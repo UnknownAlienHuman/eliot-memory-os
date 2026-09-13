@@ -59,6 +59,23 @@ pub use wire::{
     request_frame_with_payload_authority, response_frame,
 };
 
+mod operation_catalogue;
+mod operation_parameters;
+
+pub use operation_catalogue::{
+    ACTIVATED_READ_OWNING_SECTION, GENESIS_OWNING_SECTION, MINIMUM_COMPATIBLE_VERSION,
+    OPERATION_CATALOGUE_PROFILE, READ_MAX_INPUT_BYTES, READ_MAX_OUTPUT_BYTES, READ_TIMEOUT_MS,
+    SCOPE_KIND_NONE, SCOPE_KIND_SCOPE, SINGLE_MANIFEST_OWNING_SECTION, OperationKind,
+    activated_read_operations, generated_operation_manifests, operation_manifest_set_digest,
+};
+
+pub use operation_parameters::{
+    ParameterDeclaration, ParameterSchemaField, ParameterShape, declared_read_parameters,
+    named_mutation_operation_by_name, named_mutation_operation_name, named_read_operation_by_name,
+    named_read_operation_name, parameter_schema_digest, project_parameter_schema,
+    validate_typed_read_parameters,
+};
+
 /// Stable identity of this contract surface.
 pub const CONTRACT_NAME: &str = "eliot.storage.store-api";
 /// Current wire revision of this contract surface.
@@ -633,6 +650,19 @@ impl NamedReadRequest {
             .map_err(StoreError::Foundation)?;
         validate_parameters(&self.parameters)
     }
+
+    /// Validates this request against a generated operation catalogue set.
+    ///
+    /// This is the pre-dispatch authority for named reads: catalogue
+    /// membership, typed parameters, scope declaration, and declared input
+    /// bounds. It issues no authority; scope, role, fence, and expiry
+    /// enforcement stay in slice C2.
+    pub fn validate_against_catalogue(
+        &self,
+        entries: &[NamedOperationManifest],
+    ) -> Result<(), StoreError> {
+        operation_catalogue::validate_read_against_catalogue(self, entries)
+    }
 }
 
 /// Named read response.  The payload is opaque to the store and typed by the
@@ -905,11 +935,36 @@ impl EventProjectionRelationIntents {
 
 /// One named operation manifest entry.  Its digest binds the ceiling and
 /// compatibility range to a prepared transition.
+///
+/// An entry describes exactly one operation: the operation identity in
+/// `name`, its [`OperationKind`], the owning architecture section, the exact
+/// parameter-schema revision and digest, the scope declaration, and the
+/// compatibility range together with the input/output/timeout bounds. Read
+/// entries persist no effect (`maximum_effect` is `Read`) and carry no
+/// transition classes; a non-empty transition-class set is required only for
+/// mutations. Entries hash without their own digest; the catalogue set digest
+/// binds the ordered entries (see [`operation_manifest_set_digest`]).
 #[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct NamedOperationManifest {
     pub name: String,
     pub version: ContractVersion,
+    #[serde(default = "default_manifest_operation_kind")]
+    pub operation_kind: OperationKind,
+    #[serde(default)]
+    pub owning_section: String,
+    #[serde(default = "default_manifest_schema_revision")]
+    pub schema_revision: ContractVersion,
+    #[serde(default)]
+    pub parameter_schema: Vec<ParameterSchemaField>,
+    #[serde(default)]
+    pub schema_digest: String,
+    #[serde(default)]
+    pub requires_scope_id: bool,
+    #[serde(default)]
+    pub scope_kind: String,
+    #[serde(default = "default_manifest_minimum_compatible")]
+    pub minimum_compatible_version: ContractVersion,
     pub transition_classes: Vec<TransitionClass>,
     pub maximum_effect: EffectClass,
     pub max_input_bytes: u32,
@@ -918,8 +973,91 @@ pub struct NamedOperationManifest {
     pub digest: OperationManifestDigest,
 }
 
+fn default_manifest_operation_kind() -> OperationKind {
+    OperationKind::Mutation
+}
+
+fn default_manifest_schema_revision() -> ContractVersion {
+    CONTRACT_VERSION
+}
+
+fn default_manifest_minimum_compatible() -> ContractVersion {
+    ContractVersion::new(1, 0, 0)
+}
+
+/// Complete pre-digest construction spec for one manifest entry.
+///
+/// Every manifest, whether built through the legacy [`NamedOperationManifest::new`]
+/// or generated from the operation catalogue table, flows through
+/// [`NamedOperationManifest::from_spec`] so schema and entry digests are
+/// derived in exactly one place.
+#[derive(Clone, Debug)]
+pub struct OperationManifestSpec {
+    /// Canonical operation identity (a closed operation name).
+    pub name: String,
+    /// Manifest revision of this entry.
+    pub version: ContractVersion,
+    /// Whether this entry describes a read or a mutation.
+    pub operation_kind: OperationKind,
+    /// Owning architecture section for the operation's meaning.
+    pub owning_section: String,
+    /// Revision of the declared parameter schema.
+    pub schema_revision: ContractVersion,
+    /// Owner-approved parameter schema projection.
+    pub parameter_schema: Vec<ParameterSchemaField>,
+    /// Whether callers must address a scope for this operation.
+    pub requires_scope_id: bool,
+    /// Scope kind paired with `requires_scope_id` (`"none"` or `"scope"`).
+    pub scope_kind: String,
+    /// Oldest compatible manifest version.
+    pub minimum_compatible_version: ContractVersion,
+    /// Allowed transition families (empty for reads, non-empty for mutations).
+    pub transition_classes: Vec<TransitionClass>,
+    /// Maximum canonical effect (`Read` for read entries).
+    pub maximum_effect: EffectClass,
+    /// Maximum canonical input bytes.
+    pub max_input_bytes: u32,
+    /// Maximum canonical output bytes.
+    pub max_output_bytes: u32,
+    /// Admission timeout in milliseconds.
+    pub timeout_ms: u32,
+}
+
 impl NamedOperationManifest {
+    /// Builds a manifest from a complete spec and derives its digests.
+    pub fn from_spec(spec: OperationManifestSpec) -> Result<Self, StoreError> {
+        validate_text(&spec.name, "manifest.name")?;
+        let schema_digest = parameter_schema_digest(&spec.parameter_schema)?;
+        let mut manifest = Self {
+            name: spec.name,
+            version: spec.version,
+            operation_kind: spec.operation_kind,
+            owning_section: spec.owning_section,
+            schema_revision: spec.schema_revision,
+            parameter_schema: spec.parameter_schema,
+            schema_digest,
+            requires_scope_id: spec.requires_scope_id,
+            scope_kind: spec.scope_kind,
+            minimum_compatible_version: spec.minimum_compatible_version,
+            transition_classes: spec.transition_classes,
+            maximum_effect: spec.maximum_effect,
+            max_input_bytes: spec.max_input_bytes,
+            max_output_bytes: spec.max_output_bytes,
+            timeout_ms: spec.timeout_ms,
+            digest: OperationManifestDigest::new("pending")?,
+        };
+        let digest = manifest_digest(&manifest)?;
+        manifest.digest = OperationManifestDigest::new(digest)?;
+        manifest.validate()?;
+        Ok(manifest)
+    }
+
     /// Builds a manifest and derives its canonical digest.
+    ///
+    /// Legacy single-manifest constructor retained for the genesis/bootstrap
+    /// path and already-deployed single manifests. The catalogue-owned fields
+    /// take neutral single-manifest values owned by the catalogue mechanism
+    /// itself; per-operation entries are generated from the catalogue table.
     pub fn new(
         name: impl Into<String>,
         version: ContractVersion,
@@ -929,42 +1067,83 @@ impl NamedOperationManifest {
         max_output_bytes: u32,
         timeout_ms: u32,
     ) -> Result<Self, StoreError> {
-        let mut manifest = Self {
+        Self::from_spec(OperationManifestSpec {
             name: name.into(),
             version,
+            operation_kind: OperationKind::Mutation,
+            owning_section: SINGLE_MANIFEST_OWNING_SECTION.to_owned(),
+            schema_revision: version,
+            parameter_schema: Vec::new(),
+            requires_scope_id: false,
+            scope_kind: SCOPE_KIND_NONE.to_owned(),
+            minimum_compatible_version: ContractVersion::new(1, 0, 0),
             transition_classes,
             maximum_effect,
             max_input_bytes,
             max_output_bytes,
             timeout_ms,
-            digest: OperationManifestDigest::new("pending")?,
-        };
-        let digest = manifest_digest(&manifest)?;
-        manifest.digest = OperationManifestDigest::new(digest)?;
-        manifest.validate()?;
-        Ok(manifest)
+        })
     }
 
     /// Validates the closed manifest and its self-digest.
     pub fn validate(&self) -> Result<(), StoreError> {
         validate_text(&self.name, "manifest.name")?;
-        if self.transition_classes.is_empty() {
-            return Err(StoreError::Empty {
-                field: "manifest.transition_classes",
+        validate_text(&self.owning_section, "manifest.owning_section")?;
+        if self.minimum_compatible_version > self.version {
+            return Err(StoreError::InvalidField {
+                field: "manifest.compatibility",
+                reason: "minimum compatible version exceeds manifest version",
             });
         }
-        unique(
-            self.transition_classes.iter().copied(),
-            "manifest.transition_classes",
-        )?;
-        if self.maximum_effect == EffectClass::ExternalEffect {
-            return Err(StoreError::EffectCeilingExceeded);
+        match self.operation_kind {
+            OperationKind::Read => {
+                if !self.transition_classes.is_empty() {
+                    return Err(StoreError::InvalidField {
+                        field: "manifest.transition_classes",
+                        reason: "read entries carry no transition class",
+                    });
+                }
+                if self.maximum_effect != EffectClass::Read {
+                    return Err(StoreError::InvalidField {
+                        field: "manifest.maximum_effect",
+                        reason: "read entries persist no effect",
+                    });
+                }
+            }
+            OperationKind::Mutation => {
+                if self.transition_classes.is_empty() {
+                    return Err(StoreError::Empty {
+                        field: "manifest.transition_classes",
+                    });
+                }
+                unique(
+                    self.transition_classes.iter().copied(),
+                    "manifest.transition_classes",
+                )?;
+                if self.maximum_effect == EffectClass::ExternalEffect {
+                    return Err(StoreError::EffectCeilingExceeded);
+                }
+            }
+        }
+        let scope_pair_ok = (self.requires_scope_id
+            && self.scope_kind == SCOPE_KIND_SCOPE)
+            || (!self.requires_scope_id && self.scope_kind == SCOPE_KIND_NONE);
+        if !scope_pair_ok {
+            return Err(StoreError::InvalidField {
+                field: "manifest.scope",
+                reason: "scope declaration must pair requires_scope_id with its scope kind",
+            });
         }
         if self.max_input_bytes == 0 || self.max_output_bytes == 0 || self.timeout_ms == 0 {
             return Err(StoreError::InvalidField {
                 field: "manifest.limits",
                 reason: "must be non-zero",
             });
+        }
+        validate_digest(&self.schema_digest, "manifest.schema_digest")?;
+        let schema_digest = parameter_schema_digest(&self.parameter_schema)?;
+        if self.schema_digest != schema_digest {
+            return Err(StoreError::ManifestMismatch);
         }
         let digest = manifest_digest(self)?;
         if self.digest.as_str() != digest {
@@ -985,6 +1164,14 @@ fn manifest_digest(manifest: &NamedOperationManifest) -> Result<String, StoreErr
     let shape = (
         &manifest.name,
         manifest.version,
+        manifest.operation_kind,
+        &manifest.owning_section,
+        manifest.schema_revision,
+        &manifest.parameter_schema,
+        &manifest.schema_digest,
+        manifest.requires_scope_id,
+        &manifest.scope_kind,
+        manifest.minimum_compatible_version,
         &manifest.transition_classes,
         manifest.maximum_effect,
         manifest.max_input_bytes,
@@ -1084,6 +1271,13 @@ impl PreparedTransition {
     }
 
     /// Checks this plan against a closed named-operation manifest.
+    ///
+    /// Bootstrap/single-manifest check retained for the genesis path and
+    /// already-deployed single manifests. Named operations validate against
+    /// the generated catalogue set instead (see
+    /// [`PreparedTransition::validate_against_catalogue`]); both mechanisms
+    /// derive from the same generated table, so there are no competing
+    /// manifest authorities.
     pub fn validate_against_manifest(
         &self,
         manifest: &NamedOperationManifest,
@@ -1098,21 +1292,33 @@ impl PreparedTransition {
         }
         Ok(())
     }
+
+    /// Checks this plan against a generated operation catalogue set.
+    ///
+    /// Pre-dispatch authority for prepared transitions: the genesis/bootstrap
+    /// shape binds to the genesis entry, while a plan carrying named
+    /// operations binds to the whole set digest with every command resolved
+    /// in order against a mutation entry. Plan commands are never reordered.
+    pub fn validate_against_catalogue(
+        &self,
+        entries: &[NamedOperationManifest],
+    ) -> Result<(), StoreError> {
+        operation_catalogue::validate_transition_against_catalogue(self, entries)
+    }
 }
 
 /// Builds the one provider-independent manifest admitted for Store genesis.
 /// The digest is derived from the complete manifest shape and is shared by
 /// every adapter; no provider name or zero digest is accepted as a substitute.
+///
+/// The entry is sourced from the generated operation catalogue
+/// ([`generated_operation_manifests`]), so the genesis path and the named
+/// operation catalogue share one authority.
 pub fn genesis_manifest() -> Result<NamedOperationManifest, StoreError> {
-    NamedOperationManifest::new(
-        GENESIS_MANIFEST_NAME,
-        CONTRACT_VERSION,
-        vec![TransitionClass::RecoverySchema],
-        EffectClass::ReversibleMutation,
-        3_145_728,
-        3_145_728,
-        1_000,
-    )
+    generated_operation_manifests()?
+        .into_iter()
+        .find(|entry| entry.name == GENESIS_MANIFEST_NAME)
+        .ok_or(StoreError::UnknownOperation)
 }
 
 /// Derives the canonical neutral transition used to issue and validate every
