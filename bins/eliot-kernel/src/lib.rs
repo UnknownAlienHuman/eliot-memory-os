@@ -167,6 +167,8 @@ pub use eliot_ors::{SupervisionLeaseCommitTicket, SupervisionLeaseStageReceipt};
 #[cfg(test)]
 use eliot_platform::ClockObservation;
 #[cfg(windows)]
+use eliot_platform::PlatformHandle;
+#[cfg(windows)]
 use eliot_platform_windows::{
     FileIdentity as WindowsFileIdentity, NamedPipePeerKind, NamedPipePeerProfile, NamedPipePeerSet,
     ProtectedRootLease, ProtectedRuntimePathLease, PublicationOutcome, PublicationPrecondition,
