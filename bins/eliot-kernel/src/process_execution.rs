@@ -1414,7 +1414,30 @@ impl KernelComposition {
         session_binding: ProcessSessionBinding,
         request: ProcessExecutionRequest,
     ) -> ProcessExecutionResponse {
-        let Ok((owner, expected_session_binding)) = super::caller_binding(session) else {
+        // The process authority must be configured before the caller owner can be
+        // bound: the owner carries the gateway's retained EpochId pair
+        // (T2.md:177-206), resolved against the session scalar contour.
+        let Some(gateway) = &self.process_gateway else {
+            return ProcessExecutionResponse::Rejected(
+                eliot_kernel_service::ProcessExecutionRejection {
+                    code: "PROCESS_AUTHORITY_CONFIGURATION_REQUIRED".to_owned(),
+                    detail: "external process authority key, snapshot, replay, and evidence bindings are required".to_owned(),
+                },
+            );
+        };
+        let Ok(owner_epoch) =
+            super::daemon_session_guard::retained_owner_epoch(gateway, session.authority_epoch)
+        else {
+            return ProcessExecutionResponse::Rejected(
+                eliot_kernel_service::ProcessExecutionRejection {
+                    code: "AUTHENTICATED_CALLER_REQUIRED".to_owned(),
+                    detail: "the established authenticated session binding is unavailable"
+                        .to_owned(),
+                },
+            );
+        };
+        let Ok((owner, expected_session_binding)) = super::caller_binding(session, &owner_epoch)
+        else {
             return ProcessExecutionResponse::Rejected(
                 eliot_kernel_service::ProcessExecutionRejection {
                     code: "AUTHENTICATED_CALLER_REQUIRED".to_owned(),
@@ -1431,14 +1454,6 @@ impl KernelComposition {
                 },
             );
         }
-        let Some(gateway) = &self.process_gateway else {
-            return ProcessExecutionResponse::Rejected(
-                eliot_kernel_service::ProcessExecutionRejection {
-                    code: "PROCESS_AUTHORITY_CONFIGURATION_REQUIRED".to_owned(),
-                    detail: "external process authority key, snapshot, replay, and evidence bindings are required".to_owned(),
-                },
-            );
-        };
         let result = match request {
             ProcessExecutionRequest::Start(admission) => {
                 let proof = match self.retain_process_path_proof(&admission) {

@@ -612,7 +612,17 @@ impl EliotdLiveObserver for ProductionEliotdLiveObserver {
         {
             return Ok(None);
         }
-        if receipt.binding().state_fence().authority_epoch()
+        // Scalar-sequence staleness gate against the approved manifest contour:
+        // the receipt fence carries the full EpochId pair (lineage proven at
+        // admission), while the manifest retains only the scalar contour, so
+        // the contour join is on the sequence component. Lineage itself is
+        // never re-derived from this scalar.
+        if receipt
+            .binding()
+            .state_fence()
+            .authority_epoch()
+            .sequence
+            .get()
             != manifest
                 .runtime_launch
                 .authority_state_fence
