@@ -622,10 +622,12 @@ impl KernelHostRequestPort for KernelHostRequestClient {
             // Only a cached replay can be stale here: fresh builds set
             // deadline to now plus a positive preference. The original attempt
             // may still be live kernel-side, so probe once instead of assuming
-            // expiry; a failed probe settles as deadline exceeded.
-            return self
-                .probe_settles_invocation(&facts, &session, &envelope, now_ms)
-                .map_err(|_| PortFailure::DeadlineExceeded);
+            // expiry. A failed probe leaves delivery unknown -- the response
+            // may already be completed kernel-side -- so the probe's
+            // unknown-outcome error is returned unchanged and MUST NOT be
+            // rewritten into DeadlineExceeded. Only the Kernel-owned Expired
+            // record state maps to an owner timeout.
+            return self.probe_settles_invocation(&facts, &session, &envelope, now_ms);
         }
         let frame = host_request_frame_for_envelope(
             AGENT_HOST_REQUEST_SUBMIT_OPERATION,
