@@ -275,7 +275,7 @@ impl CapabilityAdmissionPort for FakeAdmission {
             },
             request.revocation_revision(),
             if state.stale_lease {
-                WorkLeaseId::new("lease-stale").expect("stale lease")
+                serde_json::from_value::<WorkLeaseId>(serde_json::json!({"namespace": "eliot.governor.work-lease", "revision": "v1", "value": "lease-stale"})).expect("stale lease")
             } else {
                 request.lease().clone()
             },
@@ -539,7 +539,7 @@ fn authority(state_fence: StateFence) -> AuthorityEnvelope {
             allowed: [EffectKind::WriteCandidate].into_iter().collect(),
             max_external_effects: 0,
         },
-        lease: WorkLeaseId::new("lease-1").expect("lease"),
+        lease: serde_json::from_value::<WorkLeaseId>(serde_json::json!({"namespace": "eliot.governor.work-lease", "revision": "v1", "value": "lease-1"})).expect("lease"),
         state_fence,
         valid_until: "provider-owned".to_owned(),
     }
@@ -700,7 +700,7 @@ fn frame(request_id: &str, body: WorkerFrameBody) -> WorkerFrame {
             AuthorityEpoch::new(1).expect("epoch"),
             ResourceGeneration::new(1).expect("generation"),
         ),
-        lease_id: "lease-1".to_owned(),
+        lease_id: serde_json::from_value::<WorkLeaseId>(serde_json::json!({"namespace": "eliot.governor.work-lease", "revision": "v1", "value": "lease-1"})).expect("lease"),
         admission_revision: "admission-revision-1".to_owned(),
         producer_generation: 1,
         body,

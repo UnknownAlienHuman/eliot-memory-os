@@ -1230,7 +1230,7 @@ mod tests {
                 epoch: AuthorityEpoch::new(1)?,
                 scope_ref: "scope-1".into(),
                 effect_ceiling: ceiling(),
-                lease: WorkLeaseId::new("lease-1")?,
+                lease: serde_json::from_value::<WorkLeaseId>(serde_json::json!({"namespace": "eliot.governor.work-lease", "revision": "v1", "value": "lease-1"}))?,
                 state_fence: StateFence::new(AuthorityEpoch::new(1)?, ResourceGeneration::new(1)?),
                 valid_until: "never".into(),
             },
@@ -1806,7 +1806,7 @@ mod tests {
             begin_attempt_strict(
                 &attached,
                 &gate,
-                WorkLeaseId::new("lease-1")?,
+                serde_json::from_value::<WorkLeaseId>(serde_json::json!({"namespace": "eliot.governor.work-lease", "revision": "v1", "value": "lease-1"}))?,
                 AttemptId::new("attempt-1")?,
                 ContinuityKind::Fresh
             ),
@@ -1826,7 +1826,7 @@ mod tests {
             begin_attempt_strict(
                 &attached,
                 &gate,
-                WorkLeaseId::new("lease-1")?,
+                serde_json::from_value::<WorkLeaseId>(serde_json::json!({"namespace": "eliot.governor.work-lease", "revision": "v1", "value": "lease-1"}))?,
                 AttemptId::new("attempt-1")?,
                 ContinuityKind::Fresh
             ),
@@ -1920,7 +1920,7 @@ mod tests {
             epoch: eliot_agent_api::AuthorityEpoch::new(1)?,
             scope_ref: "scope-1".into(),
             effect_ceiling: ceiling(),
-            lease: WorkLeaseId::new("lease-1")?,
+            lease: serde_json::from_value::<WorkLeaseId>(serde_json::json!({"namespace": "eliot.governor.work-lease", "revision": "v1", "value": "lease-1"}))?,
             state_fence: eliot_agent_api::StateFence::new(
                 eliot_agent_api::AuthorityEpoch::new(1)?,
                 eliot_agent_api::ResourceGeneration::new(1)?,
@@ -1945,7 +1945,7 @@ mod tests {
         let attempt = begin_attempt_strict(
             &attached,
             &gate,
-            WorkLeaseId::new("lease-1")?,
+            serde_json::from_value::<WorkLeaseId>(serde_json::json!({"namespace": "eliot.governor.work-lease", "revision": "v1", "value": "lease-1"}))?,
             AttemptId::new("attempt-1")?,
             ContinuityKind::Fresh,
         )?;

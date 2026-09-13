@@ -1,6 +1,6 @@
 use std::collections::{BTreeMap, BTreeSet};
 
-use eliot_agent_api::{AttemptId, AuthorizedEffect, BudgetEnvelope, ProposedEffect};
+use eliot_agent_api::{AttemptId, AuthorizedEffect, BudgetEnvelope, ProposedEffect, WorkLeaseId};
 use eliot_contracts::{
     AuthorityEpoch, DecisionId, SessionId, StateFence, TaskId, canonical_json_bytes, sha256_hex,
 };
@@ -242,7 +242,7 @@ pub struct WorkerFrame {
     pub deadline_unix_ms: u64,
     pub authority_epoch: AuthorityEpoch,
     pub state_fence: StateFence,
-    pub lease_id: String,
+    pub lease_id: WorkLeaseId,
     pub admission_revision: String,
     pub producer_generation: u64,
     pub body: WorkerFrameBody,
@@ -259,13 +259,15 @@ impl WorkerFrame {
         for (field, value) in [
             ("connection_id", &self.connection_id),
             ("request_id", &self.request_id),
-            ("lease_id", &self.lease_id),
             ("admission_revision", &self.admission_revision),
         ] {
             if value.trim().is_empty() {
                 return Err(WorkerError::InvalidFrame(field));
             }
         }
+        // lease_id carries canonical WorkLeaseId via eliot-agent-api re-export:
+        // blank/control/too-long/wrong-domain rejected at Deserialize boundary;
+        // binding enforced via == against grant.authority().lease.
         if self.deadline_unix_ms == 0
             || self.producer_generation == 0
             || self

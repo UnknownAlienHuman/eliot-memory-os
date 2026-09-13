@@ -1683,6 +1683,10 @@ fn route_class_allowed(allowed_route_classes: &[String], provider: &str) -> bool
 
 fn validate_admission_text(receipt: &ProviderAdmissionReceipt) -> Result<(), CoordinatorError> {
     receipt.provider_identity.validate()?;
+    // coordinator_lease is the canonical `WorkLeaseId` (re-exported owner):
+    // non-blank/control/boundary/length is already enforced by Deserialize;
+    // provenance and equality are enforced downstream via `==`/`!=`
+    // (`validate_context` coordinator_lease equality, `lease_exists` equality).
     for (value, field) in [
         (receipt.launch_request_id.as_str(), "launch_request_id"),
         (receipt.recipe_id.as_str(), "recipe_id"),
@@ -1690,7 +1694,6 @@ fn validate_admission_text(receipt: &ProviderAdmissionReceipt) -> Result<(), Coo
         (receipt.task_id.as_str(), "task_id"),
         (&receipt.task_revision, "task_revision"),
         (receipt.plan_revision.as_str(), "plan_revision"),
-        (receipt.coordinator_lease.as_str(), "coordinator_lease"),
         (
             &receipt.g11_admission_receipt_ref,
             "g11_admission_receipt_ref",
@@ -1743,7 +1746,9 @@ fn validate_admitted_lane(lane: &crate::AdmittedLaneReceipt) -> Result<(), Coord
     validate_text(lane.role_id.as_str(), "role_id")?;
     validate_text(lane.role_revision.as_str(), "role_revision")?;
     validate_text(lane.attempt_id.as_str(), "attempt_id")?;
-    validate_text(lane.lease_id.as_str(), "lease_id")?;
+    // lease_id is the canonical `WorkLeaseId`: blank/control/boundary/length already
+    // enforced by Deserialize; uniqueness and binding are enforced via `==`
+    // (`leases` BTreeSet in `admit`, `validate_attempt_binding` lease equality).
     validate_text(lane.worker_id.as_str(), "worker_id")?;
     validate_text(&lane.routing_receipt_digest, "routing_receipt_digest")?;
     lane.route.validate().map_err(provider_contract)?;
