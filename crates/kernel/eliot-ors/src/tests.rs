@@ -5,7 +5,9 @@ use std::sync::OnceLock;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::thread;
 
-use eliot_contracts::{AuthorityEpoch, ResourceGeneration, StateFence, sha256_hex};
+use eliot_contracts::{
+    AuthorityEpoch, EpochId, EpochLineageId, ResourceGeneration, StateFence, sha256_hex,
+};
 use eliot_platform::SecretReference;
 use eliot_receipts::{ReceiptCore, ReceiptEnvelope};
 use eliot_runtime_contracts::{
@@ -23,6 +25,14 @@ use serde_json::{Value, json};
 use crate::*;
 
 type TestResult<T = ()> = Result<T, Box<dyn std::error::Error>>;
+
+fn test_epoch(sequence: u64) -> EpochId {
+    EpochId::new(
+        EpochLineageId::new("550e8400-e29b-41d4-a716-446655440000").expect("lineage"),
+        std::num::NonZeroU64::new(sequence).expect("sequence"),
+    )
+    .expect("epoch")
+}
 
 static NEXT_DATABASE: AtomicU64 = AtomicU64::new(1);
 
@@ -648,7 +658,7 @@ fn supervision_binding(
             process_id: "kernel-process-1".to_owned(),
             process_generation: ResourceGeneration::new(1)?,
         },
-        state_fence: StateFence::new(AuthorityEpoch::new(2)?, ResourceGeneration::new(1)?),
+        state_fence: StateFence::new(test_epoch(2), ResourceGeneration::new(1)?),
         issued_at_ms,
         expires_at_ms: issued_at_ms + 900,
         renew_before_ms: issued_at_ms + 450,
@@ -1087,7 +1097,7 @@ fn supervision_lease_renew_is_monotonic_and_history_is_bounded() -> TestResult {
     let mut mismatched_binding = supervision_binding(LeaseState::Active, 250)?;
     mismatched_binding.kernel_epoch = AuthorityEpoch::new(3)?;
     mismatched_binding.state_fence =
-        StateFence::new(AuthorityEpoch::new(3)?, ResourceGeneration::new(1)?);
+        StateFence::new(test_epoch(3), ResourceGeneration::new(1)?);
     assert!(matches!(
         store.prepare_supervision_lease(supervision_request(
             "ticket-fence-mismatch",
@@ -1564,7 +1574,11 @@ fn process_evidence(
                 "state_fence": {
                     "authority_epoch": 1,
                     "generation": 1,
-                    "nonce": "fence-1"
+                    "nonce": "fence-1",
+                    "canonical_epoch": {
+                        "lineage_id": "550e8400-e29b-41d4-a716-446655440000",
+                        "sequence": 1
+                    }
                 },
                 "request_digest": "11".repeat(32),
                 "permit_digest": "22".repeat(32),
@@ -1600,11 +1614,12 @@ fn process_evidence_record(
     lifecycle: &str,
     observed_at_ms: i64,
 ) -> TestResult<ProcessEvidenceRecord> {
-    let owner = eliot_process::ProcessOwnerBinding::new(
+    let owner = eliot_process::ProcessOwnerBinding::new_with_canonical(
         "testd",
         "aa".repeat(32),
         1,
         eliot_process::Generation::new(1)?,
+        test_epoch(1),
     )?;
     Ok(ProcessEvidenceRecord::from_evidence(
         process_evidence(operation_id, lifecycle)?,

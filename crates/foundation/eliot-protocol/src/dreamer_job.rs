@@ -8,7 +8,7 @@
 use std::fmt;
 
 use eliot_contracts::{
-    ArtifactId, AuthorityEpoch, ContractIdentity, ContractVersion, OperationId, ReceiptId,
+    ArtifactId, ContractIdentity, ContractVersion, EpochId, OperationId, ReceiptId,
     ResourceGeneration, StateFence, TaskId, canonical_json_bytes, sha256_hex,
 };
 use eliot_receipts::{
@@ -394,7 +394,7 @@ pub struct AdmissionRef {
     pub route_class: String,
     pub budget_units: u64,
     pub deadline_unix_ms: u64,
-    pub validity_epoch: AuthorityEpoch,
+    pub validity_epoch: EpochId,
     pub resource_generation: ResourceGeneration,
     pub admission_receipt: ReceiptId,
 }
@@ -410,8 +410,19 @@ impl AdmissionRef {
             .state_fence
             .validate()
             .map_err(DurableJobError::Foundation)?;
-        if self.authority.authority_epoch != self.validity_epoch
-            || self.authority.state_fence.authority_epoch != self.authority.authority_epoch
+        // Exact-tuple authority checks (Implements #64): equal sequences from
+        // different lineages are unrelated. `AuthorityBinding`/`SessionBinding`
+        // epoch fields migrate to `EpochId` with eliot-receipts (residual owner);
+        // until then this crate assumes their `EpochId` shape.
+        if !self
+            .authority
+            .authority_epoch
+            .is_same_authority(&self.validity_epoch)
+            || !self
+                .authority
+                .state_fence
+                .authority_epoch
+                .is_same_authority(&self.authority.authority_epoch)
             || self.scope.resource_generation != self.resource_generation
             || self.scope.state_fence.resource_generation != self.scope.resource_generation
             || self.scope.state_fence != self.authority.state_fence
@@ -432,7 +443,7 @@ impl AdmissionRef {
             });
         }
         if let Some(session) = &self.session
-            && session.authority_epoch != self.validity_epoch
+            && !session.authority_epoch.is_same_authority(&self.validity_epoch)
         {
             return Err(DurableJobError::FenceMismatch);
         }

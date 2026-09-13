@@ -1,4 +1,4 @@
-use eliot_contracts::{AuthorityEpoch, ResourceGeneration, StateFence, canonical_json_bytes};
+use eliot_contracts::{AuthorityEpoch, EpochId, ResourceGeneration, StateFence, canonical_json_bytes};
 use eliot_platform::{PlatformHandle, SecretReference};
 use eliot_receipts::ReceiptEnvelope;
 use eliot_runtime_contracts::{
@@ -1074,6 +1074,13 @@ pub enum AuthorityHandoffBegin {
 }
 
 /// Observation-only process evidence retained by ORS.
+///
+/// The authority epoch is the lineage-aware [`EpochId`] exact tuple
+/// (Implements #64, donor precedent `origin/work/100-process-epoch-v4-F`).
+/// It is bound from the owner's canonical epoch at admission; scalar-only
+/// owners without canonical lineage evidence cannot produce active authority
+/// and fail closed. Adjacent `AuthorityHandoffRecord` u64 contours are
+/// intentionally not widened here (flagged residual).
 #[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ProcessEvidenceRecord {
@@ -1085,7 +1092,7 @@ pub struct ProcessEvidenceRecord {
     pub image_id: OpaqueLabel,
     pub session_id: OpaqueLabel,
     pub owner: eliot_process::ProcessOwnerBinding,
-    pub authority_epoch: u64,
+    pub authority_epoch: EpochId,
     pub generation: u64,
     pub state_fence_digest: String,
     pub binding_digest: String,
@@ -1118,6 +1125,16 @@ impl ProcessEvidenceRecord {
             .map_err(|error| OrsError::Encoding(error.to_string()))?;
         let evidence_bytes =
             serde_json::to_vec(&evidence).map_err(|error| OrsError::Encoding(error.to_string()))?;
+        // Lineage-aware binding (Implements #64): the active epoch comes only
+        // from the owner's canonical `EpochId`. A scalar-only owner carries no
+        // provable lineage and fails closed; legacy numerics enter only via
+        // `import_legacy_scalar_epoch` with evidence, never via coercion.
+        let authority_epoch = owner.canonical_epoch().cloned().ok_or_else(|| {
+            OrsError::IntegrityProblem {
+                record_type: "process_evidence",
+                reason: "owner carries no canonical lineage epoch".to_owned(),
+            }
+        })?;
         let record = Self {
             contract_version: CONTRACT_VERSION,
             operation_id: OperationIdentity::new(binding.operation_id().as_str())?,
@@ -1126,7 +1143,7 @@ impl ProcessEvidenceRecord {
             job_id: OpaqueLabel::new(binding.job_id().as_str())?,
             image_id: OpaqueLabel::new(binding.image_id().as_str())?,
             session_id: OpaqueLabel::new(binding.session_id().as_str())?,
-            authority_epoch: owner.authority_epoch(),
+            authority_epoch,
             generation: owner.generation().get(),
             owner,
             state_fence_digest: sha256_hex(&state_fence_bytes),
@@ -1184,7 +1201,9 @@ impl ProcessEvidenceRecord {
         )?;
         validate_digest(&self.binding_digest, "process_evidence_binding_digest")?;
         validate_digest(&self.evidence_digest, "process_evidence_digest")?;
-        if self.authority_epoch == 0 || self.generation == 0 || self.observed_at_ms <= 0 {
+        // `EpochId` is always a validated non-zero tuple; only generation and
+        // observation time retain scalar positivity checks.
+        if self.generation == 0 || self.observed_at_ms <= 0 {
             return Err(OrsError::InvalidField {
                 field: "process_evidence_identity",
                 reason: "epoch, generation, and observation time must be positive",
@@ -1218,8 +1237,18 @@ impl ProcessEvidenceRecord {
             record_type: "process_evidence",
             reason: error.to_string(),
         })?;
+        // Exact-tuple lineage check (Implements #64): the record epoch must be
+        // the same `(lineage_id, sequence)` as the owner's canonical epoch.
+        // A scalar-only owner (no canonical lineage) cannot satisfy this and
+        // fails closed; equal sequences from different lineages are unrelated.
+        let owner_canonical = self.owner.canonical_epoch().ok_or_else(|| {
+            OrsError::IntegrityProblem {
+                record_type: "process_evidence",
+                reason: "owner carries no canonical lineage epoch".to_owned(),
+            }
+        })?;
         if owner != self.owner
-            || self.authority_epoch != self.owner.authority_epoch()
+            || !self.authority_epoch.is_same_authority(owner_canonical)
             || self.generation != self.owner.generation().get()
             || self.operation_id.as_str() != self.evidence.operation_id().as_str()
             || self.request_digest != self.evidence.request_digest()
@@ -1254,15 +1283,22 @@ impl ProcessEvidenceRecord {
         }
         let fence: Value = serde_json::from_slice(&state_fence_bytes)
             .map_err(|error| OrsError::Encoding(error.to_string()))?;
-        let fence_epoch = fence
-            .get("authority_epoch")
-            .and_then(Value::as_u64)
+        // Lineage-aware fence binding (Implements #64): the P-03 execution
+        // fence carries its canonical `EpochId` alongside the scalar contour.
+        // Authorization uses exact-tuple `is_same_authority`; the scalar wire
+        // value alone never authorizes and is never coerced.
+        let fence_canonical = binding
+            .state_fence()
+            .canonical_epoch()
             .ok_or(OrsError::FenceMismatch)?;
+        if !fence_canonical.is_same_authority(&self.authority_epoch) {
+            return Err(OrsError::FenceMismatch);
+        }
         let fence_generation = fence
             .get("generation")
             .and_then(Value::as_u64)
             .ok_or(OrsError::FenceMismatch)?;
-        if fence_epoch != self.authority_epoch || fence_generation != self.generation {
+        if fence_generation != self.generation {
             return Err(OrsError::FenceMismatch);
         }
         Ok(())
@@ -1315,6 +1351,24 @@ impl StateFenceSnapshot {
             .map_err(|error| OrsError::Encoding(error.to_string()))?
             != self.canonical_json
         {
+            return Err(OrsError::FenceMismatch);
+        }
+        Ok(())
+    }
+
+    /// Lineage-bound validation against an [`EpochLineage`] gate (Implements #64).
+    ///
+    /// The `u64` contour is intentionally retained (donor precedent: no silent
+    /// widening without a migration receipt). This additive check requires the
+    /// snapshot's observed sequence to equal the lineage's current epoch AND
+    /// the lineage edge itself to validate via existing `EpochLineage` gates
+    /// (non-zero, predecessor ordering). Cross-lineage numeric equality alone
+    /// never authorizes; callers holding a canonical [`EpochId`] must additionally
+    /// enforce exact-tuple `is_same_authority` at their own boundary.
+    pub fn validate_against_lineage(&self, lineage: &EpochLineage) -> Result<(), OrsError> {
+        self.validate()?;
+        lineage.validate()?;
+        if self.observed_authority_epoch != lineage.current.epoch {
             return Err(OrsError::FenceMismatch);
         }
         Ok(())
@@ -2501,7 +2555,14 @@ pub struct HostRequestRecord {
     pub scope_ref: Option<OpaqueLabel>,
     pub capability_ref: OpaqueLabel,
     pub fence_digest: String,
-    pub authority_epoch: u64,
+    /// Lineage-aware authority epoch (Implements #64).
+    ///
+    /// Widened from the `u64` contour because `host_request_binding`
+    /// (owned Split B path) binds it directly from the migrated `StateFence`
+    /// `EpochId`; a scalar contour would require a forbidden
+    /// `.sequence.get()` adapter. `AuthorityHandoffRecord` u64 contours remain
+    /// flagged adjacent residuals.
+    pub authority_epoch: EpochId,
     pub generation: u64,
     pub deadline_unix_ms: u64,
     pub state: HostRequestState,
@@ -2580,7 +2641,8 @@ impl HostRequestRecord {
         }
         validate_text(self.capability_ref.as_str(), "host_request_capability_ref")?;
         validate_digest(&self.fence_digest, "host_request_fence_digest")?;
-        if self.authority_epoch == 0 || self.generation == 0 {
+        // `EpochId` is always validated; only generation retains a scalar check.
+        if self.generation == 0 {
             return Err(OrsError::InvalidField {
                 field: "host_request_epoch",
                 reason: "must be non-zero",
