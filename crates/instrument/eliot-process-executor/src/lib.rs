@@ -645,9 +645,31 @@ impl ProcessExecutor for WindowsProcessExecutor {
                 return Err(ProcessExecutionError::UnknownOutcome);
             };
             guard.deadline_watcher = Some(deadline_watcher);
+            let view = guard.state.view();
+            let sink = Arc::clone(&guard.sink);
+            drop(guard);
+            let evidence =
+                ProcessEvidence::new_typed(view, None, None, EvidenceAxes::observed());
+            let published = match evidence {
+                Ok(evidence) => sink.record(evidence).is_ok(),
+                Err(_) => false,
+            };
+            let Ok(mut guard) = operation.lock() else {
+                return Err(ProcessExecutionError::UnknownOutcome);
+            };
+            if !published {
+                quarantine_operation(&mut guard);
+                drop(guard);
+                if let Ok(mut registry) = self.operations.lock() {
+                    registry
+                        .entry(operation_id.clone())
+                        .or_insert_with(|| Arc::clone(&operation));
+                }
+                return Err(ProcessExecutionError::UnknownOutcome);
+            }
             self.operations
                 .lock()
-                .map_err(|_| unavailable("operation registry lock poisoned"))?
+                .map_err(|_| ProcessExecutionError::UnknownOutcome)?
                 .insert(operation_id, Arc::clone(&operation));
             let Ok(receipt) = ProcessStartReceipt::new(&guard.state) else {
                 quarantine_operation(&mut guard);
@@ -1229,4 +1251,377 @@ fn now_ms() -> u64 {
 
 fn unavailable(error: impl std::fmt::Display) -> ProcessExecutionError {
     ProcessExecutionError::Unavailable(error.to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{DispatchValidationPort, WindowsProcessExecutor};
+    use eliot_process::{
+        ActionLeaseRef, DispatchAuthorityId, DispatchPermitAuthority, EnvironmentInheritance,
+        EnvironmentProjection, EvidenceSinkError, FencingToken, Generation, ImageId, JobId,
+        KernelDispatchKey, OperationId, PermitIssuance, ProcessEvidence, ProcessEvidenceSink,
+        ProcessExecutionError, ProcessExecutor, ProcessIntent, ProcessRequest, ProcessTreeId,
+        ResourceLimits, SecretRef, SessionId, SuspendedProcessIdentity, ValidatedDispatch,
+    };
+    use std::collections::BTreeMap;
+    use std::future::Future;
+    use std::sync::{Arc, Mutex};
+    use std::task::{Context, Poll, Waker};
+
+    #[cfg(windows)]
+    use eliot_instrument_api::EvidenceAxes;
+    #[cfg(windows)]
+    use eliot_platform::ClockObservation;
+    #[cfg(windows)]
+    use eliot_process::{DispatchValidationContext, ProcessLifecycle};
+
+    fn block_on<F: Future>(future: F) -> F::Output {
+        let mut future = std::pin::pin!(future);
+        let waker = Waker::noop();
+        let mut context = Context::from_waker(waker);
+        loop {
+            match future.as_mut().poll(&mut context) {
+                Poll::Ready(output) => return output,
+                Poll::Pending => std::thread::yield_now(),
+            }
+        }
+    }
+
+    fn revisions() -> BTreeMap<String, String> {
+        BTreeMap::from([
+            ("authority".to_owned(), "a".repeat(64)),
+            ("state".to_owned(), "b".repeat(64)),
+        ])
+    }
+
+    #[derive(Default)]
+    struct RecordingSink {
+        evidence: Mutex<Vec<ProcessEvidence>>,
+    }
+
+    impl ProcessEvidenceSink for RecordingSink {
+        fn record(&self, evidence: ProcessEvidence) -> Result<(), EvidenceSinkError> {
+            match self.evidence.lock() {
+                Ok(mut guard) => {
+                    guard.push(evidence);
+                    Ok(())
+                }
+                Err(_) => Err(EvidenceSinkError {
+                    message: "recording sink lock poisoned".to_owned(),
+                }),
+            }
+        }
+    }
+
+    impl RecordingSink {
+        fn recorded_len(&self) -> usize {
+            match self.evidence.lock() {
+                Ok(guard) => guard.len(),
+                Err(_) => usize::MAX,
+            }
+        }
+
+        fn recorded_one(&self) -> Option<ProcessEvidence> {
+            match self.evidence.lock() {
+                Ok(guard) => guard.first().cloned(),
+                Err(_) => None,
+            }
+        }
+    }
+
+    struct DummyPort;
+
+    impl DispatchValidationPort for DummyPort {
+        fn validate_and_consume(
+            &self,
+            _request: ProcessRequest,
+            _observed: SuspendedProcessIdentity,
+        ) -> Result<ValidatedDispatch, ProcessExecutionError> {
+            Err(ProcessExecutionError::Unavailable(
+                "dummy port must not be called pre-spawn".to_owned(),
+            ))
+        }
+    }
+
+    #[cfg(windows)]
+    struct FakePort {
+        authority: Mutex<DispatchPermitAuthority>,
+        context: DispatchValidationContext,
+    }
+
+    #[cfg(windows)]
+    impl DispatchValidationPort for FakePort {
+        fn validate_and_consume(
+            &self,
+            request: ProcessRequest,
+            observed: SuspendedProcessIdentity,
+        ) -> Result<ValidatedDispatch, ProcessExecutionError> {
+            let mut authority = self.authority.lock().map_err(|_| {
+                ProcessExecutionError::Unavailable("dispatch authority lock poisoned".to_owned())
+            })?;
+            authority
+                .validate_and_consume(request, observed, &self.context)
+                .map_err(Into::into)
+        }
+    }
+
+    #[cfg(windows)]
+    struct FailingSink;
+
+    #[cfg(windows)]
+    impl ProcessEvidenceSink for FailingSink {
+        fn record(&self, _evidence: ProcessEvidence) -> Result<(), EvidenceSinkError> {
+            Err(EvidenceSinkError {
+                message: "injected sink failure".to_owned(),
+            })
+        }
+    }
+
+    // Large matrix deferred per START.md s1 — minimal 3-test recipe only.
+    #[test]
+    #[cfg(windows)]
+    fn start_publishes_initial_observed_evidence() -> Result<(), Box<dyn std::error::Error>> {
+        let executable = r"C:\Windows\System32\cmd.exe";
+        let digest = super::sha256_file(std::path::Path::new(executable))?;
+        let working_directory = std::env::temp_dir().to_string_lossy().into_owned();
+        let operation_id = OperationId::new("op-t2-s01-ok")?;
+        let generation = Generation::new(1)?;
+        let intent = ProcessIntent::new(
+            operation_id.clone(),
+            ProcessTreeId::new("tree-t2-s01-ok")?,
+            JobId::new("job-t2-s01-ok")?,
+            ImageId::new("image-t2-s01-ok")?,
+            SessionId::new("session-t2-s01-ok")?,
+            generation,
+            executable,
+            digest,
+            vec![
+                "/c".to_owned(),
+                "ping".to_owned(),
+                "-n".to_owned(),
+                "5".to_owned(),
+                "127.0.0.1".to_owned(),
+            ],
+            working_directory,
+            EnvironmentProjection::default(),
+            ResourceLimits::new(30_000, Some(10_000), Some(512_000_000), 4_096, 4_096, 4)?,
+        )?;
+        let fence = FencingToken::new(1, generation, "fence-t2-s01-ok")?;
+        let mut authority = DispatchPermitAuthority::activate(
+            DispatchAuthorityId::new("auth-t2-s01")?,
+            KernelDispatchKey::from_secret_bytes([0x5a; 32])?,
+        );
+        let permit = authority.issue(
+            &intent,
+            PermitIssuance::new(
+                ActionLeaseRef::new("lease-t2-s01-ok")?,
+                fence.clone(),
+                revisions(),
+                100,
+                10_000,
+                "nonce-t2-s01-ok",
+            )?,
+        )?;
+        let request = ProcessRequest::new(intent, permit)?;
+        let context = DispatchValidationContext::new(
+            ClockObservation {
+                valid_time_ms: Some(150),
+                known_time_ms: Some(150),
+                transaction_sequence: None,
+                monotonic_ns: Some(1),
+            },
+            fence,
+            1,
+            revisions(),
+            41,
+        )?;
+        let port = FakePort {
+            authority: Mutex::new(authority),
+            context,
+        };
+        let executor = WindowsProcessExecutor::new(Arc::new(port));
+        let sink = Arc::new(RecordingSink::default());
+        let sink_dyn: Arc<dyn ProcessEvidenceSink> = sink.clone();
+        let _receipt = block_on(executor.start(request, sink_dyn))?;
+        assert_eq!(sink.recorded_len(), 1);
+        let Some(evidence) = sink.recorded_one() else {
+            panic!("expected exactly one recorded evidence")
+        };
+        assert_eq!(evidence.view().lifecycle(), ProcessLifecycle::Running);
+        assert_eq!(evidence.operation_id(), &operation_id);
+        assert_eq!(evidence.axes(), EvidenceAxes::observed());
+        let inspected = block_on(executor.inspect(operation_id))?;
+        assert_eq!(inspected.lifecycle(), ProcessLifecycle::Running);
+        Ok(())
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn start_sink_failure_retains_unknown_outcome() -> Result<(), Box<dyn std::error::Error>> {
+        let executable = r"C:\Windows\System32\cmd.exe";
+        let digest = super::sha256_file(std::path::Path::new(executable))?;
+        let working_directory = std::env::temp_dir().to_string_lossy().into_owned();
+        let operation_id = OperationId::new("op-t2-s01-sink-fail")?;
+        let generation = Generation::new(1)?;
+        let intent = ProcessIntent::new(
+            operation_id.clone(),
+            ProcessTreeId::new("tree-t2-s01-sink-fail")?,
+            JobId::new("job-t2-s01-sink-fail")?,
+            ImageId::new("image-t2-s01-sink-fail")?,
+            SessionId::new("session-t2-s01-sink-fail")?,
+            generation,
+            executable,
+            digest,
+            vec![
+                "/c".to_owned(),
+                "ping".to_owned(),
+                "-n".to_owned(),
+                "5".to_owned(),
+                "127.0.0.1".to_owned(),
+            ],
+            working_directory,
+            EnvironmentProjection::default(),
+            ResourceLimits::new(30_000, Some(10_000), Some(512_000_000), 4_096, 4_096, 4)?,
+        )?;
+        let fence = FencingToken::new(1, generation, "fence-t2-s01-sink-fail")?;
+        let mut authority = DispatchPermitAuthority::activate(
+            DispatchAuthorityId::new("auth-t2-s01")?,
+            KernelDispatchKey::from_secret_bytes([0x5a; 32])?,
+        );
+        let permit = authority.issue(
+            &intent,
+            PermitIssuance::new(
+                ActionLeaseRef::new("lease-t2-s01-sink-fail")?,
+                fence.clone(),
+                revisions(),
+                100,
+                10_000,
+                "nonce-t2-s01-sink-fail",
+            )?,
+        )?;
+        let request = ProcessRequest::new(intent, permit)?;
+        let context = DispatchValidationContext::new(
+            ClockObservation {
+                valid_time_ms: Some(150),
+                known_time_ms: Some(150),
+                transaction_sequence: None,
+                monotonic_ns: Some(1),
+            },
+            fence,
+            1,
+            revisions(),
+            41,
+        )?;
+        let port = FakePort {
+            authority: Mutex::new(authority),
+            context,
+        };
+        let executor = WindowsProcessExecutor::new(Arc::new(port));
+        let sink_dyn: Arc<dyn ProcessEvidenceSink> = Arc::new(FailingSink);
+        let result = block_on(executor.start(request, sink_dyn));
+        assert!(matches!(
+            result,
+            Err(ProcessExecutionError::UnknownOutcome)
+        ));
+        let inspected = block_on(executor.inspect(operation_id))?;
+        assert_eq!(inspected.lifecycle(), ProcessLifecycle::UnknownOutcome);
+        Ok(())
+    }
+
+    #[test]
+    fn start_rejects_bad_binding_pre_spawn() -> Result<(), Box<dyn std::error::Error>> {
+        let executable = r"C:\Windows\System32\cmd.exe";
+        let working_directory = std::env::temp_dir().to_string_lossy().into_owned();
+        let generation = Generation::new(1)?;
+        let fence = FencingToken::new(1, generation, "fence-t2-s01-bad")?;
+        let mut authority = DispatchPermitAuthority::activate(
+            DispatchAuthorityId::new("auth-t2-s01")?,
+            KernelDispatchKey::from_secret_bytes([0x5a; 32])?,
+        );
+        let executor = WindowsProcessExecutor::new(Arc::new(DummyPort));
+        let tampered_id = OperationId::new("op-t2-s01-bad-sha")?;
+        let tampered_intent = ProcessIntent::new(
+            tampered_id.clone(),
+            ProcessTreeId::new("tree-t2-s01-bad-sha")?,
+            JobId::new("job-t2-s01-bad-sha")?,
+            ImageId::new("image-t2-s01-bad-sha")?,
+            SessionId::new("session-t2-s01-bad-sha")?,
+            generation,
+            executable,
+            "0".repeat(64),
+            vec!["/c".to_owned(), "echo".to_owned(), "hi".to_owned()],
+            working_directory.clone(),
+            EnvironmentProjection::default(),
+            ResourceLimits::new(30_000, Some(10_000), Some(512_000_000), 4_096, 4_096, 4)?,
+        )?;
+        let tampered_permit = authority.issue(
+            &tampered_intent,
+            PermitIssuance::new(
+                ActionLeaseRef::new("lease-t2-s01-bad-sha")?,
+                fence.clone(),
+                revisions(),
+                100,
+                10_000,
+                "nonce-t2-s01-bad-sha",
+            )?,
+        )?;
+        let tampered_request = ProcessRequest::new(tampered_intent, tampered_permit)?;
+        let tampered_sink = Arc::new(RecordingSink::default());
+        let tampered_sink_dyn: Arc<dyn ProcessEvidenceSink> = tampered_sink.clone();
+        let tampered_result = block_on(executor.start(tampered_request, tampered_sink_dyn));
+        assert!(matches!(
+            tampered_result,
+            Err(ProcessExecutionError::Unavailable(_))
+        ));
+        assert!(matches!(
+            block_on(executor.inspect(tampered_id)),
+            Err(ProcessExecutionError::NotFound)
+        ));
+        assert_eq!(tampered_sink.recorded_len(), 0);
+        let secret_id = OperationId::new("op-t2-s01-bad-secret")?;
+        let secret_env = EnvironmentProjection::new(
+            BTreeMap::new(),
+            vec![SecretRef::new("prov-t2-s01", "key-t2-s01")?],
+            EnvironmentInheritance::None,
+        )?;
+        let secret_intent = ProcessIntent::new(
+            secret_id.clone(),
+            ProcessTreeId::new("tree-t2-s01-bad-secret")?,
+            JobId::new("job-t2-s01-bad-secret")?,
+            ImageId::new("image-t2-s01-bad-secret")?,
+            SessionId::new("session-t2-s01-bad-secret")?,
+            generation,
+            executable,
+            "a".repeat(64),
+            vec!["/c".to_owned(), "echo".to_owned(), "hi".to_owned()],
+            working_directory,
+            secret_env,
+            ResourceLimits::new(30_000, Some(10_000), Some(512_000_000), 4_096, 4_096, 4)?,
+        )?;
+        let secret_permit = authority.issue(
+            &secret_intent,
+            PermitIssuance::new(
+                ActionLeaseRef::new("lease-t2-s01-bad-secret")?,
+                fence,
+                revisions(),
+                100,
+                10_000,
+                "nonce-t2-s01-bad-secret",
+            )?,
+        )?;
+        let secret_request = ProcessRequest::new(secret_intent, secret_permit)?;
+        let secret_sink = Arc::new(RecordingSink::default());
+        let secret_sink_dyn: Arc<dyn ProcessEvidenceSink> = secret_sink.clone();
+        let secret_result = block_on(executor.start(secret_request, secret_sink_dyn));
+        assert!(matches!(
+            secret_result,
+            Err(ProcessExecutionError::Unavailable(_))
+        ));
+        assert!(matches!(
+            block_on(executor.inspect(secret_id)),
+            Err(ProcessExecutionError::NotFound)
+        ));
+        assert_eq!(secret_sink.recorded_len(), 0);
+        Ok(())
+    }
 }
