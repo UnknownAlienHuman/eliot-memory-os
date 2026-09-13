@@ -16,6 +16,7 @@ pub mod candidate;
 pub mod classification;
 pub mod concept;
 pub mod curation;
+pub mod curation_invocation;
 pub mod diagnosis;
 pub mod draft;
 pub mod encoding;
@@ -25,6 +26,7 @@ pub mod grounding;
 pub mod job;
 pub mod probe;
 pub mod registry;
+pub mod rejection;
 pub mod relation;
 pub mod rival;
 pub mod screen;
@@ -75,6 +77,10 @@ pub use concept::{
     concept_proposal_digest, seal_concept, validate_concept, validate_concept_acceptance,
 };
 pub use curation::{CURATION_WIRE_KINDS, CurationKind, CurationPayload, kind_family, parse_kind};
+pub use curation_invocation::{
+    BoundCurationCall, FullCurationResult, NativeCurationHandler, ProducedCurationContent, invoke,
+    request_digest_of,
+};
 pub use diagnosis::{
     ACCEPTANCE_BINDING_SCHEMA_VERSION, AcceptanceBinding, CURRENT_DISCRIMINATOR_SCHEMA_VERSION,
     ConfirmationIndependenceClaim, CurrentDiscriminator, CurrentObservation,
@@ -115,6 +121,7 @@ pub use registry::{
     CurationHandlerPort, CurationHandlerRegistry, TargetDenominator, TypedCurationHandlerRequest,
     TypedCurationHandlerResult, family_of, parse_family,
 };
+pub use rejection::CurationRejectionCode;
 pub use relation::{
     RELATION_FAMILIES, RelationAlternative, RelationCandidate, RelationCandidateClosure,
     RelationDirection, RelationDisclosureEvidence, RelationDisposition, RelationEndpoint,
