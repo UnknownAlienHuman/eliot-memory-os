@@ -14,10 +14,12 @@ use eliot_instrument_api::EvidenceAxes;
 use eliot_process::{
     CancellationReceipt, CancellationRequest, ContractError, DescendantEvidence, ExitDisposition,
     ExitStatus, OperationId, PhysicalProcessBinding, ProcessEvidence, ProcessEvidenceSink,
-    ProcessExecutionError, ProcessExecutionView, ProcessExecutor, ProcessHealth,
-    ProcessHealthStatus, ProcessId, ProcessLaunchAdmission, ProcessLifecycle, ProcessRequest,
-    ProcessStartReceipt, ProcessState, SuspendedLaunchEvidence, SuspendedProcessIdentity,
-    ValidatedDispatch,
+    ProcessExecutionBinding, ProcessExecutionError, ProcessExecutionView, ProcessExecutor,
+    ProcessHealth, ProcessHealthStatus, ProcessId, ProcessLaunchAdmission, ProcessLifecycle,
+    ProcessRequest, ProcessStartReceipt, ProcessState, ProcessStreamEvidence, ProcessStreamKind,
+    ProcessStreamPolicyBinding, ProcessStreamPrefixPreview, StreamEvidenceGap,
+    StreamPersistenceStatus, StreamTransportStatus, SuspendedLaunchEvidence,
+    SuspendedProcessIdentity, ValidatedDispatch,
 };
 use sha2::{Digest as _, Sha256};
 use std::collections::BTreeMap;
@@ -36,6 +38,7 @@ use eliot_platform_windows::{
 };
 
 const DEFAULT_CAPTURE_LIMIT: usize = 16 * 1024 * 1024;
+const EVIDENCE_PREVIEW_CEILING: usize = 16 * 1024 * 1024;
 const JOB_TERMINATION_CODE: u32 = 0xE1_04;
 const WATCH_INTERVAL: Duration = Duration::from_millis(25);
 const STREAM_CHUNK_BYTES: usize = 8192;
@@ -82,7 +85,6 @@ pub struct CapturedStream {
     clippy::struct_excessive_bools,
     reason = "requested, captured, truncated, complete, and read_error are independent stream observations"
 )]
-#[derive(Debug)]
 struct StreamCapture {
     requested: bool,
     bytes: Vec<u8>,
@@ -92,6 +94,22 @@ struct StreamCapture {
     complete: bool,
     read_error: bool,
     captured: bool,
+    digest: Sha256,
+}
+
+impl std::fmt::Debug for StreamCapture {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("StreamCapture")
+            .field("requested", &self.requested)
+            .field("bytes", &self.bytes)
+            .field("limit", &self.limit)
+            .field("total_bytes", &self.total_bytes)
+            .field("truncated", &self.truncated)
+            .field("complete", &self.complete)
+            .field("read_error", &self.read_error)
+            .field("captured", &self.captured)
+            .finish_non_exhaustive()
+    }
 }
 
 impl StreamCapture {
@@ -105,6 +123,7 @@ impl StreamCapture {
             complete: false,
             read_error: false,
             captured: false,
+            digest: Sha256::new(),
         }
     }
 
@@ -767,12 +786,32 @@ impl ProcessExecutor for WindowsProcessExecutor {
                 return Err(ProcessExecutionError::UnknownOutcome);
             }
             let view = guard.state.view();
-            let evidence = ProcessEvidence::new(
+            let binding = view.binding().clone();
+            let stdout_typed =
+                match typed_stream_evidence(&guard.stdout, ProcessStreamKind::Stdout, &binding) {
+                    Ok(stream) => stream,
+                    Err(error) => {
+                        quarantine_operation(&mut guard);
+                        return Err(error);
+                    }
+                };
+            let stderr_typed =
+                match typed_stream_evidence(&guard.stderr, ProcessStreamKind::Stderr, &binding) {
+                    Ok(stream) => stream,
+                    Err(error) => {
+                        quarantine_operation(&mut guard);
+                        return Err(error);
+                    }
+                };
+            let Ok(evidence) = ProcessEvidence::new_typed(
                 view,
-                capture_ref(&guard.stdout),
-                capture_ref(&guard.stderr),
+                stdout_typed,
+                stderr_typed,
                 EvidenceAxes::observed(),
-            )?;
+            ) else {
+                quarantine_operation(&mut guard);
+                return Err(ProcessExecutionError::UnknownOutcome);
+            };
             guard.sink.record(evidence.clone())?;
             Ok(evidence)
         }
@@ -1179,6 +1218,7 @@ fn spawn_capture(
                         let Some(mut guard) = capture.lock().ok() else {
                             return;
                         };
+                        guard.digest.update(&buffer[..read]);
                         guard.total_bytes = guard.total_bytes.saturating_add(read as u64);
                         let remaining = guard.limit.saturating_sub(guard.bytes.len());
                         let retained = read.min(remaining);
@@ -1204,17 +1244,74 @@ fn spawn_capture(
 }
 
 #[cfg(windows)]
-fn capture_ref(capture: &Arc<Mutex<StreamCapture>>) -> Option<String> {
-    let guard = capture.lock().ok()?;
-    if !guard.captured {
-        return None;
+fn p04_stream_policy() -> Result<ProcessStreamPolicyBinding, ProcessExecutionError> {
+    // P-04 raw-transport preview-only policy binding. No durable provider is
+    // wired in P-04 and no redaction is applied; parsing stays Raw and
+    // evaluation stays Unassessed via `new_raw_inner`.
+    // - policy_ref `p04:stream-policy:transport-preview-v1`: P-04 offers only a
+    //   bounded raw-transport prefix preview, never a durable complete source.
+    // - privacy_ref `p04:privacy:raw-transport-preview`: raw child bytes are
+    //   shown unredacted in the preview; no privacy transformation is applied.
+    // - visibility_ref `p04:visibility:operation-diagnostic`: the preview is
+    //   visible to the operation owner for diagnostics, not a canonical
+    //   disclosure.
+    // - retention_ref `p04:retention:bounded-prefix-only`: only a bounded
+    //   in-memory prefix is retained; no durable retention is claimed.
+    // - redaction_ref `p04:redaction:none-raw-preview`: no redaction or
+    //   transformation is applied to the preview bytes.
+    ProcessStreamPolicyBinding::new(
+        "p04:stream-policy:transport-preview-v1",
+        "p04:privacy:raw-transport-preview",
+        "p04:visibility:operation-diagnostic",
+        "p04:retention:bounded-prefix-only",
+        "p04:redaction:none-raw-preview",
+    )
+    .map_err(|_| ProcessExecutionError::UnknownOutcome)
+}
+
+#[cfg(windows)]
+fn typed_stream_evidence(
+    capture: &Arc<Mutex<StreamCapture>>,
+    kind: ProcessStreamKind,
+    binding: &ProcessExecutionBinding,
+) -> Result<Option<ProcessStreamEvidence>, ProcessExecutionError> {
+    let (retained, total_bytes, observed_sha256) = {
+        let guard = capture
+            .lock()
+            .map_err(|_| ProcessExecutionError::UnknownOutcome)?;
+        if !guard.requested || !guard.captured {
+            return Ok(None);
+        }
+        if guard.read_error || !guard.complete {
+            return Err(ProcessExecutionError::UnknownOutcome);
+        }
+        let observed_sha256 = format!("{:x}", guard.digest.clone().finalize());
+        (guard.bytes.clone(), guard.total_bytes, observed_sha256)
+    };
+    let mut prefix = retained;
+    if prefix.len() > EVIDENCE_PREVIEW_CEILING {
+        prefix.truncate(EVIDENCE_PREVIEW_CEILING);
     }
-    Some(format!(
-        "raw:p04-stream:sha256:{}:bytes:{}:complete:{}",
-        short_digest(&guard.bytes),
-        guard.total_bytes,
-        guard.complete
-    ))
+    let policy = p04_stream_policy()?;
+    let preview = ProcessStreamPrefixPreview::from_transport_prefix(prefix, total_bytes)
+        .map_err(|_| ProcessExecutionError::UnknownOutcome)?;
+    // No durable provider is wired in P-04; the store backend is T3-owned, so
+    // persistence is always `SourceUnavailable` with exactly the
+    // `PersistenceUnavailable` gap and no source locator.
+    let evidence = ProcessStreamEvidence::new_raw(
+        binding.clone(),
+        kind,
+        policy,
+        StreamTransportStatus::Complete,
+        StreamPersistenceStatus::SourceUnavailable,
+        observed_sha256,
+        total_bytes,
+        preview,
+        None,
+        vec![StreamEvidenceGap::PersistenceUnavailable],
+    )
+    .map_err(|_| ProcessExecutionError::UnknownOutcome)?;
+    Ok(Some(evidence))
 }
 
 fn retention(limit: u64, ceiling: usize) -> usize {
@@ -1377,7 +1474,8 @@ mod tests {
         }
     }
 
-    // Large matrix deferred per START.md s1 — minimal 3-test recipe only.
+    // Large matrix deferred per START.md s1 — focused recipe only
+    // (3 baseline start tests plus 2 T2-S03 reconcile stream tests).
     #[test]
     #[cfg(windows)]
     fn start_publishes_initial_observed_evidence() -> Result<(), Box<dyn std::error::Error>> {
@@ -1622,6 +1720,281 @@ mod tests {
             Err(ProcessExecutionError::NotFound)
         ));
         assert_eq!(secret_sink.recorded_len(), 0);
+        Ok(())
+    }
+
+    #[cfg(windows)]
+    struct CountingFailSink {
+        records: Mutex<usize>,
+    }
+
+    #[cfg(windows)]
+    impl ProcessEvidenceSink for CountingFailSink {
+        fn record(&self, _evidence: ProcessEvidence) -> Result<(), EvidenceSinkError> {
+            let mut guard = self.records.lock().map_err(|_| EvidenceSinkError {
+                message: "counting sink lock poisoned".to_owned(),
+            })?;
+            *guard = guard.saturating_add(1);
+            if *guard == 1 {
+                Ok(())
+            } else {
+                Err(EvidenceSinkError {
+                    message: "injected post-start sink failure".to_owned(),
+                })
+            }
+        }
+    }
+
+    #[cfg(windows)]
+    fn start_and_reconcile(
+        op_tag: &str,
+        argv: Vec<String>,
+        stdout_limit: u64,
+        stderr_limit: u64,
+        sink: Arc<dyn ProcessEvidenceSink>,
+    ) -> Result<ProcessEvidence, Box<dyn std::error::Error>> {
+        let executable = r"C:\Windows\System32\cmd.exe";
+        let digest = super::sha256_file(std::path::Path::new(executable))?;
+        let working_directory = std::env::temp_dir().to_string_lossy().into_owned();
+        let operation_id = OperationId::new(format!("op-t2-s03-{op_tag}"))?;
+        let generation = Generation::new(1)?;
+        let intent = ProcessIntent::new(
+            operation_id.clone(),
+            ProcessTreeId::new(format!("tree-t2-s03-{op_tag}"))?,
+            JobId::new(format!("job-t2-s03-{op_tag}"))?,
+            ImageId::new(format!("image-t2-s03-{op_tag}"))?,
+            SessionId::new(format!("session-t2-s03-{op_tag}"))?,
+            generation,
+            executable,
+            digest,
+            argv,
+            working_directory,
+            EnvironmentProjection::default(),
+            ResourceLimits::new(
+                30_000,
+                Some(10_000),
+                Some(512_000_000),
+                stdout_limit,
+                stderr_limit,
+                4,
+            )?,
+        )?;
+        let fence = FencingToken::new(1, generation, format!("fence-t2-s03-{op_tag}"))?;
+        let mut authority = DispatchPermitAuthority::activate(
+            DispatchAuthorityId::new(format!("auth-t2-s03-{op_tag}"))?,
+            KernelDispatchKey::from_secret_bytes([0x5a; 32])?,
+        );
+        let permit = authority.issue(
+            &intent,
+            PermitIssuance::new(
+                ActionLeaseRef::new(format!("lease-t2-s03-{op_tag}"))?,
+                fence.clone(),
+                revisions(),
+                100,
+                10_000,
+                format!("nonce-t2-s03-{op_tag}"),
+            )?,
+        )?;
+        let request = ProcessRequest::new(intent, permit)?;
+        let context = DispatchValidationContext::new(
+            ClockObservation {
+                valid_time_ms: Some(150),
+                known_time_ms: Some(150),
+                transaction_sequence: None,
+                monotonic_ns: Some(1),
+            },
+            fence,
+            1,
+            revisions(),
+            41,
+        )?;
+        let port = FakePort {
+            authority: Mutex::new(authority),
+            context,
+        };
+        let executor = WindowsProcessExecutor::new(Arc::new(port));
+        let _receipt = block_on(executor.start(request, sink))?;
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        loop {
+            let view = block_on(executor.inspect(operation_id.clone()))?;
+            if view.lifecycle().is_terminal() {
+                break;
+            }
+            if std::time::Instant::now() >= deadline {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::TimedOut,
+                    "timed out waiting for terminal lifecycle",
+                )
+                .into());
+            }
+            std::thread::sleep(std::time::Duration::from_millis(25));
+        }
+        Ok(block_on(executor.reconcile(operation_id.clone()))?)
+    }
+
+    #[cfg(windows)]
+    fn assert_truncated_stream(
+        stream: &eliot_process::ProcessStreamEvidence,
+        expected_retained: u64,
+    ) {
+        use eliot_process::{
+            StreamEvaluationStatus, StreamEvidenceGap, StreamParsingStatus,
+            StreamPersistenceStatus, StreamTransportStatus,
+        };
+        assert_eq!(stream.transport(), StreamTransportStatus::Complete);
+        assert_eq!(
+            stream.persistence(),
+            StreamPersistenceStatus::SourceUnavailable
+        );
+        assert_eq!(stream.gaps().len(), 1);
+        assert_eq!(stream.gaps()[0], StreamEvidenceGap::PersistenceUnavailable);
+        assert!(stream.observed_bytes() > expected_retained);
+        assert!(stream.preview().is_truncated());
+        assert_eq!(stream.preview().retained_bytes(), expected_retained);
+        assert_eq!(
+            stream.preview().retained_bytes(),
+            u64::try_from(stream.preview().bytes().len()).unwrap_or(u64::MAX)
+        );
+        assert_eq!(
+            stream.preview().sha256(),
+            super::short_digest(stream.preview().bytes()).as_str()
+        );
+        assert_eq!(stream.preview().omitted_ranges().len(), 1);
+        assert_eq!(
+            stream.preview().omitted_ranges()[0].start(),
+            expected_retained
+        );
+        assert_eq!(
+            stream.preview().omitted_ranges()[0].end_exclusive(),
+            stream.observed_bytes()
+        );
+        assert_eq!(
+            stream.preview().represented_bytes(),
+            stream.observed_bytes()
+        );
+        assert!(stream.source().is_none());
+        assert_eq!(stream.parsing(), StreamParsingStatus::Raw);
+        assert_eq!(stream.evaluation(), StreamEvaluationStatus::Unassessed);
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn reconcile_reports_typed_bounded_streams_beyond_preview_bound()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let bat_path = std::env::temp_dir().join("eliot-t2-s03-pressure.bat");
+        std::fs::write(
+            &bat_path,
+            "@echo off\r\nfor /L %%i in (1,1,300) do (\r\necho STDOUT-PRESSURE-%%i-0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ\r\necho STDERR-PRESSURE-%%i-0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ 1>&2\r\n)\r\n",
+        )?;
+        let pressure_argv = vec!["/c".to_owned(), bat_path.to_string_lossy().into_owned()];
+        let sink: Arc<dyn ProcessEvidenceSink> = Arc::new(RecordingSink::default());
+        let evidence = start_and_reconcile("pressure", pressure_argv, 4_096, 4_096, sink)?;
+        let Some(stdout) = evidence.stdout() else {
+            panic!("expected typed stdout evidence")
+        };
+        let Some(stderr) = evidence.stderr() else {
+            panic!("expected typed stderr evidence")
+        };
+        assert_truncated_stream(stdout, 4_096);
+        assert_truncated_stream(stderr, 4_096);
+        let small_argv = vec![
+            "/c".to_owned(),
+            "echo".to_owned(),
+            "small-stdout".to_owned(),
+        ];
+        let small_sink: Arc<dyn ProcessEvidenceSink> = Arc::new(RecordingSink::default());
+        let small = start_and_reconcile("pressure-small", small_argv, 4_096, 4_096, small_sink)?;
+        let Some(small_stdout) = small.stdout() else {
+            panic!("expected small typed stdout evidence")
+        };
+        assert!(!small_stdout.preview().is_truncated());
+        assert!(small_stdout.preview().omitted_ranges().is_empty());
+        assert_eq!(
+            small_stdout.preview().sha256(),
+            small_stdout.observed_sha256()
+        );
+        let _ = std::fs::remove_file(&bat_path);
+        Ok(())
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn reconcile_with_failing_sink_reports_no_complete_evidence()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let executable = r"C:\Windows\System32\cmd.exe";
+        let digest = super::sha256_file(std::path::Path::new(executable))?;
+        let working_directory = std::env::temp_dir().to_string_lossy().into_owned();
+        let operation_id = OperationId::new("op-t2-s03-sink-fail")?;
+        let generation = Generation::new(1)?;
+        let intent = ProcessIntent::new(
+            operation_id.clone(),
+            ProcessTreeId::new("tree-t2-s03-sink-fail")?,
+            JobId::new("job-t2-s03-sink-fail")?,
+            ImageId::new("image-t2-s03-sink-fail")?,
+            SessionId::new("session-t2-s03-sink-fail")?,
+            generation,
+            executable,
+            digest,
+            vec!["/c".to_owned(), "echo".to_owned(), "small-ok".to_owned()],
+            working_directory,
+            EnvironmentProjection::default(),
+            ResourceLimits::new(30_000, Some(10_000), Some(512_000_000), 4_096, 4_096, 4)?,
+        )?;
+        let fence = FencingToken::new(1, generation, "fence-t2-s03-sink-fail")?;
+        let mut authority = DispatchPermitAuthority::activate(
+            DispatchAuthorityId::new("auth-t2-s03-sink-fail")?,
+            KernelDispatchKey::from_secret_bytes([0x5a; 32])?,
+        );
+        let permit = authority.issue(
+            &intent,
+            PermitIssuance::new(
+                ActionLeaseRef::new("lease-t2-s03-sink-fail")?,
+                fence.clone(),
+                revisions(),
+                100,
+                10_000,
+                "nonce-t2-s03-sink-fail",
+            )?,
+        )?;
+        let request = ProcessRequest::new(intent, permit)?;
+        let context = DispatchValidationContext::new(
+            ClockObservation {
+                valid_time_ms: Some(150),
+                known_time_ms: Some(150),
+                transaction_sequence: None,
+                monotonic_ns: Some(1),
+            },
+            fence,
+            1,
+            revisions(),
+            41,
+        )?;
+        let port = FakePort {
+            authority: Mutex::new(authority),
+            context,
+        };
+        let executor = WindowsProcessExecutor::new(Arc::new(port));
+        let sink: Arc<dyn ProcessEvidenceSink> = Arc::new(CountingFailSink {
+            records: Mutex::new(0),
+        });
+        let _receipt = block_on(executor.start(request, Arc::clone(&sink)))?;
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        loop {
+            let view = block_on(executor.inspect(operation_id.clone()))?;
+            if view.lifecycle().is_terminal() {
+                break;
+            }
+            if std::time::Instant::now() >= deadline {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::TimedOut,
+                    "timed out waiting for terminal lifecycle",
+                )
+                .into());
+            }
+            std::thread::sleep(std::time::Duration::from_millis(25));
+        }
+        let result = block_on(executor.reconcile(operation_id));
+        assert!(result.is_err());
         Ok(())
     }
 }
