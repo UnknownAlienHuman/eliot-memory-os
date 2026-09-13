@@ -557,3 +557,138 @@ fn decision_evidence_requires_one_disposition_per_candidate() {
         Err(ContextError::DenominatorMismatch)
     );
 }
+
+fn bound_omission() -> (ContextBinding, OmissionRecord, SuppliedOmissionBinding) {
+    let context = binding();
+    let role = ProviderRole {
+        provider: ProviderId::new("provider").expect("provider"),
+        role: SemanticRole::Goal,
+    };
+    let handle = ExpansionHandle {
+        handle_id: id("handle"),
+        atom_id: id("atom"),
+        source_id: id("source"),
+        source_revision: "r1".to_owned(),
+        context: context.clone(),
+        decision: decision(),
+        policy: LossPolicy::NonDroppable,
+        provider_role: role.clone(),
+        handle_digest: "c".repeat(64),
+        expires: None,
+        invalidation: None,
+    };
+    let record = OmissionRecord {
+        atom_id: id("atom"),
+        source_id: id("source"),
+        provider_role: role,
+        decision: decision(),
+        task_revision: TaskRevision::new(1).expect("revision"),
+        reason: OmissionReason::Capacity,
+        competing_constraint: "route capacity".to_owned(),
+        measured_cost: Some(4),
+        allowed_representation: LossPolicy::NonDroppable,
+        expansion: Some(handle.clone()),
+        non_recoverable_reason: None,
+        authorization_requirement: "decision owner".to_owned(),
+        privacy_requirement: "restricted".to_owned(),
+        proof_requirement: "observation".to_owned(),
+        expires: None,
+        invalidation: None,
+        digest: digest(),
+    };
+    let supplied = SuppliedOmissionBinding {
+        atom_id: id("atom"),
+        policy: LossPolicy::NonDroppable,
+        expansion: Some(handle),
+        non_recoverable_reason: None,
+        authorization_requirement: "decision owner".to_owned(),
+        privacy_requirement: "restricted".to_owned(),
+        proof_requirement: "observation".to_owned(),
+        expires: None,
+        invalidation: None,
+    };
+    (context, record, supplied)
+}
+
+#[test]
+fn omission_handle_binding_mismatch_is_rejected() {
+    let (context, record, supplied) = bound_omission();
+    record
+        .validate(&context)
+        .expect("bound expansion handle reopens the omitted unit");
+    supplied
+        .validate(&context)
+        .expect("bound supplied omission conserves the handle");
+
+    let mut wrong_context = record.clone();
+    wrong_context
+        .expansion
+        .as_mut()
+        .expect("expansion handle")
+        .context
+        .decision_id = DecisionId::new("other-decision").expect("decision identity");
+    assert_eq!(
+        wrong_context.validate(&context),
+        Err(ContextError::OmissionHandleInvalid)
+    );
+
+    let mut wrong_decision = record.clone();
+    wrong_decision
+        .expansion
+        .as_mut()
+        .expect("expansion handle")
+        .decision
+        .policy_sha256 = "b".repeat(64);
+    assert_eq!(
+        wrong_decision.validate(&context),
+        Err(ContextError::OmissionHandleInvalid)
+    );
+
+    let mut wrong_atom = record.clone();
+    wrong_atom.expansion.as_mut().expect("expansion handle").atom_id = id("other-atom");
+    assert_eq!(
+        wrong_atom.validate(&context),
+        Err(ContextError::OmissionHandleInvalid)
+    );
+
+    let mut wrong_policy = record.clone();
+    wrong_policy
+        .expansion
+        .as_mut()
+        .expect("expansion handle")
+        .policy = LossPolicy::HandleOnly;
+    assert_eq!(
+        wrong_policy.validate(&context),
+        Err(ContextError::OmissionHandleInvalid)
+    );
+
+    let mut supplied_context = supplied.clone();
+    supplied_context
+        .expansion
+        .as_mut()
+        .expect("expansion handle")
+        .context
+        .decision_id = DecisionId::new("other-decision").expect("decision identity");
+    assert_eq!(
+        supplied_context.validate(&context),
+        Err(ContextError::OmissionHandleInvalid)
+    );
+
+    let mut supplied_atom = supplied.clone();
+    supplied_atom.expansion.as_mut().expect("expansion handle").atom_id = id("other-atom");
+    assert_eq!(
+        supplied_atom.validate(&context),
+        Err(ContextError::OmissionHandleInvalid)
+    );
+
+    let mut supplied_policy = supplied.clone();
+    supplied_policy
+        .expansion
+        .as_mut()
+        .expect("expansion handle")
+        .policy = LossPolicy::HandleOnly;
+    assert_eq!(
+        supplied_policy.validate(&context),
+        Err(ContextError::OmissionHandleInvalid)
+    );
+}
