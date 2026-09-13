@@ -21,6 +21,7 @@ $docCodeConformanceVerifier = Join-Path $PSScriptRoot 'verify-doc-code-conforman
 $codeNavigation = Join-Path $PSScriptRoot 'code_navigation.py'
 $docsClosureAudit = Join-Path $PSScriptRoot 'docs_closure_audit.py'
 $standaloneCrates = Join-Path $PSScriptRoot 'verify-standalone-crates.py'
+$dependencyPolicyVerifier = Join-Path $PSScriptRoot 'verify-dependency-policy.py'
 
 $steps = @(
     [pscustomobject]@{
@@ -78,6 +79,14 @@ $steps = @(
     [pscustomobject]@{
         Name = 'normative-pair'
         Command = { pwsh -NoProfile -File (Join-Path $PSScriptRoot 'verify-normative.ps1') }
+    },
+    [pscustomobject]@{
+        Name = 'dependency-policy-self-test'
+        Command = { python $dependencyPolicyVerifier --self-test }
+    },
+    [pscustomobject]@{
+        Name = 'dependency-policy-offline'
+        Command = { python $dependencyPolicyVerifier --root $repoRoot --profile offline-source }
     },
     [pscustomobject]@{
         Name = 'architecture-boundaries-self-test'

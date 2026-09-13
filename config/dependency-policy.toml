@@ -1,0 +1,313 @@
+schema = "eliot.dependency-policy.v1"
+issue = 1229
+updated_at = "2026-09-13"
+
+[scanner]
+tool = "cargo-deny"
+version = "0.20.2"
+executable = "cargo-deny"
+sha256 = "f7292fab58c706638c999e64c4ba82e5128ae628130ba55e3266a768ee431fbf"
+advisory_owner = "cargo-deny"
+checks = ["advisories", "bans", "licenses", "sources"]
+
+[ecosystems.rust]
+manifest = "Cargo.toml"
+lockfile = "Cargo.lock"
+policy_file = "deny.toml"
+targets = ["x86_64-pc-windows-msvc"]
+features = "all"
+
+[ecosystems.nuget]
+project = "apps/Eliot.Operator/Eliot.Operator.csproj"
+lockfile = "apps/Eliot.Operator/packages.lock.json"
+target_framework = "net10.0-windows10.0.19041"
+
+[ecosystems.python]
+manifest = "scripts/requirements-verification.txt"
+require_hashes = true
+
+[ecosystems.node]
+contract = "integrations/opencode/plugin-bridge-contract.json"
+manifest = "integrations/opencode/opencode.json"
+
+[external_executables.surrealdb]
+name = "surrealdb"
+version = "2.2.1"
+license = "BSL-1.1"
+consumer = "crates/storage/eliot-store-surreal"
+trust_model = "local-loopback-service-only"
+removal_boundary = "pluggable-storage-facade"
+owner = "crates/storage/eliot-store-surreal"
+
+[direct_dependencies.anyhow]
+ecosystem = "rust"
+consumer = "workspace error reporting"
+owner = "workspace"
+reason = "ergonomic context attachments for errors"
+features = []
+public_exposure = "none"
+removal_plan = "standard library Error trait"
+
+[direct_dependencies.base64]
+ecosystem = "rust"
+consumer = "eliot-storage/crypto"
+owner = "crates/storage"
+reason = "standard base64 encode/decode"
+features = []
+public_exposure = "none"
+removal_plan = "standalone encoding helper"
+
+[direct_dependencies.blake3]
+ecosystem = "rust"
+consumer = "eliot-evidence/receipts"
+owner = "crates/foundation/eliot-evidence"
+reason = "cryptographic content addressing and tree hashing"
+features = []
+public_exposure = "digest types only"
+removal_plan = "standard SHA-256 fallback"
+
+[direct_dependencies.clap]
+ecosystem = "rust"
+consumer = "bins/eliot-cli"
+owner = "bins/eliot-cli"
+reason = "command line argument parsing and derive macros"
+features = ["derive", "env"]
+public_exposure = "CLI binary only"
+removal_plan = "manual args parsing"
+
+[direct_dependencies.ed25519-dalek]
+ecosystem = "rust"
+consumer = "eliot-authority"
+owner = "crates/governor/eliot-authority"
+reason = "Ed25519 signature verification"
+features = ["alloc", "fast", "zeroize"]
+public_exposure = "typed signature facade"
+removal_plan = "ring or aws-lc-rs"
+
+[direct_dependencies.futures-util]
+ecosystem = "rust"
+consumer = "eliot-mcp/async"
+owner = "crates/surfaces/eliot-mcp"
+reason = "Sink/Stream utility combinators"
+features = ["sink"]
+public_exposure = "internal async conduits"
+removal_plan = "hand-rolled poll loop"
+
+[direct_dependencies.wasmtime]
+ecosystem = "rust"
+consumer = "eliot-wasm-runtime"
+owner = "crates/modules/eliot-wasm-runtime"
+reason = "sandboxed WebAssembly component execution"
+features = ["component-model", "cranelift", "runtime", "std"]
+public_exposure = "sandboxed execution facade"
+removal_plan = "alternative WASM engine"
+
+[direct_dependencies.wat]
+ecosystem = "rust"
+consumer = "eliot-wasm-runtime tests"
+owner = "crates/modules/eliot-wasm-runtime"
+reason = "WASM text format test fixtures"
+features = []
+public_exposure = "dev/test only"
+removal_plan = "precompiled wasm binaries"
+
+[direct_dependencies.jsonc-parser]
+ecosystem = "rust"
+consumer = "eliot-config"
+owner = "crates/governor/eliot-config"
+reason = "JSON with comments parsing for configuration files"
+features = ["cst", "serde_json"]
+public_exposure = "internal config reader"
+removal_plan = "plain JSON parser"
+
+[direct_dependencies.redb]
+ecosystem = "rust"
+consumer = "eliot-blob/cache"
+owner = "crates/storage/eliot-blob"
+reason = "embedded key-value storage engine"
+features = []
+public_exposure = "internal blob store facade"
+removal_plan = "SurrealDB kv or in-memory"
+
+[direct_dependencies.schemars]
+ecosystem = "rust"
+consumer = "eliot-contracts/json-schema"
+owner = "crates/foundation/eliot-contracts"
+reason = "JSON Schema generation from Rust structs"
+features = ["derive", "uuid1"]
+public_exposure = "schema export endpoint"
+removal_plan = "handwritten schema files"
+
+[direct_dependencies.secrecy]
+ecosystem = "rust"
+consumer = "eliot-security-contracts"
+owner = "crates/foundation/eliot-security-contracts"
+reason = "secret memory zeroization and safe debugging"
+features = ["serde"]
+public_exposure = "Zeroizing wrapper types"
+removal_plan = "zeroize crate directly"
+
+[direct_dependencies.serde]
+ecosystem = "rust"
+consumer = "workspace"
+owner = "workspace"
+reason = "canonical serialization/deserialization framework"
+features = ["derive"]
+public_exposure = "Derive macro for internal and wire types"
+removal_plan = "manual serialization"
+
+[direct_dependencies.serde_json]
+ecosystem = "rust"
+consumer = "workspace"
+owner = "workspace"
+reason = "JSON serialization and dynamic values"
+features = ["float_roundtrip"]
+public_exposure = "Value enum in wire endpoints"
+removal_plan = "alternative JSON parser"
+
+[direct_dependencies.sha2]
+ecosystem = "rust"
+consumer = "eliot-evidence/hash"
+owner = "crates/foundation/eliot-evidence"
+reason = "SHA-256 standard cryptographic hash implementation"
+features = []
+public_exposure = "facade digest types"
+removal_plan = "blake3 or standard provider"
+
+[direct_dependencies.tempfile]
+ecosystem = "rust"
+consumer = "bins/eliot, crates/kernel/eliot-installation, workspace/tools/eliot-live-canary"
+owner = "workspace tests"
+reason = "ephemeral test directory and file provisioning"
+features = []
+public_exposure = "dev/test only"
+removal_plan = "manual temp directory cleanup"
+
+[direct_dependencies.thiserror]
+ecosystem = "rust"
+consumer = "workspace errors"
+owner = "workspace"
+reason = "derive macro for std::error::Error"
+features = []
+public_exposure = "error type definitions"
+removal_plan = "manual Error impl"
+
+[direct_dependencies.time]
+ecosystem = "rust"
+consumer = "workspace timestamps"
+owner = "workspace"
+reason = "UTC and RFC3339 timestamp handling"
+features = ["local-offset", "serde", "serde-well-known"]
+public_exposure = "time formatting utilities"
+removal_plan = "chrono or std::time"
+
+[direct_dependencies.tokio]
+ecosystem = "rust"
+consumer = "workspace async runtime"
+owner = "workspace"
+reason = "async I/O, tasks, process management, signals"
+features = ["fs", "io-util", "macros", "net", "process", "rt-multi-thread", "signal", "sync", "time"]
+public_exposure = "async task handles behind facade"
+removal_plan = "smol or async-std"
+
+[direct_dependencies.tokio-tungstenite]
+ecosystem = "rust"
+consumer = "eliot-store-surreal-adapter"
+owner = "crates/storage/eliot-store-surreal-adapter"
+reason = "WebSocket transport for SurrealDB protocol"
+features = ["connect"]
+public_exposure = "internal store connection only"
+removal_plan = "native HTTP adapter"
+
+[direct_dependencies.toml]
+ecosystem = "rust"
+consumer = "workspace configs"
+owner = "workspace"
+reason = "TOML deserialization for config and workstream files"
+features = []
+public_exposure = "internal config reader"
+removal_plan = "serde-ignored TOML"
+
+[direct_dependencies.tracing]
+ecosystem = "rust"
+consumer = "workspace diagnostics"
+owner = "workspace"
+reason = "structured logging and tracing events"
+features = []
+public_exposure = "macros only"
+removal_plan = "standard log crate"
+
+[direct_dependencies.tracing-subscriber]
+ecosystem = "rust"
+consumer = "bins/eliot-app"
+owner = "bins/eliot-app"
+reason = "formatting and filtering tracing subscribers"
+features = ["env-filter", "fmt"]
+public_exposure = "binary composition root only"
+removal_plan = "custom env logger"
+
+[direct_dependencies.uuid]
+ecosystem = "rust"
+consumer = "workspace identities"
+owner = "workspace"
+reason = "UUID v4/v7 generation and representation"
+features = ["serde", "v4", "v7"]
+public_exposure = "Uuid identifier types"
+removal_plan = "custom 128-bit id"
+
+[direct_dependencies.windows-service]
+ecosystem = "rust"
+consumer = "eliot-app/windows"
+owner = "bins/eliot-app"
+reason = "Windows Service control dispatcher and lifecycle"
+features = []
+public_exposure = "service daemon binary only"
+removal_plan = "direct win32 service API"
+
+[direct_dependencies.windows]
+ecosystem = "rust"
+consumer = "eliot-platform-windows"
+owner = "crates/kernel/eliot-platform-windows"
+reason = "Windows COM, OLE, and TaskScheduler APIs"
+features = ["Win32_System_Com", "Win32_System_Ole", "Win32_System_TaskScheduler", "Win32_System_Variant"]
+public_exposure = "platform facade only"
+removal_plan = "raw win32 FFI"
+
+[direct_dependencies.windows-sys]
+ecosystem = "rust"
+consumer = "eliot-platform-windows/ipc"
+owner = "crates/kernel/eliot-platform-windows"
+reason = "raw Windows system definitions and constants"
+features = ["Win32_Foundation", "Win32_Security", "Win32_Security_Authorization", "Win32_Security_Credentials", "Win32_Storage_FileSystem", "Win32_System_JobObjects", "Win32_System_IO", "Win32_System_Ioctl", "Win32_System_Pipes", "Win32_System_Threading"]
+public_exposure = "internal IPC only"
+removal_plan = "direct FFI bindings"
+
+[direct_dependencies."Microsoft.WindowsAppSDK"]
+ecosystem = "nuget"
+consumer = "apps/Eliot.Operator"
+owner = "apps/Eliot.Operator"
+reason = "Windows App SDK WinUI 3 controls and runtime"
+version = "2.3.1"
+public_exposure = "Operator UI"
+removal_plan = "WPF or Windows Forms"
+
+[direct_dependencies.jsonschema]
+ecosystem = "python"
+consumer = "scripts verification"
+owner = "scripts"
+reason = "JSON Schema validation in test gates"
+version = "4.25.1"
+public_exposure = "scripts only"
+removal_plan = "manual json validation"
+
+[direct_dependencies.pyyaml]
+ecosystem = "python"
+consumer = "scripts verification"
+owner = "scripts"
+reason = "YAML parsing for GitHub workflow and config verification"
+version = "6.0.3"
+public_exposure = "scripts only"
+removal_plan = "custom YAML parser"
+
+# Structured exceptions are package/version/advisory/target/feature scoped, owned, expiring and invalidated by drift.
+exceptions = []

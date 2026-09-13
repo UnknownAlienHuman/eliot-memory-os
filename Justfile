@@ -82,6 +82,15 @@ core-daemon-inventory-self-test:
 core-daemon-inventory:
     python scripts/verify-core-daemon-inventory.py --root .
 
+dependency-policy-self-test:
+    python scripts/verify-dependency-policy.py --self-test
+
+dependency-policy:
+    python scripts/verify-dependency-policy.py --root . --profile offline-source
+
+dependency-policy-advisories:
+    python scripts/verify-dependency-policy.py --root . --profile current-advisories
+
 opencode-plugin:
     Get-Content -Raw integrations/opencode/plugins/eliot.js | node --input-type=module --check
     node --test integrations/opencode/tests/eliot-plugin.test.mjs
