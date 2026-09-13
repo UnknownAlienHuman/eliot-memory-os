@@ -1607,6 +1607,284 @@ function Complete-IntegrationHarnessRun {
     return $next
 }
 
+function Resolve-HarnessInventoryFile {
+    [CmdletBinding()]
+    [OutputType([psobject])]
+    param(
+        [Parameter(Mandatory)]
+        [AllowEmptyString()]
+        [string]$InventoryPath
+    )
+    if ([string]::IsNullOrWhiteSpace($InventoryPath)) {
+        throw [System.ArgumentException]::new('HARNESS-INVALID-INVENTORY: inventory path is empty.')
+    }
+    $resolved = $null
+    try {
+        $resolved = [System.IO.Path]::GetFullPath($InventoryPath)
+    }
+    catch {
+        throw [System.ArgumentException]::new('HARNESS-INVALID-INVENTORY: inventory path is not usable.')
+    }
+    if ((Test-Path -LiteralPath $resolved -PathType Container)) {
+        throw [System.ArgumentException]::new("HARNESS-INVALID-INVENTORY: inventory path names a directory: $resolved")
+    }
+    if (-not (Test-Path -LiteralPath $resolved -PathType Leaf)) {
+        throw [System.IO.FileNotFoundException]::new("HARNESS-MISSING-INVENTORY: inventory file is absent: $resolved")
+    }
+    $text = $null
+    try {
+        $text = [System.IO.File]::ReadAllText($resolved)
+    }
+    catch {
+        throw [System.IO.IOException]::new("HARNESS-INVALID-INVENTORY: inventory file is not readable: $resolved")
+    }
+    $parsed = $null
+    try {
+        $parsed = $text | ConvertFrom-Json -ErrorAction Stop
+    }
+    catch {
+        throw [System.ArgumentException]::new("HARNESS-INVALID-INVENTORY: inventory file is not well-formed JSON: $resolved")
+    }
+    if ($null -eq $parsed -or $null -eq $parsed.PSObject.Properties['rows']) {
+        throw [System.ArgumentException]::new("HARNESS-INCOMPLETE-INVENTORY: inventory has no rows: $resolved")
+    }
+    $rows = @($parsed.rows)
+    if ($rows.Count -eq 0) {
+        throw [System.ArgumentException]::new("HARNESS-INCOMPLETE-INVENTORY: inventory denominator is empty: $resolved")
+    }
+    return $parsed
+}
+
+function Invoke-HarnessValidateConfiguration {
+    [CmdletBinding()]
+    [OutputType([hashtable])]
+    param(
+        [Parameter()]
+        [AllowEmptyString()]
+        [string]$InventoryPath,
+        [Parameter()]
+        [ValidateRange(1, 7200)]
+        [int]$TimeoutSeconds = 3600
+    )
+    if ($PSBoundParameters.ContainsKey('InventoryPath')) {
+        $parsed = Resolve-HarnessInventoryFile -InventoryPath $InventoryPath
+        $rows = @($parsed.rows)
+        $resolved = [System.IO.Path]::GetFullPath($InventoryPath)
+        return @{
+            status         = 'Valid'
+            inventory      = $resolved
+            rowCount       = $rows.Count
+            timeoutSeconds = $TimeoutSeconds
+            coreVersion    = (Get-IntegrationHarnessCoreVersion)
+            proofCeiling   = 'INTEGRATION-HARNESS-CORE-STATE-MACHINE-ONLY'
+        }
+    }
+    return @{
+        status         = 'Valid'
+        inventory      = 'default'
+        timeoutSeconds = $TimeoutSeconds
+        coreVersion    = (Get-IntegrationHarnessCoreVersion)
+        proofCeiling   = 'INTEGRATION-HARNESS-CORE-STATE-MACHINE-ONLY'
+    }
+}
+
+function Invoke-HarnessWhatIf {
+    [CmdletBinding()]
+    [OutputType([hashtable])]
+    param(
+        [Parameter()]
+        [AllowEmptyCollection()]
+        [string[]]$SelectedTestId = @(),
+        [Parameter()]
+        [switch]$SelectAllRows,
+        [Parameter()]
+        [AllowEmptyString()]
+        [string]$InventoryPath,
+        [Parameter()]
+        [ValidateRange(1, 7200)]
+        [int]$TimeoutSeconds = 3600
+    )
+    $explicit = @()
+    if ($PSBoundParameters.ContainsKey('SelectedTestId') -and $null -ne $SelectedTestId) {
+        $explicit = @($SelectedTestId)
+    }
+    $wantAll = [bool]$SelectAllRows
+    if ($wantAll -and $explicit.Count -gt 0) {
+        throw [System.ArgumentException]::new('HARNESS-CONTRADICTORY-SELECTION: SelectAllRows and SelectedTestId are mutually exclusive.')
+    }
+    if (-not $wantAll -and $explicit.Count -eq 0) {
+        throw [System.ArgumentException]::new('HARNESS-EMPTY-SELECTION: an empty selection is never success.')
+    }
+    foreach ($id in $explicit) {
+        if ([string]::IsNullOrWhiteSpace([string]$id)) {
+            throw [System.ArgumentException]::new('HARNESS-INVALID-SELECTION: selected identity is empty.')
+        }
+        $s = [string]$id
+        if ($s -eq '*' -or $s -eq 'all' -or $s.Contains('*')) {
+            throw [System.ArgumentException]::new('HARNESS-WILDCARD-SELECTION: implicit wildcard selection is forbidden.')
+        }
+    }
+    $unique = @($explicit | Sort-Object -Culture '' -CaseSensitive -Unique)
+    if ($unique.Count -ne $explicit.Count) {
+        throw [System.ArgumentException]::new('HARNESS-DUPLICATE-SELECTION: duplicate selected identity.')
+    }
+    $hasInventory = $PSBoundParameters.ContainsKey('InventoryPath') -and -not [string]::IsNullOrWhiteSpace($InventoryPath)
+    if ($PSBoundParameters.ContainsKey('InventoryPath') -and -not $hasInventory) {
+        [void](Resolve-HarnessInventoryFile -InventoryPath $InventoryPath)
+    }
+    if ($wantAll) {
+        if (-not $hasInventory) {
+            throw [System.IO.FileNotFoundException]::new('HARNESS-MISSING-INVENTORY: SelectAllRows requires a finite inventory file.')
+        }
+        $parsed = Resolve-HarnessInventoryFile -InventoryPath $InventoryPath
+        $rows = @($parsed.rows)
+        $resolved = [System.IO.Path]::GetFullPath($InventoryPath)
+        return @{
+            status         = 'Planned'
+            inventory      = $resolved
+            selectionCount = $rows.Count
+            timeoutSeconds = $TimeoutSeconds
+            coreVersion    = (Get-IntegrationHarnessCoreVersion)
+            proofCeiling   = 'INTEGRATION-HARNESS-CORE-STATE-MACHINE-ONLY'
+        }
+    }
+    if ($hasInventory) {
+        $parsed = Resolve-HarnessInventoryFile -InventoryPath $InventoryPath
+        $resolved = [System.IO.Path]::GetFullPath($InventoryPath)
+        $byIdentity = @{}
+        foreach ($row in @($parsed.rows)) {
+            $h = @{}
+            foreach ($prop in $row.PSObject.Properties) {
+                $h[[string]$prop.Name] = $prop.Value
+            }
+            try {
+                $cmd = Get-Command -Name 'Test-IntegrationHarnessInventoryRow' -ErrorAction SilentlyContinue
+                if ($null -ne $cmd) {
+                    [void](Test-IntegrationHarnessInventoryRow -Row $h)
+                }
+            }
+            catch {
+                throw [System.ArgumentException]::new("HARNESS-INCOMPLETE-INVENTORY: inventory row is not accepted: $($_.Exception.Message)")
+            }
+            $identity = ('{0}::{1}::{2}::{3}' -f $h['packageId'], $h['targetKind'], $h['targetName'], $h['testName'])
+            if (-not $byIdentity.ContainsKey($identity)) {
+                $byIdentity[$identity] = $h
+            }
+        }
+        foreach ($id in $explicit) {
+            if (-not $byIdentity.ContainsKey([string]$id)) {
+                throw [System.ArgumentException]::new("HARNESS-UNKNOWN-TEST: selected identity is not in inventory: '$id'.")
+            }
+        }
+        $sorted = @($explicit | Sort-Object -Culture '' -CaseSensitive)
+        return @{
+            status         = 'Planned'
+            inventory      = $resolved
+            selection      = @($sorted)
+            selectionCount = $sorted.Count
+            timeoutSeconds = $TimeoutSeconds
+            coreVersion    = (Get-IntegrationHarnessCoreVersion)
+            proofCeiling   = 'INTEGRATION-HARNESS-CORE-STATE-MACHINE-ONLY'
+        }
+    }
+    $sorted = @($explicit | Sort-Object -Culture '' -CaseSensitive)
+    return @{
+        status         = 'Planned'
+        inventory      = 'default'
+        selection      = @($sorted)
+        selectionCount = $sorted.Count
+        timeoutSeconds = $TimeoutSeconds
+        coreVersion    = (Get-IntegrationHarnessCoreVersion)
+        proofCeiling   = 'INTEGRATION-HARNESS-CORE-STATE-MACHINE-ONLY'
+    }
+}
+
+function Invoke-HarnessRun {
+    [CmdletBinding()]
+    [OutputType([hashtable])]
+    param(
+        [Parameter()]
+        [AllowEmptyCollection()]
+        [string[]]$SelectedTestId = @(),
+        [Parameter()]
+        [switch]$SelectAllRows,
+        [Parameter()]
+        [AllowEmptyString()]
+        [string]$InventoryPath,
+        [Parameter()]
+        [ValidateRange(1, 7200)]
+        [int]$TimeoutSeconds = 3600,
+        [Parameter()]
+        [string]$RunId,
+        [Parameter()]
+        [string]$CandidateRoot,
+        [Parameter()]
+        [ValidateSet('none', 'success', 'failure', 'retained_handle')]
+        [string]$HarnessProbe = 'none',
+        [Parameter()]
+        [switch]$InjectFailureAfterSecretSetup,
+        [Parameter()]
+        [string]$EvidenceLogPath,
+        [Parameter()]
+        [string]$ResultArtifactPath
+    )
+    $explicit = @()
+    if ($PSBoundParameters.ContainsKey('SelectedTestId') -and $null -ne $SelectedTestId) {
+        $explicit = @($SelectedTestId)
+    }
+    $wantAll = [bool]$SelectAllRows
+    if ($wantAll -and $explicit.Count -gt 0) {
+        throw [System.ArgumentException]::new('HARNESS-CONTRADICTORY-SELECTION: SelectAllRows and SelectedTestId are mutually exclusive.')
+    }
+    if (-not $wantAll -and $explicit.Count -eq 0) {
+        throw [System.ArgumentException]::new('HARNESS-EMPTY-SELECTION: an empty selection is never success.')
+    }
+    foreach ($id in $explicit) {
+        if ([string]::IsNullOrWhiteSpace([string]$id)) {
+            throw [System.ArgumentException]::new('HARNESS-INVALID-SELECTION: selected identity is empty.')
+        }
+        $s = [string]$id
+        if ($s -eq '*' -or $s -eq 'all' -or $s.Contains('*')) {
+            throw [System.ArgumentException]::new('HARNESS-WILDCARD-SELECTION: implicit wildcard selection is forbidden.')
+        }
+    }
+    $unique = @($explicit | Sort-Object -Culture '' -CaseSensitive -Unique)
+    if ($unique.Count -ne $explicit.Count) {
+        throw [System.ArgumentException]::new('HARNESS-DUPLICATE-SELECTION: duplicate selected identity.')
+    }
+    $hasInventory = $PSBoundParameters.ContainsKey('InventoryPath') -and -not [string]::IsNullOrWhiteSpace($InventoryPath)
+    if ($PSBoundParameters.ContainsKey('InventoryPath') -and -not $hasInventory) {
+        [void](Resolve-HarnessInventoryFile -InventoryPath $InventoryPath)
+    }
+    if ($wantAll -and -not $hasInventory) {
+        throw [System.IO.FileNotFoundException]::new('HARNESS-MISSING-INVENTORY: SelectAllRows requires a finite inventory file.')
+    }
+    if ($hasInventory) {
+        $parsed = Resolve-HarnessInventoryFile -InventoryPath $InventoryPath
+        $byIdentity = @{}
+        foreach ($row in @($parsed.rows)) {
+            $h = @{}
+            foreach ($prop in $row.PSObject.Properties) {
+                $h[[string]$prop.Name] = $prop.Value
+            }
+            $identity = ('{0}::{1}::{2}::{3}' -f $h['packageId'], $h['targetKind'], $h['targetName'], $h['testName'])
+            if (-not $byIdentity.ContainsKey($identity)) {
+                $byIdentity[$identity] = $h
+            }
+        }
+        foreach ($id in $explicit) {
+            if (-not $byIdentity.ContainsKey([string]$id)) {
+                throw [System.ArgumentException]::new("HARNESS-UNKNOWN-TEST: selected identity is not in inventory: '$id'.")
+            }
+        }
+        throw [System.InvalidOperationException]::new('HARNESS-PROOF-CEILING: Run execution requires concrete providers outside INTEGRATION-HARNESS-CORE-STATE-MACHINE-ONLY.')
+    }
+    if ($explicit.Count -gt 0) {
+        throw [System.ArgumentException]::new("HARNESS-UNKNOWN-TEST: selected identity is not in inventory: '$($explicit[0])'.")
+    }
+    throw [System.IO.FileNotFoundException]::new('HARNESS-MISSING-INVENTORY: Run requires a finite inventory file.')
+}
+
 Export-ModuleMember -Function @(
     'Get-IntegrationHarnessCoreVersion',
     'Get-IntegrationHarnessModelAvailability',
@@ -1633,5 +1911,8 @@ Export-ModuleMember -Function @(
     'Stop-IntegrationHarnessOwnedProcessTree',
     'Remove-IntegrationHarnessOwnedRoot',
     'Reset-IntegrationHarnessForTest',
-    'Complete-IntegrationHarnessRun'
+    'Complete-IntegrationHarnessRun',
+    'Invoke-HarnessValidateConfiguration',
+    'Invoke-HarnessWhatIf',
+    'Invoke-HarnessRun'
 )

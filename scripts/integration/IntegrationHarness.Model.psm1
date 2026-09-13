@@ -930,6 +930,58 @@ function Test-IntegrationHarnessRunEvidence {
     return $true
 }
 
+function Get-IntegrationHarnessFileDigest {
+    [CmdletBinding()]
+    [OutputType([string])]
+    param(
+        [Parameter(Mandatory)]
+        [string]$Path
+    )
+    if ([string]::IsNullOrWhiteSpace($Path)) {
+        throw [System.ArgumentException]::new('HARNESS-INVALID-PATH: path is empty.')
+    }
+    $resolved = $null
+    try {
+        $resolved = [System.IO.Path]::GetFullPath($Path)
+    }
+    catch {
+        throw [System.ArgumentException]::new('HARNESS-INVALID-PATH: path is not usable.')
+    }
+    if (-not (Test-Path -LiteralPath $resolved -PathType Leaf)) {
+        throw [System.IO.FileNotFoundException]::new("HARNESS-MISSING-FILE: file is absent: $resolved")
+    }
+    $info = Get-Item -LiteralPath $resolved -Force -ErrorAction Stop
+    if ($info.Length -gt 1048576) {
+        throw [System.ArgumentException]::new("HARNESS-BYTE-BOUND: file exceeds byte bound: $resolved")
+    }
+    $bytes = [System.IO.File]::ReadAllBytes($resolved)
+    $hasher = [System.Security.Cryptography.SHA256]::Create()
+    try {
+        $digest = $hasher.ComputeHash($bytes)
+    }
+    finally {
+        $hasher.Dispose()
+    }
+    return (($digest | ForEach-Object { $_.ToString('x2') }) -join '')
+}
+
+function Test-IntegrationHarnessPrebuiltReceipt {
+    [CmdletBinding()]
+    [OutputType([bool])]
+    param(
+        [Parameter(Mandatory)]
+        [hashtable]$Receipt
+    )
+    foreach ($field in @('testIdentity', 'binaryDigest', 'discoveryDigest')) {
+        if (-not $Receipt.ContainsKey($field) -or [string]::IsNullOrWhiteSpace([string]$Receipt[$field])) {
+            throw [System.ArgumentException]::new("HARNESS-INVALID-RECEIPT: receipt is missing '$field'.")
+        }
+    }
+    [void](Test-IntegrationHarnessDigestFormat -Digest ([string]$Receipt['binaryDigest']))
+    [void](Test-IntegrationHarnessDigestFormat -Digest ([string]$Receipt['discoveryDigest']))
+    return $true
+}
+
 Export-ModuleMember -Function @(
     'Get-IntegrationHarnessModelVersion',
     'Get-IntegrationHarnessProviderInterfaceVersion',
@@ -959,5 +1011,7 @@ Export-ModuleMember -Function @(
     'Test-IntegrationHarnessArithmetic',
     'Test-IntegrationHarnessProviderResult',
     'Test-IntegrationHarnessTerminalEvidenceSet',
-    'Test-IntegrationHarnessRunEvidence'
+    'Test-IntegrationHarnessRunEvidence',
+    'Get-IntegrationHarnessFileDigest',
+    'Test-IntegrationHarnessPrebuiltReceipt'
 )
