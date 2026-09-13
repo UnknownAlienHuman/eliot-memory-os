@@ -2934,6 +2934,273 @@ fn resumed_tree_termination_is_consuming_and_reaps_every_member() {
 }
 
 #[cfg(windows)]
+fn remapped_job_binding(
+    original: &RecoverableJobBinding,
+    edit: impl FnOnce(&mut serde_json::Value),
+) -> RecoverableJobBinding {
+    let mut value = serde_json::to_value(original).unwrap_or_else(|_| unreachable!());
+    edit(&mut value);
+    serde_json::from_value(value).unwrap_or_else(|_| unreachable!())
+}
+
+#[cfg(windows)]
+#[test]
+fn process_job_exact_tree_kill_in_place_reports_complete_history() {
+    let _spawn_guard = process_job_spawn_test_guard();
+    let root = std::env::temp_dir().join(format!("eliot-p02-exact-tree-{}", unique_suffix()));
+    std::fs::create_dir(&root).unwrap_or_else(|_| unreachable!());
+    let marker = root.join("started");
+    let child = spawn_suspended_child(&marker, &root, true);
+    let root_pid = child.id();
+    let mut running = child
+        .validate::<(), &'static str, _>(|_| Ok(()))
+        .unwrap_or_else(|_| unreachable!())
+        .resume()
+        .unwrap_or_else(|_| unreachable!());
+    wait_for_marker(&marker);
+    let mut members = Vec::new();
+    for _ in 0..100 {
+        if running
+            .job_processes()
+            .is_ok_and(|processes| processes.len() >= 2)
+        {
+            members = running
+                .job_processes()
+                .unwrap_or_else(|_| unreachable!())
+                .into_iter()
+                .map(|process| process.process_id)
+                .collect::<Vec<_>>();
+            if members.len() >= 2 {
+                break;
+            }
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    assert!(
+        members.len() >= 2,
+        "exact tree must contain root and descendant before kill, observed {}",
+        members.len()
+    );
+    assert!(members.contains(&root_pid));
+    assert!(matches!(
+        running.observe().unwrap_or_else(|_| unreachable!()),
+        RunningJobObservation::Running { active_processes } if active_processes >= 2
+    ));
+    let terminal = running
+        .terminate_in_place(0xE1_40)
+        .unwrap_or_else(|error| panic!("exact tree termination failed: {error}"));
+    assert_eq!(terminal.requested_exit_code(), 0xE1_40);
+    assert!(terminal.job_empty());
+    assert!(terminal.root_reaped());
+    let history = terminal.history();
+    assert!(
+        history.job_empty(),
+        "terminal history must observe an empty Job"
+    );
+    assert!(
+        history.complete(),
+        "exact tree kill must produce a complete history"
+    );
+    assert_eq!(history.capture_gap(), None);
+    assert!(
+        history.processes().len() >= 2,
+        "terminal history must retain every owned member"
+    );
+    for pid in &members {
+        assert!(
+            history
+                .processes()
+                .iter()
+                .any(|observed| observed.process().process_id == *pid),
+            "terminal history must account for owned member {pid}"
+        );
+    }
+    assert_eq!(
+        running.observe().unwrap_or_else(|_| unreachable!()),
+        RunningJobObservation::Exited {
+            exit_code: 0xE1_40_u32 as i32
+        }
+    );
+    assert_eq!(
+        running
+            .active_process_count()
+            .unwrap_or_else(|_| unreachable!()),
+        0
+    );
+    assert!(members.into_iter().all(wait_for_process_gone));
+    assert!(wait_for_process_gone(root_pid));
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[cfg(windows)]
+#[test]
+fn process_job_recoverable_open_rejects_substituted_root_identity() {
+    let _spawn_guard = process_job_spawn_test_guard();
+    let root = std::env::temp_dir().join(format!("eliot-p02-adopt-negative-{}", unique_suffix()));
+    std::fs::create_dir(&root).unwrap_or_else(|_| unreachable!());
+    let marker = root.join("started");
+    let child = spawn_suspended_child(&marker, &root, false);
+    let running = child
+        .validate::<(), &'static str, _>(|_| Ok(()))
+        .unwrap_or_else(|_| unreachable!())
+        .resume()
+        .unwrap_or_else(|_| unreachable!());
+    wait_for_marker(&marker);
+    let binding = running.evidence().recoverable_job_binding().clone();
+    let live_pid = binding.root().process().process_id;
+    let live_start = binding.root().process().start_time_100ns;
+    // The exact live binding reopens while the owner is alive; the handle is
+    // retained so every rejection below proves a root mismatch, not absence.
+    let _live = RecoverableJobObject::open(binding.clone())
+        .unwrap_or_else(|error| panic!("live binding must reopen: {error}"));
+    // Same PID with a different start time models PID reuse: the Job must not
+    // adopt the new generation.
+    let reused_pid = remapped_job_binding(&binding, |value| {
+        value["root"]["process"]["start_time_100ns"] =
+            serde_json::json!(live_start.saturating_add(1));
+    });
+    assert!(matches!(
+        RecoverableJobObject::open(reused_pid),
+        Err(WindowsAdapterError::IdentityMismatch)
+    ));
+    // A different PID with the original start/image models a foreign process:
+    // it is never adopted.
+    let foreign_pid = remapped_job_binding(&binding, |value| {
+        value["root"]["process"]["process_id"] = serde_json::json!(live_pid.wrapping_add(1));
+    });
+    assert!(matches!(
+        RecoverableJobObject::open(foreign_pid),
+        Err(WindowsAdapterError::IdentityMismatch)
+    ));
+    // The same PID/start with a substituted image is never adopted either.
+    let live_image = binding.root().process().image_path.clone();
+    let substituted_image = remapped_job_binding(&binding, |value| {
+        value["root"]["process"]["image_path"] =
+            serde_json::json!(format!("{live_image}.substituted"));
+    });
+    assert!(matches!(
+        RecoverableJobObject::open(substituted_image),
+        Err(WindowsAdapterError::IdentityMismatch)
+    ));
+    running
+        .terminate(0xE1_41)
+        .unwrap_or_else(|_| unreachable!());
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[cfg(windows)]
+#[test]
+fn process_job_foreign_job_and_stale_root_never_adopted() {
+    let _spawn_guard = process_job_spawn_test_guard();
+    let root = std::env::temp_dir().join(format!("eliot-p02-foreign-job-{}", unique_suffix()));
+    std::fs::create_dir(&root).unwrap_or_else(|_| unreachable!());
+    let first_marker = root.join("first");
+    let second_marker = root.join("second");
+    let first = spawn_suspended_child(&first_marker, &root, false);
+    let mut first_running = first
+        .validate::<(), &'static str, _>(|_| Ok(()))
+        .unwrap_or_else(|_| unreachable!())
+        .resume()
+        .unwrap_or_else(|_| unreachable!());
+    wait_for_marker(&first_marker);
+    let first_binding = first_running.evidence().recoverable_job_binding().clone();
+    let second = spawn_suspended_child(&second_marker, &root, false);
+    let second_running = second
+        .validate::<(), &'static str, _>(|_| Ok(()))
+        .unwrap_or_else(|_| unreachable!())
+        .resume()
+        .unwrap_or_else(|_| unreachable!());
+    wait_for_marker(&second_marker);
+    let second_binding = second_running.evidence().recoverable_job_binding().clone();
+    let _first_live = RecoverableJobObject::open(first_binding.clone())
+        .unwrap_or_else(|error| panic!("first binding must reopen: {error}"));
+    let _second_live = RecoverableJobObject::open(second_binding.clone())
+        .unwrap_or_else(|error| panic!("second binding must reopen: {error}"));
+    // A live foreign Job never adopts another Job's root.
+    let foreign = remapped_job_binding(&first_binding, |value| {
+        value["job"]["name"] = serde_json::json!(second_binding.job_identity().name());
+    });
+    assert!(matches!(
+        RecoverableJobObject::open(foreign),
+        Err(WindowsAdapterError::IdentityMismatch)
+    ));
+    // After the exact tree is terminated the retained binding admits neither
+    // reopen nor new members.
+    let first_pid = first_binding.root().process().process_id;
+    let recovered = RecoverableJobObject::open(first_binding.clone())
+        .unwrap_or_else(|error| panic!("pre-termination reopen failed: {error}"));
+    first_running
+        .terminate_in_place(0xE1_42)
+        .unwrap_or_else(|error| panic!("first tree termination failed: {error}"));
+    assert!(wait_for_process_gone(first_pid));
+    assert!(matches!(
+        RecoverableJobObject::open(first_binding),
+        Err(WindowsAdapterError::IdentityMismatch)
+    ));
+    assert!(matches!(
+        recovered.spawn_member(suspended_spec(&root.join("stale-member"), &root, false)),
+        Err(WindowsAdapterError::IdentityMismatch)
+    ));
+    let second_pid = second_binding.root().process().process_id;
+    second_running
+        .terminate(0xE1_43)
+        .unwrap_or_else(|_| unreachable!());
+    assert!(wait_for_process_gone(second_pid));
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[cfg(windows)]
+#[test]
+fn process_job_owner_drop_kills_exact_tree_and_removes_reopen_path() {
+    let _spawn_guard = process_job_spawn_test_guard();
+    let root = std::env::temp_dir().join(format!("eliot-p02-owner-loss-{}", unique_suffix()));
+    std::fs::create_dir(&root).unwrap_or_else(|_| unreachable!());
+    let marker = root.join("started");
+    let child = spawn_suspended_child(&marker, &root, true);
+    let root_pid = child.id();
+    let running = child
+        .validate::<(), &'static str, _>(|_| Ok(()))
+        .unwrap_or_else(|_| unreachable!())
+        .resume()
+        .unwrap_or_else(|_| unreachable!());
+    wait_for_marker(&marker);
+    let mut members = Vec::new();
+    for _ in 0..100 {
+        if running
+            .job_processes()
+            .is_ok_and(|processes| processes.len() >= 2)
+        {
+            members = running
+                .job_processes()
+                .unwrap_or_else(|_| unreachable!())
+                .into_iter()
+                .map(|process| process.process_id)
+                .collect::<Vec<_>>();
+            if members.len() >= 2 {
+                break;
+            }
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    assert!(
+        members.len() >= 2,
+        "owner-loss contour must include the descendant, observed {}",
+        members.len()
+    );
+    let binding = running.evidence().recoverable_job_binding().clone();
+    // Dropping the sole kill-on-close owner is the owner-loss boundary: the OS
+    // terminates every descendant and destroys the named Job.
+    drop(running);
+    assert!(members.into_iter().all(wait_for_process_gone));
+    assert!(wait_for_process_gone(root_pid));
+    assert!(matches!(
+        RecoverableJobObject::open(binding),
+        Err(WindowsAdapterError::NotFound)
+    ));
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[cfg(windows)]
 #[test]
 fn windows_argument_quoting_covers_quotes_and_trailing_backslashes() {
     use std::os::windows::ffi::OsStringExt;

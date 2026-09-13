@@ -734,20 +734,37 @@ impl ProcessExecutor for WindowsProcessExecutor {
                 .lock()
                 .map_err(|_| unavailable("operation lock poisoned"))?;
             let binding = guard.state.view().binding().clone();
-            let receipt = match guard.state.cancel(&CancellationRequest::new(binding)) {
-                Ok(receipt) => receipt,
-                Err(error) => {
-                    quarantine_operation(&mut guard);
-                    return Err(error.into());
-                }
-            };
+            if let Err(error) = guard
+                .state
+                .cancel(&CancellationRequest::new(binding.clone()))
+            {
+                quarantine_operation(&mut guard);
+                return Err(error.into());
+            }
             if guard.state.view().lifecycle() == ProcessLifecycle::Cancelling
                 && let Err(error) = finalize_operation(&mut guard, ExitDisposition::Cancelled, true)
             {
                 quarantine_operation(&mut guard);
                 return Err(error);
             }
-            Ok(receipt)
+            // Re-read the receipt after the finalize path so the returned
+            // descendants prove the post-finalize tree state instead of the
+            // pre-finalize gap. Terminal states re-report the stored closure
+            // evidence through the existing cancel projection; an
+            // UnknownOutcome landing surfaces the typed unknown outcome while
+            // the operation stays retained for reconcile/shutdown.
+            // `CancellationReceipt` carries no cleanup-required field, so the
+            // typed error is the only honest carrier for unproven closure.
+            match guard.state.cancel(&CancellationRequest::new(binding)) {
+                Ok(receipt) => Ok(receipt),
+                Err(error) => {
+                    quarantine_operation(&mut guard);
+                    if guard.state.view().lifecycle() == ProcessLifecycle::UnknownOutcome {
+                        return Err(ProcessExecutionError::UnknownOutcome);
+                    }
+                    Err(error.into())
+                }
+            }
         }
         #[cfg(not(windows))]
         {
@@ -1370,7 +1387,9 @@ mod tests {
     #[cfg(windows)]
     use eliot_platform::ClockObservation;
     #[cfg(windows)]
-    use eliot_process::{DispatchValidationContext, ProcessLifecycle};
+    use eliot_process::{
+        CancellationStatus, DispatchValidationContext, ExitDisposition, ProcessLifecycle,
+    };
 
     fn block_on<F: Future>(future: F) -> F::Output {
         let mut future = std::pin::pin!(future);
@@ -1995,6 +2014,271 @@ mod tests {
         }
         let result = block_on(executor.reconcile(operation_id));
         assert!(result.is_err());
+        Ok(())
+    }
+
+    #[cfg(windows)]
+    fn s04_authorized_request(
+        op_tag: &str,
+        argv: Vec<String>,
+        stdout_limit: u64,
+        stderr_limit: u64,
+        max_descendants: u32,
+    ) -> Result<(ProcessRequest, DispatchPermitAuthority, FencingToken), Box<dyn std::error::Error>>
+    {
+        let executable = r"C:\Windows\System32\cmd.exe";
+        let digest = super::sha256_file(std::path::Path::new(executable))?;
+        let working_directory = std::env::temp_dir().to_string_lossy().into_owned();
+        let operation_id = OperationId::new(format!("op-t2-s04-{op_tag}"))?;
+        let generation = Generation::new(1)?;
+        let intent = ProcessIntent::new(
+            operation_id,
+            ProcessTreeId::new(format!("tree-t2-s04-{op_tag}"))?,
+            JobId::new(format!("job-t2-s04-{op_tag}"))?,
+            ImageId::new(format!("image-t2-s04-{op_tag}"))?,
+            SessionId::new(format!("session-t2-s04-{op_tag}"))?,
+            generation,
+            executable,
+            digest,
+            argv,
+            working_directory,
+            EnvironmentProjection::default(),
+            ResourceLimits::new(
+                30_000,
+                Some(10_000),
+                Some(512_000_000),
+                stdout_limit,
+                stderr_limit,
+                max_descendants,
+            )?,
+        )?;
+        let fence = FencingToken::new(1, generation, format!("fence-t2-s04-{op_tag}"))?;
+        let mut authority = DispatchPermitAuthority::activate(
+            DispatchAuthorityId::new(format!("auth-t2-s04-{op_tag}"))?,
+            KernelDispatchKey::from_secret_bytes([0x5a; 32])?,
+        );
+        let permit = authority.issue(
+            &intent,
+            PermitIssuance::new(
+                ActionLeaseRef::new(format!("lease-t2-s04-{op_tag}"))?,
+                fence.clone(),
+                revisions(),
+                100,
+                10_000,
+                format!("nonce-t2-s04-{op_tag}"),
+            )?,
+        )?;
+        Ok((ProcessRequest::new(intent, permit)?, authority, fence))
+    }
+
+    #[cfg(windows)]
+    fn s04_start(
+        op_tag: &str,
+        argv: Vec<String>,
+        stdout_limit: u64,
+        stderr_limit: u64,
+        max_descendants: u32,
+    ) -> Result<(WindowsProcessExecutor, OperationId, Arc<RecordingSink>), Box<dyn std::error::Error>>
+    {
+        let (request, authority, fence) =
+            s04_authorized_request(op_tag, argv, stdout_limit, stderr_limit, max_descendants)?;
+        let operation_id = request.operation_id().clone();
+        let context = DispatchValidationContext::new(
+            ClockObservation {
+                valid_time_ms: Some(150),
+                known_time_ms: Some(150),
+                transaction_sequence: None,
+                monotonic_ns: Some(1),
+            },
+            fence,
+            1,
+            revisions(),
+            41,
+        )?;
+        let port = FakePort {
+            authority: Mutex::new(authority),
+            context,
+        };
+        let executor = WindowsProcessExecutor::new(Arc::new(port));
+        let sink = Arc::new(RecordingSink::default());
+        let sink_dyn: Arc<dyn ProcessEvidenceSink> = sink.clone();
+        // The start receipt is intentionally dropped here: the executor is the
+        // sole owner afterwards, which is exactly the disconnect shape the
+        // reconcile test needs.
+        let _receipt = block_on(executor.start(request, sink_dyn))?;
+        Ok((executor, operation_id, sink))
+    }
+
+    #[cfg(windows)]
+    fn s04_wait_terminal(
+        executor: &WindowsProcessExecutor,
+        operation_id: &OperationId,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        loop {
+            let view = block_on(executor.inspect(operation_id.clone()))?;
+            if view.lifecycle().is_terminal() {
+                return Ok(());
+            }
+            if std::time::Instant::now() >= deadline {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::TimedOut,
+                    "timed out waiting for terminal lifecycle",
+                )
+                .into());
+            }
+            std::thread::sleep(std::time::Duration::from_millis(25));
+        }
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn cancel_under_pressure_proves_tree_closure_or_typed_unknown()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let bat_path = std::env::temp_dir().join("eliot-t2-s04-cancel-tree.bat");
+        let child_path = std::env::temp_dir().join("eliot-t2-s04-cancel-child.bat");
+        // Separate files: no nested quoting, so `start` cannot re-split the
+        // child command. Keep-alive uses only cmd internals (`for`/`rem`):
+        // the spawn environment offers no PATH, so external waits like ping
+        // fail instantly and cannot hold the tree open.
+        std::fs::write(
+            &child_path,
+            "@echo off\r\nfor /L %%i in (1,1,400) do (\r\necho CHILD-OUT-%%i-0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ\r\necho CHILD-ERR-%%i-0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ 1>&2\r\n)\r\nfor /L %%i in (1,0,2) do rem\r\n",
+        )?;
+        std::fs::write(
+            &bat_path,
+            format!(
+                "@echo off\r\nstart \"\" /b \"{}\"\r\nfor /L %%i in (1,1,300) do (\r\necho ROOT-OUT-%%i-0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ\r\necho ROOT-ERR-%%i-0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ 1>&2\r\n)\r\nfor /L %%i in (1,0,2) do rem\r\n",
+                child_path.to_string_lossy()
+            ),
+        )?;
+        let argv = vec!["/c".to_owned(), bat_path.to_string_lossy().into_owned()];
+        let (executor, operation_id, _sink) = s04_start("cancel-tree", argv, 4_096, 4_096, 4)?;
+        // Prove stdout/stderr pressure accumulated before cancelling: both
+        // captured totals must exceed the 4096-byte preview bound.
+        let pressure_deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+        loop {
+            let (stdout, stderr) = executor.captured_output(&operation_id)?;
+            if stdout.total_bytes > 4_096 && stderr.total_bytes > 4_096 {
+                break;
+            }
+            if std::time::Instant::now() >= pressure_deadline {
+                let _ = std::fs::remove_file(&bat_path);
+                let _ = std::fs::remove_file(&child_path);
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::TimedOut,
+                    "timed out waiting for stream pressure",
+                )
+                .into());
+            }
+            std::thread::sleep(std::time::Duration::from_millis(25));
+        }
+        // Give the Job observer a chance to notice the real child before the
+        // tree is torn down. Both root and child spin in internal keep-alive
+        // loops afterwards, so the tree is still owned at cancel time.
+        std::thread::sleep(std::time::Duration::from_secs(1));
+        let cancel_result = block_on(executor.cancel(operation_id.clone()));
+        let _ = std::fs::remove_file(&bat_path);
+        let _ = std::fs::remove_file(&child_path);
+        match cancel_result {
+            Ok(receipt) => {
+                // Post-finalize receipt: tree closure is proven at the cancel
+                // boundary. There is no `Cancelled` lifecycle variant, so the
+                // proven terminal state is `Exited` with the `Cancelled` exit
+                // disposition plus complete descendant evidence.
+                assert_eq!(receipt.status(), CancellationStatus::Completed);
+                assert_eq!(receipt.lifecycle(), ProcessLifecycle::Exited);
+                let Some(descendants) = receipt.descendants() else {
+                    panic!("cancel receipt must carry post-finalize descendant evidence")
+                };
+                assert!(descendants.complete());
+                assert!(descendants.tree_terminated());
+                assert!(
+                    descendants.process_ids().len() >= 2,
+                    "expected root plus at least one real child, observed {}",
+                    descendants.process_ids().len()
+                );
+                let view = block_on(executor.inspect(operation_id.clone()))?;
+                assert_eq!(view.lifecycle(), ProcessLifecycle::Exited);
+                assert_eq!(view.cancellation(), CancellationStatus::Completed);
+                let Some(exit) = view.exit() else {
+                    panic!("expected an exit observation after cancel")
+                };
+                assert_eq!(exit.disposition(), ExitDisposition::Cancelled);
+                let Some(view_descendants) = view.descendants() else {
+                    panic!("expected descendant evidence after cancel")
+                };
+                assert!(view_descendants.complete() && view_descendants.tree_terminated());
+                let evidence = block_on(executor.reconcile(operation_id.clone()))?;
+                assert_eq!(evidence.operation_id(), &operation_id);
+                assert_eq!(evidence.view().lifecycle(), ProcessLifecycle::Exited);
+                let (stdout, stderr) = executor.captured_output(&operation_id)?;
+                assert!(stdout.total_bytes > 4_096);
+                assert!(stderr.total_bytes > 4_096);
+                Ok(())
+            }
+            Err(ProcessExecutionError::UnknownOutcome) => {
+                // Tree closure could not be proven within the existing waits:
+                // the operation stays retained as unknown, never promoted to
+                // a fabricated success.
+                let view = block_on(executor.inspect(operation_id.clone()))?;
+                assert_eq!(view.lifecycle(), ProcessLifecycle::UnknownOutcome);
+                assert!(matches!(
+                    block_on(executor.reconcile(operation_id)),
+                    Err(ProcessExecutionError::UnknownOutcome)
+                ));
+                Ok(())
+            }
+            Err(other) => {
+                Err(format!("cancel must prove closure or stay unknown, got {other:?}").into())
+            }
+        }
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn disconnect_reconciles_retained_operation_without_second_start()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let argv = vec![
+            "/c".to_owned(),
+            "echo".to_owned(),
+            "disconnect-probe".to_owned(),
+        ];
+        let (executor, operation_id, sink) = s04_start("disconnect", argv, 4_096, 4_096, 4)?;
+        // No cancel and no second start: reconcile the same retained
+        // operation on the same executor after all client handles were
+        // dropped inside `s04_start`.
+        s04_wait_terminal(&executor, &operation_id)?;
+        let initial = sink
+            .recorded_one()
+            .expect("start must record initial evidence");
+        let evidence = block_on(executor.reconcile(operation_id.clone()))?;
+        assert_eq!(evidence.operation_id(), &operation_id);
+        assert!(evidence.view().lifecycle().is_terminal());
+        assert_eq!(evidence.binding(), initial.binding());
+        assert_eq!(evidence.operation_id(), initial.operation_id());
+        // One record for the start plus one for the reconcile: no second
+        // child was spawned.
+        assert_eq!(sink.recorded_len(), 2);
+        // A second start with the same operation identity must hit the
+        // reservation instead of spawning another child. The argv
+        // deliberately differs so only the operation identity can match.
+        let (retry_request, _, _) = s04_authorized_request(
+            "disconnect",
+            vec!["/c".to_owned(), "echo".to_owned(), "retry-probe".to_owned()],
+            4_096,
+            4_096,
+            4,
+        )?;
+        let retry_sink: Arc<dyn ProcessEvidenceSink> = Arc::new(RecordingSink::default());
+        match block_on(executor.start(retry_request, retry_sink)) {
+            Err(ProcessExecutionError::Unavailable(_)) => {}
+            other => panic!("duplicate operation identity must hit the reservation, got {other:?}"),
+        }
+        assert_eq!(sink.recorded_len(), 2);
+        let retained = block_on(executor.inspect(operation_id))?;
+        assert_eq!(retained.operation_id(), evidence.operation_id());
+        assert_eq!(retained.binding(), evidence.binding());
         Ok(())
     }
 }
