@@ -13,7 +13,7 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 use eliot_contracts::{
-    AuthorityEpoch, ContractVersion, ResourceGeneration, StateFence, canonical_json_bytes,
+    AuthorityEpoch, ContractVersion, EpochId, ResourceGeneration, StateFence, canonical_json_bytes,
     sha256_hex,
 };
 
@@ -227,8 +227,8 @@ pub struct SupervisionLease {
     pub activation_id: String,
     /// Activation generation selected by Host/Kernel.
     pub activation_generation: ResourceGeneration,
-    /// Kernel authority epoch.
-    pub kernel_epoch: AuthorityEpoch,
+    /// Kernel authority epoch (lineage-aware exact tuple).
+    pub kernel_epoch: EpochId,
     /// Watchdog authority epoch.
     pub watchdog_epoch: AuthorityEpoch,
     /// Target/module/process generation binding.
@@ -292,12 +292,8 @@ impl SupervisionLease {
                 "must be greater than zero",
             ));
         }
-        if self.kernel_epoch.value() == 0 {
-            return Err(invalid_lease_field(
-                "kernel_epoch",
-                "must be greater than zero",
-            ));
-        }
+        // `EpochId` is always a validated non-zero `(lineage_id, sequence)`
+        // tuple by construction; no scalar zero check (Implements #64).
         if self.watchdog_epoch.value() == 0 {
             return Err(invalid_lease_field(
                 "watchdog_epoch",
@@ -315,7 +311,11 @@ impl SupervisionLease {
         self.state_fence
             .validate()
             .map_err(|error| invalid_lease_field("state_fence", error.to_string()))?;
-        if self.state_fence.authority_epoch != self.kernel_epoch {
+        if !self
+            .state_fence
+            .authority_epoch
+            .is_same_authority(&self.kernel_epoch)
+        {
             return Err(invalid_lease_field(
                 "state_fence.authority_epoch",
                 "must equal kernel_epoch",
@@ -678,8 +678,8 @@ pub struct SupervisionLeaseVerificationContext {
     pub activation_id: String,
     /// Current activation generation.
     pub activation_generation: ResourceGeneration,
-    /// Current Kernel epoch.
-    pub kernel_epoch: AuthorityEpoch,
+    /// Current Kernel epoch (lineage-aware exact tuple).
+    pub kernel_epoch: EpochId,
     /// Current Watchdog epoch.
     pub watchdog_epoch: AuthorityEpoch,
     /// Exact current Kernel-owned state fence.
@@ -730,7 +730,11 @@ impl SupervisionLeaseVerificationContext {
                 "state_fence is invalid".to_owned(),
             ));
         }
-        if self.state_fence.authority_epoch != self.kernel_epoch {
+        if !self
+            .state_fence
+            .authority_epoch
+            .is_same_authority(&self.kernel_epoch)
+        {
             return Err(SupervisionLeaseError::InvalidContext(
                 "state_fence authority must equal kernel_epoch".to_owned(),
             ));
@@ -754,13 +758,14 @@ impl SupervisionLeaseVerificationContext {
             ));
         }
         self.active_state.validate()?;
+        // `EpochId` kernel epoch is always a validated non-zero tuple;
+        // only scalar contours retain zero checks (Implements #64).
         for (field, value) in [
             ("context.host_epoch", self.host_epoch.value()),
             (
                 "context.activation_generation",
                 self.activation_generation.value(),
             ),
-            ("context.kernel_epoch", self.kernel_epoch.value()),
             ("context.watchdog_epoch", self.watchdog_epoch.value()),
             ("context.target_generation", self.target_generation.value()),
             ("context.module_generation", self.module_generation.value()),

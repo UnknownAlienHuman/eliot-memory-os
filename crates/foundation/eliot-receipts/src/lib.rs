@@ -10,7 +10,7 @@
 use std::{fmt, str::FromStr};
 
 use eliot_contracts::{
-    ArtifactId, AuthorityEpoch, ContractId, ContractIdentity, ProductId, ReceiptId, RequestId,
+    ArtifactId, ContractId, ContractIdentity, EpochId, ProductId, ReceiptId, RequestId,
     ResourceGeneration, SessionId, TaskId, TaskRevision, TransactionSequence,
     contract_identity as make_contract_identity,
 };
@@ -311,14 +311,18 @@ impl TaskBinding {
 #[serde(deny_unknown_fields)]
 pub struct SessionBinding {
     pub session_id: SessionId,
-    pub authority_epoch: AuthorityEpoch,
+    pub authority_epoch: EpochId,
     pub state_fence: StateFence,
 }
 
 impl SessionBinding {
     fn validate(&self) -> Result<(), ReceiptError> {
         self.state_fence.validate()?;
-        if self.state_fence.authority_epoch != self.authority_epoch {
+        if !self
+            .state_fence
+            .authority_epoch
+            .is_same_authority(&self.authority_epoch)
+        {
             return Err(ReceiptError::FenceMismatch {
                 left: "session.authority_epoch",
                 right: "session.state_fence",
@@ -423,7 +427,7 @@ impl OperationBinding {
 pub struct AuthorityBinding {
     pub authority_id: ContractId,
     pub authority_owner: String,
-    pub authority_epoch: AuthorityEpoch,
+    pub authority_epoch: EpochId,
     pub state_fence: StateFence,
     pub allowed_effect: EffectClass,
     pub proof_ceiling: ProofCeiling,
@@ -433,7 +437,11 @@ impl AuthorityBinding {
     fn validate(&self) -> Result<(), ReceiptError> {
         text(&self.authority_owner, "authority.authority_owner")?;
         self.state_fence.validate()?;
-        if self.state_fence.authority_epoch != self.authority_epoch {
+        if !self
+            .state_fence
+            .authority_epoch
+            .is_same_authority(&self.authority_epoch)
+        {
             return Err(ReceiptError::FenceMismatch {
                 left: "authority.authority_epoch",
                 right: "authority.state_fence",
@@ -805,8 +813,22 @@ fn validate_core(core: &ReceiptCore, receipt_id: Option<&ReceiptId>) -> Result<(
 
 /// Builds the smallest valid test receipt without IO or external state.
 #[cfg(test)]
+fn test_epoch(sequence: u64) -> EpochId {
+    use eliot_contracts::EpochLineageId;
+    use std::num::NonZeroU64;
+    let lineage = EpochLineageId::new("550e8400-e29b-41d4-a716-446655440000")
+        .expect("canonical test lineage-A");
+    EpochId::new(
+        lineage,
+        NonZeroU64::new(sequence).expect("non-zero test sequence"),
+    )
+    .expect("valid test epoch")
+}
+
+/// Builds the smallest valid test receipt without IO or external state.
+#[cfg(test)]
 fn fixture_core() -> Result<ReceiptCore, ReceiptError> {
-    let fence = StateFence::new(AuthorityEpoch::genesis(), ResourceGeneration::genesis());
+    let fence = StateFence::new(test_epoch(1), ResourceGeneration::genesis());
     let request_id = RequestId::new("request-1")?;
     let metadata = RequestMetadata {
         request_id: request_id.clone(),
@@ -839,7 +861,7 @@ fn fixture_core() -> Result<ReceiptCore, ReceiptError> {
         }),
         session: Some(SessionBinding {
             session_id: SessionId::new("session-1")?,
-            authority_epoch: AuthorityEpoch::genesis(),
+            authority_epoch: test_epoch(1),
             state_fence: fence.clone(),
         }),
         causal: CausalBinding {
@@ -863,7 +885,7 @@ fn fixture_core() -> Result<ReceiptCore, ReceiptError> {
         authority: AuthorityBinding {
             authority_id: ContractId::new("authority-1")?,
             authority_owner: "governor".to_owned(),
-            authority_epoch: AuthorityEpoch::genesis(),
+            authority_epoch: test_epoch(1),
             state_fence: fence.clone(),
             allowed_effect: EffectClass::Read,
             proof_ceiling: ProofCeiling::ScopedVerification,
@@ -924,7 +946,7 @@ mod tests {
     fn stale_fence_and_request_mismatch_fail_closed() -> TestResult {
         let mut core = fixture_core()?;
         core.operation.state_fence =
-            StateFence::new(AuthorityEpoch::new(2)?, ResourceGeneration::genesis());
+            StateFence::new(test_epoch(2), ResourceGeneration::genesis());
         assert!(matches!(
             ReceiptEnvelope::issue(core),
             Err(ReceiptError::FenceMismatch { .. })
