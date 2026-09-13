@@ -1131,7 +1131,7 @@ fn create_runtime_file_with_installer_descriptor(
         if code == ERROR_ALREADY_EXISTS || code == ERROR_FILE_EXISTS {
             return Err(std::io::Error::from(std::io::ErrorKind::AlreadyExists));
         }
-        return Err(std::io::Error::from_raw_os_error(code as i32));
+        return Err(std::io::Error::from_raw_os_error(code.cast_signed()));
     }
     // SAFETY: CreateFileW returned a uniquely owned new file handle.
     Ok(unsafe { std::fs::File::from_raw_handle(handle.cast()) })
