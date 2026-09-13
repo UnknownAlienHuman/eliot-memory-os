@@ -1,5 +1,31 @@
 # `eliot-dreamer-procedure` implementation contract
 
+<!-- eliot-doc-routing:start -->
+## Mandatory documentation routing
+
+Before changing code, configuration, tests, workflows, or normative prose, run
+from the repository root:
+
+```text
+python scripts/docs_read.py read --path <repository/path> --topic "<causal property>" --output .eliot/docs-read-bundle.md --receipt-out .eliot/docs-read-receipt.json
+```
+
+Repeat `--path` for every mutable path family, or use `--changed-from
+origin/main` for the complete branch delta, including deletions. Open the
+verified bundle and read every required item before mutation. A route alone is
+navigation, not reading evidence.
+
+Record the route receipt ID, read receipt ID, matched routes, required handles,
+fragment paths and SHA-256 values, verified bundle SHA-256, and explicit reading
+attestation in the work unit or pull request. Optional fragments are loaded only
+when the current decision crosses their stated boundary. A legacy `ELIOT_*`
+compatibility map is never an acceptable read receipt.
+
+If no non-baseline route matches, a required item is stale or missing, or scope
+expands beyond the receipt, stop and rerun or repair the route; silence is not
+permission. See [`../../../docs/architecture/READING_PROTOCOL.md`](../../../docs/architecture/READING_PROTOCOL.md).
+<!-- eliot-doc-routing:end -->
+
 Owning issue: [#661 — A-25 grounded inert procedure/Skill candidate](https://github.com/UnknownAlienHuman/eliot-memory-os/issues/661).
 
 Current state on `main@8ebf8b41847391c340393d56aeb14dd4f2b5e37b`: `Cargo.toml` declares `source_status = "NOT_IMPLEMENTED"`; `src/lib.rs` is a literal capability-cell placeholder. `module.toml` is planning metadata only.
@@ -10,7 +36,7 @@ Read through `scripts/docs_read.py`, then directly:
 
 - [`I9.3 — Job classes`](../../../docs/architecture/I09-03-job-classes.md#i93-job-classes)
 - [`I9.5 — Dream Packet`](../../../docs/architecture/I09-05-dream-packet.md#i95-dream-packet)
-- [`I9.6 — Candidate kinds`](../../../docs/architecture/I09-06-candidate-kinds.md#i96-candidate-kinds)
+- [`I9.6 — Curation candidate`](../../../docs/architecture/I09-06-curation-candidate.md#i96-curation-candidate)
 - [`I9.7 — Memory transformation validation`](../../../docs/architecture/I09-07-memory-transformation-validation.md#i97-memory-transformation-validation)
 - [`I7.12 — Short Skills`](../../../docs/architecture/I07-12-short-skills.md#i712-short-skills)
 - [`I7.25 — Skill lifecycle and execution evidence`](../../../docs/architecture/I07-25-skill-lifecycle-interaction-and-execution-evidence.md#i725-skill-lifecycle-interaction-and-execution-evidence)
