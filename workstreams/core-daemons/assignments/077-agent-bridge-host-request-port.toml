@@ -9,7 +9,8 @@ handoff_issue = 342
 issue_url = "https://github.com/UnknownAlienHuman/eliot-memory-os/issues/342"
 integration_issue_refs = [77, 23, 15, 18, 11]
 base_branch = "main"
-base_sha = "8ebf8b41847391c340393d56aeb14dd4f2b5e37b"
+# retry-1084: supersedes docs/342-agent-bridge-host-port; reconciled to work/342-host-request-cutover at 7d11f601
+base_sha = "7d11f601302cb156ad9678d4201b1063bda5acc1"
 normative_pair_ref = "docs/normative-pair.toml"
 
 [work_unit]
