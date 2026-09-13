@@ -1752,7 +1752,7 @@ mod tests {
         })
     }
 
-    fn is_binding_mismatch<T>(result: Result<T, CodexAdapterError>) -> bool {
+    fn is_binding_mismatch<T>(result: &Result<T, CodexAdapterError>) -> bool {
         matches!(
             result,
             Err(CodexAdapterError::Contract(
@@ -1829,7 +1829,7 @@ mod tests {
             Some(serde_json::json!({ "threadId": "thread-1" })),
         );
         // Thread lifecycle stays session-only: no attempt identity is invented.
-        assert!(is_binding_mismatch(translate_host_event(
+        assert!(is_binding_mismatch(&translate_host_event(
             &message,
             &session_only,
             1,
@@ -1843,7 +1843,7 @@ mod tests {
     fn missing_and_foreign_turns_quarantine_without_advancing() -> TestResult {
         let binding = bound_binding()?;
         // Same thread, foreign turn: never attempt A output.
-        assert!(is_binding_mismatch(translate_bound(
+        assert!(is_binding_mismatch(&translate_bound(
             "turn/completed",
             completed_params("thread-1", "turn-2", "completed"),
             &binding,
@@ -1851,7 +1851,7 @@ mod tests {
             None,
         )));
         // Same thread, missing turn: retained/quarantined, never guessed.
-        assert!(is_binding_mismatch(translate_bound(
+        assert!(is_binding_mismatch(&translate_bound(
             "turn/completed",
             serde_json::json!({ "threadId": "thread-1" }),
             &binding,
@@ -1912,7 +1912,7 @@ mod tests {
         )?;
         assert_eq!(unknown.observed_at, "unknown");
         // The recorded observation must agree with the claimed stream position.
-        assert!(is_binding_mismatch(translate_host_event(
+        assert!(is_binding_mismatch(&translate_host_event(
             &CodexWireMessage::notification(
                 "turn/completed",
                 Some(completed_params("thread-1", "turn-1", "completed")),
@@ -2023,7 +2023,7 @@ mod tests {
             1,
             None,
         )?;
-        assert!(is_binding_mismatch(translate_result(
+        assert!(is_binding_mismatch(&translate_result(
             result_input(&a, Some("output"), Some(foreign_terminal), false, None)?,
             &binding,
             &a.authority.effect_ceiling,

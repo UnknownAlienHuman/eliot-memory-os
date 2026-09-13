@@ -227,7 +227,7 @@ fn wrong_thread_is_rejected() -> Result<(), Box<dyn std::error::Error>> {
 }
 
 #[test]
-fn foreign_turn_never_yields_bound_attempt_output() -> Result<(), Box<dyn std::error::Error>> {
+fn foreign_turn_never_yields_bound_attempt_output() {
     assert!(matches!(
         translate_raw(
             "turn/completed",
@@ -238,7 +238,6 @@ fn foreign_turn_never_yields_bound_attempt_output() -> Result<(), Box<dyn std::e
         ),
         Err(CodexAdapterError::Contract(ContractError::BindingMismatch))
     ));
-    Ok(())
 }
 
 #[test]
