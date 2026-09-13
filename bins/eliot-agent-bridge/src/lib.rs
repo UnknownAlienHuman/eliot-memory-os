@@ -2,10 +2,13 @@
 
 #![forbid(unsafe_code)]
 
+use std::cell::RefCell;
+use std::collections::HashMap;
 use std::fmt;
 use std::path::Path;
 #[cfg(test)]
 use std::path::PathBuf;
+use std::rc::Rc;
 use std::time::Duration;
 
 use eliot_agent_bridge_core::{
@@ -14,6 +17,7 @@ use eliot_agent_bridge_core::{
     HostEventEnvelope, McpForwardingPort, ProviderFailure, ProviderReadiness,
     ReconciliationPortOutcome, ReconnectRequest,
 };
+use eliot_mcp::KernelHostRequestPort;
 use eliot_protocol::{
     AckPhase, AgentBridgeClientDeclaration, AgentBridgePeerAdmissionReceipt,
     AgentBridgePeerChallenge, EventEnvelope,
@@ -22,6 +26,7 @@ use eliot_runtime::{Runtime, RuntimeConfig};
 
 mod cli_contract;
 mod kernel_activation_client;
+mod kernel_host_request_client;
 pub(crate) use cli_contract::validate_client_declaration_path;
 pub use cli_contract::{CliConfig, CliError, Profile, Transport, parse_args};
 use kernel_activation_client::KernelHostActivationPort;
@@ -29,6 +34,7 @@ use kernel_activation_client::KernelHostActivationPort;
 use kernel_activation_client::{
     activation_frame_for_request, build_neutral_activation_request, decode_activation_response,
 };
+use kernel_host_request_client::{KernelHostRequestClient, ReplayCacheEntry};
 
 fn decode_declaration_bytes(bytes: &[u8]) -> Result<AgentBridgeClientDeclaration, String> {
     let declaration: AgentBridgeClientDeclaration =
@@ -55,6 +61,32 @@ struct AdmittedConnection {
 // _loaded: LoadedAgentBridgeDeclaration
 // activation_used: bool
 // activation exchange already consumed; restart/reconnect
+
+/// Single retained transport owner behind both kernel faces.
+///
+/// Exactly one admitted transport, one tokio runtime, one declaration lease,
+/// and one activation one-shot guard live here. `KernelHostActivationPort`
+/// (runner side) and `KernelHostRequestClient` (host-gateway side) each hold
+/// a `SharedTransport`; no second transport, runtime, or lease is ever
+/// constructed. `activated_session` keeps the kernel-issued semantic session
+/// captured by the one-shot activation exchange, so invocation envelopes bind
+/// an honest kernel-issued selector instead of host text or a minted
+/// identity. `replay_cache` makes exact host replays byte-identical (the
+/// kernel deduplicates by envelope digest) and turns a changed payload under
+/// a known correlation into a local `IdempotencyConflict` with no wire
+/// traffic. Neither is durable: both die with this process, which spans
+/// exactly one admitted connection.
+struct KernelTransportOwner {
+    admitted: AdmittedConnection,
+    runtime: tokio::runtime::Runtime,
+    _loaded: LoadedAgentBridgeDeclaration,
+    activation_used: bool,
+    limits: eliot_ipc::TransportLimits,
+    activated_session: Option<String>,
+    replay_cache: HashMap<String, ReplayCacheEntry>,
+}
+
+type SharedTransport = Rc<RefCell<KernelTransportOwner>>;
 
 struct KernelMcpForwardingPort;
 
@@ -100,7 +132,11 @@ impl McpForwardingPort for KernelMcpForwardingPort {
     }
 }
 
-pub type KernelPorts = (Box<dyn HostActivationPort>, Box<dyn McpForwardingPort>);
+pub type KernelPorts = (
+    Box<dyn HostActivationPort>,
+    Box<dyn KernelHostRequestPort>,
+    Box<dyn McpForwardingPort>,
+);
 
 fn current_os_identity() -> Result<(String, u32), RuntimeBuildError> {
     let expectation = eliot_platform_windows::current_process_named_pipe_expectation()
@@ -220,16 +256,22 @@ pub fn kernel_ports_with_declaration(
             "receipt connection mismatch".to_owned(),
         ));
     }
-    let admitted = AdmittedConnection { transport, receipt };
-    let host: Box<dyn HostActivationPort> = Box::new(KernelHostActivationPort {
-        admitted,
+    let owner: SharedTransport = Rc::new(RefCell::new(KernelTransportOwner {
+        admitted: AdmittedConnection { transport, receipt },
         runtime,
         _loaded: loaded,
         activation_used: false,
         limits,
+        activated_session: None,
+        replay_cache: HashMap::new(),
+    }));
+    let host: Box<dyn HostActivationPort> = Box::new(KernelHostActivationPort {
+        shared: owner.clone(),
     });
+    let host_request: Box<dyn KernelHostRequestPort> =
+        Box::new(KernelHostRequestClient { shared: owner });
     let fwd: Box<dyn McpForwardingPort> = Box::new(KernelMcpForwardingPort);
-    Ok((host, fwd))
+    Ok((host, host_request, fwd))
 }
 
 pub struct BridgeRunner {
