@@ -420,6 +420,7 @@ pub fn begin_attempt_with_gate(
         cancellation: eliot_agent_api::CancellationState::NotRequested,
         event_cursor: None,
         continuation: None,
+        provider_binding: None, // S1: unresolved at construction; S2 lifecycle establishes
     };
     attempt.validate()?;
     attempt.transition(AttemptState::Started)?;
@@ -838,6 +839,7 @@ pub fn translate_host_event(
         normalized_payload: params,
         parent_event_id: None,
         observed_at: observed_at.into(),
+        lineage: None, // S1: S3 binds exact turn; legacy attempt_id carries attribution until then
     };
     envelope.validate()?;
     Ok(envelope)
