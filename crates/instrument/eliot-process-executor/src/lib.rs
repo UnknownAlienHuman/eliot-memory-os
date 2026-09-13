@@ -1838,8 +1838,8 @@ mod tests {
         expected_retained: u64,
     ) {
         use eliot_process::{
-            StreamEvaluationStatus, StreamEvidenceGap, StreamParsingStatus, StreamPersistenceStatus,
-            StreamTransportStatus,
+            StreamEvaluationStatus, StreamEvidenceGap, StreamParsingStatus,
+            StreamPersistenceStatus, StreamTransportStatus,
         };
         assert_eq!(stream.transport(), StreamTransportStatus::Complete);
         assert_eq!(
@@ -1879,17 +1879,14 @@ mod tests {
 
     #[test]
     #[cfg(windows)]
-    fn reconcile_reports_typed_bounded_streams_beyond_preview_bound(
-    ) -> Result<(), Box<dyn std::error::Error>> {
+    fn reconcile_reports_typed_bounded_streams_beyond_preview_bound()
+    -> Result<(), Box<dyn std::error::Error>> {
         let bat_path = std::env::temp_dir().join("eliot-t2-s03-pressure.bat");
         std::fs::write(
             &bat_path,
             "@echo off\r\nfor /L %%i in (1,1,300) do (\r\necho STDOUT-PRESSURE-%%i-0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ\r\necho STDERR-PRESSURE-%%i-0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ 1>&2\r\n)\r\n",
         )?;
-        let pressure_argv = vec![
-            "/c".to_owned(),
-            bat_path.to_string_lossy().into_owned(),
-        ];
+        let pressure_argv = vec!["/c".to_owned(), bat_path.to_string_lossy().into_owned()];
         let sink: Arc<dyn ProcessEvidenceSink> = Arc::new(RecordingSink::default());
         let evidence = start_and_reconcile("pressure", pressure_argv, 4_096, 4_096, sink)?;
         let Some(stdout) = evidence.stdout() else {
@@ -1900,7 +1897,11 @@ mod tests {
         };
         assert_truncated_stream(stdout, 4_096);
         assert_truncated_stream(stderr, 4_096);
-        let small_argv = vec!["/c".to_owned(), "echo".to_owned(), "small-stdout".to_owned()];
+        let small_argv = vec![
+            "/c".to_owned(),
+            "echo".to_owned(),
+            "small-stdout".to_owned(),
+        ];
         let small_sink: Arc<dyn ProcessEvidenceSink> = Arc::new(RecordingSink::default());
         let small = start_and_reconcile("pressure-small", small_argv, 4_096, 4_096, small_sink)?;
         let Some(small_stdout) = small.stdout() else {
@@ -1918,8 +1919,8 @@ mod tests {
 
     #[test]
     #[cfg(windows)]
-    fn reconcile_with_failing_sink_reports_no_complete_evidence(
-    ) -> Result<(), Box<dyn std::error::Error>> {
+    fn reconcile_with_failing_sink_reports_no_complete_evidence()
+    -> Result<(), Box<dyn std::error::Error>> {
         let executable = r"C:\Windows\System32\cmd.exe";
         let digest = super::sha256_file(std::path::Path::new(executable))?;
         let working_directory = std::env::temp_dir().to_string_lossy().into_owned();
