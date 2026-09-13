@@ -5725,7 +5725,14 @@ mod production_call_path_negatives {
             PermitIssuance, ProcessId, ProcessIntent, ProcessRequest, ProcessTreeId,
             ResourceLimits, SecretRef, SessionId,
         };
-        let fence = FencingToken::new(1, generation, "fence-1").expect("fence");
+        let authority_epoch = eliot_contracts::EpochId::new(
+            eliot_contracts::EpochLineageId::new("11111111-1111-4111-8111-111111111111")
+                .expect("epoch lineage"),
+            std::num::NonZeroU64::new(1).expect("epoch sequence"),
+        )
+        .expect("epoch");
+        let fence =
+            FencingToken::new(authority_epoch.clone(), generation, "fence-1").expect("fence");
         let mut authority = DispatchPermitAuthority::activate(
             DispatchAuthorityId::new("kernel-authority-7").expect("auth id"),
             KernelDispatchKey::from_secret_bytes([0x5a; 32]).expect("key"),
@@ -5788,7 +5795,7 @@ mod production_call_path_negatives {
         let ctx = eliot_process::DispatchValidationContext::new(
             clock,
             fence.clone(),
-            1,
+            authority_epoch,
             std::collections::BTreeMap::from([
                 ("authority".to_owned(), "a".repeat(64)),
                 ("state".to_owned(), "b".repeat(64)),
