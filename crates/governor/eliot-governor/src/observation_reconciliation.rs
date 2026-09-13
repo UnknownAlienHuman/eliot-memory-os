@@ -548,21 +548,135 @@ fn check_receipt(
     Ok(())
 }
 
+/// Exactly one verified problem plus its deduplicated verifier evidence refs.
+struct ResolvedDoctorBinding {
+    problem_id: String,
+    expected_revision: u64,
+    evidence_refs: Vec<String>,
+}
+
+/// Scratch-admitted observation leg plus its store-binding digests.
+struct ScratchAdmittedLeg {
+    submission: ObservationSubmission,
+    observation_record_id: String,
+    observation_request_digest: String,
+}
+
+/// Both canonical envelopes plus the recovery hash and shared manifest digest.
+///
+/// The observation hash is derived after the proactive receipt check, matching
+/// the original two-commit order: an identical retry reconciles without
+/// touching the observation leg.
+struct PreparedDoctorLegs {
+    manifest_digest: OperationManifestDigest,
+    observation_operation: OperationId,
+    observation_envelope: CanonicalWriteEnvelope,
+    recovery_envelope: CanonicalWriteEnvelope,
+    recovery_hash: String,
+}
+
+/// Validates the endorsed report and its independence under the active fence.
+///
+/// The caller supplies evidence, never a verdict: endorsement enforces every
+/// verifier axis at once, and the artifact binding must be exact for the
+/// verified effect.
+fn validate_report_independence(
+    report: &VerificationReport,
+    doctor_fence: &eliot_doctor_core::StateFence,
+) -> Result<IndependentVerification, CompositionError> {
+    report
+        .validate()
+        .map_err(|error| owner_refused(format!("doctor verification report is malformed: {error}")))?;
+    report
+        .attempt
+        .validate()
+        .map_err(|error| owner_refused(format!("doctor attempt identity is malformed: {error}")))?;
+    report
+        .effect
+        .validate()
+        .map_err(|error| owner_refused(format!("doctor effect identity is malformed: {error}")))?;
+    if report.evidence.evidence.is_empty() {
+        return Err(owner_refused(
+            "doctor verification carries no evidence handles".to_owned(),
+        ));
+    }
+    for handle in &report.evidence.evidence {
+        handle
+            .validate()
+            .map_err(|error| owner_refused(format!("doctor evidence handle is malformed: {error}")))?;
+    }
+    let verified = report.endorse(doctor_fence).map_err(|_| {
+        owner_refused(
+            "doctor verification is not independently verified under the active fence".to_owned(),
+        )
+    })?;
+    if verified
+        .report()
+        .evidence
+        .artifact_binding
+        .bound_exact_digest()
+        != Some(verified.effect().digest())
+    {
+        return Err(owner_refused(
+            "doctor artifact binding is not exact for the verified effect".to_owned(),
+        ));
+    }
+    Ok(verified)
+}
+
+/// Builds both canonical envelopes and their hashes from scratch-admitted legs.
+fn build_doctor_leg_envelopes(
+    identity: &eliot_protocol::RequestIdentity,
+    operation_id: &OperationId,
+    verified: &IndependentVerification,
+    binding: &ResolvedDoctorBinding,
+    scratch: &ScratchAdmittedLeg,
+    doctor_fence_digest: &str,
+) -> Result<PreparedDoctorLegs, CompositionError> {
+    let manifest_digest = production_manifest_digest()?;
+    let observation_operation = OperationId::new(format!("{operation_id}/observation"))
+        .map_err(|error| owner_refused(error.to_string()))?;
+    let observation_envelope = observation_envelope(
+        identity,
+        &observation_operation,
+        &scratch.submission,
+        verified.attempt().digest(),
+        verified.effect().digest(),
+        &manifest_digest,
+        &binding.evidence_refs,
+    )?;
+    let recovery_envelope = recovery_envelope(
+        identity,
+        operation_id,
+        verified,
+        &binding.problem_id,
+        binding.expected_revision,
+        &observation_operation,
+        &scratch.observation_record_id,
+        &scratch.observation_request_digest,
+        doctor_fence_digest,
+        &manifest_digest,
+        &binding.evidence_refs,
+    )?;
+    let recovery_hash = recovery_envelope
+        .canonical_request_hash()
+        .map_err(CompositionError::Canonical)?;
+    Ok(PreparedDoctorLegs {
+        manifest_digest,
+        observation_operation,
+        observation_envelope,
+        recovery_envelope,
+        recovery_hash,
+    })
+}
+
 impl<P: KernelTransitionPort + ?Sized> GovernorObservationReconciliation<'_, P> {
-    /// Admits one independently verified Doctor result into canonical Problem
-    /// state through the common gateway.
-    ///
-    /// The caller supplies evidence, never a verdict: only an endorsed
-    /// [`IndependentVerification`] reaches the canonical path, and only a
-    /// `Committed` observation receipt admits the recovery leg. See the
-    /// module documentation for the validation order, the problem binding
-    /// contract, and the two-commit idempotency choreography.
-    pub async fn admit_doctor_verification(
+    /// Validates readiness, request identity shape, and exact fence agreement,
+    /// projecting the canonical fence to the scalar doctor echo.
+    fn validate_identity_fence(
         &self,
         identity: &eliot_protocol::RequestIdentity,
-        operation_id: &eliot_contracts::OperationId,
-        report: &eliot_doctor_core::VerificationReport,
-    ) -> Result<eliot_store_api::WriteReceipt, CompositionError> {
+    ) -> Result<eliot_doctor_core::StateFence, CompositionError> {
         if self.readiness != CompositionReadiness::Ready {
             return Err(CompositionError::NotReady);
         }
@@ -580,44 +694,15 @@ impl<P: KernelTransitionPort + ?Sized> GovernorObservationReconciliation<'_, P> 
                 "admitted request fence does not match the active canonical fence".to_owned(),
             ));
         }
-        let doctor_fence = doctor_fence_echo(fence)?;
-        report
-            .validate()
-            .map_err(|error| owner_refused(format!("doctor verification report is malformed: {error}")))?;
-        report
-            .attempt
-            .validate()
-            .map_err(|error| owner_refused(format!("doctor attempt identity is malformed: {error}")))?;
-        report
-            .effect
-            .validate()
-            .map_err(|error| owner_refused(format!("doctor effect identity is malformed: {error}")))?;
-        if report.evidence.evidence.is_empty() {
-            return Err(owner_refused(
-                "doctor verification carries no evidence handles".to_owned(),
-            ));
-        }
-        for handle in &report.evidence.evidence {
-            handle
-                .validate()
-                .map_err(|error| owner_refused(format!("doctor evidence handle is malformed: {error}")))?;
-        }
-        let verified = report.endorse(&doctor_fence).map_err(|_| {
-            owner_refused(
-                "doctor verification is not independently verified under the active fence".to_owned(),
-            )
-        })?;
-        if verified
-            .report()
-            .evidence
-            .artifact_binding
-            .bound_exact_digest()
-            != Some(verified.effect().digest())
-        {
-            return Err(owner_refused(
-                "doctor artifact binding is not exact for the verified effect".to_owned(),
-            ));
-        }
+        doctor_fence_echo(fence)
+    }
+
+    /// Resolves the verified problem to exactly one admitted revision plus
+    /// deduplicated verifier evidence refs.
+    fn resolve_problem_binding(
+        &self,
+        report: &VerificationReport,
+    ) -> Result<ResolvedDoctorBinding, CompositionError> {
         let (problem_id, expected_revision) = resolve_problem(self.problem_revisions, report)?;
         let evidence_refs: Vec<String> = report
             .evidence
@@ -627,12 +712,29 @@ impl<P: KernelTransitionPort + ?Sized> GovernorObservationReconciliation<'_, P> 
             .collect::<BTreeSet<_>>()
             .into_iter()
             .collect();
+        Ok(ResolvedDoctorBinding {
+            problem_id,
+            expected_revision,
+            evidence_refs,
+        })
+    }
+
+    /// Admits the verification to a scratch journal clone and proves the
+    /// `Verifying -> Resolved` edge is legal, without publishing authority.
+    fn admit_scratch_observation(
+        &self,
+        operation_id: &OperationId,
+        identity: &eliot_protocol::RequestIdentity,
+        report: &VerificationReport,
+        verified: &IndependentVerification,
+        binding: &ResolvedDoctorBinding,
+    ) -> Result<ScratchAdmittedLeg, CompositionError> {
         let submission = verification_submission(
             operation_id,
             identity,
             report,
-            &problem_id,
-            &evidence_refs,
+            &binding.problem_id,
+            &binding.evidence_refs,
         )?;
         let mut scratch = self.observation.clone();
         let observation_receipt = match scratch
@@ -655,41 +757,29 @@ impl<P: KernelTransitionPort + ?Sized> GovernorObservationReconciliation<'_, P> 
             }
         };
         check_problem_transition(
-            fence,
-            &problem_id,
-            expected_revision,
+            &identity.request.metadata.state_fence,
+            &binding.problem_id,
+            binding.expected_revision,
             verified.attempt().digest(),
             verified.effect().digest(),
-            &evidence_refs,
+            &binding.evidence_refs,
         )?;
-        let manifest_digest = production_manifest_digest()?;
-        let observation_operation = OperationId::new(format!("{operation_id}/observation"))
-            .map_err(|error| owner_refused(error.to_string()))?;
-        let obs_envelope = observation_envelope(
-            identity,
-            &observation_operation,
-            &submission,
-            verified.attempt().digest(),
-            verified.effect().digest(),
-            &manifest_digest,
-            &evidence_refs,
-        )?;
-        let recovery_envelope = recovery_envelope(
-            identity,
-            operation_id,
-            &verified,
-            &problem_id,
-            expected_revision,
-            &observation_operation,
-            &observation_receipt.record_id,
-            &observation_receipt.request_digest,
-            &doctor_fence.digest,
-            &manifest_digest,
-            &evidence_refs,
-        )?;
-        let recovery_hash = recovery_envelope
-            .canonical_request_hash()
-            .map_err(CompositionError::Canonical)?;
+        Ok(ScratchAdmittedLeg {
+            submission,
+            observation_record_id: observation_receipt.record_id,
+            observation_request_digest: observation_receipt.request_digest,
+        })
+    }
+
+    /// Returns the already-committed recovery receipt for an identical retry,
+    /// or fails closed when the same operation carries different bytes.
+    async fn reconcile_existing_receipt(
+        &self,
+        identity: &eliot_protocol::RequestIdentity,
+        operation_id: &OperationId,
+        recovery_hash: &str,
+        manifest_digest: &OperationManifestDigest,
+    ) -> Result<Option<WriteReceipt>, CompositionError> {
         if let Some(receipt) = self.kernel.receipt(operation_id.clone()).await? {
             if receipt.idempotency_key == identity.idempotency_key
                 && receipt.canonical_request_hash == recovery_hash
@@ -698,22 +788,32 @@ impl<P: KernelTransitionPort + ?Sized> GovernorObservationReconciliation<'_, P> 
                     &receipt,
                     operation_id,
                     identity,
-                    &recovery_hash,
+                    recovery_hash,
                     TransitionClass::RecoverySchema,
-                    &manifest_digest,
+                    manifest_digest,
                 )?;
-                return Ok(receipt);
+                return Ok(Some(receipt));
             }
             return Err(identity_refused(format!(
                 "operation {operation_id} is already committed with different canonical bytes"
             )));
         }
-        let obs_hash = obs_envelope
-            .canonical_request_hash()
-            .map_err(CompositionError::Canonical)?;
-        let obs_receipt = match self
+        Ok(None)
+    }
+
+    /// Commits the observation leg, reconciling an unknown outcome through the
+    /// neutral receipt route instead of a second execution.
+    async fn commit_observation_leg(
+        &self,
+        identity: &eliot_protocol::RequestIdentity,
+        observation_operation: &OperationId,
+        envelope: CanonicalWriteEnvelope,
+        expected_hash: &str,
+        manifest_digest: &OperationManifestDigest,
+    ) -> Result<WriteReceipt, CompositionError> {
+        let receipt = match self
             .canonical
-            .commit(self.kernel, identity, obs_envelope)
+            .commit(self.kernel, identity, envelope)
             .await
         {
             Ok(receipt) => receipt,
@@ -731,19 +831,29 @@ impl<P: KernelTransitionPort + ?Sized> GovernorObservationReconciliation<'_, P> 
             Err(other) => return Err(other),
         };
         check_receipt(
-            &obs_receipt,
-            &observation_operation,
+            &receipt,
+            observation_operation,
             identity,
-            &obs_hash,
+            expected_hash,
             TransitionClass::CaptureCandidate,
-            &manifest_digest,
+            manifest_digest,
         )?;
-        if obs_receipt.status != WriteReceiptStatus::Committed {
-            return Ok(obs_receipt);
-        }
+        Ok(receipt)
+    }
+
+    /// Commits the problem leg, reconciling an unknown outcome through the
+    /// neutral receipt route instead of a second execution.
+    async fn commit_problem_leg(
+        &self,
+        identity: &eliot_protocol::RequestIdentity,
+        operation_id: &OperationId,
+        envelope: CanonicalWriteEnvelope,
+        expected_hash: &str,
+        manifest_digest: &OperationManifestDigest,
+    ) -> Result<WriteReceipt, CompositionError> {
         let receipt = match self
             .canonical
-            .commit(self.kernel, identity, recovery_envelope)
+            .commit(self.kernel, identity, envelope)
             .await
         {
             Ok(receipt) => receipt,
@@ -764,10 +874,89 @@ impl<P: KernelTransitionPort + ?Sized> GovernorObservationReconciliation<'_, P> 
             &receipt,
             operation_id,
             identity,
-            &recovery_hash,
+            expected_hash,
             TransitionClass::RecoverySchema,
-            &manifest_digest,
+            manifest_digest,
         )?;
+        Ok(receipt)
+    }
+}
+
+impl<P: KernelTransitionPort + ?Sized> GovernorObservationReconciliation<'_, P> {
+    /// Admits one independently verified Doctor result into canonical Problem
+    /// state through the common gateway.
+    ///
+    /// The caller supplies evidence, never a verdict: only an endorsed
+    /// [`IndependentVerification`] reaches the canonical path, and only a
+    /// `Committed` observation receipt admits the recovery leg. See the
+    /// module documentation for the validation order, the problem binding
+    /// contract, and the two-commit idempotency choreography.
+    pub async fn admit_doctor_verification(
+        &self,
+        identity: &eliot_protocol::RequestIdentity,
+        operation_id: &eliot_contracts::OperationId,
+        report: &eliot_doctor_core::VerificationReport,
+    ) -> Result<eliot_store_api::WriteReceipt, CompositionError> {
+        let doctor_fence = self.validate_identity_fence(identity)?;
+        let verified = validate_report_independence(report, &doctor_fence)?;
+        let binding = self.resolve_problem_binding(report)?;
+        let scratch = self.admit_scratch_observation(
+            operation_id,
+            identity,
+            report,
+            &verified,
+            &binding,
+        )?;
+        let legs = build_doctor_leg_envelopes(
+            identity,
+            operation_id,
+            &verified,
+            &binding,
+            &scratch,
+            &doctor_fence.digest,
+        )?;
+        let PreparedDoctorLegs {
+            manifest_digest,
+            observation_operation,
+            observation_envelope,
+            recovery_envelope,
+            recovery_hash,
+        } = legs;
+        if let Some(receipt) = self
+            .reconcile_existing_receipt(
+                identity,
+                operation_id,
+                &recovery_hash,
+                &manifest_digest,
+            )
+            .await?
+        {
+            return Ok(receipt);
+        }
+        let observation_hash = observation_envelope
+            .canonical_request_hash()
+            .map_err(CompositionError::Canonical)?;
+        let observation_receipt = self
+            .commit_observation_leg(
+                identity,
+                &observation_operation,
+                observation_envelope,
+                &observation_hash,
+                &manifest_digest,
+            )
+            .await?;
+        if observation_receipt.status != WriteReceiptStatus::Committed {
+            return Ok(observation_receipt);
+        }
+        let receipt = self
+            .commit_problem_leg(
+                identity,
+                operation_id,
+                recovery_envelope,
+                &recovery_hash,
+                &manifest_digest,
+            )
+            .await?;
         Ok(receipt)
     }
 }
@@ -828,6 +1017,122 @@ mod tests {
         }
     }
 
+    /// Validates identity/transition binding plus revision/ordering fences.
+    fn check_test_transition_bindings(
+        identity: &RequestIdentity,
+        transition: &PreparedTransition,
+        expected_revision_heads: &[RevisionHeadExpectation],
+        expected_ordering_heads: &[OrderingHeadExpectation],
+    ) -> Result<(), KernelPortError> {
+        identity
+            .validate()
+            .map_err(|error| KernelPortError::Contract(error.to_string()))?;
+        transition
+            .validate()
+            .map_err(|error| KernelPortError::Contract(error.to_string()))?;
+        if identity.request.metadata.state_fence != transition.state_fence {
+            return Err(KernelPortError::Contract(
+                "test gateway: identity fence does not match transition".to_owned(),
+            ));
+        }
+        if identity.idempotency_key != transition.identity.idempotency_key {
+            return Err(KernelPortError::Contract(
+                "test gateway: idempotency does not match transition".to_owned(),
+            ));
+        }
+        for head in expected_revision_heads {
+            head.validate()
+                .map_err(|error| KernelPortError::Contract(error.to_string()))?;
+            if head.state_fence != transition.state_fence {
+                return Err(KernelPortError::Contract(
+                    "test gateway: revision head fence mismatch".to_owned(),
+                ));
+            }
+        }
+        for head in expected_ordering_heads {
+            head.validate()
+                .map_err(|error| KernelPortError::Contract(error.to_string()))?;
+            if head.state_fence != transition.state_fence {
+                return Err(KernelPortError::Contract(
+                    "test gateway: ordering head fence mismatch".to_owned(),
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    /// Builds the committed test receipt plus its store envelope.
+    fn build_test_receipt(
+        identity: &RequestIdentity,
+        transition: &PreparedTransition,
+        hash: &str,
+        sequence: u64,
+    ) -> Result<WriteReceipt, KernelPortError> {
+        let operation_id = transition.identity.operation_id.clone();
+        let candidate = WriteReceipt {
+            operation_id: operation_id.clone(),
+            idempotency_key: transition.identity.idempotency_key.clone(),
+            canonical_request_hash: hash.to_owned(),
+            transition_class: transition.transition_class,
+            status: WriteReceiptStatus::Committed,
+            commit_id: Some(
+                CommitId::new(format!("commit-{operation_id}"))
+                    .map_err(|error| KernelPortError::Contract(error.to_string()))?,
+            ),
+            state_fence: transition.state_fence.clone(),
+            ordering_sequences: Vec::new(),
+            revision_before_after: Vec::new(),
+            applied_command_ids: vec!["cmd-1".to_owned()],
+            emitted_event_ids: Vec::new(),
+            projection_refs: Vec::new(),
+            outbox_refs: Vec::new(),
+            operation_manifest_digest: transition.operation_manifest_digest.clone(),
+            error_code: None,
+            resubmission: Resubmission::None,
+            committed_at: Some(format!("commit-sequence-{sequence:016}")),
+            envelope: None,
+        };
+        candidate
+            .validate()
+            .map_err(|error| KernelPortError::Contract(error.to_string()))?;
+        let envelope = issue_store_receipt_envelope(
+            &identity.request.metadata,
+            transition,
+            &candidate,
+            sequence,
+        )
+        .map_err(|error| KernelPortError::Contract(error.to_string()))?;
+        let mut receipt = candidate;
+        receipt.envelope = Some(envelope);
+        validate_store_receipt_envelope(&identity.request.metadata, transition, &receipt)
+            .map_err(|error| KernelPortError::Contract(error.to_string()))?;
+        Ok(receipt)
+    }
+
+    /// Applies the test problem-revision compare-and-swap for recovery legs.
+    fn apply_test_revision_cas(
+        kernel: &TestKernel,
+        transition_class: TransitionClass,
+        expected_revision_heads: &[RevisionHeadExpectation],
+    ) -> Result<(), KernelPortError> {
+        if transition_class != TransitionClass::RecoverySchema {
+            return Ok(());
+        }
+        let mut revisions = kernel.problem_revisions.lock().expect("revision lock");
+        for head in expected_revision_heads {
+            if let Some(problem_id) = head.key.as_str().strip_prefix("problem:") {
+                let current = revisions.get(problem_id).copied().unwrap_or(0);
+                if current == 0 || current != head.expected_revision {
+                    return Err(KernelPortError::Contract(
+                        "test gateway: problem revision compare-and-swap failed".to_owned(),
+                    ));
+                }
+                revisions.insert(problem_id.to_owned(), current + 1);
+            }
+        }
+        Ok(())
+    }
+
     impl KernelTransitionPort for TestKernel {
         fn apply_prepared<'a>(
             &'a self,
@@ -838,40 +1143,12 @@ mod tests {
         ) -> KernelPortFuture<'a, WriteReceipt> {
             let identity = identity.clone();
             Box::pin(async move {
-                identity
-                    .validate()
-                    .map_err(|error| KernelPortError::Contract(error.to_string()))?;
-                transition
-                    .validate()
-                    .map_err(|error| KernelPortError::Contract(error.to_string()))?;
-                if identity.request.metadata.state_fence != transition.state_fence {
-                    return Err(KernelPortError::Contract(
-                        "test gateway: identity fence does not match transition".to_owned(),
-                    ));
-                }
-                if identity.idempotency_key != transition.identity.idempotency_key {
-                    return Err(KernelPortError::Contract(
-                        "test gateway: idempotency does not match transition".to_owned(),
-                    ));
-                }
-                for head in &expected_revision_heads {
-                    head.validate()
-                        .map_err(|error| KernelPortError::Contract(error.to_string()))?;
-                    if head.state_fence != transition.state_fence {
-                        return Err(KernelPortError::Contract(
-                            "test gateway: revision head fence mismatch".to_owned(),
-                        ));
-                    }
-                }
-                for head in &expected_ordering_heads {
-                    head.validate()
-                        .map_err(|error| KernelPortError::Contract(error.to_string()))?;
-                    if head.state_fence != transition.state_fence {
-                        return Err(KernelPortError::Contract(
-                            "test gateway: ordering head fence mismatch".to_owned(),
-                        ));
-                    }
-                }
+                check_test_transition_bindings(
+                    &identity,
+                    &transition,
+                    &expected_revision_heads,
+                    &expected_ordering_heads,
+                )?;
                 let key = transition.identity.operation_id.as_str().to_owned();
                 let hash = transition.identity.canonical_request_hash.clone();
                 let mut committed = self.committed.lock().expect("committed lock");
@@ -883,66 +1160,16 @@ mod tests {
                         "test gateway: committed operation identity conflict".to_owned(),
                     ));
                 }
-                if transition.transition_class == TransitionClass::RecoverySchema {
-                    let mut revisions = self.problem_revisions.lock().expect("revision lock");
-                    for head in &expected_revision_heads {
-                        if let Some(problem_id) = head.key.as_str().strip_prefix("problem:") {
-                            let current = revisions.get(problem_id).copied().unwrap_or(0);
-                            if current == 0 || current != head.expected_revision {
-                                return Err(KernelPortError::Contract(
-                                    "test gateway: problem revision compare-and-swap failed"
-                                        .to_owned(),
-                                ));
-                            }
-                            revisions.insert(problem_id.to_owned(), current + 1);
-                        }
-                    }
-                }
+                apply_test_revision_cas(
+                    self,
+                    transition.transition_class,
+                    &expected_revision_heads,
+                )?;
                 let sequence = u64::try_from(committed.len())
                     .map_err(|error| KernelPortError::Contract(error.to_string()))?
                     + 1;
-                let operation_id = transition.identity.operation_id.clone();
-                let candidate = WriteReceipt {
-                    operation_id: operation_id.clone(),
-                    idempotency_key: transition.identity.idempotency_key.clone(),
-                    canonical_request_hash: hash.clone(),
-                    transition_class: transition.transition_class,
-                    status: WriteReceiptStatus::Committed,
-                    commit_id: Some(
-                        CommitId::new(format!("commit-{operation_id}"))
-                            .map_err(|error| KernelPortError::Contract(error.to_string()))?,
-                    ),
-                    state_fence: transition.state_fence.clone(),
-                    ordering_sequences: Vec::new(),
-                    revision_before_after: Vec::new(),
-                    applied_command_ids: vec!["cmd-1".to_owned()],
-                    emitted_event_ids: Vec::new(),
-                    projection_refs: Vec::new(),
-                    outbox_refs: Vec::new(),
-                    operation_manifest_digest: transition.operation_manifest_digest.clone(),
-                    error_code: None,
-                    resubmission: Resubmission::None,
-                    committed_at: Some(format!("commit-sequence-{sequence:016}")),
-                    envelope: None,
-                };
-                candidate
-                    .validate()
-                    .map_err(|error| KernelPortError::Contract(error.to_string()))?;
-                let envelope = issue_store_receipt_envelope(
-                    &identity.request.metadata,
-                    &transition,
-                    &candidate,
-                    sequence,
-                )
-                .map_err(|error| KernelPortError::Contract(error.to_string()))?;
-                let mut receipt = candidate;
-                receipt.envelope = Some(envelope);
-                validate_store_receipt_envelope(
-                    &identity.request.metadata,
-                    &transition,
-                    &receipt,
-                )
-                .map_err(|error| KernelPortError::Contract(error.to_string()))?;
+                let receipt =
+                    build_test_receipt(&identity, &transition, &hash, sequence)?;
                 *self.apply_calls.lock().expect("apply lock") += 1;
                 committed.insert(
                     key,
@@ -975,12 +1202,8 @@ mod tests {
     }
 
     fn block_on<T>(future: impl Future<Output = T>) -> T {
-        struct NoopWaker;
-        impl std::task::Wake for NoopWaker {
-            fn wake(self: std::sync::Arc<Self>) {}
-        }
-        let waker = std::task::Waker::from(std::sync::Arc::new(NoopWaker));
-        let mut context = Context::from_waker(&waker);
+        let waker = std::task::Waker::noop();
+        let mut context = Context::from_waker(waker);
         let mut future = Box::pin(future);
         loop {
             match future.as_mut().poll(&mut context) {
