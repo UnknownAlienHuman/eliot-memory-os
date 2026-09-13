@@ -1,6 +1,6 @@
 //! Bounded provider-neutral process stream persistence-session contract.
 
-use eliot_contracts::{canonical_json_bytes, sha256_hex};
+use eliot_contracts::{EpochId, StateFence, canonical_json_bytes, sha256_hex};
 use serde::Serialize;
 use thiserror::Error;
 
@@ -143,6 +143,31 @@ fn validate_binding(binding: &ProcessExecutionBinding) -> Result<(), ProcessStre
             .map_err(|_| ProcessStreamSinkError::InvalidBinding)?;
     }
     Ok(())
+}
+
+/// Separate optional canonical validation for one execution binding.
+///
+/// Scalar checks in [`validate_binding`] are preserved unchanged and are not
+/// modified here. This function never derives a canonical epoch from the
+/// scalar `authority_epoch` (no coercion): it returns `Ok(())` only when the
+/// binding carries `Some` canonical authority and that exact tuple authorizes
+/// `expected` via [`StateFence::authorizes_canonical`]. Scalar-only
+/// (`None`) and any present-but-mismatched canonical — including
+/// cross-lineage equal sequences — return `Err`.
+pub fn validate_binding_canonical(
+    binding: &ProcessExecutionBinding,
+    expected: &EpochId,
+) -> Result<(), ProcessStreamSinkError> {
+    match binding.canonical_authority() {
+        Some(stored) if StateFence::authorizes_canonical(stored, expected) => Ok(()),
+        _ => Err(ProcessStreamSinkError::InvalidBinding),
+    }
+}
+
+/// Boolean form of [`validate_binding_canonical`]: true only for an exact
+/// canonical tuple match, false for scalar-only or mismatched canonical.
+pub fn binding_canonical_authorizes(binding: &ProcessExecutionBinding, expected: &EpochId) -> bool {
+    validate_binding_canonical(binding, expected).is_ok()
 }
 
 fn validate_evidence(evidence: &ProcessStreamEvidence) -> Result<(), ProcessStreamSinkError> {

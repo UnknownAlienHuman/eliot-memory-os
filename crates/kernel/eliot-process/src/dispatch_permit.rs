@@ -21,6 +21,7 @@ use super::{
     SessionId, SuspendedProcessIdentity, ValidatedDispatch, hash_serialized, validate_hex_digest,
     validate_opaque_id, validate_revision_heads, validate_stored_digest,
 };
+use eliot_contracts::StateFence;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
@@ -387,6 +388,7 @@ impl DispatchPermitAuthority {
             permit_digest: permit.permit_digest.clone(),
             effect_digest: request.intent.effect_digest.clone(),
             validation_revision: current.validation_revision,
+            canonical_authority: permit.state_fence.canonical_epoch().cloned(),
         };
         let next_revision =
             self.replay_revision
@@ -437,6 +439,83 @@ impl DispatchPermitAuthority {
             state_fence: current.state_fence.clone(),
             validation_revision: current.validation_revision,
         })
+    }
+
+    /// Validates and consumes one permit under canonical authority.
+    ///
+    /// Scalar checks from [`Self::validate_and_consume`] are preserved
+    /// unchanged. In addition, the permit fence and the current context must
+    /// both carry a canonical epoch (`Some` on both) and the exact tuple must
+    /// match via [`StateFence::authorizes_canonical`]. Scalar-only on either
+    /// side, or a present-but-mismatched canonical (including cross-lineage
+    /// equal sequences), fails closed with no scalar fallback and without
+    /// mutating the nonce ledger.
+    pub fn validate_and_consume_canonical(
+        &mut self,
+        request: ProcessRequest,
+        observed: SuspendedProcessIdentity,
+        current: &DispatchValidationContext,
+    ) -> Result<ValidatedDispatch, ContractError> {
+        let permit_canonical = request.permit.state_fence.canonical_epoch().cloned();
+        let current_canonical = current.canonical_authority().cloned();
+        match (permit_canonical, current_canonical) {
+            (Some(fence_epoch), Some(current_epoch)) => {
+                if request.permit.state_fence.authority_epoch() != current.authority_epoch {
+                    return Err(ContractError::StaleAuthorityEpoch);
+                }
+                if !StateFence::authorizes_canonical(&fence_epoch, &current_epoch) {
+                    return Err(ContractError::StaleAuthorityEpoch);
+                }
+                // The binding constructed inside `validate_and_consume` copies
+                // canonical from the permit fence, so all three (permit fence,
+                // current, binding) share the exact tuple. The post-check below
+                // enforces the binding pair as well.
+            }
+            _ => return Err(ContractError::StaleAuthorityEpoch),
+        }
+        let validated = self.validate_and_consume(request, observed, current)?;
+        if !validated.binding().canonical_authorizes(current) {
+            // This is unreachable when the pre-check above passed and the
+            // construction site copies canonical from the permit fence, but it
+            // closes the loop fail-closed without mutating further state.
+            // Note: the nonce was already consumed by the delegated call; a
+            // canonical mismatch here indicates a logic error, so we surface it
+            // as stale authority rather than silently accepting scalar.
+            return Err(ContractError::StaleAuthorityEpoch);
+        }
+        Ok(validated)
+    }
+
+    /// Mints a recovery capability under canonical authority.
+    ///
+    /// Requires `Some` on all three canonical values — the persisted binding
+    /// authority, the binding fence epoch, and the current context authority —
+    /// with an exact-tuple match. Existing scalar
+    /// [`Self::issue_recovery_capability`] is untouched.
+    pub fn issue_recovery_capability_canonical(
+        &self,
+        binding: ProcessExecutionBinding,
+        capability_id: impl Into<String>,
+        current: &DispatchValidationContext,
+    ) -> Result<RecoveryCapability, ContractError> {
+        let binding_canonical = binding.canonical_authority().cloned();
+        let fence_canonical = binding.state_fence().canonical_epoch().cloned();
+        let current_canonical = current.canonical_authority().cloned();
+        match (binding_canonical, fence_canonical, current_canonical) {
+            (Some(binding_epoch), Some(fence_epoch), Some(current_epoch)) => {
+                if !StateFence::authorizes_canonical(&binding_epoch, &current_epoch)
+                    || !StateFence::authorizes_canonical(&fence_epoch, &current_epoch)
+                    || !StateFence::authorizes_canonical(&binding_epoch, &fence_epoch)
+                {
+                    return Err(ContractError::RecoveryCapabilityMismatch);
+                }
+            }
+            _ => return Err(ContractError::RecoveryCapabilityMismatch),
+        }
+        if !binding.canonical_authorizes(current) {
+            return Err(ContractError::RecoveryCapabilityMismatch);
+        }
+        self.issue_recovery_capability(binding, capability_id, current)
     }
 }
 

@@ -9,7 +9,7 @@
 #![forbid(unsafe_code)]
 
 use blake3::Hash;
-use eliot_contracts::{canonical_json_bytes, sha256_hex};
+use eliot_contracts::{EpochId, StateFence, canonical_json_bytes, sha256_hex};
 use eliot_instrument_api::{Assertability, EvidenceAxes, EvidenceStatus};
 use eliot_platform::ClockObservation;
 use schemars::JsonSchema;
@@ -174,6 +174,8 @@ pub struct FencingToken {
     authority_epoch: u64,
     generation: Generation,
     nonce: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    canonical_epoch: Option<EpochId>,
 }
 
 impl FencingToken {
@@ -193,7 +195,39 @@ impl FencingToken {
             authority_epoch,
             generation,
             nonce: validate_opaque_id("fence_nonce", nonce.into())?,
+            canonical_epoch: None,
         })
+    }
+
+    /// Creates inert fence data carrying both the scalar epoch and the
+    /// canonical lineage-aware epoch. Both values are supplied explicitly;
+    /// neither is derived from the other and no coercion is performed.
+    pub fn new_with_canonical(
+        authority_epoch: u64,
+        generation: Generation,
+        nonce: impl Into<String>,
+        canonical_epoch: EpochId,
+    ) -> Result<Self, ContractError> {
+        if authority_epoch == 0 {
+            return Err(ContractError::InvalidValue {
+                field: "authority_epoch",
+                reason: "must be non-zero",
+            });
+        }
+        Ok(Self {
+            authority_epoch,
+            generation,
+            nonce: validate_opaque_id("fence_nonce", nonce.into())?,
+            canonical_epoch: Some(canonical_epoch),
+        })
+    }
+
+    /// Returns a copy carrying the supplied canonical epoch alongside the
+    /// existing scalar epoch. The scalar value is preserved unchanged.
+    #[must_use]
+    pub fn with_canonical_epoch(mut self, canonical_epoch: EpochId) -> Self {
+        self.canonical_epoch = Some(canonical_epoch);
+        self
     }
 
     /// Returns the authority epoch.
@@ -209,6 +243,61 @@ impl FencingToken {
     /// Returns the opaque nonce.
     pub fn nonce(&self) -> &str {
         &self.nonce
+    }
+
+    /// Returns the additive canonical epoch, when present.
+    ///
+    /// Scalar-only fences return `None` and every canonical-authority method
+    /// fails closed for them (quarantine: no promotion from scalar).
+    pub const fn canonical_epoch(&self) -> Option<&EpochId> {
+        self.canonical_epoch.as_ref()
+    }
+
+    /// Exact-tuple canonical authorization against the expected epoch.
+    ///
+    /// Returns true only when a canonical epoch is present and
+    /// [`StateFence::authorizes_canonical`] holds (exact `(lineage_id,
+    /// sequence)` tuple via `is_same_authority`). Scalar-only returns false.
+    /// Cross-lineage equal sequences never authorize. No fallback to scalar.
+    pub fn authorizes_canonical(&self, expected: &EpochId) -> bool {
+        match self.canonical_epoch.as_ref() {
+            Some(stored) => StateFence::authorizes_canonical(stored, expected),
+            None => false,
+        }
+    }
+
+    /// Fail-closed exact-tuple validation against the expected epoch.
+    pub fn validate_canonical_against(&self, expected: &EpochId) -> Result<(), ContractError> {
+        match self.canonical_epoch.as_ref() {
+            Some(stored) if StateFence::authorizes_canonical(stored, expected) => Ok(()),
+            _ => Err(ContractError::StaleAuthorityEpoch),
+        }
+    }
+
+    /// Fail-closed direct-child advancement check against an explicit parent.
+    ///
+    /// Returns `Ok(())` only when a canonical epoch is present and
+    /// [`StateFence::validate_canonical_epoch`] accepts the one-step
+    /// transition. Cross-lineage and non-consecutive sequences fail closed
+    /// without any scalar fallback.
+    pub fn validate_canonical_epoch(&self, parent: &EpochId) -> Result<(), ContractError> {
+        match self.canonical_epoch.as_ref() {
+            Some(candidate) => StateFence::validate_canonical_epoch(candidate, parent)
+                .map_err(|_| ContractError::StaleAuthorityEpoch),
+            None => Err(ContractError::StaleAuthorityEpoch),
+        }
+    }
+
+    /// Lineage-bound canonical digest for the carried epoch, when present.
+    ///
+    /// Scalar-only returns `None`. Equal sequences in different lineages
+    /// digest differently; the scalar value never enters the digest.
+    pub fn canonical_epoch_digest(&self) -> Option<String> {
+        self.canonical_epoch.as_ref().and_then(|epoch| {
+            StateFence::canonical_epoch_digest(epoch)
+                .ok()
+                .map(|digest| digest.as_str().to_owned())
+        })
     }
 
     /// Checks exact fence equality.
@@ -601,6 +690,8 @@ pub struct ProcessOwnerBinding {
     principal_digest: String,
     authority_epoch: u64,
     generation: Generation,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    canonical_epoch: Option<EpochId>,
 }
 
 impl ProcessOwnerBinding {
@@ -622,9 +713,45 @@ impl ProcessOwnerBinding {
             principal_digest: principal_digest.into(),
             authority_epoch,
             generation,
+            canonical_epoch: None,
         };
         validate_hex_digest("owner_principal_digest", &binding.principal_digest)?;
         Ok(binding)
+    }
+
+    /// Creates a validated owner binding carrying both the scalar epoch and
+    /// the canonical epoch. Both values are supplied explicitly; neither is
+    /// derived from the other.
+    pub fn new_with_canonical(
+        module_id: impl Into<String>,
+        principal_digest: impl Into<String>,
+        authority_epoch: u64,
+        generation: Generation,
+        canonical_epoch: EpochId,
+    ) -> Result<Self, ContractError> {
+        if authority_epoch == 0 {
+            return Err(ContractError::InvalidValue {
+                field: "owner_authority_epoch",
+                reason: "authority epoch must be non-zero",
+            });
+        }
+        let binding = Self {
+            module_id: validate_opaque_id("owner_module_id", module_id.into())?,
+            principal_digest: principal_digest.into(),
+            authority_epoch,
+            generation,
+            canonical_epoch: Some(canonical_epoch),
+        };
+        validate_hex_digest("owner_principal_digest", &binding.principal_digest)?;
+        Ok(binding)
+    }
+
+    /// Returns a copy carrying the supplied canonical epoch alongside the
+    /// existing scalar epoch.
+    #[must_use]
+    pub fn with_canonical_epoch(mut self, canonical_epoch: EpochId) -> Self {
+        self.canonical_epoch = Some(canonical_epoch);
+        self
     }
 
     /// Returns the authenticated module identity.
@@ -642,6 +769,45 @@ impl ProcessOwnerBinding {
     /// Returns the bound generation.
     pub const fn generation(&self) -> Generation {
         self.generation
+    }
+
+    /// Returns the additive canonical epoch, when present.
+    pub const fn canonical_epoch(&self) -> Option<&EpochId> {
+        self.canonical_epoch.as_ref()
+    }
+
+    /// Exact-tuple canonical authorization. Scalar-only returns false.
+    pub fn authorizes_canonical(&self, expected: &EpochId) -> bool {
+        match self.canonical_epoch.as_ref() {
+            Some(stored) => StateFence::authorizes_canonical(stored, expected),
+            None => false,
+        }
+    }
+
+    /// Fail-closed exact-tuple validation.
+    pub fn validate_canonical_against(&self, expected: &EpochId) -> Result<(), ContractError> {
+        match self.canonical_epoch.as_ref() {
+            Some(stored) if StateFence::authorizes_canonical(stored, expected) => Ok(()),
+            _ => Err(ContractError::StaleAuthorityEpoch),
+        }
+    }
+
+    /// Fail-closed direct-child advancement check.
+    pub fn validate_canonical_epoch(&self, parent: &EpochId) -> Result<(), ContractError> {
+        match self.canonical_epoch.as_ref() {
+            Some(candidate) => StateFence::validate_canonical_epoch(candidate, parent)
+                .map_err(|_| ContractError::StaleAuthorityEpoch),
+            None => Err(ContractError::StaleAuthorityEpoch),
+        }
+    }
+
+    /// Lineage-bound canonical digest, when present; otherwise `None`.
+    pub fn canonical_epoch_digest(&self) -> Option<String> {
+        self.canonical_epoch.as_ref().and_then(|epoch| {
+            StateFence::canonical_epoch_digest(epoch)
+                .ok()
+                .map(|digest| digest.as_str().to_owned())
+        })
     }
 }
 
@@ -987,6 +1153,8 @@ pub struct DispatchValidationContext {
     authority_epoch: u64,
     revision_heads: BTreeMap<String, String>,
     validation_revision: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    canonical_authority: Option<EpochId>,
 }
 
 impl DispatchValidationContext {
@@ -1004,9 +1172,93 @@ impl DispatchValidationContext {
             authority_epoch,
             revision_heads,
             validation_revision,
+            canonical_authority: None,
         };
         context.validate()?;
         Ok(context)
+    }
+
+    /// Creates a validation snapshot carrying both the scalar epoch and the
+    /// canonical authority. Both values are supplied explicitly; neither is
+    /// derived from the other.
+    pub fn new_with_canonical(
+        clock: ClockObservation,
+        state_fence: FencingToken,
+        authority_epoch: u64,
+        revision_heads: BTreeMap<String, String>,
+        validation_revision: u64,
+        canonical_authority: EpochId,
+    ) -> Result<Self, ContractError> {
+        let context = Self {
+            clock,
+            state_fence,
+            authority_epoch,
+            revision_heads,
+            validation_revision,
+            canonical_authority: Some(canonical_authority),
+        };
+        context.validate()?;
+        Ok(context)
+    }
+
+    /// Returns a copy carrying the supplied canonical authority alongside the
+    /// existing scalar epoch.
+    #[must_use]
+    pub fn with_canonical_authority(mut self, canonical_authority: EpochId) -> Self {
+        self.canonical_authority = Some(canonical_authority);
+        self
+    }
+
+    /// Alias for [`Self::with_canonical_authority`] kept for the additive
+    /// T2-S02 builder shape (`with_canonical_epoch`).
+    #[must_use]
+    pub fn with_canonical_epoch(self, canonical_authority: EpochId) -> Self {
+        self.with_canonical_authority(canonical_authority)
+    }
+
+    /// Returns the additive canonical authority, when present.
+    pub const fn canonical_authority(&self) -> Option<&EpochId> {
+        self.canonical_authority.as_ref()
+    }
+
+    /// Exact-tuple canonical authorization for one fence under this context.
+    ///
+    /// Returns true only when both this context and `fence` carry a canonical
+    /// epoch, the scalar epochs agree, and
+    /// [`StateFence::authorizes_canonical`] holds for the exact tuple.
+    /// Scalar-only on either side returns false. No fallback to scalar when
+    /// canonical is present-but-mismatched.
+    pub fn canonical_authorizes(&self, fence: &FencingToken) -> bool {
+        match (self.canonical_authority.as_ref(), fence.canonical_epoch()) {
+            (Some(current), Some(fence_epoch)) => {
+                if self.authority_epoch != fence.authority_epoch() {
+                    return false;
+                }
+                if self.state_fence.authority_epoch != fence.authority_epoch() {
+                    return false;
+                }
+                StateFence::authorizes_canonical(fence_epoch, current)
+            }
+            _ => false,
+        }
+    }
+
+    /// Fail-closed canonical validation for one fence under this context.
+    pub fn validate_canonical_against(&self, fence: &FencingToken) -> Result<(), ContractError> {
+        if self.canonical_authorizes(fence) {
+            Ok(())
+        } else {
+            Err(ContractError::StaleAuthorityEpoch)
+        }
+    }
+
+    /// Lineage-bound digest for the context canonical authority, if present.
+    pub fn canonical_authority_digest(&self) -> Option<String> {
+        self.canonical_authority.as_ref().and_then(|epoch| {
+            StateFence::canonical_epoch_digest(epoch)
+                .ok()
+                .map(|digest| digest.as_str().to_owned())
+        })
     }
 
     fn validate(&self) -> Result<(), ContractError> {
@@ -1062,6 +1314,8 @@ pub struct ProcessExecutionBinding {
     permit_digest: String,
     effect_digest: String,
     validation_revision: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    canonical_authority: Option<EpochId>,
 }
 
 impl ProcessExecutionBinding {
@@ -1133,6 +1387,63 @@ impl ProcessExecutionBinding {
     /// Returns the validation revision.
     pub const fn validation_revision(&self) -> u64 {
         self.validation_revision
+    }
+
+    /// Returns the additive canonical authority, when present.
+    ///
+    /// Scalar-only bindings return `None` and every canonical-authority
+    /// method fails closed for them.
+    pub const fn canonical_authority(&self) -> Option<&EpochId> {
+        self.canonical_authority.as_ref()
+    }
+
+    /// Exact-tuple canonical authorization under one validation context.
+    ///
+    /// Returns true only when this binding, its state fence, and `current`
+    /// all carry a canonical epoch, the scalar epochs agree, and every
+    /// canonical pair matches via [`StateFence::authorizes_canonical`].
+    /// Any missing or mismatched canonical returns false with no scalar
+    /// fallback.
+    pub fn canonical_authorizes(&self, current: &DispatchValidationContext) -> bool {
+        match (
+            self.canonical_authority.as_ref(),
+            current.canonical_authority.as_ref(),
+            self.state_fence.canonical_epoch(),
+        ) {
+            (Some(binding_epoch), Some(current_epoch), Some(fence_epoch)) => {
+                if self.authority_epoch != current.authority_epoch {
+                    return false;
+                }
+                if self.state_fence.authority_epoch() != current.state_fence.authority_epoch() {
+                    return false;
+                }
+                StateFence::authorizes_canonical(binding_epoch, current_epoch)
+                    && StateFence::authorizes_canonical(fence_epoch, current_epoch)
+                    && StateFence::authorizes_canonical(binding_epoch, fence_epoch)
+            }
+            _ => false,
+        }
+    }
+
+    /// Fail-closed canonical validation under one validation context.
+    pub fn validate_canonical_against(
+        &self,
+        current: &DispatchValidationContext,
+    ) -> Result<(), ContractError> {
+        if self.canonical_authorizes(current) {
+            Ok(())
+        } else {
+            Err(ContractError::StaleAuthorityEpoch)
+        }
+    }
+
+    /// Lineage-bound digest for the binding canonical authority, if present.
+    pub fn canonical_authority_digest(&self) -> Option<String> {
+        self.canonical_authority.as_ref().and_then(|epoch| {
+            StateFence::canonical_epoch_digest(epoch)
+                .ok()
+                .map(|digest| digest.as_str().to_owned())
+        })
     }
 
     fn matches_identity(&self, identity: &ProcessIdentity) -> bool {
@@ -1887,6 +2198,12 @@ impl EliotdLiveSupervisionEvidence {
 /// Exact request/session evidence attached to one authenticated `daemon_ready`
 /// publication.  The request payload is represented by its canonical digest;
 /// the raw request remains on the authenticated transport only.
+///
+/// This evidence copy stays scalar-only by design: it is constructed by struct
+/// literal outside this crate, so any additive field would break downstream
+/// literals. Canonical authority lives in `FencingToken`/`ProcessOwnerBinding`/
+/// `DispatchValidationContext`/`ProcessExecutionBinding`; this scalar-only
+/// evidence is quarantined from canonical authority and never promotes it.
 #[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct EliotdLiveReadyEvidence {
@@ -1933,6 +2250,14 @@ impl EliotdLiveReadyEvidence {
 /// authenticated readiness and was observed in its executor Job.  This is an
 /// inert evidence record: status consumers must independently re-read the
 /// manifest, receipt file, ORS, and live process contour.
+///
+/// This receipt copy stays scalar-only by design: it is a pub-field evidence
+/// copy (constructed via `new` from evidence assembled outside this crate),
+/// so any additive pub field would risk breaking downstream construction and
+/// wire-shape expectations. Canonical authority lives in
+/// `FencingToken`/`ProcessOwnerBinding`/`DispatchValidationContext`/
+/// `ProcessExecutionBinding`; this scalar-only receipt is quarantined from
+/// canonical authority and never promotes it.
 #[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct EliotdLiveReceipt {
@@ -3129,6 +3454,349 @@ mod tests {
         assert!(matches!(
             authority.issue(&intent, issuance("duplicate")?),
             Err(ContractError::DuplicateValue { .. })
+        ));
+        Ok(())
+    }
+
+    const CANONICAL_LINEAGE_A: &str = "550e8400-e29b-41d4-a716-446655440000";
+    const CANONICAL_LINEAGE_B: &str = "550e8400-e29b-41d4-a716-446655440001";
+
+    fn canonical_epoch(lineage: &str, sequence: u64) -> Result<EpochId, Box<dyn Error>> {
+        let lineage_id = eliot_contracts::EpochLineageId::new(lineage)
+            .map_err(|e| format!("invalid lineage: {e:?}"))?;
+        let sequence = std::num::NonZeroU64::new(sequence).ok_or("sequence must be non-zero")?;
+        EpochId::new(lineage_id, sequence).map_err(|e| format!("invalid epoch: {e:?}").into())
+    }
+
+    fn canonical_fence(
+        scalar: u64,
+        lineage: &str,
+        sequence: u64,
+        nonce: &str,
+    ) -> Result<FencingToken, Box<dyn Error>> {
+        Ok(FencingToken::new_with_canonical(
+            scalar,
+            Generation::new(1)?,
+            nonce,
+            canonical_epoch(lineage, sequence)?,
+        )?)
+    }
+
+    fn canonical_context(
+        fence: FencingToken,
+        scalar: u64,
+        lineage: &str,
+        sequence: u64,
+    ) -> Result<DispatchValidationContext, Box<dyn Error>> {
+        Ok(DispatchValidationContext::new_with_canonical(
+            ClockObservation {
+                valid_time_ms: Some(150),
+                known_time_ms: Some(150),
+                transaction_sequence: None,
+                monotonic_ns: Some(1),
+            },
+            fence,
+            scalar,
+            revisions(),
+            41,
+            canonical_epoch(lineage, sequence)?,
+        )?)
+    }
+
+    #[test]
+    fn scalar_only_roundtrip_is_readable_but_canonically_quarantined() -> TestResult {
+        let scalar_fence = fence()?;
+        assert!(scalar_fence.canonical_epoch().is_none());
+        let probe = canonical_epoch(CANONICAL_LINEAGE_A, 7)?;
+        assert!(!scalar_fence.authorizes_canonical(&probe));
+        assert!(scalar_fence.validate_canonical_against(&probe).is_err());
+        assert!(scalar_fence.canonical_epoch_digest().is_none());
+        assert!(scalar_fence.validate_canonical_epoch(&probe).is_err());
+
+        let owner = ProcessOwnerBinding::new("module-1", "c".repeat(64), 7, Generation::new(1)?)?;
+        assert!(owner.canonical_epoch().is_none());
+        assert!(!owner.authorizes_canonical(&probe));
+
+        let ctx = context(150)?;
+        assert!(ctx.canonical_authority().is_none());
+        assert!(!ctx.canonical_authorizes(&scalar_fence));
+        assert!(ctx.validate_canonical_against(&scalar_fence).is_err());
+        assert!(ctx.canonical_authority_digest().is_none());
+
+        let (_, validated) = validated()?;
+        let binding = validated.binding();
+        assert!(binding.canonical_authority().is_none());
+        assert!(!binding.canonical_authorizes(&ctx));
+        assert!(binding.canonical_authority_digest().is_none());
+
+        // Scalar-only wire omits canonical keys and round-trips.
+        let fence_value = serde_json::to_value(&scalar_fence)?;
+        assert!(fence_value.get("canonical_epoch").is_none());
+        let restored: FencingToken = serde_json::from_value(fence_value)?;
+        assert_eq!(restored, scalar_fence);
+
+        let ctx_value = serde_json::to_value(&ctx)?;
+        assert!(ctx_value.get("canonical_authority").is_none());
+        let restored_ctx: DispatchValidationContext = serde_json::from_value(ctx_value)?;
+        assert_eq!(restored_ctx, ctx);
+        Ok(())
+    }
+
+    #[test]
+    fn canonical_bearing_authorizes_exact_tuple() -> TestResult {
+        let epoch = canonical_epoch(CANONICAL_LINEAGE_A, 7)?;
+        let fence = canonical_fence(7, CANONICAL_LINEAGE_A, 7, "fence-canon-1")?;
+        assert_eq!(fence.canonical_epoch(), Some(&epoch));
+        assert!(fence.authorizes_canonical(&epoch));
+        assert!(fence.validate_canonical_against(&epoch).is_ok());
+        assert!(fence.canonical_epoch_digest().is_some());
+
+        let owner = ProcessOwnerBinding::new_with_canonical(
+            "module-1",
+            "c".repeat(64),
+            7,
+            Generation::new(1)?,
+            epoch.clone(),
+        )?;
+        assert!(owner.authorizes_canonical(&epoch));
+
+        let ctx = canonical_context(fence.clone(), 7, CANONICAL_LINEAGE_A, 7)?;
+        assert!(ctx.canonical_authorizes(&fence));
+
+        // Full dispatch flow under canonical authority.
+        let mut authority = authority()?;
+        let intent = intent()?;
+        let permit = authority.issue(
+            &intent,
+            PermitIssuance::new(
+                ActionLeaseRef::new("lease-1")?,
+                canonical_fence(7, CANONICAL_LINEAGE_A, 7, "fence-canon-flow")?,
+                revisions(),
+                100,
+                200,
+                "canon-flow-1",
+            )?,
+        )?;
+        let flow_fence = permit.state_fence.clone();
+        let request = ProcessRequest::new(intent.clone(), permit)?;
+        let flow_ctx = DispatchValidationContext::new_with_canonical(
+            ClockObservation {
+                valid_time_ms: Some(150),
+                known_time_ms: Some(150),
+                transaction_sequence: None,
+                monotonic_ns: Some(1),
+            },
+            flow_fence.clone(),
+            7,
+            revisions(),
+            41,
+            canonical_epoch(CANONICAL_LINEAGE_A, 7)?,
+        )?;
+        assert!(flow_ctx.canonical_authorizes(&flow_fence));
+        let validated =
+            authority.validate_and_consume_canonical(request, observed(&intent)?, &flow_ctx)?;
+        assert!(validated.binding().canonical_authorizes(&flow_ctx));
+        let capability = authority.issue_recovery_capability_canonical(
+            validated.binding().clone(),
+            "p07-canon-1",
+            &flow_ctx,
+        )?;
+        assert_eq!(capability.capability_id(), "p07-canon-1");
+        Ok(())
+    }
+
+    #[test]
+    fn canonical_mismatch_is_quarantined_skip_and_cross_lineage() -> TestResult {
+        let fence_a7 = canonical_fence(7, CANONICAL_LINEAGE_A, 7, "fence-a7")?;
+        let epoch_a7 = canonical_epoch(CANONICAL_LINEAGE_A, 7)?;
+        let epoch_a9 = canonical_epoch(CANONICAL_LINEAGE_A, 9)?;
+        let epoch_foreign7 = canonical_epoch(CANONICAL_LINEAGE_B, 7)?;
+        let epoch_a8 = canonical_epoch(CANONICAL_LINEAGE_A, 8)?;
+
+        // Exact-tuple authorization rejects skip and cross-lineage.
+        assert!(!fence_a7.authorizes_canonical(&epoch_a9));
+        assert!(!fence_a7.authorizes_canonical(&epoch_foreign7));
+        assert!(fence_a7.validate_canonical_against(&epoch_a9).is_err());
+        assert!(
+            fence_a7
+                .validate_canonical_against(&epoch_foreign7)
+                .is_err()
+        );
+
+        // Advancement is direct-child only with closed errors.
+        assert!(
+            eliot_contracts::StateFence::validate_canonical_epoch(&epoch_a8, &epoch_a7).is_ok()
+        );
+        assert_eq!(
+            eliot_contracts::StateFence::validate_canonical_epoch(&epoch_a9, &epoch_a7),
+            Err(eliot_contracts::EpochContractError::NotDirectChild)
+        );
+        assert_eq!(
+            eliot_contracts::StateFence::validate_canonical_epoch(&epoch_foreign7, &epoch_a7),
+            Err(eliot_contracts::EpochContractError::ParentLineageMismatch)
+        );
+
+        // Context-level and authority-level quarantine without nonce mutation.
+        let ctx_b7 = canonical_context(fence_a7.clone(), 7, CANONICAL_LINEAGE_B, 7)?;
+        assert!(!ctx_b7.canonical_authorizes(&fence_a7));
+
+        let mut authority = authority()?;
+        let intent = intent()?;
+        let permit = authority.issue(
+            &intent,
+            PermitIssuance::new(
+                ActionLeaseRef::new("lease-1")?,
+                canonical_fence(7, CANONICAL_LINEAGE_A, 7, "fence-quarantine")?,
+                revisions(),
+                100,
+                200,
+                "canon-quarantine-1",
+            )?,
+        )?;
+        let request = ProcessRequest::new(intent.clone(), permit)?;
+        let before = authority.consumed_permit_count();
+        assert!(
+            authority
+                .validate_and_consume_canonical(request, observed(&intent)?, &ctx_b7)
+                .is_err()
+        );
+        assert_eq!(authority.consumed_permit_count(), before);
+        Ok(())
+    }
+
+    #[test]
+    fn no_coercion_tampered_scalar_and_canonical_both_fail() -> TestResult {
+        let fence_match = canonical_fence(7, CANONICAL_LINEAGE_A, 7, "fence-match")?;
+        let ctx_match = canonical_context(fence_match.clone(), 7, CANONICAL_LINEAGE_A, 7)?;
+        assert!(ctx_match.canonical_authorizes(&fence_match));
+
+        // Same canonical tuple but tampered scalar epoch still fails (scalar
+        // equality is required; no derivation from canonical).
+        let fence_tampered_scalar = canonical_fence(8, CANONICAL_LINEAGE_A, 7, "fence-match")?;
+        assert!(!ctx_match.canonical_authorizes(&fence_tampered_scalar));
+        assert!(
+            ctx_match
+                .validate_canonical_against(&fence_tampered_scalar)
+                .is_err()
+        );
+
+        // Same scalar epoch but tampered canonical still fails (no fallback to
+        // scalar when canonical is present-but-mismatched).
+        let ctx_tampered_canonical =
+            canonical_context(fence_match.clone(), 7, CANONICAL_LINEAGE_B, 7)?;
+        assert!(!ctx_tampered_canonical.canonical_authorizes(&fence_match));
+
+        // Binding-level also requires both.
+        let mut authority = authority()?;
+        let intent = intent()?;
+        let shared_fence = canonical_fence(7, CANONICAL_LINEAGE_A, 7, "fence-coercion-base")?;
+        let shared_ctx = canonical_context(shared_fence.clone(), 7, CANONICAL_LINEAGE_A, 7)?;
+        let permit = authority.issue(
+            &intent,
+            PermitIssuance::new(
+                ActionLeaseRef::new("lease-1")?,
+                shared_fence,
+                revisions(),
+                100,
+                200,
+                "canon-coercion-1",
+            )?,
+        )?;
+        let request = ProcessRequest::new(intent.clone(), permit)?;
+        let validated =
+            authority.validate_and_consume_canonical(request, observed(&intent)?, &shared_ctx)?;
+        assert!(validated.binding().canonical_authorizes(&shared_ctx));
+        assert!(
+            !validated
+                .binding()
+                .canonical_authorizes(&ctx_tampered_canonical)
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn wire_compat_scalar_bytes_identical_and_old_reader_rejects_canonical() -> TestResult {
+        #[derive(serde::Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct OldFencingToken {
+            authority_epoch: u64,
+            generation: Generation,
+            nonce: String,
+        }
+
+        let scalar = fence()?;
+        let scalar_value = serde_json::to_value(&scalar)?;
+        assert!(scalar_value.get("canonical_epoch").is_none());
+        // Scalar-only preserves the exact three-field shape.
+        assert_eq!(
+            scalar_value.as_object().map(serde_json::Map::len),
+            Some(3),
+            "scalar-only fence must keep the v3 three-field shape"
+        );
+        let old_ok: OldFencingToken = serde_json::from_value(scalar_value.clone())?;
+        assert_eq!(old_ok.authority_epoch, 7);
+        assert_eq!(old_ok.generation, Generation::new(1)?);
+        assert_eq!(old_ok.nonce, "fence-7-1");
+
+        let canonical = canonical_fence(7, CANONICAL_LINEAGE_A, 7, "fence-wire")?;
+        let canonical_value = serde_json::to_value(&canonical)?;
+        assert!(canonical_value.get("canonical_epoch").is_some());
+        // Old scalar-only reader with deny_unknown_fields fails closed.
+        assert!(serde_json::from_value::<OldFencingToken>(canonical_value).is_err());
+
+        // Scalar-only binding bytes also omit the additive key.
+        let (_, validated) = validated()?;
+        let binding_value = serde_json::to_value(validated.binding())?;
+        assert!(binding_value.get("canonical_authority").is_none());
+
+        // Separate stream-sink canonical validation: scalar-only fails closed,
+        // canonical-bearing authorizes only on the exact tuple with no coercion.
+        let expected = canonical_epoch(CANONICAL_LINEAGE_A, 7)?;
+        let foreign = canonical_epoch(CANONICAL_LINEAGE_B, 7)?;
+        assert!(!crate::binding_canonical_authorizes(
+            validated.binding(),
+            &expected
+        ));
+        assert!(crate::validate_binding_canonical(validated.binding(), &expected).is_err());
+        // Canonical-bearing binding authorizes via the sink helper as well.
+        let mut authority = authority()?;
+        let intent = intent()?;
+        let permit = authority.issue(
+            &intent,
+            PermitIssuance::new(
+                ActionLeaseRef::new("lease-1")?,
+                canonical_fence(7, CANONICAL_LINEAGE_A, 7, "fence-sink-wire")?,
+                revisions(),
+                100,
+                200,
+                "canon-sink-wire-1",
+            )?,
+        )?;
+        let request = ProcessRequest::new(intent.clone(), permit)?;
+        let sink_fence = request.permit.state_fence.clone();
+        let sink_ctx = DispatchValidationContext::new_with_canonical(
+            ClockObservation {
+                valid_time_ms: Some(150),
+                known_time_ms: Some(150),
+                transaction_sequence: None,
+                monotonic_ns: Some(1),
+            },
+            sink_fence,
+            7,
+            revisions(),
+            41,
+            canonical_epoch(CANONICAL_LINEAGE_A, 7)?,
+        )?;
+        let sink_validated =
+            authority.validate_and_consume_canonical(request, observed(&intent)?, &sink_ctx)?;
+        assert!(crate::binding_canonical_authorizes(
+            sink_validated.binding(),
+            &expected
+        ));
+        assert!(crate::validate_binding_canonical(sink_validated.binding(), &expected).is_ok());
+        assert!(!crate::binding_canonical_authorizes(
+            sink_validated.binding(),
+            &foreign
         ));
         Ok(())
     }

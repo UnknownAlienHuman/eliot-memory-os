@@ -44,6 +44,8 @@ struct ProcessExecutionBindingValidationWire {
     permit_digest: String,
     effect_digest: String,
     validation_revision: u64,
+    #[serde(default)]
+    canonical_authority: Option<EpochId>,
 }
 
 fn validate_process_execution_binding(
@@ -53,6 +55,10 @@ fn validate_process_execution_binding(
         serde_json::to_value(binding).map_err(|_| ProcessStreamEvidenceError::InvalidBinding)?;
     let wire: ProcessExecutionBindingValidationWire = serde_json::from_value(serialized)
         .map_err(|_| ProcessStreamEvidenceError::InvalidBinding)?;
+    // Additive mirror: accept an optional canonical authority without changing
+    // scalar acceptance. The value is intentionally not coerced or promoted
+    // here; canonical authorization lives in the P-03 canonical methods.
+    let _ = wire.canonical_authority.as_ref();
 
     for value in [
         wire.operation_id.as_str(),
