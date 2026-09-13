@@ -458,7 +458,6 @@ fn requested_and_admitted_reconcile_in_place_without_readmission() {
 /// the one-line fix. This test is real store-backed code, kept ignored so
 /// the suite stays green; it must go red pre-fix and green post-fix.
 #[test]
-#[ignore = "blocked on ORS advance_native_worker_claim never applying its target (crates/kernel/eliot-ors/src/store.rs:1327-1328 omits `next.state = target`, unlike advance_host_request at store.rs:1178-1179); Unknown/Reconciling/Terminal rows are unreachable at base so the route's Unknown->Reconciling advance cannot be proven; owner: ORS (#15)"]
 fn unknown_advances_to_reconciling_only_terminal_absorbing() {
     let root = temp_root("unknown-terminal");
     let kernel = open_kernel(&root);

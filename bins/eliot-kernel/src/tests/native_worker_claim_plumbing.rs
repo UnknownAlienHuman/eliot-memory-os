@@ -581,7 +581,6 @@ fn claim_join_mints_no_process_request_or_permit() {
 // them after the fix with no test rewrite.
 
 #[test]
-#[ignore = "blocked by ORS advance_native_worker_claim missing next.state=target (store.rs:1328); needs ORS owner fix"]
 fn identical_claim_replays_same_receipt_across_close_reopen() {
     let (root, path) = temp_ors_path("replay");
     let now = now_ms();
@@ -621,7 +620,6 @@ fn identical_claim_replays_same_receipt_across_close_reopen() {
 }
 
 #[test]
-#[ignore = "blocked by ORS advance_native_worker_claim missing next.state=target (store.rs:1328); needs ORS owner fix"]
 fn changed_input_conflicts_with_no_effect() {
     let (root, path) = temp_ors_path("conflict");
     let now = now_ms();
@@ -679,7 +677,6 @@ fn changed_input_conflicts_with_no_effect() {
 }
 
 #[test]
-#[ignore = "blocked by ORS advance_native_worker_claim missing next.state=target (store.rs:1328); needs ORS owner fix"]
 fn lost_acknowledgement_reconciles_original_operation() {
     let (root, path) = temp_ors_path("lost-ack");
     let now = now_ms();
@@ -725,7 +722,6 @@ fn lost_acknowledgement_reconciles_original_operation() {
 }
 
 #[test]
-#[ignore = "blocked by ORS advance_native_worker_claim missing next.state=target (store.rs:1328); needs ORS owner fix"]
 fn stale_foreign_registration_cannot_use_retained_receipts() {
     let now = now_ms();
     let deadline = now.saturating_add(120_000);
@@ -795,7 +791,6 @@ fn stale_foreign_registration_cannot_use_retained_receipts() {
 }
 
 #[test]
-#[ignore = "blocked by ORS advance_native_worker_claim missing next.state=target (store.rs:1328); needs ORS owner fix"]
 fn absent_canonical_activation_performs_no_launch() {
     let now = now_ms();
     let deadline = now.saturating_add(120_000);
@@ -838,7 +833,6 @@ fn absent_canonical_activation_performs_no_launch() {
 }
 
 #[test]
-#[ignore = "blocked by ORS advance_native_worker_claim missing next.state=target (store.rs:1328); needs ORS owner fix"]
 fn credentials_stay_references_with_no_secrets_in_receipts() {
     let now = now_ms();
     let request = test_claim_request(
