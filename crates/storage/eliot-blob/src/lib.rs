@@ -11,7 +11,10 @@
 //!
 //! [`BlobStoreService`] claims the root exactly once at construction and holds
 //! the immutable [`RootOwner`] claim behind one `Arc`. Cloned handles never
-//! re-claim a root and never create a second receipt issuer. There is no global
+//! re-claim a root and never create a second receipt issuer. The owner-bound
+//! constructor binds that claim to the OS [`BlobRootOwner`] lease through one
+//! process-local single-owner registry, so a root reserved through either
+//! seam rejects a second service owner with `OwnerConflict`. There is no global
 //! state lock: reads overlap through shared platform/codec/key/AEAD locks, and
 //! same-content or same-operation identities serialize through striped shard
 //! locks. The only process-global lock is the bounded startup root-claim
@@ -22,7 +25,7 @@
 #![forbid(unsafe_code)]
 #![allow(clippy::missing_errors_doc)]
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::fs::{self, OpenOptions};
 use std::io::{Seek, SeekFrom, Write};
@@ -90,10 +93,132 @@ pub struct BlobRootOwner {
     owner_id: BlobId,
     process_id: u32,
     claim_id: String,
+    /// Normalized configured-root key shared with the service claim path.
+    /// [`owns_service_root`] is the only public comparison over it.
+    registry_key: String,
     lease: Arc<RootLeaseState>,
 }
 
 static PROCESS_ROOT_CLAIMS: OnceLock<Mutex<BTreeSet<String>>> = OnceLock::new();
+
+/// Process-wide single-owner registry shared by the OS [`BlobRootOwner`] claim
+/// path and the [`BlobStoreService`] claim path (T3-B, issue #19).
+///
+/// The two paths historically reserved different identities (an OS lease file
+/// plus `PROCESS_ROOT_CLAIMS` versus the platform port `claim_root`), so a
+/// root reserved through one seam could still admit a second service owner
+/// through the other. Both paths now reserve one normalized key here:
+/// any live entry — OS owner or service — rejects a newcomer with
+/// `OwnerConflict`. An OS owner entry is replaced by exactly one service entry
+/// when [`BlobStoreService::new_with_owner`] binds to it, and restored when
+/// that service drops. This registry is a same-process defense only;
+/// cross-process exclusion remains the OS lease file retained by the owner
+/// handle (plus the platform adapter proof for ownerless compositions).
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum RootClaimKind {
+    OsOwner { token: String },
+    Service,
+}
+
+static ROOT_OWNERSHIP: OnceLock<Mutex<BTreeMap<String, RootClaimKind>>> = OnceLock::new();
+
+/// Normalizes one configured root identity for the process-local single-owner
+/// registry. Filesystem canonicalization (symlinks, relative-vs-absolute)
+/// stays with [`canonical_root`]; this key only aligns the two claim paths
+/// that were given the same configured string.
+fn ownership_key(raw_root_id: &str) -> String {
+    let mut key = raw_root_id.replace('\\', "/");
+    if cfg!(windows) {
+        key.make_ascii_lowercase();
+    }
+    key
+}
+
+fn is_ownership_reserved(key: &str) -> bool {
+    ROOT_OWNERSHIP
+        .get()
+        .and_then(|registry| registry.lock().ok())
+        .is_some_and(|registry| registry.contains_key(key))
+}
+
+fn reserve_ownership(key: &str, kind: RootClaimKind) -> Result<(), BlobError> {
+    let registry = ROOT_OWNERSHIP.get_or_init(|| Mutex::new(BTreeMap::new()));
+    let Ok(mut registry) = registry.lock() else {
+        return Err(BlobError::Provider(
+            "Blob root ownership lock poisoned".to_owned(),
+        ));
+    };
+    if registry.contains_key(key) {
+        return Err(BlobError::OwnerConflict);
+    }
+    registry.insert(key.to_owned(), kind);
+    Ok(())
+}
+
+/// Binds one live service to the OS owner that reserved `key`. The presenting
+/// owner must be the reserver (token equality); the entry becomes `Service`
+/// so no second service — even with the same handle — can bind afterwards.
+fn bind_service_to_owner(key: &str, token: &str) -> Result<(), BlobError> {
+    let registry = ROOT_OWNERSHIP.get_or_init(|| Mutex::new(BTreeMap::new()));
+    let Ok(mut registry) = registry.lock() else {
+        return Err(BlobError::Provider(
+            "Blob root ownership lock poisoned".to_owned(),
+        ));
+    };
+    let bound = matches!(
+        registry.get(key),
+        Some(RootClaimKind::OsOwner { token: expected }) if expected == token
+    );
+    if !bound {
+        return Err(BlobError::OwnerConflict);
+    }
+    registry.insert(key.to_owned(), RootClaimKind::Service);
+    Ok(())
+}
+
+/// Restores the OS owner entry after its bound service goes away (drop or
+/// failed construction). Only a `Service` entry is replaced; any other state
+/// is left untouched so a release can never evict a newcomer.
+fn restore_os_owner(key: &str, token: &str) {
+    let Some(registry) = ROOT_OWNERSHIP.get() else {
+        return;
+    };
+    if let Ok(mut registry) = registry.lock()
+        && matches!(registry.get(key), Some(RootClaimKind::Service))
+    {
+        registry.insert(
+            key.to_owned(),
+            RootClaimKind::OsOwner {
+                token: token.to_owned(),
+            },
+        );
+    }
+}
+
+fn release_os_owner_key(key: &str, token: &str) {
+    let Some(registry) = ROOT_OWNERSHIP.get() else {
+        return;
+    };
+    if let Ok(mut registry) = registry.lock()
+        && matches!(
+            registry.get(key),
+            Some(RootClaimKind::OsOwner { token: expected }) if expected == token
+        )
+    {
+        registry.remove(key);
+    }
+}
+
+fn release_service_key(key: &str) {
+    let Some(registry) = ROOT_OWNERSHIP.get() else {
+        return;
+    };
+    if let Ok(mut registry) = registry.lock()
+        && matches!(registry.get(key), Some(RootClaimKind::Service))
+    {
+        registry.remove(key);
+    }
+}
 
 #[derive(Debug, Deserialize, Serialize)]
 struct RootLeaseRecord {
@@ -106,6 +231,7 @@ struct RootLeaseRecord {
 
 struct RootLeaseState {
     root_id: String,
+    registry_key: String,
     lock_path: PathBuf,
     token: String,
     process_id: u32,
@@ -141,6 +267,10 @@ impl Drop for RootLeaseState {
         }
         // The OS handle is the authority. Dropping it releases the claim;
         // never unlink the lock path, which would reintroduce an unlink race.
+        // Release the unified single-owner entry only while it still names
+        // this exact claim; a bound service replaces the entry and restores
+        // it on drop, so this must never evict the service entry.
+        release_os_owner_key(&self.registry_key, &self.token);
         remove_process_claim(&self.root_id);
     }
 }
@@ -153,6 +283,7 @@ impl fmt::Debug for BlobRootOwner {
             .field("owner_id", &self.owner_id)
             .field("process_id", &self.process_id)
             .field("claim_id", &self.claim_id)
+            .field("registry_key", &self.registry_key)
             .field("lease", &self.lease)
             .finish()
     }
@@ -189,22 +320,40 @@ impl BlobRootOwner {
             ));
         }
         let owner_id = BlobId::new(owner_id)?;
+        // Fail fast before touching the filesystem when the unified
+        // single-owner registry already names a live OS owner or service for
+        // this configured root. The post-acquire reservation below closes the
+        // residual race; both report the same typed conflict.
+        let registry_key = ownership_key(&configured_root);
+        if is_ownership_reserved(&registry_key) {
+            return Err(BlobError::OwnerConflict);
+        }
         let (canonical_path, root_claim_key) = canonical_root(&configured_root)?;
         let (lock_path, token, lock_file) =
             acquire_root_lease(&canonical_path, &root_claim_key, process_id)?;
+        reserve_ownership(
+            &registry_key,
+            RootClaimKind::OsOwner {
+                token: token.clone(),
+            },
+        )?;
         let claims = PROCESS_ROOT_CLAIMS.get_or_init(|| Mutex::new(BTreeSet::new()));
         let Ok(mut claims) = claims.lock() else {
+            release_os_owner_key(&registry_key, &token);
             return Err(BlobError::Provider(
                 "Blob root claim lock poisoned".to_owned(),
             ));
         };
         if !claims.insert(root_claim_key.clone()) {
+            drop(claims);
+            release_os_owner_key(&registry_key, &token);
             return Err(BlobError::OwnerConflict);
         }
 
         let stop = Arc::new(AtomicBool::new(false));
         let lease = Arc::new(RootLeaseState {
             root_id: root_claim_key.clone(),
+            registry_key: registry_key.clone(),
             lock_path,
             token: token.clone(),
             process_id,
@@ -222,6 +371,8 @@ impl BlobRootOwner {
             Ok(handle) => handle,
             Err(error) => {
                 claims.remove(&root_claim_key);
+                drop(claims);
+                release_os_owner_key(&registry_key, &token);
                 return Err(BlobError::Provider(format!(
                     "start Blob root lease heartbeat: {error}"
                 )));
@@ -229,6 +380,8 @@ impl BlobRootOwner {
         };
         let Ok(mut heartbeat_slot) = lease.heartbeat.lock() else {
             claims.remove(&root_claim_key);
+            drop(claims);
+            release_os_owner_key(&registry_key, &token);
             drop(heartbeat);
             return Err(BlobError::Provider(
                 "Blob root lease heartbeat lock poisoned".to_owned(),
@@ -245,6 +398,7 @@ impl BlobRootOwner {
             owner_id,
             process_id,
             claim_id,
+            registry_key,
             lease,
         })
     }
@@ -267,6 +421,17 @@ impl BlobRootOwner {
     #[must_use]
     pub fn claim_id(&self) -> &str {
         &self.claim_id
+    }
+
+    /// Returns true when `lease_root_id` names the same configured root this
+    /// owner was claimed for. A service lease binds to this OS claim only
+    /// through this comparison ([`BlobStoreService::new_with_owner`]); the
+    /// composition root (C3) must therefore pass the exact configured
+    /// blob-root string as the service lease `root_id`. Anything else is a
+    /// second owner and is rejected with `OwnerConflict`.
+    #[must_use]
+    pub fn owns_service_root(&self, lease_root_id: &str) -> bool {
+        ownership_key(lease_root_id) == self.registry_key
     }
 
     /// Returns the last bounded heartbeat failure observed by the native lease
@@ -1051,7 +1216,7 @@ pub struct BlobDeletionReceipt {
 /// blind retry of the physical deletion.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum BlobDeletionReconciliation {
-    Applied(BlobDeletionReceipt),
+    Applied(Box<BlobDeletionReceipt>),
     NotApplied,
     Unknown,
 }
@@ -1062,13 +1227,18 @@ pub trait BlobLiveSetPort: Send + Sync {
 
     /// Reconciles an existing deletion intent against the provider target.
     /// Implementations must return `Unknown` when they cannot prove the exact
-    /// effect identity and must not perform a blind retry.
+    /// effect identity and must not perform a blind retry. The receipt for an
+    /// `Applied` outcome must cover the residency-scoped object named by
+    /// (`locator`, `residency_sha256`): the service validates the receipt
+    /// path digest against the derived scope paths and then requires both
+    /// files to be absent.
     fn reconcile_delete(
         &mut self,
         _operation_id: &str,
         _proof: &BlobLiveSetProof,
         _locator: &BlobLocator,
         _intent_revision: u64,
+        _residency_sha256: &str,
     ) -> Result<BlobDeletionReconciliation, BlobError> {
         Ok(BlobDeletionReconciliation::Unknown)
     }
@@ -1083,6 +1253,7 @@ pub trait BlobLiveSetPort: Send + Sync {
         _proof: &BlobLiveSetProof,
         _locator: &BlobLocator,
         _intent_revision: u64,
+        _residency_sha256: &str,
         _delete: &mut dyn FnMut() -> Result<(), BlobError>,
     ) -> Result<BlobDeletionReconciliation, BlobError> {
         Err(BlobError::PlanGap(
@@ -1117,6 +1288,10 @@ struct StoredMetadata {
     /// Exact immutable receipt envelope bytes approved by the service verifier.
     receipt_bytes: Vec<u8>,
     locator: BlobLocator,
+    /// T3-B residency digest (I05-12 scope identity shim). Recomputed from
+    /// the stored locator/policy/crypto on every load; a mismatch proves the
+    /// metadata was transplanted across residency domains.
+    residency_sha256: String,
     plaintext_length: u64,
     stored_length: u64,
     envelope_length: u64,
@@ -1152,6 +1327,14 @@ impl StoredMetadata {
         validate_sha256(&self.plaintext_sha256, "plaintext_sha256")?;
         validate_sha256(&self.sealed_sha256, "sealed_sha256")?;
         validate_sha256(&self.receipt_binding_sha256, "receipt_binding_sha256")?;
+        validate_sha256(&self.residency_sha256, "residency_sha256")?;
+        // The residency binding is recomputed from the stored fields, never
+        // trusted from the stored digest alone: equal bytes under a different
+        // policy or key lineage must not validate against this object.
+        let bound = residency_scope(&self.locator, &self.policy, &self.crypto)?;
+        if bound.digest != self.residency_sha256 {
+            return Err(BlobError::MetadataPayloadMismatch);
+        }
         if self.stored_length == 0 || self.stored_length != self.envelope_length {
             return Err(BlobError::MetadataPayloadMismatch);
         }
@@ -1235,6 +1418,10 @@ struct OperationCommit {
     operation_id: String,
     idempotency_key: String,
     locator: BlobLocator,
+    /// Residency scope the operation converged to. A same-operation replay
+    /// under a rotated key resolves to this committed scope (operation
+    /// identity wins); it never silently adopts a second scope.
+    residency_sha256: String,
     metadata_sha256: String,
 }
 
@@ -1243,8 +1430,26 @@ impl OperationCommit {
         valid_operation_text(&self.operation_id, "commit.operation_id")?;
         valid_operation_text(&self.idempotency_key, "commit.idempotency_key")?;
         self.locator.validate()?;
+        validate_sha256(&self.residency_sha256, "commit.residency_sha256")?;
         validate_sha256(&self.metadata_sha256, "commit.metadata_sha256")
     }
+}
+
+/// Decodes an operation commit with an explicit legacy disposition: commits
+/// written before the T3-B residency binding carry no scope and are rejected
+/// instead of being matched to a caller-supplied locator alone.
+fn decode_commit(bytes: &[u8]) -> Result<OperationCommit, BlobError> {
+    let value: serde_json::Value =
+        serde_json::from_slice(bytes).map_err(|_| BlobError::MetadataPayloadMismatch)?;
+    if value.get("residency_sha256").is_none() {
+        return Err(BlobError::PlanGap(
+            "legacy operation commit predates T3-B residency binding; reconcile through the original stage journal or re-stage from source — never adopt by locator alone".to_owned(),
+        ));
+    }
+    let commit: OperationCommit =
+        serde_json::from_value(value).map_err(|_| BlobError::MetadataPayloadMismatch)?;
+    commit.validate()?;
+    Ok(commit)
 }
 
 impl StageJournal {
@@ -1279,6 +1484,9 @@ struct Tombstone {
     proof_id: BlobId,
     proof_snapshot_sha256: String,
     locator: BlobLocator,
+    /// Residency scope this tombstone purges. GC is per scope: purging one
+    /// domain never disturbs equal bytes in another domain.
+    residency_sha256: String,
     live_set: BlobLiveSetProof,
     payload: WorkScopePath,
     metadata: WorkScopePath,
@@ -1303,7 +1511,21 @@ impl Tombstone {
         }
         validate_sha256(&self.proof_snapshot_sha256, "tombstone.snapshot_sha256")?;
         self.locator.validate()?;
+        validate_sha256(&self.residency_sha256, "tombstone.residency_sha256")?;
         self.live_set.validate_complete()?;
+        // The tombstone paths must be exactly the derived placement for
+        // (locator, residency). A transplanted tombstone (right locator,
+        // wrong scope paths) can never authorize a deletion.
+        let scope = ResidencyScope {
+            digest: self.residency_sha256.clone(),
+        };
+        if scoped_payload_path(&self.locator, &scope)?.normalized_identity()
+            != self.payload.normalized_identity()
+            || scoped_metadata_path(&self.locator, &scope)?.normalized_identity()
+                != self.metadata.normalized_identity()
+        {
+            return Err(BlobError::MetadataPayloadMismatch);
+        }
         if self.live_set.proof_id != self.proof_id
             || self.live_set.snapshot_sha256 != self.proof_snapshot_sha256
         {
@@ -1376,12 +1598,36 @@ impl Tombstone {
     }
 }
 
+/// Decodes stored blob metadata with an explicit migration disposition:
+/// metadata written before the T3-B residency binding carries no scope and is
+/// rejected instead of being matched to a caller-supplied locator alone.
+/// Recovery is an explicit re-stage from source (re-encrypt-copy) with a new
+/// receipt — never a silent adoption under a default domain.
+fn decode_metadata(bytes: &[u8]) -> Result<StoredMetadata, BlobError> {
+    let value: serde_json::Value =
+        serde_json::from_slice(bytes).map_err(|_| BlobError::MetadataPayloadMismatch)?;
+    if value.get("residency_sha256").is_none() {
+        return Err(BlobError::PlanGap(
+            "stored blob metadata predates T3-B residency binding; re-stage from source as an explicit re-encrypt-copy with a new receipt — legacy objects are never silently adopted".to_owned(),
+        ));
+    }
+    let metadata: StoredMetadata =
+        serde_json::from_value(value).map_err(|_| BlobError::MetadataPayloadMismatch)?;
+    metadata.validate()?;
+    Ok(metadata)
+}
+
 fn decode_tombstone(bytes: &[u8]) -> Result<Tombstone, BlobError> {
     let value: serde_json::Value =
         serde_json::from_slice(bytes).map_err(|_| BlobError::MetadataPayloadMismatch)?;
     if value.get("cas").is_none() {
         return Err(BlobError::PlanGap(
             "legacy GC tombstone is missing versioned CAS authority context".to_owned(),
+        ));
+    }
+    if value.get("residency_sha256").is_none() {
+        return Err(BlobError::PlanGap(
+            "legacy GC tombstone predates T3-B residency binding; it cannot authorize a scope-blind deletion — quiesce, reconcile, and re-issue GC under the current live set".to_owned(),
         ));
     }
     serde_json::from_value(value).map_err(|_| BlobError::MetadataPayloadMismatch)
@@ -1510,10 +1756,186 @@ fn validate_deletion_receipt(
     Ok(())
 }
 
+/// T3-B residency scope (I05-12 `ObjectResidencyKey`, s-04-v2 integrated).
+///
+/// The scope digest is the canonical [`ObjectResidencyKey::key_digest`] carried
+/// by the locator itself. The on-disk `residency_sha256` field keeps its meaning
+/// (the residency digest); s-04-v2 only changes its computation from the former
+/// (locator, policy, crypto) shim to the versioned contract key. No default
+/// domain is ever substituted: a locator without a well-formed residency key is
+/// rejected by [`BlobLocator::validate`].
+///
+/// The caller-supplied policy and the converged service key are still validated
+/// at every call site, and the key lineage must equal the residency
+/// `encryption_key_domain_id` (the permitted key-lineage binding). Policy and
+/// residency travel together via
+/// [`BlobPolicyBinding::validate_for_residency`]; their cryptographic linkage
+/// lives in the API receipt binding, not in this path digest.
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct ResidencyScope {
+    digest: String,
+}
+
+fn residency_scope(
+    locator: &BlobLocator,
+    policy: &BlobPolicyBinding,
+    crypto: &CryptoDescriptor,
+) -> Result<ResidencyScope, BlobError> {
+    locator.validate()?;
+    policy.validate_for_residency(locator.residency())?;
+    crypto.validate()?;
+    if crypto.key_lineage != locator.residency().encryption_key_domain_id {
+        return Err(BlobError::InvalidField {
+            field: "crypto.key_lineage",
+            reason: "must equal residency encryption_key_domain_id",
+        });
+    }
+    let digest = locator.residency_key_digest()?;
+    Ok(ResidencyScope { digest })
+}
+
+/// Residency-scoped payload path. Equal bytes in different residency domains
+/// MUST yield different physical objects, so the residency digest is part of
+/// the file identity — never just the directory name. The derivation starts
+/// from the canonical API path (no second path scheme) and inserts the
+/// digest before the generation suffix.
+fn scoped_payload_path(
+    locator: &BlobLocator,
+    scope: &ResidencyScope,
+) -> Result<WorkScopePath, BlobError> {
+    validate_sha256(&scope.digest, "residency_sha256")?;
+    let base = payload_path(locator)?;
+    let suffix = format!(".p{}", locator.path_generation);
+    let stem = base
+        .normalized_identity()
+        .strip_suffix(suffix.as_str())
+        .ok_or(BlobError::MetadataPayloadMismatch)?;
+    WorkScopePath::new(format!("{stem}.r{}.p{}", scope.digest, locator.path_generation))
+        .map_err(|error| BlobError::InvalidContract(error.to_string()))
+}
+
+/// Residency-scoped metadata path (same construction as the payload path).
+fn scoped_metadata_path(
+    locator: &BlobLocator,
+    scope: &ResidencyScope,
+) -> Result<WorkScopePath, BlobError> {
+    validate_sha256(&scope.digest, "residency_sha256")?;
+    let base = metadata_path(locator)?;
+    let suffix = format!(".m{}", locator.path_generation);
+    let stem = base
+        .normalized_identity()
+        .strip_suffix(suffix.as_str())
+        .ok_or(BlobError::MetadataPayloadMismatch)?;
+    WorkScopePath::new(format!("{stem}.r{}.m{}", scope.digest, locator.path_generation))
+        .map_err(|error| BlobError::InvalidContract(error.to_string()))
+}
+
+/// Prefix that enumerates every residency scope stored for one locator.
+///
+/// s-04-v2 places objects under residency-scoped directories
+/// (`objects/g{R}/{rd[..2]}/{rd}/`), so scopes for one content hash spread
+/// across residency dirs. Enumeration lists the whole generation root and lets
+/// [`parse_scoped_path`] admit only byte-exact placements for the locator.
+/// Enumeration is physical scope discovery for a caller-supplied locator; it
+/// is never semantic-root discovery (liveness still comes only from the
+/// caller-supplied live-set union).
+fn scope_list_prefix(locator: &BlobLocator) -> Result<WorkScopePath, BlobError> {
+    locator.validate()?;
+    WorkScopePath::new(format!("objects/g{}/", locator.root_generation))
+        .map_err(|error| BlobError::InvalidContract(error.to_string()))
+}
+
+/// One durably stored residency scope of a locator: both files exist as a
+/// complete pair.
+struct ScopedObject {
+    scope: ResidencyScope,
+    payload: WorkScopePath,
+    metadata: WorkScopePath,
+}
+
+/// Parses the residency digest out of a scoped path and proves the path is
+/// exactly the derived placement for `(locator, digest)`. A transplanted
+/// path (right digest, wrong directory, or hand-built name) is rejected.
+///
+/// s-04-v2 layout: `objects/g{R}/{rd[..2]}/{rd}/{hash}.r{digest}.{p|m}{gen}`.
+/// The digest in the filename must reproduce the exact canonical path when
+/// rebuilt; anything else is not an object of this locator in that scope.
+fn parse_scoped_path(
+    path: &WorkScopePath,
+    locator: &BlobLocator,
+    kind: char,
+) -> Result<ResidencyScope, BlobError> {
+    let hash = locator.hash.as_str();
+    let root_prefix = format!("objects/g{}/", locator.root_generation);
+    let rest = path
+        .normalized_identity()
+        .strip_prefix(root_prefix.as_str())
+        .ok_or(BlobError::MetadataPayloadMismatch)?;
+    let mut parts = rest.splitn(3, '/');
+    let shard = parts.next().ok_or(BlobError::MetadataPayloadMismatch)?;
+    let residency_dir = parts.next().ok_or(BlobError::MetadataPayloadMismatch)?;
+    let file = parts.next().ok_or(BlobError::MetadataPayloadMismatch)?;
+    if shard.len() != 2 || residency_dir.len() != 64 {
+        return Err(BlobError::MetadataPayloadMismatch);
+    }
+    validate_sha256(residency_dir, "residency_sha256")?;
+    let stem = file
+        .strip_prefix(format!("{hash}.r").as_str())
+        .ok_or(BlobError::MetadataPayloadMismatch)?;
+    if stem.len() < 64 {
+        return Err(BlobError::MetadataPayloadMismatch);
+    }
+    let (digest, suffix) = stem.split_at(64);
+    validate_sha256(digest, "residency_sha256")?;
+    let expected_suffix = format!(".{kind}{}", locator.path_generation);
+    if suffix != expected_suffix {
+        return Err(BlobError::MetadataPayloadMismatch);
+    }
+    let scope = ResidencyScope {
+        digest: digest.to_owned(),
+    };
+    let rebuilt = match kind {
+        'p' => scoped_payload_path(locator, &scope)?,
+        _ => scoped_metadata_path(locator, &scope)?,
+    };
+    if rebuilt.normalized_identity() != path.normalized_identity() {
+        return Err(BlobError::MetadataPayloadMismatch);
+    }
+    Ok(scope)
+}
+
+/// Scope-bound AEAD nonce context: `"<content-hash>:<residency-digest>"`.
+/// Equal bytes in different domains must never reuse a nonce under one key.
+fn scope_nonce(locator: &BlobLocator, scope: &ResidencyScope) -> String {
+    format!("{}:{}", locator.hash.as_str(), scope.digest)
+}
+
+/// Per-scope GC tombstone path. Tombstones are per residency scope (not per
+/// locator) so purging one domain never disturbs another.
+fn tombstone_scope_path(
+    operation_id: &str,
+    locator: &BlobLocator,
+    scope: &ResidencyScope,
+) -> Result<WorkScopePath, BlobError> {
+    validate_sha256(&scope.digest, "residency_sha256")?;
+    WorkScopePath::new(format!(
+        "tombstones/{}-{}-r{}.json",
+        operation_id,
+        locator.hash.as_str(),
+        scope.digest
+    ))
+    .map_err(|error| BlobError::InvalidContract(error.to_string()))
+}
+
 /// Immutable claimed-root state shared by every cloned service handle.
+/// `os_owner` retains the OS lease behind the service claim for the full
+/// service lifetime when the owner-bound constructor was used; it is `None`
+/// for the ownerless unit/reference contour.
 struct RootOwner {
     lease: BlobRootLease,
     claim: RootClaimProof,
+    os_owner: Option<BlobRootOwner>,
+    service_key: String,
 }
 
 /// Striped per-content/per-operation serialization locks. There is no single
@@ -1555,6 +1977,29 @@ fn operation_shard(operation_id: &str, idempotency_key: &str) -> usize {
     (hi * 16 + lo) % SHARD_COUNT
 }
 
+impl<P, C, K, A, L> BlobStoreCore<P, C, K, A, L> {
+    /// Releases a construction-time reservation after a failed claim. A bound
+    /// service restores the reserver's OS owner entry; an ownerless attempt
+    /// only drops its own service entry.
+    fn release_construction_claim(service_key: &str, os_owner: Option<&BlobRootOwner>) {
+        if let Some(owner) = os_owner {
+            restore_os_owner(service_key, &owner.lease.token);
+        } else {
+            release_service_key(service_key);
+        }
+    }
+}
+
+impl<P, C, K, A, L> Drop for BlobStoreCore<P, C, K, A, L> {
+    fn drop(&mut self) {
+        // The core lives behind one `Arc` shared by every cloned handle, so
+        // this runs exactly once when the last handle drops. A bound service
+        // restores its reserver's OS owner entry; an ownerless service only
+        // releases its own entry and never evicts a newcomer.
+        Self::release_construction_claim(&self.owner.service_key, self.owner.os_owner.as_ref());
+    }
+}
+
 struct BlobStoreCore<P, C, K, A, L> {
     owner: RootOwner,
     platform: RwLock<P>,
@@ -1587,18 +2032,52 @@ where
 {
     fn claim(
         lease: BlobRootLease,
-        mut platform: P,
-        compression: C,
-        keys: K,
-        aead: A,
-        live_sets: L,
-        issuer_anchor: BlobIssuerTrustAnchor,
+        os_owner: Option<BlobRootOwner>,
+        ports: BlobServicePorts<P, C, K, A, L>,
     ) -> Result<Self, BlobError> {
+        let BlobServicePorts {
+            mut platform,
+            compression,
+            keys,
+            aead,
+            live_sets,
+            issuer_anchor,
+        } = ports;
         lease.validate()?;
-        let claim = platform.claim_root(&lease)?;
-        claim.validate(&lease)?;
+        // Single-owner composition (T3-B): the service claim and the OS
+        // `BlobRootOwner` claim reserve one process-local key. A root
+        // reserved through either seam rejects a second service owner here
+        // with `OwnerConflict` — the dual-claim gap this closes. An
+        // owner-bound service additionally proves it presents the reserver
+        // (token equality) and retains the OS handle, so cross-process
+        // exclusion holds for the full service lifetime.
+        let service_key = ownership_key(lease.root_id.as_str());
+        if let Some(owner) = &os_owner {
+            if !owner.owns_service_root(lease.root_id.as_str()) {
+                return Err(BlobError::OwnerConflict);
+            }
+            bind_service_to_owner(&service_key, &owner.lease.token)?;
+        } else {
+            reserve_ownership(&service_key, RootClaimKind::Service)?;
+        }
+        let claim = match platform.claim_root(&lease) {
+            Ok(claim) => claim,
+            Err(error) => {
+                Self::release_construction_claim(&service_key, os_owner.as_ref());
+                return Err(error);
+            }
+        };
+        if let Err(error) = claim.validate(&lease) {
+            Self::release_construction_claim(&service_key, os_owner.as_ref());
+            return Err(error);
+        }
         Ok(Self {
-            owner: RootOwner { lease, claim },
+            owner: RootOwner {
+                lease,
+                claim,
+                os_owner,
+                service_key,
+            },
             platform: RwLock::new(platform),
             compression: RwLock::new(compression),
             keys: RwLock::new(keys),
@@ -1945,11 +2424,18 @@ where
         proof: &BlobLiveSetProof,
         locator: &BlobLocator,
         intent_revision: u64,
+        residency_sha256: &str,
     ) -> Result<BlobDeletionReconciliation, BlobError> {
         self.live_sets
             .lock()
             .map_err(|_| BlobError::Provider("blob live-set lock poisoned".to_owned()))?
-            .reconcile_delete(operation_id, proof, locator, intent_revision)
+            .reconcile_delete(
+                operation_id,
+                proof,
+                locator,
+                intent_revision,
+                residency_sha256,
+            )
     }
 
     fn live_sets_compare_and_delete_observed(
@@ -1958,12 +2444,20 @@ where
         proof: &BlobLiveSetProof,
         locator: &BlobLocator,
         intent_revision: u64,
+        residency_sha256: &str,
         delete: &mut dyn FnMut() -> Result<(), BlobError>,
     ) -> Result<BlobDeletionReconciliation, BlobError> {
         self.live_sets
             .lock()
             .map_err(|_| BlobError::Provider("blob live-set lock poisoned".to_owned()))?
-            .compare_and_delete_observed(operation_id, proof, locator, intent_revision, delete)
+            .compare_and_delete_observed(
+                operation_id,
+                proof,
+                locator,
+                intent_revision,
+                residency_sha256,
+                delete,
+            )
     }
 
     fn ensure_lease(&self, lease: &BlobRootLease) -> Result<(), BlobError> {
@@ -2017,14 +2511,126 @@ where
         Ok(bytes)
     }
 
-    fn load_metadata(&self, locator: &BlobLocator) -> Result<(StoredMetadata, Vec<u8>), BlobError> {
-        let path = metadata_path(locator)?;
+    /// Enumerates every complete residency scope durably stored for one
+    /// locator. A scope is a complete payload/metadata pair whose names are
+    /// exactly the derived placement for `(locator, digest)`. Half-published
+    /// pairs and foreign names fail closed: silently skipping them could hide
+    /// live data from a later coherence scan. Callers needing liveness still
+    /// consult only the caller-supplied live-set union; this enumerates
+    /// physical scopes, never semantic roots.
+    fn enumerate_scopes(&self, locator: &BlobLocator) -> Result<Vec<ScopedObject>, BlobError> {
+        let prefix = scope_list_prefix(locator)?;
+        self.contained(&prefix)?;
+        // s-04-v2 generation-wide listing also returns other hashes' objects.
+        // Only filenames of this content hash can belong to this locator;
+        // anything else is skipped before the strict placement proof below.
+        // A same-hash file that fails the proof is still a hard error.
+        let file_marker = format!("/{}.r", locator.hash.as_str());
+        // s-04-v2: the locator pins one residency key, so only its own digest
+        // can yield a scope here. Same-hash files of other domains are other
+        // objects, not errors; a same-digest file at a non-canonical placement
+        // still fails the strict proof inside parse_scoped_path.
+        let own_digest = locator.residency_key_digest()?;
+        let mut payloads: BTreeMap<String, WorkScopePath> = BTreeMap::new();
+        let mut metadatas: BTreeMap<String, WorkScopePath> = BTreeMap::new();
+        for path in self.platform_list(&prefix)? {
+            let identity = path.normalized_identity().to_owned();
+            if !identity.contains(&file_marker) {
+                continue;
+            }
+            if !identity.contains(own_digest.as_str()) {
+                // Same content hash, another residency domain: another object,
+                // not an error. Only our own digest admits the strict proof.
+                continue;
+            }
+            // Claims our scope: strict placement proof, so a transplanted
+            // same-digest file is a hard error, never a silent skip.
+            let scope = parse_scoped_path(&path, locator, 'p')
+                .or_else(|_| parse_scoped_path(&path, locator, 'm'))
+                .map_err(|_| BlobError::MetadataPayloadMismatch)?;
+            if scope.digest != own_digest {
+                return Err(BlobError::MetadataPayloadMismatch);
+            }
+            let rebuilt_payload = scoped_payload_path(locator, &scope)?;
+            let rebuilt_metadata = scoped_metadata_path(locator, &scope)?;
+            if path.normalized_identity() == rebuilt_payload.normalized_identity() {
+                if payloads.insert(scope.digest.clone(), path).is_some() {
+                    return Err(BlobError::MetadataPayloadMismatch);
+                }
+            } else if path.normalized_identity() == rebuilt_metadata.normalized_identity() {
+                if metadatas.insert(scope.digest.clone(), path).is_some() {
+                    return Err(BlobError::MetadataPayloadMismatch);
+                }
+            } else {
+                return Err(BlobError::MetadataPayloadMismatch);
+            }
+        }
+        let mut scopes: Vec<ScopedObject> = Vec::new();
+        for (digest, payload) in &payloads {
+            let Some(metadata) = metadatas.remove(digest) else {
+                return Err(BlobError::MetadataPayloadMismatch);
+            };
+            scopes.push(ScopedObject {
+                scope: ResidencyScope {
+                    digest: digest.clone(),
+                },
+                payload: payload.clone(),
+                metadata,
+            });
+        }
+        if !metadatas.is_empty() {
+            return Err(BlobError::MetadataPayloadMismatch);
+        }
+        Ok(scopes)
+    }
+
+    /// Resolves the one residency scope a locator-bound read/reference means.
+    /// The request carries no policy, so the caller proves the intended scope
+    /// with the exact durable metadata digest it already holds
+    /// (`expected_metadata_sha256`): the match is byte-exact, never a
+    /// default-domain guess. Zero scopes is `NotFound`; no digest match is
+    /// `MetadataPayloadMismatch`. Only the matched scope's metadata is
+    /// validated here; coherence scans validate every scope explicitly.
+    fn resolve_scope_for_metadata(
+        &self,
+        locator: &BlobLocator,
+        expected_metadata_sha256: &str,
+    ) -> Result<(ScopedObject, StoredMetadata, Vec<u8>), BlobError> {
+        let scopes = self.enumerate_scopes(locator)?;
+        if scopes.is_empty() {
+            return Err(BlobError::NotFound);
+        }
+        for scoped in scopes {
+            let path = scoped.metadata.clone();
+            self.contained(&path)?;
+            let bytes = self.read_bounded_file(&path, MAX_METADATA_BYTES)?;
+            if sha256_hex(&bytes) != expected_metadata_sha256 {
+                continue;
+            }
+            let metadata = decode_metadata(&bytes)?;
+            if metadata.locator != *locator || metadata.residency_sha256 != scoped.scope.digest {
+                return Err(BlobError::MetadataPayloadMismatch);
+            }
+            let resolved = ScopedObject {
+                scope: scoped.scope,
+                payload: scoped.payload,
+                metadata: path,
+            };
+            return Ok((resolved, metadata, bytes));
+        }
+        Err(BlobError::MetadataPayloadMismatch)
+    }
+
+    fn load_metadata(
+        &self,
+        locator: &BlobLocator,
+        scope: &ResidencyScope,
+    ) -> Result<(StoredMetadata, Vec<u8>), BlobError> {
+        let path = scoped_metadata_path(locator, scope)?;
         self.contained(&path)?;
         let bytes = self.read_bounded_file(&path, MAX_METADATA_BYTES)?;
-        let metadata: StoredMetadata =
-            serde_json::from_slice(&bytes).map_err(|_| BlobError::MetadataPayloadMismatch)?;
-        metadata.validate()?;
-        if metadata.locator != *locator {
+        let metadata = decode_metadata(&bytes)?;
+        if metadata.locator != *locator || metadata.residency_sha256 != scope.digest {
             return Err(BlobError::MetadataPayloadMismatch);
         }
         Ok((metadata, bytes))
@@ -2324,6 +2930,7 @@ where
             operation_id: journal.operation_id.clone(),
             idempotency_key: journal.idempotency_key.clone(),
             locator: metadata.locator.clone(),
+            residency_sha256: metadata.residency_sha256.clone(),
             metadata_sha256: journal.expected_metadata_sha256.clone(),
         };
         commit.validate()?;
@@ -2488,6 +3095,9 @@ where
         let live_set = tombstone.live_set.clone();
         let locator = tombstone.locator.clone();
         let intent_revision = tombstone.intent_revision;
+        // Hoisted before the `delete` closure borrows `tombstone` mutably:
+        // the scope identity never changes across tombstone revisions.
+        let tombstone_residency = tombstone.residency_sha256.clone();
         let mut delete = || -> Result<(), BlobError> {
             for (target, state) in [
                 (&payload, GcState::PayloadDeleteAttempt),
@@ -2539,19 +3149,25 @@ where
             }
             Ok(())
         };
-        let reconciliation =
-            self.live_sets_reconcile_delete(&operation_id, &live_set, &locator, intent_revision)?;
+        let reconciliation = self.live_sets_reconcile_delete(
+            &operation_id,
+            &live_set,
+            &locator,
+            intent_revision,
+            &tombstone_residency,
+        )?;
         let applied = match reconciliation {
-            BlobDeletionReconciliation::Applied(receipt) => receipt,
+            BlobDeletionReconciliation::Applied(receipt) => *receipt,
             BlobDeletionReconciliation::NotApplied => {
                 match self.live_sets_compare_and_delete_observed(
                     &operation_id,
                     &live_set,
                     &locator,
                     intent_revision,
+                    &tombstone_residency,
                     &mut delete,
                 )? {
-                    BlobDeletionReconciliation::Applied(receipt) => receipt,
+                    BlobDeletionReconciliation::Applied(receipt) => *receipt,
                     BlobDeletionReconciliation::NotApplied
                     | BlobDeletionReconciliation::Unknown => {
                         return Err(BlobError::UnknownGcOutcome {
@@ -2596,7 +3212,15 @@ where
         Ok(ConditionalDeleteOutcome::Deleted)
     }
 
-    fn ensure_not_revoked(&self, locator: &BlobLocator) -> Result<(), BlobError> {
+    /// Rejects re-admission of a purged object in the SAME residency scope.
+    /// Purge is domain-scoped: a tombstone for equal bytes in another scope
+    /// never blocks this scope, and this scope never revives another scope's
+    /// purge. Legacy tombstones fail closed through [`decode_tombstone`].
+    fn ensure_not_revoked(
+        &self,
+        locator: &BlobLocator,
+        scope: &ResidencyScope,
+    ) -> Result<(), BlobError> {
         let tombstones = WorkScopePath::new("tombstones")
             .map_err(|error| BlobError::InvalidContract(error.to_string()))?;
         self.contained(&tombstones)?;
@@ -2604,7 +3228,7 @@ where
             let bytes = self.read_bounded_file(&path, MAX_JOURNAL_BYTES)?;
             let tombstone = decode_tombstone(&bytes)?;
             tombstone.validate()?;
-            if tombstone.locator == *locator {
+            if tombstone.locator == *locator && tombstone.residency_sha256 == scope.digest {
                 return Err(BlobError::PlanGap(
                     "purged or quarantined blob content cannot be re-admitted".to_owned(),
                 ));
@@ -2621,30 +3245,52 @@ where
     ) -> Result<BlobReadyReceipt, BlobError> {
         let locator = BlobLocator {
             hash,
+            residency: request.residency.clone(),
             root_generation: request.root_lease.root_generation,
             path_generation: PATH_GENERATION,
         };
-        let payload = payload_path(&locator)?;
-        let metadata_path_value = metadata_path(&locator)?;
+        locator.validate()?;
+        // One key observation per stage call. The residency scope — and with
+        // it the physical object identity — is the s-04-v2 contract key carried
+        // by the request. No default domain is ever invented; a rotated key
+        // lineage that disagrees with the residency encryption domain is
+        // rejected, while a converged operation below resolves to its committed
+        // scope.
+        let key = self.keys_current().map_err(|error| match error {
+            BlobError::ProviderUnavailable(_) | BlobError::NotFound => BlobError::KeyUnavailable {
+                operation: BlobKeyOperation::Stage,
+                key_lineage: None,
+                key_generation: None,
+                recovery: BlobKeyRecoveryCeiling::PlanGap,
+            },
+            other => other,
+        })?;
+        key.crypto.validate()?;
+        let scope = residency_scope(&locator, &request.policy, &key.crypto)?;
+        let payload = scoped_payload_path(&locator, &scope)?;
+        let metadata_path_value = scoped_metadata_path(&locator, &scope)?;
         self.contained(&payload)?;
         self.contained(&metadata_path_value)?;
-        self.ensure_not_revoked(&locator)?;
+        self.ensure_not_revoked(&locator, &scope)?;
 
         let journal_path = Self::operation_path(&request.context, "stage")?;
         let commit_path = Self::operation_path(&request.context, "commit")?;
         self.contained(&commit_path)?;
         if self.platform_stat(&commit_path)? != BlobPathState::Missing {
             let bytes = self.read_bounded_file(&commit_path, MAX_JOURNAL_BYTES)?;
-            let commit: OperationCommit =
-                serde_json::from_slice(&bytes).map_err(|_| BlobError::MetadataPayloadMismatch)?;
-            commit.validate()?;
+            let commit = decode_commit(&bytes)?;
             if commit.operation_id != request.context.operation.operation_id.as_str()
                 || commit.idempotency_key != request.context.operation.idempotency_key
                 || commit.locator != locator
             {
                 return Err(BlobError::IdempotencyConflict);
             }
-            let (stored, metadata_bytes) = self.load_metadata(&commit.locator)?;
+            // Operation identity wins over a rotated request scope: the
+            // committed scope is authoritative for this operation.
+            let commit_scope = ResidencyScope {
+                digest: commit.residency_sha256.clone(),
+            };
+            let (stored, metadata_bytes) = self.load_metadata(&commit.locator, &commit_scope)?;
             if sha256_hex(&metadata_bytes) != commit.metadata_sha256
                 || stored.policy != request.policy
                 || stored.plaintext_sha256 != sha256_hex(&request.bytes)
@@ -2653,7 +3299,7 @@ where
             }
             let verified = self.verify_metadata_receipt(&stored)?;
             let ready = stored.ready(verified, &self.issuer_anchor, commit.metadata_sha256)?;
-            self.verify_payload(&ready, &request.bytes)?;
+            self.verify_payload(&ready, &request.bytes, &commit_scope)?;
             return Ok(ready);
         }
         if self.platform_stat(&journal_path)? != BlobPathState::Missing {
@@ -2665,21 +3311,49 @@ where
             // paths before allowing recovery to perform any publication. A
             // reused operation with a different locator must not advance the
             // old journal and discover the mismatch only after mutation.
+            // The journal scope is parsed out of the persisted final paths
+            // and proven against the request locator: a same-operation replay
+            // under a rotated key or a changed policy recovers the journal's
+            // own scope (the post-recovery metadata binding still rejects a
+            // policy mismatch before readiness), while a different-bytes
+            // replay cannot even parse and is an idempotency conflict.
             // The persisted journal has no policy commitment, so an otherwise
             // identical content/locator replay with a changed policy remains
             // an explicitly documented reconciliation limitation; final
             // metadata binding still rejects the mismatch before readiness.
+            let journal_scope = parse_scoped_path(&journal.final_payload, &locator, 'p')
+                .map_err(|_| BlobError::IdempotencyConflict)?;
+            let journal_metadata_scope = parse_scoped_path(&journal.final_metadata, &locator, 'm')
+                .map_err(|_| BlobError::IdempotencyConflict)?;
             if journal.operation_id != request.context.operation.operation_id.as_str()
                 || journal.idempotency_key != request.context.operation.idempotency_key
                 || journal.temp_payload != Self::temp_path(&request.context, "payload")?
                 || journal.temp_metadata != Self::temp_path(&request.context, "metadata")?
-                || journal.final_payload != payload
-                || journal.final_metadata != metadata_path_value
+                || journal_metadata_scope != journal_scope
             {
                 return Err(BlobError::IdempotencyConflict);
             }
             self.finish_journal(&journal_path, &mut journal)?;
+            // Converge to the journal's own scope: a same-operation replay
+            // under a rotated key recovers the already-published object
+            // instead of publishing a second one for one operation.
+            let (stored, metadata_bytes) = self.load_metadata(&locator, &journal_scope)?;
+            if stored.policy != request.policy
+                || stored.plaintext_length != request.bytes.len() as u64
+                || stored.plaintext_sha256 != sha256_hex(&request.bytes)
+            {
+                return Err(BlobError::IdempotencyConflict);
+            }
+            let verified = self.verify_metadata_receipt(&stored)?;
+            let ready = stored.ready(verified, &self.issuer_anchor, sha256_hex(&metadata_bytes))?;
+            self.verify_payload(&ready, &request.bytes, &journal_scope)?;
+            return Ok(ready);
         }
+        // Within-scope dedup only: these paths already carry the request
+        // scope, so equal bytes in another residency domain are invisible
+        // here and always proceed to their own object below. Sharing one
+        // physical object across domains by digest alone is rejected by
+        // construction, not by comparison.
         let payload_state = self.platform_stat(&payload)?;
         let metadata_state = self.platform_stat(&metadata_path_value)?;
         if payload_state != BlobPathState::Missing || metadata_state != BlobPathState::Missing {
@@ -2688,7 +3362,7 @@ where
             {
                 return Err(BlobError::MetadataPayloadMismatch);
             }
-            let (stored, metadata_bytes) = self.load_metadata(&locator)?;
+            let (stored, metadata_bytes) = self.load_metadata(&locator, &scope)?;
             if stored.operation_id != request.context.operation.operation_id.as_str()
                 || stored.idempotency_key != request.context.operation.idempotency_key
                 || stored.policy != request.policy
@@ -2699,7 +3373,7 @@ where
             }
             let verified = self.verify_metadata_receipt(&stored)?;
             let ready = stored.ready(verified, &self.issuer_anchor, sha256_hex(&metadata_bytes))?;
-            self.verify_payload(&ready, &request.bytes)?;
+            self.verify_payload(&ready, &request.bytes, &scope)?;
             return Ok(ready);
         }
 
@@ -2711,16 +3385,6 @@ where
                 "compressed blob exceeds canonical envelope ceiling".to_owned(),
             ));
         }
-        let key = self.keys_current().map_err(|error| match error {
-            BlobError::ProviderUnavailable(_) | BlobError::NotFound => BlobError::KeyUnavailable {
-                operation: BlobKeyOperation::Stage,
-                key_lineage: None,
-                key_generation: None,
-                recovery: BlobKeyRecoveryCeiling::PlanGap,
-            },
-            other => other,
-        })?;
-        key.crypto.validate()?;
         let plaintext_sha256 = sha256_hex(&request.bytes);
         let aad = serde_json::to_vec(&(
             eliot_blob_api::CONTRACT_VERSION,
@@ -2731,9 +3395,16 @@ where
             request.context.request.metadata.request_id.as_str(),
         ))
         .map_err(|error| BlobError::InvalidContract(error.to_string()))?;
+        // The nonce binds the residency scope, not just the content hash:
+        // equal bytes in different domains must never reuse a nonce under one
+        // key. (The AAD already covers the full residency inputs through the
+        // locator/policy/crypto triple.) Envelopes sealed before this binding
+        // fail authentication-closed on open — never plaintext fallback — and
+        // recover by explicit re-stage from source.
+        let seal_nonce = scope_nonce(&locator, &scope);
         let sealed = self.aead_seal(AeadSealRequest {
             key: &key,
-            nonce_context: locator.hash.as_str().as_bytes(),
+            nonce_context: seal_nonce.as_bytes(),
             associated_data: &aad,
             plaintext: &compressed,
         })?;
@@ -2750,6 +3421,7 @@ where
 
         let sealed_sha256 = sha256_hex(&sealed);
         let format = BlobId::new(FORMAT_ID)?;
+        let residency_digest = locator.residency_key_digest()?;
         let receipt_binding_sha256 = eliot_blob_api::receipt_binding_sha256(
             &format,
             FORMAT_VERSION,
@@ -2780,11 +3452,12 @@ where
             sha256: receipt_binding_sha256.clone(),
             role: ReceiptKind::Artifact,
             source_revision: Some(format!(
-                "{};format-version:{};stored-length:{};sealed-sha256:{}",
+                "{};format-version:{};stored-length:{};sealed-sha256:{};residency:{}",
                 eliot_blob_api::CONTRACT_VERSION,
                 FORMAT_VERSION,
                 sealed.len(),
-                sealed_sha256
+                sealed_sha256,
+                residency_digest
             )),
         };
         let verified_receipt = self.issue_receipt(
@@ -2800,6 +3473,7 @@ where
             receipt: verified_receipt.receipt().clone(),
             receipt_bytes: verified_receipt.receipt_bytes().to_vec(),
             locator: locator.clone(),
+            residency_sha256: scope.digest.clone(),
             plaintext_length: request.bytes.len() as u64,
             stored_length: sealed.len() as u64,
             envelope_length: sealed.len() as u64,
@@ -2889,18 +3563,29 @@ where
         }
         self.finish_journal(&journal_path, &mut journal)?;
         let verified = self.verify_metadata_receipt(&metadata)?;
-        metadata.ready(verified, &self.issuer_anchor, metadata_sha256)
+        let ready = metadata.ready(verified, &self.issuer_anchor, metadata_sha256)?;
+        self.verify_payload(&ready, &request.bytes, &scope)?;
+        Ok(ready)
     }
 
     fn verify_payload(
         &self,
         ready: &BlobReadyReceipt,
         expected_plaintext: &[u8],
+        scope: &ResidencyScope,
     ) -> Result<(), BlobError> {
-        let path = payload_path(ready.locator())?;
+        // The receipt binds the full (locator, policy, crypto) triple, so the
+        // scope it claims is exact. A caller-supplied scope for another
+        // domain can never verify against this object.
+        let bound = residency_scope(ready.locator(), ready.policy(), ready.crypto())?;
+        if bound.digest != scope.digest {
+            return Err(BlobError::MetadataPayloadMismatch);
+        }
+        let path = scoped_payload_path(ready.locator(), scope)?;
         self.contained(&path)?;
         let sealed = self.read_bounded_file(&path, MAX_BLOB_ENVELOPE_BYTES)?;
-        if sha256_hex(&sealed) != self.load_metadata(ready.locator())?.0.sealed_sha256 {
+        let (stored, _) = self.load_metadata(ready.locator(), scope)?;
+        if sha256_hex(&sealed) != stored.sealed_sha256 {
             return Err(BlobError::IntegrityMismatch);
         }
         let key = self.keys_resolve(ready.crypto()).map_err(|error| {
@@ -2918,9 +3603,10 @@ where
             ready.receipt().core.request.metadata.request_id.as_str(),
         ))
         .map_err(|error| BlobError::InvalidContract(error.to_string()))?;
+        let open_nonce = scope_nonce(ready.locator(), scope);
         let compressed = self.aead_open(AeadOpenRequest {
             key: &key,
-            nonce_context: ready.locator().hash.as_str().as_bytes(),
+            nonce_context: open_nonce.as_bytes(),
             associated_data: &aad,
             ciphertext: &sealed,
         })?;
@@ -2944,7 +3630,13 @@ where
     ) -> Result<(BlobReadyReceipt, Vec<u8>), BlobError> {
         request.validate()?;
         self.ensure_lease(&request.root_lease)?;
-        let (metadata, metadata_bytes) = self.load_metadata(&request.locator)?;
+        // The request names a locator but no residency scope; the caller
+        // proves the intended scope with the exact metadata digest it holds.
+        // Resolution is byte-exact across every stored scope — never a
+        // default-domain guess.
+        let (resolved, metadata, metadata_bytes) =
+            self.resolve_scope_for_metadata(&request.locator, &request.expected_metadata_sha256)?;
+        let scope = resolved.scope;
         let metadata_sha256 = sha256_hex(&metadata_bytes);
         if metadata_sha256 != request.expected_metadata_sha256
             || metadata.receipt.identity.receipt_id.as_str() != request.expected_ready_receipt_id
@@ -2953,7 +3645,7 @@ where
         }
         let verified = self.verify_metadata_receipt(&metadata)?;
         let ready = metadata.ready(verified, &self.issuer_anchor, metadata_sha256)?;
-        let path = payload_path(&request.locator)?;
+        let path = scoped_payload_path(&request.locator, &scope)?;
         self.contained(&path)?;
         let decode_ceiling = request.max_bytes.min(MAX_BLOB_PLAINTEXT_BYTES);
         if request.max_bytes > MAX_BLOB_PLAINTEXT_BYTES {
@@ -2995,9 +3687,10 @@ where
             metadata.receipt.core.request.metadata.request_id.as_str(),
         ))
         .map_err(|error| BlobError::InvalidContract(error.to_string()))?;
+        let open_nonce = scope_nonce(&request.locator, &scope);
         let compressed = self.aead_open(AeadOpenRequest {
             key: &key,
-            nonce_context: request.locator.hash.as_str().as_bytes(),
+            nonce_context: open_nonce.as_bytes(),
             associated_data: &aad,
             ciphertext: &sealed,
         })?;
@@ -3035,6 +3728,7 @@ where
         let content_idx = content_shard(&request.locator.hash);
         let _guard = self.lock_shards(&[content_idx])?;
         let (ready, bytes) = self.read_verified(request)?;
+        let read_residency_digest = request.locator.residency_key_digest()?;
         let artifact = ArtifactBinding {
             artifact_id: format!("blob-read-{}", request.locator.hash)
                 .parse()
@@ -3042,10 +3736,11 @@ where
             sha256: ready.plaintext_sha256().to_owned(),
             role: ReceiptKind::Artifact,
             source_revision: Some(format!(
-                "{};root-generation:{};path-generation:{}",
+                "{};root-generation:{};path-generation:{};residency:{}",
                 ready.metadata_sha256(),
                 ready.root_generation(),
-                ready.path_generation()
+                ready.path_generation(),
+                read_residency_digest
             )),
         };
         let verified_receipt = self.issue_receipt(
@@ -3066,12 +3761,14 @@ where
     ) -> Result<BlobReferenceObservation, BlobError> {
         request.validate()?;
         self.ensure_lease(&request.root_lease)?;
-        let (metadata, bytes) = self.load_metadata(&request.locator)?;
+        let (resolved, metadata, bytes) =
+            self.resolve_scope_for_metadata(&request.locator, &request.expected_metadata_sha256)?;
+        let scope = resolved.scope;
         let metadata_sha256 = sha256_hex(&bytes);
         if metadata_sha256 != request.expected_metadata_sha256 {
             return Err(BlobError::MetadataPayloadMismatch);
         }
-        let payload = payload_path(&request.locator)?;
+        let payload = scoped_payload_path(&request.locator, &scope)?;
         let present =
             self.exact_bytes_at(&payload, &metadata.sealed_sha256, MAX_BLOB_ENVELOPE_BYTES)?;
         let receipt = self.issue_receipt(
@@ -3097,16 +3794,37 @@ where
     ) -> Result<BlobReachabilityView, BlobError> {
         request.validate()?;
         self.ensure_lease(&request.root_lease)?;
+        // Coherent reachability (T3-B): the view is bound to a freshly
+        // revalidated complete live set. A stale or partial source blocks the
+        // view instead of reporting reachability against a superseded union.
+        // Liveness itself still comes only from the caller-supplied union —
+        // the service never discovers semantic roots; per-locator scope
+        // enumeration below resolves physical placements, not liveness.
+        let observed = self.live_sets_revalidate(&request.live_set)?;
+        Self::validate_live_set_revalidation(&request.live_set, &observed)?;
         let mut present = Vec::new();
         let mut missing = Vec::new();
         for locator in &request.live_set.live {
-            let payload = payload_path(locator)?;
-            let metadata = metadata_path(locator)?;
-            let payload_state = self.platform_stat(&payload)?;
-            let metadata_state = self.platform_stat(&metadata)?;
-            if matches!(payload_state, BlobPathState::File { .. })
-                && matches!(metadata_state, BlobPathState::File { .. })
-            {
+            // A locator is present only when at least one residency scope
+            // exists and every stored scope is a complete, residency-bound
+            // pair. Any gap — no scopes, a half-published pair, or a metadata
+            // whose stored binding does not match its placement — reports the
+            // locator missing rather than claiming a coherent view.
+            let scopes = self.enumerate_scopes(locator)?;
+            let mut complete = !scopes.is_empty();
+            for scoped in &scopes {
+                let (metadata, _) = self.load_metadata(locator, &scoped.scope)?;
+                let payload_state = self.platform_stat(&scoped.payload)?;
+                let metadata_state = self.platform_stat(&scoped.metadata)?;
+                if !matches!(payload_state, BlobPathState::File { .. })
+                    || !matches!(metadata_state, BlobPathState::File { .. })
+                    || metadata.locator != *locator
+                {
+                    complete = false;
+                    break;
+                }
+            }
+            if complete {
                 present.push(locator.clone());
             } else {
                 missing.push(locator.clone());
@@ -3134,6 +3852,156 @@ where
         })
     }
 
+    /// Lists durable per-scope tombstone paths for one operation and locator.
+    /// The prefix binds the operation and the content hash; every match is
+    /// still fully validated on load — the listing never authorizes anything.
+    fn scope_tombstone_paths(
+        &self,
+        operation_id: &str,
+        locator: &BlobLocator,
+    ) -> Result<Vec<WorkScopePath>, BlobError> {
+        let prefix = WorkScopePath::new(format!(
+            "tombstones/{}-{}-r",
+            operation_id,
+            locator.hash.as_str()
+        ))
+        .map_err(|error| BlobError::InvalidContract(error.to_string()))?;
+        self.contained(&prefix)?;
+        self.platform_list(&prefix)
+    }
+
+    /// Resumes one durable per-scope tombstone against the exact request.
+    /// Locator, residency placement, proof, snapshot, revision, and parent
+    /// idempotency must all match; anything else fails closed instead of
+    /// deleting under a superseded intent.
+    fn resume_scope_tombstone(
+        &self,
+        request: &BlobGcRequest,
+        locator: &BlobLocator,
+        tombstone_path: &WorkScopePath,
+    ) -> Result<ConditionalDeleteOutcome, BlobError> {
+        self.contained(tombstone_path)?;
+        let bytes = self.read_bounded_file(tombstone_path, MAX_JOURNAL_BYTES)?;
+        let tombstone = decode_tombstone(&bytes)?;
+        tombstone.validate()?;
+        if tombstone.locator != *locator
+            || tombstone.operation_id != request.context.operation.operation_id.as_str()
+            || tombstone.proof_id != request.live_set.proof_id
+            || tombstone.proof_snapshot_sha256 != request.live_set.snapshot_sha256
+            || tombstone.live_set.revision != request.live_set.revision
+        {
+            return Err(BlobError::PlanGap(
+                "GC tombstone identity does not match the exact request".to_owned(),
+            ));
+        }
+        // The loaded tombstone must live exactly at the derived placement
+        // for its own (locator, residency): a transplanted record can never
+        // authorize this path's deletion.
+        let loaded_scope = ResidencyScope {
+            digest: tombstone.residency_sha256.clone(),
+        };
+        if tombstone_scope_path(&tombstone.operation_id, &tombstone.locator, &loaded_scope)?
+            .normalized_identity()
+            != tombstone_path.normalized_identity()
+        {
+            return Err(BlobError::PlanGap(
+                "GC tombstone identity does not match the exact request".to_owned(),
+            ));
+        }
+        if tombstone.parent_idempotency_key != request.context.operation.idempotency_key {
+            return Err(BlobError::IdempotencyConflict);
+        }
+        self.reconcile_tombstone_path(tombstone_path)
+    }
+
+    /// Collects one residency scope of an unreachable candidate: resumes an
+    /// existing per-scope tombstone or, after grace and a fresh
+    /// destructive-boundary revalidation, persists one and reconciles it to
+    /// deletion. A resumed tombstone must match the exact request —
+    /// locator, residency scope, proof, snapshot, revision, and parent
+    /// idempotency — or the run fails closed instead of deleting under a
+    /// superseded intent.
+    #[allow(clippy::too_many_lines)]
+    fn gc_scope(
+        &self,
+        request: &BlobGcRequest,
+        locator: &BlobLocator,
+        scoped: &ScopedObject,
+        now: u64,
+    ) -> Result<ConditionalDeleteOutcome, BlobError> {
+        let operation_id = request.context.operation.operation_id.to_string();
+        let tombstone_path = tombstone_scope_path(&operation_id, locator, &scoped.scope)?;
+        self.contained(&tombstone_path)?;
+        if self.platform_stat(&tombstone_path)? != BlobPathState::Missing {
+            return self.resume_scope_tombstone(request, locator, &tombstone_path);
+        }
+        let modified = match self.platform_stat(&scoped.payload)? {
+            BlobPathState::File {
+                modified_unix_ms, ..
+            } => modified_unix_ms,
+            BlobPathState::Missing => {
+                return Ok(ConditionalDeleteOutcome::RetainedLive);
+            }
+            BlobPathState::ReparsePoint => {
+                return Err(BlobError::PlanGap(
+                    "P-02 rejected a reparse point during GC".to_owned(),
+                ));
+            }
+            BlobPathState::Directory | BlobPathState::Other => {
+                return Err(BlobError::MetadataPayloadMismatch);
+            }
+        };
+        match self.platform_stat(&scoped.metadata)? {
+            BlobPathState::File { .. } => {}
+            BlobPathState::Missing => return Err(BlobError::MetadataPayloadMismatch),
+            BlobPathState::ReparsePoint => {
+                return Err(BlobError::PlanGap(
+                    "P-02 rejected a metadata reparse point during GC".to_owned(),
+                ));
+            }
+            BlobPathState::Directory | BlobPathState::Other => {
+                return Err(BlobError::MetadataPayloadMismatch);
+            }
+        }
+        if now.saturating_sub(modified) < request.grace_period_seconds.saturating_mul(1_000) {
+            return Ok(ConditionalDeleteOutcome::RetainedLive);
+        }
+        // Revalidate at each destructive boundary, not once per batch.
+        let current = self.live_sets_revalidate(&request.live_set)?;
+        Self::validate_revalidation(request, &current)?;
+        let tombstone = Tombstone {
+            operation_id,
+            parent_idempotency_key: request.context.operation.idempotency_key.clone(),
+            revision: 1,
+            intent_revision: 1,
+            proof_id: request.live_set.proof_id.clone(),
+            proof_snapshot_sha256: request.live_set.snapshot_sha256.clone(),
+            locator: locator.clone(),
+            residency_sha256: scoped.scope.digest.clone(),
+            live_set: request.live_set.clone(),
+            payload: scoped.payload.clone(),
+            metadata: scoped.metadata.clone(),
+            state: GcState::TombstoneDurable,
+            receipt: None,
+            cas: Some(TombstoneCas {
+                version: 2,
+                context: Self::tombstone_cas_context(
+                    &request.context,
+                    request.context.operation.operation_id.as_str(),
+                    &tombstone_path,
+                    1,
+                )?,
+                root_lease: self.owner.lease.clone(),
+                target: tombstone_path.clone(),
+                expected: BlobCasState::Missing,
+                expected_backend_generation: self.platform_backend_generation()?,
+                requested_durability: BlobCasDurability::Requested,
+            }),
+        };
+        self.persist_tombstone(&tombstone_path, &tombstone, None)?;
+        self.reconcile_tombstone_path(&tombstone_path)
+    }
+
     #[allow(clippy::too_many_lines)]
     fn gc(&self, request: BlobGcRequest) -> Result<BlobGcReceipt, BlobError> {
         request.validate()?;
@@ -3150,104 +4018,62 @@ where
             }
             let content_idx = content_shard(&locator.hash);
             let _guard = self.lock_shards(&[content_idx])?;
-            let payload = payload_path(locator)?;
-            let metadata = metadata_path(locator)?;
-            let tombstone_path = WorkScopePath::new(format!(
-                "tombstones/{}-{}.json",
-                request.context.operation.operation_id.as_str(),
-                locator.hash
-            ))
-            .map_err(|error| BlobError::InvalidContract(error.to_string()))?;
-            self.contained(&tombstone_path)?;
-            if self.platform_stat(&tombstone_path)? != BlobPathState::Missing {
-                let bytes = self.read_bounded_file(&tombstone_path, MAX_JOURNAL_BYTES)?;
-                let tombstone = decode_tombstone(&bytes)?;
-                tombstone.validate()?;
-                if tombstone.locator != *locator
-                    || tombstone.proof_id != request.live_set.proof_id
-                    || tombstone.proof_snapshot_sha256 != request.live_set.snapshot_sha256
-                {
-                    return Err(BlobError::PlanGap(
-                        "GC tombstone identity does not match the exact request".to_owned(),
-                    ));
+            // Residency-scoped collection: every stored scope of an
+            // unreachable locator is collected independently, each with its
+            // own tombstone, grace check, and destructive-boundary
+            // revalidation. Liveness stays locator-level and conservative — a
+            // live locator retains all of its scopes — while deletion is per
+            // scope so purging one domain never disturbs equal bytes in
+            // another.
+            let scopes = self.enumerate_scopes(locator)?;
+            if scopes.is_empty() {
+                // No complete scope pairs remain: either nothing was ever
+                // published, or a prior run already deleted every scope and
+                // left only durable tombstones. Resume this operation's
+                // tombstones so an exact GC replay converges to the same
+                // receipt; anything else retains (never error, never delete
+                // blind).
+                let operation_id = request.context.operation.operation_id.to_string();
+                let mut replayed_deleted = false;
+                let mut replayed_retained = false;
+                for tombstone_path in self.scope_tombstone_paths(&operation_id, locator)? {
+                    if self.platform_stat(&tombstone_path)? == BlobPathState::Missing {
+                        continue;
+                    }
+                    match self.resume_scope_tombstone(&request, locator, &tombstone_path)? {
+                        ConditionalDeleteOutcome::Deleted => {
+                            replayed_deleted = true;
+                        }
+                        ConditionalDeleteOutcome::RetainedLive => {
+                            replayed_retained = true;
+                        }
+                    }
                 }
-                if tombstone.parent_idempotency_key != request.context.operation.idempotency_key {
-                    return Err(BlobError::IdempotencyConflict);
-                }
-                match self.reconcile_tombstone_path(&tombstone_path)? {
-                    ConditionalDeleteOutcome::Deleted => deleted.push(locator.clone()),
-                    ConditionalDeleteOutcome::RetainedLive => retained.push(locator.clone()),
-                }
-                continue;
-            }
-            let modified = match self.platform_stat(&payload)? {
-                BlobPathState::File {
-                    modified_unix_ms, ..
-                } => modified_unix_ms,
-                BlobPathState::Missing => {
+                if replayed_deleted && !replayed_retained {
+                    deleted.push(locator.clone());
+                } else {
                     retained.push(locator.clone());
-                    continue;
                 }
-                BlobPathState::ReparsePoint => {
-                    return Err(BlobError::PlanGap(
-                        "P-02 rejected a reparse point during GC".to_owned(),
-                    ));
-                }
-                BlobPathState::Directory | BlobPathState::Other => {
-                    return Err(BlobError::MetadataPayloadMismatch);
-                }
-            };
-            match self.platform_stat(&metadata)? {
-                BlobPathState::File { .. } => {}
-                BlobPathState::Missing => return Err(BlobError::MetadataPayloadMismatch),
-                BlobPathState::ReparsePoint => {
-                    return Err(BlobError::PlanGap(
-                        "P-02 rejected a metadata reparse point during GC".to_owned(),
-                    ));
-                }
-                BlobPathState::Directory | BlobPathState::Other => {
-                    return Err(BlobError::MetadataPayloadMismatch);
-                }
-            }
-            if now.saturating_sub(modified) < request.grace_period_seconds.saturating_mul(1_000) {
-                retained.push(locator.clone());
                 continue;
             }
-            // Revalidate at each destructive boundary, not once per batch.
-            let current = self.live_sets_revalidate(&request.live_set)?;
-            Self::validate_revalidation(&request, &current)?;
-            let tombstone = Tombstone {
-                operation_id: request.context.operation.operation_id.to_string(),
-                parent_idempotency_key: request.context.operation.idempotency_key.clone(),
-                revision: 1,
-                intent_revision: 1,
-                proof_id: request.live_set.proof_id.clone(),
-                proof_snapshot_sha256: request.live_set.snapshot_sha256.clone(),
-                locator: locator.clone(),
-                live_set: request.live_set.clone(),
-                payload,
-                metadata,
-                state: GcState::TombstoneDurable,
-                receipt: None,
-                cas: Some(TombstoneCas {
-                    version: 2,
-                    context: Self::tombstone_cas_context(
-                        &request.context,
-                        request.context.operation.operation_id.as_str(),
-                        &tombstone_path,
-                        1,
-                    )?,
-                    root_lease: self.owner.lease.clone(),
-                    target: tombstone_path.clone(),
-                    expected: BlobCasState::Missing,
-                    expected_backend_generation: self.platform_backend_generation()?,
-                    requested_durability: BlobCasDurability::Requested,
-                }),
-            };
-            self.persist_tombstone(&tombstone_path, &tombstone, None)?;
-            match self.reconcile_tombstone_path(&tombstone_path)? {
-                ConditionalDeleteOutcome::Deleted => deleted.push(locator.clone()),
-                ConditionalDeleteOutcome::RetainedLive => retained.push(locator.clone()),
+            let mut scopes_deleted = 0_usize;
+            let mut scopes_retained = 0_usize;
+            for scoped in &scopes {
+                match self.gc_scope(&request, locator, scoped, now)? {
+                    ConditionalDeleteOutcome::Deleted => {
+                        scopes_deleted = scopes_deleted.saturating_add(1);
+                    }
+                    ConditionalDeleteOutcome::RetainedLive => {
+                        scopes_retained = scopes_retained.saturating_add(1);
+                    }
+                }
+            }
+            // The locator-level receipt vocabulary cannot express a split
+            // scope outcome: any retained scope retains the locator.
+            if scopes_deleted > 0 && scopes_retained == 0 {
+                deleted.push(locator.clone());
+            } else {
+                retained.push(locator.clone());
             }
         }
         let verified_receipt = self.issue_receipt(
@@ -3535,6 +4361,25 @@ pub struct BlobStoreService<P, C, K, A, L> {
     core: Arc<BlobStoreCore<P, C, K, A, L>>,
 }
 
+/// Construction bundle for [`BlobStoreService`] (T3-B): the six injected
+/// dependencies travel as one value so constructors stay within the argument
+/// ceiling without hiding any dependency. Every field is still supplied by
+/// the composition owner (C3 wiring for production).
+pub struct BlobServicePorts<P, C, K, A, L> {
+    /// Durable no-replace platform adapter (P-01/P-02).
+    pub platform: P,
+    /// Compression provider (never encryption).
+    pub compression: C,
+    /// Key lineage provider.
+    pub keys: K,
+    /// Authenticated-envelope provider.
+    pub aead: A,
+    /// Caller-owned live-set union provider.
+    pub live_sets: L,
+    /// Independently pinned receipt issuer anchor.
+    pub issuer_anchor: BlobIssuerTrustAnchor,
+}
+
 impl<P, C, K, A, L> BlobStoreService<P, C, K, A, L>
 where
     P: BlobPlatformPort,
@@ -3552,15 +4397,47 @@ where
         live_sets: L,
         issuer_anchor: BlobIssuerTrustAnchor,
     ) -> Result<Self, BlobError> {
+        // Ownerless contour for unit/reference compositions. It still joins
+        // the process-local single-owner registry (a second service on the
+        // same root fails with `OwnerConflict`), but without a retained OS
+        // owner handle its cross-process exclusion rests on the platform
+        // adapter's `claim_root` proof. Production compositions must use
+        // `new_with_owner`; the real P-01/P-02 adapter that would carry the
+        // cross-process proof is an honest gap (see `platform_plan_gap`).
         Ok(Self {
             core: Arc::new(BlobStoreCore::claim(
                 lease,
-                platform,
-                compression,
-                keys,
-                aead,
-                live_sets,
-                issuer_anchor,
+                None,
+                BlobServicePorts {
+                    platform,
+                    compression,
+                    keys,
+                    aead,
+                    live_sets,
+                    issuer_anchor,
+                },
+            )?),
+        })
+    }
+
+    /// Owner-bound constructor: the single-owner composition (T3-B, issue
+    /// #19). The service claim binds to the presenting OS `owner` claim —
+    /// `owns_service_root` plus reserver-token equality — so a root reserved
+    /// by one claim can never admit a second service owner in the same or
+    /// another process. The OS lease handle is retained inside the shared
+    /// core for the full service lifetime; cloned handles share it and never
+    /// re-claim. The C3 bridge wiring owns calling this with the retained
+    /// composition owner.
+    pub fn new_with_owner(
+        owner: &BlobRootOwner,
+        lease: BlobRootLease,
+        ports: BlobServicePorts<P, C, K, A, L>,
+    ) -> Result<Self, BlobError> {
+        Ok(Self {
+            core: Arc::new(BlobStoreCore::claim(
+                lease,
+                Some(owner.clone()),
+                ports,
             )?),
         })
     }
@@ -3704,6 +4581,7 @@ fn map_resolve_key_error(
 mod tests {
     use super::*;
     use eliot_blob_api::LiveSetCompleteness;
+    use eliot_blob_api::{ObjectResidencyKey, VersionedContentDigest};
     use std::collections::BTreeMap;
     use std::future::Future;
     use std::pin::Pin;
@@ -4178,13 +5056,17 @@ mod tests {
             proof: &BlobLiveSetProof,
             locator: &BlobLocator,
             intent_revision: u64,
+            residency_sha256: &str,
         ) -> Result<BlobDeletionReconciliation, BlobError> {
             match self.mode {
-                TestGcMode::Applied => Ok(BlobDeletionReconciliation::Applied(deletion_receipt(
-                    operation_id,
-                    proof,
-                    locator,
-                    intent_revision,
+                TestGcMode::Applied => Ok(BlobDeletionReconciliation::Applied(Box::new(
+                    deletion_receipt(
+                        operation_id,
+                        proof,
+                        locator,
+                        intent_revision,
+                        residency_sha256,
+                    ),
                 ))),
                 TestGcMode::NotApplied => Ok(BlobDeletionReconciliation::NotApplied),
                 TestGcMode::Unknown => Ok(BlobDeletionReconciliation::Unknown),
@@ -4197,6 +5079,7 @@ mod tests {
             proof: &BlobLiveSetProof,
             locator: &BlobLocator,
             intent_revision: u64,
+            residency_sha256: &str,
             delete: &mut dyn FnMut() -> Result<(), BlobError>,
         ) -> Result<BlobDeletionReconciliation, BlobError> {
             if self.stale {
@@ -4204,11 +5087,12 @@ mod tests {
             }
             delete()?;
             self.delete_calls = self.delete_calls.saturating_add(1);
-            let mut receipt = deletion_receipt(operation_id, proof, locator, intent_revision);
+            let mut receipt =
+                deletion_receipt(operation_id, proof, locator, intent_revision, residency_sha256);
             if self.tamper_receipt {
                 receipt.path_digest_sha256 = sha256_hex(b"wrong-path");
             }
-            Ok(BlobDeletionReconciliation::Applied(receipt))
+            Ok(BlobDeletionReconciliation::Applied(Box::new(receipt)))
         }
 
         fn compare_and_delete(
@@ -4231,9 +5115,16 @@ mod tests {
         proof: &BlobLiveSetProof,
         locator: &BlobLocator,
         intent_revision: u64,
+        residency_sha256: &str,
     ) -> BlobDeletionReceipt {
-        let payload = payload_path(locator).expect("payload path");
-        let metadata = metadata_path(locator).expect("metadata path");
+        // The port re-derives the residency-scoped placement from the digest
+        // the service passes, exactly like the service does; the service then
+        // validates the receipt path digest and requires both files absent.
+        let scope = ResidencyScope {
+            digest: residency_sha256.to_owned(),
+        };
+        let payload = scoped_payload_path(locator, &scope).expect("payload path");
+        let metadata = scoped_metadata_path(locator, &scope).expect("metadata path");
         BlobDeletionReceipt {
             operation_id: operation_id.to_owned(),
             proof_id: proof.proof_id.clone(),
@@ -4256,9 +5147,23 @@ mod tests {
         )
     }
 
+    static TEST_ROOT_COUNTER: AtomicU64 = AtomicU64::new(1);
+
+    /// Fresh root identity per test store. Stores share one process, and the
+    /// T3-B single-owner registry rejects a second service on a live root —
+    /// so every store under test needs its own root.
+    fn unique_test_root() -> String {
+        let sequence = TEST_ROOT_COUNTER.fetch_add(1, Ordering::Relaxed);
+        format!("root-test-{sequence}")
+    }
+
     fn lease(context: &BlobReceiptContext) -> BlobRootLease {
+        lease_on(context, "root-1")
+    }
+
+    fn lease_on(context: &BlobReceiptContext, root_id: &str) -> BlobRootLease {
         serde_json::from_value(serde_json::json!({
-            "root_id": "root-1",
+            "root_id": root_id,
             "owner_id": "owner-1",
             "lease_id": "lease-1",
             "root_generation": 7,
@@ -4267,31 +5172,69 @@ mod tests {
         .expect("lease")
     }
 
-    fn stage_request(operation: &str, bytes: &[u8]) -> BlobStageRequest {
+    fn stage_request(operation: &str, bytes: &[u8], root: &str) -> BlobStageRequest {
+        stage_request_with_policy(operation, bytes, root, "policy-1")
+    }
+
+    fn stage_request_with_policy(
+        operation: &str,
+        bytes: &[u8],
+        root: &str,
+        policy_ref: &str,
+    ) -> BlobStageRequest {
+        stage_request_with_scope(operation, bytes, root, policy_ref, "scope-test")
+    }
+
+    fn stage_request_with_scope(
+        operation: &str,
+        bytes: &[u8],
+        root: &str,
+        policy_ref: &str,
+        scope_domain: &str,
+    ) -> BlobStageRequest {
         let context: BlobReceiptContext = serde_json::from_str(&context_json(
             "REVERSIBLE_MUTATION",
             operation,
             &format!("request-{operation}"),
         ))
         .expect("context");
+        // s-04-v2: the request carries the full residency key whose content
+        // digest must equal BLAKE3(bytes). Test lineage matches TestKeys.
+        let digest = BlobHash::new(blake3::hash(bytes).to_hex().to_string()).expect("hash");
+        let residency = ObjectResidencyKey {
+            scope_domain_id: BlobId::new(scope_domain).expect("scope domain"),
+            access_domain_id: BlobId::new("access-test").expect("access domain"),
+            confidentiality_domain_id: BlobId::new("conf-test").expect("conf domain"),
+            encryption_key_domain_id: BlobId::new("test-lineage").expect("key domain"),
+            retention_domain_id: BlobId::new("retention-test").expect("retention domain"),
+            erasure_domain_id: BlobId::new("erasure-test").expect("erasure domain"),
+            content_digest: VersionedContentDigest {
+                algorithm: BlobId::new("blake3").expect("algorithm"),
+                version: 1,
+                digest,
+            },
+        };
+        residency.validate().expect("residency");
         BlobStageRequest {
-            root_lease: lease(&context),
+            root_lease: lease_on(&context, root),
             context,
             bytes: bytes.to_vec(),
             policy: BlobPolicyBinding {
                 privacy_class: eliot_security_contracts::PrivacyClass::Private,
                 retention_class: eliot_blob_api::RetentionClass::Task,
-                policy_ref: eliot_platform::PlatformHandle::new("policy-1").expect("policy"),
+                policy_ref: eliot_platform::PlatformHandle::new(policy_ref).expect("policy"),
                 instruction_taint: eliot_security_contracts::InstructionTaint::DataOnly,
                 effect_ceiling: eliot_security_contracts::EffectCeiling::CandidateOnly,
             },
+            residency,
         }
     }
 
     fn store_with_platform(
         platform: MemoryPlatform,
+        root: &str,
     ) -> BlobStoreService<MemoryPlatform, TestCompression, TestKeys, TestAead, TestLiveSets> {
-        let request = stage_request("bootstrap", b"");
+        let request = stage_request("bootstrap", b"", root);
         BlobStoreService::new(
             request.root_lease,
             platform,
@@ -4304,16 +5247,18 @@ mod tests {
         .expect("store")
     }
 
-    fn store() -> BlobStoreService<MemoryPlatform, TestCompression, TestKeys, TestAead, TestLiveSets>
-    {
-        store_with_platform(MemoryPlatform::default())
+    fn store_on(
+        root: &str,
+    ) -> BlobStoreService<MemoryPlatform, TestCompression, TestKeys, TestAead, TestLiveSets> {
+        store_with_platform(MemoryPlatform::default(), root)
     }
 
     fn gc_store(
         mode: TestGcMode,
         stale: bool,
+        root: &str,
     ) -> BlobStoreService<MemoryPlatform, TestCompression, TestKeys, TestAead, TestLiveSets> {
-        let request = stage_request("bootstrap", b"");
+        let request = stage_request("bootstrap", b"", root);
         BlobStoreService::new(
             request.root_lease,
             MemoryPlatform::default(),
@@ -4331,7 +5276,11 @@ mod tests {
         .expect("store")
     }
 
-    fn gc_request(live: Vec<BlobLocator>, candidates: Vec<BlobLocator>) -> BlobGcRequest {
+    fn gc_request(
+        live: Vec<BlobLocator>,
+        candidates: Vec<BlobLocator>,
+        root: &str,
+    ) -> BlobGcRequest {
         let context: BlobReceiptContext = serde_json::from_str(&context_json(
             "REVERSIBLE_MUTATION",
             "gc-operation",
@@ -4349,7 +5298,7 @@ mod tests {
             receipt_refs: vec!["receipt-gc".to_owned()],
         };
         BlobGcRequest {
-            root_lease: lease(&context),
+            root_lease: lease_on(&context, root),
             context,
             live_set,
             candidates,
@@ -4357,7 +5306,31 @@ mod tests {
         }
     }
 
-    fn read_request(ready: &BlobReadyReceipt, operation: &str) -> BlobReadRequest {
+    fn reachability_request(live: Vec<BlobLocator>, root: &str) -> BlobReachabilityRequest {
+        let context: BlobReceiptContext = serde_json::from_str(&context_json(
+            "READ",
+            "reachability-operation",
+            "request-reachability-operation",
+        ))
+        .expect("context");
+        let live_set = BlobLiveSetProof {
+            proof_id: BlobId::new("proof-reachability").expect("proof id"),
+            canonical_owner_ref: BlobId::new("canonical-owner").expect("owner ref"),
+            completeness: LiveSetCompleteness::Complete,
+            snapshot_sha256: sha256_hex(b"live-set-snapshot"),
+            revision: 1,
+            fence_binding: context.request.clone(),
+            live,
+            receipt_refs: vec!["receipt-reachability".to_owned()],
+        };
+        BlobReachabilityRequest {
+            root_lease: lease_on(&context, root),
+            context,
+            live_set,
+        }
+    }
+
+    fn read_request(ready: &BlobReadyReceipt, operation: &str, root: &str) -> BlobReadRequest {
         let context: BlobReceiptContext = serde_json::from_str(&context_json(
             "READ",
             operation,
@@ -4365,7 +5338,7 @@ mod tests {
         ))
         .expect("context");
         BlobReadRequest {
-            root_lease: lease(&context),
+            root_lease: lease_on(&context, root),
             context,
             locator: ready.locator().clone(),
             expected_metadata_sha256: ready.metadata_sha256().to_owned(),
@@ -4376,13 +5349,16 @@ mod tests {
 
     #[test]
     fn object_safe_stage_read_roundtrip() {
-        let store = store();
+        let root = unique_test_root();
+        let store = store_on(&root);
         let client: &dyn BlobStoreClient = &store;
-        let ready = block_on(client.stage(stage_request("roundtrip", b"payload"))).expect("stage");
+        let ready =
+            block_on(client.stage(stage_request("roundtrip", b"payload", &root))).expect("stage");
         let expected_anchor = test_anchor();
         assert_eq!(ready.anchor_fingerprint(), expected_anchor.fingerprint());
         assert_eq!(ready.plaintext_length(), 7);
-        let chunk = block_on(client.read(read_request(&ready, "roundtrip-read"))).expect("read");
+        let chunk = block_on(client.read(read_request(&ready, "roundtrip-read", &root)))
+            .expect("read");
         assert_eq!(chunk.bytes(), b"payload");
         assert_eq!(chunk.anchor_fingerprint(), expected_anchor.fingerprint());
         assert!(chunk.is_complete());
@@ -4391,34 +5367,39 @@ mod tests {
 
     #[test]
     fn idempotent_replay_is_exact_and_conflict_never_succeeds() {
-        let store = store();
-        let request = stage_request("idem", b"payload");
+        let root = unique_test_root();
+        let store = store_on(&root);
+        let request = stage_request("idem", b"payload", &root);
         let first = block_on(store.stage(request.clone())).expect("stage");
         let replay = block_on(store.stage(request)).expect("replay");
         assert_eq!(first, replay);
-        let conflict = block_on(store.stage(stage_request("idem", b"different")));
+        let conflict = block_on(store.stage(stage_request("idem", b"different", &root)));
         assert_eq!(conflict, Err(BlobError::IdempotencyConflict));
     }
 
     #[test]
     fn gc_retains_live_and_removes_unreachable_once() {
-        let store = gc_store(TestGcMode::NotApplied, false);
-        let live = block_on(store.stage(stage_request("live", b"live-payload"))).expect("live");
+        let root = unique_test_root();
+        let store = gc_store(TestGcMode::NotApplied, false, &root);
+        let live =
+            block_on(store.stage(stage_request("live", b"live-payload", &root))).expect("live");
         let unreachable =
-            block_on(store.stage(stage_request("orphan", b"orphan-payload"))).expect("orphan");
+            block_on(store.stage(stage_request("orphan", b"orphan-payload", &root)))
+                .expect("orphan");
         let request = gc_request(
             vec![live.locator().clone()],
             vec![live.locator().clone(), unreachable.locator().clone()],
+            &root,
         );
         let receipt = block_on(store.gc(request.clone())).expect("gc");
         assert!(receipt.deleted().contains(unreachable.locator()));
         assert!(receipt.retained().contains(live.locator()));
         assert!(matches!(
-            block_on(store.read(read_request(&unreachable, "orphan-read"))),
+            block_on(store.read(read_request(&unreachable, "orphan-read", &root))),
             Err(BlobError::NotFound)
         ));
         assert_eq!(
-            block_on(store.stage(stage_request("orphan-replay", b"orphan-payload"))),
+            block_on(store.stage(stage_request("orphan-replay", b"orphan-payload", &root))),
             Err(BlobError::PlanGap(
                 "purged or quarantined blob content cannot be re-admitted".to_owned()
             ))
@@ -4438,20 +5419,23 @@ mod tests {
 
     #[test]
     fn stale_reachability_plan_is_rejected_before_tombstone() {
-        let store = gc_store(TestGcMode::NotApplied, true);
+        let root = unique_test_root();
+        let store = gc_store(TestGcMode::NotApplied, true, &root);
         let orphan =
-            block_on(store.stage(stage_request("stale-orphan", b"payload"))).expect("orphan");
-        let request = gc_request(Vec::new(), vec![orphan.locator().clone()]);
+            block_on(store.stage(stage_request("stale-orphan", b"payload", &root)))
+                .expect("orphan");
+        let request = gc_request(Vec::new(), vec![orphan.locator().clone()], &root);
         assert_eq!(
             block_on(store.gc(request)),
             Err(BlobError::IncompleteLiveSet)
         );
-        assert!(block_on(store.read(read_request(&orphan, "stale-read"))).is_ok());
+        assert!(block_on(store.read(read_request(&orphan, "stale-read", &root))).is_ok());
     }
 
     #[test]
     fn target_receipt_path_digest_mismatch_is_rejected() {
-        let store = gc_store(TestGcMode::NotApplied, false);
+        let root = unique_test_root();
+        let store = gc_store(TestGcMode::NotApplied, false, &root);
         store
             .core
             .live_sets
@@ -4459,8 +5443,8 @@ mod tests {
             .expect("live-set lock")
             .tamper_receipt = true;
         let orphan =
-            block_on(store.stage(stage_request("bad-receipt", b"payload"))).expect("orphan");
-        let request = gc_request(Vec::new(), vec![orphan.locator().clone()]);
+            block_on(store.stage(stage_request("bad-receipt", b"payload", &root))).expect("orphan");
+        let request = gc_request(Vec::new(), vec![orphan.locator().clone()], &root);
         assert_eq!(
             block_on(store.gc(request)),
             Err(BlobError::MetadataPayloadMismatch)
@@ -4469,23 +5453,26 @@ mod tests {
 
     #[test]
     fn applied_receipt_with_live_targets_is_rejected() {
-        let store = gc_store(TestGcMode::Applied, false);
-        let orphan = block_on(store.stage(stage_request("live-target-receipt", b"payload")))
+        let root = unique_test_root();
+        let store = gc_store(TestGcMode::Applied, false, &root);
+        let orphan = block_on(store.stage(stage_request("live-target-receipt", b"payload", &root)))
             .expect("orphan");
-        let request = gc_request(Vec::new(), vec![orphan.locator().clone()]);
+        let request = gc_request(Vec::new(), vec![orphan.locator().clone()], &root);
         assert_eq!(
             block_on(store.gc(request)),
             Err(BlobError::MetadataPayloadMismatch)
         );
-        assert!(block_on(store.read(read_request(&orphan, "live-target-read"))).is_ok());
+        assert!(block_on(store.read(read_request(&orphan, "live-target-read", &root))).is_ok());
     }
 
     #[test]
     fn unknown_gc_outcome_is_durable_and_not_blindly_retried() {
-        let store = gc_store(TestGcMode::Unknown, false);
+        let root = unique_test_root();
+        let store = gc_store(TestGcMode::Unknown, false, &root);
         let orphan =
-            block_on(store.stage(stage_request("unknown-orphan", b"payload"))).expect("orphan");
-        let request = gc_request(Vec::new(), vec![orphan.locator().clone()]);
+            block_on(store.stage(stage_request("unknown-orphan", b"payload", &root)))
+                .expect("orphan");
+        let request = gc_request(Vec::new(), vec![orphan.locator().clone()], &root);
         assert!(matches!(
             block_on(store.gc(request.clone())),
             Err(BlobError::UnknownGcOutcome { .. })
@@ -4533,7 +5520,7 @@ mod tests {
                     if matches!(&*failure, BlobCasFailure::ExpectedStateConflict { request, .. }
                     if request.expected == BlobCasState::Digest(revision_one_expected.clone()))
         ));
-        assert!(block_on(store.read(read_request(&orphan, "unknown-read"))).is_ok());
+        assert!(block_on(store.read(read_request(&orphan, "unknown-read", &root))).is_ok());
         let health = block_on(store.health()).expect("health");
         assert!(!health.ready);
         assert!(!health.recovery_clean);
@@ -4544,22 +5531,33 @@ mod tests {
                 state: GcState::LiveSetRevalidated,
             })
         );
-        assert!(block_on(store.read(read_request(&orphan, "unknown-read-2"))).is_ok());
+        assert!(block_on(store.read(read_request(&orphan, "unknown-read-2", &root))).is_ok());
     }
 
     #[test]
     fn applied_reconciliation_after_effect_does_not_delete_again() {
-        let store = gc_store(TestGcMode::Unknown, false);
+        let root = unique_test_root();
+        let store = gc_store(TestGcMode::Unknown, false, &root);
         let orphan =
-            block_on(store.stage(stage_request("crash-orphan", b"payload"))).expect("orphan");
-        let request = gc_request(Vec::new(), vec![orphan.locator().clone()]);
+            block_on(store.stage(stage_request("crash-orphan", b"payload", &root)))
+                .expect("orphan");
+        let request = gc_request(Vec::new(), vec![orphan.locator().clone()], &root);
         assert!(matches!(
             block_on(store.gc(request.clone())),
             Err(BlobError::UnknownGcOutcome { .. })
         ));
 
-        let payload = payload_path(orphan.locator()).expect("payload path");
-        let metadata = metadata_path(orphan.locator()).expect("metadata path");
+        // Resolve the residency-scoped placement through the service's own
+        // enumeration: the test never guesses the physical layout.
+        let scoped = store
+            .core
+            .enumerate_scopes(orphan.locator())
+            .expect("enumerate scopes")
+            .into_iter()
+            .next()
+            .expect("one scope");
+        let payload = scoped.payload;
+        let metadata = scoped.metadata;
         store
             .core
             .platform
@@ -4588,7 +5586,7 @@ mod tests {
             0
         );
         assert!(matches!(
-            block_on(store.read(read_request(&orphan, "crash-read"))),
+            block_on(store.read(read_request(&orphan, "crash-read", &root))),
             Err(BlobError::NotFound)
         ));
     }
@@ -4757,12 +5755,13 @@ mod tests {
 
     #[test]
     fn stage_journal_capacity_retains_operation_and_attempted_bytes() {
+        let root = unique_test_root();
         let platform = MemoryPlatform {
             fail_write: Some(BlobCapacityStage::JournalWrite),
             ..MemoryPlatform::default()
         };
         let error = block_on(
-            store_with_platform(platform).stage(stage_request("journal-full", b"payload")),
+            store_with_platform(platform, &root).stage(stage_request("journal-full", b"payload", &root)),
         )
         .expect_err("journal capacity must be surfaced");
         let BlobError::StorageCapacity { failure } = error else {
@@ -4787,12 +5786,14 @@ mod tests {
 
     #[test]
     fn publication_capacity_keeps_possible_effect_for_reconciliation() {
+        let root = unique_test_root();
         let platform = MemoryPlatform {
             fail_rename: true,
             ..MemoryPlatform::default()
         };
         let error = block_on(
-            store_with_platform(platform).stage(stage_request("publication-full", b"payload")),
+            store_with_platform(platform, &root)
+                .stage(stage_request("publication-full", b"payload", &root)),
         )
         .expect_err("publication capacity must remain uncertain");
         let BlobError::StorageCapacity { failure } = error else {
@@ -4811,12 +5812,13 @@ mod tests {
 
     #[test]
     fn cleanup_capacity_retains_last_durable_phase_and_unknown_cleanup() {
+        let root = unique_test_root();
         let platform = MemoryPlatform {
             fail_remove: true,
             ..MemoryPlatform::default()
         };
         let error = block_on(
-            store_with_platform(platform).stage(stage_request("cleanup-full", b"payload")),
+            store_with_platform(platform, &root).stage(stage_request("cleanup-full", b"payload", &root)),
         )
         .expect_err("cleanup capacity must remain observable");
         let BlobError::StorageCapacity { failure } = error else {
@@ -4833,6 +5835,321 @@ mod tests {
         assert_eq!(
             failure.recovery,
             BlobCapacityRecovery::ReconcileSameOperationThenRevalidate
+        );
+    }
+
+    /// Fresh OS-claim root under the system temp dir. Callers drop the store
+    /// and the owner before removing the directory.
+    fn unique_owner_root() -> PathBuf {
+        let sequence = TEST_ROOT_COUNTER.fetch_add(1, Ordering::Relaxed);
+        std::env::temp_dir().join(format!(
+            "eliot-t3b-owner-{}-{sequence}",
+            std::process::id()
+        ))
+    }
+
+    fn owner_test_store(
+        owner: &BlobRootOwner,
+        lease: BlobRootLease,
+    ) -> BlobStoreService<MemoryPlatform, TestCompression, TestKeys, TestAead, TestLiveSets> {
+        BlobStoreService::new_with_owner(
+            owner,
+            lease,
+            BlobServicePorts {
+                platform: MemoryPlatform::default(),
+                compression: TestCompression,
+                keys: TestKeys,
+                aead: TestAead,
+                live_sets: TestLiveSets::default(),
+                issuer_anchor: test_anchor(),
+            },
+        )
+        .expect("owner-bound store")
+    }
+
+    #[test]
+    fn owner_bound_stage_read_roundtrip() {
+        let dir = unique_owner_root();
+        let root = dir.to_string_lossy().into_owned();
+        let owner =
+            BlobRootOwner::claim(root.clone(), "t3b-owner", std::process::id()).expect("claim");
+        let lease = stage_request("owner-bootstrap", b"", &root).root_lease;
+        let store = owner_test_store(&owner, lease);
+        let ready = block_on(store.stage(stage_request("owner-roundtrip", b"owner-payload", &root)))
+            .expect("stage");
+        assert_eq!(ready.plaintext_length(), 13);
+        let chunk = block_on(store.read(read_request(&ready, "owner-read", &root))).expect("read");
+        assert_eq!(chunk.bytes(), b"owner-payload");
+        assert_eq!(chunk.anchor_fingerprint(), test_anchor().fingerprint());
+        assert!(block_on(store.health()).expect("health").ready);
+        drop(store);
+        drop(owner);
+        std::fs::remove_dir_all(&dir).expect("cleanup owner root");
+    }
+
+    #[test]
+    fn second_service_owner_on_same_root_is_rejected() {
+        let root = unique_test_root();
+        let first_lease = stage_request("bootstrap-first", b"", &root).root_lease;
+        let _first = BlobStoreService::new(
+            first_lease,
+            MemoryPlatform::default(),
+            TestCompression,
+            TestKeys,
+            TestAead,
+            TestLiveSets::default(),
+            test_anchor(),
+        )
+        .expect("first service");
+        // A second service on the same live root is a second owner.
+        let second_lease = stage_request("bootstrap-second", b"", &root).root_lease;
+        assert_eq!(
+            BlobStoreService::new(
+                second_lease,
+                MemoryPlatform::default(),
+                TestCompression,
+                TestKeys,
+                TestAead,
+                TestLiveSets::default(),
+                test_anchor(),
+            )
+            .map(|_| ()),
+            Err(BlobError::OwnerConflict)
+        );
+        // So is an OS claim on a service-held root — rejected before any
+        // filesystem work by the same unified registry.
+        assert_eq!(
+            BlobRootOwner::claim(root.clone(), "t3b-owner-late", std::process::id())
+                .map(|_| ()),
+            Err(BlobError::OwnerConflict)
+        );
+    }
+
+    #[test]
+    fn owner_reserved_root_rejects_ownerless_service_but_admits_bound_service() {
+        let dir = unique_owner_root();
+        let root = dir.to_string_lossy().into_owned();
+        let owner =
+            BlobRootOwner::claim(root.clone(), "t3b-owner", std::process::id()).expect("claim");
+        // A root reserved by the OS claim can never admit an ownerless
+        // service as a second owner.
+        let probe = stage_request("bootstrap-probe", b"", &root).root_lease;
+        assert_eq!(
+            BlobStoreService::new(
+                probe,
+                MemoryPlatform::default(),
+                TestCompression,
+                TestKeys,
+                TestAead,
+                TestLiveSets::default(),
+                test_anchor(),
+            )
+            .map(|_| ()),
+            Err(BlobError::OwnerConflict)
+        );
+        // The bound service presenting the reserver is admitted exactly once.
+        let bound_lease = stage_request("bootstrap-bound", b"", &root).root_lease;
+        let bound = owner_test_store(&owner, bound_lease);
+        let again_lease = stage_request("bootstrap-again", b"", &root).root_lease;
+        assert_eq!(
+            BlobStoreService::new_with_owner(
+                &owner,
+                again_lease,
+                BlobServicePorts {
+                    platform: MemoryPlatform::default(),
+                    compression: TestCompression,
+                    keys: TestKeys,
+                    aead: TestAead,
+                    live_sets: TestLiveSets::default(),
+                    issuer_anchor: test_anchor(),
+                },
+            )
+            .map(|_| ()),
+            Err(BlobError::OwnerConflict)
+        );
+        // A lease for a different root never binds to this owner.
+        let foreign_root = unique_test_root();
+        let foreign_lease =
+            stage_request("bootstrap-foreign", b"", &foreign_root).root_lease;
+        assert_eq!(
+            BlobStoreService::new_with_owner(
+                &owner,
+                foreign_lease,
+                BlobServicePorts {
+                    platform: MemoryPlatform::default(),
+                    compression: TestCompression,
+                    keys: TestKeys,
+                    aead: TestAead,
+                    live_sets: TestLiveSets::default(),
+                    issuer_anchor: test_anchor(),
+                },
+            )
+            .map(|_| ()),
+            Err(BlobError::OwnerConflict)
+        );
+        // A second OS claim on the owner-held root is rejected as well.
+        assert_eq!(
+            BlobRootOwner::claim(root.clone(), "t3b-owner-second", std::process::id())
+                .map(|_| ()),
+            Err(BlobError::OwnerConflict)
+        );
+        drop(bound);
+        drop(owner);
+        std::fs::remove_dir_all(&dir).expect("cleanup owner root");
+    }
+
+    #[test]
+    fn same_bytes_in_different_residency_domains_never_share_an_object() {
+        let root = unique_test_root();
+        let store = gc_store(TestGcMode::NotApplied, false, &root);
+        let bytes = b"shared-bytes-across-domains";
+        // s-04-v2: residency is caller-supplied contract identity. Same bytes
+        // under the same policy but different scope domains are different
+        // locators and different physical objects by construction.
+        let first = block_on(store.stage(stage_request_with_scope(
+            "xdom-a", bytes, &root, "policy-xdom", "scope-a",
+        )))
+        .expect("domain a");
+        let second = block_on(store.stage(stage_request_with_scope(
+            "xdom-b", bytes, &root, "policy-xdom", "scope-b",
+        )))
+        .expect("domain b");
+        assert_ne!(first.locator(), second.locator());
+        assert_ne!(
+            first.locator().residency_key_digest(),
+            second.locator().residency_key_digest()
+        );
+        assert_ne!(first.metadata_sha256(), second.metadata_sha256());
+        // One physical scope per locator at distinct placements — never one
+        // shared object.
+        for ready in [&first, &second] {
+            let scopes = store
+                .core
+                .enumerate_scopes(ready.locator())
+                .expect("enumerate scopes");
+            assert_eq!(scopes.len(), 1);
+        }
+        let scopes_a = store
+            .core
+            .enumerate_scopes(first.locator())
+            .expect("enumerate a");
+        let scopes_b = store
+            .core
+            .enumerate_scopes(second.locator())
+            .expect("enumerate b");
+        assert_ne!(
+            scopes_a[0].payload.normalized_identity(),
+            scopes_b[0].payload.normalized_identity()
+        );
+        assert_ne!(
+            scopes_a[0].metadata.normalized_identity(),
+            scopes_b[0].metadata.normalized_identity()
+        );
+        // Both domains read back their exact bytes under their own receipts.
+        let chunk_a =
+            block_on(store.read(read_request(&first, "xdom-read-a", &root))).expect("read a");
+        let chunk_b =
+            block_on(store.read(read_request(&second, "xdom-read-b", &root))).expect("read b");
+        assert_eq!(chunk_a.bytes(), bytes);
+        assert_eq!(chunk_b.bytes(), bytes);
+        // GC collects both scopes independently through both locators.
+        let receipt = block_on(store.gc(gc_request(
+            Vec::new(),
+            vec![first.locator().clone(), second.locator().clone()],
+            &root,
+        )))
+        .expect("gc both scopes");
+        assert!(receipt.deleted().contains(first.locator()));
+        assert!(receipt.deleted().contains(second.locator()));
+        assert!(matches!(
+            block_on(store.read(read_request(&first, "xdom-read-a2", &root))),
+            Err(BlobError::NotFound)
+        ));
+        assert!(matches!(
+            block_on(store.read(read_request(&second, "xdom-read-b2", &root))),
+            Err(BlobError::NotFound)
+        ));
+    }
+
+    #[test]
+    fn partial_live_set_blocks_gc_before_any_effect() {
+        let root = unique_test_root();
+        let store = gc_store(TestGcMode::NotApplied, false, &root);
+        let orphan =
+            block_on(store.stage(stage_request("partial-orphan", b"payload", &root)))
+                .expect("orphan");
+        let mut request = gc_request(Vec::new(), vec![orphan.locator().clone()], &root);
+        request.live_set.completeness = LiveSetCompleteness::Partial;
+        assert_eq!(
+            block_on(store.gc(request)),
+            Err(BlobError::IncompleteLiveSet)
+        );
+        // Blocked before any tombstone effect; the object still reads.
+        let tombstones = WorkScopePath::new("tombstones").expect("tombstones");
+        let listed = store
+            .core
+            .platform
+            .read()
+            .expect("platform lock")
+            .list(&tombstones)
+            .expect("tombstone list");
+        assert!(listed.is_empty());
+        assert!(block_on(store.read(read_request(&orphan, "partial-read", &root))).is_ok());
+    }
+
+    #[test]
+    fn coherent_reachability_reports_scopes_and_rejects_stale_sources() {
+        let root = unique_test_root();
+        let store = gc_store(TestGcMode::NotApplied, false, &root);
+        let live =
+            block_on(store.stage(stage_request("reach-live", b"live", &root))).expect("live");
+        let view = block_on(store.reachability(reachability_request(
+            vec![live.locator().clone()],
+            &root,
+        )))
+        .expect("reachability view");
+        assert!(view.present.contains(live.locator()));
+        assert!(view.missing.is_empty());
+        // A locator with no stored scope reports missing without failing.
+        let absent = BlobLocator {
+            hash: BlobHash::new("b".repeat(64)).expect("hash"),
+            residency: ObjectResidencyKey {
+                scope_domain_id: BlobId::new("scope-absent").expect("scope domain"),
+                access_domain_id: BlobId::new("access-absent").expect("access domain"),
+                confidentiality_domain_id: BlobId::new("conf-absent").expect("conf domain"),
+                encryption_key_domain_id: BlobId::new("test-lineage").expect("key domain"),
+                retention_domain_id: BlobId::new("retention-absent").expect("retention domain"),
+                erasure_domain_id: BlobId::new("erasure-absent").expect("erasure domain"),
+                content_digest: VersionedContentDigest {
+                    algorithm: BlobId::new("blake3").expect("algorithm"),
+                    version: 1,
+                    digest: BlobHash::new("b".repeat(64)).expect("hash"),
+                },
+            },
+            root_generation: 7,
+            path_generation: 1,
+        };
+        let absent_view = block_on(store.reachability(reachability_request(
+            vec![absent.clone()],
+            &root,
+        )))
+        .expect("absent view");
+        assert!(absent_view.missing.contains(&absent));
+        assert!(absent_view.present.is_empty());
+        // A stale live-set source blocks the view instead of reporting
+        // reachability against a superseded union.
+        let stale_root = unique_test_root();
+        let stale_store = gc_store(TestGcMode::NotApplied, true, &stale_root);
+        let staged = block_on(
+            stale_store.stage(stage_request("reach-stale", b"stale", &stale_root)),
+        )
+        .expect("staged");
+        assert_eq!(
+            block_on(stale_store.reachability(reachability_request(
+                vec![staged.locator().clone()],
+                &stale_root,
+            ))),
+            Err(BlobError::IncompleteLiveSet)
         );
     }
 }
