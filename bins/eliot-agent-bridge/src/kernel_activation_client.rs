@@ -317,8 +317,9 @@ impl KernelTransportOwner {
                     WorkUnitId::new(b.work_unit_id).map_err(|_| provider_failure())?;
                 let generation = Generation::new(b.activation_generation.value())
                     .map_err(|_| provider_failure())?;
+                // INTENDED EpochId shape (B→A→C): fence carries EpochId after B.
                 let fence = FencingToken::new(
-                    b.state_fence.authority_epoch.value(),
+                    b.state_fence.authority_epoch.clone(),
                     generation,
                     b.state_fence.nonce,
                 )
