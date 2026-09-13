@@ -19,6 +19,11 @@ use crate::{
     Governor, GovernorConfig, GovernorState, QueueLimits, STARTUP_ORDER, ServiceId,
     ServiceObservation,
 };
+use eliot_authority::{
+    GrantActivationRequest, GrantId, GrantRevocationRequest, GrantStatus,
+    IntroductionActivationRequest, IntroductionId, IntroductionRevocationRequest,
+    IntroductionStatus, P07AuthorityPort, P07PortError,
+};
 use eliot_budget::{BudgetLedger, BudgetLedgerRecoverySnapshot};
 use eliot_canonical::{CanonicalError, CanonicalWriteEnvelope};
 use eliot_change_monitor::ChangeMonitor;
@@ -35,6 +40,7 @@ use eliot_module_registry::ModuleCatalog;
 use eliot_module_registry::ModuleCatalogSnapshot;
 use eliot_observation::{ObservationJournal, ObservationJournalEntry};
 use eliot_protocol::RequestIdentity;
+use eliot_runtime_contracts::{AuthorityActivationReceipt, AuthorityRevocationReceipt};
 use eliot_session::{SessionLifecycleOwner, SessionLifecycleSnapshot, SessionState};
 use eliot_skill::{SkillLifecycleView, SkillRegistry};
 use eliot_store_api::{
@@ -49,7 +55,10 @@ use thiserror::Error;
 
 #[path = "authority_recovery.rs"]
 mod authority_recovery;
-pub use authority_recovery::{AuthorityOwner, AuthorityOwnerSnapshot};
+pub use authority_recovery::{
+    AuthorityOwner, AuthorityOwnerSnapshot, AuthorityPresentationState, PresentedAuthorityRequest,
+    RetainedAuthorityRequest,
+};
 #[path = "genesis_owner_packet.rs"]
 mod genesis_owner_packet;
 pub use genesis_owner_packet::GovernorGenesisPacket as GovernorGenesisRequest;
@@ -728,6 +737,9 @@ pub enum CompositionError {
     /// Canonical admission rejected the envelope.
     #[error("canonical admission: {0}")]
     Canonical(#[from] CanonicalError),
+    /// P-07 authority activation refused, mismatched, or of unknown outcome.
+    #[error("authority activation: {0}")]
+    Authority(#[from] P07PortError),
     /// Kernel transition failed at the neutral port.
     #[error("Kernel transition: {0}")]
     Kernel(#[from] KernelPortError),
@@ -1387,18 +1399,25 @@ pub enum CompositionReadiness {
 /// process executor hidden behind this value.
 pub struct GovernorComposition<P: ?Sized> {
     kernel: Arc<P>,
+    /// Retained P-07 authority port. `None` means diagnosed degradation
+    /// (reads/degraded status only) and never issues rights.
+    authority_activation: Option<Arc<dyn P07AuthorityPort>>,
     governor: Governor,
     owners: GovernorOwners<P>,
     snapshot: KernelGenerationSnapshot,
     recovery: GovernorRecoverySnapshot,
     service_observations: Vec<KernelServiceRecovery>,
     readiness: CompositionReadiness,
+    /// Exact P-07 presentations retained with their owner snapshots until
+    /// exact reconciliation, keyed by [`PresentedAuthorityRequest::ledger_key`].
+    authority_presentations: BTreeMap<String, RetainedAuthorityRequest>,
 }
 
 impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
     /// Builds one composition only after exact provider and recovery checks.
     pub fn new(
         kernel: Arc<P>,
+        authority_activation: Option<Arc<dyn P07AuthorityPort>>,
         expected: &KernelGenerationExpectation,
         queues: QueueLimits,
     ) -> Result<Self, CompositionError> {
@@ -1455,12 +1474,14 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
         )?;
         Ok(Self {
             kernel,
+            authority_activation,
             governor,
             owners,
             snapshot,
             recovery,
             service_observations,
             readiness: CompositionReadiness::Ready,
+            authority_presentations: BTreeMap::new(),
         })
     }
 
@@ -1595,6 +1616,293 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
         self.recovery = recovery;
         self.service_observations = service_observations;
         Ok(())
+    }
+
+    /// Returns whether a live P-07 authority port was retained. `None` means
+    /// diagnosed degradation (reads/degraded status only); it never issues
+    /// rights and every activation entry point fails closed with
+    /// [`P07PortError::Unavailable`].
+    #[must_use]
+    pub fn authority_activation_available(&self) -> bool {
+        self.authority_activation.is_some()
+    }
+
+    /// Presents one canonical grant activation to the retained P-07 port and
+    /// records `PendingActivation -> Active` only after the exact
+    /// Kernel-issued receipt validates `Active`.
+    ///
+    /// Fail-closed behavior:
+    /// - Without a retained port, or when the composition is not ready, no
+    ///   right is issued.
+    /// - The recovered grant must still be `PendingActivation`; a restored
+    ///   `Active`, an unknown grant, or a second activation on a recorded
+    ///   identity fails closed instead of issuing twice.
+    /// - An `UnknownOutcome` retains the exact request with its owner snapshot
+    ///   until exact reconciliation; the grant stays pending, never active.
+    /// - A receipt bound to another snapshot or epoch, or failing
+    ///   `validate()`, leaves the retained state untouched.
+    pub fn activate_grant(
+        &mut self,
+        request: &GrantActivationRequest,
+    ) -> Result<AuthorityActivationReceipt, CompositionError> {
+        self.require_ready_for_authority()?;
+        let port = self.authority_port()?;
+        let presented = PresentedAuthorityRequest::GrantActivation(request.clone());
+        self.require_activatable_grant(&presented)?;
+        let receipt = match port.activate_grant(request) {
+            Ok(receipt) => receipt,
+            Err(P07PortError::UnknownOutcome { snapshot_id }) => {
+                self.note_unknown_outcome(presented, &snapshot_id)?;
+                return Err(CompositionError::Authority(P07PortError::UnknownOutcome {
+                    snapshot_id,
+                }));
+            }
+            Err(error) => return Err(CompositionError::Authority(error)),
+        };
+        let retained = self.retain_presentation(presented)?;
+        retained.note_activated(&receipt)?;
+        Ok(receipt)
+    }
+
+    /// Revokes one grant through the retained P-07 port, Kernel first. The
+    /// Kernel-issued revocation receipt is validated before the local
+    /// projection is reconciled; when that reconciliation cannot complete, the
+    /// retained revocation intent keeps effects blocked instead of reporting
+    /// an active right.
+    pub fn revoke_grant(
+        &mut self,
+        request: &GrantRevocationRequest,
+    ) -> Result<AuthorityRevocationReceipt, CompositionError> {
+        self.require_ready_for_authority()?;
+        let port = self.authority_port()?;
+        let presented = PresentedAuthorityRequest::GrantRevocation(request.clone());
+        let receipt = match port.revoke_grant(request) {
+            Ok(receipt) => receipt,
+            Err(P07PortError::UnknownOutcome { snapshot_id }) => {
+                self.note_unknown_outcome(presented, &snapshot_id)?;
+                return Err(CompositionError::Authority(P07PortError::UnknownOutcome {
+                    snapshot_id,
+                }));
+            }
+            Err(error) => return Err(CompositionError::Authority(error)),
+        };
+        receipt
+            .validate()
+            .map_err(|_| CompositionError::Authority(P07PortError::InvalidBinding))?;
+        if receipt.snapshot_id != request.snapshot_id.as_str()
+            || receipt.authority_epoch != request.binding.state_fence.authority_epoch
+        {
+            return Err(CompositionError::Authority(P07PortError::InvalidBinding));
+        }
+        // Canonical-second reconciliation: absorb the validated Kernel receipt
+        // into the local projection. The graph mutation runs before the ledger
+        // files the receipt.
+        let graph_reconciled = self
+            .owners
+            .authority
+            .grants
+            .revoke(&request.grant_id)
+            .is_ok();
+        let retained = self.retain_presentation(presented)?;
+        if !graph_reconciled {
+            // Kernel already fenced this grant (the receipt above validated),
+            // but the local projection cannot reconcile it — typically a grant
+            // unknown to the recovered graph. The visible revocation intent is
+            // strictly stronger than any right, so effects stay blocked.
+            retained.note_revocation_intended();
+            return Err(CompositionError::Recovery(
+                "grant revocation reconciled at Kernel but not in the recovered graph; \
+                 revocation intent retained and effects remain blocked"
+                    .to_owned(),
+            ));
+        }
+        if retained.note_revoked(&receipt).is_err() {
+            retained.note_revocation_intended();
+            return Err(CompositionError::Recovery(
+                "grant revocation receipt could not be filed; \
+                 revocation intent retained and effects remain blocked"
+                    .to_owned(),
+            ));
+        }
+        Ok(receipt)
+    }
+
+    /// Presents one canonical introduction activation to the retained P-07
+    /// port. The same receipt gate as [`Self::activate_grant`] applies:
+    /// `Active` is recorded only after the exact Kernel-issued receipt
+    /// validates, and a second activation on a recorded identity fails closed.
+    pub fn activate_introduction(
+        &mut self,
+        request: &IntroductionActivationRequest,
+    ) -> Result<AuthorityActivationReceipt, CompositionError> {
+        self.require_ready_for_authority()?;
+        let port = self.authority_port()?;
+        let presented = PresentedAuthorityRequest::IntroductionActivation(request.clone());
+        if let Some(retained) = self
+            .authority_presentations
+            .get(presented.ledger_key().as_str())
+            && matches!(retained.state(), AuthorityPresentationState::Active { .. })
+        {
+            return Err(CompositionError::Authority(P07PortError::InvalidBinding));
+        }
+        let receipt = match port.activate_introduction(request) {
+            Ok(receipt) => receipt,
+            Err(P07PortError::UnknownOutcome { snapshot_id }) => {
+                self.note_unknown_outcome(presented, &snapshot_id)?;
+                return Err(CompositionError::Authority(P07PortError::UnknownOutcome {
+                    snapshot_id,
+                }));
+            }
+            Err(error) => return Err(CompositionError::Authority(error)),
+        };
+        let retained = self.retain_presentation(presented)?;
+        retained.note_activated(&receipt)?;
+        Ok(receipt)
+    }
+
+    /// Revokes one introduction through the retained P-07 port, Kernel first,
+    /// with the same revocation-intent fallback as [`Self::revoke_grant`].
+    /// Introductions have no recovered graph fallback, so the validated Kernel
+    /// receipt files directly into the retained presentation.
+    pub fn revoke_introduction(
+        &mut self,
+        request: &IntroductionRevocationRequest,
+    ) -> Result<AuthorityRevocationReceipt, CompositionError> {
+        self.require_ready_for_authority()?;
+        let port = self.authority_port()?;
+        let presented = PresentedAuthorityRequest::IntroductionRevocation(request.clone());
+        let receipt = match port.revoke_introduction(request) {
+            Ok(receipt) => receipt,
+            Err(P07PortError::UnknownOutcome { snapshot_id }) => {
+                self.note_unknown_outcome(presented, &snapshot_id)?;
+                return Err(CompositionError::Authority(P07PortError::UnknownOutcome {
+                    snapshot_id,
+                }));
+            }
+            Err(error) => return Err(CompositionError::Authority(error)),
+        };
+        let retained = self.retain_presentation(presented)?;
+        if retained.note_revoked(&receipt).is_err() {
+            retained.note_revocation_intended();
+            return Err(CompositionError::Recovery(
+                "introduction revocation receipt could not be filed; \
+                 revocation intent retained and effects remain blocked"
+                    .to_owned(),
+            ));
+        }
+        Ok(receipt)
+    }
+
+    /// Returns the effective grant status: retained receipt-driven state
+    /// composes over the recovered graph status. Only a validated `Active`
+    /// receipt reports `Active`; revocation intent reports `Revoked`; anything
+    /// unresolved keeps the recovered status. `None` means the recovered graph
+    /// carries no such grant and no presentation was retained.
+    #[must_use]
+    pub fn authority_grant_status(&self, grant_id: &GrantId) -> Option<GrantStatus> {
+        let key = format!("grant:{grant_id}");
+        let graph = self.recovered_grant_status(grant_id);
+        match self.authority_presentations.get(&key) {
+            Some(retained) => Some(retained.grant_status(graph)),
+            None => graph,
+        }
+    }
+
+    /// Returns the effective introduction status. Introductions have no
+    /// recovered graph fallback: only a validated receipt reports `Active`,
+    /// revocation intent reports `Revoked`, and anything unresolved reports
+    /// nothing rather than an effective right.
+    #[must_use]
+    pub fn authority_introduction_status(
+        &self,
+        introduction_id: &IntroductionId,
+    ) -> Option<IntroductionStatus> {
+        let key = format!("introduction:{introduction_id}");
+        self.authority_presentations
+            .get(&key)
+            .and_then(RetainedAuthorityRequest::introduction_status)
+    }
+
+    fn require_ready_for_authority(&self) -> Result<(), CompositionError> {
+        if self.readiness != CompositionReadiness::Ready {
+            return Err(CompositionError::NotReady);
+        }
+        Ok(())
+    }
+
+    fn authority_port(&self) -> Result<Arc<dyn P07AuthorityPort>, CompositionError> {
+        self.authority_activation
+            .clone()
+            .ok_or_else(|| CompositionError::Authority(P07PortError::Unavailable))
+    }
+
+    /// Resolves the canonical grant for an activation presentation: the
+    /// recovered graph must still carry it as `PendingActivation`. Restored
+    /// `Active` history, unknown grants, and already-recorded activations fail
+    /// closed before any transport is touched.
+    fn require_activatable_grant(
+        &self,
+        presented: &PresentedAuthorityRequest,
+    ) -> Result<(), CompositionError> {
+        let PresentedAuthorityRequest::GrantActivation(request) = presented else {
+            return Err(CompositionError::Authority(P07PortError::InvalidBinding));
+        };
+        if self.recovered_grant_status(&request.grant_id) != Some(GrantStatus::PendingActivation) {
+            return Err(CompositionError::Authority(P07PortError::InvalidBinding));
+        }
+        if let Some(retained) = self
+            .authority_presentations
+            .get(presented.ledger_key().as_str())
+            && matches!(retained.state(), AuthorityPresentationState::Active { .. })
+        {
+            return Err(CompositionError::Authority(P07PortError::InvalidBinding));
+        }
+        Ok(())
+    }
+
+    fn recovered_grant_status(&self, grant_id: &GrantId) -> Option<GrantStatus> {
+        self.owners
+            .authority
+            .grants
+            .recovery_snapshot()
+            .ok()?
+            .grants
+            .iter()
+            .find(|record| record.grant_id == grant_id.as_str())
+            .map(|record| record.status)
+    }
+
+    /// Retains the exact presentation with the current owner snapshot,
+    /// preserving an already-recorded reconciliation state. A conflicting
+    /// presentation under the same identity fails closed.
+    fn retain_presentation(
+        &mut self,
+        presented: PresentedAuthorityRequest,
+    ) -> Result<&mut RetainedAuthorityRequest, CompositionError> {
+        let key = presented.ledger_key();
+        if let Some(retained) = self.authority_presentations.get(&key) {
+            if retained.request() != &presented {
+                return Err(CompositionError::Authority(P07PortError::InvalidBinding));
+            }
+        } else {
+            let snapshot = self.owners.authority.snapshot()?;
+            let retained = RetainedAuthorityRequest::retain(presented, snapshot)?;
+            self.authority_presentations.insert(key.clone(), retained);
+        }
+        self.authority_presentations.get_mut(&key).ok_or_else(|| {
+            CompositionError::Recovery("retained authority presentation vanished".to_owned())
+        })
+    }
+
+    /// Files a lost acknowledgement against the retained presentation. The
+    /// grant stays pending; only the exact snapshot reconciles it.
+    fn note_unknown_outcome(
+        &mut self,
+        presented: PresentedAuthorityRequest,
+        snapshot_id: &eliot_authority::SnapshotId,
+    ) -> Result<(), CompositionError> {
+        let retained = self.retain_presentation(presented)?;
+        retained.note_unknown_outcome(snapshot_id)
     }
 
     /// Reads one coherent semantic activation from all required owner records.
@@ -2030,7 +2338,7 @@ mod tests {
     };
     use eliot_protocol::RequestIdentity;
     use eliot_receipts::{AuthorityBinding, EffectClass, ProofCeiling, RequestBinding};
-    use eliot_runtime_contracts::{HealthVector, ServiceProcessState};
+    use eliot_runtime_contracts::{AuthorityState, HealthVector, ServiceProcessState};
     use eliot_session::{RegisterSession, SessionCommand, SessionCommandContext};
     use eliot_store_api::{
         CommitId, EventProjectionRelationIntents, NamedMutationOperation, NamedMutationRequest,
@@ -2734,7 +3042,7 @@ mod tests {
             KernelGenerationExpectation::from_snapshot(&observed).expect("expectation");
         expected.authority_epoch = AuthorityEpoch::new(2).expect("epoch");
         let provider = Arc::new(fake_kernel(observed));
-        let result = GovernorComposition::new(provider, &expected, QueueLimits::default());
+        let result = GovernorComposition::new(provider, None, &expected, QueueLimits::default());
         assert!(matches!(result, Err(CompositionError::Provider(_))));
     }
 
@@ -2749,8 +3057,9 @@ mod tests {
                 .expect("canonical bytes"),
         );
         let provider = Arc::new(fake);
-        let composition = GovernorComposition::new(provider, &expected, QueueLimits::default())
-            .expect("composition");
+        let composition =
+            GovernorComposition::new(provider, None, &expected, QueueLimits::default())
+                .expect("composition");
         assert_eq!(composition.readiness(), CompositionReadiness::Ready);
         assert_eq!(STARTUP_ORDER[0], ServiceId::Config);
         assert_eq!(STARTUP_ORDER[15], ServiceId::Maintenance);
@@ -2778,6 +3087,7 @@ mod tests {
         let expected = KernelGenerationExpectation::from_snapshot(&observed).expect("expectation");
         let first = GovernorComposition::new(
             Arc::new(fake_kernel(observed.clone())),
+            None,
             &expected,
             QueueLimits::default(),
         )
@@ -2787,9 +3097,13 @@ mod tests {
         let mut reversed = service_observations(&observed.state_fence());
         reversed.reverse();
         second_fake.service_observations = Some(reversed);
-        let second =
-            GovernorComposition::new(Arc::new(second_fake), &expected, QueueLimits::default())
-                .expect("second composition");
+        let second = GovernorComposition::new(
+            Arc::new(second_fake),
+            None,
+            &expected,
+            QueueLimits::default(),
+        )
+        .expect("second composition");
 
         assert_ne!(first.service_observations(), second.service_observations());
         assert_eq!(first.recovery(), second.recovery());
@@ -2806,7 +3120,8 @@ mod tests {
         let expected = KernelGenerationExpectation::from_snapshot(&observed).expect("expectation");
         let mut fake = fake_kernel(observed);
         fake.service_failure = true;
-        let result = GovernorComposition::new(Arc::new(fake), &expected, QueueLimits::default());
+        let result =
+            GovernorComposition::new(Arc::new(fake), None, &expected, QueueLimits::default());
         assert!(matches!(result, Err(CompositionError::Recovery(_))));
     }
 
@@ -2928,7 +3243,7 @@ mod tests {
         let mut fake = activation_fake(&observed);
         fake.payloads.insert(RecoveryOwner::Canonical, payload);
         let composition =
-            GovernorComposition::new(Arc::new(fake), &expected, QueueLimits::default())
+            GovernorComposition::new(Arc::new(fake), None, &expected, QueueLimits::default())
                 .expect("genesis null is recoverable");
         assert!(matches!(
             composition.read_unique_agent_activation(20),
@@ -2948,7 +3263,8 @@ mod tests {
         })
         .expect("old canonical payload");
         fake.payloads.insert(RecoveryOwner::Canonical, payload);
-        let result = GovernorComposition::new(Arc::new(fake), &expected, QueueLimits::default());
+        let result =
+            GovernorComposition::new(Arc::new(fake), None, &expected, QueueLimits::default());
         assert!(matches!(result, Err(CompositionError::Recovery(_))));
 
         let mut legacy = fake_kernel(observed.clone());
@@ -2964,7 +3280,8 @@ mod tests {
             RecoveryOwner::Canonical,
             serde_json::to_vec(&legacy_unscoped).expect("legacy canonical payload"),
         );
-        let result = GovernorComposition::new(Arc::new(legacy), &expected, QueueLimits::default());
+        let result =
+            GovernorComposition::new(Arc::new(legacy), None, &expected, QueueLimits::default());
         assert!(matches!(result, Err(CompositionError::Recovery(_))));
     }
 
@@ -2976,7 +3293,7 @@ mod tests {
         fake.genesis_all_absent = true;
         let seeded = Arc::clone(&fake.genesis_seeded);
         let composition =
-            GovernorComposition::new(Arc::new(fake), &expected, QueueLimits::default())
+            GovernorComposition::new(Arc::new(fake), None, &expected, QueueLimits::default())
                 .expect("genesis composition");
         assert!(seeded.load(Ordering::Acquire));
         assert_eq!(composition.readiness(), CompositionReadiness::Ready);
@@ -3044,7 +3361,7 @@ mod tests {
         );
         let expected = KernelGenerationExpectation::from_snapshot(&observed).expect("expectation");
         let composition =
-            GovernorComposition::new(Arc::new(fake), &expected, QueueLimits::default())
+            GovernorComposition::new(Arc::new(fake), None, &expected, QueueLimits::default())
                 .expect("composition");
         assert_eq!(composition.owners().task.snapshot(), task_snapshot);
         assert_eq!(composition.owners().session.snapshot(), session_snapshot);
@@ -3056,6 +3373,7 @@ mod tests {
         let expected = KernelGenerationExpectation::from_snapshot(&observed).expect("expectation");
         let composition = GovernorComposition::new(
             Arc::new(activation_fake(&observed)),
+            None,
             &expected,
             QueueLimits::default(),
         )
@@ -3085,7 +3403,7 @@ mod tests {
         let mut missing = activation_fake(&observed);
         missing.payloads.remove(&RecoveryOwner::Session);
         let composition =
-            GovernorComposition::new(Arc::new(missing), &expected, QueueLimits::default())
+            GovernorComposition::new(Arc::new(missing), None, &expected, QueueLimits::default())
                 .expect("composition");
         assert!(composition.read_unique_agent_activation(20).is_err());
 
@@ -3101,7 +3419,7 @@ mod tests {
             canonical_json_bytes(&inactive_snapshot).expect("inactive session bytes"),
         );
         let composition =
-            GovernorComposition::new(Arc::new(inactive), &expected, QueueLimits::default())
+            GovernorComposition::new(Arc::new(inactive), None, &expected, QueueLimits::default())
                 .expect("composition");
         assert!(composition.read_unique_agent_activation(20).is_err());
 
@@ -3117,7 +3435,7 @@ mod tests {
             canonical_json_bytes(&expired_snapshot).expect("expired session bytes"),
         );
         let composition =
-            GovernorComposition::new(Arc::new(expired), &expected, QueueLimits::default())
+            GovernorComposition::new(Arc::new(expired), None, &expected, QueueLimits::default())
                 .expect("composition");
         assert!(composition.read_unique_agent_activation(20).is_err());
     }
@@ -3128,6 +3446,7 @@ mod tests {
         let expected = KernelGenerationExpectation::from_snapshot(&observed).expect("expectation");
         let valid = GovernorComposition::new(
             Arc::new(activation_fake(&observed)),
+            None,
             &expected,
             QueueLimits::default(),
         )
@@ -3149,8 +3468,13 @@ mod tests {
             canonical_json_bytes(&coordination).expect("coordination bytes"),
         );
         assert!(
-            GovernorComposition::new(Arc::new(malformed_owner), &expected, QueueLimits::default())
-                .is_err(),
+            GovernorComposition::new(
+                Arc::new(malformed_owner),
+                None,
+                &expected,
+                QueueLimits::default()
+            )
+            .is_err(),
             "recovery accepted an active work item with a missing session"
         );
 
@@ -3171,7 +3495,7 @@ mod tests {
                 canonical_json_bytes(&coordination).expect("coordination bytes"),
             );
             assert!(
-                GovernorComposition::new(Arc::new(fake), &expected, QueueLimits::default())
+                GovernorComposition::new(Arc::new(fake), None, &expected, QueueLimits::default())
                     .is_err(),
                 "recovery accepted {name}"
             );
@@ -3195,7 +3519,7 @@ mod tests {
             canonical_json_bytes(&scoped_snapshot).expect("scoped session bytes"),
         );
         let composition =
-            GovernorComposition::new(Arc::new(scoped), &expected, QueueLimits::default())
+            GovernorComposition::new(Arc::new(scoped), None, &expected, QueueLimits::default())
                 .expect("composition");
         assert!(composition.read_unique_agent_activation(20).is_err());
 
@@ -3211,7 +3535,8 @@ mod tests {
             canonical_json_bytes(&stale_scope).expect("stale scope bytes"),
         );
         assert!(
-            GovernorComposition::new(Arc::new(stale), &expected, QueueLimits::default(),).is_err()
+            GovernorComposition::new(Arc::new(stale), None, &expected, QueueLimits::default(),)
+                .is_err()
         );
 
         let mut stale_task = activation_task_snapshot(&observed.state_fence());
@@ -3229,8 +3554,13 @@ mod tests {
             canonical_json_bytes(&stale_task).expect("stale task bytes"),
         );
         assert!(
-            GovernorComposition::new(Arc::new(stale_task_fake), &expected, QueueLimits::default(),)
-                .is_err()
+            GovernorComposition::new(
+                Arc::new(stale_task_fake),
+                None,
+                &expected,
+                QueueLimits::default(),
+            )
+            .is_err()
         );
 
         let mut stale_session = activation_session_snapshot(&observed.state_fence());
@@ -3250,6 +3580,7 @@ mod tests {
         assert!(
             GovernorComposition::new(
                 Arc::new(stale_session_fake),
+                None,
                 &expected,
                 QueueLimits::default(),
             )
@@ -3274,7 +3605,7 @@ mod tests {
             canonical_json_bytes(&terminal_snapshot).expect("terminal task bytes"),
         );
         let composition =
-            GovernorComposition::new(Arc::new(terminal), &expected, QueueLimits::default())
+            GovernorComposition::new(Arc::new(terminal), None, &expected, QueueLimits::default())
                 .expect("composition");
         assert!(composition.read_unique_agent_activation(20).is_err());
 
@@ -3295,7 +3626,7 @@ mod tests {
             canonical_json_bytes(&mismatched_plan).expect("mismatched plan bytes"),
         );
         let composition =
-            GovernorComposition::new(Arc::new(mismatch), &expected, QueueLimits::default())
+            GovernorComposition::new(Arc::new(mismatch), None, &expected, QueueLimits::default())
                 .expect("composition");
         assert!(composition.read_unique_agent_activation(20).is_err());
     }
@@ -3313,7 +3644,7 @@ mod tests {
             .expect("ambiguous coordination bytes"),
         );
         let composition =
-            GovernorComposition::new(Arc::new(fake), &expected, QueueLimits::default())
+            GovernorComposition::new(Arc::new(fake), None, &expected, QueueLimits::default())
                 .expect("composition");
         assert!(composition.read_unique_agent_activation(20).is_err());
     }
@@ -3330,12 +3661,14 @@ mod tests {
         );
         payload.push(b'x');
         fake.payloads.insert(RecoveryOwner::Task, payload);
-        let result = GovernorComposition::new(Arc::new(fake), &expected, QueueLimits::default());
+        let result =
+            GovernorComposition::new(Arc::new(fake), None, &expected, QueueLimits::default());
         assert!(matches!(result, Err(CompositionError::Recovery(_))));
 
         let mut partial = fake_kernel(observed.clone());
         partial.missing = Some(RecoveryOwner::Task);
-        let result = GovernorComposition::new(Arc::new(partial), &expected, QueueLimits::default());
+        let result =
+            GovernorComposition::new(Arc::new(partial), None, &expected, QueueLimits::default());
         assert!(matches!(result, Err(CompositionError::Recovery(_))));
     }
 
@@ -3351,7 +3684,7 @@ mod tests {
             let mut fake = fake_kernel(observed.clone());
             fake.payloads.insert(RecoveryOwner::Task, payload.to_vec());
             let result =
-                GovernorComposition::new(Arc::new(fake), &expected, QueueLimits::default());
+                GovernorComposition::new(Arc::new(fake), None, &expected, QueueLimits::default());
             assert!(matches!(
                 result,
                 Err(CompositionError::Recovery(message))
@@ -3467,7 +3800,8 @@ mod tests {
         let payload = canonical_json_bytes(&substituted_revision).expect("budget bytes");
         fake.payloads.insert(RecoveryOwner::Budget, payload);
         assert!(
-            GovernorComposition::new(Arc::new(fake), &expected, QueueLimits::default()).is_err()
+            GovernorComposition::new(Arc::new(fake), None, &expected, QueueLimits::default())
+                .is_err()
         );
 
         let encoded = serde_json::to_value(valid).expect("budget json");
@@ -3485,6 +3819,7 @@ mod tests {
         let expected = KernelGenerationExpectation::from_snapshot(&observed).expect("expectation");
         let coherent = GovernorComposition::new(
             Arc::new(activation_fake(&observed)),
+            None,
             &expected,
             QueueLimits::default(),
         )
@@ -3515,9 +3850,13 @@ mod tests {
             ))
             .expect("ambiguous bytes"),
         );
-        let ambiguous =
-            GovernorComposition::new(Arc::new(ambiguous_fake), &expected, QueueLimits::default())
-                .expect("ambiguous composition");
+        let ambiguous = GovernorComposition::new(
+            Arc::new(ambiguous_fake),
+            None,
+            &expected,
+            QueueLimits::default(),
+        )
+        .expect("ambiguous composition");
         let outcome = ambiguous.resolve_activation_outcome(20);
         assert!(!outcome.is_resolved());
         assert_eq!(outcome.kind_str(), "SCOPE_AMBIGUOUS");
@@ -3602,7 +3941,7 @@ mod tests {
         let expected = KernelGenerationExpectation::from_snapshot(&observed).expect("expectation");
         let kernel = Arc::new(fake);
         let mut composition =
-            GovernorComposition::new(kernel.clone(), &expected, QueueLimits::default())
+            GovernorComposition::new(kernel.clone(), None, &expected, QueueLimits::default())
                 .expect("composition");
         assert_eq!(
             composition.owners().task.task(&task_id).expect("task").goal,
@@ -3633,8 +3972,9 @@ mod tests {
         assert_eq!(composition.recovery().canonical_scope, moved_heads);
         // A restart rehydrates the same committed state, proving the refreshed
         // projection was Kernel-owned rather than locally fabricated.
-        let restarted = GovernorComposition::new(kernel.clone(), &expected, QueueLimits::default())
-            .expect("restart");
+        let restarted =
+            GovernorComposition::new(kernel.clone(), None, &expected, QueueLimits::default())
+                .expect("restart");
         assert_eq!(
             restarted.owners().task.task(&task_id).expect("task").goal,
             "goal after refresh"
@@ -3679,7 +4019,7 @@ mod tests {
         let expected = KernelGenerationExpectation::from_snapshot(&observed).expect("expectation");
         let kernel = Arc::new(fake);
         let mut composition =
-            GovernorComposition::new(kernel.clone(), &expected, QueueLimits::default())
+            GovernorComposition::new(kernel.clone(), None, &expected, QueueLimits::default())
                 .expect("composition");
         assert_eq!(composition.recovery().receipts, vec![receipt.clone()]);
         let retained = composition.recovery().clone();
@@ -3822,7 +4162,7 @@ mod tests {
         let expected = KernelGenerationExpectation::from_snapshot(&observed).expect("expectation");
         let kernel = Arc::new(fake_kernel(observed));
         let composition =
-            GovernorComposition::new(kernel.clone(), &expected, QueueLimits::default())
+            GovernorComposition::new(kernel.clone(), None, &expected, QueueLimits::default())
                 .expect("composition");
         (kernel, composition)
     }
@@ -3962,7 +4302,7 @@ mod tests {
         let expected = KernelGenerationExpectation::from_snapshot(&observed).expect("expectation");
         let kernel = Arc::new(fake);
         let mut composition =
-            GovernorComposition::new(kernel.clone(), &expected, QueueLimits::default())
+            GovernorComposition::new(kernel.clone(), None, &expected, QueueLimits::default())
                 .expect("composition");
         let identity = commit_identity(&fence);
         let envelope = commit_envelope(
@@ -3998,5 +4338,267 @@ mod tests {
             "goal after commit"
         );
         assert_eq!(composition.recovery().canonical_scope, moved_heads);
+    }
+
+    /// Scripted P-07 port for the authority gating proof below. Each behavior
+    /// is an explicit gate assertion, never a production success path: this
+    /// double is `cfg(test)`-only, while end-to-end production activation
+    /// awaits the Kernel P-07 front-door route (T6/#15).
+    struct ScriptedAuthorityPort {
+        behavior: Mutex<ScriptedAuthorityBehavior>,
+    }
+
+    #[derive(Clone)]
+    enum ScriptedAuthorityBehavior {
+        Unavailable,
+        UnknownAck,
+        NonActiveReceipt,
+        Active { activation_id: String },
+    }
+
+    impl P07AuthorityPort for ScriptedAuthorityPort {
+        fn activate_grant(
+            &self,
+            request: &GrantActivationRequest,
+        ) -> Result<AuthorityActivationReceipt, P07PortError> {
+            let behavior = self.behavior.lock().expect("script lock").clone();
+            let snapshot_id = request.snapshot_id.as_str().to_owned();
+            let authority_epoch = request.binding.state_fence.authority_epoch;
+            match behavior {
+                ScriptedAuthorityBehavior::Unavailable => Err(P07PortError::Unavailable),
+                ScriptedAuthorityBehavior::UnknownAck => Err(P07PortError::UnknownOutcome {
+                    snapshot_id: request.snapshot_id.clone(),
+                }),
+                ScriptedAuthorityBehavior::NonActiveReceipt => Ok(AuthorityActivationReceipt {
+                    activation_id: "act-scripted-non-active".to_owned(),
+                    snapshot_id,
+                    authority_epoch,
+                    state: AuthorityState::PendingKernelActivation,
+                }),
+                ScriptedAuthorityBehavior::Active { activation_id } => {
+                    Ok(AuthorityActivationReceipt {
+                        activation_id,
+                        snapshot_id,
+                        authority_epoch,
+                        state: AuthorityState::Active,
+                    })
+                }
+            }
+        }
+
+        fn revoke_grant(
+            &self,
+            _request: &GrantRevocationRequest,
+        ) -> Result<AuthorityRevocationReceipt, P07PortError> {
+            Err(P07PortError::Unavailable)
+        }
+
+        fn activate_introduction(
+            &self,
+            _request: &IntroductionActivationRequest,
+        ) -> Result<AuthorityActivationReceipt, P07PortError> {
+            Err(P07PortError::Unavailable)
+        }
+
+        fn revoke_introduction(
+            &self,
+            _request: &IntroductionRevocationRequest,
+        ) -> Result<AuthorityRevocationReceipt, P07PortError> {
+            Err(P07PortError::Unavailable)
+        }
+    }
+
+    fn pending_grant_fixture(
+        grant_id: &str,
+        fence: &StateFence,
+    ) -> eliot_authority::CapabilityGrant {
+        eliot_authority::CapabilityGrant {
+            grant_id: eliot_authority::GrantId::new(grant_id).expect("grant id"),
+            parent_grant_id: None,
+            authority_root_ref: "authority:test-root".to_owned(),
+            issuer: eliot_authority::PrincipalRef::new("principal:issuer").expect("issuer"),
+            holder: eliot_authority::PrincipalRef::new("principal:holder").expect("holder"),
+            authority: eliot_authority::AuthoritySet::new(
+                ["op:test".to_owned()],
+                ["res:test".to_owned()],
+                EffectClass::ReversibleMutation,
+            )
+            .expect("authority set"),
+            inherited_source_ceiling: None,
+            binding: AuthorityBinding {
+                authority_id: ContractId::new("authority:test").expect("authority id"),
+                authority_owner: "test-owner".to_owned(),
+                authority_epoch: fence.authority_epoch,
+                state_fence: fence.clone(),
+                allowed_effect: EffectClass::ExternalEffect,
+                proof_ceiling: ProofCeiling::ObservedExternalEffect,
+            },
+            issued_at: eliot_authority::LogicalTime::new(1),
+            expires_at: eliot_authority::LogicalTime::new(2),
+            max_uses: 1,
+            status: eliot_authority::GrantStatus::PendingActivation,
+        }
+    }
+
+    fn authority_payload_with_pending_grants(fence: &StateFence) -> Vec<u8> {
+        let graph = eliot_authority::GrantGraph::from_grants(
+            [
+                pending_grant_fixture("grant-a", fence),
+                pending_grant_fixture("grant-b", fence),
+            ],
+            1,
+        )
+        .expect("pending grant graph");
+        let effect_authorizer = eliot_authority::EffectAuthorizer::default()
+            .snapshot()
+            .expect("effect snapshot");
+        let snapshot = AuthorityOwnerSnapshot::new(
+            fence.clone(),
+            graph.recovery_snapshot().expect("grant snapshot"),
+            effect_authorizer,
+        )
+        .expect("authority snapshot");
+        canonical_json_bytes(&serde_json::to_value(snapshot).expect("authority JSON"))
+            .expect("authority bytes")
+    }
+
+    fn grant_activation_fixture(
+        grant_id: &str,
+        fence: &StateFence,
+    ) -> eliot_authority::GrantActivationRequest {
+        eliot_authority::GrantActivationRequest {
+            grant_id: eliot_authority::GrantId::new(grant_id).expect("grant id"),
+            snapshot_id: eliot_authority::SnapshotId::new("snap-1").expect("snapshot id"),
+            binding: AuthorityBinding {
+                authority_id: ContractId::new("authority:test").expect("authority id"),
+                authority_owner: "test-owner".to_owned(),
+                authority_epoch: fence.authority_epoch,
+                state_fence: fence.clone(),
+                allowed_effect: EffectClass::ExternalEffect,
+                proof_ceiling: ProofCeiling::ObservedExternalEffect,
+            },
+        }
+    }
+
+    #[test]
+    fn pending_grant_becomes_effective_only_after_real_activation() {
+        let observed = snapshot();
+        let fence = observed.state_fence();
+        let expected = KernelGenerationExpectation::from_snapshot(&observed).expect("expectation");
+        let mut fake = fake_kernel(observed.clone());
+        fake.payloads.insert(
+            RecoveryOwner::Authority,
+            authority_payload_with_pending_grants(&fence),
+        );
+        let script = Arc::new(ScriptedAuthorityPort {
+            behavior: Mutex::new(ScriptedAuthorityBehavior::Unavailable),
+        });
+        let mut composition = GovernorComposition::new(
+            Arc::new(fake),
+            Some(script.clone() as Arc<dyn P07AuthorityPort>),
+            &expected,
+            QueueLimits::default(),
+        )
+        .expect("composition");
+        assert!(composition.authority_activation_available());
+        let grant_a = eliot_authority::GrantId::new("grant-a").expect("grant id");
+        let grant_b = eliot_authority::GrantId::new("grant-b").expect("grant id");
+
+        // Unavailable: the grant stays pending and is never read as effective.
+        let request_a = grant_activation_fixture("grant-a", &fence);
+        assert_eq!(
+            composition.authority_grant_status(&grant_a),
+            Some(eliot_authority::GrantStatus::PendingActivation)
+        );
+        let error = composition
+            .activate_grant(&request_a)
+            .expect_err("unavailable activation must fail closed");
+        assert!(matches!(
+            error,
+            CompositionError::Authority(P07PortError::Unavailable)
+        ));
+        assert_eq!(
+            composition.authority_grant_status(&grant_a),
+            Some(eliot_authority::GrantStatus::PendingActivation)
+        );
+
+        // Lost acknowledgement: the exact request is retained under its
+        // snapshot and the grant stays pending, never active.
+        *script.behavior.lock().expect("script lock") = ScriptedAuthorityBehavior::UnknownAck;
+        let error = composition
+            .activate_grant(&request_a)
+            .expect_err("unknown outcome must fail closed");
+        match error {
+            CompositionError::Authority(P07PortError::UnknownOutcome { snapshot_id }) => {
+                assert_eq!(snapshot_id.as_str(), "snap-1");
+            }
+            other => panic!("expected an unknown outcome, got {other:?}"),
+        }
+        assert_eq!(
+            composition.authority_grant_status(&grant_a),
+            Some(eliot_authority::GrantStatus::PendingActivation)
+        );
+
+        // A receipt that fails validate() (non-Active) never flips the grant.
+        *script.behavior.lock().expect("script lock") = ScriptedAuthorityBehavior::NonActiveReceipt;
+        let request_b = grant_activation_fixture("grant-b", &fence);
+        let error = composition
+            .activate_grant(&request_b)
+            .expect_err("non-active receipt must fail closed");
+        assert!(matches!(
+            error,
+            CompositionError::Authority(P07PortError::InvalidBinding)
+        ));
+        assert_eq!(
+            composition.authority_grant_status(&grant_b),
+            Some(eliot_authority::GrantStatus::PendingActivation)
+        );
+
+        // A validated Active receipt flips pending -> active exactly once.
+        *script.behavior.lock().expect("script lock") = ScriptedAuthorityBehavior::Active {
+            activation_id: "act-a-1".to_owned(),
+        };
+        let receipt = composition
+            .activate_grant(&request_a)
+            .expect("validated active receipt");
+        assert_eq!(receipt.activation_id, "act-a-1");
+        assert_eq!(receipt.snapshot_id, "snap-1");
+        assert_eq!(
+            composition.authority_grant_status(&grant_a),
+            Some(eliot_authority::GrantStatus::Active)
+        );
+
+        // A second activation on the recorded identity fails closed: the
+        // receipt is not issued twice and the status never leaves Active for
+        // a second proof.
+        let error = composition
+            .activate_grant(&request_a)
+            .expect_err("second activation must fail closed");
+        assert!(matches!(
+            error,
+            CompositionError::Authority(P07PortError::InvalidBinding)
+        ));
+        assert_eq!(
+            composition.authority_grant_status(&grant_a),
+            Some(eliot_authority::GrantStatus::Active)
+        );
+
+        // Without a retained port the same presentation is diagnosed
+        // degradation: unavailable, never issuance.
+        let mut degraded = GovernorComposition::new(
+            Arc::new(fake_kernel(observed.clone())),
+            None,
+            &expected,
+            QueueLimits::default(),
+        )
+        .expect("degraded composition");
+        assert!(!degraded.authority_activation_available());
+        let error = degraded
+            .activate_grant(&request_a)
+            .expect_err("missing port must fail closed");
+        assert!(matches!(
+            error,
+            CompositionError::Authority(P07PortError::Unavailable)
+        ));
     }
 }

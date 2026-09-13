@@ -74,9 +74,11 @@ pub(super) fn run() -> Result<(), String> {
     )
     .map_err(|error| error.to_string())?;
     let kernel = DaemonKernelClient::connect(&config).map_err(|error| error.to_string())?;
+    let authority_activation = eliotd::kernel_authority_port(&kernel);
     let composition = DaemonComposition::start(
         config,
         Arc::clone(&kernel) as Arc<dyn eliot_governor::KernelGenerationPort>,
+        Some(authority_activation),
     )
     .map_err(|error| error.to_string())?;
     kernel.report_ready().map_err(|error| error.to_string())?;

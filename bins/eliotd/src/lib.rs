@@ -37,6 +37,7 @@ mod activation_projection;
 mod daemon_config;
 mod daemon_kernel_client;
 mod daemon_kernel_port_adapters;
+mod kernel_authority_client;
 mod kernel_recovery_client;
 mod kernel_transition_client;
 mod store_failure_projection;
@@ -56,7 +57,22 @@ pub(crate) use daemon_kernel_client::{
     is_pre_admission_pending_rejection, retry_pre_admission, validate_server_hello,
 };
 pub(crate) use daemon_kernel_port_adapters::kind_value;
+pub(crate) use kernel_authority_client::KernelAuthorityClient;
 pub use store_failure_projection::{GovernorStoreFailureProjection, GovernorStoreProjectionError};
+
+/// Builds the production P-07 authority adapter over an already-connected
+/// authenticated Kernel client.
+///
+/// The adapter type stays private to this crate; only the port object crosses
+/// into the daemon runtime wiring, which passes it to
+/// [`DaemonComposition::start`]. Until the Kernel front-door grant route lands
+/// (T6/#15) the adapter fails closed on every presentation — honest diagnosed
+/// degradation, never invented rights.
+pub fn kernel_authority_port(
+    kernel: &Arc<DaemonKernelClient>,
+) -> Arc<dyn eliot_authority::P07AuthorityPort> {
+    Arc::new(KernelAuthorityClient::new(Arc::clone(kernel)))
+}
 
 /// Stable daemon identity.
 pub const SERVICE_NAME: &str = "eliotd";
@@ -162,9 +178,16 @@ impl DaemonComposition {
     ///
     /// The port is retained exactly once. Its snapshot and the recovered owner
     /// set are checked before this method returns a composition marked ready.
+    ///
+    /// The P-07 authority port is retained alongside the Kernel port and
+    /// forwarded to the Governor composition: pending grants become effective
+    /// only after the exact Kernel activation receipt, and revocation runs
+    /// Kernel-first. `None` means diagnosed degradation (reads/degraded
+    /// status only) and never issues rights.
     pub fn start(
         mut config: DaemonConfig,
         kernel: Arc<dyn KernelGenerationPort>,
+        authority_activation: Option<Arc<dyn eliot_authority::P07AuthorityPort>>,
     ) -> Result<Self, DaemonError> {
         let config_lease = config.config_lease.take().ok_or_else(|| {
             DaemonError::Lifecycle(
@@ -187,8 +210,12 @@ impl DaemonComposition {
                 "protected lifecycle identity changed during composition".to_owned(),
             ));
         }
-        let governor =
-            GovernorComposition::new(kernel, &config.launch().kernel, QueueLimits::default())?;
+        let governor = GovernorComposition::new(
+            kernel,
+            authority_activation,
+            &config.launch().kernel,
+            QueueLimits::default(),
+        )?;
         Ok(Self {
             governor,
             config_lease,
