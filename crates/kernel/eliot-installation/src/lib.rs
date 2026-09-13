@@ -2913,8 +2913,17 @@ impl InstallationEffectObservation {
                 service_runtime_lineage,
             } => {
                 observed_precondition.validate()?;
+                // s33.3 (#1313): a package `Absent` carries its independently
+                // observed `package_snapshot` (trusted source-bundle readback),
+                // not an OS/credential contour. Accept it as the third
+                // absence-snapshot kind alongside OS and credential snapshots.
+                // This is not a blanket allow: at least one typed snapshot is
+                // still required when `allow_service_absence` is false (the
+                // strict rollback gate), and `InstallationEffectPrecondition`
+                // still enforces mutual exclusivity plus digest binding.
                 if observed_precondition.os_snapshot.is_none()
                     && observed_precondition.credential_snapshot.is_none()
+                    && observed_precondition.package_snapshot.is_none()
                     && !allow_service_absence
                 {
                     return Err(InstallationError::InvalidField {
@@ -3848,11 +3857,39 @@ impl WindowsInstallationEffectPort {
             .ok_or(PortError::InvalidRequestMetadata)?
             .validate()
             .map_err(|_| PortError::InvalidRequestMetadata)?;
+        // s33.3 (#1313): preserve an admitted generation snapshot verbatim
+        // when rollback reconcile revisits a fixed inspect (same pattern as
+        // `service_absent_from_live_inspection`). A first-time pending
+        // Phase-B has no independently observed OS/credential/package contour
+        // yet — its materialization is Host-owned and the Host wire
+        // (`HostCredentialControlResponse`, credential_provision.rs, not owned
+        // here) returns no absence snapshot for pending — so the precondition
+        // is cloned unchanged. Identity is still bound: evidence covers the
+        // exact effect, plan, and candidate generation, mirroring the
+        // service-absent-v2 binding, so a foreign generation can never be
+        // mistaken for this pending one. Rollback never applies the strict
+        // gate here: a Pending Phase-B is skipped by the reverse loop and an
+        // Applied Phase-B quarantines as retained authority before the loop.
+        let InstallerEffectPlan::MaterializePhaseB {
+            candidate_manifest_digest,
+            ..
+        } = &request.plan
+        else {
+            return Err(PortError::InvalidRequestMetadata);
+        };
         Ok(InstallationEffectObservation::Absent {
             observed_precondition: request.precondition.clone(),
             evidence: vec![
-                PlatformHandle::new(format!("phase-b-pending:{}", request.effect_id.as_str()))
-                    .unwrap_or_else(|_| unreachable!()),
+                PlatformHandle::new(sha256_hex(
+                    format!(
+                        "phase-b-pending-v1\0{}\0{}\0{}",
+                        request.effect_id.as_str(),
+                        request.plan_digest.as_str(),
+                        candidate_manifest_digest.as_str(),
+                    )
+                    .as_bytes(),
+                ))
+                .map_err(|_| PortError::InvalidRequestMetadata)?,
             ],
             service_runtime_lineage: None,
         })
@@ -4239,6 +4276,96 @@ impl WindowsInstallationEffectPort {
         })
     }
 
+    /// Attaches a platform-observed absence snapshot to a live stopped/starting
+    /// `StartService` readback, the start analogue of
+    /// `service_absent_with_snapshot` (#1308).
+    ///
+    /// The snapshot is never derived from the plan alone: callers pass the
+    /// live `ServiceRuntimeObservation` (stopped/starting) so the target binds
+    /// the exact queried service name plus admitted configuration digest, and
+    /// the parents are the installer-root handles just read back in this call.
+    /// A precondition that already carries the admitted OS snapshot (rollback
+    /// reconcile after a fixed inspect) is preserved verbatim.
+    fn service_start_absent_with_snapshot(
+        request: &InstallationEffectRequest,
+        registration: &ServiceRegistrationRequest,
+        reason: &str,
+        service_runtime_lineage: Option<InstallationServiceProcessLineage>,
+        snapshot: InstallerRootAbsentSnapshot,
+    ) -> Result<InstallationEffectObservation, PortError> {
+        let snapshot = installation_absent_snapshot(snapshot)?;
+        let precondition = request
+            .precondition
+            .with_os_snapshot(snapshot)
+            .map_err(|_| PortError::InvalidRequestMetadata)?;
+        Self::service_start_absent(
+            &InstallationEffectRequest {
+                precondition,
+                ..request.clone()
+            },
+            registration,
+            reason,
+            service_runtime_lineage,
+        )
+    }
+
+    /// Builds the `Absent` observation for a just-observed stopped/starting
+    /// `StartService` runtime.
+    ///
+    /// The live SCM observation must bind this exact validated registration; a
+    /// readback for any other name or configuration digest is a
+    /// provider/readback substitution and fails closed, so a foreign service
+    /// is never mistaken for our stopped start. Nothing is derived from the
+    /// plan alone: the snapshot target covers the live stopped/starting
+    /// outcome and the parents are the handles just read back in this call.
+    fn service_start_absent_from_live_inspection(
+        &self,
+        request: &InstallationEffectRequest,
+        registration: &ServiceRegistrationRequest,
+        reason: &str,
+        service_runtime_lineage: Option<InstallationServiceProcessLineage>,
+        observation: &eliot_platform_windows::ServiceRuntimeObservation,
+        spec: &InstallerRootPrimitiveSpec,
+    ) -> Result<InstallationEffectObservation, PortError> {
+        if observation.service_name() != registration.service_name()
+            || observation.configuration_digest()
+                != registration.expected_configuration_digest()
+        {
+            return Err(PortError::InvalidRequestMetadata);
+        }
+        if request.precondition.os_snapshot.is_some() {
+            return Self::service_start_absent(request, registration, reason, service_runtime_lineage);
+        }
+        let snapshot = match self.primitive.inspect(spec).map_err(root_port_error)? {
+            InstallerRootPrimitiveObservation::Absent(snapshot) => snapshot,
+            InstallerRootPrimitiveObservation::Matching(root) => InstallerRootAbsentSnapshot {
+                target_path_digest: sha256_hex(
+                    format!(
+                        "service-start-absent-target-v1\0{}\0{}\0{}",
+                        registration.service_name(),
+                        registration.expected_configuration_digest(),
+                        reason,
+                    )
+                    .as_bytes(),
+                ),
+                profile_anchor: root.clone(),
+                ancestors: vec![root.clone()],
+                parent: root,
+                root_absent: true,
+            },
+            InstallerRootPrimitiveObservation::Mismatch => {
+                return Ok(root_mismatch("service-root-readback"));
+            }
+        };
+        Self::service_start_absent_with_snapshot(
+            request,
+            registration,
+            reason,
+            service_runtime_lineage,
+            snapshot,
+        )
+    }
+
     fn service_runtime_identity_evidence(
         registration: &ServiceRegistrationRequest,
         observation: &eliot_platform_windows::ServiceRuntimeObservation,
@@ -4260,15 +4387,11 @@ impl WindowsInstallationEffectPort {
             .map_err(|_| PortError::InvalidRequestMetadata)
     }
 
-    #[allow(
-        clippy::unused_self,
-        reason = "the sealed effect-port receiver keeps StartService context behind one adapter"
-    )]
     fn service_start_inspect(
         &self,
         request: &InstallationEffectRequest,
     ) -> Result<InstallationEffectObservation, PortError> {
-        let (platform, registration, _) = Self::service_start_context(request)?;
+        let (platform, registration, spec) = Self::service_start_context(request)?;
         match platform.inspect_service_registration_runtime(&registration) {
             ServiceRegistrationRuntimeInspection::Matching { observation }
                 if observation.is_running() =>
@@ -4283,7 +4406,14 @@ impl WindowsInstallationEffectPort {
             ServiceRegistrationRuntimeInspection::Matching { observation }
                 if observation.is_stopped() =>
             {
-                Self::service_start_absent(request, &registration, "service-stopped", None)
+                self.service_start_absent_from_live_inspection(
+                    request,
+                    &registration,
+                    "service-stopped",
+                    None,
+                    &observation,
+                    &spec,
+                )
             }
             ServiceRegistrationRuntimeInspection::Matching { .. } => {
                 Ok(root_mismatch("service-state-indeterminate"))
@@ -4294,15 +4424,11 @@ impl WindowsInstallationEffectPort {
         }
     }
 
-    #[allow(
-        clippy::unused_self,
-        reason = "the sealed effect-port receiver keeps StartService context behind one adapter"
-    )]
     fn service_start_reconcile(
         &self,
         request: &InstallationEffectRequest,
     ) -> Result<InstallationEffectObservation, PortError> {
-        let (platform, registration, _) = Self::service_start_context(request)?;
+        let (platform, registration, spec) = Self::service_start_context(request)?;
         match platform.inspect_service_registration_runtime(&registration) {
             ServiceRegistrationRuntimeInspection::Matching { observation }
                 if observation.is_running() =>
@@ -4330,18 +4456,27 @@ impl WindowsInstallationEffectPort {
                 if observation.is_starting()
                     && request.action == InstallationEffectAction::Apply =>
             {
-                Self::service_start_absent(
+                self.service_start_absent_from_live_inspection(
                     request,
                     &registration,
                     "service-starting",
                     Self::service_process_lineage_if_available(&observation)?,
+                    &observation,
+                    &spec,
                 )
             }
             ServiceRegistrationRuntimeInspection::Matching { observation }
                 if observation.is_stopped()
                     && request.action == InstallationEffectAction::Rollback =>
             {
-                Self::service_start_absent(request, &registration, "service-stopped", None)
+                self.service_start_absent_from_live_inspection(
+                    request,
+                    &registration,
+                    "service-stopped",
+                    None,
+                    &observation,
+                    &spec,
+                )
             }
             ServiceRegistrationRuntimeInspection::Matching { .. } => {
                 Ok(root_mismatch("service-state-indeterminate"))
@@ -4704,11 +4839,55 @@ impl WindowsInstallationEffectPort {
                 if expected != absence_digest {
                     return Err(PortError::IdentityConflict);
                 }
-                Ok(InstallationEffectObservation::Absent {
-                    observed_precondition: request.precondition.clone(),
-                    evidence: vec![absence_digest],
-                    service_runtime_lineage: None,
-                })
+                // s33.3 (#1313): a delete acknowledgement without a typed
+                // absence snapshot cannot pass the strict rollback gate
+                // (`validate()` requires os/credential/package). Preserve the
+                // admitted credential snapshot verbatim when the rollback
+                // request already carries it (fixed inspect followed by
+                // reconcile). Otherwise independently re-observe absence now
+                // through an `Inspect` Host call and bind its snapshot via
+                // `with_credential_snapshot` — never fabricated from the plan.
+                // The delete digest stays in evidence alongside the fresh
+                // absent digest so both the authenticated delete and the
+                // re-observed absence are bound. Any non-absent re-readback
+                // fails closed.
+                if request.precondition.credential_snapshot.is_some() {
+                    return Ok(InstallationEffectObservation::Absent {
+                        observed_precondition: request.precondition.clone(),
+                        evidence: vec![absence_digest],
+                        service_runtime_lineage: None,
+                    });
+                }
+                let inspect_request = Self::host_credential_request(
+                    request,
+                    HostCredentialControlOperation::Inspect,
+                    Vec::new(),
+                )?;
+                match self.call_credential_host(&inspect_request)? {
+                    HostCredentialControlResponse::Absent {
+                        snapshot,
+                        response_digest,
+                    } => {
+                        if response_digest
+                            != credential_absent_response_digest(
+                                &inspect_request.intent.request_digest,
+                                &snapshot,
+                            )
+                            .map_err(|_| PortError::IdentityConflict)?
+                        {
+                            return Err(PortError::IdentityConflict);
+                        }
+                        Ok(InstallationEffectObservation::Absent {
+                            observed_precondition: request
+                                .precondition
+                                .with_credential_snapshot(snapshot)
+                                .map_err(|_| PortError::InvalidRequestMetadata)?,
+                            evidence: vec![absence_digest, response_digest],
+                            service_runtime_lineage: None,
+                        })
+                    }
+                    _ => Err(PortError::IdentityConflict),
+                }
             }
             HostCredentialControlResponse::PhaseBReady { .. }
             | HostCredentialControlResponse::PhaseBPrepared { .. } => {
@@ -6950,21 +7129,40 @@ where
                 evidence,
                 service_runtime_lineage,
             } => {
+                // s33.3 (#1313): align the drive gate with the strict
+                // rollback gate (`validate()` requires os/credential/package)
+                // and with what production now observes. Register/Start carry
+                // a live OS snapshot (#1308 plus StartService live inspection
+                // above); Stage carries its package snapshot; Provision
+                // carries its credential snapshot; roots carry OS. Phase-B
+                // pending keeps os_none+cred_none (matching
+                // `validate_effect_progress`, which allows empty-or-package
+                // for Phase-B): a Pending Phase-B is skipped by the rollback
+                // reverse loop and an Applied Phase-B quarantines before the
+                // loop, so the strict gate never applies to it. Snapshots are
+                // mutually exclusive, so each arm also requires the other two
+                // to be absent.
                 let snapshot_matches_effect = match &transaction.installer_effects[index] {
                     InstallerEffectPlan::ProvisionStoreCredential { .. } => {
                         observed_precondition.credential_snapshot.is_some()
                             && observed_precondition.os_snapshot.is_none()
+                            && observed_precondition.package_snapshot.is_none()
                     }
-                    InstallerEffectPlan::RegisterService { .. }
-                    | InstallerEffectPlan::StartService { .. } => true,
-                    InstallerEffectPlan::StagePackage { .. }
-                    | InstallerEffectPlan::MaterializePhaseB { .. } => {
+                    InstallerEffectPlan::StagePackage { .. } => {
+                        observed_precondition.package_snapshot.is_some()
+                            && observed_precondition.os_snapshot.is_none()
+                            && observed_precondition.credential_snapshot.is_none()
+                    }
+                    InstallerEffectPlan::MaterializePhaseB { .. } => {
                         observed_precondition.os_snapshot.is_none()
                             && observed_precondition.credential_snapshot.is_none()
                     }
+                    // Register/Start carry a live OS snapshot and roots carry
+                    // OS: both require os_some with the other snapshots absent.
                     _ => {
                         observed_precondition.os_snapshot.is_some()
                             && observed_precondition.credential_snapshot.is_none()
+                            && observed_precondition.package_snapshot.is_none()
                     }
                 };
                 if observed_precondition.evidence_refs != request.precondition.evidence_refs

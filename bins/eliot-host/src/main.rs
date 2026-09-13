@@ -13,6 +13,219 @@ use host_console_protocol::{Request, Response, write_response};
 
 static PROCESS_BOOTSTRAP: OnceLock<Result<HostLaunchOptions, String>> = OnceLock::new();
 
+/// Win32 `ERROR_SERVICE_SPECIFIC_ERROR`: the `dwWin32ExitCode` reported for
+/// every typed Host start failure. The per-class detail travels in
+/// `dwServiceSpecificExitCode` ([`HostStopCode::specific`]), so `sc queryex`
+/// names the failure class instead of collapsing every start failure to
+/// `exit 1 / specific 0`.
+const HOST_WIN32_SERVICE_SPECIFIC_ERROR: u32 = 1066;
+
+/// Process exit code for console start failures. A console run has no
+/// `SERVICE_STATUS_HANDLE`, so the 1066 marker is carried as the process exit
+/// code on Windows while the typed class is carried in stderr and the capsule.
+const HOST_CONSOLE_PROCESS_EXIT_CODE: i32 = 1066;
+
+/// Single bounded start-failure capsule file inside the Host state root.
+const HOST_START_FAILURE_CAPSULE_FILE_NAME: &str = "eliot-host-start-failure.json";
+/// Hard ceiling for the serialized capsule; the builder truncates fields first
+/// and then trims at a character boundary so output never exceeds this.
+const HOST_START_FAILURE_CAPSULE_MAX_BYTES: usize = 4096;
+/// Per-field ceiling for the free-text failure detail.
+const HOST_START_FAILURE_DETAIL_MAX_CHARS: usize = 512;
+/// Per-field ceiling for the installation identity echo.
+const HOST_START_FAILURE_IDENTITY_MAX_CHARS: usize = 128;
+
+/// Typed Host service-start failure classes.
+///
+/// Each variant documents the exact `service_main` site it classifies and owns
+/// one stable `dwServiceSpecificExitCode` (the discriminant). Discriminants
+/// are never reused or reordered: operators and installers key runbooks off
+/// them. Only the numeric projection changes; every site keeps its historical
+/// control flow, stderr text, and shutdown behavior.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum HostStopCode {
+    /// `RegisterServiceCtrlHandlerExW` returned NULL. Previously a silent
+    /// return; now also leaves stderr and a capsule.
+    ScmRegisterNull = 1,
+    /// `ServiceMain` argv shape or the captured process bootstrap is invalid.
+    InvalidScmArgvOrBootstrap = 2,
+    /// The read-only SCM registration inspection is not an exact match.
+    InvalidRegistration = 3,
+    /// The `START_PENDING` progress reporter thread could not start.
+    ReporterStartFailed = 4,
+    /// `HostComposition::open` failed.
+    OpenHostFailed = 5,
+    /// The `START_PENDING` reporter did not sustain progress publication.
+    ReporterProgressFailed = 6,
+    /// `HostComposition::credential_control` failed.
+    CredentialControlFailed = 7,
+    /// The credential-control thread could not be spawned.
+    SpawnCredentialFailed = 8,
+    /// `HostComposition::runtime_control` failed.
+    RuntimeControlFailed = 9,
+    /// The runtime-control thread could not be spawned.
+    SpawnRuntimeFailed = 10,
+    /// Durable SCM shutdown (`host.stop()`) failed; recovery is required.
+    DurableShutdownFailed = 11,
+    /// `StartServiceCtrlDispatcherW` failed in the console entry path.
+    DispatcherFailed = 12,
+    /// The stdin/stdout console protocol failed before durable shutdown.
+    ConsoleFailed = 13,
+}
+
+impl HostStopCode {
+    /// Stable per-class `dwServiceSpecificExitCode` (`sc queryex` names this).
+    #[must_use]
+    const fn specific(self) -> u32 {
+        self as u32
+    }
+
+    /// Stable machine-readable class name recorded in the capsule.
+    #[must_use]
+    const fn failure_class(self) -> &'static str {
+        match self {
+            Self::ScmRegisterNull => "scm_register_null",
+            Self::InvalidScmArgvOrBootstrap => "invalid_scm_argv_or_bootstrap",
+            Self::InvalidRegistration => "invalid_scm_registration",
+            Self::ReporterStartFailed => "reporter_start_failed",
+            Self::OpenHostFailed => "open_host_failed",
+            Self::ReporterProgressFailed => "reporter_progress_failed",
+            Self::CredentialControlFailed => "credential_control_failed",
+            Self::SpawnCredentialFailed => "spawn_credential_failed",
+            Self::RuntimeControlFailed => "runtime_control_failed",
+            Self::SpawnRuntimeFailed => "spawn_runtime_failed",
+            Self::DurableShutdownFailed => "durable_shutdown_failed",
+            Self::DispatcherFailed => "dispatcher_failed",
+            Self::ConsoleFailed => "console_failed",
+        }
+    }
+}
+
+/// Secret-free kind name for a [`HostError`], recorded in the capsule.
+///
+/// Only the variant discriminant is recorded, never the payload, so paths,
+/// digests, and evidence handles inside the error cannot leak through this
+/// field; the truncated `detail` still carries the same text stderr already
+/// prints.
+fn host_error_variant(error: &HostError) -> &'static str {
+    match error {
+        HostError::State(_) => "state",
+        HostError::Journal(_) => "journal",
+        HostError::Installation(_) => "installation",
+        HostError::Platform(_) => "platform",
+        HostError::Stopped => "stopped",
+        HostError::MissingInstallation => "missing_installation",
+        HostError::ProcessContour(_) => "process_contour",
+        HostError::StoreNotLive { .. } => "store_not_live",
+        HostError::RecoveryRequired(_) => "recovery_required",
+        #[cfg(windows)]
+        HostError::StoreRecoveryRequired(_) => "store_recovery_required",
+        HostError::OwnerLeaseHeld => "owner_lease_held",
+        HostError::OwnerLeaseRecovery(_) => "owner_lease_recovery",
+    }
+}
+
+/// Builds the bounded secret-free start-failure capsule JSON.
+///
+/// The record carries the failure class, the error kind, both exit codes, and
+/// the non-secret launch identities (installation id, plan generation) when
+/// known. The registration nonce is never read and therefore can never be
+/// persisted; the free-text detail is truncated to
+/// [`HOST_START_FAILURE_DETAIL_MAX_CHARS`] characters and the whole record is
+/// capped at [`HOST_START_FAILURE_CAPSULE_MAX_BYTES`] bytes.
+#[must_use]
+fn build_host_start_failure_capsule(
+    code: HostStopCode,
+    error_variant: &str,
+    detail: &str,
+    installation_id: Option<&str>,
+    plan_generation: Option<u64>,
+) -> String {
+    let detail = truncate_host_chars(detail, HOST_START_FAILURE_DETAIL_MAX_CHARS);
+    let installation = installation_id
+        .map(|value| truncate_host_chars(value, HOST_START_FAILURE_IDENTITY_MAX_CHARS));
+    let value = serde_json::json!({
+        "record_type": "host_start_failure",
+        "service": SERVICE_NAME,
+        "failure_class": code.failure_class(),
+        "error_variant": error_variant,
+        "win32_exit_code": HOST_WIN32_SERVICE_SPECIFIC_ERROR,
+        "service_specific_exit_code": code.specific(),
+        "installation_id": installation.as_deref(),
+        "tx_plan_generation": plan_generation,
+        "detail": detail,
+    });
+    let mut text = serde_json::to_string(&value)
+        .unwrap_or_else(|_| String::from("{\"record_type\":\"host_start_failure\"}"));
+    while text.len() > HOST_START_FAILURE_CAPSULE_MAX_BYTES {
+        text.pop();
+    }
+    text
+}
+
+/// Persists one bounded secret-free start-failure capsule inside the Host
+/// state root (the existing Host-owned root from the launch options), or the
+/// process temp directory when no valid launch options exist.
+///
+/// The write is best-effort and never fails the service path: SCM status plus
+/// stderr remain the primary signals. This is a terminal receipt projection,
+/// not a logging subsystem: one file, one record, bounded bytes.
+fn persist_host_start_failure(
+    code: HostStopCode,
+    error_variant: &str,
+    detail: &str,
+    launch_options: Option<&HostLaunchOptions>,
+) {
+    let (installation_id, plan_generation, root) = match launch_options {
+        Some(options) => (
+            Some(options.installation().as_str()),
+            Some(options.transaction_plan_generation()),
+            options.host_state_root().to_path_buf(),
+        ),
+        None => (None, None, std::env::temp_dir()),
+    };
+    let capsule = build_host_start_failure_capsule(
+        code,
+        error_variant,
+        detail,
+        installation_id,
+        plan_generation,
+    );
+    let _ = std::fs::write(root.join(HOST_START_FAILURE_CAPSULE_FILE_NAME), capsule);
+}
+
+fn truncate_host_chars(value: &str, max_chars: usize) -> String {
+    if value.chars().count() > max_chars {
+        value.chars().take(max_chars).collect()
+    } else {
+        value.to_owned()
+    }
+}
+
+/// Cloned process bootstrap for capsule identities, when it parsed.
+///
+/// Only installation id, plan generation, and Host state root are ever read
+/// from it; the registration nonce is never accessed.
+fn captured_bootstrap_snapshot() -> Option<HostLaunchOptions> {
+    PROCESS_BOOTSTRAP
+        .get()
+        .and_then(|result| result.as_ref().ok())
+        .cloned()
+}
+
+/// Console process exit for a failed run: the 1066 marker on Windows, where
+/// SCM status projection exists, and the historical `1` elsewhere.
+fn console_process_exit_code() -> i32 {
+    #[cfg(windows)]
+    {
+        HOST_CONSOLE_PROCESS_EXIT_CODE
+    }
+    #[cfg(not(windows))]
+    {
+        1
+    }
+}
+
 fn main() {
     let _ = PROCESS_BOOTSTRAP.set(parse_process_bootstrap(std::env::args_os().skip(1)));
     #[cfg(windows)]
@@ -20,15 +233,29 @@ fn main() {
         Ok(true) => return,
         Ok(false) => {}
         Err(error) => {
-            let _ = writeln!(
-                io::stderr().lock(),
-                "eliot-host: StartServiceCtrlDispatcherW failed with Win32 error {error} (0x{error:08X})"
+            let detail = format!(
+                "StartServiceCtrlDispatcherW failed with Win32 error {error} (0x{error:08X})"
             );
-            std::process::exit(1);
+            let _ = writeln!(io::stderr().lock(), "eliot-host: {detail}");
+            let cached = captured_bootstrap_snapshot();
+            persist_host_start_failure(
+                HostStopCode::DispatcherFailed,
+                "dispatcher",
+                &detail,
+                cached.as_ref(),
+            );
+            std::process::exit(HOST_CONSOLE_PROCESS_EXIT_CODE);
         }
     }
     if !run_console() {
-        std::process::exit(1);
+        let cached = captured_bootstrap_snapshot();
+        persist_host_start_failure(
+            HostStopCode::ConsoleFailed,
+            "console",
+            "console protocol failed before durable shutdown",
+            cached.as_ref(),
+        );
+        std::process::exit(console_process_exit_code());
     }
 }
 
@@ -270,6 +497,28 @@ impl Drop for HostStartPendingReporter {
 
 #[cfg(windows)]
 #[allow(
+    clippy::too_many_arguments,
+    reason = "one terminal failure projection carries class, kind, detail, and identities together"
+)]
+fn fail_host_service(
+    handle: windows_sys::Win32::System::Services::SERVICE_STATUS_HANDLE,
+    status: &mut windows_sys::Win32::System::Services::SERVICE_STATUS,
+    code: HostStopCode,
+    error_variant: &str,
+    detail: &str,
+    launch_options: Option<&HostLaunchOptions>,
+) {
+    use windows_sys::Win32::System::Services::{SERVICE_STOPPED, SetServiceStatus};
+    persist_host_start_failure(code, error_variant, detail, launch_options);
+    status.dwCurrentState = SERVICE_STOPPED;
+    status.dwWin32ExitCode = HOST_WIN32_SERVICE_SPECIFIC_ERROR;
+    status.dwServiceSpecificExitCode = code.specific();
+    // SAFETY: handle is registered and status is initialized.
+    unsafe { SetServiceStatus(handle, &raw const *status) };
+}
+
+#[cfg(windows)]
+#[allow(
     clippy::too_many_lines,
     reason = "the SCM callback owns the complete fail-closed service lifecycle"
 )]
@@ -291,9 +540,6 @@ unsafe extern "system" fn service_main(service_arg_count: u32, service_arg_vecto
     let handle = unsafe {
         RegisterServiceCtrlHandlerExW(name.as_ptr(), Some(service_control), std::ptr::null_mut())
     };
-    if handle.is_null() {
-        return;
-    }
     let mut status = SERVICE_STATUS {
         dwServiceType: 0x0000_0010,
         dwCurrentState: SERVICE_START_PENDING,
@@ -303,6 +549,20 @@ unsafe extern "system" fn service_main(service_arg_count: u32, service_arg_vecto
         dwCheckPoint: 1,
         dwWaitHint: 10_000,
     };
+    if handle.is_null() {
+        let detail = "RegisterServiceCtrlHandlerExW returned a null handle";
+        let _ = writeln!(io::stderr().lock(), "eliot-host: {detail}");
+        let cached = captured_bootstrap_snapshot();
+        fail_host_service(
+            handle,
+            &mut status,
+            HostStopCode::ScmRegisterNull,
+            "none",
+            detail,
+            cached.as_ref(),
+        );
+        return;
+    }
     // SAFETY: handle is registered and status is initialized.
     unsafe { SetServiceStatus(handle, &raw const status) };
     let launch_options =
@@ -311,89 +571,151 @@ unsafe extern "system" fn service_main(service_arg_count: u32, service_arg_vecto
         {
             Ok(options) => options,
             Err(error) => {
-                let _ = writeln!(
-                    io::stderr().lock(),
-                    "eliot-host: invalid SCM launch argv or process bootstrap: {error}"
+                let detail = format!("invalid SCM launch argv or process bootstrap: {error}");
+                let _ = writeln!(io::stderr().lock(), "eliot-host: {detail}");
+                let cached = captured_bootstrap_snapshot();
+                fail_host_service(
+                    handle,
+                    &mut status,
+                    HostStopCode::InvalidScmArgvOrBootstrap,
+                    host_error_variant(&error),
+                    &detail,
+                    cached.as_ref(),
                 );
-                status.dwCurrentState = SERVICE_STOPPED;
-                status.dwWin32ExitCode = 1;
-                // SAFETY: handle is registered and status is initialized.
-                unsafe { SetServiceStatus(handle, &raw const status) };
                 return;
             }
         };
     if let Err(error) = eliot_host::validate_host_scm_bootstrap(&launch_options) {
-        let _ = writeln!(
-            io::stderr().lock(),
-            "eliot-host: invalid SCM registration: {error}"
+        let detail = format!("invalid SCM registration: {error}");
+        let _ = writeln!(io::stderr().lock(), "eliot-host: {detail}");
+        fail_host_service(
+            handle,
+            &mut status,
+            HostStopCode::InvalidRegistration,
+            host_error_variant(&error),
+            &detail,
+            Some(&launch_options),
         );
-        status.dwCurrentState = SERVICE_STOPPED;
-        status.dwWin32ExitCode = 1;
-        unsafe { SetServiceStatus(handle, &raw const status) };
         return;
     }
     let reporter = match HostStartPendingReporter::start(handle) {
         Ok(reporter) => reporter,
         Err(error) => {
-            let _ = writeln!(
-                io::stderr().lock(),
-                "eliot-host: SCM start-pending reporter could not start: {error}"
+            let detail = format!("SCM start-pending reporter could not start: {error}");
+            let _ = writeln!(io::stderr().lock(), "eliot-host: {detail}");
+            fail_host_service(
+                handle,
+                &mut status,
+                HostStopCode::ReporterStartFailed,
+                "io",
+                &detail,
+                Some(&launch_options),
             );
-            status.dwCurrentState = SERVICE_STOPPED;
-            status.dwWin32ExitCode = 1;
-            unsafe { SetServiceStatus(handle, &raw const status) };
             return;
         }
     };
+    let capsule_bootstrap = launch_options.clone();
     let host_result = open_host(launch_options);
     let reporter_succeeded = reporter.finish();
-    let Ok(mut host) = host_result else {
-        status.dwCurrentState = SERVICE_STOPPED;
-        status.dwWin32ExitCode = 1;
-        // SAFETY: handle is registered and status is initialized.
-        unsafe { SetServiceStatus(handle, &raw const status) };
-        return;
+    let mut host = match host_result {
+        Ok(host) => host,
+        Err(error) => {
+            let detail = format!("SCM host open failed: {error}");
+            let _ = writeln!(io::stderr().lock(), "eliot-host: {detail}");
+            fail_host_service(
+                handle,
+                &mut status,
+                HostStopCode::OpenHostFailed,
+                host_error_variant(&error),
+                &detail,
+                Some(&capsule_bootstrap),
+            );
+            return;
+        }
     };
     if !reporter_succeeded {
-        let _ = writeln!(
-            io::stderr().lock(),
-            "eliot-host: SCM start-pending progress could not be published"
-        );
-        status.dwCurrentState = SERVICE_STOPPED;
-        status.dwWin32ExitCode = 1;
+        let detail = "SCM start-pending progress could not be published";
+        let _ = writeln!(io::stderr().lock(), "eliot-host: {detail}");
         let _ = host.stop();
-        unsafe { SetServiceStatus(handle, &raw const status) };
+        fail_host_service(
+            handle,
+            &mut status,
+            HostStopCode::ReporterProgressFailed,
+            "reporter",
+            detail,
+            Some(&capsule_bootstrap),
+        );
         return;
     }
-    let Ok(credential_control) = host.credential_control() else {
-        status.dwCurrentState = SERVICE_STOPPED;
-        status.dwWin32ExitCode = 1;
-        let _ = host.stop();
-        unsafe { SetServiceStatus(handle, &raw const status) };
-        return;
+    let credential_control = match host.credential_control() {
+        Ok(control) => control,
+        Err(error) => {
+            let detail = format!("SCM credential control is unavailable: {error}");
+            let _ = writeln!(io::stderr().lock(), "eliot-host: {detail}");
+            let _ = host.stop();
+            fail_host_service(
+                handle,
+                &mut status,
+                HostStopCode::CredentialControlFailed,
+                host_error_variant(&error),
+                &detail,
+                Some(&capsule_bootstrap),
+            );
+            return;
+        }
     };
     let phase_b_queue = credential_control.phase_b_queue();
-    let Ok(credential_thread) = spawn_credential_control(credential_control) else {
-        status.dwCurrentState = SERVICE_STOPPED;
-        status.dwWin32ExitCode = 1;
-        let _ = host.stop();
-        unsafe { SetServiceStatus(handle, &raw const status) };
-        return;
+    let credential_thread = match spawn_credential_control(credential_control) {
+        Ok(thread) => thread,
+        Err(error) => {
+            let detail = format!("SCM credential-control thread could not start: {error}");
+            let _ = writeln!(io::stderr().lock(), "eliot-host: {detail}");
+            let _ = host.stop();
+            fail_host_service(
+                handle,
+                &mut status,
+                HostStopCode::SpawnCredentialFailed,
+                host_error_variant(&error),
+                &detail,
+                Some(&capsule_bootstrap),
+            );
+            return;
+        }
     };
-    let Ok(runtime_control) = host.runtime_control() else {
-        status.dwCurrentState = SERVICE_STOPPED;
-        status.dwWin32ExitCode = 1;
-        let _ = host.stop();
-        unsafe { SetServiceStatus(handle, &raw const status) };
-        return;
+    let runtime_control = match host.runtime_control() {
+        Ok(control) => control,
+        Err(error) => {
+            let detail = format!("SCM runtime control is unavailable: {error}");
+            let _ = writeln!(io::stderr().lock(), "eliot-host: {detail}");
+            let _ = host.stop();
+            fail_host_service(
+                handle,
+                &mut status,
+                HostStopCode::RuntimeControlFailed,
+                host_error_variant(&error),
+                &detail,
+                Some(&capsule_bootstrap),
+            );
+            return;
+        }
     };
     let runtime_queue = runtime_control.queue();
-    let Ok(runtime_thread) = spawn_runtime_control(runtime_control) else {
-        status.dwCurrentState = SERVICE_STOPPED;
-        status.dwWin32ExitCode = 1;
-        let _ = host.stop();
-        unsafe { SetServiceStatus(handle, &raw const status) };
-        return;
+    let runtime_thread = match spawn_runtime_control(runtime_control) {
+        Ok(thread) => thread,
+        Err(error) => {
+            let detail = format!("SCM runtime-control thread could not start: {error}");
+            let _ = writeln!(io::stderr().lock(), "eliot-host: {detail}");
+            let _ = host.stop();
+            fail_host_service(
+                handle,
+                &mut status,
+                HostStopCode::SpawnRuntimeFailed,
+                host_error_variant(&error),
+                &detail,
+                Some(&capsule_bootstrap),
+            );
+            return;
+        }
     };
     status.dwCurrentState = SERVICE_RUNNING;
     status.dwControlsAccepted = SERVICE_ACCEPT_STOP | SERVICE_ACCEPT_SHUTDOWN;
@@ -449,14 +771,18 @@ unsafe extern "system" fn service_main(service_arg_count: u32, service_arg_vecto
     status.dwCurrentState = SERVICE_STOPPED;
     status.dwControlsAccepted = 0;
     if let Err(error) = stop_result {
-        let _ = writeln!(
-            io::stderr().lock(),
-            "eliot-host: durable SCM shutdown failed; recovery required: {error}"
+        let detail = format!("durable SCM shutdown failed; recovery required: {error}");
+        let _ = writeln!(io::stderr().lock(), "eliot-host: {detail}");
+        persist_host_start_failure(
+            HostStopCode::DurableShutdownFailed,
+            host_error_variant(&error),
+            &detail,
+            Some(&capsule_bootstrap),
         );
-        // SCM receives a stopped state with a non-zero service-specific code,
-        // which is a failed/recovery outcome rather than a clean stop.
-        status.dwWin32ExitCode = 1;
-        status.dwServiceSpecificExitCode = 1;
+        // SCM receives a stopped state with 1066 plus a typed service-specific
+        // code, which is a failed/recovery outcome rather than a clean stop.
+        status.dwWin32ExitCode = HOST_WIN32_SERVICE_SPECIFIC_ERROR;
+        status.dwServiceSpecificExitCode = HostStopCode::DurableShutdownFailed.specific();
     }
     // SAFETY: handle is registered and status is initialized.
     unsafe { SetServiceStatus(handle, &raw const status) };
@@ -791,6 +1117,189 @@ mod tests {
             runtime_control_dispatch(&HostRuntimeControlOperation::ReconcileStoreRecovery),
             RuntimeControlDispatch::Store
         );
+    }
+
+    fn all_stop_codes() -> [HostStopCode; 13] {
+        use HostStopCode::{
+            ConsoleFailed, CredentialControlFailed, DispatcherFailed, DurableShutdownFailed,
+            InvalidRegistration, InvalidScmArgvOrBootstrap, OpenHostFailed, ReporterProgressFailed,
+            ReporterStartFailed, RuntimeControlFailed, ScmRegisterNull, SpawnCredentialFailed,
+            SpawnRuntimeFailed,
+        };
+        [
+            ScmRegisterNull,
+            InvalidScmArgvOrBootstrap,
+            InvalidRegistration,
+            ReporterStartFailed,
+            OpenHostFailed,
+            ReporterProgressFailed,
+            CredentialControlFailed,
+            SpawnCredentialFailed,
+            RuntimeControlFailed,
+            SpawnRuntimeFailed,
+            DurableShutdownFailed,
+            DispatcherFailed,
+            ConsoleFailed,
+        ]
+    }
+
+    #[test]
+    fn host_stop_codes_are_stable_unique_and_typed() {
+        let codes = all_stop_codes();
+        let mut specifics = codes.map(HostStopCode::specific);
+        specifics.sort_unstable();
+        assert_eq!(
+            specifics,
+            [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13],
+            "discriminants are the stable documented specific codes"
+        );
+        for code in codes {
+            assert!(!code.failure_class().is_empty());
+        }
+        assert_eq!(
+            HOST_WIN32_SERVICE_SPECIFIC_ERROR, 1066,
+            "Win32 marker must be ERROR_SERVICE_SPECIFIC_ERROR"
+        );
+        let mut classes: Vec<&'static str> =
+            codes.iter().map(|code| code.failure_class()).collect();
+        classes.sort_unstable();
+        classes.dedup();
+        assert_eq!(classes.len(), codes.len(), "failure classes must be unique");
+    }
+
+    #[test]
+    fn host_error_variants_name_kinds_without_data() {
+        let secret = "registration-nonce-should-never-appear";
+        assert_eq!(
+            host_error_variant(&HostError::Platform(secret.to_owned())),
+            "platform"
+        );
+        assert_eq!(
+            host_error_variant(&HostError::RecoveryRequired(secret.to_owned())),
+            "recovery_required"
+        );
+        assert_eq!(host_error_variant(&HostError::Stopped), "stopped");
+        assert_eq!(
+            host_error_variant(&HostError::MissingInstallation),
+            "missing_installation"
+        );
+        assert_eq!(
+            host_error_variant(&HostError::OwnerLeaseHeld),
+            "owner_lease_held"
+        );
+        for variant in [
+            host_error_variant(&HostError::Platform(secret.to_owned())),
+            host_error_variant(&HostError::RecoveryRequired(secret.to_owned())),
+        ] {
+            assert!(
+                !variant.contains(secret),
+                "variant names must never carry error payloads"
+            );
+        }
+    }
+
+    fn windows_test_options(state_root: &std::path::Path) -> HostLaunchOptions {
+        use std::ffi::OsString;
+        let args = vec![
+            OsString::from("--config-descriptor"),
+            OsString::from(
+                state_root
+                    .join("eliot-authority.json")
+                    .to_string_lossy()
+                    .into_owned(),
+            ),
+            OsString::from("--config-descriptor-sha256"),
+            OsString::from("a".repeat(64)),
+            OsString::from("--installation-id"),
+            OsString::from("installation-host-test"),
+            OsString::from("--tx-plan-generation"),
+            OsString::from("7"),
+            OsString::from("--host-state-root"),
+            OsString::from(state_root.to_string_lossy().into_owned()),
+            OsString::from("--registration-nonce"),
+            OsString::from("b".repeat(64)),
+        ];
+        HostLaunchOptions::parse_system_service(args)
+            .unwrap_or_else(|error| panic!("test launch options: {error}"))
+    }
+
+    #[test]
+    fn host_capsule_is_bounded_and_secret_free() {
+        let root =
+            std::env::temp_dir().join(format!("eliot-host-stop-code-test-{}", std::process::id()));
+        std::fs::create_dir_all(&root).unwrap_or_else(|error| panic!("fixture root: {error}"));
+        let options = windows_test_options(&root);
+        let nonce = options
+            .registration_nonce()
+            .unwrap_or_else(|| panic!("fixture nonce"))
+            .as_str()
+            .to_owned();
+        let capsule = build_host_start_failure_capsule(
+            HostStopCode::OpenHostFailed,
+            host_error_variant(&HostError::RecoveryRequired(
+                "durable state diverged".to_owned(),
+            )),
+            &"d".repeat(4000),
+            Some(options.installation().as_str()),
+            Some(options.transaction_plan_generation()),
+        );
+        assert!(
+            capsule.len() <= HOST_START_FAILURE_CAPSULE_MAX_BYTES,
+            "capsule must stay bounded"
+        );
+        let parsed: serde_json::Value =
+            serde_json::from_str(&capsule).unwrap_or_else(|error| panic!("capsule JSON: {error}"));
+        assert_eq!(parsed["record_type"], "host_start_failure");
+        assert_eq!(parsed["service"], SERVICE_NAME);
+        assert_eq!(parsed["failure_class"], "open_host_failed");
+        assert_eq!(parsed["error_variant"], "recovery_required");
+        assert_eq!(parsed["win32_exit_code"], 1066);
+        assert_eq!(parsed["service_specific_exit_code"], 5);
+        assert_eq!(parsed["installation_id"], "installation-host-test");
+        assert_eq!(parsed["tx_plan_generation"], 7);
+        assert!(
+            parsed["detail"]
+                .as_str()
+                .is_some_and(|detail| detail.chars().count() <= HOST_START_FAILURE_DETAIL_MAX_CHARS),
+            "detail must be truncated"
+        );
+        assert!(
+            !capsule.contains(&nonce),
+            "the registration nonce must never be persisted"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn host_capsule_persist_roundtrip_never_carries_the_nonce() {
+        let root = std::env::temp_dir().join(format!(
+            "eliot-host-stop-code-persist-{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&root).unwrap_or_else(|error| panic!("fixture root: {error}"));
+        let options = windows_test_options(&root);
+        let nonce = options
+            .registration_nonce()
+            .unwrap_or_else(|| panic!("fixture nonce"))
+            .as_str()
+            .to_owned();
+        persist_host_start_failure(
+            HostStopCode::InvalidRegistration,
+            "platform",
+            "Host SCM registration is not an exact read-only match",
+            Some(&options),
+        );
+        let stored = std::fs::read_to_string(root.join(HOST_START_FAILURE_CAPSULE_FILE_NAME))
+            .unwrap_or_else(|error| panic!("capsule readback: {error}"));
+        assert!(
+            !stored.contains(&nonce),
+            "the nonce must never be persisted"
+        );
+        assert!(stored.contains("invalid_scm_registration"));
+        assert!(stored.contains("installation-host-test"));
+        assert!(stored.len() <= HOST_START_FAILURE_CAPSULE_MAX_BYTES);
+        let _ = std::fs::remove_file(root.join(HOST_START_FAILURE_CAPSULE_FILE_NAME));
+        let _ = std::fs::remove_dir(&root);
     }
 }
 

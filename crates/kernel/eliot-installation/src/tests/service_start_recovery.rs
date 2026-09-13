@@ -22,8 +22,6 @@ use super::must;
 use super::pending_start_precondition;
 use super::pending_system_service_start_transaction;
 use super::registering_system_service_start_transaction;
-use super::start_absent;
-use super::start_absent_with_lineage;
 use super::test_handle;
 use crate::InstallationCoordinator;
 use crate::InstallationEffectAction;
@@ -43,6 +41,78 @@ use crate::RedbInstallationTransactionStore;
 use crate::TransactionVersion;
 use crate::effect_request;
 use crate::transaction_store_private;
+
+/// s33.3 (#1313): snapshot-carrying `StartService` `Absent` for drive mocks.
+///
+/// Production `service_start_inspect`/`reconcile` now attach a live OS
+/// snapshot (the `StartService` analogue of #1308 `service_absent_from_live_
+/// inspection`). The drive gate requires `os_some` for `StartService` and the
+/// strict rollback gate requires os/credential/package, so the old empty
+/// `start_absent` mock (no snapshot) fails closed in both. This helper keeps
+/// the exact `start_absent` evidence shape (`{reason}:{service_name}`) and
+/// the exact per-effect `pending_start_precondition` evidence refs, adding
+/// only the independently-observed OS contour (same test contour as
+/// `absent_with_file_index`). No assertions are weakened; only the mock
+/// observation is strengthened to the production shape.
+#[cfg(windows)]
+fn start_absent_with_snapshot(
+    transaction: &InstallationTransaction,
+    index: usize,
+    reason: &str,
+) -> InstallationEffectObservation {
+    let precondition = pending_start_precondition(transaction, index);
+    let object = crate::InstallationOsObjectSnapshot {
+        canonical_path_digest: test_handle("b".repeat(64)),
+        volume_serial_number: 1,
+        file_index: 11,
+        security_descriptor_digest: test_handle("c".repeat(64)),
+    };
+    let snapshot = crate::InstallationRootAbsentSnapshot {
+        target_path_digest: test_handle("d".repeat(64)),
+        profile_anchor: object.clone(),
+        ancestors: vec![object.clone()],
+        parent: object,
+        root_absent: true,
+    };
+    let observed_precondition = must(precondition.with_os_snapshot(snapshot));
+    let service_name = match &transaction.installer_effects[index] {
+        InstallerEffectPlan::StartService { service_name, .. } => service_name.clone(),
+        _ => unreachable!(),
+    };
+    InstallationEffectObservation::Absent {
+        observed_precondition,
+        evidence: vec![test_handle(format!(
+            "{reason}:{}",
+            service_name.as_str()
+        ))],
+        service_runtime_lineage: None,
+    }
+}
+
+/// Snapshot-carrying variant of `start_absent_with_lineage` (same snapshot
+/// contour as [`start_absent_with_snapshot`], plus the caller-observed
+/// `START_PENDING` lineage).
+#[cfg(windows)]
+fn start_absent_with_snapshot_and_lineage(
+    transaction: &InstallationTransaction,
+    index: usize,
+    reason: &str,
+    lineage: InstallationServiceProcessLineage,
+) -> InstallationEffectObservation {
+    match start_absent_with_snapshot(transaction, index, reason) {
+        InstallationEffectObservation::Absent {
+            observed_precondition,
+            evidence,
+            ..
+        } => InstallationEffectObservation::Absent {
+            observed_precondition,
+            evidence,
+            service_runtime_lineage: Some(lineage),
+        },
+        InstallationEffectObservation::Matching { .. }
+        | InstallationEffectObservation::Mismatch { .. } => unreachable!(),
+    }
+}
 
 #[cfg(windows)]
 #[test]
@@ -69,7 +139,7 @@ fn start_service_never_duplicates_after_authoritative_receipt() {
     let execute_count = Arc::new(Mutex::new(0));
     let mut port = fake_port(
         store.clone(),
-        vec![PortOutcome::Known(start_absent(
+        vec![PortOutcome::Known(start_absent_with_snapshot(
             &transaction,
             watchdog_index,
             "service-stopped",
@@ -234,7 +304,7 @@ fn start_service_race_already_running_never_becomes_owned_or_stopped() {
     let execute_count = Arc::new(Mutex::new(0));
     let mut port = fake_port(
         store.clone(),
-        vec![PortOutcome::Known(start_absent(
+        vec![PortOutcome::Known(start_absent_with_snapshot(
             &transaction,
             watchdog_index,
             "service-stopped",
@@ -341,7 +411,7 @@ fn start_service_race_already_starting_is_unknown_and_never_owned() {
     let execute_count = Arc::new(Mutex::new(0));
     let mut port = fake_port(
         store.clone(),
-        vec![PortOutcome::Known(start_absent(
+        vec![PortOutcome::Known(start_absent_with_snapshot(
             &transaction,
             watchdog_index,
             "service-stopped",
@@ -444,7 +514,7 @@ fn start_service_response_loss_blocks_retry_without_ownership_inference() {
     let execute_count = Arc::new(Mutex::new(0));
     let mut port = fake_port(
         store.clone(),
-        vec![PortOutcome::Known(start_absent(
+        vec![PortOutcome::Known(start_absent_with_snapshot(
             &transaction,
             watchdog_index,
             "service-stopped",
@@ -512,8 +582,20 @@ fn start_service_waits_on_starting_then_times_out_without_resend() {
             )
         })
         .unwrap_or_else(|| unreachable!());
-    transaction.effect_progress[index].admitted_precondition =
-        Some(pending_start_precondition(&transaction, index));
+    // s33.3 (#1313): the IntentCommitted reconcile `Absent` must equal the
+    // admitted precondition exactly (`was_intent` arm). Production now admits
+    // the OS snapshot at inspect time, so seed the admitted precondition with
+    // the same snapshot contour the reconcile mock below carries.
+    transaction.effect_progress[index].admitted_precondition = Some(
+        match start_absent_with_snapshot(&transaction, index, "service-starting") {
+            InstallationEffectObservation::Absent {
+                observed_precondition,
+                ..
+            } => observed_precondition,
+            InstallationEffectObservation::Matching { .. }
+            | InstallationEffectObservation::Mismatch { .. } => unreachable!(),
+        },
+    );
     transaction.effect_progress[index].service_start_deadline_ms = Some(2_000);
     let request = must(effect_request(
         &transaction,
@@ -536,7 +618,7 @@ fn start_service_waits_on_starting_then_times_out_without_resend() {
     let port = fake_port(
         store.clone(),
         Vec::new(),
-        vec![PortOutcome::Known(start_absent(
+        vec![PortOutcome::Known(start_absent_with_snapshot(
             &transaction,
             index,
             "service-starting",
@@ -585,7 +667,7 @@ fn start_service_starting_without_pid_preserves_intent_until_running() {
     let execute_count = Arc::new(Mutex::new(0));
     let mut port = fake_port(
         store.clone(),
-        vec![PortOutcome::Known(start_absent(
+        vec![PortOutcome::Known(start_absent_with_snapshot(
             &transaction,
             index,
             "service-stopped",
@@ -636,7 +718,7 @@ fn start_service_starting_without_pid_preserves_intent_until_running() {
     let restart_port = fake_port(
         restart_store.clone(),
         Vec::new(),
-        vec![PortOutcome::Known(start_absent(
+        vec![PortOutcome::Known(start_absent_with_snapshot(
             &transaction,
             index,
             "service-starting",
@@ -727,12 +809,12 @@ fn start_pending_nonzero_lineage_is_durable_and_required_for_running() {
     let execute_count = Arc::new(Mutex::new(0));
     let mut port = fake_port(
         store.clone(),
-        vec![PortOutcome::Known(start_absent(
+        vec![PortOutcome::Known(start_absent_with_snapshot(
             &transaction,
             index,
             "service-stopped",
         ))],
-        vec![PortOutcome::Known(start_absent_with_lineage(
+        vec![PortOutcome::Known(start_absent_with_snapshot_and_lineage(
             &transaction,
             index,
             "service-starting",
@@ -876,7 +958,7 @@ fn start_pending_pid_zero_physical_redb_restart_foreign_running_quarantines_with
     let execute_count = Arc::new(Mutex::new(0));
     let mut port = fake_port(
         shared.clone(),
-        vec![PortOutcome::Known(start_absent(
+        vec![PortOutcome::Known(start_absent_with_snapshot(
             &activating,
             index,
             "service-stopped",
@@ -1073,7 +1155,7 @@ fn start_service_pid_substitution_and_watchdog_failure_block_host() {
     let execute_count = Arc::new(Mutex::new(0));
     let mut port = fake_port(
         store.clone(),
-        vec![PortOutcome::Known(start_absent(
+        vec![PortOutcome::Known(start_absent_with_snapshot(
             &transaction,
             watchdog_index,
             "service-stopped",
