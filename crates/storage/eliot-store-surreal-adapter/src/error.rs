@@ -90,10 +90,10 @@ mod tests {
     }
 
     #[test]
-    fn unknown_outcome_collapses_to_unavailable() {
+    fn unknown_outcome_maps_to_missing_receipt_envelope() {
         let error = AdapterError::UnknownOutcome {
             operation_id: "op-1".to_owned(),
         };
-        assert_eq!(error.into_store_error(), StoreError::Unavailable);
+        assert_eq!(error.into_store_error(), StoreError::MissingReceiptEnvelope);
     }
 }
