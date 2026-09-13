@@ -1,5 +1,11 @@
 use std::{collections::BTreeMap, path::Path};
 
+use eliot_agent_api::{
+    AdmittedRouteReceipt, CONTRACT_VERSION, CancellationState, ClockReading, EventCursor,
+    ExecutionOutcome, LowercaseSha256, PhysicalRouteObservationReceipt, ProviderExecutionBinding,
+    RouteFingerprint, RouteObservationState, UsageReceipt, route_divergence_fields,
+};
+use eliot_contracts::{canonical_json_bytes, sha256_hex};
 use serde::{Deserialize, Deserializer, Serialize, Serializer, de, ser::SerializeMap};
 use serde_json::Value;
 
@@ -904,6 +910,181 @@ impl OpenCodeWireRouteReceipt {
             }
         }
     }
+
+    /// Total versioned loss-visible conversion into the shared canonical
+    /// [`PhysicalRouteObservationReceipt`].
+    ///
+    /// - Unknown wire fields are never dropped: a non-empty `extra` map is
+    ///   hashed into `raw_evidence_digest`/`raw_evidence_ref` (loss handle).
+    /// - Missing observed identity never synthesizes `observed = requested`:
+    ///   `Unavailable` becomes `UNOBSERVED` with an explicit reason plus
+    ///   `UNKNOWN_OUTCOME` quarantine (`recovery_ref`).
+    /// - `Observed` never defaults to `MATCHED`: the observed fingerprint is
+    ///   built from the requested fingerprint with provider/model replaced
+    ///   from the wire, then classified via `route_divergence_fields`
+    ///   (`Matched` only when field-complete equal, else `Diverged` with the
+    ///   exact difference set and a quarantine `recovery_ref`).
+    /// - Session/route agreement and admission/binding linkage are enforced
+    ///   via [`PhysicalRouteObservationReceipt::validate_against`]; a forged
+    ///   binding or mismatched admission rejects.
+    #[allow(clippy::too_many_arguments)]
+    pub fn to_physical_observation(
+        &self,
+        requested: &RouteFingerprint,
+        admission: &AdmittedRouteReceipt,
+        binding: &ProviderExecutionBinding,
+        usage: UsageReceipt,
+        started: ClockReading,
+        first_byte: ClockReading,
+        first_semantic: ClockReading,
+        terminal: ClockReading,
+        event_cursor: EventCursor,
+        event_sequence: u64,
+        cancellation: Option<CancellationState>,
+    ) -> Result<PhysicalRouteObservationReceipt, OpenCodeObservationConversionError> {
+        self.validate()?;
+        // Requested wire identity must agree with the canonical requested
+        // route; the observed side is built below, never defaulted.
+        if requested.provider != self.requested.provider_id
+            || requested.model != self.requested.model_id
+        {
+            return Err(eliot_agent_api::ContractError::BindingMismatch.into());
+        }
+        if binding.route != *requested {
+            return Err(eliot_agent_api::ContractError::BindingMismatch.into());
+        }
+        let (observed_route, route_state, diverged_fields, unobserved_reason) = match self.state {
+            OpenCodeWireRouteState::Unavailable => {
+                let reason = self
+                    .extra
+                    .get("unavailable_reason")
+                    .and_then(Value::as_str)
+                    .unwrap_or("opencode wire unavailable")
+                    .to_owned();
+                (
+                    None,
+                    RouteObservationState::Unobserved,
+                    Vec::new(),
+                    Some(reason),
+                )
+            }
+            OpenCodeWireRouteState::Observed => {
+                let observed_wire =
+                    self.observed
+                        .as_ref()
+                        .ok_or(OpenCodeObservationConversionError::Wire(
+                            OpenCodeWireRouteError::ObservedIdentityMissing,
+                        ))?;
+                let mut observed_fp = requested.clone();
+                observed_fp.provider = observed_wire.provider_id.clone();
+                observed_fp.model = observed_wire.model_id.clone();
+                let diverged = route_divergence_fields(requested, &observed_fp);
+                let state = if diverged.is_empty() {
+                    RouteObservationState::Matched
+                } else {
+                    RouteObservationState::Diverged
+                };
+                (Some(observed_fp), state, diverged, None)
+            }
+        };
+        // Loss handle: every unknown wire field stays addressable by digest.
+        let (raw_evidence_digest, raw_evidence_ref) = if self.extra.is_empty() {
+            (None, None)
+        } else {
+            let bytes = canonical_json_bytes(&self.extra).map_err(|error| {
+                OpenCodeObservationConversionError::Serialization(error.to_string())
+            })?;
+            let hex = sha256_hex(&bytes);
+            let digest: LowercaseSha256 =
+                serde_json::from_value(Value::String(hex)).map_err(|error| {
+                    OpenCodeObservationConversionError::Serialization(error.to_string())
+                })?;
+            let reference = format!("opencode-wire-extra:{}", digest.as_str());
+            (Some(digest), Some(reference))
+        };
+        // Execution axis follows the route axis without collapsing them:
+        // unavailable implies unknown outcome with quarantine; observed keeps
+        // the caller-supplied terminal/cancellation and gains a quarantine
+        // handle exactly when diverged.
+        let (execution_outcome, terminal, cancellation, recovery_ref) = match route_state {
+            RouteObservationState::Unobserved => (
+                ExecutionOutcome::UnknownOutcome,
+                ClockReading::default(),
+                None,
+                Some("opencode-unobserved-recovery".to_owned()),
+            ),
+            RouteObservationState::Matched => {
+                (ExecutionOutcome::Observed, terminal, cancellation, None)
+            }
+            RouteObservationState::Diverged => (
+                ExecutionOutcome::Observed,
+                terminal,
+                cancellation,
+                Some("opencode-diverged-quarantine".to_owned()),
+            ),
+        };
+        let request_bytes = canonical_json_bytes(&self.requested).map_err(|error| {
+            OpenCodeObservationConversionError::Serialization(error.to_string())
+        })?;
+        let request_digest: LowercaseSha256 =
+            serde_json::from_value(Value::String(sha256_hex(&request_bytes))).map_err(|error| {
+                OpenCodeObservationConversionError::Serialization(error.to_string())
+            })?;
+        let mut observation = PhysicalRouteObservationReceipt {
+            schema_version: CONTRACT_VERSION.to_owned(),
+            attempt_id: binding.attempt_id.clone(),
+            state_fence: binding.state_fence.clone(),
+            runtime_generation: binding.runtime_generation,
+            admitted_route_digest: admission.self_digest.clone(),
+            binding: binding.clone(),
+            requested_route: requested.clone(),
+            observed_route,
+            route_state,
+            diverged_fields,
+            execution_outcome,
+            request_digest,
+            translation_digest: None,
+            raw_evidence_digest,
+            raw_evidence_ref,
+            usage,
+            started,
+            first_byte,
+            first_semantic,
+            terminal,
+            event_cursor,
+            event_sequence,
+            cancellation,
+            unobserved_reason,
+            recovery_ref,
+            safe_public_error: None,
+            restricted_raw_error_ref: None,
+            self_digest: serde_json::from_value(Value::String(
+                "0000000000000000000000000000000000000000000000000000000000000000".to_owned(),
+            ))
+            .map_err(|error| {
+                OpenCodeObservationConversionError::Serialization(error.to_string())
+            })?,
+        };
+        observation.self_digest = observation.compute_digest().map_err(|error| {
+            OpenCodeObservationConversionError::Serialization(error.to_string())
+        })?;
+        observation.validate()?;
+        observation.validate_against(binding, admission)?;
+        Ok(observation)
+    }
+}
+
+/// Conversion failures for [`OpenCodeWireRouteReceipt::to_physical_observation`].
+/// Wire-shape failures stay wire-typed; linkage/shape failures stay
+/// contract-typed; neither is silently upgraded.
+#[derive(Clone, Debug, Eq, PartialEq, thiserror::Error)]
+pub enum OpenCodeObservationConversionError {
+    #[error("opencode wire route is invalid: {0}")]
+    Wire(#[from] OpenCodeWireRouteError),
+    #[error("physical observation contract rejected: {0}")]
+    Contract(#[from] eliot_agent_api::ContractError),
+    #[error("observation conversion serialization failed: {0}")]
+    Serialization(String),
 }
 
 fn is_blank(value: Option<&str>) -> bool {
@@ -1568,6 +1749,219 @@ mod tests {
         };
         let wire = serde_json::to_value(&result)?;
         assert!(serde_json::from_value::<NoAuthorityRunResult>(wire).is_err());
+        Ok(())
+    }
+
+    fn conversion_digest(seed: &str) -> LowercaseSha256 {
+        serde_json::from_value(json!(eliot_contracts::sha256_hex(
+            format!("opencode-conversion-{seed}").as_bytes()
+        )))
+        .expect("valid fixture digest")
+    }
+
+    fn conversion_route() -> RouteFingerprint {
+        RouteFingerprint {
+            host_family: "opencode".to_owned(),
+            adapter: "eliot-agent-opencode".to_owned(),
+            protocol_transport: "http+sse".to_owned(),
+            runtime_hash: conversion_digest("runtime"),
+            adapter_hash: conversion_digest("adapter"),
+            provider: "opencode-go".to_owned(),
+            model: "deepseek-v4-flash".to_owned(),
+            auth_billing: "interactive-user".to_owned(),
+            serializer_hash: conversion_digest("serializer"),
+            tool_semantics_hash: conversion_digest("tools"),
+            reasoning_mode: "catalogue-default".to_owned(),
+            continuation_behavior: "native-resume".to_owned(),
+            feature_flags_hash: conversion_digest("features"),
+        }
+    }
+
+    fn conversion_binding(
+        route: &RouteFingerprint,
+    ) -> Result<ProviderExecutionBinding, Box<dyn std::error::Error>> {
+        use eliot_agent_api::{
+            AttemptId, ExecutionUnit, NativeSession, NativeSessionLocator, RequestId, WorkLeaseId,
+        };
+        use eliot_contracts::{AuthorityEpoch, ResourceGeneration, StateFence};
+        let fence = StateFence::new(AuthorityEpoch::new(1)?, ResourceGeneration::new(1)?);
+        Ok(ProviderExecutionBinding {
+            attempt_id: AttemptId::new("attempt-opencode")?,
+            lease_id: serde_json::from_value(
+                serde_json::json!({"namespace": "eliot.governor.work-lease", "revision": "v1", "value": "lease-opencode"}),
+            )?,
+            state_fence: fence.clone(),
+            runtime_generation: ResourceGeneration::new(1)?,
+            route: route.clone(),
+            session_id: None,
+            provider_scope_ref: "scope:test".to_owned(),
+            native_session: NativeSession::Native(NativeSessionLocator::new("ses_1")?),
+            execution_unit: ExecutionUnit::new("opencode", "unit-1")?,
+            start_request_id: RequestId::new("req-1")?,
+            start_request_sha256: eliot_contracts::sha256_hex(b"req-1"),
+        })
+    }
+
+    fn conversion_admission(
+        binding: &ProviderExecutionBinding,
+    ) -> Result<AdmittedRouteReceipt, Box<dyn std::error::Error>> {
+        use eliot_agent_api::{
+            CandidateSelectionDisposition, PolicyRevision, RouteSelectionCandidate,
+            candidate_digest_for,
+        };
+        use eliot_contracts::DecisionId;
+        let candidate = RouteSelectionCandidate {
+            capability: "opencode".to_owned(),
+            query_intent: "test-intent".to_owned(),
+            scope_ref: "scope:test".to_owned(),
+            policy_revision: PolicyRevision::new(3)?,
+            candidates: vec![binding.route.clone()],
+            selected: Some(binding.route.clone()),
+            rejected: Vec::new(),
+            selection: CandidateSelectionDisposition::Selected,
+            evidence_refs: vec!["evidence-1".to_owned()],
+        };
+        candidate.validate()?;
+        let zero: LowercaseSha256 = serde_json::from_value(json!(
+            "0000000000000000000000000000000000000000000000000000000000000000"
+        ))?;
+        let mut receipt = AdmittedRouteReceipt {
+            schema_version: CONTRACT_VERSION.to_owned(),
+            decision_id: DecisionId::new("decision-opencode")?,
+            candidate_digest: candidate_digest_for(&candidate)?,
+            attempt_id: binding.attempt_id.clone(),
+            lease_id: binding.lease_id.clone(),
+            state_fence: binding.state_fence.clone(),
+            runtime_generation: binding.runtime_generation,
+            policy_revision: PolicyRevision::new(3)?,
+            requested_route: binding.route.clone(),
+            selected_route: Some(binding.route.clone()),
+            no_route: None,
+            evidence_refs: vec!["evidence-1".to_owned()],
+            proof_ceiling: eliot_agent_api::ProofCeiling::CandidateArtifact,
+            self_digest: zero,
+        };
+        receipt.self_digest = receipt.compute_digest()?;
+        receipt.validate()?;
+        Ok(receipt)
+    }
+
+    fn conversion_usage() -> UsageReceipt {
+        UsageReceipt {
+            input_tokens: None,
+            output_tokens: None,
+            cost_microunits: None,
+            quota: eliot_agent_api::QuotaKnowledge::Unknown,
+        }
+    }
+
+    #[test]
+    fn wire_observed_converts_to_matched_without_synthesis()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let requested = conversion_route();
+        let binding = conversion_binding(&requested)?;
+        let admission = conversion_admission(&binding)?;
+        let wire = observed_wire_receipt()?;
+        let observation = wire.to_physical_observation(
+            &requested,
+            &admission,
+            &binding,
+            conversion_usage(),
+            ClockReading::default(),
+            ClockReading::default(),
+            ClockReading::default(),
+            ClockReading {
+                valid_time_ms: Some(2_000),
+                known_time_ms: Some(2_001),
+                transaction_sequence: None,
+                monotonic_ns: None,
+            },
+            EventCursor::new("opencode-test-1")?,
+            1,
+            None,
+        )?;
+        assert_eq!(observation.route_state, RouteObservationState::Matched);
+        assert_eq!(observation.observed_route.as_ref(), Some(&requested));
+        assert_eq!(observation.requested_route, requested);
+        assert!(observation.diverged_fields.is_empty());
+        observation.validate_against(&binding, &admission)?;
+        Ok(())
+    }
+
+    #[test]
+    fn wire_observed_with_different_model_converts_to_diverged_with_quarantine()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let requested = conversion_route();
+        let binding = conversion_binding(&requested)?;
+        let admission = conversion_admission(&binding)?;
+        let mut wire = observed_wire_receipt()?;
+        wire.observed = Some(ModelSelection::new("other-provider", "other-model")?);
+        wire.provider = Some("other-provider".to_owned());
+        let observation = wire.to_physical_observation(
+            &requested,
+            &admission,
+            &binding,
+            conversion_usage(),
+            ClockReading::default(),
+            ClockReading::default(),
+            ClockReading::default(),
+            ClockReading {
+                valid_time_ms: Some(2_000),
+                known_time_ms: Some(2_001),
+                transaction_sequence: None,
+                monotonic_ns: None,
+            },
+            EventCursor::new("opencode-test-2")?,
+            2,
+            None,
+        )?;
+        assert_eq!(observation.route_state, RouteObservationState::Diverged);
+        assert_ne!(observation.observed_route.as_ref(), Some(&requested));
+        assert!(!observation.diverged_fields.is_empty());
+        assert!(observation.recovery_ref.is_some());
+        observation.validate_against(&binding, &admission)?;
+        Ok(())
+    }
+
+    #[test]
+    fn wire_unavailable_converts_to_unobserved_with_reason_and_loss_handle()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let requested = conversion_route();
+        let binding = conversion_binding(&requested)?;
+        let admission = conversion_admission(&binding)?;
+        let mut wire =
+            OpenCodeWireRouteReceipt::unavailable(model()?, "server did not attest route");
+        wire.extra
+            .insert("future_wire_field".to_owned(), json!({"kept": true}));
+        let observation = wire.to_physical_observation(
+            &requested,
+            &admission,
+            &binding,
+            conversion_usage(),
+            ClockReading::default(),
+            ClockReading::default(),
+            ClockReading::default(),
+            ClockReading::default(),
+            EventCursor::new("opencode-test-3")?,
+            3,
+            None,
+        )?;
+        // Missing observed is never synthesized from requested.
+        assert_eq!(observation.route_state, RouteObservationState::Unobserved);
+        assert_eq!(observation.observed_route, None);
+        assert_eq!(
+            observation.unobserved_reason.as_deref(),
+            Some("server did not attest route")
+        );
+        assert_eq!(
+            observation.execution_outcome,
+            ExecutionOutcome::UnknownOutcome
+        );
+        assert!(observation.recovery_ref.is_some());
+        // Unknown fields stay loss-visible via the raw-evidence digest handle.
+        assert!(observation.raw_evidence_digest.is_some());
+        assert!(observation.raw_evidence_ref.is_some());
+        observation.validate_against(&binding, &admission)?;
         Ok(())
     }
 }

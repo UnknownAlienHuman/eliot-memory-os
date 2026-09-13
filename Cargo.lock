@@ -721,6 +721,7 @@ dependencies = [
  "base64",
  "eliot-agent-api",
  "eliot-agent-coordinator",
+ "eliot-contracts",
  "secrecy",
  "serde",
  "serde_json",

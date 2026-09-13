@@ -13,9 +13,11 @@
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
 use eliot_agent_api::{
-    ActualRouteReceipt, AgentAttempt, AgentResult, AttemptId, AuthorityEnvelope, EffectKind,
-    EventCursor, EventId, HostEventKind, QuotaKnowledge, ResultDisposition, RouteFingerprint,
-    RouteFingerprintId, TaskId, UsageReceipt,
+    AdmittedRouteReceipt, AgentAttempt, AgentResult, AttemptId, AuthorityEnvelope,
+    CONTRACT_VERSION, CancellationState, ClockReading, EffectKind, EventCursor, EventId,
+    ExecutionOutcome, HostEventKind, LowercaseSha256, PhysicalRouteObservationReceipt,
+    ProviderExecutionBinding, QuotaKnowledge, ResultDisposition, RouteFingerprint,
+    RouteObservationState, TaskId, UsageReceipt,
 };
 use eliot_process::{
     ProcessEvidence, ProcessEvidenceSink, ProcessExecutionError, ProcessExecutor, ProcessRequest,
@@ -1007,16 +1009,33 @@ pub enum AcpResultOutcome {
 impl AcpResultEnvelope {
     /// Projects ACP metadata onto the provider-neutral A-01 result boundary.
     ///
-    /// The raw payload remains in this envelope.  This projection never turns
+    /// The raw payload remains in this envelope. This projection never turns
     /// it into evidence or an authorized effect, never claims an observed
-    /// route, and never fabricates usage or a terminal timestamp.
+    /// route (always `UNOBSERVED` with an explicit reason), and never
+    /// fabricates usage or terminal time. Session/route agreement and
+    /// admission/binding linkage are enforced via
+    /// `validate_against(binding, admission)`; forged or mismatched linkage
+    /// fails closed.
     pub fn into_agent_result(
         self,
         route: RouteFingerprint,
-        route_id: RouteFingerprintId,
-        started_at: impl Into<String>,
+        binding: &ProviderExecutionBinding,
+        admission: &AdmittedRouteReceipt,
         outcome: AcpResultOutcome,
     ) -> Result<AgentResult, AcpAdapterError> {
+        if route != binding.route {
+            return Err(AcpAdapterError::ContractValidation(
+                eliot_agent_api::ContractError::BindingMismatch,
+            ));
+        }
+        if let Some(session) = &self.session_id
+            && let Some(bound_session) = binding.session_id.as_ref()
+            && session.as_str() != bound_session.as_str()
+        {
+            return Err(AcpAdapterError::ContractValidation(
+                eliot_agent_api::ContractError::BindingMismatch,
+            ));
+        }
         let (disposition, unknown_reason) = match outcome {
             AcpResultOutcome::Completed => (ResultDisposition::DegradedNoProof, None),
             AcpResultOutcome::Cancelled => (ResultDisposition::CancelledObserved, None),
@@ -1033,6 +1052,83 @@ impl AcpResultEnvelope {
             cost_microunits: None,
             quota: QuotaKnowledge::Unknown,
         };
+        let zero: LowercaseSha256 = serde_json::from_value(Value::String(
+            "0000000000000000000000000000000000000000000000000000000000000000".to_owned(),
+        ))
+        .map_err(|_| {
+            AcpAdapterError::ContractValidation(eliot_agent_api::ContractError::DigestMismatch)
+        })?;
+        // UNOBSERVED with explicit reason, never observed=requested.
+        // Cancelled carries observed cancellation; Failed preserves the
+        // sanitized reason without claiming terminal time; all unknown
+        // outcomes quarantine with a recovery handle.
+        let (execution_outcome, cancellation, recovery_ref, safe_public_error) =
+            match (&disposition, &unknown_reason) {
+                (ResultDisposition::CancelledObserved, _) => (
+                    ExecutionOutcome::Observed,
+                    Some(CancellationState::Acknowledged),
+                    None,
+                    None,
+                ),
+                (ResultDisposition::FailedVerification, Some(reason)) => (
+                    ExecutionOutcome::UnknownOutcome,
+                    None,
+                    Some(format!("acp-failed:{reason}")),
+                    Some(reason.clone()),
+                ),
+                (ResultDisposition::UnknownOutcome, Some(reason)) => (
+                    ExecutionOutcome::UnknownOutcome,
+                    None,
+                    Some(reason.clone()),
+                    None,
+                ),
+                _ => (
+                    ExecutionOutcome::UnknownOutcome,
+                    None,
+                    Some("acp-outcome-requires-reconciliation".to_owned()),
+                    unknown_reason.clone(),
+                ),
+            };
+        let mut actual_route = PhysicalRouteObservationReceipt {
+            schema_version: CONTRACT_VERSION.to_owned(),
+            attempt_id: binding.attempt_id.clone(),
+            state_fence: binding.state_fence.clone(),
+            runtime_generation: binding.runtime_generation,
+            admitted_route_digest: admission.self_digest.clone(),
+            binding: binding.clone(),
+            requested_route: route,
+            observed_route: None,
+            route_state: RouteObservationState::Unobserved,
+            diverged_fields: Vec::new(),
+            execution_outcome,
+            request_digest: zero.clone(),
+            translation_digest: None,
+            raw_evidence_digest: None,
+            raw_evidence_ref: None,
+            usage: usage.clone(),
+            started: ClockReading::default(),
+            first_byte: ClockReading::default(),
+            first_semantic: ClockReading::default(),
+            terminal: ClockReading::default(),
+            event_cursor: EventCursor::new("acp-result")
+                .map_err(AcpAdapterError::ContractValidation)?,
+            event_sequence: 1,
+            cancellation,
+            unobserved_reason: Some(
+                "acp physical route not separately observed; requested retained without synthesis"
+                    .to_owned(),
+            ),
+            recovery_ref,
+            safe_public_error,
+            restricted_raw_error_ref: None,
+            self_digest: zero,
+        };
+        actual_route.self_digest = actual_route.compute_digest().map_err(|_| {
+            AcpAdapterError::ContractValidation(eliot_agent_api::ContractError::DigestMismatch)
+        })?;
+        actual_route
+            .validate_against(binding, admission)
+            .map_err(AcpAdapterError::ContractValidation)?;
         let result = AgentResult {
             attempt_id: self.attempt_id,
             disposition,
@@ -1041,20 +1137,9 @@ impl AcpResultEnvelope {
             proposed_effects: Vec::new(),
             unresolved_questions: Vec::new(),
             usage: usage.clone(),
-            actual_route: ActualRouteReceipt {
-                requested: route,
-                observed: None,
-                route_id,
-                usage,
-                started_at: started_at.into(),
-                terminal_at: None,
-            },
+            actual_route,
             unknown_reason,
         };
-        result
-            .actual_route
-            .validate()
-            .map_err(AcpAdapterError::ContractValidation)?;
         if result.disposition == ResultDisposition::UnknownOutcome
             && result.unknown_reason.as_deref().is_none_or(str::is_empty)
         {
@@ -1441,22 +1526,96 @@ mod tests {
         }
     }
 
+    fn fixture_digest(seed: &str) -> LowercaseSha256 {
+        serde_json::from_value(serde_json::json!(eliot_contracts::sha256_hex(
+            format!("acp-fixture-{seed}").as_bytes()
+        )))
+        .expect("valid fixture digest")
+    }
+
     fn route() -> RouteFingerprint {
         RouteFingerprint {
             host_family: "acp-agent".into(),
             adapter: "eliot-acp-test".into(),
             protocol_transport: "acp-stdio".into(),
-            runtime_hash: "runtime".into(),
-            adapter_hash: "adapter".into(),
+            runtime_hash: fixture_digest("runtime"),
+            adapter_hash: fixture_digest("adapter"),
             provider: "provider".into(),
             model: "model".into(),
             auth_billing: "subscription".into(),
-            serializer_hash: "serializer".into(),
-            tool_semantics_hash: "tools".into(),
+            serializer_hash: fixture_digest("serializer"),
+            tool_semantics_hash: fixture_digest("tools"),
             reasoning_mode: "default".into(),
             continuation_behavior: "native".into(),
-            feature_flags_hash: "features".into(),
+            feature_flags_hash: fixture_digest("features"),
         }
+    }
+
+    fn binding_for(
+        route: &RouteFingerprint,
+    ) -> Result<ProviderExecutionBinding, Box<dyn std::error::Error>> {
+        use eliot_agent_api::{ExecutionUnit, NativeSession, NativeSessionLocator, RequestId};
+        use eliot_contracts::{AuthorityEpoch, ResourceGeneration, StateFence};
+        let fence = StateFence::new(AuthorityEpoch::new(1)?, ResourceGeneration::new(1)?);
+        Ok(ProviderExecutionBinding {
+            attempt_id: AttemptId::new("attempt")?,
+            lease_id: serde_json::from_value(
+                serde_json::json!({"namespace": "eliot.governor.work-lease", "revision": "v1", "value": "lease-acp"}),
+            )?,
+            state_fence: fence.clone(),
+            runtime_generation: ResourceGeneration::new(1)?,
+            route: route.clone(),
+            session_id: None,
+            provider_scope_ref: "scope:test".into(),
+            native_session: NativeSession::Native(NativeSessionLocator::new("session-acp")?),
+            execution_unit: ExecutionUnit::new("acp", "unit-1")?,
+            start_request_id: RequestId::new("req-1")?,
+            start_request_sha256: eliot_contracts::sha256_hex(b"req-1"),
+        })
+    }
+
+    fn admission_for(
+        binding: &ProviderExecutionBinding,
+    ) -> Result<AdmittedRouteReceipt, Box<dyn std::error::Error>> {
+        use eliot_agent_api::{
+            CandidateSelectionDisposition, PolicyRevision, RouteSelectionCandidate,
+            candidate_digest_for,
+        };
+        use eliot_contracts::DecisionId;
+        let candidate = RouteSelectionCandidate {
+            capability: "acp".to_owned(),
+            query_intent: "test-intent".to_owned(),
+            scope_ref: "scope:test".to_owned(),
+            policy_revision: PolicyRevision::new(3)?,
+            candidates: vec![binding.route.clone()],
+            selected: Some(binding.route.clone()),
+            rejected: Vec::new(),
+            selection: CandidateSelectionDisposition::Selected,
+            evidence_refs: vec!["evidence-1".to_owned()],
+        };
+        candidate.validate()?;
+        let zero: LowercaseSha256 = serde_json::from_value(serde_json::json!(
+            "0000000000000000000000000000000000000000000000000000000000000000"
+        ))?;
+        let mut receipt = AdmittedRouteReceipt {
+            schema_version: CONTRACT_VERSION.to_owned(),
+            decision_id: DecisionId::new("decision-acp")?,
+            candidate_digest: candidate_digest_for(&candidate)?,
+            attempt_id: binding.attempt_id.clone(),
+            lease_id: binding.lease_id.clone(),
+            state_fence: binding.state_fence.clone(),
+            runtime_generation: binding.runtime_generation,
+            policy_revision: PolicyRevision::new(3)?,
+            requested_route: binding.route.clone(),
+            selected_route: Some(binding.route.clone()),
+            no_route: None,
+            evidence_refs: vec!["evidence-1".to_owned()],
+            proof_ceiling: eliot_agent_api::ProofCeiling::CandidateArtifact,
+            self_digest: zero,
+        };
+        receipt.self_digest = receipt.compute_digest()?;
+        receipt.validate()?;
+        Ok(receipt)
     }
 
     #[test]
@@ -1688,12 +1847,14 @@ mod tests {
     fn project_result(
         outcome: AcpResultOutcome,
     ) -> Result<eliot_agent_api::AgentResult, AcpAdapterError> {
-        result_envelope()?.into_agent_result(
-            route(),
-            RouteFingerprintId::new("route").map_err(AcpAdapterError::ContractValidation)?,
-            "started",
-            outcome,
-        )
+        let route = route();
+        let binding = binding_for(&route).map_err(|_| {
+            AcpAdapterError::ContractValidation(eliot_agent_api::ContractError::BindingMismatch)
+        })?;
+        let admission = admission_for(&binding).map_err(|_| {
+            AcpAdapterError::ContractValidation(eliot_agent_api::ContractError::BindingMismatch)
+        })?;
+        result_envelope()?.into_agent_result(route, &binding, &admission, outcome)
     }
 
     #[test]
@@ -1703,12 +1864,16 @@ mod tests {
         assert_eq!(result.disposition, ResultDisposition::DegradedNoProof);
         assert!(result.evidence_refs.is_empty());
         assert!(result.proposed_effects.is_empty());
-        assert!(result.actual_route.observed.is_none());
+        assert_eq!(result.actual_route.observed_route, None);
+        assert_eq!(
+            result.actual_route.route_state,
+            eliot_agent_api::RouteObservationState::Unobserved
+        );
         assert_eq!(result.actual_route.usage.quota, QuotaKnowledge::Unknown);
         assert!(result.actual_route.usage.input_tokens.is_none());
         assert!(result.actual_route.usage.output_tokens.is_none());
         assert!(result.actual_route.usage.cost_microunits.is_none());
-        assert!(result.actual_route.terminal_at.is_none());
+        assert!(result.actual_route.terminal.valid_time_ms.is_none());
         Ok(())
     }
 

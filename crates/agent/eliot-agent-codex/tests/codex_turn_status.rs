@@ -1,6 +1,6 @@
 use eliot_agent_api::{
     AttemptId, ContractError, EventCursor, ExecutionUnit, ExecutionUnitObservation,
-    HostEventEnvelope, HostEventKind, NativeSession, NativeSessionLocator,
+    HostEventEnvelope, HostEventKind, LowercaseSha256, NativeSession, NativeSessionLocator,
     ProviderExecutionBinding, ProviderObservationLineage, SessionId, SessionObservation,
 };
 use eliot_agent_codex::{
@@ -9,18 +9,25 @@ use eliot_agent_codex::{
 use eliot_contracts::{ClockReading, sha256_hex};
 use serde_json::Value;
 
+fn fixture_digest(seed: &str) -> LowercaseSha256 {
+    serde_json::from_value(serde_json::json!(eliot_contracts::sha256_hex(
+        format!("codex-turn-{seed}").as_bytes()
+    )))
+    .expect("valid fixture digest")
+}
+
 fn route() -> eliot_agent_api::RouteFingerprint {
     codex_route(
-        "runtime-1",
-        "adapter-1",
+        fixture_digest("runtime"),
+        fixture_digest("adapter"),
         "provider-1",
         "model-1",
         "subscription-1",
-        "serializer-1",
-        "tools-1",
+        fixture_digest("serializer"),
+        fixture_digest("tools"),
         "visible",
         "native_resume",
-        "features-1",
+        fixture_digest("features"),
     )
 }
 
@@ -28,7 +35,7 @@ fn session() -> Result<CodexSessionBinding, Box<dyn std::error::Error>> {
     Ok(CodexSessionBinding {
         session_id: SessionId::new("session-1")?,
         thread_id: "thread-1".to_owned(),
-        runtime_hash: "runtime-1".to_owned(),
+        runtime_hash: fixture_digest("runtime"),
         working_directory: "C:\\workspace".to_owned(),
     })
 }

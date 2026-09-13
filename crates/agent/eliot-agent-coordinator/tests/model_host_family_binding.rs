@@ -1,29 +1,37 @@
 use std::collections::{BTreeMap, BTreeSet};
 
-use eliot_agent_api::RouteFingerprint;
+use eliot_agent_api::{LowercaseSha256, RouteFingerprint};
 use eliot_agent_coordinator::{
     BillingClass, BillingEvidence, MODEL_CATALOGUE_SCHEMA_VERSION, ModelAvailability,
     ModelCatalogueEntry, ModelCatalogueSnapshot, ModelControlError, QuotaDisposition,
     QuotaObservation, RouteAdmissionStatus, RouteHealthStatus,
 };
 
+use eliot_contracts::sha256_hex;
+
 const NOW: u64 = 10_000;
 
 fn route(host_family: &str) -> RouteFingerprint {
+    let digest = |seed: &str| {
+        serde_json::from_value::<LowercaseSha256>(serde_json::json!(sha256_hex(
+            format!("host-family-fixture-{seed}-{host_family}").as_bytes()
+        )))
+        .expect("valid fixture digest")
+    };
     RouteFingerprint {
         host_family: host_family.to_owned(),
         adapter: format!("eliot-agent-{host_family}"),
         protocol_transport: "http+sse".to_owned(),
-        runtime_hash: "runtime-v1".to_owned(),
-        adapter_hash: "adapter-v1".to_owned(),
+        runtime_hash: digest("runtime"),
+        adapter_hash: digest("adapter"),
         provider: "provider-a".to_owned(),
         model: "model-a".to_owned(),
         auth_billing: "account-scope-1".to_owned(),
-        serializer_hash: "serializer-v1".to_owned(),
-        tool_semantics_hash: "tools-v1".to_owned(),
+        serializer_hash: digest("serializer"),
+        tool_semantics_hash: digest("tools"),
         reasoning_mode: "default".to_owned(),
         continuation_behavior: "native-resume".to_owned(),
-        feature_flags_hash: "features-v1".to_owned(),
+        feature_flags_hash: digest("features"),
     }
 }
 
