@@ -1031,6 +1031,12 @@ name = "eliot-doctor"
 version = "0.1.0"
 dependencies = [
  "eliot-doctor-core",
+ "eliot-process",
+ "serde",
+ "serde_json",
+ "thiserror",
+ "time",
+ "tokio",
 ]
 
 [[package]]
