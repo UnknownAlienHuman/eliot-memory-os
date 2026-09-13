@@ -5,7 +5,6 @@
 //! watchdog publication bundle and re-checks identity/contour after verification. It never mints
 //! authority, never selects an alternate current owner, and fails closed on any lease/fence mismatch.
 
-use eliot_installation::RedbInstallationRegistry;
 use eliot_platform_windows::{ProtectedRootLease, ProtectedRuntimePathLease, windows_paths_equal};
 use eliot_runtime_contracts::{
     SupervisionLeaseIncarnationBinding, SupervisionLeasePredecessorIdentity,
@@ -13,6 +12,7 @@ use eliot_runtime_contracts::{
     WatchdogAdmissionTemplate, WatchdogPublicationRetentionPlan,
 };
 
+use super::watchdog_admission::inspect_registry_at;
 use super::{
     FileWatchdogAdmission, HOST_JOURNAL_FILE_NAME, INSTALLATION_REGISTRY_FILE_NAME, SpoolError,
     VerifiedWatchdogAdmission, WatchdogAdmissionConfig, WatchdogRuntimeBinding, current_unix_ms,
@@ -138,7 +138,11 @@ pub(super) fn load_content_addressed_supervision_lease_bound(
             "Watchdog admission does not match provisioned Phase-B digest".to_owned(),
         ));
     }
-    let registry = RedbInstallationRegistry::inspect_existing_at(
+    // s37/#1339: the registry re-read flows through the single
+    // `watchdog_admission` inspection so lock handling has one fix site.
+    // Mapping is unchanged; per-tick failures stay nonfatal gaps in the
+    // composition loop.
+    let registry = inspect_registry_at(
         ProtectedRootLease::open_existing(binding.host_state_root()).map_err(|error| {
             SpoolError::InvalidLease(format!("Host state root reopen failed: {error}"))
         })?,
