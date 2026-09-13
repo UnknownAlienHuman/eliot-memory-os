@@ -2343,7 +2343,7 @@ pub struct ServerHello {
     /// Rejection reason when no session was admitted.
     pub rejection_reason: Option<String>,
     /// Authority epoch selected for the session.
-    pub authority_epoch: AuthorityEpoch,
+    pub authority_epoch: EpochId,
 }
 
 impl ServerHello {

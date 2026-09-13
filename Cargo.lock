@@ -1435,6 +1435,7 @@ dependencies = [
 name = "eliot-ipc"
 version = "0.1.0"
 dependencies = [
+ "eliot-contracts",
  "eliot-platform",
  "eliot-platform-windows",
  "eliot-protocol",
@@ -1788,6 +1789,7 @@ dependencies = [
 name = "eliot-process-executor"
 version = "0.1.0"
 dependencies = [
+ "eliot-contracts",
  "eliot-instrument-api",
  "eliot-platform",
  "eliot-platform-windows",
@@ -2213,6 +2215,7 @@ name = "eliot-testd-core"
 version = "0.1.0"
 dependencies = [
  "blake3",
+ "eliot-contracts",
  "eliot-instrument-api",
  "eliot-process",
  "redb",
