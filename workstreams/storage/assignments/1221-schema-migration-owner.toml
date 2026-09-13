@@ -41,10 +41,11 @@ confirmed = [
 ]
 
 [disposition]
-orphan_root = "deleted-as-orphan"
+orphan_root = "fixture-not-executable"
+fixture_path = "migrations/0001_bootstrap.surql.retired"
 deleted = "2026-09-13"
 consumers_found = 0
-removal_condition = "satisfied; waves B/C/D deferred"
+removal_condition = "fixture expires 2026-12-12 or when waves B/C/D close legacy mapping; waves B/C/D deferred"
 
 [scope]
 primary_paths = [
