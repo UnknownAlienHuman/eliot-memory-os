@@ -37,10 +37,9 @@
 #![forbid(unsafe_code)]
 
 use eliot_contracts::{StateFence, canonical_json_bytes, sha256_hex};
-use eliot_dreamer_candidate_validation::RejectionCode;
 use eliot_dreamer_contracts::{
-    CurationKind, GroundedDreamDraft, PreservationReport, TargetDenominator, ValidatedCurationItem,
-    ValidationReceipt, is_hex64_lower,
+    CurationKind, CurationRejectionCode, GroundedDreamDraft, PreservationReport, TargetDenominator,
+    ValidatedCurationItem, ValidationReceipt, is_hex64_lower,
 };
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
@@ -2425,18 +2424,20 @@ pub fn propose_memory_repair(
     emit_repair_candidate(request, kind_verdict)
 }
 
-/// Maps a terminal outcome to the closest A-05 rejection hint, if any.
+/// Maps a terminal outcome to the closest A-03 curation rejection hint, if any.
 #[must_use]
-pub fn outcome_rejection_hint(outcome: &RepairOutcome) -> Option<RejectionCode> {
+pub fn outcome_rejection_hint(outcome: &RepairOutcome) -> Option<CurationRejectionCode> {
     match outcome {
         RepairOutcome::Complete => None,
         RepairOutcome::Partial | RepairOutcome::Blocked | RepairOutcome::Review => {
-            Some(RejectionCode::PreservationFailed)
+            Some(CurationRejectionCode::PreservationFailed)
         }
         RepairOutcome::Abstention | RepairOutcome::NoSafeRepair => {
-            Some(RejectionCode::LineageMismatch)
+            Some(CurationRejectionCode::LineageMismatch)
         }
-        RepairOutcome::Stale | RepairOutcome::Rejected => Some(RejectionCode::IdentityMismatch),
+        RepairOutcome::Stale | RepairOutcome::Rejected => {
+            Some(CurationRejectionCode::IdentityMismatch)
+        }
     }
 }
 
