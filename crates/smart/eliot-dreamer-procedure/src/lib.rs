@@ -53,7 +53,7 @@
 #![forbid(unsafe_code)]
 
 use eliot_contracts::{canonical_json_bytes, sha256_hex};
-use eliot_dreamer_candidate_validation::RejectionCode;
+use eliot_dreamer_contracts::CurationRejectionCode;
 use eliot_dreamer_contracts::{
     CurationKind, GroundedDreamDraft, ValidatedCurationItem, ValidationReceipt, check_fence,
     is_hex64_lower,
@@ -2154,22 +2154,22 @@ pub fn propose_procedure(
     )
 }
 
-/// Maps a terminal outcome to the closest A-05 rejection hint, if any.
+/// Maps a terminal outcome to the closest hub rejection hint, if any.
 #[must_use]
-pub fn outcome_rejection_hint(outcome: &ProcedureOutcome) -> Option<RejectionCode> {
+pub fn outcome_rejection_hint(outcome: &ProcedureOutcome) -> Option<CurationRejectionCode> {
     match outcome {
         ProcedureOutcome::Complete => None,
         ProcedureOutcome::Partial | ProcedureOutcome::BlockedUnknownEffect => {
-            Some(RejectionCode::PreservationFailed)
+            Some(CurationRejectionCode::PreservationFailed)
         }
-        ProcedureOutcome::Empirical => Some(RejectionCode::UnsupportedPrecision),
-        ProcedureOutcome::MissingVerifier => Some(RejectionCode::LineageMismatch),
-        ProcedureOutcome::Unsafe => Some(RejectionCode::UnsupportedJobShape),
+        ProcedureOutcome::Empirical => Some(CurationRejectionCode::UnsupportedPrecision),
+        ProcedureOutcome::MissingVerifier => Some(CurationRejectionCode::LineageMismatch),
+        ProcedureOutcome::Unsafe => Some(CurationRejectionCode::UnsupportedJobShape),
         ProcedureOutcome::Duplicate
         | ProcedureOutcome::Refinement
         | ProcedureOutcome::Conflict
         | ProcedureOutcome::Stale
-        | ProcedureOutcome::Rejected => Some(RejectionCode::IdentityMismatch),
+        | ProcedureOutcome::Rejected => Some(CurationRejectionCode::IdentityMismatch),
     }
 }
 
@@ -2651,7 +2651,7 @@ mod tests {
         assert!(is_hex64_lower(&candidate.candidate_digest));
         assert_eq!(
             outcome_rejection_hint(&candidate.outcome),
-            Some(RejectionCode::PreservationFailed)
+            Some(CurationRejectionCode::PreservationFailed)
         );
         let baseline = match propose_procedure(
             &item,
