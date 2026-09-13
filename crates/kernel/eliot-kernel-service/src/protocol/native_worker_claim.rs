@@ -19,7 +19,7 @@
 //! and the plain strings used here serialize to identical JSON, so equal
 //! logical claims yield equal digests on both sides.
 
-use eliot_contracts::{AuthorityEpoch, StateFence, canonical_json_bytes, sha256_hex};
+use eliot_contracts::{EpochId, StateFence, canonical_json_bytes, sha256_hex};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
@@ -156,7 +156,7 @@ pub struct NativeWorkerClaimRequest {
     /// Predecessor revision this claim continues from.
     pub predecessor_revision: String,
     /// Current authority epoch.
-    pub authority_epoch: AuthorityEpoch,
+    pub authority_epoch: EpochId,
     /// Exact immutable fence paired with the generation and epoch.
     pub state_fence: StateFence,
     /// Canonical digest over every bound work field.
@@ -230,7 +230,7 @@ impl NativeWorkerClaimRequest {
             expected_result_schema: &'a str,
             expected_result_schema_version: u16,
             predecessor_revision: &'a str,
-            authority_epoch: AuthorityEpoch,
+            authority_epoch: EpochId,
             state_fence: &'a StateFence,
             binding_digest: &'a str,
         }
@@ -258,7 +258,7 @@ impl NativeWorkerClaimRequest {
             expected_result_schema: &self.expected_result_schema,
             expected_result_schema_version: self.expected_result_schema_version,
             predecessor_revision: &self.predecessor_revision,
-            authority_epoch: self.authority_epoch,
+            authority_epoch: self.authority_epoch.clone(),
             state_fence: &self.state_fence,
             binding_digest: &self.binding_digest,
         };
@@ -399,7 +399,7 @@ impl NativeWorkerClaimRequest {
         &self,
         registration_id: &str,
         worker_generation: u64,
-        authority_epoch: AuthorityEpoch,
+        authority_epoch: EpochId,
         state_fence: &StateFence,
     ) -> Result<(), KernelServiceError> {
         if self.registration_id != registration_id {
@@ -473,7 +473,7 @@ pub struct NativeWorkerClaimReceipt {
     /// Admitted worker generation.
     pub worker_generation: u64,
     /// Authority epoch at admission time.
-    pub authority_epoch: AuthorityEpoch,
+    pub authority_epoch: EpochId,
     /// State fence at admission time.
     pub state_fence: StateFence,
     /// Admitted binding digest.
@@ -499,7 +499,7 @@ impl NativeWorkerClaimReceipt {
             attempt_id: &'a str,
             operation_id: &'a str,
             worker_generation: u64,
-            authority_epoch: AuthorityEpoch,
+            authority_epoch: EpochId,
             state_fence: &'a StateFence,
             binding_digest: &'a str,
             admitted_at_unix_ms: u64,
@@ -512,7 +512,7 @@ impl NativeWorkerClaimReceipt {
             attempt_id: &self.attempt_id,
             operation_id: &self.operation_id,
             worker_generation: self.worker_generation,
-            authority_epoch: self.authority_epoch,
+            authority_epoch: self.authority_epoch.clone(),
             state_fence: &self.state_fence,
             binding_digest: &self.binding_digest,
             admitted_at_unix_ms: self.admitted_at_unix_ms,

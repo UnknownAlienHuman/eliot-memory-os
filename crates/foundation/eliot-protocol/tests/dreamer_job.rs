@@ -1,8 +1,9 @@
 #![allow(clippy::expect_used, clippy::unwrap_used)]
 
 use eliot_contracts::{
-    ArtifactId, AuthorityEpoch, ClockReading, ContractId, ContractIdentity, ContractVersion,
-    OperationId, ProductId, ReceiptId, RequestId, ResourceGeneration, SourceId, StateFence, TaskId,
+    ArtifactId, ClockReading, ContractId, ContractIdentity, ContractVersion, EpochId,
+    EpochLineageId, OperationId, ProductId, ReceiptId, RequestId, ResourceGeneration, SourceId,
+    StateFence, TaskId,
 };
 use eliot_protocol::{
     AdmissionRef, CancellationState, DurableJobRecord, DurableJobRequest, DurableRequestIdentity,
@@ -229,7 +230,7 @@ fn submission() -> eliot_protocol::JobSubmission {
             authority: AuthorityBinding {
                 authority_id: ContractId::new("kernel").expect("authority"),
                 authority_owner: "kernel".to_owned(),
-                authority_epoch: AuthorityEpoch::genesis(),
+                authority_epoch: test_epoch(),
                 state_fence: fence(),
                 allowed_effect: EffectClass::Candidate,
                 proof_ceiling: ProofCeiling::CandidateArtifact,
@@ -241,7 +242,7 @@ fn submission() -> eliot_protocol::JobSubmission {
             route_class: "bounded".to_owned(),
             budget_units: 1,
             deadline_unix_ms: 100,
-            validity_epoch: AuthorityEpoch::genesis(),
+            validity_epoch: test_epoch(),
             resource_generation: ResourceGeneration::genesis(),
             admission_receipt: ReceiptId::new("admission-receipt").expect("receipt"),
         },
@@ -356,6 +357,14 @@ fn scope() -> WorkScopeBinding {
     }
 }
 
+fn test_epoch() -> EpochId {
+    EpochId::new(
+        EpochLineageId::new("550e8400-e29b-41d4-a716-446655440000").expect("lineage"),
+        std::num::NonZeroU64::new(1).expect("sequence"),
+    )
+    .expect("epoch")
+}
+
 fn fence() -> StateFence {
-    StateFence::new(AuthorityEpoch::genesis(), ResourceGeneration::genesis())
+    StateFence::new(test_epoch(), ResourceGeneration::genesis())
 }

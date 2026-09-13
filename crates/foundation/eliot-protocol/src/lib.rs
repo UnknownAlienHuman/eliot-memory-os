@@ -12,8 +12,8 @@ use std::{collections::BTreeMap, fmt, io::Read};
 
 use eliot_agent_contracts::LivePeerMessage;
 use eliot_contracts::{
-    ArtifactId, AuthorityEpoch, ContractError, ContractIdentity, ContractVersion, RequestId,
-    ResourceGeneration, StateFence, canonical_json_bytes, contract_identity,
+    ArtifactId, AuthorityEpoch, ContractError, ContractIdentity, ContractVersion, EpochId,
+    RequestId, ResourceGeneration, StateFence, canonical_json_bytes, contract_identity,
 };
 use eliot_evidence::EvidenceEnvelope;
 use eliot_instrument_api::{InstrumentInvocation, VerificationRun};
@@ -636,7 +636,11 @@ pub struct EventEnvelope {
     /// Producer generation used to fence old producers.
     pub producer_generation: ResourceGeneration,
     /// Authority epoch observed when the event was produced.
-    pub authority_epoch: AuthorityEpoch,
+    ///
+    /// Lineage-aware [`EpochId`] exact tuple; must match
+    /// `state_fence.authority_epoch` via `is_same_authority` (Implements #64).
+    /// Bare scalars are rejected at the wire boundary.
+    pub authority_epoch: EpochId,
     /// Stable event identity used for idempotent replay.
     pub event_id: String,
     /// Monotonic stream sequence.
@@ -673,7 +677,10 @@ impl EventEnvelope {
         unique_texts(&self.causal_predecessor_refs, "causal_predecessor_refs")?;
         self.payload_or_blob_ref.validate()?;
         self.state_fence.validate()?;
-        if self.authority_epoch != self.state_fence.authority_epoch {
+        if !self
+            .authority_epoch
+            .is_same_authority(&self.state_fence.authority_epoch)
+        {
             return Err(ProtocolError::InvalidField {
                 field: "authority_epoch",
                 reason: "must match state_fence.authority_epoch",
@@ -943,7 +950,10 @@ pub struct ClientHello {
     /// Maximum frame body accepted by the client.
     pub max_frame: u32,
     /// State/authority epoch observed by the client.
-    pub authority_epoch: AuthorityEpoch,
+    ///
+    /// Lineage-aware [`EpochId`]; must match the registered module generation
+    /// fence via `is_same_authority` (Implements #64).
+    pub authority_epoch: EpochId,
 }
 
 impl ClientHello {
@@ -973,7 +983,12 @@ impl ClientHello {
                 reason: "must match module contract and generation artifact",
             });
         }
-        if self.module_generation.state_fence.authority_epoch != self.authority_epoch {
+        if !self
+            .module_generation
+            .state_fence
+            .authority_epoch
+            .is_same_authority(&self.authority_epoch)
+        {
             return Err(ProtocolError::InvalidField {
                 field: "authority_epoch",
                 reason: "must match the registered module generation fence",
@@ -1032,7 +1047,9 @@ pub struct AgentBridgeClientDeclaration {
     /// Protected Kernel handshake principal binding. This is not an `AgentSession` principal.
     pub expected_kernel_principal_binding: String,
     /// Protected authority epoch expected from the Kernel server.
-    pub expected_kernel_authority_epoch: AuthorityEpoch,
+    ///
+    /// Lineage-aware [`EpochId`] (Implements #64).
+    pub expected_kernel_authority_epoch: EpochId,
     /// Protected immutable generation expected from the Kernel server.
     pub expected_kernel_generation: ResourceGeneration,
     /// Lowercase SHA-256 of the expected Kernel artifact.
@@ -1080,7 +1097,7 @@ impl AgentBridgeClientDeclaration {
             capabilities: self.capabilities.clone(),
             privacy_classes: self.privacy_classes.clone(),
             max_frame: self.max_frame,
-            authority_epoch: self.module_generation.state_fence.authority_epoch,
+            authority_epoch: self.module_generation.state_fence.authority_epoch.clone(),
         };
         hello.validate()?;
         Ok(hello)
@@ -1200,7 +1217,10 @@ pub struct AgentBridgePeerChallenge {
     /// Exact Kernel handshake principal binding observed by the Kernel.
     pub kernel_principal_binding: String,
     /// Exact Kernel authority epoch observed by the Kernel.
-    pub kernel_authority_epoch: AuthorityEpoch,
+    ///
+    /// Lineage-aware [`EpochId`]; validated by exact-tuple equality, never by
+    /// numeric ordering (Implements #64).
+    pub kernel_authority_epoch: EpochId,
     /// Exact Kernel generation observed by the Kernel.
     pub kernel_generation: ResourceGeneration,
     /// Lowercase SHA-256 of the exact Kernel executable artifact.
@@ -1263,7 +1283,9 @@ impl AgentBridgePeerChallenge {
             &self.kernel_principal_binding,
             "agent_bridge_peer_challenge.kernel_principal_binding",
         )?;
-        if self.kernel_authority_epoch.value() == 0 || self.kernel_generation.value() == 0 {
+        // `EpochId` is always a validated non-zero tuple; only the generation
+        // retains a scalar zero check.
+        if self.kernel_generation.value() == 0 {
             return Err(ProtocolError::InvalidField {
                 field: "agent_bridge_peer_challenge.kernel_generation",
                 reason: "Kernel authority and generation must be nonzero and generation-bound",
@@ -3308,13 +3330,28 @@ impl AgentBridgeProcessBinding {
 mod tests {
     use super::*;
     use eliot_contracts::{
-        ArtifactId, AuthorityEpoch, ClockReading, ContractId, ContractVersion, ProductId,
-        RequestMetadata, ResourceGeneration, SourceId,
+        ArtifactId, AuthorityEpoch, ClockReading, ContractId, ContractVersion, EpochLineageId,
+        ProductId, RequestMetadata, ResourceGeneration, SourceId,
     };
     use eliot_runtime_contracts::{HealthVector, ModuleGenerationState};
+    use std::num::NonZeroU64;
+
+    const TEST_LINEAGE_A: &str = "550e8400-e29b-41d4-a716-446655440000";
+    const TEST_LINEAGE_B: &str = "550e8400-e29b-41d4-a716-446655440001";
+
+    fn test_epoch(lineage: &str, sequence: u64) -> EpochId {
+        EpochId::new(
+            EpochLineageId::new(lineage).expect("valid test lineage"),
+            NonZeroU64::new(sequence).expect("nonzero test sequence"),
+        )
+        .expect("valid test epoch")
+    }
 
     fn fence() -> StateFence {
-        StateFence::new(AuthorityEpoch::genesis(), ResourceGeneration::genesis())
+        StateFence::new(
+            test_epoch(TEST_LINEAGE_A, 1),
+            ResourceGeneration::genesis(),
+        )
     }
 
     fn agent_bridge_client_declaration() -> Result<AgentBridgeClientDeclaration, ProtocolError> {
@@ -3355,7 +3392,7 @@ mod tests {
             expected_kernel_sid: "S-1-5-18".to_owned(),
             expected_kernel_session_id: 0,
             expected_kernel_principal_binding: "kernel:agent-bridge".to_owned(),
-            expected_kernel_authority_epoch: AuthorityEpoch::new(7)?,
+            expected_kernel_authority_epoch: test_epoch(TEST_LINEAGE_A, 7),
             expected_kernel_generation: ResourceGeneration::new(11)?,
             expected_kernel_artifact_sha256: "b".repeat(64),
             expected_kernel_config_snapshot_sha256: "c".repeat(64),
@@ -3940,7 +3977,7 @@ mod tests {
         assert!(receipt.validate_challenge(&substituted_generation).is_err());
 
         let mut substituted_fence = challenge.clone();
-        substituted_fence.state_fence.authority_epoch = AuthorityEpoch::new(2)?;
+        substituted_fence.state_fence.authority_epoch = test_epoch(TEST_LINEAGE_A, 2);
         substituted_fence = substituted_fence.with_computed_digest()?;
         assert!(substituted_fence.validate().is_ok());
         assert!(receipt.validate_challenge(&substituted_fence).is_err());
@@ -4167,7 +4204,7 @@ mod tests {
             stream_id: "stream-1".to_owned(),
             producer_id: "module-1".to_owned(),
             producer_generation: ResourceGeneration::genesis(),
-            authority_epoch: AuthorityEpoch::genesis(),
+            authority_epoch: test_epoch(TEST_LINEAGE_A, 1),
             event_id: "event-1".to_owned(),
             sequence: 1,
             causal_predecessor_refs: Vec::new(),
@@ -4350,7 +4387,7 @@ mod tests {
     #[test]
     fn event_rejects_authority_epoch_mismatch() -> Result<(), ProtocolError> {
         let mut value = event();
-        value.authority_epoch = AuthorityEpoch::new(2)?;
+        value.authority_epoch = test_epoch(TEST_LINEAGE_A, 2);
         assert!(matches!(
             value.validate(),
             Err(ProtocolError::InvalidField {
