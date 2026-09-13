@@ -5010,9 +5010,17 @@ fn read_file_prefix_handle(
     file: &std::fs::File,
     limit: usize,
 ) -> Result<Vec<u8>, PackageStagingError> {
-    let file = file
+    let mut file = file
         .try_clone()
         .map_err(|error| map_package_io_error(error, PackageStagingStage::DuplicateHandle))?;
+    // `try_clone` duplicates the handle with a shared file position on
+    // Windows, so seek to the start before the bounded read. Callers such as
+    // `read_current_files` drain the same handle to EOF through
+    // `read_destination_snapshot_handle` first; without this seek the prefix
+    // read starts at EOF, yields 0 bytes, and every `executable = true`
+    // entry fails PE parsing with `Truncated`.
+    file.seek(SeekFrom::Start(0))
+        .map_err(|error| map_package_io_error(error, PackageStagingStage::SetFilePointerEx))?;
     let mut bytes = Vec::new();
     file.take(u64::try_from(limit).map_err(|_| PackageStagingError::BoundExceeded)?)
         .read_to_end(&mut bytes)
@@ -6173,6 +6181,37 @@ mod tests {
         assert_eq!(parse_pe_coff(&x86), Err(PeCoffError::InvalidSignature));
         let amd64 = minimal_pe(0x8664, 0x20b);
         assert_eq!(parse_pe_coff(&amd64)?.machine, 0x8664);
+        Ok(())
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn prefix_reader_is_position_independent_after_snapshot_read() -> TestResult {
+        use std::io::{Read as _, Seek as _};
+
+        let path = std::env::temp_dir().join(format!(
+            "eliot-package-prefix-seek-{}",
+            super::super::unique_suffix()
+        ));
+        let expected = minimal_pe(0x8664, 0x20b);
+        std::fs::write(&path, &expected)?;
+        let file = open_existing_file(&path)?;
+        // Mirror `read_destination_snapshot_handle`: the clone shares the
+        // file position on Windows (`DuplicateHandle`), so draining it
+        // leaves the original handle at EOF — the exact precondition that
+        // made `read_current_files` read a 0-byte prefix and fail every
+        // `executable = true` entry with `PeParse(Truncated)`.
+        let mut drain = file.try_clone()?;
+        drain.seek(std::io::SeekFrom::Start(0))?;
+        let mut sink = Vec::new();
+        drain.read_to_end(&mut sink)?;
+        assert_eq!(sink, expected);
+        let prefix = read_file_prefix_handle(&file, MAX_PE_HEADER_BYTES)?;
+        assert_eq!(prefix, expected);
+        assert_eq!(parse_pe_coff(&prefix)?.machine, 0x8664);
+        drop(drain);
+        drop(file);
+        std::fs::remove_file(&path)?;
         Ok(())
     }
 
