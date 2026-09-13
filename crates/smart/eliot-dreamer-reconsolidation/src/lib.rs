@@ -13,7 +13,7 @@
 
 #![forbid(unsafe_code)]
 
-use eliot_dreamer_candidate_validation::RejectionCode;
+use eliot_dreamer_contracts::CurationRejectionCode;
 use eliot_dreamer_contracts::{
     CurationKind, PreservationReport, TargetDenominator, ValidationReceipt,
 };
@@ -1360,24 +1360,24 @@ pub fn propose_reconsolidation(
     )
 }
 
-/// Maps a terminal outcome to the closest A-05 hint without re-running validation.
+/// Maps a terminal outcome to the closest A-03 hub hint without re-running validation.
 ///
 /// Returns `None` for [`ReconsolidationOutcome::Complete`]; every other
 /// outcome maps to the rejection class a downstream gate would most likely
 /// record. The mapping is diagnostic only and never executes validation.
 #[must_use]
-pub fn outcome_rejection_hint(outcome: &ReconsolidationOutcome) -> Option<RejectionCode> {
+pub fn outcome_rejection_hint(outcome: &ReconsolidationOutcome) -> Option<CurationRejectionCode> {
     match outcome {
         ReconsolidationOutcome::Complete => None,
         ReconsolidationOutcome::Partial | ReconsolidationOutcome::Blocked => {
-            Some(RejectionCode::PreservationFailed)
+            Some(CurationRejectionCode::PreservationFailed)
         }
         ReconsolidationOutcome::NoMaterialNewEvidence | ReconsolidationOutcome::Abstention => {
-            Some(RejectionCode::LineageMismatch)
+            Some(CurationRejectionCode::LineageMismatch)
         }
-        ReconsolidationOutcome::NoSafeRevision => Some(RejectionCode::UnsupportedPrecision),
+        ReconsolidationOutcome::NoSafeRevision => Some(CurationRejectionCode::UnsupportedPrecision),
         ReconsolidationOutcome::Stale | ReconsolidationOutcome::Rejected => {
-            Some(RejectionCode::IdentityMismatch)
+            Some(CurationRejectionCode::IdentityMismatch)
         }
     }
 }
