@@ -1,15 +1,16 @@
 use std::collections::BTreeSet;
 
 use eliot_agent_api::{
-    ActualRouteReceipt, AgentLaunchRequest, AgentResult, AgentWorkUnitBrief, ArtifactId, AttemptId,
-    AuthorityEpoch, BudgetEnvelope, ContractError, EffectCeiling, EffectKind, ExecutionUnit,
-    LaunchRequestId, NativeSession, NativeSessionLocator, ProviderExecutionBinding, QuotaKnowledge,
-    RequestId, ResourceGeneration, ResultDisposition, RouteFingerprint, RouteFingerprintId,
-    StateFence, TaskId, UsageReceipt, WorkLeaseId, WorkUnitId,
+    AgentLaunchRequest, AgentResult, AgentWorkUnitBrief, ArtifactId, AttemptId, AuthorityEpoch,
+    BudgetEnvelope, CONTRACT_VERSION, ClockReading, ContractError, EffectCeiling, EffectKind,
+    EventCursor, ExecutionOutcome, ExecutionUnit, LaunchRequestId, LowercaseSha256, NativeSession,
+    NativeSessionLocator, PhysicalRouteObservationReceipt, ProviderExecutionBinding,
+    QuotaKnowledge, RequestId, ResourceGeneration, ResultDisposition, RouteFingerprint,
+    RouteObservationState, StateFence, TaskId, UsageReceipt, WorkLeaseId, WorkUnitId,
+    candidate_digest_for,
 };
 use eliot_agent_contracts::{
     DeliveryPolicy, DescendantClosureReceipt, LivePeerMessage, LivePeerMessageState, RevisionId,
-    contract_shape_digest,
 };
 use eliot_contracts::{IntegrationRevision, PolicyRevision, TaskRevision, sha256_hex};
 use eliot_evaluation_contracts::BudgetEvidence;
@@ -133,20 +134,26 @@ fn budget() -> BudgetEnvelope {
 }
 
 fn route(name: &str) -> RouteFingerprint {
+    let digest = |seed: &str| {
+        serde_json::from_value::<LowercaseSha256>(serde_json::json!(sha256_hex(
+            format!("coordinator-fixture-{seed}-{name}").as_bytes()
+        )))
+        .expect("valid fixture digest")
+    };
     RouteFingerprint {
         host_family: "test-host".to_owned(),
         adapter: format!("adapter-{name}"),
         protocol_transport: "fixture".to_owned(),
-        runtime_hash: format!("runtime-{name}"),
-        adapter_hash: format!("adapter-hash-{name}"),
+        runtime_hash: digest("runtime"),
+        adapter_hash: digest("adapter"),
         provider: format!("provider-{name}"),
         model: format!("model-{name}"),
         auth_billing: "fixture-account".to_owned(),
-        serializer_hash: "serializer-v1".to_owned(),
-        tool_semantics_hash: "tools-v1".to_owned(),
+        serializer_hash: digest("serializer"),
+        tool_semantics_hash: digest("tools"),
         reasoning_mode: "bounded".to_owned(),
         continuation_behavior: "fresh".to_owned(),
-        feature_flags_hash: "features-v1".to_owned(),
+        feature_flags_hash: digest("features"),
     }
 }
 
@@ -302,6 +309,11 @@ fn provider_receipt(
         .iter()
         .enumerate()
         .map(|(index, lane)| {
+            let selected = lane
+                .routing
+                .selected
+                .clone()
+                .ok_or("candidate must select a route")?;
             Ok(AdmittedLaneReceipt {
                 work_unit_id: lane.work_unit_id.clone(),
                 role_id: lane.role_id.clone(),
@@ -309,8 +321,8 @@ fn provider_receipt(
                 attempt_id: AttemptId::new(format!("attempt-{tag}-{index}"))?,
                 lease_id: serde_json::from_value::<WorkLeaseId>(serde_json::json!({"namespace": "eliot.governor.work-lease", "revision": "v1", "value": format!("lease-{tag}-{index}")}))?,
                 worker_id: WorkerId::new(format!("worker-{tag}-{index}"))?,
-                route: lane.routing.selected_route.clone(),
-                routing_receipt_digest: contract_shape_digest(&lane.routing)?,
+                route: selected,
+                routing_receipt_digest: candidate_digest_for(&lane.routing)?,
                 budget: lane.budget.clone(),
                 priority: lane.priority,
                 mutation_scope: lane.mutation_scope.clone(),
@@ -328,7 +340,9 @@ fn provider_receipt(
         plan_revision: candidate.plan_revision.clone(),
         state_fence: candidate.state_fence.clone(),
         controller_epoch: AuthorityEpoch::new(1)?,
-        coordinator_lease: serde_json::from_value::<WorkLeaseId>(serde_json::json!({"namespace": "eliot.governor.work-lease", "revision": "v1", "value": format!("coordinator-lease-{tag}")}))?,
+        coordinator_lease: serde_json::from_value::<WorkLeaseId>(
+            serde_json::json!({"namespace": "eliot.governor.work-lease", "revision": "v1", "value": format!("coordinator-lease-{tag}")}),
+        )?,
         provider_identity: provider_identity(),
         g11_admission_receipt_ref: format!("proof-admission-{tag}"),
         durable_job_ref: format!("durable-job-{tag}"),
@@ -355,11 +369,132 @@ fn usage() -> UsageReceipt {
     }
 }
 
+fn observation_binding(lane: &AdmittedLaneReceipt) -> TestResult<ProviderExecutionBinding> {
+    Ok(ProviderExecutionBinding {
+        attempt_id: lane.attempt_id.clone(),
+        lease_id: lane.lease_id.clone(),
+        state_fence: fence(),
+        runtime_generation: ResourceGeneration::genesis(),
+        route: lane.route.clone(),
+        session_id: None,
+        provider_scope_ref: "scope:test".to_owned(),
+        native_session: NativeSession::Native(NativeSessionLocator::new("thread-1")?),
+        execution_unit: ExecutionUnit::new("test-provider", "unit-1")?,
+        start_request_id: RequestId::new("req-1")?,
+        start_request_sha256: sha256_hex(b"req-1"),
+    })
+}
+
+fn zero_digest() -> TestResult<LowercaseSha256> {
+    Ok(serde_json::from_value(serde_json::json!(
+        "0000000000000000000000000000000000000000000000000000000000000000"
+    ))?)
+}
+
+fn matched_observation(
+    lane: &AdmittedLaneReceipt,
+    binding: &ProviderExecutionBinding,
+) -> TestResult<PhysicalRouteObservationReceipt> {
+    let mut observation = PhysicalRouteObservationReceipt {
+        schema_version: CONTRACT_VERSION.to_owned(),
+        attempt_id: lane.attempt_id.clone(),
+        state_fence: fence(),
+        runtime_generation: ResourceGeneration::genesis(),
+        admitted_route_digest: zero_digest()?,
+        binding: binding.clone(),
+        requested_route: lane.route.clone(),
+        observed_route: Some(lane.route.clone()),
+        route_state: RouteObservationState::Matched,
+        diverged_fields: Vec::new(),
+        execution_outcome: ExecutionOutcome::Observed,
+        request_digest: zero_digest()?,
+        translation_digest: None,
+        raw_evidence_digest: None,
+        raw_evidence_ref: None,
+        usage: usage(),
+        started: ClockReading {
+            valid_time_ms: Some(1_000),
+            known_time_ms: Some(1_001),
+            transaction_sequence: None,
+            monotonic_ns: None,
+        },
+        first_byte: ClockReading::default(),
+        first_semantic: ClockReading::default(),
+        terminal: ClockReading {
+            valid_time_ms: Some(2_000),
+            known_time_ms: Some(2_001),
+            transaction_sequence: None,
+            monotonic_ns: None,
+        },
+        event_cursor: EventCursor::new("cursor-1")?,
+        event_sequence: 1,
+        cancellation: None,
+        unobserved_reason: None,
+        recovery_ref: None,
+        safe_public_error: None,
+        restricted_raw_error_ref: None,
+        self_digest: zero_digest()?,
+    };
+    observation.self_digest = observation.compute_digest()?;
+    observation.validate()?;
+    Ok(observation)
+}
+
+fn unknown_observation(
+    lane: &AdmittedLaneReceipt,
+    binding: &ProviderExecutionBinding,
+) -> TestResult<PhysicalRouteObservationReceipt> {
+    let mut observation = PhysicalRouteObservationReceipt {
+        schema_version: CONTRACT_VERSION.to_owned(),
+        attempt_id: lane.attempt_id.clone(),
+        state_fence: fence(),
+        runtime_generation: ResourceGeneration::genesis(),
+        admitted_route_digest: zero_digest()?,
+        binding: binding.clone(),
+        requested_route: lane.route.clone(),
+        observed_route: Some(lane.route.clone()),
+        route_state: RouteObservationState::Matched,
+        diverged_fields: Vec::new(),
+        execution_outcome: ExecutionOutcome::UnknownOutcome,
+        request_digest: zero_digest()?,
+        translation_digest: None,
+        raw_evidence_digest: None,
+        raw_evidence_ref: None,
+        usage: usage(),
+        started: ClockReading {
+            valid_time_ms: Some(1_000),
+            known_time_ms: Some(1_001),
+            transaction_sequence: None,
+            monotonic_ns: None,
+        },
+        first_byte: ClockReading::default(),
+        first_semantic: ClockReading::default(),
+        terminal: ClockReading::default(),
+        event_cursor: EventCursor::new("cursor-1")?,
+        event_sequence: 1,
+        cancellation: None,
+        unobserved_reason: None,
+        recovery_ref: Some("provider outcome unresolved".to_owned()),
+        safe_public_error: None,
+        restricted_raw_error_ref: None,
+        self_digest: zero_digest()?,
+    };
+    observation.self_digest = observation.compute_digest()?;
+    observation.validate()?;
+    Ok(observation)
+}
+
 fn result_submission(
     tag: &str,
     lane: &AdmittedLaneReceipt,
     disposition: ResultDisposition,
 ) -> TestResult<ResultSubmission> {
+    let binding = observation_binding(lane)?;
+    let actual_route = if disposition == ResultDisposition::UnknownOutcome {
+        unknown_observation(lane, &binding)?
+    } else {
+        matched_observation(lane, &binding)?
+    };
     Ok(ResultSubmission {
         submission_id: SubmissionId::new(format!("submission-{tag}"))?,
         lease_id: lane.lease_id.clone(),
@@ -378,14 +513,7 @@ fn result_submission(
             proposed_effects: Vec::new(),
             unresolved_questions: Vec::new(),
             usage: usage(),
-            actual_route: ActualRouteReceipt {
-                requested: lane.route.clone(),
-                observed: Some(lane.route.clone()),
-                route_id: RouteFingerprintId::new(format!("route-receipt-{tag}"))?,
-                usage: usage(),
-                started_at: "2026-08-14T00:00:00Z".to_owned(),
-                terminal_at: Some("2026-08-14T00:00:01Z".to_owned()),
-            },
+            actual_route,
             unknown_reason: (disposition == ResultDisposition::UnknownOutcome)
                 .then(|| "provider outcome unresolved".to_owned()),
         },
@@ -681,7 +809,9 @@ fn admission_bijection_and_reassignment_capacity_fail_closed() -> TestResult {
         old_attempt_id: a_lane.attempt_id.clone(),
         old_lease_id: a_lane.lease_id.clone(),
         new_attempt_id: AttemptId::new("attempt-a-new")?,
-        new_lease_id: serde_json::from_value::<WorkLeaseId>(serde_json::json!({"namespace": "eliot.governor.work-lease", "revision": "v1", "value": "lease-a-new"}))?,
+        new_lease_id: serde_json::from_value::<WorkLeaseId>(
+            serde_json::json!({"namespace": "eliot.governor.work-lease", "revision": "v1", "value": "lease-a-new"}),
+        )?,
         new_worker_id: WorkerId::new("worker-a-new")?,
         route: b.admitted_lanes[0].route.clone(),
         budget: budget(),
@@ -736,7 +866,7 @@ fn live_capacity_evidence_limits_admission_and_reassignment() -> TestResult {
     )?;
     old_request.lanes[0].route_candidates[0].capacity_limit = 1;
     let old_candidate = coordinator.plan(old_request)?;
-    assert_eq!(old_candidate.lanes[0].routing.capacity_limit, 1);
+    assert_eq!(old_candidate.lanes[0].capacity_limit, 1);
     let old = coordinator.admit(provider_receipt(&old_candidate, "cap-old")?)?;
     let old_lane = old.admitted_lanes[0].clone();
     let old_context = ExecutionContext::from(&old);
@@ -790,7 +920,9 @@ fn live_capacity_evidence_limits_admission_and_reassignment() -> TestResult {
         old_attempt_id: old_lane.attempt_id.clone(),
         old_lease_id: old_lane.lease_id.clone(),
         new_attempt_id: AttemptId::new("attempt-cap-route")?,
-        new_lease_id: serde_json::from_value::<WorkLeaseId>(serde_json::json!({"namespace": "eliot.governor.work-lease", "revision": "v1", "value": "lease-cap-route"}))?,
+        new_lease_id: serde_json::from_value::<WorkLeaseId>(
+            serde_json::json!({"namespace": "eliot.governor.work-lease", "revision": "v1", "value": "lease-cap-route"}),
+        )?,
         new_worker_id: WorkerId::new("worker-cap-route")?,
         route: route("b"),
         budget: budget(),
@@ -807,7 +939,9 @@ fn live_capacity_evidence_limits_admission_and_reassignment() -> TestResult {
         old_attempt_id: old_lane.attempt_id,
         old_lease_id: old_lane.lease_id,
         new_attempt_id: AttemptId::new("attempt-cap-widen")?,
-        new_lease_id: serde_json::from_value::<WorkLeaseId>(serde_json::json!({"namespace": "eliot.governor.work-lease", "revision": "v1", "value": "lease-cap-widen"}))?,
+        new_lease_id: serde_json::from_value::<WorkLeaseId>(
+            serde_json::json!({"namespace": "eliot.governor.work-lease", "revision": "v1", "value": "lease-cap-widen"}),
+        )?,
         new_worker_id: WorkerId::new("worker-cap-widen")?,
         route: live.admitted_lanes[0].route.clone(),
         budget: budget(),
@@ -1974,5 +2108,292 @@ fn binding_snapshot_restore_preserves_binding_and_absent_stays_unresolved() -> T
         &bound
     );
     assert_eq!(restored_post.events(), coordinator.events());
+    Ok(())
+}
+
+fn diverged_observation(
+    lane: &AdmittedLaneReceipt,
+    binding: &ProviderExecutionBinding,
+    observed: &RouteFingerprint,
+) -> TestResult<PhysicalRouteObservationReceipt> {
+    use eliot_agent_api::route_divergence_fields;
+    let diverged = route_divergence_fields(&lane.route, observed);
+    assert!(!diverged.is_empty(), "diverged fixture must differ");
+    let zero = zero_digest()?;
+    let mut observation = PhysicalRouteObservationReceipt {
+        schema_version: CONTRACT_VERSION.to_owned(),
+        attempt_id: lane.attempt_id.clone(),
+        state_fence: fence(),
+        runtime_generation: ResourceGeneration::genesis(),
+        admitted_route_digest: zero.clone(),
+        binding: binding.clone(),
+        requested_route: lane.route.clone(),
+        observed_route: Some(observed.clone()),
+        route_state: RouteObservationState::Diverged,
+        diverged_fields: diverged,
+        execution_outcome: ExecutionOutcome::Observed,
+        request_digest: zero.clone(),
+        translation_digest: None,
+        raw_evidence_digest: None,
+        raw_evidence_ref: None,
+        usage: usage(),
+        started: ClockReading {
+            valid_time_ms: Some(1_000),
+            known_time_ms: Some(1_001),
+            transaction_sequence: None,
+            monotonic_ns: None,
+        },
+        first_byte: ClockReading::default(),
+        first_semantic: ClockReading::default(),
+        terminal: ClockReading {
+            valid_time_ms: Some(2_000),
+            known_time_ms: Some(2_001),
+            transaction_sequence: None,
+            monotonic_ns: None,
+        },
+        event_cursor: EventCursor::new("cursor-diverged")?,
+        event_sequence: 2,
+        cancellation: None,
+        unobserved_reason: None,
+        recovery_ref: Some("diverged-quarantine".to_owned()),
+        safe_public_error: None,
+        restricted_raw_error_ref: None,
+        self_digest: zero,
+    };
+    observation.self_digest = observation.compute_digest()?;
+    observation.validate()?;
+    Ok(observation)
+}
+
+fn unobserved_observation(
+    lane: &AdmittedLaneReceipt,
+    binding: &ProviderExecutionBinding,
+) -> TestResult<PhysicalRouteObservationReceipt> {
+    let zero = zero_digest()?;
+    let mut observation = PhysicalRouteObservationReceipt {
+        schema_version: CONTRACT_VERSION.to_owned(),
+        attempt_id: lane.attempt_id.clone(),
+        state_fence: fence(),
+        runtime_generation: ResourceGeneration::genesis(),
+        admitted_route_digest: zero.clone(),
+        binding: binding.clone(),
+        requested_route: lane.route.clone(),
+        observed_route: None,
+        route_state: RouteObservationState::Unobserved,
+        diverged_fields: Vec::new(),
+        execution_outcome: ExecutionOutcome::UnknownOutcome,
+        request_digest: zero.clone(),
+        translation_digest: None,
+        raw_evidence_digest: None,
+        raw_evidence_ref: None,
+        usage: usage(),
+        started: ClockReading {
+            valid_time_ms: Some(1_000),
+            known_time_ms: Some(1_001),
+            transaction_sequence: None,
+            monotonic_ns: None,
+        },
+        first_byte: ClockReading::default(),
+        first_semantic: ClockReading::default(),
+        terminal: ClockReading::default(),
+        event_cursor: EventCursor::new("cursor-unobserved")?,
+        event_sequence: 3,
+        cancellation: None,
+        unobserved_reason: Some("provider did not attest route".to_owned()),
+        recovery_ref: Some("unobserved-recovery".to_owned()),
+        safe_public_error: None,
+        restricted_raw_error_ref: None,
+        self_digest: zero,
+    };
+    observation.self_digest = observation.compute_digest()?;
+    observation.validate()?;
+    Ok(observation)
+}
+
+#[test]
+fn diverged_observation_is_retained_with_capped_ceiling() -> TestResult {
+    let mut coordinator = coordinator(
+        config(2, 2),
+        &["proof-admission-diverged", "proof-result-diverged"],
+    )?;
+    let admitted = plan_and_admit(
+        &mut coordinator,
+        "diverged",
+        &[LaneSpec {
+            work: "work-diverged",
+            role: "reader-diverged",
+            route: "a",
+            scope: None,
+            write: false,
+            priority: 1,
+        }],
+        None,
+    )?;
+    let context = ExecutionContext::from(&admitted);
+    let lane = admitted.admitted_lanes[0].clone();
+    coordinator.start_attempt(context.clone(), lane.attempt_id.clone())?;
+    let binding = observation_binding(&lane)?;
+    let observed = route("b");
+    let mut submission = result_submission("diverged", &lane, ResultDisposition::Partial)?;
+    submission.provider_result_receipt_ref = "proof-result-diverged".to_owned();
+    submission.result.actual_route = diverged_observation(&lane, &binding, &observed)?;
+    let receipt = coordinator.submit_result(context, submission)?;
+    assert_eq!(
+        receipt.proof_ceiling,
+        eliot_receipts::ProofCeiling::CandidateArtifact
+    );
+    assert_eq!(
+        receipt.actual_route.route_state,
+        RouteObservationState::Diverged
+    );
+    assert_eq!(
+        receipt.actual_route.observed_route.as_ref(),
+        Some(&observed)
+    );
+    Ok(())
+}
+
+#[test]
+fn unobserved_observation_is_retained_with_capped_ceiling() -> TestResult {
+    let mut coordinator = coordinator(
+        config(2, 2),
+        &["proof-admission-unobserved", "proof-result-unobserved"],
+    )?;
+    let admitted = plan_and_admit(
+        &mut coordinator,
+        "unobserved",
+        &[LaneSpec {
+            work: "work-unobserved",
+            role: "reader-unobserved",
+            route: "a",
+            scope: None,
+            write: false,
+            priority: 1,
+        }],
+        None,
+    )?;
+    let context = ExecutionContext::from(&admitted);
+    let lane = admitted.admitted_lanes[0].clone();
+    coordinator.start_attempt(context.clone(), lane.attempt_id.clone())?;
+    let binding = observation_binding(&lane)?;
+    let mut submission = result_submission("unobserved", &lane, ResultDisposition::UnknownOutcome)?;
+    submission.provider_result_receipt_ref = "proof-result-unobserved".to_owned();
+    submission.result.actual_route = unobserved_observation(&lane, &binding)?;
+    submission.result.unknown_reason = Some("provider outcome unresolved".to_owned());
+    let receipt = coordinator.submit_result(context, submission)?;
+    assert_eq!(
+        receipt.proof_ceiling,
+        eliot_receipts::ProofCeiling::CandidateArtifact
+    );
+    assert_eq!(
+        receipt.actual_route.route_state,
+        RouteObservationState::Unobserved
+    );
+    assert_eq!(receipt.actual_route.observed_route, None);
+    Ok(())
+}
+
+#[test]
+fn mismatched_requested_route_rejects_as_invalid_candidate() -> TestResult {
+    let mut coordinator = coordinator(
+        config(2, 2),
+        &["proof-admission-mismatch", "proof-result-mismatch"],
+    )?;
+    let admitted = plan_and_admit(
+        &mut coordinator,
+        "mismatch",
+        &[LaneSpec {
+            work: "work-mismatch",
+            role: "reader-mismatch",
+            route: "a",
+            scope: None,
+            write: false,
+            priority: 1,
+        }],
+        None,
+    )?;
+    let context = ExecutionContext::from(&admitted);
+    let lane = admitted.admitted_lanes[0].clone();
+    coordinator.start_attempt(context.clone(), lane.attempt_id.clone())?;
+    let binding = observation_binding(&lane)?;
+    // Requested differs from the admitted/assigned route: invalid candidate.
+    // Build a matched observation for a different requested route (b) while
+    // keeping the binding attempt so the failure is the requested mismatch.
+    let mut forged_lane = lane.clone();
+    forged_lane.route = route("b");
+    let mut submission = result_submission("mismatch", &lane, ResultDisposition::Partial)?;
+    submission.provider_result_receipt_ref = "proof-result-mismatch".to_owned();
+    let mut observation = matched_observation(&forged_lane, &binding)?;
+    observation.binding = binding.clone();
+    observation.self_digest = observation.compute_digest()?;
+    submission.result.actual_route = observation;
+    assert_eq!(
+        coordinator.submit_result(context, submission).err(),
+        Some(CoordinatorError::RouteMismatch)
+    );
+    Ok(())
+}
+
+#[test]
+fn forged_binding_rejects_at_intake() -> TestResult {
+    let mut coordinator = coordinator(
+        config(2, 2),
+        &["proof-admission-forged", "proof-result-forged"],
+    )?;
+    let admitted = plan_and_admit(
+        &mut coordinator,
+        "forged",
+        &[LaneSpec {
+            work: "work-forged",
+            role: "reader-forged",
+            route: "a",
+            scope: None,
+            write: false,
+            priority: 1,
+        }],
+        None,
+    )?;
+    let context = ExecutionContext::from(&admitted);
+    let lane = admitted.admitted_lanes[0].clone();
+    coordinator.start_attempt(context.clone(), lane.attempt_id.clone())?;
+    // Forge the lease: the presented binding no longer agrees with the
+    // admitted attempt on the exact typed lease, so intake fails closed.
+    let mut binding = observation_binding(&lane)?;
+    binding.lease_id = serde_json::from_value::<WorkLeaseId>(
+        serde_json::json!({"namespace": "eliot.governor.work-lease", "revision": "v1", "value": "lease-forged"}),
+    )?;
+    let mut submission = result_submission("forged", &lane, ResultDisposition::Partial)?;
+    submission.provider_result_receipt_ref = "proof-result-forged".to_owned();
+    let mut observation = matched_observation(&lane, &observation_binding(&lane)?)?;
+    observation.binding = binding;
+    observation.self_digest = observation.compute_digest()?;
+    submission.result.actual_route = observation;
+    assert_eq!(
+        coordinator.submit_result(context, submission).err(),
+        Some(CoordinatorError::IdentityConflict("execution_binding"))
+    );
+    Ok(())
+}
+
+#[test]
+fn invalid_candidate_selection_rejects_with_route_mismatch() -> TestResult {
+    use eliot_agent_api::{
+        CandidateSelectionDisposition, PolicyRevision, RejectedRouteCandidate,
+        RouteSelectionCandidate,
+    };
+    let valid = route("a");
+    let absent = route("b");
+    let candidate = RouteSelectionCandidate {
+        capability: "test-capability".to_owned(),
+        query_intent: "test-intent".to_owned(),
+        scope_ref: "scope:test".to_owned(),
+        policy_revision: PolicyRevision::new(3)?,
+        candidates: vec![valid],
+        selected: Some(absent),
+        rejected: Vec::<RejectedRouteCandidate>::new(),
+        selection: CandidateSelectionDisposition::Selected,
+        evidence_refs: vec!["evidence-1".to_owned()],
+    };
+    assert_eq!(candidate.validate(), Err(ContractError::RouteMismatch));
     Ok(())
 }

@@ -2,9 +2,9 @@ use std::collections::BTreeSet;
 
 use eliot_agent_api::{
     AgentLaunchRequest, AgentWorkUnitBrief, AllowedMode, AttemptId, AuthorityEpoch, BudgetEnvelope,
-    EffectCeiling, EffectKind, ExecutionUnit, LaunchRequestId, NativeSession,
+    EffectCeiling, EffectKind, ExecutionUnit, LaunchRequestId, LowercaseSha256, NativeSession,
     ProviderExecutionBinding, RequestId, ResourceGeneration, RouteFingerprint, StateFence, TaskId,
-    WorkLeaseId, WorkUnitId,
+    WorkLeaseId, WorkUnitId, candidate_digest_for,
 };
 use eliot_agent_contracts::RevisionId;
 use eliot_agent_coordinator::{
@@ -14,6 +14,7 @@ use eliot_agent_coordinator::{
     RoleProfileManifest, RouteCandidateEvidence, StaffingLaneRequest, StaffingPlanRequest,
     WorkerId,
 };
+use eliot_contracts::sha256_hex;
 use eliot_evaluation_contracts::BudgetEvidence;
 use eliot_security_contracts::PrivacyClass;
 
@@ -35,20 +36,26 @@ fn fence() -> StateFence {
 }
 
 fn route(name: &str) -> RouteFingerprint {
+    let digest = |seed: &str| {
+        serde_json::from_value::<LowercaseSha256>(serde_json::json!(sha256_hex(
+            format!("coordinator-fixture-{seed}-{name}").as_bytes()
+        )))
+        .expect("valid fixture digest")
+    };
     RouteFingerprint {
         host_family: "test-host".to_owned(),
         adapter: format!("adapter-{name}"),
         protocol_transport: "fixture".to_owned(),
-        runtime_hash: format!("runtime-{name}"),
-        adapter_hash: format!("adapter-hash-{name}"),
+        runtime_hash: digest("runtime"),
+        adapter_hash: digest("adapter"),
         provider: format!("provider-{name}"),
         model: format!("model-{name}"),
         auth_billing: "fixture-account".to_owned(),
-        serializer_hash: "serializer-v1".to_owned(),
-        tool_semantics_hash: "tools-v1".to_owned(),
+        serializer_hash: digest("serializer"),
+        tool_semantics_hash: digest("tools"),
         reasoning_mode: "bounded".to_owned(),
         continuation_behavior: "fresh".to_owned(),
-        feature_flags_hash: "features-v1".to_owned(),
+        feature_flags_hash: digest("features"),
     }
 }
 
@@ -178,11 +185,13 @@ fn planning_is_deterministic_and_uses_c0_13_route_evidence() -> TestResult {
     let mut coordinator = AgentCoordinator::new(config()?, gap())?;
     let candidate = coordinator.plan(request()?)?;
     assert_eq!(candidate.recipe_id.as_str(), "solo-verified-v1");
-    assert_eq!(
-        candidate.lanes[0].routing.budget_evidence.arm_id,
-        "route-arm-0"
+    assert!(
+        candidate.lanes[0]
+            .routing
+            .evidence_refs
+            .contains(&"route-evidence-0".to_owned())
     );
-    assert_eq!(candidate.lanes[0].routing.rejected_alternatives.len(), 1);
+    assert_eq!(candidate.lanes[0].routing.rejected.len(), 1);
     Ok(())
 }
 
@@ -208,7 +217,7 @@ fn caller_fabricated_admission_cannot_bypass_plan_gap() -> TestResult {
     let cfg = config()?;
     let mut coordinator = AgentCoordinator::new(cfg.clone(), gap())?;
     let candidate = coordinator.plan(request()?)?;
-    let routing_digest = eliot_agent_contracts::contract_shape_digest(&candidate.lanes[0].routing)?;
+    let routing_digest = candidate_digest_for(&candidate.lanes[0].routing)?;
     let forged_identity = ProviderIdentity {
         verifier_identity: "caller".to_owned(),
         a01_acceptance_receipt_ref: "forged-a01".to_owned(),
@@ -228,7 +237,9 @@ fn caller_fabricated_admission_cannot_bypass_plan_gap() -> TestResult {
         plan_revision: candidate.plan_revision.clone(),
         state_fence: candidate.state_fence.clone(),
         controller_epoch: AuthorityEpoch::new(1)?,
-        coordinator_lease: serde_json::from_value::<eliot_agent_api::WorkLeaseId>(serde_json::json!({"namespace": "eliot.governor.work-lease", "revision": "v1", "value": "lease-forged"}))?,
+        coordinator_lease: serde_json::from_value::<eliot_agent_api::WorkLeaseId>(
+            serde_json::json!({"namespace": "eliot.governor.work-lease", "revision": "v1", "value": "lease-forged"}),
+        )?,
         provider_identity: forged_identity,
         g11_admission_receipt_ref: "forged-g11-admission".to_owned(),
         durable_job_ref: "forged-job".to_owned(),
@@ -237,9 +248,15 @@ fn caller_fabricated_admission_cannot_bypass_plan_gap() -> TestResult {
             role_id: candidate.lanes[0].role_id.clone(),
             role_revision: candidate.lanes[0].role_revision.clone(),
             attempt_id: eliot_agent_api::AttemptId::new("attempt-forged")?,
-            lease_id: serde_json::from_value::<eliot_agent_api::WorkLeaseId>(serde_json::json!({"namespace": "eliot.governor.work-lease", "revision": "v1", "value": "work-lease-forged"}))?,
+            lease_id: serde_json::from_value::<eliot_agent_api::WorkLeaseId>(
+                serde_json::json!({"namespace": "eliot.governor.work-lease", "revision": "v1", "value": "work-lease-forged"}),
+            )?,
             worker_id: WorkerId::new("worker-forged")?,
-            route: candidate.lanes[0].routing.selected_route.clone(),
+            route: candidate.lanes[0]
+                .routing
+                .selected
+                .clone()
+                .ok_or("candidate must select a route")?,
             routing_receipt_digest: routing_digest,
             budget: candidate.lanes[0].budget.clone(),
             priority: candidate.lanes[0].priority,

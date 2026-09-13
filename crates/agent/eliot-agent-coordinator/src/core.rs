@@ -1,15 +1,17 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use eliot_agent_api::{
-    AgentAttempt, AttemptId, AttemptState, AuthorityEnvelope, CancellationState, ContinuityKind,
-    ContractError, EffectCeiling, EffectKind, ProviderExecutionBinding, ResultDisposition,
-    WorkLeaseId, validate_execution_binding,
+    AgentAttempt, AttemptId, AttemptState, AuthorityEnvelope, CancellationState,
+    CandidateSelectionDisposition, ContinuityKind, ContractError, EffectCeiling, EffectKind,
+    ProviderExecutionBinding, RejectedRouteCandidate, ResultDisposition, RouteSelectionCandidate,
+    WorkLeaseId, candidate_digest_for, validate_execution_binding,
 };
 use eliot_agent_contracts::{
     AgentAttemptId, CoordinationEntry, CoordinationMapView, DescendantTerminalState,
     LivePeerMessage, LivePeerMessageState, MessageId, ParentFinishCeiling, RevisionId, WorkItemId,
     contract_shape_digest,
 };
+use eliot_contracts::PolicyRevision;
 use eliot_receipts::ProofCeiling;
 use serde::Serialize;
 
@@ -23,10 +25,9 @@ use crate::model::{
     PlanGap, ProviderAdmissionReceipt, ProviderBindingSnapshot, ProviderCancellationReconciliation,
     ProviderExecutionBindingSubmission, ProviderIdentity, ProviderReassignmentReceipt,
     ProviderUnknownOutcomeReconciliation, ProviderWorkerFenceReceipt, ReassignmentId,
-    ReassignmentReceipt, RejectedRoute, ResultSubmission, RoleProfileManifest,
-    RouteCandidateEvidence, RouteRejectionReason, RoutingReceipt, StaffingLaneCandidate,
-    StaffingPlanCandidate, StaffingPlanRequest, SubmissionId, UnknownOutcomeFinalReceipt, WorkerId,
-    validate_text,
+    ReassignmentReceipt, ResultSubmission, RoleProfileManifest, RouteCandidateEvidence,
+    StaffingLaneCandidate, StaffingPlanCandidate, StaffingPlanRequest, SubmissionId,
+    UnknownOutcomeFinalReceipt, WorkerId, validate_text,
 };
 
 #[derive(Clone, Copy, Debug)]
@@ -301,11 +302,23 @@ impl AgentCoordinator {
             }
             let routing =
                 select_route(&self.config, &request, role, lane.route_candidates.clone())?;
+            let selected_route = routing
+                .selected
+                .clone()
+                .ok_or(CoordinatorError::RouteEvidence)?;
+            let selected_evidence = lane
+                .route_candidates
+                .iter()
+                .find(|evidence| evidence.route == selected_route)
+                .ok_or(CoordinatorError::RouteEvidence)?;
             lanes.push(StaffingLaneCandidate {
                 work_unit_id: lane.work_unit_id.clone(),
                 role_id: lane.role_id.clone(),
                 role_revision: role.manifest_revision.clone(),
                 routing,
+                capacity_identity: selected_evidence.capacity_identity.clone(),
+                capacity_revision: selected_evidence.capacity_revision.clone(),
+                capacity_limit: selected_evidence.capacity_limit,
                 budget: lane.budget.clone(),
                 priority: lane.priority,
                 mutation_scope: lane.mutation_scope.clone(),
@@ -319,8 +332,7 @@ impl AgentCoordinator {
                 .then_with(|| left.work_unit_id.cmp(&right.work_unit_id))
                 .then_with(|| left.role_id.cmp(&right.role_id))
                 .then_with(|| {
-                    route_key(&left.routing.selected_route)
-                        .cmp(&route_key(&right.routing.selected_route))
+                    selected_route_key(&left.routing).cmp(&selected_route_key(&right.routing))
                 })
         });
 
@@ -428,9 +440,20 @@ impl AgentCoordinator {
             let candidate_lane = candidate_lanes
                 .get(&lane_key)
                 .ok_or(CoordinatorError::IdentityConflict("admitted_lane"))?;
-            let routing_digest = contract_shape_digest(&candidate_lane.routing)
+            let routing_digest = candidate_digest_for(&candidate_lane.routing)
                 .map_err(|error| CoordinatorError::Serialization(error.to_string()))?;
-            if lane.route != candidate_lane.routing.selected_route
+            let selected_route = candidate_lane
+                .routing
+                .selected
+                .as_ref()
+                .ok_or(CoordinatorError::IdentityConflict("admitted_lane"))?;
+            // Candidate itself must still validate: an invalid selection
+            // (e.g. selected absent from set) rejects here, never at intake.
+            candidate_lane
+                .routing
+                .validate()
+                .map_err(provider_contract)?;
+            if lane.route != *selected_route
                 || lane.routing_receipt_digest != routing_digest
                 || lane.role_revision != candidate_lane.role_revision
                 || lane.budget != candidate_lane.budget
@@ -457,9 +480,9 @@ impl AgentCoordinator {
             }
             let capacity = RouteCapacityRequest {
                 requested: 1,
-                capacity_identity: candidate_lane.routing.capacity_identity.clone(),
-                capacity_revision: candidate_lane.routing.capacity_revision.clone(),
-                capacity_limit: candidate_lane.routing.capacity_limit,
+                capacity_identity: candidate_lane.capacity_identity.clone(),
+                capacity_revision: candidate_lane.capacity_revision.clone(),
+                capacity_limit: candidate_lane.capacity_limit,
             };
             match route_additions.entry(route_key(&lane.route)) {
                 std::collections::btree_map::Entry::Vacant(entry) => {
@@ -500,9 +523,9 @@ impl AgentCoordinator {
                 lease_id: lane.lease_id.clone(),
                 worker_id: lane.worker_id.clone(),
                 route: lane.route.clone(),
-                capacity_identity: candidate_lane.routing.capacity_identity.clone(),
-                capacity_revision: candidate_lane.routing.capacity_revision.clone(),
-                capacity_limit: candidate_lane.routing.capacity_limit,
+                capacity_identity: candidate_lane.capacity_identity.clone(),
+                capacity_revision: candidate_lane.capacity_revision.clone(),
+                capacity_limit: candidate_lane.capacity_limit,
                 budget: lane.budget.clone(),
                 priority: lane.priority,
                 mutation_scope: lane.mutation_scope.clone(),
@@ -1106,11 +1129,32 @@ impl AgentCoordinator {
             .validate(&work_unit.effect_ceiling)
             .map_err(provider_contract)?;
         let actual = &submission.result.actual_route;
-        if actual.requested != current.route
-            || actual.observed.as_ref() != Some(&current.route)
-            || actual.route_id.as_str().trim().is_empty()
-        {
+        // Requested must equal the admitted/assigned route; a mismatch is an
+        // invalid candidate selection and rejects. Observed divergence or
+        // absence is retained evidence (DIVERGED/UNOBSERVED) at a capped
+        // ceiling, never a mismatch rejection.
+        if actual.requested_route != current.route {
             return Err(CoordinatorError::RouteMismatch);
+        }
+        if actual.attempt_id != current.attempt_id {
+            return Err(CoordinatorError::IdentityConflict("attempt_id"));
+        }
+        // Binding-gated intake: an exact stored binding must match exactly;
+        // without a stored binding, the presented binding must still agree on
+        // attempt/lease/fence/route, otherwise it is forged and rejects.
+        if let Some(stored) = &current.provider_binding {
+            if &actual.binding != stored {
+                return Err(CoordinatorError::IdentityConflict("execution_binding"));
+            }
+        } else if actual.binding.attempt_id != current.attempt_id
+            || actual.binding.lease_id != current.lease_id
+            || actual.binding.state_fence != current.state_fence
+            || actual.binding.route != current.route
+        {
+            return Err(CoordinatorError::IdentityConflict("execution_binding"));
+        }
+        if actual.state_fence != current.state_fence {
+            return Err(CoordinatorError::IdentityConflict("execution_binding"));
         }
         if submission.result.disposition == ResultDisposition::CandidateSucceeded {
             self.require_descendant_closure(&current.attempt_id)?;
@@ -1825,7 +1869,7 @@ fn select_route(
     request: &StaffingPlanRequest,
     role: &RoleProfileManifest,
     mut candidates: Vec<RouteCandidateEvidence>,
-) -> Result<RoutingReceipt, CoordinatorError> {
+) -> Result<RouteSelectionCandidate, CoordinatorError> {
     if candidates.is_empty() {
         return Err(CoordinatorError::RouteEvidence);
     }
@@ -1865,23 +1909,45 @@ fn select_route(
             .then_with(|| route_key(&left.route).cmp(&route_key(&right.route)))
     });
     let selected = candidates.remove(0);
-    let rejected_alternatives = candidates
+    let all_routes = std::iter::once(selected.route.clone())
+        .chain(candidates.iter().map(|candidate| candidate.route.clone()))
+        .collect::<Vec<_>>();
+    let rejected = candidates
         .into_iter()
-        .map(|candidate| RejectedRoute {
+        .map(|candidate| RejectedRouteCandidate {
             route: candidate.route,
-            reason: RouteRejectionReason::LowerDeterministicRank,
+            reason_code: "LOWER_DETERMINISTIC_RANK".to_owned(),
+            evidence_ref: candidate.evidence_refs.first().cloned(),
         })
-        .collect();
-    Ok(RoutingReceipt {
-        selected_route: selected.route,
-        capacity_identity: selected.capacity_identity,
-        capacity_revision: selected.capacity_revision,
-        capacity_limit: selected.capacity_limit,
-        budget_evidence: selected.budget_evidence,
-        evidence_refs: selected.evidence_refs,
-        rejected_alternatives,
-        proof_ceiling: ProofCeiling::CandidateArtifact,
-    })
+        .collect::<Vec<_>>();
+    // Typed policy revision binds to the fence's policy revision when present;
+    // no bare-string parsing. Capability/intent/scope are deterministic
+    // staffing-lane projections, never admission claims.
+    let policy_revision = request
+        .state_fence
+        .policy_revision
+        .clone()
+        .unwrap_or_else(PolicyRevision::genesis);
+    let capability = role.required_competence.join("+");
+    let query_intent = request.candidate_id.as_str().to_owned();
+    let scope_ref = format!(
+        "{}:{}",
+        request.candidate_id.as_str(),
+        role.role_id.as_str()
+    );
+    let candidate = RouteSelectionCandidate {
+        capability,
+        query_intent,
+        scope_ref,
+        policy_revision,
+        candidates: all_routes,
+        selected: Some(selected.route.clone()),
+        rejected,
+        selection: CandidateSelectionDisposition::Selected,
+        evidence_refs: selected.evidence_refs.clone(),
+    };
+    candidate.validate().map_err(provider_contract)?;
+    Ok(candidate)
 }
 
 fn route_class_allowed(allowed_route_classes: &[String], provider: &str) -> bool {
@@ -1958,8 +2024,10 @@ fn validate_admitted_lane(lane: &crate::AdmittedLaneReceipt) -> Result<(), Coord
     // lease_id is the canonical `WorkLeaseId`: blank/control/boundary/length already
     // enforced by Deserialize; uniqueness and binding are enforced via `==`
     // (`leases` BTreeSet in `admit`, `validate_attempt_binding` lease equality).
+    // routing_receipt_digest is the typed `LowercaseSha256` candidate identity:
+    // form is enforced by Deserialize, exact value is recomputed in `admit`
+    // via `candidate_digest_for` (canonical JSON + SHA-256 hex).
     validate_text(lane.worker_id.as_str(), "worker_id")?;
-    validate_text(&lane.routing_receipt_digest, "routing_receipt_digest")?;
     lane.route.validate().map_err(provider_contract)?;
     lane.budget.validate().map_err(provider_contract)?;
     if let Some(scope) = &lane.mutation_scope {
@@ -2021,6 +2089,14 @@ fn route_key(route: &eliot_agent_api::RouteFingerprint) -> String {
     route
         .canonical_json()
         .unwrap_or_else(|_| "<invalid-route>".to_owned())
+}
+
+fn selected_route_key(candidate: &RouteSelectionCandidate) -> String {
+    candidate
+        .selected
+        .as_ref()
+        .map(route_key)
+        .unwrap_or_else(|| "<no-route>".to_owned())
 }
 
 fn canonical(value: &impl Serialize) -> Result<String, CoordinatorError> {

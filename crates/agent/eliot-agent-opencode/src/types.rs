@@ -1,5 +1,11 @@
 use std::{collections::BTreeMap, path::Path};
 
+use eliot_agent_api::{
+    AdmittedRouteReceipt, CONTRACT_VERSION, CancellationState, ClockReading, EventCursor,
+    ExecutionOutcome, LowercaseSha256, PhysicalRouteObservationReceipt, ProviderExecutionBinding,
+    RouteFingerprint, RouteObservationState, UsageReceipt, route_divergence_fields,
+};
+use eliot_contracts::{canonical_json_bytes, sha256_hex};
 use serde::{Deserialize, Deserializer, Serialize, Serializer, de, ser::SerializeMap};
 use serde_json::Value;
 
@@ -701,8 +707,27 @@ pub enum RunRequestError {
     InvalidMessageIdentity,
 }
 
+/// Adapter-internal OpenCode wire route record (PRIVATE_WIRE_PROJECTION).
+///
+/// Issue #369 (T4 S4, `workstreams/T4.md` §5.2): this is the provider-wire
+/// shape (`ModelSelection`, endpoint, directory, server/session fields plus
+/// forward-compatible unknown fields), not the shared canonical physical
+/// observation. It exists for wire decoding only: no Governor/coordinator
+/// public edge imports it as the canonical receipt (verified zero hits at
+/// this base). Conversion of its model/session/endpoint fields and
+/// unknown-field loss into the shared `PhysicalRouteObservationReceipt` is
+/// deferred until `eliot-agent-api` lands that owner; this crate must not
+/// duplicate the canonical type.
+///
+/// Loss visibility: `extra` preserves every unknown wire field through the
+/// flattened round-trip (never silently dropped). An unavailable record
+/// carries its reason under `extra["unavailable_reason"]` with no observed
+/// identity. `observed` is never defaulted from `requested`: `Observed`
+/// requires an explicit observed identity plus full bindings, `Unavailable`
+/// requires `observed: None` plus no identity (see
+/// [`OpenCodeWireRouteReceipt::validate`]).
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
-pub struct ActualRouteReceipt {
+pub struct OpenCodeWireRouteReceipt {
     pub requested: ModelSelection,
     pub observed: Option<ModelSelection>,
     pub provider: Option<String>,
@@ -712,18 +737,22 @@ pub struct ActualRouteReceipt {
     pub directory: Option<String>,
     pub server_version: Option<String>,
     pub workspace_id: Option<String>,
-    pub state: ActualRouteState,
+    pub state: OpenCodeWireRouteState,
     #[serde(flatten)]
     pub extra: UnknownFields,
 }
 
-impl<'de> Deserialize<'de> for ActualRouteReceipt {
+/// Compatibility alias for pre-rename importers outside `src/` (e.g. the
+/// `tests/` integration suite). New code uses [`OpenCodeWireRouteReceipt`].
+pub type ActualRouteReceipt = OpenCodeWireRouteReceipt;
+
+impl<'de> Deserialize<'de> for OpenCodeWireRouteReceipt {
     fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
     where
         D: Deserializer<'de>,
     {
         #[derive(Deserialize)]
-        struct RawActualRouteReceipt {
+        struct RawOpenCodeWireRouteReceipt {
             requested: ModelSelection,
             #[serde(default)]
             observed: Option<ModelSelection>,
@@ -741,12 +770,12 @@ impl<'de> Deserialize<'de> for ActualRouteReceipt {
             server_version: Option<String>,
             #[serde(default, alias = "workspaceID")]
             workspace_id: Option<String>,
-            state: ActualRouteState,
+            state: OpenCodeWireRouteState,
             #[serde(flatten)]
             extra: UnknownFields,
         }
 
-        let raw = RawActualRouteReceipt::deserialize(deserializer)?;
+        let raw = RawOpenCodeWireRouteReceipt::deserialize(deserializer)?;
         let receipt = Self {
             requested: raw.requested,
             observed: raw.observed,
@@ -765,7 +794,7 @@ impl<'de> Deserialize<'de> for ActualRouteReceipt {
     }
 }
 
-impl ActualRouteReceipt {
+impl OpenCodeWireRouteReceipt {
     pub fn observed(requested: ModelSelection, observed: ModelSelection) -> Self {
         Self {
             requested,
@@ -777,7 +806,7 @@ impl ActualRouteReceipt {
             directory: None,
             server_version: None,
             workspace_id: None,
-            state: ActualRouteState::Observed,
+            state: OpenCodeWireRouteState::Observed,
             extra: UnknownFields::new(),
         }
     }
@@ -798,31 +827,31 @@ impl ActualRouteReceipt {
             directory: None,
             server_version: None,
             workspace_id: None,
-            state: ActualRouteState::Unavailable,
+            state: OpenCodeWireRouteState::Unavailable,
             extra,
         }
     }
 
     pub fn is_observed(&self) -> bool {
-        self.state == ActualRouteState::Observed && self.observed.is_some()
+        self.state == OpenCodeWireRouteState::Observed && self.observed.is_some()
     }
 
-    pub fn validate(&self) -> Result<(), RouteReceiptError> {
+    pub fn validate(&self) -> Result<(), OpenCodeWireRouteError> {
         self.requested
             .validate()
-            .map_err(RouteReceiptError::InvalidRequestedModel)?;
+            .map_err(OpenCodeWireRouteError::InvalidRequestedModel)?;
         if let Some(observed) = &self.observed {
             observed
                 .validate()
-                .map_err(RouteReceiptError::InvalidObservedModel)?;
+                .map_err(OpenCodeWireRouteError::InvalidObservedModel)?;
         }
         match self.state {
-            ActualRouteState::Observed => {
+            OpenCodeWireRouteState::Observed => {
                 if self.observed.is_none() {
-                    return Err(RouteReceiptError::ObservedIdentityMissing);
+                    return Err(OpenCodeWireRouteError::ObservedIdentityMissing);
                 }
                 if is_blank(self.provider.as_deref()) {
-                    return Err(RouteReceiptError::ObservedProviderMissing);
+                    return Err(OpenCodeWireRouteError::ObservedProviderMissing);
                 }
                 if self.provider.as_deref()
                     != self
@@ -830,41 +859,41 @@ impl ActualRouteReceipt {
                         .as_ref()
                         .map(|model| model.provider_id.as_str())
                 {
-                    return Err(RouteReceiptError::ObservedProviderMismatch);
+                    return Err(OpenCodeWireRouteError::ObservedProviderMismatch);
                 }
                 let endpoint = self
                     .endpoint
                     .as_deref()
-                    .ok_or(RouteReceiptError::ObservedEndpointMissing)?;
+                    .ok_or(OpenCodeWireRouteError::ObservedEndpointMissing)?;
                 if crate::LoopbackEndpoint::parse(endpoint).is_err() {
-                    return Err(RouteReceiptError::ObservedEndpointNotLoopback);
+                    return Err(OpenCodeWireRouteError::ObservedEndpointNotLoopback);
                 }
                 if is_blank(self.route_fingerprint.as_deref()) {
-                    return Err(RouteReceiptError::ObservedRouteFingerprintMissing);
+                    return Err(OpenCodeWireRouteError::ObservedRouteFingerprintMissing);
                 }
                 if is_blank(self.session_id.as_deref()) {
-                    return Err(RouteReceiptError::ObservedSessionIdentityMissing);
+                    return Err(OpenCodeWireRouteError::ObservedSessionIdentityMissing);
                 }
                 let directory = self
                     .directory
                     .as_deref()
-                    .ok_or(RouteReceiptError::ObservedDirectoryMissing)?;
+                    .ok_or(OpenCodeWireRouteError::ObservedDirectoryMissing)?;
                 if !Path::new(directory).is_absolute() {
-                    return Err(RouteReceiptError::ObservedDirectoryNotAbsolute);
+                    return Err(OpenCodeWireRouteError::ObservedDirectoryNotAbsolute);
                 }
                 if is_blank(self.server_version.as_deref()) {
-                    return Err(RouteReceiptError::ObservedServerVersionMissing);
+                    return Err(OpenCodeWireRouteError::ObservedServerVersionMissing);
                 }
                 if self
                     .workspace_id
                     .as_deref()
                     .is_some_and(|workspace| workspace.trim().is_empty())
                 {
-                    return Err(RouteReceiptError::ObservedWorkspaceIdentityBlank);
+                    return Err(OpenCodeWireRouteError::ObservedWorkspaceIdentityBlank);
                 }
                 Ok(())
             }
-            ActualRouteState::Unavailable => {
+            OpenCodeWireRouteState::Unavailable => {
                 if self.observed.is_some()
                     || self.provider.is_some()
                     || self.endpoint.is_some()
@@ -874,13 +903,188 @@ impl ActualRouteReceipt {
                     || self.server_version.is_some()
                     || self.workspace_id.is_some()
                 {
-                    Err(RouteReceiptError::UnavailableHasIdentity)
+                    Err(OpenCodeWireRouteError::UnavailableHasIdentity)
                 } else {
                     Ok(())
                 }
             }
         }
     }
+
+    /// Total versioned loss-visible conversion into the shared canonical
+    /// [`PhysicalRouteObservationReceipt`].
+    ///
+    /// - Unknown wire fields are never dropped: a non-empty `extra` map is
+    ///   hashed into `raw_evidence_digest`/`raw_evidence_ref` (loss handle).
+    /// - Missing observed identity never synthesizes `observed = requested`:
+    ///   `Unavailable` becomes `UNOBSERVED` with an explicit reason plus
+    ///   `UNKNOWN_OUTCOME` quarantine (`recovery_ref`).
+    /// - `Observed` never defaults to `MATCHED`: the observed fingerprint is
+    ///   built from the requested fingerprint with provider/model replaced
+    ///   from the wire, then classified via `route_divergence_fields`
+    ///   (`Matched` only when field-complete equal, else `Diverged` with the
+    ///   exact difference set and a quarantine `recovery_ref`).
+    /// - Session/route agreement and admission/binding linkage are enforced
+    ///   via [`PhysicalRouteObservationReceipt::validate_against`]; a forged
+    ///   binding or mismatched admission rejects.
+    #[allow(clippy::too_many_arguments)]
+    pub fn to_physical_observation(
+        &self,
+        requested: &RouteFingerprint,
+        admission: &AdmittedRouteReceipt,
+        binding: &ProviderExecutionBinding,
+        usage: UsageReceipt,
+        started: ClockReading,
+        first_byte: ClockReading,
+        first_semantic: ClockReading,
+        terminal: ClockReading,
+        event_cursor: EventCursor,
+        event_sequence: u64,
+        cancellation: Option<CancellationState>,
+    ) -> Result<PhysicalRouteObservationReceipt, OpenCodeObservationConversionError> {
+        self.validate()?;
+        // Requested wire identity must agree with the canonical requested
+        // route; the observed side is built below, never defaulted.
+        if requested.provider != self.requested.provider_id
+            || requested.model != self.requested.model_id
+        {
+            return Err(eliot_agent_api::ContractError::BindingMismatch.into());
+        }
+        if binding.route != *requested {
+            return Err(eliot_agent_api::ContractError::BindingMismatch.into());
+        }
+        let (observed_route, route_state, diverged_fields, unobserved_reason) = match self.state {
+            OpenCodeWireRouteState::Unavailable => {
+                let reason = self
+                    .extra
+                    .get("unavailable_reason")
+                    .and_then(Value::as_str)
+                    .unwrap_or("opencode wire unavailable")
+                    .to_owned();
+                (
+                    None,
+                    RouteObservationState::Unobserved,
+                    Vec::new(),
+                    Some(reason),
+                )
+            }
+            OpenCodeWireRouteState::Observed => {
+                let observed_wire =
+                    self.observed
+                        .as_ref()
+                        .ok_or(OpenCodeObservationConversionError::Wire(
+                            OpenCodeWireRouteError::ObservedIdentityMissing,
+                        ))?;
+                let mut observed_fp = requested.clone();
+                observed_fp.provider = observed_wire.provider_id.clone();
+                observed_fp.model = observed_wire.model_id.clone();
+                let diverged = route_divergence_fields(requested, &observed_fp);
+                let state = if diverged.is_empty() {
+                    RouteObservationState::Matched
+                } else {
+                    RouteObservationState::Diverged
+                };
+                (Some(observed_fp), state, diverged, None)
+            }
+        };
+        // Loss handle: every unknown wire field stays addressable by digest.
+        let (raw_evidence_digest, raw_evidence_ref) = if self.extra.is_empty() {
+            (None, None)
+        } else {
+            let bytes = canonical_json_bytes(&self.extra).map_err(|error| {
+                OpenCodeObservationConversionError::Serialization(error.to_string())
+            })?;
+            let hex = sha256_hex(&bytes);
+            let digest: LowercaseSha256 =
+                serde_json::from_value(Value::String(hex)).map_err(|error| {
+                    OpenCodeObservationConversionError::Serialization(error.to_string())
+                })?;
+            let reference = format!("opencode-wire-extra:{}", digest.as_str());
+            (Some(digest), Some(reference))
+        };
+        // Execution axis follows the route axis without collapsing them:
+        // unavailable implies unknown outcome with quarantine; observed keeps
+        // the caller-supplied terminal/cancellation and gains a quarantine
+        // handle exactly when diverged.
+        let (execution_outcome, terminal, cancellation, recovery_ref) = match route_state {
+            RouteObservationState::Unobserved => (
+                ExecutionOutcome::UnknownOutcome,
+                ClockReading::default(),
+                None,
+                Some("opencode-unobserved-recovery".to_owned()),
+            ),
+            RouteObservationState::Matched => {
+                (ExecutionOutcome::Observed, terminal, cancellation, None)
+            }
+            RouteObservationState::Diverged => (
+                ExecutionOutcome::Observed,
+                terminal,
+                cancellation,
+                Some("opencode-diverged-quarantine".to_owned()),
+            ),
+        };
+        let request_bytes = canonical_json_bytes(&self.requested).map_err(|error| {
+            OpenCodeObservationConversionError::Serialization(error.to_string())
+        })?;
+        let request_digest: LowercaseSha256 =
+            serde_json::from_value(Value::String(sha256_hex(&request_bytes))).map_err(|error| {
+                OpenCodeObservationConversionError::Serialization(error.to_string())
+            })?;
+        let mut observation = PhysicalRouteObservationReceipt {
+            schema_version: CONTRACT_VERSION.to_owned(),
+            attempt_id: binding.attempt_id.clone(),
+            state_fence: binding.state_fence.clone(),
+            runtime_generation: binding.runtime_generation,
+            admitted_route_digest: admission.self_digest.clone(),
+            binding: binding.clone(),
+            requested_route: requested.clone(),
+            observed_route,
+            route_state,
+            diverged_fields,
+            execution_outcome,
+            request_digest,
+            translation_digest: None,
+            raw_evidence_digest,
+            raw_evidence_ref,
+            usage,
+            started,
+            first_byte,
+            first_semantic,
+            terminal,
+            event_cursor,
+            event_sequence,
+            cancellation,
+            unobserved_reason,
+            recovery_ref,
+            safe_public_error: None,
+            restricted_raw_error_ref: None,
+            self_digest: serde_json::from_value(Value::String(
+                "0000000000000000000000000000000000000000000000000000000000000000".to_owned(),
+            ))
+            .map_err(|error| {
+                OpenCodeObservationConversionError::Serialization(error.to_string())
+            })?,
+        };
+        observation.self_digest = observation.compute_digest().map_err(|error| {
+            OpenCodeObservationConversionError::Serialization(error.to_string())
+        })?;
+        observation.validate()?;
+        observation.validate_against(binding, admission)?;
+        Ok(observation)
+    }
+}
+
+/// Conversion failures for [`OpenCodeWireRouteReceipt::to_physical_observation`].
+/// Wire-shape failures stay wire-typed; linkage/shape failures stay
+/// contract-typed; neither is silently upgraded.
+#[derive(Clone, Debug, Eq, PartialEq, thiserror::Error)]
+pub enum OpenCodeObservationConversionError {
+    #[error("opencode wire route is invalid: {0}")]
+    Wire(#[from] OpenCodeWireRouteError),
+    #[error("physical observation contract rejected: {0}")]
+    Contract(#[from] eliot_agent_api::ContractError),
+    #[error("observation conversion serialization failed: {0}")]
+    Serialization(String),
 }
 
 fn is_blank(value: Option<&str>) -> bool {
@@ -888,7 +1092,7 @@ fn is_blank(value: Option<&str>) -> bool {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, thiserror::Error)]
-pub enum RouteReceiptError {
+pub enum OpenCodeWireRouteError {
     #[error("requested route model is invalid: {0}")]
     InvalidRequestedModel(ModelSelectionError),
     #[error("observed route model is invalid: {0}")]
@@ -921,10 +1125,19 @@ pub enum RouteReceiptError {
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
-pub enum ActualRouteState {
+pub enum OpenCodeWireRouteState {
     Observed,
     Unavailable,
 }
+
+/// Compatibility alias for pre-rename importers outside `src/`. New code
+/// uses [`OpenCodeWireRouteState`]; the serialized wire (`observed` /
+/// `unavailable`) is unchanged.
+pub type ActualRouteState = OpenCodeWireRouteState;
+
+/// Compatibility alias for pre-rename importers. New code uses
+/// [`OpenCodeWireRouteError`]; every variant and message is unchanged.
+pub type RouteReceiptError = OpenCodeWireRouteError;
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 pub struct UsageTelemetry {
@@ -1011,7 +1224,7 @@ pub struct NoAuthorityRunResult {
     pub status: RunStatus,
     pub candidate_only: bool,
     pub authority: AuthorityCeiling,
-    pub actual_route: ActualRouteReceipt,
+    pub actual_route: OpenCodeWireRouteReceipt,
     pub usage: UsageAvailability,
     pub quota: QuotaAvailability,
     #[serde(default, alias = "sessionID")]
@@ -1039,7 +1252,7 @@ impl<'de> Deserialize<'de> for NoAuthorityRunResult {
             status: RunStatus,
             candidate_only: bool,
             authority: AuthorityCeiling,
-            actual_route: ActualRouteReceipt,
+            actual_route: OpenCodeWireRouteReceipt,
             usage: UsageAvailability,
             quota: QuotaAvailability,
             #[serde(default, alias = "sessionID")]
@@ -1061,7 +1274,7 @@ impl<'de> Deserialize<'de> for NoAuthorityRunResult {
             ));
         }
         raw.actual_route.validate().map_err(de::Error::custom)?;
-        if raw.actual_route.state == ActualRouteState::Observed
+        if raw.actual_route.state == OpenCodeWireRouteState::Observed
             && raw.session_id.as_deref() != raw.actual_route.session_id.as_deref()
         {
             return Err(de::Error::custom(
@@ -1246,7 +1459,7 @@ mod tests {
     #[test]
     fn result_rejects_authority_overclaim_and_records_unavailable_telemetry()
     -> Result<(), Box<dyn std::error::Error>> {
-        let route = ActualRouteReceipt::unavailable(model()?, "server did not attest route");
+        let route = OpenCodeWireRouteReceipt::unavailable(model()?, "server did not attest route");
         let result = NoAuthorityRunResult {
             status: RunStatus::Unknown,
             candidate_only: true,
@@ -1271,8 +1484,8 @@ mod tests {
         Ok(())
     }
 
-    fn observed_route_receipt() -> Result<ActualRouteReceipt, ModelSelectionError> {
-        Ok(ActualRouteReceipt {
+    fn observed_wire_receipt() -> Result<OpenCodeWireRouteReceipt, ModelSelectionError> {
+        Ok(OpenCodeWireRouteReceipt {
             requested: model()?,
             observed: Some(model()?),
             provider: Some("opencode-go".to_owned()),
@@ -1282,7 +1495,7 @@ mod tests {
             directory: Some(r"C:\Scratch".to_owned()),
             server_version: Some("1.4.3".to_owned()),
             workspace_id: Some("workspace-1".to_owned()),
-            state: ActualRouteState::Observed,
+            state: OpenCodeWireRouteState::Observed,
             extra: UnknownFields::new(),
         })
     }
@@ -1290,12 +1503,12 @@ mod tests {
     #[test]
     fn route_receipt_requires_observed_bindings_and_round_trips()
     -> Result<(), Box<dyn std::error::Error>> {
-        let receipt = observed_route_receipt()?;
+        let receipt = observed_wire_receipt()?;
         receipt.validate()?;
         let wire = serde_json::to_value(&receipt)?;
         assert_eq!(wire["session_id"], json!("ses_1"));
         assert_eq!(wire["workspace_id"], json!("workspace-1"));
-        let decoded: ActualRouteReceipt = serde_json::from_value(wire.clone())?;
+        let decoded: OpenCodeWireRouteReceipt = serde_json::from_value(wire.clone())?;
         assert_eq!(decoded, receipt);
 
         let aliases = json!({
@@ -1311,31 +1524,34 @@ mod tests {
             "state": "observed"
         });
         assert_eq!(
-            serde_json::from_value::<ActualRouteReceipt>(aliases)?,
+            serde_json::from_value::<OpenCodeWireRouteReceipt>(aliases)?,
             receipt
         );
 
         for (field, expected) in [
-            ("provider", RouteReceiptError::ObservedProviderMissing),
-            ("endpoint", RouteReceiptError::ObservedEndpointMissing),
+            ("provider", OpenCodeWireRouteError::ObservedProviderMissing),
+            ("endpoint", OpenCodeWireRouteError::ObservedEndpointMissing),
             (
                 "route_fingerprint",
-                RouteReceiptError::ObservedRouteFingerprintMissing,
+                OpenCodeWireRouteError::ObservedRouteFingerprintMissing,
             ),
             (
                 "session_id",
-                RouteReceiptError::ObservedSessionIdentityMissing,
+                OpenCodeWireRouteError::ObservedSessionIdentityMissing,
             ),
-            ("directory", RouteReceiptError::ObservedDirectoryMissing),
+            (
+                "directory",
+                OpenCodeWireRouteError::ObservedDirectoryMissing,
+            ),
             (
                 "server_version",
-                RouteReceiptError::ObservedServerVersionMissing,
+                OpenCodeWireRouteError::ObservedServerVersionMissing,
             ),
         ] {
             let mut invalid = wire.clone();
             invalid[field] = Value::Null;
             assert!(matches!(
-                serde_json::from_value::<ActualRouteReceipt>(invalid),
+                serde_json::from_value::<OpenCodeWireRouteReceipt>(invalid),
                 Err(error) if error.to_string().contains(&expected.to_string())
             ));
         }
@@ -1344,9 +1560,9 @@ mod tests {
             let mut invalid = wire.clone();
             invalid["endpoint"] = json!(endpoint);
             assert!(matches!(
-                serde_json::from_value::<ActualRouteReceipt>(invalid),
+                serde_json::from_value::<OpenCodeWireRouteReceipt>(invalid),
                 Err(error) if error.to_string().contains(
-                    &RouteReceiptError::ObservedEndpointNotLoopback.to_string()
+                    &OpenCodeWireRouteError::ObservedEndpointNotLoopback.to_string()
                 )
             ));
         }
@@ -1354,30 +1570,30 @@ mod tests {
         let mut invalid_directory = wire.clone();
         invalid_directory["directory"] = json!("relative/path");
         assert!(matches!(
-            serde_json::from_value::<ActualRouteReceipt>(invalid_directory),
+            serde_json::from_value::<OpenCodeWireRouteReceipt>(invalid_directory),
             Err(error) if error.to_string().contains(
-                &RouteReceiptError::ObservedDirectoryNotAbsolute.to_string()
+                &OpenCodeWireRouteError::ObservedDirectoryNotAbsolute.to_string()
             )
         ));
 
         let mut invalid_workspace = wire.clone();
         invalid_workspace["workspace_id"] = json!(" ");
         assert!(matches!(
-            serde_json::from_value::<ActualRouteReceipt>(invalid_workspace),
+            serde_json::from_value::<OpenCodeWireRouteReceipt>(invalid_workspace),
             Err(error) if error.to_string().contains(
-                &RouteReceiptError::ObservedWorkspaceIdentityBlank.to_string()
+                &OpenCodeWireRouteError::ObservedWorkspaceIdentityBlank.to_string()
             )
         ));
 
-        let mut unavailable = serde_json::to_value(ActualRouteReceipt::unavailable(
+        let mut unavailable = serde_json::to_value(OpenCodeWireRouteReceipt::unavailable(
             model()?,
             "route unavailable",
         ))?;
         unavailable["server_version"] = json!("1.4.3");
         assert!(matches!(
-            serde_json::from_value::<ActualRouteReceipt>(unavailable),
+            serde_json::from_value::<OpenCodeWireRouteReceipt>(unavailable),
             Err(error) if error.to_string().contains(
-                &RouteReceiptError::UnavailableHasIdentity.to_string()
+                &OpenCodeWireRouteError::UnavailableHasIdentity.to_string()
             )
         ));
         Ok(())
@@ -1423,6 +1639,329 @@ mod tests {
             &assistant.parts[1],
             MessagePart::Permission { permission, .. } if permission == "read"
         ));
+        Ok(())
+    }
+
+    #[test]
+    fn wire_projection_is_not_the_canonical_physical_shape()
+    -> Result<(), Box<dyn std::error::Error>> {
+        // PRIVATE_WIRE_PROJECTION: the adapter wire record carries
+        // provider/endpoint/session wire bindings and none of the canonical
+        // api fields (`route_id`, `usage`, `started_at`, `terminal_at`).
+        let receipt = observed_wire_receipt()?;
+        let wire = serde_json::to_value(&receipt)?;
+        let map = wire.as_object().expect("wire object");
+        for canonical_only in ["route_id", "usage", "started_at", "terminal_at"] {
+            assert!(!map.contains_key(canonical_only));
+        }
+        for wire_binding in [
+            "provider",
+            "endpoint",
+            "route_fingerprint",
+            "session_id",
+            "directory",
+            "server_version",
+            "state",
+        ] {
+            assert!(map.contains_key(wire_binding));
+        }
+        // The pre-rename alias decodes the same wire for importers outside
+        // `src/`; both spellings agree byte-for-byte.
+        let via_alias: ActualRouteReceipt = serde_json::from_value(wire.clone())?;
+        assert_eq!(via_alias, receipt);
+        Ok(())
+    }
+
+    #[test]
+    fn wire_observed_is_never_defaulted_from_requested() -> Result<(), Box<dyn std::error::Error>> {
+        // `state: observed` without an explicit observed identity fails with
+        // the typed missing-identity error instead of echoing `requested`.
+        let missing_observed = json!({
+            "requested": {"providerID": "opencode-go", "modelID": "deepseek-v4-flash"},
+            "provider": "opencode-go",
+            "endpoint": "http://127.0.0.1:4096",
+            "route_fingerprint": "sha256:route",
+            "session_id": "ses_1",
+            "directory": "C:\\Scratch",
+            "server_version": "1.4.3",
+            "state": "observed"
+        });
+        assert!(matches!(
+            serde_json::from_value::<OpenCodeWireRouteReceipt>(missing_observed),
+            Err(error) if error.to_string().contains(
+                &OpenCodeWireRouteError::ObservedIdentityMissing.to_string()
+            )
+        ));
+        // `state: unavailable` smuggling any observed identity is rejected.
+        let mut smuggled = serde_json::to_value(OpenCodeWireRouteReceipt::unavailable(
+            model()?,
+            "route unavailable",
+        ))?;
+        smuggled["provider"] = json!("opencode-go");
+        assert!(matches!(
+            serde_json::from_value::<OpenCodeWireRouteReceipt>(smuggled),
+            Err(error) if error.to_string().contains(
+                &OpenCodeWireRouteError::UnavailableHasIdentity.to_string()
+            )
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn wire_unavailable_reason_is_explicit_and_identity_free()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let receipt =
+            OpenCodeWireRouteReceipt::unavailable(model()?, "server did not attest route");
+        assert!(!receipt.is_observed());
+        assert_eq!(receipt.observed, None);
+        assert_eq!(
+            receipt.extra.get("unavailable_reason"),
+            Some(&json!("server did not attest route"))
+        );
+        receipt.validate()?;
+        Ok(())
+    }
+
+    #[test]
+    fn wire_unknown_fields_stay_loss_visible() -> Result<(), Box<dyn std::error::Error>> {
+        let mut wire = serde_json::to_value(observed_wire_receipt()?)?;
+        wire["future_wire_field"] = json!({"kept": true});
+        let decoded: OpenCodeWireRouteReceipt = serde_json::from_value(wire.clone())?;
+        assert_eq!(decoded.extra["future_wire_field"], json!({"kept": true}));
+        assert_eq!(serde_json::to_value(&decoded)?, wire);
+        Ok(())
+    }
+
+    #[test]
+    fn wire_result_rejects_session_divergence() -> Result<(), Box<dyn std::error::Error>> {
+        let result = NoAuthorityRunResult {
+            status: RunStatus::Unknown,
+            candidate_only: true,
+            authority: AuthorityCeiling::CandidateOnly,
+            actual_route: observed_wire_receipt()?,
+            usage: UsageAvailability::unavailable("usage endpoint unavailable"),
+            quota: QuotaAvailability::unavailable("quota endpoint unavailable"),
+            session_id: Some("ses_other".to_owned()),
+            output: None,
+            events: Vec::new(),
+            diff: Vec::new(),
+            extra: UnknownFields::new(),
+        };
+        let wire = serde_json::to_value(&result)?;
+        assert!(serde_json::from_value::<NoAuthorityRunResult>(wire).is_err());
+        Ok(())
+    }
+
+    fn conversion_digest(seed: &str) -> LowercaseSha256 {
+        serde_json::from_value(json!(eliot_contracts::sha256_hex(
+            format!("opencode-conversion-{seed}").as_bytes()
+        )))
+        .expect("valid fixture digest")
+    }
+
+    fn conversion_route() -> RouteFingerprint {
+        RouteFingerprint {
+            host_family: "opencode".to_owned(),
+            adapter: "eliot-agent-opencode".to_owned(),
+            protocol_transport: "http+sse".to_owned(),
+            runtime_hash: conversion_digest("runtime"),
+            adapter_hash: conversion_digest("adapter"),
+            provider: "opencode-go".to_owned(),
+            model: "deepseek-v4-flash".to_owned(),
+            auth_billing: "interactive-user".to_owned(),
+            serializer_hash: conversion_digest("serializer"),
+            tool_semantics_hash: conversion_digest("tools"),
+            reasoning_mode: "catalogue-default".to_owned(),
+            continuation_behavior: "native-resume".to_owned(),
+            feature_flags_hash: conversion_digest("features"),
+        }
+    }
+
+    fn conversion_binding(
+        route: &RouteFingerprint,
+    ) -> Result<ProviderExecutionBinding, Box<dyn std::error::Error>> {
+        use eliot_agent_api::{
+            AttemptId, ExecutionUnit, NativeSession, NativeSessionLocator, RequestId, WorkLeaseId,
+        };
+        use eliot_contracts::{AuthorityEpoch, ResourceGeneration, StateFence};
+        let fence = StateFence::new(AuthorityEpoch::new(1)?, ResourceGeneration::new(1)?);
+        Ok(ProviderExecutionBinding {
+            attempt_id: AttemptId::new("attempt-opencode")?,
+            lease_id: serde_json::from_value(
+                serde_json::json!({"namespace": "eliot.governor.work-lease", "revision": "v1", "value": "lease-opencode"}),
+            )?,
+            state_fence: fence.clone(),
+            runtime_generation: ResourceGeneration::new(1)?,
+            route: route.clone(),
+            session_id: None,
+            provider_scope_ref: "scope:test".to_owned(),
+            native_session: NativeSession::Native(NativeSessionLocator::new("ses_1")?),
+            execution_unit: ExecutionUnit::new("opencode", "unit-1")?,
+            start_request_id: RequestId::new("req-1")?,
+            start_request_sha256: eliot_contracts::sha256_hex(b"req-1"),
+        })
+    }
+
+    fn conversion_admission(
+        binding: &ProviderExecutionBinding,
+    ) -> Result<AdmittedRouteReceipt, Box<dyn std::error::Error>> {
+        use eliot_agent_api::{
+            CandidateSelectionDisposition, PolicyRevision, RouteSelectionCandidate,
+            candidate_digest_for,
+        };
+        use eliot_contracts::DecisionId;
+        let candidate = RouteSelectionCandidate {
+            capability: "opencode".to_owned(),
+            query_intent: "test-intent".to_owned(),
+            scope_ref: "scope:test".to_owned(),
+            policy_revision: PolicyRevision::new(3)?,
+            candidates: vec![binding.route.clone()],
+            selected: Some(binding.route.clone()),
+            rejected: Vec::new(),
+            selection: CandidateSelectionDisposition::Selected,
+            evidence_refs: vec!["evidence-1".to_owned()],
+        };
+        candidate.validate()?;
+        let zero: LowercaseSha256 = serde_json::from_value(json!(
+            "0000000000000000000000000000000000000000000000000000000000000000"
+        ))?;
+        let mut receipt = AdmittedRouteReceipt {
+            schema_version: CONTRACT_VERSION.to_owned(),
+            decision_id: DecisionId::new("decision-opencode")?,
+            candidate_digest: candidate_digest_for(&candidate)?,
+            attempt_id: binding.attempt_id.clone(),
+            lease_id: binding.lease_id.clone(),
+            state_fence: binding.state_fence.clone(),
+            runtime_generation: binding.runtime_generation,
+            policy_revision: PolicyRevision::new(3)?,
+            requested_route: binding.route.clone(),
+            selected_route: Some(binding.route.clone()),
+            no_route: None,
+            evidence_refs: vec!["evidence-1".to_owned()],
+            proof_ceiling: eliot_agent_api::ProofCeiling::CandidateArtifact,
+            self_digest: zero,
+        };
+        receipt.self_digest = receipt.compute_digest()?;
+        receipt.validate()?;
+        Ok(receipt)
+    }
+
+    fn conversion_usage() -> UsageReceipt {
+        UsageReceipt {
+            input_tokens: None,
+            output_tokens: None,
+            cost_microunits: None,
+            quota: eliot_agent_api::QuotaKnowledge::Unknown,
+        }
+    }
+
+    #[test]
+    fn wire_observed_converts_to_matched_without_synthesis()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let requested = conversion_route();
+        let binding = conversion_binding(&requested)?;
+        let admission = conversion_admission(&binding)?;
+        let wire = observed_wire_receipt()?;
+        let observation = wire.to_physical_observation(
+            &requested,
+            &admission,
+            &binding,
+            conversion_usage(),
+            ClockReading::default(),
+            ClockReading::default(),
+            ClockReading::default(),
+            ClockReading {
+                valid_time_ms: Some(2_000),
+                known_time_ms: Some(2_001),
+                transaction_sequence: None,
+                monotonic_ns: None,
+            },
+            EventCursor::new("opencode-test-1")?,
+            1,
+            None,
+        )?;
+        assert_eq!(observation.route_state, RouteObservationState::Matched);
+        assert_eq!(observation.observed_route.as_ref(), Some(&requested));
+        assert_eq!(observation.requested_route, requested);
+        assert!(observation.diverged_fields.is_empty());
+        observation.validate_against(&binding, &admission)?;
+        Ok(())
+    }
+
+    #[test]
+    fn wire_observed_with_different_model_converts_to_diverged_with_quarantine()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let requested = conversion_route();
+        let binding = conversion_binding(&requested)?;
+        let admission = conversion_admission(&binding)?;
+        let mut wire = observed_wire_receipt()?;
+        wire.observed = Some(ModelSelection::new("other-provider", "other-model")?);
+        wire.provider = Some("other-provider".to_owned());
+        let observation = wire.to_physical_observation(
+            &requested,
+            &admission,
+            &binding,
+            conversion_usage(),
+            ClockReading::default(),
+            ClockReading::default(),
+            ClockReading::default(),
+            ClockReading {
+                valid_time_ms: Some(2_000),
+                known_time_ms: Some(2_001),
+                transaction_sequence: None,
+                monotonic_ns: None,
+            },
+            EventCursor::new("opencode-test-2")?,
+            2,
+            None,
+        )?;
+        assert_eq!(observation.route_state, RouteObservationState::Diverged);
+        assert_ne!(observation.observed_route.as_ref(), Some(&requested));
+        assert!(!observation.diverged_fields.is_empty());
+        assert!(observation.recovery_ref.is_some());
+        observation.validate_against(&binding, &admission)?;
+        Ok(())
+    }
+
+    #[test]
+    fn wire_unavailable_converts_to_unobserved_with_reason_and_loss_handle()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let requested = conversion_route();
+        let binding = conversion_binding(&requested)?;
+        let admission = conversion_admission(&binding)?;
+        let mut wire =
+            OpenCodeWireRouteReceipt::unavailable(model()?, "server did not attest route");
+        wire.extra
+            .insert("future_wire_field".to_owned(), json!({"kept": true}));
+        let observation = wire.to_physical_observation(
+            &requested,
+            &admission,
+            &binding,
+            conversion_usage(),
+            ClockReading::default(),
+            ClockReading::default(),
+            ClockReading::default(),
+            ClockReading::default(),
+            EventCursor::new("opencode-test-3")?,
+            3,
+            None,
+        )?;
+        // Missing observed is never synthesized from requested.
+        assert_eq!(observation.route_state, RouteObservationState::Unobserved);
+        assert_eq!(observation.observed_route, None);
+        assert_eq!(
+            observation.unobserved_reason.as_deref(),
+            Some("server did not attest route")
+        );
+        assert_eq!(
+            observation.execution_outcome,
+            ExecutionOutcome::UnknownOutcome
+        );
+        assert!(observation.recovery_ref.is_some());
+        // Unknown fields stay loss-visible via the raw-evidence digest handle.
+        assert!(observation.raw_evidence_digest.is_some());
+        assert!(observation.raw_evidence_ref.is_some());
+        observation.validate_against(&binding, &admission)?;
         Ok(())
     }
 }

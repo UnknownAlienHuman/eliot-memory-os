@@ -1,12 +1,13 @@
 use eliot_agent_api::{
-    ActualRouteReceipt, AgentLaunchRequest, AgentResult, AttemptId, AuthorityEpoch, BudgetEnvelope,
-    CancelReason, LaunchRequestId, ProviderExecutionBinding, ResultDisposition, RouteFingerprint,
-    StateFence, TaskId, WorkLeaseId, WorkUnitId,
+    AgentLaunchRequest, AgentResult, AttemptId, AuthorityEpoch, BudgetEnvelope, CancelReason,
+    LaunchRequestId, PhysicalRouteObservationReceipt, ProviderExecutionBinding, ResultDisposition,
+    RouteFingerprint, RouteSelectionCandidate, StateFence, TaskId, WorkLeaseId, WorkUnitId,
 };
 use eliot_agent_contracts::{
     DescendantClosureReceipt, LivePeerMessage, LivePeerMessageState, MessageId,
     ParentFinishCeiling, RevisionId,
 };
+use eliot_contracts::LowercaseSha256;
 use eliot_evaluation_contracts::BudgetEvidence;
 use eliot_receipts::ProofCeiling;
 use eliot_security_contracts::PrivacyClass;
@@ -195,32 +196,9 @@ pub struct RouteCandidateEvidence {
     pub evidence_refs: Vec<String>,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
-#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
-pub enum RouteRejectionReason {
-    LowerDeterministicRank,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct RejectedRoute {
-    pub route: RouteFingerprint,
-    pub reason: RouteRejectionReason,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct RoutingReceipt {
-    pub selected_route: RouteFingerprint,
-    pub capacity_identity: String,
-    pub capacity_revision: RevisionId,
-    pub capacity_limit: usize,
-    pub budget_evidence: BudgetEvidence,
-    pub evidence_refs: Vec<String>,
-    pub rejected_alternatives: Vec<RejectedRoute>,
-    pub proof_ceiling: ProofCeiling,
-}
-
+/// Staffing-lane capacity/budget/rank evidence stays in this lane.
+/// Route selection itself is the imported single-owner
+/// [`RouteSelectionCandidate`]; there is no second shared routing receipt.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct StaffingLaneRequest {
@@ -251,7 +229,10 @@ pub struct StaffingLaneCandidate {
     pub work_unit_id: WorkUnitId,
     pub role_id: RoleProfileId,
     pub role_revision: RevisionId,
-    pub routing: RoutingReceipt,
+    pub routing: RouteSelectionCandidate,
+    pub capacity_identity: String,
+    pub capacity_revision: RevisionId,
+    pub capacity_limit: usize,
     pub budget: BudgetEnvelope,
     pub priority: u16,
     pub mutation_scope: Option<String>,
@@ -282,7 +263,10 @@ pub struct AdmittedLaneReceipt {
     pub lease_id: WorkLeaseId,
     pub worker_id: WorkerId,
     pub route: RouteFingerprint,
-    pub routing_receipt_digest: String,
+    /// Recomputed candidate identity: `candidate_digest_for` of the admitted
+    /// `RouteSelectionCandidate` bytes (canonical JSON + SHA-256 hex, typed).
+    /// Validators recompute; an unchecked copy is rejected at admission.
+    pub routing_receipt_digest: LowercaseSha256,
     pub budget: BudgetEnvelope,
     pub priority: u16,
     pub mutation_scope: Option<String>,
@@ -501,7 +485,7 @@ pub struct CandidateResultReceipt {
     pub attempt_id: AttemptId,
     pub provider_disposition: ResultDisposition,
     pub proof_ceiling: ProofCeiling,
-    pub actual_route: ActualRouteReceipt,
+    pub actual_route: PhysicalRouteObservationReceipt,
     pub evidence_refs: Vec<String>,
     pub proposed_effect_count: usize,
 }

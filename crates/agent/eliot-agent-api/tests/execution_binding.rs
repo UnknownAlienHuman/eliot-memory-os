@@ -8,31 +8,45 @@
 use eliot_agent_api::{
     AgentAttempt, AgentWorkUnitBrief, AttemptId, AttemptState, AuthorityEnvelope, AuthorityEpoch,
     BudgetEnvelope, CancellationState, ContinuityKind, ContractError, EffectCeiling, EffectKind,
-    EventCursor, ExecutionUnit, ExecutionUnitObservation, LaunchRequestId, NativeSession,
-    NativeSessionLocator, ProviderExecutionBinding, ProviderObservationLineage, RequestId,
-    ResourceGeneration, RouteFingerprint, SessionId, SessionObservation, StateFence, TaskId,
-    WorkLeaseId, WorkUnitId, validate_execution_binding,
+    EventCursor, ExecutionUnit, ExecutionUnitObservation, LaunchRequestId, LowercaseSha256,
+    NativeSession, NativeSessionLocator, ProviderExecutionBinding, ProviderObservationLineage,
+    RequestId, ResourceGeneration, RouteFingerprint, SessionId, SessionObservation, StateFence,
+    TaskId, WorkLeaseId, WorkUnitId, validate_execution_binding,
 };
 use eliot_contracts::{TaskRevision, sha256_hex};
 
 type TestResult = Result<(), Box<dyn std::error::Error>>;
 
-fn route() -> RouteFingerprint {
-    RouteFingerprint {
+fn fixture_digest(value: &str) -> Result<LowercaseSha256, serde_json::Error> {
+    serde_json::from_value(serde_json::json!(value))
+}
+
+fn route() -> Result<RouteFingerprint, serde_json::Error> {
+    Ok(RouteFingerprint {
         host_family: "test-host".into(),
         adapter: "test-adapter".into(),
         protocol_transport: "loopback".into(),
-        runtime_hash: "sha256:runtime".into(),
-        adapter_hash: "sha256:adapter".into(),
+        runtime_hash: fixture_digest(
+            "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+        )?,
+        adapter_hash: fixture_digest(
+            "fedcba9876543210fedcba9876543210fedcba9876543210fedcba9876543210",
+        )?,
         provider: "provider".into(),
         model: "model".into(),
         auth_billing: "subscription".into(),
-        serializer_hash: "sha256:serializer".into(),
-        tool_semantics_hash: "sha256:tools".into(),
+        serializer_hash: fixture_digest(
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        )?,
+        tool_semantics_hash: fixture_digest(
+            "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        )?,
         reasoning_mode: "visible".into(),
         continuation_behavior: "native_resume".into(),
-        feature_flags_hash: "sha256:features".into(),
-    }
+        feature_flags_hash: fixture_digest(
+            "1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef",
+        )?,
+    })
 }
 
 fn budget() -> BudgetEnvelope {
@@ -94,7 +108,7 @@ fn admitted_attempt() -> Result<AgentAttempt, Box<dyn std::error::Error>> {
         lease: lease("lease-binding-1")?,
         state: AttemptState::Admitted,
         continuity: ContinuityKind::Fresh,
-        route: route(),
+        route: route()?,
         budget: work_budget,
         authority: AuthorityEnvelope {
             epoch: AuthorityEpoch::new(1)?,

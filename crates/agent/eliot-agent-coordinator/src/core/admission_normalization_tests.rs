@@ -2,10 +2,11 @@ use std::collections::BTreeSet;
 
 use eliot_agent_api::{
     AgentLaunchRequest, AgentWorkUnitBrief, AttemptId, AuthorityEpoch, BudgetEnvelope,
-    EffectCeiling, EffectKind, LaunchRequestId, ResourceGeneration, RouteFingerprint, StateFence,
-    TaskId, WorkLeaseId, WorkUnitId,
+    EffectCeiling, EffectKind, LaunchRequestId, LowercaseSha256, ResourceGeneration,
+    RouteFingerprint, StateFence, TaskId, WorkLeaseId, WorkUnitId, candidate_digest_for,
 };
-use eliot_agent_contracts::{RevisionId, contract_shape_digest};
+use eliot_agent_contracts::RevisionId;
+use eliot_contracts::sha256_hex;
 use eliot_evaluation_contracts::BudgetEvidence;
 use eliot_security_contracts::PrivacyClass;
 
@@ -117,20 +118,26 @@ fn effect_ceiling() -> EffectCeiling {
 }
 
 fn route(tag: &str) -> RouteFingerprint {
+    let digest = |seed: &str| {
+        serde_json::from_value::<LowercaseSha256>(serde_json::json!(sha256_hex(
+            format!("normalization-fixture-{seed}-{tag}").as_bytes()
+        )))
+        .expect("valid fixture digest")
+    };
     RouteFingerprint {
         host_family: "fixture-host".to_owned(),
         adapter: format!("adapter-{tag}"),
         protocol_transport: "fixture".to_owned(),
-        runtime_hash: format!("runtime-{tag}"),
-        adapter_hash: format!("adapter-hash-{tag}"),
+        runtime_hash: digest("runtime"),
+        adapter_hash: digest("adapter"),
         provider: format!("provider-{tag}"),
         model: format!("model-{tag}"),
         auth_billing: "fixture-account".to_owned(),
-        serializer_hash: "serializer-v1".to_owned(),
-        tool_semantics_hash: "tools-v1".to_owned(),
+        serializer_hash: digest("serializer"),
+        tool_semantics_hash: digest("tools"),
         reasoning_mode: "bounded".to_owned(),
         continuation_behavior: "fresh".to_owned(),
-        feature_flags_hash: "features-v1".to_owned(),
+        feature_flags_hash: digest("features"),
     }
 }
 
@@ -251,6 +258,11 @@ fn admission_receipt(
         .iter()
         .map(|lane| {
             let suffix = lane.work_unit_id.as_str();
+            let selected = lane
+                .routing
+                .selected
+                .clone()
+                .ok_or("candidate must select a route")?;
             Ok(AdmittedLaneReceipt {
                 work_unit_id: lane.work_unit_id.clone(),
                 role_id: lane.role_id.clone(),
@@ -258,8 +270,8 @@ fn admission_receipt(
                 attempt_id: AttemptId::new(format!("attempt-{suffix}"))?,
                 lease_id: serde_json::from_value::<WorkLeaseId>(serde_json::json!({"namespace": "eliot.governor.work-lease", "revision": "v1", "value": format!("lease-{suffix}")}))?,
                 worker_id: WorkerId::new(format!("worker-{suffix}"))?,
-                route: lane.routing.selected_route.clone(),
-                routing_receipt_digest: contract_shape_digest(&lane.routing)?,
+                route: selected,
+                routing_receipt_digest: candidate_digest_for(&lane.routing)?,
                 budget: lane.budget.clone(),
                 priority: lane.priority,
                 mutation_scope: lane.mutation_scope.clone(),
@@ -277,7 +289,9 @@ fn admission_receipt(
         plan_revision: candidate.plan_revision.clone(),
         state_fence: candidate.state_fence.clone(),
         controller_epoch: candidate.state_fence.authority_epoch,
-        coordinator_lease: serde_json::from_value::<WorkLeaseId>(serde_json::json!({"namespace": "eliot.governor.work-lease", "revision": "v1", "value": "coordinator-lease-normalization"}))?,
+        coordinator_lease: serde_json::from_value::<WorkLeaseId>(
+            serde_json::json!({"namespace": "eliot.governor.work-lease", "revision": "v1", "value": "coordinator-lease-normalization"}),
+        )?,
         provider_identity: provider_identity(),
         g11_admission_receipt_ref: proof_ref.to_owned(),
         durable_job_ref: "durable-job-normalization".to_owned(),

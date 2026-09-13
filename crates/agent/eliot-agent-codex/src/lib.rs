@@ -9,13 +9,14 @@
 use std::sync::Arc;
 
 use eliot_agent_api::{
-    ActualRouteReceipt, AgentAttempt, AgentLaunchRequest, AgentResult, AgentWorkUnitBrief,
-    AttemptId, AttemptState, AuthorityEnvelope, CancelReason, ContinuityKind, EffectCeiling,
-    EventId, ExecutionUnitObservation, HostEventEnvelope, HostEventKind, NativeSession,
-    ProviderExecutionBinding, ProviderObservationLineage, ResultDisposition,
-    RouteContinuationLocator, RouteFingerprint, SessionId, UsageReceipt, WorkLeaseId,
+    AdmittedRouteReceipt, AgentAttempt, AgentLaunchRequest, AgentResult, AgentWorkUnitBrief,
+    AttemptId, AttemptState, AuthorityEnvelope, CONTRACT_VERSION, CancelReason, CancellationState,
+    ClockReading, ContinuityKind, EffectCeiling, EventCursor, EventId, ExecutionOutcome,
+    ExecutionUnit, ExecutionUnitObservation, HostEventEnvelope, HostEventKind, LowercaseSha256,
+    NativeSession, PhysicalRouteObservationReceipt, ProviderExecutionBinding,
+    ProviderObservationLineage, ResultDisposition, RouteContinuationLocator, RouteFingerprint,
+    RouteObservationState, SessionId, UsageReceipt, WorkLeaseId,
 };
-use eliot_contracts::ClockReading;
 use eliot_process::{
     CancellationReceipt, ProcessEvidence, ProcessEvidenceSink, ProcessExecutionError,
     ProcessExecutor, ProcessRequest, ProcessStartReceipt,
@@ -91,31 +92,31 @@ pub enum CodexAdapterError {
 /// projection; no vendor SDK type escapes this crate.
 #[allow(clippy::too_many_arguments)]
 pub fn codex_route(
-    runtime_hash: impl Into<String>,
-    adapter_hash: impl Into<String>,
+    runtime_hash: LowercaseSha256,
+    adapter_hash: LowercaseSha256,
     provider: impl Into<String>,
     model: impl Into<String>,
     auth_billing: impl Into<String>,
-    serializer_hash: impl Into<String>,
-    tool_semantics_hash: impl Into<String>,
+    serializer_hash: LowercaseSha256,
+    tool_semantics_hash: LowercaseSha256,
     reasoning_mode: impl Into<String>,
     continuation_behavior: impl Into<String>,
-    feature_flags_hash: impl Into<String>,
+    feature_flags_hash: LowercaseSha256,
 ) -> RouteFingerprint {
     RouteFingerprint {
         host_family: CODEX_HOST_FAMILY.into(),
         adapter: CODEX_ADAPTER_ID.into(),
         protocol_transport: CODEX_PROTOCOL_TRANSPORT.into(),
-        runtime_hash: runtime_hash.into(),
-        adapter_hash: adapter_hash.into(),
+        runtime_hash,
+        adapter_hash,
         provider: provider.into(),
         model: model.into(),
         auth_billing: auth_billing.into(),
-        serializer_hash: serializer_hash.into(),
-        tool_semantics_hash: tool_semantics_hash.into(),
+        serializer_hash,
+        tool_semantics_hash,
         reasoning_mode: reasoning_mode.into(),
         continuation_behavior: continuation_behavior.into(),
-        feature_flags_hash: feature_flags_hash.into(),
+        feature_flags_hash,
     }
 }
 
@@ -137,14 +138,14 @@ fn validate_codex_route(route: &RouteFingerprint) -> Result<(), CodexAdapterErro
 pub struct CodexSessionBinding {
     pub session_id: SessionId,
     pub thread_id: String,
-    pub runtime_hash: String,
+    pub runtime_hash: LowercaseSha256,
     pub working_directory: String,
 }
 
 impl CodexSessionBinding {
     pub fn validate(&self, route: &RouteFingerprint) -> Result<(), CodexAdapterError> {
         validate_codex_route(route)?;
-        for value in [&self.thread_id, &self.runtime_hash, &self.working_directory] {
+        for value in [&self.thread_id, &self.working_directory] {
             if value.trim().is_empty() {
                 return Err(CodexAdapterError::SessionMismatch);
             }
@@ -984,9 +985,6 @@ pub struct CodexResultInput {
     pub cancelled: bool,
     pub unknown_reason: Option<String>,
     pub usage: UsageReceipt,
-    pub route_id: eliot_agent_api::RouteFingerprintId,
-    pub started_at: String,
-    pub terminal_at: Option<String>,
     pub continuation: Option<RouteContinuationLocator>,
     pub proposed_effects: Vec<eliot_agent_api::ProposedEffect>,
 }
@@ -1028,11 +1026,14 @@ fn validate_terminal_observation(
 ///
 /// Attempt identity comes from the recorded `binding`, never from an ambient
 /// parameter. Session/route inputs must agree with that binding, and the
-/// observed route is never defaulted from the requested route: physical-route
-/// observation belongs to S4, so unobserved stays `None`.
+/// observed route is never defaulted from the requested route: the physical
+/// observation is always `UNOBSERVED` with an explicit reason (the adapter
+/// records no separate physical route), and the admitted/binding linkage is
+/// enforced via `validate_against(binding, admission)`.
 pub fn translate_result(
     input: CodexResultInput,
     binding: &ProviderExecutionBinding,
+    admission: &AdmittedRouteReceipt,
     authority: &EffectCeiling,
 ) -> Result<AgentResult, CodexAdapterError> {
     validate_codex_route(&input.route)?;
@@ -1080,6 +1081,81 @@ pub fn translate_result(
     } else {
         (ResultDisposition::Partial, input.unknown_reason)
     };
+    let zero_digest: LowercaseSha256 = serde_json::from_value(serde_json::Value::String(
+        "0000000000000000000000000000000000000000000000000000000000000000".to_owned(),
+    ))
+    .map_err(|_| CodexAdapterError::Contract(eliot_agent_api::ContractError::DigestMismatch))?;
+    // Binding-gated physical observation: UNOBSERVED with explicit reason,
+    // never observed=requested. Cancelled carries observed cancellation;
+    // all other outcomes stay UNKNOWN_OUTCOME with a quarantine recovery
+    // handle, preserving evidence without fabricating wall time.
+    let (execution_outcome, cancellation, recovery_ref) = if input.cancelled {
+        (
+            ExecutionOutcome::Observed,
+            Some(CancellationState::Acknowledged),
+            None,
+        )
+    } else if input.terminal_observation.is_some() {
+        let handle = input
+            .terminal_observation
+            .as_ref()
+            .map(|terminal| format!("codex-terminal:{}", terminal.event_id.as_str()))
+            .unwrap_or_else(|| "codex-partial-recovery".to_owned());
+        (ExecutionOutcome::UnknownOutcome, None, Some(handle))
+    } else {
+        (
+            ExecutionOutcome::UnknownOutcome,
+            None,
+            Some(
+                unknown_reason
+                    .clone()
+                    .unwrap_or_else(|| "terminal observation absent".to_owned()),
+            ),
+        )
+    };
+    let mut actual_route = PhysicalRouteObservationReceipt {
+        schema_version: CONTRACT_VERSION.to_owned(),
+        attempt_id: binding.attempt_id.clone(),
+        state_fence: binding.state_fence.clone(),
+        runtime_generation: binding.runtime_generation,
+        admitted_route_digest: admission.self_digest.clone(),
+        binding: binding.clone(),
+        requested_route: input.route.clone(),
+        observed_route: None,
+        route_state: RouteObservationState::Unobserved,
+        diverged_fields: Vec::new(),
+        execution_outcome,
+        request_digest: zero_digest,
+        translation_digest: None,
+        raw_evidence_digest: None,
+        raw_evidence_ref: None,
+        usage: input.usage.clone(),
+        started: ClockReading::default(),
+        first_byte: ClockReading::default(),
+        first_semantic: ClockReading::default(),
+        terminal: ClockReading::default(),
+        event_cursor: EventCursor::new("codex-result")?,
+        event_sequence: 1,
+        cancellation,
+        unobserved_reason: Some(
+            "codex physical route not separately observed; requested retained without synthesis"
+                .to_owned(),
+        ),
+        recovery_ref,
+        safe_public_error: None,
+        restricted_raw_error_ref: None,
+        self_digest: serde_json::from_value(serde_json::Value::String(
+            "0000000000000000000000000000000000000000000000000000000000000000".to_owned(),
+        ))
+        .map_err(|_| CodexAdapterError::Contract(eliot_agent_api::ContractError::DigestMismatch))?,
+    };
+    actual_route.self_digest = actual_route
+        .compute_digest()
+        .map_err(|_| CodexAdapterError::Contract(eliot_agent_api::ContractError::DigestMismatch))?;
+    // Enforce exact binding/attempt/lease/fence/generation/admission
+    // agreement and requested==admitted-selected; forged or mismatched
+    // linkage fails closed here, never at a later intake.
+    actual_route.validate_against(binding, admission)?;
     let result = AgentResult {
         attempt_id: binding.attempt_id.clone(),
         disposition,
@@ -1088,14 +1164,7 @@ pub fn translate_result(
         proposed_effects: input.proposed_effects,
         unresolved_questions: Vec::new(),
         usage: input.usage.clone(),
-        actual_route: ActualRouteReceipt {
-            requested: input.route.clone(),
-            observed: None,
-            route_id: input.route_id,
-            usage: input.usage,
-            started_at: input.started_at,
-            terminal_at: input.terminal_at,
-        },
+        actual_route,
         unknown_reason,
     };
     result.validate(authority)?;
@@ -1196,18 +1265,25 @@ mod tests {
 
     type TestResult<T = ()> = Result<T, Box<dyn std::error::Error>>;
 
+    fn fixture_digest(seed: &str) -> LowercaseSha256 {
+        serde_json::from_value(serde_json::json!(eliot_contracts::sha256_hex(
+            format!("codex-fixture-{seed}").as_bytes()
+        )))
+        .expect("valid fixture digest")
+    }
+
     fn route() -> RouteFingerprint {
         codex_route(
-            "runtime-1",
-            "adapter-1",
+            fixture_digest("runtime"),
+            fixture_digest("adapter"),
             "provider",
             "model",
             "subscription",
-            "serializer-1",
-            "tools-1",
+            fixture_digest("serializer"),
+            fixture_digest("tools"),
             "visible",
             "native_resume",
-            "features-1",
+            fixture_digest("features"),
         )
     }
 
@@ -1435,7 +1511,9 @@ mod tests {
                 epoch: AuthorityEpoch::new(1)?,
                 scope_ref: "scope-1".into(),
                 effect_ceiling: ceiling(),
-                lease: serde_json::from_value::<WorkLeaseId>(serde_json::json!({"namespace": "eliot.governor.work-lease", "revision": "v1", "value": "lease-1"}))?,
+                lease: serde_json::from_value::<WorkLeaseId>(
+                    serde_json::json!({"namespace": "eliot.governor.work-lease", "revision": "v1", "value": "lease-1"}),
+                )?,
                 state_fence: StateFence::new(AuthorityEpoch::new(1)?, ResourceGeneration::new(1)?),
                 valid_until: "never".into(),
             },
@@ -1443,7 +1521,7 @@ mod tests {
             session: CodexSessionBinding {
                 session_id: SessionId::new("session-1")?,
                 thread_id: "thread-1".into(),
-                runtime_hash: "runtime-1".into(),
+                runtime_hash: fixture_digest("runtime"),
                 working_directory: "C:\\workspace".into(),
             },
             process_request: process_request()?,
@@ -1706,6 +1784,48 @@ mod tests {
         })
     }
 
+    fn admission_for(binding: &ProviderExecutionBinding) -> TestResult<AdmittedRouteReceipt> {
+        use eliot_agent_api::{
+            CandidateSelectionDisposition, PolicyRevision, RouteSelectionCandidate,
+            candidate_digest_for,
+        };
+        use eliot_contracts::DecisionId;
+        let candidate = RouteSelectionCandidate {
+            capability: "codex".to_owned(),
+            query_intent: "test-intent".to_owned(),
+            scope_ref: "scope:test".to_owned(),
+            policy_revision: PolicyRevision::new(3)?,
+            candidates: vec![binding.route.clone()],
+            selected: Some(binding.route.clone()),
+            rejected: Vec::new(),
+            selection: CandidateSelectionDisposition::Selected,
+            evidence_refs: vec!["evidence-1".to_owned()],
+        };
+        candidate.validate()?;
+        let zero: LowercaseSha256 = serde_json::from_value(serde_json::json!(
+            "0000000000000000000000000000000000000000000000000000000000000000"
+        ))?;
+        let mut receipt = AdmittedRouteReceipt {
+            schema_version: CONTRACT_VERSION.to_owned(),
+            decision_id: DecisionId::new("decision-1")?,
+            candidate_digest: candidate_digest_for(&candidate)?,
+            attempt_id: binding.attempt_id.clone(),
+            lease_id: binding.lease_id.clone(),
+            state_fence: binding.state_fence.clone(),
+            runtime_generation: binding.runtime_generation,
+            policy_revision: PolicyRevision::new(3)?,
+            requested_route: binding.route.clone(),
+            selected_route: Some(binding.route.clone()),
+            no_route: None,
+            evidence_refs: vec!["evidence-1".to_owned()],
+            proof_ceiling: eliot_agent_api::ProofCeiling::CandidateArtifact,
+            self_digest: zero,
+        };
+        receipt.self_digest = receipt.compute_digest()?;
+        receipt.validate()?;
+        Ok(receipt)
+    }
+
     fn bound_lineage(
         binding: &ProviderExecutionBinding,
         sequence: u64,
@@ -1945,9 +2065,6 @@ mod tests {
                 cost_microunits: None,
                 quota: QuotaKnowledge::Unknown,
             },
-            route_id: eliot_agent_api::RouteFingerprintId::new("route-1")?,
-            started_at: "start".into(),
-            terminal_at: None,
             continuation: None,
             proposed_effects: Vec::new(),
         })
@@ -1968,6 +2085,7 @@ mod tests {
     fn provider_success_stays_candidate_and_terminal_mappings_are_preserved() -> TestResult {
         let a = attached()?;
         let binding = bound_binding()?;
+        let admission = admission_for(&binding)?;
         let success = translate_result(
             result_input(
                 &a,
@@ -1977,14 +2095,19 @@ mod tests {
                 None,
             )?,
             &binding,
+            &admission,
             &a.authority.effect_ceiling,
         )?;
         assert_eq!(success.disposition, ResultDisposition::Partial);
         assert_ne!(success.disposition, ResultDisposition::CandidateSucceeded);
         assert_eq!(success.attempt_id, binding.attempt_id);
         // Observed route is never defaulted from the requested route.
-        assert_eq!(success.actual_route.observed, None);
-        assert_eq!(success.actual_route.requested, binding.route);
+        assert_eq!(success.actual_route.observed_route, None);
+        assert_eq!(
+            success.actual_route.route_state,
+            RouteObservationState::Unobserved
+        );
+        assert_eq!(success.actual_route.requested_route, binding.route);
 
         let cancelled = translate_result(
             result_input(
@@ -1995,6 +2118,7 @@ mod tests {
                 None,
             )?,
             &binding,
+            &admission,
             &a.authority.effect_ceiling,
         )?;
         assert_eq!(cancelled.disposition, ResultDisposition::CancelledObserved);
@@ -2002,6 +2126,7 @@ mod tests {
         let unknown = translate_result(
             result_input(&a, None, None, false, None)?,
             &binding,
+            &admission,
             &a.authority.effect_ceiling,
         )?;
         assert_eq!(unknown.disposition, ResultDisposition::UnknownOutcome);
@@ -2013,6 +2138,7 @@ mod tests {
     fn foreign_or_nonterminal_observations_never_become_results() -> TestResult {
         let a = attached()?;
         let binding = bound_binding()?;
+        let admission = admission_for(&binding)?;
         // Same-thread turn B observation presented for attempt A quarantines.
         let mut foreign_binding = binding.clone();
         foreign_binding.execution_unit = ExecutionUnit::new("codex", "turn-2")?;
@@ -2026,6 +2152,7 @@ mod tests {
         assert!(is_binding_mismatch(&translate_result(
             result_input(&a, Some("output"), Some(foreign_terminal), false, None)?,
             &binding,
+            &admission,
             &a.authority.effect_ceiling,
         )));
         // A non-terminal observation cannot stand in as terminal evidence.
@@ -2040,6 +2167,7 @@ mod tests {
             translate_result(
                 result_input(&a, Some("output"), Some(nonterminal), false, None)?,
                 &binding,
+                &admission,
                 &a.authority.effect_ceiling,
             ),
             Err(CodexAdapterError::MalformedWire(_))
@@ -2056,7 +2184,12 @@ mod tests {
         )?;
         mismatched.session = wrong_session;
         assert!(matches!(
-            translate_result(mismatched, &binding, &a.authority.effect_ceiling,),
+            translate_result(
+                mismatched,
+                &binding,
+                &admission,
+                &a.authority.effect_ceiling,
+            ),
             Err(CodexAdapterError::SessionMismatch)
         ));
         Ok(())
@@ -2152,14 +2285,14 @@ mod tests {
             provider_id: "codex".to_owned(),
             provider_policy: CodexProviderPolicy {
                 route: CodexRouteTemplate {
-                    runtime_hash: "runtime-hash".to_owned(),
-                    adapter_hash: "adapter-hash".to_owned(),
+                    runtime_hash: fixture_digest("runtime"),
+                    adapter_hash: fixture_digest("adapter"),
                     auth_billing: "account-1".to_owned(),
-                    serializer_hash: "serializer-hash".to_owned(),
-                    tool_semantics_hash: "tool-semantics-hash".to_owned(),
+                    serializer_hash: fixture_digest("serializer"),
+                    tool_semantics_hash: fixture_digest("tools"),
                     reasoning_mode: "catalogue-default".to_owned(),
                     continuation_behavior: "native-resume".to_owned(),
-                    feature_flags_hash: "feature-flags-hash".to_owned(),
+                    feature_flags_hash: fixture_digest("features"),
                 },
                 route_admission: RouteAdmissionStatus::Admitted,
                 route_health: RouteHealthStatus::Healthy,
@@ -2218,16 +2351,16 @@ mod tests {
         snapshot.validate()?;
         // bind catalogue using the exact route that the attached receipt will use
         let route = crate::codex_route(
-            "runtime-hash",
-            "adapter-hash",
+            fixture_digest("runtime"),
+            fixture_digest("adapter"),
             "codex",
             model,
             "account-1",
-            "serializer-hash",
-            "tool-semantics-hash",
+            fixture_digest("serializer"),
+            fixture_digest("tools"),
             "catalogue-default",
             "native-resume",
-            "feature-flags-hash",
+            fixture_digest("features"),
         );
         gate.bind_catalogue(&snapshot, &route, now)?;
         Ok((gate, snapshot))
@@ -2277,7 +2410,9 @@ mod tests {
             begin_attempt_strict(
                 &attached,
                 &gate,
-                serde_json::from_value::<WorkLeaseId>(serde_json::json!({"namespace": "eliot.governor.work-lease", "revision": "v1", "value": "lease-1"}))?,
+                serde_json::from_value::<WorkLeaseId>(
+                    serde_json::json!({"namespace": "eliot.governor.work-lease", "revision": "v1", "value": "lease-1"})
+                )?,
                 AttemptId::new("attempt-1")?,
                 ContinuityKind::Fresh
             ),
@@ -2297,7 +2432,9 @@ mod tests {
             begin_attempt_strict(
                 &attached,
                 &gate,
-                serde_json::from_value::<WorkLeaseId>(serde_json::json!({"namespace": "eliot.governor.work-lease", "revision": "v1", "value": "lease-1"}))?,
+                serde_json::from_value::<WorkLeaseId>(
+                    serde_json::json!({"namespace": "eliot.governor.work-lease", "revision": "v1", "value": "lease-1"})
+                )?,
                 AttemptId::new("attempt-1")?,
                 ContinuityKind::Fresh
             ),
@@ -2305,16 +2442,16 @@ mod tests {
         ));
         // also test mismatched snapshot directly via gate binding: try bind wrong model
         let wrong_route = crate::codex_route(
-            "runtime-hash",
-            "adapter-hash",
+            fixture_digest("runtime"),
+            fixture_digest("adapter"),
             "codex",
             "other-model",
             "account-1",
-            "serializer-hash",
-            "tool-semantics-hash",
+            fixture_digest("serializer"),
+            fixture_digest("tools"),
             "catalogue-default",
             "native-resume",
-            "feature-flags-hash",
+            fixture_digest("features"),
         );
         let mut fresh_gate = crate::preflight::CodexPreflightGate::new();
         fresh_gate.observe(&CodexWireMessage::initialize("init-1", "eliot", "0.1.0"))?;
@@ -2376,22 +2513,24 @@ mod tests {
         let (source_assurance, source_expectation) = source()?;
         let launch = launch()?;
         let route = crate::codex_route(
-            "runtime-hash",
-            "adapter-hash",
+            fixture_digest("runtime"),
+            fixture_digest("adapter"),
             "codex",
             "model-a",
             "account-1",
-            "serializer-hash",
-            "tool-semantics-hash",
+            fixture_digest("serializer"),
+            fixture_digest("tools"),
             "catalogue-default",
             "native-resume",
-            "feature-flags-hash",
+            fixture_digest("features"),
         );
         let authority = eliot_agent_api::AuthorityEnvelope {
             epoch: eliot_agent_api::AuthorityEpoch::new(1)?,
             scope_ref: "scope-1".into(),
             effect_ceiling: ceiling(),
-            lease: serde_json::from_value::<WorkLeaseId>(serde_json::json!({"namespace": "eliot.governor.work-lease", "revision": "v1", "value": "lease-1"}))?,
+            lease: serde_json::from_value::<WorkLeaseId>(
+                serde_json::json!({"namespace": "eliot.governor.work-lease", "revision": "v1", "value": "lease-1"}),
+            )?,
             state_fence: eliot_agent_api::StateFence::new(
                 eliot_agent_api::AuthorityEpoch::new(1)?,
                 eliot_agent_api::ResourceGeneration::new(1)?,
@@ -2405,7 +2544,7 @@ mod tests {
             session: CodexSessionBinding {
                 session_id: SessionId::new("session-1")?,
                 thread_id: "thread-1".into(),
-                runtime_hash: "runtime-hash".into(),
+                runtime_hash: fixture_digest("runtime"),
                 working_directory: "C:\\workspace".into(),
             },
             process_request: process_request()?,
@@ -2416,7 +2555,9 @@ mod tests {
         let attempt = begin_attempt_strict(
             &attached,
             &gate,
-            serde_json::from_value::<WorkLeaseId>(serde_json::json!({"namespace": "eliot.governor.work-lease", "revision": "v1", "value": "lease-1"}))?,
+            serde_json::from_value::<WorkLeaseId>(
+                serde_json::json!({"namespace": "eliot.governor.work-lease", "revision": "v1", "value": "lease-1"}),
+            )?,
             AttemptId::new("attempt-1")?,
             ContinuityKind::Fresh,
         )?;

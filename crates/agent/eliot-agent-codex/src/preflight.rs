@@ -310,24 +310,31 @@ mod tests {
         CODEX_CATALOGUE_CONTEXT_VERSION, CodexCatalogueContext, CodexModelWire,
         CodexProviderPolicy, CodexRouteTemplate, compile_codex_model_catalogue,
     };
-    use eliot_agent_api::RouteFingerprint;
+    use eliot_agent_api::{LowercaseSha256, RouteFingerprint};
     use eliot_agent_coordinator::{
         ModelRole, QuotaDisposition, QuotaObservation, RouteAdmissionStatus, RouteHealthStatus,
     };
     use std::collections::{BTreeMap, BTreeSet};
 
+    fn template_digest(seed: &str) -> LowercaseSha256 {
+        serde_json::from_value(serde_json::json!(eliot_contracts::sha256_hex(
+            format!("codex-preflight-{seed}").as_bytes()
+        )))
+        .expect("valid fixture digest")
+    }
+
     fn route_for(model: &str) -> RouteFingerprint {
         crate::codex_route(
-            "runtime-hash",
-            "adapter-hash",
+            template_digest("runtime"),
+            template_digest("adapter"),
             "codex",
             model,
             "account-1",
-            "serializer-hash",
-            "tool-semantics-hash",
+            template_digest("serializer"),
+            template_digest("tools"),
             "catalogue-default",
             "native-resume",
-            "feature-flags-hash",
+            template_digest("features"),
         )
     }
 
@@ -344,14 +351,14 @@ mod tests {
             provider_id: "codex".to_owned(),
             provider_policy: CodexProviderPolicy {
                 route: CodexRouteTemplate {
-                    runtime_hash: "runtime-hash".to_owned(),
-                    adapter_hash: "adapter-hash".to_owned(),
+                    runtime_hash: template_digest("runtime"),
+                    adapter_hash: template_digest("adapter"),
                     auth_billing: "account-1".to_owned(),
-                    serializer_hash: "serializer-hash".to_owned(),
-                    tool_semantics_hash: "tool-semantics-hash".to_owned(),
+                    serializer_hash: template_digest("serializer"),
+                    tool_semantics_hash: template_digest("tools"),
                     reasoning_mode: "catalogue-default".to_owned(),
                     continuation_behavior: "native-resume".to_owned(),
-                    feature_flags_hash: "feature-flags-hash".to_owned(),
+                    feature_flags_hash: template_digest("features"),
                 },
                 route_admission: RouteAdmissionStatus::Admitted,
                 route_health: RouteHealthStatus::Healthy,

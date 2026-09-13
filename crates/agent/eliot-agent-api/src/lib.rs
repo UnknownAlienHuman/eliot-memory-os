@@ -9,28 +9,42 @@ use std::collections::BTreeSet;
 
 pub use eliot_agent_contracts::AgentAttemptId;
 pub use eliot_contracts::{
-    ArtifactId, AuthorityEpoch, RequestId, ResourceGeneration, SessionId, StateFence, TaskId,
-    WorkLeaseId,
+    ArtifactId, AuthorityEpoch, ClockReading, DecisionId, LowercaseSha256, PolicyRevision,
+    RequestId, ResourceGeneration, SessionId, StateFence, TaskId, WorkLeaseId,
 };
+pub use eliot_receipts::ProofCeiling;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 pub mod execution_binding;
+pub mod route_receipts;
 pub use execution_binding::{
     ExecutionUnit, ExecutionUnitObservation, NativeSession, NativeSessionLocator,
     ProviderExecutionBinding, ProviderObservationLineage, SessionObservation,
     validate_execution_binding,
 };
+pub use route_receipts::{
+    AdmittedRouteReceipt, CandidateSelectionDisposition, ExecutionOutcome,
+    LEGACY_CANDIDATE_SCHEMA_V5, LegacyCandidateMigration, LegacyCapabilityRouteDecisionV5,
+    LegacyQuarantineReason, LegacyRouteQuarantine, MAX_EVIDENCE_REFS, MAX_REJECTED_CANDIDATES,
+    MAX_ROUTE_CANDIDATES, MAX_SAFE_ERROR_CHARS, MAX_TEXT_REF_CHARS, NoRouteDisposition,
+    PhysicalRouteObservationReceipt, RejectedRouteCandidate, RouteObservationState,
+    RouteSelectionCandidate, candidate_digest_for, route_divergence_fields,
+};
 
-/// Wire revision v5 adds the S1 provider-execution binding
-/// (`AgentAttempt::provider_binding`) and observation lineage
-/// (`HostEventEnvelope::lineage`) from issue #361 under owner freeze
-/// `A01_PROVIDER_EXECUTION_BINDING_V1`. Additive: absent fields default to
-/// `None` (unresolved launch / legacy thread-only wire). A thread-only wire
-/// without binding/lineage is rejected for attribution at validation, never
-/// silently accepted as execution-unit evidence.
-pub const CONTRACT_VERSION: &str = "eliot-agent-api/v5";
+/// Wire revision v6 converges the six #369 route rows (T4 S4, T4 §5.2):
+/// `CapabilityRouteDecision` is renamed to the candidate-only
+/// `RouteSelectionCandidate` (explicit versioned legacy decoder, never silent
+/// upgrade); the API `RoutingReceipt` migrates to `AdmittedRouteReceipt`
+/// with a recomputed self digest; `ActualRouteReceipt` and
+/// `PhysicalModelAttemptReceipt` merge into the single
+/// `PhysicalRouteObservationReceipt` with requested/observed evidence and
+/// two independent disposition axes; behavior-bearing `RouteFingerprint`
+/// hashes become canonical lowercase 64-hex SHA-256. Breaking: old wires do
+/// not silently upgrade (deny-unknown-fields plus digest/version checks);
+/// direct consumers migrate through the sibling coordinator/wire slices.
+pub const CONTRACT_VERSION: &str = "eliot-agent-api/v6";
 
 /// Compatibility spelling retained as an exact alias of the canonical owner.
 pub type AttemptId = AgentAttemptId;
@@ -137,6 +151,22 @@ pub enum ContractError {
     InvalidStateFence,
     #[error("provider execution binding does not match the admitted attempt")]
     BindingMismatch,
+    #[error("{field} must be a canonical lowercase SHA-256 hex digest")]
+    InvalidDigest { field: &'static str },
+    #[error("receipt digest does not match its canonical payload")]
+    DigestMismatch,
+    #[error("clock reading has invalid observed/known ordering")]
+    InvalidClock,
+    #[error("route disposition contradicts its evidence")]
+    InvalidRouteDisposition,
+    #[error("conflicting observation for the same receipt/execution identity")]
+    ConflictingObservation,
+    #[error("route observation requires an explicit reason and recovery reference")]
+    MissingObservationReason,
+    #[error("{field} exceeds the bounded length")]
+    OversizeField { field: &'static str },
+    #[error("unknown route contract version")]
+    UnknownContractVersion,
 }
 
 /// Whether an admission may expose only safe observations or material work.
@@ -164,41 +194,44 @@ pub enum AdmissionDecision {
 }
 
 /// A route is a semantic fingerprint, not a model/vendor name.
+///
+/// Behavior-bearing hashes are canonical lowercase 64-hex SHA-256
+/// ([`LowercaseSha256`], domain `eliot.agent.route-fingerprint.v6`):
+/// placeholders such as `sha256:runtime` are invalid and rejected at the
+/// deserialization boundary. Display names and provider locators are not
+/// identity proof and remain validated non-blank strings.
 #[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct RouteFingerprint {
     pub host_family: String,
     pub adapter: String,
     pub protocol_transport: String,
-    pub runtime_hash: String,
-    pub adapter_hash: String,
+    pub runtime_hash: LowercaseSha256,
+    pub adapter_hash: LowercaseSha256,
     pub provider: String,
     pub model: String,
     pub auth_billing: String,
-    pub serializer_hash: String,
-    pub tool_semantics_hash: String,
+    pub serializer_hash: LowercaseSha256,
+    pub tool_semantics_hash: LowercaseSha256,
     pub reasoning_mode: String,
     pub continuation_behavior: String,
-    pub feature_flags_hash: String,
+    pub feature_flags_hash: LowercaseSha256,
 }
 
 impl RouteFingerprint {
     /// Validates that all behavior-bearing identity components are present.
+    /// Hash fields are proven by [`LowercaseSha256`] at the deserialization
+    /// boundary; this validates the remaining display/locator components.
     pub fn validate(&self) -> Result<(), ContractError> {
         let values = [
             ("host_family", &self.host_family),
             ("adapter", &self.adapter),
             ("protocol_transport", &self.protocol_transport),
-            ("runtime_hash", &self.runtime_hash),
-            ("adapter_hash", &self.adapter_hash),
             ("provider", &self.provider),
             ("model", &self.model),
             ("auth_billing", &self.auth_billing),
-            ("serializer_hash", &self.serializer_hash),
-            ("tool_semantics_hash", &self.tool_semantics_hash),
             ("reasoning_mode", &self.reasoning_mode),
             ("continuation_behavior", &self.continuation_behavior),
-            ("feature_flags_hash", &self.feature_flags_hash),
         ];
         values
             .into_iter()
@@ -724,33 +757,6 @@ pub struct UsageReceipt {
     pub quota: QuotaKnowledge,
 }
 
-#[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct ActualRouteReceipt {
-    pub requested: RouteFingerprint,
-    pub observed: Option<RouteFingerprint>,
-    pub route_id: RouteFingerprintId,
-    pub usage: UsageReceipt,
-    pub started_at: String,
-    pub terminal_at: Option<String>,
-}
-
-impl ActualRouteReceipt {
-    pub fn validate(&self) -> Result<(), ContractError> {
-        self.requested.validate()?;
-        if let Some(observed) = &self.observed {
-            observed.validate()?;
-            if observed != &self.requested {
-                return Err(ContractError::RouteMismatch);
-            }
-        }
-        if self.started_at.trim().is_empty() {
-            return Err(ContractError::EmptyField("started_at"));
-        }
-        Ok(())
-    }
-}
-
 /// Durable attempt identity and its bounded projections.
 #[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -917,7 +923,13 @@ pub struct AgentResult {
     /// owned by the canonical effect/transition layer.
     pub unresolved_questions: Vec<String>,
     pub usage: UsageReceipt,
-    pub actual_route: ActualRouteReceipt,
+    /// Observed physical route/usage evidence, owned by
+    /// [`PhysicalRouteObservationReceipt`]. Requested/observed divergence is
+    /// preserved evidence here, never a schema error. Shape is validated
+    /// with the result; linkage against the admission and execution binding
+    /// is enforced at intake via
+    /// [`PhysicalRouteObservationReceipt::validate_against`].
+    pub actual_route: PhysicalRouteObservationReceipt,
     pub unknown_reason: Option<String>,
 }
 
@@ -936,132 +948,6 @@ impl AgentResult {
     }
 }
 
-/// Code-intelligence/route specialization.  It selects a capability only; it
-/// is not a scheduler or policy owner.
-#[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct CapabilityRouteDecision {
-    pub capability: String,
-    pub query_intent: String,
-    pub scope_ref: String,
-    pub policy_revision: String,
-    pub candidates: Vec<RouteFingerprint>,
-    pub selected: Option<RouteFingerprint>,
-    pub decision: AdmissionDecision,
-    pub evidence_refs: Vec<String>,
-}
-
-impl CapabilityRouteDecision {
-    pub fn validate(&self) -> Result<(), ContractError> {
-        for (field, value) in [
-            ("capability", &self.capability),
-            ("query_intent", &self.query_intent),
-            ("scope_ref", &self.scope_ref),
-            ("policy_revision", &self.policy_revision),
-        ] {
-            if value.trim().is_empty() {
-                return Err(ContractError::EmptyField(field));
-            }
-        }
-        if self.candidates.is_empty() {
-            return Err(ContractError::EmptyCollection("candidates"));
-        }
-        for candidate in &self.candidates {
-            candidate.validate()?;
-        }
-        if let Some(selected) = &self.selected
-            && !self.candidates.contains(selected)
-        {
-            return Err(ContractError::RouteMismatch);
-        }
-        Ok(())
-    }
-}
-
-/// Physical provider attempt receipt, kept separate from logical routing.
-#[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct PhysicalModelAttemptReceipt {
-    pub attempt_id: AttemptId,
-    pub logical_decision_ref: String,
-    pub requested_route: RouteFingerprint,
-    pub observed_route: Option<RouteFingerprint>,
-    pub request_digest: String,
-    pub translation_receipt: Option<String>,
-    pub started_at: String,
-    pub first_byte_at: Option<String>,
-    pub first_semantic_at: Option<String>,
-    pub terminal_at: Option<String>,
-    pub cancellation_disposition: Option<String>,
-    pub unknown_outcome: bool,
-    pub usage: UsageReceipt,
-    pub safe_public_error: Option<String>,
-    pub restricted_raw_error_ref: Option<String>,
-}
-
-impl PhysicalModelAttemptReceipt {
-    pub fn validate(&self) -> Result<(), ContractError> {
-        self.requested_route.validate()?;
-        if let Some(observed) = &self.observed_route {
-            observed.validate()?;
-            if observed != &self.requested_route {
-                return Err(ContractError::RouteMismatch);
-            }
-        }
-        for (field, value) in [
-            ("logical_decision_ref", &self.logical_decision_ref),
-            ("request_digest", &self.request_digest),
-            ("started_at", &self.started_at),
-        ] {
-            if value.trim().is_empty() {
-                return Err(ContractError::EmptyField(field));
-            }
-        }
-        if self.unknown_outcome && self.cancellation_disposition.is_none() {
-            return Err(ContractError::MissingUnknownReason);
-        }
-        Ok(())
-    }
-}
-
-/// Logical route choice, with no claim that a physical provider call occurred.
-#[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct RoutingReceipt {
-    pub decision_id: String,
-    pub requested_route: RouteFingerprint,
-    pub selected_route: Option<RouteFingerprint>,
-    pub alternatives: Vec<String>,
-    pub decision_source: String,
-    pub policy_revision: String,
-    pub state_fence: StateFence,
-    pub pinned_until_boundary: String,
-    pub evidence_refs: Vec<String>,
-}
-
-impl RoutingReceipt {
-    pub fn validate(&self) -> Result<(), ContractError> {
-        self.requested_route.validate()?;
-        for (field, value) in [
-            ("decision_id", &self.decision_id),
-            ("decision_source", &self.decision_source),
-            ("policy_revision", &self.policy_revision),
-            ("pinned_until_boundary", &self.pinned_until_boundary),
-        ] {
-            if value.trim().is_empty() {
-                return Err(ContractError::EmptyField(field));
-            }
-        }
-        if let Some(route) = &self.selected_route {
-            route.validate()?;
-        }
-        self.state_fence
-            .validate()
-            .map_err(|_| ContractError::InvalidStateFence)?;
-        Ok(())
-    }
-}
-
 /// Stable schema for downstream generators and fixture comparison.
 pub fn contract_schema() -> schemars::Schema {
     schemars::schema_for!(AgentLaunchRequest)
@@ -1073,22 +959,39 @@ mod tests {
 
     type TestResult = Result<(), Box<dyn std::error::Error>>;
 
-    fn route() -> RouteFingerprint {
-        RouteFingerprint {
+    /// Decodes one canonical digest fixture. Fixture digests are valid-form
+    /// lowercase hex; production placeholders such as `sha256:runtime` fail
+    /// this same decode and are covered as negatives below.
+    fn fixture_digest(value: &str) -> Result<LowercaseSha256, serde_json::Error> {
+        serde_json::from_value(serde_json::json!(value))
+    }
+
+    fn route() -> Result<RouteFingerprint, serde_json::Error> {
+        Ok(RouteFingerprint {
             host_family: "test-host".into(),
             adapter: "test-adapter".into(),
             protocol_transport: "loopback".into(),
-            runtime_hash: "sha256:runtime".into(),
-            adapter_hash: "sha256:adapter".into(),
+            runtime_hash: fixture_digest(
+                "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+            )?,
+            adapter_hash: fixture_digest(
+                "fedcba9876543210fedcba9876543210fedcba9876543210fedcba9876543210",
+            )?,
             provider: "provider".into(),
             model: "model".into(),
             auth_billing: "subscription".into(),
-            serializer_hash: "sha256:serializer".into(),
-            tool_semantics_hash: "sha256:tools".into(),
+            serializer_hash: fixture_digest(
+                "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            )?,
+            tool_semantics_hash: fixture_digest(
+                "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            )?,
             reasoning_mode: "visible".into(),
             continuation_behavior: "native_resume".into(),
-            feature_flags_hash: "sha256:features".into(),
-        }
+            feature_flags_hash: fixture_digest(
+                "1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef",
+            )?,
+        })
     }
 
     fn budget() -> BudgetEnvelope {
@@ -1110,19 +1013,185 @@ mod tests {
         }
     }
 
+    fn lease(value: &str) -> Result<WorkLeaseId, serde_json::Error> {
+        serde_json::from_value(serde_json::json!({
+            "namespace": "eliot.governor.work-lease",
+            "revision": "v1",
+            "value": value,
+        }))
+    }
+
+    fn zero_digest() -> Result<LowercaseSha256, serde_json::Error> {
+        fixture_digest("0000000000000000000000000000000000000000000000000000000000000000")
+    }
+
+    fn observation_binding(
+        attempt: &AttemptId,
+        lease_id: &WorkLeaseId,
+        route: &RouteFingerprint,
+        fence: &StateFence,
+    ) -> Result<ProviderExecutionBinding, Box<dyn std::error::Error>> {
+        Ok(ProviderExecutionBinding {
+            attempt_id: attempt.clone(),
+            lease_id: lease_id.clone(),
+            state_fence: fence.clone(),
+            runtime_generation: ResourceGeneration::new(1)?,
+            route: route.clone(),
+            session_id: None,
+            provider_scope_ref: "scope:test".into(),
+            native_session: NativeSession::Native(NativeSessionLocator::new("thread-1")?),
+            execution_unit: ExecutionUnit::new("test-provider", "unit-1")?,
+            start_request_id: RequestId::new("req-1")?,
+            start_request_sha256: eliot_contracts::sha256_hex(b"req-1"),
+        })
+    }
+
+    fn admitted_fixture(
+        attempt: &AttemptId,
+        lease_id: &WorkLeaseId,
+        route: &RouteFingerprint,
+        fence: &StateFence,
+    ) -> Result<AdmittedRouteReceipt, Box<dyn std::error::Error>> {
+        let candidate = RouteSelectionCandidate {
+            capability: "test-capability".into(),
+            query_intent: "test-intent".into(),
+            scope_ref: "scope:test".into(),
+            policy_revision: PolicyRevision::new(3)?,
+            candidates: vec![route.clone()],
+            selected: Some(route.clone()),
+            rejected: Vec::new(),
+            selection: CandidateSelectionDisposition::Selected,
+            evidence_refs: vec!["evidence-1".into()],
+        };
+        candidate.validate()?;
+        let mut receipt = AdmittedRouteReceipt {
+            schema_version: CONTRACT_VERSION.to_owned(),
+            decision_id: DecisionId::new("decision-1")?,
+            candidate_digest: candidate_digest_for(&candidate)?,
+            attempt_id: attempt.clone(),
+            lease_id: lease_id.clone(),
+            state_fence: fence.clone(),
+            runtime_generation: ResourceGeneration::new(1)?,
+            policy_revision: PolicyRevision::new(3)?,
+            requested_route: route.clone(),
+            selected_route: Some(route.clone()),
+            no_route: None,
+            evidence_refs: vec!["evidence-1".into()],
+            proof_ceiling: eliot_receipts::ProofCeiling::CandidateArtifact,
+            self_digest: zero_digest()?,
+        };
+        receipt.self_digest = receipt.compute_digest()?;
+        receipt.validate()?;
+        Ok(receipt)
+    }
+
+    fn matched_observation_fixture(
+        attempt: &AttemptId,
+        route: &RouteFingerprint,
+        fence: &StateFence,
+        admission: &AdmittedRouteReceipt,
+        binding: &ProviderExecutionBinding,
+    ) -> Result<PhysicalRouteObservationReceipt, Box<dyn std::error::Error>> {
+        let mut observation = PhysicalRouteObservationReceipt {
+            schema_version: CONTRACT_VERSION.to_owned(),
+            attempt_id: attempt.clone(),
+            state_fence: fence.clone(),
+            runtime_generation: ResourceGeneration::new(1)?,
+            admitted_route_digest: admission.self_digest.clone(),
+            binding: binding.clone(),
+            requested_route: route.clone(),
+            observed_route: Some(route.clone()),
+            route_state: RouteObservationState::Matched,
+            diverged_fields: Vec::new(),
+            execution_outcome: ExecutionOutcome::Observed,
+            request_digest: fixture_digest(
+                "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            )?,
+            translation_digest: None,
+            raw_evidence_digest: None,
+            raw_evidence_ref: None,
+            usage: UsageReceipt {
+                input_tokens: None,
+                output_tokens: None,
+                cost_microunits: None,
+                quota: QuotaKnowledge::Unknown,
+            },
+            started: ClockReading {
+                valid_time_ms: Some(1_000),
+                known_time_ms: Some(1_001),
+                transaction_sequence: None,
+                monotonic_ns: None,
+            },
+            first_byte: ClockReading::default(),
+            first_semantic: ClockReading::default(),
+            terminal: ClockReading {
+                valid_time_ms: Some(2_000),
+                known_time_ms: Some(2_001),
+                transaction_sequence: None,
+                monotonic_ns: None,
+            },
+            event_cursor: EventCursor::new("cursor-1")?,
+            event_sequence: 1,
+            cancellation: None,
+            unobserved_reason: None,
+            recovery_ref: None,
+            safe_public_error: None,
+            restricted_raw_error_ref: None,
+            self_digest: zero_digest()?,
+        };
+        observation.self_digest = observation.compute_digest()?;
+        observation.validate()?;
+        Ok(observation)
+    }
+
     #[test]
     fn route_identity_is_complete_and_deterministic() -> TestResult {
-        let route = route();
+        let route = route()?;
         route.validate()?;
         assert_eq!(route.canonical_json()?, route.canonical_json()?);
         Ok(())
     }
 
     #[test]
-    fn malformed_route_is_rejected() {
-        let mut route = route();
-        route.model.clear();
-        assert_eq!(route.validate(), Err(ContractError::EmptyField("model")));
+    fn malformed_route_is_rejected() -> TestResult {
+        let mut invalid = route()?;
+        invalid.model.clear();
+        assert_eq!(invalid.validate(), Err(ContractError::EmptyField("model")));
+
+        // Production placeholders are labels, not canonical digests: they
+        // fail at the deserialization boundary, never at a later stage.
+        for placeholder in [
+            "sha256:runtime",
+            "sha256:adapter",
+            "sha256:serializer",
+            "sha256:tools",
+            "sha256:features",
+            "sha256:route",
+        ] {
+            let mut wire = serde_json::to_value(route()?)?;
+            wire["runtime_hash"] = serde_json::json!(placeholder);
+            assert!(
+                serde_json::from_value::<RouteFingerprint>(wire).is_err(),
+                "placeholder must be rejected: {placeholder}"
+            );
+        }
+        // Malformed digest forms fail as well: empty, short, uppercase,
+        // non-hex, and wrong-length inputs are not digests.
+        for malformed in [
+            "",
+            "abc",
+            "0123456789ABCDEF0123456789ABCDEF0123456789ABCDEF0123456789ABCDEF",
+            "zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz",
+            "0123456789abcdef",
+        ] {
+            let mut wire = serde_json::to_value(route()?)?;
+            wire["adapter_hash"] = serde_json::json!(malformed);
+            assert!(
+                serde_json::from_value::<RouteFingerprint>(wire).is_err(),
+                "malformed digest must be rejected: {malformed}"
+            );
+        }
+        Ok(())
     }
 
     #[test]
@@ -1156,6 +1225,12 @@ mod tests {
 
     #[test]
     fn unknown_result_requires_reason() -> TestResult {
+        let route = route()?;
+        let attempt = AttemptId::new("attempt-1")?;
+        let lease_id = lease("lease-1")?;
+        let fence = StateFence::new(AuthorityEpoch::new(1)?, ResourceGeneration::new(1)?);
+        let admission = admitted_fixture(&attempt, &lease_id, &route, &fence)?;
+        let binding = observation_binding(&attempt, &lease_id, &route, &fence)?;
         let result = AgentResult {
             attempt_id: AttemptId::new("attempt-1")?,
             disposition: ResultDisposition::UnknownOutcome,
@@ -1169,19 +1244,9 @@ mod tests {
                 cost_microunits: None,
                 quota: QuotaKnowledge::Unknown,
             },
-            actual_route: ActualRouteReceipt {
-                requested: route(),
-                observed: None,
-                route_id: RouteFingerprintId::new("route-1")?,
-                usage: UsageReceipt {
-                    input_tokens: None,
-                    output_tokens: None,
-                    cost_microunits: None,
-                    quota: QuotaKnowledge::Unknown,
-                },
-                started_at: "2026-08-14T00:00:00Z".into(),
-                terminal_at: None,
-            },
+            actual_route: matched_observation_fixture(
+                &attempt, &route, &fence, &admission, &binding,
+            )?,
             unknown_reason: None,
         };
         assert_eq!(
@@ -1213,16 +1278,20 @@ mod tests {
                 stop_condition: "verified".into(),
             },
             session: None,
-            lease: serde_json::from_value::<WorkLeaseId>(serde_json::json!({"namespace": "eliot.governor.work-lease", "revision": "v1", "value": "lease-1"}))?,
+            lease: serde_json::from_value::<WorkLeaseId>(
+                serde_json::json!({"namespace": "eliot.governor.work-lease", "revision": "v1", "value": "lease-1"}),
+            )?,
             state: AttemptState::Completed,
             continuity: ContinuityKind::Fresh,
-            route: route(),
+            route: route()?,
             budget: budget(),
             authority: AuthorityEnvelope {
                 epoch: AuthorityEpoch::new(1)?,
                 scope_ref: "scope:test".into(),
                 effect_ceiling: ceiling(),
-                lease: serde_json::from_value::<WorkLeaseId>(serde_json::json!({"namespace": "eliot.governor.work-lease", "revision": "v1", "value": "lease-1"}))?,
+                lease: serde_json::from_value::<WorkLeaseId>(
+                    serde_json::json!({"namespace": "eliot.governor.work-lease", "revision": "v1", "value": "lease-1"}),
+                )?,
                 state_fence: StateFence::new(AuthorityEpoch::new(1)?, ResourceGeneration::new(1)?),
                 valid_until: "2026-08-14T00:00:00Z".into(),
             },
@@ -1256,7 +1325,9 @@ mod tests {
             epoch: AuthorityEpoch::new(1)?,
             scope_ref: "scope:test".into(),
             effect_ceiling: ceiling(),
-            lease: serde_json::from_value::<WorkLeaseId>(serde_json::json!({"namespace": "eliot.governor.work-lease", "revision": "v1", "value": "lease-1"}))?,
+            lease: serde_json::from_value::<WorkLeaseId>(
+                serde_json::json!({"namespace": "eliot.governor.work-lease", "revision": "v1", "value": "lease-1"}),
+            )?,
             state_fence: StateFence::new(AuthorityEpoch::new(1)?, ResourceGeneration::new(1)?),
             valid_until: "later".into(),
         };
@@ -1271,7 +1342,9 @@ mod tests {
             epoch: AuthorityEpoch::new(7)?,
             scope_ref: "scope:test".into(),
             effect_ceiling: ceiling(),
-            lease: serde_json::from_value::<WorkLeaseId>(serde_json::json!({"namespace": "eliot.governor.work-lease", "revision": "v1", "value": "lease-1"}))?,
+            lease: serde_json::from_value::<WorkLeaseId>(
+                serde_json::json!({"namespace": "eliot.governor.work-lease", "revision": "v1", "value": "lease-1"}),
+            )?,
             state_fence: StateFence::new(AuthorityEpoch::new(7)?, ResourceGeneration::new(3)?),
             valid_until: "later".into(),
         })
@@ -1369,7 +1442,7 @@ mod tests {
     }
 
     #[test]
-    fn api_case_08_cancel_and_routing_receipts_reject_legacy_and_zero_fences() -> TestResult {
+    fn api_case_08_cancel_and_admitted_receipts_reject_legacy_and_zero_fences() -> TestResult {
         let zero_fence = StateFence::new(AuthorityEpoch::default(), ResourceGeneration::default());
         let typed_cancel = CancelRequest {
             attempt_id: AttemptId::new("attempt-case-08")?,
@@ -1379,18 +1452,28 @@ mod tests {
         };
         assert!(typed_cancel.validate().is_err());
 
-        let typed_routing = RoutingReceipt {
-            decision_id: "decision-case-08-zero".into(),
-            requested_route: route(),
-            selected_route: None,
-            alternatives: Vec::new(),
-            decision_source: "test".into(),
-            policy_revision: "policy-1".into(),
+        let route = route()?;
+        let attempt = AttemptId::new("attempt-case-08")?;
+        let lease_id = lease("lease-case-08")?;
+        let typed_admitted = AdmittedRouteReceipt {
+            schema_version: CONTRACT_VERSION.to_owned(),
+            decision_id: DecisionId::new("decision-case-08-zero")?,
+            candidate_digest: fixture_digest(
+                "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            )?,
+            attempt_id: attempt.clone(),
+            lease_id: lease_id.clone(),
             state_fence: zero_fence,
-            pinned_until_boundary: "later".into(),
+            runtime_generation: ResourceGeneration::new(1)?,
+            policy_revision: PolicyRevision::new(3)?,
+            requested_route: route.clone(),
+            selected_route: Some(route.clone()),
+            no_route: None,
             evidence_refs: Vec::new(),
+            proof_ceiling: eliot_receipts::ProofCeiling::CandidateArtifact,
+            self_digest: zero_digest()?,
         };
-        assert!(typed_routing.validate().is_err());
+        assert!(typed_admitted.validate().is_err());
 
         let mut cancel = serde_json::json!({
             "attempt_id": "attempt-case-08",
@@ -1408,29 +1491,48 @@ mod tests {
         });
         assert!(serde_json::from_value::<CancelRequest>(cancel).is_err());
 
-        let routing = RoutingReceipt {
-            decision_id: "decision-case-08".into(),
-            requested_route: route(),
-            selected_route: None,
-            alternatives: Vec::new(),
-            decision_source: "test".into(),
-            policy_revision: "policy-1".into(),
-            state_fence: StateFence::new(AuthorityEpoch::new(1)?, ResourceGeneration::new(1)?),
-            pinned_until_boundary: "later".into(),
-            evidence_refs: Vec::new(),
-        };
-        let mut routing_wire = serde_json::to_value(&routing)?;
-        routing_wire["state_fence"] = serde_json::json!("legacy-fence");
-        assert!(serde_json::from_value::<RoutingReceipt>(routing_wire).is_err());
-        let mut zero_routing = serde_json::to_value(routing)?;
-        zero_routing["state_fence"] = serde_json::json!({
+        let fence = StateFence::new(AuthorityEpoch::new(1)?, ResourceGeneration::new(1)?);
+        let admitted = admitted_fixture(&attempt, &lease_id, &route, &fence)?;
+        let mut admitted_wire = serde_json::to_value(&admitted)?;
+        admitted_wire["state_fence"] = serde_json::json!("legacy-fence");
+        assert!(serde_json::from_value::<AdmittedRouteReceipt>(admitted_wire).is_err());
+        let mut zero_admitted = serde_json::to_value(&admitted)?;
+        zero_admitted["state_fence"] = serde_json::json!({
             "authority_epoch": 0,
             "resource_generation": 0,
             "task_revision": null,
             "policy_revision": null,
             "integration_revision": null
         });
-        assert!(serde_json::from_value::<RoutingReceipt>(zero_routing).is_err());
+        assert!(serde_json::from_value::<AdmittedRouteReceipt>(zero_admitted).is_err());
+
+        // A copied unchecked digest never validates: recomputation fails.
+        let mut forged = admitted.clone();
+        forged.self_digest =
+            fixture_digest("ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff")?;
+        assert_eq!(forged.validate(), Err(ContractError::DigestMismatch));
+        // Schema-version substitution fails: the digest binds the version.
+        let mut wrong_version = admitted.clone();
+        wrong_version.schema_version = "eliot-agent-api/v5".to_owned();
+        assert_eq!(
+            wrong_version.validate(),
+            Err(ContractError::UnknownContractVersion)
+        );
+        // Selected route and no-route disposition are exclusive.
+        let mut contradictory = admitted.clone();
+        contradictory.no_route = Some(NoRouteDisposition::AdmissionDenied);
+        assert_eq!(
+            contradictory.validate(),
+            Err(ContractError::InvalidRouteDisposition)
+        );
+        // Admission authorizes candidate work only, never verification.
+        let mut overclaim = admitted.clone();
+        overclaim.proof_ceiling = eliot_receipts::ProofCeiling::ScopedVerification;
+        overclaim.self_digest = overclaim.compute_digest()?;
+        assert_eq!(
+            overclaim.validate(),
+            Err(ContractError::InsufficientAuthority)
+        );
         Ok(())
     }
 
@@ -1498,18 +1600,22 @@ mod tests {
         // Blank and whitespace-only are still rejected.
         assert!(LaunchRequestId::new("   ").is_err());
         // Canonical WorkLeaseId (re-exported owner) rejects control/blank via validated object wire.
-        assert!(serde_json::from_value::<WorkLeaseId>(serde_json::json!({
-            "namespace": "eliot.governor.work-lease",
-            "revision": "v1",
-            "value": "lease\x00control"
-        }))
-        .is_err());
-        assert!(serde_json::from_value::<WorkLeaseId>(serde_json::json!({
-            "namespace": "eliot.governor.work-lease",
-            "revision": "v1",
-            "value": ""
-        }))
-        .is_err());
+        assert!(
+            serde_json::from_value::<WorkLeaseId>(serde_json::json!({
+                "namespace": "eliot.governor.work-lease",
+                "revision": "v1",
+                "value": "lease\x00control"
+            }))
+            .is_err()
+        );
+        assert!(
+            serde_json::from_value::<WorkLeaseId>(serde_json::json!({
+                "namespace": "eliot.governor.work-lease",
+                "revision": "v1",
+                "value": ""
+            }))
+            .is_err()
+        );
         // Valid values round-trip as canonical object wire.
         let lease = serde_json::from_value::<WorkLeaseId>(serde_json::json!({
             "namespace": "eliot.governor.work-lease",
@@ -1561,43 +1667,55 @@ mod tests {
         );
         assert!(serde_json::from_str::<WorkLeaseId>(r#""lease-case-12""#).is_err());
         // Wrong namespace/revision/blank/control/too-long must err.
-        assert!(serde_json::from_value::<WorkLeaseId>(serde_json::json!({
-            "namespace": "wrong.namespace",
-            "revision": "v1",
-            "value": "lease-case-12"
-        }))
-        .is_err());
-        assert!(serde_json::from_value::<WorkLeaseId>(serde_json::json!({
-            "namespace": eliot_contracts::WORK_LEASE_NAMESPACE,
-            "revision": "v2",
-            "value": "lease-case-12"
-        }))
-        .is_err());
-        assert!(serde_json::from_value::<WorkLeaseId>(serde_json::json!({
-            "namespace": eliot_contracts::WORK_LEASE_NAMESPACE,
-            "revision": eliot_contracts::WORK_LEASE_WIRE_REVISION,
-            "value": ""
-        }))
-        .is_err());
-        assert!(serde_json::from_value::<WorkLeaseId>(serde_json::json!({
-            "namespace": eliot_contracts::WORK_LEASE_NAMESPACE,
-            "revision": eliot_contracts::WORK_LEASE_WIRE_REVISION,
-            "value": "lease\x00control"
-        }))
-        .is_err());
-        assert!(serde_json::from_value::<WorkLeaseId>(serde_json::json!({
-            "namespace": eliot_contracts::WORK_LEASE_NAMESPACE,
-            "revision": eliot_contracts::WORK_LEASE_WIRE_REVISION,
-            "value": " lease-case-12"
-        }))
-        .is_err());
+        assert!(
+            serde_json::from_value::<WorkLeaseId>(serde_json::json!({
+                "namespace": "wrong.namespace",
+                "revision": "v1",
+                "value": "lease-case-12"
+            }))
+            .is_err()
+        );
+        assert!(
+            serde_json::from_value::<WorkLeaseId>(serde_json::json!({
+                "namespace": eliot_contracts::WORK_LEASE_NAMESPACE,
+                "revision": "v2",
+                "value": "lease-case-12"
+            }))
+            .is_err()
+        );
+        assert!(
+            serde_json::from_value::<WorkLeaseId>(serde_json::json!({
+                "namespace": eliot_contracts::WORK_LEASE_NAMESPACE,
+                "revision": eliot_contracts::WORK_LEASE_WIRE_REVISION,
+                "value": ""
+            }))
+            .is_err()
+        );
+        assert!(
+            serde_json::from_value::<WorkLeaseId>(serde_json::json!({
+                "namespace": eliot_contracts::WORK_LEASE_NAMESPACE,
+                "revision": eliot_contracts::WORK_LEASE_WIRE_REVISION,
+                "value": "lease\x00control"
+            }))
+            .is_err()
+        );
+        assert!(
+            serde_json::from_value::<WorkLeaseId>(serde_json::json!({
+                "namespace": eliot_contracts::WORK_LEASE_NAMESPACE,
+                "revision": eliot_contracts::WORK_LEASE_WIRE_REVISION,
+                "value": " lease-case-12"
+            }))
+            .is_err()
+        );
         let too_long = "a".repeat(eliot_contracts::WORK_LEASE_MAX_VALUE_LENGTH + 1);
-        assert!(serde_json::from_value::<WorkLeaseId>(serde_json::json!({
-            "namespace": eliot_contracts::WORK_LEASE_NAMESPACE,
-            "revision": eliot_contracts::WORK_LEASE_WIRE_REVISION,
-            "value": too_long
-        }))
-        .is_err());
+        assert!(
+            serde_json::from_value::<WorkLeaseId>(serde_json::json!({
+                "namespace": eliot_contracts::WORK_LEASE_NAMESPACE,
+                "revision": eliot_contracts::WORK_LEASE_WIRE_REVISION,
+                "value": too_long
+            }))
+            .is_err()
+        );
         // AuthorityEnvelope using the canonical object lease must still validate with typed StateFence.
         let envelope = AuthorityEnvelope {
             epoch: AuthorityEpoch::new(1)?,
@@ -1657,6 +1775,12 @@ mod tests {
         assert!(serde_json::from_value::<ResultDisposition>(serde_json::json!(0)).is_err());
         assert!(serde_json::from_value::<ResultDisposition>(serde_json::json!(null)).is_err());
         // Provider result must not contain effect_receipts.
+        let route = route()?;
+        let attempt = AttemptId::new("attempt-case-10")?;
+        let lease_id = lease("lease-case-10")?;
+        let fence = StateFence::new(AuthorityEpoch::new(1)?, ResourceGeneration::new(1)?);
+        let admission = admitted_fixture(&attempt, &lease_id, &route, &fence)?;
+        let binding = observation_binding(&attempt, &lease_id, &route, &fence)?;
         let api = AgentResult {
             attempt_id: AttemptId::new("attempt-case-10")?,
             disposition: ResultDisposition::CandidateSucceeded,
@@ -1670,19 +1794,9 @@ mod tests {
                 cost_microunits: None,
                 quota: QuotaKnowledge::Unknown,
             },
-            actual_route: ActualRouteReceipt {
-                requested: route(),
-                observed: Some(route()),
-                route_id: RouteFingerprintId::new("route-case-10")?,
-                usage: UsageReceipt {
-                    input_tokens: None,
-                    output_tokens: None,
-                    cost_microunits: None,
-                    quota: QuotaKnowledge::Unknown,
-                },
-                started_at: "2026-08-14T00:00:00Z".into(),
-                terminal_at: None,
-            },
+            actual_route: matched_observation_fixture(
+                &attempt, &route, &fence, &admission, &binding,
+            )?,
             unknown_reason: None,
         };
         api.validate(&ceiling())?;
@@ -1705,6 +1819,12 @@ mod tests {
 
     #[test]
     fn api_case_14_candidate_evidence_does_not_raise_proof_ceiling() -> TestResult {
+        let route = route()?;
+        let attempt = AttemptId::new("attempt-case-11")?;
+        let lease_id = lease("lease-case-11")?;
+        let fence = StateFence::new(AuthorityEpoch::new(1)?, ResourceGeneration::new(1)?);
+        let admission = admitted_fixture(&attempt, &lease_id, &route, &fence)?;
+        let binding = observation_binding(&attempt, &lease_id, &route, &fence)?;
         let mut result = AgentResult {
             attempt_id: AttemptId::new("attempt-case-11")?,
             disposition: ResultDisposition::CandidateSucceeded,
@@ -1718,19 +1838,9 @@ mod tests {
                 cost_microunits: None,
                 quota: QuotaKnowledge::Unknown,
             },
-            actual_route: ActualRouteReceipt {
-                requested: route(),
-                observed: Some(route()),
-                route_id: RouteFingerprintId::new("route-case-11")?,
-                usage: UsageReceipt {
-                    input_tokens: None,
-                    output_tokens: None,
-                    cost_microunits: None,
-                    quota: QuotaKnowledge::Unknown,
-                },
-                started_at: "2026-08-14T00:00:00Z".into(),
-                terminal_at: None,
-            },
+            actual_route: matched_observation_fixture(
+                &attempt, &route, &fence, &admission, &binding,
+            )?,
             unknown_reason: None,
         };
         // Candidate success with nonempty evidence remains candidate-only; it
@@ -1756,7 +1866,9 @@ mod tests {
     #[test]
     #[allow(clippy::unnecessary_wraps)]
     fn api_case_15_serialized_forgery_is_rejected() -> TestResult {
-        // Forged legacy JSON attempting to claim completion.
+        // Forged legacy JSON attempting to claim completion. The embedded
+        // v5 `actual_route` shape (raw string times, `route_id`, no digests)
+        // is itself rejected: old wires never silently upgrade.
         let forged = serde_json::json!({
             "attempt_id": "attempt-case-12",
             "disposition": "VERIFIED_COMPLETE",
@@ -1766,8 +1878,8 @@ mod tests {
             "unresolved_questions": [],
             "usage": {"input_tokens": null, "output_tokens": null, "cost_microunits": null, "quota": "unknown"},
             "actual_route": {
-                "requested": route(),
-                "observed": route(),
+                "requested": route()?,
+                "observed": route()?,
                 "route_id": "route-case-12",
                 "usage": {"input_tokens": null, "output_tokens": null, "cost_microunits": null, "quota": "unknown"},
                 "started_at": "2026-08-14T00:00:00Z",
@@ -1786,8 +1898,8 @@ mod tests {
             "unresolved_questions": [],
             "usage": {"input_tokens": null, "output_tokens": null, "cost_microunits": null, "quota": "unknown"},
             "actual_route": {
-                "requested": route(),
-                "observed": route(),
+                "requested": route()?,
+                "observed": route()?,
                 "route_id": "route-case-12",
                 "usage": {"input_tokens": null, "output_tokens": null, "cost_microunits": null, "quota": "unknown"},
                 "started_at": "2026-08-14T00:00:00Z",
@@ -1806,8 +1918,8 @@ mod tests {
             "unresolved_questions": [],
             "usage": {"input_tokens": null, "output_tokens": null, "cost_microunits": null, "quota": "unknown"},
             "actual_route": {
-                "requested": route(),
-                "observed": route(),
+                "requested": route()?,
+                "observed": route()?,
                 "route_id": "route-case-12",
                 "usage": {"input_tokens": null, "output_tokens": null, "cost_microunits": null, "quota": "unknown"},
                 "started_at": "2026-08-14T00:00:00Z",
