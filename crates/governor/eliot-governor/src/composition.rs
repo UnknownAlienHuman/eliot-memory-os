@@ -17,6 +17,7 @@ use crate::activation_outcome::{
 use crate::controlboard_projection::{
     ControlBoardGovernorSnapshot, ControlBoardProjectionParts, compile_controlboard_snapshot,
 };
+use crate::observation_reconciliation::GovernorObservationReconciliation;
 use crate::owner_projection_refresh::{coherence_result, compare_scope_heads};
 use crate::skill_lifecycle::GovernorSkillLifecycle;
 use crate::{
@@ -1585,6 +1586,27 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
             &self.owners.skill,
             &self.owners.canonical,
             self.kernel.as_ref(),
+        )
+    }
+
+    /// Borrows the single observation/verified-repair reconciliation owner as
+    /// a canonical [`GovernorObservationReconciliation`] adapter.
+    ///
+    /// The adapter reads the current `observation: ObservationJournal` owner
+    /// (recovered via the `Observation` named read) together with the
+    /// `ProblemOwner` revision map, the canonical admission owner, and the
+    /// retained neutral Kernel port. It creates no per-caller journal or
+    /// problem map; admission commits through the existing canonical path
+    /// and publishes only via `refresh_from_kernel` at the returned receipt
+    /// revisions.
+    #[must_use]
+    pub fn observation_reconciliation(&self) -> GovernorObservationReconciliation<'_, P> {
+        GovernorObservationReconciliation::new(
+            &self.owners.observation,
+            &self.owners.problem.revisions,
+            &self.owners.canonical,
+            self.kernel.as_ref(),
+            self.readiness,
         )
     }
 

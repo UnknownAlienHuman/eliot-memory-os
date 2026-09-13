@@ -1188,6 +1188,7 @@ dependencies = [
  "eliot-config",
  "eliot-contracts",
  "eliot-coordination",
+ "eliot-doctor-core",
  "eliot-finish",
  "eliot-maintenance",
  "eliot-module-registry",
@@ -1206,6 +1207,7 @@ dependencies = [
  "serde",
  "serde_json",
  "thiserror",
+ "time",
 ]
 
 [[package]]
@@ -2372,6 +2374,7 @@ dependencies = [
  "eliot-authority",
  "eliot-contracts",
  "eliot-controlboard",
+ "eliot-doctor-core",
  "eliot-governor",
  "eliot-ipc",
  "eliot-maintenance",
@@ -2382,6 +2385,7 @@ dependencies = [
  "eliot-runtime-contracts",
  "eliot-skill",
  "eliot-store-api",
+ "eliot-watchdog-core",
  "serde",
  "serde_json",
  "thiserror",
