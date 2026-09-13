@@ -946,6 +946,62 @@ impl AgentResult {
         }
         Ok(())
     }
+
+    /// Validates a candidate result against its live execution binding,
+    /// admission, and effect ceiling (T4 S5, issue #370).
+    ///
+    /// Fail-closed contextual validation; it constructs no Finish state,
+    /// raises no proof ceiling, mints no effect receipt, and synthesizes no
+    /// `observed = requested` route. `UnknownOutcome` ownership stays with
+    /// the coordinator reconciliation path; this method only enforces the
+    /// linkage below plus the existing shape/ceiling checks.
+    ///
+    /// Enforced, in order:
+    /// - (a) physical linkage via
+    ///   [`PhysicalRouteObservationReceipt::validate_against`], which rejects
+    ///   a forged binding and preserves `DIVERGED`/`UNOBSERVED` evidence;
+    /// - (b) three-way attempt identity: `self.attempt_id`,
+    ///   `binding.attempt_id`, `self.actual_route.attempt_id`, and
+    ///   `admission.attempt_id` (field declared at
+    ///   `src/route_receipts.rs:427`) must agree by typed `==`;
+    /// - (c) lease/fence/generation/route agreement between the presented
+    ///   binding and the admission, consistent with
+    ///   [`validate_execution_binding`]: exact typed-object `==` on
+    ///   `lease_id`, `state_fence`, `runtime_generation`, and admitted route
+    ///   identity — never text matching, numeric casts, or UUID-string
+    ///   comparison;
+    /// - (d) per-effect attempt match: every
+    ///   [`ProposedEffect::attempt_id`] equals `self.attempt_id` (the gap S5
+    ///   closes);
+    /// - existing shape/ceiling/unknown-reason checks via [`Self::validate`]
+    ///   (per-effect ceiling/scope plus unknown-reason).
+    pub fn validate_for_binding(
+        &self,
+        binding: &ProviderExecutionBinding,
+        admission: &AdmittedRouteReceipt,
+        ceiling: &EffectCeiling,
+    ) -> Result<(), ContractError> {
+        self.actual_route.validate_against(binding, admission)?;
+        if self.attempt_id != binding.attempt_id
+            || self.attempt_id != self.actual_route.attempt_id
+            || self.attempt_id != admission.attempt_id
+        {
+            return Err(ContractError::BindingMismatch);
+        }
+        if binding.lease_id != admission.lease_id
+            || binding.state_fence != admission.state_fence
+            || binding.runtime_generation != admission.runtime_generation
+            || binding.route != admission.requested_route
+        {
+            return Err(ContractError::BindingMismatch);
+        }
+        for effect in &self.proposed_effects {
+            if effect.attempt_id != self.attempt_id {
+                return Err(ContractError::BindingMismatch);
+            }
+        }
+        self.validate(ceiling)
+    }
 }
 
 /// Stable schema for downstream generators and fixture comparison.
@@ -1928,6 +1984,135 @@ mod tests {
             "unknown_reason": null
         });
         assert!(serde_json::from_value::<AgentResult>(forged_num).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn api_case_16_result_binding_triple_mismatch_rejected() -> TestResult {
+        // S5 (a)-(b): the physical observation matches the live binding and
+        // admission, but the result names a foreign attempt. Shape-only
+        // `validate` would accept the observation; `validate_for_binding`
+        // must reject the foreign turn with `BindingMismatch`.
+        let route = route()?;
+        let attempt = AttemptId::new("attempt-s5-16")?;
+        let lease_id = lease("lease-s5-16")?;
+        let fence = StateFence::new(AuthorityEpoch::new(1)?, ResourceGeneration::new(1)?);
+        let admission = admitted_fixture(&attempt, &lease_id, &route, &fence)?;
+        let binding = observation_binding(&attempt, &lease_id, &route, &fence)?;
+        let observation =
+            matched_observation_fixture(&attempt, &route, &fence, &admission, &binding)?;
+        let result = AgentResult {
+            attempt_id: AttemptId::new("attempt-s5-16-foreign")?,
+            disposition: ResultDisposition::CandidateSucceeded,
+            artifacts: Vec::new(),
+            evidence_refs: Vec::new(),
+            proposed_effects: Vec::new(),
+            unresolved_questions: Vec::new(),
+            usage: UsageReceipt {
+                input_tokens: None,
+                output_tokens: None,
+                cost_microunits: None,
+                quota: QuotaKnowledge::Unknown,
+            },
+            actual_route: observation,
+            unknown_reason: None,
+        };
+        assert_eq!(
+            result.validate_for_binding(&binding, &admission, &ceiling()),
+            Err(ContractError::BindingMismatch)
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn api_case_17_proposed_effect_attempt_mismatch_rejected() -> TestResult {
+        // S5 (d): the result/binding/admission triple agrees, but one
+        // proposed effect names a foreign attempt. The ceiling/scope check
+        // alone would pass (Observe under scope:test); the per-effect
+        // attempt match must reject it.
+        let route = route()?;
+        let attempt = AttemptId::new("attempt-s5-17")?;
+        let lease_id = lease("lease-s5-17")?;
+        let fence = StateFence::new(AuthorityEpoch::new(1)?, ResourceGeneration::new(1)?);
+        let admission = admitted_fixture(&attempt, &lease_id, &route, &fence)?;
+        let binding = observation_binding(&attempt, &lease_id, &route, &fence)?;
+        let observation =
+            matched_observation_fixture(&attempt, &route, &fence, &admission, &binding)?;
+        let foreign_effect = ProposedEffect {
+            effect_id: "effect-s5-17-foreign".into(),
+            attempt_id: AttemptId::new("attempt-s5-17-foreign")?,
+            kind: EffectKind::Observe,
+            scope_ref: "scope:test".into(),
+            payload_digest: "payload-1".into(),
+            rationale_ref: None,
+        };
+        // Sanity: the effect itself satisfies the ceiling, so only the
+        // attempt linkage can fail.
+        foreign_effect.validate_against(&ceiling())?;
+        let result = AgentResult {
+            attempt_id: attempt.clone(),
+            disposition: ResultDisposition::CandidateSucceeded,
+            artifacts: Vec::new(),
+            evidence_refs: Vec::new(),
+            proposed_effects: vec![foreign_effect],
+            unresolved_questions: Vec::new(),
+            usage: UsageReceipt {
+                input_tokens: None,
+                output_tokens: None,
+                cost_microunits: None,
+                quota: QuotaKnowledge::Unknown,
+            },
+            actual_route: observation,
+            unknown_reason: None,
+        };
+        assert_eq!(
+            result.validate_for_binding(&binding, &admission, &ceiling()),
+            Err(ContractError::BindingMismatch)
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn api_case_18_result_binding_admission_ceiling_accepted() -> TestResult {
+        // S5 happy path: exact binding + admission + ceiling, including one
+        // ceiling-permitted effect bound to the same attempt.
+        let route = route()?;
+        let attempt = AttemptId::new("attempt-s5-18")?;
+        let lease_id = lease("lease-s5-18")?;
+        let fence = StateFence::new(AuthorityEpoch::new(1)?, ResourceGeneration::new(1)?);
+        let admission = admitted_fixture(&attempt, &lease_id, &route, &fence)?;
+        let binding = observation_binding(&attempt, &lease_id, &route, &fence)?;
+        let observation =
+            matched_observation_fixture(&attempt, &route, &fence, &admission, &binding)?;
+        let effect = ProposedEffect {
+            effect_id: "effect-s5-18-1".into(),
+            attempt_id: attempt.clone(),
+            kind: EffectKind::Observe,
+            scope_ref: "scope:test".into(),
+            payload_digest: "payload-1".into(),
+            rationale_ref: None,
+        };
+        let result = AgentResult {
+            attempt_id: attempt.clone(),
+            disposition: ResultDisposition::CandidateSucceeded,
+            artifacts: Vec::new(),
+            evidence_refs: Vec::new(),
+            proposed_effects: vec![effect],
+            unresolved_questions: Vec::new(),
+            usage: UsageReceipt {
+                input_tokens: None,
+                output_tokens: None,
+                cost_microunits: None,
+                quota: QuotaKnowledge::Unknown,
+            },
+            actual_route: observation,
+            unknown_reason: None,
+        };
+        assert!(
+            result
+                .validate_for_binding(&binding, &admission, &ceiling())
+                .is_ok()
+        );
         Ok(())
     }
 }
