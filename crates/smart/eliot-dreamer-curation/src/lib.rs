@@ -84,7 +84,7 @@ fn redact(value: &str) -> String {
     out
 }
 
-fn contract_detail(err: ContractViolation) -> String {
+fn contract_detail(err: &ContractViolation) -> String {
     redact(&err.to_string())
 }
 
@@ -166,7 +166,7 @@ fn canonical_families() -> Result<Vec<CurationFamily>, CurationRoutingError> {
     let mut families = Vec::with_capacity(CURATION_FAMILIES.len());
     for spelling in CURATION_FAMILIES {
         let family = parse_family(spelling).map_err(|err| CurationRoutingError::Registry {
-            detail: contract_detail(err),
+            detail: contract_detail(&err),
         })?;
         families.push(family);
     }
@@ -456,11 +456,11 @@ impl ValidatedCurationBatch {
             .validate()
             .map_err(|err| CurationRoutingError::Batch {
                 field: "requester",
-                detail: contract_detail(err),
+                detail: contract_detail(&err),
             })?;
         check_fence(&self.state_fence).map_err(|err| CurationRoutingError::Batch {
             field: "state_fence",
-            detail: contract_detail(err),
+            detail: contract_detail(&err),
         })?;
         check_digest(&self.bundle_digest, "bundle_digest")?;
         check_digest(&self.manifest_digest, "manifest_digest")?;
@@ -468,7 +468,7 @@ impl ValidatedCurationBatch {
         self.receipt
             .validate()
             .map_err(|err| CurationRoutingError::Receipt {
-                detail: contract_detail(err),
+                detail: contract_detail(&err),
             })?;
         if self.receipt.terminal_disposition != "accepted"
             && self.receipt.terminal_disposition != "partial"
@@ -486,7 +486,7 @@ impl ValidatedCurationBatch {
         self.denominator
             .validate()
             .map_err(|err| CurationRoutingError::Denominator {
-                detail: contract_detail(err),
+                detail: contract_detail(&err),
             })?;
         if self.privacy_profile != PRIVACY_LOCAL_ONLY
             && self.privacy_profile != PRIVACY_GOVERNED_EXTERNAL
@@ -729,7 +729,7 @@ impl CurationPortSet<'_> {
                 .port
                 .validate()
                 .map_err(|err| CurationRoutingError::Port {
-                    detail: contract_detail(err),
+                    detail: contract_detail(&err),
                 })?;
             let Some(declared) = registry
                 .handlers
@@ -1033,6 +1033,13 @@ impl CurationCandidateSet {    /// Validates intrinsic set shape, count reconcil
     /// disagrees with per-member counts, any frontier or omission that
     /// disagrees with member state, or any set digest that does not recompute.
     pub fn validate(&self) -> Result<(), CurationRoutingError> {
+        self.validate_set_bindings()?;
+        self.validate_set_tallies()?;
+        self.validate_set_coverage()?;
+        Ok(())
+    }
+
+    fn validate_set_bindings(&self) -> Result<(), CurationRoutingError> {
         let failed = |detail: &str| CurationRoutingError::Batch {
             field: "candidate_set",
             detail: detail.to_owned(),
@@ -1059,7 +1066,7 @@ impl CurationCandidateSet {    /// Validates intrinsic set shape, count reconcil
         self.denominator
             .validate()
             .map_err(|err| CurationRoutingError::Denominator {
-                detail: contract_detail(err),
+                detail: contract_detail(&err),
             })?;
         self.budgets
             .validate()
@@ -1070,6 +1077,14 @@ impl CurationCandidateSet {    /// Validates intrinsic set shape, count reconcil
         if self.proof_note != ROUTING_PROOF_NOTE {
             return Err(failed("proof note must be the routing-only ceiling"));
         }
+        Ok(())
+    }
+
+    fn validate_set_tallies(&self) -> Result<(), CurationRoutingError> {
+        let failed = |detail: &str| CurationRoutingError::Batch {
+            field: "candidate_set",
+            detail: detail.to_owned(),
+        };
         let mut seen: Vec<&str> = Vec::with_capacity(self.members.len());
         let mut accepted = 0u32;
         let mut rejected = 0u32;
@@ -1113,6 +1128,14 @@ impl CurationCandidateSet {    /// Validates intrinsic set shape, count reconcil
         if self.total_handler_calls != total_calls {
             return Err(failed("total handler calls must equal the per-member sum"));
         }
+        Ok(())
+    }
+
+    fn validate_set_coverage(&self) -> Result<(), CurationRoutingError> {
+        let failed = |detail: &str| CurationRoutingError::Batch {
+            field: "candidate_set",
+            detail: detail.to_owned(),
+        };
         let frontier: Vec<&str> = self
             .members
             .iter()
@@ -1335,14 +1358,14 @@ pub fn route_validated_curation(
         .validate()
         .map_err(|err| CurationRoutingError::Batch {
             field: "budgets",
-            detail: contract_detail(err),
+            detail: contract_detail(&err),
         })?;
     batch
         .usage
         .fits(&batch.budgets)
         .map_err(|err| CurationRoutingError::Batch {
             field: "budgets",
-            detail: contract_detail(err),
+            detail: contract_detail(&err),
         })?;
     let input_digest = compute_input_digest(batch, screen, &registry_digest, policy)?;
     if input_digest != batch.input_digest {
@@ -1416,7 +1439,7 @@ fn validate_registry(registry: &CurationHandlerRegistry) -> Result<String, Curat
     registry
         .validate_closure()
         .map_err(|err| CurationRoutingError::Registry {
-            detail: contract_detail(err),
+            detail: contract_detail(&err),
         })?;
     if registry.handlers.len() != EXPECTED_OWNER_DESCRIPTORS {
         return Err(CurationRoutingError::Registry {
@@ -1443,7 +1466,7 @@ fn validate_registry(registry: &CurationHandlerRegistry) -> Result<String, Curat
     registry
         .digest()
         .map_err(|err| CurationRoutingError::Registry {
-            detail: contract_detail(err),
+            detail: contract_detail(&err),
         })
 }
 
