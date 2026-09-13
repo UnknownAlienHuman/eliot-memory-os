@@ -14,9 +14,15 @@ mod tests {
             "generation": 3,
             "action_lease_ref": "lease-1",
             "authority_id": "authority-1",
-            "authority_epoch": 7,
+            "authority_epoch": {
+                "lineage_id": "11111111-1111-4111-8111-111111111111",
+                "sequence": 7
+            },
             "state_fence": {
-                "authority_epoch": 7,
+                "authority_epoch": {
+                    "lineage_id": "11111111-1111-4111-8111-111111111111",
+                    "sequence": 7
+                },
                 "generation": 3,
                 "nonce": "fence-1"
             },
@@ -837,13 +843,78 @@ mod tests {
         )?;
 
         let mut invalid_binding = serde_json::to_value(&evidence)?;
-        invalid_binding["binding"]["authority_epoch"] = serde_json::json!(8);
+        invalid_binding["binding"]["authority_epoch"] = serde_json::json!({
+            "lineage_id": "11111111-1111-4111-8111-111111111111",
+            "sequence": 8
+        });
         assert!(serde_json::from_value::<ProcessStreamEvidence>(invalid_binding).is_err());
+
+        // v3 numeric epochs are quarantined, never promoted to authority.
+        let mut numeric_binding = serde_json::to_value(&evidence)?;
+        numeric_binding["binding"]["authority_epoch"] = serde_json::json!(8);
+        assert!(serde_json::from_value::<ProcessStreamEvidence>(numeric_binding).is_err());
+        let mut numeric_fence = serde_json::to_value(&evidence)?;
+        numeric_fence["binding"]["state_fence"]["authority_epoch"] = serde_json::json!(7);
+        assert!(serde_json::from_value::<ProcessStreamEvidence>(numeric_fence).is_err());
 
         let mut promoted = serde_json::to_value(evidence)?;
         promoted["parsing"] = serde_json::json!("PARSED");
         promoted["evaluation"] = serde_json::json!("PASS");
         assert!(serde_json::from_value::<ProcessStreamEvidence>(promoted).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn stream_evidence_binds_full_epoch_lineage() -> TestResult {
+        // Equal sequences from different lineages are unrelated and never
+        // authorize: top-level epoch on lineage B vs fence on lineage A.
+        let mut mismatched = serde_json::to_value(binding()?)?;
+        mismatched["authority_epoch"] = serde_json::json!({
+            "lineage_id": "22222222-2222-4222-8222-222222222222",
+            "sequence": 7
+        });
+        let mismatched_binding: ProcessExecutionBinding =
+            serde_json::from_value(mismatched)?;
+        assert!(
+            ProcessStreamEvidence::new_raw(
+                mismatched_binding,
+                ProcessStreamKind::Stdout,
+                policy()?,
+                StreamTransportStatus::Complete,
+                StreamPersistenceStatus::CompleteSource,
+                sha256_hex(b"abc"),
+                3,
+                ProcessStreamPrefixPreview::from_transport_prefix(b"abc".to_vec(), 3)?,
+                Some(exact_source(b"abc")?),
+                Vec::new(),
+            )
+            .is_err()
+        );
+
+        // A fully consistent lineage-B binding carries the full EpochId and validates.
+        let mut lineage_b = serde_json::to_value(binding()?)?;
+        let b_epoch = serde_json::json!({
+            "lineage_id": "22222222-2222-4222-8222-222222222222",
+            "sequence": 7
+        });
+        lineage_b["authority_epoch"] = b_epoch.clone();
+        lineage_b["state_fence"]["authority_epoch"] = b_epoch;
+        let consistent: ProcessExecutionBinding = serde_json::from_value(lineage_b)?;
+        assert!(
+            ProcessStreamEvidence::new_raw(
+                consistent,
+                ProcessStreamKind::Stdout,
+                policy()?,
+                StreamTransportStatus::Complete,
+                StreamPersistenceStatus::CompleteSource,
+                sha256_hex(b"abc"),
+                3,
+                ProcessStreamPrefixPreview::from_transport_prefix(b"abc".to_vec(), 3)?,
+                Some(exact_source(b"abc")?),
+                Vec::new(),
+            )
+            .is_ok()
+        );
         Ok(())
     }
 

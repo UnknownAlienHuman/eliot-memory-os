@@ -20,8 +20,18 @@ fn binding() -> TestResult<ProcessExecutionBinding> {
         "generation": 3,
         "action_lease_ref": "lease-1",
         "authority_id": "authority-1",
-        "authority_epoch": 7,
-        "state_fence": {"authority_epoch": 7, "generation": 3, "nonce": "fence-1"},
+        "authority_epoch": {
+            "lineage_id": "11111111-1111-4111-8111-111111111111",
+            "sequence": 7
+        },
+        "state_fence": {
+            "authority_epoch": {
+                "lineage_id": "11111111-1111-4111-8111-111111111111",
+                "sequence": 7
+            },
+            "generation": 3,
+            "nonce": "fence-1"
+        },
         "request_digest": "a".repeat(64),
         "permit_digest": "b".repeat(64),
         "effect_digest": "c".repeat(64),
@@ -1334,7 +1344,10 @@ fn terminal_identity_is_idempotent_and_unknown_readback_is_write_fenced() -> Tes
 fn binding_stream_policy_source_and_evidence_authority_mismatches_reject() -> TestResult {
     let session = session("one")?;
     let mut other = serde_json::to_value(binding()?)?;
-    other["authority_epoch"] = serde_json::json!(8);
+    other["authority_epoch"] = serde_json::json!({
+        "lineage_id": "11111111-1111-4111-8111-111111111111",
+        "sequence": 8
+    });
     let other_binding: ProcessExecutionBinding = serde_json::from_value(other)?;
     let evidence = ProcessStreamEvidence::new_raw(
         other_binding,
@@ -1368,6 +1381,67 @@ fn binding_stream_policy_source_and_evidence_authority_mismatches_reject() -> Te
         ProcessStreamSinkError::PolicyMismatch
     ));
     assert_eq!(session.stream(), ProcessStreamKind::Stdout);
+    Ok(())
+}
+
+#[test]
+fn sink_binding_binds_full_epoch_lineage() -> TestResult {
+    // Equal sequences from different lineages are unrelated: a session whose
+    // top-level epoch is lineage B while the fence stays lineage A must fail
+    // closed at open-request validation (full-pair EpochId match).
+    let mut mismatched = serde_json::to_value(binding()?)?;
+    mismatched["authority_epoch"] = serde_json::json!({
+        "lineage_id": "22222222-2222-4222-8222-222222222222",
+        "sequence": 7
+    });
+    let mismatched_binding: ProcessExecutionBinding = serde_json::from_value(mismatched)?;
+    assert!(
+        open_request("lineage-mismatch")
+            .and_then(|_| {
+                ProcessStreamSinkOpenRequest::new(
+                    ProcessStreamSinkSessionId::new("lineage-mismatch")?,
+                    ProcessStreamSinkSourceId::new("source:lineage-mismatch")?,
+                    ProcessStreamSinkTerminalId::new("terminal:lineage-mismatch")?,
+                    mismatched_binding,
+                    ProcessStreamKind::Stdout,
+                    policy()?,
+                    limits()?,
+                    ProcessStreamDigestAlgorithm::Sha256,
+                    ProcessStreamDigestAlgorithm::Sha256,
+                )
+                .map_err(|error| Box::<dyn std::error::Error>::from(error.to_string()))
+            })
+            .is_err()
+    );
+
+    // v3 numeric epochs are quarantined, never promoted to authority.
+    let mut numeric = serde_json::to_value(binding()?)?;
+    numeric["authority_epoch"] = serde_json::json!(7);
+    assert!(serde_json::from_value::<ProcessExecutionBinding>(numeric).is_err());
+
+    // A fully consistent lineage-B binding opens successfully.
+    let mut lineage_b = serde_json::to_value(binding()?)?;
+    let b_epoch = serde_json::json!({
+        "lineage_id": "22222222-2222-4222-8222-222222222222",
+        "sequence": 7
+    });
+    lineage_b["authority_epoch"] = b_epoch.clone();
+    lineage_b["state_fence"]["authority_epoch"] = b_epoch;
+    let consistent: ProcessExecutionBinding = serde_json::from_value(lineage_b)?;
+    assert!(
+        ProcessStreamSinkOpenRequest::new(
+            ProcessStreamSinkSessionId::new("lineage-b")?,
+            ProcessStreamSinkSourceId::new("source:lineage-b")?,
+            ProcessStreamSinkTerminalId::new("terminal:lineage-b")?,
+            consistent,
+            ProcessStreamKind::Stdout,
+            policy()?,
+            limits()?,
+            ProcessStreamDigestAlgorithm::Sha256,
+            ProcessStreamDigestAlgorithm::Sha256,
+        )
+        .is_ok()
+    );
     Ok(())
 }
 

@@ -38,7 +38,7 @@ struct ProcessExecutionBindingValidationWire {
     generation: Generation,
     action_lease_ref: ActionLeaseRef,
     authority_id: DispatchAuthorityId,
-    authority_epoch: u64,
+    authority_epoch: EpochId,
     state_fence: FencingToken,
     request_digest: String,
     permit_digest: String,
@@ -69,9 +69,17 @@ fn validate_process_execution_binding(
         }
     }
     if wire.generation.get() == 0
-        || wire.authority_epoch == 0
         || wire.validation_revision == 0
-        || wire.state_fence.authority_epoch() != wire.authority_epoch
+        // Full-pair (lineage_id, sequence) authority match on the canonical
+        // EpochId; equal sequences from different lineages are unrelated and
+        // never authorize here. `EpochId` validity (validated lineage plus
+        // non-zero sequence) is enforced by the type itself, so no scalar
+        // zero-check exists; a v3 numeric `authority_epoch` fails to
+        // deserialize into this wire (quarantine, not silent promotion).
+        || !wire
+            .state_fence
+            .authority_epoch()
+            .is_same_authority(&wire.authority_epoch)
         || wire.state_fence.generation() != wire.generation
     {
         return Err(ProcessStreamEvidenceError::InvalidBinding);

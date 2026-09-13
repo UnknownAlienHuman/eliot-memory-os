@@ -20,9 +20,15 @@ fn binding(operation_id: &str) -> TestResult<ProcessExecutionBinding> {
         "generation": 3,
         "action_lease_ref": "lease-1",
         "authority_id": "authority-1",
-        "authority_epoch": 7,
+        "authority_epoch": {
+            "lineage_id": "11111111-1111-4111-8111-111111111111",
+            "sequence": 7
+        },
         "state_fence": {
-            "authority_epoch": 7,
+            "authority_epoch": {
+                "lineage_id": "11111111-1111-4111-8111-111111111111",
+                "sequence": 7
+            },
             "generation": 3,
             "nonce": "fence-1"
         },

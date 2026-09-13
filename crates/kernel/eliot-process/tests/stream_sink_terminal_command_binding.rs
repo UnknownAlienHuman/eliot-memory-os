@@ -28,8 +28,18 @@ fn binding() -> TestResult<ProcessExecutionBinding> {
         "generation": 3,
         "action_lease_ref": "lease-1",
         "authority_id": "authority-1",
-        "authority_epoch": 7,
-        "state_fence": {"authority_epoch": 7, "generation": 3, "nonce": "fence-1"},
+        "authority_epoch": {
+            "lineage_id": "11111111-1111-4111-8111-111111111111",
+            "sequence": 7
+        },
+        "state_fence": {
+            "authority_epoch": {
+                "lineage_id": "11111111-1111-4111-8111-111111111111",
+                "sequence": 7
+            },
+            "generation": 3,
+            "nonce": "fence-1"
+        },
         "request_digest": "a".repeat(64),
         "permit_digest": "b".repeat(64),
         "effect_digest": "c".repeat(64),

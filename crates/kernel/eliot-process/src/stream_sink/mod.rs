@@ -1,6 +1,6 @@
 //! Bounded provider-neutral process stream persistence-session contract.
 
-use eliot_contracts::{canonical_json_bytes, sha256_hex};
+use eliot_contracts::{EpochId, canonical_json_bytes, sha256_hex};
 use serde::Serialize;
 use thiserror::Error;
 
@@ -99,10 +99,15 @@ fn validate_binding(binding: &ProcessExecutionBinding) -> Result<(), ProcessStre
             return Err(ProcessStreamSinkError::InvalidBinding);
         }
     }
-    let epoch = object
+    // Canonical `{lineage_id, sequence}` object shape (matching `EpochId`'s
+    // Serialize); a v3 bare-number `authority_epoch` fails to deserialize here
+    // (quarantine, not silent promotion). Validity (validated lineage plus
+    // non-zero sequence) is enforced by the canonical type itself.
+    let epoch_value = object
         .get("authority_epoch")
-        .and_then(serde_json::Value::as_u64)
         .ok_or(ProcessStreamSinkError::InvalidBinding)?;
+    let epoch: EpochId = serde_json::from_value(epoch_value.clone())
+        .map_err(|_| ProcessStreamSinkError::InvalidBinding)?;
     let revision = object
         .get("validation_revision")
         .and_then(serde_json::Value::as_u64)
@@ -115,13 +120,16 @@ fn validate_binding(binding: &ProcessExecutionBinding) -> Result<(), ProcessStre
         .get("state_fence")
         .and_then(serde_json::Value::as_object)
         .ok_or(ProcessStreamSinkError::InvalidBinding)?;
-    if epoch == 0
-        || revision == 0
+    let fence_epoch_value = fence
+        .get("authority_epoch")
+        .ok_or(ProcessStreamSinkError::InvalidBinding)?;
+    let fence_epoch: EpochId = serde_json::from_value(fence_epoch_value.clone())
+        .map_err(|_| ProcessStreamSinkError::InvalidBinding)?;
+    if revision == 0
         || generation == 0
-        || fence
-            .get("authority_epoch")
-            .and_then(serde_json::Value::as_u64)
-            != Some(epoch)
+        // Full-pair (lineage_id, sequence) authority match; equal sequences
+        // from different lineages are unrelated and never authorize here.
+        || !fence_epoch.is_same_authority(&epoch)
         || fence.get("generation").and_then(serde_json::Value::as_u64) != Some(generation)
         || fence
             .get("nonce")
