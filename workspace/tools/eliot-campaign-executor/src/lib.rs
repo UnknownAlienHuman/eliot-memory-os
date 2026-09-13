@@ -119,12 +119,8 @@ fn canonical(value: &Value) -> Value {
     }
 }
 
-#[allow(clippy::manual_unwrap_or_default)]
-fn canonical_bytes(value: &Value) -> Vec<u8> {
-    match serde_json::to_vec(&canonical(value)) {
-        Ok(bytes) => bytes,
-        Err(_) => Vec::new(),
-    }
+fn canonical_bytes(value: &Value) -> Result<Vec<u8>> {
+    serde_json::to_vec(&canonical(value)).context("canonical JSON serialization")
 }
 
 /// An immutable event in the external campaign ledger.
@@ -180,7 +176,7 @@ impl LedgerEvent {
         payload: Value,
         previous_segment_hash: String,
         hash_algorithm: HashAlgorithm,
-    ) -> Self {
+    ) -> Result<Self> {
         let unsigned = Self::unsigned_value(
             sequence,
             event_type,
@@ -189,8 +185,11 @@ impl LedgerEvent {
             &payload,
             &previous_segment_hash,
         );
-        let event_hash = digest(&canonical_bytes(&unsigned), hash_algorithm);
-        Self {
+        let event_hash = digest(
+            &canonical_bytes(&unsigned).context("canonical JSON serialization")?,
+            hash_algorithm,
+        );
+        Ok(Self {
             sequence,
             event_type: event_type.to_owned(),
             actor: actor.to_owned(),
@@ -200,7 +199,7 @@ impl LedgerEvent {
             previous_segment_hash,
             event_hash,
             raw_bytes: None,
-        }
+        })
     }
 
     fn verify(&self, expected_sequence: u64, previous_hash: &str) -> Result<()> {
@@ -222,8 +221,10 @@ impl LedgerEvent {
             &self.payload,
             &self.previous_segment_hash,
         );
+        let unsigned_bytes =
+            canonical_bytes(&unsigned).context("canonical JSON serialization")?;
         let computed = self.raw_bytes.as_deref().map_or_else(
-            || digest(&canonical_bytes(&unsigned), self.hash_algorithm),
+            || digest(&unsigned_bytes, self.hash_algorithm),
             |bytes| digest(bytes, HashAlgorithm::Sha256),
         );
         ensure!(
@@ -513,8 +514,9 @@ impl CampaignLedger {
     ) -> Result<Self> {
         ensure!(seed.is_object(), "bootstrap seed must be an object");
         ensure!(receipt.is_object(), "bootstrap receipt must be an object");
-        let seed_digest = sha256(&canonical_bytes(&seed));
-        let receipt_digest = sha256(&canonical_bytes(&receipt));
+        let seed_digest = sha256(&canonical_bytes(&seed).context("canonical JSON serialization")?);
+        let receipt_digest =
+            sha256(&canonical_bytes(&receipt).context("canonical JSON serialization")?);
         if let Some(epoch) = seed.get("controller_epoch").and_then(Value::as_u64) {
             ensure!(epoch == 0, "bootstrap seed controller epoch must be zero");
         }
@@ -527,11 +529,14 @@ impl CampaignLedger {
                 "bootstrap receipt seed digest mismatch"
             );
         }
-        let segment_hash = sha256(&canonical_bytes(&json!({
-            "sequence": 0,
-            "seed_digest": seed_digest,
-            "receipt_digest": receipt_digest,
-        })));
+        let segment_hash = sha256(
+            &canonical_bytes(&json!({
+                "sequence": 0,
+                "seed_digest": seed_digest,
+                "receipt_digest": receipt_digest,
+            }))
+            .context("canonical JSON serialization")?,
+        );
         let genesis = Genesis {
             sequence: 0,
             seed_digest,
@@ -659,7 +664,7 @@ impl CampaignLedger {
             }),
             self.head_hash().to_owned(),
             HashAlgorithm::Blake3,
-        );
+        )?;
         let adopted_suffix_head = self.head_hash().to_owned();
         let adoption_event_hash = event.event_hash.clone();
         self.suffix.push(event);
@@ -690,7 +695,7 @@ impl CampaignLedger {
             payload,
             previous,
             HashAlgorithm::Blake3,
-        ));
+        )?);
         self.suffix
             .last()
             .ok_or_else(|| anyhow::anyhow!("event append did not produce an event"))
@@ -1348,7 +1353,7 @@ impl CampaignStore {
         let target = self.root.join(version);
         let temp = target.with_extension("json.tmp");
         let mut file = File::create(&temp)?;
-        file.write_all(&canonical_bytes(projection))?;
+        file.write_all(&canonical_bytes(projection).context("canonical JSON serialization")?)?;
         file.sync_all()?;
         drop(file);
         fs::rename(temp, target)?;
@@ -2439,7 +2444,7 @@ mod tests {
 
     fn fixture() -> CampaignLedger {
         let seed = json!({"controller_epoch":0,"campaign_id":"test"});
-        let seed_digest = sha256(&canonical_bytes(&seed));
+        let seed_digest = sha256(&canonical_bytes(&seed).expect("canonical JSON serialization"));
         let receipt = json!({"sequence":0,"seed_digest":seed_digest});
         CampaignLedger::from_seed_and_suffix(seed, receipt, Vec::new()).expect("genesis")
     }
