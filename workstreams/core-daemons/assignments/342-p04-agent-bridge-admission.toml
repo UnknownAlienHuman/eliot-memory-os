@@ -34,7 +34,7 @@ implementation = [
   "https://github.com/UnknownAlienHuman/eliot-memory-os/blob/main/docs/architecture/I06-15-capability-grant-lineage-introductions-and-resource-facets.md#i615-capability-grant-lineage-introductions-and-resource-facets",
   "https://github.com/UnknownAlienHuman/eliot-memory-os/blob/main/docs/architecture/I07-01-eliot-bridge-protocol-ebp1.md#i71-eliot-bridge-protocol-ebp1",
   "https://github.com/UnknownAlienHuman/eliot-memory-os/blob/main/docs/architecture/I07-02-frame.md#i72-frame",
-  "https://github.com/UnknownAlienHuman/eliot-memory-os/blob/main/docs/architecture/I07-17-scope-and-task-onboarding.md#i717-scope-and-task-onboarding",
+  "https://github.com/UnknownAlienHuman/eliot-memory-os/blob/main/docs/architecture/I07-17-convenience-surfaces.md#i717-convenience-surfaces",
   "https://github.com/UnknownAlienHuman/eliot-memory-os/blob/main/docs/architecture/I07-20-agent-facing-error-contract.md#i720-agent-facing-error-contract",
   "https://github.com/UnknownAlienHuman/eliot-memory-os/blob/main/docs/architecture/I07-24-tool-surface-economy-and-cognitive-exposure.md#i724-tool-surface-economy-and-cognitive-exposure",
   "https://github.com/UnknownAlienHuman/eliot-memory-os/blob/main/docs/architecture/I14-20-canonical-runtime-lifecycle-vocabulary.md#i1420-canonical-runtime-lifecycle-vocabulary",

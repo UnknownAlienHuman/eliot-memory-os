@@ -24,7 +24,7 @@ architecture = [
   "https://github.com/UnknownAlienHuman/eliot-memory-os/blob/main/docs/architecture/A13-02-kernel-and-failure-domains.md#a132-kernel-and-failure-domains",
 ]
 implementation = [
-  "https://github.com/UnknownAlienHuman/eliot-memory-os/blob/main/docs/architecture/I05-01-store-boundary.md#i51-store-boundary",
+  "https://github.com/UnknownAlienHuman/eliot-memory-os/blob/main/docs/architecture/I05-01-storage-boundary.md#i51-storage-boundary",
   "https://github.com/UnknownAlienHuman/eliot-memory-os/blob/main/docs/architecture/I05-19-write-submission-execution-and-receipts.md#i519-write-submission-execution-and-receipts",
   "https://github.com/UnknownAlienHuman/eliot-memory-os/blob/main/docs/architecture/I07-20-agent-facing-error-contract.md#i720-agent-facing-error-contract",
   "https://github.com/UnknownAlienHuman/eliot-memory-os/blob/main/docs/architecture/I14-20-canonical-runtime-lifecycle-vocabulary.md#i1420-canonical-runtime-lifecycle-vocabulary",
