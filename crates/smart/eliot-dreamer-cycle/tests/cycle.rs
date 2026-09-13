@@ -15,7 +15,7 @@ use eliot_dreamer_contracts::{
 use eliot_dreamer_cycle::{
     CyclePhase, CyclePolicy, DreamerCycleState, ExpectedArtifact, ObservedOutcome,
     OutcomeDisposition, PendingRequest, PhasePolicyRule, RequestKind, StepDisposition,
-    step_dreamer_cycle,
+    step_dreamer_cycle, step_dreamer_cycle_at,
 };
 use eliot_receipts::{
     AuthorityBinding, CausalBinding, EffectClass, OperationBinding, ProofCeiling, ReceiptCore,
@@ -464,6 +464,7 @@ fn validation_receipt(state: &DreamerCycleState, request: &PendingRequest) -> Va
     }
 }
 
+// WORK_UNIT_CASE: 806/2
 #[test]
 #[allow(clippy::too_many_lines)]
 fn completed_receipt_advances_one_adjacent_phase() {
@@ -706,6 +707,7 @@ fn completed_receipt_advances_one_adjacent_phase() {
     assert_eq!(closure_step.next_state.phase, CyclePhase::ClosureObserved);
 }
 
+// WORK_UNIT_CASE: 806/4
 #[test]
 fn exact_receipt_replays_without_mutation() {
     let fence = fence();
@@ -730,6 +732,7 @@ fn exact_receipt_replays_without_mutation() {
     assert_eq!(replay.next_state, replay_state);
 }
 
+// WORK_UNIT_CASE: 806/4
 #[test]
 fn changed_payload_under_same_receipt_id_is_rejected() {
     let fence = fence();
@@ -751,6 +754,7 @@ fn changed_payload_under_same_receipt_id_is_rejected() {
     assert!(step_dreamer_cycle(&first.next_state, &[changed], &policy).is_err());
 }
 
+// WORK_UNIT_CASE: 806/8
 #[test]
 #[allow(clippy::too_many_lines)]
 fn unknown_then_predecessor_linked_completion_reconciles_same_operation() {
@@ -859,6 +863,7 @@ fn unknown_then_predecessor_linked_completion_reconciles_same_operation() {
     assert!(done.next_state.pending.is_empty());
 }
 
+// WORK_UNIT_CASE: 806/5
 #[test]
 fn unrelated_valid_receipt_cannot_advance_pending_request() {
     let fence = fence();
@@ -888,6 +893,7 @@ fn unrelated_valid_receipt_cannot_advance_pending_request() {
     assert_eq!(current.phase, CyclePhase::Validated);
 }
 
+// WORK_UNIT_CASE: 806/6
 #[test]
 fn pending_operation_must_match_frozen_phase_rule() {
     let fence = fence();
@@ -974,4 +980,94 @@ fn pending_operation_must_match_frozen_phase_rule() {
     );
     handler_outcome.phase = CyclePhase::HandlerObserved;
     assert!(step_dreamer_cycle(&handler_state, &[handler_outcome], &handler_policy).is_err());
+}
+
+// WORK_UNIT_CASE: 806/4
+#[test]
+fn injected_observation_time_replay_matches_timeless_digest() {
+    let fence = fence();
+    let policy = policy(&fence, "bundle_validation");
+    let request = pending(&policy);
+    let current = state(&policy, request.clone());
+    let receipt = receipt(
+        &request,
+        ReceiptDisposition::Success {
+            proof: ProofCeiling::Observation,
+        },
+        None,
+    );
+    let observed = outcome(&request, receipt, OutcomeDisposition::Completed, false);
+    let first = step_dreamer_cycle(&current, std::slice::from_ref(&observed), &policy).unwrap();
+    let mut replay_state = first.next_state.clone();
+    replay_state.proposed_requests.push(request);
+    replay_state.seal().unwrap();
+    let timeless =
+        step_dreamer_cycle(&replay_state, std::slice::from_ref(&observed), &policy).unwrap();
+    let injected = step_dreamer_cycle_at(
+        &replay_state,
+        std::slice::from_ref(&observed),
+        &policy,
+        Some(1),
+    )
+    .unwrap();
+    assert_eq!(timeless.disposition, StepDisposition::Replayed);
+    assert_eq!(injected.disposition, StepDisposition::Replayed);
+    assert_eq!(injected.next_state, replay_state);
+    assert_eq!(injected.transition_digest, timeless.transition_digest);
+}
+
+// WORK_UNIT_CASE: 806/2
+#[test]
+fn rejected_common_validation_blocks_without_advancing() {
+    let fence = fence();
+    let common_policy = policy_for_phase(&fence, CyclePhase::CommonValidated, "common_validation");
+    let mut request = pending(&common_policy);
+    set_phase(
+        &mut request,
+        CyclePhase::CommonValidated,
+        RequestKind::CommonValidation,
+    );
+    let mut current = state(&common_policy, request.clone());
+    current.phase = CyclePhase::GroundingValidated;
+    current.seal().unwrap();
+    let mut validation = validation_receipt(&current, &request);
+    validation.terminal_disposition = "rejected".to_owned();
+    let validation_input = validation.input_digest.clone();
+    let validation_output = validation.output_digest.clone();
+    let validation_digest = sha256_hex(&canonical_json_bytes(&validation).unwrap());
+    let common_receipt = receipt_with_artifacts(
+        &request,
+        ReceiptDisposition::Success {
+            proof: ProofCeiling::Observation,
+        },
+        request.predecessor_receipt_id.clone(),
+        &[
+            ("validation-input", &validation_input),
+            ("validation-output", &validation_output),
+            ("validation-evidence", &validation_digest),
+        ],
+    );
+    let common_outcome = outcome_at(
+        &request,
+        common_receipt,
+        CyclePhase::CommonValidated,
+        OutcomeDisposition::Completed,
+        false,
+        vec![
+            ArtifactId::new("payload-1").unwrap(),
+            ArtifactId::new("validation-input").unwrap(),
+            ArtifactId::new("validation-output").unwrap(),
+            ArtifactId::new("validation-evidence").unwrap(),
+        ],
+        None,
+        Some(validation),
+        None,
+    );
+    let step = step_dreamer_cycle(&current, &[common_outcome], &common_policy).unwrap();
+    assert_eq!(step.disposition, StepDisposition::Blocked);
+    assert_eq!(step.next_state.phase, CyclePhase::GroundingValidated);
+    assert_eq!(step.next_state.pending.len(), 1);
+    assert_eq!(step.next_state.pending[0].request_id, request.request_id);
+    assert_eq!(step.next_state.outcomes.len(), 1);
+    assert!(step.requests.is_empty());
 }
