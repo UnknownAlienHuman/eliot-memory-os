@@ -18,6 +18,12 @@ use eliot_process::{
 
 type TestResult<T = ()> = Result<T, Box<dyn std::error::Error>>;
 
+const LINEAGE_A: &str = "550e8400-e29b-41d4-a716-446655440000";
+
+fn epoch(lineage: &str, sequence: u64) -> serde_json::Value {
+    serde_json::json!({"lineage_id": lineage, "sequence": sequence})
+}
+
 fn binding() -> TestResult<ProcessExecutionBinding> {
     Ok(serde_json::from_value(serde_json::json!({
         "operation_id": "operation-1",
@@ -28,8 +34,12 @@ fn binding() -> TestResult<ProcessExecutionBinding> {
         "generation": 3,
         "action_lease_ref": "lease-1",
         "authority_id": "authority-1",
-        "authority_epoch": 7,
-        "state_fence": {"authority_epoch": 7, "generation": 3, "nonce": "fence-1"},
+        "authority_epoch": epoch(LINEAGE_A, 7),
+        "state_fence": {
+            "authority_epoch": epoch(LINEAGE_A, 7),
+            "generation": 3,
+            "nonce": "fence-1"
+        },
         "request_digest": "a".repeat(64),
         "permit_digest": "b".repeat(64),
         "effect_digest": "c".repeat(64),

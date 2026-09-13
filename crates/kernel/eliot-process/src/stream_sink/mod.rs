@@ -1,6 +1,6 @@
 //! Bounded provider-neutral process stream persistence-session contract.
 
-use eliot_contracts::{EpochId, StateFence, canonical_json_bytes, sha256_hex};
+use eliot_contracts::{EpochId, canonical_json_bytes, sha256_hex};
 use serde::Serialize;
 use thiserror::Error;
 
@@ -99,10 +99,6 @@ fn validate_binding(binding: &ProcessExecutionBinding) -> Result<(), ProcessStre
             return Err(ProcessStreamSinkError::InvalidBinding);
         }
     }
-    let epoch = object
-        .get("authority_epoch")
-        .and_then(serde_json::Value::as_u64)
-        .ok_or(ProcessStreamSinkError::InvalidBinding)?;
     let revision = object
         .get("validation_revision")
         .and_then(serde_json::Value::as_u64)
@@ -115,13 +111,26 @@ fn validate_binding(binding: &ProcessExecutionBinding) -> Result<(), ProcessStre
         .get("state_fence")
         .and_then(serde_json::Value::as_object)
         .ok_or(ProcessStreamSinkError::InvalidBinding)?;
-    if epoch == 0
-        || revision == 0
-        || generation == 0
-        || fence
+    // EpochId-only gate: a legacy numeric `authority_epoch` cannot deserialize
+    // into `EpochId` and is quarantined here. No scalar coercion is performed;
+    // the binding epoch and the fence epoch must be the exact tuple.
+    let epoch: EpochId = serde_json::from_value(
+        object
             .get("authority_epoch")
-            .and_then(serde_json::Value::as_u64)
-            != Some(epoch)
+            .cloned()
+            .ok_or(ProcessStreamSinkError::InvalidBinding)?,
+    )
+    .map_err(|_| ProcessStreamSinkError::InvalidBinding)?;
+    let fence_epoch: EpochId = serde_json::from_value(
+        fence
+            .get("authority_epoch")
+            .cloned()
+            .ok_or(ProcessStreamSinkError::InvalidBinding)?,
+    )
+    .map_err(|_| ProcessStreamSinkError::InvalidBinding)?;
+    if revision == 0
+        || generation == 0
+        || !epoch.is_same_authority(&fence_epoch)
         || fence.get("generation").and_then(serde_json::Value::as_u64) != Some(generation)
         || fence
             .get("nonce")
@@ -145,22 +154,21 @@ fn validate_binding(binding: &ProcessExecutionBinding) -> Result<(), ProcessStre
     Ok(())
 }
 
-/// Separate optional canonical validation for one execution binding.
+/// Exact-tuple canonical validation for one execution binding.
 ///
-/// Scalar checks in [`validate_binding`] are preserved unchanged and are not
-/// modified here. This function never derives a canonical epoch from the
-/// scalar `authority_epoch` (no coercion): it returns `Ok(())` only when the
-/// binding carries `Some` canonical authority and that exact tuple authorizes
-/// `expected` via [`StateFence::authorizes_canonical`]. Scalar-only
-/// (`None`) and any present-but-mismatched canonical — including
-/// cross-lineage equal sequences — return `Err`.
+/// Returns `Ok(())` only when the binding epoch is the exact tuple of
+/// `expected` via [`EpochId::is_same_authority`]. Any mismatch — including a
+/// cross-lineage equal sequence — returns `Err`. Legacy numeric epochs cannot
+/// deserialize into the binding shape, so they never reach this helper and
+/// are quarantined at the wire boundary instead.
 pub fn validate_binding_canonical(
     binding: &ProcessExecutionBinding,
     expected: &EpochId,
 ) -> Result<(), ProcessStreamSinkError> {
-    match binding.canonical_authority() {
-        Some(stored) if StateFence::authorizes_canonical(stored, expected) => Ok(()),
-        _ => Err(ProcessStreamSinkError::InvalidBinding),
+    if binding.authority_epoch().is_same_authority(expected) {
+        Ok(())
+    } else {
+        Err(ProcessStreamSinkError::InvalidBinding)
     }
 }
 
