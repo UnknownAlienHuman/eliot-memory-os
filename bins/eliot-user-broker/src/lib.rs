@@ -145,8 +145,11 @@ impl BrokerDispatchAuthority {
         grant: &LaunchGrant,
         now: u64,
     ) -> Result<ProcessRequest, PortError> {
+        // INTENDED EpochId shape (Split C broker mint + Split A cutover):
+        // LaunchGrant.authority_epoch is EpochId; FencingToken::new(EpochId).
+        // B→A→C order; do not edit A/B files.
         let fence = FencingToken::new(
-            grant.authority_epoch,
+            grant.authority_epoch.clone(),
             grant.approved.generation,
             grant.approved.process_fence_nonce.clone(),
         )
@@ -175,7 +178,7 @@ impl BrokerDispatchAuthority {
                 monotonic_ns: Some(1),
             },
             fence,
-            grant.authority_epoch,
+            grant.authority_epoch.clone(),
             BTreeMap::from([("launch-grant".to_owned(), grant.grant_digest.clone())]),
             1,
         )

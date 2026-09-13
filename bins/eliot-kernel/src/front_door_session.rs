@@ -256,8 +256,13 @@ impl KernelComposition {
             .validate()
             .map_err(|_| TransportError::SessionFenced)?;
         let physical = receipt.identity().physical();
+        // INTENDED EpochId shape (B→A→C): exact-tuple is_same_authority.
         if receipt.accepted_generation().get() != launch.generation.value()
-            || receipt.binding().state_fence().authority_epoch() != launch.authority_epoch.value()
+            || !receipt
+                .binding()
+                .state_fence()
+                .authority_epoch()
+                .is_same_authority(&launch.authority_epoch)
             || receipt.identity().executable_sha256() != launch.executable_sha256
             || peer_binding.process_id() != physical.process_id()
             || peer_binding.start_time_100ns() != physical.start_time_100ns()

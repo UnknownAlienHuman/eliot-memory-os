@@ -181,12 +181,23 @@ pub async fn start_admitted_native_worker_claim(
             "native-worker claim deadline is missing",
         )
     })?;
-    let claim_epoch = native_worker_json_u64(claim, "authority_epoch").map_err(|_| {
+    let claim_epoch_value = claim.get("authority_epoch").cloned().ok_or_else(|| {
         reject(
             "CLAIM_BINDING_MISSING",
             "native-worker claim authority epoch is missing",
         )
     })?;
+    // Scalar-only claims have no lineage and stay HISTORICAL_SUSPENDED: they
+    // are never promoted. Only an EpochId object (lineage_id+sequence) may
+    // authorize via exact-tuple is_same_authority. No .sequence.get() adapter,
+    // no From<u64>.
+    let claim_epoch: eliot_contracts::EpochId =
+        serde_json::from_value(claim_epoch_value).map_err(|_| {
+            reject(
+                "CLAIM_BINDING_MISMATCH",
+                "native-worker claim authority epoch has no provable lineage",
+            )
+        })?;
     let claim_generation = native_worker_json_u64(claim, "worker_generation").map_err(|_| {
         reject(
             "CLAIM_BINDING_MISSING",
@@ -236,7 +247,10 @@ pub async fn start_admitted_native_worker_claim(
             "native-worker claim admission deadline does not match the admitted claim",
         ));
     }
-    if admission.state_fence().authority_epoch() != claim_epoch
+    if !admission
+        .state_fence()
+        .authority_epoch()
+        .is_same_authority(&claim_epoch)
         || admission.state_fence().generation().get() != claim_generation
     {
         return Err(reject(
