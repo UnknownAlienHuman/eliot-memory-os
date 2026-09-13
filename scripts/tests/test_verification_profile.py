@@ -603,7 +603,7 @@ class TestVerificationProfile(unittest.TestCase):
         commands = {normalize_gate(row["name"]): row["command"] or "" for row in table["steps"]}
         patterns = {
             "cargo-metadata": re.compile(r"cargo\s+metadata\s+--locked\s+(--no-deps\s+)?--format-version\s+1"),
-            "cargo-fmt": re.compile(r"cargo\s+fmt\s+--all\s+--\s+--check"),
+            "cargo-fmt": re.compile(r"cargo\s+fmt\s+(--all\s+--\s+--check|--check)"),
             "cargo-check-workspace": re.compile(r"cargo\s+check\s+--locked\s+--workspace\s+--all-targets"),
             "cargo-clippy-workspace": re.compile(r"cargo\s+clippy\s+--locked\s+--workspace\s+--all-targets\s+--\s+-D\s+warnings"),
             "cargo-test-workspace": re.compile(r"cargo\s+test\s+--locked\s+--workspace\b"),
@@ -1004,6 +1004,17 @@ class TestVerificationProfile(unittest.TestCase):
         table = ps_profile_table(broken)
         self.assertTrue(validate_review_tail([r["name"] for r in table["steps"]]))
         self.assertEqual(evaluate_gate("unknown", None), "UNKNOWN")
+
+    def test_750_35_cargo_fmt_bounded_batches(self) -> None:
+        # WORK_UNIT_CASE: 750/35 — cargo-fmt bounded batches on Windows
+        table = ps_profile_table(VERIFY_PS1)
+        cargo_fmt = next((r for r in table["steps"] if normalize_gate(r["name"]) == "cargo-fmt"), None)
+        self.assertIsNotNone(cargo_fmt, "cargo-fmt gate missing from verify.ps1")
+        cmd = cargo_fmt["command"] or ""
+        self.assertIn("cargo fmt --check", cmd)
+        self.assertIn("metadata.packages", cmd)
+        self.assertIn("$batchSize", cmd)
+
 
 
 if __name__ == "__main__":
