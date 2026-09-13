@@ -1,9 +1,12 @@
 #![forbid(unsafe_code)]
 
 use eliot_agent_bridge::{
-    BridgeRunner, CliError, Profile, kernel_ports_with_declaration, parse_args,
+    kernel_ports_with_declaration, parse_args, BridgeRunner, CliError, Profile,
 };
-use eliot_agent_bridge_core::{AttachRequest, BridgeError, HostEventEnvelope};
+use eliot_agent_bridge_core::{
+    AttachRequest, BridgeError, ConnectionId, FencingToken, Generation, HostEventEnvelope,
+    ReconnectRequest, SessionId,
+};
 #[cfg(test)]
 use eliot_mcp::{HostCancellationPortOutcome, HostInvocationPortOutcome, PortFailure};
 use eliot_mcp::{
@@ -17,16 +20,45 @@ use std::io::{self, BufRead, Write};
 const INVALID_ARGUMENT_EXIT: i32 = 2;
 const PROVIDER_PORT_EXIT: i32 = 69;
 
+/// Closed kernel entry that rehydrates one exact operation from the durable record.
+///
+/// Owned by `bins/eliot-kernel/src/host_request_route.rs`
+/// (`AGENT_HOST_REQUEST_REHYDRATE_OPERATION`); the literal is repeated here
+/// for typed recovery routing only because that constant is `pub(crate)` to
+/// the kernel binary. This process never sends it: rehydrate consumes the
+/// exact (envelope, admission-receipt) pair, and a transport replacement keeps
+/// neither alive across the old connection — a replacement connection requires
+/// a new admission, and cached state cannot revive the prior one.
+const AGENT_HOST_REQUEST_REHYDRATE_OPERATION: &str = "agent_host_request_rehydrate";
+
 #[derive(Debug, Deserialize)]
 #[serde(tag = "op", rename_all = "snake_case", deny_unknown_fields)]
 #[allow(clippy::large_enum_variant)]
 enum Request {
-    Attach { request: AttachRequest },
-    Invoke { request: HostInvocationRequest },
-    Cancel { request: HostCancellationRequest },
-    ForwardHook { event: HostEventEnvelope },
-    ForwardEvent { event: EventEnvelope },
+    Attach {
+        request: AttachRequest,
+    },
+    Invoke {
+        request: HostInvocationRequest,
+    },
+    Cancel {
+        request: HostCancellationRequest,
+    },
+    ForwardHook {
+        event: HostEventEnvelope,
+    },
+    ForwardEvent {
+        event: EventEnvelope,
+    },
     ReconcileExternal {},
+    Reconnect {
+        expected_connection_id: ConnectionId,
+        new_connection_id: ConnectionId,
+        session_id: String,
+        activation_generation: u64,
+        authority_epoch: u64,
+        fence_nonce: String,
+    },
     Status,
     Stop,
 }
@@ -37,11 +69,25 @@ enum Response {
     Status {
         profile: &'static str,
         control_capacity: usize,
+        attached: bool,
+        connection_id: Option<String>,
+        session_id: Option<String>,
+        activation_generation: Option<u64>,
+        authority_epoch: Option<u64>,
+        reconciliation_required: bool,
         activation_port: &'static str,
         host_request_port: &'static str,
         observation_forwarding_port: &'static str,
+        recovery: &'static str,
     },
     Attached,
+    Reconnected {
+        previous_connection_id: String,
+        connection_id: String,
+        session_id: String,
+        activation_generation: u64,
+        authority_epoch: u64,
+    },
     Invocation {
         result: HostInvocationResult,
         completion: HostCorrelationReceipt,
@@ -174,13 +220,23 @@ fn main() {
                         bridge_error(&error)
                     }
                 },
-                Ok(Request::Status) => Response::Status {
-                    profile: Profile::as_str(config.profile),
-                    control_capacity: runner.control_capacity(),
-                    activation_port: "observed after Kernel admission",
-                    host_request_port: "typed ingress active; shared transport live after Kernel activation",
-                    observation_forwarding_port: "unavailable: Kernel observation route not admitted",
-                },
+                Ok(Request::Reconnect {
+                    expected_connection_id,
+                    new_connection_id,
+                    session_id,
+                    activation_generation,
+                    authority_epoch,
+                    fence_nonce,
+                }) => handle_reconnect(
+                    &mut runner,
+                    &expected_connection_id,
+                    &new_connection_id,
+                    &session_id,
+                    activation_generation,
+                    authority_epoch,
+                    &fence_nonce,
+                ),
+                Ok(Request::Status) => status_response(config.profile, &runner),
                 Ok(Request::Stop) => Response::Stopped,
                 Err(error) => Response::Error {
                     code: "REQUEST_INVALID",
@@ -211,10 +267,7 @@ fn handle_invocation<P: KernelHostRequestPort + ?Sized>(
     request: &HostInvocationRequest,
 ) -> Response {
     match gateway.invoke_with_receipt(port, request) {
-        Ok((result, completion)) => Response::Invocation {
-            result,
-            completion,
-        },
+        Ok((result, completion)) => Response::Invocation { result, completion },
         Err(error) => host_gateway_error(&error),
     }
 }
@@ -227,6 +280,152 @@ fn handle_cancellation<P: KernelHostRequestPort + ?Sized>(
     match gateway.cancel(port, request) {
         Ok(result) => Response::Cancellation { result },
         Err(error) => host_gateway_error(&error),
+    }
+}
+
+/// Validates one closed reconnect claim and advances the host-facing transport binding.
+///
+/// This follows the [`HostRequestGateway`] pattern without adding gateway
+/// surface: inert claims are shaped into typed authority facts *before* the
+/// runner is touched (validate before dispatch), and the response preserves
+/// the caller's connection correlation alongside the owner-derived binding.
+/// Host text is never trusted: `session_id`, `activation_generation`,
+/// `authority_epoch`, and `fence_nonce` are bearer claims compared by
+/// `Runner::reconnect` against the live activation binding, and any mismatch
+/// fails closed with typed recovery. The session, generation, and fence stay
+/// kernel-issued — sealed at activation from the admission receipt established
+/// by `kernel_ports_with_declaration` (declaration lease, front-door
+/// expectation/SID, challenge → hello → receipt, fence joins) — and are never
+/// minted, widened, or inferred from process identity here. Cursors and replay
+/// inheritance survive only through that exact owner-authorized match; the
+/// kernel transport itself is untouched, so kernel envelopes keep riding the
+/// admitted receipt connection until a new process admission replaces it (the
+/// activation one-shot guard is preserved: this path never reactivates).
+fn handle_reconnect(
+    runner: &mut BridgeRunner,
+    expected_connection_id: &ConnectionId,
+    new_connection_id: &ConnectionId,
+    session_id: &str,
+    activation_generation: u64,
+    authority_epoch: u64,
+    fence_nonce: &str,
+) -> Response {
+    let Some(live) = runner.attach_view() else {
+        return Response::Error {
+            code: "BRIDGE_NOT_ATTACHED",
+            detail: "bridge is not attached; attach and activate before reconnect — reconnect preserves only the owner-authorized session, generation, and fence of a live attach".to_owned(),
+        };
+    };
+    if expected_connection_id.as_str() != live.binding().connection_id().as_str() {
+        return Response::Error {
+            code: "RECONNECT_STALE_CONNECTION",
+            detail: format!(
+                "reconnect presents stale connection `{}`; the live connection is `{}` — re-read status for the live facts and retry; wrong/stale targets fail closed",
+                expected_connection_id.as_str(),
+                live.binding().connection_id().as_str(),
+            ),
+        };
+    }
+    if new_connection_id.as_str() == live.binding().connection_id().as_str() {
+        return Response::Error {
+            code: "RECONNECT_INVALID",
+            detail: "reconnect requires a new connection identity distinct from the live connection; resending the live connection performs no replacement".to_owned(),
+        };
+    }
+    let Ok(session) = SessionId::new(session_id) else {
+        return Response::Error {
+            code: "RECONNECT_INVALID",
+            detail: "reconnect session_id is not a valid opaque identity; present the exact live session from status".to_owned(),
+        };
+    };
+    let Ok(generation) = Generation::new(activation_generation) else {
+        return Response::Error {
+            code: "RECONNECT_INVALID",
+            detail: "reconnect activation_generation must be non-zero; present the exact live generation from status".to_owned(),
+        };
+    };
+    let Ok(fence) = FencingToken::new(authority_epoch, generation, fence_nonce) else {
+        return Response::Error {
+            code: "RECONNECT_INVALID",
+            detail: "reconnect authority_epoch must be non-zero and fence_nonce must be a non-blank opaque value; present the exact live fence from status".to_owned(),
+        };
+    };
+    let replacement = new_connection_id.clone();
+    let request = match ReconnectRequest::new(session, generation, fence, replacement) {
+        Ok(request) => request,
+        Err(error) => {
+            return Response::Error {
+                code: "RECONNECT_INVALID",
+                detail: format!(
+                    "reconnect authority triple is malformed: {error}; present the exact live session, generation, epoch, and fence nonce from status"
+                ),
+            };
+        }
+    };
+    match runner.reconnect(request) {
+        Ok(view) => Response::Reconnected {
+            previous_connection_id: expected_connection_id.as_str().to_owned(),
+            connection_id: view.binding().connection_id().as_str().to_owned(),
+            session_id: view.binding().session_id().as_str().to_owned(),
+            activation_generation: view.binding().activation_generation().get(),
+            authority_epoch: view.binding().state_fence().authority_epoch(),
+        },
+        Err(BridgeError::StaleAuthority) => Response::Error {
+            code: "RECONNECT_STALE_AUTHORITY",
+            detail: format!(
+                "reconnect session, generation, or fence does not match the live attach; re-attach and activate for a new admission. A replacement connection requires a new admission and cached state cannot revive the prior connection; the kernel-owned `{AGENT_HOST_REQUEST_REHYDRATE_OPERATION}` entry serves only the exact (envelope, admission-receipt) pair"
+            ),
+        },
+        Err(BridgeError::NotAttached) => Response::Error {
+            code: "BRIDGE_NOT_ATTACHED",
+            detail: "bridge attach lapsed during reconnect; attach and activate before retrying"
+                .to_owned(),
+        },
+        Err(error) => bridge_error(&error),
+    }
+}
+
+/// Projects owner-derived bridge liveness without probing the Kernel.
+///
+/// Every fact comes from the composition or activation owners: the profile
+/// from CLI decoding, capacity from the runtime, and attach/session/fence
+/// facts from the activation-sealed binding (the kernel-issued
+/// `activated_session` captured by the one-shot activation exchange).
+/// Pre-activation reports `not-attached` with no liveness text; post-activation
+/// reports the admitted-session facts but never a probe-backed readiness claim —
+/// dispatch still traverses the live admitted transport per operation, and
+/// staleness surfaces as typed `RECONNECT_*` failures pointing back at this
+/// status and the reconnect operation.
+fn status_response(profile: Profile, runner: &BridgeRunner) -> Response {
+    match runner.attach_view() {
+        None => Response::Status {
+            profile: Profile::as_str(profile),
+            control_capacity: runner.control_capacity(),
+            attached: false,
+            connection_id: None,
+            session_id: None,
+            activation_generation: None,
+            authority_epoch: None,
+            reconciliation_required: false,
+            activation_port: "not-attached",
+            host_request_port: "no-session: attach and activate before host-request dispatch",
+            observation_forwarding_port: "unavailable: Kernel observation route not admitted",
+            recovery: "attach and activate before host requests; reconnect requires a live attach",
+        },
+        Some(view) => Response::Status {
+            profile: Profile::as_str(profile),
+            control_capacity: runner.control_capacity(),
+            attached: true,
+            connection_id: Some(view.binding().connection_id().as_str().to_owned()),
+            session_id: Some(view.binding().session_id().as_str().to_owned()),
+            activation_generation: Some(view.binding().activation_generation().get()),
+            authority_epoch: Some(view.binding().state_fence().authority_epoch()),
+            reconciliation_required: view.reconciliation_required(),
+            activation_port: "attached",
+            host_request_port: "session-bound: dispatch joins the admitted Kernel session",
+            observation_forwarding_port: "unavailable: Kernel observation route not admitted",
+            recovery: "reconnect with the live connection, session, generation, epoch, and fence nonce from this status; stale targets fail closed",
+        },
     }
 }
 
