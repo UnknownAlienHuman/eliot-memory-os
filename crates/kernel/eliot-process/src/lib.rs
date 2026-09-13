@@ -224,6 +224,7 @@ impl FencingToken {
 
     /// Returns a copy carrying the supplied canonical epoch alongside the
     /// existing scalar epoch. The scalar value is preserved unchanged.
+    #[must_use]
     pub fn with_canonical_epoch(mut self, canonical_epoch: EpochId) -> Self {
         self.canonical_epoch = Some(canonical_epoch);
         self
@@ -747,6 +748,7 @@ impl ProcessOwnerBinding {
 
     /// Returns a copy carrying the supplied canonical epoch alongside the
     /// existing scalar epoch.
+    #[must_use]
     pub fn with_canonical_epoch(mut self, canonical_epoch: EpochId) -> Self {
         self.canonical_epoch = Some(canonical_epoch);
         self
@@ -1201,6 +1203,7 @@ impl DispatchValidationContext {
 
     /// Returns a copy carrying the supplied canonical authority alongside the
     /// existing scalar epoch.
+    #[must_use]
     pub fn with_canonical_authority(mut self, canonical_authority: EpochId) -> Self {
         self.canonical_authority = Some(canonical_authority);
         self
@@ -1208,6 +1211,7 @@ impl DispatchValidationContext {
 
     /// Alias for [`Self::with_canonical_authority`] kept for the additive
     /// T2-S02 builder shape (`with_canonical_epoch`).
+    #[must_use]
     pub fn with_canonical_epoch(self, canonical_authority: EpochId) -> Self {
         self.with_canonical_authority(canonical_authority)
     }
@@ -3606,14 +3610,18 @@ mod tests {
         let fence_a7 = canonical_fence(7, CANONICAL_LINEAGE_A, 7, "fence-a7")?;
         let epoch_a7 = canonical_epoch(CANONICAL_LINEAGE_A, 7)?;
         let epoch_a9 = canonical_epoch(CANONICAL_LINEAGE_A, 9)?;
-        let epoch_b7 = canonical_epoch(CANONICAL_LINEAGE_B, 7)?;
+        let epoch_foreign7 = canonical_epoch(CANONICAL_LINEAGE_B, 7)?;
         let epoch_a8 = canonical_epoch(CANONICAL_LINEAGE_A, 8)?;
 
         // Exact-tuple authorization rejects skip and cross-lineage.
         assert!(!fence_a7.authorizes_canonical(&epoch_a9));
-        assert!(!fence_a7.authorizes_canonical(&epoch_b7));
+        assert!(!fence_a7.authorizes_canonical(&epoch_foreign7));
         assert!(fence_a7.validate_canonical_against(&epoch_a9).is_err());
-        assert!(fence_a7.validate_canonical_against(&epoch_b7).is_err());
+        assert!(
+            fence_a7
+                .validate_canonical_against(&epoch_foreign7)
+                .is_err()
+        );
 
         // Advancement is direct-child only with closed errors.
         assert!(
@@ -3624,7 +3632,7 @@ mod tests {
             Err(eliot_contracts::EpochContractError::NotDirectChild)
         );
         assert_eq!(
-            eliot_contracts::StateFence::validate_canonical_epoch(&epoch_b7, &epoch_a7),
+            eliot_contracts::StateFence::validate_canonical_epoch(&epoch_foreign7, &epoch_a7),
             Err(eliot_contracts::EpochContractError::ParentLineageMismatch)
         );
 
@@ -3721,7 +3729,7 @@ mod tests {
         assert!(scalar_value.get("canonical_epoch").is_none());
         // Scalar-only preserves the exact three-field shape.
         assert_eq!(
-            scalar_value.as_object().map(|o| o.len()),
+            scalar_value.as_object().map(serde_json::Map::len),
             Some(3),
             "scalar-only fence must keep the v3 three-field shape"
         );
