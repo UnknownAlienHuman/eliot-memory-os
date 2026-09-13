@@ -415,7 +415,7 @@ impl DaemonComposition {
         }
     }
 
-    /// Builds one provider-neutral ControlBoard over the current Governor
+    /// Builds one provider-neutral `ControlBoard` over the current Governor
     /// projection snapshot.
     ///
     /// The board reads one immutable snapshot taken here; every port call in
