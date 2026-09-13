@@ -51,7 +51,10 @@ pub use runtime_control::{
     HostRuntimeControlOperation, HostRuntimeControlQueue, HostRuntimeControlRequest,
     HostRuntimeControlResponse, HostStoreRecoveryReceipt,
 };
-pub use scm_launch::{ValidatedHostScmLaunch, validate_host_scm_bootstrap};
+pub use scm_launch::{
+    HOST_SCM_CAUSE_MAX_CHARS, HostScmRegistrationCause, ValidatedHostScmLaunch,
+    classify_host_scm_inspection, validate_host_scm_bootstrap,
+};
 pub use store_kernel_launch_sequence::StoreLivenessEvidence;
 #[cfg(all(test, windows))]
 use store_kernel_launch_sequence::{StoreKernelLaunchError, launch_store_then_kernel};
