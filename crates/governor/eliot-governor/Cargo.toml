@@ -20,6 +20,7 @@ eliot-module-registry.workspace = true
 eliot-observation.workspace = true
 eliot-observation-contracts.workspace = true
 eliot-problem.workspace = true
+eliot-protocol.workspace = true
 eliot-receipts.workspace = true
 eliot-session.workspace = true
 eliot-skill.workspace = true

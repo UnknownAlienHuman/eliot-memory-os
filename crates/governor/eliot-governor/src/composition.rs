@@ -23,8 +23,8 @@ use eliot_budget::{BudgetLedger, BudgetLedgerRecoverySnapshot};
 use eliot_canonical::{CanonicalError, CanonicalWriteEnvelope};
 use eliot_change_monitor::ChangeMonitor;
 use eliot_contracts::{
-    AuthorityEpoch, OperationId, RequestMetadata, ResourceGeneration, SessionId, StateFence,
-    TaskId, canonical_json_bytes, sha256_hex,
+    AuthorityEpoch, OperationId, ResourceGeneration, SessionId, StateFence, TaskId,
+    canonical_json_bytes, sha256_hex,
 };
 use eliot_coordination::CoordinationOwner;
 use eliot_finish::{FinishDecisionReceipt, FinishService};
@@ -34,6 +34,7 @@ use eliot_maintenance::{
 use eliot_module_registry::ModuleCatalog;
 use eliot_module_registry::ModuleCatalogSnapshot;
 use eliot_observation::{ObservationJournal, ObservationJournalEntry};
+use eliot_protocol::RequestIdentity;
 use eliot_session::{SessionLifecycleOwner, SessionLifecycleSnapshot, SessionState};
 use eliot_skill::{SkillLifecycleView, SkillRegistry};
 use eliot_store_api::{
@@ -63,10 +64,13 @@ pub use genesis_owner_packet::{
 /// it to the authenticated Kernel generation.  It deliberately does not
 /// expose a store client, query surface, provider SDK, or completion API.
 pub trait KernelTransitionPort: Send + Sync {
-    /// Applies one prepared transition under the exact caller/fence binding.
+    /// Applies one prepared transition under the exact admitted request
+    /// identity. The identity carries the original caller/fence binding plus
+    /// the admitted idempotency, deadline and cancellation terms; the port
+    /// must forward those terms unchanged and never synthesize defaults.
     fn apply_prepared<'a>(
         &'a self,
-        request: &RequestMetadata,
+        identity: &RequestIdentity,
         transition: PreparedTransition,
         expected_revision_heads: Vec<RevisionHeadExpectation>,
         expected_ordering_heads: Vec<OrderingHeadExpectation>,
@@ -908,19 +912,50 @@ impl CanonicalAdmissionOwner {
         Ok(envelope.prepare()?)
     }
 
-    /// Sends only a Canonical-produced transition to the neutral Kernel port.
+    /// Sends only a Canonical-produced transition to the neutral Kernel port
+    /// under the exact admitted request identity.
+    ///
+    /// The identity comes from admitted ingress, not from the envelope: the
+    /// envelope's request binding and idempotency key must agree exactly with
+    /// the admitted identity, and the immutable transition derived from the
+    /// envelope must agree with both. Any substitution of the binding,
+    /// operation/idempotency terms, deadline or cancellation fails closed
+    /// here; nothing is rehashed or repaired locally, preserving the shared
+    /// canonical hashing contract. The transport peer stays distinct from the
+    /// initiating principal/session: this method never rewrites the
+    /// identity's source. `prepare()` alone remains non-authorizing.
     async fn commit<P: KernelTransitionPort + ?Sized>(
         &self,
         port: &P,
+        identity: &RequestIdentity,
         envelope: CanonicalWriteEnvelope,
     ) -> Result<WriteReceipt, CompositionError> {
+        identity
+            .validate()
+            .map_err(|error| CompositionError::Provider(error.to_string()))?;
+        if envelope.request != identity.request.metadata {
+            return Err(CompositionError::Provider(
+                "admitted request binding does not match the Canonical envelope request".to_owned(),
+            ));
+        }
+        if envelope.idempotency_key != identity.idempotency_key {
+            return Err(CompositionError::Provider(
+                "admitted idempotency key does not match the Canonical envelope".to_owned(),
+            ));
+        }
         let expected_revision_heads = envelope.expected_revision_heads.clone();
         let expected_ordering_heads = envelope.expected_ordering_heads.clone();
-        let request = envelope.request.clone();
         let transition = self.prepare(&envelope)?;
+        if transition.identity.idempotency_key != identity.idempotency_key
+            || transition.state_fence != identity.request.metadata.state_fence
+        {
+            return Err(CompositionError::Provider(
+                "immutable transition does not agree with the admitted request identity".to_owned(),
+            ));
+        }
         Ok(port
             .apply_prepared(
-                &request,
+                identity,
                 transition,
                 expected_revision_heads,
                 expected_ordering_heads,
@@ -1468,10 +1503,13 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
     }
 
     /// Applies one Canonical-admitted transition through the sole retained
-    /// Kernel port. Callers cannot provide a second client or bypass
-    /// Canonical admission with an arbitrary transition.
+    /// Kernel port under the exact admitted request identity. Callers cannot
+    /// provide a second client or bypass Canonical admission with an
+    /// arbitrary transition. The identity comes from admitted ingress;
+    /// `prepare()` alone is not an authorization.
     pub async fn commit_canonical(
         &self,
+        identity: &RequestIdentity,
         envelope: CanonicalWriteEnvelope,
     ) -> Result<WriteReceipt, CompositionError> {
         if self.readiness != CompositionReadiness::Ready {
@@ -1479,7 +1517,7 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
         }
         self.owners
             .canonical
-            .commit(self.kernel.as_ref(), envelope)
+            .commit(self.kernel.as_ref(), identity, envelope)
             .await
     }
 
@@ -1981,17 +2019,24 @@ mod tests {
     use super::*;
     use crate::{STARTUP_ORDER, ServiceId};
     use eliot_budget::{BudgetEnvelope, BudgetLedger, ProviderToolAttribution, QuotaState};
+    use eliot_canonical::CanonicalWriteEnvelope;
     use eliot_config::Applicability;
-    use eliot_contracts::{ClockReading, ContractId, SessionId, TaskId};
+    use eliot_contracts::{
+        ClockReading, ContractId, ProductId, RequestId, RequestMetadata, SessionId, SourceId,
+        TaskId,
+    };
     use eliot_coordination::{
         RegisterSession as CoordinationRegisterSession, WorkItem, WorkLeaseRequest, WorkState,
     };
-    use eliot_receipts::{AuthorityBinding, EffectClass, ProofCeiling};
+    use eliot_protocol::RequestIdentity;
+    use eliot_receipts::{AuthorityBinding, EffectClass, ProofCeiling, RequestBinding};
     use eliot_runtime_contracts::{HealthVector, ServiceProcessState};
     use eliot_session::{RegisterSession, SessionCommand, SessionCommandContext};
     use eliot_store_api::{
-        CommitId, OperationManifestDigest, OrderingHead, OrderingScopeId, Resubmission,
-        RevisionHead, RevisionKey, ScopeId, TransitionClass, WriteReceipt, WriteReceiptStatus,
+        CommitId, EventProjectionRelationIntents, NamedMutationOperation, NamedMutationRequest,
+        OperationManifestDigest, OrderingHead, OrderingHeadExpectation, OrderingScopeId,
+        Resubmission, RevisionHead, RevisionKey, ScopeId, SecurityContext, TransitionClass,
+        WriteReceipt, WriteReceiptStatus, validate_store_receipt_envelope,
     };
     use eliot_task::{TaskCommandContext, TaskLifecycleEvent, TaskProposal, TaskRecord};
     use std::sync::Mutex;
@@ -2011,6 +2056,13 @@ mod tests {
         staged_scopes: Mutex<Vec<ScopeRevisionView>>,
         /// Terminal receipts served by the receipts route.
         receipts: Vec<WriteReceipt>,
+        /// Committed transitions keyed by operation id, served by the
+        /// transition-port receipt route for exact reconciliation.
+        committed: Mutex<BTreeMap<OperationId, (RequestIdentity, WriteReceipt)>>,
+        /// Number of actual gateway executions. Idempotent replays of an
+        /// already committed operation resolve to the stored receipt without
+        /// incrementing this count.
+        apply_calls: Mutex<u64>,
         missing: Option<RecoveryOwner>,
         genesis_all_absent: bool,
         genesis_seeded: Arc<AtomicBool>,
@@ -2027,19 +2079,136 @@ mod tests {
     impl KernelTransitionPort for FakeKernel {
         fn apply_prepared<'a>(
             &'a self,
-            _request: &RequestMetadata,
-            _transition: PreparedTransition,
-            _expected_revision_heads: Vec<RevisionHeadExpectation>,
-            _expected_ordering_heads: Vec<OrderingHeadExpectation>,
+            identity: &RequestIdentity,
+            transition: PreparedTransition,
+            expected_revision_heads: Vec<RevisionHeadExpectation>,
+            expected_ordering_heads: Vec<OrderingHeadExpectation>,
         ) -> KernelPortFuture<'a, WriteReceipt> {
-            Box::pin(async { Err(KernelPortError::Unknown("test port".to_owned())) })
+            let identity = identity.clone();
+            Box::pin(async move {
+                identity
+                    .validate()
+                    .map_err(|error| KernelPortError::Contract(error.to_string()))?;
+                transition
+                    .validate()
+                    .map_err(|error| KernelPortError::Contract(error.to_string()))?;
+                // Exact binding agreement: the admitted identity's request
+                // binding, fence and idempotency terms must match the
+                // immutable transition. Substitutions fail closed here and
+                // are never repaired or rehashed.
+                if identity.request.metadata.state_fence != transition.state_fence
+                    || identity.request.state_fence != transition.state_fence
+                {
+                    return Err(KernelPortError::Contract(
+                        "fake gateway: identity fence does not match the transition fence"
+                            .to_owned(),
+                    ));
+                }
+                if identity.idempotency_key != transition.identity.idempotency_key {
+                    return Err(KernelPortError::Contract(
+                        "fake gateway: identity idempotency does not match the transition"
+                            .to_owned(),
+                    ));
+                }
+                for head in &expected_revision_heads {
+                    head.validate()
+                        .map_err(|error| KernelPortError::Contract(error.to_string()))?;
+                    if head.state_fence != transition.state_fence {
+                        return Err(KernelPortError::Contract(
+                            "fake gateway: revision head fence does not match the transition"
+                                .to_owned(),
+                        ));
+                    }
+                }
+                for head in &expected_ordering_heads {
+                    head.validate()
+                        .map_err(|error| KernelPortError::Contract(error.to_string()))?;
+                    if head.state_fence != transition.state_fence {
+                        return Err(KernelPortError::Contract(
+                            "fake gateway: ordering head fence does not match the transition"
+                                .to_owned(),
+                        ));
+                    }
+                }
+                let mut committed = self.committed.lock().expect("committed lock");
+                if let Some((_, receipt)) = committed.get(&transition.identity.operation_id) {
+                    // Exact idempotent replay: the same operation identity
+                    // resolves to the stored receipt without re-execution. A
+                    // different idempotency or hash under a committed
+                    // operation id is an identity conflict, never a silent
+                    // second execution.
+                    if receipt.idempotency_key == transition.identity.idempotency_key
+                        && receipt.canonical_request_hash
+                            == transition.identity.canonical_request_hash
+                    {
+                        return Ok(receipt.clone());
+                    }
+                    return Err(KernelPortError::Contract(
+                        "fake gateway: committed operation identity conflict".to_owned(),
+                    ));
+                }
+                // Issue the store-owned receipt envelope through the real
+                // shared contract: no canned receipt bypasses validation.
+                let sequence = u64::try_from(committed.len())
+                    .map_err(|error| KernelPortError::Contract(error.to_string()))?
+                    + 1;
+                let operation_id = transition.identity.operation_id.clone();
+                let candidate = WriteReceipt {
+                    operation_id: operation_id.clone(),
+                    idempotency_key: transition.identity.idempotency_key.clone(),
+                    canonical_request_hash: transition.identity.canonical_request_hash.clone(),
+                    transition_class: transition.transition_class,
+                    status: WriteReceiptStatus::Committed,
+                    commit_id: Some(
+                        CommitId::new(format!("commit-{operation_id}"))
+                            .map_err(|error| KernelPortError::Contract(error.to_string()))?,
+                    ),
+                    state_fence: transition.state_fence.clone(),
+                    ordering_sequences: Vec::new(),
+                    revision_before_after: Vec::new(),
+                    applied_command_ids: vec!["cmd-1".to_owned()],
+                    emitted_event_ids: Vec::new(),
+                    projection_refs: Vec::new(),
+                    outbox_refs: Vec::new(),
+                    operation_manifest_digest: transition.operation_manifest_digest.clone(),
+                    error_code: None,
+                    resubmission: Resubmission::None,
+                    committed_at: Some(format!("commit-sequence-{sequence:016}")),
+                    envelope: None,
+                };
+                candidate
+                    .validate()
+                    .map_err(|error| KernelPortError::Contract(error.to_string()))?;
+                let envelope = eliot_store_api::issue_store_receipt_envelope(
+                    &identity.request.metadata,
+                    &transition,
+                    &candidate,
+                    sequence,
+                )
+                .map_err(|error| KernelPortError::Contract(error.to_string()))?;
+                let mut receipt = candidate;
+                receipt.envelope = Some(envelope);
+                eliot_store_api::validate_store_receipt_envelope(
+                    &identity.request.metadata,
+                    &transition,
+                    &receipt,
+                )
+                .map_err(|error| KernelPortError::Contract(error.to_string()))?;
+                *self.apply_calls.lock().expect("apply call lock") += 1;
+                committed.insert(operation_id, (identity, receipt.clone()));
+                Ok(receipt)
+            })
         }
 
-        fn receipt(
-            &self,
-            _operation_id: OperationId,
-        ) -> KernelPortFuture<'_, Option<WriteReceipt>> {
-            Box::pin(async { Ok(None) })
+        fn receipt(&self, operation_id: OperationId) -> KernelPortFuture<'_, Option<WriteReceipt>> {
+            Box::pin(async move {
+                Ok(self
+                    .committed
+                    .lock()
+                    .expect("committed lock")
+                    .get(&operation_id)
+                    .map(|(_, receipt)| receipt.clone()))
+            })
         }
 
         fn health(&self) -> KernelPortFuture<'_, StoreHealth> {
@@ -2194,6 +2363,8 @@ mod tests {
             live_reads: Mutex::new(BTreeMap::new()),
             staged_scopes: Mutex::new(Vec::new()),
             receipts: Vec::new(),
+            committed: Mutex::new(BTreeMap::new()),
+            apply_calls: Mutex::new(0),
             missing: None,
             genesis_all_absent: false,
             genesis_seeded: Arc::new(AtomicBool::new(false)),
@@ -3558,5 +3729,274 @@ mod tests {
             composition.owners().task.task(&task_id).expect("task").goal,
             "stable goal"
         );
+    }
+
+    struct NoopWaker;
+
+    impl std::task::Wake for NoopWaker {
+        fn wake(self: Arc<Self>) {}
+    }
+
+    /// Drives an immediately-ready future without an external executor. The
+    /// fake gateway never pends, so this terminates; it exists only because
+    /// this crate takes no executor dependency.
+    fn block_on<F: std::future::Future>(future: F) -> F::Output {
+        use std::task::{Context, Poll};
+        let waker = std::task::Waker::from(Arc::new(NoopWaker));
+        let mut context = Context::from_waker(&waker);
+        let mut future = Box::pin(future);
+        loop {
+            match future.as_mut().poll(&mut context) {
+                Poll::Ready(output) => return output,
+                Poll::Pending => std::thread::yield_now(),
+            }
+        }
+    }
+
+    /// Admitted ingress metadata. The source is an external principal, never
+    /// the daemon transport peer, and the session is the initiating session.
+    fn commit_metadata(fence: &StateFence) -> RequestMetadata {
+        RequestMetadata {
+            request_id: RequestId::new("req-t1-2-1").expect("request id"),
+            session_id: Some(SessionId::new("session-t1-2").expect("session id")),
+            task_id: None,
+            product_id: ProductId::new("test-product").expect("product id"),
+            source_id: SourceId::new("agent-bridge").expect("source id"),
+            state_fence: fence.clone(),
+            clock: ClockReading::default(),
+        }
+    }
+
+    fn commit_identity(fence: &StateFence) -> RequestIdentity {
+        let metadata = commit_metadata(fence);
+        RequestIdentity {
+            request: RequestBinding {
+                metadata,
+                state_fence: fence.clone(),
+            },
+            idempotency_key: "idem-t1-2-1".to_owned(),
+            deadline_unix_ms: 1_800_000_000_000,
+            cancellation_id: "cancel-t1-2-1".to_owned(),
+        }
+    }
+
+    fn commit_envelope(
+        fence: &StateFence,
+        metadata: RequestMetadata,
+        idempotency_key: &str,
+        operation_id: &str,
+    ) -> CanonicalWriteEnvelope {
+        CanonicalWriteEnvelope {
+            operation_id: OperationId::new(operation_id).expect("operation id"),
+            request: metadata,
+            idempotency_key: idempotency_key.to_owned(),
+            scope_id: ScopeId::new("governor").expect("scope"),
+            task_id: None,
+            transition_class: TransitionClass::TaskControl,
+            requested_effect_ceiling: EffectClass::ReversibleMutation,
+            admission_contract_set_digest: "a".repeat(64),
+            operation_manifest_digest: OperationManifestDigest::new("manifest")
+                .expect("manifest digest"),
+            semantic_commands: vec![NamedMutationRequest {
+                operation: NamedMutationOperation::UpdateTaskState,
+                parameters: BTreeMap::new(),
+            }],
+            event_projection_relation_intents: EventProjectionRelationIntents {
+                event_ids: Vec::new(),
+                projection_kinds: Vec::new(),
+                relation_kinds: Vec::new(),
+            },
+            security: SecurityContext::default(),
+            required_proof_and_approval_refs: Vec::new(),
+            expected_revision_heads: Vec::new(),
+            expected_ordering_heads: vec![OrderingHeadExpectation {
+                scope: OrderingScopeId::new("scope:governor").expect("ordering scope"),
+                expected_sequence: 1,
+                state_fence: fence.clone(),
+            }],
+        }
+    }
+
+    fn committed_composition() -> (Arc<FakeKernel>, GovernorComposition<FakeKernel>) {
+        let observed = snapshot();
+        let expected = KernelGenerationExpectation::from_snapshot(&observed).expect("expectation");
+        let kernel = Arc::new(fake_kernel(observed));
+        let composition =
+            GovernorComposition::new(kernel.clone(), &expected, QueueLimits::default())
+                .expect("composition");
+        (kernel, composition)
+    }
+
+    #[test]
+    fn admitted_identity_reaches_gateway_with_exact_terms() {
+        let (kernel, composition) = committed_composition();
+        let fence = composition.kernel_snapshot().state_fence();
+        let identity = commit_identity(&fence);
+        let envelope = commit_envelope(
+            &fence,
+            identity.request.metadata.clone(),
+            &identity.idempotency_key,
+            "op-t1-2-positive",
+        );
+        let receipt = block_on(composition.commit_canonical(&identity, envelope.clone()))
+            .expect("admitted commit");
+        // The gateway observed the exact admitted terms: initiating source
+        // and session preserved, never rewritten to a transport peer.
+        let stored = kernel
+            .committed
+            .lock()
+            .expect("committed lock")
+            .get(&receipt.operation_id)
+            .expect("stored operation")
+            .clone();
+        assert_eq!(stored.0, identity);
+        assert_eq!(stored.0.request.metadata.source_id.as_str(), "agent-bridge");
+        assert_eq!(
+            stored
+                .0
+                .request
+                .metadata
+                .session_id
+                .as_ref()
+                .expect("session")
+                .as_str(),
+            "session-t1-2"
+        );
+        assert_eq!(stored.0.deadline_unix_ms, 1_800_000_000_000);
+        assert_eq!(stored.0.cancellation_id, "cancel-t1-2-1");
+        // The exact validated receipt binds the same operation identity.
+        assert_eq!(receipt.operation_id.as_str(), "op-t1-2-positive");
+        assert_eq!(receipt.idempotency_key, identity.idempotency_key);
+        assert_eq!(receipt.status, WriteReceiptStatus::Committed);
+        let transition = envelope.prepare().expect("immutable transition");
+        assert_eq!(
+            receipt.canonical_request_hash,
+            transition.identity.canonical_request_hash
+        );
+        validate_store_receipt_envelope(&identity.request.metadata, &transition, &receipt)
+            .expect("shared receipt envelope");
+        assert_eq!(*kernel.apply_calls.lock().expect("apply call lock"), 1);
+    }
+
+    #[test]
+    fn substituted_binding_is_rejected_before_the_gateway() {
+        let (kernel, composition) = committed_composition();
+        let fence = composition.kernel_snapshot().state_fence();
+        let identity = commit_identity(&fence);
+        // A substituted request binding under the same fence is rejected even
+        // though the envelope is internally well-formed.
+        let mut substituted = identity.request.metadata.clone();
+        substituted.source_id = SourceId::new("intruder").expect("source id");
+        let substituted_envelope = commit_envelope(
+            &fence,
+            substituted,
+            &identity.idempotency_key,
+            "op-t1-2-substituted",
+        );
+        let rejected = block_on(composition.commit_canonical(&identity, substituted_envelope));
+        assert!(
+            matches!(rejected, Err(CompositionError::Provider(_))),
+            "substituted binding was not rejected: {rejected:?}"
+        );
+        // A substituted idempotency key is rejected the same way.
+        let idempotency_envelope = commit_envelope(
+            &fence,
+            identity.request.metadata.clone(),
+            "idem-substituted",
+            "op-t1-2-substituted-idem",
+        );
+        let rejected = block_on(composition.commit_canonical(&identity, idempotency_envelope));
+        assert!(
+            matches!(rejected, Err(CompositionError::Provider(_))),
+            "substituted idempotency was not rejected: {rejected:?}"
+        );
+        // Neither rejection reached the gateway: no execution, no receipt.
+        assert_eq!(*kernel.apply_calls.lock().expect("apply call lock"), 0);
+        assert!(kernel.committed.lock().expect("committed lock").is_empty());
+    }
+
+    #[test]
+    fn lost_acknowledgement_reconciles_to_the_same_operation_receipt() {
+        let (kernel, composition) = committed_composition();
+        let fence = composition.kernel_snapshot().state_fence();
+        let identity = commit_identity(&fence);
+        let envelope = commit_envelope(
+            &fence,
+            identity.request.metadata.clone(),
+            &identity.idempotency_key,
+            "op-t1-2-reconcile",
+        );
+        let receipt = block_on(composition.commit_canonical(&identity, envelope.clone()))
+            .expect("admitted commit");
+        // A lost acknowledgement resolves through exact receipt
+        // reconciliation, not through a second execution.
+        let reconciled = block_on(kernel.receipt(receipt.operation_id.clone()))
+            .expect("receipt route")
+            .expect("stored receipt");
+        assert_eq!(reconciled, receipt);
+        // A retry carrying a fresh deadline/cancellation for the same
+        // operation replays the stored receipt instead of re-executing.
+        let mut retry = identity.clone();
+        retry.deadline_unix_ms = 1_900_000_000_000;
+        retry.cancellation_id = "cancel-t1-2-retry".to_owned();
+        let replayed =
+            block_on(composition.commit_canonical(&retry, envelope)).expect("idempotent replay");
+        assert_eq!(replayed, receipt);
+        assert_eq!(
+            *kernel.apply_calls.lock().expect("apply call lock"),
+            1,
+            "retry with a new deadline must not re-execute"
+        );
+    }
+
+    #[test]
+    fn commit_then_refresh_publishes_the_kernel_change() {
+        let observed = snapshot();
+        let fence = observed.state_fence();
+        let mut fake = fake_kernel(observed.clone());
+        fake.payloads.insert(
+            RecoveryOwner::Task,
+            canonical_json_bytes(&refresh_task_snapshot(&fence, "goal before commit"))
+                .expect("task bytes"),
+        );
+        let expected = KernelGenerationExpectation::from_snapshot(&observed).expect("expectation");
+        let kernel = Arc::new(fake);
+        let mut composition =
+            GovernorComposition::new(kernel.clone(), &expected, QueueLimits::default())
+                .expect("composition");
+        let identity = commit_identity(&fence);
+        let envelope = commit_envelope(
+            &fence,
+            identity.request.metadata.clone(),
+            &identity.idempotency_key,
+            "op-t1-2-refresh",
+        );
+        let receipt =
+            block_on(composition.commit_canonical(&identity, envelope)).expect("admitted commit");
+        assert_eq!(receipt.status, WriteReceiptStatus::Committed);
+        // The Kernel advances task state plus a new stable head set; one
+        // refresh publishes both without a daemon restart.
+        kernel.live_reads.lock().expect("live read lock").insert(
+            RecoveryOwner::Task,
+            Some(
+                canonical_json_bytes(&refresh_task_snapshot(&fence, "goal after commit"))
+                    .expect("task bytes"),
+            ),
+        );
+        let moved_heads = refresh_heads(&fence, 2, 2);
+        kernel
+            .staged_scopes
+            .lock()
+            .expect("staged scope lock")
+            .push(moved_heads.clone());
+        composition
+            .refresh_from_kernel()
+            .expect("refresh publishes the committed change");
+        let task_id = TaskId::new("task-1").expect("task id");
+        assert_eq!(
+            composition.owners().task.task(&task_id).expect("task").goal,
+            "goal after commit"
+        );
+        assert_eq!(composition.recovery().canonical_scope, moved_heads);
     }
 }
