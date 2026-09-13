@@ -8,7 +8,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use eliot_agent_api::{AgentAttempt as LaunchAttempt, EffectKind};
+use eliot_agent_api::{AgentAttempt as LaunchAttempt, EffectKind, WorkLeaseId};
 use eliot_agent_contracts::{
     AgentAttempt, AgentAttemptId, CoordinationEntry, CoordinationMapView, RevisionId, RouteId,
     WorkItem, WorkItemId, WorkItemState,
@@ -200,7 +200,7 @@ pub struct ProviderBinding {
     pub work_item_id: WorkItemId,
     pub role_id: RoleId,
     pub route_id: String,
-    pub lease_id: String,
+    pub lease_id: WorkLeaseId,
     pub reviewer_attempt_id: Option<AgentAttemptId>,
     pub affected_branch: Option<BranchId>,
 }
@@ -227,10 +227,13 @@ impl ProviderBinding {
                 self.work_contract_revision.as_str(),
             ),
             ("route_id", self.route_id.as_str()),
-            ("lease_id", self.lease_id.as_str()),
         ] {
             validate_text(value, field)?;
         }
+        // lease_id is the canonical `WorkLeaseId` (re-exported owner via
+        // `eliot-agent-api`): non-blank/control/boundary/length is already
+        // enforced by Deserialize; provenance and equality are enforced via
+        // `==` against `AgentAttempt::lease` / `AuthorityEnvelope::lease`.
         Ok(())
     }
 
@@ -693,7 +696,7 @@ impl AdmittedSwarmPlan {
         work_item_id: WorkItemId,
         role_id: RoleId,
         route_id: String,
-        lease_id: String,
+        lease_id: WorkLeaseId,
         work_contract_revision: String,
     ) -> ProviderBinding {
         let mut binding = self.provider_binding.clone();
@@ -1275,7 +1278,7 @@ fn assignment_request(
             assignment.work_item.work_item_id.clone(),
             assignment.role_id.clone(),
             assignment.attempt.route.route_id.as_str().to_owned(),
-            assignment.launch_attempt.lease.as_str().to_owned(),
+            assignment.launch_attempt.lease.clone(),
             assignment
                 .launch_attempt
                 .work_unit
@@ -1568,7 +1571,7 @@ pub fn accept_cross_review(
             .route_id
             .as_str()
             .to_owned(),
-        reviewer.assignment.launch_attempt.lease.as_str().to_owned(),
+        reviewer.assignment.launch_attempt.lease.clone(),
         reviewer
             .assignment
             .launch_attempt
@@ -1841,7 +1844,7 @@ pub fn accept_blind_audit(
             .route_id
             .as_str()
             .to_owned(),
-        auditor.assignment.launch_attempt.lease.as_str().to_owned(),
+        auditor.assignment.launch_attempt.lease.clone(),
         auditor
             .assignment
             .launch_attempt

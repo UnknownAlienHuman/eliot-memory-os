@@ -994,7 +994,7 @@ where
         if frame.state_fence != grant.authority().state_fence {
             return Err(WorkerError::StaleFence);
         }
-        if frame.lease_id != grant.authority().lease.as_str() {
+        if frame.lease_id != grant.authority().lease {
             return Err(WorkerError::StaleLease);
         }
         if frame.admission_revision != grant.admission_revision() {
