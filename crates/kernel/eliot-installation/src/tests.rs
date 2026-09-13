@@ -1272,18 +1272,21 @@ fn test_watchdog_control_grant() -> InstallerServiceControlGrantReceipt {
 }
 
 // s38 (#1345): the installer-policy service DACL grant read back for the
-// Host registration itself. The receipt reuses the exact installer-policy
-// DACL shape (principal Host SID, installer mask, policy digest computed by
-// the real platform digest authority for a distinct valid Host SID), so the
-// Host proof round-trips through the same marker/evidence/approval gates as
-// the Watchdog proof without canned digests.
+// Host registration itself. The receipt uses the exact Host installer-policy
+// DACL shape (principal Host SID, Host mask
+// `ELIOT_HOST_SERVICE_CONTROL_ACCESS_MASK`, Host policy digest computed by
+// the real platform Host digest authority
+// `host_service_security_descriptor_digest` for a distinct valid Host SID),
+// so the Host proof round-trips through the same marker/evidence/approval
+// gates as the Watchdog proof without canned digests. The Watchdog fixture
+// above stays on the Watchdog mask/digest (byte-identical behavior).
 fn test_host_service_control_grant() -> InstallerServiceControlGrantReceipt {
     let principal_sid = "S-1-5-80-9-8-7-6-5";
     let receipt = InstallerServiceControlGrantReceipt {
         principal_service: test_handle(ELIOT_HOST_SERVICE_NAME),
         principal_sid: test_handle(principal_sid),
-        access_mask: ELIOT_WATCHDOG_HOST_CONTROL_ACCESS_MASK,
-        security_descriptor_digest: test_handle(must(watchdog_service_security_descriptor_digest(
+        access_mask: ELIOT_HOST_SERVICE_CONTROL_ACCESS_MASK,
+        security_descriptor_digest: test_handle(must(host_service_security_descriptor_digest(
             principal_sid,
         ))),
     };
@@ -6214,8 +6217,12 @@ fn service_registration_projection_is_durable_and_exact() {
         ELIOT_HOST_SERVICE_NAME
     );
     assert_eq!(
+        host_grant.access_mask(),
+        ELIOT_HOST_SERVICE_CONTROL_ACCESS_MASK
+    );
+    assert_eq!(
         host_grant.security_descriptor_digest().as_str(),
-        must(watchdog_service_security_descriptor_digest(
+        must(host_service_security_descriptor_digest(
             host_grant.principal_sid().as_str()
         ))
     );

@@ -4,10 +4,11 @@ use std::path::Path;
 
 use eliot_contracts::sha256_hex;
 use eliot_platform_windows::{
-    ELIOT_HOST_SERVICE_DISPLAY_NAME, ELIOT_HOST_SERVICE_NAME,
-    ELIOT_WATCHDOG_HOST_CONTROL_ACCESS_MASK, ELIOT_WATCHDOG_SERVICE_DISPLAY_NAME,
-    ELIOT_WATCHDOG_SERVICE_NAME, ServiceAccount, ServiceBootstrapArguments,
-    ServiceControlGrantReadback, ServiceRegistrationRequest, ServiceStartMode,
+    ELIOT_HOST_SERVICE_CONTROL_ACCESS_MASK, ELIOT_HOST_SERVICE_DISPLAY_NAME,
+    ELIOT_HOST_SERVICE_NAME, ELIOT_WATCHDOG_HOST_CONTROL_ACCESS_MASK,
+    ELIOT_WATCHDOG_SERVICE_DISPLAY_NAME, ELIOT_WATCHDOG_SERVICE_NAME, ServiceAccount,
+    ServiceBootstrapArguments, ServiceControlGrantReadback, ServiceRegistrationRequest,
+    ServiceStartMode, host_service_security_descriptor_digest,
     watchdog_service_security_descriptor_digest,
 };
 use schemars::JsonSchema;
@@ -17,9 +18,12 @@ use super::{
     InstallationError, InstallationServiceBootstrap, InstallerServiceAccount, InstallerServiceRole,
     PlatformHandle, approved_path, handle, sha256_handle,
 };
-/// Durable installer receipt for the one narrow Host-to-Watchdog SCM control
-/// grant. The private service key and SCM mutation handles never cross this
-/// projection.
+/// Durable installer receipt for one narrow per-service installer-policy SCM
+/// control grant: the `EliotHost` self-grant on the canonical `EliotHost`
+/// registration, or the `EliotHost` service-SID grant on the canonical
+/// `EliotWatchdog` registration. Both carry the deterministic Host SID as
+/// principal and differ only in mask/descriptor digest. The private service
+/// key and SCM mutation handles never cross this projection.
 #[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct InstallerServiceControlGrantReceipt {
@@ -114,7 +118,10 @@ impl InstallerServiceControlGrantReceipt {
         })
     }
 
-    /// Validates the receipt without touching SCM.
+    /// Validates the receipt without touching SCM. Accepts both canonical
+    /// per-service installer-policy grants (Host self-grant and
+    /// Host-to-Watchdog grant), mirroring
+    /// `ServiceControlGrantReadback::validate`.
     pub fn validate(&self) -> Result<(), InstallationError> {
         handle(
             &self.principal_service,
@@ -139,13 +146,25 @@ impl InstallerServiceControlGrantReceipt {
                             || part.parse::<u32>().is_err()
                     })
             })
-            || self.access_mask != ELIOT_WATCHDOG_HOST_CONTROL_ACCESS_MASK
-            || !watchdog_service_security_descriptor_digest(self.principal_sid.as_str())
-                .is_ok_and(|expected| expected == self.security_descriptor_digest.as_str())
         {
             return Err(InstallationError::IdentityConflict);
         }
-        Ok(())
+        // Watchdog grant path (byte-identical legacy behavior).
+        if self.access_mask == ELIOT_WATCHDOG_HOST_CONTROL_ACCESS_MASK
+            && watchdog_service_security_descriptor_digest(self.principal_sid.as_str())
+                .is_ok_and(|expected| expected == self.security_descriptor_digest.as_str())
+        {
+            return Ok(());
+        }
+        // Host self-grant path (per-service generalization; Watchdog path
+        // above unchanged).
+        if self.access_mask == ELIOT_HOST_SERVICE_CONTROL_ACCESS_MASK
+            && host_service_security_descriptor_digest(self.principal_sid.as_str())
+                .is_ok_and(|expected| expected == self.security_descriptor_digest.as_str())
+        {
+            return Ok(());
+        }
+        Err(InstallationError::IdentityConflict)
     }
 }
 
