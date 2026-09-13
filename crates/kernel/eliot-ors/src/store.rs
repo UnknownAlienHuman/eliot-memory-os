@@ -1326,6 +1326,7 @@ impl RedbRecoveryStore {
         }
         existing.state.transition_to(target)?;
         let mut next = existing.clone();
+        next.state = target;
         if target == crate::NativeWorkerClaimState::Admitted {
             match (
                 &existing.receipt_digest,

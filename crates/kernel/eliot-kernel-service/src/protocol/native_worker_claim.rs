@@ -380,6 +380,74 @@ impl NativeWorkerClaimRequest {
         }
         Ok(())
     }
+
+    /// Validates that this claim was presented under one exact registration.
+    ///
+    /// Mirrors the worker-side `ClaimAdmissionRequest::validate_binding`
+    /// without importing worker internals: same registration identity, same
+    /// worker generation, same authority epoch, same immutable fence. A claim
+    /// rewired onto a stale or foreign registration fails here before any
+    /// admission owner stages it, so fresh work is never admitted merely
+    /// because its digest shape is well-formed.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`KernelServiceError::InvalidField`] for a registration or
+    /// generation mismatch and [`KernelServiceError::HandshakeMismatch`] for
+    /// epoch or fence disagreement.
+    pub fn validate_presented_under_registration(
+        &self,
+        registration_id: &str,
+        worker_generation: u64,
+        authority_epoch: AuthorityEpoch,
+        state_fence: &StateFence,
+    ) -> Result<(), KernelServiceError> {
+        if self.registration_id != registration_id {
+            return Err(KernelServiceError::InvalidField {
+                field: "native_worker_claim.registration_binding",
+                reason: "claim registration does not match the presenting registration",
+            });
+        }
+        if self.worker_generation != worker_generation {
+            return Err(KernelServiceError::InvalidField {
+                field: "native_worker_claim.generation_binding",
+                reason: "claim generation does not match the presenting registration",
+            });
+        }
+        if self.authority_epoch != authority_epoch {
+            return Err(KernelServiceError::HandshakeMismatch {
+                field: "native_worker_claim.epoch_fence",
+            });
+        }
+        if self.state_fence != *state_fence {
+            return Err(KernelServiceError::HandshakeMismatch {
+                field: "native_worker_claim.state_fence",
+            });
+        }
+        Ok(())
+    }
+
+    /// Fail-closed gate for the absent U1 executable binding (stop S-U1).
+    ///
+    /// The Wave-A claim contour carries only the `route_class` admitted
+    /// label, the budget ceiling, and digests. It structurally lacks the
+    /// full `RouteFingerprint`, adapter/config/facet revisions, introduction
+    /// references, replay stream, claim-bound launch nonce, and effective
+    /// capability projection required to start execution. This gate always
+    /// fails closed with the first absent input so callers stop instead of
+    /// inventing wire fields.
+    ///
+    /// # Errors
+    ///
+    /// Always returns [`KernelServiceError::InvalidField`] naming
+    /// `u1_missing_route_fingerprint` until the U1 owner supplies the
+    /// versioned owner-produced join.
+    pub fn require_executable_binding(&self) -> Result<(), KernelServiceError> {
+        Err(KernelServiceError::InvalidField {
+            field: "native_worker_claim.u1_missing_route_fingerprint",
+            reason: "executable binding requires the U1 owner-produced route fingerprint join",
+        })
+    }
 }
 
 /// Bound receipt for one admitted claim.
@@ -666,5 +734,25 @@ impl NativeWorkerClaimResponse {
             Self::Rejected(rejection) => rejection.validate(),
             Self::Conflict(conflict) => conflict.validate(),
         }
+    }
+
+    /// Fail-closed gate proving claim admission never implies launch (stop S-X2).
+    ///
+    /// Even an `Admitted` receipt is admission proof only: it carries the
+    /// claim/binding identity and digests, never a `ProcessRequest`, permit,
+    /// grant, or dispatch authority. Positive claim-to-process launch waits
+    /// on the X2 owner contract; until then every call fails closed so an
+    /// absent canonical activation performs no launch and no caller can
+    /// mistake a receipt for launch authority.
+    ///
+    /// # Errors
+    ///
+    /// Always returns [`KernelServiceError::InvalidField`] naming
+    /// `missing_canonical_activation`.
+    pub fn require_canonical_activation(&self) -> Result<(), KernelServiceError> {
+        Err(KernelServiceError::InvalidField {
+            field: "native_worker_claim.missing_canonical_activation",
+            reason: "claim admission is not launch authority; positive launch waits on X2",
+        })
     }
 }

@@ -48,7 +48,7 @@ use super::{
     caller_binding, native_worker_reconcile_route::NATIVE_WORKER_RECONCILE_OPERATION, sha256_json,
     status_frame, unix_ms,
 };
-use eliot_contracts::{AuthorityEpoch, StateFence};
+use eliot_contracts::{AuthorityEpoch, StateFence, canonical_json_bytes, sha256_hex};
 use eliot_ipc::{Session, TransportError};
 use eliot_kernel_service::{
     NATIVE_WORKER_CLAIM_WIRE_ID, NATIVE_WORKER_CLAIM_WIRE_VERSION,
@@ -978,24 +978,148 @@ impl KernelComposition {
         Ok((claim, registration))
     }
 
+    /// Requires the claim's worker resource identity to exactly match its
+    /// presenting registration.
+    ///
+    /// The split above binds registration identity, generation, epoch, and
+    /// fence. This binds the resource envelope the service owner persists as
+    /// an opaque digest: installation, artifact, and configuration identity.
+    /// A claim rewired onto a foreign worker generation fails here before any
+    /// owner stages it, so fresh work is never admitted merely because its
+    /// digest shape is well-formed.
+    pub(crate) fn require_claim_registration_resource_binding(
+        claim: &serde_json::Value,
+        registration: &serde_json::Value,
+    ) -> Result<(), NativeWorkerRouteError> {
+        if require_claim_text(claim, "installation_id")?
+            != require_claim_text(registration, "installation_id")?
+        {
+            return Err(NativeWorkerRouteError::Fence {
+                field: "installation_binding",
+            });
+        }
+        if require_digest(claim, "worker_artifact_digest")?
+            != require_digest(registration, "worker_artifact_digest")?
+        {
+            return Err(NativeWorkerRouteError::Fence {
+                field: "artifact_binding",
+            });
+        }
+        if require_digest(claim, "worker_config_digest")?
+            != require_digest(registration, "worker_config_digest")?
+        {
+            return Err(NativeWorkerRouteError::Fence {
+                field: "config_binding",
+            });
+        }
+        Ok(())
+    }
+
+    /// Computes the canonical fence digest for one presenting fence.
+    ///
+    /// Uses the same canonical JSON procedure the service owner uses for the
+    /// durable `fence_digest`, so a retained receipt presented under a
+    /// different fence fails the equality check in [`Self::load_and_bind`]
+    /// even when the epoch value alone still matches.
+    pub(crate) fn presenting_fence_digest(
+        fence: &StateFence,
+    ) -> Result<String, NativeWorkerRouteError> {
+        canonical_json_bytes(fence)
+            .map(|bytes| sha256_hex(&bytes))
+            .map_err(|_| NativeWorkerRouteError::Fence {
+                field: "state_fence",
+            })
+    }
+
+    /// Validates that credential references carry only provider/key references.
+    ///
+    /// Each entry must be exactly `{ "provider", "key" }`: two bounded
+    /// reference texts and no other key. Any extra key — including a
+    /// `secret`, `value`, `bytes`, or `material` field — fails closed so
+    /// secret material can never smuggle through a reference list into a
+    /// receipt or log.
+    pub(crate) fn validate_credential_refs_shape(
+        refs: &[serde_json::Value],
+    ) -> Result<(), NativeWorkerRouteError> {
+        if refs.len() > MAX_CREDENTIAL_REFERENCES {
+            return Err(NativeWorkerRouteError::Shape {
+                field: "credential_refs",
+            });
+        }
+        for reference in refs {
+            let object = reference.as_object().ok_or(NativeWorkerRouteError::Shape {
+                field: "credential_refs",
+            })?;
+            if object.len() != 2 || !object.contains_key("provider") || !object.contains_key("key")
+            {
+                return Err(NativeWorkerRouteError::Shape {
+                    field: "credential_refs",
+                });
+            }
+            require_claim_text(reference, "provider")?;
+            require_claim_text(reference, "key")?;
+        }
+        Ok(())
+    }
+
     /// Admits one claim: validate, deadline, typed service admission, receipt.
     ///
     /// Persistence happens inside the service owner's
     /// `admit_native_worker_claim` (persist-before-ack): an exact replay
     /// returns the stored receipt unchanged, and a changed binding under the
     /// same claim identity returns `CONFLICT` and takes no effect.
+    ///
+    /// The presenting registration is validated as a live registration here
+    /// (shape, future lease, resource-identity agreement with the claim) so
+    /// a stale or foreign registration cannot sponsor a claim, even when the
+    /// claim half alone is shape-valid. Admission itself stays with the typed
+    /// service owner; this route never fabricates persistence or a receipt,
+    /// and never mints a `ProcessRequest`, permit, or grant: the only
+    /// `ProcessExecutionRequest` in this file is the existing #100 `Cancel`
+    /// path owned by `stage_native_worker_cancellation`.
     fn handle_native_worker_claim(
         &self,
         identity: &serde_json::Value,
         payload: &serde_json::Value,
     ) -> Result<serde_json::Value, NativeWorkerRouteError> {
-        let (claim, _) = Self::split_claim_presentation(payload)?;
+        let (claim, registration) = Self::split_claim_presentation(payload)?;
+        Self::validate_native_worker_registration(registration)?;
+        let now = unix_ms();
+        let lease_expires_at_unix_ms =
+            require_nonzero_u64(registration, "lease_expires_at_unix_ms")?;
+        if lease_expires_at_unix_ms <= now {
+            return Err(NativeWorkerRouteError::Fence {
+                field: "lease_expires_at_unix_ms",
+            });
+        }
+        Self::require_claim_registration_resource_binding(claim, registration)?;
         let (claim_id, binding_digest, worker_generation) =
             Self::validate_native_worker_claim(claim)?;
         Self::require_message_identity(identity, &claim_id)?;
-        let now = unix_ms();
         Self::require_claim_deadline(claim, now)?;
         let request = Self::build_claim_request(claim)?;
+        request
+            .validate_presented_under_registration(
+                &require_op_id(registration, "registration_id")?,
+                require_nonzero_u64(registration, "worker_generation")?,
+                AuthorityEpoch::new(native_worker_json_u64(registration, "authority_epoch")?)
+                    .map_err(|_| NativeWorkerRouteError::Fence {
+                        field: "authority_epoch",
+                    })?,
+                &serde_json::from_value::<StateFence>(
+                    registration.get("state_fence").cloned().ok_or(
+                        NativeWorkerRouteError::Shape {
+                            field: "state_fence",
+                        },
+                    )?,
+                )
+                .map_err(|_| NativeWorkerRouteError::Shape {
+                    field: "state_fence",
+                })?,
+            )
+            .map_err(|_| NativeWorkerRouteError::Fence {
+                field: "registration_binding",
+            })?;
         let service = self.service_guard()?;
         let decision = service
             .admit_native_worker_claim(self.generation_gateway.ors.as_ref(), &request, now)
@@ -1098,6 +1222,10 @@ impl KernelComposition {
 
     /// Validates the content of one `READY` report: registry revision,
     /// credential references, and a live deadline.
+    ///
+    /// Credential entries are references only (`provider` + `key`); any extra
+    /// key fails closed so secret bytes can never smuggle through the
+    /// reference list into a receipt or log.
     fn validate_ready_report_content(
         report: &serde_json::Value,
         claim: &serde_json::Value,
@@ -1110,23 +1238,7 @@ impl KernelComposition {
             .ok_or(NativeWorkerRouteError::Shape {
                 field: "credential_refs",
             })?;
-        if refs.len() > MAX_CREDENTIAL_REFERENCES {
-            return Err(NativeWorkerRouteError::Shape {
-                field: "credential_refs",
-            });
-        }
-        for reference in refs {
-            let object = reference.as_object().ok_or(NativeWorkerRouteError::Shape {
-                field: "credential_refs",
-            })?;
-            if !object.contains_key("provider") || !object.contains_key("key") {
-                return Err(NativeWorkerRouteError::Shape {
-                    field: "credential_refs",
-                });
-            }
-            require_claim_text(reference, "provider")?;
-            require_claim_text(reference, "key")?;
-        }
+        Self::validate_credential_refs_shape(refs)?;
         let ready_at = require_nonzero_u64(report, "ready_at_unix_ms")?;
         let deadline = require_nonzero_u64(claim, "deadline_unix_ms")?;
         if now == 0 || deadline <= now || ready_at > deadline {
@@ -1273,7 +1385,9 @@ impl KernelComposition {
     /// is `Conflict`. The immutable fence itself was fixed at admission (the
     /// record carries its digest and the service owner re-checked agreement
     /// there); here the presenting fence must still agree with the session
-    /// fence (enforced at dispatch) and the epoch it carries.
+    /// fence (enforced at dispatch), the epoch it carries, and the durable
+    /// fence digest, so a retained receipt presented under a different fence
+    /// is fenced even when the epoch value alone still matches.
     fn load_and_bind(
         &self,
         binding: &NativeWorkerBindingView,
@@ -1292,6 +1406,11 @@ impl KernelComposition {
         if binding.fence.authority_epoch.value() != binding.authority_epoch {
             return Err(NativeWorkerRouteError::Fence {
                 field: "epoch_fence",
+            });
+        }
+        if Self::presenting_fence_digest(&binding.fence)? != staged.fence_digest {
+            return Err(NativeWorkerRouteError::Fence {
+                field: "state_fence",
             });
         }
         let mut changed: Vec<String> = Vec::new();
@@ -1536,3 +1655,12 @@ impl KernelComposition {
         Ok((operation_id, session_binding))
     }
 }
+
+// Slice A focused proofs live in `tests/native_worker_claim_plumbing.rs`.
+// They are wired here (not via `tests.rs`) so this slice touches only its
+// owned files: the lifecycle route, the claim protocol, and the one new test
+// file. The sibling Slice B wires its distinctly named test file through the
+// reconcile route, keeping both slices disjoint.
+#[cfg(test)]
+#[path = "tests/native_worker_claim_plumbing.rs"]
+mod native_worker_claim_plumbing;
