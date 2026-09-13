@@ -18,6 +18,14 @@ use eliot_process::{
 };
 use thiserror::Error;
 
+pub mod registry;
+pub mod testd_port;
+
+pub use registry::{ProviderRegistry, RegistryEntry, RegistryError};
+pub use testd_port::{
+    OmissionReason, RawEvidence, TestdAdmission, TestdAdmissionPort, TestdPortError,
+};
+
 /// Stable identity of the shared instrument runner contract.
 pub const CONTRACT_NAME: &str = "eliot.instrument.runner";
 /// Wire revision of the runner contract.
