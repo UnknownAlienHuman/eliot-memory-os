@@ -16,6 +16,7 @@ path = "src/main.rs"
 [dependencies]
 eliot-authority.workspace = true
 eliot-contracts.workspace = true
+eliot-controlboard.workspace = true
 eliot-governor.workspace = true
 eliot-ipc.workspace = true
 eliot-maintenance.workspace = true

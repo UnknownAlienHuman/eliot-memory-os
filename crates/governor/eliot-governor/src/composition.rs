@@ -14,6 +14,9 @@ use crate::activation_outcome::{
     GovernorActivationOutcome, GovernorCandidateCoverage, GovernorRetryDirective,
     GovernorSelectionDirective,
 };
+use crate::controlboard_projection::{
+    ControlBoardGovernorSnapshot, ControlBoardProjectionParts, compile_controlboard_snapshot,
+};
 use crate::owner_projection_refresh::{coherence_result, compare_scope_heads};
 use crate::{
     Governor, GovernorConfig, GovernorState, QueueLimits, STARTUP_ORDER, ServiceId,
@@ -1521,6 +1524,49 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
     #[must_use]
     pub fn governor(&self) -> &Governor {
         &self.governor
+    }
+
+    /// Compiles the `ControlBoard` read projection over the current owners.
+    ///
+    /// The snapshot is assembled from the live coordination, problem,
+    /// observation, task, and read-scope owners at the retained fence, with
+    /// the board revision and receipt references taken from the
+    /// refresh-consistent recovery named reads. Only a fully admitted
+    /// composition publishes: any other readiness fails closed so the
+    /// surface reports a typed provider gap instead of a stale projection.
+    pub fn controlboard_snapshot(&self) -> Result<ControlBoardGovernorSnapshot, CompositionError> {
+        if self.readiness != CompositionReadiness::Ready {
+            return Err(CompositionError::NotReady);
+        }
+        let fence = self.snapshot.state_fence();
+        if self.owners.read.state_fence() != &fence {
+            return Err(CompositionError::Recovery(
+                "read owner projection is not bound to the active fence".to_owned(),
+            ));
+        }
+        let read_revision = self.recovery.owner_read(RecoveryOwner::Read)?.revision;
+        let coordination_receipt = self
+            .recovery
+            .owner_read(RecoveryOwner::Coordination)?
+            .value_digest
+            .clone();
+        let observation_receipt = self
+            .recovery
+            .owner_read(RecoveryOwner::Observation)?
+            .value_digest
+            .clone();
+        compile_controlboard_snapshot(&ControlBoardProjectionParts {
+            fence: &fence,
+            read_revision,
+            coordination: &self.owners.coordination,
+            task: &self.owners.task,
+            observation: &self.owners.observation,
+            problem_revisions: &self.owners.problem.revisions,
+            read_scope: self.owners.read.scope(),
+            coordination_receipt_digest: &coordination_receipt,
+            observation_receipt_digest: &observation_receipt,
+        })
+        .map_err(|error| CompositionError::Owner(error.to_string()))
     }
 
     /// Applies one Canonical-admitted transition through the sole retained
