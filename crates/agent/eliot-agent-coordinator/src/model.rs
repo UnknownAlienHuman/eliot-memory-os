@@ -1,7 +1,8 @@
 use eliot_agent_api::{
-    AgentLaunchRequest, AgentResult, AttemptId, AuthorityEpoch, BudgetEnvelope, CancelReason,
-    LaunchRequestId, PhysicalRouteObservationReceipt, ProviderExecutionBinding, ResultDisposition,
-    RouteFingerprint, RouteSelectionCandidate, StateFence, TaskId, WorkLeaseId, WorkUnitId,
+    AdmittedRouteReceipt, AgentLaunchRequest, AgentResult, AttemptId, AuthorityEpoch,
+    BudgetEnvelope, CancelReason, LaunchRequestId, PhysicalRouteObservationReceipt,
+    ProviderExecutionBinding, ResultDisposition, RouteFingerprint, RouteSelectionCandidate,
+    StateFence, TaskId, WorkLeaseId, WorkUnitId,
 };
 use eliot_agent_contracts::{
     DescendantClosureReceipt, LivePeerMessage, LivePeerMessageState, MessageId,
@@ -270,6 +271,14 @@ pub struct AdmittedLaneReceipt {
     pub budget: BudgetEnvelope,
     pub priority: u16,
     pub mutation_scope: Option<String>,
+    /// Externally-issued admitted route decision for this lane (issue #370
+    /// S5). The external admission owner issues the receipt; the coordinator
+    /// only stores and validates it, never mints. `None` is a legacy or
+    /// unresolved launch and is rejected for binding closure (fail-closed).
+    /// The `#[serde(default)]` keeps pre-S5 wire readable (additive, cf. S2
+    /// `provider_binding`).
+    #[serde(default)]
+    pub admitted_route: Option<AdmittedRouteReceipt>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -370,6 +379,14 @@ pub struct AttemptRecord {
     /// `#[serde(default)]` keeps pre-S2 wire readable (additive).
     #[serde(default)]
     pub provider_binding: Option<ProviderExecutionBinding>,
+    /// Stored admitted route decision for this attempt (issue #370 S5).
+    /// Set from the admitted lane at admission; `None` is a legacy or
+    /// unresolved launch (including reassigned attempts awaiting a new
+    /// external decision for their new attempt identity) and is rejected for
+    /// binding closure (fail-closed). The `#[serde(default)]` keeps pre-S5
+    /// wire readable (additive, cf. S2 `provider_binding`).
+    #[serde(default)]
+    pub admitted_route: Option<AdmittedRouteReceipt>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
