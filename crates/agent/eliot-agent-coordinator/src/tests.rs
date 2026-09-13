@@ -1,12 +1,13 @@
 use std::collections::BTreeSet;
 
 use eliot_agent_api::{
-    AgentLaunchRequest, AgentResult, AgentWorkUnitBrief, ArtifactId, AttemptId, AuthorityEpoch,
-    BudgetEnvelope, CONTRACT_VERSION, ClockReading, ContractError, EffectCeiling, EffectKind,
-    EventCursor, ExecutionOutcome, ExecutionUnit, LaunchRequestId, LowercaseSha256, NativeSession,
-    NativeSessionLocator, PhysicalRouteObservationReceipt, ProviderExecutionBinding,
-    QuotaKnowledge, RequestId, ResourceGeneration, ResultDisposition, RouteFingerprint,
-    RouteObservationState, StateFence, TaskId, UsageReceipt, WorkLeaseId, WorkUnitId,
+    AdmittedRouteReceipt, AgentLaunchRequest, AgentResult, AgentWorkUnitBrief, ArtifactId,
+    AttemptId, AuthorityEpoch, BudgetEnvelope, CONTRACT_VERSION, ClockReading, ContractError,
+    DecisionId, EffectCeiling, EffectKind, EventCursor, ExecutionOutcome, ExecutionUnit,
+    LaunchRequestId, LowercaseSha256, NativeSession, NativeSessionLocator,
+    PhysicalRouteObservationReceipt, ProposedEffect, ProviderExecutionBinding, QuotaKnowledge,
+    RequestId, ResourceGeneration, ResultDisposition, RouteFingerprint, RouteObservationState,
+    RouteSelectionCandidate, StateFence, TaskId, UsageReceipt, WorkLeaseId, WorkUnitId,
     candidate_digest_for,
 };
 use eliot_agent_contracts::{
@@ -300,6 +301,42 @@ fn request(
     })
 }
 
+fn admitted_route_receipt(
+    tag: &str,
+    index: usize,
+    routing: &RouteSelectionCandidate,
+    attempt_id: &AttemptId,
+    lease_id: &WorkLeaseId,
+    route: &RouteFingerprint,
+    fence: &StateFence,
+) -> TestResult<AdmittedRouteReceipt> {
+    // Test-only mint via the api fixture pattern (lib.rs admitted_fixture):
+    // the external admission owner issues the decision; the coordinator only
+    // stores/validates. Candidate digest + policy come from the real routing
+    // so linkage checks bind exact bytes, never a hardcoded digest.
+    let mut receipt = AdmittedRouteReceipt {
+        schema_version: CONTRACT_VERSION.to_owned(),
+        decision_id: DecisionId::new(format!("decision-{tag}-{index}"))?,
+        candidate_digest: candidate_digest_for(routing)?,
+        attempt_id: attempt_id.clone(),
+        lease_id: lease_id.clone(),
+        state_fence: fence.clone(),
+        runtime_generation: ResourceGeneration::genesis(),
+        policy_revision: routing.policy_revision.clone(),
+        requested_route: route.clone(),
+        selected_route: Some(route.clone()),
+        no_route: None,
+        evidence_refs: routing.evidence_refs.clone(),
+        proof_ceiling: eliot_receipts::ProofCeiling::CandidateArtifact,
+        self_digest: zero_digest()?,
+    };
+    receipt.self_digest = receipt.compute_digest()?;
+    receipt
+        .validate()
+        .map_err(|error| format!("admission fixture must validate: {error}"))?;
+    Ok(receipt)
+}
+
 fn provider_receipt(
     candidate: &StaffingPlanCandidate,
     tag: &str,
@@ -314,18 +351,31 @@ fn provider_receipt(
                 .selected
                 .clone()
                 .ok_or("candidate must select a route")?;
+            let attempt_id = AttemptId::new(format!("attempt-{tag}-{index}"))?;
+            let lease_id = serde_json::from_value::<WorkLeaseId>(serde_json::json!({"namespace": "eliot.governor.work-lease", "revision": "v1", "value": format!("lease-{tag}-{index}")}))?;
+            let routing_receipt_digest = candidate_digest_for(&lane.routing)?;
+            let admitted_route = admitted_route_receipt(
+                tag,
+                index,
+                &lane.routing,
+                &attempt_id,
+                &lease_id,
+                &selected,
+                &candidate.state_fence,
+            )?;
             Ok(AdmittedLaneReceipt {
                 work_unit_id: lane.work_unit_id.clone(),
                 role_id: lane.role_id.clone(),
                 role_revision: lane.role_revision.clone(),
-                attempt_id: AttemptId::new(format!("attempt-{tag}-{index}"))?,
-                lease_id: serde_json::from_value::<WorkLeaseId>(serde_json::json!({"namespace": "eliot.governor.work-lease", "revision": "v1", "value": format!("lease-{tag}-{index}")}))?,
+                attempt_id,
+                lease_id,
                 worker_id: WorkerId::new(format!("worker-{tag}-{index}"))?,
                 route: selected,
-                routing_receipt_digest: candidate_digest_for(&lane.routing)?,
+                routing_receipt_digest,
                 budget: lane.budget.clone(),
                 priority: lane.priority,
                 mutation_scope: lane.mutation_scope.clone(),
+                admitted_route: Some(admitted_route),
             })
         })
         .collect::<TestResult<Vec<_>>>()?;
@@ -391,6 +441,25 @@ fn zero_digest() -> TestResult<LowercaseSha256> {
     ))?)
 }
 
+fn stored_admission_digest(lane: &AdmittedLaneReceipt) -> TestResult<LowercaseSha256> {
+    // S5 linkage: the observation must reference the stored admission's
+    // self_digest. Legacy lanes without stored admission fall back to the
+    // zero digest so the observation shape still validates; intake then
+    // fails closed on the missing stored decision.
+    Ok(lane
+        .admitted_route
+        .as_ref()
+        .map(|admission| admission.self_digest.clone())
+        .unwrap_or(try_zero_digest()))
+}
+
+fn try_zero_digest() -> LowercaseSha256 {
+    serde_json::from_value(serde_json::json!(
+        "0000000000000000000000000000000000000000000000000000000000000000"
+    ))
+    .expect("zero digest must decode")
+}
+
 fn matched_observation(
     lane: &AdmittedLaneReceipt,
     binding: &ProviderExecutionBinding,
@@ -400,7 +469,7 @@ fn matched_observation(
         attempt_id: lane.attempt_id.clone(),
         state_fence: fence(),
         runtime_generation: ResourceGeneration::genesis(),
-        admitted_route_digest: zero_digest()?,
+        admitted_route_digest: stored_admission_digest(lane)?,
         binding: binding.clone(),
         requested_route: lane.route.clone(),
         observed_route: Some(lane.route.clone()),
@@ -449,7 +518,7 @@ fn unknown_observation(
         attempt_id: lane.attempt_id.clone(),
         state_fence: fence(),
         runtime_generation: ResourceGeneration::genesis(),
-        admitted_route_digest: zero_digest()?,
+        admitted_route_digest: stored_admission_digest(lane)?,
         binding: binding.clone(),
         requested_route: lane.route.clone(),
         observed_route: Some(lane.route.clone()),
@@ -2120,12 +2189,13 @@ fn diverged_observation(
     let diverged = route_divergence_fields(&lane.route, observed);
     assert!(!diverged.is_empty(), "diverged fixture must differ");
     let zero = zero_digest()?;
+    let admitted_digest = stored_admission_digest(lane)?;
     let mut observation = PhysicalRouteObservationReceipt {
         schema_version: CONTRACT_VERSION.to_owned(),
         attempt_id: lane.attempt_id.clone(),
         state_fence: fence(),
         runtime_generation: ResourceGeneration::genesis(),
-        admitted_route_digest: zero.clone(),
+        admitted_route_digest: admitted_digest,
         binding: binding.clone(),
         requested_route: lane.route.clone(),
         observed_route: Some(observed.clone()),
@@ -2170,12 +2240,13 @@ fn unobserved_observation(
     binding: &ProviderExecutionBinding,
 ) -> TestResult<PhysicalRouteObservationReceipt> {
     let zero = zero_digest()?;
+    let admitted_digest = stored_admission_digest(lane)?;
     let mut observation = PhysicalRouteObservationReceipt {
         schema_version: CONTRACT_VERSION.to_owned(),
         attempt_id: lane.attempt_id.clone(),
         state_fence: fence(),
         runtime_generation: ResourceGeneration::genesis(),
-        admitted_route_digest: zero.clone(),
+        admitted_route_digest: admitted_digest,
         binding: binding.clone(),
         requested_route: lane.route.clone(),
         observed_route: None,
@@ -2395,5 +2466,438 @@ fn invalid_candidate_selection_rejects_with_route_mismatch() -> TestResult {
         evidence_refs: vec!["evidence-1".to_owned()],
     };
     assert_eq!(candidate.validate(), Err(ContractError::RouteMismatch));
+    Ok(())
+}
+
+#[test]
+fn s5_stored_admission_closes_binding_and_forged_digest_rejects() -> TestResult {
+    // S5 happy path + digest-linkage negative + snapshot preservation.
+    // Stored admission comes from the external decision carried in the
+    // admitted lane (never minted); intake closes via validate_for_binding
+    // and a forged admitted_route_digest fails closed.
+    let proofs = [
+        "proof-admission-s5a",
+        "proof-result-s5a-0",
+        "proof-result-s5a-1-forged",
+    ];
+    let mut coordinator = coordinator(config(4, 4), &proofs)?;
+    let admitted = plan_and_admit(
+        &mut coordinator,
+        "s5a",
+        &[
+            LaneSpec {
+                work: "work-s5a-0",
+                role: "reader-s5a-0",
+                route: "a",
+                scope: None,
+                write: false,
+                priority: 2,
+            },
+            LaneSpec {
+                work: "work-s5a-1",
+                role: "reader-s5a-1",
+                route: "b",
+                scope: None,
+                write: false,
+                priority: 1,
+            },
+        ],
+        None,
+    )?;
+    // Stored admission is present and equals the presented lane decision.
+    for lane in &admitted.admitted_lanes {
+        let stored = coordinator
+            .attempt(&lane.attempt_id)
+            .unwrap_or_else(|| panic!("admitted attempt must exist"))
+            .admitted_route
+            .clone();
+        assert_eq!(stored, lane.admitted_route);
+        assert!(stored.is_some());
+    }
+    let context = ExecutionContext::from(&admitted);
+    let first = admitted.admitted_lanes[0].clone();
+    let second = admitted.admitted_lanes[1].clone();
+    coordinator.start_attempt(context.clone(), first.attempt_id.clone())?;
+    coordinator.start_attempt(context.clone(), second.attempt_id.clone())?;
+    // Snapshot round-trip preserves the stored decision; restore-then-submit
+    // still closes.
+    let snapshot = coordinator.snapshot()?;
+    let mut restored = AgentCoordinator::restore_with_provider(
+        snapshot.clone(),
+        config(4, 4),
+        Box::new(verifier(&proofs, snapshot.event_sequence)),
+    )?;
+    assert_eq!(
+        restored
+            .attempt(&first.attempt_id)
+            .unwrap_or_else(|| panic!("restored attempt must exist"))
+            .admitted_route,
+        first.admitted_route
+    );
+    let happy = result_submission("s5a-0", &first, ResultDisposition::Partial)?;
+    let receipt = restored.submit_result(context.clone(), happy)?;
+    assert_eq!(
+        receipt.proof_ceiling,
+        eliot_receipts::ProofCeiling::CandidateArtifact
+    );
+    // Forged digest: same attempt/binding/route but a zero digest instead of
+    // the stored self_digest. Shape still validates (recomputed self_digest)
+    // so only the admission linkage can fail.
+    let mut forged = result_submission("s5a-1-forged", &second, ResultDisposition::Partial)?;
+    forged.result.actual_route.admitted_route_digest = zero_digest()?;
+    forged.result.actual_route.self_digest = forged.result.actual_route.compute_digest()?;
+    assert_eq!(
+        coordinator.submit_result(context, forged).err(),
+        Some(CoordinatorError::IdentityConflict("execution_binding"))
+    );
+    Ok(())
+}
+
+#[test]
+fn s5_foreign_turn_binding_admission_triple_mismatch_rejects() -> TestResult {
+    // Foreign execution unit and foreign admission digest both fail closed,
+    // preserving DIVERGED/UNOBSERVED handling (those stay retained, not
+    // rejected as mismatch).
+    let proofs = [
+        "proof-admission-s5b",
+        "proof-result-s5b-foreign-bind",
+        "proof-result-s5b-foreign-digest",
+    ];
+    let mut coordinator = coordinator(config(4, 4), &proofs)?;
+    let admitted = plan_and_admit(
+        &mut coordinator,
+        "s5b",
+        &[
+            LaneSpec {
+                work: "work-s5b-0",
+                role: "reader-s5b-0",
+                route: "a",
+                scope: None,
+                write: false,
+                priority: 2,
+            },
+            LaneSpec {
+                work: "work-s5b-1",
+                role: "reader-s5b-1",
+                route: "b",
+                scope: None,
+                write: false,
+                priority: 1,
+            },
+        ],
+        None,
+    )?;
+    let context = ExecutionContext::from(&admitted);
+    let lane_a = admitted.admitted_lanes[0].clone();
+    let lane_b = admitted.admitted_lanes[1].clone();
+    coordinator.start_attempt(context.clone(), lane_a.attempt_id.clone())?;
+    coordinator.start_attempt(context.clone(), lane_b.attempt_id.clone())?;
+    // Foreign turn: result names attempt A but the embedded binding is B's
+    // unit (different attempt/lease). Intake fails closed.
+    let binding_b = observation_binding(&lane_b)?;
+    let mut foreign_bind =
+        result_submission("s5b-foreign-bind", &lane_a, ResultDisposition::Partial)?;
+    foreign_bind.result.actual_route.binding = binding_b;
+    foreign_bind.result.actual_route.self_digest =
+        foreign_bind.result.actual_route.compute_digest()?;
+    assert_eq!(
+        coordinator
+            .submit_result(context.clone(), foreign_bind)
+            .err(),
+        Some(CoordinatorError::IdentityConflict("execution_binding"))
+    );
+    // Foreign admission: binding is A's but the digest points at B's
+    // decision. Linkage against stored A fails closed.
+    let foreign_digest = lane_b
+        .admitted_route
+        .as_ref()
+        .unwrap_or_else(|| panic!("lane must carry stored admission"))
+        .self_digest
+        .clone();
+    let mut foreign_digest_sub =
+        result_submission("s5b-foreign-digest", &lane_a, ResultDisposition::Partial)?;
+    foreign_digest_sub.result.actual_route.admitted_route_digest = foreign_digest;
+    foreign_digest_sub.result.actual_route.self_digest =
+        foreign_digest_sub.result.actual_route.compute_digest()?;
+    assert_eq!(
+        coordinator.submit_result(context, foreign_digest_sub).err(),
+        Some(CoordinatorError::IdentityConflict("execution_binding"))
+    );
+    Ok(())
+}
+
+#[test]
+fn s5_per_effect_attempt_mismatch_rejects() -> TestResult {
+    // Reachable via submit_result: the effect itself satisfies the ceiling
+    // so only the S5 per-effect attempt linkage can fail.
+    let mut coordinator = coordinator(config(2, 2), &["proof-admission-s5c", "proof-result-s5c"])?;
+    let admitted = plan_and_admit(
+        &mut coordinator,
+        "s5c",
+        &[LaneSpec {
+            work: "work-s5c",
+            role: "reader-s5c",
+            route: "a",
+            scope: None,
+            write: false,
+            priority: 1,
+        }],
+        None,
+    )?;
+    let context = ExecutionContext::from(&admitted);
+    let lane = admitted.admitted_lanes[0].clone();
+    coordinator.start_attempt(context.clone(), lane.attempt_id.clone())?;
+    let mut submission = result_submission("s5c", &lane, ResultDisposition::Partial)?;
+    let foreign_effect = ProposedEffect {
+        effect_id: "effect-s5c-1".to_owned(),
+        attempt_id: AttemptId::new("attempt-s5c-foreign")?,
+        kind: EffectKind::Observe,
+        scope_ref: "scope-work-s5c".to_owned(),
+        payload_digest: "payload-s5c-1".to_owned(),
+        rationale_ref: None,
+    };
+    submission.result.proposed_effects = vec![foreign_effect];
+    assert_eq!(
+        coordinator.submit_result(context, submission).err(),
+        Some(CoordinatorError::IdentityConflict("execution_binding"))
+    );
+    Ok(())
+}
+
+#[test]
+fn s5_missing_stored_admission_and_reassigned_stays_unresolved() -> TestResult {
+    // Legacy `None` (pre-S5 wire) and reassigned attempts (new identity
+    // awaiting a new external decision) both fail closed at intake with the
+    // admission owner named, never silently upgraded.
+    let mut legacy = coordinator(config(2, 2), &["proof-admission-s5d", "proof-result-s5d"])?;
+    let candidate = legacy.plan(request(
+        "s5d",
+        &[LaneSpec {
+            work: "work-s5d",
+            role: "reader-s5d",
+            route: "a",
+            scope: None,
+            write: false,
+            priority: 1,
+        }],
+        None,
+    )?)?;
+    let mut receipt = provider_receipt(&candidate, "s5d")?;
+    receipt.admitted_lanes[0].admitted_route = None;
+    let admitted = legacy.admit(receipt)?;
+    let context = ExecutionContext::from(&admitted);
+    let lane = admitted.admitted_lanes[0].clone();
+    assert_eq!(
+        legacy
+            .attempt(&lane.attempt_id)
+            .unwrap_or_else(|| panic!("legacy attempt must exist"))
+            .admitted_route,
+        None
+    );
+    legacy.start_attempt(context.clone(), lane.attempt_id.clone())?;
+    let submission = result_submission("s5d", &lane, ResultDisposition::Partial)?;
+    assert_eq!(
+        legacy.submit_result(context, submission).err(),
+        Some(CoordinatorError::IdentityConflict("admitted_route"))
+    );
+
+    // Reassigned attempt: new identity starts unresolved.
+    let proofs = [
+        "proof-admission-s5e",
+        "proof-fence-s5e",
+        "proof-reassign-s5e",
+        "proof-result-s5e-new",
+    ];
+    let mut coordinator = coordinator(config(4, 4), &proofs)?;
+    let admitted = plan_and_admit(
+        &mut coordinator,
+        "s5e",
+        &[LaneSpec {
+            work: "work-s5e",
+            role: "reader-s5e",
+            route: "a",
+            scope: None,
+            write: false,
+            priority: 1,
+        }],
+        None,
+    )?;
+    let context = ExecutionContext::from(&admitted);
+    let lane = admitted.admitted_lanes[0].clone();
+    coordinator.start_attempt(context.clone(), lane.attempt_id.clone())?;
+    coordinator.mark_worker_lost(
+        context.clone(),
+        worker_fence(&lane, "s5e", "proof-fence-s5e")?,
+    )?;
+    let new_attempt = AttemptId::new("attempt-s5e-new")?;
+    let new_lease = serde_json::from_value::<WorkLeaseId>(
+        serde_json::json!({"namespace": "eliot.governor.work-lease", "revision": "v1", "value": "lease-s5e-new"}),
+    )?;
+    let new_worker = WorkerId::new("worker-s5e-new")?;
+    coordinator.reassign(
+        context.clone(),
+        ProviderReassignmentReceipt {
+            reassignment_id: ReassignmentId::new("reassign-s5e")?,
+            provider_identity: provider_identity(),
+            g11_receipt_ref: "proof-reassign-s5e".to_owned(),
+            old_attempt_id: lane.attempt_id.clone(),
+            old_lease_id: lane.lease_id.clone(),
+            new_attempt_id: new_attempt.clone(),
+            new_lease_id: new_lease.clone(),
+            new_worker_id: new_worker.clone(),
+            route: lane.route.clone(),
+            budget: budget(),
+        },
+    )?;
+    let reassigned = coordinator
+        .attempt(&new_attempt)
+        .unwrap_or_else(|| panic!("reassigned attempt must exist"))
+        .clone();
+    assert_eq!(reassigned.admitted_route, None);
+    coordinator.start_attempt(context.clone(), new_attempt.clone())?;
+    // Build a submission naming the new identity; the embedded binding and
+    // digest are well-formed for the new identity but no stored decision
+    // exists, so intake names the admission owner.
+    let fake_lane = AdmittedLaneReceipt {
+        work_unit_id: reassigned.work_unit_id.clone(),
+        role_id: reassigned.role_id.clone(),
+        role_revision: reassigned.role_revision.clone(),
+        attempt_id: new_attempt.clone(),
+        lease_id: new_lease.clone(),
+        worker_id: new_worker.clone(),
+        route: reassigned.route.clone(),
+        routing_receipt_digest: lane.routing_receipt_digest.clone(),
+        budget: reassigned.budget.clone(),
+        priority: reassigned.priority,
+        mutation_scope: reassigned.mutation_scope.clone(),
+        admitted_route: None,
+    };
+    let mut submission = result_submission("s5e-new", &fake_lane, ResultDisposition::Partial)?;
+    submission.provider_result_receipt_ref = "proof-result-s5e-new".to_owned();
+    assert_eq!(
+        coordinator.submit_result(context, submission).err(),
+        Some(CoordinatorError::IdentityConflict("admitted_route"))
+    );
+    Ok(())
+}
+
+#[test]
+fn s5_forged_lane_admission_rejects_at_admit() -> TestResult {
+    // Forged decisions are rejected at admission, never stored: wrong
+    // attempt/route/digest/policy and no-route denials all fail closed, and
+    // a tampered self_digest fails as a provider contract (shape) error.
+    let mut coord = coordinator(config(4, 4), &["proof-admission-s5f"])?;
+    let candidate = coord.plan(request(
+        "s5f",
+        &[LaneSpec {
+            work: "work-s5f",
+            role: "reader-s5f",
+            route: "a",
+            scope: None,
+            write: false,
+            priority: 1,
+        }],
+        None,
+    )?)?;
+    let good = provider_receipt(&candidate, "s5f")?;
+    // Sanity: the good receipt admits.
+    let mut sanity = crate::core::AgentCoordinator::with_provider(
+        config(4, 4),
+        Box::new(verifier(&["proof-admission-s5f"], 0)),
+    )?;
+    let sanity_candidate = sanity.plan(request(
+        "s5f-sanity",
+        &[LaneSpec {
+            work: "work-s5f",
+            role: "reader-s5f",
+            route: "a",
+            scope: None,
+            write: false,
+            priority: 1,
+        }],
+        None,
+    )?)?;
+    sanity.admit(provider_receipt(&sanity_candidate, "s5f")?)?;
+
+    // Wrong attempt identity (recomputed digest isolates the linkage failure).
+    let mut wrong_attempt = good.clone();
+    {
+        let lane = &mut wrong_attempt.admitted_lanes[0];
+        let admission = lane
+            .admitted_route
+            .as_mut()
+            .unwrap_or_else(|| panic!("lane must carry admission"));
+        admission.attempt_id = AttemptId::new("attempt-s5f-foreign")?;
+        admission.self_digest = admission.compute_digest()?;
+    }
+    assert_eq!(
+        coord.admit(wrong_attempt).err(),
+        Some(CoordinatorError::IdentityConflict("admitted_route"))
+    );
+
+    // Wrong route (requested/selected no longer match the lane).
+    let mut wrong_route = good.clone();
+    {
+        let lane = &mut wrong_route.admitted_lanes[0];
+        let admission = lane
+            .admitted_route
+            .as_mut()
+            .unwrap_or_else(|| panic!("lane must carry admission"));
+        admission.requested_route = route("b");
+        admission.selected_route = Some(route("b"));
+        admission.self_digest = admission.compute_digest()?;
+    }
+    assert_eq!(
+        coord.admit(wrong_route).err(),
+        Some(CoordinatorError::IdentityConflict("admitted_route"))
+    );
+
+    // Wrong candidate digest (exact bytes no longer bound).
+    let mut wrong_digest = good.clone();
+    {
+        let lane = &mut wrong_digest.admitted_lanes[0];
+        let admission = lane
+            .admitted_route
+            .as_mut()
+            .unwrap_or_else(|| panic!("lane must carry admission"));
+        admission.candidate_digest = zero_digest()?;
+        admission.self_digest = admission.compute_digest()?;
+    }
+    assert_eq!(
+        coord.admit(wrong_digest).err(),
+        Some(CoordinatorError::IdentityConflict("admitted_route"))
+    );
+
+    // No-route denial cannot back an attempt (selected absent).
+    let mut no_route = good.clone();
+    {
+        let lane = &mut no_route.admitted_lanes[0];
+        let admission = lane
+            .admitted_route
+            .as_mut()
+            .unwrap_or_else(|| panic!("lane must carry admission"));
+        admission.selected_route = None;
+        admission.no_route = Some(eliot_agent_api::NoRouteDisposition::AdmissionDenied);
+        admission.self_digest = admission.compute_digest()?;
+    }
+    assert_eq!(
+        coord.admit(no_route).err(),
+        Some(CoordinatorError::IdentityConflict("admitted_route"))
+    );
+
+    // Tampered self_digest without recompute fails as a shape/contract error.
+    let mut bad_digest = good.clone();
+    {
+        let lane = &mut bad_digest.admitted_lanes[0];
+        let admission = lane
+            .admitted_route
+            .as_mut()
+            .unwrap_or_else(|| panic!("lane must carry admission"));
+        admission.self_digest = zero_digest()?;
+    }
+    assert!(matches!(
+        coord.admit(bad_digest).err(),
+        Some(CoordinatorError::ProviderContract(_))
+    ));
     Ok(())
 }

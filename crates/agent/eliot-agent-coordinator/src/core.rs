@@ -462,6 +462,12 @@ impl AgentCoordinator {
             {
                 return Err(CoordinatorError::IdentityConflict("admitted_lane"));
             }
+            // S5: validate the externally-issued admitted route decision
+            // against this exact lane/candidate/fence. `None` stays
+            // unresolved for additive pre-S5 wire and fails closed at intake;
+            // a present receipt is shape-validated and linkage-checked, never
+            // minted here.
+            validate_lane_admission(lane, &candidate_lane.routing, &receipt.state_fence)?;
             if !attempts.insert(lane.attempt_id.clone())
                 || self.attempts.contains_key(&lane.attempt_id)
             {
@@ -532,6 +538,7 @@ impl AgentCoordinator {
                 state: CoordinatedAttemptState::Admitted,
                 superseded_by: None,
                 provider_binding: None,
+                admitted_route: lane.admitted_route.clone(),
             };
             if let Some(scope) = &record.mutation_scope {
                 self.writer_holders
@@ -1052,6 +1059,12 @@ impl AgentCoordinator {
             state: CoordinatedAttemptState::Admitted,
             superseded_by: None,
             provider_binding: None,
+            // S5: a reassigned attempt carries a new attempt identity, so the
+            // old lane's admitted decision (bound to the old attempt_id)
+            // cannot transfer. It stays unresolved (`None`) until the
+            // external admission owner issues a new decision for the new
+            // identity; intake fails closed meanwhile (honest T1 gap).
+            admitted_route: None,
         };
         if let Some(scope) = &new_record.mutation_scope {
             self.writer_holders
@@ -1156,6 +1169,22 @@ impl AgentCoordinator {
         if actual.state_fence != current.state_fence {
             return Err(CoordinatorError::IdentityConflict("execution_binding"));
         }
+        // S5 binding closure (issue #370): the stored externally-issued
+        // admitted decision must exist and the result must close the full
+        // triple via the shared S5 validator. Stored-only, never
+        // provider-supplied: the observation already carries the digest link
+        // (`admitted_route_digest`), and equality against stored is enforced
+        // inside `validate_for_binding`. Missing stored admission fails
+        // closed as `admitted_route`; validator mismatches map via the
+        // existing binding convention (`execution_binding`).
+        let stored_admission = current
+            .admitted_route
+            .as_ref()
+            .ok_or(CoordinatorError::IdentityConflict("admitted_route"))?;
+        submission
+            .result
+            .validate_for_binding(&actual.binding, stored_admission, &work_unit.effect_ceiling)
+            .map_err(binding_contract)?;
         if submission.result.disposition == ResultDisposition::CandidateSucceeded {
             self.require_descendant_closure(&current.attempt_id)?;
         }
@@ -2032,6 +2061,45 @@ fn validate_admitted_lane(lane: &crate::AdmittedLaneReceipt) -> Result<(), Coord
     lane.budget.validate().map_err(provider_contract)?;
     if let Some(scope) = &lane.mutation_scope {
         validate_text(scope, "mutation_scope")?;
+    }
+    Ok(())
+}
+
+/// Validates the externally-issued admitted route decision carried by one
+/// admitted lane (issue #370 S5). The coordinator never mints: shape and
+/// self-digest are checked via `admission.validate()`, then exact typed `==`
+/// linkage binds the decision to this lane's attempt/lease/fence/generation,
+/// requested/selected route, candidate digest, and policy revision. `None`
+/// is additive pre-S5 wire and stays unresolved here; intake fails closed
+/// later when no stored admission exists.
+fn validate_lane_admission(
+    lane: &crate::AdmittedLaneReceipt,
+    routing: &RouteSelectionCandidate,
+    admission_fence: &eliot_agent_api::StateFence,
+) -> Result<(), CoordinatorError> {
+    let Some(admission) = &lane.admitted_route else {
+        return Ok(());
+    };
+    admission.validate().map_err(provider_contract)?;
+    if admission.attempt_id != lane.attempt_id
+        || admission.lease_id != lane.lease_id
+        || admission.state_fence != *admission_fence
+        || admission.runtime_generation != admission_fence.resource_generation
+        || admission.requested_route != lane.route
+    {
+        return Err(CoordinatorError::IdentityConflict("admitted_route"));
+    }
+    // Only a selecting admission authorizes execution; a no-route denial
+    // carries no authorized route and cannot back an attempt.
+    if admission.selected_route.as_ref() != Some(&lane.route) {
+        return Err(CoordinatorError::IdentityConflict("admitted_route"));
+    }
+    // Bind the exact candidate bytes and policy: the admission cannot
+    // reinterpret a newer policy or route under the same identity.
+    if admission.candidate_digest != lane.routing_receipt_digest
+        || admission.policy_revision != routing.policy_revision
+    {
+        return Err(CoordinatorError::IdentityConflict("admitted_route"));
     }
     Ok(())
 }

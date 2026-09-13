@@ -261,6 +261,7 @@ fn caller_fabricated_admission_cannot_bypass_plan_gap() -> TestResult {
             budget: candidate.lanes[0].budget.clone(),
             priority: candidate.lanes[0].priority,
             mutation_scope: candidate.lanes[0].mutation_scope.clone(),
+            admitted_route: None,
         }],
     };
     assert!(matches!(

@@ -275,6 +275,10 @@ fn admission_receipt(
                 budget: lane.budget.clone(),
                 priority: lane.priority,
                 mutation_scope: lane.mutation_scope.clone(),
+                // Normalization fixtures stay admission-unresolved (pre-S5
+                // wire): additive `None` reads old snapshots and fails closed
+                // at intake, never inventing a decision.
+                admitted_route: None,
             })
         })
         .collect::<TestResult<Vec<_>>>()?;
