@@ -139,6 +139,25 @@ impl EpochId {
         })
     }
 
+    /// Exact authority match: true only when `lineage_id` and `sequence`
+    /// are both equal (contract `types.EpochId` exact-tuple rule; I6.10
+    /// exact-match: equal sequences from different lineages are unrelated).
+    #[must_use]
+    pub fn is_same_authority(&self, expected: &Self) -> bool {
+        self.lineage_id == expected.lineage_id && self.sequence == expected.sequence
+    }
+
+    /// Direct-child check: true only when the lineage is equal and
+    /// `self.sequence == parent.sequence + 1` (contract
+    /// `types.EpochTransition` one-step rule; I6.10 exact-match).
+    /// Overflow-closed: `checked_add` failure returns false, so a genesis
+    /// `sequence == 1` epoch is never a child.
+    #[must_use]
+    pub fn is_direct_child_of(&self, parent: &Self) -> bool {
+        self.lineage_id == parent.lineage_id
+            && parent.sequence.get().checked_add(1) == Some(self.sequence.get())
+    }
+
     /// Returns the relation of this epoch to another validated epoch.
     #[must_use]
     pub fn relation_to(&self, other: &Self) -> EpochRelation {
@@ -259,6 +278,14 @@ impl EpochTransition {
                 }
             }
         }
+    }
+
+    /// Advancement check: true only when the transition validates (contract
+    /// `types.EpochTransition` genesis/direct-child/lineage rules; I6.10
+    /// exact-match) and the explicit parent equals `prior`.
+    #[must_use]
+    pub fn advances(&self, prior: &EpochId) -> bool {
+        self.validate().is_ok() && self.parent.as_ref() == Some(prior)
     }
 }
 
@@ -798,5 +825,37 @@ mod tests {
             .is_err()
         );
         assert!(serde_json::from_value::<EpochRelation>(serde_json::json!("FUTURE")).is_err());
+    }
+
+    #[test]
+    fn same_authority_requires_exact_tuple_match() {
+        assert!(epoch(LINEAGE_A, 3).is_same_authority(&epoch(LINEAGE_A, 3)));
+        assert!(!epoch(LINEAGE_A, 3).is_same_authority(&epoch(LINEAGE_A, 4)));
+        assert!(!epoch(LINEAGE_A, 3).is_same_authority(&epoch(LINEAGE_B, 3)));
+        assert!(!epoch(LINEAGE_A, 3).is_same_authority(&epoch(LINEAGE_B, 9)));
+    }
+
+    #[test]
+    fn direct_child_requires_same_lineage_plus_one() {
+        assert!(epoch(LINEAGE_A, 2).is_direct_child_of(&epoch(LINEAGE_A, 1)));
+        assert!(!epoch(LINEAGE_A, 1).is_direct_child_of(&epoch(LINEAGE_A, 1)));
+        assert!(!epoch(LINEAGE_A, 3).is_direct_child_of(&epoch(LINEAGE_A, 1)));
+        assert!(!epoch(LINEAGE_A, 1).is_direct_child_of(&epoch(LINEAGE_A, 2)));
+        assert!(!epoch(LINEAGE_B, 2).is_direct_child_of(&epoch(LINEAGE_A, 1)));
+        assert!(!epoch(LINEAGE_A, 1).is_direct_child_of(&epoch(LINEAGE_A, u64::MAX)));
+    }
+
+    #[test]
+    fn advances_requires_valid_transition_with_matching_prior() {
+        let prior = epoch(LINEAGE_A, 1);
+        let direct = EpochTransition::direct_child(&prior).expect("direct child");
+        assert!(direct.advances(&prior));
+        assert!(!EpochTransition::genesis(lineage(LINEAGE_A)).advances(&epoch(LINEAGE_A, 1)));
+        assert!(!direct.advances(&epoch(LINEAGE_A, 2)));
+        assert!(!EpochTransition {
+            current: epoch(LINEAGE_A, 3),
+            parent: Some(epoch(LINEAGE_A, 1)),
+        }
+        .advances(&epoch(LINEAGE_A, 1)));
     }
 }
