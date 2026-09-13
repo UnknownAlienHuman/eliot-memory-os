@@ -560,6 +560,15 @@ impl ProviderRegistry {
     }
 }
 
+impl<'a> IntoIterator for &'a ProviderRegistry {
+    type Item = &'a RegistryEntry;
+    type IntoIter = std::collections::btree_map::Values<'a, (String, String), RegistryEntry>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        self.iter()
+    }
+}
+
 /// Deterministic sort rank for [`InstrumentKind`], following declaration order.
 const fn kind_rank(kind: InstrumentKind) -> u8 {
     match kind {
