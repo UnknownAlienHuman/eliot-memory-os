@@ -7,6 +7,7 @@
 
 #![forbid(unsafe_code)]
 
+mod doctor;
 mod model;
 mod reservation_model;
 mod snapshot_model;
@@ -17,6 +18,7 @@ mod store;
 #[cfg(feature = "test-support")]
 pub mod test_support;
 
+pub use doctor::*;
 pub use model::*;
 pub use reservation_model::{
     ReservationRecord, ReservationRequest, ReservationState, ReservedScope,

@@ -1474,6 +1474,7 @@ name = "eliot-kernel-service"
 version = "0.1.0"
 dependencies = [
  "eliot-contracts",
+ "eliot-doctor-core",
  "eliot-ipc",
  "eliot-kernel-core",
  "eliot-mcp",

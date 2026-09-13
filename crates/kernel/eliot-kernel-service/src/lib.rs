@@ -16,6 +16,7 @@
 use std::future::Future;
 use std::pin::Pin;
 
+mod doctor;
 mod host_request_binding;
 mod lifecycle;
 mod process_execution_client;
@@ -24,6 +25,14 @@ mod store_client;
 #[cfg(windows)]
 mod store_gateway;
 
+pub use doctor::{
+    DOCTOR_CONFLICT_MAX_FIELDS, DOCTOR_MAX_ENVELOPE_BYTES, DOCTOR_MAX_LEASE_DURATION_NANOS,
+    DOCTOR_RECOVERY_LEASE_OWNER, DOCTOR_REPAIR_ADVERTISED, DOCTOR_REPAIR_WIRE_ID,
+    DOCTOR_REPAIR_WIRE_VERSION, DoctorAdmissionContext, DoctorRecipeRegistry, DoctorRegistryError,
+    DoctorRepairAdmission, DoctorRepairAttemptRequest, DoctorRepairConflict, DoctorRepairRejection,
+    DoctorRepairRejectionReason, DoctorRepairResponse, RegisteredDoctorRecipe, admit_doctor_repair,
+    advertise_doctor_repair, reconcile_doctor_repair_admission, route_doctor_repair,
+};
 pub use eliot_process::ProcessExecutionAdmissionRequest;
 pub use eliot_protocol::{
     AGENT_BRIDGE_CLIENT_DECLARATION_WIRE_ID, AGENT_BRIDGE_CLIENT_DECLARATION_WIRE_VERSION,
