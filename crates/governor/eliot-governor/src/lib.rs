@@ -36,12 +36,14 @@ mod activation_outcome;
 mod composition;
 mod controlboard_projection;
 mod owner_projection_refresh;
+mod skill_lifecycle;
 
 pub use activation_outcome::*;
 pub use composition::*;
 pub use controlboard_projection::{
     ControlBoardGovernorSnapshot, ControlBoardOwnerBinding, ControlBoardProjectionError,
 };
+pub use skill_lifecycle::GovernorSkillLifecycle;
 /// Canonical write envelope admitted by `commit_canonical`. Re-exported so
 /// the daemon composition root can name the exact envelope type without a
 /// second canonical dependency path.

@@ -18,6 +18,7 @@ use crate::controlboard_projection::{
     ControlBoardGovernorSnapshot, ControlBoardProjectionParts, compile_controlboard_snapshot,
 };
 use crate::owner_projection_refresh::{coherence_result, compare_scope_heads};
+use crate::skill_lifecycle::GovernorSkillLifecycle;
 use crate::{
     Governor, GovernorConfig, GovernorState, QueueLimits, STARTUP_ORDER, ServiceId,
     ServiceObservation,
@@ -939,7 +940,7 @@ impl CanonicalAdmissionOwner {
     /// canonical hashing contract. The transport peer stays distinct from the
     /// initiating principal/session: this method never rewrites the
     /// identity's source. `prepare()` alone remains non-authorizing.
-    async fn commit<P: KernelTransitionPort + ?Sized>(
+    pub(crate) async fn commit<P: KernelTransitionPort + ?Sized>(
         &self,
         port: &P,
         identity: &RequestIdentity,
@@ -1567,6 +1568,24 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
             observation_receipt_digest: &observation_receipt,
         })
         .map_err(|error| CompositionError::Owner(error.to_string()))
+    }
+
+    /// Borrows the single Skill lifecycle owner as a canonical
+    /// [`SkillLifecycleApi`](eliot_skill::SkillLifecycleApi) adapter.
+    ///
+    /// The adapter reads the current `skill: SkillRegistry` owner (recovered
+    /// via the `Skill` named read) together with the canonical admission owner
+    /// and the retained neutral Kernel port. It creates no per-caller
+    /// registry; promotion commits through the existing canonical path and
+    /// publishes only via `refresh_from_kernel` at the returned receipt
+    /// revisions.
+    #[must_use]
+    pub fn skill_lifecycle(&self) -> GovernorSkillLifecycle<'_, P> {
+        GovernorSkillLifecycle::new(
+            &self.owners.skill,
+            &self.owners.canonical,
+            self.kernel.as_ref(),
+        )
     }
 
     /// Applies one Canonical-admitted transition through the sole retained
