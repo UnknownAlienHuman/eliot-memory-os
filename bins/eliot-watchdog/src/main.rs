@@ -22,7 +22,9 @@ use eliot_watchdog::{
 };
 #[cfg(windows)]
 use watchdog_service_status::{
-    SERVICE_STATUS_HANDLE, publish_service_status, set_service_status_running,
+    CONSOLE_PROCESS_EXIT_CODE, SERVICE_STATUS_HANDLE, WatchdogStopCode,
+    classify_bootstrap_launch_error, classify_runtime_error, persist_start_failure,
+    publish_service_status, publish_stopped_with_code, set_service_status_running,
     set_service_status_stopped,
 };
 
@@ -36,17 +38,54 @@ fn main() {
         Ok(true) => return,
         Ok(false) => {}
         Err(error) => {
-            let _ = writeln!(
-                io::stderr().lock(),
-                "{SERVICE_NAME}: StartServiceCtrlDispatcherW failed with Win32 error {error} (0x{error:08X})"
+            let detail = format!(
+                "StartServiceCtrlDispatcherW failed with Win32 error {error} (0x{error:08X})"
             );
-            std::process::exit(1);
+            let _ = writeln!(io::stderr().lock(), "{SERVICE_NAME}: {detail}");
+            persist_start_failure(
+                WatchdogStopCode::DispatcherFailed,
+                &detail,
+                captured_bootstrap_for_capsule(),
+            );
+            std::process::exit(CONSOLE_PROCESS_EXIT_CODE);
         }
     }
     if let Err(error) = run_watchdog(Arc::new(AtomicBool::new(false)), None) {
         let _ = writeln!(io::stderr().lock(), "{SERVICE_NAME}: {error}");
+        report_console_runtime_failure(&error);
+    }
+}
+
+/// Typed console exit for a `run_watchdog` failure without an SCM handle.
+///
+/// Windows carries the 1066 marker as the process exit code and the typed
+/// class in stderr plus the capsule; other platforms keep the historical
+/// `exit(1)` because SCM status projection does not exist there.
+fn report_console_runtime_failure(error: &str) -> ! {
+    #[cfg(windows)]
+    {
+        let code = classify_runtime_error(error);
+        persist_start_failure(code, error, captured_bootstrap_for_capsule());
+        std::process::exit(CONSOLE_PROCESS_EXIT_CODE);
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = error;
         std::process::exit(1);
     }
+}
+
+/// Non-secret bootstrap identities for the start-failure capsule.
+///
+/// Returns the captured process bootstrap when it parsed; the capsule builder
+/// only reads installation id, plan generation, and Host state root, never
+/// the registration nonce.
+#[cfg(windows)]
+fn captured_bootstrap_for_capsule() -> Option<&'static ServiceBootstrapArguments> {
+    PROCESS_BOOTSTRAP
+        .get()
+        .and_then(|result| result.as_ref().ok())
+        .and_then(|bootstrap| bootstrap.as_ref())
 }
 
 #[cfg(windows)]
@@ -89,6 +128,7 @@ impl WatchdogSelfAdmissionStatus for ScmWatchdogSelfAdmissionStatus {
             publish_service_status(
                 raw as _,
                 windows_sys::Win32::System::Services::SERVICE_START_PENDING,
+                0,
                 0,
                 0,
                 checkpoint,
@@ -143,7 +183,7 @@ unsafe extern "system" fn watchdog_service_main(
     use std::os::windows::ffi::OsStrExt;
     use windows_sys::Win32::Foundation::GetLastError;
     use windows_sys::Win32::System::Services::{
-        RegisterServiceCtrlHandlerExW, SERVICE_START_PENDING, SERVICE_STOPPED,
+        RegisterServiceCtrlHandlerExW, SERVICE_START_PENDING,
     };
     let name = OsStr::new(SERVICE_NAME)
         .encode_wide()
@@ -155,30 +195,53 @@ unsafe extern "system" fn watchdog_service_main(
     };
     if handle.is_null() {
         let error = unsafe { GetLastError() };
-        publish_service_status(handle, SERVICE_STOPPED, 0, error, 0, 0);
+        let detail = format!(
+            "RegisterServiceCtrlHandlerExW failed with Win32 error {error} (0x{error:08X})"
+        );
+        let _ = writeln!(io::stderr().lock(), "{SERVICE_NAME}: {detail}");
+        persist_start_failure(
+            WatchdogStopCode::ScmRegisterNull,
+            &detail,
+            captured_bootstrap_for_capsule(),
+        );
+        publish_stopped_with_code(handle, WatchdogStopCode::ScmRegisterNull);
         return;
     }
     SERVICE_STATUS_HANDLE.store(handle as isize, Ordering::Release);
-    publish_service_status(handle, SERVICE_START_PENDING, 0, 0, 1, 10_000);
-    let validated_launch =
-        match unsafe { service_launch_options(service_arg_count, service_arg_vector) }
-            .and_then(|()| validate_registered_process_bootstrap())
-        {
-            Ok(launch) => launch,
-            Err(error) => {
-                let _ = writeln!(
-                    io::stderr().lock(),
-                    "{SERVICE_NAME}: invalid SCM launch argv or registration: {error}"
-                );
-                publish_service_status(handle, SERVICE_STOPPED, 0, 1, 0, 0);
-                return;
-            }
-        };
+    publish_service_status(handle, SERVICE_START_PENDING, 0, 0, 0, 1, 10_000);
+    // Stage 1 keeps the exact historical order: the `ServiceMain` argv shape
+    // is validated before the process bootstrap is touched.
+    if let Err(error) = unsafe { service_launch_options(service_arg_count, service_arg_vector) } {
+        let detail = format!("invalid SCM ServiceMain argv: {error}");
+        let _ = writeln!(io::stderr().lock(), "{SERVICE_NAME}: {detail}");
+        persist_start_failure(
+            WatchdogStopCode::InvalidScmArgv,
+            &detail,
+            captured_bootstrap_for_capsule(),
+        );
+        publish_stopped_with_code(handle, WatchdogStopCode::InvalidScmArgv);
+        return;
+    }
+    // Stage 2 validates the captured process bootstrap against the
+    // installer-approved registration with a read-only inspection.
+    let validated_launch = match validate_registered_process_bootstrap() {
+        Ok(launch) => launch,
+        Err(error) => {
+            let code = classify_bootstrap_launch_error(&error);
+            let detail = format!("invalid SCM launch registration: {error}");
+            let _ = writeln!(io::stderr().lock(), "{SERVICE_NAME}: {detail}");
+            persist_start_failure(code, &detail, captured_bootstrap_for_capsule());
+            publish_stopped_with_code(handle, code);
+            return;
+        }
+    };
     let stop_signal = Arc::new(AtomicBool::new(false));
     let _ = SERVICE_STOP_REQUESTED.set(stop_signal.clone());
     if let Err(error) = run_watchdog(stop_signal, Some(&validated_launch)) {
+        let code = classify_runtime_error(&error);
         let _ = writeln!(io::stderr().lock(), "{SERVICE_NAME}: {error}");
-        publish_service_status(handle, SERVICE_STOPPED, 0, 1, 0, 0);
+        persist_start_failure(code, &error, captured_bootstrap_for_capsule());
+        publish_stopped_with_code(handle, code);
     }
 }
 
@@ -264,7 +327,7 @@ unsafe extern "system" fn service_control(
         }
         let raw = SERVICE_STATUS_HANDLE.load(Ordering::Acquire);
         if raw != 0 {
-            publish_service_status(raw as _, SERVICE_STOP_PENDING, 0, 0, 1, 10_000);
+            publish_service_status(raw as _, SERVICE_STOP_PENDING, 0, 0, 0, 1, 10_000);
         }
     }
     if control == SERVICE_CONTROL_INTERROGATE {
