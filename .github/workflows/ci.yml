@@ -24,6 +24,7 @@ jobs:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
         with:
           fetch-depth: 0
+          persist-credentials: false
 
       - name: Configure Cargo environment
         shell: pwsh
@@ -50,11 +51,11 @@ jobs:
           path: |
             ~/.cargo/registry
             ~/.cargo/git
-          key: ${{ runner.os }}-cargo-${{ hashFiles('Cargo.lock') }}
+          key: ${{ runner.os }}-cargo-profile-review-${{ hashFiles('Cargo.lock') }}
 
       - name: Run current bounded repository verification
         shell: pwsh
-        run: pwsh -NoProfile -File scripts/verify.ps1
+        run: pwsh -NoProfile -File scripts/verify.ps1 -Profile Review
 
       - name: Restore and build Eliot.Operator in locked mode
         shell: pwsh
@@ -77,5 +78,11 @@ jobs:
           Add-Content -LiteralPath $env:GITHUB_STEP_SUMMARY -Value "- Python dependencies: hash-locked requirements-verification.txt"
           Add-Content -LiteralPath $env:GITHUB_STEP_SUMMARY -Value "- NuGet: locked-mode restore packages.lock.json"
           Add-Content -LiteralPath $env:GITHUB_STEP_SUMMARY -Value "- Operator tests: executed Eliot.Operator.Tests (exit 0)"
+          Add-Content -LiteralPath $env:GITHUB_STEP_SUMMARY -Value "- Profile: Review (sole gate-definition owner scripts/verify.ps1, closed Review profile)"
+          Add-Content -LiteralPath $env:GITHUB_STEP_SUMMARY -Value "- Package denominator: exact count bound at runtime by VERIFY_WORKSPACE_MEMBERS (cargo metadata --locked --no-deps)"
+          Add-Content -LiteralPath $env:GITHUB_STEP_SUMMARY -Value "- Gate order: documentation-shards-self-test, documentation-shards, documentation-routes-self-test, documentation-routes, documentation-read-self-test, documentation-code-conformance-self-test, documentation-code-conformance, code-navigation-self-test, code-navigation, documentation-closure-audit, standalone-crates, core-daemon-inventory-self-test, core-daemon-inventory, normative-pair, dependency-policy-self-test, dependency-policy-offline, architecture-boundaries-self-test, architecture-boundaries, agent-guardrails-self-test, agent-guardrails, agent-route-bundles-self-test, agent-route-bundles, runtime-source-hygiene-self-test, runtime-source-hygiene, agent-bridge-protocol-self-test, agent-bridge-protocol, cargo-metadata, cargo-fmt, cargo-check-workspace, cargo-clippy-workspace, cargo-test-workspace, cargo-deny"
+          Add-Content -LiteralPath $env:GITHUB_STEP_SUMMARY -Value "- Proof ceiling: REVIEW_SOURCE_ONLY (not release/source-candidate, not installed-runtime/store/Product-Pulse proof)"
+          Add-Content -LiteralPath $env:GITHUB_STEP_SUMMARY -Value "- D-INT ceiling: ignored/stateful/live-provider tests are outside normal Review"
+          Add-Content -LiteralPath $env:GITHUB_STEP_SUMMARY -Value "- Cache: key binds OS+lockfile+profile; hit/miss run the same gates; no pass receipt from cache"
           Add-Content -LiteralPath $env:GITHUB_STEP_SUMMARY -Value "PR_INTEGRATION_SOURCE_CHECK_ONLY"
           Add-Content -LiteralPath $env:GITHUB_STEP_SUMMARY -Value "No live Windows/store/Product-Pulse claim."
