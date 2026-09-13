@@ -15,8 +15,10 @@ use std::time::Duration;
 use eliot_contracts::{ClockReading, ProductId, RequestId, RequestMetadata, SourceId};
 use eliot_governor::{GovernorLaunchConfig, KernelGenerationSnapshot, KernelPortError};
 use eliot_protocol::{
-    AgentActivationResolutionDecision, AgentActivationResolutionTicket, EncodingProfile, Frame,
-    FrameKind, MessageType, ProtocolPayload, ProtocolVersion, RequestIdentity,
+    AgentActivationResolutionDecision, AgentActivationResolutionResult,
+    AgentActivationResolutionTicket, AgentActivationResultAck, AgentActivationResultReconcile,
+    AgentActivationResultSubmit, EncodingProfile, Frame, FrameKind, MessageType, ProtocolPayload,
+    ProtocolVersion, RequestIdentity,
 };
 use eliot_receipts::RequestBinding;
 
@@ -110,6 +112,57 @@ impl DaemonKernelClient {
         .await
         .map(|_| ())
         .map_err(|error| super::DaemonError::Kernel(error.to_string()))
+    }
+
+    #[cfg(windows)]
+    pub async fn submit_agent_activation_result(
+        &self,
+        result: &AgentActivationResolutionResult,
+    ) -> Result<AgentActivationResultAck, super::DaemonError> {
+        let submit = AgentActivationResultSubmit::new(result.clone())
+            .map_err(|error| super::DaemonError::Kernel(error.to_string()))?;
+        let value = self
+            .transact_async(
+                "agent_activation_submit",
+                serde_json::json!({ "result": submit }),
+            )
+            .await
+            .map_err(|error| super::DaemonError::Kernel(error.to_string()))?;
+        let ack_value = value.get("ack").cloned().ok_or_else(|| {
+            super::DaemonError::Kernel("Kernel submit response omitted acknowledgement".to_owned())
+        })?;
+        let ack: AgentActivationResultAck = serde_json::from_value(ack_value)
+            .map_err(|error| super::DaemonError::Kernel(error.to_string()))?;
+        ack.validate()
+            .map_err(|error| super::DaemonError::Kernel(error.to_string()))?;
+        Ok(ack)
+    }
+
+    #[cfg(windows)]
+    pub async fn reconcile_agent_activation_result(
+        &self,
+        query: &AgentActivationResultReconcile,
+    ) -> Result<AgentActivationResultAck, super::DaemonError> {
+        query
+            .validate()
+            .map_err(|error| super::DaemonError::Kernel(error.to_string()))?;
+        let value = self
+            .transact_async(
+                "agent_activation_reconcile",
+                serde_json::json!({ "reconcile": query }),
+            )
+            .await
+            .map_err(|error| super::DaemonError::Kernel(error.to_string()))?;
+        let ack_value = value.get("ack").cloned().ok_or_else(|| {
+            super::DaemonError::Kernel(
+                "Kernel reconcile response omitted acknowledgement".to_owned(),
+            )
+        })?;
+        let ack: AgentActivationResultAck = serde_json::from_value(ack_value)
+            .map_err(|error| super::DaemonError::Kernel(error.to_string()))?;
+        ack.validate()
+            .map_err(|error| super::DaemonError::Kernel(error.to_string()))?;
+        Ok(ack)
     }
 
     pub fn connect(config: &super::DaemonConfig) -> Result<Arc<Self>, super::DaemonError> {
