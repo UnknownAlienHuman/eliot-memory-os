@@ -8516,25 +8516,14 @@ where
             &transaction.installer_effects[index],
             &service_control_grant,
         ) {
-            (
-                InstallerEffectPlan::RegisterService {
-                    role: InstallerServiceRole::Watchdog,
-                    ..
-                },
-                Some(receipt),
-            ) => receipt.validate()?,
-            // s38 (#1345): Host parity with the Watchdog arm above. The
-            // installer-policy DACL digest is already bound into the
-            // ownership marker and the matching evidence; persisting a Host
-            // `Applied` state without its grant receipt would let a default
-            // DACL service read as transaction-owned.
-            (
-                InstallerEffectPlan::RegisterService {
-                    role: InstallerServiceRole::Host,
-                    ..
-                },
-                Some(receipt),
-            ) => receipt.validate()?,
+            // s38 (#1345): Host and Watchdog service effects both persist
+            // `Applied` only with a validated installer-policy DACL grant
+            // receipt. The digest is already bound into the ownership marker
+            // and the matching evidence; persisting without the receipt
+            // would let a default-DACL service read as transaction-owned.
+            (InstallerEffectPlan::RegisterService { .. }, Some(receipt)) => {
+                receipt.validate()?;
+            }
             (InstallerEffectPlan::RegisterService { .. }, _) | (_, Some(_)) => {
                 return Err(InstallationError::IdentityConflict);
             }

@@ -1290,7 +1290,7 @@ mod tests {
         let cause = eliot_host::classify_host_scm_inspection(
             &eliot_platform_windows::ServiceRegistrationInspection::Mismatched,
         )
-        .expect("mismatched inspection must classify");
+        .unwrap_or_else(|| panic!("mismatched inspection must classify"));
         assert_eq!(
             cause,
             eliot_host::HostScmRegistrationCause::Mismatched {

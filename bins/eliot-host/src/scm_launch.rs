@@ -84,12 +84,10 @@ impl HostScmRegistrationCause {
                 "host-scm-registration-absent: service '{service_name}' is not registered (configuration {configuration_digest})"
             ),
             Self::Mismatched { inspection_debug } => format!(
-                "host-scm-registration-mismatched: service '{}' exists but its SCM configuration, service-SID type, or service-object security descriptor does not exactly match the canonical request (platform inspection reports Mismatched without field-level detail; inspection: {inspection_debug})",
-                ELIOT_HOST_SERVICE_NAME,
+                "host-scm-registration-mismatched: service '{ELIOT_HOST_SERVICE_NAME}' exists but its SCM configuration, service-SID type, or service-object security descriptor does not exactly match the canonical request (platform inspection reports Mismatched without field-level detail; inspection: {inspection_debug})",
             ),
             Self::Unknown { inspection_debug } => format!(
-                "host-scm-registration-unknown: service '{}' SCM configuration and state are not authoritatively observable (fail-closed; possible access-denied readback or provider uncertainty; inspection: {inspection_debug})",
-                ELIOT_HOST_SERVICE_NAME,
+                "host-scm-registration-unknown: service '{ELIOT_HOST_SERVICE_NAME}' SCM configuration and state are not authoritatively observable (fail-closed; possible access-denied readback or provider uncertainty; inspection: {inspection_debug})",
             ),
         };
         truncate_host_scm_cause(&text)
@@ -217,7 +215,7 @@ mod tests {
         // collapsing Absent/Mismatched/Unknown into one string.
         let mismatched =
             classify_host_scm_inspection(&ServiceRegistrationInspection::Mismatched)
-                .expect("mismatched inspection must classify");
+                .unwrap_or_else(|| panic!("mismatched inspection must classify"));
         assert_eq!(
             mismatched,
             HostScmRegistrationCause::Mismatched {
@@ -226,7 +224,7 @@ mod tests {
         );
         assert_eq!(mismatched.cause(), "mismatched");
         let unknown = classify_host_scm_inspection(&ServiceRegistrationInspection::Unknown)
-            .expect("unknown inspection must classify");
+            .unwrap_or_else(|| panic!("unknown inspection must classify"));
         assert_eq!(
             unknown,
             HostScmRegistrationCause::Unknown {

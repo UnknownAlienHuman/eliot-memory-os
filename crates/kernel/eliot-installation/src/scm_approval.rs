@@ -294,7 +294,7 @@ impl InstallerServiceRegistrationApproval {
         // fails closed exactly like a Watchdog approval without its own.
         match (self.role, &self.service_control_grant) {
             (InstallerServiceRole::Host | InstallerServiceRole::Watchdog, Some(receipt)) => {
-                receipt.validate()?
+                receipt.validate()?;
             }
             (InstallerServiceRole::Host | InstallerServiceRole::Watchdog, None) => {
                 return Err(InstallationError::IdentityConflict);
