@@ -1,9 +1,10 @@
 use crate::{
-    ActualRouteReceipt, AuthorityCeiling, BasicAuth, HealthResponse, HttpMethod, HttpRequest,
-    LoopbackEndpoint, LoopbackHttpClient, LoopbackHttpError, ModelSelection, NoAuthorityRunResult,
-    OpenCodeEvent, ProviderCatalog, QuotaAvailability, ReadOnlyRunRequest, RunRequestError,
-    RunStatus, Session, SessionDiff, SessionStatus, SessionStatusMap, SseConnection,
-    SseDecodeError, SseDecoder, SseLimits, UnknownFields, UsageAvailability, UsageTelemetry,
+    AuthorityCeiling, BasicAuth, HealthResponse, HttpMethod, HttpRequest, LoopbackEndpoint,
+    LoopbackHttpClient, LoopbackHttpError, ModelSelection, NoAuthorityRunResult, OpenCodeEvent,
+    OpenCodeWireRouteReceipt, ProviderCatalog, QuotaAvailability, ReadOnlyRunRequest,
+    RunRequestError, RunStatus, Session, SessionDiff, SessionStatus, SessionStatusMap,
+    SseConnection, SseDecodeError, SseDecoder, SseLimits, UnknownFields, UsageAvailability,
+    UsageTelemetry,
 };
 use serde_json::{Value, json};
 use sha2::{Digest as _, Sha256};
@@ -935,8 +936,10 @@ impl OpenCodeClient {
             &request.model,
             READ_ONLY_AGENT,
         );
-        let mut actual_route =
-            ActualRouteReceipt::observed(request.model.clone(), projection.observed_model.clone());
+        let mut actual_route = OpenCodeWireRouteReceipt::observed(
+            request.model.clone(),
+            projection.observed_model.clone(),
+        );
         actual_route.provider = Some(projection.observed_model.provider_id.clone());
         actual_route.endpoint = Some(self.endpoint.to_string());
         actual_route.route_fingerprint = Some(route_fingerprint);
@@ -1506,8 +1509,8 @@ mod tests {
         encode_component, generate_message_id,
     };
     use crate::{
-        ActualRouteState, AuthorityCeiling, BasicAuth, LoopbackEndpoint, ModelSelection,
-        OpenCodeEvent, ReadOnlyRunRequest, RunStatus,
+        AuthorityCeiling, BasicAuth, LoopbackEndpoint, ModelSelection, OpenCodeEvent,
+        OpenCodeWireRouteState, ReadOnlyRunRequest, RunStatus,
     };
     use secrecy::SecretString;
     use std::collections::VecDeque;
@@ -1720,7 +1723,7 @@ mod tests {
         assert_eq!(result.status, RunStatus::Succeeded);
         assert!(result.candidate_only);
         assert_eq!(result.authority, AuthorityCeiling::CandidateOnly);
-        assert_eq!(result.actual_route.state, ActualRouteState::Observed);
+        assert_eq!(result.actual_route.state, OpenCodeWireRouteState::Observed);
         assert_eq!(result.output, Some(serde_json::json!({"status":"ready"})));
         assert!(result.diff.is_empty());
 
