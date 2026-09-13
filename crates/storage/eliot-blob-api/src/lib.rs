@@ -201,7 +201,7 @@ impl<'de> Deserialize<'de> for VersionedContentDigest {
 /// implied here and no silent default domain is ever substituted.
 #[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
 pub struct ObjectResidencyKey {
-    /// Lawful WorkScope or source namespace binding.
+    /// Lawful `WorkScope` or source namespace binding.
     pub scope_domain_id: BlobId,
     /// Principal/access binding.
     pub access_domain_id: BlobId,
@@ -3294,7 +3294,10 @@ mod tests {
         // s-04-v1 legacy shape: valid generations but no residency identity.
         // Rejected; migration is explicit re-encrypt-copy, never silent upgrade.
         let legacy = r#"{"hash":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","root_generation":7,"path_generation":1}"#;
-        let legacy_error = format!("{:?}", serde_json::from_str::<BlobLocator>(legacy).unwrap_err());
+        let legacy_error = match serde_json::from_str::<BlobLocator>(legacy) {
+            Ok(_) => panic!("legacy locator without residency must be rejected"),
+            Err(error) => format!("{error:?}"),
+        };
         assert!(legacy_error.contains("residency"));
     }
 

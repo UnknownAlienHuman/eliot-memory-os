@@ -159,10 +159,10 @@ fn equal_bytes_in_different_domains_never_co_reside() {
 fn legacy_locator_and_digest_mismatch_are_rejected_without_silent_upgrade() {
     // s-04-v1 3-field shape without residency: rejected, never defaulted.
     let legacy = r#"{"hash":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","root_generation":7,"path_generation":1}"#;
-    let legacy_error = format!(
-        "{:?}",
-        serde_json::from_str::<BlobLocator>(legacy).unwrap_err()
-    );
+    let legacy_error = match serde_json::from_str::<BlobLocator>(legacy) {
+        Ok(_) => panic!("legacy locator without residency must be rejected"),
+        Err(error) => format!("{error:?}"),
+    };
     assert!(legacy_error.contains("residency"));
 
     // Hash that does not equal the residency content digest: rejected.

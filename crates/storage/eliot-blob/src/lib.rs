@@ -283,6 +283,7 @@ impl fmt::Debug for BlobRootOwner {
             .field("owner_id", &self.owner_id)
             .field("process_id", &self.process_id)
             .field("claim_id", &self.claim_id)
+            .field("registry_key", &self.registry_key)
             .field("lease", &self.lease)
             .finish()
     }
@@ -330,14 +331,12 @@ impl BlobRootOwner {
         let (canonical_path, root_claim_key) = canonical_root(&configured_root)?;
         let (lock_path, token, lock_file) =
             acquire_root_lease(&canonical_path, &root_claim_key, process_id)?;
-        if let Err(error) = reserve_ownership(
+        reserve_ownership(
             &registry_key,
             RootClaimKind::OsOwner {
                 token: token.clone(),
             },
-        ) {
-            return Err(error);
-        }
+        )?;
         let claims = PROCESS_ROOT_CLAIMS.get_or_init(|| Mutex::new(BTreeSet::new()));
         let Ok(mut claims) = claims.lock() else {
             release_os_owner_key(&registry_key, &token);
@@ -1217,7 +1216,7 @@ pub struct BlobDeletionReceipt {
 /// blind retry of the physical deletion.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum BlobDeletionReconciliation {
-    Applied(BlobDeletionReceipt),
+    Applied(Box<BlobDeletionReceipt>),
     NotApplied,
     Unknown,
 }
@@ -1982,7 +1981,7 @@ impl<P, C, K, A, L> BlobStoreCore<P, C, K, A, L> {
     /// Releases a construction-time reservation after a failed claim. A bound
     /// service restores the reserver's OS owner entry; an ownerless attempt
     /// only drops its own service entry.
-    fn release_construction_claim(service_key: &str, os_owner: &Option<BlobRootOwner>) {
+    fn release_construction_claim(service_key: &str, os_owner: Option<&BlobRootOwner>) {
         if let Some(owner) = os_owner {
             restore_os_owner(service_key, &owner.lease.token);
         } else {
@@ -1997,7 +1996,7 @@ impl<P, C, K, A, L> Drop for BlobStoreCore<P, C, K, A, L> {
         // this runs exactly once when the last handle drops. A bound service
         // restores its reserver's OS owner entry; an ownerless service only
         // releases its own entry and never evicts a newcomer.
-        Self::release_construction_claim(&self.owner.service_key, &self.owner.os_owner);
+        Self::release_construction_claim(&self.owner.service_key, self.owner.os_owner.as_ref());
     }
 }
 
@@ -2034,13 +2033,16 @@ where
     fn claim(
         lease: BlobRootLease,
         os_owner: Option<BlobRootOwner>,
-        mut platform: P,
-        compression: C,
-        keys: K,
-        aead: A,
-        live_sets: L,
-        issuer_anchor: BlobIssuerTrustAnchor,
+        ports: BlobServicePorts<P, C, K, A, L>,
     ) -> Result<Self, BlobError> {
+        let BlobServicePorts {
+            mut platform,
+            compression,
+            keys,
+            aead,
+            live_sets,
+            issuer_anchor,
+        } = ports;
         lease.validate()?;
         // Single-owner composition (T3-B): the service claim and the OS
         // `BlobRootOwner` claim reserve one process-local key. A root
@@ -2054,21 +2056,19 @@ where
             if !owner.owns_service_root(lease.root_id.as_str()) {
                 return Err(BlobError::OwnerConflict);
             }
-            if let Err(error) = bind_service_to_owner(&service_key, &owner.lease.token) {
-                return Err(error);
-            }
-        } else if let Err(error) = reserve_ownership(&service_key, RootClaimKind::Service) {
-            return Err(error);
+            bind_service_to_owner(&service_key, &owner.lease.token)?;
+        } else {
+            reserve_ownership(&service_key, RootClaimKind::Service)?;
         }
         let claim = match platform.claim_root(&lease) {
             Ok(claim) => claim,
             Err(error) => {
-                Self::release_construction_claim(&service_key, &os_owner);
+                Self::release_construction_claim(&service_key, os_owner.as_ref());
                 return Err(error);
             }
         };
         if let Err(error) = claim.validate(&lease) {
-            Self::release_construction_claim(&service_key, &os_owner);
+            Self::release_construction_claim(&service_key, os_owner.as_ref());
             return Err(error);
         }
         Ok(Self {
@@ -3157,7 +3157,7 @@ where
             &tombstone_residency,
         )?;
         let applied = match reconciliation {
-            BlobDeletionReconciliation::Applied(receipt) => receipt,
+            BlobDeletionReconciliation::Applied(receipt) => *receipt,
             BlobDeletionReconciliation::NotApplied => {
                 match self.live_sets_compare_and_delete_observed(
                     &operation_id,
@@ -3167,7 +3167,7 @@ where
                     &tombstone_residency,
                     &mut delete,
                 )? {
-                    BlobDeletionReconciliation::Applied(receipt) => receipt,
+                    BlobDeletionReconciliation::Applied(receipt) => *receipt,
                     BlobDeletionReconciliation::NotApplied
                     | BlobDeletionReconciliation::Unknown => {
                         return Err(BlobError::UnknownGcOutcome {
@@ -4361,6 +4361,25 @@ pub struct BlobStoreService<P, C, K, A, L> {
     core: Arc<BlobStoreCore<P, C, K, A, L>>,
 }
 
+/// Construction bundle for [`BlobStoreService`] (T3-B): the six injected
+/// dependencies travel as one value so constructors stay within the argument
+/// ceiling without hiding any dependency. Every field is still supplied by
+/// the composition owner (C3 wiring for production).
+pub struct BlobServicePorts<P, C, K, A, L> {
+    /// Durable no-replace platform adapter (P-01/P-02).
+    pub platform: P,
+    /// Compression provider (never encryption).
+    pub compression: C,
+    /// Key lineage provider.
+    pub keys: K,
+    /// Authenticated-envelope provider.
+    pub aead: A,
+    /// Caller-owned live-set union provider.
+    pub live_sets: L,
+    /// Independently pinned receipt issuer anchor.
+    pub issuer_anchor: BlobIssuerTrustAnchor,
+}
+
 impl<P, C, K, A, L> BlobStoreService<P, C, K, A, L>
 where
     P: BlobPlatformPort,
@@ -4389,12 +4408,14 @@ where
             core: Arc::new(BlobStoreCore::claim(
                 lease,
                 None,
-                platform,
-                compression,
-                keys,
-                aead,
-                live_sets,
-                issuer_anchor,
+                BlobServicePorts {
+                    platform,
+                    compression,
+                    keys,
+                    aead,
+                    live_sets,
+                    issuer_anchor,
+                },
             )?),
         })
     }
@@ -4410,23 +4431,13 @@ where
     pub fn new_with_owner(
         owner: &BlobRootOwner,
         lease: BlobRootLease,
-        platform: P,
-        compression: C,
-        keys: K,
-        aead: A,
-        live_sets: L,
-        issuer_anchor: BlobIssuerTrustAnchor,
+        ports: BlobServicePorts<P, C, K, A, L>,
     ) -> Result<Self, BlobError> {
         Ok(Self {
             core: Arc::new(BlobStoreCore::claim(
                 lease,
                 Some(owner.clone()),
-                platform,
-                compression,
-                keys,
-                aead,
-                live_sets,
-                issuer_anchor,
+                ports,
             )?),
         })
     }
@@ -5048,12 +5059,14 @@ mod tests {
             residency_sha256: &str,
         ) -> Result<BlobDeletionReconciliation, BlobError> {
             match self.mode {
-                TestGcMode::Applied => Ok(BlobDeletionReconciliation::Applied(deletion_receipt(
-                    operation_id,
-                    proof,
-                    locator,
-                    intent_revision,
-                    residency_sha256,
+                TestGcMode::Applied => Ok(BlobDeletionReconciliation::Applied(Box::new(
+                    deletion_receipt(
+                        operation_id,
+                        proof,
+                        locator,
+                        intent_revision,
+                        residency_sha256,
+                    ),
                 ))),
                 TestGcMode::NotApplied => Ok(BlobDeletionReconciliation::NotApplied),
                 TestGcMode::Unknown => Ok(BlobDeletionReconciliation::Unknown),
@@ -5079,7 +5092,7 @@ mod tests {
             if self.tamper_receipt {
                 receipt.path_digest_sha256 = sha256_hex(b"wrong-path");
             }
-            Ok(BlobDeletionReconciliation::Applied(receipt))
+            Ok(BlobDeletionReconciliation::Applied(Box::new(receipt)))
         }
 
         fn compare_and_delete(
@@ -5842,12 +5855,14 @@ mod tests {
         BlobStoreService::new_with_owner(
             owner,
             lease,
-            MemoryPlatform::default(),
-            TestCompression,
-            TestKeys,
-            TestAead,
-            TestLiveSets::default(),
-            test_anchor(),
+            BlobServicePorts {
+                platform: MemoryPlatform::default(),
+                compression: TestCompression,
+                keys: TestKeys,
+                aead: TestAead,
+                live_sets: TestLiveSets::default(),
+                issuer_anchor: test_anchor(),
+            },
         )
         .expect("owner-bound store")
     }
@@ -5940,12 +5955,14 @@ mod tests {
             BlobStoreService::new_with_owner(
                 &owner,
                 again_lease,
-                MemoryPlatform::default(),
-                TestCompression,
-                TestKeys,
-                TestAead,
-                TestLiveSets::default(),
-                test_anchor(),
+                BlobServicePorts {
+                    platform: MemoryPlatform::default(),
+                    compression: TestCompression,
+                    keys: TestKeys,
+                    aead: TestAead,
+                    live_sets: TestLiveSets::default(),
+                    issuer_anchor: test_anchor(),
+                },
             )
             .map(|_| ()),
             Err(BlobError::OwnerConflict)
@@ -5958,12 +5975,14 @@ mod tests {
             BlobStoreService::new_with_owner(
                 &owner,
                 foreign_lease,
-                MemoryPlatform::default(),
-                TestCompression,
-                TestKeys,
-                TestAead,
-                TestLiveSets::default(),
-                test_anchor(),
+                BlobServicePorts {
+                    platform: MemoryPlatform::default(),
+                    compression: TestCompression,
+                    keys: TestKeys,
+                    aead: TestAead,
+                    live_sets: TestLiveSets::default(),
+                    issuer_anchor: test_anchor(),
+                },
             )
             .map(|_| ()),
             Err(BlobError::OwnerConflict)
