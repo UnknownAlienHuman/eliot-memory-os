@@ -1,5 +1,7 @@
 #![forbid(unsafe_code)]
 
+mod request_input;
+
 use eliot_agent_bridge::{
     kernel_ports_with_declaration, parse_args, BridgeRunner, CliError, Profile,
 };
@@ -14,8 +16,11 @@ use eliot_mcp::{
     HostInvocationRequest, HostInvocationResult, HostRequestGateway, KernelHostRequestPort,
 };
 use eliot_protocol::EventEnvelope;
+use request_input::{
+    REQUEST_INPUT_PROFILE, REQUEST_INPUT_PROFILE_ID, ReadOutcome, read_bounded_record,
+};
 use serde::{Deserialize, Serialize};
-use std::io::{self, BufRead, Write};
+use std::io::{self, Write};
 
 const INVALID_ARGUMENT_EXIT: i32 = 2;
 const PROVIDER_PORT_EXIT: i32 = 69;
@@ -182,10 +187,126 @@ fn main() {
     };
     let host_gateway = HostRequestGateway;
     let mut provider_failure = false;
-    for line in io::stdin().lock().lines() {
-        let response = match line {
-            Ok(line) if line.trim().is_empty() => continue,
-            Ok(line) => match serde_json::from_str::<Request>(&line) {
+    if REQUEST_INPUT_PROFILE.validate().is_err() {
+        let detail = format!(
+            "request input profile {REQUEST_INPUT_PROFILE_ID} is internally inconsistent"
+        );
+        emit_error("BRIDGE_COMPOSITION_REJECTED", &detail);
+        std::process::exit(PROVIDER_PORT_EXIT);
+    }
+    let mut stdin_lock = io::stdin().lock();
+    // Total non-blank bounded records observed (dispatched or malformed) and
+    // the current run of consecutive acquisition/deserialization failures.
+    // Both counters use checked arithmetic so neither can wrap into a bypass.
+    let mut total_records: u64 = 0;
+    let mut consecutive_invalid: u32 = 0;
+    loop {
+        let outcome = match read_bounded_record(&mut stdin_lock, REQUEST_INPUT_PROFILE) {
+            Ok(outcome) => outcome,
+            Err(error) => {
+                let Some(next_invalid) = consecutive_invalid.checked_add(1) else {
+                    break;
+                };
+                consecutive_invalid = next_invalid;
+                let rejection = Response::Error {
+                    code: "INPUT_FAILURE",
+                    detail: error.to_string(),
+                };
+                if emit_bounded_rejection(&rejection) {
+                    break;
+                }
+                if consecutive_invalid >= REQUEST_INPUT_PROFILE.max_consecutive_invalid_records
+                {
+                    break;
+                }
+                continue;
+            }
+        };
+        // Framing failures are rejected here without reaching any handler,
+        // gateway, port, or runner call below: each arm only shapes one
+        // redacted rejection and then continues or breaks fail-closed.
+        let record_bytes = match outcome {
+            ReadOutcome::Eof => break,
+            ReadOutcome::Oversize {
+                discarded_bytes,
+                found_terminator,
+            } => {
+                let Some(next_invalid) = consecutive_invalid.checked_add(1) else {
+                    break;
+                };
+                consecutive_invalid = next_invalid;
+                let rejection = Response::Error {
+                    code: "REQUEST_INVALID",
+                    detail: format!(
+                        "record exceeds {} encoded bytes ({REQUEST_INPUT_PROFILE_ID}); discarded {discarded_bytes} bytes",
+                        REQUEST_INPUT_PROFILE.max_record_bytes
+                    ),
+                };
+                if emit_bounded_rejection(&rejection) {
+                    break;
+                }
+                if !found_terminator {
+                    break;
+                }
+                if consecutive_invalid >= REQUEST_INPUT_PROFILE.max_consecutive_invalid_records
+                {
+                    break;
+                }
+                continue;
+            }
+            ReadOutcome::InvalidUtf8 => {
+                let Some(next_invalid) = consecutive_invalid.checked_add(1) else {
+                    break;
+                };
+                consecutive_invalid = next_invalid;
+                let rejection = Response::Error {
+                    code: "REQUEST_INVALID",
+                    detail: format!(
+                        "record is not valid UTF-8 ({REQUEST_INPUT_PROFILE_ID})"
+                    ),
+                };
+                if emit_bounded_rejection(&rejection) {
+                    break;
+                }
+                if consecutive_invalid >= REQUEST_INPUT_PROFILE.max_consecutive_invalid_records
+                {
+                    break;
+                }
+                continue;
+            }
+            ReadOutcome::Record(bytes) => bytes,
+        };
+        // The bounded reader only yields `Record` for valid UTF-8, so the
+        // rejection below is a defensive second gate that still never
+        // dispatches.
+        let Ok(text) = std::str::from_utf8(&record_bytes) else {
+            let Some(next_invalid) = consecutive_invalid.checked_add(1) else {
+                break;
+            };
+            consecutive_invalid = next_invalid;
+            let rejection = Response::Error {
+                code: "REQUEST_INVALID",
+                detail: format!("record is not valid UTF-8 ({REQUEST_INPUT_PROFILE_ID})"),
+            };
+            if emit_bounded_rejection(&rejection) {
+                break;
+            }
+            if consecutive_invalid >= REQUEST_INPUT_PROFILE.max_consecutive_invalid_records {
+                break;
+            }
+            continue;
+        };
+        if text.trim().is_empty() {
+            continue;
+        }
+        if total_records >= REQUEST_INPUT_PROFILE.max_requests_per_process {
+            break;
+        }
+        let Some(next_total) = total_records.checked_add(1) else {
+            break;
+        };
+        total_records = next_total;
+        let response = match serde_json::from_str::<Request>(text) {
                 Ok(Request::Attach { request }) => match runner.attach(request) {
                     Ok(_) => Response::Attached,
                     Err(error) => {
@@ -242,17 +363,37 @@ fn main() {
                     code: "REQUEST_INVALID",
                     detail: error.to_string(),
                 },
-            },
-            Err(error) => Response::Error {
-                code: "INPUT_FAILURE",
-                detail: error.to_string(),
-            },
-        };
+            };
+        // Only the deserialization-failure arm above produces REQUEST_INVALID:
+        // every handler, gateway, and runner error path uses a distinct code,
+        // so this flag exactly tracks whether a request was dispatched. Valid
+        // dispatches reset the consecutive-invalid run; malformed records
+        // extend it without ever having reached a handler.
+        let dispatched = !matches!(
+            &response,
+            Response::Error {
+                code: "REQUEST_INVALID",
+                ..
+            }
+        );
+        if dispatched {
+            consecutive_invalid = 0;
+        } else {
+            let Some(next_invalid) = consecutive_invalid.checked_add(1) else {
+                break;
+            };
+            consecutive_invalid = next_invalid;
+        }
         let stop = matches!(response, Response::Stopped);
         let receipt = write_response(&response);
         // A zero-byte emission proves nothing reached the host, so the loop
         // must not continue as if the correlation had been delivered.
         if receipt.bytes_written() == 0 || receipt.should_break() || stop {
+            break;
+        }
+        if !dispatched
+            && consecutive_invalid >= REQUEST_INPUT_PROFILE.max_consecutive_invalid_records
+        {
             break;
         }
     }
@@ -503,6 +644,18 @@ impl StdioWriteReceipt {
     const fn should_break(&self) -> bool {
         !self.flushed || !matches!(self.cause, StdioBreakCause::Emitted)
     }
+}
+
+/// Emits one typed stdin rejection without touching any request handler,
+/// gateway, port, or runner.
+///
+/// Oversize, non-UTF-8, and transport failures are shaped into responses by
+/// the caller, so the dispatch match is unreachable for them by construction:
+/// this helper only writes the already-shaped rejection and reports whether
+/// the acquisition loop must break afterwards.
+fn emit_bounded_rejection(response: &Response) -> bool {
+    let receipt = write_response(response);
+    receipt.bytes_written() == 0 || receipt.should_break()
 }
 
 fn write_response(response: &Response) -> StdioWriteReceipt {
