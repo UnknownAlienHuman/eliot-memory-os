@@ -25,14 +25,14 @@ WHERE project_id = $project_id
   AND (
     candidate_id = <string> $candidate_id
     OR (
-      (candidate_id = NONE OR candidate_id = NULL OR candidate_id = '')
+      (candidate_id ?? '') = ''
       AND <string> receipt_body.candidate_id = <string> $candidate_id
     )
   )
   AND (
     canonical_action = <string> $action
     OR (
-      (canonical_action = NONE OR canonical_action = NULL OR canonical_action = '')
+      (canonical_action ?? '') = ''
       AND <string> receipt_body.action = <string> $action
     )
   )
