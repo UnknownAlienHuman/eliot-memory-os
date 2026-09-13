@@ -35,7 +35,7 @@ use std::path::PathBuf;
 use eliot_platform_windows::ServiceBootstrapArguments;
 use windows_sys::Win32::System::Services::{SERVICE_STATUS, SetServiceStatus};
 
-use eliot_watchdog::{SERVICE_NAME, WatchdogScmLaunchError};
+use eliot_watchdog::{FileWatchdogAdmission, SERVICE_NAME, WatchdogScmLaunchError};
 
 pub(super) static SERVICE_STATUS_HANDLE: std::sync::atomic::AtomicIsize =
     std::sync::atomic::AtomicIsize::new(0);
@@ -160,9 +160,17 @@ pub(super) fn classify_bootstrap_launch_error(error: &WatchdogScmLaunchError) ->
 /// `run_watchdog` (`runtime_loop.rs`) collapses every failure to `String`, so
 /// admission/ordering logic is untouched and classification matches on the
 /// exact production substrings it emits. Order is significant: bootstrap
-/// markers first, then the self-admission gate, then admission/spool/lease
-/// markers; anything else is the supervision catch-all. The mapping is covered
-/// by `runtime_error_strings_classify_to_documented_classes`.
+/// markers first, then the self-admission gate, then transient redb lock
+/// contention, then admission/spool/lease markers; anything else is the
+/// supervision catch-all. The mapping is covered by
+/// `runtime_error_strings_classify_to_documented_classes`.
+///
+/// The transient arm is taxonomy defense-in-depth only: the primary nonfatal
+/// handling is the fence-poll retry in `runtime_loop.rs`, which never returns
+/// a transient lock as a `run_watchdog` failure. If such a string ever
+/// escapes (console path, future call site), it must not collapse into
+/// `RuntimeAdmission` (1066/9, the approval-failure runbook); it maps to the
+/// documented supervision catch-all while the capsule keeps the inner cause.
 #[must_use]
 pub(super) fn classify_runtime_error(message: &str) -> WatchdogStopCode {
     if message.contains("SCM bootstrap is required")
@@ -173,6 +181,8 @@ pub(super) fn classify_runtime_error(message: &str) -> WatchdogStopCode {
         || message.contains("current Watchdog process identity")
     {
         WatchdogStopCode::RuntimeSelfAdmission
+    } else if FileWatchdogAdmission::is_transient_registry_lock(message) {
+        WatchdogStopCode::RuntimeSupervision
     } else if message.contains("watchdog spool")
         || message.contains("watchdog lease")
         || message.contains("watchdog admission was denied")
@@ -658,6 +668,114 @@ mod tests {
         assert_eq!(
             classify_runtime_error("tokio runtime construction failed: io error"),
             WatchdogStopCode::RuntimeSupervision
+        );
+    }
+
+    #[test]
+    fn transient_registry_lock_preserves_cause_and_retries_fence_poll() {
+        use crate::runtime_loop::{
+            FencePollDisposition, fence_poll_disposition, transient_lock_backoff,
+        };
+        use eliot_watchdog::{FileWatchdogAdmission, SpoolError};
+
+        static TRANSIENT_LOCK_SERIAL: std::sync::atomic::AtomicU64 =
+            std::sync::atomic::AtomicU64::new(0);
+        let serial = TRANSIENT_LOCK_SERIAL.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let lock_path = std::env::temp_dir().join(format!(
+            "eliot-watchdog-transient-lock-{}-{serial}.redb",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&lock_path);
+        // Genuine contention: hold a real writer `Database` open so the
+        // read-only open fails with the production `DatabaseAlreadyOpen`
+        // instead of canned text.
+        let _writer = redb::Database::create(&lock_path)
+            .unwrap_or_else(|error| panic!("transient-lock writer fixture: {error}"));
+        let lock_error = match redb::ReadOnlyDatabase::open(&lock_path) {
+            Ok(_) => panic!("held writer must block the read-only registry open"),
+            Err(error) => error,
+        };
+        let lock_text = lock_error.to_string();
+        assert!(
+            lock_text.contains("already open"),
+            "fixture must carry the real lock signal: {lock_text}"
+        );
+        assert!(
+            lock_text.contains("Cannot acquire lock"),
+            "fixture must carry the real lock cause: {lock_text}"
+        );
+        drop(lock_error);
+        drop(_writer);
+        let _ = std::fs::remove_file(&lock_path);
+
+        // (a) The production wrap chain preserves the inner cause through
+        // classification into the capsule without collapsing to 1066/9.
+        let runtime_text = SpoolError::InvalidLease(lock_text.clone()).to_string();
+        assert!(
+            runtime_text.contains("watchdog lease is unavailable or invalid"),
+            "wrap chain must keep the production prefix: {runtime_text}"
+        );
+        assert!(FileWatchdogAdmission::is_transient_registry_lock(
+            &runtime_text
+        ));
+        // A same-process table defect without the lock marker stays
+        // fail-closed: it is not transient contention.
+        assert!(!FileWatchdogAdmission::is_transient_registry_lock(
+            "watchdog lease is unavailable or invalid: Table 'registry' already opened at: test"
+        ));
+        let code = classify_runtime_error(&runtime_text);
+        assert_eq!(code, WatchdogStopCode::RuntimeSupervision);
+        assert_ne!(code, WatchdogStopCode::RuntimeAdmission);
+        assert_eq!(code.specific(), 11);
+        let capsule =
+            build_start_failure_capsule(code, &runtime_text, Some("installation-7"), Some(7));
+        assert!(
+            capsule.contains("Cannot acquire lock"),
+            "capsule must preserve the inner cause: {capsule}"
+        );
+        assert!(
+            capsule.len() <= START_FAILURE_CAPSULE_MAX_BYTES,
+            "capsule must stay bounded"
+        );
+        let parsed: serde_json::Value =
+            serde_json::from_str(&capsule).unwrap_or_else(|error| panic!("capsule JSON: {error}"));
+        assert_eq!(parsed["failure_class"], "runtime_supervision");
+        assert_eq!(parsed["win32_exit_code"], 1066);
+        assert_eq!(parsed["service_specific_exit_code"], 11);
+
+        // (b) The real fence-poll disposition retries lock contention instead
+        // of exiting, and still fails closed on real approval failures.
+        for _ in 0..3 {
+            assert_eq!(
+                fence_poll_disposition(&runtime_text, &runtime_text),
+                FencePollDisposition::RetryTransient
+            );
+        }
+        // Contention on either read alone still retries: the waiter cannot
+        // prove a fail-closed state while a read is lock-blocked.
+        let real = "watchdog lease is unavailable or invalid: installer SCM registration approval is missing";
+        assert_eq!(
+            fence_poll_disposition(real, &runtime_text),
+            FencePollDisposition::RetryTransient
+        );
+        assert_eq!(
+            fence_poll_disposition(real, real),
+            FencePollDisposition::FailClosed
+        );
+        assert!(!FileWatchdogAdmission::is_transient_registry_lock(real));
+        assert_eq!(
+            classify_runtime_error(real),
+            WatchdogStopCode::RuntimeAdmission
+        );
+        // Backoff is bounded: base on the first streak, capped under
+        // sustained contention.
+        assert_eq!(
+            transient_lock_backoff(0),
+            std::time::Duration::from_millis(250)
+        );
+        assert_eq!(
+            transient_lock_backoff(u32::MAX),
+            std::time::Duration::from_millis(2_000)
         );
     }
 

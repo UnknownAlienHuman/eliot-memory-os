@@ -11,22 +11,23 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use eliot_installation::{
-    verify_file_digest, verify_file_digest_with_lease, CandidateManifest, InstallationProfile,
+    ApprovedGenerationRegistry, CandidateManifest, InstallationError, InstallationProfile,
     PendingActivationState, RedbInstallationRegistry, RuntimeStateRoots,
     ValidatedRuntimeRootLeases, WindowsRuntimeRootLease, WindowsRuntimeRootLeaseProvider,
+    verify_file_digest, verify_file_digest_with_lease,
 };
 use eliot_platform_windows::{
-    windows_paths_equal, ProtectedPathLease, ProtectedRootLease, ServiceBootstrapArguments,
-    ServiceRegistrationRequest,
+    ProtectedPathLease, ProtectedRootLease, ServiceBootstrapArguments, ServiceRegistrationRequest,
+    windows_paths_equal,
 };
 use eliot_runtime_contracts::ProvisionedSupervisionAuthority;
 
 use super::runtime_manifest_selection::{approved_host_artifact_path, select_runtime_manifest};
 use super::service_registration_projection::load_approved_service_registrations;
 use super::{
-    supervision_lease_load, ApprovedHostRegistration, SpoolError, VerifiedWatchdogAdmission,
-    WatchdogAdmissionSource, WatchdogAuthorityState, WatchdogConfig, WatchdogReadiness,
-    INSTALLATION_REGISTRY_FILE_NAME, PROTOCOL_VERSION, SERVICE_NAME,
+    ApprovedHostRegistration, INSTALLATION_REGISTRY_FILE_NAME, PROTOCOL_VERSION, SERVICE_NAME,
+    SpoolError, VerifiedWatchdogAdmission, WatchdogAdmissionSource, WatchdogAuthorityState,
+    WatchdogConfig, WatchdogReadiness, supervision_lease_load,
 };
 
 /// Registry- and ORS-backed admission source for the immutable Host
@@ -80,6 +81,30 @@ impl WatchdogRuntimeBinding {
 }
 
 impl FileWatchdogAdmission {
+    /// Transient redb lock-contention probe for registry reads (s37, #1339).
+    ///
+    /// Returns true when `message` carries the redb file-lock contention
+    /// signal (`DatabaseAlreadyOpen`, rendered as
+    /// `Database already open. Cannot acquire lock.`), including through the
+    /// `InstallationError::Platform` and `SpoolError::InvalidLease` wrappers
+    /// the Watchdog read path adds. Matching is case-insensitive and requires
+    /// the lock marker so a same-process `Table ... already opened` defect
+    /// stays fail-closed instead of retrying as transient contention.
+    ///
+    /// A transient lock is never a verdict on registry bytes: callers retry
+    /// with bounded backoff inside their readiness window (A0.3 defaults to
+    /// retry with new evidence outside Hard Boundaries) and keep every fence
+    /// and approval check intact.
+    #[must_use]
+    pub fn is_transient_registry_lock(message: &str) -> bool {
+        let folded = message.to_ascii_lowercase();
+        if folded.contains("cannot acquire lock") {
+            return true;
+        }
+        (folded.contains("already open") || folded.contains("alreadyopen"))
+            && folded.contains("lock")
+    }
+
     /// # Errors
     ///
     /// Returns an error when the registry is missing, invalid, has no exact
@@ -172,7 +197,7 @@ impl FileWatchdogAdmission {
                 "Watchdog registry path is not the exact approved Host child".to_owned(),
             ));
         }
-        let registry = RedbInstallationRegistry::inspect_existing_at(
+        let registry = inspect_registry_at(
             ProtectedRootLease::open_existing(&canonical_host_root).map_err(|error| {
                 SpoolError::InvalidLease(format!("Host state root reopen failed: {error}"))
             })?,
@@ -254,6 +279,20 @@ impl WatchdogAdmissionSource for FileWatchdogAdmission {
     }
 }
 
+/// Single read-only registry inspection for the Watchdog contour.
+///
+/// Every Watchdog registry read flows through this choke point so lock, lease,
+/// and validation handling has one future fix site. The handle is a
+/// short-lived read-only inspection that is dropped before return: it never
+/// creates a file, database, table, or ACL and never retains a writer across
+/// a wait. Callers keep their exact `SpoolError` mapping so capsule detail
+/// and failure taxonomy are unchanged.
+pub(crate) fn inspect_registry_at(
+    host_root: ProtectedRootLease,
+) -> Result<Option<ApprovedGenerationRegistry>, InstallationError> {
+    RedbInstallationRegistry::inspect_existing_at(host_root)
+}
+
 #[allow(
     clippy::too_many_lines,
     reason = "runtime binding selection keeps protected registry, manifest, bootstrap, and retained-root checks in one fail-closed read transaction"
@@ -285,7 +324,7 @@ fn load_runtime_binding(
             "Watchdog registry path is not the exact approved Host child".to_owned(),
         ));
     }
-    let registry = RedbInstallationRegistry::inspect_existing_at(
+    let registry = inspect_registry_at(
         ProtectedRootLease::open_existing(&canonical_host_root).map_err(|error| {
             SpoolError::InvalidLease(format!("Host state root reopen failed: {error}"))
         })?,
@@ -436,11 +475,13 @@ mod tests {
         assert_eq!(fence.watchdog_epoch, 0);
         // Recovery-required pending must stay fail-closed, never fenced.
         fixture.write_registry(&fixture.recovery_required());
-        assert!(FileWatchdogAdmission::pending_phase_b_fence_readiness(
-            registry_path.clone(),
-            bootstrap.clone()
-        )
-        .is_err());
+        assert!(
+            FileWatchdogAdmission::pending_phase_b_fence_readiness(
+                registry_path.clone(),
+                bootstrap.clone()
+            )
+            .is_err()
+        );
         // An active generation without a committed Phase-B fence is corruption,
         // not an awaitable bootstrap state, so it must also stay fail-closed.
         fixture.write_registry(&fixture.active_only());

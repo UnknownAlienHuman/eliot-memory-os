@@ -3401,6 +3401,20 @@ pub struct HostComposition {
     )]
     runtime_control_boundary: HostRuntimeControlProductionBoundary,
     journal: ProductionHostStateJournal,
+    /// Durable installation-registry writer retained for the Host process
+    /// lifetime (s37/#1339, A13.9).
+    ///
+    /// Host is the registry's live compare-and-swap owner: every Phase-B and
+    /// recovery mutation commits through this handle with an expected
+    /// revision, so the hold spans the process lifetime and ends at SCM stop.
+    /// This is process-lifetime ownership, not a writer held across an
+    /// unbounded wait: the installer releases its staging writer before the
+    /// SCM start + convergence wait (`bins/eliot/src/main.rs`
+    /// INSTALL-WATCHDOG-APPROVAL `drop(registry)`), and readers (Watchdog
+    /// short-lived `inspect_existing_at`, installer reconcile
+    /// `open_existing_at`) treat `DatabaseAlreadyOpen` lock contention as
+    /// bounded transient retry. The open below applies that same bounded
+    /// retry to the Host-side release race.
     registry_store: RedbInstallationRegistry,
     registry: ApprovedGenerationRegistry,
     launch_options: HostLaunchOptions,
@@ -3574,6 +3588,72 @@ fn start_approved_manifest_contour<P: ApprovedHostStartupPort>(
     )
 }
 
+/// Bounded `DatabaseAlreadyOpen` retry budget for the Host registry open
+/// (s37/#1339). Six attempts back off 250ms, 500ms, 1s, then 2s capped, so
+/// the worst-case wait stays near 8s: inside the SCM start-pending window
+/// and always interruptible by process stop.
+const HOST_REGISTRY_OPEN_RETRY_ATTEMPTS: u32 = 6;
+const HOST_REGISTRY_OPEN_RETRY_BASE_MS: u64 = 250;
+const HOST_REGISTRY_OPEN_RETRY_MAX_MS: u64 = 2_000;
+
+/// Returns true when `error` carries redb file-lock contention (a live writer
+/// holds the registry file). This mirrors the Watchdog reader probe
+/// (`FileWatchdogAdmission::is_transient_registry_lock`): matching is
+/// case-insensitive and requires the lock marker so unrelated platform text
+/// that merely mentions an open path stays fail-closed.
+fn installation_registry_lock_contended(error: &InstallationError) -> bool {
+    let folded = error.to_string().to_ascii_lowercase();
+    folded.contains("cannot acquire lock")
+        || ((folded.contains("already open") || folded.contains("alreadyopen"))
+            && folded.contains("lock"))
+}
+
+/// Opens the existing installation registry below `host_state_root`,
+/// tolerating a short writer-release race with bounded backoff.
+///
+/// The installer staging writer is released before the SCM start +
+/// convergence wait, so lock contention here is a release race, not a held
+/// owner (A13.9). Each attempt opens a fresh short-lived root lease and
+/// re-proves the exact retained-root identity before touching the database;
+/// every non-contention failure still fails closed immediately.
+///
+/// # Errors
+///
+/// Returns [`HostError::Platform`] when the root lease or path proof fails,
+/// and [`HostError::Installation`] when the registry open fails, including
+/// contention that outlasts the bounded retry budget.
+fn open_installation_registry_with_transient_retry(
+    host_state_root: &Path,
+) -> Result<Option<RedbInstallationRegistry>, HostError> {
+    let mut attempt = 0_u32;
+    loop {
+        let root_lease = ProtectedRootLease::open_existing(host_state_root)
+            .map_err(|error| HostError::Platform(error.to_string()))?;
+        let canonical = root_lease
+            .canonical_path()
+            .map_err(|error| HostError::Platform(error.to_string()))?;
+        if canonical.as_path() != host_state_root {
+            return Err(HostError::ProcessContour(
+                "SCM Host state root is not the exact retained installation root".to_owned(),
+            ));
+        }
+        match RedbInstallationRegistry::open_existing_at(root_lease) {
+            Ok(store) => return Ok(store),
+            Err(error)
+                if installation_registry_lock_contended(&error)
+                    && attempt < HOST_REGISTRY_OPEN_RETRY_ATTEMPTS =>
+            {
+                attempt += 1;
+                let shift = attempt.saturating_sub(1).min(3);
+                let backoff_ms = (HOST_REGISTRY_OPEN_RETRY_BASE_MS << shift)
+                    .min(HOST_REGISTRY_OPEN_RETRY_MAX_MS);
+                std::thread::sleep(std::time::Duration::from_millis(backoff_ms));
+            }
+            Err(error) => return Err(HostError::Installation(error)),
+        }
+    }
+}
+
 impl HostComposition {
     /// Opens the durable Host contour for one installation identity and
     /// advances its persisted epoch before any process admission.
@@ -3603,8 +3683,14 @@ impl HostComposition {
                 "SCM Host state root is not the exact retained installation root".to_owned(),
             ));
         }
-        let registry_store =
-            RedbInstallationRegistry::open_existing_at(root_lease)?.ok_or_else(|| {
+        // s37/#1339, A13.9: the installer staging writer is released before
+        // the SCM start + convergence wait, so `DatabaseAlreadyOpen` here is
+        // a short release race, not a held owner. Retry it with bounded
+        // backoff; every other open failure still fails closed immediately.
+        // `root_lease` stays in this scope for the canonical-path proof;
+        // each attempt opens a fresh short-lived lease inside the helper.
+        let registry_store = open_installation_registry_with_transient_retry(&host_state_root)?
+            .ok_or_else(|| {
                 HostError::ProcessContour(
                     "SCM Host state root has no approved-generation registry".to_owned(),
                 )
