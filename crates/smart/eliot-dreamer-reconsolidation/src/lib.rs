@@ -115,7 +115,7 @@ fn contains_handle(values: &[String], handle: &str) -> bool {
 }
 
 fn digits_of(value: &str) -> Vec<char> {
-    value.chars().filter(|c| c.is_ascii_digit()).collect()
+    value.chars().filter(char::is_ascii_digit).collect()
 }
 
 fn has_absolute_claim(value: &str) -> bool {
@@ -1038,7 +1038,7 @@ pub fn propose_reconsolidation(
             continue;
         }
         let normalized = normalize_statement(&item.statement);
-        if parent_statements.iter().any(|s| *s == normalized) {
+        if parent_statements.contains(&normalized) {
             continue;
         }
         if item.observed_at_ms.is_none() {
@@ -1165,7 +1165,7 @@ pub fn propose_reconsolidation(
                 }
                 if introduces_precision || has_absolute_claim(revised) {
                     let mut supported = false;
-                    for item in genuine.iter() {
+                    for item in &genuine {
                         if item.statement.contains(revised.as_str())
                             || revised.contains(item.statement.as_str())
                         {
@@ -1254,7 +1254,7 @@ pub fn propose_reconsolidation(
         .map_err(|err| ReconsolidationError::Denominator {
             detail: redact(&err.to_string()),
         })?;
-    for item in genuine.iter() {
+    for item in &genuine {
         if !request
             .new_member_denominator
             .members
@@ -1325,11 +1325,10 @@ pub fn propose_reconsolidation(
             has_unresolved = true;
             if let Some(parent) =
                 find_proposition(&request.parent_propositions, &delta.proposition_id)
+                && parent.is_load_bearing
             {
-                if parent.is_load_bearing {
-                    has_load_bearing_unresolved = true;
-                    break;
-                }
+                has_load_bearing_unresolved = true;
+                break;
             }
         }
     }
@@ -1370,13 +1369,16 @@ pub fn propose_reconsolidation(
 pub fn outcome_rejection_hint(outcome: &ReconsolidationOutcome) -> Option<RejectionCode> {
     match outcome {
         ReconsolidationOutcome::Complete => None,
-        ReconsolidationOutcome::Partial => Some(RejectionCode::PreservationFailed),
-        ReconsolidationOutcome::NoMaterialNewEvidence => Some(RejectionCode::LineageMismatch),
+        ReconsolidationOutcome::Partial | ReconsolidationOutcome::Blocked => {
+            Some(RejectionCode::PreservationFailed)
+        }
+        ReconsolidationOutcome::NoMaterialNewEvidence | ReconsolidationOutcome::Abstention => {
+            Some(RejectionCode::LineageMismatch)
+        }
         ReconsolidationOutcome::NoSafeRevision => Some(RejectionCode::UnsupportedPrecision),
-        ReconsolidationOutcome::Abstention => Some(RejectionCode::LineageMismatch),
-        ReconsolidationOutcome::Stale => Some(RejectionCode::IdentityMismatch),
-        ReconsolidationOutcome::Blocked => Some(RejectionCode::PreservationFailed),
-        ReconsolidationOutcome::Rejected => Some(RejectionCode::IdentityMismatch),
+        ReconsolidationOutcome::Stale | ReconsolidationOutcome::Rejected => {
+            Some(RejectionCode::IdentityMismatch)
+        }
     }
 }
 
