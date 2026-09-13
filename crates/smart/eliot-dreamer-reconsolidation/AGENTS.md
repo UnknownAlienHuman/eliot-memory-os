@@ -42,7 +42,7 @@ Read through `scripts/docs_read.py`, then directly:
 - [`I12.26 — Memory admission and retrieval trace`](../../../docs/architecture/I12-26-memory-admission-and-retrieval-trace.md#i1226-memory-admission-and-retrieval-trace)
 - [`I12.38 — Causal influence status`](../../../docs/architecture/I12-38-causal-influence-status.md#i1238-causal-influence-status)
 - [`I7.25 — Skill lifecycle and execution evidence`](../../../docs/architecture/I07-25-skill-lifecycle-interaction-and-execution-evidence.md#i725-skill-lifecycle-interaction-and-execution-evidence)
-- [`I5.27 — Canonical operation and effect identity`](../../../docs/architecture/I05-27-canonical-operation-identity-and-effect-identity.md#i527-canonical-operation-and-effect-identity)
+- [`I5.27 — Canonical operation and effect identity`](../../../docs/architecture/I05-27-canonical-operation-identity-and-effect-identity.md#i527-canonical-operation-identity-and-effect-identity)
 
 ## What to implement
 

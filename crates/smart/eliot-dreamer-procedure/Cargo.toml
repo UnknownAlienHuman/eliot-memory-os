@@ -11,7 +11,7 @@ description = "Propose one grounded procedure with trigger, preconditions, steps
 path = "src/lib.rs"
 
 [package.metadata.eliot]
-prototype = false
+prototype = true
 source_status = "IMPLEMENTED"
 workspace_admission = "pending_agent_implementation_and_proof"
 functional_cell = "smart.dreamer.procedure"
