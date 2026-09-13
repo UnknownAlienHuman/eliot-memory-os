@@ -1,3 +1,7 @@
+-- NON-EXECUTABLE FIXTURE — not loaded by any migration graph
+-- Original: migrations/0001_bootstrap.surql deleted 2026-09-13 per #1221 AC#3 option 2
+-- consumers_found=0, expires when Waves B/C/D close legacy mapping or 2026-12-12
+-- See workstreams/storage/assignments/1221-schema-migration-owner.toml [disposition]
 DEFINE TABLE IF NOT EXISTS health_record SCHEMAFULL;
 DEFINE FIELD component ON health_record TYPE string;
 DEFINE FIELD status ON health_record TYPE string;
