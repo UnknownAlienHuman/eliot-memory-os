@@ -2194,6 +2194,12 @@ impl EliotdLiveSupervisionEvidence {
 /// Exact request/session evidence attached to one authenticated `daemon_ready`
 /// publication.  The request payload is represented by its canonical digest;
 /// the raw request remains on the authenticated transport only.
+///
+/// This evidence copy stays scalar-only by design: it is constructed by struct
+/// literal outside this crate, so any additive field would break downstream
+/// literals. Canonical authority lives in `FencingToken`/`ProcessOwnerBinding`/
+/// `DispatchValidationContext`/`ProcessExecutionBinding`; this scalar-only
+/// evidence is quarantined from canonical authority and never promotes it.
 #[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct EliotdLiveReadyEvidence {
@@ -2211,9 +2217,6 @@ pub struct EliotdLiveReadyEvidence {
     pub generation: u64,
     /// Digest of the authenticated launch nonce.
     pub launch_nonce_sha256: String,
-    /// Additive canonical authority carried alongside the scalar epoch.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub canonical_authority: Option<EpochId>,
 }
 
 impl EliotdLiveReadyEvidence {
@@ -2237,57 +2240,20 @@ impl EliotdLiveReadyEvidence {
         )?;
         Ok(())
     }
-
-    /// Returns the additive canonical authority, when present.
-    pub const fn canonical_authority(&self) -> Option<&EpochId> {
-        self.canonical_authority.as_ref()
-    }
-
-    /// Returns a copy carrying the supplied canonical authority.
-    pub fn with_canonical_authority(mut self, canonical_authority: EpochId) -> Self {
-        self.canonical_authority = Some(canonical_authority);
-        self
-    }
-
-    /// Alias for [`Self::with_canonical_authority`].
-    pub fn with_canonical_epoch(self, canonical_authority: EpochId) -> Self {
-        self.with_canonical_authority(canonical_authority)
-    }
-
-    /// Exact-tuple canonical authorization. Scalar-only returns false.
-    pub fn authorizes_canonical(&self, expected: &EpochId) -> bool {
-        match self.canonical_authority.as_ref() {
-            Some(stored) => {
-                // Scalar equality is required alongside the exact tuple;
-                // no coercion from scalar to canonical is performed.
-                StateFence::authorizes_canonical(stored, expected)
-            }
-            None => false,
-        }
-    }
-
-    /// Fail-closed exact-tuple validation.
-    pub fn validate_canonical_against(&self, expected: &EpochId) -> Result<(), ContractError> {
-        match self.canonical_authority.as_ref() {
-            Some(stored) if StateFence::authorizes_canonical(stored, expected) => Ok(()),
-            _ => Err(ContractError::StaleAuthorityEpoch),
-        }
-    }
-
-    /// Lineage-bound digest for the ready canonical authority, if present.
-    pub fn canonical_authority_digest(&self) -> Option<String> {
-        self.canonical_authority.as_ref().and_then(|epoch| {
-            StateFence::canonical_epoch_digest(epoch)
-                .ok()
-                .map(|digest| digest.as_str().to_owned())
-        })
-    }
 }
 
 /// Kernel-owned durable receipt proving that the exact eliotd process passed
 /// authenticated readiness and was observed in its executor Job.  This is an
 /// inert evidence record: status consumers must independently re-read the
 /// manifest, receipt file, ORS, and live process contour.
+///
+/// This receipt copy stays scalar-only by design: it is a pub-field evidence
+/// copy (constructed via `new` from evidence assembled outside this crate),
+/// so any additive pub field would risk breaking downstream construction and
+/// wire-shape expectations. Canonical authority lives in
+/// `FencingToken`/`ProcessOwnerBinding`/`DispatchValidationContext`/
+/// `ProcessExecutionBinding`; this scalar-only receipt is quarantined from
+/// canonical authority and never promotes it.
 #[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct EliotdLiveReceipt {
@@ -2325,9 +2291,6 @@ pub struct EliotdLiveReceipt {
     pub published_at_unix_ms: u64,
     /// Digest of the canonical receipt with this field omitted.
     pub receipt_sha256: String,
-    /// Additive canonical authority carried alongside the scalar epoch.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub canonical_authority: Option<EpochId>,
 }
 
 #[derive(Serialize)]
@@ -2348,8 +2311,6 @@ struct EliotdLiveReceiptUnsigned<'a> {
     supervision: &'a EliotdLiveSupervisionEvidence,
     ready: &'a EliotdLiveReadyEvidence,
     published_at_unix_ms: u64,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    canonical_authority: Option<&'a EpochId>,
 }
 
 impl EliotdLiveReceipt {
@@ -2389,105 +2350,10 @@ impl EliotdLiveReceipt {
             ready,
             published_at_unix_ms,
             receipt_sha256: String::new(),
-            canonical_authority: None,
         };
         receipt.validate_shape()?;
         receipt.receipt_sha256 = receipt.compute_digest()?;
         Ok(receipt)
-    }
-
-    /// Computes one receipt carrying both the scalar epoch and the canonical
-    /// authority. Both values are supplied explicitly; neither is derived from
-    /// the other.
-    #[allow(clippy::too_many_arguments)]
-    pub fn new_with_canonical(
-        receipt_root: impl Into<String>,
-        receipt_root_identity_sha256: impl Into<String>,
-        runtime_state_roots_digest: impl Into<String>,
-        installation_id: impl Into<String>,
-        approved_generation: impl Into<String>,
-        generation: u64,
-        authority_epoch: u64,
-        config_descriptor_sha256: impl Into<String>,
-        descriptor_sha256: impl Into<String>,
-        kernel_artifact_sha256: impl Into<String>,
-        process: ProcessStartReceipt,
-        supervision: EliotdLiveSupervisionEvidence,
-        ready: EliotdLiveReadyEvidence,
-        published_at_unix_ms: u64,
-        canonical_authority: EpochId,
-    ) -> Result<Self, ContractError> {
-        let mut receipt = Self {
-            wire_id: ELIOTD_LIVE_RECEIPT_WIRE_ID.to_owned(),
-            wire_version: ELIOTD_LIVE_RECEIPT_WIRE_VERSION,
-            receipt_root: receipt_root.into(),
-            receipt_root_identity_sha256: receipt_root_identity_sha256.into(),
-            runtime_state_roots_digest: runtime_state_roots_digest.into(),
-            installation_id: installation_id.into(),
-            approved_generation: approved_generation.into(),
-            generation,
-            authority_epoch,
-            config_descriptor_sha256: config_descriptor_sha256.into(),
-            descriptor_sha256: descriptor_sha256.into(),
-            kernel_artifact_sha256: kernel_artifact_sha256.into(),
-            process,
-            supervision,
-            ready,
-            published_at_unix_ms,
-            receipt_sha256: String::new(),
-            canonical_authority: Some(canonical_authority),
-        };
-        receipt.validate_shape()?;
-        receipt.receipt_sha256 = receipt.compute_digest()?;
-        Ok(receipt)
-    }
-
-    /// Returns a copy carrying the supplied canonical authority alongside the
-    /// existing scalar epoch. The digest is recomputed to bind the canonical
-    /// value; scalar-only bytes are preserved when canonical is `None`.
-    pub fn with_canonical_authority(
-        mut self,
-        canonical_authority: EpochId,
-    ) -> Result<Self, ContractError> {
-        self.canonical_authority = Some(canonical_authority);
-        self.validate_shape()?;
-        self.receipt_sha256 = self.compute_digest()?;
-        Ok(self)
-    }
-
-    /// Alias for [`Self::with_canonical_authority`].
-    pub fn with_canonical_epoch(self, canonical_authority: EpochId) -> Result<Self, ContractError> {
-        self.with_canonical_authority(canonical_authority)
-    }
-
-    /// Returns the additive canonical authority, when present.
-    pub const fn canonical_authority(&self) -> Option<&EpochId> {
-        self.canonical_authority.as_ref()
-    }
-
-    /// Exact-tuple canonical authorization. Scalar-only returns false.
-    pub fn authorizes_canonical(&self, expected: &EpochId) -> bool {
-        match self.canonical_authority.as_ref() {
-            Some(stored) => StateFence::authorizes_canonical(stored, expected),
-            None => false,
-        }
-    }
-
-    /// Fail-closed exact-tuple validation.
-    pub fn validate_canonical_against(&self, expected: &EpochId) -> Result<(), ContractError> {
-        match self.canonical_authority.as_ref() {
-            Some(stored) if StateFence::authorizes_canonical(stored, expected) => Ok(()),
-            _ => Err(ContractError::StaleAuthorityEpoch),
-        }
-    }
-
-    /// Lineage-bound digest for the receipt canonical authority, if present.
-    pub fn canonical_authority_digest(&self) -> Option<String> {
-        self.canonical_authority.as_ref().and_then(|epoch| {
-            StateFence::canonical_epoch_digest(epoch)
-                .ok()
-                .map(|digest| digest.as_str().to_owned())
-        })
     }
 
     fn unsigned(&self) -> EliotdLiveReceiptUnsigned<'_> {
@@ -2508,7 +2374,6 @@ impl EliotdLiveReceipt {
             supervision: &self.supervision,
             ready: &self.ready,
             published_at_unix_ms: self.published_at_unix_ms,
-            canonical_authority: self.canonical_authority.as_ref(),
         }
     }
 
@@ -3401,7 +3266,6 @@ mod tests {
             authority_epoch: 3,
             generation: 1,
             launch_nonce_sha256: "f".repeat(64),
-            canonical_authority: None,
         };
         let root = std::env::temp_dir().join("eliot-live-receipt-test");
         let receipt = EliotdLiveReceipt::new(
