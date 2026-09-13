@@ -16,6 +16,7 @@
 use std::future::Future;
 use std::pin::Pin;
 
+mod host_request_binding;
 mod lifecycle;
 mod process_execution_client;
 mod protocol;
@@ -28,6 +29,7 @@ pub use eliot_protocol::{
     AGENT_BRIDGE_CLIENT_DECLARATION_WIRE_ID, AGENT_BRIDGE_CLIENT_DECLARATION_WIRE_VERSION,
     AgentBridgeClientDeclaration,
 };
+pub use host_request_binding::{AuthenticatedHostSession, KernelHostRequestBinder};
 pub use lifecycle::{
     AdmissionLease, KernelService, KernelServiceError, KernelServiceState, ServiceFailure,
 };
