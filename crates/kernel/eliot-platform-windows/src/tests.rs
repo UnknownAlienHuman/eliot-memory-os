@@ -3601,6 +3601,80 @@ fn runtime_file_access_is_ba_ls_sy_verify_only_while_legacy_keeps_write_dac() {
 
 #[cfg(windows)]
 #[test]
+fn runtime_file_create_mints_installer_descriptor_and_wrong_acl_fails_closed() {
+    use windows_sys::Win32::Storage::FileSystem::{FILE_SHARE_READ, FILE_SHARE_WRITE};
+
+    // Production-policy contour: this test never sets the test-root bypass,
+    // so the create branch mints the real installer descriptor and the
+    // readback below enforces it.
+    assert!(test_protected_root().is_none());
+    let dir = std::env::temp_dir().join(format!("eliot-runtime-acl-{}", unique_suffix()));
+    std::fs::create_dir_all(&dir).unwrap_or_else(|_| unreachable!());
+    let expected = OwnedSecurityDescriptor::for_installer_system_object(false)
+        .unwrap_or_else(|error| panic!("runtime descriptor failed: {error}"));
+
+    // (a) Create mints the installer descriptor AT CREATION: the retained
+    // handle verifies under the production policy with owner SYSTEM.
+    let created_path = dir.join(format!("created-{}", unique_suffix()));
+    let created = open_runtime_file_with_share(
+        &created_path,
+        true,
+        FILE_SHARE_READ | FILE_SHARE_WRITE,
+    )
+    .unwrap_or_else(|error| {
+        panic!("runtime create must mint the installer descriptor: {error:?}")
+    });
+    verify_readonly_acl(&created, &expected).unwrap_or_else(|error| {
+        panic!("created file must verify under the installer descriptor: {error:?}")
+    });
+    assert_eq!(
+        sid_to_string(
+            expected
+                .owner()
+                .unwrap_or_else(|_| unreachable!())
+        )
+        .unwrap_or_else(|_| unreachable!()),
+        "S-1-5-18"
+    );
+    // Passing `verify_readonly_acl` above already proves the created file
+    // carries exactly this descriptor's owner, protected bit, and DACL
+    // bytes; the descriptor's principal set {SY, LS, BA} is pinned by
+    // `runtime_file_access_is_ba_ls_sy_verify_only_while_legacy_keeps_write_dac`.
+    // (No ACE walk here: this contour adds no new `unsafe` sites.)
+    drop(created);
+    std::fs::remove_file(&created_path).unwrap_or_else(|_| unreachable!());
+
+    // (b) AlreadyExists with a wrong (user/inherited) ACL keeps failing
+    // closed: no silent re-ACL, and the file keeps its non-installer ACL.
+    let wrong_path = dir.join(format!("wrong-acl-{}", unique_suffix()));
+    std::fs::write(&wrong_path, b"user-owned").unwrap_or_else(|_| unreachable!());
+    let probe = std::fs::OpenOptions::new()
+        .read(true)
+        .open(&wrong_path)
+        .unwrap_or_else(|_| unreachable!());
+    assert!(
+        verify_readonly_acl(&probe, &expected).is_err(),
+        "fixture must carry a non-installer ACL"
+    );
+    drop(probe);
+    assert!(matches!(
+        open_runtime_file_with_share(&wrong_path, true, FILE_SHARE_READ | FILE_SHARE_WRITE),
+        Err(ProtectedPathError::AclMismatch)
+    ));
+    let after = std::fs::OpenOptions::new()
+        .read(true)
+        .open(&wrong_path)
+        .unwrap_or_else(|_| unreachable!());
+    assert!(
+        verify_readonly_acl(&after, &expected).is_err(),
+        "refused open must not re-ACL the file"
+    );
+    drop(after);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[cfg(windows)]
+#[test]
 fn protected_path_lease_rejects_directory_and_file_reparse_substitution() {
     use std::os::windows::fs::{symlink_dir, symlink_file};
 
