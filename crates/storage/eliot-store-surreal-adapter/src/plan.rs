@@ -9,15 +9,32 @@
 use std::collections::BTreeSet;
 
 use eliot_store_api::{
-    CommitId, EventId, EventProjectionRelationIntents, OrderingHead, OrderingScopeId, OutboxId,
-    OutboxIntent, OutboxState, PreparedTransition, ProjectionMode, ProjectionPublicationId,
-    ProjectionPublicationRecord, ProjectionStatus, RequestMeta, Resubmission, RevisionDelta,
-    RevisionHead, RevisionKey, SplitView, StoreError, WriteReceipt, WriteReceiptStatus,
-    canonical_json_bytes, issue_store_receipt_envelope, sha256_hex,
+    CommitId, EventId, EventProjectionRelationIntents, ExactJsonBytes, OrderingHead,
+    OrderingScopeId, OutboxId, OutboxIntent, OutboxState, PreparedTransition, ProjectionMode,
+    ProjectionPublicationId, ProjectionPublicationRecord, ProjectionStatus, RequestMeta,
+    Resubmission, RevisionDelta, RevisionHead, RevisionKey, SplitView, StoreError, WriteReceipt,
+    WriteReceiptStatus, canonical_json_bytes, issue_store_receipt_envelope, sha256_hex,
     validate_store_receipt_envelope,
 };
 
 use crate::error::AdapterError;
+
+/// Opaque payload-authority provenance for one named operation (issue #10).
+///
+/// This record carries identity only (version, encoding, digest, length):
+/// the exact bytes are persisted opaquely by the transaction writer, while
+/// every queryable body below stays a derivative projection. A plan with an
+/// empty `payload_authority` vector is a legacy transition with no claimed
+/// authority; its behavior is unchanged.
+#[derive(Clone, Debug)]
+pub(crate) struct PayloadAuthorityRecord {
+    pub(crate) operation_index: usize,
+    pub(crate) version: u16,
+    pub(crate) encoding: String,
+    pub(crate) digest_hex: String,
+    pub(crate) byte_len: usize,
+    pub(crate) bytes: Vec<u8>,
+}
 
 /// Planned durable effects of one committed transition.
 #[derive(Clone, Debug)]
@@ -34,10 +51,19 @@ pub(crate) struct ApplyPlan {
     pub(crate) outbox_records: Vec<OutboxIntent>,
     pub(crate) next_commit_sequence: u64,
     pub(crate) next_outbox_sequence: u64,
+    /// Per-operation payload authorities bound into this plan. Empty for
+    /// legacy transitions. Queryable `projection_records` and outbox bodies
+    /// are derivatives of these authorities, never replacements for them.
+    pub(crate) payload_authority: Vec<PayloadAuthorityRecord>,
 }
 
 /// Computes the durable effects of a transition from current heads and the
 /// store's next sequence values.
+///
+/// Legacy entry point: every operation claims no payload authority, so the
+/// plan carries no authority records and all digests keep their historical
+/// values. Authority-carrying callers use
+/// [`plan_apply_with_payload_authority`].
 pub(crate) fn plan_apply(
     transition: &PreparedTransition,
     current_revision_heads: &[RevisionHead],
@@ -45,7 +71,36 @@ pub(crate) fn plan_apply(
     next_commit_sequence: u64,
     next_outbox_sequence: u64,
 ) -> Result<ApplyPlan, StoreError> {
+    let authorities: Vec<Option<ExactJsonBytes>> = vec![None; transition.named_operations.len()];
+    plan_apply_with_payload_authority(
+        transition,
+        &authorities,
+        current_revision_heads,
+        current_ordering_heads,
+        next_commit_sequence,
+        next_outbox_sequence,
+    )
+}
+
+/// Plans one committed transition with per-operation payload authorities
+/// bound in (issue #10, Wave C).
+///
+/// `authorities` aligns 1:1 with `transition.named_operations`: `Some`
+/// entries are revalidated and must decode to exactly the operation's
+/// queryable parameters, `None` entries mean that operation claims no
+/// authority. When at least one authority is present, the outbox payload
+/// digest binds every authority digest on top of the whole-transition
+/// digest; legacy all-`None` plans keep the exact historical digest.
+pub(crate) fn plan_apply_with_payload_authority(
+    transition: &PreparedTransition,
+    authorities: &[Option<ExactJsonBytes>],
+    current_revision_heads: &[RevisionHead],
+    current_ordering_heads: &[OrderingHead],
+    next_commit_sequence: u64,
+    next_outbox_sequence: u64,
+) -> Result<ApplyPlan, StoreError> {
     transition.validate()?;
+    let records = payload_authority_records(transition, authorities)?;
     let commit_sequence = next_commit_sequence;
     let committed_at = format!("commit-sequence-{next_commit_sequence:016}");
     let next_commit_sequence =
@@ -93,10 +148,11 @@ pub(crate) fn plan_apply(
         &operation_key,
     )?;
     let command_ids = command_ids(transition, &operation_key);
-    let payload_digest = sha256_hex(
-        &canonical_json_bytes(transition)
-            .map_err(|error| StoreError::Serialization(error.to_string()))?,
-    );
+    let payload_digest = if records.is_empty() {
+        transition_payload_digest(transition)?
+    } else {
+        bound_payload_digest(transition, &records)?
+    };
     let projection_records =
         projection_records(transition, &operation_key, &commit_id, &next_revision_heads)?;
     let (outbox_records, next_outbox_sequence) = outbox_records(
@@ -120,7 +176,77 @@ pub(crate) fn plan_apply(
         outbox_records,
         next_commit_sequence,
         next_outbox_sequence,
+        payload_authority: records,
     })
+}
+
+/// Validates per-operation payload authorities against the transition's
+/// queryable parameters and renders their plan records.
+///
+/// Length, digest, duplicate-key, control-field, and narrowing checks all
+/// run here, before any durable effect is planned: a mismatched authority
+/// fails the plan instead of reaching the transaction writer.
+fn payload_authority_records(
+    transition: &PreparedTransition,
+    authorities: &[Option<ExactJsonBytes>],
+) -> Result<Vec<PayloadAuthorityRecord>, StoreError> {
+    if authorities.len() != transition.named_operations.len() {
+        return Err(StoreError::InvalidField {
+            field: "payload.authority",
+            reason: "payload authority count does not match named operations",
+        });
+    }
+    let mut records = Vec::new();
+    for (index, (operation, authority)) in transition
+        .named_operations
+        .iter()
+        .zip(authorities.iter())
+        .enumerate()
+    {
+        if let Some(authority) = authority {
+            authority.validate()?;
+            let decoded = authority.decode_object_parameters()?;
+            if decoded != operation.parameters {
+                return Err(StoreError::InvalidField {
+                    field: "payload.authority",
+                    reason: "payload authority does not match named-operation parameters",
+                });
+            }
+            records.push(PayloadAuthorityRecord {
+                operation_index: index,
+                version: authority.version,
+                encoding: authority.encoding.mnemonic().to_owned(),
+                digest_hex: authority.digest_hex(),
+                byte_len: authority.byte_len(),
+                bytes: authority.bytes.clone(),
+            });
+        }
+    }
+    Ok(records)
+}
+
+/// Whole-transition digest used when no payload authority is claimed.
+/// Computed in exactly one place so legacy and bound plans agree on the
+/// base value.
+fn transition_payload_digest(transition: &PreparedTransition) -> Result<String, StoreError> {
+    Ok(sha256_hex(&canonical_json_bytes(transition).map_err(
+        |error| StoreError::Serialization(error.to_string()),
+    )?))
+}
+
+/// Binds per-operation payload-authority digests over the
+/// whole-transition digest. The base digest keeps its historical value; the
+/// bound digest additionally covers every authority digest in operation
+/// order, so a substituted authority can never reuse a bound outbox row.
+fn bound_payload_digest(
+    transition: &PreparedTransition,
+    records: &[PayloadAuthorityRecord],
+) -> Result<String, StoreError> {
+    let mut material = transition_payload_digest(transition)?;
+    for record in records {
+        material.push_str(&record.digest_hex);
+    }
+    Ok(sha256_hex(material.as_bytes()))
 }
 
 /// Builds and validates the immutable write receipt for a planned transition.
@@ -240,6 +366,13 @@ fn command_ids(transition: &PreparedTransition, operation_key: &str) -> Vec<Stri
         .collect()
 }
 
+/// Derives queryable projection publications for a transition.
+///
+/// These records are explicitly derivatives: when a plan carries payload
+/// authorities, the opaque authority bytes (persisted alongside the receipt)
+/// are the lossless representation and these projections must never be used
+/// to reconstruct payload content. Any authority/projection disagreement is
+/// a typed error at the read boundary, never a silent fallback.
 fn projection_records(
     transition: &PreparedTransition,
     operation_key: &str,

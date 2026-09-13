@@ -1,0 +1,161 @@
+schema = "eliot.agent-work-unit.v1"
+authority = "NON_NORMATIVE_REGRESSION_ALLOCATION"
+routing_authority = "owning_issue_and_normative_pair_only"
+status = "READY_FOR_CURRENT_STORE_EDGE_REPRODUCTION"
+implementation_support = "TYPED_JSON_RPC_PATH_AND_SELECTIVE_LOSSLESS_LEGACY_FIELD_PRESENT_GENERIC_EDGE_UNPROVED"
+evidence_execution_status = "CURRENT_WRITE_READ_AND_LEGACY_MITIGATION_PATHS_INSPECTED_LIVE_SURREAL_RUN_NOT_EXECUTED"
+proof_ceiling = "ARBITRARY_JSON_STORE_EDGE_CANDIDATE_ONLY"
+issue = 10
+store_generation_issue = 19
+storage_portability_issue = 1113
+verification_profile_issue = 750
+store_provider_issue = 909
+parent_product_issue = 11
+base_branch = "main"
+base_sha = "8ebf8b41847391c340393d56aeb14dd4f2b5e37b"
+normative_pair_ref = "docs/normative-pair.toml"
+
+[approved_store_artifact]
+lock_path = "docs/release/SURREALDB_WINDOWS_X64.lock.json"
+version = "3.1.4"
+architecture = "windows-x64"
+pe_machine = "8664"
+sha256 = "13781bc97db9348498bd6b5e0090cf2770e9d296640be8adacf73956e8a568a1"
+
+[work_unit]
+cell_id = "regression.store-arbitrary-json-authority-and-readback"
+causal_property = "One accepted application JSON payload acquires one versioned vendor-neutral authoritative representation and digest before the Store-provider boundary; commit, direct read, governed L2/read model and applicable export/import preserve either exact admitted bytes or exact declared canonical JSON semantics without record coercion, duplicate-key collapse, numeric narrowing, null/absence conflation or control-field injection."
+current_discriminator = "The current store-neutral requests carry BTreeMap<String, serde_json::Value>; PreparedTransition is converted with serde_json::to_value and sent through JSON-RPC variables to SurrealDB. The legacy Store selectively stores receipt_body_json_b64 beside a queryable receipt_body projection, but no generic current-path proof covers all observation, evidence, claim, verification and failure payloads. The historical SurrealDB 3.1.4 record-like string coercion has not yet been reproduced or refuted on this exact main/artifact/schema path."
+primary_issue_url = "https://github.com/UnknownAlienHuman/eliot-memory-os/issues/10"
+
+[documentation]
+implementation = [
+  "https://github.com/UnknownAlienHuman/eliot-memory-os/blob/main/docs/architecture/I05-01-store-boundary.md#i51-store-boundary",
+  "https://github.com/UnknownAlienHuman/eliot-memory-os/blob/main/docs/architecture/I05-19-write-submission-execution-and-receipts.md#i519-write-submission-execution-and-receipts",
+  "https://github.com/UnknownAlienHuman/eliot-memory-os/blob/main/docs/architecture/I05-20-read-model-consistency-and-cache.md#i520-read-model-consistency-and-cache",
+  "https://github.com/UnknownAlienHuman/eliot-memory-os/blob/main/docs/architecture/I05-27-canonical-operation-identity-and-effect-identity.md#i527-canonical-operation-identity-and-effect-identity",
+  "https://github.com/UnknownAlienHuman/eliot-memory-os/blob/main/docs/architecture/I07-02-frame.md#i72-frame",
+  "https://github.com/UnknownAlienHuman/eliot-memory-os/blob/main/docs/architecture/I07-20-agent-facing-error-contract.md#i720-agent-facing-error-contract",
+  "https://github.com/UnknownAlienHuman/eliot-memory-os/blob/main/docs/architecture/I14-21-unknown-commit-recovery.md#i1421-unknown-commit-recovery",
+  "https://github.com/UnknownAlienHuman/eliot-memory-os/blob/main/docs/architecture/I15-01-input-validation-and-trust-boundaries.md#i151-input-validation-and-trust-boundaries",
+]
+anchors = ["ARCH-SEC-02", "ARCH-ORD-01", "ARCH-OBS-01", "ARCH-RES-03", "ARCH-RES-04"]
+
+[current_source]
+confirmed = [
+  "NamedMutationRequest and NamedReadRequest expose BTreeMap<String, serde_json::Value> parameters; any duplicate object member is already unrecoverable after ordinary Value/map decoding.",
+  "The store-neutral canonical request digest is computed after conversion into serde_json::Value, not from an authoritative original payload byte representation.",
+  "eliot-store-surreal-adapter serializes PreparedTransition with serde_json::to_value and sends JSON-RPC query variables as serde_json::Value through the SurrealDB RPC client.",
+  "The current adapter decodes provider responses through serde_json::Value, so exact lexical payload bytes are not independently retained by the public current Store edge.",
+  "Legacy eliot-store canonical records may store both receipt_body and receipt_body_json_b64; CanonicalRecord prefers the encoded field and falls back to the legacy projection.",
+  "The encoded legacy field is selective and downstream-specific; it does not prove one generic vendor-neutral owner across every active arbitrary-payload family or current named-operation path.",
+  "Current isolated artifact policy pins SurrealDB 3.1.4 Windows x64 with the exact digest recorded above.",
+  "Historical record-like string truncation is retained by Issue #10 as a discriminator, not assumed current truth.",
+]
+
+[scope]
+primary_paths = [
+  "crates/storage/eliot-store-api/src/** exact payload representation, validation, digest and receipt spans",
+  "crates/storage/eliot-store-surreal-adapter/src/apply/atomic_write.rs",
+  "crates/storage/eliot-store-surreal-adapter/src/client.rs only exact JSON-RPC binding/readback spans",
+  "bins/eliot-store-surreal/src/request_dispatch.rs only if exact ingress bytes/versioning must cross the service boundary",
+  "crates/eliot-store/src/canonical_record.rs, canonical_store.rs and surql/apply_write_envelope.surql only for accepted legacy migration/reconciliation",
+  "exact direct-read, governed L2/read-model and ECXF/export-import consumers required by the regression",
+  "directly relevant tests and finite adversarial JSON fixtures",
+]
+serialized_dependencies = [
+  "#19 Store bridge/generation owner",
+  "#1113 ECXF/backup/restore portability",
+  "#909 isolated SurrealDB provider",
+  "#750 locked verification profiles",
+  "#11 installed Product proof",
+]
+forbidden = [
+  "assuming the historical coercion remains current without an exact live reproduction",
+  "calling serde_json::Value reserialization byte-exact unless canonical JSON mode explicitly owns that semantics",
+  "per-kind ad hoc encodings or a second protected-payload owner",
+  "raw SurrealDB/provider value types in the public Store contract",
+  "generic query or raw SurrealQL expansion",
+  "using application JSON fields as operation, Session, StateFence, authority, deadline, receipt or idempotency control input",
+  "guessing missing historical suffixes or reconstructing corrupted values from shape/similarity",
+  "blind retry after possible commit",
+  "weakening Store schemas, identity checks, proof ceilings or Product requirements",
+  "automatic workflow triggers",
+]
+
+[[waves]]
+id = "A"
+what = "Freeze the exact current transport and reproduce or refute the historical matrix."
+how = [
+  "Record source/tree, Store API/bridge/server artifact, JSON library/features, JSON-RPC protocol, schema/migration, namespace/database, operation manifest, source/build receipt and direct/L2/export reader identities.",
+  "Run the pinned SurrealDB 3.1.4 artifact through #909 using one disposable authenticated namespace/database and exact same-source bridge binaries.",
+  "Exercise historical top-level, nested-object and array values plus adversarial record-like, UUID-like, URL, Windows-path, Unicode, escaped-control, empty and scalar variants across every active arbitrary-payload family.",
+  "If current behavior is lossless, retain exact refutation evidence and add only missing contract/regression coverage; do not add an unnecessary workaround.",
+]
+
+[[waves]]
+id = "B"
+what = "Define one authoritative vendor-neutral payload representation before provider materialization."
+how = [
+  "Use a closed versioned payload mode: ExactJsonBytes when original admitted bytes are semantically required, or CanonicalJson when deterministic canonical JSON semantics are declared by the caller contract.",
+  "Bind representation version, media/type profile, encoded length, content digest, canonicalization profile and source identity before converting anything to provider query values.",
+  "Reject duplicate object keys before map collapse in canonical mode; do not silently choose first or last value.",
+  "Preserve supported integers/decimals without routing through f64; values outside the declared numeric domain fail before admission rather than narrowing or rounding.",
+  "Preserve null, absent, false, zero, empty string, empty array and empty object as distinct states wherever the owning operation schema accepts them.",
+]
+
+[[waves]]
+id = "C"
+what = "Store authoritative bytes separately from query-friendly projections and bind receipts/readback."
+how = [
+  "Transmit the authoritative representation through a proved opaque encoding or Blob/payload field that SurrealDB cannot reinterpret as a record, while retaining queryable object/scalar projections only as explicitly non-authoritative derivatives.",
+  "Generalize or migrate the selective receipt_body_json_b64 mechanism into the one accepted payload owner; do not leave overlapping per-kind encoders.",
+  "Bind WriteSubmission, named operation, WriteReceipt, canonical record/blob identity, authoritative payload digest, projection digest, provider operation and readback result under the same OperationId/StateFence.",
+  "Direct ID read, exact governed L2/read model and applicable export/import must verify the authoritative representation before returning payload data.",
+  "Projection disagreement, missing authoritative bytes, digest mismatch or unsupported legacy row remains typed partial/corrupt/unverified rather than falling back silently.",
+]
+
+[[waves]]
+id = "D"
+what = "Close replay, migration, historical disposition and exhaustive real-edge proof."
+how = [
+  "Exact same-operation replay returns the same receipt and authoritative digest; changed payload/mode/version under one identity is IDENTITY_CONFLICT.",
+  "Timeout/disconnect after possible commit remains UNKNOWN_OUTCOME and reconciles the exact operation/readback before retry.",
+  "Inventory potentially affected historical records through an evidence-backed schema/time/writer/path predicate and classify each as exact-reconstructable, exact-refuted-safe, unreconstructable-corrupt/stale or outside scope.",
+  "Reconstruct only from exact canonical/external source bytes; never infer truncated suffixes.",
+  "Carry authoritative payload bytes/digest, tombstone/revocation and omission disposition through #1113 export/import/migration before declaring round-trip support.",
+  "Run package tests plus one real pinned-Surreal direct-write/direct-read/L2/export round trip with provider-side projection coercion detection.",
+]
+
+[acceptance]
+criteria = [
+  "The historical matrix is first reproduced or explicitly refuted on one exact current source/bridge/server/schema/namespace identity.",
+  "Top-level, nested-object and array record-like strings preserve the exact admitted payload representation through commit, direct read and governed L2/read model.",
+  "Observation/tool, evidence, claim, verification and failure payload families share one authoritative representation owner and regression corpus.",
+  "ExactJsonBytes returns byte-identical payload bytes; CanonicalJson returns byte-identical canonical bytes under one versioned profile and does not claim original lexical-byte identity.",
+  "Duplicate keys are rejected before map collapse; first-wins/last-wins behavior is impossible.",
+  "Supported wide integers and decimals are not narrowed through f64; unsupported ranges fail before write with a typed error.",
+  "Null, absent, false, zero, empty string, empty array and empty object remain distinguishable according to the owning schema.",
+  "Record-shaped strings, UUID-looking values, URLs, Windows paths, Unicode and escaped controls cannot be retyped by SurrealDB or materialized projections.",
+  "Application payload fields cannot override operation, Session, task/WorkScope, StateFence, authority, deadline, idempotency, receipt or projection metadata.",
+  "Queryable Surreal objects/scalars are explicitly non-authoritative and disagreement with authoritative bytes is surfaced as corruption/conflict.",
+  "WriteReceipt and every accepted readback bind the exact authoritative digest, payload mode/version, operation, fence, record/blob and provider identities.",
+  "Exact replay is idempotent; changed same-identity payload/mode/version conflicts.",
+  "Unknown commit is reconciled before retry and cannot become not-attempted, successful absence or a second write.",
+  "Legacy rows without verified authoritative bytes are explicitly legacy-projection-only/unverified; no fallback is called lossless.",
+  "Historical affected records receive exact reconstructable/refuted/unreconstructable/out-of-scope dispositions and guessed reconstruction is impossible.",
+  "Applicable ECXF/export/import preserves authoritative bytes/digest and cannot regenerate payload from a coerced projection.",
+  "Real pinned SurrealDB 3.1.4 proof passes; in-memory/fake-store tests alone are insufficient.",
+  "No provider type, raw query, schema weakening, alternate canonical writer, authority or Finish ownership is introduced.",
+]
+
+[verification]
+commands = [
+  "cargo fmt --all -- --check",
+  "cargo check --locked -p eliot-store-api -p eliot-store-surreal-adapter -p eliot-store-surreal -p eliot-store -p eliot-ecxf --all-targets for packages retained in the accepted current/legacy split",
+  "cargo test --locked -p eliot-store-api -p eliot-store-surreal-adapter -p eliot-store-surreal -p eliot-store -p eliot-ecxf --all-targets for packages retained in the accepted current/legacy split",
+  "cargo clippy --locked -p eliot-store-api -p eliot-store-surreal-adapter -p eliot-store-surreal -p eliot-store -p eliot-ecxf --all-targets -- -D warnings for packages retained in the accepted current/legacy split",
+  "git diff --check",
+]
+live_evidence = "Using #909, run the complete matrix through the pinned SurrealDB 3.1.4 bridge, verify direct and L2 reads and one applicable export/import round trip, and attach nonsecret source/artifact/schema/operation/receipt/readback identities to the Issue/PR artifact."
+product_proof = "This proves one arbitrary-payload Store edge only; complete Store generation, portability and installed Product proof remain #19/#1113/#11."

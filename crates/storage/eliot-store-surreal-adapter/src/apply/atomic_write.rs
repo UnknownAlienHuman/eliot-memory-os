@@ -12,7 +12,7 @@ use serde_json::{Map, Value, json};
 use crate::client;
 use crate::config::SurrealAdapterConfig;
 use crate::error::AdapterError;
-use crate::plan::ApplyPlan;
+use crate::plan::{ApplyPlan, PayloadAuthorityRecord};
 use crate::schema;
 use eliot_store_api::{OrderingHead, RevisionHead, WriteReceipt};
 
@@ -222,6 +222,12 @@ pub(super) async fn write_transaction(
             "operation_id": receipt.operation_id.to_string(),
             "idempotency_key": receipt.idempotency_key,
             "body": to_value(receipt)?,
+            // Opaque payload authorities (issue #10): exact versioned,
+            // digest-bound bytes persisted alongside — never inside —
+            // the queryable `body` projections above. An empty array means
+            // the transition claimed no authority; receipt `body` readback
+            // selects `body` only, so this field changes no read path.
+            "payload_authority": payload_authority_binding(&plan.payload_authority)?,
         }),
     );
 
@@ -259,6 +265,35 @@ fn is_transaction_conflict(error: &str) -> bool {
 
 pub(super) fn to_value<T: Serialize>(value: &T) -> Result<Value, AdapterError> {
     serde_json::to_value(value).map_err(|error| AdapterError::Serialization(error.to_string()))
+}
+
+/// Renders the opaque payload-authority array for the receipt record
+/// binding (issue #10, Wave C).
+///
+/// Each entry carries the authority identity (operation index, version,
+/// encoding, digest, length) plus the exact UTF-8 bytes as one opaque
+/// string scalar. Bytes that are not valid UTF-8 JSON fail closed here
+/// instead of being lossily coerced into the binding.
+fn payload_authority_binding(records: &[PayloadAuthorityRecord]) -> Result<Value, AdapterError> {
+    records
+        .iter()
+        .map(|record| {
+            let bytes_utf8 = String::from_utf8(record.bytes.clone()).map_err(|_| {
+                AdapterError::Serialization(
+                    "payload authority bytes are not valid UTF-8 JSON".to_owned(),
+                )
+            })?;
+            Ok(json!({
+                "operation_index": record.operation_index,
+                "version": record.version,
+                "encoding": record.encoding,
+                "digest_hex": record.digest_hex,
+                "byte_len": record.byte_len,
+                "bytes_utf8": bytes_utf8,
+            }))
+        })
+        .collect::<Result<Vec<_>, AdapterError>>()
+        .map(Value::Array)
 }
 
 pub(super) fn revision_write_template(initial_state: bool, exists: bool) -> &'static str {
