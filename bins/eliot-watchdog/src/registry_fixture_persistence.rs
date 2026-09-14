@@ -26,11 +26,12 @@ use eliot_installation::{
     RuntimeStateRoots, phase_b_scm_selector,
 };
 use eliot_platform_windows::{
-    ELIOT_HOST_SERVICE_DISPLAY_NAME, ELIOT_HOST_SERVICE_NAME,
-    ELIOT_WATCHDOG_HOST_CONTROL_ACCESS_MASK, ELIOT_WATCHDOG_SERVICE_DISPLAY_NAME,
-    ELIOT_WATCHDOG_SERVICE_NAME, InstallerRootPrimitiveSpec, InstallerRootProfile, ServiceAccount,
-    ServiceBootstrapArguments, ServiceRegistrationRequest, ServiceStartMode,
-    WindowsInstallerRootPrimitive, prepare_protected_directory,
+    ELIOT_HOST_SERVICE_CONTROL_ACCESS_MASK, ELIOT_HOST_SERVICE_DISPLAY_NAME,
+    ELIOT_HOST_SERVICE_NAME, ELIOT_WATCHDOG_HOST_CONTROL_ACCESS_MASK,
+    ELIOT_WATCHDOG_SERVICE_DISPLAY_NAME, ELIOT_WATCHDOG_SERVICE_NAME, InstallerRootPrimitiveSpec,
+    InstallerRootProfile, ServiceAccount, ServiceBootstrapArguments, ServiceRegistrationRequest,
+    ServiceStartMode, WindowsInstallerRootPrimitive, host_service_security_descriptor_digest,
+    prepare_protected_directory,
     test_support::{self, ProtectedRootOverride},
     watchdog_service_security_descriptor_digest,
 };
@@ -505,7 +506,15 @@ impl RegistryFixture {
         )
         .unwrap_or_else(|error| panic!("invalid service approval request: {error}"));
         let service_control_grant = if host {
-            Value::Null
+            let principal_sid = "S-1-5-80-1-2-3-4-5";
+            let security_descriptor_digest = host_service_security_descriptor_digest(principal_sid)
+                .unwrap_or_else(|error| panic!("Host control-grant fixture: {error}"));
+            json!({
+                "principal_service": ELIOT_HOST_SERVICE_NAME,
+                "principal_sid": principal_sid,
+                "access_mask": ELIOT_HOST_SERVICE_CONTROL_ACCESS_MASK,
+                "security_descriptor_digest": security_descriptor_digest,
+            })
         } else {
             let principal_sid = "S-1-5-80-1-2-3-4-5";
             let security_descriptor_digest =

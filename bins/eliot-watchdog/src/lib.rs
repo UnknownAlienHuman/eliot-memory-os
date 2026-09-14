@@ -921,7 +921,22 @@ mod tests {
             ),
         };
         let service_control_grant = match role {
-            InstallerServiceRole::Host => serde_json::Value::Null,
+            InstallerServiceRole::Host => {
+                let principal_sid = "S-1-5-80-1-2-3-4-5";
+                let security_descriptor_digest =
+                    match eliot_platform_windows::host_service_security_descriptor_digest(
+                        principal_sid,
+                    ) {
+                        Ok(digest) => digest,
+                        Err(error) => panic!("Host control-grant fixture: {error}"),
+                    };
+                serde_json::json!({
+                    "principal_service": eliot_platform_windows::ELIOT_HOST_SERVICE_NAME,
+                    "principal_sid": principal_sid,
+                    "access_mask": eliot_platform_windows::ELIOT_HOST_SERVICE_CONTROL_ACCESS_MASK,
+                    "security_descriptor_digest": security_descriptor_digest,
+                })
+            }
             InstallerServiceRole::Watchdog => {
                 let principal_sid = "S-1-5-80-1-2-3-4-5";
                 let security_descriptor_digest =
