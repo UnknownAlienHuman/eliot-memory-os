@@ -309,10 +309,14 @@ pub(crate) struct AdmittedSwarmProvider {
     receipt_ref: String,
 }
 
+// RECHECK-265: composition admission seam wired once live catalogue bytes exist.
+#[allow(dead_code)]
 fn valid_binding_text(value: &str) -> bool {
     !value.trim().is_empty() && !value.chars().any(char::is_control)
 }
 
+// RECHECK-265: composition admission seam wired once live catalogue bytes exist.
+#[allow(dead_code)]
 fn valid_binding_digest(value: &str) -> bool {
     value.len() == 64
         && value
@@ -320,6 +324,8 @@ fn valid_binding_digest(value: &str) -> bool {
             .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
 }
 
+// RECHECK-265: composition admission seam wired once live catalogue bytes exist.
+#[allow(dead_code)]
 impl AdmittedSwarmProvider {
     pub(crate) fn new(
         slot: SwarmProviderSlot,
@@ -371,6 +377,8 @@ impl GovernorSwarmProjection {
     /// port. Each binding is validated fail-closed; re-admitting an identical
     /// binding is an idempotent replay, while a changed binding under an
     /// already-admitted slot is an identity conflict that mutates nothing.
+    // RECHECK-265: composition admission point wired once live catalogue bytes exist.
+    #[allow(dead_code)]
     pub(crate) fn with_admitted_providers(
         snapshot: Arc<ControlBoardGovernorSnapshot>,
         admitted: Vec<AdmittedSwarmProvider>,

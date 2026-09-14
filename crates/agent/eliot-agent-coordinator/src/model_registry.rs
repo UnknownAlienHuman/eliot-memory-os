@@ -1333,6 +1333,35 @@ fn provider_evidence_refs(
 /// Layers one independent check per provider/account axis. Each check reads
 /// only its own axis: a passing rate-limit axis never clears a saturated
 /// concurrency axis, and a stale window surfaces as stale rather than ready.
+fn provider_row_identity_check(
+    row: &ProviderAccountRow,
+    refs: Vec<String>,
+    now_unix_ms: u64,
+) -> HardCheck {
+    if !row.is_current(now_unix_ms) {
+        check(
+            "provider_account",
+            CheckDisposition::Stale,
+            "provider account row evidence is stale",
+            refs,
+        )
+    } else if !row.invalidation.is_empty() {
+        check(
+            "provider_account",
+            CheckDisposition::Fail,
+            "provider account row is invalidated by its owner",
+            refs,
+        )
+    } else {
+        check(
+            "provider_account",
+            CheckDisposition::Pass,
+            "provider account row bound to this route",
+            refs,
+        )
+    }
+}
+
 fn provider_account_checks(
     accounts: &ProviderAccountCatalogueSnapshot,
     row: Option<&ProviderAccountRow>,
@@ -1359,36 +1388,15 @@ fn provider_account_checks(
         return checks;
     };
     let refs = provider_evidence_refs(accounts, Some(row));
-    if !row.is_current(now_unix_ms) {
-        checks.push(check(
-            "provider_account",
-            CheckDisposition::Stale,
-            "provider account row evidence is stale",
-            refs.clone(),
-        ));
-    } else if !row.invalidation.is_empty() {
-        checks.push(check(
-            "provider_account",
-            CheckDisposition::Fail,
-            "provider account row is invalidated by its owner",
-            refs.clone(),
-        ));
-    } else {
-        checks.push(check(
-            "provider_account",
-            CheckDisposition::Pass,
-            "provider account row bound to this route",
-            refs.clone(),
-        ));
-    }
-    let rate_limit = if !row.rate_limit.is_current(now_unix_ms) {
-        CheckDisposition::Stale
-    } else {
+    checks.push(provider_row_identity_check(row, refs.clone(), now_unix_ms));
+    let rate_limit = if row.rate_limit.is_current(now_unix_ms) {
         match row.rate_limit.effective(now_unix_ms) {
             RateLimitDisposition::Ready => CheckDisposition::Pass,
             RateLimitDisposition::Limited => CheckDisposition::Fail,
             RateLimitDisposition::Unknown => CheckDisposition::Missing,
         }
+    } else {
+        CheckDisposition::Stale
     };
     checks.push(check(
         "provider_rate_limit",
@@ -1396,14 +1404,14 @@ fn provider_account_checks(
         "provider rate-limit/backoff evidence",
         refs.clone(),
     ));
-    let concurrency = if !row.concurrency.is_current(now_unix_ms) {
-        CheckDisposition::Stale
-    } else {
+    let concurrency = if row.concurrency.is_current(now_unix_ms) {
         match row.concurrency.effective(now_unix_ms) {
             ConcurrencyDisposition::Available => CheckDisposition::Pass,
             ConcurrencyDisposition::Saturated => CheckDisposition::Fail,
             ConcurrencyDisposition::Unknown => CheckDisposition::Missing,
         }
+    } else {
+        CheckDisposition::Stale
     };
     checks.push(check(
         "provider_concurrency",
@@ -1411,14 +1419,14 @@ fn provider_account_checks(
         "provider concurrency evidence",
         refs.clone(),
     ));
-    let incident = if !row.incident.is_current(now_unix_ms) {
-        CheckDisposition::Stale
-    } else {
+    let incident = if row.incident.is_current(now_unix_ms) {
         match row.incident.effective(now_unix_ms) {
             IncidentDisposition::None => CheckDisposition::Pass,
             IncidentDisposition::Degraded | IncidentDisposition::Outage => CheckDisposition::Fail,
             IncidentDisposition::Unknown => CheckDisposition::Missing,
         }
+    } else {
+        CheckDisposition::Stale
     };
     checks.push(check(
         "provider_incident",
@@ -1426,9 +1434,7 @@ fn provider_account_checks(
         "provider incident evidence",
         refs.clone(),
     ));
-    let auth = if !row.auth.is_current(now_unix_ms) {
-        CheckDisposition::Stale
-    } else {
+    let auth = if row.auth.is_current(now_unix_ms) {
         match row.auth.effective(now_unix_ms) {
             AuthDisposition::Bound => CheckDisposition::Pass,
             AuthDisposition::Expired | AuthDisposition::Revoked | AuthDisposition::Conflicted => {
@@ -1436,6 +1442,8 @@ fn provider_account_checks(
             }
             AuthDisposition::Unknown => CheckDisposition::Missing,
         }
+    } else {
+        CheckDisposition::Stale
     };
     checks.push(check(
         "provider_auth",

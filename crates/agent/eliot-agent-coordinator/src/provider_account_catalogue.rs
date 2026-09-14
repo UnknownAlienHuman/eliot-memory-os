@@ -304,13 +304,9 @@ impl IncidentObservation {
                 validate_text(reference, "provider_account.incident.incident_ref")?;
                 Ok(())
             }
-            (IncidentDisposition::Degraded | IncidentDisposition::Outage, None) => {
-                Err(ProviderAccountCatalogueError::InvalidField(
-                    "provider_account.incident.incident_ref",
-                ))
-            }
             (IncidentDisposition::None | IncidentDisposition::Unknown, None) => Ok(()),
-            (IncidentDisposition::None | IncidentDisposition::Unknown, Some(_)) => {
+            (IncidentDisposition::Degraded | IncidentDisposition::Outage, None)
+            | (IncidentDisposition::None | IncidentDisposition::Unknown, Some(_)) => {
                 Err(ProviderAccountCatalogueError::InvalidField(
                     "provider_account.incident.incident_ref",
                 ))
@@ -515,10 +511,7 @@ impl ProviderAccountRow {
         now_unix_ms >= self.observed_at_unix_ms && now_unix_ms <= self.expires_at_unix_ms
     }
 
-    /// Computes row readiness without coercion: stale, conflicted, and unknown
-    /// evidence each surface under their own status with per-axis reasons.
-    #[must_use]
-    pub fn readiness(&self, now_unix_ms: u64) -> ProviderAccountReadiness {
+    fn stale_reasons(&self, now_unix_ms: u64) -> Vec<String> {
         let mut stale = Vec::new();
         if !self.is_current(now_unix_ms) {
             stale.push("provider_account:row_evidence_stale".to_owned());
@@ -541,6 +534,14 @@ impl ProviderAccountRow {
         if !self.auth.is_current(now_unix_ms) {
             stale.push("provider_account:auth_evidence_stale".to_owned());
         }
+        stale
+    }
+
+    /// Computes row readiness without coercion: stale, conflicted, and unknown
+    /// evidence each surface under their own status with per-axis reasons.
+    #[must_use]
+    pub fn readiness(&self, now_unix_ms: u64) -> ProviderAccountReadiness {
+        let stale = self.stale_reasons(now_unix_ms);
         if !stale.is_empty() {
             return ProviderAccountReadiness::Stale { reasons: stale };
         }
