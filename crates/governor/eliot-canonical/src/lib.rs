@@ -16,9 +16,9 @@ use eliot_contracts::{
     canonical_json_bytes, contract_identity as foundation_contract_identity,
 };
 use eliot_store_api::{
-    CanonicalStoreClient, EffectClass, EventProjectionRelationIntents, NamedMutationOperation,
-    NamedMutationRequest, OperationIdentity, OperationManifestDigest, OrderingHead,
-    OrderingHeadExpectation, PreparedTransition, ReadConsistency, RevisionHead,
+    CanonicalRequestView, CanonicalStoreClient, EffectClass, EventProjectionRelationIntents,
+    NamedMutationOperation, NamedMutationRequest, OperationIdentity, OperationManifestDigest,
+    OrderingHead, OrderingHeadExpectation, PreparedTransition, ReadConsistency, RevisionHead,
     RevisionHeadExpectation, ScopeId, ScopeRevisionView, SecurityContext, StoreConflictObservation,
     StoreError, StoreFailure, StoreFailureDisposition, StoreHealth, StoreMutationDisposition,
     StoreRecoveryAction, StoreRetryDirective, TransitionClass, WriteReceipt,
@@ -225,6 +225,9 @@ impl<'a> StoreRecoveryProjection<'a> {
             StoreError::InvalidReceipt => internal_defect_parts("INVALID_RECEIPT"),
             StoreError::IdentityConflict => {
                 conflict_parts("IDENTITY_CONFLICT", StoreRecoveryAction::None)
+            }
+            StoreError::TransitionDigestMismatch { .. } => {
+                conflict_parts("TRANSITION_DIGEST_MISMATCH", StoreRecoveryAction::None)
             }
             StoreError::ReceiptNotFound => {
                 deterministic_rejection_parts("RECEIPT_NOT_FOUND", ResolveWriteReceipt)
@@ -493,12 +496,37 @@ impl CanonicalWriteEnvelope {
     /// Computes the immutable request hash used by the store's idempotency
     /// boundary.  Expected heads are included, so changing the CAS contract
     /// cannot silently reuse an earlier semantic decision.
+    ///
+    /// This routes through the shared provider-neutral
+    /// [`eliot_store_api::canonical_request_hash`] over the
+    /// envelope-equivalent [`CanonicalRequestView`] (issue #63, RECHECK-63
+    /// slice A). The view is field-identical to the envelope, so the emitted
+    /// value is byte-identical to the previous envelope hash; Kernel/store
+    /// rebuild the same view from their transported apply values.
     pub fn canonical_request_hash(&self) -> Result<String, CanonicalError> {
-        let bytes = canonical_json_bytes(self).map_err(|_| CanonicalError::InvalidField {
-            field: "canonical_request",
-            reason: "cannot serialize canonical request",
-        })?;
-        Ok(eliot_contracts::sha256_hex(&bytes))
+        eliot_store_api::canonical_request_hash(&self.canonical_request_view())
+            .map_err(CanonicalError::Store)
+    }
+
+    /// Builds the shared provider-neutral hash input for this envelope.
+    fn canonical_request_view(&self) -> CanonicalRequestView {
+        CanonicalRequestView {
+            operation_id: self.operation_id.clone(),
+            request: self.request.clone(),
+            idempotency_key: self.idempotency_key.clone(),
+            scope_id: self.scope_id.clone(),
+            task_id: self.task_id.clone(),
+            transition_class: self.transition_class,
+            requested_effect_ceiling: self.requested_effect_ceiling,
+            admission_contract_set_digest: self.admission_contract_set_digest.clone(),
+            operation_manifest_digest: self.operation_manifest_digest.clone(),
+            semantic_commands: self.semantic_commands.clone(),
+            event_projection_relation_intents: self.event_projection_relation_intents.clone(),
+            security: self.security.clone(),
+            required_proof_and_approval_refs: self.required_proof_and_approval_refs.clone(),
+            expected_revision_heads: self.expected_revision_heads.clone(),
+            expected_ordering_heads: self.expected_ordering_heads.clone(),
+        }
     }
 
     /// Converts the admitted envelope to the one shared prepared-transition
@@ -1122,4 +1150,135 @@ pub fn contract_identity() -> Result<ContractIdentity, CanonicalError> {
         }),
     )
     .map_err(CanonicalError::Foundation)
+}
+
+#[cfg(test)]
+#[allow(clippy::expect_used)]
+mod tests {
+    use super::*;
+    use eliot_store_api::{EventId, OrderingScopeId, RevisionKey};
+    use std::collections::BTreeMap;
+
+    fn test_fence() -> StateFence {
+        use eliot_contracts::{EpochId, EpochLineageId, ResourceGeneration};
+        use std::num::NonZeroU64;
+        let lineage = EpochLineageId::new("550e8400-e29b-41d4-a716-446655440000")
+            .expect("canonical test lineage-A");
+        let epoch = EpochId::new(lineage, NonZeroU64::new(1).expect("non-zero")).expect("epoch");
+        StateFence::new(epoch, ResourceGeneration::genesis())
+    }
+
+    fn test_request(fence: &StateFence) -> RequestMetadata {
+        RequestMetadata {
+            request_id: eliot_contracts::RequestId::new("request-byte-identity")
+                .expect("request id"),
+            session_id: None,
+            task_id: None,
+            product_id: eliot_contracts::ProductId::new("product-byte-identity")
+                .expect("product id"),
+            source_id: eliot_contracts::SourceId::new("source-byte-identity").expect("source id"),
+            state_fence: fence.clone(),
+            clock: eliot_contracts::ClockReading::default(),
+        }
+    }
+
+    /// Pre-slice envelope hash logic, kept here as the byte-identity oracle:
+    /// canonical JSON of the envelope itself, then SHA-256 hex.
+    fn legacy_envelope_hash(envelope: &CanonicalWriteEnvelope) -> String {
+        let bytes = canonical_json_bytes(envelope).expect("legacy envelope serializes");
+        eliot_contracts::sha256_hex(&bytes)
+    }
+
+    fn minimal_envelope(fence: &StateFence) -> CanonicalWriteEnvelope {
+        CanonicalWriteEnvelope {
+            operation_id: OperationId::new("op-byte-identity-min").expect("operation id"),
+            request: test_request(fence),
+            idempotency_key: "idem-byte-identity-min".to_owned(),
+            scope_id: ScopeId::new("scope-byte-identity").expect("scope"),
+            task_id: None,
+            transition_class: TransitionClass::CaptureCandidate,
+            requested_effect_ceiling: EffectClass::Candidate,
+            admission_contract_set_digest: "c".repeat(64),
+            operation_manifest_digest: OperationManifestDigest::new("manifest-byte-identity")
+                .expect("manifest digest"),
+            semantic_commands: vec![NamedMutationRequest {
+                operation: NamedMutationOperation::CaptureObservation,
+                parameters: BTreeMap::from([(
+                    "subject".to_owned(),
+                    serde_json::json!("observation-byte-identity"),
+                )]),
+            }],
+            event_projection_relation_intents: EventProjectionRelationIntents {
+                event_ids: Vec::new(),
+                projection_kinds: Vec::new(),
+                relation_kinds: Vec::new(),
+            },
+            security: SecurityContext::default(),
+            required_proof_and_approval_refs: Vec::new(),
+            expected_revision_heads: Vec::new(),
+            expected_ordering_heads: vec![OrderingHeadExpectation {
+                scope: OrderingScopeId::new("scope-byte-identity").expect("ordering scope"),
+                expected_sequence: 1,
+                state_fence: fence.clone(),
+            }],
+        }
+    }
+
+    #[test]
+    fn shared_request_hash_is_byte_identical_to_the_envelope_hash() {
+        let fence = test_fence();
+        let minimal = minimal_envelope(&fence);
+        assert_eq!(
+            minimal
+                .canonical_request_hash()
+                .expect("shared hash computes"),
+            legacy_envelope_hash(&minimal)
+        );
+
+        // Representative envelope: task binding, sorted multi-element heads,
+        // sorted proof refs, and event/projection/relation intents. Set-like
+        // collections are already in canonical order here, so the shared
+        // normalization is the identity and byte-identity must hold exactly.
+        let mut representative = minimal_envelope(&fence);
+        representative.operation_id =
+            OperationId::new("op-byte-identity-rep").expect("operation id");
+        representative.task_id = Some("task-byte-identity".to_owned());
+        representative.event_projection_relation_intents = EventProjectionRelationIntents {
+            event_ids: vec![
+                EventId::new("event-byte-identity-1").expect("event id"),
+                EventId::new("event-byte-identity-2").expect("event id"),
+            ],
+            projection_kinds: vec!["projection-a".to_owned(), "projection-b".to_owned()],
+            relation_kinds: vec!["relation-a".to_owned()],
+        };
+        representative.required_proof_and_approval_refs =
+            vec!["approval-1".to_owned(), "proof-1".to_owned()];
+        representative.expected_revision_heads = vec![
+            RevisionHeadExpectation {
+                key: RevisionKey::new("revision-a").expect("key"),
+                expected_revision: 1,
+                state_fence: fence.clone(),
+            },
+            RevisionHeadExpectation {
+                key: RevisionKey::new("revision-b").expect("key"),
+                expected_revision: 2,
+                state_fence: fence.clone(),
+            },
+        ];
+        assert_eq!(
+            representative
+                .canonical_request_hash()
+                .expect("shared hash computes"),
+            legacy_envelope_hash(&representative)
+        );
+
+        // prepare() routes through the same shared function.
+        let transition = representative.prepare().expect("envelope prepares");
+        assert_eq!(
+            transition.identity.canonical_request_hash,
+            representative
+                .canonical_request_hash()
+                .expect("shared hash recomputes")
+        );
+    }
 }

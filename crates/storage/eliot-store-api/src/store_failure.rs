@@ -416,6 +416,13 @@ impl StoreFailure {
                 StoreRetryDirective::NewIdentityAfterCondition,
                 StoreRecoveryAction::None,
             ),
+            StoreError::TransitionDigestMismatch { .. } => (
+                StoreFailureDisposition::Conflict,
+                "TRANSITION_DIGEST_MISMATCH",
+                StoreMutationDisposition::NotAttempted,
+                StoreRetryDirective::NewIdentityAfterCondition,
+                StoreRecoveryAction::None,
+            ),
             StoreError::ReceiptNotFound => (
                 StoreFailureDisposition::DeterministicRejection,
                 "RECEIPT_NOT_FOUND",

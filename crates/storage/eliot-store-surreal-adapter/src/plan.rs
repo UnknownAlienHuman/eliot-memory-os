@@ -9,12 +9,13 @@
 use std::collections::BTreeSet;
 
 use eliot_store_api::{
-    CommitId, EventId, EventProjectionRelationIntents, ExactJsonBytes, OrderingHead,
-    OrderingScopeId, OutboxId, OutboxIntent, OutboxState, PreparedTransition, ProjectionMode,
-    ProjectionPublicationId, ProjectionPublicationRecord, ProjectionStatus, RequestMeta,
-    Resubmission, RevisionDelta, RevisionHead, RevisionKey, SplitView, StoreError, WriteReceipt,
-    WriteReceiptStatus, canonical_json_bytes, issue_store_receipt_envelope, sha256_hex,
-    validate_store_receipt_envelope,
+    CanonicalRequestView, CommitId, EventId, EventProjectionRelationIntents, ExactJsonBytes,
+    OrderingHead, OrderingHeadExpectation, OrderingScopeId, OutboxId, OutboxIntent, OutboxState,
+    PreparedTransition, ProjectionMode, ProjectionPublicationId, ProjectionPublicationRecord,
+    ProjectionStatus, RequestMeta, Resubmission, RevisionDelta, RevisionHead,
+    RevisionHeadExpectation, RevisionKey, SplitView, StoreError, WriteReceipt, WriteReceiptStatus,
+    canonical_json_bytes, canonical_request_hash, issue_store_receipt_envelope, sha256_hex,
+    validate_store_receipt_envelope, verify_canonical_request_hash,
 };
 
 use crate::error::AdapterError;
@@ -356,6 +357,139 @@ pub(crate) fn validate_receipt_identity(
     Ok(())
 }
 
+/// Recomputes the canonical request hash from the exact values to be
+/// executed/committed (RECHECK-63 slice C).
+///
+/// Shared-helper only: builds [`CanonicalRequestView::from_apply`] from the
+/// transported `ctx` + `transition` + expected heads and hashes via
+/// [`canonical_request_hash`]. Never reimplements hashing.
+#[allow(dead_code)]
+pub(crate) fn recomputed_canonical_request_hash(
+    ctx: &RequestMeta,
+    transition: &PreparedTransition,
+    expected_revision_heads: &[RevisionHeadExpectation],
+    expected_ordering_heads: &[OrderingHeadExpectation],
+) -> Result<String, StoreError> {
+    let view = CanonicalRequestView::from_apply(
+        ctx,
+        transition,
+        expected_revision_heads,
+        expected_ordering_heads,
+    );
+    canonical_request_hash(&view)
+}
+
+/// Verifies the supplied claim against the recomputed digest and returns the
+/// recomputed value for receipt binding.
+///
+/// Supplied != recomputed is [`StoreError::TransitionDigestMismatch`] with no
+/// transaction and no lookup success. Callers must invoke this BEFORE any
+/// idempotency-lookup success is returned and BEFORE any transaction/receipt.
+#[allow(dead_code)]
+pub(crate) fn verify_apply_canonical_hash(
+    ctx: &RequestMeta,
+    transition: &PreparedTransition,
+    expected_revision_heads: &[RevisionHeadExpectation],
+    expected_ordering_heads: &[OrderingHeadExpectation],
+) -> Result<String, StoreError> {
+    let view = CanonicalRequestView::from_apply(
+        ctx,
+        transition,
+        expected_revision_heads,
+        expected_ordering_heads,
+    );
+    verify_canonical_request_hash(&view, &transition.identity.canonical_request_hash)?;
+    canonical_request_hash(&view)
+}
+
+/// Builds the receipt bound to the recomputed digest (slice C).
+///
+/// Verifies first, then binds `WriteReceipt.canonical_request_hash` to the
+/// recomputed value (never a blind copy of the supplied claim).
+/// Residual wiring (cannot edit `apply.rs` here): `apply.rs:622`
+/// `build_receipt(ctx, &transition, &plan)` must switch to this function with
+/// the `expected_revision_heads` / `expected_ordering_heads` available in
+/// `apply_prepared_with_authority`, otherwise the live Surreal path keeps the
+/// legacy blind-copy receipt for non-empty-heads applies.
+#[allow(dead_code)]
+pub(crate) fn build_receipt_with_expected_heads(
+    ctx: &RequestMeta,
+    transition: &PreparedTransition,
+    plan: &ApplyPlan,
+    expected_revision_heads: &[RevisionHeadExpectation],
+    expected_ordering_heads: &[OrderingHeadExpectation],
+) -> Result<WriteReceipt, StoreError> {
+    let recomputed = verify_apply_canonical_hash(
+        ctx,
+        transition,
+        expected_revision_heads,
+        expected_ordering_heads,
+    )?;
+    let mut receipt = WriteReceipt {
+        operation_id: transition.identity.operation_id.clone(),
+        idempotency_key: transition.identity.idempotency_key.clone(),
+        canonical_request_hash: recomputed,
+        transition_class: transition.transition_class,
+        status: WriteReceiptStatus::Committed,
+        commit_id: Some(plan.commit_id.clone()),
+        state_fence: transition.state_fence.clone(),
+        ordering_sequences: plan.next_ordering_heads.clone(),
+        revision_before_after: plan.revision_before_after.clone(),
+        applied_command_ids: plan.command_ids.clone(),
+        emitted_event_ids: plan.event_ids.clone(),
+        projection_refs: plan
+            .projection_records
+            .iter()
+            .map(|record| record.publication_id.clone())
+            .collect(),
+        outbox_refs: plan
+            .outbox_records
+            .iter()
+            .map(|record| record.outbox_id.clone())
+            .collect(),
+        operation_manifest_digest: transition.operation_manifest_digest.clone(),
+        error_code: None,
+        resubmission: Resubmission::None,
+        committed_at: Some(plan.committed_at.clone()),
+        envelope: None,
+    };
+    receipt.envelope = Some(issue_store_receipt_envelope(
+        ctx,
+        transition,
+        &receipt,
+        plan.commit_sequence,
+    )?);
+    receipt.validate()?;
+    Ok(receipt)
+}
+
+/// Validates receipt identity plus the recomputed digest (slice C).
+///
+/// Checks supplied == recomputed (typed mismatch otherwise), receipt ==
+/// recomputed, and the legacy identity/envelope rules. Residual wiring:
+/// `apply.rs:581` and `apply.rs:638` `validate_receipt_identity` calls must
+/// switch here with the expected heads from `apply_prepared_with_authority`.
+#[allow(dead_code)]
+pub(crate) fn validate_receipt_identity_with_expected_heads(
+    receipt: &WriteReceipt,
+    ctx: &RequestMeta,
+    transition: &PreparedTransition,
+    expected_revision_heads: &[RevisionHeadExpectation],
+    expected_ordering_heads: &[OrderingHeadExpectation],
+) -> Result<(), AdapterError> {
+    let recomputed = verify_apply_canonical_hash(
+        ctx,
+        transition,
+        expected_revision_heads,
+        expected_ordering_heads,
+    )
+    .map_err(AdapterError::Store)?;
+    if receipt.canonical_request_hash != recomputed {
+        return Err(AdapterError::Store(StoreError::InvalidReceipt));
+    }
+    validate_receipt_identity(receipt, ctx, transition)
+}
+
 /// Validates a deduplicated revision-head result set.
 pub(crate) fn validate_revision_heads(heads: &[RevisionHead]) -> Result<(), StoreError> {
     ensure_unique_revision_keys(
@@ -680,6 +814,46 @@ mod tests {
             select_apply_plan(&transition, &[Some(substituted)], &[], &[], 1, 1).is_err(),
             "substituted authority fails closed"
         );
+        Ok(())
+    }
+
+    #[test]
+    fn canonical_recompute_rejects_tamper_and_binds_recomputed() -> Result<(), StoreError> {
+        // RECHECK-63 slice C (pure, no live DB): the shared helper recomputes
+        // from the exact values to be committed. The legacy fixture claim
+        // `"a".repeat(64)` is a placeholder (proof below: it never equals the
+        // recomputed digest), so the new validators bind the recomputed value.
+        // Cross-crate stability: this uses the same `canonical_request_hash`
+        // that yields the Slice A golden
+        // `55e62e405f35c7f137fe9fcdf177c66a1cba54a5b75fb547deaa11f001a89ec1`
+        // in `eliot-store-api`.
+        let (context, mut transition) = fixture()?;
+        let recomputed = recomputed_canonical_request_hash(&context, &transition, &[], &[])?;
+        assert_ne!(
+            recomputed,
+            "a".repeat(64),
+            "placeholder claim is never the real digest"
+        );
+        // Exact binds recomputed and validates.
+        transition.identity.canonical_request_hash = recomputed.clone();
+        let plan = plan_apply(&transition, &[], &[], 1, 1)?;
+        let receipt = build_receipt_with_expected_heads(&context, &transition, &plan, &[], &[])?;
+        assert_eq!(receipt.canonical_request_hash, recomputed);
+        validate_receipt_identity_with_expected_heads(&receipt, &context, &transition, &[], &[])
+            .expect("exact receipt identity validates");
+        // Tampered executable bytes with the old claim fail typed.
+        let mut tampered = transition.clone();
+        tampered.named_operations[0]
+            .parameters
+            .insert("subject".to_owned(), json!("tampered"));
+        assert!(matches!(
+            verify_apply_canonical_hash(&context, &tampered, &[], &[]),
+            Err(StoreError::TransitionDigestMismatch { .. })
+        ));
+        assert!(matches!(
+            build_receipt_with_expected_heads(&context, &tampered, &plan, &[], &[]),
+            Err(StoreError::TransitionDigestMismatch { .. })
+        ));
         Ok(())
     }
 }
