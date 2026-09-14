@@ -13,6 +13,7 @@
 //! environment, and never claims a repair: without a Kernel-issued admission
 //! it exits 78.
 
+mod dispatched_material;
 mod kernel_client;
 
 use std::io::Write as _;
@@ -63,14 +64,17 @@ fn deny(detail: &str) -> i32 {
 /// The shot drives if and only if the live Kernel advertises the exact
 /// doctor repair-attempt operation (`advertised`) AND the dispatch contour
 /// delivered a session-bound attempt presentation to this invocation
-/// (`attempt_presented`: envelope bytes plus the concrete process request
+/// (`attempt_presented`: a dispatch file validated against the live
+/// bootstrap epoch, carrying the envelope bytes plus the session binding
 /// the real effect adapter binds). Advertisement alone never executes:
 /// without delivered bytes there is no admission to bind, so the shot
-/// fails closed naming the dispatch residual. This argv-only invocation
-/// form carries no attempt bytes by contract (see
-/// `decode_bootstrap_args`), so it always presents `false` here; the
-/// `Drive` arm names the rule the future dispatch contour must satisfy,
-/// and `drive_admitted_attempt` stays the only driver.
+/// fails closed naming the dispatch residual. The presentation is read from
+/// the bins-local dispatch file next to this executable (see
+/// `dispatched_material`), never from argv, stdin, or environment; an
+/// absent or invalid file presents `false` (invalid files additionally deny
+/// with their typed detail before the gate is reached). The `Drive` arm
+/// names the rule the dispatch contour must satisfy, and
+/// `drive_admitted_attempt` stays the only driver.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum GateDecision {
     /// Drive the delivered attempt through `drive_admitted_attempt`.
@@ -108,14 +112,24 @@ fn bootstrap_and_run_once() -> i32 {
     };
     match client.advertise_doctor() {
         Ok(advertised) => {
-            // This argv-only invocation form is never presented a
-            // session-bound attempt: envelope bytes plus the concrete
-            // process request arrive only with the dispatch contour named
-            // by the residual, never via argv, stdin, or environment.
-            const ATTEMPT_PRESENTED: bool = false;
-            match gate_after_advertise(advertised, ATTEMPT_PRESENTED) {
+            // Session-bound attempt material arrives only over the
+            // bins-local dispatch file next to this executable (see
+            // `dispatched_material`): envelope bytes plus the session
+            // nonce/generation/epoch binding, validated against the live
+            // bootstrap epoch before the gate is reached. Never argv,
+            // stdin, or environment. A missing file presents nothing; a
+            // present but invalid file denies here with its typed detail.
+            let live_epoch = client.live_epoch().cloned();
+            let attempt_presented = match live_epoch {
+                Some(ref epoch) => match dispatched_material::read_dispatched_material(epoch) {
+                    Ok(material) => material.is_some(),
+                    Err(error) => return deny(&error.to_string()),
+                },
+                None => false,
+            };
+            match gate_after_advertise(advertised, attempt_presented) {
                 GateDecision::Drive => deny(&format!(
-                    "kernel advertises the doctor operation and an attempt was presented, but this invocation form carries no session-bound attempt value to drive; residual={DOCTOR_DISPATCH_RESIDUAL}"
+                    "kernel advertises the doctor operation and a session-bound attempt file validated, but this composition still lacks the executor-bound ProcessRequest delivery (never deserialized, never minted here); residual={DOCTOR_DISPATCH_RESIDUAL}"
                 )),
                 GateDecision::DenyNotAdvertised => {
                     deny("kernel does not advertise the doctor operation")
