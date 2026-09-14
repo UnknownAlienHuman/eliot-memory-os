@@ -1124,7 +1124,20 @@ name = "eliot-epistemic"
 version = "0.1.0"
 dependencies = [
  "eliot-contracts",
+ "eliot-epistemic-contracts",
  "eliot-evidence",
+ "schemars",
+ "serde",
+ "thiserror",
+]
+
+[[package]]
+name = "eliot-epistemic-contracts"
+version = "0.1.0"
+dependencies = [
+ "eliot-contracts",
+ "eliot-evidence",
+ "eliot-receipts",
  "schemars",
  "serde",
  "thiserror",

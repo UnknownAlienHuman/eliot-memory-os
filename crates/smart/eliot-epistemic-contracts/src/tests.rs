@@ -2452,3 +2452,205 @@ fn malformed_input_bounded_panic_free() -> CaseResult {
     );
     Ok(())
 }
+// WORK_UNIT_CASE: 580/46
+#[test]
+fn explicit_fence_and_lineage_survive_round_trip() -> CaseResult {
+    let epoch9 = AuthorityEpoch::new(9).map_err(|_| case_error("case.epoch"))?;
+    let fence9 = StateFence::new(epoch9, ResourceGeneration::genesis());
+    let content_a = sha256_hex("content-a".as_bytes());
+    let content_b = sha256_hex("content-b".as_bytes());
+    let closure9 = ProvenanceClosure::new(ProvenanceClosureParams {
+        records: BTreeSet::from([artifact("handle-1")?, artifact("handle-2")?]),
+        sources: BTreeSet::from([source("source-a")?]),
+        raw_handles: BTreeSet::from(["raw-1".to_owned(), "raw-2".to_owned()]),
+        revisions: BTreeSet::from(["r1".to_owned()]),
+        lineage: vec![
+            SourceLineage::new(
+                source("source-a")?,
+                SourceRevisionId::new("r1")?,
+                content_a.clone(),
+                Some("raw-1".to_owned()),
+                BTreeSet::new(),
+                None,
+            )?,
+            SourceLineage::new(
+                source("source-a")?,
+                SourceRevisionId::new("r1")?,
+                content_b.clone(),
+                Some("raw-2".to_owned()),
+                BTreeSet::from([content_a.clone()]),
+                None,
+            )?,
+        ],
+        record_origin: BTreeMap::from([
+            (artifact("handle-1")?, content_a.clone()),
+            (artifact("handle-2")?, content_b.clone()),
+        ]),
+        temporal_digest: None,
+        mixed_sources: false,
+        assertability: Assertability::NonAssertableUnverified,
+        scope: "scope-580".to_owned(),
+        fence: fence9.clone(),
+    })?;
+    closure9.validate()?;
+    assert_eq!(closure9.digest, closure9.compute_digest()?);
+    let wire = encoded(&closure9)?;
+    assert!(wire.contains("PROVENANCE_CLOSURE"));
+    let decoded: ProvenanceClosure = parse(&wire)?;
+    decoded.validate()?;
+    assert_eq!(decoded, closure9);
+    assert_eq!(decoded.fence, fence9);
+    assert_eq!(
+        decoded.records,
+        BTreeSet::from([artifact("handle-1")?, artifact("handle-2")?])
+    );
+    assert_eq!(decoded.sources, BTreeSet::from([source("source-a")?]));
+    assert_eq!(decoded.revisions, BTreeSet::from(["r1".to_owned()]));
+    assert_eq!(decoded.lineage.len(), 2);
+    assert_eq!(
+        decoded.lineage[1].predecessors,
+        BTreeSet::from([content_a.clone()])
+    );
+    assert_eq!(
+        decoded.record_origin.get(&artifact("handle-1")?),
+        Some(&content_a)
+    );
+    assert_eq!(
+        decoded.record_origin.get(&artifact("handle-2")?),
+        Some(&content_b)
+    );
+    assert!(!decoded.mixed_sources);
+    let tampered = wire.replacen("\"records\"", "\"no_records\"", 1);
+    assert!(serde_json::from_str::<ProvenanceClosure>(&tampered).is_err());
+    Ok(())
+}
+// Old-resolver migration helper for 580/47: rebuilds resolver
+// `provenance_for` semantics (BTreeSet ordering, mixed-source derivation,
+// weakest assertability) through the real closure constructors.
+fn old_resolver_closure() -> Result<ProvenanceClosure, ContractError> {
+    struct OldRecord {
+        handle: &'static str,
+        source: &'static str,
+        raw: &'static str,
+        revision: &'static str,
+        assertable: bool,
+    }
+    let old = vec![
+        OldRecord {
+            handle: "handle-1",
+            source: "source-a",
+            raw: "raw-1",
+            revision: "r1",
+            assertable: false,
+        },
+        OldRecord {
+            handle: "handle-2",
+            source: "source-a",
+            raw: "raw-2",
+            revision: "r1",
+            assertable: false,
+        },
+        OldRecord {
+            handle: "handle-3",
+            source: "source-b",
+            raw: "raw-3",
+            revision: "r2",
+            assertable: true,
+        },
+    ];
+    let mut records = BTreeSet::new();
+    let mut sources = BTreeSet::new();
+    let mut raws = BTreeSet::new();
+    let mut revisions = BTreeSet::new();
+    let mut lineage = Vec::new();
+    let mut record_origin = BTreeMap::new();
+    let mut assertability = Assertability::Assertable;
+    for item in &old {
+        let handle = artifact(item.handle)?;
+        let owner = source(item.source)?;
+        let content = sha256_hex(format!("content-{}", item.handle).as_bytes());
+        records.insert(handle.clone());
+        sources.insert(owner.clone());
+        raws.insert(item.raw.to_owned());
+        revisions.insert(item.revision.to_owned());
+        lineage.push(SourceLineage::new(
+            owner,
+            SourceRevisionId::new(item.revision)?,
+            content.clone(),
+            Some(item.raw.to_owned()),
+            BTreeSet::new(),
+            None,
+        )?);
+        record_origin.insert(handle, content);
+        let item_assertability = if item.assertable {
+            Assertability::Assertable
+        } else {
+            Assertability::NonAssertableUnverified
+        };
+        assertability = match (assertability, item_assertability) {
+            (Assertability::AbstainOrFence, _) | (_, Assertability::AbstainOrFence) => {
+                Assertability::AbstainOrFence
+            }
+            (Assertability::NonAssertableUnverified, _)
+            | (_, Assertability::NonAssertableUnverified) => Assertability::NonAssertableUnverified,
+            _ => Assertability::Assertable,
+        };
+    }
+    let closure = ProvenanceClosure::new(ProvenanceClosureParams {
+        records,
+        sources: sources.clone(),
+        raw_handles: raws,
+        revisions,
+        lineage,
+        record_origin,
+        temporal_digest: None,
+        mixed_sources: sources.len() > 1,
+        assertability,
+        scope: "scope-580".to_owned(),
+        fence: case_fence(),
+    })?;
+    closure.validate()?;
+    Ok(closure)
+}
+// WORK_UNIT_CASE: 580/47
+#[test]
+fn old_resolver_records_migrate_preserving_handles_sources_revisions() -> CaseResult {
+    let closure = old_resolver_closure()?;
+    assert_eq!(
+        closure.records,
+        BTreeSet::from([
+            artifact("handle-1")?,
+            artifact("handle-2")?,
+            artifact("handle-3")?
+        ])
+    );
+    assert_eq!(
+        closure.sources,
+        BTreeSet::from([source("source-a")?, source("source-b")?])
+    );
+    assert_eq!(
+        closure.raw_handles,
+        BTreeSet::from(["raw-1".to_owned(), "raw-2".to_owned(), "raw-3".to_owned()])
+    );
+    assert_eq!(
+        closure.revisions,
+        BTreeSet::from(["r1".to_owned(), "r2".to_owned()])
+    );
+    assert!(closure.mixed_sources);
+    assert_eq!(
+        closure.assertability,
+        Assertability::NonAssertableUnverified
+    );
+    assert_eq!(closure.scope.as_str(), "scope-580");
+    assert_eq!(closure.fence, case_fence());
+    let decoded: ProvenanceClosure = parse(&encoded(&closure)?)?;
+    assert_eq!(decoded, closure);
+    let view = admitted()?;
+    view.validate()?;
+    assert_eq!(view.admission.scope.as_str(), closure.scope.as_str());
+    assert_eq!(view.admission.fence, closure.fence);
+    assert_eq!(view.position_identity().0.as_str(), "position-580");
+    let view_decoded: CurrentEpistemicPosition = parse(&encoded(&view)?)?;
+    assert_eq!(view_decoded, view);
+    Ok(())
+}
