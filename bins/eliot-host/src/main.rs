@@ -1,3 +1,5 @@
+#![forbid(unsafe_code)]
+
 mod host_console_protocol;
 
 use std::io::{self, BufRead, Write};
@@ -383,38 +385,16 @@ static STOP_REQUESTED: std::sync::atomic::AtomicBool = std::sync::atomic::Atomic
 
 #[cfg(windows)]
 fn run_as_scm_service() -> Result<bool, u32> {
-    use std::ffi::OsStr;
-    use std::os::windows::ffi::OsStrExt;
-    use windows_sys::Win32::Foundation::{ERROR_FAILED_SERVICE_CONTROLLER_CONNECT, GetLastError};
-    use windows_sys::Win32::System::Services::{SERVICE_TABLE_ENTRYW, StartServiceCtrlDispatcherW};
+    use eliot_platform_windows::scm_entry::{DispatcherOutcome, run_service_dispatcher};
 
-    let name = OsStr::new(SERVICE_NAME)
-        .encode_wide()
-        .chain(Some(0))
-        .collect::<Vec<_>>();
-    let table = [
-        SERVICE_TABLE_ENTRYW {
-            lpServiceName: name.as_ptr().cast_mut(),
-            lpServiceProc: Some(service_main),
-        },
-        SERVICE_TABLE_ENTRYW {
-            lpServiceName: std::ptr::null_mut(),
-            lpServiceProc: None,
-        },
-    ];
-    // SAFETY: the table and UTF-16 name remain live until SCM returns.
-    let connected = unsafe { StartServiceCtrlDispatcherW(table.as_ptr()) } != 0;
-    if connected {
-        Ok(true)
-    } else {
-        let error = unsafe { GetLastError() };
-        if error == ERROR_FAILED_SERVICE_CONTROLLER_CONNECT {
+    match run_service_dispatcher(SERVICE_NAME, service_main) {
+        Ok(DispatcherOutcome::Dispatched) => Ok(true),
+        Ok(DispatcherOutcome::Console) => {
             // The documented interactive-console case is the only condition
             // under which the process may enter its stdin/stdout fallback.
             Ok(false)
-        } else {
-            Err(error)
         }
+        Err(error) => Err(error.code()),
     }
 }
 
@@ -427,18 +407,14 @@ struct HostStartPendingReporter {
 
 #[cfg(windows)]
 impl HostStartPendingReporter {
-    fn start(
-        handle: windows_sys::Win32::System::Services::SERVICE_STATUS_HANDLE,
-    ) -> io::Result<Self> {
+    fn start(handle: eliot_platform_windows::scm_entry::ServiceStatusHandle) -> io::Result<Self> {
         use std::sync::atomic::{AtomicBool, Ordering};
-        use windows_sys::Win32::System::Services::{
-            SERVICE_START_PENDING, SERVICE_STATUS, SetServiceStatus,
-        };
+        use windows_sys::Win32::System::Services::SERVICE_START_PENDING;
+        use eliot_platform_windows::scm_entry::{ServiceStatusReport, report_service_status};
 
         let (stop, stopped) = std::sync::mpsc::channel();
         let failed = std::sync::Arc::new(AtomicBool::new(false));
         let task_failed = failed.clone();
-        let raw_handle = handle as isize;
         let task = std::thread::Builder::new()
             .name("eliot-host-scm-start-pending".to_owned())
             .spawn(move || {
@@ -448,18 +424,17 @@ impl HostStartPendingReporter {
                         Ok(()) | Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
                         Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
                     }
-                    let status = SERVICE_STATUS {
-                        dwServiceType: 0x0000_0010,
-                        dwCurrentState: SERVICE_START_PENDING,
-                        dwControlsAccepted: 0,
-                        dwWin32ExitCode: 0,
-                        dwServiceSpecificExitCode: 0,
-                        dwCheckPoint: checkpoint,
-                        dwWaitHint: 10_000,
-                    };
-                    // SAFETY: the service-main thread retains the registered
+                    let report = ServiceStatusReport::new(
+                        SERVICE_START_PENDING,
+                        0,
+                        0,
+                        0,
+                        checkpoint,
+                        10_000,
+                    );
+                    // The service-main thread retains the registered
                     // status handle until this reporter is stopped and joined.
-                    if unsafe { SetServiceStatus(raw_handle as _, &raw const status) } == 0 {
+                    if report_service_status(&handle, &report).is_err() {
                         task_failed.store(true, Ordering::Release);
                         break;
                     }
@@ -501,20 +476,20 @@ impl Drop for HostStartPendingReporter {
     reason = "one terminal failure projection carries class, kind, detail, and identities together"
 )]
 fn fail_host_service(
-    handle: windows_sys::Win32::System::Services::SERVICE_STATUS_HANDLE,
-    status: &mut windows_sys::Win32::System::Services::SERVICE_STATUS,
+    handle: &eliot_platform_windows::scm_entry::ServiceStatusHandle,
+    report: &mut eliot_platform_windows::scm_entry::ServiceStatusReport,
     code: HostStopCode,
     error_variant: &str,
     detail: &str,
     launch_options: Option<&HostLaunchOptions>,
 ) {
-    use windows_sys::Win32::System::Services::{SERVICE_STOPPED, SetServiceStatus};
+    use windows_sys::Win32::System::Services::SERVICE_STOPPED;
+    use eliot_platform_windows::scm_entry::report_service_status;
     persist_host_start_failure(code, error_variant, detail, launch_options);
-    status.dwCurrentState = SERVICE_STOPPED;
-    status.dwWin32ExitCode = HOST_WIN32_SERVICE_SPECIFIC_ERROR;
-    status.dwServiceSpecificExitCode = code.specific();
-    // SAFETY: handle is registered and status is initialized.
-    unsafe { SetServiceStatus(handle, &raw const *status) };
+    report.current_state = SERVICE_STOPPED;
+    report.win32_exit_code = HOST_WIN32_SERVICE_SPECIFIC_ERROR;
+    report.service_specific_exit_code = code.specific();
+    let _ = report_service_status(handle, report);
 }
 
 #[cfg(windows)]
@@ -522,52 +497,52 @@ fn fail_host_service(
     clippy::too_many_lines,
     reason = "the SCM callback owns the complete fail-closed service lifecycle"
 )]
-unsafe extern "system" fn service_main(service_arg_count: u32, service_arg_vector: *mut *mut u16) {
-    use std::ffi::OsStr;
-    use std::os::windows::ffi::OsStrExt;
+extern "system" fn service_main(service_arg_count: u32, service_arg_vector: *mut *mut u16) {
     use std::sync::atomic::Ordering;
     use windows_sys::Win32::System::Services::{
-        RegisterServiceCtrlHandlerExW, SERVICE_ACCEPT_SHUTDOWN, SERVICE_ACCEPT_STOP,
-        SERVICE_RUNNING, SERVICE_START_PENDING, SERVICE_STATUS, SERVICE_STOP_PENDING,
-        SERVICE_STOPPED, SetServiceStatus,
+        SERVICE_ACCEPT_SHUTDOWN, SERVICE_ACCEPT_STOP, SERVICE_RUNNING, SERVICE_START_PENDING,
+        SERVICE_STOP_PENDING, SERVICE_STOPPED,
+    };
+    use eliot_platform_windows::scm_entry::{
+        ServiceArgvError, ServiceStatusReport, parse_service_main_argv,
+        register_service_control_handler, report_service_status,
     };
 
-    let name = OsStr::new(SERVICE_NAME)
-        .encode_wide()
-        .chain(Some(0))
-        .collect::<Vec<_>>();
-    // SAFETY: callback and name are valid for the service lifetime.
-    let handle = unsafe {
-        RegisterServiceCtrlHandlerExW(name.as_ptr(), Some(service_control), std::ptr::null_mut())
+    let handle = match register_service_control_handler(SERVICE_NAME, service_control) {
+        Ok(handle) => handle,
+        Err(error) => {
+            let code = error.code();
+            let detail = format!(
+                "RegisterServiceCtrlHandlerExW returned a null handle (Win32 error {code} (0x{code:08X}))"
+            );
+            let _ = writeln!(io::stderr().lock(), "eliot-host: {detail}");
+            let cached = captured_bootstrap_snapshot();
+            persist_host_start_failure(
+                HostStopCode::ScmRegisterNull,
+                "none",
+                &detail,
+                cached.as_ref(),
+            );
+            return;
+        }
     };
-    let mut status = SERVICE_STATUS {
-        dwServiceType: 0x0000_0010,
-        dwCurrentState: SERVICE_START_PENDING,
-        dwControlsAccepted: 0,
-        dwWin32ExitCode: 0,
-        dwServiceSpecificExitCode: 0,
-        dwCheckPoint: 1,
-        dwWaitHint: 10_000,
-    };
-    if handle.is_null() {
-        let detail = "RegisterServiceCtrlHandlerExW returned a null handle";
-        let _ = writeln!(io::stderr().lock(), "eliot-host: {detail}");
-        let cached = captured_bootstrap_snapshot();
-        fail_host_service(
-            handle,
-            &mut status,
-            HostStopCode::ScmRegisterNull,
-            "none",
-            detail,
-            cached.as_ref(),
-        );
-        return;
-    }
-    // SAFETY: handle is registered and status is initialized.
-    unsafe { SetServiceStatus(handle, &raw const status) };
-    let launch_options =
-        match unsafe { service_launch_options(service_arg_count, service_arg_vector) }
-            .and_then(|()| captured_process_bootstrap())
+    let mut report = ServiceStatusReport::new(SERVICE_START_PENDING, 0, 0, 0, 1, 10_000);
+    let _ = report_service_status(&handle, &report);
+    let launch_options = match parse_service_main_argv(service_arg_count, service_arg_vector)
+        .map_err(|argv_error| match argv_error {
+            ServiceArgvError::BadCount | ServiceArgvError::NullVector => HostError::Platform(
+                "SCM did not provide the canonical EliotHost ServiceMain argv".to_owned(),
+            ),
+            ServiceArgvError::NullValue => {
+                HostError::Platform("SCM provided a null service argv value".to_owned())
+            }
+            ServiceArgvError::TooLong => {
+                HostError::Platform("SCM argv value is too long".to_owned())
+            }
+            ServiceArgvError::InvalidUtf16 => HostError::Platform(argv_error.to_string()),
+        })
+        .and_then(|argv| HostLaunchOptions::validate_service_main_argv([argv]))
+        .and_then(|()| captured_process_bootstrap())
         {
             Ok(options) => options,
             Err(error) => {
@@ -575,8 +550,8 @@ unsafe extern "system" fn service_main(service_arg_count: u32, service_arg_vecto
                 let _ = writeln!(io::stderr().lock(), "eliot-host: {detail}");
                 let cached = captured_bootstrap_snapshot();
                 fail_host_service(
-                    handle,
-                    &mut status,
+                    &handle,
+                    &mut report,
                     HostStopCode::InvalidScmArgvOrBootstrap,
                     host_error_variant(&error),
                     &detail,
@@ -589,8 +564,8 @@ unsafe extern "system" fn service_main(service_arg_count: u32, service_arg_vecto
         let detail = format!("invalid SCM registration: {error}");
         let _ = writeln!(io::stderr().lock(), "eliot-host: {detail}");
         fail_host_service(
-            handle,
-            &mut status,
+            &handle,
+            &mut report,
             HostStopCode::InvalidRegistration,
             host_error_variant(&error),
             &detail,
@@ -604,8 +579,8 @@ unsafe extern "system" fn service_main(service_arg_count: u32, service_arg_vecto
             let detail = format!("SCM start-pending reporter could not start: {error}");
             let _ = writeln!(io::stderr().lock(), "eliot-host: {detail}");
             fail_host_service(
-                handle,
-                &mut status,
+                &handle,
+                &mut report,
                 HostStopCode::ReporterStartFailed,
                 "io",
                 &detail,
@@ -623,8 +598,8 @@ unsafe extern "system" fn service_main(service_arg_count: u32, service_arg_vecto
             let detail = format!("SCM host open failed: {error}");
             let _ = writeln!(io::stderr().lock(), "eliot-host: {detail}");
             fail_host_service(
-                handle,
-                &mut status,
+                &handle,
+                &mut report,
                 HostStopCode::OpenHostFailed,
                 host_error_variant(&error),
                 &detail,
@@ -638,8 +613,8 @@ unsafe extern "system" fn service_main(service_arg_count: u32, service_arg_vecto
         let _ = writeln!(io::stderr().lock(), "eliot-host: {detail}");
         let _ = host.stop();
         fail_host_service(
-            handle,
-            &mut status,
+            &handle,
+            &mut report,
             HostStopCode::ReporterProgressFailed,
             "reporter",
             detail,
@@ -654,8 +629,8 @@ unsafe extern "system" fn service_main(service_arg_count: u32, service_arg_vecto
             let _ = writeln!(io::stderr().lock(), "eliot-host: {detail}");
             let _ = host.stop();
             fail_host_service(
-                handle,
-                &mut status,
+                &handle,
+                &mut report,
                 HostStopCode::CredentialControlFailed,
                 host_error_variant(&error),
                 &detail,
@@ -672,8 +647,8 @@ unsafe extern "system" fn service_main(service_arg_count: u32, service_arg_vecto
             let _ = writeln!(io::stderr().lock(), "eliot-host: {detail}");
             let _ = host.stop();
             fail_host_service(
-                handle,
-                &mut status,
+                &handle,
+                &mut report,
                 HostStopCode::SpawnCredentialFailed,
                 host_error_variant(&error),
                 &detail,
@@ -689,8 +664,8 @@ unsafe extern "system" fn service_main(service_arg_count: u32, service_arg_vecto
             let _ = writeln!(io::stderr().lock(), "eliot-host: {detail}");
             let _ = host.stop();
             fail_host_service(
-                handle,
-                &mut status,
+                &handle,
+                &mut report,
                 HostStopCode::RuntimeControlFailed,
                 host_error_variant(&error),
                 &detail,
@@ -707,8 +682,8 @@ unsafe extern "system" fn service_main(service_arg_count: u32, service_arg_vecto
             let _ = writeln!(io::stderr().lock(), "eliot-host: {detail}");
             let _ = host.stop();
             fail_host_service(
-                handle,
-                &mut status,
+                &handle,
+                &mut report,
                 HostStopCode::SpawnRuntimeFailed,
                 host_error_variant(&error),
                 &detail,
@@ -717,11 +692,10 @@ unsafe extern "system" fn service_main(service_arg_count: u32, service_arg_vecto
             return;
         }
     };
-    status.dwCurrentState = SERVICE_RUNNING;
-    status.dwControlsAccepted = SERVICE_ACCEPT_STOP | SERVICE_ACCEPT_SHUTDOWN;
-    status.dwCheckPoint = 0;
-    // SAFETY: handle is registered and status is initialized.
-    unsafe { SetServiceStatus(handle, &raw const status) };
+    report.current_state = SERVICE_RUNNING;
+    report.controls_accepted = SERVICE_ACCEPT_STOP | SERVICE_ACCEPT_SHUTDOWN;
+    report.check_point = 0;
+    let _ = report_service_status(&handle, &report);
     while !STOP_REQUESTED.load(Ordering::Acquire) && host.running() {
         process_phase_b_requests(&mut host, &phase_b_queue);
         process_runtime_control_requests(&mut host, &runtime_queue);
@@ -761,15 +735,14 @@ unsafe extern "system" fn service_main(service_arg_count: u32, service_arg_vecto
     STOP_REQUESTED.store(true, Ordering::Release);
     let _ = credential_thread.join();
     let _ = runtime_thread.join();
-    status.dwCurrentState = SERVICE_STOP_PENDING;
-    status.dwControlsAccepted = 0;
-    status.dwCheckPoint = 1;
-    status.dwWaitHint = 10_000;
-    // SAFETY: handle is registered and status is initialized.
-    unsafe { SetServiceStatus(handle, &raw const status) };
+    report.current_state = SERVICE_STOP_PENDING;
+    report.controls_accepted = 0;
+    report.check_point = 1;
+    report.wait_hint = 10_000;
+    let _ = report_service_status(&handle, &report);
     let stop_result = host.stop();
-    status.dwCurrentState = SERVICE_STOPPED;
-    status.dwControlsAccepted = 0;
+    report.current_state = SERVICE_STOPPED;
+    report.controls_accepted = 0;
     if let Err(error) = stop_result {
         let detail = format!("durable SCM shutdown failed; recovery required: {error}");
         let _ = writeln!(io::stderr().lock(), "eliot-host: {detail}");
@@ -781,45 +754,10 @@ unsafe extern "system" fn service_main(service_arg_count: u32, service_arg_vecto
         );
         // SCM receives a stopped state with 1066 plus a typed service-specific
         // code, which is a failed/recovery outcome rather than a clean stop.
-        status.dwWin32ExitCode = HOST_WIN32_SERVICE_SPECIFIC_ERROR;
-        status.dwServiceSpecificExitCode = HostStopCode::DurableShutdownFailed.specific();
+        report.win32_exit_code = HOST_WIN32_SERVICE_SPECIFIC_ERROR;
+        report.service_specific_exit_code = HostStopCode::DurableShutdownFailed.specific();
     }
-    // SAFETY: handle is registered and status is initialized.
-    unsafe { SetServiceStatus(handle, &raw const status) };
-}
-
-#[cfg(windows)]
-unsafe fn service_launch_options(
-    service_arg_count: u32,
-    service_arg_vector: *mut *mut u16,
-) -> Result<(), HostError> {
-    use std::ffi::OsString;
-    use std::os::windows::ffi::OsStringExt;
-    const MAX_SERVICE_ARG_UNITS: usize = 64 * 1024;
-
-    if service_arg_vector.is_null() || service_arg_count != 1 {
-        return Err(HostError::Platform(
-            "SCM did not provide the canonical EliotHost ServiceMain argv".to_owned(),
-        ));
-    }
-    let raw = unsafe {
-        std::slice::from_raw_parts(service_arg_vector.cast_const(), service_arg_count as usize)
-    };
-    let pointer = raw[0];
-    if pointer.is_null() {
-        return Err(HostError::Platform(
-            "SCM provided a null service argv value".to_owned(),
-        ));
-    }
-    let mut length = 0usize;
-    while length < MAX_SERVICE_ARG_UNITS && unsafe { *pointer.add(length) } != 0 {
-        length += 1;
-    }
-    if length == MAX_SERVICE_ARG_UNITS {
-        return Err(HostError::Platform("SCM argv value is too long".to_owned()));
-    }
-    let value = unsafe { std::slice::from_raw_parts(pointer.cast_const(), length) };
-    HostLaunchOptions::validate_service_main_argv([OsString::from_wide(value)])
+    let _ = report_service_status(&handle, &report);
 }
 
 #[cfg(windows)]
@@ -1012,7 +950,7 @@ fn report_scm_tick(outcome: ScmContourTickOutcome) {
 }
 
 #[cfg(windows)]
-unsafe extern "system" fn service_control(
+extern "system" fn service_control(
     control: u32,
     _event_type: u32,
     _event_data: *mut std::ffi::c_void,
