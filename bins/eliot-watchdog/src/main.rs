@@ -1,3 +1,5 @@
+#![forbid(unsafe_code)]
+
 use std::io::{self, Write};
 use std::sync::Arc;
 use std::sync::OnceLock;
@@ -15,6 +17,11 @@ use runtime_loop::run_watchdog;
 
 use eliot_platform_windows::ServiceBootstrapArguments;
 #[cfg(windows)]
+use eliot_platform_windows::scm_entry::{
+    DispatcherOutcome, ServiceArgvError, parse_service_main_argv, register_service_control_handler,
+    run_service_dispatcher,
+};
+#[cfg(windows)]
 use eliot_platform_windows::{ServiceRegistrationRequest, WindowsPlatform};
 use eliot_watchdog::{
     SERVICE_NAME, WatchdogRuntimeReadback, WatchdogSelfAdmissionProbe, WatchdogSelfAdmissionStatus,
@@ -22,10 +29,11 @@ use eliot_watchdog::{
 };
 #[cfg(windows)]
 use watchdog_service_status::{
-    CONSOLE_PROCESS_EXIT_CODE, SERVICE_STATUS_HANDLE, WatchdogStopCode,
-    classify_bootstrap_launch_error, classify_runtime_error, persist_start_failure,
-    publish_service_status, publish_stopped_with_code, set_service_status_running,
-    set_service_status_stopped,
+    CONSOLE_PROCESS_EXIT_CODE, SERVICE_CONTROL_INTERROGATE, SERVICE_CONTROL_PRESHUTDOWN,
+    SERVICE_CONTROL_SHUTDOWN, SERVICE_CONTROL_STOP, SERVICE_START_PENDING, SERVICE_STATUS_HANDLE,
+    SERVICE_STOP_PENDING, WatchdogStopCode, classify_bootstrap_launch_error,
+    classify_runtime_error, persist_start_failure, publish_service_status,
+    publish_stopped_with_code, set_service_status_running, set_service_status_stopped,
 };
 
 static PROCESS_BOOTSTRAP: OnceLock<Result<Option<ServiceBootstrapArguments>, String>> =
@@ -123,11 +131,10 @@ struct ScmWatchdogSelfAdmissionStatus;
 #[cfg(windows)]
 impl WatchdogSelfAdmissionStatus for ScmWatchdogSelfAdmissionStatus {
     fn report_start_pending(&mut self, checkpoint: u32, wait_hint_ms: u32) {
-        let raw = SERVICE_STATUS_HANDLE.load(Ordering::Acquire);
-        if raw != 0 {
+        if let Some(handle) = SERVICE_STATUS_HANDLE.get() {
             publish_service_status(
-                raw as _,
-                windows_sys::Win32::System::Services::SERVICE_START_PENDING,
+                handle,
+                SERVICE_START_PENDING,
                 0,
                 0,
                 0,
@@ -143,75 +150,42 @@ static SERVICE_STOP_REQUESTED: std::sync::OnceLock<Arc<AtomicBool>> = std::sync:
 
 #[cfg(windows)]
 fn run_as_scm_service() -> Result<bool, u32> {
-    use std::ffi::OsStr;
-    use std::os::windows::ffi::OsStrExt;
-    use windows_sys::Win32::Foundation::{ERROR_FAILED_SERVICE_CONTROLLER_CONNECT, GetLastError};
-    use windows_sys::Win32::System::Services::{SERVICE_TABLE_ENTRYW, StartServiceCtrlDispatcherW};
-    let name = OsStr::new(SERVICE_NAME)
-        .encode_wide()
-        .chain(Some(0))
-        .collect::<Vec<_>>();
-    let table = [
-        SERVICE_TABLE_ENTRYW {
-            lpServiceName: name.as_ptr().cast_mut(),
-            lpServiceProc: Some(watchdog_service_main),
-        },
-        SERVICE_TABLE_ENTRYW {
-            lpServiceName: std::ptr::null_mut(),
-            lpServiceProc: None,
-        },
-    ];
-    // SAFETY: SCM borrows the table only until the dispatcher returns.
-    if unsafe { StartServiceCtrlDispatcherW(table.as_ptr()) } != 0 {
-        Ok(true)
-    } else {
-        let error = unsafe { GetLastError() };
-        if error == ERROR_FAILED_SERVICE_CONTROLLER_CONNECT {
-            Ok(false)
-        } else {
-            Err(error)
-        }
+    match run_service_dispatcher(SERVICE_NAME, watchdog_service_main) {
+        Ok(DispatcherOutcome::Dispatched) => Ok(true),
+        Ok(DispatcherOutcome::Console) => Ok(false),
+        Err(error) => Err(error.code()),
     }
 }
 
 #[cfg(windows)]
-unsafe extern "system" fn watchdog_service_main(
+extern "system" fn watchdog_service_main(
     service_arg_count: u32,
     service_arg_vector: *mut *mut u16,
 ) {
-    use std::ffi::OsStr;
-    use std::os::windows::ffi::OsStrExt;
-    use windows_sys::Win32::Foundation::GetLastError;
-    use windows_sys::Win32::System::Services::{
-        RegisterServiceCtrlHandlerExW, SERVICE_START_PENDING,
+    let handle = match register_service_control_handler(SERVICE_NAME, service_control) {
+        Ok(handle) => handle,
+        Err(registration) => {
+            let error = registration.code();
+            let detail = format!(
+                "RegisterServiceCtrlHandlerExW failed with Win32 error {error} (0x{error:08X})"
+            );
+            let _ = writeln!(io::stderr().lock(), "{SERVICE_NAME}: {detail}");
+            persist_start_failure(
+                WatchdogStopCode::ScmRegisterNull,
+                &detail,
+                captured_bootstrap_for_capsule(),
+            );
+            // No status handle exists on this path: the historical
+            // `SetServiceStatus` through the null handle always failed and its
+            // result was ignored, so there is nothing to publish.
+            return;
+        }
     };
-    let name = OsStr::new(SERVICE_NAME)
-        .encode_wide()
-        .chain(Some(0))
-        .collect::<Vec<_>>();
-    // SAFETY: the callback and name remain valid for the service lifetime.
-    let handle = unsafe {
-        RegisterServiceCtrlHandlerExW(name.as_ptr(), Some(service_control), std::ptr::null_mut())
-    };
-    if handle.is_null() {
-        let error = unsafe { GetLastError() };
-        let detail = format!(
-            "RegisterServiceCtrlHandlerExW failed with Win32 error {error} (0x{error:08X})"
-        );
-        let _ = writeln!(io::stderr().lock(), "{SERVICE_NAME}: {detail}");
-        persist_start_failure(
-            WatchdogStopCode::ScmRegisterNull,
-            &detail,
-            captured_bootstrap_for_capsule(),
-        );
-        publish_stopped_with_code(handle, WatchdogStopCode::ScmRegisterNull);
-        return;
-    }
-    SERVICE_STATUS_HANDLE.store(handle as isize, Ordering::Release);
-    publish_service_status(handle, SERVICE_START_PENDING, 0, 0, 0, 1, 10_000);
+    let _ = SERVICE_STATUS_HANDLE.set(handle);
+    publish_service_status(&handle, SERVICE_START_PENDING, 0, 0, 0, 1, 10_000);
     // Stage 1 keeps the exact historical order: the `ServiceMain` argv shape
     // is validated before the process bootstrap is touched.
-    if let Err(error) = unsafe { service_launch_options(service_arg_count, service_arg_vector) } {
+    if let Err(error) = service_launch_options(service_arg_count, service_arg_vector) {
         let detail = format!("invalid SCM ServiceMain argv: {error}");
         let _ = writeln!(io::stderr().lock(), "{SERVICE_NAME}: {detail}");
         persist_start_failure(
@@ -219,7 +193,7 @@ unsafe extern "system" fn watchdog_service_main(
             &detail,
             captured_bootstrap_for_capsule(),
         );
-        publish_stopped_with_code(handle, WatchdogStopCode::InvalidScmArgv);
+        publish_stopped_with_code(&handle, WatchdogStopCode::InvalidScmArgv);
         return;
     }
     // Stage 2 validates the captured process bootstrap against the
@@ -231,7 +205,7 @@ unsafe extern "system" fn watchdog_service_main(
             let detail = format!("invalid SCM launch registration: {error}");
             let _ = writeln!(io::stderr().lock(), "{SERVICE_NAME}: {detail}");
             persist_start_failure(code, &detail, captured_bootstrap_for_capsule());
-            publish_stopped_with_code(handle, code);
+            publish_stopped_with_code(&handle, code);
             return;
         }
     };
@@ -241,7 +215,7 @@ unsafe extern "system" fn watchdog_service_main(
         let code = classify_runtime_error(&error);
         let _ = writeln!(io::stderr().lock(), "{SERVICE_NAME}: {error}");
         persist_start_failure(code, &error, captured_bootstrap_for_capsule());
-        publish_stopped_with_code(handle, code);
+        publish_stopped_with_code(&handle, code);
     }
 }
 
@@ -272,52 +246,43 @@ fn validate_registered_process_bootstrap()
 }
 
 #[cfg(windows)]
-unsafe fn service_launch_options(
+fn service_launch_options(
     service_arg_count: u32,
     service_arg_vector: *mut *mut u16,
 ) -> Result<(), eliot_watchdog::WatchdogScmLaunchError> {
-    use std::ffi::OsString;
-    use std::os::windows::ffi::OsStringExt;
-    const MAX_SERVICE_ARG_UNITS: usize = 64 * 1024;
-
-    if service_arg_vector.is_null() || service_arg_count != 1 {
-        return Err(eliot_watchdog::WatchdogScmLaunchError::InvalidArgv(
-            "ServiceMain argv must contain only the canonical service name".to_owned(),
-        ));
-    }
-    let raw = unsafe {
-        std::slice::from_raw_parts(service_arg_vector.cast_const(), service_arg_count as usize)
+    let value = match parse_service_main_argv(service_arg_count, service_arg_vector) {
+        Ok(value) => value,
+        Err(shape) => {
+            // The safe platform parser reports shapes; the historical
+            // `service_launch_options` strings are preserved verbatim so the
+            // stage-1 gate keeps its exact stderr/capsule wording.
+            let detail = match shape {
+                ServiceArgvError::BadCount
+                | ServiceArgvError::NullVector
+                | ServiceArgvError::InvalidUtf16 => {
+                    // `InvalidUtf16` is unreachable on Windows, where the
+                    // platform conversion is lossless; it shares the shape
+                    // rejection like every other non-value error.
+                    "ServiceMain argv must contain only the canonical service name"
+                }
+                ServiceArgvError::NullValue => "SCM provided a null service argv value",
+                ServiceArgvError::TooLong => "SCM argv value is too long",
+            };
+            return Err(eliot_watchdog::WatchdogScmLaunchError::InvalidArgv(
+                detail.to_owned(),
+            ));
+        }
     };
-    let pointer = raw[0];
-    if pointer.is_null() {
-        return Err(eliot_watchdog::WatchdogScmLaunchError::InvalidArgv(
-            "SCM provided a null service argv value".to_owned(),
-        ));
-    }
-    let mut length = 0usize;
-    while length < MAX_SERVICE_ARG_UNITS && unsafe { *pointer.add(length) } != 0 {
-        length += 1;
-    }
-    if length == MAX_SERVICE_ARG_UNITS {
-        return Err(eliot_watchdog::WatchdogScmLaunchError::InvalidArgv(
-            "SCM argv value is too long".to_owned(),
-        ));
-    }
-    let value = unsafe { std::slice::from_raw_parts(pointer.cast_const(), length) };
-    eliot_watchdog::validate_watchdog_service_main_argv([OsString::from_wide(value)])
+    eliot_watchdog::validate_watchdog_service_main_argv([value])
 }
 
 #[cfg(windows)]
-unsafe extern "system" fn service_control(
+extern "system" fn service_control(
     control: u32,
     _event_type: u32,
     _event_data: *mut std::ffi::c_void,
     _context: *mut std::ffi::c_void,
 ) -> u32 {
-    use windows_sys::Win32::System::Services::{
-        SERVICE_CONTROL_INTERROGATE, SERVICE_CONTROL_PRESHUTDOWN, SERVICE_CONTROL_SHUTDOWN,
-        SERVICE_CONTROL_STOP, SERVICE_STOP_PENDING,
-    };
     if matches!(
         control,
         SERVICE_CONTROL_STOP | SERVICE_CONTROL_SHUTDOWN | SERVICE_CONTROL_PRESHUTDOWN
@@ -325,9 +290,8 @@ unsafe extern "system" fn service_control(
         if let Some(stop_signal) = SERVICE_STOP_REQUESTED.get() {
             stop_signal.store(true, Ordering::Release);
         }
-        let raw = SERVICE_STATUS_HANDLE.load(Ordering::Acquire);
-        if raw != 0 {
-            publish_service_status(raw as _, SERVICE_STOP_PENDING, 0, 0, 0, 1, 10_000);
+        if let Some(handle) = SERVICE_STATUS_HANDLE.get() {
+            publish_service_status(handle, SERVICE_STOP_PENDING, 0, 0, 0, 1, 10_000);
         }
     }
     if control == SERVICE_CONTROL_INTERROGATE {

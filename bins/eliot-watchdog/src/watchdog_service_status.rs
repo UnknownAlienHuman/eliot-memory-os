@@ -31,14 +31,33 @@
 //! file, one record, bounded bytes, best-effort write, never a secret.
 
 use std::path::PathBuf;
+use std::sync::OnceLock;
 
 use eliot_platform_windows::ServiceBootstrapArguments;
-use windows_sys::Win32::System::Services::{SERVICE_STATUS, SetServiceStatus};
+use eliot_platform_windows::scm_entry::{
+    ServiceStatusHandle, ServiceStatusReport, report_service_status,
+};
 
 use eliot_watchdog::{FileWatchdogAdmission, SERVICE_NAME, WatchdogScmLaunchError};
 
-pub(super) static SERVICE_STATUS_HANDLE: std::sync::atomic::AtomicIsize =
-    std::sync::atomic::AtomicIsize::new(0);
+pub(super) static SERVICE_STATUS_HANDLE: OnceLock<ServiceStatusHandle> = OnceLock::new();
+
+/// Stable Win32 SCM status/control ABI values, previously named through
+/// `windows_sys` at each call site. The service-status choke
+/// ([`publish_service_status`]) transports them verbatim through the safe
+/// platform wrapper, which fixes `dwServiceType` to
+/// `SERVICE_WIN32_OWN_PROCESS` (`0x10`).
+pub(super) const SERVICE_STOPPED: u32 = 1;
+pub(super) const SERVICE_START_PENDING: u32 = 2;
+pub(super) const SERVICE_STOP_PENDING: u32 = 3;
+pub(super) const SERVICE_RUNNING: u32 = 4;
+pub(super) const SERVICE_ACCEPT_STOP: u32 = 0x0000_0001;
+pub(super) const SERVICE_ACCEPT_SHUTDOWN: u32 = 0x0000_0004;
+pub(super) const SERVICE_ACCEPT_PRESHUTDOWN: u32 = 0x0000_0010;
+pub(super) const SERVICE_CONTROL_STOP: u32 = 1;
+pub(super) const SERVICE_CONTROL_INTERROGATE: u32 = 4;
+pub(super) const SERVICE_CONTROL_SHUTDOWN: u32 = 5;
+pub(super) const SERVICE_CONTROL_PRESHUTDOWN: u32 = 15;
 
 /// Win32 `ERROR_SERVICE_SPECIFIC_ERROR`: the `dwWin32ExitCode` reported for
 /// every typed Watchdog start failure. The per-class detail travels in
@@ -68,7 +87,7 @@ pub(super) const START_FAILURE_IDENTITY_MAX_CHARS: usize = 128;
 /// installers key runbooks off them.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) enum WatchdogStopCode {
-    /// `RegisterServiceCtrlHandlerExW` returned NULL (`main.rs` register-null
+    /// SCM control-handler registration failed (`main.rs` register-failure
     /// site). The SCM-provided Win32 error is preserved in stderr and the
     /// capsule; no status handle exists to publish through.
     ScmRegisterNull = 1,
@@ -201,15 +220,11 @@ pub(super) fn classify_runtime_error(message: &str) -> WatchdogStopCode {
 }
 
 pub(super) fn set_service_status_running() {
-    use std::sync::atomic::Ordering;
-    let raw = SERVICE_STATUS_HANDLE.load(Ordering::Acquire);
-    if raw != 0 {
+    if let Some(handle) = SERVICE_STATUS_HANDLE.get() {
         publish_service_status(
-            raw as _,
-            windows_sys::Win32::System::Services::SERVICE_RUNNING,
-            windows_sys::Win32::System::Services::SERVICE_ACCEPT_STOP
-                | windows_sys::Win32::System::Services::SERVICE_ACCEPT_SHUTDOWN
-                | windows_sys::Win32::System::Services::SERVICE_ACCEPT_PRESHUTDOWN,
+            handle,
+            SERVICE_RUNNING,
+            SERVICE_ACCEPT_STOP | SERVICE_ACCEPT_SHUTDOWN | SERVICE_ACCEPT_PRESHUTDOWN,
             0,
             0,
             0,
@@ -219,30 +234,17 @@ pub(super) fn set_service_status_running() {
 }
 
 pub(super) fn set_service_status_stopped() {
-    use std::sync::atomic::Ordering;
-    let raw = SERVICE_STATUS_HANDLE.load(Ordering::Acquire);
-    if raw != 0 {
-        publish_service_status(
-            raw as _,
-            windows_sys::Win32::System::Services::SERVICE_STOPPED,
-            0,
-            0,
-            0,
-            0,
-            0,
-        );
+    if let Some(handle) = SERVICE_STATUS_HANDLE.get() {
+        publish_service_status(handle, SERVICE_STOPPED, 0, 0, 0, 0, 0);
     }
 }
 
 /// Publishes one typed `SERVICE_STOPPED` for a start failure: Win32 1066 plus
 /// the per-class specific code from [`WatchdogStopCode::specific`].
-pub(super) fn publish_stopped_with_code(
-    handle: windows_sys::Win32::System::Services::SERVICE_STATUS_HANDLE,
-    code: WatchdogStopCode,
-) {
+pub(super) fn publish_stopped_with_code(handle: &ServiceStatusHandle, code: WatchdogStopCode) {
     publish_service_status(
         handle,
-        windows_sys::Win32::System::Services::SERVICE_STOPPED,
+        SERVICE_STOPPED,
         0,
         WIN32_SERVICE_SPECIFIC_ERROR,
         code.specific(),
@@ -252,7 +254,7 @@ pub(super) fn publish_stopped_with_code(
 }
 
 pub(super) fn publish_service_status(
-    handle: windows_sys::Win32::System::Services::SERVICE_STATUS_HANDLE,
+    handle: &ServiceStatusHandle,
     state: u32,
     controls: u32,
     win32_error: u32,
@@ -260,17 +262,18 @@ pub(super) fn publish_service_status(
     checkpoint: u32,
     wait_hint: u32,
 ) {
-    let status = SERVICE_STATUS {
-        dwServiceType: 0x0000_0010,
-        dwCurrentState: state,
-        dwControlsAccepted: controls,
-        dwWin32ExitCode: win32_error,
-        dwServiceSpecificExitCode: specific_error,
-        dwCheckPoint: checkpoint,
-        dwWaitHint: wait_hint,
-    };
-    // SAFETY: the handle is either SCM-provided or zero-checked by callers.
-    unsafe { SetServiceStatus(handle, &raw const status) };
+    let report = ServiceStatusReport::new(
+        state,
+        controls,
+        win32_error,
+        specific_error,
+        checkpoint,
+        wait_hint,
+    );
+    // The platform wrapper owns the `SetServiceStatus` mechanics; the result
+    // stays ignored exactly as before, keeping status publication best-effort
+    // while SCM status plus stderr remain the primary signals.
+    let _ = report_service_status(handle, &report);
 }
 
 /// Builds the bounded secret-free start-failure capsule JSON.

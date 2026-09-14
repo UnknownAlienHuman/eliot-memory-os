@@ -85,7 +85,7 @@ pub fn project_service_runtime_inspection(
         }
         ServiceRegistrationRuntimeInspection::Absent => WatchdogRuntimeReadback::Absent,
         ServiceRegistrationRuntimeInspection::Mismatched => WatchdogRuntimeReadback::Mismatched,
-        ServiceRegistrationRuntimeInspection::Unknown => WatchdogRuntimeReadback::Unknown,
+        ServiceRegistrationRuntimeInspection::Unknown { .. } => WatchdogRuntimeReadback::Unknown,
     }
 }
 
