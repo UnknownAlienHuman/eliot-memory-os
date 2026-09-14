@@ -2773,7 +2773,12 @@ mod honest_tests {
     fn service_status_indeterminate_fails_closed_without_liveness_claim() {
         let state = project_service_registration_inspection(
             eliot_platform_windows::ELIOT_WATCHDOG_SERVICE_NAME,
-            eliot_platform_windows::ServiceRegistrationRuntimeInspection::Unknown,
+            eliot_platform_windows::ServiceRegistrationRuntimeInspection::Unknown {
+                detail: eliot_platform_windows::ServiceInspectionUnknownDetail::new(
+                    5,
+                    "open-service",
+                ),
+            },
         );
         assert_eq!(state.registration, "Unknown");
         assert_eq!(state.state, "Unknown");
