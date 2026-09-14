@@ -26,6 +26,7 @@ use eliot_agent_bridge_core::ProviderFailure;
 use eliot_agent_bridge_core::SessionId;
 use eliot_agent_bridge_core::TaskId;
 use eliot_agent_bridge_core::WorkUnitId;
+use eliot_protocol::AgentBridgeActivationDenialCode;
 use eliot_protocol::AgentBridgeActivationRequest;
 use eliot_protocol::AgentBridgeActivationResponse;
 use eliot_protocol::AgentBridgePeerAdmissionReceipt;
@@ -36,6 +37,31 @@ use eliot_protocol::ProtocolPayload;
 
 use crate::KernelTransportOwner;
 use crate::SharedTransport;
+
+/// Surfaces one typed activation denial as its stable agent-visible reason
+/// string. The match is exhaustive with no wildcard arm, so a future denial
+/// code breaks compilation here instead of collapsing into another string.
+pub(super) fn denial_reason_code(reason_code: AgentBridgeActivationDenialCode) -> &'static str {
+    match reason_code {
+        AgentBridgeActivationDenialCode::SemanticResolutionUnavailable => {
+            eliot_protocol::AGENT_BRIDGE_SEMANTIC_RESOLUTION_UNAVAILABLE
+        }
+        AgentBridgeActivationDenialCode::TaskSelectionRequired => {
+            eliot_protocol::AGENT_BRIDGE_TASK_SELECTION_REQUIRED
+        }
+        AgentBridgeActivationDenialCode::ScopeSelectionRequired => {
+            eliot_protocol::AGENT_BRIDGE_SCOPE_SELECTION_REQUIRED
+        }
+        AgentBridgeActivationDenialCode::ScopeAmbiguous => {
+            eliot_protocol::AGENT_BRIDGE_SCOPE_AMBIGUOUS
+        }
+        AgentBridgeActivationDenialCode::NotReady => eliot_protocol::AGENT_BRIDGE_NOT_READY,
+        AgentBridgeActivationDenialCode::StaleFence => eliot_protocol::AGENT_BRIDGE_STALE_FENCE,
+        AgentBridgeActivationDenialCode::FailedInternal => {
+            eliot_protocol::AGENT_BRIDGE_FAILED_INTERNAL
+        }
+    }
+}
 
 fn provider_failure() -> ProviderFailure {
     ProviderFailure::new(
@@ -302,11 +328,7 @@ impl KernelTransportOwner {
             decode_activation_response(&wire, &activation_request, &self.admitted.receipt)?;
         match response.disposition {
             eliot_protocol::AgentBridgeActivationDisposition::Denied { reason_code } => {
-                let code: &'static str = match reason_code {
-                    eliot_protocol::AgentBridgeActivationDenialCode::SemanticResolutionUnavailable => {
-                        "SEMANTIC_RESOLUTION_UNAVAILABLE"
-                    }
-                };
+                let code: &'static str = denial_reason_code(reason_code);
                 Ok(ActivationPortOutcome::Denied { reason_code: code })
             }
             eliot_protocol::AgentBridgeActivationDisposition::Authenticated { binding } => {

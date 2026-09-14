@@ -97,8 +97,22 @@ pub const AGENT_BRIDGE_ACTIVATION_RESPONSE_WIRE_ID: &str =
     "eliot.protocol.agent-bridge-activation-response";
 /// Current agent-bridge activation response wire version.
 pub const AGENT_BRIDGE_ACTIVATION_RESPONSE_WIRE_VERSION: u16 = 1;
-/// Stable denial code used until the eliotd semantic resolver exists.
+/// Stable denial code for a Kernel-owned activation refusal with no typed
+/// daemon semantic result (pre-ticket immediate denial or result-less expiry).
+/// It never stands in for one of the six typed disposition codes below.
 pub const AGENT_BRIDGE_SEMANTIC_RESOLUTION_UNAVAILABLE: &str = "SEMANTIC_RESOLUTION_UNAVAILABLE";
+/// Stable denial code projecting a daemon `TASK_SELECTION_REQUIRED` disposition.
+pub const AGENT_BRIDGE_TASK_SELECTION_REQUIRED: &str = "TASK_SELECTION_REQUIRED";
+/// Stable denial code projecting a daemon `SCOPE_SELECTION_REQUIRED` disposition.
+pub const AGENT_BRIDGE_SCOPE_SELECTION_REQUIRED: &str = "SCOPE_SELECTION_REQUIRED";
+/// Stable denial code projecting a daemon `SCOPE_AMBIGUOUS` disposition.
+pub const AGENT_BRIDGE_SCOPE_AMBIGUOUS: &str = "SCOPE_AMBIGUOUS";
+/// Stable denial code projecting a daemon `NOT_READY` disposition.
+pub const AGENT_BRIDGE_NOT_READY: &str = "NOT_READY";
+/// Stable denial code projecting a daemon `STALE_FENCE` disposition.
+pub const AGENT_BRIDGE_STALE_FENCE: &str = "STALE_FENCE";
+/// Stable denial code projecting a daemon `FAILED_INTERNAL` disposition.
+pub const AGENT_BRIDGE_FAILED_INTERNAL: &str = "FAILED_INTERNAL";
 /// Stable wire identity for a Kernel-to-eliotd semantic-resolution ticket.
 pub const AGENT_ACTIVATION_RESOLUTION_TICKET_WIRE_ID: &str =
     "eliot.protocol.agent-activation-resolution-ticket";
@@ -2134,11 +2148,33 @@ impl AgentBridgeAuthenticatedBinding {
 }
 
 /// Typed reason why an admitted bridge transport cannot be activated.
+///
+/// The six disposition codes project the exact daemon-owned
+/// [`AgentActivationResolutionDisposition`](crate::AgentActivationResolutionDisposition)
+/// that refused the ticket; each carries that disposition's stable
+/// `SCREAMING_SNAKE_CASE` wire string so agents can distinguish selection,
+/// ambiguity, retry, fence, and internal outcomes. `Resolved` never maps here:
+/// it yields the `Authenticated` binding instead. `SemanticResolutionUnavailable`
+/// is Kernel-owned and is used only when no daemon disposition exists at all
+/// (pre-ticket immediate denial or result-less expiry); it never collapses two
+/// distinct dispositions into one code.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
 pub enum AgentBridgeActivationDenialCode {
-    /// The trusted eliotd semantic resolver is not yet available.
+    /// No typed daemon semantic result can be projected for this ticket.
     SemanticResolutionUnavailable,
+    /// The daemon reported `TASK_SELECTION_REQUIRED`.
+    TaskSelectionRequired,
+    /// The daemon reported `SCOPE_SELECTION_REQUIRED`.
+    ScopeSelectionRequired,
+    /// The daemon reported `SCOPE_AMBIGUOUS`.
+    ScopeAmbiguous,
+    /// The daemon reported `NOT_READY`.
+    NotReady,
+    /// The daemon reported `STALE_FENCE`.
+    StaleFence,
+    /// The daemon reported `FAILED_INTERNAL`.
+    FailedInternal,
 }
 
 impl AgentBridgeActivationDenialCode {
@@ -2147,6 +2183,12 @@ impl AgentBridgeActivationDenialCode {
     pub const fn as_str(self) -> &'static str {
         match self {
             Self::SemanticResolutionUnavailable => AGENT_BRIDGE_SEMANTIC_RESOLUTION_UNAVAILABLE,
+            Self::TaskSelectionRequired => AGENT_BRIDGE_TASK_SELECTION_REQUIRED,
+            Self::ScopeSelectionRequired => AGENT_BRIDGE_SCOPE_SELECTION_REQUIRED,
+            Self::ScopeAmbiguous => AGENT_BRIDGE_SCOPE_AMBIGUOUS,
+            Self::NotReady => AGENT_BRIDGE_NOT_READY,
+            Self::StaleFence => AGENT_BRIDGE_STALE_FENCE,
+            Self::FailedInternal => AGENT_BRIDGE_FAILED_INTERNAL,
         }
     }
 }
@@ -2198,7 +2240,10 @@ impl AgentBridgeActivationResponse {
     /// Current activation response contract version.
     pub const CONTRACT_VERSION: u16 = AGENT_BRIDGE_ACTIVATION_RESPONSE_WIRE_VERSION;
 
-    /// Constructs the only R13.1b-authorized response while semantic resolution is absent.
+    /// Constructs the fail-closed denial response for one exact request: either
+    /// a Kernel-owned refusal with no daemon disposition (pre-ticket immediate
+    /// denial or result-less expiry) or the typed projection of one daemon
+    /// non-`Resolved` disposition supplied by the caller.
     pub fn denied(
         request: &AgentBridgeActivationRequest,
         reason_code: AgentBridgeActivationDenialCode,
@@ -3883,6 +3928,54 @@ mod tests {
         let mut unknown_response = encoded;
         unknown_response["session_id"] = Value::String("forbidden-session".to_owned());
         assert!(serde_json::from_value::<AgentBridgeActivationResponse>(unknown_response).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn bridge_activation_denial_codes_roundtrip_each_typed_variant() -> Result<(), ProtocolError> {
+        let cases = [
+            (
+                AgentBridgeActivationDenialCode::SemanticResolutionUnavailable,
+                AGENT_BRIDGE_SEMANTIC_RESOLUTION_UNAVAILABLE,
+            ),
+            (
+                AgentBridgeActivationDenialCode::TaskSelectionRequired,
+                AGENT_BRIDGE_TASK_SELECTION_REQUIRED,
+            ),
+            (
+                AgentBridgeActivationDenialCode::ScopeSelectionRequired,
+                AGENT_BRIDGE_SCOPE_SELECTION_REQUIRED,
+            ),
+            (
+                AgentBridgeActivationDenialCode::ScopeAmbiguous,
+                AGENT_BRIDGE_SCOPE_AMBIGUOUS,
+            ),
+            (
+                AgentBridgeActivationDenialCode::NotReady,
+                AGENT_BRIDGE_NOT_READY,
+            ),
+            (
+                AgentBridgeActivationDenialCode::StaleFence,
+                AGENT_BRIDGE_STALE_FENCE,
+            ),
+            (
+                AgentBridgeActivationDenialCode::FailedInternal,
+                AGENT_BRIDGE_FAILED_INTERNAL,
+            ),
+        ];
+        let mut seen = std::collections::BTreeSet::new();
+        for (code, wire) in cases {
+            assert_eq!(code.as_str(), wire);
+            assert!(seen.insert(wire), "denial wire codes must be distinct");
+            let encoded = serde_json::to_value(&code)
+                .map_err(|error| ProtocolError::Json(error.to_string()))?;
+            assert_eq!(encoded, Value::String(wire.to_owned()));
+            let decoded: AgentBridgeActivationDenialCode = serde_json::from_value(encoded)
+                .map_err(|error| ProtocolError::Json(error.to_string()))?;
+            assert_eq!(decoded, code);
+            assert_eq!(decoded.as_str(), wire);
+        }
+        assert_eq!(seen.len(), cases.len());
         Ok(())
     }
 
