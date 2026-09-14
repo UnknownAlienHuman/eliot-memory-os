@@ -1,21 +1,24 @@
 use std::collections::BTreeSet;
 
 use eliot_agent_api::{
-    AgentLaunchRequest, AgentWorkUnitBrief, AllowedMode, AttemptId, BudgetEnvelope, EffectCeiling,
-    EffectKind, EpochId, ExecutionUnit, LaunchRequestId, LowercaseSha256, NativeSession,
-    ProviderExecutionBinding, RequestId, ResourceGeneration, RouteFingerprint, StateFence, TaskId,
-    WorkLeaseId, WorkUnitId, candidate_digest_for,
+    AdmittedRouteReceipt, AgentLaunchRequest, AgentWorkUnitBrief, AllowedMode, AttemptId,
+    BudgetEnvelope, CONTRACT_VERSION, DecisionId, EffectCeiling, EffectKind, EpochId,
+    ExecutionUnit, LaunchRequestId, LowercaseSha256, NativeSession, ProviderExecutionBinding,
+    RequestId, ResourceGeneration, RouteFingerprint, StateFence, TaskId, WorkLeaseId, WorkUnitId,
+    candidate_digest_for,
 };
 use eliot_agent_contracts::RevisionId;
 use eliot_agent_coordinator::{
-    AdmissionId, AdmittedLaneReceipt, AgentCoordinator, CandidateId, CoordinatorConfig,
-    CoordinatorError, CoordinatorEvent, ExecutionContext, PlanGap, ProviderAdmissionReceipt,
-    ProviderExecutionBindingSubmission, ProviderIdentity, RecipeId, RecipeManifest, RoleProfileId,
-    RoleProfileManifest, RouteCandidateEvidence, StaffingLaneRequest, StaffingPlanRequest,
-    WorkerId,
+    AdmissionId, AdmittedLaneReceipt, AdmittedProviderCapability, AgentCoordinator, CandidateId,
+    CoordinatorConfig, CoordinatorError, CoordinatorEvent, ExecutionContext, PlanGap,
+    ProviderAdmissionReceipt, ProviderExecutionBindingSubmission, ProviderIdentity, RecipeId,
+    RecipeManifest, RoleProfileId, RoleProfileManifest, RouteCandidateEvidence,
+    StaffingLaneRequest, StaffingPlanCandidate, StaffingPlanRequest, WorkerId,
 };
 use eliot_contracts::{EpochLineageId, sha256_hex};
 use eliot_evaluation_contracts::BudgetEvidence;
+use eliot_kernel_service::ProviderCapabilityExpectation;
+use eliot_receipts::ProofCeiling;
 use eliot_security_contracts::PrivacyClass;
 
 type TestResult<T = ()> = Result<T, Box<dyn std::error::Error>>;
@@ -369,5 +372,147 @@ fn serde_rejects_unknown_fields_and_invented_accepted_status() -> TestResult {
     });
     assert!(serde_json::from_value::<PlanGap>(invented).is_err());
     let _ = AllowedMode::Material;
+    Ok(())
+}
+
+fn integration_provider_identity() -> TestResult<ProviderIdentity> {
+    Ok(ProviderIdentity {
+        verifier_identity: "sealed-integration-verifier".to_owned(),
+        a01_acceptance_receipt_ref: "a01-accepted-proof".to_owned(),
+        a01_contract_revision: "a01-rev-1".to_owned(),
+        g11_provider_revision: "g11-rev-1".to_owned(),
+        capacity_identity: "capacity-a".to_owned(),
+        capacity_revision: RevisionId::new("capacity-rev-1")?,
+    })
+}
+
+/// Builds daemon-supplied Kernel admission from exact owner records. Every
+/// digest is recomputed with the same `sha256_hex` validator the production
+/// verifier uses; no canned pass value is hardcoded.
+fn integration_capability(revoked: bool) -> TestResult<AdmittedProviderCapability> {
+    let epoch = test_epoch(TEST_LINEAGE_A, 1);
+    Ok(AdmittedProviderCapability::new(
+        integration_provider_identity()?,
+        "claim-integration-1".to_owned(),
+        "attempt-integration-1".to_owned(),
+        "op-integration-1".to_owned(),
+        sha256_hex(b"claim-binding-material-integration-1"),
+        sha256_hex(b"executable-material-integration-1"),
+        "route-rev-7".to_owned(),
+        "capacity-rev-3".to_owned(),
+        ProviderCapabilityExpectation {
+            current_route_revision: "route-rev-7".to_owned(),
+            current_capacity_revision: "capacity-rev-3".to_owned(),
+            live_authority_epoch: epoch.clone(),
+            revoked,
+        },
+        epoch,
+        0,
+    )?)
+}
+
+fn integration_zero_digest() -> TestResult<LowercaseSha256> {
+    Ok(serde_json::from_value(serde_json::json!(
+        "0000000000000000000000000000000000000000000000000000000000000000"
+    ))?)
+}
+
+fn integration_admission_receipt(
+    candidate: &StaffingPlanCandidate,
+) -> TestResult<ProviderAdmissionReceipt> {
+    let lane = candidate
+        .lanes
+        .first()
+        .ok_or("candidate must carry one lane")?;
+    let selected = lane
+        .routing
+        .selected
+        .clone()
+        .ok_or("candidate must select a route")?;
+    let attempt_id = AttemptId::new("attempt-integration-1")?;
+    let lease_id = serde_json::from_value::<WorkLeaseId>(
+        serde_json::json!({"namespace": "eliot.governor.work-lease", "revision": "v1", "value": "lease-integration-1"}),
+    )?;
+    let mut admitted_route = AdmittedRouteReceipt {
+        schema_version: CONTRACT_VERSION.to_owned(),
+        decision_id: DecisionId::new("decision-integration-1")?,
+        candidate_digest: candidate_digest_for(&lane.routing)?,
+        attempt_id: attempt_id.clone(),
+        lease_id: lease_id.clone(),
+        state_fence: candidate.state_fence.clone(),
+        runtime_generation: ResourceGeneration::genesis(),
+        policy_revision: lane.routing.policy_revision,
+        requested_route: selected.clone(),
+        selected_route: Some(selected.clone()),
+        no_route: None,
+        evidence_refs: lane.routing.evidence_refs.clone(),
+        proof_ceiling: ProofCeiling::CandidateArtifact,
+        self_digest: integration_zero_digest()?,
+    };
+    admitted_route.self_digest = admitted_route.compute_digest()?;
+    admitted_route
+        .validate()
+        .map_err(|error| format!("integration admission fixture must validate: {error}"))?;
+    Ok(ProviderAdmissionReceipt {
+        admission_id: AdmissionId::new("admission-integration-1")?,
+        candidate_id: candidate.candidate_id.clone(),
+        launch_request_id: candidate.launch_request_id.clone(),
+        recipe_id: candidate.recipe_id.clone(),
+        recipe_revision: candidate.recipe_revision.clone(),
+        task_id: candidate.task_id.clone(),
+        task_revision: candidate.task_revision.clone(),
+        plan_revision: candidate.plan_revision.clone(),
+        state_fence: candidate.state_fence.clone(),
+        controller_epoch: test_epoch(TEST_LINEAGE_A, 1),
+        coordinator_lease: serde_json::from_value::<WorkLeaseId>(
+            serde_json::json!({"namespace": "eliot.governor.work-lease", "revision": "v1", "value": "coordinator-lease-integration-1"}),
+        )?,
+        provider_identity: integration_provider_identity()?,
+        g11_admission_receipt_ref: "proof-admission-integration-1".to_owned(),
+        durable_job_ref: "durable-job-integration-1".to_owned(),
+        admitted_lanes: vec![AdmittedLaneReceipt {
+            work_unit_id: lane.work_unit_id.clone(),
+            role_id: lane.role_id.clone(),
+            role_revision: lane.role_revision.clone(),
+            attempt_id,
+            lease_id,
+            worker_id: WorkerId::new("worker-integration-1")?,
+            route: selected,
+            routing_receipt_digest: candidate_digest_for(&lane.routing)?,
+            budget: lane.budget.clone(),
+            priority: lane.priority,
+            mutation_scope: lane.mutation_scope.clone(),
+            admitted_route: Some(admitted_route),
+        }],
+    })
+}
+
+#[test]
+fn production_capability_admits_and_restores_receipt() -> TestResult {
+    let cfg = config()?;
+    let mut coordinator =
+        AgentCoordinator::new_with_admitted_provider(cfg.clone(), integration_capability(false)?)?;
+    let candidate = coordinator.plan(request()?)?;
+    let admitted = coordinator.admit(integration_admission_receipt(&candidate)?)?;
+    assert_eq!(admitted.admitted_lanes.len(), 1);
+    let snapshot = coordinator.snapshot()?;
+    let restored = AgentCoordinator::restore_with_admitted_provider(
+        snapshot.clone(),
+        cfg.clone(),
+        integration_capability(false)?,
+    )?;
+    assert_eq!(restored.events(), coordinator.events());
+    assert_eq!(restored.snapshot()?, snapshot);
+    // Revoked Kernel evidence fails a fresh restore closed: the stored
+    // `Verified` label alone never restores authority.
+    assert_eq!(
+        AgentCoordinator::restore_with_admitted_provider(
+            snapshot,
+            cfg,
+            integration_capability(true)?,
+        )
+        .err(),
+        Some(CoordinatorError::StaleProviderBinding)
+    );
     Ok(())
 }

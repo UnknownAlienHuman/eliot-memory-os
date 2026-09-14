@@ -181,6 +181,8 @@ verification.
 Owned entrypoint:
 
 ```rust
+AgentCoordinator::new_with_admitted_provider(CoordinatorConfig, AdmittedProviderCapability)
+AgentCoordinator::restore_with_admitted_provider(CoordinatorSnapshot, CoordinatorConfig, AdmittedProviderCapability)
 AgentCoordinator::admit(ProviderAdmissionReceipt)
 ```
 
@@ -191,9 +193,16 @@ Responsibility:
 - preserve idempotency and reject stale provider/capacity generations;
 - create no provider authority locally.
 
-The public constructor intentionally installs a typed `PLAN_GAP` provider until
-an accepted adapter exists. Do not add a caller-implementable or
-`always_verified` verifier.
+The plan-only constructor (`AgentCoordinator::new`) intentionally installs a
+typed `PLAN_GAP` provider. Closed production verification arrives only through
+`new_with_admitted_provider` / `restore_with_admitted_provider`, which require
+an in-memory `AdmittedProviderCapability` built by the daemon from exact Kernel
+claim material (`verify_provider_capability`) plus the current
+`ProviderCapabilityExpectation`; the coordinator performs no I/O and launches
+nothing, every `verify` re-runs the Kernel pure verifier, and restore
+re-verifies every event against freshly supplied capability data. Do not add a
+caller-implementable or `always_verified` verifier, and never accept a
+serialized `Verified` label as authority.
 
 ### `agent.coordinator.attempt-reconciliation`
 
