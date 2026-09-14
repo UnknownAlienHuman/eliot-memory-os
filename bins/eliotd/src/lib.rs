@@ -442,9 +442,7 @@ impl DaemonComposition {
     /// Governor owner. Callers take a fresh adapter per operation so a
     /// Governor refresh surfaces as an exact-view mismatch instead of silent
     /// divergence.
-    pub fn skill_lifecycle(
-        &self,
-    ) -> Result<impl eliot_skill::SkillLifecycleApi + '_, DaemonError> {
+    pub fn skill_lifecycle(&self) -> Result<impl eliot_skill::SkillLifecycleApi + '_, DaemonError> {
         if self.readiness() != eliot_governor::CompositionReadiness::Ready {
             return Err(DaemonError::Composition(
                 eliot_governor::CompositionError::NotReady,
@@ -479,9 +477,11 @@ impl DaemonComposition {
                 eliot_governor::CompositionError::NotReady,
             ));
         }
-        Ok(observation_adapters::ForwardingObservationReconciliation::new(
-            self.governor.observation_reconciliation(),
-        ))
+        Ok(
+            observation_adapters::ForwardingObservationReconciliation::new(
+                self.governor.observation_reconciliation(),
+            ),
+        )
     }
 
     /// Stops the one daemon owner and releases protected handles together.

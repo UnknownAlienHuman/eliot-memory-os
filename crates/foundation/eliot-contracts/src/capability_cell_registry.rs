@@ -703,10 +703,7 @@ impl CapabilityCellRegistry {
     }
 }
 
-fn push_duplicate_cells(
-    cells: &[CapabilityCellRecord],
-    diagnostics: &mut Vec<RegistryDiagnostic>,
-) {
+fn push_duplicate_cells(cells: &[CapabilityCellRecord], diagnostics: &mut Vec<RegistryDiagnostic>) {
     let mut index = 0;
     while index < cells.len() {
         let mut next = index + 1;
@@ -811,14 +808,24 @@ fn validate_manifest(
     manifest: &EffectiveMicroModuleManifest,
     diagnostics: &mut Vec<RegistryDiagnostic>,
 ) {
-    validate_capsule(cell, "module-contract-kit", &manifest.contract_kit, diagnostics);
+    validate_capsule(
+        cell,
+        "module-contract-kit",
+        &manifest.contract_kit,
+        diagnostics,
+    );
     validate_capsule(
         cell,
         "crate-context-capsule",
         &manifest.context_capsule,
         diagnostics,
     );
-    validate_capsule(cell, "module-test-capsule", &manifest.test_capsule, diagnostics);
+    validate_capsule(
+        cell,
+        "module-test-capsule",
+        &manifest.test_capsule,
+        diagnostics,
+    );
 }
 
 fn validate_capsule(

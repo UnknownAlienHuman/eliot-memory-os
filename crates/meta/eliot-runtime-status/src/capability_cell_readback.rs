@@ -20,7 +20,7 @@
 //!   never derived from `Debug` formatting.
 
 use eliot_contracts::{
-    CapabilityCellRegistry, EXPECTED_NORMATIVE_PAIR_KEY, ProofCeiling, ProductPulse,
+    CapabilityCellRegistry, EXPECTED_NORMATIVE_PAIR_KEY, ProductPulse, ProofCeiling,
     RegistryDiagnostic, RegistryValidationError,
 };
 use serde::{Deserialize, Serialize};
@@ -183,12 +183,13 @@ pub fn resolve_generation_via_registry(
         .ok_or_else(|| CellReadbackError::UnknownGeneration {
             generation: generation.to_owned(),
         })?;
-    let proof_entrypoint = record
-        .proof_entrypoint
-        .as_ref()
-        .ok_or_else(|| CellReadbackError::MissingProof {
-            cell: record.cell.as_str().to_owned(),
-        })?;
+    let proof_entrypoint =
+        record
+            .proof_entrypoint
+            .as_ref()
+            .ok_or_else(|| CellReadbackError::MissingProof {
+                cell: record.cell.as_str().to_owned(),
+            })?;
     let (product_pulse, not_applicable_reason) = match &record.product_pulse {
         ProductPulse::Referenced(pulse) => (Some(pulse.as_str().to_owned()), None),
         ProductPulse::NotApplicable { reason } => {
@@ -200,11 +201,12 @@ pub fn resolve_generation_via_registry(
             (None, Some(reason.as_str().to_owned()))
         }
     };
-    let registry_digest = registry
-        .registry_digest()
-        .map_err(|error| CellReadbackError::DigestFailed {
-            detail: error.to_string(),
-        })?;
+    let registry_digest =
+        registry
+            .registry_digest()
+            .map_err(|error| CellReadbackError::DigestFailed {
+                detail: error.to_string(),
+            })?;
     Ok(GenerationCellResolution {
         generation: generation.to_owned(),
         cell: record.cell.as_str().to_owned(),

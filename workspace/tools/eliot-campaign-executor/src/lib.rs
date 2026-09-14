@@ -221,8 +221,7 @@ impl LedgerEvent {
             &self.payload,
             &self.previous_segment_hash,
         );
-        let unsigned_bytes =
-            canonical_bytes(&unsigned).context("canonical JSON serialization")?;
+        let unsigned_bytes = canonical_bytes(&unsigned).context("canonical JSON serialization")?;
         let computed = self.raw_bytes.as_deref().map_or_else(
             || digest(&unsigned_bytes, self.hash_algorithm),
             |bytes| digest(bytes, HashAlgorithm::Sha256),

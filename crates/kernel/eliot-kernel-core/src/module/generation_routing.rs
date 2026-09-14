@@ -555,11 +555,10 @@ mod tests {
     }
 
     fn canonical_epoch(lineage: &str, sequence: u64) -> Result<EpochId, KernelError> {
-        let lineage_id =
-            EpochLineageId::new(lineage).map_err(|_| KernelError::InvalidField {
-                field: "lineage_id",
-                reason: "must be a canonical UUID lineage",
-            })?;
+        let lineage_id = EpochLineageId::new(lineage).map_err(|_| KernelError::InvalidField {
+            field: "lineage_id",
+            reason: "must be a canonical UUID lineage",
+        })?;
         let sequence = NonZeroU64::new(sequence).ok_or(KernelError::InvalidField {
             field: "sequence",
             reason: "must be greater than zero",
@@ -584,7 +583,11 @@ mod tests {
         let same = canonical_epoch("550e8400-e29b-41d4-a716-446655440000", 2)?;
         let cross_lineage_same_sequence =
             canonical_epoch("6ba7b810-9dad-11d1-80b4-00c04fd430c8", 2)?;
-        assert!(router.route_for_canonical_fence(&fence, &same, &active).is_ok());
+        assert!(
+            router
+                .route_for_canonical_fence(&fence, &same, &active)
+                .is_ok()
+        );
         assert!(matches!(
             router.route_for_canonical_fence(&fence, &cross_lineage_same_sequence, &active),
             Err(KernelError::FenceMismatch)

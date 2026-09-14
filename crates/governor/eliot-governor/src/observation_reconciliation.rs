@@ -157,21 +157,27 @@ impl<'a, P: ?Sized> GovernorObservationReconciliation<'a, P> {
 /// The digest is the lowercase hex SHA-256 over the canonical JSON bytes of
 /// the exact admitted fence, so an external verifier holding the same fence
 /// computes the identical echo without trusting caller-supplied text.
-fn doctor_fence_echo(fence: &StateFence) -> Result<eliot_doctor_core::StateFence, CompositionError> {
-    let bytes = canonical_json_bytes(fence)
-        .map_err(|error| CompositionError::Owner(format!("cannot canonicalize active fence: {error}")))?;
+fn doctor_fence_echo(
+    fence: &StateFence,
+) -> Result<eliot_doctor_core::StateFence, CompositionError> {
+    let bytes = canonical_json_bytes(fence).map_err(|error| {
+        CompositionError::Owner(format!("cannot canonicalize active fence: {error}"))
+    })?;
     eliot_doctor_core::StateFence::new(
         fence.authority_epoch.value(),
         fence.resource_generation.value(),
         sha256_hex(&bytes),
     )
-    .map_err(|_| CompositionError::Owner("active fence does not project to a doctor echo".to_owned()))
+    .map_err(|_| {
+        CompositionError::Owner("active fence does not project to a doctor echo".to_owned())
+    })
 }
 
 /// Canonical digest helper for admission-contract digests.
 fn canonical_digest(value: &impl serde::Serialize) -> Result<String, CompositionError> {
-    let bytes = canonical_json_bytes(value)
-        .map_err(|error| CompositionError::Owner(format!("cannot canonicalize admission bytes: {error}")))?;
+    let bytes = canonical_json_bytes(value).map_err(|error| {
+        CompositionError::Owner(format!("cannot canonicalize admission bytes: {error}"))
+    })?;
     Ok(sha256_hex(&bytes))
 }
 
@@ -228,7 +234,9 @@ fn resolve_problem(
         )));
     }
     let problem_id = candidates.into_iter().next().ok_or_else(|| {
-        owner_refused("doctor verification problem binding is empty after uniqueness check".to_owned())
+        owner_refused(
+            "doctor verification problem binding is empty after uniqueness check".to_owned(),
+        )
     })?;
     let expected = problem_revisions.get(&problem_id).copied().unwrap_or(0);
     if expected == 0 {
@@ -351,12 +359,16 @@ fn check_problem_transition(
         revision: expected_revision,
         reopen_count: 0,
     };
-    scratch
-        .validate()
-        .map_err(|error| owner_refused(format!("verified problem scratch state is not admissible: {error}")))?;
+    scratch.validate().map_err(|error| {
+        owner_refused(format!(
+            "verified problem scratch state is not admissible: {error}"
+        ))
+    })?;
     scratch
         .transition(fence, ProblemState::Resolved)
-        .map_err(|error| owner_refused(format!("verified problem cannot legally resolve: {error}")))?;
+        .map_err(|error| {
+            owner_refused(format!("verified problem cannot legally resolve: {error}"))
+        })?;
     Ok(())
 }
 
@@ -392,7 +404,8 @@ fn observation_envelope(
         operation_id: observation_operation.clone(),
         request: identity.request.metadata.clone(),
         idempotency_key: identity.idempotency_key.clone(),
-        scope_id: ScopeId::new(GOVERNOR_SCOPE_ID).map_err(|error| owner_refused(error.to_string()))?,
+        scope_id: ScopeId::new(GOVERNOR_SCOPE_ID)
+            .map_err(|error| owner_refused(error.to_string()))?,
         task_id: identity
             .request
             .metadata
@@ -429,7 +442,10 @@ fn observation_envelope(
 /// Builds the problem-leg envelope under the base operation identity,
 /// binding the already-admitted observation by its digests and the problem
 /// by its compare-and-swap revision head.
-#[allow(clippy::too_many_arguments, reason = "the recovery envelope binds every verified identity explicitly")]
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the recovery envelope binds every verified identity explicitly"
+)]
 fn recovery_envelope(
     identity: &eliot_protocol::RequestIdentity,
     operation_id: &OperationId,
@@ -475,7 +491,8 @@ fn recovery_envelope(
         operation_id: operation_id.clone(),
         request: identity.request.metadata.clone(),
         idempotency_key: identity.idempotency_key.clone(),
-        scope_id: ScopeId::new(GOVERNOR_SCOPE_ID).map_err(|error| owner_refused(error.to_string()))?,
+        scope_id: ScopeId::new(GOVERNOR_SCOPE_ID)
+            .map_err(|error| owner_refused(error.to_string()))?,
         task_id: identity
             .request
             .metadata
@@ -584,9 +601,9 @@ fn validate_report_independence(
     report: &VerificationReport,
     doctor_fence: &eliot_doctor_core::StateFence,
 ) -> Result<IndependentVerification, CompositionError> {
-    report
-        .validate()
-        .map_err(|error| owner_refused(format!("doctor verification report is malformed: {error}")))?;
+    report.validate().map_err(|error| {
+        owner_refused(format!("doctor verification report is malformed: {error}"))
+    })?;
     report
         .attempt
         .validate()
@@ -601,9 +618,9 @@ fn validate_report_independence(
         ));
     }
     for handle in &report.evidence.evidence {
-        handle
-            .validate()
-            .map_err(|error| owner_refused(format!("doctor evidence handle is malformed: {error}")))?;
+        handle.validate().map_err(|error| {
+            owner_refused(format!("doctor evidence handle is malformed: {error}"))
+        })?;
     }
     let verified = report.endorse(doctor_fence).map_err(|_| {
         owner_refused(
@@ -811,11 +828,7 @@ impl<P: KernelTransitionPort + ?Sized> GovernorObservationReconciliation<'_, P> 
         expected_hash: &str,
         manifest_digest: &OperationManifestDigest,
     ) -> Result<WriteReceipt, CompositionError> {
-        let receipt = match self
-            .canonical
-            .commit(self.kernel, identity, envelope)
-            .await
-        {
+        let receipt = match self.canonical.commit(self.kernel, identity, envelope).await {
             Ok(receipt) => receipt,
             Err(CompositionError::Kernel(KernelPortError::Unknown(_))) => {
                 match self.kernel.receipt(observation_operation.clone()).await? {
@@ -851,11 +864,7 @@ impl<P: KernelTransitionPort + ?Sized> GovernorObservationReconciliation<'_, P> 
         expected_hash: &str,
         manifest_digest: &OperationManifestDigest,
     ) -> Result<WriteReceipt, CompositionError> {
-        let receipt = match self
-            .canonical
-            .commit(self.kernel, identity, envelope)
-            .await
-        {
+        let receipt = match self.canonical.commit(self.kernel, identity, envelope).await {
             Ok(receipt) => receipt,
             Err(CompositionError::Kernel(KernelPortError::Unknown(_))) => {
                 match self.kernel.receipt(operation_id.clone()).await? {
@@ -900,13 +909,8 @@ impl<P: KernelTransitionPort + ?Sized> GovernorObservationReconciliation<'_, P> 
         let doctor_fence = self.validate_identity_fence(identity)?;
         let verified = validate_report_independence(report, &doctor_fence)?;
         let binding = self.resolve_problem_binding(report)?;
-        let scratch = self.admit_scratch_observation(
-            operation_id,
-            identity,
-            report,
-            &verified,
-            &binding,
-        )?;
+        let scratch =
+            self.admit_scratch_observation(operation_id, identity, report, &verified, &binding)?;
         let legs = build_doctor_leg_envelopes(
             identity,
             operation_id,
@@ -923,12 +927,7 @@ impl<P: KernelTransitionPort + ?Sized> GovernorObservationReconciliation<'_, P> 
             recovery_hash,
         } = legs;
         if let Some(receipt) = self
-            .reconcile_existing_receipt(
-                identity,
-                operation_id,
-                &recovery_hash,
-                &manifest_digest,
-            )
+            .reconcile_existing_receipt(identity, operation_id, &recovery_hash, &manifest_digest)
             .await?
         {
             return Ok(receipt);
@@ -973,17 +972,17 @@ mod tests {
         ResourceGeneration, SessionId, SourceId,
     };
     use eliot_doctor_core::{
-        ArtifactBinding, DiagnosticBrief, EvaluationOutcome, EvidenceHandle, IndependenceClass,
-        IndependenceProfile, RegisteredOperation, RepairAttemptIdentity, RepairEffectIdentity,
-        RepairOperationRef, RepairRecipe, RepairRecipeIdentity, RepairRecipeManifest, RepairClass,
-        ScopeAttestation, VerificationExecution, VerificationReport, VerifierEvidence,
-        AttemptIdentityBinding,
+        ArtifactBinding, AttemptIdentityBinding, DiagnosticBrief, EvaluationOutcome,
+        EvidenceHandle, IndependenceClass, IndependenceProfile, RegisteredOperation,
+        RepairAttemptIdentity, RepairClass, RepairEffectIdentity, RepairOperationRef, RepairRecipe,
+        RepairRecipeIdentity, RepairRecipeManifest, ScopeAttestation, VerificationExecution,
+        VerificationReport, VerifierEvidence,
     };
     use eliot_protocol::RequestIdentity;
     use eliot_receipts::RequestBinding;
     use eliot_store_api::{
-        CommitId, OrderingHeadExpectation, PreparedTransition, Resubmission, RevisionHeadExpectation,
-        ScopeRevisionView, StoreHealth, WriteReceipt, WriteReceiptStatus,
+        CommitId, OrderingHeadExpectation, PreparedTransition, Resubmission,
+        RevisionHeadExpectation, ScopeRevisionView, StoreHealth, WriteReceipt, WriteReceiptStatus,
         issue_store_receipt_envelope, validate_store_receipt_envelope,
     };
 
@@ -1168,8 +1167,7 @@ mod tests {
                 let sequence = u64::try_from(committed.len())
                     .map_err(|error| KernelPortError::Contract(error.to_string()))?
                     + 1;
-                let receipt =
-                    build_test_receipt(&identity, &transition, &hash, sequence)?;
+                let receipt = build_test_receipt(&identity, &transition, &hash, sequence)?;
                 *self.apply_calls.lock().expect("apply lock") += 1;
                 committed.insert(
                     key,
@@ -1195,9 +1193,7 @@ mod tests {
         }
 
         fn health(&self) -> KernelPortFuture<'_, StoreHealth> {
-            Box::pin(async move {
-                Err(KernelPortError::NotAdmitted("test port".to_owned()))
-            })
+            Box::pin(async move { Err(KernelPortError::NotAdmitted("test port".to_owned())) })
         }
     }
 
@@ -1289,8 +1285,7 @@ mod tests {
         operation_value: &RepairOperationRef,
         doctor_fence: &eliot_doctor_core::StateFence,
     ) -> RepairAttemptIdentity {
-        let recipe_identity =
-            RepairRecipeIdentity::bind(recipe_value).expect("recipe identity");
+        let recipe_identity = RepairRecipeIdentity::bind(recipe_value).expect("recipe identity");
         RepairAttemptIdentity::bind(&AttemptIdentityBinding {
             attempt_id,
             brief: brief_value,
@@ -1526,11 +1521,7 @@ mod tests {
             "false verification was not rejected: {rejected:?}"
         );
         assert_eq!(kernel.apply_count(), 0);
-        assert!(kernel
-            .committed
-            .lock()
-            .expect("committed lock")
-            .is_empty());
+        assert!(kernel.committed.lock().expect("committed lock").is_empty());
         assert_eq!(kernel.problem_revision("problem-1"), Some(3));
     }
 
@@ -1544,9 +1535,14 @@ mod tests {
         let operation_id = OperationId::new("op-doctor-replay").expect("operation id");
         let report_value = valid_report("problem-1", "attempt-replay");
         let refs = evidence_refs(&report_value);
-        let submission =
-            verification_submission(&operation_id, &identity_value, &report_value, "problem-1", &refs)
-                .expect("submission builds");
+        let submission = verification_submission(
+            &operation_id,
+            &identity_value,
+            &report_value,
+            "problem-1",
+            &refs,
+        )
+        .expect("submission builds");
         let mut recovered = ObservationJournal::default();
         let admitted = recovered.admit(submission).expect("recovery admission");
         assert!(matches!(
@@ -1586,10 +1582,6 @@ mod tests {
             matches!(mutated, Err(CompositionError::Owner(_))),
             "mutated bytes under the same idempotency key must conflict: {mutated:?}"
         );
-        assert_eq!(
-            kernel.apply_count(),
-            2,
-            "conflicting retry must not commit"
-        );
+        assert_eq!(kernel.apply_count(), 2, "conflicting retry must not commit");
     }
 }

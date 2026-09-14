@@ -29,7 +29,9 @@
 
 #![forbid(unsafe_code)]
 
-use eliot_skill::{PromotionGate, SkillCandidate, SkillError, SkillLifecycleApi, SkillLifecycleView};
+use eliot_skill::{
+    PromotionGate, SkillCandidate, SkillError, SkillLifecycleApi, SkillLifecycleView,
+};
 
 /// Forwards one [`SkillLifecycleApi`] to the single Governor owner.
 ///

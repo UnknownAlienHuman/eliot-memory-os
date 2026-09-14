@@ -667,8 +667,7 @@ impl ProcessExecutor for WindowsProcessExecutor {
             let view = guard.state.view();
             let sink = Arc::clone(&guard.sink);
             drop(guard);
-            let evidence =
-                ProcessEvidence::new_typed(view, None, None, EvidenceAxes::observed());
+            let evidence = ProcessEvidence::new_typed(view, None, None, EvidenceAxes::observed());
             let published = match evidence {
                 Ok(evidence) => sink.record(evidence).is_ok(),
                 Err(_) => false,
@@ -1636,10 +1635,7 @@ mod tests {
         let executor = WindowsProcessExecutor::new(Arc::new(port));
         let sink_dyn: Arc<dyn ProcessEvidenceSink> = Arc::new(FailingSink);
         let result = block_on(executor.start(request, sink_dyn));
-        assert!(matches!(
-            result,
-            Err(ProcessExecutionError::UnknownOutcome)
-        ));
+        assert!(matches!(result, Err(ProcessExecutionError::UnknownOutcome)));
         let inspected = block_on(executor.inspect(operation_id))?;
         assert_eq!(inspected.lifecycle(), ProcessLifecycle::UnknownOutcome);
         Ok(())

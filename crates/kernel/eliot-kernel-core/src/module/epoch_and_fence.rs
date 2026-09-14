@@ -283,9 +283,9 @@ pub fn authorizes_canonical(fence_epoch: &EpochId, active: &EpochId) -> bool {
 #[must_use]
 pub fn is_stale_canonical(fence_epoch: &EpochId, active: &EpochId) -> bool {
     match fence_epoch.relation_to(active) {
-        EpochRelation::Same
-        | EpochRelation::DirectParent
-        | EpochRelation::SameLineageNewer => false,
+        EpochRelation::Same | EpochRelation::DirectParent | EpochRelation::SameLineageNewer => {
+            false
+        }
         EpochRelation::DirectChild
         | EpochRelation::SameLineageOlder
         | EpochRelation::UnrelatedLineage => true,
@@ -422,11 +422,10 @@ mod tests {
     }
 
     fn canonical_epoch(lineage: &str, sequence: u64) -> Result<EpochId, KernelError> {
-        let lineage_id =
-            EpochLineageId::new(lineage).map_err(|_| KernelError::InvalidField {
-                field: "lineage_id",
-                reason: "must be a canonical UUID lineage",
-            })?;
+        let lineage_id = EpochLineageId::new(lineage).map_err(|_| KernelError::InvalidField {
+            field: "lineage_id",
+            reason: "must be a canonical UUID lineage",
+        })?;
         let sequence = NonZeroU64::new(sequence).ok_or(KernelError::InvalidField {
             field: "sequence",
             reason: "must be greater than zero",

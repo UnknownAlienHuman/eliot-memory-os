@@ -4370,13 +4370,17 @@ impl WindowsInstallationEffectPort {
         spec: &InstallerRootPrimitiveSpec,
     ) -> Result<InstallationEffectObservation, PortError> {
         if observation.service_name() != registration.service_name()
-            || observation.configuration_digest()
-                != registration.expected_configuration_digest()
+            || observation.configuration_digest() != registration.expected_configuration_digest()
         {
             return Err(PortError::InvalidRequestMetadata);
         }
         if request.precondition.os_snapshot.is_some() {
-            return Self::service_start_absent(request, registration, reason, service_runtime_lineage);
+            return Self::service_start_absent(
+                request,
+                registration,
+                reason,
+                service_runtime_lineage,
+            );
         }
         let snapshot = match self.primitive.inspect(spec).map_err(root_port_error)? {
             InstallerRootPrimitiveObservation::Absent(snapshot) => snapshot,
@@ -4462,7 +4466,9 @@ impl WindowsInstallationEffectPort {
             }
             ServiceRegistrationRuntimeInspection::Absent => Ok(root_mismatch("service-missing")),
             ServiceRegistrationRuntimeInspection::Mismatched => Ok(root_mismatch("service-config")),
-            ServiceRegistrationRuntimeInspection::Unknown { .. } => Ok(root_mismatch("service-readback")),
+            ServiceRegistrationRuntimeInspection::Unknown { .. } => {
+                Ok(root_mismatch("service-readback"))
+            }
         }
     }
 
@@ -4525,7 +4531,9 @@ impl WindowsInstallationEffectPort {
             }
             ServiceRegistrationRuntimeInspection::Absent => Ok(root_mismatch("service-missing")),
             ServiceRegistrationRuntimeInspection::Mismatched => Ok(root_mismatch("service-config")),
-            ServiceRegistrationRuntimeInspection::Unknown { .. } => Ok(root_mismatch("service-readback")),
+            ServiceRegistrationRuntimeInspection::Unknown { .. } => {
+                Ok(root_mismatch("service-readback"))
+            }
         }
     }
 
@@ -8654,12 +8662,11 @@ where
         transaction_id: &PlatformHandle,
         pending_ref: PlatformHandle,
     ) -> Result<InstallationStepOutcome, InstallationError> {
-        let mut transaction =
-            self.store.load(transaction_id)?.ok_or_else(|| {
-                InstallationError::TransactionNotFound {
-                    transaction_id: transaction_id.as_str().to_owned(),
-                }
-            })?;
+        let mut transaction = self.store.load(transaction_id)?.ok_or_else(|| {
+            InstallationError::TransactionNotFound {
+                transaction_id: transaction_id.as_str().to_owned(),
+            }
+        })?;
         transaction.validate()?;
         let expected = TransactionVersion::of(&transaction)?;
         transaction.mark_unknown(vec![pending_ref.clone()])?;

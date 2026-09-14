@@ -1591,7 +1591,8 @@ impl BlobReadyReceipt {
         }
         self.compression.validate()?;
         self.crypto.validate()?;
-        self.policy.validate_for_residency(&self.locator.residency)?;
+        self.policy
+            .validate_for_residency(&self.locator.residency)?;
         canonical_sha256(&self.anchor_fingerprint, "anchor_fingerprint")?;
         if self.root_generation != self.locator.root_generation
             || self.path_generation != self.locator.path_generation

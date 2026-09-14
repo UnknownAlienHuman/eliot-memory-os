@@ -209,7 +209,9 @@ fn genesis_entry_spec() -> OperationManifestSpec {
 pub fn generated_operation_manifests() -> Result<Vec<NamedOperationManifest>, StoreError> {
     let mut entries = Vec::with_capacity(ACTIVATED_READS.len() + 1);
     for descriptor in &ACTIVATED_READS {
-        entries.push(NamedOperationManifest::from_spec(read_entry_spec(descriptor))?);
+        entries.push(NamedOperationManifest::from_spec(read_entry_spec(
+            descriptor,
+        ))?);
     }
     entries.push(NamedOperationManifest::from_spec(genesis_entry_spec())?);
     let mut names = BTreeSet::new();

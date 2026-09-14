@@ -3,7 +3,7 @@
 mod request_input;
 
 use eliot_agent_bridge::{
-    kernel_ports_with_declaration, parse_args, BridgeRunner, CliError, Profile,
+    BridgeRunner, CliError, Profile, kernel_ports_with_declaration, parse_args,
 };
 use eliot_agent_bridge_core::{
     AttachRequest, BridgeError, ConnectionId, FencingToken, Generation, HostEventEnvelope,
@@ -188,9 +188,8 @@ fn main() {
     let host_gateway = HostRequestGateway;
     let mut provider_failure = false;
     if REQUEST_INPUT_PROFILE.validate().is_err() {
-        let detail = format!(
-            "request input profile {REQUEST_INPUT_PROFILE_ID} is internally inconsistent"
-        );
+        let detail =
+            format!("request input profile {REQUEST_INPUT_PROFILE_ID} is internally inconsistent");
         emit_error("BRIDGE_COMPOSITION_REJECTED", &detail);
         std::process::exit(PROVIDER_PORT_EXIT);
     }
@@ -215,8 +214,7 @@ fn main() {
                 if emit_bounded_rejection(&rejection) {
                     break;
                 }
-                if consecutive_invalid >= REQUEST_INPUT_PROFILE.max_consecutive_invalid_records
-                {
+                if consecutive_invalid >= REQUEST_INPUT_PROFILE.max_consecutive_invalid_records {
                     break;
                 }
                 continue;
@@ -248,8 +246,7 @@ fn main() {
                 if !found_terminator {
                     break;
                 }
-                if consecutive_invalid >= REQUEST_INPUT_PROFILE.max_consecutive_invalid_records
-                {
+                if consecutive_invalid >= REQUEST_INPUT_PROFILE.max_consecutive_invalid_records {
                     break;
                 }
                 continue;
@@ -261,15 +258,12 @@ fn main() {
                 consecutive_invalid = next_invalid;
                 let rejection = Response::Error {
                     code: "REQUEST_INVALID",
-                    detail: format!(
-                        "record is not valid UTF-8 ({REQUEST_INPUT_PROFILE_ID})"
-                    ),
+                    detail: format!("record is not valid UTF-8 ({REQUEST_INPUT_PROFILE_ID})"),
                 };
                 if emit_bounded_rejection(&rejection) {
                     break;
                 }
-                if consecutive_invalid >= REQUEST_INPUT_PROFILE.max_consecutive_invalid_records
-                {
+                if consecutive_invalid >= REQUEST_INPUT_PROFILE.max_consecutive_invalid_records {
                     break;
                 }
                 continue;
@@ -307,63 +301,63 @@ fn main() {
         };
         total_records = next_total;
         let response = match serde_json::from_str::<Request>(text) {
-                Ok(Request::Attach { request }) => match runner.attach(request) {
-                    Ok(_) => Response::Attached,
-                    Err(error) => {
-                        provider_failure |= matches!(error, BridgeError::PlanGap(_));
-                        bridge_error(&error)
-                    }
-                },
-                Ok(Request::Invoke { request }) => {
-                    handle_invocation(&host_gateway, &mut *host_request_port, &request)
+            Ok(Request::Attach { request }) => match runner.attach(request) {
+                Ok(_) => Response::Attached,
+                Err(error) => {
+                    provider_failure |= matches!(error, BridgeError::PlanGap(_));
+                    bridge_error(&error)
                 }
-                Ok(Request::Cancel { request }) => {
-                    handle_cancellation(&host_gateway, &mut *host_request_port, &request)
+            },
+            Ok(Request::Invoke { request }) => {
+                handle_invocation(&host_gateway, &mut *host_request_port, &request)
+            }
+            Ok(Request::Cancel { request }) => {
+                handle_cancellation(&host_gateway, &mut *host_request_port, &request)
+            }
+            Ok(Request::ForwardHook { event }) => match runner.forward_hook(&event) {
+                Ok(()) => Response::Forwarded,
+                Err(error) => {
+                    provider_failure |= is_provider_failure(&error);
+                    bridge_error(&error)
                 }
-                Ok(Request::ForwardHook { event }) => match runner.forward_hook(&event) {
-                    Ok(()) => Response::Forwarded,
-                    Err(error) => {
-                        provider_failure |= is_provider_failure(&error);
-                        bridge_error(&error)
-                    }
-                },
-                Ok(Request::ForwardEvent { event }) => match runner.forward_event(&event) {
-                    Ok(_) => Response::Forwarded,
-                    Err(error) => {
-                        provider_failure |= is_provider_failure(&error);
-                        bridge_error(&error)
-                    }
-                },
-                Ok(Request::ReconcileExternal {}) => match runner.reconcile_external() {
-                    Ok(_) => Response::Reconciled,
-                    Err(error) => {
-                        provider_failure |= is_provider_failure(&error);
-                        bridge_error(&error)
-                    }
-                },
-                Ok(Request::Reconnect {
-                    expected_connection_id,
-                    new_connection_id,
-                    session_id,
-                    activation_generation,
-                    authority_epoch,
-                    fence_nonce,
-                }) => handle_reconnect(
-                    &mut runner,
-                    &expected_connection_id,
-                    &new_connection_id,
-                    &session_id,
-                    activation_generation,
-                    authority_epoch,
-                    &fence_nonce,
-                ),
-                Ok(Request::Status) => status_response(config.profile, &runner),
-                Ok(Request::Stop) => Response::Stopped,
-                Err(error) => Response::Error {
-                    code: "REQUEST_INVALID",
-                    detail: error.to_string(),
-                },
-            };
+            },
+            Ok(Request::ForwardEvent { event }) => match runner.forward_event(&event) {
+                Ok(_) => Response::Forwarded,
+                Err(error) => {
+                    provider_failure |= is_provider_failure(&error);
+                    bridge_error(&error)
+                }
+            },
+            Ok(Request::ReconcileExternal {}) => match runner.reconcile_external() {
+                Ok(_) => Response::Reconciled,
+                Err(error) => {
+                    provider_failure |= is_provider_failure(&error);
+                    bridge_error(&error)
+                }
+            },
+            Ok(Request::Reconnect {
+                expected_connection_id,
+                new_connection_id,
+                session_id,
+                activation_generation,
+                authority_epoch,
+                fence_nonce,
+            }) => handle_reconnect(
+                &mut runner,
+                &expected_connection_id,
+                &new_connection_id,
+                &session_id,
+                activation_generation,
+                authority_epoch,
+                &fence_nonce,
+            ),
+            Ok(Request::Status) => status_response(config.profile, &runner),
+            Ok(Request::Stop) => Response::Stopped,
+            Err(error) => Response::Error {
+                code: "REQUEST_INVALID",
+                detail: error.to_string(),
+            },
+        };
         // Only the deserialization-failure arm above produces REQUEST_INVALID:
         // every handler, gateway, and runner error path uses a distinct code,
         // so this flag exactly tracks whether a request was dispatched. Valid

@@ -812,7 +812,9 @@ fn p3_rejects_scope_fence_contract_and_lease_mismatch() -> TestResult {
         Err(SwarmError::AssignmentMismatch)
     );
     let mut wrong_lease = assigned(&plan, "lane-a", "route-a")?;
-    wrong_lease.launch_attempt.lease = serde_json::from_value::<eliot_agent_api::WorkLeaseId>(serde_json::json!({"namespace": "eliot.governor.work-lease", "revision": "v1", "value": "other-lease"}))?;
+    wrong_lease.launch_attempt.lease = serde_json::from_value::<eliot_agent_api::WorkLeaseId>(
+        serde_json::json!({"namespace": "eliot.governor.work-lease", "revision": "v1", "value": "other-lease"}),
+    )?;
     assert_eq!(
         admit_wave(
             &plan,

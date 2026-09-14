@@ -7,11 +7,17 @@ use std::sync::{Arc, Mutex};
 
 use super::SharedStore;
 use super::absent;
+#[cfg(windows)]
+use super::absent_with_file_index;
 use super::admitted_precondition;
 use super::fake_port;
 use super::matching;
+#[cfg(windows)]
+use super::matching_for;
 use super::must;
 use super::planned_transaction;
+#[cfg(windows)]
+use super::system_registration_transaction;
 use super::test_handle;
 use super::test_ownership_secret;
 #[cfg(windows)]
@@ -19,51 +25,45 @@ use super::test_secret_creation_proof;
 #[cfg(windows)]
 use super::test_secret_reference;
 #[cfg(windows)]
-use super::absent_with_file_index;
-#[cfg(windows)]
-use super::matching_for;
-#[cfg(windows)]
-use super::system_registration_transaction;
-#[cfg(windows)]
 use crate::CredentialAccessReceipt;
 #[cfg(windows)]
 use crate::CredentialOwnershipMarkerIdentity;
-#[cfg(windows)]
-use crate::InstallationOsObjectSnapshot;
-#[cfg(windows)]
-use crate::InstallationOwnershipSecret;
-#[cfg(windows)]
-use crate::InstallationRootAbsentSnapshot;
-#[cfg(windows)]
-use crate::InstallationSecretProvisionDisposition;
-#[cfg(windows)]
-use crate::InstallationServiceProcessLineage;
-#[cfg(windows)]
-use crate::InstallationServiceStartProof;
-#[cfg(windows)]
-use crate::PackageObservationSnapshot;
-#[cfg(windows)]
-use crate::PlatformHandle;
-#[cfg(windows)]
-use crate::StoreCredentialLifecycle;
-#[cfg(windows)]
-use crate::StoreCredentialProgress;
-#[cfg(windows)]
-use crate::credential_matching_response_digest;
 use crate::InstallationCoordinator;
 use crate::InstallationCreateDisposition;
 use crate::InstallationEffectDisposition;
 use crate::InstallationEffectObservation;
 use crate::InstallationEffectPrecondition;
 use crate::InstallationEffectProgressState;
+#[cfg(windows)]
+use crate::InstallationOsObjectSnapshot;
+#[cfg(windows)]
+use crate::InstallationOwnershipSecret;
+#[cfg(windows)]
+use crate::InstallationRootAbsentSnapshot;
 use crate::InstallationSecretLifecycle;
+#[cfg(windows)]
+use crate::InstallationSecretProvisionDisposition;
+#[cfg(windows)]
+use crate::InstallationServiceProcessLineage;
+#[cfg(windows)]
+use crate::InstallationServiceStartProof;
 use crate::InstallationStage;
 use crate::InstallationStepOutcome;
 use crate::InstallationTransaction;
 use crate::InstallationTransactionStore;
 use crate::InstallerEffectPlan;
 use crate::InstallerServiceRole;
+#[cfg(windows)]
+use crate::PackageObservationSnapshot;
+#[cfg(windows)]
+use crate::PlatformHandle;
 use crate::PortOutcome;
+#[cfg(windows)]
+use crate::StoreCredentialLifecycle;
+#[cfg(windows)]
+use crate::StoreCredentialProgress;
+#[cfg(windows)]
+use crate::credential_matching_response_digest;
 
 /// s33.3 (#1313): distinct ownership-secret references for multi-secret
 /// rollback. `test_ownership_secret` uses one fixed target, so two secrets in
@@ -324,9 +324,7 @@ fn interrupted_service_rollback_resumes_after_first_delete() {
     let host_change = transaction
         .planned_changes
         .iter()
-        .find(|change| {
-            change.change_id == *transaction.installer_effects[host_index].effect_id()
-        })
+        .find(|change| change.change_id == *transaction.installer_effects[host_index].effect_id())
         .cloned()
         .unwrap_or_else(|| unreachable!());
     let empty_precondition = must(InstallationEffectPrecondition::from_change(&host_change));
@@ -344,9 +342,9 @@ fn interrupted_service_rollback_resumes_after_first_delete() {
         .validate()
         .expect_err("pre-fix empty service Absent must fail strict validate()");
     assert!(
-        error.to_string().contains(
-            "absence must contain an independently observed OS snapshot"
-        ),
+        error
+            .to_string()
+            .contains("absence must contain an independently observed OS snapshot"),
         "pre-fix validate() must report the missing OS snapshot, observed {error}"
     );
 
@@ -469,66 +467,51 @@ fn interrupted_rollback_resumes_through_all_effect_kinds() {
             .position(predicate)
             .unwrap_or_else(|| unreachable!())
     };
-    let root_index = find_effect(
-        &transaction,
-        &|effect| matches!(effect, InstallerEffectPlan::CreateRoot { .. }),
-    );
-    let package_index = find_effect(
-        &transaction,
-        &|effect| matches!(effect, InstallerEffectPlan::StagePackage { .. }),
-    );
-    let host_reg_index = find_effect(
-        &transaction,
-        &|effect| {
-            matches!(
-                effect,
-                InstallerEffectPlan::RegisterService {
-                    role: InstallerServiceRole::Host,
-                    ..
-                }
-            )
-        },
-    );
-    let watchdog_reg_index = find_effect(
-        &transaction,
-        &|effect| {
-            matches!(
-                effect,
-                InstallerEffectPlan::RegisterService {
-                    role: InstallerServiceRole::Watchdog,
-                    ..
-                }
-            )
-        },
-    );
-    let provision_index = find_effect(
-        &transaction,
-        &|effect| matches!(effect, InstallerEffectPlan::ProvisionStoreCredential { .. }),
-    );
-    let watchdog_start_index = find_effect(
-        &transaction,
-        &|effect| {
-            matches!(
-                effect,
-                InstallerEffectPlan::StartService {
-                    role: InstallerServiceRole::Watchdog,
-                    ..
-                }
-            )
-        },
-    );
-    let host_start_index = find_effect(
-        &transaction,
-        &|effect| {
-            matches!(
-                effect,
-                InstallerEffectPlan::StartService {
-                    role: InstallerServiceRole::Host,
-                    ..
-                }
-            )
-        },
-    );
+    let root_index = find_effect(&transaction, &|effect| {
+        matches!(effect, InstallerEffectPlan::CreateRoot { .. })
+    });
+    let package_index = find_effect(&transaction, &|effect| {
+        matches!(effect, InstallerEffectPlan::StagePackage { .. })
+    });
+    let host_reg_index = find_effect(&transaction, &|effect| {
+        matches!(
+            effect,
+            InstallerEffectPlan::RegisterService {
+                role: InstallerServiceRole::Host,
+                ..
+            }
+        )
+    });
+    let watchdog_reg_index = find_effect(&transaction, &|effect| {
+        matches!(
+            effect,
+            InstallerEffectPlan::RegisterService {
+                role: InstallerServiceRole::Watchdog,
+                ..
+            }
+        )
+    });
+    let provision_index = find_effect(&transaction, &|effect| {
+        matches!(effect, InstallerEffectPlan::ProvisionStoreCredential { .. })
+    });
+    let watchdog_start_index = find_effect(&transaction, &|effect| {
+        matches!(
+            effect,
+            InstallerEffectPlan::StartService {
+                role: InstallerServiceRole::Watchdog,
+                ..
+            }
+        )
+    });
+    let host_start_index = find_effect(&transaction, &|effect| {
+        matches!(
+            effect,
+            InstallerEffectPlan::StartService {
+                role: InstallerServiceRole::Host,
+                ..
+            }
+        )
+    });
     // Rollback rev-iterates `CreatedByTransaction`, so the stuck-rc4 shape
     // (Watchdog service deleted first, Host deleted by this recover) requires
     // this exact ascending order; rev then visits Provision first and the
@@ -575,13 +558,12 @@ fn interrupted_rollback_resumes_through_all_effect_kinds() {
                     image_path: test_handle(r"C:\Eliot\host.exe"),
                 }),
             });
-        transaction.effect_progress[start_index].state =
-            InstallationEffectProgressState::Applied {
-                disposition: InstallationEffectDisposition::CreatedByTransaction,
-                external_identity: test_handle(format!("external:start:{role:?}")),
-                evidence: vec![test_handle(format!("evidence:start:{role:?}"))],
-                postcondition_digest: test_handle("2".repeat(64)),
-            };
+        transaction.effect_progress[start_index].state = InstallationEffectProgressState::Applied {
+            disposition: InstallationEffectDisposition::CreatedByTransaction,
+            external_identity: test_handle(format!("external:start:{role:?}")),
+            evidence: vec![test_handle(format!("evidence:start:{role:?}"))],
+            postcondition_digest: test_handle("2".repeat(64)),
+        };
     }
 
     // Provision to Applied CreatedByTransaction with a credential snapshot,
@@ -641,7 +623,9 @@ fn interrupted_rollback_resumes_through_all_effect_kinds() {
                 lifecycle: StoreCredentialLifecycle::DeleteIntentCommitted,
                 receipt: Some(CredentialAccessReceipt {
                     transaction_id: transaction.transaction_id.clone(),
-                    effect_id: transaction.effect_progress[provision_index].effect_id.clone(),
+                    effect_id: transaction.effect_progress[provision_index]
+                        .effect_id
+                        .clone(),
                     generation: provision.generation,
                     config_digest: provision.config_digest.clone(),
                     target: provision.target.clone(),
@@ -671,9 +655,7 @@ fn interrupted_rollback_resumes_through_all_effect_kinds() {
         let change = transaction
             .planned_changes
             .iter()
-            .find(|change| {
-                change.change_id == transaction.effect_progress[root_index].effect_id
-            })
+            .find(|change| change.change_id == transaction.effect_progress[root_index].effect_id)
             .cloned()
             .unwrap_or_else(|| unreachable!());
         let object = InstallationOsObjectSnapshot {
@@ -740,9 +722,7 @@ fn interrupted_rollback_resumes_through_all_effect_kinds() {
         let change = transaction
             .planned_changes
             .iter()
-            .find(|change| {
-                change.change_id == transaction.effect_progress[package_index].effect_id
-            })
+            .find(|change| change.change_id == transaction.effect_progress[package_index].effect_id)
             .cloned()
             .unwrap_or_else(|| unreachable!());
         let files = Vec::new();
@@ -864,8 +844,7 @@ fn interrupted_rollback_resumes_through_all_effect_kinds() {
     );
     // Both ownership secrets (root forward-first, then provision) are already
     // absent: no secret delete call, just absence evidence.
-    port.secret_absence =
-        vec![PortOutcome::Known(true), PortOutcome::Known(true)].into();
+    port.secret_absence = vec![PortOutcome::Known(true), PortOutcome::Known(true)].into();
     let mut coordinator = InstallationCoordinator::new(port, store.clone());
     assert!(matches!(
         must(coordinator.rollback(&transaction_id)),

@@ -36,10 +36,9 @@ use eliot_skill::{
 use eliot_store_api::{
     CONTRACT_VERSION, EffectClass, EventProjectionRelationIntents, NamedMutationOperation,
     NamedMutationRequest, NamedOperationManifest, OperationManifestDigest, OrderingHeadExpectation,
-    OrderingScopeId, ScopeId, SecurityContext, STORE_FAILURE_CONTRACT_REVISION, StoreFailure,
+    OrderingScopeId, STORE_FAILURE_CONTRACT_REVISION, ScopeId, SecurityContext, StoreFailure,
     StoreFailureDisposition, StoreFailureIdentityContext, StoreMutationDisposition,
-    StoreReasonCode, StoreRecoveryAction, StoreRetryDirective, TransitionClass,
-    WriteReceiptStatus,
+    StoreReasonCode, StoreRecoveryAction, StoreRetryDirective, TransitionClass, WriteReceiptStatus,
 };
 
 use crate::{CanonicalAdmissionOwner, CompositionError, KernelPortError, KernelTransitionPort};
@@ -120,8 +119,8 @@ fn store_failure(
     recovery: StoreRecoveryAction,
     ctx: &StoreFailureIdentityContext,
 ) -> Result<StoreFailure, SkillError> {
-    let reason_code =
-        StoreReasonCode::new(reason_token).map_err(|error| SkillError::Serialization(error.to_string()))?;
+    let reason_code = StoreReasonCode::new(reason_token)
+        .map_err(|error| SkillError::Serialization(error.to_string()))?;
     let failure = StoreFailure {
         contract_revision: STORE_FAILURE_CONTRACT_REVISION.to_owned(),
         disposition,
@@ -370,8 +369,7 @@ impl<P: KernelTransitionPort + ?Sized> SkillLifecycleApi for GovernorSkillLifecy
         ctx: &eliot_contracts::RequestMetadata,
         skill_id: String,
     ) -> Result<Option<SkillLifecycleView>, SkillError> {
-        ctx.validate()
-            .map_err(|_| SkillError::IdentityMismatch)?;
+        ctx.validate().map_err(|_| SkillError::IdentityMismatch)?;
         if &ctx.state_fence != self.canonical.state_fence() {
             return Err(SkillError::FenceMismatch);
         }
@@ -394,8 +392,7 @@ impl<P: KernelTransitionPort + ?Sized> SkillLifecycleApi for GovernorSkillLifecy
         dependencies: Vec<eliot_skill::DependencyVersion>,
         scope: eliot_skill::SkillScope,
     ) -> Result<SkillCandidate, SkillError> {
-        ctx.validate()
-            .map_err(|_| SkillError::IdentityMismatch)?;
+        ctx.validate().map_err(|_| SkillError::IdentityMismatch)?;
         if &ctx.state_fence != self.canonical.state_fence() {
             return Err(SkillError::FenceMismatch);
         }
@@ -531,7 +528,14 @@ impl<P: KernelTransitionPort + ?Sized> SkillLifecycleApi for GovernorSkillLifecy
                     StoreRecoveryAction::EscalateInternalDefect,
                 ),
             };
-            let failure = store_failure(disposition, reason, StoreMutationDisposition::NotAttempted, retry, recovery, &ctx)?;
+            let failure = store_failure(
+                disposition,
+                reason,
+                StoreMutationDisposition::NotAttempted,
+                retry,
+                recovery,
+                &ctx,
+            )?;
             return Err(SkillError::Store(failure));
         }
         Ok(receipt)
@@ -638,10 +642,9 @@ mod tests {
                         "test gateway: committed operation identity conflict".to_owned(),
                     ));
                 }
-                let sequence =
-                    u64::try_from(committed.len()).map_err(|error| {
-                        KernelPortError::Contract(error.to_string())
-                    })? + 1;
+                let sequence = u64::try_from(committed.len())
+                    .map_err(|error| KernelPortError::Contract(error.to_string()))?
+                    + 1;
                 let operation_id = transition.identity.operation_id.clone();
                 let candidate = WriteReceipt {
                     operation_id: operation_id.clone(),
@@ -678,12 +681,8 @@ mod tests {
                 .map_err(|error| KernelPortError::Contract(error.to_string()))?;
                 let mut receipt = candidate;
                 receipt.envelope = Some(envelope);
-                validate_store_receipt_envelope(
-                    &identity.request.metadata,
-                    &transition,
-                    &receipt,
-                )
-                .map_err(|error| KernelPortError::Contract(error.to_string()))?;
+                validate_store_receipt_envelope(&identity.request.metadata, &transition, &receipt)
+                    .map_err(|error| KernelPortError::Contract(error.to_string()))?;
                 *self.apply_calls.lock().expect("apply lock") += 1;
                 committed.insert(operation_id, (identity, receipt.clone()));
                 Ok(receipt)
@@ -702,9 +701,7 @@ mod tests {
         }
 
         fn health(&self) -> KernelPortFuture<'_, StoreHealth> {
-            Box::pin(async move {
-                Err(KernelPortError::NotAdmitted("test port".to_owned()))
-            })
+            Box::pin(async move { Err(KernelPortError::NotAdmitted("test port".to_owned())) })
         }
     }
 
@@ -852,8 +849,7 @@ mod tests {
         let candidate_value = candidate(&fence, &base);
         let gate_value = gate(&fence, &candidate_value);
         let identity_value = identity(&fence);
-        let operation_id =
-            OperationId::new("op-skill-positive").expect("operation id");
+        let operation_id = OperationId::new("op-skill-positive").expect("operation id");
         let receipt = block_on(owner.promote(
             &identity_value,
             operation_id.clone(),
@@ -871,14 +867,10 @@ mod tests {
             .expect("receipt route")
             .expect("stored receipt");
         assert_eq!(stored, receipt);
-        let rebuilt =
-            SkillRegistry::from_snapshot([promoted.clone()]).expect("reconstruction");
+        let rebuilt = SkillRegistry::from_snapshot([promoted.clone()]).expect("reconstruction");
         let read = rebuilt.view("skill-demo").expect("rebuilt view");
         assert_eq!(read.lifecycle_revision, 2);
-        assert_eq!(
-            read.skill_ref.package_digest,
-            "b".repeat(64)
-        );
+        assert_eq!(read.skill_ref.package_digest, "b".repeat(64));
         assert_eq!(read.state_fence, fence);
     }
 
@@ -908,16 +900,14 @@ mod tests {
         assert!(
             matches!(
                 rejected,
-                Err(SkillError::IdentityMismatch | SkillError::RevisionConflict | SkillError::NotFound)
+                Err(SkillError::IdentityMismatch
+                    | SkillError::RevisionConflict
+                    | SkillError::NotFound)
             ),
             "stale base was not rejected without promotion: {rejected:?}"
         );
         assert_eq!(kernel.apply_count(), 0);
-        assert!(kernel
-            .committed
-            .lock()
-            .expect("lock")
-            .is_empty());
+        assert!(kernel.committed.lock().expect("lock").is_empty());
     }
 
     #[test]

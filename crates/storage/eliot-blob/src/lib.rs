@@ -1810,8 +1810,11 @@ fn scoped_payload_path(
         .normalized_identity()
         .strip_suffix(suffix.as_str())
         .ok_or(BlobError::MetadataPayloadMismatch)?;
-    WorkScopePath::new(format!("{stem}.r{}.p{}", scope.digest, locator.path_generation))
-        .map_err(|error| BlobError::InvalidContract(error.to_string()))
+    WorkScopePath::new(format!(
+        "{stem}.r{}.p{}",
+        scope.digest, locator.path_generation
+    ))
+    .map_err(|error| BlobError::InvalidContract(error.to_string()))
 }
 
 /// Residency-scoped metadata path (same construction as the payload path).
@@ -1826,8 +1829,11 @@ fn scoped_metadata_path(
         .normalized_identity()
         .strip_suffix(suffix.as_str())
         .ok_or(BlobError::MetadataPayloadMismatch)?;
-    WorkScopePath::new(format!("{stem}.r{}.m{}", scope.digest, locator.path_generation))
-        .map_err(|error| BlobError::InvalidContract(error.to_string()))
+    WorkScopePath::new(format!(
+        "{stem}.r{}.m{}",
+        scope.digest, locator.path_generation
+    ))
+    .map_err(|error| BlobError::InvalidContract(error.to_string()))
 }
 
 /// Prefix that enumerates every residency scope stored for one locator.
@@ -4434,11 +4440,7 @@ where
         ports: BlobServicePorts<P, C, K, A, L>,
     ) -> Result<Self, BlobError> {
         Ok(Self {
-            core: Arc::new(BlobStoreCore::claim(
-                lease,
-                Some(owner.clone()),
-                ports,
-            )?),
+            core: Arc::new(BlobStoreCore::claim(lease, Some(owner.clone()), ports)?),
         })
     }
 
@@ -5087,8 +5089,13 @@ mod tests {
             }
             delete()?;
             self.delete_calls = self.delete_calls.saturating_add(1);
-            let mut receipt =
-                deletion_receipt(operation_id, proof, locator, intent_revision, residency_sha256);
+            let mut receipt = deletion_receipt(
+                operation_id,
+                proof,
+                locator,
+                intent_revision,
+                residency_sha256,
+            );
             if self.tamper_receipt {
                 receipt.path_digest_sha256 = sha256_hex(b"wrong-path");
             }
@@ -5357,8 +5364,8 @@ mod tests {
         let expected_anchor = test_anchor();
         assert_eq!(ready.anchor_fingerprint(), expected_anchor.fingerprint());
         assert_eq!(ready.plaintext_length(), 7);
-        let chunk = block_on(client.read(read_request(&ready, "roundtrip-read", &root)))
-            .expect("read");
+        let chunk =
+            block_on(client.read(read_request(&ready, "roundtrip-read", &root))).expect("read");
         assert_eq!(chunk.bytes(), b"payload");
         assert_eq!(chunk.anchor_fingerprint(), expected_anchor.fingerprint());
         assert!(chunk.is_complete());
@@ -5383,9 +5390,8 @@ mod tests {
         let store = gc_store(TestGcMode::NotApplied, false, &root);
         let live =
             block_on(store.stage(stage_request("live", b"live-payload", &root))).expect("live");
-        let unreachable =
-            block_on(store.stage(stage_request("orphan", b"orphan-payload", &root)))
-                .expect("orphan");
+        let unreachable = block_on(store.stage(stage_request("orphan", b"orphan-payload", &root)))
+            .expect("orphan");
         let request = gc_request(
             vec![live.locator().clone()],
             vec![live.locator().clone(), unreachable.locator().clone()],
@@ -5421,9 +5427,8 @@ mod tests {
     fn stale_reachability_plan_is_rejected_before_tombstone() {
         let root = unique_test_root();
         let store = gc_store(TestGcMode::NotApplied, true, &root);
-        let orphan =
-            block_on(store.stage(stage_request("stale-orphan", b"payload", &root)))
-                .expect("orphan");
+        let orphan = block_on(store.stage(stage_request("stale-orphan", b"payload", &root)))
+            .expect("orphan");
         let request = gc_request(Vec::new(), vec![orphan.locator().clone()], &root);
         assert_eq!(
             block_on(store.gc(request)),
@@ -5469,9 +5474,8 @@ mod tests {
     fn unknown_gc_outcome_is_durable_and_not_blindly_retried() {
         let root = unique_test_root();
         let store = gc_store(TestGcMode::Unknown, false, &root);
-        let orphan =
-            block_on(store.stage(stage_request("unknown-orphan", b"payload", &root)))
-                .expect("orphan");
+        let orphan = block_on(store.stage(stage_request("unknown-orphan", b"payload", &root)))
+            .expect("orphan");
         let request = gc_request(Vec::new(), vec![orphan.locator().clone()], &root);
         assert!(matches!(
             block_on(store.gc(request.clone())),
@@ -5538,9 +5542,8 @@ mod tests {
     fn applied_reconciliation_after_effect_does_not_delete_again() {
         let root = unique_test_root();
         let store = gc_store(TestGcMode::Unknown, false, &root);
-        let orphan =
-            block_on(store.stage(stage_request("crash-orphan", b"payload", &root)))
-                .expect("orphan");
+        let orphan = block_on(store.stage(stage_request("crash-orphan", b"payload", &root)))
+            .expect("orphan");
         let request = gc_request(Vec::new(), vec![orphan.locator().clone()], &root);
         assert!(matches!(
             block_on(store.gc(request.clone())),
@@ -5760,9 +5763,11 @@ mod tests {
             fail_write: Some(BlobCapacityStage::JournalWrite),
             ..MemoryPlatform::default()
         };
-        let error = block_on(
-            store_with_platform(platform, &root).stage(stage_request("journal-full", b"payload", &root)),
-        )
+        let error = block_on(store_with_platform(platform, &root).stage(stage_request(
+            "journal-full",
+            b"payload",
+            &root,
+        )))
         .expect_err("journal capacity must be surfaced");
         let BlobError::StorageCapacity { failure } = error else {
             panic!("expected typed journal capacity failure");
@@ -5791,10 +5796,11 @@ mod tests {
             fail_rename: true,
             ..MemoryPlatform::default()
         };
-        let error = block_on(
-            store_with_platform(platform, &root)
-                .stage(stage_request("publication-full", b"payload", &root)),
-        )
+        let error = block_on(store_with_platform(platform, &root).stage(stage_request(
+            "publication-full",
+            b"payload",
+            &root,
+        )))
         .expect_err("publication capacity must remain uncertain");
         let BlobError::StorageCapacity { failure } = error else {
             panic!("expected typed publication capacity failure");
@@ -5817,9 +5823,11 @@ mod tests {
             fail_remove: true,
             ..MemoryPlatform::default()
         };
-        let error = block_on(
-            store_with_platform(platform, &root).stage(stage_request("cleanup-full", b"payload", &root)),
-        )
+        let error = block_on(store_with_platform(platform, &root).stage(stage_request(
+            "cleanup-full",
+            b"payload",
+            &root,
+        )))
         .expect_err("cleanup capacity must remain observable");
         let BlobError::StorageCapacity { failure } = error else {
             panic!("expected typed cleanup capacity failure");
@@ -5842,10 +5850,7 @@ mod tests {
     /// and the owner before removing the directory.
     fn unique_owner_root() -> PathBuf {
         let sequence = TEST_ROOT_COUNTER.fetch_add(1, Ordering::Relaxed);
-        std::env::temp_dir().join(format!(
-            "eliot-t3b-owner-{}-{sequence}",
-            std::process::id()
-        ))
+        std::env::temp_dir().join(format!("eliot-t3b-owner-{}-{sequence}", std::process::id()))
     }
 
     fn owner_test_store(
@@ -5875,8 +5880,9 @@ mod tests {
             BlobRootOwner::claim(root.clone(), "t3b-owner", std::process::id()).expect("claim");
         let lease = stage_request("owner-bootstrap", b"", &root).root_lease;
         let store = owner_test_store(&owner, lease);
-        let ready = block_on(store.stage(stage_request("owner-roundtrip", b"owner-payload", &root)))
-            .expect("stage");
+        let ready =
+            block_on(store.stage(stage_request("owner-roundtrip", b"owner-payload", &root)))
+                .expect("stage");
         assert_eq!(ready.plaintext_length(), 13);
         let chunk = block_on(store.read(read_request(&ready, "owner-read", &root))).expect("read");
         assert_eq!(chunk.bytes(), b"owner-payload");
@@ -5919,8 +5925,7 @@ mod tests {
         // So is an OS claim on a service-held root — rejected before any
         // filesystem work by the same unified registry.
         assert_eq!(
-            BlobRootOwner::claim(root.clone(), "t3b-owner-late", std::process::id())
-                .map(|_| ()),
+            BlobRootOwner::claim(root.clone(), "t3b-owner-late", std::process::id()).map(|_| ()),
             Err(BlobError::OwnerConflict)
         );
     }
@@ -5969,8 +5974,7 @@ mod tests {
         );
         // A lease for a different root never binds to this owner.
         let foreign_root = unique_test_root();
-        let foreign_lease =
-            stage_request("bootstrap-foreign", b"", &foreign_root).root_lease;
+        let foreign_lease = stage_request("bootstrap-foreign", b"", &foreign_root).root_lease;
         assert_eq!(
             BlobStoreService::new_with_owner(
                 &owner,
@@ -5989,8 +5993,7 @@ mod tests {
         );
         // A second OS claim on the owner-held root is rejected as well.
         assert_eq!(
-            BlobRootOwner::claim(root.clone(), "t3b-owner-second", std::process::id())
-                .map(|_| ()),
+            BlobRootOwner::claim(root.clone(), "t3b-owner-second", std::process::id()).map(|_| ()),
             Err(BlobError::OwnerConflict)
         );
         drop(bound);
@@ -6007,11 +6010,19 @@ mod tests {
         // under the same policy but different scope domains are different
         // locators and different physical objects by construction.
         let first = block_on(store.stage(stage_request_with_scope(
-            "xdom-a", bytes, &root, "policy-xdom", "scope-a",
+            "xdom-a",
+            bytes,
+            &root,
+            "policy-xdom",
+            "scope-a",
         )))
         .expect("domain a");
         let second = block_on(store.stage(stage_request_with_scope(
-            "xdom-b", bytes, &root, "policy-xdom", "scope-b",
+            "xdom-b",
+            bytes,
+            &root,
+            "policy-xdom",
+            "scope-b",
         )))
         .expect("domain b");
         assert_ne!(first.locator(), second.locator());
@@ -6075,9 +6086,8 @@ mod tests {
     fn partial_live_set_blocks_gc_before_any_effect() {
         let root = unique_test_root();
         let store = gc_store(TestGcMode::NotApplied, false, &root);
-        let orphan =
-            block_on(store.stage(stage_request("partial-orphan", b"payload", &root)))
-                .expect("orphan");
+        let orphan = block_on(store.stage(stage_request("partial-orphan", b"payload", &root)))
+            .expect("orphan");
         let mut request = gc_request(Vec::new(), vec![orphan.locator().clone()], &root);
         request.live_set.completeness = LiveSetCompleteness::Partial;
         assert_eq!(
@@ -6103,11 +6113,9 @@ mod tests {
         let store = gc_store(TestGcMode::NotApplied, false, &root);
         let live =
             block_on(store.stage(stage_request("reach-live", b"live", &root))).expect("live");
-        let view = block_on(store.reachability(reachability_request(
-            vec![live.locator().clone()],
-            &root,
-        )))
-        .expect("reachability view");
+        let view =
+            block_on(store.reachability(reachability_request(vec![live.locator().clone()], &root)))
+                .expect("reachability view");
         assert!(view.present.contains(live.locator()));
         assert!(view.missing.is_empty());
         // A locator with no stored scope reports missing without failing.
@@ -6129,21 +6137,18 @@ mod tests {
             root_generation: 7,
             path_generation: 1,
         };
-        let absent_view = block_on(store.reachability(reachability_request(
-            vec![absent.clone()],
-            &root,
-        )))
-        .expect("absent view");
+        let absent_view =
+            block_on(store.reachability(reachability_request(vec![absent.clone()], &root)))
+                .expect("absent view");
         assert!(absent_view.missing.contains(&absent));
         assert!(absent_view.present.is_empty());
         // A stale live-set source blocks the view instead of reporting
         // reachability against a superseded union.
         let stale_root = unique_test_root();
         let stale_store = gc_store(TestGcMode::NotApplied, true, &stale_root);
-        let staged = block_on(
-            stale_store.stage(stage_request("reach-stale", b"stale", &stale_root)),
-        )
-        .expect("staged");
+        let staged =
+            block_on(stale_store.stage(stage_request("reach-stale", b"stale", &stale_root)))
+                .expect("staged");
         assert_eq!(
             block_on(stale_store.reachability(reachability_request(
                 vec![staged.locator().clone()],

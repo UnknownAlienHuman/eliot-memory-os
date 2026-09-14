@@ -8895,14 +8895,10 @@ fn rollback_registering_with_cli_persisted_registry_rejection_succeeds() {
     let pending_ref = must(registry_projection_pending_ref(&transaction_id));
     assert_eq!(
         pending_ref.as_str(),
-        format!(
-            "pending:registry-projection:{}",
-            transaction_id.as_str()
-        )
+        format!("pending:registry-projection:{}", transaction_id.as_str())
     );
-    let persisted = must(
-        coordinator.persist_non_effect_rejection(&transaction_id, pending_ref.clone()),
-    );
+    let persisted =
+        must(coordinator.persist_non_effect_rejection(&transaction_id, pending_ref.clone()));
     assert!(matches!(
         persisted,
         InstallationStepOutcome::RollbackRequired { ref pending_refs }
@@ -8910,10 +8906,7 @@ fn rollback_registering_with_cli_persisted_registry_rejection_succeeds() {
     ));
     let persisted_state = must(store.load(&transaction_id)).unwrap_or_else(|| unreachable!());
     assert_eq!(persisted_state.stage(), InstallationStage::RollbackRequired);
-    assert_eq!(
-        persisted_state.pending_external_changes,
-        vec![pending_ref]
-    );
+    assert_eq!(persisted_state.pending_external_changes, vec![pending_ref]);
     assert!(!persisted_state.has_activation_projection_intent());
     // Later recover/rollback reaches RolledBack with registration rollback executed.
     let outcome = must(coordinator.rollback(&transaction_id));

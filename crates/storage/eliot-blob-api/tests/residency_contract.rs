@@ -81,7 +81,12 @@ fn make_stage_request(operation: &str, scope: &str) -> BlobStageRequest {
 fn residency_scoped_stage_request_is_accepted() {
     let request = make_stage_request("stage-residency-1", "scope-a");
     assert_eq!(request.residency.scope_domain_id.as_str(), "scope-a");
-    assert!(request.policy.validate_for_residency(&request.residency).is_ok());
+    assert!(
+        request
+            .policy
+            .validate_for_residency(&request.residency)
+            .is_ok()
+    );
     assert!(request.validate().is_ok());
     // Wire round-trip preserves the full residency identity.
     let wire = ok(serde_json::to_string(&request));

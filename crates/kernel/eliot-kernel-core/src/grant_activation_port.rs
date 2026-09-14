@@ -1571,11 +1571,10 @@ mod tests {
     use std::num::NonZeroU64;
 
     fn canonical_epoch(lineage: &str, sequence: u64) -> Result<EpochId, KernelError> {
-        let lineage_id =
-            EpochLineageId::new(lineage).map_err(|_| KernelError::InvalidField {
-                field: "lineage_id",
-                reason: "must be a canonical UUID lineage",
-            })?;
+        let lineage_id = EpochLineageId::new(lineage).map_err(|_| KernelError::InvalidField {
+            field: "lineage_id",
+            reason: "must be a canonical UUID lineage",
+        })?;
         let sequence = NonZeroU64::new(sequence).ok_or(KernelError::InvalidField {
             field: "sequence",
             reason: "must be greater than zero",
