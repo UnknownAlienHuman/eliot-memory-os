@@ -1248,7 +1248,7 @@ mod tests {
         BudgetEnvelope, EffectKind, EpochId, LaunchRequestId, QuotaKnowledge, ResourceGeneration,
         StateFence, WorkUnitId,
     };
-    use eliot_contracts::{EpochLineageId};
+    use eliot_contracts::EpochLineageId;
     use std::num::NonZeroU64;
 
     const TEST_LINEAGE_A: &str = "550e8400-e29b-41d4-a716-446655440000";

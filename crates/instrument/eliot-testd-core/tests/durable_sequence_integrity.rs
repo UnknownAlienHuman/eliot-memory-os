@@ -18,8 +18,13 @@ use std::time::{SystemTime, UNIX_EPOCH};
 fn test_epoch(sequence: u64) -> eliot_contracts::EpochId {
     use eliot_contracts::{EpochId, EpochLineageId};
     use std::num::NonZeroU64;
-    let lineage = EpochLineageId::new("550e8400-e29b-41d4-a716-446655440000").expect("canonical test lineage-A");
-    EpochId::new(lineage, NonZeroU64::new(sequence).expect("non-zero test sequence")).expect("valid test epoch")
+    let lineage = EpochLineageId::new("550e8400-e29b-41d4-a716-446655440000")
+        .expect("canonical test lineage-A");
+    EpochId::new(
+        lineage,
+        NonZeroU64::new(sequence).expect("non-zero test sequence"),
+    )
+    .expect("valid test epoch")
 }
 
 const JOBS: TableDefinition<&str, &[u8]> = TableDefinition::new("testd_jobs_v1");
@@ -142,7 +147,8 @@ fn fixture_process(
             PermitIssuance::new(
                 eliot_process::ActionLeaseRef::new(format!("lease-{job_id}"))
                     .expect("fixture lease"),
-                FencingToken::new(test_epoch(7), generation, format!("fence-{job_id}")).expect("fixture fence"),
+                FencingToken::new(test_epoch(7), generation, format!("fence-{job_id}"))
+                    .expect("fixture fence"),
                 BTreeMap::from([
                     ("authority".to_owned(), "a".repeat(64)),
                     ("state".to_owned(), "b".repeat(64)),

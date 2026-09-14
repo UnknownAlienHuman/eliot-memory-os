@@ -637,8 +637,13 @@ mod tests {
     use std::num::NonZeroU64;
 
     fn test_epoch(sequence: u64) -> EpochId {
-        let lineage = EpochLineageId::new("550e8400-e29b-41d4-a716-446655440000").expect("canonical test lineage-A");
-        EpochId::new(lineage, NonZeroU64::new(sequence).expect("non-zero test sequence")).expect("valid test epoch")
+        let lineage = EpochLineageId::new("550e8400-e29b-41d4-a716-446655440000")
+            .expect("canonical test lineage-A");
+        EpochId::new(
+            lineage,
+            NonZeroU64::new(sequence).expect("non-zero test sequence"),
+        )
+        .expect("valid test epoch")
     }
 
     fn source_id(value: &str) -> Result<SourceId, EvidenceError> {

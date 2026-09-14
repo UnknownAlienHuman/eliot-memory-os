@@ -1795,10 +1795,7 @@ mod tests {
             AttemptId, ExecutionUnit, NativeSession, NativeSessionLocator, RequestId, WorkLeaseId,
         };
         use eliot_contracts::{ResourceGeneration, StateFence};
-        let fence = StateFence::new(
-            test_epoch(TEST_LINEAGE_A, 1),
-            ResourceGeneration::new(1)?,
-        );
+        let fence = StateFence::new(test_epoch(TEST_LINEAGE_A, 1), ResourceGeneration::new(1)?);
         Ok(ProviderExecutionBinding {
             attempt_id: AttemptId::new("attempt-opencode")?,
             lease_id: serde_json::from_value(

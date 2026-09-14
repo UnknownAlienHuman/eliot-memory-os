@@ -15,32 +15,31 @@ use eliot_contracts::{
     ResourceGeneration, SessionId, SourceId, StateFence,
 };
 use eliot_notify_core::{
-    watchdog_notification_id, watchdog_request_hash, watchdog_request_id,
-    watchdog_signature_payload, A08AdmissionPort, AdmissionRequest, AdmissionResult,
-    DeliveryObservation, DeliveryProviderEvidence, DeliveryReceiptEvidence, DeliveryReceiptPort,
-    G08NotificationPort, LedgerCommitOutcome, LedgerIntent, LedgerReservation,
-    LedgerReserveOutcome, NotificationEnvelope, NotifyCore, OneShotLedgerPort,
-    SignedWatchdogFallbackEnvelope, VerificationPorts, WatchdogSignaturePort, WATCHDOG_PRODUCT_ID,
-    WATCHDOG_SIGNATURE_ALGORITHM, WATCHDOG_SIGNATURE_DOMAIN, WATCHDOG_SOURCE_ID,
+    A08AdmissionPort, AdmissionRequest, AdmissionResult, DeliveryObservation,
+    DeliveryProviderEvidence, DeliveryReceiptEvidence, DeliveryReceiptPort, G08NotificationPort,
+    LedgerCommitOutcome, LedgerIntent, LedgerReservation, LedgerReserveOutcome,
+    NotificationEnvelope, NotifyCore, OneShotLedgerPort, SignedWatchdogFallbackEnvelope,
+    VerificationPorts, WATCHDOG_PRODUCT_ID, WATCHDOG_SIGNATURE_ALGORITHM,
+    WATCHDOG_SIGNATURE_DOMAIN, WATCHDOG_SOURCE_ID, WatchdogSignaturePort, watchdog_notification_id,
+    watchdog_request_hash, watchdog_request_id, watchdog_signature_payload,
 };
 use eliot_platform::{
     NotificationObservation, NotificationPort, NotificationRequest, PlatformHandle, PortError,
     PortOutcome, ProviderError, ProviderErrorCode, UnknownReason, WorkScopePath,
 };
 use eliot_platform_windows::{
+    ProtectedPathLease, PublicationOutcome, WATCHDOG_FALLBACK_TASK_NAME, WatchdogTaskRegistration,
+    WatchdogTaskRegistrationReceipt, WatchdogTaskRunReceipt, WindowsPlatform,
     current_process_named_pipe_expectation, protected_program_data_path,
     register_interactive_watchdog_task, run_registered_watchdog_task, validate_pinned_artifact,
-    ProtectedPathLease, PublicationOutcome, WatchdogTaskRegistration,
-    WatchdogTaskRegistrationReceipt, WatchdogTaskRunReceipt, WindowsPlatform,
-    WATCHDOG_FALLBACK_TASK_NAME,
 };
 use eliot_protocol::RequestIdentity;
 use eliot_receipts::{
-    contract_identity, EffectClass, ProofCeiling, ReceiptEnvelope, RequestBinding,
+    EffectClass, ProofCeiling, ReceiptEnvelope, RequestBinding, contract_identity,
 };
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use std::num::NonZeroU64;
 
 pub const SERVICE_NAME: &str = "eliot-notify";
@@ -568,8 +567,8 @@ mod fallback_verification;
 #[cfg(test)]
 use fallback_verification::sha256_hex;
 use fallback_verification::{
-    decode_hex, fallback_provider_error, load_fallback_material, FallbackMaterial,
-    FallbackVerificationDeclaration,
+    FallbackMaterial, FallbackVerificationDeclaration, decode_hex, fallback_provider_error,
+    load_fallback_material,
 };
 
 /// Registers the installer-owned X-01 fallback task for the current
@@ -665,8 +664,8 @@ pub fn activate_watchdog_fallback_task() -> Result<WatchdogTaskRunReceipt, Notif
 /// Loads one autonomous scheduler envelope and derives every request identity
 /// from the protected declaration and signed payload. No stdin or caller-owned
 /// [`NotificationRequest`] participates in this route.
-pub fn load_watchdog_fallback_request(
-) -> Result<(SignedWatchdogFallbackEnvelope, NotificationRequest), NotifyBuildError> {
+pub fn load_watchdog_fallback_request()
+-> Result<(SignedWatchdogFallbackEnvelope, NotificationRequest), NotifyBuildError> {
     let material = load_fallback_material()?;
     #[cfg(not(windows))]
     return Err(NotifyBuildError::Fallback(

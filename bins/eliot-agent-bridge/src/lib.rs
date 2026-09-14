@@ -381,9 +381,10 @@ impl std::error::Error for RuntimeBuildError {}
 #[allow(clippy::expect_used, clippy::unwrap_used)]
 mod tests {
     use super::*;
-    use eliot_contracts::{ArtifactId, ContractId, ContractVersion, EpochId, EpochLineageId, StateFence};
     use eliot_contracts::ResourceGeneration;
-    use std::num::NonZeroU64;
+    use eliot_contracts::{
+        ArtifactId, ContractId, ContractVersion, EpochId, EpochLineageId, StateFence,
+    };
     use eliot_protocol::AgentBridgeActivationResponse;
     use eliot_protocol::{
         AGENT_BRIDGE_CLIENT_DECLARATION_WIRE_ID, AGENT_BRIDGE_CLIENT_DECLARATION_WIRE_VERSION,
@@ -396,6 +397,7 @@ mod tests {
     use eliot_runtime_contracts::{HealthVector, ModuleGenerationState};
     use eliot_runtime_contracts::{ModuleContract, ModuleGeneration};
     use std::collections::BTreeMap;
+    use std::num::NonZeroU64;
 
     const TEST_LINEAGE_A: &str = "550e8400-e29b-41d4-a716-446655440000";
 
@@ -408,10 +410,7 @@ mod tests {
     }
 
     fn fixture_declaration() -> AgentBridgeClientDeclaration {
-        let fence = StateFence::new(
-            test_epoch(3),
-            ResourceGeneration::new(7).unwrap(),
-        );
+        let fence = StateFence::new(test_epoch(3), ResourceGeneration::new(7).unwrap());
         let artifact = ArtifactId::new("a".repeat(64)).unwrap();
         let module = ContractId::new(AGENT_BRIDGE_MODULE_ID).unwrap();
         let contract = ModuleContract {
@@ -784,10 +783,8 @@ mod tests {
         bad_deadline.receipt_sha256 = bad_deadline.compute_digest().unwrap();
         assert!(bad_deadline.validate_challenge(&chal).is_err());
         let mut bad_fence = receipt.clone();
-        bad_fence.state_fence = StateFence::new(
-            test_epoch(99),
-            ResourceGeneration::new(99).unwrap(),
-        );
+        bad_fence.state_fence =
+            StateFence::new(test_epoch(99), ResourceGeneration::new(99).unwrap());
         bad_fence.receipt_sha256 = bad_fence.compute_digest().unwrap();
         assert!(bad_fence.validate_challenge(&chal).is_err());
     }

@@ -443,7 +443,9 @@ impl AdmissionRef {
             });
         }
         if let Some(session) = &self.session
-            && !session.authority_epoch.is_same_authority(&self.validity_epoch)
+            && !session
+                .authority_epoch
+                .is_same_authority(&self.validity_epoch)
         {
             return Err(DurableJobError::FenceMismatch);
         }

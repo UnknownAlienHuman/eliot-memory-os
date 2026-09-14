@@ -1,4 +1,6 @@
-use eliot_contracts::{AuthorityEpoch, EpochId, ResourceGeneration, StateFence, canonical_json_bytes};
+use eliot_contracts::{
+    AuthorityEpoch, EpochId, ResourceGeneration, StateFence, canonical_json_bytes,
+};
 use eliot_platform::{PlatformHandle, SecretReference};
 use eliot_receipts::ReceiptEnvelope;
 use eliot_runtime_contracts::{

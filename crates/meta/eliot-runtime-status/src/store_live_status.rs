@@ -21,8 +21,8 @@ use eliot_contracts::sha256_hex;
 
 use crate::supervision_verification::require_host_monotonic_lease;
 use crate::{
-    current_unix_ms, is_fresh_typed, is_sha256_hex, select_current_store_rebind, unknown_component,
-    ComponentState,
+    ComponentState, current_unix_ms, is_fresh_typed, is_sha256_hex, select_current_store_rebind,
+    unknown_component,
 };
 
 #[derive(Clone, Debug, Eq, PartialEq)]

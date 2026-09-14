@@ -1186,10 +1186,7 @@ mod tests {
     use tempfile::tempdir;
 
     fn declaration() -> AgentBridgeClientDeclaration {
-        let fence = StateFence::new(
-            installation_epoch(3),
-            ResourceGeneration::new(7).unwrap(),
-        );
+        let fence = StateFence::new(installation_epoch(3), ResourceGeneration::new(7).unwrap());
         let artifact = ArtifactId::new("a".repeat(64)).unwrap();
         let module = ContractId::new(AGENT_BRIDGE_MODULE_ID).unwrap();
         let contract = ModuleContract {

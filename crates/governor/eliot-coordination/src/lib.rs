@@ -478,7 +478,9 @@ impl CoordinationOwner {
         if snapshot.events.iter().enumerate().any(|(index, event)| {
             event.sequence != index as u64 + 1
                 || event.state_fence.validate().is_err()
-                || !event.authority_epoch.is_same_authority(&event.state_fence.authority_epoch)
+                || !event
+                    .authority_epoch
+                    .is_same_authority(&event.state_fence.authority_epoch)
         }) {
             return Err(CoordinationError::CausalPredecessorMismatch);
         }
@@ -559,12 +561,16 @@ impl CoordinationOwner {
                 || item.state_fence.validate().is_err()
                 || session.state != SessionState::Active
                 || session.session_id != session_id
-                || !session.authority_epoch.is_same_authority(&item.state_fence.authority_epoch.clone())
+                || !session
+                    .authority_epoch
+                    .is_same_authority(&item.state_fence.authority_epoch.clone())
                 || session.state_fence != item.state_fence
                 || lease.lease_id != lease_id
                 || lease.work_item_id != item.work_item_id
                 || lease.holder_session_id != session_id
-                || !lease.authority_epoch.is_same_authority(&item.state_fence.authority_epoch.clone())
+                || !lease
+                    .authority_epoch
+                    .is_same_authority(&item.state_fence.authority_epoch.clone())
                 || lease.state_fence != item.state_fence
                 || lease.issued_at == 0
                 || lease.expires_at == 0
@@ -608,7 +614,9 @@ impl CoordinationOwner {
                 id: session_id.to_owned(),
             })?;
         if session.session_id != session_id
-            || !session.authority_epoch.is_same_authority(&authority_epoch.clone())
+            || !session
+                .authority_epoch
+                .is_same_authority(&authority_epoch.clone())
             || session.state_fence != *state_fence
         {
             return Err(CoordinationError::FenceMismatch);
@@ -636,7 +644,8 @@ impl CoordinationOwner {
         text(work_item_id, "work_item_id")?;
         text(session_id, "session_id")?;
         self.common(authority_epoch.clone(), state_fence)?;
-        let session = self.read_active_session(session_id, now, authority_epoch.clone(), state_fence)?;
+        let session =
+            self.read_active_session(session_id, now, authority_epoch.clone(), state_fence)?;
         let work_item = self
             .work
             .get(work_item_id)
@@ -842,7 +851,9 @@ impl CoordinationOwner {
             && event.event_id == format!("claim:{}", req.lease_id)
             && event.subject_id == req.work_item_id
             && event.actor_id == req.session_id
-            && event.authority_epoch.is_same_authority(&req.authority_epoch.clone())
+            && event
+                .authority_epoch
+                .is_same_authority(&req.authority_epoch.clone())
             && event.state_fence == req.state_fence
             && event.payload_digest == req.lease_id;
         let exact_lease = self.leases.get(&req.lease_id).is_some_and(|lease| {
@@ -850,7 +861,9 @@ impl CoordinationOwner {
                 && lease.lease_id == req.lease_id
                 && lease.work_item_id == req.work_item_id
                 && lease.holder_session_id == req.session_id
-                && lease.authority_epoch.is_same_authority(&req.authority_epoch.clone())
+                && lease
+                    .authority_epoch
+                    .is_same_authority(&req.authority_epoch.clone())
                 && lease.state_fence == req.state_fence
                 && lease.issued_at == req.now
                 && lease.last_heartbeat == req.now
@@ -1091,7 +1104,11 @@ impl CoordinationOwner {
         }
         self.common(req.authority_epoch.clone(), &req.state_fence)?;
         nonzero(req.lease_duration, "lease_duration")?;
-        let session = self.session(&req.session_id, req.authority_epoch.clone(), &req.state_fence)?;
+        let session = self.session(
+            &req.session_id,
+            req.authority_epoch.clone(),
+            &req.state_fence,
+        )?;
         let item = self
             .work
             .get(&req.work_item_id)
@@ -1391,7 +1408,9 @@ impl CoordinationOwner {
             || lease.retired_at.is_some()
             || lease.work_item_id != req.work_item_id
             || lease.holder_session_id != req.new_session_id
-            || !lease.authority_epoch.is_same_authority(&req.authority_epoch.clone())
+            || !lease
+                .authority_epoch
+                .is_same_authority(&req.authority_epoch.clone())
             || lease.state_fence != req.state_fence
             || lease.issued_at != req.now
             || lease.expires_at != expires_at
@@ -1422,7 +1441,9 @@ impl CoordinationOwner {
         }
         if old.lease_id != req.old_lease_id
             || old.work_item_id != req.work_item_id
-            || !old.authority_epoch.is_same_authority(&req.authority_epoch.clone())
+            || !old
+                .authority_epoch
+                .is_same_authority(&req.authority_epoch.clone())
             || old.state_fence != req.state_fence
         {
             return Err(CoordinationError::FenceMismatch);
@@ -1591,7 +1612,11 @@ impl CoordinationOwner {
         req: IntegrationLeaseRequest,
     ) -> Result<IntegrationLeaseDecision, CoordinationError> {
         text(&req.target_scope, "target_scope")?;
-        self.session(&req.session_id, req.authority_epoch.clone(), &req.state_fence)?;
+        self.session(
+            &req.session_id,
+            req.authority_epoch.clone(),
+            &req.state_fence,
+        )?;
         if let Some(old) = self.integrations.get(&req.target_scope)
             && old.expires_at >= req.now
         {
@@ -1666,7 +1691,9 @@ fn reassignment_event_matches_request(
         && event.event_id == format!("reassign:{}", request.work_item_id)
         && event.subject_id == request.work_item_id
         && event.actor_id == request.new_session_id
-        && event.authority_epoch.is_same_authority(&request.authority_epoch.clone())
+        && event
+            .authority_epoch
+            .is_same_authority(&request.authority_epoch.clone())
         && event.state_fence == request.state_fence
         && event.payload_digest == reassignment_payload(request)
 }
@@ -1680,9 +1707,8 @@ mod tests {
     fn test_epoch(sequence: u64) -> EpochId {
         use eliot_contracts::EpochLineageId;
         use std::num::NonZeroU64;
-        let lineage =
-            EpochLineageId::new("550e8400-e29b-41d4-a716-446655440000")
-                .expect("canonical test lineage-A");
+        let lineage = EpochLineageId::new("550e8400-e29b-41d4-a716-446655440000")
+            .expect("canonical test lineage-A");
         EpochId::new(
             lineage,
             NonZeroU64::new(sequence).expect("non-zero test sequence"),
@@ -1841,13 +1867,7 @@ mod tests {
     fn read_active_work_lease_returns_coherent_cloned_projection() {
         let (owner, state_fence) = claimed_owner();
         let projection = owner
-            .read_active_work_lease(
-                "work-1",
-                "session-1",
-                50,
-                test_epoch(1),
-                &state_fence,
-            )
+            .read_active_work_lease("work-1", "session-1", 50, test_epoch(1), &state_fence)
             .expect("active work lease");
         assert_eq!(projection.session.session_id, "session-1");
         assert_eq!(
@@ -1863,17 +1883,13 @@ mod tests {
     #[test]
     fn reads_reject_stale_epoch_and_fence() {
         let (owner, expected_fence) = claimed_owner();
-        let stale_fence = StateFence::new(
-            test_epoch(1),
-            ResourceGeneration::new(2).unwrap(),
-        );
+        let stale_fence = StateFence::new(test_epoch(1), ResourceGeneration::new(2).unwrap());
         assert_eq!(
             owner.read_active_session("session-1", 50, test_epoch(1), &stale_fence,),
             Err(CoordinationError::FenceMismatch)
         );
         let stale_epoch = test_epoch(2);
-        let stale_epoch_fence =
-            StateFence::new(stale_epoch.clone(), ResourceGeneration::genesis());
+        let stale_epoch_fence = StateFence::new(stale_epoch.clone(), ResourceGeneration::genesis());
         assert_eq!(
             owner.read_active_work_lease(
                 "work-1",
@@ -1930,12 +1946,7 @@ mod tests {
             .unwrap()
             .heartbeat_deadline = 0;
         assert_eq!(
-            zero_deadline.read_active_session(
-                "session-1",
-                50,
-                test_epoch(1),
-                &state_fence,
-            ),
+            zero_deadline.read_active_session("session-1", 50, test_epoch(1), &state_fence,),
             Err(CoordinationError::InvalidField("heartbeat_deadline"))
         );
         let mut direct_zero = owner.clone();
@@ -1949,11 +1960,7 @@ mod tests {
             Err(CoordinationError::InvalidField("heartbeat_deadline"))
         ));
         assert!(matches!(
-            CoordinationOwner::from_snapshot_at(
-                zero_deadline,
-                test_epoch(1),
-                &state_fence,
-            ),
+            CoordinationOwner::from_snapshot_at(zero_deadline, test_epoch(1), &state_fence,),
             Err(CoordinationError::InvalidField("heartbeat_deadline"))
         ));
 
@@ -1993,25 +2000,13 @@ mod tests {
         let (mut owner, state_fence) = claimed_owner();
         owner.work.get_mut("work-1").unwrap().owner_session_id = Some("other-session".to_owned());
         assert!(matches!(
-            owner.read_active_work_lease(
-                "work-1",
-                "session-1",
-                50,
-                test_epoch(1),
-                &state_fence,
-            ),
+            owner.read_active_work_lease("work-1", "session-1", 50, test_epoch(1), &state_fence,),
             Err(CoordinationError::LeaseOwnerMismatch { .. })
         ));
         owner.work.get_mut("work-1").unwrap().owner_session_id = Some("session-1".to_owned());
         owner.work.get_mut("work-1").unwrap().state = WorkState::Submitted;
         assert_eq!(
-            owner.read_active_work_lease(
-                "work-1",
-                "session-1",
-                50,
-                test_epoch(1),
-                &state_fence,
-            ),
+            owner.read_active_work_lease("work-1", "session-1", 50, test_epoch(1), &state_fence,),
             Err(CoordinationError::InvalidState)
         );
     }
@@ -2021,37 +2016,19 @@ mod tests {
         let (mut owner, state_fence) = claimed_owner();
         owner.leases.get_mut("lease-1").unwrap().expires_at = 49;
         assert_eq!(
-            owner.read_active_work_lease(
-                "work-1",
-                "session-1",
-                50,
-                test_epoch(1),
-                &state_fence,
-            ),
+            owner.read_active_work_lease("work-1", "session-1", 50, test_epoch(1), &state_fence,),
             Err(CoordinationError::LeaseExpired)
         );
         owner.leases.get_mut("lease-1").unwrap().expires_at = 60;
         owner.leases.get_mut("lease-1").unwrap().last_heartbeat = 51;
         assert_eq!(
-            owner.read_active_work_lease(
-                "work-1",
-                "session-1",
-                50,
-                test_epoch(1),
-                &state_fence,
-            ),
+            owner.read_active_work_lease("work-1", "session-1", 50, test_epoch(1), &state_fence,),
             Err(CoordinationError::InvalidField("lease_last_heartbeat"))
         );
         owner.leases.get_mut("lease-1").unwrap().last_heartbeat = 20;
         owner.leases.get_mut("lease-1").unwrap().issued_at = 0;
         assert_eq!(
-            owner.read_active_work_lease(
-                "work-1",
-                "session-1",
-                50,
-                test_epoch(1),
-                &state_fence,
-            ),
+            owner.read_active_work_lease("work-1", "session-1", 50, test_epoch(1), &state_fence,),
             Err(CoordinationError::InvalidField("lease_interval"))
         );
     }
@@ -2158,9 +2135,8 @@ mod tests {
             CoordinationOwner::from_snapshot(malformed),
             Err(CoordinationError::InvalidState)
         ));
-        let recovered =
-            CoordinationOwner::from_snapshot_at(owner, test_epoch(1), &state_fence)
-                .expect("reassignment recovery");
+        let recovered = CoordinationOwner::from_snapshot_at(owner, test_epoch(1), &state_fence)
+            .expect("reassignment recovery");
         assert_eq!(
             recovered
                 .read_unique_active_work_lease(50, test_epoch(1), &state_fence)

@@ -5,20 +5,20 @@
 //! watchdog publication bundle and re-checks identity/contour after verification. It never mints
 //! authority, never selects an alternate current owner, and fails closed on any lease/fence mismatch.
 
-use eliot_platform_windows::{windows_paths_equal, ProtectedRootLease, ProtectedRuntimePathLease};
+use eliot_platform_windows::{ProtectedRootLease, ProtectedRuntimePathLease, windows_paths_equal};
 use eliot_runtime_contracts::{
     SupervisionLeaseIncarnationBinding, SupervisionLeasePredecessorIdentity,
-    WatchdogAdmissionTemplate, WatchdogPublicationRetentionPlan,
     WATCHDOG_PUBLICATION_DIRECTORY_PREFIX, WATCHDOG_PUBLICATION_RETAINED_LIMIT,
+    WatchdogAdmissionTemplate, WatchdogPublicationRetentionPlan,
 };
 
 use super::watchdog_admission::inspect_registry_at;
 use super::{
-    current_unix_ms, observe_watchdog_publication, read_manifest_selected_ors_current,
-    scan_watchdog_publications, select_runtime_manifest, validate_bound_service_registrations,
-    validate_runtime_binding, verify_against_durable_current, FileWatchdogAdmission, SpoolError,
-    VerifiedWatchdogAdmission, WatchdogAdmissionConfig, WatchdogRuntimeBinding,
-    HOST_JOURNAL_FILE_NAME, INSTALLATION_REGISTRY_FILE_NAME,
+    FileWatchdogAdmission, HOST_JOURNAL_FILE_NAME, INSTALLATION_REGISTRY_FILE_NAME, SpoolError,
+    VerifiedWatchdogAdmission, WatchdogAdmissionConfig, WatchdogRuntimeBinding, current_unix_ms,
+    observe_watchdog_publication, read_manifest_selected_ors_current, scan_watchdog_publications,
+    select_runtime_manifest, validate_bound_service_registrations, validate_runtime_binding,
+    verify_against_durable_current,
 };
 
 fn read_journaled_current_supervision(

@@ -379,10 +379,7 @@ fn receipt_must_bind_the_declared_rollback_artifact() {
 #[test]
 fn receipt_fence_and_identity_tampering_fail_closed() {
     let mut projection = procedure();
-    projection.state_fence = StateFence::new(
-        test_epoch(2),
-        ResourceGeneration::genesis(),
-    );
+    projection.state_fence = StateFence::new(test_epoch(2), ResourceGeneration::genesis());
     assert!(matches!(
         projection.validate(),
         Err(

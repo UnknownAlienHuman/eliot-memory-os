@@ -1,6 +1,6 @@
 //! Host↔Kernel protocol records.
 
-use eliot_contracts::{sha256_hex, AuthorityEpoch, EpochId, ResourceGeneration, StateFence};
+use eliot_contracts::{AuthorityEpoch, EpochId, ResourceGeneration, StateFence, sha256_hex};
 use eliot_ipc::TransportError;
 use eliot_ors::{SupervisionLeaseProjection, SupervisionLeaseSnapshot};
 use eliot_platform::{KernelActivationNonce, PlatformHandle, PortError};
@@ -21,15 +21,16 @@ use serde::{Deserialize, Serialize};
 use std::collections::BTreeSet;
 use std::path::Path;
 
-use crate::{validate_text, KernelServiceError, KernelServiceState};
+use crate::{KernelServiceError, KernelServiceState, validate_text};
 
 mod native_worker_claim;
 mod process_authority_handoff;
 pub use native_worker_claim::{
+    NATIVE_WORKER_CLAIM_WIRE_ID, NATIVE_WORKER_CLAIM_WIRE_VERSION,
+    NATIVE_WORKER_EXECUTION_UNIT_SCHEMA_VERSION, NATIVE_WORKER_PROTOCOL_VERSION,
     NativeWorkerClaimBudget, NativeWorkerClaimConflict, NativeWorkerClaimReceipt,
     NativeWorkerClaimRejection, NativeWorkerClaimRejectionReason, NativeWorkerClaimRequest,
-    NativeWorkerClaimResponse, NATIVE_WORKER_CLAIM_WIRE_ID, NATIVE_WORKER_CLAIM_WIRE_VERSION,
-    NATIVE_WORKER_EXECUTION_UNIT_SCHEMA_VERSION, NATIVE_WORKER_PROTOCOL_VERSION,
+    NativeWorkerClaimResponse,
 };
 pub use process_authority_handoff::ProcessAuthorityHandoffDescriptor;
 
@@ -3030,9 +3031,11 @@ mod tests {
     ) {
         let mut changed_digest = declaration.clone();
         changed_digest.declaration_sha256 = "f".repeat(64);
-        assert!(descriptor
-            .validate_client_declaration(&changed_digest)
-            .is_err());
+        assert!(
+            descriptor
+                .validate_client_declaration(&changed_digest)
+                .is_err()
+        );
 
         let mut changed_policy = declaration.clone();
         changed_policy
@@ -3041,9 +3044,11 @@ mod tests {
         changed_policy.declaration_sha256 = changed_policy
             .compute_digest()
             .expect("changed policy declaration digest");
-        assert!(descriptor
-            .validate_client_declaration(&changed_policy)
-            .is_err());
+        assert!(
+            descriptor
+                .validate_client_declaration(&changed_policy)
+                .is_err()
+        );
 
         let mut changed_kernel_expectation = declaration.clone();
         changed_kernel_expectation
@@ -3052,9 +3057,11 @@ mod tests {
         changed_kernel_expectation.declaration_sha256 = changed_kernel_expectation
             .compute_digest()
             .expect("changed Kernel expectation digest");
-        assert!(descriptor
-            .validate_client_declaration(&changed_kernel_expectation)
-            .is_err());
+        assert!(
+            descriptor
+                .validate_client_declaration(&changed_kernel_expectation)
+                .is_err()
+        );
     }
 
     #[test]
@@ -3805,13 +3812,17 @@ mod tests {
         stale_request.message_id = handle_value("probe-message-2");
         stale_request.sequence = 6;
         stale_request.payload_digest = stale_request.compute_digest().expect("stale digest");
-        assert!(receipt
-            .validate_for_probe(&stale_request, &activation)
-            .is_err());
+        assert!(
+            receipt
+                .validate_for_probe(&stale_request, &activation)
+                .is_err()
+        );
         let repeated = bound_ready_receipt(&stale_request, &activation);
-        assert!(repeated
-            .validate_for_probe(&stale_request, &activation)
-            .is_ok());
+        assert!(
+            repeated
+                .validate_for_probe(&stale_request, &activation)
+                .is_ok()
+        );
         assert_ne!(request.payload_digest, stale_request.payload_digest);
         assert_ne!(receipt.evidence_refs, repeated.evidence_refs);
         assert_eq!(
@@ -3825,12 +3836,16 @@ mod tests {
             .compute_digest()
             .expect("next repeat digest");
         let next_repeated = bound_ready_receipt(&next_repeat_request, &activation);
-        assert!(next_repeated
-            .validate_for_probe(&next_repeat_request, &activation)
-            .is_ok());
-        assert!(repeated
-            .validate_for_probe(&next_repeat_request, &activation)
-            .is_err());
+        assert!(
+            next_repeated
+                .validate_for_probe(&next_repeat_request, &activation)
+                .is_ok()
+        );
+        assert!(
+            repeated
+                .validate_for_probe(&next_repeat_request, &activation)
+                .is_err()
+        );
         assert_ne!(repeated.evidence_refs, next_repeated.evidence_refs);
         assert_eq!(
             repeated.activation_nonce_digest,
@@ -3840,23 +3855,29 @@ mod tests {
         let mut other_generation = request.clone();
         other_generation.generation = ResourceGeneration::new(4).expect("generation");
         other_generation.payload_digest = other_generation.compute_digest().expect("digest");
-        assert!(receipt
-            .validate_for_probe(&other_generation, &activation)
-            .is_err());
+        assert!(
+            receipt
+                .validate_for_probe(&other_generation, &activation)
+                .is_err()
+        );
 
         let mut other_fence = request.clone();
         other_fence.candidate.kernel_epoch = test_epoch(2);
         other_fence.payload_digest = other_fence.compute_digest().expect("digest");
-        assert!(receipt
-            .validate_for_probe(&other_fence, &activation)
-            .is_err());
+        assert!(
+            receipt
+                .validate_for_probe(&other_fence, &activation)
+                .is_err()
+        );
 
         let mut other_config = request.clone();
         other_config.candidate.config_hash = handle_value("config-2");
         other_config.payload_digest = other_config.compute_digest().expect("digest");
-        assert!(receipt
-            .validate_for_probe(&other_config, &activation)
-            .is_err());
+        assert!(
+            receipt
+                .validate_for_probe(&other_config, &activation)
+                .is_err()
+        );
 
         let mut ambiguous = receipt.clone();
         ambiguous
@@ -3873,9 +3894,11 @@ mod tests {
         substituted
             .evidence_refs
             .push(handle_value("kernel-probe-authority-epoch:99"));
-        assert!(substituted
-            .validate_for_probe(&request, &activation)
-            .is_err());
+        assert!(
+            substituted
+                .validate_for_probe(&request, &activation)
+                .is_err()
+        );
 
         let mut non_probe = request;
         non_probe.command = KernelControlCommand::Drain;

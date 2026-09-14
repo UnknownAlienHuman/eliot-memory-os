@@ -1071,9 +1071,9 @@ impl Session {
             || client.module_generation.module_id.as_str() != server.module_id
             || client.module_generation != server.module_generation
             || client.artifact_hash != server.module_generation.artifact_id
-            || !client.authority_epoch.is_same_authority(
-                &server.module_generation.state_fence.authority_epoch,
-            )
+            || !client
+                .authority_epoch
+                .is_same_authority(&server.module_generation.state_fence.authority_epoch)
             || client.launch_nonce != server.launch_nonce
         {
             return Err(TransportError::SessionFenced);
@@ -1087,11 +1087,7 @@ impl Session {
             connection_id: connection_id.into(),
             protocol_version,
             peer,
-            authority_epoch: server
-                .module_generation
-                .state_fence
-                .authority_epoch
-                .clone(),
+            authority_epoch: server.module_generation.state_fence.authority_epoch.clone(),
             module_generation: server.module_generation.clone(),
             launch_nonce: server.launch_nonce.clone(),
             capabilities: capabilities.clone(),
@@ -1109,11 +1105,7 @@ impl Session {
             heartbeat_ms: server.heartbeat_ms,
             control_channel: server.control_channel.clone(),
             rejection_reason: None,
-            authority_epoch: server
-                .module_generation
-                .state_fence
-                .authority_epoch
-                .clone(),
+            authority_epoch: server.module_generation.state_fence.authority_epoch.clone(),
         };
         server_hello.validate()?;
         Ok(HandshakeResult {
@@ -2522,9 +2514,8 @@ mod tests {
     fn test_epoch(sequence: u64) -> EpochId {
         use eliot_contracts::{EpochId, EpochLineageId};
         use std::num::NonZeroU64;
-        let lineage =
-            EpochLineageId::new("550e8400-e29b-41d4-a716-446655440000")
-                .expect("canonical test lineage-A");
+        let lineage = EpochLineageId::new("550e8400-e29b-41d4-a716-446655440000")
+            .expect("canonical test lineage-A");
         EpochId::new(
             lineage,
             NonZeroU64::new(sequence).expect("non-zero test sequence"),
@@ -3169,7 +3160,9 @@ mod tests {
         );
 
         let mut fence_challenge = challenge.clone();
-        fence_challenge.state_fence.authority_epoch = serde_json::from_value(serde_json::json!({"lineage_id": "550e8400-e29b-41d4-a716-446655440000", "sequence": 8}))?;
+        fence_challenge.state_fence.authority_epoch = serde_json::from_value(
+            serde_json::json!({"lineage_id": "550e8400-e29b-41d4-a716-446655440000", "sequence": 8}),
+        )?;
         fence_challenge = fence_challenge.with_computed_digest()?;
         assert!(
             ServerFirstConnection::new("server-connection", fence_challenge, &declaration).is_err()

@@ -11,7 +11,6 @@ use eliot_runtime_contracts::RuntimeLiveStoreIdentity;
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
 
-use eliot_contracts::{EpochId, EpochLineageId};
 use crate::{
     AgentBridgeSourceMaterializationPlan, CandidateManifest, InstallationEpoch, InstallationError,
     InstallationProfile, InstallationTransaction, InstallerAclPrincipal, InstallerEffectPlan,
@@ -22,6 +21,7 @@ use crate::{
     SupervisionAuthorityProvisionPlan, candidate_manifest_digest as candidate_digest_fn, handle,
     phase_b_static_template_for_candidate, supervision_key_slot_for_scope_id,
 };
+use eliot_contracts::{EpochId, EpochLineageId};
 
 // Canonical lineage-A for the Phase-A template fence (Implements #64).
 const PACKAGE_PLANNER_LINEAGE_A: &str = "550e8400-e29b-41d4-a716-446655440000";

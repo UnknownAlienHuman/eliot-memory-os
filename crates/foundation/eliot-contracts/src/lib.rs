@@ -520,7 +520,8 @@ impl StateFence {
     /// `(lineage_id, sequence)` tuple equality: equal sequences from different
     /// lineages are unrelated and return false.
     pub fn is_compatible_with(&self, other: &Self) -> bool {
-        self.authority_epoch.is_same_authority(&other.authority_epoch)
+        self.authority_epoch
+            .is_same_authority(&other.authority_epoch)
             && self.resource_generation == other.resource_generation
             && (self.task_revision.is_none() || self.task_revision == other.task_revision)
             && (self.policy_revision.is_none() || self.policy_revision == other.policy_revision)
@@ -1198,9 +1199,11 @@ mod tests {
         );
         assert!(!fence.is_compatible_with(&foreign));
         assert!(!foreign.is_compatible_with(&fence));
-        assert!(!fence
-            .authority_epoch
-            .is_same_authority(&foreign.authority_epoch));
+        assert!(
+            !fence
+                .authority_epoch
+                .is_same_authority(&foreign.authority_epoch)
+        );
 
         // Bare numeric wire is rejected; legacy numerics stay quarantined.
         let numeric_wire = serde_json::json!({

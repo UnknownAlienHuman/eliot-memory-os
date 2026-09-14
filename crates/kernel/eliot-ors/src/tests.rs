@@ -1115,8 +1115,7 @@ fn supervision_lease_renew_is_monotonic_and_history_is_bounded() -> TestResult {
     ));
     let mut mismatched_binding = supervision_binding(LeaseState::Active, 250)?;
     mismatched_binding.kernel_epoch = test_epoch(3);
-    mismatched_binding.state_fence =
-        StateFence::new(test_epoch(3), ResourceGeneration::new(1)?);
+    mismatched_binding.state_fence = StateFence::new(test_epoch(3), ResourceGeneration::new(1)?);
     assert!(matches!(
         store.prepare_supervision_lease(supervision_request(
             "ticket-fence-mismatch",

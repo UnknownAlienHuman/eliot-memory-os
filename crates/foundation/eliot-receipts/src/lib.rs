@@ -945,8 +945,7 @@ mod tests {
     #[test]
     fn stale_fence_and_request_mismatch_fail_closed() -> TestResult {
         let mut core = fixture_core()?;
-        core.operation.state_fence =
-            StateFence::new(test_epoch(2), ResourceGeneration::genesis());
+        core.operation.state_fence = StateFence::new(test_epoch(2), ResourceGeneration::genesis());
         assert!(matches!(
             ReceiptEnvelope::issue(core),
             Err(ReceiptError::FenceMismatch { .. })

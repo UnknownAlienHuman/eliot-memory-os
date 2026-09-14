@@ -509,8 +509,7 @@ pub enum ProtocolError {
 )]
 mod tests {
     use super::*;
-    use eliot_contracts::{EpochLineageId, EpochId};
-    use std::num::NonZeroU64;
+    use eliot_contracts::{EpochId, EpochLineageId};
     use eliot_process::{
         ActionLeaseRef, DispatchAuthorityId, DispatchPermitAuthority, EnvironmentInheritance,
         EnvironmentProjection, FencingToken, Generation, ImageId, JobId, KernelDispatchKey,
@@ -518,12 +517,12 @@ mod tests {
         SessionId,
     };
     use std::collections::BTreeMap;
+    use std::num::NonZeroU64;
     use std::sync::Mutex;
 
     fn test_epoch(sequence: u64) -> EpochId {
-        let lineage =
-            EpochLineageId::new("550e8400-e29b-41d4-a716-446655440000")
-                .expect("canonical test lineage-A");
+        let lineage = EpochLineageId::new("550e8400-e29b-41d4-a716-446655440000")
+            .expect("canonical test lineage-A");
         EpochId::new(
             lineage,
             NonZeroU64::new(sequence).expect("non-zero test sequence"),

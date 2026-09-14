@@ -15,11 +15,11 @@ use crate::KernelBuildError;
 use crate::sha256_hex;
 #[cfg(windows)]
 use crate::unix_ms;
+use eliot_contracts::EpochId;
 #[cfg(windows)]
 use eliot_kernel_service::EliotdLaunchDescriptor;
 #[cfg(windows)]
 use eliot_platform::PlatformHandle;
-use eliot_contracts::EpochId;
 use eliot_process::Generation;
 #[cfg(windows)]
 use serde::Serialize;

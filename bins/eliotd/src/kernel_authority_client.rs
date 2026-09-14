@@ -33,7 +33,7 @@ use eliot_governor::{KernelGenerationSnapshotProvider, KernelPortError};
 use eliot_receipts::AuthorityBinding;
 use eliot_runtime_contracts::{AuthorityActivationReceipt, AuthorityRevocationReceipt};
 
-use super::{kind_value, DaemonKernelClient};
+use super::{DaemonKernelClient, kind_value};
 
 /// Daemon→Kernel P-07 route names. These name the Kernel-owned front-door
 /// route (T6/#15); until it exists the Kernel rejects them and the adapter

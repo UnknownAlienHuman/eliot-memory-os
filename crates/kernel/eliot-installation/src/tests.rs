@@ -6762,9 +6762,7 @@ fn committed_registry_terminal_reconciles_real_redb_transaction_once() {
     stale_epoch
         .commit_fence
         .authority_state_fence
-        .authority_epoch = next_epoch(
-        &receipt.commit_fence.authority_state_fence.authority_epoch,
-    );
+        .authority_epoch = next_epoch(&receipt.commit_fence.authority_state_fence.authority_epoch);
     assert!(matches!(
         transaction_store
             .reconcile_active_verified(stale_epoch, vec![test_handle("evidence:stale-epoch")],),

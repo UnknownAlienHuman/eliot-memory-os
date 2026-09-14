@@ -187,9 +187,9 @@ mod projection_tests {
     use eliot_contracts::RequestId;
     use eliot_contracts::{EpochId, EpochLineageId, ResourceGeneration, StateFence};
     use eliot_governor::{
-        fixture_failed_internal, fixture_not_ready, fixture_scope_ambiguous,
-        fixture_scope_selection_required, fixture_stale_fence, fixture_task_selection_required,
-        GovernorActivationSnapshot,
+        GovernorActivationSnapshot, fixture_failed_internal, fixture_not_ready,
+        fixture_scope_ambiguous, fixture_scope_selection_required, fixture_stale_fence,
+        fixture_task_selection_required,
     };
     use eliot_protocol::AgentActivationResolutionTicket;
     use std::num::NonZeroU64;

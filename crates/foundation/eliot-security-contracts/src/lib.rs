@@ -61,10 +61,7 @@ mod negative_consumer_fixtures {
     }
 
     fn fence() -> StateFence {
-        StateFence::new(
-            test_epoch(TEST_LINEAGE_A, 1),
-            ResourceGeneration::genesis(),
-        )
+        StateFence::new(test_epoch(TEST_LINEAGE_A, 1), ResourceGeneration::genesis())
     }
 
     fn closure(completeness: ClosureCompleteness) -> DisclosureDependencyClosure {

@@ -2755,13 +2755,13 @@ mod tests {
 
         // Wrong-lineage cursor with equal sequence must fail closed.
         let mut snapshot = broker.snapshot();
-        let mut wrong = snapshot
-            .operation_cursors
-            .first()
-            .expect("cursor")
-            .clone();
+        let mut wrong = snapshot.operation_cursors.first().expect("cursor").clone();
         wrong.authority_epoch = test_epoch_b(7);
-        assert!(!wrong.authority_epoch.is_same_authority(&receipt.authority_epoch));
+        assert!(
+            !wrong
+                .authority_epoch
+                .is_same_authority(&receipt.authority_epoch)
+        );
         snapshot.operation_cursors[0] = wrong;
         let mut restarted = UserBroker::new(
             Some(Box::new(FakeAuthority::new())),
@@ -2774,9 +2774,6 @@ mod tests {
                 snapshot: Some(snapshot),
             })),
         );
-        assert_eq!(
-            restarted.recover(),
-            Err(BrokerError::GrantBindingMismatch)
-        );
+        assert_eq!(restarted.recover(), Err(BrokerError::GrantBindingMismatch));
     }
 }

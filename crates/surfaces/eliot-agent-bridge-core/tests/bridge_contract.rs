@@ -296,10 +296,12 @@ fn attach_binds_authenticated_connection_session_generation_and_fence()
     assert_eq!(binding.session_id().as_str(), "session-1");
     assert_eq!(binding.connection_id().as_str(), "connection-1");
     assert_eq!(binding.activation_generation().get(), 1);
-    assert!(binding
-        .state_fence()
-        .authority_epoch()
-        .is_same_authority(&test_epoch(1)));
+    assert!(
+        binding
+            .state_fence()
+            .authority_epoch()
+            .is_same_authority(&test_epoch(1))
+    );
     assert_eq!(binding.state_fence().generation().get(), 1);
     assert_eq!(binding.task_binding().task_id().as_str(), "task-1");
     assert_eq!(

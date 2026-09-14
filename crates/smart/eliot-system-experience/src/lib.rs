@@ -626,8 +626,13 @@ mod tests {
     use std::num::NonZeroU64;
 
     fn test_epoch(sequence: u64) -> EpochId {
-        let lineage = EpochLineageId::new("550e8400-e29b-41d4-a716-446655440000").expect("canonical test lineage-A");
-        EpochId::new(lineage, NonZeroU64::new(sequence).expect("non-zero test sequence")).expect("valid test epoch")
+        let lineage = EpochLineageId::new("550e8400-e29b-41d4-a716-446655440000")
+            .expect("canonical test lineage-A");
+        EpochId::new(
+            lineage,
+            NonZeroU64::new(sequence).expect("non-zero test sequence"),
+        )
+        .expect("valid test epoch")
     }
     use eliot_evidence::{
         Assertability, EvidenceAuthority, EvidenceCoverage, EvidenceEnvelope, EvidenceFreshness,
@@ -664,10 +669,7 @@ mod tests {
                 assertability: Assertability::NonAssertableUnverified,
                 provenance: provenance(scope)?,
                 verification: None,
-                state_fence: StateFence::new(
-                    test_epoch(1),
-                    ResourceGeneration::genesis(),
-                ),
+                state_fence: StateFence::new(test_epoch(1), ResourceGeneration::genesis()),
             },
             lifecycle: LifecycleState::Active,
         })

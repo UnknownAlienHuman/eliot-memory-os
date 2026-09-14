@@ -153,7 +153,8 @@ impl CapabilityAdmissionRequest {
         }
         if !presented
             .authority_epoch
-            .is_same_authority(&registration.authority_epoch) {
+            .is_same_authority(&registration.authority_epoch)
+        {
             return Err(WorkerError::StaleEpoch);
         }
         if presented.state_fence != registration.state_fence {
@@ -164,7 +165,10 @@ impl CapabilityAdmissionRequest {
         {
             return Err(WorkerError::InvalidRequest("generation_binding"));
         }
-        if !presented.authority_epoch.is_same_authority(&hello.authority_epoch) {
+        if !presented
+            .authority_epoch
+            .is_same_authority(&hello.authority_epoch)
+        {
             return Err(WorkerError::StaleEpoch);
         }
         if presented.state_fence != hello.state_fence {
@@ -1124,7 +1128,8 @@ impl ClaimAdmissionRequest {
         if !self
             .claim
             .authority_epoch
-            .is_same_authority(&self.registration.authority_epoch) {
+            .is_same_authority(&self.registration.authority_epoch)
+        {
             return Err(WorkerError::StaleEpoch);
         }
         if self.claim.state_fence != self.registration.state_fence {

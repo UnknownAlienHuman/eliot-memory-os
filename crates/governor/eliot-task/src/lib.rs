@@ -243,10 +243,7 @@ pub struct TaskLifecycleOwner {
 
 impl TaskLifecycleOwner {
     /// Creates an empty owner.  The fence is the owner-wide admission boundary.
-    pub fn new(
-        authority_epoch: EpochId,
-        state_fence: StateFence,
-    ) -> Result<Self, TaskError> {
+    pub fn new(authority_epoch: EpochId, state_fence: StateFence) -> Result<Self, TaskError> {
         state_fence
             .validate()
             .map_err(|_| TaskError::FenceMismatch)?;

@@ -16,8 +16,8 @@ use std::{
 };
 
 use eliot_contracts::{
-    ClockReading, ProductId, RequestId, RequestMetadata, ResourceGeneration,
-    SourceId, StateFence, TransactionSequence,
+    ClockReading, ProductId, RequestId, RequestMetadata, ResourceGeneration, SourceId, StateFence,
+    TransactionSequence,
 };
 use serde::{Serialize, de::DeserializeOwned};
 use thiserror::Error;
@@ -156,8 +156,13 @@ pub enum IdError {
 fn test_epoch(sequence: u64) -> eliot_contracts::EpochId {
     use eliot_contracts::{EpochId, EpochLineageId};
     use std::num::NonZeroU64;
-    let lineage = EpochLineageId::new("550e8400-e29b-41d4-a716-446655440000").expect("canonical test lineage-A");
-    EpochId::new(lineage, NonZeroU64::new(sequence).expect("non-zero test sequence")).expect("valid test epoch")
+    let lineage = EpochLineageId::new("550e8400-e29b-41d4-a716-446655440000")
+        .expect("canonical test lineage-A");
+    EpochId::new(
+        lineage,
+        NonZeroU64::new(sequence).expect("non-zero test sequence"),
+    )
+    .expect("valid test epoch")
 }
 
 /// A valid request fixture composed only from C0-01 primitives.

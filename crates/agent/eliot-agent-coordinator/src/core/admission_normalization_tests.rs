@@ -236,10 +236,7 @@ fn plan_request() -> TestResult<StaffingPlanRequest> {
         },
         task_revision: "task-normalization-v1".to_owned(),
         plan_revision: rev("plan-normalization-v1"),
-        state_fence: StateFence::new(
-            test_epoch(TEST_LINEAGE_A, 1),
-            ResourceGeneration::genesis(),
-        ),
+        state_fence: StateFence::new(test_epoch(TEST_LINEAGE_A, 1), ResourceGeneration::genesis()),
         privacy_class: PrivacyClass::Private,
         lanes: vec![
             StaffingLaneRequest {

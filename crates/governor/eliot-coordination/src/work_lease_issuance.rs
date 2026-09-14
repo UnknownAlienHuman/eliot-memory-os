@@ -230,7 +230,9 @@ impl super::CoordinationOwner {
             if lease.lease_id != decision.lease.lease_id
                 || lease.work_item_id != decision.lease.work_item_id
                 || lease.holder_session_id != decision.lease.holder_session_id
-                || !lease.authority_epoch.is_same_authority(&decision.lease.authority_epoch)
+                || !lease
+                    .authority_epoch
+                    .is_same_authority(&decision.lease.authority_epoch)
                 || lease.state_fence != decision.lease.state_fence
                 || lease.issued_at != decision.lease.issued_at
                 || lease.expires_at == 0
@@ -245,7 +247,9 @@ impl super::CoordinationOwner {
                 .get(&request.session_id)
                 .ok_or(super::CoordinationError::InvalidState)?;
             if session.session_id != request.session_id
-                || !session.authority_epoch.is_same_authority(&request.authority_epoch.clone())
+                || !session
+                    .authority_epoch
+                    .is_same_authority(&request.authority_epoch.clone())
                 || session.state_fence != request.state_fence
             {
                 return Err(super::CoordinationError::InvalidState);
@@ -310,12 +314,16 @@ impl super::CoordinationOwner {
                 .get(lease_id)
                 .ok_or(super::CoordinationError::InvalidState)?;
             if session.state != super::SessionState::Active
-                || !session.authority_epoch.is_same_authority(&authority_epoch.clone())
+                || !session
+                    .authority_epoch
+                    .is_same_authority(&authority_epoch.clone())
                 || session.state_fence != *state_fence
                 || lease.lease_id != lease_id
                 || lease.work_item_id != item.work_item_id
                 || lease.holder_session_id != session_id
-                || !lease.authority_epoch.is_same_authority(&authority_epoch.clone())
+                || !lease
+                    .authority_epoch
+                    .is_same_authority(&authority_epoch.clone())
                 || lease.state_fence != *state_fence
                 || lease.retired_at.is_some()
                 || lease.issued_at == 0
@@ -397,7 +405,9 @@ fn validate_candidate_records(
         .get(&request.lease_id)
         .ok_or(WorkLeaseIssuanceError::InconsistentOwnerEvidence)?;
     if session.state != super::SessionState::Active
-        || !session.authority_epoch.is_same_authority(&request.authority_epoch.clone())
+        || !session
+            .authority_epoch
+            .is_same_authority(&request.authority_epoch.clone())
         || session.state_fence != request.state_fence
         || item.state != super::WorkState::Claimed
         || item.owner_session_id.as_deref() != Some(request.session_id.as_str())
@@ -419,7 +429,9 @@ fn event_matches_request(
         && event.event_id == format!("claim:{}", request.lease_id)
         && event.subject_id == request.work_item_id
         && event.actor_id == request.session_id
-        && event.authority_epoch.is_same_authority(&request.authority_epoch.clone())
+        && event
+            .authority_epoch
+            .is_same_authority(&request.authority_epoch.clone())
         && event.state_fence == request.state_fence
         && event.payload_digest == request.lease_id
 }
@@ -436,7 +448,9 @@ fn validate_request_binding(
     if lease.lease_id != request.lease_id
         || lease.work_item_id != request.work_item_id
         || lease.holder_session_id != request.session_id
-        || !lease.authority_epoch.is_same_authority(&request.authority_epoch.clone())
+        || !lease
+            .authority_epoch
+            .is_same_authority(&request.authority_epoch.clone())
         || lease.state_fence != request.state_fence
         || lease.issued_at != request.now
         || lease.expires_at != expires_at
@@ -501,9 +515,8 @@ mod tests {
     fn test_epoch(sequence: u64) -> EpochId {
         use eliot_contracts::EpochLineageId;
         use std::num::NonZeroU64;
-        let lineage =
-            EpochLineageId::new("550e8400-e29b-41d4-a716-446655440000")
-                .expect("canonical test lineage-A");
+        let lineage = EpochLineageId::new("550e8400-e29b-41d4-a716-446655440000")
+            .expect("canonical test lineage-A");
         EpochId::new(
             lineage,
             NonZeroU64::new(sequence).expect("non-zero test sequence"),

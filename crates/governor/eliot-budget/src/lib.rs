@@ -1506,8 +1506,8 @@ mod tests {
 
     use super::*;
     use eliot_contracts::{
-        ContractId, EpochId, EpochLineageId, OperationId, ReceiptId, RequestId,
-        ResourceGeneration, StateFence,
+        ContractId, EpochId, EpochLineageId, OperationId, ReceiptId, RequestId, ResourceGeneration,
+        StateFence,
     };
     use eliot_receipts::{EffectClass, ProofCeiling};
     use std::num::NonZeroU64;

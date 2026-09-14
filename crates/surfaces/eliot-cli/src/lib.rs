@@ -989,7 +989,9 @@ pub mod kernel_client {
             assert!(validate_server_snapshot(&hello, &expected, 12, &"a".repeat(64)).is_err());
             assert!(validate_server_snapshot(&hello, &expected, 11, &"b".repeat(64)).is_err());
             let wrong_sequence = test_epoch(8);
-            assert!(validate_server_snapshot(&hello, &wrong_sequence, 11, &"a".repeat(64)).is_err());
+            assert!(
+                validate_server_snapshot(&hello, &wrong_sequence, 11, &"a".repeat(64)).is_err()
+            );
             let wrong_lineage = EpochId::new(
                 EpochLineageId::new(OTHER_LINEAGE).expect("valid test lineage"),
                 NonZeroU64::new(7).expect("nonzero test sequence"),

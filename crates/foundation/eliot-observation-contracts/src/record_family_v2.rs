@@ -628,9 +628,7 @@ mod tests {
         ObservationEventIdentity, ObservationKind, ObservationScope, PrivacyRetentionDisclosure,
         ProducerTrace,
     };
-    use eliot_contracts::{
-        ClockReading, EpochId, EpochLineageId, ResourceGeneration, StateFence,
-    };
+    use eliot_contracts::{ClockReading, EpochId, EpochLineageId, ResourceGeneration, StateFence};
     use std::num::NonZeroU64;
 
     type TestResult = Result<(), Box<dyn std::error::Error>>;
@@ -646,10 +644,7 @@ mod tests {
     }
 
     fn fence() -> StateFence {
-        StateFence::new(
-            test_epoch(TEST_LINEAGE_A, 1),
-            ResourceGeneration::genesis(),
-        )
+        StateFence::new(test_epoch(TEST_LINEAGE_A, 1), ResourceGeneration::genesis())
     }
 
     fn event(kind: ObservationKind) -> Result<ObservationEventCore, ObservationError> {

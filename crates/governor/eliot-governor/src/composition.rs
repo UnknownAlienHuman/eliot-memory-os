@@ -1232,9 +1232,12 @@ impl<P: KernelDurableJobPort + ?Sized> GovernorOwners<P> {
         let authority_epoch = state_fence.authority_epoch.clone();
         let task_snapshot: TaskLifecycleSnapshot =
             decode_owner_snapshot(recovery, RecoveryOwner::Task)?;
-        let task =
-            TaskLifecycleOwner::from_snapshot(authority_epoch.clone(), state_fence.clone(), task_snapshot)
-                .map_err(|error| CompositionError::Recovery(error.to_string()))?;
+        let task = TaskLifecycleOwner::from_snapshot(
+            authority_epoch.clone(),
+            state_fence.clone(),
+            task_snapshot,
+        )
+        .map_err(|error| CompositionError::Recovery(error.to_string()))?;
         let session_snapshot: SessionLifecycleSnapshot =
             decode_owner_snapshot(recovery, RecoveryOwner::Session)?;
         let session = SessionLifecycleOwner::from_snapshot(
@@ -1710,7 +1713,7 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
             return Err(CompositionError::NotReady);
         }
         let fence = self.snapshot.state_fence();
-        let authority_epoch = self.snapshot.authority_epoch;
+        let authority_epoch = self.snapshot.authority_epoch.clone();
         let generation = self.snapshot.generation;
         if config_snapshot_digest != self.snapshot.protected_snapshot_digest
             || config_snapshot_digest != self.owners.config.snapshot_digest()
@@ -1802,7 +1805,7 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
             launch_nonce: launch_nonce.to_owned(),
             process_invocation_digest: process_invocation_digest.to_owned(),
             state_fence: fence,
-            authority_epoch,
+            authority_epoch: authority_epoch.clone(),
             generation,
             deadline_unix_ms,
             expires_at_unix_ms,
@@ -3613,7 +3616,8 @@ mod tests {
     fn restart_rehydrates_nonempty_task_and_session_snapshots() {
         let observed = snapshot();
         let fence = observed.state_fence();
-        let mut task = TaskLifecycleOwner::new(fence.authority_epoch.clone(), fence.clone()).expect("task");
+        let mut task =
+            TaskLifecycleOwner::new(fence.authority_epoch.clone(), fence.clone()).expect("task");
         let task_snapshot = {
             task.propose(TaskProposal {
                 task_id: TaskId::new("task-1").expect("task id"),
@@ -3631,8 +3635,8 @@ mod tests {
             .expect("task proposal");
             task.snapshot()
         };
-        let mut session =
-            SessionLifecycleOwner::new(fence.authority_epoch.clone(), fence.clone()).expect("session");
+        let mut session = SessionLifecycleOwner::new(fence.authority_epoch.clone(), fence.clone())
+            .expect("session");
         let session_snapshot = {
             session
                 .register(RegisterSession {
@@ -4194,7 +4198,8 @@ mod tests {
     }
 
     fn refresh_task_snapshot(fence: &StateFence, goal: &str) -> TaskLifecycleSnapshot {
-        let mut task = TaskLifecycleOwner::new(fence.authority_epoch.clone(), fence.clone()).expect("task");
+        let mut task =
+            TaskLifecycleOwner::new(fence.authority_epoch.clone(), fence.clone()).expect("task");
         task.propose(TaskProposal {
             task_id: TaskId::new("task-1").expect("task id"),
             project_ref: "project-1".to_owned(),

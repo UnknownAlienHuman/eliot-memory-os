@@ -7,10 +7,10 @@
 
 #![forbid(unsafe_code)]
 
+use eliot_contracts::EpochId;
 use eliot_instrument_api::{
     ExecutionStatus, InstrumentInvocation, InstrumentKind, VerificationRun,
 };
-use eliot_contracts::EpochId;
 use eliot_process::ProcessRequest;
 use redb::{Database, ReadableDatabase, ReadableTable, TableDefinition};
 use serde::{Deserialize, Serialize};
@@ -219,9 +219,11 @@ pub fn issue_process_admission(
             .non_secret()
             .get("CARGO_HOME")
             != Some(&request.cache_root)
-        || !evidence.process.fence().authority_epoch().is_same_authority(
-                &request.invocation.request.state_fence.authority_epoch
-            )
+        || !evidence
+            .process
+            .fence()
+            .authority_epoch()
+            .is_same_authority(&request.invocation.request.state_fence.authority_epoch)
         || evidence.process.generation().get()
             != request
                 .invocation
@@ -321,7 +323,9 @@ impl ExecutionContourGrant {
             || self.invocation_id != invocation_id
             || self.operation_id != process.operation_id().as_str()
             || self.process_tree_id != process.process_tree_id().as_str()
-            || !self.authority_epoch.is_same_authority(process.fence().authority_epoch())
+            || !self
+                .authority_epoch
+                .is_same_authority(process.fence().authority_epoch())
             || self.resource_generation != process.generation().get()
         {
             return Err(TestdError::InvalidBinding);
@@ -1481,7 +1485,9 @@ fn validate_receipt_binding(job: &TestJob, receipt: &ReceiptBinding) -> Result<(
         && receipt.operation_id == job.process.operation_id
         && receipt.process_tree_id == job.process.process_tree_id
         && receipt.generation == job.process.generation
-        && receipt.authority_epoch.is_same_authority(&job.process.authority_epoch)
+        && receipt
+            .authority_epoch
+            .is_same_authority(&job.process.authority_epoch)
         && receipt_invocation_matches(receipt, job.invocation.request.request_id.as_str())
         && receipt.invocation_digest == job.process.invocation_digest
         && receipt.allowed_contour_root == job.target_roots.allowed_contour_root
@@ -1639,9 +1645,8 @@ mod tests {
     use std::num::NonZeroU64;
 
     fn test_epoch(sequence: u64) -> EpochId {
-        let lineage =
-            EpochLineageId::new("550e8400-e29b-41d4-a716-446655440000")
-                .expect("canonical test lineage-A");
+        let lineage = EpochLineageId::new("550e8400-e29b-41d4-a716-446655440000")
+            .expect("canonical test lineage-A");
         EpochId::new(
             lineage,
             NonZeroU64::new(sequence).expect("non-zero test sequence"),

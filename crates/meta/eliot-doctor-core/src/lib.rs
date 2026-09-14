@@ -1,9 +1,7 @@
 #![forbid(unsafe_code)]
 
 use blake3::Hasher;
-use eliot_contracts::{
-    EpochId, ResourceGeneration, StateFence as CanonicalStateFence,
-};
+use eliot_contracts::{EpochId, ResourceGeneration, StateFence as CanonicalStateFence};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeSet;
 use thiserror::Error;

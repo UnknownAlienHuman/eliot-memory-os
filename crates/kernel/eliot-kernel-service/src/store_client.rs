@@ -514,7 +514,6 @@ impl<T: EbpStoreTransport + 'static> CanonicalStoreClient for EbpCanonicalStoreC
 )]
 mod tests {
     use super::*;
-    use std::num::NonZeroU64;
     use eliot_contracts::{
         ClockReading, EpochId, EpochLineageId, ProductId, RequestId, ResourceGeneration, SourceId,
         StateFence,
@@ -524,6 +523,7 @@ mod tests {
     use eliot_protocol::{FrameKind, MessageType, ProtocolPayload, ServerHello};
     use eliot_store_api::StoreResponse;
     use serde_json::json;
+    use std::num::NonZeroU64;
 
     const TEST_LINEAGE_A: &str = "550e8400-e29b-41d4-a716-446655440000";
 

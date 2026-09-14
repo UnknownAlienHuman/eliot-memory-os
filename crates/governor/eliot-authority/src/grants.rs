@@ -816,10 +816,7 @@ mod recovery_tests {
 
     fn binding() -> Result<AuthorityBinding, Box<dyn Error>> {
         let authority_epoch = test_epoch(TEST_LINEAGE_A, 1);
-        let state_fence = StateFence::new(
-            authority_epoch.clone(),
-            ResourceGeneration::new(1)?,
-        );
+        let state_fence = StateFence::new(authority_epoch.clone(), ResourceGeneration::new(1)?);
         Ok(AuthorityBinding {
             authority_id: ContractId::new("authority:test")?,
             authority_owner: "G-01".to_owned(),

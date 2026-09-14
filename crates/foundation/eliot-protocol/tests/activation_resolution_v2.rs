@@ -302,8 +302,7 @@ fn ticket_identity_digest_fence_and_result_digest_substitution_fail() -> Result<
     assert!(other_digest.validate_against(&ticket).is_err());
 
     let mut other_fence = result.clone();
-    other_fence.ticket_state_fence =
-        StateFence::new(test_epoch(8), ResourceGeneration::new(11)?);
+    other_fence.ticket_state_fence = StateFence::new(test_epoch(8), ResourceGeneration::new(11)?);
     other_fence = other_fence.with_computed_digest()?;
     assert!(other_fence.validate_against(&ticket).is_err());
 

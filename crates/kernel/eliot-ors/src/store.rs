@@ -4653,8 +4653,7 @@ impl OperationalRecoveryStore for RedbRecoveryStore {
             receipt_epoch.sequence.get(),
         )?;
         if receipt_fence != record.item.envelope.state_fence
-            || receipt_epoch.sequence.get()
-                != record.item.envelope.authority_epoch.current.epoch
+            || receipt_epoch.sequence.get() != record.item.envelope.authority_epoch.current.epoch
             || receipt_epoch.lineage_id.as_str()
                 != record
                     .item

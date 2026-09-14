@@ -134,7 +134,10 @@ impl WorkerHello {
         self.state_fence
             .validate()
             .map_err(|_| WorkerError::InvalidHandshake("state_fence"))?;
-        if !self.authority_epoch.is_same_authority(&self.state_fence.authority_epoch) {
+        if !self
+            .authority_epoch
+            .is_same_authority(&self.state_fence.authority_epoch)
+        {
             return Err(WorkerError::InvalidHandshake("epoch_fence"));
         }
         Ok(())
@@ -280,7 +283,10 @@ impl WorkerFrame {
         self.state_fence
             .validate()
             .map_err(|_| WorkerError::InvalidFrame("state_fence"))?;
-        if !self.authority_epoch.is_same_authority(&self.state_fence.authority_epoch) {
+        if !self
+            .authority_epoch
+            .is_same_authority(&self.state_fence.authority_epoch)
+        {
             return Err(WorkerError::InvalidFrame("epoch_fence"));
         }
         Ok(())
@@ -717,7 +723,10 @@ impl NativeWorkerRegistration {
         self.state_fence
             .validate()
             .map_err(|_| WorkerError::InvalidHandshake("state_fence"))?;
-        if !self.authority_epoch.is_same_authority(&self.state_fence.authority_epoch) {
+        if !self
+            .authority_epoch
+            .is_same_authority(&self.state_fence.authority_epoch)
+        {
             return Err(WorkerError::InvalidHandshake("epoch_fence"));
         }
         if self.resource_limits.wall_timeout_ms() == 0
@@ -879,7 +888,10 @@ impl NativeWorkerClaim {
         self.state_fence
             .validate()
             .map_err(|_| WorkerError::InvalidRequest("state_fence"))?;
-        if !self.authority_epoch.is_same_authority(&self.state_fence.authority_epoch) {
+        if !self
+            .authority_epoch
+            .is_same_authority(&self.state_fence.authority_epoch)
+        {
             return Err(WorkerError::InvalidRequest("epoch_fence"));
         }
         if !is_lowercase_sha256(&self.binding_digest) {
@@ -1114,7 +1126,10 @@ impl NativeReadyReport {
         if self.worker_generation == 0 || self.worker_generation != claim.worker_generation {
             return Err(WorkerError::InvalidRequest("generation_binding"));
         }
-        if !self.authority_epoch.is_same_authority(&claim.authority_epoch) {
+        if !self
+            .authority_epoch
+            .is_same_authority(&claim.authority_epoch)
+        {
             return Err(WorkerError::StaleEpoch);
         }
         if self.state_fence != claim.state_fence {
@@ -1123,7 +1138,10 @@ impl NativeReadyReport {
         self.state_fence
             .validate()
             .map_err(|_| WorkerError::InvalidRequest("state_fence"))?;
-        if !self.authority_epoch.is_same_authority(&self.state_fence.authority_epoch) {
+        if !self
+            .authority_epoch
+            .is_same_authority(&self.state_fence.authority_epoch)
+        {
             return Err(WorkerError::InvalidRequest("epoch_fence"));
         }
         if !is_lowercase_sha256(&self.claim_binding_digest)
@@ -1183,7 +1201,10 @@ impl NativeBlockedReport {
         if self.worker_generation == 0 || self.worker_generation != claim.worker_generation {
             return Err(WorkerError::InvalidRequest("generation_binding"));
         }
-        if !self.authority_epoch.is_same_authority(&claim.authority_epoch) {
+        if !self
+            .authority_epoch
+            .is_same_authority(&claim.authority_epoch)
+        {
             return Err(WorkerError::StaleEpoch);
         }
         if self.state_fence != claim.state_fence {
@@ -1192,7 +1213,10 @@ impl NativeBlockedReport {
         self.state_fence
             .validate()
             .map_err(|_| WorkerError::InvalidRequest("state_fence"))?;
-        if !self.authority_epoch.is_same_authority(&self.state_fence.authority_epoch) {
+        if !self
+            .authority_epoch
+            .is_same_authority(&self.state_fence.authority_epoch)
+        {
             return Err(WorkerError::InvalidRequest("epoch_fence"));
         }
         if !is_lowercase_sha256(&self.claim_binding_digest)
@@ -1273,7 +1297,10 @@ impl NativeLifecycleBinding {
         self.state_fence
             .validate()
             .map_err(|_| WorkerError::InvalidRequest("state_fence"))?;
-        if !self.authority_epoch.is_same_authority(&self.state_fence.authority_epoch) {
+        if !self
+            .authority_epoch
+            .is_same_authority(&self.state_fence.authority_epoch)
+        {
             return Err(WorkerError::InvalidRequest("epoch_fence"));
         }
         Ok(())
@@ -1454,7 +1481,10 @@ impl NativeAckRecord {
         self.state_fence
             .validate()
             .map_err(|_| WorkerError::InvalidRequest("state_fence"))?;
-        if !self.authority_epoch.is_same_authority(&self.state_fence.authority_epoch) {
+        if !self
+            .authority_epoch
+            .is_same_authority(&self.state_fence.authority_epoch)
+        {
             return Err(WorkerError::InvalidRequest("epoch_fence"));
         }
         if !is_lowercase_sha256(&self.acknowledged_digest) {

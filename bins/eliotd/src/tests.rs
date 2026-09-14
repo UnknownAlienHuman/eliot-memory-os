@@ -54,8 +54,8 @@ fn resolution_ticket() -> Result<AgentActivationResolutionTicket, Box<dyn std::e
 }
 
 #[test]
-fn semantic_resolution_mapping_is_immutable_and_ticket_bound(
-) -> Result<(), Box<dyn std::error::Error>> {
+fn semantic_resolution_mapping_is_immutable_and_ticket_bound()
+-> Result<(), Box<dyn std::error::Error>> {
     let ticket = resolution_ticket()?;
     ticket.validate()?;
     let snapshot = eliot_governor::GovernorActivationSnapshot {
@@ -102,8 +102,8 @@ fn production_config_has_no_root_or_environment_override() {
 }
 
 #[test]
-fn application_payload_always_carries_a_closed_operation_identity(
-) -> Result<(), Box<dyn std::error::Error>> {
+fn application_payload_always_carries_a_closed_operation_identity()
+-> Result<(), Box<dyn std::error::Error>> {
     let payload = operation_payload("health", serde_json::json!({}))?;
     assert_eq!(payload["operation"], "health");
     assert!(operation_payload("health", serde_json::json!([])).is_err());
@@ -130,8 +130,8 @@ fn snapshot_expectation_rejects_unbound_digest() -> Result<(), Box<dyn std::erro
 }
 
 #[test]
-fn kernel_and_eliotd_artifact_domains_cannot_rewrite_each_other(
-) -> Result<(), Box<dyn std::error::Error>> {
+fn kernel_and_eliotd_artifact_domains_cannot_rewrite_each_other()
+-> Result<(), Box<dyn std::error::Error>> {
     let launch = valid_launch_config()?;
     let kernel_digest = launch.kernel.artifact_digest.clone();
     let child_digest = "c".repeat(64);
@@ -188,8 +188,8 @@ fn kernel_and_eliotd_artifact_domains_cannot_rewrite_each_other(
 
 #[cfg(windows)]
 #[test]
-fn production_server_hello_requires_observed_sid_and_session_binding(
-) -> Result<(), Box<dyn std::error::Error>> {
+fn production_server_hello_requires_observed_sid_and_session_binding()
+-> Result<(), Box<dyn std::error::Error>> {
     let launch = valid_launch_config()?;
     let config = DaemonConfig::from_launch_with_binding(
         launch.clone(),
@@ -248,8 +248,8 @@ fn production_server_hello_requires_observed_sid_and_session_binding(
 
 #[cfg(windows)]
 #[tokio::test]
-async fn receipt_publication_race_retries_only_exact_pre_admission_failures(
-) -> Result<(), Box<dyn std::error::Error>> {
+async fn receipt_publication_race_retries_only_exact_pre_admission_failures()
+-> Result<(), Box<dyn std::error::Error>> {
     let connection_id = "eliotd:race:test";
     let pending =
         eliot_ipc::handshake_rejection_frame(connection_id, ELIOTD_RECEIPT_PENDING_REJECTION)?;

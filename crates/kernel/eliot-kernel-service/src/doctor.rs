@@ -30,10 +30,10 @@
 
 use std::collections::BTreeSet;
 
-use eliot_contracts::{canonical_json_bytes, sha256_hex, EpochId};
+use eliot_contracts::{EpochId, canonical_json_bytes, sha256_hex};
 use eliot_doctor_core::{
-    canonical_fence, AttemptIdentityBinding, ClosedRepairRequest, RepairClass, RepairOperationRef,
-    RepairRecipe, RepairRecipeIdentity, RepairRecipeManifest,
+    AttemptIdentityBinding, ClosedRepairRequest, RepairClass, RepairOperationRef, RepairRecipe,
+    RepairRecipeIdentity, RepairRecipeManifest, canonical_fence,
 };
 use eliot_ors::{
     DoctorAttemptAdmission, DoctorAttemptRecord, DoctorAttemptState, DoctorBudgetDecision,
@@ -44,7 +44,7 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
-use crate::{validate_text, KernelServiceError, KernelServiceState};
+use crate::{KernelServiceError, KernelServiceState, validate_text};
 
 /// Stable identity for the Kernel-owned Doctor repair-attempt wire.
 pub const DOCTOR_REPAIR_WIRE_ID: &str = "eliot.kernel.doctor-repair-attempt";

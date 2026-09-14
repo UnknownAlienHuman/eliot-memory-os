@@ -109,10 +109,7 @@ fn requirements() -> Result<RouteRequirements, Box<dyn Error>> {
         "task-1",
         "attempt-1",
         "scope-1",
-        StateFence::new(
-            test_epoch(TEST_LINEAGE_A, 1),
-            ResourceGeneration::new(1)?,
-        ),
+        StateFence::new(test_epoch(TEST_LINEAGE_A, 1), ResourceGeneration::new(1)?),
         "policy-1",
         NOW,
     ))

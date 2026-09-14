@@ -13,11 +13,11 @@ use eliot_contracts::OperationId;
 use eliot_governor::{KernelPortError, KernelPortFuture, KernelTransitionPort};
 use eliot_protocol::RequestIdentity;
 use eliot_store_api::{
-    validate_store_receipt_envelope, OrderingHeadExpectation, PreparedTransition,
-    RevisionHeadExpectation, StoreHealth, WriteReceipt,
+    OrderingHeadExpectation, PreparedTransition, RevisionHeadExpectation, StoreHealth,
+    WriteReceipt, validate_store_receipt_envelope,
 };
 
-use super::{kernel_port_error, kind_value, DaemonKernelClient};
+use super::{DaemonKernelClient, kernel_port_error, kind_value};
 
 /// Checks the admitted identity against the immutable transition before any
 /// transport is touched.

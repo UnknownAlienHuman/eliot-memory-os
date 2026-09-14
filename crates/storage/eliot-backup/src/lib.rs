@@ -17,9 +17,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use eliot_blob_api::{
     BlobError, BlobHash, BlobId, BlobLocator, CompressionDescriptor, CryptoDescriptor,
 };
-use eliot_contracts::{
-    EpochId, ResourceGeneration, StateFence, canonical_json_bytes, sha256_hex,
-};
+use eliot_contracts::{EpochId, ResourceGeneration, StateFence, canonical_json_bytes, sha256_hex};
 use eliot_security_contracts::PurgeLedgerEntry;
 use eliot_store_api::{OrderingHead, RevisionHead, ScopeId, StoreError, WriteReceipt};
 use serde::{Deserialize, Serialize};
@@ -1037,14 +1035,12 @@ impl RestorePlan {
             .map_or(source.resource_generation, |ors| ors.resource_generation);
         // Lineage-aware restore ordering (Implements #64): same-lineage must
         // advance; new-lineage must be genesis (sequence 1).
-        let epoch_advances = if target.target_authority_epoch.lineage_id == ors_epoch.lineage_id
-        {
+        let epoch_advances = if target.target_authority_epoch.lineage_id == ors_epoch.lineage_id {
             target.target_authority_epoch.sequence.get() > ors_epoch.sequence.get()
         } else {
             target.target_authority_epoch.sequence.get() == 1
         };
-        if !epoch_advances || target.target_resource_generation <= ors_generation
-        {
+        if !epoch_advances || target.target_resource_generation <= ors_generation {
             return Err(BackupError::StaleRestoreLineage);
         }
         let restored_fence = RestoredFence {

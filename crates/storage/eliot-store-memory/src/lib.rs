@@ -1063,8 +1063,8 @@ fn checked_increment(
 mod tests {
     use super::*;
     use eliot_contracts::{
-        ClockReading, EpochId, EpochLineageId, ProductId, RequestId, ResourceGeneration,
-        SessionId, SourceId, TaskId,
+        ClockReading, EpochId, EpochLineageId, ProductId, RequestId, ResourceGeneration, SessionId,
+        SourceId, TaskId,
     };
     use eliot_store_api::{
         EffectClass, NamedOperationManifest, StoreGenesisRequest, StoreRecoveryRequest,

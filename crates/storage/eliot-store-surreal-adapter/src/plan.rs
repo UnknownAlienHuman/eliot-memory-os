@@ -476,8 +476,7 @@ fn ensure_unique_ordering_scopes(scopes: &[OrderingScopeId]) -> Result<(), Store
 mod tests {
     use super::*;
     use eliot_contracts::{
-        ClockReading, EpochId, EpochLineageId, ProductId, RequestId, ResourceGeneration,
-        SourceId,
+        ClockReading, EpochId, EpochLineageId, ProductId, RequestId, ResourceGeneration, SourceId,
     };
     use eliot_store_api::{
         EffectClass, EventProjectionRelationIntents, NamedMutationOperation, NamedMutationRequest,

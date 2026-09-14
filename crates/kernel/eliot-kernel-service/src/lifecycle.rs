@@ -977,15 +977,12 @@ impl KernelService {
                 field: "authority_epoch",
             });
         }
-        let next_sequence = self
-            .canonical_epoch
-            .sequence
-            .get()
-            .checked_add(1)
-            .ok_or(KernelServiceError::InvalidField {
+        let next_sequence = self.canonical_epoch.sequence.get().checked_add(1).ok_or(
+            KernelServiceError::InvalidField {
                 field: "authority_epoch",
                 reason: "sequence overflow",
-            })?;
+            },
+        )?;
         let next = EpochId::new(
             self.canonical_epoch.lineage_id.clone(),
             NonZeroU64::new(next_sequence).ok_or(KernelServiceError::InvalidField {
@@ -1051,12 +1048,11 @@ impl KernelService {
         // epoch (donor precedent: no silent widening of the core). The
         // sequence contour is the exact tuple projection, never a
         // cross-lineage coercion.
-        let scalar_target =
-            AuthorityEpoch::new(target.sequence.get()).map_err(|_| {
-                KernelServiceError::HandshakeMismatch {
-                    field: "authority_epoch_corrupt",
-                }
-            })?;
+        let scalar_target = AuthorityEpoch::new(target.sequence.get()).map_err(|_| {
+            KernelServiceError::HandshakeMismatch {
+                field: "authority_epoch_corrupt",
+            }
+        })?;
         let front_door_epoch = self.front_door.synchronize_epoch(scalar_target)?;
         let mirrored = self.authority.synchronize_epoch(scalar_target)?;
         if front_door_epoch != mirrored || mirrored != scalar_target {

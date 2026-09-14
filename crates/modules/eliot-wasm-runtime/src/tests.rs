@@ -622,7 +622,10 @@ impl P03ReceiptVerifierPort for ReceiptVerifierMock {
             || receipt.operation_id() != binding.operation_id()
             || receipt.request_digest() != binding.request_digest()
             || !receipt.binding().state_fence().matches(binding.fence())
-            || !binding.fence().authority_epoch().is_same_authority(&envelope.lease.state_fence.authority_epoch)
+            || !binding
+                .fence()
+                .authority_epoch()
+                .is_same_authority(&envelope.lease.state_fence.authority_epoch)
         {
             Err(PortError::Denied)
         } else {
@@ -641,7 +644,10 @@ impl P03ReceiptVerifierPort for ReceiptVerifierMock {
             && receipt_binding.process_tree_id() == binding.process_tree_id()
             && receipt_binding.request_digest() == binding.request_digest()
             && receipt_binding.state_fence().matches(binding.fence())
-            && binding.fence().authority_epoch().is_same_authority(&envelope.lease.state_fence.authority_epoch);
+            && binding
+                .fence()
+                .authority_epoch()
+                .is_same_authority(&envelope.lease.state_fence.authority_epoch);
         if self.config.cancel_receipt_mismatch || self.config.reject_cancel_receipt || !exact {
             Err(PortError::Denied)
         } else {
@@ -660,7 +666,10 @@ impl P03ReceiptVerifierPort for ReceiptVerifierMock {
             && evidence_binding.process_tree_id() == binding.process_tree_id()
             && evidence_binding.request_digest() == binding.request_digest()
             && evidence_binding.state_fence().matches(binding.fence())
-            && binding.fence().authority_epoch().is_same_authority(&envelope.lease.state_fence.authority_epoch);
+            && binding
+                .fence()
+                .authority_epoch()
+                .is_same_authority(&envelope.lease.state_fence.authority_epoch);
         if self.config.reject_reconcile_evidence || !exact {
             Err(PortError::Denied)
         } else {

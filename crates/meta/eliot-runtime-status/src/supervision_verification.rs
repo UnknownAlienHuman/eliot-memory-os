@@ -7,12 +7,12 @@ use std::time::Instant;
 use eliot_contracts::sha256_hex;
 use eliot_installation::CandidateManifest;
 use eliot_runtime_contracts::{
-    SignedSupervisionLease, SupervisionLeaseIncarnationBinding,
+    SUPERVISION_LEASE_FILE_NAME, SignedSupervisionLease, SupervisionLeaseIncarnationBinding,
     SupervisionLeasePredecessorIdentity, SupervisionLeaseVerificationContext,
-    SupervisionLeaseVerifier, SupervisionTrustAnchor, WatchdogAdmissionTemplate,
-    WatchdogPublicationBundle, WatchdogPublicationRetentionPlan, SUPERVISION_LEASE_FILE_NAME,
-    WATCHDOG_ADMISSION_FILE_NAME, WATCHDOG_PUBLICATION_DIRECTORY_PREFIX,
-    WATCHDOG_PUBLICATION_FILE_NAME, WATCHDOG_PUBLICATION_RETAINED_LIMIT,
+    SupervisionLeaseVerifier, SupervisionTrustAnchor, WATCHDOG_ADMISSION_FILE_NAME,
+    WATCHDOG_PUBLICATION_DIRECTORY_PREFIX, WATCHDOG_PUBLICATION_FILE_NAME,
+    WATCHDOG_PUBLICATION_RETAINED_LIMIT, WatchdogAdmissionTemplate, WatchdogPublicationBundle,
+    WatchdogPublicationRetentionPlan,
 };
 
 pub(super) fn require_host_monotonic_lease(

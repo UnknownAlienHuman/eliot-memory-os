@@ -1046,7 +1046,7 @@ pub fn contract_schema() -> schemars::Schema {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use eliot_contracts::{EpochLineageId};
+    use eliot_contracts::EpochLineageId;
     use std::num::NonZeroU64;
 
     type TestResult = Result<(), Box<dyn std::error::Error>>;
@@ -1395,7 +1395,10 @@ mod tests {
                 lease: serde_json::from_value::<WorkLeaseId>(
                     serde_json::json!({"namespace": "eliot.governor.work-lease", "revision": "v1", "value": "lease-1"}),
                 )?,
-                state_fence: StateFence::new(test_epoch(TEST_LINEAGE_A, 1), ResourceGeneration::new(1)?),
+                state_fence: StateFence::new(
+                    test_epoch(TEST_LINEAGE_A, 1),
+                    ResourceGeneration::new(1)?,
+                ),
                 valid_until: "2026-08-14T00:00:00Z".into(),
             },
             cancellation: CancellationState::NotRequested,
@@ -1431,7 +1434,10 @@ mod tests {
             lease: serde_json::from_value::<WorkLeaseId>(
                 serde_json::json!({"namespace": "eliot.governor.work-lease", "revision": "v1", "value": "lease-1"}),
             )?,
-            state_fence: StateFence::new(test_epoch(TEST_LINEAGE_A, 1), ResourceGeneration::new(1)?),
+            state_fence: StateFence::new(
+                test_epoch(TEST_LINEAGE_A, 1),
+                ResourceGeneration::new(1)?,
+            ),
             valid_until: "later".into(),
         };
         assert!(authority.validate().is_ok());
@@ -1448,7 +1454,10 @@ mod tests {
             lease: serde_json::from_value::<WorkLeaseId>(
                 serde_json::json!({"namespace": "eliot.governor.work-lease", "revision": "v1", "value": "lease-1"}),
             )?,
-            state_fence: StateFence::new(test_epoch(TEST_LINEAGE_A, 7), ResourceGeneration::new(3)?),
+            state_fence: StateFence::new(
+                test_epoch(TEST_LINEAGE_A, 7),
+                ResourceGeneration::new(3)?,
+            ),
             valid_until: "later".into(),
         })
     }
@@ -1507,7 +1516,10 @@ mod tests {
         assert_eq!(wire["epoch"]["lineage_id"], TEST_LINEAGE_A);
         assert_eq!(wire["epoch"]["sequence"], 7);
         assert!(wire["state_fence"].is_object());
-        assert_eq!(serde_json::from_value::<AuthorityEnvelope>(wire.clone())?, original);
+        assert_eq!(
+            serde_json::from_value::<AuthorityEnvelope>(wire.clone())?,
+            original
+        );
         // Legacy numeric epoch never deserializes (EpochId-only, Implements #64).
         let mut numeric = wire;
         numeric["epoch"] = serde_json::json!(7);
@@ -1538,10 +1550,8 @@ mod tests {
     fn api_case_07_zero_epoch_generation_and_fence_are_rejected() -> TestResult {
         assert!(NonZeroU64::new(0).is_none());
         assert!(ResourceGeneration::new(0).is_err());
-        let zero_fence = StateFence::new(
-            test_epoch(TEST_LINEAGE_A, 1),
-            ResourceGeneration::default(),
-        );
+        let zero_fence =
+            StateFence::new(test_epoch(TEST_LINEAGE_A, 1), ResourceGeneration::default());
         assert!(zero_fence.validate().is_err());
         let zero = serde_json::json!({
             "authority_epoch": 0,
@@ -1552,27 +1562,21 @@ mod tests {
         });
         assert!(serde_json::from_value::<StateFence>(zero).is_err());
         // Cross-lineage same sequence never authorizes (EpochId-only, Implements #64).
-        let foreign = StateFence::new(
-            test_epoch(TEST_LINEAGE_B, 1),
-            ResourceGeneration::new(1)?,
-        );
-        let local = StateFence::new(
-            test_epoch(TEST_LINEAGE_A, 1),
-            ResourceGeneration::new(1)?,
-        );
+        let foreign = StateFence::new(test_epoch(TEST_LINEAGE_B, 1), ResourceGeneration::new(1)?);
+        let local = StateFence::new(test_epoch(TEST_LINEAGE_A, 1), ResourceGeneration::new(1)?);
         assert!(!local.is_compatible_with(&foreign));
-        assert!(!local
-            .authority_epoch
-            .is_same_authority(&foreign.authority_epoch));
+        assert!(
+            !local
+                .authority_epoch
+                .is_same_authority(&foreign.authority_epoch)
+        );
         Ok(())
     }
 
     #[test]
     fn api_case_08_cancel_and_admitted_receipts_reject_legacy_and_zero_fences() -> TestResult {
-        let zero_fence = StateFence::new(
-            test_epoch(TEST_LINEAGE_A, 1),
-            ResourceGeneration::default(),
-        );
+        let zero_fence =
+            StateFence::new(test_epoch(TEST_LINEAGE_A, 1), ResourceGeneration::default());
         let typed_cancel = CancelRequest {
             attempt_id: AttemptId::new("attempt-case-08")?,
             reason: CancelReason::UserRequested,
@@ -1856,7 +1860,10 @@ mod tests {
                 "revision": "v1",
                 "value": "lease-case-12"
             }))?,
-            state_fence: StateFence::new(test_epoch(TEST_LINEAGE_A, 1), ResourceGeneration::new(1)?),
+            state_fence: StateFence::new(
+                test_epoch(TEST_LINEAGE_A, 1),
+                ResourceGeneration::new(1)?,
+            ),
             valid_until: "later".into(),
         };
         assert!(envelope.validate().is_ok());

@@ -5,13 +5,13 @@
 
 use std::path::{Path, PathBuf};
 
-use eliot_contracts::{sha256_hex, StateFence};
+use eliot_contracts::{StateFence, sha256_hex};
 use eliot_governor::GovernorLaunchConfig;
 use eliot_platform_windows::{
-    current_process_named_pipe_expectation, protected_program_data_path, ProtectedRuntimePathLease,
+    ProtectedRuntimePathLease, current_process_named_pipe_expectation, protected_program_data_path,
 };
 
-use super::{DaemonError, KernelLaunchBinding, KERNEL_PIPE_NAME, MAX_CONFIG_BYTES};
+use super::{DaemonError, KERNEL_PIPE_NAME, KernelLaunchBinding, MAX_CONFIG_BYTES};
 
 fn observed_runtime_identity() -> Result<(String, u32), DaemonError> {
     let expectation = current_process_named_pipe_expectation()

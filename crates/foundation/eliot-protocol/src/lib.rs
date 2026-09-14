@@ -3355,10 +3355,7 @@ mod tests {
     }
 
     fn fence() -> StateFence {
-        StateFence::new(
-            test_epoch(TEST_LINEAGE_A, 1),
-            ResourceGeneration::genesis(),
-        )
+        StateFence::new(test_epoch(TEST_LINEAGE_A, 1), ResourceGeneration::genesis())
     }
 
     fn agent_bridge_client_declaration() -> Result<AgentBridgeClientDeclaration, ProtocolError> {

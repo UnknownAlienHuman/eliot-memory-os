@@ -213,10 +213,7 @@ pub struct SessionLifecycleOwner {
 
 impl SessionLifecycleOwner {
     /// Creates an empty owner at the genesis causal sequence.
-    pub fn new(
-        authority_epoch: EpochId,
-        state_fence: StateFence,
-    ) -> Result<Self, SessionError> {
+    pub fn new(authority_epoch: EpochId, state_fence: StateFence) -> Result<Self, SessionError> {
         state_fence
             .validate()
             .map_err(|_| SessionError::FenceMismatch)?;
@@ -251,9 +248,7 @@ impl SessionLifecycleOwner {
             return Err(SessionError::CausalSequenceMismatch);
         }
         for session in snapshot.sessions.values() {
-            if !session
-                .authority_epoch
-                .is_same_authority(&authority_epoch)
+            if !session.authority_epoch.is_same_authority(&authority_epoch)
                 || session.state_fence != owner.state_fence
                 || session.expires_at < session.heartbeat_at
             {

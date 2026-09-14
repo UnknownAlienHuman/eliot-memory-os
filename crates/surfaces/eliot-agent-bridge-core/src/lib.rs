@@ -1221,8 +1221,7 @@ fn validate_authority_binding(
     // EpochId is always a validated non-zero (lineage_id, sequence) tuple by
     // construction (Implements #64); only the generation retains a scalar
     // non-zero check here.
-    if activation_generation.get() == 0 || state_fence.generation().get() == 0
-    {
+    if activation_generation.get() == 0 || state_fence.generation().get() == 0 {
         return Err(BridgeError::InvalidContract {
             field: "authority_binding",
             reason: "session generation and authority epoch must be non-zero",

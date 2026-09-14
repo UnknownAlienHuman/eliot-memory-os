@@ -15,7 +15,6 @@ use eliot_agent_api::{
     ResourceGeneration, StateFence, WorkLeaseId,
 };
 use eliot_contracts::{EpochId, EpochLineageId, IntegrationRevision, PolicyRevision, TaskRevision};
-use std::num::NonZeroU64;
 use eliot_process::{
     ActionLeaseRef, CancellationReceipt, CancellationRequest, DescendantEvidence,
     DispatchAuthorityId, DispatchPermitAuthority, DispatchValidationContext, EnvironmentProjection,
@@ -26,6 +25,7 @@ use eliot_process::{
     ProcessStartReceipt, ProcessState, ProcessTreeId, ResourceLimits, SessionId,
     SuspendedProcessIdentity,
 };
+use std::num::NonZeroU64;
 
 use super::*;
 
@@ -580,9 +580,12 @@ fn process_request_with(operation: &str, tree: &str, generation: u64) -> Process
         ResourceLimits::new(5_000, Some(1_000), Some(1_048_576), 4_096, 4_096, 2).expect("limits"),
     )
     .expect("process intent");
-    let fence =
-        FencingToken::new(test_epoch(1), generation, format!("process-fence-{generation:?}"))
-            .expect("fence");
+    let fence = FencingToken::new(
+        test_epoch(1),
+        generation,
+        format!("process-fence-{generation:?}"),
+    )
+    .expect("fence");
     let mut authority = DispatchPermitAuthority::activate(
         DispatchAuthorityId::new("native-worker-authority").expect("authority"),
         KernelDispatchKey::from_secret_bytes([0x5a; 32]).expect("key"),

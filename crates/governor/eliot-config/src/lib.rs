@@ -336,10 +336,7 @@ mod tests {
     }
 
     fn fence() -> StateFence {
-        StateFence::new(
-            test_epoch(TEST_LINEAGE_A, 1),
-            ResourceGeneration::genesis(),
-        )
+        StateFence::new(test_epoch(TEST_LINEAGE_A, 1), ResourceGeneration::genesis())
     }
     fn snapshot(machine: &str, scope: &str, revision: u64) -> ConfigPolicySnapshot {
         let fence = fence();

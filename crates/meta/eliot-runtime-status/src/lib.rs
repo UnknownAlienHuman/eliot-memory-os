@@ -25,7 +25,7 @@ pub(crate) use service_registration_status::inspect_approved_service_registratio
 #[cfg(test)]
 pub(crate) use service_registration_status::project_service_registration_inspection;
 pub use service_registration_status::{
-    service_gap_for, ServiceRegistrationState, ServiceRuntimeIdentity,
+    ServiceRegistrationState, ServiceRuntimeIdentity, service_gap_for,
 };
 
 mod supervision_verification;
@@ -39,33 +39,33 @@ pub use supervision_projection::CurrentSupervisionEvidence;
 mod store_live_status;
 #[cfg(test)]
 use store_live_status::store_tcp_endpoint_exact;
-use store_live_status::{inspect_store_live, production_store_observer};
 pub use store_live_status::{ProductionStoreLiveObserver, StoreLiveObserver, StoreLiveSnapshot};
+use store_live_status::{inspect_store_live, production_store_observer};
 
 mod store_failure_status;
 pub use store_failure_status::{
-    component_state_for, project_store_failure, writer_readiness_denominator,
-    StoreFailureStatusError, StoreFailureStatusProjection, WriterReadinessDenominator,
-    MAX_BLOCKING_OPERATION_REFS,
+    MAX_BLOCKING_OPERATION_REFS, StoreFailureStatusError, StoreFailureStatusProjection,
+    WriterReadinessDenominator, component_state_for, project_store_failure,
+    writer_readiness_denominator,
 };
 
 mod eliotd_live;
-use eliotd_live::{eliotd_live_gap, inspect_eliotd_live};
 pub use eliotd_live::{EliotdLiveObserver, EliotdLiveSnapshot, ProductionEliotdLiveObserver};
+use eliotd_live::{eliotd_live_gap, inspect_eliotd_live};
 
 mod watchdog_live;
-use watchdog_live::{inspect_watchdog_live, watchdog_gap};
 pub use watchdog_live::{
     ProductionWatchdogLiveObserver, WatchdogLiveObserver, WatchdogLiveSnapshot,
 };
+use watchdog_live::{inspect_watchdog_live, watchdog_gap};
 
 mod readiness_projection;
-use readiness_projection::inspect_readiness_from_host_state;
 pub use readiness_projection::ReadinessContour;
+use readiness_projection::inspect_readiness_from_host_state;
 
 mod capability_cell_readback;
 pub use capability_cell_readback::{
-    resolve_generation_via_registry, CellReadbackError, GenerationCellResolution,
+    CellReadbackError, GenerationCellResolution, resolve_generation_via_registry,
 };
 
 const WATCHDOG_PUBLICATION_CHILD_LIMIT: u64 = 1024 * 1024;
@@ -2669,18 +2669,24 @@ mod honest_tests {
         assert_eq!(report.status, "NOT_HEALTHY");
         assert_eq!(report.contract, "eliot.runtime.live");
         assert_eq!(report.contract_version, "1.1.0");
-        assert!(report
-            .gaps
-            .iter()
-            .any(|g| g.contains("freshness cannot be proven")));
-        assert!(report
-            .gaps
-            .iter()
-            .any(|g| g.contains("provisioned trust anchor")));
-        assert!(report
-            .gaps
-            .iter()
-            .any(|g| g.contains("installation transaction stage")));
+        assert!(
+            report
+                .gaps
+                .iter()
+                .any(|g| g.contains("freshness cannot be proven"))
+        );
+        assert!(
+            report
+                .gaps
+                .iter()
+                .any(|g| g.contains("provisioned trust anchor"))
+        );
+        assert!(
+            report
+                .gaps
+                .iter()
+                .any(|g| g.contains("installation transaction stage"))
+        );
         assert!(report.gaps.iter().any(|g| g.contains("Kernel")));
         assert!(report.gaps.iter().any(|g| g.contains("Store")));
         assert!(report.gaps.iter().any(|g| g.contains("eliotd")));
@@ -2883,10 +2889,12 @@ mod honest_tests {
             }
             other => panic!("transaction stage must be Unknown, got {other:?}"),
         }
-        assert!(report
-            .gaps
-            .iter()
-            .any(|g| g == &transaction_stage_gap_for() || g.contains("transaction_stage")));
+        assert!(
+            report
+                .gaps
+                .iter()
+                .any(|g| g == &transaction_stage_gap_for() || g.contains("transaction_stage"))
+        );
         let _ = std::fs::remove_dir_all(root);
     }
 
@@ -4707,9 +4715,11 @@ mod live_production_observer_tests {
             Instant::now() + Duration::from_secs(2),
         );
         assert!(matches!(state, ComponentState::Unknown { .. }));
-        assert!(format!("{state:?}")
-            .to_ascii_lowercase()
-            .contains("monotonic"));
+        assert!(
+            format!("{state:?}")
+                .to_ascii_lowercase()
+                .contains("monotonic")
+        );
         let _ = std::fs::remove_dir_all(&tmp);
     }
     #[test]
@@ -4743,9 +4753,11 @@ mod live_production_observer_tests {
             Instant::now() + Duration::from_secs(2),
         );
         assert!(matches!(state, ComponentState::Unknown { .. }));
-        assert!(format!("{state:?}")
-            .to_ascii_lowercase()
-            .contains("monotonic"));
+        assert!(
+            format!("{state:?}")
+                .to_ascii_lowercase()
+                .contains("monotonic")
+        );
         let _ = std::fs::remove_dir_all(&tmp);
     }
     #[test]
@@ -4773,9 +4785,11 @@ mod live_production_observer_tests {
             Instant::now() + Duration::from_secs(2),
         );
         assert!(matches!(state, ComponentState::Unknown { .. }));
-        assert!(format!("{state:?}")
-            .to_ascii_lowercase()
-            .contains("monotonic"));
+        assert!(
+            format!("{state:?}")
+                .to_ascii_lowercase()
+                .contains("monotonic")
+        );
         let _ = std::fs::remove_dir_all(&tmp);
     }
     #[test]
@@ -4814,9 +4828,11 @@ mod live_production_observer_tests {
             Instant::now() + Duration::from_secs(2),
         );
         assert!(matches!(state, ComponentState::Unknown { .. }));
-        assert!(format!("{state:?}")
-            .to_ascii_lowercase()
-            .contains("monotonic"));
+        assert!(
+            format!("{state:?}")
+                .to_ascii_lowercase()
+                .contains("monotonic")
+        );
         let _ = std::fs::remove_dir_all(&tmp);
     }
     #[test]
@@ -5080,9 +5096,9 @@ mod cli_separate_process_tests {
 mod host_journal_projection_tests {
     use super::*;
     use eliot_host_state::{
-        record_checksum, ActivationState, EpochIdentity, EpochTransition, HostInstallationEpoch,
-        HostStateRecord, IdempotencyIdentity, KernelJobBinding, KernelReadinessObservationRecord,
-        OneTimeNonceState, PriorKernelDisposition, ReadinessApprovedContour,
+        ActivationState, EpochIdentity, EpochTransition, HostInstallationEpoch, HostStateRecord,
+        IdempotencyIdentity, KernelJobBinding, KernelReadinessObservationRecord, OneTimeNonceState,
+        PriorKernelDisposition, ReadinessApprovedContour, record_checksum,
     };
     use eliot_platform::PlatformHandle;
     use eliot_runtime_contracts::KernelActivationState;

@@ -645,7 +645,9 @@ impl fmt::Display for RuleRef {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use eliot_contracts::{ContractVersion, EpochId, EpochLineageId, ProductId, ResourceGeneration};
+    use eliot_contracts::{
+        ContractVersion, EpochId, EpochLineageId, ProductId, ResourceGeneration,
+    };
     use eliot_receipts::WorkScopeId;
     use std::num::NonZeroU64;
 

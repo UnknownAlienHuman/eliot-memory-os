@@ -90,10 +90,7 @@ fn rev(value: &str) -> RevisionId {
 }
 
 fn fence() -> StateFence {
-    StateFence::new(
-        test_epoch(TEST_LINEAGE_A, 1),
-        ResourceGeneration::genesis(),
-    )
+    StateFence::new(test_epoch(TEST_LINEAGE_A, 1), ResourceGeneration::genesis())
 }
 
 fn full_fence() -> StateFence {

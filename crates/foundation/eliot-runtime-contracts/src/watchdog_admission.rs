@@ -412,7 +412,9 @@ mod tests {
     use super::*;
     use std::num::NonZeroU64;
 
-    use eliot_contracts::{AuthorityEpoch, EpochId, EpochLineageId, ResourceGeneration, StateFence};
+    use eliot_contracts::{
+        AuthorityEpoch, EpochId, EpochLineageId, ResourceGeneration, StateFence,
+    };
 
     /// Lineage-A fixture epoch for tests (canonical UUID lineage, no scalar).
     fn test_epoch(sequence: u64) -> EpochId {

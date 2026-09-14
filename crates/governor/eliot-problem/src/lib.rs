@@ -1261,10 +1261,7 @@ mod tests {
     }
 
     fn state_fence() -> StateFence {
-        StateFence::new(
-            test_epoch(TEST_LINEAGE_A, 1),
-            ResourceGeneration::genesis(),
-        )
+        StateFence::new(test_epoch(TEST_LINEAGE_A, 1), ResourceGeneration::genesis())
     }
 
     fn owner() -> OwnerRef {
@@ -1331,10 +1328,8 @@ mod tests {
     #[test]
     fn owner_reassignment_fences_old_owner() -> Result<(), ProblemError> {
         let old_fence = state_fence();
-        let new_fence = StateFence::new(
-            test_epoch(TEST_LINEAGE_A, 2),
-            ResourceGeneration::genesis(),
-        );
+        let new_fence =
+            StateFence::new(test_epoch(TEST_LINEAGE_A, 2), ResourceGeneration::genesis());
         let mut value = problem()?;
         value.reassign_owner(&old_fence, owner(), new_fence.clone())?;
         assert!(matches!(

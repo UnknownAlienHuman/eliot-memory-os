@@ -1729,10 +1729,7 @@ mod tests {
     ) -> Result<ProviderExecutionBinding, Box<dyn std::error::Error>> {
         use eliot_agent_api::{ExecutionUnit, NativeSession, NativeSessionLocator, RequestId};
         use eliot_contracts::{ResourceGeneration, StateFence};
-        let fence = StateFence::new(
-            test_epoch(TEST_LINEAGE_A, 1),
-            ResourceGeneration::new(1)?,
-        );
+        let fence = StateFence::new(test_epoch(TEST_LINEAGE_A, 1), ResourceGeneration::new(1)?);
         Ok(ProviderExecutionBinding {
             attempt_id: AttemptId::new("attempt")?,
             lease_id: serde_json::from_value(
