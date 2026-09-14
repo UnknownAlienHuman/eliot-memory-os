@@ -157,12 +157,20 @@ pub(super) fn run() -> Result<(), String> {
     .map_err(|error| error.to_string())?;
     let kernel = DaemonKernelClient::connect(&config).map_err(|error| error.to_string())?;
     let authority_activation = eliotd::kernel_authority_port(&kernel);
-    let composition = DaemonComposition::start(
+    let mut composition = DaemonComposition::start(
         config,
         Arc::clone(&kernel) as Arc<dyn eliot_governor::KernelGenerationPort>,
         Some(authority_activation),
     )
     .map_err(|error| error.to_string())?;
+    // AUD-C02-B: the single place holding both the concrete client and the
+    // composition. Push the already-validated Kernel-issued owner session
+    // facts (if a handshake validated them) into the composition via the one
+    // setter. No new thread, no new handshake, no storing the client; without
+    // facts the composition keeps the empty (unadmitted) board behaviour.
+    if let Some(facts) = kernel.owner_session_facts() {
+        composition.note_owner_session_binding(facts);
+    }
     kernel.report_ready().map_err(|error| error.to_string())?;
     let status = composition.status();
     write_json(&ready_message(&status))?;

@@ -9,6 +9,7 @@
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
+use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
@@ -47,6 +48,32 @@ pub struct DaemonKernelClient {
     pub(super) connection_id: String,
     pub(super) snapshot: KernelGenerationSnapshot,
     request_counter: Arc<AtomicU64>,
+    /// Literal Kernel-issued `sid=..;session=..` binding string retained only
+    /// after a successful [`validate_server_hello`](handshake::validate_server_hello)
+    /// in this process (AUD-C02-B, Implements #1187). Never the whole
+    /// `ServerHello`, never a constant, no secret: identity refs only. `None`
+    /// until the first validated handshake, so pre-handshake reads stay
+    /// fail-closed to "no live session".
+    validated_session_binding: Mutex<Option<String>>,
+}
+
+/// Already-validated Kernel-issued owner session facts for the single live
+/// owner session (AUD-C02-B, Implements #1187; single-owner decision #1376).
+///
+/// Every field is cloned from state this client already holds after the
+/// authenticated handshake: the validated `sid=..;session=..` binding string,
+/// the Kernel snapshot principal and receipt-relevant artifact digests, the
+/// local connection correlation id, and the descriptor launch nonce carried
+/// in [`KernelLaunchBinding::launch_nonce`]. No re-handshake, no secret, no
+/// constant, no parsing of constants.
+#[derive(Clone, Debug)]
+pub struct OwnerSessionFacts {
+    pub(crate) session_binding: String,
+    pub(crate) kernel_principal: String,
+    pub(crate) connection_id: String,
+    pub(crate) launch_nonce: String,
+    pub(crate) artifact_digest: String,
+    pub(crate) protected_snapshot_digest: String,
 }
 
 #[cfg(windows)]
@@ -178,6 +205,7 @@ impl DaemonKernelClient {
             snapshot: expected_snapshot(&config.launch)?,
             kernel_binding: config.kernel_binding.clone(),
             request_counter: Arc::new(AtomicU64::new(1)),
+            validated_session_binding: Mutex::new(None),
         };
         #[cfg(windows)]
         {
@@ -199,6 +227,37 @@ impl DaemonKernelClient {
                 KernelClientError::Unsupported.to_string(),
             ))
         }
+    }
+
+    /// Returns the already-validated Kernel-issued owner session facts for
+    /// the single live owner session (AUD-C02-B, Implements #1187).
+    ///
+    /// Read-only over held fields: the retained `sid=..;session=..` binding
+    /// string (set only on successful `validate_server_hello`, never a
+    /// constant), the snapshot principal and artifact digests, the connection
+    /// id, and the descriptor launch nonce. No re-handshake, no secret.
+    /// `None` until a handshake in this process has validated a `ServerHello`,
+    /// so daemon composition without a live session keeps the empty
+    /// (unadmitted) controlboard behaviour.
+    #[must_use]
+    pub fn owner_session_facts(&self) -> Option<OwnerSessionFacts> {
+        Some(OwnerSessionFacts {
+            session_binding: self.validated_session_binding()?,
+            kernel_principal: self.snapshot.principal.clone(),
+            connection_id: self.connection_id.clone(),
+            launch_nonce: self.kernel_binding.launch_nonce.clone(),
+            artifact_digest: self.snapshot.artifact_digest.clone(),
+            protected_snapshot_digest: self.snapshot.protected_snapshot_digest.clone(),
+        })
+    }
+
+    /// Clones the retained validated binding string, if any. A poisoned slot
+    /// reads as absent (fail-closed to "no live session"), never invented.
+    fn validated_session_binding(&self) -> Option<String> {
+        self.validated_session_binding
+            .lock()
+            .ok()
+            .and_then(|guard| guard.clone())
     }
 
     pub fn report_ready(&self) -> Result<(), super::DaemonError> {
@@ -475,6 +534,13 @@ impl DaemonKernelClient {
         let server = eliot_ipc::decode_server_hello_frame(&response, &self.connection_id)
             .map_err(|error| KernelClientError::Contract(error.to_string()))?;
         validate_server_hello(&self.launch, &self.kernel_binding, &server)?;
+        // Retain the literal Kernel-issued binding string only now that it
+        // validated: the owner session facts reader forwards these exact
+        // bytes, never a locally minted session. A lock failure keeps the
+        // previous value, so admission stays fail-closed, never invented.
+        if let Ok(mut slot) = self.validated_session_binding.lock() {
+            *slot = Some(server.session_principal_binding.clone());
+        }
         Ok((transport, limits))
     }
 
@@ -563,6 +629,7 @@ impl DaemonKernelClient {
             connection_id: self.connection_id.clone(),
             snapshot: self.snapshot.clone(),
             request_counter: Arc::clone(&self.request_counter),
+            validated_session_binding: Mutex::new(self.validated_session_binding()),
         })
     }
 }
