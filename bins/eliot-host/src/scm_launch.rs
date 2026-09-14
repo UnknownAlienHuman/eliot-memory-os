@@ -614,9 +614,17 @@ mod tests {
         assert_ne!(absent_detail, mismatched_detail);
         assert_ne!(absent_detail, unknown_detail);
 
-        // Transient-pending predicate: TRUE only for the (0, "query-status",
-        // START_PENDING) race triple, regardless of PID; FALSE for a real
-        // Win32 code, a non-status stage, or a non-pending state.
+        assert_transient_pending_predicate_cases();
+    }
+
+    /// Case table for [`host_scm_unknown_is_transient_pending`]: TRUE only
+    /// for the (0, "query-status", `START_PENDING`) race triple, regardless of
+    /// PID; FALSE for a real Win32 code, a non-status stage, or a
+    /// non-pending state. Split from
+    /// `runtime_starting_is_admissible_while_mismatch_and_unknown_stay_typed`
+    /// so each test function stays within the pedantic line budget without
+    /// weakening any assertion.
+    fn assert_transient_pending_predicate_cases() {
         for (win32_error, stage, state, pid) in [
             (0_u32, "query-status", 2_u32, 0_u32),
             (0_u32, "query-status", 2_u32, 4242_u32),
