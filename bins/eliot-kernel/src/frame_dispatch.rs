@@ -10,14 +10,15 @@
 //! Forbidden authority: must not fabricate execution success, must not accept peer-owned shutdown authority, must not bypass `ServerHandshakePolicy`, generation poison, or state-fence compatibility.
 //! Ordinary module: I2.23 Capability-family topology and crate extraction decisions — ordinary single-file extraction (<10k LOC) owning only `KernelComposition::dispatch_frame` plus inseparable dispatch-only helpers with zero external users.
 
-use super::front_door_session::DOCTOR_MODULE_ID;
+use super::front_door_session::{DOCTOR_MODULE_ID, TESTD_MODULE_ID};
 use super::native_worker_lifecycle_route::is_native_worker_operation;
 use super::{
     ACTIVE_DAEMON_CALLER, DOCTOR_REPAIR_WIRE_ID, DoctorAdmissionContext,
     DoctorRepairAttemptRequest, Frame, FrameKind, KernelComposition, KernelFrameAction,
     KernelServiceState, MessageType, ProcessExecutionRequest, ProtocolPayload, Session,
-    TransportError, caller_binding, probe_ready_state_admitted, route_doctor_repair, status_frame,
-    unix_ms,
+    TESTD_ADMISSION_WIRE_ID, TestdAdmissionAttemptRequest, TestdAdmissionContext, TransportError,
+    caller_binding, probe_ready_state_admitted, route_doctor_repair, route_testd_admission,
+    status_frame, unix_ms,
 };
 
 impl KernelComposition {
@@ -285,6 +286,50 @@ impl KernelComposition {
                 }
                 return self.dispatch_doctor_frame(session, frame);
             }
+            if is_testd_operation(native_operation) {
+                // P-07 testd admission intake rides the same admitted
+                // transport through this closed gateway. New-execution intake
+                // (`Request`/`Execute`) requires `Ready`; control frames
+                // (`Cancel`/`Cancel`) additionally route while `Degraded`, so
+                // a blanket `Ready` gate never destroys cancel/reconcile
+                // recovery capability (host-request `Ready|Degraded` pattern
+                // above). Peer, correlation, and fence joins mirror the
+                // host-request gate; wire/shape/digest joins live in
+                // `dispatch_testd_frame`. Stale or unauthenticated sessions
+                // fence here and are never granted protected input.
+                let control =
+                    frame.kind == FrameKind::Cancel && frame.message_type == MessageType::Cancel;
+                if control {
+                    if !matches!(
+                        self.service_state()
+                            .map_err(|_| TransportError::SessionFenced)?,
+                        KernelServiceState::Ready | KernelServiceState::Degraded
+                    ) {
+                        return Err(TransportError::SessionFenced);
+                    }
+                } else {
+                    if frame.kind != FrameKind::Request
+                        || frame.message_type != MessageType::Execute
+                    {
+                        return Err(TransportError::SessionFenced);
+                    }
+                    if self
+                        .service_state()
+                        .map_err(|_| TransportError::SessionFenced)?
+                        != KernelServiceState::Ready
+                    {
+                        return Err(TransportError::SessionFenced);
+                    }
+                }
+                session
+                    .peer
+                    .validate()
+                    .map_err(|_| TransportError::PeerIdentityUnavailable)?;
+                if frame.request_id.is_none() || frame.request_identity.is_none() {
+                    return Err(TransportError::SessionFenced);
+                }
+                return self.dispatch_testd_frame(session, frame);
+            }
             if self
                 .service_state()
                 .map_err(|_| TransportError::SessionFenced)?
@@ -373,6 +418,17 @@ impl KernelComposition {
 /// `route_doctor_repair` wire check in `dispatch_doctor_frame` as authority.
 pub(crate) fn is_doctor_operation(operation: &str) -> bool {
     operation == DOCTOR_REPAIR_WIRE_ID
+}
+
+/// Returns whether the operation string selects the P-07 testd admission route.
+///
+/// The operation string is the stable wire identity itself
+/// (`TESTD_ADMISSION_WIRE_ID`); there is no second dispatch vocabulary and no
+/// generic JSON command routing. Callers must still prove the exact
+/// (`wire_id`, `wire_version`) pair through `route_testd_admission` on the
+/// decoded typed request: the operation string only selects this closed entry.
+pub(crate) fn is_testd_operation(operation: &str) -> bool {
+    operation == TESTD_ADMISSION_WIRE_ID
 }
 
 impl KernelComposition {
@@ -569,6 +625,200 @@ fn doctor_request_from_payload(
         .validate_canonical_digest()
         .map_err(|_| TransportError::SessionFenced)?;
     if !route_doctor_repair(&request.wire_id, request.wire_version) {
+        return Err(TransportError::SessionFenced);
+    }
+    Ok(request)
+}
+
+impl KernelComposition {
+    /// Dispatches one testd admission frame from an admitted session.
+    ///
+    /// The caller ([`KernelComposition::dispatch_frame`]) has already run the
+    /// closed-gateway gates (generation poison, session/frame identity,
+    /// daemon-session currency) and the per-kind service gate (new-execution
+    /// intake requires `Ready`, control additionally routes while `Degraded`);
+    /// those joins are re-checked here so direct callers cannot bypass them.
+    /// The frame must ride the presenting session's connection, the operation
+    /// string must be the exact testd wire identity, and the payload must
+    /// carry the typed [`TestdAdmissionAttemptRequest`] under `request` with a
+    /// valid shape, canonical digest, and exact wire version. The validated
+    /// request is forwarded as [`KernelFrameAction::Testd`]; job-bound
+    /// admission itself runs in [`KernelComposition::execute_testd_request`].
+    /// Unknown operations and mismatched joins fence; nothing is retried
+    /// blindly and no admission is fabricated here.
+    pub(crate) fn dispatch_testd_frame(
+        &self,
+        session: &Session,
+        frame: &Frame,
+    ) -> Result<KernelFrameAction, TransportError> {
+        let control = frame.kind == FrameKind::Cancel && frame.message_type == MessageType::Cancel;
+        if control {
+            if !matches!(
+                self.service_state()
+                    .map_err(|_| TransportError::SessionFenced)?,
+                KernelServiceState::Ready | KernelServiceState::Degraded
+            ) {
+                return Err(TransportError::SessionFenced);
+            }
+        } else {
+            if frame.kind != FrameKind::Request || frame.message_type != MessageType::Execute {
+                return Err(TransportError::SessionFenced);
+            }
+            if self
+                .service_state()
+                .map_err(|_| TransportError::SessionFenced)?
+                != KernelServiceState::Ready
+            {
+                return Err(TransportError::SessionFenced);
+            }
+        }
+        session
+            .peer
+            .validate()
+            .map_err(|_| TransportError::PeerIdentityUnavailable)?;
+        let request_id = frame
+            .request_id
+            .clone()
+            .ok_or(TransportError::SessionFenced)?;
+        let identity = frame
+            .request_identity
+            .as_ref()
+            .ok_or(TransportError::SessionFenced)?;
+        if !session
+            .module_generation
+            .state_fence
+            .is_compatible_with(&identity.request.state_fence)
+        {
+            return Err(TransportError::SessionFenced);
+        }
+        if frame.connection_id != session.connection_id {
+            return Err(TransportError::SessionFenced);
+        }
+        let payload = match &frame.payload {
+            ProtocolPayload::Json(payload) => payload.clone(),
+            _ => return Err(TransportError::SessionFenced),
+        };
+        let operation = payload
+            .get("operation")
+            .and_then(serde_json::Value::as_str)
+            .ok_or(TransportError::SessionFenced)?;
+        if !is_testd_operation(operation) {
+            return Err(TransportError::SessionFenced);
+        }
+        let request = testd_request_from_payload(&payload)?;
+        if operation != request.wire_id
+            || !route_testd_admission(&request.wire_id, request.wire_version)
+        {
+            return Err(TransportError::SessionFenced);
+        }
+        Ok(KernelFrameAction::Testd {
+            request_id,
+            operation: operation.to_owned(),
+            payload,
+        })
+    }
+
+    /// Executes one validated testd admission operation (T6-X1 P-07).
+    ///
+    /// Revalidates the closed operation name, the presenting session's testd
+    /// binding, and the typed request shape/digest/wire version through the
+    /// existing `testd_front_door.rs` entries, then builds the live admission
+    /// context from Kernel-owned state (service state, `KernelService`
+    /// authority epoch, consumed activation generation) following the
+    /// `host_request_binding` live-authority pattern. Neither the epoch nor
+    /// the generation is ever taken from the request envelope.
+    ///
+    /// INTEGRATOR (T6-X1 B->A) — REWIRE RECORD. Attempted to replace the
+    /// fail-closed tail with `eliot_kernel_service::handle_testd_admission_attempt`
+    /// (Slice B `testd_front_door.rs`): no bootstrap-bound testd principal
+    /// accessor exists in bins scope for `AuthenticatedTestdSession::bind`
+    /// (only the transport `Session` plus the generation-bound
+    /// `front_door_session` module binding), and no production testd job
+    /// ledger accessor exists here (the durable job store is owned by the
+    /// testd binary). Fabricating a principal string or a durable store
+    /// would violate authority, so admission stays fail-closed without
+    /// minting, persisting, or projecting any admission. Control-frame
+    /// `reconcile_testd_admission` likewise stays unavailable here: it needs
+    /// a retained admission plus envelope which this frame path does not
+    /// carry. No new constants, no relaxations, no silent tuple drop.
+    pub async fn execute_testd_request(
+        &self,
+        session: &Session,
+        _request_id: super::RequestId,
+        operation: &str,
+        payload: serde_json::Value,
+    ) -> Result<Frame, TransportError> {
+        if !is_testd_operation(operation) {
+            return Err(TransportError::SessionFenced);
+        }
+        if session.module_generation.module_id.as_str() != TESTD_MODULE_ID {
+            return Err(TransportError::SessionFenced);
+        }
+        session
+            .peer
+            .validate()
+            .map_err(|_| TransportError::PeerIdentityUnavailable)?;
+        if !matches!(
+            self.service_state()
+                .map_err(|_| TransportError::SessionFenced)?,
+            KernelServiceState::Ready | KernelServiceState::Degraded
+        ) {
+            return Err(TransportError::SessionFenced);
+        }
+        let request = testd_request_from_payload(&payload)?;
+        if operation != request.wire_id
+            || !route_testd_admission(&request.wire_id, request.wire_version)
+        {
+            return Err(TransportError::SessionFenced);
+        }
+        let (service_state, authority_epoch, generation) = {
+            let service = self
+                .service
+                .lock()
+                .map_err(|_| TransportError::SessionFenced)?;
+            let generation = service
+                .activation_receipt()
+                .ok_or(TransportError::SessionFenced)?
+                .generation
+                .value();
+            (service.state(), service.authority_epoch(), generation)
+        };
+        let _context = TestdAdmissionContext::new(service_state, authority_epoch, generation)
+            .map_err(|_| TransportError::SessionFenced)?;
+        let now_unix_nanos = unix_ms().saturating_mul(1_000_000);
+        if now_unix_nanos == 0 {
+            return Err(TransportError::SessionFenced);
+        }
+        // Explicit fail-closed (see rewire record above): the validated
+        // context and request are retained but never admitted. No
+        // `let _ = (...)` silent-drop placeholder.
+        Err(TransportError::SessionFenced)
+    }
+}
+
+/// Decodes the exact typed testd admission request from a P-07 frame
+/// payload.
+///
+/// The payload carries the closed operation string plus the full typed request
+/// under `request`; the request shape, its canonical digest, and its exact
+/// wire version are re-validated through the existing `testd_front_door.rs`
+/// entries, so this is typed dispatch, not generic JSON routing.
+fn testd_request_from_payload(
+    payload: &serde_json::Value,
+) -> Result<TestdAdmissionAttemptRequest, TransportError> {
+    let request_value = payload
+        .get("request")
+        .cloned()
+        .ok_or(TransportError::SessionFenced)?;
+    let request: TestdAdmissionAttemptRequest =
+        serde_json::from_value(request_value).map_err(|_| TransportError::SessionFenced)?;
+    request
+        .validate()
+        .map_err(|_| TransportError::SessionFenced)?;
+    request
+        .validate_canonical_digest()
+        .map_err(|_| TransportError::SessionFenced)?;
+    if !route_testd_admission(&request.wire_id, request.wire_version) {
         return Err(TransportError::SessionFenced);
     }
     Ok(request)
