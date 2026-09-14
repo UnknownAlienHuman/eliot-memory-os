@@ -739,11 +739,10 @@ fn tamper_route(
     claim: NativeWorkerClaim,
 ) -> (NativeWorkerRegistration, NativeWorkerClaim) {
     let mut claim = claim;
-    claim
-        .executable_binding
-        .as_mut()
-        .expect("v2 fixture carries the join")
-        .route_ref = "route://changed".to_owned();
+    match claim.executable_binding.as_mut() {
+        Some(join) => "route://changed".clone_into(&mut join.route_ref),
+        None => panic!("v2 fixture carries the join"),
+    }
     let claim = load(claim.with_computed_digest());
     (registration, claim)
 }
@@ -753,11 +752,10 @@ fn tamper_invocation_digest(
     claim: NativeWorkerClaim,
 ) -> (NativeWorkerRegistration, NativeWorkerClaim) {
     let mut claim = claim;
-    claim
-        .executable_binding
-        .as_mut()
-        .expect("v2 fixture carries the join")
-        .process_invocation_digest = "e".repeat(64);
+    match claim.executable_binding.as_mut() {
+        Some(join) => join.process_invocation_digest = "e".repeat(64),
+        None => panic!("v2 fixture carries the join"),
+    }
     let claim = load(claim.with_computed_digest());
     (registration, claim)
 }
@@ -875,6 +873,13 @@ fn admitted_bounded_op_reaches_ready_with_bound_receipt_and_durable_event() {
 
     // The same bounded shape completes 0 with bounded stdout through the real
     // executor directly: launch a fresh instance and observe it to termination.
+    assert_direct_shape_completes_with_zero();
+    remove_bat("a-ready");
+}
+
+/// Runs the same bounded shape directly through the real executor and asserts
+/// it completes 0 with bounded stdout.
+fn assert_direct_shape_completes_with_zero() {
     let direct_bat = write_bat("a-direct", SUCCESS_BAT);
     let (direct_process, direct_authority) = build_process(
         "operation-1-complete",
@@ -893,10 +898,13 @@ fn admitted_bounded_op_reaches_ready_with_bound_receipt_and_durable_event() {
     block_on(direct_executor.start(direct_process, direct_sink))
         .unwrap_or_else(|error| panic!("bounded child must launch, got {error:?}"));
     let terminal = poll_terminal(&direct_executor, &direct_operation);
-    let exit = terminal
-        .exit()
-        .expect("terminal view carries an exit observation");
-    let exit_json = serde_json::to_value(exit).expect("exit observation serializes");
+    let Some(exit) = terminal.exit() else {
+        panic!("terminal view carries an exit observation");
+    };
+    let exit_json = match serde_json::to_value(exit) {
+        Ok(exit_json) => exit_json,
+        Err(error) => panic!("exit observation serializes: {error:?}"),
+    };
     assert_eq!(
         exit_json
             .get("disposition")
@@ -904,15 +912,15 @@ fn admitted_bounded_op_reaches_ready_with_bound_receipt_and_durable_event() {
         Some("completed")
     );
     assert_eq!(
-        exit_json.get("code").and_then(|value| value.as_i64()),
+        exit_json.get("code").and_then(serde_json::Value::as_i64),
         Some(0)
     );
-    let (stdout, _) = direct_executor
-        .captured_output(&direct_operation)
-        .expect("completed operation retains stream projections");
+    let (stdout, _) = match direct_executor.captured_output(&direct_operation) {
+        Ok(output) => output,
+        Err(error) => panic!("completed operation retains stream projections: {error:?}"),
+    };
     assert!(stdout.captured && stdout.complete && !stdout.bytes.is_empty());
     assert!(stdout.total_bytes <= 4_096);
-    remove_bat("a-ready");
     remove_bat("a-direct");
 }
 
@@ -1037,10 +1045,13 @@ fn failing_bounded_op_is_typed_and_never_ready_while_host_survives() {
     block_on(fail_executor.start(fail_process, fail_sink))
         .unwrap_or_else(|error| panic!("failing child must still launch, got {error:?}"));
     let terminal = poll_terminal(&fail_executor, &fail_operation);
-    let exit = terminal
-        .exit()
-        .expect("terminal view carries an exit observation");
-    let exit_json = serde_json::to_value(exit).expect("exit observation serializes");
+    let Some(exit) = terminal.exit() else {
+        panic!("terminal view carries an exit observation");
+    };
+    let exit_json = match serde_json::to_value(exit) {
+        Ok(exit_json) => exit_json,
+        Err(error) => panic!("exit observation serializes: {error:?}"),
+    };
     assert_eq!(
         exit_json
             .get("disposition")
@@ -1048,7 +1059,7 @@ fn failing_bounded_op_is_typed_and_never_ready_while_host_survives() {
         Some("completed")
     );
     assert_eq!(
-        exit_json.get("code").and_then(|value| value.as_i64()),
+        exit_json.get("code").and_then(serde_json::Value::as_i64),
         Some(3)
     );
 
