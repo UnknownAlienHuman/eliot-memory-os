@@ -2,17 +2,17 @@ use std::collections::BTreeSet;
 
 use eliot_agent_api::{
     AdmittedRouteReceipt, AgentLaunchRequest, AgentResult, AgentWorkUnitBrief, ArtifactId,
-    AssistantDeltaObservation, AttemptId, BudgetEnvelope, CONTRACT_VERSION, ClockReading,
-    ContractError, DecisionId, EffectCeiling, EffectKind, EpochId, EventCursor, EventId,
-    ExecutionOutcome, ExecutionUnit, ExecutionUnitObservation, HOST_EVENT_CONTRACT_VERSION,
-    HOST_EVENT_DIGEST_ALGORITHM, HostEventDeliveryDisposition, HostEventNormalizationReceipt,
-    HostEventPrivacyClass, LaunchRequestId, LowercaseSha256, NativeSession, NativeSessionLocator,
-    NormalizationCoverage, NormalizedHostEventEnvelope, NormalizedHostEventPayload,
-    PhysicalRouteObservationReceipt, ProposedEffect, ProviderExecutionBinding,
-    ProviderObservationLineage, QualifiedSourceDigest, QuotaKnowledge, RawSourceRecord, RequestId,
-    ResourceGeneration, RestrictedRawSourceHandle, ResultDisposition, RouteFingerprint,
-    RouteObservationState, RouteSelectionCandidate, StateFence, TaskId, UnsupportedDisposition,
-    UsageReceipt, WorkLeaseId, WorkUnitId, candidate_digest_for,
+    AssistantDeltaObservation, AttemptId, BudgetEnvelope, CONTRACT_VERSION, CancelReason,
+    ClockReading, ContractError, DecisionId, EffectCeiling, EffectKind, EpochId, EventCursor,
+    EventId, ExecutionOutcome, ExecutionUnit, ExecutionUnitObservation,
+    HOST_EVENT_CONTRACT_VERSION, HOST_EVENT_DIGEST_ALGORITHM, HostEventDeliveryDisposition,
+    HostEventNormalizationReceipt, HostEventPrivacyClass, LaunchRequestId, LowercaseSha256,
+    NativeSession, NativeSessionLocator, NormalizationCoverage, NormalizedHostEventEnvelope,
+    NormalizedHostEventPayload, PhysicalRouteObservationReceipt, ProposedEffect,
+    ProviderExecutionBinding, ProviderObservationLineage, QualifiedSourceDigest, QuotaKnowledge,
+    RawSourceRecord, RequestId, ResourceGeneration, RestrictedRawSourceHandle, ResultDisposition,
+    RouteFingerprint, RouteObservationState, RouteSelectionCandidate, StateFence, TaskId,
+    UnsupportedDisposition, UsageReceipt, WorkLeaseId, WorkUnitId, candidate_digest_for,
 };
 use eliot_agent_contracts::{
     DeliveryPolicy, DescendantClosureReceipt, LivePeerMessage, LivePeerMessageState, RevisionId,
@@ -21,18 +21,20 @@ use eliot_contracts::{
     EpochLineageId, IntegrationRevision, PolicyRevision, TaskRevision, sha256_hex,
 };
 use eliot_evaluation_contracts::BudgetEvidence;
+use eliot_kernel_service::ProviderCapabilityExpectation;
 use eliot_security_contracts::PrivacyClass;
 
 use crate::core::{ProviderProofKind, ProviderVerifier};
 use crate::{
-    AdmissionId, AdmittedLaneReceipt, AgentCoordinator, CandidateId, CoordinatorConfig,
-    CoordinatorError, DescendantClosureSubmission, ExecutionContext, ObservationId, OperationId,
+    AdmissionId, AdmittedLaneReceipt, AdmittedProviderCapability, AgentCoordinator, CancelCommand,
+    CancellationReconciliationId, CandidateId, CoordinatorConfig, CoordinatorError,
+    DescendantClosureSubmission, ExecutionContext, ObservationId, OperationId,
     OutcomeReconciliationId, PlanGap, ProviderAdmissionReceipt, ProviderBindingSnapshot,
-    ProviderExecutionBindingSubmission, ProviderIdentity, ProviderReassignmentReceipt,
-    ProviderUnknownOutcomeReconciliation, ProviderWorkerFenceReceipt, ReassignmentId, RecipeId,
-    RecipeManifest, ResultSubmission, RoleProfileId, RoleProfileManifest, RouteCandidateEvidence,
-    StaffingLaneRequest, StaffingPlanCandidate, StaffingPlanRequest, SubmissionId,
-    UnknownOutcomeResolution, WorkerId,
+    ProviderCancellationReconciliation, ProviderExecutionBindingSubmission, ProviderIdentity,
+    ProviderReassignmentReceipt, ProviderUnknownOutcomeReconciliation, ProviderWorkerFenceReceipt,
+    ReassignmentId, RecipeId, RecipeManifest, ResultSubmission, RoleProfileId, RoleProfileManifest,
+    RouteCandidateEvidence, StaffingLaneRequest, StaffingPlanCandidate, StaffingPlanRequest,
+    SubmissionId, UnknownOutcomeResolution, WorkerId,
 };
 
 type TestResult<T = ()> = Result<T, Box<dyn std::error::Error>>;
@@ -137,6 +139,66 @@ fn coordinator(
     proofs: &[&str],
 ) -> Result<AgentCoordinator, CoordinatorError> {
     AgentCoordinator::with_provider(cfg, Box::new(verifier(proofs, 0)))
+}
+
+fn admitted_capability(minimum_sequence: u64) -> TestResult<AdmittedProviderCapability> {
+    admitted_capability_for(
+        provider_identity(),
+        false,
+        "route-rev-7",
+        "capacity-rev-3",
+        "route-rev-7",
+        "capacity-rev-3",
+        1,
+        1,
+        minimum_sequence,
+    )
+}
+
+/// Builds daemon-supplied Kernel admission from exact owner records. Every
+/// digest is recomputed here with the same `sha256_hex` validator the
+/// verifier uses; no canned pass value is hardcoded.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the test fixture mirrors the admitted capability's flat owner tuple one-to-one"
+)]
+fn admitted_capability_for(
+    identity: ProviderIdentity,
+    revoked: bool,
+    route_revision: &str,
+    capacity_revision: &str,
+    current_route_revision: &str,
+    current_capacity_revision: &str,
+    expectation_sequence: u64,
+    live_sequence: u64,
+    minimum_sequence: u64,
+) -> TestResult<AdmittedProviderCapability> {
+    let live_epoch = test_epoch(TEST_LINEAGE_A, live_sequence);
+    Ok(AdmittedProviderCapability::new(
+        identity,
+        "claim-t9-05-1".to_owned(),
+        "attempt-t9-05-1".to_owned(),
+        "op-t9-05-1".to_owned(),
+        sha256_hex(b"claim-binding-material-t9-05-1"),
+        sha256_hex(b"executable-material-t9-05-1"),
+        route_revision.to_owned(),
+        capacity_revision.to_owned(),
+        ProviderCapabilityExpectation {
+            current_route_revision: current_route_revision.to_owned(),
+            current_capacity_revision: current_capacity_revision.to_owned(),
+            live_authority_epoch: test_epoch(TEST_LINEAGE_A, expectation_sequence),
+            revoked,
+        },
+        live_epoch,
+        minimum_sequence,
+    )?)
+}
+
+fn production_coordinator(cfg: CoordinatorConfig) -> TestResult<AgentCoordinator> {
+    Ok(AgentCoordinator::new_with_admitted_provider(
+        cfg,
+        admitted_capability(0)?,
+    )?)
 }
 
 fn budget() -> BudgetEnvelope {
@@ -3076,5 +3138,446 @@ fn observe_rejects_foreign_turn_and_unknown_attempt_before_mutation() -> TestRes
         Err(CoordinatorError::UnknownAttempt)
     );
     assert_eq!(coordinator.events().len(), events_before);
+    Ok(())
+}
+
+#[test]
+fn production_verifier_admits_binds_and_accepts_result() -> TestResult {
+    let mut coordinator = production_coordinator(config(4, 4))?;
+    let admitted = plan_and_admit(
+        &mut coordinator,
+        "prod-abr",
+        &[bind_lane_spec("work-prod-abr", "reader-prod-abr", "a")],
+        None,
+    )?;
+    let context = ExecutionContext::from(&admitted);
+    let lane = admitted.admitted_lanes[0].clone();
+    coordinator.start_attempt(context.clone(), lane.attempt_id.clone())?;
+    let binding = coordinator.bind_provider_execution(
+        context.clone(),
+        binding_submission("prod-abr", &lane, "unit-prod-abr", "scope-prod-abr")?,
+    )?;
+    assert_eq!(
+        coordinator
+            .attempt(&lane.attempt_id)
+            .unwrap_or_else(|| panic!("bound attempt must exist"))
+            .provider_binding,
+        Some(binding.clone())
+    );
+    // The result closes on the exact stored binding, never a second unit.
+    let mut submission = result_submission("prod-abr", &lane, ResultDisposition::Partial)?;
+    submission.result.actual_route = matched_observation(&lane, &binding)?;
+    let receipt = coordinator.submit_result(context, submission)?;
+    assert_eq!(
+        receipt.proof_ceiling,
+        eliot_receipts::ProofCeiling::CandidateArtifact
+    );
+    Ok(())
+}
+
+#[test]
+fn production_verifier_reconciles_cancellation() -> TestResult {
+    let mut coordinator = production_coordinator(config(2, 2))?;
+    let admitted = plan_and_admit(
+        &mut coordinator,
+        "prod-cancel",
+        &[bind_lane_spec(
+            "work-prod-cancel",
+            "reader-prod-cancel",
+            "a",
+        )],
+        None,
+    )?;
+    let context = ExecutionContext::from(&admitted);
+    let lane = admitted.admitted_lanes[0].clone();
+    coordinator.start_attempt(context.clone(), lane.attempt_id.clone())?;
+    let operation_id = OperationId::new("operation-prod-cancel")?;
+    coordinator.request_cancellation(
+        context.clone(),
+        CancelCommand {
+            operation_id: operation_id.clone(),
+            attempt_id: lane.attempt_id.clone(),
+            lease_id: lane.lease_id.clone(),
+            worker_id: lane.worker_id.clone(),
+            reason: CancelReason::UserRequested,
+        },
+    )?;
+    let final_receipt = coordinator.reconcile_cancellation(
+        context,
+        ProviderCancellationReconciliation {
+            reconciliation_id: CancellationReconciliationId::new("cancel-final-prod")?,
+            request_operation_id: operation_id,
+            attempt_id: lane.attempt_id.clone(),
+            lease_id: lane.lease_id.clone(),
+            worker_id: lane.worker_id.clone(),
+            provider_identity: provider_identity(),
+            no_effect_or_cleanup_receipt_ref: "proof-cancel-prod".to_owned(),
+        },
+    )?;
+    assert_eq!(final_receipt.attempt_id, lane.attempt_id);
+    assert_eq!(
+        final_receipt.state,
+        crate::CoordinatedAttemptState::Cancelled
+    );
+    Ok(())
+}
+
+#[test]
+fn production_verifier_fences_and_reassigns() -> TestResult {
+    let mut coordinator = production_coordinator(config(4, 4))?;
+    let admitted = plan_and_admit(
+        &mut coordinator,
+        "prod-fence",
+        &[bind_lane_spec("work-prod-fence", "reader-prod-fence", "a")],
+        None,
+    )?;
+    let context = ExecutionContext::from(&admitted);
+    let lane = admitted.admitted_lanes[0].clone();
+    coordinator.start_attempt(context.clone(), lane.attempt_id.clone())?;
+    coordinator.mark_worker_lost(
+        context.clone(),
+        worker_fence(&lane, "prod-fence", "proof-fence-prod")?,
+    )?;
+    let new_attempt = AttemptId::new("attempt-prod-fence-new")?;
+    coordinator.reassign(
+        context,
+        ProviderReassignmentReceipt {
+            reassignment_id: ReassignmentId::new("reassign-prod-fence")?,
+            provider_identity: provider_identity(),
+            g11_receipt_ref: "proof-reassign-prod".to_owned(),
+            old_attempt_id: lane.attempt_id.clone(),
+            old_lease_id: lane.lease_id.clone(),
+            new_attempt_id: new_attempt.clone(),
+            new_lease_id: serde_json::from_value::<WorkLeaseId>(
+                serde_json::json!({"namespace": "eliot.governor.work-lease", "revision": "v1", "value": "lease-prod-fence-new"}),
+            )?,
+            new_worker_id: WorkerId::new("worker-prod-fence-new")?,
+            route: lane.route.clone(),
+            budget: budget(),
+        },
+    )?;
+    assert!(coordinator.attempt(&new_attempt).is_some());
+    Ok(())
+}
+
+#[test]
+fn production_verifier_reconciles_unknown_outcome() -> TestResult {
+    let mut coordinator = production_coordinator(config(2, 2))?;
+    let admitted = plan_and_admit(
+        &mut coordinator,
+        "prod-unknown",
+        &[bind_lane_spec(
+            "work-prod-unknown",
+            "reader-prod-unknown",
+            "a",
+        )],
+        None,
+    )?;
+    let context = ExecutionContext::from(&admitted);
+    let lane = admitted.admitted_lanes[0].clone();
+    coordinator.start_attempt(context.clone(), lane.attempt_id.clone())?;
+    let submission = result_submission("prod-unknown", &lane, ResultDisposition::UnknownOutcome)?;
+    let submission_id = submission.submission_id.clone();
+    coordinator.submit_result(context.clone(), submission)?;
+    let final_receipt = coordinator.reconcile_unknown_outcome(
+        context,
+        ProviderUnknownOutcomeReconciliation {
+            reconciliation_id: OutcomeReconciliationId::new("unknown-final-prod")?,
+            submission_id,
+            attempt_id: lane.attempt_id.clone(),
+            lease_id: lane.lease_id.clone(),
+            worker_id: lane.worker_id.clone(),
+            provider_identity: provider_identity(),
+            resolution: UnknownOutcomeResolution::NoEffect,
+            effect_reconciliation_ref: "proof-unknown-prod".to_owned(),
+        },
+    )?;
+    assert_eq!(
+        final_receipt.state,
+        crate::CoordinatedAttemptState::CandidateResultSubmitted
+    );
+    Ok(())
+}
+
+#[test]
+fn production_replay_is_idempotent_and_conflict_fails_closed() -> TestResult {
+    let mut coordinator = production_coordinator(config(2, 2))?;
+    let candidate = coordinator.plan(request(
+        "prod-replay",
+        &[bind_lane_spec(
+            "work-prod-replay",
+            "reader-prod-replay",
+            "a",
+        )],
+        None,
+    )?)?;
+    let receipt = provider_receipt(&candidate, "prod-replay")?;
+    let events_before = coordinator.events().len();
+    let first = coordinator.admit(receipt.clone())?;
+    assert_eq!(coordinator.events().len(), events_before + 1);
+    let replayed = coordinator.admit(receipt.clone())?;
+    assert_eq!(replayed, first);
+    assert_eq!(coordinator.events().len(), events_before + 1);
+    let mut conflict = receipt;
+    conflict.durable_job_ref = "durable-job-changed".to_owned();
+    assert_eq!(
+        coordinator.admit(conflict).err(),
+        Some(CoordinatorError::IdentityConflict("admission_id"))
+    );
+    assert_eq!(coordinator.events().len(), events_before + 1);
+    Ok(())
+}
+
+#[test]
+fn production_revoked_capability_fails_closed_without_mutation() -> TestResult {
+    let revoked = admitted_capability_for(
+        provider_identity(),
+        true,
+        "route-rev-7",
+        "capacity-rev-3",
+        "route-rev-7",
+        "capacity-rev-3",
+        1,
+        1,
+        0,
+    )?;
+    let mut coordinator = AgentCoordinator::new_with_admitted_provider(config(2, 2), revoked)?;
+    let candidate = coordinator.plan(request(
+        "prod-revoked",
+        &[bind_lane_spec(
+            "work-prod-revoked",
+            "reader-prod-revoked",
+            "a",
+        )],
+        None,
+    )?)?;
+    let before = coordinator.snapshot_json()?;
+    assert_eq!(
+        coordinator
+            .admit(provider_receipt(&candidate, "prod-revoked")?)
+            .err(),
+        Some(CoordinatorError::StaleProviderBinding)
+    );
+    assert_eq!(coordinator.snapshot_json()?, before);
+    Ok(())
+}
+
+#[test]
+fn production_stale_route_capacity_epoch_fail_closed() -> TestResult {
+    let stale_capacity = admitted_capability_for(
+        provider_identity(),
+        false,
+        "route-rev-7",
+        "capacity-rev-stale",
+        "route-rev-7",
+        "capacity-rev-3",
+        1,
+        1,
+        0,
+    )?;
+    let mut coordinator =
+        AgentCoordinator::new_with_admitted_provider(config(2, 2), stale_capacity)?;
+    let candidate = coordinator.plan(request(
+        "prod-stale-cap",
+        &[bind_lane_spec(
+            "work-prod-stale-cap",
+            "reader-prod-stale-cap",
+            "a",
+        )],
+        None,
+    )?)?;
+    let before = coordinator.snapshot_json()?;
+    assert_eq!(
+        coordinator
+            .admit(provider_receipt(&candidate, "prod-stale-cap")?)
+            .err(),
+        Some(CoordinatorError::StaleCapacity)
+    );
+    assert_eq!(coordinator.snapshot_json()?, before);
+
+    let stale_route = admitted_capability_for(
+        provider_identity(),
+        false,
+        "route-rev-stale",
+        "capacity-rev-3",
+        "route-rev-7",
+        "capacity-rev-3",
+        1,
+        1,
+        0,
+    )?;
+    let mut coordinator = AgentCoordinator::new_with_admitted_provider(config(2, 2), stale_route)?;
+    let candidate = coordinator.plan(request(
+        "prod-stale-route",
+        &[bind_lane_spec(
+            "work-prod-stale-route",
+            "reader-prod-stale-route",
+            "a",
+        )],
+        None,
+    )?)?;
+    assert_eq!(
+        coordinator
+            .admit(provider_receipt(&candidate, "prod-stale-route")?)
+            .err(),
+        Some(CoordinatorError::RouteEvidence)
+    );
+
+    let stale_epoch = admitted_capability_for(
+        provider_identity(),
+        false,
+        "route-rev-7",
+        "capacity-rev-3",
+        "route-rev-7",
+        "capacity-rev-3",
+        1,
+        2,
+        0,
+    )?;
+    let mut coordinator = AgentCoordinator::new_with_admitted_provider(config(2, 2), stale_epoch)?;
+    let candidate = coordinator.plan(request(
+        "prod-stale-epoch",
+        &[bind_lane_spec(
+            "work-prod-stale-epoch",
+            "reader-prod-stale-epoch",
+            "a",
+        )],
+        None,
+    )?)?;
+    assert_eq!(
+        coordinator
+            .admit(provider_receipt(&candidate, "prod-stale-epoch")?)
+            .err(),
+        Some(CoordinatorError::StaleController)
+    );
+    Ok(())
+}
+
+#[test]
+fn production_foreign_identity_fails_closed() -> TestResult {
+    let mut coordinator = production_coordinator(config(2, 2))?;
+    let candidate = coordinator.plan(request(
+        "prod-foreign",
+        &[bind_lane_spec(
+            "work-prod-foreign",
+            "reader-prod-foreign",
+            "a",
+        )],
+        None,
+    )?)?;
+    let mut receipt = provider_receipt(&candidate, "prod-foreign")?;
+    receipt.provider_identity.verifier_identity = "foreign-verifier".to_owned();
+    let before = coordinator.snapshot_json()?;
+    assert_eq!(
+        coordinator.admit(receipt).err(),
+        Some(CoordinatorError::StaleProviderBinding)
+    );
+    assert_eq!(coordinator.snapshot_json()?, before);
+    Ok(())
+}
+
+#[test]
+fn plan_only_constructor_still_refuses_effects() -> TestResult {
+    let cfg = config(2, 2);
+    let gap = PlanGap::G11Unavailable {
+        reason: "G-11 absent".to_owned(),
+    };
+    let mut gap_coordinator = AgentCoordinator::new(cfg.clone(), gap)?;
+    let candidate = gap_coordinator.plan(request(
+        "prod-split",
+        &[bind_lane_spec("work-prod-split", "reader-prod-split", "a")],
+        None,
+    )?)?;
+    let receipt = provider_receipt(&candidate, "prod-split")?;
+    assert!(matches!(
+        gap_coordinator.admit(receipt.clone()),
+        Err(CoordinatorError::PlanGap(_))
+    ));
+    let mut production = production_coordinator(cfg)?;
+    production.plan(request(
+        "prod-split",
+        &[bind_lane_spec("work-prod-split", "reader-prod-split", "a")],
+        None,
+    )?)?;
+    production.admit(receipt)?;
+    Ok(())
+}
+
+#[test]
+fn production_restore_reverifies_against_fresh_kernel_evidence() -> TestResult {
+    let cfg = config(4, 4);
+    let mut coordinator = production_coordinator(cfg.clone())?;
+    let admitted = plan_and_admit(
+        &mut coordinator,
+        "prod-restore",
+        &[bind_lane_spec(
+            "work-prod-restore",
+            "reader-prod-restore",
+            "a",
+        )],
+        None,
+    )?;
+    coordinator.start_attempt(
+        ExecutionContext::from(&admitted),
+        admitted.admitted_lanes[0].attempt_id.clone(),
+    )?;
+    let snapshot = coordinator.snapshot()?;
+    let restored = AgentCoordinator::restore_with_admitted_provider(
+        snapshot.clone(),
+        cfg.clone(),
+        admitted_capability(snapshot.event_sequence)?,
+    )?;
+    assert_eq!(restored.events(), coordinator.events());
+    assert_eq!(
+        AgentCoordinator::restore_with_admitted_provider(
+            snapshot.clone(),
+            cfg.clone(),
+            admitted_capability_for(
+                provider_identity(),
+                true,
+                "route-rev-7",
+                "capacity-rev-3",
+                "route-rev-7",
+                "capacity-rev-3",
+                1,
+                1,
+                0,
+            )?,
+        )
+        .err(),
+        Some(CoordinatorError::StaleProviderBinding)
+    );
+    assert_eq!(
+        AgentCoordinator::restore_with_admitted_provider(
+            snapshot.clone(),
+            cfg.clone(),
+            admitted_capability(snapshot.event_sequence + 1)?,
+        )
+        .err(),
+        Some(CoordinatorError::SnapshotRollback)
+    );
+    // A serialized `Verified` label alone never restores authority: a
+    // foreign identity fails even though the snapshot claims verification.
+    let mut foreign_identity = provider_identity();
+    foreign_identity.verifier_identity = "foreign-verifier".to_owned();
+    assert_eq!(
+        AgentCoordinator::restore_with_admitted_provider(
+            snapshot,
+            cfg,
+            admitted_capability_for(
+                foreign_identity,
+                false,
+                "route-rev-7",
+                "capacity-rev-3",
+                "route-rev-7",
+                "capacity-rev-3",
+                1,
+                1,
+                0,
+            )?,
+        )
+        .err(),
+        Some(CoordinatorError::StaleProviderBinding)
+    );
     Ok(())
 }

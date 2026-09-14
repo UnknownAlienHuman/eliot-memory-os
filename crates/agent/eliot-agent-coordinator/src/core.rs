@@ -31,6 +31,7 @@ use crate::model::{
     StaffingLaneCandidate, StaffingPlanCandidate, StaffingPlanRequest, SubmissionId,
     UnknownOutcomeFinalReceipt, WorkerId, validate_text,
 };
+use crate::provider_admission::{AdmittedProviderCapability, KernelProviderVerifier};
 
 #[derive(Clone, Copy, Debug)]
 pub(crate) enum ProviderProofKind {
@@ -43,17 +44,18 @@ pub(crate) enum ProviderProofKind {
     /// Authenticates the exact start correlation of one provider execution
     /// unit before it is bound to an admitted attempt (issue #361 S2). This
     /// is a sealed extension of the same verifier path: no public trait, no
-    /// caller-implementable or always-verified verifier. The public
-    /// constructor still installs only the typed `PLAN_GAP` verifier, so live
-    /// production binding stays unavailable until an accepted A-01/G-11
-    /// adapter exists.
+    /// caller-implementable or always-verified verifier. The plan-only
+    /// constructor still installs only the typed `PLAN_GAP` verifier; closed
+    /// production binding arrives only through `new_with_admitted_provider`
+    /// on daemon-supplied Kernel capability data.
     Binding,
 }
 
 /// Sealed inside this crate so callers cannot implement an "always verified"
-/// provider. A future accepted A-01/G-11 adapter must be added here and bind
-/// its own authenticated receipts. Until then the public constructor installs
-/// only a typed `PLAN_GAP` verifier.
+/// provider. The closed production adapter (`provider_admission`) is added
+/// here and binds daemon-supplied Kernel capability data to its own
+/// authenticated receipts. The plan-only constructor still installs only a
+/// typed `PLAN_GAP` verifier.
 pub(crate) trait ProviderVerifier: Send + Sync {
     fn binding(&self) -> ProviderBindingSnapshot;
     fn minimum_event_sequence(&self) -> u64;
@@ -150,6 +152,22 @@ impl AgentCoordinator {
     pub fn new(config: CoordinatorConfig, gap: PlanGap) -> Result<Self, CoordinatorError> {
         gap.validate()?;
         Self::with_provider(config, Box::new(GapProvider { gap }))
+    }
+
+    /// Creates a closed production coordinator on daemon-supplied Kernel
+    /// admission (T9-05, issue #1108).
+    ///
+    /// The `capability` is plain validated data extracted by the daemon
+    /// caller from its authenticated Kernel session (durable ORS claim row
+    /// plus observed Governor currentness): the coordinator performs no I/O
+    /// and launches nothing. Every proof re-runs the T9-04 pure Kernel
+    /// verifier, so stale, revoked, foreign, or conflicting evidence fails
+    /// closed exactly like the plan-only gap, but with live Kernel backing.
+    pub fn new_with_admitted_provider(
+        config: CoordinatorConfig,
+        capability: AdmittedProviderCapability,
+    ) -> Result<Self, CoordinatorError> {
+        Self::with_provider(config, Box::new(KernelProviderVerifier::new(capability)))
     }
 
     pub(crate) fn with_provider(
@@ -634,10 +652,10 @@ impl AgentCoordinator {
     ///   agreement (`validate_context`);
     /// - the sealed provider verifier authenticates the exact start
     ///   correlation (`ProviderProofKind::Binding` over the canonical
-    ///   submission); there is no `verified = true` shortcut and the public
-    ///   constructor still installs only the typed `PLAN_GAP` verifier, so
-    ///   production binding stays unavailable until an accepted A-01/G-11
-    ///   adapter exists;
+    ///   submission); there is no `verified = true` shortcut and the
+    ///   plan-only constructor still installs only the typed `PLAN_GAP`
+    ///   verifier, so closed production binding arrives only through
+    ///   `new_with_admitted_provider` on daemon-supplied Kernel data;
     /// - exact canonical-input replay returns the stored binding without a
     ///   new event; the same attempt identity with different canonical bytes
     ///   (a second unit rebound to the same attempt) is an
@@ -1650,8 +1668,7 @@ impl AgentCoordinator {
             .map_err(|error| CoordinatorError::Serialization(error.to_string()))
     }
 
-    /// Public restore remains plan-only because no accepted A-01/G-11 provider
-    /// exists in this cell yet.
+    /// Plan-only public restore reinstalls the `PLAN_GAP` verifier.
     pub fn restore(
         snapshot: CoordinatorSnapshot,
         live_config: CoordinatorConfig,
@@ -1659,6 +1676,26 @@ impl AgentCoordinator {
     ) -> Result<Self, CoordinatorError> {
         gap.validate()?;
         Self::restore_with_provider(snapshot, live_config, Box::new(GapProvider { gap }))
+    }
+
+    /// Closed production restore on freshly supplied Kernel admission (T9-05,
+    /// issue #1108).
+    ///
+    /// The daemon re-queries Kernel and passes a fresh `capability`: the
+    /// snapshot's stored binding must equal the live binding derived from it,
+    /// and every replayed event re-verifies through the T9-04 pure verifier,
+    /// so a serialized `Verified` label alone never restores authority and
+    /// revoked or stale Kernel evidence fails closed.
+    pub fn restore_with_admitted_provider(
+        snapshot: CoordinatorSnapshot,
+        live_config: CoordinatorConfig,
+        capability: AdmittedProviderCapability,
+    ) -> Result<Self, CoordinatorError> {
+        Self::restore_with_provider(
+            snapshot,
+            live_config,
+            Box::new(KernelProviderVerifier::new(capability)),
+        )
     }
 
     pub fn restore_json(
