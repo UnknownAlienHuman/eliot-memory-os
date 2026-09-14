@@ -49,14 +49,18 @@
 //!
 //! Kernel validates identity, epoch, fence, and ordering only; it never
 //! interprets task semantics, provider policy, payload meaning, or finish.
-//! Event payloads cross this boundary as opaque digests plus bounded type
-//! labels, never as content. Depending on `eliot-governor` or
+//! Event payloads cross this boundary as bounded opaque bytes plus a digest
+//! and a bounded type label: Kernel compares digests and labels for equality
+//! only and never interprets content. Depending on `eliot-governor` or
 //! `eliot-native-worker-core` from this C1 crate would invert the I2.3
 //! dependency direction (C4 → C3 → C2 → C1 → C0), so the owner digest and the
 //! draft/envelope/receipt shapes are carried by value and compared against
 //! caller-supplied current owner records passed as plain parameters.
 
-use eliot_contracts::{EpochId, StateFence};
+use std::collections::BTreeMap;
+
+use eliot_contracts::{EpochId, StateFence, sha256_hex};
+use eliot_receipts::ReceiptDisposition;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
@@ -76,6 +80,19 @@ pub const NATIVE_WORKER_REPLAY_WIRE_VERSION: u16 = 1;
 /// catches up on old history in bounded pages, and retention holds only
 /// until `APPLIED`/`REJECTED` plus this bounded window.
 pub const NATIVE_WORKER_REPLAY_MAX_PAGE: u16 = 256;
+/// Maximum event payload bytes carried inline on one draft/envelope.
+///
+/// Mirrors the ORS `MAX_INLINE_RECOVERY_BYTES` bound so the wire can never
+/// present an event the durable owner must refuse for size.
+pub const NATIVE_WORKER_REPLAY_MAX_EVENT_BYTES: u64 = 4 * 1024 * 1024;
+/// Maximum causal-predecessor references carried on one draft/envelope.
+///
+/// Mirrors the ORS per-event reference bound.
+pub const NATIVE_WORKER_REPLAY_MAX_EVENT_REFS: usize = 64;
+/// Maximum trace-context entries carried on one draft/envelope.
+///
+/// Mirrors the ORS per-event trace bound.
+pub const NATIVE_WORKER_REPLAY_MAX_TRACE_ENTRIES: usize = 64;
 
 /// Returns the canonical replay stream identity for one claim generation.
 ///
@@ -160,6 +177,22 @@ impl NativeWorkerReplayAckPhase {
     pub const fn retention_releasable(self) -> bool {
         matches!(self, Self::Applied | Self::Rejected)
     }
+}
+
+/// Mechanical delivery class carried opaquely on drafts and envelopes.
+///
+/// Mirrors the ORS `WorkerReplayDeliveryClass` value-for-value; Kernel never
+/// interprets payload meaning from it. The route maps this onto the owner
+/// type when delegating to ORS.
+#[derive(Clone, Copy, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum NativeWorkerReplayDeliveryClass {
+    /// Durable control event; ordered and retained like any event.
+    DurableControl,
+    /// Durable observation event; ordered and retained like any event.
+    DurableObservation,
+    /// Best-effort telemetry; still durably ordered once appended.
+    BestEffortTelemetry,
 }
 
 /// Presented stream binding carried by value on every replay request.
@@ -424,11 +457,11 @@ pub fn admit_replay_request(
 
 /// Kernel-side projection of one durable event draft (append input).
 ///
-/// Carries the stream binding cross-checks plus opaque payload references:
-/// `payload_type` is a bounded type label and `payload_digest` is the
-/// lowercase SHA-256 of the exact event payload bytes. Kernel compares
-/// digests and labels for equality only; it never interprets payload
-/// meaning.
+/// Carries the stream binding cross-checks plus the exact opaque event
+/// content the durable owner persists: bounded payload bytes with their
+/// SHA-256, causal references, trace context, delivery class, ack flag, and
+/// the owner receipt disposition. Kernel compares digests and labels for
+/// equality only; it never interprets payload meaning.
 #[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct NativeWorkerReplayEventDraft {
@@ -442,8 +475,24 @@ pub struct NativeWorkerReplayEventDraft {
     pub request_id: String,
     /// Bounded payload type label, carried opaquely.
     pub payload_type: String,
-    /// Lowercase SHA-256 of the exact event payload bytes, carried opaquely.
+    /// Lowercase SHA-256 of the exact event payload bytes; must equal the
+    /// digest of [`NativeWorkerReplayEventDraft::payload`].
     pub payload_digest: String,
+    /// Exact event payload bytes, bounded by
+    /// [`NATIVE_WORKER_REPLAY_MAX_EVENT_BYTES`], carried opaquely.
+    pub payload: String,
+    /// Opaque causal-predecessor references, at most
+    /// [`NATIVE_WORKER_REPLAY_MAX_EVENT_REFS`].
+    pub causal_predecessor_refs: Vec<String>,
+    /// Opaque trace context, at most
+    /// [`NATIVE_WORKER_REPLAY_MAX_TRACE_ENTRIES`] entries.
+    pub trace_context: BTreeMap<String, String>,
+    /// Mechanical delivery class, carried opaquely.
+    pub delivery_class: NativeWorkerReplayDeliveryClass,
+    /// Whether the consumer must acknowledge this event.
+    pub ack_required: bool,
+    /// Owner receipt disposition, preserved opaquely.
+    pub disposition: ReceiptDisposition,
 }
 
 impl NativeWorkerReplayEventDraft {
@@ -451,7 +500,9 @@ impl NativeWorkerReplayEventDraft {
     ///
     /// # Errors
     ///
-    /// Returns [`KernelServiceError::InvalidField`] for a malformed shape.
+    /// Returns [`KernelServiceError::InvalidField`] for a malformed shape, an
+    /// over-bound payload, reference, or trace set, or a digest that does
+    /// not match the carried bytes.
     pub fn validate(&self) -> Result<(), KernelServiceError> {
         for (text, field) in [
             (&self.stream_id, "native_worker_replay_draft.stream_id"),
@@ -474,14 +525,56 @@ impl NativeWorkerReplayEventDraft {
                 reason: "generation must be non-zero",
             });
         }
+        let payload_len =
+            u64::try_from(self.payload.len()).map_err(|_| KernelServiceError::InvalidField {
+                field: "native_worker_replay_draft.payload",
+                reason: "payload length does not fit",
+            })?;
+        if payload_len > NATIVE_WORKER_REPLAY_MAX_EVENT_BYTES {
+            return Err(KernelServiceError::InvalidField {
+                field: "native_worker_replay_draft.payload",
+                reason: "payload exceeds the inline event bound",
+            });
+        }
+        if sha256_hex(self.payload.as_bytes()) != self.payload_digest {
+            return Err(KernelServiceError::InvalidField {
+                field: "native_worker_replay_draft.payload_digest",
+                reason: "digest does not match the carried payload bytes",
+            });
+        }
+        if self.causal_predecessor_refs.len() > NATIVE_WORKER_REPLAY_MAX_EVENT_REFS {
+            return Err(KernelServiceError::InvalidField {
+                field: "native_worker_replay_draft.causal_predecessor_refs",
+                reason: "causal predecessor references exceed the retained bound",
+            });
+        }
+        for reference in &self.causal_predecessor_refs {
+            validate_wire_text(
+                reference,
+                "native_worker_replay_draft.causal_predecessor_ref",
+            )?;
+        }
+        if self.trace_context.len() > NATIVE_WORKER_REPLAY_MAX_TRACE_ENTRIES {
+            return Err(KernelServiceError::InvalidField {
+                field: "native_worker_replay_draft.trace_context",
+                reason: "trace context exceeds the retained bound",
+            });
+        }
+        for (key, value) in &self.trace_context {
+            validate_wire_text(key, "native_worker_replay_draft.trace_key")?;
+            validate_wire_text(value, "native_worker_replay_draft.trace_value")?;
+        }
         Ok(())
     }
 }
 
 /// Kernel-side projection of one durable event envelope.
 ///
-/// The owner assigns `event_id` and `sequence`; the payload crosses as an
-/// opaque digest plus a bounded type label, never as interpreted content.
+/// The owner assigns `event_id` and `sequence`; the exact opaque event
+/// content (bytes, causal references, trace, delivery class, ack flag,
+/// disposition) is preserved so a history read returns the retained suffix
+/// with identities, order, and causal references intact. Kernel never
+/// interprets payload meaning.
 #[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct NativeWorkerReplayEnvelope {
@@ -497,10 +590,27 @@ pub struct NativeWorkerReplayEnvelope {
     pub sequence: u64,
     /// Durable request identity the event belongs to.
     pub request_id: String,
+    /// Request fingerprint bound at acquisition, copied for locality.
+    pub fingerprint: String,
     /// Bounded payload type label, carried opaquely.
     pub payload_type: String,
-    /// Lowercase SHA-256 of the exact event payload bytes, carried opaquely.
+    /// Lowercase SHA-256 of the exact event payload bytes; must equal the
+    /// digest of [`NativeWorkerReplayEnvelope::payload`].
     pub payload_digest: String,
+    /// Exact event payload bytes, carried opaquely.
+    pub payload: String,
+    /// Opaque causal-predecessor references, at most
+    /// [`NATIVE_WORKER_REPLAY_MAX_EVENT_REFS`].
+    pub causal_predecessor_refs: Vec<String>,
+    /// Opaque trace context, at most
+    /// [`NATIVE_WORKER_REPLAY_MAX_TRACE_ENTRIES`] entries.
+    pub trace_context: BTreeMap<String, String>,
+    /// Mechanical delivery class, carried opaquely.
+    pub delivery_class: NativeWorkerReplayDeliveryClass,
+    /// Whether the consumer must acknowledge this event.
+    pub ack_required: bool,
+    /// Owner receipt disposition, preserved opaquely.
+    pub disposition: ReceiptDisposition,
 }
 
 impl NativeWorkerReplayEnvelope {
@@ -508,7 +618,9 @@ impl NativeWorkerReplayEnvelope {
     ///
     /// # Errors
     ///
-    /// Returns [`KernelServiceError::InvalidField`] for a malformed shape.
+    /// Returns [`KernelServiceError::InvalidField`] for a malformed shape, an
+    /// over-bound payload, reference, or trace set, or a digest that does
+    /// not match the carried bytes.
     pub fn validate(&self) -> Result<(), KernelServiceError> {
         for (text, field) in [
             (&self.stream_id, "native_worker_replay_envelope.stream_id"),
@@ -518,6 +630,10 @@ impl NativeWorkerReplayEnvelope {
             ),
             (&self.event_id, "native_worker_replay_envelope.event_id"),
             (&self.request_id, "native_worker_replay_envelope.request_id"),
+            (
+                &self.fingerprint,
+                "native_worker_replay_envelope.fingerprint",
+            ),
             (
                 &self.payload_type,
                 "native_worker_replay_envelope.payload_type",
@@ -534,6 +650,45 @@ impl NativeWorkerReplayEnvelope {
                 field: "native_worker_replay_envelope.bounded_fields",
                 reason: "producer generation and sequence must be non-zero",
             });
+        }
+        let payload_len =
+            u64::try_from(self.payload.len()).map_err(|_| KernelServiceError::InvalidField {
+                field: "native_worker_replay_envelope.payload",
+                reason: "payload length does not fit",
+            })?;
+        if payload_len > NATIVE_WORKER_REPLAY_MAX_EVENT_BYTES {
+            return Err(KernelServiceError::InvalidField {
+                field: "native_worker_replay_envelope.payload",
+                reason: "payload exceeds the inline event bound",
+            });
+        }
+        if sha256_hex(self.payload.as_bytes()) != self.payload_digest {
+            return Err(KernelServiceError::InvalidField {
+                field: "native_worker_replay_envelope.payload_digest",
+                reason: "digest does not match the carried payload bytes",
+            });
+        }
+        if self.causal_predecessor_refs.len() > NATIVE_WORKER_REPLAY_MAX_EVENT_REFS {
+            return Err(KernelServiceError::InvalidField {
+                field: "native_worker_replay_envelope.causal_predecessor_refs",
+                reason: "causal predecessor references exceed the retained bound",
+            });
+        }
+        for reference in &self.causal_predecessor_refs {
+            validate_wire_text(
+                reference,
+                "native_worker_replay_envelope.causal_predecessor_ref",
+            )?;
+        }
+        if self.trace_context.len() > NATIVE_WORKER_REPLAY_MAX_TRACE_ENTRIES {
+            return Err(KernelServiceError::InvalidField {
+                field: "native_worker_replay_envelope.trace_context",
+                reason: "trace context exceeds the retained bound",
+            });
+        }
+        for (key, value) in &self.trace_context {
+            validate_wire_text(key, "native_worker_replay_envelope.trace_key")?;
+            validate_wire_text(value, "native_worker_replay_envelope.trace_value")?;
         }
         Ok(())
     }
@@ -1380,17 +1535,27 @@ mod replay_wire_tests {
     }
 
     fn test_draft(stream_id: &str) -> NativeWorkerReplayEventDraft {
+        let payload = "{\"beat\":1}".to_owned();
         NativeWorkerReplayEventDraft {
             stream_id: stream_id.to_owned(),
             producer_id: "producer-1".to_owned(),
             producer_generation: 1,
             request_id: "req-1".to_owned(),
             payload_type: "heartbeat".to_owned(),
-            payload_digest: "c".repeat(64),
+            payload_digest: sha256_hex(payload.as_bytes()),
+            payload,
+            causal_predecessor_refs: Vec::new(),
+            trace_context: BTreeMap::new(),
+            delivery_class: NativeWorkerReplayDeliveryClass::DurableObservation,
+            ack_required: true,
+            disposition: ReceiptDisposition::Unknown {
+                reason: "test draft".to_owned(),
+            },
         }
     }
 
     fn test_envelope(stream_id: &str, sequence: u64) -> NativeWorkerReplayEnvelope {
+        let payload = "{\"beat\":1}".to_owned();
         NativeWorkerReplayEnvelope {
             stream_id: stream_id.to_owned(),
             producer_id: "producer-1".to_owned(),
@@ -1398,8 +1563,17 @@ mod replay_wire_tests {
             event_id: format!("event-{sequence}"),
             sequence,
             request_id: "req-1".to_owned(),
+            fingerprint: "{\"kind\":\"EXECUTE\"}".to_owned(),
             payload_type: "heartbeat".to_owned(),
-            payload_digest: "c".repeat(64),
+            payload_digest: sha256_hex(payload.as_bytes()),
+            payload,
+            causal_predecessor_refs: Vec::new(),
+            trace_context: BTreeMap::new(),
+            delivery_class: NativeWorkerReplayDeliveryClass::DurableObservation,
+            ack_required: true,
+            disposition: ReceiptDisposition::Unknown {
+                reason: "test envelope".to_owned(),
+            },
         }
     }
 

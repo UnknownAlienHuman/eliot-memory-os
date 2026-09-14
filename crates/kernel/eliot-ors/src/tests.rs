@@ -2672,12 +2672,16 @@ fn open_bound_replay_stream(
 #[test]
 fn worker_replay_stream_id_constructor_matches_claim_generation_shape() -> TestResult {
     let claim_id = OperationIdentity::new("claim-t9-03-1")?;
-    assert_eq!(replay_stream_id(&claim_id, 1)?.as_str(), "claim-t9-03-1/1");
-    let (parsed_claim, parsed_generation) = parse_replay_stream_id("claim-t9-03-1/1")?;
+    assert_eq!(
+        replay_stream_id(&claim_id, 1)?.as_str(),
+        "claim-t9-03-1/gen-1"
+    );
+    let (parsed_claim, parsed_generation) = parse_replay_stream_id("claim-t9-03-1/gen-1")?;
     assert_eq!(parsed_claim, claim_id);
     assert_eq!(parsed_generation, 1);
     assert!(replay_stream_id(&claim_id, 0).is_err());
-    assert!(parse_replay_stream_id("claim-t9-03-1/gen-1").is_err());
+    assert!(parse_replay_stream_id("claim-t9-03-1/1").is_err());
+    assert!(parse_replay_stream_id("claim-t9-03-1/gen-0").is_err());
     assert!(parse_replay_stream_id("no-separator").is_err());
     Ok(())
 }
@@ -2928,7 +2932,7 @@ fn worker_replay_generation_change_never_relaunches() -> TestResult {
 
     // A new generation under the same claim is stale against the bound claim:
     // acquire, append, and acknowledge all fail closed.
-    let rotated_stream = "claim-generation-1/2".to_owned();
+    let rotated_stream = "claim-generation-1/gen-2".to_owned();
     assert!(matches!(
         store.begin_replay_request(&replay_begin_fixture(
             &rotated_stream,

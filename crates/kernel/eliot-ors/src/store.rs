@@ -465,6 +465,26 @@ pub trait OperationalRecoveryStore: Send + Sync {
     /// maintenance, not execution: it requires no claim binding and never
     /// touches UNKNOWN (still reconciling) events.
     fn prune_replay_stream(&self, stream_id: &str) -> Result<u64, OrsError>;
+    /// Loads one replay stream head without mutating anything.
+    ///
+    /// Read-only projection for the Kernel replay transport: an unknown
+    /// stream returns `Ok(None)`; a stored head is validated before return.
+    /// Used to answer `New` decisions with the exact next sequence and to
+    /// build conflict evidence without acquiring.
+    fn load_replay_stream_head(
+        &self,
+        stream_id: &str,
+    ) -> Result<Option<WorkerReplayStreamRecord>, OrsError>;
+    /// Loads one retained replay acquisition without mutating anything.
+    ///
+    /// Read-only projection for the Kernel replay transport: an unknown
+    /// `(stream, request)` returns `Ok(None)`. Used to report the recorded
+    /// fingerprint in `Conflict` decisions.
+    fn load_replay_request_record(
+        &self,
+        stream_id: &str,
+        request_id: &str,
+    ) -> Result<Option<WorkerReplayRequestRecord>, OrsError>;
 }
 
 /// redb-backed ORS implementation. Every mutating method commits one short transaction.
@@ -1989,6 +2009,65 @@ impl RedbRecoveryStore {
         }
         write.commit().map_err(storage)?;
         Ok(removed)
+    }
+
+    /// Loads one replay stream head without mutating anything.
+    ///
+    /// Read-only projection for the Kernel replay transport: an unknown
+    /// stream returns `Ok(None)`; a stored head is validated before return.
+    pub fn load_replay_stream_head(
+        &self,
+        stream_id: &str,
+    ) -> Result<Option<WorkerReplayStreamRecord>, OrsError> {
+        parse_replay_stream_id(stream_id)?;
+        let read = self.database.begin_read().map_err(storage)?;
+        let table = read.open_table(REPLAY_STREAMS).map_err(storage)?;
+        table
+            .get(stream_id)
+            .map_err(storage)?
+            .map(|value| {
+                let head: WorkerReplayStreamRecord = decode(value.value())?;
+                head.validate()?;
+                if head.stream_id != stream_id {
+                    return Err(OrsError::IntegrityProblem {
+                        record_type: "worker_replay_stream",
+                        reason: "stream head identity does not match its key".to_owned(),
+                    });
+                }
+                Ok(head)
+            })
+            .transpose()
+    }
+
+    /// Loads one retained replay acquisition without mutating anything.
+    ///
+    /// Read-only projection for the Kernel replay transport: an unknown
+    /// `(stream, request)` returns `Ok(None)`.
+    pub fn load_replay_request_record(
+        &self,
+        stream_id: &str,
+        request_id: &str,
+    ) -> Result<Option<WorkerReplayRequestRecord>, OrsError> {
+        parse_replay_stream_id(stream_id)?;
+        crate::model::validate_text(request_id, "worker_replay_request_id")?;
+        let read = self.database.begin_read().map_err(storage)?;
+        let key = WorkerReplayRequestRecord::key_for(stream_id, request_id);
+        let table = read.open_table(REPLAY_REQUESTS).map_err(storage)?;
+        table
+            .get(key.as_str())
+            .map_err(storage)?
+            .map(|value| {
+                let stored: WorkerReplayRequestRecord = decode(value.value())?;
+                stored.validate()?;
+                if stored.stream_id != stream_id || stored.request_id != request_id {
+                    return Err(OrsError::IntegrityProblem {
+                        record_type: "worker_replay_request",
+                        reason: "request record identity does not match its key".to_owned(),
+                    });
+                }
+                Ok(stored)
+            })
+            .transpose()
     }
 
     #[cfg(feature = "test-support")]
@@ -5799,6 +5878,21 @@ impl OperationalRecoveryStore for RedbRecoveryStore {
     fn prune_replay_stream(&self, stream_id: &str) -> Result<u64, OrsError> {
         RedbRecoveryStore::prune_replay_stream(self, stream_id)
     }
+
+    fn load_replay_stream_head(
+        &self,
+        stream_id: &str,
+    ) -> Result<Option<WorkerReplayStreamRecord>, OrsError> {
+        RedbRecoveryStore::load_replay_stream_head(self, stream_id)
+    }
+
+    fn load_replay_request_record(
+        &self,
+        stream_id: &str,
+        request_id: &str,
+    ) -> Result<Option<WorkerReplayRequestRecord>, OrsError> {
+        RedbRecoveryStore::load_replay_request_record(self, stream_id, request_id)
+    }
 }
 
 /// Single coordinator facade. It owns no semantic policy and delegates one durable transition.
@@ -6014,6 +6108,23 @@ impl<S: OperationalRecoveryStore> OrsCoordinator<S> {
     /// retaining the newest [`crate::MAX_REPLAY_PAGE`] terminal events.
     pub fn prune_replay_stream(&self, stream_id: &str) -> Result<u64, OrsError> {
         self.store.prune_replay_stream(stream_id)
+    }
+
+    /// Loads one replay stream head without mutating anything.
+    pub fn load_replay_stream_head(
+        &self,
+        stream_id: &str,
+    ) -> Result<Option<WorkerReplayStreamRecord>, OrsError> {
+        self.store.load_replay_stream_head(stream_id)
+    }
+
+    /// Loads one retained replay acquisition without mutating anything.
+    pub fn load_replay_request_record(
+        &self,
+        stream_id: &str,
+        request_id: &str,
+    ) -> Result<Option<WorkerReplayRequestRecord>, OrsError> {
+        self.store.load_replay_request_record(stream_id, request_id)
     }
 }
 

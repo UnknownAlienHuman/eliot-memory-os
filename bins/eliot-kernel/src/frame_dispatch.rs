@@ -159,6 +159,31 @@ impl KernelComposition {
                 }
                 return self.dispatch_native_worker_frame(session, frame);
             }
+            if super::native_worker_replay_route::is_native_worker_replay_operation(
+                native_operation,
+            ) {
+                // Native-worker durable-replay operations (T9-03) delegate to
+                // the replay route file. Same Ready-gating and peer
+                // authentication as the lifecycle branch; per-operation
+                // admission (T9-02 gate revalidation + wire admit) and
+                // persist-before-ack live in the route. Stale bindings fence
+                // the session there and are never granted authority.
+                if self
+                    .service_state()
+                    .map_err(|_| TransportError::SessionFenced)?
+                    != KernelServiceState::Ready
+                {
+                    return Err(TransportError::SessionFenced);
+                }
+                session
+                    .peer
+                    .validate()
+                    .map_err(|_| TransportError::PeerIdentityUnavailable)?;
+                if frame.request_id.is_none() || frame.request_identity.is_none() {
+                    return Err(TransportError::SessionFenced);
+                }
+                return self.dispatch_native_worker_replay_frame(session, frame);
+            }
             #[cfg(windows)]
             if super::host_request_route::is_host_request_operation(native_operation) {
                 // P-04 admitted host-request envelopes ride the same admitted

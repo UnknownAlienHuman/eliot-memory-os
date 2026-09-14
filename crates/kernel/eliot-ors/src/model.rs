@@ -3075,9 +3075,11 @@ const MAX_REPLAY_TRACE_ENTRIES: usize = 64;
 
 /// Builds the durable replay stream identity for one claim generation.
 ///
-/// The stream id is `"{claim_id}/{generation}"` with a nonzero generation.
-/// The claim identity is already validated by construction; only the
-/// generation bound is checked here.
+/// The stream id is `"{claim_id}/gen-{generation}"` with a nonzero generation,
+/// matching the T9-02 executable-binding fixture (`stream-claim-t9-02-1/gen-1`)
+/// and the kernel-service replay wire constructor. The claim identity is
+/// already validated by construction; only the generation bound is checked
+/// here.
 pub fn replay_stream_id(claim_id: &OperationIdentity, generation: u64) -> Result<String, OrsError> {
     if generation == 0 {
         return Err(OrsError::InvalidField {
@@ -3085,38 +3087,34 @@ pub fn replay_stream_id(claim_id: &OperationIdentity, generation: u64) -> Result
             reason: "generation must be greater than zero",
         });
     }
-    Ok(format!("{}/{}", claim_id.as_str(), generation))
+    Ok(format!("{}/gen-{}", claim_id.as_str(), generation))
 }
 
 /// Splits a replay stream identity back into its claim and generation halves.
 ///
 /// The split is at the last `/` so a claim identity containing `/` still
-/// round-trips through [`replay_stream_id`]. The generation half must be a
-/// nonzero integer; owner-shaped strings with a non-numeric generation half
+/// round-trips through [`replay_stream_id`]. The generation half must be
+/// `gen-{nonzero integer}`; owner-shaped strings without the `gen-` prefix
 /// are rejected as malformed (fail closed) and must be mapped through
 /// [`replay_stream_id`] by the kernel-service adapter before reaching ORS.
 pub fn parse_replay_stream_id(stream_id: &str) -> Result<(OperationIdentity, u64), OrsError> {
     let (claim_part, generation_part) =
         stream_id.rsplit_once('/').ok_or(OrsError::InvalidField {
             field: "worker_replay_stream_id",
-            reason: "stream identity must be \"{claim_id}/{generation}\"",
+            reason: "stream identity must be \"{claim_id}/gen-{generation}\"",
         })?;
     let claim_id = OperationIdentity::new(claim_part).map_err(|_| OrsError::InvalidField {
         field: "worker_replay_stream_id",
         reason: "stream claim identity must be non-blank",
     })?;
     let generation: u64 = generation_part
-        .parse()
-        .map_err(|_| OrsError::InvalidField {
+        .strip_prefix("gen-")
+        .and_then(|digits| digits.parse().ok())
+        .filter(|generation| *generation > 0)
+        .ok_or(OrsError::InvalidField {
             field: "worker_replay_stream_id",
-            reason: "stream generation must be a nonzero integer",
+            reason: "stream generation must be gen-{nonzero integer}",
         })?;
-    if generation == 0 {
-        return Err(OrsError::InvalidField {
-            field: "worker_replay_stream_id",
-            reason: "stream generation must be a nonzero integer",
-        });
-    }
     Ok((claim_id, generation))
 }
 

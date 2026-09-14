@@ -154,7 +154,9 @@ impl NativeWorkerLivenessReceipt {
 }
 
 /// Seals one route receipt body with its canonical digest.
-fn seal_route_receipt(mut body: serde_json::Value) -> Result<serde_json::Value, TransportError> {
+pub(crate) fn seal_route_receipt(
+    mut body: serde_json::Value,
+) -> Result<serde_json::Value, TransportError> {
     let digest = sha256_json(&body).map_err(|_| TransportError::SessionFenced)?;
     body["receipt_digest"] = serde_json::Value::String(digest);
     Ok(body)
@@ -174,6 +176,23 @@ pub(crate) struct NativeWorkerRouteConflict {
     expected_digest: String,
     observed_digest: String,
     changed_fields: Vec<String>,
+}
+
+impl NativeWorkerRouteConflict {
+    /// Builds one changed-work conflict under a known identity.
+    pub(crate) fn new(
+        identity: String,
+        expected_digest: String,
+        observed_digest: String,
+        changed_fields: Vec<String>,
+    ) -> Self {
+        Self {
+            identity,
+            expected_digest,
+            observed_digest,
+            changed_fields,
+        }
+    }
 }
 
 /// Typed failure for one native-worker lifecycle operation.
@@ -213,7 +232,7 @@ impl std::fmt::Display for NativeWorkerRouteError {
 }
 
 impl NativeWorkerRouteError {
-    fn into_transport(self) -> TransportError {
+    pub(crate) fn into_transport(self) -> TransportError {
         match self {
             Self::Shape { .. } | Self::Fence { .. } => TransportError::SessionFenced,
             Self::Unknown { .. } => TransportError::UnknownRequest,
@@ -244,7 +263,7 @@ pub(crate) fn native_worker_json_str(
 }
 
 /// Reads one bounded operation-identity field.
-fn require_op_id(
+pub(crate) fn require_op_id(
     value: &serde_json::Value,
     field: &'static str,
 ) -> Result<String, NativeWorkerRouteError> {
@@ -252,7 +271,7 @@ fn require_op_id(
 }
 
 /// Reads one bounded claim/registration text field.
-fn require_claim_text(
+pub(crate) fn require_claim_text(
     value: &serde_json::Value,
     field: &'static str,
 ) -> Result<String, NativeWorkerRouteError> {
@@ -294,7 +313,7 @@ fn native_worker_json_u32(
 }
 
 /// Reads one nonzero `u64` field.
-fn require_nonzero_u64(
+pub(crate) fn require_nonzero_u64(
     value: &serde_json::Value,
     field: &'static str,
 ) -> Result<u64, NativeWorkerRouteError> {
@@ -306,7 +325,7 @@ fn require_nonzero_u64(
 }
 
 /// Reads one lowercase SHA-256 digest field.
-fn require_digest(
+pub(crate) fn require_digest(
     value: &serde_json::Value,
     field: &'static str,
 ) -> Result<String, NativeWorkerRouteError> {
@@ -379,7 +398,7 @@ impl KernelComposition {
     /// Loads one claim record by exact identity. Unknown identities are
     /// `Unknown` (records are never invented here); storage or corruption
     /// failures fence the session fail-closed.
-    fn load_claim_record(
+    pub(crate) fn load_claim_record(
         &self,
         claim_id: &str,
     ) -> Result<NativeWorkerClaimRecord, NativeWorkerRouteError> {
@@ -542,7 +561,7 @@ impl KernelComposition {
 
     /// Requires the frame idempotency key to equal the message's distinct
     /// operation identity, binding replay protection to the exact message.
-    fn require_message_identity(
+    pub(crate) fn require_message_identity(
         identity: &serde_json::Value,
         operation_id: &str,
     ) -> Result<(), NativeWorkerRouteError> {
@@ -562,7 +581,7 @@ impl KernelComposition {
 
     /// Fails with [`NativeWorkerRouteError::ExpiredDeadline`] when the claim's
     /// absolute deadline elapsed before `now`.
-    fn require_claim_deadline(
+    pub(crate) fn require_claim_deadline(
         payload: &serde_json::Value,
         now: u64,
     ) -> Result<u64, NativeWorkerRouteError> {
@@ -574,7 +593,7 @@ impl KernelComposition {
     }
 
     /// Validates one registration (or renewal, with a fresh renewal identity).
-    fn validate_native_worker_registration(
+    pub(crate) fn validate_native_worker_registration(
         payload: &serde_json::Value,
     ) -> Result<(String, u64), NativeWorkerRouteError> {
         let registration_id = require_op_id(payload, "registration_id")?;
@@ -728,7 +747,7 @@ impl KernelComposition {
     /// typed `u1_old_wire_without_executable_binding` disposition, never
     /// promoted; wire v2 must carry the join (checked in
     /// [`Self::build_claim_request`]).
-    fn validate_native_worker_claim(
+    pub(crate) fn validate_native_worker_claim(
         payload: &serde_json::Value,
     ) -> Result<(String, String, u64), NativeWorkerRouteError> {
         let wire = payload
@@ -823,7 +842,7 @@ impl KernelComposition {
     }
 
     /// Locks the Kernel service owner for one admission verdict.
-    fn service_guard(
+    pub(crate) fn service_guard(
         &self,
     ) -> Result<
         std::sync::MutexGuard<'_, eliot_kernel_service::KernelService>,
@@ -870,7 +889,7 @@ impl KernelComposition {
     /// service owner's `validate` + `validate_canonical_digest` run over the
     /// exact admitted shape; a presentation that passed the boundary parse
     /// but disagrees with the typed contract still fails there.
-    fn build_claim_request(
+    pub(crate) fn build_claim_request(
         claim: &serde_json::Value,
     ) -> Result<NativeWorkerClaimRequest, NativeWorkerRouteError> {
         let budget_value = claim
@@ -1006,7 +1025,7 @@ impl KernelComposition {
     /// `u1_old_wire_without_executable_binding` — and exist only so the
     /// refusal is the service owner's typed disposition instead of a local
     /// invention.
-    fn build_executable_expectation(
+    pub(crate) fn build_executable_expectation(
         presented: Option<&NativeWorkerExecutableBinding>,
         registration: &serde_json::Value,
         registration_fence: &StateFence,
@@ -1066,7 +1085,7 @@ impl KernelComposition {
     /// (`IdentityConflict`, mirroring the reconcile-route identity semantics);
     /// epoch, generation, or fence disagreement is `Fence` (`SessionFenced`);
     /// an elapsed binding window is `ExpiredDeadline` (`Timeout`).
-    fn enforce_claim_executable_binding(
+    pub(crate) fn enforce_claim_executable_binding(
         request: &NativeWorkerClaimRequest,
         expectation: &NativeWorkerExecutableExpectation,
         now: u64,
@@ -1137,7 +1156,7 @@ impl KernelComposition {
     /// `ClaimAdmissionRequest::validate_binding` does: same registration,
     /// same generation, same epoch, same fence. A claim rewired onto a
     /// different registration fails here before any owner sees it.
-    fn split_claim_presentation(
+    pub(crate) fn split_claim_presentation(
         payload: &serde_json::Value,
     ) -> Result<(&serde_json::Value, &serde_json::Value), NativeWorkerRouteError> {
         let claim = payload
