@@ -10,7 +10,7 @@ use std::sync::{Mutex, MutexGuard, TryLockError};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use eliot_store_api::{
-    CanonicalStoreClient, CanonicalValidationSnapshot, CommitId, EventId,
+    CanonicalRequestView, CanonicalStoreClient, CanonicalValidationSnapshot, CommitId, EventId,
     EventProjectionRelationIntents, NamedReadOperation, NamedReadRequest, NamedReadResponse,
     OperationId, OperationManifestDigest, OrderingHead, OrderingHeadExpectation, OrderingScopeId,
     OutboxId, OutboxIntent, OutboxState, PreparedTransition, ProjectionMode,
@@ -19,9 +19,9 @@ use eliot_store_api::{
     RevisionHeadExpectation, RevisionKey, ScopeId, ScopeRevisionView, SplitView, StateFence,
     StoreError, StoreGenesisRequest, StoreHealth, StoreHealthStatus, StoreRecoveryRequest,
     StoreRecoverySnapshot, WriteReceipt, WriteReceiptStatus, canonical_json_bytes,
-    genesis_manifest, is_genesis_fence, issue_genesis_receipt_envelope,
+    canonical_request_hash, genesis_manifest, is_genesis_fence, issue_genesis_receipt_envelope,
     issue_store_receipt_envelope, sha256_hex, validate_genesis_receipt_envelope,
-    validate_store_receipt_envelope,
+    validate_store_receipt_envelope, verify_canonical_request_hash,
 };
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
@@ -70,6 +70,15 @@ impl MemoryStore {
     }
 
     /// Applies one transition synchronously for model/reference tests.
+    ///
+    /// RECHECK-63 slice C: recomputes the canonical request hash from the
+    /// exact values to be executed (`ctx` + `transition` + expected heads)
+    /// via the shared helper and rejects divergence with
+    /// `TransitionDigestMismatch` BEFORE any idempotency-lookup success and
+    /// BEFORE any transaction/receipt. The receipt binds the recomputed
+    /// digest, never a blind copy of the supplied value. Same
+    /// idempotency key + different executable bytes (recomputed != stored,
+    /// supplied == recomputed) stays `IdentityConflict` with no transaction.
     pub fn apply_transaction(
         &self,
         ctx: &RequestMeta,
@@ -78,9 +87,18 @@ impl MemoryStore {
         expected_ordering_heads: &[OrderingHeadExpectation],
     ) -> Result<WriteReceipt, StoreError> {
         validate_transaction(ctx, &transition)?;
+        // Recompute before any lookup or effect: supplied != recomputed is a
+        // typed digest mismatch with no transaction and no lookup success.
+        let view = CanonicalRequestView::from_apply(
+            ctx,
+            &transition,
+            expected_revision_heads,
+            expected_ordering_heads,
+        );
+        verify_canonical_request_hash(&view, &transition.identity.canonical_request_hash)?;
+        let recomputed = canonical_request_hash(&view)?;
         let operation_key = transition.identity.operation_id.to_string();
         let mut state = self.lock_state()?;
-        let canonical_hash = transition.identity.canonical_request_hash.clone();
         let idempotency_key = transition.identity.idempotency_key.clone();
         if let Some(receipt) = existing_receipt(
             &state,
@@ -88,7 +106,7 @@ impl MemoryStore {
             &transition,
             &operation_key,
             &idempotency_key,
-            &canonical_hash,
+            &recomputed,
         )? {
             return Ok(receipt);
         }
@@ -99,8 +117,7 @@ impl MemoryStore {
             expected_ordering_heads,
         )?;
         let plan = transaction_plan(&state, &transition, &operation_key)?;
-        let receipt =
-            transaction_receipt(ctx, &transition, idempotency_key, canonical_hash, &plan)?;
+        let receipt = transaction_receipt(ctx, &transition, idempotency_key, recomputed, &plan)?;
         Ok(commit_transaction(
             &mut state,
             transition,
@@ -602,6 +619,10 @@ impl MemoryStore {
         context: &RequestMeta,
         request: &StoreGenesisRequest,
     ) -> Result<WriteReceipt, StoreError> {
+        // RECHECK-63 slice C: recompute first so tamper is a typed digest
+        // mismatch with no lookup success and no transaction, before the
+        // generic validation (which would report InvalidField).
+        let recomputed = verify_genesis_canonical_hash(request)?;
         request.validate_for_context(context)?;
         let mut state = self.lock_state()?;
 
@@ -670,12 +691,11 @@ impl MemoryStore {
         }
         state.fences = Some(request.state_fence.clone());
         state.next_commit_sequence = next_commit_sequence;
+        // Bind the recomputed digest, never a blind copy of the supplied value
+        // (equal here after verification, but explicit for the receipt invariant).
         state.receipts_by_idempotency.insert(
             request.idempotency_key.clone(),
-            (
-                request.canonical_request_hash.clone(),
-                request.operation_id.to_string(),
-            ),
+            (recomputed, request.operation_id.to_string()),
         );
         state
             .receipts_by_operation
@@ -756,16 +776,45 @@ impl CanonicalStoreClient for MemoryStore {
     }
 }
 
+/// Recomputes the genesis canonical hash and rejects divergence with the
+/// typed mismatch (RECHECK-63 slice C).
+///
+/// Returns the recomputed digest so callers bind the receipt to it, never a
+/// blind copy of the supplied value. Supplied != recomputed is
+/// `TransitionDigestMismatch` with no transaction and no lookup success;
+/// same key + different bytes with supplied == recomputed stays
+/// `IdentityConflict` at the caller's idempotency checks.
+fn verify_genesis_canonical_hash(request: &StoreGenesisRequest) -> Result<String, StoreError> {
+    let recomputed = request.compute_digest()?;
+    if recomputed == request.canonical_request_hash {
+        Ok(recomputed)
+    } else {
+        Err(StoreError::TransitionDigestMismatch {
+            expected: request
+                .canonical_request_hash
+                .chars()
+                .take(eliot_store_api::MAX_DIGEST_DETAIL_CHARS)
+                .collect(),
+            observed: recomputed
+                .chars()
+                .take(eliot_store_api::MAX_DIGEST_DETAIL_CHARS)
+                .collect(),
+        })
+    }
+}
+
 fn genesis_receipt(
     context: &RequestMeta,
     request: &StoreGenesisRequest,
     commit_sequence: u64,
 ) -> Result<WriteReceipt, StoreError> {
+    // Bind the receipt to the recomputed digest, never a blind copy.
+    let recomputed = verify_genesis_canonical_hash(request)?;
     let manifest = genesis_manifest()?;
     let mut receipt = WriteReceipt {
         operation_id: request.operation_id.clone(),
         idempotency_key: request.idempotency_key.clone(),
-        canonical_request_hash: request.canonical_request_hash.clone(),
+        canonical_request_hash: recomputed,
         transition_class: eliot_store_api::TransitionClass::RecoverySchema,
         status: WriteReceiptStatus::Committed,
         commit_id: Some(CommitId::new("commit-genesis")?),
@@ -1174,8 +1223,12 @@ mod tests {
         operation: &str,
         state_fence: &StateFence,
     ) -> Result<PreparedTransition, StoreError> {
+        // RECHECK-63 slice C: bind the real shared-function digest for the
+        // empty-heads view (the old `"a".repeat(64)` was a placeholder, never
+        // the hash of these executable bytes). Callers that apply with
+        // non-empty expected heads must rebind via `transition_with_heads`.
         let operation_id = OperationId::new(operation).map_err(StoreError::Foundation)?;
-        Ok(PreparedTransition {
+        let mut prepared = PreparedTransition {
             identity: eliot_store_api::OperationIdentity {
                 operation_id,
                 idempotency_key: format!("idem-{operation}"),
@@ -1200,7 +1253,33 @@ mod tests {
             },
             security: eliot_store_api::SecurityContext::default(),
             required_proof_and_approval_refs: vec![],
-        })
+        };
+        let ctx = metadata(state_fence)?;
+        let view = CanonicalRequestView::from_apply(&ctx, &prepared, &[], &[]);
+        prepared.identity.canonical_request_hash = canonical_request_hash(&view)?;
+        Ok(prepared)
+    }
+
+    /// Rebinds a transition's digest for the exact expected heads it will be
+    /// applied with (non-empty-heads callers must use this; the empty-heads
+    /// `transition` digest would otherwise mismatch and yield a typed digest
+    /// error instead of the intended revision/ordering check).
+    fn transition_with_heads(
+        operation: &str,
+        state_fence: &StateFence,
+        ctx: &RequestMeta,
+        expected_revision_heads: &[RevisionHeadExpectation],
+        expected_ordering_heads: &[OrderingHeadExpectation],
+    ) -> Result<PreparedTransition, StoreError> {
+        let mut prepared = transition(operation, state_fence)?;
+        let view = CanonicalRequestView::from_apply(
+            ctx,
+            &prepared,
+            expected_revision_heads,
+            expected_ordering_heads,
+        );
+        prepared.identity.canonical_request_hash = canonical_request_hash(&view)?;
+        Ok(prepared)
     }
 
     #[test]
@@ -1343,12 +1422,20 @@ mod tests {
         let before = store.lock_state()?.clone();
         let mut changed_hash = request.clone();
         changed_hash.canonical_request_hash = "d".repeat(64);
-        assert_eq!(
-            store.initialize_genesis_sync(&metadata(&state_fence)?, &changed_hash),
-            Err(StoreError::InvalidField {
-                field: "canonical_request_hash",
-                reason: "does not match canonical genesis request",
-            })
+        // RECHECK-63 slice C: supplied != recomputed is now the typed digest
+        // mismatch (not the generic InvalidField), still with no state change.
+        // Proof: `changed_hash` keeps every committed field identical so its
+        // recomputed digest equals the original request digest; only the
+        // supplied claimant (`"d".repeat`) diverges.
+        let tampered = store.initialize_genesis_sync(&metadata(&state_fence)?, &changed_hash);
+        assert!(
+            matches!(
+                &tampered,
+                Err(StoreError::TransitionDigestMismatch { expected, observed })
+                    if expected == &"d".repeat(64)
+                        && observed == &request.compute_digest().expect("recomputed digest")
+            ),
+            "tampered genesis hash must be a typed digest mismatch, got {tampered:?}"
         );
         let mut changed_operation = request.clone();
         changed_operation.operation_id =
@@ -1378,12 +1465,21 @@ mod tests {
         ))?;
         let mut changed_owner_records = request.clone();
         changed_owner_records.owner_records[0].key = "two".to_owned();
-        assert_eq!(
-            store.initialize_genesis_sync(&metadata(&state_fence)?, &changed_owner_records,),
-            Err(StoreError::InvalidField {
-                field: "canonical_request_hash",
-                reason: "does not match canonical genesis request",
-            })
+        // Same typed-mismatch rule: the owner mutation changes the recomputed
+        // digest while the supplied claimant stays the original hash.
+        let tampered_owners =
+            store.initialize_genesis_sync(&metadata(&state_fence)?, &changed_owner_records);
+        assert!(
+            matches!(
+                &tampered_owners,
+                Err(StoreError::TransitionDigestMismatch { expected, observed })
+                    if expected == &request.canonical_request_hash
+                        && observed
+                            == &changed_owner_records
+                                .compute_digest()
+                                .expect("recomputed owner digest")
+            ),
+            "mutated genesis owners must be a typed digest mismatch, got {tampered_owners:?}"
         );
         let after = store.lock_state()?.clone();
         assert_eq!(before_snapshot, store.snapshot()?);
@@ -1564,15 +1660,25 @@ mod tests {
         let ctx = metadata(&state_fence)?;
         let prepared = transition("op-substitution", &state_fence)?;
         store.apply_transaction(&ctx, prepared.clone(), &[], &[])?;
+        let before = store.snapshot()?;
 
         let mut substituted = prepared;
         substituted.named_operations[0]
             .parameters
             .insert("subject".to_owned(), json!("substituted"));
-        assert_eq!(
-            store.apply_transaction(&ctx, substituted, &[], &[]),
-            Err(StoreError::InvalidReceipt)
+        // RECHECK-63 slice C: the substituted bytes keep the original claim,
+        // so supplied != recomputed is now the typed digest mismatch (not the
+        // legacy InvalidReceipt from envelope replay), still with no state
+        // change. Proof: `transition()` binds the real digest for the exact
+        // bytes; mutating one parameter without rebinding must diverge.
+        let err = store
+            .apply_transaction(&ctx, substituted, &[], &[])
+            .expect_err("substituted payload must fail");
+        assert!(
+            matches!(err, StoreError::TransitionDigestMismatch { .. }),
+            "payload substitution must be TRANSITION_DIGEST_MISMATCH, got {err:?}"
         );
+        assert_eq!(before, store.snapshot()?);
         Ok(())
     }
 
@@ -1612,16 +1718,15 @@ mod tests {
             expected_revision: 1,
             state_fence: state_fence.clone(),
         }];
-        let error = store.apply_transaction(
-            &ctx,
-            transition("op-2", &state_fence)?,
-            &stale,
-            &[OrderingHeadExpectation {
-                scope: OrderingScopeId::new("scope-1")?,
-                expected_sequence: 2,
-                state_fence,
-            }],
-        );
+        let stale_ordering = vec![OrderingHeadExpectation {
+            scope: OrderingScopeId::new("scope-1")?,
+            expected_sequence: 2,
+            state_fence: state_fence.clone(),
+        }];
+        // Rebind the digest for the exact heads under test so the revision
+        // gate (not a digest mismatch) is what fails here.
+        let prepared = transition_with_heads("op-2", &state_fence, &ctx, &stale, &stale_ordering)?;
+        let error = store.apply_transaction(&ctx, prepared, &stale, &stale_ordering);
         assert!(matches!(error, Err(StoreError::RevisionConflict)));
         assert_eq!(before, store.snapshot()?);
         Ok(())
@@ -1675,7 +1780,13 @@ mod tests {
         }];
         left.apply_transaction(
             &ctx,
-            transition("op-left", &state_fence)?,
+            transition_with_heads(
+                "op-left",
+                &state_fence,
+                &ctx,
+                &expected_next_revision,
+                &expected_next_ordering,
+            )?,
             &expected_next_revision,
             &expected_next_ordering,
         )?;
@@ -1685,7 +1796,13 @@ mod tests {
 
         right.apply_transaction(
             &ctx,
-            transition("op-right", &state_fence)?,
+            transition_with_heads(
+                "op-right",
+                &state_fence,
+                &ctx,
+                &expected_next_revision,
+                &expected_next_ordering,
+            )?,
             &expected_next_revision,
             &expected_next_ordering,
         )?;
@@ -1872,6 +1989,88 @@ mod tests {
         }));
         assert!(poison_result.is_err());
         assert_eq!(store.health_sync()?.status, StoreHealthStatus::Unavailable);
+        Ok(())
+    }
+
+    #[test]
+    fn tampered_canonical_hash_is_a_typed_mismatch_with_no_state_change() -> Result<(), StoreError>
+    {
+        // RECHECK-63 slice C: supplied != recomputed fails typed before any
+        // idempotency-lookup success and before any transaction/receipt, with
+        // the receipt binding the recomputed digest on the exact path.
+        let state_fence = fence();
+        let store = store()?;
+        let ctx = metadata(&state_fence)?;
+        let exact = transition("op-tamper", &state_fence)?;
+        let view = CanonicalRequestView::from_apply(&ctx, &exact, &[], &[]);
+        let recomputed = canonical_request_hash(&view)?;
+        assert_eq!(exact.identity.canonical_request_hash, recomputed);
+        // Exact commits and binds the recomputed digest.
+        let receipt = store.apply_transaction(&ctx, exact.clone(), &[], &[])?;
+        assert_eq!(receipt.canonical_request_hash, recomputed);
+        let before = store.snapshot()?;
+        // Tamper one load-bearing byte (subject) while keeping the old claim.
+        let mut tampered = exact.clone();
+        tampered.named_operations[0]
+            .parameters
+            .insert("subject".to_owned(), json!("tampered"));
+        let err = store
+            .apply_transaction(&ctx, tampered, &[], &[])
+            .expect_err("tampered bytes must fail");
+        assert!(
+            matches!(
+                &err,
+                StoreError::TransitionDigestMismatch { expected, observed }
+                    if expected == &recomputed
+                        && observed
+                            != &recomputed
+            ),
+            "tamper must be TRANSITION_DIGEST_MISMATCH, got {err:?}"
+        );
+        assert_eq!(before, store.snapshot()?);
+        // Same-key-different-bytes with a correctly recomputed claim for the
+        // new bytes stays IDENTITY_CONFLICT (not a digest mismatch) and is
+        // still atomic.
+        let mut forked = exact;
+        forked.identity.operation_id =
+            OperationId::new("op-tamper-fork").map_err(StoreError::Foundation)?;
+        forked.named_operations[0]
+            .parameters
+            .insert("subject".to_owned(), json!("forked"));
+        let forked_view = CanonicalRequestView::from_apply(&ctx, &forked, &[], &[]);
+        forked.identity.canonical_request_hash = canonical_request_hash(&forked_view)?;
+        // Force the idempotency-key collision while keeping the fork's own
+        // digest self-consistent: reuse the original idempotency key.
+        forked.identity.idempotency_key = format!("idem-op-tamper");
+        let conflict = store
+            .apply_transaction(&ctx, forked, &[], &[])
+            .expect_err("same-key fork must conflict");
+        assert_eq!(conflict, StoreError::IdentityConflict);
+        assert_eq!(before, store.snapshot()?);
+        Ok(())
+    }
+
+    #[test]
+    fn exact_replay_binds_recomputed_digest_and_is_byte_identical() -> Result<(), StoreError> {
+        // Proves cross-crate stability: the store recompute uses the same
+        // shared helper as Slice A (golden vector
+        // `55e62e405f35c7f137fe9fcdf177c66a1cba54a5b75fb547deaa11f001a89ec1`
+        // is produced by `canonical_request_hash` in `eliot-store-api`).
+        // Here the memory path binds its own recomputed digest and replays
+        // byte-identically.
+        let state_fence = fence();
+        let store = store()?;
+        let ctx = metadata(&state_fence)?;
+        let prepared = transition("op-replay-digest", &state_fence)?;
+        let view = CanonicalRequestView::from_apply(&ctx, &prepared, &[], &[]);
+        let recomputed = canonical_request_hash(&view)?;
+        verify_canonical_request_hash(&view, &prepared.identity.canonical_request_hash)?;
+        let first = store.apply_transaction(&ctx, prepared.clone(), &[], &[])?;
+        assert_eq!(first.canonical_request_hash, recomputed);
+        let before = store.snapshot()?;
+        let replay = store.apply_transaction(&ctx, prepared, &[], &[])?;
+        assert_eq!(first, replay);
+        assert_eq!(before, store.snapshot()?);
         Ok(())
     }
 }
