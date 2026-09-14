@@ -4,10 +4,10 @@ use serde_json::{Map, Value, json};
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::fs::{self, OpenOptions};
-use std::io::Write;
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
-use std::process::Command;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::process::{Command, Stdio};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 /// Frozen historical D-01 verification profile.
 ///
@@ -43,11 +43,412 @@ pub mod legacy_d01 {
     /// Frozen historical D-01 value, not a current trust root.
     pub const LEGACY_D01_EXPECTED_WORK_GRAPH_ARRAY_SHA256: &str =
         "2cc172ea0b4d1ab7a884fffedd73e0d44d5ca13c2bfb6aa65b93d3a43bc2d929";
+    /// Version of this legacy tool itself, bound to the tool package version
+    /// at compile time (`--version` surfaces the same value via clap).
+    ///
+    /// Read-only historical D-01 verifier identity only: this version never
+    /// grants runtime, semantic, canonical-state, or Product authority, and a
+    /// verifier PASS alone is not current support evidence (non-current
+    /// ceiling, see the receipt `document_status_ceiling`).
+    pub const LEGACY_D01_VERSION: &str = env!("CARGO_PKG_VERSION");
+    /// Explicit expiry statement for the legacy tool itself (not a date: the
+    /// verifier stays until its removal condition holds, then is deleted).
+    ///
+    /// Read-only historical D-01 verifier scope only; no authority is
+    /// conferred by this string.
+    pub const LEGACY_D01_EXPIRY: &str = "zero-reference removal: this read-only historical verifier expires when \
+         LEGACY_D01_REMOVAL_CONDITION holds, then it is removed, not migrated";
+    /// Explicit removal condition for the legacy tool itself (per #1223 req 4).
+    ///
+    /// Zero-reference removal: delete this verifier only after proving zero
+    /// live references remain (no current producer, no installation/runtime
+    /// admission consumer, no invocation residue). Until then it is retained
+    /// read-only, explicitly `LEGACY_D01`, and absent from current support paths.
+    pub const LEGACY_D01_REMOVAL_CONDITION: &str = "zero-reference removal per #1223 req 4: remove only after proving zero \
+         current producers, zero installation/runtime consumers, and zero \
+         invocation residue; never migrate into a current trust path";
 }
 
 /// Deprecated historical plan identity alias; use [`legacy_d01::LEGACY_D01_PLAN_ID`].
 #[deprecated(note = "frozen historical D-01 plan identity; use legacy_d01::LEGACY_D01_PLAN_ID")]
 pub const PLAN_ID: &str = legacy_d01::LEGACY_D01_PLAN_ID;
+
+/// Pre-allocation bounds for the legacy D-01 verifier (#1223 req 2).
+///
+/// Every bound is enforced BEFORE the corresponding read/allocation in the
+/// real input path (`read_json`, payload hashing, `run_command`,
+/// `write_report_atomic`, manifest member ingestion); violations fail closed
+/// with [`CompilerError`], never `Ok`.
+pub mod bounds {
+    /// Maximum bytes of any single input file read by the verifier.
+    pub const MAX_INPUT_FILE_BYTES: u64 = 8 * 1024 * 1024;
+    /// Maximum nesting depth of any parsed JSON value (root counts as 1).
+    pub const MAX_JSON_DEPTH: usize = 64;
+    /// Maximum number of JSON containers (objects plus arrays) in one value.
+    pub const MAX_JSON_CONTAINERS: u64 = 100_000;
+    /// Maximum bytes of any single JSON string (keys and values).
+    pub const MAX_JSON_STRING_LEN: usize = 1024 * 1024;
+    /// Maximum entries in a bundle manifest `payload_files` array.
+    pub const MAX_PAYLOAD_COUNT: usize = 512;
+    /// Maximum summed bytes of all hashed manifest payloads.
+    pub const MAX_TOTAL_PAYLOAD_BYTES: u64 = 64 * 1024 * 1024;
+    /// Maximum captured bytes (stdout/stderr) of one repository-tool process.
+    pub const MAX_PROCESS_OUTPUT_BYTES: usize = 8 * 1024 * 1024;
+    /// Maximum wall-clock seconds for one repository-tool process.
+    pub const MAX_PROCESS_TIMEOUT_SECS: u64 = 120;
+    /// Maximum bytes of a serialized verification report.
+    pub const MAX_REPORT_BYTES: usize = 8 * 1024 * 1024;
+}
+
+/// Typed fail-closed failures for verifier bounds, identity, and boundary.
+///
+/// Every variant fails closed: callers convert into the audit FAIL receipt
+/// (directly or via `anyhow`), never into `Ok` on an error path.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CompilerError {
+    /// A file (or report/process buffer) exceeds its byte cap before read.
+    InputTooLarge {
+        path: String,
+        bytes: u64,
+        max_bytes: u64,
+    },
+    /// A counted bound (containers, payload members, total bytes) is exceeded.
+    BoundExceeded {
+        bound: &'static str,
+        actual: u64,
+        max: u64,
+    },
+    /// A parsed JSON value nests deeper than [`bounds::MAX_JSON_DEPTH`].
+    JsonTooDeep { depth: usize, max_depth: usize },
+    /// A JSON string exceeds [`bounds::MAX_JSON_STRING_LEN`].
+    JsonStringTooLong { len: usize, max_len: usize },
+    /// A program/argument shape outside the fixed repository-tool allowlist.
+    RepositoryToolRejected { program: String },
+    /// A payload or normative path resolves through a symlink/reparse point.
+    SymlinkRejected { path: String },
+    /// Input roots overlap (nest) or cannot be canonicalized.
+    RootOverlapRejected { detail: &'static str },
+    /// A repository-tool process exceeded its wall-clock budget.
+    ProcessTimeout { program: &'static str, secs: u64 },
+    /// A repository-tool process emitted more than the output cap.
+    ProcessOutputTooLarge {
+        program: &'static str,
+        bytes: usize,
+        max_bytes: usize,
+    },
+}
+
+impl std::fmt::Display for CompilerError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::InputTooLarge {
+                path,
+                bytes,
+                max_bytes,
+            } => write!(
+                f,
+                "input too large: {path} is {bytes} bytes (max {max_bytes})"
+            ),
+            Self::BoundExceeded { bound, actual, max } => {
+                write!(f, "bound exceeded: {bound} is {actual} (max {max})")
+            }
+            Self::JsonTooDeep { depth, max_depth } => {
+                write!(f, "JSON too deep: depth {depth} (max {max_depth})")
+            }
+            Self::JsonStringTooLong { len, max_len } => {
+                write!(f, "JSON string too long: {len} bytes (max {max_len})")
+            }
+            Self::RepositoryToolRejected { program } => {
+                write!(
+                    f,
+                    "repository tool rejected: {program} is outside the allowlist"
+                )
+            }
+            Self::SymlinkRejected { path } => {
+                write!(f, "symlink or reparse point rejected: {path}")
+            }
+            Self::RootOverlapRejected { detail } => {
+                write!(f, "input roots rejected: {detail}")
+            }
+            Self::ProcessTimeout { program, secs } => {
+                write!(f, "repository tool timed out: {program} exceeded {secs}s")
+            }
+            Self::ProcessOutputTooLarge {
+                program,
+                bytes,
+                max_bytes,
+            } => write!(
+                f,
+                "repository tool output too large: {program} emitted {bytes} bytes (max {max_bytes})"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for CompilerError {}
+
+/// Fixed read-only repository-tool boundary (#1223 req 3).
+///
+/// Only these exact program-plus-argument shapes may execute, all read-only
+/// against the supplied repository directory:
+/// - `cargo metadata --no-deps --format-version 1 --offline --locked`
+/// - `git rev-parse HEAD`
+/// - `git status --porcelain=v1 --untracked-files=all`
+/// - `git diff --binary --no-ext-diff --full-index HEAD --`
+/// - `git ls-files --others --exclude-standard`
+///
+/// No shell (spawned via `Command::new` with an argument array, never through
+/// a shell), no network (cargo always passes `--offline`; the git shapes are
+/// local-only), no credentials (no credential flags and no credential
+/// environment is set or read). Anything outside this list fails closed with
+/// [`CompilerError::RepositoryToolRejected`] by construction: `run_command`
+/// only accepts this enum, so a non-allowlisted program cannot be spawned.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RepositoryTool {
+    CargoMetadata,
+    GitRevParseHead,
+    GitStatusPorcelain,
+    GitDiffBinaryHead,
+    GitLsFilesOthers,
+}
+
+impl RepositoryTool {
+    /// The exact executable for this allowlisted tool.
+    #[must_use]
+    pub fn program(self) -> &'static str {
+        match self {
+            Self::CargoMetadata => "cargo",
+            Self::GitRevParseHead
+            | Self::GitStatusPorcelain
+            | Self::GitDiffBinaryHead
+            | Self::GitLsFilesOthers => "git",
+        }
+    }
+
+    /// The exact argument list for this allowlisted tool.
+    #[must_use]
+    pub fn args(self) -> &'static [&'static str] {
+        match self {
+            Self::CargoMetadata => &[
+                "metadata",
+                "--no-deps",
+                "--format-version",
+                "1",
+                "--offline",
+                "--locked",
+            ],
+            Self::GitRevParseHead => &["rev-parse", "HEAD"],
+            Self::GitStatusPorcelain => &["status", "--porcelain=v1", "--untracked-files=all"],
+            Self::GitDiffBinaryHead => &[
+                "diff",
+                "--binary",
+                "--no-ext-diff",
+                "--full-index",
+                "HEAD",
+                "--",
+            ],
+            Self::GitLsFilesOthers => &["ls-files", "--others", "--exclude-standard"],
+        }
+    }
+
+    /// Accept only an exact allowlisted program-plus-argument shape.
+    ///
+    /// Anything else (including the right program with the wrong arguments,
+    /// e.g. `cargo build` or `git push`) fails closed.
+    pub fn validate(program: &str, args: &[&str]) -> Result<Self, CompilerError> {
+        const ALL: [RepositoryTool; 5] = [
+            RepositoryTool::CargoMetadata,
+            RepositoryTool::GitRevParseHead,
+            RepositoryTool::GitStatusPorcelain,
+            RepositoryTool::GitDiffBinaryHead,
+            RepositoryTool::GitLsFilesOthers,
+        ];
+        for tool in ALL {
+            if program == tool.program() && args == tool.args() {
+                return Ok(tool);
+            }
+        }
+        Err(CompilerError::RepositoryToolRejected {
+            program: program.to_owned(),
+        })
+    }
+}
+
+/// Reject a file length before it is read or allocated.
+fn check_file_size(path: &Path, bytes: u64) -> Result<(), CompilerError> {
+    if bytes > bounds::MAX_INPUT_FILE_BYTES {
+        return Err(CompilerError::InputTooLarge {
+            path: path.display().to_string(),
+            bytes,
+            max_bytes: bounds::MAX_INPUT_FILE_BYTES,
+        });
+    }
+    Ok(())
+}
+
+/// Reject structural JSON excess (depth, container count, string length).
+///
+/// Runs on the parsed value before any downstream use, so an over-deep,
+/// over-wide, or over-long payload fails closed before it is trusted.
+fn check_json_bounds(value: &Value) -> Result<(), CompilerError> {
+    let mut containers: u64 = 0;
+    let mut stack: Vec<(&Value, usize)> = vec![(value, 1)];
+    while let Some((node, depth)) = stack.pop() {
+        if depth > bounds::MAX_JSON_DEPTH {
+            return Err(CompilerError::JsonTooDeep {
+                depth,
+                max_depth: bounds::MAX_JSON_DEPTH,
+            });
+        }
+        match node {
+            Value::Array(items) => {
+                containers += 1;
+                if containers > bounds::MAX_JSON_CONTAINERS {
+                    return Err(CompilerError::BoundExceeded {
+                        bound: "json.containers",
+                        actual: containers,
+                        max: bounds::MAX_JSON_CONTAINERS,
+                    });
+                }
+                for item in items {
+                    stack.push((item, depth + 1));
+                }
+            }
+            Value::Object(map) => {
+                containers += 1;
+                if containers > bounds::MAX_JSON_CONTAINERS {
+                    return Err(CompilerError::BoundExceeded {
+                        bound: "json.containers",
+                        actual: containers,
+                        max: bounds::MAX_JSON_CONTAINERS,
+                    });
+                }
+                for (key, item) in map {
+                    if key.len() > bounds::MAX_JSON_STRING_LEN {
+                        return Err(CompilerError::JsonStringTooLong {
+                            len: key.len(),
+                            max_len: bounds::MAX_JSON_STRING_LEN,
+                        });
+                    }
+                    stack.push((item, depth + 1));
+                }
+            }
+            Value::String(text) if text.len() > bounds::MAX_JSON_STRING_LEN => {
+                return Err(CompilerError::JsonStringTooLong {
+                    len: text.len(),
+                    max_len: bounds::MAX_JSON_STRING_LEN,
+                });
+            }
+            _ => {}
+        }
+    }
+    Ok(())
+}
+
+/// Reject an over-long manifest member list before payloads are read.
+fn check_payload_count(count: usize) -> Result<(), CompilerError> {
+    let actual = count as u64;
+    if count > bounds::MAX_PAYLOAD_COUNT {
+        return Err(CompilerError::BoundExceeded {
+            bound: "payload_files.len",
+            actual,
+            max: bounds::MAX_PAYLOAD_COUNT as u64,
+        });
+    }
+    Ok(())
+}
+
+/// Reject an over-large summed payload size before further reads.
+fn check_total_payload_bytes(total: u64) -> Result<(), CompilerError> {
+    if total > bounds::MAX_TOTAL_PAYLOAD_BYTES {
+        return Err(CompilerError::BoundExceeded {
+            bound: "payload.total_bytes",
+            actual: total,
+            max: bounds::MAX_TOTAL_PAYLOAD_BYTES,
+        });
+    }
+    Ok(())
+}
+
+/// Reject an over-large serialized report before any filesystem write.
+fn check_report_size(bytes: usize) -> Result<(), CompilerError> {
+    let actual = bytes as u64;
+    if actual > bounds::MAX_REPORT_BYTES as u64 {
+        return Err(CompilerError::InputTooLarge {
+            path: "report".to_owned(),
+            bytes: actual,
+            max_bytes: bounds::MAX_REPORT_BYTES as u64,
+        });
+    }
+    Ok(())
+}
+
+#[cfg(windows)]
+use std::os::windows::fs::MetadataExt;
+
+/// True when `path` is a symlink or (Windows) reparse point.
+///
+/// Uses `symlink_metadata`, which never follows the final component, so a
+/// symlink is observed rather than traversed. Absent or unreadable paths
+/// report false; downstream existence/read checks then fail closed on their
+/// own. A check-then-use race remains if a caller-supplied root is mutated
+/// concurrently; roots are caller-supplied inputs, not a trust boundary
+/// against their own owner.
+fn is_symlink_or_reparse(path: &Path) -> bool {
+    let Ok(meta) = fs::symlink_metadata(path) else {
+        return false;
+    };
+    if meta.file_type().is_symlink() {
+        return true;
+    }
+    #[cfg(windows)]
+    {
+        const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x400;
+        if meta.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+            return true;
+        }
+    }
+    false
+}
+
+/// Reject overlapping (nested) input roots (#1223 req 2).
+///
+/// All three roots are canonicalized (failure fails closed: an
+/// unresolvable root cannot be bound to one identity). Exact equality is the
+/// documented single-root projection — the CLI defaults `normative_root` to
+/// `runtime_root`, and fixtures verify with all roots equal — so equality is
+/// allowed. Strict nesting (one root containing another under a distinct
+/// role) is rejected fail-closed: distinct roles must not alias one another.
+fn validate_input_roots(opts: &CompileOptions) -> Result<(), CompilerError> {
+    let runtime =
+        opts.runtime_root
+            .canonicalize()
+            .map_err(|_| CompilerError::RootOverlapRejected {
+                detail: "runtime root is not canonicalizable",
+            })?;
+    let normative =
+        opts.normative_root
+            .canonicalize()
+            .map_err(|_| CompilerError::RootOverlapRejected {
+                detail: "normative root is not canonicalizable",
+            })?;
+    let repository =
+        opts.repository
+            .canonicalize()
+            .map_err(|_| CompilerError::RootOverlapRejected {
+                detail: "repository root is not canonicalizable",
+            })?;
+    for (pair, first, second) in [
+        ("runtime/normative", &runtime, &normative),
+        ("runtime/repository", &runtime, &repository),
+        ("normative/repository", &normative, &repository),
+    ] {
+        if first != second && (first.starts_with(second) || second.starts_with(first)) {
+            return Err(CompilerError::RootOverlapRejected { detail: pair });
+        }
+    }
+    Ok(())
+}
 const GLOBAL_COMPOSITION_PROFILES: [&str; 5] = [
     "CONTROL_BOOTABLE",
     "SPINE_FUNCTIONAL",
@@ -128,9 +529,18 @@ fn canonical_bytes(v: &Value) -> Result<Vec<u8>> {
 }
 
 fn read_json(path: &Path) -> Result<(Value, Vec<u8>)> {
+    // Bound before allocation: reject by on-disk size first, then re-check
+    // the bytes actually read (TOCTOU growth), then cap JSON structure
+    // before the value is used downstream.
+    let on_disk = fs::metadata(path)
+        .with_context(|| format!("metadata {}", path.display()))?
+        .len();
+    check_file_size(path, on_disk)?;
     let bytes = fs::read(path).with_context(|| format!("read {}", path.display()))?;
+    check_file_size(path, bytes.len() as u64)?;
     let value: Value =
         serde_json::from_slice(&bytes).with_context(|| format!("parse {}", path.display()))?;
+    check_json_bounds(&value)?;
     Ok((value, bytes))
 }
 
@@ -147,13 +557,29 @@ fn strv<'a>(v: &'a Value, key: &str) -> Result<&'a str> {
         .and_then(Value::as_str)
         .ok_or_else(|| anyhow!("missing string field {key}"))
 }
-fn resolve_payload(runtime: &Path, normative: &Path, name: &str) -> Option<PathBuf> {
-    if matches!(name, "ELIOT_ARCHITECTURE.md" | "ELIOT_IMPLEMENTATION.md") {
-        let p = normative.join(name);
-        return p.is_file().then_some(p);
+/// Resolve a manifest-listed payload without following symlinks.
+///
+/// Symlinks and reparse points fail closed with
+/// [`CompilerError::SymlinkRejected`]; absent non-link paths report `None`
+/// (the caller records a missing-member FAIL). The metadata query never
+/// follows the final component.
+fn resolve_payload(
+    runtime: &Path,
+    normative: &Path,
+    name: &str,
+) -> Result<Option<PathBuf>, CompilerError> {
+    let base = if matches!(name, "ELIOT_ARCHITECTURE.md" | "ELIOT_IMPLEMENTATION.md") {
+        normative
+    } else {
+        runtime
+    };
+    let candidate = base.join(name);
+    if is_symlink_or_reparse(&candidate) {
+        return Err(CompilerError::SymlinkRejected {
+            path: candidate.display().to_string(),
+        });
     }
-    let p = runtime.join(name);
-    p.is_file().then_some(p)
+    Ok(candidate.is_file().then_some(candidate))
 }
 
 fn graph_analysis(
@@ -3336,26 +3762,91 @@ fn collect_manifests(directory: &Path, repository: &Path, manifests: &mut Vec<St
     }
 }
 
-fn run_command(repository: &Path, program: &str, args: &[&str]) -> Result<String> {
-    let output = Command::new(program)
-        .args(args)
+/// Read one captured output stream with a pre-allocation cap.
+///
+/// At most `MAX_PROCESS_OUTPUT_BYTES + 1` bytes are ever buffered; anything
+/// beyond the cap fails closed before UTF-8 conversion or JSON parsing.
+fn read_capped<R: Read>(stream: R, program: &'static str) -> Result<Vec<u8>> {
+    let mut buf = Vec::new();
+    stream
+        .take(bounds::MAX_PROCESS_OUTPUT_BYTES as u64 + 1)
+        .read_to_end(&mut buf)
+        .with_context(|| format!("read {program} output"))?;
+    if buf.len() > bounds::MAX_PROCESS_OUTPUT_BYTES {
+        return Err(CompilerError::ProcessOutputTooLarge {
+            program,
+            bytes: buf.len(),
+            max_bytes: bounds::MAX_PROCESS_OUTPUT_BYTES,
+        }
+        .into());
+    }
+    Ok(buf)
+}
+
+/// Run one allowlisted repository tool with output and wall-clock caps.
+///
+/// Fixed read-only boundary (see [`RepositoryTool`]): only the exact
+/// allowlisted program-plus-argument shapes run — no shell, no network, no
+/// credentials. The process is bounded by [`bounds::MAX_PROCESS_TIMEOUT_SECS`]
+/// (killed and failed closed on expiry) and its captured output is capped by
+/// [`bounds::MAX_PROCESS_OUTPUT_BYTES`] before conversion or parsing.
+fn run_command(repository: &Path, tool: RepositoryTool) -> Result<String> {
+    let program = tool.program();
+    let mut child = Command::new(program)
+        .args(tool.args())
         .current_dir(repository)
-        .output()
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
         .with_context(|| format!("spawn {program}"))?;
-    if !output.status.success() {
+    let deadline = Instant::now() + Duration::from_secs(bounds::MAX_PROCESS_TIMEOUT_SECS);
+    let status = loop {
+        if let Some(status) = child
+            .try_wait()
+            .with_context(|| format!("wait {program}"))?
+        {
+            break status;
+        }
+        if Instant::now() >= deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(CompilerError::ProcessTimeout {
+                program,
+                secs: bounds::MAX_PROCESS_TIMEOUT_SECS,
+            }
+            .into());
+        }
+        std::thread::sleep(Duration::from_millis(5));
+    };
+    // The child has exited, so draining the pipes cannot block on output;
+    // each stream is still capped before it is trusted downstream.
+    let stdout = child
+        .stdout
+        .take()
+        .map(|stream| read_capped(stream, program))
+        .transpose()?
+        .unwrap_or_default();
+    let stderr = child
+        .stderr
+        .take()
+        .map(|stream| read_capped(stream, program))
+        .transpose()?
+        .unwrap_or_default();
+    if !status.success() {
         return Err(anyhow!(
             "{program} failed with {}: {}",
-            output.status,
-            String::from_utf8_lossy(&output.stderr).trim()
+            status,
+            String::from_utf8_lossy(&stderr).trim()
         ));
     }
-    String::from_utf8(output.stdout).context("command output is not UTF-8")
+    String::from_utf8(stdout).context("command output is not UTF-8")
 }
 
 fn cargo_metadata_manifests(repository: &Path) -> Result<BTreeMap<PathBuf, String>> {
     let mut manifests = BTreeMap::new();
     let mut ingest = |raw: &str| -> Result<()> {
         let metadata: Value = serde_json::from_str(raw).context("cargo metadata JSON")?;
+        check_json_bounds(&metadata)?;
         for package in arr(&metadata, "packages")? {
             let name = strv(package, "name")?.to_owned();
             let manifest = PathBuf::from(strv(package, "manifest_path")?);
@@ -3373,18 +3864,7 @@ fn cargo_metadata_manifests(repository: &Path) -> Result<BTreeMap<PathBuf, Strin
         }
         Ok(())
     };
-    let raw = run_command(
-        repository,
-        "cargo",
-        &[
-            "metadata",
-            "--no-deps",
-            "--format-version",
-            "1",
-            "--offline",
-            "--locked",
-        ],
-    )?;
+    let raw = run_command(repository, RepositoryTool::CargoMetadata)?;
     ingest(&raw)?;
     Ok(manifests)
 }
@@ -3405,39 +3885,26 @@ fn source_snapshot(repository: &Path, gaps: &[Value]) -> Result<Value> {
         .iter()
         .map(|relative| {
             let path = repository.join(relative);
-            Ok(json!({"path":relative,"sha256":sha256(&fs::read(path)?)}))
+            let bytes = fs::read(&path)?;
+            check_file_size(&path, bytes.len() as u64)?;
+            Ok(json!({"path":relative,"sha256":sha256(&bytes)}))
         })
         .collect::<Result<_>>()?;
-    let head = run_command(repository, "git", &["rev-parse", "HEAD"])?;
-    let dirty = run_command(
-        repository,
-        "git",
-        &["status", "--porcelain=v1", "--untracked-files=all"],
-    )?
-    .replace(char::from(13), "");
-    let diff = run_command(
-        repository,
-        "git",
-        &[
-            "diff",
-            "--binary",
-            "--no-ext-diff",
-            "--full-index",
-            "HEAD",
-            "--",
-        ],
-    )?;
-    let untracked = run_command(
-        repository,
-        "git",
-        &["ls-files", "--others", "--exclude-standard"],
-    )?;
+    let head = run_command(repository, RepositoryTool::GitRevParseHead)?;
+    let dirty =
+        run_command(repository, RepositoryTool::GitStatusPorcelain)?.replace(char::from(13), "");
+    let diff = run_command(repository, RepositoryTool::GitDiffBinaryHead)?;
+    let untracked = run_command(repository, RepositoryTool::GitLsFilesOthers)?;
     let untracked_records: Vec<Value> = untracked
         .lines()
         .filter(|path| !path.is_empty())
         .map(|relative| {
             let path = repository.join(relative);
-            Ok(json!({"path":relative,"size":fs::metadata(&path)?.len(),"sha256":sha256(&fs::read(path)?)}))
+            let size = fs::metadata(&path)?.len();
+            check_file_size(&path, size)?;
+            let bytes = fs::read(&path)?;
+            check_file_size(&path, bytes.len() as u64)?;
+            Ok(json!({"path":relative,"size":size,"sha256":sha256(&bytes)}))
         })
         .collect::<Result<_>>()?;
     let frontier_material = json!({
@@ -3445,19 +3912,9 @@ fn source_snapshot(repository: &Path, gaps: &[Value]) -> Result<Value> {
         "diff_sha256":sha256(diff.as_bytes()),
         "untracked":untracked_records.clone(),
     });
-    let metadata_raw = run_command(
-        repository,
-        "cargo",
-        &[
-            "metadata",
-            "--no-deps",
-            "--format-version",
-            "1",
-            "--offline",
-            "--locked",
-        ],
-    )?;
+    let metadata_raw = run_command(repository, RepositoryTool::CargoMetadata)?;
     let metadata: Value = serde_json::from_str(&metadata_raw).context("cargo metadata JSON")?;
+    check_json_bounds(&metadata)?;
     let metadata_manifests: Vec<Value> = metadata
         .get("packages")
         .and_then(Value::as_array)
@@ -3466,7 +3923,9 @@ fn source_snapshot(repository: &Path, gaps: &[Value]) -> Result<Value> {
         .filter_map(|package| package.get("manifest_path").and_then(Value::as_str))
         .map(|path| {
             let path = PathBuf::from(path);
-            Ok(json!({"path":path.to_string_lossy().replace('\\',"/"),"sha256":sha256(&fs::read(path)?)}))
+            let bytes = fs::read(&path)?;
+            check_file_size(&path, bytes.len() as u64)?;
+            Ok(json!({"path":path.to_string_lossy().replace('\\',"/"),"sha256":sha256(&bytes)}))
         })
         .collect::<Result<_>>()?;
     Ok(json!({
@@ -3511,6 +3970,9 @@ fn path_is_within(path: &Path, root: &Path) -> bool {
 }
 
 fn write_report_atomic(report: &Path, bytes: &[u8], opts: &CompileOptions) -> Result<()> {
+    // Bound before allocation or write: an over-large report fails closed
+    // before any filesystem observation.
+    check_report_size(bytes.len())?;
     if path_is_within(report, &opts.runtime_root)
         || path_is_within(report, &opts.normative_root)
         || path_is_within(report, &opts.repository)
@@ -3578,15 +4040,30 @@ pub fn verify_legacy_d01(opts: &CompileOptions) -> Value {
     let mut payload_root = Value::Null;
     let mut gaps = Vec::new();
     let result: Result<()> = (|| {
+        // Roots bound to one identity: nested input roles fail closed here,
+        // before any payload is trusted (exact equality remains the
+        // documented single-root projection).
+        if let Err(error) = validate_input_roots(opts) {
+            audit.error(
+                "roots.disjoint",
+                "input roots overlap or are unavailable",
+                json!({"error": error.to_string()}),
+            );
+            return Ok(());
+        }
         let expected_pair = load_expected_normative_pair(&mut audit, &opts.repository);
         let manifest_path = opts.runtime_root.join("Eliot_Runtime_BundleManifest.json");
         let (manifest, manifest_bytes) = read_json(&manifest_path).context("bundle manifest")?;
         manifest_sha = Value::String(sha256(&manifest_bytes));
         let listed = arr(&manifest, "payload_files")?;
+        // Bound before allocation: reject an over-long member list and an
+        // over-large summed payload size before further reads.
+        check_payload_count(listed.len())?;
         let mut names = BTreeSet::new();
         let mut missing = Vec::new();
         let mut bad = Vec::new();
         let mut root_rows = Vec::new();
+        let mut total_payload_bytes: u64 = 0;
         for entry in listed {
             let name = strv(entry, "path")?.to_owned();
             if !names.insert(name.clone()) {
@@ -3604,12 +4081,29 @@ pub fn verify_legacy_d01(opts: &CompileOptions) -> Value {
                 );
                 continue;
             }
-            let Some(path) = resolve_payload(&opts.runtime_root, &opts.normative_root, &name)
-            else {
-                missing.push(name.clone());
-                continue;
+            let path = match resolve_payload(&opts.runtime_root, &opts.normative_root, &name) {
+                Ok(Some(path)) => path,
+                Ok(None) => {
+                    missing.push(name.clone());
+                    continue;
+                }
+                Err(error) => {
+                    audit.error(
+                        "payload.symlink_rejected",
+                        "payload resolves through a symlink or reparse point",
+                        json!({"path": name, "error": error.to_string()}),
+                    );
+                    continue;
+                }
             };
+            let on_disk = fs::metadata(&path)
+                .with_context(|| format!("metadata {}", path.display()))?
+                .len();
+            check_file_size(&path, on_disk)?;
             let bytes = fs::read(&path)?;
+            check_file_size(&path, bytes.len() as u64)?;
+            total_payload_bytes = total_payload_bytes.saturating_add(bytes.len() as u64);
+            check_total_payload_bytes(total_payload_bytes)?;
             let actual = sha256(&bytes);
             let size = bytes.len() as u64;
             payload_hashes.insert(name.clone(), Value::String(actual.clone()));
@@ -3661,8 +4155,11 @@ pub fn verify_legacy_d01(opts: &CompileOptions) -> Value {
         let seed_path = opts.runtime_root.join("Eliot_Runtime_BootstrapSeed.json");
         let (seed, _) = read_json(&seed_path).context("bootstrap seed")?;
         let read = |name: &str| -> Result<Value> {
-            let path = resolve_payload(&opts.runtime_root, &opts.normative_root, name)
-                .ok_or_else(|| anyhow!("missing payload {name}"))?;
+            let path = match resolve_payload(&opts.runtime_root, &opts.normative_root, name) {
+                Ok(Some(path)) => path,
+                Ok(None) => return Err(anyhow!("missing payload {name}")),
+                Err(error) => return Err(error.into()),
+            };
             Ok(read_json(&path)?.0)
         };
         let work = read("Eliot_Runtime_WorkGraph.json")?;
@@ -3737,6 +4234,17 @@ pub fn verify_legacy_d01(opts: &CompileOptions) -> Value {
             &read("Eliot_Runtime_DonorEvidenceGraph.json")?,
             &nodes,
         )?;
+        // Fixed normative inputs bypass the manifest list, so they carry
+        // their own symlink/reparse guard before they are read.
+        for fixed in ["ELIOT_ARCHITECTURE.md", "ELIOT_IMPLEMENTATION.md"] {
+            let path = opts.normative_root.join(fixed);
+            if is_symlink_or_reparse(&path) {
+                return Err(CompilerError::SymlinkRejected {
+                    path: path.display().to_string(),
+                }
+                .into());
+            }
+        }
         check_normative_references(
             &mut audit,
             &index,
@@ -4094,7 +4602,10 @@ mod tests {
             "normative book",
         );
         assert_eq!(
-            resolve_payload(&runtime, &normative, "ELIOT_ARCHITECTURE.md"),
+            must(
+                resolve_payload(&runtime, &normative, "ELIOT_ARCHITECTURE.md"),
+                "resolve normative payload"
+            ),
             Some(normative.join("ELIOT_ARCHITECTURE.md"))
         );
         let _ = fs::remove_dir_all(runtime);
@@ -4161,7 +4672,13 @@ mod tests {
             fs::write(normative.join("Eliot_Runtime_WorkGraph.json"), b"shadow"),
             "semantic shadow",
         );
-        assert!(resolve_payload(&runtime, &normative, "Eliot_Runtime_WorkGraph.json").is_none());
+        assert!(
+            must(
+                resolve_payload(&runtime, &normative, "Eliot_Runtime_WorkGraph.json"),
+                "absent semantic payload"
+            )
+            .is_none()
+        );
         let _ = fs::remove_dir_all(runtime);
         let _ = fs::remove_dir_all(normative);
     }
@@ -4885,5 +5402,313 @@ mod tests {
                 .any(|gap| gap["reason"] == "cargo_metadata_manifest_mismatch")
         );
         let _ = fs::remove_dir_all(root);
+    }
+
+    #[cfg(unix)]
+    fn make_symlink(target: &Path, link: &Path) -> bool {
+        std::os::unix::fs::symlink(target, link).is_ok()
+    }
+
+    #[cfg(windows)]
+    fn make_symlink(target: &Path, link: &Path) -> bool {
+        std::os::windows::fs::symlink_file(target, link).is_ok()
+    }
+
+    #[test]
+    fn legacy_d01_version_and_expiry_are_present_and_shaped() {
+        assert!(!legacy_d01::LEGACY_D01_VERSION.is_empty());
+        assert!(
+            legacy_d01::LEGACY_D01_VERSION.contains('.'),
+            "tool version is dotted"
+        );
+        assert!(
+            legacy_d01::LEGACY_D01_EXPIRY.contains("zero-reference"),
+            "expiry states the removal condition"
+        );
+        assert!(
+            legacy_d01::LEGACY_D01_REMOVAL_CONDITION.contains("zero-reference"),
+            "removal condition is explicit"
+        );
+    }
+
+    #[test]
+    fn repository_tool_allowlist_rejects_non_allowlisted_programs() {
+        assert_eq!(
+            RepositoryTool::validate(
+                "cargo",
+                &[
+                    "metadata",
+                    "--no-deps",
+                    "--format-version",
+                    "1",
+                    "--offline",
+                    "--locked"
+                ]
+            ),
+            Ok(RepositoryTool::CargoMetadata)
+        );
+        assert_eq!(
+            RepositoryTool::validate("git", &["rev-parse", "HEAD"]),
+            Ok(RepositoryTool::GitRevParseHead)
+        );
+        assert_eq!(
+            RepositoryTool::validate(
+                "git",
+                &["status", "--porcelain=v1", "--untracked-files=all"]
+            ),
+            Ok(RepositoryTool::GitStatusPorcelain)
+        );
+        assert_eq!(
+            RepositoryTool::validate(
+                "git",
+                &[
+                    "diff",
+                    "--binary",
+                    "--no-ext-diff",
+                    "--full-index",
+                    "HEAD",
+                    "--"
+                ]
+            ),
+            Ok(RepositoryTool::GitDiffBinaryHead)
+        );
+        assert_eq!(
+            RepositoryTool::validate("git", &["ls-files", "--others", "--exclude-standard"]),
+            Ok(RepositoryTool::GitLsFilesOthers)
+        );
+        // Anything outside the list fails closed, including the right
+        // program with the wrong arguments.
+        let rejected: [(&str, &[&str]); 7] = [
+            ("rm", &["-rf", "/"]),
+            ("curl", &["https://example.com"]),
+            ("ssh", &["host"]),
+            ("cargo", &["build"]),
+            ("cargo", &["metadata"]),
+            ("git", &["push"]),
+            ("git", &["status"]),
+        ];
+        for (program, args) in rejected {
+            assert!(
+                RepositoryTool::validate(program, args).is_err(),
+                "non-allowlisted tool must be rejected: {program}"
+            );
+        }
+    }
+
+    #[test]
+    fn oversized_input_file_is_rejected_before_read() {
+        let dir = temp_dir("oversized-input");
+        let small = dir.join("small.json");
+        must(fs::write(&small, b"{\"ok\":true}"), "small fixture");
+        assert!(read_json(&small).is_ok(), "bounded input still reads");
+        let big = dir.join("big.json");
+        let over_file = must(
+            usize::try_from(bounds::MAX_INPUT_FILE_BYTES),
+            "file cap fits pointer",
+        ) + 1;
+        must(fs::write(&big, vec![b'x'; over_file]), "oversized fixture");
+        match read_json(&big) {
+            Err(error) => assert!(
+                matches!(
+                    error.downcast_ref::<CompilerError>(),
+                    Some(CompilerError::InputTooLarge { .. })
+                ),
+                "oversized input fails with the typed bound error: {error:?}"
+            ),
+            Ok(_) => panic!("oversized input must fail closed"),
+        }
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn json_structural_caps_reject_over_deep_over_long_over_wide() {
+        // Over-deep through the real read path: depth 81 exceeds the cap of
+        // 64 while staying below serde's own recursion limit, so the typed
+        // verifier error (not the parser limit) fires.
+        let dir = temp_dir("deep-json");
+        let mut deep = json!(null);
+        for _ in 0..80 {
+            deep = json!([deep]);
+        }
+        assert!(check_json_bounds(&deep).is_err());
+        let deep_path = dir.join("deep.json");
+        must(
+            fs::write(
+                &deep_path,
+                must(serde_json::to_vec(&deep), "serialize deep"),
+            ),
+            "deep fixture",
+        );
+        match read_json(&deep_path) {
+            Err(error) => assert!(
+                matches!(
+                    error.downcast_ref::<CompilerError>(),
+                    Some(CompilerError::JsonTooDeep { .. })
+                ),
+                "over-deep JSON fails with the typed bound error: {error:?}"
+            ),
+            Ok(_) => panic!("over-deep JSON must fail closed"),
+        }
+        let _ = fs::remove_dir_all(dir);
+        // Shallow control passes.
+        assert!(check_json_bounds(&json!({"a": [1, 2, {"b": "c"}]})).is_ok());
+        // Over-long string.
+        let long = "x".repeat(bounds::MAX_JSON_STRING_LEN + 1);
+        assert!(matches!(
+            check_json_bounds(&json!({"s": long})),
+            Err(CompilerError::JsonStringTooLong { .. })
+        ));
+        // Over-wide containers.
+        let over_wide = must(
+            usize::try_from(bounds::MAX_JSON_CONTAINERS),
+            "container cap fits pointer",
+        ) + 1;
+        let wide = Value::Array(vec![Value::Array(Vec::new()); over_wide]);
+        assert!(matches!(
+            check_json_bounds(&wide),
+            Err(CompilerError::BoundExceeded { .. })
+        ));
+    }
+
+    #[test]
+    fn symlink_payload_is_rejected_without_following() {
+        let runtime = temp_dir("symlink-runtime");
+        let normative = temp_dir("symlink-normative");
+        let target = runtime.join("real.json");
+        must(fs::write(&target, b"{\"ok\":true}"), "payload target");
+        assert!(!is_symlink_or_reparse(&target));
+        assert!(matches!(
+            resolve_payload(&runtime, &normative, "real.json"),
+            Ok(Some(_))
+        ));
+        let link = runtime.join("linked.json");
+        if make_symlink(&target, &link) {
+            assert!(is_symlink_or_reparse(&link));
+            assert!(matches!(
+                resolve_payload(&runtime, &normative, "linked.json"),
+                Err(CompilerError::SymlinkRejected { .. })
+            ));
+            // Whole path: a symlinked manifest member fails the verification
+            // with the symlink rejection (previously the link was followed).
+            let manifest = json!({
+                "payload_files": [{"path": "linked.json", "sha256": "00", "size": 1}],
+                "payload_root_sha256": "00"
+            });
+            must(
+                fs::write(
+                    runtime.join("Eliot_Runtime_BundleManifest.json"),
+                    must(serde_json::to_vec(&manifest), "serialize manifest"),
+                ),
+                "write manifest",
+            );
+            let receipt = verify_legacy_d01(&CompileOptions {
+                runtime_root: runtime.clone(),
+                normative_root: normative.clone(),
+                repository: runtime.clone(),
+                report: None,
+            });
+            assert_eq!(receipt["verdict"], "FAIL");
+            assert!(receipt["errors"].as_array().is_some_and(|errors| {
+                errors
+                    .iter()
+                    .any(|error| error["check_id"] == "payload.symlink_rejected")
+            }));
+        } else {
+            // Symlink creation needs privilege on some platforms: the
+            // metadata branch still proves absent paths are Ok(None), never Err.
+            assert!(matches!(
+                resolve_payload(&runtime, &normative, "missing.json"),
+                Ok(None)
+            ));
+        }
+        let _ = fs::remove_dir_all(runtime);
+        let _ = fs::remove_dir_all(normative);
+    }
+
+    #[test]
+    fn overlapping_input_roots_are_rejected() {
+        let outer = temp_dir("overlap-outer");
+        let inner = outer.join("inner");
+        must(fs::create_dir_all(&inner), "nested root");
+        let repository = temp_dir("overlap-repository");
+        let nested = CompileOptions {
+            runtime_root: inner.clone(),
+            normative_root: outer.clone(),
+            repository: repository.clone(),
+            report: None,
+        };
+        assert!(validate_input_roots(&nested).is_err());
+        // Whole path: nested roots fail the verification with the disjoint error.
+        let receipt = verify_legacy_d01(&nested);
+        assert_eq!(receipt["verdict"], "FAIL");
+        assert!(receipt["errors"].as_array().is_some_and(|errors| {
+            errors
+                .iter()
+                .any(|error| error["check_id"] == "roots.disjoint")
+        }));
+        // Disjoint roots pass validation.
+        let dir_a = temp_dir("overlap-a");
+        let dir_b = temp_dir("overlap-b");
+        let dir_c = temp_dir("overlap-c");
+        let disjoint = CompileOptions {
+            runtime_root: dir_a.clone(),
+            normative_root: dir_b.clone(),
+            repository: dir_c.clone(),
+            report: None,
+        };
+        assert!(validate_input_roots(&disjoint).is_ok());
+        // Exact equality is the documented single-root projection (the CLI
+        // defaults normative_root to runtime_root).
+        let single = CompileOptions {
+            runtime_root: outer.clone(),
+            normative_root: outer.clone(),
+            repository: outer.clone(),
+            report: None,
+        };
+        assert!(validate_input_roots(&single).is_ok());
+        let _ = fs::remove_dir_all(outer);
+        let _ = fs::remove_dir_all(repository);
+        let _ = fs::remove_dir_all(dir_a);
+        let _ = fs::remove_dir_all(dir_b);
+        let _ = fs::remove_dir_all(dir_c);
+    }
+
+    #[test]
+    fn oversized_report_is_rejected_before_write() {
+        let runtime = temp_dir("report-runtime");
+        let normative = temp_dir("report-normative");
+        let repository = temp_dir("report-repository");
+        let report_dir = temp_dir("report-output");
+        let report = report_dir.join("receipt.json");
+        let opts = CompileOptions {
+            runtime_root: runtime.clone(),
+            normative_root: normative.clone(),
+            repository: repository.clone(),
+            report: None,
+        };
+        let big = vec![0u8; bounds::MAX_REPORT_BYTES + 1];
+        assert!(write_report_atomic(&report, &big, &opts).is_err());
+        assert!(!report.exists(), "rejected report must not be created");
+        drop(big);
+        assert!(write_report_atomic(&report, b"{}", &opts).is_ok());
+        assert_eq!(must(fs::read(&report), "read report"), b"{}");
+        let _ = fs::remove_dir_all(runtime);
+        let _ = fs::remove_dir_all(normative);
+        let _ = fs::remove_dir_all(repository);
+        let _ = fs::remove_dir_all(report_dir);
+    }
+
+    #[test]
+    fn payload_count_and_total_bytes_caps_fail_closed() {
+        assert!(check_payload_count(bounds::MAX_PAYLOAD_COUNT).is_ok());
+        assert!(matches!(
+            check_payload_count(bounds::MAX_PAYLOAD_COUNT + 1),
+            Err(CompilerError::BoundExceeded { .. })
+        ));
+        assert!(check_total_payload_bytes(bounds::MAX_TOTAL_PAYLOAD_BYTES).is_ok());
+        assert!(matches!(
+            check_total_payload_bytes(bounds::MAX_TOTAL_PAYLOAD_BYTES + 1),
+            Err(CompilerError::BoundExceeded { .. })
+        ));
     }
 }
