@@ -11,7 +11,7 @@ harness_issue = 907
 containment_issue = 850
 parent_product_issue = 11
 base_branch = "main"
-base_sha = "8ebf8b41847391c340393d56aeb14dd4f2b5e37b"
+base_sha = "ceb66c5ca03f643658955f83fda96a5614c985da"
 normative_pair_ref = "docs/normative-pair.toml"
 
 [work_unit]
