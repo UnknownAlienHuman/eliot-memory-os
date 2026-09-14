@@ -1,12 +1,23 @@
 use std::collections::BTreeSet;
+use std::num::NonZeroU64;
 
-use eliot_contracts::{ArtifactId, AuthorityEpoch, ResourceGeneration, StateFence};
+use eliot_contracts::{ArtifactId, EpochId, EpochLineageId, ResourceGeneration, StateFence};
 use eliot_cues::{
     CueError, CueKey, CueKind, CueRecord, CueSnapshot, CueStrength, Freshness, InvalidationCause,
 };
 use eliot_evidence::LifecycleState;
 
 type TestResult = Result<(), Box<dyn std::error::Error>>;
+
+const TEST_LINEAGE_A: &str = "550e8400-e29b-41d4-a716-446655440000";
+
+fn test_epoch(sequence: u64) -> EpochId {
+    EpochId::new(
+        EpochLineageId::new(TEST_LINEAGE_A).expect("valid test lineage"),
+        NonZeroU64::new(sequence).expect("nonzero test sequence"),
+    )
+    .expect("valid test epoch")
+}
 
 fn record(target: &str) -> Result<CueRecord, Box<dyn std::error::Error>> {
     let key = CueKey::new("test", CueKind::Concept, "usable cue")?;
@@ -23,7 +34,7 @@ fn record(target: &str) -> Result<CueRecord, Box<dyn std::error::Error>> {
 fn snapshot(record: CueRecord) -> CueSnapshot {
     CueSnapshot {
         revision: 1,
-        fence: StateFence::new(AuthorityEpoch::genesis(), ResourceGeneration::genesis()),
+        fence: StateFence::new(test_epoch(1), ResourceGeneration::genesis()),
         records: vec![record],
         edges: Vec::new(),
     }

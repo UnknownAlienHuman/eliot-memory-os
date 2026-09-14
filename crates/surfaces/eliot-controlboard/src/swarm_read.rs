@@ -211,11 +211,22 @@ mod tests {
     use eliot_agent_coordinator::{
         ModelQueryReceipt, SwarmCatalogueProjection, SwarmProjectionGap, SwarmProjectionProvider,
     };
-    use eliot_contracts::{AuthorityEpoch, ResourceGeneration};
+    use eliot_contracts::{EpochId, EpochLineageId, ResourceGeneration};
+    use std::num::NonZeroU64;
 
     use super::*;
 
     use crate::{AccessResolverPort, PLAN_GAP};
+
+    const TEST_LINEAGE_A: &str = "550e8400-e29b-41d4-a716-446655440000";
+
+    fn test_epoch(sequence: u64) -> EpochId {
+        EpochId::new(
+            EpochLineageId::new(TEST_LINEAGE_A).expect("valid test lineage"),
+            NonZeroU64::new(sequence).expect("nonzero test sequence"),
+        )
+        .expect("valid test epoch")
+    }
 
     #[derive(Clone)]
     struct FakeAccess {
@@ -249,7 +260,7 @@ mod tests {
 
     fn fence() -> StateFence {
         StateFence::new(
-            AuthorityEpoch::new(3).expect("epoch"),
+            test_epoch(3),
             ResourceGeneration::new(7).expect("generation"),
         )
     }
@@ -416,7 +427,7 @@ mod tests {
         let mut stale = envelope(Visibility::Public, PrivacyClass::Public);
         stale.revision = ViewRevision::new(8).expect("revision");
         stale.fence = StateFence::new(
-            AuthorityEpoch::new(3).expect("epoch"),
+            test_epoch(3),
             ResourceGeneration::new(8).expect("generation"),
         );
         stale.source_digest = swarm_projection_source_digest(&stale).expect("digest");

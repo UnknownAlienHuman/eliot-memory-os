@@ -645,13 +645,24 @@ impl fmt::Display for RuleRef {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use eliot_contracts::{AuthorityEpoch, ContractVersion, ProductId, ResourceGeneration};
+    use eliot_contracts::{ContractVersion, EpochId, EpochLineageId, ProductId, ResourceGeneration};
     use eliot_receipts::WorkScopeId;
+    use std::num::NonZeroU64;
 
     type TestResult<T = ()> = Result<T, Box<dyn std::error::Error>>;
 
+    const TEST_LINEAGE_A: &str = "550e8400-e29b-41d4-a716-446655440000";
+
+    fn test_epoch(sequence: u64) -> EpochId {
+        EpochId::new(
+            EpochLineageId::new(TEST_LINEAGE_A).expect("valid test lineage"),
+            NonZeroU64::new(sequence).expect("nonzero test sequence"),
+        )
+        .expect("valid test epoch")
+    }
+
     fn fence() -> StateFence {
-        StateFence::new(AuthorityEpoch::genesis(), ResourceGeneration::genesis())
+        StateFence::new(test_epoch(1), ResourceGeneration::genesis())
     }
 
     fn reference(id: &str) -> TestResult<PublicReference> {

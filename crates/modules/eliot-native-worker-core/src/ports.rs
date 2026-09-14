@@ -611,7 +611,7 @@ impl CapabilityLivenessRequest {
             admission_revision: grant.admission_revision().to_owned(),
             revocation_revision: grant.revocation_revision(),
             lease: grant.authority().lease.clone(),
-            authority_epoch: grant.authority().epoch,
+            authority_epoch: grant.authority().epoch.clone(),
             state_fence: grant.authority().state_fence.clone(),
         }
     }
@@ -669,7 +669,7 @@ impl EffectAdmissionRequest {
             admission_revision: grant.admission_revision.clone(),
             revocation_revision: grant.revocation_revision,
             lease: grant.authority.lease.clone(),
-            authority_epoch: grant.authority.epoch,
+            authority_epoch: grant.authority.epoch.clone(),
             state_fence: grant.authority.state_fence.clone(),
         }
     }
@@ -863,7 +863,7 @@ impl DurableCheckpointRequest {
             request_id,
             stream_id: grant.stream_id().to_owned(),
             producer_generation: grant.worker_generation(),
-            authority_epoch: grant.authority().epoch,
+            authority_epoch: grant.authority().epoch.clone(),
             state_fence: grant.authority().state_fence.clone(),
             admission_revision: grant.admission_revision().to_owned(),
             operation_id: process.operation_id().clone(),

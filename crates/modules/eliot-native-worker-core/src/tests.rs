@@ -289,7 +289,7 @@ impl CapabilityAdmissionPort for FakeAdmission {
             } else {
                 request.lease().clone()
             },
-            *request.authority_epoch(),
+            request.authority_epoch().clone(),
             if state.stale_fence {
                 StateFence::new(
                     test_epoch(1),
@@ -332,7 +332,7 @@ impl CapabilityAdmissionPort for FakeAdmission {
             EffectAdmissionFacts::new(
                 AuthorizedEffect {
                     proposal: request.proposal().clone(),
-                    authority_epoch: *request.authority_epoch(),
+                    authority_epoch: request.authority_epoch().clone(),
                     authorization_ref: "effect-authorization-1".to_owned(),
                     authorized_at: "provider-observed".to_owned(),
                     expires_at: "provider-expiry".to_owned(),
@@ -500,7 +500,7 @@ impl DurableCheckpointPort for FakeReplay {
                 request.request_id(),
                 request.stream_id(),
                 request.producer_generation(),
-                *request.authority_epoch(),
+                request.authority_epoch().clone(),
                 request.state_fence().clone(),
                 request.admission_revision(),
                 request.operation_id().clone(),
@@ -663,7 +663,7 @@ fn validated_process_state(request: ProcessRequest) -> Result<ProcessState, Proc
         "monotonic_ns": 1
     }))
     .expect("clock observation");
-    let context = DispatchValidationContext::new(clock, fence, 1, revisions(), 41)?;
+    let context = DispatchValidationContext::new(clock, fence, test_epoch(1), revisions(), 41)?;
     let validated = authority.validate_and_consume(request, observed, &context)?;
     let mut state = ProcessState::from_validated(&validated);
     state.mark_resumed(
