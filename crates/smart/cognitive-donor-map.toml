@@ -1,6 +1,6 @@
 schema_version = 3
 map_id = "cognitive-donor-map-2026-08-28-rev6"
-current_main_commit = "7a1a6eaa8d4e908afe89f0668922afed27a4cd22"
+current_main_commit = "29715ec120863e1b0148846fc4ed6e1d1d1a195f"
 superseded_prototype_branch_commit = "b35e4a489d45d81f172ef7d5b44bea165438cb1c"
 rule = "Reuse requires one current causal owner, current documentation fit, a pure or reconstructible boundary, exact donor anchors, an independent proof path and an explicit rejected-overgeneralization."
 source_status = "STATIC_REVIEW_ONLY"
@@ -21,10 +21,11 @@ rejected_overgeneralization = "Nested compilation, mixed ownership and a facade 
 
 [[donor]]
 path = "crates/smart/eliot-understanding"
-disposition = "MERGE_RENDERING_INTO_CONTEXT_ASSEMBLY_THEN_RETIRE"
+disposition = "RETIRED_DUPLICATE_UNDERSTANDING_FACADE"
 targets = ["eliot-context-assembly"]
-rationale = "Retain role-preserving sections, omission manifest and expansion handles; remove the second ContextCompiler invocation and duplicate understanding owner."
+rationale = "Extraction outcome idea-only: role-preserving sections, omission manifest and expansion-handle ideas inform Context assembly rendering; second ContextCompiler invocation and duplicate understanding owner rejected, nothing copied. Zero-consumer proof at base 29715ec1 (no external Cargo dependents, no eliot_understanding:: import, Cargo.lock own-entry only). Package source, root member and lock entry removed in work/251-retire-understanding-facade atop base 29715ec1 (Implements #251, Supersedes #1197)."
 rejected_overgeneralization = "Independent mutable Understanding State or a second admission pass."
+extraction_proof = "Context assembly rendering via crates/smart/eliot-context-assembly (no second compilation; retirement Implements #251, Supersedes #1197)"
 
 [[donor]]
 path = "crates/smart/eliot-cues"

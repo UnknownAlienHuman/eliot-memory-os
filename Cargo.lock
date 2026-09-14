@@ -2241,19 +2241,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "eliot-understanding"
-version = "0.1.0"
-dependencies = [
- "blake3",
- "eliot-context",
- "eliot-contracts",
- "eliot-evidence",
- "schemars",
- "serde",
- "thiserror",
-]
-
-[[package]]
 name = "eliot-user-broker"
 version = "0.1.0"
 dependencies = [
