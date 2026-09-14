@@ -922,6 +922,7 @@ impl WorkScopeBindingOwner {
 
 #[cfg(test)]
 mod tests {
+    #![allow(clippy::expect_used)] // test-only panic-acceptable (#838).
     use super::*;
     use eliot_contracts::{EpochId, EpochLineageId, ResourceGeneration};
     use serde::de::DeserializeOwned;
