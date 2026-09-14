@@ -11,6 +11,7 @@ mod core;
 mod model;
 mod model_control;
 mod model_registry;
+mod provider_account_catalogue;
 mod swarm_controlboard;
 #[cfg(test)]
 mod tests;
@@ -23,7 +24,14 @@ pub use crate::model_registry::{
     MODEL_REGISTRY_SCHEMA_VERSION, MODEL_SEARCH_SCHEMA_VERSION, ModelRegistryError,
     ModelRegistrySnapshot, ModelSearchResult, RankingDimension, RankingDisposition, RankingPolicy,
     RankingPolicyInput, RegistryEvidence, RegistryRoute, RouteExplanation, RouteRequirements,
-    find_models,
+    find_models, find_models_with_provider_accounts,
+};
+pub use crate::provider_account_catalogue::{
+    AuthDisposition, AuthObservation, ConcurrencyDisposition, ConcurrencyObservation,
+    IncidentDisposition, IncidentObservation, PROVIDER_ACCOUNT_CATALOGUE_SCHEMA_VERSION,
+    ProviderAccountCatalogueError, ProviderAccountCatalogueSnapshot, ProviderAccountCommand,
+    ProviderAccountReadiness, ProviderAccountRow, RateLimitDisposition, RateLimitObservation,
+    ReplayDisposition, build_snapshot,
 };
 pub use crate::swarm_controlboard::*;
 

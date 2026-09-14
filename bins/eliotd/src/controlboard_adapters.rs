@@ -12,10 +12,15 @@
 //!   [`resolve`](eliot_controlboard::AccessResolverPort::resolve) validates
 //!   the request shape and snapshot pins, then fails closed with a typed
 //!   provider gap instead of inventing rights.
-//! - The Swarm projection providers (catalogue, preferences) are not admitted
-//!   to the Governor composition, so the Swarm read fails closed with a typed
-//!   gap after the same currency checks. The zero-model gate stays intact in
-//!   `eliot-controlboard`; nothing here populates live execution.
+//! - The Swarm projection providers (catalogue, preferences) are admitted to
+//!   the Governor snapshot port as explicit owner-issued bindings
+//!   ([`GovernorSwarmProjection::with_admitted_providers`]). Admission records
+//!   which providers the composition trusts; it does not fabricate their
+//!   bytes. The Governor snapshot carries no catalogue/preference owner
+//!   state, so an admitted-but-unresolvable read still fails closed with a
+//!   typed gap (`Unknown`, distinct from the unadmitted `Unavailable`). The
+//!   zero-model gate stays intact in `eliot-controlboard`; nothing here
+//!   populates live execution.
 //! - Operator submission admits one exact-view intent against the live
 //!   snapshot fence and returns a candidate-only receipt. Acceptance is
 //!   transport acknowledgement, never task completion or a canonical write:
@@ -33,7 +38,7 @@
 
 #![forbid(unsafe_code)]
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
 
 use eliot_contracts::SessionId;
@@ -269,16 +274,134 @@ impl OperatorCommandPort for GovernorOperatorCommand {
 
 /// Governor-backed Swarm projection reader.
 ///
-/// Applies the same currency check as the canonical reader, then reports the
-/// genuinely absent Swarm projection providers as a typed gap. The zero-model
-/// profile is preserved by refusing to populate it, not by synthesizing one.
+/// The port admits the catalogue and preference Swarm providers as explicit
+/// owner-issued bindings (see [`GovernorSwarmProjection::with_admitted_providers`]).
+/// Admission never invents projection bytes: the Governor snapshot carries no
+/// catalogue/preference owner state, so a fully admitted read whose bytes are
+/// not resolvable from the snapshot fails closed with a typed `Unknown` gap,
+/// while a read with a missing provider fails as `Unavailable`. Both stay
+/// typed gaps at the board (`UnknownOutcome` vs `PlanGap`); the zero-model
+/// profile is preserved because this port populates no execution state either
+/// way.
+#[derive(Clone, Debug, Eq, PartialEq)]
 struct GovernorSwarmProjection {
     snapshot: Arc<ControlBoardGovernorSnapshot>,
+    admitted: BTreeMap<SwarmProviderSlot, AdmittedSwarmProvider>,
+}
+
+/// One Swarm provider slot the Governor snapshot port can admit. Only the
+/// catalogue and preference providers have a Swarm projection contract; any
+/// other provider remains a typed gap by construction.
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+pub(crate) enum SwarmProviderSlot {
+    Catalogue,
+    Preferences,
+}
+
+/// Opaque owner-issued binding for one admitted Swarm provider. References
+/// only: binding identity, binding digest, and receipt reference as strings.
+/// No credential, secret, token, cookie, or payload bytes ever appear here.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct AdmittedSwarmProvider {
+    slot: SwarmProviderSlot,
+    binding_id: String,
+    binding_digest: String,
+    receipt_ref: String,
+}
+
+// RECHECK-265: composition admission seam wired once live catalogue bytes exist.
+#[allow(dead_code)]
+fn valid_binding_text(value: &str) -> bool {
+    !value.trim().is_empty() && !value.chars().any(char::is_control)
+}
+
+// RECHECK-265: composition admission seam wired once live catalogue bytes exist.
+#[allow(dead_code)]
+fn valid_binding_digest(value: &str) -> bool {
+    value.len() == 64
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+}
+
+// RECHECK-265: composition admission seam wired once live catalogue bytes exist.
+#[allow(dead_code)]
+impl AdmittedSwarmProvider {
+    pub(crate) fn new(
+        slot: SwarmProviderSlot,
+        binding_id: impl Into<String>,
+        binding_digest: impl Into<String>,
+        receipt_ref: impl Into<String>,
+    ) -> Result<Self, PortError> {
+        let binding = Self {
+            slot,
+            binding_id: binding_id.into(),
+            binding_digest: binding_digest.into(),
+            receipt_ref: receipt_ref.into(),
+        };
+        binding.validate()?;
+        Ok(binding)
+    }
+
+    fn validate(&self) -> Result<Self, PortError> {
+        if !valid_binding_text(&self.binding_id)
+            || !valid_binding_text(&self.receipt_ref)
+            || !valid_binding_digest(&self.binding_digest)
+        {
+            return Err(PortError::Invalid(
+                "swarm provider admission binding is malformed".to_owned(),
+            ));
+        }
+        Ok(self.clone())
+    }
+
+    /// Exact-replay rule for one slot: identical bytes replay, changed bytes
+    /// under the same slot conflict without mutating the stored binding.
+    fn same_binding(&self, other: &Self) -> bool {
+        self.slot == other.slot
+            && self.binding_id == other.binding_id
+            && self.binding_digest == other.binding_digest
+            && self.receipt_ref == other.receipt_ref
+    }
 }
 
 impl GovernorSwarmProjection {
     fn new(snapshot: Arc<ControlBoardGovernorSnapshot>) -> Self {
-        Self { snapshot }
+        Self {
+            snapshot,
+            admitted: BTreeMap::new(),
+        }
+    }
+
+    /// Admits catalogue/preference Swarm providers into the Governor snapshot
+    /// port. Each binding is validated fail-closed; re-admitting an identical
+    /// binding is an idempotent replay, while a changed binding under an
+    /// already-admitted slot is an identity conflict that mutates nothing.
+    // RECHECK-265: composition admission point wired once live catalogue bytes exist.
+    #[allow(dead_code)]
+    pub(crate) fn with_admitted_providers(
+        snapshot: Arc<ControlBoardGovernorSnapshot>,
+        admitted: Vec<AdmittedSwarmProvider>,
+    ) -> Result<Self, PortError> {
+        let mut slots = BTreeMap::new();
+        for binding in admitted {
+            let binding = binding.validate()?;
+            match slots.get(&binding.slot) {
+                None => {
+                    slots.insert(binding.slot, binding);
+                }
+                Some(stored) if stored.same_binding(&binding) => {}
+                Some(_) => return Err(PortError::IdentityConflict),
+            }
+        }
+        Ok(Self {
+            snapshot,
+            admitted: slots,
+        })
+    }
+
+    fn admitted(&self, slot: SwarmProviderSlot) -> bool {
+        self.admitted.contains_key(&slot)
     }
 }
 
@@ -289,7 +412,16 @@ impl SwarmProjectionPort for GovernorSwarmProjection {
         access: &AccessBinding,
     ) -> Result<SwarmProjectionEnvelope, PortError> {
         access_currency(&self.snapshot, access)?;
-        Err(PortError::Unavailable)
+        if !self.admitted(SwarmProviderSlot::Catalogue)
+            || !self.admitted(SwarmProviderSlot::Preferences)
+        {
+            return Err(PortError::Unavailable);
+        }
+        // Both providers are admitted, but the Governor snapshot carries no
+        // catalogue/preference owner bytes to project. Serving invented rows
+        // would be a privacy expansion and a fabricated observation, so the
+        // admitted-but-unresolvable read stays a typed gap instead.
+        Err(PortError::Unknown)
     }
 }
 
@@ -763,6 +895,149 @@ mod tests {
             .expect("replay receipt");
         assert_eq!(replay, first);
         assert_eq!(*calls.lock().expect("call count"), 1);
+    }
+
+    fn admitted_binding(slot: SwarmProviderSlot, name: &str) -> AdmittedSwarmProvider {
+        AdmittedSwarmProvider::new(
+            slot,
+            format!("governor-owner:{name}"),
+            "c".repeat(64),
+            "e".repeat(64),
+        )
+        .expect("valid admission binding")
+    }
+
+    fn admitted_port() -> GovernorSwarmProjection {
+        GovernorSwarmProjection::with_admitted_providers(
+            Arc::new(snapshot()),
+            vec![
+                admitted_binding(SwarmProviderSlot::Catalogue, "catalogue"),
+                admitted_binding(SwarmProviderSlot::Preferences, "preferences"),
+            ],
+        )
+        .expect("admitted port")
+    }
+
+    #[test]
+    fn swarm_provider_admission_validates_replays_and_conflicts() {
+        assert!(matches!(
+            AdmittedSwarmProvider::new(
+                SwarmProviderSlot::Catalogue,
+                "   ",
+                "c".repeat(64),
+                "e".repeat(64)
+            ),
+            Err(PortError::Invalid(_))
+        ));
+        assert!(matches!(
+            AdmittedSwarmProvider::new(
+                SwarmProviderSlot::Preferences,
+                "governor-owner:preferences",
+                "not-a-digest",
+                "e".repeat(64)
+            ),
+            Err(PortError::Invalid(_))
+        ));
+        assert!(matches!(
+            AdmittedSwarmProvider::new(
+                SwarmProviderSlot::Catalogue,
+                "governor-owner:catalogue",
+                "c".repeat(64),
+                "receipt\x07ref"
+            ),
+            Err(PortError::Invalid(_))
+        ));
+
+        // Re-admitting identical bindings is an idempotent replay.
+        let replay = GovernorSwarmProjection::with_admitted_providers(
+            Arc::new(snapshot()),
+            vec![
+                admitted_binding(SwarmProviderSlot::Catalogue, "catalogue"),
+                admitted_binding(SwarmProviderSlot::Preferences, "preferences"),
+            ],
+        )
+        .expect("replay admission");
+        assert_eq!(replay.admitted, admitted_port().admitted);
+
+        // A changed binding under an admitted slot conflicts and stores nothing.
+        assert_eq!(
+            GovernorSwarmProjection::with_admitted_providers(
+                Arc::new(snapshot()),
+                vec![
+                    admitted_binding(SwarmProviderSlot::Catalogue, "catalogue"),
+                    AdmittedSwarmProvider::new(
+                        SwarmProviderSlot::Catalogue,
+                        "governor-owner:catalogue",
+                        "d".repeat(64),
+                        "e".repeat(64),
+                    )
+                    .expect("changed binding validates structurally"),
+                ],
+            ),
+            Err(PortError::IdentityConflict)
+        );
+    }
+
+    #[test]
+    fn admitted_swarm_reads_fail_as_typed_gaps_never_panics() {
+        let access = access_for("session-a", &[]);
+        // No admitted provider: the classic unavailable gap.
+        let mut bare = GovernorSwarmProjection::new(Arc::new(snapshot()));
+        assert_eq!(
+            bare.read(&request_for("session-a"), &access),
+            Err(PortError::Unavailable)
+        );
+        // Partial admission still lacks a required provider.
+        let mut partial = GovernorSwarmProjection::with_admitted_providers(
+            Arc::new(snapshot()),
+            vec![admitted_binding(SwarmProviderSlot::Catalogue, "catalogue")],
+        )
+        .expect("partial admission");
+        assert_eq!(
+            partial.read(&request_for("session-a"), &access),
+            Err(PortError::Unavailable)
+        );
+        // Full admission without resolvable Governor bytes is a distinct
+        // typed gap, not a silent empty view and not a panic.
+        let mut full = admitted_port();
+        assert_eq!(
+            full.read(&request_for("session-a"), &access),
+            Err(PortError::Unknown)
+        );
+        // Currency still enforced before admission state is even consulted.
+        let stale_access = access_at(
+            "session-a",
+            &[],
+            ViewRevision::new(8).expect("revision"),
+            fence(),
+        );
+        assert_eq!(
+            full.read(&request_for("session-a"), &stale_access),
+            Err(PortError::Denied)
+        );
+
+        // Board mapping keeps both gaps typed: unadmitted is a plan gap,
+        // admitted-but-unresolvable is an unknown outcome.
+        let bindings = BTreeMap::from([("session-a".to_owned(), access_for("session-a", &[]))]);
+        let mut gap_board =
+            ControlBoard::new(Some(Box::new(SessionKeyedAccess { bindings })), None, None)
+                .with_swarm_projection(Box::new(GovernorSwarmProjection::new(
+                    Arc::new(snapshot()),
+                )));
+        assert_eq!(
+            gap_board.swarm_view(&request_for("session-a")),
+            Err(ControlBoardError::PlanGap(
+                RequiredProvider::SwarmProjection
+            ))
+        );
+        let bindings = BTreeMap::from([("session-a".to_owned(), access_for("session-a", &[]))]);
+        let mut admitted_board =
+            ControlBoard::new(Some(Box::new(SessionKeyedAccess { bindings })), None, None)
+                .with_swarm_projection(Box::new(admitted_port()));
+        assert_eq!(
+            admitted_board.swarm_view(&request_for("session-a")),
+            Err(ControlBoardError::UnknownOutcome)
+        );
     }
 
     #[test]
