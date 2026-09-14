@@ -1,0 +1,16 @@
+schema_version = "eliot-work-unit-descriptor-v2"
+identity = {value = "work-unit-999"}
+issue = {repository = {owner = "UnknownAlienHuman", name = "eliot-memory-os"}, number = 999}
+unit = {value = "D-WU-FUTURE"}
+mode = "python-unittest"
+source_roots = [{value = "scripts/testdata/work-unit-gate/integration/repos/future-only/not-yet-created.py"}]
+test_roots = [{value = "scripts/testdata/work-unit-gate/integration/repos/future-only/not-yet-created-test.py"}]
+matrix_cases = 1
+proof_ceiling = {value = "package-local"}
+revision = 1
+body_sha256 = "9999999999999999999999999999999999999999999999999999999999999999"
+matrix_sha256 = "8888888888888888888888888888888888888888888888888888888888888888"
+require_workspace_member = false
+module = {value = "integration.future_only.not_yet_created"}
+requirements = {source_floor = 1, public_floor = 0, test_floor = 1, required_guards = [{value = "bounded"}]}
+bounds = {wall_ms = 10000, idle_ms = 5000, output_bytes = 65536, line_bytes = 4096, discovery_tests = 1000, child_processes = 4}
