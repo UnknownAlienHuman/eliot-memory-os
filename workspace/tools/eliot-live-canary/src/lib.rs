@@ -1789,9 +1789,12 @@ fn inspect_exact_scm(
         eliot_platform_windows::ServiceRegistrationRuntimeInspection::Mismatched => {
             Err(format!("{role} SCM registration is substituted"))
         }
-        eliot_platform_windows::ServiceRegistrationRuntimeInspection::Unknown => Err(format!(
-            "{role} SCM registration/runtime readback is Unknown"
-        )),
+        eliot_platform_windows::ServiceRegistrationRuntimeInspection::Unknown { detail } => {
+            Err(format!(
+                "{role} SCM registration/runtime readback is Unknown ({})",
+                detail.detail()
+            ))
+        }
     }
 }
 
