@@ -14,6 +14,22 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
+// Contract boundary: wire types live in `eliot-epistemic-contracts` and are
+// re-exported here so consumers migrate to one vocabulary. The resolver's
+// local algebra (`PositionState`, `EpistemicRecord`, `PositionRequest`,
+// `CurrentEpistemicPosition`, `ProvenanceView`) is policy, not a wire
+// duplicate: local `PositionState` stays six-variant per the algebra below
+// while the contracts `PositionState` is foundation `EpistemicStatus`
+// (eight states); contract `PositionRequest` / `CurrentEpistemicPosition` /
+// `ProvenanceClosure` carry digests, work-scope bindings, and lineage while
+// resolver inputs carry embedded `EvidenceEnvelope`s. Donor `resolve`,
+// `provenance_for`, and `lowest_assertability` remain resolver policy.
+pub use eliot_epistemic_contracts::{
+    AdmittedReceipt, AssumptionRecord, ContractError as EpistemicContractError,
+    CurrentEpistemicPosition as ContractPosition, InvestigationRequirement,
+    PositionRequest as ContractPositionRequest, ProvenanceClosure, SupportRecord,
+};
+
 pub const CONTRACT_NAME: &str = "eliot.smart.epistemic";
 pub const CONTRACT_VERSION: ContractVersion = ContractVersion::new(1, 0, 0);
 
