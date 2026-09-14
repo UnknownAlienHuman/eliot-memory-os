@@ -30,11 +30,13 @@ pub use eliot_testd_core::{
 };
 
 pub mod kernel_client;
+pub mod worker;
 pub use kernel_client::{
     KernelTestdIpcClient, TESTD_ADMISSION_ADVERTISED, TESTD_ADMISSION_OPERATION,
     TESTD_ADMISSION_OPERATION_VERSION, TESTD_DISPATCH_RESIDUAL, advertise_testd_admission,
     route_testd_admission,
 };
+pub use worker::{ADMITTED_WORKER_LEASE_MS, drive_admitted_one_shot};
 
 /// Stable daemon service identity.
 pub const SERVICE_NAME: &str = "eliot-testd";
@@ -348,6 +350,17 @@ impl TestdComposition {
         })
     }
 
+    /// Borrows the durable store backing this composition.
+    ///
+    /// The admitted one-shot worker claims and finishes through this exact
+    /// handle so the lease, start, and finish views never diverge across
+    /// handles. The borrow exposes no mutation beyond the store's own
+    /// fenced transitions and weakens no check.
+    #[must_use]
+    pub fn store(&self) -> &TestdStore {
+        &self.store
+    }
+
     /// Admits one exact typed profile through TestdJob/Fence admission.
     pub fn submit(&self, request: TestdJobRequest) -> Result<TestReceipt, TestdError> {
         request
@@ -478,6 +491,34 @@ pub fn compose_process_executor(
     WindowsProcessExecutor::new(authority)
 }
 
+/// Drives exactly one admitted one-shot claim through the worker.
+///
+/// Thin binary entry used by `main` on the admitted path: durable claim,
+/// fresh bound admission, the single consuming start, observation, raw
+/// capture, and deterministic finish/cancel all live in
+/// [`worker::drive_admitted_one_shot`]. This only binds the composition's own
+/// store handle so claim, finish, and start observe one durable view.
+/// `Succeeded` stays a local status projection and is never canonical.
+pub fn run_admitted_one_shot<E: ProcessExecutor + 'static>(
+    composition: &TestdComposition,
+    presented: kernel_client::PresentedAdmission,
+    executor: &E,
+    owner: &str,
+    lease_ms: u64,
+    now: u64,
+) -> Result<TestReceipt, TestdError> {
+    let store = composition.store();
+    worker::drive_admitted_one_shot(
+        composition,
+        store,
+        presented,
+        executor,
+        owner,
+        lease_ms,
+        now,
+    )
+}
+
 fn receipt(job: &TestJob) -> TestReceipt {
     TestReceipt {
         job_id: job.job_id.clone(),
@@ -515,13 +556,18 @@ pub enum ProtocolError {
     reason = "test fixtures intentionally panic when construction or filesystem setup invariants fail"
 )]
 mod tests {
+    use super::kernel_client::{
+        PresentedAdmission, TESTD_ADMISSION_OPERATION, TESTD_ADMISSION_OPERATION_VERSION,
+        TestdAdmissionRequest, canonical_invocation_digest,
+    };
     use super::*;
     use eliot_contracts::{EpochId, EpochLineageId};
     use eliot_process::{
-        ActionLeaseRef, DispatchAuthorityId, DispatchPermitAuthority, EnvironmentInheritance,
-        EnvironmentProjection, FencingToken, Generation, ImageId, JobId, KernelDispatchKey,
-        OperationId, PermitIssuance, ProcessIntent, ProcessRequest, ProcessTreeId, ResourceLimits,
-        SessionId,
+        ActionLeaseRef, CancellationReceipt, DispatchAuthorityId, DispatchPermitAuthority,
+        EnvironmentInheritance, EnvironmentProjection, FencingToken, Generation, ImageId, JobId,
+        KernelDispatchKey, OperationId, PermitIssuance, ProcessEvidence, ProcessEvidenceSink,
+        ProcessExecutionError, ProcessExecutionView, ProcessExecutor, ProcessIntent,
+        ProcessRequest, ProcessStartReceipt, ProcessTreeId, ResourceLimits, SessionId,
     };
     use std::collections::BTreeMap;
     use std::num::NonZeroU64;
@@ -752,5 +798,187 @@ mod tests {
         artifact.sha256 = sha256_artifact(artifact.length, &artifact.bytes);
         artifact.length = artifact.length.saturating_add(1);
         assert!(artifact.validate().is_err());
+    }
+
+    /// Minimal test-only executor: counts consuming starts and reports the
+    /// executor-owned unknown path, which the worker must reconcile by exact
+    /// identity instead of retrying blind. Inspection, cancellation, and
+    /// reconciliation are unreachable on the covered paths.
+    struct OneShotTestExecutor {
+        starts: Mutex<usize>,
+    }
+
+    impl ProcessExecutor for OneShotTestExecutor {
+        async fn start(
+            &self,
+            _request: ProcessRequest,
+            _sink: Arc<dyn ProcessEvidenceSink>,
+        ) -> Result<ProcessStartReceipt, ProcessExecutionError> {
+            *self.starts.lock().unwrap() += 1;
+            Err(ProcessExecutionError::UnknownOutcome)
+        }
+
+        async fn inspect(
+            &self,
+            _operation_id: OperationId,
+        ) -> Result<ProcessExecutionView, ProcessExecutionError> {
+            Err(ProcessExecutionError::NotFound)
+        }
+
+        async fn cancel(
+            &self,
+            _operation_id: OperationId,
+        ) -> Result<CancellationReceipt, ProcessExecutionError> {
+            Err(ProcessExecutionError::NotFound)
+        }
+
+        async fn reconcile(
+            &self,
+            _operation_id: OperationId,
+        ) -> Result<ProcessEvidence, ProcessExecutionError> {
+            Err(ProcessExecutionError::NotFound)
+        }
+    }
+
+    /// Submitted-job fixture reusing the existing provider/process doubles:
+    /// one durable TEST job admitted through `ExternalKernelProvider` over
+    /// real temporary roots.
+    struct AdmittedDriveFixture {
+        base: PathBuf,
+        composition: TestdComposition,
+        invocation: InstrumentInvocation,
+        source: String,
+        build: String,
+        contour: String,
+    }
+
+    fn admitted_drive_fixture(label: &str) -> AdmittedDriveFixture {
+        let base = test_root(label);
+        let source_dir = base.join("source");
+        let contour_dir = base.join("external");
+        let build_dir = contour_dir.join("build");
+        std::fs::create_dir_all(&source_dir).unwrap();
+        std::fs::create_dir_all(&build_dir).unwrap();
+        // Canonicalize up front: the durable projection persists canonical
+        // roots, the fresh seal compares exact strings, and `start_claimed`
+        // binds the presented process to the durable roots by string
+        // equality, so every party must seal the canonical form.
+        let source = std::fs::canonicalize(&source_dir)
+            .unwrap()
+            .to_string_lossy()
+            .into_owned();
+        let build = std::fs::canonicalize(&build_dir)
+            .unwrap()
+            .to_string_lossy()
+            .into_owned();
+        let contour = std::fs::canonicalize(&contour_dir)
+            .unwrap()
+            .to_string_lossy()
+            .into_owned();
+        let provider = ExternalKernelProvider {
+            process: Mutex::new(Some(external_process_request(&source, &build, &build))),
+            contour_root: contour.clone(),
+        };
+        let composition =
+            TestdComposition::open(base.join("testd-state.redb"), Arc::new(provider)).unwrap();
+        let invocation = external_invocation();
+        composition
+            .submit(TestdJobRequest {
+                job_id: "job-1".to_owned(),
+                project_id: "project-1".to_owned(),
+                invocation: invocation.clone(),
+                target_contract: TargetContract {
+                    target: source.clone(),
+                    build_root: build.clone(),
+                    cache_root: build.clone(),
+                },
+                priority: 0,
+            })
+            .unwrap();
+        AdmittedDriveFixture {
+            base,
+            composition,
+            invocation,
+            source,
+            build,
+            contour,
+        }
+    }
+
+    fn presented_for(fixture: &AdmittedDriveFixture, cancelled: bool) -> PresentedAdmission {
+        let invocation_digest = canonical_invocation_digest(&fixture.invocation).unwrap();
+        let envelope = TestdAdmissionRequest {
+            wire_id: TESTD_ADMISSION_OPERATION.to_owned(),
+            wire_version: TESTD_ADMISSION_OPERATION_VERSION,
+            job_id: "job-1".to_owned(),
+            invocation_id: "operation-1".to_owned(),
+            invocation_digest,
+            authority_epoch: test_epoch(7),
+            generation: 1,
+            request_digest: String::new(),
+        }
+        .with_computed_digest()
+        .unwrap();
+        PresentedAdmission {
+            request: envelope,
+            invocation: fixture.invocation.clone(),
+            process: external_process_request(&fixture.source, &fixture.build, &fixture.build),
+            epoch: test_epoch(7),
+            evidence_ref: "evidence-1".to_owned(),
+            cancelled,
+        }
+    }
+
+    #[test]
+    fn admitted_one_shot_drives_claim_to_reconcile_receipt() {
+        let fixture = admitted_drive_fixture("admitted-drive");
+        let presented = presented_for(&fixture, false);
+        let executor = OneShotTestExecutor {
+            starts: Mutex::new(0),
+        };
+        let receipt = run_admitted_one_shot(
+            &fixture.composition,
+            presented,
+            &executor,
+            SERVICE_NAME,
+            ADMITTED_WORKER_LEASE_MS,
+            unix_ms(),
+        )
+        .unwrap();
+        assert_eq!(receipt.job_id, "job-1");
+        assert_eq!(receipt.state, "RetryWait");
+        // The durable projection retains canonical source roots, while the
+        // allowed contour keeps the provider-sealed string; both are checked
+        // in the exact form the validators persist.
+        let expected_source = std::fs::canonicalize(fixture.base.join("source"))
+            .unwrap()
+            .to_string_lossy()
+            .into_owned();
+        assert_eq!(receipt.source_root, expected_source);
+        assert_eq!(receipt.allowed_contour_root, fixture.contour);
+        assert_eq!(*executor.starts.lock().unwrap(), 1);
+        std::fs::remove_dir_all(fixture.base).unwrap();
+    }
+
+    #[test]
+    fn admitted_cancelled_presentation_projects_cancel_without_start() {
+        let fixture = admitted_drive_fixture("admitted-cancel");
+        let presented = presented_for(&fixture, true);
+        let executor = OneShotTestExecutor {
+            starts: Mutex::new(0),
+        };
+        let receipt = run_admitted_one_shot(
+            &fixture.composition,
+            presented,
+            &executor,
+            SERVICE_NAME,
+            ADMITTED_WORKER_LEASE_MS,
+            unix_ms(),
+        )
+        .unwrap();
+        assert_eq!(receipt.job_id, "job-1");
+        assert_eq!(receipt.state, "Cancelled");
+        assert_eq!(*executor.starts.lock().unwrap(), 0);
+        std::fs::remove_dir_all(fixture.base).unwrap();
     }
 }
