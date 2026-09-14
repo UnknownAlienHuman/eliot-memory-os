@@ -15,9 +15,9 @@ use eliot_context_contracts::{
     SnapshotDenominator, SourceSnapshot,
 };
 use eliot_contracts::{
-    ArtifactId, AuthorityEpoch, ClockReading, ContractId, ContractIdentity, ContractVersion,
-    OperationId, ProductId, RequestId, ResourceGeneration, SessionId, SourceId, StateFence, TaskId,
-    TransactionSequence, canonical_json_bytes,
+    ArtifactId, ClockReading, ContractId, ContractIdentity, ContractVersion, EpochId,
+    EpochLineageId, OperationId, ProductId, RequestId, ResourceGeneration, SessionId, SourceId,
+    StateFence, TaskId, TransactionSequence, canonical_json_bytes,
 };
 use eliot_evidence::{
     Assertability, EpistemicStatus, EvidenceAuthority, EvidenceCoverage, EvidenceEnvelope,
@@ -239,9 +239,17 @@ struct RenderedCanonical<'a> {
     rendered: &'a [eliot_context_contracts::RenderedAtom],
 }
 
+pub fn test_epoch() -> EpochId {
+    EpochId::new(
+        EpochLineageId::new("550e8400-e29b-41d4-a716-446655440000").expect("lineage"),
+        std::num::NonZeroU64::new(1).expect("sequence"),
+    )
+    .expect("epoch")
+}
+
 pub fn fence() -> StateFence {
     StateFence::new(
-        AuthorityEpoch::new(1).expect("fixture epoch"),
+        test_epoch(),
         ResourceGeneration::new(1).expect("fixture generation"),
     )
 }
@@ -740,7 +748,7 @@ fn generic_receipt(
         }),
         session: Some(SessionBinding {
             session_id: payload.recipient.session_id.clone(),
-            authority_epoch: fence.authority_epoch,
+            authority_epoch: fence.authority_epoch.clone(),
             state_fence: fence.clone(),
         }),
         causal: CausalBinding {
@@ -772,7 +780,7 @@ fn generic_receipt(
         authority: AuthorityBinding {
             authority_id: ContractId::new("recipient-authority")?,
             authority_owner: "recipient".to_owned(),
-            authority_epoch: fence.authority_epoch,
+            authority_epoch: fence.authority_epoch.clone(),
             state_fence: fence.clone(),
             allowed_effect: EffectClass::Read,
             proof_ceiling: ProofCeiling::Observation,

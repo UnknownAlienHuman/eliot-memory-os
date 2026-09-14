@@ -5,7 +5,7 @@ use eliot_change_monitor::{
     ResourceSnapshot,
 };
 use eliot_contracts::{
-    AuthorityEpoch, ClockReading, ResourceGeneration, SourceId, StateFence, TaskId,
+    ClockReading, EpochId, EpochLineageId, ResourceGeneration, SourceId, StateFence, TaskId,
 };
 use eliot_cue_binding::{BindingProfile, BindingRule, ColdBinding, ColdReason, ResourceField};
 use eliot_cue_contracts::{
@@ -40,8 +40,16 @@ fn cold_identity_retains_reason_without_admission_claim() {
     assert_eq!(decoded, value);
 }
 
+fn test_epoch() -> EpochId {
+    EpochId::new(
+        EpochLineageId::new("550e8400-e29b-41d4-a716-446655440000").expect("lineage"),
+        std::num::NonZeroU64::new(1).expect("sequence"),
+    )
+    .expect("epoch")
+}
+
 fn fence() -> StateFence {
-    StateFence::new(AuthorityEpoch::genesis(), ResourceGeneration::genesis())
+    StateFence::new(test_epoch(), ResourceGeneration::genesis())
 }
 fn seeded(seed: u8) -> Digest {
     Digest::new(format!("{seed:02x}").repeat(32)).expect("digest")
@@ -213,6 +221,7 @@ fn admitted_rows(
             journal_control_event: false,
             parent_record_id: None,
         },
+        record_v2: None,
         capture_route: CaptureRoute::CanonicalJournal,
         durability: Durability::Durable,
         plan: None,
