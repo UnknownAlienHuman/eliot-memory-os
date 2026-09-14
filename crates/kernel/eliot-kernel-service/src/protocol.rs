@@ -24,6 +24,7 @@ use std::path::Path;
 use crate::{KernelServiceError, KernelServiceState, validate_text};
 
 mod native_worker_claim;
+mod native_worker_replay;
 mod process_authority_handoff;
 pub use native_worker_claim::{
     NATIVE_WORKER_CLAIM_WIRE_ID, NATIVE_WORKER_CLAIM_WIRE_VERSION,
@@ -32,6 +33,18 @@ pub use native_worker_claim::{
     NativeWorkerClaimBudget, NativeWorkerClaimConflict, NativeWorkerClaimReceipt,
     NativeWorkerClaimRejection, NativeWorkerClaimRejectionReason, NativeWorkerClaimRequest,
     NativeWorkerClaimResponse, NativeWorkerExecutableBinding, NativeWorkerExecutableExpectation,
+};
+pub use native_worker_replay::{
+    NATIVE_WORKER_REPLAY_MAX_PAGE, NATIVE_WORKER_REPLAY_WIRE_ID, NATIVE_WORKER_REPLAY_WIRE_VERSION,
+    NativeWorkerReplayAckPhase, NativeWorkerReplayAckReceipt, NativeWorkerReplayAcknowledgeReply,
+    NativeWorkerReplayAcknowledgeRequest, NativeWorkerReplayAppendReply,
+    NativeWorkerReplayAppendRequest, NativeWorkerReplayAuthority, NativeWorkerReplayBeginReply,
+    NativeWorkerReplayBeginRequest, NativeWorkerReplayConflict, NativeWorkerReplayDecision,
+    NativeWorkerReplayEnvelope, NativeWorkerReplayEventDraft, NativeWorkerReplayExpectation,
+    NativeWorkerReplayLookupReply, NativeWorkerReplayLookupRequest, NativeWorkerReplayOperation,
+    NativeWorkerReplayPage, NativeWorkerReplayReplayReply, NativeWorkerReplayReplayRequest,
+    NativeWorkerReplayStreamBinding, NativeWorkerReplayStreamPosition, admit_replay_request,
+    replay_stream_id,
 };
 pub use process_authority_handoff::ProcessAuthorityHandoffDescriptor;
 
