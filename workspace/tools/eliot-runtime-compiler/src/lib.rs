@@ -9,19 +9,45 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-pub const PLAN_ID: &str = "D-01:plan-v2";
-const EXPECTED_MANIFEST_SHA256: &str =
-    "4f53344519857e3237379fc26d6bc839f683271347bdc1d2110aa02798ee1d89";
-const EXPECTED_PAYLOAD_ROOT_SHA256: &str =
-    "32e3f3b3193bc081eba15cdd199aac5dcbdb819bd9848ea2a47ffd7c1075918d";
-const EXPECTED_RUNTIME_SHA256: &str =
-    "8cee5d0fb4fa58bf37730b9a92edf1a1e37d83695c62febfabb4e0450a3814bf";
-const EXPECTED_TEMPLATE_SHA256: &str =
-    "154b63ab7583dcd07dbd5e62ae2781c73b96332ceac1f1dafe6ac5c27b475c74";
-const EXPECTED_WORK_GRAPH_SHA256: &str =
-    "2e82caaf35d95bcf20ff168d6c881ac8626bec26d5393a3a87bb75e9b19cae52";
-const EXPECTED_WORK_GRAPH_ARRAY_SHA256: &str =
-    "2cc172ea0b4d1ab7a884fffedd73e0d44d5ca13c2bfb6aa65b93d3a43bc2d929";
+/// Frozen historical D-01 verification profile.
+///
+/// Every value in this module is a frozen historical D-01 campaign artifact.
+/// These pins are compared by exact equality only (legacy profile equality,
+/// not current trust): they are never current trust roots, never grant
+/// runtime, semantic, canonical-state, or Product authority, and a verifier
+/// PASS alone is not current support evidence. This tool is a read-only
+/// historical D-01 verifier; it admits no artifact into any installation or
+/// runtime. Check-id strings are intentionally left unchanged so existing
+/// logs and receipts remain byte-stable while this module declares the
+/// legacy scope in code.
+pub mod legacy_d01 {
+    /// Legacy scope marker referenced by the verification receipt.
+    pub const PROFILE: &str = "LEGACY_D01";
+    /// Frozen historical plan identity, not a current trust root.
+    pub const LEGACY_D01_PLAN_ID: &str = "D-01:plan-v2";
+    /// Frozen historical D-01 value, not a current trust root.
+    pub const LEGACY_D01_EXPECTED_MANIFEST_SHA256: &str =
+        "4f53344519857e3237379fc26d6bc839f683271347bdc1d2110aa02798ee1d89";
+    /// Frozen historical D-01 value, not a current trust root.
+    pub const LEGACY_D01_EXPECTED_PAYLOAD_ROOT_SHA256: &str =
+        "32e3f3b3193bc081eba15cdd199aac5dcbdb819bd9848ea2a47ffd7c1075918d";
+    /// Frozen historical D-01 value, not a current trust root.
+    pub const LEGACY_D01_EXPECTED_RUNTIME_SHA256: &str =
+        "8cee5d0fb4fa58bf37730b9a92edf1a1e37d83695c62febfabb4e0450a3814bf";
+    /// Frozen historical D-01 value, not a current trust root.
+    pub const LEGACY_D01_EXPECTED_TEMPLATE_SHA256: &str =
+        "154b63ab7583dcd07dbd5e62ae2781c73b96332ceac1f1dafe6ac5c27b475c74";
+    /// Frozen historical D-01 value, not a current trust root.
+    pub const LEGACY_D01_EXPECTED_WORK_GRAPH_SHA256: &str =
+        "2e82caaf35d95bcf20ff168d6c881ac8626bec26d5393a3a87bb75e9b19cae52";
+    /// Frozen historical D-01 value, not a current trust root.
+    pub const LEGACY_D01_EXPECTED_WORK_GRAPH_ARRAY_SHA256: &str =
+        "2cc172ea0b4d1ab7a884fffedd73e0d44d5ca13c2bfb6aa65b93d3a43bc2d929";
+}
+
+/// Deprecated historical plan identity alias; use [`legacy_d01::LEGACY_D01_PLAN_ID`].
+#[deprecated(note = "frozen historical D-01 plan identity; use legacy_d01::LEGACY_D01_PLAN_ID")]
+pub const PLAN_ID: &str = legacy_d01::LEGACY_D01_PLAN_ID;
 const GLOBAL_COMPOSITION_PROFILES: [&str; 5] = [
     "CONTROL_BOOTABLE",
     "SPINE_FUNCTIONAL",
@@ -96,11 +122,9 @@ fn canonical(v: &Value) -> Value {
     }
 }
 
-fn canonical_bytes(v: &Value) -> Vec<u8> {
-    match serde_json::to_vec(&canonical(v)) {
-        Ok(bytes) => bytes,
-        Err(error) => panic!("JSON Value serialization failed unexpectedly: {error}"),
-    }
+/// Canonical JSON bytes for hashing; typed failure, never panics.
+fn canonical_bytes(v: &Value) -> Result<Vec<u8>> {
+    serde_json::to_vec(&canonical(v)).context("canonical JSON bytes")
 }
 
 fn read_json(path: &Path) -> Result<(Value, Vec<u8>)> {
@@ -713,8 +737,9 @@ fn check_index_plans(
     {
         mismatches.push(json!({"field":"schema_version"}));
     }
+    // Legacy profile equality, not current trust.
     if plans.get("acceptance_graph_digest").and_then(Value::as_str)
-        != Some(EXPECTED_WORK_GRAPH_SHA256)
+        != Some(legacy_d01::LEGACY_D01_EXPECTED_WORK_GRAPH_SHA256)
     {
         mismatches.push(json!({"field":"acceptance_graph_digest"}));
     }
@@ -2644,16 +2669,17 @@ fn check_bootstrap_identity(
     work: &Value,
     raw_manifest_sha256: &str,
 ) -> Result<()> {
+    // Legacy profile equality, not current trust.
     a.check(
         "bootstrap.manifest_trust",
-        raw_manifest_sha256 == EXPECTED_MANIFEST_SHA256,
+        raw_manifest_sha256 == legacy_d01::LEGACY_D01_EXPECTED_MANIFEST_SHA256,
         "bundle manifest identity is pinned",
         json!({"actual":raw_manifest_sha256}),
     );
     a.check(
         "bootstrap.payload_root_trust",
         manifest.get("payload_root_sha256").and_then(Value::as_str)
-            == Some(EXPECTED_PAYLOAD_ROOT_SHA256),
+            == Some(legacy_d01::LEGACY_D01_EXPECTED_PAYLOAD_ROOT_SHA256),
         "payload root identity is pinned",
         json!({}),
     );
@@ -2701,13 +2727,25 @@ fn check_bootstrap_identity(
     let template_hash = campaign
         .get("template_payload_sha256")
         .and_then(Value::as_str);
-    let actual_template_hash = sha256(&canonical_bytes(fixed));
+    // Legacy profile equality, not current trust.
+    let template_canonical = match canonical_bytes(fixed) {
+        Ok(bytes) => bytes,
+        Err(error) => {
+            a.error(
+                "manifest.canonicalize",
+                "template payload canonical bytes unavailable",
+                json!({"error": error.to_string()}),
+            );
+            return Ok(());
+        }
+    };
+    let actual_template_hash = sha256(&template_canonical);
     a.check(
         "bootstrap.template_identity",
-        template_hash == Some(EXPECTED_TEMPLATE_SHA256)
-            && actual_template_hash == EXPECTED_TEMPLATE_SHA256,
+        template_hash == Some(legacy_d01::LEGACY_D01_EXPECTED_TEMPLATE_SHA256)
+            && actual_template_hash == legacy_d01::LEGACY_D01_EXPECTED_TEMPLATE_SHA256,
         "bootstrap template payload identity matches",
-        json!({"actual":actual_template_hash,"expected":EXPECTED_TEMPLATE_SHA256}),
+        json!({"actual":actual_template_hash,"expected":legacy_d01::LEGACY_D01_EXPECTED_TEMPLATE_SHA256}),
     );
     let fixed_values = fixed
         .get("fixed_identity_values")
@@ -2742,18 +2780,30 @@ fn check_bootstrap_identity(
     let graph_hash = payload_hashes
         .get("Eliot_Runtime_WorkGraph.json")
         .and_then(Value::as_str);
-    let graph_array_hash = sha256(&canonical_bytes(
-        work.get("graph")
-            .ok_or_else(|| anyhow!("WorkGraph graph missing"))?,
-    ));
+    // Legacy profile equality, not current trust.
+    let graph_payload = work
+        .get("graph")
+        .ok_or_else(|| anyhow!("WorkGraph graph missing"))?;
+    let graph_canonical = match canonical_bytes(graph_payload) {
+        Ok(bytes) => bytes,
+        Err(error) => {
+            a.error(
+                "manifest.canonicalize",
+                "WorkGraph array canonical bytes unavailable",
+                json!({"error": error.to_string()}),
+            );
+            return Ok(());
+        }
+    };
+    let graph_array_hash = sha256(&graph_canonical);
     a.check(
         "bootstrap.runtime_graph_identity",
-        runtime_fixed_hash == Some(EXPECTED_RUNTIME_SHA256)
+        runtime_fixed_hash == Some(legacy_d01::LEGACY_D01_EXPECTED_RUNTIME_SHA256)
             && runtime_fixed_hash == runtime_payload_hash
             && fixed_values
                 .get("work_graph_file_sha256")
                 .and_then(Value::as_str)
-                == Some(EXPECTED_WORK_GRAPH_SHA256)
+                == Some(legacy_d01::LEGACY_D01_EXPECTED_WORK_GRAPH_SHA256)
             && fixed_values
                 .get("work_graph_file_sha256")
                 .and_then(Value::as_str)
@@ -2765,7 +2815,7 @@ fn check_bootstrap_identity(
             && fixed_values
                 .get("work_graph_array_sha256")
                 .and_then(Value::as_str)
-                == Some(EXPECTED_WORK_GRAPH_ARRAY_SHA256),
+                == Some(legacy_d01::LEGACY_D01_EXPECTED_WORK_GRAPH_ARRAY_SHA256),
         "runtime and WorkGraph identities match pinned seed",
         json!({
             "runtime_fixed": runtime_fixed_hash,
@@ -3426,7 +3476,7 @@ fn source_snapshot(repository: &Path, gaps: &[Value]) -> Result<Value> {
         "dirty_status_bytes":dirty.len(),
         "diff_sha256":sha256(diff.as_bytes()),
         "untracked_files":untracked_records,
-        "source_frontier_sha256":sha256(&canonical_bytes(&frontier_material)),
+        "source_frontier_sha256":sha256(&canonical_bytes(&frontier_material).context("source frontier canonical bytes")?),
         "cargo_manifest_paths":manifest_records,
         "cargo_metadata_manifests":metadata_manifests,
         "target_root_gaps":gaps,
@@ -3510,11 +3560,18 @@ fn write_report_atomic(report: &Path, bytes: &[u8], opts: &CompileOptions) -> Re
     Ok(())
 }
 
-/// Compiles the sealed runtime projection into one bounded verification receipt.
+/// Verifies the sealed runtime projection against the frozen historical D-01
+/// profile ([`legacy_d01::PROFILE`]) and returns one bounded verification receipt.
+///
+/// Read-only historical D-01 verification; not current support evidence.
+/// Read-only: this function admits no artifact into any installation or
+/// runtime and grants no runtime, semantic, canonical-state, or Product
+/// authority. Every pin compared here is legacy profile equality, not
+/// current trust.
 #[must_use]
-// The compiler keeps the fail-closed audit sequence visible in one orchestration function.
+// The verifier keeps the fail-closed audit sequence visible in one orchestration function.
 #[allow(clippy::too_many_lines)]
-pub fn compile(opts: &CompileOptions) -> Value {
+pub fn verify_legacy_d01(opts: &CompileOptions) -> Value {
     let mut audit = Audit::default();
     let mut payload_hashes = Map::new();
     let mut manifest_sha = Value::Null;
@@ -3582,7 +3639,18 @@ pub fn compile(opts: &CompileOptions) -> Value {
                 .and_then(Value::as_str)
                 .cmp(&b.get("path").and_then(Value::as_str))
         });
-        let computed = sha256(&canonical_bytes(&Value::Array(root_rows)));
+        let root_canonical = match canonical_bytes(&Value::Array(root_rows)) {
+            Ok(bytes) => bytes,
+            Err(error) => {
+                audit.error(
+                    "manifest.canonicalize",
+                    "payload root canonical bytes unavailable",
+                    json!({"error": error.to_string()}),
+                );
+                return Ok(());
+            }
+        };
+        let computed = sha256(&root_canonical);
         payload_root = Value::String(computed.clone());
         audit.check(
             "manifest.payload_root",
@@ -3708,19 +3776,30 @@ pub fn compile(opts: &CompileOptions) -> Value {
         }
     };
     let passed = audit.errors.is_empty();
-    let receipt = json!({"schema_version":"eliot-runtime-compiler-receipt-v1","work_id":"D-01","plan_id":PLAN_ID,"verdict":if passed{"PASS"}else{"FAIL"},"document_status_ceiling":"DOCUMENT_CONFORMANT / CODEX_W0_READY only; source/runtime/product/release unverified","manifest_sha256":manifest_sha,"payload_root_sha256":payload_root,"payload_sha256":payload_hashes,"checks":audit.checks,"checks_passed":audit.checks.iter().filter(|x|x.get("passed")==Some(&Value::Bool(true))).count(),"checks_total":audit.checks.len(),"errors":audit.errors,"warnings":audit.warnings,"current_source_gap":gaps,"source_snapshot":source});
+    let receipt = json!({"schema_version":"eliot-runtime-compiler-receipt-v1","work_id":"D-01","plan_id":legacy_d01::LEGACY_D01_PLAN_ID,"profile":legacy_d01::PROFILE,"authoritative":false,"verdict":if passed{"PASS"}else{"FAIL"},"document_status_ceiling":"DOCUMENT_CONFORMANT / CODEX_W0_READY only; source/runtime/product/release unverified","manifest_sha256":manifest_sha,"payload_root_sha256":payload_root,"payload_sha256":payload_hashes,"checks":audit.checks,"checks_passed":audit.checks.iter().filter(|x|x.get("passed")==Some(&Value::Bool(true))).count(),"checks_total":audit.checks.len(),"errors":audit.errors,"warnings":audit.warnings,"current_source_gap":gaps,"source_snapshot":source});
     if let Some(report) = &opts.report {
         let bytes = match serde_json::to_vec_pretty(&receipt) {
             Ok(bytes) => bytes,
             Err(error) => {
-                return json!({"schema_version":"eliot-runtime-compiler-receipt-v1","work_id":"D-01","plan_id":PLAN_ID,"verdict":"FAIL","errors":[{"check_id":"report.serialize","message":error.to_string()}]});
+                return json!({"schema_version":"eliot-runtime-compiler-receipt-v1","work_id":"D-01","plan_id":legacy_d01::LEGACY_D01_PLAN_ID,"profile":legacy_d01::PROFILE,"authoritative":false,"verdict":"FAIL","errors":[{"check_id":"report.serialize","message":error.to_string()}]});
             }
         };
         if let Err(e) = write_report_atomic(report, &bytes, opts) {
-            return json!({"schema_version":"eliot-runtime-compiler-receipt-v1","work_id":"D-01","plan_id":PLAN_ID,"verdict":"FAIL","errors":[{"check_id":"report.write","message":e.to_string()}]});
+            return json!({"schema_version":"eliot-runtime-compiler-receipt-v1","work_id":"D-01","plan_id":legacy_d01::LEGACY_D01_PLAN_ID,"profile":legacy_d01::PROFILE,"authoritative":false,"verdict":"FAIL","errors":[{"check_id":"report.write","message":e.to_string()}]});
         }
     }
     receipt
+}
+
+/// Deprecated historical entry point; use [`verify_legacy_d01`].
+///
+/// Thin alias preserving the previous `compile` surface for existing callers
+/// (e.g. the companion CLI). Legacy D-01 scope only: read-only historical
+/// D-01 verification, not current support evidence.
+#[deprecated(note = "read-only historical D-01 verification; use verify_legacy_d01")]
+#[must_use]
+pub fn compile(opts: &CompileOptions) -> Value {
+    verify_legacy_d01(opts)
 }
 
 #[cfg(test)]
@@ -3757,7 +3836,7 @@ mod tests {
         }]});
         let plans = json!({
             "schema_version":"eliot-cell-execution-plans-v3",
-            "acceptance_graph_digest":EXPECTED_WORK_GRAPH_SHA256,
+            "acceptance_graph_digest":legacy_d01::LEGACY_D01_EXPECTED_WORK_GRAPH_SHA256,
             "plans":[{
                 "work_id":"A-01", "plan_id":"A-01:plan-v2", "plan_kind":"single_slice",
                 "causal_property":"cause", "primary_lifecycle_owner":"A-01",
@@ -3912,7 +3991,10 @@ mod tests {
     fn canonical_hash_is_deterministic() {
         let a = json!({"z":1,"a":{"b":2,"a":1}});
         let b = json!({"a":{"a":1,"b":2},"z":1});
-        assert_eq!(sha256(&canonical_bytes(&a)), sha256(&canonical_bytes(&b)));
+        assert_eq!(
+            sha256(&must(canonical_bytes(&a), "canonical bytes")),
+            sha256(&must(canonical_bytes(&b), "canonical bytes"))
+        );
     }
 
     #[test]
@@ -3926,7 +4008,7 @@ mod tests {
             ),
             "write manifest",
         );
-        let receipt = compile(&CompileOptions {
+        let receipt = verify_legacy_d01(&CompileOptions {
             runtime_root: root.clone(),
             normative_root: root.clone(),
             repository: root.clone(),
@@ -3953,7 +4035,7 @@ mod tests {
             ),
             "write manifest",
         );
-        let receipt = compile(&CompileOptions {
+        let receipt = verify_legacy_d01(&CompileOptions {
             runtime_root: root.clone(),
             normative_root: root.clone(),
             repository: root.clone(),
@@ -4123,7 +4205,7 @@ mod tests {
         }]});
         let plans = json!({
             "schema_version":"eliot-cell-execution-plans-v3",
-            "acceptance_graph_digest":EXPECTED_WORK_GRAPH_SHA256,
+            "acceptance_graph_digest":legacy_d01::LEGACY_D01_EXPECTED_WORK_GRAPH_SHA256,
             "plans":[{
                 "work_id":"MIG-01", "plan_id":"MIG-01:plan-v2", "plan_kind":"split",
                 "causal_property":"migrate", "primary_lifecycle_owner":"MIG-01",
@@ -4259,7 +4341,7 @@ mod tests {
         }]});
         let plans = json!({
             "schema_version":"eliot-cell-execution-plans-v3",
-            "acceptance_graph_digest":EXPECTED_WORK_GRAPH_SHA256,
+            "acceptance_graph_digest":legacy_d01::LEGACY_D01_EXPECTED_WORK_GRAPH_SHA256,
             "plans":[{
                 "work_id":"LEG-01", "plan_id":"LEG-01:plan-v2", "plan_kind":"single_slice",
                 "causal_property":"audit", "primary_lifecycle_owner":"LEG-01",
@@ -4323,7 +4405,7 @@ mod tests {
         }]});
         let plans = json!({
             "schema_version":"eliot-cell-execution-plans-v3",
-            "acceptance_graph_digest":EXPECTED_WORK_GRAPH_SHA256,
+            "acceptance_graph_digest":legacy_d01::LEGACY_D01_EXPECTED_WORK_GRAPH_SHA256,
             "plans":[{
                 "work_id":"MIG-00", "plan_id":"MIG-00:plan-v2", "plan_kind":"single_slice",
                 "causal_property":"snapshot", "primary_lifecycle_owner":"MIG-00",
