@@ -21,7 +21,7 @@ primary_issue_url = "https://github.com/UnknownAlienHuman/eliot-memory-os/issues
 
 [documentation]
 implementation = [
-  "docs/architecture/I00-05-current-system-evidence-and-source-support-model.md#i05-current-system-evidence-and-source-support-model",
+  "docs/architecture/I00-05-conformance-support-and-evidence-status.md",
   "docs/architecture/I02-08-package-metadata-source-ownership-and-generated-registry.md#i28-package-metadata-source-ownership-and-generated-registry",
   "docs/architecture/I02-18-build-test-and-artifact-graph.md#i218-build-test-and-artifact-graph",
   "docs/architecture/I02-23-capability-family-topology-and-crate-extraction-decisions.md#i223-capability-family-topology-and-crate-extraction-decisions",
