@@ -130,7 +130,7 @@ impl BrokerDispatchAuthority {
         let mut key = [0_u8; 32];
         let nonce = uuid::Uuid::new_v4().as_bytes().to_owned();
         key[..16].copy_from_slice(&nonce);
-        key[16..].copy_from_slice(&Sha256::digest(nonce));
+        key[16..].copy_from_slice(&Sha256::digest(nonce)[..16]);
         let key = KernelDispatchKey::from_secret_bytes(key)
             .map_err(|error| PortError::Invalid(error.to_string()))?;
         Ok(Self {
@@ -780,4 +780,24 @@ pub fn snapshot_digest(path: &Path) -> Result<String, CompositionError> {
     let mut digest = Sha256::new();
     digest.update(bytes);
     Ok(format!("{:x}", digest.finalize()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{BrokerDispatchAuthority, LocalProcessPort};
+
+    #[test]
+    fn broker_dispatch_authority_constructs_ephemeral_key() {
+        // Regression for #1390: key assembly panicked copying the 32-byte
+        // digest into the 16-byte second half of the 32-byte key.
+        assert!(BrokerDispatchAuthority::new().is_ok());
+        assert!(BrokerDispatchAuthority::new().is_ok());
+    }
+
+    #[test]
+    fn local_process_port_constructs_on_this_platform() {
+        // Production path `start_with_kernel` -> `LocalProcessPort::new()`;
+        // unit-level only: no daemon/service start, no network.
+        assert!(LocalProcessPort::new().is_ok());
+    }
 }
