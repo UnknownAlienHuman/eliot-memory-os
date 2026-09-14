@@ -21,13 +21,15 @@ discriminator = "Missing provider or fence cases return incomplete candidate set
 primary_responsibility = "Map immutable task, attention, epistemic, cue-activation, negative-memory, evidence and affordance projections into whole context candidates with lineage."
 owned_mutable_state = []
 allowed_effects = []
-inputs = ["TaskFrame projection", "CriticalAttention and Conflict handles", "CurrentEpistemicPosition", "CueActivationResult", "negative-memory and affordance projections"]
+inputs = ["TaskFrame projection", "CriticalAttention and Conflict handles", "CurrentEpistemicPosition", "ActivationResult", "negative-memory and affordance projections"]
 outputs = ["ContextCandidateSet", "coverage manifest", "missing-input and unknown list"]
-depends_on = ["eliot-cue-contracts", "eliot-cue-activation", "eliot-epistemic", "eliot-context-contracts"]
+# eliot-cue-activation is the runtime producer of the explicit ActivationResult
+# input (A-14a #600) and is never imported or called by this pure mapper.
+depends_on = ["eliot-cue-contracts", "eliot-epistemic-contracts", "eliot-context-contracts"]
 providers = ["Governor read projections", "cue activation"]
 consumers = ["context admission"]
 non_goals = ["store queries", "ranking", "rendering", "semantic synthesis"]
-invariants = ["every material candidate has lineage", "one compatible fence governs the set", "CueActivationResult is an explicit input rather than an implicit lookup", "retrieval and activation only propose influence"]
+invariants = ["every material candidate has lineage", "one compatible fence governs the set", "ActivationResult is an explicit input rather than an implicit lookup", "retrieval and activation only propose influence"]
 failure_behavior = "Return an incomplete set with exact missing providers; never cross scope silently or fabricate atoms."
 proof_surface = ["missing cue-activation provider", "duplicate or conflicting identity", "cross-fence rejection", "role and lineage completeness"]
 proof_ceiling = "Module proof only; real provider/consumer Edge proof and Product Pulse remain separate"
