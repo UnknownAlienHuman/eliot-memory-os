@@ -126,3 +126,4 @@ commands = [
 ]
 edge_proof = "Generate twice, compare exact bytes, compile, mutate every load-bearing input and exercise installation admission plus cutover/rollback; or prove zero current consumers for a legacy/delete disposition."
 product_proof = "Issue #11 remains open."
+# RECHECK-1195 disposition (b): disposition = "LEGACY_D01"; retirement = "read-only historical verifier; deletion wave follows with #1189".
