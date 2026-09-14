@@ -397,6 +397,41 @@ impl InstrumentInvocation {
     }
 }
 
+/// Neutral request delivered to the injected Kernel/Governor admission port.
+///
+/// This is an inert description only. It contains no contour authority and
+/// cannot be used to construct a process permit without the core sealing
+/// boundary in `eliot-testd-core`. Shape validation is stateless: it checks
+/// non-blank identities, delegates to [`InstrumentInvocation::validate`], and
+/// checks non-blank roots. It performs no filesystem access and makes no
+/// admission decision.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct KernelProcessAdmissionRequest {
+    pub job_id: String,
+    pub project_id: String,
+    pub invocation: InstrumentInvocation,
+    pub source_root: String,
+    pub target_root: String,
+    pub cache_root: String,
+}
+
+impl KernelProcessAdmissionRequest {
+    /// Validates shape only, with no filesystem or admission effects.
+    pub fn validate(&self) -> Result<(), InstrumentContractError> {
+        validate_text(&self.job_id, "job_id")?;
+        validate_text(&self.project_id, "project_id")?;
+        for (field, value) in [
+            ("source_root", self.source_root.as_str()),
+            ("target_root", self.target_root.as_str()),
+            ("cache_root", self.cache_root.as_str()),
+        ] {
+            validate_text(value, field)?;
+        }
+        self.invocation.validate()
+    }
+}
+
 /// Semantic outcome of a verification run; it is not a finish decision.
 #[derive(Clone, Copy, Debug, Eq, Hash, JsonSchema, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]

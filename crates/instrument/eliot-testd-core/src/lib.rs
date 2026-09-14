@@ -8,6 +8,7 @@
 #![forbid(unsafe_code)]
 
 use eliot_contracts::EpochId;
+pub use eliot_instrument_api::KernelProcessAdmissionRequest;
 use eliot_instrument_api::{
     ExecutionStatus, InstrumentInvocation, InstrumentKind, VerificationRun,
 };
@@ -135,39 +136,6 @@ impl ProcessAdmission {
     }
 }
 
-/// Neutral request delivered to the injected Kernel/Governor admission port.
-///
-/// This is an inert description only. It contains no contour authority and
-/// cannot be used to construct a process permit without the core sealing
-/// boundary below.
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct KernelProcessAdmissionRequest {
-    pub job_id: String,
-    pub project_id: String,
-    pub invocation: InstrumentInvocation,
-    pub source_root: String,
-    pub target_root: String,
-    pub cache_root: String,
-}
-
-impl KernelProcessAdmissionRequest {
-    fn validate(&self) -> Result<(), TestdError> {
-        validate_text(&self.job_id, "job_id")?;
-        validate_text(&self.project_id, "project_id")?;
-        for (field, value) in [
-            ("source_root", self.source_root.as_str()),
-            ("target_root", self.target_root.as_str()),
-            ("cache_root", self.cache_root.as_str()),
-        ] {
-            validate_text(value, field)?;
-        }
-        self.invocation
-            .validate()
-            .map_err(|error| TestdError::Contract(error.to_string()))
-    }
-}
-
 /// Evidence returned by the Kernel/Governor admission provider.
 ///
 /// The consuming [`ProcessRequest`] is already authenticated by Kernel. The
@@ -197,7 +165,9 @@ pub fn issue_process_admission(
     provider: &dyn KernelProcessAdmissionProvider,
     request: &KernelProcessAdmissionRequest,
 ) -> Result<ProcessAdmissionPermit, TestdError> {
-    request.validate()?;
+    request
+        .validate()
+        .map_err(|error| TestdError::Contract(error.to_string()))?;
     let evidence = provider.admit(request)?;
     evidence
         .process
