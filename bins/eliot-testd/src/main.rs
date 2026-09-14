@@ -1,3 +1,5 @@
+#![forbid(unsafe_code)]
+
 use std::io::{self, Write};
 
 use eliot_testd::{PROTOCOL_VERSION, SERVICE_NAME};

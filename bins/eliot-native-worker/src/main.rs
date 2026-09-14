@@ -1,3 +1,5 @@
+#![forbid(unsafe_code)]
+
 use std::io::{self, Write};
 
 use eliot_native_worker::{KERNEL_ADMISSION_REQUIRED, KernelNativeWorkerClient, NativeWorkerError};

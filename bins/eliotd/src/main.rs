@@ -1,3 +1,5 @@
+#![forbid(unsafe_code)]
+
 //! `eliotd` service entrypoint.
 //!
 //! Host/N1 owns the authenticated Kernel-generation transport. This binary

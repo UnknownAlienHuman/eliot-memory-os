@@ -1,3 +1,5 @@
+#![forbid(unsafe_code)]
+
 //! `eliot-kernel` binary entry: thin orchestration over ROOT inputs.
 //!
 //! `main` keeps parse → build → construct → run → shutdown only. The startup

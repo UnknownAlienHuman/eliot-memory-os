@@ -1,3 +1,5 @@
+#![forbid(unsafe_code)]
+
 use std::io::{self, Write};
 
 use eliot_wasm_host::{CliError, parse_args};
