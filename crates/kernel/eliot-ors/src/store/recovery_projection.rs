@@ -138,10 +138,9 @@ impl RedbRecoveryStore {
         let projection = OperationalRecoveryState {
             ors_revision: format!("eliot.kernel.ors/v{}", crate::CONTRACT_VERSION),
             integrity: HealthDimension::Healthy,
-            // Residual (Implements #64): `OperationalRecoveryState::authority_epoch`
-            // still declares the scalar contour (`eliot-runtime-contracts`), so this
-            // canonical `EpochId` cannot land until that contract migrates; cloning
-            // (never scalar-coercing) keeps the post-migration form exact.
+            // Canonical `EpochId` (Implements #64): the receipt carries the
+            // lineage-aware exact tuple and the migrated contract field takes
+            // it by clone, never by scalar coercion.
             authority_epoch: active_receipt.core.authority.authority_epoch.clone(),
             pending_operation_refs,
             active_generation_refs,

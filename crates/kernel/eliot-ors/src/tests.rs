@@ -667,7 +667,7 @@ fn supervision_binding(
         host_epoch: AuthorityEpoch::new(1)?,
         activation_id: label("activation-1")?,
         activation_generation: ResourceGeneration::new(1)?,
-        kernel_epoch: AuthorityEpoch::new(2)?,
+        kernel_epoch: test_epoch(2),
         watchdog_epoch: AuthorityEpoch::new(1)?,
         generation_binding: SupervisionGenerationBinding {
             target_id: "target-1".to_owned(),
@@ -1114,7 +1114,7 @@ fn supervision_lease_renew_is_monotonic_and_history_is_bounded() -> TestResult {
         Err(OrsError::SupervisionLeaseStaleRevision)
     ));
     let mut mismatched_binding = supervision_binding(LeaseState::Active, 250)?;
-    mismatched_binding.kernel_epoch = AuthorityEpoch::new(3)?;
+    mismatched_binding.kernel_epoch = test_epoch(3);
     mismatched_binding.state_fence =
         StateFence::new(test_epoch(3), ResourceGeneration::new(1)?);
     assert!(matches!(
@@ -1599,11 +1599,7 @@ fn process_evidence(
                         "sequence": 1
                     },
                     "generation": 1,
-                    "nonce": "fence-1",
-                    "canonical_epoch": {
-                        "lineage_id": "550e8400-e29b-41d4-a716-446655440000",
-                        "sequence": 1
-                    }
+                    "nonce": "fence-1"
                 },
                 "request_digest": "11".repeat(32),
                 "permit_digest": "22".repeat(32),

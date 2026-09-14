@@ -161,7 +161,7 @@ pub struct SupervisionLeaseBinding {
     pub host_epoch: AuthorityEpoch,
     pub activation_id: OpaqueLabel,
     pub activation_generation: ResourceGeneration,
-    pub kernel_epoch: AuthorityEpoch,
+    pub kernel_epoch: EpochId,
     pub watchdog_epoch: AuthorityEpoch,
     pub generation_binding: SupervisionGenerationBinding,
     pub state_fence: StateFence,
@@ -210,7 +210,7 @@ impl SupervisionLeaseBinding {
             host_epoch: self.host_epoch,
             activation_id: self.activation_id.as_str().to_owned(),
             activation_generation: self.activation_generation,
-            kernel_epoch: self.kernel_epoch,
+            kernel_epoch: self.kernel_epoch.clone(),
             watchdog_epoch: self.watchdog_epoch,
             generation_binding: self.generation_binding.clone(),
             state_fence: self.state_fence.clone(),
@@ -846,7 +846,7 @@ impl SupervisionLeaseSnapshot {
             host_epoch: binding.host_epoch,
             activation_id: binding.activation_id.as_str().to_owned(),
             activation_generation: binding.activation_generation,
-            kernel_epoch: binding.kernel_epoch,
+            kernel_epoch: binding.kernel_epoch.clone(),
             watchdog_epoch: binding.watchdog_epoch,
             state_fence: binding.state_fence.clone(),
             scope_ref: binding.scope_ref.as_str().to_owned(),
@@ -911,7 +911,7 @@ impl ProcessStartReplayRecord {
         eliot_process::ProcessOwnerBinding::new(
             self.owner.module_id(),
             self.owner.principal_digest(),
-            self.owner.authority_epoch(),
+            self.owner.authority_epoch().clone(),
             self.owner.generation(),
         )
         .map_err(|error| OrsError::IntegrityProblem {
@@ -1126,15 +1126,10 @@ impl ProcessEvidenceRecord {
         let evidence_bytes =
             serde_json::to_vec(&evidence).map_err(|error| OrsError::Encoding(error.to_string()))?;
         // Lineage-aware binding (Implements #64): the active epoch comes only
-        // from the owner's canonical `EpochId`. A scalar-only owner carries no
-        // provable lineage and fails closed; legacy numerics enter only via
-        // `import_legacy_scalar_epoch` with evidence, never via coercion.
-        let authority_epoch = owner.canonical_epoch().cloned().ok_or_else(|| {
-            OrsError::IntegrityProblem {
-                record_type: "process_evidence",
-                reason: "owner carries no canonical lineage epoch".to_owned(),
-            }
-        })?;
+        // from the owner's canonical `EpochId` via `authority_epoch`.
+        // Legacy numerics enter only via `import_legacy_scalar_epoch` with
+        // evidence, never via coercion.
+        let authority_epoch = owner.authority_epoch().clone();
         let record = Self {
             contract_version: CONTRACT_VERSION,
             operation_id: OperationIdentity::new(binding.operation_id().as_str())?,
@@ -1230,7 +1225,7 @@ impl ProcessEvidenceRecord {
         let owner = eliot_process::ProcessOwnerBinding::new(
             self.owner.module_id(),
             self.owner.principal_digest(),
-            self.owner.authority_epoch(),
+            self.owner.authority_epoch().clone(),
             self.owner.generation(),
         )
         .map_err(|error| OrsError::IntegrityProblem {
@@ -1238,15 +1233,10 @@ impl ProcessEvidenceRecord {
             reason: error.to_string(),
         })?;
         // Exact-tuple lineage check (Implements #64): the record epoch must be
-        // the same `(lineage_id, sequence)` as the owner's canonical epoch.
-        // A scalar-only owner (no canonical lineage) cannot satisfy this and
-        // fails closed; equal sequences from different lineages are unrelated.
-        let owner_canonical = self.owner.canonical_epoch().ok_or_else(|| {
-            OrsError::IntegrityProblem {
-                record_type: "process_evidence",
-                reason: "owner carries no canonical lineage epoch".to_owned(),
-            }
-        })?;
+        // the same `(lineage_id, sequence)` as the owner's canonical epoch
+        // via `authority_epoch`; equal sequences from different lineages are
+        // unrelated.
+        let owner_canonical = self.owner.authority_epoch();
         if owner != self.owner
             || !self.authority_epoch.is_same_authority(owner_canonical)
             || self.generation != self.owner.generation().get()
@@ -1284,13 +1274,9 @@ impl ProcessEvidenceRecord {
         let fence: Value = serde_json::from_slice(&state_fence_bytes)
             .map_err(|error| OrsError::Encoding(error.to_string()))?;
         // Lineage-aware fence binding (Implements #64): the P-03 execution
-        // fence carries its canonical `EpochId` alongside the scalar contour.
-        // Authorization uses exact-tuple `is_same_authority`; the scalar wire
-        // value alone never authorizes and is never coerced.
-        let fence_canonical = binding
-            .state_fence()
-            .canonical_epoch()
-            .ok_or(OrsError::FenceMismatch)?;
+        // fence carries its canonical `EpochId`; authorization uses
+        // exact-tuple `is_same_authority`.
+        let fence_canonical = binding.state_fence().authority_epoch();
         if !fence_canonical.is_same_authority(&self.authority_epoch) {
             return Err(OrsError::FenceMismatch);
         }

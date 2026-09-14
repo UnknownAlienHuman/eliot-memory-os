@@ -770,7 +770,7 @@ mod tests {
             host_epoch: AuthorityEpoch::new(1).unwrap(),
             activation_id: label("activation-1"),
             activation_generation: ResourceGeneration::new(1).unwrap(),
-            kernel_epoch: AuthorityEpoch::new(2).unwrap(),
+            kernel_epoch: test_epoch(TEST_LINEAGE_A, 2),
             watchdog_epoch: AuthorityEpoch::new(1).unwrap(),
             generation_binding: SupervisionGenerationBinding {
                 target_id: "target-1".to_owned(),
@@ -1827,7 +1827,7 @@ mod tests {
                     host_epoch: AuthorityEpoch::new(1).unwrap(),
                     activation_id: label("activation-1"),
                     activation_generation: ResourceGeneration::new(1).unwrap(),
-                    kernel_epoch: AuthorityEpoch::new(2).unwrap(),
+                    kernel_epoch: test_epoch(TEST_LINEAGE_A, 2),
                     watchdog_epoch: AuthorityEpoch::new(1).unwrap(),
                     generation_binding: SupervisionGenerationBinding {
                         target_id: "target-1".to_owned(),

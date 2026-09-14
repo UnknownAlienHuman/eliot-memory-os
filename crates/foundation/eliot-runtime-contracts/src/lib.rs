@@ -884,8 +884,8 @@ pub struct OperationalRecoveryState {
     pub ors_revision: String,
     /// Integrity status of the ORS itself.
     pub integrity: HealthDimension,
-    /// Active authority epoch.
-    pub authority_epoch: AuthorityEpoch,
+    /// Active authority epoch (lineage-aware exact tuple, Implements #64).
+    pub authority_epoch: EpochId,
     /// Pending opaque operation handles.
     pub pending_operation_refs: Vec<String>,
     /// Current generation/cutover references.
