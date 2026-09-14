@@ -82,6 +82,27 @@ where
             .map_err(NativeWorkerError::from)
     }
 
+    /// Performs the claimed admission and process start handshake for one
+    /// exact Kernel-issued claim presentation (T2-S05 first consumer).
+    ///
+    /// Binds the existing claimed start path without minting authority: the
+    /// supplied `claim`, `hello`, and `process` are validated through the
+    /// production `from_claim` join and executable gate before the injected
+    /// admission port and P-03 executor run. The existing unclaimed `start`
+    /// is untouched; `ProcessRequest` stays an in-memory composition value
+    /// and never enters a wire type.
+    pub async fn start_claimed(
+        &mut self,
+        claim: eliot_native_worker_core::ClaimAdmissionRequest,
+        hello: WorkerHello,
+        process: ProcessRequest,
+    ) -> Result<eliot_native_worker_core::WorkerReady, NativeWorkerError> {
+        self.core
+            .demand_start_claimed(claim, hello, process)
+            .await
+            .map_err(NativeWorkerError::from)
+    }
+
     /// Restores an exact fenced binding and replays durable events.
     pub async fn recover(
         &mut self,

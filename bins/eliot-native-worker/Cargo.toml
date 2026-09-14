@@ -21,5 +21,9 @@ serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
 
+[dev-dependencies]
+eliot-contracts.workspace = true
+eliot-process-executor.workspace = true
+
 [lints]
 workspace = true

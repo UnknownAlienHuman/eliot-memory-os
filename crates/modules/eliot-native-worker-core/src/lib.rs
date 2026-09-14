@@ -13,6 +13,12 @@ mod protocol;
 use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
 
+/// Constituent envelope types of the public claim protocol, re-exported so
+/// composition roots (which must not depend on the agent plane directly) can
+/// build and inspect claims through this crate's API.
+pub use eliot_agent_api::{
+    AttemptId, AuthorityEnvelope, BudgetEnvelope, EffectCeiling, EffectKind,
+};
 use eliot_agent_api::{AuthorizedEffect, ProposedEffect};
 use eliot_process::{
     CancellationStatus, EvidenceSinkError, FencingToken, OperationId,
@@ -447,10 +453,77 @@ where
 
     /// Restores an exact process/admission binding after an A-13 restart without
     /// launching a duplicate process. P-03 inspect and durable replay are the source.
+    ///
+    /// Unclaimed projection: delegates to the shared downstream recovery path
+    /// with no claim echo and no executable gate. Observable behavior is
+    /// unchanged from the previous inline implementation.
     pub async fn recover_after_restart(
         &mut self,
         hello: WorkerHello,
         process: ProcessRequest,
+        replay_after_sequence: u64,
+    ) -> Result<WorkerRecovery, WorkerError> {
+        let admission_request = CapabilityAdmissionRequest::from_start(&hello, &process);
+        self.recover_after_restart_inner(hello, process, admission_request, replay_after_sequence)
+            .await
+    }
+
+    /// Claim-bound restart recovery: the same retained-acquisition inspect +
+    /// replay-suffix path as [`WorkerCore::recover_after_restart`], bound to
+    /// one exact claim presentation exactly like
+    /// [`WorkerCore::demand_start_claimed`].
+    ///
+    /// First validates the claim/registration cross-binding, then performs
+    /// the checked join of the claim with the owner-supplied `hello` and
+    /// `process` via `CapabilityAdmissionRequest::from_claim` (including the
+    /// executable join binding to `hello`/`process`/registration). Any
+    /// mismatch fails here, before the admission owner is consulted and
+    /// without launching anything. On a match the call delegates to the
+    /// shared downstream recovery path (admit, grant validation including
+    /// the claim echo and the owner-produced executable expectation,
+    /// executable-binding gate, retained P-03 inspect, durable replay
+    /// suffix). No `ProcessRequest` is minted, no grant is sealed by the
+    /// join itself, and no duplicate process is ever launched: only the
+    /// supplied `claim`, `hello`, and `process` are reused.
+    ///
+    /// A stale-generation/epoch or misaddressed join is refused typed,
+    /// exactly like `demand_start_claimed`. The recovered binding keeps the
+    /// ORIGINAL claim identity — nothing is minted — so a later
+    /// cancel/checkpoint acts under the same binding and an unknown outcome
+    /// reconciles under the original claim echo. The drain analogue remains
+    /// quiesce→shutdown (docs only; no new owner).
+    ///
+    /// # Errors
+    ///
+    /// Returns the `from_claim` join failure (`InvalidRequest`,
+    /// `UnsupportedVersion`, `StaleEpoch`, `StaleFence`, or
+    /// `DeadlineExpired`), the downstream admission/inspect/replay failure, or
+    /// the typed executable-join refusal (`InvalidRequest`, `StaleEpoch`,
+    /// `StaleFence`, `DeadlineExpired`, `Revoked`, or `UnsupportedVersion`).
+    pub async fn recover_after_restart_claimed(
+        &mut self,
+        claim: ClaimAdmissionRequest,
+        hello: WorkerHello,
+        process: ProcessRequest,
+        replay_after_sequence: u64,
+    ) -> Result<WorkerRecovery, WorkerError> {
+        claim.validate_binding()?;
+        let admission_request = CapabilityAdmissionRequest::from_claim(&claim, &hello, &process)?;
+        self.recover_after_restart_inner(hello, process, admission_request, replay_after_sequence)
+            .await
+    }
+
+    /// Shared downstream recovery path for [`WorkerCore::recover_after_restart`]
+    /// and [`WorkerCore::recover_after_restart_claimed`]: lifecycle gate,
+    /// owner validation, admission, grant checks (including the claim echo
+    /// and the owner-produced executable expectation when the request carries
+    /// one), the executable join gate, retained P-03 inspect, and the durable
+    /// replay suffix. No duplicate process is ever launched.
+    async fn recover_after_restart_inner(
+        &mut self,
+        hello: WorkerHello,
+        process: ProcessRequest,
+        admission_request: CapabilityAdmissionRequest,
         replay_after_sequence: u64,
     ) -> Result<WorkerRecovery, WorkerError> {
         if !matches!(
@@ -465,7 +538,6 @@ where
             .map_err(|error| WorkerError::Process(error.to_string()))?;
         self.require_replay()?;
         self.require_executor()?;
-        let admission_request = CapabilityAdmissionRequest::from_start(&hello, &process);
         let grant = match self
             .admission
             .as_mut()
@@ -484,7 +556,10 @@ where
                 return Err(WorkerError::Revoked(revision));
             }
         };
-        validate_grant(&grant, &hello, &process, None)?;
+        validate_grant(&grant, &hello, &process, admission_request.claim())?;
+        if let Some(presented) = admission_request.claim() {
+            require_claim_executable_binding(presented, &hello, &process, &grant)?;
+        }
         let process_binding = ProcessBindingSnapshot::from_request(&process);
         let view = self
             .executor

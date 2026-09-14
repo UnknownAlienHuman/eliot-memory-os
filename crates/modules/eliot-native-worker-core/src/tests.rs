@@ -5,16 +5,19 @@
     clippy::unwrap_used
 )]
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::future::Future;
 use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll, Waker};
 
 use eliot_agent_api::{
-    AttemptId, AuthorityEnvelope, AuthorizedEffect, EffectCeiling, EffectKind, ProposedEffect,
-    ResourceGeneration, StateFence, WorkLeaseId,
+    AttemptId, AuthorityEnvelope, AuthorizedEffect, BudgetEnvelope, EffectCeiling, EffectKind,
+    ProposedEffect, ResourceGeneration, StateFence, WorkLeaseId,
 };
-use eliot_contracts::{EpochId, EpochLineageId, IntegrationRevision, PolicyRevision, TaskRevision};
+use eliot_contracts::{
+    DecisionId, EpochId, EpochLineageId, IntegrationRevision, PolicyRevision, TaskId, TaskRevision,
+    sha256_hex,
+};
 use eliot_process::{
     ActionLeaseRef, CancellationReceipt, CancellationRequest, DescendantEvidence,
     DispatchAuthorityId, DispatchPermitAuthority, DispatchValidationContext, EnvironmentProjection,
@@ -62,6 +65,7 @@ struct ExecutorState {
     reconciliations: usize,
     start_mode: StartMode,
     cancel_unknown: bool,
+    report_unknown_on_inspect: bool,
     request: Option<ProcessBindingSnapshot>,
     process: Option<ProcessState>,
 }
@@ -75,6 +79,7 @@ impl Default for ExecutorState {
             reconciliations: 0,
             start_mode: StartMode::Normal,
             cancel_unknown: false,
+            report_unknown_on_inspect: false,
             request: None,
             process: None,
         }
@@ -134,6 +139,25 @@ impl ProcessExecutor for FakeExecutor {
     ) -> Result<ProcessExecutionView, ProcessExecutionError> {
         let mut state = self.state.lock().expect("executor lock");
         state.inspections += 1;
+        if state.report_unknown_on_inspect {
+            let process = state
+                .process
+                .as_mut()
+                .ok_or(ProcessExecutionError::NotFound)?;
+            let identity = process.view().identity().expect("running identity").clone();
+            let descendants = DescendantEvidence::new(
+                process.binding().clone(),
+                identity.process_id().clone(),
+                Vec::new(),
+                false,
+                false,
+                None,
+            )?;
+            process.exit(
+                ExitStatus::new(ExitDisposition::Unknown, None, None, 202)?,
+                descendants,
+            )?;
+        }
         state
             .process
             .as_ref()
@@ -211,6 +235,7 @@ struct AdmissionState {
     effect_expired: bool,
     observed_at_unix_ms: u64,
     expires_at_unix_ms: u64,
+    last_claim_digest: Option<String>,
 }
 
 #[derive(Clone, Default)]
@@ -242,8 +267,8 @@ impl CapabilityAdmissionPort for FakeAdmission {
             authority.state_fence.resource_generation = ResourceGeneration::new(2)
                 .map_err(|_| ProviderFailure::new("admission", "wrong generation"))?;
         }
-        Ok(CapabilityAdmissionOutcome::Admitted(Box::new(
-            CapabilityAdmissionFacts::new(
+        Ok(CapabilityAdmissionOutcome::Admitted(Box::new({
+            let mut facts = CapabilityAdmissionFacts::new(
                 "admission-1",
                 "admission-revision-1",
                 1,
@@ -262,8 +287,19 @@ impl CapabilityAdmissionPort for FakeAdmission {
                 request.process_fence().clone(),
                 request.process_request_digest(),
                 *request.resource_limits(),
-            ),
-        )))
+            );
+            if let Some(presented) = request.claim() {
+                state.last_claim_digest = Some(presented.claim().binding_digest.clone());
+                facts = facts.with_claim_binding(presented.claim());
+                if let Some(join) = &presented.claim().executable_binding {
+                    facts = facts.with_executable_expectation(NativeWorkerExecutableExpectation {
+                        current: join.clone(),
+                        revoked: false,
+                    });
+                }
+            }
+            facts
+        })))
     }
 
     fn revalidate(
@@ -1720,4 +1756,524 @@ fn native_case_21_stale_resource_task_policy_integration_fences_preserve_provide
 fn native_case_22_existing_cancellation_and_unknown_outcome_paths_remain_green() {
     cancel_calls_p03_once_and_replays_the_same_durable_event();
     unknown_cancel_blocks_work_until_exact_p03_reconciliation();
+}
+
+// ---------------------------------------------------------------------------
+// T2-S05 Slice B: claim-bound recovery + binding preservation (issue #1430).
+//
+// Additive coverage for `WorkerCore::recover_after_restart_claimed`: the same
+// retained-acquisition inspect + replay-suffix path as `recover_after_restart`
+// under the exact claim identity, with stale/misaddressed joins refused
+// exactly like `demand_start_claimed`. No existing case above is modified.
+// ---------------------------------------------------------------------------
+
+fn claim_limits() -> ResourceLimits {
+    ResourceLimits::new(5_000, Some(1_000), Some(1_048_576), 4_096, 4_096, 2).expect("limits")
+}
+
+fn claim_registration() -> NativeWorkerRegistration {
+    NativeWorkerRegistration {
+        registration_id: NativeRegistrationId::new("registration-1").expect("registration"),
+        installation_id: "installation-1".to_owned(),
+        worker_artifact_digest: "a".repeat(64),
+        worker_config_digest: "b".repeat(64),
+        protocol_version: PROTOCOL_VERSION.to_owned(),
+        worker_generation: 1,
+        process_id: 4242,
+        process_start_100ns: 120,
+        process_image_digest: "c".repeat(64),
+        principal_ref: "principal-1".to_owned(),
+        session_id: eliot_contracts::SessionId::new("session-operation-1").expect("session"),
+        connection_id: "connection-claim-1".to_owned(),
+        authority_epoch: test_epoch(1),
+        state_fence: StateFence::new(
+            test_epoch(1),
+            ResourceGeneration::new(1).expect("generation"),
+        ),
+        lease_id: "lease-reg-1".to_owned(),
+        lease_expires_at_unix_ms: 9_000,
+        renewal_id: NativeRenewalId::new("renewal-1").expect("renewal"),
+        execution_unit_schema_version: EXECUTION_UNIT_SCHEMA_VERSION,
+        resource_limits: claim_limits(),
+        invalidation_set: BTreeSet::new(),
+    }
+}
+
+fn claim_owner_digest() -> String {
+    sha256_hex(b"t2-s05 slice-b owner-issued executable digest stand-in")
+}
+
+fn claim_join(
+    registration: &NativeWorkerRegistration,
+    hello_value: &WorkerHello,
+    process: &ProcessRequest,
+) -> NativeWorkerExecutableBinding {
+    NativeWorkerExecutableBinding {
+        route_ref: hello_value.route_ref.clone(),
+        adapter_id: "adapter-test".to_owned(),
+        adapter_revision: 3,
+        config_digest: registration.worker_config_digest.clone(),
+        facet_manifest_ref: "facet-manifest-7".to_owned(),
+        grant_graph_revision: 5,
+        replay_stream_id: "worker-stream-1".to_owned(),
+        launch_nonce: hello_value.launch_nonce.clone(),
+        process_invocation_digest: process.invocation_digest().to_owned(),
+        authority_epoch: test_epoch(1),
+        generation: ResourceGeneration::new(1).expect("generation"),
+        state_fence: StateFence::new(
+            test_epoch(1),
+            ResourceGeneration::new(1).expect("generation"),
+        ),
+        deadline_unix_ms: 8_000,
+        expires_at_unix_ms: 9_500,
+        executable_wire_version: NATIVE_WORKER_EXECUTABLE_BINDING_EXPECTED_WIRE_VERSION,
+        executable_binding_digest: claim_owner_digest(),
+    }
+}
+
+fn claim_for(
+    registration: &NativeWorkerRegistration,
+    hello_value: &WorkerHello,
+    process: &ProcessRequest,
+) -> NativeWorkerClaim {
+    let join = claim_join(registration, hello_value, process);
+    let draft = NativeWorkerClaim {
+        claim_id: NativeClaimId::new("claim-1").expect("claim"),
+        registration_id: registration.registration_id.clone(),
+        worker_generation: 1,
+        parent_job_id: "job-parent-1".to_owned(),
+        task_id: TaskId::new("task-1").expect("task"),
+        work_scope_id: "scope-1".to_owned(),
+        decision_id: DecisionId::new("decision-1").expect("decision"),
+        attempt_id: AttemptId::new("attempt-1").expect("attempt"),
+        operation_id: OperationId::new("operation-1").expect("operation"),
+        route_class: "test-route".to_owned(),
+        budget: BudgetEnvelope {
+            context_tokens: 100,
+            wall_time_ms: 4_000,
+            output_bytes: 4_096,
+            cost_microunits: 1_000,
+            max_depth: 4,
+            max_descendants: 8,
+        },
+        deadline_unix_ms: 9_000,
+        cancellation_policy_id: "policy-1".to_owned(),
+        expected_result_schema: "result-schema-1".to_owned(),
+        expected_result_schema_version: 1,
+        predecessor_revision: "rev-0".to_owned(),
+        authority_epoch: test_epoch(1),
+        state_fence: StateFence::new(
+            test_epoch(1),
+            ResourceGeneration::new(1).expect("generation"),
+        ),
+        wire_version: NATIVE_WORKER_CLAIM_WIRE_VERSION,
+        executable_binding: Some(join),
+        binding_digest: String::new(),
+    };
+    draft.with_computed_digest().expect("claim digest")
+}
+
+fn claim_request_for(
+    registration: &NativeWorkerRegistration,
+    claim: &NativeWorkerClaim,
+) -> ClaimAdmissionRequest {
+    serde_json::from_value(serde_json::json!({
+        "registration": registration,
+        "claim": claim,
+    }))
+    .expect("claim request")
+}
+
+fn claimed_frame(connection: &str, request_id: &str, body: WorkerFrameBody) -> WorkerFrame {
+    let mut created = frame(request_id, body);
+    created.connection_id = connection.to_owned();
+    created
+}
+
+fn claim_hello(connection: &str, request: &str) -> WorkerHello {
+    let mut created = hello(connection, request);
+    created.launch_nonce = "launch-nonce-claim-1".to_owned();
+    created
+}
+
+fn claimed_setup() -> (
+    TestCore,
+    FakeExecutor,
+    FakeAdmission,
+    FakeReplay,
+    ClaimAdmissionRequest,
+    String,
+) {
+    let (core, executor, admission, replay, _) = fixture();
+    let registration = claim_registration();
+    let process = process_request();
+    let hello_value = claim_hello("connection-claim-1", "start-claim-1");
+    let claim_value = claim_for(&registration, &hello_value, &process);
+    let digest = claim_value.binding_digest.clone();
+    let request = claim_request_for(&registration, &claim_value);
+    (core, executor, admission, replay, request, digest)
+}
+
+fn claimed_start(core: &mut TestCore, claim: &ClaimAdmissionRequest) {
+    block_on(core.demand_start_claimed(
+        claim.clone(),
+        claim_hello("connection-claim-1", "start-claim-1"),
+        process_request(),
+    ))
+    .expect("claimed start");
+    assert_eq!(core.lifecycle(), WorkerLifecycle::Ready);
+}
+
+fn restarted_core(
+    executor: &FakeExecutor,
+    admission: &FakeAdmission,
+    replay: &FakeReplay,
+) -> TestCore {
+    WorkerCore::new(
+        Some(executor.clone()),
+        Some(admission.clone()),
+        Some(replay.clone()),
+        Some(replay.clone()),
+        Some(Arc::new(RecordingSink::default())),
+    )
+}
+
+#[test]
+fn claim_bound_recovery_retains_acquisition_and_replays_suffix_without_duplicate_start() {
+    let (mut first, executor, admission, replay, claim, digest) = claimed_setup();
+    claimed_start(&mut first, &claim);
+    let heartbeat = block_on(first.handle(claimed_frame(
+        "connection-claim-1",
+        "heartbeat-claim-1",
+        WorkerFrameBody::Heartbeat,
+    )))
+    .expect("heartbeat");
+    let original_id = heartbeat[0].event_id.clone();
+
+    let mut restarted = restarted_core(&executor, &admission, &replay);
+    let recovery = block_on(restarted.recover_after_restart_claimed(
+        claim,
+        claim_hello("connection-claim-2", "recover-claim-1"),
+        process_request(),
+        0,
+    ))
+    .expect("claimed recovery");
+    assert_eq!(recovery.connection_id, "connection-claim-2");
+    assert_eq!(recovery.lifecycle, WorkerLifecycle::Ready);
+    assert_eq!(restarted.lifecycle(), WorkerLifecycle::Ready);
+    assert!(
+        recovery
+            .replayed_events
+            .iter()
+            .any(|event| event.event_id == original_id)
+    );
+    let state = executor.state.lock().expect("executor lock");
+    assert_eq!(state.starts, 1);
+    assert_eq!(state.inspections, 2);
+    drop(state);
+    let admission_state = admission.state.lock().expect("admission lock");
+    assert_eq!(admission_state.admissions, 2);
+    assert_eq!(admission_state.last_claim_digest, Some(digest));
+}
+
+#[test]
+fn claim_bound_recovery_refuses_stale_generation_epoch_and_misaddressed_joins() {
+    // Stale generation: claim + registration advanced while hello/process stay
+    // on generation 1 — refused before admission, exactly like the start path.
+    {
+        let (mut core, executor, admission, _, claim, _) = claimed_setup();
+        let mut registration_value = claim_registration();
+        let mut claim_value = serde_json::from_value::<NativeWorkerClaim>(
+            serde_json::to_value(claim.claim()).expect("claim value"),
+        )
+        .expect("claim roundtrip");
+        registration_value.worker_generation = 2;
+        claim_value.worker_generation = 2;
+        let claim_value = claim_value.with_computed_digest().expect("redigest");
+        let stale = claim_request_for(&registration_value, &claim_value);
+        assert_eq!(
+            block_on(core.recover_after_restart_claimed(
+                stale,
+                claim_hello("connection-claim-2", "recover-claim-stale-gen"),
+                process_request(),
+                0,
+            )),
+            Err(WorkerError::InvalidRequest("generation_binding"))
+        );
+        assert_eq!(
+            admission.state.lock().expect("admission lock").admissions,
+            0
+        );
+        assert_eq!(executor.state.lock().expect("executor lock").starts, 0);
+        assert_eq!(core.lifecycle(), WorkerLifecycle::Created);
+    }
+    // Stale epoch: claim + registration on a newer authority lineage sequence
+    // than the presented hello — refused before admission.
+    {
+        let (mut core, executor, admission, _, claim, _) = claimed_setup();
+        let mut registration_value = claim_registration();
+        let mut claim_value = serde_json::from_value::<NativeWorkerClaim>(
+            serde_json::to_value(claim.claim()).expect("claim value"),
+        )
+        .expect("claim roundtrip");
+        let advanced = test_epoch(2);
+        let advanced_fence = StateFence::new(
+            advanced.clone(),
+            ResourceGeneration::new(1).expect("generation"),
+        );
+        registration_value.authority_epoch = advanced.clone();
+        registration_value.state_fence = advanced_fence.clone();
+        claim_value.authority_epoch = advanced;
+        claim_value.state_fence = advanced_fence;
+        let claim_value = claim_value.with_computed_digest().expect("redigest");
+        let stale = claim_request_for(&registration_value, &claim_value);
+        assert_eq!(
+            block_on(core.recover_after_restart_claimed(
+                stale,
+                claim_hello("connection-claim-2", "recover-claim-stale-epoch"),
+                process_request(),
+                0,
+            )),
+            Err(WorkerError::StaleEpoch)
+        );
+        assert_eq!(
+            admission.state.lock().expect("admission lock").admissions,
+            0
+        );
+        assert_eq!(executor.state.lock().expect("executor lock").starts, 0);
+        assert_eq!(core.lifecycle(), WorkerLifecycle::Created);
+    }
+    // Misrouted join: the executable join names a different route than the
+    // presented hello — refused before admission.
+    {
+        let (mut core, executor, admission, _, claim, _) = claimed_setup();
+        let registration_value = claim_registration();
+        let mut claim_value = serde_json::from_value::<NativeWorkerClaim>(
+            serde_json::to_value(claim.claim()).expect("claim value"),
+        )
+        .expect("claim roundtrip");
+        claim_value
+            .executable_binding
+            .as_mut()
+            .expect("v2 fixture carries the join")
+            .route_ref = "route://changed".to_owned();
+        let claim_value = claim_value.with_computed_digest().expect("redigest");
+        let misaddressed = claim_request_for(&registration_value, &claim_value);
+        assert_eq!(
+            block_on(core.recover_after_restart_claimed(
+                misaddressed,
+                claim_hello("connection-claim-2", "recover-claim-route"),
+                process_request(),
+                0,
+            )),
+            Err(WorkerError::InvalidRequest("executable_binding.route_ref"))
+        );
+        assert_eq!(
+            admission.state.lock().expect("admission lock").admissions,
+            0
+        );
+        assert_eq!(executor.state.lock().expect("executor lock").starts, 0);
+        assert_eq!(core.lifecycle(), WorkerLifecycle::Created);
+    }
+    // Misaddressed stream: the join passes the hello/process check but names
+    // a replay stream the admitted grant does not own — refused after
+    // admission, before any inspect, with zero starts.
+    {
+        let (mut core, executor, admission, _, claim, _) = claimed_setup();
+        let registration_value = claim_registration();
+        let mut claim_value = serde_json::from_value::<NativeWorkerClaim>(
+            serde_json::to_value(claim.claim()).expect("claim value"),
+        )
+        .expect("claim roundtrip");
+        claim_value
+            .executable_binding
+            .as_mut()
+            .expect("v2 fixture carries the join")
+            .replay_stream_id = "stream-other/gen-1".to_owned();
+        let claim_value = claim_value.with_computed_digest().expect("redigest");
+        let misaddressed = claim_request_for(&registration_value, &claim_value);
+        assert_eq!(
+            block_on(core.recover_after_restart_claimed(
+                misaddressed,
+                claim_hello("connection-claim-2", "recover-claim-stream"),
+                process_request(),
+                0,
+            )),
+            Err(WorkerError::InvalidRequest(
+                "executable_binding.replay_stream_id"
+            ))
+        );
+        assert_eq!(
+            admission.state.lock().expect("admission lock").admissions,
+            1
+        );
+        assert_eq!(executor.state.lock().expect("executor lock").starts, 0);
+        assert_eq!(executor.state.lock().expect("executor lock").inspections, 0);
+        assert_eq!(core.lifecycle(), WorkerLifecycle::Created);
+    }
+}
+
+#[test]
+fn claim_bound_recovery_preserves_cancel_and_checkpoint_under_same_binding() {
+    let (mut first, executor, admission, replay, claim, _) = claimed_setup();
+    claimed_start(&mut first, &claim);
+    let mut restarted = restarted_core(&executor, &admission, &replay);
+    block_on(restarted.recover_after_restart_claimed(
+        claim,
+        claim_hello("connection-claim-2", "recover-claim-1"),
+        process_request(),
+        0,
+    ))
+    .expect("claimed recovery");
+
+    let checkpoint = block_on(restarted.handle(claimed_frame(
+        "connection-claim-2",
+        "checkpoint-claim-1",
+        WorkerFrameBody::Checkpoint(CheckpointRequest {
+            checkpoint_ref: "checkpoint-blob-1".to_owned(),
+        }),
+    )))
+    .expect("checkpoint");
+    assert!(matches!(
+        checkpoint[0].payload,
+        WorkerEventPayload::Checkpoint { .. }
+    ));
+    assert_eq!(replay.state.lock().expect("replay lock").checkpoints, 1);
+
+    let cancel = claimed_frame(
+        "connection-claim-2",
+        "cancel-claim-1",
+        WorkerFrameBody::Cancel(CancelRequest {
+            attempt_id: AttemptId::new("attempt-1").expect("attempt"),
+            reason: "operator".to_owned(),
+        }),
+    );
+    let first_cancel = block_on(restarted.handle(cancel.clone())).expect("cancel");
+    let second_cancel = block_on(restarted.handle(cancel)).expect("cancel replay");
+    assert_eq!(first_cancel, second_cancel);
+    assert_eq!(executor.state.lock().expect("executor lock").cancels, 1);
+}
+
+#[test]
+fn claim_bound_unknown_outcome_reconciles_under_original_claim_identity() {
+    let (mut first, executor, admission, replay, claim, digest) = claimed_setup();
+    claimed_start(&mut first, &claim);
+    executor
+        .state
+        .lock()
+        .expect("executor lock")
+        .report_unknown_on_inspect = true;
+
+    let mut restarted = restarted_core(&executor, &admission, &replay);
+    let recovery = block_on(restarted.recover_after_restart_claimed(
+        claim,
+        claim_hello("connection-claim-2", "recover-claim-unknown"),
+        process_request(),
+        0,
+    ))
+    .expect("claimed recovery");
+    assert_eq!(recovery.lifecycle, WorkerLifecycle::UnknownOutcome);
+    assert_eq!(restarted.lifecycle(), WorkerLifecycle::UnknownOutcome);
+    assert!(!recovery.replayed_events.is_empty());
+
+    let reconciled = block_on(restarted.handle(claimed_frame(
+        "connection-claim-2",
+        "reconcile-claim-1",
+        WorkerFrameBody::Reconcile,
+    )))
+    .expect("reconcile");
+    assert!(matches!(
+        reconciled[0].payload,
+        WorkerEventPayload::Reconciled { .. }
+    ));
+    assert_eq!(restarted.lifecycle(), WorkerLifecycle::Reconciled);
+    assert_eq!(
+        executor
+            .state
+            .lock()
+            .expect("executor lock")
+            .reconciliations,
+        1
+    );
+    // The reconcile ran under the recovered binding: the admission owner saw
+    // the original claim digest on recovery, never a fresh identity.
+    assert_eq!(
+        admission
+            .state
+            .lock()
+            .expect("admission lock")
+            .last_claim_digest,
+        Some(digest)
+    );
+}
+
+#[test]
+fn claim_bound_reconnect_refuses_stale_generation_and_epoch() {
+    let (mut first, executor, admission, replay, claim, _) = claimed_setup();
+    claimed_start(&mut first, &claim);
+    let mut restarted = restarted_core(&executor, &admission, &replay);
+    block_on(restarted.recover_after_restart_claimed(
+        claim,
+        claim_hello("connection-claim-2", "recover-claim-1"),
+        process_request(),
+        0,
+    ))
+    .expect("claimed recovery");
+
+    let mut stale_generation = claimed_frame(
+        "connection-claim-2",
+        "reconnect-claim-stale-gen",
+        WorkerFrameBody::Reconnect(ReconnectRequest {
+            previous_connection_id: "connection-claim-2".to_owned(),
+            new_connection_id: "connection-claim-3".to_owned(),
+            replay_after_sequence: 0,
+        }),
+    );
+    stale_generation.producer_generation = 2;
+    assert_eq!(
+        block_on(restarted.handle(stale_generation)),
+        Err(WorkerError::StaleEpoch)
+    );
+
+    let mut stale_epoch = claimed_frame(
+        "connection-claim-2",
+        "reconnect-claim-stale-epoch",
+        WorkerFrameBody::Reconnect(ReconnectRequest {
+            previous_connection_id: "connection-claim-2".to_owned(),
+            new_connection_id: "connection-claim-3".to_owned(),
+            replay_after_sequence: 0,
+        }),
+    );
+    stale_epoch.authority_epoch = test_epoch(2);
+    stale_epoch.state_fence.authority_epoch = test_epoch(2);
+    assert_eq!(
+        block_on(restarted.handle(stale_epoch)),
+        Err(WorkerError::StaleEpoch)
+    );
+
+    // Both refusals preserved the recovered binding: a well-formed reconnect
+    // on the same connection still succeeds afterwards.
+    let reconnected = block_on(restarted.handle(claimed_frame(
+        "connection-claim-2",
+        "reconnect-claim-1",
+        WorkerFrameBody::Reconnect(ReconnectRequest {
+            previous_connection_id: "connection-claim-2".to_owned(),
+            new_connection_id: "connection-claim-3".to_owned(),
+            replay_after_sequence: 0,
+        }),
+    )))
+    .expect("reconnect");
+    assert!(
+        reconnected
+            .iter()
+            .any(|event| event.payload_type == "worker.reconnected")
+    );
+    assert!(
+        block_on(restarted.handle(claimed_frame(
+            "connection-claim-3",
+            "health-claim-1",
+            WorkerFrameBody::Health
+        )))
+        .is_ok()
+    );
 }
