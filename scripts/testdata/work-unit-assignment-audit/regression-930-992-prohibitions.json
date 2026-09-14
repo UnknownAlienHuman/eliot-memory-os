@@ -1,0 +1,39 @@
+{
+  "schema": "eliot-assignment-snapshot-v1",
+  "header": {
+    "repository": "UnknownAlienHuman/eliot-memory-os",
+    "base_sha": "fb3fc334e113236cb82cf5ca9139fc0970df032b",
+    "complete": true
+  },
+  "issues": [
+    {
+      "number": 930,
+      "state": "open",
+      "title": "Assignment integrity oracle with strict inline prohibitions",
+      "body": "## Exclusive mutable scope\n- scripts/audit-work-unit-assignments.py\n- scripts/tests/test_audit_work_unit_assignments.py\n\nNo other files or directories may be modified. Do not modify Cargo.toml, Cargo.lock, or any files under crates/.\nOnly scripts/audit-work-unit-assignments.py and scripts/tests/test_audit_work_unit_assignments.py are authorized.\n\n## Required test matrix\nDeclared denominator: 1 cases, exactly 1..1.\n1. Case one\n",
+      "dependencies": []
+    }
+  ],
+  "pull_requests": [
+    {
+      "number": 1390,
+      "state": "open",
+      "draft": false,
+      "title": "work(scripts): implement oracle",
+      "body": "Implements #930",
+      "head_ref": "work/930-inline-prohibitions",
+      "head_repo": "UnknownAlienHuman/eliot-memory-os",
+      "base_ref": "main",
+      "base_sha": "fb3fc334e113236cb82cf5ca9139fc0970df032b",
+      "changed_paths": [
+        "scripts/audit-work-unit-assignments.py",
+        "Cargo.toml",
+        "crates/kernel/src/lib.rs"
+      ]
+    }
+  ],
+  "repository_records": {
+    "workstreams": [],
+    "retired_refs": []
+  }
+}

@@ -343,6 +343,19 @@ class AssignmentIntegrityOracle:
                 branch_exceptions.add(be["branch"])
 
         retired_refs: Set[str] = set(repo_records.get("retired_refs", []))
+        manifests_data = repo_records.get("manifests", [])
+        tracked_tree_data = repo_records.get("tracked_tree", [])
+
+        # Index manifests by directory and package
+        manifests_by_dir: Dict[str, Dict[str, Any]] = {}
+        manifests_by_pkg: Dict[str, List[Dict[str, Any]]] = {}
+        for m in manifests_data:
+            m_path = normalize_path(m.get("path", ""))
+            m_pkg = m.get("package", "")
+            m_dir = m_path.rsplit("/", 1)[0] + "/" if "/" in m_path else m_path + "/"
+            entry = {"path": m_path, "package": m_pkg, "dir": m_dir, "plane": m.get("plane", "")}
+            manifests_by_dir[m_dir] = entry
+            manifests_by_pkg.setdefault(m_pkg, []).append(entry)
 
         # 2. Parse and validate issues
         issues_by_number: Dict[int, Dict[str, Any]] = {}
@@ -526,8 +539,33 @@ class AssignmentIntegrityOracle:
             expected_repo = header.get("repository", "")
             changed_paths = [normalize_path(p) for p in pr.get("changed_paths", [])]
             is_draft = pr.get("draft", False)
-            is_reservation = pr.get("is_reservation", False)
-            has_marker = pr.get("has_reservation_marker", False)
+            marker_files = [p for p in changed_paths if p.startswith(".github/temporary/work-unit-") or p.endswith(".marker")]
+            has_marker_in_diff = bool(marker_files) or pr.get("has_reservation_marker", False)
+
+            # Metadata-only changed paths: files under .github/temporary/, workstreams .toml, .md, or .marker
+            def is_metadata_path(p: str) -> bool:
+                if p.startswith(".github/temporary/") or p.endswith(".marker"):
+                    return True
+                if p.startswith("workstreams/") and p.endswith(".toml"):
+                    return True
+                if p.endswith(".md"):
+                    return True
+                return False
+
+            prod_diff = [p for p in changed_paths if not is_metadata_path(p)]
+
+            # Intent indicators: title, body, or head_ref
+            has_reservation_intent = bool(
+                re.search(r"\breservation\b", title, re.IGNORECASE)
+                or re.search(r"\breserve\b", title, re.IGNORECASE)
+                or re.search(r"\breservation\b", body, re.IGNORECASE)
+                or head_ref.startswith("reserve/")
+                or head_ref.startswith("reservation/")
+                or pr.get("is_reservation", False)
+            )
+
+            # Derived reservation status: reservation-only if marker and metadata diff, or reservation intent
+            is_reservation = (has_reservation_intent and not prod_diff) or (has_marker_in_diff and not prod_diff) or pr.get("is_reservation", False)
 
             # Check fork/head repository mismatch
             if expected_repo and head_repo and expected_repo.lower() != head_repo.lower():
@@ -614,9 +652,28 @@ class AssignmentIntegrityOracle:
                         issue=primary_owner,
                     ))
 
-            # Candidate status check
-            cand_status = pr.get("candidate_status")
-            if cand_status == "stale_base":
+            # Candidate status check derived from primary facts
+            pr_base_sha = pr.get("base_sha")
+            auth_base_sha = header.get("base_sha")
+            pr_merge_base_sha = pr.get("merge_base_sha")
+
+            if pr_base_sha and auth_base_sha and pr_base_sha != auth_base_sha:
+                self.findings.append(Finding(
+                    rule_id="AU-CAND-STALE-BASE",
+                    severity=FindingSeverity.ERROR,
+                    finding_class=FindingClass.BRANCH_VIOLATION,
+                    message=f"PR #{pr_num} has stale base commit: {pr_base_sha} != {auth_base_sha}",
+                    pr=pr_num,
+                ))
+            elif pr_merge_base_sha and auth_base_sha and pr_merge_base_sha != auth_base_sha:
+                self.findings.append(Finding(
+                    rule_id="AU-CAND-STALE-BASE",
+                    severity=FindingSeverity.ERROR,
+                    finding_class=FindingClass.BRANCH_VIOLATION,
+                    message=f"PR #{pr_num} merge base {pr_merge_base_sha} is not repository base {auth_base_sha}",
+                    pr=pr_num,
+                ))
+            elif pr.get("candidate_status") == "stale_base":
                 self.findings.append(Finding(
                     rule_id="AU-CAND-STALE-BASE",
                     severity=FindingSeverity.ERROR,
@@ -624,27 +681,31 @@ class AssignmentIntegrityOracle:
                     message=f"PR #{pr_num} has stale base commit",
                     pr=pr_num,
                 ))
-            elif cand_status == "dirty":
+
+            dirty_files = pr.get("dirty_files", [])
+            tree_state = pr.get("tree_state")
+            worktree_clean = pr.get("worktree_clean")
+            if dirty_files or tree_state == "dirty" or worktree_clean is False or pr.get("candidate_status") == "dirty":
                 self.findings.append(Finding(
                     rule_id="AU-CAND-DIRTY",
                     severity=FindingSeverity.ERROR,
                     finding_class=FindingClass.BRANCH_VIOLATION,
-                    message=f"PR #{pr_num} candidate worktree is dirty",
+                    message=f"PR #{pr_num} candidate worktree is dirty: {dirty_files or 'unclean tree'}",
                     pr=pr_num,
                 ))
-            elif cand_status == "head_mismatch":
+
+            head_sha = pr.get("head_sha")
+            expected_head_sha = pr.get("expected_head_sha") or pr.get("initial_head_sha") or pr.get("ref_sha")
+            if (head_sha and expected_head_sha and head_sha != expected_head_sha) or pr.get("candidate_status") == "head_mismatch":
                 self.findings.append(Finding(
                     rule_id="AU-CAND-HEAD-MISMATCH",
                     severity=FindingSeverity.ERROR,
                     finding_class=FindingClass.BRANCH_VIOLATION,
-                    message=f"PR #{pr_num} candidate has initial HEAD mismatch",
+                    message=f"PR #{pr_num} candidate has initial HEAD mismatch: {head_sha} != {expected_head_sha}",
                     pr=pr_num,
                 ))
 
             # Reservation lifecycle checks
-            marker_files = [p for p in changed_paths if p.startswith(".github/temporary/work-unit-") or p.endswith(".marker")]
-            has_marker_in_diff = bool(marker_files) or has_marker
-
             for mf in marker_files:
                 m_num = re.search(r"work-unit-(\d+)", mf)
                 if m_num and owner_claims:
@@ -660,7 +721,7 @@ class AssignmentIntegrityOracle:
                             path=mf,
                         ))
 
-            if is_reservation:
+            if is_reservation or has_reservation_intent:
                 # Valid reservation draft
                 if not is_draft:
                     self.findings.append(Finding(
@@ -671,7 +732,6 @@ class AssignmentIntegrityOracle:
                         pr=pr_num,
                     ))
                 # Check for production code diff in reservation-only PR
-                prod_diff = [p for p in changed_paths if not p.startswith(".github/temporary/") and not p.endswith(".toml") and not p.endswith(".md")]
                 if prod_diff:
                     self.findings.append(Finding(
                         rule_id="AU-RESERV-PROD-DIFF",
@@ -691,7 +751,7 @@ class AssignmentIntegrityOracle:
                     ))
             else:
                 # Implementation PR retaining marker rejected
-                if has_marker_in_diff and any(p.endswith(".rs") or p.endswith(".py") for p in changed_paths):
+                if has_marker_in_diff and (prod_diff or any(p.endswith(".rs") or p.endswith(".py") for p in changed_paths)):
                     self.findings.append(Finding(
                         rule_id="AU-RESERV-RETAINED",
                         severity=FindingSeverity.ERROR,
@@ -710,10 +770,14 @@ class AssignmentIntegrityOracle:
                 claimed_issue = owner_claims[0]
                 allowed_scope = issue_write_scopes.get(claimed_issue, [])
                 prohibitions = issue_prohibitions.get(claimed_issue, [])
+                has_strict_no_other = any("no other" in prh.lower() for prh in prohibitions)
 
                 for cp in changed_paths:
-                    # Check if changed path violates explicit prohibition
-                    if any(paths_overlap(cp, prh) for prh in prohibitions):
+                    # Check if changed path violates explicit prohibition or strict scope
+                    is_prohibited = any(paths_overlap(cp, prh) for prh in prohibitions if "/" in prh or "." in prh)
+                    is_outside_scope = has_strict_no_other and not any(paths_overlap(cp, allow) for allow in allowed_scope)
+
+                    if is_prohibited or is_outside_scope:
                         self.findings.append(Finding(
                             rule_id="AU-PROHIBITION-01",
                             severity=FindingSeverity.ERROR,
@@ -738,11 +802,19 @@ class AssignmentIntegrityOracle:
         # 4. Workstream and Repository Records Validation
         workstreams = repo_records.get("workstreams", [])
         workstream_names: Set[str] = set()
+        workstreams_by_pkg: Dict[str, List[Dict[str, Any]]] = {}
+
         for ws in workstreams:
             path = ws.get("path", "")
             internal_iss = ws.get("internal_issue")
             target_issue = ws.get("issue")
             owner_issues = ws.get("owner_issues", [])
+            claimed_pkg = ws.get("package", "")
+            target_dir = ws.get("target_dir") or ws.get("crate_dir", "")
+            ws_write_paths = [normalize_path(p) for p in ws.get("write_paths", [])]
+
+            if claimed_pkg:
+                workstreams_by_pkg.setdefault(claimed_pkg, []).append(ws)
 
             # Malformed/duplicate workstream
             if path in workstream_names:
@@ -781,9 +853,20 @@ class AssignmentIntegrityOracle:
                     path=path,
                 ))
 
-            # Physical package owner validation
-            claimed_pkg = ws.get("package", "")
+            # Physical package owner validation derived from manifests / target_dir
             physical_pkg = ws.get("physical_package", "")
+            if not physical_pkg and target_dir:
+                norm_td = normalize_path(target_dir)
+                if not norm_td.endswith("/"):
+                    norm_td += "/"
+                if norm_td in manifests_by_dir:
+                    physical_pkg = manifests_by_dir[norm_td].get("package", "")
+                else:
+                    for m_dir, m_entry in manifests_by_dir.items():
+                        if paths_overlap(norm_td, m_dir):
+                            physical_pkg = m_entry.get("package", "")
+                            break
+
             if claimed_pkg and physical_pkg and claimed_pkg != physical_pkg:
                 self.findings.append(Finding(
                     rule_id="AU-PHYSICAL-OWNER",
@@ -793,8 +876,25 @@ class AssignmentIntegrityOracle:
                     path=path,
                 ))
 
-            # Neighbor crate and incompatible package checks (cases 29, 32)
-            if ws.get("neighbor_crate_violation", False):
+            # Neighbor crate ownership check (case 29) derived from manifests / tracked tree
+            is_neighbor_violation = ws.get("neighbor_crate_violation", False)
+            if not is_neighbor_violation and claimed_pkg:
+                claimed_pkg_entries = manifests_by_pkg.get(claimed_pkg, [])
+                pkg_dir = claimed_pkg_entries[0].get("dir") if claimed_pkg_entries else (target_dir or "")
+                if pkg_dir:
+                    norm_pkg_dir = normalize_path(pkg_dir)
+                    if not norm_pkg_dir.endswith("/"):
+                        norm_pkg_dir += "/"
+                    for wp in ws_write_paths:
+                        if not paths_overlap(wp, norm_pkg_dir):
+                            for other_dir, other_m in manifests_by_dir.items():
+                                if other_dir != norm_pkg_dir and paths_overlap(wp, other_dir):
+                                    is_neighbor_violation = True
+                                    break
+                            if is_neighbor_violation:
+                                break
+
+            if is_neighbor_violation:
                 self.findings.append(Finding(
                     rule_id="AU-NEIGHBOR-CRATE",
                     severity=FindingSeverity.ERROR,
@@ -802,7 +902,17 @@ class AssignmentIntegrityOracle:
                     message=f"Workstream '{path}' improperly claims neighboring crate ownership",
                     path=path,
                 ))
-            if claimed_pkg and ws.get("incompatible_with_existing", False):
+
+            # Duplicate incompatible package owners check (case 32)
+            is_incompatible = ws.get("incompatible_with_existing", False)
+            if not is_incompatible and claimed_pkg:
+                pkg_ws_list = workstreams_by_pkg.get(claimed_pkg, [])
+                if len(pkg_ws_list) > 1:
+                    first_ws = pkg_ws_list[0]
+                    if ws.get("internal_issue") != first_ws.get("internal_issue") or ws.get("path") != first_ws.get("path"):
+                        is_incompatible = True
+
+            if is_incompatible:
                 self.findings.append(Finding(
                     rule_id="AU-PKG-DUP-INCOMPATIBLE",
                     severity=FindingSeverity.ERROR,
@@ -1016,6 +1126,17 @@ class AssignmentIntegrityOracle:
             if stripped.startswith(">") or line.startswith("    ") or line.startswith("\t"):
                 continue
 
+            # Check for inline prohibitions anywhere in the body outside code fences
+            if re.search(r"\b(?:no other|do not modify|not authorized|must not modify|no \w+ changes)\b", stripped, re.IGNORECASE):
+                if stripped not in res["prohibitions"]:
+                    res["prohibitions"].append(stripped)
+                for token in stripped.split():
+                    clean_tok = token.strip(".,;:()'`\"[]*")
+                    if ("/" in clean_tok or clean_tok in ("Cargo.toml", "Cargo.lock")) and not clean_tok.startswith("http"):
+                        norm_tok = normalize_path(clean_tok)
+                        if norm_tok not in res["prohibitions"]:
+                            res["prohibitions"].append(norm_tok)
+
             # Check if line is a heading
             if line.startswith("#"):
                 norm = normalize_heading(line)
@@ -1037,19 +1158,31 @@ class AssignmentIntegrityOracle:
                 scope_lines.append(stripped)
             elif current_section == "prohibition":
                 prohibition_lines.append(stripped)
-            elif current_section == "matrix":
+            elif current_section in ("matrix", "verification"):
                 matrix_lines.append(stripped)
 
         # Parse Scope lines: extract bullet points and inline prohibitions
         for sl in scope_lines:
             # Inline restrictions
-            if re.search(r"\b(?:no other|do not modify|not authorized|no \w+ changes)\b", sl, re.IGNORECASE):
+            if re.search(r"\b(?:no other|do not modify|not authorized|must not modify|no \w+ changes)\b", sl, re.IGNORECASE):
                 # Restrictive clause
                 res["prohibitions"].append(sl)
+                for token in sl.split():
+                    clean_tok = token.strip(".,;:()'`\"[]*")
+                    if ("/" in clean_tok or clean_tok in ("Cargo.toml", "Cargo.lock")) and not clean_tok.startswith("http"):
+                        res["prohibitions"].append(normalize_path(clean_tok))
             elif sl.startswith("-") or sl.startswith("*"):
                 item = sl.lstrip("-* ").rstrip(";")
-                if item and not item.startswith("#") and not item.startswith("http"):
+                # Ignore conditional clauses that must not be guessed as write paths
+                if re.match(r"^(?:only when|only if|if\b|where\b|when\b|provided\b|unless\b)", item, re.IGNORECASE):
+                    pass
+                elif item and not item.startswith("#") and not item.startswith("http"):
                     res["write_paths"].append(normalize_path(item))
+            elif re.match(r"^Only\s+([^\s]+)\s+is authorized", sl, re.IGNORECASE):
+                m_only = re.match(r"^Only\s+([^\s]+)\s+is authorized", sl, re.IGNORECASE)
+                if m_only:
+                    res["write_paths"].append(normalize_path(m_only.group(1)))
+                    res["prohibitions"].append("No other paths authorized")
 
         # Parse Prohibition lines
         for pl in prohibition_lines:

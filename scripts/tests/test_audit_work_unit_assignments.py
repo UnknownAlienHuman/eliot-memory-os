@@ -102,13 +102,9 @@ class AssignmentIntegrityOracleTests(unittest.TestCase):
 
     # WORK_UNIT_CASE: 818/1
     def test_647_646_vs_physical_644_mismatch(self):
-        snap = base_valid_snapshot()
-        snap["repository_records"]["workstreams"] = [{
-            "path": "workstreams/dreamer/assignments/646-dreamer-core.toml",
-            "internal_issue": 644,
-            "package": "eliot-dreamer-core",
-            "physical_package": "eliot-dreamer-kernel",
-        }]
+        fixture_path = Path(__file__).resolve().parent.parent / "testdata" / "work-unit-assignment-audit" / "mismatch-646-644.json"
+        with open(fixture_path, "r", encoding="utf-8") as f:
+            snap = json.load(f)
         res = AssignmentIntegrityOracle(snap).audit()
         self.assertEqual(res.status, ResultStatus.INTEGRITY_VIOLATION)
         rule_ids = {f.rule_id for f in res.findings}
@@ -118,78 +114,78 @@ class AssignmentIntegrityOracleTests(unittest.TestCase):
     # WORK_UNIT_CASE: 818/2
     def test_corrected_644_647_fixture_valid(self):
         snap = base_valid_snapshot()
+        snap["repository_records"]["manifests"] = [{
+            "path": "crates/smart/eliot-dreamer-core/Cargo.toml",
+            "package": "eliot-dreamer-core",
+            "plane": "smart",
+        }]
         snap["repository_records"]["workstreams"] = [{
             "path": "workstreams/dreamer/assignments/644-dreamer-core.toml",
             "internal_issue": 644,
             "package": "eliot-dreamer-core",
-            "physical_package": "eliot-dreamer-core",
+            "target_dir": "crates/smart/eliot-dreamer-core/",
         }]
         res = AssignmentIntegrityOracle(snap).audit()
         self.assertEqual(res.status, ResultStatus.VALID)
 
     # WORK_UNIT_CASE: 818/3
     def test_724_725_wrong_branch_duplicate(self):
-        snap = base_valid_snapshot()
-        snap["pull_requests"][0]["head_ref"] = "work/724-claude-sidecar"
-        snap["pull_requests"][0]["body"] = "Implements #725"
+        fixture_path = Path(__file__).resolve().parent.parent / "testdata" / "work-unit-assignment-audit" / "regression-724-725.json"
+        with open(fixture_path, "r", encoding="utf-8") as f:
+            snap = json.load(f)
         res = AssignmentIntegrityOracle(snap).audit()
         self.assertIn("AU-BRANCH-MISMATCH", {f.rule_id for f in res.findings})
 
     # WORK_UNIT_CASE: 818/4
     def test_superseded_724_725_not_live_owner_or_dependency(self):
-        snap = base_valid_snapshot()
-        snap["issues"].append({
-            "number": 724,
-            "state": "closed",
-            "disposition": "superseded",
-            "dependencies": [],
-        })
-        snap["issues"][0]["dependencies"] = [724]
+        fixture_path = Path(__file__).resolve().parent.parent / "testdata" / "work-unit-assignment-audit" / "regression-724-725.json"
+        with open(fixture_path, "r", encoding="utf-8") as f:
+            snap = json.load(f)
         res = AssignmentIntegrityOracle(snap).audit()
         self.assertIn("AU-DEP-SUPERSEDED", {f.rule_id for f in res.findings})
 
     # WORK_UNIT_CASE: 818/5
     def test_790_783_windows_ipc_mismatch(self):
-        snap = base_valid_snapshot()
-        snap["repository_records"]["workstreams"] = [{
-            "path": "workstreams/kernel/assignments/789-windows-ipc.toml",
-            "internal_issue": 789,
-            "plane": "smart",
-            "target_plane": "kernel",
-            "package": "eliot-platform-windows",
-            "physical_package": "eliot-platform-windows",
-        }]
+        fixture_path = Path(__file__).resolve().parent.parent / "testdata" / "work-unit-assignment-audit" / "regression-790-783.json"
+        with open(fixture_path, "r", encoding="utf-8") as f:
+            snap = json.load(f)
         res = AssignmentIntegrityOracle(snap).audit()
         self.assertIn("AU-PLANE-MISMATCH", {f.rule_id for f in res.findings})
 
     # WORK_UNIT_CASE: 818/6
     def test_corrected_789_fixture_valid(self):
         snap = base_valid_snapshot()
+        snap["repository_records"]["manifests"] = [{
+            "path": "crates/platform/eliot-platform-windows/Cargo.toml",
+            "package": "eliot-platform-windows",
+            "plane": "kernel",
+        }]
         snap["repository_records"]["workstreams"] = [{
             "path": "workstreams/kernel/assignments/789-windows-ipc.toml",
             "internal_issue": 789,
             "plane": "kernel",
             "target_plane": "kernel",
             "package": "eliot-platform-windows",
-            "physical_package": "eliot-platform-windows",
+            "target_dir": "crates/platform/eliot-platform-windows/",
         }]
         res = AssignmentIntegrityOracle(snap).audit()
         self.assertEqual(res.status, ResultStatus.VALID)
 
     # WORK_UNIT_CASE: 818/7
     def test_shifted_neighboring_reservations(self):
-        snap = base_valid_snapshot()
-        snap["repository_records"]["workstreams"] = [{
-            "path": "workstreams/dreamer/assignments/610-reconsolidation.toml",
-            "internal_issue": 610,
-            "neighbor_crate_violation": True,
-        }]
+        fixture_path = Path(__file__).resolve().parent.parent / "testdata" / "work-unit-assignment-audit" / "regression-shifted-reservations.json"
+        with open(fixture_path, "r", encoding="utf-8") as f:
+            snap = json.load(f)
         res = AssignmentIntegrityOracle(snap).audit()
-        self.assertIn("AU-NEIGHBOR-CRATE", {f.rule_id for f in res.findings})
+        rule_ids = {f.rule_id for f in res.findings}
+        self.assertIn("AU-NEIGHBOR-CRATE", rule_ids)
+        self.assertIn("AU-RESERV-PROD-DIFF", rule_ids)
 
     # WORK_UNIT_CASE: 818/8
     def test_exact_issue_pr_branch_valid(self):
-        snap = base_valid_snapshot()
+        fixture_path = Path(__file__).resolve().parent.parent / "testdata" / "work-unit-assignment-audit" / "valid-baseline.json"
+        with open(fixture_path, "r", encoding="utf-8") as f:
+            snap = json.load(f)
         res = AssignmentIntegrityOracle(snap).audit()
         self.assertEqual(res.status, ResultStatus.VALID)
         self.assertEqual(len(res.findings), 0)
@@ -275,24 +271,30 @@ class AssignmentIntegrityOracleTests(unittest.TestCase):
 
     # WORK_UNIT_CASE: 818/17
     def test_stale_base_initial_head_mismatch_and_dirty_candidate_distinguished(self):
-        snap = base_valid_snapshot()
-        snap["pull_requests"][0]["candidate_status"] = "stale_base"
-        res1 = AssignmentIntegrityOracle(snap).audit()
+        # 1. Stale base derived from base_sha mismatching authoritative base
+        snap1 = base_valid_snapshot()
+        snap1["pull_requests"][0]["base_sha"] = "0000000000000000000000000000000000000000"
+        res1 = AssignmentIntegrityOracle(snap1).audit()
         self.assertIn("AU-CAND-STALE-BASE", {f.rule_id for f in res1.findings})
 
-        snap["pull_requests"][0]["candidate_status"] = "dirty"
-        res2 = AssignmentIntegrityOracle(snap).audit()
+        # 2. Dirty candidate derived from dirty_files in worktree
+        snap2 = base_valid_snapshot()
+        snap2["pull_requests"][0]["dirty_files"] = ["scripts/uncommitted_file.py"]
+        res2 = AssignmentIntegrityOracle(snap2).audit()
         self.assertIn("AU-CAND-DIRTY", {f.rule_id for f in res2.findings})
 
-        snap["pull_requests"][0]["candidate_status"] = "head_mismatch"
-        res3 = AssignmentIntegrityOracle(snap).audit()
+        # 3. Initial HEAD mismatch derived from head_sha != expected_head_sha
+        snap3 = base_valid_snapshot()
+        snap3["pull_requests"][0]["head_sha"] = "1111111111111111111111111111111111111111"
+        snap3["pull_requests"][0]["expected_head_sha"] = "2222222222222222222222222222222222222222"
+        res3 = AssignmentIntegrityOracle(snap3).audit()
         self.assertIn("AU-CAND-HEAD-MISMATCH", {f.rule_id for f in res3.findings})
 
     # WORK_UNIT_CASE: 818/18
     def test_valid_reservation_only_draft(self):
         snap = base_valid_snapshot()
         snap["pull_requests"][0]["draft"] = True
-        snap["pull_requests"][0]["is_reservation"] = True
+        snap["pull_requests"][0]["title"] = "reserve: work unit 818"
         snap["pull_requests"][0]["changed_paths"] = [
             ".github/temporary/work-unit-818.md",
             "workstreams/assignments/818.toml",
@@ -304,7 +306,7 @@ class AssignmentIntegrityOracleTests(unittest.TestCase):
     def test_missing_required_reservation_marker(self):
         snap = base_valid_snapshot()
         snap["pull_requests"][0]["draft"] = True
-        snap["pull_requests"][0]["is_reservation"] = True
+        snap["pull_requests"][0]["title"] = "reserve: work unit 818"
         snap["pull_requests"][0]["changed_paths"] = ["workstreams/assignments/818.toml"]
         res = AssignmentIntegrityOracle(snap).audit()
         self.assertIn("AU-RESERV-MISSING-MARKER", {f.rule_id for f in res.findings})
@@ -313,7 +315,7 @@ class AssignmentIntegrityOracleTests(unittest.TestCase):
     def test_wrong_marker_issue_pr_branch(self):
         snap = base_valid_snapshot()
         snap["pull_requests"][0]["draft"] = True
-        snap["pull_requests"][0]["is_reservation"] = True
+        snap["pull_requests"][0]["title"] = "reserve: work unit 818"
         snap["pull_requests"][0]["changed_paths"] = [".github/temporary/work-unit-999.md"]
         res = AssignmentIntegrityOracle(snap).audit()
         self.assertIn("AU-RESERV-WRONG-MARKER", {f.rule_id for f in res.findings})
@@ -322,7 +324,7 @@ class AssignmentIntegrityOracleTests(unittest.TestCase):
     def test_production_diff_in_reservation_only_pr(self):
         snap = base_valid_snapshot()
         snap["pull_requests"][0]["draft"] = True
-        snap["pull_requests"][0]["is_reservation"] = True
+        snap["pull_requests"][0]["title"] = "reserve: work unit 818"
         snap["pull_requests"][0]["changed_paths"] = [
             ".github/temporary/work-unit-818.md",
             "crates/kernel/src/lib.rs",
@@ -334,7 +336,7 @@ class AssignmentIntegrityOracleTests(unittest.TestCase):
     def test_ready_marker_only_pr_rejected(self):
         snap = base_valid_snapshot()
         snap["pull_requests"][0]["draft"] = False
-        snap["pull_requests"][0]["is_reservation"] = True
+        snap["pull_requests"][0]["title"] = "reserve: work unit 818"
         snap["pull_requests"][0]["changed_paths"] = [".github/temporary/work-unit-818.md"]
         res = AssignmentIntegrityOracle(snap).audit()
         self.assertIn("AU-RESERV-READY", {f.rule_id for f in res.findings})
@@ -342,7 +344,7 @@ class AssignmentIntegrityOracleTests(unittest.TestCase):
     # WORK_UNIT_CASE: 818/23
     def test_implementation_retaining_marker_rejected(self):
         snap = base_valid_snapshot()
-        snap["pull_requests"][0]["is_reservation"] = False
+        snap["pull_requests"][0]["title"] = "feat: implement oracle"
         snap["pull_requests"][0]["changed_paths"] = [
             ".github/temporary/work-unit-818.md",
             "scripts/audit-work-unit-assignments.py",
@@ -353,7 +355,7 @@ class AssignmentIntegrityOracleTests(unittest.TestCase):
     # WORK_UNIT_CASE: 818/24
     def test_valid_marker_removal(self):
         snap = base_valid_snapshot()
-        snap["pull_requests"][0]["is_reservation"] = False
+        snap["pull_requests"][0]["title"] = "feat: implement oracle"
         snap["pull_requests"][0]["changed_paths"] = ["scripts/audit-work-unit-assignments.py"]
         res = AssignmentIntegrityOracle(snap).audit()
         self.assertEqual(res.status, ResultStatus.VALID)
@@ -404,10 +406,16 @@ class AssignmentIntegrityOracleTests(unittest.TestCase):
     # WORK_UNIT_CASE: 818/29
     def test_neighboring_crate_ownership_rejected(self):
         snap = base_valid_snapshot()
+        snap["repository_records"]["manifests"] = [
+            {"path": "crates/smart/eliot-dreamer-reconsolidation/Cargo.toml", "package": "eliot-dreamer-reconsolidation", "plane": "smart"},
+            {"path": "crates/smart/eliot-dreamer-core/Cargo.toml", "package": "eliot-dreamer-core", "plane": "smart"},
+        ]
         snap["repository_records"]["workstreams"] = [{
             "path": "workstreams/smart/assignments/610-dreamer.toml",
             "internal_issue": 610,
-            "neighbor_crate_violation": True,
+            "package": "eliot-dreamer-reconsolidation",
+            "target_dir": "crates/smart/eliot-dreamer-reconsolidation/",
+            "write_paths": ["crates/smart/eliot-dreamer-core/src/lib.rs"],
         }]
         res = AssignmentIntegrityOracle(snap).audit()
         self.assertIn("AU-NEIGHBOR-CRATE", {f.rule_id for f in res.findings})
@@ -434,12 +442,18 @@ class AssignmentIntegrityOracleTests(unittest.TestCase):
     # WORK_UNIT_CASE: 818/32
     def test_duplicate_incompatible_package_owners(self):
         snap = base_valid_snapshot()
-        snap["repository_records"]["workstreams"] = [{
-            "path": "workstreams/assignments/818-oracle.toml",
-            "internal_issue": 818,
-            "package": "eliot-scripts",
-            "incompatible_with_existing": True,
-        }]
+        snap["repository_records"]["workstreams"] = [
+            {
+                "path": "workstreams/assignments/818-oracle.toml",
+                "internal_issue": 818,
+                "package": "eliot-scripts",
+            },
+            {
+                "path": "workstreams/assignments/819-oracle.toml",
+                "internal_issue": 819,
+                "package": "eliot-scripts",
+            },
+        ]
         res = AssignmentIntegrityOracle(snap).audit()
         self.assertIn("AU-PKG-DUP-INCOMPATIBLE", {f.rule_id for f in res.findings})
 
@@ -817,14 +831,34 @@ class AssignmentIntegrityOracleTests(unittest.TestCase):
 
     # WORK_UNIT_CASE: 818/68
     def test_inline_no_other_restrictions_exclude_rather_than_grant(self):
-        snap = base_valid_snapshot()
-        snap["issues"][0]["body"] = (
+        # 1. Test #930/#992 style inline prohibitions fixture
+        fixture_prohib = Path(__file__).resolve().parent.parent / "testdata" / "work-unit-assignment-audit" / "regression-930-992-prohibitions.json"
+        with open(fixture_prohib, "r", encoding="utf-8") as f:
+            snap_prohib = json.load(f)
+        res_prohib = AssignmentIntegrityOracle(snap_prohib).audit()
+        self.assertIn("AU-PROHIBITION-01", {f.rule_id for f in res_prohib.findings})
+
+        # 2. Test #840 style mixed acceptance fixture with conditional clauses
+        fixture_mixed = Path(__file__).resolve().parent.parent / "testdata" / "work-unit-assignment-audit" / "regression-840-mixed-acceptance.json"
+        with open(fixture_mixed, "r", encoding="utf-8") as f:
+            snap_mixed = json.load(f)
+        res_mixed = AssignmentIntegrityOracle(snap_mixed).audit()
+        self.assertEqual(res_mixed.status, ResultStatus.VALID)
+
+        # 3. Unit test: conditional clauses must not be guessed as write paths, inline prohibitions extracted
+        body = (
             "## Exclusive mutable scope\n"
-            "- scripts/audit-work-unit-assignments.py\n"
-            "No other modifications permitted.\n"
+            "- scripts/audit-work-unit-assignments.py\n\n"
+            "## Acceptance criteria\n"
+            "- Only when test passes exit 0\n"
+            "- If crates/kernel is changed, recheck\n"
+            "- Where documentation changes, route\n\n"
+            "No other modifications permitted. Do not modify Cargo.toml or crates/.\n"
         )
-        parsed = AssignmentIntegrityOracle(snap)._parse_markdown_body(snap["issues"][0]["body"], 818)
-        self.assertIn("scripts/audit-work-unit-assignments.py", parsed["write_paths"])
+        parsed = AssignmentIntegrityOracle(base_valid_snapshot())._parse_markdown_body(body, 818)
+        self.assertEqual(parsed["write_paths"], ["scripts/audit-work-unit-assignments.py"])
+        self.assertIn("Cargo.toml", parsed["prohibitions"])
+        self.assertIn("crates/", parsed["prohibitions"])
         self.assertTrue(any("No other" in p for p in parsed["prohibitions"]))
 
 
