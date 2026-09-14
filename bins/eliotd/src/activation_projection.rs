@@ -183,6 +183,7 @@ pub fn map_governor_outcome_to_protocol(
 
 #[cfg(test)]
 mod projection_tests {
+    #![allow(clippy::expect_used)] // test-only panic-acceptable (#838).
     use super::*;
     use eliot_contracts::RequestId;
     use eliot_contracts::{EpochId, EpochLineageId, ResourceGeneration, StateFence};

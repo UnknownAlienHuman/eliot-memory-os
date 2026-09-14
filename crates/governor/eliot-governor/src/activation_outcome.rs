@@ -131,7 +131,7 @@ pub fn fixture_resolved(snapshot: GovernorActivationSnapshot) -> GovernorActivat
     GovernorActivationOutcome::Resolved(snapshot)
 }
 
-/// Fixture: no current task / missing TaskContract -> TaskSelectionRequired.
+/// Fixture: no current task / missing `TaskContract` -> `TaskSelectionRequired`.
 /// Uses UNKNOWN coverage with empty handles to avoid claiming exhaustive absence.
 pub fn fixture_task_selection_required() -> GovernorActivationOutcome {
     GovernorActivationOutcome::TaskSelectionRequired {
@@ -181,7 +181,7 @@ pub fn fixture_scope_ambiguous(candidates: Vec<String>) -> GovernorActivationOut
     }
 }
 
-/// Fixture: transient named owner dependency -> NotReady.
+/// Fixture: transient named owner dependency -> `NotReady`.
 pub fn fixture_not_ready(
     dependency_ref: &str,
     observed_revision: &str,
@@ -193,7 +193,7 @@ pub fn fixture_not_ready(
     }
 }
 
-/// Fixture: ticket / snapshot fence mismatch -> StaleFence.
+/// Fixture: ticket / snapshot fence mismatch -> `StaleFence`.
 pub fn fixture_stale_fence(observed: Option<StateFence>) -> GovernorActivationOutcome {
     GovernorActivationOutcome::StaleFence {
         recovery_handle: "governor.stale-fence:recovery".to_owned(),
@@ -201,7 +201,7 @@ pub fn fixture_stale_fence(observed: Option<StateFence>) -> GovernorActivationOu
     }
 }
 
-/// Fixture: malformed/impossible snapshot -> FailedInternal.
+/// Fixture: malformed/impossible snapshot -> `FailedInternal`.
 pub fn fixture_failed_internal(reason: &str) -> GovernorActivationOutcome {
     GovernorActivationOutcome::FailedInternal {
         failure_handle: format!("governor.internal:{reason}"),
@@ -219,10 +219,10 @@ mod tests {
 
     fn test_epoch(lineage: &str, sequence: u64) -> EpochId {
         EpochId::new(
-            EpochLineageId::new(lineage).expect("valid test lineage"),
-            NonZeroU64::new(sequence).expect("nonzero test sequence"),
+            EpochLineageId::new(lineage).unwrap(),
+            NonZeroU64::new(sequence).unwrap(),
         )
-        .expect("valid test epoch")
+        .unwrap()
     }
 
     fn test_snapshot() -> crate::composition::GovernorActivationSnapshot {
