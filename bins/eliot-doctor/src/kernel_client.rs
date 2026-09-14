@@ -1458,4 +1458,243 @@ mod tests {
         assert_eq!(transport.submits, 1);
         assert_eq!(executor.lock().starts, 0);
     }
+
+    // ------------------------------------------------------------------
+    // Slice-C dispatch-file consume (bins-local envelope). The reader is
+    // pure filesystem plus validation against the live bootstrap epoch: no
+    // transport runs here, so every rejection below proves "typed deny,
+    // exit 78, no drive" by construction. The positive test then feeds the
+    // validated file material into the real driver with the test transport,
+    // exactly like the existing drive tests; production never uses a test
+    // double and never deserializes the concrete process request from the
+    // file (it stays an in-memory test value here, as in every existing
+    // drive test).
+    // ------------------------------------------------------------------
+
+    use crate::dispatched_material::{
+        DispatchedAttemptEnvelope, DispatchedMaterialError, read_dispatched_material_from,
+    };
+
+    fn dispatched_test_nonce() -> String {
+        "session-nonce-doctor-test-01".to_owned()
+    }
+
+    fn dispatched_valid_envelope(now: OffsetDateTime) -> (DispatchedAttemptEnvelope, EpochId) {
+        let (request, manifest) = effect_request(now);
+        let epoch = test_epoch();
+        let generation = request.fence.generation;
+        let attempt = test_envelope(&request, ATTEMPT_ID, EFFECT_SEQ);
+        (
+            DispatchedAttemptEnvelope {
+                attempt,
+                request,
+                manifest,
+                epoch: epoch.clone(),
+                generation,
+                nonce: dispatched_test_nonce(),
+            },
+            epoch,
+        )
+    }
+
+    fn write_dispatched_temp(
+        envelope: &DispatchedAttemptEnvelope,
+        tag: &str,
+    ) -> Result<std::path::PathBuf, String> {
+        let path = std::env::temp_dir().join(format!(
+            "eliot-doctor-dispatch-test-{tag}-{pid}.json",
+            pid = std::process::id()
+        ));
+        let bytes = serde_json::to_vec(envelope).map_err(|error| error.to_string())?;
+        std::fs::write(&path, bytes).map_err(|error| error.to_string())?;
+        Ok(path)
+    }
+
+    fn remove_dispatched_temp(path: &std::path::Path) {
+        let _ = std::fs::remove_file(path);
+    }
+
+    fn denied_error(
+        path: &std::path::Path,
+        live_epoch: &EpochId,
+    ) -> Result<DispatchedMaterialError, String> {
+        match read_dispatched_material_from(path, live_epoch) {
+            Ok(_) => Err("dispatch file must deny, but it validated".to_owned()),
+            Err(error) => Ok(error),
+        }
+    }
+
+    #[test]
+    fn dispatched_file_absent_is_not_presented() -> Result<(), String> {
+        let path = std::env::temp_dir().join(format!(
+            "eliot-doctor-dispatch-test-absent-{pid}.json",
+            pid = std::process::id()
+        ));
+        remove_dispatched_temp(&path);
+        let material = read_dispatched_material_from(&path, &test_epoch())
+            .map_err(|error| error.to_string())?;
+        assert!(material.is_none());
+        Ok(())
+    }
+
+    #[test]
+    fn dispatched_file_foreign_epoch_is_typed_deny() -> Result<(), String> {
+        let now = OffsetDateTime::now_utc();
+        let (mut envelope, _) = dispatched_valid_envelope(now);
+        envelope.epoch = foreign_epoch();
+        let path = write_dispatched_temp(&envelope, "foreign-epoch")?;
+        let error = denied_error(&path, &test_epoch())?;
+        assert!(matches!(error, DispatchedMaterialError::StaleEpoch { .. }));
+        // Present but invalid files are preserved for diagnosis and still
+        // deny on every retry; nothing drove.
+        assert!(path.exists());
+        remove_dispatched_temp(&path);
+        Ok(())
+    }
+
+    #[test]
+    fn dispatched_file_stale_generation_is_typed_deny() -> Result<(), String> {
+        let now = OffsetDateTime::now_utc();
+        let (envelope, live) = dispatched_valid_envelope(now);
+        for (tag, generation) in [
+            ("zero-generation", 0_u64),
+            (
+                "fence-mismatch-generation",
+                envelope.request.fence.generation + 1,
+            ),
+        ] {
+            let mut stale = envelope.clone();
+            stale.generation = generation;
+            let path = write_dispatched_temp(&stale, tag)?;
+            let error = denied_error(&path, &live)?;
+            assert!(
+                matches!(error, DispatchedMaterialError::StaleGeneration { .. }),
+                "tag {tag}: expected stale generation, got {error}"
+            );
+            remove_dispatched_temp(&path);
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn dispatched_file_bad_nonce_is_typed_deny() -> Result<(), String> {
+        let now = OffsetDateTime::now_utc();
+        let (envelope, live) = dispatched_valid_envelope(now);
+        for (tag, nonce) in [
+            ("empty-nonce", String::new()),
+            ("short-nonce", "short".to_owned()),
+            (
+                "whitespace-nonce",
+                "session nonce with spaces 01".to_owned(),
+            ),
+        ] {
+            let mut bad = envelope.clone();
+            bad.nonce = nonce;
+            let path = write_dispatched_temp(&bad, tag)?;
+            let error = denied_error(&path, &live)?;
+            assert!(
+                matches!(error, DispatchedMaterialError::BadNonce),
+                "tag {tag}: expected bad nonce, got {error}"
+            );
+            remove_dispatched_temp(&path);
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn dispatched_file_tampered_digest_is_typed_deny() -> Result<(), String> {
+        let now = OffsetDateTime::now_utc();
+        let (mut envelope, live) = dispatched_valid_envelope(now);
+        envelope.attempt.request_digest = digest(0xdd);
+        let path = write_dispatched_temp(&envelope, "tampered-digest")?;
+        let error = denied_error(&path, &live)?;
+        assert!(matches!(error, DispatchedMaterialError::Contract(_)));
+        assert!(path.exists());
+        remove_dispatched_temp(&path);
+        Ok(())
+    }
+
+    #[test]
+    fn dispatched_file_byte_identity_mismatch_is_typed_deny() -> Result<(), String> {
+        let now = OffsetDateTime::now_utc();
+        let (mut envelope, live) = dispatched_valid_envelope(now);
+        // Swap in a different valid closed request: the envelope bytes no
+        // longer equal the presented request, so the byte-identity proof
+        // must fail before any submit.
+        let (other, _) = diagnose_request(now);
+        envelope.request = other;
+        let path = write_dispatched_temp(&envelope, "byte-identity")?;
+        let error = denied_error(&path, &live)?;
+        assert!(matches!(error, DispatchedMaterialError::Contract(_)));
+        remove_dispatched_temp(&path);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn valid_dispatched_file_material_reaches_drive() {
+        if let Err(detail) = drive_validated_file_material().await {
+            panic!("validated file material must drive: {detail}");
+        }
+    }
+
+    async fn drive_validated_file_material() -> Result<(), String> {
+        let now = OffsetDateTime::now_utc();
+        let (envelope, live) = dispatched_valid_envelope(now);
+        let path = write_dispatched_temp(&envelope, "valid")?;
+        let validated = read_dispatched_material_from(&path, &live)
+            .map_err(|error| error.to_string())?
+            .ok_or_else(|| "valid file must present material".to_owned())?;
+        // A validated file is consumed once, so a later invocation cannot
+        // replay it.
+        assert!(!path.exists());
+        assert_eq!(validated.epoch, live);
+        assert_eq!(validated.generation, validated.request.fence.generation);
+        assert_eq!(validated.nonce, dispatched_test_nonce());
+        assert_eq!(validated.attempt.attempt_id, ATTEMPT_ID);
+        // A validated file is exactly what the entry maps to a presented
+        // attempt (`material.is_some()`), and the entry gate drives if and
+        // only if both halves hold (proven by the gate truth-table tests in
+        // the composition root): this is the drive path reached.
+        // The validated file material feeds the real driver. The concrete
+        // process request stays an in-memory test value (production receives
+        // it only with the dispatch launch, never from the file); the
+        // transport double is test-only, as in every existing drive test.
+        let admission = honest_admission(
+            &validated.request,
+            &validated.manifest,
+            ATTEMPT_ID,
+            EFFECT_SEQ,
+            &validated.epoch,
+            now,
+        );
+        let expected_effect = admission.effect_digest.clone();
+        let mut transport = FakeTransport::admitting(admission);
+        let executor = Arc::new(FakeExecutor::new(FakeMode::Success));
+        let presented = PresentedAttempt {
+            attempt: validated.attempt,
+            request: validated.request,
+            manifest: validated.manifest,
+            process: test_process_request(),
+            epoch: validated.epoch,
+        };
+        let outcome = drive_admitted_attempt(
+            &mut transport,
+            Arc::clone(&executor),
+            Arc::new(EvidenceCollector::new()),
+            presented,
+            now,
+        )
+        .await
+        .map_err(|error| error.to_string())?;
+        assert!(matches!(
+            outcome.disposition,
+            DoctorDisposition::RepairedPendingVerification { .. }
+        ));
+        assert_eq!(outcome.exit_code(), EXIT_PENDING_VERIFICATION);
+        assert_eq!(outcome.report.effect_digest, expected_effect);
+        assert_eq!(transport.submits, 1);
+        assert_eq!(executor.lock().starts, 1);
+        remove_dispatched_temp(&path);
+        Ok(())
+    }
 }
