@@ -5,11 +5,14 @@
 //! activated operation. The table activates exactly the four reads with
 //! proven adapter handlers, parameter shapes, and consumers on base
 //! (`GetRevisionHeads`, `GetOrderingHeads`, `GetScopeRevisionView`,
-//! `ResolveWriteReceipt`), plus the provider-independent genesis bootstrap
-//! entry sourced by [`genesis_manifest`](crate::genesis_manifest). Every
-//! other operation stays known-but-unsupported and unadvertised: no mutation
-//! on base has a proven handler, schema, and consumer triple, so C1 advertises
-//! no mutation entries and any transition carrying named operations fails
+//! `ResolveWriteReceipt`), the single `CaptureObservation` mutation
+//! (`TransitionClass::CaptureCandidate` with the `EffectClass::Candidate`
+//! ceiling and the owner-approved `subject` schema, AUD-C01), plus the
+//! provider-independent genesis bootstrap entry sourced by
+//! [`genesis_manifest`](crate::genesis_manifest). Every other operation stays
+//! known-but-unsupported and unadvertised: no other mutation on base has a
+//! proven handler, schema, and consumer triple, so C1 advertises no other
+//! mutation entry and any transition carrying another named command fails
 //! closed against the generated set.
 //!
 //! Authority split (one authority, two mechanisms over the same table):
@@ -37,14 +40,14 @@ use std::collections::BTreeSet;
 use serde::Serialize;
 
 use crate::operation_parameters::{
-    named_mutation_operation_name, named_read_operation_name, project_parameter_schema,
-    validate_typed_read_parameters,
+    named_mutation_operation_name, named_read_operation_name, project_mutation_parameter_schema,
+    project_parameter_schema, validate_typed_mutation_parameters, validate_typed_read_parameters,
 };
 use crate::{
     CONTRACT_NAME, CONTRACT_VERSION, ContractVersion, EffectClass, GENESIS_MANIFEST_NAME,
-    NamedOperationManifest, NamedReadOperation, NamedReadRequest, OperationManifestDigest,
-    OperationManifestSpec, PAYLOAD_AUTHORITY_VERSION, PreparedTransition, StoreError,
-    TransitionClass, canonical_json_bytes, sha256_hex,
+    NamedMutationOperation, NamedOperationManifest, NamedReadOperation, NamedReadRequest,
+    OperationManifestDigest, OperationManifestSpec, PAYLOAD_AUTHORITY_VERSION, PreparedTransition,
+    StoreError, TransitionClass, canonical_json_bytes, sha256_hex,
 };
 
 /// Operation identity kind carried by each manifest entry.
@@ -74,6 +77,11 @@ pub const OPERATION_CATALOGUE_PROFILE: &str = "eliot.storage.operation-profile.v
 /// activation (only spine-required variants activate with owner, catalogue
 /// entry, consumer, and proof).
 pub const ACTIVATED_READ_OWNING_SECTION: &str = "I5.17";
+
+/// Owning section for the activated mutation entry: the same command-family
+/// activation section that owns the read entries (AUD-C01 activates the one
+/// proven capture mutation under it).
+pub const ACTIVATED_MUTATION_OWNING_SECTION: &str = "I5.17";
 
 /// Owning section for the genesis bootstrap entry: the canonical contract
 /// catalogue that owns catalogue identity and bootstrap meaning.
@@ -161,6 +169,24 @@ pub const fn activated_read_operations() -> [NamedReadOperation; 4] {
     ]
 }
 
+/// One activated mutation row of the declaration table.
+struct ActivatedMutationDescriptor {
+    operation: NamedMutationOperation,
+    transition_classes: &'static [TransitionClass],
+    maximum_effect: EffectClass,
+}
+
+/// The single declaration table for activated mutations.
+///
+/// `CaptureObservation` persists the lowest ceiling (`Candidate`) through the
+/// `CaptureCandidate` family and addresses no scope, mirroring the scope-free
+/// read descriptors. Every other mutation stays known-but-unsupported.
+const ACTIVATED_MUTATIONS: [ActivatedMutationDescriptor; 1] = [ActivatedMutationDescriptor {
+    operation: NamedMutationOperation::CaptureObservation,
+    transition_classes: &[TransitionClass::CaptureCandidate],
+    maximum_effect: EffectClass::Candidate,
+}];
+
 fn read_entry_spec(descriptor: &ActivatedReadDescriptor) -> OperationManifestSpec {
     OperationManifestSpec {
         name: named_read_operation_name(descriptor.operation).to_owned(),
@@ -174,6 +200,25 @@ fn read_entry_spec(descriptor: &ActivatedReadDescriptor) -> OperationManifestSpe
         minimum_compatible_version: MINIMUM_COMPATIBLE_VERSION,
         transition_classes: Vec::new(),
         maximum_effect: EffectClass::Read,
+        max_input_bytes: READ_MAX_INPUT_BYTES,
+        max_output_bytes: READ_MAX_OUTPUT_BYTES,
+        timeout_ms: READ_TIMEOUT_MS,
+    }
+}
+
+fn mutation_entry_spec(descriptor: &ActivatedMutationDescriptor) -> OperationManifestSpec {
+    OperationManifestSpec {
+        name: named_mutation_operation_name(descriptor.operation).to_owned(),
+        version: CONTRACT_VERSION,
+        operation_kind: OperationKind::Mutation,
+        owning_section: ACTIVATED_MUTATION_OWNING_SECTION.to_owned(),
+        schema_revision: CONTRACT_VERSION,
+        parameter_schema: project_mutation_parameter_schema(descriptor.operation),
+        requires_scope_id: false,
+        scope_kind: SCOPE_KIND_NONE.to_owned(),
+        minimum_compatible_version: MINIMUM_COMPATIBLE_VERSION,
+        transition_classes: descriptor.transition_classes.to_vec(),
+        maximum_effect: descriptor.maximum_effect,
         max_input_bytes: READ_MAX_INPUT_BYTES,
         max_output_bytes: READ_MAX_OUTPUT_BYTES,
         timeout_ms: READ_TIMEOUT_MS,
@@ -203,13 +248,19 @@ fn genesis_entry_spec() -> OperationManifestSpec {
 
 /// Generates the per-operation manifest descriptors from the declaration table.
 ///
-/// Declaration order is the canonical order: the four activated reads followed
-/// by the genesis bootstrap entry. Generation is pure over crate constants,
-/// so the same source always yields byte-identical entries.
+/// Declaration order is the canonical order: the four activated reads, the
+/// one activated mutation, then the genesis bootstrap entry. Generation is
+/// pure over crate constants, so the same source always yields byte-identical
+/// entries.
 pub fn generated_operation_manifests() -> Result<Vec<NamedOperationManifest>, StoreError> {
-    let mut entries = Vec::with_capacity(ACTIVATED_READS.len() + 1);
+    let mut entries = Vec::with_capacity(ACTIVATED_READS.len() + ACTIVATED_MUTATIONS.len() + 1);
     for descriptor in &ACTIVATED_READS {
         entries.push(NamedOperationManifest::from_spec(read_entry_spec(
+            descriptor,
+        ))?);
+    }
+    for descriptor in &ACTIVATED_MUTATIONS {
+        entries.push(NamedOperationManifest::from_spec(mutation_entry_spec(
             descriptor,
         ))?);
     }
@@ -353,9 +404,11 @@ pub fn validate_read_against_catalogue(
 /// genesis/bootstrap shape and must carry exactly the genesis entry digest
 /// within its ceiling; a plan carrying named operations must carry exactly
 /// the catalogue set digest, resolve every command (in order, never sorted)
-/// to a mutation entry, and stay within that entry's ceiling. C1 advertises
-/// no mutation entries, so any named command fails closed here until a later
-/// slice proves a handler, schema, and consumer triple.
+/// to a mutation entry, stay within that entry's ceiling, carry only the
+/// owner-approved typed parameters for the approved command, and stay within
+/// the entry input bound. Only `CaptureObservation` has an activated mutation
+/// entry; any other named command fails closed here until a later slice
+/// proves its handler, schema, and consumer triple.
 pub fn validate_transition_against_catalogue(
     transition: &PreparedTransition,
     entries: &[NamedOperationManifest],
@@ -399,6 +452,25 @@ pub fn validate_transition_against_catalogue(
             transition.requested_effect_ceiling,
         ) {
             return Err(StoreError::TransitionClassExceeded);
+        }
+        match command.operation {
+            NamedMutationOperation::CaptureObservation => {
+                validate_typed_mutation_parameters(command.operation, &command.parameters)?;
+            }
+            NamedMutationOperation::ApplyEpistemicRevision
+            | NamedMutationOperation::UpdateTaskState
+            | NamedMutationOperation::ApplyLifecyclePolicy
+            | NamedMutationOperation::ReconcileRecovery
+            | NamedMutationOperation::AppendAuditEvent => {
+                return Err(StoreError::UnknownOperation);
+            }
+        }
+        let parameter_bytes = canonical_json_bytes(&command.parameters)
+            .map_err(|error| StoreError::Serialization(error.to_string()))?;
+        if u64::try_from(parameter_bytes.len())
+            .map_or(true, |len| len > u64::from(entry.max_input_bytes))
+        {
+            return Err(StoreError::PayloadTooLarge);
         }
     }
     Ok(())

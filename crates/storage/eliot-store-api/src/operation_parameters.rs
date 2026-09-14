@@ -4,10 +4,14 @@
 //! adapter handlers, parameter shapes, and consumers:
 //! `GetRevisionHeads`, `GetOrderingHeads`, `GetScopeRevisionView`, and
 //! `ResolveWriteReceipt` (see `apply/read_boundary.rs` in the Surreal adapter
-//! and `execute_named_sync` in the memory adapter). Every other
-//! [`NamedReadOperation`](crate::NamedReadOperation) variant stays
-//! known-but-unsupported and unadvertised, and no mutation has an
-//! owner-approved typed schema yet.
+//! and `execute_named_sync` in the memory adapter), plus the single
+//! `CaptureObservation` mutation (AUD-C01: `TransitionClass::CaptureCandidate`
+//! with the `EffectClass::Candidate` ceiling, carrying the owner-shaped
+//! `subject` string already used by the adapter receipt/plan fixtures).
+//! Every other [`NamedReadOperation`](crate::NamedReadOperation) variant and
+//! every other [`NamedMutationOperation`](crate::NamedMutationOperation)
+//! variant stays known-but-unsupported and unadvertised, and no other mutation
+//! has an owner-approved typed schema yet.
 //!
 //! This module is the single source of truth for those contracts: the closed
 //! operation-name mapping, the declared parameter list per activated
@@ -17,10 +21,10 @@
 //!
 //! Validation is control-contract only and issues no authority: scope, role,
 //! fence, and expiry enforcement stay in slice C2. An explicitly declared
-//! parameter (today only `operation_id` for `ResolveWriteReceipt`) is
-//! owner-approved and therefore supersedes the generic
-//! [`CONTROL_FIELD_DENYLIST`](crate::CONTROL_FIELD_DENYLIST) for that exact
-//! name; every undeclared control name is still rejected fail-closed.
+//! parameter (today `operation_id` for `ResolveWriteReceipt` and `subject`
+//! for `CaptureObservation`) is owner-approved and therefore supersedes the
+//! generic [`CONTROL_FIELD_DENYLIST`](crate::CONTROL_FIELD_DENYLIST) for that
+//! exact name; every undeclared control name is still rejected fail-closed.
 
 use std::collections::BTreeMap;
 
@@ -35,14 +39,21 @@ use crate::{
 
 /// Closed shape vocabulary for owner-approved named-operation parameters.
 ///
-/// Slice C1 needs exactly one shape: the `operation_id` string consumed by
-/// `ResolveWriteReceipt`. The enum is closed so a future parameter kind is a
+/// Slice C1 needs exactly two shapes: the `operation_id` string consumed by
+/// `ResolveWriteReceipt` and the `subject` string captured by
+/// `CaptureObservation`. The enum is closed so a future parameter kind is a
 /// contract change with a new owner-approved arm, never silent `Value`
 /// passthrough.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ParameterShape {
     /// A string that must parse as a store [`OperationId`].
     OperationId,
+    /// A non-blank observation subject string captured by
+    /// `CaptureObservation`. Length is bounded by the owning manifest entry's
+    /// `max_input_bytes` over the canonical parameter bytes (the same
+    /// mechanism that bounds the activated reads), so no separate string
+    /// length constant exists here.
+    Subject,
 }
 
 impl ParameterShape {
@@ -51,6 +62,7 @@ impl ParameterShape {
     pub const fn code(self) -> &'static str {
         match self {
             Self::OperationId => "operation-id",
+            Self::Subject => "subject-text",
         }
     }
 }
@@ -73,6 +85,11 @@ const OPERATION_ID_DECLARATION: ParameterDeclaration = ParameterDeclaration {
 };
 
 static RESOLVE_WRITE_RECEIPT_PARAMETERS: [ParameterDeclaration; 1] = [OPERATION_ID_DECLARATION];
+static CAPTURE_OBSERVATION_PARAMETERS: [ParameterDeclaration; 1] = [ParameterDeclaration {
+    name: "subject",
+    shape: ParameterShape::Subject,
+    required: true,
+}];
 static NO_PARAMETERS: [ParameterDeclaration; 0] = [];
 
 /// Returns the canonical operation name bound into manifests and digests.
@@ -178,6 +195,26 @@ pub const fn declared_read_parameters(
     }
 }
 
+/// Returns the owner-approved parameter declarations for one mutation.
+///
+/// Only `CaptureObservation` declares a parameter on base (the required
+/// owner-shaped `subject` string); every other variant declares none, so any
+/// supplied parameter fails closed. Variants without a catalogue entry never
+/// reach this table: they fail as [`StoreError::UnknownOperation`] first.
+#[must_use]
+pub const fn declared_mutation_parameters(
+    operation: NamedMutationOperation,
+) -> &'static [ParameterDeclaration] {
+    match operation {
+        NamedMutationOperation::CaptureObservation => &CAPTURE_OBSERVATION_PARAMETERS,
+        NamedMutationOperation::ApplyEpistemicRevision
+        | NamedMutationOperation::UpdateTaskState
+        | NamedMutationOperation::ApplyLifecyclePolicy
+        | NamedMutationOperation::ReconcileRecovery
+        | NamedMutationOperation::AppendAuditEvent => &NO_PARAMETERS,
+    }
+}
+
 /// Serializable parameter-schema projection stored in each manifest entry.
 ///
 /// The stored projection is what [`parameter_schema_digest`] binds, so the
@@ -197,6 +234,21 @@ pub struct ParameterSchemaField {
 #[must_use]
 pub fn project_parameter_schema(operation: NamedReadOperation) -> Vec<ParameterSchemaField> {
     declared_read_parameters(operation)
+        .iter()
+        .map(|declaration| ParameterSchemaField {
+            name: declaration.name.to_owned(),
+            shape: declaration.shape.code().to_owned(),
+            required: declaration.required,
+        })
+        .collect()
+}
+
+/// Projects the declared parameters of one mutation into the stored schema form.
+#[must_use]
+pub fn project_mutation_parameter_schema(
+    operation: NamedMutationOperation,
+) -> Vec<ParameterSchemaField> {
+    declared_mutation_parameters(operation)
         .iter()
         .map(|declaration| ParameterSchemaField {
             name: declaration.name.to_owned(),
@@ -256,6 +308,43 @@ pub fn validate_typed_read_parameters(
     Ok(())
 }
 
+/// Validates mutation parameters against the owner-approved typed declaration.
+///
+/// Same closed contract as [`validate_typed_read_parameters`]: exact
+/// membership, control-substitution rejection, required presence, and declared
+/// shape. Runs pre-dispatch and issues no authority.
+pub fn validate_typed_mutation_parameters(
+    operation: NamedMutationOperation,
+    parameters: &BTreeMap<String, Value>,
+) -> Result<(), StoreError> {
+    let declared = declared_mutation_parameters(operation);
+    for (name, value) in parameters {
+        if let Some(declaration) = declared.iter().find(|field| field.name == name.as_str()) {
+            check_declared_shape(declaration, value)?;
+        } else {
+            if CONTROL_FIELD_DENYLIST.contains(&name.as_str()) {
+                return Err(StoreError::InvalidField {
+                    field: "payload.control_field",
+                    reason: "payload must not override a control field",
+                });
+            }
+            return Err(StoreError::InvalidField {
+                field: "operation.parameter",
+                reason: "unknown parameter for operation",
+            });
+        }
+    }
+    for declaration in declared {
+        if declaration.required && !parameters.contains_key(declaration.name) {
+            return Err(StoreError::InvalidField {
+                field: "operation.parameter",
+                reason: "missing required parameter",
+            });
+        }
+    }
+    Ok(())
+}
+
 fn check_declared_shape(
     declaration: &ParameterDeclaration,
     value: &Value,
@@ -270,6 +359,22 @@ fn check_declared_shape(
                 field: "operation.parameter",
                 reason: "operation_id must be a valid operation identity",
             })?;
+            Ok(())
+        }
+        ParameterShape::Subject => {
+            let text = value.as_str().ok_or(StoreError::InvalidField {
+                field: "operation.parameter",
+                reason: "subject must be a non-blank string",
+            })?;
+            // Same store text rule as every other identifier boundary
+            // (non-blank, no control characters); stated inline because the
+            // generic text helper lives in the crate root.
+            if text.trim().is_empty() || text.chars().any(char::is_control) {
+                return Err(StoreError::InvalidField {
+                    field: "operation.parameter",
+                    reason: "subject must be a non-blank string",
+                });
+            }
             Ok(())
         }
     }
