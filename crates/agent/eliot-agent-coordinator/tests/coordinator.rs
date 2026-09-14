@@ -441,7 +441,7 @@ fn integration_admission_receipt(
         lease_id: lease_id.clone(),
         state_fence: candidate.state_fence.clone(),
         runtime_generation: ResourceGeneration::genesis(),
-        policy_revision: lane.routing.policy_revision.clone(),
+        policy_revision: lane.routing.policy_revision,
         requested_route: selected.clone(),
         selected_route: Some(selected.clone()),
         no_route: None,
