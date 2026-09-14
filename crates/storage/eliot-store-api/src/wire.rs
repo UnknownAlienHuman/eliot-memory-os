@@ -542,9 +542,16 @@ pub fn request_frame(
 /// revalidated and its decoded parameters must equal the operation's
 /// queryable parameters byte-for-byte at the `Value` level. A mismatch is a
 /// corrupt or substituted payload and fails closed here, before the `JsonV1`
-/// codec can collapse anything. The frame codec itself is unchanged; the
-/// authority travels with the caller and is persisted opaquely by the store.
-/// Any other request shape must carry no authorities.
+/// codec can collapse anything.
+///
+/// The authorities travel inside the frame's `trace_context` under the
+/// [`PAYLOAD_AUTHORITY_COUNT_KEY`] / [`payload_authority_entry_key`] channel
+/// as exact JSON renderings of [`ExactJsonBytes`] (original raw bytes
+/// preserved, never re-serialized from a collapsed `Value`). The `Frame`
+/// struct and the `StoreRequest` wire shape are unchanged, so legacy ingress
+/// that ignores `trace_context` keeps decoding; authority-aware ingress uses
+/// [`decode_request_frame_with_authority`]. Any other request shape must
+/// carry no authorities.
 pub fn request_frame_with_payload_authority(
     connection_id: impl Into<String>,
     protocol_version: ProtocolVersion,
@@ -554,13 +561,54 @@ pub fn request_frame_with_payload_authority(
     authorities: &[ExactJsonBytes],
 ) -> Result<Frame, StoreWireError> {
     bind_payload_authorities(&request, authorities)?;
-    request_frame(
+    let mut frame = request_frame(
         connection_id,
         protocol_version,
         request_id,
         identity,
         request,
-    )
+    )?;
+    embed_payload_authorities(&mut frame, authorities)?;
+    Ok(frame)
+}
+
+/// `trace_context` key carrying the number of embedded payload authorities.
+///
+/// The value is a decimal integer. `trace_context` stays a non-authoritative
+/// transport map: every embedded authority is revalidated
+/// ([`ExactJsonBytes::validate`]) and rebound to the decoded transition on
+/// the decode path, so a tampered count or entry fails closed there.
+const PAYLOAD_AUTHORITY_COUNT_KEY: &str = "eliot.store.payload_authority.count";
+
+/// Renders the `trace_context` key for one embedded payload authority.
+fn payload_authority_entry_key(index: usize) -> String {
+    format!("eliot.store.payload_authority.{index}")
+}
+
+/// Embeds exact payload authorities into a frame's `trace_context`.
+///
+/// Each authority serializes through its canonical [`ExactJsonBytes`] shape,
+/// which carries the original raw bytes opaquely; no authority is ever
+/// reconstructed from a re-serialized `Value` here.
+fn embed_payload_authorities(
+    frame: &mut Frame,
+    authorities: &[ExactJsonBytes],
+) -> Result<(), StoreWireError> {
+    for authority in authorities {
+        authority.validate().map_err(StoreWireError::Store)?;
+    }
+    frame.trace_context.insert(
+        PAYLOAD_AUTHORITY_COUNT_KEY.to_owned(),
+        authorities.len().to_string(),
+    );
+    for (index, authority) in authorities.iter().enumerate() {
+        let encoded = serde_json::to_string(authority)
+            .map_err(|error| StoreWireError::Payload(error.to_string()))?;
+        frame
+            .trace_context
+            .insert(payload_authority_entry_key(index), encoded);
+    }
+    Ok(())
 }
 
 /// Verifies that payload authorities exactly cover one `Apply` transition.
@@ -608,6 +656,33 @@ fn bind_payload_authorities(
 pub fn decode_request_frame(
     frame: &Frame,
 ) -> Result<(RequestId, RequestIdentity, StoreRequest), StoreWireError> {
+    let (request_id, identity, request, _) = decode_request_frame_with_authority(frame)?;
+    Ok((request_id, identity, request))
+}
+
+/// Decodes and validates one authenticated Execute request frame while
+/// preserving its embedded payload authorities (slice C2, issue #19).
+///
+/// The returned authorities carry the original raw bytes exactly as embedded
+/// by [`request_frame_with_payload_authority`]: each entry is deserialized
+/// from the frame channel and revalidated ([`ExactJsonBytes::validate`]), so
+/// its digest still binds version, encoding and the original bytes. Frames
+/// without the authority channel yield an empty vector and take the legacy
+/// path downstream. When authorities are present they are rebound to the
+/// decoded transition here, before any staging or commit: a count mismatch,
+/// a missing or trailing entry, a digest failure, or a parameter mismatch is
+/// a corrupt or substituted payload and fails closed without fallback.
+pub fn decode_request_frame_with_authority(
+    frame: &Frame,
+) -> Result<
+    (
+        RequestId,
+        RequestIdentity,
+        StoreRequest,
+        Vec<ExactJsonBytes>,
+    ),
+    StoreWireError,
+> {
     frame
         .validate()
         .map_err(|error| StoreWireError::Protocol(error.to_string()))?;
@@ -635,7 +710,64 @@ pub fn decode_request_frame(
     let request: StoreRequest = serde_json::from_value(payload.clone())
         .map_err(|error| StoreWireError::Payload(error.to_string()))?;
     request.validate_for_identity(&request_id, &identity)?;
-    Ok((request_id, identity, request))
+    let authorities = extract_payload_authorities(frame, &request)?;
+    Ok((request_id, identity, request, authorities))
+}
+
+/// Recovers embedded payload authorities from a decoded frame.
+///
+/// The channel is strict: a missing count with no entries means legacy
+/// (empty vector); a missing count with entries, an unparsable count, a
+/// missing or trailing entry, a malformed authority, a digest failure, or a
+/// parameter mismatch all fail closed as payload errors.
+fn extract_payload_authorities(
+    frame: &Frame,
+    request: &StoreRequest,
+) -> Result<Vec<ExactJsonBytes>, StoreWireError> {
+    let Some(count_text) = frame.trace_context.get(PAYLOAD_AUTHORITY_COUNT_KEY) else {
+        for key in frame.trace_context.keys() {
+            if key.starts_with("eliot.store.payload_authority.") {
+                return Err(StoreWireError::Payload(
+                    "payload authority entries without an authority count".to_owned(),
+                ));
+            }
+        }
+        return Ok(Vec::new());
+    };
+    let count: usize = count_text.parse().map_err(|_| {
+        StoreWireError::Payload("payload authority count is not a decimal integer".to_owned())
+    })?;
+    let mut authorities = Vec::with_capacity(count);
+    for index in 0..count {
+        let key = payload_authority_entry_key(index);
+        let encoded = frame.trace_context.get(&key).ok_or_else(|| {
+            StoreWireError::Payload(format!(
+                "payload authority entry is missing for operation {index}"
+            ))
+        })?;
+        let authority: ExactJsonBytes = serde_json::from_str(encoded)
+            .map_err(|error| StoreWireError::Payload(error.to_string()))?;
+        authority.validate().map_err(StoreWireError::Store)?;
+        authorities.push(authority);
+    }
+    for key in frame.trace_context.keys() {
+        if key.starts_with("eliot.store.payload_authority.")
+            && key != PAYLOAD_AUTHORITY_COUNT_KEY
+            && !key
+                .strip_prefix("eliot.store.payload_authority.")
+                .is_some_and(|suffix| {
+                    suffix
+                        .parse::<usize>()
+                        .is_ok_and(|index| index < count && suffix == index.to_string())
+                })
+        {
+            return Err(StoreWireError::Payload(
+                "trailing payload authority entry beyond the authority count".to_owned(),
+            ));
+        }
+    }
+    bind_payload_authorities(request, &authorities)?;
+    Ok(authorities)
 }
 
 /// Builds one correlated Result response frame.
@@ -763,7 +895,103 @@ fn validate_legacy_failure_text(value: &str, field: &'static str) -> Result<(), 
 
 #[cfg(test)]
 mod tests {
+    #![allow(clippy::expect_used)]
+
     use super::*;
+    use crate::{
+        EffectClass, EventProjectionRelationIntents, NamedMutationOperation, NamedMutationRequest,
+        OperationIdentity, OperationManifestDigest, OrderingScopeId, PayloadSource,
+        PreparedTransition, ScopeId, SecurityContext, TransitionClass,
+    };
+    use serde_json::{Value, json};
+    use std::collections::BTreeMap;
+
+    fn test_fence() -> crate::StateFence {
+        use eliot_contracts::{EpochId, EpochLineageId, ResourceGeneration};
+        use std::num::NonZeroU64;
+        let lineage = EpochLineageId::new("550e8400-e29b-41d4-a716-446655440000")
+            .expect("canonical test lineage-A");
+        let epoch = EpochId::new(lineage, NonZeroU64::new(1).expect("non-zero")).expect("epoch");
+        crate::StateFence::new(epoch, ResourceGeneration::genesis())
+    }
+
+    fn test_context(fence: &crate::StateFence) -> crate::RequestMeta {
+        crate::RequestMeta {
+            request_id: RequestId::new("request-authority").expect("request id"),
+            session_id: None,
+            task_id: None,
+            product_id: eliot_contracts::ProductId::new("product-authority").expect("product id"),
+            source_id: eliot_contracts::SourceId::new("source-authority").expect("source id"),
+            state_fence: fence.clone(),
+            clock: eliot_contracts::ClockReading::default(),
+        }
+    }
+
+    fn apply_parts(params: BTreeMap<String, Value>) -> (crate::RequestMeta, PreparedTransition) {
+        let fence = test_fence();
+        let context = test_context(&fence);
+        let transition = PreparedTransition {
+            identity: OperationIdentity {
+                operation_id: OperationId::new("op-authority").expect("operation id"),
+                idempotency_key: "idem-authority".to_owned(),
+                canonical_request_hash: "a".repeat(64),
+            },
+            state_fence: fence,
+            scope_id: ScopeId::new("scope-authority").expect("scope"),
+            task_id: None,
+            ordering_scopes: vec![OrderingScopeId::new("scope-authority").expect("ordering")],
+            transition_class: TransitionClass::CaptureCandidate,
+            requested_effect_ceiling: EffectClass::Candidate,
+            admission_contract_set_digest: "b".repeat(64),
+            operation_manifest_digest: OperationManifestDigest::new("manifest-authority")
+                .expect("manifest digest"),
+            named_operations: vec![NamedMutationRequest {
+                operation: NamedMutationOperation::CaptureObservation,
+                parameters: params,
+            }],
+            event_projection_relation_intents: EventProjectionRelationIntents {
+                event_ids: Vec::new(),
+                projection_kinds: Vec::new(),
+                relation_kinds: Vec::new(),
+            },
+            security: SecurityContext::default(),
+            required_proof_and_approval_refs: Vec::new(),
+        };
+        (context, transition)
+    }
+
+    fn test_identity(context: &crate::RequestMeta, idempotency_key: &str) -> RequestIdentity {
+        RequestIdentity {
+            request: eliot_receipts::RequestBinding {
+                metadata: context.clone(),
+                state_fence: context.state_fence.clone(),
+            },
+            idempotency_key: idempotency_key.to_owned(),
+            deadline_unix_ms: 1,
+            cancellation_id: "cancel-authority".to_owned(),
+        }
+    }
+
+    fn apply_frame(
+        context: &crate::RequestMeta,
+        transition: PreparedTransition,
+        authorities: &[ExactJsonBytes],
+    ) -> Frame {
+        request_frame_with_payload_authority(
+            "connection-authority",
+            ProtocolVersion::CURRENT,
+            context.request_id.clone(),
+            test_identity(context, &transition.identity.idempotency_key),
+            StoreRequest::Apply {
+                context: context.clone(),
+                transition,
+                expected_revision_heads: Vec::new(),
+                expected_ordering_heads: Vec::new(),
+            },
+            authorities,
+        )
+        .expect("authority frame builds")
+    }
 
     #[test]
     fn advertised_capabilities_are_complete_unique_and_canonical() {
@@ -787,5 +1015,197 @@ mod tests {
 
         let unique: BTreeSet<&str> = CAPABILITIES.iter().copied().collect();
         assert_eq!(unique.len(), CAPABILITIES.len());
+    }
+
+    #[test]
+    fn authority_frame_round_trip_preserves_original_raw_bytes() {
+        let raw = br#"{"subject":"observation-1"}"#;
+        let authority = ExactJsonBytes::parse(PayloadSource::NamedOperationParameter, raw)
+            .expect("authority parses");
+        let (context, transition) =
+            apply_parts(authority.decode_object_parameters().expect("params"));
+        let frame = apply_frame(&context, transition, std::slice::from_ref(&authority));
+        let (_, _, request, recovered) =
+            decode_request_frame_with_authority(&frame).expect("authority frame decodes");
+        assert_eq!(recovered.len(), 1);
+        assert_eq!(recovered[0].bytes, raw);
+        assert_eq!(recovered[0].digest_hex(), authority.digest_hex());
+        let StoreRequest::Apply { transition, .. } = request else {
+            panic!("apply request round-trips");
+        };
+        assert_eq!(
+            recovered[0]
+                .decode_object_parameters()
+                .expect("authority decodes"),
+            transition.named_operations[0].parameters
+        );
+    }
+
+    #[test]
+    fn authority_keeps_null_absent_false_and_zero_distinct() {
+        // One owner-shaped parameter field carrying the four JSON spellings
+        // that a collapsed `Value` pipeline must never conflate. The
+        // authority layer keeps them distinct as opaque bytes and as decoded
+        // values; the generic transition validator still rejects an explicit
+        // null (C1-owned `validate_parameters` rule, frozen for this slice),
+        // so only the three `Value`-valid spellings take the frame path here.
+        let raws: [&[u8]; 4] = [
+            br#"{"subject":null}"#,
+            b"{}",
+            br#"{"subject":false}"#,
+            br#"{"subject":0}"#,
+        ];
+        let authorities: Vec<ExactJsonBytes> = raws
+            .iter()
+            .map(|raw| {
+                ExactJsonBytes::parse(PayloadSource::NamedOperationParameter, raw)
+                    .expect("variant parses")
+            })
+            .collect();
+        let digests: BTreeSet<String> =
+            authorities.iter().map(ExactJsonBytes::digest_hex).collect();
+        assert_eq!(digests.len(), 4, "all four spellings bind distinct digests");
+        let decoded: Vec<BTreeMap<String, Value>> = authorities
+            .iter()
+            .map(|authority| {
+                authority
+                    .decode_object_parameters()
+                    .expect("variant decodes")
+            })
+            .collect();
+        for (left, right) in decoded.iter().zip(decoded.iter().skip(1)) {
+            assert_ne!(left, right, "decoded parameters stay distinct");
+        }
+        // Cross-binding any authority against another variant's parameters
+        // fails closed instead of substituting the payload.
+        let (context, transition) = apply_parts(decoded[2].clone());
+        assert!(
+            request_frame_with_payload_authority(
+                "connection-authority",
+                ProtocolVersion::CURRENT,
+                context.request_id.clone(),
+                test_identity(&context, &transition.identity.idempotency_key),
+                StoreRequest::Apply {
+                    context: context.clone(),
+                    transition,
+                    expected_revision_heads: Vec::new(),
+                    expected_ordering_heads: Vec::new(),
+                },
+                &[authorities[0].clone()],
+            )
+            .is_err(),
+            "null authority must not bind false parameters"
+        );
+        // The three `Value`-valid spellings round-trip byte-identically
+        // through a genuine frame encode/decode.
+        for (raw, params) in [raws[1], raws[2], raws[3]].into_iter().zip([
+            decoded[1].clone(),
+            decoded[2].clone(),
+            decoded[3].clone(),
+        ]) {
+            let authority = ExactJsonBytes::parse(PayloadSource::NamedOperationParameter, raw)
+                .expect("variant parses");
+            let (context, transition) = apply_parts(params);
+            let frame = apply_frame(&context, transition, &[authority]);
+            let (_, _, _, recovered) =
+                decode_request_frame_with_authority(&frame).expect("variant frame decodes");
+            assert_eq!(recovered.len(), 1);
+            assert_eq!(recovered[0].bytes, raw);
+        }
+        // The explicit-null spelling still fails closed at the generic
+        // parameter boundary before any frame is produced.
+        let (context, transition) = apply_parts(decoded[0].clone());
+        assert!(
+            request_frame_with_payload_authority(
+                "connection-authority",
+                ProtocolVersion::CURRENT,
+                context.request_id.clone(),
+                test_identity(&context, &transition.identity.idempotency_key),
+                StoreRequest::Apply {
+                    context: context.clone(),
+                    transition,
+                    expected_revision_heads: Vec::new(),
+                    expected_ordering_heads: Vec::new(),
+                },
+                &[authorities[0].clone()],
+            )
+            .is_err(),
+            "explicit null still rejected by the frozen generic parameter rule"
+        );
+    }
+
+    #[test]
+    fn legacy_frames_decode_without_authorities_and_tampering_fails_closed() {
+        let (context, transition) = apply_parts(BTreeMap::from([(
+            "subject".to_owned(),
+            json!("observation-1"),
+        )]));
+        let frame = request_frame(
+            "connection-authority",
+            ProtocolVersion::CURRENT,
+            context.request_id.clone(),
+            test_identity(&context, &transition.identity.idempotency_key),
+            StoreRequest::Apply {
+                context: context.clone(),
+                transition,
+                expected_revision_heads: Vec::new(),
+                expected_ordering_heads: Vec::new(),
+            },
+        )
+        .expect("legacy frame builds");
+        let (_, _, _, recovered) =
+            decode_request_frame_with_authority(&frame).expect("legacy frame decodes");
+        assert!(recovered.is_empty(), "legacy frames take the legacy path");
+
+        // Entries without a count fail closed.
+        let mut orphan = frame.clone();
+        orphan.trace_context.insert(
+            payload_authority_entry_key(0),
+            json!({"version": 1}).to_string(),
+        );
+        assert!(decode_request_frame_with_authority(&orphan).is_err());
+
+        // A count without its entry fails closed.
+        let mut missing = frame.clone();
+        missing
+            .trace_context
+            .insert(PAYLOAD_AUTHORITY_COUNT_KEY.to_owned(), "1".to_owned());
+        assert!(decode_request_frame_with_authority(&missing).is_err());
+
+        // A trailing entry beyond the count fails closed.
+        let raw = br#"{"subject":"observation-1"}"#;
+        let authority = ExactJsonBytes::parse(PayloadSource::NamedOperationParameter, raw)
+            .expect("authority parses");
+        let (context, transition) =
+            apply_parts(authority.decode_object_parameters().expect("params"));
+        let mut trailing = apply_frame(&context, transition, &[authority]);
+        trailing.trace_context.insert(
+            payload_authority_entry_key(1),
+            json!({"version": 1}).to_string(),
+        );
+        assert!(decode_request_frame_with_authority(&trailing).is_err());
+
+        // A substituted digest fails closed.
+        let mut substituted = apply_frame(
+            &context,
+            apply_parts(BTreeMap::from([(
+                "subject".to_owned(),
+                json!("observation-1"),
+            )]))
+            .1,
+            &[
+                ExactJsonBytes::parse(PayloadSource::NamedOperationParameter, raw)
+                    .expect("authority parses"),
+            ],
+        );
+        let mut tampered: ExactJsonBytes =
+            serde_json::from_str(&substituted.trace_context[&payload_authority_entry_key(0)])
+                .expect("embedded authority parses");
+        tampered.bytes = br#"{"subject":"substituted"}"#.to_vec();
+        substituted.trace_context.insert(
+            payload_authority_entry_key(0),
+            serde_json::to_string(&tampered).expect("tampered authority encodes"),
+        );
+        assert!(decode_request_frame_with_authority(&substituted).is_err());
     }
 }

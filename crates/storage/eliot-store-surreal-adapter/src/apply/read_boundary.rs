@@ -16,7 +16,7 @@ use crate::schema;
 use eliot_store_api::{
     CanonicalValidationSnapshot, NamedReadOperation, NamedReadRequest, NamedReadResponse,
     OperationId, OrderingHead, OrderingScopeId, RevisionHead, RevisionKey, ScopeId,
-    ScopeRevisionView, StoreError,
+    ScopeRevisionView, StoreError, generated_operation_manifests,
 };
 
 use super::{
@@ -27,6 +27,23 @@ use super::{
 };
 
 pub(super) const READ_VALIDATION_SNAPSHOT: &str = "BEGIN TRANSACTION; SELECT * FROM ONLY schema_meta:current; SELECT VALUE { state_fence: state_fence, next_commit_sequence: next_commit_sequence, next_outbox_sequence: next_outbox_sequence } FROM ONLY canonical_fence:current; SELECT VALUE body FROM revision_head; COMMIT TRANSACTION;";
+
+/// Enforces the active generated catalogue on one named read before dispatch
+/// (slice C2, issue #19).
+///
+/// Only the four activated reads (plus the genesis bootstrap entry, which
+/// never arrives through this path) are admitted: catalogue membership, the
+/// owner-approved typed parameters, the scope declaration, and the declared
+/// input bound are checked here, before any provider I/O. Unknown operations
+/// fail with [`StoreError::UnknownOperation`]; extra, control-substitution,
+/// or misshapen parameters fail with their existing typed mismatch variants.
+/// Nothing is normalized and there is no fallback: every rejection maps to a
+/// typed [`StoreFailure`](eliot_store_api::StoreFailure) at the dispatch
+/// boundary, never to a generic error.
+fn validate_named_against_active_catalogue(query: &NamedReadRequest) -> Result<(), StoreError> {
+    let entries = generated_operation_manifests()?;
+    query.validate_against_catalogue(&entries)
+}
 
 pub(crate) async fn read_validation_snapshot(
     adapter: &SurrealStoreAdapter,
@@ -197,7 +214,7 @@ pub(crate) async fn execute_named(
     adapter: &SurrealStoreAdapter,
     query: NamedReadRequest,
 ) -> Result<NamedReadResponse, AdapterError> {
-    query.validate()?;
+    validate_named_against_active_catalogue(&query).map_err(AdapterError::Store)?;
     let db = super::client(adapter).await?;
     ensure_ready(adapter, db).await?;
 
@@ -293,4 +310,117 @@ async fn read_all_ordering_heads(
     let heads = take_vec::<OrderingHead>(&mut response, 0)?;
     plan::validate_ordering_heads(&heads)?;
     Ok(heads)
+}
+
+#[cfg(test)]
+mod admitted_read_tests {
+    #![allow(clippy::expect_used)]
+
+    use super::*;
+    use eliot_store_api::ReadConsistency;
+    use serde_json::json;
+    use std::collections::BTreeMap;
+
+    fn test_fence() -> eliot_store_api::StateFence {
+        use eliot_contracts::{EpochId, EpochLineageId, ResourceGeneration};
+        use std::num::NonZeroU64;
+        let lineage = EpochLineageId::new("550e8400-e29b-41d4-a716-446655440000")
+            .expect("canonical test lineage-A");
+        let epoch = EpochId::new(lineage, NonZeroU64::new(1).expect("non-zero")).expect("epoch");
+        eliot_store_api::StateFence::new(epoch, ResourceGeneration::genesis())
+    }
+
+    fn read_request(
+        operation: NamedReadOperation,
+        scope_id: Option<ScopeId>,
+        parameters: BTreeMap<String, Value>,
+    ) -> NamedReadRequest {
+        NamedReadRequest {
+            operation,
+            scope_id,
+            consistency: ReadConsistency::Eventual,
+            state_fence: test_fence(),
+            parameters,
+        }
+    }
+
+    #[test]
+    fn activated_reads_are_accepted_before_dispatch() {
+        for request in [
+            read_request(NamedReadOperation::GetRevisionHeads, None, BTreeMap::new()),
+            read_request(NamedReadOperation::GetOrderingHeads, None, BTreeMap::new()),
+            read_request(
+                NamedReadOperation::GetScopeRevisionView,
+                Some(ScopeId::new("scope-1").expect("scope")),
+                BTreeMap::new(),
+            ),
+            read_request(
+                NamedReadOperation::ResolveWriteReceipt,
+                None,
+                BTreeMap::from([("operation_id".to_owned(), json!("op-1"))]),
+            ),
+        ] {
+            assert!(
+                validate_named_against_active_catalogue(&request).is_ok(),
+                "activated read must pass the pre-dispatch gate: {:?}",
+                request.operation
+            );
+        }
+    }
+
+    #[test]
+    fn extra_unknown_and_control_parameters_are_rejected_before_dispatch() {
+        // Extra undeclared parameter on an activated read.
+        let extra = read_request(
+            NamedReadOperation::GetRevisionHeads,
+            None,
+            BTreeMap::from([("extra".to_owned(), json!(1))]),
+        );
+        assert!(matches!(
+            validate_named_against_active_catalogue(&extra),
+            Err(StoreError::InvalidField { .. })
+        ));
+        // Control-substitution parameter name.
+        let control = read_request(
+            NamedReadOperation::GetRevisionHeads,
+            None,
+            BTreeMap::from([("state_fence".to_owned(), json!("x"))]),
+        );
+        assert!(matches!(
+            validate_named_against_active_catalogue(&control),
+            Err(StoreError::InvalidField {
+                field: "payload.control_field",
+                ..
+            })
+        ));
+        // Known-but-unadvertised operation stays unsupported.
+        let unadvertised = read_request(NamedReadOperation::GetTaskState, None, BTreeMap::new());
+        assert_eq!(
+            validate_named_against_active_catalogue(&unadvertised),
+            Err(StoreError::UnknownOperation)
+        );
+        // Missing required typed parameter.
+        let missing = read_request(
+            NamedReadOperation::ResolveWriteReceipt,
+            None,
+            BTreeMap::new(),
+        );
+        assert!(matches!(
+            validate_named_against_active_catalogue(&missing),
+            Err(StoreError::InvalidField { .. })
+        ));
+        // Scope declaration mismatch in both directions.
+        let stray_scope = read_request(
+            NamedReadOperation::GetRevisionHeads,
+            Some(ScopeId::new("scope-1").expect("scope")),
+            BTreeMap::new(),
+        );
+        assert!(validate_named_against_active_catalogue(&stray_scope).is_err());
+        let missing_scope = read_request(
+            NamedReadOperation::GetScopeRevisionView,
+            None,
+            BTreeMap::new(),
+        );
+        assert!(validate_named_against_active_catalogue(&missing_scope).is_err());
+    }
 }

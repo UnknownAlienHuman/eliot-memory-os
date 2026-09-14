@@ -53,8 +53,8 @@ pub use wire::{
     CAPABILITY_NAMED_READ, CAPABILITY_ORDERING_HEADS, CAPABILITY_READINESS, CAPABILITY_RECEIPT,
     CAPABILITY_RECOVERY, CAPABILITY_REVISION_HEADS, CAPABILITY_VALIDATION_SNAPSHOT, EFFECTS,
     ReadinessReceipt, ReadinessStatus, StoreRequest, StoreResponse, StoreWireError,
-    decode_request_frame, decode_response_frame, request_frame,
-    request_frame_with_payload_authority, response_frame,
+    decode_request_frame, decode_request_frame_with_authority, decode_response_frame,
+    request_frame, request_frame_with_payload_authority, response_frame,
 };
 
 mod operation_catalogue;
