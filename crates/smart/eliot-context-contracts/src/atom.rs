@@ -468,6 +468,16 @@ impl ContextCandidate {
     ///
     /// A Governor-owned route/disclosure contract must replace this narrow
     /// prototype rule before scoped or restricted material can cross a route.
+    ///
+    /// Owner transfer (issue #1025 finding 2): this cell refuses every
+    /// non-public atom at the validation call sites and defines no
+    /// `Secret`/`Restricted` route rule of its own. Route and disclosure
+    /// enforcement for non-public material is owned by Governor
+    /// `eliot-workscope` (`crates/governor/eliot-workscope/src/lib.rs:587`,
+    /// `PrivacyProfile::admits`, denying with `PrivacyDenied` at `:676-677`
+    /// and `:737-738`); downstream non-public disclosure is additionally
+    /// withheld as `WithheldPrivacy` by `classify_privacy_and_proof`
+    /// (`crates/smart/eliot-reactive-context-plan/src/plan.rs:2551-2557`).
     pub(crate) fn validate_public_privacy(&self) -> Result<(), ContextError> {
         if self.privacy == PrivacyClass::Public {
             Ok(())
