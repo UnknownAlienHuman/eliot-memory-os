@@ -381,8 +381,9 @@ impl std::error::Error for RuntimeBuildError {}
 #[allow(clippy::expect_used, clippy::unwrap_used)]
 mod tests {
     use super::*;
-    use eliot_contracts::{ArtifactId, ContractId, ContractVersion, StateFence};
-    use eliot_contracts::{AuthorityEpoch, ResourceGeneration};
+    use eliot_contracts::{ArtifactId, ContractId, ContractVersion, EpochId, EpochLineageId, StateFence};
+    use eliot_contracts::ResourceGeneration;
+    use std::num::NonZeroU64;
     use eliot_protocol::AgentBridgeActivationResponse;
     use eliot_protocol::{
         AGENT_BRIDGE_CLIENT_DECLARATION_WIRE_ID, AGENT_BRIDGE_CLIENT_DECLARATION_WIRE_VERSION,
@@ -396,9 +397,19 @@ mod tests {
     use eliot_runtime_contracts::{ModuleContract, ModuleGeneration};
     use std::collections::BTreeMap;
 
+    const TEST_LINEAGE_A: &str = "550e8400-e29b-41d4-a716-446655440000";
+
+    fn test_epoch(sequence: u64) -> EpochId {
+        EpochId::new(
+            EpochLineageId::new(TEST_LINEAGE_A).expect("valid test lineage"),
+            NonZeroU64::new(sequence).expect("nonzero test sequence"),
+        )
+        .expect("valid test epoch")
+    }
+
     fn fixture_declaration() -> AgentBridgeClientDeclaration {
         let fence = StateFence::new(
-            AuthorityEpoch::new(3).unwrap(),
+            test_epoch(3),
             ResourceGeneration::new(7).unwrap(),
         );
         let artifact = ArtifactId::new("a".repeat(64)).unwrap();
@@ -440,7 +451,7 @@ mod tests {
             expected_kernel_sid: "S-1-5-18".to_owned(),
             expected_kernel_session_id: 0,
             expected_kernel_principal_binding: "kernel:agent-bridge".to_owned(),
-            expected_kernel_authority_epoch: AuthorityEpoch::new(8).unwrap(),
+            expected_kernel_authority_epoch: test_epoch(8),
             expected_kernel_generation: ResourceGeneration::new(2).unwrap(),
             expected_kernel_artifact_sha256: "b".repeat(64),
             expected_kernel_config_snapshot_sha256: "c".repeat(64),
@@ -461,7 +472,7 @@ mod tests {
             bridge_generation: decl.module_generation.generation,
             state_fence: decl.module_generation.state_fence.clone(),
             kernel_principal_binding: decl.expected_kernel_principal_binding.clone(),
-            kernel_authority_epoch: decl.expected_kernel_authority_epoch,
+            kernel_authority_epoch: decl.expected_kernel_authority_epoch.clone(),
             kernel_generation: decl.expected_kernel_generation,
             kernel_artifact_sha256: decl.expected_kernel_artifact_sha256.clone(),
             kernel_config_snapshot_sha256: decl.expected_kernel_config_snapshot_sha256.clone(),
@@ -774,7 +785,7 @@ mod tests {
         assert!(bad_deadline.validate_challenge(&chal).is_err());
         let mut bad_fence = receipt.clone();
         bad_fence.state_fence = StateFence::new(
-            AuthorityEpoch::new(99).unwrap(),
+            test_epoch(99),
             ResourceGeneration::new(99).unwrap(),
         );
         bad_fence.receipt_sha256 = bad_fence.compute_digest().unwrap();
@@ -944,7 +955,7 @@ mod tests {
                     session_id: "session-1".to_owned(),
                     activation_generation: receipt.state_fence.resource_generation,
                     state_fence: eliot_protocol::AgentBridgeActivationFence {
-                        authority_epoch: receipt.state_fence.authority_epoch,
+                        authority_epoch: receipt.state_fence.authority_epoch.clone(),
                         generation: receipt.state_fence.resource_generation,
                         nonce: "semantic-fence-1".to_owned(),
                     },
@@ -976,7 +987,7 @@ mod tests {
         if let eliot_protocol::AgentBridgeActivationDisposition::Authenticated { binding } =
             &mut bad_authority_epoch.disposition
         {
-            binding.state_fence.authority_epoch = AuthorityEpoch::new(99).unwrap();
+            binding.state_fence.authority_epoch = test_epoch(99);
         }
         bad_authority_epoch = bad_authority_epoch.with_computed_digest().unwrap();
         let bad_authority_epoch_frame = frame_for(&bad_authority_epoch, "conn-1");

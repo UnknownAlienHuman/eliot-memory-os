@@ -10,7 +10,7 @@ use std::fmt;
 
 use eliot_contracts::{
     ArtifactId, AuthorityEpoch, ContractError, ContractId, ContractIdentity, ContractVersion,
-    ResourceGeneration, StateFence,
+    EpochId, ResourceGeneration, StateFence,
 };
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
@@ -788,7 +788,7 @@ pub struct RuntimeLease {
     /// Opaque reason/scope reference.
     pub scope_ref: String,
     /// Authority epoch and fence at issue.
-    pub authority_epoch: AuthorityEpoch,
+    pub authority_epoch: EpochId,
     pub state_fence: StateFence,
     /// Current lifecycle state.
     pub state: LeaseState,

@@ -149,9 +149,15 @@ impl KernelComposition {
             kernel_process.image_path(),
         )?;
         let expected_operation = eliotd_operation_id(generation, &launch_identity)?;
+        // INTENDED EpochId shape (B→A→C): exact-tuple is_same_authority, no
+        // scalar !=, no .value() coercion.
         if receipt.operation_id() != &expected_operation
             || receipt.accepted_generation().get() != launch.generation.value()
-            || receipt.binding().state_fence().authority_epoch() != launch.authority_epoch.value()
+            || !receipt
+                .binding()
+                .state_fence()
+                .authority_epoch()
+                .is_same_authority(&launch.authority_epoch)
             || receipt.binding().state_fence().generation() != generation
             || receipt.identity().executable_sha256() != launch.executable_sha256
             || !receipt
@@ -171,10 +177,10 @@ impl KernelComposition {
             stable_owner_principal_digest(
                 kernel_expectation.expected_sid(),
                 ACTIVE_DAEMON_CALLER,
-                launch.authority_epoch.value(),
+                &launch.authority_epoch,
                 generation,
             ),
-            launch.authority_epoch.value(),
+            launch.authority_epoch.clone(),
             generation,
         )
         .map_err(|error| KernelBuildError::Service(error.to_string()))?;
@@ -320,8 +326,11 @@ impl KernelComposition {
                 KernelBuildError::Service("front-door policy lock poisoned".to_owned())
             })?;
             if policy.module_generation.generation != next_launch.generation
-                || policy.module_generation.state_fence.authority_epoch
-                    != next_launch.authority_epoch
+                || !policy
+                    .module_generation
+                    .state_fence
+                    .authority_epoch
+                    .is_same_authority(&next_launch.authority_epoch)
             {
                 return Err(KernelBuildError::Service(
                     "eliotd recovery descriptor has the wrong generation or authority".to_owned(),

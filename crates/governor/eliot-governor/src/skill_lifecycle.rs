@@ -551,7 +551,7 @@ mod tests {
     use std::task::{Context, Poll};
 
     use eliot_contracts::{
-        AuthorityEpoch, ClockReading, OperationId, ProductId, RequestId, RequestMetadata,
+        ClockReading, EpochId, EpochLineageId, OperationId, ProductId, RequestId, RequestMetadata,
         ResourceGeneration, SessionId, SourceId, StateFence,
     };
     use eliot_protocol::RequestIdentity;
@@ -567,6 +567,16 @@ mod tests {
     };
 
     use crate::{CanonicalAdmissionSnapshot, KernelPortFuture};
+
+    const TEST_LINEAGE_A: &str = "550e8400-e29b-41d4-a716-446655440000";
+
+    fn test_epoch(lineage: &str, sequence: u64) -> EpochId {
+        EpochId::new(
+            EpochLineageId::new(lineage).expect("valid test lineage"),
+            std::num::NonZeroU64::new(sequence).expect("nonzero test sequence"),
+        )
+        .expect("valid test epoch")
+    }
 
     struct TestKernel {
         committed: Mutex<BTreeMap<OperationId, (RequestIdentity, WriteReceipt)>>,
@@ -723,7 +733,7 @@ mod tests {
 
     fn fence() -> StateFence {
         StateFence::new(
-            AuthorityEpoch::new(1).expect("epoch"),
+            test_epoch(TEST_LINEAGE_A, 1),
             ResourceGeneration::new(1).expect("generation"),
         )
     }

@@ -11,7 +11,7 @@
 use std::collections::BTreeMap;
 
 use eliot_contracts::{
-    AuthorityEpoch, ClockReading, OperationId, ProductId, RequestId, ResourceGeneration, SourceId,
+    ClockReading, EpochId, OperationId, ProductId, RequestId, ResourceGeneration, SourceId,
 };
 use eliot_store_api::{
     CONTRACT_VERSION, EffectClass, EventProjectionRelationIntents, GENESIS_MANIFEST_NAME,
@@ -24,8 +24,20 @@ use eliot_store_api::{
 };
 use serde_json::{Value, json};
 
+fn test_epoch(sequence: u64) -> EpochId {
+    use eliot_contracts::EpochLineageId;
+    use std::num::NonZeroU64;
+    let lineage = EpochLineageId::new("550e8400-e29b-41d4-a716-446655440000")
+        .expect("canonical test lineage-A");
+    EpochId::new(
+        lineage,
+        NonZeroU64::new(sequence).expect("non-zero test sequence"),
+    )
+    .expect("valid test epoch")
+}
+
 fn fence() -> StateFence {
-    StateFence::new(AuthorityEpoch::genesis(), ResourceGeneration::genesis())
+    StateFence::new(test_epoch(1), ResourceGeneration::genesis())
 }
 
 fn read_request(

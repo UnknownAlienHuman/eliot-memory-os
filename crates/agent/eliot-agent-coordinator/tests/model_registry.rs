@@ -1,9 +1,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::error::Error;
 
-use eliot_agent_api::{
-    AuthorityEpoch, LowercaseSha256, ResourceGeneration, RouteFingerprint, StateFence,
-};
+use eliot_agent_api::{EpochId, LowercaseSha256, ResourceGeneration, RouteFingerprint, StateFence};
 use eliot_agent_coordinator::{
     BillingClass, BillingEvidence, CapabilityObservation, CapabilityStatus, CheckDisposition,
     CoverageState, ModelAvailability, ModelCatalogueEntry, ModelCatalogueSnapshot,
@@ -12,7 +10,17 @@ use eliot_agent_coordinator::{
     RouteRequirements, compile_model_selection, find_models,
 };
 
-use eliot_contracts::sha256_hex;
+use eliot_contracts::{EpochLineageId, sha256_hex};
+
+const TEST_LINEAGE_A: &str = "550e8400-e29b-41d4-a716-446655440000";
+
+fn test_epoch(lineage: &str, sequence: u64) -> EpochId {
+    EpochId::new(
+        EpochLineageId::new(lineage).expect("valid test lineage"),
+        std::num::NonZeroU64::new(sequence).expect("nonzero test sequence"),
+    )
+    .expect("valid test epoch")
+}
 
 const NOW: u64 = 10_000;
 
@@ -101,7 +109,10 @@ fn requirements() -> Result<RouteRequirements, Box<dyn Error>> {
         "task-1",
         "attempt-1",
         "scope-1",
-        StateFence::new(AuthorityEpoch::new(1)?, ResourceGeneration::new(1)?),
+        StateFence::new(
+            test_epoch(TEST_LINEAGE_A, 1),
+            ResourceGeneration::new(1)?,
+        ),
         "policy-1",
         NOW,
     ))

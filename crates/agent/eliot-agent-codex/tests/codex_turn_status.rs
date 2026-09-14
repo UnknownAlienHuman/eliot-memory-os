@@ -6,8 +6,18 @@ use eliot_agent_api::{
 use eliot_agent_codex::{
     CodexAdapterError, CodexSessionBinding, CodexWireMessage, codex_route, translate_host_event,
 };
-use eliot_contracts::{ClockReading, sha256_hex};
+use eliot_contracts::{ClockReading, EpochId, EpochLineageId, sha256_hex};
 use serde_json::Value;
+
+const TEST_LINEAGE_A: &str = "550e8400-e29b-41d4-a716-446655440000";
+
+fn test_epoch(lineage: &str, sequence: u64) -> EpochId {
+    EpochId::new(
+        EpochLineageId::new(lineage).expect("valid test lineage"),
+        std::num::NonZeroU64::new(sequence).expect("nonzero test sequence"),
+    )
+    .expect("valid test epoch")
+}
 
 fn fixture_digest(seed: &str) -> LowercaseSha256 {
     serde_json::from_value(serde_json::json!(eliot_contracts::sha256_hex(
@@ -47,7 +57,7 @@ fn binding() -> Result<ProviderExecutionBinding, Box<dyn std::error::Error>> {
             serde_json::json!({"namespace": "eliot.governor.work-lease", "revision": "v1", "value": "lease-1"}),
         )?,
         state_fence: eliot_agent_api::StateFence::new(
-            eliot_agent_api::AuthorityEpoch::new(1)?,
+            test_epoch(TEST_LINEAGE_A, 1),
             eliot_agent_api::ResourceGeneration::new(1)?,
         ),
         runtime_generation: eliot_agent_api::ResourceGeneration::new(1)?,

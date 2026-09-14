@@ -475,11 +475,19 @@ impl ClockReading {
 }
 
 /// A compact, dependency-only state fence.
+///
+/// The authority epoch is the lineage-aware [`EpochId`] exact tuple
+/// (`epoch_identity.rs:125`; contract `epoch-id.contract.toml`
+/// `[types.EpochId]`). Equal sequences from different lineages are unrelated
+/// and never authorize; a numerically larger sequence from another lineage is
+/// never newer. Scalar [`AuthorityEpoch`] values are never coerced into this
+/// field; legacy numeric records enter only through
+/// [`import_legacy_scalar_epoch`] with explicit evidence.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct StateFence {
-    /// Current authority epoch.
-    pub authority_epoch: AuthorityEpoch,
+    /// Current lineage-aware authority epoch (exact `(lineage_id, sequence)` tuple).
+    pub authority_epoch: EpochId,
     /// Resource generation relevant to the decision.
     pub resource_generation: ResourceGeneration,
     /// Current task-plan revision, when task-bound.
@@ -492,10 +500,12 @@ pub struct StateFence {
 
 impl StateFence {
     /// Constructs a fence with the minimum authority and resource dependencies.
-    pub const fn new(
-        authority_epoch: AuthorityEpoch,
-        resource_generation: ResourceGeneration,
-    ) -> Self {
+    ///
+    /// Takes the lineage-aware [`EpochId`] directly; no scalar-to-canonical
+    /// coercion exists (contract `[functions] forbidden`: no
+    /// `From<u64>`/`Ord`/cross-lineage compare, no implicit current-lineage
+    /// fallback).
+    pub fn new(authority_epoch: EpochId, resource_generation: ResourceGeneration) -> Self {
         Self {
             authority_epoch,
             resource_generation,
@@ -505,8 +515,12 @@ impl StateFence {
         }
     }
     /// Returns whether two fences can safely share a decision scope.
+    ///
+    /// Authority epochs match only via [`EpochId::is_same_authority`] exact
+    /// `(lineage_id, sequence)` tuple equality: equal sequences from different
+    /// lineages are unrelated and return false.
     pub fn is_compatible_with(&self, other: &Self) -> bool {
-        self.authority_epoch == other.authority_epoch
+        self.authority_epoch.is_same_authority(&other.authority_epoch)
             && self.resource_generation == other.resource_generation
             && (self.task_revision.is_none() || self.task_revision == other.task_revision)
             && (self.policy_revision.is_none() || self.policy_revision == other.policy_revision)
@@ -514,8 +528,11 @@ impl StateFence {
                 || self.integration_revision == other.integration_revision)
     }
     /// Validates the fence's required dependencies.
+    ///
+    /// [`EpochId`] is always a validated non-zero `(lineage_id, sequence)`
+    /// tuple by construction, so only the resource generation is checked here.
     pub fn validate(&self) -> Result<(), ContractError> {
-        if self.authority_epoch.value() == 0 || self.resource_generation.value() == 0 {
+        if self.resource_generation.value() == 0 {
             return Err(ContractError::EmptyFence);
         }
         Ok(())
@@ -533,10 +550,9 @@ impl StateFence {
     /// `[types.EpochId]` exact-tuple rule and `[types.EpochRelation]`
     /// `UNRELATED_LINEAGE never authorizes`).
     ///
-    /// Additive prep only: the scalar `StateFence` fields above are unchanged
-    /// (migration wave 1 must not touch `StateFence` consumers), and this
-    /// function takes explicit `EpochId` values without any
-    /// scalar-to-canonical coercion.
+    /// Additive prep only: this function takes explicit `EpochId` values
+    /// without any scalar-to-canonical coercion. `StateFence.authority_epoch`
+    /// itself is now the canonical [`EpochId`] (migration wave 3).
     #[must_use]
     pub fn authorizes_canonical(fence_epoch: &EpochId, active_epoch: &EpochId) -> bool {
         fence_epoch.is_same_authority(active_epoch)
@@ -813,7 +829,10 @@ mod tests {
             task_id: None,
             product_id: ProductId::new("product-1")?,
             source_id: SourceId::new("source-1")?,
-            state_fence: StateFence::new(AuthorityEpoch::genesis(), ResourceGeneration::genesis()),
+            state_fence: StateFence::new(
+                canonical_epoch(CANONICAL_LINEAGE_A, 1),
+                ResourceGeneration::genesis(),
+            ),
             clock: ClockReading {
                 valid_time_ms: Some(10),
                 known_time_ms: Some(11),
@@ -834,10 +853,24 @@ mod tests {
     fn malformed_unknown_fields_fail_closed() {
         let value = serde_json::json!({
             "request_id": "req-1", "product_id": "p", "source_id": "s",
-            "state_fence": {"authority_epoch": 1, "resource_generation": 1, "unexpected": true},
+            "state_fence": {
+                "authority_epoch": {
+                    "lineage_id": CANONICAL_LINEAGE_A,
+                    "sequence": 1
+                },
+                "resource_generation": 1,
+                "unexpected": true
+            },
             "clock": {}
         });
         assert!(serde_json::from_value::<RequestMetadata>(value).is_err());
+        // A bare numeric authority epoch is no longer a valid wire shape.
+        let legacy_scalar = serde_json::json!({
+            "request_id": "req-1", "product_id": "p", "source_id": "s",
+            "state_fence": {"authority_epoch": 1, "resource_generation": 1},
+            "clock": {}
+        });
+        assert!(serde_json::from_value::<RequestMetadata>(legacy_scalar).is_err());
     }
 
     #[test]
@@ -1137,6 +1170,49 @@ mod tests {
         assert_eq!(first.as_str(), epoch_identity_digest(&same_a)?.as_str());
         assert_ne!(first, StateFence::canonical_epoch_digest(&other_lineage)?);
         assert_ne!(first, StateFence::canonical_epoch_digest(&other_sequence)?);
+        Ok(())
+    }
+
+    /// Split B proportionate proof (Implements #64): the migrated `StateFence`
+    /// round-trips its lineage-aware epoch wire shape, rejects the exact same
+    /// sequence from a different lineage via `is_same_authority` exact-tuple
+    /// equality, and quarantines a bare numeric epoch (no `From<u64>`, no
+    /// scalar coercion; legacy numerics enter only via
+    /// `import_legacy_scalar_epoch` with evidence).
+    #[test]
+    fn state_fence_epoch_id_wire_roundtrip_rejects_foreign_lineage() -> TestResult {
+        let fence = StateFence::new(
+            canonical_epoch(CANONICAL_LINEAGE_A, 3),
+            ResourceGeneration::new(5)?,
+        );
+        fence.validate()?;
+        let wire = serde_json::to_string(&fence)?;
+        let decoded: StateFence = serde_json::from_str(&wire)?;
+        assert_eq!(decoded, fence);
+        assert!(decoded.is_compatible_with(&fence));
+
+        // Same sequence, different lineage: unrelated, never compatible.
+        let foreign = StateFence::new(
+            canonical_epoch(CANONICAL_LINEAGE_B, 3),
+            ResourceGeneration::new(5)?,
+        );
+        assert!(!fence.is_compatible_with(&foreign));
+        assert!(!foreign.is_compatible_with(&fence));
+        assert!(!fence
+            .authority_epoch
+            .is_same_authority(&foreign.authority_epoch));
+
+        // Bare numeric wire is rejected; legacy numerics stay quarantined.
+        let numeric_wire = serde_json::json!({
+            "authority_epoch": 3,
+            "resource_generation": 5
+        });
+        assert!(serde_json::from_value::<StateFence>(numeric_wire).is_err());
+        let legacy = LegacyScalarEpoch::new(3, "record-3", "scalar-v3")?;
+        assert!(matches!(
+            import_legacy_scalar_epoch(legacy, LegacyEpochEvidence::Missing),
+            Ok(LegacyEpochImport::HistoricalSuspended { .. })
+        ));
         Ok(())
     }
 }

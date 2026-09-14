@@ -654,6 +654,7 @@ name = "eliot-agent-bridge-core"
 version = "0.1.0"
 dependencies = [
  "eliot-agent-api",
+ "eliot-contracts",
  "eliot-observation-contracts",
  "eliot-process",
  "eliot-protocol",
@@ -1435,6 +1436,7 @@ dependencies = [
 name = "eliot-ipc"
 version = "0.1.0"
 dependencies = [
+ "eliot-contracts",
  "eliot-platform",
  "eliot-platform-windows",
  "eliot-protocol",
@@ -1788,6 +1790,7 @@ dependencies = [
 name = "eliot-process-executor"
 version = "0.1.0"
 dependencies = [
+ "eliot-contracts",
  "eliot-instrument-api",
  "eliot-platform",
  "eliot-platform-windows",
@@ -2197,6 +2200,7 @@ dependencies = [
 name = "eliot-testd"
 version = "0.1.0"
 dependencies = [
+ "eliot-contracts",
  "eliot-instrument-api",
  "eliot-platform-windows",
  "eliot-process",
@@ -2213,6 +2217,7 @@ name = "eliot-testd-core"
 version = "0.1.0"
 dependencies = [
  "blake3",
+ "eliot-contracts",
  "eliot-instrument-api",
  "eliot-process",
  "redb",
@@ -2273,6 +2278,7 @@ dependencies = [
 name = "eliot-user-broker-core"
 version = "0.1.0"
 dependencies = [
+ "eliot-contracts",
  "eliot-platform",
  "eliot-process",
  "eliot-protocol",

@@ -1,8 +1,8 @@
 use std::collections::BTreeSet;
 
 use eliot_agent_api::{
-    AgentLaunchRequest, AgentWorkUnitBrief, AllowedMode, AttemptId, AuthorityEpoch, BudgetEnvelope,
-    EffectCeiling, EffectKind, ExecutionUnit, LaunchRequestId, LowercaseSha256, NativeSession,
+    AgentLaunchRequest, AgentWorkUnitBrief, AllowedMode, AttemptId, BudgetEnvelope, EffectCeiling,
+    EffectKind, EpochId, ExecutionUnit, LaunchRequestId, LowercaseSha256, NativeSession,
     ProviderExecutionBinding, RequestId, ResourceGeneration, RouteFingerprint, StateFence, TaskId,
     WorkLeaseId, WorkUnitId, candidate_digest_for,
 };
@@ -14,11 +14,21 @@ use eliot_agent_coordinator::{
     RoleProfileManifest, RouteCandidateEvidence, StaffingLaneRequest, StaffingPlanRequest,
     WorkerId,
 };
-use eliot_contracts::sha256_hex;
+use eliot_contracts::{EpochLineageId, sha256_hex};
 use eliot_evaluation_contracts::BudgetEvidence;
 use eliot_security_contracts::PrivacyClass;
 
 type TestResult<T = ()> = Result<T, Box<dyn std::error::Error>>;
+
+const TEST_LINEAGE_A: &str = "550e8400-e29b-41d4-a716-446655440000";
+
+fn test_epoch(lineage: &str, sequence: u64) -> EpochId {
+    EpochId::new(
+        EpochLineageId::new(lineage).expect("valid test lineage"),
+        std::num::NonZeroU64::new(sequence).expect("nonzero test sequence"),
+    )
+    .expect("valid test epoch")
+}
 
 fn budget() -> BudgetEnvelope {
     BudgetEnvelope {
@@ -32,7 +42,10 @@ fn budget() -> BudgetEnvelope {
 }
 
 fn fence() -> StateFence {
-    StateFence::new(AuthorityEpoch::genesis(), ResourceGeneration::genesis())
+    StateFence::new(
+        test_epoch(TEST_LINEAGE_A, 1),
+        ResourceGeneration::genesis(),
+    )
 }
 
 fn route(name: &str) -> RouteFingerprint {
@@ -236,7 +249,7 @@ fn caller_fabricated_admission_cannot_bypass_plan_gap() -> TestResult {
         task_revision: candidate.task_revision.clone(),
         plan_revision: candidate.plan_revision.clone(),
         state_fence: candidate.state_fence.clone(),
-        controller_epoch: AuthorityEpoch::new(1)?,
+        controller_epoch: test_epoch(TEST_LINEAGE_A, 1),
         coordinator_lease: serde_json::from_value::<eliot_agent_api::WorkLeaseId>(
             serde_json::json!({"namespace": "eliot.governor.work-lease", "revision": "v1", "value": "lease-forged"}),
         )?,
@@ -330,7 +343,7 @@ fn execution_binding_submission_wire_is_additive_and_snapshot_stays_v4() -> Test
         task_revision: "task-rev-1".to_owned(),
         plan_revision: RevisionId::new("plan-rev-1")?,
         state_fence: fence(),
-        controller_epoch: AuthorityEpoch::new(1)?,
+        controller_epoch: test_epoch(TEST_LINEAGE_A, 1),
         coordinator_lease: serde_json::from_value::<WorkLeaseId>(
             serde_json::json!({"namespace": "eliot.governor.work-lease", "revision": "v1", "value": "coordinator-lease-wire"}),
         )?,

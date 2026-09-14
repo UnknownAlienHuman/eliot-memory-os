@@ -633,7 +633,13 @@ pub fn evidence_shape_digest<T: Serialize>(shape: &T) -> Result<String, Evidence
 #[cfg(test)]
 mod tests {
     use super::*;
-    use eliot_contracts::{AuthorityEpoch, ResourceGeneration};
+    use eliot_contracts::{EpochId, EpochLineageId, ResourceGeneration};
+    use std::num::NonZeroU64;
+
+    fn test_epoch(sequence: u64) -> EpochId {
+        let lineage = EpochLineageId::new("550e8400-e29b-41d4-a716-446655440000").expect("canonical test lineage-A");
+        EpochId::new(lineage, NonZeroU64::new(sequence).expect("non-zero test sequence")).expect("valid test epoch")
+    }
 
     fn source_id(value: &str) -> Result<SourceId, EvidenceError> {
         SourceId::new(value).map_err(|_| EvidenceError::InvalidText { field: "source_id" })
@@ -676,7 +682,7 @@ mod tests {
             assertability,
             provenance: provenance()?,
             verification,
-            state_fence: StateFence::new(AuthorityEpoch::genesis(), ResourceGeneration::genesis()),
+            state_fence: StateFence::new(test_epoch(1), ResourceGeneration::genesis()),
         })
     }
 
@@ -730,7 +736,7 @@ mod tests {
             reason: "fixture".to_owned(),
             scope: "fixture-scope".to_owned(),
             provenance: provenance()?,
-            state_fence: StateFence::new(AuthorityEpoch::genesis(), ResourceGeneration::genesis()),
+            state_fence: StateFence::new(test_epoch(1), ResourceGeneration::genesis()),
         };
         assert!(matches!(
             transition.validate(),

@@ -199,7 +199,11 @@ impl CapabilityGrant {
             .state_fence
             .validate()
             .map_err(|_| AuthorityError::FenceMismatch)?;
-        if self.binding.authority_epoch != self.binding.state_fence.authority_epoch {
+        if !self
+            .binding
+            .authority_epoch
+            .is_same_authority(&self.binding.state_fence.authority_epoch)
+        {
             return Err(AuthorityError::EpochMismatch);
         }
         if effect_rank(self.authority.max_effect()) > effect_rank(self.binding.allowed_effect) {
@@ -387,7 +391,10 @@ impl EffectiveCapabilitySnapshot {
         {
             return Err(AuthorityError::FenceMismatch);
         }
-        if session.authority_epoch != session.state_fence.authority_epoch {
+        if !session
+            .authority_epoch
+            .is_same_authority(&session.state_fence.authority_epoch)
+        {
             return Err(AuthorityError::EpochMismatch);
         }
         Ok(())
@@ -577,7 +584,11 @@ impl GrantGraph {
         {
             return Err(AuthorityError::FenceMismatch);
         }
-        if grant.binding.authority_epoch != session.authority_epoch {
+        if !grant
+            .binding
+            .authority_epoch
+            .is_same_authority(&session.authority_epoch)
+        {
             return Err(AuthorityError::EpochMismatch);
         }
         Ok(())
@@ -637,7 +648,10 @@ fn validate_context(
     if work_scope.state_fence != session.state_fence {
         return Err(AuthorityError::FenceMismatch);
     }
-    if session.authority_epoch != session.state_fence.authority_epoch {
+    if !session
+        .authority_epoch
+        .is_same_authority(&session.state_fence.authority_epoch)
+    {
         return Err(AuthorityError::EpochMismatch);
     }
     Ok(())
@@ -783,15 +797,29 @@ mod recovery_tests {
 
     use super::*;
     use eliot_contracts::{
-        AuthorityEpoch, ContractId, ResourceGeneration, StateFence, canonical_json_bytes,
+        ContractId, EpochId, EpochLineageId, ResourceGeneration, StateFence, canonical_json_bytes,
     };
     use eliot_receipts::ProofCeiling;
+    use std::num::NonZeroU64;
+
+    const TEST_LINEAGE_A: &str = "550e8400-e29b-41d4-a716-446655440000";
+
+    fn test_epoch(lineage: &str, sequence: u64) -> EpochId {
+        EpochId::new(
+            EpochLineageId::new(lineage).expect("valid test lineage"),
+            NonZeroU64::new(sequence).expect("nonzero test sequence"),
+        )
+        .expect("valid test epoch")
+    }
 
     type TestResult = Result<(), Box<dyn Error>>;
 
     fn binding() -> Result<AuthorityBinding, Box<dyn Error>> {
-        let authority_epoch = AuthorityEpoch::new(1)?;
-        let state_fence = StateFence::new(authority_epoch, ResourceGeneration::new(1)?);
+        let authority_epoch = test_epoch(TEST_LINEAGE_A, 1);
+        let state_fence = StateFence::new(
+            authority_epoch.clone(),
+            ResourceGeneration::new(1)?,
+        );
         Ok(AuthorityBinding {
             authority_id: ContractId::new("authority:test")?,
             authority_owner: "G-01".to_owned(),

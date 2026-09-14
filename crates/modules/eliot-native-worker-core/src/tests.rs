@@ -11,10 +11,11 @@ use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll, Waker};
 
 use eliot_agent_api::{
-    AttemptId, AuthorityEnvelope, AuthorityEpoch, AuthorizedEffect, EffectCeiling, EffectKind,
-    ProposedEffect, ResourceGeneration, StateFence, WorkLeaseId,
+    AttemptId, AuthorityEnvelope, AuthorizedEffect, EffectCeiling, EffectKind, ProposedEffect,
+    ResourceGeneration, StateFence, WorkLeaseId,
 };
-use eliot_contracts::{IntegrationRevision, PolicyRevision, TaskRevision};
+use eliot_contracts::{EpochId, EpochLineageId, IntegrationRevision, PolicyRevision, TaskRevision};
+use std::num::NonZeroU64;
 use eliot_process::{
     ActionLeaseRef, CancellationReceipt, CancellationRequest, DescendantEvidence,
     DispatchAuthorityId, DispatchPermitAuthority, DispatchValidationContext, EnvironmentProjection,
@@ -27,6 +28,16 @@ use eliot_process::{
 };
 
 use super::*;
+
+const TEST_LINEAGE_A: &str = "550e8400-e29b-41d4-a716-446655440000";
+
+fn test_epoch(sequence: u64) -> EpochId {
+    EpochId::new(
+        EpochLineageId::new(TEST_LINEAGE_A).expect("valid test lineage"),
+        NonZeroU64::new(sequence).expect("nonzero test sequence"),
+    )
+    .expect("valid test epoch")
+}
 
 type TestCore = WorkerCore<FakeExecutor, FakeAdmission, FakeReplay, FakeReplay>;
 
@@ -219,9 +230,8 @@ impl CapabilityAdmissionPort for FakeAdmission {
         }
         let mut authority = authority(request.hello().state_fence.clone());
         if state.returned_wrong_epoch {
-            let wrong_epoch = AuthorityEpoch::new(2)
-                .map_err(|_| ProviderFailure::new("admission", "wrong epoch"))?;
-            authority.epoch = wrong_epoch;
+            let wrong_epoch = test_epoch(2);
+            authority.epoch = wrong_epoch.clone();
             authority.state_fence.authority_epoch = wrong_epoch;
         }
         if state.returned_wrong_fence {
@@ -282,7 +292,7 @@ impl CapabilityAdmissionPort for FakeAdmission {
             *request.authority_epoch(),
             if state.stale_fence {
                 StateFence::new(
-                    AuthorityEpoch::new(1).expect("epoch"),
+                    test_epoch(1),
                     ResourceGeneration::new(2).expect("generation"),
                 )
             } else {
@@ -532,7 +542,7 @@ fn block_on<F: Future>(future: F) -> F::Output {
 
 fn authority(state_fence: StateFence) -> AuthorityEnvelope {
     AuthorityEnvelope {
-        epoch: AuthorityEpoch::new(1).expect("epoch"),
+        epoch: test_epoch(1),
         scope_ref: "scope-1".to_owned(),
         effect_ceiling: EffectCeiling {
             scope_ref: "scope-1".to_owned(),
@@ -567,7 +577,8 @@ fn process_request_with(operation: &str, tree: &str, generation: u64) -> Process
     )
     .expect("process intent");
     let fence =
-        FencingToken::new(1, generation, format!("process-fence-{generation:?}")).expect("fence");
+        FencingToken::new(test_epoch(1), generation, format!("process-fence-{generation:?}"))
+            .expect("fence");
     let mut authority = DispatchPermitAuthority::activate(
         DispatchAuthorityId::new("native-worker-authority").expect("authority"),
         KernelDispatchKey::from_secret_bytes([0x5a; 32]).expect("key"),
@@ -675,9 +686,9 @@ fn hello(connection: &str, request: &str) -> WorkerHello {
         artifact_manifest_digest: "manifest-digest-1".to_owned(),
         launch_nonce: "launch-nonce-1".to_owned(),
         worker_generation: 1,
-        authority_epoch: AuthorityEpoch::new(1).expect("epoch"),
+        authority_epoch: test_epoch(1),
         state_fence: StateFence::new(
-            AuthorityEpoch::new(1).expect("epoch"),
+            test_epoch(1),
             ResourceGeneration::new(1).expect("generation"),
         ),
         route_ref: "route-1".to_owned(),
@@ -695,9 +706,9 @@ fn frame(request_id: &str, body: WorkerFrameBody) -> WorkerFrame {
             .into_iter()
             .collect(),
         deadline_unix_ms: 5_000,
-        authority_epoch: AuthorityEpoch::new(1).expect("epoch"),
+        authority_epoch: test_epoch(1),
         state_fence: StateFence::new(
-            AuthorityEpoch::new(1).expect("epoch"),
+            test_epoch(1),
             ResourceGeneration::new(1).expect("generation"),
         ),
         lease_id: serde_json::from_value::<WorkLeaseId>(serde_json::json!({"namespace": "eliot.governor.work-lease", "revision": "v1", "value": "lease-1"})).expect("lease"),
@@ -883,15 +894,15 @@ fn stale_epoch_and_fence_are_rejected_before_live_provider_use() {
         .expect("admission lock")
         .revalidations;
     let mut stale_epoch = frame("execute-epoch", WorkerFrameBody::Execute(request(None)));
-    stale_epoch.authority_epoch = AuthorityEpoch::new(2).expect("epoch");
-    stale_epoch.state_fence.authority_epoch = AuthorityEpoch::new(2).expect("epoch");
+    stale_epoch.authority_epoch = test_epoch(2);
+    stale_epoch.state_fence.authority_epoch = test_epoch(2);
     assert_eq!(
         block_on(core.handle(stale_epoch)),
         Err(WorkerError::StaleEpoch)
     );
     let mut stale_fence = frame("execute-fence", WorkerFrameBody::Execute(request(None)));
     stale_fence.state_fence = StateFence::new(
-        AuthorityEpoch::new(1).expect("epoch"),
+        test_epoch(1),
         ResourceGeneration::new(2).expect("generation"),
     );
     assert_eq!(
@@ -1110,9 +1121,9 @@ fn reconnect_replays_and_ack_advances_only_through_durable_port() {
             event_id: heartbeat[0].event_id.clone(),
             sequence: heartbeat[0].sequence,
             producer_generation: 1,
-            authority_epoch: AuthorityEpoch::new(1).expect("epoch"),
+            authority_epoch: test_epoch(1),
             state_fence: StateFence::new(
-                AuthorityEpoch::new(1).expect("epoch"),
+                test_epoch(1),
                 ResourceGeneration::new(1).expect("generation"),
             ),
             phase: AckPhase::Normalized,
@@ -1517,13 +1528,13 @@ fn native_case_20_zero_counters_and_epoch_fence_mismatch_reject() {
     value["state_fence"]["resource_generation"] = serde_json::json!(0);
     assert!(serde_json::from_value::<WorkerHello>(value).is_err());
     let mut mismatched = hello("connection-20c", "request-20c");
-    mismatched.authority_epoch = AuthorityEpoch::new(2).expect("epoch");
+    mismatched.authority_epoch = test_epoch(2);
     assert_eq!(
         mismatched.validate(),
         Err(WorkerError::InvalidHandshake("epoch_fence"))
     );
     let mut mismatched_frame = frame("request-20d", WorkerFrameBody::Execute(request(None)));
-    mismatched_frame.authority_epoch = AuthorityEpoch::new(2).expect("epoch");
+    mismatched_frame.authority_epoch = test_epoch(2);
     assert_eq!(
         mismatched_frame.validate_shape(),
         Err(WorkerError::InvalidFrame("epoch_fence"))
@@ -1579,7 +1590,7 @@ fn native_case_21_stale_resource_task_policy_integration_fences_preserve_provide
         .expect("admission lock")
         .revalidations;
     let baseline_fence = StateFence::new(
-        AuthorityEpoch::new(1).expect("epoch"),
+        test_epoch(1),
         ResourceGeneration::new(1).expect("generation"),
     );
     for (name, fence) in [

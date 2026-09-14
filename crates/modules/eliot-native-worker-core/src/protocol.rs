@@ -2,7 +2,7 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use eliot_agent_api::{AttemptId, AuthorizedEffect, BudgetEnvelope, ProposedEffect, WorkLeaseId};
 use eliot_contracts::{
-    AuthorityEpoch, DecisionId, SessionId, StateFence, TaskId, canonical_json_bytes, sha256_hex,
+    DecisionId, EpochId, SessionId, StateFence, TaskId, canonical_json_bytes, sha256_hex,
 };
 use eliot_process::{
     CancellationStatus, OperationId, ProcessLifecycle, ProcessStartReceipt, ResourceLimits,
@@ -92,7 +92,7 @@ pub struct WorkerHello {
     pub artifact_manifest_digest: String,
     pub launch_nonce: String,
     pub worker_generation: u64,
-    pub authority_epoch: AuthorityEpoch,
+    pub authority_epoch: EpochId,
     pub state_fence: StateFence,
     pub route_ref: String,
     pub requested_capabilities: BTreeSet<String>,
@@ -134,7 +134,7 @@ impl WorkerHello {
         self.state_fence
             .validate()
             .map_err(|_| WorkerError::InvalidHandshake("state_fence"))?;
-        if self.authority_epoch != self.state_fence.authority_epoch {
+        if !self.authority_epoch.is_same_authority(&self.state_fence.authority_epoch) {
             return Err(WorkerError::InvalidHandshake("epoch_fence"));
         }
         Ok(())
@@ -224,7 +224,7 @@ pub struct EventAckReceipt {
     pub event_id: String,
     pub sequence: u64,
     pub producer_generation: u64,
-    pub authority_epoch: AuthorityEpoch,
+    pub authority_epoch: EpochId,
     pub state_fence: StateFence,
     pub phase: AckPhase,
     pub acknowledged_at_unix_ms: u64,
@@ -240,7 +240,7 @@ pub struct WorkerFrame {
     pub request_id: String,
     pub trace_context: BTreeMap<String, String>,
     pub deadline_unix_ms: u64,
-    pub authority_epoch: AuthorityEpoch,
+    pub authority_epoch: EpochId,
     pub state_fence: StateFence,
     pub lease_id: WorkLeaseId,
     pub admission_revision: String,
@@ -280,7 +280,7 @@ impl WorkerFrame {
         self.state_fence
             .validate()
             .map_err(|_| WorkerError::InvalidFrame("state_fence"))?;
-        if self.authority_epoch != self.state_fence.authority_epoch {
+        if !self.authority_epoch.is_same_authority(&self.state_fence.authority_epoch) {
             return Err(WorkerError::InvalidFrame("epoch_fence"));
         }
         Ok(())
@@ -362,7 +362,7 @@ pub struct WorkerEventDraft {
     stream_id: String,
     producer_id: String,
     producer_generation: u64,
-    authority_epoch: AuthorityEpoch,
+    authority_epoch: EpochId,
     request_id: String,
     causal_predecessor_refs: Vec<String>,
     delivery_class: DeliveryClass,
@@ -380,7 +380,7 @@ impl WorkerEventDraft {
         stream_id: String,
         producer_id: String,
         producer_generation: u64,
-        authority_epoch: AuthorityEpoch,
+        authority_epoch: EpochId,
         request_id: String,
         causal_predecessor_refs: Vec<String>,
         delivery_class: DeliveryClass,
@@ -455,7 +455,7 @@ pub struct WorkerEventEnvelope {
     pub stream_id: String,
     pub producer_id: String,
     pub producer_generation: u64,
-    pub authority_epoch: AuthorityEpoch,
+    pub authority_epoch: EpochId,
     pub event_id: String,
     pub sequence: u64,
     pub request_id: String,
@@ -622,7 +622,7 @@ fn validate_claim_text(value: &str, field: &'static str) -> Result<(), WorkerErr
 ///
 /// Binds one installation, one worker artifact/config/protocol generation,
 /// one process/start identity, one principal/session, one connection, the
-/// current [`AuthorityEpoch`]/[`StateFence`], the registration lease
+/// current [`EpochId`]/[`StateFence`], the registration lease
 /// (identity, expiry, and renewal identity), the supported execution-unit
 /// schema version, the resource envelope, and the invalidation set. Kernel
 /// admits at most one current registration per worker generation; anything
@@ -657,7 +657,7 @@ pub struct NativeWorkerRegistration {
     /// Transport connection carrying this registration.
     pub connection_id: String,
     /// Current authority epoch; must equal `state_fence.authority_epoch`.
-    pub authority_epoch: AuthorityEpoch,
+    pub authority_epoch: EpochId,
     /// Exact immutable fence paired with the generation and epoch.
     pub state_fence: StateFence,
     /// Registration lease identity; expiry ends authority without renewal.
@@ -717,7 +717,7 @@ impl NativeWorkerRegistration {
         self.state_fence
             .validate()
             .map_err(|_| WorkerError::InvalidHandshake("state_fence"))?;
-        if self.authority_epoch != self.state_fence.authority_epoch {
+        if !self.authority_epoch.is_same_authority(&self.state_fence.authority_epoch) {
             return Err(WorkerError::InvalidHandshake("epoch_fence"));
         }
         if self.resource_limits.wall_timeout_ms() == 0
@@ -788,7 +788,7 @@ pub struct NativeWorkerClaim {
     /// Predecessor revision this claim continues from.
     pub predecessor_revision: String,
     /// Current authority epoch; must equal `state_fence.authority_epoch`.
-    pub authority_epoch: AuthorityEpoch,
+    pub authority_epoch: EpochId,
     /// Exact immutable fence paired with the generation and epoch.
     pub state_fence: StateFence,
     /// Canonical digest over every bound work field (see
@@ -879,7 +879,7 @@ impl NativeWorkerClaim {
         self.state_fence
             .validate()
             .map_err(|_| WorkerError::InvalidRequest("state_fence"))?;
-        if self.authority_epoch != self.state_fence.authority_epoch {
+        if !self.authority_epoch.is_same_authority(&self.state_fence.authority_epoch) {
             return Err(WorkerError::InvalidRequest("epoch_fence"));
         }
         if !is_lowercase_sha256(&self.binding_digest) {
@@ -950,7 +950,8 @@ impl NativeWorkerClaim {
             "predecessor_revision",
         );
         note(
-            self.authority_epoch == other.authority_epoch,
+            self.authority_epoch
+                .is_same_authority(&other.authority_epoch),
             "authority_epoch",
         );
         note(self.state_fence == other.state_fence, "state_fence");
@@ -1052,7 +1053,7 @@ pub struct NativeReadyReport {
     /// Generation accepting the unit; must be current.
     pub worker_generation: u64,
     /// Current authority epoch; must equal `state_fence.authority_epoch`.
-    pub authority_epoch: AuthorityEpoch,
+    pub authority_epoch: EpochId,
     /// Exact immutable fence paired with the generation and epoch.
     pub state_fence: StateFence,
     /// Echo of the admitted claim binding digest.
@@ -1113,7 +1114,7 @@ impl NativeReadyReport {
         if self.worker_generation == 0 || self.worker_generation != claim.worker_generation {
             return Err(WorkerError::InvalidRequest("generation_binding"));
         }
-        if self.authority_epoch != claim.authority_epoch {
+        if !self.authority_epoch.is_same_authority(&claim.authority_epoch) {
             return Err(WorkerError::StaleEpoch);
         }
         if self.state_fence != claim.state_fence {
@@ -1122,7 +1123,7 @@ impl NativeReadyReport {
         self.state_fence
             .validate()
             .map_err(|_| WorkerError::InvalidRequest("state_fence"))?;
-        if self.authority_epoch != self.state_fence.authority_epoch {
+        if !self.authority_epoch.is_same_authority(&self.state_fence.authority_epoch) {
             return Err(WorkerError::InvalidRequest("epoch_fence"));
         }
         if !is_lowercase_sha256(&self.claim_binding_digest)
@@ -1153,7 +1154,7 @@ pub struct NativeBlockedReport {
     /// Generation refusing the unit.
     pub worker_generation: u64,
     /// Authority epoch observed by the refusing generation.
-    pub authority_epoch: AuthorityEpoch,
+    pub authority_epoch: EpochId,
     /// Fence observed by the refusing generation.
     pub state_fence: StateFence,
     /// Echo of the admitted claim binding digest.
@@ -1182,7 +1183,7 @@ impl NativeBlockedReport {
         if self.worker_generation == 0 || self.worker_generation != claim.worker_generation {
             return Err(WorkerError::InvalidRequest("generation_binding"));
         }
-        if self.authority_epoch != claim.authority_epoch {
+        if !self.authority_epoch.is_same_authority(&claim.authority_epoch) {
             return Err(WorkerError::StaleEpoch);
         }
         if self.state_fence != claim.state_fence {
@@ -1191,7 +1192,7 @@ impl NativeBlockedReport {
         self.state_fence
             .validate()
             .map_err(|_| WorkerError::InvalidRequest("state_fence"))?;
-        if self.authority_epoch != self.state_fence.authority_epoch {
+        if !self.authority_epoch.is_same_authority(&self.state_fence.authority_epoch) {
             return Err(WorkerError::InvalidRequest("epoch_fence"));
         }
         if !is_lowercase_sha256(&self.claim_binding_digest)
@@ -1251,7 +1252,7 @@ pub struct NativeLifecycleBinding {
     /// Predecessor revision this binding continues from.
     pub predecessor_revision: String,
     /// Current authority epoch; must equal `state_fence.authority_epoch`.
-    pub authority_epoch: AuthorityEpoch,
+    pub authority_epoch: EpochId,
     /// Exact immutable fence paired with the generation and epoch.
     pub state_fence: StateFence,
 }
@@ -1272,7 +1273,7 @@ impl NativeLifecycleBinding {
         self.state_fence
             .validate()
             .map_err(|_| WorkerError::InvalidRequest("state_fence"))?;
-        if self.authority_epoch != self.state_fence.authority_epoch {
+        if !self.authority_epoch.is_same_authority(&self.state_fence.authority_epoch) {
             return Err(WorkerError::InvalidRequest("epoch_fence"));
         }
         Ok(())
@@ -1430,7 +1431,7 @@ pub struct NativeAckRecord {
     /// Worker generation acknowledging; nonzero.
     pub worker_generation: u64,
     /// Current authority epoch; must equal `state_fence.authority_epoch`.
-    pub authority_epoch: AuthorityEpoch,
+    pub authority_epoch: EpochId,
     /// Exact immutable fence paired with the generation and epoch.
     pub state_fence: StateFence,
     /// Lowercase SHA-256 of the exact acknowledged receipt bytes.
@@ -1453,7 +1454,7 @@ impl NativeAckRecord {
         self.state_fence
             .validate()
             .map_err(|_| WorkerError::InvalidRequest("state_fence"))?;
-        if self.authority_epoch != self.state_fence.authority_epoch {
+        if !self.authority_epoch.is_same_authority(&self.state_fence.authority_epoch) {
             return Err(WorkerError::InvalidRequest("epoch_fence"));
         }
         if !is_lowercase_sha256(&self.acknowledged_digest) {

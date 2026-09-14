@@ -9,8 +9,8 @@ use std::collections::BTreeSet;
 
 pub use eliot_agent_contracts::AgentAttemptId;
 pub use eliot_contracts::{
-    ArtifactId, AuthorityEpoch, ClockReading, DecisionId, LowercaseSha256, PolicyRevision,
-    RequestId, ResourceGeneration, SessionId, StateFence, TaskId, WorkLeaseId,
+    ArtifactId, ClockReading, DecisionId, EpochId, LowercaseSha256, PolicyRevision, RequestId,
+    ResourceGeneration, SessionId, StateFence, TaskId, WorkLeaseId,
 };
 pub use eliot_receipts::ProofCeiling;
 use schemars::JsonSchema;
@@ -416,7 +416,7 @@ impl EffectCeiling {
 #[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct AuthorityEnvelope {
-    pub epoch: AuthorityEpoch,
+    pub epoch: EpochId,
     pub scope_ref: String,
     pub effect_ceiling: EffectCeiling,
     pub lease: WorkLeaseId,
@@ -440,7 +440,10 @@ impl AuthorityEnvelope {
         self.state_fence
             .validate()
             .map_err(|_| ContractError::InvalidStateFence)?;
-        if self.epoch != self.state_fence.authority_epoch {
+        if !self
+            .epoch
+            .is_same_authority(&self.state_fence.authority_epoch)
+        {
             return Err(ContractError::InvalidStateFence);
         }
         self.effect_ceiling.validate()
@@ -893,7 +896,7 @@ impl ProposedEffect {
 #[serde(deny_unknown_fields)]
 pub struct AuthorizedEffect {
     pub proposal: ProposedEffect,
-    pub authority_epoch: AuthorityEpoch,
+    pub authority_epoch: EpochId,
     pub authorization_ref: String,
     pub authorized_at: String,
     pub expires_at: String,
@@ -905,7 +908,7 @@ impl AuthorizedEffect {
         if self.authorization_ref.trim().is_empty()
             || self.authorized_at.trim().is_empty()
             || self.expires_at.trim().is_empty()
-            || self.authority_epoch != authority.epoch
+            || !self.authority_epoch.is_same_authority(&authority.epoch)
         {
             return Err(ContractError::InsufficientAuthority);
         }
@@ -1043,8 +1046,21 @@ pub fn contract_schema() -> schemars::Schema {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use eliot_contracts::{EpochLineageId};
+    use std::num::NonZeroU64;
 
     type TestResult = Result<(), Box<dyn std::error::Error>>;
+
+    const TEST_LINEAGE_A: &str = "550e8400-e29b-41d4-a716-446655440000";
+    const TEST_LINEAGE_B: &str = "550e8400-e29b-41d4-a716-446655440001";
+
+    fn test_epoch(lineage: &str, sequence: u64) -> EpochId {
+        EpochId::new(
+            EpochLineageId::new(lineage).expect("valid test lineage"),
+            NonZeroU64::new(sequence).expect("nonzero test sequence"),
+        )
+        .expect("valid test epoch")
+    }
 
     /// Decodes one canonical digest fixture. Fixture digests are valid-form
     /// lowercase hex; production placeholders such as `sha256:runtime` fail
@@ -1315,7 +1331,7 @@ mod tests {
         let route = route()?;
         let attempt = AttemptId::new("attempt-1")?;
         let lease_id = lease("lease-1")?;
-        let fence = StateFence::new(AuthorityEpoch::new(1)?, ResourceGeneration::new(1)?);
+        let fence = StateFence::new(test_epoch(TEST_LINEAGE_A, 1), ResourceGeneration::new(1)?);
         let admission = admitted_fixture(&attempt, &lease_id, &route, &fence)?;
         let binding = observation_binding(&attempt, &lease_id, &route, &fence)?;
         let result = AgentResult {
@@ -1373,13 +1389,13 @@ mod tests {
             route: route()?,
             budget: budget(),
             authority: AuthorityEnvelope {
-                epoch: AuthorityEpoch::new(1)?,
+                epoch: test_epoch(TEST_LINEAGE_A, 1),
                 scope_ref: "scope:test".into(),
                 effect_ceiling: ceiling(),
                 lease: serde_json::from_value::<WorkLeaseId>(
                     serde_json::json!({"namespace": "eliot.governor.work-lease", "revision": "v1", "value": "lease-1"}),
                 )?,
-                state_fence: StateFence::new(AuthorityEpoch::new(1)?, ResourceGeneration::new(1)?),
+                state_fence: StateFence::new(test_epoch(TEST_LINEAGE_A, 1), ResourceGeneration::new(1)?),
                 valid_until: "2026-08-14T00:00:00Z".into(),
             },
             cancellation: CancellationState::NotRequested,
@@ -1409,30 +1425,30 @@ mod tests {
         assert!(serde_json::from_value::<AuthorityEnvelope>(legacy).is_err());
 
         let mut authority = AuthorityEnvelope {
-            epoch: AuthorityEpoch::new(1)?,
+            epoch: test_epoch(TEST_LINEAGE_A, 1),
             scope_ref: "scope:test".into(),
             effect_ceiling: ceiling(),
             lease: serde_json::from_value::<WorkLeaseId>(
                 serde_json::json!({"namespace": "eliot.governor.work-lease", "revision": "v1", "value": "lease-1"}),
             )?,
-            state_fence: StateFence::new(AuthorityEpoch::new(1)?, ResourceGeneration::new(1)?),
+            state_fence: StateFence::new(test_epoch(TEST_LINEAGE_A, 1), ResourceGeneration::new(1)?),
             valid_until: "later".into(),
         };
         assert!(authority.validate().is_ok());
-        authority.epoch = AuthorityEpoch::new(2)?;
+        authority.epoch = test_epoch(TEST_LINEAGE_A, 2);
         assert_eq!(authority.validate(), Err(ContractError::InvalidStateFence));
         Ok(())
     }
 
     fn authority() -> Result<AuthorityEnvelope, Box<dyn std::error::Error>> {
         Ok(AuthorityEnvelope {
-            epoch: AuthorityEpoch::new(7)?,
+            epoch: test_epoch(TEST_LINEAGE_A, 7),
             scope_ref: "scope:test".into(),
             effect_ceiling: ceiling(),
             lease: serde_json::from_value::<WorkLeaseId>(
                 serde_json::json!({"namespace": "eliot.governor.work-lease", "revision": "v1", "value": "lease-1"}),
             )?,
-            state_fence: StateFence::new(AuthorityEpoch::new(7)?, ResourceGeneration::new(3)?),
+            state_fence: StateFence::new(test_epoch(TEST_LINEAGE_A, 7), ResourceGeneration::new(3)?),
             valid_until: "later".into(),
         })
     }
@@ -1487,9 +1503,15 @@ mod tests {
     fn api_case_04_authority_numeric_epoch_and_object_fence_roundtrip() -> TestResult {
         let original = authority()?;
         let wire = serde_json::to_value(&original)?;
-        assert!(wire["epoch"].is_number());
+        assert!(wire["epoch"].is_object());
+        assert_eq!(wire["epoch"]["lineage_id"], TEST_LINEAGE_A);
+        assert_eq!(wire["epoch"]["sequence"], 7);
         assert!(wire["state_fence"].is_object());
-        assert_eq!(serde_json::from_value::<AuthorityEnvelope>(wire)?, original);
+        assert_eq!(serde_json::from_value::<AuthorityEnvelope>(wire.clone())?, original);
+        // Legacy numeric epoch never deserializes (EpochId-only, Implements #64).
+        let mut numeric = wire;
+        numeric["epoch"] = serde_json::json!(7);
+        assert!(serde_json::from_value::<AuthorityEnvelope>(numeric).is_err());
         Ok(())
     }
 
@@ -1507,16 +1529,19 @@ mod tests {
     #[test]
     fn api_case_06_epoch_and_fence_mismatch_fails_closed() -> TestResult {
         let mut value = authority()?;
-        value.epoch = AuthorityEpoch::new(8)?;
+        value.epoch = test_epoch(TEST_LINEAGE_A, 8);
         assert_eq!(value.validate(), Err(ContractError::InvalidStateFence));
         Ok(())
     }
 
     #[test]
-    fn api_case_07_zero_epoch_generation_and_fence_are_rejected() {
-        assert!(AuthorityEpoch::new(0).is_err());
+    fn api_case_07_zero_epoch_generation_and_fence_are_rejected() -> TestResult {
+        assert!(NonZeroU64::new(0).is_none());
         assert!(ResourceGeneration::new(0).is_err());
-        let zero_fence = StateFence::new(AuthorityEpoch::default(), ResourceGeneration::default());
+        let zero_fence = StateFence::new(
+            test_epoch(TEST_LINEAGE_A, 1),
+            ResourceGeneration::default(),
+        );
         assert!(zero_fence.validate().is_err());
         let zero = serde_json::json!({
             "authority_epoch": 0,
@@ -1526,11 +1551,28 @@ mod tests {
             "integration_revision": null
         });
         assert!(serde_json::from_value::<StateFence>(zero).is_err());
+        // Cross-lineage same sequence never authorizes (EpochId-only, Implements #64).
+        let foreign = StateFence::new(
+            test_epoch(TEST_LINEAGE_B, 1),
+            ResourceGeneration::new(1)?,
+        );
+        let local = StateFence::new(
+            test_epoch(TEST_LINEAGE_A, 1),
+            ResourceGeneration::new(1)?,
+        );
+        assert!(!local.is_compatible_with(&foreign));
+        assert!(!local
+            .authority_epoch
+            .is_same_authority(&foreign.authority_epoch));
+        Ok(())
     }
 
     #[test]
     fn api_case_08_cancel_and_admitted_receipts_reject_legacy_and_zero_fences() -> TestResult {
-        let zero_fence = StateFence::new(AuthorityEpoch::default(), ResourceGeneration::default());
+        let zero_fence = StateFence::new(
+            test_epoch(TEST_LINEAGE_A, 1),
+            ResourceGeneration::default(),
+        );
         let typed_cancel = CancelRequest {
             attempt_id: AttemptId::new("attempt-case-08")?,
             reason: CancelReason::UserRequested,
@@ -1578,7 +1620,7 @@ mod tests {
         });
         assert!(serde_json::from_value::<CancelRequest>(cancel).is_err());
 
-        let fence = StateFence::new(AuthorityEpoch::new(1)?, ResourceGeneration::new(1)?);
+        let fence = StateFence::new(test_epoch(TEST_LINEAGE_A, 1), ResourceGeneration::new(1)?);
         let admitted = admitted_fixture(&attempt, &lease_id, &route, &fence)?;
         let mut admitted_wire = serde_json::to_value(&admitted)?;
         admitted_wire["state_fence"] = serde_json::json!("legacy-fence");
@@ -1629,7 +1671,7 @@ mod tests {
         let second = serde_json::to_value(schemars::schema_for!(AuthorityEnvelope))?;
         assert_eq!(first, second);
         assert_eq!(first["type"], "object");
-        assert_eq!(first["$defs"]["AuthorityEpoch"]["type"], "integer");
+        assert_eq!(first["$defs"]["EpochId"]["type"], "object");
         assert_eq!(first["$defs"]["StateFence"]["type"], "object");
         assert_ne!(first["$defs"]["StateFence"]["type"], "string");
         Ok(())
@@ -1665,7 +1707,8 @@ mod tests {
         );
         // Source must import canonical owners and retain no local duplicate wrappers.
         let source = include_str!("lib.rs");
-        assert!(source.contains("ArtifactId, AuthorityEpoch"));
+        assert!(source.contains("ArtifactId, ClockReading"));
+        assert!(source.contains("EpochId"));
         assert!(source.contains("SessionId, StateFence, TaskId"));
         let dup_task = ["id_type!", "(", "TaskId", ")"].concat();
         let dup_artifact = ["id_type!", "(", "ArtifactId", ")"].concat();
@@ -1805,7 +1848,7 @@ mod tests {
         );
         // AuthorityEnvelope using the canonical object lease must still validate with typed StateFence.
         let envelope = AuthorityEnvelope {
-            epoch: AuthorityEpoch::new(1)?,
+            epoch: test_epoch(TEST_LINEAGE_A, 1),
             scope_ref: "scope:test".into(),
             effect_ceiling: ceiling(),
             lease: serde_json::from_value::<WorkLeaseId>(serde_json::json!({
@@ -1813,7 +1856,7 @@ mod tests {
                 "revision": "v1",
                 "value": "lease-case-12"
             }))?,
-            state_fence: StateFence::new(AuthorityEpoch::new(1)?, ResourceGeneration::new(1)?),
+            state_fence: StateFence::new(test_epoch(TEST_LINEAGE_A, 1), ResourceGeneration::new(1)?),
             valid_until: "later".into(),
         };
         assert!(envelope.validate().is_ok());
@@ -1865,7 +1908,7 @@ mod tests {
         let route = route()?;
         let attempt = AttemptId::new("attempt-case-10")?;
         let lease_id = lease("lease-case-10")?;
-        let fence = StateFence::new(AuthorityEpoch::new(1)?, ResourceGeneration::new(1)?);
+        let fence = StateFence::new(test_epoch(TEST_LINEAGE_A, 1), ResourceGeneration::new(1)?);
         let admission = admitted_fixture(&attempt, &lease_id, &route, &fence)?;
         let binding = observation_binding(&attempt, &lease_id, &route, &fence)?;
         let api = AgentResult {
@@ -1909,7 +1952,7 @@ mod tests {
         let route = route()?;
         let attempt = AttemptId::new("attempt-case-11")?;
         let lease_id = lease("lease-case-11")?;
-        let fence = StateFence::new(AuthorityEpoch::new(1)?, ResourceGeneration::new(1)?);
+        let fence = StateFence::new(test_epoch(TEST_LINEAGE_A, 1), ResourceGeneration::new(1)?);
         let admission = admitted_fixture(&attempt, &lease_id, &route, &fence)?;
         let binding = observation_binding(&attempt, &lease_id, &route, &fence)?;
         let mut result = AgentResult {
@@ -2027,7 +2070,7 @@ mod tests {
         let route = route()?;
         let attempt = AttemptId::new("attempt-s5-16")?;
         let lease_id = lease("lease-s5-16")?;
-        let fence = StateFence::new(AuthorityEpoch::new(1)?, ResourceGeneration::new(1)?);
+        let fence = StateFence::new(test_epoch(TEST_LINEAGE_A, 1), ResourceGeneration::new(1)?);
         let admission = admitted_fixture(&attempt, &lease_id, &route, &fence)?;
         let binding = observation_binding(&attempt, &lease_id, &route, &fence)?;
         let observation =
@@ -2064,7 +2107,7 @@ mod tests {
         let route = route()?;
         let attempt = AttemptId::new("attempt-s5-17")?;
         let lease_id = lease("lease-s5-17")?;
-        let fence = StateFence::new(AuthorityEpoch::new(1)?, ResourceGeneration::new(1)?);
+        let fence = StateFence::new(test_epoch(TEST_LINEAGE_A, 1), ResourceGeneration::new(1)?);
         let admission = admitted_fixture(&attempt, &lease_id, &route, &fence)?;
         let binding = observation_binding(&attempt, &lease_id, &route, &fence)?;
         let observation =
@@ -2110,7 +2153,7 @@ mod tests {
         let route = route()?;
         let attempt = AttemptId::new("attempt-s5-18")?;
         let lease_id = lease("lease-s5-18")?;
-        let fence = StateFence::new(AuthorityEpoch::new(1)?, ResourceGeneration::new(1)?);
+        let fence = StateFence::new(test_epoch(TEST_LINEAGE_A, 1), ResourceGeneration::new(1)?);
         let admission = admitted_fixture(&attempt, &lease_id, &route, &fence)?;
         let binding = observation_binding(&attempt, &lease_id, &route, &fence)?;
         let observation =

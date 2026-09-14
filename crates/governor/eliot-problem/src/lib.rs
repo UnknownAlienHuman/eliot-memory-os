@@ -1247,10 +1247,24 @@ pub fn contract_identity() -> Result<eliot_contracts::ContractIdentity, ProblemE
 #[cfg(test)]
 mod tests {
     use super::*;
-    use eliot_contracts::{AuthorityEpoch, ResourceGeneration};
+    use eliot_contracts::{EpochId, EpochLineageId, ResourceGeneration};
+    use std::num::NonZeroU64;
+
+    const TEST_LINEAGE_A: &str = "550e8400-e29b-41d4-a716-446655440000";
+
+    fn test_epoch(lineage: &str, sequence: u64) -> EpochId {
+        EpochId::new(
+            EpochLineageId::new(lineage).expect("valid test lineage"),
+            NonZeroU64::new(sequence).expect("nonzero test sequence"),
+        )
+        .expect("valid test epoch")
+    }
 
     fn state_fence() -> StateFence {
-        StateFence::new(AuthorityEpoch::genesis(), ResourceGeneration::genesis())
+        StateFence::new(
+            test_epoch(TEST_LINEAGE_A, 1),
+            ResourceGeneration::genesis(),
+        )
     }
 
     fn owner() -> OwnerRef {
@@ -1318,10 +1332,7 @@ mod tests {
     fn owner_reassignment_fences_old_owner() -> Result<(), ProblemError> {
         let old_fence = state_fence();
         let new_fence = StateFence::new(
-            AuthorityEpoch::new(2).map_err(|_| ProblemError::InvalidField {
-                field: "authority_epoch",
-                reason: "invalid epoch",
-            })?,
+            test_epoch(TEST_LINEAGE_A, 2),
             ResourceGeneration::genesis(),
         );
         let mut value = problem()?;

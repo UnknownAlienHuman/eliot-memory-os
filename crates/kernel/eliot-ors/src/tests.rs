@@ -5,7 +5,9 @@ use std::sync::OnceLock;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::thread;
 
-use eliot_contracts::{AuthorityEpoch, ResourceGeneration, StateFence, sha256_hex};
+use eliot_contracts::{
+    AuthorityEpoch, EpochId, EpochLineageId, ResourceGeneration, StateFence, sha256_hex,
+};
 use eliot_platform::SecretReference;
 use eliot_receipts::{ReceiptCore, ReceiptEnvelope};
 use eliot_runtime_contracts::{
@@ -23,6 +25,23 @@ use serde_json::{Value, json};
 use crate::*;
 
 type TestResult<T = ()> = Result<T, Box<dyn std::error::Error>>;
+
+// Canonical lineage fixtures (Implements #64): every contour lineage that can
+// reach an `EpochId` wire shape (receipt authority, fence canonical JSON) must
+// name a canonical UUID lineage, because `EpochLineageId` validation rejects
+// display-name labels at deserialization. Contours that never cross that
+// boundary keep their display names.
+const TEST_LINEAGE_A: &str = "550e8400-e29b-41d4-a716-446655440000";
+const TEST_LINEAGE_B: &str = "550e8400-e29b-41d4-a716-446655440001";
+const TEST_LINEAGE_C: &str = "550e8400-e29b-41d4-a716-446655440002";
+
+fn test_epoch(sequence: u64) -> EpochId {
+    EpochId::new(
+        EpochLineageId::new(TEST_LINEAGE_A).expect("lineage"),
+        std::num::NonZeroU64::new(sequence).expect("sequence"),
+    )
+    .expect("epoch")
+}
 
 static NEXT_DATABASE: AtomicU64 = AtomicU64::new(1);
 
@@ -262,16 +281,23 @@ fn successor(prior: &EpochIdentity, lineage: &str, value: u64) -> Result<EpochLi
     })
 }
 
-fn fence(epoch: u64) -> Result<StateFenceSnapshot, OrsError> {
+fn fence(authority_epoch: &EpochLineage) -> Result<StateFenceSnapshot, OrsError> {
+    // Exact-tuple fence contour (Implements #64): the snapshot's canonical JSON
+    // carries the canonical `EpochId` object shape so it deserializes into the
+    // migrated fence contracts; the retained `u64` contour observes the same
+    // sequence and never authorizes on its own.
     StateFenceSnapshot::capture(
         &json!({
-            "authority_epoch": epoch,
+            "authority_epoch": {
+                "lineage_id": authority_epoch.current.lineage_id.as_str(),
+                "sequence": authority_epoch.current.epoch
+            },
             "integration_revision": null,
             "policy_revision": null,
             "resource_generation": 1,
             "task_revision": null
         }),
-        epoch,
+        authority_epoch.current.epoch,
     )
 }
 
@@ -288,13 +314,13 @@ fn operational_input(
     authority_epoch: EpochLineage,
     payload: &str,
 ) -> Result<OperationalRecordInput, OrsError> {
-    let epoch_value = authority_epoch.current.epoch;
+    let state_fence = fence(&authority_epoch)?;
     OperationalRecordInput::encrypted(
         OperationalRecordContext {
             record_id: label(record_id)?,
             subject_id: label(subject_id)?,
             authority_epoch,
-            state_fence: fence(epoch_value)?,
+            state_fence,
             created_at_ms: 100,
             cleanup_after_ms: Some(10_000),
         },
@@ -310,13 +336,13 @@ fn request(
     writer_epoch: EpochLineage,
     scopes: &[&str],
 ) -> TestResult<ReservationRequest> {
-    let epoch_value = writer_epoch.current.epoch;
+    let state_fence = fence(&writer_epoch)?;
     let envelope = RecoveryPayloadEnvelope::encrypted(
         RecoveryEnvelopeContext {
             operation_or_checkpoint_id: label(operation_id)?,
             privacy_and_visibility_class: access()?,
             authority_epoch: writer_epoch.clone(),
-            state_fence: fence(epoch_value)?,
+            state_fence,
             created_at_ms: 10,
             known_at_ms: 11,
             expires_at_ms: Some(10_000),
@@ -396,7 +422,10 @@ fn receipt(token: &WriterReservationToken, disposition: &Value) -> TestResult<Re
         "authority": {
             "authority_id": "authority-1",
             "authority_owner": "governor",
-            "authority_epoch": token.writer_epoch.current.epoch,
+            "authority_epoch": {
+                "lineage_id": token.writer_epoch.current.lineage_id.as_str(),
+                "sequence": token.writer_epoch.current.epoch
+            },
             "state_fence": state_fence,
             "allowed_effect": "REVERSIBLE_MUTATION",
             "proof_ceiling": "SCOPED_VERIFICATION"
@@ -466,7 +495,7 @@ fn envelope_validation_rejects_tamper_version_and_bad_fence() -> TestResult {
     let original = request(
         "reservation-a",
         "operation-a",
-        epoch("lineage-a", 7)?,
+        epoch(TEST_LINEAGE_A, 7)?,
         &["a"],
     )?;
     original.envelope.validate()?;
@@ -504,7 +533,7 @@ fn process_start_replay_has_one_atomic_winner_and_rejects_substitution() -> Test
     let owner = eliot_process::ProcessOwnerBinding::new(
         "testd",
         "a".repeat(64),
-        1,
+        test_epoch(1),
         eliot_process::Generation::new(1)?,
     )?;
     let record = ProcessStartReplayRecord {
@@ -648,7 +677,7 @@ fn supervision_binding(
             process_id: "kernel-process-1".to_owned(),
             process_generation: ResourceGeneration::new(1)?,
         },
-        state_fence: StateFence::new(AuthorityEpoch::new(2)?, ResourceGeneration::new(1)?),
+        state_fence: StateFence::new(test_epoch(2), ResourceGeneration::new(1)?),
         issued_at_ms,
         expires_at_ms: issued_at_ms + 900,
         renew_before_ms: issued_at_ms + 450,
@@ -797,7 +826,7 @@ fn supervision_verification_inputs(
         host_epoch: payload.host_epoch,
         activation_id: payload.activation_id.clone(),
         activation_generation: payload.activation_generation,
-        kernel_epoch: payload.kernel_epoch,
+        kernel_epoch: payload.kernel_epoch.clone(),
         watchdog_epoch: payload.watchdog_epoch,
         state_fence: payload.state_fence.clone(),
         scope_ref: payload.scope_ref.clone(),
@@ -1087,7 +1116,7 @@ fn supervision_lease_renew_is_monotonic_and_history_is_bounded() -> TestResult {
     let mut mismatched_binding = supervision_binding(LeaseState::Active, 250)?;
     mismatched_binding.kernel_epoch = AuthorityEpoch::new(3)?;
     mismatched_binding.state_fence =
-        StateFence::new(AuthorityEpoch::new(3)?, ResourceGeneration::new(1)?);
+        StateFence::new(test_epoch(3), ResourceGeneration::new(1)?);
     assert!(matches!(
         store.prepare_supervision_lease(supervision_request(
             "ticket-fence-mismatch",
@@ -1560,11 +1589,21 @@ fn process_evidence(
                 "generation": 1,
                 "action_lease_ref": "lease-1",
                 "authority_id": "authority-1",
-                "authority_epoch": 1,
+                "authority_epoch": {
+                    "lineage_id": "550e8400-e29b-41d4-a716-446655440000",
+                    "sequence": 1
+                },
                 "state_fence": {
-                    "authority_epoch": 1,
+                    "authority_epoch": {
+                        "lineage_id": "550e8400-e29b-41d4-a716-446655440000",
+                        "sequence": 1
+                    },
                     "generation": 1,
-                    "nonce": "fence-1"
+                    "nonce": "fence-1",
+                    "canonical_epoch": {
+                        "lineage_id": "550e8400-e29b-41d4-a716-446655440000",
+                        "sequence": 1
+                    }
                 },
                 "request_digest": "11".repeat(32),
                 "permit_digest": "22".repeat(32),
@@ -1600,10 +1639,13 @@ fn process_evidence_record(
     lifecycle: &str,
     observed_at_ms: i64,
 ) -> TestResult<ProcessEvidenceRecord> {
+    // `new_with_canonical` was sealed away with the v4 `EpochId`-only cutover:
+    // the owner binding carries the canonical tuple directly, so the fixture
+    // passes `test_epoch(1)` as the authority epoch itself.
     let owner = eliot_process::ProcessOwnerBinding::new(
         "testd",
         "aa".repeat(32),
-        1,
+        test_epoch(1),
         eliot_process::Generation::new(1)?,
     )?;
     Ok(ProcessEvidenceRecord::from_evidence(
@@ -1627,9 +1669,15 @@ fn process_start_receipt(
             "generation": 1,
             "action_lease_ref": "lease-1",
             "authority_id": "authority-1",
-            "authority_epoch": 1,
+            "authority_epoch": {
+                "lineage_id": "550e8400-e29b-41d4-a716-446655440000",
+                "sequence": 1
+            },
             "state_fence": {
-                "authority_epoch": 1,
+                "authority_epoch": {
+                    "lineage_id": "550e8400-e29b-41d4-a716-446655440000",
+                    "sequence": 1
+                },
                 "generation": 1,
                 "nonce": "fence-1"
             },
@@ -1682,7 +1730,7 @@ fn process_evidence_appends_history_idempotently_and_recovers_in_order() -> Test
     conflicting.owner = eliot_process::ProcessOwnerBinding::new(
         "native",
         conflicting.owner.principal_digest(),
-        conflicting.owner.authority_epoch(),
+        conflicting.owner.authority_epoch().clone(),
         conflicting.owner.generation(),
     )?;
     assert_eq!(conflicting.record_key()?, first.record_key()?);
@@ -1987,7 +2035,7 @@ fn multi_scope_reservation_is_atomic_ordered_and_conflict_on_duplicate() -> Test
     let path = database_path("atomic");
     cleanup(&path);
     let coordinator = coordinator(&path)?;
-    let writer_epoch = epoch("lineage-a", 7)?;
+    let writer_epoch = epoch(TEST_LINEAGE_A, 7)?;
     let original = request(
         "reservation-a",
         "operation-a",
@@ -2021,7 +2069,7 @@ fn multi_scope_reservation_is_atomic_ordered_and_conflict_on_duplicate() -> Test
     coordinator.release(&token, &writer_epoch.current)?;
     coordinator.eligible(&second)?;
 
-    let wrong_epoch = epoch("other-lineage", 1)?;
+    let wrong_epoch = epoch(TEST_LINEAGE_B, 1)?;
     let failed = request(
         "reservation-failed",
         "operation-failed",
@@ -2049,7 +2097,7 @@ fn multi_scope_reservation_is_atomic_ordered_and_conflict_on_duplicate() -> Test
 fn crash_restart_enters_reconciliation_and_receipt_unblocks_scope() -> TestResult {
     let path = database_path("restart");
     cleanup(&path);
-    let writer_epoch = epoch("lineage-a", 7)?;
+    let writer_epoch = epoch(TEST_LINEAGE_A, 7)?;
     let token = {
         let coordinator = coordinator(&path)?;
         let token = coordinator.reserve(request(
@@ -2109,7 +2157,7 @@ fn unknown_outcome_has_no_blind_replay_or_cleanup_expiry() -> TestResult {
     let path = database_path("unknown");
     cleanup(&path);
     let coordinator = coordinator(&path)?;
-    let writer_epoch = epoch("lineage-a", 7)?;
+    let writer_epoch = epoch(TEST_LINEAGE_A, 7)?;
     let token = coordinator.reserve(request(
         "reservation-a",
         "operation-a",
@@ -2164,7 +2212,7 @@ fn lineage_fences_old_owner_and_requires_recovery() -> TestResult {
     let path = database_path("lineage");
     cleanup(&path);
     let coordinator = coordinator(&path)?;
-    let old = epoch("lineage-a", 7)?;
+    let old = epoch(TEST_LINEAGE_A, 7)?;
     let token = coordinator.reserve(request(
         "reservation-a",
         "operation-a",
@@ -2214,7 +2262,7 @@ fn recovery_cursor_is_bounded_and_expiry_requires_owner() -> TestResult {
     let path = database_path("cursor");
     cleanup(&path);
     let coordinator = coordinator(&path)?;
-    let writer_epoch = epoch("lineage-a", 7)?;
+    let writer_epoch = epoch(TEST_LINEAGE_A, 7)?;
     let first = coordinator.reserve(request(
         "reservation-1",
         "operation-1",
@@ -2281,7 +2329,7 @@ fn canonical_head_readback_blocks_jump_and_preserves_predecessor_fairness() -> T
     let path = database_path("head-binding");
     cleanup(&path);
     let coordinator = coordinator_with_evidence(&path, Arc::new(GenesisHeadEvidence))?;
-    let writer_epoch = epoch("lineage-a", 7)?;
+    let writer_epoch = epoch(TEST_LINEAGE_A, 7)?;
     let mut fabricated = request(
         "reservation-fabricated",
         "operation-fabricated",
@@ -2389,7 +2437,7 @@ fn reservation_order_and_scope_sequences_hold_over_generated_matrix() -> TestRes
 fn caller_issued_receipt_cannot_finalize_without_injected_readback() -> TestResult {
     let path = database_path("readback-auth");
     cleanup(&path);
-    let writer_epoch = epoch("lineage-a", 7)?;
+    let writer_epoch = epoch(TEST_LINEAGE_A, 7)?;
     let token;
     let exact;
     {
@@ -2437,7 +2485,7 @@ fn persisted_invalid_label_and_envelope_digest_fail_closed() -> TestResult {
         coordinator.reserve(request(
             "reservation-a",
             "operation-a",
-            epoch("lineage-a", 7)?,
+            epoch(TEST_LINEAGE_A, 7)?,
             &["scope-a"],
         )?)?;
         stored = coordinator
@@ -2478,7 +2526,7 @@ fn persisted_invalid_label_and_envelope_digest_fail_closed() -> TestResult {
         let token = coordinator.reserve(request(
             "reservation-b",
             "operation-b",
-            epoch("lineage-a", 7)?,
+            epoch(TEST_LINEAGE_A, 7)?,
             &["scope-b"],
         )?)?;
         operation_id = token.operation_id;
@@ -2523,7 +2571,7 @@ fn appendix_p4_operational_surface_projects_rollover_and_retains_snapshot() -> T
     cleanup(&path);
     let coordinator = coordinator(&path)?;
     let store = coordinator.store();
-    let old = epoch("kernel-lineage-a", 7)?;
+    let old = epoch(TEST_LINEAGE_C, 7)?;
     let token = coordinator.reserve(request(
         "reservation-p4",
         "operation-p4",

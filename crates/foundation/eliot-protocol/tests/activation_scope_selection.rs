@@ -1,4 +1,4 @@
-use eliot_contracts::{AuthorityEpoch, RequestId, ResourceGeneration, StateFence};
+use eliot_contracts::{EpochId, EpochLineageId, RequestId, ResourceGeneration, StateFence};
 use eliot_protocol::{
     AGENT_ACTIVATION_RESOLUTION_TICKET_WIRE_ID, AGENT_ACTIVATION_RESOLUTION_TICKET_WIRE_VERSION,
     AgentActivationCandidateCoverage, AgentActivationResolutionDisposition,
@@ -7,6 +7,14 @@ use eliot_protocol::{
 };
 
 const RESOLVED_AT_UNIX_MS: u64 = 9_000;
+
+fn test_epoch(sequence: u64) -> EpochId {
+    EpochId::new(
+        EpochLineageId::new("550e8400-e29b-41d4-a716-446655440000").expect("lineage"),
+        std::num::NonZeroU64::new(sequence).expect("sequence"),
+    )
+    .expect("epoch")
+}
 
 fn ticket() -> Result<AgentActivationResolutionTicket, ProtocolError> {
     AgentActivationResolutionTicket {
@@ -17,7 +25,7 @@ fn ticket() -> Result<AgentActivationResolutionTicket, ProtocolError> {
         activation_request_sha256: "a".repeat(64),
         peer_admission_receipt_sha256: "b".repeat(64),
         connection_id: "activation-scope-connection-v2-1".to_owned(),
-        state_fence: StateFence::new(AuthorityEpoch::new(7)?, ResourceGeneration::new(11)?),
+        state_fence: StateFence::new(test_epoch(7), ResourceGeneration::new(11)?),
         kernel_deadline_unix_ms: 10_000,
         ticket_sha256: String::new(),
     }

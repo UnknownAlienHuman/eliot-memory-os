@@ -1,9 +1,8 @@
 use eliot_agent_api::{
-    AdmittedRouteReceipt, AgentLaunchRequest, AgentResult, AttemptId, AuthorityEpoch,
-    BudgetEnvelope, CancelReason, EventId, HostEventNormalizationReceipt, LaunchRequestId,
-    NormalizedHostEventEnvelope, PhysicalRouteObservationReceipt, ProviderExecutionBinding,
-    ResultDisposition, RouteFingerprint, RouteSelectionCandidate, StateFence, TaskId, WorkLeaseId,
-    WorkUnitId,
+    AdmittedRouteReceipt, AgentLaunchRequest, AgentResult, AttemptId, BudgetEnvelope, CancelReason,
+    EpochId, EventId, HostEventNormalizationReceipt, LaunchRequestId, NormalizedHostEventEnvelope,
+    PhysicalRouteObservationReceipt, ProviderExecutionBinding, ResultDisposition, RouteFingerprint,
+    RouteSelectionCandidate, StateFence, TaskId, WorkLeaseId, WorkUnitId,
 };
 use eliot_agent_contracts::{
     DescendantClosureReceipt, LivePeerMessage, LivePeerMessageState, MessageId,
@@ -294,7 +293,7 @@ pub struct ProviderAdmissionReceipt {
     pub task_revision: String,
     pub plan_revision: RevisionId,
     pub state_fence: StateFence,
-    pub controller_epoch: AuthorityEpoch,
+    pub controller_epoch: EpochId,
     pub coordinator_lease: WorkLeaseId,
     pub provider_identity: ProviderIdentity,
     pub g11_admission_receipt_ref: String,
@@ -309,7 +308,7 @@ pub struct ExecutionContext {
     pub task_revision: String,
     pub plan_revision: RevisionId,
     pub state_fence: StateFence,
-    pub controller_epoch: AuthorityEpoch,
+    pub controller_epoch: EpochId,
     pub coordinator_lease: WorkLeaseId,
 }
 
@@ -320,7 +319,7 @@ impl From<&ProviderAdmissionReceipt> for ExecutionContext {
             task_revision: receipt.task_revision.clone(),
             plan_revision: receipt.plan_revision.clone(),
             state_fence: receipt.state_fence.clone(),
-            controller_epoch: receipt.controller_epoch,
+            controller_epoch: receipt.controller_epoch.clone(),
             coordinator_lease: receipt.coordinator_lease.clone(),
         }
     }

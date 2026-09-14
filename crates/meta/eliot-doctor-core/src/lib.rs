@@ -2,7 +2,7 @@
 
 use blake3::Hasher;
 use eliot_contracts::{
-    AuthorityEpoch, EpochId, ResourceGeneration, StateFence as CanonicalStateFence,
+    EpochId, ResourceGeneration, StateFence as CanonicalStateFence,
 };
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeSet;
@@ -71,14 +71,14 @@ impl EvidenceHandle {
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct StateFence {
-    pub authority_epoch: u64,
+    pub authority_epoch: EpochId,
     pub generation: u64,
     pub digest: String,
 }
 
 impl StateFence {
     pub fn new(
-        authority_epoch: u64,
+        authority_epoch: EpochId,
         generation: u64,
         digest: impl Into<String>,
     ) -> Result<Self, DoctorError> {
@@ -91,11 +91,9 @@ impl StateFence {
         Ok(fence)
     }
     pub fn validate(&self) -> Result<(), DoctorError> {
-        let authority =
-            AuthorityEpoch::new(self.authority_epoch).map_err(|_| DoctorError::InvalidFence)?;
         let generation =
             ResourceGeneration::new(self.generation).map_err(|_| DoctorError::InvalidFence)?;
-        CanonicalStateFence::new(authority, generation)
+        CanonicalStateFence::new(self.authority_epoch.clone(), generation)
             .validate()
             .map_err(|_| DoctorError::InvalidFence)?;
         hex_digest(&self.digest, "state fence digest")
@@ -108,11 +106,12 @@ impl StateFence {
 /// returns the canonical view for evaluation.
 pub fn canonical_fence(fence: &StateFence) -> Result<CanonicalStateFence, DoctorError> {
     fence.validate()?;
-    let authority =
-        AuthorityEpoch::new(fence.authority_epoch).map_err(|_| DoctorError::InvalidFence)?;
     let generation =
         ResourceGeneration::new(fence.generation).map_err(|_| DoctorError::InvalidFence)?;
-    Ok(CanonicalStateFence::new(authority, generation))
+    Ok(CanonicalStateFence::new(
+        fence.authority_epoch.clone(),
+        generation,
+    ))
 }
 
 /// Lineage-aware fence evaluation against the canonical epoch owner.
@@ -120,7 +119,7 @@ pub fn canonical_fence(fence: &StateFence) -> Result<CanonicalStateFence, Doctor
 /// sequence. Doctor never mints the epoch, it only echoes and checks.
 pub fn check_fence_against_epoch(fence: &StateFence, epoch: &EpochId) -> Result<(), DoctorError> {
     let canonical = canonical_fence(fence)?;
-    if canonical.authority_epoch.value() != epoch.sequence.get() {
+    if !canonical.authority_epoch.is_same_authority(epoch) {
         return Err(DoctorError::InvalidFence);
     }
     Ok(())
@@ -907,8 +906,13 @@ impl RepairAttemptIdentity {
         hash_operation_ref(&mut hasher, binding.operation);
         hash_field(
             &mut hasher,
-            b"authority_epoch",
-            &binding.fence.authority_epoch.to_le_bytes(),
+            b"authority_epoch_lineage",
+            binding.fence.authority_epoch.lineage_id.as_str().as_bytes(),
+        );
+        hash_field(
+            &mut hasher,
+            b"authority_epoch_sequence",
+            &binding.fence.authority_epoch.sequence.get().to_le_bytes(),
         );
         hash_field(
             &mut hasher,
@@ -2111,6 +2115,20 @@ pub fn disposition_for_verified_attempt(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::num::NonZeroU64;
+
+    use eliot_contracts::EpochLineageId;
+
+    /// Lineage-A fixture epoch for tests (canonical UUID lineage, no scalar).
+    fn test_epoch(sequence: u64) -> EpochId {
+        let lineage = EpochLineageId::new("550e8400-e29b-41d4-a716-446655440000")
+            .expect("canonical test lineage-A");
+        EpochId::new(
+            lineage,
+            NonZeroU64::new(sequence).expect("non-zero test sequence"),
+        )
+        .expect("valid test epoch")
+    }
 
     fn now() -> OffsetDateTime {
         OffsetDateTime::UNIX_EPOCH + Duration::seconds(100)
@@ -2151,7 +2169,7 @@ mod tests {
                 unknowns: Vec::new(),
             },
             recipe,
-            fence: StateFence::new(1, 1, "b".repeat(64)).unwrap(),
+            fence: StateFence::new(test_epoch(1), 1, "b".repeat(64)).unwrap(),
             lease: RecoveryLease {
                 lease_id: "lease".into(),
                 owner: "kernel".into(),
