@@ -1,0 +1,28 @@
+{
+  "schema": "eliot-assignment-snapshot-v1",
+  "header": {
+    "repository": "UnknownAlienHuman/eliot-memory-os",
+    "base_sha": "fb3fc334e113236cb82cf5ca9139fc0970df032b",
+    "complete": true
+  },
+  "issues": [
+    {
+      "number": 646,
+      "state": "open",
+      "title": "Historical workstream registration for 644",
+      "write_paths": ["crates/smart/eliot-dreamer-core/"],
+      "dependencies": []
+    }
+  ],
+  "pull_requests": [],
+  "repository_records": {
+    "workstreams": [
+      {
+        "path": "workstreams/dreamer/assignments/646-dreamer-core.toml",
+        "internal_issue": 644,
+        "package": "eliot-dreamer-core",
+        "physical_package": "eliot-dreamer-kernel"
+      }
+    ]
+  }
+}

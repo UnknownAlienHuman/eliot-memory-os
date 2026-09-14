@@ -71,6 +71,12 @@ pub use genesis_owner_packet::{
     GOVERNOR_GENESIS_PACKET_SCHEMA, GOVERNOR_GENESIS_PACKET_VERSION, GovernorGenesisOwnerRecord,
     GovernorGenesisPacket,
 };
+#[path = "native_worker_binding.rs"]
+mod native_worker_binding;
+pub use native_worker_binding::{
+    NATIVE_WORKER_EXECUTABLE_BINDING_WIRE_ID, NATIVE_WORKER_EXECUTABLE_BINDING_WIRE_VERSION,
+    NativeWorkerExecutableBinding,
+};
 
 /// The only application write port exposed to the daemon.
 ///
@@ -1629,6 +1635,192 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
             .canonical
             .commit(self.kernel.as_ref(), identity, envelope)
             .await
+    }
+
+    /// Publishes one versioned Governor-owned executable binding projection
+    /// (T9-01 M1, `T9.md` 3.2) for a registered native-worker attempt.
+    ///
+    /// The binding is a pure projection over admitted owner records at the
+    /// retained fence: `state_fence`, `authority_epoch`, and `generation` are
+    /// taken from the retained Kernel snapshot, never from the caller. The
+    /// caller-supplied `plan_id` / `plan_revision` / `task_id` /
+    /// `work_scope_id` must equal the current canonical plan at that fence,
+    /// `task_revision` must equal the task owner revision, `session_id` must
+    /// name a session at the fence with `route_ref` equal to its admitted
+    /// `model_route`, `work_scope_id` must equal the bound `WorkScope` scope,
+    /// and `config_snapshot_digest` must equal the retained protected snapshot
+    /// digest. Any mismatch fails closed as `Recovery` (stale), never repaired
+    /// locally. T9-02 enforces the remaining currentness (route/adapter/
+    /// config/facet/grant/epoch change makes stale) at the Kernel before
+    /// resume; this method binds to the current fence/epoch and refuses a
+    /// stale fence.
+    ///
+    /// This method performs no transport: the caller commits a sibling
+    /// `PreparedTransition` through the existing `commit_canonical` path and
+    /// correlates by `operation_id` / `canonical_request_hash` / `state_fence`.
+    /// All parameters are required; blank or malformed input fails closed.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "M1 binding joins every T9.md 3.2 denominator field in one versioned projection"
+    )]
+    pub fn publish_native_worker_binding(
+        &self,
+        claim_id: &str,
+        registration_id: &str,
+        installation_id: &str,
+        task_id: &str,
+        work_unit_id: &str,
+        work_scope_id: &str,
+        attempt: u32,
+        lease_id: &str,
+        operation_id: &str,
+        canonical_request_hash: &str,
+        principal_id: &str,
+        session_id: &str,
+        worker_generation: u64,
+        process_tree_id: &str,
+        process_generation: u64,
+        process_fence: &str,
+        route_ref: &str,
+        adapter_id: &str,
+        adapter_revision: u64,
+        artifact_digest: &str,
+        config_digest: &str,
+        protocol_digest: &str,
+        command_ref: &str,
+        facet_manifest_ref: &str,
+        introduction_refs: Vec<String>,
+        supporting_grant_refs: Vec<String>,
+        grant_graph_revision: u64,
+        effective_ceiling: eliot_store_api::EffectClass,
+        credential_refs: Vec<String>,
+        resource_refs: Vec<String>,
+        replay_stream_id: &str,
+        launch_nonce: &str,
+        process_invocation_digest: &str,
+        deadline_unix_ms: u64,
+        expires_at_unix_ms: u64,
+        plan_id: &str,
+        plan_revision: &str,
+        task_revision: u64,
+        config_snapshot_digest: &str,
+        admission_revision_ref: &str,
+    ) -> Result<NativeWorkerExecutableBinding, CompositionError> {
+        if self.readiness != CompositionReadiness::Ready {
+            return Err(CompositionError::NotReady);
+        }
+        let fence = self.snapshot.state_fence();
+        let authority_epoch = self.snapshot.authority_epoch;
+        let generation = self.snapshot.generation;
+        if config_snapshot_digest != self.snapshot.protected_snapshot_digest
+            || config_snapshot_digest != self.owners.config.snapshot_digest()
+        {
+            return Err(CompositionError::Recovery(
+                "native binding config snapshot is not the retained protected snapshot".to_owned(),
+            ));
+        }
+        let plan = self.owners.canonical.read_current_plan(&fence)?;
+        if plan.plan_id != plan_id
+            || plan.plan_revision != plan_revision
+            || plan.task_id.as_str() != task_id
+            || plan.work_scope_id != work_scope_id
+        {
+            return Err(CompositionError::Recovery(
+                "native binding plan/task/scope does not match the current canonical plan"
+                    .to_owned(),
+            ));
+        }
+        let task_key = TaskId::new(task_id.to_owned())
+            .map_err(|error| CompositionError::Recovery(error.to_string()))?;
+        let task = self.owners.task.task(&task_key).ok_or_else(|| {
+            CompositionError::Recovery("native binding task has no owner record".to_owned())
+        })?;
+        if task.revision != task_revision || task.state_fence != fence {
+            return Err(CompositionError::Recovery(
+                "native binding task revision is stale or foreign".to_owned(),
+            ));
+        }
+        let session_key = SessionId::new(session_id.to_owned())
+            .map_err(|error| CompositionError::Recovery(error.to_string()))?;
+        let session = self.owners.session.session(&session_key).ok_or_else(|| {
+            CompositionError::Recovery("native binding session has no owner record".to_owned())
+        })?;
+        if session.state_fence != fence
+            || session.authority_epoch != authority_epoch
+            || session.model_route != route_ref
+        {
+            return Err(CompositionError::Recovery(
+                "native binding session/route is stale or foreign".to_owned(),
+            ));
+        }
+        let scope_owner = self.owners.work_scope.as_ref().ok_or_else(|| {
+            CompositionError::Recovery(
+                "native binding WorkScope is unbound; semantic activation is unavailable"
+                    .to_owned(),
+            )
+        })?;
+        let scope = scope_owner
+            .read_current(&fence)
+            .map_err(|error| CompositionError::Recovery(error.to_string()))?;
+        if scope.binding.scope.scope_ref != work_scope_id {
+            return Err(CompositionError::Recovery(
+                "native binding work scope does not match the bound WorkScope".to_owned(),
+            ));
+        }
+        let mut binding = NativeWorkerExecutableBinding {
+            claim_id: claim_id.to_owned(),
+            registration_id: registration_id.to_owned(),
+            task_id: task_id.to_owned(),
+            work_unit_id: work_unit_id.to_owned(),
+            work_scope_id: work_scope_id.to_owned(),
+            attempt,
+            lease_id: lease_id.to_owned(),
+            operation_id: operation_id.to_owned(),
+            canonical_request_hash: canonical_request_hash.to_owned(),
+            installation_id: installation_id.to_owned(),
+            principal_id: principal_id.to_owned(),
+            session_id: session_id.to_owned(),
+            worker_generation,
+            process_tree_id: process_tree_id.to_owned(),
+            process_generation,
+            process_fence: process_fence.to_owned(),
+            route_ref: route_ref.to_owned(),
+            adapter_id: adapter_id.to_owned(),
+            adapter_revision,
+            artifact_digest: artifact_digest.to_owned(),
+            config_digest: config_digest.to_owned(),
+            protocol_digest: protocol_digest.to_owned(),
+            command_ref: command_ref.to_owned(),
+            facet_manifest_ref: facet_manifest_ref.to_owned(),
+            introduction_refs,
+            supporting_grant_refs,
+            grant_graph_revision,
+            effective_ceiling,
+            credential_refs,
+            resource_refs,
+            replay_stream_id: replay_stream_id.to_owned(),
+            launch_nonce: launch_nonce.to_owned(),
+            process_invocation_digest: process_invocation_digest.to_owned(),
+            state_fence: fence,
+            authority_epoch,
+            generation,
+            deadline_unix_ms,
+            expires_at_unix_ms,
+            plan_id: plan_id.to_owned(),
+            plan_revision: plan_revision.to_owned(),
+            task_revision,
+            config_snapshot_digest: config_snapshot_digest.to_owned(),
+            admission_revision_ref: admission_revision_ref.to_owned(),
+            wire_id: NATIVE_WORKER_EXECUTABLE_BINDING_WIRE_ID.to_owned(),
+            wire_version: NATIVE_WORKER_EXECUTABLE_BINDING_WIRE_VERSION,
+            binding_digest: String::new(),
+        };
+        let digest = binding
+            .compute_digest()
+            .map_err(CompositionError::Recovery)?;
+        binding.binding_digest = digest;
+        binding.validate().map_err(CompositionError::Recovery)?;
+        Ok(binding)
     }
 
     /// Re-reads Kernel-owned owner projections and publishes a coherent live
