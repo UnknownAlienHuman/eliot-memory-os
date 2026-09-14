@@ -1,0 +1,126 @@
+schema = "eliot.agent-work-unit.v1"
+authority = "NON_NORMATIVE_IMPLEMENTATION_ALLOCATION"
+routing_authority = "owning_issue_and_normative_pair_only"
+status = "RETIRED_ZERO_CONSUMER_AWAITING_MERGE"
+implementation_support = "RETIRED_ZERO_CONSUMER_NO_CURRENT_SUPPORT"
+evidence_execution_status = "ZERO_CONSUMER_GREP_PROOF_AND_LOCKED_METADATA_EXECUTED_FULL_WORKSPACE_CHECK_AND_BOUNDARY_AUDIT_EXECUTED_LIVE_RUNTIME_TESTS_NOT_EXECUTED"
+proof_ceiling = "SYSTEM_EXPERIENCE_PROJECTION_REMOVAL_ONLY"
+issue = 1199
+parent_issue = 39
+source_repair_issue = 209
+governor_issue = 18
+store_issue = 19
+read_issue = 1119
+registry_issue = 13
+parent_product_issue = 11
+base_branch = "main"
+base_sha = "87c38c815a95d54c660627bff1b54693b28e826c"
+normative_pair_ref = "docs/normative-pair.toml"
+
+[work_unit]
+cell_id = "memory.system-experience-projection-disposition"
+causal_property = "One owner-supplied immutable system-experience read set is projected by exactly one current read owner under exact source, scope, denominator, consistency, privacy, freshness and invalidation identities; an unconsumed compatibility package cannot advertise current support."
+current_discriminator = "Retired: the stateless v2 package had no external Cargo/source/runtime consumer and still advertised a compatibility functional cell and proof profile. Zero-consumer proof executed on base 87c38c81; package, workspace member, lock entry and generated index rows removed in this wave."
+primary_issue_url = "https://github.com/UnknownAlienHuman/eliot-memory-os/issues/1199"
+
+[documentation]
+implementation = [
+  "docs/architecture/I04-08-eliot-self-scope-and-immediate-system-experience-bank.md#i48-eliot-self-scope-and-immediate-system-experience-bank",
+  "docs/architecture/I05-20-read-model-consistency-and-cache.md#i520-read-model-consistency-and-cache",
+  "docs/architecture/I05-24-operational-control-state-versus-cognitive-inheritance.md#i524-operational-control-state-versus-cognitive-inheritance",
+  "docs/architecture/I02-23-capability-family-topology-and-crate-extraction-decisions.md#i223-capability-family-topology-and-crate-extraction-decisions",
+  "docs/architecture/I07-20-agent-facing-error-contract.md#i720-agent-facing-error-contract",
+]
+anchors = ["ARCH-MOD-03", "ARCH-MEM-04", "ARCH-SEC-02", "ARCH-OBS-01", "ARCH-RES-04"]
+
+[current_source]
+confirmed = [
+  "Closed #209 removed the duplicate mutable SystemExperienceOwner and retained one pure bounded projection; this wave removes that remaining stateless package after the zero-consumer proof.",
+  "Repo-wide grep for eliot_system_experience / eliot_system_experience:: finds zero Rust imports: no `use` of the crate anywhere outside this file's own prose.",
+  "Only Cargo.toml naming eliot-system-experience besides its own manifest was the root workspace member line (removed); no crate lists it as a dependency, so Cargo reverse-dep count is 0.",
+  "No Governor, Store, Context, Operator, ControlBoard, runtime-status or installation composition invokes project_experience; the only call sites were the deleted crate's own lib.rs unit tests.",
+  "No ExperienceProjection / ExperienceProjectionRequest / ExperienceProjectionError type use and no eliot.smart.system_experience_projection contract-name reference exist outside the deleted crate.",
+  "Package metadata advertised smart.experience.projection.compatibility and an independent proof profile with no consumer; that advertisement is deleted with the crate.",
+  "cognitive-donor-map.toml still says RETIRE_AS_STATE_OWNER_DEFER_READ_PROJECTION_IDEAS and names no target package; that stanza is out of this wave's scope and untouched.",
+]
+
+[scope]
+primary_paths = [
+  "crates/smart/eliot-system-experience/**",
+  "exact root workspace member line",
+  "Cargo.lock eliot-system-experience [[package]] entry only",
+  "generated docs/code-navigation/PACKAGE_DOCS_INDEX.md rows via the owned generator",
+  "workstreams/memory/assignments/1199-system-experience-disposition.toml",
+]
+serialized_dependencies = ["#18/#19 Governor and Store", "#1119 read owner", "#39 parent retirement", "#13 registry", "#11 Product proof"]
+forbidden = [
+  "mutable experience, relation, lifecycle, revision or history state",
+  "Store I/O/credentials or direct Context membership",
+  "retrieval reinforcement or current-system status ownership",
+  "model/provider calls, authority, effects or Finish",
+  "automatic workflow triggers",
+]
+
+[disposition]
+decision = "retired-zero-consumer"
+implements = 1199
+supersedes = 1200
+allocation = "PR #1200 allocation-only draft commit 5763aa35 (never landed) cherry-picked onto work/1199-system-experience-retire, then rewritten to this retire disposition; the new PR says Supersedes #1200."
+t1_decision = 'workstreams/core-daemons/T1.md:390@87c38c81: "G-06/Governor is the read consumer owner if a real consumer exists; #1199 must prove that denominator or retire the unused system-experience projection. No automatic keep decision." Retire branch taken: real consumer count is 0.'
+t3_r2 = "not-needed: with no consumer there is no owner-issued snapshot -> projection -> consumer edge to wire, so T3-R2 is not required."
+zero_consumer_proof = "On base 87c38c81 with the package present: (1) `git grep -n eliot_system_experience` -> only this file's prose; (2) `git grep -n eliot-system-experience -- **/Cargo.toml` -> only the crate's own manifest, no reverse-deps; (3) `git grep -n project_experience` -> only the crate's own lib.rs tests plus prose; (4) `git grep -n ExperienceProjection` and `system_experience_projection` -> only inside the crate. Post-removal: the same greps show only historical/plan prose plus this disposition file; `cargo metadata --locked --no-deps` exits 0 with 125 packages and no eliot-system-experience."
+remaining_out_of_scope = "Untouched per scope: crates/smart/cognitive-donor-map.toml donor stanza (RETIRE_AS_STATE_OWNER_DEFER_READ_PROJECTION_IDEAS, no target), crates/smart/eliot-dreamer-episode/module.toml and crates/smart/eliot-dreamer-relation/module.toml donor stanzas (extract-only-applicable-pure-logic provenance, not live consumers). Follow-up owner must reconcile those historical references."
+evidence_state = "Writer-executed in worktree C:\\Development\\Rust\\projects\\eliot-swarm\\mgr02-item-RECHECK-1199 on branch work/1199-system-experience-retire: crate deleted via git rm, member line and lock entry removed, index regenerated via python scripts/code_navigation.py sync-index (126->125 members, 297->296 targets). Gates run for real; outputs recorded in the commit body. No live-runtime/ignored tests run; no new tests added (deletion needs none)."
+reader_note = "workers/MGR02/items/RECHECK-1199/reader.md was not present in this worktree or the mgr02 base checkout at execution time, so the zero-consumer proof above was re-executed from scratch with the listed greps rather than copied."
+
+[[waves]]
+id = "A"
+what = "Revalidate zero current consumers against the merge base."
+how = [
+  "Ran Cargo/source/runtime/install/registry reverse-consumer inventory: Rust-use grep, Cargo reverse-dep grep, project_experience call-site grep, ExperienceProjection type grep, contract-name grep.",
+  "Confirmed zero real consumers, so the T1.md:390 retire branch fires and no Governor/Store/read-contract comparison table is needed.",
+]
+
+[[waves]]
+id = "B"
+what = "Remove the unconsumed package as one closed change."
+how = [
+  "Deleted crates/smart/eliot-system-experience via git rm (AGENTS.md, Cargo.toml, src/lib.rs).",
+  "Removed the exact root workspace member line; removed the exact Cargo.lock [[package]] stanza with no other lock churn.",
+  "Regenerated docs/code-navigation/PACKAGE_DOCS_INDEX.md via the owned generator python scripts/code_navigation.py sync-index --root . (never edited by hand).",
+]
+
+[[waves]]
+id = "C"
+what = "Prove no behavior regresses and no live reference remains."
+how = [
+  "cargo metadata --locked --no-deps exits 0: 125 packages, no eliot-system-experience.",
+  "Repo-wide absence greps with the package unavailable show only historical/plan prose plus this disposition file.",
+  "Ran cargo fmt --all -- --check, git diff --check, cargo check --locked --workspace --all-targets, python scripts/audit-architecture-boundaries.py for real.",
+]
+
+[acceptance]
+criteria = [
+  "Reverse-consumer inventory proves zero external consumers of eliot-system-experience (no Rust use, no Cargo reverse-dep, no project_experience call site, no public-type consumer).",
+  "The package directory and exact workspace member are removed.",
+  "The Cargo.lock eliot-system-experience [[package]] entry is removed with no other lock churn; locked metadata stays clean.",
+  "The generated package index no longer advertises the crate (generator-regenerated, 126->125 members).",
+  "This disposition file records retired-zero-consumer, the zero-consumer proof, the T1.md:390 decision, T3-R2-not-needed, Supersedes #1200 and Implements #1199.",
+  "No Governor, Store, read-contract, donor-map, Dreamer module.toml or second experience bank/cache/facade file was modified in this wave.",
+  "No mutable system-experience or relation/lifecycle state is reintroduced.",
+  "No new consumer, facade, or compatibility re-export of the removed projection is introduced.",
+  "#13 resolves one final owner/proof surface and #39 remains open until both duplicate-owner removals and affected proof complete.",
+  "Package proof alone is not runtime or Product support.",
+]
+
+[verification]
+commands = [
+  "cargo fmt --all -- --check",
+  "git diff --check",
+  "cargo check --locked --workspace --all-targets",
+  "python scripts/audit-architecture-boundaries.py",
+  "cargo metadata --locked --no-deps",
+  "git grep -n \"eliot_system_experience\\|eliot-system-experience\\|project_experience\\|ExperienceProjection\\|system_experience_projection\" -- .",
+]
+edge_proof = "Zero references proven with the package unavailable: locked metadata clean (125 packages, no eliot-system-experience) and absence greps show only historical/plan prose plus this disposition file."
+product_proof = "Issue #11 remains open."
