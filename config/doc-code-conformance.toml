@@ -176,46 +176,6 @@ token = "C216FB7F6FDBC62D108C748BE6F61CA7EF9E5D24E5BB13AF2677C31A58460C0B"
 reason = "Pre-sharding source traceability marker retained pending the owning source migration."
 
 [[retired_references.allow]]
-path = "crates/kernel/eliot-platform-windows/src/directory_publication.rs"
-token = "eliot-architecture-docs-fa941135"
-reason = "Pre-sharding source traceability marker retained pending the owning source migration."
-
-[[retired_references.allow]]
-path = "crates/kernel/eliot-platform-windows/src/kernel_front_door_expectation.rs"
-token = "eliot-architecture-docs-fa941135"
-reason = "Pre-sharding source traceability marker retained pending the owning source migration."
-
-[[retired_references.allow]]
-path = "crates/kernel/eliot-platform-windows/src/kernel_front_door_server.rs"
-token = "eliot-architecture-docs-fa941135"
-reason = "Pre-sharding source traceability marker retained pending the owning source migration."
-
-[[retired_references.allow]]
-path = "crates/kernel/eliot-platform-windows/src/named_pipe_peer_auth.rs"
-token = "eliot-architecture-docs-fa941135"
-reason = "Pre-sharding source traceability marker retained pending the owning source migration."
-
-[[retired_references.allow]]
-path = "crates/kernel/eliot-platform-windows/src/named_pipe_process_admission.rs"
-token = "eliot-architecture-docs-fa941135"
-reason = "Pre-sharding source traceability marker retained pending the owning source migration."
-
-[[retired_references.allow]]
-path = "crates/kernel/eliot-platform-windows/src/process_identity.rs"
-token = "eliot-architecture-docs-fa941135"
-reason = "Pre-sharding source traceability marker retained pending the owning source migration."
-
-[[retired_references.allow]]
-path = "crates/kernel/eliot-platform-windows/src/process_job.rs"
-token = "eliot-architecture-docs-fa941135"
-reason = "Pre-sharding source traceability marker retained pending the owning source migration."
-
-[[retired_references.allow]]
-path = "crates/kernel/eliot-platform-windows/src/tests.rs"
-token = "eliot-architecture-docs-fa941135"
-reason = "Pre-sharding source traceability marker retained pending the owning source migration."
-
-[[retired_references.allow]]
 path = ".github/workflows/repository-policy.yml"
 token = "docs/normative/"
 reason = "The policy intentionally rejects reintroduced retired authority paths."
