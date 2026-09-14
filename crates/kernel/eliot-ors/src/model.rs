@@ -3645,3 +3645,50 @@ pub(crate) fn require_replay_claim_binding(
 pub(crate) const fn is_replay_terminal_phase(phase: WorkerReplayPhase) -> bool {
     phase.advances_consumer_cursor()
 }
+
+// ---------------------------------------------------------------------------
+// T9-04 provider-capability read projection (issue #1108, M2 supplier core).
+//
+// Read-only lookup identity for resolving one durable claim row from the
+// exact claim/attempt/operation triple carried by a provider-capability
+// proof. This adds no new authority table and no write path: the claim row
+// stays the single durable binding, and this projection only names the row a
+// reverse scan must agree with byte-for-byte.
+//
+// Residual: there is deliberately no `executable_binding_digest` column here
+// (no write migration in this slice). The executable digest is presented per
+// call by daemon composition and compared for equality against the durable
+// claim binding material, exactly like the T9-02 presented-expectation
+// pattern — never trusted by value.
+#[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ProviderCapabilityLookup {
+    /// Durable claim identity under which the proof is presented.
+    pub claim_id: String,
+    /// Attempt identity the proof claims to bind.
+    pub attempt_id: String,
+    /// Exact external-effect operation identity the proof claims to bind.
+    pub operation_id: String,
+}
+
+impl ProviderCapabilityLookup {
+    /// Validates the bounded lookup shape without consulting any authority.
+    pub fn validate(&self) -> Result<(), OrsError> {
+        validate_text(&self.claim_id, "provider_capability_claim_id")?;
+        validate_text(&self.attempt_id, "provider_capability_attempt_id")?;
+        validate_text(&self.operation_id, "provider_capability_operation_id")?;
+        Ok(())
+    }
+
+    /// Returns true only when a durable claim row carries exactly this
+    /// claim/attempt/operation identity.
+    ///
+    /// All three comparisons are exact strings: attempt and operation labels
+    /// are opaque to ORS (same opacity as on the claim row), so a foreign
+    /// attempt or operation under a known claim identity never matches.
+    pub fn matches(&self, record: &NativeWorkerClaimRecord) -> bool {
+        record.claim_id.as_str() == self.claim_id
+            && record.attempt_id.as_str() == self.attempt_id
+            && record.operation_id.as_str() == self.operation_id
+    }
+}

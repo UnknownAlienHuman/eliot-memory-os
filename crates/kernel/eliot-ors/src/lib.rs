@@ -19,6 +19,7 @@ mod store;
 pub mod test_support;
 
 pub use doctor::*;
+pub use model::ProviderCapabilityLookup;
 pub use model::*;
 pub use reservation_model::{
     ReservationRecord, ReservationRequest, ReservationState, ReservedScope,

@@ -71,12 +71,14 @@ pub use protocol::{
     NativeWorkerReplayExpectation, NativeWorkerReplayLookupReply, NativeWorkerReplayLookupRequest,
     NativeWorkerReplayOperation, NativeWorkerReplayPage, NativeWorkerReplayReplayReply,
     NativeWorkerReplayReplayRequest, NativeWorkerReplayStreamBinding,
-    NativeWorkerReplayStreamPosition, ProcessAuthorityHandoffDescriptor, ProcessExecutionRejection,
-    ProcessExecutionRequest, ProcessExecutionResponse, ProcessObservation, RestartBudget,
+    NativeWorkerReplayStreamPosition, PROVIDER_CAPABILITY_WIRE_VERSION,
+    ProcessAuthorityHandoffDescriptor, ProcessExecutionRejection, ProcessExecutionRequest,
+    ProcessExecutionResponse, ProcessObservation, ProviderCapabilityError,
+    ProviderCapabilityExpectation, ProviderCapabilityRequest, ProviderProofKind, RestartBudget,
     StoreBootstrapDescriptor, StoreBootstrapHandoff, StoreProcessBinding, StoreRebindHandoff,
     StoreRebindQuery, StoreRebindReceipt, admit_replay_request, control_request_frame,
     control_response_frame, decode_control_request_frame, decode_control_response_frame,
-    replay_stream_id, semantic_store_config_hash_from_json,
+    replay_stream_id, semantic_store_config_hash_from_json, verify_provider_capability,
 };
 pub use store_client::{EbpCanonicalStoreClient, EbpStoreTransport, StoreClientError};
 #[cfg(windows)]
