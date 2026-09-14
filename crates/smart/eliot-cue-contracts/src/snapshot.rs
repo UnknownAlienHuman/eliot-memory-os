@@ -180,7 +180,7 @@ impl CueSnapshot {
         )?;
         bounds::collection(&self.members, MAX_SNAPSHOT_MEMBERS, "members")?;
         self.validate_payload_budget()?;
-        if self.schema_revision != crate::CONTRACT_REVISION {
+        if !crate::is_supported_schema_revision(&self.schema_revision) {
             return Err(CueContractError::InvalidText {
                 field: "schema_revision",
             });

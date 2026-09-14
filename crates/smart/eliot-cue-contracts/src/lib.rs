@@ -35,11 +35,14 @@ mod activation;
 mod binding;
 mod bounds;
 mod context;
+mod diagnostic;
 mod error;
 mod identity;
 mod index_bounds;
 mod index_candidate;
 mod index_projection;
+mod invalidation;
+mod lineage;
 mod normalization;
 mod observation;
 mod relation;
@@ -52,6 +55,7 @@ pub use activation::{
 };
 pub use binding::{BindingDisposition, BindingRole, CueBindingCandidate};
 pub use context::CueContext;
+pub use diagnostic::{REDACTED_SPAN, RedactedDiagnostic, SENSITIVE_MARKERS};
 pub use eliot_evidence::{EvidenceEnvelope, LifecycleState, RelationKind};
 pub use eliot_receipts::{ProofCeiling, WorkScopeId};
 pub use eliot_security_contracts::PrivacyClass;
@@ -62,6 +66,8 @@ pub use identity::{
 };
 pub use index_candidate::{CueSnapshotBuildCandidate, INDEX_CONTRACT_REVISION};
 pub use index_projection::{AdmittedCueBindingProjection, CueBindingAdmissionRef};
+pub use invalidation::{InvalidationCause, SnapshotInvalidation};
+pub use lineage::{DerivedTarget, RetrievalLineage};
 pub use normalization::{
     CanonicalCueIdentity, ComparisonForm, ComparisonKey, CueKind, MatchMode, NormalizationOutcome,
     NormalizationProfile, NormalizedCue, TransformationStep,
@@ -72,6 +78,16 @@ pub use snapshot::{CueSnapshot, RebuildIdentity, SnapshotMember};
 
 /// Schema revision of this vocabulary. A change to any wire shape changes it.
 pub const CONTRACT_REVISION: &str = "2.0.0";
+
+/// Returns true only for the exact current vocabulary revision.
+///
+/// Every record validates its `schema_revision` through this gate, so a payload
+/// written against any retired revision is rejected by current decoding rather
+/// than interpreted under the current shape.
+#[must_use]
+pub fn is_supported_schema_revision(revision: &str) -> bool {
+    revision == CONTRACT_REVISION
+}
 
 /// Maximum comparison keys one canonical identity may carry.
 ///
@@ -108,6 +124,16 @@ pub const MAX_DERIVED: usize = 512;
 ///
 /// `EmpiricalParameter` status `UNVALIDATED`.
 pub const MAX_PATH_LEN: usize = 8;
+
+/// Maximum selected candidates and admission digests one retrieval lineage may carry.
+///
+/// `EmpiricalParameter` status `UNVALIDATED`.
+pub const MAX_LINEAGE_SELECTIONS: usize = 768;
+
+/// Maximum prior snapshots one invalidation record may preserve.
+///
+/// `EmpiricalParameter` status `UNVALIDATED`.
+pub const MAX_INVALIDATION_HISTORY: usize = 64;
 
 /// Maximum members one snapshot may carry.
 ///
