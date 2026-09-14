@@ -18,9 +18,9 @@ use eliot_store_api::{
     NamedMutationOperation, NamedMutationRequest, NamedOperationManifest, NamedReadOperation,
     NamedReadRequest, OperationIdentity, OperationManifestDigest, OperationManifestSpec,
     OrderingScopeId, ReadConsistency, ScopeId, SecurityContext, StateFence, StoreError,
-    StoreGenesisRequest, TransitionClass, canonical_json_bytes, genesis_manifest,
-    genesis_transition, generated_operation_manifests, named_read_operation_name,
-    operation_manifest_set_digest, sha256_hex,
+    StoreGenesisRequest, TransitionClass, canonical_json_bytes, generated_operation_manifests,
+    genesis_manifest, genesis_transition, named_read_operation_name, operation_manifest_set_digest,
+    sha256_hex,
 };
 use serde_json::{Value, json};
 
@@ -67,18 +67,10 @@ fn activated_typed_reads_pass_catalogue_validation() {
         );
     }
 
-    let heads = read_request(
-        NamedReadOperation::GetRevisionHeads,
-        None,
-        BTreeMap::new(),
-    );
+    let heads = read_request(NamedReadOperation::GetRevisionHeads, None, BTreeMap::new());
     assert!(heads.validate_against_catalogue(&entries).is_ok());
 
-    let ordering = read_request(
-        NamedReadOperation::GetOrderingHeads,
-        None,
-        BTreeMap::new(),
-    );
+    let ordering = read_request(NamedReadOperation::GetOrderingHeads, None, BTreeMap::new());
     assert!(ordering.validate_against_catalogue(&entries).is_ok());
 
     let view = read_request(

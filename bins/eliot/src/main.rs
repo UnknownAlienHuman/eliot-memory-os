@@ -2157,9 +2157,7 @@ fn run_installation_effect(
                         // E4: persist a durable typed rejection so a later
                         // recover/rollback reaches RolledBack and removes exactly
                         // the CreatedByTransaction service registrations.
-                        if let Ok(pending_ref) =
-                            registry_projection_pending_ref(&transaction_id)
-                        {
+                        if let Ok(pending_ref) = registry_projection_pending_ref(&transaction_id) {
                             let _ = coordinator
                                 .persist_non_effect_rejection(&transaction_id, pending_ref);
                         }
@@ -2175,9 +2173,7 @@ fn run_installation_effect(
                     Err(error) => {
                         // E5: same durable rejection as E4 (registry unreadable
                         // after open is UNKNOWN_OUTCOME/ROLLBACK_REQUIRED).
-                        if let Ok(pending_ref) =
-                            registry_projection_pending_ref(&transaction_id)
-                        {
+                        if let Ok(pending_ref) = registry_projection_pending_ref(&transaction_id) {
                             let _ = coordinator
                                 .persist_non_effect_rejection(&transaction_id, pending_ref);
                         }
@@ -2206,11 +2202,10 @@ fn run_installation_effect(
                         Ok(None) | Err(_) => false,
                     };
                     if still_registering
-                        && let Ok(pending_ref) =
-                            registry_projection_pending_ref(&transaction_id)
+                        && let Ok(pending_ref) = registry_projection_pending_ref(&transaction_id)
                     {
-                        let _ = coordinator
-                            .persist_non_effect_rejection(&transaction_id, pending_ref);
+                        let _ =
+                            coordinator.persist_non_effect_rejection(&transaction_id, pending_ref);
                     }
                     write_installation_error(
                         "INSTALLATION_APPLY_ERROR",

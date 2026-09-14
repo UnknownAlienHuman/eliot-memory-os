@@ -2792,7 +2792,12 @@ fn contour_from_state(state: &HostState) -> Result<ContourSnapshot, CanaryError>
     let activation_generation = state.activation.as_ref().map(|record| {
         format!(
             "{}:{}",
-            record.fence.activation_generation.current.lineage_id.as_str(),
+            record
+                .fence
+                .activation_generation
+                .current
+                .lineage_id
+                .as_str(),
             record.fence.activation_generation.current.sequence.get()
         )
     });

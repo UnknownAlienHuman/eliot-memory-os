@@ -852,10 +852,12 @@ mod tests {
         assert!(direct.advances(&prior));
         assert!(!EpochTransition::genesis(lineage(LINEAGE_A)).advances(&epoch(LINEAGE_A, 1)));
         assert!(!direct.advances(&epoch(LINEAGE_A, 2)));
-        assert!(!EpochTransition {
-            current: epoch(LINEAGE_A, 3),
-            parent: Some(epoch(LINEAGE_A, 1)),
-        }
-        .advances(&epoch(LINEAGE_A, 1)));
+        assert!(
+            !EpochTransition {
+                current: epoch(LINEAGE_A, 3),
+                parent: Some(epoch(LINEAGE_A, 1)),
+            }
+            .advances(&epoch(LINEAGE_A, 1))
+        );
     }
 }

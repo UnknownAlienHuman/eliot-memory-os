@@ -83,10 +83,7 @@ fn start_absent_with_snapshot(
     };
     InstallationEffectObservation::Absent {
         observed_precondition,
-        evidence: vec![test_handle(format!(
-            "{reason}:{}",
-            service_name.as_str()
-        ))],
+        evidence: vec![test_handle(format!("{reason}:{}", service_name.as_str()))],
         service_runtime_lineage: None,
     }
 }

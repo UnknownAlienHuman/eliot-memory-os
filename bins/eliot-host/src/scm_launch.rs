@@ -283,8 +283,7 @@ mod tests {
     use super::*;
 
     fn test_registration_request() -> ServiceRegistrationRequest {
-        let image =
-            std::env::current_exe().unwrap_or_else(|_| panic!("test image unavailable"));
+        let image = std::env::current_exe().unwrap_or_else(|_| panic!("test image unavailable"));
         ServiceRegistrationRequest::new(
             ELIOT_HOST_SERVICE_NAME,
             ELIOT_HOST_SERVICE_DISPLAY_NAME,
@@ -303,9 +302,11 @@ mod tests {
         // differs. The host projection must preserve that cause instead of
         // collapsing Absent/Mismatched/Unknown into one string.
         let request = test_registration_request();
-        let mismatched =
-            classify_host_scm_inspection(&request, &ServiceRegistrationRuntimeInspection::Mismatched)
-                .unwrap_or_else(|| panic!("mismatched inspection must classify"));
+        let mismatched = classify_host_scm_inspection(
+            &request,
+            &ServiceRegistrationRuntimeInspection::Mismatched,
+        )
+        .unwrap_or_else(|| panic!("mismatched inspection must classify"));
         assert_eq!(
             mismatched,
             HostScmRegistrationCause::Mismatched {
@@ -325,9 +326,8 @@ mod tests {
         assert_eq!(unknown_detail_typed.stage(), "open-service");
         assert_eq!(unknown_detail_typed.current_state(), Some(3));
         assert_eq!(unknown_detail_typed.process_id(), Some(1234));
-        let unknown =
-            classify_host_scm_inspection(&request, &unknown_inspection)
-                .unwrap_or_else(|| panic!("unknown inspection must classify"));
+        let unknown = classify_host_scm_inspection(&request, &unknown_inspection)
+            .unwrap_or_else(|| panic!("unknown inspection must classify"));
         assert_eq!(unknown.cause(), "unknown");
         assert_ne!(mismatched, unknown);
         let mismatched_detail = mismatched.detail();
@@ -405,9 +405,11 @@ mod tests {
         ));
 
         let request = test_registration_request();
-        let mismatched =
-            classify_host_scm_inspection(&request, &ServiceRegistrationRuntimeInspection::Mismatched)
-                .unwrap_or_else(|| panic!("mismatched inspection must classify"));
+        let mismatched = classify_host_scm_inspection(
+            &request,
+            &ServiceRegistrationRuntimeInspection::Mismatched,
+        )
+        .unwrap_or_else(|| panic!("mismatched inspection must classify"));
         // Writer-A payload: Unknown carries typed win32_error/stage/state/pid.
         let unknown_inspection = ServiceRegistrationRuntimeInspection::unknown_with_status(
             1066,

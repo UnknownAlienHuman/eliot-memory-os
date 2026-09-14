@@ -2258,10 +2258,7 @@ impl PackageStager {
         let root_file = {
             #[cfg(windows)]
             {
-                let retained = parent
-                    .contour
-                    .last()
-                    .ok_or(PackageStagingError::Io)?;
+                let retained = parent.contour.last().ok_or(PackageStagingError::Io)?;
                 create_generation_root_at(retained, &generation_root)
                     .map_err(|error| error.with_site(STAGING_SITE_GENERATION_ROOT_CREATE))?
             }
@@ -3434,10 +3431,7 @@ fn retain_destination_parent(
     // ancestor discipline. The leaf is always descriptor-proven, and every
     // caller additionally binds the leaf to its exact expected identity and
     // request before use.
-    let mut ancestors = path
-        .ancestors()
-        .map(Path::to_path_buf)
-        .collect::<Vec<_>>();
+    let mut ancestors = path.ancestors().map(Path::to_path_buf).collect::<Vec<_>>();
     ancestors.reverse();
     let mut contour = Vec::with_capacity(ancestors.len());
     for (index, ancestor) in ancestors.iter().enumerate() {
@@ -3784,10 +3778,9 @@ fn verify_system_security(
     file: &std::fs::File,
     directory: bool,
 ) -> Result<String, PackageStagingError> {
-    let expected = super::OwnedSecurityDescriptor::for_installer_system_object(directory)
-        .map_err(|error| {
-            map_installer_descriptor_error(error, PackageStagingStage::GetSecurityInfo)
-        })?;
+    let expected = super::OwnedSecurityDescriptor::for_installer_system_object(directory).map_err(
+        |error| map_installer_descriptor_error(error, PackageStagingStage::GetSecurityInfo),
+    )?;
     if super::verify_exact_file_security(file, &expected, "S-1-5-18").is_err() {
         // The shared verifier intentionally exposes only its semantic adapter
         // error. Probe the same handle once more to retain a raw GetSecurityInfo
@@ -3977,23 +3970,18 @@ fn staging_nt_full_path(path: &Path) -> Result<Vec<u16>, PackageStagingError> {
     if !path.is_absolute() || text.contains('\0') {
         return Err(PackageStagingError::InvalidRelativePath);
     }
-    let normalized =
-        if let Some(rest) = text
-            .strip_prefix(r"\\?\")
-            .or_else(|| text.strip_prefix(r"\\.\"))
-        {
-            format!(r"\??\{rest}")
-        } else if text.starts_with(r"\??\") {
-            text.to_owned()
-        } else {
-            format!(r"\??\{text}")
-        };
-    let wide: Vec<u16> = normalized.encode_utf16().collect();
-    if wide
-        .len()
-        .saturating_mul(2)
-        .gt(&usize::from(u16::MAX))
+    let normalized = if let Some(rest) = text
+        .strip_prefix(r"\\?\")
+        .or_else(|| text.strip_prefix(r"\\.\"))
     {
+        format!(r"\??\{rest}")
+    } else if text.starts_with(r"\??\") {
+        text.to_owned()
+    } else {
+        format!(r"\??\{text}")
+    };
+    let wide: Vec<u16> = normalized.encode_utf16().collect();
+    if wide.len().saturating_mul(2).gt(&usize::from(u16::MAX)) {
         return Err(PackageStagingError::InvalidRelativePath);
     }
     Ok(wide)
@@ -4015,8 +4003,7 @@ fn staging_apply_directory_security(
     use std::os::windows::io::AsRawHandle as _;
     use windows_sys::Win32::Security::Authorization::{SE_FILE_OBJECT, SetSecurityInfo};
     use windows_sys::Win32::Security::{
-        DACL_SECURITY_INFORMATION, OWNER_SECURITY_INFORMATION,
-        PROTECTED_DACL_SECURITY_INFORMATION,
+        DACL_SECURITY_INFORMATION, OWNER_SECURITY_INFORMATION, PROTECTED_DACL_SECURITY_INFORMATION,
     };
     let owner = descriptor
         .owner()
@@ -4092,12 +4079,7 @@ fn nt_create_directory_object(
         DELETE, FILE_ADD_SUBDIRECTORY, FILE_ATTRIBUTE_REPARSE_POINT, FILE_GENERIC_READ,
         FILE_SHARE_READ, FILE_SHARE_WRITE, WRITE_DAC, WRITE_OWNER,
     };
-    if name.is_empty()
-        || name
-            .len()
-            .saturating_mul(2)
-            .gt(&usize::from(u16::MAX))
-    {
+    if name.is_empty() || name.len().saturating_mul(2).gt(&usize::from(u16::MAX)) {
         return Err(PackageStagingError::InvalidRelativePath);
     }
     let length = u16::try_from(name.len().saturating_mul(2))
@@ -4168,9 +4150,7 @@ fn nt_create_directory_object(
     let result = (|| {
         staging_apply_directory_security(&file, descriptor)?;
         let metadata = file.metadata().map_err(|_| PackageStagingError::Io)?;
-        if !metadata.is_dir()
-            || metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0
-        {
+        if !metadata.is_dir() || metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
             return Err(PackageStagingError::ReparsePoint);
         }
         Ok(())
@@ -4196,9 +4176,7 @@ fn nt_create_directory_object(
 /// create below to the retained object instead of a substituted pathname.
 #[cfg(windows)]
 fn pin_retained_parent(parent: &std::fs::File, child: &Path) -> Result<(), PackageStagingError> {
-    let expected = child
-        .parent()
-        .ok_or(PackageStagingError::RootUnavailable)?;
+    let expected = child.parent().ok_or(PackageStagingError::RootUnavailable)?;
     let canonical = final_path_from_handle(parent)?;
     if !super::windows_paths_equal(&canonical, expected) {
         return Err(PackageStagingError::IdentityMismatch);
@@ -4264,9 +4242,10 @@ fn create_generation_root(path: &Path) -> Result<std::fs::File, PackageStagingEr
     // by path would fail with a sharing violation because the retained handle
     // carries DELETE access without delete sharing.
     let name = staging_nt_full_path(path)?;
-    let descriptor = super::OwnedSecurityDescriptor::for_installer_system_object(true).map_err(
-        |error| map_installer_descriptor_error(error, PackageStagingStage::SetSecurityInfo),
-    )?;
+    let descriptor =
+        super::OwnedSecurityDescriptor::for_installer_system_object(true).map_err(|error| {
+            map_installer_descriptor_error(error, PackageStagingStage::SetSecurityInfo)
+        })?;
     let root = nt_create_directory_object(&name, &descriptor)?;
     finish_created_directory(root, path).map(|(file, _, _)| file)
 }
@@ -4285,9 +4264,10 @@ fn create_generation_root_at(
         .file_name()
         .and_then(|value| value.to_str())
         .ok_or(PackageStagingError::InvalidRelativePath)?;
-    let descriptor = super::OwnedSecurityDescriptor::for_installer_system_object(true).map_err(
-        |error| map_installer_descriptor_error(error, PackageStagingStage::SetSecurityInfo),
-    )?;
+    let descriptor =
+        super::OwnedSecurityDescriptor::for_installer_system_object(true).map_err(|error| {
+            map_installer_descriptor_error(error, PackageStagingStage::SetSecurityInfo)
+        })?;
     let root = super::create_owned_directory_relative(parent, name, descriptor.raw)
         .map_err(map_directory_publication_error)?;
     finish_created_directory(root, path).map(|(file, _, _)| file)
@@ -4325,8 +4305,8 @@ fn create_destination_file(
         FILE_FLAG_WRITE_THROUGH, FILE_GENERIC_READ, FILE_GENERIC_WRITE, FILE_SHARE_READ,
     };
 
-    let descriptor = super::OwnedSecurityDescriptor::for_installer_system_object(false)
-        .map_err(|error| {
+    let descriptor =
+        super::OwnedSecurityDescriptor::for_installer_system_object(false).map_err(|error| {
             map_installer_descriptor_error(error, PackageStagingStage::SetSecurityInfo)
         })?;
     // Absolute-path create-only entry point for callers with no retained
@@ -4605,9 +4585,10 @@ fn create_destination_directory(
     // through the absolute NT path so a live retained ancestor is traversed,
     // never reopened.
     let name = staging_nt_full_path(path)?;
-    let descriptor = super::OwnedSecurityDescriptor::for_installer_system_object(true).map_err(
-        |error| map_installer_descriptor_error(error, PackageStagingStage::SetSecurityInfo),
-    )?;
+    let descriptor =
+        super::OwnedSecurityDescriptor::for_installer_system_object(true).map_err(|error| {
+            map_installer_descriptor_error(error, PackageStagingStage::SetSecurityInfo)
+        })?;
     let directory = nt_create_directory_object(&name, &descriptor)?;
     finish_created_directory(directory, path)
 }
@@ -4626,9 +4607,10 @@ fn create_destination_directory_at(
         .file_name()
         .and_then(|value| value.to_str())
         .ok_or(PackageStagingError::InvalidRelativePath)?;
-    let descriptor = super::OwnedSecurityDescriptor::for_installer_system_object(true).map_err(
-        |error| map_installer_descriptor_error(error, PackageStagingStage::SetSecurityInfo),
-    )?;
+    let descriptor =
+        super::OwnedSecurityDescriptor::for_installer_system_object(true).map_err(|error| {
+            map_installer_descriptor_error(error, PackageStagingStage::SetSecurityInfo)
+        })?;
     let directory = super::create_owned_directory_relative(parent, name, descriptor.raw)
         .map_err(map_directory_publication_error)?;
     finish_created_directory(directory, path)

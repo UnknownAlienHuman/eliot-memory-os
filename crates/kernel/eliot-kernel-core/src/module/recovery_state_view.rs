@@ -247,36 +247,28 @@ mod tests {
 
     #[test]
     fn canonical_epoch_id_rejects_cross_lineage_same_sequence() -> Result<(), KernelError> {
-        let left = authority_epoch_id_from(&epoch_identity(
-            "550e8400-e29b-41d4-a716-446655440000",
-            3,
-        ))?;
-        let right = authority_epoch_id_from(&epoch_identity(
-            "6ba7b810-9dad-11d1-80b4-00c04fd430c8",
-            3,
-        ))?;
+        let left =
+            authority_epoch_id_from(&epoch_identity("550e8400-e29b-41d4-a716-446655440000", 3))?;
+        let right =
+            authority_epoch_id_from(&epoch_identity("6ba7b810-9dad-11d1-80b4-00c04fd430c8", 3))?;
         // Same numeric sequence from different lineages is unrelated authority.
         assert!(!left.is_same_authority(&right));
         assert!(!right.is_same_authority(&left));
         // The exact same tuple authorizes.
-        let again = authority_epoch_id_from(&epoch_identity(
-            "550e8400-e29b-41d4-a716-446655440000",
-            3,
-        ))?;
+        let again =
+            authority_epoch_id_from(&epoch_identity("550e8400-e29b-41d4-a716-446655440000", 3))?;
         assert!(left.is_same_authority(&again));
         // Non-UUID lineage and zero sequence fail closed without manufacturing.
+        assert!(authority_epoch_id_from(&epoch_identity("not-a-uuid-lineage", 3)).is_err());
         assert!(
-            authority_epoch_id_from(&epoch_identity("not-a-uuid-lineage", 3)).is_err()
-        );
-        assert!(
-            authority_epoch_id_from(&epoch_identity(
-                "550e8400-e29b-41d4-a716-446655440000",
-                0
-            ))
-            .is_err()
+            authority_epoch_id_from(&epoch_identity("550e8400-e29b-41d4-a716-446655440000", 0))
+                .is_err()
         );
         // Scalar path stays intact alongside the canonical variant.
-        assert_eq!(authority_epoch_from(&epoch_identity("any-label", 3))?.value(), 3);
+        assert_eq!(
+            authority_epoch_from(&epoch_identity("any-label", 3))?.value(),
+            3
+        );
         Ok(())
     }
 }

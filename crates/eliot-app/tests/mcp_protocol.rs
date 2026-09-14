@@ -6642,8 +6642,7 @@ fn recall_l0_mcp_matches_cli() -> TestResult {
     let deadline = Instant::now() + Duration::from_secs(30);
     let mut cli = run_json(&cli_args)?;
     loop {
-        let published =
-            cli.get("projection_state").and_then(Value::as_str) == Some("published");
+        let published = cli.get("projection_state").and_then(Value::as_str) == Some("published");
         let has_handles = cli
             .get("handles")
             .and_then(Value::as_array)

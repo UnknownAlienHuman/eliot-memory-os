@@ -64,8 +64,8 @@ mod operation_parameters;
 
 pub use operation_catalogue::{
     ACTIVATED_READ_OWNING_SECTION, GENESIS_OWNING_SECTION, MINIMUM_COMPATIBLE_VERSION,
-    OPERATION_CATALOGUE_PROFILE, READ_MAX_INPUT_BYTES, READ_MAX_OUTPUT_BYTES, READ_TIMEOUT_MS,
-    SCOPE_KIND_NONE, SCOPE_KIND_SCOPE, SINGLE_MANIFEST_OWNING_SECTION, OperationKind,
+    OPERATION_CATALOGUE_PROFILE, OperationKind, READ_MAX_INPUT_BYTES, READ_MAX_OUTPUT_BYTES,
+    READ_TIMEOUT_MS, SCOPE_KIND_NONE, SCOPE_KIND_SCOPE, SINGLE_MANIFEST_OWNING_SECTION,
     activated_read_operations, generated_operation_manifests, operation_manifest_set_digest,
 };
 
@@ -1125,8 +1125,7 @@ impl NamedOperationManifest {
                 }
             }
         }
-        let scope_pair_ok = (self.requires_scope_id
-            && self.scope_kind == SCOPE_KIND_SCOPE)
+        let scope_pair_ok = (self.requires_scope_id && self.scope_kind == SCOPE_KIND_SCOPE)
             || (!self.requires_scope_id && self.scope_kind == SCOPE_KIND_NONE);
         if !scope_pair_ok {
             return Err(StoreError::InvalidField {

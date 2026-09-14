@@ -540,9 +540,7 @@ mod tests {
             5
         );
         assert_eq!(
-            config
-                .delegation_calibration
-                .minimum_executed_reviews_total,
+            config.delegation_calibration.minimum_executed_reviews_total,
             4
         );
         assert_eq!(
@@ -558,25 +556,27 @@ mod tests {
                 .to_bits(),
             0.80_f64.to_bits()
         );
-        assert_eq!(
-            config.delegation_calibration.minimum_shadow_tasks_total,
-            12
+        assert_eq!(config.delegation_calibration.minimum_shadow_tasks_total, 12);
+        assert!(
+            config
+                .delegation_calibration
+                .require_zero_authority_violations
         );
-        assert!(config.delegation_calibration.require_zero_authority_violations);
-        assert!(config
-            .delegation_calibration
-            .require_zero_live_tree_violations);
-        assert!(config
-            .delegation_calibration
-            .require_zero_recursive_executions);
+        assert!(
+            config
+                .delegation_calibration
+                .require_zero_live_tree_violations
+        );
+        assert!(
+            config
+                .delegation_calibration
+                .require_zero_recursive_executions
+        );
         assert_eq!(
             config.db.surreal.credential_provider,
             CredentialProviderKind::WindowsCredentialManager
         );
-        assert_eq!(
-            config.db.surreal.credential_id,
-            "surreal-runtime/local-dev"
-        );
+        assert_eq!(config.db.surreal.credential_id, "surreal-runtime/local-dev");
         assert_eq!(
             config.db.surreal.password_file,
             "%LOCALAPPDATA%/Eliot/secrets/surreal_root_password.txt"
@@ -589,17 +589,12 @@ mod tests {
         // Default-constructed config carries the same frozen non-colliding identity.
         let defaults = GovernorConfig::default();
         defaults.validate().expect("default config validates");
-        assert!(!defaults.collides_with_store(
-            RUNTIME_BIND,
-            RUNTIME_ENDPOINT,
-            RUNTIME_NAMESPACE
-        ));
+        assert!(!defaults.collides_with_store(RUNTIME_BIND, RUNTIME_ENDPOINT, RUNTIME_NAMESPACE));
     }
 
     #[test]
     fn exact_collision_rejects_with_collides_prefix() {
-        let mut config =
-            decode(&valid_non_colliding_toml()).expect("valid TOML decodes");
+        let mut config = decode(&valid_non_colliding_toml()).expect("valid TOML decodes");
         config.db.surreal.bind = RUNTIME_BIND.to_owned();
         config.db.surreal.endpoint = RUNTIME_ENDPOINT.to_owned();
         config.db.surreal.ns = RUNTIME_NAMESPACE.to_owned();
@@ -608,10 +603,7 @@ mod tests {
             .reject_store_collision(RUNTIME_BIND, RUNTIME_ENDPOINT, RUNTIME_NAMESPACE)
             .expect_err("exact runtime-live identity must collide");
         assert!(
-            matches!(
-                error,
-                ConfigError::RuntimeLiveStoreCollision { .. }
-            ),
+            matches!(error, ConfigError::RuntimeLiveStoreCollision { .. }),
             "unexpected error: {error}"
         );
         let display = format!("{error}");
@@ -623,29 +615,31 @@ mod tests {
 
     #[test]
     fn loopback_port_alias_collision_rejects() {
-        let mut config =
-            decode(&valid_non_colliding_toml()).expect("valid TOML decodes");
+        let mut config = decode(&valid_non_colliding_toml()).expect("valid TOML decodes");
         // Same numeric port through a different spelling still claims the store.
         config.db.surreal.bind = "127.0.0.1:18001".to_owned();
         config.db.surreal.endpoint = "WS://127.0.0.1:08000/rpc".to_owned();
         config.db.surreal.ns = RUNTIME_NAMESPACE.to_owned();
         assert!(config.collides_with_store(RUNTIME_BIND, RUNTIME_ENDPOINT, RUNTIME_NAMESPACE));
-        assert!(config
-            .reject_store_collision(RUNTIME_BIND, RUNTIME_ENDPOINT, RUNTIME_NAMESPACE)
-            .is_err());
+        assert!(
+            config
+                .reject_store_collision(RUNTIME_BIND, RUNTIME_ENDPOINT, RUNTIME_NAMESPACE)
+                .is_err()
+        );
     }
 
     #[test]
     fn bind_only_collision_rejects() {
-        let mut config =
-            decode(&valid_non_colliding_toml()).expect("valid TOML decodes");
+        let mut config = decode(&valid_non_colliding_toml()).expect("valid TOML decodes");
         config.db.surreal.bind = RUNTIME_BIND.to_owned();
         config.db.surreal.endpoint = "ws://127.0.0.1:18001/rpc".to_owned();
         config.db.surreal.ns = RUNTIME_NAMESPACE.to_owned();
         assert!(config.collides_with_store(RUNTIME_BIND, RUNTIME_ENDPOINT, RUNTIME_NAMESPACE));
-        assert!(config
-            .reject_store_collision(RUNTIME_BIND, RUNTIME_ENDPOINT, RUNTIME_NAMESPACE)
-            .is_err());
+        assert!(
+            config
+                .reject_store_collision(RUNTIME_BIND, RUNTIME_ENDPOINT, RUNTIME_NAMESPACE)
+                .is_err()
+        );
     }
 
     #[test]
@@ -658,95 +652,85 @@ mod tests {
     fn invalid_variants_are_invalid() {
         let base = valid_non_colliding_toml();
         // schema mismatch
-        let config: GovernorConfig = toml::from_str(&base.replace(
-            "schema_version = \"1\"",
-            "schema_version = \"2\"",
-        ))
-        .expect("schema TOML decodes");
+        let config: GovernorConfig =
+            toml::from_str(&base.replace("schema_version = \"1\"", "schema_version = \"2\""))
+                .expect("schema TOML decodes");
         assert!(matches!(
             config.validate(),
             Err(ConfigError::UnsupportedSchemaVersion { .. })
         ));
         // empty required field
-        let mut config: GovernorConfig =
-            toml::from_str(&base).expect("valid TOML decodes");
+        let mut config: GovernorConfig = toml::from_str(&base).expect("valid TOML decodes");
         config.service.service_name = "   ".to_owned();
         assert!(matches!(
             config.validate(),
             Err(ConfigError::EmptyField { .. })
         ));
         // watchdog zero
-        let mut config: GovernorConfig =
-            toml::from_str(&base).expect("valid TOML decodes");
+        let mut config: GovernorConfig = toml::from_str(&base).expect("valid TOML decodes");
         config.supervision.watchdog_interval_ms = 0;
-        assert!(matches!(config.validate(), Err(ConfigError::ZeroField { .. })));
+        assert!(matches!(
+            config.validate(),
+            Err(ConfigError::ZeroField { .. })
+        ));
         // non-loopback bind
-        let mut config: GovernorConfig =
-            toml::from_str(&base).expect("valid TOML decodes");
+        let mut config: GovernorConfig = toml::from_str(&base).expect("valid TOML decodes");
         config.db.surreal.bind = "0.0.0.0:18000".to_owned();
         assert!(matches!(
             config.validate(),
             Err(ConfigError::ForbiddenDbBind { .. })
         ));
         // endpoint shape
-        let mut config: GovernorConfig =
-            toml::from_str(&base).expect("valid TOML decodes");
+        let mut config: GovernorConfig = toml::from_str(&base).expect("valid TOML decodes");
         config.db.surreal.endpoint = "http://127.0.0.1:18000/rpc".to_owned();
         assert!(matches!(
             config.validate(),
             Err(ConfigError::ForbiddenDbEndpoint { .. })
         ));
         // storage scheme
-        let mut config: GovernorConfig =
-            toml::from_str(&base).expect("valid TOML decodes");
+        let mut config: GovernorConfig = toml::from_str(&base).expect("valid TOML decodes");
         config.db.surreal.storage = "rocksdb://data".to_owned();
         assert!(matches!(
             config.validate(),
             Err(ConfigError::ForbiddenDbStorage { .. })
         ));
         // capabilities: deny_all false
-        let mut config: GovernorConfig =
-            toml::from_str(&base).expect("valid TOML decodes");
+        let mut config: GovernorConfig = toml::from_str(&base).expect("valid TOML decodes");
         config.db.surreal.capabilities.deny_all = false;
         assert!(matches!(
             config.validate(),
             Err(ConfigError::ForbiddenCapability { .. })
         ));
         // capabilities: scripting true
-        let mut config: GovernorConfig =
-            toml::from_str(&base).expect("valid TOML decodes");
+        let mut config: GovernorConfig = toml::from_str(&base).expect("valid TOML decodes");
         config.db.surreal.capabilities.allow_scripting = true;
         assert!(matches!(
             config.validate(),
             Err(ConfigError::ForbiddenCapability { .. })
         ));
         // capabilities: guests true
-        let mut config: GovernorConfig =
-            toml::from_str(&base).expect("valid TOML decodes");
+        let mut config: GovernorConfig = toml::from_str(&base).expect("valid TOML decodes");
         config.db.surreal.capabilities.allow_guests = true;
         assert!(matches!(
             config.validate(),
             Err(ConfigError::ForbiddenCapability { .. })
         ));
         // capabilities: allow_net non-empty
-        let mut config: GovernorConfig =
-            toml::from_str(&base).expect("valid TOML decodes");
+        let mut config: GovernorConfig = toml::from_str(&base).expect("valid TOML decodes");
         config.db.surreal.capabilities.allow_net = vec!["example.com".to_owned()];
         assert!(matches!(
             config.validate(),
             Err(ConfigError::ForbiddenCapability { .. })
         ));
         // unsupported credential provider (only the two gated providers validate)
-        let mut config: GovernorConfig =
-            toml::from_str(&base).expect("valid TOML decodes");
+        let mut config: GovernorConfig = toml::from_str(&base).expect("valid TOML decodes");
         config.db.surreal.credential_provider = CredentialProviderKind::DpapiProtectedFile;
         assert!(matches!(
             config.validate(),
             Err(ConfigError::UnsupportedCredentialProvider { .. })
         ));
         // legacy provider requires an explicit non-empty password file
-        let mut config: GovernorConfig =
-            toml::from_str(&base).expect("valid TOML decodes");
+        let mut config: GovernorConfig = toml::from_str(&base).expect("valid TOML decodes");
         config.db.surreal.credential_provider = CredentialProviderKind::LegacyPasswordFile;
         config.db.surreal.password_file = String::new();
         assert!(matches!(

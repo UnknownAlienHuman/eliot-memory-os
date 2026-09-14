@@ -44,12 +44,12 @@ pub use composition::*;
 pub use controlboard_projection::{
     ControlBoardGovernorSnapshot, ControlBoardOwnerBinding, ControlBoardProjectionError,
 };
-pub use observation_reconciliation::GovernorObservationReconciliation;
-pub use skill_lifecycle::GovernorSkillLifecycle;
 /// Canonical write envelope admitted by `commit_canonical`. Re-exported so
 /// the daemon composition root can name the exact envelope type without a
 /// second canonical dependency path.
 pub use eliot_canonical::CanonicalWriteEnvelope;
+pub use observation_reconciliation::GovernorObservationReconciliation;
+pub use skill_lifecycle::GovernorSkillLifecycle;
 
 use std::collections::BTreeMap;
 

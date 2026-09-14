@@ -88,9 +88,7 @@ pub const fn named_read_operation_name(operation: NamedReadOperation) -> &'stati
         NamedReadOperation::GetTaskState => "GetTaskState",
         NamedReadOperation::GetCurrentEpistemicPosition => "GetCurrentEpistemicPosition",
         NamedReadOperation::GetEvidencePack => "GetEvidencePack",
-        NamedReadOperation::GetUnderstandingProjectionInputs => {
-            "GetUnderstandingProjectionInputs"
-        }
+        NamedReadOperation::GetUnderstandingProjectionInputs => "GetUnderstandingProjectionInputs",
         NamedReadOperation::GetAttentionAndProblems => "GetAttentionAndProblems",
         NamedReadOperation::GetModuleCatalogState => "GetModuleCatalogState",
         NamedReadOperation::GetCapabilityEvidenceState => "GetCapabilityEvidenceState",
