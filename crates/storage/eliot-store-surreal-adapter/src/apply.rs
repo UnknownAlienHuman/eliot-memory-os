@@ -1029,18 +1029,36 @@ mod admitted_operation_gate_tests {
             validate_transition(&context, &stale),
             Err(AdapterError::Store(StoreError::ManifestMismatch))
         );
-        // Current set digest but no admitted mutation entry: fail-closed
-        // until a later slice proves a handler/schema/consumer triple.
+        // Current set digest but still-unadmitted mutation entry: fail-closed
+        // for the remaining mutations. `CaptureObservation` is admitted (its
+        // handler/schema/consumer triple is proven); this proof uses
+        // `ApplyEpistemicRevision` (still unadmitted).
         let unadmitted = transition_with(
+            &fence,
+            set_digest.clone(),
+            TransitionClass::Epistemic,
+            EffectClass::Candidate,
+            vec![NamedMutationRequest {
+                operation: NamedMutationOperation::ApplyEpistemicRevision,
+                parameters: BTreeMap::new(),
+            }],
+        );
+        assert_eq!(
+            validate_transition(&context, &unadmitted),
+            Err(AdapterError::Store(StoreError::UnknownOperation))
+        );
+        // Admitted `CaptureObservation` with current set digest and approved
+        // subject params passes the pre-stage gate.
+        let admitted = transition_with(
             &fence,
             set_digest,
             TransitionClass::CaptureCandidate,
             EffectClass::Candidate,
             vec![mutation_operation()],
         );
-        assert_eq!(
-            validate_transition(&context, &unadmitted),
-            Err(AdapterError::Store(StoreError::UnknownOperation))
+        assert!(
+            validate_transition(&context, &admitted).is_ok(),
+            "admitted CaptureObservation passes the pre-stage gate"
         );
         // Fence divergence between caller context and transition.
         let manifest = genesis_manifest().expect("genesis entry is active");

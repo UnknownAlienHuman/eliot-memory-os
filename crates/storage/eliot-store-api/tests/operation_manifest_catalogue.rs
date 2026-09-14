@@ -18,7 +18,8 @@ use eliot_store_api::{
     NamedMutationOperation, NamedMutationRequest, NamedOperationManifest, NamedReadOperation,
     NamedReadRequest, OperationIdentity, OperationManifestDigest, OperationManifestSpec,
     OrderingScopeId, ReadConsistency, ScopeId, SecurityContext, StateFence, StoreError,
-    StoreGenesisRequest, TransitionClass, canonical_json_bytes, generated_operation_manifests,
+    StoreFailure, StoreFailureDisposition, StoreFailureIdentityContext, StoreGenesisRequest,
+    StoreMutationDisposition, TransitionClass, canonical_json_bytes, generated_operation_manifests,
     genesis_manifest, genesis_transition, named_read_operation_name, operation_manifest_set_digest,
     sha256_hex,
 };
@@ -63,7 +64,7 @@ fn receipt_params() -> BTreeMap<String, Value> {
 #[test]
 fn activated_typed_reads_pass_catalogue_validation() {
     let entries = generated_operation_manifests().unwrap();
-    assert_eq!(entries.len(), 5);
+    assert_eq!(entries.len(), 6);
 
     // The closed name mapping is the single owner for code, manifests, wire.
     for operation in [
@@ -244,6 +245,8 @@ fn entry_binding_change_moves_set_digest() {
 }
 
 fn mutation_plan(set_digest: &OperationManifestDigest) -> eliot_store_api::PreparedTransition {
+    let mut parameters = BTreeMap::new();
+    parameters.insert("subject".to_owned(), json!("observation-1"));
     eliot_store_api::PreparedTransition {
         identity: OperationIdentity {
             operation_id: OperationId::new("operation-1").unwrap(),
@@ -260,7 +263,7 @@ fn mutation_plan(set_digest: &OperationManifestDigest) -> eliot_store_api::Prepa
         operation_manifest_digest: set_digest.clone(),
         named_operations: vec![NamedMutationRequest {
             operation: NamedMutationOperation::CaptureObservation,
-            parameters: BTreeMap::new(),
+            parameters,
         }],
         event_projection_relation_intents: EventProjectionRelationIntents {
             event_ids: Vec::new(),
@@ -273,17 +276,14 @@ fn mutation_plan(set_digest: &OperationManifestDigest) -> eliot_store_api::Prepa
 }
 
 #[test]
-fn stale_digest_plan_fails_manifest_mismatch() {
+fn approved_capture_plan_passes_and_stale_digest_fails_manifest_mismatch() {
     let entries = generated_operation_manifests().unwrap();
     let set_digest = operation_manifest_set_digest(&entries).unwrap();
 
-    // C1 advertises no mutation: the set digest binds, but the command
-    // resolves to no entry.
+    // AUD-C01 activates exactly one mutation: the approved CaptureObservation
+    // plan binds the set digest and passes the whole catalogue path.
     let plan = mutation_plan(&set_digest);
-    assert_eq!(
-        plan.validate_against_catalogue(&entries),
-        Err(StoreError::UnknownOperation)
-    );
+    assert!(plan.validate_against_catalogue(&entries).is_ok());
 
     // A stale digest fails before command resolution.
     let mut stale = plan.clone();
@@ -291,6 +291,53 @@ fn stale_digest_plan_fails_manifest_mismatch() {
     assert_eq!(
         stale.validate_against_catalogue(&entries),
         Err(StoreError::ManifestMismatch)
+    );
+}
+
+#[test]
+fn capture_observation_passes_whole_path() {
+    let entries = generated_operation_manifests().unwrap();
+    assert_eq!(entries.len(), 6);
+    let set_digest = operation_manifest_set_digest(&entries).unwrap();
+
+    // Approved owner-shaped subject params pass catalogue validation.
+    let plan = mutation_plan(&set_digest);
+    assert!(plan.validate_against_catalogue(&entries).is_ok());
+
+    // An exact replay fixture (same operation identity and idempotency key)
+    // binds the same digest path instead of creating a second submission.
+    let replay = mutation_plan(&set_digest);
+    assert_eq!(replay.identity.operation_id, plan.identity.operation_id);
+    assert_eq!(
+        replay.identity.idempotency_key,
+        plan.identity.idempotency_key
+    );
+    assert!(replay.validate_against_catalogue(&entries).is_ok());
+    assert_eq!(
+        replay.operation_manifest_digest,
+        plan.operation_manifest_digest
+    );
+
+    // The same idempotency key with a different operation identity is the
+    // IdentityConflict path (I5.5): the store's existing failure mapping
+    // classifies it as Conflict with no attempted mutation, so no record is
+    // created and no database is needed to prove the classification.
+    let mut conflicted = mutation_plan(&set_digest);
+    conflicted.identity.operation_id = OperationId::new("operation-2").unwrap();
+    assert_ne!(conflicted.identity.operation_id, plan.identity.operation_id);
+    assert_eq!(
+        conflicted.identity.idempotency_key,
+        plan.identity.idempotency_key
+    );
+    let failure = StoreFailure::from_store_error(
+        StoreError::IdentityConflict,
+        StoreFailureIdentityContext::default(),
+    )
+    .unwrap();
+    assert_eq!(failure.disposition, StoreFailureDisposition::Conflict);
+    assert_eq!(
+        failure.mutation_disposition,
+        StoreMutationDisposition::NotAttempted
     );
 }
 
