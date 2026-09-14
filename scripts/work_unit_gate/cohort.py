@@ -31,6 +31,7 @@ MAX_MATRIX_CASES = 1000
 
 _RE_ABSOLUTE_DRIVE = re.compile(r"^[A-Za-z]:[\\/]")
 _RE_UNC = re.compile(r"^\\\\")
+_RE_HEX_SHA256 = re.compile(r"[0-9a-f]{64}")
 
 # Restricted paths: ordinary leaves cannot claim root or shared configuration
 RESTRICTED_ROOT_PATHS = frozenset({
@@ -358,19 +359,61 @@ def validate_snapshot_completeness(snapshot: dict) -> None:
         )
 
 
-def verify_leaf_routers_unchanged(repo_root: Path, base_commit: str, router_paths: Sequence[str] = (
-    "scripts/docs_router.py",
-    "scripts/docs_router_core.py",
-    "scripts/docs_shards.py",
-    "scripts/docs_shards_core.py",
-)) -> bool:
-    """Verify that leaf router files on disk are byte-identical to base_commit."""
+def verify_leaf_routers_unchanged(
+    repo_root: Path,
+    frozen_router_sha256: Dict[str, str],
+    router_paths: Sequence[str] = (
+        "scripts/docs_router.py",
+        "scripts/docs_router_core.py",
+        "scripts/docs_shards.py",
+        "scripts/docs_shards_core.py",
+    ),
+) -> bool:
+    """Verify that leaf router files on disk are byte-identical to frozen base identities.
+
+    Pure (no network I/O, subprocess execution, or repository mutation): hashes
+    the exact on-disk bytes of each listed router (binary mode, sha256) and
+    compares against the caller-supplied frozen mapping of rel-path ->
+    64-hex-char sha256 recorded from the immutable base snapshot/receipt.
+    Raises CohortError(ROUTER_MUTATION_DETECTED) on any mismatch: mutated
+    bytes, CRLF-only change, missing file, missing frozen identity for a
+    listed router, or malformed expected digest. Returns True only when every
+    listed router matches.
+    """
+    try:
+        get_digest = frozen_router_sha256.get
+    except AttributeError:
+        raise CohortError(
+            CohortProblem.ROUTER_MUTATION_DETECTED,
+            "frozen router identities must be a rel-path -> sha256 mapping",
+        ) from None
+    root = Path(repo_root)
     for rel_path in router_paths:
-        file_path = repo_root / rel_path
+        expected = get_digest(rel_path)
+        if expected is None:
+            raise CohortError(
+                CohortProblem.ROUTER_MUTATION_DETECTED,
+                f"missing frozen identity for router: {rel_path}",
+            )
+        if not isinstance(expected, str) or _RE_HEX_SHA256.fullmatch(expected) is None:
+            raise CohortError(
+                CohortProblem.ROUTER_MUTATION_DETECTED,
+                f"malformed frozen digest for router: {rel_path}",
+            )
+        file_path = root / rel_path
         if not file_path.is_file():
             raise CohortError(CohortProblem.ROUTER_MUTATION_DETECTED, f"router missing: {rel_path}")
-        # When checking in tests or real git repo, if git is available we can check git diff
-        # In mock or offline tests, caller can supply mock or compare content.
+        try:
+            actual = hashlib.sha256(file_path.read_bytes()).hexdigest()
+        except OSError as e:
+            raise CohortError(
+                CohortProblem.ROUTER_MUTATION_DETECTED, f"router unreadable: {rel_path} ({e})"
+            ) from e
+        if actual != expected:
+            raise CohortError(
+                CohortProblem.ROUTER_MUTATION_DETECTED,
+                f"router bytes differ from frozen identity: {rel_path}",
+            )
     return True
 
 

@@ -25,6 +25,17 @@ BODY, MATRIX, SOURCE, ARTIFACT = (char * 64 for char in "abcd")
 PROOF = c.ProofCeiling("catalogue-integrity-only")
 GUARD = c.WorkUnitIdentity("source-shape")
 
+# Frozen leaf-router byte identities: sha256 of the exact on-disk bytes at base
+# commit c0c7257f (Windows CRLF checkout; `.gitattributes` sets `* text=auto`
+# so disk bytes are CRLF while git blobs are LF-only). Fixed literals recorded
+# once — never computed from live files at test runtime.
+FROZEN_LEAF_ROUTER_SHA256 = {
+    "scripts/docs_router.py": "dfa620878659326985b5319baf9516e01a31f49decaae44c438244753d9e84f4",
+    "scripts/docs_router_core.py": "752834cad7e5d759eeb522badaba653d6587cb6f8b56393d4a5816c99ccb3c89",
+    "scripts/docs_shards.py": "a542962499de7b4db5be555cfa41f27fb826ecc8a7cb6595dc96d3560eff8067",
+    "scripts/docs_shards_core.py": "0d94fdbcd034a96ceac7ee40e79ad7b89e7a9723ab9ca4e7b3308d22913e0965",
+}
+
 
 def make_desc(
     issue_num: int = 852,
@@ -530,7 +541,57 @@ bounds = { wall_ms = 60000, idle_ms = 10000, output_bytes = 1048576, line_bytes 
 
     # WORK_UNIT_CASE: 852/28
     def test_routers_unchanged_against_current_base_newer_semantic_edits_preserved(self):
-        self.assertTrue(ch.verify_leaf_routers_unchanged(ROOT, "5cb0cb21"))
+        # Unchanged on-disk routers match the frozen base identities.
+        self.assertTrue(ch.verify_leaf_routers_unchanged(ROOT, FROZEN_LEAF_ROUTER_SHA256))
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            for rel in FROZEN_LEAF_ROUTER_SHA256:
+                dst = root / rel
+                dst.parent.mkdir(parents=True, exist_ok=True)
+                dst.write_bytes((ROOT / rel).read_bytes())
+
+            # Exact-copy bytes pass.
+            self.assertTrue(ch.verify_leaf_routers_unchanged(root, FROZEN_LEAF_ROUTER_SHA256))
+
+            # One mutated byte raises.
+            target = root / "scripts/docs_router.py"
+            mutated = bytearray(target.read_bytes())
+            mutated[0] ^= 0x01
+            target.write_bytes(bytes(mutated))
+            with self.assertRaises(ch.CohortError) as ctx:
+                ch.verify_leaf_routers_unchanged(root, FROZEN_LEAF_ROUTER_SHA256)
+            self.assertEqual(ctx.exception.problem, ch.CohortProblem.ROUTER_MUTATION_DETECTED)
+            target.write_bytes((ROOT / "scripts/docs_router.py").read_bytes())
+
+            # A CRLF-only change (CRLF -> LF, same text) raises.
+            shard = root / "scripts/docs_shards.py"
+            crlf_bytes = shard.read_bytes()
+            lf_bytes = crlf_bytes.replace(b"\r\n", b"\n")
+            self.assertNotEqual(lf_bytes, crlf_bytes)
+            shard.write_bytes(lf_bytes)
+            with self.assertRaises(ch.CohortError) as ctx:
+                ch.verify_leaf_routers_unchanged(root, FROZEN_LEAF_ROUTER_SHA256)
+            self.assertEqual(ctx.exception.problem, ch.CohortProblem.ROUTER_MUTATION_DETECTED)
+            shard.write_bytes(crlf_bytes)
+
+            # A missing file raises.
+            (root / "scripts/docs_shards_core.py").unlink()
+            with self.assertRaises(ch.CohortError) as ctx:
+                ch.verify_leaf_routers_unchanged(root, FROZEN_LEAF_ROUTER_SHA256)
+            self.assertEqual(ctx.exception.problem, ch.CohortProblem.ROUTER_MUTATION_DETECTED)
+
+        # A missing frozen identity for a listed router raises.
+        with self.assertRaises(ch.CohortError) as ctx:
+            ch.verify_leaf_routers_unchanged(ROOT, {})
+        self.assertEqual(ctx.exception.problem, ch.CohortProblem.ROUTER_MUTATION_DETECTED)
+
+        # A malformed expected digest raises.
+        bad = dict(FROZEN_LEAF_ROUTER_SHA256)
+        bad["scripts/docs_router.py"] = "not-a-sha256"
+        with self.assertRaises(ch.CohortError) as ctx:
+            ch.verify_leaf_routers_unchanged(ROOT, bad)
+        self.assertEqual(ctx.exception.problem, ch.CohortProblem.ROUTER_MUTATION_DETECTED)
 
     # WORK_UNIT_CASE: 852/29
     def test_invalid_aggregate_lock_or_invalidation_fails(self):
