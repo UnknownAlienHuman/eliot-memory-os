@@ -2,24 +2,24 @@
 //! Implementation: I2.23, I8.1, I8.3, I8.4, I14.10, I14.15.
 //! Responsibility/Forbidden ownership: bounded Watchdog runtime composition and admitted heartbeat only; no Kernel effect, Host identity, Store canonical state, unbounded restart, default, retry, or mint authority.
 
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use std::time::Duration;
 
 use eliot_runtime::{ChildClass, Runtime, ShutdownOutcome, SupervisionStrategy, TaskFailure};
 
+use crate::admission_gap_reason;
+use crate::kernel_gap_reason;
+use crate::report_gap_nonfatal;
 use crate::CompositionError;
 use crate::HostObservationSource;
 use crate::HostObservationState;
 use crate::KernelWatchdogPort;
 use crate::LiveHostObservationSource;
-use crate::PROTOCOL_VERSION;
-use crate::SERVICE_NAME;
 use crate::WatchdogAdmissionSource;
 use crate::WatchdogConfig;
-use crate::admission_gap_reason;
-use crate::kernel_gap_reason;
-use crate::report_gap_nonfatal;
+use crate::PROTOCOL_VERSION;
+use crate::SERVICE_NAME;
 
 mod authority_state;
 
@@ -161,7 +161,7 @@ impl WatchdogComposition {
                         }
                         match kernel.supervise(admission.lease()).await {
                             Ok(()) => authority_state.publish_admitted(
-                                admission.lease().lease().kernel_epoch.value(),
+                                admission.lease().lease().kernel_epoch.sequence.get(),
                                 admission.watchdog_epoch().value(),
                             ),
                             Err(error) => {

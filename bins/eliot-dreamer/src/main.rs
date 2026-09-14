@@ -41,11 +41,22 @@ fn write_response(output: &mut impl Write, response: &Response) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use eliot_contracts::{AuthorityEpoch, ResourceGeneration, StateFence};
+    use eliot_contracts::{EpochId, EpochLineageId, ResourceGeneration, StateFence};
     use eliot_dreamer::{
         DreamJobInput, JobClass, JobView, KernelJobAdmission, KernelSupervisedComposition,
     };
     use std::collections::VecDeque;
+    use std::num::NonZeroU64;
+
+    const TEST_LINEAGE_A: &str = "550e8400-e29b-41d4-a716-446655440000";
+
+    fn test_epoch(sequence: u64) -> EpochId {
+        EpochId::new(
+            EpochLineageId::new(TEST_LINEAGE_A).expect("valid test lineage"),
+            NonZeroU64::new(sequence).expect("nonzero test sequence"),
+        )
+        .expect("valid test epoch")
+    }
 
     struct ClosedKernel {
         handshake: Result<eliot_dreamer::KernelHandshake, DreamerError>,
@@ -98,7 +109,7 @@ mod tests {
             idempotency_key: "job-1:attempt-1".to_owned(),
             cancellation_id: "cancel-1".to_owned(),
             deadline_unix_ms: u64::MAX,
-            state_fence: StateFence::new(AuthorityEpoch::genesis(), ResourceGeneration::genesis()),
+            state_fence: StateFence::new(test_epoch(1), ResourceGeneration::genesis()),
         }
     }
 
@@ -220,9 +231,7 @@ mod tests {
             Err(eliot_dreamer::KERNEL_ADMISSION_REQUIRED)
         );
         let mut switched = admission;
-        let Ok(switched_epoch) = AuthorityEpoch::new(2) else {
-            return;
-        };
+        let switched_epoch = test_epoch(2);
         switched.state_fence.authority_epoch = switched_epoch;
         assert_eq!(
             service.status(&switched).map_err(|error| error.code()),

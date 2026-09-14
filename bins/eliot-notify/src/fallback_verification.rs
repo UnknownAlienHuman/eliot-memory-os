@@ -23,7 +23,7 @@ use std::path::Path;
 
 use ed25519_dalek::VerifyingKey;
 use eliot_platform::{PlatformHandle, PortError, ProviderError, ProviderErrorCode};
-use eliot_platform_windows::{ProtectedPathLease, protected_program_data_path};
+use eliot_platform_windows::{protected_program_data_path, ProtectedPathLease};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 

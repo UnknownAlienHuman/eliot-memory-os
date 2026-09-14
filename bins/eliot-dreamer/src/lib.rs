@@ -413,7 +413,7 @@ impl<P: KernelJobPort> KernelSupervisedComposition<P> {
 
     fn validate_fence(&self, admission: &KernelJobAdmission) -> Result<(), DreamerError> {
         admission.validate()?;
-        if admission.state_fence.authority_epoch.value() != self.handshake.authority_epoch {
+        if admission.state_fence.authority_epoch.sequence.get() != self.handshake.authority_epoch {
             return Err(DreamerError::KernelAdmissionRequired(
                 "job state fence does not match the authenticated Kernel epoch".to_owned(),
             ));
