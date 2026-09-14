@@ -31,6 +31,7 @@ use serde_json::Value;
 use thiserror::Error;
 
 mod payload_authority;
+mod request_hash;
 mod store_failure;
 mod wire;
 
@@ -38,6 +39,11 @@ pub use payload_authority::{
     CONTROL_FIELD_DENYLIST, CanonicalJson, ExactJsonBytes, MAX_EXACT_JSON_BYTES,
     PAYLOAD_AUTHORITY_VERSION, PayloadEncoding, PayloadSource, json_shape_name,
     number_token_would_narrow, reject_control_parameter_name,
+};
+
+pub use request_hash::{
+    CanonicalRequestView, MAX_DIGEST_DETAIL_CHARS, canonical_request_bytes, canonical_request_hash,
+    verify_canonical_request_hash,
 };
 
 pub use store_failure::{
@@ -2041,6 +2047,13 @@ pub enum StoreError {
     InvalidReceipt,
     #[error("identity conflict")]
     IdentityConflict,
+    #[error("transition digest mismatch: expected {expected}, observed {observed}")]
+    TransitionDigestMismatch {
+        /// Claimed digest, bounded to [`MAX_DIGEST_DETAIL_CHARS`] characters.
+        expected: String,
+        /// Recomputed digest, bounded to [`MAX_DIGEST_DETAIL_CHARS`] characters.
+        observed: String,
+    },
     #[error("receipt not found")]
     ReceiptNotFound,
     #[error("receipt envelope is missing; write outcome is unknown")]
