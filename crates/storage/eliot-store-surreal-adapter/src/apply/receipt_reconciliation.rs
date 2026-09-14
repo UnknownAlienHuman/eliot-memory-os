@@ -215,7 +215,7 @@ mod idempotency_tests {
             .expect("exact triple classifies")
         {
             Idempotency::Replay(replayed) => {
-                assert_eq!(replayed, receipt, "exact retry replays without re-effect")
+                assert_eq!(replayed, receipt, "exact retry replays without re-effect");
             }
             Idempotency::Conflict | Idempotency::None => {
                 panic!("exact triple must replay")
