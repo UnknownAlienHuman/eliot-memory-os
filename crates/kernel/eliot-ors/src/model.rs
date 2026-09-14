@@ -2,7 +2,7 @@ use eliot_contracts::{
     AuthorityEpoch, EpochId, ResourceGeneration, StateFence, canonical_json_bytes,
 };
 use eliot_platform::{PlatformHandle, SecretReference};
-use eliot_receipts::ReceiptEnvelope;
+use eliot_receipts::{ReceiptDisposition, ReceiptEnvelope};
 use eliot_runtime_contracts::{
     GenerationCutoverRecord as RuntimeGenerationCutoverRecord, LeaseState, SignedSupervisionLease,
     SupervisionGenerationBinding, SupervisionLease, SupervisionLeaseActiveStateBinding,
@@ -18,7 +18,8 @@ use sha2::{Digest, Sha256};
 use thiserror::Error;
 
 use crate::reservation_model::ReservationRecord;
-use crate::{CONTRACT_VERSION, MAX_RECOVERY_PAGE};
+use crate::{CONTRACT_VERSION, MAX_INLINE_RECOVERY_BYTES, MAX_RECOVERY_PAGE};
+use std::collections::BTreeMap;
 
 /// A validated opaque label that carries no semantic authority.
 #[derive(Clone, Debug, Eq, JsonSchema, Ord, PartialEq, PartialOrd, Serialize)]
@@ -2228,6 +2229,28 @@ pub enum OrsError {
     },
     #[error("native-worker claim {claim_id} conflicts with durable ORS state: IDENTITY_CONFLICT")]
     NativeWorkerClaimIdentityConflict { claim_id: String },
+    #[error(
+        "worker replay stream {stream_id} request {request_id} conflicts with durable ORS state: IDENTITY_CONFLICT"
+    )]
+    WorkerReplayIdentityConflict {
+        stream_id: String,
+        request_id: String,
+    },
+    #[error(
+        "worker replay stream {stream_id} has no bound claim or a stale generation/epoch/fence"
+    )]
+    WorkerReplayStaleStream { stream_id: String },
+    #[error(
+        "worker replay acknowledgement does not bind its durable event on stream {stream_id} at sequence {sequence}"
+    )]
+    WorkerReplayAckMismatch { stream_id: String, sequence: u64 },
+    #[error(
+        "worker replay suffix on stream {stream_id} is incomplete after sequence {after_sequence}"
+    )]
+    WorkerReplayIncomplete {
+        stream_id: String,
+        after_sequence: u64,
+    },
     #[error("durable ORS storage failed: {0}")]
     Storage(String),
     #[error("durable ORS encoding failed: {0}")]
@@ -3017,4 +3040,610 @@ impl NativeWorkerClaimStageOutcome {
             Self::Stored(record) | Self::Existing(record) => record,
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// T9-03 owner-backed durable replay stream (issue #22, M3).
+//
+// Kernel/ORS owns the stream. The stream id is the exact `(claim id, worker
+// generation)` pair rendered as `"{claim_id}/{generation}"` (two-part shape
+// precedent: the T9-02 fixture `stream-claim-t9-02-1/gen-1`). The sequence is
+// a monotonic `u64` per stream persisted in ORS. The producer cursor advances
+// at DURABLE, the consumer cursor advances at APPLIED or REJECTED, and
+// UNKNOWN never advances a cursor: an unknown outcome stays reconciling under
+// its original identity. Retention holds every event until APPLIED/REJECTED,
+// plus a bounded newest window of [`crate::MAX_REPLAY_PAGE`] terminal events. A new
+// generation may read retained history but never acquires, appends, or
+// acknowledges under a stale binding. Semantic observation ownership stays
+// with its owner: ORS preserves the opaque envelope bytes, the owner receipt
+// disposition, and the mechanical delivery class without interpreting them.
+// The Kernel admission owner validates identity/epoch/fence; ORS compares the
+// presented binding for exact equality against the bound claim record
+// (read-only) and never re-derives authority.
+//
+// Wire revision is the kernel-service (W-B) adapter's business: W-B projects
+// the worker `EpochId`/`StateFence` bindings onto the `u64` epoch sequence
+// and fence digest the claim record already binds, exactly as the existing
+// claim contour does (`authority_epoch` is the epoch sequence, `fence_digest`
+// the opaque fence binding).
+// ---------------------------------------------------------------------------
+
+/// Maximum opaque causal-predecessor references retained on one replay event.
+const MAX_REPLAY_EVENT_REFS: usize = 64;
+/// Maximum trace-context entries retained on one replay event.
+const MAX_REPLAY_TRACE_ENTRIES: usize = 64;
+
+/// Builds the durable replay stream identity for one claim generation.
+///
+/// The stream id is `"{claim_id}/{generation}"` with a nonzero generation.
+/// The claim identity is already validated by construction; only the
+/// generation bound is checked here.
+pub fn replay_stream_id(claim_id: &OperationIdentity, generation: u64) -> Result<String, OrsError> {
+    if generation == 0 {
+        return Err(OrsError::InvalidField {
+            field: "worker_replay_generation",
+            reason: "generation must be greater than zero",
+        });
+    }
+    Ok(format!("{}/{}", claim_id.as_str(), generation))
+}
+
+/// Splits a replay stream identity back into its claim and generation halves.
+///
+/// The split is at the last `/` so a claim identity containing `/` still
+/// round-trips through [`replay_stream_id`]. The generation half must be a
+/// nonzero integer; owner-shaped strings with a non-numeric generation half
+/// are rejected as malformed (fail closed) and must be mapped through
+/// [`replay_stream_id`] by the kernel-service adapter before reaching ORS.
+pub fn parse_replay_stream_id(stream_id: &str) -> Result<(OperationIdentity, u64), OrsError> {
+    let (claim_part, generation_part) =
+        stream_id.rsplit_once('/').ok_or(OrsError::InvalidField {
+            field: "worker_replay_stream_id",
+            reason: "stream identity must be \"{claim_id}/{generation}\"",
+        })?;
+    let claim_id = OperationIdentity::new(claim_part).map_err(|_| OrsError::InvalidField {
+        field: "worker_replay_stream_id",
+        reason: "stream claim identity must be non-blank",
+    })?;
+    let generation: u64 = generation_part
+        .parse()
+        .map_err(|_| OrsError::InvalidField {
+            field: "worker_replay_stream_id",
+            reason: "stream generation must be a nonzero integer",
+        })?;
+    if generation == 0 {
+        return Err(OrsError::InvalidField {
+            field: "worker_replay_stream_id",
+            reason: "stream generation must be a nonzero integer",
+        });
+    }
+    Ok((claim_id, generation))
+}
+
+/// Explicit cursor phase for one replay acknowledgement.
+///
+/// Mirrors the worker acknowledgement phases mechanically: ORS routes cursors
+/// from this value and never lets transport receipt impersonate application
+/// outcome.
+#[derive(Clone, Copy, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum WorkerReplayPhase {
+    Received,
+    Durable,
+    Normalized,
+    Applied,
+    Rejected,
+    Unknown,
+}
+
+impl WorkerReplayPhase {
+    /// M3 producer rule: only a DURABLE acknowledgement advances the producer
+    /// cursor.
+    pub const fn advances_producer_cursor(self) -> bool {
+        matches!(self, Self::Durable)
+    }
+
+    /// M3 consumer rule: only APPLIED or REJECTED advances the consumer
+    /// cursor. UNKNOWN (and the non-terminal phases) never advance a cursor.
+    pub const fn advances_consumer_cursor(self) -> bool {
+        matches!(self, Self::Applied | Self::Rejected)
+    }
+}
+
+/// Mechanical delivery class preserved opaquely on one replay event.
+///
+/// This is delivery mechanics only: ORS never interprets payload meaning from
+/// it, and semantic observation ownership stays with its owner.
+#[derive(Clone, Copy, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum WorkerReplayDeliveryClass {
+    DurableControl,
+    DurableObservation,
+    BestEffortTelemetry,
+}
+
+/// Acquisition request for one durable replay request identity.
+///
+/// Lookup with this identity acquires nothing; begin atomically acquires or
+/// reports the durable conflict. The numeric binding travels with the request
+/// so the store can reject a stale generation/epoch/fence against the bound
+/// claim without trusting the caller.
+#[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WorkerReplayBegin {
+    pub stream_id: String,
+    pub request_id: String,
+    pub fingerprint: String,
+    pub producer_generation: u64,
+    pub authority_epoch: u64,
+    pub fence_digest: String,
+}
+
+impl WorkerReplayBegin {
+    pub(crate) fn validate(&self) -> Result<(), OrsError> {
+        parse_replay_stream_id(&self.stream_id)?;
+        validate_text(&self.request_id, "worker_replay_request_id")?;
+        validate_text(&self.fingerprint, "worker_replay_fingerprint")?;
+        if self.producer_generation == 0 || self.authority_epoch == 0 {
+            return Err(OrsError::InvalidField {
+                field: "worker_replay_epoch",
+                reason: "generation and epoch must be greater than zero",
+            });
+        }
+        validate_digest(&self.fence_digest, "worker_replay_fence_digest")?;
+        Ok(())
+    }
+}
+
+/// Exact event content handed to the durable replay owner.
+///
+/// Every identity is opaque to ORS: the producer, request, payload label, and
+/// payload bytes are preserved exactly for replay comparison and never
+/// interpreted. The owner receipt disposition is preserved opaquely; the
+/// Kernel admission owner validates it and ORS never re-derives control
+/// meaning from it.
+#[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WorkerReplayDraft {
+    pub stream_id: String,
+    pub producer_id: String,
+    pub producer_generation: u64,
+    pub authority_epoch: u64,
+    pub fence_digest: String,
+    pub request_id: String,
+    pub causal_predecessor_refs: Vec<String>,
+    pub delivery_class: WorkerReplayDeliveryClass,
+    pub ack_required: bool,
+    pub payload_type: String,
+    pub payload: String,
+    pub disposition: ReceiptDisposition,
+    pub trace_context: BTreeMap<String, String>,
+}
+
+impl WorkerReplayDraft {
+    pub(crate) fn validate(&self) -> Result<(), OrsError> {
+        parse_replay_stream_id(&self.stream_id)?;
+        validate_text(&self.producer_id, "worker_replay_producer_id")?;
+        validate_text(&self.request_id, "worker_replay_request_id")?;
+        if self.producer_generation == 0 || self.authority_epoch == 0 {
+            return Err(OrsError::InvalidField {
+                field: "worker_replay_epoch",
+                reason: "generation and epoch must be greater than zero",
+            });
+        }
+        validate_digest(&self.fence_digest, "worker_replay_fence_digest")?;
+        validate_text(&self.payload_type, "worker_replay_payload_type")?;
+        let payload_len =
+            u64::try_from(self.payload.len()).map_err(|_| OrsError::PayloadTooLarge)?;
+        if payload_len > MAX_INLINE_RECOVERY_BYTES {
+            return Err(OrsError::PayloadTooLarge);
+        }
+        if self.causal_predecessor_refs.len() > MAX_REPLAY_EVENT_REFS {
+            return Err(OrsError::InvalidField {
+                field: "worker_replay_causal_predecessor_refs",
+                reason: "causal predecessor references exceed the retained bound",
+            });
+        }
+        for reference in &self.causal_predecessor_refs {
+            validate_text(reference, "worker_replay_causal_predecessor_ref")?;
+        }
+        if self.trace_context.len() > MAX_REPLAY_TRACE_ENTRIES {
+            return Err(OrsError::InvalidField {
+                field: "worker_replay_trace_context",
+                reason: "trace context exceeds the retained bound",
+            });
+        }
+        for (key, value) in &self.trace_context {
+            validate_text(key, "worker_replay_trace_key")?;
+            validate_text(value, "worker_replay_trace_value")?;
+        }
+        Ok(())
+    }
+
+    /// Canonical digest over the exact draft binding used for append
+    /// idempotency: an identical draft replays the same durable identity and
+    /// sequence instead of duplicating the event.
+    pub(crate) fn draft_digest(&self) -> Result<String, OrsError> {
+        let canonical = serde_json::json!({
+            "ack_required": self.ack_required,
+            "authority_epoch": self.authority_epoch,
+            "causal_predecessor_refs": self.causal_predecessor_refs,
+            "delivery_class": self.delivery_class,
+            "disposition": self.disposition,
+            "fence_digest": self.fence_digest,
+            "payload": self.payload,
+            "payload_type": self.payload_type,
+            "producer_generation": self.producer_generation,
+            "producer_id": self.producer_id,
+            "request_id": self.request_id,
+            "stream_id": self.stream_id,
+            "trace_context": self.trace_context,
+        });
+        let bytes = canonical_json_bytes(&canonical)
+            .map_err(|error| OrsError::Encoding(error.to_string()))?;
+        Ok(sha256_hex(&bytes))
+    }
+}
+
+/// Durable replay event envelope returned by the replay owner.
+///
+/// The `event_id` and `sequence` are assigned atomically by ORS on append:
+/// the sequence is monotonic per stream starting at 1, and the identity is
+/// stable across close/reopen. The `fingerprint` is the request fingerprint
+/// bound at acquisition, copied here for locality.
+#[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WorkerReplayEvent {
+    pub contract_version: u16,
+    pub stream_id: String,
+    pub event_id: String,
+    pub sequence: u64,
+    pub request_id: String,
+    pub fingerprint: String,
+    pub producer_id: String,
+    pub producer_generation: u64,
+    pub authority_epoch: u64,
+    pub fence_digest: String,
+    pub causal_predecessor_refs: Vec<String>,
+    pub delivery_class: WorkerReplayDeliveryClass,
+    pub ack_required: bool,
+    pub payload_type: String,
+    pub payload: String,
+    pub disposition: ReceiptDisposition,
+    pub trace_context: BTreeMap<String, String>,
+    pub draft_digest: String,
+    pub durable_at_unix_ms: u64,
+}
+
+impl WorkerReplayEvent {
+    /// Returns the durable key binding one stream to one exact sequence.
+    /// The separator is a control character that validated identities can
+    /// never contain, so composite keys cannot collide.
+    pub fn record_key(&self) -> String {
+        Self::key_for(&self.stream_id, self.sequence)
+    }
+
+    pub(crate) fn key_for(stream_id: &str, sequence: u64) -> String {
+        format!("{stream_id}\u{1f}{sequence:020}")
+    }
+
+    pub(crate) fn key_prefix_for(stream_id: &str) -> String {
+        format!("{stream_id}\u{1f}")
+    }
+
+    /// Validates identity shape and stream/binding coherence.
+    pub fn validate(&self) -> Result<(), OrsError> {
+        if self.contract_version != CONTRACT_VERSION {
+            return Err(OrsError::UnsupportedContractVersion(self.contract_version));
+        }
+        let (_, stream_generation) = parse_replay_stream_id(&self.stream_id)?;
+        validate_text(&self.event_id, "worker_replay_event_id")?;
+        validate_text(&self.request_id, "worker_replay_request_id")?;
+        validate_text(&self.fingerprint, "worker_replay_fingerprint")?;
+        validate_text(&self.producer_id, "worker_replay_producer_id")?;
+        validate_text(&self.payload_type, "worker_replay_payload_type")?;
+        if self.sequence == 0 {
+            return Err(OrsError::InvalidField {
+                field: "worker_replay_sequence",
+                reason: "sequence must be greater than zero",
+            });
+        }
+        if self.producer_generation == 0 || self.authority_epoch == 0 {
+            return Err(OrsError::InvalidField {
+                field: "worker_replay_epoch",
+                reason: "generation and epoch must be greater than zero",
+            });
+        }
+        if stream_generation != self.producer_generation {
+            return Err(OrsError::InvalidField {
+                field: "worker_replay_generation",
+                reason: "stream generation and producer generation must agree",
+            });
+        }
+        validate_digest(&self.fence_digest, "worker_replay_fence_digest")?;
+        validate_digest(&self.draft_digest, "worker_replay_draft_digest")?;
+        let payload_len =
+            u64::try_from(self.payload.len()).map_err(|_| OrsError::PayloadTooLarge)?;
+        if payload_len > MAX_INLINE_RECOVERY_BYTES {
+            return Err(OrsError::PayloadTooLarge);
+        }
+        if self.causal_predecessor_refs.len() > MAX_REPLAY_EVENT_REFS {
+            return Err(OrsError::InvalidField {
+                field: "worker_replay_causal_predecessor_refs",
+                reason: "causal predecessor references exceed the retained bound",
+            });
+        }
+        for reference in &self.causal_predecessor_refs {
+            validate_text(reference, "worker_replay_causal_predecessor_ref")?;
+        }
+        if self.trace_context.len() > MAX_REPLAY_TRACE_ENTRIES {
+            return Err(OrsError::InvalidField {
+                field: "worker_replay_trace_context",
+                reason: "trace context exceeds the retained bound",
+            });
+        }
+        for (key, value) in &self.trace_context {
+            validate_text(key, "worker_replay_trace_key")?;
+            validate_text(value, "worker_replay_trace_value")?;
+        }
+        if self.durable_at_unix_ms == 0 {
+            return Err(OrsError::InvalidField {
+                field: "worker_replay_durable_at",
+                reason: "durability time must be greater than zero",
+            });
+        }
+        Ok(())
+    }
+}
+
+/// Durable per-stream replay head: cursors plus the next sequence.
+///
+/// The producer cursor is the newest DURABLE sequence, the consumer cursor
+/// the newest APPLIED-or-REJECTED sequence, and `next_sequence` the sequence
+/// the next append assigns. All three survive close/reopen in redb.
+#[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WorkerReplayStreamRecord {
+    pub contract_version: u16,
+    pub stream_id: String,
+    pub claim_id: OperationIdentity,
+    pub worker_generation: u64,
+    pub producer_cursor: u64,
+    pub consumer_cursor: u64,
+    pub next_sequence: u64,
+}
+
+impl WorkerReplayStreamRecord {
+    /// Validates identity shape and cursor/sequence coherence.
+    pub fn validate(&self) -> Result<(), OrsError> {
+        if self.contract_version != CONTRACT_VERSION {
+            return Err(OrsError::UnsupportedContractVersion(self.contract_version));
+        }
+        let (claim_id, stream_generation) = parse_replay_stream_id(&self.stream_id)?;
+        if claim_id != self.claim_id || stream_generation != self.worker_generation {
+            return Err(OrsError::InvalidField {
+                field: "worker_replay_stream_binding",
+                reason: "stream identity must bind its claim and generation",
+            });
+        }
+        if self.worker_generation == 0 {
+            return Err(OrsError::InvalidField {
+                field: "worker_replay_generation",
+                reason: "generation must be greater than zero",
+            });
+        }
+        if self.next_sequence == 0 {
+            return Err(OrsError::InvalidField {
+                field: "worker_replay_next_sequence",
+                reason: "next sequence must be greater than zero",
+            });
+        }
+        if self.producer_cursor >= self.next_sequence || self.consumer_cursor >= self.next_sequence
+        {
+            return Err(OrsError::InvalidField {
+                field: "worker_replay_cursor",
+                reason: "cursors must stay below the next sequence",
+            });
+        }
+        Ok(())
+    }
+}
+
+/// Durable acquisition of one `(stream, request)` identity.
+///
+/// The first writer wins: the fingerprint bound here rejects every later
+/// changed binding under the same identity without overwriting.
+#[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WorkerReplayRequestRecord {
+    pub stream_id: String,
+    pub request_id: String,
+    pub fingerprint: String,
+    pub producer_generation: u64,
+    pub authority_epoch: u64,
+    pub fence_digest: String,
+    pub acquired_at_unix_ms: u64,
+}
+
+impl WorkerReplayRequestRecord {
+    /// Returns the durable key binding one stream to one exact request.
+    pub fn record_key(&self) -> String {
+        Self::key_for(&self.stream_id, &self.request_id)
+    }
+
+    pub(crate) fn key_for(stream_id: &str, request_id: &str) -> String {
+        format!("{stream_id}\u{1f}{request_id}")
+    }
+
+    /// Validates identity shape and binding coherence.
+    pub fn validate(&self) -> Result<(), OrsError> {
+        let (_, stream_generation) = parse_replay_stream_id(&self.stream_id)?;
+        validate_text(&self.request_id, "worker_replay_request_id")?;
+        validate_text(&self.fingerprint, "worker_replay_fingerprint")?;
+        if self.producer_generation == 0 || self.authority_epoch == 0 {
+            return Err(OrsError::InvalidField {
+                field: "worker_replay_epoch",
+                reason: "generation and epoch must be greater than zero",
+            });
+        }
+        if stream_generation != self.producer_generation {
+            return Err(OrsError::InvalidField {
+                field: "worker_replay_generation",
+                reason: "stream generation and producer generation must agree",
+            });
+        }
+        validate_digest(&self.fence_digest, "worker_replay_fence_digest")?;
+        if self.acquired_at_unix_ms == 0 {
+            return Err(OrsError::InvalidField {
+                field: "worker_replay_acquired_at",
+                reason: "acquisition time must be greater than zero",
+            });
+        }
+        Ok(())
+    }
+}
+
+/// Acknowledgement of one durable replay event.
+///
+/// Every field must bind the stored event exactly: a foreign acknowledgement
+/// (wrong stream, event, generation, epoch, or fence) is rejected and never
+/// moves a cursor.
+#[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WorkerReplayAck {
+    pub stream_id: String,
+    pub event_id: String,
+    pub sequence: u64,
+    pub producer_generation: u64,
+    pub authority_epoch: u64,
+    pub fence_digest: String,
+    pub phase: WorkerReplayPhase,
+}
+
+impl WorkerReplayAck {
+    pub(crate) fn validate(&self) -> Result<(), OrsError> {
+        let (_, stream_generation) = parse_replay_stream_id(&self.stream_id)?;
+        validate_text(&self.event_id, "worker_replay_event_id")?;
+        if self.sequence == 0 {
+            return Err(OrsError::InvalidField {
+                field: "worker_replay_sequence",
+                reason: "sequence must be greater than zero",
+            });
+        }
+        if self.producer_generation == 0 || self.authority_epoch == 0 {
+            return Err(OrsError::InvalidField {
+                field: "worker_replay_epoch",
+                reason: "generation and epoch must be greater than zero",
+            });
+        }
+        if stream_generation != self.producer_generation {
+            return Err(OrsError::InvalidField {
+                field: "worker_replay_generation",
+                reason: "stream generation and producer generation must agree",
+            });
+        }
+        validate_digest(&self.fence_digest, "worker_replay_fence_digest")?;
+        Ok(())
+    }
+}
+
+/// Durable per-event acknowledgement fact.
+///
+/// One record per acknowledged `(stream, sequence)`, keyed exactly like its
+/// event. Later phases overwrite the retained phase (DURABLE then APPLIED is
+/// the normal lifecycle across two acknowledgements); cursors only move
+/// forward under the phase rule, so reordering never regresses them.
+#[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WorkerReplayAckRecord {
+    pub stream_id: String,
+    pub event_id: String,
+    pub sequence: u64,
+    pub phase: WorkerReplayPhase,
+    pub acknowledged_at_unix_ms: u64,
+}
+
+impl WorkerReplayAckRecord {
+    /// Returns the durable key binding one acknowledgement to its event.
+    pub fn record_key(&self) -> String {
+        WorkerReplayEvent::key_for(&self.stream_id, self.sequence)
+    }
+
+    /// Validates identity shape.
+    pub fn validate(&self) -> Result<(), OrsError> {
+        parse_replay_stream_id(&self.stream_id)?;
+        validate_text(&self.event_id, "worker_replay_event_id")?;
+        if self.sequence == 0 {
+            return Err(OrsError::InvalidField {
+                field: "worker_replay_sequence",
+                reason: "sequence must be greater than zero",
+            });
+        }
+        if self.acknowledged_at_unix_ms == 0 {
+            return Err(OrsError::InvalidField {
+                field: "worker_replay_acknowledged_at",
+                reason: "acknowledgement time must be greater than zero",
+            });
+        }
+        Ok(())
+    }
+}
+
+/// Result of a replay-request lookup or atomic acquisition.
+///
+/// `New` carries no durable state: lookup acquired nothing and begin durably
+/// acquired for the first time. `Replay` carries the request's retained
+/// events in sequence order, so a retained acquisition after a crash is never
+/// mistaken for a fresh request. `Conflict` reports a changed fingerprint
+/// under a retained identity without overwriting it.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum WorkerReplayRequestDecision {
+    New,
+    Replay(Vec<WorkerReplayEvent>),
+    Conflict,
+}
+
+/// Durable per-stream cursor projection returned by acknowledgement.
+#[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WorkerReplayCursors {
+    pub stream_id: String,
+    pub producer_cursor: u64,
+    pub consumer_cursor: u64,
+}
+
+/// Requires the presented stream binding to equal the bound claim.
+///
+/// The stream suffix, the presented generation, the claim's bound generation,
+/// the presented epoch, the claim's bound epoch, and the fence binding must
+/// all agree exactly. Reads never call this; every mutating replay path does,
+/// against the existing claim record, read-only. A missing claim, a rotated
+/// generation, or a disagreeing epoch/fence fails closed: the caller never
+/// executes under a stale epoch.
+pub(crate) fn require_replay_claim_binding(
+    stream_id: &str,
+    producer_generation: u64,
+    authority_epoch: u64,
+    fence_digest: &str,
+    claim: &NativeWorkerClaimRecord,
+) -> Result<(), OrsError> {
+    let (claim_id, stream_generation) = parse_replay_stream_id(stream_id)?;
+    if claim.claim_id != claim_id
+        || stream_generation != producer_generation
+        || producer_generation != claim.worker_generation
+        || authority_epoch != claim.authority_epoch
+        || fence_digest != claim.fence_digest
+    {
+        return Err(OrsError::WorkerReplayStaleStream {
+            stream_id: stream_id.to_owned(),
+        });
+    }
+    Ok(())
+}
+
+/// Returns true when an acknowledgement phase makes an event eligible for
+/// retention pruning. Only APPLIED or REJECTED events prune; UNKNOWN stays
+/// reconciling under its original identity.
+pub(crate) const fn is_replay_terminal_phase(phase: WorkerReplayPhase) -> bool {
+    phase.advances_consumer_cursor()
 }

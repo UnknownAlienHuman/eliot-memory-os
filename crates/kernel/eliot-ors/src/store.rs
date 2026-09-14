@@ -49,8 +49,11 @@ use crate::{
     SupervisionLeaseRecord, SupervisionLeaseSnapshot, SupervisionLeaseStageReceipt,
     SupervisionLeaseStageResolution, SupervisionLeaseStageResolutionDisposition,
     SupervisionLeaseTicketReconciliation, UserBrokerFence, UserBrokerRegistration,
-    UserBrokerRegistrationReceipt, WriterReservationToken, signed_supervision_lease_from_verified,
-    signed_terminal_supervision_lease_from_verified,
+    UserBrokerRegistrationReceipt, WorkerReplayAck, WorkerReplayAckRecord, WorkerReplayBegin,
+    WorkerReplayCursors, WorkerReplayDraft, WorkerReplayEvent, WorkerReplayRequestDecision,
+    WorkerReplayRequestRecord, WorkerReplayStreamRecord, WriterReservationToken,
+    is_replay_terminal_phase, parse_replay_stream_id, require_replay_claim_binding,
+    signed_supervision_lease_from_verified, signed_terminal_supervision_lease_from_verified,
 };
 
 const META: TableDefinition<&str, &str> = TableDefinition::new("ors_meta_v1");
@@ -91,6 +94,10 @@ const STORE_FAILURE_RETENTION: TableDefinition<&str, &str> =
 const HOST_REQUESTS: TableDefinition<&str, &str> = TableDefinition::new("ors_host_requests_v1");
 const NATIVE_WORKER_CLAIMS: TableDefinition<&str, &str> =
     TableDefinition::new("ors_native_worker_claims_v1");
+const REPLAY_STREAMS: TableDefinition<&str, &str> = TableDefinition::new("ors_replay_streams_v1");
+const REPLAY_REQUESTS: TableDefinition<&str, &str> = TableDefinition::new("ors_replay_requests_v1");
+const REPLAY_EVENTS: TableDefinition<&str, &str> = TableDefinition::new("ors_replay_events_v1");
+const REPLAY_ACKS: TableDefinition<&str, &str> = TableDefinition::new("ors_replay_acks_v1");
 const NEXT_GLOBAL_ORDER: &str = "next_global_order";
 const SUPERVISION_STAGE_RESOLUTION_SCHEMA_KEY: &str = "supervision_stage_resolution_schema";
 const SUPERVISION_STAGE_RESOLUTION_SCHEMA_V1: &str = "eliot.ors.supervision-stage-resolution.v1";
@@ -386,6 +393,78 @@ pub trait OperationalRecoveryStore: Send + Sync {
         &self,
         claim_id: &crate::OperationIdentity,
     ) -> Result<Option<crate::NativeWorkerClaimRecord>, OrsError>;
+    /// Looks up one durable replay request without acquiring anything.
+    ///
+    /// An unknown identity returns [`WorkerReplayRequestDecision::New`]; a
+    /// retained identity with the same fingerprint returns
+    /// [`WorkerReplayRequestDecision::Replay`] with the request's retained
+    /// events in sequence order; a retained identity with a changed
+    /// fingerprint returns [`WorkerReplayRequestDecision::Conflict`]. No
+    /// claim binding is required: reads never execute.
+    fn lookup_replay_request(
+        &self,
+        stream_id: &str,
+        request_id: &str,
+        fingerprint: &str,
+    ) -> Result<WorkerReplayRequestDecision, OrsError>;
+    /// Atomically acquires one durable replay request or reports its durable
+    /// outcome.
+    ///
+    /// The first writer wins in one write transaction: an unknown identity is
+    /// durably acquired and returns [`WorkerReplayRequestDecision::New`]; a
+    /// retained acquisition returns `Replay` or `Conflict` exactly as
+    /// [`OperationalRecoveryStore::lookup_replay_request`] does, so a
+    /// retained acquisition is never a fresh request after a crash. The
+    /// presented generation/epoch/fence must equal the bound claim record
+    /// (read-only); a missing claim or a stale binding fails with
+    /// [`OrsError::WorkerReplayStaleStream`] and acquires nothing.
+    fn begin_replay_request(
+        &self,
+        begin: &WorkerReplayBegin,
+    ) -> Result<WorkerReplayRequestDecision, OrsError>;
+    /// Persists one replay draft under its exact stream with a durable
+    /// identity and sequence.
+    ///
+    /// An identical draft under the same `(stream, request)` replays the same
+    /// `event_id` and sequence instead of duplicating the event. A draft for
+    /// a request that was never acquired fails with
+    /// [`OrsError::ReservationNotFound`]; a stale binding fails with
+    /// [`OrsError::WorkerReplayStaleStream`].
+    fn append_replay_event(&self, draft: &WorkerReplayDraft)
+    -> Result<WorkerReplayEvent, OrsError>;
+    /// Returns the retained suffix strictly after `after_sequence` in
+    /// sequence order, preserving gaps.
+    ///
+    /// A suffix longer than [`crate::MAX_REPLAY_PAGE`] fails with
+    /// [`OrsError::ProjectionLimitExceeded`] instead of truncating silently;
+    /// a prefix gap from retention pruning (events at or before
+    /// `after_sequence` are gone) fails with
+    /// [`OrsError::WorkerReplayIncomplete`] instead of returning an empty
+    /// success on incomplete storage.
+    fn replay_stream(
+        &self,
+        stream_id: &str,
+        after_sequence: u64,
+    ) -> Result<Vec<WorkerReplayEvent>, OrsError>;
+    /// Verifies one acknowledgement against its exact durable event,
+    /// persists the disposition, and advances only the cursor its phase
+    /// allows (DURABLE advances the producer cursor, APPLIED or REJECTED the
+    /// consumer cursor, UNKNOWN none).
+    ///
+    /// A foreign acknowledgement fails with
+    /// [`OrsError::WorkerReplayAckMismatch`]; a stale binding fails with
+    /// [`OrsError::WorkerReplayStaleStream`].
+    fn acknowledge_replay_event(
+        &self,
+        ack: &WorkerReplayAck,
+    ) -> Result<WorkerReplayCursors, OrsError>;
+    /// Prunes the longest APPLIED-or-REJECTED event prefix of one stream,
+    /// retaining the newest [`crate::MAX_REPLAY_PAGE`] terminal events.
+    ///
+    /// Returns the number of events removed. Pruning is retention
+    /// maintenance, not execution: it requires no claim binding and never
+    /// touches UNKNOWN (still reconciling) events.
+    fn prune_replay_stream(&self, stream_id: &str) -> Result<u64, OrsError>;
 }
 
 /// redb-backed ORS implementation. Every mutating method commits one short transaction.
@@ -424,6 +503,38 @@ impl persistence_codec::PersistedValue for HostRequestRecord {
 
 impl persistence_codec::PersistedValue for NativeWorkerClaimRecord {
     const RECORD_TYPE: &'static str = "native_worker_claim";
+
+    fn validate_persisted(&self) -> Result<(), OrsError> {
+        self.validate()
+    }
+}
+
+impl persistence_codec::PersistedValue for crate::WorkerReplayEvent {
+    const RECORD_TYPE: &'static str = "worker_replay_event";
+
+    fn validate_persisted(&self) -> Result<(), OrsError> {
+        self.validate()
+    }
+}
+
+impl persistence_codec::PersistedValue for crate::WorkerReplayStreamRecord {
+    const RECORD_TYPE: &'static str = "worker_replay_stream";
+
+    fn validate_persisted(&self) -> Result<(), OrsError> {
+        self.validate()
+    }
+}
+
+impl persistence_codec::PersistedValue for crate::WorkerReplayRequestRecord {
+    const RECORD_TYPE: &'static str = "worker_replay_request";
+
+    fn validate_persisted(&self) -> Result<(), OrsError> {
+        self.validate()
+    }
+}
+
+impl persistence_codec::PersistedValue for crate::WorkerReplayAckRecord {
+    const RECORD_TYPE: &'static str = "worker_replay_ack";
 
     fn validate_persisted(&self) -> Result<(), OrsError> {
         self.validate()
@@ -1373,6 +1484,511 @@ impl RedbRecoveryStore {
         }
         write.commit().map_err(storage)?;
         Ok(Some(next))
+    }
+
+    /// Reads the retained events of one stream, optionally scoped to one
+    /// request, in sequence order.
+    fn replay_events_in(
+        table: &impl ReadableTable<&'static str, &'static str>,
+        stream_id: &str,
+        request_id: Option<&str>,
+    ) -> Result<Vec<WorkerReplayEvent>, OrsError> {
+        let prefix = WorkerReplayEvent::key_prefix_for(stream_id);
+        let mut events = Vec::new();
+        for row in table.iter().map_err(storage)? {
+            let (key, value) = row.map_err(storage)?;
+            if !key.value().starts_with(prefix.as_str()) {
+                continue;
+            }
+            let event: WorkerReplayEvent = decode(value.value())?;
+            if event.stream_id != stream_id {
+                return Err(OrsError::IntegrityProblem {
+                    record_type: "worker_replay_event",
+                    reason: "event stream does not match its key".to_owned(),
+                });
+            }
+            if request_id.is_some_and(|request| event.request_id != request) {
+                continue;
+            }
+            events.push(event);
+        }
+        events.sort_by_key(|event| event.sequence);
+        Ok(events)
+    }
+
+    /// Loads one native-worker claim inside a write transaction without
+    /// mutating it. The replay journal only ever reads the claim table: the
+    /// claim contour stays the single writer of claim state.
+    fn load_claim_in(
+        write: &redb::WriteTransaction,
+        claim_id: &crate::OperationIdentity,
+    ) -> Result<Option<crate::NativeWorkerClaimRecord>, OrsError> {
+        let table = write.open_table(NATIVE_WORKER_CLAIMS).map_err(storage)?;
+        table
+            .get(claim_id.as_str())
+            .map_err(storage)?
+            .map(|value| {
+                let record: crate::NativeWorkerClaimRecord = decode(value.value())?;
+                record.validate()?;
+                if record.claim_id != *claim_id {
+                    return Err(OrsError::IntegrityProblem {
+                        record_type: "native_worker_claim",
+                        reason: "claim record identity does not match its key".to_owned(),
+                    });
+                }
+                Ok(record)
+            })
+            .transpose()
+    }
+
+    /// Loads one replay stream head inside a write transaction.
+    fn load_stream_head_in(
+        write: &redb::WriteTransaction,
+        stream_id: &str,
+    ) -> Result<Option<WorkerReplayStreamRecord>, OrsError> {
+        let table = write.open_table(REPLAY_STREAMS).map_err(storage)?;
+        table
+            .get(stream_id)
+            .map_err(storage)?
+            .map(|value| {
+                let head: WorkerReplayStreamRecord = decode(value.value())?;
+                head.validate()?;
+                if head.stream_id != stream_id {
+                    return Err(OrsError::IntegrityProblem {
+                        record_type: "worker_replay_stream",
+                        reason: "stream head identity does not match its key".to_owned(),
+                    });
+                }
+                Ok(head)
+            })
+            .transpose()
+    }
+
+    /// Looks up one durable replay request without acquiring anything.
+    ///
+    /// Read-only: an unknown identity returns
+    /// [`WorkerReplayRequestDecision::New`] and persists nothing, so a lookup
+    /// can never manufacture an acquisition.
+    pub fn lookup_replay_request(
+        &self,
+        stream_id: &str,
+        request_id: &str,
+        fingerprint: &str,
+    ) -> Result<WorkerReplayRequestDecision, OrsError> {
+        parse_replay_stream_id(stream_id)?;
+        crate::model::validate_text(request_id, "worker_replay_request_id")?;
+        crate::model::validate_text(fingerprint, "worker_replay_fingerprint")?;
+        let read = self.database.begin_read().map_err(storage)?;
+        let key = WorkerReplayRequestRecord::key_for(stream_id, request_id);
+        let stored: Option<WorkerReplayRequestRecord> = {
+            let table = read.open_table(REPLAY_REQUESTS).map_err(storage)?;
+            table
+                .get(key.as_str())
+                .map_err(storage)?
+                .map(|value| decode(value.value()))
+                .transpose()?
+        };
+        let Some(stored) = stored else {
+            return Ok(WorkerReplayRequestDecision::New);
+        };
+        if stored.stream_id != stream_id || stored.request_id != request_id {
+            return Err(OrsError::IntegrityProblem {
+                record_type: "worker_replay_request",
+                reason: "request record identity does not match its key".to_owned(),
+            });
+        }
+        if stored.fingerprint != fingerprint {
+            return Ok(WorkerReplayRequestDecision::Conflict);
+        }
+        let events = {
+            let table = read.open_table(REPLAY_EVENTS).map_err(storage)?;
+            Self::replay_events_in(&table, stream_id, Some(request_id))?
+        };
+        Ok(WorkerReplayRequestDecision::Replay(events))
+    }
+
+    /// Atomically acquires one durable replay request or reports its durable
+    /// outcome.
+    ///
+    /// Persist-before-ack: the claim gate runs first against the existing
+    /// claim record (read-only); a missing claim or a stale
+    /// generation/epoch/fence fails closed and acquires nothing. The stream
+    /// head and the request record are then created in the same write
+    /// transaction, so concurrent acquirers serialize on first-writer-wins
+    /// and a retained acquisition is never a fresh request after a crash.
+    /// This table never writes the claim table: one writer per state.
+    pub fn begin_replay_request(
+        &self,
+        begin: &WorkerReplayBegin,
+    ) -> Result<WorkerReplayRequestDecision, OrsError> {
+        begin.validate()?;
+        let (claim_id, _) = parse_replay_stream_id(&begin.stream_id)?;
+        let write = self.database.begin_write().map_err(storage)?;
+        let Some(claim) = Self::load_claim_in(&write, &claim_id)? else {
+            return Err(OrsError::WorkerReplayStaleStream {
+                stream_id: begin.stream_id.clone(),
+            });
+        };
+        require_replay_claim_binding(
+            &begin.stream_id,
+            begin.producer_generation,
+            begin.authority_epoch,
+            &begin.fence_digest,
+            &claim,
+        )?;
+        let key = WorkerReplayRequestRecord::key_for(&begin.stream_id, &begin.request_id);
+        let stored: Option<WorkerReplayRequestRecord> = {
+            let table = write.open_table(REPLAY_REQUESTS).map_err(storage)?;
+            table
+                .get(key.as_str())
+                .map_err(storage)?
+                .map(|value| decode(value.value()))
+                .transpose()?
+        };
+        if let Some(stored) = stored {
+            if stored.stream_id != begin.stream_id || stored.request_id != begin.request_id {
+                return Err(OrsError::IntegrityProblem {
+                    record_type: "worker_replay_request",
+                    reason: "request record identity does not match its key".to_owned(),
+                });
+            }
+            if stored.fingerprint != begin.fingerprint {
+                return Ok(WorkerReplayRequestDecision::Conflict);
+            }
+            let events = {
+                let table = write.open_table(REPLAY_EVENTS).map_err(storage)?;
+                Self::replay_events_in(&table, &begin.stream_id, Some(begin.request_id.as_str()))?
+            };
+            return Ok(WorkerReplayRequestDecision::Replay(events));
+        }
+        if Self::load_stream_head_in(&write, &begin.stream_id)?.is_none() {
+            let (head_claim_id, head_generation) = parse_replay_stream_id(&begin.stream_id)?;
+            let head = WorkerReplayStreamRecord {
+                contract_version: crate::CONTRACT_VERSION,
+                stream_id: begin.stream_id.clone(),
+                claim_id: head_claim_id,
+                worker_generation: head_generation,
+                producer_cursor: 0,
+                consumer_cursor: 0,
+                next_sequence: 1,
+            };
+            head.validate()?;
+            let mut streams = write.open_table(REPLAY_STREAMS).map_err(storage)?;
+            streams
+                .insert(begin.stream_id.as_str(), encode(&head)?.as_str())
+                .map_err(storage)?;
+        }
+        let record = WorkerReplayRequestRecord {
+            stream_id: begin.stream_id.clone(),
+            request_id: begin.request_id.clone(),
+            fingerprint: begin.fingerprint.clone(),
+            producer_generation: begin.producer_generation,
+            authority_epoch: begin.authority_epoch,
+            fence_digest: begin.fence_digest.clone(),
+            acquired_at_unix_ms: current_unix_ms_u64()?,
+        };
+        record.validate()?;
+        {
+            let mut table = write.open_table(REPLAY_REQUESTS).map_err(storage)?;
+            table
+                .insert(key.as_str(), encode(&record)?.as_str())
+                .map_err(storage)?;
+        }
+        write.commit().map_err(storage)?;
+        Ok(WorkerReplayRequestDecision::New)
+    }
+
+    /// Persists one replay draft under its exact stream with a durable
+    /// identity and sequence.
+    ///
+    /// One write transaction: claim gate, acquisition check, idempotent
+    /// replay of an identical draft (same `event_id` and sequence), otherwise
+    /// assignment of the stream's next sequence. The claim table is only
+    /// read; the event row is immutable once written.
+    pub fn append_replay_event(
+        &self,
+        draft: &WorkerReplayDraft,
+    ) -> Result<WorkerReplayEvent, OrsError> {
+        draft.validate()?;
+        let digest = draft.draft_digest()?;
+        let (claim_id, _) = parse_replay_stream_id(&draft.stream_id)?;
+        let write = self.database.begin_write().map_err(storage)?;
+        let Some(claim) = Self::load_claim_in(&write, &claim_id)? else {
+            return Err(OrsError::WorkerReplayStaleStream {
+                stream_id: draft.stream_id.clone(),
+            });
+        };
+        require_replay_claim_binding(
+            &draft.stream_id,
+            draft.producer_generation,
+            draft.authority_epoch,
+            &draft.fence_digest,
+            &claim,
+        )?;
+        let request_key = WorkerReplayRequestRecord::key_for(&draft.stream_id, &draft.request_id);
+        let request: WorkerReplayRequestRecord = {
+            let table = write.open_table(REPLAY_REQUESTS).map_err(storage)?;
+            table
+                .get(request_key.as_str())
+                .map_err(storage)?
+                .map(|value| decode(value.value()))
+                .transpose()?
+                .ok_or(OrsError::ReservationNotFound)?
+        };
+        if request.stream_id != draft.stream_id || request.request_id != draft.request_id {
+            return Err(OrsError::IntegrityProblem {
+                record_type: "worker_replay_request",
+                reason: "request record identity does not match its key".to_owned(),
+            });
+        }
+        let replayed = {
+            let table = write.open_table(REPLAY_EVENTS).map_err(storage)?;
+            Self::replay_events_in(&table, &draft.stream_id, Some(draft.request_id.as_str()))?
+                .into_iter()
+                .find(|event| event.draft_digest == digest)
+        };
+        if let Some(replayed) = replayed {
+            return Ok(replayed);
+        }
+        let mut head = Self::load_stream_head_in(&write, &draft.stream_id)?.ok_or_else(|| {
+            OrsError::IntegrityProblem {
+                record_type: "worker_replay_stream",
+                reason: "stream head is missing for an acquired request".to_owned(),
+            }
+        })?;
+        let sequence = head.next_sequence;
+        head.next_sequence = sequence
+            .checked_add(1)
+            .ok_or_else(|| OrsError::IntegrityProblem {
+                record_type: "worker_replay_stream",
+                reason: "sequence counter exhausted".to_owned(),
+            })?;
+        head.validate()?;
+        let stream_digest = crate::model::sha256_hex(draft.stream_id.as_bytes());
+        let stream_tag = stream_digest
+            .get(..16)
+            .ok_or_else(|| OrsError::IntegrityProblem {
+                record_type: "worker_replay_event",
+                reason: "stream digest is unexpectedly short".to_owned(),
+            })?;
+        let event = WorkerReplayEvent {
+            contract_version: crate::CONTRACT_VERSION,
+            stream_id: draft.stream_id.clone(),
+            event_id: format!("evt-{stream_tag}-{sequence:020}"),
+            sequence,
+            request_id: draft.request_id.clone(),
+            fingerprint: request.fingerprint.clone(),
+            producer_id: draft.producer_id.clone(),
+            producer_generation: draft.producer_generation,
+            authority_epoch: draft.authority_epoch,
+            fence_digest: draft.fence_digest.clone(),
+            causal_predecessor_refs: draft.causal_predecessor_refs.clone(),
+            delivery_class: draft.delivery_class,
+            ack_required: draft.ack_required,
+            payload_type: draft.payload_type.clone(),
+            payload: draft.payload.clone(),
+            disposition: draft.disposition.clone(),
+            trace_context: draft.trace_context.clone(),
+            draft_digest: digest,
+            durable_at_unix_ms: current_unix_ms_u64()?,
+        };
+        event.validate()?;
+        {
+            let mut events = write.open_table(REPLAY_EVENTS).map_err(storage)?;
+            events
+                .insert(event.record_key().as_str(), encode(&event)?.as_str())
+                .map_err(storage)?;
+            let mut streams = write.open_table(REPLAY_STREAMS).map_err(storage)?;
+            streams
+                .insert(head.stream_id.as_str(), encode(&head)?.as_str())
+                .map_err(storage)?;
+        }
+        write.commit().map_err(storage)?;
+        Ok(event)
+    }
+
+    /// Returns the retained suffix strictly after `after_sequence` in
+    /// sequence order, preserving gaps.
+    ///
+    /// Read-only. An oversized suffix fails with
+    /// [`OrsError::ProjectionLimitExceeded`] instead of truncating silently;
+    /// a pruned prefix covering `after_sequence` fails with
+    /// [`OrsError::WorkerReplayIncomplete`] instead of returning an empty
+    /// success on incomplete storage. A caught-up consumer (nothing retained
+    /// after its cursor) honestly receives an empty suffix.
+    pub fn replay_stream(
+        &self,
+        stream_id: &str,
+        after_sequence: u64,
+    ) -> Result<Vec<WorkerReplayEvent>, OrsError> {
+        parse_replay_stream_id(stream_id)?;
+        let read = self.database.begin_read().map_err(storage)?;
+        let table = read.open_table(REPLAY_EVENTS).map_err(storage)?;
+        let events: Vec<WorkerReplayEvent> = Self::replay_events_in(&table, stream_id, None)?
+            .into_iter()
+            .filter(|event| event.sequence > after_sequence)
+            .collect();
+        let Some(first) = events.first() else {
+            return Ok(Vec::new());
+        };
+        let want =
+            after_sequence
+                .checked_add(1)
+                .ok_or_else(|| OrsError::WorkerReplayIncomplete {
+                    stream_id: stream_id.to_owned(),
+                    after_sequence,
+                })?;
+        if want < first.sequence {
+            return Err(OrsError::WorkerReplayIncomplete {
+                stream_id: stream_id.to_owned(),
+                after_sequence,
+            });
+        }
+        if events.len() > usize::from(crate::MAX_REPLAY_PAGE) {
+            return Err(OrsError::ProjectionLimitExceeded);
+        }
+        Ok(events)
+    }
+
+    /// Verifies one acknowledgement against its exact durable event,
+    /// persists the disposition, and advances only the cursor its phase
+    /// allows.
+    ///
+    /// One write transaction: claim gate, exact event binding (stream, event,
+    /// sequence, generation, epoch, fence), ack persistence, monotonic cursor
+    /// advance. UNKNOWN persists its disposition for reconciliation by the
+    /// original identity and moves no cursor.
+    pub fn acknowledge_replay_event(
+        &self,
+        ack: &WorkerReplayAck,
+    ) -> Result<WorkerReplayCursors, OrsError> {
+        ack.validate()?;
+        let mismatch = || OrsError::WorkerReplayAckMismatch {
+            stream_id: ack.stream_id.clone(),
+            sequence: ack.sequence,
+        };
+        let (claim_id, _) = parse_replay_stream_id(&ack.stream_id)?;
+        let write = self.database.begin_write().map_err(storage)?;
+        let Some(claim) = Self::load_claim_in(&write, &claim_id)? else {
+            return Err(OrsError::WorkerReplayStaleStream {
+                stream_id: ack.stream_id.clone(),
+            });
+        };
+        require_replay_claim_binding(
+            &ack.stream_id,
+            ack.producer_generation,
+            ack.authority_epoch,
+            &ack.fence_digest,
+            &claim,
+        )?;
+        let event_key = WorkerReplayEvent::key_for(&ack.stream_id, ack.sequence);
+        let event: WorkerReplayEvent = {
+            let table = write.open_table(REPLAY_EVENTS).map_err(storage)?;
+            table
+                .get(event_key.as_str())
+                .map_err(storage)?
+                .map(|value| decode(value.value()))
+                .transpose()?
+                .ok_or_else(&mismatch)?
+        };
+        if event.stream_id != ack.stream_id
+            || event.sequence != ack.sequence
+            || event.event_id != ack.event_id
+            || event.producer_generation != ack.producer_generation
+            || event.authority_epoch != ack.authority_epoch
+            || event.fence_digest != ack.fence_digest
+        {
+            return Err(mismatch());
+        }
+        let stored = WorkerReplayAckRecord {
+            stream_id: ack.stream_id.clone(),
+            event_id: ack.event_id.clone(),
+            sequence: ack.sequence,
+            phase: ack.phase,
+            acknowledged_at_unix_ms: current_unix_ms_u64()?,
+        };
+        stored.validate()?;
+        {
+            let mut acks = write.open_table(REPLAY_ACKS).map_err(storage)?;
+            acks.insert(event_key.as_str(), encode(&stored)?.as_str())
+                .map_err(storage)?;
+        }
+        let mut head = Self::load_stream_head_in(&write, &ack.stream_id)?.ok_or_else(|| {
+            OrsError::IntegrityProblem {
+                record_type: "worker_replay_stream",
+                reason: "stream head is missing for an acknowledged event".to_owned(),
+            }
+        })?;
+        if ack.phase.advances_producer_cursor() {
+            head.producer_cursor = head.producer_cursor.max(ack.sequence);
+        }
+        if ack.phase.advances_consumer_cursor() {
+            head.consumer_cursor = head.consumer_cursor.max(ack.sequence);
+        }
+        head.validate()?;
+        {
+            let mut streams = write.open_table(REPLAY_STREAMS).map_err(storage)?;
+            streams
+                .insert(head.stream_id.as_str(), encode(&head)?.as_str())
+                .map_err(storage)?;
+        }
+        write.commit().map_err(storage)?;
+        Ok(WorkerReplayCursors {
+            stream_id: ack.stream_id.clone(),
+            producer_cursor: head.producer_cursor,
+            consumer_cursor: head.consumer_cursor,
+        })
+    }
+
+    /// Prunes the longest APPLIED-or-REJECTED event prefix of one stream,
+    /// retaining the newest [`crate::MAX_REPLAY_PAGE`] terminal events.
+    ///
+    /// Retention maintenance, not execution: no claim binding is required, so
+    /// old-generation history stays bounded too. The scan stops at the first
+    /// event without an APPLIED/REJECTED acknowledgement, so UNKNOWN (still
+    /// reconciling) events and their ack facts are never removed. Ack facts
+    /// of pruned events are removed with them. Returns the number of events
+    /// removed.
+    pub fn prune_replay_stream(&self, stream_id: &str) -> Result<u64, OrsError> {
+        parse_replay_stream_id(stream_id)?;
+        let write = self.database.begin_write().map_err(storage)?;
+        let events = {
+            let table = write.open_table(REPLAY_EVENTS).map_err(storage)?;
+            Self::replay_events_in(&table, stream_id, None)?
+        };
+        let mut prunable: Vec<String> = Vec::new();
+        {
+            let acks = write.open_table(REPLAY_ACKS).map_err(storage)?;
+            for event in &events {
+                let key = event.record_key();
+                let terminal = match acks.get(key.as_str()).map_err(storage)? {
+                    None => false,
+                    Some(value) => {
+                        let ack: WorkerReplayAckRecord = decode(value.value())?;
+                        is_replay_terminal_phase(ack.phase)
+                    }
+                };
+                if !terminal {
+                    break;
+                }
+                prunable.push(key);
+            }
+        }
+        let drop_count = prunable
+            .len()
+            .saturating_sub(usize::from(crate::MAX_REPLAY_PAGE));
+        let mut removed: u64 = 0;
+        if drop_count > 0 {
+            let mut events_table = write.open_table(REPLAY_EVENTS).map_err(storage)?;
+            let mut acks_table = write.open_table(REPLAY_ACKS).map_err(storage)?;
+            for key in prunable.iter().take(drop_count) {
+                events_table.remove(key.as_str()).map_err(storage)?;
+                acks_table.remove(key.as_str()).map_err(storage)?;
+                removed += 1;
+            }
+        }
+        write.commit().map_err(storage)?;
+        Ok(removed)
     }
 
     #[cfg(feature = "test-support")]
@@ -2981,6 +3597,10 @@ impl RedbRecoveryStore {
             );
             drop(write.open_table(STORE_REBIND_REPLAY).map_err(storage)?);
             drop(write.open_table(NATIVE_WORKER_CLAIMS).map_err(storage)?);
+            drop(write.open_table(REPLAY_STREAMS).map_err(storage)?);
+            drop(write.open_table(REPLAY_REQUESTS).map_err(storage)?);
+            drop(write.open_table(REPLAY_EVENTS).map_err(storage)?);
+            drop(write.open_table(REPLAY_ACKS).map_err(storage)?);
             if initialize_resolution_schema {
                 let mut meta = write.open_table(META).map_err(storage)?;
                 meta.insert(
@@ -5137,6 +5757,48 @@ impl OperationalRecoveryStore for RedbRecoveryStore {
     ) -> Result<Option<crate::NativeWorkerClaimRecord>, OrsError> {
         RedbRecoveryStore::load_native_worker_claim(self, claim_id)
     }
+
+    fn lookup_replay_request(
+        &self,
+        stream_id: &str,
+        request_id: &str,
+        fingerprint: &str,
+    ) -> Result<WorkerReplayRequestDecision, OrsError> {
+        RedbRecoveryStore::lookup_replay_request(self, stream_id, request_id, fingerprint)
+    }
+
+    fn begin_replay_request(
+        &self,
+        begin: &WorkerReplayBegin,
+    ) -> Result<WorkerReplayRequestDecision, OrsError> {
+        RedbRecoveryStore::begin_replay_request(self, begin)
+    }
+
+    fn append_replay_event(
+        &self,
+        draft: &WorkerReplayDraft,
+    ) -> Result<WorkerReplayEvent, OrsError> {
+        RedbRecoveryStore::append_replay_event(self, draft)
+    }
+
+    fn replay_stream(
+        &self,
+        stream_id: &str,
+        after_sequence: u64,
+    ) -> Result<Vec<WorkerReplayEvent>, OrsError> {
+        RedbRecoveryStore::replay_stream(self, stream_id, after_sequence)
+    }
+
+    fn acknowledge_replay_event(
+        &self,
+        ack: &WorkerReplayAck,
+    ) -> Result<WorkerReplayCursors, OrsError> {
+        RedbRecoveryStore::acknowledge_replay_event(self, ack)
+    }
+
+    fn prune_replay_stream(&self, stream_id: &str) -> Result<u64, OrsError> {
+        RedbRecoveryStore::prune_replay_stream(self, stream_id)
+    }
 }
 
 /// Single coordinator facade. It owns no semantic policy and delegates one durable transition.
@@ -5295,8 +5957,63 @@ impl<S: OperationalRecoveryStore> OrsCoordinator<S> {
     pub fn load_native_worker_claim(
         &self,
         claim_id: &crate::OperationIdentity,
-    ) -> Result<Option<NativeWorkerClaimRecord>, OrsError> {
+    ) -> Result<Option<crate::NativeWorkerClaimRecord>, OrsError> {
         self.store.load_native_worker_claim(claim_id)
+    }
+
+    /// Looks up one durable replay request without acquiring anything.
+    pub fn lookup_replay_request(
+        &self,
+        stream_id: &str,
+        request_id: &str,
+        fingerprint: &str,
+    ) -> Result<WorkerReplayRequestDecision, OrsError> {
+        self.store
+            .lookup_replay_request(stream_id, request_id, fingerprint)
+    }
+
+    /// Atomically acquires one durable replay request or reports its durable
+    /// outcome.
+    pub fn begin_replay_request(
+        &self,
+        begin: &WorkerReplayBegin,
+    ) -> Result<WorkerReplayRequestDecision, OrsError> {
+        self.store.begin_replay_request(begin)
+    }
+
+    /// Persists one replay draft under its exact stream with a durable
+    /// identity and sequence.
+    pub fn append_replay_event(
+        &self,
+        draft: &WorkerReplayDraft,
+    ) -> Result<WorkerReplayEvent, OrsError> {
+        self.store.append_replay_event(draft)
+    }
+
+    /// Returns the retained suffix strictly after `after_sequence` in
+    /// sequence order, preserving gaps.
+    pub fn replay_stream(
+        &self,
+        stream_id: &str,
+        after_sequence: u64,
+    ) -> Result<Vec<WorkerReplayEvent>, OrsError> {
+        self.store.replay_stream(stream_id, after_sequence)
+    }
+
+    /// Verifies one acknowledgement against its exact durable event,
+    /// persists the disposition, and advances only the cursor its phase
+    /// allows.
+    pub fn acknowledge_replay_event(
+        &self,
+        ack: &WorkerReplayAck,
+    ) -> Result<WorkerReplayCursors, OrsError> {
+        self.store.acknowledge_replay_event(ack)
+    }
+
+    /// Prunes the longest APPLIED-or-REJECTED event prefix of one stream,
+    /// retaining the newest [`crate::MAX_REPLAY_PAGE`] terminal events.
+    pub fn prune_replay_stream(&self, stream_id: &str) -> Result<u64, OrsError> {
+        self.store.prune_replay_stream(stream_id)
     }
 }
 
