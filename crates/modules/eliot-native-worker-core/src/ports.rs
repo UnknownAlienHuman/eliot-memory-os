@@ -13,8 +13,9 @@ use thiserror::Error;
 
 use crate::WorkerError;
 use crate::protocol::{
-    EventAckReceipt, NativeWorkerClaim, NativeWorkerReadiness, NativeWorkerRegistration,
-    WorkerEventDraft, WorkerEventEnvelope, WorkerHello,
+    EventAckReceipt, NATIVE_WORKER_CLAIM_WIRE_VERSION, NATIVE_WORKER_CLAIM_WIRE_VERSION_V1,
+    NativeWorkerClaim, NativeWorkerExecutableExpectation, NativeWorkerReadiness,
+    NativeWorkerRegistration, WorkerEventDraft, WorkerEventEnvelope, WorkerHello,
 };
 
 /// A-13's inert post-start binding.  `ProcessRequest` is authority-bearing and
@@ -123,20 +124,28 @@ impl CapabilityAdmissionRequest {
 
     /// Checked join of one exact claim presentation with the owner-supplied
     /// handshake and process request. Verifies the claim halves against each
-    /// other and then against `hello`/`process`, and carries the claim into
-    /// the admission projection. Invents nothing: no `ProcessRequest` is
+    /// other and then against `hello`/`process`, including the T9-02
+    /// executable join binding (route, nonce, invocation digest, config,
+    /// epoch/fence/generation, and binding window), and carries the claim
+    /// into the admission projection. Invents nothing: no `ProcessRequest` is
     /// minted, no grant is sealed, `route_class` is never equated with a
     /// full route fingerprint, and no defaults are fabricated for
     /// `WorkerHello` fields. The claim's `attempt_id` has no start-time
     /// counterpart, so it is carried digest-bound rather than equated.
+    /// Adapter/facet/grant/stream/owner-digest currentness against the live
+    /// owner record is enforced by
+    /// [`NativeWorkerClaim::require_executable_binding`] after admission;
+    /// this join enforces the parts bound to `hello`/`process`/registration
+    /// before the admission owner is consulted.
     ///
     /// # Errors
     ///
     /// Returns [`WorkerError::InvalidRequest`] for a malformed half or an
-    /// identity/generation/operation mismatch, [`WorkerError::StaleEpoch`]
-    /// or [`WorkerError::StaleFence`] for epoch/fence disagreement, and
-    /// [`WorkerError::DeadlineExpired`] when the handshake outlives the
-    /// claim deadline.
+    /// identity/generation/operation/join mismatch,
+    /// [`WorkerError::UnsupportedVersion`] for an unknown claim wire,
+    /// [`WorkerError::StaleEpoch`] or [`WorkerError::StaleFence`] for
+    /// epoch/fence disagreement, and [`WorkerError::DeadlineExpired`] when
+    /// the handshake outlives the claim deadline or the binding window.
     pub fn from_claim(
         claim: &ClaimAdmissionRequest,
         hello: &WorkerHello,
@@ -180,6 +189,7 @@ impl CapabilityAdmissionRequest {
         if hello.deadline_unix_ms > presented.deadline_unix_ms {
             return Err(WorkerError::DeadlineExpired);
         }
+        validate_claim_executable_hello_process_binding(presented, registration, hello, process)?;
         Ok(Self {
             hello: hello.clone(),
             operation_id: process.operation_id().clone(),
@@ -286,6 +296,15 @@ pub struct CapabilityAdmissionFacts {
     /// Echo of the exact operation bound to the admitted claim, if any.
     #[serde(skip_serializing_if = "Option::is_none")]
     claim_operation_id: Option<OperationId>,
+    /// Owner-produced current executable authority for the admitted claim,
+    /// when the launch was presented under a v2 claim.
+    ///
+    /// `None` preserves the pre-claim wire shape. A present expectation
+    /// carries the live owner record the presented join is refused against;
+    /// a missing expectation for a v2 claim fails closed at grant
+    /// validation, never promotes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    executable_expectation: Option<NativeWorkerExecutableExpectation>,
 }
 
 impl CapabilityAdmissionFacts {
@@ -332,6 +351,7 @@ impl CapabilityAdmissionFacts {
             claim_binding_digest: None,
             claim_attempt_id: None,
             claim_operation_id: None,
+            executable_expectation: None,
         }
     }
 
@@ -345,6 +365,21 @@ impl CapabilityAdmissionFacts {
         self.claim_binding_digest = Some(claim.binding_digest.clone());
         self.claim_attempt_id = Some(claim.attempt_id.clone());
         self.claim_operation_id = Some(claim.operation_id.clone());
+        self
+    }
+
+    /// Attaches the owner-produced current executable authority.
+    ///
+    /// Records the live owner record the presented v2 join is refused
+    /// against, plus observed revocation evidence. The expectation is inert
+    /// data: a missing expectation for a v2 claim, or any disagreement with
+    /// the presented join, fails closed at grant validation.
+    #[must_use]
+    pub fn with_executable_expectation(
+        mut self,
+        expected: NativeWorkerExecutableExpectation,
+    ) -> Self {
+        self.executable_expectation = Some(expected);
         self
     }
 
@@ -454,6 +489,12 @@ impl CapabilityAdmissionFacts {
     #[must_use]
     pub const fn claim_operation_id(&self) -> Option<&OperationId> {
         self.claim_operation_id.as_ref()
+    }
+
+    /// Returns the owner-produced current executable authority, if any.
+    #[must_use]
+    pub const fn executable_expectation(&self) -> Option<&NativeWorkerExecutableExpectation> {
+        self.executable_expectation.as_ref()
     }
 }
 
@@ -1137,6 +1178,87 @@ impl ClaimAdmissionRequest {
         }
         Ok(())
     }
+}
+
+/// Binds the v2 executable join to the owner-supplied `hello`/`process`.
+///
+/// Checks the join parts that have a `hello`/`process`/registration
+/// counterpart: route, launch nonce, invocation digest, config digest,
+/// epoch/fence/generation agreement, and that the handshake does not
+/// outlive the binding window. Adapter/facet/grant/stream/owner-digest
+/// currentness against the live owner record is enforced by
+/// [`NativeWorkerClaim::require_executable_binding`] after admission, not
+/// here. Wire v1 has no join and can never satisfy a claimed start.
+///
+/// # Errors
+///
+/// Returns [`WorkerError::InvalidRequest`] for a missing or mismatched join
+/// field, [`WorkerError::UnsupportedVersion`] for an unknown claim wire,
+/// [`WorkerError::StaleEpoch`]/[`WorkerError::StaleFence`] for
+/// epoch/fence/generation disagreement, and [`WorkerError::DeadlineExpired`]
+/// when the handshake outlives the binding window.
+fn validate_claim_executable_hello_process_binding(
+    presented: &NativeWorkerClaim,
+    registration: &NativeWorkerRegistration,
+    hello: &WorkerHello,
+    process: &ProcessRequest,
+) -> Result<(), WorkerError> {
+    if presented.wire_version == NATIVE_WORKER_CLAIM_WIRE_VERSION_V1 {
+        return Err(WorkerError::InvalidRequest(
+            "u1_old_wire_without_executable_binding",
+        ));
+    }
+    if presented.wire_version != NATIVE_WORKER_CLAIM_WIRE_VERSION {
+        return Err(WorkerError::UnsupportedVersion);
+    }
+    let join = presented
+        .executable_binding
+        .as_ref()
+        .ok_or(WorkerError::InvalidRequest("executable_binding"))?;
+    join.validate()?;
+    if join.route_ref != hello.route_ref {
+        return Err(WorkerError::InvalidRequest("executable_binding.route_ref"));
+    }
+    if join.launch_nonce != hello.launch_nonce {
+        return Err(WorkerError::InvalidRequest(
+            "executable_binding.launch_nonce",
+        ));
+    }
+    if join.process_invocation_digest != process.invocation_digest() {
+        return Err(WorkerError::InvalidRequest(
+            "executable_binding.process_invocation_digest",
+        ));
+    }
+    if join.config_digest != registration.worker_config_digest {
+        return Err(WorkerError::InvalidRequest(
+            "executable_binding.config_digest",
+        ));
+    }
+    if !join
+        .authority_epoch
+        .is_same_authority(&hello.authority_epoch)
+    {
+        return Err(WorkerError::StaleEpoch);
+    }
+    if join.state_fence != hello.state_fence {
+        return Err(WorkerError::StaleFence);
+    }
+    if !join
+        .authority_epoch
+        .is_same_authority(&presented.authority_epoch)
+    {
+        return Err(WorkerError::StaleEpoch);
+    }
+    if join.state_fence != presented.state_fence {
+        return Err(WorkerError::StaleFence);
+    }
+    if join.generation.value() != presented.worker_generation {
+        return Err(WorkerError::InvalidRequest("executable_binding.generation"));
+    }
+    if hello.deadline_unix_ms >= join.expires_at_unix_ms {
+        return Err(WorkerError::DeadlineExpired);
+    }
+    Ok(())
 }
 
 /// One typed ready-or-blocked submission for one admitted claim.

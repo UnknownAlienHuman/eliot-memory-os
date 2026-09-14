@@ -2,7 +2,8 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use eliot_agent_api::{AttemptId, AuthorizedEffect, BudgetEnvelope, ProposedEffect, WorkLeaseId};
 use eliot_contracts::{
-    DecisionId, EpochId, SessionId, StateFence, TaskId, canonical_json_bytes, sha256_hex,
+    DecisionId, EpochId, ResourceGeneration, SessionId, StateFence, TaskId, canonical_json_bytes,
+    sha256_hex,
 };
 use eliot_process::{
     CancellationStatus, OperationId, ProcessLifecycle, ProcessStartReceipt, ResourceLimits,
@@ -500,6 +501,23 @@ pub struct WorkerRecovery {
 /// A registration presenting any other version is rejected as unknown; the
 /// Kernel never negotiates a schema it does not implement.
 pub const EXECUTION_UNIT_SCHEMA_VERSION: u16 = 1;
+/// Current revision of the worker-side native-worker claim wire (T9-02).
+///
+/// Revision 2 carries the executable-binding join (`executable_binding` with
+/// the owner-produced executable digest plus M1 currentness inputs).
+/// Revision 1 still parses — its join decodes as absent — but can never
+/// satisfy [`NativeWorkerClaim::require_executable_binding`].
+pub const NATIVE_WORKER_CLAIM_WIRE_VERSION: u16 = 2;
+/// Previous claim-wire revision, retained only to reject old-wire claims
+/// explicitly at the executable gate instead of promoting them silently.
+pub const NATIVE_WORKER_CLAIM_WIRE_VERSION_V1: u16 = 1;
+/// Expected wire revision of the owner-produced executable binding (T9-01
+/// `NativeWorkerExecutableBinding` v1).
+///
+/// Carried by value, never imported: this crate must not depend on
+/// `eliot-governor`. A binding-wire drift changes the owner digest as well,
+/// so this pin fails closed twice.
+pub const NATIVE_WORKER_EXECUTABLE_BINDING_EXPECTED_WIRE_VERSION: u16 = 1;
 /// Maximum length of bounded claim/registration text fields, in UTF-8 bytes.
 pub const MAX_CLAIM_TEXT_LEN: usize = 1_024;
 /// Maximum length of one native-worker operation identity, in UTF-8 bytes.
@@ -749,6 +767,169 @@ impl NativeWorkerRegistration {
     }
 }
 
+/// Worker-side projection of the owner-produced executable binding (T9-02).
+///
+/// Carries the M1 currentness inputs the start path needs for refusal —
+/// route, adapter, config, facet, grant revision, replay stream, launch
+/// nonce, invocation digest, epoch/generation/fence, and the binding window
+/// — plus the opaque owner-produced `NativeWorkerExecutableBinding` v1
+/// digest. Field names reuse the T9-01 names where they exist, matching the
+/// Kernel-side `eliot-kernel-service` projection field-for-field. This is an
+/// identity/epoch/fence/ordering projection only: it carries references and
+/// revisions, never task meaning, plan/policy content, effective ceilings,
+/// credential or resource values, or Governor composition. The full T9-01
+/// record stays with its owner; this side compares the carried digest for
+/// equality against the current owner record and refuses any stale join.
+#[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct NativeWorkerExecutableBinding {
+    /// Full canonical route label from the session owner.
+    pub route_ref: String,
+    /// Adapter/factory identity.
+    pub adapter_id: String,
+    /// Adapter revision; nonzero.
+    pub adapter_revision: u64,
+    /// Lowercase SHA-256 of the admitted worker configuration bytes.
+    pub config_digest: String,
+    /// Facet manifest reference.
+    pub facet_manifest_ref: String,
+    /// Grant-graph revision the binding was compiled against; nonzero.
+    pub grant_graph_revision: u64,
+    /// Replay stream identity bound to this claim.
+    pub replay_stream_id: String,
+    /// Claim-bound launch nonce (16..=256 chars, mirroring T9-01).
+    pub launch_nonce: String,
+    /// Lowercase SHA-256 of the exact process invocation.
+    pub process_invocation_digest: String,
+    /// Authority epoch; must agree with `state_fence` via
+    /// `is_same_authority`, never by raw sequence comparison.
+    pub authority_epoch: EpochId,
+    /// Resource generation; must equal `state_fence.resource_generation`.
+    pub generation: ResourceGeneration,
+    /// Exact immutable fence the binding was compiled against.
+    pub state_fence: StateFence,
+    /// Execution deadline in Unix milliseconds; nonzero, before expiry.
+    pub deadline_unix_ms: u64,
+    /// Binding expiry in Unix milliseconds; nonzero, after deadline.
+    pub expires_at_unix_ms: u64,
+    /// Owner binding wire revision; must equal
+    /// [`NATIVE_WORKER_EXECUTABLE_BINDING_EXPECTED_WIRE_VERSION`].
+    pub executable_wire_version: u16,
+    /// Opaque owner-produced executable digest (lowercase SHA-256).
+    pub executable_binding_digest: String,
+}
+
+impl NativeWorkerExecutableBinding {
+    /// Minimum presented launch-nonce length (mirrors T9-01).
+    pub const MIN_NONCE_LEN: usize = 16;
+    /// Maximum presented launch-nonce length (mirrors T9-01).
+    pub const MAX_NONCE_LEN: usize = 256;
+
+    /// Validates the closed join shape without treating it as authority.
+    ///
+    /// Checks bounded texts, digest shapes, nonzero revisions, the
+    /// deadline-before-expiry window, and fence/epoch/generation agreement.
+    /// Digest equality against the current owner record is checked by
+    /// [`NativeWorkerClaim::require_executable_binding`], not here.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`WorkerError::InvalidRequest`] for a malformed, unbounded,
+    /// or disagreeing shape field, [`WorkerError::UnsupportedVersion`] for
+    /// an unknown executable wire version, [`WorkerError::StaleEpoch`] for
+    /// epoch disagreement, and [`WorkerError::StaleFence`] for
+    /// generation/fence disagreement.
+    pub fn validate(&self) -> Result<(), WorkerError> {
+        for (text, field) in [
+            (&self.route_ref, "executable_binding.route_ref"),
+            (&self.adapter_id, "executable_binding.adapter_id"),
+            (
+                &self.facet_manifest_ref,
+                "executable_binding.facet_manifest_ref",
+            ),
+            (
+                &self.replay_stream_id,
+                "executable_binding.replay_stream_id",
+            ),
+        ] {
+            validate_claim_text(text, field)?;
+        }
+        validate_claim_text(&self.launch_nonce, "executable_binding.launch_nonce")?;
+        if self.launch_nonce.len() < Self::MIN_NONCE_LEN
+            || self.launch_nonce.len() > Self::MAX_NONCE_LEN
+        {
+            return Err(WorkerError::InvalidRequest(
+                "executable_binding.launch_nonce",
+            ));
+        }
+        for (digest, field) in [
+            (&self.config_digest, "executable_binding.config_digest"),
+            (
+                &self.process_invocation_digest,
+                "executable_binding.process_invocation_digest",
+            ),
+            (
+                &self.executable_binding_digest,
+                "executable_binding.executable_binding_digest",
+            ),
+        ] {
+            if !is_lowercase_sha256(digest) {
+                return Err(WorkerError::InvalidRequest(field));
+            }
+        }
+        if self.adapter_revision == 0 || self.grant_graph_revision == 0 {
+            return Err(WorkerError::InvalidRequest("executable_binding.revisions"));
+        }
+        if self.generation.value() == 0 {
+            return Err(WorkerError::InvalidRequest("executable_binding.generation"));
+        }
+        if self.executable_wire_version != NATIVE_WORKER_EXECUTABLE_BINDING_EXPECTED_WIRE_VERSION {
+            return Err(WorkerError::UnsupportedVersion);
+        }
+        if self.deadline_unix_ms == 0 || self.expires_at_unix_ms == 0 {
+            return Err(WorkerError::InvalidRequest("executable_binding.deadlines"));
+        }
+        if self.deadline_unix_ms >= self.expires_at_unix_ms {
+            return Err(WorkerError::InvalidRequest("executable_binding.deadlines"));
+        }
+        self.state_fence
+            .validate()
+            .map_err(|_| WorkerError::InvalidRequest("executable_binding.state_fence"))?;
+        if !self
+            .authority_epoch
+            .is_same_authority(&self.state_fence.authority_epoch)
+        {
+            return Err(WorkerError::StaleEpoch);
+        }
+        if self.generation != self.state_fence.resource_generation {
+            return Err(WorkerError::StaleFence);
+        }
+        Ok(())
+    }
+}
+
+/// Current owner-produced executable authority one claim is checked against.
+///
+/// The route builds this from the live registration, admission, activation,
+/// and epoch records at admission time: `current` is what the owner says the
+/// binding is now, and `revoked` carries observed invalidation evidence (the
+/// binding was withdrawn or superseded after publication). This side never
+/// mints this value; it only refuses presented claims that disagree with it.
+#[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct NativeWorkerExecutableExpectation {
+    /// Owner-produced current executable record.
+    pub current: NativeWorkerExecutableBinding,
+    /// True when current records show the binding withdrawn or superseded.
+    pub revoked: bool,
+}
+
+/// Returns the default claim-wire revision for payloads that predate the
+/// executable join (wire v1, no `wire_version` key).
+fn native_claim_wire_v1() -> u16 {
+    NATIVE_WORKER_CLAIM_WIRE_VERSION_V1
+}
+
 /// One Kernel-owned execution unit claimed by exactly one admitted worker
 /// generation.
 ///
@@ -761,6 +942,11 @@ impl NativeWorkerRegistration {
 /// bound work field; the same claim identity presented with changed work,
 /// generation, route, budget, schema, fence, or predecessor is a [`ClaimBindingDecision::Conflict`],
 /// never a silent supersede.
+///
+/// Wire v2 (T9-02) additionally binds `executable_binding`, the
+/// owner-produced executable join. Wire v1 parses (its join decodes as
+/// absent) but can never carry executable authority; unknown wires are
+/// rejected as [`WorkerError::UnsupportedVersion`].
 #[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct NativeWorkerClaim {
@@ -800,6 +986,17 @@ pub struct NativeWorkerClaim {
     pub authority_epoch: EpochId,
     /// Exact immutable fence paired with the generation and epoch.
     pub state_fence: StateFence,
+    /// Claim-wire revision. Defaults to v1 for payloads that predate the
+    /// executable join so old-wire claims still parse; v1 can never carry
+    /// executable authority and unknown revisions are rejected as
+    /// [`WorkerError::UnsupportedVersion`].
+    #[serde(default = "native_claim_wire_v1")]
+    pub wire_version: u16,
+    /// T9-02 executable join: owner-produced digest plus M1 currentness
+    /// inputs. Absent (`None`) on wire v1, which predates the join and can
+    /// never carry executable authority; required on wire v2.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub executable_binding: Option<NativeWorkerExecutableBinding>,
     /// Canonical digest over every bound work field (see
     /// [`NativeWorkerClaim::compute_binding_digest`]).
     pub binding_digest: String,
@@ -810,12 +1007,24 @@ impl NativeWorkerClaim {
     ///
     /// The digest covers exactly these keys: `attempt_id`,
     /// `authority_epoch`, `budget`, `cancellation_policy_id`, `claim_id`,
-    /// `deadline_unix_ms`, `decision_id`, `expected_result_schema`,
-    /// `expected_result_schema_version`, `operation_id`, `parent_job_id`,
-    /// `predecessor_revision`, `registration_id`, `route_class`,
-    /// `state_fence`, `task_id`, `work_scope_id`, `worker_generation`.
-    /// Keys are sorted recursively before hashing, so the Kernel-side mirror
-    /// over the same logical values yields the identical digest.
+    /// `deadline_unix_ms`, `decision_id`, `executable_binding`,
+    /// `expected_result_schema`, `expected_result_schema_version`,
+    /// `operation_id`, `parent_job_id`, `predecessor_revision`,
+    /// `registration_id`, `route_class`, `state_fence`, `task_id`,
+    /// `work_scope_id`, `worker_generation`. The nested `executable_binding`
+    /// object is JSON `null` for wire-v1 claims (which predate the join) and
+    /// otherwise covers exactly the keys `adapter_id`, `adapter_revision`,
+    /// `authority_epoch`, `config_digest`, `deadline_unix_ms`,
+    /// `executable_binding_digest`, `executable_wire_version`,
+    /// `expires_at_unix_ms`, `facet_manifest_ref`, `generation`,
+    /// `grant_graph_revision`, `launch_nonce`, `process_invocation_digest`,
+    /// `replay_stream_id`, `route_ref`, `state_fence`, with object keys
+    /// sorted recursively before hashing. This matches the Kernel-side
+    /// `NativeWorkerClaimRequest::compute_binding_digest` byte-for-byte: the
+    /// worker-side transparent string newtypes and the Kernel-side plain
+    /// strings serialize to identical JSON, and the epoch/fence/generation
+    /// values on both sides come from the same `eliot-contracts` types, so
+    /// equal logical claims yield equal digests on both sides.
     ///
     /// # Errors
     ///
@@ -830,6 +1039,7 @@ impl NativeWorkerClaim {
             "claim_id": self.claim_id,
             "deadline_unix_ms": self.deadline_unix_ms,
             "decision_id": self.decision_id,
+            "executable_binding": self.executable_binding,
             "expected_result_schema": self.expected_result_schema,
             "expected_result_schema_version": self.expected_result_schema_version,
             "operation_id": self.operation_id,
@@ -861,11 +1071,22 @@ impl NativeWorkerClaim {
 
     /// Validates the closed claim shape, every binding, and the digest.
     ///
+    /// Wire v1 (including payloads that predate the `wire_version` key)
+    /// parses but must not carry a join; wire v2 must carry a valid join.
+    /// Unknown wire revisions are rejected as
+    /// [`WorkerError::UnsupportedVersion`], never promoted.
+    ///
     /// # Errors
     ///
-    /// Returns [`WorkerError::InvalidRequest`] for any malformed, unbounded,
-    /// disagreeing, or digest-mismatching field.
+    /// Returns [`WorkerError::UnsupportedVersion`] for an unknown wire
+    /// revision and [`WorkerError::InvalidRequest`] for any malformed,
+    /// unbounded, disagreeing, or digest-mismatching field.
     pub fn validate(&self) -> Result<(), WorkerError> {
+        if self.wire_version != NATIVE_WORKER_CLAIM_WIRE_VERSION
+            && self.wire_version != NATIVE_WORKER_CLAIM_WIRE_VERSION_V1
+        {
+            return Err(WorkerError::UnsupportedVersion);
+        }
         for (text, field) in [
             (&self.parent_job_id, "parent_job_id"),
             (&self.work_scope_id, "work_scope_id"),
@@ -897,8 +1118,101 @@ impl NativeWorkerClaim {
         if !is_lowercase_sha256(&self.binding_digest) {
             return Err(WorkerError::InvalidRequest("binding_digest"));
         }
+        if self.wire_version == NATIVE_WORKER_CLAIM_WIRE_VERSION_V1 {
+            if self.executable_binding.is_some() {
+                return Err(WorkerError::InvalidRequest("executable_binding"));
+            }
+        } else {
+            self.require_present_join()?;
+        }
         if self.compute_binding_digest()? != self.binding_digest {
             return Err(WorkerError::InvalidRequest("binding_digest"));
+        }
+        Ok(())
+    }
+
+    /// Returns the validated wire-v2 executable join.
+    ///
+    /// Wire v1 has no join by construction; callers branch on the wire
+    /// version first and only call this on v2.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`WorkerError::InvalidRequest`] when the v2 claim carries no
+    /// join or the join shape is malformed.
+    fn require_present_join(&self) -> Result<&NativeWorkerExecutableBinding, WorkerError> {
+        let join = self
+            .executable_binding
+            .as_ref()
+            .ok_or(WorkerError::InvalidRequest("executable_binding"))?;
+        join.validate()?;
+        Ok(join)
+    }
+
+    /// Enforces the owner-produced executable binding join (T9-02, M1).
+    ///
+    /// Compares the presented wire-v2 join against the current owner record
+    /// supplied by the route from the live registration, admission,
+    /// activation, and epoch records. The presented claim binding digest is
+    /// recomputed (it covers the join), the carried owner digest must equal
+    /// the current owner digest, and every M1 currentness input must agree.
+    /// Epoch agreement always goes through `is_same_authority`, never through
+    /// a raw sequence comparison. A stale binding — changed route, adapter,
+    /// config, facet, grant revision, nonce, stream, invocation digest, or
+    /// owner digest; advanced epoch; withdrawn authority; expired window;
+    /// fence disagreement — is refused; it needs a new admission, never a
+    /// local repair.
+    ///
+    /// Callers run [`NativeWorkerClaim::validate`] first; this gate checks
+    /// the join, not the full envelope shape.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`WorkerError::InvalidRequest`] for an old-wire or malformed
+    /// presentation, [`WorkerError::UnsupportedVersion`] for an unknown wire,
+    /// [`WorkerError::StaleEpoch`] for epoch disagreement,
+    /// [`WorkerError::StaleFence`] for fence/generation disagreement,
+    /// [`WorkerError::DeadlineExpired`] for an expired binding window, and
+    /// [`WorkerError::Revoked`] when current records show the binding
+    /// withdrawn or superseded.
+    pub fn require_executable_binding(
+        &self,
+        expected: &NativeWorkerExecutableExpectation,
+        now_unix_ms: u64,
+    ) -> Result<(), WorkerError> {
+        if self.wire_version == NATIVE_WORKER_CLAIM_WIRE_VERSION_V1 {
+            return Err(WorkerError::InvalidRequest(
+                "u1_old_wire_without_executable_binding",
+            ));
+        }
+        if self.wire_version != NATIVE_WORKER_CLAIM_WIRE_VERSION {
+            return Err(WorkerError::UnsupportedVersion);
+        }
+        let presented = self.require_present_join()?;
+        expected.current.validate()?;
+        if expected.revoked {
+            return Err(WorkerError::Revoked("executable_binding".to_owned()));
+        }
+        if self.compute_binding_digest()? != self.binding_digest {
+            return Err(WorkerError::InvalidRequest("binding_digest"));
+        }
+        compare_executable_currentness(presented, &expected.current)?;
+        if !presented
+            .authority_epoch
+            .is_same_authority(&self.authority_epoch)
+        {
+            return Err(WorkerError::StaleEpoch);
+        }
+        if presented.state_fence != self.state_fence {
+            return Err(WorkerError::StaleFence);
+        }
+        if now_unix_ms == 0 {
+            return Err(WorkerError::InvalidRequest(
+                "executable_binding.observation_time",
+            ));
+        }
+        if now_unix_ms >= presented.expires_at_unix_ms {
+            return Err(WorkerError::DeadlineExpired);
         }
         Ok(())
     }
@@ -910,8 +1224,9 @@ impl NativeWorkerClaim {
     /// The same identity with identical bound work is
     /// [`ClaimBindingDecision::SameBinding`]. The same identity with changed
     /// work, generation, route, budget, schema, fence, epoch, deadline,
-    /// cancellation policy, attempt, operation, registration, or predecessor
-    /// is [`ClaimBindingDecision::Conflict`], naming every changed dimension.
+    /// cancellation policy, attempt, operation, registration, predecessor,
+    /// wire version, or executable join is [`ClaimBindingDecision::Conflict`],
+    /// naming every changed dimension.
     /// A bare digest mismatch with otherwise identical work is reported as a
     /// conflict on `binding_digest` itself.
     #[must_use]
@@ -967,6 +1282,11 @@ impl NativeWorkerClaim {
             "authority_epoch",
         );
         note(self.state_fence == other.state_fence, "state_fence");
+        note(self.wire_version == other.wire_version, "wire_version");
+        note(
+            self.executable_binding == other.executable_binding,
+            "executable_binding",
+        );
         if changed.is_empty() && self.binding_digest != other.binding_digest {
             changed.push("binding_digest".to_owned());
         }
@@ -981,6 +1301,87 @@ impl NativeWorkerClaim {
             })
         }
     }
+}
+
+/// Compares one well-formed presented join against the current owner record.
+///
+/// The carried owner digest must equal the current owner digest, and every
+/// M1 currentness input must agree exactly. Epoch agreement always goes
+/// through `is_same_authority`, never through a raw sequence comparison.
+/// Checks follow the documented absent-input order (route, adapter, config,
+/// facet, grant, stream, nonce, invocation, digest, wire, epoch,
+/// generation, fence) so the first reported field is the first missing
+/// input callers must supply.
+///
+/// # Errors
+///
+/// Returns [`WorkerError::InvalidRequest`] for a changed join field,
+/// [`WorkerError::UnsupportedVersion`] for an executable-wire drift,
+/// [`WorkerError::StaleEpoch`] for epoch disagreement, and
+/// [`WorkerError::StaleFence`] for generation/fence disagreement.
+fn compare_executable_currentness(
+    presented: &NativeWorkerExecutableBinding,
+    current: &NativeWorkerExecutableBinding,
+) -> Result<(), WorkerError> {
+    if presented.route_ref != current.route_ref {
+        return Err(WorkerError::InvalidRequest("executable_binding.route_ref"));
+    }
+    if presented.adapter_id != current.adapter_id
+        || presented.adapter_revision != current.adapter_revision
+    {
+        return Err(WorkerError::InvalidRequest("executable_binding.adapter"));
+    }
+    if presented.config_digest != current.config_digest {
+        return Err(WorkerError::InvalidRequest(
+            "executable_binding.config_digest",
+        ));
+    }
+    if presented.facet_manifest_ref != current.facet_manifest_ref {
+        return Err(WorkerError::InvalidRequest(
+            "executable_binding.facet_manifest_ref",
+        ));
+    }
+    if presented.grant_graph_revision != current.grant_graph_revision {
+        return Err(WorkerError::InvalidRequest(
+            "executable_binding.grant_graph_revision",
+        ));
+    }
+    if presented.replay_stream_id != current.replay_stream_id {
+        return Err(WorkerError::InvalidRequest(
+            "executable_binding.replay_stream_id",
+        ));
+    }
+    if presented.launch_nonce != current.launch_nonce {
+        return Err(WorkerError::InvalidRequest(
+            "executable_binding.launch_nonce",
+        ));
+    }
+    if presented.process_invocation_digest != current.process_invocation_digest {
+        return Err(WorkerError::InvalidRequest(
+            "executable_binding.process_invocation_digest",
+        ));
+    }
+    if presented.executable_binding_digest != current.executable_binding_digest {
+        return Err(WorkerError::InvalidRequest(
+            "executable_binding.executable_binding_digest",
+        ));
+    }
+    if presented.executable_wire_version != current.executable_wire_version {
+        return Err(WorkerError::UnsupportedVersion);
+    }
+    if !presented
+        .authority_epoch
+        .is_same_authority(&current.authority_epoch)
+    {
+        return Err(WorkerError::StaleEpoch);
+    }
+    if presented.generation != current.generation {
+        return Err(WorkerError::StaleFence);
+    }
+    if presented.state_fence != current.state_fence {
+        return Err(WorkerError::StaleFence);
+    }
+    Ok(())
 }
 
 /// Same-binding decision for one presented claim identity.

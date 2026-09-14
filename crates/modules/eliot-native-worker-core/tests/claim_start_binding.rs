@@ -1,12 +1,15 @@
-//! T5-01 claim-bound start tests (issue #22).
+//! T9-02 claim-bound start tests (issue #22).
 //!
 //! Binds `WorkerCore::demand_start_claimed` to one exact
-//! `ClaimAdmissionRequest`: a matching projection reaches the real
-//! admission port and then reports the U1 executable-binding gap instead
-//! of starting; every mismatched dimension fails before admission and
-//! never reaches `ProcessExecutor::start`. The port doubles below are
-//! faithful to `src/tests.rs` (admit through the real port shape, count
-//! starts) and bypass nothing.
+//! `ClaimAdmissionRequest` with the v2 executable join: a matching
+//! projection passes the production executable gate and reaches
+//! `ProcessExecutor::start`; every mismatched dimension fails before
+//! admission or at the typed executable refusal and never starts with
+//! stale authority. The port doubles below are faithful to `src/tests.rs`
+//! (admit through the real port shape, count starts) and bypass nothing.
+//! The table-driven mutation set exercises the production
+//! `NativeWorkerClaim::require_executable_binding` validator directly with
+//! real claim/registration/hello/process fixtures and no admission double.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Debug;
@@ -18,16 +21,18 @@ use eliot_agent_api::{
     AttemptId, AuthorityEnvelope, BudgetEnvelope, EffectCeiling, EffectKind, ResourceGeneration,
     StateFence, WorkLeaseId,
 };
-use eliot_contracts::{DecisionId, EpochId, EpochLineageId, SessionId, TaskId};
+use eliot_contracts::{DecisionId, EpochId, EpochLineageId, SessionId, TaskId, sha256_hex};
 use eliot_native_worker_core::{
     AdmissionLivenessOutcome, CapabilityAdmissionFacts, CapabilityAdmissionOutcome,
     CapabilityAdmissionPort, CapabilityAdmissionRequest, CapabilityLivenessRequest,
     ClaimAdmissionRequest, DurableCheckpointPort, DurableCheckpointRequest, DurableReplayPort,
     DurableRequestDecision, EXECUTION_UNIT_SCHEMA_VERSION, EffectAdmissionOutcome,
-    EffectAdmissionRequest, EventAckReceipt, JSON_ENCODING_PROFILE, NativeClaimId,
-    NativeRegistrationId, NativeRenewalId, NativeWorkerClaim, NativeWorkerRegistration,
-    PROTOCOL_VERSION, ProviderFailure, WorkerCore, WorkerError, WorkerEventDraft,
-    WorkerEventEnvelope, WorkerHello, WorkerLifecycle,
+    EffectAdmissionRequest, EventAckReceipt, JSON_ENCODING_PROFILE,
+    NATIVE_WORKER_CLAIM_WIRE_VERSION, NATIVE_WORKER_CLAIM_WIRE_VERSION_V1,
+    NATIVE_WORKER_EXECUTABLE_BINDING_EXPECTED_WIRE_VERSION, NativeClaimId, NativeRegistrationId,
+    NativeRenewalId, NativeWorkerClaim, NativeWorkerExecutableBinding,
+    NativeWorkerExecutableExpectation, NativeWorkerRegistration, PROTOCOL_VERSION, ProviderFailure,
+    WorkerCore, WorkerError, WorkerEventDraft, WorkerEventEnvelope, WorkerHello, WorkerLifecycle,
 };
 use eliot_process::SessionId as ProcessSessionId;
 use eliot_process::{
@@ -119,6 +124,14 @@ impl CapabilityAdmissionPort for FakeAdmission {
             } else {
                 facts.with_claim_binding(presented.claim())
             };
+            if !self.corrupt_claim_echo
+                && let Some(join) = &presented.claim().executable_binding
+            {
+                facts = facts.with_executable_expectation(NativeWorkerExecutableExpectation {
+                    current: join.clone(),
+                    revoked: false,
+                });
+            }
         }
         Ok(CapabilityAdmissionOutcome::Admitted(Box::new(facts)))
     }
@@ -378,7 +391,63 @@ fn registration() -> NativeWorkerRegistration {
     }
 }
 
+/// Opaque owner-produced executable digest stand-in.
+///
+/// Deterministic SHA-256 over stable seed bytes through the real hash
+/// procedure — never hardcoded. Opaque to the join, which compares it for
+/// equality only.
+fn owner_issued_digest() -> String {
+    sha256_hex(b"t9-02 w-c owner-issued executable digest stand-in")
+}
+
+fn valid_join(
+    registration: &NativeWorkerRegistration,
+    hello_value: &WorkerHello,
+    process: &ProcessRequest,
+) -> NativeWorkerExecutableBinding {
+    NativeWorkerExecutableBinding {
+        route_ref: hello_value.route_ref.clone(),
+        adapter_id: "adapter-test".to_owned(),
+        adapter_revision: 3,
+        config_digest: registration.worker_config_digest.clone(),
+        facet_manifest_ref: "facet-manifest-7".to_owned(),
+        grant_graph_revision: 5,
+        replay_stream_id: "worker-stream-1".to_owned(),
+        launch_nonce: hello_value.launch_nonce.clone(),
+        process_invocation_digest: process.invocation_digest().to_owned(),
+        authority_epoch: epoch(),
+        generation: load(ResourceGeneration::new(1)),
+        state_fence: fence(),
+        deadline_unix_ms: 8_000,
+        expires_at_unix_ms: 9_500,
+        executable_wire_version: NATIVE_WORKER_EXECUTABLE_BINDING_EXPECTED_WIRE_VERSION,
+        executable_binding_digest: owner_issued_digest(),
+    }
+}
+
+fn valid_expected(
+    registration: &NativeWorkerRegistration,
+    hello_value: &WorkerHello,
+    process: &ProcessRequest,
+) -> NativeWorkerExecutableExpectation {
+    NativeWorkerExecutableExpectation {
+        current: valid_join(registration, hello_value, process),
+        revoked: false,
+    }
+}
+
 fn claim(registration: &NativeWorkerRegistration) -> NativeWorkerClaim {
+    let hello_value = hello();
+    let process = process_request();
+    claim_with(registration, &hello_value, &process)
+}
+
+fn claim_with(
+    registration: &NativeWorkerRegistration,
+    hello_value: &WorkerHello,
+    process: &ProcessRequest,
+) -> NativeWorkerClaim {
+    let join = valid_join(registration, hello_value, process);
     let draft = NativeWorkerClaim {
         claim_id: load(NativeClaimId::new("claim-1")),
         registration_id: registration.registration_id.clone(),
@@ -405,6 +474,8 @@ fn claim(registration: &NativeWorkerRegistration) -> NativeWorkerClaim {
         predecessor_revision: "rev-0".to_owned(),
         authority_epoch: epoch(),
         state_fence: fence(),
+        wire_version: NATIVE_WORKER_CLAIM_WIRE_VERSION,
+        executable_binding: Some(join),
         binding_digest: String::new(),
     };
     load(draft.with_computed_digest())
@@ -540,7 +611,7 @@ fn tamper_attempt_without_redigest(
 }
 
 #[test]
-fn matching_projection_reaches_admission_then_reports_u1_gap() {
+fn matching_projection_passes_executable_gate_and_reaches_start() {
     let Fixture {
         mut core,
         executor_starts,
@@ -552,12 +623,16 @@ fn matching_projection_reaches_admission_then_reports_u1_gap() {
     let expected_digest = claim_value.binding_digest.clone();
     let request = claim_request(&registration, &claim_value);
     let result = block_on(core.demand_start_claimed(request, hello(), process_request()));
-    assert_eq!(
-        result,
-        Err(WorkerError::InvalidRequest("u1_missing_route_fingerprint"))
+    // The valid v2 join passes the production executable gate and reaches
+    // P-03; the test double has no process to start, so the downstream
+    // proof fails with a process error — never the old u1 gap, and never
+    // with stale authority.
+    assert!(
+        matches!(result, Err(WorkerError::Process(_))),
+        "valid join must pass the executable gate, got {result:?}"
     );
     assert_eq!(*lock(&admissions), 1);
-    assert_eq!(*lock(&executor_starts), 0);
+    assert_eq!(*lock(&executor_starts), 1);
     assert_eq!((*lock(&last_claim_digest)).clone(), Some(expected_digest));
     assert_eq!(core.lifecycle(), WorkerLifecycle::Created);
 }
@@ -624,6 +699,247 @@ fn disagreeing_grant_claim_echo_fails_closed_before_start() {
     assert_eq!(*lock(&admissions), 1);
     assert_eq!(*lock(&executor_starts), 0);
     assert_eq!(core.lifecycle(), WorkerLifecycle::Created);
+}
+
+#[test]
+fn executable_join_mutations_reject_typed_through_production_validator() {
+    struct JoinFixture {
+        claim: NativeWorkerClaim,
+        expected: NativeWorkerExecutableExpectation,
+        now_ms: u64,
+    }
+
+    fn valid_fixture() -> JoinFixture {
+        let registration = registration();
+        let hello_value = hello();
+        let process = process_request();
+        let claim = claim_with(&registration, &hello_value, &process);
+        let expected = valid_expected(&registration, &hello_value, &process);
+        JoinFixture {
+            claim,
+            expected,
+            now_ms: 6_000,
+        }
+    }
+
+    fn rebind(fixture: &mut JoinFixture) {
+        fixture.claim.binding_digest = load(fixture.claim.compute_binding_digest());
+    }
+
+    fn join_of(fixture: &mut JoinFixture) -> &mut NativeWorkerExecutableBinding {
+        fixture
+            .claim
+            .executable_binding
+            .as_mut()
+            .expect("v2 fixture carries the join")
+    }
+
+    fn epoch2() -> EpochId {
+        load(EpochId::new(
+            load(EpochLineageId::new("550e8400-e29b-41d4-a716-446655440000")),
+            load(std::num::NonZeroU64::new(2).ok_or("non-zero test sequence")),
+        ))
+    }
+
+    // The valid owner record passes the production validator end to end:
+    // shape, hello/process join (no admission double), and the
+    // expected-record gate.
+    {
+        let registration = registration();
+        let hello_value = hello();
+        let process = process_request();
+        let claim = claim_with(&registration, &hello_value, &process);
+        let expected = valid_expected(&registration, &hello_value, &process);
+        load(claim.validate());
+        let presented = load(serde_json::from_value::<ClaimAdmissionRequest>(
+            serde_json::json!({"registration": registration, "claim": claim}),
+        ));
+        load(CapabilityAdmissionRequest::from_claim(
+            &presented,
+            &hello_value,
+            &process,
+        ));
+        load(
+            claim_with(&registration, &hello_value, &process)
+                .require_executable_binding(&expected, 6_000),
+        );
+    }
+
+    struct MutationCase {
+        name: &'static str,
+        mutate: fn(&mut JoinFixture),
+        rebind_claim: bool,
+        expected: WorkerError,
+    }
+
+    let cases: Vec<MutationCase> = vec![
+        MutationCase {
+            name: "changed route",
+            mutate: |fixture| {
+                join_of(fixture).route_ref = "route://changed".to_owned();
+            },
+            rebind_claim: true,
+            expected: WorkerError::InvalidRequest("executable_binding.route_ref"),
+        },
+        MutationCase {
+            name: "changed adapter revision",
+            mutate: |fixture| {
+                join_of(fixture).adapter_revision = 4;
+            },
+            rebind_claim: true,
+            expected: WorkerError::InvalidRequest("executable_binding.adapter"),
+        },
+        MutationCase {
+            name: "changed config digest",
+            mutate: |fixture| {
+                join_of(fixture).config_digest = "e".repeat(64);
+            },
+            rebind_claim: true,
+            expected: WorkerError::InvalidRequest("executable_binding.config_digest"),
+        },
+        MutationCase {
+            name: "changed facet manifest",
+            mutate: |fixture| {
+                join_of(fixture).facet_manifest_ref = "facet-manifest-9".to_owned();
+            },
+            rebind_claim: true,
+            expected: WorkerError::InvalidRequest("executable_binding.facet_manifest_ref"),
+        },
+        MutationCase {
+            name: "changed grant revision",
+            mutate: |fixture| {
+                join_of(fixture).grant_graph_revision = 6;
+            },
+            rebind_claim: true,
+            expected: WorkerError::InvalidRequest("executable_binding.grant_graph_revision"),
+        },
+        MutationCase {
+            name: "changed replay stream",
+            mutate: |fixture| {
+                join_of(fixture).replay_stream_id = "stream-other/gen-1".to_owned();
+            },
+            rebind_claim: true,
+            expected: WorkerError::InvalidRequest("executable_binding.replay_stream_id"),
+        },
+        MutationCase {
+            name: "changed launch nonce",
+            mutate: |fixture| {
+                join_of(fixture).launch_nonce = "changed-nonce-0123456789abcdef".to_owned();
+            },
+            rebind_claim: true,
+            expected: WorkerError::InvalidRequest("executable_binding.launch_nonce"),
+        },
+        MutationCase {
+            name: "changed invocation digest",
+            mutate: |fixture| {
+                join_of(fixture).process_invocation_digest = "e".repeat(64);
+            },
+            rebind_claim: true,
+            expected: WorkerError::InvalidRequest("executable_binding.process_invocation_digest"),
+        },
+        MutationCase {
+            name: "changed owner digest",
+            mutate: |fixture| {
+                join_of(fixture).executable_binding_digest = "e".repeat(64);
+            },
+            rebind_claim: true,
+            expected: WorkerError::InvalidRequest("executable_binding.executable_binding_digest"),
+        },
+        MutationCase {
+            name: "join bound to a foreign claim epoch",
+            mutate: |fixture| {
+                let advanced = epoch2();
+                fixture.claim.authority_epoch = advanced.clone();
+                fixture.claim.state_fence =
+                    StateFence::new(advanced, load(ResourceGeneration::new(1)));
+            },
+            rebind_claim: true,
+            expected: WorkerError::StaleEpoch,
+        },
+        MutationCase {
+            name: "stale epoch while owner advanced",
+            mutate: |fixture| {
+                let advanced = epoch2();
+                fixture.expected.current.authority_epoch = advanced.clone();
+                fixture.expected.current.state_fence =
+                    StateFence::new(advanced, load(ResourceGeneration::new(1)));
+            },
+            rebind_claim: false,
+            expected: WorkerError::StaleEpoch,
+        },
+        MutationCase {
+            name: "stale generation while owner advanced",
+            mutate: |fixture| {
+                let advanced = load(ResourceGeneration::new(2));
+                fixture.expected.current.generation = advanced;
+                fixture.expected.current.state_fence = StateFence::new(epoch(), advanced);
+            },
+            rebind_claim: false,
+            expected: WorkerError::StaleFence,
+        },
+        MutationCase {
+            name: "revoked authority",
+            mutate: |fixture| {
+                fixture.expected.revoked = true;
+            },
+            rebind_claim: false,
+            expected: WorkerError::Revoked("executable_binding".to_owned()),
+        },
+        MutationCase {
+            name: "expired binding window",
+            mutate: |fixture| {
+                fixture.now_ms = 9_500;
+            },
+            rebind_claim: false,
+            expected: WorkerError::DeadlineExpired,
+        },
+        MutationCase {
+            name: "missing observation time",
+            mutate: |fixture| {
+                fixture.now_ms = 0;
+            },
+            rebind_claim: false,
+            expected: WorkerError::InvalidRequest("executable_binding.observation_time"),
+        },
+        MutationCase {
+            name: "old wire v1 never promotes",
+            mutate: |fixture| {
+                fixture.claim.wire_version = NATIVE_WORKER_CLAIM_WIRE_VERSION_V1;
+                fixture.claim.executable_binding = None;
+            },
+            rebind_claim: true,
+            expected: WorkerError::InvalidRequest("u1_old_wire_without_executable_binding"),
+        },
+        MutationCase {
+            name: "unknown wire stays rejected",
+            mutate: |fixture| {
+                fixture.claim.wire_version = 9;
+            },
+            rebind_claim: false,
+            expected: WorkerError::UnsupportedVersion,
+        },
+        MutationCase {
+            name: "v2 without join is missing not silent",
+            mutate: |fixture| {
+                fixture.claim.executable_binding = None;
+            },
+            rebind_claim: true,
+            expected: WorkerError::InvalidRequest("executable_binding"),
+        },
+    ];
+
+    for case in cases {
+        let mut fixture = valid_fixture();
+        (case.mutate)(&mut fixture);
+        if case.rebind_claim {
+            rebind(&mut fixture);
+        }
+        let error = fixture
+            .claim
+            .require_executable_binding(&fixture.expected, fixture.now_ms)
+            .unwrap_err();
+        assert_eq!(error, case.expected, "mutation: {}", case.name);
+    }
 }
 
 #[test]
