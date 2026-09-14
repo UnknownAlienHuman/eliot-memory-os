@@ -531,6 +531,7 @@ where
             request: &request,
             manifest: &manifest,
             attempt_id: attempt.attempt_id.as_str(),
+            epoch: &epoch,
             sink,
             process_request: process,
             now,
@@ -1331,6 +1332,7 @@ mod tests {
                 attempt_id: ATTEMPT_ID,
                 operation_id,
                 reconciliation_key: reconciliation_key.as_str(),
+                epoch: &test_epoch(),
                 now,
             })
             .await
@@ -1406,6 +1408,51 @@ mod tests {
         assert!(matches!(
             error,
             AdapterError::Admission(DoctorError::OperationNotAdmitted)
+        ));
+        assert_eq!(error.exit_code(), EXIT_KERNEL_ADMISSION_REQUIRED);
+        assert_eq!(transport.submits, 1);
+        assert_eq!(executor.lock().starts, 0);
+    }
+
+    fn foreign_epoch() -> EpochId {
+        EpochId::new(
+            EpochLineageId::new("660e8400-e29b-41d4-a716-446655440001").expect("test lineage"),
+            NonZeroU64::new(7).expect("test sequence"),
+        )
+        .expect("test epoch")
+    }
+
+    #[tokio::test]
+    async fn foreign_lineage_epoch_fails_closed_without_effect() {
+        let now = OffsetDateTime::now_utc();
+        let (request, manifest) = effect_request(now);
+        let epoch = test_epoch();
+        let admission = honest_admission(&request, &manifest, ATTEMPT_ID, EFFECT_SEQ, &epoch, now);
+        let mut transport = FakeTransport::admitting(admission);
+        let executor = Arc::new(FakeExecutor::new(FakeMode::Success));
+        // The admission was honestly bound under the request fence lineage,
+        // but the dispatch presentation carries a foreign lineage: the
+        // lineage-aware attempt binding must refuse before any intent or
+        // effect, even though the envelope submit itself succeeds.
+        let presented = PresentedAttempt {
+            attempt: test_envelope(&request, ATTEMPT_ID, EFFECT_SEQ),
+            request,
+            manifest,
+            process: test_process_request(),
+            epoch: foreign_epoch(),
+        };
+        let error = drive_admitted_attempt(
+            &mut transport,
+            Arc::clone(&executor),
+            Arc::new(EvidenceCollector::new()),
+            presented,
+            now,
+        )
+        .await
+        .expect_err("foreign lineage fails closed");
+        assert!(matches!(
+            error,
+            AdapterError::Admission(DoctorError::InvalidFence)
         ));
         assert_eq!(error.exit_code(), EXIT_KERNEL_ADMISSION_REQUIRED);
         assert_eq!(transport.submits, 1);
