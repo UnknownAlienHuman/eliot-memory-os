@@ -4,8 +4,8 @@ use std::collections::BTreeSet;
 
 use eliot_agent_contracts::AgentAttemptId;
 use eliot_contracts::{
-    AuthorityEpoch, OperationId, PolicyRevision, ProductId, RequestId, ResourceGeneration,
-    SourceId, StateFence, TaskRevision,
+    EpochId, EpochLineageId, OperationId, PolicyRevision, ProductId, RequestId,
+    ResourceGeneration, SourceId, StateFence, TaskRevision,
 };
 use eliot_memory_curation_contracts::*;
 use eliot_receipts::WorkScopeId;
@@ -16,7 +16,15 @@ fn digest() -> Digest {
 }
 
 fn fence() -> StateFence {
-    let mut fence = StateFence::new(AuthorityEpoch::genesis(), ResourceGeneration::genesis());
+    let mut fence = StateFence::new(
+        EpochId::new(
+            EpochLineageId::new("550e8400-e29b-41d4-a716-446655440000")
+                .expect("valid test lineage"),
+            std::num::NonZeroU64::new(1).expect("nonzero test sequence"),
+        )
+        .expect("valid test epoch"),
+        ResourceGeneration::genesis(),
+    );
     fence.policy_revision = Some(PolicyRevision::genesis());
     fence
 }
