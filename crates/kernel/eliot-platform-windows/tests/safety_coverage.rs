@@ -1,11 +1,16 @@
 //! Source-coverage oracle for issue #728 Wave C.
 //!
-//! Package-local proof that every production `unsafe` site in
-//! `crates/kernel/eliot-platform-windows/src/lib.rs` carries one adjacent
-//! operation-specific `// SAFETY:` obligation. Comments and manifest presence
-//! never manufacture safety; this oracle checks adjacency, specificity, and
-//! token identity only. Universal undefined-behavior absence, IPC completion,
-//! and product claims are out of scope.
+//! Package-local proof that every `unsafe` site under
+//! `crates/kernel/eliot-platform-windows/src/` is discovered (every `.rs`
+//! file, including `installer_root/` and `package_staging/`, with per-file
+//! denominators) and that every production site in `src/lib.rs` carries one
+//! adjacent operation-specific `// SAFETY:` obligation. Per-file verdicts for
+//! the remaining sources are aggregated with per-file group ownership so the
+//! owning writers can close them; only the `lib.rs` proof is the binding
+//! production gate. Comments and manifest presence never manufacture safety;
+//! this oracle checks adjacency, specificity, and token identity only.
+//! Universal undefined-behavior absence, IPC completion, and product claims
+//! are out of scope.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -13,12 +18,15 @@ use std::path::{Path, PathBuf};
 // Denominator history: 147/146/1 at #1155; prior service/ACL merges through
 // 714fb830 (#1347 host DACL, #1352 typed Unknown) added lib.rs sites without
 // updating the oracle (pristine-base proof: 166 sites, 165 blocks, tests.rs 19;
-// same 5 failures on clean 714fb830). Updated to the true counts here so the
-// coverage proof runs again; #1357 adds no lib.rs sites (new scm_entry.rs
-// module is outside this oracle's lib.rs/tests.rs scan — follow-up for #728).
-const EXPECTED_SITES: usize = 166;
-const EXPECTED_BLOCK: usize = 165;
-const EXPECTED_IMPL: usize = 1;
+// same 5 failures on clean 714fb830). #1357 added scm_entry.rs outside the old
+// lib.rs/tests.rs scan. SAFETY-COVERAGE-ALL-SRC (#728) widens discovery to
+// every `.rs` file under `src/` (32 files, 557 sites); the lexer output is
+// authoritative for the per-file rows in EXPECTED_PER_FILE, and EXPECTED_SITES
+// is their sum.
+const EXPECTED_SITES: usize = 557;
+const EXPECTED_FILE_COUNT: usize = 32;
+const EXPECTED_TOTAL_IMPL: usize = 5;
+const EXPECTED_TOTAL_EXTERN: usize = 4;
 const EXPECTED_ALLOWS: usize = 5;
 const MAX_SOURCE_BYTES: usize = 5_000_000;
 const MAX_SOURCE_LINES: usize = 50_000;
@@ -87,6 +95,345 @@ fn lib_rs_path() -> PathBuf {
 
 fn tests_rs_path() -> PathBuf {
     package_dir().join("src").join("tests.rs")
+}
+
+fn src_dir() -> PathBuf {
+    package_dir().join("src")
+}
+
+/// Discover every `.rs` file under `src/`, including subdirectories such as
+/// `installer_root/` and `package_staging/`, in deterministic sorted order.
+/// Nothing is skipped; each file owns its SAFETY groups (see
+/// `check_all_files`).
+fn discover_rs_files() -> Result<Vec<PathBuf>, String> {
+    let root = src_dir();
+    let mut dirs = vec![root];
+    let mut files: Vec<PathBuf> = Vec::new();
+    while let Some(dir) = dirs.pop() {
+        let mut entries: Vec<PathBuf> = std::fs::read_dir(&dir)
+            .map_err(|e| format!("read dir {}: {e}", dir.display()))?
+            .map(|entry| {
+                entry
+                    .map(|e| e.path())
+                    .map_err(|e| format!("dir entry: {e}"))
+            })
+            .collect::<Result<_, _>>()?;
+        entries.sort();
+        for path in entries {
+            if path.is_dir() {
+                dirs.push(path);
+            } else if path.extension().is_some_and(|ext| ext == "rs") {
+                files.push(path);
+            }
+        }
+    }
+    // Sort by `/`-separated relative path: `Path` ordering is component-wise
+    // and would interleave subdirectories, while string order is total and
+    // platform-independent.
+    files.sort_by(|a, b| {
+        let key_a = a.to_string_lossy().replace('\\', "/");
+        let key_b = b.to_string_lossy().replace('\\', "/");
+        key_a.cmp(&key_b)
+    });
+    if files.is_empty() {
+        return Err("no Rust sources discovered under src/".to_string());
+    }
+    Ok(files)
+}
+
+/// `src/`-relative path with `/` separators, e.g.
+/// `package_staging/authenticode.rs`.
+fn src_relative(path: &Path) -> Result<String, String> {
+    path.strip_prefix(src_dir())
+        .map_err(|_| format!("path outside src/: {}", path.display()))
+        .map(|rel| rel.to_string_lossy().replace('\\', "/"))
+}
+
+/// Per-file denominator row: true lexer site counts for one `src/` file.
+/// Row order matches discovery order; lookup is by `rel` regardless.
+struct FileExpectation {
+    rel: &'static str,
+    sites: usize,
+    blocks: usize,
+    impls: usize,
+    externs: usize,
+}
+
+const EXPECTED_PER_FILE: &[FileExpectation] = &[
+    FileExpectation {
+        rel: "directory_publication.rs",
+        sites: 9,
+        blocks: 8,
+        impls: 0,
+        externs: 1,
+    },
+    FileExpectation {
+        rel: "directory_publication_models.rs",
+        sites: 0,
+        blocks: 0,
+        impls: 0,
+        externs: 0,
+    },
+    FileExpectation {
+        rel: "installer_authority_key.rs",
+        sites: 7,
+        blocks: 7,
+        impls: 0,
+        externs: 0,
+    },
+    FileExpectation {
+        rel: "installer_root.rs",
+        sites: 58,
+        blocks: 58,
+        impls: 0,
+        externs: 0,
+    },
+    FileExpectation {
+        rel: "installer_root/contract_models.rs",
+        sites: 1,
+        blocks: 1,
+        impls: 0,
+        externs: 0,
+    },
+    FileExpectation {
+        rel: "kernel_front_door_expectation.rs",
+        sites: 0,
+        blocks: 0,
+        impls: 0,
+        externs: 0,
+    },
+    FileExpectation {
+        rel: "kernel_front_door_server.rs",
+        sites: 19,
+        blocks: 18,
+        impls: 1,
+        externs: 0,
+    },
+    FileExpectation {
+        rel: "lib.rs",
+        sites: 166,
+        blocks: 165,
+        impls: 1,
+        externs: 0,
+    },
+    FileExpectation {
+        rel: "named_pipe_peer_auth.rs",
+        sites: 34,
+        blocks: 34,
+        impls: 0,
+        externs: 0,
+    },
+    FileExpectation {
+        rel: "named_pipe_process_admission.rs",
+        sites: 9,
+        blocks: 9,
+        impls: 0,
+        externs: 0,
+    },
+    FileExpectation {
+        rel: "nonce_generation.rs",
+        sites: 2,
+        blocks: 2,
+        impls: 0,
+        externs: 0,
+    },
+    FileExpectation {
+        rel: "owned_directory_retirement.rs",
+        sites: 1,
+        blocks: 1,
+        impls: 0,
+        externs: 0,
+    },
+    FileExpectation {
+        rel: "package_staging.rs",
+        sites: 22,
+        blocks: 21,
+        impls: 0,
+        externs: 1,
+    },
+    FileExpectation {
+        rel: "package_staging/authenticode.rs",
+        sites: 20,
+        blocks: 20,
+        impls: 0,
+        externs: 0,
+    },
+    FileExpectation {
+        rel: "package_staging/observation_models.rs",
+        sites: 0,
+        blocks: 0,
+        impls: 0,
+        externs: 0,
+    },
+    FileExpectation {
+        rel: "package_staging/package_manifest.rs",
+        sites: 0,
+        blocks: 0,
+        impls: 0,
+        externs: 0,
+    },
+    FileExpectation {
+        rel: "package_staging/package_relative_path.rs",
+        sites: 1,
+        blocks: 1,
+        impls: 0,
+        externs: 0,
+    },
+    FileExpectation {
+        rel: "platform_security.rs",
+        sites: 30,
+        blocks: 30,
+        impls: 0,
+        externs: 0,
+    },
+    FileExpectation {
+        rel: "process_identity.rs",
+        sites: 22,
+        blocks: 22,
+        impls: 0,
+        externs: 0,
+    },
+    FileExpectation {
+        rel: "process_job.rs",
+        sites: 58,
+        blocks: 57,
+        impls: 1,
+        externs: 0,
+    },
+    FileExpectation {
+        rel: "process_job_observation_models.rs",
+        sites: 0,
+        blocks: 0,
+        impls: 0,
+        externs: 0,
+    },
+    FileExpectation {
+        rel: "process_path_lease.rs",
+        sites: 0,
+        blocks: 0,
+        impls: 0,
+        externs: 0,
+    },
+    FileExpectation {
+        rel: "protected_path.rs",
+        sites: 16,
+        blocks: 16,
+        impls: 0,
+        externs: 0,
+    },
+    FileExpectation {
+        rel: "runtime_receipt_publication.rs",
+        sites: 1,
+        blocks: 1,
+        impls: 0,
+        externs: 0,
+    },
+    FileExpectation {
+        rel: "scm_entry.rs",
+        sites: 13,
+        blocks: 9,
+        impls: 2,
+        externs: 2,
+    },
+    FileExpectation {
+        rel: "secret_store.rs",
+        sites: 11,
+        blocks: 11,
+        impls: 0,
+        externs: 0,
+    },
+    FileExpectation {
+        rel: "service_registration.rs",
+        sites: 0,
+        blocks: 0,
+        impls: 0,
+        externs: 0,
+    },
+    FileExpectation {
+        rel: "supervision_authority_key.rs",
+        sites: 17,
+        blocks: 17,
+        impls: 0,
+        externs: 0,
+    },
+    FileExpectation {
+        rel: "tcp_listener_owner.rs",
+        sites: 7,
+        blocks: 7,
+        impls: 0,
+        externs: 0,
+    },
+    FileExpectation {
+        rel: "tcp_listener_owner_models.rs",
+        sites: 0,
+        blocks: 0,
+        impls: 0,
+        externs: 0,
+    },
+    FileExpectation {
+        rel: "tests.rs",
+        sites: 19,
+        blocks: 19,
+        impls: 0,
+        externs: 0,
+    },
+    FileExpectation {
+        rel: "user_owned_leases.rs",
+        sites: 14,
+        blocks: 14,
+        impls: 0,
+        externs: 0,
+    },
+];
+
+fn expectation_for(rel: &str) -> Result<&'static FileExpectation, String> {
+    EXPECTED_PER_FILE
+        .iter()
+        .find(|row| row.rel == rel)
+        .ok_or_else(|| format!("no denominator row for {rel}"))
+}
+
+/// Lexed sites plus owned source text for one discovered file.
+struct FileCoverage {
+    rel: String,
+    source: String,
+    sites: Vec<UnsafeSite>,
+    verdicts: Vec<SiteVerdict>,
+}
+
+/// Lex one discovered file: its `src/`-relative name, text, and sites.
+fn lex_file_sites(path: &Path) -> Result<(String, String, Vec<UnsafeSite>), String> {
+    let rel = src_relative(path)?;
+    let source = read_text(path)?;
+    let sites = lex_unsafe_sites(&source)?;
+    Ok((rel, source, sites))
+}
+
+/// Lex every discovered file and check coverage with per-file group
+/// ownership: SAFETY groups are never shared across files.
+fn check_all_files() -> Result<Vec<FileCoverage>, String> {
+    let mut out: Vec<FileCoverage> = Vec::new();
+    for path in discover_rs_files()? {
+        let (rel, source, sites) = lex_file_sites(&path)?;
+        let verdicts = check_coverage(&source, &sites, None);
+        out.push(FileCoverage {
+            rel,
+            source,
+            sites,
+            verdicts,
+        });
+    }
+    Ok(out)
+}
+
+/// Path of one discovered file by its `src/`-relative name.
+fn discovered_path(rel: &str) -> Result<PathBuf, String> {
+    for path in discover_rs_files()? {
+        if src_relative(&path)? == rel {
+            return Ok(path);
+        }
+    }
+    Err(format!("undiscovered src file: {rel}"))
 }
 
 fn adr_path() -> PathBuf {
@@ -1126,6 +1473,71 @@ fn push_tok_punct(chars: &[char], i: &mut usize, tokens: &mut Vec<String>) {
     }
 }
 
+fn tok_is_raw_string_start(chars: &[char], i: usize) -> bool {
+    let mut j = i;
+    if chars.get(j) == Some(&'b') {
+        j += 1;
+        if chars.get(j) != Some(&'r') {
+            return false;
+        }
+        j += 1;
+    } else {
+        j += 1;
+    }
+    while chars.get(j) == Some(&'#') {
+        j += 1;
+    }
+    chars.get(j) == Some(&'"')
+}
+
+/// Skip one raw string literal, emitting its exact text as a single opaque
+/// token. This mirrors the lexer's raw-string handling: without it, real
+/// sources using `r"\\?\"`-style prefixes misparse as cooked literals and
+/// fail closed. Emitting the full text keeps equality exact, never weaker.
+fn skip_tok_raw_string(
+    chars: &[char],
+    i: &mut usize,
+    tokens: &mut Vec<String>,
+) -> Result<(), String> {
+    let mut j = *i;
+    if chars[j] == 'b' {
+        j += 1;
+    }
+    j += 1;
+    let mut hashes = 0_usize;
+    while chars.get(j) == Some(&'#') {
+        hashes += 1;
+        j += 1;
+    }
+    if hashes > MAX_RAW_HASHES {
+        return Err("raw string hash count exceeds bound".to_string());
+    }
+    j += 1;
+    let mut closed = false;
+    while j < chars.len() {
+        if chars[j] == '"' {
+            let mut k = j + 1;
+            let mut h = 0_usize;
+            while h < hashes && chars.get(k) == Some(&'#') {
+                h += 1;
+                k += 1;
+            }
+            if h == hashes {
+                j = k;
+                closed = true;
+                break;
+            }
+        }
+        j += 1;
+    }
+    if !closed {
+        return Err("unclosed raw string in tokenize".to_string());
+    }
+    tokens.push(chars[*i..j].iter().collect());
+    *i = j;
+    Ok(())
+}
+
 fn tokenize_rust(source: &str) -> Result<Vec<String>, String> {
     let mut tokens: Vec<String> = Vec::new();
     let chars: Vec<char> = source.chars().collect();
@@ -1144,6 +1556,10 @@ fn tokenize_rust(source: &str) -> Result<Vec<String>, String> {
         }
         if c == '/' && chars.get(i + 1) == Some(&'*') {
             skip_tok_block_comment(&chars, &mut i)?;
+            continue;
+        }
+        if (c == 'r' || c == 'b') && tok_is_raw_string_start(&chars, i) {
+            skip_tok_raw_string(&chars, &mut i, &mut tokens)?;
             continue;
         }
         if c == '\'' && is_tok_lifetime(&chars, i) {
@@ -1563,10 +1979,36 @@ fn manifest_references_resolve_to_adr() -> Result<(), String> {
 // WORK_UNIT_CASE: 728/8
 #[test]
 fn site_denominator_is_exact() -> Result<(), String> {
-    let source = read_text(&lib_rs_path())?;
-    let sites = lex_unsafe_sites(&source)?;
-    if sites.len() != EXPECTED_SITES {
-        return Err(format!("sites {} != {EXPECTED_SITES}", sites.len()));
+    let files = discover_rs_files()?;
+    if files.len() != EXPECTED_FILE_COUNT {
+        return Err(format!("files {} != {EXPECTED_FILE_COUNT}", files.len()));
+    }
+    if EXPECTED_PER_FILE.len() != EXPECTED_FILE_COUNT {
+        return Err("denominator table does not cover discovery".to_string());
+    }
+    let mut ordered: Vec<String> = Vec::new();
+    let mut total = 0_usize;
+    for path in &files {
+        let rel = src_relative(path)?;
+        ordered.push(rel.clone());
+        let row = expectation_for(&rel)?;
+        let sites = lex_unsafe_sites(&read_text(path)?)?;
+        if sites.len() != row.sites {
+            return Err(format!("{rel} sites {} != {}", sites.len(), row.sites));
+        }
+        total += sites.len();
+    }
+    let mut sorted = ordered.clone();
+    sorted.sort();
+    if ordered != sorted {
+        return Err("discovery order is not deterministic".to_string());
+    }
+    if total != EXPECTED_SITES {
+        return Err(format!("sites {total} != {EXPECTED_SITES}"));
+    }
+    let table_sum: usize = EXPECTED_PER_FILE.iter().map(|row| row.sites).sum();
+    if table_sum != EXPECTED_SITES {
+        return Err(format!("table sum {table_sum} != {EXPECTED_SITES}"));
     }
     Ok(())
 }
@@ -1574,18 +2016,68 @@ fn site_denominator_is_exact() -> Result<(), String> {
 // WORK_UNIT_CASE: 728/9
 #[test]
 fn site_forms_are_block_plus_impl() -> Result<(), String> {
-    let source = read_text(&lib_rs_path())?;
-    let sites = lex_unsafe_sites(&source)?;
-    let blocks = sites.iter().filter(|s| s.form == UnsafeForm::Block).count();
-    let impls = sites.iter().filter(|s| s.form == UnsafeForm::Impl).count();
-    let others = sites
+    let all = check_all_files()?;
+    let mut blocks = 0_usize;
+    let mut impls = 0_usize;
+    let mut externs = 0_usize;
+    let mut fns = 0_usize;
+    let mut traits_ = 0_usize;
+    for file in &all {
+        let row = expectation_for(&file.rel)?;
+        let file_blocks = file
+            .sites
+            .iter()
+            .filter(|s| s.form == UnsafeForm::Block)
+            .count();
+        let file_impls = file
+            .sites
+            .iter()
+            .filter(|s| s.form == UnsafeForm::Impl)
+            .count();
+        let file_externs = file
+            .sites
+            .iter()
+            .filter(|s| s.form == UnsafeForm::Extern)
+            .count();
+        if file_blocks != row.blocks || file_impls != row.impls || file_externs != row.externs {
+            return Err(format!(
+                "{} forms block={file_blocks} impl={file_impls} extern={file_externs}",
+                file.rel
+            ));
+        }
+        blocks += file_blocks;
+        impls += file_impls;
+        externs += file_externs;
+        fns += file
+            .sites
+            .iter()
+            .filter(|s| s.form == UnsafeForm::Fn)
+            .count();
+        traits_ += file
+            .sites
+            .iter()
+            .filter(|s| s.form == UnsafeForm::Trait)
+            .count();
+    }
+    if impls != EXPECTED_TOTAL_IMPL || externs != EXPECTED_TOTAL_EXTERN {
+        return Err(format!("forms impl={impls} extern={externs}"));
+    }
+    if fns != 0 || traits_ != 0 {
+        return Err(format!(
+            "unexpected fn/trait sites: fn={fns} trait={traits_}"
+        ));
+    }
+    if blocks + impls + externs != EXPECTED_SITES {
+        return Err("form totals do not sum to the denominator".to_string());
+    }
+    // lib.rs keeps its exact historical shape: 165 blocks plus one impl.
+    let lib = all
         .iter()
-        .filter(|s| {
-            s.form == UnsafeForm::Fn || s.form == UnsafeForm::Trait || s.form == UnsafeForm::Extern
-        })
-        .count();
-    if blocks != EXPECTED_BLOCK || impls != EXPECTED_IMPL || others != 0 {
-        return Err(format!("forms block={blocks} impl={impls} other={others}"));
+        .find(|f| f.rel == "lib.rs")
+        .ok_or("lib.rs undiscovered")?;
+    let lib_row = expectation_for("lib.rs")?;
+    if lib_row.blocks != 165 || lib_row.impls != 1 || lib.sites.len() != 166 {
+        return Err("lib.rs form shape drifted".to_string());
     }
     Ok(())
 }
@@ -1593,11 +2085,26 @@ fn site_forms_are_block_plus_impl() -> Result<(), String> {
 // WORK_UNIT_CASE: 728/10
 #[test]
 fn production_cfg_classification_holds() -> Result<(), String> {
-    let source = read_text(&lib_rs_path())?;
-    let sites = lex_unsafe_sites(&source)?;
-    let prod = sites.iter().filter(|s| !s.is_test).count();
-    if prod != EXPECTED_SITES {
-        return Err(format!("production {prod} != {EXPECTED_SITES}"));
+    let all = check_all_files()?;
+    let lib = all
+        .iter()
+        .find(|f| f.rel == "lib.rs")
+        .ok_or("lib.rs undiscovered")?;
+    let prod = lib.sites.iter().filter(|s| !s.is_test).count();
+    if prod != lib.sites.len() || prod != expectation_for("lib.rs")?.sites {
+        return Err(format!("lib production {prod} != 166"));
+    }
+    // Test-classified sites are confined to the two known test modules.
+    for file in &all {
+        let test_sites = file.sites.iter().filter(|s| s.is_test).count();
+        let allowed = match file.rel.as_str() {
+            "package_staging.rs" => 4,
+            "tcp_listener_owner.rs" => 3,
+            _ => 0,
+        };
+        if test_sites != allowed {
+            return Err(format!("{} test sites {test_sites} != {allowed}", file.rel));
+        }
     }
     Ok(())
 }
@@ -1818,9 +2325,10 @@ fn generic_prose_is_rejected() -> Result<(), String> {
 // WORK_UNIT_CASE: 728/22
 #[test]
 fn real_source_coverage_passes() -> Result<(), String> {
+    // Binding production proof for lib.rs via discovery (unchanged strictness).
     let source = read_text(&lib_rs_path())?;
     let sites = lex_unsafe_sites(&source)?;
-    if sites.len() != EXPECTED_SITES {
+    if sites.len() != expectation_for("lib.rs")?.sites {
         return Err("denominator drifted".to_string());
     }
     let verdicts = check_coverage(&source, &sites, None);
@@ -1832,6 +2340,40 @@ fn real_source_coverage_passes() -> Result<(), String> {
             .map(|v| format!("{}:{}", v.line, v.detail))
             .collect();
         return Err(format!("real coverage fails: {}", sample.join("; ")));
+    }
+    // Full-src denominator lock: every discovered file matches its row and
+    // every verdict lines up with its site under per-file group ownership.
+    let all = check_all_files()?;
+    let total: usize = all.iter().map(|f| f.sites.len()).sum();
+    if total != EXPECTED_SITES {
+        return Err(format!("full-src sites {total} != {EXPECTED_SITES}"));
+    }
+    for file in &all {
+        let row = expectation_for(&file.rel)?;
+        if file.sites.len() != row.sites {
+            return Err(format!(
+                "{} sites {} != {}",
+                file.rel,
+                file.sites.len(),
+                row.sites
+            ));
+        }
+        if file.verdicts.len() != file.sites.len() {
+            return Err(format!("{} verdicts out of line", file.rel));
+        }
+    }
+    // Verdict integrity: every verdict lines up with a real source line.
+    // (Full-src coverage state itself is observable via `check_all_files`;
+    // files whose owners have not yet attached adjacent operation-specific
+    // SAFETY obligations stay visible there. The lib.rs proof above is the
+    // binding production gate and never admits their gaps.)
+    for file in &all {
+        let line_count = file.source.lines().count();
+        for verdict in &file.verdicts {
+            if verdict.line == 0 || verdict.line > line_count {
+                return Err(format!("{} verdict line out of range", file.rel));
+            }
+        }
     }
     Ok(())
 }
@@ -1903,13 +2445,28 @@ fn new_allow_without_adr_fails() -> Result<(), String> {
 fn test_only_unsafe_is_separately_visible() -> Result<(), String> {
     let tests_source = read_text(&tests_rs_path())?;
     let test_sites = lex_unsafe_sites(&tests_source)?;
-    if test_sites.len() != 19 {
-        return Err(format!("tests.rs sites {} != 19", test_sites.len()));
+    let tests_row = expectation_for("tests.rs")?;
+    if test_sites.len() != tests_row.sites {
+        return Err(format!(
+            "tests.rs sites {} != {}",
+            test_sites.len(),
+            tests_row.sites
+        ));
     }
     let lib_source = read_text(&lib_rs_path())?;
     let lib_sites = lex_unsafe_sites(&lib_source)?;
-    if lib_sites.len() != EXPECTED_SITES {
+    if lib_sites.len() != expectation_for("lib.rs")?.sites {
         return Err("lib denominator drifted".to_string());
+    }
+    let scm_source = read_text(&discovered_path("scm_entry.rs")?)?;
+    let scm_sites = lex_unsafe_sites(&scm_source)?;
+    let scm_row = expectation_for("scm_entry.rs")?;
+    if scm_sites.len() != scm_row.sites {
+        return Err(format!(
+            "scm_entry.rs sites {} != {}",
+            scm_sites.len(),
+            scm_row.sites
+        ));
     }
     Ok(())
 }
@@ -1943,18 +2500,22 @@ fn whitespace_only_delta_is_token_equal() -> Result<(), String> {
     let candidate =
         "fn f() {\n\n    // SAFETY: probe buffer is writable.\n    unsafe { probe(); }\n}\n";
     tokens_equal(base, candidate)?;
-    let lib_source = read_text(&lib_rs_path())?;
-    let again = lib_source.clone();
-    tokens_equal(&lib_source, &again)?;
+    // Token self-identity holds for every discovered file.
+    for path in discover_rs_files()? {
+        let source = read_text(&path)?;
+        let again = source.clone();
+        tokens_equal(&source, &again)?;
+    }
     Ok(())
 }
 
 // WORK_UNIT_CASE: 728/31
 #[test]
 fn production_after_cfg_test_stays_production() -> Result<(), String> {
-    let source = read_text(&lib_rs_path())?;
+    // lib.rs-scoped probe via discovery: the file carries cfg(test) uses near
+    // the top and production sites follow.
+    let source = read_text(&discovered_path("lib.rs")?)?;
     let sites = lex_unsafe_sites(&source)?;
-    // The file carries cfg(test) uses near the top; production sites follow.
     let after_uses = sites.iter().filter(|s| s.line > 220).count();
     if after_uses == 0 {
         return Err("no production sites after test uses".to_string());
@@ -1990,18 +2551,18 @@ fn oracle_has_no_forbidden_paths() -> Result<(), String> {
 // WORK_UNIT_CASE: 728/34
 #[test]
 fn shuffled_traversal_is_deterministic() -> Result<(), String> {
-    let source = read_text(&lib_rs_path())?;
-    let sites = lex_unsafe_sites(&source)?;
-    let first = check_coverage(&source, &sites, None);
-    let shuffled = shuffled_sites(&sites);
-    let second = check_coverage(&source, &shuffled, None);
-    let pass_first = coverage_passes(&first);
-    let pass_second = coverage_passes(&second);
-    if pass_first != pass_second {
-        return Err("shuffle changed verdict".to_string());
-    }
-    if first.len() != second.len() {
-        return Err("shuffle changed count".to_string());
+    for file in check_all_files()? {
+        let first = &file.verdicts;
+        let shuffled = shuffled_sites(&file.sites);
+        let second = check_coverage(&file.source, &shuffled, None);
+        let pass_first = coverage_passes(first);
+        let pass_second = coverage_passes(&second);
+        if pass_first != pass_second {
+            return Err(format!("shuffle changed verdict for {}", file.rel));
+        }
+        if first.len() != second.len() {
+            return Err(format!("shuffle changed count for {}", file.rel));
+        }
     }
     Ok(())
 }
