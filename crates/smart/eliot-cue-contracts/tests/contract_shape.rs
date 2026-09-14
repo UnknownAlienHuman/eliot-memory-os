@@ -8,7 +8,9 @@
 // target production paths.
 #![allow(clippy::expect_used, clippy::unwrap_used)]
 
-use eliot_contracts::{AuthorityEpoch, ClockReading, ResourceGeneration, SourceId, StateFence};
+use eliot_contracts::{
+    ClockReading, EpochId, EpochLineageId, ResourceGeneration, SourceId, StateFence,
+};
 use eliot_cue_contracts::{
     ActivationBounds, ActivationBoundsSpec, ActivationRequest, ActivationRequestId,
     ActivationRequestSpec, ActivationResult, ActivationResultSpec, ActivationStrength,
@@ -36,7 +38,15 @@ fn digest(seed: u8) -> Digest {
 }
 
 fn fence() -> StateFence {
-    StateFence::new(AuthorityEpoch::genesis(), ResourceGeneration::genesis())
+    StateFence::new(
+        EpochId::new(
+            EpochLineageId::new("550e8400-e29b-41d4-a716-446655440002")
+                .expect("valid test lineage"),
+            std::num::NonZeroU64::new(1).expect("nonzero test sequence"),
+        )
+        .expect("valid test epoch"),
+        ResourceGeneration::genesis(),
+    )
 }
 
 fn provenance() -> Provenance {

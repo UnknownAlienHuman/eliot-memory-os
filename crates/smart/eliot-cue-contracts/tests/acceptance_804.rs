@@ -10,7 +10,7 @@
 #![allow(clippy::expect_used, clippy::unwrap_used)]
 
 use eliot_contracts::{
-    AuthorityEpoch, ClockReading, ReceiptId, ResourceGeneration, SourceId, StateFence,
+    ClockReading, EpochId, EpochLineageId, ReceiptId, ResourceGeneration, SourceId, StateFence,
 };
 use eliot_cue_contracts::{
     ActivationBounds, ActivationBoundsSpec, ActivationRequest, ActivationRequestId,
@@ -39,15 +39,22 @@ fn digest(seed: u8) -> Digest {
     Digest::new(format!("{seed:02x}").repeat(32)).expect("64 hex characters")
 }
 
+const TEST_LINEAGE: &str = "550e8400-e29b-41d4-a716-446655440001";
+
+fn epoch(sequence: u64) -> EpochId {
+    EpochId::new(
+        EpochLineageId::new(TEST_LINEAGE).expect("valid test lineage"),
+        std::num::NonZeroU64::new(sequence).expect("nonzero test sequence"),
+    )
+    .expect("valid test epoch")
+}
+
 fn fence() -> StateFence {
-    StateFence::new(AuthorityEpoch::genesis(), ResourceGeneration::genesis())
+    StateFence::new(epoch(1), ResourceGeneration::genesis())
 }
 
 fn next_fence() -> StateFence {
-    StateFence::new(
-        AuthorityEpoch::new(2).expect("non-genesis epoch"),
-        ResourceGeneration::genesis(),
-    )
+    StateFence::new(epoch(2), ResourceGeneration::genesis())
 }
 
 fn provenance() -> Provenance {
