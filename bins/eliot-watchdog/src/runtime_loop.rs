@@ -1,12 +1,11 @@
 //! Private runtime-loop wiring for the independent Watchdog process.
 //!
-//! Architecture (`ELIOT_ARCHITECTURE.md`, `4.5-draft`): A8.1 Watchdog
-//! purpose, A8.2 deterministic supervision, A13.2 failure domains,
-//! `ARCH-WDG-01`, and `ARCH-WDG-02`.
-//! Implementation (`ELIOT_IMPLEMENTATION.md`, `0.29-draft`): I1.2 mandatory
-//! runtime processes, I8.1 process and authority, I8.2 independent observation
-//! routes, I8.3 deterministic supervision loop, and I14.10 supervision
-//! strategies and restart intensity.
+//! Architecture: A8.1 (docs/architecture/A08-01-purpose.md#a81-purpose),
+//! A13.2 (docs/architecture/A13-02-kernel-and-failure-domains.md#a132-kernel-and-failure-domains),
+//! ARCH-WDG-01, ARCH-WDG-02.
+//! Implementation: I1.2 (docs/architecture/I01-02-required-processes-of-the-first-complete-runtime.md#i12-required-processes-of-the-first-complete-runtime),
+//! I8.1 (docs/architecture/I08-01-process-and-authority.md#i81-process-and-authority),
+//! I8.2 (docs/architecture/I08-02-independent-observation-routes.md#i82-independent-observation-routes).
 //!
 //! This private child owns only the extracted bounded Watchdog composition
 //! mechanism. It owns no lifecycle, SCM, canonical, semantic, or write

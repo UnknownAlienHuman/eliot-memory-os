@@ -1,7 +1,7 @@
 //! Service registration projection for the independent Watchdog.
 //!
-//! Architecture: A8 Watchdog (ELIOT_ARCHITECTURE.A8.-Watchdog), Watchdog и Doctor (ELIOT_ARCHITECTURE.Watchdog-и-Doctor)
-//! Implementation: I8 Watchdog implementation contract (ELIOT_IMPLEMENTATION.I8.-Watchdog-implementation-contract), I8.1 Process and authority (ELIOT_IMPLEMENTATION.I8.1.-Process-and-authority), B.5 Watchdog (ELIOT_IMPLEMENTATION.B.5.-Watchdog), P.11 Dreamer, Watchdog and Doctor boundaries (ELIOT_IMPLEMENTATION.P.11.-Dreamer,-Watchdog-and-Doctor-boundaries)
+//! Architecture: A8.1 (docs/architecture/A08-01-purpose.md#a81-purpose)
+//! Implementation: I8.1 (docs/architecture/I08-01-process-and-authority.md#i81-process-and-authority), I8.2 (docs/architecture/I08-02-independent-observation-routes.md#i82-independent-observation-routes)
 //!
 //! This module is a read-only, fail-closed projection over installer-approved
 //! service registrations. It performs exact deterministic checks against the
