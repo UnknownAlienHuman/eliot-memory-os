@@ -40,7 +40,7 @@ implementation_rule = "Open primary issues own current integration. Completed ba
 id = "cognitive-micromodules"
 status = "active"
 branch_strategy = "fresh_per_issue_from_current_main"
-issue_refs = [38, 39, 40, 41, 42, 43, 44, 45]
+issue_refs = [38, 39, 40, 41, 43, 44, 45]
 briefs = [
   "crates/smart/cognitive-wave-01.toml",
   "crates/smart/cognitive-wave-02.toml"
