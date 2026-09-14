@@ -879,6 +879,12 @@ impl KernelComposition {
             .ors
             .acknowledge_replay_event(&ack)
             .map_err(|error| self.map_replay_store_error(&error, &binding.stream_id, "", ""))?;
+        // The reply advance flags are declared from the phase alone (the
+        // wire contract): a reordered duplicate ack of an already-advanced
+        // event still reports the phase-derived flag even though the owner
+        // `max()` holds the cursor. The flags are commit proof, not a
+        // cursor readback; readers observe exact cursors via the stream
+        // head.
         let reply = NativeWorkerReplayAcknowledgeReply {
             wire_id: NATIVE_WORKER_REPLAY_WIRE_ID.to_owned(),
             wire_version: NATIVE_WORKER_REPLAY_WIRE_VERSION,

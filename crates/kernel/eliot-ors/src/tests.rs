@@ -2553,7 +2553,7 @@ fn persisted_invalid_label_and_envelope_digest_fail_closed() -> TestResult {
         })
     ));
     drop(coordinator);
-    cleanup(&path);
+    cleanup(&envelope_path);
     Ok(())
 }
 
