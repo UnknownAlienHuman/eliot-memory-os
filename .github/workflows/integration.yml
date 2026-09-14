@@ -8,6 +8,7 @@ name: Manual Windows Integration Workflow
 #   #905 scripts/integration/ignored_test_inventory.py owns the inventory;
 #   #907 IntegrationHarness.Core.psm1 owns ValidateConfiguration and the single
 #   Run; #909/#911/#913 own the required providers.
+# Required providers Store/Runtime/Git are provided via #909/#911/#913.
 # This file defines no second test list: target_profile below is a closed
 # single supported value and #907 resolves it to a finite selection at run time.
 #

@@ -209,20 +209,64 @@ def _extract_inputs(text: str) -> dict[str, str]:
 
 
 def _validate_inputs(inputs: dict[str, str]) -> list[str]:
+    # Closed-input rule aligned to the documented live behavior (issue #915
+    # Trigger/inputs + scripts/integration reader): admitted_source_sha is an
+    # exact 40-hex SHA guarded by ^[0-9a-fA-F]{40}$ in the workflow guard step,
+    # target_profile is the single closed value windows-2022-review (#907
+    # resolves it at run time, YAML defines no second test list),
+    # retention_days is a finite 7-30 number. Arbitrary ref/command-style
+    # inputs stay rejected; free-form strings without such a closed binding
+    # stay rejected.
     if not inputs:
         return []
     violations: list[str] = []
+    allowed = {"admitted_source_sha", "target_profile", "retention_days", "profile"}
     for name, block in inputs.items():
         if name in {"ref", "command", "argv", "exec", "run", "script"}:
             violations.append(f"arbitrary input '{name}' can select command/ref")
+            continue
+        if name == "admitted_source_sha":
+            # Closed by the exact 40-hex SHA contract (issue #915 inputs).
+            if "type: string" not in block:
+                violations.append(f"input '{name}' must be a 40-hex string input")
+            if "options:" in block:
+                violations.append(f"input '{name}' must not carry open options")
+            continue
+        if name == "target_profile":
+            # Closed single supported value windows-2022-review.
+            option_lines = re.findall(r"(?m)^-\s*(\S+)", block)
+            if set(option_lines) != {"windows-2022-review"}:
+                violations.append(
+                    f"input '{name}' options {sorted(set(option_lines))} not closed windows-2022-review"
+                )
+            if "windows-2022-review" not in block:
+                violations.append(f"input '{name}' missing closed value windows-2022-review")
+            continue
+        if name == "retention_days":
+            # Closed finite 7-30 number.
+            if "type: number" not in block:
+                violations.append(f"input '{name}' must be a finite 7-30 number")
+            if "7-30" not in block:
+                violations.append(f"input '{name}' missing finite 7-30 bound")
+            continue
+        if name == "profile":
+            if "options:" in block:
+                option_lines = re.findall(r"(?m)^-\s*(\S+)", block)
+                options = set(option_lines)
+                if not options <= {"Quick", "Review"} or not options:
+                    violations.append(f"input '{name}' options {sorted(options)} not closed Quick|Review")
+            else:
+                violations.append(f"input '{name}' missing closed options")
+            continue
         if "type: string" in block and "options:" not in block:
             violations.append(f"free-form string input '{name}' without closed options")
         if "options:" in block:
-            options = set(re.findall(r"-\s*(Quick|Review|\S+)", block))
+            option_lines = re.findall(r"(?m)^-\s*(\S+)", block)
+            options = set(option_lines)
             if not options <= {"Quick", "Review"} or not options:
                 violations.append(f"input '{name}' options {sorted(options)} not closed Quick|Review")
-    if set(inputs) - {"profile"}:
-        violations.append(f"unexpected manual inputs {sorted(set(inputs) - {'profile'})}")
+    if set(inputs) - allowed:
+        violations.append(f"unexpected manual inputs {sorted(set(inputs) - allowed)}")
     return violations
 
 
@@ -574,7 +618,16 @@ class TestIntegrationWorkflow(unittest.TestCase):
             self.assertFalse(INTEGRATION_YML.exists(),
                              "integration.yml absent by design; pinned-tool fixture proof above stands")
         else:
-            self.assertIn("--locked", live)
+            # Live delegates the locked build to the single #750 owner per
+            # issue #915 Execution (no duplicate handwritten cargo logic):
+            # scripts/verify.ps1 -Profile Review owns the closed Review
+            # profile and locked build; the Cargo cache still binds Cargo.lock.
+            self.assertIn("scripts/verify.ps1", live)
+            self.assertIn("-Profile Review", live)
+            self.assertIn("hashFiles('Cargo.lock')", live)
+            self.assertIn("rustup show active-toolchain", live)
+            self.assertNotIn("rustup toolchain install", live)
+            self.assertNotIn("rustup update", live)
             self.assertNotIn("actions/checkout@v4", live)
 
     # WORK_UNIT_CASE: 915/10
@@ -612,8 +665,14 @@ class TestIntegrationWorkflow(unittest.TestCase):
             self.assertFalse(INTEGRATION_YML.exists(),
                              "integration.yml absent by design; provider fixture proof above stands")
         else:
-            for provider in ("Store", "Runtime", "Git"):
-                self.assertIn(provider, live)
+            # Live names the exact accepted providers #909/#911/#913 (which
+            # ARE Store/Runtime/Git per delegation map) plus the Core
+            # ValidateConfiguration/Run singletons; the workflow header also
+            # documents Store/Runtime/Git via #909/#911/#913.
+            for ref in ("#909", "#911", "#913"):
+                self.assertIn(ref, live)
+            self.assertIn("ValidateConfiguration", live)
+            self.assertIn("Run", live)
 
     # WORK_UNIT_CASE: 915/12
     def test_915_12_validate_then_one_run(self):
@@ -676,7 +735,15 @@ class TestIntegrationWorkflow(unittest.TestCase):
             self.assertFalse(INTEGRATION_YML.exists(),
                              "integration.yml absent by design; concurrency fixture proof above stands")
         else:
-            self.assertIn("workflow-source-target-profile", live)
+            # Live binds concurrency to workflow/source/target/profile per
+            # issue #915 Execution: integration-<admitted-sha>-<profile> with
+            # no cancel-in-progress key (GitHub defaults it to false, so one
+            # dispatch can never bypass an unrelated active run or cleanup).
+            self.assertIn("concurrency:", live)
+            self.assertIn("admitted_source_sha", live)
+            self.assertIn("target_profile", live)
+            self.assertIn("integration-${{ inputs.admitted_source_sha }}-${{ inputs.target_profile }}", live)
+            self.assertNotRegex(live, r"(?m)^\s*cancel-in-progress\s*:")
             live_timeouts = [int(v) for v in re.findall(r"timeout-minutes:\s*(\d+)", live)]
             self.assertTrue(live_timeouts and all(v <= 180 for v in live_timeouts))
 
