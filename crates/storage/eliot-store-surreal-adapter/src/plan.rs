@@ -82,6 +82,49 @@ pub(crate) fn plan_apply(
     )
 }
 
+/// Routes one transition to the legacy or the authority-carrying plan.
+///
+/// Slice C2 (issue #19): when at least one operation claims a payload
+/// authority, the transaction plans through
+/// [`plan_apply_with_payload_authority`] with the original authority values
+/// (never re-parsed from a re-serialized `Value`); otherwise it keeps the
+/// exact legacy [`plan_apply`] path. Authority alignment is enforced in both
+/// directions: a length mismatch against the transition's named operations
+/// fails closed instead of silently dropping or inventing authorities.
+pub(crate) fn select_apply_plan(
+    transition: &PreparedTransition,
+    authorities: &[Option<ExactJsonBytes>],
+    current_revision_heads: &[RevisionHead],
+    current_ordering_heads: &[OrderingHead],
+    next_commit_sequence: u64,
+    next_outbox_sequence: u64,
+) -> Result<ApplyPlan, StoreError> {
+    if authorities.len() != transition.named_operations.len() {
+        return Err(StoreError::InvalidField {
+            field: "payload.authority",
+            reason: "payload authority count does not match named operations",
+        });
+    }
+    if authorities.iter().any(Option::is_some) {
+        plan_apply_with_payload_authority(
+            transition,
+            authorities,
+            current_revision_heads,
+            current_ordering_heads,
+            next_commit_sequence,
+            next_outbox_sequence,
+        )
+    } else {
+        plan_apply(
+            transition,
+            current_revision_heads,
+            current_ordering_heads,
+            next_commit_sequence,
+            next_outbox_sequence,
+        )
+    }
+}
+///
 /// Plans one committed transition with per-operation payload authorities
 /// bound in (issue #10, Wave C).
 ///
@@ -581,6 +624,62 @@ mod tests {
         substituted_receipt.envelope =
             Some(ReceiptEnvelope::issue(substituted_core).map_err(StoreError::Receipt)?);
         assert!(validate_receipt_identity(&substituted_receipt, &context, &transition).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn plan_routing_keeps_legacy_path_without_authorities() -> Result<(), StoreError> {
+        use crate::plan::select_apply_plan;
+
+        let (_, transition) = fixture()?;
+        let legacy = plan_apply(&transition, &[], &[], 1, 1)?;
+        assert!(legacy.payload_authority.is_empty());
+        let routed = select_apply_plan(&transition, &[None], &[], &[], 1, 1)?;
+        assert!(routed.payload_authority.is_empty());
+        assert_eq!(
+            routed.outbox_records, legacy.outbox_records,
+            "all-None authorities keep the exact historical digest path"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn plan_routing_binds_original_authority_bytes_when_present() -> Result<(), StoreError> {
+        use crate::plan::select_apply_plan;
+        use eliot_store_api::{ExactJsonBytes, PayloadSource};
+
+        let (_, transition) = fixture()?;
+        let raw = br#"{"subject":"op-envelope"}"#;
+        let authority = ExactJsonBytes::parse(PayloadSource::NamedOperationParameter, raw)?;
+        assert_eq!(
+            authority.decode_object_parameters()?,
+            transition.named_operations[0].parameters,
+            "fixture authority matches the admitted parameters"
+        );
+        let routed = select_apply_plan(&transition, &[Some(authority)], &[], &[], 1, 1)?;
+        assert_eq!(routed.payload_authority.len(), 1);
+        assert_eq!(
+            routed.payload_authority[0].bytes, raw,
+            "original raw bytes reach the plan, never a re-serialized Value"
+        );
+        let legacy = plan_apply(&transition, &[], &[], 1, 1)?;
+        assert_ne!(
+            routed.outbox_records[0].payload_digest, legacy.outbox_records[0].payload_digest,
+            "claimed authority changes the bound outbox digest"
+        );
+        // Misaligned or substituted authorities fail closed.
+        assert!(
+            select_apply_plan(&transition, &[], &[], &[], 1, 1).is_err(),
+            "authority count mismatch fails closed"
+        );
+        let substituted = ExactJsonBytes::parse(
+            PayloadSource::NamedOperationParameter,
+            br#"{"subject":"substituted"}"#,
+        )?;
+        assert!(
+            select_apply_plan(&transition, &[Some(substituted)], &[], &[], 1, 1).is_err(),
+            "substituted authority fails closed"
+        );
         Ok(())
     }
 }

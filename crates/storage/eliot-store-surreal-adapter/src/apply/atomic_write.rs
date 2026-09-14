@@ -311,3 +311,70 @@ pub(super) fn ordering_write_template(initial_state: bool, exists: bool) -> &'st
         schema::TX_UPSERT_ORDERING
     }
 }
+
+#[cfg(test)]
+mod authority_binding_tests {
+    #![allow(clippy::expect_used)]
+
+    use super::*;
+    use eliot_store_api::{ExactJsonBytes, PayloadSource};
+
+    fn authority_record(raw: &[u8]) -> PayloadAuthorityRecord {
+        let authority = ExactJsonBytes::parse(PayloadSource::NamedOperationParameter, raw)
+            .expect("authority parses");
+        PayloadAuthorityRecord {
+            operation_index: 0,
+            version: authority.version,
+            encoding: authority.encoding.mnemonic().to_owned(),
+            digest_hex: authority.digest_hex(),
+            byte_len: authority.byte_len(),
+            bytes: authority.bytes.clone(),
+        }
+    }
+
+    #[test]
+    fn binding_persists_opaque_bytes_beside_queryable_bodies() {
+        let raw = br#"{"subject":"observation-1"}"#;
+        let bound = payload_authority_binding(&[authority_record(raw)]).expect("binding renders");
+        let entries = bound.as_array().expect("binding is an array");
+        assert_eq!(entries.len(), 1);
+        assert_eq!(
+            entries[0].get("bytes_utf8").and_then(Value::as_str),
+            Some(std::str::from_utf8(raw).expect("test raw is UTF-8")),
+            "opaque bytes round-trip exactly for readback"
+        );
+        assert_eq!(
+            entries[0].get("operation_index"),
+            Some(&Value::from(0)),
+            "operation index is preserved"
+        );
+        assert!(
+            entries[0]
+                .get("digest_hex")
+                .and_then(Value::as_str)
+                .is_some_and(|digest| digest.len() == 64),
+            "digest identity travels with the opaque bytes"
+        );
+        assert_eq!(
+            payload_authority_binding(&[]).expect("empty binding renders"),
+            Value::Array(Vec::new()),
+            "legacy transitions persist an empty authority array"
+        );
+    }
+
+    #[test]
+    fn non_utf8_authority_bytes_fail_closed() {
+        let record = PayloadAuthorityRecord {
+            operation_index: 0,
+            version: 1,
+            encoding: "utf8_json".to_owned(),
+            digest_hex: "0".repeat(64),
+            byte_len: 1,
+            bytes: vec![0xff],
+        };
+        assert!(
+            payload_authority_binding(&[record]).is_err(),
+            "non-UTF-8 bytes never coerce into the binding"
+        );
+    }
+}

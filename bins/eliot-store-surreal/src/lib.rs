@@ -30,10 +30,11 @@ use eliot_protocol::{
     ProtocolVersion, ServerHello,
 };
 use eliot_store_api::{
-    CAPABILITIES, CanonicalStoreClient, CanonicalValidationSnapshot, EFFECTS, NamedReadRequest,
-    NamedReadResponse, OperationId, OrderingHead, OrderingHeadExpectation, OrderingScopeId,
-    PreparedTransition, RequestMeta, RevisionHead, RevisionHeadExpectation, RevisionKey,
-    StoreError, StoreHealth, WriteReceipt, decode_request_frame,
+    CAPABILITIES, CanonicalStoreClient, CanonicalValidationSnapshot, EFFECTS, ExactJsonBytes,
+    NamedReadRequest, NamedReadResponse, OperationId, OrderingHead, OrderingHeadExpectation,
+    OrderingScopeId, PreparedTransition, RequestMeta, RevisionHead, RevisionHeadExpectation,
+    RevisionKey, StoreError, StoreHealth, WriteReceipt, decode_request_frame_with_authority,
+    generated_operation_manifests, genesis_manifest,
 };
 pub use eliot_store_api::{
     ReadinessReceipt, ReadinessStatus, StoreRequest as Request, StoreResponse as Response,
@@ -395,6 +396,34 @@ impl StoreComposition {
         expected_revision_heads: Vec<RevisionHeadExpectation>,
         expected_ordering_heads: Vec<OrderingHeadExpectation>,
     ) -> Result<WriteReceipt, StoreCompositionError> {
+        let authorities: Vec<Option<ExactJsonBytes>> =
+            vec![None; transition.named_operations.len()];
+        self.apply_with_authority(
+            context,
+            transition,
+            expected_revision_heads,
+            expected_ordering_heads,
+            &authorities,
+        )
+        .await
+    }
+
+    /// Applies one fully prepared transition with per-operation payload
+    /// authorities bound in (slice C2, issue #19).
+    ///
+    /// `authorities` aligns 1:1 with the transition's named operations and
+    /// carries the original authority values. The same admitted-operation
+    /// gate runs before any provider I/O in both cases; entries with at
+    /// least one claimed authority plan through the authority-carrying path,
+    /// all-`None` entries keep the legacy path.
+    pub async fn apply_with_authority(
+        &self,
+        context: &RequestMeta,
+        transition: PreparedTransition,
+        expected_revision_heads: Vec<RevisionHeadExpectation>,
+        expected_ordering_heads: Vec<OrderingHeadExpectation>,
+        authorities: &[Option<ExactJsonBytes>],
+    ) -> Result<WriteReceipt, StoreCompositionError> {
         context
             .validate()
             .map_err(StoreError::Foundation)
@@ -405,12 +434,17 @@ impl StoreComposition {
         if context.state_fence != transition.state_fence {
             return Err(StoreCompositionError::Store(StoreError::FenceMismatch));
         }
+        let entries = generated_operation_manifests().map_err(StoreCompositionError::Store)?;
+        transition
+            .validate_against_catalogue(&entries)
+            .map_err(StoreCompositionError::Store)?;
         self.store
-            .apply_prepared(
+            .apply_prepared_with_authority(
                 context,
                 transition,
                 expected_revision_heads,
                 expected_ordering_heads,
+                authorities,
             )
             .await
             .map_err(map_adapter_error)
@@ -639,6 +673,17 @@ pub fn admit_handshake(
 }
 
 /// Validates one request against the admitted session and replay ledger.
+///
+/// After the existing session, fence, replay, and capability checks, the
+/// request is re-checked against the active generated operation catalogue
+/// before any provider I/O: named reads and prepared transitions must satisfy
+/// the same validators the adapter enforces pre-commit, and embedded payload
+/// authorities (when present) are rebound to the decoded transition here via
+/// [`decode_request_frame_with_authority`] — a mismatch fails closed before
+/// dispatch. Schema/manifest mismatches are returned as typed errors and
+/// never normalized or fallen back. The recovered authority bytes cannot ride
+/// the frozen `StoreRequest` shape further; authority-byte flow to the plan
+/// uses [`StoreComposition::apply_with_authority`].
 pub fn validate_request_frame(
     session: &mut StoreEbpSession,
     frame: &Frame,
@@ -648,8 +693,8 @@ pub fn validate_request_frame(
     {
         return Err("request frame is outside the negotiated EBP session".to_owned());
     }
-    let (request_id, identity, request) =
-        decode_request_frame(frame).map_err(|error| error.to_string())?;
+    let (request_id, identity, request, _) =
+        decode_request_frame_with_authority(frame).map_err(|error| error.to_string())?;
     if identity.request.state_fence != session.state_fence {
         return Err("request identity state fence does not match the handshake fence".to_owned());
     }
@@ -673,7 +718,48 @@ pub fn validate_request_frame(
     if !session.capabilities.contains(capability) {
         return Err(format!("capability is not admitted: {capability}"));
     }
+    enforce_admitted_operation(&request)?;
     Ok(request)
+}
+
+/// Re-enforces the active generated catalogue on one session-validated
+/// request before any provider I/O (slice C2, issue #19).
+///
+/// Named reads and prepared transitions use the same catalogue validators as
+/// the adapter's pre-commit gate. Genesis is an explicit closed admitted
+/// path bound to the active genesis entry — not a wildcard: the seed must
+/// satisfy its context contract while the entry exists. Recovery, receipt,
+/// head, snapshot, health, and readiness requests keep their own bounded
+/// validation (already run by the wire decode) and perform no canonical
+/// mutation.
+fn enforce_admitted_operation(request: &Request) -> Result<(), String> {
+    match request {
+        Request::Named { request } => {
+            let entries = generated_operation_manifests().map_err(|error| error.to_string())?;
+            request
+                .validate_against_catalogue(&entries)
+                .map_err(|error| error.to_string())
+        }
+        Request::Apply { transition, .. } => {
+            let entries = generated_operation_manifests().map_err(|error| error.to_string())?;
+            transition
+                .validate_against_catalogue(&entries)
+                .map_err(|error| error.to_string())
+        }
+        Request::InitializeGenesis { context, request } => {
+            genesis_manifest().map_err(|error| error.to_string())?;
+            request
+                .validate_for_context(context)
+                .map_err(|error| error.to_string())
+        }
+        Request::Health
+        | Request::Readiness
+        | Request::Recovery { .. }
+        | Request::Receipt { .. }
+        | Request::RevisionHeads { .. }
+        | Request::OrderingHeads { .. }
+        | Request::ValidationSnapshot => Ok(()),
+    }
 }
 
 #[cfg(test)]
@@ -1585,6 +1671,224 @@ mod tests {
         assert_eq!(
             ledger.observe_bound(overflow, &frame),
             Err(TransportError::RegistryFull)
+        );
+    }
+
+    fn admitted_session(config: &StoreLaunchConfig) -> StoreEbpSession {
+        let identity = StoreHandshakeIdentity::new("manifest-test", serde_json::json!({}));
+        let (session, _) = admit_handshake(
+            client_hello_frame(config),
+            TransportLimits::default(),
+            config,
+            &identity,
+        )
+        .expect("handshake admits");
+        session
+    }
+
+    fn session_identity(
+        context: &RequestMeta,
+        idempotency_key: &str,
+    ) -> eliot_protocol::RequestIdentity {
+        // `RequestBinding` is not re-exported to this crate, so the identity
+        // is built through its canonical JSON shape (field names are covered
+        // by the `deny_unknown_fields` contract on both structs).
+        serde_json::from_value(serde_json::json!({
+            "request": {
+                "metadata": context,
+                "state_fence": context.state_fence,
+            },
+            "idempotency_key": idempotency_key,
+            "deadline_unix_ms": 1,
+            "cancellation_id": "cancel-bridge",
+        }))
+        .expect("test identity builds")
+    }
+
+    fn ingress_frame(
+        session: &StoreEbpSession,
+        context: &RequestMeta,
+        identity: eliot_protocol::RequestIdentity,
+        request: Request,
+    ) -> Frame {
+        eliot_store_api::request_frame(
+            session.connection_id(),
+            session.protocol_version(),
+            context.request_id.clone(),
+            identity,
+            request,
+        )
+        .expect("ingress frame builds")
+    }
+
+    fn mutation_transition(
+        fence: &StateFence,
+        manifest_digest: &str,
+    ) -> eliot_store_api::PreparedTransition {
+        use eliot_store_api::{
+            EffectClass, EventProjectionRelationIntents, NamedMutationOperation,
+            NamedMutationRequest, OperationIdentity, OperationManifestDigest, OrderingScopeId,
+            ScopeId, SecurityContext, TransitionClass,
+        };
+        eliot_store_api::PreparedTransition {
+            identity: OperationIdentity {
+                operation_id: OperationId::new("op-bridge").expect("operation id"),
+                idempotency_key: "idem-bridge".to_owned(),
+                canonical_request_hash: "a".repeat(64),
+            },
+            state_fence: fence.clone(),
+            scope_id: ScopeId::new("scope-bridge").expect("scope"),
+            task_id: None,
+            ordering_scopes: vec![OrderingScopeId::new("scope-bridge").expect("ordering")],
+            transition_class: TransitionClass::CaptureCandidate,
+            requested_effect_ceiling: EffectClass::Candidate,
+            admission_contract_set_digest: "b".repeat(64),
+            operation_manifest_digest: OperationManifestDigest::new(manifest_digest)
+                .expect("manifest digest"),
+            named_operations: vec![NamedMutationRequest {
+                operation: NamedMutationOperation::CaptureObservation,
+                parameters: std::collections::BTreeMap::from([(
+                    "subject".to_owned(),
+                    serde_json::json!("op-bridge"),
+                )]),
+            }],
+            event_projection_relation_intents: EventProjectionRelationIntents {
+                event_ids: Vec::new(),
+                projection_kinds: Vec::new(),
+                relation_kinds: Vec::new(),
+            },
+            security: SecurityContext::default(),
+            required_proof_and_approval_refs: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn ingress_rejects_stale_manifest_before_any_provider_effect() {
+        let config = config();
+        let mut session = admitted_session(&config);
+        let fence = config.runtime_launch.authority_state_fence.clone();
+        let context = request_meta(fence.clone());
+        let transition = mutation_transition(&fence, "stale-manifest-digest");
+        let identity = session_identity(&context, &transition.identity.idempotency_key);
+        let frame = ingress_frame(
+            &session,
+            &context,
+            identity,
+            Request::Apply {
+                context: context.clone(),
+                transition,
+                expected_revision_heads: Vec::new(),
+                expected_ordering_heads: Vec::new(),
+            },
+        );
+        let error = validate_request_frame(&mut session, &frame)
+            .expect_err("stale manifest must fail before dispatch");
+        assert!(
+            error.contains("operation manifest digest mismatch")
+                || error.contains("unknown named operation"),
+            "typed catalogue rejection, never generic: {error}"
+        );
+    }
+
+    #[test]
+    fn ingress_rejects_extra_read_parameter_before_dispatch() {
+        use eliot_store_api::{NamedReadOperation, ReadConsistency};
+        let config = config();
+        let mut session = admitted_session(&config);
+        let fence = config.runtime_launch.authority_state_fence.clone();
+        let context = request_meta(fence.clone());
+        let read = NamedReadRequest {
+            operation: NamedReadOperation::GetRevisionHeads,
+            scope_id: None,
+            consistency: ReadConsistency::Eventual,
+            state_fence: fence,
+            parameters: std::collections::BTreeMap::from([(
+                "extra".to_owned(),
+                serde_json::json!(1),
+            )]),
+        };
+        let identity = session_identity(&context, "idem-read");
+        let frame = ingress_frame(
+            &session,
+            &context,
+            identity,
+            Request::Named { request: read },
+        );
+        assert!(
+            validate_request_frame(&mut session, &frame).is_err(),
+            "extra read parameter must fail before dispatch"
+        );
+    }
+
+    #[test]
+    fn ingress_accepts_activated_read_and_closed_genesis() {
+        use eliot_store_api::{NamedReadOperation, OWNER_SNAPSHOT_SCHEMA, ReadConsistency};
+        let config = config();
+        let mut session = admitted_session(&config);
+        let fence = config.runtime_launch.authority_state_fence.clone();
+        let context = request_meta(fence.clone());
+        let read = NamedReadRequest {
+            operation: NamedReadOperation::GetRevisionHeads,
+            scope_id: None,
+            consistency: ReadConsistency::Eventual,
+            state_fence: fence.clone(),
+            parameters: std::collections::BTreeMap::new(),
+        };
+        let identity = session_identity(&context, "idem-read-ok");
+        let frame = ingress_frame(
+            &session,
+            &context,
+            identity,
+            Request::Named { request: read },
+        );
+        assert!(
+            matches!(
+                validate_request_frame(&mut session, &frame),
+                Ok(Request::Named { .. })
+            ),
+            "activated read passes ingress"
+        );
+
+        // Genesis is an explicit closed admitted path, not a wildcard.
+        let payload = b"{\"seed\":true}".to_vec();
+        let genesis = StoreGenesisRequest {
+            contract_version: eliot_store_api::CONTRACT_VERSION,
+            operation_id: OperationId::new("genesis-bridge").expect("operation id"),
+            idempotency_key: "genesis-bridge-key".to_owned(),
+            canonical_request_hash: String::new(),
+            state_fence: fence.clone(),
+            owner_records: vec![eliot_store_api::RecoveryRecord {
+                namespace: "owner".to_owned(),
+                key: "seed".to_owned(),
+                state_fence: fence,
+                revision: 1,
+                schema: OWNER_SNAPSHOT_SCHEMA.to_owned(),
+                payload: payload.clone(),
+                value_digest: eliot_store_api::sha256_hex(&payload),
+            }],
+        };
+        let genesis = genesis
+            .with_computed_digest()
+            .expect("genesis digest computes");
+        let mut genesis_context = request_meta(genesis.state_fence.clone());
+        genesis_context.request_id =
+            eliot_contracts::RequestId::new("request-genesis-bridge").expect("request id");
+        let genesis_identity = session_identity(&genesis_context, &genesis.idempotency_key);
+        let genesis_frame = ingress_frame(
+            &session,
+            &genesis_context,
+            genesis_identity,
+            Request::InitializeGenesis {
+                context: genesis_context.clone(),
+                request: genesis,
+            },
+        );
+        assert!(
+            matches!(
+                validate_request_frame(&mut session, &genesis_frame),
+                Ok(Request::InitializeGenesis { .. })
+            ),
+            "closed genesis path passes ingress"
         );
     }
 }

@@ -9,6 +9,7 @@ use std::collections::BTreeSet;
 use crate::SurrealStoreAdapter;
 use crate::config::{SchemaGeneration, SurrealAdapterConfig};
 use crate::error::AdapterError;
+use crate::plan::select_apply_plan;
 use crate::plan::{self, build_receipt, validate_receipt_identity, validate_revision_heads};
 use crate::readiness::{CompiledMigration, MigrationReceipt, SemanticReadiness};
 use crate::{client, schema};
@@ -17,9 +18,10 @@ use eliot_store_api::{
     CONTRACT_VERSION, OperationId, StoreGenesisRequest, validate_genesis_receipt_envelope,
 };
 use eliot_store_api::{
-    OrderingHead, OrderingHeadExpectation, OrderingScopeId, RecoveryRecord, RevisionHead,
-    RevisionHeadExpectation, RevisionKey, StateFence, StoreError, StoreRecoveryRequest,
-    StoreRecoverySnapshot, WriteReceipt,
+    ExactJsonBytes, OrderingHead, OrderingHeadExpectation, OrderingScopeId, RecoveryRecord,
+    RevisionHead, RevisionHeadExpectation, RevisionKey, StateFence, StoreError,
+    StoreRecoveryRequest, StoreRecoverySnapshot, WriteReceipt, generated_operation_manifests,
+    operation_manifest_set_digest,
 };
 use serde::de::DeserializeOwned;
 use serde_json::{Map, Value, json};
@@ -527,6 +529,10 @@ pub(crate) async fn apply_migration(
 /// Atomically applies one exact S-01 transition and returns its immutable receipt.
 /// Projection publications and outbox intents are derived by the shared
 /// transition planner, matching the in-memory reference implementation.
+///
+/// Legacy entry point: no operation claims a payload authority, so planning
+/// keeps the exact historical digest path. Authority-carrying callers use
+/// [`apply_prepared_with_authority`].
 pub(crate) async fn apply_prepared(
     adapter: &SurrealStoreAdapter,
     ctx: &eliot_store_api::RequestMeta,
@@ -534,7 +540,36 @@ pub(crate) async fn apply_prepared(
     expected_revision_heads: Vec<eliot_store_api::RevisionHeadExpectation>,
     expected_ordering_heads: Vec<eliot_store_api::OrderingHeadExpectation>,
 ) -> Result<WriteReceipt, AdapterError> {
-    validate_transition(adapter, ctx, &transition)?;
+    let authorities: Vec<Option<ExactJsonBytes>> = vec![None; transition.named_operations.len()];
+    apply_prepared_with_authority(
+        adapter,
+        ctx,
+        transition,
+        expected_revision_heads,
+        expected_ordering_heads,
+        &authorities,
+    )
+    .await
+}
+
+/// Atomically applies one exact S-01 transition with per-operation payload
+/// authorities bound in (slice C2, issue #19).
+///
+/// `authorities` aligns 1:1 with the transition's named operations and
+/// carries the original authority values (never re-parsed from a
+/// re-serialized `Value`): entries with at least one claimed authority plan
+/// through the authority-carrying path, all-`None` entries keep the legacy
+/// path. The admitted-operation gate ([`validate_transition`]) runs before
+/// any provider I/O in both cases.
+pub(crate) async fn apply_prepared_with_authority(
+    adapter: &SurrealStoreAdapter,
+    ctx: &eliot_store_api::RequestMeta,
+    transition: eliot_store_api::PreparedTransition,
+    expected_revision_heads: Vec<eliot_store_api::RevisionHeadExpectation>,
+    expected_ordering_heads: Vec<eliot_store_api::OrderingHeadExpectation>,
+    authorities: &[Option<ExactJsonBytes>],
+) -> Result<WriteReceipt, AdapterError> {
+    validate_transition(ctx, &transition)?;
 
     let db = client(adapter).await?;
     ensure_ready(adapter, db).await?;
@@ -576,8 +611,9 @@ pub(crate) async fn apply_prepared(
         &transition.state_fence,
     )?;
 
-    let plan = plan::plan_apply(
+    let plan = select_apply_plan(
         &transition,
+        authorities,
         &current_revisions,
         &current_orderings,
         next_commit_sequence,
@@ -603,14 +639,30 @@ pub(crate) async fn apply_prepared(
     Ok(receipt)
 }
 
+/// Enforces the same admitted operation before staging and commit (slice C2).
+///
+/// The pre-stage gate binds, in order: the generic transition shape
+/// ([`PreparedTransition::validate`], which also aligns security scope/proof
+/// material and the effect ceiling with the transition fence), the active
+/// generated catalogue set ([`generated_operation_manifests`] with its
+/// [`operation_manifest_set_digest`] well-formedness proof and
+/// [`PreparedTransition::validate_against_catalogue`] membership/digest/bound
+/// checks, covering the original admitted plan identity through the
+/// operation-manifest digest), and the caller/transition fence equality. A
+/// set-digest mismatch, an unknown or extra operation, a scope/effect excess,
+/// or a fence mismatch fails closed here, before any provider I/O, receipt,
+/// or fence advance. There is no aggregate-manifest fallback.
 fn validate_transition(
-    adapter: &SurrealStoreAdapter,
     ctx: &eliot_store_api::RequestMeta,
     transition: &eliot_store_api::PreparedTransition,
 ) -> Result<(), AdapterError> {
     ctx.validate().map_err(StoreError::Foundation)?;
     transition.validate()?;
-    transition.validate_against_manifest(&adapter.operation_manifest)?;
+    let entries = generated_operation_manifests().map_err(AdapterError::Store)?;
+    operation_manifest_set_digest(&entries).map_err(AdapterError::Store)?;
+    transition
+        .validate_against_catalogue(&entries)
+        .map_err(AdapterError::Store)?;
     if ctx.state_fence != transition.state_fence {
         return Err(AdapterError::Store(StoreError::FenceMismatch));
     }
@@ -853,3 +905,160 @@ fn ensure_unique_ordering_scopes(scopes: &[OrderingScopeId]) -> Result<(), Adapt
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod admitted_operation_gate_tests {
+    #![allow(clippy::expect_used)]
+
+    use super::*;
+    use eliot_store_api::{
+        EffectClass, EventProjectionRelationIntents, NamedMutationOperation, NamedMutationRequest,
+        OperationIdentity, OperationManifestDigest, OrderingScopeId, ScopeId, SecurityContext,
+        TransitionClass, genesis_manifest,
+    };
+    use serde_json::json;
+    use std::collections::BTreeMap;
+
+    const TEST_LINEAGE_A: &str = "550e8400-e29b-41d4-a716-446655440000";
+
+    fn test_epoch(sequence: u64) -> eliot_contracts::EpochId {
+        use eliot_contracts::{EpochId, EpochLineageId};
+        use std::num::NonZeroU64;
+        EpochId::new(
+            EpochLineageId::new(TEST_LINEAGE_A).expect("canonical test lineage-A"),
+            NonZeroU64::new(sequence).expect("non-zero test sequence"),
+        )
+        .expect("valid test epoch")
+    }
+
+    fn test_fence(sequence: u64) -> StateFence {
+        StateFence::new(
+            test_epoch(sequence),
+            eliot_contracts::ResourceGeneration::genesis(),
+        )
+    }
+
+    fn test_context(fence: &StateFence) -> eliot_store_api::RequestMeta {
+        eliot_store_api::RequestMeta {
+            request_id: eliot_contracts::RequestId::new("request-gate").expect("request id"),
+            session_id: None,
+            task_id: None,
+            product_id: eliot_contracts::ProductId::new("product-gate").expect("product"),
+            source_id: eliot_contracts::SourceId::new("source-gate").expect("source"),
+            state_fence: fence.clone(),
+            clock: eliot_contracts::ClockReading::default(),
+        }
+    }
+
+    fn transition_with(
+        fence: &StateFence,
+        manifest_digest: OperationManifestDigest,
+        class: TransitionClass,
+        ceiling: eliot_store_api::EffectClass,
+        named_operations: Vec<eliot_store_api::NamedMutationRequest>,
+    ) -> eliot_store_api::PreparedTransition {
+        eliot_store_api::PreparedTransition {
+            identity: OperationIdentity {
+                operation_id: eliot_store_api::OperationId::new("op-gate").expect("operation"),
+                idempotency_key: "idem-gate".to_owned(),
+                canonical_request_hash: "a".repeat(64),
+            },
+            state_fence: fence.clone(),
+            scope_id: ScopeId::new("scope-gate").expect("scope"),
+            task_id: None,
+            ordering_scopes: vec![OrderingScopeId::new("scope-gate").expect("ordering")],
+            transition_class: class,
+            requested_effect_ceiling: ceiling,
+            admission_contract_set_digest: "b".repeat(64),
+            operation_manifest_digest: manifest_digest,
+            named_operations,
+            event_projection_relation_intents: EventProjectionRelationIntents {
+                event_ids: Vec::new(),
+                projection_kinds: Vec::new(),
+                relation_kinds: Vec::new(),
+            },
+            security: SecurityContext::default(),
+            required_proof_and_approval_refs: Vec::new(),
+        }
+    }
+
+    fn mutation_operation() -> eliot_store_api::NamedMutationRequest {
+        NamedMutationRequest {
+            operation: NamedMutationOperation::CaptureObservation,
+            parameters: BTreeMap::from([("subject".to_owned(), json!("op-gate"))]),
+        }
+    }
+
+    #[test]
+    fn genesis_shaped_transition_passes_the_pre_stage_gate() {
+        let fence = test_fence(1);
+        let context = test_context(&fence);
+        let manifest = genesis_manifest().expect("genesis entry is active");
+        let transition = transition_with(
+            &fence,
+            manifest.digest.clone(),
+            TransitionClass::RecoverySchema,
+            EffectClass::ReversibleMutation,
+            Vec::new(),
+        );
+        assert!(
+            validate_transition(&context, &transition).is_ok(),
+            "genesis/bootstrap shape stays admitted"
+        );
+    }
+
+    #[test]
+    fn pre_stage_digest_mismatch_leaves_no_receipt_or_fence_effect() {
+        // The gate runs before any provider I/O, receipt, or fence advance
+        // (see `apply_prepared_with_authority` ordering): every rejection
+        // below is deterministic and repeatable with no durable effect.
+        let fence = test_fence(1);
+        let context = test_context(&fence);
+        let entries = generated_operation_manifests().expect("active catalogue generates");
+        let set_digest = operation_manifest_set_digest(&entries).expect("set digest computes");
+
+        // Stale manifest digest on a mutation: membership cannot even start.
+        let stale = transition_with(
+            &fence,
+            OperationManifestDigest::new("stale-manifest-digest").expect("digest"),
+            TransitionClass::CaptureCandidate,
+            EffectClass::Candidate,
+            vec![mutation_operation()],
+        );
+        assert_eq!(
+            validate_transition(&context, &stale),
+            Err(AdapterError::Store(StoreError::ManifestMismatch))
+        );
+        // Current set digest but no admitted mutation entry: fail-closed
+        // until a later slice proves a handler/schema/consumer triple.
+        let unadmitted = transition_with(
+            &fence,
+            set_digest,
+            TransitionClass::CaptureCandidate,
+            EffectClass::Candidate,
+            vec![mutation_operation()],
+        );
+        assert_eq!(
+            validate_transition(&context, &unadmitted),
+            Err(AdapterError::Store(StoreError::UnknownOperation))
+        );
+        // Fence divergence between caller context and transition.
+        let manifest = genesis_manifest().expect("genesis entry is active");
+        let drifted = transition_with(
+            &test_fence(2),
+            manifest.digest.clone(),
+            TransitionClass::RecoverySchema,
+            EffectClass::ReversibleMutation,
+            Vec::new(),
+        );
+        assert_eq!(
+            validate_transition(&context, &drifted),
+            Err(AdapterError::Store(StoreError::FenceMismatch))
+        );
+        // Deterministic: repeating the rejections changes nothing.
+        assert_eq!(
+            validate_transition(&context, &stale),
+            Err(AdapterError::Store(StoreError::ManifestMismatch))
+        );
+    }
+}
