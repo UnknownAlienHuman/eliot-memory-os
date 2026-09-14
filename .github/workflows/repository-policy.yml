@@ -213,6 +213,16 @@ jobs:
             exit 1
           fi
 
+          if git grep -nE 'docs/normative/|ELIOT_(ARCHITECTURE|IMPLEMENTATION)_ENGLISH_FINAL_2026-08-28' \
+            -- ':!config/doc-code-conformance.toml' \
+               ':!scripts/doc_code_conformance_core.py' \
+               ':!scripts/docs_closure_audit.py' \
+               ':!scripts/docs_shards_core.py' \
+               ':!.github/workflows/repository-policy.yml'; then
+            echo 'Stale normative reference detected across active tracked tree.'
+            exit 1
+          fi
+
       - name: Verify manual-only policy, profile wiring, least privilege, cache safety, source-candidate identity
         shell: bash
         run: |
