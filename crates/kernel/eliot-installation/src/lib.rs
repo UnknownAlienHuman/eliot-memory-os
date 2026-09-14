@@ -4146,7 +4146,7 @@ impl WindowsInstallationEffectPort {
                 }
             }
             ServiceRegistrationInspection::Mismatched => Ok(root_mismatch("service-config")),
-            ServiceRegistrationInspection::Unknown => Ok(root_mismatch("service-readback")),
+            ServiceRegistrationInspection::Unknown { .. } => Ok(root_mismatch("service-readback")),
         }
     }
 
@@ -4232,7 +4232,7 @@ impl WindowsInstallationEffectPort {
                 )
             }
             ServiceRegistrationInspection::Mismatched => Ok(root_mismatch("service-config")),
-            ServiceRegistrationInspection::Unknown => Ok(root_mismatch("service-readback")),
+            ServiceRegistrationInspection::Unknown { .. } => Ok(root_mismatch("service-readback")),
         }
     }
 
@@ -4462,7 +4462,7 @@ impl WindowsInstallationEffectPort {
             }
             ServiceRegistrationRuntimeInspection::Absent => Ok(root_mismatch("service-missing")),
             ServiceRegistrationRuntimeInspection::Mismatched => Ok(root_mismatch("service-config")),
-            ServiceRegistrationRuntimeInspection::Unknown => Ok(root_mismatch("service-readback")),
+            ServiceRegistrationRuntimeInspection::Unknown { .. } => Ok(root_mismatch("service-readback")),
         }
     }
 
@@ -4525,7 +4525,7 @@ impl WindowsInstallationEffectPort {
             }
             ServiceRegistrationRuntimeInspection::Absent => Ok(root_mismatch("service-missing")),
             ServiceRegistrationRuntimeInspection::Mismatched => Ok(root_mismatch("service-config")),
-            ServiceRegistrationRuntimeInspection::Unknown => Ok(root_mismatch("service-readback")),
+            ServiceRegistrationRuntimeInspection::Unknown { .. } => Ok(root_mismatch("service-readback")),
         }
     }
 

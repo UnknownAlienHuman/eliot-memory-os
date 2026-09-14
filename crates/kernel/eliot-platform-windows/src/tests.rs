@@ -1689,7 +1689,8 @@ fn host_service_dacl_is_protected_exact_and_sid_bound_without_scm_mutation() {
     // test); live SCM registration is not exercised here (requires admin +
     // real service creation, out of scope for this unit).
     let required = 0x0000_0001 | 0x0000_0004 | 0x0000_0010 | 0x0002_0000;
-    let forbidden = 0x0000_0002 | 0x0000_0020 | 0x0000_0040 | 0x0000_0100 | 0x0001_0000 | 0x000C_0000;
+    let forbidden =
+        0x0000_0002 | 0x0000_0020 | 0x0000_0040 | 0x0000_0100 | 0x0001_0000 | 0x000C_0000;
     assert_eq!(ELIOT_HOST_SERVICE_CONTROL_ACCESS_MASK, required);
     assert_eq!(ELIOT_HOST_SERVICE_CONTROL_ACCESS_MASK & forbidden, 0);
 
@@ -1745,20 +1746,24 @@ fn host_service_dacl_is_protected_exact_and_sid_bound_without_scm_mutation() {
     // Watchdog mask with Host digest, are both rejected.
     let watchdog_digest = watchdog_service_security_descriptor_digest(host_sid)
         .unwrap_or_else(|error| panic!("Watchdog digest failed: {error}"));
-    assert!(ServiceControlGrantReadback::new(
-        ELIOT_HOST_SERVICE_NAME,
-        host_sid,
-        ELIOT_HOST_SERVICE_CONTROL_ACCESS_MASK,
-        watchdog_digest,
-    )
-    .is_err());
-    assert!(ServiceControlGrantReadback::new(
-        ELIOT_HOST_SERVICE_NAME,
-        host_sid,
-        ELIOT_WATCHDOG_HOST_CONTROL_ACCESS_MASK,
-        digest,
-    )
-    .is_err());
+    assert!(
+        ServiceControlGrantReadback::new(
+            ELIOT_HOST_SERVICE_NAME,
+            host_sid,
+            ELIOT_HOST_SERVICE_CONTROL_ACCESS_MASK,
+            watchdog_digest,
+        )
+        .is_err()
+    );
+    assert!(
+        ServiceControlGrantReadback::new(
+            ELIOT_HOST_SERVICE_NAME,
+            host_sid,
+            ELIOT_WATCHDOG_HOST_CONTROL_ACCESS_MASK,
+            digest,
+        )
+        .is_err()
+    );
 
     // Registration wiring: Host keeps UNRESTRICTED SID type (load-bearing for
     // the Watchdog grant reference), requires the grant predicate, and its
@@ -1772,7 +1777,10 @@ fn host_service_dacl_is_protected_exact_and_sid_bound_without_scm_mutation() {
         ServiceAccount::LocalService,
     )
     .unwrap_or_else(|error| panic!("Host request failed: {error}"));
-    assert_eq!(host_request.service_sid_type(), ServiceSidType::Unrestricted);
+    assert_eq!(
+        host_request.service_sid_type(),
+        ServiceSidType::Unrestricted
+    );
     assert!(host_request.requires_host_service_control_grant());
     assert_ne!(
         service_registration_mutation_access(&host_request) & WRITE_DAC,
@@ -2344,7 +2352,7 @@ fn post_create_readback_failure_cannot_report_success() {
         &ServiceRegistrationInspection::Mismatched
     ));
     assert!(!service_readback_is_acceptable(
-        &ServiceRegistrationInspection::Unknown
+        &ServiceRegistrationInspection::unknown(5, "read-grant")
     ));
     assert!(service_readback_is_acceptable(
         &ServiceRegistrationInspection::Matching {
@@ -2379,15 +2387,90 @@ fn partial_service_status_never_maps_to_matching() {
         generation: None,
         process: None,
     };
-    assert_eq!(
-        service_registration_inspection_from_status(
-            PortOutcome::Partial {
-                value: observation,
-                missing: vec![handle("authority")],
-            },
-            None
-        ),
-        ServiceRegistrationInspection::Unknown
+    let inspection = service_registration_inspection_from_status(
+        PortOutcome::Partial {
+            value: observation,
+            missing: vec![handle("authority")],
+        },
+        None,
+    );
+    // Fail-closed: Partial never becomes Matching or Mismatched.
+    assert!(matches!(
+        inspection,
+        ServiceRegistrationInspection::Unknown { .. }
+    ));
+    assert!(!service_readback_is_acceptable(&inspection));
+    let detail = inspection
+        .unknown_detail()
+        .unwrap_or_else(|| unreachable!("Unknown must carry diagnostics"));
+    assert_eq!(detail.stage(), "query-status");
+    assert_eq!(detail.win32_error(), 0);
+    assert!(detail.detail().contains("query-status"));
+    #[cfg(windows)]
+    {
+        // Running maps to SERVICE_RUNNING (4); PID is unavailable from the
+        // provider-neutral Partial value so the fallback carries 0.
+        assert_eq!(detail.current_state(), Some(4));
+        assert_eq!(detail.process_id(), Some(0));
+    }
+}
+
+#[test]
+fn host_selfcheck_is_dacl_only_with_typed_unknown_diagnostics() {
+    // Standing s40 (ELIOT #1352): read paths use DACL info only; the audit
+    // SACL contour is never opened or hashed and the digest stays DACL-scoped.
+    assert_eq!(SERVICE_DACL_READ_SECURITY_INFORMATION, 0x0000_0004);
+    assert_eq!(SERVICE_OWNER_READ_SECURITY_INFORMATION, 0x0000_0001);
+    assert_eq!(SERVICE_EXPECTED_OWNER_SID, "S-1-5-18");
+    // Neither read mask sets the SACL bit (0x0000_0008).
+    assert_eq!(SERVICE_DACL_READ_SECURITY_INFORMATION & 0x0000_0008, 0);
+    assert_eq!(SERVICE_OWNER_READ_SECURITY_INFORMATION & 0x0000_0008, 0);
+    #[cfg(windows)]
+    {
+        use windows_sys::Win32::Security::{DACL_SECURITY_INFORMATION, OWNER_SECURITY_INFORMATION};
+        assert_eq!(
+            SERVICE_DACL_READ_SECURITY_INFORMATION,
+            DACL_SECURITY_INFORMATION
+        );
+        assert_eq!(
+            SERVICE_OWNER_READ_SECURITY_INFORMATION,
+            OWNER_SECURITY_INFORMATION
+        );
+    }
+    // Unknown carries the preserved Win32 code and stage without weakening
+    // fail-closed semantics.
+    let unknown = ServiceRegistrationInspection::unknown(5, "read-grant");
+    let detail = unknown
+        .unknown_detail()
+        .unwrap_or_else(|| unreachable!("Unknown must carry diagnostics"));
+    assert_eq!(detail.win32_error(), 5);
+    assert_eq!(detail.stage(), "read-grant");
+    assert!(detail.detail().contains("read-grant"));
+    assert!(detail.detail().contains('5'));
+    assert!(!service_readback_is_acceptable(&unknown));
+    // Mismatched (AclMismatch/IdentityMismatch only) is never collapsed into
+    // Unknown and vice versa.
+    assert_ne!(unknown, ServiceRegistrationInspection::Mismatched);
+    assert!(
+        ServiceRegistrationInspection::Mismatched
+            .unknown_detail()
+            .is_none()
+    );
+    let runtime =
+        ServiceRegistrationRuntimeInspection::unknown_with_status(5, "query-status", 2, 1_234);
+    let runtime_detail = runtime
+        .unknown_detail()
+        .unwrap_or_else(|| unreachable!("runtime Unknown must carry diagnostics"));
+    assert_eq!(runtime_detail.win32_error(), 5);
+    assert_eq!(runtime_detail.stage(), "query-status");
+    assert_eq!(runtime_detail.current_state(), Some(2));
+    assert_eq!(runtime_detail.process_id(), Some(1_234));
+    assert!(runtime_detail.detail().contains("query-status"));
+    // An owner mismatch fails as AclMismatch (Mismatched), never as Unknown:
+    // the dispositions stay distinct even for the owner stage.
+    assert_ne!(
+        ServiceRegistrationInspection::Mismatched,
+        ServiceRegistrationInspection::unknown(5, "query-owner")
     );
 }
 
@@ -2450,7 +2533,7 @@ fn exact_runtime_service_observation_requires_handle_bound_live_identity() {
     ));
     assert_eq!(
         classify_service_runtime_observation(&request, ServiceState::Running, 0, 0, 41, None,),
-        ServiceRegistrationRuntimeInspection::Unknown
+        ServiceRegistrationRuntimeInspection::unknown_with_status(0, "query-status", 4, 41)
     );
     assert_eq!(
         classify_service_runtime_observation(
@@ -2465,7 +2548,7 @@ fn exact_runtime_service_observation_requires_handle_bound_live_identity() {
                 image_path: image.to_string_lossy().into_owned(),
             }),
         ),
-        ServiceRegistrationRuntimeInspection::Unknown
+        ServiceRegistrationRuntimeInspection::unknown_with_status(0, "query-status", 1, 41)
     );
     assert_eq!(
         classify_service_runtime_observation(
@@ -2573,7 +2656,10 @@ fn scm_mutation_outcomes_never_promote_unknown_readback() {
         ServiceStartOutcome::Started { .. }
     ));
     assert_eq!(
-        start_outcome_from_inspection(ServiceRegistrationRuntimeInspection::Unknown, true,),
+        start_outcome_from_inspection(
+            ServiceRegistrationRuntimeInspection::unknown(5, "query-status"),
+            true,
+        ),
         ServiceStartOutcome::EffectUnknown
     );
     assert!(matches!(
@@ -3999,24 +4085,17 @@ fn runtime_file_create_mints_installer_descriptor_and_wrong_acl_fails_closed() {
     // (a) Create mints the installer descriptor AT CREATION: the retained
     // handle verifies under the production policy with owner SYSTEM.
     let created_path = dir.join(format!("created-{}", unique_suffix()));
-    let created = open_runtime_file_with_share(
-        &created_path,
-        true,
-        FILE_SHARE_READ | FILE_SHARE_WRITE,
-    )
-    .unwrap_or_else(|error| {
-        panic!("runtime create must mint the installer descriptor: {error:?}")
-    });
+    let created =
+        open_runtime_file_with_share(&created_path, true, FILE_SHARE_READ | FILE_SHARE_WRITE)
+            .unwrap_or_else(|error| {
+                panic!("runtime create must mint the installer descriptor: {error:?}")
+            });
     verify_readonly_acl(&created, &expected).unwrap_or_else(|error| {
         panic!("created file must verify under the installer descriptor: {error:?}")
     });
     assert_eq!(
-        sid_to_string(
-            expected
-                .owner()
-                .unwrap_or_else(|_| unreachable!())
-        )
-        .unwrap_or_else(|_| unreachable!()),
+        sid_to_string(expected.owner().unwrap_or_else(|_| unreachable!()))
+            .unwrap_or_else(|_| unreachable!()),
         "S-1-5-18"
     );
     // Passing `verify_readonly_acl` above already proves the created file

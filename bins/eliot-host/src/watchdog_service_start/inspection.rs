@@ -143,7 +143,7 @@ impl InstalledWatchdogControl for WindowsPlatform {
             ServiceRegistrationRuntimeInspection::Mismatched => {
                 InstalledWatchdogRuntimeInspection::Mismatched
             }
-            ServiceRegistrationRuntimeInspection::Unknown => {
+            ServiceRegistrationRuntimeInspection::Unknown { .. } => {
                 InstalledWatchdogRuntimeInspection::Unknown
             }
         }

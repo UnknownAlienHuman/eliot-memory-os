@@ -1283,12 +1283,25 @@ mod tests {
             .unwrap_or_else(|| panic!("fixture nonce"))
             .as_str()
             .to_owned();
-        // Typed self-check contract (s38 item 2): a default-DACL (Mismatched
-        // SD) observation projects through the same pure host projection the
-        // bootstrap path uses, and the capsule carries that exact typed
-        // detail — never the old collapsed string.
+        // Typed self-check contract (s38 item 2, s40 runtime contour): a
+        // default-DACL (Mismatched SD) observation projects through the same
+        // pure host projection the bootstrap path uses, and the capsule
+        // carries that exact typed detail — never the old collapsed string.
+        // The runtime contour reports Mismatched as a unit variant; the Absent
+        // bindings come from the validated request.
+        let image =
+            std::env::current_exe().unwrap_or_else(|_| panic!("test image unavailable"));
+        let request = eliot_platform_windows::ServiceRegistrationRequest::new(
+            eliot_platform_windows::ELIOT_HOST_SERVICE_NAME,
+            eliot_platform_windows::ELIOT_HOST_SERVICE_DISPLAY_NAME,
+            &image,
+            eliot_platform_windows::ServiceStartMode::Automatic,
+            eliot_platform_windows::ServiceAccount::LocalService,
+        )
+        .unwrap_or_else(|_| panic!("test registration request must build"));
         let cause = eliot_host::classify_host_scm_inspection(
-            &eliot_platform_windows::ServiceRegistrationInspection::Mismatched,
+            &request,
+            &eliot_platform_windows::ServiceRegistrationRuntimeInspection::Mismatched,
         )
         .unwrap_or_else(|| panic!("mismatched inspection must classify"));
         assert_eq!(
