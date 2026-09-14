@@ -218,6 +218,7 @@ fn admitted_set(candidate: ContextCandidate) -> AdmittedContextSet {
             remaining_headroom: 99_989,
             route_capacity: 100_000,
         },
+        recipe_digest: digest(),
         receipt_digest: digest(),
     };
     let mut admitted = AdmittedContextSet {
@@ -251,15 +252,33 @@ fn admitted_set(candidate: ContextCandidate) -> AdmittedContextSet {
         floor,
         economy,
     };
+    {
+        let mut unsigned = admitted.economy.clone();
+        unsigned.receipt_digest = "0".repeat(64);
+        admitted.economy.receipt_digest =
+            canonical_digest(&unsigned).expect("intermediate economy receipt");
+    }
     let payload_bytes = admitted
         .canonical_payload_utf8_bytes()
         .expect("valid admitted payload");
     admitted.economy.allocations.admitted_required = payload_bytes;
     admitted.economy.allocations.admitted_optional = 0;
     admitted.economy.allocations.remaining_headroom = 100_000 - 2 - 3 - 4 - payload_bytes;
+    {
+        let mut unsigned = admitted.economy.clone();
+        unsigned.receipt_digest = "0".repeat(64);
+        admitted.economy.receipt_digest =
+            canonical_digest(&unsigned).expect("pre-measurement economy receipt");
+    }
     admitted.economy.measurement.digest = admitted
         .canonical_payload_digest()
         .expect("valid admitted payload digest");
+    {
+        let mut unsigned = admitted.economy.clone();
+        unsigned.receipt_digest = "0".repeat(64);
+        admitted.economy.receipt_digest =
+            canonical_digest(&unsigned).expect("final economy receipt");
+    }
     admitted
 }
 
@@ -293,8 +312,8 @@ fn loss_policy_wire_names_are_closed_over_all_four_variants() {
 
 #[test]
 fn decision_context_incomplete_wire_code_is_exact() {
-    let encoded = serde_json::to_string(&ContextErrorCode::DecisionContextIncomplete)
-        .expect("wire encoding");
+    let encoded =
+        serde_json::to_string(&ContextErrorCode::DecisionContextIncomplete).expect("wire encoding");
     assert_eq!(encoded, "\"DECISION_CONTEXT_INCOMPLETE\"");
     assert_eq!(
         serde_json::from_str::<ContextErrorCode>(&encoded).expect("wire round-trip"),
@@ -594,6 +613,7 @@ fn economy_requires_exact_requested_admitted_displaced_conservation() {
             remaining_headroom: 9,
             route_capacity: 10,
         },
+        recipe_digest: digest(),
         receipt_digest: digest(),
     };
     receipt

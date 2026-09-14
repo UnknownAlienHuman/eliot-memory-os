@@ -154,16 +154,27 @@ fn admitted() -> AdmittedContextSet {
                 remaining_headroom: 99_990,
                 route_capacity: 100_000,
             },
+            recipe_digest: recipe(&context).recipe_sha256.clone(),
             receipt_digest: digest(),
         },
     };
+    refresh_economy_receipt(&mut value);
     let payload_bytes = value
         .canonical_payload_utf8_bytes()
         .expect("admitted payload");
     value.economy.allocations.admitted_required = payload_bytes;
     value.economy.allocations.remaining_headroom = 100_000 - 9 - payload_bytes;
+    refresh_economy_receipt(&mut value);
     value.economy.measurement.digest = value.canonical_payload_digest().expect("admitted digest");
+    refresh_economy_receipt(&mut value);
     value
+}
+
+fn refresh_economy_receipt(value: &mut AdmittedContextSet) {
+    let mut unsigned = value.economy.clone();
+    unsigned.receipt_digest = "0".repeat(64);
+    value.economy.receipt_digest =
+        eliot_context_contracts::canonical_digest(&unsigned).expect("economy receipt");
 }
 
 fn admitted_two() -> AdmittedContextSet {
@@ -188,14 +199,17 @@ fn admitted_two() -> AdmittedContextSet {
     });
     value.economy.requested.push(id("atom-two"));
     value.economy.admitted.push(id("atom-two"));
+    refresh_economy_receipt(&mut value);
     let payload_bytes = value
         .canonical_payload_utf8_bytes()
         .expect("two-atom admitted payload");
     value.economy.allocations.admitted_required = payload_bytes;
     value.economy.allocations.remaining_headroom = 100_000 - 9 - payload_bytes;
+    refresh_economy_receipt(&mut value);
     value.economy.measurement.digest = value
         .canonical_payload_digest()
         .expect("two-atom admitted digest");
+    refresh_economy_receipt(&mut value);
     value
 }
 
@@ -258,8 +272,13 @@ fn measurement(context: &ContextBinding, bytes: &[u8]) -> SerializedContextMeasu
 }
 
 fn policy(max_serialized_bytes: u64) -> AssemblyPolicy {
+    policy_for(&binding(), max_serialized_bytes)
+}
+
+fn policy_for(context: &ContextBinding, max_serialized_bytes: u64) -> AssemblyPolicy {
     AssemblyPolicy {
-        fence_digest: "b".repeat(64),
+        fence_digest: eliot_context_contracts::canonical_fence_digest(&context.state_fence)
+            .expect("fence digest"),
         max_serialized_bytes,
         serializer_id: "fixture-serde-v1".to_owned(),
         serializer_version: "1".to_owned(),
@@ -384,9 +403,13 @@ fn canonical_payload_matches_a15_digest_and_order() {
     let mut second = admitted_two();
     second.records.reverse();
     second.admissions.reverse();
+    // Reversing records does not change the canonical admitted payload digest
+    // (ordering is normalized), but the economy receipt must be refreshed for
+    // the reordered measurement binding to stay verifiable.
     second.economy.measurement.digest = second
         .canonical_payload_digest()
         .expect("reversed admitted digest");
+    refresh_economy_receipt(&mut second);
     let right = assemble_active_view(
         &second,
         &recipe(&context),
@@ -403,7 +426,8 @@ fn canonical_payload_matches_a15_digest_and_order() {
         ActiveUnderstandingView::canonical_output_digest(
             &context,
             &recipe(&context).recipe_sha256,
-            &"b".repeat(64),
+            &eliot_context_contracts::canonical_fence_digest(&context.state_fence)
+                .expect("fence digest"),
             &left.view.rendered,
         )
         .expect("A15 digest")
@@ -464,7 +488,8 @@ fn output_byte_limit_is_checked_before_measurement() {
     let bytes = ActiveUnderstandingView::canonical_output_utf8_bytes(
         &context,
         &digest(),
-        &"b".repeat(64),
+        &eliot_context_contracts::canonical_fence_digest(&context.state_fence)
+            .expect("fence digest"),
         &rendered,
     )
     .expect("rendered payload");
@@ -552,5 +577,63 @@ fn rendered_fields_and_quality_binding_are_retained() {
     assert_eq!(
         result,
         Err(AssemblyError::Contract(ContextError::DenominatorMismatch))
+    );
+}
+
+#[test]
+fn fence_digest_binds_to_admitted_state_fence() {
+    let value = admitted();
+    let context = value.binding.clone();
+    let expected =
+        eliot_context_contracts::canonical_fence_digest(&context.state_fence).expect("fence");
+    let view = assemble_active_view(
+        &value,
+        &recipe(&context),
+        quality(&context),
+        &policy_for(&context, 100_000),
+        |bytes| Ok(measurement(&context, bytes)),
+    )
+    .expect("real fence binds");
+    assert_eq!(view.view.fence_digest, expected);
+    view.view
+        .validate_against(&value)
+        .expect("fence-bound view");
+}
+
+#[test]
+fn forged_fence_digest_is_rejected_as_invalid_fence() {
+    let value = admitted();
+    let context = value.binding.clone();
+    let expected =
+        eliot_context_contracts::canonical_fence_digest(&context.state_fence).expect("fence");
+    let mut forged = "b".repeat(64);
+    if forged == expected {
+        forged = "c".repeat(64);
+    }
+    let forged_policy = AssemblyPolicy {
+        fence_digest: forged,
+        max_serialized_bytes: 100_000,
+        serializer_id: "fixture-serde-v1".to_owned(),
+        serializer_version: "1".to_owned(),
+        serializer_options_digest: digest(),
+        route_id: "route".to_owned(),
+        model_id: "model".to_owned(),
+        measurement_status: MeasurementStatus::ExactUtf8,
+    };
+    let mut calls = 0;
+    let result = assemble_active_view(
+        &value,
+        &recipe(&context),
+        quality(&context),
+        &forged_policy,
+        |bytes| {
+            calls += 1;
+            Ok(measurement(&context, bytes))
+        },
+    );
+    assert_eq!(calls, 0);
+    assert_eq!(
+        result,
+        Err(AssemblyError::Contract(ContextError::InvalidFence))
     );
 }

@@ -102,3 +102,14 @@ pub fn canonical_digest<T: serde::Serialize>(value: &T) -> Result<String, Contex
         .map_err(|_| ContextError::InvalidField("canonical_value"))?;
     Ok(sha256_hex(&bytes))
 }
+
+/// Compute the canonical digest bound to one state fence.
+///
+/// This is sha256 over the canonical JSON bytes of `binding.state_fence`;
+/// `StateFence` is canonical by construction via
+/// `StateFence::new(EpochId, ResourceGeneration)`.
+pub fn canonical_fence_digest(fence: &eliot_contracts::StateFence) -> Result<String, ContextError> {
+    let bytes = eliot_contracts::canonical_json_bytes(fence)
+        .map_err(|_| ContextError::InvalidField("canonical_fence"))?;
+    Ok(sha256_hex(&bytes))
+}

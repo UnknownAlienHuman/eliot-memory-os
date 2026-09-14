@@ -238,7 +238,10 @@ impl FinishContext {
 }
 
 /// Strict public finish input.  It contains a candidate draft and rehydrated
-/// evidence only; there is intentionally no completion-proof field.
+/// evidence only; there is intentionally no accepted completion-proof field.
+/// A caller-supplied `completion_proof` value is captured solely so that
+/// [`FinishService::evaluate`] can reject it with
+/// [`FinishError::CallerProofRejected`].  The canonical path never sets it.
 #[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct FinishAttempt {
@@ -252,6 +255,13 @@ pub struct FinishAttempt {
     pub evidence: FinishEvidence,
     /// Explicit lifecycle disposition requested by the owner.
     pub closure_intent: FinishClosureIntent,
+    /// Legacy caller-supplied proof, captured only for rejection.  This is
+    /// the exact `completion_proof` spelling sent by legacy finish callers;
+    /// it is never serialized, digested, published in the contract schema,
+    /// or admitted.
+    #[serde(default, skip_serializing)]
+    #[schemars(skip)]
+    pub completion_proof: Option<serde_json::Value>,
 }
 
 impl FinishAttempt {
@@ -459,6 +469,9 @@ impl FinishService {
         attempt: FinishAttempt,
         context: &FinishContext,
     ) -> Result<FinishAdmission, FinishError> {
+        if attempt.completion_proof.is_some() {
+            return Err(FinishError::CallerProofRejected);
+        }
         attempt.validate()?;
         let attempt_digest = attempt.digest()?;
         if let Some(existing) = self.receipts.get(&attempt.attempt_id) {
@@ -701,6 +714,7 @@ mod tests {
                 unresolved_effect_refs: vec![],
             },
             closure_intent: FinishClosureIntent::Continue,
+            completion_proof: None,
         }
     }
 
@@ -750,5 +764,26 @@ mod tests {
             FinishAdmission::Replayed { receipt } => assert_eq!(receipt, accepted_receipt),
             FinishAdmission::Accepted { .. } => panic!("existing attempt must replay"),
         }
+    }
+
+    #[test]
+    fn caller_supplied_completion_proof_is_rejected() {
+        let mut legacy_value =
+            serde_json::to_value(attempt()).expect("canonical fixture serializes");
+        legacy_value["completion_proof"] = serde_json::json!({"verdict": "VERIFIED_COMPLETE"});
+        let legacy_attempt: FinishAttempt =
+            serde_json::from_value(legacy_value).expect("legacy proof decodes for rejection");
+        assert!(legacy_attempt.completion_proof.is_some());
+
+        let mut service = FinishService::default();
+        assert_eq!(
+            service.evaluate(legacy_attempt, &context()),
+            Err(FinishError::CallerProofRejected)
+        );
+
+        assert!(matches!(
+            service.evaluate(attempt(), &context()),
+            Ok(FinishAdmission::Accepted { .. })
+        ));
     }
 }

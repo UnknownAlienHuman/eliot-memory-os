@@ -540,6 +540,16 @@ impl StateFence {
     }
 }
 
+/// Returns whether two fences match exactly at the point of use.
+///
+/// Unlike [`StateFence::is_compatible_with`], which treats `None` on `self`'s
+/// side as a one-directional wildcard, this helper requires agreement in both
+/// directions. A `None` revision wildcard is rejected unless both sides agree.
+#[must_use]
+pub fn fences_match_exact(a: &StateFence, b: &StateFence) -> bool {
+    a.is_compatible_with(b) && b.is_compatible_with(a)
+}
+
 impl StateFence {
     /// Canonical exact-tuple authorization for one fence/active epoch pair.
     ///

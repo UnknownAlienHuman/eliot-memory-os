@@ -756,3 +756,27 @@ fn candidate_permutation_keeps_membership_and_priority_stable() {
         .collect::<Vec<_>>();
     assert_eq!(admitted_ids, vec![id("b"), id("optional"), id("required")]);
 }
+
+#[test]
+fn mutated_economy_recipe_digest_fails_receipt_validation() {
+    let input = input_with_optional(AdmissionMeasuredCost::ExactUtf8Bytes { value: 1 });
+    let result = admit_context(&input).expect("valid admission");
+    let ContextOutcome::Complete(admitted) = result.outcome else {
+        panic!("floor should fit");
+    };
+    assert_eq!(admitted.economy.recipe_digest, input.recipe.recipe_sha256);
+    admitted.validate().expect("bound receipt validates");
+    let mut mutated = admitted.clone();
+    let original = mutated.economy.recipe_digest.clone();
+    let replacement = if original == "b".repeat(64) {
+        "c".repeat(64)
+    } else {
+        "b".repeat(64)
+    };
+    mutated.economy.recipe_digest = replacement;
+    assert_eq!(
+        mutated.economy.validate(),
+        Err(ContextError::IdentityConflict)
+    );
+    assert_eq!(mutated.validate(), Err(ContextError::IdentityConflict));
+}
