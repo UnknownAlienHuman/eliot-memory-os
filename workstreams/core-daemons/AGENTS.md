@@ -27,7 +27,7 @@ permission. See [`../../docs/architecture/READING_PROTOCOL.md`](../../docs/archi
 <!-- eliot-doc-routing:end -->
 
 
-This brief routes open primary issues #13–#15, #18–#22, #24, completed boundary
+This brief routes open primary issues #14, #18–#22, #24, completed boundary
 baselines #16, #17, #23, and confirmed bounded defect units #63–#67, #74, #77–#79.
 It is not normative. Current meaning comes from the canonical pair in
 `docs/architecture/`, and the exact issue body is the work-unit contract.
@@ -103,15 +103,18 @@ Every candidate returns:
 
 | Issue | Primary boundary |
 |---|---|
-| #13 | generated capability-cell ownership, proof, and current-pair bindings |
 | #14 | Host lifecycle and `HostStateJournal` |
-| #15 | small Kernel, fencing, ORS, Control Reserve, generation routing |
 | #18 | `eliotd` semantic admission, legacy-facade extraction, `PreparedTransition`, strict finish |
 | #19 | store bridge, BlobStore owner, Surreal process generation |
 | #20 | isolated typed Instrument/testd execution |
 | #21 | capability-limited WASM component generations |
 | #22 | native worker artifact/facet/epoch/process boundary |
 | #24 | governed Researcher provider process bridge |
+
+Completed primaries #13 and #15 are historical references only and are never
+valid writers. #15 is succeeded for req.1+2+6 by open #1238 (per #1238 body;
+not stated in #15 body). #13 has no single successor; #11 consumes registry
+identities.
 
 Regression probes #7–#10 own Claude Desktop completion, attach/context,
 Antigravity terminal reconciliation, and arbitrary JSON payload integrity.
@@ -170,8 +173,7 @@ Do not combine the load-bearing migrations into one broad patch. Completed repai
 dependent work:
 
 ```text
-#13 capability/proof ownership projection
-→ #64 lineaged epoch contract
+#64 lineaged epoch contract
 → #63 executable request digest
 → #65 protected capacity classes
 → process-specific identity/activation/error units (#66, #74, #77–#79)
