@@ -25,7 +25,7 @@ pub(crate) use service_registration_status::inspect_approved_service_registratio
 #[cfg(test)]
 pub(crate) use service_registration_status::project_service_registration_inspection;
 pub use service_registration_status::{
-    ServiceRegistrationState, ServiceRuntimeIdentity, service_gap_for,
+    service_gap_for, ServiceRegistrationState, ServiceRuntimeIdentity,
 };
 
 mod supervision_verification;
@@ -39,33 +39,33 @@ pub use supervision_projection::CurrentSupervisionEvidence;
 mod store_live_status;
 #[cfg(test)]
 use store_live_status::store_tcp_endpoint_exact;
-pub use store_live_status::{ProductionStoreLiveObserver, StoreLiveObserver, StoreLiveSnapshot};
 use store_live_status::{inspect_store_live, production_store_observer};
+pub use store_live_status::{ProductionStoreLiveObserver, StoreLiveObserver, StoreLiveSnapshot};
 
 mod store_failure_status;
 pub use store_failure_status::{
-    MAX_BLOCKING_OPERATION_REFS, StoreFailureStatusError, StoreFailureStatusProjection,
-    WriterReadinessDenominator, component_state_for, project_store_failure,
-    writer_readiness_denominator,
+    component_state_for, project_store_failure, writer_readiness_denominator,
+    StoreFailureStatusError, StoreFailureStatusProjection, WriterReadinessDenominator,
+    MAX_BLOCKING_OPERATION_REFS,
 };
 
 mod eliotd_live;
-pub use eliotd_live::{EliotdLiveObserver, EliotdLiveSnapshot, ProductionEliotdLiveObserver};
 use eliotd_live::{eliotd_live_gap, inspect_eliotd_live};
+pub use eliotd_live::{EliotdLiveObserver, EliotdLiveSnapshot, ProductionEliotdLiveObserver};
 
 mod watchdog_live;
+use watchdog_live::{inspect_watchdog_live, watchdog_gap};
 pub use watchdog_live::{
     ProductionWatchdogLiveObserver, WatchdogLiveObserver, WatchdogLiveSnapshot,
 };
-use watchdog_live::{inspect_watchdog_live, watchdog_gap};
 
 mod readiness_projection;
-pub use readiness_projection::ReadinessContour;
 use readiness_projection::inspect_readiness_from_host_state;
+pub use readiness_projection::ReadinessContour;
 
 mod capability_cell_readback;
 pub use capability_cell_readback::{
-    CellReadbackError, GenerationCellResolution, resolve_generation_via_registry,
+    resolve_generation_via_registry, CellReadbackError, GenerationCellResolution,
 };
 
 const WATCHDOG_PUBLICATION_CHILD_LIMIT: u64 = 1024 * 1024;
@@ -2519,7 +2519,14 @@ fn eliotd_live_receipt_ors_matches(
             .resource_generation
             .value()
             != receipt.generation
-        || current.record.binding.state_fence.authority_epoch.value() != receipt.authority_epoch
+        || current
+            .record
+            .binding
+            .state_fence
+            .authority_epoch
+            .sequence
+            .get()
+            != receipt.authority_epoch
         || current.record.record_id.as_str() != receipt.supervision.record_id
         || current.record.revision != receipt.supervision.revision
         || current.record.receipt_sha256 != receipt.supervision.receipt_sha256
@@ -2662,24 +2669,18 @@ mod honest_tests {
         assert_eq!(report.status, "NOT_HEALTHY");
         assert_eq!(report.contract, "eliot.runtime.live");
         assert_eq!(report.contract_version, "1.1.0");
-        assert!(
-            report
-                .gaps
-                .iter()
-                .any(|g| g.contains("freshness cannot be proven"))
-        );
-        assert!(
-            report
-                .gaps
-                .iter()
-                .any(|g| g.contains("provisioned trust anchor"))
-        );
-        assert!(
-            report
-                .gaps
-                .iter()
-                .any(|g| g.contains("installation transaction stage"))
-        );
+        assert!(report
+            .gaps
+            .iter()
+            .any(|g| g.contains("freshness cannot be proven")));
+        assert!(report
+            .gaps
+            .iter()
+            .any(|g| g.contains("provisioned trust anchor")));
+        assert!(report
+            .gaps
+            .iter()
+            .any(|g| g.contains("installation transaction stage")));
         assert!(report.gaps.iter().any(|g| g.contains("Kernel")));
         assert!(report.gaps.iter().any(|g| g.contains("Store")));
         assert!(report.gaps.iter().any(|g| g.contains("eliotd")));
@@ -2882,12 +2883,10 @@ mod honest_tests {
             }
             other => panic!("transaction stage must be Unknown, got {other:?}"),
         }
-        assert!(
-            report
-                .gaps
-                .iter()
-                .any(|g| g == &transaction_stage_gap_for() || g.contains("transaction_stage"))
-        );
+        assert!(report
+            .gaps
+            .iter()
+            .any(|g| g == &transaction_stage_gap_for() || g.contains("transaction_stage")));
         let _ = std::fs::remove_dir_all(root);
     }
 
@@ -3639,11 +3638,13 @@ mod store_currentness_production_tests {
                 authority_generation: eliot_installation::ResourceGeneration::new(1).expect("gen"),
                 authority_state_fence: eliot_installation::StateFence::new(
                     eliot_contracts::EpochId::new(
-                    eliot_contracts::EpochLineageId::new("550e8400-e29b-41d4-a716-446655440000")
+                        eliot_contracts::EpochLineageId::new(
+                            "550e8400-e29b-41d4-a716-446655440000",
+                        )
                         .expect("canonical test lineage-A"),
-                    std::num::NonZeroU64::new(1).expect("non-zero test sequence"),
-                )
-                .expect("valid test epoch"),
+                        std::num::NonZeroU64::new(1).expect("non-zero test sequence"),
+                    )
+                    .expect("valid test epoch"),
                     eliot_installation::ResourceGeneration::genesis(),
                 ),
                 supervision_authority: eliot_installation::SupervisionAuthorityBinding::Pending {
@@ -4152,11 +4153,13 @@ mod live_production_observer_tests {
                         .expect("gen"),
                     authority_state_fence: eliot_installation::StateFence::new(
                         eliot_contracts::EpochId::new(
-                    eliot_contracts::EpochLineageId::new("550e8400-e29b-41d4-a716-446655440000")
-                        .expect("canonical test lineage-A"),
-                    std::num::NonZeroU64::new(1).expect("non-zero test sequence"),
-                )
-                .expect("valid test epoch"),
+                            eliot_contracts::EpochLineageId::new(
+                                "550e8400-e29b-41d4-a716-446655440000",
+                            )
+                            .expect("canonical test lineage-A"),
+                            std::num::NonZeroU64::new(1).expect("non-zero test sequence"),
+                        )
+                        .expect("valid test epoch"),
                         eliot_installation::ResourceGeneration::genesis(),
                     ),
                     supervision_authority:
@@ -4704,11 +4707,9 @@ mod live_production_observer_tests {
             Instant::now() + Duration::from_secs(2),
         );
         assert!(matches!(state, ComponentState::Unknown { .. }));
-        assert!(
-            format!("{state:?}")
-                .to_ascii_lowercase()
-                .contains("monotonic")
-        );
+        assert!(format!("{state:?}")
+            .to_ascii_lowercase()
+            .contains("monotonic"));
         let _ = std::fs::remove_dir_all(&tmp);
     }
     #[test]
@@ -4742,11 +4743,9 @@ mod live_production_observer_tests {
             Instant::now() + Duration::from_secs(2),
         );
         assert!(matches!(state, ComponentState::Unknown { .. }));
-        assert!(
-            format!("{state:?}")
-                .to_ascii_lowercase()
-                .contains("monotonic")
-        );
+        assert!(format!("{state:?}")
+            .to_ascii_lowercase()
+            .contains("monotonic"));
         let _ = std::fs::remove_dir_all(&tmp);
     }
     #[test]
@@ -4774,11 +4773,9 @@ mod live_production_observer_tests {
             Instant::now() + Duration::from_secs(2),
         );
         assert!(matches!(state, ComponentState::Unknown { .. }));
-        assert!(
-            format!("{state:?}")
-                .to_ascii_lowercase()
-                .contains("monotonic")
-        );
+        assert!(format!("{state:?}")
+            .to_ascii_lowercase()
+            .contains("monotonic"));
         let _ = std::fs::remove_dir_all(&tmp);
     }
     #[test]
@@ -4817,11 +4814,9 @@ mod live_production_observer_tests {
             Instant::now() + Duration::from_secs(2),
         );
         assert!(matches!(state, ComponentState::Unknown { .. }));
-        assert!(
-            format!("{state:?}")
-                .to_ascii_lowercase()
-                .contains("monotonic")
-        );
+        assert!(format!("{state:?}")
+            .to_ascii_lowercase()
+            .contains("monotonic"));
         let _ = std::fs::remove_dir_all(&tmp);
     }
     #[test]
@@ -5085,9 +5080,9 @@ mod cli_separate_process_tests {
 mod host_journal_projection_tests {
     use super::*;
     use eliot_host_state::{
-        ActivationState, EpochIdentity, EpochTransition, HostInstallationEpoch, HostStateRecord,
-        IdempotencyIdentity, KernelJobBinding, KernelReadinessObservationRecord, OneTimeNonceState,
-        PriorKernelDisposition, ReadinessApprovedContour, record_checksum,
+        record_checksum, ActivationState, EpochIdentity, EpochTransition, HostInstallationEpoch,
+        HostStateRecord, IdempotencyIdentity, KernelJobBinding, KernelReadinessObservationRecord,
+        OneTimeNonceState, PriorKernelDisposition, ReadinessApprovedContour,
     };
     use eliot_platform::PlatformHandle;
     use eliot_runtime_contracts::KernelActivationState;
@@ -5818,7 +5813,7 @@ mod production_call_path_negatives {
         let ctx = eliot_process::DispatchValidationContext::new(
             clock,
             fence.clone(),
-            1,
+            fence.authority_epoch().clone(),
             std::collections::BTreeMap::from([
                 ("authority".to_owned(), "a".repeat(64)),
                 ("state".to_owned(), "b".repeat(64)),

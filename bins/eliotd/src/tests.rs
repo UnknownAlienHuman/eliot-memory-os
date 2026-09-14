@@ -8,6 +8,17 @@
 //! Governor or Kernel authority — no session, fence, or capability issuance.
 
 use super::*;
+use eliot_contracts::{EpochId, EpochLineageId};
+use std::num::NonZeroU64;
+
+const TEST_LINEAGE_A: &str = "550e8400-e29b-41d4-a716-446655440000";
+
+fn test_epoch(sequence: u64) -> Result<EpochId, Box<dyn std::error::Error>> {
+    Ok(EpochId::new(
+        EpochLineageId::new(TEST_LINEAGE_A)?,
+        NonZeroU64::new(sequence).ok_or("nonzero test sequence")?,
+    )?)
+}
 
 fn valid_launch_config() -> Result<GovernorLaunchConfig, Box<dyn std::error::Error>> {
     Ok(GovernorLaunchConfig {
@@ -19,7 +30,7 @@ fn valid_launch_config() -> Result<GovernorLaunchConfig, Box<dyn std::error::Err
             protected_snapshot_digest: "b".repeat(64),
             principal: "local-service".to_owned(),
             generation: ResourceGeneration::new(1)?,
-            authority_epoch: AuthorityEpoch::new(1)?,
+            authority_epoch: test_epoch(1)?,
         },
         protected_snapshot_digest: "b".repeat(64),
     })
@@ -34,7 +45,7 @@ fn resolution_ticket() -> Result<AgentActivationResolutionTicket, Box<dyn std::e
         activation_request_sha256: "a".repeat(64),
         peer_admission_receipt_sha256: "b".repeat(64),
         connection_id: "connection-1".to_owned(),
-        state_fence: StateFence::new(AuthorityEpoch::new(1)?, ResourceGeneration::new(1)?),
+        state_fence: StateFence::new(test_epoch(1)?, ResourceGeneration::new(1)?),
         kernel_deadline_unix_ms: 100,
         ticket_sha256: String::new(),
     }
@@ -43,8 +54,8 @@ fn resolution_ticket() -> Result<AgentActivationResolutionTicket, Box<dyn std::e
 }
 
 #[test]
-fn semantic_resolution_mapping_is_immutable_and_ticket_bound()
--> Result<(), Box<dyn std::error::Error>> {
+fn semantic_resolution_mapping_is_immutable_and_ticket_bound(
+) -> Result<(), Box<dyn std::error::Error>> {
     let ticket = resolution_ticket()?;
     ticket.validate()?;
     let snapshot = eliot_governor::GovernorActivationSnapshot {
@@ -70,7 +81,7 @@ fn semantic_resolution_mapping_is_immutable_and_ticket_bound()
     assert!(decision.validate_against(&substituted).is_err());
 
     let mut stale = ticket.clone();
-    stale.state_fence = StateFence::new(AuthorityEpoch::new(1)?, ResourceGeneration::new(2)?);
+    stale.state_fence = StateFence::new(test_epoch(1)?, ResourceGeneration::new(2)?);
     stale.ticket_sha256 = stale.compute_digest()?;
     assert!(decision.validate_against(&stale).is_err());
     Ok(())
@@ -91,8 +102,8 @@ fn production_config_has_no_root_or_environment_override() {
 }
 
 #[test]
-fn application_payload_always_carries_a_closed_operation_identity()
--> Result<(), Box<dyn std::error::Error>> {
+fn application_payload_always_carries_a_closed_operation_identity(
+) -> Result<(), Box<dyn std::error::Error>> {
     let payload = operation_payload("health", serde_json::json!({}))?;
     assert_eq!(payload["operation"], "health");
     assert!(operation_payload("health", serde_json::json!([])).is_err());
@@ -119,8 +130,8 @@ fn snapshot_expectation_rejects_unbound_digest() -> Result<(), Box<dyn std::erro
 }
 
 #[test]
-fn kernel_and_eliotd_artifact_domains_cannot_rewrite_each_other()
--> Result<(), Box<dyn std::error::Error>> {
+fn kernel_and_eliotd_artifact_domains_cannot_rewrite_each_other(
+) -> Result<(), Box<dyn std::error::Error>> {
     let launch = valid_launch_config()?;
     let kernel_digest = launch.kernel.artifact_digest.clone();
     let child_digest = "c".repeat(64);
@@ -177,8 +188,8 @@ fn kernel_and_eliotd_artifact_domains_cannot_rewrite_each_other()
 
 #[cfg(windows)]
 #[test]
-fn production_server_hello_requires_observed_sid_and_session_binding()
--> Result<(), Box<dyn std::error::Error>> {
+fn production_server_hello_requires_observed_sid_and_session_binding(
+) -> Result<(), Box<dyn std::error::Error>> {
     let launch = valid_launch_config()?;
     let config = DaemonConfig::from_launch_with_binding(
         launch.clone(),
@@ -199,14 +210,14 @@ fn production_server_hello_requires_observed_sid_and_session_binding()
             "service": launch.kernel.service,
             "protocol": launch.kernel.protocol,
             "generation": launch.kernel.generation.value(),
-            "authority_epoch": launch.kernel.authority_epoch.value(),
+            "authority_epoch": launch.kernel.authority_epoch.clone(),
             "artifact_digest": launch.kernel.artifact_digest,
             "protected_snapshot_digest": launch.protected_snapshot_digest,
         }),
         heartbeat_ms: 1_000,
         control_channel: KERNEL_PIPE_NAME.to_owned(),
         rejection_reason: None,
-        authority_epoch: launch.kernel.authority_epoch,
+        authority_epoch: launch.kernel.authority_epoch.clone(),
     };
     validate_server_hello(&launch, &config.kernel_binding, &hello)?;
 
@@ -237,8 +248,8 @@ fn production_server_hello_requires_observed_sid_and_session_binding()
 
 #[cfg(windows)]
 #[tokio::test]
-async fn receipt_publication_race_retries_only_exact_pre_admission_failures()
--> Result<(), Box<dyn std::error::Error>> {
+async fn receipt_publication_race_retries_only_exact_pre_admission_failures(
+) -> Result<(), Box<dyn std::error::Error>> {
     let connection_id = "eliotd:race:test";
     let pending =
         eliot_ipc::handshake_rejection_frame(connection_id, ELIOTD_RECEIPT_PENDING_REJECTION)?;

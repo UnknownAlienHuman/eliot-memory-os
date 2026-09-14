@@ -7,12 +7,12 @@ use std::time::Instant;
 use eliot_contracts::sha256_hex;
 use eliot_installation::CandidateManifest;
 use eliot_runtime_contracts::{
-    SUPERVISION_LEASE_FILE_NAME, SignedSupervisionLease, SupervisionLeaseIncarnationBinding,
+    SignedSupervisionLease, SupervisionLeaseIncarnationBinding,
     SupervisionLeasePredecessorIdentity, SupervisionLeaseVerificationContext,
-    SupervisionLeaseVerifier, SupervisionTrustAnchor, WATCHDOG_ADMISSION_FILE_NAME,
-    WATCHDOG_PUBLICATION_DIRECTORY_PREFIX, WATCHDOG_PUBLICATION_FILE_NAME,
-    WATCHDOG_PUBLICATION_RETAINED_LIMIT, WatchdogAdmissionTemplate, WatchdogPublicationBundle,
-    WatchdogPublicationRetentionPlan,
+    SupervisionLeaseVerifier, SupervisionTrustAnchor, WatchdogAdmissionTemplate,
+    WatchdogPublicationBundle, WatchdogPublicationRetentionPlan, SUPERVISION_LEASE_FILE_NAME,
+    WATCHDOG_ADMISSION_FILE_NAME, WATCHDOG_PUBLICATION_DIRECTORY_PREFIX,
+    WATCHDOG_PUBLICATION_FILE_NAME, WATCHDOG_PUBLICATION_RETAINED_LIMIT,
 };
 
 pub(super) fn require_host_monotonic_lease(
@@ -393,7 +393,10 @@ pub(super) fn verify_host_supervision_bundle(
         || current_binding.activation_id.as_str() != journaled_incarnation.activation_id
         || current_binding.activation_generation.value()
             != journaled_incarnation.activation_generation.sequence
-        || current_binding.kernel_epoch.value() != journaled_incarnation.kernel_generation.sequence
+        || current_binding.kernel_epoch.lineage_id.as_str()
+            != journaled_incarnation.kernel_generation.lineage_id.as_str()
+        || current_binding.kernel_epoch.sequence.get()
+            != journaled_incarnation.kernel_generation.sequence
         || current_binding.observation_scope != journaled_incarnation.observation_scope
         || current_binding.watchdog_epoch.value() != journaled_incarnation.watchdog_epoch.sequence
         || current_binding.wake_policy != journaled_incarnation.wake_policy

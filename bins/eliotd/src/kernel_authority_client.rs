@@ -33,7 +33,7 @@ use eliot_governor::{KernelGenerationSnapshotProvider, KernelPortError};
 use eliot_receipts::AuthorityBinding;
 use eliot_runtime_contracts::{AuthorityActivationReceipt, AuthorityRevocationReceipt};
 
-use super::{DaemonKernelClient, kind_value};
+use super::{kind_value, DaemonKernelClient};
 
 /// Daemon→Kernel P-07 route names. These name the Kernel-owned front-door
 /// route (T6/#15); until it exists the Kernel rejects them and the adapter
@@ -251,14 +251,25 @@ fn decode_revocation_receipt(
 mod tests {
     use super::*;
     use eliot_authority::{GrantId, GrantStatus, IntroductionStatus};
-    use eliot_contracts::{AuthorityEpoch, ContractId, ResourceGeneration};
+    use eliot_contracts::{ContractId, EpochId, EpochLineageId, ResourceGeneration};
     use eliot_governor::{PresentedAuthorityRequest, RetainedAuthorityRequest};
     use eliot_receipts::{EffectClass, ProofCeiling};
     use eliot_runtime_contracts::AuthorityState;
+    use std::num::NonZeroU64;
+
+    const TEST_LINEAGE_A: &str = "550e8400-e29b-41d4-a716-446655440000";
+
+    fn test_epoch(sequence: u64) -> EpochId {
+        EpochId::new(
+            EpochLineageId::new(TEST_LINEAGE_A).expect("valid test lineage"),
+            NonZeroU64::new(sequence).expect("nonzero test sequence"),
+        )
+        .expect("valid test epoch")
+    }
 
     fn test_fence() -> StateFence {
         StateFence::new(
-            AuthorityEpoch::new(1).expect("authority epoch"),
+            test_epoch(1),
             ResourceGeneration::new(1).expect("resource generation"),
         )
     }
@@ -267,7 +278,7 @@ mod tests {
         AuthorityBinding {
             authority_id: ContractId::new("authority:test").expect("authority id"),
             authority_owner: "test-owner".to_owned(),
-            authority_epoch: fence.authority_epoch,
+            authority_epoch: fence.authority_epoch.clone(),
             state_fence: fence.clone(),
             allowed_effect: EffectClass::ExternalEffect,
             proof_ceiling: ProofCeiling::ObservedExternalEffect,
@@ -309,7 +320,7 @@ mod tests {
             Err(P07PortError::InvalidBinding)
         ));
         let mut split_binding = test_binding(&fence);
-        split_binding.authority_epoch = AuthorityEpoch::new(2).expect("authority epoch");
+        split_binding.authority_epoch = test_epoch(2);
         assert!(matches!(
             check_binding(&split_binding, &fence),
             Err(P07PortError::InvalidBinding)
@@ -356,7 +367,7 @@ mod tests {
         let valid = serde_json::to_value(AuthorityActivationReceipt {
             activation_id: "act-1".to_owned(),
             snapshot_id: "snap-1".to_owned(),
-            authority_epoch: fence.authority_epoch,
+            authority_epoch: fence.authority_epoch.clone(),
             state: AuthorityState::Active,
         })
         .expect("receipt JSON");
@@ -367,7 +378,7 @@ mod tests {
         let non_active = serde_json::to_value(AuthorityActivationReceipt {
             activation_id: "act-2".to_owned(),
             snapshot_id: "snap-1".to_owned(),
-            authority_epoch: fence.authority_epoch,
+            authority_epoch: fence.authority_epoch.clone(),
             state: AuthorityState::PendingKernelActivation,
         })
         .expect("receipt JSON");
@@ -379,7 +390,7 @@ mod tests {
         let foreign_snapshot = serde_json::to_value(AuthorityActivationReceipt {
             activation_id: "act-3".to_owned(),
             snapshot_id: "snap-other".to_owned(),
-            authority_epoch: fence.authority_epoch,
+            authority_epoch: fence.authority_epoch.clone(),
             state: AuthorityState::Active,
         })
         .expect("receipt JSON");
@@ -409,7 +420,7 @@ mod tests {
         let non_terminal = serde_json::to_value(AuthorityRevocationReceipt {
             revocation_id: "rev-1".to_owned(),
             snapshot_id: "snap-1".to_owned(),
-            authority_epoch: fence.authority_epoch,
+            authority_epoch: fence.authority_epoch.clone(),
             state: AuthorityState::Active,
         })
         .expect("receipt JSON");
@@ -420,7 +431,7 @@ mod tests {
         let revoked = serde_json::to_value(AuthorityRevocationReceipt {
             revocation_id: "rev-2".to_owned(),
             snapshot_id: "snap-1".to_owned(),
-            authority_epoch: fence.authority_epoch,
+            authority_epoch: fence.authority_epoch.clone(),
             state: AuthorityState::Revoked,
         })
         .expect("receipt JSON");
@@ -489,7 +500,7 @@ mod tests {
         let receipt = AuthorityRevocationReceipt {
             revocation_id: "rev-9".to_owned(),
             snapshot_id: "snap-1".to_owned(),
-            authority_epoch: fence.authority_epoch,
+            authority_epoch: fence.authority_epoch.clone(),
             state: AuthorityState::Revoked,
         };
         revoked
@@ -518,7 +529,7 @@ mod tests {
         let activation = AuthorityActivationReceipt {
             activation_id: "act-never".to_owned(),
             snapshot_id: "snap-1".to_owned(),
-            authority_epoch: fence.authority_epoch,
+            authority_epoch: fence.authority_epoch.clone(),
             state: AuthorityState::Active,
         };
         assert!(

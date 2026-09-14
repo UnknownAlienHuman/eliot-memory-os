@@ -5,20 +5,20 @@
 //! watchdog publication bundle and re-checks identity/contour after verification. It never mints
 //! authority, never selects an alternate current owner, and fails closed on any lease/fence mismatch.
 
-use eliot_platform_windows::{ProtectedRootLease, ProtectedRuntimePathLease, windows_paths_equal};
+use eliot_platform_windows::{windows_paths_equal, ProtectedRootLease, ProtectedRuntimePathLease};
 use eliot_runtime_contracts::{
     SupervisionLeaseIncarnationBinding, SupervisionLeasePredecessorIdentity,
-    WATCHDOG_PUBLICATION_DIRECTORY_PREFIX, WATCHDOG_PUBLICATION_RETAINED_LIMIT,
     WatchdogAdmissionTemplate, WatchdogPublicationRetentionPlan,
+    WATCHDOG_PUBLICATION_DIRECTORY_PREFIX, WATCHDOG_PUBLICATION_RETAINED_LIMIT,
 };
 
 use super::watchdog_admission::inspect_registry_at;
 use super::{
-    FileWatchdogAdmission, HOST_JOURNAL_FILE_NAME, INSTALLATION_REGISTRY_FILE_NAME, SpoolError,
-    VerifiedWatchdogAdmission, WatchdogAdmissionConfig, WatchdogRuntimeBinding, current_unix_ms,
-    observe_watchdog_publication, read_manifest_selected_ors_current, scan_watchdog_publications,
-    select_runtime_manifest, validate_bound_service_registrations, validate_runtime_binding,
-    verify_against_durable_current,
+    current_unix_ms, observe_watchdog_publication, read_manifest_selected_ors_current,
+    scan_watchdog_publications, select_runtime_manifest, validate_bound_service_registrations,
+    validate_runtime_binding, verify_against_durable_current, FileWatchdogAdmission, SpoolError,
+    VerifiedWatchdogAdmission, WatchdogAdmissionConfig, WatchdogRuntimeBinding,
+    HOST_JOURNAL_FILE_NAME, INSTALLATION_REGISTRY_FILE_NAME,
 };
 
 fn read_journaled_current_supervision(
@@ -231,7 +231,8 @@ pub(super) fn load_content_addressed_supervision_lease_bound(
         || durable_binding.activation_id.as_str() != journaled_incarnation.activation_id
         || durable_binding.activation_generation.value()
             != journaled_incarnation.activation_generation.sequence
-        || durable_binding.kernel_epoch.value() != journaled_incarnation.kernel_generation.sequence
+        || durable_binding.kernel_epoch.sequence.get()
+            != journaled_incarnation.kernel_generation.sequence
         || durable_binding.observation_scope != journaled_incarnation.observation_scope
         || durable_binding.watchdog_epoch.value() != journaled_incarnation.watchdog_epoch.sequence
         || durable_binding.wake_policy != journaled_incarnation.wake_policy

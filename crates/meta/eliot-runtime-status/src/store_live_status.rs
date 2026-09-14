@@ -21,8 +21,8 @@ use eliot_contracts::sha256_hex;
 
 use crate::supervision_verification::require_host_monotonic_lease;
 use crate::{
-    ComponentState, current_unix_ms, is_fresh_typed, is_sha256_hex, select_current_store_rebind,
-    unknown_component,
+    current_unix_ms, is_fresh_typed, is_sha256_hex, select_current_store_rebind, unknown_component,
+    ComponentState,
 };
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -305,7 +305,8 @@ pub(super) fn inspect_store_live(
             .runtime_launch
             .authority_state_fence
             .authority_epoch
-            .value()
+            .sequence
+            .get()
     {
         return unknown_component(
             "Store",
@@ -316,7 +317,8 @@ pub(super) fn inspect_store_live(
                     .runtime_launch
                     .authority_state_fence
                     .authority_epoch
-                    .value()
+                    .sequence
+                    .get()
             ),
         );
     }
