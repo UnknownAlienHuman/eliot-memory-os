@@ -1047,7 +1047,12 @@ dependencies = [
 name = "eliot-doctor"
 version = "0.1.0"
 dependencies = [
+ "eliot-cli",
+ "eliot-contracts",
  "eliot-doctor-core",
+ "eliot-instrument-api",
+ "eliot-kernel-service",
+ "eliot-platform",
  "eliot-process",
  "serde",
  "serde_json",

@@ -14,7 +14,10 @@ name = "eliot-doctor"
 path = "src/main.rs"
 
 [dependencies]
+eliot-cli.workspace = true
+eliot-contracts.workspace = true
 eliot-doctor-core.workspace = true
+eliot-kernel-service.workspace = true
 eliot-process.workspace = true
 serde.workspace = true
 serde_json.workspace = true
@@ -24,3 +27,7 @@ tokio.workspace = true
 
 [lints]
 workspace = true
+
+[dev-dependencies]
+eliot-instrument-api.workspace = true
+eliot-platform.workspace = true
