@@ -11,7 +11,11 @@ use crate::client;
 use crate::config::SurrealAdapterConfig;
 use crate::error::AdapterError;
 use crate::schema;
-use eliot_store_api::{OperationId, WriteReceipt, validate_store_receipt_envelope};
+use eliot_store_api::{
+    CanonicalRequestView, OperationId, OrderingHeadExpectation, RevisionHeadExpectation,
+    WriteReceipt, canonical_request_hash, validate_store_receipt_envelope,
+    verify_canonical_request_hash,
+};
 
 use super::{FenceRecord, Idempotency, take_optional, take_vec};
 
@@ -105,6 +109,68 @@ pub(super) fn classify_idempotency(
     if let Some(receipt) = by_idempotency.into_iter().next() {
         receipt.validate()?;
         return if receipt.canonical_request_hash == transition.identity.canonical_request_hash
+            && receipt.operation_id == transition.identity.operation_id
+        {
+            validate_store_receipt_envelope(ctx, transition, &receipt)?;
+            Ok(Idempotency::Replay(receipt))
+        } else {
+            Ok(Idempotency::Conflict)
+        };
+    }
+    Ok(Idempotency::None)
+}
+
+/// Decides replay/conflict/digest-mismatch from durable reads (RECHECK-63
+/// slice C).
+///
+/// Recomputes the canonical hash from the exact values to be executed
+/// (`ctx` + `transition` + expected heads) via the shared helper BEFORE any
+/// idempotency-lookup success is returned: supplied != recomputed is
+/// `TransitionDigestMismatch` (mapped to `TRANSITION_DIGEST_MISMATCH`) with no
+/// transaction and no replay. Same key + different executable bytes
+/// (recomputed != stored, supplied == recomputed) stays `IdentityConflict`
+/// with no transaction. Exact triple with a valid envelope replays.
+///
+/// Residual wiring (cannot edit `apply.rs` here): `apply.rs:579`
+/// `read_idempotency(db, &adapter.config, ctx, &transition)` must pass the
+/// `expected_revision_heads` / `expected_ordering_heads` from
+/// `apply_prepared_with_authority` and call this function, otherwise the live
+/// Surreal path keeps the legacy hash-blind classifier.
+#[allow(dead_code)]
+pub(super) fn classify_idempotency_with_expected_heads(
+    by_operation: Vec<WriteReceipt>,
+    by_idempotency: Vec<WriteReceipt>,
+    ctx: &eliot_store_api::RequestMeta,
+    transition: &eliot_store_api::PreparedTransition,
+    expected_revision_heads: &[RevisionHeadExpectation],
+    expected_ordering_heads: &[OrderingHeadExpectation],
+) -> Result<Idempotency, AdapterError> {
+    let view = CanonicalRequestView::from_apply(
+        ctx,
+        transition,
+        expected_revision_heads,
+        expected_ordering_heads,
+    );
+    verify_canonical_request_hash(&view, &transition.identity.canonical_request_hash)
+        .map_err(AdapterError::Store)?;
+    let recomputed = canonical_request_hash(&view).map_err(AdapterError::Store)?;
+    // From here supplied == recomputed, so stored-vs-supplied and
+    // stored-vs-recomputed coincide; compare against recomputed explicitly so
+    // the receipt invariant (binds recomputed) is what gates replay.
+    if let Some(receipt) = by_operation.into_iter().next() {
+        receipt.validate()?;
+        return if receipt.idempotency_key == transition.identity.idempotency_key
+            && receipt.canonical_request_hash == recomputed
+        {
+            validate_store_receipt_envelope(ctx, transition, &receipt)?;
+            Ok(Idempotency::Replay(receipt))
+        } else {
+            Ok(Idempotency::Conflict)
+        };
+    }
+    if let Some(receipt) = by_idempotency.into_iter().next() {
+        receipt.validate()?;
+        return if receipt.canonical_request_hash == recomputed
             && receipt.operation_id == transition.identity.operation_id
         {
             validate_store_receipt_envelope(ctx, transition, &receipt)?;
@@ -273,5 +339,101 @@ mod idempotency_tests {
             classify_idempotency(vec![tampered], Vec::new(), &context, &transition).is_err(),
             "envelope substitution must fail closed, never replay"
         );
+    }
+
+    #[test]
+    fn recomputed_classifier_rejects_tamper_before_replay_and_keeps_conflict_split() {
+        use crate::plan::{build_receipt_with_expected_heads, plan_apply};
+        use eliot_store_api::{CanonicalRequestView, StoreError, canonical_request_hash};
+
+        // RECHECK-63 slice C (pure, no live DB): supplied != recomputed is
+        // TRANSITION_DIGEST_MISMATCH with no replay; same-key-different-bytes
+        // with supplied == recomputed stays IDENTITY_CONFLICT (Conflict).
+        let (context, mut transition) = fixture();
+        let view = CanonicalRequestView::from_apply(&context, &transition, &[], &[]);
+        let recomputed = canonical_request_hash(&view).expect("recomputed digest");
+        assert_ne!(
+            recomputed,
+            "a".repeat(64),
+            "legacy placeholder is never the real digest"
+        );
+        transition.identity.canonical_request_hash = recomputed.clone();
+        let plan = plan_apply(&transition, &[], &[], 1, 1).expect("plan applies");
+        let receipt = build_receipt_with_expected_heads(&context, &transition, &plan, &[], &[])
+            .expect("receipt binds recomputed");
+        assert_eq!(receipt.canonical_request_hash, recomputed);
+        // Exact replays.
+        assert!(matches!(
+            classify_idempotency_with_expected_heads(
+                vec![receipt.clone()],
+                Vec::new(),
+                &context,
+                &transition,
+                &[],
+                &[]
+            )
+            .expect("exact classifies"),
+            Idempotency::Replay(replayed) if replayed == receipt
+        ));
+        // Tampered executable bytes with the old claim: typed mismatch, never
+        // a replay and never a conflict success.
+        let mut tampered = transition.clone();
+        tampered.named_operations[0]
+            .parameters
+            .insert("subject".to_owned(), json!("tampered"));
+        assert!(matches!(
+            classify_idempotency_with_expected_heads(
+                vec![receipt.clone()],
+                Vec::new(),
+                &context,
+                &tampered,
+                &[],
+                &[]
+            ),
+            Err(AdapterError::Store(
+                StoreError::TransitionDigestMismatch { .. }
+            ))
+        ));
+        assert!(matches!(
+            classify_idempotency_with_expected_heads(
+                Vec::new(),
+                Vec::new(),
+                &context,
+                &tampered,
+                &[],
+                &[]
+            ),
+            Err(AdapterError::Store(
+                StoreError::TransitionDigestMismatch { .. }
+            ))
+        ));
+        // Same idempotency key, different executable bytes, each side
+        // self-consistent (supplied == recomputed for its own bytes): the
+        // stored receipt differs from the new recomputed, so Conflict.
+        let mut forked = transition.clone();
+        forked.identity.operation_id =
+            eliot_store_api::OperationId::new("op-idem-fork").expect("operation");
+        forked.named_operations[0]
+            .parameters
+            .insert("subject".to_owned(), json!("forked"));
+        let forked_view = CanonicalRequestView::from_apply(&context, &forked, &[], &[]);
+        forked.identity.canonical_request_hash =
+            canonical_request_hash(&forked_view).expect("forked digest");
+        assert_ne!(
+            forked.identity.canonical_request_hash, recomputed,
+            "fork binds a different recomputed digest"
+        );
+        assert!(matches!(
+            classify_idempotency_with_expected_heads(
+                vec![receipt],
+                Vec::new(),
+                &context,
+                &forked,
+                &[],
+                &[]
+            )
+            .expect("fork classifies"),
+            Idempotency::Conflict
+        ));
     }
 }
