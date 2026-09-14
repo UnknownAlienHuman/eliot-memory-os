@@ -181,6 +181,7 @@ exclude = [
   "crates/smart/eliot-dreamer-maintenance-plan",  # agent_order 41
   "crates/smart/eliot-dreamer-configuration-plan",  # agent_order 42
   "crates/smart/eliot-dreamer-orchestration-plan",  # agent_order 43
+  "crates/foundation/eliot-conformance-contracts",  # prototype dep target for #216 (not a member; admission forbidden until fixture+review)
 ]
 default-members = [
   "bins/eliot",

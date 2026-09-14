@@ -828,6 +828,7 @@ name = "eliot-bootstrap"
 version = "0.1.0"
 dependencies = [
  "eliot-agent-api",
+ "eliot-conformance-contracts",
  "eliot-contracts",
  "eliot-protocol",
  "eliot-rules",
@@ -954,6 +955,14 @@ dependencies = [
  "schemars",
  "serde",
  "serde_json",
+ "thiserror",
+]
+
+[[package]]
+name = "eliot-conformance-contracts"
+version = "0.1.0"
+dependencies = [
+ "serde",
  "thiserror",
 ]
 
