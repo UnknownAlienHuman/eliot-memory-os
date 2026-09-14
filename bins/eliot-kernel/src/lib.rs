@@ -167,6 +167,17 @@ pub use eliot_kernel_service::{
     DOCTOR_REPAIR_WIRE_ID, DOCTOR_REPAIR_WIRE_VERSION, DoctorAdmissionContext,
     DoctorRepairAttemptRequest, route_doctor_repair,
 };
+/// P-07 testd wire seam for the front-door dispatch/driver arms (T6-X1 Slice B).
+///
+/// The dispatch arm (`frame_dispatch`) and the session binder
+/// (`front_door_session`) depend only on these existing
+/// `testd_front_door.rs` symbols. The `testd_front_door.rs` handler plugs
+/// into the marked call site in `frame_dispatch::execute_testd_request`
+/// without changing this seam.
+pub use eliot_kernel_service::{
+    TESTD_ADMISSION_WIRE_ID, TESTD_ADMISSION_WIRE_VERSION, TestdAdmissionAttemptRequest,
+    TestdAdmissionContext, route_testd_admission,
+};
 #[cfg(test)]
 use eliot_ors::CanonicalEvidenceProvider;
 use eliot_ors::{AuthorityHandoffBegin, AuthorityHandoffRecord, AuthorityHandoffState, OrsError};
@@ -613,6 +624,21 @@ pub enum KernelFrameAction {
         /// Closed operation name; must equal `DOCTOR_REPAIR_WIRE_ID`.
         operation: String,
         /// Bounded operation payload carrying the typed repair-attempt request.
+        payload: serde_json::Value,
+    },
+    /// Execute one authenticated testd admission operation (T6-X1 P-07).
+    /// The operation carries the exact testd wire identity; job-bound
+    /// admission itself is owned by the P-07 testd handler through
+    /// `eliot_kernel_service::testd_front_door` (`route_testd_admission` /
+    /// `handle_testd_admission_attempt`). New-execution intake is
+    /// `Ready`-gated per kind; cancel/reconcile control additionally routes
+    /// while `Degraded`.
+    Testd {
+        /// Correlation identity to echo in the response.
+        request_id: RequestId,
+        /// Closed operation name; must equal `TESTD_ADMISSION_WIRE_ID`.
+        operation: String,
+        /// Bounded operation payload carrying the typed admission request.
         payload: serde_json::Value,
     },
     /// Return a typed rejection, then fence the connection.

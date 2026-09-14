@@ -25,6 +25,7 @@ mod protocol;
 mod store_client;
 #[cfg(windows)]
 mod store_gateway;
+mod testd_front_door;
 
 pub use doctor::{
     DOCTOR_CONFLICT_MAX_FIELDS, DOCTOR_MAX_ENVELOPE_BYTES, DOCTOR_MAX_LEASE_DURATION_NANOS,
@@ -88,6 +89,15 @@ pub use protocol::{
 pub use store_client::{EbpCanonicalStoreClient, EbpStoreTransport, StoreClientError};
 #[cfg(windows)]
 pub use store_gateway::KernelStoreGateway;
+pub use testd_front_door::{
+    AuthenticatedTestdSession, TESTD_ADMISSION_ADVERTISED, TESTD_ADMISSION_WIRE_ID,
+    TESTD_ADMISSION_WIRE_VERSION, TESTD_CONFLICT_MAX_FIELDS, TESTD_MAX_ENVELOPE_BYTES,
+    TestdAdmission, TestdAdmissionAttemptRequest, TestdAdmissionConflict, TestdAdmissionContext,
+    TestdAdmissionEnvelope, TestdAdmissionRejection, TestdAdmissionRejectionReason,
+    TestdAdmissionResponse, advertise_testd_admission, handle_testd_admission_attempt,
+    handle_testd_cancellation, is_testd_diagnosis_only_envelope, reconcile_testd_admission,
+    reconcile_testd_delivery, route_testd_admission,
+};
 
 /// Boxed future for provider-neutral Kernel process operations.
 pub type ProcessExecutionFuture<'a> =

@@ -29,6 +29,13 @@ pub use eliot_testd_core::{
     NormalizedEvidence, RawArtifact, VerificationReceipt, sha256_artifact, sha256_hex,
 };
 
+pub mod kernel_client;
+pub use kernel_client::{
+    KernelTestdIpcClient, TESTD_ADMISSION_ADVERTISED, TESTD_ADMISSION_OPERATION,
+    TESTD_ADMISSION_OPERATION_VERSION, TESTD_DISPATCH_RESIDUAL, advertise_testd_admission,
+    route_testd_admission,
+};
+
 /// Stable daemon service identity.
 pub const SERVICE_NAME: &str = "eliot-testd";
 /// Stable line-protocol revision.
