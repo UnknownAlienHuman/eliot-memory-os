@@ -16,8 +16,9 @@ use super::*;
 mod store_receipt_dispatch;
 use eliot_contracts::StateFence;
 use eliot_store_api::{
-    OrderingHeadExpectation, PreparedTransition, RequestMeta, RevisionHeadExpectation, StoreError,
-    StoreGenesisRequest, StoreRecoveryRequest, StoreRecoverySnapshot, WriteReceipt,
+    CanonicalRequestView, OrderingHeadExpectation, PreparedTransition, RequestMeta,
+    RevisionHeadExpectation, StoreError, StoreGenesisRequest, StoreRecoveryRequest,
+    StoreRecoverySnapshot, WriteReceipt, verify_canonical_request_hash,
 };
 use serde::Deserialize;
 
@@ -514,6 +515,29 @@ impl KernelComposition {
             }
             if head.state_fence != operation.context.state_fence {
                 return Err(TransportError::SessionFenced);
+            }
+        }
+        // RECHECK-63 slice B: recompute the canonical request hash from the
+        // exact values about to be executed (context + transition + expected
+        // heads) and reject divergence before the gateway call. The view is
+        // built from these references — not re-forwarded copies — so a
+        // mutation after admission fails here with the typed mismatch,
+        // rendered through the existing store-error response shape.
+        {
+            let view = CanonicalRequestView::from_apply(
+                &operation.context,
+                &operation.transition,
+                &operation.expected_revision_heads,
+                &operation.expected_ordering_heads,
+            );
+            if let Err(error) = verify_canonical_request_hash(
+                &view,
+                &operation.transition.identity.canonical_request_hash,
+            ) {
+                return Ok(Self::store_error_response_text(
+                    "write_receipt",
+                    &error.to_string(),
+                ));
             }
         }
         let gateway = self.retained_store_gateway()?;

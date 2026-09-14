@@ -421,12 +421,16 @@ impl<T: EbpStoreTransport + 'static> EbpCanonicalStoreClient<T> {
     /// which would invite same-identity write retry after a possible commit),
     /// and an absent receipt after the exact query stays unknown for the same
     /// reason. Only a substituted receipt (wrong operation identity) is an
-    /// identity conflict, reported after the exact query ran.
+    /// identity conflict, reported after the exact query ran. A receipt whose
+    /// canonical request hash diverges from the admitted digest (RECHECK-63)
+    /// is a digest mismatch, never an adopted identity.
     pub(super) async fn receipt_exact(
         &self,
         operation_id: OperationId,
+        expected_canonical_request_hash: &str,
     ) -> Result<WriteReceipt, StoreError> {
         let expected = operation_id.clone();
+        let expected_hash = expected_canonical_request_hash.to_owned();
         let response = self
             .execute_raw(
                 StoreRequest::Receipt { operation_id },
@@ -446,6 +450,12 @@ impl<T: EbpStoreTransport + 'static> EbpCanonicalStoreClient<T> {
         };
         if receipt.operation_id != expected {
             return Err(StoreError::IdentityConflict);
+        }
+        if receipt.canonical_request_hash != expected_hash {
+            return Err(StoreError::TransitionDigestMismatch {
+                expected: expected_hash,
+                observed: receipt.canonical_request_hash.clone(),
+            });
         }
         Ok(receipt)
     }

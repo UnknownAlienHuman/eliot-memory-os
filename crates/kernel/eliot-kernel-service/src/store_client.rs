@@ -14,12 +14,13 @@ use eliot_ipc::{DeliveryOutcome, TransportError, TransportLimits};
 use eliot_protocol::{ClientHello, Frame, ProtocolRange, ProtocolVersion, ServerHello};
 use eliot_runtime_contracts::{ModuleContract, ModuleGeneration, ModuleGenerationState};
 use eliot_store_api::{
-    CAPABILITIES, CanonicalStoreClient, CanonicalValidationSnapshot, EFFECTS, NamedReadOperation,
-    NamedReadRequest, NamedReadResponse, OperationId, OrderingHead, OrderingHeadExpectation,
-    OrderingScopeId, PreparedTransition, ReadConsistency, RecoveryRecordKey, RequestMeta,
-    RevisionHead, RevisionHeadExpectation, RevisionKey, ScopeId, ScopeRevisionView, StoreError,
-    StoreGenesisRequest, StoreHealth, StoreRecoveryRequest, StoreRecoverySnapshot, StoreRequest,
-    StoreResponse, StoreWireError, WriteReceipt, validate_genesis_receipt_envelope,
+    CAPABILITIES, CanonicalRequestView, CanonicalStoreClient, CanonicalValidationSnapshot, EFFECTS,
+    NamedReadOperation, NamedReadRequest, NamedReadResponse, OperationId, OrderingHead,
+    OrderingHeadExpectation, OrderingScopeId, PreparedTransition, ReadConsistency,
+    RecoveryRecordKey, RequestMeta, RevisionHead, RevisionHeadExpectation, RevisionKey, ScopeId,
+    ScopeRevisionView, StoreError, StoreGenesisRequest, StoreHealth, StoreRecoveryRequest,
+    StoreRecoverySnapshot, StoreRequest, StoreResponse, StoreWireError, WriteReceipt,
+    validate_genesis_receipt_envelope, verify_canonical_request_hash,
 };
 use thiserror::Error;
 use tokio::sync::Mutex;
@@ -229,7 +230,12 @@ impl<T: EbpStoreTransport + 'static> EbpCanonicalStoreClient<T> {
         context: &RequestMeta,
         request: &StoreGenesisRequest,
     ) -> Result<WriteReceipt, StoreError> {
-        let receipt = self.receipt_exact(request.operation_id.clone()).await?;
+        let receipt = self
+            .receipt_exact(
+                request.operation_id.clone(),
+                &request.canonical_request_hash,
+            )
+            .await?;
         self.validate_genesis_receipt(context, request, &receipt)?;
         Ok(receipt)
     }
@@ -250,8 +256,23 @@ impl<T: EbpStoreTransport + 'static> CanonicalStoreClient for EbpCanonicalStoreC
         {
             return Err(StoreError::FenceMismatch);
         }
+        // RECHECK-63 slice B: recompute the canonical request hash from the
+        // exact values about to be sent (context + transition + expected
+        // heads) and reject divergence before the Apply frame is built. The
+        // view borrows these references — not re-forwarded copies — so a
+        // mutation after admission fails here with the typed mismatch.
+        {
+            let view = CanonicalRequestView::from_apply(
+                ctx,
+                &transition,
+                &expected_revision_heads,
+                &expected_ordering_heads,
+            );
+            verify_canonical_request_hash(&view, &transition.identity.canonical_request_hash)?;
+        }
         let operation_id = transition.identity.operation_id.clone();
         let idempotency_key = transition.identity.idempotency_key.clone();
+        let canonical_request_hash = transition.identity.canonical_request_hash.clone();
         let result = self
             .execute_raw(
                 StoreRequest::Apply {
@@ -272,7 +293,10 @@ impl<T: EbpStoreTransport + 'static> CanonicalStoreClient for EbpCanonicalStoreC
             // with the wrong operation identity or response kind is itself an
             // uncertain observation. Reconcile only the operation that this
             // Kernel call admitted; never adopt an identity from the peer.
-            Ok(_) => self.receipt_exact(operation_id).await,
+            Ok(_) => {
+                self.receipt_exact(operation_id, &canonical_request_hash)
+                    .await
+            }
             Err(RequestFailure::Unknown {
                 operation_id: observed,
                 ..
@@ -280,12 +304,14 @@ impl<T: EbpStoreTransport + 'static> CanonicalStoreClient for EbpCanonicalStoreC
                 // The peer's identity is evidence of a mismatch only; the
                 // receipt lookup remains bound to our admitted operation.
                 let _ = observed;
-                self.receipt_exact(operation_id).await
+                self.receipt_exact(operation_id, &canonical_request_hash)
+                    .await
             }
             // A typed unknown-outcome failure was already bound to the
             // admitted operation in `execute_raw`; reconcile exactly it.
             Err(error) if error.is_unknown_outcome_failure() => {
-                self.receipt_exact(operation_id).await
+                self.receipt_exact(operation_id, &canonical_request_hash)
+                    .await
             }
             Err(error) => Err(error.into_store_error()),
         }
@@ -522,6 +548,11 @@ mod tests {
     use eliot_platform::PlatformHandle;
     use eliot_protocol::{FrameKind, MessageType, ProtocolPayload, ServerHello};
     use eliot_store_api::StoreResponse;
+    use eliot_store_api::{
+        CommitId, EffectClass, EventProjectionRelationIntents, NamedMutationOperation,
+        NamedMutationRequest, OperationIdentity, OperationManifestDigest, Resubmission,
+        TransitionClass, WriteReceiptStatus, canonical_request_hash,
+    };
     use serde_json::json;
     use std::num::NonZeroU64;
 
@@ -558,9 +589,11 @@ mod tests {
         validation_calls: usize,
         recovery_response: Option<Box<StoreResponse>>,
         genesis_response: Option<Box<StoreResponse>>,
+        apply_response: Option<Box<StoreResponse>>,
         reconciliation_receipt: Option<Box<WriteReceipt>>,
         recovery_calls: usize,
         genesis_calls: usize,
+        apply_calls: usize,
         receipt_requests: Vec<OperationId>,
     }
 
@@ -573,9 +606,11 @@ mod tests {
                 validation_calls: 0,
                 recovery_response: None,
                 genesis_response: None,
+                apply_response: None,
                 reconciliation_receipt: None,
                 recovery_calls: 0,
                 genesis_calls: 0,
+                apply_calls: 0,
                 receipt_requests: Vec::new(),
             }
         }
@@ -587,6 +622,11 @@ mod tests {
 
         fn with_genesis_response(mut self, response: StoreResponse) -> Self {
             self.genesis_response = Some(Box::new(response));
+            self
+        }
+
+        fn with_apply_response(mut self, response: StoreResponse) -> Self {
+            self.apply_response = Some(Box::new(response));
             self
         }
 
@@ -769,6 +809,17 @@ mod tests {
                     self.genesis_calls += 1;
                     let response = *self.genesis_response.take().ok_or_else(|| {
                         StoreClientError::Contract("fake genesis response missing".to_owned())
+                    })?;
+                    self.pending = Some(Self::response(
+                        self.requirement.connection_id.as_str().to_owned(),
+                        request_id,
+                        response,
+                    ));
+                }
+                StoreRequest::Apply { .. } => {
+                    self.apply_calls += 1;
+                    let response = *self.apply_response.take().ok_or_else(|| {
+                        StoreClientError::Contract("fake apply response missing".to_owned())
                     })?;
                     self.pending = Some(Self::response(
                         self.requirement.connection_id.as_str().to_owned(),
@@ -962,6 +1013,229 @@ mod tests {
         );
         receipt.validate().expect("genesis receipt");
         receipt
+    }
+
+    /// Builds admission-valid apply parts bound to `fence`, with the
+    /// transition's claimed digest computed from the exact values via the
+    /// shared Slice A helper (the production Governor-admission shape).
+    fn apply_parts(
+        fence: &StateFence,
+    ) -> (
+        RequestMeta,
+        PreparedTransition,
+        Vec<RevisionHeadExpectation>,
+        Vec<OrderingHeadExpectation>,
+    ) {
+        let context = context_for(fence, "apply-request-1", "source");
+        let mut transition = PreparedTransition {
+            identity: OperationIdentity {
+                operation_id: OperationId::new("apply-op-1").expect("operation id"),
+                idempotency_key: "apply-idem-1".to_owned(),
+                canonical_request_hash: "a".repeat(64),
+            },
+            state_fence: fence.clone(),
+            scope_id: ScopeId::new("scope-authority").expect("scope"),
+            task_id: None,
+            ordering_scopes: vec![OrderingScopeId::new("scope-authority").expect("ordering")],
+            transition_class: TransitionClass::CaptureCandidate,
+            requested_effect_ceiling: EffectClass::Candidate,
+            admission_contract_set_digest: "b".repeat(64),
+            operation_manifest_digest: OperationManifestDigest::new("manifest-authority")
+                .expect("manifest digest"),
+            named_operations: vec![NamedMutationRequest {
+                operation: NamedMutationOperation::CaptureObservation,
+                parameters: BTreeMap::from([(
+                    "subject".to_owned(),
+                    serde_json::json!("observation-1"),
+                )]),
+            }],
+            event_projection_relation_intents: EventProjectionRelationIntents {
+                event_ids: Vec::new(),
+                projection_kinds: Vec::new(),
+                relation_kinds: Vec::new(),
+            },
+            security: eliot_store_api::SecurityContext::default(),
+            required_proof_and_approval_refs: Vec::new(),
+        };
+        let revision_heads = vec![RevisionHeadExpectation {
+            key: RevisionKey::new("scope:one").expect("key"),
+            expected_revision: 1,
+            state_fence: fence.clone(),
+        }];
+        let ordering_heads = vec![OrderingHeadExpectation {
+            scope: OrderingScopeId::new("scope-authority").expect("ordering"),
+            expected_sequence: 1,
+            state_fence: fence.clone(),
+        }];
+        let view = CanonicalRequestView::from_apply(
+            &context,
+            &transition,
+            &revision_heads,
+            &ordering_heads,
+        );
+        transition.identity.canonical_request_hash =
+            canonical_request_hash(&view).expect("apply digest computes");
+        transition.validate().expect("apply transition");
+        (context, transition, revision_heads, ordering_heads)
+    }
+
+    fn apply_receipt(context: &RequestMeta, transition: &PreparedTransition) -> WriteReceipt {
+        let mut receipt = WriteReceipt {
+            operation_id: transition.identity.operation_id.clone(),
+            idempotency_key: transition.identity.idempotency_key.clone(),
+            canonical_request_hash: transition.identity.canonical_request_hash.clone(),
+            transition_class: transition.transition_class,
+            status: WriteReceiptStatus::Committed,
+            commit_id: Some(CommitId::new("commit-apply-1").expect("commit")),
+            state_fence: context.state_fence.clone(),
+            ordering_sequences: Vec::new(),
+            revision_before_after: Vec::new(),
+            applied_command_ids: vec!["capture-observation".to_owned()],
+            emitted_event_ids: Vec::new(),
+            projection_refs: Vec::new(),
+            outbox_refs: Vec::new(),
+            operation_manifest_digest: transition.operation_manifest_digest.clone(),
+            error_code: None,
+            resubmission: Resubmission::None,
+            committed_at: Some("commit-sequence-0000000000000001".to_owned()),
+            envelope: None,
+        };
+        // The wire requires the store-owned reconciliation envelope, issued
+        // exactly as an adapter would after deriving the receipt.
+        receipt.envelope = Some(
+            eliot_store_api::issue_store_receipt_envelope(context, transition, &receipt, 1)
+                .expect("apply receipt envelope"),
+        );
+        receipt.validate().expect("apply receipt");
+        receipt
+    }
+
+    #[tokio::test]
+    async fn apply_prepared_rejects_tampered_expected_head_before_store_send() {
+        let requirement = requirement();
+        let (context, transition, mut revision_heads, ordering_heads) =
+            apply_parts(&requirement.state_fence);
+        let claimed = transition.identity.canonical_request_hash.clone();
+        // Mutation after admission: the exact expected-head list handed to
+        // `apply_prepared` diverges from the admitted digest while every
+        // other field stays valid, so only the hash recompute can catch it.
+        revision_heads[0].expected_revision = 2;
+        let client = EbpCanonicalStoreClient::connect(
+            FakeEbpStoreTransport::new(requirement.clone(), SnapshotFault::Valid),
+            requirement,
+        )
+        .await
+        .expect("fake handshake and readiness");
+        match client
+            .apply_prepared(&context, transition, revision_heads, ordering_heads)
+            .await
+        {
+            Err(StoreError::TransitionDigestMismatch { expected, observed }) => {
+                assert_eq!(expected, claimed);
+                assert_ne!(observed, claimed);
+            }
+            other => panic!("tampered apply must fail with the typed mismatch: {other:?}"),
+        }
+        assert_eq!(
+            client.transport.lock().await.apply_calls,
+            0,
+            "tampered apply must never reach the store"
+        );
+    }
+
+    #[tokio::test]
+    async fn apply_prepared_accepts_exact_replay_of_identical_bytes() {
+        let requirement = requirement();
+        let (context, transition, revision_heads, ordering_heads) =
+            apply_parts(&requirement.state_fence);
+        let receipt = apply_receipt(&context, &transition);
+        // Exact replay: the byte-identical request re-encodes and applies.
+        let request = StoreRequest::Apply {
+            context,
+            transition,
+            expected_revision_heads: revision_heads,
+            expected_ordering_heads: ordering_heads,
+        };
+        let bytes = serde_json::to_vec(&request).expect("apply request encodes");
+        let replay: StoreRequest = serde_json::from_slice(&bytes).expect("apply request replays");
+        assert_eq!(
+            serde_json::to_vec(&replay).expect("replay re-encodes"),
+            bytes
+        );
+        let StoreRequest::Apply {
+            context,
+            transition,
+            expected_revision_heads,
+            expected_ordering_heads,
+        } = replay
+        else {
+            panic!("replayed request must stay an Apply");
+        };
+        let client = EbpCanonicalStoreClient::connect(
+            FakeEbpStoreTransport::new(requirement.clone(), SnapshotFault::Valid)
+                .with_apply_response(StoreResponse::Transaction {
+                    receipt: receipt.clone(),
+                }),
+            requirement,
+        )
+        .await
+        .expect("fake handshake and readiness");
+        assert_eq!(
+            client
+                .apply_prepared(
+                    &context,
+                    transition,
+                    expected_revision_heads,
+                    expected_ordering_heads
+                )
+                .await
+                .expect("exact replay applies"),
+            receipt
+        );
+        assert_eq!(client.transport.lock().await.apply_calls, 1);
+    }
+
+    #[tokio::test]
+    async fn receipt_exact_rejects_substituted_canonical_hash_with_typed_mismatch() {
+        let requirement = requirement();
+        let (context, transition, _, _) = apply_parts(&requirement.state_fence);
+        let admitted = transition.identity.canonical_request_hash.clone();
+        let operation_id = transition.identity.operation_id.clone();
+        let receipt = apply_receipt(&context, &transition);
+        let client = EbpCanonicalStoreClient::connect(
+            FakeEbpStoreTransport::new(requirement.clone(), SnapshotFault::Valid)
+                .with_reconciliation_receipt(receipt.clone()),
+            requirement.clone(),
+        )
+        .await
+        .expect("fake handshake and readiness");
+        assert_eq!(
+            client
+                .receipt_exact(operation_id.clone(), &admitted)
+                .await
+                .expect("exact receipt reconciles"),
+            receipt
+        );
+
+        let mut substituted = receipt.clone();
+        substituted.canonical_request_hash = "e".repeat(64);
+        let substituted_client = EbpCanonicalStoreClient::connect(
+            FakeEbpStoreTransport::new(requirement.clone(), SnapshotFault::Valid)
+                .with_reconciliation_receipt(substituted),
+            requirement,
+        )
+        .await
+        .expect("fake handshake and readiness");
+        match substituted_client
+            .receipt_exact(operation_id, &admitted)
+            .await
+        {
+            Err(StoreError::TransitionDigestMismatch { expected, observed }) => {
+                assert_eq!(expected, admitted);
+                assert_eq!(observed, "e".repeat(64));
+            }
+            other => panic!("substituted receipt hash must fail typed: {other:?}"),
+        }
     }
 
     #[tokio::test]
