@@ -129,3 +129,222 @@ required_tokens = [
   "docs/architecture/ELIOT_IMPLEMENTATION.md",
   "docs/ARCHITECTURE_CONTRACT.md",
 ]
+
+# Non-Windows headers retired by #1368 and prior traceability issues (issue #506).
+# Verified comment-only scope: obsolete pre-sharding markers, predecessor digests,
+# nonexistent I2.2, and stale pins are replaced with current canonical authority.
+
+[[surface]]
+path = "bins/eliot-host/src/credential_control/codec.rs"
+reason = "Retire pre-sharding doc project ID and ensure canonical architecture, implementation, and contract references."
+forbidden_patterns = [
+  "eliot-architecture-docs-fa94113[5]",
+  '(?<![A-Za-z0-9])I2\.2(?![0-9])',
+]
+required_tokens = [
+  "docs/architecture/ELIOT_ARCHITECTURE.md",
+  "docs/architecture/ELIOT_IMPLEMENTATION.md",
+  "docs/ARCHITECTURE_CONTRACT.md",
+]
+
+[[surface]]
+path = "bins/eliot-host/src/journal_append/readiness_append.rs"
+reason = "Retire pre-sharding doc project ID and ensure canonical architecture, implementation, and contract references."
+forbidden_patterns = [
+  "eliot-architecture-docs-fa94113[5]",
+  '(?<![A-Za-z0-9])I2\.2(?![0-9])',
+]
+required_tokens = [
+  "docs/architecture/ELIOT_ARCHITECTURE.md",
+  "docs/architecture/ELIOT_IMPLEMENTATION.md",
+  "docs/ARCHITECTURE_CONTRACT.md",
+]
+
+[[surface]]
+path = "bins/eliot-host/src/kernel_front_door_client.rs"
+reason = "Retire pre-sharding doc project ID and ensure canonical architecture, implementation, and contract references."
+forbidden_patterns = [
+  "eliot-architecture-docs-fa94113[5]",
+  '(?<![A-Za-z0-9])I2\.2(?![0-9])',
+]
+required_tokens = [
+  "docs/architecture/ELIOT_ARCHITECTURE.md",
+  "docs/architecture/ELIOT_IMPLEMENTATION.md",
+  "docs/ARCHITECTURE_CONTRACT.md",
+]
+
+[[surface]]
+path = "bins/eliot-host/src/launch_descriptor_validation.rs"
+reason = "Retire pre-sharding doc project ID and ensure architecture and implementation document references."
+forbidden_patterns = [
+  "eliot-architecture-docs-fa94113[5]",
+  '(?<![A-Za-z0-9])I2\.2(?![0-9])',
+]
+required_tokens = [
+  "ELIOT_ARCHITECTURE.md",
+  "ELIOT_IMPLEMENTATION.md",
+]
+
+[[surface]]
+path = "bins/eliot-host/src/host_job_launch.rs"
+reason = "Retire nonexistent I2.2 handle and ensure architecture decision anchors and implementation handles."
+forbidden_patterns = [
+  "eliot-architecture-docs-fa94113[5]",
+  '(?<![A-Za-z0-9])I2\.2(?![0-9])',
+]
+required_tokens = [
+  "ARCH-MOD-01",
+  "I1.2",
+  "I2.23",
+]
+
+[[surface]]
+path = "bins/eliot-store-surreal/src/adapter_materialization.rs"
+reason = "Retire predecessor digests and pre-sharding project ID while ensuring canonical architecture, implementation, and contract references."
+forbidden_patterns = [
+  "eliot-architecture-docs-fa94113[5]",
+  "58E71A2BDB10925C63D85A708ED768AEE8617BED0FB52EB044478EC20AB439D[8]",
+  "C216FB7F6FDBC62D108C748BE6F61CA7EF9E5D24E5BB13AF2677C31A58460C0[B]",
+  '(?<![A-Za-z0-9])I2\.2(?![0-9])',
+]
+required_tokens = [
+  "docs/architecture/ELIOT_ARCHITECTURE.md",
+  "docs/architecture/ELIOT_IMPLEMENTATION.md",
+  "docs/ARCHITECTURE_CONTRACT.md",
+]
+
+[[surface]]
+path = "bins/eliot-store-surreal/src/launch_config.rs"
+reason = "Retire pre-sharding doc project ID and ensure canonical architecture, implementation, and contract references."
+forbidden_patterns = [
+  "eliot-architecture-docs-fa94113[5]",
+  '(?<![A-Za-z0-9])I2\.2(?![0-9])',
+]
+required_tokens = [
+  "docs/architecture/ELIOT_ARCHITECTURE.md",
+  "docs/architecture/ELIOT_IMPLEMENTATION.md",
+  "docs/ARCHITECTURE_CONTRACT.md",
+]
+
+[[surface]]
+path = "bins/eliot-store-surreal/src/launch_mode.rs"
+reason = "Retire pre-sharding doc project ID and ensure canonical architecture, implementation, and contract references."
+forbidden_patterns = [
+  "eliot-architecture-docs-fa94113[5]",
+  '(?<![A-Za-z0-9])I2\.2(?![0-9])',
+]
+required_tokens = [
+  "docs/architecture/ELIOT_ARCHITECTURE.md",
+  "docs/architecture/ELIOT_IMPLEMENTATION.md",
+  "docs/ARCHITECTURE_CONTRACT.md",
+]
+
+[[surface]]
+path = "bins/eliot-watchdog/src/self_admission.rs"
+reason = "Retire pre-sharding doc project ID and ensure canonical architecture, implementation, and contract references."
+forbidden_patterns = [
+  "eliot-architecture-docs-fa94113[5]",
+  '(?<![A-Za-z0-9])I2\.2(?![0-9])',
+]
+required_tokens = [
+  "docs/architecture/ELIOT_ARCHITECTURE.md",
+  "docs/architecture/ELIOT_IMPLEMENTATION.md",
+  "docs/ARCHITECTURE_CONTRACT.md",
+]
+
+[[surface]]
+path = "crates/eliot-engine/src/context_contracts.rs"
+reason = "Retire pre-sharding doc project ID and stale git hashes while ensuring canonical architecture, implementation, and contract references."
+forbidden_patterns = [
+  "eliot-architecture-docs-fa94113[5]",
+  "eliot-memory-os-121e27d-live",
+  "121e27dfd232f18900253e2f06a6b6b4723473c7",
+  '(?<![A-Za-z0-9])I2\.2(?![0-9])',
+]
+required_tokens = [
+  "docs/architecture/ELIOT_ARCHITECTURE.md",
+  "docs/architecture/ELIOT_IMPLEMENTATION.md",
+  "docs/ARCHITECTURE_CONTRACT.md",
+]
+
+[[surface]]
+path = "crates/eliot-engine/src/project_understanding/continuity.rs"
+reason = "Retire predecessor digests, pre-sharding project ID, and stale line coordinates while ensuring canonical architecture, implementation, and contract references."
+forbidden_patterns = [
+  "eliot-architecture-docs-fa94113[5]",
+  "58E71A2BDB10925C63D85A708ED768AEE8617BED0FB52EB044478EC20AB439D[8]",
+  "C216FB7F6FDBC62D108C748BE6F61CA7EF9E5D24E5BB13AF2677C31A58460C0[B]",
+  "context\\.rs:2939",
+  '(?<![A-Za-z0-9])I2\.2(?![0-9])',
+]
+required_tokens = [
+  "docs/architecture/ELIOT_ARCHITECTURE.md",
+  "docs/architecture/ELIOT_IMPLEMENTATION.md",
+  "docs/ARCHITECTURE_CONTRACT.md",
+]
+
+[[surface]]
+path = "crates/eliot-engine/src/read/l2_and_graph_health.rs"
+reason = "Retire predecessor digests and pre-sharding project ID while ensuring canonical architecture, implementation, and contract references."
+forbidden_patterns = [
+  "eliot-architecture-docs-fa94113[5]",
+  "58E71A2BDB10925C63D85A708ED768AEE8617BED0FB52EB044478EC20AB439D[8]",
+  "C216FB7F6FDBC62D108C748BE6F61CA7EF9E5D24E5BB13AF2677C31A58460C0[B]",
+  '(?<![A-Za-z0-9])I2\.2(?![0-9])',
+]
+required_tokens = [
+  "docs/architecture/ELIOT_ARCHITECTURE.md",
+  "docs/architecture/ELIOT_IMPLEMENTATION.md",
+  "docs/ARCHITECTURE_CONTRACT.md",
+]
+
+[[surface]]
+path = "bins/eliot-kernel/src/store_receipt_dispatch.rs"
+reason = "Retire nonexistent I2.2 handle and ensure architecture decision anchors and implementation handles."
+forbidden_patterns = [
+  "eliot-architecture-docs-fa94113[5]",
+  '(?<![A-Za-z0-9])I2\.2(?![0-9])',
+]
+required_tokens = [
+  "ARCH-AUTH-01",
+  "A12.3",
+  "I2.23",
+]
+
+[[surface]]
+path = "crates/kernel/eliot-ipc/src/frame_codec.rs"
+reason = "Retire nonexistent I2.2 handle and ensure implementation and architecture handles."
+forbidden_patterns = [
+  "eliot-architecture-docs-fa94113[5]",
+  '(?<![A-Za-z0-9])I2\.2(?![0-9])',
+]
+required_tokens = [
+  "I7.2",
+  "I2.23",
+]
+
+[[surface]]
+path = "crates/kernel/eliot-kernel-service/src/store_receipt_gateway.rs"
+reason = "Retire nonexistent I2.2 handle and ensure architecture decision anchors and implementation handles."
+forbidden_patterns = [
+  "eliot-architecture-docs-fa94113[5]",
+  '(?<![A-Za-z0-9])I2\.2(?![0-9])',
+]
+required_tokens = [
+  "ARCH-AUTH-01",
+  "A12.3",
+  "I2.23",
+]
+
+[[surface]]
+path = "crates/governor/eliot-governor/src/authority_recovery.rs"
+reason = "Retire nonexistent I2.2 handle and ensure architecture decision anchors and implementation handles."
+forbidden_patterns = [
+  "eliot-architecture-docs-fa94113[5]",
+  '(?<![A-Za-z0-9])I2\.2(?![0-9])',
+]
+required_tokens = [
+  "ARCH-AUTH-01",
+  "P.3",
+  "I2.23",
+]
