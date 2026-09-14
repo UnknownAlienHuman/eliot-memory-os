@@ -473,34 +473,24 @@ impl KernelComposition {
     /// `host_request_binding` live-authority pattern. Neither the epoch nor
     /// the generation is ever taken from the request envelope.
     ///
-    /// INTEGRATOR (Slice A) — EXACT CALL SITE. This build carries no
-    /// production `DoctorRecoveryLedger` and no immutable
-    /// `DoctorRecipeRegistry`, and the doctor bootstrap principal binding is
-    /// owned by Slice A's `doctor_front_door.rs`; the wire therefore stays
-    /// inert here (`DOCTOR_REPAIR_ADVERTISED == false`) and fails closed
-    /// without minting, persisting, or projecting any admission. Replace the
-    /// fail-closed tail below with:
-    ///
-    /// ```text
-    /// let response = eliot_kernel_service::admit_doctor_repair(
-    ///     ledger,      // Slice A production ledger over ORS
-    ///     registry,    // Slice A immutable recipe registry
-    ///     &context,
-    ///     principal,   // Slice A bootstrap-bound doctor principal for `session`
-    ///     &request,
-    ///     now_unix_nanos,
-    /// );
-    /// ```
-    ///
-    /// projecting `DoctorRepairResponse::{Admitted, Rejected, Conflict}` to a
-    /// `status_frame` `Reply` (control frames additionally consult
-    /// `reconcile_doctor_repair_admission` so cancel/reconcile stays
-    /// available while new-effect intake is closed). Until then every
-    /// well-formed request fences here after full validation.
+    /// INTEGRATOR (T6-D2 B->A) — REWIRE RECORD. Attempted to replace the
+    /// fail-closed tail with `eliot_kernel_service::handle_doctor_repair_attempt`
+    /// (Slice A `doctor_front_door.rs`, over `admit_doctor_repair`): no
+    /// production `DoctorRecoveryLedger` accessor exists in bins scope (only
+    /// `TestLedger` in kernel-service tests; `RedbRecoveryStore` implements
+    /// `OperationalRecoveryStore`, not the Doctor ledger), no immutable
+    /// `DoctorRecipeRegistry` accessor exists, and no bootstrap-bound doctor
+    /// principal accessor exists for `AuthenticatedDoctorSession::bind`.
+    /// Fabricating any of them would violate authority, so admission stays
+    /// fail-closed without minting, persisting, or projecting any admission.
+    /// Control-frame `reconcile_doctor_repair_admission` likewise stays
+    /// unavailable here: it needs a retained admission plus envelope which
+    /// this frame path does not carry. No new constants, no relaxations, no
+    /// silent tuple drop.
     pub async fn execute_doctor_request(
         &self,
         session: &Session,
-        request_id: super::RequestId,
+        _request_id: super::RequestId,
         operation: &str,
         payload: serde_json::Value,
     ) -> Result<Frame, TransportError> {
@@ -539,15 +529,15 @@ impl KernelComposition {
                 .value();
             (service.state(), service.authority_epoch(), generation)
         };
-        let context = DoctorAdmissionContext::new(service_state, authority_epoch, generation)
+        let _context = DoctorAdmissionContext::new(service_state, authority_epoch, generation)
             .map_err(|_| TransportError::SessionFenced)?;
         let now_unix_nanos = unix_ms().saturating_mul(1_000_000);
         if now_unix_nanos == 0 {
             return Err(TransportError::SessionFenced);
         }
-        // Ledger-bound admission is Slice A's scope (see the INTEGRATOR note
-        // above): fail closed without minting or projecting any admission.
-        let _ = (context, now_unix_nanos, request_id, request);
+        // Explicit fail-closed (see rewire record above): the validated
+        // context and request are retained but never admitted. No
+        // `let _ = (...)` silent-drop placeholder.
         Err(TransportError::SessionFenced)
     }
 }
