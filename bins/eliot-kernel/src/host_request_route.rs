@@ -1003,3 +1003,162 @@ pub(crate) fn host_request_rehydrated_response(record: &HostRequestRecord) -> se
         "recovery": null,
     })
 }
+
+/// Expected route identity for one Watchdog spool export batch.
+///
+/// The EBP `payload_type`/`message_type` binding for
+/// `watchdog-spool-batch-v1` is deferred (protocol file out of scope; see PR
+/// residual). Until it lands, this closed route string is the mechanical
+/// route check below; no new payload type is created here.
+pub(crate) const WATCHDOG_SPOOL_BATCH_ROUTE: &str = "watchdog-spool-batch-v1";
+
+/// Validates one Watchdog spool batch envelope mechanically.
+///
+/// Checks process/session binding (presenting connection equals the retained
+/// session connection), generation/epoch agreement against the admitted
+/// fence, route identity, predecessor binding (`first == predecessor + 1`,
+/// or the explicit empty-batch shape), range containment
+/// (`last <= high-water`), and freshness (`created < expires`, `now <
+/// expires`). There is no semantic interpretation and no canonical write:
+/// payload digests, coverage, and admission stay with the Watchdog owner and
+/// the Governor canonical path.
+///
+/// Error mapping mirrors [`KernelComposition::admit_host_request_envelope`]:
+/// shape, digest, fence, descriptor, and session failures fail closed as
+/// `SessionFenced`; a changed predecessor binding under the same identity is
+/// `IdentityConflict`; an elapsed acknowledgement deadline is `Timeout`. No
+/// error prose drives routing.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the mechanical envelope joins stay explicit until the EBP payload_type lands"
+)]
+pub(crate) fn validate_watchdog_spool_batch_envelope(
+    predecessor_acknowledged: u64,
+    first_sequence: u64,
+    last_sequence: u64,
+    high_water_sequence: u64,
+    watchdog_generation: u64,
+    watchdog_epoch: u64,
+    installation_id: &str,
+    sink_id: &str,
+    route: &str,
+    fence_generation: u64,
+    fence_epoch_sequence: u64,
+    session_connection_id: &str,
+    expected_connection_id: &str,
+    created_at_ms: u64,
+    expires_at_ms: u64,
+    now_ms: u64,
+    is_empty_batch: bool,
+    item_count: usize,
+    byte_size: u64,
+) -> Result<(), TransportError> {
+    if installation_id.is_empty() || sink_id.is_empty() {
+        return Err(TransportError::SessionFenced);
+    }
+    if route != WATCHDOG_SPOOL_BATCH_ROUTE {
+        return Err(TransportError::SessionFenced);
+    }
+    if watchdog_generation == 0 || watchdog_generation != fence_generation {
+        return Err(TransportError::SessionFenced);
+    }
+    if watchdog_epoch != fence_epoch_sequence {
+        return Err(TransportError::SessionFenced);
+    }
+    if session_connection_id.is_empty()
+        || expected_connection_id.is_empty()
+        || session_connection_id != expected_connection_id
+    {
+        return Err(TransportError::SessionFenced);
+    }
+    if created_at_ms >= expires_at_ms {
+        return Err(TransportError::SessionFenced);
+    }
+    if now_ms >= expires_at_ms {
+        return Err(TransportError::Timeout);
+    }
+    if is_empty_batch {
+        if item_count != 0 || byte_size != 0 {
+            return Err(TransportError::SessionFenced);
+        }
+        if predecessor_acknowledged != high_water_sequence {
+            return Err(TransportError::IdentityConflict);
+        }
+        let expected_first = high_water_sequence
+            .checked_add(1)
+            .ok_or(TransportError::SessionFenced)?;
+        if first_sequence != expected_first || last_sequence != high_water_sequence {
+            return Err(TransportError::SessionFenced);
+        }
+        return Ok(());
+    }
+    if item_count == 0 || byte_size == 0 {
+        return Err(TransportError::SessionFenced);
+    }
+    let expected_first = predecessor_acknowledged
+        .checked_add(1)
+        .ok_or(TransportError::SessionFenced)?;
+    if first_sequence != expected_first {
+        return Err(TransportError::IdentityConflict);
+    }
+    if last_sequence < first_sequence || last_sequence > high_water_sequence {
+        return Err(TransportError::SessionFenced);
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod watchdog_spool_batch_tests {
+    use super::*;
+
+    #[test]
+    fn rejects_stale_epoch() {
+        assert!(
+            validate_watchdog_spool_batch_envelope(
+                4,
+                5,
+                6,
+                6,
+                7,
+                3,
+                "installation-test",
+                "sink-test",
+                WATCHDOG_SPOOL_BATCH_ROUTE,
+                7,
+                3,
+                "connection-1",
+                "connection-1",
+                1_000,
+                2_000,
+                1_500,
+                false,
+                2,
+                128,
+            )
+            .is_ok(),
+            "the mechanically bound envelope must validate"
+        );
+        let stale = validate_watchdog_spool_batch_envelope(
+            4,
+            5,
+            6,
+            6,
+            7,
+            4,
+            "installation-test",
+            "sink-test",
+            WATCHDOG_SPOOL_BATCH_ROUTE,
+            7,
+            3,
+            "connection-1",
+            "connection-1",
+            1_000,
+            2_000,
+            1_500,
+            false,
+            2,
+            128,
+        );
+        assert_eq!(stale, Err(TransportError::SessionFenced));
+    }
+}

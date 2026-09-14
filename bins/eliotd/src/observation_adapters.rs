@@ -77,9 +77,7 @@ impl<P: KernelTransitionPort + ?Sized> ForwardingObservationReconciliation<'_, P
 /// cursor. Gap-like entries resolve through [`gap_requires_recovery`], never
 /// through a canonical receipt mapping.
 ///
-/// Consumed by the Watchdog export path in a later slice; marked accordingly
-/// until that consumer lands.
-#[allow(dead_code)]
+/// Live: consumed by [`forward_watchdog_batch`] below.
 pub fn sink_disposition_for_canonical_outcome(
     status: Option<eliot_store_api::WriteReceiptStatus>,
 ) -> eliot_watchdog_core::WatchdogSpoolSinkDisposition {
@@ -104,9 +102,7 @@ pub fn sink_disposition_for_canonical_outcome(
 /// applying it to a `Heartbeat` entry is the wrong phase and never advances
 /// (enforced by the Watchdog owner's own classifier).
 ///
-/// Consumed by the Watchdog export path in a later slice; marked accordingly
-/// until that consumer lands.
-#[allow(dead_code)]
+/// Live: consumed by [`forward_watchdog_batch`] below.
 pub fn gap_requires_recovery() -> eliot_watchdog_core::WatchdogSpoolSinkDisposition {
     eliot_watchdog_core::WatchdogSpoolSinkDisposition::GapRequiresRecovery
 }
@@ -120,9 +116,8 @@ pub fn gap_requires_recovery() -> eliot_watchdog_core::WatchdogSpoolSinkDisposit
 /// for gap-like entries) in batch order. Cursor-advance validation stays
 /// with the Watchdog owner; this constructor invents no digest or cursor.
 ///
-/// Consumed by the Watchdog export path in a later slice; marked accordingly
-/// until that consumer lands.
-#[allow(dead_code)]
+/// Live: consumed by [`forward_watchdog_batch`] and the store-unavailable
+/// constructors below.
 pub fn acknowledgement_for_batch(
     batch: &eliot_watchdog_core::WatchdogSpoolExportBatch,
     dispositions: Vec<eliot_watchdog_core::WatchdogSpoolEntryDisposition>,
@@ -139,5 +134,187 @@ pub fn acknowledgement_for_batch(
         watchdog_epoch: batch.watchdog_epoch,
         installation_id: batch.installation_id.clone(),
         dispositions,
+    }
+}
+
+/// Forwards one Watchdog export batch through the live disposition mapping.
+///
+/// Takes the immutable export batch plus the per-entry canonical outcomes in
+/// batch order (`None` per entry means the commit outcome is unknown) and
+/// returns the exact sink-owned acknowledgement. Heartbeat entries map
+/// through [`sink_disposition_for_canonical_outcome`]; gap-like
+/// (`Gap`/`Recovery`) entries resolve through [`gap_requires_recovery`] when
+/// the canonical outcome is `Committed` and through the terminal-as-decided
+/// mapping when the canonical outcome is `Rejected`/`DeadLetter`/`Cancelled`;
+/// unknown outcomes stay `Unknown` and never advance the cursor. A shorter
+/// outcome slice pads with `Unknown` and a longer one truncates, so a length
+/// mismatch fails closed as non-terminal instead of panicking. No policy,
+/// admission, or semantic rule lives here; cursor-advance validation stays
+/// with the Watchdog owner. The Governor composition accessor is deferred
+/// (see PR residual); this mapping is the daemon-side consumer that feeds
+/// `WatchdogSpool::apply_acknowledgement`.
+pub fn forward_watchdog_batch(
+    batch: &eliot_watchdog_core::WatchdogSpoolExportBatch,
+    outcomes: &[Option<eliot_store_api::WriteReceiptStatus>],
+) -> eliot_watchdog_core::WatchdogSpoolAcknowledgement {
+    let mut dispositions = Vec::with_capacity(batch.entries.len());
+    for (index, entry) in batch.entries.iter().enumerate() {
+        let outcome = outcomes.get(index).copied().flatten();
+        let is_gap_like = matches!(
+            entry.payload_kind,
+            eliot_watchdog_core::WatchdogSpoolPayloadKind::Gap
+                | eliot_watchdog_core::WatchdogSpoolPayloadKind::Recovery
+        );
+        let disposition =
+            if is_gap_like && outcome == Some(eliot_store_api::WriteReceiptStatus::Committed) {
+                gap_requires_recovery()
+            } else {
+                sink_disposition_for_canonical_outcome(outcome)
+            };
+        dispositions.push(eliot_watchdog_core::WatchdogSpoolEntryDisposition {
+            sequence: entry.sequence,
+            disposition,
+            record_digest: entry.record_digest.clone(),
+        });
+    }
+    acknowledgement_for_batch(batch, dispositions)
+}
+
+/// Builds the honest store-unavailable acknowledgement for the durable stage:
+/// every entry reports `Durable` (stored without admission). It never
+/// advances the cursor; the Watchdog owner refuses it as non-terminal and the
+/// batch stays replayable.
+pub fn durable_acknowledgement_for_batch(
+    batch: &eliot_watchdog_core::WatchdogSpoolExportBatch,
+) -> eliot_watchdog_core::WatchdogSpoolAcknowledgement {
+    let dispositions = batch
+        .entries
+        .iter()
+        .map(|entry| eliot_watchdog_core::WatchdogSpoolEntryDisposition {
+            sequence: entry.sequence,
+            disposition: eliot_watchdog_core::WatchdogSpoolSinkDisposition::Durable,
+            record_digest: entry.record_digest.clone(),
+        })
+        .collect();
+    acknowledgement_for_batch(batch, dispositions)
+}
+
+/// Builds the honest store-unavailable acknowledgement for the unknown stage:
+/// every entry reports `Unknown`. It fails acknowledgement validation
+/// (`UnknownOutcome`) so the cursor stays unchanged and the batch stays
+/// replayable.
+pub fn unknown_acknowledgement_for_batch(
+    batch: &eliot_watchdog_core::WatchdogSpoolExportBatch,
+) -> eliot_watchdog_core::WatchdogSpoolAcknowledgement {
+    let dispositions = batch
+        .entries
+        .iter()
+        .map(|entry| eliot_watchdog_core::WatchdogSpoolEntryDisposition {
+            sequence: entry.sequence,
+            disposition: eliot_watchdog_core::WatchdogSpoolSinkDisposition::Unknown,
+            record_digest: entry.record_digest.clone(),
+        })
+        .collect();
+    acknowledgement_for_batch(batch, dispositions)
+}
+
+#[cfg(test)]
+#[allow(clippy::expect_used, clippy::unwrap_used)]
+mod tests {
+    use super::*;
+
+    fn fixture_digest(byte: u8) -> String {
+        format!("{byte:02x}").repeat(32)
+    }
+
+    fn fixture_batch() -> eliot_watchdog_core::WatchdogSpoolExportBatch {
+        let predecessor = eliot_watchdog_core::WatchdogSpoolCursor {
+            schema_version: 1,
+            acknowledged_sequence: 0,
+            watchdog_generation: 7,
+            watchdog_epoch: 3,
+            installation_id: "installation-test".to_owned(),
+            sink_id: "sink-test".to_owned(),
+        };
+        eliot_watchdog_core::WatchdogSpoolExportBatch {
+            schema_version: 1,
+            batch_id: "batch-test-1".to_owned(),
+            installation_id: "installation-test".to_owned(),
+            watchdog_generation: 7,
+            watchdog_epoch: 3,
+            predecessor_cursor: predecessor,
+            first_sequence: 1,
+            last_sequence: 2,
+            high_water_sequence: 2,
+            entries: vec![
+                eliot_watchdog_core::WatchdogSpoolExportEntry {
+                    sequence: 1,
+                    schema_version: 1,
+                    observed_at_ms: 1_000,
+                    payload_kind: eliot_watchdog_core::WatchdogSpoolPayloadKind::Heartbeat,
+                    payload_digest: fixture_digest(0x0c),
+                    record_digest: fixture_digest(0x0d),
+                },
+                eliot_watchdog_core::WatchdogSpoolExportEntry {
+                    sequence: 2,
+                    schema_version: 1,
+                    observed_at_ms: 1_001,
+                    payload_kind: eliot_watchdog_core::WatchdogSpoolPayloadKind::Gap,
+                    payload_digest: fixture_digest(0x0e),
+                    record_digest: fixture_digest(0x0f),
+                },
+            ],
+            item_count: 2,
+            byte_size: 128,
+            batch_digest: fixture_digest(0x0b),
+            is_empty_batch: false,
+            created_at_ms: 1_000,
+            expires_at_ms: 2_000,
+        }
+    }
+
+    #[test]
+    fn forwards_heartbeat_and_gap_with_durable_unknown_branches() {
+        let batch = fixture_batch();
+        let ack = forward_watchdog_batch(
+            &batch,
+            &[
+                Some(eliot_store_api::WriteReceiptStatus::Committed),
+                Some(eliot_store_api::WriteReceiptStatus::Committed),
+            ],
+        );
+        assert_eq!(ack.batch_id, batch.batch_id);
+        assert_eq!(ack.batch_digest, batch.batch_digest);
+        assert_eq!(
+            ack.predecessor_sequence,
+            batch.predecessor_cursor.acknowledged_sequence
+        );
+        assert_eq!(ack.first_sequence, batch.first_sequence);
+        assert_eq!(ack.last_sequence, batch.last_sequence);
+        assert_eq!(ack.sink_id, batch.predecessor_cursor.sink_id);
+        assert_eq!(ack.dispositions.len(), 2);
+        assert_eq!(
+            ack.dispositions[0].disposition,
+            eliot_watchdog_core::WatchdogSpoolSinkDisposition::Applied
+        );
+        assert_eq!(
+            ack.dispositions[1].disposition,
+            eliot_watchdog_core::WatchdogSpoolSinkDisposition::GapRequiresRecovery
+        );
+
+        let unknown = forward_watchdog_batch(&batch, &[None, None]);
+        assert!(unknown.dispositions.iter().all(|line| {
+            line.disposition == eliot_watchdog_core::WatchdogSpoolSinkDisposition::Unknown
+        }));
+
+        let durable = durable_acknowledgement_for_batch(&batch);
+        assert!(durable.dispositions.iter().all(|line| {
+            line.disposition == eliot_watchdog_core::WatchdogSpoolSinkDisposition::Durable
+        }));
+
+        let unknown_stage = unknown_acknowledgement_for_batch(&batch);
+        assert!(unknown_stage.dispositions.iter().all(|line| {
+            line.disposition == eliot_watchdog_core::WatchdogSpoolSinkDisposition::Unknown
+        }));
     }
 }

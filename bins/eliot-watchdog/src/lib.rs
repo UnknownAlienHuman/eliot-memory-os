@@ -337,6 +337,14 @@ impl IndependentKernelSensor {
     /// cursor against the first real heartbeat. There is no semantic
     /// interpretation here and no canonical store write.
     ///
+    /// Expose-or-drop decision: the spool's canonical raw entry bytes are
+    /// not discarded silently. The typed batch is the transport unit the
+    /// Governor/eliotd path admits (its digests already bind the raw bytes,
+    /// so downstream never parses raws); the raws themselves stay available
+    /// through [`IndependentKernelSensor::export_spool_batch_with_raws`] for
+    /// transport debugging and re-encoding. This method keeps the typed-only
+    /// surface for the existing caller.
+    ///
     /// # Errors
     ///
     /// Returns an error when the epoch is not established, the stored cursor
@@ -347,6 +355,29 @@ impl IndependentKernelSensor {
         sink_id: &str,
         limits: WatchdogSpoolExportLimits,
     ) -> Result<WatchdogSpoolExportBatch, SpoolError> {
+        self.export_spool_batch_with_raws(sink_id, limits)
+            .map(|(batch, _raw_entry_bytes)| batch)
+    }
+
+    /// Exports one bounded immutable spool batch plus its canonical raw
+    /// entry bytes for transport.
+    ///
+    /// The raws are the canonical entry encodings whose digests the batch
+    /// binds; they are timestamp-free, so an exact retry stays
+    /// digest-equivalent. Downstream admission consumes the typed batch, not
+    /// the raws. There is no semantic interpretation here and no canonical
+    /// store write.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the epoch is not established, the stored cursor
+    /// or retained records fail validation, or the bounded window cannot be
+    /// covered consecutively.
+    pub fn export_spool_batch_with_raws(
+        &self,
+        sink_id: &str,
+        limits: WatchdogSpoolExportLimits,
+    ) -> Result<(WatchdogSpoolExportBatch, Vec<Vec<u8>>), SpoolError> {
         let installation_id = self
             .runtime_binding
             .selected_manifest
@@ -387,19 +418,27 @@ impl IndependentKernelSensor {
             sink_id: sink_id.to_owned(),
         };
         let high_water = self.spool.high_water_sequence()?;
-        self.spool
-            .export_batch(&predecessor, high_water, limits)
-            .map(|(batch, _raw_entry_bytes)| batch)
+        self.spool.export_batch(&predecessor, high_water, limits)
     }
 
     /// Applies an exact authenticated sink acknowledgement to the export
     /// cursor and returns the new acknowledged sequence.
     ///
-    /// Unknown outcomes, timeouts, and disconnects must never reach this
-    /// method; only a complete acknowledgement for one immutable batch is
-    /// applied, and a duplicate acknowledgement returns the stored sequence
-    /// unchanged instead of failing. There is no semantic interpretation
-    /// here and no canonical store write.
+    /// Authenticated gating runs before the spool owner is touched: the
+    /// acknowledgement must echo the exact batch identity (id, digest,
+    /// predecessor, range, sink, generation, epoch, installation) with
+    /// per-entry digest coverage and usable outcomes, and the batch must be
+    /// fresh on the owner clock. A forged acknowledgement (mutated digest,
+    /// predecessor, sink, generation, epoch, installation, range, or record
+    /// digest), an expired batch, or an unknown outcome fails closed without
+    /// writing. A duplicate acknowledgement returns the stored sequence
+    /// unchanged instead of failing. Unknown outcomes, timeouts, and
+    /// disconnects must never reach beyond this gate; only a complete
+    /// acknowledgement for one immutable batch is applied. There is no
+    /// semantic interpretation here and no canonical store write. Transport
+    /// signature binding arrives via the EBP durable-observation path
+    /// (deferred composition wiring; see PR residual) — no new auth system,
+    /// user account, or OAuth is introduced here per #1376.
     ///
     /// # Errors
     ///
@@ -410,6 +449,13 @@ impl IndependentKernelSensor {
         batch: &WatchdogSpoolExportBatch,
         ack: &WatchdogSpoolAcknowledgement,
     ) -> Result<u64, SpoolError> {
+        let stored = self.spool.read_export_cursor()?;
+        let now_ms = current_unix_ms()?;
+        if let Some(duplicate) =
+            validate_authenticated_spool_ack(batch, ack, stored.acknowledged_sequence, now_ms)?
+        {
+            return Ok(duplicate);
+        }
         self.spool.apply_acknowledgement(batch, ack)
     }
 
@@ -622,6 +668,34 @@ fn current_unix_ms() -> Result<u64, SpoolError> {
         .as_millis()
         .try_into()
         .map_err(|_| SpoolError::InvalidLease("current time overflows u64".to_owned()))
+}
+
+/// Validates an authenticated sink acknowledgement before the spool owner is
+/// touched.
+///
+/// Returns `Ok(Some(stored))` for an idempotent duplicate (the caller
+/// returns the stored sequence unchanged without writing) and `Ok(None)`
+/// when the acknowledgement may proceed to
+/// `WatchdogSpool::apply_acknowledgement`, which revalidates authoritatively
+/// inside its write transaction. Any forged identity echo, expired batch, or
+/// unusable outcome fails closed here without writing.
+///
+/// # Errors
+///
+/// Returns [`SpoolError`] carrying the exact reconciliation failure for a
+/// forged, expired, or otherwise unusable acknowledgement.
+fn validate_authenticated_spool_ack(
+    batch: &WatchdogSpoolExportBatch,
+    ack: &WatchdogSpoolAcknowledgement,
+    stored_acknowledged: u64,
+    now_ms: u64,
+) -> Result<Option<u64>, SpoolError> {
+    if eliot_watchdog_core::is_duplicate_ack(stored_acknowledged, ack) {
+        return Ok(Some(stored_acknowledged));
+    }
+    eliot_watchdog_core::validate_batch_freshness(batch, now_ms)?;
+    eliot_watchdog_core::validate_acknowledgement(batch, ack)?;
+    Ok(None)
 }
 
 #[cfg(test)]
@@ -2299,5 +2373,104 @@ mod tests {
         );
         drop(reopened);
         let _ = std::fs::remove_dir_all(root);
+    }
+
+    fn spool_ack_fixture_digest(byte: u8) -> String {
+        format!("{byte:02x}").repeat(32)
+    }
+
+    fn spool_ack_fixture_batch() -> WatchdogSpoolExportBatch {
+        let predecessor = eliot_watchdog_core::WatchdogSpoolCursor {
+            schema_version: SPOOL_EXPORT_CURSOR_SCHEMA_VERSION,
+            acknowledged_sequence: 0,
+            watchdog_generation: 7,
+            watchdog_epoch: 3,
+            installation_id: "installation-test".to_owned(),
+            sink_id: "sink-test".to_owned(),
+        };
+        eliot_watchdog_core::WatchdogSpoolExportBatch {
+            schema_version: SPOOL_EXPORT_CURSOR_SCHEMA_VERSION,
+            batch_id: "batch-test-1".to_owned(),
+            installation_id: "installation-test".to_owned(),
+            watchdog_generation: 7,
+            watchdog_epoch: 3,
+            predecessor_cursor: predecessor,
+            first_sequence: 1,
+            last_sequence: 1,
+            high_water_sequence: 1,
+            entries: vec![eliot_watchdog_core::WatchdogSpoolExportEntry {
+                sequence: 1,
+                schema_version: SPOOL_EXPORT_CURSOR_SCHEMA_VERSION,
+                observed_at_ms: 1_000,
+                payload_kind: eliot_watchdog_core::WatchdogSpoolPayloadKind::Heartbeat,
+                payload_digest: spool_ack_fixture_digest(0x0c),
+                record_digest: spool_ack_fixture_digest(0x0d),
+            }],
+            item_count: 1,
+            byte_size: 64,
+            batch_digest: spool_ack_fixture_digest(0x0b),
+            is_empty_batch: false,
+            created_at_ms: 1_000,
+            expires_at_ms: 2_000,
+        }
+    }
+
+    fn spool_ack_fixture_ack(batch: &WatchdogSpoolExportBatch) -> WatchdogSpoolAcknowledgement {
+        WatchdogSpoolAcknowledgement {
+            schema_version: batch.schema_version,
+            batch_id: batch.batch_id.clone(),
+            batch_digest: batch.batch_digest.clone(),
+            predecessor_sequence: batch.predecessor_cursor.acknowledged_sequence,
+            first_sequence: batch.first_sequence,
+            last_sequence: batch.last_sequence,
+            sink_id: batch.predecessor_cursor.sink_id.clone(),
+            watchdog_generation: batch.watchdog_generation,
+            watchdog_epoch: batch.watchdog_epoch,
+            installation_id: batch.installation_id.clone(),
+            dispositions: vec![eliot_watchdog_core::WatchdogSpoolEntryDisposition {
+                sequence: 1,
+                disposition: eliot_watchdog_core::WatchdogSpoolSinkDisposition::Applied,
+                record_digest: batch.entries[0].record_digest.clone(),
+            }],
+        }
+    }
+
+    #[test]
+    fn authenticated_spool_ack_gating_rejects_forged_expired_and_duplicate() {
+        let batch = spool_ack_fixture_batch();
+        let ack = spool_ack_fixture_ack(&batch);
+        assert!(
+            validate_authenticated_spool_ack(&batch, &ack, 0, 1_500)
+                .unwrap_or_else(|error| panic!("valid ack must pass the gate: {error}"))
+                .is_none(),
+            "a valid acknowledgement must proceed to the spool owner"
+        );
+
+        let mut forged = ack.clone();
+        forged.batch_digest = spool_ack_fixture_digest(0xff);
+        assert!(
+            validate_authenticated_spool_ack(&batch, &forged, 0, 1_500).is_err(),
+            "a forged acknowledgement digest must fail closed without writing"
+        );
+
+        assert!(
+            validate_authenticated_spool_ack(&batch, &ack, 0, 2_000).is_err(),
+            "an expired batch must fail closed without writing"
+        );
+
+        assert_eq!(
+            validate_authenticated_spool_ack(&batch, &ack, 1, 1_500)
+                .unwrap_or_else(|error| panic!("duplicate ack must be idempotent: {error}")),
+            Some(1),
+            "a duplicate acknowledgement must return the stored sequence unchanged"
+        );
+
+        let mut unknown = ack.clone();
+        unknown.dispositions[0].disposition =
+            eliot_watchdog_core::WatchdogSpoolSinkDisposition::Unknown;
+        assert!(
+            validate_authenticated_spool_ack(&batch, &unknown, 0, 1_500).is_err(),
+            "an unknown outcome must never advance the cursor"
+        );
     }
 }

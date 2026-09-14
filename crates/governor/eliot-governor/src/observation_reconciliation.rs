@@ -89,15 +89,20 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use eliot_canonical::CanonicalWriteEnvelope;
-use eliot_contracts::{OperationId, StateFence, canonical_json_bytes, sha256_hex};
+use eliot_contracts::{
+    ArtifactId, ClockReading, OperationId, StateFence, canonical_json_bytes, sha256_hex,
+};
 use eliot_doctor_core::{IndependentVerification, VerificationReport};
 use eliot_observation::{
-    CaptureRoute, CoverageDisposition, CoverageEvidence, Durability, ObservationAdmissionResult,
-    ObservationEventCore, ObservationEventIdentity, ObservationJournal, ObservationKind,
-    ObservationRecordEnvelope, ObservationRecordKind, ObservationScope, ObservationSubmission,
-    PrivacyRetentionDisclosure, ProducerTrace, RejectionDisposition,
+    CaptureRoute, CoverageDisposition, CoverageEvidence, CoverageGap, Durability, GapDisposition,
+    ObservationAdmissionResult, ObservationEventCore, ObservationEventIdentity, ObservationJournal,
+    ObservationKind, ObservationRecordEnvelope, ObservationRecordKind, ObservationScope,
+    ObservationSubmission, PrivacyRetentionDisclosure, ProducerTrace, RejectionDisposition,
 };
-use eliot_problem::{OwnerRef, Problem, ProblemId, ProblemState, SignalId};
+use eliot_problem::{
+    DeliveryState, OwnerRef, Problem, ProblemId, ProblemState, Signal, SignalAttribution,
+    SignalDisposition, SignalId, SignalProcessingState, SignalSeverity,
+};
 use eliot_receipts::WorkScopeId;
 use eliot_store_api::{
     CONTRACT_VERSION, EffectClass, EventProjectionRelationIntents, NamedMutationOperation,
@@ -891,7 +896,600 @@ impl<P: KernelTransitionPort + ?Sized> GovernorObservationReconciliation<'_, P> 
     }
 }
 
+/// Watchdog spool entry kind for Governor admission.
+///
+/// Mirrors `eliot-watchdog-core::WatchdogSpoolPayloadKind` without depending
+/// on the Watchdog crate: the Governor must not depend on the Watchdog (the
+/// daemon adapter owns that boundary). Deferred: add an
+/// `eliot-watchdog-core` dependency and replace this view with the canonical
+/// type when the composition claim widens (see PR residual).
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum WatchdogEntryKind {
+    Heartbeat,
+    Gap,
+    Recovery,
+}
+
+impl WatchdogEntryKind {
+    /// True for gap-like entries that lower coverage instead of evidencing
+    /// liveness.
+    const fn is_gap_like(self) -> bool {
+        matches!(self, Self::Gap | Self::Recovery)
+    }
+}
+
+/// One spool entry view for Governor admission: sequence plus opaque digests,
+/// no semantics. Timestamps never enter canonical digests.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct WatchdogEntryAdmission {
+    pub sequence: u64,
+    pub kind: WatchdogEntryKind,
+    pub record_digest: String,
+    pub payload_digest: String,
+    pub observed_at_ms: u64,
+}
+
+/// Per-entry canonical outcome for one Watchdog batch, in batch order. A
+/// `None` receipt means the canonical outcome is unknown (store unavailable);
+/// the daemon maps it to `Unknown`/`Durable` so the Watchdog cursor stays
+/// put.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct WatchdogAdmittedEntry {
+    pub sequence: u64,
+    pub record_digest: String,
+    pub receipt: Option<WriteReceipt>,
+}
+
+/// Watchdog batch admission through the sole Governor transition path.
+///
+/// - Heartbeat becomes a non-semantic system observation (`Telemetry`,
+///   supervision evidence, explicitly not health truth) via
+///   `ObservationSubmission { capture_route: WatchdogSpool }`.
+/// - Gap/Recovery becomes a lowered-coverage candidate (`CoverageGap` with
+///   `DegradeDependentGuarantees`) plus a scratch `Signal
+///   { disposition: ProblemCandidate }` and a scratch `Problem`
+///   `Open -> Triaged` legality check. Severity is fixed `Info`; disposition
+///   is fixed `ProblemCandidate`; the transition is fixed to `Triaged` —
+///   never `Incident`, never from model prose.
+/// - Idempotent replay on the same batch id/digest returns the same receipts
+///   with no second observation per spool sequence (per-entry operation
+///   `{base}/watchdog-{sequence}` plus per-entry idempotency
+///   `{caller}:watchdog:{batch_id}:{sequence}`; same key with different bytes
+///   conflicts instead of overwriting).
+/// - Store-unavailable yields a `None` receipt per affected entry; the daemon
+///   maps that stage-honestly to `Durable`/`Unknown` and the Watchdog cursor
+///   stays unchanged (core refuses non-terminal).
+/// - No semantic severity is read from any prose; no direct store write
+///   happens outside [`CanonicalAdmissionOwner::commit`]. The full
+///   Problem-leg canonical commit and the `composition.rs`/`lib.rs` accessor
+///   are deferred (direct owner construction as the tests do; see PR
+///   residual). The EBP `payload_type` binding is likewise deferred (protocol
+///   file out of scope).
+fn watchdog_digest_shape(value: &str) -> bool {
+    value.len() == 64 && value.bytes().all(|byte| byte.is_ascii_hexdigit())
+}
+
+/// Validates the batch identity shape (non-blank id, 64-hex digest).
+fn validate_watchdog_batch_identity(
+    batch_id: &str,
+    batch_digest: &str,
+) -> Result<(), CompositionError> {
+    if batch_id.trim().is_empty() || batch_id.chars().any(char::is_control) {
+        return Err(owner_refused(
+            "watchdog batch identity is blank or contains control characters".to_owned(),
+        ));
+    }
+    if !watchdog_digest_shape(batch_digest) {
+        return Err(owner_refused(
+            "watchdog batch digest must be a 64-character hex string".to_owned(),
+        ));
+    }
+    Ok(())
+}
+
+/// Validates one entry view shape (nonzero sequence, 64-hex digests).
+fn validate_watchdog_entry(entry: &WatchdogEntryAdmission) -> Result<(), CompositionError> {
+    if entry.sequence == 0 {
+        return Err(owner_refused("watchdog spool sequence is zero".to_owned()));
+    }
+    if !watchdog_digest_shape(&entry.record_digest) {
+        return Err(owner_refused(
+            "watchdog entry record digest must be a 64-character hex string".to_owned(),
+        ));
+    }
+    if !watchdog_digest_shape(&entry.payload_digest) {
+        return Err(owner_refused(
+            "watchdog entry payload digest must be a 64-character hex string".to_owned(),
+        ));
+    }
+    Ok(())
+}
+
+/// Builds the deterministic per-entry submission. Heartbeat is `Telemetry`
+/// supervision evidence; gap-like entries are `CoverageGap` candidates that
+/// lower coverage without self-certifying an incident.
+#[allow(
+    clippy::too_many_lines,
+    reason = "the heartbeat/gap submission shapes stay side by side for review"
+)]
+fn watchdog_submission(
+    per_entry_operation: &OperationId,
+    per_entry_idempotency: &str,
+    identity: &eliot_protocol::RequestIdentity,
+    batch_id: &str,
+    batch_digest: &str,
+    entry: &WatchdogEntryAdmission,
+) -> Result<ObservationSubmission, CompositionError> {
+    let fence = identity.request.metadata.state_fence.clone();
+    let record_id = format!("watchdog-spool:{batch_id}:{}", entry.sequence);
+    if entry.kind.is_gap_like() {
+        let reason_ref = match entry.kind {
+            WatchdogEntryKind::Gap => "watchdog-gap",
+            WatchdogEntryKind::Recovery => "watchdog-recovery",
+            WatchdogEntryKind::Heartbeat => {
+                return Err(owner_refused(
+                    "watchdog heartbeat entry reached the gap submission path".to_owned(),
+                ));
+            }
+        };
+        let record = ObservationRecordEnvelope {
+            record_id,
+            kind: ObservationRecordKind::CoverageGap,
+            event: None,
+            coverage_gap: Some(CoverageGap {
+                gap_id: format!("watchdog-gap:{batch_id}:{}", entry.sequence),
+                obligation_profile_ref: "watchdog-spool-coverage".to_owned(),
+                reason_ref: reason_ref.to_owned(),
+                affected_interval: None,
+                disposition: GapDisposition::DegradeDependentGuarantees,
+                protected: false,
+                evidence_refs: vec![entry.record_digest.clone(), entry.payload_digest.clone()],
+            }),
+            journal_control_event: false,
+            parent_record_id: None,
+        };
+        return Ok(ObservationSubmission {
+            operation_id: per_entry_operation.as_str().to_owned(),
+            idempotency_key: per_entry_idempotency.to_owned(),
+            state_fence: fence,
+            record,
+            record_v2: None,
+            capture_route: CaptureRoute::WatchdogSpool,
+            durability: Durability::Durable,
+            plan: None,
+            task_selection: None,
+            evidence: None,
+        });
+    }
+    let record = ObservationRecordEnvelope {
+        record_id,
+        kind: ObservationRecordKind::Telemetry,
+        event: Some(ObservationEventCore {
+            event_id_and_time: ObservationEventIdentity {
+                event_id: format!("watchdog-spool-event:{batch_id}:{}", entry.sequence),
+                clock: ClockReading::default(),
+            },
+            producer_generation_and_trace: ProducerTrace {
+                producer: "watchdog-spool".to_owned(),
+                generation: fence.resource_generation.value().to_string(),
+                trace_ref: Some(entry.payload_digest.clone()),
+            },
+            kind: ObservationKind::LoopOrNoProgress,
+            affected_scope: ObservationScope {
+                work_scope: WorkScopeId::new(GOVERNOR_SCOPE_ID)
+                    .map_err(|error| owner_refused(error.to_string()))?,
+                task_ref: None,
+                attempt_ref: Some(entry.payload_digest.clone()),
+                module_or_route_ref: Some("watchdog-spool".to_owned()),
+            },
+            observed_delta: format!(
+                "watchdog supervision evidence sequence {} batch {batch_id} digest {batch_digest} (not health truth)",
+                entry.sequence
+            ),
+            expected_baseline: None,
+            evidence_and_raw_handles: vec![
+                entry.record_digest.clone(),
+                entry.payload_digest.clone(),
+            ],
+            coverage_and_blind_intervals: CoverageEvidence {
+                disposition: CoverageDisposition::Complete,
+                denominator_source_ref: "watchdog-spool".to_owned(),
+                interval: None,
+                blind_intervals: Vec::new(),
+                observed_count: 1,
+            },
+            privacy_retention_and_disclosure: PrivacyRetentionDisclosure {
+                privacy_domain_ref: "governor-verification".to_owned(),
+                retention_policy_ref: "governor-retention".to_owned(),
+                disclosure_class: "internal".to_owned(),
+            },
+            candidate_importance: 1,
+            dedup_key: format!(
+                "watchdog-spool:{batch_digest}:{}:{}",
+                entry.sequence, entry.record_digest
+            ),
+        }),
+        coverage_gap: None,
+        journal_control_event: false,
+        parent_record_id: None,
+    };
+    Ok(ObservationSubmission {
+        operation_id: per_entry_operation.as_str().to_owned(),
+        idempotency_key: per_entry_idempotency.to_owned(),
+        state_fence: fence,
+        record,
+        record_v2: None,
+        capture_route: CaptureRoute::WatchdogSpool,
+        durability: Durability::Durable,
+        plan: None,
+        task_selection: None,
+        evidence: None,
+    })
+}
+
+/// Proves a gap-like entry yields a `ProblemCandidate` signal and a legal
+/// `Open -> Triaged` problem edge on scratch copies only. Severity is fixed
+/// `Info` and the transition target is fixed to `Triaged`: an incident is
+/// never self-certified here.
+fn check_watchdog_gap_candidate(
+    fence: &StateFence,
+    batch_id: &str,
+    batch_digest: &str,
+    entry: &WatchdogEntryAdmission,
+) -> Result<(), CompositionError> {
+    let signal_id = SignalId::new(format!("watchdog-gap-signal:{batch_id}:{}", entry.sequence))
+        .map_err(|error| owner_refused(error.to_string()))?;
+    let evidence = ArtifactId::new(format!(
+        "watchdog-spool-entry:{batch_id}:{}",
+        entry.sequence
+    ))
+    .map_err(|error| owner_refused(error.to_string()))?;
+    let signal = Signal {
+        signal_id: signal_id.clone(),
+        rule_id: "watchdog-spool-gap".to_owned(),
+        severity: SignalSeverity::Info,
+        subject: format!("watchdog spool gap sequence {}", entry.sequence),
+        scope_id: GOVERNOR_SCOPE_ID.to_owned(),
+        observed_at: ClockReading::default(),
+        evidence_handles: vec![evidence.clone()],
+        observation: None,
+        attribution: SignalAttribution::Suspected,
+        processing_state: SignalProcessingState::Observed,
+        delivery_state: DeliveryState::Pending,
+        disposition: SignalDisposition::ProblemCandidate,
+        dedup_key: format!(
+            "watchdog-gap:{batch_digest}:{}:{}",
+            entry.sequence, entry.record_digest
+        ),
+        reopen_condition: "watchdog-gap-recovery-observed".to_owned(),
+        state_fence: fence.clone(),
+    };
+    signal.validate().map_err(|error| {
+        owner_refused(format!("watchdog gap signal is not admissible: {error}"))
+    })?;
+    if signal.disposition != SignalDisposition::ProblemCandidate
+        || signal.severity == SignalSeverity::IncidentCandidate
+    {
+        return Err(owner_refused(
+            "watchdog gap signal must stay a non-incident problem candidate".to_owned(),
+        ));
+    }
+    let mut scratch = Problem {
+        problem_id: ProblemId::new(format!(
+            "watchdog-gap-problem:{batch_id}:{}",
+            entry.sequence
+        ))
+        .map_err(|error| owner_refused(error.to_string()))?,
+        signal_refs: vec![signal_id],
+        title: format!(
+            "watchdog coverage gap candidate batch {batch_id} sequence {}",
+            entry.sequence
+        ),
+        scope_id: GOVERNOR_SCOPE_ID.to_owned(),
+        owner: OwnerRef {
+            principal: GOVERNOR_SCOPE_ID.to_owned(),
+            generation: fence.resource_generation.value().to_string(),
+        },
+        state: ProblemState::Open,
+        evidence_refs: vec![evidence],
+        resolution_condition: format!("watchdog recovery observed for sequence {}", entry.sequence),
+        acknowledged_by: None,
+        state_fence: fence.clone(),
+        revision: 1,
+        reopen_count: 0,
+    };
+    scratch.validate().map_err(|error| {
+        owner_refused(format!(
+            "watchdog gap problem scratch state is not admissible: {error}"
+        ))
+    })?;
+    scratch
+        .transition(fence, ProblemState::Triaged)
+        .map_err(|error| {
+            owner_refused(format!(
+                "watchdog gap problem cannot legally become a candidate: {error}"
+            ))
+        })?;
+    Ok(())
+}
+
+/// Builds the per-entry observation-leg envelope under the derived per-entry
+/// operation identity. Required proof binds the spool digests so a mutated
+/// payload under the same sequence changes the canonical hash and conflicts
+/// instead of overwriting.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the watchdog envelope binds every spool identity explicitly"
+)]
+fn watchdog_observation_envelope(
+    identity: &eliot_protocol::RequestIdentity,
+    observation_operation: &OperationId,
+    submission: &ObservationSubmission,
+    batch_id: &str,
+    batch_digest: &str,
+    entry: &WatchdogEntryAdmission,
+    manifest_digest: &OperationManifestDigest,
+) -> Result<CanonicalWriteEnvelope, CompositionError> {
+    let fence = &identity.request.metadata.state_fence;
+    let request_digest = submission
+        .request_digest()
+        .map_err(|error| owner_refused(error.to_string()))?;
+    let mut parameters = BTreeMap::new();
+    for (name, value) in [
+        ("record_id", submission.record.record_id.clone()),
+        ("request_digest", request_digest),
+        ("operation_id", submission.operation_id.clone()),
+        ("idempotency_key", submission.idempotency_key.clone()),
+        ("batch_id", batch_id.to_owned()),
+        ("batch_digest", batch_digest.to_owned()),
+        ("sequence", entry.sequence.to_string()),
+        ("record_digest", entry.record_digest.clone()),
+        ("payload_digest", entry.payload_digest.clone()),
+    ] {
+        parameters.insert(name.to_owned(), serde_json::Value::String(value));
+    }
+    let envelope = CanonicalWriteEnvelope {
+        operation_id: observation_operation.clone(),
+        request: identity.request.metadata.clone(),
+        idempotency_key: submission.idempotency_key.clone(),
+        scope_id: ScopeId::new(GOVERNOR_SCOPE_ID)
+            .map_err(|error| owner_refused(error.to_string()))?,
+        task_id: identity
+            .request
+            .metadata
+            .task_id
+            .as_ref()
+            .map(|task| task.as_str().to_owned()),
+        transition_class: TransitionClass::CaptureCandidate,
+        requested_effect_ceiling: EffectClass::Candidate,
+        admission_contract_set_digest: canonical_digest(submission)?,
+        operation_manifest_digest: manifest_digest.clone(),
+        semantic_commands: vec![NamedMutationRequest {
+            operation: NamedMutationOperation::CaptureObservation,
+            parameters,
+        }],
+        event_projection_relation_intents: EventProjectionRelationIntents {
+            event_ids: Vec::new(),
+            projection_kinds: Vec::new(),
+            relation_kinds: Vec::new(),
+        },
+        security: SecurityContext::default(),
+        required_proof_and_approval_refs: vec![
+            entry.record_digest.clone(),
+            entry.payload_digest.clone(),
+        ],
+        expected_revision_heads: Vec::new(),
+        expected_ordering_heads: vec![OrderingHeadExpectation {
+            scope: OrderingScopeId::new(GOVERNOR_ORDERING_SCOPE)
+                .map_err(|error| owner_refused(error.to_string()))?,
+            expected_sequence: 1,
+            state_fence: fence.clone(),
+        }],
+    };
+    envelope.validate()?;
+    Ok(envelope)
+}
+
 impl<P: KernelTransitionPort + ?Sized> GovernorObservationReconciliation<'_, P> {
+    /// Validates readiness plus exact fence agreement for Watchdog admission.
+    ///
+    /// Mirrors [`Self::validate_identity_fence`] without the doctor echo: the
+    /// request binding fence, the envelope metadata fence, and the canonical
+    /// owner fence must coincide. No verifier endorsement applies here.
+    fn validate_watchdog_identity_fence(
+        &self,
+        identity: &eliot_protocol::RequestIdentity,
+    ) -> Result<(), CompositionError> {
+        if self.readiness != CompositionReadiness::Ready {
+            return Err(CompositionError::NotReady);
+        }
+        identity
+            .validate()
+            .map_err(|error| identity_refused(error.to_string()))?;
+        let fence = &identity.request.metadata.state_fence;
+        if identity.request.state_fence != *fence {
+            return Err(identity_refused(
+                "admitted request fence does not match the request binding fence".to_owned(),
+            ));
+        }
+        if self.canonical.state_fence() != fence {
+            return Err(identity_refused(
+                "admitted request fence does not match the active canonical fence".to_owned(),
+            ));
+        }
+        Ok(())
+    }
+
+    /// Returns the already-committed per-entry observation receipt for an
+    /// identical retry, or fails closed when the same operation carries
+    /// different bytes. The caller passes the derived per-entry identity
+    /// (caller binding plus per-entry idempotency), so the receipt binding
+    /// check compares against that identity.
+    async fn reconcile_watchdog_observation_receipt(
+        &self,
+        identity: &eliot_protocol::RequestIdentity,
+        observation_operation: &OperationId,
+        recovery_hash: &str,
+        manifest_digest: &OperationManifestDigest,
+    ) -> Result<Option<WriteReceipt>, CompositionError> {
+        if let Some(receipt) = self.kernel.receipt(observation_operation.clone()).await? {
+            if receipt.idempotency_key == identity.idempotency_key
+                && receipt.canonical_request_hash == recovery_hash
+            {
+                check_receipt(
+                    &receipt,
+                    observation_operation,
+                    identity,
+                    recovery_hash,
+                    TransitionClass::CaptureCandidate,
+                    manifest_digest,
+                )?;
+                return Ok(Some(receipt));
+            }
+            return Err(identity_refused(format!(
+                "operation {observation_operation} is already committed with different canonical bytes"
+            )));
+        }
+        Ok(None)
+    }
+
+    /// Admits one Watchdog spool export batch into canonical observations
+    /// through the common gateway.
+    ///
+    /// See [`WatchdogAdmittedEntry`] and the module-level Watchdog admission
+    /// documentation for the heartbeat/gap mapping, the idempotency rule, and
+    /// the deferred composition accessor.
+    #[allow(
+        clippy::too_many_lines,
+        reason = "the per-entry scratch/commit/reconcile steps stay in explicit order"
+    )]
+    pub async fn admit_watchdog_batch(
+        &self,
+        identity: &eliot_protocol::RequestIdentity,
+        base_operation_id: &OperationId,
+        batch_id: &str,
+        batch_digest: &str,
+        entries: &[WatchdogEntryAdmission],
+    ) -> Result<Vec<WatchdogAdmittedEntry>, CompositionError> {
+        self.validate_watchdog_identity_fence(identity)?;
+        validate_watchdog_batch_identity(batch_id, batch_digest)?;
+        for entry in entries {
+            validate_watchdog_entry(entry)?;
+        }
+        if entries.is_empty() {
+            return Ok(Vec::new());
+        }
+        let manifest_digest = production_manifest_digest()?;
+        let fence = identity.request.metadata.state_fence.clone();
+        let mut scratch = self.observation.clone();
+        let mut outcomes = Vec::with_capacity(entries.len());
+        for entry in entries {
+            let observation_operation =
+                OperationId::new(format!("{base_operation_id}/watchdog-{}", entry.sequence))
+                    .map_err(|error| owner_refused(error.to_string()))?;
+            let per_entry_idempotency = format!(
+                "{}:watchdog:{batch_id}:{}",
+                identity.idempotency_key, entry.sequence
+            );
+            // Derived per-entry identity: the caller binding plus the
+            // deterministic per-entry idempotency. The canonical owner
+            // requires the envelope idempotency to equal the admitted
+            // identity idempotency, so each entry commits under its own
+            // identity. A retry must reuse the caller identity and the base
+            // operation (documented above); anything else conflicts instead
+            // of writing a second observation for one spool sequence.
+            let entry_identity = eliot_protocol::RequestIdentity {
+                request: identity.request.clone(),
+                idempotency_key: per_entry_idempotency.clone(),
+                deadline_unix_ms: identity.deadline_unix_ms,
+                cancellation_id: identity.cancellation_id.clone(),
+            };
+            let submission = watchdog_submission(
+                &observation_operation,
+                &per_entry_idempotency,
+                identity,
+                batch_id,
+                batch_digest,
+                entry,
+            )?;
+            match scratch
+                .admit(submission.clone())
+                .map_err(|error| owner_refused(error.to_string()))?
+            {
+                ObservationAdmissionResult::Accepted { .. }
+                | ObservationAdmissionResult::Replayed { .. } => {}
+                ObservationAdmissionResult::Rejected { rejection } => {
+                    if rejection.disposition == RejectionDisposition::Conflict {
+                        return Err(owner_refused(format!(
+                            "watchdog observation identity conflict: {}",
+                            rejection.all_contract_errors.join("; ")
+                        )));
+                    }
+                    return Err(owner_refused(format!(
+                        "watchdog observation is not admissible: {}",
+                        rejection.all_contract_errors.join("; ")
+                    )));
+                }
+            }
+            if entry.kind.is_gap_like() {
+                check_watchdog_gap_candidate(&fence, batch_id, batch_digest, entry)?;
+            }
+            let envelope = watchdog_observation_envelope(
+                &entry_identity,
+                &observation_operation,
+                &submission,
+                batch_id,
+                batch_digest,
+                entry,
+                &manifest_digest,
+            )?;
+            let expected_hash = envelope
+                .canonical_request_hash()
+                .map_err(CompositionError::Canonical)?;
+            if let Some(receipt) = self
+                .reconcile_watchdog_observation_receipt(
+                    &entry_identity,
+                    &observation_operation,
+                    &expected_hash,
+                    &manifest_digest,
+                )
+                .await?
+            {
+                outcomes.push(WatchdogAdmittedEntry {
+                    sequence: entry.sequence,
+                    record_digest: entry.record_digest.clone(),
+                    receipt: Some(receipt),
+                });
+                continue;
+            }
+            match self
+                .commit_observation_leg(
+                    &entry_identity,
+                    &observation_operation,
+                    envelope,
+                    &expected_hash,
+                    &manifest_digest,
+                )
+                .await
+            {
+                Ok(receipt) => outcomes.push(WatchdogAdmittedEntry {
+                    sequence: entry.sequence,
+                    record_digest: entry.record_digest.clone(),
+                    receipt: Some(receipt),
+                }),
+                Err(CompositionError::Kernel(KernelPortError::Unknown(_))) => {
+                    outcomes.push(WatchdogAdmittedEntry {
+                        sequence: entry.sequence,
+                        record_digest: entry.record_digest.clone(),
+                        receipt: None,
+                    });
+                }
+                Err(other) => return Err(other),
+            }
+        }
+        Ok(outcomes)
+    }
+
     /// Admits one independently verified Doctor result into canonical Problem
     /// state through the common gateway.
     ///
@@ -1591,6 +2189,89 @@ mod tests {
         assert!(
             matches!(mutated, Err(CompositionError::Owner(_))),
             "mutated bytes under the same idempotency key must conflict: {mutated:?}"
+        );
+        assert_eq!(kernel.apply_count(), 2, "conflicting retry must not commit");
+    }
+
+    #[test]
+    fn watchdog_batch_admits_heartbeat_and_gap_idempotently() {
+        let fence_value = fence();
+        let journal = ObservationJournal::default();
+        let revisions = BTreeMap::new();
+        let canonical = canonical_owner(&fence_value);
+        let kernel = TestKernel::new(revisions.clone());
+        let owner = adapter(&journal, &revisions, &canonical, &kernel);
+        let identity_value = identity(&fence_value);
+        let base = OperationId::new("op-watchdog-batch-1").expect("base operation");
+        let batch_id = "batch-watchdog-1";
+        let batch_digest = sha256_hex(b"watchdog-batch-1");
+        let entries = vec![
+            WatchdogEntryAdmission {
+                sequence: 1,
+                kind: WatchdogEntryKind::Heartbeat,
+                record_digest: sha256_hex(b"watchdog-rec-1"),
+                payload_digest: sha256_hex(b"watchdog-pay-1"),
+                observed_at_ms: 1_786_000_000_000,
+            },
+            WatchdogEntryAdmission {
+                sequence: 2,
+                kind: WatchdogEntryKind::Gap,
+                record_digest: sha256_hex(b"watchdog-rec-2"),
+                payload_digest: sha256_hex(b"watchdog-pay-2"),
+                observed_at_ms: 1_786_000_000_001,
+            },
+        ];
+        let outcomes = block_on(owner.admit_watchdog_batch(
+            &identity_value,
+            &base,
+            batch_id,
+            &batch_digest,
+            &entries,
+        ))
+        .expect("watchdog batch admits");
+        assert_eq!(outcomes.len(), 2);
+        for (outcome, entry) in outcomes.iter().zip(entries.iter()) {
+            assert_eq!(outcome.sequence, entry.sequence);
+            assert_eq!(outcome.record_digest, entry.record_digest);
+            let receipt = outcome.receipt.as_ref().expect("committed receipt");
+            assert_eq!(receipt.status, WriteReceiptStatus::Committed);
+            assert_eq!(receipt.transition_class, TransitionClass::CaptureCandidate);
+            assert_eq!(receipt.state_fence, fence_value);
+        }
+        assert_eq!(kernel.apply_count(), 2);
+        let replayed = block_on(owner.admit_watchdog_batch(
+            &identity_value,
+            &base,
+            batch_id,
+            &batch_digest,
+            &entries,
+        ))
+        .expect("exact batch replay reconciles");
+        assert_eq!(replayed, outcomes);
+        assert_eq!(
+            kernel.apply_count(),
+            2,
+            "exact batch replay must not execute a second transition per spool sequence"
+        );
+        let mut mutated = entries.clone();
+        mutated[0].record_digest = sha256_hex(b"watchdog-rec-1-mutated");
+        let conflict = block_on(owner.admit_watchdog_batch(
+            &identity_value,
+            &base,
+            batch_id,
+            &batch_digest,
+            &mutated,
+        ));
+        // Fail-closed at either layer: journal identity conflict (Owner) when
+        // the composition persists the first admission, or canonical receipt
+        // reconciliation (Provider) when scratch is per-call as here. Both
+        // refuse a second transition for one spool sequence.
+        assert!(
+            matches!(
+                conflict,
+                Err(CompositionError::Owner(_) | CompositionError::Provider(_))
+            ),
+            "mutated payload under the same spool sequence must conflict: {conflict:?}"
         );
         assert_eq!(kernel.apply_count(), 2, "conflicting retry must not commit");
     }
