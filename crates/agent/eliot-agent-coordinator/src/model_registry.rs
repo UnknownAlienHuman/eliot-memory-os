@@ -20,6 +20,10 @@ use crate::model_control::{
     ModelRole, ModelSelectionReceipt, ModelSelector, QuotaDisposition, RouteAdmissionStatus,
     RouteHealthStatus, SelectionRejection, ZeroModelExecutionCounters,
 };
+use crate::provider_account_catalogue::{
+    AuthDisposition, ConcurrencyDisposition, IncidentDisposition, ProviderAccountCatalogueSnapshot,
+    ProviderAccountRow, RateLimitDisposition,
+};
 
 pub const MODEL_REGISTRY_SCHEMA_VERSION: &str = "eliot.agent-model-registry/v1";
 pub const MODEL_SEARCH_SCHEMA_VERSION: &str = "eliot.agent-model-search/v1";
@@ -36,6 +40,8 @@ pub enum ModelRegistryError {
     DuplicateRoute,
     #[error("model registry serialization failed: {0}")]
     Serialization(String),
+    #[error(transparent)]
+    ProviderAccounts(#[from] crate::provider_account_catalogue::ProviderAccountCatalogueError),
     #[error(transparent)]
     ModelControl(#[from] ModelControlError),
 }
@@ -1202,6 +1208,242 @@ where
         execution: ZeroModelExecutionCounters::zero(),
         proof_ceiling: ProofCeiling::CandidateArtifact,
     })
+}
+
+/// Provider-aware eligibility search over the observation-only
+/// provider/account catalogue.
+///
+/// This is a pure consumer of [`ProviderAccountCatalogueSnapshot`]: it joins
+/// registry routes to provider rows by provider id plus field-complete route
+/// identity, layers one independent check per new provider axis
+/// (`provider_account`, `provider_rate_limit`, `provider_concurrency`,
+/// `provider_incident`, `provider_auth`, plus the catalogue-level
+/// `provider_catalogue_source`), and re-ranks the surviving candidates with
+/// the provider readiness rank as the final deterministic tie-break after the
+/// policy order. Filtering only narrows: an eligible route of
+/// [`find_models`] can only stay eligible or be removed, never added, and a
+/// provider blocker (fail, stale, or missing evidence) always removes
+/// eligibility — stale, conflicted, and unknown provider evidence is never
+/// coerced to ready.
+///
+/// Billing, quota, health, and availability stay owned by the catalogue entry
+/// checks; this layer gates only on the provider/account axes that the
+/// catalogue entry cannot observe (rate-limit, concurrency, incident, auth)
+/// plus row presence, row currency, and row invalidation. The result keeps the
+/// candidate-only ceiling: zero execution counters,
+/// [`ProofCeiling::CandidateArtifact`], no provider call, no network.
+pub fn find_models_with_provider_accounts<P>(
+    snapshot: &ModelRegistrySnapshot,
+    accounts: &ProviderAccountCatalogueSnapshot,
+    requirements: &RouteRequirements,
+    ranking_policy: P,
+) -> Result<ModelSearchResult, ModelRegistryError>
+where
+    P: Into<RankingPolicyInput>,
+{
+    accounts.validate()?;
+    if accounts.account_scope != snapshot.account_scope {
+        return Err(ModelRegistryError::InvalidField(
+            "provider_accounts.account_scope",
+        ));
+    }
+    let mut rows = BTreeMap::new();
+    for row in &accounts.rows {
+        let key = (row.provider_id.clone(), route_key(&row.route)?);
+        rows.insert(key, row);
+    }
+    let now_unix_ms = requirements.supplied_at_unix_ms;
+    let mut result = find_models(snapshot, requirements, ranking_policy)?;
+    let mut readiness_rank = BTreeMap::new();
+    for explanation in &mut result.explanations {
+        let key = (
+            explanation.route.provider.clone(),
+            route_sort_key(&explanation.route),
+        );
+        let row = rows.get(&key).copied();
+        let mut extra = provider_account_checks(accounts, row, now_unix_ms);
+        explanation.checks.append(&mut extra);
+        explanation.failures = explanation
+            .checks
+            .iter()
+            .filter(|item| item.disposition == CheckDisposition::Fail)
+            .cloned()
+            .collect::<Vec<_>>();
+        explanation.missing_evidence = explanation
+            .checks
+            .iter()
+            .filter(|item| {
+                matches!(
+                    item.disposition,
+                    CheckDisposition::Missing | CheckDisposition::Stale
+                )
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+        explanation.eligible =
+            explanation.failures.is_empty() && explanation.missing_evidence.is_empty();
+        readiness_rank.insert(
+            key.1,
+            row.map_or(u8::MAX, |candidate| candidate.readiness(now_unix_ms).rank()),
+        );
+        for item in &explanation.missing_evidence {
+            if item.dimension.starts_with("provider_") {
+                result.unresolved_facts.push(format!(
+                    "{}:{}",
+                    explanation.entry_id.as_deref().unwrap_or("missing"),
+                    item.dimension
+                ));
+            }
+        }
+    }
+    result.unresolved_facts.sort();
+    result.unresolved_facts.dedup();
+    let eligibility = result
+        .explanations
+        .iter()
+        .map(|explanation| (route_sort_key(&explanation.route), explanation.eligible))
+        .collect::<BTreeMap<_, _>>();
+    result.eligible.retain(|entry| {
+        eligibility
+            .get(&route_sort_key(&entry.route))
+            .copied()
+            .unwrap_or(false)
+    });
+    // Stable sort keeps the policy order within equal provider ranks; every
+    // surviving row is provider-Ready, so this is the deterministic final
+    // tie-break rather than a policy override.
+    result
+        .eligible
+        .sort_by_key(|entry| readiness_rank.get(&route_sort_key(&entry.route)).copied());
+    Ok(result)
+}
+
+fn provider_evidence_refs(
+    accounts: &ProviderAccountCatalogueSnapshot,
+    row: Option<&ProviderAccountRow>,
+) -> Vec<String> {
+    let mut refs = vec![accounts.canonical_digest.clone()];
+    if let Some(row) = row {
+        refs.push(row.receipt_ref.clone());
+        refs.push(row.source.clone());
+    }
+    refs
+}
+
+/// Layers one independent check per provider/account axis. Each check reads
+/// only its own axis: a passing rate-limit axis never clears a saturated
+/// concurrency axis, and a stale window surfaces as stale rather than ready.
+fn provider_account_checks(
+    accounts: &ProviderAccountCatalogueSnapshot,
+    row: Option<&ProviderAccountRow>,
+    now_unix_ms: u64,
+) -> Vec<HardCheck> {
+    let mut checks = Vec::new();
+    checks.push(check(
+        "provider_catalogue_source",
+        if accounts.is_current(now_unix_ms) {
+            CheckDisposition::Pass
+        } else {
+            CheckDisposition::Stale
+        },
+        "provider account catalogue freshness",
+        vec![accounts.canonical_digest.clone()],
+    ));
+    let Some(row) = row else {
+        checks.push(check(
+            "provider_account",
+            CheckDisposition::Missing,
+            "no provider account row bound to this route",
+            vec![accounts.canonical_digest.clone()],
+        ));
+        return checks;
+    };
+    let refs = provider_evidence_refs(accounts, Some(row));
+    if !row.is_current(now_unix_ms) {
+        checks.push(check(
+            "provider_account",
+            CheckDisposition::Stale,
+            "provider account row evidence is stale",
+            refs.clone(),
+        ));
+    } else if !row.invalidation.is_empty() {
+        checks.push(check(
+            "provider_account",
+            CheckDisposition::Fail,
+            "provider account row is invalidated by its owner",
+            refs.clone(),
+        ));
+    } else {
+        checks.push(check(
+            "provider_account",
+            CheckDisposition::Pass,
+            "provider account row bound to this route",
+            refs.clone(),
+        ));
+    }
+    let rate_limit = if !row.rate_limit.is_current(now_unix_ms) {
+        CheckDisposition::Stale
+    } else {
+        match row.rate_limit.effective(now_unix_ms) {
+            RateLimitDisposition::Ready => CheckDisposition::Pass,
+            RateLimitDisposition::Limited => CheckDisposition::Fail,
+            RateLimitDisposition::Unknown => CheckDisposition::Missing,
+        }
+    };
+    checks.push(check(
+        "provider_rate_limit",
+        rate_limit,
+        "provider rate-limit/backoff evidence",
+        refs.clone(),
+    ));
+    let concurrency = if !row.concurrency.is_current(now_unix_ms) {
+        CheckDisposition::Stale
+    } else {
+        match row.concurrency.effective(now_unix_ms) {
+            ConcurrencyDisposition::Available => CheckDisposition::Pass,
+            ConcurrencyDisposition::Saturated => CheckDisposition::Fail,
+            ConcurrencyDisposition::Unknown => CheckDisposition::Missing,
+        }
+    };
+    checks.push(check(
+        "provider_concurrency",
+        concurrency,
+        "provider concurrency evidence",
+        refs.clone(),
+    ));
+    let incident = if !row.incident.is_current(now_unix_ms) {
+        CheckDisposition::Stale
+    } else {
+        match row.incident.effective(now_unix_ms) {
+            IncidentDisposition::None => CheckDisposition::Pass,
+            IncidentDisposition::Degraded | IncidentDisposition::Outage => CheckDisposition::Fail,
+            IncidentDisposition::Unknown => CheckDisposition::Missing,
+        }
+    };
+    checks.push(check(
+        "provider_incident",
+        incident,
+        "provider incident evidence",
+        refs.clone(),
+    ));
+    let auth = if !row.auth.is_current(now_unix_ms) {
+        CheckDisposition::Stale
+    } else {
+        match row.auth.effective(now_unix_ms) {
+            AuthDisposition::Bound => CheckDisposition::Pass,
+            AuthDisposition::Expired | AuthDisposition::Revoked | AuthDisposition::Conflicted => {
+                CheckDisposition::Fail
+            }
+            AuthDisposition::Unknown => CheckDisposition::Missing,
+        }
+    };
+    checks.push(check(
+        "provider_auth",
+        auth,
+        "provider credential-binding evidence",
+        refs,
+    ));
+    checks
 }
 
 /// Compatibility delegation for the existing model-control consumer.  The
