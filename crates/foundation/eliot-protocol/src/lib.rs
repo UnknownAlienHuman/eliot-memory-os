@@ -12,8 +12,8 @@ use std::{collections::BTreeMap, fmt, io::Read};
 
 use eliot_agent_contracts::LivePeerMessage;
 use eliot_contracts::{
-    ArtifactId, AuthorityEpoch, ContractError, ContractIdentity, ContractVersion, EpochId,
-    RequestId, ResourceGeneration, StateFence, canonical_json_bytes, contract_identity,
+    ArtifactId, ContractError, ContractIdentity, ContractVersion, EpochId, RequestId,
+    ResourceGeneration, StateFence, canonical_json_bytes, contract_identity,
 };
 use eliot_evidence::EvidenceEnvelope;
 use eliot_instrument_api::{InstrumentInvocation, VerificationRun};
@@ -2024,7 +2024,11 @@ impl AgentActivationResolutionDecision {
 #[serde(deny_unknown_fields)]
 pub struct AgentBridgeActivationFence {
     /// Semantic authority epoch selected by Kernel admission.
-    pub authority_epoch: AuthorityEpoch,
+    ///
+    /// Lineage-aware [`EpochId`] exact tuple; lineage is threaded from the
+    /// Kernel activation receipt (`AgentBridgePeerAdmissionReceipt.state_fence`)
+    /// and matched via `is_same_authority`/`==` (Implements #64).
+    pub authority_epoch: EpochId,
     /// Semantic activation generation selected by Kernel admission.
     pub generation: ResourceGeneration,
     /// Kernel-issued fence nonce.
@@ -2033,10 +2037,13 @@ pub struct AgentBridgeActivationFence {
 
 impl AgentBridgeActivationFence {
     fn validate(&self) -> Result<(), ProtocolError> {
-        if self.authority_epoch.value() == 0 || self.generation.value() == 0 {
+        // `EpochId` is always a validated non-zero `(lineage_id, sequence)`
+        // tuple by construction; only the activation generation needs a
+        // nonzero check here.
+        if self.generation.value() == 0 {
             return Err(ProtocolError::InvalidField {
                 field: "agent_bridge_activation_response.state_fence",
-                reason: "authority epoch and activation generation must be nonzero",
+                reason: "activation generation must be nonzero",
             });
         }
         bounded_text(
@@ -3330,8 +3337,8 @@ impl AgentBridgeProcessBinding {
 mod tests {
     use super::*;
     use eliot_contracts::{
-        ArtifactId, AuthorityEpoch, ClockReading, ContractId, ContractVersion, EpochLineageId,
-        ProductId, RequestMetadata, ResourceGeneration, SourceId,
+        ArtifactId, ClockReading, ContractId, ContractVersion, EpochLineageId, ProductId,
+        RequestMetadata, ResourceGeneration, SourceId,
     };
     use eliot_runtime_contracts::{HealthVector, ModuleGenerationState};
     use std::num::NonZeroU64;
@@ -3890,7 +3897,7 @@ mod tests {
             session_id: "session-1".to_owned(),
             activation_generation: ResourceGeneration::new(3)?,
             state_fence: AgentBridgeActivationFence {
-                authority_epoch: AuthorityEpoch::new(2)?,
+                authority_epoch: test_epoch(TEST_LINEAGE_A, 2),
                 generation: ResourceGeneration::new(3)?,
                 nonce: "semantic-fence-nonce-1".to_owned(),
             },

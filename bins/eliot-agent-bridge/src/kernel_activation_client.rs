@@ -238,7 +238,10 @@ pub(super) fn decode_activation_response(
     if let eliot_protocol::AgentBridgeActivationDisposition::Authenticated { binding } =
         &response.disposition
         && (binding.activation_generation != admission.state_fence.resource_generation
-            || binding.state_fence.authority_epoch != admission.state_fence.authority_epoch
+            || !binding
+                .state_fence
+                .authority_epoch
+                .is_same_authority(&admission.state_fence.authority_epoch)
             || binding.state_fence.generation != admission.state_fence.resource_generation)
     {
         return Err(provider_failure());
