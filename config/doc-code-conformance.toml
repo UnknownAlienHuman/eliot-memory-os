@@ -103,7 +103,7 @@ ignore_globs = [
   # The closure audit defines the same retired-token list it scans for.
   "scripts/docs_closure_audit.py",
 ]
-unstable_line_reference_regex = 'docs/(?:normative|architecture)/ELIOT_(?:ARCHITECTURE|IMPLEMENTATION)\.md:\d+'
+unstable_line_reference_regex = '(?<![A-Za-z0-9_./-])(?:docs/(?:normative|architecture)/)?ELIOT_(?:ARCHITECTURE|IMPLEMENTATION)\.md:\d+(?:-(?:[A-Za-z0-9_]+)?)?'
 
 [[retired_references.allow]]
 path = "bins/eliot-host/src/credential_control/codec.rs"

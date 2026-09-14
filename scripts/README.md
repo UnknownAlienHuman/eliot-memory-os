@@ -66,7 +66,7 @@ The conformance policy introduced by issue #291 lives at
 
 - `DCC-001` — verified-reader contract drift across instruction/generator surfaces;
 - `DCC-002` — workflow documentation differs from actual trigger source;
-- `DCC-003` — retired or unstable documentation authority references;
+- `DCC-003` — retired or unstable documentation authority references (rejects path-qualified and bare normative line numbers and ranges);
 - `DCC-004` — maintained top-level script missing from this map;
 - `DCC-005` — root Cargo `bins/*` composition package missing from `PROJECT_MAP`;
 - `DCC-006` — stale current-owner/work reference;
@@ -78,9 +78,10 @@ The conformance policy introduced by issue #291 lives at
 
 The conformance self-test and repository audit run from `just quick` and
 `scripts/verify.ps1`; `scripts/verify.sh` delegates to the same PowerShell-owned
-profile. Any finding fails the normal local verification path. A clean result
-still proves no Architecture semantics, compilation, runtime behavior, authority
-correctness, Product acceptance, or release support.
+profile. Any finding fails the normal local verification path. The proof ceiling
+for documentation/source conformance is static reference-shape consistency only;
+a clean result proves no Architecture semantics, compilation, runtime behavior,
+authority correctness, Product acceptance, or release support.
 
 ## Agent route, host, and model-selection utilities
 
