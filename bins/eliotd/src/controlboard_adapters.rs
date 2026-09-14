@@ -27,7 +27,10 @@
 //! - Operator submission admits one exact-view intent against the live
 //!   snapshot fence and returns a candidate-only receipt. Acceptance is
 //!   transport acknowledgement, never task completion or a canonical write:
-//!   there is no commit path in this module.
+//!   there is no commit path in this module. Boards built from one daemon
+//!   composition share one volatile replay handle
+//!   ([`SharedOperatorReplay`]); durable operator identity lives in Kernel
+//!   ORS through the async Governor operator borrow.
 //! - Action digests, ceilings, capabilities, and targets are enforced by
 //!   `ControlBoard` before and after the port call; the adapters enforce the
 //!   bindings only the live snapshot can check (revision/fence currency and
@@ -42,7 +45,7 @@
 #![forbid(unsafe_code)]
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use eliot_contracts::SessionId;
 use eliot_controlboard::{
@@ -58,14 +61,34 @@ use eliot_governor::ControlBoardGovernorSnapshot;
 /// The snapshot is immutable: every port call in the returned board observes
 /// the same fence and revision, so a mid-read Governor refresh surfaces as an
 /// exact-view mismatch at the next call rather than silent divergence.
-pub(crate) fn controlboard_over_snapshot(snapshot: ControlBoardGovernorSnapshot) -> ControlBoard {
+///
+/// The board shares the caller-retained [`SharedOperatorReplay`] handle, so a
+/// newly created board replays an already-admitted operation instead of
+/// admitting it twice. `admitted` carries owner-issued session bindings for
+/// the access resolver; production passes none (the session owner is
+/// deferred), which keeps the unadmitted typed gap.
+pub(crate) fn controlboard_over_snapshot(
+    snapshot: ControlBoardGovernorSnapshot,
+    shared: &SharedOperatorReplay,
+    admitted: Vec<AdmittedSessionAccess>,
+) -> ControlBoard {
     let snapshot = Arc::new(snapshot);
+    // Production passes no sessions, which cannot fail. An invalid test
+    // admission degrades to the empty resolver so submission stays fail-closed
+    // downstream instead of inventing rights.
+    let access = if admitted.is_empty() {
+        GovernorAccessResolver::new(Arc::clone(&snapshot))
+    } else {
+        GovernorAccessResolver::with_admitted_sessions(Arc::clone(&snapshot), admitted)
+            .unwrap_or_else(|_| GovernorAccessResolver::new(Arc::clone(&snapshot)))
+    };
     ControlBoard::new(
-        Some(Box::new(GovernorAccessResolver::new(Arc::clone(&snapshot)))),
+        Some(Box::new(access)),
         Some(Box::new(GovernorCanonicalState::new(Arc::clone(&snapshot)))),
-        Some(Box::new(GovernorOperatorCommand::new(Arc::clone(
-            &snapshot,
-        )))),
+        Some(Box::new(GovernorOperatorCommand::with_shared_replay(
+            Arc::clone(&snapshot),
+            shared,
+        ))),
     )
     .with_swarm_projection(Box::new(GovernorSwarmProjection::new(snapshot)))
 }
@@ -369,6 +392,34 @@ impl CanonicalStatePort for GovernorCanonicalState {
     }
 }
 
+/// Process-retained exact-replay handle shared by every board built through
+/// [`controlboard_over_snapshot`] from one
+/// [`DaemonComposition`](super::DaemonComposition).
+///
+/// Volatile fast path only, never the durability story: it lets a newly
+/// created board replay an admission without a second effecting-port call
+/// while the process lives. Durable operator identity lives in Kernel ORS and
+/// is reconciled through the async Governor operator borrow
+/// (`GovernorComposition::operator_reconciliation`); a restart drops this map
+/// and replays resolve through that receipt route instead.
+#[derive(Clone, Debug, Default)]
+pub(crate) struct SharedOperatorReplay {
+    inner: Arc<Mutex<HashMap<String, (CommandRequest, CommandReceipt)>>>,
+}
+
+impl SharedOperatorReplay {
+    pub(crate) fn new() -> Self {
+        Self::default()
+    }
+
+    /// Counts stored admissions. Test introspection only: proving a replay
+    /// across boards added no second admission.
+    #[cfg(test)]
+    pub(crate) fn admission_count(&self) -> usize {
+        self.inner.lock().map_or(0, |map| map.len())
+    }
+}
+
 /// Governor-backed operator command admission.
 ///
 /// Admits one exact-view intent after verifying the owner-issued identity
@@ -377,21 +428,40 @@ impl CanonicalStatePort for GovernorCanonicalState {
 /// write.
 struct GovernorOperatorCommand {
     snapshot: Arc<ControlBoardGovernorSnapshot>,
-    // #1187 R1: in-memory exact-replay store keyed by operation_id text. An
-    // identical binding returns the stored receipt without a second admission;
-    // a changed binding under the same operation_id surfaces as the
-    // controlboard IdentityConflict (via PortError::IdentityConflict, mapped by
+    // #1187: exact-replay record keyed by operation_id text, shared through
+    // [`SharedOperatorReplay`] so every board built from one daemon
+    // composition replays the same admission. An identical binding returns
+    // the stored receipt without a second admission; a changed binding under
+    // the same operation_id surfaces as the controlboard IdentityConflict
+    // (via PortError::IdentityConflict, mapped by
     // ControlBoardError::from_port). The stored binding is never overwritten,
-    // so a conflict mutates no state. Cross-restart durability is R2's owner
-    // and explicitly out of scope here.
-    replay: HashMap<String, (CommandRequest, CommandReceipt)>,
+    // so a conflict mutates no state. This map is a volatile fast path only:
+    // cross-restart durability belongs to Kernel ORS through the async
+    // Governor operator borrow, never to this handle.
+    replay: SharedOperatorReplay,
 }
 
 impl GovernorOperatorCommand {
+    /// Per-instance replay handle. Test use only: production boards share
+    /// one daemon handle through [`Self::with_shared_replay`].
+    #[cfg(test)]
     fn new(snapshot: Arc<ControlBoardGovernorSnapshot>) -> Self {
         Self {
             snapshot,
-            replay: HashMap::new(),
+            replay: SharedOperatorReplay::new(),
+        }
+    }
+
+    /// Shares one process-retained replay handle across boards built from one
+    /// daemon composition. The handle is a volatile fast path only; durable
+    /// identity stays in Kernel ORS.
+    fn with_shared_replay(
+        snapshot: Arc<ControlBoardGovernorSnapshot>,
+        shared: &SharedOperatorReplay,
+    ) -> Self {
+        Self {
+            snapshot,
+            replay: shared.clone(),
         }
     }
 }
@@ -415,7 +485,10 @@ fn same_operator_binding(stored: &CommandRequest, incoming: &CommandRequest) -> 
 impl OperatorCommandPort for GovernorOperatorCommand {
     fn submit(&mut self, command: &CommandRequest) -> Result<CommandReceipt, PortError> {
         let operation_key = command.operation_id.as_str().to_owned();
-        if let Some((bound, receipt)) = self.replay.get(&operation_key) {
+        // A poisoned replay lock leaves the outcome unknown rather than
+        // inventing an admission or a denial.
+        let mut replay = self.replay.inner.lock().map_err(|_| PortError::Unknown)?;
+        if let Some((bound, receipt)) = replay.get(&operation_key) {
             if same_operator_binding(bound, command) {
                 return Ok(receipt.clone());
             }
@@ -458,8 +531,7 @@ impl OperatorCommandPort for GovernorOperatorCommand {
             observed_revision: command.expected_revision,
             observed_fence: command.expected_fence.clone(),
         };
-        self.replay
-            .insert(operation_key, (command.clone(), receipt.clone()));
+        replay.insert(operation_key, (command.clone(), receipt.clone()));
         Ok(receipt)
     }
 }
@@ -929,7 +1001,8 @@ mod tests {
 
     #[test]
     fn missing_providers_are_typed_gaps_not_empty_views() {
-        let mut board = controlboard_over_snapshot(snapshot());
+        let mut board =
+            controlboard_over_snapshot(snapshot(), &SharedOperatorReplay::new(), Vec::new());
         assert_eq!(
             board.view(&request_for("session-a")),
             Err(ControlBoardError::PlanGap(RequiredProvider::AccessResolver))
@@ -1248,6 +1321,81 @@ mod tests {
         assert_eq!(port.submit(&changed), Err(PortError::IdentityConflict));
         // No state mutation on conflict: the original binding still replays.
         assert_eq!(port.submit(&submitted).expect("replay receipt"), first);
+    }
+
+    fn admitted_start_session(session: &str) -> AdmittedSessionAccess {
+        AdmittedSessionAccess::new(
+            session,
+            format!("{session}-principal"),
+            "scope",
+            Role::HumanRequester,
+            vec![PrivacyClass::Public],
+            vec![ActionCapability::StartQuery],
+            format!("governor-owner:access:{session}"),
+            "e".repeat(64),
+            format!("governor-owner:receipt:{session}"),
+            1_000,
+            1_100,
+            2_000,
+        )
+        .expect("valid session admission")
+    }
+
+    #[test]
+    fn factory_boards_share_replay_without_second_admission() {
+        // #1187 AUD-C03 acceptance 1-3 at eliotd level, built only through
+        // the real factory path: board A admits, a newly created board B
+        // replays the original identity with no second admission, a changed
+        // payload conflicts without mutating anything, and a post-refresh
+        // snapshot with the same handle still replays.
+        let shared = SharedOperatorReplay::new();
+        let mut board_a = controlboard_over_snapshot(
+            snapshot(),
+            &shared,
+            vec![admitted_start_session("session-a")],
+        );
+        let submitted = start_query_for("session-a");
+        let first = board_a
+            .submit(&request_for("session-a"), submitted.clone())
+            .expect("first receipt");
+        assert_eq!(first.disposition, CommandDisposition::Accepted);
+        assert_eq!(shared.admission_count(), 1);
+        drop(board_a);
+        // A newly created board over a post-refresh snapshot (same live
+        // fence/revision) resolves the original identity.
+        let mut board_b = controlboard_over_snapshot(
+            snapshot(),
+            &shared,
+            vec![admitted_start_session("session-a")],
+        );
+        let replayed = board_b
+            .submit(&request_for("session-a"), submitted.clone())
+            .expect("replay receipt");
+        assert_eq!(replayed, first);
+        assert_eq!(
+            shared.admission_count(),
+            1,
+            "replay through a new board must not be a second admission"
+        );
+        // Changed payload under the same operation id conflicts and stores
+        // nothing.
+        let changed = command_for(
+            "session-a",
+            OperatorAction::StartQuery {
+                query_kind: "other-query".to_owned(),
+            },
+        );
+        assert_eq!(
+            board_b.submit(&request_for("session-a"), changed),
+            Err(ControlBoardError::IdentityConflict)
+        );
+        assert_eq!(shared.admission_count(), 1);
+        // The conflict mutated nothing: the original binding still replays.
+        let again = board_b
+            .submit(&request_for("session-a"), submitted)
+            .expect("post-conflict replay");
+        assert_eq!(again, first);
+        assert_eq!(shared.admission_count(), 1);
     }
 
     fn admitted_session(session: &str) -> AdmittedSessionAccess {

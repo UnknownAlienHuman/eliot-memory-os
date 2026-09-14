@@ -18,6 +18,7 @@ use crate::controlboard_projection::{
     ControlBoardGovernorSnapshot, ControlBoardProjectionParts, compile_controlboard_snapshot,
 };
 use crate::observation_reconciliation::GovernorObservationReconciliation;
+use crate::operator_reconciliation::GovernorOperatorReconciliation;
 use crate::owner_projection_refresh::{coherence_result, compare_scope_heads};
 use crate::skill_lifecycle::GovernorSkillLifecycle;
 use crate::{
@@ -1621,6 +1622,25 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
         )
     }
 
+    /// Borrows the single operator-command reconciliation owner as a canonical
+    /// [`GovernorOperatorReconciliation`] adapter.
+    ///
+    /// The adapter reads the canonical admission owner together with the
+    /// retained neutral Kernel port. It creates no per-caller ledger: operator
+    /// admission commits through the existing canonical path and every retry
+    /// reconciles through the Kernel receipt route, so a newly created board
+    /// resolves the original operation identity instead of re-admitting it.
+    /// Publication follows `refresh_from_kernel` at the returned receipt
+    /// revisions.
+    #[must_use]
+    pub fn operator_reconciliation(&self) -> GovernorOperatorReconciliation<'_, P> {
+        GovernorOperatorReconciliation::new(
+            &self.owners.canonical,
+            self.kernel.as_ref(),
+            self.readiness,
+        )
+    }
+
     /// Applies one Canonical-admitted transition through the sole retained
     /// Kernel port under the exact admitted request identity. Callers cannot
     /// provide a second client or bypass Canonical admission with an
@@ -1854,6 +1874,9 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
     /// - The orchestration lifecycle object is retained: re-validated
     ///   observations still satisfy the required-base admission proved at
     ///   construction under the same fence.
+    /// - Operator command replay lives in Kernel ORS behind the receipt route
+    ///   (see `operator_reconciliation`); the refresh swaps Governor owners
+    ///   only and never resets that durable identity.
     pub fn refresh_from_kernel(&mut self) -> Result<(), CompositionError> {
         let observed = self.kernel.snapshot().clone();
         let expected =
@@ -4598,6 +4621,41 @@ mod tests {
             1,
             "retry with a new deadline must not re-execute"
         );
+    }
+
+    #[test]
+    fn operator_borrow_admits_through_the_retained_kernel_port() {
+        let (kernel, composition) = committed_composition();
+        let fence = composition.kernel_snapshot().state_fence();
+        let identity = commit_identity(&fence);
+        let operation_id = OperationId::new("op-operator-borrow").expect("operation id");
+        let envelope = crate::operator_reconciliation::operator_command_envelope(
+            &identity,
+            &operation_id,
+            "session-t1-2",
+            &"a".repeat(64),
+            &"b".repeat(64),
+            1,
+        )
+        .expect("operator envelope");
+        // The composition borrow admits through the retained Kernel port and
+        // stores the operation in Kernel ORS for later receipt reconciliation.
+        let receipt = block_on(
+            composition
+                .operator_reconciliation()
+                .admit_operator_command(&identity, &operation_id, envelope),
+        )
+        .expect("operator admission");
+        assert_eq!(receipt.operation_id, operation_id);
+        assert_eq!(receipt.idempotency_key, identity.idempotency_key);
+        assert_eq!(receipt.transition_class, TransitionClass::CaptureCandidate);
+        assert_eq!(receipt.status, WriteReceiptStatus::Committed);
+        assert_eq!(receipt.state_fence, fence);
+        assert_eq!(*kernel.apply_calls.lock().expect("apply call lock"), 1);
+        let stored = block_on(kernel.receipt(operation_id.clone()))
+            .expect("receipt route")
+            .expect("stored receipt");
+        assert_eq!(stored, receipt);
     }
 
     #[test]

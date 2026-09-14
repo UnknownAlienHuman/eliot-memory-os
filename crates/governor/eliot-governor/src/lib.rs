@@ -36,6 +36,7 @@ mod activation_outcome;
 mod composition;
 mod controlboard_projection;
 mod observation_reconciliation;
+mod operator_reconciliation;
 mod owner_projection_refresh;
 mod skill_lifecycle;
 
@@ -49,6 +50,7 @@ pub use controlboard_projection::{
 /// second canonical dependency path.
 pub use eliot_canonical::CanonicalWriteEnvelope;
 pub use observation_reconciliation::GovernorObservationReconciliation;
+pub use operator_reconciliation::{GovernorOperatorReconciliation, operator_command_envelope};
 pub use skill_lifecycle::GovernorSkillLifecycle;
 
 use std::collections::BTreeMap;
