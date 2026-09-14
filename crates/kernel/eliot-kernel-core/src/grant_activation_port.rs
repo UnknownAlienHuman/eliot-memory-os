@@ -24,7 +24,7 @@
 //!   rejected before mutation.
 //!
 //! The port stores no epoch and reads no clock. The single P-07 epoch owner
-//! supplies its current [`AuthorityEpoch`] on every call and the caller
+//! supplies its current [`EpochId`] on every call and the caller
 //! supplies the observation time for expiry checks, so this adapter can never
 //! fence against a shadow epoch or a stale reading. Only canonical
 //! [`AuthorityActivationReceipt`](eliot_runtime_contracts::AuthorityActivationReceipt)
@@ -38,7 +38,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::{Mutex, MutexGuard};
 
-use eliot_contracts::{AuthorityEpoch, EpochId, canonical_json_bytes, sha256_hex};
+use eliot_contracts::{EpochId, canonical_json_bytes, sha256_hex};
 use eliot_receipts::{AuthorityBinding, EffectClass, ProofCeiling};
 use eliot_runtime_contracts::{
     AuthorityActivationReceipt, AuthorityRevocationReceipt, AuthorityState,
@@ -288,15 +288,14 @@ impl GrantActivationPort {
     /// # Errors
     ///
     /// Returns [`KernelError::IdempotencyConflict`] for a changed payload,
-    /// [`KernelError::StaleEpoch`] for a fenced epoch,
-    /// [`KernelError::FenceMismatch`] for a future epoch or a cross-lineage
-    /// parent or fence, [`KernelError::Expired`] for an expired intent, and
-    /// [`KernelError::InvalidField`] for any other invalid identity,
-    /// revision, binding, ceiling or lineage value.
+    /// [`KernelError::FenceMismatch`] for a stale, future or cross-lineage
+    /// epoch or a cross-lineage parent or fence, [`KernelError::Expired`] for
+    /// an expired intent, and [`KernelError::InvalidField`] for any other
+    /// invalid identity, revision, binding, ceiling or lineage value.
     pub fn activate_grant(
         &self,
         request: &GrantActivationIntent,
-        active_epoch: AuthorityEpoch,
+        active_epoch: EpochId,
         now_ms: i64,
     ) -> Result<AuthorityActivationReceipt, KernelError> {
         let mut ledger = self.lock_ledger();
@@ -309,12 +308,12 @@ impl GrantActivationPort {
             }
             IntentResolve::New => {}
         }
-        validate_grant_activation(request, &ledger, active_epoch, now_ms)?;
+        validate_grant_activation(request, &ledger, &active_epoch, now_ms)?;
         let operation_id = request.operation_id.clone();
         let receipt = AuthorityActivationReceipt {
             activation_id: format!("activation-{operation_id}"),
             snapshot_id: request.snapshot_id.clone(),
-            authority_epoch: active_epoch,
+            authority_epoch: active_epoch.clone(),
             state: AuthorityState::Active,
         };
         receipt.validate()?;
@@ -358,15 +357,14 @@ impl GrantActivationPort {
     /// # Errors
     ///
     /// Returns [`KernelError::IdempotencyConflict`] for a changed payload,
-    /// [`KernelError::StaleEpoch`] for a fenced epoch,
-    /// [`KernelError::FenceMismatch`] for a future epoch or a cross-lineage
-    /// root, and [`KernelError::InvalidField`] for any other invalid
-    /// identity, revision or binding value, including an unknown grant
-    /// identity, which is recorded as reconciling.
+    /// [`KernelError::FenceMismatch`] for a stale, future or cross-lineage
+    /// epoch or a cross-lineage root, and [`KernelError::InvalidField`] for
+    /// any other invalid identity, revision or binding value, including an
+    /// unknown grant identity, which is recorded as reconciling.
     pub fn revoke_grant(
         &self,
         request: &GrantRevocationIntent,
-        active_epoch: AuthorityEpoch,
+        active_epoch: EpochId,
     ) -> Result<AuthorityRevocationReceipt, KernelError> {
         let mut ledger = self.lock_ledger();
         validate_id(&request.operation_id, "operation_id")?;
@@ -389,7 +387,7 @@ impl GrantActivationPort {
             validate_id(operation, "unknown_outcome_operation")?;
             unknown_effects.insert(operation.clone());
         }
-        check_binding(&request.binding, active_epoch)?;
+        check_binding(&request.binding, &active_epoch)?;
         let recorded_root = match ledger.grants.get(&request.grant_id) {
             None => {
                 ledger.intents.insert(
@@ -446,7 +444,7 @@ impl GrantActivationPort {
         let receipt = AuthorityRevocationReceipt {
             revocation_id: format!("revocation-{operation_id}"),
             snapshot_id: request.snapshot_id.clone(),
-            authority_epoch: active_epoch,
+            authority_epoch: active_epoch.clone(),
             state: AuthorityState::Revoked,
         };
         receipt.validate()?;
@@ -480,7 +478,7 @@ impl GrantActivationPort {
     pub fn activate_introduction(
         &self,
         request: &IntroductionActivationIntent,
-        active_epoch: AuthorityEpoch,
+        active_epoch: EpochId,
         now_ms: i64,
     ) -> Result<AuthorityActivationReceipt, KernelError> {
         let mut ledger = self.lock_ledger();
@@ -493,7 +491,7 @@ impl GrantActivationPort {
             }
             IntentResolve::New => {}
         }
-        validate_introduction_activation(request, &ledger, active_epoch, now_ms)?;
+        validate_introduction_activation(request, &ledger, &active_epoch, now_ms)?;
         let mut supporting = BTreeSet::new();
         for id in &request.supporting_grant_ids {
             supporting.insert(id.clone());
@@ -502,7 +500,7 @@ impl GrantActivationPort {
         let receipt = AuthorityActivationReceipt {
             activation_id: format!("activation-{operation_id}"),
             snapshot_id: request.snapshot_id.clone(),
-            authority_epoch: active_epoch,
+            authority_epoch: active_epoch.clone(),
             state: AuthorityState::Active,
         };
         receipt.validate()?;
@@ -543,7 +541,7 @@ impl GrantActivationPort {
     pub fn revoke_introduction(
         &self,
         request: &IntroductionRevocationIntent,
-        active_epoch: AuthorityEpoch,
+        active_epoch: EpochId,
     ) -> Result<AuthorityRevocationReceipt, KernelError> {
         let mut ledger = self.lock_ledger();
         validate_id(&request.operation_id, "operation_id")?;
@@ -566,7 +564,7 @@ impl GrantActivationPort {
             validate_id(operation, "unknown_outcome_operation")?;
             unknown_effects.insert(operation.clone());
         }
-        check_binding(&request.binding, active_epoch)?;
+        check_binding(&request.binding, &active_epoch)?;
         let recorded_root = match ledger.introductions.get(&request.introduction_id) {
             None => {
                 ledger.intents.insert(
@@ -605,7 +603,7 @@ impl GrantActivationPort {
         let receipt = AuthorityRevocationReceipt {
             revocation_id: format!("revocation-{operation_id}"),
             snapshot_id: request.snapshot_id.clone(),
-            authority_epoch: active_epoch,
+            authority_epoch: active_epoch.clone(),
             state: AuthorityState::Revoked,
         };
         receipt.validate()?;
@@ -834,27 +832,20 @@ fn check_revision(
 
 /// Validates the binding owner, fence consistency and epoch currency.
 ///
-/// A binding older than the active epoch is stale; a binding newer than the
-/// active epoch names an unactivated future and fails as a fence mismatch,
-/// mirroring exact route-fence enforcement.
-fn check_binding(
-    binding: &AuthorityBinding,
-    active_epoch: AuthorityEpoch,
-) -> Result<(), KernelError> {
+/// The binding epoch must be the exact lineage-plus-sequence tuple carried by
+/// both the binding fence and the active epoch. Stale, future and
+/// cross-lineage epochs all fail closed as [`KernelError::FenceMismatch`]
+/// without any scalar coercion, mirroring exact route-fence enforcement.
+fn check_binding(binding: &AuthorityBinding, active_epoch: &EpochId) -> Result<(), KernelError> {
     validate_text(&binding.authority_owner, "binding.authority_owner")?;
     binding.state_fence.validate()?;
-    if binding.authority_epoch != binding.state_fence.authority_epoch {
+    if !binding
+        .authority_epoch
+        .is_same_authority(&binding.state_fence.authority_epoch)
+    {
         return Err(KernelError::FenceMismatch);
     }
-    if binding.authority_epoch.value() < active_epoch.value() {
-        return Err(KernelError::StaleEpoch {
-            observed: binding.authority_epoch.value(),
-            active: active_epoch.value(),
-        });
-    }
-    if binding.authority_epoch != active_epoch {
-        return Err(KernelError::FenceMismatch);
-    }
+    check_canonical_epoch_binding(&binding.authority_epoch, active_epoch)?;
     Ok(())
 }
 
@@ -969,7 +960,7 @@ fn descendant_closure(
 fn validate_grant_activation(
     request: &GrantActivationIntent,
     ledger: &PortLedger,
-    active_epoch: AuthorityEpoch,
+    active_epoch: &EpochId,
     now_ms: i64,
 ) -> Result<(), KernelError> {
     validate_id(&request.grant_id, "grant_id")?;
@@ -1038,7 +1029,7 @@ fn validate_grant_activation(
 fn validate_introduction_activation(
     request: &IntroductionActivationIntent,
     ledger: &PortLedger,
-    active_epoch: AuthorityEpoch,
+    active_epoch: &EpochId,
     now_ms: i64,
 ) -> Result<(), KernelError> {
     validate_id(&request.introduction_id, "introduction_id")?;
@@ -1350,15 +1341,21 @@ impl IntroductionRevocationIntent {
 /// Derives the thin-port operation identity for one target/snapshot/epoch.
 ///
 /// Thin requests carry no operation identity, so Slice A binds `(operation
-/// kind, target identity, snapshot identity, binding epoch)`. Exact replay of
+/// kind, target identity, snapshot identity, binding epoch)`. The epoch enters
+/// as the exact canonical `(lineage_id, sequence)` tuple: equal sequences from
+/// different lineages derive distinct identities. Exact replay of
 /// one thin request re-derives the same identity and the rich canonical
 /// digest then matches, returning the same receipt; any other caller-material
 /// change under the derived identity fails as
 /// [`KernelError::IdempotencyConflict`] inside the rich call. An epoch
 /// advance (or a new snapshot) derives a fresh identity, which re-confirms
 /// the fence with a fresh receipt.
-fn thin_operation_id(kind: &str, target_id: &str, snapshot_id: &str, epoch: u64) -> String {
-    format!("p07-{kind}-{target_id}-{snapshot_id}-e{epoch}")
+fn thin_operation_id(kind: &str, target_id: &str, snapshot_id: &str, epoch: &EpochId) -> String {
+    format!(
+        "p07-{kind}-{target_id}-{snapshot_id}-{}-{}",
+        epoch.lineage_id.as_str(),
+        epoch.sequence.get()
+    )
 }
 
 impl eliot_authority::P07AuthorityPort for GrantActivationPort {
@@ -1367,8 +1364,8 @@ impl eliot_authority::P07AuthorityPort for GrantActivationPort {
         request: &eliot_authority::GrantActivationRequest,
     ) -> Result<AuthorityActivationReceipt, eliot_authority::P07PortError> {
         use eliot_authority::P07PortError;
-        let active_epoch = request.binding.authority_epoch;
-        if check_binding(&request.binding, active_epoch).is_err() {
+        let active_epoch = request.binding.authority_epoch.clone();
+        if check_binding(&request.binding, &active_epoch).is_err() {
             // Missing owner: valid caller binding material. The presented
             // binding is internally inconsistent (owner/fence/epoch), and no
             // owner in Slice A repairs caller material; the caller
@@ -1399,7 +1396,7 @@ impl eliot_authority::P07AuthorityPort for GrantActivationPort {
         request: &eliot_authority::GrantRevocationRequest,
     ) -> Result<AuthorityRevocationReceipt, eliot_authority::P07PortError> {
         use eliot_authority::P07PortError;
-        let active_epoch = request.binding.authority_epoch;
+        let active_epoch = request.binding.authority_epoch.clone();
         let rich = {
             let ledger = self.lock_ledger();
             let Some(authority_root_ref) = ledger
@@ -1430,7 +1427,7 @@ impl eliot_authority::P07AuthorityPort for GrantActivationPort {
                     "revoke-grant",
                     request.grant_id.as_str(),
                     request.snapshot_id.as_str(),
-                    active_epoch.value(),
+                    &active_epoch,
                 ),
                 grant_id: request.grant_id.as_str().to_owned(),
                 authority_root_ref,
@@ -1465,8 +1462,8 @@ impl eliot_authority::P07AuthorityPort for GrantActivationPort {
         request: &eliot_authority::IntroductionActivationRequest,
     ) -> Result<AuthorityActivationReceipt, eliot_authority::P07PortError> {
         use eliot_authority::P07PortError;
-        let active_epoch = request.binding.authority_epoch;
-        if check_binding(&request.binding, active_epoch).is_err() {
+        let active_epoch = request.binding.authority_epoch.clone();
+        if check_binding(&request.binding, &active_epoch).is_err() {
             // Missing owner: valid caller binding material. The presented
             // binding is internally inconsistent (owner/fence/epoch), and no
             // owner in Slice A repairs caller material; the caller
@@ -1501,7 +1498,7 @@ impl eliot_authority::P07AuthorityPort for GrantActivationPort {
         request: &eliot_authority::IntroductionRevocationRequest,
     ) -> Result<AuthorityRevocationReceipt, eliot_authority::P07PortError> {
         use eliot_authority::P07PortError;
-        let active_epoch = request.binding.authority_epoch;
+        let active_epoch = request.binding.authority_epoch.clone();
         let rich = {
             let ledger = self.lock_ledger();
             let Some(authority_root_ref) = ledger
@@ -1533,7 +1530,7 @@ impl eliot_authority::P07AuthorityPort for GrantActivationPort {
                     "revoke-introduction",
                     request.introduction_id.as_str(),
                     request.snapshot_id.as_str(),
-                    active_epoch.value(),
+                    &active_epoch,
                 ),
                 introduction_id: request.introduction_id.as_str().to_owned(),
                 authority_root_ref,

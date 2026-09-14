@@ -2,9 +2,9 @@
 
 use eliot_agent_contracts::AgentAttemptId;
 use eliot_contracts::{
-    ArtifactId, AuthorityEpoch, ClockReading, ContractId, OperationId, PolicyRevision, ProductId,
-    RequestId, ResourceGeneration, SourceId, StateFence, TaskId, TaskRevision, TransactionSequence,
-    canonical_json_bytes, sha256_hex,
+    ArtifactId, ClockReading, ContractId, EpochId, EpochLineageId, OperationId, PolicyRevision,
+    ProductId, RequestId, ResourceGeneration, SourceId, StateFence, TaskId, TaskRevision,
+    TransactionSequence, canonical_json_bytes, sha256_hex,
 };
 use eliot_dreamer_contracts::curation::{ClassificationPayload, TargetEvidence};
 use eliot_dreamer_contracts::{
@@ -23,11 +23,23 @@ use eliot_receipts::{
     WorkScopeBinding, WorkScopeId, contract_identity,
 };
 
+use std::num::NonZeroU64;
+
 const PAYLOAD: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+
+const TEST_LINEAGE_A: &str = "550e8400-e29b-41d4-a716-446655440000";
+
+fn test_epoch(sequence: u64) -> EpochId {
+    EpochId::new(
+        EpochLineageId::new(TEST_LINEAGE_A).unwrap(),
+        NonZeroU64::new(sequence).unwrap(),
+    )
+    .unwrap()
+}
 
 fn fence() -> StateFence {
     StateFence {
-        authority_epoch: AuthorityEpoch::genesis(),
+        authority_epoch: test_epoch(1),
         resource_generation: ResourceGeneration::genesis(),
         task_revision: Some(TaskRevision::genesis()),
         policy_revision: Some(PolicyRevision::genesis()),
@@ -244,7 +256,7 @@ fn receipt_with_artifacts(
         authority: AuthorityBinding {
             authority_id: ContractId::new("authority-1").unwrap(),
             authority_owner: request.owner.clone(),
-            authority_epoch: fence.authority_epoch,
+            authority_epoch: fence.authority_epoch.clone(),
             state_fence: fence.clone(),
             allowed_effect: request.effect,
             proof_ceiling: request.proof_ceiling,

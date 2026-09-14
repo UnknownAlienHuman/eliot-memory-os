@@ -696,7 +696,7 @@ pub struct AuthorityActivationReceipt {
     /// Snapshot activated by Kernel.
     pub snapshot_id: String,
     /// Epoch activated.
-    pub authority_epoch: AuthorityEpoch,
+    pub authority_epoch: EpochId,
     /// Activation state.
     pub state: AuthorityState,
 }
@@ -725,7 +725,7 @@ pub struct AuthorityRevocationReceipt {
     /// Snapshot fenced by Kernel.
     pub snapshot_id: String,
     /// Epoch at which revocation took effect.
-    pub authority_epoch: AuthorityEpoch,
+    pub authority_epoch: EpochId,
     /// Revocation state.
     pub state: AuthorityState,
 }
@@ -981,6 +981,19 @@ pub fn contract_identity() -> Result<ContractIdentity, RuntimeContractError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::num::NonZeroU64;
+
+    use eliot_contracts::EpochLineageId;
+
+    fn test_epoch(sequence: u64) -> EpochId {
+        let lineage = EpochLineageId::new("550e8400-e29b-41d4-a716-446655440000")
+            .expect("canonical test lineage-A");
+        EpochId::new(
+            lineage,
+            NonZeroU64::new(sequence).expect("non-zero test sequence"),
+        )
+        .expect("valid test epoch")
+    }
 
     #[test]
     fn process_machine_rejects_skipping_start() {
@@ -1101,7 +1114,7 @@ mod tests {
         let receipt = AuthorityActivationReceipt {
             activation_id: "activation-1".to_owned(),
             snapshot_id: "snapshot-1".to_owned(),
-            authority_epoch: AuthorityEpoch::genesis(),
+            authority_epoch: test_epoch(1),
             state: AuthorityState::PendingKernelActivation,
         };
         assert!(receipt.validate().is_err());

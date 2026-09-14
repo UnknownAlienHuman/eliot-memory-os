@@ -39,6 +39,10 @@ fn test_epoch(sequence: u64) -> EpochId {
     .expect("valid test epoch")
 }
 
+fn epoch_wire() -> serde_json::Value {
+    serde_json::json!({"lineage_id": TEST_LINEAGE_A, "sequence": 1})
+}
+
 type TestCore = WorkerCore<FakeExecutor, FakeAdmission, FakeReplay, FakeReplay>;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1391,7 +1395,7 @@ fn native_case_17_typed_v2_roundtrips_and_sealed_provider_output_matches() {
     let original_hello = hello("connection-17", "request-17");
     let hello_wire = serde_json::to_value(&original_hello).expect("hello wire");
     assert_eq!(hello_wire["protocol_version"], PROTOCOL_VERSION);
-    assert!(hello_wire["authority_epoch"].is_number());
+    assert_eq!(hello_wire["authority_epoch"], epoch_wire());
     assert!(hello_wire["state_fence"].is_object());
     assert_eq!(
         serde_json::from_value::<WorkerHello>(hello_wire).expect("hello roundtrip"),
@@ -1400,7 +1404,7 @@ fn native_case_17_typed_v2_roundtrips_and_sealed_provider_output_matches() {
 
     let original_frame = frame("request-17", WorkerFrameBody::Execute(request(None)));
     let frame_wire = serde_json::to_value(&original_frame).expect("frame wire");
-    assert!(frame_wire["authority_epoch"].is_number());
+    assert_eq!(frame_wire["authority_epoch"], epoch_wire());
     assert!(frame_wire["state_fence"].is_object());
     assert_eq!(
         serde_json::from_value::<WorkerFrame>(frame_wire).expect("frame roundtrip"),
@@ -1418,7 +1422,7 @@ fn native_case_17_typed_v2_roundtrips_and_sealed_provider_output_matches() {
         .cloned()
         .expect("start event");
     let event_wire = serde_json::to_value(&event).expect("event wire");
-    assert!(event_wire["authority_epoch"].is_number());
+    assert_eq!(event_wire["authority_epoch"], epoch_wire());
     assert!(event_wire["state_fence"].is_object());
     assert_eq!(
         serde_json::from_value::<WorkerEventEnvelope>(event_wire).expect("event roundtrip"),
@@ -1435,7 +1439,7 @@ fn native_case_17_typed_v2_roundtrips_and_sealed_provider_output_matches() {
         acknowledged_at_unix_ms: 1_000,
     };
     let ack_wire = serde_json::to_value(&ack).expect("ack wire");
-    assert!(ack_wire["authority_epoch"].is_number());
+    assert_eq!(ack_wire["authority_epoch"], epoch_wire());
     assert!(ack_wire["state_fence"].is_object());
     assert_eq!(
         serde_json::from_value::<EventAckReceipt>(ack_wire).expect("ack roundtrip"),
@@ -1464,7 +1468,7 @@ fn native_case_17_typed_v2_roundtrips_and_sealed_provider_output_matches() {
     assert_eq!(sealed.authority().state_fence, request.hello().state_fence);
     let facts_wire: serde_json::Value =
         serde_json::from_str(&facts_wire).expect("facts JSON object");
-    assert!(facts_wire["authority"]["epoch"].is_number());
+    assert_eq!(facts_wire["authority"]["epoch"], epoch_wire());
     assert!(facts_wire["authority"]["state_fence"].is_object());
     assert_eq!(provider.state.lock().expect("admission lock").admissions, 1);
 }

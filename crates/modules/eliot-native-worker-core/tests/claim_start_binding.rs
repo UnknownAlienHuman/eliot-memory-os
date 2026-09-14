@@ -253,7 +253,7 @@ fn block_on<F: Future>(future: F) -> F::Output {
 fn epoch() -> EpochId {
     load(EpochId::new(
         load(EpochLineageId::new("550e8400-e29b-41d4-a716-446655440000")),
-        load(std::num::NonZeroU64::new(1)),
+        load(std::num::NonZeroU64::new(1).ok_or("non-zero test sequence")),
     ))
 }
 
@@ -480,10 +480,8 @@ fn tamper_epoch(
     claim: NativeWorkerClaim,
 ) -> (NativeWorkerRegistration, NativeWorkerClaim) {
     let other = load(EpochId::new(
-        load(EpochLineageId::new(
-            "550e8400-e29b-41d4-a716-446655440000",
-        )),
-        load(std::num::NonZeroU64::new(2)),
+        load(EpochLineageId::new("550e8400-e29b-41d4-a716-446655440000")),
+        load(std::num::NonZeroU64::new(2).ok_or("non-zero test sequence")),
     ));
     let other_fence = StateFence::new(other.clone(), load(ResourceGeneration::new(1)));
     let mut registration = registration;
