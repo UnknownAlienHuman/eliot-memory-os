@@ -17,13 +17,13 @@ path = "src/main.rs"
 eliot-cli.workspace = true
 eliot-native-worker-core.workspace = true
 eliot-process.workspace = true
+eliot-process-executor.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
 
 [dev-dependencies]
 eliot-contracts.workspace = true
-eliot-process-executor.workspace = true
 
 [lints]
 workspace = true
