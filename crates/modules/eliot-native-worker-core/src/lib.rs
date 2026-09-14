@@ -1175,7 +1175,7 @@ where
             grant.stream_id().to_owned(),
             grant.producer_id().to_owned(),
             grant.worker_generation(),
-            grant.authority().epoch,
+            grant.authority().epoch.clone(),
             request_id.to_owned(),
             causal_predecessor_refs,
             delivery_class,
