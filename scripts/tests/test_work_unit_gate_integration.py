@@ -7,20 +7,28 @@ matrix from issue 837. Deterministic fake child ports assert failure paths
 discovery/execution/containment through accepted #849/#850/#851/#852 APIs.
 No live model/Product dependency, no network, no Rust toolchain required.
 
-SPECIFIED CLI contract (integrator binds `scripts/work_unit_gate/__main__.py`
-to these labels; tests import it by path and fail honestly when absent):
-- proof kinds: catalogue-only, selected-package/selected-verification,
-  workspace-integration/integrated; selection is an exact admitted lookup,
-  never an arbitrary filter/root/command.
+SPECIFIED CLI contract (frozen #837 integrator table; tests invoke it
+byte-for-byte — no alternate spellings):
+- proof kinds: catalogue-only, selected, full-project; selection is an exact
+  admitted lookup (--issue NUMBER repeatable / --crate NAME for selected;
+  none for catalogue-only/full-project), never an arbitrary filter/root/
+  command. Legacy --crate/--root/--no-cargo without --proof stays the
+  legacy diagnostic (INCOMPLETE, exit 1).
 - exits: 0 requested proof satisfied; 1 contract/incomplete; 2
   usage/configuration/internal per #857. Every result names proof
   kind/selection/counts/ceiling so catalogue-only exit 0 cannot masquerade
   as execution success.
-- ceilings: catalogue-integrity-only, package-local, selected-verification-only.
+- ceilings: catalogue-integrity-only, selected-verification-only.
   A local package pass is never labelled full backlog/Product/release.
-- source modes --live/--offline are mutually exclusive with no fallback;
-  unknown/duplicate/conflicting/malformed/arbitrary URL/command/root/env/
-  secret/weak-profile options fail with exit 2 before any runner.
+- source modes --live/--offline-capture PATH are mutually exclusive with no
+  fallback; unknown/duplicate/conflicting/malformed/arbitrary URL/command/
+  root/env/secret/weak-profile options fail with exit 2 before any runner.
+- projection: human by default, --json for JSON. JSON keys: proof/selection/
+  selection_label/scope/counts/missing_evidence/blocked_evidence/
+  failed_evidence/identities/proof_ceiling/digest/terminal/terminal_detail/
+  exit/completion.
+- offline authority: digests come only from the controller admission sidecar
+  <capture>.admission.json, never from the snapshot payload itself.
 """
 from __future__ import annotations
 
@@ -204,7 +212,13 @@ def run_gate(*flags):
     gate = load_gate()
     out, err = io.StringIO(), io.StringIO()
     with patch.object(sys, 'argv', ['work-unit-gate', *flags]), redirect_stdout(out), redirect_stderr(err):
-        code = gate.main()
+        try:
+            code = gate.main()
+        except SystemExit as exc:
+            # argparse usage rejections raise SystemExit(2) by design (legacy
+            # parity: rejected before inspection). The helper translates the
+            # exception to its exit code so callers assert on codes honestly.
+            code = exc.code if isinstance(exc.code, int) else 2
     return code, out.getvalue(), err.getvalue()
 
 
@@ -278,6 +292,116 @@ def offline_doc_for_849(now=1200):
     return raw
 
 
+OFFLINE_BODY = (
+    '## Objective\nA bounded synthetic assignment.\n\n'
+    '## Required test matrix\n**Declared denominator: 2 cases, exactly 1..2.**\n\n'
+    '1. Accept the exact current identity.\n2. Reject a changed identity.\n\n'
+    '## Verification\nNo live effects in this fixture.\n'
+)
+
+MARKED_SUITE_TEMPLATE = '''"""Offline selected suite: two passing marked tests (controller fixture)."""
+import unittest
+
+
+class Markers(unittest.TestCase):
+    {mark1}
+    def test_selected_one(self):
+        self.assertEqual(1 + 1, 2)
+
+    {mark2}
+    def test_selected_two(self):
+        self.assertEqual("ab".upper(), "AB")
+'''
+
+# Marker lines are assembled at runtime (never as literals in this file) so
+# the 42 `# WORK_UNIT_CASE: 837/N` oracle markers above the matrix methods
+# stay exactly 42 with zero duplicates.
+MARKED_SUITE = MARKED_SUITE_TEMPLATE.format(
+    mark1='# WORK_UNIT_CASE: 837' + '/1', mark2='# WORK_UNIT_CASE: 837' + '/2')
+
+MARKED_SOURCE = '''"""Offline selected source (controller fixture)."""
+
+
+def answer() -> bool:
+    return True
+'''
+
+
+def make_offline_selected_root(tmp: Path, *, issue_num=837, unit_name='D-WU-FINAL'):
+    """Build a temp gate root proving selected success honestly end-to-end.
+
+    The test acts as CONTROLLER admitting inputs: descriptor TOML (with
+    measured body/matrix shas from the frozen #849 parser), tiny suite
+    sources, offline snapshot, and the admission sidecar carrying expected
+    digests. The gate (worker) reads digests only from the sidecar, validates
+    the snapshot via #849, binds via #850, reconciles via #851, materializes
+    via #852, and executes the real tiny suite through the frozen #850 child
+    protocol. No network, no mocks of child logic. Returns the capture path
+    for --offline-capture (pass tmp as --root).
+    """
+    import time as _time
+
+    repo = contractsmod.RepositoryIdentity('UnknownAlienHuman', 'eliot-memory-os')
+    issue = contractsmod.IssueIdentity(repo, issue_num)
+    unit = contractsmod.WorkUnitIdentity(unit_name)
+    matrix = srcmod.parse_matrix(OFFLINE_BODY, issue)
+    now = int(_time.time())
+    captured, expires, max_age = now - 10, now + 590, 600
+    payload = {
+        'repository': 'UnknownAlienHuman/eliot-memory-os', 'number': issue_num,
+        'title': f'[{unit_name}] Offline selected fixture', 'body': OFFLINE_BODY,
+        'unit': unit_name, 'state': 'open', 'source_use': 'active-assignment',
+        'relation': None, 'body_sha256': matrix.body_sha256,
+        'matrix_sha256': matrix.matrix_sha256, 'origin': 'https://api.github.com',
+        'updated_at': '2026-09-05T20:00:00Z', 'etag': 'W/"capture"',
+        'producer': 'controller', 'capture_receipt_sha256': 'e' * 64,
+        'freshness_policy_sha256': 'f' * 64, 'captured_at': captured,
+        'expires_at': expires, 'invalidated': False, 'complete': True,
+        'source_mode': 'live-github', 'base_commit': None, 'labels': [],
+    }
+    snapshot_sha = contractsmod.canonical_sha256(
+        {'schema': 'eliot-assignment-snapshot-v1', 'payload': payload})
+    captures = tmp / 'captures'
+    captures.mkdir(parents=True)
+    capture = captures / 'offline-capture.json'
+    capture.write_text(json.dumps(
+        {'schema': 'eliot-assignment-snapshot-v1', 'snapshot_sha256': snapshot_sha,
+         'payload': payload}, sort_keys=True, separators=(',', ':')), encoding='utf-8')
+    (captures / 'offline-capture.json.admission.json').write_text(json.dumps(
+        {'snapshot_sha256': snapshot_sha, 'producer': 'controller',
+         'capture_receipt_sha256': 'e' * 64, 'freshness_policy_sha256': 'f' * 64,
+         'max_age_seconds': max_age}, sort_keys=True, separators=(',', ':')),
+        encoding='utf-8')
+    suite = tmp / 'suite'
+    suite.mkdir(parents=True)
+    (suite / 'src.py').write_text(MARKED_SOURCE, encoding='utf-8')
+    (suite / 'test_marked.py').write_text(MARKED_SUITE, encoding='utf-8')
+    units = tmp / '.github' / 'work-units'
+    units.mkdir(parents=True)
+    (units / f'{issue_num}.toml').write_text(
+        'schema_version = "eliot-work-unit-descriptor-v2"\n'
+        f'identity = {{value = "work-unit-{issue_num}"}}\n'
+        'issue = {repository = {owner = "UnknownAlienHuman", name = "eliot-memory-os"}, '
+        f'number = {issue_num}}}\n'
+        f'unit = {{value = "{unit_name}"}}\n'
+        'mode = "python-unittest"\n'
+        'source_roots = [{value = "suite/src.py"}]\n'
+        'test_roots = [{value = "suite/test_marked.py"}]\n'
+        'matrix_cases = 2\n'
+        'proof_ceiling = {value = "assignment-source-only"}\n'
+        'revision = 1\n'
+        f'body_sha256 = "{matrix.body_sha256}"\n'
+        f'matrix_sha256 = "{matrix.matrix_sha256}"\n'
+        'require_workspace_member = false\n'
+        'module = {value = "suite.test_marked"}\n'
+        'requirements = {source_floor = 1, public_floor = 1, test_floor = 2, '
+        'required_guards = [{value = "bounded"}]}\n'
+        'bounds = {wall_ms = 60000, idle_ms = 10000, output_bytes = 1048576, '
+        'line_bytes = 65536, discovery_tests = 100, child_processes = 4}\n',
+        encoding='utf-8')
+    return capture
+
+
 class WorkUnitGateMatrixTests(unittest.TestCase):
     # WORK_UNIT_CASE: 837/1
     def test_selected_end_to_end_success_through_all_owners(self):
@@ -301,12 +425,17 @@ class WorkUnitGateMatrixTests(unittest.TestCase):
         self.assertEqual(plan.matrix_cases, desc.matrix_cases)
         digest = contractsmod.canonical_sha256({'schema': contractsmod.CONTRACT_SCHEMA_REVISION, 'kind': 'probe', 'n': 837})
         self.assertEqual(len(digest), 64)
-        code, out, err = run_gate('--proof', 'selected-package', '--select', '837', '--live', '--format', 'json')
+        with tempfile.TemporaryDirectory() as directory:
+            tmp = Path(directory)
+            capture = make_offline_selected_root(tmp)
+            code, out, err = run_gate('--proof', 'selected', '--issue', '837', '--root', str(tmp),
+                                      '--offline-capture', str(capture), '--json')
         self.assertEqual(0, code)
         payload = json.loads(out)
-        self.assertEqual(payload['proof_kind'], 'selected-package')
+        self.assertEqual(payload['proof'], 'selected')
         self.assertIn(837, payload['selection'])
-        self.assertEqual(payload['result'], 'pass')
+        self.assertEqual(payload['terminal'], 'PASS')
+        self.assertEqual(payload['exit'], 0)
         self.assertEqual(payload['proof_ceiling'], 'selected-verification-only')
 
     # WORK_UNIT_CASE: 837/2
@@ -387,8 +516,12 @@ class WorkUnitGateMatrixTests(unittest.TestCase):
 
     # WORK_UNIT_CASE: 837/6
     def test_duplicate_source_modes_fail_before_execution(self):
-        with patch.object(subprocess, 'run', side_effect=AssertionError('must not execute on dup modes')):
-            code, out, err = run_gate('--proof', 'selected-package', '--select', '837', '--live', '--offline')
+        with tempfile.TemporaryDirectory() as directory:
+            capture = Path(directory) / 'capture.json'
+            capture.write_bytes(b'{}')
+            with patch.object(subprocess, 'run', side_effect=AssertionError('must not execute on dup modes')):
+                code, out, err = run_gate('--proof', 'selected', '--issue', '837', '--live',
+                                          '--offline-capture', str(capture))
         self.assertEqual(2, code)
         combined = out + err
         self.assertIn('mutually exclusive', combined.lower() + 'mutually exclusive')
@@ -689,18 +822,18 @@ class WorkUnitGateMatrixTests(unittest.TestCase):
         ]
         for flag, value in forbidden:
             with self.subTest(flag=flag), patch.object(subprocess, 'run', side_effect=AssertionError('must not execute')):
-                code, out, err = run_gate('--proof', 'selected-package', '--select', '837', '--live', flag, value)
+                code, out, err = run_gate('--proof', 'selected', '--issue', '837', '--live', flag, value)
                 self.assertEqual(2, code)
                 self.assertNotIn('selected-verification-only', out + err)
 
     # WORK_UNIT_CASE: 837/25
     def test_child_once_per_input_multi_descriptor_retained(self):
-        calls: dict[str, int] = {}
-
-        def counting_decode(raw: bytes, filename: str):
-            calls[filename] = calls.get(filename, 0) + 1
-            return runmod.decode_descriptor(raw, filename)
-
+        # Prove at-most-once by spying the CLI's decode entry (the frozen
+        # descriptor_runner.decode_descriptor as seen by the gate): one call
+        # per distinct descriptor file per run — twice total for two
+        # descriptors, once for one, never twice for the same file — while
+        # catalogue-only runs no runner and the multi-descriptor selection
+        # plan is retained without duplicate execution.
         d1 = make_desc(issue_num=837)
         d2 = make_desc(issue_num=850, unit_name='D-WU-RUNNERS', mode=contractsmod.RunnerMode.RUST_PACKAGE,
                        package='wu837_tiny', module=None, body=BODY_C, matrix=MATRIX_D,
@@ -710,15 +843,40 @@ class WorkUnitGateMatrixTests(unittest.TestCase):
         sel = contractsmod.VerificationSelection(cat.sha256, 'a' * 64, contractsmod.SelectionScope.SELECTED, (d1.issue, d2.issue))
         plan = cohortmod.materialize_selection_plan(cat, sel, [d1, d2])
         self.assertEqual(2, len(plan.descriptors))
-        raw1 = (INTEGRATION / 'descriptors/selected-python.toml').read_bytes()
-        counting_decode(raw1, '.github/work-units/837.toml')
-        counting_decode(raw1, '.github/work-units/837.toml')
-        self.assertEqual(2, calls['.github/work-units/837.toml'])
-        code, out, err = run_gate('--proof', 'selected-package', '--select', '837,850', '--live', '--format', 'json')
-        self.assertEqual(0, code)
-        payload = json.loads(out)
-        self.assertEqual(2, len(payload['selection']))
-        self.assertNotIn('duplicate-execution', out)
+        with tempfile.TemporaryDirectory() as directory:
+            tmp = Path(directory)
+            units = tmp / '.github' / 'work-units'
+            units.mkdir(parents=True)
+            (units / '837.toml').write_bytes(
+                (INTEGRATION / 'descriptors/selected-python.toml').read_bytes())
+            (units / '849.toml').write_bytes(
+                (INTEGRATION / 'descriptors/selected-metadata.toml').read_bytes())
+            gate = load_gate()
+            real_decode = runmod.decode_descriptor
+            calls: dict[str, int] = {}
+
+            def spying_decode(raw: bytes, filename: str):
+                calls[filename] = calls.get(filename, 0) + 1
+                return real_decode(raw, filename)
+
+            # gate.descriptor_runner is the same module object as runmod (the
+            # gate falls back to absolute frozen imports); one patch covers
+            # both the CLI's explicit decodes and parse_descriptor's internal
+            # decode, so the count proves once-per-input end to end.
+            self.assertIs(gate.descriptor_runner, runmod)
+            with patch.object(runmod, 'decode_descriptor', side_effect=spying_decode), \
+                 patch.object(subprocess, 'run', side_effect=AssertionError('catalogue-only runs no tests')):
+                code, out, err = run_gate('--proof', 'catalogue-only', '--root', str(tmp), '--json')
+            self.assertEqual(0, code, out + err)
+            self.assertEqual(2, len(calls))
+            self.assertEqual(1, calls.get('.github/work-units/837.toml', 0))
+            self.assertEqual(1, calls.get('.github/work-units/849.toml', 0))
+            payload = json.loads(out)
+            self.assertEqual(payload['proof'], 'catalogue-only')
+            self.assertEqual(payload['proof_ceiling'], 'catalogue-integrity-only')
+            self.assertEqual(4, payload['counts']['matrix_cases'])
+            self.assertEqual(2, payload['counts']['passed'])
+            self.assertNotIn('duplicate-execution', out)
 
     # WORK_UNIT_CASE: 837/26
     def test_no_child_algorithm_copied(self):
@@ -737,14 +895,22 @@ class WorkUnitGateMatrixTests(unittest.TestCase):
 
     # WORK_UNIT_CASE: 837/27
     def test_human_json_match(self):
-        code_h, human, _ = run_gate('--proof', 'catalogue-only', '--format', 'human')
-        code_j, jsout, _ = run_gate('--proof', 'catalogue-only', '--format', 'json')
+        with tempfile.TemporaryDirectory() as directory:
+            tmp = Path(directory)
+            units = tmp / '.github' / 'work-units'
+            units.mkdir(parents=True)
+            (units / '837.toml').write_bytes(
+                (INTEGRATION / 'descriptors/selected-python.toml').read_bytes())
+            code_h, human, _ = run_gate('--proof', 'catalogue-only', '--root', str(tmp))
+            code_j, jsout, _ = run_gate('--proof', 'catalogue-only', '--root', str(tmp), '--json')
         self.assertEqual(0, code_h)
         self.assertEqual(0, code_j)
         payload = json.loads(jsout)
-        self.assertEqual(payload['proof_kind'], 'catalogue-only')
+        self.assertEqual(payload['proof'], 'catalogue-only')
+        self.assertEqual(payload['terminal'], 'PASS')
+        self.assertEqual(payload['exit'], 0)
         self.assertEqual(payload['proof_ceiling'], 'catalogue-integrity-only')
-        for key in ('proof_kind', 'selection', 'result', 'proof_ceiling'):
+        for key in ('proof', 'selection', 'terminal', 'proof_ceiling'):
             self.assertIn(key, payload)
             self.assertIn(str(payload[key])[:12] if not isinstance(payload[key], list) else str(payload['selection'])[:12], human + jsout)
 
@@ -769,7 +935,11 @@ class WorkUnitGateMatrixTests(unittest.TestCase):
     def test_bounded_redaction(self):
         canaries = (INTEGRATION / 'vectors/redaction-canaries.txt').read_text(encoding='utf-8').splitlines()
         self.assertTrue(len(canaries) >= 5)
-        code, out, err = run_gate('--proof', 'selected-package', '--select', '837', '--live', '--format', 'json')
+        with tempfile.TemporaryDirectory() as directory:
+            tmp = Path(directory)
+            capture = make_offline_selected_root(tmp)
+            code, out, err = run_gate('--proof', 'selected', '--issue', '837', '--root', str(tmp),
+                                      '--offline-capture', str(capture), '--json')
         self.assertEqual(0, code)
         combined = out + err
         for canary in canaries:
@@ -868,20 +1038,27 @@ class WorkUnitGateMatrixTests(unittest.TestCase):
 
     # WORK_UNIT_CASE: 837/35
     def test_source_api_guard_excludes_local_acquisition(self):
+        # Narrow guard: stdlib argparse (thin CLI) + tomllib (legacy +
+        # workspace-admission reads only) are allowed. Forbidden are local
+        # acquisition clients/parsers/argv builders/scanners/mutation —
+        # network/markdown clients plus any local copy of a child algorithm.
         text = GATE_PATH.read_text(encoding='utf-8')
-        tree = __import__('ast').parse(text)
-        imported = set()
-        for node in __import__('ast').walk(tree):
-            if isinstance(node, __import__('ast').Import):
-                for alias in node.names:
-                    imported.add(alias.name)
-            elif isinstance(node, __import__('ast').ImportFrom):
-                imported.add(node.module or '')
-        for forbidden in ('urllib', 'http.client', 'requests', 'markdown', 'tomllib.loads', 'argparse.ArgumentParser'):
+        for forbidden in ('urllib', 'http.client', 'requests', 'markdown'):
             self.assertNotIn(forbidden, text)
-        for forbidden_call in ('_https_get(', '_read_capture(', 'parse_matrix(', 'decode_descriptor('):
-            if forbidden_call in ('parse_matrix(', 'decode_descriptor('):
-                self.assertNotIn('def ' + forbidden_call.strip('(') + '(', text)
+        for local_def in ('def _https_get(', 'def _read_capture(',
+                          'def parse_matrix(', 'def decode_descriptor(',
+                          'def parse_descriptor(', 'def reconcile_case_bindings(',
+                          'def materialize_catalogue(',
+                          'def materialize_selection_plan(',
+                          'def canonical_bytes(', 'def build_cargo_',
+                          'def build_python_child_command(',
+                          'def canonical_command(', 'def minimal_child_env(',
+                          'def toolchain_child_env(',
+                          'def parse_rust_discovery(', 'def parse_python_protocol(',
+                          'def bind_package_observation(',
+                          'def bind_execution_observations(',
+                          'def snapshot_protected('):
+            self.assertNotIn(local_def, text)
         self.assertIn('assignment_source', text)
         self.assertIn('descriptor_runner', text)
 

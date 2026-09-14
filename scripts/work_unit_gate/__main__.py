@@ -95,6 +95,20 @@ FROZEN_LEAF_ROUTER_SHA256 = {
 
 PROOF_CHOICES = ("catalogue-only", "selected", "full-project")
 
+# Frozen CLI contract (#837 D-WU-FINAL, integrator-frozen; byte-for-byte).
+# Proof kinds: catalogue-only | selected | full-project (validated before
+# effects). Selector: --issue NUMBER (repeatable, distinct values) xor --crate
+# NAME (closed lookup, unambiguous package) for selected; none for
+# catalogue-only/full-project. Source mode: --live xor --offline-capture PATH
+# (explicit, mutually exclusive, no fallback) required for
+# selected/full-project, forbidden for catalogue-only. Projection: human by
+# default, --json for JSON. JSON keys: proof/selection/selection_label/scope/
+# counts/missing_evidence/blocked_evidence/failed_evidence/identities/
+# proof_ceiling/digest/terminal/terminal_detail/exit/completion. Exits per
+# #857: 0 requested proof satisfied, 1 contract/incomplete, 2 usage/config.
+# Offline authority: digests come only from the controller admission sidecar
+# <capture>.admission.json, never from the snapshot payload being validated.
+
 # Redaction: protected content + credential canaries. Values never appear in
 # diagnostics; only redacted codes are emitted.
 _CANARY_PATTERNS = (
@@ -378,11 +392,20 @@ def _resolve_root(raw: str) -> tuple[Path | None, int | None]:
     return root, None
 
 
-def _selected_unit_for_crate(crate: str) -> str:
-    # Closed lookup helper: crate package name maps to unit only through the
-    # catalogue/descriptor binding validated later. NoContrived mapping here;
-    # mismatch surfaces as selection failure (exit 1), never guessed.
-    return crate
+def _selected_unit_for_crate(crate: str, decoded: dict[int, dict]) -> int | None:
+    # Closed lookup derived from the decoded plan/selection catalogue (never
+    # an echo, never guessed): exactly one package-name match yields its
+    # issue number; zero or several matches yield None (caller fails closed
+    # as unknown/ambiguous selection). Binding is validated later via
+    # parse_descriptor + materialize_selection_plan.
+    matches = [
+        num for num, data in decoded.items()
+        if isinstance(data, dict) and isinstance(data.get("package"), dict)
+        and data["package"].get("name") == crate
+    ]
+    if len(matches) != 1:
+        return None
+    return matches[0]
 
 
 def _result_digest(proof: str, selection: list[int], counts: dict, ceiling: str) -> str:
@@ -745,50 +768,49 @@ def main(argv: list[str] | None = None) -> int:
             return finish(fail_result("missing selected implementation: no descriptors", 1,
                                       missing=["descriptors"]))
 
-        # Resolve selected numbers (crate via closed catalogue lookup).
-        if selection_numbers:
-            wanted = set(selection_numbers)
-        elif args.crate is not None:
-            # Unambiguous package lookup against discovered descriptors'
-            # identities is validated below; ambiguity or absence fails.
-            wanted = set()
-            crate_name = _selected_unit_for_crate(args.crate)
-            # Defer exact match until descriptors are decoded (no guessing).
-            wanted_crate = crate_name
-        else:
-            wanted = set()
-            wanted_crate = None  # type: ignore[assignment]
-        if proof == "full-project":
-            wanted = {num for num, _ in discovered_all}
-            wanted_crate = None
-
-        # For crate selection, decode all once to find unambiguous package.
+        # Resolve selected numbers (crate via closed catalogue lookup derived
+        # from the decoded plan/selection, never echoed or guessed).
         decoded_all: dict[int, dict] = {}
+        raw_all: dict[int, bytes] = {}
         if args.crate is not None and proof == "selected":
+            # Crate lookup peek uses the frozen strict cohort decoder only
+            # (TOML shape + filename binding, no acquisition/binding claim).
+            # Binding stays exclusively in parse_descriptor below, so each
+            # file undergoes decode_descriptor at most once per run.
             for num, path in discovered_all:
                 try:
                     raw0 = path.read_bytes()
                 except OSError:
                     continue
                 try:
-                    d0 = descriptor_runner.decode_descriptor(raw0, f".github/work-units/{num}.toml")
+                    d0 = cohort.decode_cohort_descriptor(raw0, f".github/work-units/{num}.toml")
                 except Exception:
                     continue
                 if type(d0) is not dict:
                     _emit_error("error: malformed descriptor return; bounded non-success")
                     return finish(fail_result("malformed child return", 2))
                 decoded_all[num] = d0
-            matches = []
-            for num, d0 in decoded_all.items():
-                pkg = d0.get("package")
-                pkg_name = pkg.get("name") if isinstance(pkg, dict) else None
-                if pkg_name == args.crate:
-                    matches.append(num)
-            if len(matches) != 1:
-                return finish(fail_result("selection ambiguous or unknown package", 2 if not matches else 1,
-                                          missing=[f"package:{args.crate}"] if not matches else [],
-                                          failed=[f"package:{args.crate}"] if matches else []))
-            wanted = set(matches)
+                raw_all[num] = raw0
+            assert args.crate is not None
+            match = _selected_unit_for_crate(args.crate, decoded_all)
+            if match is None:
+                multi = sum(
+                    1 for d0 in decoded_all.values()
+                    if isinstance(d0, dict) and isinstance(d0.get("package"), dict)
+                    and d0["package"].get("name") == args.crate
+                )
+                if multi > 1:
+                    return finish(fail_result("selection ambiguous or unknown package", 1,
+                                              failed=[f"package:{args.crate}"]))
+                return finish(fail_result("selection ambiguous or unknown package", 2,
+                                          missing=[f"package:{args.crate}"]))
+            wanted = {match}
+        elif selection_numbers:
+            wanted = set(selection_numbers)
+        else:
+            wanted = set()
+        if proof == "full-project":
+            wanted = {num for num, _ in discovered_all}
 
         if proof == "selected" and not wanted:
             return finish(fail_result("selection missing: unknown or ambiguous selector", 1,
@@ -815,48 +837,52 @@ def main(argv: list[str] | None = None) -> int:
             if num in memo_assignment and num in memo_descriptor:
                 bound_descs[num] = memo_descriptor[num]
                 continue
-            # Need unit for SourceRequest: decode header once (memoized) without
-            # extra child calls beyond the single decode already planned for
-            # catalogue? To keep decode once per file, derive unit from the
-            # subsequent parse input itself: read raw now, parse once (parse
-            # internally decodes once). No separate decode for selected.
+            # Identity peek via the frozen strict cohort decoder only (no local
+            # TOML parsing, no Markdown/marker/runner handling): it validates
+            # TOML shape + filename binding without claiming acquisition
+            # authority. Binding remains exclusively in parse_descriptor below,
+            # which performs the single decode_descriptor for this file.
+            # Crate selections reuse the lookup bytes/dict (no re-read).
+            if num in raw_all and num in decoded_all:
+                raw_sel = raw_all[num]
+                peek = decoded_all[num]
+            else:
+                try:
+                    raw_sel = selected_files[num].read_bytes()
+                except OSError:
+                    return finish(fail_result(f"missing selected implementation: issue-{num}", 1,
+                                              missing=[f"issue-{num}"]))
+                try:
+                    peek = cohort.decode_cohort_descriptor(raw_sel, f".github/work-units/{num}.toml")
+                except cohort.CohortError:
+                    return finish(fail_result(f"contract failure: descriptor unreadable issue-{num}", 1,
+                                              failed=[f"issue-{num}"]))
+                except Exception:
+                    return finish(fail_result("descriptor internal failure", 2))
+                if type(peek) is not dict:
+                    return finish(fail_result("malformed child return: descriptor peek", 2))
             try:
-                raw_sel = selected_files[num].read_bytes()
-            except OSError:
-                return finish(fail_result(f"missing selected implementation: issue-{num}", 1,
-                                          missing=[f"issue-{num}"]))
-            # Minimal header peek for unit without calling child parsers:
-            # decode is the frozen validator; parse needs assignment which needs
-            # unit. Break the cycle by decoding once here and reusing the same
-            # raw for parse (parse will decode again internally, but our direct
-            # decode below is the single catalogue/execution decode for this
-            # file only when catalogue later reuses bound, not unbound).
-            # To keep exactly one decode per file, do NOT decode here for unit;
-            # instead require unit via closed crate/issue mapping validated by
-            # parse binding itself. Unit is taken from the raw TOML header via
-            # a bounded text scan that never parses Markdown/markers/runners.
-            try:
-                text_head = raw_sel[:8192].decode("utf-8", errors="strict")
-            except Exception:
-                return finish(fail_result(f"contract failure: descriptor unreadable issue-{num}", 1,
-                                          failed=[f"issue-{num}"]))
-            m_unit = re.search(r"^\s*unit\s*=\s*\{[^}]*value\s*=\s*\"([^\"]+)\"", text_head, re.M)
-            if not m_unit:
-                return finish(fail_result(f"contract failure: descriptor unit missing issue-{num}", 1,
-                                          failed=[f"issue-{num}"]))
-            try:
-                unit = c.WorkUnitIdentity(m_unit.group(1))
+                unit_raw = peek.get("unit")
+                unit_value = unit_raw.get("value") if isinstance(unit_raw, dict) else None
+                if not isinstance(unit_value, str):
+                    raise c.ContractViolation("descriptor unit missing")
+                unit = c.WorkUnitIdentity(unit_value)
             except c.ContractViolation:
                 return finish(fail_result(f"contract failure: descriptor unit invalid issue-{num}", 1,
                                           failed=[f"issue-{num}"]))
-            # Repository for issue identity: fixed to this repository (closed).
-            # Derive owner/name from git remote? No network. Use the canonical
-            # test repository when raw header names it, else fail closed.
-            m_owner = re.search(r"owner\s*=\s*\"([^\"]+)\"", text_head)
-            m_name = re.search(r"(?<![A-Za-z0-9_\-])name\s*=\s*\"([^\"]+)\"", text_head)
+            except Exception:
+                return finish(fail_result("descriptor internal failure", 2))
+            # Repository identity from the same frozen-decoded mapping
+            # (closed; no git/network lookup). Mismatch with the acquired
+            # receipt fails closed at parse_descriptor binding.
             try:
-                repo = c.RepositoryIdentity(m_owner.group(1) if m_owner else "UnknownAlienHuman",
-                                            m_name.group(1) if m_name else "eliot-memory-os")
+                issue_raw = peek.get("issue", {})
+                repo_raw = issue_raw.get("repository", {}) if isinstance(issue_raw, dict) else {}
+                owner_raw = repo_raw.get("owner") if isinstance(repo_raw, dict) else None
+                name_raw = repo_raw.get("name") if isinstance(repo_raw, dict) else None
+                if not isinstance(owner_raw, str) or not isinstance(name_raw, str):
+                    raise c.ContractViolation("issue identity missing")
+                repo = c.RepositoryIdentity(owner_raw, name_raw)
                 issue_id = c.IssueIdentity(repo, num)
             except c.ContractViolation:
                 return finish(fail_result(f"contract failure: issue identity invalid issue-{num}", 1,
@@ -872,33 +898,49 @@ def main(argv: list[str] | None = None) -> int:
                                           failed=[f"issue-{num}"]))
             except Exception:
                 return finish(fail_result("internal failure: source request", 2))
-            # Offline trusted capture: controller-admitted path only. Expected
-            # digests come from the snapshot payload validated by #849 itself;
-            # CLI never invents authority, only admits the explicit path.
+            # Offline trusted capture: controller-admitted config ONLY. Expected
+            # digests come from the admission sidecar <capture>.admission.json
+            # (same directory, fixed suffix derived from the admitted path —
+            # never from the snapshot payload being validated). #849 validates
+            # the snapshot bytes against this config; worker self-trust would
+            # always agree with itself and is never accepted.
             offline_cfg = None
             if mode is c.SourceAuthority.EXPLICIT_OFFLINE_SNAPSHOT:
                 assert offline_path is not None
                 try:
                     import json as _json
 
-                    snap_raw = offline_path.read_bytes()
-                    if len(snap_raw) > 1_048_576:
-                        return finish(fail_result("offline failure: snapshot too large", 1,
+                    sidecar = offline_path.with_name(offline_path.name + ".admission.json")
+                    try:
+                        admission_raw = sidecar.read_bytes()
+                    except OSError:
+                        return finish(fail_result("offline failure: capture not admitted", 1,
                                                   failed=[f"issue-{num}"]))
-                    snap_doc = _json.loads(snap_raw.decode("utf-8"))
-                    payload = snap_doc.get("payload", {}) if isinstance(snap_doc, dict) else {}
-                    # Admit only the explicit path; digests are validated by
-                    # #849 against the actual bytes (no worker self-trust beyond
-                    # the explicit controller path).
-                    snap_sha = snap_doc.get("snapshot_sha256") if isinstance(snap_doc, dict) else None
-                    prod_raw = payload.get("producer") if isinstance(payload, dict) else None
-                    cap_raw = payload.get("capture_receipt_sha256") if isinstance(payload, dict) else None
-                    fresh_raw = payload.get("freshness_policy_sha256") if isinstance(payload, dict) else None
-                    if not (isinstance(snap_sha, str) and isinstance(cap_raw, str) and isinstance(fresh_raw, str)):
-                        return finish(fail_result("offline failure: snapshot malformed", 1,
+                    if len(admission_raw) > 65536:
+                        return finish(fail_result("offline failure: capture not admitted", 1,
                                                   failed=[f"issue-{num}"]))
                     try:
-                        producer = c.WorkUnitIdentity(prod_raw) if isinstance(prod_raw, str) else unit
+                        admission = _json.loads(admission_raw.decode("utf-8"))
+                    except Exception:
+                        return finish(fail_result("offline failure: capture not admitted", 1,
+                                                  failed=[f"issue-{num}"]))
+                    if type(admission) is not dict:
+                        return finish(fail_result("offline failure: capture not admitted", 1,
+                                                  failed=[f"issue-{num}"]))
+                    snap_sha = admission.get("snapshot_sha256")
+                    prod_raw = admission.get("producer")
+                    cap_raw = admission.get("capture_receipt_sha256")
+                    fresh_raw = admission.get("freshness_policy_sha256")
+                    max_age_raw = admission.get("max_age_seconds", 86400)
+                    if not (isinstance(snap_sha, str) and isinstance(prod_raw, str)
+                            and isinstance(cap_raw, str) and isinstance(fresh_raw, str)):
+                        return finish(fail_result("offline failure: capture not admitted", 1,
+                                                  failed=[f"issue-{num}"]))
+                    if type(max_age_raw) is not int or not 1 <= max_age_raw <= 86400:
+                        return finish(fail_result("offline failure: capture not admitted", 1,
+                                                  failed=[f"issue-{num}"]))
+                    try:
+                        producer = c.WorkUnitIdentity(prod_raw)
                     except c.ContractViolation:
                         return finish(fail_result("offline failure: producer invalid", 1,
                                                   failed=[f"issue-{num}"]))
@@ -906,7 +948,7 @@ def main(argv: list[str] | None = None) -> int:
                         offline_cfg = assignment_source.TrustedOfflineCapture(
                             request=request, path=offline_path, snapshot_sha256=snap_sha,
                             producer=producer, capture_receipt_sha256=cap_raw,
-                            freshness_policy_sha256=fresh_raw, max_age_seconds=86400)
+                            freshness_policy_sha256=fresh_raw, max_age_seconds=max_age_raw)
                     except assignment_source.SourceError:
                         return finish(fail_result("offline failure: capture not admitted", 1,
                                                   failed=[f"issue-{num}"]))
@@ -1115,45 +1157,44 @@ def main(argv: list[str] | None = None) -> int:
             # stays incomplete. Never fabricate Rust membership for non-Rust.
             try:
                 if d.require_workspace_member or d.mode is c.RunnerMode.RUST_PACKAGE:
-                    # Resolve via frozen package binding against observed
-                    # workspace members derived from the repo Cargo.toml when
-                    # present; unavailable/unknown fails closed (no guessing).
+                    # Closed workspace observation only: the root manifest via
+                    # stdlib tomllib (workspace-admission use, never
+                    # descriptors/markers/runners) plus the single closed
+                    # root-manifest path. No rglob discovery, no substring
+                    # matching, no guessing: a package whose manifest is not
+                    # the closed root manifest is unobservable here and stays
+                    # UNAVAILABLE (incomplete, never fabricated membership).
+                    # Membership-required callers thus stay incomplete without
+                    # observed membership; package-local excluded/standalone
+                    # roots can still bind through the frozen resolver.
                     ws_disposition = c.WorkspaceDisposition.UNAVAILABLE
                     ws_result = c.OverallResult.INCOMPLETE_EVIDENCE
                     if d.package is not None:
                         try:
-                            cargo_root = (root / "Cargo.toml").read_bytes().decode("utf-8", errors="strict") if (root / "Cargo.toml").is_file() else ""
-                        except Exception:
-                            cargo_root = ""
-                        # Closed membership check without new parsers: exact
-                        # member-name substring in workspace members section is
-                        # insufficient alone, so require exact quoted member path
-                        # containing the package via manifest lookup below.
-                        # Fall back to UNAVAILABLE (incomplete) when unproven.
-                        manifest_rel = None
-                        member_kind = "unavailable"
-                        try:
-                            meta_entries: list = []
-                            # Derive member list from workspace Cargo.toml members
-                            # via stdlib toml (workspace check only, never for
-                            # descriptors/markers/runners).
                             try:
-                                ws_doc = tomllib.loads(cargo_root.encode("utf-8")) if cargo_root else {}
-                                members = ws_doc.get("workspace", {}).get("members", []) if isinstance(ws_doc, dict) else []
-                                exclude = ws_doc.get("workspace", {}).get("exclude", []) if isinstance(ws_doc, dict) else []
+                                ws_doc = tomllib.loads((root / "Cargo.toml").read_bytes()) if (root / "Cargo.toml").is_file() else {}
                             except Exception:
-                                members, exclude = [], []
-                            # Exact package manifest lookup under root (closed).
-                            for cand in sorted(root.rglob("Cargo.toml")) if root.is_dir() else []:
-                                if "target" in cand.parts:
-                                    continue
-                                try:
-                                    if f'name = "{d.package.name}"' in cand.read_text(encoding="utf-8", errors="strict"):
-                                        rel_m = cand.parent.relative_to(root).as_posix()
-                                        kind = "member" if rel_m in set(members or []) else ("excluded" if rel_m in set(exclude or []) else "standalone")
-                                        meta_entries.append({"name": d.package.name, "manifest_rel": rel_m + "/Cargo.toml", "member_kind": kind})
-                                except Exception:
-                                    continue
+                                ws_doc = {}
+                            members = ws_doc.get("workspace", {}).get("members", []) if isinstance(ws_doc, dict) else []
+                            exclude = ws_doc.get("workspace", {}).get("exclude", []) if isinstance(ws_doc, dict) else []
+                            root_pkg = ws_doc.get("package", {}) if isinstance(ws_doc, dict) else {}
+                            meta_entries: list = []
+                            # Truthful closed entry only: the root manifest
+                            # itself naming this exact package. Its directory
+                            # is "."; kind follows the workspace tables
+                            # verbatim (member/excluded) or own-[workspace]
+                            # standalone, else unavailable.
+                            if isinstance(root_pkg, dict) and root_pkg.get("name") == d.package.name:
+                                if "." in set(members or []):
+                                    closed_kind = "member"
+                                elif "." in set(exclude or []):
+                                    closed_kind = "excluded"
+                                elif isinstance(ws_doc.get("workspace"), dict):
+                                    closed_kind = "standalone"
+                                else:
+                                    closed_kind = "unavailable"
+                                meta_entries.append({"name": d.package.name, "manifest_rel": "Cargo.toml",
+                                                     "member_kind": closed_kind})
                             binding = descriptor_runner.resolve_package_manifest(
                                 package_name=d.package.name, metadata_packages=meta_entries,
                                 require_workspace_member=bool(d.require_workspace_member))
@@ -1207,9 +1248,63 @@ def main(argv: list[str] | None = None) -> int:
                     if d.package is None:
                         return finish(fail_result(f"contract failure: package required issue-{num}", 1,
                                                   failed=[f"issue-{num}"]))
-                    # Observation inputs come from descriptor + repo only.
-                    meta_for_bind: list = []
-                    # Reuse member entries when available (no new discovery).
+                    # Observation inputs come from descriptor + repo only, via the
+                    # frozen build/parse/bind path (never canned). The build
+                    # runs through the frozen builder; its stream is parsed by
+                    # parse_cargo_build_stream; binary/package observations are
+                    # bound by _rust_binary_binding/_rust_package_binding on
+                    # those observed artifacts. A missing binary or package
+                    # observation is incomplete (exit 1), never a canned pass
+                    # or canned failure literal.
+                    try:
+                        build_argv = descriptor_runner.build_cargo_build_command(
+                            manifest_rel="Cargo.toml", target_dir_rel="target/wu837-gate",
+                            package=d.package.name)
+                    except descriptor_runner.RunnerInputError:
+                        return finish(fail_result("configuration failure: build command", 2))
+                    except Exception:
+                        return finish(fail_result("internal failure: build command", 2))
+                    _cmd_build = descriptor_runner.canonical_command(list(build_argv))
+                    wall_s = float(transport["wall_s"])
+                    out_cap = int(transport["output_bytes"])
+                    env = descriptor_runner.toolchain_child_env(dict(os.environ))
+                    if type(env) is not dict:
+                        return finish(fail_result("malformed child return: env", 2))
+                    try:
+                        bproc = subprocess.run([str(a) for a in build_argv], capture_output=True,
+                                               timeout=wall_s, env=env, cwd=str(root))
+                        build_raw = bproc.stdout or b""
+                    except subprocess.TimeoutExpired:
+                        return finish(fail_result(f"execution timeout: issue-{num}", 1, failed=[f"issue-{num}"]))
+                    except OSError:
+                        return finish(fail_result(f"execution unavailable: issue-{num}", 1, failed=[f"issue-{num}"]))
+                    except Exception:
+                        return finish(fail_result("internal failure: runner", 2))
+                    if len(build_raw) > out_cap:
+                        return finish(fail_result(f"execution truncated: issue-{num}", 1, failed=[f"issue-{num}"]))
+                    try:
+                        artifacts = descriptor_runner.parse_cargo_build_stream(
+                            build_raw, package=d.package.name, manifest_rel="Cargo.toml")
+                    except descriptor_runner.RunnerInputError:
+                        return finish(fail_result(f"build failure: issue-{num}", 1, failed=[f"issue-{num}"]))
+                    except Exception:
+                        return finish(fail_result("internal failure: build parse", 2))
+                    if type(artifacts) is not tuple:
+                        return finish(fail_result("malformed child return: build parse", 2))
+                    try:
+                        rust_binary = _rust_binary_binding(d, root, artifacts)
+                    except descriptor_runner.RunnerInputError:
+                        return finish(fail_result(f"missing test binary: issue-{num}", 1,
+                                                  missing=[f"issue-{num}"], failed=[f"issue-{num}"]))
+                    except Exception:
+                        return finish(fail_result("internal failure: binary bind", 2))
+                    try:
+                        rust_package = _rust_package_binding(d, root, artifacts)
+                    except descriptor_runner.RunnerInputError:
+                        return finish(fail_result(f"package observation unavailable: issue-{num}", 1,
+                                                  missing=[f"issue-{num}"], failed=[f"issue-{num}"]))
+                    except Exception:
+                        return finish(fail_result("internal failure: package bind", 2))
                     disc_argv = descriptor_runner.build_cargo_discovery_command(
                         manifest_rel="Cargo.toml", target_dir_rel="target/wu837-gate", package=d.package.name)
                     if type(disc_argv) not in (list, tuple):
@@ -1250,10 +1345,9 @@ def main(argv: list[str] | None = None) -> int:
                             break
                         try:
                             dreceipt = descriptor_runner.compose_discovery_receipt(
-                                descriptor=d, binary=None if False else _rust_binary_binding(
-                                    d, root, transport),
+                                descriptor=d, binary=rust_binary,
                                 test_name=test_name, kind="rust",
-                                package=_rust_package_binding(d, root))
+                                package=rust_package)
                         except descriptor_runner.RunnerInputError:
                             return finish(fail_result(f"discovery binding failure: issue-{num}", 1,
                                                       failed=[f"issue-{num}"]))
@@ -1429,13 +1523,25 @@ def main(argv: list[str] | None = None) -> int:
                 if diff.get("mutated") or diff.get("added") or diff.get("removed"):
                     return finish(fail_result(f"source mutation invalidates result: issue-{num}", 1,
                                               failed=[f"issue-{num}"]))
-                # Cleanup verdict (owned-tree reconciliation only).
-                _cleanup = descriptor_runner.cleanup_verdict(cleanup="clean", active_processes=0, truncated=False)
-                _phase = descriptor_runner.phase_verdict(d.phase.value, "pass")
             except descriptor_runner.RunnerInputError:
                 return finish(fail_result(f"source unavailable: issue-{num}", 1, missing=[f"issue-{num}"]))
             except Exception:
                 return finish(fail_result("internal failure: snapshot compare", 2))
+            # Cleanup + phase reconciliation (owned-tree only). The runner
+            # phase verdict uses the measured execution outcome ("execute" x
+            # observed disposition), never the descriptor's verification
+            # phase label (those pairs are disjoint grammars).
+            try:
+                _cleanup = descriptor_runner.cleanup_verdict(cleanup="clean", active_processes=0, truncated=False)
+                exec_outcome = "pass" if executions and all(
+                    getattr(e, "disposition", None) is c.ExecutionDisposition.EXECUTED_PASS
+                    for e in executions) else "error"
+                _phase = descriptor_runner.phase_verdict("execute", exec_outcome)
+            except descriptor_runner.RunnerInputError:
+                return finish(fail_result(f"phase verdict failure: issue-{num}", 1,
+                                          failed=[f"issue-{num}"]))
+            except Exception:
+                return finish(fail_result("internal failure: phase verdict", 2))
 
             # Markers + case reconciliation against SELECTED denominator.
             try:
@@ -1487,18 +1593,53 @@ def main(argv: list[str] | None = None) -> int:
             except Exception:
                 return finish(fail_result("case binding internal failure", 2))
 
-            # Source-shape + package coherence (selected denominator).
+            # Source-shape + package coherence (selected denominator): every
+            # count and guard derives from frozen child outputs — never
+            # max()-fabricated floors, never assumed PASS. Sources from the
+            # protected snapshot mapping (snapshot_protected), public items
+            # from parsed case markers (parse_source_markers), executed tests
+            # from bound execution dispositions (compose_execution_record via
+            # the rust bind_execution_observations / python protocol path),
+            # guards from the reconciled case accounting (reconcile_case_
+            # bindings). Results mirror the contracts' combine priority
+            # (CONTRACT_FAILURE > INCOMPLETE_EVIDENCE > PASS); the receipt
+            # constructors re-validate, so any derivation slip fails closed.
             try:
-                guards = tuple(c.GuardResult(g, c.OverallResult.PASS) for g in d.requirements.required_guards)
-                # Counts satisfy floors when implementation exists; missing
-                # implementation already returned incomplete above.
+                source_items = len(before) if type(before) is dict else 0
+                public_items = len(markers)
+                passed_exec = sum(
+                    1 for e in executions
+                    if getattr(e, "disposition", None) is c.ExecutionDisposition.EXECUTED_PASS
+                )
+                test_items = passed_exec
+                floors_ok = (
+                    source_items >= d.requirements.source_floor
+                    and public_items >= d.requirements.public_floor
+                    and test_items >= d.requirements.test_floor
+                )
+                if (accounting.result is c.OverallResult.PASS and floors_ok
+                        and 0 < passed_exec == len(executions)):
+                    guard_outcome = c.OverallResult.PASS
+                elif accounting.result is c.OverallResult.CONTRACT_FAILURE:
+                    guard_outcome = c.OverallResult.CONTRACT_FAILURE
+                else:
+                    guard_outcome = c.OverallResult.INCOMPLETE_EVIDENCE
+                guards = tuple(c.GuardResult(g, guard_outcome) for g in d.requirements.required_guards)
+                if guard_outcome is c.OverallResult.PASS and floors_ok:
+                    shape_result = c.OverallResult.PASS
+                elif (guard_outcome is c.OverallResult.CONTRACT_FAILURE
+                        or accounting.result is c.OverallResult.CONTRACT_FAILURE
+                        or not floors_ok):
+                    shape_result = c.OverallResult.CONTRACT_FAILURE
+                else:
+                    shape_result = c.OverallResult.INCOMPLETE_EVIDENCE
                 shape = c.SourceShapeGateReceipt(assignment=doc.receipt, descriptor=d,
-                                                 result=c.OverallResult.PASS, findings=(),
+                                                 result=shape_result, findings=(),
                                                  proof_ceiling=d.proof_ceiling,
                                                  source_sha256=d.body_sha256,
-                                                 source_items=max(1, d.requirements.source_floor),
-                                                 public_items=max(0, d.requirements.public_floor),
-                                                 test_items=max(d.matrix_cases, d.requirements.test_floor),
+                                                 source_items=source_items,
+                                                 public_items=public_items,
+                                                 test_items=test_items,
                                                  guards=guards)
             except c.ContractViolation:
                 return finish(fail_result(f"source-shape contract failure: issue-{num}", 1,
@@ -1508,10 +1649,18 @@ def main(argv: list[str] | None = None) -> int:
             pkg_receipt = None
             if d.package is not None:
                 try:
+                    if (shape.result is c.OverallResult.PASS
+                            and accounting.result is c.OverallResult.PASS):
+                        pkg_result = c.OverallResult.PASS
+                    elif (shape.result is c.OverallResult.CONTRACT_FAILURE
+                            or accounting.result is c.OverallResult.CONTRACT_FAILURE):
+                        pkg_result = c.OverallResult.CONTRACT_FAILURE
+                    else:
+                        pkg_result = c.OverallResult.INCOMPLETE_EVIDENCE
                     pkg_receipt = c.PackageGateReceipt(assignment=doc.receipt, descriptor=d,
                                                        package=d.package, module=d.module,
                                                        source_shape=shape, case_accounting=accounting,
-                                                       result=c.OverallResult.PASS, findings=(),
+                                                       result=pkg_result, findings=(),
                                                        proof_ceiling=d.proof_ceiling)
                 except c.ContractViolation:
                     return finish(fail_result(f"package contract failure: issue-{num}", 1,
@@ -1592,27 +1741,82 @@ def main(argv: list[str] | None = None) -> int:
         return 2
 
 
-def _rust_binary_binding(descriptor, root: Path, transport: dict):  # type: ignore[no-untyped-def]
-    # Fail-closed rust binding through frozen APIs only (called once per
-    # descriptor when rust is selected; real cargo builds supply artifacts via
-    # parse_cargo_build_stream + binders in the caller). Empty metadata fails
-    # closed with PACKAGE_NOT_FOUND (no guessing, no custom argv).
-    return descriptor_runner.bind_test_binary(
-        artifact={"package": descriptor.package.name if descriptor.package else "unknown",
-                  "package_id": "unknown#unknown@0.0.0", "manifest_rel": "Cargo.toml",
-                  "filenames": [], "package_version": "0.0.0"},
-        binary_name="missing-test-binary",
-        binary_sha256="0" * 64)
+def _rust_binary_binding(descriptor, root: Path, artifacts: tuple):  # type: ignore[no-untyped-def]
+    # Real test-binary binding over observed build artifacts (frozen
+    # parse_cargo_build_stream output from a frozen-builder cargo build).
+    # Binds the first test-profile artifact whose observed binary bytes hash
+    # cleanly (controller-owned hashing of observed bytes, exactly like the
+    # frozen child-request binding). A missing binary raises the frozen
+    # BINARY_NOT_PRODUCED rejection (caller maps to incomplete, exit 1) —
+    # never a canned digest, empty filename list, or placeholder name.
+    import hashlib as _hashlib
+
+    if type(artifacts) is not tuple or not artifacts:
+        raise descriptor_runner.RunnerInputError("BINARY_NOT_PRODUCED")
+    for artifact in artifacts:
+        if not isinstance(artifact, dict) or artifact.get("profile_test") is not True:
+            continue
+        filenames = artifact.get("filenames", [])
+        if type(filenames) not in (list, tuple):
+            continue
+        for path in filenames:
+            if type(path) is not str or not path:
+                continue
+            binary_name = path.replace("\\", "/").rsplit("/", 1)[-1]
+            if not binary_name:
+                continue
+            try:
+                digest = _hashlib.sha256(Path(path).read_bytes()).hexdigest()
+            except OSError:
+                continue
+            except Exception:
+                continue
+            try:
+                return descriptor_runner.bind_test_binary(
+                    artifact=artifact, binary_name=binary_name, binary_sha256=digest)
+            except descriptor_runner.RunnerInputError:
+                continue
+    raise descriptor_runner.RunnerInputError("BINARY_NOT_PRODUCED")
 
 
-def _rust_package_binding(descriptor, root: Path):  # type: ignore[no-untyped-def]
-    # Fail-closed package binding through the frozen resolver only (once per
-    # descriptor). Empty metadata fails closed; membership-required callers
-    # thus stay incomplete without fabricating membership.
-    name = descriptor.package.name if descriptor.package else "unknown"
-    return descriptor_runner.resolve_package_manifest(
-        package_name=name, metadata_packages=[],
-        require_workspace_member=bool(descriptor.require_workspace_member))
+def _rust_package_binding(descriptor, root: Path, artifacts: tuple):  # type: ignore[no-untyped-def]
+    # Real package-observation binding over observed build artifacts via the
+    # frozen bind_package_observation. The metadata observation is assembled
+    # from frozen-parsed build artifacts (name/id/version, buildable exactly
+    # because the build just produced them) plus closed workspace tables
+    # (members/exclude via stdlib tomllib, workspace-admission use only).
+    # No rglob discovery, no substring matching. Unobservable packages raise
+    # the frozen PACKAGE_NOT_FOUND-class rejection (caller: incomplete).
+    if type(artifacts) is not tuple or not artifacts:
+        raise descriptor_runner.RunnerInputError("PACKAGE_NOT_FOUND")
+    name = descriptor.package.name if descriptor.package else None
+    if not isinstance(name, str):
+        raise descriptor_runner.RunnerInputError("PACKAGE_NOT_FOUND")
+    try:
+        ws_doc = tomllib.loads((root / "Cargo.toml").read_bytes()) if (root / "Cargo.toml").is_file() else {}
+    except Exception:
+        ws_doc = {}
+    members = ws_doc.get("workspace", {}).get("members", []) if isinstance(ws_doc, dict) else []
+    exclude = ws_doc.get("workspace", {}).get("exclude", []) if isinstance(ws_doc, dict) else []
+    _ = members
+    entries = []
+    for artifact in artifacts:
+        if not isinstance(artifact, dict) or artifact.get("package") != name:
+            continue
+        entries.append({
+            "name": artifact["package"],
+            "manifest_path": str(root / "Cargo.toml"),
+            "id": artifact.get("package_id", ""),
+            "buildable": True,
+            "version": artifact.get("version", artifact.get("package_version", "")),
+        })
+    metadata = {
+        "packages": [dict(t) for t in {tuple(sorted(e.items())): None for e in entries}],
+        "workspace_members": [],
+        "excluded": [e for e in (exclude or []) if isinstance(e, str)],
+    }
+    return descriptor_runner.bind_package_observation(
+        descriptor=descriptor, metadata=metadata, root=root, manifest_rel="Cargo.toml")
 
 
 def _run_python_child(root: Path, module: str, suite_rel: str, source_sha: str,  # type: ignore[no-untyped-def]
