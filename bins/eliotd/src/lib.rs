@@ -11,7 +11,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use eliot_contracts::{AuthorityEpoch, ResourceGeneration, StateFence};
+use eliot_contracts::{EpochId, ResourceGeneration, StateFence};
 use eliot_governor::{
     CompositionError, CompositionReadiness, GovernorActivationOutcome, GovernorComposition,
     GovernorLaunchConfig, KernelGenerationPort, QueueLimits,
@@ -101,7 +101,7 @@ struct KernelLaunchBinding {
     expected_kernel_sid: String,
     expected_kernel_session_id: u32,
     module_generation: ResourceGeneration,
-    authority_epoch: AuthorityEpoch,
+    authority_epoch: EpochId,
     state_fence: StateFence,
     launch_nonce: String,
     kernel_artifact_sha256: String,
@@ -305,7 +305,7 @@ impl DaemonComposition {
             service: SERVICE_NAME.to_owned(),
             protocol: PROTOCOL_VERSION.to_owned(),
             generation: snapshot.generation.value(),
-            authority_epoch: snapshot.authority_epoch.value(),
+            authority_epoch: snapshot.authority_epoch.sequence.get(),
             ready: self.started
                 && !self.view_stale
                 && self.readiness() == CompositionReadiness::Ready,

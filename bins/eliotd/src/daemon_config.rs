@@ -5,13 +5,13 @@
 
 use std::path::{Path, PathBuf};
 
-use eliot_contracts::{StateFence, sha256_hex};
+use eliot_contracts::{sha256_hex, StateFence};
 use eliot_governor::GovernorLaunchConfig;
 use eliot_platform_windows::{
-    ProtectedRuntimePathLease, current_process_named_pipe_expectation, protected_program_data_path,
+    current_process_named_pipe_expectation, protected_program_data_path, ProtectedRuntimePathLease,
 };
 
-use super::{DaemonError, KERNEL_PIPE_NAME, KernelLaunchBinding, MAX_CONFIG_BYTES};
+use super::{DaemonError, KernelLaunchBinding, KERNEL_PIPE_NAME, MAX_CONFIG_BYTES};
 
 fn observed_runtime_identity() -> Result<(String, u32), DaemonError> {
     let expectation = current_process_named_pipe_expectation()
@@ -122,8 +122,11 @@ impl DaemonConfig {
             expected_kernel_sid,
             expected_kernel_session_id,
             module_generation: launch.kernel.generation,
-            authority_epoch: launch.kernel.authority_epoch,
-            state_fence: StateFence::new(launch.kernel.authority_epoch, launch.kernel.generation),
+            authority_epoch: launch.kernel.authority_epoch.clone(),
+            state_fence: StateFence::new(
+                launch.kernel.authority_epoch.clone(),
+                launch.kernel.generation,
+            ),
             launch_nonce: format!("eliotd:{}", launch.instance_id),
             kernel_artifact_sha256: launch.kernel.artifact_digest.clone(),
             daemon_artifact_sha256: launch.kernel.artifact_digest.clone(),
@@ -160,8 +163,11 @@ impl DaemonConfig {
             expected_kernel_sid,
             expected_kernel_session_id,
             module_generation: launch.kernel.generation,
-            authority_epoch: launch.kernel.authority_epoch,
-            state_fence: StateFence::new(launch.kernel.authority_epoch, launch.kernel.generation),
+            authority_epoch: launch.kernel.authority_epoch.clone(),
+            state_fence: StateFence::new(
+                launch.kernel.authority_epoch.clone(),
+                launch.kernel.generation,
+            ),
             launch_nonce: launch_nonce.to_owned(),
             // The daemon child artifact is a separate domain from the
             // KernelGenerationExpectation artifact. The former is supplied by

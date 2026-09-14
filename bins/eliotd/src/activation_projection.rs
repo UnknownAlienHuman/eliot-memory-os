@@ -185,13 +185,24 @@ pub fn map_governor_outcome_to_protocol(
 mod projection_tests {
     use super::*;
     use eliot_contracts::RequestId;
-    use eliot_contracts::{AuthorityEpoch, ResourceGeneration, StateFence};
+    use eliot_contracts::{EpochId, EpochLineageId, ResourceGeneration, StateFence};
     use eliot_governor::{
-        GovernorActivationSnapshot, fixture_failed_internal, fixture_not_ready,
-        fixture_scope_ambiguous, fixture_scope_selection_required, fixture_stale_fence,
-        fixture_task_selection_required,
+        fixture_failed_internal, fixture_not_ready, fixture_scope_ambiguous,
+        fixture_scope_selection_required, fixture_stale_fence, fixture_task_selection_required,
+        GovernorActivationSnapshot,
     };
     use eliot_protocol::AgentActivationResolutionTicket;
+    use std::num::NonZeroU64;
+
+    const TEST_LINEAGE_A: &str = "550e8400-e29b-41d4-a716-446655440000";
+
+    fn test_epoch(sequence: u64) -> EpochId {
+        EpochId::new(
+            EpochLineageId::new(TEST_LINEAGE_A).expect("valid test lineage"),
+            NonZeroU64::new(sequence).expect("nonzero test sequence"),
+        )
+        .expect("valid test epoch")
+    }
 
     fn test_ticket(deadline: u64) -> AgentActivationResolutionTicket {
         let mut ticket = AgentActivationResolutionTicket {
@@ -202,10 +213,7 @@ mod projection_tests {
             activation_request_sha256: "a".repeat(64),
             peer_admission_receipt_sha256: "b".repeat(64),
             connection_id: "connection-1".to_owned(),
-            state_fence: StateFence::new(
-                AuthorityEpoch::new(1).expect("epoch"),
-                ResourceGeneration::new(1).expect("gen"),
-            ),
+            state_fence: StateFence::new(test_epoch(1), ResourceGeneration::new(1).expect("gen")),
             kernel_deadline_unix_ms: deadline,
             ticket_sha256: String::new(),
         };
@@ -215,10 +223,7 @@ mod projection_tests {
 
     fn test_snapshot() -> GovernorActivationSnapshot {
         GovernorActivationSnapshot {
-            state_fence: StateFence::new(
-                AuthorityEpoch::new(1).expect("epoch"),
-                ResourceGeneration::new(1).expect("gen"),
-            ),
+            state_fence: StateFence::new(test_epoch(1), ResourceGeneration::new(1).expect("gen")),
             principal_id: "principal-1".to_owned(),
             session_id: "session-1".to_owned(),
             task_id: eliot_contracts::TaskId::new("task-1").expect("task id"),
@@ -318,10 +323,7 @@ mod projection_tests {
     #[test]
     fn stale_fence_with_observed_fence_preserves_difference() {
         let ticket = test_ticket(100);
-        let observed = StateFence::new(
-            AuthorityEpoch::new(1).expect("epoch"),
-            ResourceGeneration::new(2).expect("gen"),
-        );
+        let observed = StateFence::new(test_epoch(1), ResourceGeneration::new(2).expect("gen"));
         let outcome = fixture_stale_fence(Some(observed.clone()));
         let result = map_governor_outcome_to_protocol(&ticket, outcome, 50).expect("mapping");
         match result.disposition {

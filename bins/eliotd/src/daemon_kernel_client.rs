@@ -8,8 +8,8 @@
 //! sole process, Store, and canonical authority owner.
 
 use std::collections::BTreeMap;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
 use std::time::Duration;
 
 use eliot_contracts::{ClockReading, ProductId, RequestId, RequestMetadata, SourceId};
@@ -32,13 +32,13 @@ mod handshake;
 #[cfg(windows)]
 use handshake::client_hello;
 use handshake::expected_snapshot;
-pub(super) use handshake::{KernelClientError, WireOutcome, kernel_port_error, operation_payload};
 #[cfg(windows)]
 pub(super) use handshake::{is_pre_admission_pending_rejection, validate_server_hello};
+pub(super) use handshake::{kernel_port_error, operation_payload, KernelClientError, WireOutcome};
 
 use super::{
-    KERNEL_OPERATION_TIMEOUT, KernelLaunchBinding, PRE_ADMISSION_RETRY_DELAY, SERVICE_NAME,
-    unix_ms, unix_ms_i64,
+    unix_ms, unix_ms_i64, KernelLaunchBinding, KERNEL_OPERATION_TIMEOUT, PRE_ADMISSION_RETRY_DELAY,
+    SERVICE_NAME,
 };
 
 pub struct DaemonKernelClient {
@@ -169,10 +169,11 @@ impl DaemonKernelClient {
         let client = Self {
             launch: config.launch.clone(),
             connection_id: format!(
-                "eliotd:{}:{}:{}",
+                "eliotd:{}:{}:{}:{}",
                 config.launch.instance_id,
                 config.launch.kernel.generation.value(),
-                config.launch.kernel.authority_epoch.value()
+                config.launch.kernel.authority_epoch.lineage_id.as_str(),
+                config.launch.kernel.authority_epoch.sequence.get()
             ),
             snapshot: expected_snapshot(&config.launch)?,
             kernel_binding: config.kernel_binding.clone(),
@@ -306,7 +307,7 @@ impl DaemonKernelClient {
                     "daemon_ready",
                     serde_json::json!({
                         "generation": self.snapshot.generation.value(),
-                        "authority_epoch": self.snapshot.authority_epoch.value(),
+                        "authority_epoch": self.snapshot.authority_epoch.clone(),
                     }),
                 )
             },
