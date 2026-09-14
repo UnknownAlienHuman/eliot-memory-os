@@ -142,12 +142,15 @@ pub const fn host_runtime_bootstrap_state_is_admissible(state: ServiceState) -> 
 /// is never requested: platform `GetSecurityInfo` reads are DACL-only
 /// (`lib.rs:4019,4152`).
 ///
-/// WRITER-A forward-compat: base `Absent`/`Mismatched`/`Unknown` are unit
-/// variants. This is the sole inspection-to-cause mapping site; carry
-/// stage/state/pid strings via the platform Debug text verbatim (truncated to
-/// [`HOST_SCM_CAUSE_MAX_CHARS`]) and do NOT match on `Unknown` payload
-/// fields — a future typed `Unknown { win32_error, stage, current_state,
-/// process_id }` payload is adopted here with minimal edits.
+/// WRITER-A carry-over (s40 integration): platform `Unknown` is the typed
+/// payload `Unknown { detail: ServiceInspectionUnknownDetail }` (Writer-A).
+/// This is the sole inspection-to-cause mapping site; the `Unknown` arm
+/// matches `Unknown { detail }` and preserves `detail.win32_error`,
+/// `detail.stage`, `detail.current_state`, and `detail.process_id` via the
+/// explicit typed rendering plus the platform Debug text verbatim (truncated
+/// to [`HOST_SCM_CAUSE_MAX_CHARS`]). Fail-closed is unchanged: `Unknown`
+/// never maps to `None`, never to `Matching`, and never collapses
+/// `Mismatched`.
 #[must_use]
 pub fn classify_host_scm_inspection(
     request: &ServiceRegistrationRequest,
@@ -173,9 +176,16 @@ pub fn classify_host_scm_inspection(
                 inspection_debug: format!("{inspection:?}"),
             })
         }
-        ServiceRegistrationRuntimeInspection::Unknown => Some(HostScmRegistrationCause::Unknown {
-            inspection_debug: format!("{inspection:?}"),
-        }),
+        ServiceRegistrationRuntimeInspection::Unknown { detail } => {
+            // Typed payload carry-over: preserve win32_error/stage/state/pid
+            // explicitly via the typed rendering plus Debug verbatim. Both
+            // stay bounded through truncate_host_scm_cause downstream.
+            // SACL is never requested (platform DACL-only); Unknown stays
+            // fail-closed 1066/3.
+            Some(HostScmRegistrationCause::Unknown {
+                inspection_debug: format!("{} | {inspection:?}", detail.detail()),
+            })
+        }
     }
 }
 
@@ -303,15 +313,21 @@ mod tests {
             }
         );
         assert_eq!(mismatched.cause(), "mismatched");
+        // Writer-A payload carry-over: Unknown is now typed Unknown{detail}.
+        // The host projection preserves win32_error/stage/state/pid via the
+        // explicit typed rendering plus Debug verbatim, still fail-closed.
+        let unknown_inspection =
+            ServiceRegistrationRuntimeInspection::unknown_with_status(5, "open-service", 3, 1234);
+        let unknown_detail_typed = unknown_inspection
+            .unknown_detail()
+            .unwrap_or_else(|| panic!("unknown inspection must carry diagnostics"));
+        assert_eq!(unknown_detail_typed.win32_error(), 5);
+        assert_eq!(unknown_detail_typed.stage(), "open-service");
+        assert_eq!(unknown_detail_typed.current_state(), Some(3));
+        assert_eq!(unknown_detail_typed.process_id(), Some(1234));
         let unknown =
-            classify_host_scm_inspection(&request, &ServiceRegistrationRuntimeInspection::Unknown)
+            classify_host_scm_inspection(&request, &unknown_inspection)
                 .unwrap_or_else(|| panic!("unknown inspection must classify"));
-        assert_eq!(
-            unknown,
-            HostScmRegistrationCause::Unknown {
-                inspection_debug: "Unknown".to_owned(),
-            }
-        );
         assert_eq!(unknown.cause(), "unknown");
         assert_ne!(mismatched, unknown);
         let mismatched_detail = mismatched.detail();
@@ -323,6 +339,20 @@ mod tests {
         assert_ne!(mismatched_detail, unknown_detail);
         assert!(mismatched_detail.contains("host-scm-registration-mismatched"));
         assert!(unknown_detail.contains("host-scm-registration-unknown"));
+        // Typed preservation: the bounded cause carries win32_error/stage/
+        // state/pid plus Debug verbatim.
+        assert!(
+            unknown_detail.contains("open-service"),
+            "unknown cause must preserve stage: {unknown_detail}"
+        );
+        assert!(
+            unknown_detail.contains('5'),
+            "unknown cause must preserve win32_error: {unknown_detail}"
+        );
+        assert!(
+            unknown_detail.contains("Unknown"),
+            "unknown cause must carry Debug verbatim: {unknown_detail}"
+        );
         for detail in [&mismatched_detail, &unknown_detail] {
             assert!(
                 !detail.contains("is not an exact read-only match"),
@@ -350,7 +380,8 @@ mod tests {
         // crate, so no `Matching { observation }` value can be constructed
         // here; the admissibility predicate IS the exact gate the `Matching`
         // arm uses, and the fail-closed arms are proven below with directly
-        // constructible unit inspection variants. No SCM calls, no mocks.
+        // constructible inspection variants (Mismatched unit, typed Unknown
+        // payload). No SCM calls, no mocks.
         assert!(host_runtime_bootstrap_state_is_admissible(
             ServiceState::Starting
         ));
@@ -377,9 +408,22 @@ mod tests {
         let mismatched =
             classify_host_scm_inspection(&request, &ServiceRegistrationRuntimeInspection::Mismatched)
                 .unwrap_or_else(|| panic!("mismatched inspection must classify"));
-        let unknown =
-            classify_host_scm_inspection(&request, &ServiceRegistrationRuntimeInspection::Unknown)
-                .unwrap_or_else(|| panic!("unknown inspection must classify"));
+        // Writer-A payload: Unknown carries typed win32_error/stage/state/pid.
+        let unknown_inspection = ServiceRegistrationRuntimeInspection::unknown_with_status(
+            1066,
+            "query-status",
+            3,
+            4242,
+        );
+        let unknown_typed = unknown_inspection
+            .unknown_detail()
+            .unwrap_or_else(|| panic!("unknown inspection must carry diagnostics"));
+        assert_eq!(unknown_typed.win32_error(), 1066);
+        assert_eq!(unknown_typed.stage(), "query-status");
+        assert_eq!(unknown_typed.current_state(), Some(3));
+        assert_eq!(unknown_typed.process_id(), Some(4242));
+        let unknown = classify_host_scm_inspection(&request, &unknown_inspection)
+            .unwrap_or_else(|| panic!("unknown inspection must classify"));
         assert_eq!(mismatched.cause(), "mismatched");
         assert_eq!(unknown.cause(), "unknown");
         assert_ne!(mismatched, unknown);
@@ -394,7 +438,8 @@ mod tests {
         assert!(unknown_detail.contains("Unknown"));
         // Typed s40-1 diagnostics: the Unknown detail names the runtime
         // contour used and records that SACL was never requested, while
-        // carrying the platform Debug text verbatim.
+        // carrying the platform Debug text verbatim plus the explicit typed
+        // win32_error/stage/state/pid rendering.
         assert!(
             unknown_detail.contains("inspect_service_registration_runtime"),
             "unknown detail must name the runtime contour: {unknown_detail}"
@@ -402,6 +447,18 @@ mod tests {
         assert!(
             unknown_detail.contains("SACL"),
             "unknown detail must record that SACL was never requested: {unknown_detail}"
+        );
+        assert!(
+            unknown_detail.contains("query-status"),
+            "unknown detail must preserve stage: {unknown_detail}"
+        );
+        assert!(
+            unknown_detail.contains("1066"),
+            "unknown detail must preserve win32_error: {unknown_detail}"
+        );
+        assert!(
+            unknown_detail.contains("4242"),
+            "unknown detail must preserve pid: {unknown_detail}"
         );
         for detail in [&mismatched_detail, &unknown_detail] {
             assert!(
