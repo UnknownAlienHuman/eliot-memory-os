@@ -408,9 +408,9 @@ struct HostStartPendingReporter {
 #[cfg(windows)]
 impl HostStartPendingReporter {
     fn start(handle: eliot_platform_windows::scm_entry::ServiceStatusHandle) -> io::Result<Self> {
+        use eliot_platform_windows::scm_entry::{ServiceStatusReport, report_service_status};
         use std::sync::atomic::{AtomicBool, Ordering};
         use windows_sys::Win32::System::Services::SERVICE_START_PENDING;
-        use eliot_platform_windows::scm_entry::{ServiceStatusReport, report_service_status};
 
         let (stop, stopped) = std::sync::mpsc::channel();
         let failed = std::sync::Arc::new(AtomicBool::new(false));
@@ -483,8 +483,8 @@ fn fail_host_service(
     detail: &str,
     launch_options: Option<&HostLaunchOptions>,
 ) {
-    use windows_sys::Win32::System::Services::SERVICE_STOPPED;
     use eliot_platform_windows::scm_entry::report_service_status;
+    use windows_sys::Win32::System::Services::SERVICE_STOPPED;
     persist_host_start_failure(code, error_variant, detail, launch_options);
     report.current_state = SERVICE_STOPPED;
     report.win32_exit_code = HOST_WIN32_SERVICE_SPECIFIC_ERROR;
@@ -498,14 +498,14 @@ fn fail_host_service(
     reason = "the SCM callback owns the complete fail-closed service lifecycle"
 )]
 extern "system" fn service_main(service_arg_count: u32, service_arg_vector: *mut *mut u16) {
+    use eliot_platform_windows::scm_entry::{
+        ServiceArgvError, ServiceStatusReport, parse_service_main_argv,
+        register_service_control_handler, report_service_status,
+    };
     use std::sync::atomic::Ordering;
     use windows_sys::Win32::System::Services::{
         SERVICE_ACCEPT_SHUTDOWN, SERVICE_ACCEPT_STOP, SERVICE_RUNNING, SERVICE_START_PENDING,
         SERVICE_STOP_PENDING, SERVICE_STOPPED,
-    };
-    use eliot_platform_windows::scm_entry::{
-        ServiceArgvError, ServiceStatusReport, parse_service_main_argv,
-        register_service_control_handler, report_service_status,
     };
 
     let handle = match register_service_control_handler(SERVICE_NAME, service_control) {
@@ -543,23 +543,23 @@ extern "system" fn service_main(service_arg_count: u32, service_arg_vector: *mut
         })
         .and_then(|argv| HostLaunchOptions::validate_service_main_argv([argv]))
         .and_then(|()| captured_process_bootstrap())
-        {
-            Ok(options) => options,
-            Err(error) => {
-                let detail = format!("invalid SCM launch argv or process bootstrap: {error}");
-                let _ = writeln!(io::stderr().lock(), "eliot-host: {detail}");
-                let cached = captured_bootstrap_snapshot();
-                fail_host_service(
-                    &handle,
-                    &mut report,
-                    HostStopCode::InvalidScmArgvOrBootstrap,
-                    host_error_variant(&error),
-                    &detail,
-                    cached.as_ref(),
-                );
-                return;
-            }
-        };
+    {
+        Ok(options) => options,
+        Err(error) => {
+            let detail = format!("invalid SCM launch argv or process bootstrap: {error}");
+            let _ = writeln!(io::stderr().lock(), "eliot-host: {detail}");
+            let cached = captured_bootstrap_snapshot();
+            fail_host_service(
+                &handle,
+                &mut report,
+                HostStopCode::InvalidScmArgvOrBootstrap,
+                host_error_variant(&error),
+                &detail,
+                cached.as_ref(),
+            );
+            return;
+        }
+    };
     if let Err(error) = eliot_host::validate_host_scm_bootstrap(&launch_options) {
         let detail = format!("invalid SCM registration: {error}");
         let _ = writeln!(io::stderr().lock(), "eliot-host: {detail}");
@@ -1227,8 +1227,7 @@ mod tests {
         // carries that exact typed detail — never the old collapsed string.
         // The runtime contour reports Mismatched as a unit variant; the Absent
         // bindings come from the validated request.
-        let image =
-            std::env::current_exe().unwrap_or_else(|_| panic!("test image unavailable"));
+        let image = std::env::current_exe().unwrap_or_else(|_| panic!("test image unavailable"));
         let request = eliot_platform_windows::ServiceRegistrationRequest::new(
             eliot_platform_windows::ELIOT_HOST_SERVICE_NAME,
             eliot_platform_windows::ELIOT_HOST_SERVICE_DISPLAY_NAME,

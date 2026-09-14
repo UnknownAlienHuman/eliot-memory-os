@@ -10,8 +10,14 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
-const EXPECTED_SITES: usize = 147;
-const EXPECTED_BLOCK: usize = 146;
+// Denominator history: 147/146/1 at #1155; prior service/ACL merges through
+// 714fb830 (#1347 host DACL, #1352 typed Unknown) added lib.rs sites without
+// updating the oracle (pristine-base proof: 166 sites, 165 blocks, tests.rs 19;
+// same 5 failures on clean 714fb830). Updated to the true counts here so the
+// coverage proof runs again; #1357 adds no lib.rs sites (new scm_entry.rs
+// module is outside this oracle's lib.rs/tests.rs scan — follow-up for #728).
+const EXPECTED_SITES: usize = 166;
+const EXPECTED_BLOCK: usize = 165;
 const EXPECTED_IMPL: usize = 1;
 const EXPECTED_ALLOWS: usize = 5;
 const MAX_SOURCE_BYTES: usize = 5_000_000;
@@ -1897,8 +1903,8 @@ fn new_allow_without_adr_fails() -> Result<(), String> {
 fn test_only_unsafe_is_separately_visible() -> Result<(), String> {
     let tests_source = read_text(&tests_rs_path())?;
     let test_sites = lex_unsafe_sites(&tests_source)?;
-    if test_sites.len() != 16 {
-        return Err(format!("tests.rs sites {} != 16", test_sites.len()));
+    if test_sites.len() != 19 {
+        return Err(format!("tests.rs sites {} != 19", test_sites.len()));
     }
     let lib_source = read_text(&lib_rs_path())?;
     let lib_sites = lex_unsafe_sites(&lib_source)?;

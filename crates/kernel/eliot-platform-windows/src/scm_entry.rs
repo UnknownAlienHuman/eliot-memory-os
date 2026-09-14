@@ -101,11 +101,7 @@ impl Win32Error {
 
 impl std::fmt::Display for Win32Error {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(
-            formatter,
-            "Win32 error {} (0x{:08X})",
-            self.code, self.code
-        )
+        write!(formatter, "Win32 error {} (0x{:08X})", self.code, self.code)
     }
 }
 
@@ -236,9 +232,7 @@ impl std::fmt::Display for ServiceArgvError {
                 formatter,
                 "SCM service argv value exceeds {MAX_SERVICE_ARG_UNITS} UTF-16 units without a terminator"
             ),
-            Self::InvalidUtf16 => {
-                formatter.write_str("SCM service argv value is not valid UTF-16")
-            }
+            Self::InvalidUtf16 => formatter.write_str("SCM service argv value is not valid UTF-16"),
         }
     }
 }
@@ -427,10 +421,7 @@ pub fn parse_service_main_argv(
     // `service_arg_vector` addresses exactly one readable entry pointer. Only
     // index 0 is read; nothing is mutated.
     let vector = unsafe {
-        std::slice::from_raw_parts(
-            service_arg_vector.cast_const(),
-            service_arg_count as usize,
-        )
+        std::slice::from_raw_parts(service_arg_vector.cast_const(), service_arg_count as usize)
     };
     let pointer = vector[0];
     if pointer.is_null() {

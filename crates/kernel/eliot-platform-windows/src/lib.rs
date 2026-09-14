@@ -4091,9 +4091,9 @@ fn verify_service_owner_is_system(
     }
     let mut owner: PSID = std::ptr::null_mut();
     let mut defaulted = 0;
-    // SAFETY: GetSecurityDescriptorOwner borrows the validated descriptor; owner/defaulted are valid
-    // writable out-pointers; descriptor outlives the borrow.
     let owner_ok =
+        // SAFETY: GetSecurityDescriptorOwner borrows the validated descriptor; owner/defaulted are valid
+        // writable out-pointers; descriptor outlives the borrow.
         unsafe { GetSecurityDescriptorOwner(descriptor, &raw mut owner, &raw mut defaulted) } != 0
             && !owner.is_null();
     let owner_text = if owner_ok {

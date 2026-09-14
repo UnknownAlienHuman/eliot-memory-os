@@ -17,12 +17,12 @@ use runtime_loop::run_watchdog;
 
 use eliot_platform_windows::ServiceBootstrapArguments;
 #[cfg(windows)]
-use eliot_platform_windows::{ServiceRegistrationRequest, WindowsPlatform};
-#[cfg(windows)]
 use eliot_platform_windows::scm_entry::{
     DispatcherOutcome, ServiceArgvError, parse_service_main_argv, register_service_control_handler,
     run_service_dispatcher,
 };
+#[cfg(windows)]
+use eliot_platform_windows::{ServiceRegistrationRequest, WindowsPlatform};
 use eliot_watchdog::{
     SERVICE_NAME, WatchdogRuntimeReadback, WatchdogSelfAdmissionProbe, WatchdogSelfAdmissionStatus,
     project_service_runtime_inspection,
@@ -31,9 +31,9 @@ use eliot_watchdog::{
 use watchdog_service_status::{
     CONSOLE_PROCESS_EXIT_CODE, SERVICE_CONTROL_INTERROGATE, SERVICE_CONTROL_PRESHUTDOWN,
     SERVICE_CONTROL_SHUTDOWN, SERVICE_CONTROL_STOP, SERVICE_START_PENDING, SERVICE_STATUS_HANDLE,
-    SERVICE_STOP_PENDING, WatchdogStopCode, classify_bootstrap_launch_error, classify_runtime_error,
-    persist_start_failure, publish_service_status, publish_stopped_with_code,
-    set_service_status_running, set_service_status_stopped,
+    SERVICE_STOP_PENDING, WatchdogStopCode, classify_bootstrap_launch_error,
+    classify_runtime_error, persist_start_failure, publish_service_status,
+    publish_stopped_with_code, set_service_status_running, set_service_status_stopped,
 };
 
 static PROCESS_BOOTSTRAP: OnceLock<Result<Option<ServiceBootstrapArguments>, String>> =
