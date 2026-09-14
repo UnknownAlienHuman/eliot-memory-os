@@ -989,6 +989,20 @@ mod admitted_operation_gate_tests {
         }
     }
 
+    fn audit_operation() -> eliot_store_api::NamedMutationRequest {
+        NamedMutationRequest {
+            operation: NamedMutationOperation::AppendAuditEvent,
+            parameters: BTreeMap::from([
+                ("operation_id".to_owned(), json!("op-gate")),
+                ("idempotency_key".to_owned(), json!("idem-gate")),
+                ("session_id".to_owned(), json!("session-gate")),
+                ("access_digest".to_owned(), json!("a".repeat(64))),
+                ("action_digest".to_owned(), json!("b".repeat(64))),
+                ("expected_revision".to_owned(), json!("7")),
+            ]),
+        }
+    }
+
     #[test]
     fn genesis_shaped_transition_passes_the_pre_stage_gate() {
         let fence = test_fence(1);
@@ -1030,9 +1044,10 @@ mod admitted_operation_gate_tests {
             Err(AdapterError::Store(StoreError::ManifestMismatch))
         );
         // Current set digest but still-unadmitted mutation entry: fail-closed
-        // for the remaining mutations. `CaptureObservation` is admitted (its
-        // handler/schema/consumer triple is proven); this proof uses
-        // `ApplyEpistemicRevision` (still unadmitted).
+        // for the remaining mutations. `CaptureObservation` and
+        // `AppendAuditEvent` are admitted (their handler/schema/consumer
+        // triples are proven); this proof uses `ApplyEpistemicRevision`
+        // (still unadmitted).
         let unadmitted = transition_with(
             &fence,
             set_digest.clone(),
@@ -1051,7 +1066,7 @@ mod admitted_operation_gate_tests {
         // subject params passes the pre-stage gate.
         let admitted = transition_with(
             &fence,
-            set_digest,
+            set_digest.clone(),
             TransitionClass::CaptureCandidate,
             EffectClass::Candidate,
             vec![mutation_operation()],
@@ -1059,6 +1074,19 @@ mod admitted_operation_gate_tests {
         assert!(
             validate_transition(&context, &admitted).is_ok(),
             "admitted CaptureObservation passes the pre-stage gate"
+        );
+        // Admitted `AppendAuditEvent` with current set digest and approved
+        // receipt-bound params passes the pre-stage gate.
+        let admitted_audit = transition_with(
+            &fence,
+            set_digest,
+            TransitionClass::CaptureCandidate,
+            EffectClass::Candidate,
+            vec![audit_operation()],
+        );
+        assert!(
+            validate_transition(&context, &admitted_audit).is_ok(),
+            "admitted AppendAuditEvent passes the pre-stage gate"
         );
         // Fence divergence between caller context and transition.
         let manifest = genesis_manifest().expect("genesis entry is active");
