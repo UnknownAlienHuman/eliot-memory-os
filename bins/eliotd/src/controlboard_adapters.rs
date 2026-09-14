@@ -47,7 +47,7 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::sync::{Arc, Mutex};
 
-use eliot_contracts::SessionId;
+use eliot_contracts::{SessionId, sha256_hex};
 use eliot_controlboard::{
     AccessBinding, AccessResolverPort, ActionCapability, CanonicalState, CanonicalStatePort,
     CommandDisposition, CommandReceipt, CommandRequest, ControlBoard, OperatorCommandPort,
@@ -55,6 +55,8 @@ use eliot_controlboard::{
     ReadRequest, Role, SwarmProjectionEnvelope, SwarmProjectionPort, ViewRevision,
 };
 use eliot_governor::ControlBoardGovernorSnapshot;
+
+use super::daemon_kernel_client::OwnerSessionFacts;
 
 /// Builds one [`ControlBoard`] over a fresh Governor projection snapshot.
 ///
@@ -193,6 +195,63 @@ impl AdmittedSessionAccess {
         Ok(binding)
     }
 
+    /// Builds the single live owner binding from already-validated
+    /// Kernel-issued session facts threaded through daemon composition
+    /// (AUD-C02-B, Implements #1187; single-owner decision #1376).
+    ///
+    /// Every identity/provenance byte comes from the threaded facts, never a
+    /// constant: the session id and principal id are parsed from the
+    /// validated `sid=..;session=..` binding string (fail-closed `Invalid` on
+    /// malformed, never a default); the binding id/digest are real SHA-256
+    /// over the binding bytes via the existing digest helper; the receipt ref
+    /// is the held Kernel handoff digest; the lifetime is stamped from the
+    /// real clock (`issued == observed == now`, `expires = now + bounded
+    /// window`, obeying the structural rule in [`Self::validate`]). The role
+    /// is the existing [`Role::HumanSystemOwner`] variant — the one denoting
+    /// the single system owner, so no new variant — with the minimal
+    /// [`PrivacyClass::Public`] scope and the read/query
+    /// [`ActionCapability::StartQuery`] capability only; mutation, approval,
+    /// and recovery capabilities stay unadmitted. `resolve`,
+    /// `with_admitted_sessions`, and `same_binding` are unchanged: unknown
+    /// sessions still resolve `Unavailable` and stale fences still deny.
+    pub(crate) fn from_kernel_owner_facts(facts: &OwnerSessionFacts) -> Result<Self, PortError> {
+        let (principal_sid, session_id) = parse_kernel_session_binding(&facts.session_binding)?;
+        let now = super::unix_ms();
+        let binding_id = sha256_hex(
+            format!(
+                "eliotd-owner-session-binding:{}:{}:{}",
+                facts.session_binding, facts.connection_id, facts.launch_nonce
+            )
+            .as_bytes(),
+        );
+        let binding_digest = sha256_hex(
+            format!(
+                "eliotd-owner-session-digest:{binding_id}:{}:{}:{}",
+                facts.kernel_principal, facts.artifact_digest, facts.protected_snapshot_digest
+            )
+            .as_bytes(),
+        );
+        Self::new(
+            session_id,
+            principal_sid,
+            super::SERVICE_NAME,
+            Role::HumanSystemOwner,
+            vec![PrivacyClass::Public],
+            vec![ActionCapability::StartQuery],
+            binding_id,
+            binding_digest,
+            facts.protected_snapshot_digest.clone(),
+            now,
+            now,
+            // Bounded owner-session window: structural lifetime only; the
+            // issuing owner plus `ControlBoard::seal_for` enforce it on every
+            // view. Any window must satisfy `observed < expires` in `validate`;
+            // five minutes keeps a per-board issuance tight without touching
+            // Kernel authority.
+            now.saturating_add(300_000),
+        )
+    }
+
     fn validate(&self) -> Result<Self, PortError> {
         if !valid_binding_text(&self.session_id)
             || !valid_binding_text(&self.principal_id)
@@ -250,6 +309,21 @@ impl AdmittedSessionAccess {
             && self.observed_at_unix_ms == other.observed_at_unix_ms
             && self.expires_at_unix_ms == other.expires_at_unix_ms
     }
+}
+
+/// Parses the validated Kernel-issued `sid=..;session=..` binding string into
+/// `(principal_sid, session_id)` (AUD-C02-B). Exact shape only: anything else
+/// fails closed as `Invalid`, never a default. Text/character rules are
+/// re-checked by [`AdmittedSessionAccess::new`].
+fn parse_kernel_session_binding(binding: &str) -> Result<(String, String), PortError> {
+    let invalid = || PortError::Invalid("kernel owner session binding is malformed".to_owned());
+    let rest = binding.strip_prefix("sid=").ok_or_else(invalid)?;
+    let (sid, rest) = rest.split_once(';').ok_or_else(invalid)?;
+    let session = rest.strip_prefix("session=").ok_or_else(invalid)?;
+    if sid.is_empty() || session.is_empty() || sid.contains(';') || session.contains(';') {
+        return Err(invalid());
+    }
+    Ok((sid.to_owned(), session.to_owned()))
 }
 
 impl GovernorAccessResolver {
@@ -381,6 +455,14 @@ impl CanonicalStatePort for GovernorCanonicalState {
                     receipt_ref: self.snapshot.i12_report.receipt_ref.clone(),
                 },
             },
+            // AUD-C02-B residual: rows stay empty. The coordination, task, and
+            // observation owners exist in the Governor projection parts
+            // (controlboard_projection.rs:93-112) but carry no ControlBoard
+            // visibility, privacy, or epistemic facts, and no
+            // item/review/provenance mapper exists in bins/eliotd; inventing
+            // rows would be a privacy expansion per
+            // controlboard_projection.rs:23-29. The close condition for this
+            // item is the owner session path only.
             items: Vec::new(),
             reviews: Vec::new(),
             provenance: Vec::new(),
@@ -1546,5 +1628,72 @@ mod tests {
             ),
             Err(PortError::Invalid(_))
         ));
+    }
+
+    fn kernel_owner_facts(session_binding: &str) -> OwnerSessionFacts {
+        OwnerSessionFacts {
+            session_binding: session_binding.to_owned(),
+            kernel_principal: "local-service".to_owned(),
+            connection_id: "eliotd:test-instance:1:550e8400-e29b-41d4-a716-446655440000:1"
+                .to_owned(),
+            launch_nonce: "eliotd:0123456789abcdef0123456789abcdef".to_owned(),
+            artifact_digest: "a".repeat(64),
+            protected_snapshot_digest: "b".repeat(64),
+        }
+    }
+
+    #[test]
+    fn kernel_owner_facts_admit_live_pinned_owner_view() {
+        // AUD-C02-B (a): realistic Kernel-issued facts thread one validated
+        // owner binding through the real factory; resolve with the matching
+        // session id on the live fence returns the live pinned view, never
+        // Unavailable. Real sha256, real fence/revision, real clock — no
+        // canned pass.
+        let admitted = AdmittedSessionAccess::from_kernel_owner_facts(&kernel_owner_facts(
+            "sid=S-1-5-18;session=0",
+        ))
+        .expect("owner admission from Kernel facts");
+        assert_eq!(admitted.session_id, "0");
+        assert_eq!(admitted.principal_id, "S-1-5-18");
+        assert_eq!(admitted.role, Role::HumanSystemOwner);
+        let mut board =
+            controlboard_over_snapshot(snapshot(), &SharedOperatorReplay::new(), vec![admitted]);
+        let view = board
+            .view(&request_for("0"))
+            .expect("live pinned owner view");
+        assert_eq!(view.revision.get(), 7);
+        assert_eq!(view.fence, fence());
+        assert!(view.items.is_empty());
+        assert!(view.reviews.is_empty());
+        assert!(view.provenance.is_empty());
+    }
+
+    #[test]
+    fn kernel_owner_board_refuses_unknown_session_and_stale_fence() {
+        // AUD-C02-B (b): the same board keeps refusal paths — an unadmitted
+        // session is source-not-connected (Unavailable), a stale fence pin is
+        // denied — and malformed Kernel bytes never admit.
+        assert!(
+            AdmittedSessionAccess::from_kernel_owner_facts(&kernel_owner_facts("local-user"))
+                .is_err()
+        );
+        let admitted = AdmittedSessionAccess::from_kernel_owner_facts(&kernel_owner_facts(
+            "sid=S-1-5-18;session=0",
+        ))
+        .expect("owner admission from Kernel facts");
+        let mut board =
+            controlboard_over_snapshot(snapshot(), &SharedOperatorReplay::new(), vec![admitted]);
+        assert_eq!(
+            board.view(&request_for("1")),
+            Err(ControlBoardError::PlanGap(RequiredProvider::AccessResolver))
+        );
+        let stale = request_for("0").pinned(
+            ViewRevision::new(7).expect("revision"),
+            StateFence::new(
+                test_epoch(1),
+                ResourceGeneration::new(6).expect("generation"),
+            ),
+        );
+        assert_eq!(board.view(&stale), Err(ControlBoardError::Unauthorized));
     }
 }

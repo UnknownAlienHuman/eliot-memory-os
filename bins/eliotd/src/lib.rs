@@ -54,6 +54,7 @@ use activation_projection::map_activation_snapshot;
 
 pub use daemon_config::DaemonConfig;
 pub use daemon_kernel_client::DaemonKernelClient;
+pub use daemon_kernel_client::OwnerSessionFacts;
 pub(crate) use daemon_kernel_client::kernel_port_error;
 #[cfg(test)]
 pub(crate) use daemon_kernel_client::{KernelClientError, WireOutcome, operation_payload};
@@ -185,6 +186,13 @@ pub struct DaemonComposition {
     /// already durable. The dependent view is stale/pending until the caller
     /// drops this composition and re-runs authenticated connect+start.
     view_stale: bool,
+    /// Already-validated Kernel-issued owner session facts threaded once by
+    /// the daemon runtime where the concrete client and this composition meet
+    /// (AUD-C02-B, Implements #1187). Facts only, never the client itself:
+    /// [`DaemonComposition::controlboard`] builds at most one admitted owner
+    /// binding from them. `None` until the runtime notes a live session, so
+    /// boards keep the empty (unadmitted) behaviour without one.
+    owner_session: Option<OwnerSessionFacts>,
 }
 
 impl DaemonComposition {
@@ -239,6 +247,7 @@ impl DaemonComposition {
             started: true,
             view_stale: false,
             operator_replay: SharedOperatorReplay::new(),
+            owner_session: None,
         })
     }
 
@@ -432,6 +441,16 @@ impl DaemonComposition {
         }
     }
 
+    /// Records the already-validated Kernel-issued owner session facts for
+    /// the single live owner session (AUD-C02-B, Implements #1187).
+    ///
+    /// Called once by the daemon runtime at the single place holding both the
+    /// concrete [`DaemonKernelClient`] and this composition. Stores facts
+    /// only, never the client; no new thread, no new handshake.
+    pub fn note_owner_session_binding(&mut self, facts: OwnerSessionFacts) {
+        self.owner_session = Some(facts);
+    }
+
     /// Builds one provider-neutral `ControlBoard` over the current Governor
     /// projection snapshot.
     ///
@@ -442,16 +461,31 @@ impl DaemonComposition {
     /// retained volatile replay handle, so a newly created board replays an
     /// already-admitted operation instead of admitting it twice; durable
     /// operator identity stays in Kernel ORS through the async Governor
-    /// operator borrow. Access resolution and the Swarm projection remain
-    /// typed provider gaps until their owning slices land; reads serve a
+    /// operator borrow. Access resolution admits exactly the one live
+    /// Kernel-issued owner session when the runtime threaded validated facts
+    /// (AUD-C02-B), else the typed provider gap; the Swarm projection remains
+    /// a typed provider gap until its owning slice lands. Reads serve a
     /// coherent empty-items view over real G-11/I-12 bindings and submission
     /// admits candidate-only intents.
     pub fn controlboard(&self) -> Result<eliot_controlboard::ControlBoard, DaemonError> {
         let snapshot = self.governor.controlboard_snapshot()?;
+        // One admitted owner binding from the threaded Kernel-issued facts
+        // when present, else the empty production behaviour (unadmitted typed
+        // gap). Malformed held facts stay fail-closed to empty: no live
+        // session is ever minted from a literal.
+        let admitted = match &self.owner_session {
+            Some(facts) => {
+                match controlboard_adapters::AdmittedSessionAccess::from_kernel_owner_facts(facts) {
+                    Ok(binding) => vec![binding],
+                    Err(_) => Vec::new(),
+                }
+            }
+            None => Vec::new(),
+        };
         Ok(controlboard_adapters::controlboard_over_snapshot(
             snapshot,
             &self.operator_replay,
-            Vec::new(),
+            admitted,
         ))
     }
 
