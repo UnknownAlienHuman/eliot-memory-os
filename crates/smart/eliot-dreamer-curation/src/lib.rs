@@ -26,14 +26,14 @@
 #![forbid(unsafe_code)]
 
 use eliot_contracts::{StateFence, canonical_json_bytes, sha256_hex};
-use eliot_dreamer_candidate_validation::RejectionCode;
 use eliot_dreamer_contracts::error::{check_fence, is_hex64_lower, sorted_set_eq};
 use eliot_dreamer_contracts::job::{PRIVACY_GOVERNED_EXTERNAL, PRIVACY_LOCAL_ONLY};
 use eliot_dreamer_contracts::{
     AtomicityMode, BudgetLimits, BudgetUsage, CURATION_FAMILIES, CandidateDisposition,
     ContractViolation, CurationFamily, CurationHandlerPort, CurationHandlerRegistry, CurationKind,
-    Requester, ScreenBinding, ScreenState, TargetDenominator, TypedCurationHandlerRequest,
-    TypedCurationHandlerResult, ValidatedCurationItem, ValidationReceipt, family_of, parse_family,
+    CurationRejectionCode, Requester, ScreenBinding, ScreenState, TargetDenominator,
+    TypedCurationHandlerRequest, TypedCurationHandlerResult, ValidatedCurationItem,
+    ValidationReceipt, family_of, parse_family,
 };
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
@@ -430,7 +430,7 @@ pub struct ValidatedCurationBatch {
     pub invalidation_note: String,
     /// Pinned closed-registry digest; must equal the injected registry digest.
     pub registry_digest: String,
-    /// Exactly one revision pin per owner family, sorted by family spelling.
+    /// Exactly one revision pin per owner family, in `CURATION_FAMILIES` canonical order.
     pub owner_pins: Vec<OwnerRevisionPin>,
     /// Sealed input digest over batch, screen, registry digest, and policy.
     pub input_digest: String,
@@ -525,16 +525,23 @@ impl ValidatedCurationBatch {
                 ),
             });
         }
-        let mut spellings: Vec<String> = Vec::with_capacity(self.owner_pins.len());
-        for pin in &self.owner_pins {
+        let canonical = canonical_families()?;
+        for (index, pin) in self.owner_pins.iter().enumerate() {
             check_bounded_text(&pin.revision, "owner_pins", MAX_ID_BYTES)?;
-            spellings.push(pin.family.as_str().to_owned());
-        }
-        if !is_sorted_unique(&spellings) {
-            return Err(CurationRoutingError::Batch {
-                field: "owner_pins",
-                detail: "owner pins must cover each family exactly once in order".to_owned(),
-            });
+            let Some(expected) = canonical.get(index) else {
+                return Err(CurationRoutingError::Batch {
+                    field: "owner_pins",
+                    detail: "owner pins must cover each family exactly once in canonical order"
+                        .to_owned(),
+                });
+            };
+            if pin.family != *expected {
+                return Err(CurationRoutingError::Batch {
+                    field: "owner_pins",
+                    detail: "owner pins must cover each family exactly once in canonical order"
+                        .to_owned(),
+                });
+            }
         }
         Ok(())
     }
@@ -851,23 +858,25 @@ impl From<CandidateDisposition> for RoutingDisposition {
 
 /// Maps one routing disposition to its routing-only rejection hint.
 ///
-/// Accepted candidates carry no hint. The hint is never an A-05 verdict and
+/// Accepted candidates carry no hint. The hint is never a hub-external verdict and
 /// never authorizes anything; it only classifies preserved outcomes for
 /// downstream accounting.
 #[must_use]
-pub const fn routing_rejection_hint(disposition: RoutingDisposition) -> Option<RejectionCode> {
+pub const fn routing_rejection_hint(
+    disposition: RoutingDisposition,
+) -> Option<CurationRejectionCode> {
     match disposition {
         RoutingDisposition::Candidate => None,
         RoutingDisposition::Duplicate | RoutingDisposition::Conflict => {
-            Some(RejectionCode::LineageMismatch)
+            Some(CurationRejectionCode::LineageMismatch)
         }
         RoutingDisposition::Abstention | RoutingDisposition::Unsupported => {
-            Some(RejectionCode::UnsupportedJobShape)
+            Some(CurationRejectionCode::UnsupportedJobShape)
         }
-        RoutingDisposition::Partial => Some(RejectionCode::UnsupportedPrecision),
-        RoutingDisposition::Blocked => Some(RejectionCode::IdentityMismatch),
-        RoutingDisposition::InternalDefect => Some(RejectionCode::PreservationFailed),
-        RoutingDisposition::Unprocessed => Some(RejectionCode::Cancelled),
+        RoutingDisposition::Partial => Some(CurationRejectionCode::UnsupportedPrecision),
+        RoutingDisposition::Blocked => Some(CurationRejectionCode::IdentityMismatch),
+        RoutingDisposition::InternalDefect => Some(CurationRejectionCode::PreservationFailed),
+        RoutingDisposition::Unprocessed => Some(CurationRejectionCode::Cancelled),
     }
 }
 
@@ -889,7 +898,7 @@ pub struct CurationMemberOutcome {
     /// Exactly one disposition for this member.
     pub disposition: RoutingDisposition,
     /// Routing-only rejection hint classifying the disposition.
-    pub rejection_hint: Option<RejectionCode>,
+    pub rejection_hint: Option<CurationRejectionCode>,
     /// Handler calls performed for this member: exactly zero or one.
     pub calls: u32,
     /// Digest of the dispatched request; absent when never dispatched.
