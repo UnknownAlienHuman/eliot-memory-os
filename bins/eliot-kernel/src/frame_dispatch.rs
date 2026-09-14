@@ -184,6 +184,31 @@ impl KernelComposition {
                 }
                 return self.dispatch_native_worker_replay_frame(session, frame);
             }
+            if super::provider_capability_route::is_provider_capability_operation(native_operation)
+            {
+                // Provider-capability verification (T9-04) delegates to the
+                // capability route file. Same Ready-gating and peer
+                // authentication as the lifecycle/replay branches; per-call
+                // session authentication, the ORS claim lookup, the fresh
+                // live-epoch query, and the owner delegation live in the
+                // route. Stale bindings fence the session there and are never
+                // granted authority.
+                if self
+                    .service_state()
+                    .map_err(|_| TransportError::SessionFenced)?
+                    != KernelServiceState::Ready
+                {
+                    return Err(TransportError::SessionFenced);
+                }
+                session
+                    .peer
+                    .validate()
+                    .map_err(|_| TransportError::PeerIdentityUnavailable)?;
+                if frame.request_id.is_none() || frame.request_identity.is_none() {
+                    return Err(TransportError::SessionFenced);
+                }
+                return self.dispatch_provider_capability_frame(session, frame);
+            }
             #[cfg(windows)]
             if super::host_request_route::is_host_request_operation(native_operation) {
                 // P-04 admitted host-request envelopes ride the same admitted
