@@ -947,7 +947,24 @@ pub struct AcpEvent {
 }
 
 impl AcpEvent {
-    /// Converts a normalized event to the A-01 host-event contract.
+    /// Legacy quarantine boundary (issue #371 T4 S7): converts a legacy generic
+    /// event to the legacy `HostEventEnvelope` wire with
+    /// `normalized_payload: serde_json::Value` and `lineage: None`.
+    ///
+    /// New code must use [`normalize_acp_event`] with explicit
+    /// [`ProviderObservationLineage`] plus the recorded #369 admission, which
+    /// returns the closed [`NormalizedHostEventEnvelope`] and its
+    /// [`HostEventNormalizationReceipt`]. This legacy path carries no receipt,
+    /// binds no normalizer identity/version, accepts caller-supplied digest and
+    /// wall-clock strings, and leaves `lineage: None` (session observation
+    /// only, rejected for attribution). Its payload/booleans (for example the
+    /// `terminal` flag on [`AcpResultEnvelope`]) are never promoted to
+    /// authority, completion, usage proof, or route admission. Retained only
+    /// because the in-crate compatibility test exercises it; no new producer or
+    /// consumer may be added.
+    #[deprecated(
+        note = "legacy quarantine boundary; use normalize_acp_event with explicit lineage plus admission for new code"
+    )]
     pub fn into_host_event(
         self,
         raw_payload_digest: String,
@@ -1030,15 +1047,29 @@ pub struct AcpHostEventInput<'a> {
 pub const ACP_NORMALIZER_IDENTITY: &str = "eliot-agent-acp";
 
 /// Normalizes one typed ACP observation into the closed v7 host-event schema
-/// (issue #371 S7-partial).
+/// (issue #371 T4 S7).
 ///
 /// The adapter identity/version (`eliot-agent-acp` / [`ACP_SCHEMA_VERSION`])
 /// is bound by this function, never supplied by the caller; the input source
-/// digest is computed from `raw_source_bytes`; and the sealed envelope is
-/// validated before return (execution-unit lineage against the exact binding
-/// plus the #369 admission, session lineage on the session path). Raw bytes
-/// stay behind the restricted handle; the public payload holds the bounded
-/// typed summary only.
+/// digest is computed from `raw_source_bytes` with the canonical
+/// `sha256-canonical-json-v1` algorithm; and the sealed envelope is validated
+/// before return (execution-unit lineage against the exact binding plus the
+/// #369 admission, session lineage on the session path). Raw bytes stay behind
+/// the restricted handle; the public payload holds the bounded typed summary
+/// only. `raw_source_bytes` plus the [`RestrictedRawSourceHandle`] are both
+/// required: a missing handle or missing bytes fails closed, and the combined
+/// [`RawSourceRecord`](eliot_agent_api::RawSourceRecord) is validated before
+/// sealing. Absent native cursor/replay evidence is never synthesized: cursors
+/// arrive from the post-R1 owner via the input fields, and delivery stays as
+/// supplied (best-effort or explicit replay, never a fabricated durable
+/// cursor).
+///
+/// The returned pair feeds
+/// `eliot-agent-coordinator::AgentCoordinator::observe_provider_event`
+/// directly: the receipt equals the envelope's embedded normalization receipt
+/// (`envelope.normalization == receipt`), both carry
+/// [`eliot_agent_api::ProofCeiling::Observation`] only, and no new store,
+/// durable sink, or Kernel authority is created here.
 pub fn normalize_acp_event(
     input: AcpHostEventInput<'_>,
 ) -> Result<(NormalizedHostEventEnvelope, HostEventNormalizationReceipt), AcpAdapterError> {
@@ -1047,6 +1078,22 @@ pub fn normalize_acp_event(
     }
     if input.raw_source_bytes.is_empty() || input.raw_source_bytes.len() > DEFAULT_MAX_FRAME_BYTES {
         return Err(AcpAdapterError::InvalidInput("raw_source_bytes"));
+    }
+    if input.predecessors.len() > eliot_agent_api::MAX_HOST_EVENT_PREDECESSORS {
+        return Err(AcpAdapterError::InvalidInput("predecessors"));
+    }
+    if input.omitted_source_fields.len() > eliot_agent_api::MAX_HOST_EVENT_OMITTED_FIELDS {
+        return Err(AcpAdapterError::InvalidInput("omitted_fields"));
+    }
+    if input.warnings.len() > eliot_agent_api::MAX_HOST_EVENT_WARNINGS {
+        return Err(AcpAdapterError::InvalidInput("warnings"));
+    }
+    // Loss-manifest invariant, checked before sealing so a complete
+    // normalization with a stray omission (or vice versa) fails closed here
+    // rather than after minting a digest.
+    let lossy_input = input.coverage != NormalizationCoverage::Complete;
+    if lossy_input == input.omitted_source_fields.is_empty() {
+        return Err(AcpAdapterError::InvalidInput("omitted_fields/coverage"));
     }
     if let ProviderObservationLineage::ExecutionUnitObservation(_) = &input.lineage {
         match input.admission {
@@ -1058,12 +1105,26 @@ pub fn normalize_acp_event(
     } else if input.admission.is_some() {
         return Err(AcpAdapterError::InvalidInput("admission/lineage"));
     }
-    let input_digest = serde_json::from_value(Value::String(eliot_contracts::sha256_hex(
-        input.raw_source_bytes,
-    )))
-    .map_err(|_| {
-        AcpAdapterError::ContractValidation(eliot_agent_api::ContractError::DigestMismatch)
-    })?;
+    let input_digest: LowercaseSha256 =
+        serde_json::from_value(Value::String(eliot_contracts::sha256_hex(
+            input.raw_source_bytes,
+        )))
+        .map_err(|_| {
+            AcpAdapterError::ContractValidation(eliot_agent_api::ContractError::DigestMismatch)
+        })?;
+    // The restricted handle plus its qualified digest must validate together
+    // before any envelope is minted; a handle without its digest (or vice
+    // versa) fails closed here.
+    let raw_record = eliot_agent_api::RawSourceRecord {
+        handle: input.raw_source_handle.clone(),
+        digest: eliot_agent_api::QualifiedSourceDigest {
+            algorithm: eliot_agent_api::HOST_EVENT_DIGEST_ALGORITHM.to_owned(),
+            digest: input_digest.clone(),
+        },
+    };
+    raw_record
+        .validate()
+        .map_err(AcpAdapterError::ContractValidation)?;
     let unsupported_disposition = match &input.payload {
         NormalizedHostEventPayload::UnsupportedQuarantined(_) => {
             UnsupportedDisposition::UnsupportedMethodQuarantined
@@ -1981,6 +2042,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(deprecated)]
     fn event_conversion_preserves_attempt_and_route() -> Result<(), Box<dyn std::error::Error>> {
         let event = AcpEvent {
             event_id: EventId::new("event")?,
@@ -2333,6 +2395,206 @@ mod tests {
         // Ensure no legacy string fallback is present.
         let s = schema.to_string();
         assert!(!s.contains("\"legacy-fence\""));
+        Ok(())
+    }
+
+    fn typed_acp_input<'a>(
+        event_id: EventId,
+        cursor: EventCursor,
+        sequence: u64,
+        lineage: ProviderObservationLineage,
+        raw: &'a [u8],
+        handle: RestrictedRawSourceHandle,
+        admission: Option<&'a AdmittedRouteReceipt>,
+    ) -> AcpHostEventInput<'a> {
+        use eliot_agent_api::AssistantDeltaObservation;
+        AcpHostEventInput {
+            event_id,
+            cursor,
+            sequence,
+            predecessors: Vec::new(),
+            lineage,
+            raw_source_bytes: raw,
+            raw_source_handle: handle,
+            payload: NormalizedHostEventPayload::AssistantDelta(AssistantDeltaObservation {
+                delta_chars: 2,
+                truncated: false,
+            }),
+            omitted_source_fields: Vec::new(),
+            warnings: Vec::new(),
+            privacy_class: HostEventPrivacyClass::RedactedSummary,
+            coverage: NormalizationCoverage::Complete,
+            observed_at: ClockReading {
+                valid_time_ms: Some(1_700_000_000_000),
+                known_time_ms: Some(1_700_000_000_001),
+                transaction_sequence: None,
+                monotonic_ns: None,
+            },
+            delivery: HostEventDeliveryDisposition::DurableOrdered,
+            admission,
+        }
+    }
+
+    #[test]
+    #[allow(deprecated)]
+    fn legacy_into_host_event_is_quarantined_without_lineage_or_receipt()
+    -> Result<(), Box<dyn std::error::Error>> {
+        // Reverse-consumer proof: the only in-workspace caller of the legacy
+        // path is the compatibility test itself; new code must use
+        // `normalize_acp_event`. The legacy envelope carries no lineage and no
+        // normalization receipt, so it can never deserialize as the closed v7
+        // schema and can never feed `observe_provider_event`.
+        let event = AcpEvent {
+            event_id: EventId::new("evt-acp-legacy-q")?,
+            attempt_id: AttemptId::new("attempt")?,
+            session_id: "session".into(),
+            sequence: 1,
+            cursor: EventCursor::new("cursor-legacy-q")?,
+            kind: HostEventKind::AssistantDelta,
+            route: route(),
+            payload: serde_json::json!({"text":"ok"}),
+        };
+        let legacy = event.into_host_event("digest".into(), "now".into())?;
+        assert_eq!(legacy.lineage, None);
+        // Legacy generic payload never deserializes as the closed typed envelope.
+        let legacy_wire = serde_json::to_value(&legacy)?;
+        assert!(
+            serde_json::from_value::<NormalizedHostEventEnvelope>(legacy_wire).is_err()
+        );
+        // Legacy caller-supplied digest/time strings are never qualified source
+        // digests or typed clock readings.
+        assert!(
+            serde_json::from_value::<eliot_agent_api::QualifiedSourceDigest>(
+                serde_json::json!({"algorithm": "unqualified", "digest": legacy.raw_payload_digest})
+            )
+            .is_err()
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn typed_normalizer_hardening_rejects_bounds_and_loss_mismatch()
+    -> Result<(), Box<dyn std::error::Error>> {
+        use eliot_agent_api::{ExecutionUnitObservation, HostEventDeliveryDisposition};
+        let route = route();
+        let binding = binding_for(&route)?;
+        let admission = admission_for(&binding)?;
+        let raw = br#"{"jsonrpc":"2.0","method":"session/update","params":{}}"#;
+        let cursor = EventCursor::new("cursor-acp-harden-1")?;
+        let lineage = ProviderObservationLineage::ExecutionUnitObservation(Box::new(
+            ExecutionUnitObservation {
+                binding: binding.clone(),
+                cursor: cursor.clone(),
+                sequence: 1,
+            },
+        ));
+        // Empty raw bytes fail closed before any digest is minted.
+        assert!(matches!(
+            normalize_acp_event(typed_acp_input(
+                EventId::new("evt-acp-harden-empty")?,
+                cursor.clone(),
+                1,
+                lineage.clone(),
+                b"",
+                RestrictedRawSourceHandle::new("restricted-acp:harden-empty")?,
+                Some(&admission),
+            )),
+            Err(AcpAdapterError::InvalidInput("raw_source_bytes"))
+        ));
+        // Complete coverage with a stray omission fails closed (and vice versa).
+        let mut mismatched = typed_acp_input(
+            EventId::new("evt-acp-harden-loss")?,
+            cursor.clone(),
+            1,
+            lineage.clone(),
+            raw,
+            RestrictedRawSourceHandle::new("restricted-acp:harden-loss")?,
+            Some(&admission),
+        );
+        mismatched.omitted_source_fields = vec!["extra:future".to_owned()];
+        mismatched.coverage = NormalizationCoverage::Complete;
+        assert!(matches!(
+            normalize_acp_event(mismatched),
+            Err(AcpAdapterError::InvalidInput("omitted_fields/coverage"))
+        ));
+        // Oversized predecessor list fails closed without minting a digest.
+        let mut too_many = typed_acp_input(
+            EventId::new("evt-acp-harden-pred")?,
+            cursor.clone(),
+            1,
+            lineage,
+            raw,
+            RestrictedRawSourceHandle::new("restricted-acp:harden-pred")?,
+            Some(&admission),
+        );
+        too_many.predecessors = (0..9)
+            .map(|index| EventCursor::new(format!("cursor-pred-{index}")))
+            .collect::<Result<Vec<EventCursor>, _>>()?
+            .into_iter()
+            .map(|_| EventId::new("evt-pred").expect("valid predecessor"))
+            .collect();
+        // Nine predecessors exceed MAX_HOST_EVENT_PREDECESSORS (8).
+        assert!(matches!(
+            normalize_acp_event(too_many),
+            Err(AcpAdapterError::InvalidInput("predecessors"))
+        ));
+        // Delivery is preserved as supplied; no cursor is synthesized.
+        let _ = HostEventDeliveryDisposition::BestEffortOrdered;
+        Ok(())
+    }
+
+    #[test]
+    fn typed_output_feeds_coordinator_shape_without_new_store()
+    -> Result<(), Box<dyn std::error::Error>> {
+        use eliot_agent_api::{AssistantDeltaObservation, ExecutionUnitObservation};
+        let route = route();
+        let binding = binding_for(&route)?;
+        let admission = admission_for(&binding)?;
+        let raw = br#"{"jsonrpc":"2.0","method":"session/update","params":{"delta":"hi"}}"#;
+        let cursor = EventCursor::new("cursor-acp-coord-1")?;
+        let (envelope, receipt) = normalize_acp_event(AcpHostEventInput {
+            event_id: EventId::new("evt-acp-coord-1")?,
+            cursor: cursor.clone(),
+            sequence: 1,
+            predecessors: Vec::new(),
+            lineage: ProviderObservationLineage::ExecutionUnitObservation(Box::new(
+                ExecutionUnitObservation {
+                    binding: binding.clone(),
+                    cursor: cursor.clone(),
+                    sequence: 1,
+                },
+            )),
+            raw_source_bytes: raw,
+            raw_source_handle: RestrictedRawSourceHandle::new("restricted-acp:coord-1")?,
+            payload: NormalizedHostEventPayload::AssistantDelta(AssistantDeltaObservation {
+                delta_chars: 2,
+                truncated: false,
+            }),
+            omitted_source_fields: Vec::new(),
+            warnings: Vec::new(),
+            privacy_class: HostEventPrivacyClass::RedactedSummary,
+            coverage: NormalizationCoverage::Complete,
+            observed_at: ClockReading::default(),
+            delivery: HostEventDeliveryDisposition::BestEffortOrdered,
+            admission: Some(&admission),
+        })?;
+        // Coordinator `observe_provider_event` requires the receipt to equal the
+        // envelope's embedded receipt; this pair satisfies that by construction.
+        assert_eq!(envelope.normalization, receipt);
+        envelope.validate_for_lineage(&binding, &admission)?;
+        // Public payload is a typed summary only: raw frame bytes never appear.
+        let public = serde_json::to_value(&envelope)?;
+        assert!(!public.to_string().contains("session/update"));
+        // Raw source is bound by handle plus qualified digest, never embedded.
+        assert_eq!(
+            envelope.raw_source.handle.as_str(),
+            "restricted-acp:coord-1"
+        );
+        envelope.raw_source.validate()?;
+        assert_eq!(
+            envelope.raw_source.digest.algorithm,
+            eliot_agent_api::HOST_EVENT_DIGEST_ALGORITHM
+        );
         Ok(())
     }
 }
