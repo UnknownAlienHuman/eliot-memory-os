@@ -1,0 +1,324 @@
+name: Manual Windows Integration Workflow
+
+# Implements #915 (cases 915/1..20, structural tier; live case-20 evidence
+# arrives only via a controller-authorized manual dispatch after this file is
+# registered on the default branch, never from a pre-registration claim).
+# Delegation only, no hand-rolled build/test logic:
+#   #750 scripts/verify.ps1 owns the closed Review profile and locked build;
+#   #905 scripts/integration/ignored_test_inventory.py owns the inventory;
+#   #907 IntegrationHarness.Core.psm1 owns ValidateConfiguration and the single
+#   Run; #909/#911/#913 own the required providers.
+# This file defines no second test list: target_profile below is a closed
+# single supported value and #907 resolves it to a finite selection at run time.
+#
+# Manual-only policy (.github/README.md; repository-policy.yml): `on:` carries
+# `workflow_dispatch` only. No automatic trigger may ever be added here.
+#
+# Cache note: the Cargo cache key binds runner OS + target profile + Cargo.lock.
+# A cache hit still runs inventory, validation, execution, and cleanup below; a
+# hit never skips a gate and never mints a pass receipt.
+#
+# Retry note: no automatic retries exist. A manual rerun is a new immutable
+# attempt; the prior run result is retained by the run history.
+#
+# Evidence-channel note: no third-party upload action is pinned here because no
+# upload-artifact SHA is verifiable from base content, and inventing a SHA is
+# forbidden. Evidence publication stays inside the harness Core module (#907),
+# which owns bounded redacted receipts. No artifact or runtime token is passed
+# to checked-out code, and this workflow carries no credential material.
+
+on:
+  workflow_dispatch:
+    inputs:
+      admitted_source_sha:
+        description: Exact admitted 40-hex source SHA to check out and execute (source admission, distinct from workflow registration identity)
+        required: true
+        type: string
+      target_profile:
+        description: Fixed supported integration target profile (#907 resolves it to a finite selection; YAML defines no second test list)
+        required: true
+        default: windows-2022-review
+        type: choice
+        options:
+          - windows-2022-review
+      retention_days:
+        description: Finite evidence retention in days (7-30)
+        required: true
+        default: 14
+        type: number
+
+permissions:
+  contents: read
+
+concurrency:
+  group: integration-${{ inputs.admitted_source_sha }}-${{ inputs.target_profile }}
+  # cancel-in-progress is intentionally absent (GitHub defaults it to false) so
+  # one dispatch can never bypass an unrelated active run or its cleanup.
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_TERM_VERBOSE: false
+  RUST_BACKTRACE: 1
+
+jobs:
+  inventory:
+    name: Inventory before configuration and run
+    permissions:
+      contents: read
+    runs-on: windows-latest
+    timeout-minutes: 60
+
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          ref: ${{ inputs.admitted_source_sha }}
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Guard admitted inputs and checkout identity
+        shell: pwsh
+        run: |
+          $sha = '${{ inputs.admitted_source_sha }}'
+          if ($sha -notmatch '^[0-9a-fA-F]{40}$') {
+            throw "ADMITTED_SOURCE_SHA_INVALID: admitted_source_sha must be an exact 40-hex commit SHA."
+          }
+          $head = (git rev-parse HEAD).Trim()
+          if ($head -ne $sha) {
+            throw "SOURCE_IDENTITY_FAILURE: checked out $head but admitted $sha."
+          }
+          if ('${{ inputs.target_profile }}' -ne 'windows-2022-review') {
+            throw "TARGET_PROFILE_REJECTED: only the closed supported value windows-2022-review is admitted."
+          }
+          $retention = [int]'${{ inputs.retention_days }}'
+          if ($retention -lt 7 -or $retention -gt 30) {
+            throw "RETENTION_REJECTED: retention_days must be a finite 7-30."
+          }
+          Add-Content -LiteralPath $env:GITHUB_STEP_SUMMARY -Value "- Admitted source SHA: $head"
+
+      - name: Show pinned toolchain identity (no latest installer)
+        run: rustup show active-toolchain
+
+      - name: Record observed runner image and tool identities
+        shell: pwsh
+        run: |
+          Add-Content -LiteralPath $env:GITHUB_STEP_SUMMARY -Value "- Runner OS: $env:RUNNER_OS"
+          Add-Content -LiteralPath $env:GITHUB_STEP_SUMMARY -Value "- Runner image: $env:ImageOS $env:ImageVersion"
+          python --version
+          $PSVersionTable.PSVersion.ToString()
+
+      - name: Cache Cargo inputs (hit still runs every gate below)
+        uses: actions/cache@1bd1e32a3bdc45362d1e726936510720a7c30a57 # v4.2.0
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+          key: ${{ runner.os }}-cargo-windows-2022-review-${{ hashFiles('Cargo.lock') }}
+
+      - name: Produce run-local ignored-test inventory
+        shell: pwsh
+        run: |
+          python scripts/integration/ignored_test_inventory.py --repo-root . --output .eliot/inventory.json
+
+      - name: Validate inventory digest, target, and coverage denominator
+        shell: pwsh
+        run: |
+          $admitted = '${{ inputs.admitted_source_sha }}'
+          $inventory = Get-Content -LiteralPath .eliot/inventory.json -Raw | ConvertFrom-Json
+          if ($inventory.header.schema -ne 'eliot.integration.ignored-test-inventory.v1') {
+            throw 'INVENTORY_SCHEMA_FAILURE: unexpected inventory schema.'
+          }
+          if ($inventory.header.source_identity.head -ne $admitted) {
+            throw 'INVENTORY_SOURCE_FAILURE: inventory source identity does not match the admitted SHA.'
+          }
+          $rows = @($inventory.rows)
+          if ($rows.Count -eq 0 -or $inventory.header.row_count -ne $rows.Count) {
+            throw 'INVENTORY_DENOMINATOR_FAILURE: zero or contradictory row denominator.'
+          }
+          if ($inventory.header.aggregate_sha256 -notmatch '^[0-9a-f]{64}$') {
+            throw 'INVENTORY_DIGEST_FAILURE: aggregate digest is missing or malformed.'
+          }
+          $seen = @{}
+          foreach ($row in $rows) {
+            foreach ($field in @('package_id', 'target_kind', 'target_name', 'test_name', 'row_digest')) {
+              if ([string]::IsNullOrWhiteSpace([string]$row.$field)) {
+                throw "INVENTORY_ROW_FAILURE: row is missing $field."
+              }
+            }
+            if ([string]$row.row_digest -notmatch '^[0-9a-f]{64}$') {
+              throw 'INVENTORY_ROW_FAILURE: row digest is malformed.'
+            }
+            $identity = '{0}::{1}::{2}::{3}' -f $row.package_id, $row.target_kind, $row.target_name, $row.test_name
+            if ($seen.ContainsKey($identity)) {
+              throw "INVENTORY_ROW_FAILURE: duplicate selected identity: $identity."
+            }
+            $seen[$identity] = $true
+          }
+          Add-Content -LiteralPath $env:GITHUB_STEP_SUMMARY -Value "- Inventory rows: $($rows.Count)"
+          Add-Content -LiteralPath $env:GITHUB_STEP_SUMMARY -Value "- Inventory complete: $($inventory.header.complete)"
+          Add-Content -LiteralPath $env:GITHUB_STEP_SUMMARY -Value "- Inventory ceiling: $($inventory.header.proof_ceiling)"
+
+  validate:
+    name: Validate configuration after inventory
+    permissions:
+      contents: read
+    needs:
+      - inventory
+    runs-on: windows-latest
+    timeout-minutes: 120
+
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          ref: ${{ inputs.admitted_source_sha }}
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Guard admitted inputs and checkout identity
+        shell: pwsh
+        run: |
+          $sha = '${{ inputs.admitted_source_sha }}'
+          if ($sha -notmatch '^[0-9a-fA-F]{40}$') {
+            throw "ADMITTED_SOURCE_SHA_INVALID: admitted_source_sha must be an exact 40-hex commit SHA."
+          }
+          $head = (git rev-parse HEAD).Trim()
+          if ($head -ne $sha) {
+            throw "SOURCE_IDENTITY_FAILURE: checked out $head but admitted $sha."
+          }
+
+      - name: Show pinned toolchain identity (no latest installer)
+        run: rustup show active-toolchain
+
+      - name: Cache Cargo inputs (hit still runs every gate below)
+        uses: actions/cache@1bd1e32a3bdc45362d1e726936510720a7c30a57 # v4.2.0
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+          key: ${{ runner.os }}-cargo-windows-2022-review-${{ hashFiles('Cargo.lock') }}
+
+      - name: Re-derive run-local inventory with the single #905 owner
+        shell: pwsh
+        run: |
+          python scripts/integration/ignored_test_inventory.py --repo-root . --output .eliot/inventory.json
+
+      - name: Run canonical locked Review gate with the single #750 owner
+        shell: pwsh
+        run: pwsh -NoProfile -File scripts/verify.ps1 -Profile Review
+
+      - name: Validate harness configuration against the inventory
+        shell: pwsh
+        run: |
+          Import-Module (Join-Path $env:GITHUB_WORKSPACE 'scripts/integration/IntegrationHarness.Core.psm1')
+          $result = Invoke-HarnessValidateConfiguration -InventoryPath (Join-Path $env:GITHUB_WORKSPACE '.eliot/inventory.json') -TimeoutSeconds 3600
+          if ($result.status -ne 'Valid') {
+            throw "HARNESS_CONFIGURATION_FAILURE: ValidateConfiguration did not report Valid."
+          }
+          Add-Content -LiteralPath $env:GITHUB_STEP_SUMMARY -Value "- ValidateConfiguration rows: $($result.rowCount)"
+
+  run:
+    name: Execute the single bounded integration run
+    permissions:
+      contents: read
+    needs:
+      - validate
+    runs-on: windows-latest
+    timeout-minutes: 180
+
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          ref: ${{ inputs.admitted_source_sha }}
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Guard admitted inputs and checkout identity
+        shell: pwsh
+        run: |
+          $sha = '${{ inputs.admitted_source_sha }}'
+          if ($sha -notmatch '^[0-9a-fA-F]{40}$') {
+            throw "ADMITTED_SOURCE_SHA_INVALID: admitted_source_sha must be an exact 40-hex commit SHA."
+          }
+          $head = (git rev-parse HEAD).Trim()
+          if ($head -ne $sha) {
+            throw "SOURCE_IDENTITY_FAILURE: checked out $head but admitted $sha."
+          }
+
+      - name: Show pinned toolchain identity (no latest installer)
+        run: rustup show active-toolchain
+
+      - name: Cache Cargo inputs (hit still runs execution and cleanup)
+        uses: actions/cache@1bd1e32a3bdc45362d1e726936510720a7c30a57 # v4.2.0
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+          key: ${{ runner.os }}-cargo-windows-2022-review-${{ hashFiles('Cargo.lock') }}
+
+      - name: Re-derive run-local inventory with the single #905 owner
+        shell: pwsh
+        run: |
+          python scripts/integration/ignored_test_inventory.py --repo-root . --output .eliot/inventory.json
+
+      - name: Execute the one explicit bounded harness run
+        shell: pwsh
+        run: |
+          Import-Module (Join-Path $env:GITHUB_WORKSPACE 'scripts/integration/IntegrationHarness.Core.psm1')
+          Invoke-HarnessRun -SelectAllRows -InventoryPath (Join-Path $env:GITHUB_WORKSPACE '.eliot/inventory.json') -TimeoutSeconds 3600
+
+  evidence-cleanup:
+    name: Collect bounded redacted evidence and clean up
+    permissions:
+      contents: read
+    needs:
+      - inventory
+      - validate
+      - run
+    if: always()
+    runs-on: windows-latest
+    timeout-minutes: 30
+
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          ref: ${{ inputs.admitted_source_sha }}
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Write bounded redacted receipt with finite retention
+        shell: pwsh
+        env:
+          INVENTORY_RESULT: ${{ needs.inventory.result }}
+          VALIDATE_RESULT: ${{ needs.validate.result }}
+          RUN_RESULT: ${{ needs.run.result }}
+        run: |
+          Import-Module (Join-Path $env:GITHUB_WORKSPACE 'scripts/integration/IntegrationHarness.Core.psm1')
+          $retention = [int]'${{ inputs.retention_days }}'
+          if ($retention -lt 7 -or $retention -gt 30) {
+            throw "RETENTION_REJECTED: retention_days must be a finite 7-30."
+          }
+          # Runner loss, forced cancellation, or job timeout can prevent this
+          # finalizer from completing: a missing or partial receipt stays
+          # unknown/reconciliation-required and never reads as clean.
+          $manifest = @(
+            'workflow=Manual Windows Integration Workflow',
+            ('admitted_source_sha={0}' -f '${{ inputs.admitted_source_sha }}'),
+            ('checkout_sha={0}' -f ((git rev-parse HEAD).Trim())),
+            ('target_profile={0}' -f '${{ inputs.target_profile }}'),
+            ('retention_days={0}' -f $retention),
+            ('inventory={0}' -f $env:INVENTORY_RESULT),
+            ('validate={0}' -f $env:VALIDATE_RESULT),
+            ('run={0}' -f $env:RUN_RESULT),
+            ('runner_os={0}' -f $env:RUNNER_OS)
+          ) -join "`n"
+          $redacted = Get-IntegrationHarnessRedactedText -Text $manifest -MaxBytes 65536
+          $receiptPath = Join-Path $env:GITHUB_WORKSPACE '.eliot/evidence-receipt.txt'
+          [System.IO.File]::WriteAllText($receiptPath, [string]$redacted)
+          Add-Content -LiteralPath $env:GITHUB_STEP_SUMMARY -Value '### Integration evidence receipt (redacted, bounded)'
+          Add-Content -LiteralPath $env:GITHUB_STEP_SUMMARY -Value ([string]$redacted)
+          Add-Content -LiteralPath $env:GITHUB_STEP_SUMMARY -Value "- Retention bound days: $retention"
+          if ($env:INVENTORY_RESULT -ne 'success' -or $env:VALIDATE_RESULT -ne 'success' -or $env:RUN_RESULT -ne 'success') {
+            throw 'EVIDENCE_CLEANUP_UNKNOWN: an upstream gate did not succeed; cleanup is reconciliation-required, never green.'
+          }
+          if (-not (Test-Path -LiteralPath $receiptPath -PathType Leaf)) {
+            throw 'EVIDENCE_CLEANUP_UNKNOWN: redacted receipt is missing; result stays unknown.'
+          }
