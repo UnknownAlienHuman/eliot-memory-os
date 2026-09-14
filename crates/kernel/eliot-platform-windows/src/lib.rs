@@ -107,6 +107,7 @@ mod process_job;
 mod process_path_lease;
 mod protected_path;
 mod runtime_receipt_publication;
+pub mod scm_entry;
 mod secret_store;
 mod service_registration;
 mod supervision_authority_key;
@@ -242,6 +243,11 @@ pub use protected_path::{
 pub use runtime_receipt_publication::{
     PublicationOutcome, PublicationPrecondition, PublicationReceipt, PublicationUnknown,
     PublicationUnknownReceipt, publish_atomic_owned_runtime_receipt,
+};
+pub use scm_entry::{
+    DispatcherOutcome, MAX_SERVICE_ARG_UNITS, ServiceArgvError, ServiceControlHandlerFn,
+    ServiceMainFn, ServiceStatusHandle, ServiceStatusReport, Win32Error, parse_service_main_argv,
+    register_service_control_handler, report_service_status, run_service_dispatcher,
 };
 use secret_store::valid_credential_key;
 pub use secret_store::{
