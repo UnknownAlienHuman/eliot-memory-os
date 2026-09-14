@@ -127,3 +127,40 @@ commands = [
 edge_proof = "Generate twice, compare exact bytes, compile, mutate every load-bearing input and exercise installation admission plus cutover/rollback; or prove zero current consumers for a legacy/delete disposition."
 product_proof = "Issue #11 remains open."
 # RECHECK-1195 disposition (b): disposition = "LEGACY_D01"; retirement = "read-only historical verifier; deletion wave follows with #1189".
+# RESIDUAL-1195 (branch work/1195-sealed-bundle-residual, base 1395d0f0c17c0d84b68cff19ccb4895dec8c9d0b):
+# bounded hardening ledger for the retained read-only LEGACY_D01 verifier (#1223 reqs 1-4
+# merged into #1195). Disposition stays (b); this note records evidence only: it creates no
+# owner and no new ontology. Capability-registry reuse cites #13 by name only; evidence /
+# invalidation closure cites #216 by name only; no second owner is created.
+# Native process calls (single spawn site; fixed allowlist by construction):
+# - workspace/tools/eliot-runtime-compiler/src/lib.rs:3796 `Command::new` inside run_command
+#   (lib.rs:3794), which accepts ONLY RepositoryTool (lib.rs:207): CargoMetadata via
+#   lib.rs:3868,3916; GitRevParseHead 3894; GitStatusPorcelain 3896; GitDiffBinaryHead 3897;
+#   GitLsFilesOthers 3898. Exact shapes: `cargo metadata --no-deps --format-version 1
+#   --offline --locked`; `git rev-parse HEAD`; `git status --porcelain=v1 --untracked-files=all`;
+#   `git diff --binary --no-ext-diff --full-index HEAD --`; `git ls-files --others
+#   --exclude-standard`. No shell (argv spawn), no network (--offline; local-only git shapes),
+#   no credentials. Output capped + 120s timeout before conversion/parse (read_capped 3770).
+# Report fields (receipt, lib.rs:4288): schema_version, work_id, plan_id, profile,
+# authoritative:false, verdict, document_status_ceiling (non-current ceiling),
+# manifest_sha256, payload_root_sha256, payload_sha256, checks, checks_passed, checks_total,
+# errors, warnings, current_source_gap, source_snapshot. Report write is create-new atomic,
+# external to all roots, size-capped before write (lib.rs:3973).
+# Pre-allocation caps (bounds module, lib.rs:78-100; typed CompilerError, lib.rs:108):
+# MAX_INPUT_FILE_BYTES 8MiB (read_json 532 + payload hashing); MAX_JSON_DEPTH 64 /
+# MAX_JSON_CONTAINERS 100000 / MAX_JSON_STRING_LEN 1MiB (check_json_bounds, enforced in
+# read_json + cargo metadata parses); MAX_PAYLOAD_COUNT 512 + MAX_TOTAL_PAYLOAD_BYTES 64MiB
+# (manifest loop); MAX_PROCESS_OUTPUT_BYTES 8MiB + MAX_PROCESS_TIMEOUT_SECS 120 (run_command);
+# MAX_REPORT_BYTES 8MiB (write_report_atomic).
+# Identity/expiry (lib.rs:53-67): LEGACY_D01_VERSION bound to CARGO_PKG_VERSION (also
+# surfaced by --version; main.rs untouched); LEGACY_D01_EXPIRY + LEGACY_D01_REMOVAL_CONDITION
+# = zero-reference removal per #1223 req 4.
+# Roots/symlinks: resolve_payload (567) rejects symlinks/reparse points via symlink_metadata
+# (398, never follows); validate_input_roots (423) rejects nested roots (exact equality stays
+# the documented single-root projection: the CLI defaults normative_root to runtime_root);
+# new audit check_ids roots.disjoint (4049) + payload.symlink_rejected (4093); verdict FAIL.
+# Verification on this branch: cargo check --locked -p eliot-runtime-compiler --all-targets OK
+# (2 pre-existing main.rs deprecated-use warnings); cargo test --locked -p eliot-runtime-compiler:
+# 36 passed (28 pre-existing + 8 new), 0 failed; cargo fmt --check clean; clippy clean for the
+# package; git diff --check clean. Docs routing read receipts: e5c16a51 (lib.rs),
+# f6c8acdb (assignment toml), 327638a7 (main.rs).
