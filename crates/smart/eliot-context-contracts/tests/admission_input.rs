@@ -246,6 +246,7 @@ fn complete_result(input: &AdmissionInput) -> AdmissionResult {
             remaining_headroom: 46,
             route_capacity: 100,
         },
+        recipe_digest: input.recipe.recipe_sha256.clone(),
         receipt_digest: digest(),
     };
     let mut admitted = AdmittedContextSet {
@@ -264,6 +265,12 @@ fn complete_result(input: &AdmissionInput) -> AdmissionResult {
         floor: input.floor.floor.clone(),
         economy: economy.clone(),
     };
+    {
+        let mut unsigned = admitted.economy.clone();
+        unsigned.receipt_digest = "0".repeat(64);
+        admitted.economy.receipt_digest =
+            canonical_digest(&unsigned).expect("intermediate economy receipt");
+    }
     let admitted_digest = admitted
         .canonical_payload_digest()
         .expect("admitted payload digest");
@@ -272,6 +279,12 @@ fn complete_result(input: &AdmissionInput) -> AdmissionResult {
         .measurement
         .digest
         .clone_from(&admitted_digest);
+    {
+        let mut unsigned = admitted.economy.clone();
+        unsigned.receipt_digest = "0".repeat(64);
+        admitted.economy.receipt_digest =
+            canonical_digest(&unsigned).expect("final economy receipt");
+    }
     let evidence = AdmissionDecisionEvidence {
         binding: input.binding.clone(),
         decisions: admitted.admissions.clone(),
@@ -654,7 +667,11 @@ fn omission_handle_binding_mismatch_is_rejected() {
     );
 
     let mut wrong_atom = record.clone();
-    wrong_atom.expansion.as_mut().expect("expansion handle").atom_id = id("other-atom");
+    wrong_atom
+        .expansion
+        .as_mut()
+        .expect("expansion handle")
+        .atom_id = id("other-atom");
     assert_eq!(
         wrong_atom.validate(&context),
         Err(ContextError::OmissionHandleInvalid)
@@ -684,7 +701,11 @@ fn omission_handle_binding_mismatch_is_rejected() {
     );
 
     let mut supplied_atom = supplied.clone();
-    supplied_atom.expansion.as_mut().expect("expansion handle").atom_id = id("other-atom");
+    supplied_atom
+        .expansion
+        .as_mut()
+        .expect("expansion handle")
+        .atom_id = id("other-atom");
     assert_eq!(
         supplied_atom.validate(&context),
         Err(ContextError::OmissionHandleInvalid)

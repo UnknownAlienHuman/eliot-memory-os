@@ -211,15 +211,34 @@ fn admitted() -> AdmittedContextSet {
                 remaining_headroom: 99_990,
                 route_capacity: 100_000,
             },
+            recipe_digest: digest(),
             receipt_digest: digest(),
         },
     };
+    {
+        let mut unsigned = result.economy.clone();
+        unsigned.receipt_digest = "0".repeat(64);
+        result.economy.receipt_digest =
+            eliot_context_contracts::canonical_digest(&unsigned).expect("intermediate receipt");
+    }
     let bytes = result
         .canonical_payload_utf8_bytes()
         .expect("admitted bytes");
     result.economy.allocations.admitted_required = bytes;
     result.economy.allocations.remaining_headroom = 100_000 - 2 - 3 - 4 - bytes;
+    {
+        let mut unsigned = result.economy.clone();
+        unsigned.receipt_digest = "0".repeat(64);
+        result.economy.receipt_digest =
+            eliot_context_contracts::canonical_digest(&unsigned).expect("pre-measurement receipt");
+    }
     result.economy.measurement.digest = result.canonical_payload_digest().expect("admitted digest");
+    {
+        let mut unsigned = result.economy.clone();
+        unsigned.receipt_digest = "0".repeat(64);
+        result.economy.receipt_digest =
+            eliot_context_contracts::canonical_digest(&unsigned).expect("final receipt");
+    }
     result
 }
 
