@@ -3498,6 +3498,9 @@ fn production_bound_active_phase_b_receipt_recovery_uses_physical_cas() -> TestR
         &commit_fence,
     )?;
     let registry = registry_store.load()?;
+    // #1339: Host never retains the exclusive writer; drop the seeding handle
+    // so the composition below uses short-lived open-use-drop handles only.
+    drop(registry_store);
     let launch_options = HostLaunchOptions {
         config_descriptor_path: PathBuf::from(
             manifest.runtime_launch.authority_descriptor_path.as_str(),
@@ -3521,7 +3524,7 @@ fn production_bound_active_phase_b_receipt_recovery_uses_physical_cas() -> TestR
         HOST_STORE_REBIND_PRODUCTION_DISCRIMINATOR
     );
     let build_composition = |journal: ProductionHostStateJournal,
-                             registry_store: RedbInstallationRegistry,
+                             registry_file: PathBuf,
                              registry: ApprovedGenerationRegistry,
                              launch_options: HostLaunchOptions,
                              host: HostInstallationEpoch,
@@ -3530,11 +3533,13 @@ fn production_bound_active_phase_b_receipt_recovery_uses_physical_cas() -> TestR
                              owner_lease: HostOwnerLease|
      -> Result<HostComposition, WindowsAdapterError> {
         let jobs = HostJobBranches::new_test_support(&host)?;
+        let registry_host_root = launch_options.host_state_root().to_path_buf();
         Ok(HostComposition {
             store_rebind_boundary: HostStoreRebindProductionBoundary,
             runtime_control_boundary: HostRuntimeControlProductionBoundary,
             journal,
-            registry_store,
+            registry_host_root,
+            test_registry_file: Some(registry_file),
             registry,
             launch_options,
             host,
@@ -3559,7 +3564,7 @@ fn production_bound_active_phase_b_receipt_recovery_uses_physical_cas() -> TestR
     };
     let mut first = build_composition(
         first_journal,
-        registry_store,
+        registry_path.clone(),
         registry,
         launch_options.clone(),
         first_host.clone(),
@@ -3636,9 +3641,10 @@ fn production_bound_active_phase_b_receipt_recovery_uses_physical_cas() -> TestR
     let recovery_owner_lease = HostOwnerLease::acquire(&installation)?;
     let recovery_registry_store = RedbInstallationRegistry::open_test_support(&registry_path)?;
     let recovery_registry = recovery_registry_store.load()?;
+    drop(recovery_registry_store);
     let mut second = build_composition(
         second_journal,
-        recovery_registry_store,
+        registry_path.clone(),
         recovery_registry,
         launch_options,
         second_host,

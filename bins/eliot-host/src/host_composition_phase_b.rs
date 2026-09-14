@@ -815,7 +815,7 @@ impl HostComposition {
             ));
         }
         let committed = self
-            .registry_store
+            .open_registry_store()?
             .read_committed_activation_receipt(
                 active.approval.transaction_id(),
                 active.approval.installer_plan_digest(),
@@ -1412,7 +1412,7 @@ impl HostComposition {
         })?;
         let host_capability = self.owner_lease.activation_capability();
         let expected_revision = self.registry.revision();
-        self.registry_store
+        self.open_registry_store()?
             .clear_pending_phase_b_prepared(
                 &host_capability,
                 expected_revision,
@@ -1420,13 +1420,13 @@ impl HostComposition {
                 prepared,
             )
             .map_err(HostError::Installation)?;
-        self.registry = self.registry_store.load().map_err(|error| {
+        self.registry = self.open_registry_store()?.load().map_err(|error| {
             HostError::RecoveryRequired(format!(
                 "Phase-B rollback preparation clear readback failed: {error}"
             ))
         })?;
         let expected_revision = self.registry.revision();
-        self.registry_store
+        self.open_registry_store()?
             .clear_pending_phase_b_intent(
                 &host_capability,
                 expected_revision,
@@ -1434,7 +1434,7 @@ impl HostComposition {
                 intent,
             )
             .map_err(HostError::Installation)?;
-        self.registry = self.registry_store.load().map_err(|error| {
+        self.registry = self.open_registry_store()?.load().map_err(|error| {
             HostError::RecoveryRequired(format!(
                 "Phase-B rollback intent clear readback failed: {error}"
             ))

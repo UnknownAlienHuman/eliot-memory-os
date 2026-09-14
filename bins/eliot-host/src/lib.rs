@@ -3406,21 +3406,25 @@ pub struct HostComposition {
     )]
     runtime_control_boundary: HostRuntimeControlProductionBoundary,
     journal: ProductionHostStateJournal,
-    /// Durable installation-registry writer retained for the Host process
-    /// lifetime (s37/#1339, A13.9).
+    /// Retained canonical Host state root for short-lived installation-registry
+    /// opens (#1339, A13.9).
     ///
-    /// Host is the registry's live compare-and-swap owner: every Phase-B and
-    /// recovery mutation commits through this handle with an expected
-    /// revision, so the hold spans the process lifetime and ends at SCM stop.
-    /// This is process-lifetime ownership, not a writer held across an
-    /// unbounded wait: the installer releases its staging writer before the
-    /// SCM start + convergence wait (`bins/eliot/src/main.rs`
-    /// INSTALL-WATCHDOG-APPROVAL `drop(registry)`), and readers (Watchdog
-    /// short-lived `inspect_existing_at`, installer reconcile
-    /// `open_existing_at`) treat `DatabaseAlreadyOpen` lock contention as
-    /// bounded transient retry. The open below applies that same bounded
-    /// retry to the Host-side release race.
-    registry_store: RedbInstallationRegistry,
+    /// Host is the registry's live compare-and-swap owner, but it never
+    /// retains the exclusive redb `Database` across the process lifetime:
+    /// every Phase-B and recovery mutation opens a short-lived
+    /// `RedbInstallationRegistry` via `open_registry_store_at` (bounded
+    /// `DatabaseAlreadyOpen` retry), commits one expected-revision CAS, and
+    /// drops the handle before any wait; readbacks re-open the same way. The
+    /// installer releases its staging writer before the SCM start +
+    /// convergence wait (`bins/eliot/src/main.rs` INSTALL-WATCHDOG-APPROVAL
+    /// `drop(registry)`), and readers (Watchdog short-lived
+    /// `inspect_existing_at`, installer reconcile `open_existing_at`) treat
+    /// `DatabaseAlreadyOpen` lock contention as bounded transient retry. The
+    /// cached `registry` projection below is revision-keyed and rebuildable
+    /// from these short-lived opens; it never creates authority or freshness.
+    registry_host_root: PathBuf,
+    #[cfg(test)]
+    test_registry_file: Option<PathBuf>,
     registry: ApprovedGenerationRegistry,
     launch_options: HostLaunchOptions,
     host: HostInstallationEpoch,
@@ -3627,7 +3631,7 @@ fn installation_registry_lock_contended(error: &InstallationError) -> bool {
 /// Returns [`HostError::Platform`] when the root lease or path proof fails,
 /// and [`HostError::Installation`] when the registry open fails, including
 /// contention that outlasts the bounded retry budget.
-fn open_installation_registry_with_transient_retry(
+pub(crate) fn open_installation_registry_with_transient_retry(
     host_state_root: &Path,
 ) -> Result<Option<RedbInstallationRegistry>, HostError> {
     let mut attempt = 0_u32;
@@ -3659,7 +3663,39 @@ fn open_installation_registry_with_transient_retry(
     }
 }
 
+/// Opens one short-lived installation-registry writer below
+/// `host_state_root` (#1339, A13.9).
+///
+/// Each caller drops the returned handle immediately after one bounded CAS or
+/// load; no handle is retained across waits. Returns
+/// [`HostError::ProcessContour`] when the registry file is absent.
+///
+/// # Errors
+///
+/// Returns [`HostError`] when the root lease, path proof, or bounded
+/// contention retry fails.
+pub(crate) fn open_registry_store_at(
+    host_state_root: &Path,
+) -> Result<RedbInstallationRegistry, HostError> {
+    open_installation_registry_with_transient_retry(host_state_root)?.ok_or_else(|| {
+        HostError::ProcessContour(
+            "SCM Host state root has no approved-generation registry".to_owned(),
+        )
+    })
+}
+
 impl HostComposition {
+    /// Opens one short-lived installation-registry handle below the retained
+    /// Host root (#1339, A13.9). The caller drops it after one CAS or load.
+    fn open_registry_store(&self) -> Result<RedbInstallationRegistry, HostError> {
+        #[cfg(test)]
+        if let Some(path) = self.test_registry_file.as_ref() {
+            return RedbInstallationRegistry::open_test_support(path)
+                .map_err(HostError::Installation);
+        }
+        open_registry_store_at(&self.registry_host_root)
+    }
+
     /// Opens the durable Host contour for one installation identity and
     /// advances its persisted epoch before any process admission.
     ///
@@ -3694,13 +3730,14 @@ impl HostComposition {
         // backoff; every other open failure still fails closed immediately.
         // `root_lease` stays in this scope for the canonical-path proof;
         // each attempt opens a fresh short-lived lease inside the helper.
-        let registry_store = open_installation_registry_with_transient_retry(&host_state_root)?
-            .ok_or_else(|| {
-                HostError::ProcessContour(
-                    "SCM Host state root has no approved-generation registry".to_owned(),
-                )
-            })?;
-        let mut registry = registry_store.load()?;
+        // The handle below is short-lived (open-load-drop); Host retains only
+        // `host_state_root` and re-opens per CAS/readback.
+        let mut registry = {
+            let store = open_registry_store_at(&host_state_root)?;
+            let loaded = store.load()?;
+            drop(store);
+            loaded
+        };
         let pending_for_reopen = registry.pending_activation().cloned();
         Self::validate_launch_options_for_registry(
             &launch_options,
@@ -3731,7 +3768,7 @@ impl HostComposition {
             let reason = "pending activation installation epoch is stale";
             let host_capability = owner_lease.activation_capability();
             persist_pending_recovery(
-                &registry_store,
+                &host_state_root,
                 &mut registry,
                 &host_capability,
                 pending,
@@ -3789,7 +3826,9 @@ impl HostComposition {
             store_rebind_boundary: HostStoreRebindProductionBoundary,
             runtime_control_boundary: HostRuntimeControlProductionBoundary,
             journal,
-            registry_store,
+            registry_host_root: host_state_root,
+            #[cfg(test)]
+            test_registry_file: None,
             registry,
             launch_options,
             host,
@@ -4311,7 +4350,7 @@ impl HostComposition {
                     })?;
                 let manifest_digest = phase_b_manifest_digest(&active.manifest)?;
                 let terminal = self
-                    .registry_store
+                    .open_registry_store()?
                     .read_committed_activation_receipt(
                         &intent.transaction_id,
                         &intent.installation_plan_digest,
@@ -5445,8 +5484,9 @@ impl HostComposition {
         let launch = match result {
             Ok(launch) => launch,
             Err(error) => {
+                let registry_root = self.registry_host_root.clone();
                 persist_pending_recovery(
-                    &self.registry_store,
+                    &registry_root,
                     &mut self.registry,
                     &host_capability,
                     &pending,
@@ -5457,8 +5497,9 @@ impl HostComposition {
         };
         if let Err(error) = self.fail_current_kernel_record("kernel-cutover-prior-terminated") {
             let cleanup = self.cleanup_launched_contour(error);
+            let registry_root = self.registry_host_root.clone();
             persist_pending_recovery(
-                &self.registry_store,
+                &registry_root,
                 &mut self.registry,
                 &host_capability,
                 &pending,
@@ -5489,7 +5530,7 @@ impl HostComposition {
                 )));
             }
             if let Err(error) = persist_pending_recovery(
-                &self.registry_store,
+                &self.registry_host_root.clone(),
                 &mut self.registry,
                 &host_capability,
                 &pending,
@@ -5545,7 +5586,7 @@ impl HostComposition {
             }
             let reason = candidate_error.to_string();
             if let Err(error) = persist_pending_recovery(
-                &self.registry_store,
+                &self.registry_host_root.clone(),
                 &mut self.registry,
                 &host_capability,
                 &pending,
@@ -5566,8 +5607,9 @@ impl HostComposition {
             let reason = error.to_string();
             let cleanup =
                 self.cleanup_active_kernel_contour(error, "candidate-process-observation-failed");
+            let registry_root = self.registry_host_root.clone();
             persist_pending_recovery(
-                &self.registry_store,
+                &registry_root,
                 &mut self.registry,
                 &host_capability,
                 &pending,

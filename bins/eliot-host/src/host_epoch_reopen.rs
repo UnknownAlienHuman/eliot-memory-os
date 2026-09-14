@@ -4,10 +4,9 @@ use super::{
     ActivationState, ActivePhaseBRebindRecoveryKind, ApprovedGenerationRegistry, EpochTransition,
     HostError, HostInstallationEpoch, HostStateJournalService, HostStateRecord, JournalBackend,
     JournalError, PendingActivationState, PlatformHandle, ProductionHostStateJournal,
-    ReconcileOutcome, RedbInstallationRegistry, RedbJournalBackend, StoreRecoveryReopenFence,
-    StoreRecoveryStartupFence, active_phase_b_rebind_recovery_kind, append_reconciled,
-    child_host_epoch, epoch_contract_error, fresh_host_epoch, fresh_identity, fresh_lineage_id,
-    initial_activation_record, root_epoch,
+    ReconcileOutcome, RedbJournalBackend, StoreRecoveryReopenFence, StoreRecoveryStartupFence,
+    active_phase_b_rebind_recovery_kind, append_reconciled, child_host_epoch, epoch_contract_error,
+    fresh_host_epoch, fresh_identity, fresh_lineage_id, initial_activation_record, root_epoch,
 };
 
 pub(super) fn reopen_existing_epoch<B: JournalBackend>(
@@ -111,7 +110,7 @@ pub(super) fn reopen_existing_epoch<B: JournalBackend>(
 }
 
 pub(super) fn persist_pending_recovery(
-    registry_store: &RedbInstallationRegistry,
+    host_state_root: &Path,
     registry: &mut ApprovedGenerationRegistry,
     host_capability: &eliot_platform_windows::HostOwnerEpochCapability,
     pending: &eliot_installation::PendingActivation,
@@ -134,17 +133,26 @@ pub(super) fn persist_pending_recovery(
             ))
         })?
     };
-    let outcome = registry_store.mark_pending_recovery(
-        host_capability,
-        expected_revision,
-        &pending.approval,
-        reason,
-    );
-    let durable = registry_store.load().map_err(|readback_error| {
-        HostError::RecoveryRequired(format!(
-            "{reason}; recovery disposition outcome is unknown and registry readback failed: {readback_error}"
-        ))
-    })?;
+    let outcome = {
+        // #1339, A13.9: short-lived open-use-drop CAS; the handle is dropped
+        // before the readback open below, so concurrent Watchdog/installer
+        // readers never observe a Host-held exclusive lock.
+        let store = crate::open_registry_store_at(host_state_root)?;
+        store.mark_pending_recovery(
+            host_capability,
+            expected_revision,
+            &pending.approval,
+            reason,
+        )
+    };
+    let durable = {
+        let store = crate::open_registry_store_at(host_state_root)?;
+        store.load().map_err(|readback_error| {
+            HostError::RecoveryRequired(format!(
+                "{reason}; recovery disposition outcome is unknown and registry readback failed: {readback_error}"
+            ))
+        })?
+    };
     let exact_readback = durable.revision() == expected_post_revision
         && durable.pending_activation().is_some_and(|current| {
             current.transaction_id == pending.transaction_id
