@@ -761,3 +761,234 @@ impl KernelHostRequestClient {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use eliot_contracts::{EpochId, EpochLineageId, ResourceGeneration};
+    use std::num::NonZeroU64;
+
+    const TEST_LINEAGE: &str = "550e8400-e29b-41d4-a716-446655440000";
+
+    const INVOCATION_JSON: &str = r#"{
+        "protocol_version":"2026-07-28",
+        "correlation_id":"host-request-1",
+        "client_capabilities":{"tasks":false},
+        "tool":{"name":"eliot.state","arguments":{"include":["task"]}},
+        "deadline_preference_ms":5000,
+        "observed_context":{
+            "host_session_hint":"host-turn-1",
+            "observed_resource_refs":[],
+            "event_cursors":[],
+            "trace_context":{}
+        }
+    }"#;
+
+    fn test_facts(connection_id: &str) -> TransportFacts {
+        let epoch = EpochId::new(
+            EpochLineageId::new(TEST_LINEAGE).expect("valid test lineage"),
+            NonZeroU64::new(3).expect("nonzero test sequence"),
+        )
+        .expect("valid test epoch");
+        TransportFacts {
+            connection_id: connection_id.to_owned(),
+            state_fence: StateFence::new(
+                epoch,
+                ResourceGeneration::new(7).expect("nonzero test generation"),
+            ),
+            descriptor_sha256: "d".repeat(64),
+            receipt_sha256: "e".repeat(64),
+            session: Some("kernel-session-1".to_owned()),
+        }
+    }
+
+    fn test_envelope() -> (HostInvocationRequest, TransportFacts, HostRequestEnvelope) {
+        let request: HostInvocationRequest =
+            serde_json::from_str(INVOCATION_JSON).expect("fixture must deserialize");
+        let facts = test_facts("conn-test-1");
+        let payload_digest =
+            canonical_payload_digest(&request.tool).expect("payload digest must compute");
+        let envelope = build_invocation_envelope(
+            &request,
+            &facts,
+            "kernel-session-1",
+            &payload_digest,
+            1_000_000,
+        )
+        .expect("envelope must build");
+        (request, facts, envelope)
+    }
+
+    fn admitted_reply_frame(
+        envelope: &HostRequestEnvelope,
+        receipt: &HostRequestAdmissionReceipt,
+    ) -> Frame {
+        Frame {
+            protocol_version: ProtocolVersion::CURRENT,
+            encoding_profile: EncodingProfile::JsonV1,
+            connection_id: envelope.connection_id.clone(),
+            request_id: Some(envelope.identity.request_id.clone()),
+            kind: FrameKind::Response,
+            message_type: MessageType::Result,
+            request_identity: None,
+            payload: ProtocolPayload::Json(serde_json::json!({
+                "status": "known",
+                "value": {
+                    "accepted": true,
+                    "receipt": serde_json::to_value(receipt).expect("receipt must serialize"),
+                    "record": {
+                        "operation_id": receipt.operation_id,
+                        "state": "RESULT_RECEIVED",
+                    },
+                },
+            })),
+            trace_context: BTreeMap::new(),
+        }
+    }
+
+    #[test]
+    fn invocation_envelope_binds_kernel_session_and_neutral_identity() {
+        let (request, facts, envelope) = test_envelope();
+        assert_eq!(envelope.connection_id, "conn-test-1");
+        assert_eq!(
+            envelope.identity.session_id.as_deref(),
+            Some("kernel-session-1")
+        );
+        assert!(envelope.identity.task_id.is_none());
+        assert!(envelope.identity.work_scope_id.is_none());
+        assert_eq!(
+            envelope.identity.idempotency_key,
+            format!("{}:invoke", request.correlation_id.as_str())
+        );
+        assert!(envelope.identity.parent_operation_id.is_none());
+        assert_eq!(envelope.identity.capability, request.tool.canonical_name());
+        assert_eq!(envelope.identity.request_id.as_str(), "host-request-1");
+        assert!(facts.session.is_some());
+        envelope.validate().expect("built envelope must validate");
+        let empty: Result<HostInvocationRequest, _> =
+            serde_json::from_str(&INVOCATION_JSON.replace("host-request-1", ""));
+        assert!(
+            empty.is_err(),
+            "empty correlation must not deserialize into a dispatchable request"
+        );
+    }
+
+    #[test]
+    fn foreign_or_malformed_cancel_handle_rejected_without_wire() {
+        let (_, _, envelope) = test_envelope();
+        let handle = host_request_operation_id(&envelope);
+        let digest = parse_operation_handle(&handle).expect("kernel handle must parse");
+        assert_eq!(digest, envelope.envelope_sha256);
+        assert!(
+            parse_operation_handle(&format!("foreign:{digest}")).is_err(),
+            "foreign prefix must be rejected without wire use"
+        );
+        assert!(
+            parse_operation_handle(&digest).is_err(),
+            "missing prefix must be rejected without wire use"
+        );
+        assert!(
+            parse_operation_handle(&format!("hostreq:{}", "A".repeat(64))).is_err(),
+            "uppercase digest must be rejected without wire use"
+        );
+    }
+
+    #[test]
+    fn stale_reply_decodes_unknown_and_states_map_typed() {
+        let (_, facts, envelope) = test_envelope();
+        let receipt = HostRequestAdmissionReceipt::issue(&envelope).expect("receipt must issue");
+        let reply = admitted_reply_frame(&envelope, &receipt);
+        let (decoded_receipt, decoded_record) =
+            decode_admitted_reply(&reply, &envelope).expect("valid reply must decode");
+        assert_eq!(decoded_receipt.operation_id, receipt.operation_id);
+        assert_eq!(decoded_record.operation_id, receipt.operation_id);
+
+        let mut foreign_connection = reply.clone();
+        foreign_connection.connection_id = "foreign-conn".to_owned();
+        assert!(
+            decode_admitted_reply(&foreign_connection, &envelope).is_none(),
+            "wrong connection must decode to unknown"
+        );
+
+        let mut wrong_request = reply.clone();
+        wrong_request.request_id =
+            Some(RequestId::new("other-correlation").expect("valid test request id"));
+        assert!(
+            decode_admitted_reply(&wrong_request, &envelope).is_none(),
+            "wrong request id must decode to unknown"
+        );
+
+        let request_frame =
+            host_request_frame_for_envelope(AGENT_HOST_REQUEST_SUBMIT_OPERATION, &envelope, &facts)
+                .expect("request frame must build");
+        let mut with_identity = reply.clone();
+        with_identity.request_identity = request_frame.request_identity.clone();
+        assert!(
+            with_identity.request_identity.is_some(),
+            "fixture must carry a real request identity"
+        );
+        assert!(
+            decode_admitted_reply(&with_identity, &envelope).is_none(),
+            "present request identity must decode to unknown"
+        );
+
+        let sibling_request: HostInvocationRequest =
+            serde_json::from_str(INVOCATION_JSON).expect("fixture must deserialize");
+        let sibling = build_invocation_envelope(
+            &sibling_request,
+            &facts,
+            "kernel-session-1",
+            &"b".repeat(64),
+            1_000_000,
+        )
+        .expect("sibling envelope must build");
+        assert_eq!(
+            sibling.identity.request_id, envelope.identity.request_id,
+            "sibling keeps the same request identity"
+        );
+        assert_ne!(
+            sibling.envelope_sha256, envelope.envelope_sha256,
+            "sibling carries a different digest"
+        );
+        assert!(
+            decode_admitted_reply(&reply, &sibling).is_none(),
+            "digest mismatch must decode to unknown"
+        );
+
+        let record_for = |state| AdmittedReplyView {
+            operation_id: receipt.operation_id.clone(),
+            state,
+        };
+        assert!(matches!(
+            submit_outcome(&receipt, &record_for(HostRequestRecordState::Expired)),
+            Err(PortFailure::DeadlineExceeded)
+        ));
+        assert!(matches!(
+            submit_outcome(&receipt, &record_for(HostRequestRecordState::Cancelled)),
+            Err(PortFailure::Cancelled)
+        ));
+        for state in [
+            HostRequestRecordState::Conflicted,
+            HostRequestRecordState::Terminal,
+        ] {
+            match submit_outcome(&receipt, &record_for(state)) {
+                Err(PortFailure::TransportBindingRejected { reason }) => {
+                    assert!(
+                        reason.contains("terminal"),
+                        "terminal rejection must name reconciliation"
+                    );
+                }
+                other => panic!("expected terminal rejection, got {other:?}"),
+            }
+        }
+        match submit_outcome(
+            &receipt,
+            &record_for(HostRequestRecordState::ResultReceived),
+        ) {
+            Ok(HostInvocationPortOutcome::Accepted { operation_handle }) => {
+                assert_eq!(operation_handle.as_str(), receipt.operation_id.as_str());
+            }
+            other => panic!("expected accepted outcome, got {other:?}"),
+        }
+    }
+}
