@@ -14,14 +14,19 @@ pub use swarm_read::*;
 
 use std::collections::{BTreeSet, HashMap};
 use std::fmt;
+use std::future::Future;
+use std::pin::Pin;
 
-use eliot_contracts::{OperationId, SessionId};
+use eliot_contracts::{OperationId, RequestMetadata, SessionId};
 use eliot_evaluation_contracts::ObjectiveStatus;
 use eliot_evidence::{EpistemicStatus, EvidenceFreshness};
 use eliot_observation_contracts::ObservationKind;
 use eliot_protocol::RequestIdentity;
 use eliot_receipts::ProofCeiling;
 pub use eliot_security_contracts::{EffectCeiling, PrivacyClass};
+use eliot_skill::{
+    DependencyVersion, LifecycleAction, SkillCandidate, SkillError, SkillLifecycleView, SkillScope,
+};
 use serde::{Deserialize, Deserializer, Serialize, de};
 use sha2::{Digest, Sha256};
 use thiserror::Error;
@@ -337,6 +342,7 @@ pub enum RequiredProvider {
     CanonicalState,
     OperatorCommand,
     SwarmProjection,
+    SkillLifecycle,
     G11ReviewProjection,
     I12ReportProjection,
 }
@@ -1029,12 +1035,127 @@ pub trait OperatorCommandPort: Send {
     fn submit(&mut self, request: &CommandRequest) -> Result<CommandReceipt, PortError>;
 }
 
+/// Typed Skill candidate submission. All fields are owner-neutral data; the
+/// admission fence travels in the caller's [`RequestMetadata`], never here:
+/// this surface mints no fence, principal, session, epoch, or operation
+/// identity. Deserialization rejects unknown fields by construction, and every
+/// typed rule is re-checked by [`ProposeSkillRequest::validate`] at the
+/// surface boundary and again by the owning Skill lifecycle.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ProposeSkillRequest {
+    /// Skill under lifecycle review.
+    pub skill_id: String,
+    /// Materialized candidate package digest (lowercase SHA-256 hex).
+    pub candidate_package_digest: String,
+    /// Proposed lifecycle change.
+    pub action: LifecycleAction,
+    /// Exact evidence references (non-empty, unique).
+    pub evidence_refs: Vec<String>,
+    /// Pinned dependency versions.
+    pub dependency_versions: Vec<DependencyVersion>,
+    /// Candidate scope.
+    pub scope: SkillScope,
+}
+
+impl ProposeSkillRequest {
+    /// Creates a typed candidate submission.
+    pub fn new(
+        skill_id: impl Into<String>,
+        candidate_package_digest: impl Into<String>,
+        action: LifecycleAction,
+        evidence_refs: Vec<String>,
+        dependency_versions: Vec<DependencyVersion>,
+        scope: SkillScope,
+    ) -> Result<Self, ControlBoardError> {
+        let request = Self {
+            skill_id: skill_id.into(),
+            candidate_package_digest: candidate_package_digest.into(),
+            action,
+            evidence_refs,
+            dependency_versions,
+            scope,
+        };
+        request.validate()?;
+        Ok(request)
+    }
+
+    /// Re-checks every typed rule without mutating the request.
+    pub fn validate(&self) -> Result<(), ControlBoardError> {
+        text(&self.skill_id, "skill_id")?;
+        if self.candidate_package_digest.len() != 64
+            || self
+                .candidate_package_digest
+                .bytes()
+                .any(|byte| !byte.is_ascii_hexdigit() || byte.is_ascii_uppercase())
+        {
+            return Err(ControlBoardError::InvalidField(
+                "candidate.candidate_package_digest",
+            ));
+        }
+        if self.evidence_refs.is_empty() {
+            return Err(ControlBoardError::InvalidField("candidate.evidence_refs"));
+        }
+        let mut seen = BTreeSet::new();
+        for reference in &self.evidence_refs {
+            text(reference, "candidate.evidence_ref")?;
+            if !seen.insert(reference) {
+                return Err(ControlBoardError::DuplicateReference);
+            }
+        }
+        let mut dependencies = BTreeSet::new();
+        for dependency in &self.dependency_versions {
+            dependency
+                .validate()
+                .map_err(|_| ControlBoardError::InvalidField("candidate.dependencies"))?;
+            if !dependencies.insert(dependency) {
+                return Err(ControlBoardError::DuplicateReference);
+            }
+        }
+        self.scope
+            .validate()
+            .map_err(|_| ControlBoardError::InvalidField("candidate.scope"))?;
+        Ok(())
+    }
+}
+
+/// Skill lifecycle owner port. It is the only route for Skill lifecycle reads
+/// and typed candidate submissions.
+///
+/// The port is defined locally (rather than reused from the agent-bridge
+/// surface) to avoid a cross-surface dependency, mirroring the
+/// [`SwarmProjectionPort`] pattern. Results are the Governor-owned
+/// [`SkillLifecycleView`] and [`SkillCandidate`] types directly: there is no
+/// generic-JSON submission path by construction.
+///
+/// The boxed-future shape (instead of `async fn`) keeps this trait
+/// object-safe without a new async-trait dependency. No `Send` bound is
+/// imposed: the Governor borrows behind a production implementation are not
+/// guaranteed `Send`, and the board holds the port like its other injected
+/// boundaries.
+pub trait SkillLifecyclePort {
+    /// Reads one immutable Skill lifecycle view at the admitted fence.
+    fn skill_read<'a>(
+        &'a mut self,
+        ctx: &'a RequestMetadata,
+        skill_id: String,
+    ) -> Pin<Box<dyn Future<Output = Result<Option<SkillLifecycleView>, SkillError>> + 'a>>;
+
+    /// Submits one typed Skill candidate at the admitted fence.
+    fn propose_skill<'a>(
+        &'a mut self,
+        ctx: &'a RequestMetadata,
+        request: ProposeSkillRequest,
+    ) -> Pin<Box<dyn Future<Output = Result<SkillCandidate, SkillError>> + 'a>>;
+}
+
 /// A-08 surface over sealed provider boundaries.
 pub struct ControlBoard {
     access: Option<Box<dyn AccessResolverPort>>,
     state: Option<Box<dyn CanonicalStatePort>>,
     commands: Option<Box<dyn OperatorCommandPort>>,
     swarm_projection: Option<Box<dyn SwarmProjectionPort>>,
+    skill_lifecycle: Option<Box<dyn SkillLifecyclePort>>,
     replay: HashMap<String, StoredReplay>,
 }
 
@@ -1101,6 +1222,7 @@ impl ControlBoard {
             state,
             commands,
             swarm_projection: None,
+            skill_lifecycle: None,
             replay: HashMap::new(),
         }
     }
@@ -1205,6 +1327,93 @@ impl ControlBoard {
         self.replay
             .insert(operation_key, StoredReplay::bind(&command, receipt.clone()));
         Ok(receipt)
+    }
+}
+
+impl ControlBoard {
+    /// Injects the composition-selected Skill lifecycle owner.
+    #[must_use]
+    pub fn with_skill_lifecycle(mut self, port: Box<dyn SkillLifecyclePort>) -> Self {
+        self.skill_lifecycle = Some(port);
+        self
+    }
+
+    /// Returns one cloned Skill lifecycle view at the exact access fence.
+    ///
+    /// The caller supplies the admitted [`RequestMetadata`] observed at
+    /// ingress; A-08 never mints it. The metadata fence must equal the
+    /// resolved access fence, otherwise the read fails closed as
+    /// [`ControlBoardError::StaleView`].
+    pub async fn skill_view(
+        &mut self,
+        request: &ReadRequest,
+        ctx: &RequestMetadata,
+        skill_id: &str,
+    ) -> Result<Option<SkillLifecycleView>, ControlBoardError> {
+        request.validate()?;
+        ctx.validate()
+            .map_err(|_| ControlBoardError::InvalidField("request_metadata"))?;
+        let access = self.resolve_access(request)?;
+        if ctx.state_fence != access.binding.access_fence {
+            return Err(ControlBoardError::StaleView);
+        }
+        let view = self
+            .skill_lifecycle
+            .as_mut()
+            .ok_or(ControlBoardError::PlanGap(RequiredProvider::SkillLifecycle))?
+            .skill_read(ctx, skill_id.to_owned())
+            .await
+            .map_err(map_skill_error)?;
+        if let Some(view) = &view {
+            view.validate()
+                .map_err(|error| ControlBoardError::Provider(error.to_string()))?;
+        }
+        Ok(view)
+    }
+
+    /// Submits one typed Skill candidate at the exact access fence.
+    ///
+    /// There is no generic-JSON submission path: only the typed
+    /// [`ProposeSkillRequest`] reaches the owner, which re-enforces every
+    /// rule before returning the [`SkillCandidate`] with its exact
+    /// `candidate_digest`.
+    pub async fn propose_skill_candidate(
+        &mut self,
+        request: &ReadRequest,
+        ctx: &RequestMetadata,
+        proposal: ProposeSkillRequest,
+    ) -> Result<SkillCandidate, ControlBoardError> {
+        request.validate()?;
+        proposal.validate()?;
+        ctx.validate()
+            .map_err(|_| ControlBoardError::InvalidField("request_metadata"))?;
+        let access = self.resolve_access(request)?;
+        if ctx.state_fence != access.binding.access_fence {
+            return Err(ControlBoardError::StaleView);
+        }
+        let candidate = self
+            .skill_lifecycle
+            .as_mut()
+            .ok_or(ControlBoardError::PlanGap(RequiredProvider::SkillLifecycle))?
+            .propose_skill(ctx, proposal)
+            .await
+            .map_err(map_skill_error)?;
+        candidate
+            .validate()
+            .map_err(|error| ControlBoardError::Provider(error.to_string()))?;
+        Ok(candidate)
+    }
+}
+
+/// Maps an owner Skill failure onto the closed board errors without widening.
+/// A fence disagreement stays a fence mismatch and a revision conflict stays
+/// stale; every other owner rejection is preserved verbatim as a provider
+/// contract failure.
+fn map_skill_error(error: SkillError) -> ControlBoardError {
+    match error {
+        SkillError::FenceMismatch => ControlBoardError::FenceMismatch,
+        SkillError::RevisionConflict => ControlBoardError::StaleView,
+        other => ControlBoardError::Provider(other.to_string()),
     }
 }
 
@@ -1419,6 +1628,7 @@ impl fmt::Display for RequiredProvider {
             Self::CanonicalState => "CANONICAL_STATE",
             Self::OperatorCommand => "OPERATOR_COMMAND",
             Self::SwarmProjection => "SWARM_PROJECTION",
+            Self::SkillLifecycle => "SKILL_LIFECYCLE",
             Self::G11ReviewProjection => "G11_REVIEW_PROJECTION",
             Self::I12ReportProjection => "I12_REPORT_PROJECTION",
         })
@@ -2411,5 +2621,184 @@ mod tests {
         assert_eq!(first, second);
         assert_eq!(*calls.lock().expect("call count"), 1);
         assert_eq!(*reads.lock().expect("read count"), 1);
+    }
+
+    // ---- Skill lifecycle surface read + typed propose (#1191 bullet 14) ----
+
+    use eliot_skill::{LifecycleCounters, SkillInteractionView, SkillRef, SkillStatus};
+    use std::future::Future;
+    use std::pin::Pin;
+
+    struct FakeSkill {
+        view: Option<SkillLifecycleView>,
+        candidate: SkillCandidate,
+    }
+
+    impl SkillLifecyclePort for FakeSkill {
+        fn skill_read<'a>(
+            &'a mut self,
+            _ctx: &'a RequestMetadata,
+            _skill_id: String,
+        ) -> Pin<Box<dyn Future<Output = Result<Option<SkillLifecycleView>, SkillError>> + 'a>>
+        {
+            Box::pin(async move { Ok(self.view.clone()) })
+        }
+
+        fn propose_skill<'a>(
+            &'a mut self,
+            _ctx: &'a RequestMetadata,
+            _request: ProposeSkillRequest,
+        ) -> Pin<Box<dyn Future<Output = Result<SkillCandidate, SkillError>> + 'a>> {
+            Box::pin(async move { Ok(self.candidate.clone()) })
+        }
+    }
+
+    fn skill_scope() -> SkillScope {
+        SkillScope {
+            task_scope: "task-scope".to_owned(),
+            host: "host-1".to_owned(),
+            route: "route-1".to_owned(),
+            governance_scope: "gov-1".to_owned(),
+        }
+    }
+
+    fn skill_view(fence: &StateFence) -> SkillLifecycleView {
+        SkillLifecycleView {
+            skill_ref: SkillRef::new("skill-demo", "rev-1", "Demo Skill", "a".repeat(64))
+                .expect("skill ref"),
+            scope: skill_scope(),
+            applies_when: vec!["when-a".to_owned()],
+            does_not_apply_when: vec!["not-when-a".to_owned()],
+            dependencies: Vec::new(),
+            counters: LifecycleCounters::default(),
+            execution_evidence: Vec::new(),
+            observed_decision_or_verifier_delta: None,
+            false_activation_refs: Vec::new(),
+            interactions: SkillInteractionView::default(),
+            status: SkillStatus::Current,
+            stale_or_quarantine_reason: None,
+            proposed_action: LifecycleAction::Keep,
+            review: None,
+            state_fence: fence.clone(),
+            lifecycle_revision: 1,
+        }
+    }
+
+    fn skill_ctx(fence: &StateFence) -> RequestMetadata {
+        RequestMetadata {
+            request_id: RequestId::new("req-skill-1").expect("request id"),
+            session_id: Some(SessionId::new("session").expect("session id")),
+            task_id: None,
+            product_id: ProductId::new("product").expect("product id"),
+            source_id: SourceId::new("source").expect("source id"),
+            state_fence: fence.clone(),
+            clock: ClockReading::default(),
+        }
+    }
+
+    fn skill_board(view: Option<SkillLifecycleView>, candidate: SkillCandidate) -> ControlBoard {
+        ControlBoard::new(
+            Some(Box::new(access(
+                Role::HumanRequester,
+                &[],
+                &[PrivacyClass::Public],
+            ))),
+            None,
+            None,
+        )
+        .with_skill_lifecycle(Box::new(FakeSkill { view, candidate }))
+    }
+
+    fn skill_candidate(fence: &StateFence) -> SkillCandidate {
+        SkillCandidate::new(
+            &skill_view(fence),
+            "b".repeat(64),
+            LifecycleAction::Patch,
+            vec!["evidence-1".to_owned()],
+            Vec::new(),
+            skill_scope(),
+            fence.clone(),
+        )
+        .expect("candidate")
+    }
+
+    fn block_on<T>(future: impl Future<Output = T>) -> T {
+        struct NoopWaker;
+        impl std::task::Wake for NoopWaker {
+            fn wake(self: std::sync::Arc<Self>) {}
+        }
+        let waker = std::task::Waker::from(std::sync::Arc::new(NoopWaker));
+        let mut context = std::task::Context::from_waker(&waker);
+        let mut future = Box::pin(future);
+        loop {
+            match future.as_mut().poll(&mut context) {
+                std::task::Poll::Ready(output) => return output,
+                std::task::Poll::Pending => std::thread::yield_now(),
+            }
+        }
+    }
+
+    #[test]
+    fn skill_view_returns_the_cloned_governor_view() {
+        let fence = fence();
+        let view = skill_view(&fence);
+        let mut board = skill_board(Some(view.clone()), skill_candidate(&fence));
+        let read = block_on(board.skill_view(
+            &read_request(Role::HumanRequester),
+            &skill_ctx(&fence),
+            "skill-demo",
+        ))
+        .expect("view");
+        assert_eq!(read, Some(view));
+    }
+
+    #[test]
+    fn typed_propose_returns_the_exact_candidate_digest_and_stale_fences_fail_closed() {
+        let fence = fence();
+        let mut board = skill_board(Some(skill_view(&fence)), skill_candidate(&fence));
+        let proposal = ProposeSkillRequest::new(
+            "skill-demo",
+            "b".repeat(64),
+            LifecycleAction::Patch,
+            vec!["evidence-1".to_owned()],
+            Vec::new(),
+            skill_scope(),
+        )
+        .expect("proposal");
+        let returned = block_on(board.propose_skill_candidate(
+            &read_request(Role::HumanRequester),
+            &skill_ctx(&fence),
+            proposal,
+        ))
+        .expect("candidate");
+        let expected = skill_candidate(&fence);
+        assert_eq!(returned, expected);
+        assert_eq!(returned.candidate_digest, expected.candidate_digest);
+        let stale = fence_at_generation(6);
+        assert_eq!(
+            block_on(board.skill_view(
+                &read_request(Role::HumanRequester),
+                &skill_ctx(&stale),
+                "skill-demo",
+            )),
+            Err(ControlBoardError::StaleView)
+        );
+        let stale_proposal = ProposeSkillRequest::new(
+            "skill-demo",
+            "b".repeat(64),
+            LifecycleAction::Patch,
+            vec!["evidence-1".to_owned()],
+            Vec::new(),
+            skill_scope(),
+        )
+        .expect("proposal");
+        assert_eq!(
+            block_on(board.propose_skill_candidate(
+                &read_request(Role::HumanRequester),
+                &skill_ctx(&stale),
+                stale_proposal,
+            )),
+            Err(ControlBoardError::StaleView)
+        );
     }
 }

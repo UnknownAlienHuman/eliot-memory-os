@@ -7,19 +7,25 @@
 
 #![forbid(unsafe_code)]
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
+use std::future::Future;
+use std::pin::Pin;
 
 pub use eliot_agent_api::{
     AttemptId, EventCursor, EventId, HostEventEnvelope, HostEventKind, RouteFingerprint, SessionId,
     TaskId, WorkUnitId,
 };
+use eliot_contracts::RequestMetadata;
 pub use eliot_observation_contracts::{
     BlindInterval, CoverageGap, CoverageInterval, GapDisposition,
 };
 pub use eliot_process::{FencingToken, Generation};
 pub use eliot_protocol::{AckPhase, DeliveryClass, EventDisposition, EventEnvelope};
 use eliot_protocol::{EventAckReceipt, EventIdentityKey, ReplayLedger};
+use eliot_skill::{
+    DependencyVersion, LifecycleAction, SkillCandidate, SkillError, SkillLifecycleView, SkillScope,
+};
 use serde::{Deserialize, Deserializer, Serialize, de};
 use thiserror::Error;
 
@@ -92,6 +98,7 @@ pub enum RequiredProvider {
     P03ProcessContracts,
     HostActivationPort,
     McpForwardingPort,
+    SkillLifecyclePort,
 }
 
 impl RequiredProvider {
@@ -112,6 +119,7 @@ impl RequiredProvider {
             Self::P03ProcessContracts => "crates/kernel/eliot-process",
             Self::HostActivationPort => "injected host activation port",
             Self::McpForwardingPort => "injected A-06/MCP forwarding port",
+            Self::SkillLifecyclePort => "injected Skill lifecycle port",
         }
     }
 }
@@ -836,6 +844,7 @@ pub struct AgentBridgeCore {
     readiness: ProviderReadiness,
     host_activation: Option<Box<dyn HostActivationPort>>,
     mcp_forwarding: Option<Box<dyn McpForwardingPort>>,
+    skill_lifecycle: Option<Box<dyn SkillLifecyclePort>>,
     cursor_policy: CursorPolicy,
     active: Option<ActiveAttach>,
     replay: ReplayLedger,
@@ -855,6 +864,7 @@ impl AgentBridgeCore {
             readiness,
             host_activation,
             mcp_forwarding,
+            skill_lifecycle: None,
             cursor_policy,
             active: None,
             replay: ReplayLedger::new(),
@@ -1249,6 +1259,254 @@ const fn phase_reaches(required: AckPhase, observed: AckPhase) -> bool {
     }
 }
 
+/// Typed Skill candidate submission. Fields are private and deserialization
+/// re-runs the constructor, so malformed digests, blank references, or
+/// duplicate evidence cannot be created. The admission fence travels in the
+/// caller's [`RequestMetadata`], never here: this surface mints no fence,
+/// principal, session, epoch, or operation identity.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ProposeSkillRequest {
+    skill_id: String,
+    candidate_package_digest: String,
+    action: LifecycleAction,
+    evidence_refs: Vec<String>,
+    dependency_versions: Vec<DependencyVersion>,
+    scope: SkillScope,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawProposeSkillRequest {
+    skill_id: String,
+    candidate_package_digest: String,
+    action: LifecycleAction,
+    evidence_refs: Vec<String>,
+    dependency_versions: Vec<DependencyVersion>,
+    scope: SkillScope,
+}
+
+impl<'de> Deserialize<'de> for ProposeSkillRequest {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let raw = RawProposeSkillRequest::deserialize(deserializer)?;
+        Self::new(
+            raw.skill_id,
+            raw.candidate_package_digest,
+            raw.action,
+            raw.evidence_refs,
+            raw.dependency_versions,
+            raw.scope,
+        )
+        .map_err(de::Error::custom)
+    }
+}
+
+impl ProposeSkillRequest {
+    /// Creates a typed candidate submission. Every typed rule is enforced
+    /// here and re-enforced by the owning Skill lifecycle before promotion.
+    pub fn new(
+        skill_id: impl Into<String>,
+        candidate_package_digest: impl Into<String>,
+        action: LifecycleAction,
+        evidence_refs: Vec<String>,
+        dependency_versions: Vec<DependencyVersion>,
+        scope: SkillScope,
+    ) -> Result<Self, SkillError> {
+        let request = Self {
+            skill_id: skill_id.into(),
+            candidate_package_digest: candidate_package_digest.into(),
+            action,
+            evidence_refs,
+            dependency_versions,
+            scope,
+        };
+        request.validate()?;
+        Ok(request)
+    }
+
+    /// Re-checks every typed rule without mutating the request.
+    pub fn validate(&self) -> Result<(), SkillError> {
+        if self.skill_id.trim().is_empty() || self.skill_id.chars().any(char::is_control) {
+            return Err(SkillError::InvalidField {
+                field: "skill_id",
+                reason: "must be non-blank and contain no control characters",
+            });
+        }
+        if self.candidate_package_digest.len() != 64
+            || self
+                .candidate_package_digest
+                .bytes()
+                .any(|byte| !byte.is_ascii_hexdigit() || byte.is_ascii_uppercase())
+        {
+            return Err(SkillError::InvalidField {
+                field: "candidate.candidate_package_digest",
+                reason: "must be lowercase SHA-256 hex",
+            });
+        }
+        if self.evidence_refs.is_empty() {
+            return Err(SkillError::InvalidField {
+                field: "candidate.evidence_refs",
+                reason: "candidate evidence is required",
+            });
+        }
+        let mut seen = BTreeSet::new();
+        for reference in &self.evidence_refs {
+            validate_text(reference, "candidate.evidence_ref").map_err(|_| {
+                SkillError::InvalidField {
+                    field: "candidate.evidence_ref",
+                    reason: "must be non-blank and contain no control characters",
+                }
+            })?;
+            if !seen.insert(reference) {
+                return Err(SkillError::Duplicate {
+                    field: "candidate.evidence_refs",
+                });
+            }
+        }
+        let mut dependencies = BTreeSet::new();
+        for dependency in &self.dependency_versions {
+            dependency.validate()?;
+            if !dependencies.insert(dependency) {
+                return Err(SkillError::Duplicate {
+                    field: "candidate.dependencies",
+                });
+            }
+        }
+        self.scope.validate()?;
+        Ok(())
+    }
+
+    /// Returns the Skill under lifecycle review.
+    pub fn skill_id(&self) -> &str {
+        &self.skill_id
+    }
+
+    /// Returns the materialized candidate package digest.
+    pub fn candidate_package_digest(&self) -> &str {
+        &self.candidate_package_digest
+    }
+
+    /// Returns the proposed lifecycle change.
+    pub const fn action(&self) -> LifecycleAction {
+        self.action
+    }
+
+    /// Returns the exact evidence references.
+    pub fn evidence_refs(&self) -> &[String] {
+        &self.evidence_refs
+    }
+
+    /// Returns the pinned dependency versions.
+    pub fn dependency_versions(&self) -> &[DependencyVersion] {
+        &self.dependency_versions
+    }
+
+    /// Returns the candidate scope.
+    pub const fn scope(&self) -> &SkillScope {
+        &self.scope
+    }
+}
+
+/// Injected Skill lifecycle boundary. The Governor skill owner, not A-16,
+/// owns lifecycle evidence, conflict state, reversible proposals, and
+/// evidence-gated promotion. A-16 forwards the exact admitted fence and typed
+/// fields and returns only typed results.
+///
+/// The boxed-future shape (instead of `async fn`) keeps this trait
+/// object-safe without a new async-trait dependency. No `Send` bound is
+/// imposed: the Governor borrows behind a production implementation are not
+/// guaranteed `Send`, and this surface holds the port thread-locally like its
+/// other injected ports.
+pub trait SkillLifecyclePort {
+    /// Reads one immutable Skill lifecycle view at the admitted fence.
+    fn skill_read<'a>(
+        &'a mut self,
+        ctx: &'a RequestMetadata,
+        skill_id: String,
+    ) -> Pin<Box<dyn Future<Output = Result<Option<SkillLifecycleView>, SkillError>> + 'a>>;
+
+    /// Submits one typed Skill candidate at the admitted fence.
+    fn propose_skill<'a>(
+        &'a mut self,
+        ctx: &'a RequestMetadata,
+        request: ProposeSkillRequest,
+    ) -> Pin<Box<dyn Future<Output = Result<SkillCandidate, SkillError>> + 'a>>;
+}
+
+impl AgentBridgeCore {
+    /// Injects the composition-selected Skill lifecycle owner.
+    #[must_use]
+    pub fn with_skill_lifecycle(mut self, port: Box<dyn SkillLifecyclePort>) -> Self {
+        self.skill_lifecycle = Some(port);
+        self
+    }
+
+    /// Returns one cloned Skill lifecycle view at the exact attached fence.
+    pub async fn skill_view(
+        &mut self,
+        ctx: &RequestMetadata,
+        skill_id: &str,
+    ) -> Result<Option<SkillLifecycleView>, BridgeError> {
+        ctx.validate()
+            .map_err(|error| BridgeError::ProviderContract(error.to_string()))?;
+        self.skill_authority_matches(ctx)?;
+        let view = self
+            .skill_port()?
+            .skill_read(ctx, skill_id.to_owned())
+            .await?;
+        if let Some(view) = &view {
+            view.validate()
+                .map_err(|error| BridgeError::ProviderContract(error.to_string()))?;
+        }
+        Ok(view)
+    }
+
+    /// Submits one typed Skill candidate at the exact attached fence.
+    pub async fn propose_skill_candidate(
+        &mut self,
+        ctx: &RequestMetadata,
+        request: ProposeSkillRequest,
+    ) -> Result<SkillCandidate, BridgeError> {
+        request.validate()?;
+        ctx.validate()
+            .map_err(|error| BridgeError::ProviderContract(error.to_string()))?;
+        self.skill_authority_matches(ctx)?;
+        let candidate = self.skill_port()?.propose_skill(ctx, request).await?;
+        candidate
+            .validate()
+            .map_err(|error| BridgeError::ProviderContract(error.to_string()))?;
+        Ok(candidate)
+    }
+
+    /// Fails closed unless the caller fence covers the exact attached
+    /// transport authority. [`RequestMetadata`] carries the dependency-only
+    /// [`eliot_contracts::StateFence`] while the attach binding carries the
+    /// process [`FencingToken`], so the comparison is the shared authority
+    /// epoch tuple plus the resource generation, mirroring
+    /// [`AgentBridgeCore::validate_event_binding`].
+    fn skill_authority_matches(&self, ctx: &RequestMetadata) -> Result<(), BridgeError> {
+        let fence = self.binding()?.state_fence();
+        if !ctx
+            .state_fence
+            .authority_epoch
+            .is_same_authority(fence.authority_epoch())
+            || ctx.state_fence.resource_generation.value() != fence.generation().get()
+        {
+            return Err(BridgeError::StaleAuthority);
+        }
+        Ok(())
+    }
+
+    fn skill_port(&mut self) -> Result<&mut (dyn SkillLifecyclePort + 'static), BridgeError> {
+        self.skill_lifecycle.as_deref_mut().ok_or_else(|| {
+            BridgeError::PlanGap(PlanGap::missing(RequiredProvider::SkillLifecyclePort))
+        })
+    }
+}
+
 /// Sanitized injected-provider failure. It must not contain credentials or raw
 /// provider response bodies.
 #[derive(Clone, Debug, Eq, Error, PartialEq)]
@@ -1298,6 +1556,8 @@ pub enum BridgeError {
     AckIdentityMismatch,
     #[error("provider returned invalid event disposition {0:?}")]
     InvalidEventDisposition(EventDisposition),
+    #[error(transparent)]
+    Skill(#[from] SkillError),
 }
 
 impl fmt::Debug for AgentBridgeCore {

@@ -22,6 +22,7 @@ eliot-observation-contracts.workspace = true
 eliot-protocol.workspace = true
 eliot-receipts.workspace = true
 eliot-security-contracts.workspace = true
+eliot-skill.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 sha2.workspace = true
