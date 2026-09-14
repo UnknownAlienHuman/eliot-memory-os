@@ -1,6 +1,6 @@
 schema_version = 3
 map_id = "cognitive-donor-map-2026-08-28-rev6"
-current_main_commit = "7f075ddf5d168f3d2ad3144807b7f0b9d4f0bb61"
+current_main_commit = "7a1a6eaa8d4e908afe89f0668922afed27a4cd22"
 superseded_prototype_branch_commit = "b35e4a489d45d81f172ef7d5b44bea165438cb1c"
 rule = "Reuse requires one current causal owner, current documentation fit, a pure or reconstructible boundary, exact donor anchors, an independent proof path and an explicit rejected-overgeneralization."
 source_status = "STATIC_REVIEW_ONLY"
@@ -56,16 +56,17 @@ rejected_overgeneralization = "Duplicate domain enums, writer utility as authori
 
 [[donor]]
 path = "crates/smart/eliot-memory"
-disposition = "RETIRE_AS_COGNITIVE_STATE_OWNER_AFTER_EDGE_MIGRATION"
+disposition = "RETIRED_DUPLICATE_COGNITIVE_STATE_OWNER"
 targets = ["governor.observation.classifier"]
-rationale = "Salvage only pure classification heuristics. Arc/Mutex canonical memory, retrieval, status, lifecycle and influence ownership conflict with the sole Governor/canonical path."
+rationale = "Extraction outcome idea-only: the classify helper informed the Governor observation classifier; ObservationHint/RecordKind/EpistemicStatus vocabulary rejected, nothing copied. Zero-consumer proof at base 7a1a6eaa (cargo metadata reverse-deps 0, no eliot_memory:: import, Cargo.lock own-entry only). Package source, root member and lock entry removed in work/39-retire-duplicate-cognitive-owners atop base 7a1a6eaa (removal commit SHA in #39 work unit)."
 rejected_overgeneralization = "Any second memory plane, status owner, retrieval reinforcement or direct write surface."
+extraction_proof = "D1_CAPTURE_CLASSIFICATION_EDGE_01 via crates/governor/eliot-observation/tests/classifier_first_pass.rs (5 tests)"
 
 [[donor]]
 path = "crates/smart/eliot-system-experience"
 disposition = "RETIRE_AS_STATE_OWNER_DEFER_READ_PROJECTION_IDEAS"
 targets = []
-rationale = "The canonical self-scope experience bank and SystemObservationJournal already have Governor/Memory OS owners. Later reuse only bounded read/filter/projection mechanics over those records."
+rationale = "The canonical self-scope experience bank and SystemObservationJournal already have Governor/Memory OS owners. Later reuse only bounded read/filter/projection mechanics over those records. Status under #39: retained-stateless v2 confirmed, owner-neutral edge deferred; source untouched by the eliot-memory retirement."
 rejected_overgeneralization = "A second self-memory owner, relation store or lifecycle transition path."
 
 [[donor]]
