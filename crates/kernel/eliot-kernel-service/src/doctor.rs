@@ -33,12 +33,13 @@ use std::collections::BTreeSet;
 use eliot_contracts::{EpochId, canonical_json_bytes, sha256_hex};
 use eliot_doctor_core::{
     AttemptIdentityBinding, ClosedRepairRequest, RepairClass, RepairOperationRef, RepairRecipe,
-    RepairRecipeIdentity, RepairRecipeManifest, canonical_fence,
+    RepairRecipeIdentity, RepairRecipeManifest, canonical_fence, check_fence_against_epoch,
 };
 use eliot_ors::{
     DoctorAttemptAdmission, DoctorAttemptRecord, DoctorAttemptState, DoctorBudgetDecision,
     DoctorBudgetLedger, DoctorEffectRecord, DoctorEffectState, DoctorLedgerError,
-    DoctorQuarantineCause, DoctorRecoveryLedger, OpaqueLabel, OperationIdentity,
+    DoctorQuarantineCause, DoctorRecoveryLedger, EpochIdentity, EpochLineage, OpaqueLabel,
+    OperationIdentity,
 };
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
@@ -223,6 +224,16 @@ impl DoctorRecipeRegistry {
 /// The binary-slice dispatch arm builds this from live Kernel state; the
 /// gate itself takes the live fence only, so admission never depends on ambient
 /// authority.
+///
+/// T6-D1 construction contract (issue #461, owned by the D2 bins
+/// front-door slice): `authority_epoch` must be the live Kernel
+/// `EpochId` from `KernelService::authority_epoch()`, and `generation`
+/// must be the live activation generation, following the
+/// `host_request_binding.rs:113-129` pattern (live authority from the
+/// Kernel service lineage plus the consumed activation receipt). Neither
+/// value is ever taken from the request envelope: the gate proves the
+/// presented fence agrees with this context via exact-tuple
+/// `is_same_authority` and rejects mismatches before any effect.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct DoctorAdmissionContext {
     /// Live Kernel service state; admission requires `Ready`.
@@ -571,6 +582,22 @@ pub enum DoctorRepairRejectionReason {
     EffectNotAuthorized,
     /// Guarded repair arrived without an approval.
     ApprovalRequired,
+    /// Guarded repair presented an approval that is not bound to a live
+    /// activation record.
+    ///
+    /// T6-D1 fail-closed cutover (issue #461): a guarded effect requires
+    /// an exact approval digest bound to a live activation record, and no
+    /// Doctor approval-to-activation lookup contract is published on this
+    /// base — there is no documented rule mapping a Doctor approval string
+    /// to an activation owner, and D1 invents none (no new lease/grant
+    /// type, no string-to-activation mapping, no non-empty-string
+    /// acceptance). Until the owning activation/approval snapshot contract
+    /// for Doctor is published, every guarded attempt fails closed here,
+    /// even with a well-formed approval present. Owner question for the
+    /// follow-up slice: which contract publishes the Doctor
+    /// approval-to-activation binding, and what exact digest rule proves a
+    /// presented approval is live and unrevoked? (PR-body residual, D1.)
+    ApprovalNotActivated,
     /// The durable admission count reached the recipe budget.
     BudgetExhausted,
     /// A new attempt arrived inside the recipe cooldown.
@@ -873,7 +900,40 @@ fn check_doctor_operation<'e>(
     Ok(operation)
 }
 
+/// Checks the guarded-approval activation binding (T6-D1, issue #461).
+///
+/// Presence was already proven by [`check_doctor_operation`]
+/// (`ApprovalRequired` when missing or blank). A present approval still
+/// authorizes nothing here: it must be bound to a live activation record,
+/// and no such lookup contract is published for Doctor on this base, so
+/// every guarded attempt fails closed with `ApprovalNotActivated`. See the
+/// variant docs for the owner question. Automatic-safe attempts never reach
+/// this refusal.
+fn check_doctor_approval_activation(
+    recipe: &RepairRecipe,
+    envelope: &ClosedRepairRequest,
+) -> Result<(), DoctorRefusal> {
+    if !matches!(recipe.repair_class, RepairClass::Guarded) {
+        return Ok(());
+    }
+    if envelope.approval.as_deref().is_none_or(str::is_empty) {
+        return Err((
+            DoctorRepairRejectionReason::ApprovalRequired,
+            "doctor_repair.approval",
+        ));
+    }
+    Err((
+        DoctorRepairRejectionReason::ApprovalNotActivated,
+        "doctor_repair.approval",
+    ))
+}
+
 /// Checks the presented fence against the live epoch and generation.
+///
+/// T6-D1 admission cutover (issue #461): the echo is evaluated through the
+/// canonical epoch owner (`check_fence_against_epoch`), so a full fence
+/// carrying a foreign lineage is rejected here, before any staging,
+/// budget, or effect — never trusted from the envelope, never minted.
 fn check_doctor_fence(
     context: &DoctorAdmissionContext,
     envelope: &ClosedRepairRequest,
@@ -884,11 +944,7 @@ fn check_doctor_fence(
             "doctor_repair.fence",
         ));
     }
-    if !envelope
-        .fence
-        .authority_epoch
-        .is_same_authority(&context.authority_epoch)
-    {
+    if check_fence_against_epoch(&envelope.fence, &context.authority_epoch).is_err() {
         return Err((
             DoctorRepairRejectionReason::StaleEpoch,
             "doctor_repair.authority_epoch",
@@ -964,6 +1020,7 @@ fn validate_doctor_terms<'a>(
     let envelope = parse_doctor_wire(request)?;
     let (recipe, registered_identity) = resolve_doctor_recipe(registry, &envelope)?;
     check_doctor_operation(registry, recipe, &envelope)?;
+    check_doctor_approval_activation(recipe, &envelope)?;
     check_doctor_fence(context, &envelope)?;
     let (lease_expiry_nanos, deadline_nanos, cooldown_nanos) =
         resolve_doctor_clocks(&envelope, now_unix_nanos)?;
@@ -979,14 +1036,19 @@ fn validate_doctor_terms<'a>(
 }
 
 /// Binds the Slice 1 attempt and effect identities for validated terms.
+///
+/// T6-D1 admission cutover (issue #461): the identity binds the live
+/// context epoch (`Some`), never the echo path (`None`). The gate already
+/// proved exact-tuple agreement, so this re-proves lineage at bind time:
+/// a foreign lineage fails closed here even if it ever reached binding.
 fn bind_doctor_identities(
     request: &DoctorRepairAttemptRequest,
     terms: &ValidatedDoctorTerms<'_>,
+    context: &DoctorAdmissionContext,
 ) -> Result<(String, String), KernelServiceError> {
     // The deadline moves out of the deserialized envelope by value, so no
-    // `time` type is ever named here; the epoch stays on the echo path
-    // (`None`) while the gate enforces exact epoch agreement in
-    // `check_doctor_fence`.
+    // `time` type is ever named here; the epoch is the live Kernel
+    // authority from the admission context, never envelope bytes.
     let operation = terms_operation(terms);
     let attempt = eliot_doctor_core::RepairAttemptIdentity::bind(&AttemptIdentityBinding {
         attempt_id: &request.attempt_id,
@@ -994,7 +1056,7 @@ fn bind_doctor_identities(
         recipe: terms.registered_identity,
         operation,
         fence: &terms.envelope.fence,
-        epoch: None,
+        epoch: Some(&context.authority_epoch),
         approval: terms.envelope.approval.as_deref(),
         budget_units: terms.envelope.budget_units,
         deadline: terms.envelope.deadline,
@@ -1030,14 +1092,26 @@ fn doctor_envelope_digests(
 }
 
 /// Builds the staged attempt row for bound identities.
+///
+/// T6-D1 admission cutover (issue #461): the row carries the live lineage
+/// from the admission context, never `None`, and the `u64` epoch and
+/// generation projections come from the live context — not the envelope —
+/// because the gate proved them equal to the presented fence
+/// (`is_same_authority` plus generation equality). `fence_digest` stays
+/// the opaque echo for exact-replay comparison. The `authority_epoch`
+/// column keeps its `u64` sequence projection with `epoch_lineage` as the
+/// authority; widening the column type is a migration owned by T6-E4.
 fn build_staged_doctor_attempt(
     request: &DoctorRepairAttemptRequest,
     terms: &ValidatedDoctorTerms<'_>,
     session_principal: &str,
     attempt_digest: &str,
     evidence_digest: &str,
+    context: &DoctorAdmissionContext,
 ) -> Result<DoctorAttemptRecord, KernelServiceError> {
     let operation = terms_operation(terms);
+    let lineage_id = OpaqueLabel::new(context.authority_epoch.lineage_id.as_str())
+        .map_err(|error| KernelServiceError::Platform(error.to_string()))?;
     let staged = DoctorAttemptRecord {
         contract_version: eliot_ors::DOCTOR_RECORD_CONTRACT_VERSION,
         attempt_digest: OperationIdentity::new(attempt_digest)
@@ -1055,9 +1129,20 @@ fn build_staged_doctor_attempt(
         principal_ref: OpaqueLabel::new(session_principal)
             .map_err(|error| KernelServiceError::Platform(error.to_string()))?,
         fence_digest: terms.envelope.fence.digest.clone(),
-        authority_epoch: terms.envelope.fence.authority_epoch.sequence.get(),
-        generation: terms.envelope.fence.generation,
-        epoch_lineage: None,
+        // Sequence projection of the live context epoch only; the
+        // `epoch_lineage` field below is the authority. Gate-proven equal
+        // to the presented fence sequence.
+        authority_epoch: context.authority_epoch.sequence.get(),
+        // Live context generation; gate-proven equal to the presented
+        // fence generation.
+        generation: context.generation,
+        epoch_lineage: Some(EpochLineage {
+            current: EpochIdentity {
+                lineage_id,
+                epoch: context.authority_epoch.sequence.get(),
+            },
+            predecessor: None,
+        }),
         target_resource_digest: request.target_resource_digest.clone(),
         approval_digest: terms
             .envelope
@@ -1091,9 +1176,10 @@ fn bind_and_stage_doctor_attempt<L: DoctorRecoveryLedger>(
     request: &DoctorRepairAttemptRequest,
     terms: &ValidatedDoctorTerms<'_>,
     session_principal: &str,
+    context: &DoctorAdmissionContext,
 ) -> Result<(BoundDoctorAttempt, DoctorAttemptRecord), DoctorGateHalt> {
     let (attempt_digest, effect_digest) =
-        bind_doctor_identities(request, terms).map_err(DoctorGateHalt::Mechanical)?;
+        bind_doctor_identities(request, terms, context).map_err(DoctorGateHalt::Mechanical)?;
     let (evidence_digest, intent_digest) =
         doctor_envelope_digests(&terms.envelope).map_err(DoctorGateHalt::Mechanical)?;
     let staged = build_staged_doctor_attempt(
@@ -1102,6 +1188,7 @@ fn bind_and_stage_doctor_attempt<L: DoctorRecoveryLedger>(
         session_principal,
         &attempt_digest,
         &evidence_digest,
+        context,
     )
     .map_err(DoctorGateHalt::Mechanical)?;
     let durable = match ledger.stage_doctor_attempt(&staged) {
@@ -1195,7 +1282,7 @@ pub fn admit_doctor_repair<L: DoctorRecoveryLedger>(
     };
     let operation = terms_operation(&terms);
     let (bound, durable) =
-        match bind_and_stage_doctor_attempt(ledger, request, &terms, session_principal) {
+        match bind_and_stage_doctor_attempt(ledger, request, &terms, session_principal, context) {
             Ok(staged) => staged,
             Err(DoctorGateHalt::Respond(response)) => return Ok(response),
             Err(DoctorGateHalt::Mechanical(error)) => return Err(error),
@@ -1449,6 +1536,10 @@ fn build_doctor_admission(
         allowed_effects,
         budget_units: mint.envelope.budget_units,
         deadline_unix_nanos: mint.deadline_nanos,
+        // Presence record only, bound into the admission digest for
+        // exact-replay comparison — never authorization. Guarded attempts
+        // never reach this mint: the `ApprovalNotActivated` gate refuses
+        // them first (T6-D1, issue #461).
         approval_present: mint
             .envelope
             .approval
@@ -1825,10 +1916,17 @@ fn rebuild_doctor_admission<L: DoctorRecoveryLedger>(
 /// service state and issues no new authority; an unknown delivery whose
 /// durable outcome is still uncertain remains the responsibility of the
 /// durable attempt record.
+///
+/// T6-D1 admission cutover (issue #461): `authority_epoch` is the live
+/// Kernel `EpochId` (from `KernelService::authority_epoch()`, supplied by
+/// the D2 dispatch arm — never envelope bytes), and the identity is
+/// re-derived against that exact authority, so an admission minted under a
+/// different lineage never reconciles as this one.
 pub fn reconcile_doctor_repair_admission(
     admission: &DoctorRepairAdmission,
     request: &DoctorRepairAttemptRequest,
     envelope: &ClosedRepairRequest,
+    authority_epoch: &EpochId,
 ) -> Result<bool, KernelServiceError> {
     admission.validate()?;
     request.validate()?;
@@ -1871,7 +1969,7 @@ pub fn reconcile_doctor_repair_admission(
         recipe: &envelope.recipe_identity,
         operation,
         fence: &envelope.fence,
-        epoch: None,
+        epoch: Some(authority_epoch),
         approval: envelope.approval.as_deref(),
         budget_units: envelope.budget_units,
         deadline: envelope.deadline,

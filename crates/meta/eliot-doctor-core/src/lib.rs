@@ -853,8 +853,12 @@ pub struct RepairAttemptIdentity {
 /// owner (`canonical_fence`); the optional lineaged `EpochId` binds the
 /// exact lineage where the fence is evaluated. Doctor never mints fence
 /// authority, it only binds the exact fence the Kernel admission carried.
-/// `None` preserves the Wave-A echo path for admissions that do not yet
-/// carry lineage; `Some` additionally proves sequence binding.
+/// `Some` carries the live Kernel `EpochId` the T6-D1 admission cutover
+/// (issue #461) enforces at the Kernel gate: the fence is proven against
+/// that exact authority before any effect. `None` preserves the pre-cutover
+/// echo path for the D2 bins front-door slice, which must supply the live
+/// epoch (via `ClosedRepairRequest::bind_attempt_on_epoch`) once its
+/// dispatch arm lands; the Kernel admission path never passes `None`.
 #[derive(Clone, Copy, Debug)]
 pub struct AttemptIdentityBinding<'a> {
     pub attempt_id: &'a str,
@@ -870,12 +874,20 @@ pub struct AttemptIdentityBinding<'a> {
 
 impl RepairAttemptIdentity {
     /// Binds every load-bearing attempt field. Fails closed on invalid input.
+    ///
+    /// T6-D1 admission cutover (issue #461): the fence authority encoding
+    /// is re-derived from the canonical `eliot-contracts` owner
+    /// (`canonical_fence`), never trusted from the presented struct fields
+    /// as authority. The presented `fence.digest` is bound only as an
+    /// opaque echo for exact-replay comparison; the lineage-aware epoch
+    /// tuple and generation bound here come from the canonical encoding,
+    /// so a caller-supplied digest can neither mint nor widen authority.
     pub fn bind(binding: &AttemptIdentityBinding<'_>) -> Result<Self, DoctorError> {
         text(binding.attempt_id, "attempt id")?;
         binding.brief.validate()?;
         binding.recipe.validate()?;
         binding.operation.validate()?;
-        canonical_fence(binding.fence)?;
+        let canonical = canonical_fence(binding.fence)?;
         if let Some(epoch) = binding.epoch {
             check_fence_against_epoch(binding.fence, epoch)?;
         }
@@ -902,21 +914,30 @@ impl RepairAttemptIdentity {
             binding.recipe.digest.as_bytes(),
         );
         hash_operation_ref(&mut hasher, binding.operation);
+        // Authority encoding re-derived from the canonical owner: the exact
+        // `(lineage_id, sequence)` tuple plus the canonical generation. The
+        // byte encoding is unchanged from the pre-cutover echo path (the
+        // canonical owner echoes these same values after validation), so
+        // valid admissions keep their identity digests; only the source of
+        // authority changes, from presented fields to canonical bytes.
         hash_field(
             &mut hasher,
             b"authority_epoch_lineage",
-            binding.fence.authority_epoch.lineage_id.as_str().as_bytes(),
+            canonical.authority_epoch.lineage_id.as_str().as_bytes(),
         );
         hash_field(
             &mut hasher,
             b"authority_epoch_sequence",
-            &binding.fence.authority_epoch.sequence.get().to_le_bytes(),
+            &canonical.authority_epoch.sequence.get().to_le_bytes(),
         );
         hash_field(
             &mut hasher,
             b"generation",
-            &binding.fence.generation.to_le_bytes(),
+            &canonical.resource_generation.value().to_le_bytes(),
         );
+        // Opaque echo only: bound for exact-replay comparison, never as
+        // authority. Authority over this digest is not established here;
+        // the Kernel gate owns fence currency and lineage agreement.
         hash_field(
             &mut hasher,
             b"fence_digest",
@@ -1422,11 +1443,47 @@ impl ClosedRepairRequest {
     /// Binds one attempt identity over this admitted request. The operation
     /// must be one of the admitted closed operations; anything else,
     /// including a free-form name, fails with `OperationNotAdmitted`.
+    ///
+    /// Pre-cutover echo path: the fence is validated for canonical shape
+    /// but is not proven against a live epoch here. The Kernel admission
+    /// gate never uses this path (it binds `RepairAttemptIdentity` directly
+    /// with the live `EpochId`); the D2 bins front-door slice must migrate
+    /// to `bind_attempt_on_epoch` with the live Kernel epoch once its
+    /// dispatch arm lands (residual for D2, issue #461).
     pub fn bind_attempt(
         &self,
         manifest: &RepairRecipeManifest,
         attempt_id: &str,
         operation: &RepairOperationRef,
+        now: OffsetDateTime,
+    ) -> Result<RepairAttemptIdentity, DoctorError> {
+        self.bind_attempt_inner(manifest, attempt_id, operation, None, now)
+    }
+    /// Binds one attempt identity over this admitted request against the
+    /// live Kernel epoch (T6-D1 admission cutover, issue #461).
+    ///
+    /// Identical to `bind_attempt` except the fence is additionally proven
+    /// against the exact lineaged authority via `check_fence_against_epoch`
+    /// before any identity is minted, so a foreign lineage fails closed
+    /// here instead of binding. This is the constructor the Kernel-admitted
+    /// path must use; `epoch` is the live Kernel `EpochId`, never a value
+    /// taken from the request envelope.
+    pub fn bind_attempt_on_epoch(
+        &self,
+        manifest: &RepairRecipeManifest,
+        attempt_id: &str,
+        operation: &RepairOperationRef,
+        epoch: &EpochId,
+        now: OffsetDateTime,
+    ) -> Result<RepairAttemptIdentity, DoctorError> {
+        self.bind_attempt_inner(manifest, attempt_id, operation, Some(epoch), now)
+    }
+    fn bind_attempt_inner(
+        &self,
+        manifest: &RepairRecipeManifest,
+        attempt_id: &str,
+        operation: &RepairOperationRef,
+        epoch: Option<&EpochId>,
         now: OffsetDateTime,
     ) -> Result<RepairAttemptIdentity, DoctorError> {
         self.validate_closed(manifest, now)?;
@@ -1439,7 +1496,7 @@ impl ClosedRepairRequest {
             recipe: &self.recipe_identity,
             operation,
             fence: &self.fence,
-            epoch: None,
+            epoch,
             approval: self.approval.as_deref(),
             budget_units: self.budget_units,
             deadline: self.deadline,
