@@ -9,6 +9,7 @@
 //! Test-oracle-only: no production ownership or approval semantics.
 
 use std::sync::atomic::Ordering;
+use std::sync::{Arc, Barrier};
 
 use redb::{Database, ReadableDatabase};
 
@@ -286,4 +287,151 @@ fn held_writer_contention_is_transient_under_bounded_registry_retry() {
     drop(transaction_store);
     let _ = std::fs::remove_file(registry_path);
     let _ = std::fs::remove_file(transaction_path);
+}
+
+/// Short-lived open-use-drop interleave proof (#1339, A13.9).
+///
+/// `INTERLEAVES` x open-mutate-drop interleaved with open-read-drop from two
+/// threads on the REAL registry retry primitives
+/// (`crate::redb_state::open_registry_writer_with_retry` /
+/// `open_registry_reader_with_retry`, the exact primitives shared with
+/// `open_existing_at` and `inspect_existing_at`). No mocks: one shared temp
+/// redb file with a raw `REGISTRY_TABLE` revision cell.
+///
+/// The test proves the post-fix lifetime: every handle is dropped before the
+/// next open, so the bounded `AlreadyOpen` retry never returns a fatal
+/// beyond-budget contention and the final revision is exact. Before the fix,
+/// a process-lifetime held writer made this contention deterministic (see the
+/// held-writer oracles above); the trailing control re-proves that a held
+/// writer exhausts even a small bounded retry, documenting why the Host
+/// lifetime hold was wrong.
+#[cfg(windows)]
+#[test]
+fn short_lived_registry_interleave_converges_with_exact_revision() {
+    const INTERLEAVES: u64 = 25;
+    let registry_path = std::env::temp_dir().join(format!(
+        "eliot-host-short-lived-registry-{}-{}.redb",
+        std::process::id(),
+        NEXT_TRANSACTION_ROOT.fetch_add(1, Ordering::Relaxed)
+    ));
+    let _ = std::fs::remove_file(&registry_path);
+    // Seed revision cell 0, then drop (short-lived).
+    {
+        let database = must(Database::create(&registry_path));
+        let write = must(database.begin_write());
+        {
+            let mut table = must(write.open_table(REGISTRY_TABLE));
+            let zero = 0_u64.to_le_bytes();
+            must(table.insert("rev", zero.as_slice()));
+        }
+        must(write.commit());
+    }
+    let barrier = Arc::new(Barrier::new(2));
+    // Writer: INTERLEAVES x open-mutate-drop via the real writer retry.
+    let writer_path = registry_path.clone();
+    let writer_barrier = Arc::clone(&barrier);
+    let writer = std::thread::spawn(move || {
+        writer_barrier.wait();
+        for expected in 1..=INTERLEAVES {
+            let database = crate::redb_state::open_registry_writer_with_retry(&writer_path)
+                .unwrap_or_else(|error| {
+                    panic!("short-lived writer open {expected} must converge: {error}")
+                });
+            let write = database.begin_write().unwrap_or_else(|error| {
+                panic!("short-lived writer begin_write must succeed: {error}")
+            });
+            {
+                let mut table = write
+                    .open_table(REGISTRY_TABLE)
+                    .unwrap_or_else(|error| panic!("short-lived writer must open table: {error}"));
+                let bytes = expected.to_le_bytes();
+                table
+                    .insert("rev", bytes.as_slice())
+                    .unwrap_or_else(|error| {
+                        panic!("short-lived writer insert must succeed: {error}")
+                    });
+            }
+            write
+                .commit()
+                .unwrap_or_else(|error| panic!("short-lived writer commit must succeed: {error}"));
+            // Drop before the next open: no exclusive owner across iterations.
+            drop(database);
+        }
+    });
+    // Reader: INTERLEAVES x open-read-drop via the real reader retry.
+    let reader_path = registry_path.clone();
+    let reader_barrier = Arc::clone(&barrier);
+    let reader = std::thread::spawn(move || {
+        reader_barrier.wait();
+        for _ in 0..INTERLEAVES {
+            let database = crate::redb_state::open_registry_reader_with_retry(&reader_path)
+                .unwrap_or_else(|error| panic!("short-lived reader open must converge: {error}"));
+            let read = database
+                .begin_read()
+                .unwrap_or_else(|_| unreachable!("short-lived reader must begin a read"));
+            let table = read
+                .open_table(REGISTRY_TABLE)
+                .unwrap_or_else(|_| unreachable!("short-lived reader must open the table"));
+            let value = table
+                .get("rev")
+                .unwrap_or_else(|_| unreachable!("revision cell must be readable"))
+                .unwrap_or_else(|| unreachable!("revision cell must exist"));
+            let bytes: [u8; 8] = value
+                .value()
+                .try_into()
+                .unwrap_or_else(|_| unreachable!("revision cell must be 8 bytes"));
+            let observed = u64::from_le_bytes(bytes);
+            assert!(
+                observed <= INTERLEAVES,
+                "reader must never observe a revision beyond the writer budget, got {observed}"
+            );
+            drop(read);
+            drop(database);
+        }
+    });
+    writer
+        .join()
+        .unwrap_or_else(|_| unreachable!("writer thread must converge"));
+    reader
+        .join()
+        .unwrap_or_else(|_| unreachable!("reader thread must converge"));
+    // Final revision is exact: one more short-lived read observes INTERLEAVES.
+    // All read handles drop at the end of this block so the held-writer
+    // control below observes only its own retained handle.
+    {
+        let database = must(crate::redb_state::open_registry_reader_with_retry(
+            &registry_path,
+        ));
+        let read = must(database.begin_read());
+        let table = must(read.open_table(REGISTRY_TABLE));
+        let value =
+            must(table.get("rev")).unwrap_or_else(|| unreachable!("final revision must exist"));
+        let bytes: [u8; 8] = value
+            .value()
+            .try_into()
+            .unwrap_or_else(|_| unreachable!("final revision must be 8 bytes"));
+        assert_eq!(
+            u64::from_le_bytes(bytes),
+            INTERLEAVES,
+            "final revision must be exact after short-lived interleaves"
+        );
+    }
+    // Held-writer control: a retained exclusive handle exhausts even a small
+    // bounded retry, documenting why the Host lifetime hold was wrong.
+    let held = must(Database::open(&registry_path));
+    let exhausted = crate::redb_state::retry_registry_open_on_already_open(
+        3,
+        std::time::Duration::from_millis(10),
+        std::time::Duration::from_millis(20),
+        || redb::ReadOnlyDatabase::open(&registry_path),
+    );
+    let Err(contention) = exhausted else {
+        unreachable!("bounded retry must exhaust while the writer is held")
+    };
+    assert!(
+        matches!(contention, redb::DatabaseError::DatabaseAlreadyOpen),
+        "held writer must exhaust bounded retry with typed AlreadyOpen, got: {contention}"
+    );
+    drop(held);
+    let _ = std::fs::remove_file(&registry_path);
 }

@@ -7,10 +7,12 @@
 //!
 //! Handle lifetime: the installer holds this writer `Database` only for the
 //! bounded stage/load projection and releases it before any SCM start or
-//! convergence wait (A13.9: no exclusive owner across an unbounded wait). A
-//! held writer blocks the Watchdog approval reader (`inspect_existing_at`, a
-//! short-lived `ReadOnlyDatabase`); terminal reconcile re-opens short-lived
-//! handles via `open_existing_at`.
+//! convergence wait, and the Host holds no writer across its process lifetime
+//! (one short-lived open-use-drop per CAS/readback via
+//! `open_existing_at` + bounded `AlreadyOpen` retry, #1339). A held writer
+//! blocks the Watchdog approval reader (`inspect_existing_at`, a short-lived
+//! `ReadOnlyDatabase`); terminal reconcile re-opens short-lived handles via
+//! `open_existing_at`.
 
 use std::path::{Path, PathBuf};
 

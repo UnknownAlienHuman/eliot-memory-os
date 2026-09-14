@@ -18,7 +18,7 @@ impl HostComposition {
         {
             let reason = "pending activation installation epoch is stale";
             persist_pending_recovery(
-                &self.registry_store,
+                &self.registry_host_root.clone(),
                 &mut self.registry,
                 &host_capability,
                 &pending,
@@ -37,7 +37,7 @@ impl HostComposition {
             } else {
                 let reason = error.to_string();
                 persist_pending_recovery(
-                    &self.registry_store,
+                    &self.registry_host_root.clone(),
                     &mut self.registry,
                     &host_capability,
                     &pending,
@@ -69,12 +69,12 @@ impl HostComposition {
                 )
             })?
         };
-        let outcome = self.registry_store.claim_pending_activation(
+        let outcome = self.open_registry_store()?.claim_pending_activation(
             host_capability,
             expected_revision,
             &pending.approval,
         );
-        let durable = self.registry_store.load().map_err(|readback_error| {
+        let durable = self.open_registry_store()?.load().map_err(|readback_error| {
             HostError::RecoveryRequired(format!(
                 "pending activation claim outcome is unknown and registry readback failed: {readback_error}"
             ))
@@ -129,13 +129,13 @@ impl HostComposition {
                 HostError::RecoveryRequired("Phase-B intent registry revision overflow".to_owned())
             })?
         };
-        let outcome = self.registry_store.record_pending_phase_b_intent(
+        let outcome = self.open_registry_store()?.record_pending_phase_b_intent(
             host_capability,
             expected_revision,
             &pending.approval,
             intent,
         );
-        let durable = self.registry_store.load().map_err(|readback_error| {
+        let durable = self.open_registry_store()?.load().map_err(|readback_error| {
             HostError::RecoveryRequired(format!(
                 "Phase-B intent outcome is unknown and registry readback failed: {readback_error}"
             ))
@@ -186,13 +186,13 @@ impl HostComposition {
                 )
             })?
         };
-        let outcome = self.registry_store.record_pending_phase_b_prepared(
+        let outcome = self.open_registry_store()?.record_pending_phase_b_prepared(
             host_capability,
             expected_revision,
             &pending.approval,
             prepared,
         );
-        let durable = self.registry_store.load().map_err(|readback_error| {
+        let durable = self.open_registry_store()?.load().map_err(|readback_error| {
             HostError::RecoveryRequired(format!(
                 "Phase-B preparation outcome is unknown and registry readback failed: {readback_error}"
             ))
@@ -241,14 +241,14 @@ impl HostComposition {
             })?
         };
         let outcome = self
-            .registry_store
+            .open_registry_store()?
             .record_pending_phase_b_agent_bridge_stage_prepared(
                 host_capability,
                 expected_revision,
                 &pending.approval,
                 stage,
             );
-        let durable = self.registry_store.load().map_err(|readback_error| {
+        let durable = self.open_registry_store()?.load().map_err(|readback_error| {
             HostError::RecoveryRequired(format!(
                 "Agent Bridge stage-prepared outcome is unknown and registry readback failed: {readback_error}"
             ))
@@ -300,14 +300,14 @@ impl HostComposition {
             expected_revision
         };
         let outcome = self
-            .registry_store
+            .open_registry_store()?
             .clear_pending_phase_b_agent_bridge_stage_prepared(
                 host_capability,
                 expected_revision,
                 &pending.approval,
                 stage,
             );
-        let durable = self.registry_store.load().map_err(|readback_error| {
+        let durable = self.open_registry_store()?.load().map_err(|readback_error| {
             HostError::RecoveryRequired(format!(
                 "Agent Bridge stage-clear outcome is unknown and registry readback failed: {readback_error}"
             ))
@@ -354,13 +354,13 @@ impl HostComposition {
                 HostError::RecoveryRequired("Phase-B receipt registry revision overflow".to_owned())
             })?
         };
-        let outcome = self.registry_store.record_pending_phase_b_receipt(
+        let outcome = self.open_registry_store()?.record_pending_phase_b_receipt(
             host_capability,
             expected_revision,
             &pending.approval,
             receipt,
         );
-        let durable = self.registry_store.load().map_err(|readback_error| {
+        let durable = self.open_registry_store()?.load().map_err(|readback_error| {
             HostError::RecoveryRequired(format!(
                 "Phase-B receipt outcome is unknown and registry readback failed: {readback_error}"
             ))
@@ -423,13 +423,15 @@ impl HostComposition {
                 HostError::RecoveryRequired("Phase-B prepared receipt revision overflow".to_owned())
             })?
         };
-        let outcome = self.registry_store.record_pending_phase_b_prepared_receipt(
-            host_capability,
-            expected_revision,
-            &pending.approval,
-            receipt,
-        );
-        let durable = self.registry_store.load().map_err(|error| {
+        let outcome = self
+            .open_registry_store()?
+            .record_pending_phase_b_prepared_receipt(
+                host_capability,
+                expected_revision,
+                &pending.approval,
+                receipt,
+            );
+        let durable = self.open_registry_store()?.load().map_err(|error| {
             HostError::RecoveryRequired(format!(
                 "prepared receipt outcome is unknown and registry readback failed: {error}"
             ))
@@ -474,12 +476,10 @@ impl HostComposition {
                 )
             })?
         };
-        let outcome = self.registry_store.record_active_phase_b_rebind_intent(
-            host_capability,
-            expected_revision,
-            intent,
-        );
-        let durable = self.registry_store.load().map_err(|readback_error| {
+        let outcome = self
+            .open_registry_store()?
+            .record_active_phase_b_rebind_intent(host_capability, expected_revision, intent);
+        let durable = self.open_registry_store()?.load().map_err(|readback_error| {
             HostError::RecoveryRequired(format!(
                 "Active Phase-B rebind intent outcome is unknown and registry readback failed: {readback_error}"
             ))
@@ -535,14 +535,14 @@ impl HostComposition {
                 })?
             };
         let outcome = self
-            .registry_store
+            .open_registry_store()?
             .record_active_phase_b_rebind_recovery_and_intent(
                 host_capability,
                 expected_revision,
                 recovery,
                 intent,
             );
-        let durable = self.registry_store.load().map_err(|readback_error| {
+        let durable = self.open_registry_store()?.load().map_err(|readback_error| {
             HostError::RecoveryRequired(format!(
                 "Active Phase-B recovery/intent outcome is unknown and registry readback failed: {readback_error}"
             ))
@@ -602,12 +602,10 @@ impl HostComposition {
                 )
             })?
         };
-        let outcome = self.registry_store.record_active_phase_b_rebind_prepared(
-            host_capability,
-            expected_revision,
-            prepared,
-        );
-        let durable = self.registry_store.load().map_err(|readback_error| {
+        let outcome = self
+            .open_registry_store()?
+            .record_active_phase_b_rebind_prepared(host_capability, expected_revision, prepared);
+        let durable = self.open_registry_store()?.load().map_err(|readback_error| {
             HostError::RecoveryRequired(format!(
                 "Active Phase-B rebind preparation outcome is unknown and registry readback failed: {readback_error}"
             ))
@@ -654,12 +652,10 @@ impl HostComposition {
                 )
             })?
         };
-        let outcome = self.registry_store.record_active_phase_b_rebind_receipt(
-            host_capability,
-            expected_revision,
-            receipt,
-        );
-        let durable = self.registry_store.load().map_err(|readback_error| {
+        let outcome = self
+            .open_registry_store()?
+            .record_active_phase_b_rebind_receipt(host_capability, expected_revision, receipt);
+        let durable = self.open_registry_store()?.load().map_err(|readback_error| {
             HostError::RecoveryRequired(format!(
                 "Active Phase-B rebind receipt outcome is unknown and registry readback failed: {readback_error}"
             ))
@@ -702,12 +698,12 @@ impl HostComposition {
         } else {
             expected_revision
         };
-        let outcome = self.registry_store.abort_pending_activation(
+        let outcome = self.open_registry_store()?.abort_pending_activation(
             host_capability,
             expected_revision,
             &pending.approval,
         );
-        let durable = self.registry_store.load().map_err(|readback_error| {
+        let durable = self.open_registry_store()?.load().map_err(|readback_error| {
             HostError::RecoveryRequired(format!(
                 "pending activation abort outcome is unknown and registry readback failed: {readback_error}"
             ))
@@ -742,7 +738,7 @@ impl HostComposition {
         pending: &eliot_installation::PendingActivation,
     ) -> Result<ActivationCommitFence, HostError> {
         self.ensure_admission_open()?;
-        let durable = self.registry_store.load().map_err(|error| {
+        let durable = self.open_registry_store()?.load().map_err(|error| {
             HostError::RecoveryRequired(format!(
                 "activation commit readiness fence registry readback failed: {error}"
             ))
@@ -978,7 +974,7 @@ impl HostComposition {
         host_capability: &eliot_platform_windows::HostOwnerEpochCapability,
     ) -> Result<(), HostError> {
         let commit_fence = self.fresh_pending_commit_fence(pending)?;
-        let durable_before_commit = self.registry_store.load().map_err(|error| {
+        let durable_before_commit = self.open_registry_store()?.load().map_err(|error| {
             HostError::RecoveryRequired(format!(
                 "activation commit registry readback failed after readiness proof: {error}"
             ))
@@ -1005,13 +1001,13 @@ impl HostComposition {
         } else {
             expected_revision
         };
-        let outcome = self.registry_store.commit_pending_activation(
+        let outcome = self.open_registry_store()?.commit_pending_activation(
             host_capability,
             expected_revision,
             &pending.approval,
             &commit_fence,
         );
-        let durable = self.registry_store.load().map_err(|readback_error| {
+        let durable = self.open_registry_store()?.load().map_err(|readback_error| {
             HostError::RecoveryRequired(format!(
                 "activation commit outcome is unknown and registry readback failed: {readback_error}"
             ))
@@ -1040,7 +1036,7 @@ impl HostComposition {
                 && current.approval == pending.approval
         }) {
             persist_pending_recovery(
-                &self.registry_store,
+                &self.registry_host_root.clone(),
                 &mut self.registry,
                 host_capability,
                 pending,
