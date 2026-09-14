@@ -33,6 +33,7 @@ use kernel_activation_client::KernelHostActivationPort;
 #[cfg(test)]
 use kernel_activation_client::{
     activation_frame_for_request, build_neutral_activation_request, decode_activation_response,
+    denial_reason_code,
 };
 use kernel_host_request_client::{KernelHostRequestClient, ReplayCacheEntry};
 
@@ -917,6 +918,82 @@ mod tests {
         )
         .unwrap();
         assert!(resp.validate_request(&req).is_ok());
+    }
+
+    #[test]
+    fn typed_denial_codes_surface_distinctly() {
+        use std::collections::BTreeSet;
+
+        use eliot_protocol::AgentBridgeActivationDenialCode;
+
+        let decl = fixture_declaration();
+        let chal = fixture_challenge(&decl);
+        let hello = decl.client_hello(chal.challenge_nonce.clone()).unwrap();
+        let receipt = fixture_receipt(&chal, &hello);
+        let core_req = AttachRequest::managed(
+            DemandId::new("demand-1").unwrap(),
+            ConnectionId::new("conn-1").unwrap(),
+        );
+        let req = build_neutral_activation_request(&core_req, &receipt, "demand-1").unwrap();
+        let cases = [
+            (
+                AgentBridgeActivationDenialCode::SemanticResolutionUnavailable,
+                eliot_protocol::AGENT_BRIDGE_SEMANTIC_RESOLUTION_UNAVAILABLE,
+            ),
+            (
+                AgentBridgeActivationDenialCode::TaskSelectionRequired,
+                eliot_protocol::AGENT_BRIDGE_TASK_SELECTION_REQUIRED,
+            ),
+            (
+                AgentBridgeActivationDenialCode::ScopeSelectionRequired,
+                eliot_protocol::AGENT_BRIDGE_SCOPE_SELECTION_REQUIRED,
+            ),
+            (
+                AgentBridgeActivationDenialCode::ScopeAmbiguous,
+                eliot_protocol::AGENT_BRIDGE_SCOPE_AMBIGUOUS,
+            ),
+            (
+                AgentBridgeActivationDenialCode::NotReady,
+                eliot_protocol::AGENT_BRIDGE_NOT_READY,
+            ),
+            (
+                AgentBridgeActivationDenialCode::StaleFence,
+                eliot_protocol::AGENT_BRIDGE_STALE_FENCE,
+            ),
+            (
+                AgentBridgeActivationDenialCode::FailedInternal,
+                eliot_protocol::AGENT_BRIDGE_FAILED_INTERNAL,
+            ),
+        ];
+        let mut seen = BTreeSet::new();
+        for (code, wire) in cases {
+            assert!(seen.insert(wire), "denial reason strings must be distinct");
+            assert_eq!(denial_reason_code(code), wire);
+            let resp = AgentBridgeActivationResponse::denied(&req, code).unwrap();
+            assert!(resp.validate_request(&req).is_ok());
+            let frame = Frame {
+                protocol_version: eliot_protocol::ProtocolVersion::CURRENT,
+                encoding_profile: EncodingProfile::JsonV1,
+                connection_id: req.connection_id.clone(),
+                request_id: Some(req.request_identity.request.metadata.request_id.clone()),
+                kind: FrameKind::Response,
+                message_type: MessageType::Result,
+                request_identity: None,
+                payload: ProtocolPayload::Json(serde_json::to_value(&resp).unwrap()),
+                trace_context: BTreeMap::new(),
+            };
+            let decoded = decode_activation_response(&frame, &req, &receipt).expect("decode");
+            match decoded.disposition {
+                eliot_protocol::AgentBridgeActivationDisposition::Denied { reason_code } => {
+                    assert_eq!(reason_code, code);
+                    assert_eq!(denial_reason_code(reason_code), wire);
+                }
+                eliot_protocol::AgentBridgeActivationDisposition::Authenticated { .. } => {
+                    panic!("denial response must not decode as authenticated");
+                }
+            }
+        }
+        assert_eq!(seen.len(), cases.len());
     }
 
     #[test]

@@ -1009,16 +1009,49 @@ impl KernelComposition {
         Ok(reply)
     }
 
+    /// Maps one non-`Resolved` daemon disposition to its exact agent-visible
+    /// denial code. The match is exhaustive with no wildcard arm, so a future
+    /// disposition breaks compilation here and at every projection site instead
+    /// of collapsing into another code. `Resolved` yields `None` because it
+    /// never projects a denial; it builds the `Authenticated` binding instead.
+    /// Kernel-owned refusals with no daemon disposition at all (pre-ticket
+    /// immediate denial, result-less expiry) never reach this function; they
+    /// keep the Kernel-owned `SemanticResolutionUnavailable` code.
+    pub(super) fn activation_denial_code_for_disposition(
+        disposition: &AgentActivationResolutionDisposition,
+    ) -> Option<AgentBridgeActivationDenialCode> {
+        match disposition {
+            AgentActivationResolutionDisposition::Resolved { .. } => None,
+            AgentActivationResolutionDisposition::TaskSelectionRequired { .. } => {
+                Some(AgentBridgeActivationDenialCode::TaskSelectionRequired)
+            }
+            AgentActivationResolutionDisposition::ScopeSelectionRequired { .. } => {
+                Some(AgentBridgeActivationDenialCode::ScopeSelectionRequired)
+            }
+            AgentActivationResolutionDisposition::ScopeAmbiguous { .. } => {
+                Some(AgentBridgeActivationDenialCode::ScopeAmbiguous)
+            }
+            AgentActivationResolutionDisposition::NotReady { .. } => {
+                Some(AgentBridgeActivationDenialCode::NotReady)
+            }
+            AgentActivationResolutionDisposition::StaleFence { .. } => {
+                Some(AgentBridgeActivationDenialCode::StaleFence)
+            }
+            AgentActivationResolutionDisposition::FailedInternal { .. } => {
+                Some(AgentBridgeActivationDenialCode::FailedInternal)
+            }
+        }
+    }
+
     /// Projects one accepted v2 result to its exact bridge connection. The
     /// match is exhaustive over all seven typed dispositions with no
     /// fallback arm, so the compiler rejects any silent coercion: only an
     /// exact valid `Resolved` binding creates a Session, and every
-    /// non-`Resolved` disposition receives an immediate typed denial that
-    /// creates no Session, authority, capability, or Finish state. The exact
-    /// disposition remains retained in the Kernel record and the
-    /// daemon-facing acknowledgement; the thin bridge wire below carries the
-    /// single closed denial code owned by the bridge contract, so mapping is
-    /// decided by the typed arm alone and never by human detail or log text.
+    /// non-`Resolved` disposition receives an immediate typed denial carrying
+    /// its own exact denial code, creating no Session, authority, capability,
+    /// or Finish state. The exact disposition remains retained in the Kernel
+    /// record and the daemon-facing acknowledgement; mapping is decided by
+    /// these typed arms alone and never by human detail or log text.
     #[cfg(windows)]
     fn activation_result_response_frame(
         &self,
@@ -1039,10 +1072,11 @@ impl KernelComposition {
         // The match stays exhaustive with no wildcard arm, so adding a
         // future disposition breaks compilation instead of silently
         // coercing. All six non-success dispositions share the bridge
-        // outcome below: an immediate typed denial with no Session,
-        // authority, capability, or Finish. Their exact typed content stays
-        // retained in the Kernel record and the daemon-facing
-        // acknowledgement; mapping is decided by these typed arms alone.
+        // outcome below: an immediate typed denial carrying the exact
+        // per-disposition code, with no Session, authority, capability, or
+        // Finish. Their exact typed content stays retained in the Kernel
+        // record and the daemon-facing acknowledgement; mapping is decided
+        // by these typed arms alone.
         match &result.disposition {
             AgentActivationResolutionDisposition::Resolved { binding } => {
                 self.resolved_result_response_frame(connection_id, original, pending, binding)
@@ -1053,7 +1087,9 @@ impl KernelComposition {
             | AgentActivationResolutionDisposition::NotReady { .. }
             | AgentActivationResolutionDisposition::StaleFence { .. }
             | AgentActivationResolutionDisposition::FailedInternal { .. } => {
-                self.denied_result_response_frame(connection_id, original, pending)
+                let reason_code = Self::activation_denial_code_for_disposition(&result.disposition)
+                    .ok_or(TransportError::SessionFenced)?;
+                self.denied_result_response_frame(connection_id, original, pending, reason_code)
             }
         }
     }
@@ -1063,8 +1099,9 @@ impl KernelComposition {
     /// A `Resolved` disposition builds the Authenticated transport binding by
     /// copying the Governor-owned resolved fields and the exact ticket fence;
     /// Kernel performs no semantic selection or retry interpretation. Any
-    /// other disposition revokes the connection and returns the single
-    /// fail-closed denial without creating a Session.
+    /// other disposition revokes the connection and returns the immediate
+    /// typed denial carrying that disposition's exact denial code, without
+    /// creating a Session. The match stays exhaustive with no wildcard arm.
     #[cfg(windows)]
     fn activation_result_response(
         &self,
@@ -1084,58 +1121,72 @@ impl KernelComposition {
                 .ok_or(TransportError::SessionFenced)?
                 .clone()
         };
-        let AgentActivationResolutionDisposition::Resolved { binding } = &result.disposition else {
-            self.agent_activation_pending
-                .lock()
-                .map_err(|_| TransportError::SessionFenced)?
-                .entries
-                .remove(ticket_id);
-            self.agent_activation_results
-                .lock()
-                .map_err(|_| TransportError::SessionFenced)?
-                .remove(ticket_id);
-            self.revoke_agent_bridge(connection_id);
-            let response = AgentBridgeActivationResponse::denied(
-                &pending.request,
-                AgentBridgeActivationDenialCode::SemanticResolutionUnavailable,
-            )
-            .map_err(|_| TransportError::SessionFenced)?;
-            response
-                .validate_request(&pending.request)
-                .map_err(|_| TransportError::SessionFenced)?;
-            let reply = Frame {
-                protocol_version: frame.protocol_version,
-                encoding_profile: frame.encoding_profile,
-                connection_id: connection_id.to_owned(),
-                request_id: Some(response.request_id.clone()),
-                kind: FrameKind::Response,
-                message_type: MessageType::Result,
-                request_identity: None,
-                payload: ProtocolPayload::Json(
-                    serde_json::to_value(response).map_err(|_| TransportError::SessionFenced)?,
-                ),
-                trace_context: frame.trace_context.clone(),
-            };
-            reply.validate()?;
-            return Ok(reply);
-        };
-        let reply = self.activation_response_frame_for_resolution(
-            connection_id,
-            frame,
-            &pending,
-            result,
-            binding,
-        )?;
-        self.agent_activation_pending
-            .lock()
-            .map_err(|_| TransportError::SessionFenced)?
-            .entries
-            .remove(ticket_id);
-        self.agent_activation_results
-            .lock()
-            .map_err(|_| TransportError::SessionFenced)?
-            .remove(ticket_id);
-        Ok(reply)
+        // Exhaustive per-disposition projection with no wildcard arm: a
+        // future disposition breaks compilation here instead of silently
+        // reusing another denial code. Only `Resolved` reaches the binding
+        // projector; every other disposition is revoked and denied with its
+        // exact code, creating no Session.
+        match &result.disposition {
+            AgentActivationResolutionDisposition::Resolved { binding } => {
+                let reply = self.activation_response_frame_for_resolution(
+                    connection_id,
+                    frame,
+                    &pending,
+                    result,
+                    binding,
+                )?;
+                self.agent_activation_pending
+                    .lock()
+                    .map_err(|_| TransportError::SessionFenced)?
+                    .entries
+                    .remove(ticket_id);
+                self.agent_activation_results
+                    .lock()
+                    .map_err(|_| TransportError::SessionFenced)?
+                    .remove(ticket_id);
+                Ok(reply)
+            }
+            AgentActivationResolutionDisposition::TaskSelectionRequired { .. }
+            | AgentActivationResolutionDisposition::ScopeSelectionRequired { .. }
+            | AgentActivationResolutionDisposition::ScopeAmbiguous { .. }
+            | AgentActivationResolutionDisposition::NotReady { .. }
+            | AgentActivationResolutionDisposition::StaleFence { .. }
+            | AgentActivationResolutionDisposition::FailedInternal { .. } => {
+                self.agent_activation_pending
+                    .lock()
+                    .map_err(|_| TransportError::SessionFenced)?
+                    .entries
+                    .remove(ticket_id);
+                self.agent_activation_results
+                    .lock()
+                    .map_err(|_| TransportError::SessionFenced)?
+                    .remove(ticket_id);
+                self.revoke_agent_bridge(connection_id);
+                let reason_code = Self::activation_denial_code_for_disposition(&result.disposition)
+                    .ok_or(TransportError::SessionFenced)?;
+                let response = AgentBridgeActivationResponse::denied(&pending.request, reason_code)
+                    .map_err(|_| TransportError::SessionFenced)?;
+                response
+                    .validate_request(&pending.request)
+                    .map_err(|_| TransportError::SessionFenced)?;
+                let reply = Frame {
+                    protocol_version: frame.protocol_version,
+                    encoding_profile: frame.encoding_profile,
+                    connection_id: connection_id.to_owned(),
+                    request_id: Some(response.request_id.clone()),
+                    kind: FrameKind::Response,
+                    message_type: MessageType::Result,
+                    request_identity: None,
+                    payload: ProtocolPayload::Json(
+                        serde_json::to_value(response)
+                            .map_err(|_| TransportError::SessionFenced)?,
+                    ),
+                    trace_context: frame.trace_context.clone(),
+                };
+                reply.validate()?;
+                Ok(reply)
+            }
+        }
     }
 
     /// Builds the Authenticated transport binding for a `Resolved` result.
@@ -1277,8 +1328,9 @@ impl KernelComposition {
         Ok(reply)
     }
 
-    /// Returns the immediate typed denial for one non-`Resolved` result. No
-    /// Session, authority, capability, or Finish state is created on any
+    /// Returns the immediate typed denial for one non-`Resolved` result,
+    /// carrying the exact per-disposition denial code supplied by the caller.
+    /// No Session, authority, capability, or Finish state is created on any
     /// path through this function; the bridge leg is only marked complete.
     #[cfg(windows)]
     fn denied_result_response_frame(
@@ -1286,12 +1338,10 @@ impl KernelComposition {
         connection_id: &str,
         original: &Frame,
         pending: &AgentActivationPending,
+        reason_code: AgentBridgeActivationDenialCode,
     ) -> Result<Frame, TransportError> {
-        let response = AgentBridgeActivationResponse::denied(
-            &pending.request,
-            AgentBridgeActivationDenialCode::SemanticResolutionUnavailable,
-        )
-        .map_err(|_| TransportError::SessionFenced)?;
+        let response = AgentBridgeActivationResponse::denied(&pending.request, reason_code)
+            .map_err(|_| TransportError::SessionFenced)?;
         response
             .validate_request(&pending.request)
             .map_err(|_| TransportError::SessionFenced)?;
@@ -1338,11 +1388,12 @@ impl KernelComposition {
     /// full typed resolution result, whichever the resolver submits first for
     /// the exact ticket. A `Resolved` result yields the same Authenticated
     /// transport binding as a legacy decision through a mechanical field copy;
-    /// every other disposition yields the single fail-closed typed denial and
-    /// creates no Session. The full typed result stays addressable under its
-    /// ticket and result digests for Governor reconciliation through the
-    /// host-request route; the denial wire carries no disposition mapping
-    /// because no new contract wire version is admitted in this scope.
+    /// every other disposition yields the immediate typed denial carrying that
+    /// disposition's exact denial code and creates no Session. The full typed
+    /// result stays addressable under its ticket and result digests for
+    /// Governor reconciliation through the host-request route; the denial wire
+    /// carries the exact per-disposition code so the agent can distinguish
+    /// selection, ambiguity, retry, fence, and internal outcomes.
     #[cfg(windows)]
     pub async fn await_agent_bridge_activation_response(
         &self,
@@ -1542,6 +1593,10 @@ impl KernelComposition {
             .entries
             .remove(&ticket.ticket_id);
         self.revoke_agent_bridge(connection_id);
+        // Result-less expiry has no daemon disposition to project, so it keeps
+        // the Kernel-owned no-result denial code. Mapping it to any of the six
+        // disposition codes would fabricate a daemon semantic result after the
+        // deadline, which the expiry race must never do.
         let response = AgentBridgeActivationResponse::denied(
             &request,
             AgentBridgeActivationDenialCode::SemanticResolutionUnavailable,
