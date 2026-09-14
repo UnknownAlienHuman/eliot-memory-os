@@ -122,7 +122,9 @@ be promoted to live multi-agent/runtime proof.
 |---|---|---|
 | `build-eliot-windows-x64-release.ps1` | Build declared Windows x64 release inputs and an unsigned bundle | Build/staging only |
 | `finalize-eliot-windows-x64-release.ps1` | Sign/finalize and independently read back declared release artifacts | Release-artifact evidence only |
+| `install-pipeline.ps1` | Root-controller install pipeline executing materialization and installation apply | Installation orchestration only |
 | `invoke-eliot-windows-x64-production.ps1` | Execute the manifest-bound production invocation/installation flow | Live acceptance remains issue #11 |
+| `reset-developer-install.ps1` | Reset developer installation state across services, processes, directories, and credentials | Developer machine reset only |
 
 Read `docs/release/WINDOWS_X64_RELEASE.md` before use. The canonical operator
 surface is `eliot.exe`; scripts do not create a parallel CLI or direct
