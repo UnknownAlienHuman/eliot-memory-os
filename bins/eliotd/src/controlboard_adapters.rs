@@ -45,16 +45,20 @@
 #![forbid(unsafe_code)]
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::future::Future;
+use std::pin::Pin;
 use std::sync::{Arc, Mutex};
 
-use eliot_contracts::{SessionId, sha256_hex};
+use eliot_contracts::{RequestMetadata, SessionId, sha256_hex};
 use eliot_controlboard::{
     AccessBinding, AccessResolverPort, ActionCapability, CanonicalState, CanonicalStatePort,
     CommandDisposition, CommandReceipt, CommandRequest, ControlBoard, OperatorCommandPort,
-    PortError, PrivacyClass, ProjectionBinding, ProjectionProvider, ProviderCompleteness,
-    ReadRequest, Role, SwarmProjectionEnvelope, SwarmProjectionPort, ViewRevision,
+    PortError, PrivacyClass, ProjectionBinding, ProjectionProvider, ProposeSkillRequest,
+    ProviderCompleteness, ReadRequest, Role, SkillLifecyclePort, SwarmProjectionEnvelope,
+    SwarmProjectionPort, ViewRevision,
 };
 use eliot_governor::ControlBoardGovernorSnapshot;
+use eliot_skill::{SkillCandidate, SkillError, SkillLifecycleView};
 
 use super::daemon_kernel_client::OwnerSessionFacts;
 
@@ -92,7 +96,10 @@ pub(crate) fn controlboard_over_snapshot(
             shared,
         ))),
     )
-    .with_swarm_projection(Box::new(GovernorSwarmProjection::new(snapshot)))
+    .with_swarm_projection(Box::new(GovernorSwarmProjection::new(Arc::clone(
+        &snapshot,
+    ))))
+    .with_skill_lifecycle(Box::new(GovernorSkillSnapshot::new(snapshot)))
 }
 
 /// Rejects bindings that are not current at the snapshot fence and revision.
@@ -768,6 +775,68 @@ impl SwarmProjectionPort for GovernorSwarmProjection {
         // would be a privacy expansion and a fabricated observation, so the
         // admitted-but-unresolvable read stays a typed gap instead.
         Err(PortError::Unknown)
+    }
+}
+
+/// Governor-backed Skill lifecycle reader over the immutable snapshot.
+///
+/// The snapshot carries no Skill registry rows, so this port serves the
+/// honest empty projection and fails propose closed, mirroring
+/// [`GovernorCanonicalState`]: owner records carry no Skill lifecycle bytes
+/// here, and inventing a view or candidate would fabricate lifecycle
+/// evidence. Every call still enforces the exact snapshot fence first, so a
+/// stale caller fails closed with [`SkillError::FenceMismatch`] before any
+/// projection answer. Live Skill bytes remain available per operation through
+/// [`DaemonComposition::skill_controlboard_port`](super::DaemonComposition::skill_controlboard_port),
+/// which forwards to the Governor owner instead of this snapshot.
+struct GovernorSkillSnapshot {
+    snapshot: Arc<ControlBoardGovernorSnapshot>,
+}
+
+impl GovernorSkillSnapshot {
+    fn new(snapshot: Arc<ControlBoardGovernorSnapshot>) -> Self {
+        Self { snapshot }
+    }
+}
+
+impl SkillLifecyclePort for GovernorSkillSnapshot {
+    fn skill_read<'a>(
+        &'a mut self,
+        ctx: &'a RequestMetadata,
+        skill_id: String,
+    ) -> Pin<Box<dyn Future<Output = Result<Option<SkillLifecycleView>, SkillError>> + 'a>> {
+        let fence = self.snapshot.fence.clone();
+        Box::pin(async move {
+            ctx.validate().map_err(|_| SkillError::IdentityMismatch)?;
+            if ctx.state_fence != fence {
+                return Err(SkillError::FenceMismatch);
+            }
+            if skill_id.trim().is_empty() || skill_id.chars().any(char::is_control) {
+                return Err(SkillError::InvalidField {
+                    field: "skill_id",
+                    reason: "must be non-blank and contain no control characters",
+                });
+            }
+            Ok(None)
+        })
+    }
+
+    fn propose_skill<'a>(
+        &'a mut self,
+        ctx: &'a RequestMetadata,
+        request: ProposeSkillRequest,
+    ) -> Pin<Box<dyn Future<Output = Result<SkillCandidate, SkillError>> + 'a>> {
+        let fence = self.snapshot.fence.clone();
+        Box::pin(async move {
+            ctx.validate().map_err(|_| SkillError::IdentityMismatch)?;
+            if ctx.state_fence != fence {
+                return Err(SkillError::FenceMismatch);
+            }
+            request
+                .validate()
+                .map_err(|error| SkillError::Surface(error.to_string()))?;
+            Err(SkillError::NotFound)
+        })
     }
 }
 

@@ -43,6 +43,7 @@ mod kernel_recovery_client;
 mod kernel_transition_client;
 mod observation_adapters;
 mod skill_lifecycle_adapters;
+mod skill_surface_adapters;
 mod store_failure_projection;
 
 pub use activation_projection::AgentActivationResolver;
@@ -507,6 +508,29 @@ impl DaemonComposition {
         }
         Ok(skill_lifecycle_adapters::ForwardingSkillLifecycle::new(
             self.governor.skill_lifecycle(),
+        ))
+    }
+
+    /// Borrows the single Governor Skill lifecycle owner as the provider-neutral
+    /// [`SkillLifecyclePort`](eliot_controlboard::SkillLifecyclePort) surface port.
+    ///
+    /// The port forwards the exact admitted identity and typed fields to the
+    /// Governor canonical read/propose path (`skill_lifecycle` ->
+    /// `ForwardingSkillLifecycle` -> `GovernorSkillLifecycle::view/propose`)
+    /// and returns only typed results. No policy, admission, or semantic
+    /// rules live here; a stale fence fails closed in the Governor owner.
+    /// Callers take a fresh port per operation so a Governor refresh surfaces
+    /// as an exact-view mismatch instead of silent divergence.
+    pub fn skill_controlboard_port(
+        &self,
+    ) -> Result<impl eliot_controlboard::SkillLifecyclePort + '_, DaemonError> {
+        if self.readiness() != eliot_governor::CompositionReadiness::Ready {
+            return Err(DaemonError::Composition(
+                eliot_governor::CompositionError::NotReady,
+            ));
+        }
+        Ok(skill_surface_adapters::GovernorSkillForwarder::new(
+            self.skill_lifecycle()?,
         ))
     }
 
