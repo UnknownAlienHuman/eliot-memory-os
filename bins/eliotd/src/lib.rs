@@ -47,6 +47,8 @@ mod store_failure_projection;
 
 pub use activation_projection::AgentActivationResolver;
 
+use controlboard_adapters::SharedOperatorReplay;
+
 #[cfg(test)]
 use activation_projection::map_activation_snapshot;
 
@@ -170,6 +172,15 @@ pub struct DaemonComposition {
     config_path: PathBuf,
     state_root: PathBuf,
     started: bool,
+    /// Process-retained operator replay handle shared by every board built
+    /// through [`DaemonComposition::controlboard`].
+    ///
+    /// Volatile fast path only, never durability: a newly created board
+    /// replays an already-admitted operation without a second effecting-port
+    /// call while the process lives. Durable operator identity lives in
+    /// Kernel ORS through the async Governor operator borrow; post-commit
+    /// refreshes retain this handle without ever clearing it.
+    operator_replay: SharedOperatorReplay,
     /// Set when a post-commit refresh fails after the write receipt was
     /// already durable. The dependent view is stale/pending until the caller
     /// drops this composition and re-runs authenticated connect+start.
@@ -227,6 +238,7 @@ impl DaemonComposition {
             state_root: config.state_root,
             started: true,
             view_stale: false,
+            operator_replay: SharedOperatorReplay::new(),
         })
     }
 
@@ -243,6 +255,9 @@ impl DaemonComposition {
     ///   keeps the already durable receipt, marks this composition's
     ///   dependent view stale/pending (see `status`), and still returns the
     ///   receipt: a committed operation is never reported as non-executed.
+    /// - The retained volatile operator replay handle is preserved across the
+    ///   refresh, never cleared; durable operator identity is unaffected
+    ///   because it lives in Kernel ORS, not in this handle.
     /// - Any `Err` from `commit_canonical` — including epoch/generation
     ///   `Recovery` — propagates unchanged so the caller drops this
     ///   composition and re-runs authenticated connect+start. A stale view
@@ -423,13 +438,21 @@ impl DaemonComposition {
     /// The board reads one immutable snapshot taken here; every port call in
     /// the returned value observes the same revision and fence. Callers take
     /// a fresh board per operation so a Governor refresh surfaces as an
-    /// exact-view mismatch instead of silent divergence. Access resolution
-    /// and the Swarm projection remain typed provider gaps until their
-    /// owning slices land; reads serve a coherent empty-items view over real
-    /// G-11/I-12 bindings and submission admits candidate-only intents.
+    /// exact-view mismatch instead of silent divergence. The board shares the
+    /// retained volatile replay handle, so a newly created board replays an
+    /// already-admitted operation instead of admitting it twice; durable
+    /// operator identity stays in Kernel ORS through the async Governor
+    /// operator borrow. Access resolution and the Swarm projection remain
+    /// typed provider gaps until their owning slices land; reads serve a
+    /// coherent empty-items view over real G-11/I-12 bindings and submission
+    /// admits candidate-only intents.
     pub fn controlboard(&self) -> Result<eliot_controlboard::ControlBoard, DaemonError> {
         let snapshot = self.governor.controlboard_snapshot()?;
-        Ok(controlboard_adapters::controlboard_over_snapshot(snapshot))
+        Ok(controlboard_adapters::controlboard_over_snapshot(
+            snapshot,
+            &self.operator_replay,
+            Vec::new(),
+        ))
     }
 
     /// Borrows the single Governor Skill lifecycle owner as a forwarding
