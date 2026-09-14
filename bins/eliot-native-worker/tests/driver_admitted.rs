@@ -21,9 +21,11 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Debug;
 use std::future::Future;
-use std::io::Cursor;
+use std::io::{Cursor, Read, Write};
+use std::process::{Command, Stdio};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::task::{Context, Poll, Waker};
+use std::time::{Duration, Instant};
 
 use eliot_contracts::{
     ClockReading, DecisionId, EpochId, EpochLineageId, ResourceGeneration, SessionId, StateFence,
@@ -31,11 +33,11 @@ use eliot_contracts::{
 };
 use eliot_native_worker::{
     AdmittedLifecycle, KernelReplayPort, KernelReplayTransport, NativeWorker, NativeWorkerError,
-    ReconcileSubmission, drive_admitted_claimed,
+    ReconcileRetainedReceipt, ReconcileSubmission, WorkerResponse, drive_admitted_claimed,
 };
 use eliot_native_worker_core::{
     AdmissionLivenessFacts, AdmissionLivenessOutcome, AttemptId, AuthorityEnvelope, BudgetEnvelope,
-    CapabilityAdmissionFacts, CapabilityAdmissionOutcome, CapabilityAdmissionPort,
+    CancelRequest, CapabilityAdmissionFacts, CapabilityAdmissionOutcome, CapabilityAdmissionPort,
     CapabilityAdmissionRequest, CapabilityLivenessRequest, CheckpointProviderOutcome,
     CheckpointReceiptFacts, ClaimAdmissionRequest, DurableCheckpointPort, DurableCheckpointRequest,
     DurableReplayPort, DurableRequestDecision, EXECUTION_UNIT_SCHEMA_VERSION,
@@ -44,8 +46,8 @@ use eliot_native_worker_core::{
     NATIVE_WORKER_EXECUTABLE_BINDING_EXPECTED_WIRE_VERSION, NativeClaimId, NativeRegistrationId,
     NativeRenewalId, NativeWorkerClaim, NativeWorkerExecutableBinding,
     NativeWorkerExecutableExpectation, NativeWorkerRegistration, PROTOCOL_VERSION, ProviderFailure,
-    WorkerCore, WorkerError, WorkerEventEnvelope, WorkerFrame, WorkerFrameBody, WorkerHello,
-    WorkerLifecycle,
+    WorkerCore, WorkerError, WorkerEventEnvelope, WorkerEventPayload, WorkerFrame, WorkerFrameBody,
+    WorkerHello, WorkerLifecycle, WorkerRequest,
 };
 use eliot_process::SessionId as ProcessSessionId;
 use eliot_process::{
@@ -1154,4 +1156,397 @@ fn recover_claimed_preserves_recover_without_second_process() {
     assert!(lock(&evidence).is_empty());
 
     remove_bat("drive-recover");
+}
+
+#[test]
+fn retained_record_restart_reconciles_with_receipt_without_second_process() {
+    let (mut worker, _, registration, claim_value, hello_value, process, evidence, admissions, bat) =
+        build_driver(
+            "drive-restart",
+            "operation-restart-1",
+            "tree-restart-1",
+            "nonce-restart-1",
+        );
+    let admission = claim_request(&registration, &claim_value);
+    let reconcile = reconcile_for(&claim_value);
+    let readiness = readiness_for(&claim_value);
+    let mut lifecycle = FakeLifecycle::new();
+
+    let ready = block_on(drive_admitted_claimed(
+        &mut lifecycle,
+        &mut worker,
+        &registration,
+        &admission,
+        hello_value,
+        process,
+        &reconcile,
+        &readiness,
+    ))
+    .unwrap_or_else(|error| panic!("admitted drive must reach Ready, got {error:?}"));
+    assert_eq!(worker.lifecycle(), WorkerLifecycle::Ready);
+    assert_eq!(ready.stream_id, "claim-1/gen-1");
+    assert_eq!(lifecycle.registrations, 1);
+    assert_eq!(lifecycle.claims, 1);
+    assert_eq!(lifecycle.reconciles, 1);
+    assert_eq!(lifecycle.readiness, 1);
+    assert_eq!(*lock(&admissions), 1);
+    assert_eq!(lock(&evidence).len(), 1);
+
+    // The start response is lost but the generation retains its record, so the
+    // restart reconciles through the retained receipt bound to the exact
+    // claim. This receipt-carrying path is not covered by the receipt=None
+    // happy path (`reconcile_for`).
+    let retained = ReconcileRetainedReceipt {
+        claim_id: claim_value.claim_id.as_str().to_owned(),
+        receipt_digest: sha256_hex(b"t9-06 retained start receipt"),
+        worker_generation: None,
+        authority_epoch: None,
+        state_fence: None,
+        registration_id: None,
+        binding_digest: None,
+        attempt_id: None,
+        operation_id: None,
+    };
+    let restart = ReconcileSubmission::new(
+        "reconcile-restart-1".to_owned(),
+        claim_value.clone(),
+        Some(retained),
+    );
+    let reply = lifecycle
+        .submit_reconcile(&restart)
+        .unwrap_or_else(|error| panic!("receipt-bound reconcile must be accepted, got {error:?}"));
+    assert_eq!(
+        reply.get("kind").and_then(serde_json::Value::as_str),
+        Some("native_worker_reconciled")
+    );
+    assert_eq!(
+        reply
+            .get("reconcile_id")
+            .and_then(serde_json::Value::as_str),
+        Some("reconcile-restart-1")
+    );
+    assert_eq!(
+        reply.get("claim_id").and_then(serde_json::Value::as_str),
+        Some(claim_value.claim_id.as_str())
+    );
+    assert_eq!(lifecycle.reconciles, 2);
+
+    // No second process follows: the live generation refuses `recover_claimed`
+    // at the lifecycle gate (before admission and before P-03), so the
+    // admission and evidence counts cannot move. The rebuild reuses the same
+    // bat path and nonce so its invocation digest still matches the admitted
+    // join; refusal therefore proves the gate, not a join mismatch.
+    let (process_two, _) = build_process(
+        "operation-restart-1",
+        "tree-restart-1",
+        vec!["/c".to_owned(), bat.clone()],
+        "nonce-restart-1",
+    );
+    let recovery = block_on(worker.recover_claimed(
+        claim_request(&registration, &claim_value),
+        hello(),
+        process_two,
+        0,
+    ));
+    assert!(
+        matches!(
+            recovery,
+            Err(NativeWorkerError::Core(WorkerError::InvalidLifecycle))
+        ),
+        "recover on the live generation must be refused, got {recovery:?}"
+    );
+    assert_eq!(*lock(&admissions), 1);
+    assert_eq!(lock(&evidence).len(), 1);
+
+    // Exactly once, as in the admitted-drive duplicate-start pattern: a second
+    // claimed start is refused without new admission or evidence.
+    let (process_three, _) = build_process(
+        "operation-restart-1",
+        "tree-restart-1",
+        vec!["/c".to_owned(), bat.clone()],
+        "nonce-restart-1",
+    );
+    let second = block_on(worker.start_claimed(
+        claim_request(&registration, &claim_value),
+        hello(),
+        process_three,
+    ));
+    assert!(
+        matches!(
+            second,
+            Err(NativeWorkerError::Core(WorkerError::InvalidLifecycle))
+        ),
+        "second start must be refused, got {second:?}"
+    );
+    assert_eq!(*lock(&admissions), 1);
+    assert_eq!(lock(&evidence).len(), 1);
+
+    remove_bat("drive-restart");
+}
+
+// ---------------------------------------------------------------------------
+// Cancel/heartbeat starvation probe through the real `serve_stdio`.
+// ---------------------------------------------------------------------------
+
+/// Environment switch selecting the piped-child role of the starvation probe:
+/// the same test binary re-runs this test with piped stdio and serves.
+const STDIO_STARVATION_CHILD_ENV: &str = "ELIOT_T9_06_STDIO_STARVATION_CHILD";
+const STDIO_STARVATION_TEST_NAME: &str = "cancel_heartbeat_served_through_stdio_while_running";
+/// Sync marker printed by the child before serving: everything before this
+/// line on the child stdout is libtest harness output, never frame bytes.
+const STDIO_BEGIN_MARKER: &str = "ELIOT-T9-06-STDIO-BEGIN";
+
+/// Frame envelope mirroring `health_frame` (same grant binding), with the
+/// caller choosing the body and a unique idempotency identity.
+fn stdio_frame(request_id: &str, body: WorkerFrameBody) -> WorkerFrame {
+    let lease: WorkLeaseId = load(serde_json::from_value(
+        serde_json::json!({"namespace": "eliot.governor.work-lease", "revision": "v1", "value": "lease-1"}),
+    ));
+    WorkerFrame {
+        protocol_version: PROTOCOL_VERSION.to_owned(),
+        encoding_profile: JSON_ENCODING_PROFILE.to_owned(),
+        connection_id: "connection-claim-1".to_owned(),
+        request_id: request_id.to_owned(),
+        trace_context: BTreeMap::from([("trace_id".to_owned(), format!("trace-{request_id}"))]),
+        deadline_unix_ms: 5_000,
+        authority_epoch: epoch(),
+        state_fence: fence(),
+        lease_id: lease,
+        admission_revision: "admission-revision-1".to_owned(),
+        producer_generation: 1,
+        body,
+    }
+}
+
+fn stdio_execute_frame() -> WorkerFrame {
+    stdio_frame(
+        "stdio-exec-1",
+        WorkerFrameBody::Execute(WorkerRequest {
+            attempt_id: load(AttemptId::new("attempt-stdio-exec-1")),
+            capability: "inspect".to_owned(),
+            payload: BTreeMap::new(),
+            proposed_effect: None,
+        }),
+    )
+}
+
+fn stdio_cancel_frame() -> WorkerFrame {
+    stdio_frame(
+        "stdio-cancel-1",
+        WorkerFrameBody::Cancel(CancelRequest {
+            attempt_id: load(AttemptId::new("attempt-stdio-cancel-1")),
+            reason: "t9-06 starvation probe".to_owned(),
+        }),
+    )
+}
+
+fn stdio_heartbeat_frame() -> WorkerFrame {
+    stdio_frame("stdio-heartbeat-1", WorkerFrameBody::Heartbeat)
+}
+
+/// Child role: drive one real admitted contour to `Ready` with the real
+/// `WindowsProcessExecutor`, print the sync marker, then serve the REAL
+/// `serve_stdio` loop (dedicated reader thread plus bounded `sync_channel(64)`)
+/// until the parent closes stdin (EOF). Every served response is a
+/// length-delimited frame on stdout after the marker line.
+fn stdio_starvation_child() {
+    let (mut worker, _, registration, claim_value, hello_value, process, _, _, _) = build_driver(
+        "serve-stdio",
+        "operation-stdio-1",
+        "tree-stdio-1",
+        "nonce-stdio-1",
+    );
+    let admission = claim_request(&registration, &claim_value);
+    let reconcile = reconcile_for(&claim_value);
+    let readiness = readiness_for(&claim_value);
+    let mut lifecycle = FakeLifecycle::new();
+    block_on(drive_admitted_claimed(
+        &mut lifecycle,
+        &mut worker,
+        &registration,
+        &admission,
+        hello_value,
+        process,
+        &reconcile,
+        &readiness,
+    ))
+    .unwrap_or_else(|error| panic!("stdio child must reach Ready, got {error:?}"));
+    assert_eq!(worker.lifecycle(), WorkerLifecycle::Ready);
+    println!("{STDIO_BEGIN_MARKER}");
+    std::io::stdout().flush().expect("flush stdio begin marker");
+    block_on(worker.serve_stdio())
+        .unwrap_or_else(|error| panic!("stdio child must serve until EOF, got {error:?}"));
+    remove_bat("serve-stdio");
+}
+
+fn fill_stdio(stdout: &mut impl Read, buffered: &mut Vec<u8>) -> Result<bool, String> {
+    let mut chunk = [0_u8; 1024];
+    let read = stdout
+        .read(&mut chunk)
+        .map_err(|error| format!("stdio child read failed: {error}"))?;
+    buffered.extend_from_slice(&chunk[..read]);
+    Ok(read > 0)
+}
+
+/// Reads exactly `expected` length-delimited [`WorkerResponse`] frames from
+/// the child stdout, discarding the harness preamble through the marker line.
+fn read_stdio_responses(
+    stdout: &mut impl Read,
+    expected: usize,
+) -> Result<Vec<WorkerResponse>, String> {
+    let mut buffered = Vec::new();
+    loop {
+        if let Some(position) = buffered
+            .windows(STDIO_BEGIN_MARKER.len())
+            .position(|window| window == STDIO_BEGIN_MARKER.as_bytes())
+        {
+            let after = position + STDIO_BEGIN_MARKER.len();
+            let line_end = buffered[after..]
+                .iter()
+                .position(|byte| *byte == b'\n')
+                .map(|offset| after + offset + 1)
+                .unwrap_or(buffered.len());
+            buffered = buffered[line_end..].to_vec();
+            break;
+        }
+        if !fill_stdio(stdout, &mut buffered)? {
+            return Err("child stdout ended before the stdio begin marker".to_owned());
+        }
+    }
+    let mut out = Vec::with_capacity(expected);
+    while out.len() < expected {
+        while buffered.len() < 4 {
+            if !fill_stdio(stdout, &mut buffered)? {
+                return Err(format!(
+                    "child stdout ended after {} of {expected} responses",
+                    out.len()
+                ));
+            }
+        }
+        let length = u32::from_le_bytes(
+            buffered[..4]
+                .try_into()
+                .map_err(|_| "stdio frame prefix is corrupt".to_owned())?,
+        ) as usize;
+        if length == 0 || length > 4 * 1024 * 1024 {
+            return Err(format!("stdio frame length out of bounds: {length}"));
+        }
+        while buffered.len() < 4 + length {
+            if !fill_stdio(stdout, &mut buffered)? {
+                return Err(format!(
+                    "child stdout ended after {} of {expected} responses",
+                    out.len()
+                ));
+            }
+        }
+        let frame: Vec<u8> = buffered.drain(..4 + length).collect();
+        out.push(decode_response(&frame));
+    }
+    Ok(out)
+}
+
+/// Parent role: pipes Execute, Cancel, and Heartbeat frames into the child,
+/// then asserts every frame is served within a bounded wait. Execute moves the
+/// worker to `Running`; Cancel and Heartbeat must still be served after it,
+/// proving the `serve_stdio` reader-thread split keeps cancellation and
+/// heartbeat observable instead of stuck behind a blocked read. The ceiling is
+/// fail-closed seconds; the steady-state run is the child start (one bounded
+/// ping batch) plus three tiny frames.
+fn stdio_starvation_parent() {
+    let exe = std::env::current_exe().expect("current test binary");
+    let mut child = Command::new(exe)
+        .arg("--exact")
+        .arg(STDIO_STARVATION_TEST_NAME)
+        .arg("--nocapture")
+        .env(STDIO_STARVATION_CHILD_ENV, "1")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::inherit())
+        .spawn()
+        .expect("spawn stdio child");
+    let mut stdin = child.stdin.take().expect("child stdin");
+    let mut stdout = child.stdout.take().expect("child stdout");
+    let (sender, receiver) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let _ = sender.send(read_stdio_responses(&mut stdout, 3));
+        // Keep the only stdout read end open until the child exits: dropping
+        // it right after the third frame would break the child harness
+        // summary pipe (BrokenPipe) and fail an otherwise clean child.
+        // EOF arrives when the child exits; a killed child ends this too.
+        loop {
+            let mut chunk = [0_u8; 4096];
+            match stdout.read(&mut chunk) {
+                Ok(0) => break,
+                Ok(_) => {}
+                Err(_) => break,
+            }
+        }
+    });
+    for frame in [
+        stdio_execute_frame(),
+        stdio_cancel_frame(),
+        stdio_heartbeat_frame(),
+    ] {
+        stdin
+            .write_all(&encode_frame(&frame))
+            .expect("write stdio frame");
+    }
+    stdin.flush().expect("flush stdio frames");
+    let responses = receiver
+        .recv_timeout(Duration::from_secs(30))
+        .expect("cancel/heartbeat must be served within the bounded wait");
+    // Closing stdin races nothing: the pipe preserves frame order, so the
+    // reader thread observes the three frames before EOF.
+    drop(stdin);
+    let responses =
+        responses.unwrap_or_else(|error| panic!("stdio child responses unreadable: {error}"));
+    assert_eq!(responses.len(), 3);
+    for response in &responses {
+        assert!(!response.events.is_empty());
+        assert!(
+            response
+                .events
+                .iter()
+                .all(|event| event.stream_id == "claim-1/gen-1")
+        );
+    }
+    let kinds: Vec<&str> = responses
+        .iter()
+        .map(|response| match &response.events[0].payload {
+            WorkerEventPayload::Accepted { .. } => "accepted",
+            WorkerEventPayload::Cancellation { .. } => "cancellation",
+            WorkerEventPayload::Heartbeat => "heartbeat",
+            unexpected => panic!("unexpected stdio payload: {unexpected:?}"),
+        })
+        .collect();
+    assert_eq!(kinds, vec!["accepted", "cancellation", "heartbeat"]);
+    // EOF ends the serve loop; the child must exit cleanly within bounds.
+    let deadline = Instant::now() + Duration::from_secs(15);
+    loop {
+        if let Some(status) = child.try_wait().expect("poll stdio child") {
+            assert!(
+                status.success(),
+                "stdio child must exit cleanly, got {status:?}"
+            );
+            return;
+        }
+        if Instant::now() > deadline {
+            child.kill().ok();
+            panic!("stdio child did not exit after EOF");
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
+#[test]
+fn cancel_heartbeat_served_through_stdio_while_running() {
+    // Dual-role probe in ONE test so the package keeps exact test counts: the
+    // parent role spawns this same test binary with piped stdio, and the
+    // re-executed child role drives a real admitted contour and serves the
+    // real `serve_stdio`. No production hook, no new target, no new dep.
+    if std::env::var(STDIO_STARVATION_CHILD_ENV).as_deref() == Ok("1") {
+        stdio_starvation_child();
+        return;
+    }
+    stdio_starvation_parent();
 }
