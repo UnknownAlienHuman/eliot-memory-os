@@ -1168,10 +1168,11 @@ impl ProcessStartPorts for ProcessExecutionGateway {
                 eliot_process::ContractError::DispatchBindingMismatch,
             ));
         }
-        if !admission
-            .state_fence()
-            .authority_epoch()
-            .is_same_authority(&self.snapshot_binding.authority_epoch().current.epoch)
+        // Scalar ORS snapshot contour (residual): project the canonical fence
+        // sequence for the stale-fence join; lineage-exact gating lives in the
+        // admission/owner `is_same_authority` check above.
+        if admission.state_fence().authority_epoch().sequence.get()
+            != self.snapshot_binding.authority_epoch().current.epoch
             || admission.state_fence().generation() != admission.intent().generation()
         {
             return Err(ProcessExecutionError::Contract(

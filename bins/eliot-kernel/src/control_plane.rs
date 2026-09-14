@@ -100,10 +100,22 @@ impl KernelComposition {
                 .lock()
                 .map_err(|_| TransportError::SessionFenced)?;
             let reconcile = matches!(&request.command, KernelControlCommand::Reconcile);
-            let policy_epoch = policy.module_generation.state_fence.authority_epoch;
+            let policy_epoch = policy.module_generation.state_fence.authority_epoch.clone();
+            let epoch_mismatch = {
+                let candidate = &request.candidate.kernel_epoch;
+                if candidate.is_same_authority(&policy_epoch) {
+                    false
+                } else if reconcile
+                    && candidate.lineage_id == policy_epoch.lineage_id
+                    && candidate.sequence.get() > policy_epoch.sequence.get()
+                {
+                    false
+                } else {
+                    true
+                }
+            };
             if request.generation != policy.module_generation.generation
-                || request.candidate.kernel_epoch.value() < policy_epoch.value()
-                || (!reconcile && request.candidate.kernel_epoch != policy_epoch)
+                || epoch_mismatch
                 || self
                     .kernel_artifact_sha256
                     .as_deref()
@@ -115,14 +127,18 @@ impl KernelComposition {
             {
                 return Err(TransportError::SessionFenced);
             }
-            if request.candidate.kernel_epoch != policy_epoch {
+            if !request
+                .candidate
+                .kernel_epoch
+                .is_same_authority(&policy_epoch)
+            {
                 self.service
                     .lock()
                     .map_err(|_| TransportError::SessionFenced)?
-                    .synchronize_authority_epoch(request.candidate.kernel_epoch)
+                    .synchronize_authority_epoch(request.candidate.kernel_epoch.clone())
                     .map_err(|_| TransportError::SessionFenced)?;
                 policy.module_generation.state_fence =
-                    StateFence::new(request.candidate.kernel_epoch, request.generation);
+                    StateFence::new(request.candidate.kernel_epoch.clone(), request.generation);
             }
         }
         if let Some(handoff) = bootstrap {
@@ -167,8 +183,11 @@ impl KernelComposition {
                         {
                             return Err(TransportError::SessionFenced);
                         }
-                        let receipt = store_rebind_receipt_from_ors_record(&record)
-                            .map_err(|_| TransportError::SessionFenced)?;
+                        let receipt = store_rebind_receipt_from_ors_record(
+                            &record,
+                            &request.candidate.kernel_epoch,
+                        )
+                        .map_err(|_| TransportError::SessionFenced)?;
                         self.verify_store_rebind_publication_complete(&receipt)?;
                         Some(receipt)
                     }
@@ -215,8 +234,11 @@ impl KernelComposition {
                                 {
                                     return Err(TransportError::SessionFenced);
                                 }
-                                let receipt = store_rebind_receipt_from_ors_record(&after)
-                                    .map_err(|_| TransportError::SessionFenced)?;
+                                let receipt = store_rebind_receipt_from_ors_record(
+                                    &after,
+                                    &request.candidate.kernel_epoch,
+                                )
+                                .map_err(|_| TransportError::SessionFenced)?;
                                 self.verify_store_rebind_publication_complete(&receipt)?;
                                 Some(receipt)
                             }

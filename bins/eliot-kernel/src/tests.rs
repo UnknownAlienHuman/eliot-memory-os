@@ -34,6 +34,15 @@ use eliot_store_api::{RevisionHead, RevisionKey};
 use std::process::Stdio;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
+fn test_epoch(sequence: u64) -> eliot_contracts::EpochId {
+    eliot_contracts::EpochId::new(
+        eliot_contracts::EpochLineageId::new("550e8400-e29b-41d4-a716-446655440000")
+            .expect("lineage"),
+        std::num::NonZeroU64::new(sequence).expect("sequence"),
+    )
+    .expect("epoch")
+}
+
 mod activation;
 mod process_execution;
 
@@ -121,8 +130,8 @@ impl RealExecutorTestAuthority {
     fn new(authority_id: DispatchAuthorityId) -> Self {
         let issued_at_ms = unix_ms();
         let generation = Generation::new(1).expect("generation");
-        let fence =
-            FencingToken::new(1, generation, "real-executor-test-fence").expect("test fence");
+        let fence = FencingToken::new(test_epoch(1), generation, "real-executor-test-fence")
+            .expect("test fence");
         let revision_heads = BTreeMap::from([("real-executor".to_owned(), "a".repeat(64))]);
         let context = DispatchValidationContext::new(
             ClockObservation {
@@ -132,7 +141,7 @@ impl RealExecutorTestAuthority {
                 monotonic_ns: None,
             },
             fence.clone(),
-            1,
+            test_epoch(1),
             revision_heads.clone(),
             1,
         )
@@ -268,8 +277,12 @@ fn real_executor_admission(
         ACTIVE_DAEMON_CALLER,
         intent,
         ActionLeaseRef::new(format!("real-executor-lease-{operation}")).expect("action lease"),
-        FencingToken::new(1, generation, format!("real-executor-fence-{operation}"))
-            .expect("state fence"),
+        FencingToken::new(
+            test_epoch(1),
+            generation,
+            format!("real-executor-fence-{operation}"),
+        )
+        .expect("state fence"),
         unix_ms().saturating_add(60_000),
     )
     .expect("real executor admission")
@@ -536,7 +549,7 @@ fn recovery_nonce_rotation_fences_stale_daemon_sessions() {
         peer: PeerIdentity::Unavailable {
             reason: eliot_ipc::PeerIdentityUnavailable::ProviderProofNotComposed,
         },
-        authority_epoch: policy.module_generation.state_fence.authority_epoch.value(),
+        authority_epoch: policy.module_generation.state_fence.authority_epoch.clone(),
         module_generation: policy.module_generation.clone(),
         launch_nonce: policy.launch_nonce.clone(),
         capabilities: policy.allowed_capabilities.clone(),
@@ -635,8 +648,8 @@ async fn external_agent_bridge_os_process_receives_typed_semantic_resolution_den
         .with_process_binding(host_process)
         .expect("current Host process identity");
     let bridge_generation = ResourceGeneration::new(7).expect("bridge generation");
-    let bridge_authority_epoch = AuthorityEpoch::new(8).expect("bridge authority epoch");
-    let bridge_state_fence = StateFence::new(bridge_authority_epoch, bridge_generation);
+    let bridge_authority_epoch = test_epoch(8);
+    let bridge_state_fence = StateFence::new(bridge_authority_epoch.clone(), bridge_generation);
     let work_root = std::env::temp_dir().join(format!(
         "eliot-kernel-r13-denied-os-harness-{}-{}",
         std::process::id(),
@@ -794,8 +807,8 @@ async fn external_agent_bridge_os_process_receives_typed_semantic_resolution_den
             file_index: bridge_identity.file_index,
         },
         generation: bridge_generation,
-        authority_epoch: bridge_authority_epoch,
-        state_fence: bridge_state_fence,
+        authority_epoch: bridge_authority_epoch.clone(),
+        state_fence: bridge_state_fence.clone(),
         approved_user_sid: host_expectation.expected_sid().to_owned(),
         caller_session_policy:
             eliot_kernel_service::AgentBridgeCallerSessionPolicy::AnyInteractiveSessionForApprovedSid,
@@ -862,7 +875,7 @@ async fn external_agent_bridge_os_process_receives_typed_semantic_resolution_den
     let candidate = HostKernelCandidateBinding {
         installation_id: PlatformHandle::new("installation-1").expect("installation"),
         host_epoch: AuthorityEpoch::new(1).expect("host epoch"),
-        kernel_epoch: bridge_authority_epoch,
+        kernel_epoch: bridge_authority_epoch.clone(),
         activation_id: PlatformHandle::new("activation-1").expect("activation"),
         artifact_hash: PlatformHandle::new("artifact-r13-denied-os").expect("artifact"),
         config_hash: PlatformHandle::new("config-r13-denied-os").expect("config"),
@@ -912,7 +925,7 @@ async fn external_agent_bridge_os_process_receives_typed_semantic_resolution_den
             journal_transaction_id: PlatformHandle::new("txn-r13-denied-os").expect("transaction"),
             journal_sequence: 1,
             generation: bridge_generation,
-            authority_epoch: bridge_authority_epoch,
+            authority_epoch: bridge_authority_epoch.clone(),
             activation_nonce: eliot_platform::KernelActivationNonce::new(
                 PlatformHandle::new("a".repeat(64)).expect("activation nonce"),
             )
@@ -1282,7 +1295,7 @@ fn test_client(policy: &ServerHandshakePolicy) -> eliot_protocol::ClientHello {
         capabilities: policy.allowed_capabilities.clone(),
         privacy_classes: policy.allowed_privacy_classes.clone(),
         max_frame: policy.max_frame,
-        authority_epoch: policy.module_generation.state_fence.authority_epoch,
+        authority_epoch: policy.module_generation.state_fence.authority_epoch.clone(),
     }
 }
 
@@ -1348,7 +1361,7 @@ fn test_daemon_launch(root: &Path) -> EliotdLaunchDescriptor {
         config_descriptor_sha256: config_sha256,
         protected_snapshot_digest: "c".repeat(64),
         launch_nonce: nonce,
-        authority_epoch: AuthorityEpoch::genesis(),
+        authority_epoch: test_epoch(1),
         generation: ResourceGeneration::genesis(),
         descriptor_sha256: String::new(),
     }
@@ -1400,10 +1413,7 @@ fn live_receipt_manifest(
         installation_epoch,
         generation: generation.clone(),
         authority_generation: ResourceGeneration::genesis(),
-        authority_state_fence: StateFence::new(
-            AuthorityEpoch::genesis(),
-            ResourceGeneration::genesis(),
-        ),
+        authority_state_fence: StateFence::new(test_epoch(1), ResourceGeneration::genesis()),
         authority_descriptor_path: authority_descriptor_path.clone(),
         authority_descriptor_digest: authority_descriptor_digest.clone(),
         supervision_authority: eliot_installation::SupervisionAuthorityBinding::Pending {
@@ -1591,9 +1601,15 @@ fn test_process_start_receipt_with_physical(
             "generation": 1,
             "action_lease_ref": "eliotd-ready-test-lease",
             "authority_id": "eliotd",
-            "authority_epoch": 1,
+            "authority_epoch": {
+                "lineage_id": "550e8400-e29b-41d4-a716-446655440000",
+                "sequence": 1
+            },
             "state_fence": {
-                "authority_epoch": 1,
+                "authority_epoch": {
+                    "lineage_id": "550e8400-e29b-41d4-a716-446655440000",
+                    "sequence": 1
+                },
                 "generation": 1,
                 "nonce": "eliotd-ready-test-fence"
             },
@@ -1725,7 +1741,7 @@ fn running_daemon_retains_only_the_same_authenticated_ready_publication_operatio
         peer: PeerIdentity::Unavailable {
             reason: eliot_ipc::PeerIdentityUnavailable::ProviderProofNotComposed,
         },
-        authority_epoch: policy.module_generation.state_fence.authority_epoch.value(),
+        authority_epoch: policy.module_generation.state_fence.authority_epoch.clone(),
         module_generation: policy.module_generation.clone(),
         launch_nonce: policy.launch_nonce.clone(),
         capabilities: policy.allowed_capabilities.clone(),
@@ -1815,7 +1831,7 @@ fn superseded_replay_requires_the_exact_terminal_signature_and_history() {
         host_epoch: AuthorityEpoch::genesis(),
         activation_id: OperationIdentity::new("activation-1").expect("activation"),
         activation_generation: ResourceGeneration::genesis(),
-        kernel_epoch: AuthorityEpoch::genesis(),
+        kernel_epoch: test_epoch(1),
         watchdog_epoch: AuthorityEpoch::genesis(),
         generation_binding: SupervisionGenerationBinding {
             target_id: "eliotd-artifact".to_owned(),
@@ -1825,7 +1841,7 @@ fn superseded_replay_requires_the_exact_terminal_signature_and_history() {
             process_id: "pid:401:start:1".to_owned(),
             process_generation: ResourceGeneration::genesis(),
         },
-        state_fence: StateFence::new(AuthorityEpoch::genesis(), ResourceGeneration::genesis()),
+        state_fence: StateFence::new(test_epoch(1), ResourceGeneration::genesis()),
         issued_at_ms: now_ms,
         expires_at_ms: now_ms.saturating_add(60_000),
         renew_before_ms: now_ms.saturating_add(30_000),
@@ -2114,7 +2130,7 @@ async fn authenticated_handshake_fences_ready_without_production_supervision_dep
                         .module_generation
                         .state_fence
                         .authority_epoch
-                        .value(),
+                        .clone(),
                 }),
             )
             .await
@@ -2133,7 +2149,7 @@ async fn authenticated_handshake_fences_ready_without_production_supervision_dep
                         .module_generation
                         .state_fence
                         .authority_epoch
-                        .value(),
+                        .clone(),
                 }),
             )
             .await
@@ -2233,9 +2249,13 @@ fn test_validation_context(seed: &str) -> DispatchValidationContext {
             transaction_sequence: None,
             monotonic_ns: None,
         },
-        FencingToken::new(1, Generation::new(1).expect("generation"), "context-fence")
-            .expect("fence"),
-        1,
+        FencingToken::new(
+            test_epoch(1),
+            Generation::new(1).expect("generation"),
+            "context-fence",
+        )
+        .expect("fence"),
+        test_epoch(1),
         BTreeMap::from([(seed.to_owned(), "a".repeat(64))]),
         1,
     )
@@ -2246,7 +2266,7 @@ fn gateway_test_owner() -> ProcessOwnerBinding {
     ProcessOwnerBinding::new(
         "eliotd",
         "a".repeat(64),
-        1,
+        test_epoch(1),
         Generation::new(1).expect("generation"),
     )
     .expect("owner")
@@ -2274,7 +2294,7 @@ fn gateway_test_admission(operation: &str) -> ProcessExecutionAdmissionRequest {
         intent,
         ActionLeaseRef::new(format!("lease-{operation}")).expect("lease"),
         FencingToken::new(
-            1,
+            test_epoch(1),
             Generation::new(1).expect("generation"),
             format!("fence-{operation}"),
         )
@@ -2365,7 +2385,7 @@ fn test_provisioned_supervision_authority(suffix: &str) -> ProvisionedSupervisio
 fn authority_descriptor(suffix: &str, provider: &str) -> ProcessAuthorityHandoffDescriptor {
     let authority_id =
         DispatchAuthorityId::new(format!("authority-{suffix}")).expect("authority id");
-    let state_fence = StateFence::new(AuthorityEpoch::genesis(), ResourceGeneration::genesis());
+    let state_fence = StateFence::new(test_epoch(1), ResourceGeneration::genesis());
     let epoch = EpochLineage {
         current: EpochIdentity {
             lineage_id: OpaqueLabel::new(format!("handoff-lineage-{suffix}")).expect("lineage"),
@@ -2927,10 +2947,10 @@ async fn daemon_recovery_closes_exact_prior_tree_and_rejects_stale_receipt() {
         stable_owner_principal_digest(
             expectation.expected_sid(),
             ACTIVE_DAEMON_CALLER,
-            launch.authority_epoch.value(),
+            &launch.authority_epoch,
             generation,
         ),
-        launch.authority_epoch.value(),
+        launch.authority_epoch.clone(),
         generation,
     )
     .expect("daemon owner");
@@ -2980,7 +3000,7 @@ async fn daemon_recovery_closes_exact_prior_tree_and_rejects_stale_receipt() {
 #[test]
 fn store_projection_is_deterministic_and_binds_empty_and_full_fence_state() {
     let fence = StoreStateFence::new(
-        eliot_contracts::AuthorityEpoch::new(3).expect("epoch"),
+        test_epoch(3),
         eliot_contracts::ResourceGeneration::new(4).expect("generation"),
     );
     let first = CanonicalValidationSnapshot {
@@ -3055,8 +3075,12 @@ fn process_authority_first_issue_is_versioned_and_stale_controller_fails_closed(
     let issuance = |nonce: &str| {
         PermitIssuance::new(
             ActionLeaseRef::new("cas-lease").expect("lease"),
-            FencingToken::new(1, Generation::new(1).expect("generation"), "cas-fence")
-                .expect("fence"),
+            FencingToken::new(
+                test_epoch(1),
+                Generation::new(1).expect("generation"),
+                "cas-fence",
+            )
+            .expect("fence"),
             BTreeMap::from([("authority".to_owned(), "a".repeat(64))]),
             1,
             2,
@@ -3146,8 +3170,12 @@ fn process_authority_constructor_reuses_one_real_ors_store() {
         seed_store,
         Arc::clone(&codec),
     );
-    let seed_fence = FencingToken::new(1, Generation::new(1).expect("generation"), "seed-fence")
-        .expect("seed fence");
+    let seed_fence = FencingToken::new(
+        test_epoch(1),
+        Generation::new(1).expect("generation"),
+        "seed-fence",
+    )
+    .expect("seed fence");
     seeder
         .issue(
             &seed_intent(),
@@ -3233,19 +3261,22 @@ fn process_authority_constructor_reuses_one_real_ors_store() {
 #[test]
 fn process_owner_survives_reconnect_but_rejects_cross_owner() {
     let generation = Generation::new(7).expect("generation");
-    let owner = ProcessOwnerBinding::new("testd", "a".repeat(64), 3, generation).expect("owner");
-    let reconnected =
-        ProcessOwnerBinding::new("testd", "a".repeat(64), 3, generation).expect("owner");
+    let owner = ProcessOwnerBinding::new("testd", "a".repeat(64), test_epoch(3), generation)
+        .expect("owner");
+    let reconnected = ProcessOwnerBinding::new("testd", "a".repeat(64), test_epoch(3), generation)
+        .expect("owner");
     assert!(authorize_process_owner(&owner, &reconnected).is_ok());
 
     let wrong_module =
-        ProcessOwnerBinding::new("native", "a".repeat(64), 3, generation).expect("owner");
+        ProcessOwnerBinding::new("native", "a".repeat(64), test_epoch(3), generation)
+            .expect("owner");
     let wrong_principal =
-        ProcessOwnerBinding::new("testd", "b".repeat(64), 3, generation).expect("owner");
+        ProcessOwnerBinding::new("testd", "b".repeat(64), test_epoch(3), generation)
+            .expect("owner");
     let wrong_generation = ProcessOwnerBinding::new(
         "testd",
         "a".repeat(64),
-        3,
+        test_epoch(3),
         Generation::new(8).expect("generation"),
     )
     .expect("owner");
@@ -3353,7 +3384,7 @@ fn protected_authority_preparation_acceptance_matrix() {
     );
     assert_eq!(
         consumed.authority_epoch,
-        positive.state_fence.authority_epoch.value()
+        positive.state_fence.authority_epoch.sequence.get()
     );
     assert_eq!(consumed.generation, positive.generation.value());
     assert_eq!(
@@ -3587,10 +3618,8 @@ fn protected_authority_preparation_acceptance_matrix() {
     );
 
     let mut state_fence_substitution = valid_substitution;
-    state_fence_substitution.state_fence = StateFence::new(
-        AuthorityEpoch::new(2).expect("epoch"),
-        ResourceGeneration::genesis(),
-    );
+    state_fence_substitution.state_fence =
+        StateFence::new(test_epoch(2), ResourceGeneration::genesis());
     state_fence_substitution = state_fence_substitution
         .with_computed_digest()
         .expect("state fence substitution digest");
@@ -3853,29 +3882,32 @@ fn physical_supervision_signer_unseals_only_with_exact_eliot_host_service_sid_to
 #[test]
 fn stable_sid_owner_digest_ignores_process_and_session_replacement() {
     let generation = Generation::new(7).expect("generation");
-    let first_digest = stable_owner_principal_digest("S-1-5-18", "testd", 3, generation);
-    let restarted_digest = stable_owner_principal_digest("S-1-5-18", "testd", 3, generation);
+    let first_digest =
+        stable_owner_principal_digest("S-1-5-18", "testd", &test_epoch(3), generation);
+    let restarted_digest =
+        stable_owner_principal_digest("S-1-5-18", "testd", &test_epoch(3), generation);
     assert_eq!(first_digest, restarted_digest);
-    let first = ProcessOwnerBinding::new("testd", first_digest, 3, generation).expect("owner");
-    let restarted =
-        ProcessOwnerBinding::new("testd", restarted_digest, 3, generation).expect("owner");
+    let first =
+        ProcessOwnerBinding::new("testd", first_digest, test_epoch(3), generation).expect("owner");
+    let restarted = ProcessOwnerBinding::new("testd", restarted_digest, test_epoch(3), generation)
+        .expect("owner");
     let first_session = ProcessSessionBinding::new("connection-a", 1).expect("session");
     let restarted_session = ProcessSessionBinding::new("connection-b", 2).expect("session");
     assert_ne!(first_session, restarted_session);
     assert!(authorize_process_owner(&first, &restarted).is_ok());
 
     for (sid, module, authority, candidate_generation) in [
-        ("S-1-5-19", "testd", 3, generation),
-        ("S-1-5-18", "native", 3, generation),
-        ("S-1-5-18", "testd", 4, generation),
+        ("S-1-5-19", "testd", test_epoch(3), generation),
+        ("S-1-5-18", "native", test_epoch(3), generation),
+        ("S-1-5-18", "testd", test_epoch(4), generation),
         (
             "S-1-5-18",
             "testd",
-            3,
+            test_epoch(3),
             Generation::new(8).expect("generation"),
         ),
     ] {
-        let digest = stable_owner_principal_digest(sid, module, authority, candidate_generation);
+        let digest = stable_owner_principal_digest(sid, module, &authority, candidate_generation);
         let candidate = ProcessOwnerBinding::new(module, digest, authority, candidate_generation)
             .expect("owner");
         assert!(authorize_process_owner(&first, &candidate).is_err());
@@ -3901,7 +3933,7 @@ fn store_rebind_restart_reconstructs_exact_handoff_and_rejects_substitution() {
         route_identity: PlatformHandle::new("store_bridge").expect("route"),
         canonical_pipe_identity: PlatformHandle::new(r"\\.\pipe\eliot\store").expect("pipe"),
         store_generation: ResourceGeneration::genesis(),
-        state_fence: StateFence::new(AuthorityEpoch::genesis(), ResourceGeneration::genesis()),
+        state_fence: StateFence::new(test_epoch(1), ResourceGeneration::genesis()),
         launch_nonce: PlatformHandle::new("store-launch-nonce").expect("launch nonce"),
         connection_id: PlatformHandle::new("store-connection").expect("connection"),
         expected_peer_sid: PlatformHandle::new("S-1-5-18").expect("sid"),
@@ -3925,7 +3957,7 @@ fn store_rebind_restart_reconstructs_exact_handoff_and_rejects_substitution() {
         process_image_path: process_image_path.clone(),
         job_name: job_name.clone(),
         generation: requirement.state_fence.resource_generation.value(),
-        authority_epoch: requirement.state_fence.authority_epoch.value(),
+        authority_epoch: requirement.state_fence.authority_epoch.sequence.get(),
         state: eliot_ors::StoreRebindReplayState::Committed,
         receipt: Some(request_digest.clone()),
         commit_order: 0,
@@ -4012,7 +4044,7 @@ async fn c54_p1_reconcile_rebind_fenced_until_publication_via_control_path() {
         route_identity: PlatformHandle::new("store_bridge").unwrap(),
         canonical_pipe_identity: PlatformHandle::new(r"\\.\pipe\eliot\store").unwrap(),
         store_generation: ResourceGeneration::genesis(),
-        state_fence: StateFence::new(AuthorityEpoch::genesis(), ResourceGeneration::genesis()),
+        state_fence: StateFence::new(test_epoch(1), ResourceGeneration::genesis()),
         launch_nonce: PlatformHandle::new("store-launch-nonce").unwrap(),
         connection_id: PlatformHandle::new("store-connection").unwrap(),
         expected_peer_sid: PlatformHandle::new("S-1-5-18").unwrap(),
@@ -4031,7 +4063,7 @@ async fn c54_p1_reconcile_rebind_fenced_until_publication_via_control_path() {
         let cand = HostKernelCandidateBinding {
             installation_id: PlatformHandle::new("installation-1").unwrap(),
             host_epoch: AuthorityEpoch::new(1).unwrap(),
-            kernel_epoch: AuthorityEpoch::genesis(),
+            kernel_epoch: test_epoch(1),
             activation_id: PlatformHandle::new("activation-1").unwrap(),
             artifact_hash: PlatformHandle::new("artifact-1").unwrap(),
             config_hash: PlatformHandle::new("config-1").unwrap(),
@@ -4073,7 +4105,7 @@ async fn c54_p1_reconcile_rebind_fenced_until_publication_via_control_path() {
             journal_transaction_id: PlatformHandle::new("txn-1").unwrap(),
             journal_sequence: 1,
             generation: ResourceGeneration::genesis(),
-            authority_epoch: cand.kernel_epoch,
+            authority_epoch: cand.kernel_epoch.clone(),
             activation_nonce: eliot_platform::KernelActivationNonce::new(
                 PlatformHandle::new("a".repeat(64)).unwrap(),
             )
@@ -4116,14 +4148,14 @@ async fn c54_p1_reconcile_rebind_fenced_until_publication_via_control_path() {
         },
         candidate_binding_digest: candidate.compute_digest().unwrap(),
         generation: ResourceGeneration::genesis(),
-        authority_epoch: AuthorityEpoch::genesis(),
+        authority_epoch: test_epoch(1),
         store_fence: String::new(),
     };
     let mut handoff = handoff;
     let mut hasher = Sha256::new();
     hasher.update(serde_json::to_vec(&handoff.requirement.state_fence).unwrap());
     hasher.update(handoff.generation.value().to_le_bytes());
-    hasher.update(handoff.authority_epoch.value().to_le_bytes());
+    hasher.update(handoff.authority_epoch.sequence.get().to_le_bytes());
     hasher.update(
         handoff
             .requirement
@@ -4158,7 +4190,7 @@ async fn c54_p1_reconcile_rebind_fenced_until_publication_via_control_path() {
         process_image_path: handoff.process_binding.process.image_path.clone(),
         job_name: handoff.process_binding.job.as_str().to_owned(),
         generation: handoff.generation.value(),
-        authority_epoch: handoff.authority_epoch.value(),
+        authority_epoch: handoff.authority_epoch.sequence.get(),
         state: eliot_ors::StoreRebindReplayState::Committed,
         receipt: Some(request_digest.clone()),
         commit_order: 0,
@@ -4222,7 +4254,7 @@ async fn c54_p1_superseded_rebind_durably_fenced_via_control_path() {
         route_identity: PlatformHandle::new("store_bridge").unwrap(),
         canonical_pipe_identity: PlatformHandle::new(r"\\.\pipe\eliot\store").unwrap(),
         store_generation: ResourceGeneration::genesis(),
-        state_fence: StateFence::new(AuthorityEpoch::genesis(), ResourceGeneration::genesis()),
+        state_fence: StateFence::new(test_epoch(1), ResourceGeneration::genesis()),
         launch_nonce: PlatformHandle::new("store-launch-nonce").unwrap(),
         connection_id: PlatformHandle::new("store-connection").unwrap(),
         expected_peer_sid: PlatformHandle::new("S-1-5-18").unwrap(),
@@ -4239,7 +4271,7 @@ async fn c54_p1_superseded_rebind_durably_fenced_via_control_path() {
         let cand = HostKernelCandidateBinding {
             installation_id: PlatformHandle::new("installation-1").unwrap(),
             host_epoch: AuthorityEpoch::new(1).unwrap(),
-            kernel_epoch: AuthorityEpoch::genesis(),
+            kernel_epoch: test_epoch(1),
             activation_id: PlatformHandle::new("activation-1").unwrap(),
             artifact_hash: PlatformHandle::new("artifact-1").unwrap(),
             config_hash: PlatformHandle::new("config-1").unwrap(),
@@ -4281,7 +4313,7 @@ async fn c54_p1_superseded_rebind_durably_fenced_via_control_path() {
             journal_transaction_id: PlatformHandle::new("txn-1").unwrap(),
             journal_sequence: 1,
             generation: ResourceGeneration::genesis(),
-            authority_epoch: cand.kernel_epoch,
+            authority_epoch: cand.kernel_epoch.clone(),
             activation_nonce: eliot_platform::KernelActivationNonce::new(
                 PlatformHandle::new("a".repeat(64)).unwrap(),
             )
@@ -4425,7 +4457,7 @@ async fn c54_p1_generic_reconcile_fenced_on_mismatched_store_gate_via_control_pa
         route_identity: PlatformHandle::new("store_bridge").unwrap(),
         canonical_pipe_identity: PlatformHandle::new(r"\\.\pipe\eliot\store").unwrap(),
         store_generation: ResourceGeneration::genesis(),
-        state_fence: StateFence::new(AuthorityEpoch::genesis(), ResourceGeneration::genesis()),
+        state_fence: StateFence::new(test_epoch(1), ResourceGeneration::genesis()),
         launch_nonce: PlatformHandle::new("store-launch-nonce").unwrap(),
         connection_id: PlatformHandle::new("store-connection").unwrap(),
         expected_peer_sid: PlatformHandle::new("S-1-5-18").unwrap(),
@@ -4442,7 +4474,7 @@ async fn c54_p1_generic_reconcile_fenced_on_mismatched_store_gate_via_control_pa
         let cand = HostKernelCandidateBinding {
             installation_id: PlatformHandle::new("installation-1").unwrap(),
             host_epoch: AuthorityEpoch::new(1).unwrap(),
-            kernel_epoch: AuthorityEpoch::genesis(),
+            kernel_epoch: test_epoch(1),
             activation_id: PlatformHandle::new("activation-1").unwrap(),
             artifact_hash: PlatformHandle::new("artifact-1").unwrap(),
             config_hash: PlatformHandle::new("config-1").unwrap(),
@@ -4484,7 +4516,7 @@ async fn c54_p1_generic_reconcile_fenced_on_mismatched_store_gate_via_control_pa
             journal_transaction_id: PlatformHandle::new("txn-1").unwrap(),
             journal_sequence: 1,
             generation: ResourceGeneration::genesis(),
-            authority_epoch: cand.kernel_epoch,
+            authority_epoch: cand.kernel_epoch.clone(),
             activation_nonce: eliot_platform::KernelActivationNonce::new(
                 PlatformHandle::new("a".repeat(64)).unwrap(),
             )
@@ -4525,14 +4557,14 @@ async fn c54_p1_generic_reconcile_fenced_on_mismatched_store_gate_via_control_pa
             },
             candidate_binding_digest: cand.compute_digest().unwrap(),
             generation: ResourceGeneration::genesis(),
-            authority_epoch: AuthorityEpoch::genesis(),
+            authority_epoch: test_epoch(1),
             store_fence: String::new(),
         };
         let mut handoff = handoff;
         let mut hasher = Sha256::new();
         hasher.update(serde_json::to_vec(&handoff.requirement.state_fence).unwrap());
         hasher.update(handoff.generation.value().to_le_bytes());
-        hasher.update(handoff.authority_epoch.value().to_le_bytes());
+        hasher.update(handoff.authority_epoch.sequence.get().to_le_bytes());
         hasher.update(
             handoff
                 .requirement
@@ -4612,7 +4644,7 @@ async fn c54_p1_probe_ready_requires_exact_store_fence_via_control_path() {
         route_identity: PlatformHandle::new("store_bridge").unwrap(),
         canonical_pipe_identity: PlatformHandle::new(r"\\.\pipe\eliot\store").unwrap(),
         store_generation: ResourceGeneration::genesis(),
-        state_fence: StateFence::new(AuthorityEpoch::genesis(), ResourceGeneration::genesis()),
+        state_fence: StateFence::new(test_epoch(1), ResourceGeneration::genesis()),
         launch_nonce: PlatformHandle::new("store-launch-nonce").unwrap(),
         connection_id: PlatformHandle::new("store-connection").unwrap(),
         expected_peer_sid: PlatformHandle::new("S-1-5-18").unwrap(),
@@ -4638,7 +4670,7 @@ async fn c54_p1_probe_ready_requires_exact_store_fence_via_control_path() {
         process_image_path: r"C:\Eliot\eliot-store.exe".to_owned(),
         job_name: r"Local\Eliot-Store-recovered".to_owned(),
         generation: requirement.state_fence.resource_generation.value(),
-        authority_epoch: requirement.state_fence.authority_epoch.value(),
+        authority_epoch: requirement.state_fence.authority_epoch.sequence.get(),
         state: eliot_ors::StoreRebindReplayState::Committed,
         receipt: Some("c".repeat(64)),
         commit_order: 0,
@@ -4651,7 +4683,7 @@ async fn c54_p1_probe_ready_requires_exact_store_fence_via_control_path() {
     let candidate = HostKernelCandidateBinding {
         installation_id: PlatformHandle::new("installation-1").unwrap(),
         host_epoch: AuthorityEpoch::new(1).unwrap(),
-        kernel_epoch: AuthorityEpoch::genesis(),
+        kernel_epoch: test_epoch(1),
         activation_id: PlatformHandle::new("activation-1").unwrap(),
         artifact_hash: PlatformHandle::new("artifact-1").unwrap(),
         config_hash: PlatformHandle::new("config-1").unwrap(),
@@ -4733,7 +4765,7 @@ async fn c54_p1_legacy_zero_order_requires_migration_via_control_path() {
         route_identity: PlatformHandle::new("store_bridge").unwrap(),
         canonical_pipe_identity: PlatformHandle::new(r"\\.\pipe\eliot\store").unwrap(),
         store_generation: ResourceGeneration::genesis(),
-        state_fence: StateFence::new(AuthorityEpoch::genesis(), ResourceGeneration::genesis()),
+        state_fence: StateFence::new(test_epoch(1), ResourceGeneration::genesis()),
         launch_nonce: PlatformHandle::new("store-launch-nonce").unwrap(),
         connection_id: PlatformHandle::new("store-connection").unwrap(),
         expected_peer_sid: PlatformHandle::new("S-1-5-18").unwrap(),
@@ -4750,7 +4782,7 @@ async fn c54_p1_legacy_zero_order_requires_migration_via_control_path() {
         let cand = HostKernelCandidateBinding {
             installation_id: PlatformHandle::new("installation-1").unwrap(),
             host_epoch: AuthorityEpoch::new(1).unwrap(),
-            kernel_epoch: AuthorityEpoch::genesis(),
+            kernel_epoch: test_epoch(1),
             activation_id: PlatformHandle::new("activation-1").unwrap(),
             artifact_hash: PlatformHandle::new("artifact-1").unwrap(),
             config_hash: PlatformHandle::new("config-1").unwrap(),
@@ -4792,7 +4824,7 @@ async fn c54_p1_legacy_zero_order_requires_migration_via_control_path() {
             journal_transaction_id: PlatformHandle::new("txn-1").unwrap(),
             journal_sequence: 1,
             generation: ResourceGeneration::genesis(),
-            authority_epoch: cand.kernel_epoch,
+            authority_epoch: cand.kernel_epoch.clone(),
             activation_nonce: eliot_platform::KernelActivationNonce::new(
                 PlatformHandle::new("a".repeat(64)).unwrap(),
             )
@@ -4928,7 +4960,7 @@ async fn c183_probe_ready_shares_store_rebind_gate_and_requires_committed_public
         route_identity: PlatformHandle::new("store_bridge").unwrap(),
         canonical_pipe_identity: PlatformHandle::new(r"\\.\pipe\eliot\store").unwrap(),
         store_generation: ResourceGeneration::genesis(),
-        state_fence: StateFence::new(AuthorityEpoch::genesis(), ResourceGeneration::genesis()),
+        state_fence: StateFence::new(test_epoch(1), ResourceGeneration::genesis()),
         launch_nonce: PlatformHandle::new("store-launch-nonce").unwrap(),
         connection_id: PlatformHandle::new("store-connection").unwrap(),
         expected_peer_sid: PlatformHandle::new("S-1-5-18").unwrap(),
@@ -4945,7 +4977,7 @@ async fn c183_probe_ready_shares_store_rebind_gate_and_requires_committed_public
         let cand = HostKernelCandidateBinding {
             installation_id: PlatformHandle::new("installation-1").unwrap(),
             host_epoch: AuthorityEpoch::new(1).unwrap(),
-            kernel_epoch: AuthorityEpoch::genesis(),
+            kernel_epoch: test_epoch(1),
             activation_id: PlatformHandle::new("activation-1").unwrap(),
             artifact_hash: PlatformHandle::new("artifact-1").unwrap(),
             config_hash: PlatformHandle::new("config-1").unwrap(),
@@ -4987,7 +5019,7 @@ async fn c183_probe_ready_shares_store_rebind_gate_and_requires_committed_public
             journal_transaction_id: PlatformHandle::new("txn-1").unwrap(),
             journal_sequence: 1,
             generation: ResourceGeneration::genesis(),
-            authority_epoch: cand.kernel_epoch,
+            authority_epoch: cand.kernel_epoch.clone(),
             activation_nonce: eliot_platform::KernelActivationNonce::new(
                 PlatformHandle::new("a".repeat(64)).unwrap(),
             )
@@ -5104,7 +5136,7 @@ async fn c183_probe_ready_shares_store_rebind_gate_and_requires_committed_public
         },
         candidate_binding_digest: candidate_digest.clone(),
         generation: ResourceGeneration::genesis(),
-        authority_epoch: AuthorityEpoch::genesis(),
+        authority_epoch: test_epoch(1),
         store_fence: store_fence.clone(),
     };
     let mut handoff = handoff;

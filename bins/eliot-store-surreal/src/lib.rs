@@ -575,7 +575,7 @@ pub fn admit_handshake(
         || state_fence.resource_generation != hello.module_generation.generation
         || state_fence.resource_generation.value() != config.store_generation()
         || state_fence.authority_epoch != hello.authority_epoch
-        || state_fence.authority_epoch.value() != config.authority_epoch()
+        || state_fence.authority_epoch.sequence.get() != config.authority_epoch()
         || state_fence != &config.runtime_launch.authority_state_fence
     {
         return Err(
@@ -682,7 +682,7 @@ pub fn validate_request_frame(
 mod tests {
     use super::*;
     use eliot_contracts::{
-        ArtifactId, AuthorityEpoch, ClockReading, ContractId, ContractVersion, ProductId,
+        ArtifactId, ClockReading, ContractId, ContractVersion, EpochId, EpochLineageId, ProductId,
         RequestId, ResourceGeneration, SourceId,
     };
     use eliot_installation::{InstallationEpoch, RuntimeStateRoots};
@@ -692,6 +692,14 @@ mod tests {
 
     fn handle(value: impl Into<String>) -> PlatformHandle {
         PlatformHandle::new(value).expect("valid test handle")
+    }
+
+    fn test_epoch(sequence: u64) -> EpochId {
+        EpochId::new(
+            EpochLineageId::new("550e8400-e29b-41d4-a716-446655440000").expect("lineage"),
+            std::num::NonZeroU64::new(sequence).expect("sequence"),
+        )
+        .expect("epoch")
     }
 
     fn request_meta(state_fence: StateFence) -> RequestMeta {
@@ -763,8 +771,7 @@ mod tests {
         let roots = runtime_state_roots();
         let config_path = handle(r"C:\ProgramData\Eliot\generation.json");
         let authority_generation = ResourceGeneration::genesis();
-        let authority_state_fence =
-            StateFence::new(AuthorityEpoch::genesis(), authority_generation);
+        let authority_state_fence = StateFence::new(test_epoch(1), authority_generation);
         let mut descriptor = RuntimeLaunchDescriptor {
             profile: InstallationProfile::SystemService,
             portable_root: None,
@@ -963,10 +970,7 @@ mod tests {
 
         let binding = StoreSchemaBootstrapBinding::from_config(&config);
         let mut drifted = command;
-        drifted.state_fence = StateFence::new(
-            AuthorityEpoch::new(2).expect("epoch"),
-            ResourceGeneration::genesis(),
-        );
+        drifted.state_fence = StateFence::new(test_epoch(2), ResourceGeneration::genesis());
         assert!(matches!(
             binding.validate_command(&drifted, &migration),
             Err(StoreSchemaBootstrapError::Rejected(reason))
@@ -1210,7 +1214,7 @@ mod tests {
     fn recovery_dispatch_default_unavailable_is_error() {
         let request = eliot_store_api::StoreRecoveryRequest {
             contract_version: eliot_store_api::CONTRACT_VERSION,
-            state_fence: StateFence::new(AuthorityEpoch::genesis(), ResourceGeneration::genesis()),
+            state_fence: StateFence::new(test_epoch(1), ResourceGeneration::genesis()),
             records: Vec::new(),
             include_receipts: false,
             include_jobs: false,
@@ -1243,7 +1247,7 @@ mod tests {
             operation_id: OperationId::new("genesis-dispatch").expect("operation id"),
             idempotency_key: "genesis-retry".to_owned(),
             canonical_request_hash: String::new(),
-            state_fence: StateFence::new(AuthorityEpoch::genesis(), ResourceGeneration::genesis()),
+            state_fence: StateFence::new(test_epoch(1), ResourceGeneration::genesis()),
             owner_records: Vec::new(),
         };
         let context = request_meta(request.state_fence.clone());
@@ -1279,7 +1283,7 @@ mod tests {
             operation_id: operation_id.clone(),
             idempotency_key: "genesis-retry".to_owned(),
             canonical_request_hash: String::new(),
-            state_fence: StateFence::new(AuthorityEpoch::genesis(), ResourceGeneration::genesis()),
+            state_fence: StateFence::new(test_epoch(1), ResourceGeneration::genesis()),
             owner_records: Vec::new(),
         };
         let context = request_meta(request.state_fence.clone());
@@ -1360,7 +1364,11 @@ mod tests {
         let module_id = ContractId::new(STORE_MODULE_IDENTITY).expect("module id");
         let artifact_id =
             ArtifactId::new(config.approved_artifact_hash.as_str()).expect("artifact");
-        let authority_epoch = config.runtime_launch.authority_state_fence.authority_epoch;
+        let authority_epoch = config
+            .runtime_launch
+            .authority_state_fence
+            .authority_epoch
+            .clone();
         let generation = config.runtime_launch.authority_generation;
         let hello = ClientHello {
             protocol_range: ProtocolRange {
@@ -1387,7 +1395,7 @@ mod tests {
                 artifact_id,
                 state: ModuleGenerationState::Active,
                 health: HealthVector::healthy(),
-                state_fence: StateFence::new(authority_epoch, generation),
+                state_fence: StateFence::new(authority_epoch.clone(), generation),
             },
             launch_nonce: config.launch_nonce.clone(),
             capabilities: CAPABILITIES
@@ -1422,7 +1430,11 @@ mod tests {
         };
         let mut hello: ClientHello = serde_json::from_value(payload).expect("client hello");
         hello.module_generation.state_fence = StateFence::new(
-            config.runtime_launch.authority_state_fence.authority_epoch,
+            config
+                .runtime_launch
+                .authority_state_fence
+                .authority_epoch
+                .clone(),
             ResourceGeneration::new(config.store_generation() + 1).expect("generation"),
         );
         let mismatched =
@@ -1431,9 +1443,17 @@ mod tests {
             admit_handshake(mismatched, TransportLimits::default(), &config, &identity,).is_err()
         );
 
-        let mismatched_authority =
-            AuthorityEpoch::new(config.authority_epoch() + 1).expect("epoch");
-        hello.authority_epoch = mismatched_authority;
+        let mismatched_authority = EpochId::new(
+            config
+                .runtime_launch
+                .authority_state_fence
+                .authority_epoch
+                .lineage_id
+                .clone(),
+            std::num::NonZeroU64::new(config.authority_epoch() + 1).expect("epoch"),
+        )
+        .expect("epoch");
+        hello.authority_epoch = mismatched_authority.clone();
         hello.module_generation.state_fence = StateFence::new(
             mismatched_authority,
             config.runtime_launch.authority_generation,
@@ -1469,7 +1489,10 @@ mod tests {
                     "capacity": "HEALTHY"
                 },
                 "state_fence": {
-                    "authority_epoch": 1,
+                    "authority_epoch": {
+                        "lineage_id": "550e8400-e29b-41d4-a716-446655440000",
+                        "sequence": 1
+                    },
                     "resource_generation": 1
                 }
             }))
@@ -1530,7 +1553,10 @@ mod tests {
                     "capacity": "HEALTHY"
                 },
                 "state_fence": {
-                    "authority_epoch": 1,
+                    "authority_epoch": {
+                        "lineage_id": "550e8400-e29b-41d4-a716-446655440000",
+                        "sequence": 1
+                    },
                     "resource_generation": 1
                 }
             }))

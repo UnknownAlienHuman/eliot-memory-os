@@ -350,7 +350,7 @@ impl KernelComposition {
             serde_json::from_value(fence_value).map_err(|_| NativeWorkerReconcileError::Shape {
                 field: "state_fence",
             })?;
-        if fence.authority_epoch.value() != authority_epoch {
+        if fence.authority_epoch.sequence.get() != authority_epoch {
             return Err(NativeWorkerReconcileError::Fence {
                 field: "epoch_fence",
             });
@@ -512,7 +512,7 @@ impl KernelComposition {
                     field: "receipt.state_fence",
                 }
             })?;
-            if fence.authority_epoch.value() != staged.authority_epoch {
+            if fence.authority_epoch.sequence.get() != staged.authority_epoch {
                 return Err(NativeWorkerReconcileError::Fence {
                     field: "receipt.epoch_fence",
                 });

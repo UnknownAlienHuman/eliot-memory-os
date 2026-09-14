@@ -8,11 +8,20 @@
 //! boundary via `super::*`. It is an ordinary module kept under 10k LOC.
 
 use super::*;
+use eliot_contracts::{EpochId, EpochLineageId};
+
+fn test_epoch(sequence: u64) -> EpochId {
+    EpochId::new(
+        EpochLineageId::new("550e8400-e29b-41d4-a716-446655440000").expect("lineage"),
+        std::num::NonZeroU64::new(sequence).expect("sequence"),
+    )
+    .expect("epoch")
+}
 
 #[cfg(windows)]
 fn activation_test_entry(deadline: u64) -> (String, AgentActivationPending) {
     let state_fence = StateFence::new(
-        AuthorityEpoch::new(1).expect("authority epoch"),
+        test_epoch(1),
         ResourceGeneration::new(1).expect("resource generation"),
     );
     let request_id = RequestId::new("activation-request-test").expect("request id");
@@ -82,7 +91,7 @@ fn activation_test_decision(ticket_id: &str) -> AgentActivationResolutionDecisio
         ticket_id: ticket_id.to_owned(),
         ticket_sha256: "c".repeat(64),
         state_fence: StateFence::new(
-            AuthorityEpoch::new(1).expect("authority epoch"),
+            test_epoch(1),
             ResourceGeneration::new(1).expect("resource generation"),
         ),
         principal_id: "principal-test".to_owned(),

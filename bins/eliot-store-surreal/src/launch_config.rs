@@ -153,7 +153,8 @@ impl StoreLaunchConfig {
         self.runtime_launch
             .authority_state_fence
             .authority_epoch
-            .value()
+            .sequence
+            .get()
     }
 
     pub(crate) const fn store_generation(&self) -> u64 {

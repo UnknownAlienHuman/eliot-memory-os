@@ -722,7 +722,7 @@ fn requested_host_request_record(
         capability_ref: label(&envelope.identity.capability)?,
         fence_digest: sha256_json(&envelope.state_fence)
             .map_err(|_| TransportError::SessionFenced)?,
-        authority_epoch: envelope.state_fence.authority_epoch.value(),
+        authority_epoch: envelope.state_fence.authority_epoch.clone(),
         generation: envelope.state_fence.resource_generation.value(),
         deadline_unix_ms: envelope.identity.deadline_unix_ms,
         state: HostRequestState::Requested,
@@ -803,7 +803,7 @@ fn require_current_generation_parent(
     parent: &HostRequestRecord,
     descriptor: &AgentBridgeAdmissionDescriptor,
 ) -> Result<(), TransportError> {
-    if parent.authority_epoch != descriptor.authority_epoch.value()
+    if parent.authority_epoch != descriptor.authority_epoch
         || parent.generation != descriptor.generation.value()
     {
         return Err(TransportError::SessionFenced);

@@ -441,7 +441,7 @@ impl KernelComposition {
             snapshot_record_id: descriptor.snapshot_binding.record_id.clone(),
             snapshot_binding_digest: sha256_json(&descriptor.snapshot_binding)
                 .map_err(|_| AuthorityPreparationError::DescriptorInvalid)?,
-            authority_epoch: descriptor.state_fence.authority_epoch.value(),
+            authority_epoch: descriptor.state_fence.authority_epoch.sequence.get(),
             generation: descriptor.generation.value(),
             state_fence_digest: sha256_json(&descriptor.state_fence)
                 .map_err(|_| AuthorityPreparationError::DescriptorInvalid)?,
@@ -569,15 +569,34 @@ impl KernelComposition {
         // exact Host-approved bootstrap fence. Falling back to genesis is
         // reserved for the explicitly standalone composition, where no Store
         // authority has been injected.
-        let (authority_epoch, generation) = store_bootstrap.as_ref().map_or(
-            (AuthorityEpoch::genesis(), ResourceGeneration::genesis()),
-            |requirement| {
+        //
+        // Lineage-aware split (Implements #64): the scalar `GenerationRouter`
+        // residual keeps the exact sequence projection, while canonical
+        // `StateFence`/`KernelService` fencing uses the full `EpochId` tuple.
+        // Cross-lineage same-sequence routes never authorize through the
+        // canonical gate.
+        let (authority_epoch, canonical_epoch, generation) = match store_bootstrap.as_ref() {
+            None => (
+                AuthorityEpoch::genesis(),
+                eliot_contracts::EpochId::new(
+                    eliot_contracts::EpochLineageId::new("550e8400-e29b-41d4-a716-446655440000")
+                        .map_err(|error| KernelBuildError::Service(error.to_string()))?,
+                    std::num::NonZeroU64::MIN,
+                )
+                .map_err(|error| KernelBuildError::Service(error.to_string()))?,
+                ResourceGeneration::genesis(),
+            ),
+            Some(requirement) => {
+                let canonical = requirement.state_fence.authority_epoch.clone();
+                let scalar = AuthorityEpoch::new(canonical.sequence.get())
+                    .map_err(|error| KernelBuildError::Service(error.to_string()))?;
                 (
-                    requirement.state_fence.authority_epoch,
+                    scalar,
+                    canonical,
                     requirement.state_fence.resource_generation,
                 )
-            },
-        );
+            }
+        };
         let mut generations = GenerationRouter::at_epoch(authority_epoch)
             .map_err(|error| KernelBuildError::Core(error.to_string()))?;
         generations
@@ -622,7 +641,7 @@ impl KernelComposition {
             artifact_id,
             state: ModuleGenerationState::Starting,
             health: HealthVector::healthy(),
-            state_fence: StateFence::new(authority_epoch, generation),
+            state_fence: StateFence::new(canonical_epoch.clone(), generation),
         };
         #[cfg(windows)]
         let session_principal_binding = observed_session_principal_binding()?;
@@ -680,7 +699,7 @@ impl KernelComposition {
         let generation_gateway = OrsGenerationCoordinator::new(ors.clone());
         let mut service = service;
         service
-            .synchronize_authority_epoch(authority_epoch)
+            .synchronize_authority_epoch(canonical_epoch)
             .map_err(|error| KernelBuildError::Service(error.to_string()))?;
         let mut policy = front_door_policy;
         generation_gateway

@@ -35,7 +35,7 @@ impl KernelComposition {
                 .map_err(|_| KernelServiceError::ReadinessNotProven)?,
             connection_id: session.connection_id.clone(),
             session_epoch: session.session_epoch,
-            authority_epoch: session.authority_epoch,
+            authority_epoch: session.authority_epoch.sequence.get(),
             generation: session.module_generation.generation.value(),
             launch_nonce_sha256: format!("{:x}", Sha256::digest(session.launch_nonce.as_bytes())),
         })
@@ -103,7 +103,7 @@ impl KernelComposition {
             .current_eliotd_live_projection(
                 &supervision_contour.incarnation.supervision_lease_id,
                 launch.generation.value(),
-                launch.authority_epoch.value(),
+                launch.authority_epoch.sequence.get(),
             )
             .map_err(|_| KernelServiceError::ReadinessNotProven)?;
         let receipt = EliotdLiveReceipt::new(
@@ -114,7 +114,7 @@ impl KernelComposition {
             runtime_binding.installation_id(),
             runtime_binding.approved_generation(),
             launch.generation.value(),
-            launch.authority_epoch.value(),
+            launch.authority_epoch.sequence.get(),
             launch.config_descriptor_sha256.as_str(),
             descriptor_artifact,
             kernel_artifact,
@@ -271,7 +271,7 @@ impl KernelComposition {
             .current_eliotd_live_projection(
                 &supervision_contour.incarnation.supervision_lease_id,
                 launch.generation.value(),
-                launch.authority_epoch.value(),
+                launch.authority_epoch.sequence.get(),
             )
             .map_err(|_| KernelServiceError::ReadinessNotProven)?;
         if post_supervision != supervision || post_issued_at_ms != supervision_issued_at_ms {
@@ -541,7 +541,7 @@ impl KernelComposition {
                         r.commit_order == 0
                             && r.requirement_digest == receipt.requirement_digest
                             && r.generation == receipt.generation.value()
-                            && r.authority_epoch == receipt.authority_epoch.value()
+                            && r.authority_epoch == receipt.authority_epoch.sequence.get()
                     })
                     .count();
                 if lineage_zeros > 1 {
