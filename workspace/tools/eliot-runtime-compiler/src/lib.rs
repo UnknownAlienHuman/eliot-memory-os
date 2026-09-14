@@ -339,7 +339,6 @@ fn check_json_bounds(value: &Value) -> Result<(), CompilerError> {
                     max_len: bounds::MAX_JSON_STRING_LEN,
                 });
             }
-            Value::String(_) => {}
             _ => {}
         }
     }
