@@ -290,6 +290,16 @@ class AssignmentIntegrityOracleTests(unittest.TestCase):
         res3 = AssignmentIntegrityOracle(snap3).audit()
         self.assertIn("AU-CAND-HEAD-MISMATCH", {f.rule_id for f in res3.findings})
 
+        # 4. Valid base-ancestor candidate: base_sha is an ancestor of authoritative base
+        snap4 = base_valid_snapshot()
+        ancestor_sha = "8ebf8b4000000000000000000000000000000000"
+        snap4["header"]["base_ancestors"] = [ancestor_sha]
+        snap4["pull_requests"][0]["base_sha"] = ancestor_sha
+        snap4["pull_requests"][0]["merge_base_sha"] = ancestor_sha
+        res4 = AssignmentIntegrityOracle(snap4).audit()
+        self.assertEqual(res4.status, ResultStatus.VALID)
+        self.assertNotIn("AU-CAND-STALE-BASE", {f.rule_id for f in res4.findings})
+
     # WORK_UNIT_CASE: 818/18
     def test_valid_reservation_only_draft(self):
         snap = base_valid_snapshot()
@@ -394,11 +404,16 @@ class AssignmentIntegrityOracleTests(unittest.TestCase):
     # WORK_UNIT_CASE: 818/28
     def test_exact_physical_owner_valid(self):
         snap = base_valid_snapshot()
+        snap["repository_records"]["manifests"] = [{
+            "path": "crates/kernel/eliot-kernel/Cargo.toml",
+            "package": "eliot-kernel",
+            "plane": "kernel",
+        }]
         snap["repository_records"]["workstreams"] = [{
             "path": "workstreams/kernel/assignments/015-kernel.toml",
             "internal_issue": 15,
             "package": "eliot-kernel",
-            "physical_package": "eliot-kernel",
+            "target_dir": "crates/kernel/eliot-kernel/",
         }]
         res = AssignmentIntegrityOracle(snap).audit()
         self.assertEqual(res.status, ResultStatus.VALID)
@@ -636,11 +651,38 @@ class AssignmentIntegrityOracleTests(unittest.TestCase):
 
     # WORK_UNIT_CASE: 818/48
     def test_unknown_field_schema_rejected(self):
+        # 1. Unsupported schema string
         snap = base_valid_snapshot()
         snap["schema"] = "unsupported-schema-v99"
         res = AssignmentIntegrityOracle(snap).audit()
         self.assertEqual(res.status, ResultStatus.MALFORMED_INPUT)
         self.assertIn("AU-SCHEMA-02", {f.rule_id for f in res.findings})
+
+        # 2. Removed label field in PR rejected by schema
+        snap2 = base_valid_snapshot()
+        snap2["pull_requests"][0]["candidate_status"] = "stale_base"
+        res2 = AssignmentIntegrityOracle(snap2).audit()
+        self.assertEqual(res2.status, ResultStatus.MALFORMED_INPUT)
+        self.assertIn("AU-SCHEMA-02", {f.rule_id for f in res2.findings})
+
+        # 3. Removed label field in workstream rejected by schema
+        snap3 = base_valid_snapshot()
+        snap3["repository_records"]["workstreams"] = [{
+            "path": "workstreams/assignments/818.toml",
+            "internal_issue": 818,
+            "package": "eliot-scripts",
+            "physical_package": "eliot-scripts",
+        }]
+        res3 = AssignmentIntegrityOracle(snap3).audit()
+        self.assertEqual(res3.status, ResultStatus.MALFORMED_INPUT)
+        self.assertIn("AU-SCHEMA-02", {f.rule_id for f in res3.findings})
+
+        # 4. Unknown field in root rejected by schema
+        snap4 = base_valid_snapshot()
+        snap4["unknown_root_key"] = "forbidden"
+        res4 = AssignmentIntegrityOracle(snap4).audit()
+        self.assertEqual(res4.status, ResultStatus.MALFORMED_INPUT)
+        self.assertIn("AU-SCHEMA-02", {f.rule_id for f in res4.findings})
 
     # WORK_UNIT_CASE: 818/49
     def test_bounded_malformed_fuzzed_snapshot_without_parent_crash(self):
