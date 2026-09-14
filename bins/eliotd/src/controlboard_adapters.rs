@@ -10,8 +10,11 @@
 //! - No policy, admission, or semantic rules live here. Role, privacy, and
 //!   capability resolution stays with the session/authority owner, so
 //!   [`resolve`](eliot_controlboard::AccessResolverPort::resolve) validates
-//!   the request shape and snapshot pins, then fails closed with a typed
-//!   provider gap instead of inventing rights.
+//!   the request shape and snapshot pins, then admits one owner-issued session
+//!   binding ([`AdmittedSessionAccess`]) pinned to the live snapshot
+//!   fence/revision instead of inventing rights. A session with no admission
+//!   keeps the fail-closed gap (`Unavailable`), so 'source not connected'
+//!   stays distinct from an admitted-but-empty view.
 //! - The Swarm projection providers (catalogue, preferences) are admitted to
 //!   the Governor snapshot port as explicit owner-issued bindings
 //!   ([`GovernorSwarmProjection::with_admitted_providers`]). Admission records
@@ -38,15 +41,15 @@
 
 #![forbid(unsafe_code)]
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::sync::Arc;
 
 use eliot_contracts::SessionId;
 use eliot_controlboard::{
-    AccessBinding, AccessResolverPort, CanonicalState, CanonicalStatePort, CommandDisposition,
-    CommandReceipt, CommandRequest, ControlBoard, OperatorCommandPort, PortError,
-    ProjectionBinding, ProjectionProvider, ProviderCompleteness, ReadRequest,
-    SwarmProjectionEnvelope, SwarmProjectionPort, ViewRevision,
+    AccessBinding, AccessResolverPort, ActionCapability, CanonicalState, CanonicalStatePort,
+    CommandDisposition, CommandReceipt, CommandRequest, ControlBoard, OperatorCommandPort,
+    PortError, PrivacyClass, ProjectionBinding, ProjectionProvider, ProviderCompleteness,
+    ReadRequest, Role, SwarmProjectionEnvelope, SwarmProjectionPort, ViewRevision,
 };
 use eliot_governor::ControlBoardGovernorSnapshot;
 
@@ -85,17 +88,182 @@ fn access_currency(
 
 /// Governor-backed access resolver.
 ///
-/// Performs the real request-shape and snapshot-pin checks, then reports the
-/// genuinely missing session-to-access semantic mapping as a typed gap. The
-/// Governor session owner carries no `ControlBoard` role, privacy, or
-/// capability facts, and this adapter never invents them.
+/// Performs the real request-shape and snapshot-pin checks, then admits one
+/// owner-issued session binding per known session (see
+/// [`AdmittedSessionAccess`]). The Governor session owner carries no
+/// `ControlBoard` role, privacy, or capability facts itself, and this adapter
+/// never invents them: access rights come only from the admitted owner-issued
+/// facts, pinned here to the live snapshot fence and revision. A session with
+/// no admission keeps the fail-closed gap (`Unavailable`, reported by the
+/// board as `PlanGap(AccessResolver)`), so 'source not connected' stays
+/// distinct from an admitted-but-empty view.
 struct GovernorAccessResolver {
     snapshot: Arc<ControlBoardGovernorSnapshot>,
+    admitted: BTreeMap<String, AdmittedSessionAccess>,
+}
+
+/// Owner-issued session access facts admitted by the Governor snapshot port.
+///
+/// References and facts only: session identity, principal id, work scope,
+/// role, admitted privacy classes, action capabilities, owner provenance refs
+/// (binding id, binding digest, receipt ref), and owner-observed timestamps.
+/// No credential, secret, token, cookie, or payload bytes ever appear here.
+///
+/// The timestamps are echoed owner-observed facts (like the ceiling echoing
+/// documented at the top of this module); lifetime enforcement stays with the
+/// issuing owner and `ControlBoard::seal_for`, which re-checks the echoed
+/// bounds on every view.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct AdmittedSessionAccess {
+    session_id: String,
+    principal_id: String,
+    work_scope: String,
+    role: Role,
+    admitted_privacy: Vec<PrivacyClass>,
+    capabilities: Vec<ActionCapability>,
+    binding_id: String,
+    binding_digest: String,
+    receipt_ref: String,
+    issued_at_unix_ms: u64,
+    observed_at_unix_ms: u64,
+    expires_at_unix_ms: u64,
+}
+
+// AUD-C02: composition admission seam for the future session owner (User
+// Broker role issuance is deferred to #23/#1135). Production wiring stays on
+// `new` (empty map) until that owner exists.
+#[allow(dead_code)]
+impl AdmittedSessionAccess {
+    /// Admits one owner-issued session binding after fail-closed validation.
+    /// The full owner-issued fact set travels in one validated step so no
+    /// partial binding can resolve.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn new(
+        session_id: impl Into<String>,
+        principal_id: impl Into<String>,
+        work_scope: impl Into<String>,
+        role: Role,
+        admitted_privacy: Vec<PrivacyClass>,
+        capabilities: Vec<ActionCapability>,
+        binding_id: impl Into<String>,
+        binding_digest: impl Into<String>,
+        receipt_ref: impl Into<String>,
+        issued_at_unix_ms: u64,
+        observed_at_unix_ms: u64,
+        expires_at_unix_ms: u64,
+    ) -> Result<Self, PortError> {
+        let binding = Self {
+            session_id: session_id.into(),
+            principal_id: principal_id.into(),
+            work_scope: work_scope.into(),
+            role,
+            admitted_privacy,
+            capabilities,
+            binding_id: binding_id.into(),
+            binding_digest: binding_digest.into(),
+            receipt_ref: receipt_ref.into(),
+            issued_at_unix_ms,
+            observed_at_unix_ms,
+            expires_at_unix_ms,
+        };
+        binding.validate()?;
+        Ok(binding)
+    }
+
+    fn validate(&self) -> Result<Self, PortError> {
+        if !valid_binding_text(&self.session_id)
+            || !valid_binding_text(&self.principal_id)
+            || !valid_binding_text(&self.work_scope)
+            || !valid_binding_text(&self.binding_id)
+            || !valid_binding_text(&self.receipt_ref)
+            || !valid_binding_digest(&self.binding_digest)
+            || self.admitted_privacy.is_empty()
+        {
+            return Err(PortError::Invalid(
+                "session access admission binding is malformed".to_owned(),
+            ));
+        }
+        if self.issued_at_unix_ms == 0
+            || self.observed_at_unix_ms < self.issued_at_unix_ms
+            || self.observed_at_unix_ms >= self.expires_at_unix_ms
+        {
+            return Err(PortError::Invalid(
+                "session access admission lifetime is malformed".to_owned(),
+            ));
+        }
+        let mut privacy = BTreeSet::new();
+        for class in &self.admitted_privacy {
+            if !privacy.insert(*class as u8) {
+                return Err(PortError::Invalid(
+                    "session access admission has a duplicate privacy class".to_owned(),
+                ));
+            }
+        }
+        let mut capabilities = BTreeSet::new();
+        for capability in &self.capabilities {
+            if !capabilities.insert(*capability as u8) {
+                return Err(PortError::Invalid(
+                    "session access admission has a duplicate capability".to_owned(),
+                ));
+            }
+        }
+        Ok(self.clone())
+    }
+
+    /// Exact-replay rule for one session: identical facts replay, changed
+    /// facts under the same session id conflict without mutating the stored
+    /// binding.
+    fn same_binding(&self, other: &Self) -> bool {
+        self.session_id == other.session_id
+            && self.principal_id == other.principal_id
+            && self.work_scope == other.work_scope
+            && self.role == other.role
+            && self.admitted_privacy == other.admitted_privacy
+            && self.capabilities == other.capabilities
+            && self.binding_id == other.binding_id
+            && self.binding_digest == other.binding_digest
+            && self.receipt_ref == other.receipt_ref
+            && self.issued_at_unix_ms == other.issued_at_unix_ms
+            && self.observed_at_unix_ms == other.observed_at_unix_ms
+            && self.expires_at_unix_ms == other.expires_at_unix_ms
+    }
 }
 
 impl GovernorAccessResolver {
     fn new(snapshot: Arc<ControlBoardGovernorSnapshot>) -> Self {
-        Self { snapshot }
+        Self {
+            snapshot,
+            admitted: BTreeMap::new(),
+        }
+    }
+
+    /// Admits owner-issued session bindings into the Governor snapshot port.
+    /// Each binding is validated fail-closed; re-admitting an identical
+    /// binding is an idempotent replay, while a changed binding under an
+    /// already-admitted session id is an identity conflict that mutates
+    /// nothing.
+    // AUD-C02: composition admission point for the future session owner;
+    // production wiring stays on `new` (empty map) until that owner exists.
+    #[allow(dead_code)]
+    pub(crate) fn with_admitted_sessions(
+        snapshot: Arc<ControlBoardGovernorSnapshot>,
+        admitted: Vec<AdmittedSessionAccess>,
+    ) -> Result<Self, PortError> {
+        let mut sessions = BTreeMap::new();
+        for binding in admitted {
+            let binding = binding.validate()?;
+            match sessions.get(&binding.session_id) {
+                None => {
+                    sessions.insert(binding.session_id.clone(), binding);
+                }
+                Some(stored) if stored.same_binding(&binding) => {}
+                Some(_) => return Err(PortError::IdentityConflict),
+            }
+        }
+        Ok(Self {
+            snapshot,
+            admitted: sessions,
+        })
     }
 }
 
@@ -113,7 +281,31 @@ impl AccessResolverPort for GovernorAccessResolver {
         {
             return Err(PortError::Denied);
         }
-        Err(PortError::Unavailable)
+        let admitted = self
+            .admitted
+            .get(&request.session_id)
+            .ok_or(PortError::Unavailable)?;
+        let access_revision = ViewRevision::new(self.snapshot.read_revision).map_err(|_| {
+            PortError::Invalid("controlboard read revision must be non-zero".to_owned())
+        })?;
+        Ok(AccessBinding {
+            principal_id: admitted.principal_id.clone(),
+            work_scope: admitted.work_scope.clone(),
+            role: admitted.role,
+            admitted_privacy: admitted.admitted_privacy.clone(),
+            capabilities: admitted.capabilities.clone(),
+            session_id: request.session_id.clone(),
+            connection_id: request.connection_id.clone(),
+            credential_binding: request.credential_binding.clone(),
+            challenge: request.challenge.clone(),
+            request_id: request.request_id.clone(),
+            generation: request.generation,
+            issued_at_unix_ms: admitted.issued_at_unix_ms,
+            observed_at_unix_ms: admitted.observed_at_unix_ms,
+            expires_at_unix_ms: admitted.expires_at_unix_ms,
+            access_revision,
+            access_fence: self.snapshot.fence.clone(),
+        })
     }
 }
 
@@ -1056,5 +1248,155 @@ mod tests {
         assert_eq!(port.submit(&changed), Err(PortError::IdentityConflict));
         // No state mutation on conflict: the original binding still replays.
         assert_eq!(port.submit(&submitted).expect("replay receipt"), first);
+    }
+
+    fn admitted_session(session: &str) -> AdmittedSessionAccess {
+        AdmittedSessionAccess::new(
+            session,
+            format!("{session}-principal"),
+            "scope",
+            Role::HumanRequester,
+            vec![PrivacyClass::Public],
+            Vec::new(),
+            format!("governor-owner:access:{session}"),
+            "e".repeat(64),
+            format!("governor-owner:receipt:{session}"),
+            1_000,
+            1_100,
+            2_000,
+        )
+        .expect("valid session admission")
+    }
+
+    fn board_with_admitted_session(
+        snapshot: Arc<ControlBoardGovernorSnapshot>,
+        admitted: AdmittedSessionAccess,
+    ) -> ControlBoard {
+        ControlBoard::new(
+            Some(Box::new(
+                GovernorAccessResolver::with_admitted_sessions(
+                    Arc::clone(&snapshot),
+                    vec![admitted],
+                )
+                .expect("admitted session"),
+            )),
+            Some(Box::new(GovernorCanonicalState::new(snapshot))),
+            None,
+        )
+    }
+
+    #[test]
+    fn admitted_session_resolves_to_live_pinned_view() {
+        let snapshot = Arc::new(snapshot());
+        let admitted = admitted_session("session-a");
+        // Port-level resolve pins the owner-issued facts to the live pins.
+        let mut resolver = GovernorAccessResolver::with_admitted_sessions(
+            Arc::clone(&snapshot),
+            vec![admitted.clone()],
+        )
+        .expect("admitted session");
+        let binding = resolver
+            .resolve(&request_for("session-a"))
+            .expect("resolve");
+        assert_eq!(binding.session_id, "session-a");
+        assert_eq!(binding.connection_id, "session-a-connection");
+        assert_eq!(binding.principal_id, "session-a-principal");
+        assert_eq!(binding.access_revision.get(), 7);
+        assert_eq!(binding.access_fence, fence());
+        // The same binding reads the real G-11/I-12 bindings from canonical state.
+        let mut reader = GovernorCanonicalState::new(Arc::clone(&snapshot));
+        let canonical = reader
+            .read(&request_for("session-a"), &binding)
+            .expect("canonical");
+        assert_eq!(
+            canonical.completeness.g11_coordination.binding_id,
+            "governor-owner:coordination"
+        );
+        assert_eq!(
+            canonical.completeness.i12_report_projection.binding_id,
+            "governor-owner:observation"
+        );
+        // Board view over the real adapters: Ok empty view on the live pins.
+        let mut board = board_with_admitted_session(Arc::clone(&snapshot), admitted);
+        let view = board.view(&request_for("session-a")).expect("view");
+        assert_eq!(view.revision.get(), 7);
+        assert_eq!(view.fence, fence());
+        assert!(view.items.is_empty());
+        assert!(view.reviews.is_empty());
+        assert!(view.provenance.is_empty());
+        // Unknown session: source not connected, never an empty view.
+        assert_eq!(
+            board.view(&request_for("session-b")),
+            Err(ControlBoardError::PlanGap(RequiredProvider::AccessResolver))
+        );
+        // Stale fence pin: denied before admission state is even consulted.
+        let stale = request_for("session-a").pinned(
+            ViewRevision::new(7).expect("revision"),
+            StateFence::new(
+                test_epoch(1),
+                ResourceGeneration::new(6).expect("generation"),
+            ),
+        );
+        assert_eq!(board.view(&stale), Err(ControlBoardError::Unauthorized));
+        // Empty admission map: production behaviour is unchanged (unavailable).
+        let mut bare = ControlBoard::new(
+            Some(Box::new(GovernorAccessResolver::new(Arc::clone(&snapshot)))),
+            Some(Box::new(GovernorCanonicalState::new(snapshot))),
+            None,
+        );
+        assert_eq!(
+            bare.view(&request_for("session-a")),
+            Err(ControlBoardError::PlanGap(RequiredProvider::AccessResolver))
+        );
+    }
+
+    #[test]
+    fn changed_session_readmission_is_identity_conflict() {
+        let snapshot = Arc::new(snapshot());
+        let admitted = admitted_session("session-a");
+        // Identical re-admission replays: both instances resolve the same binding.
+        let mut first = GovernorAccessResolver::with_admitted_sessions(
+            Arc::clone(&snapshot),
+            vec![admitted.clone()],
+        )
+        .expect("admit");
+        let mut replay = GovernorAccessResolver::with_admitted_sessions(
+            Arc::clone(&snapshot),
+            vec![admitted.clone()],
+        )
+        .expect("replay");
+        assert_eq!(
+            first.resolve(&request_for("session-a")).expect("resolve"),
+            replay.resolve(&request_for("session-a")).expect("resolve")
+        );
+        // Changed facts under the admitted session id conflict and store nothing.
+        let mut changed = admitted.clone();
+        changed.work_scope = "other-scope".to_owned();
+        assert!(matches!(
+            GovernorAccessResolver::with_admitted_sessions(
+                Arc::clone(&snapshot),
+                vec![admitted, changed]
+            ),
+            Err(PortError::IdentityConflict)
+        ));
+        // Malformed owner facts (empty privacy admits nothing sealable) are
+        // rejected at admission, never resolved.
+        assert!(matches!(
+            AdmittedSessionAccess::new(
+                "session-a",
+                "session-a-principal",
+                "scope",
+                Role::HumanRequester,
+                Vec::new(),
+                Vec::new(),
+                "governor-owner:access:session-a",
+                "e".repeat(64),
+                "governor-owner:receipt:session-a",
+                1_000,
+                1_100,
+                2_000,
+            ),
+            Err(PortError::Invalid(_))
+        ));
     }
 }
