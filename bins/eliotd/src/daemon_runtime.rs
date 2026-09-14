@@ -13,13 +13,15 @@
 
 use std::io::{self, Write};
 use std::path::PathBuf;
+use std::pin::Pin;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use eliot_governor::KernelTransitionPort;
 use eliot_protocol::{
     AgentActivationResolutionDisposition, AgentActivationResolutionResult,
-    AgentActivationResolutionTicket, AgentActivationResultAckOutcome,
+    AgentActivationResolutionTicket, AgentActivationResultAck, AgentActivationResultAckOutcome,
     AgentActivationResultReconcile,
 };
 use eliotd::{
@@ -31,6 +33,86 @@ use tokio::time::{Instant, Interval, MissedTickBehavior};
 
 const ACTIVATION_POLL_INTERVAL: Duration = Duration::from_millis(100);
 const HEALTH_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(5);
+/// Bounded drain for an in-flight activation when shutdown arrives. The drain
+/// never starts new work and never recomputes under a new id; a timeout
+/// surfaces a typed unknown outcome with the original identity.
+const SHUTDOWN_ACTIVATION_DRAIN: Duration = Duration::from_secs(2);
+
+/// Bounded observation counter for transient `NotReady` deferrals. Kernel
+/// owns retry policy; this counter is diagnostic only and introduces no
+/// timer or cache.
+static TRANSIENT_DEFERRAL_OBSERVED: AtomicU64 = AtomicU64::new(0);
+
+/// Explicit loop exit so a shutdown that races an in-flight submit is never
+/// silently dropped. `ShutdownActivationUnknown` carries the original
+/// ticket/result identity verbatim; it is a local outcome only, not a
+/// protocol change.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum RunLoopExit {
+    Shutdown,
+    ShutdownActivationUnknown {
+        ticket_id: String,
+        result_sha256: String,
+        detail: String,
+    },
+}
+
+/// Typed dispatch failure so the shutdown drain can distinguish an ambiguous
+/// submit (unknown retention, original identity preserved) from a hard
+/// fail-closed error. Local only; no protocol change.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ActivationDispatchError {
+    Hard(String),
+    Unknown {
+        ticket_id: String,
+        result_sha256: String,
+        detail: String,
+    },
+}
+
+/// Retained identity for an in-flight dispatch. Cloned verbatim from the
+/// single resolved result; never recomputed and never re-resolved.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct RetainedActivationIdentity {
+    ticket_id: String,
+    result_sha256: String,
+}
+
+/// Completion of one in-flight activation step. Claim and dispatch share one
+/// flight branch so health and shutdown stay pollable while either is
+/// outstanding.
+enum ActivationCompletion {
+    Claim(Result<Option<AgentActivationResolutionTicket>, String>),
+    Dispatch(Result<(), ActivationDispatchError>),
+}
+
+struct ActivationFlightState {
+    future: Pin<Box<dyn std::future::Future<Output = ActivationCompletion>>>,
+    retained: Option<RetainedActivationIdentity>,
+}
+
+/// Sole owner of activation state in `run_loop`. `Idle` means no activation
+/// work is outstanding; `InFlight` holds the one pending step. No second
+/// owner and no second concurrent activation exist.
+enum ActivationFlight {
+    Idle,
+    InFlight(ActivationFlightState),
+}
+
+/// Pure tick gate: the activation timer starts work only when the flight is
+/// idle. The in-flight future is polled in its own `select!` branch.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ActivationTickDecision {
+    StartClaim,
+    SkipInFlight,
+}
+
+fn decide_activation_tick(flight: &ActivationFlight) -> ActivationTickDecision {
+    match flight {
+        ActivationFlight::Idle => ActivationTickDecision::StartClaim,
+        ActivationFlight::InFlight(_) => ActivationTickDecision::SkipInFlight,
+    }
+}
 
 #[derive(Debug, Serialize)]
 #[serde(tag = "status", rename_all = "snake_case")]
@@ -92,9 +174,35 @@ pub(super) fn run() -> Result<(), String> {
     let loop_result = runtime.block_on(run_loop(Arc::clone(&kernel), &composition));
     let shutdown_result = composition.shutdown().map_err(|error| error.to_string());
     match (loop_result, shutdown_result) {
-        (Ok(()), Ok(())) => Ok(()),
+        (Ok(RunLoopExit::Shutdown), Ok(())) => Ok(()),
+        (
+            Ok(RunLoopExit::ShutdownActivationUnknown {
+                ticket_id,
+                result_sha256,
+                detail,
+            }),
+            Ok(()),
+        ) => Err(report_terminal_failure(
+            &kernel,
+            format!(
+                "daemon shutdown with activation submit unknown ticket {ticket_id} result {result_sha256}: {detail}"
+            ),
+        )),
+        (Ok(RunLoopExit::Shutdown), Err(error)) => Err(report_terminal_failure(&kernel, error)),
+        (
+            Ok(RunLoopExit::ShutdownActivationUnknown {
+                ticket_id,
+                result_sha256,
+                detail,
+            }),
+            Err(shutdown_error),
+        ) => Err(report_terminal_failure(
+            &kernel,
+            format!(
+                "daemon shutdown with activation submit unknown ticket {ticket_id} result {result_sha256}: {detail}; shutdown: {shutdown_error}"
+            ),
+        )),
         (Err(error), Ok(())) => Err(report_terminal_failure(&kernel, error)),
-        (Ok(()), Err(error)) => Err(report_terminal_failure(&kernel, error)),
         (Err(error), Err(shutdown_error)) => Err(report_terminal_failure(
             &kernel,
             format!("{error}; shutdown: {shutdown_error}"),
@@ -196,47 +304,162 @@ impl LoopCadence {
 async fn run_loop(
     kernel: Arc<DaemonKernelClient>,
     composition: &DaemonComposition,
-) -> Result<(), String> {
+) -> Result<RunLoopExit, String> {
     let mut cadence = LoopCadence::production();
+    // Sole owner of activation state. No second owner and no second
+    // concurrent activation exist: the timer starts work only when idle and
+    // the in-flight step is polled only in its own branch below.
+    let mut flight = ActivationFlight::Idle;
     loop {
         tokio::select! {
             signal = tokio::signal::ctrl_c() => {
                 signal.map_err(|error| format!("daemon shutdown signal: {error}"))?;
-                return Ok(());
+                return drain_activation_on_shutdown(&mut flight).await;
             }
             _ = cadence.activation_poll.tick() => {
-                if let Some(ticket) = kernel
-                    .claim_agent_activation_ticket()
-                    .await
-                    .map_err(|error| format!("Kernel activation ticket claim: {error}"))?
-                {
-                    let now = unix_ms(SystemTime::now())?;
-                    if activation_deadline_expired(now, ticket.kernel_deadline_unix_ms) {
-                        // Kernel owns the typed expiry outcome.  Do not call
-                        // the resolver at or after its exact deadline, and do
-                        // not submit or reconcile an expired ticket.
-                        continue;
+                if decide_activation_tick(&flight) != ActivationTickDecision::StartClaim {
+                    continue;
+                }
+                let kernel_clone = Arc::clone(&kernel);
+                let future: Pin<Box<dyn std::future::Future<Output = ActivationCompletion>>> =
+                    Box::pin(async move {
+                        let outcome: Result<
+                            Option<AgentActivationResolutionTicket>,
+                            String,
+                        > = kernel_clone
+                            .claim_agent_activation_ticket()
+                            .await
+                            .map_err(|error| {
+                                format!("Kernel activation ticket claim: {error}")
+                            });
+                        ActivationCompletion::Claim(outcome)
+                    });
+                flight = ActivationFlight::InFlight(ActivationFlightState {
+                    future,
+                    retained: None,
+                });
+            }
+            completion = async {
+                match &mut flight {
+                    ActivationFlight::Idle => {
+                        std::future::pending::<ActivationCompletion>().await
                     }
-                    // Single v2 resolution per newly admitted ticket.  The v2
-                    // resolver maps all seven Governor outcomes to typed
-                    // results; any Err is a real validation/readiness failure
-                    // and must fail closed rather than silently discarding a
-                    // disposition.
-                    let result = composition
-                        .resolve_agent_activation_v2(&ticket, now)
-                        .map_err(|error| {
-                            format!(
-                                "daemon activation resolve ticket {}: {error}",
-                                ticket.ticket_id
+                    ActivationFlight::InFlight(state) => (&mut state.future).await,
+                }
+            } => {
+                match completion {
+                    ActivationCompletion::Claim(claim_outcome) => {
+                        let ticket = match claim_outcome {
+                            Err(error) => return Err(error),
+                            Ok(None) => {
+                                flight = ActivationFlight::Idle;
+                                continue;
+                            }
+                            Ok(Some(ticket)) => ticket,
+                        };
+                        let now = unix_ms(SystemTime::now())?;
+                        if activation_deadline_expired(now, ticket.kernel_deadline_unix_ms) {
+                            // Kernel owns the typed expiry outcome.  Do not call
+                            // the resolver at or after its exact deadline, and do
+                            // not submit or reconcile an expired ticket.
+                            flight = ActivationFlight::Idle;
+                            continue;
+                        }
+                        // Single v2 resolution per newly admitted ticket.  The v2
+                        // resolver maps all seven Governor outcomes to typed
+                        // results; any Err is a real validation/readiness failure
+                        // and must fail closed rather than silently discarding a
+                        // disposition.
+                        let result = composition
+                            .resolve_agent_activation_v2(&ticket, now)
+                            .map_err(|error| {
+                                format!(
+                                    "daemon activation resolve ticket {}: {error}",
+                                    ticket.ticket_id
+                                )
+                            })?;
+                        let retained = RetainedActivationIdentity {
+                            ticket_id: ticket.ticket_id.clone(),
+                            result_sha256: result.result_sha256.clone(),
+                        };
+                        let kernel_clone = Arc::clone(&kernel);
+                        let future: Pin<
+                            Box<dyn std::future::Future<Output = ActivationCompletion>>,
+                        > = Box::pin(async move {
+                            let outcome = dispatch_agent_activation_result(
+                                &kernel_clone,
+                                &ticket,
+                                result,
                             )
-                        })?;
-                    dispatch_agent_activation_result(&kernel, &ticket, result).await?;
+                            .await;
+                            ActivationCompletion::Dispatch(outcome)
+                        });
+                        flight = ActivationFlight::InFlight(ActivationFlightState {
+                            future,
+                            retained: Some(retained),
+                        });
+                    }
+                    ActivationCompletion::Dispatch(dispatch_outcome) => match dispatch_outcome {
+                        Ok(()) => {
+                            flight = ActivationFlight::Idle;
+                        }
+                        Err(ActivationDispatchError::Hard(error)) => return Err(error),
+                        Err(ActivationDispatchError::Unknown { detail, .. }) => {
+                            return Err(detail);
+                        }
+                    },
                 }
             }
             _ = cadence.health_heartbeat.tick() => {
                 KernelTransitionPort::health(&*kernel)
                     .await
                     .map_err(|error| format!("Kernel health heartbeat: {error}"))?;
+            }
+        }
+    }
+}
+
+/// Bounded shutdown drain for one in-flight activation. Never starts new
+/// work, never recomputes under a new id, and never silently drops an
+/// ambiguous submit: the original ticket/result identity is retained and a
+/// timeout or unknown retention surfaces a typed unknown outcome.
+async fn drain_activation_on_shutdown(
+    flight: &mut ActivationFlight,
+) -> Result<RunLoopExit, String> {
+    let previous = std::mem::replace(flight, ActivationFlight::Idle);
+    let ActivationFlight::InFlight(state) = previous else {
+        return Ok(RunLoopExit::Shutdown);
+    };
+    let retained = state.retained;
+    match tokio::time::timeout(SHUTDOWN_ACTIVATION_DRAIN, state.future).await {
+        Ok(ActivationCompletion::Claim(claim_outcome)) => match claim_outcome {
+            Ok(None) => Ok(RunLoopExit::Shutdown),
+            Ok(Some(_)) => Ok(RunLoopExit::Shutdown),
+            Err(error) => Err(error),
+        },
+        Ok(ActivationCompletion::Dispatch(dispatch_outcome)) => match dispatch_outcome {
+            Ok(()) => Ok(RunLoopExit::Shutdown),
+            Err(ActivationDispatchError::Hard(error)) => Err(error),
+            Err(ActivationDispatchError::Unknown {
+                ticket_id,
+                result_sha256,
+                detail,
+            }) => Ok(RunLoopExit::ShutdownActivationUnknown {
+                ticket_id,
+                result_sha256,
+                detail,
+            }),
+        },
+        Err(_) => {
+            if let Some(identity) = retained {
+                Ok(RunLoopExit::ShutdownActivationUnknown {
+                    ticket_id: identity.ticket_id,
+                    result_sha256: identity.result_sha256,
+                    detail: "daemon shutdown drain timed out with activation submit outstanding; original ticket/result identity retained, no recompute"
+                        .to_owned(),
+                })
+            } else {
+                Ok(RunLoopExit::Shutdown)
             }
         }
     }
@@ -256,73 +479,108 @@ async fn dispatch_agent_activation_result(
     kernel: &DaemonKernelClient,
     ticket: &AgentActivationResolutionTicket,
     result: AgentActivationResolutionResult,
-) -> Result<(), String> {
+) -> Result<(), ActivationDispatchError> {
     observe_transient_deferral(&result);
     match kernel.submit_agent_activation_result(&result).await {
-        Ok(ack) => {
-            if ack.ticket_id != ticket.ticket_id
-                || ack.ticket_id != result.ticket_id
-                || ack.result_sha256 != result.result_sha256
-            {
-                return Err(format!(
-                    "Kernel activation result ack ticket {} binding mismatch",
-                    ticket.ticket_id
-                ));
-            }
-            match ack.outcome {
-                AgentActivationResultAckOutcome::Accepted
-                | AgentActivationResultAckOutcome::ExactReplay
-                | AgentActivationResultAckOutcome::Reconciled => Ok(()),
-                AgentActivationResultAckOutcome::Unknown => Err(format!(
-                    "Kernel activation result ack ticket {} unknown without retention",
-                    ticket.ticket_id
-                )),
-            }
-        }
+        Ok(ack) => classify_submit_ack(ticket, &result, &ack),
         Err(submit_error) => {
             // The submit may have committed before the acknowledgement was
             // lost. Retain the exact ticket/result identity and reconcile
             // from Kernel retention before any second Governor read. Do not
             // recompute a different result here.
-            let query = AgentActivationResultReconcile::new(
-                ticket.ticket_id.clone(),
-                result.result_sha256.clone(),
-            )
-            .map_err(|error| {
-                format!(
-                    "daemon activation reconcile ticket {} query: {error}",
-                    ticket.ticket_id
-                )
-            })?;
+            let submit_detail = submit_error.to_string();
+            let query = retained_reconcile_query(ticket, &result)?;
             let ack = kernel
                 .reconcile_agent_activation_result(&query)
                 .await
                 .map_err(|error| {
-                    format!(
-                        "Kernel activation result reconcile ticket {}: {error}; submit: {submit_error}",
+                    ActivationDispatchError::Hard(format!(
+                        "Kernel activation result reconcile ticket {}: {error}; submit: {submit_detail}",
                         ticket.ticket_id
-                    )
+                    ))
                 })?;
-            match ack.outcome {
-                AgentActivationResultAckOutcome::Accepted
-                | AgentActivationResultAckOutcome::ExactReplay
-                | AgentActivationResultAckOutcome::Reconciled => {
-                    if ack.ticket_id != ticket.ticket_id
-                        || ack.result_sha256 != result.result_sha256
-                    {
-                        return Err(format!(
-                            "Kernel activation result reconcile ticket {} binding mismatch",
-                            ticket.ticket_id
-                        ));
-                    }
-                    Ok(())
-                }
-                AgentActivationResultAckOutcome::Unknown => Err(format!(
-                    "Kernel activation result submit ticket {} failed without retention: {submit_error}",
-                    ticket.ticket_id
-                )),
-            }
+            classify_reconcile_ack(ticket, &result, &ack, &submit_detail)
         }
+    }
+}
+
+/// Builds the lost-acknowledgement reconcile query from the single retained
+/// result. The ticket id and result digest are cloned verbatim; no second
+/// Governor read and no recompute occur here.
+fn retained_reconcile_query(
+    ticket: &AgentActivationResolutionTicket,
+    result: &AgentActivationResolutionResult,
+) -> Result<AgentActivationResultReconcile, ActivationDispatchError> {
+    AgentActivationResultReconcile::new(ticket.ticket_id.clone(), result.result_sha256.clone())
+        .map_err(|error| {
+            ActivationDispatchError::Hard(format!(
+                "daemon activation reconcile ticket {} query: {error}",
+                ticket.ticket_id
+            ))
+        })
+}
+
+/// Classifies a submit acknowledgement against the retained identity. Unknown
+/// preserves the original ticket/result identity verbatim in a typed outcome
+/// instead of silently dropping it.
+fn classify_submit_ack(
+    ticket: &AgentActivationResolutionTicket,
+    result: &AgentActivationResolutionResult,
+    ack: &AgentActivationResultAck,
+) -> Result<(), ActivationDispatchError> {
+    if ack.ticket_id != ticket.ticket_id
+        || ack.ticket_id != result.ticket_id
+        || ack.result_sha256 != result.result_sha256
+    {
+        return Err(ActivationDispatchError::Hard(format!(
+            "Kernel activation result ack ticket {} binding mismatch",
+            ticket.ticket_id
+        )));
+    }
+    match ack.outcome {
+        AgentActivationResultAckOutcome::Accepted
+        | AgentActivationResultAckOutcome::ExactReplay
+        | AgentActivationResultAckOutcome::Reconciled => Ok(()),
+        AgentActivationResultAckOutcome::Unknown => Err(ActivationDispatchError::Unknown {
+            ticket_id: ticket.ticket_id.clone(),
+            result_sha256: result.result_sha256.clone(),
+            detail: format!(
+                "Kernel activation result ack ticket {} unknown without retention",
+                ticket.ticket_id
+            ),
+        }),
+    }
+}
+
+/// Classifies a reconcile acknowledgement after a submit failure. The
+/// retained result is reused verbatim; Unknown preserves the original
+/// ticket/result identity verbatim and never triggers a recompute.
+fn classify_reconcile_ack(
+    ticket: &AgentActivationResolutionTicket,
+    result: &AgentActivationResolutionResult,
+    ack: &AgentActivationResultAck,
+    submit_detail: &str,
+) -> Result<(), ActivationDispatchError> {
+    match ack.outcome {
+        AgentActivationResultAckOutcome::Accepted
+        | AgentActivationResultAckOutcome::ExactReplay
+        | AgentActivationResultAckOutcome::Reconciled => {
+            if ack.ticket_id != ticket.ticket_id || ack.result_sha256 != result.result_sha256 {
+                return Err(ActivationDispatchError::Hard(format!(
+                    "Kernel activation result reconcile ticket {} binding mismatch",
+                    ticket.ticket_id
+                )));
+            }
+            Ok(())
+        }
+        AgentActivationResultAckOutcome::Unknown => Err(ActivationDispatchError::Unknown {
+            ticket_id: ticket.ticket_id.clone(),
+            result_sha256: result.result_sha256.clone(),
+            detail: format!(
+                "Kernel activation result submit ticket {} failed without retention: {submit_detail}",
+                ticket.ticket_id
+            ),
+        }),
     }
 }
 
@@ -337,7 +595,13 @@ async fn dispatch_agent_activation_result(
 /// on the submit path.
 fn observe_transient_deferral(result: &AgentActivationResolutionResult) {
     if result.is_transient_retry() {
-        let _ = transient_not_before(result);
+        if let Some(not_before) = transient_not_before(result) {
+            TRANSIENT_DEFERRAL_OBSERVED.fetch_add(1, Ordering::Relaxed);
+            eprintln!(
+                "eliotd transient activation deferral ticket {} not_before {not_before}",
+                result.ticket_id
+            );
+        }
     }
 }
 
@@ -487,5 +751,134 @@ mod tests {
 
         assert!(error.contains("daemon status encode/write"));
         assert!(error.contains("injected status output failure"));
+    }
+
+    #[tokio::test]
+    async fn activation_flight_gates_second_start_and_keeps_health_and_shutdown_pollable() {
+        assert_eq!(
+            decide_activation_tick(&ActivationFlight::Idle),
+            ActivationTickDecision::StartClaim
+        );
+        let mut flight = ActivationFlight::InFlight(ActivationFlightState {
+            future: Box::pin(std::future::pending::<ActivationCompletion>()),
+            retained: None,
+        });
+        assert_eq!(
+            decide_activation_tick(&flight),
+            ActivationTickDecision::SkipInFlight
+        );
+
+        let mut cadence =
+            LoopCadence::with_periods(Duration::from_millis(5), Duration::from_millis(10));
+        let deadline = Instant::now() + Duration::from_millis(300);
+        let mut health_served = false;
+        let mut shutdown_served = false;
+        let mut activation_ticks = 0_u32;
+        let shutdown = tokio::time::sleep(Duration::from_millis(60));
+        tokio::pin!(shutdown);
+        while !health_served || !shutdown_served {
+            tokio::select! {
+                _ = cadence.activation_poll.tick() => {
+                    assert_eq!(
+                        decide_activation_tick(&flight),
+                        ActivationTickDecision::SkipInFlight
+                    );
+                    activation_ticks += 1;
+                }
+                completion = async {
+                    match &mut flight {
+                        ActivationFlight::Idle => {
+                            std::future::pending::<ActivationCompletion>().await
+                        }
+                        ActivationFlight::InFlight(state) => (&mut state.future).await,
+                    }
+                } => {
+                    let _ = completion;
+                    panic!("never-completing activation future must stay pending");
+                }
+                _ = cadence.health_heartbeat.tick() => {
+                    health_served = true;
+                }
+                () = &mut shutdown => {
+                    shutdown_served = true;
+                }
+                () = tokio::time::sleep_until(deadline) => {
+                    panic!("health/shutdown starved by never-completing activation");
+                }
+            }
+        }
+        assert!(health_served && shutdown_served);
+        assert!(activation_ticks >= 1);
+    }
+
+    #[test]
+    fn submit_failure_reconcile_unknown_reuses_original_identity() {
+        use std::cell::Cell;
+        use std::num::NonZeroU64;
+
+        use eliot_contracts::{EpochId, EpochLineageId, RequestId, ResourceGeneration, StateFence};
+        use eliot_protocol::{AgentActivationResultAck, AgentActivationRetryDirective};
+
+        const LINEAGE: &str = "550e8400-e29b-41d4-a716-446655440000";
+        let epoch = EpochId::new(
+            EpochLineageId::new(LINEAGE).expect("valid lineage"),
+            NonZeroU64::new(1).expect("nonzero sequence"),
+        )
+        .expect("valid epoch");
+        let fence = StateFence::new(epoch, ResourceGeneration::new(1).expect("generation"));
+        let ticket = AgentActivationResolutionTicket {
+            wire_id: eliot_protocol::AGENT_ACTIVATION_RESOLUTION_TICKET_WIRE_ID.to_owned(),
+            wire_version: eliot_protocol::AGENT_ACTIVATION_RESOLUTION_TICKET_WIRE_VERSION,
+            ticket_id: "ticket-1".to_owned(),
+            activation_request_id: RequestId::new("activation-request-1").expect("request id"),
+            activation_request_sha256: "a".repeat(64),
+            peer_admission_receipt_sha256: "b".repeat(64),
+            connection_id: "connection-1".to_owned(),
+            state_fence: fence,
+            kernel_deadline_unix_ms: 100,
+            ticket_sha256: String::new(),
+        }
+        .with_computed_digest()
+        .expect("valid ticket");
+
+        let resolver_calls = Cell::new(0_u32);
+        let resolve_once = || {
+            resolver_calls.set(resolver_calls.get() + 1);
+            AgentActivationResolutionResult::new(
+                &ticket,
+                50,
+                AgentActivationResolutionDisposition::NotReady {
+                    recovery_handle: "recovery-1".to_owned(),
+                    retry: AgentActivationRetryDirective {
+                        dependency_ref: "dep-1".to_owned(),
+                        observed_dependency_revision: "rev-1".to_owned(),
+                        not_before_unix_ms: 75,
+                    },
+                },
+            )
+            .expect("valid test result")
+        };
+        let result = resolve_once();
+        let original_ticket = ticket.ticket_id.clone();
+        let original_sha = result.result_sha256.clone();
+
+        let query = retained_reconcile_query(&ticket, &result).expect("reconcile query");
+        assert_eq!(query.ticket_id, original_ticket);
+        assert_eq!(query.result_sha256, original_sha);
+
+        let ack = AgentActivationResultAck::unknown(&query).expect("unknown ack");
+        match classify_reconcile_ack(&ticket, &result, &ack, "injected submit transport failure") {
+            Err(ActivationDispatchError::Unknown {
+                ticket_id,
+                result_sha256,
+                detail,
+            }) => {
+                assert_eq!(ticket_id, original_ticket);
+                assert_eq!(result_sha256, original_sha);
+                assert!(detail.contains(&original_ticket));
+            }
+            other => panic!("expected typed Unknown, got {other:?}"),
+        }
+        assert_eq!(resolver_calls.get(), 1);
     }
 }
