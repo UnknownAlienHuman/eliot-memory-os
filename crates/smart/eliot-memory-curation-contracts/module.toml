@@ -26,7 +26,7 @@ failure_behavior = "Return incomplete/unsupported screen status with exact omiss
 proof_surface = ["schema round-trip", "protection-role compatibility", "bounded coverage fixtures", "no-action authority tests"]
 replacement_boundary = "screening protocol; screen algorithm and Dreamer handlers remain independent"
 split_trigger = "screen request/result versions diverge from finding/protection vocabulary"
-rust_contract_dependencies = ["eliot-contracts", "eliot-evidence"]
+rust_contract_dependencies = ["eliot-contracts", "eliot-evidence", "eliot-agent-contracts", "eliot-receipts"]
 
 [[donor]]
 path = "crates/smart/eliot-memory-curation/src/lib.rs"
