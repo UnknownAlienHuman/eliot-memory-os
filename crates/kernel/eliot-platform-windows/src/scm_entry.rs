@@ -58,6 +58,13 @@ pub const MAX_SERVICE_ARG_UNITS: usize = 64 * 1024;
 /// Equivalent to `windows_sys`'s `LPSERVICE_MAIN_FUNCTIONW` payload without
 /// the `Option` wrapper: a dispatch-table entry always names a real callback,
 /// so `None` is not representable here.
+// SAFETY: StartServiceCtrlDispatcherW dispatch-table ABI — the
+// SERVICE_TABLE_ENTRY array and UTF-16 service name are caller-provided
+// stack locals that outlive the blocking dispatcher call; the table is
+// null-terminated, bounding SCM's walk; this fn item has process lifetime
+// with no captures and no borrowed state crossing into SCM; SCM invokes it
+// on its own thread, and the argv wide pointer is NUL-terminated UTF-16
+// valid for the callback duration under the extern "system" ABI.
 pub type ServiceMainFn = unsafe extern "system" fn(u32, *mut *mut u16);
 
 /// Extended service-control handler invoked by SCM.
@@ -65,6 +72,10 @@ pub type ServiceMainFn = unsafe extern "system" fn(u32, *mut *mut u16);
 /// Equivalent to `windows_sys`'s `LPHANDLER_FUNCTION_EX` payload without the
 /// `Option` wrapper. Must be a `fn` item with process lifetime; see the
 /// module-level safety invariants.
+// SAFETY: RegisterServiceCtrlHandlerExW handler ABI — a process-lifetime
+// fn item with no captures; the NULL context carries no borrowed state
+// into SCM; SCM invokes this callback on its control thread, and the
+// handler returns promptly with no unwind across the extern boundary.
 pub type ServiceControlHandlerFn =
     unsafe extern "system" fn(u32, u32, *mut std::ffi::c_void, *mut std::ffi::c_void) -> u32;
 
