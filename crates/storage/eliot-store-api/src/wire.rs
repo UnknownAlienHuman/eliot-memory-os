@@ -16,11 +16,12 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 use crate::{
-    CanonicalValidationSnapshot, ExactJsonBytes, MAX_STORE_FAILURE_DETAIL_LEN, NamedReadRequest,
-    NamedReadResponse, OperationId, OrderingHead, OrderingHeadExpectation, OrderingScopeId,
-    PreparedTransition, RequestMeta, RevisionHead, RevisionHeadExpectation, RevisionKey,
-    StoreError, StoreGenesisRequest, StoreHealth, StoreRecoveryRequest, StoreRecoverySnapshot,
-    WriteReceipt, json_shape_name,
+    CanonicalRequestView, CanonicalValidationSnapshot, ExactJsonBytes,
+    MAX_STORE_FAILURE_DETAIL_LEN, NamedReadRequest, NamedReadResponse, OperationId, OrderingHead,
+    OrderingHeadExpectation, OrderingScopeId, PreparedTransition, RequestMeta, RevisionHead,
+    RevisionHeadExpectation, RevisionKey, StoreError, StoreGenesisRequest, StoreHealth,
+    StoreRecoveryRequest, StoreRecoverySnapshot, WriteReceipt, json_shape_name,
+    verify_canonical_request_hash,
 };
 use schemars::JsonSchema;
 
@@ -238,6 +239,51 @@ impl StoreRequest {
             Self::ValidationSnapshot => CAPABILITY_VALIDATION_SNAPSHOT,
             Self::Recovery { .. } => CAPABILITY_RECOVERY,
             Self::InitializeGenesis { .. } => CAPABILITY_INITIALIZE_GENESIS,
+        }
+    }
+
+    /// Builds the shared canonical-request view for an `Apply` request.
+    ///
+    /// This rebinds the separately transported `context` and expected heads
+    /// around the prepared transition (issue #63, RECHECK-63 slice A). The
+    /// wire format is unchanged: every field is already transported, only
+    /// reassembled here for the Kernel/store recompute path. Returns `None`
+    /// for non-`Apply` variants, which carry no executable-request digest.
+    #[must_use]
+    pub fn apply_canonical_request_view(&self) -> Option<CanonicalRequestView> {
+        match self {
+            Self::Apply {
+                context,
+                transition,
+                expected_revision_heads,
+                expected_ordering_heads,
+            } => Some(CanonicalRequestView::from_apply(
+                context,
+                transition,
+                expected_revision_heads,
+                expected_ordering_heads,
+            )),
+            _ => None,
+        }
+    }
+
+    /// Recomputes the canonical request hash for an `Apply` request and
+    /// rejects divergence with [`StoreError::TransitionDigestMismatch`].
+    ///
+    /// Non-`Apply` variants carry no executable-request digest and validate
+    /// as `Ok`. Kernel/store call this before idempotency lookup and
+    /// transaction so a separately transported load-bearing field cannot
+    /// silently diverge from the admitted digest.
+    pub fn verify_apply_canonical_hash(&self) -> Result<(), StoreError> {
+        match self {
+            Self::Apply { transition, .. } => match self.apply_canonical_request_view() {
+                Some(view) => verify_canonical_request_hash(
+                    &view,
+                    &transition.identity.canonical_request_hash,
+                ),
+                None => Ok(()),
+            },
+            _ => Ok(()),
         }
     }
 
@@ -1207,5 +1253,50 @@ mod tests {
             serde_json::to_string(&tampered).expect("tampered authority encodes"),
         );
         assert!(decode_request_frame_with_authority(&substituted).is_err());
+    }
+
+    #[test]
+    fn apply_canonical_hash_verifies_the_recomputed_digest() {
+        use crate::{OrderingHeadExpectation, RevisionHeadExpectation};
+        let (context, mut transition) = apply_parts(BTreeMap::from([(
+            "subject".to_owned(),
+            json!("observation-1"),
+        )]));
+        let fence = context.state_fence.clone();
+        let revision_heads = vec![RevisionHeadExpectation {
+            key: crate::RevisionKey::new("scope:one").expect("key"),
+            expected_revision: 1,
+            state_fence: fence.clone(),
+        }];
+        let ordering_heads = vec![OrderingHeadExpectation {
+            scope: OrderingScopeId::new("scope-authority").expect("ordering"),
+            expected_sequence: 1,
+            state_fence: fence,
+        }];
+        // The placeholder digest diverges from the recomputed request hash.
+        let stale = StoreRequest::Apply {
+            context: context.clone(),
+            transition: transition.clone(),
+            expected_revision_heads: revision_heads.clone(),
+            expected_ordering_heads: ordering_heads.clone(),
+        };
+        assert!(matches!(
+            stale.verify_apply_canonical_hash(),
+            Err(crate::StoreError::TransitionDigestMismatch { .. })
+        ));
+        // The recomputed digest verifies; non-apply variants carry no digest.
+        let view = stale
+            .apply_canonical_request_view()
+            .expect("apply view builds");
+        transition.identity.canonical_request_hash =
+            crate::canonical_request_hash(&view).expect("digest computes");
+        let fresh = StoreRequest::Apply {
+            context,
+            transition,
+            expected_revision_heads: revision_heads,
+            expected_ordering_heads: ordering_heads,
+        };
+        assert!(fresh.verify_apply_canonical_hash().is_ok());
+        assert!(StoreRequest::Health.verify_apply_canonical_hash().is_ok());
     }
 }
