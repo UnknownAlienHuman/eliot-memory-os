@@ -144,7 +144,6 @@
       "strategy": "TARGETED_EXTRACTION_AND_HARDENING",
       "main_nonconformant_boundary": "Scalar epochs, ordinary-workload reserve use, process Session conflation and broad composition violate the small failure-surviving Kernel target.",
       "owner_issues": [
-        15,
         63,
         64,
         65,
@@ -544,7 +543,6 @@
       "strategy": "KEEP_AND_REPAIR_OPERATION_LINEAGE",
       "main_nonconformant_boundary": "Verify, admit, reserve, delivery verification and commit reuse one RequestIdentity despite distinct effects.",
       "owner_issues": [
-        13,
         64,
         78
       ],
@@ -580,7 +578,6 @@
         7,
         8,
         9,
-        13,
         64,
         66,
         77,
@@ -666,9 +663,7 @@
       "main_nonconformant_boundary": "Static source/build/signing evidence is not an installed runtime; SCM, ACL, credentials, process lineage, store ownership and failure recovery remain unobserved.",
       "owner_issues": [
         11,
-        13,
         14,
-        15,
         18,
         19
       ],
