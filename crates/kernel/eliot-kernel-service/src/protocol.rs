@@ -26,6 +26,7 @@ use crate::{KernelServiceError, KernelServiceState, validate_text};
 mod native_worker_claim;
 mod native_worker_replay;
 mod process_authority_handoff;
+mod provider_capability;
 pub use native_worker_claim::{
     NATIVE_WORKER_CLAIM_WIRE_ID, NATIVE_WORKER_CLAIM_WIRE_VERSION,
     NATIVE_WORKER_CLAIM_WIRE_VERSION_V1, NATIVE_WORKER_EXECUTABLE_BINDING_EXPECTED_WIRE_VERSION,
@@ -49,6 +50,10 @@ pub use native_worker_replay::{
     NativeWorkerReplayStreamPosition, admit_replay_request, replay_stream_id,
 };
 pub use process_authority_handoff::ProcessAuthorityHandoffDescriptor;
+pub use provider_capability::{
+    PROVIDER_CAPABILITY_WIRE_VERSION, ProviderCapabilityError, ProviderCapabilityExpectation,
+    ProviderCapabilityRequest, ProviderProofKind, verify_provider_capability,
+};
 
 fn handle(value: &PlatformHandle, field: &'static str) -> Result<(), KernelServiceError> {
     validate_text(value.as_str(), field)

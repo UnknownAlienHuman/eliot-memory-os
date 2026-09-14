@@ -1402,6 +1402,45 @@ impl RedbRecoveryStore {
             .transpose()
     }
 
+    /// Reverse-resolves one claim identity from its bound attempt and
+    /// operation labels (T9-04 supplier core, issue #1108).
+    ///
+    /// Read-only: this performs no writes, creates no table, and grants no
+    /// authority. It scans the existing claim rows with early exit on the
+    /// first exact attempt-plus-operation match, mirroring the
+    /// `replay_events_in` full-table scan precedent. The scan carries no row
+    /// cap on purpose: a cap would turn a present row past the bound into a
+    /// false unknown. A corrupt or unreadable row ends the scan without a
+    /// match, so callers must confirm any hit with
+    /// [`Self::load_native_worker_claim`] under the exact claim identity and
+    /// treat `None` as "no durable binding observed", never as proof of
+    /// absence. There is deliberately no reverse index and no second writer:
+    /// the claim table stays the single owner of claim state.
+    pub fn find_native_worker_claim_id_by_attempt_operation(
+        &self,
+        attempt_id: &str,
+        operation_id: &str,
+    ) -> Option<String> {
+        if crate::model::validate_text(attempt_id, "native_worker_claim_attempt_id").is_err()
+            || crate::model::validate_text(operation_id, "native_worker_claim_operation_id")
+                .is_err()
+        {
+            return None;
+        }
+        let read = self.database.begin_read().ok()?;
+        let table = read.open_table(NATIVE_WORKER_CLAIMS).ok()?;
+        for row in table.iter().ok()? {
+            let (_, value) = row.ok()?;
+            let record: crate::NativeWorkerClaimRecord = decode(value.value()).ok()?;
+            if record.attempt_id.as_str() == attempt_id
+                && record.operation_id.as_str() == operation_id
+            {
+                return Some(record.claim_id.as_str().to_owned());
+            }
+        }
+        None
+    }
+
     /// Advances one staged claim to its next mechanical state.
     ///
     /// The transition table owns the anti-downgrade fence: `Terminal` is
