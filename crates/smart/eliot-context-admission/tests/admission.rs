@@ -9,8 +9,8 @@ use eliot_agent_contracts::AgentAttemptId;
 use eliot_context_admission::admit_context;
 use eliot_context_contracts::*;
 use eliot_contracts::{
-    ArtifactId, AuthorityEpoch, DecisionId, ResourceGeneration, SourceId, StateFence, TaskId,
-    TaskRevision,
+    ArtifactId, DecisionId, EpochId, EpochLineageId, ResourceGeneration, SourceId, StateFence,
+    TaskId, TaskRevision,
 };
 use eliot_evidence::{Assertability, EpistemicStatus};
 use eliot_receipts::{ProofCeiling, WorkScopeId};
@@ -23,9 +23,17 @@ fn digest(byte: u8) -> String {
     char::from(byte).to_string().repeat(64)
 }
 
+fn test_epoch() -> EpochId {
+    EpochId::new(
+        EpochLineageId::new("550e8400-e29b-41d4-a716-446655440000").expect("lineage"),
+        std::num::NonZeroU64::new(1).expect("sequence"),
+    )
+    .expect("epoch")
+}
+
 fn binding() -> ContextBinding {
     let mut fence = StateFence::new(
-        AuthorityEpoch::new(1).expect("epoch"),
+        test_epoch(),
         ResourceGeneration::new(1).expect("generation"),
     );
     fence.task_revision = Some(TaskRevision::new(1).expect("task revision"));

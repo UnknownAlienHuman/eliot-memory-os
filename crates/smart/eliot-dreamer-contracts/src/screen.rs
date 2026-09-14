@@ -253,10 +253,17 @@ fn require_digest(field: &'static str, value: &str) -> Result<(), ContractViolat
 #[allow(clippy::expect_used)]
 mod tests {
     use super::*;
-    use eliot_contracts::{AuthorityEpoch, ResourceGeneration};
+    use eliot_contracts::{EpochId, EpochLineageId, ResourceGeneration};
+    use std::num::NonZeroU64;
 
     fn fence() -> StateFence {
-        StateFence::new(AuthorityEpoch::genesis(), ResourceGeneration::genesis())
+        let epoch = EpochId::new(
+            EpochLineageId::new("550e8400-e29b-41d4-a716-446655440000")
+                .expect("canonical test lineage-A"),
+            NonZeroU64::new(1).expect("non-zero test sequence"),
+        )
+        .expect("valid test epoch");
+        StateFence::new(epoch, ResourceGeneration::genesis())
     }
 
     fn valid_reference() -> ScreenReference {

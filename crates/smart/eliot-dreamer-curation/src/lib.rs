@@ -1913,7 +1913,8 @@ fn unprocessed_set(
 #[allow(clippy::expect_used)]
 mod tests {
     use super::*;
-    use eliot_contracts::{AuthorityEpoch, ReceiptId, RequestId, ResourceGeneration};
+    use eliot_contracts::{EpochId, EpochLineageId, ReceiptId, RequestId, ResourceGeneration};
+    use std::num::NonZeroU64;
     use eliot_dreamer_contracts::CurationHandlerDescriptor;
     use eliot_dreamer_contracts::curation::{
         AccessibilityPayload, ClassificationPayload, ConceptPayload, EpisodePayload,
@@ -1923,7 +1924,13 @@ mod tests {
     use std::cell::Cell;
 
     fn test_fence() -> StateFence {
-        StateFence::new(AuthorityEpoch::genesis(), ResourceGeneration::genesis())
+        let epoch = EpochId::new(
+            EpochLineageId::new("550e8400-e29b-41d4-a716-446655440000")
+                .expect("canonical test lineage-A"),
+            NonZeroU64::new(1).expect("non-zero test sequence"),
+        )
+        .expect("valid test epoch");
+        StateFence::new(epoch, ResourceGeneration::genesis())
     }
 
     fn test_receipt() -> ValidationReceipt {

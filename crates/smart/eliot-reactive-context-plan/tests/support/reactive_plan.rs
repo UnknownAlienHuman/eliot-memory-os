@@ -7,7 +7,8 @@ use eliot_context_contracts::{
     AdmissionDisposition, AdmissionRecord, ReactiveDeliveryMode, SemanticRole,
 };
 use eliot_contracts::{
-    AuthorityEpoch, ClockReading, OperationId, ResourceGeneration, SourceId, StateFence, TaskId,
+    ClockReading, EpochId, EpochLineageId, OperationId, ResourceGeneration, SourceId, StateFence,
+    TaskId,
 };
 use eliot_cue_contracts::{
     ActivationBounds, ActivationBoundsSpec, ActivationRequest, ActivationRequestSpec,
@@ -45,7 +46,12 @@ struct AdmittedCanonical<'a> {
 
 pub fn fence() -> StateFence {
     StateFence::new(
-        AuthorityEpoch::new(1).unwrap(),
+        EpochId::new(
+            EpochLineageId::new("550e8400-e29b-41d4-a716-446655440000")
+                .expect("valid test lineage"),
+            std::num::NonZeroU64::new(1).expect("nonzero test sequence"),
+        )
+        .expect("valid test epoch"),
         ResourceGeneration::new(1).unwrap(),
     )
 }

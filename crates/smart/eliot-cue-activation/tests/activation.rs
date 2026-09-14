@@ -1,7 +1,8 @@
 #![allow(clippy::expect_used, clippy::unwrap_used)]
 
 use eliot_contracts::{
-    AuthorityEpoch, ClockReading, ReceiptId, ResourceGeneration, SourceId, StateFence, TaskId,
+    ClockReading, EpochId, EpochLineageId, ReceiptId, ResourceGeneration, SourceId, StateFence,
+    TaskId,
 };
 use eliot_cue_activation::{
     ActivationError, ActivationProfile, MatchRule, RelationRule, evaluate_activation,
@@ -25,8 +26,15 @@ use eliot_receipts::{ReceiptIdentity, WorkScopeId};
 fn digest(seed: u8) -> Digest {
     Digest::new(format!("{seed:02x}").repeat(32)).expect("digest")
 }
+fn test_epoch() -> EpochId {
+    EpochId::new(
+        EpochLineageId::new("550e8400-e29b-41d4-a716-446655440000").expect("lineage"),
+        std::num::NonZeroU64::new(1).expect("sequence"),
+    )
+    .expect("epoch")
+}
 fn fence() -> StateFence {
-    StateFence::new(AuthorityEpoch::genesis(), ResourceGeneration::genesis())
+    StateFence::new(test_epoch(), ResourceGeneration::genesis())
 }
 fn norm_profile() -> NormalizationProfile {
     NormalizationProfile::new("norm-v1".into(), 1, digest(1))

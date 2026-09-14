@@ -555,11 +555,19 @@ impl TypedCurationHandlerResult {
 }
 
 #[cfg(test)]
-use eliot_contracts::{AuthorityEpoch, ReceiptId, RequestId, ResourceGeneration};
+use eliot_contracts::{EpochId, EpochLineageId, ReceiptId, RequestId, ResourceGeneration};
+#[cfg(test)]
+use std::num::NonZeroU64;
 
 #[cfg(test)]
 pub(crate) fn fence() -> StateFence {
-    StateFence::new(AuthorityEpoch::genesis(), ResourceGeneration::genesis())
+    let epoch = EpochId::new(
+        EpochLineageId::new("550e8400-e29b-41d4-a716-446655440000")
+            .expect("canonical test lineage-A"),
+        NonZeroU64::new(1).expect("non-zero test sequence"),
+    )
+    .expect("valid test epoch");
+    StateFence::new(epoch, ResourceGeneration::genesis())
 }
 
 #[cfg(test)]
@@ -588,11 +596,20 @@ mod tests {
     use crate::curation::{CURATION_WIRE_KINDS, parse_kind, sample_payload};
     use crate::draft::{ValidatedCurationItem, valid_receipt};
     use crate::job::{Requester, RequesterOrigin};
-    use eliot_contracts::{AuthorityEpoch, ReceiptId, RequestId, ResourceGeneration, sha256_hex};
+    use eliot_contracts::{
+        EpochId, EpochLineageId, ReceiptId, RequestId, ResourceGeneration, sha256_hex,
+    };
+    use std::num::NonZeroU64;
 
     fn bumped_fence() -> StateFence {
         let gen2 = ResourceGeneration::new(2).expect("counter");
-        StateFence::new(AuthorityEpoch::genesis(), gen2)
+        let drift_epoch = EpochId::new(
+            EpochLineageId::new("550e8400-e29b-41d4-a716-446655440001")
+                .expect("canonical test lineage-B"),
+            NonZeroU64::new(1).expect("non-zero test sequence"),
+        )
+        .expect("valid test epoch");
+        StateFence::new(drift_epoch, gen2)
     }
     fn descriptor(f: CurationFamily, id: &str, k: Vec<CurationKind>) -> CurationHandlerDescriptor {
         CurationHandlerDescriptor {

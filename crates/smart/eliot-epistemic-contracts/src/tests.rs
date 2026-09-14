@@ -4,7 +4,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use eliot_contracts::{
-    ArtifactId, AuthorityEpoch, ContractId, OperationId, ProductId, ReceiptId, RequestId,
+    ArtifactId, ContractId, EpochId, EpochLineageId, OperationId, ProductId, ReceiptId, RequestId,
     ResourceGeneration, SourceId, StateFence, TaskId, TaskRevision, sha256_hex,
 };
 use eliot_evidence::{Assertability, EvidenceAuthority, EvidenceFreshness, VerificationBinding};
@@ -100,8 +100,18 @@ fn parse<T: DeserializeOwned>(wire: &str) -> Result<T, ContractError> {
 fn case_error(field: &'static str) -> ContractError {
     ContractError::Blank { field }
 }
+const TEST_LINEAGE_A: &str = "550e8400-e29b-41d4-a716-446655440000";
+const TEST_LINEAGE_B: &str = "550e8400-e29b-41d4-a716-446655440001";
+#[allow(clippy::expect_used)]
+fn case_epoch(lineage: &str, sequence: u64) -> EpochId {
+    EpochId::new(
+        EpochLineageId::new(lineage).expect("valid test lineage"),
+        std::num::NonZeroU64::new(sequence).expect("nonzero test sequence"),
+    )
+    .expect("valid test epoch")
+}
 fn case_fence() -> StateFence {
-    StateFence::new(AuthorityEpoch::genesis(), ResourceGeneration::genesis())
+    StateFence::new(case_epoch(TEST_LINEAGE_A, 1), ResourceGeneration::genesis())
 }
 fn artifact(value: &str) -> Result<ArtifactId, ContractError> {
     ArtifactId::new(value).map_err(|_| case_error("case.artifact"))
@@ -795,7 +805,7 @@ fn wrong_task_scope_fence_rejected() -> CaseResult {
         None,
     )?;
     let other_task = TaskId::new("task-other").map_err(|_| case_error("case.task"))?;
-    let epoch9 = AuthorityEpoch::new(9).map_err(|_| case_error("case.epoch"))?;
+    let epoch9 = case_epoch(TEST_LINEAGE_B, 9);
     let task_probe = record.validate_for(&other_task, "scope-580", &case_fence());
     expect_err!(task_probe, TaskMismatch, "support.task_id");
     let scope_probe = record.validate_for(&task()?, "scope-other", &case_fence());
@@ -1295,7 +1305,7 @@ fn changed_query_scope_fence_snapshot_invalidates_absence() -> CaseResult {
     let live_query = shape_digest(&live_spec)?;
     let other_query = sha256_hex("other-query".as_bytes());
     let genesis = case_fence();
-    let epoch7 = AuthorityEpoch::new(7).map_err(|_| case_error("case.epoch"))?;
+    let epoch7 = case_epoch(TEST_LINEAGE_B, 7);
     let drifted_fence = StateFence::new(epoch7, ResourceGeneration::genesis());
     let live = live_query.as_str();
     // One drifted axis per row: scope, query, snapshot, and fence each invalidate the claim.
@@ -2139,15 +2149,15 @@ fn transition_preserves_before_after_predecessor() -> CaseResult {
     let rev_check = drifted_rev.validate_closed(&inquiry, &drifted_candidate, &before, &after);
     expect_err!(rev_check, StaleContext, "transition.candidate_revision");
     // Fence drift fails at close through the shared work-scope equality chain.
-    let epoch9 = AuthorityEpoch::new(9).map_err(|_| case_error("case.epoch"))?;
+    let epoch9 = case_epoch(TEST_LINEAGE_B, 9);
     let mut drifted_fence = closed_movement.clone();
-    drifted_fence.expected_fence = StateFence::new(epoch9, ResourceGeneration::genesis());
+    drifted_fence.expected_fence = StateFence::new(epoch9.clone(), ResourceGeneration::genesis());
     drifted_fence.digest = drifted_fence.compute_digest()?;
     let fence_check = drifted_fence.validate_closed(&inquiry, &current, &before, &after);
     expect_err!(fence_check, FenceMismatch, "transition.work_scope");
     // Candidate fence drift fails the candidate work-scope pin first.
     let mut fenced_candidate = candidate()?;
-    fenced_candidate.fence = StateFence::new(epoch9, ResourceGeneration::genesis());
+    fenced_candidate.fence = StateFence::new(epoch9.clone(), ResourceGeneration::genesis());
     fenced_candidate.digest = fenced_candidate.compute_digest()?;
     let mut fence_drifted = closed_movement.clone();
     fence_drifted.candidate_digest = fenced_candidate.digest.clone();
@@ -2455,7 +2465,7 @@ fn malformed_input_bounded_panic_free() -> CaseResult {
 // WORK_UNIT_CASE: 580/46
 #[test]
 fn explicit_fence_and_lineage_survive_round_trip() -> CaseResult {
-    let epoch9 = AuthorityEpoch::new(9).map_err(|_| case_error("case.epoch"))?;
+    let epoch9 = case_epoch(TEST_LINEAGE_A, 9);
     let fence9 = StateFence::new(epoch9, ResourceGeneration::genesis());
     let content_a = sha256_hex("content-a".as_bytes());
     let content_b = sha256_hex("content-b".as_bytes());

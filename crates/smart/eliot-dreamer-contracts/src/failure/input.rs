@@ -772,7 +772,7 @@ mod tests {
     use crate::relation::{RelationPreservationDimension, RelationPreservationVerdict};
     use crate::screen::ScreenState;
     use eliot_contracts::{
-        ArtifactId, AuthorityEpoch, ClockReading, ContractId, ContractVersion, OperationId,
+        ArtifactId, ClockReading, ContractId, ContractVersion, EpochId, EpochLineageId, OperationId,
         ProductId, RequestId, ResourceGeneration, SourceId, StateFence, TaskId, TaskRevision,
         TransactionSequence, sha256_hex,
     };
@@ -785,6 +785,7 @@ mod tests {
         ReceiptDisposition, ReceiptEnvelope, ReceiptKind, RequestBinding, TaskBinding,
         VerifierBinding, WorkScopeBinding, WorkScopeId, contract_identity,
     };
+    use std::num::NonZeroU64;
 
     fn preservation() -> crate::relation::RelationPreservation {
         crate::relation::RelationPreservation {
@@ -800,12 +801,20 @@ mod tests {
                 .collect(),
         }
     }
+    fn test_epoch() -> EpochId {
+        EpochId::new(
+            EpochLineageId::new("550e8400-e29b-41d4-a716-446655440000")
+                .expect("canonical test lineage-A"),
+            NonZeroU64::new(1).expect("non-zero test sequence"),
+        )
+        .expect("valid test epoch")
+    }
     fn fence() -> StateFence {
-        StateFence::new(AuthorityEpoch::genesis(), ResourceGeneration::genesis())
+        StateFence::new(test_epoch(), ResourceGeneration::genesis())
     }
     fn distinct_fence(generation: u64) -> StateFence {
         StateFence::new(
-            AuthorityEpoch::genesis(),
+            test_epoch(),
             ResourceGeneration::new(generation).unwrap(),
         )
     }
@@ -873,7 +882,7 @@ mod tests {
             authority: AuthorityBinding {
                 authority_id: ContractId::new("authority-1").unwrap(),
                 authority_owner: "owner".into(),
-                authority_epoch: state_fence.authority_epoch,
+                authority_epoch: state_fence.authority_epoch.clone(),
                 state_fence,
                 allowed_effect: EffectClass::Candidate,
                 proof_ceiling: ProofCeiling::CandidateArtifact,

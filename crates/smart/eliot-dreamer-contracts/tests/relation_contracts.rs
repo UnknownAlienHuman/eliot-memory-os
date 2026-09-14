@@ -2,9 +2,10 @@
 #![allow(clippy::expect_used)]
 
 use eliot_contracts::{
-    ArtifactId, AuthorityEpoch, ReceiptId, RequestId, ResourceGeneration, SourceId, StateFence,
-    TaskId, sha256_hex,
+    ArtifactId, EpochId, EpochLineageId, ReceiptId, RequestId, ResourceGeneration, SourceId,
+    StateFence, TaskId, sha256_hex,
 };
+use std::num::NonZeroU64;
 use eliot_dreamer_contracts::curation::{RelationPayload, TargetEvidence};
 use eliot_dreamer_contracts::encoding::canonical_bytes;
 use eliot_dreamer_contracts::*;
@@ -21,7 +22,13 @@ fn digest(value: &str) -> String {
     sha256_hex(value.as_bytes())
 }
 fn fence() -> StateFence {
-    StateFence::new(AuthorityEpoch::genesis(), ResourceGeneration::genesis())
+    let epoch = EpochId::new(
+        EpochLineageId::new("550e8400-e29b-41d4-a716-446655440000")
+            .expect("canonical test lineage-A"),
+        NonZeroU64::new(1).expect("non-zero test sequence"),
+    )
+    .expect("valid test epoch");
+    StateFence::new(epoch, ResourceGeneration::genesis())
 }
 
 fn preservation() -> RelationPreservation {

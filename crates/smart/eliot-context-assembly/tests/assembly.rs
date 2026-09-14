@@ -7,8 +7,8 @@ use eliot_context_assembly::{
 };
 use eliot_context_contracts::*;
 use eliot_contracts::{
-    ArtifactId, AuthorityEpoch, DecisionId, ResourceGeneration, StateFence, TaskId, TaskRevision,
-    sha256_hex,
+    ArtifactId, DecisionId, EpochId, EpochLineageId, ResourceGeneration, StateFence, TaskId,
+    TaskRevision, sha256_hex,
 };
 use eliot_evidence::{Assertability, EpistemicStatus};
 use eliot_receipts::{ProofCeiling, WorkScopeId};
@@ -21,13 +21,21 @@ fn digest() -> String {
     "a".repeat(64)
 }
 
+fn test_epoch() -> EpochId {
+    EpochId::new(
+        EpochLineageId::new("550e8400-e29b-41d4-a716-446655440000").expect("lineage"),
+        std::num::NonZeroU64::new(1).expect("sequence"),
+    )
+    .expect("epoch")
+}
+
 fn binding() -> ContextBinding {
     ContextBinding {
         task_id: TaskId::new("task").expect("fixture task"),
         attempt_id: AgentAttemptId::new("attempt").expect("fixture attempt"),
         scope_id: WorkScopeId::new("scope").expect("fixture scope"),
         state_fence: StateFence::new(
-            AuthorityEpoch::new(1).expect("fixture epoch"),
+            test_epoch(),
             ResourceGeneration::new(1).expect("fixture generation"),
         ),
         decision_id: DecisionId::new("decision").expect("fixture decision"),

@@ -1,9 +1,10 @@
 #![allow(clippy::expect_used)]
 
 use eliot_contracts::{
-    ArtifactId, AuthorityEpoch, ReceiptId, RequestId, ResourceGeneration, SourceId, StateFence,
-    TaskId,
+    ArtifactId, EpochId, EpochLineageId, ReceiptId, RequestId, ResourceGeneration, SourceId,
+    StateFence, TaskId,
 };
+use std::num::NonZeroU64;
 use eliot_dreamer_classification::{
     ClassificationDisposition, ClassificationPolicy, EvidenceGradeBinding, classify,
     grade_binding_digest,
@@ -20,7 +21,13 @@ fn id(v: &str) -> ArtifactId {
     ArtifactId::new(v).expect("id")
 }
 fn fence() -> StateFence {
-    StateFence::new(AuthorityEpoch::genesis(), ResourceGeneration::genesis())
+    let epoch = EpochId::new(
+        EpochLineageId::new("550e8400-e29b-41d4-a716-446655440000")
+            .expect("canonical test lineage-A"),
+        NonZeroU64::new(1).expect("non-zero test sequence"),
+    )
+    .expect("valid test epoch");
+    StateFence::new(epoch, ResourceGeneration::genesis())
 }
 fn hash(v: &str) -> String {
     eliot_contracts::sha256_hex(v.as_bytes())

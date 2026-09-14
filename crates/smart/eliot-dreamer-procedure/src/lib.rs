@@ -2314,7 +2314,8 @@ fn collect_candidate_steps(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use eliot_contracts::{AuthorityEpoch, ResourceGeneration};
+    use eliot_contracts::{EpochId, EpochLineageId, ResourceGeneration};
+    use std::num::NonZeroU64;
     use eliot_dreamer_contracts::{
         AtomicityMode, ClaimResidue, Requester, RequesterOrigin, SupportState, TargetDenominator,
         curation::{ProcedurePayload, TargetEvidence},
@@ -2322,7 +2323,13 @@ mod tests {
 
     /// Returns the test state fence at genesis.
     fn test_fence() -> eliot_contracts::StateFence {
-        eliot_contracts::StateFence::new(AuthorityEpoch::genesis(), ResourceGeneration::genesis())
+        let epoch = EpochId::new(
+            EpochLineageId::new("550e8400-e29b-41d4-a716-446655440000")
+                .expect("canonical test lineage-A"),
+            NonZeroU64::new(1).expect("non-zero test sequence"),
+        )
+        .expect("valid test epoch");
+        eliot_contracts::StateFence::new(epoch, ResourceGeneration::genesis())
     }
 
     /// Returns a valid A-05 receipt for the test job and digests.
