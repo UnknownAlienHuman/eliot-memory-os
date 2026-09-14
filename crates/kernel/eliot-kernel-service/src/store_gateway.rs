@@ -17,9 +17,10 @@ use eliot_contracts::{OperationId, RequestMetadata, StateFence};
 use eliot_ipc::NamedPipeTransport;
 use eliot_kernel_core::GenerationRoute;
 use eliot_store_api::{
-    CanonicalStoreClient, CanonicalValidationSnapshot, OrderingHeadExpectation, PreparedTransition,
-    RequestMeta, RevisionHeadExpectation, StoreGenesisRequest, StoreHealth, StoreRecoveryRequest,
-    StoreRecoverySnapshot, WriteReceipt,
+    CanonicalRequestView, CanonicalStoreClient, CanonicalValidationSnapshot,
+    OrderingHeadExpectation, PreparedTransition, RequestMeta, RevisionHeadExpectation,
+    StoreGenesisRequest, StoreHealth, StoreRecoveryRequest, StoreRecoverySnapshot, WriteReceipt,
+    verify_canonical_request_hash,
 };
 
 use crate::{EbpCanonicalStoreClient, KernelService};
@@ -191,6 +192,21 @@ impl KernelStoreGateway {
         }
         if transition.state_fence != context.state_fence {
             return Err("transition state fence does not match request metadata".to_owned());
+        }
+        // RECHECK-63 slice B: recompute the canonical request hash from the
+        // exact values about to be executed (context + transition + expected
+        // heads) and reject divergence before any store work. The view is
+        // built from these references — not re-forwarded copies — so a
+        // mutation after admission fails here with the typed mismatch.
+        {
+            let view = CanonicalRequestView::from_apply(
+                context,
+                &transition,
+                &expected_revision_heads,
+                &expected_ordering_heads,
+            );
+            verify_canonical_request_hash(&view, &transition.identity.canonical_request_hash)
+                .map_err(|error| error.to_string())?;
         }
 
         let lease = {
