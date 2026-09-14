@@ -104,7 +104,6 @@ members = [
   "crates/smart/eliot-cues",
   "crates/smart/eliot-dreamer-core",
   "crates/smart/eliot-epistemic",
-  "crates/smart/eliot-memory",
   "crates/smart/eliot-memory-curation",
   "crates/smart/eliot-system-experience",
   "crates/smart/eliot-understanding",
