@@ -35,7 +35,7 @@ code-navigation-sync:
 docs-closure-audit:
     python scripts/docs_closure_audit.py --root .
 
-# Completion gate for one capability cell, e.g. `just work-unit eliot-cue-contracts`.
+# Legacy source-shape diagnostic (always NOT_VERIFIED; see module.toml acceptance), e.g. `just work-unit eliot-cue-contracts`.
 work-unit crate:
     python scripts/verify-work-unit.py --crate {{crate}} --root .
 # Crates that live outside the workspace and outside `exclude`, so no other gate
