@@ -4,6 +4,19 @@
 
 use super::*;
 
+use eliot_contracts::{EpochId, EpochLineageId};
+use std::num::NonZeroU64;
+
+const TEST_LINEAGE_A: &str = "550e8400-e29b-41d4-a716-446655440000";
+
+fn test_epoch(sequence: u64) -> EpochId {
+    EpochId::new(
+        EpochLineageId::new(TEST_LINEAGE_A).expect("valid test lineage"),
+        NonZeroU64::new(sequence).expect("nonzero test sequence"),
+    )
+    .expect("valid test epoch")
+}
+
 fn v1_migration() -> CompiledMigration {
     CompiledMigration::new(
         schema::MIGRATION_ID_V1,
@@ -30,7 +43,7 @@ fn v1_to_v2_migration() -> CompiledMigration {
 
 fn genesis_fixture() -> (eliot_store_api::RequestMeta, StoreGenesisRequest) {
     let fence = StateFence::new(
-        eliot_contracts::AuthorityEpoch::genesis(),
+        test_epoch(1),
         eliot_contracts::ResourceGeneration::genesis(),
     );
     let payload = b"{\"seed\":true}".to_vec();
@@ -569,7 +582,7 @@ fn transaction_has_no_destructive_statements_and_no_fence_rewrite_for_forward() 
     assert!(forward_sql.contains(schema::RECOVERY_TABLES_DDL.trim()));
     let fence = FenceRecord {
         state_fence: StateFence::new(
-            eliot_contracts::AuthorityEpoch::new(1).expect("epoch"),
+            test_epoch(1),
             eliot_contracts::ResourceGeneration::new(1).expect("gen"),
         ),
         next_commit_sequence: 7,
@@ -616,7 +629,7 @@ fn wrong_state_fence_is_rejected_by_forward_guard() {
     let existing = schema_meta_record(&v1, "1000");
     let fence_ok = FenceRecord {
         state_fence: StateFence::new(
-            eliot_contracts::AuthorityEpoch::new(1).expect("epoch"),
+            test_epoch(1),
             eliot_contracts::ResourceGeneration::new(1).expect("gen"),
         ),
         next_commit_sequence: 1,
@@ -624,7 +637,7 @@ fn wrong_state_fence_is_rejected_by_forward_guard() {
     };
     let fence_bad = FenceRecord {
         state_fence: StateFence::new(
-            eliot_contracts::AuthorityEpoch::new(2).expect("epoch"),
+            test_epoch(2),
             eliot_contracts::ResourceGeneration::new(1).expect("gen"),
         ),
         next_commit_sequence: 1,
@@ -648,7 +661,7 @@ fn changed_sequence_is_rejected_by_forward_guard() {
     let existing = schema_meta_record(&v1, "1000");
     let fence_ok = FenceRecord {
         state_fence: StateFence::new(
-            eliot_contracts::AuthorityEpoch::new(1).expect("epoch"),
+            test_epoch(1),
             eliot_contracts::ResourceGeneration::new(1).expect("gen"),
         ),
         next_commit_sequence: 1,
@@ -718,7 +731,7 @@ fn schema_and_fence_records_round_trip_as_json() {
     let schema = schema_meta_record(&migration, "1000");
     let fence = FenceRecord {
         state_fence: StateFence::new(
-            eliot_contracts::AuthorityEpoch::new(1).expect("epoch"),
+            test_epoch(1),
             eliot_contracts::ResourceGeneration::new(1).expect("generation"),
         ),
         next_commit_sequence: 2,
@@ -740,7 +753,7 @@ fn schema_and_fence_records_round_trip_as_json() {
 fn unknown_fence_record_field_fails_deserialization() {
     let fence = FenceRecord {
         state_fence: StateFence::new(
-            eliot_contracts::AuthorityEpoch::new(1).expect("epoch"),
+            test_epoch(1),
             eliot_contracts::ResourceGeneration::new(1).expect("generation"),
         ),
         next_commit_sequence: 1,
@@ -765,7 +778,7 @@ fn predecessor_cas_binds_every_predecessor_field_and_history_value() {
     let existing = schema_meta_record(&v1, "1000");
     let fence = FenceRecord {
         state_fence: StateFence::new(
-            eliot_contracts::AuthorityEpoch::new(1).expect("epoch"),
+            test_epoch(1),
             eliot_contracts::ResourceGeneration::new(1).expect("generation"),
         ),
         next_commit_sequence: 1,
@@ -878,7 +891,7 @@ fn canonical_fence_record_reads_use_explicit_flat_projection() {
 fn validation_result_indexes_admit_a_fresh_empty_canonical_store() {
     let migration = v2_baseline_migration();
     let fence = StateFence::new(
-        eliot_contracts::AuthorityEpoch::new(1).expect("epoch"),
+        test_epoch(1),
         eliot_contracts::ResourceGeneration::new(1).expect("generation"),
     );
     let snapshot = build_validation_snapshot(
@@ -915,7 +928,7 @@ fn validation_rejects_missing_or_malformed_fence() {
         Some(schema_meta_record(&migration, "1000")),
         Some(FenceRecord {
             state_fence: StateFence::new(
-                eliot_contracts::AuthorityEpoch::new(1).expect("epoch"),
+                test_epoch(1),
                 eliot_contracts::ResourceGeneration::new(1).expect("generation"),
             ),
             next_commit_sequence: 0,
@@ -960,7 +973,7 @@ fn ready_v2_requires_a_valid_canonical_fence() {
 
     let malformed = FenceRecord {
         state_fence: StateFence::new(
-            eliot_contracts::AuthorityEpoch::new(1).expect("epoch"),
+            test_epoch(1),
             eliot_contracts::ResourceGeneration::new(1).expect("generation"),
         ),
         next_commit_sequence: 0,

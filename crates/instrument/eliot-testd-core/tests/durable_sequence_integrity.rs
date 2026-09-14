@@ -15,6 +15,13 @@ use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use std::time::{SystemTime, UNIX_EPOCH};
 
+fn test_epoch(sequence: u64) -> eliot_contracts::EpochId {
+    use eliot_contracts::{EpochId, EpochLineageId};
+    use std::num::NonZeroU64;
+    let lineage = EpochLineageId::new("550e8400-e29b-41d4-a716-446655440000").expect("canonical test lineage-A");
+    EpochId::new(lineage, NonZeroU64::new(sequence).expect("non-zero test sequence")).expect("valid test epoch")
+}
+
 const JOBS: TableDefinition<&str, &[u8]> = TableDefinition::new("testd_jobs_v1");
 const EVENTS: TableDefinition<&str, &[u8]> = TableDefinition::new("testd_events_v1");
 const META: TableDefinition<&str, &[u8]> = TableDefinition::new("testd_meta_v1");
@@ -64,7 +71,7 @@ fn fixture_invocation(operation_id: &str) -> InstrumentInvocation {
             "product_id": "product-1",
             "source_id": "source-1",
             "state_fence": {
-                "authority_epoch": 7,
+                "authority_epoch": {"lineage_id": "550e8400-e29b-41d4-a716-446655440000", "sequence": 7},
                 "resource_generation": 1,
                 "task_revision": null,
                 "policy_revision": null,
@@ -135,7 +142,7 @@ fn fixture_process(
             PermitIssuance::new(
                 eliot_process::ActionLeaseRef::new(format!("lease-{job_id}"))
                     .expect("fixture lease"),
-                FencingToken::new(7, generation, format!("fence-{job_id}")).expect("fixture fence"),
+                FencingToken::new(test_epoch(7), generation, format!("fence-{job_id}")).expect("fixture fence"),
                 BTreeMap::from([
                     ("authority".to_owned(), "a".repeat(64)),
                     ("state".to_owned(), "b".repeat(64)),
@@ -210,7 +217,7 @@ fn job_bytes(job_id: &str, project_id: &str, project_sequence: u64) -> Vec<u8> {
                 "product_id": "product-1",
                 "source_id": "source-1",
                 "state_fence": {
-                    "authority_epoch": 7,
+                    "authority_epoch": {"lineage_id": "550e8400-e29b-41d4-a716-446655440000", "sequence": 7},
                     "resource_generation": 1,
                     "task_revision": null,
                     "policy_revision": null,
@@ -242,7 +249,7 @@ fn job_bytes(job_id: &str, project_id: &str, project_sequence: u64) -> Vec<u8> {
             "operation_id": "operation-1",
             "process_tree_id": "tree-1",
             "generation": 1,
-            "authority_epoch": 7,
+            "authority_epoch": {"lineage_id": "550e8400-e29b-41d4-a716-446655440000", "sequence": 7},
             "invocation_digest": "digest"
         },
         "target_roots": {

@@ -948,7 +948,7 @@ impl KernelComposition {
             session_id: decision.session_id.clone(),
             activation_generation: decision.state_fence.resource_generation,
             state_fence: AgentBridgeActivationFence {
-                authority_epoch: decision.state_fence.authority_epoch,
+                authority_epoch: decision.state_fence.authority_epoch.clone(),
                 generation: decision.state_fence.resource_generation,
                 nonce: session_nonce,
             },
@@ -1216,7 +1216,7 @@ impl KernelComposition {
             session_id: binding.session_id.clone(),
             activation_generation: pending.ticket.state_fence.resource_generation,
             state_fence: AgentBridgeActivationFence {
-                authority_epoch: pending.ticket.state_fence.authority_epoch,
+                authority_epoch: pending.ticket.state_fence.authority_epoch.clone(),
                 generation: pending.ticket.state_fence.resource_generation,
                 nonce: session_nonce,
             },

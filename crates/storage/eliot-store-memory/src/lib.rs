@@ -1063,16 +1063,27 @@ fn checked_increment(
 mod tests {
     use super::*;
     use eliot_contracts::{
-        AuthorityEpoch, ClockReading, ProductId, RequestId, ResourceGeneration, SessionId,
-        SourceId, TaskId,
+        ClockReading, EpochId, EpochLineageId, ProductId, RequestId, ResourceGeneration,
+        SessionId, SourceId, TaskId,
     };
     use eliot_store_api::{
         EffectClass, NamedOperationManifest, StoreGenesisRequest, StoreRecoveryRequest,
         TransitionClass,
     };
+    use std::num::NonZeroU64;
+
+    const TEST_LINEAGE_A: &str = "550e8400-e29b-41d4-a716-446655440000";
+
+    fn test_epoch(sequence: u64) -> EpochId {
+        EpochId::new(
+            EpochLineageId::new(TEST_LINEAGE_A).expect("valid test lineage"),
+            NonZeroU64::new(sequence).expect("nonzero test sequence"),
+        )
+        .expect("valid test epoch")
+    }
 
     fn fence() -> StateFence {
-        StateFence::new(AuthorityEpoch::genesis(), ResourceGeneration::genesis())
+        StateFence::new(test_epoch(1), ResourceGeneration::genesis())
     }
 
     fn metadata(state_fence: &StateFence) -> Result<RequestMeta, StoreError> {
@@ -1304,10 +1315,7 @@ mod tests {
             vec![recovery_record("owner", "one", &state_fence, b"one")],
         )?;
         let first = store.initialize_genesis_sync(&metadata(&state_fence)?, &request)?;
-        let substituted_fence = StateFence::new(
-            AuthorityEpoch::new(2).map_err(StoreError::Foundation)?,
-            ResourceGeneration::genesis(),
-        );
+        let substituted_fence = StateFence::new(test_epoch(2), ResourceGeneration::genesis());
         store.lock_state()?.fences = Some(substituted_fence);
         let before = store.lock_state()?.clone();
         assert_eq!(
@@ -1432,10 +1440,7 @@ mod tests {
         );
         assert_eq!(before, store.lock_state()?.clone());
 
-        let other_fence = StateFence::new(
-            AuthorityEpoch::new(2).map_err(StoreError::Foundation)?,
-            ResourceGeneration::genesis(),
-        );
+        let other_fence = StateFence::new(test_epoch(2), ResourceGeneration::genesis());
         let mut stale = recovery_request(
             &state_fence,
             vec![RecoveryRecordKey::new("owner", "one")?],

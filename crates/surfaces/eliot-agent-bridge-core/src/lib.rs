@@ -1163,8 +1163,13 @@ impl AgentBridgeCore {
         event: &EventEnvelope,
     ) -> Result<(), BridgeError> {
         let fence = binding.state_fence();
-        if event.authority_epoch.value() != fence.authority_epoch()
-            || event.state_fence.authority_epoch.value() != fence.authority_epoch()
+        if !event
+            .authority_epoch
+            .is_same_authority(fence.authority_epoch())
+            || !event
+                .state_fence
+                .authority_epoch
+                .is_same_authority(fence.authority_epoch())
             || event.producer_generation.value() != fence.generation().get()
             || event.state_fence.resource_generation.value() != fence.generation().get()
         {
@@ -1213,9 +1218,10 @@ fn validate_authority_binding(
     state_fence: &FencingToken,
 ) -> Result<(), BridgeError> {
     validate_text(session_id.as_str(), "session_id")?;
-    if activation_generation.get() == 0
-        || state_fence.authority_epoch() == 0
-        || state_fence.generation().get() == 0
+    // EpochId is always a validated non-zero (lineage_id, sequence) tuple by
+    // construction (Implements #64); only the generation retains a scalar
+    // non-zero check here.
+    if activation_generation.get() == 0 || state_fence.generation().get() == 0
     {
         return Err(BridgeError::InvalidContract {
             field: "authority_binding",

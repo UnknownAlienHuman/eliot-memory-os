@@ -10,6 +10,7 @@
 use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
 
+use eliot_contracts::EpochId;
 use eliot_instrument_api::{InstrumentContractError, InstrumentInvocation};
 use eliot_platform_windows::WindowsPlatform;
 use eliot_process::{
@@ -295,7 +296,7 @@ pub struct TestReceipt {
     pub operation_id: String,
     pub process_tree_id: String,
     pub generation: u64,
-    pub authority_epoch: u64,
+    pub authority_epoch: EpochId,
     pub invocation_digest: String,
     pub allowed_contour_root: String,
     pub source_root: String,
@@ -446,7 +447,7 @@ impl TestdComposition {
             || operation_id.as_str() != current.process.operation_id
             || process_tree_id != current.process.process_tree_id
             || generation != current.process.generation
-            || authority_epoch != current.process.authority_epoch
+            || !authority_epoch.is_same_authority(&current.process.authority_epoch)
             || digest != current.process.invocation_digest
             || request.working_directory() != current.target_roots.source_root
             || environment.get("CARGO_TARGET_DIR") != Some(&current.target_roots.target_root)
@@ -476,7 +477,7 @@ fn receipt(job: &TestJob) -> TestReceipt {
         operation_id: job.process.operation_id.clone(),
         process_tree_id: job.process.process_tree_id.clone(),
         generation: job.process.generation,
-        authority_epoch: job.process.authority_epoch,
+        authority_epoch: job.process.authority_epoch.clone(),
         invocation_digest: job.process.invocation_digest.clone(),
         allowed_contour_root: job.target_roots.allowed_contour_root.clone(),
         source_root: job.target_roots.source_root.clone(),
@@ -508,6 +509,8 @@ pub enum ProtocolError {
 )]
 mod tests {
     use super::*;
+    use eliot_contracts::{EpochLineageId, EpochId};
+    use std::num::NonZeroU64;
     use eliot_process::{
         ActionLeaseRef, DispatchAuthorityId, DispatchPermitAuthority, EnvironmentInheritance,
         EnvironmentProjection, FencingToken, Generation, ImageId, JobId, KernelDispatchKey,
@@ -516,6 +519,17 @@ mod tests {
     };
     use std::collections::BTreeMap;
     use std::sync::Mutex;
+
+    fn test_epoch(sequence: u64) -> EpochId {
+        let lineage =
+            EpochLineageId::new("550e8400-e29b-41d4-a716-446655440000")
+                .expect("canonical test lineage-A");
+        EpochId::new(
+            lineage,
+            NonZeroU64::new(sequence).expect("non-zero test sequence"),
+        )
+        .expect("valid test epoch")
+    }
 
     fn test_root(label: &str) -> PathBuf {
         let nonce = std::time::SystemTime::now()
@@ -585,7 +599,7 @@ mod tests {
                 &intent,
                 PermitIssuance::new(
                     ActionLeaseRef::new("lease-1").unwrap(),
-                    FencingToken::new(7, generation, "fence-1").unwrap(),
+                    FencingToken::new(test_epoch(7), generation, "fence-1").unwrap(),
                     BTreeMap::from([
                         ("authority".to_owned(), "a".repeat(64)),
                         ("state".to_owned(), "b".repeat(64)),
@@ -609,7 +623,10 @@ mod tests {
                 "product_id": "product-1",
                 "source_id": "source-1",
                 "state_fence": {
-                    "authority_epoch": 7,
+                    "authority_epoch": {
+                        "lineage_id": "550e8400-e29b-41d4-a716-446655440000",
+                        "sequence": 7
+                    },
                     "resource_generation": 1,
                     "task_revision": null,
                     "policy_revision": null,

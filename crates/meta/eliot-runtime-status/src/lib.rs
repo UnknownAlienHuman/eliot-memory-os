@@ -2974,7 +2974,12 @@ mod honest_tests {
             generation: generation.clone(),
             authority_generation: eliot_installation::ResourceGeneration::genesis(),
             authority_state_fence: eliot_installation::StateFence::new(
-                eliot_installation::AuthorityEpoch::genesis(),
+                eliot_contracts::EpochId::new(
+                    eliot_contracts::EpochLineageId::new("550e8400-e29b-41d4-a716-446655440000")
+                        .expect("canonical test lineage-A"),
+                    std::num::NonZeroU64::new(1).expect("non-zero test sequence"),
+                )
+                .expect("valid test epoch"),
                 eliot_installation::ResourceGeneration::genesis(),
             ),
             supervision_authority: eliot_installation::SupervisionAuthorityBinding::Provisioned {
@@ -3633,7 +3638,12 @@ mod store_currentness_production_tests {
                 generation: h("gen-1"),
                 authority_generation: eliot_installation::ResourceGeneration::new(1).expect("gen"),
                 authority_state_fence: eliot_installation::StateFence::new(
-                    eliot_installation::AuthorityEpoch::genesis(),
+                    eliot_contracts::EpochId::new(
+                    eliot_contracts::EpochLineageId::new("550e8400-e29b-41d4-a716-446655440000")
+                        .expect("canonical test lineage-A"),
+                    std::num::NonZeroU64::new(1).expect("non-zero test sequence"),
+                )
+                .expect("valid test epoch"),
                     eliot_installation::ResourceGeneration::genesis(),
                 ),
                 supervision_authority: eliot_installation::SupervisionAuthorityBinding::Pending {
@@ -4141,7 +4151,12 @@ mod live_production_observer_tests {
                     authority_generation: eliot_installation::ResourceGeneration::new(1)
                         .expect("gen"),
                     authority_state_fence: eliot_installation::StateFence::new(
-                        eliot_installation::AuthorityEpoch::genesis(),
+                        eliot_contracts::EpochId::new(
+                    eliot_contracts::EpochLineageId::new("550e8400-e29b-41d4-a716-446655440000")
+                        .expect("canonical test lineage-A"),
+                    std::num::NonZeroU64::new(1).expect("non-zero test sequence"),
+                )
+                .expect("valid test epoch"),
                         eliot_installation::ResourceGeneration::genesis(),
                     ),
                     supervision_authority:
@@ -5730,7 +5745,17 @@ mod production_call_path_negatives {
             PermitIssuance, ProcessId, ProcessIntent, ProcessRequest, ProcessTreeId,
             ResourceLimits, SecretRef, SessionId,
         };
-        let fence = FencingToken::new(1, generation, "fence-1").expect("fence");
+        let fence = FencingToken::new(
+            eliot_contracts::EpochId::new(
+                eliot_contracts::EpochLineageId::new("550e8400-e29b-41d4-a716-446655440000")
+                    .expect("canonical test lineage-A"),
+                std::num::NonZeroU64::new(1).expect("non-zero test sequence"),
+            )
+            .expect("valid test epoch"),
+            generation,
+            "fence-1",
+        )
+        .expect("fence");
         let mut authority = DispatchPermitAuthority::activate(
             DispatchAuthorityId::new("kernel-authority-7").expect("auth id"),
             KernelDispatchKey::from_secret_bytes([0x5a; 32]).expect("key"),

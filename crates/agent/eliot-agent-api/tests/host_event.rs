@@ -6,12 +6,12 @@
 //! SHA-256 over canonical bytes; no hardcoded pass values.
 
 use eliot_agent_api::{
-    AdmittedRouteReceipt, AssistantDeltaObservation, AttemptId, AuthorityEpoch,
-    CandidateSelectionDisposition, ClockReading, ContractError, DecisionId, EventCursor, EventId,
-    ExecutionUnit, ExecutionUnitObservation, HOST_EVENT_CONTRACT_VERSION,
-    HOST_EVENT_DIGEST_ALGORITHM, HostEventDeliveryDisposition, HostEventNormalizationReceipt,
-    HostEventPrivacyClass, HostEventQuarantineReason, HostEventReplayDisposition, LowercaseSha256,
-    NativeSession, NativeSessionLocator, NormalizationCoverage, NormalizedHostEventEnvelope,
+    AdmittedRouteReceipt, AssistantDeltaObservation, AttemptId, CandidateSelectionDisposition,
+    ClockReading, ContractError, DecisionId, EpochId, EventCursor, EventId, ExecutionUnit,
+    ExecutionUnitObservation, HOST_EVENT_CONTRACT_VERSION, HOST_EVENT_DIGEST_ALGORITHM,
+    HostEventDeliveryDisposition, HostEventNormalizationReceipt, HostEventPrivacyClass,
+    HostEventQuarantineReason, HostEventReplayDisposition, LowercaseSha256, NativeSession,
+    NativeSessionLocator, NormalizationCoverage, NormalizedHostEventEnvelope,
     NormalizedHostEventPayload, PolicyRevision, ProofCeiling, ProviderExecutionBinding,
     ProviderObservationLineage, QualifiedSourceDigest, RawSourceRecord, RequestId,
     ResourceGeneration, RestrictedRawSourceHandle, RouteFingerprint, RouteSelectionCandidate,
@@ -19,9 +19,19 @@ use eliot_agent_api::{
     UnsupportedDisposition, UnsupportedEventObservation, UnsupportedEventReason, WorkLeaseId,
     candidate_digest_for,
 };
-use eliot_contracts::sha256_hex;
+use eliot_contracts::{EpochLineageId, sha256_hex};
 
 type TestResult = Result<(), Box<dyn std::error::Error>>;
+
+const TEST_LINEAGE_A: &str = "550e8400-e29b-41d4-a716-446655440000";
+
+fn test_epoch(lineage: &str, sequence: u64) -> EpochId {
+    EpochId::new(
+        EpochLineageId::new(lineage).expect("valid test lineage"),
+        std::num::NonZeroU64::new(sequence).expect("nonzero test sequence"),
+    )
+    .expect("valid test epoch")
+}
 
 fn fixture_digest(bytes: &[u8]) -> Result<LowercaseSha256, serde_json::Error> {
     serde_json::from_value(serde_json::json!(sha256_hex(bytes)))
@@ -56,7 +66,7 @@ fn lease(value: &str) -> Result<WorkLeaseId, serde_json::Error> {
 
 fn fence() -> Result<StateFence, Box<dyn std::error::Error>> {
     Ok(StateFence::new(
-        AuthorityEpoch::new(1)?,
+        test_epoch(TEST_LINEAGE_A, 1),
         ResourceGeneration::new(1)?,
     ))
 }

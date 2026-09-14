@@ -404,9 +404,15 @@ impl KernelComposition {
                 self.reject_daemon_process_readiness("eliotd launch operation identity is invalid")
             })?;
         let physical = receipt.identity().physical();
+        // INTENDED EpochId shape (B→A→C): fence exact-tuple. Quarantined
+        // EliotdLive* scalar lines below stay untouched (HISTORICAL_SUSPENDED).
         if receipt.operation_id() != &expected_operation
             || receipt.accepted_generation().get() != launch.generation.value()
-            || receipt.binding().state_fence().authority_epoch() != launch.authority_epoch.value()
+            || !receipt
+                .binding()
+                .state_fence()
+                .authority_epoch()
+                .is_same_authority(&launch.authority_epoch)
             || receipt.binding().state_fence().generation() != generation
             || receipt.identity().executable_sha256() != launch.executable_sha256
             || !physical

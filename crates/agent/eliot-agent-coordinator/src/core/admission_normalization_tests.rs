@@ -1,12 +1,12 @@
 use std::collections::BTreeSet;
 
 use eliot_agent_api::{
-    AgentLaunchRequest, AgentWorkUnitBrief, AttemptId, AuthorityEpoch, BudgetEnvelope,
-    EffectCeiling, EffectKind, LaunchRequestId, LowercaseSha256, ResourceGeneration,
-    RouteFingerprint, StateFence, TaskId, WorkLeaseId, WorkUnitId, candidate_digest_for,
+    AgentLaunchRequest, AgentWorkUnitBrief, AttemptId, BudgetEnvelope, EffectCeiling, EffectKind,
+    EpochId, LaunchRequestId, LowercaseSha256, ResourceGeneration, RouteFingerprint, StateFence,
+    TaskId, WorkLeaseId, WorkUnitId, candidate_digest_for,
 };
 use eliot_agent_contracts::RevisionId;
-use eliot_contracts::sha256_hex;
+use eliot_contracts::{EpochLineageId, sha256_hex};
 use eliot_evaluation_contracts::BudgetEvidence;
 use eliot_security_contracts::PrivacyClass;
 
@@ -19,6 +19,16 @@ use crate::{
 };
 
 type TestResult<T = ()> = Result<T, Box<dyn std::error::Error>>;
+
+const TEST_LINEAGE_A: &str = "550e8400-e29b-41d4-a716-446655440000";
+
+fn test_epoch(lineage: &str, sequence: u64) -> EpochId {
+    EpochId::new(
+        EpochLineageId::new(lineage).expect("valid test lineage"),
+        std::num::NonZeroU64::new(sequence).expect("nonzero test sequence"),
+    )
+    .expect("valid test epoch")
+}
 
 #[derive(Clone)]
 struct ExactAdmissionProvider {
@@ -226,7 +236,10 @@ fn plan_request() -> TestResult<StaffingPlanRequest> {
         },
         task_revision: "task-normalization-v1".to_owned(),
         plan_revision: rev("plan-normalization-v1"),
-        state_fence: StateFence::new(AuthorityEpoch::genesis(), ResourceGeneration::genesis()),
+        state_fence: StateFence::new(
+            test_epoch(TEST_LINEAGE_A, 1),
+            ResourceGeneration::genesis(),
+        ),
         privacy_class: PrivacyClass::Private,
         lanes: vec![
             StaffingLaneRequest {
@@ -292,7 +305,7 @@ fn admission_receipt(
         task_revision: candidate.task_revision.clone(),
         plan_revision: candidate.plan_revision.clone(),
         state_fence: candidate.state_fence.clone(),
-        controller_epoch: candidate.state_fence.authority_epoch,
+        controller_epoch: candidate.state_fence.authority_epoch.clone(),
         coordinator_lease: serde_json::from_value::<WorkLeaseId>(
             serde_json::json!({"namespace": "eliot.governor.work-lease", "revision": "v1", "value": "coordinator-lease-normalization"}),
         )?,

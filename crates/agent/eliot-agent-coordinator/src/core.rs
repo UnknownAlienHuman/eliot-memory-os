@@ -792,7 +792,7 @@ impl AgentCoordinator {
             // `valid_until` is left empty so this projection can never be
             // mistaken for Governor-minted authority.
             authority: AuthorityEnvelope {
-                epoch: admission.controller_epoch,
+                epoch: admission.controller_epoch.clone(),
                 scope_ref: work_unit.effect_ceiling.scope_ref.clone(),
                 effect_ceiling: work_unit.effect_ceiling.clone(),
                 lease: attempt.lease_id.clone(),
@@ -2153,7 +2153,10 @@ fn validate_admission_text(receipt: &ProviderAdmissionReceipt) -> Result<(), Coo
         validate_text(value, field)?;
     }
     validate_state_fence(&receipt.state_fence)?;
-    if receipt.controller_epoch != receipt.state_fence.authority_epoch {
+    if !receipt
+        .controller_epoch
+        .is_same_authority(&receipt.state_fence.authority_epoch)
+    {
         return Err(CoordinatorError::StaleController);
     }
     if receipt.admitted_lanes.is_empty() {

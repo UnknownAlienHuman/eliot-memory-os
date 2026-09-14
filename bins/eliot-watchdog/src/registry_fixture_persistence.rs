@@ -19,7 +19,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use eliot_contracts::{AuthorityEpoch, ResourceGeneration, StateFence, sha256_hex};
+use eliot_contracts::{EpochId, EpochLineageId, ResourceGeneration, StateFence, sha256_hex};
 use eliot_installation::{
     CandidateManifest, INSTALLATION_REGISTRY_WIRE_VERSION, InstallationEpoch, InstallationProfile,
     PHASE_B_PENDING_MARKER, PHASE_B_PENDING_SCM_DIGEST, PlatformHandle, RuntimeLaunchDescriptor,
@@ -583,7 +583,12 @@ impl RegistryFixture {
             authority_generation: ResourceGeneration::new(generation)
                 .unwrap_or_else(|error| panic!("invalid authority generation: {error}")),
             authority_state_fence: StateFence::new(
-                AuthorityEpoch::genesis(),
+                EpochId::new(
+                    EpochLineageId::new("550e8400-e29b-41d4-a716-446655440000")
+                        .expect("canonical test lineage-A"),
+                    std::num::NonZeroU64::new(1).expect("non-zero test sequence"),
+                )
+                .expect("valid test epoch"),
                 ResourceGeneration::new(generation)
                     .unwrap_or_else(|error| panic!("invalid state generation: {error}")),
             ),

@@ -1,8 +1,8 @@
 #![allow(clippy::expect_used)]
 
 use eliot_contracts::{
-    ArtifactId, AuthorityEpoch, ContractId, ResourceGeneration, StateFence, TaskId, TaskRevision,
-    TransactionSequence,
+    ArtifactId, ContractId, EpochId, EpochLineageId, ResourceGeneration, StateFence, TaskId,
+    TaskRevision, TransactionSequence,
 };
 use eliot_contracts::{ClockReading, ProductId, RequestId, SourceId};
 use eliot_receipts::{
@@ -18,8 +18,18 @@ use eliot_skills::{
     project_governed_procedure_to_portable_skill_candidates,
 };
 
+const TEST_LINEAGE_A: &str = "550e8400-e29b-41d4-a716-446655440000";
+
+fn test_epoch(sequence: u64) -> EpochId {
+    EpochId::new(
+        EpochLineageId::new(TEST_LINEAGE_A).expect("valid test lineage"),
+        std::num::NonZeroU64::new(sequence).expect("nonzero test sequence"),
+    )
+    .expect("valid test epoch")
+}
+
 fn fence() -> StateFence {
-    StateFence::new(AuthorityEpoch::genesis(), ResourceGeneration::genesis())
+    StateFence::new(test_epoch(1), ResourceGeneration::genesis())
 }
 
 fn receipt(procedure_revision: &str, state_fence: StateFence) -> eliot_skills::ReceiptClaim {
@@ -57,7 +67,7 @@ fn receipt(procedure_revision: &str, state_fence: StateFence) -> eliot_skills::R
         }),
         session: Some(SessionBinding {
             session_id: eliot_contracts::SessionId::new("session-1").expect("session id"),
-            authority_epoch: AuthorityEpoch::genesis(),
+            authority_epoch: test_epoch(1),
             state_fence: state_fence.clone(),
         }),
         causal: CausalBinding {
@@ -81,7 +91,7 @@ fn receipt(procedure_revision: &str, state_fence: StateFence) -> eliot_skills::R
         authority: AuthorityBinding {
             authority_id: ContractId::new("authority-1").expect("authority id"),
             authority_owner: "governor.skill".to_owned(),
-            authority_epoch: AuthorityEpoch::genesis(),
+            authority_epoch: test_epoch(1),
             state_fence: state_fence.clone(),
             allowed_effect: EffectClass::Read,
             proof_ceiling: ProofCeiling::ScopedVerification,
@@ -370,7 +380,7 @@ fn receipt_must_bind_the_declared_rollback_artifact() {
 fn receipt_fence_and_identity_tampering_fail_closed() {
     let mut projection = procedure();
     projection.state_fence = StateFence::new(
-        AuthorityEpoch::new(2).expect("epoch"),
+        test_epoch(2),
         ResourceGeneration::genesis(),
     );
     assert!(matches!(

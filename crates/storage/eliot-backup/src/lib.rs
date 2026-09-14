@@ -18,7 +18,7 @@ use eliot_blob_api::{
     BlobError, BlobHash, BlobId, BlobLocator, CompressionDescriptor, CryptoDescriptor,
 };
 use eliot_contracts::{
-    AuthorityEpoch, ResourceGeneration, StateFence, canonical_json_bytes, sha256_hex,
+    EpochId, ResourceGeneration, StateFence, canonical_json_bytes, sha256_hex,
 };
 use eliot_security_contracts::PurgeLedgerEntry;
 use eliot_store_api::{OrderingHead, RevisionHead, ScopeId, StoreError, WriteReceipt};
@@ -332,7 +332,7 @@ impl BackupArtifact {
 #[serde(deny_unknown_fields)]
 pub struct OrsSnapshotFence {
     pub snapshot_id: String,
-    pub authority_epoch: AuthorityEpoch,
+    pub authority_epoch: EpochId,
     pub resource_generation: ResourceGeneration,
     pub last_receipt_cursor: u64,
     pub last_event_cursor: u64,
@@ -350,7 +350,9 @@ impl OrsSnapshotFence {
         self.state_fence
             .validate()
             .map_err(|error| BackupError::Foundation(error.to_string()))?;
-        if self.authority_epoch != self.state_fence.authority_epoch
+        if !self
+            .authority_epoch
+            .is_same_authority(&self.state_fence.authority_epoch)
             || self.resource_generation != self.state_fence.resource_generation
         {
             return Err(BackupError::FenceMismatch {
@@ -839,7 +841,7 @@ fn validate_class_requirements(bundle: &BackupBundle) -> Result<(), BackupError>
 #[serde(deny_unknown_fields)]
 pub struct RestoreContext {
     pub target_id: String,
-    pub target_authority_epoch: AuthorityEpoch,
+    pub target_authority_epoch: EpochId,
     pub target_resource_generation: ResourceGeneration,
 }
 
@@ -854,7 +856,7 @@ impl RestoreContext {
 #[serde(deny_unknown_fields)]
 pub struct RestoredFence {
     pub source_state_fence: StateFence,
-    pub authority_epoch: AuthorityEpoch,
+    pub authority_epoch: EpochId,
     pub resource_generation: ResourceGeneration,
 }
 
@@ -863,7 +865,19 @@ impl RestoredFence {
         self.source_state_fence
             .validate()
             .map_err(|error| BackupError::Foundation(error.to_string()))?;
-        if self.authority_epoch <= self.source_state_fence.authority_epoch
+        // Lineage-aware restore ordering (Implements #64): sequence is
+        // compared only when lineage_id is exactly equal (contract
+        // types.EpochId). Same-lineage restore must advance; a new lineage
+        // restore must be genesis (sequence 1, contract types.EpochTransition).
+        // Cross-lineage non-genesis never advances.
+        let target = &self.authority_epoch;
+        let source = &self.source_state_fence.authority_epoch;
+        let epoch_advances = if target.lineage_id == source.lineage_id {
+            target.sequence.get() > source.sequence.get()
+        } else {
+            target.sequence.get() == 1
+        };
+        if !epoch_advances
             || self.resource_generation <= self.source_state_fence.resource_generation
         {
             return Err(BackupError::StaleRestoreLineage);
@@ -1014,19 +1028,28 @@ impl RestorePlan {
         let ors_epoch = bundle
             .ors_snapshot
             .as_ref()
-            .map_or(source.authority_epoch, |ors| ors.authority_epoch);
+            .map_or(source.authority_epoch.clone(), |ors| {
+                ors.authority_epoch.clone()
+            });
         let ors_generation = bundle
             .ors_snapshot
             .as_ref()
             .map_or(source.resource_generation, |ors| ors.resource_generation);
-        if target.target_authority_epoch <= ors_epoch
-            || target.target_resource_generation <= ors_generation
+        // Lineage-aware restore ordering (Implements #64): same-lineage must
+        // advance; new-lineage must be genesis (sequence 1).
+        let epoch_advances = if target.target_authority_epoch.lineage_id == ors_epoch.lineage_id
+        {
+            target.target_authority_epoch.sequence.get() > ors_epoch.sequence.get()
+        } else {
+            target.target_authority_epoch.sequence.get() == 1
+        };
+        if !epoch_advances || target.target_resource_generation <= ors_generation
         {
             return Err(BackupError::StaleRestoreLineage);
         }
         let restored_fence = RestoredFence {
             source_state_fence: source.clone(),
-            authority_epoch: target.target_authority_epoch,
+            authority_epoch: target.target_authority_epoch.clone(),
             resource_generation: target.target_resource_generation,
         };
         restored_fence.validate()?;
@@ -1519,7 +1542,9 @@ fn validate_applied_effect(
         return Err(BackupError::RestoreEvidenceIncomplete);
     }
     if evidence.target_id != plan.target.target_id
-        || evidence.authority_epoch != plan.restored_fence.authority_epoch
+        || !evidence
+            .authority_epoch
+            .is_same_authority(&plan.restored_fence.authority_epoch)
         || evidence.resource_generation != plan.restored_fence.resource_generation
     {
         return Err(BackupError::FinalizeEvidenceMismatch);
@@ -1550,7 +1575,7 @@ pub struct RestoreEvidence {
     pub receipt_event_chain_verified: bool,
     pub ors_suspended: bool,
     pub active_authority_restored: bool,
-    pub authority_epoch: AuthorityEpoch,
+    pub authority_epoch: EpochId,
     pub resource_generation: ResourceGeneration,
 }
 
@@ -1721,7 +1746,18 @@ mod restore_tests {
     #![allow(clippy::expect_used)]
 
     use super::*;
-    use eliot_contracts::{AuthorityEpoch, ResourceGeneration, StateFence};
+    use eliot_contracts::{EpochId, EpochLineageId, ResourceGeneration, StateFence};
+    use std::num::NonZeroU64;
+
+    const TEST_LINEAGE_A: &str = "550e8400-e29b-41d4-a716-446655440000";
+
+    fn test_epoch(sequence: u64) -> EpochId {
+        EpochId::new(
+            EpochLineageId::new(TEST_LINEAGE_A).expect("valid test lineage"),
+            NonZeroU64::new(sequence).expect("nonzero test sequence"),
+        )
+        .expect("valid test epoch")
+    }
 
     #[derive(Default)]
     struct TestJournal {
@@ -1880,7 +1916,7 @@ mod restore_tests {
                 receipt_event_chain_verified: true,
                 ors_suspended: false,
                 active_authority_restored: false,
-                authority_epoch: AuthorityEpoch::new(2).expect("epoch"),
+                authority_epoch: test_epoch(2),
                 resource_generation: ResourceGeneration::new(2).expect("generation"),
             })
         }
@@ -1908,7 +1944,7 @@ mod restore_tests {
                 receipt_event_chain_verified: true,
                 ors_suspended: false,
                 active_authority_restored: false,
-                authority_epoch: AuthorityEpoch::new(2).expect("epoch"),
+                authority_epoch: test_epoch(2),
                 resource_generation: ResourceGeneration::new(2).expect("generation"),
             })
         } else {
@@ -1931,8 +1967,7 @@ mod restore_tests {
     }
 
     fn plan() -> RestorePlan {
-        let source_fence =
-            StateFence::new(AuthorityEpoch::genesis(), ResourceGeneration::genesis());
+        let source_fence = StateFence::new(test_epoch(1), ResourceGeneration::genesis());
         let bundle = BackupBundle::build(BackupInput {
             backup_id: "backup".to_owned(),
             class: BackupClass::CanonicalOnlyDegraded,
@@ -1970,7 +2005,7 @@ mod restore_tests {
             &bundle,
             RestoreContext {
                 target_id: "target".to_owned(),
-                target_authority_epoch: AuthorityEpoch::new(2).expect("epoch"),
+                target_authority_epoch: test_epoch(2),
                 target_resource_generation: ResourceGeneration::new(2).expect("generation"),
             },
         )

@@ -11,7 +11,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use eliot_contracts::{
-    ArtifactId, AuthorityEpoch, ContractId, ResourceGeneration, TransactionSequence,
+    ArtifactId, ContractId, ResourceGeneration, TransactionSequence,
 };
 pub use eliot_contracts::{
     ContractError, ContractVersion, ErrorCode, OperationId, RequestMetadata, StateFence,
@@ -401,9 +401,13 @@ fn validate_recovery_packet_size<T: Serialize>(value: &T) -> Result<(), StoreErr
 }
 
 /// Returns whether a fence is the only accepted empty-genesis fence.
+///
+/// Genesis is lineage-agnostic: any lineage at sequence 1 with genesis
+/// resources and no bound revisions qualifies. Epoch lineage itself is never
+/// compared by scalar ordering; only the genesis sequence position is checked.
 #[must_use]
 pub fn is_genesis_fence(fence: &StateFence) -> bool {
-    fence.authority_epoch == AuthorityEpoch::genesis()
+    fence.authority_epoch.sequence.get() == 1
         && fence.resource_generation == ResourceGeneration::genesis()
         && fence.task_revision.is_none()
         && fence.policy_revision.is_none()
@@ -1687,7 +1691,7 @@ pub fn issue_store_receipt_envelope(
             ))
             .map_err(StoreError::Foundation)?,
             authority_owner: context.source_id.to_string(),
-            authority_epoch: state_fence.authority_epoch,
+            authority_epoch: state_fence.authority_epoch.clone(),
             state_fence: state_fence.clone(),
             allowed_effect: transition.requested_effect_ceiling,
             proof_ceiling,
@@ -1815,7 +1819,7 @@ fn receipt_task(
 fn receipt_session(context: &RequestMeta, state_fence: &StateFence) -> Option<SessionBinding> {
     context.session_id.clone().map(|session_id| SessionBinding {
         session_id,
-        authority_epoch: state_fence.authority_epoch,
+        authority_epoch: state_fence.authority_epoch.clone(),
         state_fence: state_fence.clone(),
     })
 }
@@ -2111,10 +2115,23 @@ pub trait CanonicalStoreClient: Send + Sync {
 #[allow(clippy::expect_used, clippy::unwrap_used)]
 mod tests {
     use super::*;
-    use eliot_contracts::{AuthorityEpoch, ResourceGeneration};
+    use eliot_contracts::{EpochId, ResourceGeneration};
+
+    fn test_epoch(sequence: u64) -> EpochId {
+        use eliot_contracts::EpochLineageId;
+        use std::num::NonZeroU64;
+        let lineage =
+            EpochLineageId::new("550e8400-e29b-41d4-a716-446655440000")
+                .expect("canonical test lineage-A");
+        EpochId::new(
+            lineage,
+            NonZeroU64::new(sequence).expect("non-zero test sequence"),
+        )
+        .expect("valid test epoch")
+    }
 
     fn fence() -> StateFence {
-        StateFence::new(AuthorityEpoch::genesis(), ResourceGeneration::genesis())
+        StateFence::new(test_epoch(1), ResourceGeneration::genesis())
     }
 
     fn id(value: &str) -> Result<OperationId, StoreError> {
@@ -2247,7 +2264,7 @@ mod tests {
 
         let mut mixed_fence = valid.clone();
         mixed_fence.revision_heads[0].state_fence =
-            StateFence::new(AuthorityEpoch::new(2)?, ResourceGeneration::genesis());
+            StateFence::new(test_epoch(2), ResourceGeneration::genesis());
         assert_eq!(mixed_fence.validate(), Err(StoreError::FenceMismatch));
 
         let mut zero_revision = valid.clone();
@@ -2335,10 +2352,7 @@ mod tests {
         ));
 
         let mut stale = recovery_record("one", b"payload");
-        stale.state_fence = StateFence::new(
-            AuthorityEpoch::new(2).expect("epoch"),
-            ResourceGeneration::genesis(),
-        );
+        stale.state_fence = StateFence::new(test_epoch(2), ResourceGeneration::genesis());
         assert_eq!(
             recovery_snapshot(vec![stale]).validate(),
             Err(StoreError::FenceMismatch)
@@ -2586,7 +2600,7 @@ mod tests {
         ));
 
         let mut stale = request.clone();
-        stale.state_fence = StateFence::new(AuthorityEpoch::new(2)?, ResourceGeneration::genesis());
+        stale.state_fence = StateFence::new(test_epoch(2), ResourceGeneration::genesis());
         assert_eq!(stale.validate(), Err(StoreError::FenceMismatch));
 
         let mut semantic = request;

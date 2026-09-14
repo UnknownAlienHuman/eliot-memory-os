@@ -212,12 +212,23 @@ pub fn fixture_failed_internal(reason: &str) -> GovernorActivationOutcome {
 mod tests {
     #![allow(clippy::unwrap_used)]
     use super::*;
-    use eliot_contracts::{AuthorityEpoch, ResourceGeneration, StateFence, TaskId};
+    use eliot_contracts::{EpochId, EpochLineageId, ResourceGeneration, StateFence, TaskId};
+    use std::num::NonZeroU64;
+
+    const TEST_LINEAGE_A: &str = "550e8400-e29b-41d4-a716-446655440000";
+
+    fn test_epoch(lineage: &str, sequence: u64) -> EpochId {
+        EpochId::new(
+            EpochLineageId::new(lineage).expect("valid test lineage"),
+            NonZeroU64::new(sequence).expect("nonzero test sequence"),
+        )
+        .expect("valid test epoch")
+    }
 
     fn test_snapshot() -> crate::composition::GovernorActivationSnapshot {
         crate::composition::GovernorActivationSnapshot {
             state_fence: StateFence::new(
-                AuthorityEpoch::new(1).unwrap(),
+                test_epoch(TEST_LINEAGE_A, 1),
                 ResourceGeneration::new(1).unwrap(),
             ),
             principal_id: "principal-1".to_owned(),
@@ -295,7 +306,7 @@ mod tests {
         assert!(!stale.is_resolved());
         assert_eq!(stale.kind_str(), "STALE_FENCE");
         let with_fence = fixture_stale_fence(Some(StateFence::new(
-            AuthorityEpoch::new(1).unwrap(),
+            test_epoch(TEST_LINEAGE_A, 1),
             ResourceGeneration::new(2).unwrap(),
         )));
         assert!(!with_fence.is_resolved());

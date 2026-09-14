@@ -10,8 +10,8 @@ use eliot_authority::{
     ReceiptObligation, SnapshotId, UnavailableP07AuthorityPort,
 };
 use eliot_contracts::{
-    AuthorityEpoch, ContractId, OperationId, ProductId, RequestId, ResourceGeneration, SessionId,
-    StateFence,
+    ContractId, EpochId, EpochLineageId, OperationId, ProductId, RequestId, ResourceGeneration,
+    SessionId, StateFence,
 };
 use eliot_receipts::{
     AuthorityBinding, EffectClass, OperationBinding, ProofCeiling, SessionBinding,
@@ -21,6 +21,16 @@ use eliot_security_contracts::EffectCeiling;
 
 type TestResult = Result<(), Box<dyn Error>>;
 
+const TEST_LINEAGE_A: &str = "550e8400-e29b-41d4-a716-446655440000";
+
+fn test_epoch(lineage: &str, sequence: u64) -> EpochId {
+    EpochId::new(
+        EpochLineageId::new(lineage).expect("valid test lineage"),
+        std::num::NonZeroU64::new(sequence).expect("nonzero test sequence"),
+    )
+    .expect("valid test epoch")
+}
+
 fn digest(byte: char) -> String {
     std::iter::repeat_n(byte, 64).collect()
 }
@@ -29,8 +39,11 @@ fn bindings(
     epoch: u64,
     generation: u64,
 ) -> Result<(WorkScopeBinding, SessionBinding, AuthorityBinding), Box<dyn Error>> {
-    let authority_epoch = AuthorityEpoch::new(epoch)?;
-    let state_fence = StateFence::new(authority_epoch, ResourceGeneration::new(generation)?);
+    let authority_epoch = test_epoch(TEST_LINEAGE_A, epoch);
+    let state_fence = StateFence::new(
+        authority_epoch.clone(),
+        ResourceGeneration::new(generation)?,
+    );
     Ok((
         WorkScopeBinding {
             scope_id: WorkScopeId::new("scope:test")?,
@@ -40,7 +53,7 @@ fn bindings(
         },
         SessionBinding {
             session_id: SessionId::new("session:test")?,
-            authority_epoch,
+            authority_epoch: authority_epoch.clone(),
             state_fence: state_fence.clone(),
         },
         AuthorityBinding {

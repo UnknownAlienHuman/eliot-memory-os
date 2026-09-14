@@ -7,7 +7,7 @@
 
 use std::num::NonZeroU64;
 
-use eliot_contracts::{AuthorityEpoch, EpochId, EpochLineageId};
+use eliot_contracts::{EpochId, EpochLineageId};
 use eliot_ors::{EpochIdentity, OperationalControlProjection};
 use eliot_runtime_contracts::{
     HealthDimension, ModuleGeneration, OperationalRecoveryState, RecoveryDirective, RecoveryView,
@@ -120,14 +120,13 @@ impl RecoveryViewBuilder {
 ///
 /// # Errors
 ///
-/// Returns an error when the authority epoch in the lineage is zero, the
-/// resulting operational state fails validation, or the ref-vector bounds are
-/// exceeded.
+/// Returns an error when the lineage is not a canonical UUID or the sequence
+/// is zero, or when the resulting operational state fails validation.
 pub fn project_operational_state(
     projection: &OperationalControlProjection,
     integrity: HealthDimension,
 ) -> Result<OperationalRecoveryState, KernelError> {
-    let authority_epoch = authority_epoch_from(&projection.authority_lineage.current)?;
+    let authority_epoch = authority_epoch_id_from(&projection.authority_lineage.current)?;
     let state = OperationalRecoveryState {
         ors_revision: "eliot.kernel.ors/v1".to_owned(),
         integrity,
@@ -140,17 +139,12 @@ pub fn project_operational_state(
     Ok(state)
 }
 
-fn authority_epoch_from(current: &EpochIdentity) -> Result<AuthorityEpoch, KernelError> {
-    AuthorityEpoch::new(current.epoch).map_err(KernelError::from)
-}
-
 /// Builds the canonical lineage-aware [`EpochId`] for an ORS epoch identity.
 ///
 /// The ORS lineage label is validated as a canonical lowercase hyphenated UUID
 /// and the sequence must be non-zero; any other spelling fails closed without
-/// manufacturing a lineage. The scalar [`authority_epoch_from`] path is left
-/// intact for existing consumers: this canonical variant runs alongside it for
-/// exact-tuple authorization via `is_same_authority`.
+/// manufacturing a lineage. Authorization over the resulting tuple is exact
+/// via `is_same_authority`.
 ///
 /// # Errors
 ///
@@ -183,7 +177,7 @@ mod tests {
         let ors = OperationalRecoveryState {
             ors_revision: "eliot.kernel.ors/v1".to_owned(),
             integrity: HealthDimension::Healthy,
-            authority_epoch: AuthorityEpoch::genesis(),
+            authority_epoch: test_epoch(),
             pending_operation_refs: Vec::new(),
             active_generation_refs: Vec::new(),
             recovery_intent_refs: Vec::new(),
@@ -206,7 +200,7 @@ mod tests {
         let ors = OperationalRecoveryState {
             ors_revision: "eliot.kernel.ors/v1".to_owned(),
             integrity: HealthDimension::Healthy,
-            authority_epoch: AuthorityEpoch::genesis(),
+            authority_epoch: test_epoch(),
             pending_operation_refs: Vec::new(),
             active_generation_refs: Vec::new(),
             recovery_intent_refs: Vec::new(),
@@ -219,7 +213,7 @@ mod tests {
         let ors = OperationalRecoveryState {
             ors_revision: "eliot.kernel.ors/v1".to_owned(),
             integrity: HealthDimension::Healthy,
-            authority_epoch: AuthorityEpoch::genesis(),
+            authority_epoch: test_epoch(),
             pending_operation_refs: Vec::new(),
             active_generation_refs: Vec::new(),
             recovery_intent_refs: Vec::new(),
@@ -245,6 +239,10 @@ mod tests {
         }
     }
 
+    fn test_epoch() -> EpochId {
+        authority_epoch_id_from(&epoch_identity("550e8400-e29b-41d4-a716-446655440000", 1)).unwrap()
+    }
+
     #[test]
     fn canonical_epoch_id_rejects_cross_lineage_same_sequence() -> Result<(), KernelError> {
         let left =
@@ -263,11 +261,6 @@ mod tests {
         assert!(
             authority_epoch_id_from(&epoch_identity("550e8400-e29b-41d4-a716-446655440000", 0))
                 .is_err()
-        );
-        // Scalar path stays intact alongside the canonical variant.
-        assert_eq!(
-            authority_epoch_from(&epoch_identity("any-label", 3))?.value(),
-            3
         );
         Ok(())
     }

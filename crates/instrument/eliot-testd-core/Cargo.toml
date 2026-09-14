@@ -8,6 +8,7 @@ description = "Persistent scheduling and state core for the ELIOT instrument tes
 
 [dependencies]
 blake3 = "1.8.5"
+eliot-contracts.workspace = true
 eliot-instrument-api.workspace = true
 eliot-process.workspace = true
 redb = "4.1.0"

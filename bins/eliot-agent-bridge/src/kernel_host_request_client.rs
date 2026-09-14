@@ -443,7 +443,10 @@ fn host_request_frame_for_envelope(
     {
         return Err(request_failure());
     }
-    let frame_fence = StateFence::new(fence.authority_epoch, fence.resource_generation);
+    let frame_fence = StateFence::new(
+        fence.authority_epoch.clone(),
+        fence.resource_generation,
+    );
     let metadata = RequestMetadata {
         request_id: envelope.identity.request_id.clone(),
         session_id: None,

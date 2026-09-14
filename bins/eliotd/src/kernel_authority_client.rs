@@ -391,7 +391,12 @@ mod tests {
         let foreign_epoch = serde_json::to_value(AuthorityActivationReceipt {
             activation_id: "act-4".to_owned(),
             snapshot_id: "snap-1".to_owned(),
-            authority_epoch: AuthorityEpoch::new(2).expect("authority epoch"),
+            authority_epoch: eliot_contracts::EpochId::new(
+                eliot_contracts::EpochLineageId::new("550e8400-e29b-41d4-a716-446655440000")
+                    .expect("authority epoch lineage"),
+                std::num::NonZeroU64::new(2).expect("authority epoch sequence"),
+            )
+            .expect("authority epoch"),
             state: AuthorityState::Active,
         })
         .expect("receipt JSON");

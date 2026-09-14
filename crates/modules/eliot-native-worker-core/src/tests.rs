@@ -11,10 +11,11 @@ use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll, Waker};
 
 use eliot_agent_api::{
-    AttemptId, AuthorityEnvelope, AuthorityEpoch, AuthorizedEffect, EffectCeiling, EffectKind,
-    ProposedEffect, ResourceGeneration, StateFence, WorkLeaseId,
+    AttemptId, AuthorityEnvelope, AuthorizedEffect, EffectCeiling, EffectKind, ProposedEffect,
+    ResourceGeneration, StateFence, WorkLeaseId,
 };
-use eliot_contracts::{IntegrationRevision, PolicyRevision, TaskRevision};
+use eliot_contracts::{EpochId, EpochLineageId, IntegrationRevision, PolicyRevision, TaskRevision};
+use std::num::NonZeroU64;
 use eliot_process::{
     ActionLeaseRef, CancellationReceipt, CancellationRequest, DescendantEvidence,
     DispatchAuthorityId, DispatchPermitAuthority, DispatchValidationContext, EnvironmentProjection,
@@ -27,6 +28,20 @@ use eliot_process::{
 };
 
 use super::*;
+
+const TEST_LINEAGE_A: &str = "550e8400-e29b-41d4-a716-446655440000";
+
+fn test_epoch(sequence: u64) -> EpochId {
+    EpochId::new(
+        EpochLineageId::new(TEST_LINEAGE_A).expect("valid test lineage"),
+        NonZeroU64::new(sequence).expect("nonzero test sequence"),
+    )
+    .expect("valid test epoch")
+}
+
+fn epoch_wire() -> serde_json::Value {
+    serde_json::json!({"lineage_id": TEST_LINEAGE_A, "sequence": 1})
+}
 
 type TestCore = WorkerCore<FakeExecutor, FakeAdmission, FakeReplay, FakeReplay>;
 
@@ -219,9 +234,8 @@ impl CapabilityAdmissionPort for FakeAdmission {
         }
         let mut authority = authority(request.hello().state_fence.clone());
         if state.returned_wrong_epoch {
-            let wrong_epoch = AuthorityEpoch::new(2)
-                .map_err(|_| ProviderFailure::new("admission", "wrong epoch"))?;
-            authority.epoch = wrong_epoch;
+            let wrong_epoch = test_epoch(2);
+            authority.epoch = wrong_epoch.clone();
             authority.state_fence.authority_epoch = wrong_epoch;
         }
         if state.returned_wrong_fence {
@@ -279,10 +293,10 @@ impl CapabilityAdmissionPort for FakeAdmission {
             } else {
                 request.lease().clone()
             },
-            *request.authority_epoch(),
+            request.authority_epoch().clone(),
             if state.stale_fence {
                 StateFence::new(
-                    AuthorityEpoch::new(1).expect("epoch"),
+                    test_epoch(1),
                     ResourceGeneration::new(2).expect("generation"),
                 )
             } else {
@@ -322,7 +336,7 @@ impl CapabilityAdmissionPort for FakeAdmission {
             EffectAdmissionFacts::new(
                 AuthorizedEffect {
                     proposal: request.proposal().clone(),
-                    authority_epoch: *request.authority_epoch(),
+                    authority_epoch: request.authority_epoch().clone(),
                     authorization_ref: "effect-authorization-1".to_owned(),
                     authorized_at: "provider-observed".to_owned(),
                     expires_at: "provider-expiry".to_owned(),
@@ -490,7 +504,7 @@ impl DurableCheckpointPort for FakeReplay {
                 request.request_id(),
                 request.stream_id(),
                 request.producer_generation(),
-                *request.authority_epoch(),
+                request.authority_epoch().clone(),
                 request.state_fence().clone(),
                 request.admission_revision(),
                 request.operation_id().clone(),
@@ -532,7 +546,7 @@ fn block_on<F: Future>(future: F) -> F::Output {
 
 fn authority(state_fence: StateFence) -> AuthorityEnvelope {
     AuthorityEnvelope {
-        epoch: AuthorityEpoch::new(1).expect("epoch"),
+        epoch: test_epoch(1),
         scope_ref: "scope-1".to_owned(),
         effect_ceiling: EffectCeiling {
             scope_ref: "scope-1".to_owned(),
@@ -567,7 +581,8 @@ fn process_request_with(operation: &str, tree: &str, generation: u64) -> Process
     )
     .expect("process intent");
     let fence =
-        FencingToken::new(1, generation, format!("process-fence-{generation:?}")).expect("fence");
+        FencingToken::new(test_epoch(1), generation, format!("process-fence-{generation:?}"))
+            .expect("fence");
     let mut authority = DispatchPermitAuthority::activate(
         DispatchAuthorityId::new("native-worker-authority").expect("authority"),
         KernelDispatchKey::from_secret_bytes([0x5a; 32]).expect("key"),
@@ -652,7 +667,7 @@ fn validated_process_state(request: ProcessRequest) -> Result<ProcessState, Proc
         "monotonic_ns": 1
     }))
     .expect("clock observation");
-    let context = DispatchValidationContext::new(clock, fence, 1, revisions(), 41)?;
+    let context = DispatchValidationContext::new(clock, fence, test_epoch(1), revisions(), 41)?;
     let validated = authority.validate_and_consume(request, observed, &context)?;
     let mut state = ProcessState::from_validated(&validated);
     state.mark_resumed(
@@ -675,9 +690,9 @@ fn hello(connection: &str, request: &str) -> WorkerHello {
         artifact_manifest_digest: "manifest-digest-1".to_owned(),
         launch_nonce: "launch-nonce-1".to_owned(),
         worker_generation: 1,
-        authority_epoch: AuthorityEpoch::new(1).expect("epoch"),
+        authority_epoch: test_epoch(1),
         state_fence: StateFence::new(
-            AuthorityEpoch::new(1).expect("epoch"),
+            test_epoch(1),
             ResourceGeneration::new(1).expect("generation"),
         ),
         route_ref: "route-1".to_owned(),
@@ -695,9 +710,9 @@ fn frame(request_id: &str, body: WorkerFrameBody) -> WorkerFrame {
             .into_iter()
             .collect(),
         deadline_unix_ms: 5_000,
-        authority_epoch: AuthorityEpoch::new(1).expect("epoch"),
+        authority_epoch: test_epoch(1),
         state_fence: StateFence::new(
-            AuthorityEpoch::new(1).expect("epoch"),
+            test_epoch(1),
             ResourceGeneration::new(1).expect("generation"),
         ),
         lease_id: serde_json::from_value::<WorkLeaseId>(serde_json::json!({"namespace": "eliot.governor.work-lease", "revision": "v1", "value": "lease-1"})).expect("lease"),
@@ -883,15 +898,15 @@ fn stale_epoch_and_fence_are_rejected_before_live_provider_use() {
         .expect("admission lock")
         .revalidations;
     let mut stale_epoch = frame("execute-epoch", WorkerFrameBody::Execute(request(None)));
-    stale_epoch.authority_epoch = AuthorityEpoch::new(2).expect("epoch");
-    stale_epoch.state_fence.authority_epoch = AuthorityEpoch::new(2).expect("epoch");
+    stale_epoch.authority_epoch = test_epoch(2);
+    stale_epoch.state_fence.authority_epoch = test_epoch(2);
     assert_eq!(
         block_on(core.handle(stale_epoch)),
         Err(WorkerError::StaleEpoch)
     );
     let mut stale_fence = frame("execute-fence", WorkerFrameBody::Execute(request(None)));
     stale_fence.state_fence = StateFence::new(
-        AuthorityEpoch::new(1).expect("epoch"),
+        test_epoch(1),
         ResourceGeneration::new(2).expect("generation"),
     );
     assert_eq!(
@@ -1110,9 +1125,9 @@ fn reconnect_replays_and_ack_advances_only_through_durable_port() {
             event_id: heartbeat[0].event_id.clone(),
             sequence: heartbeat[0].sequence,
             producer_generation: 1,
-            authority_epoch: AuthorityEpoch::new(1).expect("epoch"),
+            authority_epoch: test_epoch(1),
             state_fence: StateFence::new(
-                AuthorityEpoch::new(1).expect("epoch"),
+                test_epoch(1),
                 ResourceGeneration::new(1).expect("generation"),
             ),
             phase: AckPhase::Normalized,
@@ -1380,7 +1395,7 @@ fn native_case_17_typed_v2_roundtrips_and_sealed_provider_output_matches() {
     let original_hello = hello("connection-17", "request-17");
     let hello_wire = serde_json::to_value(&original_hello).expect("hello wire");
     assert_eq!(hello_wire["protocol_version"], PROTOCOL_VERSION);
-    assert!(hello_wire["authority_epoch"].is_number());
+    assert_eq!(hello_wire["authority_epoch"], epoch_wire());
     assert!(hello_wire["state_fence"].is_object());
     assert_eq!(
         serde_json::from_value::<WorkerHello>(hello_wire).expect("hello roundtrip"),
@@ -1389,7 +1404,7 @@ fn native_case_17_typed_v2_roundtrips_and_sealed_provider_output_matches() {
 
     let original_frame = frame("request-17", WorkerFrameBody::Execute(request(None)));
     let frame_wire = serde_json::to_value(&original_frame).expect("frame wire");
-    assert!(frame_wire["authority_epoch"].is_number());
+    assert_eq!(frame_wire["authority_epoch"], epoch_wire());
     assert!(frame_wire["state_fence"].is_object());
     assert_eq!(
         serde_json::from_value::<WorkerFrame>(frame_wire).expect("frame roundtrip"),
@@ -1407,7 +1422,7 @@ fn native_case_17_typed_v2_roundtrips_and_sealed_provider_output_matches() {
         .cloned()
         .expect("start event");
     let event_wire = serde_json::to_value(&event).expect("event wire");
-    assert!(event_wire["authority_epoch"].is_number());
+    assert_eq!(event_wire["authority_epoch"], epoch_wire());
     assert!(event_wire["state_fence"].is_object());
     assert_eq!(
         serde_json::from_value::<WorkerEventEnvelope>(event_wire).expect("event roundtrip"),
@@ -1424,7 +1439,7 @@ fn native_case_17_typed_v2_roundtrips_and_sealed_provider_output_matches() {
         acknowledged_at_unix_ms: 1_000,
     };
     let ack_wire = serde_json::to_value(&ack).expect("ack wire");
-    assert!(ack_wire["authority_epoch"].is_number());
+    assert_eq!(ack_wire["authority_epoch"], epoch_wire());
     assert!(ack_wire["state_fence"].is_object());
     assert_eq!(
         serde_json::from_value::<EventAckReceipt>(ack_wire).expect("ack roundtrip"),
@@ -1453,7 +1468,7 @@ fn native_case_17_typed_v2_roundtrips_and_sealed_provider_output_matches() {
     assert_eq!(sealed.authority().state_fence, request.hello().state_fence);
     let facts_wire: serde_json::Value =
         serde_json::from_str(&facts_wire).expect("facts JSON object");
-    assert!(facts_wire["authority"]["epoch"].is_number());
+    assert_eq!(facts_wire["authority"]["epoch"], epoch_wire());
     assert!(facts_wire["authority"]["state_fence"].is_object());
     assert_eq!(provider.state.lock().expect("admission lock").admissions, 1);
 }
@@ -1517,13 +1532,13 @@ fn native_case_20_zero_counters_and_epoch_fence_mismatch_reject() {
     value["state_fence"]["resource_generation"] = serde_json::json!(0);
     assert!(serde_json::from_value::<WorkerHello>(value).is_err());
     let mut mismatched = hello("connection-20c", "request-20c");
-    mismatched.authority_epoch = AuthorityEpoch::new(2).expect("epoch");
+    mismatched.authority_epoch = test_epoch(2);
     assert_eq!(
         mismatched.validate(),
         Err(WorkerError::InvalidHandshake("epoch_fence"))
     );
     let mut mismatched_frame = frame("request-20d", WorkerFrameBody::Execute(request(None)));
-    mismatched_frame.authority_epoch = AuthorityEpoch::new(2).expect("epoch");
+    mismatched_frame.authority_epoch = test_epoch(2);
     assert_eq!(
         mismatched_frame.validate_shape(),
         Err(WorkerError::InvalidFrame("epoch_fence"))
@@ -1579,7 +1594,7 @@ fn native_case_21_stale_resource_task_policy_integration_fences_preserve_provide
         .expect("admission lock")
         .revalidations;
     let baseline_fence = StateFence::new(
-        AuthorityEpoch::new(1).expect("epoch"),
+        test_epoch(1),
         ResourceGeneration::new(1).expect("generation"),
     );
     for (name, fence) in [

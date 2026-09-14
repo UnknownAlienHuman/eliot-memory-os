@@ -33,8 +33,8 @@
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use eliot_contracts::{
-    AuthorityEpoch, ClockReading, ProductId, RequestMetadata, ResourceGeneration, SessionId,
-    SourceId, StateFence, canonical_json_bytes, sha256_hex,
+    ClockReading, EpochId, ProductId, RequestMetadata, ResourceGeneration, SessionId, SourceId,
+    StateFence, canonical_json_bytes, sha256_hex,
 };
 use eliot_mcp::{
     ApplicationRequest, CompatibilityCorrelation, HostCancellationPortOutcome,
@@ -80,7 +80,7 @@ pub struct AuthenticatedHostSession {
     session: SessionBinding,
     transport: TransportRequestContext,
     state_fence: StateFence,
-    authority_epoch: AuthorityEpoch,
+    authority_epoch: EpochId,
     generation: ResourceGeneration,
     connection_id: String,
     descriptor: AgentBridgeAdmissionDescriptor,
@@ -121,12 +121,20 @@ impl AuthenticatedHostSession {
                     .to_owned(),
             })?;
         check_transport(&transport)?;
+        // Live authority comes from the Kernel service lineage (Implements #64).
+        // `KernelService::authority_epoch` migrates to `EpochId` with the
+        // lifecycle owner; until then this assumes its `EpochId` shape
+        // (residual: `lifecycle.rs` `authority_epoch()`).
         let authority_epoch = service.authority_epoch();
         let generation = activation.generation;
-        if admission.authority_epoch != authority_epoch || admission.generation != generation {
+        if !admission
+            .authority_epoch
+            .is_same_authority(&authority_epoch)
+            || admission.generation != generation
+        {
             return Err(PortFailure::FenceMismatch);
         }
-        let expected_fence = StateFence::new(authority_epoch, generation);
+        let expected_fence = StateFence::new(authority_epoch.clone(), generation);
         if admission.state_fence != expected_fence {
             return Err(PortFailure::FenceMismatch);
         }
@@ -158,7 +166,7 @@ impl AuthenticatedHostSession {
             })?;
         let session = SessionBinding {
             session_id,
-            authority_epoch,
+            authority_epoch: authority_epoch.clone(),
             state_fence: expected_fence.clone(),
         };
         let connection_id = transport.connection_id.clone();
@@ -200,8 +208,8 @@ impl AuthenticatedHostSession {
 
     /// Returns the authenticated authority epoch.
     #[must_use]
-    pub const fn authority_epoch(&self) -> AuthorityEpoch {
-        self.authority_epoch
+    pub fn authority_epoch(&self) -> &EpochId {
+        &self.authority_epoch
     }
 
     /// Returns the authenticated resource generation.
@@ -564,7 +572,12 @@ impl<P: KernelGovernorPort + ?Sized> KernelHostRequestPort for KernelHostRequest
                 reason: "operation handle is not owned by this session".to_owned(),
             });
         }
-        if stored.authority_epoch != self.session.authority_epoch().value()
+        // Exact-tuple lineage check (Implements #64): the durable record epoch
+        // (widened to `EpochId` in ORS `HostRequestRecord`) must match the live
+        // session epoch; equal sequences from different lineages are unrelated.
+        if !stored
+            .authority_epoch
+            .is_same_authority(self.session.authority_epoch())
             || stored.generation != self.session.generation().value()
         {
             return Err(PortFailure::FenceMismatch);
@@ -699,7 +712,7 @@ fn requested_host_request_record(
                 reason: "state fence cannot be canonicalized".to_owned(),
             }
         })?,
-        authority_epoch: envelope.state_fence.authority_epoch.value(),
+        authority_epoch: envelope.state_fence.authority_epoch.clone(),
         generation: envelope.state_fence.resource_generation.value(),
         deadline_unix_ms: envelope.identity.deadline_unix_ms,
         state: HostRequestState::Requested,

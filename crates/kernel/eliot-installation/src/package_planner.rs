@@ -11,17 +11,29 @@ use eliot_runtime_contracts::RuntimeLiveStoreIdentity;
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
 
+use eliot_contracts::{EpochId, EpochLineageId};
 use crate::{
-    AgentBridgeSourceMaterializationPlan, AuthorityEpoch, CandidateManifest, InstallationEpoch,
-    InstallationError, InstallationProfile, InstallationTransaction, InstallerAclPrincipal,
-    InstallerEffectPlan, InstallerServiceAccount, InstallerServiceRole, LOCAL_SERVICE_SID,
-    ManagedEnvironmentAction, ManagedEnvironmentChangeRequest, PHASE_B_PENDING_MARKER,
-    PackageArtifactDigest, PlannedChange, ResourceGeneration, RuntimeLaunchDescriptor,
-    RuntimeStateRoots, StateFence, StoreCredentialProvider, StoreCredentialProvisionPlan,
-    StoreCredentialScope, SupervisionAuthorityProvisionPlan,
-    candidate_manifest_digest as candidate_digest_fn, handle,
+    AgentBridgeSourceMaterializationPlan, CandidateManifest, InstallationEpoch, InstallationError,
+    InstallationProfile, InstallationTransaction, InstallerAclPrincipal, InstallerEffectPlan,
+    InstallerServiceAccount, InstallerServiceRole, LOCAL_SERVICE_SID, ManagedEnvironmentAction,
+    ManagedEnvironmentChangeRequest, PHASE_B_PENDING_MARKER, PackageArtifactDigest, PlannedChange,
+    ResourceGeneration, RuntimeLaunchDescriptor, RuntimeStateRoots, StateFence,
+    StoreCredentialProvider, StoreCredentialProvisionPlan, StoreCredentialScope,
+    SupervisionAuthorityProvisionPlan, candidate_manifest_digest as candidate_digest_fn, handle,
     phase_b_static_template_for_candidate, supervision_key_slot_for_scope_id,
 };
+
+// Canonical lineage-A for the Phase-A template fence (Implements #64).
+const PACKAGE_PLANNER_LINEAGE_A: &str = "550e8400-e29b-41d4-a716-446655440000";
+
+fn planner_epoch(sequence: u64) -> EpochId {
+    use std::num::NonZeroU64;
+    EpochId::new(
+        EpochLineageId::new(PACKAGE_PLANNER_LINEAGE_A).expect("canonical planner lineage-A"),
+        NonZeroU64::new(sequence).expect("non-zero planner sequence"),
+    )
+    .expect("valid planner epoch")
+}
 
 /// The immutable package inventory produced by the trusted generation seam.
 ///
@@ -1205,18 +1217,17 @@ impl GenerationPackagePlanner {
                 field: "generation.authority_generation".to_owned(),
                 reason: error.to_string(),
             })?;
-        let authority_epoch =
-            AuthorityEpoch::new(1).map_err(|error| InstallationError::InvalidField {
-                field: "generation.authority_epoch".to_owned(),
-                reason: error.to_string(),
-            })?;
-        let authority_state_fence = StateFence::new(authority_epoch, authority_generation);
+        let authority_epoch = planner_epoch(1);
+        let authority_state_fence = StateFence::new(authority_epoch.clone(), authority_generation);
         if let Some(source) = input.agent_bridge_source.as_ref() {
             let expected_kernel_snapshot = serde_json::json!({
                 "service": "eliot-kernel",
                 "protocol": "eliot.kernel.v1",
                 "generation": authority_generation.value(),
-                "authority_epoch": authority_epoch.value(),
+                "authority_epoch": {
+                    "lineage_id": PACKAGE_PLANNER_LINEAGE_A,
+                    "sequence": 1
+                },
                 "artifact_digest": kernel_digest.as_str(),
                 "protected_snapshot_digest": protected_snapshot_digest.as_str(),
             });
@@ -1234,7 +1245,9 @@ impl GenerationPackagePlanner {
                 || declaration.expected_kernel_session_id != 0
                 || declaration.expected_kernel_principal_binding
                     != format!("sid={LOCAL_SERVICE_SID};session=0")
-                || declaration.expected_kernel_authority_epoch != authority_epoch
+                || !declaration
+                    .expected_kernel_authority_epoch
+                    .is_same_authority(&authority_epoch)
                 || declaration.expected_kernel_generation != authority_generation
                 || declaration.expected_kernel_artifact_sha256 != kernel_digest.as_str()
                 || declaration.expected_kernel_config_snapshot_sha256
@@ -2363,7 +2376,7 @@ mod tests {
             generation: h("candidate"),
             authority_generation: eliot_contracts::ResourceGeneration::genesis(),
             authority_state_fence: eliot_contracts::StateFence::new(
-                eliot_contracts::AuthorityEpoch::genesis(),
+                planner_epoch(1),
                 eliot_contracts::ResourceGeneration::genesis(),
             ),
             supervision_authority: crate::SupervisionAuthorityBinding::Pending {

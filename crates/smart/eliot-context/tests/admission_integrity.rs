@@ -1,20 +1,33 @@
 use std::error::Error;
+use std::num::NonZeroU64;
 
 use eliot_context::{
     AdmissionDisposition, ContextAtom, ContextCompiler, ContextError, ContextInput, ContextRecipe,
     ContextRole, RoleBudget,
 };
-use eliot_contracts::{ArtifactId, AuthorityEpoch, ResourceGeneration, StateFence, TaskRevision};
+use eliot_contracts::{
+    ArtifactId, EpochId, EpochLineageId, ResourceGeneration, StateFence, TaskRevision,
+};
 use eliot_evidence::{Assertability, EpistemicStatus, EvidenceFreshness};
 
 type TestResult = Result<(), Box<dyn Error>>;
+
+const TEST_LINEAGE_A: &str = "550e8400-e29b-41d4-a716-446655440000";
+
+fn test_epoch(sequence: u64) -> EpochId {
+    EpochId::new(
+        EpochLineageId::new(TEST_LINEAGE_A).expect("valid test lineage"),
+        NonZeroU64::new(sequence).expect("nonzero test sequence"),
+    )
+    .expect("valid test epoch")
+}
 
 fn revision(value: u64) -> Result<TaskRevision, Box<dyn Error>> {
     Ok(TaskRevision::new(value)?)
 }
 
 fn fence(task_revision: TaskRevision) -> StateFence {
-    let mut fence = StateFence::new(AuthorityEpoch::genesis(), ResourceGeneration::genesis());
+    let mut fence = StateFence::new(test_epoch(1), ResourceGeneration::genesis());
     fence.task_revision = Some(task_revision);
     fence
 }

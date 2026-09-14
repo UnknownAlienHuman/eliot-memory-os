@@ -38,7 +38,10 @@ fn request_json(command: &str) -> Value {
                     "product_id": "product-1",
                     "source_id": "source-1",
                     "state_fence": {
-                        "authority_epoch": 1,
+                        "authority_epoch": {
+                            "lineage_id": "550e8400-e29b-41d4-a716-446655440000",
+                            "sequence": 1
+                        },
                         "resource_generation": 1,
                         "task_revision": null,
                         "policy_revision": null,
@@ -52,7 +55,10 @@ fn request_json(command: &str) -> Value {
                     }
                 },
                 "state_fence": {
-                    "authority_epoch": 1,
+                    "authority_epoch": {
+                        "lineage_id": "550e8400-e29b-41d4-a716-446655440000",
+                        "sequence": 1
+                    },
                     "resource_generation": 1,
                     "task_revision": null,
                     "policy_revision": null,

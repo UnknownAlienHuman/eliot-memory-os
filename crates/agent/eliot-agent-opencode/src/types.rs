@@ -1316,7 +1316,18 @@ pub enum RunStatus {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use eliot_contracts::{EpochId, EpochLineageId};
     use serde_json::json;
+
+    const TEST_LINEAGE_A: &str = "550e8400-e29b-41d4-a716-446655440000";
+
+    fn test_epoch(lineage: &str, sequence: u64) -> EpochId {
+        EpochId::new(
+            EpochLineageId::new(lineage).expect("valid test lineage"),
+            std::num::NonZeroU64::new(sequence).expect("nonzero test sequence"),
+        )
+        .expect("valid test epoch")
+    }
 
     fn model() -> Result<ModelSelection, ModelSelectionError> {
         ModelSelection::new("opencode-go", "deepseek-v4-flash")
@@ -1783,8 +1794,11 @@ mod tests {
         use eliot_agent_api::{
             AttemptId, ExecutionUnit, NativeSession, NativeSessionLocator, RequestId, WorkLeaseId,
         };
-        use eliot_contracts::{AuthorityEpoch, ResourceGeneration, StateFence};
-        let fence = StateFence::new(AuthorityEpoch::new(1)?, ResourceGeneration::new(1)?);
+        use eliot_contracts::{ResourceGeneration, StateFence};
+        let fence = StateFence::new(
+            test_epoch(TEST_LINEAGE_A, 1),
+            ResourceGeneration::new(1)?,
+        );
         Ok(ProviderExecutionBinding {
             attempt_id: AttemptId::new("attempt-opencode")?,
             lease_id: serde_json::from_value(
