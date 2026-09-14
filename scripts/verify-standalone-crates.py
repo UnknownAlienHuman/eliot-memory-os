@@ -10,7 +10,8 @@ ships 1 424 lines and 16 passing tests that no gate runs.
 
 It also compile-checks the test targets of every package listed in the root
 workspace `exclude` (Cargo.toml:139-185), which no workspace-wide `cargo test`
-reaches, with a locked no-run build per package.
+reaches, with a locked no-run build per package when `<crate>/Cargo.lock`
+exists and an offline no-run build otherwise (lockless libraries).
 
 This verifier discovers those crates from the tree rather than a hand-written
 list, and runs fmt, clippy and the tests for each one. It does not admit any
@@ -31,12 +32,29 @@ STEPS: tuple[tuple[str, tuple[str, ...]], ...] = (
     ("test", ("cargo", "test", "--manifest-path", "{manifest}", "--all-targets")),
 )
 
-# --locked follows the locked-cargo convention (scripts/verify.ps1:291);
-# --all-targets matches the existing test step scope
-# (scripts/verify-standalone-crates.py:31); --no-run compiles without executing.
-EXCLUDE_NORUN_STEPS: tuple[tuple[str, tuple[str, ...]], ...] = (
-    ("test-no-run", ("cargo", "test", "--manifest-path", "{manifest}", "--locked", "--no-run", "--all-targets")),
-)
+def exclude_norun_steps(crate: Path) -> tuple[tuple[str, tuple[str, ...]], ...]:
+    # Runtime flag selection per package (never a hardcoded per-package list):
+    # - `cargo test --help` documents `--locked` as
+    #   "Assert that `Cargo.lock` will remain unchanged", `--offline` as
+    #   "Run without accessing the network", and `--frozen` as
+    #   "Equivalent to specifying both --locked and --offline".
+    # - For lockless packages `--locked` fails before compiling with
+    #   "cannot create the lock file ... because --locked was passed" plus
+    #   "help: ... remove the --locked flag and use --offline instead", so the
+    #   lockless cohort uses `--offline` (documented equivalent per that help;
+    #   compiles all targets without network using the cached registry).
+    # - If `<crate>/Cargo.lock` exists, keep `--locked` (locked-cargo
+    #   convention scripts/verify.ps1:291); the 45 root workspace.exclude
+    #   packages are lockless libraries (no committed Cargo.lock;
+    #   crates/*/*/Cargo.lock gitignored per .gitignore:77), so they take the
+    #   `--offline` branch. A generated Cargo.lock is gitignored build output
+    #   (harmless, matches existing STEPS test behavior which also creates
+    #   them). `--all-targets` matches the existing test step scope
+    #   (scripts/verify-standalone-crates.py:31); `--no-run` compiles without
+    #   executing.
+    if (crate / "Cargo.lock").is_file():
+        return (("test-no-run", ("cargo", "test", "--manifest-path", "{manifest}", "--locked", "--no-run", "--all-targets")),)
+    return (("test-no-run", ("cargo", "test", "--manifest-path", "{manifest}", "--offline", "--no-run", "--all-targets")),)
 
 
 def workspace_paths(root: Path) -> tuple[set[str], set[str]]:
@@ -125,7 +143,7 @@ def main() -> int:
     for crate in crates:
         failures.extend(run_crate_steps(root, crate, STEPS))
     for crate in excluded:
-        failures.extend(run_crate_steps(root, crate, EXCLUDE_NORUN_STEPS))
+        failures.extend(run_crate_steps(root, crate, exclude_norun_steps(crate)))
 
     total = len(crates) + len(excluded)
     if failures:
