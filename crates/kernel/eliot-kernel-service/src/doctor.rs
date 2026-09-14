@@ -123,6 +123,10 @@ pub enum DoctorRegistryError {
     /// The registry admits no recipe.
     #[error("doctor recipe registry admits no recipe")]
     EmptyRegistry,
+    /// The one-shot composition supplied a recipe outside the
+    /// automatic-safe class.
+    #[error("doctor one-shot registry admits exactly one automatic-safe recipe")]
+    NotAutomaticSafe,
     /// Two recipes claim one recipe identity.
     #[error("duplicate doctor recipe {recipe_id} revision {revision}")]
     DuplicateRecipe {
@@ -157,6 +161,26 @@ pub struct DoctorRecipeRegistry {
 }
 
 impl DoctorRecipeRegistry {
+    /// Builds the closed one-shot registry from composition-supplied terms.
+    ///
+    /// Bins composition supplies the exact manifest revision and the one
+    /// automatic-safe recipe, and this validates both through
+    /// [`Self::register`] unchanged while additionally requiring the single
+    /// recipe to be [`RepairClass::AutomaticSafe`] — the class the closed
+    /// one-shot effect adapter executes. Content authority stays with the
+    /// supplying composition (the Kernel or Governor supplied set named in
+    /// the struct docs): Kernel-service mints no recipe, manifest, or
+    /// provenance value here, and advertisement stays inert.
+    pub fn production_one_shot(
+        manifest: RepairRecipeManifest,
+        recipe: RepairRecipe,
+    ) -> Result<Self, DoctorRegistryError> {
+        if !matches!(recipe.repair_class, RepairClass::AutomaticSafe) {
+            return Err(DoctorRegistryError::NotAutomaticSafe);
+        }
+        Self::register(manifest, vec![recipe])
+    }
+
     /// Registers one immutable manifest revision with its recipe set.
     ///
     /// Validates the manifest, every recipe, and every bound identity, and
