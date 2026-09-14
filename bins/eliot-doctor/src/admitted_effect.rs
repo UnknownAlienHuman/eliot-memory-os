@@ -11,13 +11,14 @@
 //! unreachable here by construction because the executor-side verification
 //! axes are always recorded as not-executed, unassessed, and unbound.
 //!
-//! The concrete authenticated Kernel IPC binding is owned by the concurrent
-//! Slice 2 work. Until that seam lands, the only honest client in this
-//! tree reports the Kernel as not advertising the Doctor operation, so the
-//! binary stays fail-closed with exit 78. The one-shot execution paths
-//! below are written against the `KernelDoctorClient` trait abstraction and
-//! become reachable once Slice 2 delivers authenticated admission material
-//! plus the shared executor handle.
+//! The concrete authenticated Kernel IPC binding lives in the adjacent
+//! `kernel_client` composition module of this binary (Slice C, issue #461):
+//! protected-config bootstrap, live advertisement probe, the exact
+//! `eliot.kernel.doctor-repair-attempt` exchange, and the one-shot driver.
+//! The one-shot execution paths below are written against the
+//! `KernelDoctorClient` trait abstraction; the driver supplies the real IPC
+//! client, so every path below is reachable with a Kernel-issued admission
+//! and stays fail-closed without one.
 
 use std::collections::BTreeSet;
 use std::sync::{Arc, Mutex};
@@ -25,10 +26,10 @@ use std::sync::{Arc, Mutex};
 use eliot_doctor_core::{
     AdapterReceiptStatus, ArtifactBinding, CONTRACT_NAME, CONTRACT_VERSION, CleanupDisposition,
     ClosedRepairRequest, DoctorDisposition, DoctorError, EffectDisposition, EffectIntent,
-    EffectOutcome, EvaluationOutcome, EvidenceHandle, IndependenceClass, IndependenceProfile,
-    KERNEL_ADMISSION_REQUIRED, KernelAdmission, KernelDoctorClient, RepairAttemptIdentity,
-    RepairClass, RepairEffectIdentity, RepairOperationRef, RepairRecipeManifest, RepairRequest,
-    ScopeAttestation, VerificationExecution, VerificationReport, VerifiedAttempt, VerifierEvidence,
+    EvaluationOutcome, EvidenceHandle, IndependenceClass, IndependenceProfile,
+    KERNEL_ADMISSION_REQUIRED, KernelDoctorClient, RepairAttemptIdentity, RepairClass,
+    RepairEffectIdentity, RepairOperationRef, RepairRecipeManifest, ScopeAttestation,
+    VerificationExecution, VerificationReport, VerifiedAttempt, VerifierEvidence,
     disposition_for_verified_attempt,
 };
 use eliot_process::{
@@ -287,59 +288,6 @@ pub fn admission_required_line(detail: &str) -> String {
     format!(
         "{KERNEL_ADMISSION_REQUIRED}: operation={CONTRACT_NAME} version={CONTRACT_VERSION} detail={detail} residual={SLICE2_KERNEL_BINDING_RESIDUAL} contour={PROCESS_CONTOUR_RESIDUAL}"
     )
-}
-
-/// Honest Kernel client for the current tree: the Kernel does not advertise
-/// the Doctor operation (verified: no importable doctor admission seam
-/// exists in the kernel tree at the authority base), so advertisement
-/// reports false and every authority-bearing method fails closed with a
-/// typed error. The concurrent Slice 2 work replaces this binding with the
-/// authenticated IPC client; until then every path exits 78 without effect.
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
-pub struct UnadvertisedKernelClient;
-
-impl UnadvertisedKernelClient {
-    /// Creates the current-tree client: advertisement absent by verified fact.
-    #[must_use]
-    pub const fn current() -> Self {
-        Self
-    }
-}
-
-/// Typed failure for authority-bearing calls on an unadvertised operation.
-#[derive(Clone, Copy, Debug, Eq, PartialEq, thiserror::Error)]
-pub enum UnadvertisedKernelError {
-    /// The Doctor operation is not advertised, so no admission exists.
-    #[error("kernel does not advertise the doctor operation (KERNEL_ADMISSION_REQUIRED)")]
-    NotAdvertised,
-}
-
-impl KernelDoctorClient for UnadvertisedKernelClient {
-    type Error = UnadvertisedKernelError;
-
-    fn advertise_doctor(&mut self) -> Result<bool, Self::Error> {
-        Ok(false)
-    }
-
-    fn admit(&mut self, _request: &RepairRequest) -> Result<KernelAdmission, Self::Error> {
-        Err(UnadvertisedKernelError::NotAdvertised)
-    }
-
-    fn record_intent(&mut self, _intent: &EffectIntent) -> Result<(), Self::Error> {
-        Err(UnadvertisedKernelError::NotAdvertised)
-    }
-
-    fn execute(&mut self, _intent: &EffectIntent) -> Result<EffectOutcome, Self::Error> {
-        Err(UnadvertisedKernelError::NotAdvertised)
-    }
-
-    fn reconcile(
-        &mut self,
-        _job_id: &str,
-        _attempt_id: &str,
-    ) -> Result<EffectOutcome, Self::Error> {
-        Err(UnadvertisedKernelError::NotAdvertised)
-    }
 }
 
 const SINK_LOCK_POISONED: &str = "evidence collector lock poisoned";
@@ -1047,4 +995,206 @@ pub fn project_diagnosis(
             cleanup: None,
         },
     )
+}
+
+/// Projects a cancelled effect-carrying admission to its terminal without
+/// touching any executor. A cancelled admission binds no effect, so there
+/// is no effect path here at all: execution is impossible, not merely
+/// refused. The caller proves cancellation through the closed request or
+/// the Kernel admission; a live request is rejected fail-closed instead of
+/// being silently dropped.
+pub fn project_cancelled(
+    request: &ClosedRepairRequest,
+    manifest: &RepairRecipeManifest,
+    now: OffsetDateTime,
+) -> Result<OneShotOutcome, AdapterError> {
+    request.validate_closed(manifest, now)?;
+    if !request.cancellation {
+        return Err(AdapterError::Admission(DoctorError::OperationNotAdmitted));
+    }
+    emit_outcome(
+        None,
+        None,
+        DispositionParts {
+            effect_disposition: None,
+            disposition: DoctorDisposition::Cancelled {
+                request_id: request.request_id.clone(),
+            },
+            observed: None,
+            reconciliation_key: None,
+            cleanup: None,
+        },
+    )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use eliot_contracts::{EpochId, EpochLineageId};
+    use eliot_doctor_core::{
+        ClosedRequestParams, DiagnosticBrief, RecoveryLease, RegisteredOperation, RepairRecipe,
+        StateFence,
+    };
+    use std::num::NonZeroU64;
+    use time::Duration;
+
+    const TEST_LINEAGE: &str = "550e8400-e29b-41d4-a716-446655440000";
+
+    fn digest(byte: u8) -> String {
+        (0..32).map(|_| format!("{byte:02x}")).collect()
+    }
+
+    fn test_epoch() -> EpochId {
+        EpochId::new(
+            EpochLineageId::new(TEST_LINEAGE).expect("test lineage"),
+            NonZeroU64::new(7).expect("test sequence"),
+        )
+        .expect("test epoch")
+    }
+
+    fn test_brief() -> DiagnosticBrief {
+        DiagnosticBrief {
+            problem_id: "problem-1".to_owned(),
+            component: "module-supervision".to_owned(),
+            failure_class: "stale-session".to_owned(),
+            symptom: "session does not resume".to_owned(),
+            impact: "bounded supervision retry".to_owned(),
+            evidence: vec![
+                EvidenceHandle::new("evidence-ref-1", digest(0xe1)).expect("test evidence"),
+            ],
+            unknowns: Vec::new(),
+        }
+    }
+
+    fn test_recipe(class: RepairClass) -> RepairRecipe {
+        let (operations, allowed_effects) = match class {
+            RepairClass::DiagnoseOnly => (Vec::new(), BTreeSet::new()),
+            _ => (
+                vec!["op-reconnect".to_owned()],
+                BTreeSet::from(["op-reconnect".to_owned()]),
+            ),
+        };
+        RepairRecipe {
+            recipe_id: "recipe-1".to_owned(),
+            revision: 1,
+            problem_classes: BTreeSet::from(["stale-session".to_owned()]),
+            components: BTreeSet::from(["module-supervision".to_owned()]),
+            repair_class: class,
+            prerequisites: Vec::new(),
+            required_authority: "kernel.doctor-recovery".to_owned(),
+            allowed_effects,
+            operations,
+            expected_observables: vec!["observable-1".to_owned()],
+            verification_contract: vec!["verify-1".to_owned()],
+            rollback_or_compensation: vec!["rollback-1".to_owned()],
+            attempt_budget: 3,
+            cooldown: Duration::seconds(60),
+            stop_conditions: Vec::new(),
+        }
+    }
+
+    fn test_manifest() -> RepairRecipeManifest {
+        RepairRecipeManifest {
+            manifest_id: "manifest-1".to_owned(),
+            manifest_revision: 1,
+            operations: vec![RegisteredOperation {
+                operation_id: "op-reconnect".to_owned(),
+                adapter_id: "automatic-safe".to_owned(),
+                description: "reconnect one admitted generation".to_owned(),
+                definition_digest: digest(0xd1),
+            }],
+        }
+    }
+
+    fn diagnose_request(now: OffsetDateTime) -> (ClosedRepairRequest, RepairRecipeManifest) {
+        let manifest = test_manifest();
+        let request = ClosedRepairRequest::diagnose(ClosedRequestParams {
+            request_id: "req-diagnose-1".to_owned(),
+            brief: test_brief(),
+            recipe: test_recipe(RepairClass::DiagnoseOnly),
+            operations: Vec::new(),
+            fence: StateFence::new(test_epoch(), 3, digest(0xf1)).expect("test fence"),
+            lease: RecoveryLease {
+                lease_id: "lease-1".to_owned(),
+                owner: "kernel.doctor-recovery".to_owned(),
+                expires_at: now + Duration::hours(1),
+                allowed_effects: BTreeSet::from(["op-reconnect".to_owned()]),
+            },
+            approval: None,
+            budget_units: 1,
+            deadline: now + Duration::hours(1),
+            cancellation: false,
+            escalation_target: "governor".to_owned(),
+        })
+        .expect("diagnose request builds");
+        (request, manifest)
+    }
+
+    fn effect_request(now: OffsetDateTime) -> (ClosedRepairRequest, RepairRecipeManifest) {
+        let manifest = test_manifest();
+        let operation = manifest.resolve("op-reconnect").expect("test operation");
+        let request = ClosedRepairRequest::for_effect(ClosedRequestParams {
+            request_id: "req-effect-1".to_owned(),
+            brief: test_brief(),
+            recipe: test_recipe(RepairClass::AutomaticSafe),
+            operations: vec![operation],
+            fence: StateFence::new(test_epoch(), 3, digest(0xf1)).expect("test fence"),
+            lease: RecoveryLease {
+                lease_id: "lease-1".to_owned(),
+                owner: "kernel.doctor-recovery".to_owned(),
+                expires_at: now + Duration::hours(1),
+                allowed_effects: BTreeSet::from(["op-reconnect".to_owned()]),
+            },
+            approval: None,
+            budget_units: 1,
+            deadline: now + Duration::hours(1),
+            cancellation: false,
+            escalation_target: "governor".to_owned(),
+        })
+        .expect("effect request builds");
+        (request, manifest)
+    }
+
+    #[test]
+    fn diagnose_only_projects_without_effect() {
+        let now = OffsetDateTime::now_utc();
+        let (request, manifest) = diagnose_request(now);
+        let outcome = project_diagnosis(&request, &manifest, now).expect("diagnosis projects");
+        assert!(matches!(
+            outcome.disposition,
+            DoctorDisposition::Diagnosed { .. }
+        ));
+        assert_eq!(outcome.exit_code(), EXIT_OK_NO_EFFECT);
+        // The diagnosis path binds no attempt and no effect identity: there
+        // is no identity under which an executor could run.
+        assert!(outcome.report.attempt_digest.is_none());
+        assert!(outcome.report.effect_digest.is_none());
+        assert!(outcome.report.evidence_reference.is_none());
+    }
+
+    #[test]
+    fn effect_request_is_not_diagnosable() {
+        let now = OffsetDateTime::now_utc();
+        let (request, manifest) = effect_request(now);
+        let error =
+            project_diagnosis(&request, &manifest, now).expect_err("effect must not diagnose");
+        assert!(matches!(
+            error,
+            AdapterError::Admission(DoctorError::DiagnoseEffects)
+        ));
+        assert_eq!(error.exit_code(), EXIT_KERNEL_ADMISSION_REQUIRED);
+    }
+
+    #[test]
+    fn bootstrap_rejects_caller_authority() {
+        let argv = vec!["eliot-doctor".to_owned(), "--recipe=r1".to_owned()];
+        let error = decode_bootstrap_args(&argv).expect_err("recipe authority is rejected");
+        assert!(matches!(
+            error,
+            BootstrapError::CallerAuthorityRejected { .. }
+        ));
+        assert_eq!(error.exit_code(), EXIT_KERNEL_ADMISSION_REQUIRED);
+        let argv = vec!["eliot-doctor".to_owned(), "--version".to_owned()];
+        assert_eq!(decode_bootstrap_args(&argv), Ok(BootstrapAction::Version));
+    }
 }

@@ -157,6 +157,16 @@ use eliot_kernel_service::{
     ProcessAuthorityHandoffDescriptor, ProcessExecutionRequest, ProcessExecutionResponse,
     ProcessObservation, StoreBootstrapHandoff,
 };
+/// P-07 Doctor wire seam for the front-door dispatch/driver arms (T6-D2 Slice B).
+///
+/// The dispatch arm (`frame_dispatch`) and the session binder
+/// (`front_door_session`) depend only on these existing `doctor.rs` symbols.
+/// Slice A's `doctor_front_door.rs` handler plugs into the marked call site in
+/// `frame_dispatch::execute_doctor_request` without changing this seam.
+pub use eliot_kernel_service::{
+    DOCTOR_REPAIR_WIRE_ID, DOCTOR_REPAIR_WIRE_VERSION, DoctorAdmissionContext,
+    DoctorRepairAttemptRequest, route_doctor_repair,
+};
 #[cfg(test)]
 use eliot_ors::CanonicalEvidenceProvider;
 use eliot_ors::{AuthorityHandoffBegin, AuthorityHandoffRecord, AuthorityHandoffState, OrsError};
@@ -589,6 +599,20 @@ pub enum KernelFrameAction {
         /// Closed operation name from the daemon application wire.
         operation: String,
         /// Bounded operation payload.
+        payload: serde_json::Value,
+    },
+    /// Execute one authenticated Doctor repair-attempt operation (T6-D2 P-07).
+    /// The operation carries the exact Doctor wire identity; ledger-bound
+    /// admission itself is owned by the P-07 doctor handler through
+    /// `eliot_kernel_service::doctor` (`route_doctor_repair` /
+    /// `admit_doctor_repair`). New-effect intake is `Ready`-gated per kind;
+    /// cancel/reconcile control additionally routes while `Degraded`.
+    Doctor {
+        /// Correlation identity to echo in the response.
+        request_id: RequestId,
+        /// Closed operation name; must equal `DOCTOR_REPAIR_WIRE_ID`.
+        operation: String,
+        /// Bounded operation payload carrying the typed repair-attempt request.
         payload: serde_json::Value,
     },
     /// Return a typed rejection, then fence the connection.

@@ -17,6 +17,7 @@ use std::future::Future;
 use std::pin::Pin;
 
 mod doctor;
+mod doctor_front_door;
 mod host_request_binding;
 mod lifecycle;
 mod process_execution_client;
@@ -32,6 +33,10 @@ pub use doctor::{
     DoctorRepairAdmission, DoctorRepairAttemptRequest, DoctorRepairConflict, DoctorRepairRejection,
     DoctorRepairRejectionReason, DoctorRepairResponse, RegisteredDoctorRecipe, admit_doctor_repair,
     advertise_doctor_repair, reconcile_doctor_repair_admission, route_doctor_repair,
+};
+pub use doctor_front_door::{
+    AuthenticatedDoctorSession, handle_doctor_repair_attempt, handle_doctor_repair_cancellation,
+    is_doctor_diagnosis_only_envelope, reconcile_doctor_repair_delivery,
 };
 pub use eliot_process::ProcessExecutionAdmissionRequest;
 pub use eliot_protocol::{
