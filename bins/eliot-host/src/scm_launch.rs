@@ -3,8 +3,8 @@
 use eliot_platform::ServiceState;
 use eliot_platform_windows::{
     ELIOT_HOST_SERVICE_DISPLAY_NAME, ELIOT_HOST_SERVICE_NAME, ServiceAccount,
-    ServiceBootstrapArguments, ServiceRegistrationRequest, ServiceRegistrationRuntimeInspection,
-    ServiceStartMode, WindowsPlatform,
+    ServiceBootstrapArguments, ServiceInspectionUnknownDetail, ServiceRegistrationRequest,
+    ServiceRegistrationRuntimeInspection, ServiceStartMode, WindowsPlatform,
 };
 
 use super::{HostError, HostLaunchOptions};
@@ -118,6 +118,49 @@ pub const fn host_runtime_bootstrap_state_is_admissible(state: ServiceState) -> 
     )
 }
 
+/// Raw SCM `dwCurrentState` for `SERVICE_START_PENDING`.
+///
+/// The platform preserves the raw state in
+/// [`ServiceInspectionUnknownDetail::current_state`] without mapping it to
+/// [`ServiceState`], so the transient-pending predicate compares against this
+/// documented constant instead of re-deriving the mapping.
+pub const HOST_SCM_START_PENDING_STATE: u32 = 2;
+
+/// Sleep between transient-pending re-reads.
+///
+/// This is the established host-side short poll (the same 250 ms used by the
+/// post-bootstrap control loops), so one re-read can never breach the
+/// `START_PENDING` checkpoint promise the reporter already publishes.
+pub const HOST_SCM_TRANSIENT_RETRY_SLEEP_MS: u64 = 250;
+
+/// Total runtime-contour inspections per bootstrap validation (1 initial + 4
+/// retries). Worst-case added latency is therefore `4 × 250 ms = 1.0 s`, well
+/// inside the SCM wait hint and one reporter tick.
+pub const HOST_SCM_TRANSIENT_MAX_INSPECTIONS: usize = 5;
+
+/// Whether a typed `Unknown` inspection is the transient `START_PENDING`/PID
+/// race rather than a real failure.
+///
+/// Returns true only when `detail.win32_error() == 0` (the platform's own
+/// marker for "logic contour violation, no Win32 error"), `detail.stage() ==
+/// "query-status"`, and `detail.current_state() == Some(2)` (raw
+/// `SERVICE_START_PENDING`, see [`HOST_SCM_START_PENDING_STATE`]). That triple
+/// isolates the two-sample state/PID flap and process-identity race sites from
+/// real failures: a failed second status query carries a real Win32 code, and
+/// grant/config readback failures carry their own stage names. The process id
+/// is deliberately ignored: PID `0` (pre-assignment) and an assigned PID
+/// (mid-window) are both transient while the state is `START_PENDING`.
+///
+/// Only this triple retries, at most `4 × 250 ms`. Every other `Unknown`
+/// (non-zero Win32 code, other stage, or other state) stays fail-closed with
+/// zero retries, as do `Absent`, `Mismatched`, and inadmissible `Matching`.
+#[must_use]
+pub fn host_scm_unknown_is_transient_pending(detail: &ServiceInspectionUnknownDetail) -> bool {
+    detail.win32_error() == 0
+        && detail.stage() == "query-status"
+        && detail.current_state() == Some(HOST_SCM_START_PENDING_STATE)
+}
+
 /// Pure projection from a platform runtime registration inspection to the
 /// typed host-side cause. Returns `None` only for an admissible `Matching`
 /// observation; every other outcome maps to its fail-closed cause, so
@@ -213,6 +256,62 @@ impl ValidatedHostScmLaunch {
     }
 }
 
+/// Injectable read-only mechanics for the bounded transient-pending re-read
+/// loop. Production supplies the live runtime-contour inspection plus
+/// `std::thread::sleep`; tests supply a deterministic scripted sequence with a
+/// recorded clock (no live SCM, no real sleeping). Mirrors
+/// `WatchdogSelfAdmissionProbe::{inspect, sleep_ms}`.
+trait HostScmBootstrapProbe {
+    fn inspect(&mut self) -> ServiceRegistrationRuntimeInspection;
+    fn sleep_ms(&mut self, milliseconds: u64);
+}
+
+/// Drives the bounded transient-pending re-read loop to a settled inspection.
+///
+/// Issues the initial inspection, then — only while the outcome is an
+/// `Unknown` for which [`host_scm_unknown_is_transient_pending`] holds —
+/// sleeps [`HOST_SCM_TRANSIENT_RETRY_SLEEP_MS`] and re-inspects, up to
+/// [`HOST_SCM_TRANSIENT_MAX_INSPECTIONS`] total inspections. Exits on the
+/// first non-transient outcome; a still-transient outcome after exhaustion is
+/// returned as-is so the caller maps it through the existing fail-closed
+/// `Unknown` cause (1066/3). Classification itself stays in
+/// [`classify_host_scm_inspection`], the sole inspection-to-cause mapping site.
+fn resolve_host_scm_inspection_with_probe<P: HostScmBootstrapProbe>(
+    probe: &mut P,
+) -> ServiceRegistrationRuntimeInspection {
+    let mut current = probe.inspect();
+    for _ in 1..HOST_SCM_TRANSIENT_MAX_INSPECTIONS {
+        let transient = matches!(
+            &current,
+            ServiceRegistrationRuntimeInspection::Unknown { detail }
+                if host_scm_unknown_is_transient_pending(detail)
+        );
+        if !transient {
+            break;
+        }
+        probe.sleep_ms(HOST_SCM_TRANSIENT_RETRY_SLEEP_MS);
+        current = probe.inspect();
+    }
+    current
+}
+
+/// Production probe: live runtime-contour inspection plus real thread sleep.
+struct WindowsScmBootstrapProbe<'a> {
+    platform: &'a WindowsPlatform,
+    registration: &'a ServiceRegistrationRequest,
+}
+
+impl HostScmBootstrapProbe for WindowsScmBootstrapProbe<'_> {
+    fn inspect(&mut self) -> ServiceRegistrationRuntimeInspection {
+        self.platform
+            .inspect_service_registration_runtime(self.registration)
+    }
+
+    fn sleep_ms(&mut self, milliseconds: u64) {
+        std::thread::sleep(std::time::Duration::from_millis(milliseconds));
+    }
+}
+
 /// Rebuilds and read-only-inspects the canonical Host SCM registration from
 /// the validated launch options. Host never registers or starts its own SCM
 /// service; the installer is the sole registration owner.
@@ -222,6 +321,13 @@ impl ValidatedHostScmLaunch {
 /// `Stopped`, `Starting`, and `Running` observations with valid
 /// configuration plus grant at `ServiceMain` time. `Starting` is valid: the
 /// host process is already running while SCM still reports `START_PENDING`.
+///
+/// A typed transient `Unknown` (zero Win32 error, `"query-status"` stage, raw
+/// `START_PENDING` state — see [`host_scm_unknown_is_transient_pending`]) is
+/// re-read at most four times at 250 ms intervals (5 inspections, ≤1.0 s
+/// added latency) so the `START_PENDING`/PID-assignment race can converge to
+/// a stable outcome. Exhaustion maps to the existing fail-closed `Unknown`
+/// cause; every other outcome settles with zero retries.
 ///
 /// # Errors
 ///
@@ -267,7 +373,13 @@ pub fn validate_host_scm_bootstrap(
         .ok_or_else(|| HostError::Platform("current executable has no parent".to_owned()))?;
     let platform = WindowsPlatform::new(root.to_path_buf())
         .map_err(|error| HostError::Platform(error.to_string()))?;
-    let inspection = platform.inspect_service_registration_runtime(&registration);
+    let inspection = {
+        let mut probe = WindowsScmBootstrapProbe {
+            platform: &platform,
+            registration: &registration,
+        };
+        resolve_host_scm_inspection_with_probe(&mut probe)
+    };
     if let Some(cause) = classify_host_scm_inspection(&registration, &inspection) {
         return Err(HostError::Platform(cause.detail()));
     }
@@ -368,6 +480,22 @@ mod tests {
         assert_eq!(
             truncate_host_scm_cause(&"d".repeat(4000)).chars().count(),
             HOST_SCM_CAUSE_MAX_CHARS
+        );
+        // The transient-pending predicate can never fire on Mismatched/Absent
+        // projections: they carry no Unknown detail at all, so genuine
+        // configuration/identity drift (including a default-DACL drift) is
+        // never retried and stays fail-closed on the first inspection.
+        assert!(
+            ServiceRegistrationRuntimeInspection::Mismatched
+                .unknown_detail()
+                .is_none(),
+            "Mismatched must carry no Unknown detail for the pending predicate"
+        );
+        assert!(
+            ServiceRegistrationRuntimeInspection::Absent
+                .unknown_detail()
+                .is_none(),
+            "Absent must carry no Unknown detail for the pending predicate"
         );
     }
 
@@ -485,5 +613,218 @@ mod tests {
         );
         assert_ne!(absent_detail, mismatched_detail);
         assert_ne!(absent_detail, unknown_detail);
+
+        // Transient-pending predicate: TRUE only for the (0, "query-status",
+        // START_PENDING) race triple, regardless of PID; FALSE for a real
+        // Win32 code, a non-status stage, or a non-pending state.
+        for (win32_error, stage, state, pid) in [
+            (0_u32, "query-status", 2_u32, 0_u32),
+            (0_u32, "query-status", 2_u32, 4242_u32),
+        ] {
+            let inspection = ServiceRegistrationRuntimeInspection::unknown_with_status(
+                win32_error,
+                stage,
+                state,
+                pid,
+            );
+            let detail = inspection
+                .unknown_detail()
+                .unwrap_or_else(|| panic!("unknown inspection must carry diagnostics"));
+            assert!(
+                host_scm_unknown_is_transient_pending(&detail),
+                "({win32_error}, {stage}, {state}, {pid}) must read as transient pending"
+            );
+        }
+        for (win32_error, stage, state, pid) in [
+            (1066_u32, "query-status", 2_u32, 4242_u32),
+            (0_u32, "query-config", 2_u32, 0_u32),
+            (0_u32, "open-service", 0_u32, 0_u32),
+        ] {
+            let inspection = ServiceRegistrationRuntimeInspection::unknown_with_status(
+                win32_error,
+                stage,
+                state,
+                pid,
+            );
+            let detail = inspection
+                .unknown_detail()
+                .unwrap_or_else(|| panic!("unknown inspection must carry diagnostics"));
+            assert!(
+                !host_scm_unknown_is_transient_pending(&detail),
+                "({win32_error}, {stage}, {state}, {pid}) must stay fail-closed without retry"
+            );
+        }
+    }
+
+    /// Scripted probe for the bounded re-read loop: replays platform
+    /// observations without live SCM and records inspections/sleeps with a
+    /// recorded clock (no real sleeping). It never classifies: every returned
+    /// observation flows through the production
+    /// [`resolve_host_scm_inspection_with_probe`] + [`classify_host_scm_inspection`]
+    /// path, so the loop mechanics — not faked outcomes — are under test.
+    struct RecordingProbe {
+        script: std::collections::VecDeque<ServiceRegistrationRuntimeInspection>,
+        inspections: usize,
+        sleeps_ms: Vec<u64>,
+    }
+
+    impl RecordingProbe {
+        fn with_script(
+            script: impl IntoIterator<Item = ServiceRegistrationRuntimeInspection>,
+        ) -> Self {
+            Self {
+                script: script.into_iter().collect(),
+                inspections: 0,
+                sleeps_ms: Vec::new(),
+            }
+        }
+    }
+
+    impl HostScmBootstrapProbe for RecordingProbe {
+        fn inspect(&mut self) -> ServiceRegistrationRuntimeInspection {
+            self.inspections += 1;
+            self.script
+                .pop_front()
+                .unwrap_or_else(|| panic!("probe script exhausted"))
+        }
+
+        fn sleep_ms(&mut self, milliseconds: u64) {
+            self.sleeps_ms.push(milliseconds);
+        }
+    }
+
+    #[test]
+    fn transient_pending_unknown_retries_then_admits_stable_match() {
+        // Two transient START_PENDING/PID-race Unknowns settle to a stable
+        // outcome: the loop must re-read with 250 ms sleeps and converge well
+        // within 5 inspections. `ServiceRuntimeObservation` fields are
+        // `pub(super)` to the platform crate, so no `Matching { observation }`
+        // value can be constructed here; the scripted terminal is therefore
+        // the first stable non-transient outcome (`Absent`), which proves the
+        // loop exits on stability, while admission itself is proven through
+        // the exact gate the `Matching` arm uses —
+        // `host_runtime_bootstrap_state_is_admissible(Starting)` — the same
+        // predicate-as-gate pattern as
+        // `runtime_starting_is_admissible_while_mismatch_and_unknown_stay_typed`.
+        let request = test_registration_request();
+        let mut probe = RecordingProbe::with_script([
+            ServiceRegistrationRuntimeInspection::unknown_with_status(0, "query-status", 2, 0),
+            ServiceRegistrationRuntimeInspection::unknown_with_status(0, "query-status", 2, 4242),
+            ServiceRegistrationRuntimeInspection::Absent,
+        ]);
+        let settled = resolve_host_scm_inspection_with_probe(&mut probe);
+        assert_eq!(settled, ServiceRegistrationRuntimeInspection::Absent);
+        assert!(
+            probe.inspections <= HOST_SCM_TRANSIENT_MAX_INSPECTIONS,
+            "must converge within the bounded inspections: {}",
+            probe.inspections
+        );
+        assert_eq!(probe.inspections, 3);
+        assert_eq!(
+            probe.sleeps_ms,
+            vec![
+                HOST_SCM_TRANSIENT_RETRY_SLEEP_MS,
+                HOST_SCM_TRANSIENT_RETRY_SLEEP_MS
+            ]
+        );
+        assert_eq!(probe.sleeps_ms, vec![250, 250]);
+        // The settled terminal flows through the real classifier unchanged.
+        let cause = classify_host_scm_inspection(&request, &settled)
+            .unwrap_or_else(|| panic!("settled absent inspection must classify"));
+        assert_eq!(cause.cause(), "absent");
+        // And the production terminal gate admits a stable Starting match, so
+        // a converged `Matching { Starting }` readback proceeds to bootstrap.
+        assert!(host_runtime_bootstrap_state_is_admissible(
+            ServiceState::Starting
+        ));
+    }
+
+    #[test]
+    fn exhausted_pending_and_real_unknown_stay_fail_closed_1066_3() {
+        // A transient that never converges exhausts the bound (5 inspections,
+        // 4 × 250 ms sleeps) and stays fail-closed under the EXISTING Unknown
+        // cause: no new stop code, no capsule change. The 1066/3 mapping
+        // itself lives in `bins/eliot-host/src/main.rs` (`service_main` maps
+        // any `validate_host_scm_bootstrap` error to
+        // `HostStopCode::InvalidRegistration`, specific 3, win32 1066,
+        // `invalid_scm_registration`), which this change does not touch; here
+        // the unchanged `cause()` strings plus the stable
+        // `host-scm-registration-*` detail prefixes and the
+        // `HOST_SCM_CAUSE_MAX_CHARS` bound prove the mapping inputs are
+        // identical, so the call-site projection cannot have moved.
+        let request = test_registration_request();
+        let mut exhaust = RecordingProbe::with_script([
+            ServiceRegistrationRuntimeInspection::unknown_with_status(0, "query-status", 2, 0),
+            ServiceRegistrationRuntimeInspection::unknown_with_status(0, "query-status", 2, 100),
+            ServiceRegistrationRuntimeInspection::unknown_with_status(0, "query-status", 2, 200),
+            ServiceRegistrationRuntimeInspection::unknown_with_status(0, "query-status", 2, 300),
+            ServiceRegistrationRuntimeInspection::unknown_with_status(0, "query-status", 2, 4242),
+        ]);
+        let settled = resolve_host_scm_inspection_with_probe(&mut exhaust);
+        assert_eq!(exhaust.inspections, HOST_SCM_TRANSIENT_MAX_INSPECTIONS);
+        assert_eq!(exhaust.inspections, 5);
+        assert_eq!(
+            exhaust.sleeps_ms,
+            vec![250, 250, 250, 250],
+            "exhaustion must sleep 250 ms between attempts only"
+        );
+        let exhausted_cause = classify_host_scm_inspection(&request, &settled)
+            .unwrap_or_else(|| panic!("exhausted transient must stay fail-closed"));
+        assert_eq!(exhausted_cause.cause(), "unknown");
+        let exhausted_detail = exhausted_cause.detail();
+        assert!(exhausted_detail.contains("host-scm-registration-unknown"));
+        assert!(
+            exhausted_detail.chars().count() <= HOST_SCM_CAUSE_MAX_CHARS,
+            "cause detail must stay bounded"
+        );
+
+        // Fail-closed preservation: a real Win32 code, a drifted
+        // registration, and an absent registration all settle with zero
+        // retries and unchanged cause inputs.
+        for (inspection, expected_cause, expected_prefix) in [
+            (
+                ServiceRegistrationRuntimeInspection::unknown_with_status(
+                    1066,
+                    "query-status",
+                    2,
+                    4242,
+                ),
+                "unknown",
+                "host-scm-registration-unknown",
+            ),
+            (
+                ServiceRegistrationRuntimeInspection::Mismatched,
+                "mismatched",
+                "host-scm-registration-mismatched",
+            ),
+            (
+                ServiceRegistrationRuntimeInspection::Absent,
+                "absent",
+                "host-scm-registration-absent",
+            ),
+        ] {
+            let mut probe = RecordingProbe::with_script([inspection]);
+            let settled = resolve_host_scm_inspection_with_probe(&mut probe);
+            assert_eq!(
+                probe.inspections, 1,
+                "{expected_cause} must settle with zero retries"
+            );
+            assert!(
+                probe.sleeps_ms.is_empty(),
+                "{expected_cause} must sleep zero times"
+            );
+            let cause = classify_host_scm_inspection(&request, &settled)
+                .unwrap_or_else(|| panic!("{expected_cause} inspection must classify"));
+            assert_eq!(cause.cause(), expected_cause);
+            let detail = cause.detail();
+            assert!(
+                detail.contains(expected_prefix),
+                "{expected_cause} detail must keep its prefix: {detail}"
+            );
+            assert!(
+                detail.chars().count() <= HOST_SCM_CAUSE_MAX_CHARS,
+                "{expected_cause} detail must stay bounded"
+            );
+        }
     }
 }
