@@ -25,20 +25,18 @@ use std::future::Future;
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::task::{Context, Poll, Waker};
 
-use eliot_agent_api::{
-    AttemptId, AuthorityEnvelope, BudgetEnvelope, EffectCeiling, EffectKind, ResourceGeneration,
-    StateFence, WorkLeaseId,
-};
 use eliot_contracts::{
-    ClockReading, DecisionId, EpochId, EpochLineageId, SessionId, TaskId, sha256_hex,
+    ClockReading, DecisionId, EpochId, EpochLineageId, ResourceGeneration, SessionId, StateFence,
+    TaskId, WorkLeaseId, sha256_hex,
 };
 use eliot_native_worker::{NativeWorker, NativeWorkerError};
 use eliot_native_worker_core::{
-    AdmissionLivenessOutcome, CapabilityAdmissionFacts, CapabilityAdmissionOutcome,
-    CapabilityAdmissionPort, CapabilityAdmissionRequest, CapabilityLivenessRequest,
-    CheckpointProviderOutcome, CheckpointReceiptFacts, ClaimAdmissionRequest,
-    DurableCheckpointPort, DurableCheckpointRequest, DurableReplayPort, DurableRequestDecision,
-    EXECUTION_UNIT_SCHEMA_VERSION, EffectAdmissionOutcome, EffectAdmissionRequest, EventAckReceipt,
+    AdmissionLivenessOutcome, AttemptId, AuthorityEnvelope, BudgetEnvelope,
+    CapabilityAdmissionFacts, CapabilityAdmissionOutcome, CapabilityAdmissionPort,
+    CapabilityAdmissionRequest, CapabilityLivenessRequest, CheckpointProviderOutcome,
+    CheckpointReceiptFacts, ClaimAdmissionRequest, DurableCheckpointPort, DurableCheckpointRequest,
+    DurableReplayPort, DurableRequestDecision, EXECUTION_UNIT_SCHEMA_VERSION,
+    EffectAdmissionOutcome, EffectAdmissionRequest, EffectCeiling, EffectKind, EventAckReceipt,
     JSON_ENCODING_PROFILE, NATIVE_WORKER_CLAIM_WIRE_VERSION,
     NATIVE_WORKER_EXECUTABLE_BINDING_EXPECTED_WIRE_VERSION, NativeClaimId, NativeRegistrationId,
     NativeRenewalId, NativeWorkerClaim, NativeWorkerExecutableBinding,

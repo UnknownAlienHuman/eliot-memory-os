@@ -13,6 +13,12 @@ mod protocol;
 use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
 
+/// Constituent envelope types of the public claim protocol, re-exported so
+/// composition roots (which must not depend on the agent plane directly) can
+/// build and inspect claims through this crate's API.
+pub use eliot_agent_api::{
+    AttemptId, AuthorityEnvelope, BudgetEnvelope, EffectCeiling, EffectKind,
+};
 use eliot_agent_api::{AuthorizedEffect, ProposedEffect};
 use eliot_process::{
     CancellationStatus, EvidenceSinkError, FencingToken, OperationId,
