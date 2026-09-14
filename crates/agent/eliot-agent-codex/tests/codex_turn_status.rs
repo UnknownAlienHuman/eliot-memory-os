@@ -1,10 +1,13 @@
 use eliot_agent_api::{
-    AttemptId, ContractError, EventCursor, ExecutionUnit, ExecutionUnitObservation,
-    HostEventEnvelope, HostEventKind, LowercaseSha256, NativeSession, NativeSessionLocator,
-    ProviderExecutionBinding, ProviderObservationLineage, SessionId, SessionObservation,
+    AdmittedRouteReceipt, AttemptId, CONTRACT_VERSION, ContractError, EventCursor, EventId,
+    ExecutionUnit, ExecutionUnitObservation, HostEventDeliveryDisposition, LowercaseSha256,
+    NativeSession, NativeSessionLocator, NormalizedHostEventEnvelope, NormalizedHostEventPayload,
+    ProviderExecutionBinding, ProviderObservationLineage, ProviderTerminalStatus, QuotaKnowledge,
+    RestrictedRawSourceHandle, SessionId, SessionObservation,
 };
 use eliot_agent_codex::{
-    CodexAdapterError, CodexSessionBinding, CodexWireMessage, codex_route, translate_host_event,
+    CODEX_NORMALIZER_IDENTITY, CODEX_NORMALIZER_VERSION, CodexAdapterError, CodexHostEventInput,
+    CodexSessionBinding, CodexWireMessage, codex_route, normalize_codex_event,
 };
 use eliot_contracts::{ClockReading, EpochId, EpochLineageId, sha256_hex};
 use serde_json::Value;
@@ -71,6 +74,50 @@ fn binding() -> Result<ProviderExecutionBinding, Box<dyn std::error::Error>> {
     })
 }
 
+fn admission_for(
+    binding: &ProviderExecutionBinding,
+) -> Result<AdmittedRouteReceipt, Box<dyn std::error::Error>> {
+    use eliot_agent_api::{
+        CandidateSelectionDisposition, PolicyRevision, RouteSelectionCandidate,
+        candidate_digest_for,
+    };
+    use eliot_contracts::DecisionId;
+    let candidate = RouteSelectionCandidate {
+        capability: "codex".to_owned(),
+        query_intent: "test-intent".to_owned(),
+        scope_ref: "scope:test".to_owned(),
+        policy_revision: PolicyRevision::new(3)?,
+        candidates: vec![binding.route.clone()],
+        selected: Some(binding.route.clone()),
+        rejected: Vec::new(),
+        selection: CandidateSelectionDisposition::Selected,
+        evidence_refs: vec!["evidence-1".to_owned()],
+    };
+    candidate.validate()?;
+    let zero: LowercaseSha256 = serde_json::from_value(serde_json::json!(
+        "0000000000000000000000000000000000000000000000000000000000000000"
+    ))?;
+    let mut receipt = AdmittedRouteReceipt {
+        schema_version: CONTRACT_VERSION.to_owned(),
+        decision_id: DecisionId::new("decision-1")?,
+        candidate_digest: candidate_digest_for(&candidate)?,
+        attempt_id: binding.attempt_id.clone(),
+        lease_id: binding.lease_id.clone(),
+        state_fence: binding.state_fence.clone(),
+        runtime_generation: binding.runtime_generation,
+        policy_revision: PolicyRevision::new(3)?,
+        requested_route: binding.route.clone(),
+        selected_route: Some(binding.route.clone()),
+        no_route: None,
+        evidence_refs: vec!["evidence-1".to_owned()],
+        proof_ceiling: eliot_agent_api::ProofCeiling::CandidateArtifact,
+        self_digest: zero,
+    };
+    receipt.self_digest = receipt.compute_digest()?;
+    receipt.validate()?;
+    Ok(receipt)
+}
+
 fn lineage(
     binding: &ProviderExecutionBinding,
     sequence: u64,
@@ -93,54 +140,103 @@ fn clock() -> ClockReading {
     }
 }
 
-fn translate_envelope(
+fn normalize_envelope(
     method: &str,
     params: Value,
-) -> Result<HostEventEnvelope, Box<dyn std::error::Error>> {
+) -> Result<NormalizedHostEventEnvelope, Box<dyn std::error::Error>> {
     let bound = binding()?;
+    let admission = admission_for(&bound)?;
     let message = CodexWireMessage::notification(method, Some(params));
-    Ok(translate_host_event(
-        &message,
-        &lineage(&bound, 1)?,
-        1,
-        None,
-        &clock(),
-    )?)
+    let raw = serde_json::to_vec(&message)?;
+    let (envelope, _) = normalize_codex_event(CodexHostEventInput {
+        message: &message,
+        lineage: lineage(&bound, 1)?,
+        event_id: EventId::new("turn-1:1")?,
+        cursor: EventCursor::new("turn-1:1")?,
+        sequence: 1,
+        previous_sequence: None,
+        predecessors: Vec::new(),
+        raw_source_bytes: &raw,
+        raw_source_handle: RestrictedRawSourceHandle::new("restricted-codex:turn-1:1")?,
+        observed_at: clock(),
+        delivery: HostEventDeliveryDisposition::BestEffortOrdered,
+        admission: Some(&admission),
+    })?;
+    Ok(envelope)
 }
 
-/// Concrete-error translation for quarantine assertions.
-fn translate_raw(method: &str, params: Value) -> Result<HostEventEnvelope, CodexAdapterError> {
+/// Concrete-error normalization for quarantine assertions.
+fn normalize_raw(
+    method: &str,
+    params: Value,
+) -> Result<NormalizedHostEventEnvelope, CodexAdapterError> {
     let bound = binding().expect("fixture binding");
+    let admission = admission_for(&bound).expect("fixture admission");
     let message = CodexWireMessage::notification(method, Some(params));
+    let raw = serde_json::to_vec(&message).expect("fixture raw");
     let observed = lineage(&bound, 1).expect("fixture lineage");
-    translate_host_event(&message, &observed, 1, None, &clock())
+    let (envelope, _) = normalize_codex_event(CodexHostEventInput {
+        message: &message,
+        lineage: observed,
+        event_id: EventId::new("turn-1:1").expect("fixture event"),
+        cursor: EventCursor::new("turn-1:1").expect("fixture cursor"),
+        sequence: 1,
+        previous_sequence: None,
+        predecessors: Vec::new(),
+        raw_source_bytes: &raw,
+        // The handle outlives the call via the raw bytes reference scope below:
+        // construct inline and leak the borrow through a two-step call.
+        raw_source_handle: RestrictedRawSourceHandle::new("restricted-codex:turn-1:1")
+            .expect("fixture handle"),
+        observed_at: clock(),
+        delivery: HostEventDeliveryDisposition::BestEffortOrdered,
+        admission: Some(&admission),
+    })?;
+    Ok(envelope)
 }
 
-fn translate(method: &str, params: Value) -> Result<HostEventKind, Box<dyn std::error::Error>> {
-    Ok(translate_envelope(method, params)?.kind)
+fn normalize_raw_result(
+    method: &str,
+    params: Value,
+) -> Result<NormalizedHostEventEnvelope, CodexAdapterError> {
+    normalize_raw(method, params)
+}
+
+fn terminal_status(
+    method: &str,
+    params: Value,
+) -> Result<Option<ProviderTerminalStatus>, Box<dyn std::error::Error>> {
+    let envelope = normalize_envelope(method, params)?;
+    match envelope.payload {
+        NormalizedHostEventPayload::ProviderTerminalObserved(observation) => {
+            Ok(Some(observation.status))
+        }
+        NormalizedHostEventPayload::UnsupportedQuarantined(_) => Ok(None),
+        other => panic!("unexpected typed payload for terminal case: {other:?}"),
+    }
 }
 
 #[test]
 fn canonical_turn_status_controls_terminal_event_kind() -> Result<(), Box<dyn std::error::Error>> {
     assert_eq!(
-        translate(
+        terminal_status(
             "turn/completed",
             serde_json::json!({
                 "threadId": "thread-1",
                 "turn": {"id": "turn-1", "status": "completed"}
             }),
         )?,
-        HostEventKind::Completed,
+        Some(ProviderTerminalStatus::CompletedObserved),
     );
     assert_eq!(
-        translate(
+        terminal_status(
             "turn/completed",
             serde_json::json!({
                 "threadId": "thread-1",
                 "turn": {"id": "turn-1", "status": "failed"}
             }),
         )?,
-        HostEventKind::Failed,
+        Some(ProviderTerminalStatus::FailedObserved),
     );
     Ok(())
 }
@@ -148,16 +244,23 @@ fn canonical_turn_status_controls_terminal_event_kind() -> Result<(), Box<dyn st
 #[test]
 fn legacy_terminal_aliases_are_quarantined() -> Result<(), Box<dyn std::error::Error>> {
     for method in ["turn/completion", "turn/cancelled"] {
+        let envelope = normalize_envelope(
+            method,
+            serde_json::json!({
+                "threadId": "thread-1",
+                "turn": {"id": "turn-1", "status": "completed"}
+            }),
+        )?;
+        assert!(
+            matches!(
+                envelope.payload,
+                NormalizedHostEventPayload::UnsupportedQuarantined(_)
+            ),
+            "unadmitted alias {method} must quarantine, never claim terminal",
+        );
         assert_eq!(
-            translate(
-                method,
-                serde_json::json!({
-                    "threadId": "thread-1",
-                    "turn": {"id": "turn-1", "status": "completed"}
-                }),
-            )?,
-            HostEventKind::Unknown,
-            "unadmitted alias {method} must not claim a terminal event",
+            envelope.normalization.unsupported_disposition,
+            eliot_agent_api::UnsupportedDisposition::UnsupportedMethodQuarantined
         );
     }
     Ok(())
@@ -166,7 +269,8 @@ fn legacy_terminal_aliases_are_quarantined() -> Result<(), Box<dyn std::error::E
 #[test]
 fn noncompleted_canonical_statuses_never_become_completed() -> Result<(), Box<dyn std::error::Error>>
 {
-    // Exact bound turn with a non-terminal status keeps its classification.
+    // Exact bound turn with a non-terminal status quarantines as typed
+    // evidence (never terminal success).
     for params in [
         serde_json::json!({
             "threadId": "thread-1",
@@ -185,7 +289,7 @@ fn noncompleted_canonical_statuses_never_become_completed() -> Result<(), Box<dy
             "turn": {"id": "turn-1", "status": 42}
         }),
     ] {
-        assert_eq!(translate("turn/completed", params)?, HostEventKind::Unknown);
+        assert_eq!(terminal_status("turn/completed", params)?, None);
     }
     // Missing or non-string turn identity quarantines instead of classifying.
     for params in [
@@ -201,7 +305,7 @@ fn noncompleted_canonical_statuses_never_become_completed() -> Result<(), Box<dy
     ] {
         assert!(
             matches!(
-                translate_raw("turn/completed", params),
+                normalize_raw_result("turn/completed", params),
                 Err(CodexAdapterError::Contract(ContractError::BindingMismatch))
             ),
             "missing turn identity must quarantine",
@@ -213,22 +317,24 @@ fn noncompleted_canonical_statuses_never_become_completed() -> Result<(), Box<dy
 #[test]
 fn nonterminal_method_keeps_its_existing_classification() -> Result<(), Box<dyn std::error::Error>>
 {
-    assert_eq!(
-        translate(
-            "turn/started",
-            serde_json::json!({
-                "threadId": "thread-1",
-                "turn": {"id": "turn-1", "status": "failed"}
-            }),
-        )?,
-        HostEventKind::PromptSubmitted,
-    );
+    let envelope = normalize_envelope(
+        "turn/started",
+        serde_json::json!({
+            "threadId": "thread-1",
+            "turn": {"id": "turn-1", "status": "failed"}
+        }),
+    )?;
+    assert!(matches!(
+        envelope.payload,
+        NormalizedHostEventPayload::ExecutionStarted(_)
+    ));
     Ok(())
 }
 
 #[test]
 fn wrong_thread_is_rejected() -> Result<(), Box<dyn std::error::Error>> {
     let bound = binding()?;
+    let admission = admission_for(&bound)?;
     let message = CodexWireMessage::notification(
         "turn/completed",
         Some(serde_json::json!({
@@ -236,8 +342,22 @@ fn wrong_thread_is_rejected() -> Result<(), Box<dyn std::error::Error>> {
             "turn": {"id": "turn-1", "status": "completed"}
         })),
     );
+    let raw = serde_json::to_vec(&message)?;
     assert!(matches!(
-        translate_host_event(&message, &lineage(&bound, 1)?, 1, None, &clock(),),
+        normalize_codex_event(CodexHostEventInput {
+            message: &message,
+            lineage: lineage(&bound, 1)?,
+            event_id: EventId::new("turn-1:1")?,
+            cursor: EventCursor::new("turn-1:1")?,
+            sequence: 1,
+            previous_sequence: None,
+            predecessors: Vec::new(),
+            raw_source_bytes: &raw,
+            raw_source_handle: RestrictedRawSourceHandle::new("restricted-codex:turn-1:1")?,
+            observed_at: clock(),
+            delivery: HostEventDeliveryDisposition::BestEffortOrdered,
+            admission: Some(&admission),
+        }),
         Err(eliot_agent_codex::CodexAdapterError::SessionMismatch)
     ));
     Ok(())
@@ -246,7 +366,7 @@ fn wrong_thread_is_rejected() -> Result<(), Box<dyn std::error::Error>> {
 #[test]
 fn foreign_turn_never_yields_bound_attempt_output() {
     assert!(matches!(
-        translate_raw(
+        normalize_raw_result(
             "turn/completed",
             serde_json::json!({
                 "threadId": "thread-1",
@@ -269,10 +389,32 @@ fn session_only_thread_events_carry_no_attempt_authority() -> Result<(), Box<dyn
         "thread/started",
         Some(serde_json::json!({ "threadId": "thread-1" })),
     );
+    let raw = serde_json::to_vec(&message)?;
+    let (envelope, receipt) = normalize_codex_event(CodexHostEventInput {
+        message: &message,
+        lineage: session_only.clone(),
+        event_id: EventId::new("session-1:1")?,
+        cursor: EventCursor::new("session-1:1")?,
+        sequence: 1,
+        previous_sequence: None,
+        predecessors: Vec::new(),
+        raw_source_bytes: &raw,
+        raw_source_handle: RestrictedRawSourceHandle::new("restricted-codex:session-1")?,
+        observed_at: clock(),
+        delivery: HostEventDeliveryDisposition::BestEffortOrdered,
+        admission: None,
+    })?;
+    // Session-only stays session-only: no admission reference, session
+    // lifecycle payload, and no attributable execution binding.
+    assert!(envelope.admitted_route_digest.is_none());
     assert!(matches!(
-        translate_host_event(&message, &session_only, 1, None, &clock(),),
-        Err(CodexAdapterError::Contract(ContractError::BindingMismatch))
+        envelope.payload,
+        NormalizedHostEventPayload::SessionLifecycle(_)
     ));
+    assert!(session_only.attributable_binding().is_err());
+    assert!(envelope.lineage.attributable_binding().is_err());
+    envelope.validate_as_session_observation()?;
+    assert_eq!(envelope.normalization, receipt);
     Ok(())
 }
 
@@ -280,6 +422,7 @@ fn session_only_thread_events_carry_no_attempt_authority() -> Result<(), Box<dyn
 fn recorded_observation_must_match_the_claimed_stream_position()
 -> Result<(), Box<dyn std::error::Error>> {
     let bound = binding()?;
+    let admission = admission_for(&bound)?;
     let message = CodexWireMessage::notification(
         "turn/completed",
         Some(serde_json::json!({
@@ -287,8 +430,22 @@ fn recorded_observation_must_match_the_claimed_stream_position()
             "turn": {"id": "turn-1", "status": "completed"}
         })),
     );
+    let raw = serde_json::to_vec(&message)?;
     assert!(matches!(
-        translate_host_event(&message, &lineage(&bound, 9)?, 1, None, &clock(),),
+        normalize_codex_event(CodexHostEventInput {
+            message: &message,
+            lineage: lineage(&bound, 9)?,
+            event_id: EventId::new("turn-1:9")?,
+            cursor: EventCursor::new("turn-1:9")?,
+            sequence: 1,
+            previous_sequence: None,
+            predecessors: Vec::new(),
+            raw_source_bytes: &raw,
+            raw_source_handle: RestrictedRawSourceHandle::new("restricted-codex:turn-1:9")?,
+            observed_at: clock(),
+            delivery: HostEventDeliveryDisposition::BestEffortOrdered,
+            admission: Some(&admission),
+        }),
         Err(CodexAdapterError::Contract(ContractError::BindingMismatch))
     ));
     Ok(())
@@ -297,6 +454,7 @@ fn recorded_observation_must_match_the_claimed_stream_position()
 #[test]
 fn cursor_and_sequence_are_monotonic() -> Result<(), Box<dyn std::error::Error>> {
     let bound = binding()?;
+    let admission = admission_for(&bound)?;
     let message = CodexWireMessage::notification(
         "turn/completed",
         Some(serde_json::json!({
@@ -304,8 +462,22 @@ fn cursor_and_sequence_are_monotonic() -> Result<(), Box<dyn std::error::Error>>
             "turn": {"id": "turn-1", "status": "completed"}
         })),
     );
+    let raw = serde_json::to_vec(&message)?;
     assert!(matches!(
-        translate_host_event(&message, &lineage(&bound, 2)?, 2, Some(2), &clock(),),
+        normalize_codex_event(CodexHostEventInput {
+            message: &message,
+            lineage: lineage(&bound, 2)?,
+            event_id: EventId::new("turn-1:2")?,
+            cursor: EventCursor::new("turn-1:2")?,
+            sequence: 2,
+            previous_sequence: Some(2),
+            predecessors: Vec::new(),
+            raw_source_bytes: &raw,
+            raw_source_handle: RestrictedRawSourceHandle::new("restricted-codex:turn-1:2")?,
+            observed_at: clock(),
+            delivery: HostEventDeliveryDisposition::BestEffortOrdered,
+            admission: Some(&admission),
+        }),
         Err(eliot_agent_codex::CodexAdapterError::Contract(
             eliot_agent_api::ContractError::NonMonotonicEvent
         ))
@@ -321,24 +493,118 @@ fn terminal_translation_preserves_event_identity_raw_digest_and_payload()
         "turn": {"id": "turn-1", "status": "completed"},
         "opaque": {"vendor": "value"}
     });
-    let message = CodexWireMessage::notification("turn/completed", Some(params.clone()));
-    let bytes = serde_json::to_vec(&message)?;
+    let message = CodexWireMessage::notification("turn/completed", Some(params));
+    let raw = serde_json::to_vec(&message)?;
     let bound = binding()?;
-    let envelope = translate_host_event(&message, &lineage(&bound, 1)?, 1, None, &clock())?;
+    let admission = admission_for(&bound)?;
+    let (envelope, receipt) = normalize_codex_event(CodexHostEventInput {
+        message: &message,
+        lineage: lineage(&bound, 1)?,
+        event_id: EventId::new("turn-1:1")?,
+        cursor: EventCursor::new("turn-1:1")?,
+        sequence: 1,
+        previous_sequence: None,
+        predecessors: Vec::new(),
+        raw_source_bytes: &raw,
+        raw_source_handle: RestrictedRawSourceHandle::new("restricted-codex:turn-1:1")?,
+        observed_at: clock(),
+        delivery: HostEventDeliveryDisposition::BestEffortOrdered,
+        admission: Some(&admission),
+    })?;
 
     // The recorded cursor is preserved end-to-end; no synthesized identity.
     assert_eq!(envelope.event_id.as_str(), "turn-1:1");
     assert_eq!(envelope.cursor.as_str(), "turn-1:1");
     assert_eq!(envelope.sequence, 1);
-    assert_eq!(envelope.attempt_id, bound.attempt_id);
-    assert_eq!(envelope.route, bound.route);
-    assert_eq!(envelope.observed_at, "1786000000000");
-    assert_eq!(envelope.kind, HostEventKind::Completed);
-    assert_eq!(envelope.normalized_payload, params);
     assert_eq!(
-        envelope.raw_payload_digest,
-        blake3::hash(&bytes).to_hex().to_string()
+        envelope.lineage.attributable_binding()?.attempt_id,
+        bound.attempt_id
     );
+    assert_eq!(
+        envelope.admitted_route_digest.as_ref(),
+        Some(&admission.self_digest)
+    );
+    assert_eq!(envelope.observed_at.valid_time_ms, Some(1_786_000_000_000));
+    assert!(matches!(
+        envelope.payload,
+        NormalizedHostEventPayload::ProviderTerminalObserved(ref observation)
+            if observation.status == ProviderTerminalStatus::CompletedObserved
+    ));
+    // Canonical SHA-256 over the exact raw source bytes (never blake3, never
+    // a caller string); raw bytes stay behind the restricted handle and never
+    // enter the public payload.
+    let expected_digest = sha256_hex(&raw);
+    assert_eq!(envelope.raw_source.digest.digest.as_str(), expected_digest);
+    assert_eq!(
+        envelope.raw_source.handle.as_str(),
+        "restricted-codex:turn-1:1"
+    );
+    assert_eq!(receipt.input_digest, envelope.raw_source.digest);
+    assert_eq!(
+        envelope.producer_adapter_identity,
+        CODEX_NORMALIZER_IDENTITY
+    );
+    assert_eq!(envelope.adapter_contract_version, CODEX_NORMALIZER_VERSION);
+    assert_eq!(envelope.normalization, receipt);
+    envelope.validate_for_lineage(envelope.lineage.attributable_binding()?, &admission)?;
+    let payload_value = serde_json::to_value(&envelope.payload)?;
+    assert!(!payload_value.to_string().contains("vendor"));
+    Ok(())
+}
+
+#[test]
+fn usage_without_quota_is_typed_not_exposed() -> Result<(), Box<dyn std::error::Error>> {
+    let envelope = normalize_envelope(
+        "turn/usage",
+        serde_json::json!({
+            "threadId": "thread-1",
+            "turn": {"id": "turn-1"},
+            "usage": {"input_tokens": 10, "output_tokens": 5}
+        }),
+    )?;
+    match envelope.payload {
+        NormalizedHostEventPayload::Usage(usage) => {
+            assert_eq!(usage.input_tokens, Some(10));
+            assert_eq!(usage.output_tokens, Some(5));
+            // Absent native quota evidence stays typed NotExposed, never zero.
+            assert_eq!(usage.quota, QuotaKnowledge::NotExposed);
+        }
+        other => panic!("expected typed Usage payload, got {other:?}"),
+    }
+    Ok(())
+}
+
+#[test]
+fn mismatched_recorded_cursor_never_repoints() -> Result<(), Box<dyn std::error::Error>> {
+    let bound = binding()?;
+    let admission = admission_for(&bound)?;
+    let message = CodexWireMessage::notification(
+        "turn/completed",
+        Some(serde_json::json!({
+            "threadId": "thread-1",
+            "turn": {"id": "turn-1", "status": "completed"}
+        })),
+    );
+    let raw = serde_json::to_vec(&message)?;
+    // Caller cursor disagrees with the recorded observation cursor: fail
+    // closed instead of synthesizing or re-pointing.
+    assert!(matches!(
+        normalize_codex_event(CodexHostEventInput {
+            message: &message,
+            lineage: lineage(&bound, 1)?,
+            event_id: EventId::new("turn-1:999")?,
+            cursor: EventCursor::new("turn-1:999")?,
+            sequence: 1,
+            previous_sequence: None,
+            predecessors: Vec::new(),
+            raw_source_bytes: &raw,
+            raw_source_handle: RestrictedRawSourceHandle::new("restricted-codex:turn-1:999")?,
+            observed_at: clock(),
+            delivery: HostEventDeliveryDisposition::BestEffortOrdered,
+            admission: Some(&admission),
+        }),
+        Err(CodexAdapterError::Contract(ContractError::BindingMismatch))
+    ));
     Ok(())
 }
 

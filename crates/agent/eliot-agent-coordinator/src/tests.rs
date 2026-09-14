@@ -6,13 +6,14 @@ use eliot_agent_api::{
     ClockReading, ContractError, DecisionId, EffectCeiling, EffectKind, EpochId, EventCursor,
     EventId, ExecutionOutcome, ExecutionUnit, ExecutionUnitObservation,
     HOST_EVENT_CONTRACT_VERSION, HOST_EVENT_DIGEST_ALGORITHM, HostEventDeliveryDisposition,
-    HostEventNormalizationReceipt, HostEventPrivacyClass, LaunchRequestId, LowercaseSha256,
-    NativeSession, NativeSessionLocator, NormalizationCoverage, NormalizedHostEventEnvelope,
-    NormalizedHostEventPayload, PhysicalRouteObservationReceipt, ProposedEffect,
-    ProviderExecutionBinding, ProviderObservationLineage, QualifiedSourceDigest, QuotaKnowledge,
-    RawSourceRecord, RequestId, ResourceGeneration, RestrictedRawSourceHandle, ResultDisposition,
-    RouteFingerprint, RouteObservationState, RouteSelectionCandidate, StateFence, TaskId,
-    UnsupportedDisposition, UsageReceipt, WorkLeaseId, WorkUnitId, candidate_digest_for,
+    HostEventNormalizationReceipt, HostEventPrivacyClass, HostEventQuarantineReason,
+    LaunchRequestId, LowercaseSha256, NativeSession, NativeSessionLocator, NormalizationCoverage,
+    NormalizedHostEventEnvelope, NormalizedHostEventPayload, PhysicalRouteObservationReceipt,
+    ProposedEffect, ProviderExecutionBinding, ProviderObservationLineage, QualifiedSourceDigest,
+    QuotaKnowledge, RawSourceRecord, RequestId, ResourceGeneration, RestrictedRawSourceHandle,
+    ResultDisposition, RouteFingerprint, RouteObservationState, RouteSelectionCandidate,
+    SessionLifecycleObservation, SessionLifecycleTransition, SessionObservation, StateFence,
+    TaskId, UnsupportedDisposition, UsageReceipt, WorkLeaseId, WorkUnitId, candidate_digest_for,
 };
 use eliot_agent_contracts::{
     DeliveryPolicy, DescendantClosureReceipt, LivePeerMessage, LivePeerMessageState, RevisionId,
@@ -28,7 +29,7 @@ use crate::core::{ProviderProofKind, ProviderVerifier};
 use crate::{
     AdmissionId, AdmittedLaneReceipt, AdmittedProviderCapability, AgentCoordinator, CancelCommand,
     CancellationReconciliationId, CandidateId, CoordinatorConfig, CoordinatorError,
-    DescendantClosureSubmission, ExecutionContext, ObservationId, OperationId,
+    CoordinatorEvent, DescendantClosureSubmission, ExecutionContext, ObservationId, OperationId,
     OutcomeReconciliationId, PlanGap, ProviderAdmissionReceipt, ProviderBindingSnapshot,
     ProviderCancellationReconciliation, ProviderExecutionBindingSubmission, ProviderIdentity,
     ProviderReassignmentReceipt, ProviderUnknownOutcomeReconciliation, ProviderWorkerFenceReceipt,
@@ -3084,7 +3085,9 @@ fn observe_accepts_exact_binding_and_replays_without_duplicate_effects() -> Test
     // Exact replay is idempotent: no new event, no duplicate effects.
     coordinator.observe_provider_event(context.clone(), envelope.clone(), receipt.clone())?;
     assert_eq!(coordinator.events().len(), events_before + 1);
-    // Conflicting same-identity replay is quarantined without mutation.
+    // Conflicting same-identity replay is quarantined with its typed reason
+    // (issue #371 S7): a changed payload is `ConflictingPayload`, never a
+    // generic conflict, and nothing is mutated.
     let mut conflict = envelope.clone();
     conflict.payload = NormalizedHostEventPayload::AssistantDelta(AssistantDeltaObservation {
         delta_chars: 5,
@@ -3096,7 +3099,9 @@ fn observe_accepts_exact_binding_and_replays_without_duplicate_effects() -> Test
     let conflict_receipt = conflict.normalization.clone();
     assert_eq!(
         coordinator.observe_provider_event(context, conflict, conflict_receipt),
-        Err(CoordinatorError::IdempotencyConflict)
+        Err(CoordinatorError::HostEventQuarantine(
+            HostEventQuarantineReason::ConflictingPayload
+        ))
     );
     assert_eq!(coordinator.events().len(), events_before + 1);
     Ok(())
@@ -3138,6 +3143,439 @@ fn observe_rejects_foreign_turn_and_unknown_attempt_before_mutation() -> TestRes
         Err(CoordinatorError::UnknownAttempt)
     );
     assert_eq!(coordinator.events().len(), events_before);
+    Ok(())
+}
+
+/// Builds a session-only observation envelope through the real S6 api
+/// constructors plus `seal()` (adapter-style normalized envelope+receipt, no
+/// mock adapter). Session lineage carries no admission reference and the
+/// session stays `None`: no session is invented here (T1/T5 own admission).
+fn session_event_envelope(
+    tag: &str,
+    event_tag: &str,
+    payload: NormalizedHostEventPayload,
+) -> TestResult<NormalizedHostEventEnvelope> {
+    let cursor = EventCursor::new(format!("cursor-session-{tag}"))?;
+    let raw_bytes = format!("host-event-session-source-{event_tag}").into_bytes();
+    let raw = RawSourceRecord {
+        handle: RestrictedRawSourceHandle::new(format!("restricted-session-test:{event_tag}"))?,
+        digest: QualifiedSourceDigest {
+            algorithm: HOST_EVENT_DIGEST_ALGORITHM.to_owned(),
+            digest: serde_json::from_value(serde_json::json!(sha256_hex(&raw_bytes)))?,
+        },
+    };
+    let mut envelope = NormalizedHostEventEnvelope {
+        schema_version: HOST_EVENT_CONTRACT_VERSION.to_owned(),
+        event_id: EventId::new(format!("evt-session-{event_tag}"))?,
+        cursor: cursor.clone(),
+        lineage: ProviderObservationLineage::SessionObservation(SessionObservation {
+            session_id: None,
+            native: NativeSession::Native(NativeSessionLocator::new(format!("thread-{tag}"))?),
+        }),
+        producer_adapter_identity: "test-adapter".into(),
+        adapter_contract_version: "test-adapter/v1".into(),
+        sequence: 1,
+        causal_predecessors: Vec::new(),
+        payload,
+        admitted_route_digest: None,
+        raw_source: raw.clone(),
+        normalization: HostEventNormalizationReceipt {
+            normalizer_identity: "test-adapter".into(),
+            normalizer_version: "test-adapter/v1".into(),
+            input_handle: raw.handle.clone(),
+            input_digest: raw.digest.clone(),
+            output_schema_version: HOST_EVENT_CONTRACT_VERSION.to_owned(),
+            output_digest: zero_digest()?,
+            omitted_fields: Vec::new(),
+            warnings: Vec::new(),
+            unsupported_disposition: UnsupportedDisposition::None,
+            privacy_class: HostEventPrivacyClass::RedactedSummary,
+            coverage: NormalizationCoverage::Complete,
+            proof_ceiling: eliot_receipts::ProofCeiling::Observation,
+        },
+        observed_at: ClockReading {
+            valid_time_ms: Some(1_700_000_000_000),
+            known_time_ms: Some(1_700_000_000_001),
+            transaction_sequence: None,
+            monotonic_ns: None,
+        },
+        delivery: HostEventDeliveryDisposition::DurableOrdered,
+    };
+    envelope
+        .seal()
+        .map_err(|error| format!("session envelope must seal: {error}"))?;
+    Ok(envelope)
+}
+
+#[test]
+fn observe_changed_duplicate_quarantines_with_typed_reason_per_dimension() -> TestResult {
+    let (mut coordinator, context, lane, stored) = bound_observe_setup()?;
+    let envelope = host_event_envelope(&lane, &stored, 1, "typed-1", "typed-1")?;
+    let receipt = envelope.normalization.clone();
+    let events_before = coordinator.events().len();
+    coordinator.observe_provider_event(context.clone(), envelope.clone(), receipt.clone())?;
+
+    // Same-turn steer of the lineage binding under the same event identity is
+    // a cross-turn replay: quarantined as lineage, never advancing any
+    // attempt.
+    let cross_turn_binding =
+        binding_submission("typed-x", &lane, "unit-typed-x", "scope-observe")?.binding;
+    let mut lineage = envelope.clone();
+    if let ProviderObservationLineage::ExecutionUnitObservation(observation) = &mut lineage.lineage
+    {
+        observation.binding = cross_turn_binding;
+    } else {
+        panic!("envelope must carry execution-unit lineage");
+    }
+    lineage
+        .seal()
+        .map_err(|error| format!("lineage conflict must seal: {error}"))?;
+    let lineage_receipt = lineage.normalization.clone();
+    assert_eq!(
+        coordinator.observe_provider_event(context.clone(), lineage, lineage_receipt),
+        Err(CoordinatorError::HostEventQuarantine(
+            HostEventQuarantineReason::ConflictingLineage
+        ))
+    );
+
+    // Same identity with different restricted source bytes quarantines as
+    // source (first differing dimension wins over the rebound receipt).
+    let mut source = envelope.clone();
+    let alt_bytes = b"host-event-source-typed-1-alt".to_vec();
+    let alt_digest: LowercaseSha256 =
+        serde_json::from_value(serde_json::json!(sha256_hex(&alt_bytes)))?;
+    source.raw_source.handle = RestrictedRawSourceHandle::new("restricted-test:typed-1-alt")?;
+    source.raw_source.digest = QualifiedSourceDigest {
+        algorithm: HOST_EVENT_DIGEST_ALGORITHM.to_owned(),
+        digest: alt_digest,
+    };
+    source.normalization.input_handle = source.raw_source.handle.clone();
+    source.normalization.input_digest = source.raw_source.digest.clone();
+    source
+        .seal()
+        .map_err(|error| format!("source conflict must seal: {error}"))?;
+    let source_receipt = source.normalization.clone();
+    assert_eq!(
+        coordinator.observe_provider_event(context.clone(), source, source_receipt),
+        Err(CoordinatorError::HostEventQuarantine(
+            HostEventQuarantineReason::ConflictingSource
+        ))
+    );
+
+    // Same identity and source bytes with a changed normalization manifest
+    // quarantines as normalization.
+    let mut normalization = envelope.clone();
+    normalization
+        .normalization
+        .warnings
+        .push("test-warning".to_owned());
+    normalization
+        .seal()
+        .map_err(|error| format!("normalization conflict must seal: {error}"))?;
+    let normalization_receipt = normalization.normalization.clone();
+    assert_eq!(
+        coordinator.observe_provider_event(context.clone(), normalization, normalization_receipt),
+        Err(CoordinatorError::HostEventQuarantine(
+            HostEventQuarantineReason::ConflictingNormalization
+        ))
+    );
+
+    // A sealed framing-only change (delivery) is bound by the receipt output
+    // digest, so it surfaces as a normalization conflict rather than
+    // silently; the S6 `ConflictingFraming` bucket remains the defensive
+    // fallback for valid-framing duplicates whose compared dimensions all
+    // match, and it passes through unchanged.
+    let mut framing = envelope.clone();
+    framing.delivery = HostEventDeliveryDisposition::Replay;
+    framing
+        .seal()
+        .map_err(|error| format!("framing conflict must seal: {error}"))?;
+    let framing_receipt = framing.normalization.clone();
+    assert_eq!(
+        coordinator.observe_provider_event(context.clone(), framing, framing_receipt),
+        Err(CoordinatorError::HostEventQuarantine(
+            HostEventQuarantineReason::ConflictingNormalization
+        ))
+    );
+
+    // No quarantine path mutated durable state: exactly the one observation.
+    assert_eq!(coordinator.events().len(), events_before + 1);
+    Ok(())
+}
+
+#[test]
+fn observe_gap_reorder_and_stale_sequence_are_explicit() -> TestResult {
+    let (mut coordinator, context, lane, stored) = bound_observe_setup()?;
+    let events_before = coordinator.events().len();
+    let first = host_event_envelope(&lane, &stored, 1, "seq-1", "seq-1")?;
+    coordinator.observe_provider_event(
+        context.clone(),
+        first.clone(),
+        first.normalization.clone(),
+    )?;
+    // Forward jump records an explicit gap marker before the observation; the
+    // marker itself advances no cursor (ordering evidence only).
+    let third = host_event_envelope(&lane, &stored, 3, "seq-3", "seq-3")?;
+    coordinator.observe_provider_event(
+        context.clone(),
+        third.clone(),
+        third.normalization.clone(),
+    )?;
+    assert_eq!(coordinator.events().len(), events_before + 3);
+    match &coordinator.events()[events_before + 1] {
+        CoordinatorEvent::ProviderHostEventGap {
+            expected_sequence,
+            observed_sequence,
+            ..
+        } => {
+            assert_eq!((*expected_sequence, *observed_sequence), (2, 3));
+        }
+        other => panic!("expected an explicit gap marker, got {other:?}"),
+    }
+    // Exact replay of the post-gap event stays idempotent.
+    coordinator.observe_provider_event(
+        context.clone(),
+        third.clone(),
+        third.normalization.clone(),
+    )?;
+    assert_eq!(coordinator.events().len(), events_before + 3);
+    // Reordered arrival under a new identity with a nonmonotonic sequence
+    // stays stale without mutation.
+    let second = host_event_envelope(&lane, &stored, 2, "seq-2", "seq-2")?;
+    assert_eq!(
+        coordinator.observe_provider_event(
+            context.clone(),
+            second.clone(),
+            second.normalization.clone()
+        ),
+        Err(CoordinatorError::StaleResult)
+    );
+    assert_eq!(coordinator.events().len(), events_before + 3);
+    // The next in-order event advances with no new gap.
+    let fourth = host_event_envelope(&lane, &stored, 4, "seq-4", "seq-4")?;
+    coordinator.observe_provider_event(
+        context.clone(),
+        fourth.clone(),
+        fourth.normalization.clone(),
+    )?;
+    assert_eq!(coordinator.events().len(), events_before + 4);
+    match &coordinator.events()[events_before + 3] {
+        CoordinatorEvent::ProviderHostEventObserved { .. } => {}
+        other => panic!("expected a direct observation without a gap, got {other:?}"),
+    }
+    Ok(())
+}
+
+#[test]
+fn observe_session_only_mutates_nothing_and_terminal_never_reaches_intake() -> TestResult {
+    let (mut coordinator, context, lane, stored) = bound_observe_setup()?;
+    let events_before = coordinator.events().len();
+    let binding_before = coordinator
+        .attempt(&lane.attempt_id)
+        .unwrap_or_else(|| panic!("bound attempt must exist"))
+        .provider_binding
+        .clone();
+    // A valid session-only observation is accepted but mutates no attempt
+    // state: no sequencing entry, no cursor advance, no result.
+    let session = session_event_envelope(
+        "session-1",
+        "session-1",
+        NormalizedHostEventPayload::SessionLifecycle(SessionLifecycleObservation {
+            transition: SessionLifecycleTransition::Started,
+            detail_ref: None,
+        }),
+    )?;
+    coordinator.observe_provider_event(
+        context.clone(),
+        session.clone(),
+        session.normalization.clone(),
+    )?;
+    assert_eq!(coordinator.events().len(), events_before + 1);
+    assert_eq!(
+        coordinator
+            .attempt(&lane.attempt_id)
+            .unwrap_or_else(|| panic!("bound attempt must exist"))
+            .provider_binding,
+        binding_before
+    );
+    // Exact session replay is idempotent.
+    coordinator.observe_provider_event(
+        context.clone(),
+        session.clone(),
+        session.normalization.clone(),
+    )?;
+    assert_eq!(coordinator.events().len(), events_before + 1);
+    // Attempt sequencing is untouched: the next execution-unit event continues
+    // the attempt stream with no gap.
+    let next = host_event_envelope(&lane, &stored, 1, "sess-next-1", "sess-next-1")?;
+    coordinator.observe_provider_event(
+        context.clone(),
+        next.clone(),
+        next.normalization.clone(),
+    )?;
+    assert_eq!(coordinator.events().len(), events_before + 2);
+    match &coordinator.events()[events_before + 1] {
+        CoordinatorEvent::ProviderHostEventObserved { .. } => {}
+        other => panic!("session observation must not emit a gap, got {other:?}"),
+    }
+    // Session-terminal smuggling: an attempt-usage payload on session lineage
+    // cannot validate as a session observation.
+    let terminal = session_event_envelope(
+        "session-t",
+        "session-t",
+        NormalizedHostEventPayload::Usage(usage()),
+    )?;
+    assert_eq!(
+        coordinator.observe_provider_event(
+            context.clone(),
+            terminal.clone(),
+            terminal.normalization.clone()
+        ),
+        Err(CoordinatorError::IdentityConflict("execution_binding"))
+    );
+    // Session-lifecycle payload on execution-unit lineage is rejected before
+    // any mutation.
+    let mut misplaced = host_event_envelope(&lane, &stored, 9, "sess-mis-9", "sess-mis-9")?;
+    misplaced.payload = NormalizedHostEventPayload::SessionLifecycle(SessionLifecycleObservation {
+        transition: SessionLifecycleTransition::Closed,
+        detail_ref: None,
+    });
+    misplaced
+        .seal()
+        .map_err(|error| format!("misplaced session payload must seal: {error}"))?;
+    assert_eq!(
+        coordinator.observe_provider_event(
+            context.clone(),
+            misplaced.clone(),
+            misplaced.normalization.clone()
+        ),
+        Err(CoordinatorError::IdentityConflict("execution_binding"))
+    );
+    assert_eq!(coordinator.events().len(), events_before + 2);
+    Ok(())
+}
+
+#[test]
+fn observe_e2e_lost_ack_reconstruct_replay_once_without_duplicate_effects() -> TestResult {
+    // Owner-path end to end on real api constructors (no mock adapter):
+    // ingest a normalized envelope+receipt, lose the acknowledgement,
+    // reconstruct via restore, replay once. Until a real durable
+    // Store/Governor edge exists this asserts on the in-memory event-log plus
+    // snapshot only; the installed durable commit remains controller track
+    // and no `Store` commit is invented here.
+    let cfg = config(4, 4);
+    let mut coordinator = production_coordinator(cfg.clone())?;
+    let admitted = plan_and_admit(
+        &mut coordinator,
+        "e2e-observe",
+        &[bind_lane_spec(
+            "work-e2e-observe",
+            "reader-e2e-observe",
+            "a",
+        )],
+        None,
+    )?;
+    let context = ExecutionContext::from(&admitted);
+    let lane = admitted.admitted_lanes[0].clone();
+    coordinator.start_attempt(context.clone(), lane.attempt_id.clone())?;
+    let stored = coordinator.bind_provider_execution(
+        context.clone(),
+        binding_submission(
+            "e2e-observe",
+            &lane,
+            "unit-e2e-observe",
+            "scope-e2e-observe",
+        )?,
+    )?;
+    // No session is invented at binding time: the projected session stays
+    // `None` until T1/T5 supply session admission.
+    assert!(stored.session_id.is_none());
+
+    // Durable baseline before the event exists.
+    let pre_snapshot = coordinator.snapshot()?;
+    let event_count_before = coordinator.events().len();
+
+    // Ingest one real adapter-style normalized envelope+receipt. The
+    // acknowledgement is then lost (in-memory state dropped before any
+    // further durable commit): reconstruct from the pre-ingest snapshot,
+    // which cannot contain the event.
+    let envelope = host_event_envelope(&lane, &stored, 1, "e2e-1", "e2e-1")?;
+    let receipt = envelope.normalization.clone();
+    coordinator.observe_provider_event(context.clone(), envelope.clone(), receipt.clone())?;
+    assert_eq!(coordinator.events().len(), event_count_before + 1);
+    drop(coordinator);
+    let mut coordinator = AgentCoordinator::restore_with_admitted_provider(
+        pre_snapshot.clone(),
+        cfg.clone(),
+        admitted_capability(pre_snapshot.event_sequence)?,
+    )?;
+    assert_eq!(coordinator.events().len(), event_count_before);
+    // Replay once: accepted exactly once, never duplicated.
+    coordinator.observe_provider_event(context.clone(), envelope.clone(), receipt.clone())?;
+    assert_eq!(coordinator.events().len(), event_count_before + 1);
+
+    // Redelivery after durability is idempotent: snapshot, restore, replay,
+    // and prove no duplicate usage/result mutation (event count, event log,
+    // and snapshot digest all unchanged).
+    let durable = coordinator.snapshot()?;
+    let mut restored = AgentCoordinator::restore_with_admitted_provider(
+        durable.clone(),
+        cfg.clone(),
+        admitted_capability(durable.event_sequence)?,
+    )?;
+    assert_eq!(restored.events(), coordinator.events());
+    restored.observe_provider_event(context.clone(), envelope.clone(), receipt.clone())?;
+    assert_eq!(restored.events(), coordinator.events());
+    assert_eq!(restored.snapshot()?, durable);
+
+    // A session-terminal input on the restored state still cannot reach
+    // result intake.
+    let terminal = session_event_envelope(
+        "e2e-session-t",
+        "e2e-session-t",
+        NormalizedHostEventPayload::Usage(usage()),
+    )?;
+    assert_eq!(
+        restored.observe_provider_event(
+            context.clone(),
+            terminal.clone(),
+            terminal.normalization.clone()
+        ),
+        Err(CoordinatorError::IdentityConflict("execution_binding"))
+    );
+    assert_eq!(restored.events(), coordinator.events());
+
+    // A foreign turn never reaches result intake: the binding gate rejects it
+    // even though the attempt identity matches.
+    let foreign_binding = binding_submission(
+        "e2e-foreign",
+        &lane,
+        "unit-e2e-foreign",
+        "scope-e2e-observe",
+    )?
+    .binding;
+    let mut foreign = result_submission("e2e-foreign", &lane, ResultDisposition::Partial)?;
+    foreign.result.actual_route = matched_observation(&lane, &foreign_binding)?;
+    assert_eq!(
+        restored.submit_result(context.clone(), foreign).err(),
+        Some(CoordinatorError::IdentityConflict("execution_binding"))
+    );
+
+    // The replays synthesized no usage/result: exact intake still closes
+    // exactly once, and a second intake is a duplicate.
+    let mut submission = result_submission("e2e-observe", &lane, ResultDisposition::Partial)?;
+    submission.result.actual_route = matched_observation(&lane, &stored)?;
+    let intake = restored.submit_result(context.clone(), submission)?;
+    assert_eq!(
+        intake.proof_ceiling,
+        eliot_receipts::ProofCeiling::CandidateArtifact
+    );
+    let mut again = result_submission("e2e-observe-again", &lane, ResultDisposition::Partial)?;
+    again.result.actual_route = matched_observation(&lane, &stored)?;
+    assert_eq!(
+        restored.submit_result(context, again).err(),
+        Some(CoordinatorError::DuplicateResult)
+    );
     Ok(())
 }
 

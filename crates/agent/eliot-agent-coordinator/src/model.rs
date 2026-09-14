@@ -1,8 +1,9 @@
 use eliot_agent_api::{
     AdmittedRouteReceipt, AgentLaunchRequest, AgentResult, AttemptId, BudgetEnvelope, CancelReason,
-    EpochId, EventId, HostEventNormalizationReceipt, LaunchRequestId, NormalizedHostEventEnvelope,
-    PhysicalRouteObservationReceipt, ProviderExecutionBinding, ResultDisposition, RouteFingerprint,
-    RouteSelectionCandidate, StateFence, TaskId, WorkLeaseId, WorkUnitId,
+    EpochId, EventId, HostEventNormalizationReceipt, HostEventQuarantineReason, LaunchRequestId,
+    NormalizedHostEventEnvelope, PhysicalRouteObservationReceipt, ProviderExecutionBinding,
+    ResultDisposition, RouteFingerprint, RouteSelectionCandidate, StateFence, TaskId, WorkLeaseId,
+    WorkUnitId,
 };
 use eliot_agent_contracts::{
     DescendantClosureReceipt, LivePeerMessage, LivePeerMessageState, MessageId,
@@ -737,6 +738,8 @@ pub enum CoordinatorError {
     DuplicateResult,
     #[error("idempotency identity was reused with different canonical input")]
     IdempotencyConflict,
+    #[error("host event quarantined with conflicting {0:?}")]
+    HostEventQuarantine(HostEventQuarantineReason),
     #[error("unknown outcome requires authenticated reconciliation")]
     UnknownOutcomeRequiresReconciliation,
     #[error("descendant closure is incomplete or mismatched")]

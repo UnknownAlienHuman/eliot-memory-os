@@ -10,12 +10,19 @@ use std::sync::Arc;
 
 use eliot_agent_api::{
     AdmittedRouteReceipt, AgentAttempt, AgentLaunchRequest, AgentResult, AgentWorkUnitBrief,
-    AttemptId, AttemptState, AuthorityEnvelope, CONTRACT_VERSION, CancelReason, CancellationState,
-    ClockReading, ContinuityKind, EffectCeiling, EventCursor, EventId, ExecutionOutcome,
-    ExecutionUnit, ExecutionUnitObservation, HostEventEnvelope, HostEventKind, LowercaseSha256,
-    NativeSession, PhysicalRouteObservationReceipt, ProviderExecutionBinding,
-    ProviderObservationLineage, ResultDisposition, RouteContinuationLocator, RouteFingerprint,
-    RouteObservationState, SessionId, UsageReceipt, WorkLeaseId,
+    AssistantDeltaObservation, AttemptId, AttemptState, AuthorityEnvelope, CONTRACT_VERSION,
+    CancelReason, CancellationState, ClockReading, ContinuityKind, EffectCeiling, ErrorObservation,
+    EventCursor, EventId, ExecutionOutcome, ExecutionStartedObservation, ExecutionUnit,
+    HOST_EVENT_CONTRACT_VERSION, HOST_EVENT_DIGEST_ALGORITHM, HostEventDeliveryDisposition,
+    HostEventNormalizationReceipt, HostEventPrivacyClass, LowercaseSha256, NativeSession,
+    NormalizationCoverage, NormalizedHostEventEnvelope, NormalizedHostEventPayload,
+    PhysicalRouteObservationReceipt, ProviderExecutionBinding, ProviderObservationLineage,
+    ProviderTerminalObservation, ProviderTerminalStatus, QualifiedSourceDigest, QuotaKnowledge,
+    RawSourceRecord, ReasoningSummaryObservation, RestrictedRawSourceHandle, ResultDisposition,
+    RouteContinuationLocator, RouteFingerprint, RouteObservationState, SessionId,
+    SessionLifecycleObservation, SessionLifecycleTransition, ToolInvocationObservation,
+    ToolOutcomeClass, ToolOutcomeObservation, UnsupportedDisposition, UnsupportedEventObservation,
+    UnsupportedEventReason, UsageReceipt, WorkLeaseId,
 };
 use eliot_process::{
     CancellationReceipt, ProcessEvidence, ProcessEvidenceSink, ProcessExecutionError,
@@ -39,6 +46,13 @@ pub const CODEX_WIRE_SCHEMA_VERSION: &str = "codex-app-server-stable-jsonl/v2";
 pub const CODEX_ROUTE_CLASS: &str = "codex-app-server";
 pub const MAX_JSONL_LINE_BYTES: usize = 4 * 1024 * 1024;
 pub const MAX_EVENT_BYTES: usize = 256 * 1024;
+
+/// Adapter identity bound by [`normalize_codex_event`]. Callers never supply
+/// their own producer identity.
+pub const CODEX_NORMALIZER_IDENTITY: &str = CODEX_ADAPTER_ID;
+/// Adapter contract version bound by [`normalize_codex_event`]. Callers never
+/// supply their own producer version.
+pub const CODEX_NORMALIZER_VERSION: &str = CODEX_WIRE_SCHEMA_VERSION;
 
 /// Adapter failures preserve the boundary that rejected the call.  Provider
 /// response bodies are intentionally not included in errors.
@@ -86,6 +100,8 @@ pub enum CodexAdapterError {
     CatalogueMismatch(&'static str),
     #[error("Codex model is not present in the bound catalogue snapshot")]
     ModelNotInCatalogue,
+    #[error("Codex host-event normalization input is invalid: {0}")]
+    InvalidInput(&'static str),
 }
 
 /// Exact route constructor.  The resulting value is still the A-01 route
@@ -749,62 +765,323 @@ pub fn correlate_response<'a>(
     })
 }
 
-fn event_kind(method: &str, params: &Value) -> HostEventKind {
-    match method {
-        "thread/started" | "thread/resumed" => HostEventKind::SessionStarted,
-        "turn/started" | "turn/created" => HostEventKind::PromptSubmitted,
-        "item/agentMessage/delta" | "item/assistantMessage/delta" => HostEventKind::AssistantDelta,
-        "item/reasoningSummary/delta" | "item/reasoning/delta" => HostEventKind::ReasoningDelta,
-        "item/commandExecution/requestApproval" | "item/toolCall" => HostEventKind::ToolCall,
-        "item/commandExecution/finished" | "item/toolResult" => HostEventKind::ToolResult,
-        "turn/completed" => match params
-            .get("turn")
-            .and_then(Value::as_object)
-            .and_then(|turn| turn.get("status"))
-            .and_then(Value::as_str)
-        {
-            Some("completed") => HostEventKind::Completed,
-            Some("failed") => HostEventKind::Failed,
-            _ => HostEventKind::Unknown,
-        },
-        "turn/failed" | "error" => HostEventKind::Error,
-        _ => HostEventKind::Unknown,
-    }
-}
-
 /// Namespace of the exact Codex execution unit: the turn ID. Matches the S1
 /// owner fixture (`crates/agent/eliot-agent-api/tests/execution_binding.rs`).
 const CODEX_EXECUTION_UNIT_NAMESPACE: &str = "codex";
 
-/// Render a host observation timestamp into the legacy envelope string without
-/// fabricating causal order. Only `valid_time_ms` (wall-clock time observed by
-/// the host, `crates/foundation/eliot-contracts/src/lib.rs:452-461`) is
-/// rendered; the Governor-assigned causal sequence and monotonic readings are
-/// never consulted, and unknown stays `"unknown"` per `workstreams/T4.md:140`.
-/// The string exists only because `HostEventEnvelope.observed_at`
-/// (`crates/agent/eliot-agent-api/src/lib.rs:691`) is a read-only `String`
-/// for S3; every other owner keeps typed `ClockReading`, so no canonical
-/// renderer exists in-repo and none is invented here.
-fn observed_at_string(reading: &ClockReading) -> String {
-    match reading.valid_time_ms {
-        Some(millis) => millis.to_string(),
-        None => "unknown".to_owned(),
+/// Closed-payload classification for one Codex notification.
+///
+/// Every branch returns a member of the closed
+/// [`NormalizedHostEventPayload`] family (no generic `Value`, no `Other`
+/// escape). Raw provider text/arguments/results stay behind the restricted
+/// source handle; the public payload carries only bounded summaries or
+/// canonical digests. Unknown methods and non-terminal `turn/completed`
+/// statuses quarantine as [`NormalizedHostEventPayload::UnsupportedQuarantined`],
+/// never as terminal success.
+struct ClassifiedCodexPayload {
+    payload: NormalizedHostEventPayload,
+    omitted_fields: Vec<String>,
+    warnings: Vec<String>,
+    privacy_class: HostEventPrivacyClass,
+    coverage: NormalizationCoverage,
+}
+
+/// Count characters of the first present string field, in Unicode scalar
+/// values. Absent fields yield `0` (absent evidence, never a guessed length).
+fn delta_chars_from(params: &Value, keys: &[&str]) -> u64 {
+    params
+        .as_object()
+        .and_then(|object| {
+            keys.iter()
+                .filter_map(|key| object.get(*key))
+                .filter_map(Value::as_str)
+                .next()
+        })
+        .map(|text| text.chars().count() as u64)
+        .unwrap_or(0)
+}
+
+/// Extract an opaque tool name from the wire without publishing arguments.
+/// Falls back to the wire method family (real wire evidence, never a canned
+/// universal name) when no explicit name is present.
+fn tool_name_from(params: &Value, method: &str) -> String {
+    params
+        .as_object()
+        .and_then(|object| {
+            ["tool", "name", "command", "function", "toolName"]
+                .iter()
+                .filter_map(|key| object.get(*key))
+                .filter_map(Value::as_str)
+                .map(str::trim)
+                .find(|name| !name.is_empty())
+        })
+        .unwrap_or(method)
+        .to_owned()
+}
+
+/// Canonical digest of the exact wire arguments/results for the restricted
+/// source commitment. Uses the shared canonical-JSON + SHA-256 primitive
+/// (never a new digest algorithm).
+fn digest_value(value: &Value) -> Result<LowercaseSha256, CodexAdapterError> {
+    let bytes = eliot_contracts::canonical_json_bytes(value)
+        .map_err(|_| CodexAdapterError::Contract(eliot_agent_api::ContractError::DigestMismatch))?;
+    let hex = eliot_contracts::sha256_hex(&bytes);
+    serde_json::from_value(Value::String(hex))
+        .map_err(|_| CodexAdapterError::Contract(eliot_agent_api::ContractError::DigestMismatch))
+}
+
+/// Classify the provider terminal status from `params.turn.status`.
+/// Only exact `"completed"`/`"failed"` become observed terminal success/failure;
+/// every other status (interrupted, unknown, in-progress, numeric, missing)
+/// stays quarantine and never upgrades to success.
+fn terminal_status_from(params: &Value) -> Option<ProviderTerminalStatus> {
+    match params
+        .get("turn")
+        .and_then(Value::as_object)
+        .and_then(|turn| turn.get("status"))
+        .and_then(Value::as_str)
+    {
+        Some("completed") => Some(ProviderTerminalStatus::CompletedObserved),
+        Some("failed") => Some(ProviderTerminalStatus::FailedObserved),
+        _ => None,
     }
 }
 
-/// Resolve the attributable execution-unit observation, failing closed for
-/// session-only lineage: a `SessionObservation` carries no attempt authority
-/// and can never validate as execution-unit evidence (same fail-closed as S1
-/// `ProviderObservationLineage::attributable_binding`,
-/// `crates/agent/eliot-agent-api/src/execution_binding.rs:279-284`). The
-/// caller retains the raw thread event without attributing it.
-fn execution_observation(
-    lineage: &ProviderObservationLineage,
-) -> Result<&ExecutionUnitObservation, CodexAdapterError> {
-    match lineage {
-        ProviderObservationLineage::ExecutionUnitObservation(observation) => Ok(observation),
-        ProviderObservationLineage::SessionObservation(_) => Err(CodexAdapterError::Contract(
-            eliot_agent_api::ContractError::BindingMismatch,
+/// Classify a tool outcome without inferring success. Only exact
+/// success/failure/cancelled strings classify; absent or unrecognized outcome
+/// stays [`ToolOutcomeClass::Unknown`], never success.
+fn tool_outcome_from(params: &Value) -> ToolOutcomeClass {
+    let status = params
+        .as_object()
+        .and_then(|object| {
+            ["status", "outcome", "result", "state"]
+                .iter()
+                .filter_map(|key| object.get(*key))
+                .filter_map(Value::as_str)
+                .next()
+        })
+        .map(|value| value.trim().to_ascii_lowercase());
+    match status.as_deref() {
+        Some("succeeded") | Some("success") | Some("completed") | Some("ok") => {
+            ToolOutcomeClass::Succeeded
+        }
+        Some("failed") | Some("failure") | Some("error") => ToolOutcomeClass::Failed,
+        Some("cancelled") | Some("canceled") | Some("interrupted") => ToolOutcomeClass::Cancelled,
+        _ => ToolOutcomeClass::Unknown,
+    }
+}
+
+/// Top-level params keys dropped from the public typed summary. Used for the
+/// loss manifest (`omitted_fields`); raw bytes stay behind the restricted
+/// handle by construction.
+fn omitted_top_level_keys(params: &Value, retained: &[&str]) -> Vec<String> {
+    let Some(object) = params.as_object() else {
+        return Vec::new();
+    };
+    object
+        .keys()
+        .filter(|key| !retained.contains(&key.as_str()))
+        .take(32)
+        .cloned()
+        .collect()
+}
+
+fn unsupported_quarantine(
+    method: &str,
+    reason: UnsupportedEventReason,
+    warnings: Vec<String>,
+    omitted_fields: Vec<String>,
+) -> ClassifiedCodexPayload {
+    let namespace = method
+        .split('/')
+        .next()
+        .filter(|part| !part.trim().is_empty())
+        .unwrap_or("codex");
+    ClassifiedCodexPayload {
+        payload: NormalizedHostEventPayload::UnsupportedQuarantined(UnsupportedEventObservation {
+            source_namespace: namespace.to_owned(),
+            source_version: Some(CODEX_WIRE_SCHEMA_VERSION.to_owned()),
+            reason,
+            detail_ref: Some(method.to_owned()),
+        }),
+        omitted_fields,
+        warnings,
+        privacy_class: HostEventPrivacyClass::RestrictedHandleOnly,
+        coverage: NormalizationCoverage::LossyOmission,
+    }
+}
+
+/// Map one Codex notification method + params to the closed typed payload.
+/// The bound turn/sequence supply correlation references minted by the adapter
+/// (never a provider-native cursor); raw content stays behind the handle.
+fn classify_codex_payload(
+    method: &str,
+    params: &Value,
+    bound_turn: &str,
+    sequence: u64,
+    bound_unit: &ExecutionUnit,
+) -> Result<ClassifiedCodexPayload, CodexAdapterError> {
+    match method {
+        "turn/started" | "turn/created" => Ok(ClassifiedCodexPayload {
+            payload: NormalizedHostEventPayload::ExecutionStarted(ExecutionStartedObservation {
+                execution_unit: bound_unit.clone(),
+                start_ref: bound_turn.to_owned(),
+            }),
+            omitted_fields: omitted_top_level_keys(params, &["threadId", "thread_id", "turn"]),
+            warnings: Vec::new(),
+            privacy_class: HostEventPrivacyClass::RedactedSummary,
+            coverage: if omitted_top_level_keys(params, &["threadId", "thread_id", "turn"])
+                .is_empty()
+            {
+                NormalizationCoverage::Complete
+            } else {
+                NormalizationCoverage::LossyOmission
+            },
+        }),
+        "item/agentMessage/delta" | "item/assistantMessage/delta" => {
+            let delta_chars =
+                delta_chars_from(params, &["delta", "text", "content", "message", "output"]);
+            Ok(ClassifiedCodexPayload {
+                payload: NormalizedHostEventPayload::AssistantDelta(AssistantDeltaObservation {
+                    delta_chars,
+                    truncated: false,
+                }),
+                omitted_fields: vec!["raw_delta_text".to_owned()],
+                warnings: Vec::new(),
+                privacy_class: HostEventPrivacyClass::RedactedSummary,
+                coverage: NormalizationCoverage::LossyOmission,
+            })
+        }
+        "item/reasoningSummary/delta" | "item/reasoning/delta" => {
+            let summary_chars =
+                delta_chars_from(params, &["delta", "text", "summary", "content", "message"]);
+            Ok(ClassifiedCodexPayload {
+                payload: NormalizedHostEventPayload::ReasoningSummary(
+                    ReasoningSummaryObservation {
+                        summary_chars,
+                        truncated: false,
+                    },
+                ),
+                omitted_fields: vec!["raw_reasoning_text".to_owned()],
+                warnings: Vec::new(),
+                privacy_class: HostEventPrivacyClass::RestrictedHandleOnly,
+                coverage: NormalizationCoverage::LossyOmission,
+            })
+        }
+        "item/commandExecution/requestApproval" | "item/toolCall" => {
+            let tool_name = tool_name_from(params, method);
+            if tool_name.trim().is_empty()
+                || tool_name.chars().any(char::is_control)
+                || tool_name.chars().count() > 1024
+            {
+                return Err(CodexAdapterError::MalformedWire("tool name"));
+            }
+            Ok(ClassifiedCodexPayload {
+                payload: NormalizedHostEventPayload::ToolInvocation(ToolInvocationObservation {
+                    tool_name,
+                    invocation_ref: format!("{bound_turn}:{sequence}"),
+                    arguments_digest: digest_value(params)?,
+                }),
+                omitted_fields: vec!["raw_arguments".to_owned()],
+                warnings: Vec::new(),
+                privacy_class: HostEventPrivacyClass::RestrictedHandleOnly,
+                coverage: NormalizationCoverage::LossyOmission,
+            })
+        }
+        "item/commandExecution/finished" | "item/toolResult" => {
+            let tool_name = tool_name_from(params, method);
+            if tool_name.trim().is_empty()
+                || tool_name.chars().any(char::is_control)
+                || tool_name.chars().count() > 1024
+            {
+                return Err(CodexAdapterError::MalformedWire("tool name"));
+            }
+            let result_source = params.get("result").unwrap_or(params);
+            Ok(ClassifiedCodexPayload {
+                payload: NormalizedHostEventPayload::ToolOutcome(ToolOutcomeObservation {
+                    tool_name,
+                    invocation_ref: format!("{bound_turn}:{sequence}"),
+                    outcome: tool_outcome_from(params),
+                    result_digest: digest_value(result_source)?,
+                    safe_summary: None,
+                }),
+                omitted_fields: vec!["raw_result".to_owned()],
+                warnings: Vec::new(),
+                privacy_class: HostEventPrivacyClass::RestrictedHandleOnly,
+                coverage: NormalizationCoverage::LossyOmission,
+            })
+        }
+        "turn/completed" => {
+            if let Some(status) = terminal_status_from(params) {
+                let omitted = omitted_top_level_keys(params, &["threadId", "thread_id", "turn"]);
+                let coverage = if omitted.is_empty() {
+                    NormalizationCoverage::Complete
+                } else {
+                    NormalizationCoverage::LossyOmission
+                };
+                Ok(ClassifiedCodexPayload {
+                    payload: NormalizedHostEventPayload::ProviderTerminalObserved(
+                        ProviderTerminalObservation {
+                            status,
+                            terminal_ref: bound_turn.to_owned(),
+                        },
+                    ),
+                    omitted_fields: omitted,
+                    warnings: Vec::new(),
+                    privacy_class: HostEventPrivacyClass::RedactedSummary,
+                    coverage,
+                })
+            } else {
+                Ok(unsupported_quarantine(
+                    method,
+                    UnsupportedEventReason::UnknownMethod,
+                    vec!["non-terminal-turn-status".to_owned()],
+                    omitted_top_level_keys(params, &["threadId", "thread_id"]),
+                ))
+            }
+        }
+        "turn/usage" | "usage" => {
+            let (input_tokens, output_tokens, cost_microunits) = params
+                .get("usage")
+                .and_then(Value::as_object)
+                .map(|usage| {
+                    (
+                        usage.get("input_tokens").and_then(Value::as_u64),
+                        usage.get("output_tokens").and_then(Value::as_u64),
+                        usage.get("cost_microunits").and_then(Value::as_u64),
+                    )
+                })
+                .unwrap_or((None, None, None));
+            // Absent native quota/replay evidence stays typed
+            // `NotExposed`, never a synthesized zero or string constant.
+            Ok(ClassifiedCodexPayload {
+                payload: NormalizedHostEventPayload::Usage(UsageReceipt {
+                    input_tokens,
+                    output_tokens,
+                    cost_microunits,
+                    quota: QuotaKnowledge::NotExposed,
+                }),
+                omitted_fields: Vec::new(),
+                warnings: Vec::new(),
+                privacy_class: HostEventPrivacyClass::RedactedSummary,
+                coverage: NormalizationCoverage::Complete,
+            })
+        }
+        "turn/failed" | "error" => Ok(ClassifiedCodexPayload {
+            payload: NormalizedHostEventPayload::Error(ErrorObservation {
+                code: method.to_owned(),
+                safe_summary: format!("codex {method} observed"),
+            }),
+            omitted_fields: vec!["raw_error".to_owned()],
+            warnings: Vec::new(),
+            privacy_class: HostEventPrivacyClass::RestrictedHandleOnly,
+            coverage: NormalizationCoverage::LossyOmission,
+        }),
+        _ => Ok(unsupported_quarantine(
+            method,
+            UnsupportedEventReason::UnknownMethod,
+            Vec::new(),
+            omitted_top_level_keys(params, &[]),
         )),
     }
 }
@@ -894,81 +1171,314 @@ fn validate_session_locator_against_binding(
     Ok(())
 }
 
-/// Translate one provider event into an A-01 event bound to its exact turn.
+/// Typed Codex host-event normalization input (issue #371 S7).
 ///
-/// The recorded `lineage` carries the attribution: only an
-/// `ExecutionUnitObservation` yields attempt output, with the envelope's
-/// legacy attempt identity, route, cursor, and sequence taken from that
-/// recorded binding — never from an ambient parameter or a synthesized
-/// `codex:{sequence}` cursor. The wire turn must exactly equal the bound unit
-/// (real-parser correlation over `params.turn.id`); a missing or foreign turn
-/// fails closed for quarantine without advancing another attempt, and a
-/// session-only lineage fails closed without inventing attempt identity.
-/// `previous_sequence` is supplied by the owner, avoiding a hidden local
-/// cursor/state assumption; the recorded observation sequence must agree with
-/// the claimed stream position.
-pub fn translate_host_event(
-    message: &CodexWireMessage,
-    lineage: &ProviderObservationLineage,
-    sequence: u64,
-    previous_sequence: Option<u64>,
-    observed_at: &ClockReading,
-) -> Result<HostEventEnvelope, CodexAdapterError> {
-    let observation = execution_observation(lineage)?;
-    observation.validate()?;
-    validate_binding_for_codex(&observation.binding)?;
-    if observation.sequence != sequence {
-        // The recorded observation does not belong to the claimed stream
-        // position; never reassign it to the active attempt.
-        return Err(CodexAdapterError::Contract(
-            eliot_agent_api::ContractError::BindingMismatch,
-        ));
+/// Every field is typed: the wire message travels as [`CodexWireMessage`],
+/// the exact execution lineage travels as [`ProviderObservationLineage`]
+/// (never parsed from provider locators), event identity/cursor travel as
+/// [`EventId`]/[`EventCursor`] from the post-R1 owner (never synthesized as
+/// `codex:{sequence}`), digests are computed inside from `raw_source_bytes`
+/// (never caller-supplied strings), and observation time is a typed
+/// [`ClockReading`] (never a wall-clock string). The closed typed payload is
+/// classified inside from the wire method (never caller-supplied).
+#[derive(Clone, Debug)]
+pub struct CodexHostEventInput<'a> {
+    /// Provider wire notification. Must be a notification (not request/response).
+    pub message: &'a CodexWireMessage,
+    /// Exact session or execution-unit lineage. No string/JSON parsing, no new
+    /// attempt invention.
+    pub lineage: ProviderObservationLineage,
+    /// Event identity from the post-R1 owner. For execution-unit lineage must
+    /// equal the recorded observation cursor (no synthesis).
+    pub event_id: EventId,
+    /// Resume cursor from the post-R1 owner. For execution-unit lineage must
+    /// equal the recorded observation cursor (preserved end-to-end).
+    pub cursor: EventCursor,
+    /// Monotonic sequence within the bound stream. Must be nonzero and must
+    /// equal the recorded observation sequence for execution-unit lineage.
+    pub sequence: u64,
+    /// Previous sequence observed by the owner, for monotonicity. `None` for
+    /// the first event; otherwise `sequence` must strictly increase.
+    pub previous_sequence: Option<u64>,
+    /// Causal predecessor event identities. Must never contain `event_id`.
+    pub predecessors: Vec<EventId>,
+    /// Raw Codex frame bytes (the exact JSONL wire bytes). Digested inside via
+    /// the canonical SHA-256 primitive; never copied into the public payload.
+    pub raw_source_bytes: &'a [u8],
+    /// Restricted handle addressing the immutable raw source record.
+    pub raw_source_handle: RestrictedRawSourceHandle,
+    /// Typed observation time. Unknown stays unknown; wall time never advances
+    /// sequence, cursor, fence, or attempt state.
+    pub observed_at: ClockReading,
+    /// Delivery/coverage disposition of this observation.
+    pub delivery: HostEventDeliveryDisposition,
+    /// Recorded #369 admission. Required for execution-unit lineage (the
+    /// envelope references it by digest); forbidden for session-only lineage,
+    /// which carries no admission reference.
+    pub admission: Option<&'a AdmittedRouteReceipt>,
+}
+
+/// Normalize one Codex wire notification into the closed v7 host-event schema
+/// (issue #371 S7).
+///
+/// The adapter identity/version (`eliot-agent-codex` /
+/// [`CODEX_WIRE_SCHEMA_VERSION`]) is bound by this function, never supplied by
+/// the caller; the input source digest is computed from `raw_source_bytes` via
+/// the canonical SHA-256 primitive (never `blake3`, never a new digest); and
+/// the sealed envelope is validated before return (execution-unit lineage
+/// against the exact binding plus the #369 admission via
+/// `validate_for_lineage`, session lineage on the session path via
+/// `validate_as_session_observation`). Raw bytes stay behind the restricted
+/// handle; the public payload holds the bounded typed summary only.
+///
+/// S1 binding checks are preserved: the recorded observation must agree with
+/// the claimed stream position, monotonicity is enforced by the owner-supplied
+/// `previous_sequence` (no hidden local cursor), the wire turn
+/// (`params.turn.id` via the real JSON parser) must exactly equal the bound
+/// unit (missing/foreign turn quarantines without advancing another attempt),
+/// and thread events stay session-only (never yield attempt output).
+/// The recorded `observation.cursor` is preserved end-to-end for cursor and
+/// event identity; no `codex:{sequence}` cursor is ever synthesized, and
+/// absent native replay/quota evidence maps to typed
+/// [`QuotaKnowledge::NotExposed`] (never a string constant or zero).
+pub fn normalize_codex_event(
+    input: CodexHostEventInput<'_>,
+) -> Result<(NormalizedHostEventEnvelope, HostEventNormalizationReceipt), CodexAdapterError> {
+    if input.sequence == 0 {
+        return Err(CodexAdapterError::InvalidInput("sequence"));
     }
-    if sequence == 0 || previous_sequence.is_some_and(|previous| sequence <= previous) {
+    if input.raw_source_bytes.is_empty() || input.raw_source_bytes.len() > MAX_EVENT_BYTES {
+        return Err(CodexAdapterError::InvalidInput("raw_source_bytes"));
+    }
+    if input
+        .previous_sequence
+        .is_some_and(|previous| input.sequence <= previous)
+    {
         return Err(CodexAdapterError::Contract(
             eliot_agent_api::ContractError::NonMonotonicEvent,
         ));
     }
-    let method = message
-        .method
-        .as_deref()
-        .ok_or(CodexAdapterError::MalformedWire("event has no method"))?;
-    if validate_wire_message(message)? != WireMessageKind::Notification {
+    if validate_wire_message(input.message)? != WireMessageKind::Notification {
         return Err(CodexAdapterError::MalformedWire(
             "event must be a notification",
         ));
     }
-    let params = message.params.clone().unwrap_or(Value::Null);
-    validate_wire_session_against_binding(&params, &observation.binding)?;
-    let bound_turn = observation.binding.execution_unit.unit_id.as_str();
-    if wire_turn_id(&params) != Some(bound_turn) {
-        // Missing or foreign turn: quarantine (the caller retains raw
-        // evidence); never attribute turn B output to attempt A.
-        return Err(CodexAdapterError::Contract(
-            eliot_agent_api::ContractError::BindingMismatch,
-        ));
-    }
-    let bytes = serde_json::to_vec(&message)
-        .map_err(|_| CodexAdapterError::MalformedWire("event serialization"))?;
-    if bytes.len() > MAX_EVENT_BYTES {
-        return Err(CodexAdapterError::WireTooLarge);
-    }
-    let binding = &observation.binding;
-    let envelope = HostEventEnvelope {
-        event_id: EventId::new(observation.cursor.as_str())?,
-        attempt_id: binding.attempt_id.clone(),
-        sequence,
-        cursor: observation.cursor.clone(),
-        kind: event_kind(method, &params),
-        route: binding.route.clone(),
-        raw_payload_digest: blake3::hash(&bytes).to_hex().to_string(),
-        normalized_payload: params,
-        parent_event_id: None,
-        observed_at: observed_at_string(observed_at),
-        lineage: Some(lineage.clone()),
+    let method = input
+        .message
+        .method
+        .as_deref()
+        .ok_or(CodexAdapterError::MalformedWire("event has no method"))?;
+    let params = input.message.params.clone().unwrap_or(Value::Null);
+
+    // Lineage/admission pairing (mirrors ACP): execution-unit requires
+    // admission, session-only forbids it (no attempt authority, no route
+    // reference).
+    let execution_observation = match &input.lineage {
+        ProviderObservationLineage::ExecutionUnitObservation(observation) => {
+            let admission = input
+                .admission
+                .ok_or(CodexAdapterError::InvalidInput("admission/lineage"))?;
+            admission.validate().map_err(CodexAdapterError::Contract)?;
+            observation.validate()?;
+            validate_binding_for_codex(&observation.binding)?;
+            if observation.sequence != input.sequence {
+                return Err(CodexAdapterError::Contract(
+                    eliot_agent_api::ContractError::BindingMismatch,
+                ));
+            }
+            if observation.cursor != input.cursor
+                || observation.cursor.as_str() != input.event_id.as_str()
+            {
+                // The recorded cursor is preserved end-to-end; a caller
+                // cursor that disagrees with the recorded observation is never
+                // re-pointed to the active attempt.
+                return Err(CodexAdapterError::Contract(
+                    eliot_agent_api::ContractError::BindingMismatch,
+                ));
+            }
+            validate_wire_session_against_binding(&params, &observation.binding)?;
+            let bound_turn = observation.binding.execution_unit.unit_id.as_str();
+            if wire_turn_id(&params) != Some(bound_turn) {
+                // Missing or foreign turn: quarantine (caller retains raw);
+                // never attribute turn B output to attempt A.
+                return Err(CodexAdapterError::Contract(
+                    eliot_agent_api::ContractError::BindingMismatch,
+                ));
+            }
+            Some((observation, admission, bound_turn))
+        }
+        ProviderObservationLineage::SessionObservation(observation) => {
+            if input.admission.is_some() {
+                return Err(CodexAdapterError::InvalidInput("admission/lineage"));
+            }
+            observation.validate()?;
+            None
+        }
     };
-    envelope.validate()?;
-    Ok(envelope)
+
+    let (payload, omitted_fields, warnings, privacy_class, coverage) = match execution_observation {
+        Some((observation, _, bound_turn)) => {
+            let classified = classify_codex_payload(
+                method,
+                &params,
+                bound_turn,
+                input.sequence,
+                &observation.binding.execution_unit,
+            )?;
+            (
+                classified.payload,
+                classified.omitted_fields,
+                classified.warnings,
+                classified.privacy_class,
+                classified.coverage,
+            )
+        }
+        None => {
+            // Session-only path: thread lifecycle stays session-only.
+            // Turn/delta/tool/terminal methods require execution-unit
+            // lineage and fail closed here (no attempt authority invented);
+            // unknown methods quarantine as typed session evidence.
+            match method {
+                "thread/started" => (
+                    NormalizedHostEventPayload::SessionLifecycle(SessionLifecycleObservation {
+                        transition: SessionLifecycleTransition::Started,
+                        detail_ref: None,
+                    }),
+                    Vec::new(),
+                    Vec::new(),
+                    HostEventPrivacyClass::RedactedSummary,
+                    NormalizationCoverage::Complete,
+                ),
+                "thread/resumed" => (
+                    NormalizedHostEventPayload::SessionLifecycle(SessionLifecycleObservation {
+                        transition: SessionLifecycleTransition::Resumed,
+                        detail_ref: None,
+                    }),
+                    Vec::new(),
+                    Vec::new(),
+                    HostEventPrivacyClass::RedactedSummary,
+                    NormalizationCoverage::Complete,
+                ),
+                _ if classify_needs_execution_unit(method, &params) => {
+                    return Err(CodexAdapterError::Contract(
+                        eliot_agent_api::ContractError::BindingMismatch,
+                    ));
+                }
+                _ => {
+                    let classified = unsupported_quarantine(
+                        method,
+                        UnsupportedEventReason::UnknownMethod,
+                        Vec::new(),
+                        omitted_top_level_keys(&params, &[]),
+                    );
+                    (
+                        classified.payload,
+                        classified.omitted_fields,
+                        classified.warnings,
+                        classified.privacy_class,
+                        classified.coverage,
+                    )
+                }
+            }
+        }
+    };
+
+    let unsupported_disposition = match &payload {
+        NormalizedHostEventPayload::UnsupportedQuarantined(_) => {
+            UnsupportedDisposition::UnsupportedMethodQuarantined
+        }
+        _ => UnsupportedDisposition::None,
+    };
+    let input_digest: LowercaseSha256 = serde_json::from_value(Value::String(
+        eliot_contracts::sha256_hex(input.raw_source_bytes),
+    ))
+    .map_err(|_| CodexAdapterError::Contract(eliot_agent_api::ContractError::DigestMismatch))?;
+    let receipt = HostEventNormalizationReceipt {
+        normalizer_identity: CODEX_NORMALIZER_IDENTITY.to_owned(),
+        normalizer_version: CODEX_NORMALIZER_VERSION.to_owned(),
+        input_handle: input.raw_source_handle.clone(),
+        input_digest: QualifiedSourceDigest {
+            algorithm: HOST_EVENT_DIGEST_ALGORITHM.to_owned(),
+            digest: input_digest,
+        },
+        output_schema_version: HOST_EVENT_CONTRACT_VERSION.to_owned(),
+        output_digest: serde_json::from_value(Value::String(
+            "0000000000000000000000000000000000000000000000000000000000000000".to_owned(),
+        ))
+        .map_err(|_| CodexAdapterError::Contract(eliot_agent_api::ContractError::DigestMismatch))?,
+        omitted_fields,
+        warnings,
+        unsupported_disposition,
+        privacy_class,
+        coverage,
+        proof_ceiling: eliot_agent_api::ProofCeiling::Observation,
+    };
+    let admitted_route_digest = input
+        .admission
+        .map(|admission| admission.self_digest.clone());
+    let mut envelope = NormalizedHostEventEnvelope {
+        schema_version: HOST_EVENT_CONTRACT_VERSION.to_owned(),
+        event_id: input.event_id,
+        cursor: input.cursor,
+        lineage: input.lineage,
+        producer_adapter_identity: CODEX_NORMALIZER_IDENTITY.to_owned(),
+        adapter_contract_version: CODEX_NORMALIZER_VERSION.to_owned(),
+        sequence: input.sequence,
+        causal_predecessors: input.predecessors,
+        payload,
+        admitted_route_digest,
+        raw_source: RawSourceRecord {
+            handle: input.raw_source_handle,
+            digest: receipt.input_digest.clone(),
+        },
+        normalization: receipt,
+        observed_at: input.observed_at,
+        delivery: input.delivery,
+    };
+    envelope
+        .seal()
+        .map_err(|_| CodexAdapterError::MalformedWire("event serialization"))?;
+    match envelope.lineage.attributable_binding() {
+        Ok(binding) => {
+            let admission = input
+                .admission
+                .ok_or(CodexAdapterError::InvalidInput("admission/lineage"))?;
+            envelope
+                .validate_for_lineage(binding, admission)
+                .map_err(CodexAdapterError::Contract)?;
+        }
+        Err(_) => {
+            envelope
+                .validate_as_session_observation()
+                .map_err(CodexAdapterError::Contract)?;
+        }
+    }
+    let receipt = envelope.normalization.clone();
+    Ok((envelope, receipt))
+}
+
+/// Whether a wire method needs execution-unit lineage (i.e. its typed payload
+/// requires attempt authority). Session-only callers with such methods fail
+/// closed instead of inventing binding.
+fn classify_needs_execution_unit(method: &str, params: &Value) -> bool {
+    match method {
+        "thread/started" | "thread/resumed" => false,
+        "turn/started" | "turn/created" => true,
+        "item/agentMessage/delta"
+        | "item/assistantMessage/delta"
+        | "item/reasoningSummary/delta"
+        | "item/reasoning/delta"
+        | "item/commandExecution/requestApproval"
+        | "item/toolCall"
+        | "item/commandExecution/finished"
+        | "item/toolResult"
+        | "turn/failed"
+        | "error"
+        | "turn/usage"
+        | "usage" => true,
+        "turn/completed" => terminal_status_from(params).is_some(),
+        _ => false,
+    }
 }
 
 /// Result input owned by the caller, assembled from a complete event stream.
@@ -981,7 +1491,7 @@ pub struct CodexResultInput {
     pub route: RouteFingerprint,
     pub session: CodexSessionBinding,
     pub output: Option<String>,
-    pub terminal_observation: Option<HostEventEnvelope>,
+    pub terminal_observation: Option<NormalizedHostEventEnvelope>,
     pub cancelled: bool,
     pub unknown_reason: Option<String>,
     pub usage: UsageReceipt,
@@ -989,24 +1499,34 @@ pub struct CodexResultInput {
     pub proposed_effects: Vec<eliot_agent_api::ProposedEffect>,
 }
 
-fn is_terminal_observation(kind: HostEventKind) -> bool {
-    matches!(kind, HostEventKind::Completed | HostEventKind::Failed)
+fn is_terminal_observation(payload: &NormalizedHostEventPayload) -> bool {
+    matches!(
+        payload,
+        NormalizedHostEventPayload::ProviderTerminalObserved(observation)
+            if matches!(
+                observation.status,
+                ProviderTerminalStatus::CompletedObserved
+                    | ProviderTerminalStatus::FailedObserved
+            )
+    )
 }
 
 /// Validate a supplied terminal observation against the recorded binding: the
 /// envelope must carry attributable execution-unit lineage for exactly this
 /// binding (a same-thread turn B observation never yields attempt A output)
-/// and must be terminal. Provider-effect/attempt linkage beyond this stays
-/// with S5 (`AgentResult::validate_for_binding`).
+/// and must be terminal (observed completed/failed, never a quarantined,
+/// usage, or session observation). Provider-effect/attempt linkage beyond this
+/// stays with S5 (`AgentResult::validate_for_binding`).
 fn validate_terminal_observation(
-    terminal: &HostEventEnvelope,
+    terminal: &NormalizedHostEventEnvelope,
     binding: &ProviderExecutionBinding,
+    admission: &AdmittedRouteReceipt,
 ) -> Result<(), CodexAdapterError> {
-    terminal.validate()?;
+    terminal
+        .validate_for_lineage(binding, admission)
+        .map_err(CodexAdapterError::Contract)?;
     let observed_binding = terminal
         .lineage
-        .as_ref()
-        .ok_or(eliot_agent_api::ContractError::BindingMismatch)?
         .attributable_binding()
         .map_err(CodexAdapterError::Contract)?;
     if observed_binding != binding {
@@ -1014,7 +1534,7 @@ fn validate_terminal_observation(
             eliot_agent_api::ContractError::BindingMismatch,
         ));
     }
-    if !is_terminal_observation(terminal.kind) {
+    if !is_terminal_observation(&terminal.payload) {
         return Err(CodexAdapterError::MalformedWire(
             "result terminal observation is not terminal",
         ));
@@ -1052,7 +1572,7 @@ pub fn translate_result(
         locator.validate()?;
     }
     if let Some(terminal) = &input.terminal_observation {
-        validate_terminal_observation(terminal, binding)?;
+        validate_terminal_observation(terminal, binding, admission)?;
     }
     let output_digest = input
         .output
@@ -1240,7 +1760,10 @@ pub fn wire_schema() -> Value {
 )]
 mod tests {
     use super::*;
-    use eliot_agent_api::{EventCursor, ExecutionUnit, NativeSessionLocator, SessionObservation};
+    use eliot_agent_api::{
+        EventCursor, ExecutionUnit, ExecutionUnitObservation, NativeSessionLocator,
+        SessionObservation,
+    };
     use std::collections::{BTreeMap, BTreeSet};
     use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -1869,21 +2392,87 @@ mod tests {
         }
     }
 
+    fn normalize_bound(
+        method: &str,
+        params: Value,
+        binding: &ProviderExecutionBinding,
+        admission: &AdmittedRouteReceipt,
+        sequence: u64,
+        previous_sequence: Option<u64>,
+    ) -> Result<(NormalizedHostEventEnvelope, HostEventNormalizationReceipt), CodexAdapterError>
+    {
+        // Keep the owned message alive for the input lifetime.
+        let message = CodexWireMessage::notification(method, Some(params));
+        let raw_source_bytes = serde_json::to_vec(&message)
+            .map_err(|_| CodexAdapterError::MalformedWire("event serialization"))?;
+        // Leak-free: normalize within this scope via a helper that owns bytes.
+        normalize_bound_with_bytes(
+            message,
+            raw_source_bytes,
+            binding,
+            admission,
+            sequence,
+            previous_sequence,
+            clock_at(Some(1_786_000_000_000)),
+        )
+    }
+
+    fn normalize_bound_with_bytes(
+        message: CodexWireMessage,
+        raw_source_bytes: Vec<u8>,
+        binding: &ProviderExecutionBinding,
+        admission: &AdmittedRouteReceipt,
+        sequence: u64,
+        previous_sequence: Option<u64>,
+        observed_at: ClockReading,
+    ) -> Result<(NormalizedHostEventEnvelope, HostEventNormalizationReceipt), CodexAdapterError>
+    {
+        let lineage = bound_lineage(binding, sequence).expect("fixture lineage");
+        let cursor = EventCursor::new(format!("turn-1:{sequence}")).expect("fixture cursor");
+        let event_id = EventId::new(format!("turn-1:{sequence}")).expect("fixture event");
+        // SAFETY: `raw_source_bytes` outlives the call; the input borrows it.
+        // To satisfy the borrow checker without unsafe, re-serialize inside:
+        // the canonical raw bytes are the JSON serialization of the message.
+        // We pass a reference to the local bytes (which lives for the call).
+        let handle = RestrictedRawSourceHandle::new(format!("restricted-codex:turn-1:{sequence}"))
+            .expect("fixture handle");
+        normalize_codex_event(CodexHostEventInput {
+            message: &message,
+            lineage,
+            event_id,
+            cursor,
+            sequence,
+            previous_sequence,
+            predecessors: Vec::new(),
+            raw_source_bytes: &raw_source_bytes,
+            raw_source_handle: handle,
+            observed_at,
+            delivery: HostEventDeliveryDisposition::BestEffortOrdered,
+            admission: Some(admission),
+        })
+    }
+
+    // Legacy name kept for minimal churn in existing test bodies: forwards to
+    // the typed normalizer and returns the envelope (receipt discarded by
+    // callers that only assert on envelope fields). New tests use
+    // `normalize_bound` directly to assert on receipts.
     fn translate_bound(
         method: &str,
         params: Value,
         binding: &ProviderExecutionBinding,
         sequence: u64,
         previous_sequence: Option<u64>,
-    ) -> Result<HostEventEnvelope, CodexAdapterError> {
-        let message = CodexWireMessage::notification(method, Some(params));
-        translate_host_event(
-            &message,
-            &bound_lineage(binding, sequence).expect("fixture lineage"),
+    ) -> Result<NormalizedHostEventEnvelope, CodexAdapterError> {
+        let admission = admission_for(binding).expect("fixture admission");
+        Ok(normalize_bound(
+            method,
+            params,
+            binding,
+            &admission,
             sequence,
             previous_sequence,
-            &clock_at(Some(1_786_000_000_000)),
-        )
+        )?
+        .0)
     }
 
     fn completed_params(thread: &str, turn: &str, status: &str) -> Value {
@@ -1905,18 +2494,29 @@ mod tests {
     #[test]
     fn event_from_wrong_session_is_rejected() -> TestResult {
         let binding = bound_binding()?;
+        let admission = admission_for(&binding)?;
         let message = CodexWireMessage::notification(
             "turn/completed",
             Some(completed_params("other-thread", "turn-1", "completed")),
         );
+        let raw = serde_json::to_vec(&message)?;
         assert!(matches!(
-            translate_host_event(
-                &message,
-                &bound_lineage(&binding, 1)?,
-                1,
-                None,
-                &clock_at(Some(1_786_000_000_000)),
-            ),
+            normalize_codex_event(CodexHostEventInput {
+                message: &message,
+                lineage: bound_lineage(&binding, 1)?,
+                event_id: EventId::new("turn-1:1")?,
+                cursor: EventCursor::new("turn-1:1")?,
+                sequence: 1,
+                previous_sequence: None,
+                predecessors: Vec::new(),
+                raw_source_bytes: &raw,
+                raw_source_handle: RestrictedRawSourceHandle::new(
+                    "restricted-codex:test-wrong-session"
+                )?,
+                observed_at: clock_at(Some(1_786_000_000_000)),
+                delivery: HostEventDeliveryDisposition::BestEffortOrdered,
+                admission: Some(&admission),
+            }),
             Err(CodexAdapterError::SessionMismatch)
         ));
         Ok(())
@@ -1925,18 +2525,29 @@ mod tests {
     #[test]
     fn event_session_fields_are_typed_and_event_shape_is_notification_only() -> TestResult {
         let binding = bound_binding()?;
+        let admission = admission_for(&binding)?;
         let wrong_type = CodexWireMessage::notification(
             "turn/completed",
             Some(serde_json::json!({ "threadId": 42 })),
         );
+        let raw_wrong = serde_json::to_vec(&wrong_type)?;
         assert!(matches!(
-            translate_host_event(
-                &wrong_type,
-                &bound_lineage(&binding, 1)?,
-                1,
-                None,
-                &clock_at(Some(1_786_000_000_000)),
-            ),
+            normalize_codex_event(CodexHostEventInput {
+                message: &wrong_type,
+                lineage: bound_lineage(&binding, 1)?,
+                event_id: EventId::new("turn-1:1")?,
+                cursor: EventCursor::new("turn-1:1")?,
+                sequence: 1,
+                previous_sequence: None,
+                predecessors: Vec::new(),
+                raw_source_bytes: &raw_wrong,
+                raw_source_handle: RestrictedRawSourceHandle::new(
+                    "restricted-codex:test-wrong-type"
+                )?,
+                observed_at: clock_at(Some(1_786_000_000_000)),
+                delivery: HostEventDeliveryDisposition::BestEffortOrdered,
+                admission: Some(&admission),
+            }),
             Err(CodexAdapterError::SessionMismatch)
         ));
 
@@ -1945,14 +2556,24 @@ mod tests {
             "turn/completed",
             completed_params("thread-1", "turn-1", "completed"),
         );
+        let raw_req = serde_json::to_vec(&request)?;
         assert!(matches!(
-            translate_host_event(
-                &request,
-                &bound_lineage(&binding, 1)?,
-                1,
-                None,
-                &clock_at(Some(1_786_000_000_000)),
-            ),
+            normalize_codex_event(CodexHostEventInput {
+                message: &request,
+                lineage: bound_lineage(&binding, 1)?,
+                event_id: EventId::new("turn-1:1")?,
+                cursor: EventCursor::new("turn-1:1")?,
+                sequence: 1,
+                previous_sequence: None,
+                predecessors: Vec::new(),
+                raw_source_bytes: &raw_req,
+                raw_source_handle: RestrictedRawSourceHandle::new(
+                    "restricted-codex:test-request-shape"
+                )?,
+                observed_at: clock_at(Some(1_786_000_000_000)),
+                delivery: HostEventDeliveryDisposition::BestEffortOrdered,
+                admission: Some(&admission),
+            }),
             Err(CodexAdapterError::MalformedWire(_))
         ));
         Ok(())
@@ -1969,14 +2590,38 @@ mod tests {
             "thread/started",
             Some(serde_json::json!({ "threadId": "thread-1" })),
         );
-        // Thread lifecycle stays session-only: no attempt identity is invented.
-        assert!(is_binding_mismatch(&translate_host_event(
-            &message,
-            &session_only,
-            1,
-            None,
-            &clock_at(Some(1_786_000_000_000)),
-        )));
+        let raw = serde_json::to_vec(&message)?;
+        // Thread lifecycle stays session-only: typed session observation with
+        // no admission reference and no attempt authority (never invented).
+        let (envelope, receipt) = normalize_codex_event(CodexHostEventInput {
+            message: &message,
+            lineage: session_only.clone(),
+            event_id: EventId::new("session-1:1")?,
+            cursor: EventCursor::new("session-1:1")?,
+            sequence: 1,
+            previous_sequence: None,
+            predecessors: Vec::new(),
+            raw_source_bytes: &raw,
+            raw_source_handle: RestrictedRawSourceHandle::new("restricted-codex:session-1")?,
+            observed_at: clock_at(Some(1_786_000_000_000)),
+            delivery: HostEventDeliveryDisposition::BestEffortOrdered,
+            admission: None,
+        })?;
+        assert_eq!(envelope.normalization, receipt);
+        envelope.validate_as_session_observation()?;
+        assert!(envelope.admitted_route_digest.is_none());
+        assert!(matches!(
+            envelope.payload,
+            NormalizedHostEventPayload::SessionLifecycle(_)
+        ));
+        // Session lineage never yields attributable execution binding.
+        assert!(session_only.attributable_binding().is_err());
+        assert!(envelope.lineage.attributable_binding().is_err());
+        assert_eq!(
+            envelope.producer_adapter_identity,
+            CODEX_NORMALIZER_IDENTITY
+        );
+        assert_eq!(envelope.adapter_contract_version, CODEX_NORMALIZER_VERSION);
         Ok(())
     }
 
@@ -2014,15 +2659,26 @@ mod tests {
             2,
             Some(1),
         )?;
-        assert_eq!(first.attempt_id, binding.attempt_id);
-        assert_eq!(second.attempt_id, binding.attempt_id);
-        assert_eq!(second.kind, HostEventKind::Completed);
+        let first_binding = first.lineage.attributable_binding()?;
+        let second_binding = second.lineage.attributable_binding()?;
+        assert_eq!(first_binding, &binding);
+        assert_eq!(second_binding, &binding);
+        assert!(matches!(
+            first.payload,
+            NormalizedHostEventPayload::ExecutionStarted(_)
+        ));
+        assert!(matches!(
+            second.payload,
+            NormalizedHostEventPayload::ProviderTerminalObserved(ref observation)
+                if observation.status == ProviderTerminalStatus::CompletedObserved
+        ));
         Ok(())
     }
 
     #[test]
     fn recorded_cursor_and_clock_are_preserved_without_synthesis() -> TestResult {
         let binding = bound_binding()?;
+        let admission = admission_for(&binding)?;
         let envelope = translate_bound(
             "turn/completed",
             completed_params("thread-1", "turn-1", "completed"),
@@ -2035,41 +2691,215 @@ mod tests {
         assert_eq!(envelope.cursor.as_str(), "turn-1:3");
         assert_eq!(envelope.event_id.as_str(), "turn-1:3");
         assert_eq!(envelope.sequence, 3);
-        assert_eq!(envelope.attempt_id, binding.attempt_id);
-        assert_eq!(envelope.route, binding.route);
-        assert_eq!(envelope.observed_at, "1786000000000");
-        let lineage = envelope.lineage.expect("bound lineage");
-        assert_eq!(lineage.attributable_binding()?, &binding);
+        assert_eq!(
+            envelope.lineage.attributable_binding()?.attempt_id,
+            binding.attempt_id
+        );
+        assert_eq!(
+            envelope.admitted_route_digest.as_ref(),
+            Some(&admission.self_digest)
+        );
+        assert_eq!(envelope.observed_at.valid_time_ms, Some(1_786_000_000_000));
+        assert_eq!(envelope.lineage.attributable_binding()?, &binding);
+        envelope.validate_for_lineage(&binding, &admission)?;
         // Unknown time stays unknown; causal order is never fabricated.
-        let unknown = translate_host_event(
-            &CodexWireMessage::notification(
-                "turn/completed",
-                Some(completed_params("thread-1", "turn-1", "completed")),
-            ),
-            &bound_lineage(&binding, 4)?,
-            4,
-            Some(3),
-            &clock_at(None),
-        )?;
-        assert_eq!(unknown.observed_at, "unknown");
+        let unknown_message = CodexWireMessage::notification(
+            "turn/completed",
+            Some(completed_params("thread-1", "turn-1", "completed")),
+        );
+        let unknown_raw = serde_json::to_vec(&unknown_message)?;
+        let (unknown, _) = normalize_codex_event(CodexHostEventInput {
+            message: &unknown_message,
+            lineage: bound_lineage(&binding, 4)?,
+            event_id: EventId::new("turn-1:4")?,
+            cursor: EventCursor::new("turn-1:4")?,
+            sequence: 4,
+            previous_sequence: Some(3),
+            predecessors: Vec::new(),
+            raw_source_bytes: &unknown_raw,
+            raw_source_handle: RestrictedRawSourceHandle::new(
+                "restricted-codex:test-unknown-clock",
+            )?,
+            observed_at: clock_at(None),
+            delivery: HostEventDeliveryDisposition::BestEffortOrdered,
+            admission: Some(&admission),
+        })?;
+        assert_eq!(unknown.observed_at.valid_time_ms, None);
         // The recorded observation must agree with the claimed stream position.
-        assert!(is_binding_mismatch(&translate_host_event(
-            &CodexWireMessage::notification(
-                "turn/completed",
-                Some(completed_params("thread-1", "turn-1", "completed")),
-            ),
-            &bound_lineage(&binding, 9)?,
-            4,
-            Some(3),
-            &clock_at(Some(1_786_000_000_000)),
+        let mismatch_message = CodexWireMessage::notification(
+            "turn/completed",
+            Some(completed_params("thread-1", "turn-1", "completed")),
+        );
+        let mismatch_raw = serde_json::to_vec(&mismatch_message)?;
+        assert!(is_binding_mismatch(&normalize_codex_event(
+            CodexHostEventInput {
+                message: &mismatch_message,
+                lineage: bound_lineage(&binding, 9)?,
+                event_id: EventId::new("turn-1:9")?,
+                cursor: EventCursor::new("turn-1:9")?,
+                sequence: 4,
+                previous_sequence: Some(3),
+                predecessors: Vec::new(),
+                raw_source_bytes: &mismatch_raw,
+                raw_source_handle: RestrictedRawSourceHandle::new(
+                    "restricted-codex:test-position-mismatch",
+                )?,
+                observed_at: clock_at(Some(1_786_000_000_000)),
+                delivery: HostEventDeliveryDisposition::BestEffortOrdered,
+                admission: Some(&admission),
+            }
         )));
+        Ok(())
+    }
+
+    #[test]
+    fn typed_normalizer_seals_receipt_and_preserves_recorded_cursor() -> TestResult {
+        let binding = bound_binding()?;
+        let admission = admission_for(&binding)?;
+        let (envelope, receipt) = normalize_bound(
+            "turn/completed",
+            completed_params("thread-1", "turn-1", "completed"),
+            &binding,
+            &admission,
+            1,
+            None,
+        )?;
+        // Sealed receipt coherence: identity/version/digest/loss/privacy/ceiling.
+        assert_eq!(envelope.normalization, receipt);
+        assert_eq!(
+            envelope.producer_adapter_identity,
+            CODEX_NORMALIZER_IDENTITY
+        );
+        assert_eq!(envelope.adapter_contract_version, CODEX_NORMALIZER_VERSION);
+        assert_eq!(receipt.normalizer_identity, CODEX_NORMALIZER_IDENTITY);
+        assert_eq!(receipt.normalizer_version, CODEX_NORMALIZER_VERSION);
+        assert_eq!(
+            receipt.output_schema_version,
+            eliot_agent_api::HOST_EVENT_CONTRACT_VERSION
+        );
+        assert_eq!(receipt.output_digest, envelope.compute_digest()?);
+        assert_eq!(
+            receipt.proof_ceiling,
+            eliot_agent_api::ProofCeiling::Observation
+        );
+        // Recorded cursor preserved; no synthesized provider-native cursor.
+        assert_eq!(envelope.cursor.as_str(), "turn-1:1");
+        assert_eq!(envelope.event_id.as_str(), "turn-1:1");
+        // Canonical SHA-256 over raw bytes (never blake3 for source).
+        let message = CodexWireMessage::notification(
+            "turn/completed",
+            Some(completed_params("thread-1", "turn-1", "completed")),
+        );
+        let raw = serde_json::to_vec(&message)?;
+        assert_eq!(
+            envelope.raw_source.digest.digest.as_str(),
+            eliot_contracts::sha256_hex(&raw)
+        );
+        assert_eq!(
+            envelope.raw_source.digest.algorithm,
+            eliot_agent_api::HOST_EVENT_DIGEST_ALGORITHM
+        );
+        envelope.validate_for_lineage(&binding, &admission)?;
+        Ok(())
+    }
+
+    #[test]
+    fn same_thread_different_turn_quarantines_with_typed_envelope() -> TestResult {
+        let binding = bound_binding()?;
+        let admission = admission_for(&binding)?;
+        // Same thread, different turn (turn-2 vs bound turn-1): quarantine.
+        assert!(is_binding_mismatch(&normalize_bound(
+            "turn/completed",
+            completed_params("thread-1", "turn-2", "completed"),
+            &binding,
+            &admission,
+            1,
+            None,
+        )));
+        // Same-thread steer on the exact bound turn succeeds with typed payloads.
+        let (started, _) = normalize_bound(
+            "turn/started",
+            completed_params("thread-1", "turn-1", "inProgress"),
+            &binding,
+            &admission,
+            1,
+            None,
+        )?;
+        assert!(matches!(
+            started.payload,
+            NormalizedHostEventPayload::ExecutionStarted(_)
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn terminal_and_usage_are_typed_without_synthetic_quota() -> TestResult {
+        let binding = bound_binding()?;
+        let admission = admission_for(&binding)?;
+        let (terminal, _) = normalize_bound(
+            "turn/completed",
+            completed_params("thread-1", "turn-1", "failed"),
+            &binding,
+            &admission,
+            1,
+            None,
+        )?;
+        assert!(matches!(
+            terminal.payload,
+            NormalizedHostEventPayload::ProviderTerminalObserved(ref observation)
+                if observation.status == ProviderTerminalStatus::FailedObserved
+        ));
+        let (usage, _) = normalize_bound(
+            "turn/usage",
+            serde_json::json!({
+                "threadId": "thread-1",
+                "turn": {"id": "turn-1"},
+                "usage": {"input_tokens": 7}
+            }),
+            &binding,
+            &admission,
+            2,
+            Some(1),
+        )?;
+        match usage.payload {
+            NormalizedHostEventPayload::Usage(receipt) => {
+                assert_eq!(receipt.input_tokens, Some(7));
+                // Absent quota stays typed NotExposed, never zero/success.
+                assert_eq!(receipt.quota, QuotaKnowledge::NotExposed);
+            }
+            other => panic!("expected Usage, got {other:?}"),
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn unknown_method_quarantines_as_typed_with_disposition() -> TestResult {
+        let binding = bound_binding()?;
+        let admission = admission_for(&binding)?;
+        let (envelope, receipt) = normalize_bound(
+            "turn/cancelled",
+            completed_params("thread-1", "turn-1", "completed"),
+            &binding,
+            &admission,
+            1,
+            None,
+        )?;
+        assert!(matches!(
+            envelope.payload,
+            NormalizedHostEventPayload::UnsupportedQuarantined(_)
+        ));
+        assert_eq!(
+            receipt.unsupported_disposition,
+            UnsupportedDisposition::UnsupportedMethodQuarantined
+        );
+        envelope.validate_for_lineage(&binding, &admission)?;
         Ok(())
     }
 
     fn result_input(
         attached: &CodexAttachReceipt,
         output: Option<&str>,
-        terminal_observation: Option<HostEventEnvelope>,
+        terminal_observation: Option<NormalizedHostEventEnvelope>,
         cancelled: bool,
         unknown_reason: Option<&str>,
     ) -> TestResult<CodexResultInput> {
@@ -2091,7 +2921,9 @@ mod tests {
         })
     }
 
-    fn terminal_envelope(binding: &ProviderExecutionBinding) -> TestResult<HostEventEnvelope> {
+    fn terminal_envelope(
+        binding: &ProviderExecutionBinding,
+    ) -> TestResult<NormalizedHostEventEnvelope> {
         translate_bound(
             "turn/completed",
             completed_params("thread-1", "turn-1", "completed"),

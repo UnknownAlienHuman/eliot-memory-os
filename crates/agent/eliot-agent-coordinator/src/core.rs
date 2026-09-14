@@ -3,9 +3,10 @@ use std::collections::{BTreeMap, BTreeSet};
 use eliot_agent_api::{
     AgentAttempt, AttemptId, AttemptState, AuthorityEnvelope, CancellationState,
     CandidateSelectionDisposition, ContinuityKind, ContractError, EffectCeiling, EffectKind,
-    HostEventNormalizationReceipt, NormalizedHostEventEnvelope, ProviderExecutionBinding,
-    ProviderObservationLineage, RejectedRouteCandidate, ResultDisposition, RouteSelectionCandidate,
-    WorkLeaseId, candidate_digest_for, validate_execution_binding,
+    HostEventNormalizationReceipt, HostEventQuarantineReason, HostEventReplayDisposition,
+    NormalizedHostEventEnvelope, ProviderExecutionBinding, ProviderObservationLineage,
+    RejectedRouteCandidate, ResultDisposition, RouteSelectionCandidate, WorkLeaseId,
+    candidate_digest_for, validate_execution_binding,
 };
 use eliot_agent_contracts::{
     AgentAttemptId, CoordinationEntry, CoordinationMapView, DescendantTerminalState,
@@ -22,9 +23,8 @@ use crate::model::{
     CancellationReconciliationId, CandidateId, CandidateResultReceipt, CoordinatedAttemptState,
     CoordinatorConfig, CoordinatorError, CoordinatorEvent, CoordinatorSnapshot,
     DeliveryBoundaryReceipt, DescendantClosureCandidateReceipt, DescendantClosureSubmission,
-    ExecutionContext, LostWorkerReceipt, ObservedHostEventSummary, OperationId,
-    OutcomeReconciliationId, PeerMessageReceipt, PlanGap, ProviderAdmissionReceipt,
-    ProviderBindingSnapshot, ProviderCancellationReconciliation,
+    ExecutionContext, LostWorkerReceipt, OperationId, OutcomeReconciliationId, PeerMessageReceipt,
+    PlanGap, ProviderAdmissionReceipt, ProviderBindingSnapshot, ProviderCancellationReconciliation,
     ProviderExecutionBindingSubmission, ProviderIdentity, ProviderReassignmentReceipt,
     ProviderUnknownOutcomeReconciliation, ProviderWorkerFenceReceipt, ReassignmentId,
     ReassignmentReceipt, ResultSubmission, RoleProfileManifest, RouteCandidateEvidence,
@@ -105,6 +105,19 @@ struct IdempotentRecord<T> {
     receipt: T,
 }
 
+/// Accepted v7 host-event observation entry (issue #371 S7). The canonical
+/// input binds the exact envelope plus presented-receipt bytes for durable
+/// replay; the stored envelope supports the typed
+/// [`NormalizedHostEventEnvelope::check_replay_against`] quarantine
+/// classification. Attempt scope, sequence, and output digest remain readable
+/// from the stored envelope plus [`ObservedHostEventSummary`] at insert time;
+/// per-attempt ordering lives in `last_host_sequence`.
+#[derive(Clone, Debug)]
+struct ObservedHostEventEntry {
+    canonical_input: String,
+    event: NormalizedHostEventEnvelope,
+}
+
 #[derive(Clone, Debug)]
 struct RouteCapacityRequest {
     requested: usize,
@@ -130,11 +143,13 @@ pub struct AgentCoordinator {
     submissions: BTreeMap<SubmissionId, IdempotentRecord<CandidateResultReceipt>>,
     result_by_attempt: BTreeMap<AttemptId, SubmissionId>,
     bindings: BTreeMap<AttemptId, IdempotentRecord<ProviderExecutionBinding>>,
-    /// Accepted v7 provider host events by event identity (issue #371
-    /// S7-partial). The canonical input binds the exact envelope plus receipt
-    /// bytes: an identical replay is idempotent without duplicate effects,
-    /// while a conflicting same-identity replay is an idempotency conflict.
-    observed_host_events: BTreeMap<String, IdempotentRecord<ObservedHostEventSummary>>,
+    /// Accepted v7 provider host events by event identity (issue #371 S7).
+    /// The canonical input binds the exact envelope plus receipt bytes: an
+    /// identical replay is idempotent without duplicate effects, while a
+    /// conflicting same-identity replay is quarantined with its typed
+    /// [`HostEventQuarantineReason`] (never a generic conflict, never an
+    /// advance of the wrong attempt).
+    observed_host_events: BTreeMap<String, ObservedHostEventEntry>,
     /// Last accepted host-event sequence per attempt. A new identity with a
     /// nonmonotonic sequence rejects; a forward jump records an explicit gap.
     last_host_sequence: BTreeMap<AttemptId, u64>,
@@ -1254,7 +1269,22 @@ impl AgentCoordinator {
     }
 
     /// Observes one closed v7 provider host event under the exact recorded
-    /// lineage (issue #371 S7-partial).
+    /// lineage (issue #371 S7).
+    ///
+    /// Signature note: the T4 S7 slice text spells the envelope as
+    /// `eliot_agent_api::HostEventEnvelope`, but the landed S6 owner is the
+    /// closed `eliot_agent_api::NormalizedHostEventEnvelope`
+    /// (`host-event-v7`). This signature preserves that landed owner; no
+    /// `Normalized` -> bridge `EventEnvelope` conversion happens here (bridge
+    /// wiring is a separate integrator concern).
+    ///
+    /// This method returns `()` and never a cursor: cursor acknowledgement
+    /// follows durable linkage/disposition (the appended
+    /// [`CoordinatorEvent::ProviderHostEventObserved`] plus snapshot/restore
+    /// re-verification), not this in-memory return. Until a real durable
+    /// Store/Governor edge is installed, durability is proven on the
+    /// in-memory event-log plus snapshot only; the installed durable commit
+    /// remains controller track and no `Store` commit is invented here.
     ///
     /// Enforced, in order:
     /// - the context names a known admission with exact fence/epoch/lease
@@ -1262,27 +1292,46 @@ impl AgentCoordinator {
     /// - the presented normalization receipt must equal the envelope's
     ///   embedded receipt: a caller-selected receipt never substitutes for
     ///   the sealed one;
-    /// - an already-accepted event identity replays idempotently: the exact
-    ///   canonical input returns `Ok` without a new event or duplicate
-    ///   effects, while the same identity with different canonical bytes is
-    ///   an `IdempotencyConflict` (conflicting duplicate quarantined);
+    /// - an already-accepted event identity replays through the typed S6
+    ///   classifier
+    ///   (`eliot_agent_api::NormalizedHostEventEnvelope::check_replay_against`):
+    ///   an identical replay returns `Ok` without a new event or duplicate
+    ///   effects, while the same identity with different bytes is quarantined
+    ///   with its first differing dimension as
+    ///   [`CoordinatorError::HostEventQuarantine`] (`ConflictingPayload`,
+    ///   `ConflictingLineage`, `ConflictingNormalization`, `ConflictingSource`,
+    ///   or `ConflictingFraming`) — never a generic conflict. A cross-turn
+    ///   same-`event_id` replay (different lineage/binding) therefore
+    ///   quarantines explicitly and never advances the wrong attempt; nothing
+    ///   is mutated on any replay path;
     /// - the attempt and admission resolve from recorded state, never from
     ///   caller-selected identity: the lineage binding's attempt must exist
-    ///   under this admission, the stored [`ProviderExecutionBinding`] must
-    ///   equal the presented binding exactly, and the stored #369 admitted
-    ///   route must exist. The envelope then closes through the shared S6
-    ///   validator
+    ///   under this admission (ghost callers fail as `UnknownAttempt`, foreign
+    ///   turns as `IdentityConflict`), the stored [`ProviderExecutionBinding`]
+    ///   must equal the presented binding exactly, and the stored #369
+    ///   admitted route must exist. The envelope then closes through the
+    ///   shared S6 validator
     ///   (`eliot_agent_api::NormalizedHostEventEnvelope::validate_for_lineage`),
     ///   which rejects a wrong binding/route-ref/fence/generation/cursor/
     ///   parent before any mutation. Session-only observations validate on
-    ///   the session path and mutate no attempt state;
+    ///   the session path (`validate_as_session_observation`, so
+    ///   attempt-terminal/attempt-usage payloads cannot ride session lineage)
+    ///   and mutate no attempt state: no sequencing entry, no cursor advance,
+    ///   no usage/result/completion effect;
     /// - per-attempt sequencing is explicit: a new identity with a
-    ///   nonmonotonic sequence rejects as stale, while a forward jump
-    ///   records an explicit [`CoordinatorEvent::ProviderHostEventGap`]
-    ///   before the observation.
+    ///   nonmonotonic sequence rejects as [`CoordinatorError::StaleResult`]
+    ///   without mutation, while a forward jump records an explicit
+    ///   [`CoordinatorEvent::ProviderHostEventGap`] before the observation.
+    ///   The gap marker itself advances no cursor (ordering evidence only,
+    ///   model 642-650); the accepted observation then records its own
+    ///   sequence. Reordered (stale) arrivals therefore stay stale and gaps
+    ///   regenerate deterministically on snapshot restore.
     ///
     /// Observations never synthesize a candidate result or a Finish: usage,
-    /// terminality, results, and completion are untouched here.
+    /// terminality, results, and completion are untouched here, so a
+    /// foreign-turn or session-terminal input can never reach result intake
+    /// (the `submit_result` binding gate independently requires the exact
+    /// stored binding).
     pub fn observe_provider_event(
         &mut self,
         context: ExecutionContext,
@@ -1296,10 +1345,28 @@ impl AgentCoordinator {
         let canonical_input = canonical(&(&event, &normalization))?;
         let event_key = event.event_id.as_str().to_owned();
         if let Some(existing) = self.observed_host_events.get(&event_key) {
-            return match idempotent(existing, &canonical_input) {
-                Ok(_) => Ok(()),
-                Err(_) => Err(CoordinatorError::IdempotencyConflict),
-            };
+            match event.check_replay_against(&existing.event) {
+                Ok(HostEventReplayDisposition::IdempotentReplay) => {
+                    if existing.canonical_input == canonical_input {
+                        return Ok(());
+                    }
+                    // Same typed envelope but different durable bytes (separate
+                    // receipt or serialization divergence): fail closed as a
+                    // framing quarantine, never advance or duplicate.
+                    return Err(CoordinatorError::HostEventQuarantine(
+                        HostEventQuarantineReason::ConflictingFraming,
+                    ));
+                }
+                Ok(HostEventReplayDisposition::Quarantined { reason }) => {
+                    return Err(CoordinatorError::HostEventQuarantine(reason));
+                }
+                Err(error) => {
+                    // Valid framing is required before any quarantine
+                    // classification; surfacing the contract error preserves
+                    // the exact framing failure without mutation.
+                    return Err(CoordinatorError::ProviderContract(error.to_string()));
+                }
+            }
         }
         let attempt_id = match &event.lineage {
             ProviderObservationLineage::SessionObservation(observation) => {
@@ -1349,17 +1416,11 @@ impl AgentCoordinator {
             self.last_host_sequence
                 .insert(attempt.clone(), event.sequence);
         }
-        let summary = ObservedHostEventSummary {
-            event_id: event.event_id.clone(),
-            attempt_id,
-            sequence: event.sequence,
-            output_digest: event.normalization.output_digest.clone(),
-        };
         self.observed_host_events.insert(
             event_key,
-            IdempotentRecord {
+            ObservedHostEventEntry {
                 canonical_input,
-                receipt: summary,
+                event: event.clone(),
             },
         );
         self.events
