@@ -33,6 +33,7 @@
 
 #![forbid(unsafe_code)]
 
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use eliot_contracts::SessionId;
@@ -179,16 +180,50 @@ impl CanonicalStatePort for GovernorCanonicalState {
 /// write.
 struct GovernorOperatorCommand {
     snapshot: Arc<ControlBoardGovernorSnapshot>,
+    // #1187 R1: in-memory exact-replay store keyed by operation_id text. An
+    // identical binding returns the stored receipt without a second admission;
+    // a changed binding under the same operation_id surfaces as the
+    // controlboard IdentityConflict (via PortError::IdentityConflict, mapped by
+    // ControlBoardError::from_port). The stored binding is never overwritten,
+    // so a conflict mutates no state. Cross-restart durability is R2's owner
+    // and explicitly out of scope here.
+    replay: HashMap<String, (CommandRequest, CommandReceipt)>,
 }
 
 impl GovernorOperatorCommand {
     fn new(snapshot: Arc<ControlBoardGovernorSnapshot>) -> Self {
-        Self { snapshot }
+        Self {
+            snapshot,
+            replay: HashMap::new(),
+        }
     }
+}
+
+/// Compares exactly the receipt-bound fields of two operator commands (#1187
+/// R1). `operation_id` is the lookup key and `identity` is the authenticator,
+/// so neither is compared here; session, access binding (capability),
+/// action/target bytes and digest, revision, fence, and ceilings must all
+/// match for an exact replay.
+fn same_operator_binding(stored: &CommandRequest, incoming: &CommandRequest) -> bool {
+    stored.session_id == incoming.session_id
+        && stored.access_digest == incoming.access_digest
+        && stored.action == incoming.action
+        && stored.action_digest == incoming.action_digest
+        && stored.expected_revision == incoming.expected_revision
+        && stored.expected_fence == incoming.expected_fence
+        && stored.proof_ceiling == incoming.proof_ceiling
+        && stored.effect_ceiling == incoming.effect_ceiling
 }
 
 impl OperatorCommandPort for GovernorOperatorCommand {
     fn submit(&mut self, command: &CommandRequest) -> Result<CommandReceipt, PortError> {
+        let operation_key = command.operation_id.as_str().to_owned();
+        if let Some((bound, receipt)) = self.replay.get(&operation_key) {
+            if same_operator_binding(bound, command) {
+                return Ok(receipt.clone());
+            }
+            return Err(PortError::IdentityConflict);
+        }
         if command.expected_revision.get() != self.snapshot.read_revision
             || command.expected_fence != self.snapshot.fence
         {
@@ -211,7 +246,7 @@ impl OperatorCommandPort for GovernorOperatorCommand {
         if identity_session != command.session_id {
             return Err(PortError::Denied);
         }
-        Ok(CommandReceipt {
+        let receipt = CommandReceipt {
             receipt_ref: format!(
                 "controlboard-candidate:{}:{}",
                 command.operation_id.as_str(),
@@ -225,7 +260,10 @@ impl OperatorCommandPort for GovernorOperatorCommand {
             disposition: CommandDisposition::Accepted,
             observed_revision: command.expected_revision,
             observed_fence: command.expected_fence.clone(),
-        })
+        };
+        self.replay
+            .insert(operation_key, (command.clone(), receipt.clone()));
+        Ok(receipt)
     }
 }
 
@@ -627,5 +665,121 @@ mod tests {
             board.submit(&request_for("session-a"), churned_command),
             Err(ControlBoardError::Unauthorized)
         );
+    }
+
+    /// Counting decorator around the real Governor adapter (#1187 R1). It
+    /// delegates every *new* admission and records invocations, so an exact
+    /// replay short-circuited by the board store is observable as zero
+    /// additional effecting-port calls.
+    struct CountingOperator {
+        inner: GovernorOperatorCommand,
+        calls: Arc<Mutex<usize>>,
+    }
+
+    impl OperatorCommandPort for CountingOperator {
+        fn submit(&mut self, command: &CommandRequest) -> Result<CommandReceipt, PortError> {
+            *self.calls.lock().expect("call count") += 1;
+            self.inner.submit(command)
+        }
+    }
+
+    fn board_with_governor_command(
+        snapshot: Arc<ControlBoardGovernorSnapshot>,
+        calls: Arc<Mutex<usize>>,
+    ) -> ControlBoard {
+        let bindings = BTreeMap::from([(
+            "session-a".to_owned(),
+            access_for("session-a", &[ActionCapability::StartQuery]),
+        )]);
+        ControlBoard::new(
+            Some(Box::new(SessionKeyedAccess { bindings })),
+            Some(Box::new(GovernorCanonicalState::new(Arc::clone(&snapshot)))),
+            Some(Box::new(CountingOperator {
+                inner: GovernorOperatorCommand::new(snapshot),
+                calls,
+            })),
+        )
+    }
+
+    fn start_query_for(session: &str) -> CommandRequest {
+        command_for(
+            session,
+            OperatorAction::StartQuery {
+                query_kind: "semantic-search".to_owned(),
+            },
+        )
+    }
+
+    #[test]
+    fn exact_replay_returns_same_receipt() {
+        let snapshot = Arc::new(snapshot());
+        let calls = Arc::new(Mutex::new(0));
+        let mut board = board_with_governor_command(snapshot, Arc::clone(&calls));
+        let submitted = start_query_for("session-a");
+        let first = board
+            .submit(&request_for("session-a"), submitted.clone())
+            .expect("first receipt");
+        let second = board
+            .submit(&request_for("session-a"), submitted)
+            .expect("replay receipt");
+        assert_eq!(first, second);
+        assert_eq!(first.disposition, CommandDisposition::Accepted);
+        assert_eq!(*calls.lock().expect("call count"), 1);
+    }
+
+    #[test]
+    fn changed_payload_same_operation_is_identity_conflict() {
+        let snapshot = Arc::new(snapshot());
+        let calls = Arc::new(Mutex::new(0));
+        let mut board = board_with_governor_command(snapshot, Arc::clone(&calls));
+        let submitted = start_query_for("session-a");
+        let first = board
+            .submit(&request_for("session-a"), submitted.clone())
+            .expect("first receipt");
+        assert_eq!(*calls.lock().expect("call count"), 1);
+        let changed = command_for(
+            "session-a",
+            OperatorAction::StartQuery {
+                query_kind: "other-query".to_owned(),
+            },
+        );
+        assert_eq!(
+            changed.operation_id.as_str(),
+            submitted.operation_id.as_str()
+        );
+        assert_ne!(changed.action_digest, submitted.action_digest);
+        assert_eq!(
+            board.submit(&request_for("session-a"), changed),
+            Err(ControlBoardError::IdentityConflict)
+        );
+        assert_eq!(
+            ControlBoardError::IdentityConflict.to_string(),
+            "IDENTITY_CONFLICT"
+        );
+        assert_eq!(*calls.lock().expect("call count"), 1);
+        // The conflict mutates no state: the original binding still replays.
+        let replay = board
+            .submit(&request_for("session-a"), submitted)
+            .expect("replay receipt");
+        assert_eq!(replay, first);
+        assert_eq!(*calls.lock().expect("call count"), 1);
+    }
+
+    #[test]
+    fn governor_adapter_enforces_replay_idempotency_at_snapshot_binding() {
+        let mut port = GovernorOperatorCommand::new(Arc::new(snapshot()));
+        let submitted = start_query_for("session-a");
+        let first = port.submit(&submitted).expect("first receipt");
+        let second = port.submit(&submitted).expect("replay receipt");
+        assert_eq!(first, second);
+        let changed = command_for(
+            "session-a",
+            OperatorAction::StartQuery {
+                query_kind: "other-query".to_owned(),
+            },
+        );
+        assert_eq!(port.submit(&changed), Err(PortError::IdentityConflict));
+        // No state mutation on conflict: the original binding still replays.
+        assert_eq!(port.submit(&submitted).expect("replay receipt"), first);
     }
 }

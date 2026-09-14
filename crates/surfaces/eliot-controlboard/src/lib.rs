@@ -12,7 +12,7 @@ mod swarm_read;
 
 pub use swarm_read::*;
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, HashMap};
 use std::fmt;
 
 use eliot_contracts::{OperationId, SessionId};
@@ -351,6 +351,8 @@ pub enum PortError {
     Unavailable,
     #[error("provider outcome is unknown")]
     Unknown,
+    #[error("provider reported an identity conflict")]
+    IdentityConflict,
     #[error("provider contract is invalid: {0}")]
     Invalid(String),
 }
@@ -1033,6 +1035,58 @@ pub struct ControlBoard {
     state: Option<Box<dyn CanonicalStatePort>>,
     commands: Option<Box<dyn OperatorCommandPort>>,
     swarm_projection: Option<Box<dyn SwarmProjectionPort>>,
+    replay: HashMap<String, StoredReplay>,
+}
+
+/// In-memory exact-replay record for one `operation_id` (#1187 R1).
+///
+/// The key is the operation identity text; the binding holds exactly the
+/// receipt-bound fields compared for replay. Cross-restart durability is
+/// explicitly out of scope for R1 and owned by R2; this record lives only as
+/// long as the `ControlBoard` instance.
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct StoredReplay {
+    session_id: String,
+    access_digest: String,
+    action: OperatorAction,
+    action_digest: String,
+    expected_revision: ViewRevision,
+    expected_fence: StateFence,
+    proof_ceiling: ProofCeiling,
+    effect_ceiling: EffectCeiling,
+    receipt: CommandReceipt,
+}
+
+impl StoredReplay {
+    fn bind(command: &CommandRequest, receipt: CommandReceipt) -> Self {
+        Self {
+            session_id: command.session_id.clone(),
+            access_digest: command.access_digest.clone(),
+            action: command.action.clone(),
+            action_digest: command.action_digest.clone(),
+            expected_revision: command.expected_revision,
+            expected_fence: command.expected_fence.clone(),
+            proof_ceiling: command.proof_ceiling,
+            effect_ceiling: command.effect_ceiling,
+            receipt,
+        }
+    }
+
+    /// Compares exactly the fields the receipt binds. `operation_id` is the
+    /// lookup key and `identity` is the authenticator, so neither is compared
+    /// here; session, access binding (capability), action/target bytes and
+    /// digest, revision, fence, and ceilings must all match for an exact
+    /// replay.
+    fn matches(&self, command: &CommandRequest) -> bool {
+        self.session_id == command.session_id
+            && self.access_digest == command.access_digest
+            && self.action == command.action
+            && self.action_digest == command.action_digest
+            && self.expected_revision == command.expected_revision
+            && self.expected_fence == command.expected_fence
+            && self.proof_ceiling == command.proof_ceiling
+            && self.effect_ceiling == command.effect_ceiling
+    }
 }
 
 impl ControlBoard {
@@ -1047,6 +1101,7 @@ impl ControlBoard {
             state,
             commands,
             swarm_projection: None,
+            replay: HashMap::new(),
         }
     }
 
@@ -1114,6 +1169,18 @@ impl ControlBoard {
         request.validate()?;
         let access = self.resolve_access(request)?;
         let command = command.validate_for(request, &access)?;
+        // #1187 R1: in-memory exact-replay idempotency keyed by operation_id.
+        // An identical binding returns the stored receipt without touching the
+        // effecting port again; any differing bound field is IDENTITY_CONFLICT
+        // with zero effecting-port calls and no store mutation. Cross-restart
+        // durability is explicitly out of scope here (owned by R2).
+        let operation_key = command.operation_id.as_str().to_owned();
+        if let Some(stored) = self.replay.get(&operation_key) {
+            if stored.matches(&command) {
+                return Ok(stored.receipt.clone());
+            }
+            return Err(ControlBoardError::IdentityConflict);
+        }
         let view = self.view_with_access(
             &request
                 .clone()
@@ -1135,6 +1202,8 @@ impl ControlBoard {
                 ControlBoardError::from_port(RequiredProvider::OperatorCommand, error)
             })?;
         validate_receipt(&receipt, &command)?;
+        self.replay
+            .insert(operation_key, StoredReplay::bind(&command, receipt.clone()));
         Ok(receipt)
     }
 }
@@ -1321,6 +1390,8 @@ pub enum ControlBoardError {
     ReceiptBindingMismatch,
     #[error("command receipt exceeds requested proof/effect ceiling")]
     ReceiptOverclaim,
+    #[error("IDENTITY_CONFLICT")]
+    IdentityConflict,
     #[error("provider denied the operation")]
     Unauthorized,
     #[error("provider outcome is unknown")]
@@ -1335,6 +1406,7 @@ impl ControlBoardError {
             PortError::Denied => Self::Unauthorized,
             PortError::Unavailable => Self::PlanGap(provider),
             PortError::Unknown => Self::UnknownOutcome,
+            PortError::IdentityConflict => Self::IdentityConflict,
             PortError::Invalid(detail) => Self::Provider(detail),
         }
     }
@@ -1363,6 +1435,7 @@ mod tests {
     };
     use eliot_receipts::RequestBinding;
     use std::num::NonZeroU64;
+    use std::sync::{Arc, Mutex};
 
     const TEST_LINEAGE_A: &str = "550e8400-e29b-41d4-a716-446655440000";
 
@@ -2201,5 +2274,142 @@ mod tests {
             board.submit(&read_request(Role::HumanRequester), rebound),
             Err(ControlBoardError::FenceMismatch)
         );
+    }
+
+    /// Counting operator command port (#1187 R1). It records invocations and
+    /// answers each *new* effect with a distinct receipt, so a replay that
+    /// returns the stored receipt instead of re-effecting is observable.
+    struct CountingCommand {
+        calls: Arc<Mutex<usize>>,
+    }
+
+    impl OperatorCommandPort for CountingCommand {
+        fn submit(&mut self, request: &CommandRequest) -> Result<CommandReceipt, PortError> {
+            let mut calls = self.calls.lock().expect("call count");
+            *calls += 1;
+            Ok(CommandReceipt {
+                receipt_ref: format!("receipt-{}", *calls),
+                session_id: request.session_id.clone(),
+                access_digest: request.access_digest.clone(),
+                action_digest: request.action_digest.clone(),
+                proof_ceiling: request.proof_ceiling,
+                effect_ceiling: request.effect_ceiling,
+                disposition: CommandDisposition::Accepted,
+                observed_revision: request.expected_revision,
+                observed_fence: request.expected_fence.clone(),
+            })
+        }
+    }
+
+    fn replay_board(calls: Arc<Mutex<usize>>) -> ControlBoard {
+        ControlBoard::new(
+            Some(Box::new(access(
+                Role::HumanRequester,
+                &[ActionCapability::StartQuery],
+                &[PrivacyClass::Public],
+            ))),
+            Some(Box::new(FakeRead { state: state() })),
+            Some(Box::new(CountingCommand { calls })),
+        )
+    }
+
+    fn start_query() -> CommandRequest {
+        command(OperatorAction::StartQuery {
+            query_kind: "semantic-search".to_owned(),
+        })
+    }
+
+    #[test]
+    fn exact_replay_returns_same_receipt() {
+        let calls = Arc::new(Mutex::new(0));
+        let mut board = replay_board(Arc::clone(&calls));
+        let request = read_request(Role::HumanRequester);
+        let submitted = start_query();
+        let first = board
+            .submit(&request, submitted.clone())
+            .expect("first receipt");
+        let second = board.submit(&request, submitted).expect("replay receipt");
+        assert_eq!(first, second);
+        assert_eq!(first.receipt_ref, "receipt-1");
+        assert_eq!(*calls.lock().expect("call count"), 1);
+    }
+
+    #[test]
+    fn changed_payload_same_operation_is_identity_conflict() {
+        let calls = Arc::new(Mutex::new(0));
+        let mut board = replay_board(Arc::clone(&calls));
+        let request = read_request(Role::HumanRequester);
+        let submitted = start_query();
+        board
+            .submit(&request, submitted.clone())
+            .expect("first receipt");
+        assert_eq!(*calls.lock().expect("call count"), 1);
+        let changed = command(OperatorAction::StartQuery {
+            query_kind: "other-query".to_owned(),
+        });
+        assert_eq!(changed.operation_id, submitted.operation_id);
+        assert_ne!(changed.action_digest, submitted.action_digest);
+        assert_eq!(
+            board.submit(&request, changed),
+            Err(ControlBoardError::IdentityConflict)
+        );
+        assert_eq!(
+            ControlBoardError::IdentityConflict.to_string(),
+            "IDENTITY_CONFLICT"
+        );
+        assert_eq!(*calls.lock().expect("call count"), 1);
+        // The conflict mutates no state: the original binding still replays.
+        let replay = board.submit(&request, submitted).expect("replay receipt");
+        assert_eq!(replay.receipt_ref, "receipt-1");
+        assert_eq!(*calls.lock().expect("call count"), 1);
+    }
+
+    #[test]
+    fn replay_skips_owner_ports_and_returns_stored_receipt() {
+        struct CountingRead {
+            state: CanonicalState,
+            reads: Arc<Mutex<usize>>,
+        }
+
+        impl CanonicalStatePort for CountingRead {
+            fn read(
+                &mut self,
+                _request: &ReadRequest,
+                _access: &AccessBinding,
+            ) -> Result<CanonicalState, PortError> {
+                *self.reads.lock().expect("read count") += 1;
+                Ok(self.state.clone())
+            }
+        }
+
+        let calls = Arc::new(Mutex::new(0));
+        let reads = Arc::new(Mutex::new(0));
+        let mut board = ControlBoard::new(
+            Some(Box::new(access(
+                Role::HumanRequester,
+                &[ActionCapability::StartQuery],
+                &[PrivacyClass::Public],
+            ))),
+            Some(Box::new(CountingRead {
+                state: state(),
+                reads: Arc::clone(&reads),
+            })),
+            Some(Box::new(CountingCommand {
+                calls: Arc::clone(&calls),
+            })),
+        );
+        let request = read_request(Role::HumanRequester);
+        let submitted = start_query();
+        let first = board
+            .submit(&request, submitted.clone())
+            .expect("first receipt");
+        assert_eq!(*calls.lock().expect("call count"), 1);
+        assert_eq!(*reads.lock().expect("read count"), 1);
+        // The replay returns the stored receipt without re-reading canonical
+        // state and without a second effect.
+        let second = board.submit(&request, submitted).expect("replay receipt");
+        assert_eq!(first, second);
+        assert_eq!(*calls.lock().expect("call count"), 1);
+        assert_eq!(*reads.lock().expect("read count"), 1);
     }
 }
