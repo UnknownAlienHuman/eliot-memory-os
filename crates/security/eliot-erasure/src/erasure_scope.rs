@@ -271,7 +271,7 @@ impl ResidencyBinding {
 /// Data-scope class determining the approving owner.
 ///
 /// `I15-14-privacy-erasure.md:3`: System Owner for installation data,
-/// WorkScope Owner / authorized Human for scope data.
+/// `WorkScope` Owner / authorized Human for scope data.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
 pub enum DataScopeClass {
@@ -284,12 +284,11 @@ impl DataScopeClass {
     #[must_use]
     pub const fn permits(&self, approver: &ApproverKind) -> bool {
         match (self, approver) {
-            (Self::InstallationData, ApproverKind::SystemOwner) => true,
-            (Self::InstallationData, _) => false,
-            (Self::WorkScopeData, ApproverKind::WorkScopeOwner | ApproverKind::AuthorizedHuman) => {
+            (Self::InstallationData, ApproverKind::SystemOwner)
+            | (Self::WorkScopeData, ApproverKind::WorkScopeOwner | ApproverKind::AuthorizedHuman) => {
                 true
             }
-            (Self::WorkScopeData, ApproverKind::SystemOwner) => false,
+            (Self::InstallationData, _) | (Self::WorkScopeData, ApproverKind::SystemOwner) => false,
         }
     }
 }
@@ -623,10 +622,22 @@ mod tests {
     const TEST_LINEAGE: &str = "550e8400-e29b-41d4-a716-446655440000";
 
     fn test_fence() -> StateFence {
-        let lineage = EpochLineageId::new(TEST_LINEAGE).expect("valid test lineage");
-        let epoch = EpochId::new(lineage, std::num::NonZeroU64::new(7).expect("nonzero"))
-            .expect("valid test epoch");
-        StateFence::new(epoch, ResourceGeneration::new(3).expect("valid generation"))
+        let lineage = match EpochLineageId::new(TEST_LINEAGE) {
+            Ok(lineage) => lineage,
+            Err(error) => panic!("valid test lineage: {error:?}"),
+        };
+        let Some(ordinal) = std::num::NonZeroU64::new(7) else {
+            panic!("nonzero test epoch ordinal")
+        };
+        let epoch = match EpochId::new(lineage, ordinal) {
+            Ok(epoch) => epoch,
+            Err(error) => panic!("valid test epoch: {error:?}"),
+        };
+        let generation = match ResourceGeneration::new(3) {
+            Ok(generation) => generation,
+            Err(error) => panic!("valid test generation: {error:?}"),
+        };
+        StateFence::new(epoch, generation)
     }
 
     fn test_approval() -> ApprovalBinding {
@@ -684,11 +695,13 @@ mod tests {
         assert!(snapshot.validate().is_ok());
         assert_eq!(snapshot.targets.len(), 8);
         for family in ErasureFamily::ALL {
-            let member = snapshot
+            let Some(member) = snapshot
                 .targets
                 .iter()
                 .find(|target| target.family == family)
-                .expect("each family is represented");
+            else {
+                panic!("each family is represented")
+            };
             assert_eq!(member.owner, family.owner());
             assert!(member.disposition.is_terminal());
         }
@@ -698,10 +711,15 @@ mod tests {
     fn digest_is_stable_and_idempotent_for_exact_replay() {
         let first = test_snapshot();
         let replay = test_snapshot();
-        assert_eq!(
-            first.scope_digest().expect("digest"),
-            replay.scope_digest().expect("digest")
-        );
+        let first_digest = match first.scope_digest() {
+            Ok(digest) => digest,
+            Err(error) => panic!("scope digest of first snapshot: {error:?}"),
+        };
+        let replay_digest = match replay.scope_digest() {
+            Ok(digest) => digest,
+            Err(error) => panic!("scope digest of replay snapshot: {error:?}"),
+        };
+        assert_eq!(first_digest, replay_digest);
         assert!(first.check_identity_conflict(&replay).is_ok());
     }
 
@@ -863,10 +881,15 @@ mod tests {
 
     #[test]
     fn child_effect_identity_covers_only_shape() {
-        let first = ChildEffectId::for_target("erasure-1130-a", 3, EffectKind::BlobDeletion)
-            .expect("valid shape");
-        let replay = ChildEffectId::for_target("erasure-1130-a", 3, EffectKind::BlobDeletion)
-            .expect("valid shape");
+        let first = match ChildEffectId::for_target("erasure-1130-a", 3, EffectKind::BlobDeletion) {
+            Ok(first) => first,
+            Err(error) => panic!("valid child effect shape: {error:?}"),
+        };
+        let replay = match ChildEffectId::for_target("erasure-1130-a", 3, EffectKind::BlobDeletion)
+        {
+            Ok(replay) => replay,
+            Err(error) => panic!("valid child effect shape: {error:?}"),
+        };
         assert_eq!(first, replay);
         assert!(ChildEffectId::for_target("", 0, EffectKind::KeyDestruction).is_err());
     }
@@ -897,16 +920,16 @@ mod tests {
     fn request_binds_to_frozen_snapshot_and_rejects_scope_drift() {
         let snapshot = test_snapshot();
         let request = bound_request(&snapshot);
-        let first = request
-            .bind_scope_snapshot(&snapshot)
-            .expect("binding holds");
+        let first = match request.bind_scope_snapshot(&snapshot) {
+            Ok(first) => first,
+            Err(error) => panic!("binding holds: {error:?}"),
+        };
         assert_eq!(first.len(), 64);
-        assert_eq!(
-            request
-                .bind_scope_snapshot(&test_snapshot())
-                .expect("replay binds"),
-            first
-        );
+        let replay = match request.bind_scope_snapshot(&test_snapshot()) {
+            Ok(replay) => replay,
+            Err(error) => panic!("replay binds: {error:?}"),
+        };
+        assert_eq!(replay, first);
 
         let mut drifted_subject = test_snapshot();
         drifted_subject.subject_ref = "subject:other".to_string();
