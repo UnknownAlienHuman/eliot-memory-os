@@ -325,6 +325,185 @@ class AssignmentIntegrityOracle:
             ))
             return self._build_result(ResultStatus.MALFORMED_INPUT)
 
+        # Strict schema field validation: reject unknown and removed label fields (case 48)
+        FORBIDDEN_LABEL_FIELDS_PR = {
+            "candidate_status",
+            "is_reservation",
+            "has_reservation_marker",
+            "tree_state",
+            "is_authorized_integration",
+        }
+        FORBIDDEN_LABEL_FIELDS_WS = {
+            "physical_package",
+            "incompatible_with_existing",
+            "neighbor_crate_violation",
+        }
+
+        ALLOWED_FIELDS_ROOT = {
+            "schema",
+            "header",
+            "issues",
+            "pull_requests",
+            "repository_records",
+        }
+        ALLOWED_FIELDS_HEADER = {
+            "repository",
+            "base_sha",
+            "source_sha",
+            "producer",
+            "rule_revision",
+            "complete",
+            "missing_sections",
+            "canonical_branch_pattern",
+            "branch_exceptions",
+            "base_ancestors",
+            "ancestors",
+        }
+        ALLOWED_FIELDS_ISSUE = {
+            "number",
+            "state",
+            "title",
+            "body",
+            "write_paths",
+            "prohibited_paths",
+            "future_paths",
+            "dependencies",
+            "disposition",
+            "declared_denominator",
+            "case_count",
+            "dispatch_requested",
+            "document_status",
+            "parent_issue",
+            "prohibitions",
+            "required_documents",
+            "unfrozen_inventory",
+            "state_reason",
+        }
+        ALLOWED_FIELDS_PR = {
+            "number",
+            "state",
+            "draft",
+            "merged",
+            "title",
+            "body",
+            "head_ref",
+            "head_repo",
+            "base_ref",
+            "base_sha",
+            "changed_paths",
+            "dirty_files",
+            "worktree_clean",
+            "head_sha",
+            "expected_head_sha",
+            "initial_head_sha",
+            "ref_sha",
+            "merge_base_sha",
+            "base_ancestors",
+            "ancestors",
+            "ancestry_facts",
+        }
+        ALLOWED_FIELDS_WS = {
+            "path",
+            "internal_issue",
+            "package",
+            "target_dir",
+            "plane",
+            "target_plane",
+            "write_paths",
+        }
+        ALLOWED_FIELDS_REPO_RECORDS = {
+            "workstreams",
+            "retired_refs",
+            "manifests",
+            "tracked_tree",
+            "ancestors",
+            "ancestry",
+        }
+        ALLOWED_FIELDS_MANIFEST = {
+            "path",
+            "package",
+            "plane",
+        }
+
+        for k in self.snapshot.keys():
+            if k not in ALLOWED_FIELDS_ROOT:
+                self.findings.append(Finding(
+                    rule_id="AU-SCHEMA-02",
+                    severity=FindingSeverity.ERROR,
+                    finding_class=FindingClass.INPUT_MALFORMED,
+                    message=f"Unknown field '{k}' in snapshot root",
+                ))
+                return self._build_result(ResultStatus.MALFORMED_INPUT)
+
+        for k in header.keys():
+            if k not in ALLOWED_FIELDS_HEADER:
+                self.findings.append(Finding(
+                    rule_id="AU-SCHEMA-02",
+                    severity=FindingSeverity.ERROR,
+                    finding_class=FindingClass.INPUT_MALFORMED,
+                    message=f"Unknown field '{k}' in snapshot header",
+                ))
+                return self._build_result(ResultStatus.MALFORMED_INPUT)
+
+        for iss in issues_data:
+            if isinstance(iss, dict):
+                for k in iss.keys():
+                    if k not in ALLOWED_FIELDS_ISSUE:
+                        self.findings.append(Finding(
+                            rule_id="AU-SCHEMA-02",
+                            severity=FindingSeverity.ERROR,
+                            finding_class=FindingClass.INPUT_MALFORMED,
+                            message=f"Unknown field '{k}' in issue #{iss.get('number', '?')}",
+                        ))
+                        return self._build_result(ResultStatus.MALFORMED_INPUT)
+
+        for pr in prs_data:
+            if isinstance(pr, dict):
+                for k in pr.keys():
+                    if k in FORBIDDEN_LABEL_FIELDS_PR or k not in ALLOWED_FIELDS_PR:
+                        self.findings.append(Finding(
+                            rule_id="AU-SCHEMA-02",
+                            severity=FindingSeverity.ERROR,
+                            finding_class=FindingClass.INPUT_MALFORMED,
+                            message=f"Rejected label or unknown field '{k}' in pull request #{pr.get('number', '?')}",
+                        ))
+                        return self._build_result(ResultStatus.MALFORMED_INPUT)
+
+        if isinstance(repo_records, dict):
+            for k in repo_records.keys():
+                if k not in ALLOWED_FIELDS_REPO_RECORDS:
+                    self.findings.append(Finding(
+                        rule_id="AU-SCHEMA-02",
+                        severity=FindingSeverity.ERROR,
+                        finding_class=FindingClass.INPUT_MALFORMED,
+                        message=f"Unknown field '{k}' in repository_records",
+                    ))
+                    return self._build_result(ResultStatus.MALFORMED_INPUT)
+
+            for ws in repo_records.get("workstreams", []):
+                if isinstance(ws, dict):
+                    for k in ws.keys():
+                        if k in FORBIDDEN_LABEL_FIELDS_WS or k not in ALLOWED_FIELDS_WS:
+                            self.findings.append(Finding(
+                                rule_id="AU-SCHEMA-02",
+                                severity=FindingSeverity.ERROR,
+                                finding_class=FindingClass.INPUT_MALFORMED,
+                                message=f"Rejected label or unknown field '{k}' in workstream '{ws.get('path', '?')}'",
+                            ))
+                            return self._build_result(ResultStatus.MALFORMED_INPUT)
+
+            for m in repo_records.get("manifests", []):
+                if isinstance(m, dict):
+                    for k in m.keys():
+                        if k not in ALLOWED_FIELDS_MANIFEST:
+                            self.findings.append(Finding(
+                                rule_id="AU-SCHEMA-02",
+                                severity=FindingSeverity.ERROR,
+                                finding_class=FindingClass.INPUT_MALFORMED,
+                                message=f"Unknown field '{k}' in manifest '{m.get('path', '?')}'",
+                            ))
+                            return self._build_result(ResultStatus.MALFORMED_INPUT)
+
         # Incomplete coverage flag check
         if not is_complete or self.missing_sections:
             self.findings.append(Finding(
@@ -540,7 +719,7 @@ class AssignmentIntegrityOracle:
             changed_paths = [normalize_path(p) for p in pr.get("changed_paths", [])]
             is_draft = pr.get("draft", False)
             marker_files = [p for p in changed_paths if p.startswith(".github/temporary/work-unit-") or p.endswith(".marker")]
-            has_marker_in_diff = bool(marker_files) or pr.get("has_reservation_marker", False)
+            has_marker_in_diff = bool(marker_files)
 
             # Metadata-only changed paths: files under .github/temporary/, workstreams .toml, .md, or .marker
             def is_metadata_path(p: str) -> bool:
@@ -561,11 +740,10 @@ class AssignmentIntegrityOracle:
                 or re.search(r"\breservation\b", body, re.IGNORECASE)
                 or head_ref.startswith("reserve/")
                 or head_ref.startswith("reservation/")
-                or pr.get("is_reservation", False)
             )
 
             # Derived reservation status: reservation-only if marker and metadata diff, or reservation intent
-            is_reservation = (has_reservation_intent and not prod_diff) or (has_marker_in_diff and not prod_diff) or pr.get("is_reservation", False)
+            is_reservation = (has_reservation_intent and not prod_diff) or (has_marker_in_diff and not prod_diff)
 
             # Check fork/head repository mismatch
             if expected_repo and head_repo and expected_repo.lower() != head_repo.lower():
@@ -630,7 +808,7 @@ class AssignmentIntegrityOracle:
                 ))
 
             # Multiple contradictory claims check
-            if len(owner_claims) > 1 and not pr.get("is_authorized_integration", False):
+            if len(owner_claims) > 1 and not (head_ref in branch_exceptions):
                 self.findings.append(Finding(
                     rule_id="AU-OWNER-MULTIPLE",
                     severity=FindingSeverity.ERROR,
@@ -657,35 +835,63 @@ class AssignmentIntegrityOracle:
             auth_base_sha = header.get("base_sha")
             pr_merge_base_sha = pr.get("merge_base_sha")
 
-            if pr_base_sha and auth_base_sha and pr_base_sha != auth_base_sha:
+            # Ancestry facts from snapshot
+            known_base_ancestors: Set[str] = set()
+            for a in header.get("base_ancestors", []):
+                known_base_ancestors.add(str(a))
+            for a in header.get("ancestors", []):
+                known_base_ancestors.add(str(a))
+            if isinstance(repo_records.get("ancestors"), list):
+                for a in repo_records.get("ancestors", []):
+                    known_base_ancestors.add(str(a))
+            ancestry_graph = repo_records.get("ancestry", {})
+            if isinstance(ancestry_graph, dict):
+                queue = [auth_base_sha] if auth_base_sha else []
+                seen = set()
+                while queue:
+                    curr = queue.pop(0)
+                    if curr in seen:
+                        continue
+                    seen.add(curr)
+                    parents = ancestry_graph.get(curr, [])
+                    if isinstance(parents, list):
+                        for p in parents:
+                            known_base_ancestors.add(str(p))
+                            queue.append(str(p))
+            if isinstance(pr.get("base_ancestors"), list):
+                for a in pr.get("base_ancestors", []):
+                    known_base_ancestors.add(str(a))
+            if isinstance(pr.get("ancestors"), list):
+                for a in pr.get("ancestors", []):
+                    known_base_ancestors.add(str(a))
+            if isinstance(pr.get("ancestry_facts"), dict):
+                for a in pr["ancestry_facts"].get("ancestors", []):
+                    known_base_ancestors.add(str(a))
+
+            # Stale base check: valid if base is authoritative base OR an ancestor of it
+            is_stale_base = False
+            stale_reason = ""
+            if pr_base_sha and auth_base_sha:
+                if pr_base_sha != auth_base_sha and pr_base_sha not in known_base_ancestors:
+                    is_stale_base = True
+                    stale_reason = f"base commit {pr_base_sha} is neither authoritative base {auth_base_sha} nor an ancestor of it"
+            if not is_stale_base and pr_merge_base_sha and auth_base_sha:
+                if pr_merge_base_sha != auth_base_sha and pr_merge_base_sha not in known_base_ancestors:
+                    is_stale_base = True
+                    stale_reason = f"merge base {pr_merge_base_sha} is not repository base {auth_base_sha} and lacks ancestry path"
+
+            if is_stale_base:
                 self.findings.append(Finding(
                     rule_id="AU-CAND-STALE-BASE",
                     severity=FindingSeverity.ERROR,
                     finding_class=FindingClass.BRANCH_VIOLATION,
-                    message=f"PR #{pr_num} has stale base commit: {pr_base_sha} != {auth_base_sha}",
-                    pr=pr_num,
-                ))
-            elif pr_merge_base_sha and auth_base_sha and pr_merge_base_sha != auth_base_sha:
-                self.findings.append(Finding(
-                    rule_id="AU-CAND-STALE-BASE",
-                    severity=FindingSeverity.ERROR,
-                    finding_class=FindingClass.BRANCH_VIOLATION,
-                    message=f"PR #{pr_num} merge base {pr_merge_base_sha} is not repository base {auth_base_sha}",
-                    pr=pr_num,
-                ))
-            elif pr.get("candidate_status") == "stale_base":
-                self.findings.append(Finding(
-                    rule_id="AU-CAND-STALE-BASE",
-                    severity=FindingSeverity.ERROR,
-                    finding_class=FindingClass.BRANCH_VIOLATION,
-                    message=f"PR #{pr_num} has stale base commit",
+                    message=f"PR #{pr_num} has stale base commit: {stale_reason}",
                     pr=pr_num,
                 ))
 
             dirty_files = pr.get("dirty_files", [])
-            tree_state = pr.get("tree_state")
             worktree_clean = pr.get("worktree_clean")
-            if dirty_files or tree_state == "dirty" or worktree_clean is False or pr.get("candidate_status") == "dirty":
+            if dirty_files or worktree_clean is False:
                 self.findings.append(Finding(
                     rule_id="AU-CAND-DIRTY",
                     severity=FindingSeverity.ERROR,
@@ -696,7 +902,7 @@ class AssignmentIntegrityOracle:
 
             head_sha = pr.get("head_sha")
             expected_head_sha = pr.get("expected_head_sha") or pr.get("initial_head_sha") or pr.get("ref_sha")
-            if (head_sha and expected_head_sha and head_sha != expected_head_sha) or pr.get("candidate_status") == "head_mismatch":
+            if head_sha and expected_head_sha and head_sha != expected_head_sha:
                 self.findings.append(Finding(
                     rule_id="AU-CAND-HEAD-MISMATCH",
                     severity=FindingSeverity.ERROR,
@@ -853,19 +1059,49 @@ class AssignmentIntegrityOracle:
                     path=path,
                 ))
 
-            # Physical package owner validation derived from manifests / target_dir
-            physical_pkg = ws.get("physical_package", "")
-            if not physical_pkg and target_dir:
-                norm_td = normalize_path(target_dir)
-                if not norm_td.endswith("/"):
-                    norm_td += "/"
-                if norm_td in manifests_by_dir:
-                    physical_pkg = manifests_by_dir[norm_td].get("package", "")
+            # Physical package owner validation derived from manifests / tracked tree / target_dir
+            physical_pkg = ""
+            claimed_dir = ""
+            if target_dir:
+                claimed_dir = normalize_path(target_dir)
+                if not claimed_dir.endswith("/"):
+                    claimed_dir += "/"
+            elif ws_write_paths:
+                for wp in ws_write_paths:
+                    norm_wp = normalize_path(wp)
+                    if "/" in norm_wp:
+                        claimed_dir = norm_wp.rsplit("/", 1)[0] + "/"
+                        break
+
+            if claimed_dir:
+                if claimed_dir in manifests_by_dir:
+                    physical_pkg = manifests_by_dir[claimed_dir].get("package", "")
                 else:
                     for m_dir, m_entry in manifests_by_dir.items():
-                        if paths_overlap(norm_td, m_dir):
+                        if paths_overlap(claimed_dir, m_dir):
                             physical_pkg = m_entry.get("package", "")
                             break
+
+            # If still not found, search tracked_tree for Cargo.toml at claimed path
+            if not physical_pkg and claimed_dir:
+                for t in tracked_tree_data:
+                    norm_t = normalize_path(t)
+                    if norm_t.endswith("Cargo.toml") and (paths_overlap(claimed_dir, norm_t) or norm_t.startswith(claimed_dir)):
+                        t_dir = norm_t.rsplit("/", 1)[0] + "/" if "/" in norm_t else norm_t + "/"
+                        if t_dir in manifests_by_dir:
+                            physical_pkg = manifests_by_dir[t_dir].get("package", "")
+                            break
+                        if self.repo_root:
+                            cargo_file = self.repo_root / norm_t
+                            if cargo_file.is_file():
+                                try:
+                                    content = cargo_file.read_text(encoding="utf-8")
+                                    m_pkg_match = re.search(r'^\s*name\s*=\s*["\']([^"\']+)["\']', content, re.MULTILINE)
+                                    if m_pkg_match:
+                                        physical_pkg = m_pkg_match.group(1)
+                                        break
+                                except Exception:
+                                    pass
 
             if claimed_pkg and physical_pkg and claimed_pkg != physical_pkg:
                 self.findings.append(Finding(
@@ -877,8 +1113,8 @@ class AssignmentIntegrityOracle:
                 ))
 
             # Neighbor crate ownership check (case 29) derived from manifests / tracked tree
-            is_neighbor_violation = ws.get("neighbor_crate_violation", False)
-            if not is_neighbor_violation and claimed_pkg:
+            is_neighbor_violation = False
+            if claimed_pkg:
                 claimed_pkg_entries = manifests_by_pkg.get(claimed_pkg, [])
                 pkg_dir = claimed_pkg_entries[0].get("dir") if claimed_pkg_entries else (target_dir or "")
                 if pkg_dir:
@@ -904,8 +1140,8 @@ class AssignmentIntegrityOracle:
                 ))
 
             # Duplicate incompatible package owners check (case 32)
-            is_incompatible = ws.get("incompatible_with_existing", False)
-            if not is_incompatible and claimed_pkg:
+            is_incompatible = False
+            if claimed_pkg:
                 pkg_ws_list = workstreams_by_pkg.get(claimed_pkg, [])
                 if len(pkg_ws_list) > 1:
                     first_ws = pkg_ws_list[0]
