@@ -165,7 +165,7 @@ impl<T: EbpStoreTransport + 'static> EbpCanonicalStoreClient<T> {
     fn validate_requirement_fence(&self, observed: &StateFence) -> Result<(), StoreError> {
         if observed != &self.requirement.state_fence
             || observed.resource_generation != self.requirement.store_generation
-            || observed.authority_epoch != self.requirement.authority_epoch()
+            || &observed.authority_epoch != self.requirement.authority_epoch()
         {
             return Err(StoreError::FenceMismatch);
         }
@@ -404,7 +404,7 @@ impl<T: EbpStoreTransport + 'static> CanonicalStoreClient for EbpCanonicalStoreC
         snapshot.validate()?;
         if snapshot.state_fence != self.requirement.state_fence
             || snapshot.state_fence.resource_generation != self.requirement.store_generation
-            || snapshot.state_fence.authority_epoch != self.requirement.authority_epoch()
+            || &snapshot.state_fence.authority_epoch != self.requirement.authority_epoch()
         {
             return Err(StoreError::FenceMismatch);
         }
@@ -514,8 +514,9 @@ impl<T: EbpStoreTransport + 'static> CanonicalStoreClient for EbpCanonicalStoreC
 )]
 mod tests {
     use super::*;
+    use std::num::NonZeroU64;
     use eliot_contracts::{
-        AuthorityEpoch, ClockReading, ProductId, RequestId, ResourceGeneration, SourceId,
+        ClockReading, EpochId, EpochLineageId, ProductId, RequestId, ResourceGeneration, SourceId,
         StateFence,
     };
     use eliot_ipc::DeliveryOutcome;
@@ -523,6 +524,16 @@ mod tests {
     use eliot_protocol::{FrameKind, MessageType, ProtocolPayload, ServerHello};
     use eliot_store_api::StoreResponse;
     use serde_json::json;
+
+    const TEST_LINEAGE_A: &str = "550e8400-e29b-41d4-a716-446655440000";
+
+    fn test_epoch(sequence: u64) -> EpochId {
+        EpochId::new(
+            EpochLineageId::new(TEST_LINEAGE_A).expect("valid test lineage"),
+            NonZeroU64::new(sequence).expect("nonzero test sequence"),
+        )
+        .expect("valid test epoch")
+    }
 
     #[derive(Clone, Copy, Debug)]
     enum SnapshotFault {
@@ -646,7 +657,7 @@ mod tests {
                     heartbeat_ms: 1_000,
                     control_channel: "fake-store-control".to_owned(),
                     rejection_reason: None,
-                    authority_epoch: self.requirement.authority_epoch(),
+                    authority_epoch: self.requirement.authority_epoch().clone(),
                 };
                 self.pending = Some(
                     eliot_ipc::server_hello_frame(self.requirement.connection_id.as_str(), &hello)
@@ -681,12 +692,12 @@ mod tests {
                     let fence = match self.fault {
                         SnapshotFault::WrongFence | SnapshotFault::WrongAuthority => {
                             StateFence::new(
-                                AuthorityEpoch::new(2).expect("epoch"),
+                                test_epoch(2),
                                 ResourceGeneration::new(1).expect("generation"),
                             )
                         }
                         SnapshotFault::WrongGeneration => StateFence::new(
-                            AuthorityEpoch::new(1).expect("epoch"),
+                            test_epoch(1),
                             ResourceGeneration::new(2).expect("generation"),
                         ),
                         _ => self.requirement.state_fence.clone(),
@@ -723,7 +734,7 @@ mod tests {
                                     "key": "scope:two",
                                     "revision": 1,
                                     "state_fence": StateFence::new(
-                                        AuthorityEpoch::new(1).expect("epoch"),
+                                        test_epoch(1),
                                         ResourceGeneration::new(2).expect("generation"),
                                     ),
                                 }
@@ -796,7 +807,7 @@ mod tests {
 
     fn requirement() -> HostStoreBootstrapRequirement {
         let fence = StateFence::new(
-            AuthorityEpoch::new(1).expect("epoch"),
+            test_epoch(1),
             ResourceGeneration::new(1).expect("generation"),
         );
         HostStoreBootstrapRequirement {
@@ -978,7 +989,7 @@ mod tests {
     async fn recovery_client_rejects_wrong_fence_key_and_excluded_jobs() {
         let approved_requirement = requirement();
         let wrong_fence = StateFence::new(
-            AuthorityEpoch::new(2).expect("epoch"),
+            test_epoch(2),
             ResourceGeneration::new(1).expect("generation"),
         );
         let owner = recovery_record(
@@ -1292,7 +1303,7 @@ fn client_hello(
         privacy_classes: vec!["PUBLIC".to_owned()],
         max_frame: u32::try_from(eliot_protocol::MAX_FRAME_BYTES)
             .map_err(|_| StoreClientError::Contract("protocol max frame exceeds u32".to_owned()))?,
-        authority_epoch: requirement.authority_epoch(),
+        authority_epoch: requirement.authority_epoch().clone(),
     })
 }
 
@@ -1318,7 +1329,7 @@ fn decode_server_hello(
     let expected_effects: BTreeSet<&str> = EFFECTS.iter().copied().collect();
     let observed_effects: BTreeSet<&str> =
         server.allowed_effects.iter().map(String::as_str).collect();
-    if server.authority_epoch != requirement.authority_epoch()
+    if server.authority_epoch != requirement.authority_epoch().clone()
         || server.selected_protocol != ProtocolVersion::CURRENT
         || server.rejection_reason.is_some()
         || artifact_hash != Some(requirement.approved_artifact_hash.as_str())

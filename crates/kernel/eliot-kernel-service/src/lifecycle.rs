@@ -1,9 +1,11 @@
 //! Kernel lifecycle and admission state machine.
 
 use std::fmt;
+use std::num::NonZeroU64;
 
 use eliot_contracts::{
-    AuthorityEpoch, ContractId, ResourceGeneration, canonical_json_bytes, sha256_hex,
+    AuthorityEpoch, ContractId, EpochId, EpochLineageId, ResourceGeneration, canonical_json_bytes,
+    sha256_hex,
 };
 use eliot_kernel_core::{
     AuthorityGrantRequest, ControlPermit, FrontDoor, KernelAuthority, KernelAuthorityKey,
@@ -34,6 +36,20 @@ use crate::validate_text;
 /// Recovery may fast-forward to a durable epoch, but an unbounded value is
 /// treated as corrupt rather than allowed to become an implicit replay loop.
 const MAX_EPOCH_SYNC_GAP: u64 = 4_096;
+/// Cold-state placeholder lineage for the canonical epoch before Host
+/// reconciliation adopts the real Host-approved lineage (Implements #64).
+/// Uses lineage-A (the canonical test lineage) as the inert genesis value;
+/// `reconcile` replaces it with the candidate's lineage on first admission.
+const GENESIS_LINEAGE_A: &str = "550e8400-e29b-41d4-a716-446655440000";
+
+/// Returns the inert lineage-A genesis epoch for a Cold service.
+fn genesis_epoch() -> EpochId {
+    EpochId::new(
+        EpochLineageId::new(GENESIS_LINEAGE_A).unwrap_or_else(|_| unreachable!()),
+        NonZeroU64::MIN,
+    )
+    .unwrap_or_else(|_| unreachable!())
+}
 const GENERATION_FENCE_REASON_SUBSTITUTED: &str =
     "generation fence reason was invalid; canonical reason substituted";
 
@@ -184,7 +200,7 @@ pub enum KernelServiceError {
 pub struct AdmissionLease {
     permit: ControlPermit,
     activation_id: String,
-    authority_epoch: AuthorityEpoch,
+    authority_epoch: EpochId,
 }
 
 impl AdmissionLease {
@@ -194,8 +210,8 @@ impl AdmissionLease {
     }
 
     /// Returns the authority epoch covered by this lease.
-    pub const fn authority_epoch(&self) -> AuthorityEpoch {
-        self.authority_epoch
+    pub fn authority_epoch(&self) -> EpochId {
+        self.authority_epoch.clone()
     }
 
     /// Returns the opaque held permit for transition-gateway instrumentation.
@@ -218,6 +234,13 @@ pub struct KernelService {
     state: KernelServiceState,
     authority: KernelAuthority,
     front_door: FrontDoor,
+    /// Canonical lineage-aware authority epoch (Implements #64).
+    /// Initialized to the inert lineage-A genesis before Host admission;
+    /// `reconcile` adopts the Host-approved candidate lineage. The scalar
+    /// `FrontDoor`/`KernelAuthority` fence is retained for control-reserve
+    /// compatibility and advanced alongside, but canonical fencing uses this
+    /// exact `(lineage_id, sequence)` tuple via `is_same_authority`.
+    canonical_epoch: EpochId,
     candidate: Option<HostKernelCandidateBinding>,
     activation_receipt: Option<KernelActivationReceipt>,
     activation_request_digest: Option<String>,
@@ -251,6 +274,7 @@ impl KernelService {
             state: KernelServiceState::Cold,
             front_door: FrontDoor::new(authority.clone(), control_capacity, ledger_capacity)?,
             authority,
+            canonical_epoch: genesis_epoch(),
             candidate: None,
             activation_receipt: None,
             activation_request_digest: None,
@@ -270,8 +294,8 @@ impl KernelService {
     }
 
     /// Returns the active authority epoch.
-    pub const fn authority_epoch(&self) -> AuthorityEpoch {
-        self.front_door.epoch()
+    pub fn authority_epoch(&self) -> EpochId {
+        self.canonical_epoch.clone()
     }
 
     /// Returns the available bounded control capacity.
@@ -430,6 +454,9 @@ impl KernelService {
             });
         }
         self.transition(KernelServiceState::Reconciling)?;
+        // Adopt the Host-approved Kernel lineage (Implements #64): the live
+        // canonical epoch becomes the candidate's exact tuple from here on.
+        self.canonical_epoch = candidate.kernel_epoch.clone();
         self.candidate = Some(candidate);
         self.activation_receipt = None;
         self.activation_request_digest = None;
@@ -696,7 +723,7 @@ impl KernelService {
             process_binding: handoff.process_binding.clone(),
             candidate_binding_digest: handoff.candidate_binding_digest.clone(),
             generation: handoff.generation,
-            authority_epoch: handoff.authority_epoch,
+            authority_epoch: handoff.authority_epoch.clone(),
             store_fence: handoff.store_fence.clone(),
         };
         receipt.validate()?;
@@ -936,7 +963,12 @@ impl KernelService {
     }
 
     /// Raises the Kernel authority epoch, fencing every previously issued receipt.
-    pub fn advance_authority_epoch(&mut self) -> Result<AuthorityEpoch, KernelServiceError> {
+    ///
+    /// Advances the canonical lineage by exactly one sequence within the same
+    /// lineage (Implements #64); cross-lineage advancement is impossible by
+    /// construction. The scalar control-reserve fence advances alongside for
+    /// compatibility but never authorizes canonical work.
+    pub fn advance_authority_epoch(&mut self) -> Result<EpochId, KernelServiceError> {
         if self.generation_fenced {
             return Err(KernelServiceError::GenerationFenced);
         }
@@ -945,6 +977,26 @@ impl KernelService {
                 field: "authority_epoch",
             });
         }
+        let next_sequence = self
+            .canonical_epoch
+            .sequence
+            .get()
+            .checked_add(1)
+            .ok_or(KernelServiceError::InvalidField {
+                field: "authority_epoch",
+                reason: "sequence overflow",
+            })?;
+        let next = EpochId::new(
+            self.canonical_epoch.lineage_id.clone(),
+            NonZeroU64::new(next_sequence).ok_or(KernelServiceError::InvalidField {
+                field: "authority_epoch",
+                reason: "sequence overflow",
+            })?,
+        )
+        .map_err(|_| KernelServiceError::InvalidField {
+            field: "authority_epoch",
+            reason: "invalid canonical epoch",
+        })?;
         let epoch = self.front_door.advance_epoch()?;
         let mirrored = self.authority.advance_epoch()?;
         if epoch != mirrored {
@@ -952,47 +1004,67 @@ impl KernelService {
                 field: "authority_epoch",
             });
         }
-        Ok(epoch)
+        self.canonical_epoch = next.clone();
+        Ok(next)
     }
 
     /// Replays the durable epoch lineage before admitting a front-door
-    /// session.  Epochs may only move forward; a durable regression is a
-    /// startup fence rather than an implicit genesis reset.
+    /// session.  Epochs may only move forward within the same lineage; a
+    /// durable regression or a cross-lineage target is a startup fence rather
+    /// than an implicit genesis reset (Implements #64).
     pub fn synchronize_authority_epoch(
         &mut self,
-        target: AuthorityEpoch,
+        target: EpochId,
     ) -> Result<(), KernelServiceError> {
         if self.generation_fenced {
             return Err(KernelServiceError::GenerationFenced);
         }
         let current = self.authority_epoch();
-        if self.authority.current_epoch() != current {
+        if self.authority.current_epoch() != self.front_door.epoch() {
             return Err(KernelServiceError::HandshakeMismatch {
                 field: "authority_epoch",
             });
         }
-        if target.value() < current.value() {
+        if target.lineage_id != current.lineage_id {
+            return Err(KernelServiceError::HandshakeMismatch {
+                field: "authority_epoch",
+            });
+        }
+        if target.sequence.get() < current.sequence.get() {
             return Err(KernelServiceError::HandshakeMismatch {
                 field: "authority_epoch_regression",
             });
         }
-        let gap = target.value().checked_sub(current.value()).ok_or(
-            KernelServiceError::HandshakeMismatch {
+        let gap = target
+            .sequence
+            .get()
+            .checked_sub(current.sequence.get())
+            .ok_or(KernelServiceError::HandshakeMismatch {
                 field: "authority_epoch_corrupt",
-            },
-        )?;
+            })?;
         if gap > MAX_EPOCH_SYNC_GAP {
             return Err(KernelServiceError::HandshakeMismatch {
                 field: "authority_epoch_oversized",
             });
         }
-        let front_door_epoch = self.front_door.synchronize_epoch(target)?;
-        let mirrored = self.authority.synchronize_epoch(target)?;
-        if front_door_epoch != mirrored || mirrored != target {
+        // Retain the scalar control-reserve fence alongside the canonical
+        // epoch (donor precedent: no silent widening of the core). The
+        // sequence contour is the exact tuple projection, never a
+        // cross-lineage coercion.
+        let scalar_target =
+            AuthorityEpoch::new(target.sequence.get()).map_err(|_| {
+                KernelServiceError::HandshakeMismatch {
+                    field: "authority_epoch_corrupt",
+                }
+            })?;
+        let front_door_epoch = self.front_door.synchronize_epoch(scalar_target)?;
+        let mirrored = self.authority.synchronize_epoch(scalar_target)?;
+        if front_door_epoch != mirrored || mirrored != scalar_target {
             return Err(KernelServiceError::HandshakeMismatch {
                 field: "authority_epoch",
             });
         }
+        self.canonical_epoch = target;
         Ok(())
     }
 
@@ -1018,7 +1090,7 @@ impl KernelService {
         Ok(AdmissionLease {
             permit,
             activation_id: candidate.activation_id.as_str().to_owned(),
-            authority_epoch: self.front_door.epoch(),
+            authority_epoch: self.canonical_epoch.clone(),
         })
     }
 
@@ -1154,7 +1226,7 @@ fn native_worker_claim_receipt(
         attempt_id: request.attempt_id.clone(),
         operation_id: request.operation_id.clone(),
         worker_generation: request.worker_generation,
-        authority_epoch: request.authority_epoch,
+        authority_epoch: request.authority_epoch.clone(),
         state_fence: request.state_fence.clone(),
         binding_digest: request.binding_digest.clone(),
         admitted_at_unix_ms,
@@ -1275,7 +1347,9 @@ fn native_worker_claim_staged_record(
         budget_digest: native_worker_claim_budget_digest(request)?,
         deadline_unix_ms: request.deadline_unix_ms,
         fence_digest: native_worker_claim_fence_digest(request)?,
-        authority_epoch: request.authority_epoch.value(),
+        // Retained `u64` contour (donor precedent: no silent widening of ORS).
+        // The exact tuple projection, never a cross-lineage coercion.
+        authority_epoch: request.authority_epoch.sequence.get(),
         binding_digest: request.binding_digest.clone(),
         request_digest: request.request_digest.clone(),
         execution_unit_schema_version: request.execution_unit_schema_version,
@@ -1429,14 +1503,21 @@ impl KernelService {
             let (reason, detail) = native_worker_claim_rejection_reason(&error);
             return Ok(rejected(reason, detail));
         }
-        let live_epoch = self.authority_epoch().value();
-        if request.authority_epoch.value() < live_epoch {
-            return Ok(rejected(
-                NativeWorkerClaimRejectionReason::StaleRegistration,
-                "native_worker_claim.authority_epoch",
-            ));
-        }
-        if request.authority_epoch.value() > live_epoch {
+        // Exact-tuple currency gate (Implements #64): the claim epoch must be
+        // the same `(lineage_id, sequence)` as live. Same-lineage older maps
+        // to `StaleRegistration`, same-lineage newer or cross-lineage to
+        // `StaleEpoch`; equal sequences across lineages are unrelated and
+        // never authorize.
+        let live_epoch = self.authority_epoch();
+        if !request.authority_epoch.is_same_authority(&live_epoch) {
+            if request.authority_epoch.lineage_id == live_epoch.lineage_id
+                && request.authority_epoch.sequence.get() < live_epoch.sequence.get()
+            {
+                return Ok(rejected(
+                    NativeWorkerClaimRejectionReason::StaleRegistration,
+                    "native_worker_claim.authority_epoch",
+                ));
+            }
             return Ok(rejected(
                 NativeWorkerClaimRejectionReason::StaleEpoch,
                 "native_worker_claim.authority_epoch",
@@ -1712,14 +1793,21 @@ impl KernelService {
             let (reason, detail) = native_worker_claim_rejection_reason(&error);
             return Ok(rejected(reason, detail));
         }
-        let live_epoch = self.authority_epoch().value();
-        if request.authority_epoch.value() < live_epoch {
-            return Ok(rejected(
-                NativeWorkerClaimRejectionReason::StaleRegistration,
-                "native_worker_claim.authority_epoch",
-            ));
-        }
-        if request.authority_epoch.value() > live_epoch {
+        // Exact-tuple currency gate (Implements #64): the claim epoch must be
+        // the same `(lineage_id, sequence)` as live. Same-lineage older maps
+        // to `StaleRegistration`, same-lineage newer or cross-lineage to
+        // `StaleEpoch`; equal sequences across lineages are unrelated and
+        // never authorize.
+        let live_epoch = self.authority_epoch();
+        if !request.authority_epoch.is_same_authority(&live_epoch) {
+            if request.authority_epoch.lineage_id == live_epoch.lineage_id
+                && request.authority_epoch.sequence.get() < live_epoch.sequence.get()
+            {
+                return Ok(rejected(
+                    NativeWorkerClaimRejectionReason::StaleRegistration,
+                    "native_worker_claim.authority_epoch",
+                ));
+            }
             return Ok(rejected(
                 NativeWorkerClaimRejectionReason::StaleEpoch,
                 "native_worker_claim.authority_epoch",
@@ -1870,6 +1958,15 @@ mod tests {
         PlatformHandle::new(value).unwrap_or_else(|_| unreachable!())
     }
 
+    fn test_epoch(sequence: u64) -> EpochId {
+        EpochId::new(
+            EpochLineageId::new("550e8400-e29b-41d4-a716-446655440000")
+                .unwrap_or_else(|_| unreachable!()),
+            NonZeroU64::new(sequence).unwrap_or_else(|| unreachable!()),
+        )
+        .unwrap_or_else(|_| unreachable!())
+    }
+
     fn supervision_incarnation() -> SupervisionLeaseIncarnationBinding {
         SupervisionLeaseIncarnationBinding {
             supervision_lease_scope_id: "eliot-supervision-scope:v1:test".to_owned(),
@@ -1910,7 +2007,7 @@ mod tests {
         HostKernelCandidateBinding {
             installation_id: handle("installation-1"),
             host_epoch: AuthorityEpoch::new(1).unwrap_or_else(|_| unreachable!()),
-            kernel_epoch: AuthorityEpoch::genesis(),
+            kernel_epoch: test_epoch(1),
             activation_id: handle("activation-1"),
             artifact_hash: handle("artifact-1"),
             config_hash: handle("config-1"),
@@ -1954,7 +2051,7 @@ mod tests {
             journal_transaction_id: handle("journal-transaction-1"),
             journal_sequence: 7,
             generation: ResourceGeneration::genesis(),
-            authority_epoch: candidate.kernel_epoch,
+            authority_epoch: candidate.kernel_epoch.clone(),
             activation_nonce: KernelActivationNonce::new(handle(&"a".repeat(64)))
                 .unwrap_or_else(|_| unreachable!()),
         }
@@ -1987,12 +2084,12 @@ mod tests {
         process_id: u32,
     ) -> StoreRebindHandoff {
         let generation = ResourceGeneration::new(1).unwrap_or_else(|_| unreachable!());
-        let authority_epoch = AuthorityEpoch::new(1).unwrap_or_else(|_| unreachable!());
+        let authority_epoch = test_epoch(1);
         let requirement = crate::protocol::HostStoreBootstrapRequirement {
             route_identity: handle(crate::STORE_ROUTE_IDENTITY),
             canonical_pipe_identity: handle(r"\\.\pipe\eliot\store"),
             store_generation: generation,
-            state_fence: StateFence::new(authority_epoch, generation),
+            state_fence: StateFence::new(authority_epoch.clone(), generation),
             launch_nonce: handle("store-launch-nonce"),
             connection_id: handle("store-connection"),
             expected_peer_sid: handle("S-1-5-18"),
@@ -2017,7 +2114,7 @@ mod tests {
                 .compute_digest()
                 .unwrap_or_else(|_| unreachable!()),
             generation,
-            authority_epoch,
+            authority_epoch: authority_epoch.clone(),
             store_fence: format!("{process_id:0>64}"),
         };
         handoff.request_digest = handoff
@@ -2089,9 +2186,9 @@ mod tests {
     fn durable_epoch_sync_is_direct_and_rejects_oversized_values()
     -> Result<(), Box<dyn std::error::Error>> {
         let mut service = KernelService::new([7; 32], 2, 4)?;
-        service.synchronize_authority_epoch(AuthorityEpoch::new(100)?)?;
-        assert_eq!(service.authority_epoch(), AuthorityEpoch::new(100)?);
-        let oversized = AuthorityEpoch::new(4_300)?;
+        service.synchronize_authority_epoch(test_epoch(100))?;
+        assert_eq!(service.authority_epoch(), test_epoch(100));
+        let oversized = test_epoch(4_300);
         assert!(matches!(
             service.synchronize_authority_epoch(oversized),
             Err(KernelServiceError::HandshakeMismatch {
@@ -2245,7 +2342,7 @@ mod tests {
     -> Result<(), Box<dyn std::error::Error>> {
         let mut service = KernelService::new([19; 32], 2, 4)?;
         let mut candidate = candidate();
-        candidate.kernel_epoch = AuthorityEpoch::new(1)?;
+        candidate.kernel_epoch = test_epoch(1);
         let activation = activate(&mut service, candidate.clone());
         service.publish_ready(ready_receipt(&candidate, &activation, "ready-initial"))?;
 
@@ -2302,7 +2399,7 @@ mod tests {
     -> Result<(), Box<dyn std::error::Error>> {
         let mut service = KernelService::new([21; 32], 2, 4)?;
         let mut candidate = candidate();
-        candidate.kernel_epoch = AuthorityEpoch::new(1)?;
+        candidate.kernel_epoch = test_epoch(1);
         let activation = activate(&mut service, candidate.clone());
         service.publish_ready(ready_receipt(&candidate, &activation, "ready-initial"))?;
 

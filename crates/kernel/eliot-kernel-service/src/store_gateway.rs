@@ -204,7 +204,13 @@ impl KernelStoreGateway {
             if self.is_fenced() {
                 return Err("canonical-store gateway is fenced for rebind".to_owned());
             }
-            if self.route.authority_epoch() != service.authority_epoch()
+            // Lineage-aware route gate (Implements #64): the scalar
+            // `GenerationRoute` contour (core residual) is compared by exact
+            // sequence projection, while canonical fencing uses the live
+            // `EpochId` tuple. Cross-lineage same-sequence routes never
+            // authorize through the canonical gate below.
+            let live_epoch = service.authority_epoch();
+            if self.route.authority_epoch().value() != live_epoch.sequence.get()
                 || self.route.active_generation() != transition.state_fence.resource_generation
             {
                 return Err(
@@ -344,8 +350,13 @@ impl KernelStoreGateway {
         if service.generation_fenced() {
             return Err("Kernel generation is fenced".to_owned());
         }
-        if self.route.authority_epoch() != service.authority_epoch()
-            || self.route.authority_epoch() != state_fence.authority_epoch
+        // Lineage-aware route gate (Implements #64): the scalar
+        // `GenerationRoute` contour (core residual) is compared by exact
+        // sequence projection, while canonical fencing uses exact-tuple
+        // `is_same_authority`. Cross-lineage same-sequence fences fail closed.
+        let live_epoch = service.authority_epoch();
+        if self.route.authority_epoch().value() != live_epoch.sequence.get()
+            || !live_epoch.is_same_authority(&state_fence.authority_epoch)
         {
             return Err("canonical-store route is outside the active Kernel epoch".to_owned());
         }

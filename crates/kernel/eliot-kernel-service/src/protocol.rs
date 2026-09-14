@@ -1,6 +1,6 @@
 //! Host↔Kernel protocol records.
 
-use eliot_contracts::{AuthorityEpoch, EpochId, ResourceGeneration, StateFence, sha256_hex};
+use eliot_contracts::{sha256_hex, AuthorityEpoch, EpochId, ResourceGeneration, StateFence};
 use eliot_ipc::TransportError;
 use eliot_ors::{SupervisionLeaseProjection, SupervisionLeaseSnapshot};
 use eliot_platform::{KernelActivationNonce, PlatformHandle, PortError};
@@ -21,16 +21,15 @@ use serde::{Deserialize, Serialize};
 use std::collections::BTreeSet;
 use std::path::Path;
 
-use crate::{KernelServiceError, KernelServiceState, validate_text};
+use crate::{validate_text, KernelServiceError, KernelServiceState};
 
 mod native_worker_claim;
 mod process_authority_handoff;
 pub use native_worker_claim::{
-    NATIVE_WORKER_CLAIM_WIRE_ID, NATIVE_WORKER_CLAIM_WIRE_VERSION,
-    NATIVE_WORKER_EXECUTION_UNIT_SCHEMA_VERSION, NATIVE_WORKER_PROTOCOL_VERSION,
     NativeWorkerClaimBudget, NativeWorkerClaimConflict, NativeWorkerClaimReceipt,
     NativeWorkerClaimRejection, NativeWorkerClaimRejectionReason, NativeWorkerClaimRequest,
-    NativeWorkerClaimResponse,
+    NativeWorkerClaimResponse, NATIVE_WORKER_CLAIM_WIRE_ID, NATIVE_WORKER_CLAIM_WIRE_VERSION,
+    NATIVE_WORKER_EXECUTION_UNIT_SCHEMA_VERSION, NATIVE_WORKER_PROTOCOL_VERSION,
 };
 pub use process_authority_handoff::ProcessAuthorityHandoffDescriptor;
 
@@ -844,8 +843,7 @@ impl StoreRebindHandoff {
                 field: "store_rebind.generation",
             });
         }
-        if self.authority_epoch != self.requirement.state_fence.authority_epoch
-        {
+        if self.authority_epoch != self.requirement.state_fence.authority_epoch {
             return Err(KernelServiceError::HandshakeMismatch {
                 field: "store_rebind.authority_epoch",
             });
@@ -1462,9 +1460,7 @@ mod descriptor_tests {
     #![allow(clippy::expect_used, clippy::unwrap_used)]
 
     use super::*;
-    use eliot_contracts::{
-        AuthorityEpoch, EpochId, EpochLineageId, ResourceGeneration, StateFence, TaskRevision,
-    };
+    use eliot_contracts::{EpochId, EpochLineageId, ResourceGeneration, StateFence, TaskRevision};
     use eliot_kernel_core::AuthoritySnapshotBindingWire;
     use eliot_ors::{
         EpochIdentity, EpochLineage, OpaqueLabel, OperationIdentity, StateFenceSnapshot,
@@ -1531,8 +1527,7 @@ mod descriptor_tests {
         // The observed sequence is the known genesis fixture value, not an
         // extracted adapter; lineage is enforced via `EpochLineage` gates on the
         // binding side.
-        let snapshot_fence =
-            StateFenceSnapshot::capture(&state_fence, 1).expect("snapshot fence");
+        let snapshot_fence = StateFenceSnapshot::capture(&state_fence, 1).expect("snapshot fence");
         let binding = AuthoritySnapshotBindingWire {
             authority_id: authority_id.clone(),
             record_id: OperationIdentity::new("snapshot-record").expect("record"),
@@ -1593,7 +1588,7 @@ mod descriptor_tests {
         let descriptor = descriptor();
         assert_eq!(
             descriptor.compute_digest().expect("legacy digest"),
-            "01fb85846a2a7fd4b90960c51d314144c91f9f40fa16663f42a1e0b1b551d0aa"
+            "b3ea01358c2a110201c0efe1685e29590dfee4362ed39d74a218c44c0e5c488c"
         );
     }
 
@@ -2314,7 +2309,7 @@ pub struct HostKernelCandidateBinding {
     /// Host installation epoch that owns this process.
     pub host_epoch: AuthorityEpoch,
     /// Kernel authority epoch proposed for this activation.
-    pub kernel_epoch: AuthorityEpoch,
+    pub kernel_epoch: EpochId,
     /// Exact activation identity shared by Host state and Kernel.
     pub activation_id: PlatformHandle,
     /// Approved immutable Kernel artifact hash/reference.
@@ -2383,18 +2378,16 @@ impl HostKernelCandidateBinding {
                 field: "candidate.supervision_incarnation",
             });
         }
-        if self.host_epoch.value() == 0 || self.kernel_epoch.value() == 0 {
+        if self.host_epoch.value() == 0 {
             return Err(KernelServiceError::InvalidField {
                 field: "handshake.epoch",
                 reason: "must be non-zero",
             });
         }
-        if self.host_epoch.value() > self.kernel_epoch.value() {
-            return Err(KernelServiceError::InvalidField {
-                field: "handshake.kernel_epoch",
-                reason: "must not precede host epoch",
-            });
-        }
+        // Exact-tuple lineage (Implements #64): Host and Kernel epochs live
+        // in different lineages, so no cross-lineage numeric ordering exists.
+        // `kernel_epoch` is a lineage-aware `EpochId` (always non-zero by
+        // construction); equal sequences across lineages are unrelated.
         if let Some(descriptor) = &self.agent_bridge_admission {
             descriptor.validate()?;
         }
@@ -2618,8 +2611,9 @@ impl KernelReadyReceipt {
             format!("kernel-probe-request:{}", request.payload_digest),
             format!("kernel-probe-generation:{}", request.generation.value()),
             format!(
-                "kernel-probe-authority-epoch:{}",
-                request.candidate.kernel_epoch.value()
+                "kernel-probe-authority-epoch:{}:{}",
+                request.candidate.kernel_epoch.lineage_id.as_str(),
+                request.candidate.kernel_epoch.sequence.get()
             ),
             format!(
                 "kernel-probe-config:{}",
@@ -2763,9 +2757,17 @@ mod tests {
     )]
 
     use super::*;
-    use eliot_contracts::{ArtifactId, ContractId, ContractVersion};
+    use eliot_contracts::{ArtifactId, ContractId, ContractVersion, EpochId, EpochLineageId};
     use eliot_protocol::{AgentBridgeClientDeclaration, ProtocolRange};
     use eliot_runtime_contracts::{ModuleContract, ModuleGeneration, ModuleGenerationState};
+
+    fn test_epoch(sequence: u64) -> EpochId {
+        EpochId::new(
+            EpochLineageId::new("550e8400-e29b-41d4-a716-446655440000").expect("lineage"),
+            std::num::NonZeroU64::new(sequence).expect("sequence"),
+        )
+        .expect("epoch")
+    }
 
     fn handle_value(value: &str) -> PlatformHandle {
         PlatformHandle::new(value).expect("test handle")
@@ -3028,11 +3030,9 @@ mod tests {
     ) {
         let mut changed_digest = declaration.clone();
         changed_digest.declaration_sha256 = "f".repeat(64);
-        assert!(
-            descriptor
-                .validate_client_declaration(&changed_digest)
-                .is_err()
-        );
+        assert!(descriptor
+            .validate_client_declaration(&changed_digest)
+            .is_err());
 
         let mut changed_policy = declaration.clone();
         changed_policy
@@ -3041,11 +3041,9 @@ mod tests {
         changed_policy.declaration_sha256 = changed_policy
             .compute_digest()
             .expect("changed policy declaration digest");
-        assert!(
-            descriptor
-                .validate_client_declaration(&changed_policy)
-                .is_err()
-        );
+        assert!(descriptor
+            .validate_client_declaration(&changed_policy)
+            .is_err());
 
         let mut changed_kernel_expectation = declaration.clone();
         changed_kernel_expectation
@@ -3054,11 +3052,9 @@ mod tests {
         changed_kernel_expectation.declaration_sha256 = changed_kernel_expectation
             .compute_digest()
             .expect("changed Kernel expectation digest");
-        assert!(
-            descriptor
-                .validate_client_declaration(&changed_kernel_expectation)
-                .is_err()
-        );
+        assert!(descriptor
+            .validate_client_declaration(&changed_kernel_expectation)
+            .is_err());
     }
 
     #[test]
@@ -3513,7 +3509,7 @@ mod tests {
         HostKernelCandidateBinding {
             installation_id: handle_value("installation-1"),
             host_epoch: AuthorityEpoch::new(1).expect("host epoch"),
-            kernel_epoch: AuthorityEpoch::new(1).expect("kernel epoch"),
+            kernel_epoch: test_epoch(1),
             activation_id: handle_value("activation-1"),
             artifact_hash: handle_value("artifact-1"),
             config_hash: handle_value("config-1"),
@@ -3558,7 +3554,7 @@ mod tests {
             journal_transaction_id: handle_value("journal-transaction-1"),
             journal_sequence: 7,
             generation,
-            authority_epoch: candidate.kernel_epoch,
+            authority_epoch: candidate.kernel_epoch.clone(),
             activation_nonce: KernelActivationNonce::new(handle_value(&"a".repeat(64)))
                 .expect("activation nonce"),
         }
@@ -3809,17 +3805,13 @@ mod tests {
         stale_request.message_id = handle_value("probe-message-2");
         stale_request.sequence = 6;
         stale_request.payload_digest = stale_request.compute_digest().expect("stale digest");
-        assert!(
-            receipt
-                .validate_for_probe(&stale_request, &activation)
-                .is_err()
-        );
+        assert!(receipt
+            .validate_for_probe(&stale_request, &activation)
+            .is_err());
         let repeated = bound_ready_receipt(&stale_request, &activation);
-        assert!(
-            repeated
-                .validate_for_probe(&stale_request, &activation)
-                .is_ok()
-        );
+        assert!(repeated
+            .validate_for_probe(&stale_request, &activation)
+            .is_ok());
         assert_ne!(request.payload_digest, stale_request.payload_digest);
         assert_ne!(receipt.evidence_refs, repeated.evidence_refs);
         assert_eq!(
@@ -3833,16 +3825,12 @@ mod tests {
             .compute_digest()
             .expect("next repeat digest");
         let next_repeated = bound_ready_receipt(&next_repeat_request, &activation);
-        assert!(
-            next_repeated
-                .validate_for_probe(&next_repeat_request, &activation)
-                .is_ok()
-        );
-        assert!(
-            repeated
-                .validate_for_probe(&next_repeat_request, &activation)
-                .is_err()
-        );
+        assert!(next_repeated
+            .validate_for_probe(&next_repeat_request, &activation)
+            .is_ok());
+        assert!(repeated
+            .validate_for_probe(&next_repeat_request, &activation)
+            .is_err());
         assert_ne!(repeated.evidence_refs, next_repeated.evidence_refs);
         assert_eq!(
             repeated.activation_nonce_digest,
@@ -3852,29 +3840,23 @@ mod tests {
         let mut other_generation = request.clone();
         other_generation.generation = ResourceGeneration::new(4).expect("generation");
         other_generation.payload_digest = other_generation.compute_digest().expect("digest");
-        assert!(
-            receipt
-                .validate_for_probe(&other_generation, &activation)
-                .is_err()
-        );
+        assert!(receipt
+            .validate_for_probe(&other_generation, &activation)
+            .is_err());
 
         let mut other_fence = request.clone();
-        other_fence.candidate.kernel_epoch = AuthorityEpoch::new(2).expect("epoch");
+        other_fence.candidate.kernel_epoch = test_epoch(2);
         other_fence.payload_digest = other_fence.compute_digest().expect("digest");
-        assert!(
-            receipt
-                .validate_for_probe(&other_fence, &activation)
-                .is_err()
-        );
+        assert!(receipt
+            .validate_for_probe(&other_fence, &activation)
+            .is_err());
 
         let mut other_config = request.clone();
         other_config.candidate.config_hash = handle_value("config-2");
         other_config.payload_digest = other_config.compute_digest().expect("digest");
-        assert!(
-            receipt
-                .validate_for_probe(&other_config, &activation)
-                .is_err()
-        );
+        assert!(receipt
+            .validate_for_probe(&other_config, &activation)
+            .is_err());
 
         let mut ambiguous = receipt.clone();
         ambiguous
@@ -3891,11 +3873,9 @@ mod tests {
         substituted
             .evidence_refs
             .push(handle_value("kernel-probe-authority-epoch:99"));
-        assert!(
-            substituted
-                .validate_for_probe(&request, &activation)
-                .is_err()
-        );
+        assert!(substituted
+            .validate_for_probe(&request, &activation)
+            .is_err());
 
         let mut non_probe = request;
         non_probe.command = KernelControlCommand::Drain;
