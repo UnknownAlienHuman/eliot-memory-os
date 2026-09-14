@@ -1,18 +1,11 @@
 //! Credential marker and envelope wire codec.
 //!
-//! Architecture anchors (eliot-architecture-docs-fa941135):
-//! `eliot-architecture-docs-fa941135.ELIOT_ARCHITECTURE.A2.2`,
-//! `eliot-architecture-docs-fa941135.ELIOT_ARCHITECTURE.A2.3`,
-//! `eliot-architecture-docs-fa941135.ELIOT_ARCHITECTURE.A12.3`,
-//! `eliot-architecture-docs-fa941135.ELIOT_ARCHITECTURE.A12.6`,
-//! `eliot-architecture-docs-fa941135.ELIOT_ARCHITECTURE.ARCH-AUTH-01`,
-//! `eliot-architecture-docs-fa941135.ELIOT_ARCHITECTURE.ARCH-SEC-02`, and
-//! `eliot-architecture-docs-fa941135.ELIOT_ARCHITECTURE.ARCH-RES-01`.
-//! Implementation anchors (eliot-architecture-docs-fa941135):
-//! `eliot-architecture-docs-fa941135.ELIOT_IMPLEMENTATION.I1.2`,
-//! `eliot-architecture-docs-fa941135.ELIOT_IMPLEMENTATION.I1.4`,
-//! `eliot-architecture-docs-fa941135.ELIOT_IMPLEMENTATION.I3.12`, and
-//! `eliot-architecture-docs-fa941135.ELIOT_IMPLEMENTATION.I3.15`.
+//! Architecture: `docs/architecture/ELIOT_ARCHITECTURE.md` handles `A2.2`,
+//! `A2.3`, `A12.3`, and `A12.6`, plus Decision Anchors
+//! `docs/architecture/A16-01-decision-anchors.md` `ARCH-AUTH-01`, `ARCH-SEC-02`,
+//! and `ARCH-RES-01`. Implementation:
+//! `docs/architecture/ELIOT_IMPLEMENTATION.md` handles `I1.2`, `I1.4`, `I3.12`,
+//! and `I3.15`. Normative precedence remains in `docs/ARCHITECTURE_CONTRACT.md`.
 //!
 //! This child owns only canonical marker/envelope bytes and their integrity
 //! helpers. It owns no credential authority, filesystem/provider effect,
