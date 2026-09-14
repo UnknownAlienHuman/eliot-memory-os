@@ -1,23 +1,9 @@
 //! SCM service registration contract and runtime-inspection types.
 //!
-//! Architecture handles (verified at `docs/architecture/ELIOT_ARCHITECTURE.md`):
-//! - A13.2 Kernel and failure domains (lines 2062-2075): minimal alive Kernel
-//!   preserves authority/fencing/health, Host Supervisor is outside the shared
-//!   failure domain of Kernel/Watchdog/Doctor and only bounded-restarts approved
-//!   services without reading project semantics.
-//! - A13.3 Module supervision and Doctor (lines 2081-2088): start, health/readiness
-//!   check, quiesce/drain, checkpoint, restart/rebuild, replace/rollback, quarantine,
-//!   retire.
+//! Architecture: A13.2 (docs/architecture/A13-02-kernel-and-failure-domains.md#a132-kernel-and-failure-domains).
 //!
-//! Implementation tier (separately labeled):
-//! - `docs/PROJECT_MAP.md` lines 101-108: Windows protected paths, ACLs, SCM and
-//!   process/Job observations are owned by `crates/kernel/eliot-platform-windows`
-//!   (and `crates/eliot-windows-ipc`), distinct from installation, host-state,
-//!   kernel-service, store, daemon, watchdog boundaries.
-//! - `docs/architecture/ELIOT_IMPLEMENTATION.md` lines 1218-1237: `eliotd` owns
-//!   WorkScopes/tasks/plan revisions and is hot-replaceable without changing
-//!   canonical owner; lines 1941-2005: crate-rich, process-sparse, owner-sparse
-//!   with one owner per mutable state and one canonical semantic path.
+//! Implementation: I1.2 (docs/architecture/I01-02-required-processes-of-the-first-complete-runtime.md#i12-required-processes-of-the-first-complete-runtime),
+//! I1.6 (docs/architecture/I01-06-windows-isolation.md#i16-windows-isolation).
 //!
 //! Ownership: this module is the sole owner of the SCM service registration
 //! contract and runtime-inspection types — `ServiceAccount`, `ServiceStartMode`,

@@ -1,7 +1,7 @@
 //! Read-only Host identity observation for the independent Watchdog.
 //!
-//! Source-backed Architecture: `ELIOT_ARCHITECTURE.md` A8.1, `ARCH-WDG-01`.
-//! Source-backed Implementation: `ELIOT_IMPLEMENTATION.md` I8.1, I8.2.
+//! Architecture: A8.1 (docs/architecture/A08-01-purpose.md#a81-purpose), ARCH-WDG-01.
+//! Implementation: I8.1 (docs/architecture/I08-01-process-and-authority.md#i81-process-and-authority), I8.2 (docs/architecture/I08-02-independent-observation-routes.md#i82-independent-observation-routes).
 //!
 //! This cell forbids start, stop, restart, and kill effects; semantic or
 //! canonical authority; and spool, composition, self-admission, or SCM
