@@ -63,6 +63,12 @@ harness exists; it cannot be used to manufacture runtime proof.
 Proof ceiling: full source candidate only. Release packaging belongs to
 `scripts/` and `docs/release/`; live Windows acceptance belongs to issue #11.
 
+### `integration.yml`
+
+Manual Windows integration run on one admitted SHA/profile (`workflow_dispatch` only).
+
+Proof ceiling: manual structural integration run only.
+
 ## Branch and integration rules
 
 Normal branches use:
