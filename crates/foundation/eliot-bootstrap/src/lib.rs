@@ -15,6 +15,16 @@ use std::collections::BTreeSet;
 use std::collections::BTreeMap;
 
 use eliot_agent_api::AgentWorkUnitBrief;
+pub use eliot_conformance_contracts::{
+    CONTRACT_VERSION as CONFORMANCE_CONTRACT_VERSION, CapabilitySupportRow, ContractMaturity,
+    DomainCoverage, EvidenceDomain, EvidenceExecutionStatus, ImplementationSupport,
+    SupportObservationState,
+};
+use eliot_conformance_contracts::{
+    ConformanceContractError, canonicalize_domain_coverage, canonicalize_support_claim_set,
+    validate_capability_support_row, validate_capability_support_row_against_coverage,
+    validate_domain_coverage, validate_support_claim_set,
+};
 use eliot_contracts::{
     ContractIdentity, ContractVersion, Revision, canonical_json_bytes, sha256_hex,
 };
@@ -179,6 +189,16 @@ pub enum BootstrapCompileError {
         /// Artifact whose digest was invalidated.
         artifact: &'static str,
     },
+    /// A support row claims stronger support than its exact domain evidence allows.
+    #[error("unsupported support claim {claim} in {source_id}: {detail}")]
+    UnsupportedSupportClaim {
+        /// Source owner/identity.
+        source_id: String,
+        /// Claim that exceeds its evidence.
+        claim: String,
+        /// Public reason for the rejection.
+        detail: &'static str,
+    },
 }
 
 fn text(value: &str, source: String, field: &'static str) -> Result<(), BootstrapCompileError> {
@@ -325,6 +345,12 @@ pub struct CurrentSystemEvidenceSource {
     pub records: Vec<EvidenceRecord>,
     /// Explicitly uncovered domains.
     pub unavailable_domains: Vec<String>,
+    /// Exactly one observation disposition per I0.5 domain, imported without copy.
+    #[schemars(with = "Vec<serde_json::Value>")]
+    pub domain_coverage: Vec<DomainCoverage>,
+    /// Capability support claims bound to the coverage above; never decided here.
+    #[schemars(with = "Vec<serde_json::Value>")]
+    pub support_rows: Vec<CapabilitySupportRow>,
 }
 
 /// Immutable deterministic `CurrentSystemEvidenceSnapshot`.
@@ -349,6 +375,12 @@ pub struct CurrentSystemEvidenceSnapshot {
     pub records: Vec<EvidenceRecord>,
     /// Explicitly unavailable domains.
     pub unavailable_domains: Vec<String>,
+    /// Exactly one observation disposition per I0.5 domain, imported without copy.
+    #[schemars(with = "Vec<serde_json::Value>")]
+    pub domain_coverage: Vec<DomainCoverage>,
+    /// Capability support claims bound to the coverage above; never decided here.
+    #[schemars(with = "Vec<serde_json::Value>")]
+    pub support_rows: Vec<CapabilitySupportRow>,
     /// Content address of all preceding fields.
     pub snapshot_sha256: String,
 }
@@ -384,6 +416,16 @@ impl CurrentSystemEvidenceSnapshot {
         )?;
         validate_records(&self.records, "snapshot")?;
         exact_strings(&self.unavailable_domains, "snapshot", "unavailable_domains")?;
+        validate_conformance_coverage(&self.domain_coverage, "snapshot")?;
+        validate_support_claim_set(&self.support_rows)
+            .map_err(|error| conformance_error("snapshot", &error))?;
+        for row in &self.support_rows {
+            validate_capability_support_row(row)
+                .map_err(|error| conformance_error("snapshot", &error))?;
+            validate_capability_support_row_against_coverage(row, &self.domain_coverage)
+                .map_err(|error| conformance_error("snapshot", &error))?;
+        }
+        enforce_support_ceiling(&self.support_rows, &self.domain_coverage, "snapshot")?;
         digest(
             &self.snapshot_sha256,
             "snapshot".to_owned(),
@@ -409,6 +451,73 @@ fn validate_records(records: &[EvidenceRecord], source: &str) -> Result<(), Boot
             return Err(BootstrapCompileError::ConflictingIdentity {
                 source_id: source.to_owned(),
                 identity: record.key.clone(),
+            });
+        }
+    }
+    Ok(())
+}
+
+fn conformance_error(source: &str, error: &ConformanceContractError) -> BootstrapCompileError {
+    BootstrapCompileError::ProviderValidation {
+        provider: "eliot-conformance-contracts",
+        detail: format!("{source}: {error}"),
+    }
+}
+
+fn validate_conformance_coverage(
+    coverage: &[DomainCoverage],
+    source: &str,
+) -> Result<(), BootstrapCompileError> {
+    validate_domain_coverage(coverage).map_err(|error| conformance_error(source, &error))
+}
+
+/// Bootstrap-owned ceiling over the owner-neutral validators.
+///
+/// The conformance crate proves structural shape: exactly one row per domain,
+/// intrinsic row validity, and row-against-coverage consistency. This compiler
+/// additionally refuses to serialize two promotions that structure alone cannot
+/// catch: an `EXECUTED` execution claim without `OBSERVED` coverage of the
+/// claim domain, and a current-behavior support (`CURRENT_VERIFIED`, `PARTIAL`,
+/// `DEGRADED`) without `OBSERVED` coverage of the claim domain. Observation
+/// state is only ever compared here; it is never copied into a maturity,
+/// support, or execution field. `NOT_RUNNING` passes through as an honest local
+/// observation, never as a global failure and never as support.
+fn enforce_support_ceiling(
+    rows: &[CapabilitySupportRow],
+    coverage: &[DomainCoverage],
+    source: &str,
+) -> Result<(), BootstrapCompileError> {
+    for row in rows {
+        let Some(claim_domain) = row.claim_domain else {
+            continue;
+        };
+        let Some(observed) = coverage.iter().find(|entry| entry.domain == claim_domain) else {
+            return Err(BootstrapCompileError::InvalidExactArray {
+                source_id: source.to_owned(),
+                field: "domain_coverage",
+                detail: "claim domain has no coverage row",
+            });
+        };
+        let is_observed = observed.state == SupportObservationState::Observed;
+        if row.evidence_execution_status == EvidenceExecutionStatus::Executed && !is_observed {
+            return Err(BootstrapCompileError::UnsupportedSupportClaim {
+                source_id: source.to_owned(),
+                claim: row.support_claim_ref.clone(),
+                detail: "EXECUTED evidence requires OBSERVED coverage of the claim domain",
+            });
+        }
+        if !is_observed
+            && matches!(
+                row.implementation_support,
+                ImplementationSupport::CurrentVerified
+                    | ImplementationSupport::Partial
+                    | ImplementationSupport::Degraded
+            )
+        {
+            return Err(BootstrapCompileError::UnsupportedSupportClaim {
+                source_id: source.to_owned(),
+                claim: row.support_claim_ref.clone(),
+                detail: "current-behavior support requires OBSERVED coverage of the claim domain; source-only evidence stays CURRENT_UNVERIFIED at most",
             });
         }
     }
@@ -449,6 +558,11 @@ impl CurrentSystemEvidenceCompiler {
             "unavailable_domains",
         )?;
         validate_records(&input.records, &source_id)?;
+        let domain_coverage = canonicalize_domain_coverage(input.domain_coverage)
+            .map_err(|error| conformance_error(&source_id, &error))?;
+        let support_rows = canonicalize_support_claim_set(input.support_rows, &domain_coverage)
+            .map_err(|error| conformance_error(&source_id, &error))?;
+        enforce_support_ceiling(&support_rows, &domain_coverage, &source_id)?;
 
         let mut records = input.records;
         records.sort_by(|left, right| left.key.cmp(&right.key));
@@ -464,6 +578,8 @@ impl CurrentSystemEvidenceCompiler {
             external_state_root: input.external_state_root,
             records,
             unavailable_domains,
+            domain_coverage,
+            support_rows,
             snapshot_sha256: String::new(),
         };
         snapshot.snapshot_sha256 = content_digest(&snapshot, "snapshot", |value| {
@@ -472,6 +588,72 @@ impl CurrentSystemEvidenceCompiler {
         snapshot.validate()?;
         Ok(snapshot)
     }
+
+    /// Explicit legacy import of a flat v1 evidence source.
+    ///
+    /// Old flat bytes carry no domain coverage and no support rows. This
+    /// disposition names that gap instead of reinterpreting it: every one of
+    /// the five domains becomes `UNKNOWN` with the legacy import attributed in
+    /// its handles, and no support row is minted, so the ceiling is vacuous and
+    /// no stronger than the exact evidence. A legacy `VerifierBacked` record
+    /// label is preserved byte-identically on its record; it is never mapped
+    /// into `EXECUTED` or `CURRENT_VERIFIED`.
+    pub fn compile_legacy_flat_partial(
+        source: SourceProjection<LegacyFlatEvidenceSource>,
+    ) -> Result<CurrentSystemEvidenceSnapshot, BootstrapCompileError> {
+        let (source_id, revision, input) = require(source)?;
+        let domain_coverage = EvidenceDomain::ALL
+            .map(|domain| DomainCoverage {
+                contract_version: CONFORMANCE_CONTRACT_VERSION,
+                domain,
+                state: SupportObservationState::Unknown,
+                source_handles: vec!["legacy-flat:v1".to_owned()],
+                evidence_refs: vec![format!("legacy-source:{source_id}@{revision}")],
+                blind_boundaries: Vec::new(),
+                observed_at_ms: None,
+                expires_at_ms: None,
+                invalidation_set: vec!["legacy-flat-import:v1".to_owned()],
+            })
+            .to_vec();
+        Self::compile(SourceProjection {
+            source_id: source_id.clone(),
+            revision: revision.clone(),
+            status: SourceStatus::Complete,
+            value: Some(CurrentSystemEvidenceSource {
+                normative_pair: input.normative_pair,
+                selected_repository_root: input.selected_repository_root,
+                selected_source_head: input.selected_source_head,
+                dirty_delta_artifact_ref: input.dirty_delta_artifact_ref,
+                external_state_root: input.external_state_root,
+                records: input.records,
+                unavailable_domains: input.unavailable_domains,
+                domain_coverage,
+                support_rows: Vec::new(),
+            }),
+        })
+    }
+}
+
+/// Legacy flat v1 evidence source: the exact pre-migration wire shape without
+/// five-domain coverage or support rows. Old bytes deserialize here explicitly;
+/// they are never silently reinterpreted as complete five-domain evidence.
+#[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct LegacyFlatEvidenceSource {
+    /// Normative pair bound to this observation.
+    pub normative_pair: NormativePair,
+    /// Selected repository root identity, never discovered by this crate.
+    pub selected_repository_root: String,
+    /// Selected source head identity.
+    pub selected_source_head: String,
+    /// Dirty-tree evidence artifact, if the source owner captured one.
+    pub dirty_delta_artifact_ref: Option<String>,
+    /// External state root evidence.
+    pub external_state_root: String,
+    /// Exact source/runtime/data/integration observation records.
+    pub records: Vec<EvidenceRecord>,
+    /// Explicitly uncovered domains.
+    pub unavailable_domains: Vec<String>,
 }
 
 /// Input to the bootstrap rule catalogue compiler.
@@ -1397,6 +1579,142 @@ mod tests {
         Ok(capture::load_normative_pair(&root)?)
     }
 
+    fn observed_source_coverage() -> DomainCoverage {
+        DomainCoverage {
+            contract_version: CONFORMANCE_CONTRACT_VERSION,
+            domain: EvidenceDomain::Source,
+            state: SupportObservationState::Observed,
+            source_handles: vec!["fixture:git".to_owned()],
+            evidence_refs: vec!["fixture:head".to_owned()],
+            blind_boundaries: Vec::new(),
+            observed_at_ms: Some(1),
+            expires_at_ms: None,
+            invalidation_set: vec!["fixture:invalidate".to_owned()],
+        }
+    }
+
+    fn unknown_coverage(domain: EvidenceDomain) -> DomainCoverage {
+        DomainCoverage {
+            contract_version: CONFORMANCE_CONTRACT_VERSION,
+            domain,
+            state: SupportObservationState::Unknown,
+            source_handles: Vec::new(),
+            evidence_refs: Vec::new(),
+            blind_boundaries: Vec::new(),
+            observed_at_ms: None,
+            expires_at_ms: None,
+            invalidation_set: Vec::new(),
+        }
+    }
+
+    fn not_running_coverage(domain: EvidenceDomain) -> DomainCoverage {
+        DomainCoverage {
+            contract_version: CONFORMANCE_CONTRACT_VERSION,
+            domain,
+            state: SupportObservationState::NotRunning,
+            source_handles: vec!["fixture:capture".to_owned()],
+            evidence_refs: Vec::new(),
+            blind_boundaries: Vec::new(),
+            observed_at_ms: Some(1),
+            expires_at_ms: None,
+            invalidation_set: vec!["fixture:invalidate".to_owned()],
+        }
+    }
+
+    fn stale_coverage(domain: EvidenceDomain) -> DomainCoverage {
+        DomainCoverage {
+            contract_version: CONFORMANCE_CONTRACT_VERSION,
+            domain,
+            state: SupportObservationState::Stale,
+            source_handles: vec!["fixture:capture".to_owned()],
+            evidence_refs: vec!["fixture:stale-proof".to_owned()],
+            blind_boundaries: Vec::new(),
+            observed_at_ms: Some(1),
+            expires_at_ms: None,
+            invalidation_set: vec!["fixture:invalidate".to_owned()],
+        }
+    }
+
+    fn conflicted_coverage(domain: EvidenceDomain) -> DomainCoverage {
+        DomainCoverage {
+            contract_version: CONFORMANCE_CONTRACT_VERSION,
+            domain,
+            state: SupportObservationState::Conflicted,
+            source_handles: vec![
+                "fixture:capture-a".to_owned(),
+                "fixture:capture-b".to_owned(),
+            ],
+            evidence_refs: vec![
+                "fixture:conflict-a".to_owned(),
+                "fixture:conflict-b".to_owned(),
+            ],
+            blind_boundaries: Vec::new(),
+            observed_at_ms: Some(1),
+            expires_at_ms: None,
+            invalidation_set: vec!["fixture:invalidate".to_owned()],
+        }
+    }
+
+    fn fixture_coverage() -> Vec<DomainCoverage> {
+        vec![
+            observed_source_coverage(),
+            unknown_coverage(EvidenceDomain::Build),
+            not_running_coverage(EvidenceDomain::Runtime),
+            unknown_coverage(EvidenceDomain::Store),
+            unknown_coverage(EvidenceDomain::Integrations),
+        ]
+    }
+
+    fn support_row(
+        domain: EvidenceDomain,
+        claim: &str,
+        observation: SupportObservationState,
+        support: ImplementationSupport,
+        execution: EvidenceExecutionStatus,
+    ) -> CapabilitySupportRow {
+        CapabilitySupportRow {
+            contract_version: CONFORMANCE_CONTRACT_VERSION,
+            contract_ref: "contract:fixture:v1".to_owned(),
+            support_claim_ref: claim.to_owned(),
+            scope_ref: "scope:fixture".to_owned(),
+            claim_domain: Some(domain),
+            required_dependency_domains: if domain == EvidenceDomain::Source {
+                vec![domain]
+            } else {
+                vec![EvidenceDomain::Source, domain]
+            },
+            support_observation_state: observation,
+            contract_maturity: ContractMaturity::Compatible,
+            implementation_support: support,
+            evidence_execution_status: execution,
+            proof_profile_ref: None,
+            source_handles: vec!["fixture:owner".to_owned()],
+            evidence_refs: Vec::new(),
+            blind_boundaries: Vec::new(),
+            invalidation_set: vec!["fixture:invalidate".to_owned()],
+            compatibility_rule_ref: None,
+            not_applicable_reason_ref: None,
+            evaluated_at_ms: 2,
+        }
+    }
+
+    fn verified_support_row(domain: EvidenceDomain, claim: &str) -> CapabilitySupportRow {
+        CapabilitySupportRow {
+            contract_maturity: ContractMaturity::Stable,
+            implementation_support: ImplementationSupport::CurrentVerified,
+            evidence_execution_status: EvidenceExecutionStatus::Executed,
+            proof_profile_ref: Some("fixture:proof".to_owned()),
+            evidence_refs: vec!["fixture:proof-evidence".to_owned()],
+            ..support_row(
+                domain,
+                claim,
+                SupportObservationState::Observed,
+                ImplementationSupport::CurrentVerified,
+                EvidenceExecutionStatus::Executed,
+            )
+        }
+    }
+
     fn evidence_source() -> SourceProjection<CurrentSystemEvidenceSource> {
         SourceProjection::complete(
             "current-system",
@@ -1414,6 +1732,8 @@ mod tests {
                     evaluation: EvidenceEvaluation::Screened,
                 }],
                 unavailable_domains: vec!["runtime".to_owned()],
+                domain_coverage: fixture_coverage(),
+                support_rows: Vec::new(),
             },
         )
     }
@@ -1681,6 +2001,388 @@ mod tests {
     #[test]
     fn contract_schema_is_available() -> Result<(), Box<dyn std::error::Error>> {
         assert!(!contract_identity()?.shape_sha256.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn five_domains_present_and_permutation_deterministic() -> Result<(), Box<dyn std::error::Error>>
+    {
+        let mut forward = evidence_source();
+        let value = forward
+            .value
+            .as_mut()
+            .ok_or("complete evidence fixture must carry a value")?;
+        value.support_rows = vec![
+            support_row(
+                EvidenceDomain::Source,
+                "claim:source:v1",
+                SupportObservationState::Observed,
+                ImplementationSupport::CurrentUnverified,
+                EvidenceExecutionStatus::NotExecuted,
+            ),
+            support_row(
+                EvidenceDomain::Runtime,
+                "claim:runtime:v1",
+                SupportObservationState::NotRunning,
+                ImplementationSupport::CurrentUnverified,
+                EvidenceExecutionStatus::NotExecuted,
+            ),
+        ];
+        let mut shuffled = forward.clone();
+        let shuffled_value = shuffled
+            .value
+            .as_mut()
+            .ok_or("complete evidence fixture must carry a value")?;
+        shuffled_value.domain_coverage.reverse();
+        shuffled_value.support_rows.reverse();
+        shuffled_value.records.reverse();
+
+        let first = CurrentSystemEvidenceCompiler::compile(forward)?;
+        let second = CurrentSystemEvidenceCompiler::compile(shuffled)?;
+        assert_eq!(first, second);
+        assert!(
+            first
+                .domain_coverage
+                .iter()
+                .map(|row| row.domain)
+                .eq(EvidenceDomain::ALL)
+        );
+        first.validate()?;
+        Ok(())
+    }
+
+    #[test]
+    fn missing_and_duplicate_domains_fail_closed() {
+        let mut missing = evidence_source();
+        if let Some(value) = missing.value.as_mut() {
+            value.domain_coverage.pop();
+        }
+        assert!(matches!(
+            CurrentSystemEvidenceCompiler::compile(missing),
+            Err(BootstrapCompileError::ProviderValidation { .. })
+        ));
+
+        let mut duplicate = evidence_source();
+        if let Some(value) = duplicate.value.as_mut() {
+            let store = unknown_coverage(EvidenceDomain::Store);
+            value.domain_coverage[4] = store;
+        }
+        assert!(matches!(
+            CurrentSystemEvidenceCompiler::compile(duplicate),
+            Err(BootstrapCompileError::ProviderValidation { .. })
+        ));
+    }
+
+    #[test]
+    fn source_only_snapshot_cannot_claim_runtime_or_store() {
+        let mut source_only = evidence_source();
+        if let Some(value) = source_only.value.as_mut() {
+            value.support_rows = vec![support_row(
+                EvidenceDomain::Runtime,
+                "claim:runtime:v1",
+                SupportObservationState::Observed,
+                ImplementationSupport::CurrentUnverified,
+                EvidenceExecutionStatus::NotExecuted,
+            )];
+        }
+        assert!(matches!(
+            CurrentSystemEvidenceCompiler::compile(source_only),
+            Err(BootstrapCompileError::ProviderValidation { .. })
+        ));
+
+        let mut forged_verified = evidence_source();
+        if let Some(value) = forged_verified.value.as_mut() {
+            value.support_rows = vec![verified_support_row(
+                EvidenceDomain::Store,
+                "claim:store:v1",
+            )];
+        }
+        assert!(matches!(
+            CurrentSystemEvidenceCompiler::compile(forged_verified),
+            Err(BootstrapCompileError::ProviderValidation { .. }
+                | BootstrapCompileError::UnsupportedSupportClaim { .. })
+        ));
+    }
+
+    #[test]
+    fn observed_without_execution_cannot_become_verified() {
+        let mut observed_not_executed = evidence_source();
+        if let Some(value) = observed_not_executed.value.as_mut() {
+            let mut row = verified_support_row(EvidenceDomain::Source, "claim:source:v1");
+            row.evidence_execution_status = EvidenceExecutionStatus::NotExecuted;
+            row.implementation_support = ImplementationSupport::CurrentVerified;
+            row.proof_profile_ref = Some("fixture:proof".to_owned());
+            value.support_rows = vec![row];
+        }
+        assert!(matches!(
+            CurrentSystemEvidenceCompiler::compile(observed_not_executed),
+            Err(BootstrapCompileError::ProviderValidation { .. })
+        ));
+    }
+
+    #[test]
+    fn not_running_is_valid_locally_and_distinct_from_unavailable_and_unknown()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let snapshot = CurrentSystemEvidenceCompiler::compile(evidence_source())?;
+        snapshot.validate()?;
+        let runtime = snapshot
+            .domain_coverage
+            .iter()
+            .find(|row| row.domain == EvidenceDomain::Runtime)
+            .ok_or("runtime coverage must be present")?;
+        assert_eq!(runtime.state, SupportObservationState::NotRunning);
+        assert_eq!(
+            serde_json::to_value(SupportObservationState::NotRunning)?,
+            serde_json::to_value("NOT_RUNNING")?
+        );
+        assert_ne!(
+            serde_json::to_value(SupportObservationState::NotRunning)?,
+            serde_json::to_value(SupportObservationState::Unavailable)?
+        );
+        assert_ne!(
+            serde_json::to_value(SupportObservationState::NotRunning)?,
+            serde_json::to_value(SupportObservationState::Unknown)?
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn stale_evidence_invalidates_only_dependent_rows() -> Result<(), Box<dyn std::error::Error>> {
+        let mut source = evidence_source();
+        let value = source
+            .value
+            .as_mut()
+            .ok_or("complete evidence fixture must carry a value")?;
+        for row in &mut value.domain_coverage {
+            if row.domain == EvidenceDomain::Store {
+                *row = stale_coverage(EvidenceDomain::Store);
+            }
+        }
+        value.support_rows = vec![
+            support_row(
+                EvidenceDomain::Source,
+                "claim:source:v1",
+                SupportObservationState::Observed,
+                ImplementationSupport::CurrentUnverified,
+                EvidenceExecutionStatus::NotExecuted,
+            ),
+            support_row(
+                EvidenceDomain::Store,
+                "claim:store:v1",
+                SupportObservationState::Stale,
+                ImplementationSupport::Stale,
+                EvidenceExecutionStatus::NotExecuted,
+            ),
+        ];
+        let snapshot = CurrentSystemEvidenceCompiler::compile(source)?;
+        snapshot.validate()?;
+
+        let mut promoted = evidence_source();
+        let promoted_value = promoted
+            .value
+            .as_mut()
+            .ok_or("complete evidence fixture must carry a value")?;
+        for row in &mut promoted_value.domain_coverage {
+            if row.domain == EvidenceDomain::Store {
+                *row = stale_coverage(EvidenceDomain::Store);
+            }
+        }
+        promoted_value.support_rows = vec![support_row(
+            EvidenceDomain::Store,
+            "claim:store:v1",
+            SupportObservationState::Stale,
+            ImplementationSupport::CurrentUnverified,
+            EvidenceExecutionStatus::NotExecuted,
+        )];
+        assert!(matches!(
+            CurrentSystemEvidenceCompiler::compile(promoted),
+            Err(BootstrapCompileError::ProviderValidation { .. })
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn conflicting_identities_remain_conflicted() -> Result<(), Box<dyn std::error::Error>> {
+        let mut source = evidence_source();
+        let value = source
+            .value
+            .as_mut()
+            .ok_or("complete evidence fixture must carry a value")?;
+        for row in &mut value.domain_coverage {
+            if row.domain == EvidenceDomain::Source {
+                *row = conflicted_coverage(EvidenceDomain::Source);
+            }
+        }
+        value.support_rows = vec![support_row(
+            EvidenceDomain::Source,
+            "claim:source:v1",
+            SupportObservationState::Conflicted,
+            ImplementationSupport::CurrentUnverified,
+            EvidenceExecutionStatus::NotExecuted,
+        )];
+        let snapshot = CurrentSystemEvidenceCompiler::compile(source)?;
+        snapshot.validate()?;
+        assert!(
+            snapshot
+                .domain_coverage
+                .iter()
+                .any(|row| row.state == SupportObservationState::Conflicted)
+        );
+
+        let mut promoted = evidence_source();
+        let promoted_value = promoted
+            .value
+            .as_mut()
+            .ok_or("complete evidence fixture must carry a value")?;
+        for row in &mut promoted_value.domain_coverage {
+            if row.domain == EvidenceDomain::Source {
+                *row = conflicted_coverage(EvidenceDomain::Source);
+            }
+        }
+        promoted_value.support_rows = vec![support_row(
+            EvidenceDomain::Source,
+            "claim:source:v1",
+            SupportObservationState::Observed,
+            ImplementationSupport::CurrentUnverified,
+            EvidenceExecutionStatus::NotExecuted,
+        )];
+        assert!(matches!(
+            CurrentSystemEvidenceCompiler::compile(promoted),
+            Err(BootstrapCompileError::ProviderValidation { .. })
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn forged_verified_and_executed_rows_are_rejected() {
+        let mut forged_verified = evidence_source();
+        if let Some(value) = forged_verified.value.as_mut() {
+            value.support_rows = vec![verified_support_row(
+                EvidenceDomain::Runtime,
+                "claim:runtime:v1",
+            )];
+        }
+        assert!(matches!(
+            CurrentSystemEvidenceCompiler::compile(forged_verified),
+            Err(BootstrapCompileError::ProviderValidation { .. }
+                | BootstrapCompileError::UnsupportedSupportClaim { .. })
+        ));
+
+        let mut forged_execution = evidence_source();
+        if let Some(value) = forged_execution.value.as_mut() {
+            value.support_rows = vec![support_row(
+                EvidenceDomain::Store,
+                "claim:store:v1",
+                SupportObservationState::Unknown,
+                ImplementationSupport::CurrentUnverified,
+                EvidenceExecutionStatus::Executed,
+            )];
+        }
+        assert!(matches!(
+            CurrentSystemEvidenceCompiler::compile(forged_execution),
+            Err(BootstrapCompileError::UnsupportedSupportClaim { .. })
+        ));
+    }
+
+    #[test]
+    fn legacy_flat_import_is_partial_unknown_never_complete()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let legacy = SourceProjection::complete(
+            "current-system",
+            "revision-1",
+            LegacyFlatEvidenceSource {
+                normative_pair: pair(),
+                selected_repository_root: "repo-root".to_owned(),
+                selected_source_head: "head-1".to_owned(),
+                dirty_delta_artifact_ref: None,
+                external_state_root: "state-root".to_owned(),
+                records: vec![EvidenceRecord {
+                    key: "source.head".to_owned(),
+                    value: "head-1".to_owned(),
+                    evidence_ref: "capture-1".to_owned(),
+                    evaluation: EvidenceEvaluation::VerifierBacked,
+                }],
+                unavailable_domains: vec!["runtime".to_owned()],
+            },
+        );
+        let snapshot = CurrentSystemEvidenceCompiler::compile_legacy_flat_partial(legacy)?;
+        snapshot.validate()?;
+        assert_eq!(snapshot.domain_coverage.len(), EvidenceDomain::ALL.len());
+        assert!(
+            snapshot
+                .domain_coverage
+                .iter()
+                .all(|row| row.state == SupportObservationState::Unknown)
+        );
+        assert!(snapshot.support_rows.is_empty());
+        assert_eq!(
+            snapshot.records[0].evaluation,
+            EvidenceEvaluation::VerifierBacked
+        );
+        assert!(
+            !snapshot
+                .domain_coverage
+                .iter()
+                .all(|row| row.state == SupportObservationState::Observed)
+        );
+        for row in &snapshot.support_rows {
+            assert_ne!(
+                row.implementation_support,
+                ImplementationSupport::CurrentVerified
+            );
+            assert_ne!(
+                row.evidence_execution_status,
+                EvidenceExecutionStatus::Executed
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn digest_is_sensitive_to_expiry_and_invalidation() -> Result<(), Box<dyn std::error::Error>> {
+        let baseline = CurrentSystemEvidenceCompiler::compile(evidence_source())?;
+        let mut expired = evidence_source();
+        let expired_value = expired
+            .value
+            .as_mut()
+            .ok_or("complete evidence fixture must carry a value")?;
+        let source_row = expired_value
+            .domain_coverage
+            .iter_mut()
+            .find(|row| row.domain == EvidenceDomain::Source)
+            .ok_or("source coverage must be present")?;
+        source_row.expires_at_ms = Some(1_000);
+        let expired_snapshot = CurrentSystemEvidenceCompiler::compile(expired)?;
+        assert_ne!(baseline.snapshot_sha256, expired_snapshot.snapshot_sha256);
+
+        let mut invalidated = evidence_source();
+        let invalidated_value = invalidated
+            .value
+            .as_mut()
+            .ok_or("complete evidence fixture must carry a value")?;
+        let source_row = invalidated_value
+            .domain_coverage
+            .iter_mut()
+            .find(|row| row.domain == EvidenceDomain::Source)
+            .ok_or("source coverage must be present")?;
+        source_row.invalidation_set = vec!["fixture:rotated".to_owned()];
+        let invalidated_snapshot = CurrentSystemEvidenceCompiler::compile(invalidated)?;
+        assert_ne!(
+            baseline.snapshot_sha256,
+            invalidated_snapshot.snapshot_sha256
+        );
+
+        let mut tampered = baseline.clone();
+        let tampered_row = tampered
+            .domain_coverage
+            .iter_mut()
+            .find(|row| row.domain == EvidenceDomain::Source)
+            .ok_or("source coverage must be present")?;
+        tampered_row.invalidation_set = vec!["tampered".to_owned()];
+        assert!(matches!(
+            tampered.validate(),
+            Err(BootstrapCompileError::DigestMismatch { .. })
+        ));
         Ok(())
     }
 }
