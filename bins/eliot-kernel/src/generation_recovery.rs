@@ -67,8 +67,20 @@ impl OrsGenerationCoordinator {
                 return Err("ORS route projection has invalid committed epochs".to_owned());
             }
         }
+        // Lineage-aware bridge (Implements #64): the scalar ORS cutover
+        // contour carries only the sequence; the canonical service epoch keeps
+        // its current lineage and advances to the maximal committed sequence.
+        // Cross-lineage promotion never occurs here; `synchronize` fails
+        // closed on lineage mismatch or regression.
+        let current_lineage = service.authority_epoch().lineage_id.clone();
+        let canonical = eliot_contracts::EpochId::new(
+            current_lineage,
+            std::num::NonZeroU64::new(epoch_value)
+                .ok_or_else(|| "committed cutover epoch must be non-zero".to_owned())?,
+        )
+        .map_err(|error| error.to_string())?;
         service
-            .synchronize_authority_epoch(epoch)
+            .synchronize_authority_epoch(canonical)
             .map_err(|error| error.to_string())?;
         let mut recovered = GenerationRouter::at_epoch(epoch).map_err(|error| error.to_string())?;
         for snapshot in &snapshots {
@@ -116,8 +128,19 @@ impl OrsGenerationCoordinator {
         if committed.record().state != GenerationCutoverState::Committed {
             return Err("ORS did not return a committed cutover".to_owned());
         }
+        // Same lineage-aware bridge as `recover`: project the scalar decision
+        // sequence onto the service's current lineage; cross-lineage or
+        // regression fails closed inside `synchronize`.
+        let decision_sequence = decision.new_epoch().value();
+        let decision_lineage = service.authority_epoch().lineage_id.clone();
+        let decision_canonical = eliot_contracts::EpochId::new(
+            decision_lineage,
+            std::num::NonZeroU64::new(decision_sequence)
+                .ok_or_else(|| "cutover epoch must be non-zero".to_owned())?,
+        )
+        .map_err(|error| error.to_string())?;
         service
-            .synchronize_authority_epoch(decision.new_epoch())
+            .synchronize_authority_epoch(decision_canonical)
             .map_err(|error| error.to_string())?;
         update_handshake_policy(policy, &candidate)?;
         *generations = candidate;
@@ -145,8 +168,23 @@ pub(crate) fn update_handshake_policy(
             }
         }
         policy.module_generation.generation = route.active_generation();
+        // Project the scalar route sequence onto the policy's current lineage
+        // to obtain the canonical fence epoch; the scalar route contour itself
+        // stays untouched for the residual `GenerationRouter`.
+        let policy_lineage = policy
+            .module_generation
+            .state_fence
+            .authority_epoch
+            .lineage_id
+            .clone();
+        let policy_epoch = eliot_contracts::EpochId::new(
+            policy_lineage,
+            std::num::NonZeroU64::new(route.authority_epoch().value())
+                .ok_or_else(|| "route epoch must be non-zero".to_owned())?,
+        )
+        .map_err(|error| error.to_string())?;
         policy.module_generation.state_fence =
-            StateFence::new(route.authority_epoch(), route.active_generation());
+            StateFence::new(policy_epoch, route.active_generation());
         policy.config_snapshot = serde_json::json!({
             "service": SERVICE_NAME,
             "protocol": PROTOCOL_VERSION,

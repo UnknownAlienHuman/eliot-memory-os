@@ -725,7 +725,7 @@ impl KernelComposition {
                 r.state == eliot_ors::StoreRebindReplayState::Committed
                     && r.requirement_digest == requirement_digest
                     && r.generation == requirement.state_fence.resource_generation.value()
-                    && r.authority_epoch == requirement.state_fence.authority_epoch.value()
+                    && r.authority_epoch == requirement.state_fence.authority_epoch.sequence.get()
             })
             .cloned()
             .collect();
@@ -757,8 +757,11 @@ impl KernelComposition {
                         )
                     });
                 if let Some(record) = non_zero_latest.cloned() {
-                    let receipt = store_rebind_receipt_from_ors_record(&record)
-                        .map_err(|error| error.to_string())?;
+                    let receipt = store_rebind_receipt_from_ors_record(
+                        &record,
+                        &requirement.state_fence.authority_epoch,
+                    )
+                    .map_err(|error| error.to_string())?;
                     service
                         .restore_store_rebind_for_recovery(
                             receipt.clone(),
@@ -787,7 +790,8 @@ impl KernelComposition {
             return Ok(None);
         };
         let receipt =
-            store_rebind_receipt_from_ors_record(&record).map_err(|error| error.to_string())?;
+            store_rebind_receipt_from_ors_record(&record, &requirement.state_fence.authority_epoch)
+                .map_err(|error| error.to_string())?;
         service
             .restore_store_rebind_for_recovery(receipt.clone(), record.request_digest.clone())
             .map_err(|e| e.to_string())?;
@@ -1057,7 +1061,7 @@ impl KernelComposition {
                     .map_err(|e| KernelBuildError::Service(e.to_string()))?,
             );
             hasher.update(handoff.generation.value().to_le_bytes());
-            hasher.update(handoff.authority_epoch.value().to_le_bytes());
+            hasher.update(handoff.authority_epoch.sequence.get().to_le_bytes());
             hasher.update(
                 handoff
                     .requirement
@@ -1156,7 +1160,7 @@ impl KernelComposition {
             .route(&route_scope)
             .map_err(|e| KernelBuildError::Core(e.to_string()))?
             .clone();
-        if route.authority_epoch() != requirement.authority_epoch()
+        if route.authority_epoch().value() != requirement.authority_epoch().sequence.get()
             || route.active_generation() != requirement.store_generation
             || requirement.route_identity.as_str() != STORE_BRIDGE_ROUTE
         {
@@ -1190,7 +1194,10 @@ impl KernelComposition {
                         "Store rebind superseded by newer durable commit".to_owned(),
                     ));
                 }
-                Some(store_rebind_receipt_from_ors_record(&existing)?)
+                Some(store_rebind_receipt_from_ors_record(
+                    &existing,
+                    &handoff.authority_epoch,
+                )?)
             } else {
                 if !store_rebind_record_matches(
                     &existing,
@@ -1318,7 +1325,7 @@ impl KernelComposition {
                 process_image_path: handoff.process_binding.process.image_path.clone(),
                 job_name: handoff.process_binding.job.as_str().to_owned(),
                 generation: handoff.generation.value(),
-                authority_epoch: handoff.authority_epoch.value(),
+                authority_epoch: handoff.authority_epoch.sequence.get(),
                 state: eliot_ors::StoreRebindReplayState::Pending,
                 receipt: None,
                 commit_order: 0,
@@ -1469,7 +1476,7 @@ impl KernelComposition {
                 process_image_path: handoff.process_binding.process.image_path.clone(),
                 job_name: handoff.process_binding.job.as_str().to_owned(),
                 generation: handoff.generation.value(),
-                authority_epoch: handoff.authority_epoch.value(),
+                authority_epoch: handoff.authority_epoch.sequence.get(),
                 state: eliot_ors::StoreRebindReplayState::Committed,
                 receipt: Some(receipt.request_digest.clone()),
                 commit_order: 0,
@@ -1783,13 +1790,16 @@ impl KernelComposition {
         if activation.candidate_binding_digest != candidate_digest
             || activation.authority_epoch != candidate.kernel_epoch
             || session.module_generation.module_id.as_str() != ACTIVE_DAEMON_CALLER
-            || session.authority_epoch != activation.authority_epoch.value()
+            || !session
+                .authority_epoch
+                .is_same_authority(&activation.authority_epoch)
             || session.module_generation.generation != activation.generation
             || process.accepted_generation().get() != session.module_generation.generation.value()
         {
             return Err(KernelServiceError::ReadinessNotProven);
         }
-        let state_fence = StateFence::new(activation.authority_epoch, activation.generation);
+        let state_fence =
+            StateFence::new(activation.authority_epoch.clone(), activation.generation);
         if session.module_generation.state_fence != state_fence {
             return Err(KernelServiceError::ReadinessNotProven);
         }
@@ -1862,7 +1872,7 @@ impl KernelComposition {
                 .map_err(|error| SupervisionLeaseAuthorityError::Contract(error.to_string()))?,
             activation_id: OperationIdentity::new(incarnation.activation_id.clone())?,
             activation_generation: contour.activation.generation,
-            kernel_epoch: contour.activation.authority_epoch,
+            kernel_epoch: contour.activation.authority_epoch.clone(),
             watchdog_epoch: AuthorityEpoch::new(incarnation.watchdog_epoch.sequence)
                 .map_err(|error| SupervisionLeaseAuthorityError::Contract(error.to_string()))?,
             generation_binding: contour.generation_binding.clone(),
@@ -2281,7 +2291,7 @@ impl KernelComposition {
                 .map_err(|_| TransportError::SessionFenced)?,
         );
         hasher.update(receipt.generation.value().to_le_bytes());
-        hasher.update(receipt.authority_epoch.value().to_le_bytes());
+        hasher.update(receipt.authority_epoch.sequence.get().to_le_bytes());
         hasher.update(
             handoff
                 .requirement
@@ -2313,7 +2323,7 @@ impl KernelComposition {
         query: &eliot_kernel_service::StoreRebindQuery,
         record: &eliot_ors::StoreRebindReplayRecord,
     ) -> Result<(), TransportError> {
-        let receipt = store_rebind_receipt_from_ors_record(record)
+        let receipt = store_rebind_receipt_from_ors_record(record, &request.candidate.kernel_epoch)
             .map_err(|_| TransportError::SessionFenced)?;
         let candidate_digest = request
             .candidate

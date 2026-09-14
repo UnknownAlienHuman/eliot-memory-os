@@ -1044,7 +1044,10 @@ mod tests {
             "generation": generation,
             "authority_generation": authority_generation,
             "authority_state_fence": {
-                "authority_epoch": 1,
+                "authority_epoch": {
+                    "lineage_id": "550e8400-e29b-41d4-a716-446655440000",
+                    "sequence": 1
+                },
                 "resource_generation": authority_generation,
                 "task_revision": null,
                 "policy_revision": null,
