@@ -222,6 +222,18 @@ impl ProviderCapabilityContext {
                 ProviderCapabilityRouteError::Store("kernel owner state is unavailable".to_owned())
             })?
             .authority_epoch();
+        // Freshness gate: the durable row's admission epoch sequence must
+        // equal the live authority sequence, so restore observes fresh owner
+        // evidence and a stale admission fails closed as StaleEpoch (mapped
+        // to SessionFenced at the transport boundary). The row carries only
+        // the sequence (u64); lineage agreement rides the session fence
+        // checked at dispatch plus the owner's is_same_authority on the
+        // fresh live epoch below.
+        if row.authority_epoch != live_epoch.sequence.get() {
+            return Err(ProviderCapabilityRouteError::Capability(
+                ProviderCapabilityError::StaleEpoch,
+            ));
+        }
         let request = ProviderCapabilityRequest {
             claim_id: row.claim_id.as_str().to_owned(),
             attempt_id: row.attempt_id.as_str().to_owned(),
@@ -237,10 +249,27 @@ impl ProviderCapabilityContext {
         let expectation = ProviderCapabilityExpectation {
             current_route_revision: route_rev.to_owned(),
             current_capacity_revision: capacity_rev.to_owned(),
-            live_authority_epoch: live_epoch,
+            live_authority_epoch: live_epoch.clone(),
             revoked: false,
         };
-        verify_provider_capability(&request, &row, &expectation)?;
+        // W-A owner signature is the 7-parameter pure verifier
+        // (request, expectation, loaded attempt/operation/binding/executable,
+        // live epoch). The ORS claim row carries no executable-binding column
+        // by design in this slice (no write migration; see the owner module
+        // residual), so the presented executable digest rides per call: the
+        // owner shape-checks it as lowercase SHA-256 and the durable
+        // equality gate in this slice is the binding digest from the exact
+        // row above. The durable attempt/operation/binding come from the row
+        // and the epoch is the freshly re-queried live authority epoch.
+        verify_provider_capability(
+            &request,
+            &expectation,
+            row.attempt_id.as_str(),
+            row.operation_id.as_str(),
+            row.binding_digest.as_str(),
+            executable_digest,
+            &live_epoch,
+        )?;
         Ok(())
     }
 }
