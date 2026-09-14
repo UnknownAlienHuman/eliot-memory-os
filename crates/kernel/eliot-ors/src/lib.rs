@@ -39,6 +39,14 @@ pub use store::{
 pub const CONTRACT_VERSION: u16 = 1;
 /// Hard ceiling for one recovery page.
 pub const MAX_RECOVERY_PAGE: u16 = 256;
+/// Hard ceiling for one worker-replay suffix page and for the retained
+/// terminal-event window (T9-03 owner-backed replay).
+///
+/// Mirrors the [`MAX_RECOVERY_PAGE`] precedent: a replay suffix longer than
+/// this bound is rejected with [`OrsError::ProjectionLimitExceeded`] instead
+/// of being silently truncated, and retention pruning keeps at most this many
+/// terminally-acknowledged newest events.
+pub const MAX_REPLAY_PAGE: u16 = 256;
 /// Hard ceiling for one operation's retained process-evidence history.
 pub const MAX_PROCESS_EVIDENCE_READBACK: u16 = 256;
 /// Hard ceiling for ciphertext held inline by one ORS record.
