@@ -387,11 +387,22 @@ fn lowest_assertability(left: Assertability, right: Assertability) -> Assertabil
 #[allow(clippy::expect_used)]
 mod tests {
     use super::*;
-    use eliot_contracts::{AuthorityEpoch, ContractId, ResourceGeneration, SourceId};
+    use eliot_contracts::{ContractId, EpochId, EpochLineageId, ResourceGeneration, SourceId};
+    use std::num::NonZeroU64;
+
+    fn test_epoch(sequence: u64) -> EpochId {
+        let lineage = EpochLineageId::new("550e8400-e29b-41d4-a716-446655440000")
+            .expect("canonical test lineage-A");
+        EpochId::new(
+            lineage,
+            NonZeroU64::new(sequence).expect("non-zero test sequence"),
+        )
+        .expect("valid test epoch")
+    }
     use eliot_evidence::{EvidenceAuthority, EvidenceCoverage, Provenance, VerificationBinding};
 
     fn fence() -> StateFence {
-        StateFence::new(AuthorityEpoch::genesis(), ResourceGeneration::genesis())
+        StateFence::new(test_epoch(1), ResourceGeneration::genesis())
     }
 
     fn id(value: &str) -> ArtifactId {

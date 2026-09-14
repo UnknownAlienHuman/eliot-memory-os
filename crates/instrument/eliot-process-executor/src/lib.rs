@@ -1390,6 +1390,18 @@ mod tests {
         CancellationStatus, DispatchValidationContext, ExitDisposition, ProcessLifecycle,
     };
 
+    fn test_epoch(sequence: u64) -> eliot_contracts::EpochId {
+        use eliot_contracts::{EpochId, EpochLineageId};
+        use std::num::NonZeroU64;
+        let lineage = EpochLineageId::new("550e8400-e29b-41d4-a716-446655440000")
+            .expect("canonical test lineage-A");
+        EpochId::new(
+            lineage,
+            NonZeroU64::new(sequence).expect("non-zero test sequence"),
+        )
+        .expect("valid test epoch")
+    }
+
     fn block_on<F: Future>(future: F) -> F::Output {
         let mut future = std::pin::pin!(future);
         let waker = Waker::noop();
@@ -1522,7 +1534,7 @@ mod tests {
             EnvironmentProjection::default(),
             ResourceLimits::new(30_000, Some(10_000), Some(512_000_000), 4_096, 4_096, 4)?,
         )?;
-        let fence = FencingToken::new(1, generation, "fence-t2-s01-ok")?;
+        let fence = FencingToken::new(test_epoch(1), generation, "fence-t2-s01-ok")?;
         let mut authority = DispatchPermitAuthority::activate(
             DispatchAuthorityId::new("auth-t2-s01")?,
             KernelDispatchKey::from_secret_bytes([0x5a; 32])?,
@@ -1547,7 +1559,7 @@ mod tests {
                 monotonic_ns: Some(1),
             },
             fence,
-            1,
+            test_epoch(1),
             revisions(),
             41,
         )?;
@@ -1599,7 +1611,7 @@ mod tests {
             EnvironmentProjection::default(),
             ResourceLimits::new(30_000, Some(10_000), Some(512_000_000), 4_096, 4_096, 4)?,
         )?;
-        let fence = FencingToken::new(1, generation, "fence-t2-s01-sink-fail")?;
+        let fence = FencingToken::new(test_epoch(1), generation, "fence-t2-s01-sink-fail")?;
         let mut authority = DispatchPermitAuthority::activate(
             DispatchAuthorityId::new("auth-t2-s01")?,
             KernelDispatchKey::from_secret_bytes([0x5a; 32])?,
@@ -1624,7 +1636,7 @@ mod tests {
                 monotonic_ns: Some(1),
             },
             fence,
-            1,
+            test_epoch(1),
             revisions(),
             41,
         )?;
@@ -1646,7 +1658,7 @@ mod tests {
         let executable = r"C:\Windows\System32\cmd.exe";
         let working_directory = std::env::temp_dir().to_string_lossy().into_owned();
         let generation = Generation::new(1)?;
-        let fence = FencingToken::new(1, generation, "fence-t2-s01-bad")?;
+        let fence = FencingToken::new(test_epoch(1), generation, "fence-t2-s01-bad")?;
         let mut authority = DispatchPermitAuthority::activate(
             DispatchAuthorityId::new("auth-t2-s01")?,
             KernelDispatchKey::from_secret_bytes([0x5a; 32])?,
@@ -1794,7 +1806,7 @@ mod tests {
                 4,
             )?,
         )?;
-        let fence = FencingToken::new(1, generation, format!("fence-t2-s03-{op_tag}"))?;
+        let fence = FencingToken::new(test_epoch(1), generation, format!("fence-t2-s03-{op_tag}"))?;
         let mut authority = DispatchPermitAuthority::activate(
             DispatchAuthorityId::new(format!("auth-t2-s03-{op_tag}"))?,
             KernelDispatchKey::from_secret_bytes([0x5a; 32])?,
@@ -1819,7 +1831,7 @@ mod tests {
                 monotonic_ns: Some(1),
             },
             fence,
-            1,
+            test_epoch(1),
             revisions(),
             41,
         )?;
@@ -1955,7 +1967,7 @@ mod tests {
             EnvironmentProjection::default(),
             ResourceLimits::new(30_000, Some(10_000), Some(512_000_000), 4_096, 4_096, 4)?,
         )?;
-        let fence = FencingToken::new(1, generation, "fence-t2-s03-sink-fail")?;
+        let fence = FencingToken::new(test_epoch(1), generation, "fence-t2-s03-sink-fail")?;
         let mut authority = DispatchPermitAuthority::activate(
             DispatchAuthorityId::new("auth-t2-s03-sink-fail")?,
             KernelDispatchKey::from_secret_bytes([0x5a; 32])?,
@@ -1980,7 +1992,7 @@ mod tests {
                 monotonic_ns: Some(1),
             },
             fence,
-            1,
+            test_epoch(1),
             revisions(),
             41,
         )?;
@@ -2048,7 +2060,7 @@ mod tests {
                 max_descendants,
             )?,
         )?;
-        let fence = FencingToken::new(1, generation, format!("fence-t2-s04-{op_tag}"))?;
+        let fence = FencingToken::new(test_epoch(1), generation, format!("fence-t2-s04-{op_tag}"))?;
         let mut authority = DispatchPermitAuthority::activate(
             DispatchAuthorityId::new(format!("auth-t2-s04-{op_tag}"))?,
             KernelDispatchKey::from_secret_bytes([0x5a; 32])?,
@@ -2087,7 +2099,7 @@ mod tests {
                 monotonic_ns: Some(1),
             },
             fence,
-            1,
+            test_epoch(1),
             revisions(),
             41,
         )?;

@@ -10,6 +10,7 @@ description = "Bounded EBP/1 transport contract and Windows named-pipe adapter"
 test-support = []
 
 [dependencies]
+eliot-contracts.workspace = true
 eliot-platform.workspace = true
 eliot-platform-windows.workspace = true
 eliot-protocol.workspace = true

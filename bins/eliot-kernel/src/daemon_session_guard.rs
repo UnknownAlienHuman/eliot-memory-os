@@ -31,13 +31,15 @@ pub(crate) fn caller_binding(
     let principal_digest = stable_owner_principal_digest(
         stable_sid,
         session.module_generation.module_id.as_str(),
-        session.authority_epoch,
+        // INTENDED EpochId shape (B→A→C): session.authority_epoch is EpochId
+        // after B cutover; clone via is_same_authority threading.
+        &session.authority_epoch,
         generation,
     );
     let owner = ProcessOwnerBinding::new(
         session.module_generation.module_id.as_str(),
         principal_digest,
-        session.authority_epoch,
+        session.authority_epoch.clone(),
         generation,
     )
     .map_err(|_| TransportError::SessionFenced)?;

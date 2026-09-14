@@ -1,6 +1,6 @@
 //! Host↔Kernel protocol records.
 
-use eliot_contracts::{AuthorityEpoch, ResourceGeneration, StateFence, sha256_hex};
+use eliot_contracts::{AuthorityEpoch, EpochId, ResourceGeneration, StateFence, sha256_hex};
 use eliot_ipc::TransportError;
 use eliot_ors::{SupervisionLeaseProjection, SupervisionLeaseSnapshot};
 use eliot_platform::{KernelActivationNonce, PlatformHandle, PortError};
@@ -114,7 +114,7 @@ pub struct AgentBridgeAdmissionDescriptor {
     /// Resource generation approved by Host/installation.
     pub generation: ResourceGeneration,
     /// Authority epoch approved by Host/installation.
-    pub authority_epoch: AuthorityEpoch,
+    pub authority_epoch: EpochId,
     /// Exact immutable fence paired with the approved generation and epoch.
     pub state_fence: StateFence,
     /// Stable Windows user SID allowed to present the bridge profile.
@@ -304,8 +304,9 @@ impl AgentBridgeAdmissionDescriptor {
             .map_err(|_| KernelServiceError::HandshakeMismatch {
                 field: "agent_bridge.state_fence",
             })?;
+        // `EpochId` is always a validated non-zero tuple; only the generation
+        // retains a scalar zero check (Implements #64).
         if self.generation.value() == 0
-            || self.authority_epoch.value() == 0
             || self.state_fence.resource_generation != self.generation
             || self.state_fence.authority_epoch != self.authority_epoch
         {
@@ -528,7 +529,7 @@ pub struct EliotdLaunchDescriptor {
     /// process/Job/pipe evidence remains the authority proof.
     pub launch_nonce: PlatformHandle,
     /// Kernel authority epoch bound to this child generation.
-    pub authority_epoch: AuthorityEpoch,
+    pub authority_epoch: EpochId,
     /// Kernel resource generation bound to this child generation.
     pub generation: ResourceGeneration,
     /// Lowercase SHA-256 digest over all descriptor fields except this field.
@@ -630,7 +631,7 @@ impl EliotdLaunchDescriptor {
                 });
             }
         }
-        if self.generation.value() == 0 || self.authority_epoch.value() == 0 {
+        if self.generation.value() == 0 {
             return Err(KernelServiceError::InvalidField {
                 field: "eliotd.generation",
                 reason: "generation and authority epoch must be non-zero",
@@ -791,7 +792,7 @@ pub struct StoreRebindHandoff {
     /// Current Kernel generation.
     pub generation: ResourceGeneration,
     /// Current Kernel authority epoch.
-    pub authority_epoch: AuthorityEpoch,
+    pub authority_epoch: EpochId,
     /// Store proof-fence digest binding fresh peer evidence.
     pub store_fence: String,
 }
@@ -843,9 +844,7 @@ impl StoreRebindHandoff {
                 field: "store_rebind.generation",
             });
         }
-        if self.authority_epoch.value() == 0
-            || self.authority_epoch != self.requirement.state_fence.authority_epoch
-        {
+        if self.authority_epoch != self.requirement.state_fence.authority_epoch {
             return Err(KernelServiceError::HandshakeMismatch {
                 field: "store_rebind.authority_epoch",
             });
@@ -872,7 +871,7 @@ impl StoreRebindHandoff {
             process_binding: &'a StoreProcessBinding,
             candidate_binding_digest: &'a str,
             generation: ResourceGeneration,
-            authority_epoch: AuthorityEpoch,
+            authority_epoch: EpochId,
             store_fence: &'a str,
         }
         let canonical = Canonical {
@@ -881,7 +880,7 @@ impl StoreRebindHandoff {
             process_binding: &self.process_binding,
             candidate_binding_digest: &self.candidate_binding_digest,
             generation: self.generation,
-            authority_epoch: self.authority_epoch,
+            authority_epoch: self.authority_epoch.clone(),
             store_fence: &self.store_fence,
         };
         serde_json::to_vec(&canonical)
@@ -950,7 +949,7 @@ pub struct StoreRebindReceipt {
     /// Generation at rebind time.
     pub generation: ResourceGeneration,
     /// Authority epoch at rebind time.
-    pub authority_epoch: AuthorityEpoch,
+    pub authority_epoch: EpochId,
     /// Store proof-fence digest binding fresh peer evidence.
     pub store_fence: String,
 }
@@ -983,7 +982,7 @@ impl StoreRebindReceipt {
             }
         }
         self.process_binding.validate()?;
-        if self.generation.value() == 0 || self.authority_epoch.value() == 0 {
+        if self.generation.value() == 0 {
             return Err(KernelServiceError::InvalidField {
                 field: "store_rebind_receipt.generation_or_epoch",
                 reason: "must be non-zero",
@@ -1462,13 +1461,21 @@ mod descriptor_tests {
     #![allow(clippy::expect_used, clippy::unwrap_used)]
 
     use super::*;
-    use eliot_contracts::{AuthorityEpoch, ResourceGeneration, StateFence, TaskRevision};
+    use eliot_contracts::{EpochId, EpochLineageId, ResourceGeneration, StateFence, TaskRevision};
     use eliot_kernel_core::AuthoritySnapshotBindingWire;
     use eliot_ors::{
         EpochIdentity, EpochLineage, OpaqueLabel, OperationIdentity, StateFenceSnapshot,
     };
     use eliot_platform::SecretReference;
     use eliot_runtime_contracts::ProvisionedSupervisionAuthority;
+
+    fn test_epoch(sequence: u64) -> EpochId {
+        EpochId::new(
+            EpochLineageId::new("550e8400-e29b-41d4-a716-446655440000").expect("lineage"),
+            std::num::NonZeroU64::new(sequence).expect("sequence"),
+        )
+        .expect("epoch")
+    }
 
     fn supervision_authority() -> ProvisionedSupervisionAuthority {
         let signer = eliot_runtime_contracts::Ed25519SupervisionLeaseSigner::from_secret_key(
@@ -1516,10 +1523,12 @@ mod descriptor_tests {
             },
             predecessor: None,
         };
-        let state_fence = StateFence::new(AuthorityEpoch::genesis(), ResourceGeneration::genesis());
-        let snapshot_fence =
-            StateFenceSnapshot::capture(&state_fence, state_fence.authority_epoch.value())
-                .expect("snapshot fence");
+        let state_fence = StateFence::new(test_epoch(1), ResourceGeneration::genesis());
+        // Snapshot retains its `u64` contour (donor precedent: no silent widening).
+        // The observed sequence is the known genesis fixture value, not an
+        // extracted adapter; lineage is enforced via `EpochLineage` gates on the
+        // binding side.
+        let snapshot_fence = StateFenceSnapshot::capture(&state_fence, 1).expect("snapshot fence");
         let binding = AuthoritySnapshotBindingWire {
             authority_id: authority_id.clone(),
             record_id: OperationIdentity::new("snapshot-record").expect("record"),
@@ -1580,7 +1589,7 @@ mod descriptor_tests {
         let descriptor = descriptor();
         assert_eq!(
             descriptor.compute_digest().expect("legacy digest"),
-            "01fb85846a2a7fd4b90960c51d314144c91f9f40fa16663f42a1e0b1b551d0aa"
+            "b3ea01358c2a110201c0efe1685e29590dfee4362ed39d74a218c44c0e5c488c"
         );
     }
 
@@ -1885,6 +1894,12 @@ pub fn semantic_store_config_hash_from_json(
                 "integration_revision",
             ],
         )?;
+        // Wire-shape guard (Implements #64): the fenced authority epoch must be
+        // the lineage-aware object shape `{lineage_id, sequence}`. A bare
+        // numeric scalar is rejected here; legacy numerics enter only via
+        // `import_legacy_scalar_epoch` with evidence, never via this wire.
+        let fence_epoch = required_field(&fence, "authority_epoch")?;
+        exact_object(&fence_epoch, &["lineage_id", "sequence"])?;
         let roots = required_field(value, "runtime_state_roots")?;
         exact_object(
             &roots,
@@ -2203,8 +2218,8 @@ impl HostStoreBootstrapRequirement {
 
     /// Returns the exact authority epoch bound by this requirement.
     #[must_use]
-    pub const fn authority_epoch(&self) -> AuthorityEpoch {
-        self.state_fence.authority_epoch
+    pub fn authority_epoch(&self) -> &EpochId {
+        &self.state_fence.authority_epoch
     }
 
     /// Returns the Host-approved bounded connection timeout.
@@ -2295,7 +2310,7 @@ pub struct HostKernelCandidateBinding {
     /// Host installation epoch that owns this process.
     pub host_epoch: AuthorityEpoch,
     /// Kernel authority epoch proposed for this activation.
-    pub kernel_epoch: AuthorityEpoch,
+    pub kernel_epoch: EpochId,
     /// Exact activation identity shared by Host state and Kernel.
     pub activation_id: PlatformHandle,
     /// Approved immutable Kernel artifact hash/reference.
@@ -2364,18 +2379,16 @@ impl HostKernelCandidateBinding {
                 field: "candidate.supervision_incarnation",
             });
         }
-        if self.host_epoch.value() == 0 || self.kernel_epoch.value() == 0 {
+        if self.host_epoch.value() == 0 {
             return Err(KernelServiceError::InvalidField {
                 field: "handshake.epoch",
                 reason: "must be non-zero",
             });
         }
-        if self.host_epoch.value() > self.kernel_epoch.value() {
-            return Err(KernelServiceError::InvalidField {
-                field: "handshake.kernel_epoch",
-                reason: "must not precede host epoch",
-            });
-        }
+        // Exact-tuple lineage (Implements #64): Host and Kernel epochs live
+        // in different lineages, so no cross-lineage numeric ordering exists.
+        // `kernel_epoch` is a lineage-aware `EpochId` (always non-zero by
+        // construction); equal sequences across lineages are unrelated.
         if let Some(descriptor) = &self.agent_bridge_admission {
             descriptor.validate()?;
         }
@@ -2408,7 +2421,7 @@ pub struct KernelActivationPermit {
     /// Approved runtime generation carried by the request.
     pub generation: ResourceGeneration,
     /// Strict Kernel authority epoch for this process generation.
-    pub authority_epoch: AuthorityEpoch,
+    pub authority_epoch: EpochId,
     /// Fresh one-use OS-generated activation authority.
     pub activation_nonce: KernelActivationNonce,
 }
@@ -2481,7 +2494,7 @@ pub struct KernelActivationReceipt {
     /// Approved runtime generation consumed by the Kernel.
     pub generation: ResourceGeneration,
     /// Kernel authority epoch consumed by the Kernel.
-    pub authority_epoch: AuthorityEpoch,
+    pub authority_epoch: EpochId,
     /// Non-secret digest of the consumed nonce; raw material is never echoed.
     pub activation_nonce_digest: String,
 }
@@ -2496,7 +2509,7 @@ impl KernelActivationReceipt {
             journal_transaction_id: permit.journal_transaction_id.clone(),
             journal_sequence: permit.journal_sequence,
             generation: permit.generation,
-            authority_epoch: permit.authority_epoch,
+            authority_epoch: permit.authority_epoch.clone(),
             activation_nonce_digest: permit.activation_nonce_digest(),
         }
     }
@@ -2599,8 +2612,9 @@ impl KernelReadyReceipt {
             format!("kernel-probe-request:{}", request.payload_digest),
             format!("kernel-probe-generation:{}", request.generation.value()),
             format!(
-                "kernel-probe-authority-epoch:{}",
-                request.candidate.kernel_epoch.value()
+                "kernel-probe-authority-epoch:{}:{}",
+                request.candidate.kernel_epoch.lineage_id.as_str(),
+                request.candidate.kernel_epoch.sequence.get()
             ),
             format!(
                 "kernel-probe-config:{}",
@@ -2744,9 +2758,17 @@ mod tests {
     )]
 
     use super::*;
-    use eliot_contracts::{ArtifactId, ContractId, ContractVersion};
+    use eliot_contracts::{ArtifactId, ContractId, ContractVersion, EpochId, EpochLineageId};
     use eliot_protocol::{AgentBridgeClientDeclaration, ProtocolRange};
     use eliot_runtime_contracts::{ModuleContract, ModuleGeneration, ModuleGenerationState};
+
+    fn test_epoch(sequence: u64) -> EpochId {
+        EpochId::new(
+            EpochLineageId::new("550e8400-e29b-41d4-a716-446655440000").expect("lineage"),
+            std::num::NonZeroU64::new(sequence).expect("sequence"),
+        )
+        .expect("epoch")
+    }
 
     fn handle_value(value: &str) -> PlatformHandle {
         PlatformHandle::new(value).expect("test handle")
@@ -2812,7 +2834,7 @@ mod tests {
             config_descriptor_sha256,
             protected_snapshot_digest: "c".repeat(64),
             launch_nonce: handle_value(nonce),
-            authority_epoch: AuthorityEpoch::new(1).expect("epoch"),
+            authority_epoch: test_epoch(1),
             generation: ResourceGeneration::new(1).expect("generation"),
             descriptor_sha256: String::new(),
         }
@@ -2836,7 +2858,7 @@ mod tests {
     }
 
     fn agent_bridge_admission_descriptor() -> AgentBridgeAdmissionDescriptor {
-        let authority_epoch = AuthorityEpoch::new(7).expect("epoch");
+        let authority_epoch = test_epoch(7);
         let generation = ResourceGeneration::new(11).expect("generation");
         AgentBridgeAdmissionDescriptor {
             wire_id: AGENT_BRIDGE_ADMISSION_DESCRIPTOR_WIRE_ID.to_owned(),
@@ -2851,7 +2873,7 @@ mod tests {
                 file_index: 11,
             },
             generation,
-            authority_epoch,
+            authority_epoch: authority_epoch.clone(),
             state_fence: StateFence::new(authority_epoch, generation),
             approved_user_sid: "S-1-5-21-1000".to_owned(),
             caller_session_policy:
@@ -2913,7 +2935,7 @@ mod tests {
             expected_kernel_sid: "S-1-5-18".to_owned(),
             expected_kernel_session_id: 0,
             expected_kernel_principal_binding: descriptor.expected_kernel_principal_binding.clone(),
-            expected_kernel_authority_epoch: AuthorityEpoch::new(19).expect("kernel epoch"),
+            expected_kernel_authority_epoch: test_epoch(19),
             expected_kernel_generation: ResourceGeneration::new(23).expect("kernel generation"),
             expected_kernel_artifact_sha256: "e".repeat(64),
             expected_kernel_config_snapshot_sha256: descriptor
@@ -3133,7 +3155,7 @@ mod tests {
 
         let mut stale_fence = descriptor.clone();
         stale_fence.state_fence = StateFence::new(
-            stale_fence.authority_epoch,
+            stale_fence.authority_epoch.clone(),
             ResourceGeneration::new(12).expect("generation"),
         );
         stale_fence.descriptor_sha256 = stale_fence.compute_digest().expect("digest");
@@ -3275,7 +3297,7 @@ mod tests {
     }
 
     fn requirement() -> HostStoreBootstrapRequirement {
-        let fence = StateFence::new(AuthorityEpoch::genesis(), ResourceGeneration::genesis());
+        let fence = StateFence::new(test_epoch(1), ResourceGeneration::genesis());
         HostStoreBootstrapRequirement {
             route_identity: handle_value(crate::STORE_ROUTE_IDENTITY),
             canonical_pipe_identity: handle_value(r"\\.\pipe\eliot\store"),
@@ -3338,7 +3360,10 @@ mod tests {
                 "generation": "generation-1",
                 "authority_generation": 1,
                 "authority_state_fence": {
-                    "authority_epoch": 1,
+                    "authority_epoch": {
+                        "lineage_id": "550e8400-e29b-41d4-a716-446655440000",
+                        "sequence": 1
+                    },
                     "resource_generation": 1,
                     "task_revision": null,
                     "policy_revision": null,
@@ -3491,7 +3516,7 @@ mod tests {
         HostKernelCandidateBinding {
             installation_id: handle_value("installation-1"),
             host_epoch: AuthorityEpoch::new(1).expect("host epoch"),
-            kernel_epoch: AuthorityEpoch::new(1).expect("kernel epoch"),
+            kernel_epoch: test_epoch(1),
             activation_id: handle_value("activation-1"),
             artifact_hash: handle_value("artifact-1"),
             config_hash: handle_value("config-1"),
@@ -3536,7 +3561,7 @@ mod tests {
             journal_transaction_id: handle_value("journal-transaction-1"),
             journal_sequence: 7,
             generation,
-            authority_epoch: candidate.kernel_epoch,
+            authority_epoch: candidate.kernel_epoch.clone(),
             activation_nonce: KernelActivationNonce::new(handle_value(&"a".repeat(64)))
                 .expect("activation nonce"),
         }
@@ -3837,7 +3862,7 @@ mod tests {
         );
 
         let mut other_fence = request.clone();
-        other_fence.candidate.kernel_epoch = AuthorityEpoch::new(2).expect("epoch");
+        other_fence.candidate.kernel_epoch = test_epoch(2);
         other_fence.payload_digest = other_fence.compute_digest().expect("digest");
         assert!(
             receipt

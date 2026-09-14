@@ -131,7 +131,7 @@ impl<'a, B: JournalBackend> DurableKernelActivationDriver<'a, B> {
             journal_transaction_id: receipt.transaction_id().clone(),
             journal_sequence: receipt.sequence(),
             generation,
-            authority_epoch: candidate.kernel_epoch,
+            authority_epoch: candidate.kernel_epoch.clone(),
             activation_nonce: nonce,
         };
         permit

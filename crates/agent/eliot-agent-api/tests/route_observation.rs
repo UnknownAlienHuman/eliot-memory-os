@@ -7,15 +7,26 @@
 //! and coordinator intake behavior.
 
 use eliot_agent_api::{
-    AdmittedRouteReceipt, AttemptId, AuthorityEpoch, CONTRACT_VERSION,
-    CandidateSelectionDisposition, ClockReading, ContractError, DecisionId, EventCursor,
-    ExecutionOutcome, ExecutionUnit, LowercaseSha256, NativeSession, NativeSessionLocator,
-    PhysicalRouteObservationReceipt, PolicyRevision, ProofCeiling, ProviderExecutionBinding,
-    QuotaKnowledge, RequestId, ResourceGeneration, RouteFingerprint, RouteObservationState,
-    RouteSelectionCandidate, StateFence, UsageReceipt, WorkLeaseId, candidate_digest_for,
+    AdmittedRouteReceipt, AttemptId, CONTRACT_VERSION, CandidateSelectionDisposition, ClockReading,
+    ContractError, DecisionId, EpochId, EventCursor, ExecutionOutcome, ExecutionUnit,
+    LowercaseSha256, NativeSession, NativeSessionLocator, PhysicalRouteObservationReceipt,
+    PolicyRevision, ProofCeiling, ProviderExecutionBinding, QuotaKnowledge, RequestId,
+    ResourceGeneration, RouteFingerprint, RouteObservationState, RouteSelectionCandidate,
+    StateFence, UsageReceipt, WorkLeaseId, candidate_digest_for,
 };
+use eliot_contracts::EpochLineageId;
 
 type TestResult = Result<(), Box<dyn std::error::Error>>;
+
+const TEST_LINEAGE_A: &str = "550e8400-e29b-41d4-a716-446655440000";
+
+fn test_epoch(lineage: &str, sequence: u64) -> EpochId {
+    EpochId::new(
+        EpochLineageId::new(lineage).expect("valid test lineage"),
+        std::num::NonZeroU64::new(sequence).expect("nonzero test sequence"),
+    )
+    .expect("valid test epoch")
+}
 
 fn fixture_digest(value: &str) -> Result<LowercaseSha256, serde_json::Error> {
     serde_json::from_value(serde_json::json!(value))
@@ -69,7 +80,7 @@ fn lease(value: &str) -> Result<WorkLeaseId, serde_json::Error> {
 
 fn fence() -> Result<StateFence, eliot_contracts::ContractError> {
     Ok(StateFence::new(
-        AuthorityEpoch::new(1)?,
+        test_epoch(TEST_LINEAGE_A, 1),
         ResourceGeneration::new(1)?,
     ))
 }

@@ -83,7 +83,7 @@ fn module_generation() -> ModuleGeneration {
             "integrity": "HEALTHY", "capacity": "HEALTHY"
         },
         "state_fence": {
-            "authority_epoch": 1, "resource_generation": 1,
+            "authority_epoch": {"lineage_id": "550e8400-e29b-41d4-a716-446655440000", "sequence": 1}, "resource_generation": 1,
             "task_revision": 1, "policy_revision": 1,
             "integration_revision": null
         }
@@ -99,9 +99,9 @@ fn work_scope() -> ObservationScope {
 
 fn lease() -> RuntimeLease {
     must(serde_json::from_value(json!({
-        "lease_id": "lease-1", "scope_ref": "scope-1", "authority_epoch": 1,
+        "lease_id": "lease-1", "scope_ref": "scope-1", "authority_epoch": {"lineage_id": "550e8400-e29b-41d4-a716-446655440000", "sequence": 1},
         "state_fence": {
-            "authority_epoch": 1, "resource_generation": 1,
+            "authority_epoch": {"lineage_id": "550e8400-e29b-41d4-a716-446655440000", "sequence": 1}, "resource_generation": 1,
             "task_revision": 1, "policy_revision": 1,
             "integration_revision": null
         },
@@ -119,7 +119,7 @@ fn source_assurance() -> SourceAssurance {
         "allowed_effects": ["NO_EXTERNAL_EFFECT"],
         "required_verifier": "verifier:a12", "quarantine": "NONE",
         "state_fence": {
-            "authority_epoch": 1, "resource_generation": 1,
+            "authority_epoch": {"lineage_id": "550e8400-e29b-41d4-a716-446655440000", "sequence": 1}, "resource_generation": 1,
             "task_revision": 1, "policy_revision": 1,
             "integration_revision": null
         }
@@ -461,7 +461,7 @@ impl P03ProcessPort for ProcessMock {
                         envelope.invocation_id.as_str()
                     ))),
                     must(FencingToken::new(
-                        envelope.lease.state_fence.authority_epoch.value(),
+                        envelope.lease.state_fence.authority_epoch.clone(),
                         generation,
                         format!("fence-{}", envelope.invocation_id.as_str()),
                     )),
@@ -503,7 +503,7 @@ impl P03ProcessPort for ProcessMock {
         let context = DispatchValidationContext::new(
             clock,
             request.fence().clone(),
-            request.fence().authority_epoch(),
+            request.fence().authority_epoch().clone(),
             process_revision_heads(),
             1,
         )
@@ -622,8 +622,10 @@ impl P03ReceiptVerifierPort for ReceiptVerifierMock {
             || receipt.operation_id() != binding.operation_id()
             || receipt.request_digest() != binding.request_digest()
             || !receipt.binding().state_fence().matches(binding.fence())
-            || binding.fence().authority_epoch()
-                != envelope.lease.state_fence.authority_epoch.value()
+            || !binding
+                .fence()
+                .authority_epoch()
+                .is_same_authority(&envelope.lease.state_fence.authority_epoch)
         {
             Err(PortError::Denied)
         } else {
@@ -642,8 +644,10 @@ impl P03ReceiptVerifierPort for ReceiptVerifierMock {
             && receipt_binding.process_tree_id() == binding.process_tree_id()
             && receipt_binding.request_digest() == binding.request_digest()
             && receipt_binding.state_fence().matches(binding.fence())
-            && binding.fence().authority_epoch()
-                == envelope.lease.state_fence.authority_epoch.value();
+            && binding
+                .fence()
+                .authority_epoch()
+                .is_same_authority(&envelope.lease.state_fence.authority_epoch);
         if self.config.cancel_receipt_mismatch || self.config.reject_cancel_receipt || !exact {
             Err(PortError::Denied)
         } else {
@@ -662,8 +666,10 @@ impl P03ReceiptVerifierPort for ReceiptVerifierMock {
             && evidence_binding.process_tree_id() == binding.process_tree_id()
             && evidence_binding.request_digest() == binding.request_digest()
             && evidence_binding.state_fence().matches(binding.fence())
-            && binding.fence().authority_epoch()
-                == envelope.lease.state_fence.authority_epoch.value();
+            && binding
+                .fence()
+                .authority_epoch()
+                .is_same_authority(&envelope.lease.state_fence.authority_epoch);
         if self.config.reject_reconcile_evidence || !exact {
             Err(PortError::Denied)
         } else {

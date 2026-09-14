@@ -4060,13 +4060,20 @@ impl OperationalRecoveryStore for RedbRecoveryStore {
             .ok_or(OrsError::ReservationNotFound)?;
         let operation: DurableOperationalRecord =
             decode_named(value.value(), "operational_current")?;
+        // Exact-tuple authority check (Implements #64): the receipt carries the
+        // canonical `EpochId`; the persisted `EpochLineage` contour keeps its
+        // shape and both tuple halves must agree. Equal sequences from
+        // different lineages are unrelated. The retained `u64` snapshot contour
+        // observes the canonical sequence; it never authorizes on its own.
+        let receipt_epoch = &receipt.core.authority.authority_epoch;
         let receipt_fence = crate::StateFenceSnapshot::capture(
             &receipt.core.operation.state_fence,
-            receipt.core.authority.authority_epoch.value(),
+            receipt_epoch.sequence.get(),
         )?;
         if operation.input.subject_id != operation_id
-            || operation.input.authority_epoch.current.epoch
-                != receipt.core.authority.authority_epoch.value()
+            || operation.input.authority_epoch.current.epoch != receipt_epoch.sequence.get()
+            || operation.input.authority_epoch.current.lineage_id.as_str()
+                != receipt_epoch.lineage_id.as_str()
             || operation.input.state_fence != receipt_fence
             || receipt.core.work_scope.state_fence != receipt.core.operation.state_fence
             || receipt.core.causal.state_fence != receipt.core.operation.state_fence
@@ -4635,13 +4642,26 @@ impl OperationalRecoveryStore for RedbRecoveryStore {
         {
             return Err(OrsError::ReconciliationMismatch);
         }
+        // Exact-tuple authority check (Implements #64): the receipt carries the
+        // canonical `EpochId`; the persisted `EpochLineage` contour keeps its
+        // shape and both tuple halves must agree. Equal sequences from
+        // different lineages are unrelated. The retained `u64` snapshot contour
+        // observes the canonical sequence; it never authorizes on its own.
+        let receipt_epoch = &receipt.core.authority.authority_epoch;
         let receipt_fence = crate::StateFenceSnapshot::capture(
             &receipt.core.operation.state_fence,
-            receipt.core.authority.authority_epoch.value(),
+            receipt_epoch.sequence.get(),
         )?;
         if receipt_fence != record.item.envelope.state_fence
-            || receipt.core.authority.authority_epoch.value()
-                != record.item.envelope.authority_epoch.current.epoch
+            || receipt_epoch.sequence.get() != record.item.envelope.authority_epoch.current.epoch
+            || receipt_epoch.lineage_id.as_str()
+                != record
+                    .item
+                    .envelope
+                    .authority_epoch
+                    .current
+                    .lineage_id
+                    .as_str()
             || receipt.core.work_scope.state_fence != receipt.core.operation.state_fence
             || receipt.core.causal.state_fence != receipt.core.operation.state_fence
             || receipt.core.authority.state_fence != receipt.core.operation.state_fence
@@ -5339,9 +5359,11 @@ fn reconciliation_matches(
     {
         return Err(OrsError::ReconciliationMismatch);
     }
+    // The retained `u64` snapshot contour observes the receipt's canonical
+    // `EpochId` sequence (Implements #64); it never authorizes on its own.
     let receipt_fence = crate::StateFenceSnapshot::capture(
         &receipt.core.operation.state_fence,
-        receipt.core.authority.authority_epoch.value(),
+        receipt.core.authority.authority_epoch.sequence.get(),
     )?;
     if receipt_fence != token.state_fence
         || receipt.core.work_scope.state_fence != receipt.core.operation.state_fence
@@ -5398,7 +5420,19 @@ fn storage(error: impl std::fmt::Display) -> OrsError {
 mod process_start_abort_tests {
     use super::*;
     use crate::OperationIdentity;
+    use eliot_contracts::{EpochId, EpochLineageId};
     use serde_json::json;
+
+    // Canonical `EpochId` fixture (Implements #64): lineage-aware exact tuple.
+    const TEST_LINEAGE_A: &str = "550e8400-e29b-41d4-a716-446655440000";
+
+    fn test_epoch(sequence: u64) -> EpochId {
+        EpochId::new(
+            EpochLineageId::new(TEST_LINEAGE_A).expect("valid test lineage"),
+            std::num::NonZeroU64::new(sequence).expect("nonzero test sequence"),
+        )
+        .expect("valid test epoch")
+    }
 
     fn process_start_receipt(
         operation_id: &str,
@@ -5414,9 +5448,15 @@ mod process_start_abort_tests {
                 "generation": 1,
                 "action_lease_ref": "lease-1",
                 "authority_id": "authority-1",
-                "authority_epoch": 1,
+                "authority_epoch": {
+                    "lineage_id": TEST_LINEAGE_A,
+                    "sequence": 1
+                },
                 "state_fence": {
-                    "authority_epoch": 1,
+                    "authority_epoch": {
+                        "lineage_id": TEST_LINEAGE_A,
+                        "sequence": 1
+                    },
                     "generation": 1,
                     "nonce": "fence-1"
                 },
@@ -5465,7 +5505,7 @@ mod process_start_abort_tests {
         let owner = eliot_process::ProcessOwnerBinding::new(
             "testd",
             "a".repeat(64),
-            1,
+            test_epoch(1),
             eliot_process::Generation::new(1).map_err(|error| OrsError::IntegrityProblem {
                 record_type: "test",
                 reason: error.to_string(),
@@ -5488,7 +5528,7 @@ mod process_start_abort_tests {
         let wrong_owner = eliot_process::ProcessOwnerBinding::new(
             "testd",
             "b".repeat(64),
-            1,
+            test_epoch(1),
             eliot_process::Generation::new(1).map_err(|error| OrsError::IntegrityProblem {
                 record_type: "test",
                 reason: error.to_string(),

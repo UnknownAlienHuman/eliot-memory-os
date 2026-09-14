@@ -69,7 +69,7 @@ type Duration = std::time::Duration;
 #[cfg(windows)]
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
-use eliot_contracts::{AuthorityEpoch, EpochContractError, ResourceGeneration};
+use eliot_contracts::{AuthorityEpoch, EpochContractError, EpochId, ResourceGeneration};
 #[cfg(windows)]
 use eliot_contracts::{ClockReading, ProductId, RequestId, RequestMetadata, SourceId, StateFence};
 use eliot_host_state::{
@@ -1120,7 +1120,7 @@ impl HostJobBranches {
         activation_generation: &EpochTransition,
         prior_kernel_disposition: PriorKernelDisposition,
         kernel_generation: EpochTransition,
-        kernel_authority_epoch: AuthorityEpoch,
+        kernel_authority_epoch: EpochId,
     ) -> Result<(KernelActivationReceipt, KernelReadyReceipt), HostError> {
         let launch = self.launch.as_ref().ok_or_else(|| {
             HostError::ProcessContour("runtime launch descriptor is missing".to_owned())
@@ -1325,7 +1325,8 @@ impl HostJobBranches {
             owner: "Kernel".to_owned(),
             state: ServiceProcessState::Starting,
             health: HealthVector::healthy(),
-            authority_epoch: candidate.kernel_epoch,
+            authority_epoch: AuthorityEpoch::new(candidate.kernel_epoch.sequence.get())
+                .map_err(|error| HostError::ProcessContour(error.to_string()))?,
         };
         let mut activation = DurableKernelActivationDriver::bind_candidate(
             journal,
@@ -1956,7 +1957,8 @@ impl HostJobBranches {
                 .map_err(|error| HostError::ProcessContour(error.to_string()))?,
         );
         hasher.update(launch.authority_generation.value().to_le_bytes());
-        hasher.update(candidate.kernel_epoch.value().to_le_bytes());
+        hasher.update(candidate.kernel_epoch.lineage_id.as_str().as_bytes());
+        hasher.update(candidate.kernel_epoch.sequence.get().to_le_bytes());
         hasher.update(requirement.approved_artifact_hash.as_str().as_bytes());
         hasher.update(requirement.approved_config_hash.as_str().as_bytes());
         hasher.update(store_process.process_id.to_le_bytes());
@@ -2090,7 +2092,7 @@ impl HostJobBranches {
                 },
                 candidate_binding_digest: candidate_digest.clone(),
                 generation: launch.authority_generation,
-                authority_epoch: candidate.kernel_epoch,
+                authority_epoch: candidate.kernel_epoch.clone(),
                 store_fence: store_fence.clone(),
             };
             handoff
@@ -2173,7 +2175,7 @@ impl HostJobBranches {
                 .map_err(|error| HostError::Platform(error.to_string()))?,
                 job_name: handoff_with_digest.process_binding.job.clone(),
                 generation: handoff_with_digest.generation.value(),
-                authority_epoch: handoff_with_digest.authority_epoch.value(),
+                authority_epoch: handoff_with_digest.authority_epoch.sequence.get(),
                 receipt_request_digest: None,
                 receipt_store_fence: None,
             };
@@ -2361,7 +2363,7 @@ impl HostJobBranches {
                 .map_err(|error| HostError::Platform(error.to_string()))?,
                 job_name: handoff_with_digest.process_binding.job.clone(),
                 generation: handoff_with_digest.generation.value(),
-                authority_epoch: handoff_with_digest.authority_epoch.value(),
+                authority_epoch: handoff_with_digest.authority_epoch.sequence.get(),
                 receipt_request_digest: Some(
                     PlatformHandle::new(final_receipt.request_digest.clone())
                         .map_err(|error| HostError::Platform(error.to_string()))?,
@@ -4711,7 +4713,8 @@ impl HostComposition {
                     .as_ref()
                     .ok_or_else(|| HostError::ProcessContour("launch missing".to_owned()))?
                     .authority_state_fence
-                    .authority_epoch,
+                    .authority_epoch
+                    .clone(),
                 Some(&terminated_child),
             )?;
         let prior_kernel = terminated_prior_kernel(&current_kernel, &terminated_child)?;
@@ -5002,9 +5005,9 @@ impl HostComposition {
     #[cfg(windows)]
     fn next_kernel_activation_context(
         &self,
-        manifest_authority_epoch: AuthorityEpoch,
+        manifest_authority_epoch: EpochId,
         termination: Option<&eliot_platform_windows::TerminatedJobChild>,
-    ) -> Result<(PriorKernelDisposition, EpochTransition, AuthorityEpoch), HostError> {
+    ) -> Result<(PriorKernelDisposition, EpochTransition, EpochId), HostError> {
         let state = self.journal.snapshot()?;
         if state.prior_kernel_unknown {
             return Err(HostError::OwnerLeaseRecovery(
@@ -5044,13 +5047,15 @@ impl HostComposition {
             })?
             .authority_epoch
             .value();
-        let next_authority_value =
-            manifest_authority_epoch
-                .value()
-                .max(prior_authority.checked_add(1).ok_or_else(|| {
-                    HostError::OwnerLeaseRecovery("Kernel authority epoch overflow".to_owned())
-                })?);
-        let authority = AuthorityEpoch::new(next_authority_value)
+        let next_sequence_value = manifest_authority_epoch.sequence.get().max(
+            prior_authority.checked_add(1).ok_or_else(|| {
+                HostError::OwnerLeaseRecovery("Kernel authority epoch overflow".to_owned())
+            })?,
+        );
+        let next_sequence = std::num::NonZeroU64::new(next_sequence_value).ok_or_else(|| {
+            HostError::OwnerLeaseRecovery("Kernel authority epoch overflow".to_owned())
+        })?;
+        let authority = EpochId::new(manifest_authority_epoch.lineage_id.clone(), next_sequence)
             .map_err(|error| HostError::ProcessContour(error.to_string()))?;
         let prior_disposition = terminated_prior_kernel(
             prior,
@@ -5079,7 +5084,7 @@ impl HostComposition {
     fn activate_launched_kernel(
         &mut self,
         generation: &PlatformHandle,
-        manifest_authority_epoch: AuthorityEpoch,
+        manifest_authority_epoch: EpochId,
     ) -> Result<KernelReadyReceipt, HostError> {
         let (prior_kernel, kernel_generation, kernel_authority_epoch) =
             self.next_kernel_activation_context(manifest_authority_epoch, None)?;
@@ -5278,7 +5283,7 @@ impl HostComposition {
         let config_path = PathBuf::from(approved_config_path.as_str());
         let (prior_kernel, kernel_generation, kernel_authority_epoch) = self
             .next_kernel_activation_context(
-                phase_b.launch.authority_state_fence.authority_epoch,
+                phase_b.launch.authority_state_fence.authority_epoch.clone(),
                 None,
             )?;
         self.jobs.start_approved(
@@ -5476,7 +5481,8 @@ impl HostComposition {
                     .manifest
                     .runtime_launch
                     .authority_state_fence
-                    .authority_epoch,
+                    .authority_epoch
+                    .clone(),
             ) {
                 return self.cleanup_launched_contour(HostError::RecoveryRequired(format!(
                     "candidate launch failed ({candidate_error}); rollback activation failed ({error})"
@@ -5506,7 +5512,8 @@ impl HostComposition {
                 .manifest
                 .runtime_launch
                 .authority_state_fence
-                .authority_epoch,
+                .authority_epoch
+                .clone(),
         ) {
             self.jobs.terminate_store_then_kernel()?;
             self.jobs.start_approved(
@@ -5529,7 +5536,8 @@ impl HostComposition {
                     .manifest
                     .runtime_launch
                     .authority_state_fence
-                    .authority_epoch,
+                    .authority_epoch
+                    .clone(),
             ) {
                 return self.cleanup_launched_contour(HostError::RecoveryRequired(format!(
                     "candidate activation failed ({candidate_error}); rollback activation failed ({rollback_error})"
@@ -5718,7 +5726,7 @@ impl HostComposition {
         if kernel_requires_activation && self.jobs.kernel.is_some() {
             let (prior_kernel, kernel_generation, kernel_authority_epoch) = self
                 .next_kernel_activation_context(
-                    live_launch.authority_state_fence.authority_epoch,
+                    live_launch.authority_state_fence.authority_epoch.clone(),
                     None,
                 )?;
             if let Err(error) = self.jobs.complete_kernel_control(
@@ -5874,7 +5882,7 @@ impl HostComposition {
             || active.activation_identity != candidate.activation_id
             || active.approved_artifact_hash != *kernel_artifact
             || active.active_pipe_identity.as_ref() != Some(&candidate.pipe_identity)
-            || active_process.authority_epoch != candidate.kernel_epoch
+            || active_process.authority_epoch.value() != candidate.kernel_epoch.sequence.get()
             || active_process.process_id
                 != format!(
                     "pid:{}:start:{}",
@@ -5973,7 +5981,7 @@ impl HostComposition {
                 && observation.kernel_process.process_id == active_process.process_id
                 && observation.kernel_job == *active_job
                 && observation.config_digest == *config
-                && observation.authority_epoch == candidate.kernel_epoch.value())
+                && observation.authority_epoch == candidate.kernel_epoch.sequence.get())
             .then(|| observation.store_fence.clone())
         });
         Ok(ReadinessContourIdentity {
@@ -6432,8 +6440,6 @@ fn lifecycle_context(
         std::process::id()
     ))
     .map_err(|error| HostError::Platform(error.to_string()))?;
-    let authority_epoch = AuthorityEpoch::new(host.epoch.current.sequence.get())
-        .map_err(|error| HostError::Platform(error.to_string()))?;
     Ok(RequestMetadata {
         request_id,
         session_id: None,
@@ -6442,7 +6448,7 @@ fn lifecycle_context(
             .map_err(|error| HostError::Platform(error.to_string()))?,
         source_id: SourceId::new("eliot-host-service")
             .map_err(|error| HostError::Platform(error.to_string()))?,
-        state_fence: StateFence::new(authority_epoch, ResourceGeneration::genesis()),
+        state_fence: StateFence::new(host.epoch.current.clone(), ResourceGeneration::genesis()),
         clock: ClockReading::default(),
     })
 }

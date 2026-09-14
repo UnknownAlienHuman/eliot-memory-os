@@ -13,7 +13,7 @@ use super::KernelBuildError;
 use super::KernelComposition;
 use super::STORE_BRIDGE_ROUTE;
 #[cfg(windows)]
-use eliot_contracts::{AuthorityEpoch, ResourceGeneration};
+use eliot_contracts::ResourceGeneration;
 #[cfg(windows)]
 use eliot_platform::PlatformHandle;
 use std::sync::atomic::Ordering;
@@ -186,7 +186,7 @@ impl KernelComposition {
             .route(&route_scope)
             .map_err(|error| KernelBuildError::Core(error.to_string()))?
             .clone();
-        if route.authority_epoch() != requirement.authority_epoch()
+        if route.authority_epoch().value() != requirement.authority_epoch().sequence.get()
             || route.active_generation() != requirement.store_generation
             || requirement.route_identity.as_str() != STORE_BRIDGE_ROUTE
         {
@@ -251,7 +251,7 @@ pub(crate) fn store_rebind_record_matches(
         && record.process_image_path == handoff.process_binding.process.image_path
         && record.job_name == handoff.process_binding.job.as_str()
         && record.generation == handoff.generation.value()
-        && record.authority_epoch == handoff.authority_epoch.value()
+        && record.authority_epoch == handoff.authority_epoch.sequence.get()
 }
 
 #[cfg(windows)]
@@ -281,12 +281,18 @@ pub(crate) fn store_rebind_record_is_pending(
 #[cfg(windows)]
 pub(crate) fn store_rebind_receipt_from_ors_record(
     record: &eliot_ors::StoreRebindReplayRecord,
+    expected_epoch: &eliot_contracts::EpochId,
 ) -> Result<eliot_kernel_service::StoreRebindReceipt, KernelBuildError> {
     if record.state != eliot_ors::StoreRebindReplayState::Committed
         || record.receipt.as_deref() != Some(record.request_digest.as_str())
     {
         return Err(KernelBuildError::Service(
             "ORS Store rebind record is not an exact committed receipt".to_owned(),
+        ));
+    }
+    if record.authority_epoch != expected_epoch.sequence.get() {
+        return Err(KernelBuildError::Service(
+            "ORS Store rebind record epoch does not match the expected lineage sequence".to_owned(),
         ));
     }
     let receipt = eliot_kernel_service::StoreRebindReceipt {
@@ -306,8 +312,7 @@ pub(crate) fn store_rebind_receipt_from_ors_record(
         candidate_binding_digest: record.candidate_binding_digest.clone(),
         generation: ResourceGeneration::new(record.generation)
             .map_err(|error| KernelBuildError::Service(error.to_string()))?,
-        authority_epoch: AuthorityEpoch::new(record.authority_epoch)
-            .map_err(|error| KernelBuildError::Service(error.to_string()))?,
+        authority_epoch: expected_epoch.clone(),
         store_fence: record.store_fence.clone(),
     };
     receipt

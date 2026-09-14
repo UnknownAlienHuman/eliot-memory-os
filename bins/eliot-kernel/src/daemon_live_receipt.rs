@@ -35,7 +35,7 @@ impl KernelComposition {
                 .map_err(|_| KernelServiceError::ReadinessNotProven)?,
             connection_id: session.connection_id.clone(),
             session_epoch: session.session_epoch,
-            authority_epoch: session.authority_epoch,
+            authority_epoch: session.authority_epoch.sequence.get(),
             generation: session.module_generation.generation.value(),
             launch_nonce_sha256: format!("{:x}", Sha256::digest(session.launch_nonce.as_bytes())),
         })
@@ -103,7 +103,7 @@ impl KernelComposition {
             .current_eliotd_live_projection(
                 &supervision_contour.incarnation.supervision_lease_id,
                 launch.generation.value(),
-                launch.authority_epoch.value(),
+                launch.authority_epoch.sequence.get(),
             )
             .map_err(|_| KernelServiceError::ReadinessNotProven)?;
         let receipt = EliotdLiveReceipt::new(
@@ -114,7 +114,7 @@ impl KernelComposition {
             runtime_binding.installation_id(),
             runtime_binding.approved_generation(),
             launch.generation.value(),
-            launch.authority_epoch.value(),
+            launch.authority_epoch.sequence.get(),
             launch.config_descriptor_sha256.as_str(),
             descriptor_artifact,
             kernel_artifact,
@@ -271,7 +271,7 @@ impl KernelComposition {
             .current_eliotd_live_projection(
                 &supervision_contour.incarnation.supervision_lease_id,
                 launch.generation.value(),
-                launch.authority_epoch.value(),
+                launch.authority_epoch.sequence.get(),
             )
             .map_err(|_| KernelServiceError::ReadinessNotProven)?;
         if post_supervision != supervision || post_issued_at_ms != supervision_issued_at_ms {
@@ -404,9 +404,15 @@ impl KernelComposition {
                 self.reject_daemon_process_readiness("eliotd launch operation identity is invalid")
             })?;
         let physical = receipt.identity().physical();
+        // INTENDED EpochId shape (B→A→C): fence exact-tuple. Quarantined
+        // EliotdLive* scalar lines below stay untouched (HISTORICAL_SUSPENDED).
         if receipt.operation_id() != &expected_operation
             || receipt.accepted_generation().get() != launch.generation.value()
-            || receipt.binding().state_fence().authority_epoch() != launch.authority_epoch.value()
+            || !receipt
+                .binding()
+                .state_fence()
+                .authority_epoch()
+                .is_same_authority(&launch.authority_epoch)
             || receipt.binding().state_fence().generation() != generation
             || receipt.identity().executable_sha256() != launch.executable_sha256
             || !physical
@@ -535,7 +541,7 @@ impl KernelComposition {
                         r.commit_order == 0
                             && r.requirement_digest == receipt.requirement_digest
                             && r.generation == receipt.generation.value()
-                            && r.authority_epoch == receipt.authority_epoch.value()
+                            && r.authority_epoch == receipt.authority_epoch.sequence.get()
                     })
                     .count();
                 if lineage_zeros > 1 {

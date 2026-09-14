@@ -32,7 +32,7 @@
 
 use super::{NATIVE_WORKER_RECONCILE_OPERATION, NativeWorkerReconcileError};
 use crate::{KernelComposition, KernelConfig, KernelFrameAction};
-use eliot_contracts::{AuthorityEpoch, ResourceGeneration, StateFence};
+use eliot_contracts::{AuthorityEpoch, EpochId, EpochLineageId, ResourceGeneration, StateFence};
 use eliot_ipc::{PeerIdentity, Session, TransportError};
 use eliot_ors::{NativeWorkerClaimRecord, NativeWorkerClaimState, OpaqueLabel, OperationIdentity};
 use eliot_protocol::{
@@ -61,6 +61,14 @@ fn open_kernel(root: &std::path::Path) -> KernelComposition {
 
 fn label(value: &str) -> OpaqueLabel {
     OpaqueLabel::new(value).expect("opaque label")
+}
+
+fn test_epoch(sequence: u64) -> EpochId {
+    EpochId::new(
+        EpochLineageId::new("550e8400-e29b-41d4-a716-446655440000").expect("lineage"),
+        std::num::NonZeroU64::new(sequence).expect("sequence"),
+    )
+    .expect("epoch")
 }
 
 fn identity(value: &str) -> OperationIdentity {
@@ -148,7 +156,7 @@ fn advance(
 
 fn claim_fence(epoch: u64) -> serde_json::Value {
     let fence = StateFence::new(
-        AuthorityEpoch::new(epoch).expect("epoch"),
+        test_epoch(epoch),
         ResourceGeneration::new(1).expect("generation"),
     );
     serde_json::to_value(&fence).expect("fence JSON")
@@ -807,7 +815,7 @@ fn drive_ready(kernel: &KernelComposition) {
     let candidate = HostKernelCandidateBinding {
         installation_id: PlatformHandle::new("installation-1").expect("installation"),
         host_epoch: AuthorityEpoch::new(1).expect("host epoch"),
-        kernel_epoch: AuthorityEpoch::genesis(),
+        kernel_epoch: test_epoch(1),
         activation_id: PlatformHandle::new("activation-1").expect("activation"),
         artifact_hash: PlatformHandle::new("artifact-1").expect("artifact"),
         config_hash: PlatformHandle::new("config-1").expect("config"),
@@ -899,7 +907,7 @@ fn test_session(kernel: &KernelComposition) -> Session {
         connection_id: "t5b02-reconcile-conn".to_owned(),
         protocol_version: eliot_protocol::ProtocolVersion::CURRENT,
         peer,
-        authority_epoch: policy.module_generation.state_fence.authority_epoch.value(),
+        authority_epoch: policy.module_generation.state_fence.authority_epoch.clone(),
         module_generation: policy.module_generation.clone(),
         launch_nonce: policy.launch_nonce.clone(),
         capabilities: policy.allowed_capabilities.clone(),
@@ -1068,10 +1076,7 @@ fn dispatch_gates_ready_peer_session_fence_and_maps_errors() {
     let mut fenced_frame =
         reconcile_frame(&session, "t5b02-dispatch-fenced", claim, &binding, 1, 1);
     if let Some(identity) = fenced_frame.request_identity.as_mut() {
-        let foreign = StateFence::new(
-            AuthorityEpoch::new(999).expect("epoch"),
-            ResourceGeneration::genesis(),
-        );
+        let foreign = StateFence::new(test_epoch(999), ResourceGeneration::genesis());
         identity.request.state_fence = foreign.clone();
         identity.request.metadata.state_fence = foreign;
     }

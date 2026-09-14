@@ -30,7 +30,7 @@
 
 use std::collections::BTreeSet;
 
-use eliot_contracts::{canonical_json_bytes, sha256_hex};
+use eliot_contracts::{EpochId, canonical_json_bytes, sha256_hex};
 use eliot_doctor_core::{
     AttemptIdentityBinding, ClosedRepairRequest, RepairClass, RepairOperationRef, RepairRecipe,
     RepairRecipeIdentity, RepairRecipeManifest, canonical_fence,
@@ -221,27 +221,27 @@ impl DoctorRecipeRegistry {
 /// Explicit Kernel admission inputs for one Doctor repair attempt.
 ///
 /// The binary-slice dispatch arm builds this from live Kernel state; the
-/// gate itself takes scalars only, so admission never depends on ambient
+/// gate itself takes the live fence only, so admission never depends on ambient
 /// authority.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct DoctorAdmissionContext {
     /// Live Kernel service state; admission requires `Ready`.
     pub service_state: KernelServiceState,
     /// Live authority epoch; the presented fence must match it exactly.
-    pub authority_epoch: u64,
+    pub authority_epoch: EpochId,
     /// Live resource generation; the presented fence must match it exactly.
     pub generation: u64,
 }
 
 impl DoctorAdmissionContext {
-    /// Builds the admission context, failing closed on a zero epoch or
-    /// generation.
+    /// Builds the admission context, failing closed on a zero generation.
+    /// The lineage-aware epoch is always non-zero by construction.
     pub fn new(
         service_state: KernelServiceState,
-        authority_epoch: u64,
+        authority_epoch: EpochId,
         generation: u64,
     ) -> Result<Self, KernelServiceError> {
-        if authority_epoch == 0 || generation == 0 {
+        if generation == 0 {
             return Err(KernelServiceError::InvalidField {
                 field: "doctor_repair.context",
                 reason: "authority epoch and generation must be non-zero",
@@ -884,7 +884,11 @@ fn check_doctor_fence(
             "doctor_repair.fence",
         ));
     }
-    if envelope.fence.authority_epoch != context.authority_epoch {
+    if !envelope
+        .fence
+        .authority_epoch
+        .is_same_authority(&context.authority_epoch)
+    {
         return Err((
             DoctorRepairRejectionReason::StaleEpoch,
             "doctor_repair.authority_epoch",
@@ -1051,7 +1055,7 @@ fn build_staged_doctor_attempt(
         principal_ref: OpaqueLabel::new(session_principal)
             .map_err(|error| KernelServiceError::Platform(error.to_string()))?,
         fence_digest: terms.envelope.fence.digest.clone(),
-        authority_epoch: terms.envelope.fence.authority_epoch,
+        authority_epoch: terms.envelope.fence.authority_epoch.sequence.get(),
         generation: terms.envelope.fence.generation,
         epoch_lineage: None,
         target_resource_digest: request.target_resource_digest.clone(),

@@ -694,7 +694,7 @@ impl ReactiveContextPayload {
             stream_id: self.sequence.stream_id.clone(),
             producer_id: REACTIVE_CONTEXT_PRODUCER_ID.to_owned(),
             producer_generation: self.producer_generation,
-            authority_epoch: self.work_scope.state_fence.authority_epoch,
+            authority_epoch: self.work_scope.state_fence.authority_epoch.clone(),
             event_id,
             sequence: self.sequence.sequence,
             causal_predecessor_refs: self.sequence.predecessor_event_ids.clone(),

@@ -6,7 +6,7 @@
 //! determinism, ambiguous fallback preservation, no epistemic promotion, and
 //! exact replay identity, plus fail-closed conflicting-hint behavior.
 
-use eliot_contracts::{AuthorityEpoch, ClockReading, ResourceGeneration, StateFence};
+use eliot_contracts::{ClockReading, EpochId, EpochLineageId, ResourceGeneration, StateFence};
 use eliot_observation::{
     AmbiguousOrdinaryRecordV2, CandidateDisposition, CaptureMode, CaptureRoute,
     CoverageDisposition, CoverageEvidence, CoverageInterval, Durability,
@@ -17,8 +17,18 @@ use eliot_observation::{
 };
 use eliot_observation_contracts::{AuditRecord, TelemetryRecord};
 
+const TEST_LINEAGE_A: &str = "550e8400-e29b-41d4-a716-446655440000";
+
+fn test_epoch(lineage: &str, sequence: u64) -> EpochId {
+    EpochId::new(
+        EpochLineageId::new(lineage).expect("valid test lineage"),
+        std::num::NonZeroU64::new(sequence).expect("nonzero test sequence"),
+    )
+    .expect("valid test epoch")
+}
+
 fn fence() -> StateFence {
-    StateFence::new(AuthorityEpoch::genesis(), ResourceGeneration::genesis())
+    StateFence::new(test_epoch(TEST_LINEAGE_A, 1), ResourceGeneration::genesis())
 }
 
 fn event() -> ObservationEventCore {

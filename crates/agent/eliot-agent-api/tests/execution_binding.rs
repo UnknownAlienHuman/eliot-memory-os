@@ -6,16 +6,26 @@
 //! route drift, multi-rebind, resume/fork lineage, session-spoof.
 
 use eliot_agent_api::{
-    AgentAttempt, AgentWorkUnitBrief, AttemptId, AttemptState, AuthorityEnvelope, AuthorityEpoch,
-    BudgetEnvelope, CancellationState, ContinuityKind, ContractError, EffectCeiling, EffectKind,
+    AgentAttempt, AgentWorkUnitBrief, AttemptId, AttemptState, AuthorityEnvelope, BudgetEnvelope,
+    CancellationState, ContinuityKind, ContractError, EffectCeiling, EffectKind, EpochId,
     EventCursor, ExecutionUnit, ExecutionUnitObservation, LaunchRequestId, LowercaseSha256,
     NativeSession, NativeSessionLocator, ProviderExecutionBinding, ProviderObservationLineage,
     RequestId, ResourceGeneration, RouteFingerprint, SessionId, SessionObservation, StateFence,
     TaskId, WorkLeaseId, WorkUnitId, validate_execution_binding,
 };
-use eliot_contracts::{TaskRevision, sha256_hex};
+use eliot_contracts::{EpochLineageId, TaskRevision, sha256_hex};
 
 type TestResult = Result<(), Box<dyn std::error::Error>>;
+
+const TEST_LINEAGE_A: &str = "550e8400-e29b-41d4-a716-446655440000";
+
+fn test_epoch(lineage: &str, sequence: u64) -> EpochId {
+    EpochId::new(
+        EpochLineageId::new(lineage).expect("valid test lineage"),
+        std::num::NonZeroU64::new(sequence).expect("nonzero test sequence"),
+    )
+    .expect("valid test epoch")
+}
 
 fn fixture_digest(value: &str) -> Result<LowercaseSha256, serde_json::Error> {
     serde_json::from_value(serde_json::json!(value))
@@ -78,7 +88,7 @@ fn lease(value: &str) -> Result<WorkLeaseId, Box<dyn std::error::Error>> {
 
 fn fence() -> Result<StateFence, Box<dyn std::error::Error>> {
     Ok(StateFence::new(
-        AuthorityEpoch::new(1)?,
+        test_epoch(TEST_LINEAGE_A, 1),
         ResourceGeneration::new(1)?,
     ))
 }
@@ -111,7 +121,7 @@ fn admitted_attempt() -> Result<AgentAttempt, Box<dyn std::error::Error>> {
         route: route()?,
         budget: work_budget,
         authority: AuthorityEnvelope {
-            epoch: AuthorityEpoch::new(1)?,
+            epoch: test_epoch(TEST_LINEAGE_A, 1),
             scope_ref: "scope:test".into(),
             effect_ceiling: ceiling(),
             lease: lease("lease-binding-1")?,
@@ -190,7 +200,7 @@ fn compatible_but_unequal_fence_is_rejected() -> TestResult {
     let admitted = admitted_attempt()?;
     let binding = bound_binding(&admitted)?;
     let current = StateFence {
-        authority_epoch: AuthorityEpoch::new(1)?,
+        authority_epoch: test_epoch(TEST_LINEAGE_A, 1),
         resource_generation: ResourceGeneration::new(1)?,
         task_revision: Some(TaskRevision::new(1)?),
         policy_revision: None,

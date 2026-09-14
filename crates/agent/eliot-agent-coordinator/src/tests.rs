@@ -2,8 +2,8 @@ use std::collections::BTreeSet;
 
 use eliot_agent_api::{
     AdmittedRouteReceipt, AgentLaunchRequest, AgentResult, AgentWorkUnitBrief, ArtifactId,
-    AssistantDeltaObservation, AttemptId, AuthorityEpoch, BudgetEnvelope, CONTRACT_VERSION,
-    ClockReading, ContractError, DecisionId, EffectCeiling, EffectKind, EventCursor, EventId,
+    AssistantDeltaObservation, AttemptId, BudgetEnvelope, CONTRACT_VERSION, ClockReading,
+    ContractError, DecisionId, EffectCeiling, EffectKind, EpochId, EventCursor, EventId,
     ExecutionOutcome, ExecutionUnit, ExecutionUnitObservation, HOST_EVENT_CONTRACT_VERSION,
     HOST_EVENT_DIGEST_ALGORITHM, HostEventDeliveryDisposition, HostEventNormalizationReceipt,
     HostEventPrivacyClass, LaunchRequestId, LowercaseSha256, NativeSession, NativeSessionLocator,
@@ -17,7 +17,9 @@ use eliot_agent_api::{
 use eliot_agent_contracts::{
     DeliveryPolicy, DescendantClosureReceipt, LivePeerMessage, LivePeerMessageState, RevisionId,
 };
-use eliot_contracts::{IntegrationRevision, PolicyRevision, TaskRevision, sha256_hex};
+use eliot_contracts::{
+    EpochLineageId, IntegrationRevision, PolicyRevision, TaskRevision, sha256_hex,
+};
 use eliot_evaluation_contracts::BudgetEvidence;
 use eliot_security_contracts::PrivacyClass;
 
@@ -34,6 +36,16 @@ use crate::{
 };
 
 type TestResult<T = ()> = Result<T, Box<dyn std::error::Error>>;
+
+const TEST_LINEAGE_A: &str = "550e8400-e29b-41d4-a716-446655440000";
+
+fn test_epoch(lineage: &str, sequence: u64) -> EpochId {
+    EpochId::new(
+        EpochLineageId::new(lineage).expect("valid test lineage"),
+        std::num::NonZeroU64::new(sequence).expect("nonzero test sequence"),
+    )
+    .expect("valid test epoch")
+}
 
 #[derive(Clone)]
 struct TestProvider {
@@ -78,12 +90,12 @@ fn rev(value: &str) -> RevisionId {
 }
 
 fn fence() -> StateFence {
-    StateFence::new(AuthorityEpoch::genesis(), ResourceGeneration::genesis())
+    StateFence::new(test_epoch(TEST_LINEAGE_A, 1), ResourceGeneration::genesis())
 }
 
 fn full_fence() -> StateFence {
     StateFence {
-        authority_epoch: AuthorityEpoch::genesis(),
+        authority_epoch: test_epoch(TEST_LINEAGE_A, 1),
         resource_generation: ResourceGeneration::genesis(),
         task_revision: Some(TaskRevision::genesis()),
         policy_revision: Some(PolicyRevision::genesis()),
@@ -393,7 +405,7 @@ fn provider_receipt(
         task_revision: candidate.task_revision.clone(),
         plan_revision: candidate.plan_revision.clone(),
         state_fence: candidate.state_fence.clone(),
-        controller_epoch: AuthorityEpoch::new(1)?,
+        controller_epoch: test_epoch(TEST_LINEAGE_A, 1),
         coordinator_lease: serde_json::from_value::<WorkLeaseId>(
             serde_json::json!({"namespace": "eliot.governor.work-lease", "revision": "v1", "value": format!("coordinator-lease-{tag}")}),
         )?,
@@ -1134,7 +1146,7 @@ fn peer_message(
         "delivery_policy": delivery,
         "state": "DRAFT",
         "state_fence": {
-            "authority_epoch": 1,
+            "authority_epoch": {"lineage_id": TEST_LINEAGE_A, "sequence": 1},
             "resource_generation": 1,
             "task_revision": null,
             "policy_revision": null,
@@ -1374,7 +1386,7 @@ fn coordinator_case_11_wrong_controller_epoch_has_no_mutation() -> TestResult {
     )?)?;
     let before = coordinator.snapshot_json()?;
     let mut receipt = provider_receipt(&candidate, "case-11")?;
-    receipt.controller_epoch = AuthorityEpoch::new(2)?;
+    receipt.controller_epoch = test_epoch(TEST_LINEAGE_A, 2);
     assert_eq!(
         coordinator.admit(receipt).err(),
         Some(CoordinatorError::StaleController)

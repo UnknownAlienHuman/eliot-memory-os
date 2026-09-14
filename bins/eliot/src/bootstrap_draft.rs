@@ -145,7 +145,10 @@ fn command_response(
                     "product_id": "eliot-bootstrap",
                     "source_id": work_unit_path.display().to_string(),
                     "state_fence": {
-                        "authority_epoch": 1,
+                        "authority_epoch": {
+                            "lineage_id": "550e8400-e29b-41d4-a716-446655440000",
+                            "sequence": 1
+                        },
                         "resource_generation": 1,
                         "task_revision": null,
                         "policy_revision": null,
@@ -159,7 +162,10 @@ fn command_response(
                     }
                 },
                 "state_fence": {
-                    "authority_epoch": 1,
+                    "authority_epoch": {
+                        "lineage_id": "550e8400-e29b-41d4-a716-446655440000",
+                        "sequence": 1
+                    },
                     "resource_generation": 1,
                     "task_revision": null,
                     "policy_revision": null,

@@ -476,7 +476,7 @@ fn ensure_unique_ordering_scopes(scopes: &[OrderingScopeId]) -> Result<(), Store
 mod tests {
     use super::*;
     use eliot_contracts::{
-        AuthorityEpoch, ClockReading, ProductId, RequestId, ResourceGeneration, SourceId,
+        ClockReading, EpochId, EpochLineageId, ProductId, RequestId, ResourceGeneration, SourceId,
     };
     use eliot_store_api::{
         EffectClass, EventProjectionRelationIntents, NamedMutationOperation, NamedMutationRequest,
@@ -485,9 +485,20 @@ mod tests {
     };
     use serde_json::json;
     use std::collections::BTreeMap;
+    use std::num::NonZeroU64;
+
+    const TEST_LINEAGE_A: &str = "550e8400-e29b-41d4-a716-446655440000";
+
+    fn test_epoch(sequence: u64) -> EpochId {
+        EpochId::new(
+            EpochLineageId::new(TEST_LINEAGE_A).expect("valid test lineage"),
+            NonZeroU64::new(sequence).expect("nonzero test sequence"),
+        )
+        .expect("valid test epoch")
+    }
 
     fn fixture() -> Result<(RequestMeta, PreparedTransition), StoreError> {
-        let state_fence = StateFence::new(AuthorityEpoch::genesis(), ResourceGeneration::genesis());
+        let state_fence = StateFence::new(test_epoch(1), ResourceGeneration::genesis());
         let context = RequestMeta {
             request_id: RequestId::new("request-1").map_err(StoreError::Foundation)?,
             session_id: None,

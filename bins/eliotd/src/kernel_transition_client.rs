@@ -165,8 +165,8 @@ mod tests {
     use std::collections::BTreeMap;
 
     use eliot_contracts::{
-        AuthorityEpoch, ClockReading, ProductId, RequestId, RequestMetadata, ResourceGeneration,
-        SessionId, SourceId, StateFence,
+        ClockReading, EpochId, EpochLineageId, ProductId, RequestId, RequestMetadata,
+        ResourceGeneration, SessionId, SourceId, StateFence,
     };
     use eliot_receipts::RequestBinding;
     use eliot_store_api::{
@@ -174,10 +174,21 @@ mod tests {
         OperationIdentity, OperationManifestDigest, OrderingScopeId, ScopeId, SecurityContext,
         TransitionClass,
     };
+    use std::num::NonZeroU64;
+
+    const TEST_LINEAGE_A: &str = "550e8400-e29b-41d4-a716-446655440000";
+
+    fn test_epoch(sequence: u64) -> EpochId {
+        EpochId::new(
+            EpochLineageId::new(TEST_LINEAGE_A).expect("valid test lineage"),
+            NonZeroU64::new(sequence).expect("nonzero test sequence"),
+        )
+        .expect("valid test epoch")
+    }
 
     fn test_fence(generation: u64) -> StateFence {
         StateFence::new(
-            AuthorityEpoch::new(1).expect("authority epoch"),
+            test_epoch(1),
             ResourceGeneration::new(generation).expect("resource generation"),
         )
     }

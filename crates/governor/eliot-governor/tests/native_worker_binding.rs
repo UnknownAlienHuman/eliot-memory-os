@@ -7,8 +7,8 @@ use std::sync::Arc;
 
 use eliot_authority::{EffectAuthorizer, GrantGraph};
 use eliot_contracts::{
-    AuthorityEpoch, ClockReading, ResourceGeneration, StateFence, TaskId, canonical_json_bytes,
-    sha256_hex,
+    ClockReading, EpochId, EpochLineageId, ResourceGeneration, StateFence, TaskId,
+    canonical_json_bytes, sha256_hex,
 };
 use eliot_coordination::CoordinationOwner;
 use eliot_finish::FinishDecisionReceipt;
@@ -32,6 +32,16 @@ use eliot_skill::SkillLifecycleView;
 use eliot_store_api::{EffectClass, PreparedTransition, ScopeId, ScopeRevisionView, StoreHealth};
 use eliot_task::{TaskLifecycleEvent, TaskLifecycleSnapshot, TaskRecord, TaskState};
 use eliot_workscope::WorkScopeBindingSnapshot;
+
+const TEST_LINEAGE_A: &str = "550e8400-e29b-41d4-a716-446655440000";
+
+fn test_epoch(lineage: &str, sequence: u64) -> EpochId {
+    EpochId::new(
+        EpochLineageId::new(lineage).expect("valid test lineage"),
+        std::num::NonZeroU64::new(sequence).expect("nonzero test sequence"),
+    )
+    .expect("valid test epoch")
+}
 
 struct TestKernel {
     snapshot: KernelGenerationSnapshot,
@@ -142,7 +152,7 @@ impl KernelServiceObservationPort for TestKernel {
                     state: eliot_runtime_contracts::ServiceProcessState::Ready,
                     health: eliot_runtime_contracts::HealthVector::healthy(),
                     generation: state_fence.resource_generation,
-                    authority_epoch: state_fence.authority_epoch,
+                    authority_epoch: state_fence.authority_epoch.clone(),
                 },
             })
             .collect())
@@ -171,7 +181,7 @@ fn test_snapshot() -> KernelGenerationSnapshot {
         service: "eliot-kernel".to_owned(),
         protocol: "eliot.kernel.v1".to_owned(),
         generation: ResourceGeneration::genesis(),
-        authority_epoch: AuthorityEpoch::genesis(),
+        authority_epoch: test_epoch(TEST_LINEAGE_A, 1),
         artifact_digest: "a".repeat(64),
         protected_snapshot_digest: "b".repeat(64),
         principal: "S-1-5-18".to_owned(),
@@ -205,15 +215,15 @@ fn activation_task_snapshot(fence: &StateFence) -> TaskLifecycleSnapshot {
             to: TaskState::ActionAuthorized,
             command: None,
             state_fence: fence.clone(),
-            authority_epoch: fence.authority_epoch,
+            authority_epoch: fence.authority_epoch.clone(),
             observed_at: ClockReading::default(),
         }],
     }
 }
 
 fn activation_session_snapshot(fence: &StateFence) -> eliot_session::SessionLifecycleSnapshot {
-    let mut owner =
-        SessionLifecycleOwner::new(fence.authority_epoch, fence.clone()).expect("session owner");
+    let mut owner = SessionLifecycleOwner::new(fence.authority_epoch.clone(), fence.clone())
+        .expect("session owner");
     let session_id = eliot_contracts::SessionId::new("session-1").expect("session id");
     owner
         .register(RegisterSession {
@@ -229,7 +239,7 @@ fn activation_session_snapshot(fence: &StateFence) -> eliot_session::SessionLife
             capability_profile_id: "profile-1".to_owned(),
             parent_session_id: None,
             policy_snapshot_id: "policy-1".to_owned(),
-            authority_epoch: fence.authority_epoch,
+            authority_epoch: fence.authority_epoch.clone(),
             state_fence: fence.clone(),
             now: 1,
             expires_at: 100,
@@ -243,7 +253,7 @@ fn activation_session_snapshot(fence: &StateFence) -> eliot_session::SessionLife
                 event_id: "session-activate-event".to_owned(),
                 actor_ref: "agent-1".to_owned(),
                 state_fence: fence.clone(),
-                authority_epoch: fence.authority_epoch,
+                authority_epoch: fence.authority_epoch.clone(),
                 observed_at: ClockReading::default(),
                 now: 2,
             },
@@ -589,7 +599,7 @@ fn foreign_fence_binding_fails_validate() {
     let binding = publish_valid(&composition);
     let mut foreign = binding.clone();
     foreign.state_fence = StateFence::new(
-        AuthorityEpoch::genesis(),
+        test_epoch(TEST_LINEAGE_A, 1),
         ResourceGeneration::new(2).expect("generation"),
     );
     let recomputed = foreign.compute_digest().expect("recompute foreign fence");

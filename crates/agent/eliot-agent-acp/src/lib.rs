@@ -1644,6 +1644,17 @@ pub fn acp_schema() -> schemars::Schema {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use eliot_contracts::{EpochId, EpochLineageId};
+
+    const TEST_LINEAGE_A: &str = "550e8400-e29b-41d4-a716-446655440000";
+
+    fn test_epoch(lineage: &str, sequence: u64) -> EpochId {
+        EpochId::new(
+            EpochLineageId::new(lineage).expect("valid test lineage"),
+            std::num::NonZeroU64::new(sequence).expect("nonzero test sequence"),
+        )
+        .expect("valid test epoch")
+    }
 
     #[derive(Clone, Debug)]
     struct FakeExecutor;
@@ -1717,8 +1728,8 @@ mod tests {
         route: &RouteFingerprint,
     ) -> Result<ProviderExecutionBinding, Box<dyn std::error::Error>> {
         use eliot_agent_api::{ExecutionUnit, NativeSession, NativeSessionLocator, RequestId};
-        use eliot_contracts::{AuthorityEpoch, ResourceGeneration, StateFence};
-        let fence = StateFence::new(AuthorityEpoch::new(1)?, ResourceGeneration::new(1)?);
+        use eliot_contracts::{ResourceGeneration, StateFence};
+        let fence = StateFence::new(test_epoch(TEST_LINEAGE_A, 1), ResourceGeneration::new(1)?);
         Ok(ProviderExecutionBinding {
             attempt_id: AttemptId::new("attempt")?,
             lease_id: serde_json::from_value(
@@ -2077,14 +2088,18 @@ mod tests {
             session_id: "session-cancel-01".into(),
             reason: eliot_agent_api::CancelReason::UserRequested,
             state_fence: eliot_contracts::StateFence::new(
-                eliot_contracts::AuthorityEpoch::new(3)?,
+                test_epoch(TEST_LINEAGE_A, 3),
                 eliot_contracts::ResourceGeneration::new(5)?,
             ),
         };
         assert!(typed.validate().is_ok());
         let wire = serde_json::to_value(&typed)?;
         assert!(wire["state_fence"].is_object());
-        assert_eq!(wire["state_fence"]["authority_epoch"], 3);
+        assert_eq!(wire["state_fence"]["authority_epoch"]["sequence"], 3);
+        assert_eq!(
+            wire["state_fence"]["authority_epoch"]["lineage_id"],
+            TEST_LINEAGE_A
+        );
         assert_eq!(
             serde_json::from_value::<AcpCancelRequest>(wire.clone())?,
             typed
@@ -2107,7 +2122,7 @@ mod tests {
             session_id: "session-cancel-01".into(),
             reason: eliot_agent_api::CancelReason::UserRequested,
             state_fence: eliot_contracts::StateFence::new(
-                eliot_contracts::AuthorityEpoch::default(),
+                test_epoch(TEST_LINEAGE_A, 1),
                 eliot_contracts::ResourceGeneration::default(),
             ),
         };

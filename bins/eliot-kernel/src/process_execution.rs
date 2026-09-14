@@ -342,7 +342,8 @@ pub(crate) fn project_store_snapshot(
         snapshot_digest.clone(),
     );
     let fence = FencingToken::new(
-        snapshot.state_fence.authority_epoch.value(),
+        // INTENDED EpochId shape (B→A→C): snapshot fence carries EpochId after B.
+        snapshot.state_fence.authority_epoch.clone(),
         Generation::new(snapshot.state_fence.resource_generation.value())
             .map_err(|error| ProcessExecutionError::Unavailable(error.to_string()))?,
         format!("store-snapshot-{snapshot_digest}"),
@@ -585,7 +586,9 @@ pub(crate) trait ProcessStartPorts {
         &self,
         clock: ClockObservation,
         store_fence: FencingToken,
-        authority_epoch: u64,
+        // INTENDED EpochId shape (Split A): DispatchValidationContext::new
+        // takes EpochId. B→A→C order.
+        authority_epoch: eliot_contracts::EpochId,
         revision_heads: BTreeMap<String, String>,
         validation_revision: u64,
     ) -> Result<DispatchValidationContext, ProcessExecutionError>;
@@ -1037,7 +1040,12 @@ pub(crate) async fn run_process_start<P: ProcessStartPorts>(
             Err(_) => ProcessExecutionError::UnknownOutcome,
         });
     }
-    if admission.state_fence().authority_epoch() != snapshot.state_fence.authority_epoch.value()
+    // INTENDED EpochId shape (B→A→C): exact-tuple is_same_authority for the
+    // fence side; snapshot scalar side resolves with B cutover.
+    if !admission
+        .state_fence()
+        .authority_epoch()
+        .is_same_authority(&snapshot.state_fence.authority_epoch)
         || admission.state_fence().generation().get()
             != snapshot.state_fence.resource_generation.value()
     {
@@ -1065,7 +1073,7 @@ pub(crate) async fn run_process_start<P: ProcessStartPorts>(
             monotonic_ns: None,
         },
         store_fence.clone(),
-        snapshot.state_fence.authority_epoch.value(),
+        snapshot.state_fence.authority_epoch.clone(),
         revision_heads.clone(),
         snapshot.validation_revision,
     ) {
@@ -1147,15 +1155,23 @@ impl ProcessStartPorts for ProcessExecutionGateway {
         admission: &ProcessExecutionAdmissionRequest,
         owner: &ProcessOwnerBinding,
     ) -> Result<(), ProcessExecutionError> {
+        // INTENDED EpochId shape (Split A): exact-tuple is_same_authority for
+        // fence/owner; snapshot scalar side resolves with B cutover.
         if admission.recipient_module_id() != owner.module_id()
-            || admission.state_fence().authority_epoch() != owner.authority_epoch()
+            || !admission
+                .state_fence()
+                .authority_epoch()
+                .is_same_authority(owner.authority_epoch())
             || admission.state_fence().generation().get() != owner.generation().get()
         {
             return Err(ProcessExecutionError::Contract(
                 eliot_process::ContractError::DispatchBindingMismatch,
             ));
         }
-        if admission.state_fence().authority_epoch()
+        // Scalar ORS snapshot contour (residual): project the canonical fence
+        // sequence for the stale-fence join; lineage-exact gating lives in the
+        // admission/owner `is_same_authority` check above.
+        if admission.state_fence().authority_epoch().sequence.get()
             != self.snapshot_binding.authority_epoch().current.epoch
             || admission.state_fence().generation() != admission.intent().generation()
         {
@@ -1239,7 +1255,7 @@ impl ProcessStartPorts for ProcessExecutionGateway {
         &self,
         clock: ClockObservation,
         store_fence: FencingToken,
-        authority_epoch: u64,
+        authority_epoch: eliot_contracts::EpochId,
         revision_heads: BTreeMap<String, String>,
         validation_revision: u64,
     ) -> Result<DispatchValidationContext, ProcessExecutionError> {

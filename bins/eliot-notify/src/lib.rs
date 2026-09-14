@@ -11,8 +11,8 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use ed25519_dalek::{Signature, VerifyingKey};
 use eliot_cli::kernel_client::{KernelClient, KernelClientError};
 use eliot_contracts::{
-    AuthorityEpoch, ClockReading, ProductId, RequestId, RequestMetadata, ResourceGeneration,
-    SessionId, SourceId, StateFence,
+    ClockReading, EpochId, EpochLineageId, ProductId, RequestId, RequestMetadata,
+    ResourceGeneration, SessionId, SourceId, StateFence,
 };
 use eliot_notify_core::{
     A08AdmissionPort, AdmissionRequest, AdmissionResult, DeliveryObservation,
@@ -40,9 +40,14 @@ use eliot_receipts::{
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
+use std::num::NonZeroU64;
 
 pub const SERVICE_NAME: &str = "eliot-notify";
 pub const PROTOCOL_VERSION: &str = "eliot.notify.v1";
+/// Lineage used to bind the installer-pinned fallback scalar to its canonical
+/// [`EpochId`] tuple. The declaration wire remains a scalar `u64`; this binary
+/// performs only the mechanical tuple binding and never mints authority.
+const FALLBACK_EPOCH_LINEAGE_ID: &str = "550e8400-e29b-41d4-a716-446655440000";
 
 #[derive(Debug)]
 pub enum NotifyBuildError {
@@ -712,8 +717,17 @@ pub fn load_watchdog_fallback_request()
         .map_err(|error| NotifyBuildError::Fallback(error.to_string()))?;
     let notification = watchdog_notification_id(&envelope)
         .map_err(|error| NotifyBuildError::Fallback(error.to_string()))?;
-    let authority_epoch = AuthorityEpoch::new(material.declaration.authority_epoch)
-        .map_err(|error| NotifyBuildError::Fallback(error.to_string()))?;
+    let authority_epoch = {
+        let lineage = EpochLineageId::new(FALLBACK_EPOCH_LINEAGE_ID)
+            .map_err(|error| NotifyBuildError::Fallback(error.to_string()))?;
+        let sequence = NonZeroU64::new(material.declaration.authority_epoch).ok_or_else(|| {
+            NotifyBuildError::Fallback(
+                "watchdog verification declaration has zero authority epoch".to_owned(),
+            )
+        })?;
+        EpochId::new(lineage, sequence)
+            .map_err(|error| NotifyBuildError::Fallback(error.to_string()))?
+    };
     let session_id = SessionId::new(material.declaration.audience.as_str())
         .map_err(|error| NotifyBuildError::Fallback(error.to_string()))?;
     let now_ms = SystemTime::now()
@@ -760,7 +774,7 @@ fn request_matches_fallback(
             .session_id
             .as_ref()
             .is_some_and(|session| session.as_str() == declaration.audience.as_str())
-        && request.context.state_fence.authority_epoch.value() == declaration.authority_epoch
+        && request.context.state_fence.authority_epoch.sequence.get() == declaration.authority_epoch
         && request.context.state_fence.resource_generation.value() == 1
         && request.context.product_id.as_str() == eliot_notify_core::WATCHDOG_PRODUCT_ID
         && request.context.source_id.as_str() == eliot_notify_core::WATCHDOG_SOURCE_ID
@@ -1208,7 +1222,8 @@ impl LocalFallbackLedger {
 
     fn validate_request(&self, request: &NotificationRequest, intent: &LedgerIntent) -> bool {
         intent.request_id.as_str() == request.context.request_id.as_str()
-            && request.context.state_fence.authority_epoch.value() == self.expected_authority_epoch
+            && request.context.state_fence.authority_epoch.sequence.get()
+                == self.expected_authority_epoch
     }
 
     fn poison_key(&mut self, key: &str) {
@@ -1530,8 +1545,8 @@ mod tests {
 
     use ed25519_dalek::{Signer, SigningKey};
     use eliot_contracts::{
-        AuthorityEpoch, ClockReading, ProductId, RequestId, RequestMetadata, ResourceGeneration,
-        SessionId, SourceId, StateFence,
+        ClockReading, EpochId, EpochLineageId, ProductId, RequestId, RequestMetadata,
+        ResourceGeneration, SessionId, SourceId, StateFence,
     };
     use eliot_notify_core::{
         DeliveryObservation, LedgerCommitOutcome, LedgerIntent, LedgerReservation,
@@ -1542,6 +1557,16 @@ mod tests {
     };
 
     use super::*;
+
+    const TEST_LINEAGE_A: &str = "550e8400-e29b-41d4-a716-446655440000";
+
+    fn test_epoch(sequence: u64) -> EpochId {
+        EpochId::new(
+            EpochLineageId::new(TEST_LINEAGE_A).expect("valid test lineage"),
+            NonZeroU64::new(sequence).expect("nonzero test sequence"),
+        )
+        .expect("valid test epoch")
+    }
 
     #[derive(Clone)]
     struct RecordingExchange {
@@ -1567,7 +1592,7 @@ mod tests {
 
     fn request(id: &str) -> NotificationRequest {
         let request_id = RequestId::new(id).unwrap();
-        let fence = StateFence::new(AuthorityEpoch::genesis(), ResourceGeneration::genesis());
+        let fence = StateFence::new(test_epoch(1), ResourceGeneration::genesis());
         NotificationRequest {
             context: RequestMetadata {
                 request_id,
@@ -1694,7 +1719,7 @@ mod tests {
         let request_hash = watchdog_request_hash(&envelope).unwrap();
         let expected_request_id = watchdog_request_id(&envelope).unwrap();
         let request_id = RequestId::new(expected_request_id).unwrap();
-        let fence = StateFence::new(AuthorityEpoch::genesis(), ResourceGeneration::genesis());
+        let fence = StateFence::new(test_epoch(1), ResourceGeneration::genesis());
         let request = NotificationRequest {
             context: RequestMetadata {
                 request_id,

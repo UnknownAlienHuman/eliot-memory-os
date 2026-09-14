@@ -231,7 +231,8 @@ pub(super) fn load_content_addressed_supervision_lease_bound(
         || durable_binding.activation_id.as_str() != journaled_incarnation.activation_id
         || durable_binding.activation_generation.value()
             != journaled_incarnation.activation_generation.sequence
-        || durable_binding.kernel_epoch.value() != journaled_incarnation.kernel_generation.sequence
+        || durable_binding.kernel_epoch.sequence.get()
+            != journaled_incarnation.kernel_generation.sequence
         || durable_binding.observation_scope != journaled_incarnation.observation_scope
         || durable_binding.watchdog_epoch.value() != journaled_incarnation.watchdog_epoch.sequence
         || durable_binding.wake_policy != journaled_incarnation.wake_policy

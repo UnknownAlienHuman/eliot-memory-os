@@ -33,8 +33,8 @@ use eliot_budget::{BudgetLedger, BudgetLedgerRecoverySnapshot};
 use eliot_canonical::{CanonicalError, CanonicalWriteEnvelope};
 use eliot_change_monitor::ChangeMonitor;
 use eliot_contracts::{
-    AuthorityEpoch, OperationId, ResourceGeneration, SessionId, StateFence, TaskId,
-    canonical_json_bytes, sha256_hex,
+    EpochId, OperationId, ResourceGeneration, SessionId, StateFence, TaskId, canonical_json_bytes,
+    sha256_hex,
 };
 use eliot_coordination::CoordinationOwner;
 use eliot_finish::{FinishDecisionReceipt, FinishService};
@@ -209,7 +209,7 @@ pub struct KernelGenerationSnapshot {
     /// Active resource generation.
     pub generation: ResourceGeneration,
     /// Active authority epoch.
-    pub authority_epoch: AuthorityEpoch,
+    pub authority_epoch: EpochId,
     /// SHA-256 of the admitted Kernel artifact.
     pub artifact_digest: String,
     /// SHA-256 of the protected full handoff snapshot.
@@ -248,7 +248,7 @@ impl KernelGenerationSnapshot {
                 )));
             }
         }
-        if self.generation.value() == 0 || self.authority_epoch.value() == 0 {
+        if self.generation.value() == 0 {
             return Err(KernelPortError::Contract(
                 "generation and authority_epoch must be non-zero".to_owned(),
             ));
@@ -258,8 +258,8 @@ impl KernelGenerationSnapshot {
 
     /// Returns the exact state fence represented by this snapshot.
     #[must_use]
-    pub const fn state_fence(&self) -> StateFence {
-        StateFence::new(self.authority_epoch, self.generation)
+    pub fn state_fence(&self) -> StateFence {
+        StateFence::new(self.authority_epoch.clone(), self.generation)
     }
 }
 
@@ -280,7 +280,7 @@ pub struct KernelGenerationExpectation {
     /// Expected resource generation.
     pub generation: ResourceGeneration,
     /// Expected authority epoch.
-    pub authority_epoch: AuthorityEpoch,
+    pub authority_epoch: EpochId,
 }
 
 impl KernelGenerationExpectation {
@@ -294,7 +294,7 @@ impl KernelGenerationExpectation {
             protected_snapshot_digest: snapshot.protected_snapshot_digest.clone(),
             principal: snapshot.principal.clone(),
             generation: snapshot.generation,
-            authority_epoch: snapshot.authority_epoch,
+            authority_epoch: snapshot.authority_epoch.clone(),
         })
     }
 
@@ -307,7 +307,9 @@ impl KernelGenerationExpectation {
             || self.protected_snapshot_digest != observed.protected_snapshot_digest
             || self.principal != observed.principal
             || self.generation != observed.generation
-            || self.authority_epoch != observed.authority_epoch
+            || !self
+                .authority_epoch
+                .is_same_authority(&observed.authority_epoch)
         {
             return Err(KernelPortError::Contract(
                 "observed Kernel snapshot does not match Host-approved expectation".to_owned(),
@@ -1227,12 +1229,15 @@ impl<P: KernelDurableJobPort + ?Sized> GovernorOwners<P> {
         config_snapshot_digest: String,
         recovery: &GovernorRecoverySnapshot,
     ) -> Result<Self, CompositionError> {
-        let authority_epoch = state_fence.authority_epoch;
+        let authority_epoch = state_fence.authority_epoch.clone();
         let task_snapshot: TaskLifecycleSnapshot =
             decode_owner_snapshot(recovery, RecoveryOwner::Task)?;
-        let task =
-            TaskLifecycleOwner::from_snapshot(authority_epoch, state_fence.clone(), task_snapshot)
-                .map_err(|error| CompositionError::Recovery(error.to_string()))?;
+        let task = TaskLifecycleOwner::from_snapshot(
+            authority_epoch.clone(),
+            state_fence.clone(),
+            task_snapshot,
+        )
+        .map_err(|error| CompositionError::Recovery(error.to_string()))?;
         let session_snapshot: SessionLifecycleSnapshot =
             decode_owner_snapshot(recovery, RecoveryOwner::Session)?;
         let session = SessionLifecycleOwner::from_snapshot(
@@ -1268,7 +1273,7 @@ impl<P: KernelDurableJobPort + ?Sized> GovernorOwners<P> {
             decode_owner_snapshot(recovery, RecoveryOwner::Coordination)?;
         let coordination = CoordinationOwner::from_snapshot_at(
             coordination_wire,
-            state_fence.authority_epoch,
+            state_fence.authority_epoch.clone(),
             state_fence,
         )
         .map_err(|error| CompositionError::Recovery(error.to_string()))?;
@@ -1448,7 +1453,7 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
             .map_err(|error| CompositionError::Recovery(error.to_string()))?;
         validate_service_observations(&service_observations, &state_fence)?;
         let mut governor = Governor::new(GovernorConfig {
-            authority_epoch: snapshot.authority_epoch,
+            authority_epoch: snapshot.authority_epoch.clone(),
             resource_generation: snapshot.generation,
             queues,
             background_pause_interactive_depth: 1,
@@ -1708,7 +1713,7 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
             return Err(CompositionError::NotReady);
         }
         let fence = self.snapshot.state_fence();
-        let authority_epoch = self.snapshot.authority_epoch;
+        let authority_epoch = self.snapshot.authority_epoch.clone();
         let generation = self.snapshot.generation;
         if config_snapshot_digest != self.snapshot.protected_snapshot_digest
             || config_snapshot_digest != self.owners.config.snapshot_digest()
@@ -1800,7 +1805,7 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
             launch_nonce: launch_nonce.to_owned(),
             process_invocation_digest: process_invocation_digest.to_owned(),
             state_fence: fence,
-            authority_epoch,
+            authority_epoch: authority_epoch.clone(),
             generation,
             deadline_unix_ms,
             expires_at_unix_ms,
@@ -1969,7 +1974,9 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
             .validate()
             .map_err(|_| CompositionError::Authority(P07PortError::InvalidBinding))?;
         if receipt.snapshot_id != request.snapshot_id.as_str()
-            || receipt.authority_epoch != request.binding.state_fence.authority_epoch
+            || !receipt
+                .authority_epoch
+                .is_same_authority(&request.binding.state_fence.authority_epoch)
         {
             return Err(CompositionError::Authority(P07PortError::InvalidBinding));
         }
@@ -2200,7 +2207,7 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
         let work = self
             .owners
             .coordination
-            .read_unique_active_work_lease(now, state_fence.authority_epoch, &state_fence)
+            .read_unique_active_work_lease(now, state_fence.authority_epoch.clone(), &state_fence)
             .map_err(|error| {
                 CompositionError::Recovery(format!(
                     "unique coordination activation read failed: {error}"
@@ -2221,7 +2228,9 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
             })?;
         if lifecycle_session.session_id != lifecycle_session_id
             || lifecycle_session.status != SessionState::Active
-            || lifecycle_session.authority_epoch != state_fence.authority_epoch
+            || !lifecycle_session
+                .authority_epoch
+                .is_same_authority(&state_fence.authority_epoch)
             || lifecycle_session.state_fence != state_fence
             || lifecycle_session.started_at == 0
             || lifecycle_session.heartbeat_at < lifecycle_session.started_at
@@ -2374,7 +2383,7 @@ fn recover_from_kernel<P: KernelRecoveryPort + ?Sized>(
     }
     if missing != 0 {
         if missing != RecoveryOwner::ALL.len()
-            || state_fence.authority_epoch != AuthorityEpoch::genesis()
+            || state_fence.authority_epoch.sequence.get() != 1
             || state_fence.resource_generation != ResourceGeneration::genesis()
             || state_fence.task_revision.is_some()
             || state_fence.policy_revision.is_some()
@@ -2436,7 +2445,10 @@ fn validate_service_observations(
     for recovered in observations {
         if !services.insert(recovered.service)
             || recovered.observation.generation != expected_fence.resource_generation
-            || recovered.observation.authority_epoch != expected_fence.authority_epoch
+            || !recovered
+                .observation
+                .authority_epoch
+                .is_same_authority(&expected_fence.authority_epoch)
             || recovered.observation.state != eliot_runtime_contracts::ServiceProcessState::Ready
             || !recovered.observation.health.is_fully_healthy()
         {
@@ -2577,7 +2589,7 @@ impl GovernorLaunchConfig {
             service: self.kernel.service.clone(),
             protocol: self.kernel.protocol.clone(),
             generation: self.kernel.generation,
-            authority_epoch: self.kernel.authority_epoch,
+            authority_epoch: self.kernel.authority_epoch.clone(),
             artifact_digest: self.kernel.artifact_digest.clone(),
             protected_snapshot_digest: self.protected_snapshot_digest.clone(),
             principal: self.kernel.principal.clone(),
@@ -2628,6 +2640,24 @@ mod tests {
     use eliot_task::{TaskCommandContext, TaskLifecycleEvent, TaskProposal, TaskRecord};
     use std::sync::Mutex;
     use std::sync::atomic::{AtomicBool, Ordering};
+
+    const TEST_LINEAGE_A: &str = "550e8400-e29b-41d4-a716-446655440000";
+    const TEST_LINEAGE_B: &str = "550e8400-e29b-41d4-a716-446655440001";
+
+    fn test_epoch(lineage: &str, sequence: u64) -> EpochId {
+        EpochId::new(
+            eliot_contracts::EpochLineageId::new(lineage).expect("valid test lineage"),
+            std::num::NonZeroU64::new(sequence).expect("nonzero test sequence"),
+        )
+        .expect("valid test epoch")
+    }
+
+    fn test_fence(sequence: u64) -> StateFence {
+        StateFence::new(
+            test_epoch(TEST_LINEAGE_A, sequence),
+            ResourceGeneration::genesis(),
+        )
+    }
 
     struct FakeKernel {
         snapshot: KernelGenerationSnapshot,
@@ -2936,7 +2966,7 @@ mod tests {
             service: "eliot-kernel".to_owned(),
             protocol: "eliot.kernel.v1".to_owned(),
             generation: ResourceGeneration::genesis(),
-            authority_epoch: AuthorityEpoch::genesis(),
+            authority_epoch: test_epoch(TEST_LINEAGE_A, 1),
             artifact_digest: "a".repeat(64),
             protected_snapshot_digest: "b".repeat(64),
             principal: "S-1-5-18".to_owned(),
@@ -2969,7 +2999,7 @@ mod tests {
                     state: ServiceProcessState::Ready,
                     health: HealthVector::healthy(),
                     generation: state_fence.resource_generation,
-                    authority_epoch: state_fence.authority_epoch,
+                    authority_epoch: state_fence.authority_epoch.clone(),
                 },
             })
             .collect()
@@ -3103,7 +3133,7 @@ mod tests {
                 to: TaskState::ActionAuthorized,
                 command: None,
                 state_fence: fence.clone(),
-                authority_epoch: fence.authority_epoch,
+                authority_epoch: fence.authority_epoch.clone(),
                 observed_at: ClockReading::default(),
             }],
         }
@@ -3119,7 +3149,7 @@ mod tests {
                 session_id: "session-1".to_owned(),
                 principal_id: "principal-1".to_owned(),
                 route_ref: "route-1".to_owned(),
-                authority_epoch: fence.authority_epoch,
+                authority_epoch: fence.authority_epoch.clone(),
                 state_fence: fence.clone(),
                 now: 1,
                 heartbeat_deadline: 100,
@@ -3149,7 +3179,7 @@ mod tests {
                 lease_id: "lease-1".to_owned(),
                 work_item_id: "work-1".to_owned(),
                 session_id: "session-1".to_owned(),
-                authority_epoch: fence.authority_epoch,
+                authority_epoch: fence.authority_epoch.clone(),
                 state_fence: fence.clone(),
                 now: 2,
                 lease_duration: 40,
@@ -3168,7 +3198,7 @@ mod tests {
                 session_id: "session-2".to_owned(),
                 principal_id: "principal-2".to_owned(),
                 route_ref: "route-2".to_owned(),
-                authority_epoch: fence.authority_epoch,
+                authority_epoch: fence.authority_epoch.clone(),
                 state_fence: fence.clone(),
                 now: 1,
                 heartbeat_deadline: 100,
@@ -3198,7 +3228,7 @@ mod tests {
                 lease_id: "lease-2".to_owned(),
                 work_item_id: "work-2".to_owned(),
                 session_id: "session-2".to_owned(),
-                authority_epoch: fence.authority_epoch,
+                authority_epoch: fence.authority_epoch.clone(),
                 state_fence: fence.clone(),
                 now: 2,
                 lease_duration: 40,
@@ -3208,7 +3238,7 @@ mod tests {
     }
 
     fn activation_session_snapshot(fence: &StateFence) -> SessionLifecycleSnapshot {
-        let mut owner = SessionLifecycleOwner::new(fence.authority_epoch, fence.clone())
+        let mut owner = SessionLifecycleOwner::new(fence.authority_epoch.clone(), fence.clone())
             .expect("session owner");
         let session_id = SessionId::new("session-1").expect("session id");
         owner
@@ -3225,7 +3255,7 @@ mod tests {
                 capability_profile_id: "profile-1".to_owned(),
                 parent_session_id: None,
                 policy_snapshot_id: "policy-1".to_owned(),
-                authority_epoch: fence.authority_epoch,
+                authority_epoch: fence.authority_epoch.clone(),
                 state_fence: fence.clone(),
                 now: 1,
                 expires_at: 100,
@@ -3239,7 +3269,7 @@ mod tests {
                     event_id: "session-activate-event".to_owned(),
                     actor_ref: "agent-1".to_owned(),
                     state_fence: fence.clone(),
-                    authority_epoch: fence.authority_epoch,
+                    authority_epoch: fence.authority_epoch.clone(),
                     observed_at: ClockReading::default(),
                     now: 2,
                 },
@@ -3319,7 +3349,7 @@ mod tests {
         let observed = snapshot();
         let mut expected =
             KernelGenerationExpectation::from_snapshot(&observed).expect("expectation");
-        expected.authority_epoch = AuthorityEpoch::new(2).expect("epoch");
+        expected.authority_epoch = test_epoch(TEST_LINEAGE_A, 2);
         let provider = Arc::new(fake_kernel(observed));
         let result = GovernorComposition::new(provider, None, &expected, QueueLimits::default());
         assert!(matches!(result, Err(CompositionError::Provider(_))));
@@ -3427,7 +3457,7 @@ mod tests {
         .expect("owner");
 
         let stale_fence = StateFence::new(
-            AuthorityEpoch::genesis(),
+            test_epoch(TEST_LINEAGE_A, 1),
             ResourceGeneration::new(2).expect("resource generation"),
         );
         assert!(owner.read_current_plan(&stale_fence).is_err());
@@ -3445,7 +3475,7 @@ mod tests {
 
         let mut stale_scope = scope;
         stale_scope.state_fence = StateFence::new(
-            AuthorityEpoch::genesis(),
+            test_epoch(TEST_LINEAGE_A, 1),
             ResourceGeneration::new(2).expect("resource generation"),
         );
         assert!(
@@ -3586,7 +3616,8 @@ mod tests {
     fn restart_rehydrates_nonempty_task_and_session_snapshots() {
         let observed = snapshot();
         let fence = observed.state_fence();
-        let mut task = TaskLifecycleOwner::new(fence.authority_epoch, fence.clone()).expect("task");
+        let mut task =
+            TaskLifecycleOwner::new(fence.authority_epoch.clone(), fence.clone()).expect("task");
         let task_snapshot = {
             task.propose(TaskProposal {
                 task_id: TaskId::new("task-1").expect("task id"),
@@ -3597,15 +3628,15 @@ mod tests {
                     event_id: "task-event-1".to_owned(),
                     actor_ref: "actor-1".to_owned(),
                     state_fence: fence.clone(),
-                    authority_epoch: fence.authority_epoch,
+                    authority_epoch: fence.authority_epoch.clone(),
                     observed_at: ClockReading::default(),
                 },
             })
             .expect("task proposal");
             task.snapshot()
         };
-        let mut session =
-            SessionLifecycleOwner::new(fence.authority_epoch, fence.clone()).expect("session");
+        let mut session = SessionLifecycleOwner::new(fence.authority_epoch.clone(), fence.clone())
+            .expect("session");
         let session_snapshot = {
             session
                 .register(RegisterSession {
@@ -3621,7 +3652,7 @@ mod tests {
                     capability_profile_id: "profile-1".to_owned(),
                     parent_session_id: None,
                     policy_snapshot_id: "policy-1".to_owned(),
-                    authority_epoch: fence.authority_epoch,
+                    authority_epoch: fence.authority_epoch.clone(),
                     state_fence: fence.clone(),
                     now: 1,
                     expires_at: 10,
@@ -3803,7 +3834,7 @@ mod tests {
         assert!(composition.read_unique_agent_activation(20).is_err());
 
         let stale_fence = StateFence::new(
-            AuthorityEpoch::genesis(),
+            test_epoch(TEST_LINEAGE_A, 1),
             ResourceGeneration::new(2).expect("generation"),
         );
         let mut stale_scope = activation_scope_snapshot(&stale_fence);
@@ -3824,7 +3855,7 @@ mod tests {
             .get_mut(&TaskId::new("task-1").expect("task id"))
             .expect("task")
             .state_fence = StateFence::new(
-            AuthorityEpoch::genesis(),
+            test_epoch(TEST_LINEAGE_A, 1),
             ResourceGeneration::new(2).expect("generation"),
         );
         let mut stale_task_fake = activation_fake(&observed);
@@ -3848,7 +3879,7 @@ mod tests {
             .get_mut(&SessionId::new("session-1").expect("session id"))
             .expect("session")
             .state_fence = StateFence::new(
-            AuthorityEpoch::genesis(),
+            test_epoch(TEST_LINEAGE_A, 1),
             ResourceGeneration::new(2).expect("generation"),
         );
         let mut stale_session_fake = activation_fake(&observed);
@@ -3976,7 +4007,7 @@ mod tests {
         let authority = AuthorityBinding {
             authority_id: ContractId::new("authority:budget").expect("authority id"),
             authority_owner: "budget-owner".to_owned(),
-            authority_epoch: fence.authority_epoch,
+            authority_epoch: fence.authority_epoch.clone(),
             state_fence: fence.clone(),
             allowed_effect: EffectClass::ExternalEffect,
             proof_ceiling: ProofCeiling::ObservedExternalEffect,
@@ -4167,7 +4198,8 @@ mod tests {
     }
 
     fn refresh_task_snapshot(fence: &StateFence, goal: &str) -> TaskLifecycleSnapshot {
-        let mut task = TaskLifecycleOwner::new(fence.authority_epoch, fence.clone()).expect("task");
+        let mut task =
+            TaskLifecycleOwner::new(fence.authority_epoch.clone(), fence.clone()).expect("task");
         task.propose(TaskProposal {
             task_id: TaskId::new("task-1").expect("task id"),
             project_ref: "project-1".to_owned(),
@@ -4177,7 +4209,7 @@ mod tests {
                 event_id: "task-event-1".to_owned(),
                 actor_ref: "actor-1".to_owned(),
                 state_fence: fence.clone(),
-                authority_epoch: fence.authority_epoch,
+                authority_epoch: fence.authority_epoch.clone(),
                 observed_at: ClockReading::default(),
             },
         })
@@ -4642,7 +4674,7 @@ mod tests {
         ) -> Result<AuthorityActivationReceipt, P07PortError> {
             let behavior = self.behavior.lock().expect("script lock").clone();
             let snapshot_id = request.snapshot_id.as_str().to_owned();
-            let authority_epoch = request.binding.state_fence.authority_epoch;
+            let authority_epoch = request.binding.state_fence.authority_epoch.clone();
             match behavior {
                 ScriptedAuthorityBehavior::Unavailable => Err(P07PortError::Unavailable),
                 ScriptedAuthorityBehavior::UnknownAck => Err(P07PortError::UnknownOutcome {
@@ -4707,7 +4739,7 @@ mod tests {
             binding: AuthorityBinding {
                 authority_id: ContractId::new("authority:test").expect("authority id"),
                 authority_owner: "test-owner".to_owned(),
-                authority_epoch: fence.authority_epoch,
+                authority_epoch: fence.authority_epoch.clone(),
                 state_fence: fence.clone(),
                 allowed_effect: EffectClass::ExternalEffect,
                 proof_ceiling: ProofCeiling::ObservedExternalEffect,
@@ -4751,7 +4783,7 @@ mod tests {
             binding: AuthorityBinding {
                 authority_id: ContractId::new("authority:test").expect("authority id"),
                 authority_owner: "test-owner".to_owned(),
-                authority_epoch: fence.authority_epoch,
+                authority_epoch: fence.authority_epoch.clone(),
                 state_fence: fence.clone(),
                 allowed_effect: EffectClass::ExternalEffect,
                 proof_ceiling: ProofCeiling::ObservedExternalEffect,

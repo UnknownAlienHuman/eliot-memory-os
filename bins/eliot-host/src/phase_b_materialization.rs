@@ -549,7 +549,11 @@ pub(super) fn agent_bridge_admission_descriptor(
             file_index: profile.executable_identity.file_index,
         },
         generation: profile.module_generation.generation,
-        authority_epoch: profile.module_generation.state_fence.authority_epoch,
+        authority_epoch: profile
+            .module_generation
+            .state_fence
+            .authority_epoch
+            .clone(),
         state_fence: profile.module_generation.state_fence,
         approved_user_sid: profile.approved_user_sid,
         caller_session_policy: match profile.caller_session_policy {

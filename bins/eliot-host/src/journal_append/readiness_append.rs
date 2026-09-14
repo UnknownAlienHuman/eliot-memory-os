@@ -86,7 +86,7 @@ pub(crate) fn append_authenticated_kernel_readiness<B: JournalBackend>(
         || candidate.artifact_hash != *approved_kernel_artifact
         || candidate.config_hash != *approved_config
         || active.active_pipe_identity.as_ref() != Some(&candidate.pipe_identity)
-        || active_process.authority_epoch.value() != candidate.kernel_epoch.value()
+        || active_process.authority_epoch.value() != candidate.kernel_epoch.sequence.get()
         || active_process.process_id != proof.ready.process.process_id.as_str()
         || active_job.job_name.as_str() != job.job.name
         || active_job.root_pid != job.root.process.process_id
@@ -128,11 +128,14 @@ pub(crate) fn append_authenticated_kernel_readiness<B: JournalBackend>(
                 owner: active_process.owner.clone(),
                 state: ServiceProcessState::Ready,
                 health: proof.ready.health,
-                authority_epoch: candidate.kernel_epoch,
+                authority_epoch: eliot_contracts::AuthorityEpoch::new(
+                    candidate.kernel_epoch.sequence.get(),
+                )
+                .map_err(|error| HostError::ProcessContour(error.to_string()))?,
             },
             kernel_job: active_job.clone(),
             config_digest: approved_config.clone(),
-            authority_epoch: candidate.kernel_epoch.value(),
+            authority_epoch: candidate.kernel_epoch.sequence.get(),
             store_fence: proof.store_fence.clone(),
             observed_at: fresh_identity("kernel-readiness-observed-at")?,
             evidence_refs,

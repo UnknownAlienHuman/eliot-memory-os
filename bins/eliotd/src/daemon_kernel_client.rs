@@ -169,10 +169,11 @@ impl DaemonKernelClient {
         let client = Self {
             launch: config.launch.clone(),
             connection_id: format!(
-                "eliotd:{}:{}:{}",
+                "eliotd:{}:{}:{}:{}",
                 config.launch.instance_id,
                 config.launch.kernel.generation.value(),
-                config.launch.kernel.authority_epoch.value()
+                config.launch.kernel.authority_epoch.lineage_id.as_str(),
+                config.launch.kernel.authority_epoch.sequence.get()
             ),
             snapshot: expected_snapshot(&config.launch)?,
             kernel_binding: config.kernel_binding.clone(),
@@ -306,7 +307,7 @@ impl DaemonKernelClient {
                     "daemon_ready",
                     serde_json::json!({
                         "generation": self.snapshot.generation.value(),
-                        "authority_epoch": self.snapshot.authority_epoch.value(),
+                        "authority_epoch": self.snapshot.authority_epoch.clone(),
                     }),
                 )
             },

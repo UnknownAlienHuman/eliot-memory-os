@@ -41,7 +41,7 @@ impl KernelComposition {
             return Err(TransportError::SessionFenced);
         }
         frame.validate()?;
-        if !session.accepts(session.authority_epoch, session.session_epoch)
+        if !session.accepts(&session.authority_epoch, session.session_epoch)
             || frame.connection_id != session.connection_id
             || frame.protocol_version != session.protocol_version
         {
@@ -226,8 +226,11 @@ impl KernelComposition {
                     return Err(TransportError::SessionFenced);
                 }
                 if identity.deadline_unix_ms != admission.deadline_unix_ms()
-                    || identity.request.state_fence.authority_epoch.value()
-                        != admission.state_fence().authority_epoch()
+                    || !identity
+                        .request
+                        .state_fence
+                        .authority_epoch
+                        .is_same_authority(admission.state_fence().authority_epoch())
                     || identity.request.state_fence.resource_generation.value()
                         != admission.state_fence().generation().get()
                 {

@@ -77,12 +77,15 @@ impl KernelComposition {
                     .get("generation")
                     .and_then(serde_json::Value::as_u64)
                     .ok_or(TransportError::SessionFenced)?;
-                let authority_epoch = payload
-                    .get("authority_epoch")
-                    .and_then(serde_json::Value::as_u64)
-                    .ok_or(TransportError::SessionFenced)?;
+                let authority_epoch: eliot_contracts::EpochId = serde_json::from_value(
+                    payload
+                        .get("authority_epoch")
+                        .cloned()
+                        .ok_or(TransportError::SessionFenced)?,
+                )
+                .map_err(|_| TransportError::SessionFenced)?;
                 if generation != session.module_generation.generation.value()
-                    || authority_epoch != session.authority_epoch
+                    || !authority_epoch.is_same_authority(&session.authority_epoch)
                 {
                     return Err(TransportError::SessionFenced);
                 }
@@ -569,7 +572,9 @@ fn validate_store_session_fence(
     state_fence
         .validate()
         .map_err(|_| TransportError::SessionFenced)?;
-    if session.authority_epoch != state_fence.authority_epoch.value()
+    if !session
+        .authority_epoch
+        .is_same_authority(&state_fence.authority_epoch)
         || session.module_generation.generation != state_fence.resource_generation
         || session.module_generation.state_fence != *state_fence
     {

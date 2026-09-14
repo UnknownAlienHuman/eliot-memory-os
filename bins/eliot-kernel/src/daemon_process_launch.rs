@@ -116,8 +116,11 @@ impl KernelComposition {
                 .map_err(|error| KernelBuildError::Service(error.to_string()))?,
         )
         .map_err(|error| KernelBuildError::Service(error.to_string()))?;
+        // INTENDED EpochId shape (Split A/B cutover, B→A→C): FencingToken::new
+        // takes EpochId, getter &EpochId, is_same_authority. Do not edit A/B
+        // files to make this compile in isolation.
         let state_fence = FencingToken::new(
-            launch.authority_epoch.value(),
+            launch.authority_epoch.clone(),
             generation,
             format!("eliotd-launch-fence-{launch_identity}"),
         )
@@ -138,10 +141,10 @@ impl KernelComposition {
             stable_owner_principal_digest(
                 kernel_expectation.expected_sid(),
                 ACTIVE_DAEMON_CALLER,
-                launch.authority_epoch.value(),
+                &launch.authority_epoch,
                 generation,
             ),
-            launch.authority_epoch.value(),
+            launch.authority_epoch.clone(),
             generation,
         )
         .map_err(|error| KernelBuildError::Service(error.to_string()))?;

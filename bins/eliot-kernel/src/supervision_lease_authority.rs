@@ -356,7 +356,13 @@ impl KernelSupervisionLeaseAuthority {
                 .resource_generation
                 .value()
                 != expected_generation
-            || current.record.binding.state_fence.authority_epoch.value()
+            || current
+                .record
+                .binding
+                .state_fence
+                .authority_epoch
+                .sequence
+                .get()
                 != expected_authority_epoch
         {
             return Err(SupervisionLeaseAuthorityError::Ors(
@@ -593,7 +599,7 @@ pub(super) fn verification_context_for_supervision_payload(
         host_epoch: payload.host_epoch,
         activation_id: payload.activation_id.clone(),
         activation_generation: payload.activation_generation,
-        kernel_epoch: payload.kernel_epoch,
+        kernel_epoch: payload.kernel_epoch.clone(),
         watchdog_epoch: payload.watchdog_epoch,
         state_fence: payload.state_fence.clone(),
         scope_ref: payload.scope_ref.clone(),

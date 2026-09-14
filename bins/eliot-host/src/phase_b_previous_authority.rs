@@ -197,7 +197,10 @@ pub(super) fn phase_b_validate_authority(
             ))
         })?;
     }
-    if descriptor.state_fence.authority_epoch.value() != host.epoch.current.sequence.get()
+    if !descriptor
+        .state_fence
+        .authority_epoch
+        .is_same_authority(&host.epoch.current)
         || descriptor.state_fence.resource_generation != descriptor.generation
     {
         return Err(HostError::RecoveryRequired(

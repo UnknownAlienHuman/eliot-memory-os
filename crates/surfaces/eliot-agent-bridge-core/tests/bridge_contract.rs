@@ -10,7 +10,19 @@ use eliot_agent_bridge_core::{
     ReconciliationPortOutcome, ReconciliationPortResult, ReconciliationReceiptRef,
     ReconnectRequest, RequiredProvider, SessionId, TaskId, WorkUnitId,
 };
+use eliot_contracts::{EpochId, EpochLineageId};
 use serde_json::json;
+use std::num::NonZeroU64;
+
+const TEST_LINEAGE_A: &str = "550e8400-e29b-41d4-a716-446655440000";
+
+fn test_epoch(sequence: u64) -> EpochId {
+    EpochId::new(
+        EpochLineageId::new(TEST_LINEAGE_A).expect("valid test lineage"),
+        NonZeroU64::new(sequence).expect("nonzero test sequence"),
+    )
+    .expect("valid test epoch")
+}
 
 #[derive(Default)]
 struct HostState {
@@ -131,7 +143,7 @@ fn generation(value: u64) -> Result<Generation, Box<dyn std::error::Error>> {
 
 fn fence(value: u64) -> Result<FencingToken, Box<dyn std::error::Error>> {
     Ok(FencingToken::new(
-        value,
+        test_epoch(value),
         generation(value)?,
         format!("fence-{value}"),
     )?)
@@ -178,7 +190,10 @@ fn event(class: &str, event_id: &str, sequence: u64) -> Result<EventEnvelope, se
         "stream_id": "stream-1",
         "producer_id": "bridge-producer",
         "producer_generation": 1,
-        "authority_epoch": 1,
+        "authority_epoch": {
+            "lineage_id": TEST_LINEAGE_A,
+            "sequence": 1
+        },
         "event_id": event_id,
         "sequence": sequence,
         "causal_predecessor_refs": [],
@@ -187,7 +202,10 @@ fn event(class: &str, event_id: &str, sequence: u64) -> Result<EventEnvelope, se
         "payload_type": "fixture",
         "payload_or_blob_ref": {"inline": {"Json": {"value": 1}}},
         "state_fence": {
-            "authority_epoch": 1,
+            "authority_epoch": {
+                "lineage_id": TEST_LINEAGE_A,
+                "sequence": 1
+            },
             "resource_generation": 1,
             "task_revision": null,
             "policy_revision": null,
@@ -278,7 +296,12 @@ fn attach_binds_authenticated_connection_session_generation_and_fence()
     assert_eq!(binding.session_id().as_str(), "session-1");
     assert_eq!(binding.connection_id().as_str(), "connection-1");
     assert_eq!(binding.activation_generation().get(), 1);
-    assert_eq!(binding.state_fence().authority_epoch(), 1);
+    assert!(
+        binding
+            .state_fence()
+            .authority_epoch()
+            .is_same_authority(&test_epoch(1))
+    );
     assert_eq!(binding.state_fence().generation().get(), 1);
     assert_eq!(binding.task_binding().task_id().as_str(), "task-1");
     assert_eq!(

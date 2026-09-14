@@ -48,7 +48,7 @@ impl KernelComposition {
             "service": SERVICE_NAME,
             "protocol": PROTOCOL_VERSION,
             "generation": policy.module_generation.generation.value(),
-            "authority_epoch": policy.module_generation.state_fence.authority_epoch.value(),
+            "authority_epoch": policy.module_generation.state_fence.authority_epoch.clone(),
             // This is the Kernel peer artifact domain. The daemon child
             // artifact remains in module_generation.artifact_id and ClientHello.
             "artifact_digest": kernel_artifact_digest,

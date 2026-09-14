@@ -127,7 +127,7 @@ impl HostComposition {
         let candidate_digest = candidate
             .compute_digest()
             .map_err(|error| HostError::RecoveryRequired(error.to_string()))?;
-        let candidate_authority_epoch = candidate.kernel_epoch;
+        let candidate_authority_epoch = candidate.kernel_epoch.clone();
         let launch = self.jobs.launch.as_ref().ok_or_else(|| {
             HostError::RecoveryRequired(
                 "Store recovery reconciliation has no runtime launch descriptor".to_owned(),
@@ -141,7 +141,7 @@ impl HostComposition {
                 && record.request_digest.as_str() == inner_binding.store_rebind_request_digest
                 && record.fence == active_fence
                 && record.generation == launch.authority_generation.value()
-                && record.authority_epoch == candidate_authority_epoch.value()
+                && record.authority_epoch == candidate_authority_epoch.sequence.get()
                 && record.candidate_binding_digest.as_str() == candidate_digest
         });
         let Some(record) = committed.next() else {

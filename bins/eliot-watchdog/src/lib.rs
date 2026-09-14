@@ -472,7 +472,7 @@ impl IndependentKernelSensor {
                     service: SERVICE_NAME.to_owned(),
                     lease_id: lease.lease().lease_id.clone(),
                     scope_ref: lease.lease().scope_ref.clone(),
-                    kernel_epoch: lease.lease().kernel_epoch.value(),
+                    kernel_epoch: lease.lease().kernel_epoch.sequence.get(),
                     watchdog_epoch: lease.lease().watchdog_epoch.value(),
                     payload_digest: digest,
                     envelope_digest: lease.envelope_digest().to_owned(),
@@ -628,9 +628,21 @@ fn current_unix_ms() -> Result<u64, SpoolError> {
 mod tests {
     use super::registry_fixture::RegistryFixture;
     use super::*;
+    use eliot_contracts::{EpochId, EpochLineageId};
     use eliot_runtime_contracts::{SupervisionLeaseSigner, SupervisionLeaseVerifier};
     use std::collections::VecDeque;
+    use std::num::NonZeroU64;
     use std::sync::atomic::AtomicUsize;
+
+    const TEST_LINEAGE_A: &str = "550e8400-e29b-41d4-a716-446655440000";
+
+    fn test_epoch(sequence: u64) -> EpochId {
+        EpochId::new(
+            EpochLineageId::new(TEST_LINEAGE_A).expect("valid test lineage"),
+            NonZeroU64::new(sequence).expect("nonzero test sequence"),
+        )
+        .expect("valid test epoch")
+    }
 
     static FIXTURE_ID: AtomicUsize = AtomicUsize::new(0);
 
@@ -1032,7 +1044,10 @@ mod tests {
             "generation": generation,
             "authority_generation": authority_generation,
             "authority_state_fence": {
-                "authority_epoch": 1,
+                "authority_epoch": {
+                    "lineage_id": "550e8400-e29b-41d4-a716-446655440000",
+                    "sequence": 1
+                },
                 "resource_generation": authority_generation,
                 "task_revision": null,
                 "policy_revision": null,
@@ -1843,7 +1858,7 @@ mod tests {
             host_epoch: AuthorityEpoch::new(1)?,
             activation_id: eliot_ors::OperationIdentity::new("activation-1")?,
             activation_generation: eliot_contracts::ResourceGeneration::new(1)?,
-            kernel_epoch: AuthorityEpoch::new(2)?,
+            kernel_epoch: test_epoch(2),
             watchdog_epoch: AuthorityEpoch::new(1)?,
             generation_binding: eliot_runtime_contracts::SupervisionGenerationBinding {
                 target_id: "target-1".to_owned(),
@@ -1854,7 +1869,7 @@ mod tests {
                 process_generation: eliot_contracts::ResourceGeneration::new(1)?,
             },
             state_fence: eliot_contracts::StateFence::new(
-                AuthorityEpoch::new(2)?,
+                test_epoch(2),
                 eliot_contracts::ResourceGeneration::new(1)?,
             ),
             issued_at_ms,
@@ -1928,7 +1943,7 @@ mod tests {
             host_epoch: envelope.payload.host_epoch,
             activation_id: envelope.payload.activation_id.clone(),
             activation_generation: envelope.payload.activation_generation,
-            kernel_epoch: envelope.payload.kernel_epoch,
+            kernel_epoch: envelope.payload.kernel_epoch.clone(),
             watchdog_epoch: envelope.payload.watchdog_epoch,
             state_fence: envelope.payload.state_fence.clone(),
             scope_ref: envelope.payload.scope_ref.clone(),

@@ -15,6 +15,7 @@ use crate::KernelBuildError;
 use crate::sha256_hex;
 #[cfg(windows)]
 use crate::unix_ms;
+use eliot_contracts::EpochId;
 #[cfg(windows)]
 use eliot_kernel_service::EliotdLaunchDescriptor;
 #[cfg(windows)]
@@ -47,7 +48,7 @@ pub(crate) fn eliotd_launch_attempt_identity(
 ) -> Result<String, KernelBuildError> {
     #[derive(Serialize)]
     struct AttemptBinding<'a> {
-        authority_epoch: u64,
+        authority_epoch: EpochId,
         generation: u64,
         launch_nonce: &'a str,
         kernel_process_id: u32,
@@ -56,7 +57,9 @@ pub(crate) fn eliotd_launch_attempt_identity(
     }
 
     let bytes = serde_json::to_vec(&AttemptBinding {
-        authority_epoch: launch.authority_epoch.value(),
+        // INTENDED EpochId shape (Split A/B cutover): clone the lineage-aware
+        // authority. Integrator resolves order B→A→C.
+        authority_epoch: launch.authority_epoch.clone(),
         generation: launch.generation.value(),
         launch_nonce: launch.launch_nonce.as_str(),
         kernel_process_id,
@@ -112,13 +115,17 @@ pub(crate) fn fresh_eliotd_launch_descriptor(
 pub(crate) fn stable_owner_principal_digest(
     stable_sid: &str,
     module_id: &str,
-    authority_epoch: u64,
+    authority_epoch: &EpochId,
     generation: Generation,
 ) -> String {
     let mut principal = Sha256::new();
     principal.update(stable_sid.as_bytes());
     principal.update(module_id.as_bytes());
-    principal.update(authority_epoch.to_le_bytes());
+    // Lineage+sequence digest input (T6-E3): canonical lineage spelling plus
+    // sequence bytes. No bare-u64 to_le_bytes, no .sequence.get() adapter for
+    // comparison, no From<u64>.
+    principal.update(authority_epoch.lineage_id.as_str().as_bytes());
+    principal.update(authority_epoch.sequence.get().to_le_bytes());
     principal.update(generation.get().to_le_bytes());
     format!("{:x}", Sha256::digest(principal.finalize()))
 }

@@ -377,7 +377,7 @@ pub mod kernel_client {
     use std::collections::BTreeMap;
     use std::time::Duration;
 
-    use eliot_contracts::RequestId;
+    use eliot_contracts::{EpochId, RequestId};
     use eliot_ipc::{
         DeliveryOutcome, NamedPipeTransport, TransportLimits, client_hello_frame,
         decode_server_hello_frame,
@@ -419,7 +419,10 @@ pub mod kernel_client {
         /// Protected principal binding selected by the Kernel owner.
         pub expected_server_principal_binding: String,
         /// Protected authority epoch for the configured module generation.
-        pub expected_authority_epoch: u64,
+        ///
+        /// Lineage-aware [`EpochId`] exact tuple installed by the Kernel owner;
+        /// matched via `is_same_authority` against the live Kernel `ServerHello`.
+        pub expected_authority_epoch: EpochId,
         /// Numeric identity of the expected immutable module generation.
         pub expected_generation: u64,
         /// Digest/identity of the expected server artifact.
@@ -478,7 +481,7 @@ pub mod kernel_client {
         service: String,
         protocol: String,
         generation: u64,
-        authority_epoch: u64,
+        authority_epoch: EpochId,
         artifact_digest: String,
     }
 
@@ -753,8 +756,10 @@ pub mod kernel_client {
                 "Kernel server binding declaration is invalid".to_owned(),
             ));
         }
-        if config.expected_authority_epoch == 0
-            || config.expected_generation == 0
+        // `EpochId` is always a validated non-zero `(lineage_id, sequence)`
+        // tuple by construction; only the generation and snapshot digest need
+        // nonzero/shape checks here.
+        if config.expected_generation == 0
             || config.expected_config_snapshot_sha256.len() != 64
             || !config
                 .expected_config_snapshot_sha256
@@ -778,7 +783,9 @@ pub mod kernel_client {
         if hello.rejection_reason.is_some()
             || hello.selected_protocol != ProtocolVersion::CURRENT
             || hello.session_principal_binding != config.expected_server_principal_binding
-            || hello.authority_epoch.value() != config.expected_authority_epoch
+            || !hello
+                .authority_epoch
+                .is_same_authority(&config.expected_authority_epoch)
         {
             return Err(KernelClientError::Rejected(
                 "Kernel ServerHello is not bound to the protected authority".to_owned(),
@@ -786,7 +793,7 @@ pub mod kernel_client {
         }
         validate_server_snapshot(
             hello,
-            config.expected_authority_epoch,
+            &config.expected_authority_epoch,
             config.expected_generation,
             &config.expected_artifact_digest,
         )?;
@@ -803,7 +810,7 @@ pub mod kernel_client {
 
     fn validate_server_snapshot(
         hello: &ServerHello,
-        expected_authority_epoch: u64,
+        expected_authority_epoch: &EpochId,
         expected_generation: u64,
         expected_artifact_digest: &str,
     ) -> Result<(), KernelClientError> {
@@ -817,8 +824,12 @@ pub mod kernel_client {
             || snapshot.protocol != KERNEL_PROTOCOL_VERSION
             || snapshot.generation == 0
             || snapshot.generation != expected_generation
-            || snapshot.authority_epoch != expected_authority_epoch
-            || hello.authority_epoch.value() != snapshot.authority_epoch
+            || !snapshot
+                .authority_epoch
+                .is_same_authority(expected_authority_epoch)
+            || !hello
+                .authority_epoch
+                .is_same_authority(&snapshot.authority_epoch)
             || snapshot.artifact_digest.len() != 64
             || !snapshot
                 .artifact_digest
@@ -916,7 +927,23 @@ pub mod kernel_client {
     #[allow(clippy::expect_used, clippy::items_after_test_module)]
     mod tests {
         use super::*;
-        use eliot_contracts::AuthorityEpoch;
+        use eliot_contracts::{EpochId, EpochLineageId};
+        use std::num::NonZeroU64;
+
+        const TEST_LINEAGE: &str = "550e8400-e29b-41d4-a716-446655440000";
+        const OTHER_LINEAGE: &str = "550e8400-e29b-41d4-a716-446655440001";
+
+        fn test_epoch(sequence: u64) -> EpochId {
+            EpochId::new(
+                EpochLineageId::new(TEST_LINEAGE).expect("valid test lineage"),
+                NonZeroU64::new(sequence).expect("nonzero test sequence"),
+            )
+            .expect("valid test epoch")
+        }
+
+        fn epoch_json(sequence: u64) -> Value {
+            serde_json::json!({"lineage_id": TEST_LINEAGE, "sequence": sequence})
+        }
 
         fn server_hello(snapshot: Value) -> ServerHello {
             ServerHello {
@@ -928,47 +955,60 @@ pub mod kernel_client {
                 heartbeat_ms: 1_000,
                 control_channel: KERNEL_FRONT_DOOR_PIPE.to_owned(),
                 rejection_reason: None,
-                authority_epoch: AuthorityEpoch::new(7).expect("epoch"),
+                authority_epoch: test_epoch(7),
             }
         }
 
         #[test]
         fn server_hello_fixture_binds_numeric_generation_authority_and_artifact() {
             let artifact_digest = "a".repeat(64);
+            let expected = test_epoch(7);
             let hello = server_hello(serde_json::json!({
                 "service": KERNEL_SERVICE_NAME,
                 "protocol": KERNEL_PROTOCOL_VERSION,
                 "generation": 11,
-                "authority_epoch": 7,
+                "authority_epoch": epoch_json(7),
                 "artifact_digest": artifact_digest,
             }));
             assert_eq!(
-                validate_server_snapshot(&hello, 7, 11, &"a".repeat(64)),
+                validate_server_snapshot(&hello, &expected, 11, &"a".repeat(64)),
                 Ok(())
             );
         }
 
         #[test]
         fn server_hello_fixture_rejects_numeric_or_artifact_substitution() {
+            let expected = test_epoch(7);
             let hello = server_hello(serde_json::json!({
                 "service": KERNEL_SERVICE_NAME,
                 "protocol": KERNEL_PROTOCOL_VERSION,
                 "generation": 11,
-                "authority_epoch": 7,
+                "authority_epoch": epoch_json(7),
                 "artifact_digest": "a".repeat(64),
             }));
-            assert!(validate_server_snapshot(&hello, 7, 12, &"a".repeat(64)).is_err());
-            assert!(validate_server_snapshot(&hello, 7, 11, &"b".repeat(64)).is_err());
+            assert!(validate_server_snapshot(&hello, &expected, 12, &"a".repeat(64)).is_err());
+            assert!(validate_server_snapshot(&hello, &expected, 11, &"b".repeat(64)).is_err());
+            let wrong_sequence = test_epoch(8);
+            assert!(
+                validate_server_snapshot(&hello, &wrong_sequence, 11, &"a".repeat(64)).is_err()
+            );
+            let wrong_lineage = EpochId::new(
+                EpochLineageId::new(OTHER_LINEAGE).expect("valid test lineage"),
+                NonZeroU64::new(7).expect("nonzero test sequence"),
+            )
+            .expect("valid test epoch");
+            assert!(validate_server_snapshot(&hello, &wrong_lineage, 11, &"a".repeat(64)).is_err());
         }
 
         #[test]
         fn server_hello_fixture_rejects_current_open_kernel_snapshot_until_n4_binds_artifact() {
+            let expected = test_epoch(1);
             let hello = server_hello(serde_json::json!({
                 "service": KERNEL_SERVICE_NAME,
                 "protocol": KERNEL_PROTOCOL_VERSION,
                 "generation": 1,
             }));
-            assert!(validate_server_snapshot(&hello, 1, 1, &"a".repeat(64)).is_err());
+            assert!(validate_server_snapshot(&hello, &expected, 1, &"a".repeat(64)).is_err());
         }
     }
 

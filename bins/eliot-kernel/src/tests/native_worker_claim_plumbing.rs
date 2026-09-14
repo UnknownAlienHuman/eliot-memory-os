@@ -17,7 +17,7 @@
 
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use eliot_contracts::{AuthorityEpoch, ResourceGeneration, StateFence};
+use eliot_contracts::{AuthorityEpoch, EpochId, EpochLineageId, ResourceGeneration, StateFence};
 use eliot_kernel_service::{
     HostKernelCandidateBinding, KernelActivationPermit, KernelControlCommand, KernelReadyReceipt,
     KernelService, KernelServiceState, NATIVE_WORKER_CLAIM_WIRE_ID,
@@ -34,6 +34,14 @@ use eliot_runtime_contracts::{
 
 use crate::KernelComposition;
 
+fn test_epoch(sequence: u64) -> EpochId {
+    EpochId::new(
+        EpochLineageId::new("550e8400-e29b-41d4-a716-446655440000").expect("lineage"),
+        std::num::NonZeroU64::new(sequence).expect("sequence"),
+    )
+    .expect("epoch")
+}
+
 fn now_ms() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -48,7 +56,7 @@ fn handle(value: &str) -> PlatformHandle {
 }
 
 fn live_fence() -> StateFence {
-    StateFence::new(AuthorityEpoch::genesis(), ResourceGeneration::genesis())
+    StateFence::new(test_epoch(1), ResourceGeneration::genesis())
 }
 
 fn candidate_binding() -> HostKernelCandidateBinding {
@@ -56,7 +64,7 @@ fn candidate_binding() -> HostKernelCandidateBinding {
     HostKernelCandidateBinding {
         installation_id: handle("installation-1"),
         host_epoch: AuthorityEpoch::new(1).expect("host epoch"),
-        kernel_epoch: AuthorityEpoch::genesis(),
+        kernel_epoch: test_epoch(1),
         activation_id: handle("activation-1"),
         artifact_hash: handle("artifact-1"),
         config_hash: handle("config-1"),
@@ -209,7 +217,7 @@ fn test_claim_request(
         expected_result_schema: "result-schema".to_owned(),
         expected_result_schema_version: 1,
         predecessor_revision: "rev-1".to_owned(),
-        authority_epoch: AuthorityEpoch::genesis(),
+        authority_epoch: test_epoch(1),
         state_fence: fence,
         binding_digest: String::new(),
         request_digest: String::new(),
@@ -265,32 +273,17 @@ fn typed_cross_binding_and_fail_closed_gates() {
     );
     // Exact registration binds; foreign identity/generation/epoch/fence fail.
     request
-        .validate_presented_under_registration(
-            "reg-gate-1",
-            1,
-            AuthorityEpoch::genesis(),
-            &live_fence(),
-        )
+        .validate_presented_under_registration("reg-gate-1", 1, test_epoch(1), &live_fence())
         .expect("exact registration binds");
     assert!(
         request
-            .validate_presented_under_registration(
-                "reg-foreign",
-                1,
-                AuthorityEpoch::genesis(),
-                &live_fence(),
-            )
+            .validate_presented_under_registration("reg-foreign", 1, test_epoch(1), &live_fence(),)
             .is_err(),
         "foreign registration must not bind"
     );
     assert!(
         request
-            .validate_presented_under_registration(
-                "reg-gate-1",
-                2,
-                AuthorityEpoch::genesis(),
-                &live_fence(),
-            )
+            .validate_presented_under_registration("reg-gate-1", 2, test_epoch(1), &live_fence(),)
             .is_err(),
         "foreign generation must not bind"
     );
@@ -360,10 +353,7 @@ fn route_resource_fence_and_credential_shape() {
     // Presenting fence digest matches itself and differs on a changed fence.
     let digest = KernelComposition::presenting_fence_digest(&live_fence()).expect("fence digest");
     assert_eq!(digest.len(), 64);
-    let other_fence = StateFence::new(
-        AuthorityEpoch::new(2).expect("epoch"),
-        ResourceGeneration::genesis(),
-    );
+    let other_fence = StateFence::new(test_epoch(2), ResourceGeneration::genesis());
     let other = KernelComposition::presenting_fence_digest(&other_fence).expect("other digest");
     assert_ne!(digest, other, "changed fence must change its digest");
     // Credential references carry only provider/key; secret smuggling fails.
@@ -420,7 +410,7 @@ fn stage_persists_requested_row_with_real_store() {
         budget_digest,
         deadline_unix_ms: request.deadline_unix_ms,
         fence_digest,
-        authority_epoch: request.authority_epoch.value(),
+        authority_epoch: request.authority_epoch.sequence.get(),
         binding_digest: request.binding_digest.clone(),
         request_digest: request.request_digest.clone(),
         execution_unit_schema_version: request.execution_unit_schema_version,

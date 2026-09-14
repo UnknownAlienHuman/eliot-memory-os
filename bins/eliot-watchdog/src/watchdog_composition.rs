@@ -161,7 +161,7 @@ impl WatchdogComposition {
                         }
                         match kernel.supervise(admission.lease()).await {
                             Ok(()) => authority_state.publish_admitted(
-                                admission.lease().lease().kernel_epoch.value(),
+                                admission.lease().lease().kernel_epoch.sequence.get(),
                                 admission.watchdog_epoch().value(),
                             ),
                             Err(error) => {

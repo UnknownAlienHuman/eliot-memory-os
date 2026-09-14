@@ -8,6 +8,7 @@
 use std::time::Duration;
 use std::{cmp::Ordering, future::Future};
 
+use eliot_contracts::EpochId;
 use eliot_protocol::{
     AgentBridgeClientDeclaration, AgentBridgePeerAdmissionReceipt, AgentBridgePeerChallenge,
     ClientHello, EncodingProfile, Frame, FrameKind, MessageType, ProtocolError, ProtocolPayload,
@@ -980,7 +981,7 @@ pub struct Session {
     pub protocol_version: ProtocolVersion,
     pub peer: PeerIdentity,
     /// Authority epoch captured by the handshake; reconnects must bind anew.
-    pub authority_epoch: u64,
+    pub authority_epoch: EpochId,
     /// Complete immutable generation, artifact and Kernel fence captured by the handshake.
     pub module_generation: ModuleGeneration,
     pub launch_nonce: String,
@@ -1017,7 +1018,7 @@ impl Session {
             connection_id,
             protocol_version: ProtocolVersion::CURRENT,
             peer,
-            authority_epoch: module_generation.state_fence.authority_epoch.value(),
+            authority_epoch: module_generation.state_fence.authority_epoch.clone(),
             module_generation,
             launch_nonce: session_nonce,
             capabilities: Vec::new(),
@@ -1045,7 +1046,7 @@ impl Session {
             connection_id,
             protocol_version,
             peer,
-            authority_epoch: client.authority_epoch.value(),
+            authority_epoch: client.authority_epoch.clone(),
             module_generation: client.module_generation.clone(),
             launch_nonce: client.launch_nonce.clone(),
             capabilities: client.capabilities.clone(),
@@ -1070,7 +1071,9 @@ impl Session {
             || client.module_generation.module_id.as_str() != server.module_id
             || client.module_generation != server.module_generation
             || client.artifact_hash != server.module_generation.artifact_id
-            || client.authority_epoch != server.module_generation.state_fence.authority_epoch
+            || !client
+                .authority_epoch
+                .is_same_authority(&server.module_generation.state_fence.authority_epoch)
             || client.launch_nonce != server.launch_nonce
         {
             return Err(TransportError::SessionFenced);
@@ -1084,7 +1087,7 @@ impl Session {
             connection_id: connection_id.into(),
             protocol_version,
             peer,
-            authority_epoch: server.module_generation.state_fence.authority_epoch.value(),
+            authority_epoch: server.module_generation.state_fence.authority_epoch.clone(),
             module_generation: server.module_generation.clone(),
             launch_nonce: server.launch_nonce.clone(),
             capabilities: capabilities.clone(),
@@ -1102,7 +1105,7 @@ impl Session {
             heartbeat_ms: server.heartbeat_ms,
             control_channel: server.control_channel.clone(),
             rejection_reason: None,
-            authority_epoch: server.module_generation.state_fence.authority_epoch,
+            authority_epoch: server.module_generation.state_fence.authority_epoch.clone(),
         };
         server_hello.validate()?;
         Ok(HandshakeResult {
@@ -1131,16 +1134,18 @@ impl Session {
     }
 
     /// Returns whether a frame belongs to this still-live session fence.
-    pub fn accepts(&self, authority_epoch: u64, session_epoch: u64) -> bool {
+    pub fn accepts(&self, authority_epoch: &EpochId, session_epoch: u64) -> bool {
         self.state == SessionState::Open
-            && self.authority_epoch == authority_epoch
+            && self.authority_epoch.is_same_authority(authority_epoch)
             && self.session_epoch == session_epoch
     }
 
     /// Checks all generation/fence bindings, not only the numeric epoch.
     pub fn accepts_bound(&self, generation: &ModuleGeneration, launch_nonce: &str) -> bool {
         self.state == SessionState::Open
-            && self.authority_epoch == generation.state_fence.authority_epoch.value()
+            && self
+                .authority_epoch
+                .is_same_authority(&generation.state_fence.authority_epoch)
             && self.module_generation == *generation
             && self.launch_nonce == launch_nonce
     }
@@ -1329,7 +1334,15 @@ fn health_dimension_rank(dimension: HealthDimension) -> u8 {
 ///
 /// The lifecycle and health enums use their explicit contract declaration
 /// ranks. All identifier, counter and optional fence fields use their typed
-/// `Ord`; no wire serialization participates in this order.
+/// `Ord`; the lineage-aware authority epoch uses its canonical digest
+/// ordering (digest-only, no scalar `Ord` on `EpochId`); no wire
+/// serialization participates in this order.
+fn epoch_digest_key(epoch: &EpochId) -> String {
+    eliot_contracts::StateFence::canonical_epoch_digest(epoch)
+        .map(|digest| digest.to_string())
+        .unwrap_or_default()
+}
+
 fn compare_module_generation(left: &ModuleGeneration, right: &ModuleGeneration) -> Ordering {
     left.module_id
         .cmp(&right.module_id)
@@ -1363,9 +1376,8 @@ fn compare_module_generation(left: &ModuleGeneration, right: &ModuleGeneration) 
                 .cmp(&health_dimension_rank(right.health.capacity))
         })
         .then_with(|| {
-            left.state_fence
-                .authority_epoch
-                .cmp(&right.state_fence.authority_epoch)
+            epoch_digest_key(&left.state_fence.authority_epoch)
+                .cmp(&epoch_digest_key(&right.state_fence.authority_epoch))
         })
         .then_with(|| {
             left.state_fence
@@ -2499,6 +2511,18 @@ mod tests {
 
     type TestResult = Result<(), Box<dyn std::error::Error>>;
 
+    fn test_epoch(sequence: u64) -> EpochId {
+        use eliot_contracts::{EpochId, EpochLineageId};
+        use std::num::NonZeroU64;
+        let lineage = EpochLineageId::new("550e8400-e29b-41d4-a716-446655440000")
+            .expect("canonical test lineage-A");
+        EpochId::new(
+            lineage,
+            NonZeroU64::new(sequence).expect("non-zero test sequence"),
+        )
+        .expect("valid test epoch")
+    }
+
     fn module_generation(epoch: u64) -> Result<ModuleGeneration, serde_json::Error> {
         serde_json::from_value(serde_json::json!({
             "module_id": "module.test",
@@ -2514,7 +2538,7 @@ mod tests {
                 "capacity": "HEALTHY"
             },
             "state_fence": {
-                "authority_epoch": epoch,
+                "authority_epoch": {"lineage_id": "550e8400-e29b-41d4-a716-446655440000", "sequence": epoch},
                 "resource_generation": 1,
                 "task_revision": null,
                 "policy_revision": null,
@@ -2639,8 +2663,9 @@ mod tests {
         }
 
         let mut variant = base.clone();
-        variant.module_generation.state_fence.authority_epoch =
-            serde_json::from_value(serde_json::json!(2))?;
+        variant.module_generation.state_fence.authority_epoch = serde_json::from_value(
+            serde_json::json!({"lineage_id": "550e8400-e29b-41d4-a716-446655440000", "sequence": 2}),
+        )?;
         variants.push(("authority_epoch".to_owned(), variant));
 
         let mut variant = base.clone();
@@ -2742,10 +2767,10 @@ mod tests {
     #[test]
     fn bound_identity_order_is_independent_of_serialization_field_order() -> TestResult {
         let first: ModuleGeneration = serde_json::from_str(
-            r#"{"module_id":"module.test","generation":1,"artifact_id":"artifact","state":"ACTIVE","health":{"liveness":"HEALTHY","readiness":"HEALTHY","freshness":"HEALTHY","compatibility":"HEALTHY","integrity":"HEALTHY","capacity":"HEALTHY"},"state_fence":{"authority_epoch":1,"resource_generation":1,"task_revision":null,"policy_revision":null,"integration_revision":null}}"#,
+            r#"{"module_id":"module.test","generation":1,"artifact_id":"artifact","state":"ACTIVE","health":{"liveness":"HEALTHY","readiness":"HEALTHY","freshness":"HEALTHY","compatibility":"HEALTHY","integrity":"HEALTHY","capacity":"HEALTHY"},"state_fence":{"authority_epoch":{"lineage_id":"550e8400-e29b-41d4-a716-446655440000","sequence":1},"resource_generation":1,"task_revision":null,"policy_revision":null,"integration_revision":null}}"#,
         )?;
         let second: ModuleGeneration = serde_json::from_str(
-            r#"{"state_fence":{"integration_revision":null,"policy_revision":null,"task_revision":null,"resource_generation":1,"authority_epoch":1},"health":{"capacity":"HEALTHY","integrity":"HEALTHY","compatibility":"HEALTHY","freshness":"HEALTHY","readiness":"HEALTHY","liveness":"HEALTHY"},"state":"ACTIVE","artifact_id":"artifact","generation":1,"module_id":"module.test"}"#,
+            r#"{"state_fence":{"integration_revision":null,"policy_revision":null,"task_revision":null,"resource_generation":1,"authority_epoch":{"lineage_id":"550e8400-e29b-41d4-a716-446655440000","sequence":1}},"health":{"capacity":"HEALTHY","integrity":"HEALTHY","compatibility":"HEALTHY","freshness":"HEALTHY","readiness":"HEALTHY","liveness":"HEALTHY"},"state":"ACTIVE","artifact_id":"artifact","generation":1,"module_id":"module.test"}"#,
         )?;
         let first = BoundIdentity::new("stream", first, "request")?;
         let second = BoundIdentity::new("stream", second, "request")?;
@@ -2783,9 +2808,9 @@ mod tests {
             module_generation(7)?,
             "kernel-session-fence-1",
         )?;
-        assert!(session.accepts(7, 1));
+        assert!(session.accepts(&test_epoch(7), 1));
         session.fence();
-        assert!(!session.accepts(7, 1));
+        assert!(!session.accepts(&test_epoch(7), 1));
         Ok(())
     }
 
@@ -2856,7 +2881,7 @@ mod tests {
                     "capacity": "HEALTHY"
                 },
                 "state_fence": {
-                    "authority_epoch": 7,
+                    "authority_epoch": {"lineage_id": "550e8400-e29b-41d4-a716-446655440000", "sequence": 7},
                     "resource_generation": 1,
                     "task_revision": null,
                     "policy_revision": null,
@@ -2869,7 +2894,7 @@ mod tests {
             "expected_kernel_sid": "S-1-5-18",
             "expected_kernel_session_id": 0,
             "expected_kernel_principal_binding": "kernel:agent-bridge",
-            "expected_kernel_authority_epoch": 8,
+            "expected_kernel_authority_epoch": {"lineage_id": "550e8400-e29b-41d4-a716-446655440000", "sequence": 8},
             "expected_kernel_generation": 2,
             "expected_kernel_artifact_sha256": "b".repeat(64),
             "expected_kernel_config_snapshot_sha256": "c".repeat(64),
@@ -2892,7 +2917,7 @@ mod tests {
             bridge_generation: declaration.module_generation.generation,
             state_fence: declaration.module_generation.state_fence.clone(),
             kernel_principal_binding: declaration.expected_kernel_principal_binding.clone(),
-            kernel_authority_epoch: declaration.expected_kernel_authority_epoch,
+            kernel_authority_epoch: declaration.expected_kernel_authority_epoch.clone(),
             kernel_generation: declaration.expected_kernel_generation,
             kernel_artifact_sha256: declaration.expected_kernel_artifact_sha256.clone(),
             kernel_config_snapshot_sha256: declaration
@@ -3135,7 +3160,9 @@ mod tests {
         );
 
         let mut fence_challenge = challenge.clone();
-        fence_challenge.state_fence.authority_epoch = serde_json::from_value(serde_json::json!(8))?;
+        fence_challenge.state_fence.authority_epoch = serde_json::from_value(
+            serde_json::json!({"lineage_id": "550e8400-e29b-41d4-a716-446655440000", "sequence": 8}),
+        )?;
         fence_challenge = fence_challenge.with_computed_digest()?;
         assert!(
             ServerFirstConnection::new("server-connection", fence_challenge, &declaration).is_err()
@@ -3215,7 +3242,7 @@ mod tests {
             peer: PeerIdentity::Unavailable {
                 reason: PeerIdentityUnavailable::ProviderProofNotComposed,
             },
-            authority_epoch: 4,
+            authority_epoch: test_epoch(4),
             module_generation: module_generation(4)?,
             launch_nonce: "nonce".into(),
             capabilities: Vec::new(),
@@ -3224,7 +3251,7 @@ mod tests {
             session_epoch: 2,
             state: SessionState::Open,
         };
-        assert!(!session.accepts(3, 2));
+        assert!(!session.accepts(&test_epoch(3), 2));
         let frame = heartbeat();
         let mut ledger = ReplayLedger::default();
         assert_eq!(ledger.observe("event", &frame)?, ReplayDisposition::New);
@@ -3257,7 +3284,7 @@ mod tests {
             IntegrationDependency::PlanGap
         );
         session.fence();
-        assert!(!session.accepts(4, 2));
+        assert!(!session.accepts(&test_epoch(4), 2));
         Ok(())
     }
 

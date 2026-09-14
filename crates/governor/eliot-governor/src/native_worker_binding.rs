@@ -38,9 +38,7 @@
 //!   `generation` must equal `state_fence.resource_generation`; the fence is
 //!   the binding authority, not a parallel epoch/generation claim.
 
-use eliot_contracts::{
-    AuthorityEpoch, ResourceGeneration, StateFence, canonical_json_bytes, sha256_hex,
-};
+use eliot_contracts::{EpochId, ResourceGeneration, StateFence, canonical_json_bytes, sha256_hex};
 use eliot_store_api::EffectClass;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
@@ -177,7 +175,7 @@ pub struct NativeWorkerExecutableBinding {
     /// Exact fence this binding was compiled against.
     pub state_fence: StateFence,
     /// Authority epoch, must equal `state_fence.authority_epoch`.
-    pub authority_epoch: AuthorityEpoch,
+    pub authority_epoch: EpochId,
     /// Resource generation, must equal `state_fence.resource_generation`.
     pub generation: ResourceGeneration,
     /// Execution deadline in Unix milliseconds (nonzero, before expiry).
@@ -270,7 +268,10 @@ impl NativeWorkerExecutableBinding {
         self.state_fence
             .validate()
             .map_err(|error| format!("state_fence invalid: {error}"))?;
-        if self.authority_epoch != self.state_fence.authority_epoch {
+        if !self
+            .authority_epoch
+            .is_same_authority(&self.state_fence.authority_epoch)
+        {
             return Err("authority_epoch must equal state_fence.authority_epoch".to_owned());
         }
         if self.generation != self.state_fence.resource_generation {

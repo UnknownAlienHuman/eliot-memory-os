@@ -48,7 +48,7 @@ use super::{
     caller_binding, native_worker_reconcile_route::NATIVE_WORKER_RECONCILE_OPERATION, sha256_json,
     status_frame, unix_ms,
 };
-use eliot_contracts::{AuthorityEpoch, StateFence, canonical_json_bytes, sha256_hex};
+use eliot_contracts::{StateFence, canonical_json_bytes, sha256_hex};
 use eliot_ipc::{Session, TransportError};
 use eliot_kernel_service::{
     NATIVE_WORKER_CLAIM_WIRE_ID, NATIVE_WORKER_CLAIM_WIRE_VERSION,
@@ -351,7 +351,7 @@ impl NativeWorkerBindingView {
             }
         })?;
         let authority_epoch = native_worker_json_u64(binding, "authority_epoch")?;
-        if fence.authority_epoch.value() != authority_epoch {
+        if fence.authority_epoch.sequence.get() != authority_epoch {
             return Err(NativeWorkerRouteError::Fence {
                 field: "binding.epoch_fence",
             });
@@ -667,7 +667,9 @@ impl KernelComposition {
             serde_json::from_value(fence_value).map_err(|_| NativeWorkerRouteError::Shape {
                 field: "state_fence",
             })?;
-        if fence.authority_epoch.value() != native_worker_json_u64(payload, "authority_epoch")? {
+        if fence.authority_epoch.sequence.get()
+            != native_worker_json_u64(payload, "authority_epoch")?
+        {
             return Err(NativeWorkerRouteError::Fence {
                 field: "epoch_fence",
             });
@@ -799,7 +801,9 @@ impl KernelComposition {
             serde_json::from_value(fence_value).map_err(|_| NativeWorkerRouteError::Shape {
                 field: "state_fence",
             })?;
-        if fence.authority_epoch.value() != native_worker_json_u64(payload, "authority_epoch")? {
+        if fence.authority_epoch.sequence.get()
+            != native_worker_json_u64(payload, "authority_epoch")?
+        {
             return Err(NativeWorkerRouteError::Fence {
                 field: "epoch_fence",
             });
@@ -888,12 +892,17 @@ impl KernelComposition {
             serde_json::from_value(fence_value).map_err(|_| NativeWorkerRouteError::Shape {
                 field: "state_fence",
             })?;
-        let authority_epoch =
-            AuthorityEpoch::new(native_worker_json_u64(claim, "authority_epoch")?).map_err(
-                |_| NativeWorkerRouteError::Fence {
-                    field: "authority_epoch",
-                },
-            )?;
+        // Lineage-aware bridge (Implements #64): the scalar JSON contour
+        // carries only the sequence; the canonical `EpochId` keeps the fence
+        // lineage. The sequence must match the fence tuple exactly, otherwise
+        // cross-lineage same-sequence presentation fails closed.
+        let presented_sequence = native_worker_json_u64(claim, "authority_epoch")?;
+        if fence.authority_epoch.sequence.get() != presented_sequence {
+            return Err(NativeWorkerRouteError::Fence {
+                field: "authority_epoch",
+            });
+        }
+        let authority_epoch = fence.authority_epoch.clone();
         Ok(NativeWorkerClaimRequest {
             wire_id: require_claim_text(claim, "wire_id")?,
             wire_version: native_worker_json_u16(claim, "wire_version")?,
@@ -1098,24 +1107,30 @@ impl KernelComposition {
         Self::require_message_identity(identity, &claim_id)?;
         Self::require_claim_deadline(claim, now)?;
         let request = Self::build_claim_request(claim)?;
+        // Same lineage-aware bridge as `validate_native_worker_claim`: the
+        // registration scalar contour must match its fence tuple exactly.
+        let registration_fence: StateFence =
+            serde_json::from_value(registration.get("state_fence").cloned().ok_or(
+                NativeWorkerRouteError::Shape {
+                    field: "state_fence",
+                },
+            )?)
+            .map_err(|_| NativeWorkerRouteError::Shape {
+                field: "state_fence",
+            })?;
+        if registration_fence.authority_epoch.sequence.get()
+            != native_worker_json_u64(registration, "authority_epoch")?
+        {
+            return Err(NativeWorkerRouteError::Fence {
+                field: "authority_epoch",
+            });
+        }
         request
             .validate_presented_under_registration(
                 &require_op_id(registration, "registration_id")?,
                 require_nonzero_u64(registration, "worker_generation")?,
-                AuthorityEpoch::new(native_worker_json_u64(registration, "authority_epoch")?)
-                    .map_err(|_| NativeWorkerRouteError::Fence {
-                        field: "authority_epoch",
-                    })?,
-                &serde_json::from_value::<StateFence>(
-                    registration.get("state_fence").cloned().ok_or(
-                        NativeWorkerRouteError::Shape {
-                            field: "state_fence",
-                        },
-                    )?,
-                )
-                .map_err(|_| NativeWorkerRouteError::Shape {
-                    field: "state_fence",
-                })?,
+                registration_fence.authority_epoch.clone(),
+                &registration_fence,
             )
             .map_err(|_| NativeWorkerRouteError::Fence {
                 field: "registration_binding",
@@ -1403,7 +1418,7 @@ impl KernelComposition {
                 field: "authority_epoch",
             });
         }
-        if binding.fence.authority_epoch.value() != binding.authority_epoch {
+        if binding.fence.authority_epoch.sequence.get() != binding.authority_epoch {
             return Err(NativeWorkerRouteError::Fence {
                 field: "epoch_fence",
             });

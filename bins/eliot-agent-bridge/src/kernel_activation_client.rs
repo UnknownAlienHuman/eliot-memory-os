@@ -238,7 +238,10 @@ pub(super) fn decode_activation_response(
     if let eliot_protocol::AgentBridgeActivationDisposition::Authenticated { binding } =
         &response.disposition
         && (binding.activation_generation != admission.state_fence.resource_generation
-            || binding.state_fence.authority_epoch != admission.state_fence.authority_epoch
+            || !binding
+                .state_fence
+                .authority_epoch
+                .is_same_authority(&admission.state_fence.authority_epoch)
             || binding.state_fence.generation != admission.state_fence.resource_generation)
     {
         return Err(provider_failure());
@@ -317,8 +320,9 @@ impl KernelTransportOwner {
                     WorkUnitId::new(b.work_unit_id).map_err(|_| provider_failure())?;
                 let generation = Generation::new(b.activation_generation.value())
                     .map_err(|_| provider_failure())?;
+                // INTENDED EpochId shape (B→A→C): fence carries EpochId after B.
                 let fence = FencingToken::new(
-                    b.state_fence.authority_epoch.value(),
+                    b.state_fence.authority_epoch.clone(),
                     generation,
                     b.state_fence.nonce,
                 )

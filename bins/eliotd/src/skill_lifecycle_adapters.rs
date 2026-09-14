@@ -103,10 +103,21 @@ mod tests {
     use std::sync::{Arc, Mutex};
 
     use eliot_contracts::{
-        AuthorityEpoch, ClockReading, OperationId, ProductId, RequestId, RequestMetadata,
+        ClockReading, EpochId, EpochLineageId, OperationId, ProductId, RequestId, RequestMetadata,
         ResourceGeneration, SessionId, SourceId, StateFence,
     };
     use eliot_skill::{DependencyVersion, LifecycleAction, SkillScope};
+    use std::num::NonZeroU64;
+
+    const TEST_LINEAGE_A: &str = "550e8400-e29b-41d4-a716-446655440000";
+
+    fn test_epoch(sequence: u64) -> EpochId {
+        EpochId::new(
+            EpochLineageId::new(TEST_LINEAGE_A).expect("valid test lineage"),
+            NonZeroU64::new(sequence).expect("nonzero test sequence"),
+        )
+        .expect("valid test epoch")
+    }
 
     struct ClosedInner {
         fence_mismatch: bool,
@@ -155,7 +166,7 @@ mod tests {
 
     fn fence() -> StateFence {
         StateFence::new(
-            AuthorityEpoch::new(1).expect("epoch"),
+            test_epoch(1),
             ResourceGeneration::new(1).expect("generation"),
         )
     }

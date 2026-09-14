@@ -553,6 +553,32 @@ where
     }
 }
 
+// Canonical lineage-A fixture epoch (Implements #64).
+const TEST_LINEAGE_A: &str = "550e8400-e29b-41d4-a716-446655440000";
+
+fn test_epoch(sequence: u64) -> eliot_contracts::EpochId {
+    use std::num::NonZeroU64;
+    eliot_contracts::EpochId::new(
+        eliot_contracts::EpochLineageId::new(TEST_LINEAGE_A).expect("valid test lineage"),
+        NonZeroU64::new(sequence).expect("nonzero test sequence"),
+    )
+    .expect("valid test epoch")
+}
+
+fn next_epoch(current: &eliot_contracts::EpochId) -> eliot_contracts::EpochId {
+    use std::num::NonZeroU64;
+    let next_sequence = current
+        .sequence
+        .get()
+        .checked_add(1)
+        .unwrap_or_else(|| unreachable!());
+    eliot_contracts::EpochId::new(
+        current.lineage_id.clone(),
+        NonZeroU64::new(next_sequence).unwrap_or_else(|| unreachable!()),
+    )
+    .unwrap_or_else(|_| unreachable!())
+}
+
 fn test_handle(value: impl Into<String>) -> PlatformHandle {
     must(PlatformHandle::new(value.into()))
 }
@@ -1652,7 +1678,7 @@ fn registering_transaction() -> InstallationTransaction {
                 generation: test_handle("generation:candidate"),
                 authority_generation: ResourceGeneration::genesis(),
                 authority_state_fence: StateFence::new(
-                    eliot_contracts::AuthorityEpoch::genesis(),
+                    test_epoch(1),
                     ResourceGeneration::genesis(),
                 ),
                 supervision_authority: SupervisionAuthorityBinding::Pending {
@@ -4875,9 +4901,8 @@ fn activation_approval_rejects_each_transaction_binding_mismatch() {
     value.authority_state_fence.resource_generation = next_generation;
     mismatches.push(value);
     let mut value = approval.clone();
-    value.authority_state_fence.authority_epoch = must(AuthorityEpoch::new(
-        approval.authority_state_fence.authority_epoch.value() + 1,
-    ));
+    value.authority_state_fence.authority_epoch =
+        next_epoch(&approval.authority_state_fence.authority_epoch);
     mismatches.push(value);
 
     assert_eq!(mismatches.len(), 11);
@@ -6737,15 +6762,7 @@ fn committed_registry_terminal_reconciles_real_redb_transaction_once() {
     stale_epoch
         .commit_fence
         .authority_state_fence
-        .authority_epoch = must(AuthorityEpoch::new(
-        stale_epoch
-            .commit_fence
-            .authority_state_fence
-            .authority_epoch
-            .value()
-            .checked_add(1)
-            .unwrap_or_else(|| unreachable!()),
-    ));
+        .authority_epoch = next_epoch(&receipt.commit_fence.authority_state_fence.authority_epoch);
     assert!(matches!(
         transaction_store
             .reconcile_active_verified(stale_epoch, vec![test_handle("evidence:stale-epoch")],),

@@ -305,7 +305,8 @@ pub(super) fn inspect_store_live(
             .runtime_launch
             .authority_state_fence
             .authority_epoch
-            .value()
+            .sequence
+            .get()
     {
         return unknown_component(
             "Store",
@@ -316,7 +317,8 @@ pub(super) fn inspect_store_live(
                     .runtime_launch
                     .authority_state_fence
                     .authority_epoch
-                    .value()
+                    .sequence
+                    .get()
             ),
         );
     }

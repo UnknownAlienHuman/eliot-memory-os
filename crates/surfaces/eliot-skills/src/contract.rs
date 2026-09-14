@@ -2170,7 +2170,7 @@ mod tests {
 
     fn scope() -> MaterializationScope {
         serde_json::from_str(
-            r#"{"work_scope":{"scope_id":"scope","product_id":"product","resource_generation":1,"state_fence":{"authority_epoch":1,"resource_generation":1}},"task":null}"#,
+            r#"{"work_scope":{"scope_id":"scope","product_id":"product","resource_generation":1,"state_fence":{"authority_epoch":{"lineage_id":"550e8400-e29b-41d4-a716-446655440000","sequence":1},"resource_generation":1}},"task":null}"#,
         )
         .expect("valid scope fixture")
     }
@@ -2219,7 +2219,7 @@ mod tests {
         let identity_digest = package
             .materialization_identity_digest(&inputs())
             .expect("materialization identity");
-        let fence = serde_json::json!({"authority_epoch":1,"resource_generation":1});
+        let fence = serde_json::json!({"authority_epoch":{"lineage_id":"550e8400-e29b-41d4-a716-446655440000","sequence":1},"resource_generation":1});
         let request_id = format!("request-{}", spec.operation_id);
         let mut artifacts = vec![serde_json::json!({
             "artifact_id": "package-artifact",
@@ -2309,7 +2309,7 @@ mod tests {
             "authority":{
                 "authority_id":"g16-authority",
                 "authority_owner":"G-16",
-                "authority_epoch":1,
+                "authority_epoch":{"lineage_id":"550e8400-e29b-41d4-a716-446655440000","sequence":1},
                 "state_fence":fence,
                 "allowed_effect":spec.effect,
                 "proof_ceiling":"SCOPED_VERIFICATION"
@@ -2415,7 +2415,7 @@ mod tests {
             g16: &missing,
         };
         let scope: MaterializationScope = serde_json::from_str(
-            r#"{"work_scope":{"scope_id":"scope","product_id":"product","resource_generation":1,"state_fence":{"authority_epoch":1,"resource_generation":1}},"task":null}"#,
+            r#"{"work_scope":{"scope_id":"scope","product_id":"product","resource_generation":1,"state_fence":{"authority_epoch":{"lineage_id":"550e8400-e29b-41d4-a716-446655440000","sequence":1},"resource_generation":1}},"task":null}"#,
         )
         .expect("valid scope fixture");
         assert!(matches!(
@@ -2485,7 +2485,7 @@ mod tests {
             g16: &missing,
         };
         let scope: MaterializationScope = serde_json::from_str(
-            r#"{"work_scope":{"scope_id":"scope","product_id":"product","resource_generation":1,"state_fence":{"authority_epoch":1,"resource_generation":1}},"task":null}"#,
+            r#"{"work_scope":{"scope_id":"scope","product_id":"product","resource_generation":1,"state_fence":{"authority_epoch":{"lineage_id":"550e8400-e29b-41d4-a716-446655440000","sequence":1},"resource_generation":1}},"task":null}"#,
         )
         .expect("valid scope fixture");
         let outcome = package

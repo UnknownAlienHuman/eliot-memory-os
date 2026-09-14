@@ -495,7 +495,10 @@ fn validate_resolutions(
     if !matches!(governor.lease.state, LeaseState::Active) {
         return Err(RuntimeError::LeaseNotActive);
     }
-    if governor.lease.authority_epoch != governor.lease.state_fence.authority_epoch
+    if !governor
+        .lease
+        .authority_epoch
+        .is_same_authority(&governor.lease.state_fence.authority_epoch)
         || governor.lease.state_fence != governor.generation.state_fence
         || source.assurance.state_fence != governor.generation.state_fence
     {
@@ -589,7 +592,10 @@ fn validate_process_binding(
     if process.operation_id().as_str() != envelope.invocation_id.as_str()
         || process.process_tree_id().as_str() != envelope.work_scope.work_scope.to_string()
         || process.generation().get() != envelope.generation.generation.value()
-        || process.fence().authority_epoch() != envelope.lease.state_fence.authority_epoch.value()
+        || !process
+            .fence()
+            .authority_epoch()
+            .is_same_authority(&envelope.lease.state_fence.authority_epoch)
         || process.fence().generation().get() != envelope.generation.generation.value()
     {
         return Err(RuntimeError::InvalidProcessBinding);

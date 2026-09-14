@@ -7,8 +7,9 @@ use std::{
     process::Command,
 };
 
+use eliot_contracts::{EpochId, EpochLineageId};
 use eliot_installation::{
-    AuthorityEpoch, CandidateManifest, GenerationPackagePlanInput, GenerationPackagePlanner,
+    CandidateManifest, GenerationPackagePlanInput, GenerationPackagePlanner,
     INSTALLATION_TRANSACTION_WIRE_VERSION, InstallationEpoch, InstallationProfile,
     InstallationTransaction, InstallerAclPrincipal, InstallerEffectPlan, ManagedEnvironmentAction,
     ManagedEnvironmentChangeRequest, PHASE_B_PENDING_MARKER, PackageArtifactDigest, PlannedChange,
@@ -21,6 +22,14 @@ use eliot_platform_windows::{
     protected_program_data_root,
 };
 use serde_json::Value;
+
+fn test_epoch(sequence: u64) -> EpochId {
+    EpochId::new(
+        EpochLineageId::new("550e8400-e29b-41d4-a716-446655440000").expect("lineage"),
+        std::num::NonZeroU64::new(sequence).expect("sequence"),
+    )
+    .expect("epoch")
+}
 
 fn repository_root() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -699,10 +708,7 @@ fn portable_cli_transaction(root: &Path) -> InstallationTransaction {
         installation_epoch: installation_epoch.clone(),
         generation: generation.clone(),
         authority_generation: ResourceGeneration::genesis(),
-        authority_state_fence: StateFence::new(
-            AuthorityEpoch::genesis(),
-            ResourceGeneration::genesis(),
-        ),
+        authority_state_fence: StateFence::new(test_epoch(1), ResourceGeneration::genesis()),
         supervision_authority: SupervisionAuthorityBinding::Pending {
             supervision_lease_scope_id: fixture_handle(format!(
                 "eliot-supervision-scope:v1:{}:{}",
