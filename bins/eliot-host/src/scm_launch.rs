@@ -1,8 +1,9 @@
 //! Read-only validation of the canonical Host SCM launch registration.
 
+use eliot_platform::ServiceState;
 use eliot_platform_windows::{
     ELIOT_HOST_SERVICE_DISPLAY_NAME, ELIOT_HOST_SERVICE_NAME, ServiceAccount,
-    ServiceBootstrapArguments, ServiceRegistrationInspection, ServiceRegistrationRequest,
+    ServiceBootstrapArguments, ServiceRegistrationRequest, ServiceRegistrationRuntimeInspection,
     ServiceStartMode, WindowsPlatform,
 };
 
@@ -26,22 +27,23 @@ fn truncate_host_scm_cause(value: &str) -> String {
 
 /// Typed host-side cause for a non-matching Host SCM registration inspection.
 ///
-/// The platform [`ServiceRegistrationInspection`] reports `Mismatched` as a
-/// unit variant without field-level detail, so a binary-command/account drift
-/// and a service-object security-descriptor (default-DACL, no service-SID
-/// ACE) drift are indistinguishable at this layer; the `Mismatched` detail
-/// text says so instead of guessing. This enum surfaces exactly what IS
-/// observable — the variant plus its Debug text, with the live absence-proof
-/// bindings for `Absent` — without redefining platform types. Field-level
-/// mismatch detail remains a platform-owner gap (WRITER-A). Every variant is
-/// fail-closed: [`validate_host_scm_bootstrap`] rejects bootstrap on all of
-/// them.
+/// The runtime [`ServiceRegistrationRuntimeInspection`] reports `Mismatched`
+/// as a unit variant without field-level detail, so a binary-command/account
+/// drift and a service-object security-descriptor (default-DACL, no
+/// service-SID ACE) drift are indistinguishable at this layer; the
+/// `Mismatched` detail text says so instead of guessing. This enum surfaces
+/// exactly what IS observable — the variant plus its Debug text, with the
+/// request-bound identity bindings for `Absent` — without redefining platform
+/// types. Field-level mismatch detail remains a platform-owner gap (WRITER-A).
+/// Every variant is fail-closed: [`validate_host_scm_bootstrap`] rejects
+/// bootstrap on all of them.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum HostScmRegistrationCause {
-    /// The canonical service name is not registered. Carries the live
-    /// absence-proof bindings (queried name plus admitted configuration
-    /// digest, both non-secret) so the absence stays bound to the exact
-    /// query.
+    /// The canonical service name is not registered. Carries the request-bound
+    /// identity (queried name plus admitted configuration digest, both
+    /// non-secret) so the absence stays bound to the exact query. The runtime
+    /// contour reports `Absent` as a unit variant without a live proof object,
+    /// so the bindings are taken from the validated registration request.
     Absent {
         service_name: String,
         configuration_digest: String,
@@ -87,33 +89,91 @@ impl HostScmRegistrationCause {
                 "host-scm-registration-mismatched: service '{ELIOT_HOST_SERVICE_NAME}' exists but its SCM configuration, service-SID type, or service-object security descriptor does not exactly match the canonical request (platform inspection reports Mismatched without field-level detail; inspection: {inspection_debug})",
             ),
             Self::Unknown { inspection_debug } => format!(
-                "host-scm-registration-unknown: service '{ELIOT_HOST_SERVICE_NAME}' SCM configuration and state are not authoritatively observable (fail-closed; possible access-denied readback or provider uncertainty; inspection: {inspection_debug})",
+                "host-scm-registration-unknown: service '{ELIOT_HOST_SERVICE_NAME}' SCM configuration and state are not authoritatively observable via runtime contour inspect_service_registration_runtime (fail-closed; possible access-denied readback or provider uncertainty; SACL never requested, platform DACL-only readback; inspection: {inspection_debug})",
             ),
         };
         truncate_host_scm_cause(&text)
     }
 }
 
-/// Pure projection from a platform registration inspection to the typed
-/// host-side cause. Returns `None` only for `Matching`; every other variant
-/// maps to its fail-closed cause, so `Mismatched` (including a default-DACL
-/// security-descriptor drift) can never collapse into `Unknown`.
+/// Whether a runtime `Matching` observation state is admissible as a valid
+/// Host bootstrap at `ServiceMain` time.
+///
+/// `Stopped`, `Starting`, and `Running` are accepted: `ServiceMain` runs while
+/// SCM reports `START_PENDING` with a live PID, so requiring `Stopped` would
+/// deterministically reject a healthy start. Every other state (`Stopping`,
+/// `Unknown`, `Absent`, `Failed`) is inadmissible and maps to a fail-closed
+/// `Unknown` cause in [`classify_host_scm_inspection`].
+///
+/// This predicate is the exact gate the `Matching { observation }` arm uses.
+/// It takes the public [`ServiceState`] (not the platform-owned
+/// `ServiceRuntimeObservation`, whose fields are `pub(super)` and cannot be
+/// constructed outside `eliot-platform-windows`) so the Starting-acceptance
+/// rule stays directly unit-testable without live SCM calls.
+#[must_use]
+pub const fn host_runtime_bootstrap_state_is_admissible(state: ServiceState) -> bool {
+    matches!(
+        state,
+        ServiceState::Stopped | ServiceState::Starting | ServiceState::Running
+    )
+}
+
+/// Pure projection from a platform runtime registration inspection to the
+/// typed host-side cause. Returns `None` only for an admissible `Matching`
+/// observation; every other outcome maps to its fail-closed cause, so
+/// `Mismatched` (including a default-DACL security-descriptor drift) can
+/// never collapse into `Unknown`.
+///
+/// s40: Host `ServiceMain` runs while SCM reports `START_PENDING` with a live
+/// PID. The non-runtime contour (`WindowsPlatform::inspect_service_registration`,
+/// `crates/kernel/eliot-platform-windows/src/lib.rs:5427`) maps any PID != 0
+/// readback through `inspect_service` (`lib.rs:5555`), which returns `Partial`
+/// for every PID != 0 (`lib.rs:5624-5640`), to unit `Unknown` via
+/// `service_registration_inspection_from_status` (`lib.rs:5532-5545`). A
+/// healthy Starting host therefore deterministically failed closed with
+/// 1066/3 (`bins/eliot-host/src/main.rs:588-600`,
+/// `HostStopCode::InvalidRegistration` specific 3), while the installer
+/// readback (`STOPPED`, PID 0) returned `Known` -> `Matching`. The runtime
+/// contour (`WindowsPlatform::inspect_service_registration_runtime`,
+/// `lib.rs:4938`) handles `Starting` + PID as `Matching` via
+/// `classify_service_runtime_observation` (`lib.rs:4881-4921`) with two-sample
+/// stability, matching the Watchdog path
+/// (`bins/eliot-watchdog/src/scm_launch.rs:323-331`). SACL `S:(AU;FA;;;WD)`
+/// is never requested: platform `GetSecurityInfo` reads are DACL-only
+/// (`lib.rs:4019,4152`).
+///
+/// WRITER-A forward-compat: base `Absent`/`Mismatched`/`Unknown` are unit
+/// variants. This is the sole inspection-to-cause mapping site; carry
+/// stage/state/pid strings via the platform Debug text verbatim (truncated to
+/// [`HOST_SCM_CAUSE_MAX_CHARS`]) and do NOT match on `Unknown` payload
+/// fields — a future typed `Unknown { win32_error, stage, current_state,
+/// process_id }` payload is adopted here with minimal edits.
 #[must_use]
 pub fn classify_host_scm_inspection(
-    inspection: &ServiceRegistrationInspection,
+    request: &ServiceRegistrationRequest,
+    inspection: &ServiceRegistrationRuntimeInspection,
 ) -> Option<HostScmRegistrationCause> {
     match inspection {
-        ServiceRegistrationInspection::Matching { .. } => None,
-        ServiceRegistrationInspection::Absent { proof } => {
-            Some(HostScmRegistrationCause::Absent {
-                service_name: proof.service_name().to_owned(),
-                configuration_digest: proof.configuration_digest().to_owned(),
+        ServiceRegistrationRuntimeInspection::Matching { observation }
+            if host_runtime_bootstrap_state_is_admissible(observation.state()) =>
+        {
+            None
+        }
+        ServiceRegistrationRuntimeInspection::Matching { .. } => {
+            Some(HostScmRegistrationCause::Unknown {
+                inspection_debug: format!("{inspection:?}"),
             })
         }
-        ServiceRegistrationInspection::Mismatched => Some(HostScmRegistrationCause::Mismatched {
-            inspection_debug: format!("{inspection:?}"),
+        ServiceRegistrationRuntimeInspection::Absent => Some(HostScmRegistrationCause::Absent {
+            service_name: request.service_name().to_owned(),
+            configuration_digest: request.expected_configuration_digest(),
         }),
-        ServiceRegistrationInspection::Unknown => Some(HostScmRegistrationCause::Unknown {
+        ServiceRegistrationRuntimeInspection::Mismatched => {
+            Some(HostScmRegistrationCause::Mismatched {
+                inspection_debug: format!("{inspection:?}"),
+            })
+        }
+        ServiceRegistrationRuntimeInspection::Unknown => Some(HostScmRegistrationCause::Unknown {
             inspection_debug: format!("{inspection:?}"),
         }),
     }
@@ -123,7 +183,7 @@ pub fn classify_host_scm_inspection(
 pub struct ValidatedHostScmLaunch {
     bootstrap: ServiceBootstrapArguments,
     registration: ServiceRegistrationRequest,
-    inspection: ServiceRegistrationInspection,
+    inspection: ServiceRegistrationRuntimeInspection,
 }
 
 impl ValidatedHostScmLaunch {
@@ -138,7 +198,7 @@ impl ValidatedHostScmLaunch {
     }
 
     #[must_use]
-    pub fn inspection(&self) -> &ServiceRegistrationInspection {
+    pub fn inspection(&self) -> &ServiceRegistrationRuntimeInspection {
         &self.inspection
     }
 }
@@ -146,6 +206,12 @@ impl ValidatedHostScmLaunch {
 /// Rebuilds and read-only-inspects the canonical Host SCM registration from
 /// the validated launch options. Host never registers or starts its own SCM
 /// service; the installer is the sole registration owner.
+///
+/// The readback uses the runtime contour
+/// (`WindowsPlatform::inspect_service_registration_runtime`), which accepts
+/// `Stopped`, `Starting`, and `Running` observations with valid
+/// configuration plus grant at `ServiceMain` time. `Starting` is valid: the
+/// host process is already running while SCM still reports `START_PENDING`.
 ///
 /// # Errors
 ///
@@ -191,8 +257,8 @@ pub fn validate_host_scm_bootstrap(
         .ok_or_else(|| HostError::Platform("current executable has no parent".to_owned()))?;
     let platform = WindowsPlatform::new(root.to_path_buf())
         .map_err(|error| HostError::Platform(error.to_string()))?;
-    let inspection = platform.inspect_service_registration(&registration);
-    if let Some(cause) = classify_host_scm_inspection(&inspection) {
+    let inspection = platform.inspect_service_registration_runtime(&registration);
+    if let Some(cause) = classify_host_scm_inspection(&registration, &inspection) {
         return Err(HostError::Platform(cause.detail()));
     }
     Ok(ValidatedHostScmLaunch {
@@ -206,6 +272,19 @@ pub fn validate_host_scm_bootstrap(
 mod tests {
     use super::*;
 
+    fn test_registration_request() -> ServiceRegistrationRequest {
+        let image =
+            std::env::current_exe().unwrap_or_else(|_| panic!("test image unavailable"));
+        ServiceRegistrationRequest::new(
+            ELIOT_HOST_SERVICE_NAME,
+            ELIOT_HOST_SERVICE_DISPLAY_NAME,
+            &image,
+            ServiceStartMode::Automatic,
+            ServiceAccount::LocalService,
+        )
+        .unwrap_or_else(|_| panic!("test registration request must build"))
+    }
+
     #[test]
     fn default_dacl_mismatched_sd_classifies_as_mismatched_not_unknown() {
         // A default-DACL service (Windows default service DACL, not
@@ -213,8 +292,9 @@ mod tests {
         // unit `Mismatched`: configuration/SID-type/service-DACL comparison
         // differs. The host projection must preserve that cause instead of
         // collapsing Absent/Mismatched/Unknown into one string.
+        let request = test_registration_request();
         let mismatched =
-            classify_host_scm_inspection(&ServiceRegistrationInspection::Mismatched)
+            classify_host_scm_inspection(&request, &ServiceRegistrationRuntimeInspection::Mismatched)
                 .unwrap_or_else(|| panic!("mismatched inspection must classify"));
         assert_eq!(
             mismatched,
@@ -223,8 +303,9 @@ mod tests {
             }
         );
         assert_eq!(mismatched.cause(), "mismatched");
-        let unknown = classify_host_scm_inspection(&ServiceRegistrationInspection::Unknown)
-            .unwrap_or_else(|| panic!("unknown inspection must classify"));
+        let unknown =
+            classify_host_scm_inspection(&request, &ServiceRegistrationRuntimeInspection::Unknown)
+                .unwrap_or_else(|| panic!("unknown inspection must classify"));
         assert_eq!(
             unknown,
             HostScmRegistrationCause::Unknown {
@@ -258,5 +339,92 @@ mod tests {
             truncate_host_scm_cause(&"d".repeat(4000)).chars().count(),
             HOST_SCM_CAUSE_MAX_CHARS
         );
+    }
+
+    #[test]
+    fn runtime_starting_is_admissible_while_mismatch_and_unknown_stay_typed() {
+        // s40: `ServiceMain` runs while SCM reports `START_PENDING` with a
+        // live PID. The `Matching` arm of `classify_host_scm_inspection`
+        // accepts `Starting` via `host_runtime_bootstrap_state_is_admissible`.
+        // `ServiceRuntimeObservation` fields are `pub(super)` to the platform
+        // crate, so no `Matching { observation }` value can be constructed
+        // here; the admissibility predicate IS the exact gate the `Matching`
+        // arm uses, and the fail-closed arms are proven below with directly
+        // constructible unit inspection variants. No SCM calls, no mocks.
+        assert!(host_runtime_bootstrap_state_is_admissible(
+            ServiceState::Starting
+        ));
+        assert!(host_runtime_bootstrap_state_is_admissible(
+            ServiceState::Stopped
+        ));
+        assert!(host_runtime_bootstrap_state_is_admissible(
+            ServiceState::Running
+        ));
+        assert!(!host_runtime_bootstrap_state_is_admissible(
+            ServiceState::Stopping
+        ));
+        assert!(!host_runtime_bootstrap_state_is_admissible(
+            ServiceState::Unknown
+        ));
+        assert!(!host_runtime_bootstrap_state_is_admissible(
+            ServiceState::Absent
+        ));
+        assert!(!host_runtime_bootstrap_state_is_admissible(
+            ServiceState::Failed
+        ));
+
+        let request = test_registration_request();
+        let mismatched =
+            classify_host_scm_inspection(&request, &ServiceRegistrationRuntimeInspection::Mismatched)
+                .unwrap_or_else(|| panic!("mismatched inspection must classify"));
+        let unknown =
+            classify_host_scm_inspection(&request, &ServiceRegistrationRuntimeInspection::Unknown)
+                .unwrap_or_else(|| panic!("unknown inspection must classify"));
+        assert_eq!(mismatched.cause(), "mismatched");
+        assert_eq!(unknown.cause(), "unknown");
+        assert_ne!(mismatched, unknown);
+        let mismatched_detail = mismatched.detail();
+        let unknown_detail = unknown.detail();
+        assert_ne!(mismatched_detail, unknown_detail);
+        assert!(mismatched_detail.contains("host-scm-registration-mismatched"));
+        assert!(mismatched_detail.contains("inspection:"));
+        assert!(mismatched_detail.contains("Mismatched"));
+        assert!(unknown_detail.contains("host-scm-registration-unknown"));
+        assert!(unknown_detail.contains("inspection:"));
+        assert!(unknown_detail.contains("Unknown"));
+        // Typed s40-1 diagnostics: the Unknown detail names the runtime
+        // contour used and records that SACL was never requested, while
+        // carrying the platform Debug text verbatim.
+        assert!(
+            unknown_detail.contains("inspect_service_registration_runtime"),
+            "unknown detail must name the runtime contour: {unknown_detail}"
+        );
+        assert!(
+            unknown_detail.contains("SACL"),
+            "unknown detail must record that SACL was never requested: {unknown_detail}"
+        );
+        for detail in [&mismatched_detail, &unknown_detail] {
+            assert!(
+                detail.chars().count() <= HOST_SCM_CAUSE_MAX_CHARS,
+                "cause detail must stay bounded"
+            );
+        }
+
+        // The runtime `Absent` unit variant binds the request identity
+        // (service name plus configuration digest) into the cause.
+        let absent =
+            classify_host_scm_inspection(&request, &ServiceRegistrationRuntimeInspection::Absent)
+                .unwrap_or_else(|| panic!("absent inspection must classify"));
+        assert_eq!(absent.cause(), "absent");
+        let absent_detail = absent.detail();
+        assert!(absent_detail.contains("host-scm-registration-absent"));
+        assert!(absent_detail.contains(request.service_name()));
+        assert!(absent_detail.contains(&request.expected_configuration_digest()));
+        assert!(
+            absent_detail.chars().count() <= HOST_SCM_CAUSE_MAX_CHARS,
+            "absent detail must stay bounded"
+        );
+        assert_ne!(absent_detail, mismatched_detail);
+        assert_ne!(absent_detail, unknown_detail);
     }
 }
