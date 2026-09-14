@@ -4,10 +4,13 @@
 //! adapter handlers, parameter shapes, and consumers:
 //! `GetRevisionHeads`, `GetOrderingHeads`, `GetScopeRevisionView`, and
 //! `ResolveWriteReceipt` (see `apply/read_boundary.rs` in the Surreal adapter
-//! and `execute_named_sync` in the memory adapter), plus the single
-//! `CaptureObservation` mutation (AUD-C01: `TransitionClass::CaptureCandidate`
-//! with the `EffectClass::Candidate` ceiling, carrying the owner-shaped
-//! `subject` string already used by the adapter receipt/plan fixtures).
+//! and `execute_named_sync` in the memory adapter), plus the two
+//! `CaptureObservation` / `AppendAuditEvent` mutations (AUD-C01:
+//! `TransitionClass::CaptureCandidate` with the `EffectClass::Candidate`
+//! ceiling; `CaptureObservation` carries the owner-shaped `subject` string
+//! already used by the adapter receipt/plan fixtures, `AppendAuditEvent`
+//! carries the six receipt-bound operator fields emitted by the Governor
+//! reconciliation).
 //! Every other [`NamedReadOperation`](crate::NamedReadOperation) variant and
 //! every other [`NamedMutationOperation`](crate::NamedMutationOperation)
 //! variant stays known-but-unsupported and unadvertised, and no other mutation
@@ -21,8 +24,9 @@
 //!
 //! Validation is control-contract only and issues no authority: scope, role,
 //! fence, and expiry enforcement stay in slice C2. An explicitly declared
-//! parameter (today `operation_id` for `ResolveWriteReceipt` and `subject`
-//! for `CaptureObservation`) is owner-approved and therefore supersedes the
+//! parameter (today `operation_id` for `ResolveWriteReceipt`, `subject`
+//! for `CaptureObservation`, and the six receipt-bound fields for
+//! `AppendAuditEvent`) is owner-approved and therefore supersedes the
 //! generic [`CONTROL_FIELD_DENYLIST`](crate::CONTROL_FIELD_DENYLIST) for that
 //! exact name; every undeclared control name is still rejected fail-closed.
 
@@ -40,16 +44,21 @@ use crate::{
 /// Closed shape vocabulary for owner-approved named-operation parameters.
 ///
 /// Slice C1 needs exactly two shapes: the `operation_id` string consumed by
-/// `ResolveWriteReceipt` and the `subject` string captured by
-/// `CaptureObservation`. The enum is closed so a future parameter kind is a
-/// contract change with a new owner-approved arm, never silent `Value`
+/// `ResolveWriteReceipt` (reused for the receipt-bound `AppendAuditEvent`
+/// `operation_id`) and the non-blank text captured by `CaptureObservation`
+/// as `subject` (reused for the five remaining receipt-bound
+/// `AppendAuditEvent` fields). The enum is closed so a future parameter kind
+/// is a contract change with a new owner-approved arm, never silent `Value`
 /// passthrough.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ParameterShape {
     /// A string that must parse as a store [`OperationId`].
     OperationId,
-    /// A non-blank observation subject string captured by
-    /// `CaptureObservation`. Length is bounded by the owning manifest entry's
+    /// A non-blank text string: the observation subject captured by
+    /// `CaptureObservation`, reused for the non-`operation_id` receipt-bound
+    /// `AppendAuditEvent` fields (`idempotency_key`, `session_id`,
+    /// `access_digest`, `action_digest`, and `expected_revision` as its
+    /// decimal string). Length is bounded by the owning manifest entry's
     /// `max_input_bytes` over the canonical parameter bytes (the same
     /// mechanism that bounds the activated reads), so no separate string
     /// length constant exists here.
@@ -90,6 +99,38 @@ static CAPTURE_OBSERVATION_PARAMETERS: [ParameterDeclaration; 1] = [ParameterDec
     shape: ParameterShape::Subject,
     required: true,
 }];
+static APPEND_AUDIT_EVENT_PARAMETERS: [ParameterDeclaration; 6] = [
+    ParameterDeclaration {
+        name: "operation_id",
+        shape: ParameterShape::OperationId,
+        required: true,
+    },
+    ParameterDeclaration {
+        name: "idempotency_key",
+        shape: ParameterShape::Subject,
+        required: true,
+    },
+    ParameterDeclaration {
+        name: "session_id",
+        shape: ParameterShape::Subject,
+        required: true,
+    },
+    ParameterDeclaration {
+        name: "access_digest",
+        shape: ParameterShape::Subject,
+        required: true,
+    },
+    ParameterDeclaration {
+        name: "action_digest",
+        shape: ParameterShape::Subject,
+        required: true,
+    },
+    ParameterDeclaration {
+        name: "expected_revision",
+        shape: ParameterShape::Subject,
+        required: true,
+    },
+];
 static NO_PARAMETERS: [ParameterDeclaration; 0] = [];
 
 /// Returns the canonical operation name bound into manifests and digests.
@@ -197,21 +238,23 @@ pub const fn declared_read_parameters(
 
 /// Returns the owner-approved parameter declarations for one mutation.
 ///
-/// Only `CaptureObservation` declares a parameter on base (the required
-/// owner-shaped `subject` string); every other variant declares none, so any
-/// supplied parameter fails closed. Variants without a catalogue entry never
-/// reach this table: they fail as [`StoreError::UnknownOperation`] first.
+/// `CaptureObservation` declares the required owner-shaped `subject` string;
+/// `AppendAuditEvent` declares the six required receipt-bound fields
+/// (`operation_id`, `idempotency_key`, `session_id`, `access_digest`,
+/// `action_digest`, `expected_revision`); every other variant declares none,
+/// so any supplied parameter fails closed. Variants without a catalogue entry
+/// never reach this table: they fail as [`StoreError::UnknownOperation`] first.
 #[must_use]
 pub const fn declared_mutation_parameters(
     operation: NamedMutationOperation,
 ) -> &'static [ParameterDeclaration] {
     match operation {
         NamedMutationOperation::CaptureObservation => &CAPTURE_OBSERVATION_PARAMETERS,
+        NamedMutationOperation::AppendAuditEvent => &APPEND_AUDIT_EVENT_PARAMETERS,
         NamedMutationOperation::ApplyEpistemicRevision
         | NamedMutationOperation::UpdateTaskState
         | NamedMutationOperation::ApplyLifecyclePolicy
-        | NamedMutationOperation::ReconcileRecovery
-        | NamedMutationOperation::AppendAuditEvent => &NO_PARAMETERS,
+        | NamedMutationOperation::ReconcileRecovery => &NO_PARAMETERS,
     }
 }
 
