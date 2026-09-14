@@ -46,8 +46,7 @@ fn materializer_genesis_epoch() -> Result<EpochId, MaterializeError> {
     let sequence = std::num::NonZeroU64::new(1).ok_or_else(|| {
         MaterializeError::Contract("materializer genesis epoch must be non-zero".to_owned())
     })?;
-    EpochId::new(lineage, sequence)
-        .map_err(|error| MaterializeError::Contract(error.to_string()))
+    EpochId::new(lineage, sequence).map_err(|error| MaterializeError::Contract(error.to_string()))
 }
 
 /// The only source roles admitted to Phase A.

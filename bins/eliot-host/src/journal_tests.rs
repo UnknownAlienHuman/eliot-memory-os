@@ -675,10 +675,7 @@ pub(super) fn liveness_manifest_with_distinct_store_digests()
         },
         generation: generation.clone(),
         authority_generation: ResourceGeneration::genesis(),
-        authority_state_fence: StateFence::new(
-            test_epoch(1),
-            ResourceGeneration::genesis(),
-        ),
+        authority_state_fence: StateFence::new(test_epoch(1), ResourceGeneration::genesis()),
         supervision_authority: eliot_installation::SupervisionAuthorityBinding::Provisioned {
             authority: Box::new(test_provisioned_supervision_authority(
                 "installation:liveness-store-split",

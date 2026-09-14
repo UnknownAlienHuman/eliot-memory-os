@@ -6,8 +6,8 @@ use uuid::Uuid;
 use super::{
     HostError, HostInstallationEpoch, HostProcessBinding, HostRuntimeControlOperation,
     HostRuntimeControlRequest, HostStoreBootstrapRequirement, HostStoreRecoveryReceipt,
-    PlatformHandle, ResourceGeneration, StoreProcessBinding, StoreRebindHandoff, StoreRebindReceipt,
-    StoreRebindRecord, StoreRecoveryInnerBinding, StoreRecoveryReopenFence,
+    PlatformHandle, ResourceGeneration, StoreProcessBinding, StoreRebindHandoff,
+    StoreRebindReceipt, StoreRebindRecord, StoreRecoveryInnerBinding, StoreRecoveryReopenFence,
     StoreRecoveryTerminationEvidence, TerminatedJobChild, read_bounded_runtime_restart_file,
     read_store_recovery_inner_binding, read_store_recovery_termination_evidence, sha256_json,
     valid_sha256_text,

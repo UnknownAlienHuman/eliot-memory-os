@@ -5052,15 +5052,11 @@ impl HostComposition {
                 HostError::OwnerLeaseRecovery("Kernel authority epoch overflow".to_owned())
             })?,
         );
-        let next_sequence =
-            std::num::NonZeroU64::new(next_sequence_value).ok_or_else(|| {
-                HostError::OwnerLeaseRecovery("Kernel authority epoch overflow".to_owned())
-            })?;
-        let authority = EpochId::new(
-            manifest_authority_epoch.lineage_id.clone(),
-            next_sequence,
-        )
-        .map_err(|error| HostError::ProcessContour(error.to_string()))?;
+        let next_sequence = std::num::NonZeroU64::new(next_sequence_value).ok_or_else(|| {
+            HostError::OwnerLeaseRecovery("Kernel authority epoch overflow".to_owned())
+        })?;
+        let authority = EpochId::new(manifest_authority_epoch.lineage_id.clone(), next_sequence)
+            .map_err(|error| HostError::ProcessContour(error.to_string()))?;
         let prior_disposition = terminated_prior_kernel(
             prior,
             termination.ok_or_else(|| {
@@ -6452,10 +6448,7 @@ fn lifecycle_context(
             .map_err(|error| HostError::Platform(error.to_string()))?,
         source_id: SourceId::new("eliot-host-service")
             .map_err(|error| HostError::Platform(error.to_string()))?,
-        state_fence: StateFence::new(
-            host.epoch.current.clone(),
-            ResourceGeneration::genesis(),
-        ),
+        state_fence: StateFence::new(host.epoch.current.clone(), ResourceGeneration::genesis()),
         clock: ClockReading::default(),
     })
 }
