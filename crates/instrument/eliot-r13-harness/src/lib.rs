@@ -852,7 +852,11 @@ fn admission_descriptor(
             file_index: profile.executable_identity.file_index,
         },
         generation: profile.module_generation.generation,
-        authority_epoch: profile.module_generation.state_fence.authority_epoch,
+        authority_epoch: profile
+            .module_generation
+            .state_fence
+            .authority_epoch
+            .clone(),
         state_fence: profile.module_generation.state_fence.clone(),
         approved_user_sid: profile.approved_user_sid.clone(),
         caller_session_policy,
@@ -929,7 +933,7 @@ fn harness_candidate(
         installation_id: eliot_platform::PlatformHandle::new(installation_id)
             .map_err(|error| error.to_string())?,
         host_epoch,
-        kernel_epoch: admission.authority_epoch,
+        kernel_epoch: admission.authority_epoch.clone(),
         activation_id: eliot_platform::PlatformHandle::new(activation_id)
             .map_err(|error| error.to_string())?,
         artifact_hash: eliot_platform::PlatformHandle::new(admission.executable_sha256.clone())
