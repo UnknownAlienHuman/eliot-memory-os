@@ -2156,16 +2156,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "eliot-system-experience"
-version = "0.1.0"
-dependencies = [
- "eliot-contracts",
- "eliot-evidence",
- "serde",
- "thiserror",
-]
-
-[[package]]
 name = "eliot-task"
 version = "0.1.0"
 dependencies = [
