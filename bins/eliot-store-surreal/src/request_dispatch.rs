@@ -314,3 +314,114 @@ impl StoreDispatchBackend for StoreComposition {
         }
     }
 }
+
+#[cfg(test)]
+mod reconcile_mapping_tests {
+    #![allow(clippy::expect_used)]
+
+    use super::*;
+    use eliot_store_api::{
+        CommitId, OperationId, OperationManifestDigest, Resubmission, ScopeId, TransitionClass,
+        WriteReceiptStatus,
+    };
+
+    fn test_fence() -> eliot_contracts::StateFence {
+        use eliot_contracts::{EpochId, EpochLineageId, ResourceGeneration};
+        use std::num::NonZeroU64;
+        let lineage = EpochLineageId::new("550e8400-e29b-41d4-a716-446655440000")
+            .expect("canonical test lineage-A");
+        let epoch = EpochId::new(lineage, NonZeroU64::new(1).expect("non-zero")).expect("epoch");
+        eliot_contracts::StateFence::new(epoch, ResourceGeneration::genesis())
+    }
+
+    fn committed_looking_receipt_without_envelope() -> WriteReceipt {
+        // Shape-valid terminal receipt that crossed the provider boundary
+        // without proving its envelope: reconciliation state, never success.
+        let fence = test_fence();
+        WriteReceipt {
+            operation_id: OperationId::new("op-reconcile").expect("operation id"),
+            idempotency_key: "idem-reconcile".to_owned(),
+            canonical_request_hash: "a".repeat(64),
+            transition_class: TransitionClass::RecoverySchema,
+            status: WriteReceiptStatus::Committed,
+            commit_id: Some(CommitId::new("commit-reconcile").expect("commit")),
+            state_fence: fence,
+            ordering_sequences: Vec::new(),
+            revision_before_after: Vec::new(),
+            applied_command_ids: vec!["genesis-seed".to_owned()],
+            emitted_event_ids: Vec::new(),
+            projection_refs: Vec::new(),
+            outbox_refs: Vec::new(),
+            operation_manifest_digest: OperationManifestDigest::new("manifest-reconcile")
+                .expect("manifest digest"),
+            error_code: None,
+            resubmission: Resubmission::None,
+            committed_at: Some("commit-sequence-0000000000000001".to_owned()),
+            envelope: None,
+        }
+    }
+
+    fn identity_context(operation: &str) -> StoreFailureIdentityContext {
+        StoreFailureIdentityContext {
+            operation_id: Some(OperationId::new(operation).expect("operation id")),
+            ..StoreFailureIdentityContext::default()
+        }
+    }
+
+    #[test]
+    fn drop_after_send_reconciles_without_re_effect_or_success_claim() {
+        // A drop after send leaves an envelope-less observation: the dispatch
+        // boundary reports unknown outcome bound to the exact admitted
+        // operation, never a success and never a not-attempted claim.
+        let receipt = committed_looking_receipt_without_envelope();
+        assert!(receipt.validate().is_ok(), "fixture receipt is shape-valid");
+        let context = identity_context("op-reconcile");
+        match response_for_receipt_lookup(Some(receipt), context) {
+            Response::Failure { failure } => {
+                assert_eq!(
+                    failure.operation_id,
+                    Some(OperationId::new("op-reconcile").expect("operation id"))
+                );
+                assert_eq!(
+                    failure.disposition,
+                    eliot_store_api::StoreFailureDisposition::UnknownOutcome
+                );
+                assert_eq!(
+                    failure.mutation_disposition,
+                    eliot_store_api::StoreMutationDisposition::Unknown
+                );
+                assert_eq!(
+                    failure.retry_directive,
+                    eliot_store_api::StoreRetryDirective::ReconcileExactOperation
+                );
+                failure.validate().expect("typed unknown failure validates");
+            }
+            Response::Receipt { .. } => panic!("envelope-less receipt must not report success"),
+            other => panic!("unexpected dispatch response: {other:?}"),
+        }
+        // A missing receipt stays a valid empty lookup, not a failure.
+        assert!(matches!(
+            response_for_receipt_lookup(None, identity_context("op-absent")),
+            Response::Receipt { receipt: None }
+        ));
+        let _ = ScopeId::new("scope-reconcile").expect("scope");
+    }
+
+    #[test]
+    fn transaction_receipt_without_envelope_is_unknown_outcome() {
+        let receipt = committed_looking_receipt_without_envelope();
+        match response_for_transaction_receipt(receipt, identity_context("op-reconcile")) {
+            Response::Failure { failure } => {
+                assert_eq!(
+                    failure.disposition,
+                    eliot_store_api::StoreFailureDisposition::UnknownOutcome
+                );
+                failure.validate().expect("typed unknown failure validates");
+            }
+            Response::Transaction { .. } => {
+                panic!("envelope-less transaction must not report success")
+            }
+            other => panic!("unexpected dispatch response: {other:?}"),
+        }
+    }
+}
