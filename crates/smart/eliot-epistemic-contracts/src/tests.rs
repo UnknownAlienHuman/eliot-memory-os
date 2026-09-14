@@ -2089,6 +2089,41 @@ fn planning_grants_no_effect() -> CaseResult {
     expect_err!(capped, CeilingViolation, "assertability.grade");
     Ok(())
 }
+// WORK_UNIT_CASE: 1025/F3 — seven closed levels project onto the three I12.5
+// architecture values at the closure boundary only; ceilings stay seven-valued.
+#[test]
+fn position_assertability_projects_to_arch_three_values() -> CaseResult {
+    use PositionAssertability as Closed;
+    assert_eq!(
+        Closed::ObservedFact.arch_assertability(),
+        Assertability::Assertable
+    );
+    assert_eq!(
+        Closed::QualifiedInference.arch_assertability(),
+        Assertability::Assertable
+    );
+    assert_eq!(
+        Closed::MaterialEffect.arch_assertability(),
+        Assertability::Assertable
+    );
+    assert_eq!(
+        Closed::HypothesisCandidate.arch_assertability(),
+        Assertability::NonAssertableUnverified
+    );
+    assert_eq!(
+        Closed::PlanningOnly.arch_assertability(),
+        Assertability::NonAssertableUnverified
+    );
+    assert_eq!(
+        Closed::ConflictQualificationRequired.arch_assertability(),
+        Assertability::NonAssertableUnverified
+    );
+    assert_eq!(
+        Closed::UnknownWithheldQuarantined.arch_assertability(),
+        Assertability::AbstainOrFence
+    );
+    Ok(())
+}
 // WORK_UNIT_CASE: 580/40
 #[test]
 fn transition_preserves_before_after_predecessor() -> CaseResult {
