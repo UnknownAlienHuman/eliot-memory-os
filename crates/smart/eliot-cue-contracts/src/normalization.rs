@@ -327,7 +327,7 @@ impl NormalizedCue {
     /// collections while retaining exact canonical values independently from
     /// their comparison keys.
     pub fn validate(&self) -> Result<(), CueContractError> {
-        if self.schema_revision != crate::CONTRACT_REVISION {
+        if !crate::is_supported_schema_revision(&self.schema_revision) {
             return Err(CueContractError::InvalidText {
                 field: "schema_revision",
             });
