@@ -7,6 +7,8 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
+use crate::erasure_scope::ErasureScopeSnapshot;
+
 /// A request contains references and policy evidence, never the private value
 /// being erased.  `approval_digest` binds the operator approval to this exact
 /// request and is deliberately not reversible into the erased content.
@@ -56,6 +58,59 @@ impl ErasureRequest {
         self.validate()?;
         let bytes = canonical_json_bytes(self).map_err(|_| ErasureError::Canonicalization)?;
         Ok(sha256_hex(&bytes))
+    }
+
+    /// Binds this request to a frozen [`ErasureScopeSnapshot`] (contract shape
+    /// only; performs no I/O and no destructive effect).
+    ///
+    /// Real cross-checks, all fail-closed: the snapshot validates; subject
+    /// refs match; the frozen `subject_revision` equals `expected_revision`
+    /// (I05-19: revalidate required revisions); every requested location is
+    /// covered by the frozen denominator (a request outside the denominator is
+    /// a scope gap, never silent coverage); fences are compatible; and the
+    /// same `approval_digest` binds both (the packet shape itself remains an
+    /// explicit gap per `ApprovalBinding`, so no new crypto is invented).
+    /// Returns the binding digest over both canonical digests.
+    pub fn bind_scope_snapshot(
+        &self,
+        snapshot: &ErasureScopeSnapshot,
+    ) -> Result<String, ErasureError> {
+        self.validate()?;
+        snapshot
+            .validate()
+            .map_err(|_| ErasureError::InvalidScope)?;
+        if snapshot.subject_ref != self.subject_ref {
+            return Err(ErasureError::ScopeMismatch);
+        }
+        if snapshot.subject_revision != self.expected_revision {
+            return Err(ErasureError::ScopeMismatch);
+        }
+        let frozen: BTreeSet<u8> = snapshot
+            .targets
+            .iter()
+            .map(|target| location_code(target.location))
+            .collect();
+        if !self
+            .locations
+            .iter()
+            .all(|location| frozen.contains(&location_code(*location)))
+        {
+            return Err(ErasureError::ScopeMismatch);
+        }
+        if !self.state_fence.is_compatible_with(&snapshot.state_fence) {
+            return Err(ErasureError::FenceMismatch);
+        }
+        if snapshot.approval.approval_digest != self.approval_digest {
+            return Err(ErasureError::ScopeMismatch);
+        }
+        let material = format!(
+            "{}\0{}",
+            self.request_digest()?,
+            snapshot
+                .scope_digest()
+                .map_err(|_| ErasureError::InvalidScope)?
+        );
+        Ok(sha256_hex(material.as_bytes()))
     }
 }
 
@@ -212,6 +267,10 @@ pub enum ErasureError {
     IncompleteErasure,
     #[error("generated purge ledger entry is invalid")]
     InvalidLedger,
+    #[error("erasure scope snapshot is invalid")]
+    InvalidScope,
+    #[error("erasure scope snapshot does not bind to this request")]
+    ScopeMismatch,
     #[error("erasure backend failed: {0}")]
     Backend(#[source] Box<dyn std::error::Error + Send + Sync>),
 }
