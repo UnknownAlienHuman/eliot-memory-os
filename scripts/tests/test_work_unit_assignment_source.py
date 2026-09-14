@@ -22,7 +22,7 @@ from scripts.work_unit_gate import contracts as c
 
 ROOT = Path(__file__).resolve().parents[2]
 FIXTURES = ROOT / 'scripts/testdata/work-unit-gate/assignment-source'
-LIVE = json.loads((FIXTURES / 'valid-issue.json').read_text())
+LIVE = json.loads((FIXTURES / 'valid-issue.json').read_text(encoding='utf-8'))
 OFFLINE = (FIXTURES / 'valid-offline.json').read_bytes()
 CAPTURE_SHA = '0fa6033d6cd8db573ec621bd27c7f966c56d69eda8803bcbc1ec9c05065433a8'
 BODY = LIVE['body']
@@ -546,7 +546,7 @@ class BoundaryRegressionTests(unittest.TestCase):
 
     def test_exact_once_marker_mapping_and_no_mutation_or_subprocess_surface(self):
         path=ROOT/'scripts/tests/test_work_unit_assignment_source.py'
-        tree=ast.parse(path.read_text()); lines=path.read_text().splitlines()
+        tree=ast.parse(path.read_text(encoding='utf-8')); lines=path.read_text(encoding='utf-8').splitlines()
         markers={}
         for node in ast.walk(tree):
             if isinstance(node,ast.FunctionDef) and node.name.startswith('test_'):
@@ -554,7 +554,7 @@ class BoundaryRegressionTests(unittest.TestCase):
                 if text.startswith('# WORK_UNIT_CASE: 849/'):
                     number=int(text.rsplit('/',1)[1]); self.assertNotIn(number,markers); markers[number]=node.name
         self.assertEqual(set(range(1,37)),set(markers))
-        tree=ast.parse((ROOT/'scripts/work_unit_gate/assignment_source.py').read_text())
+        tree=ast.parse((ROOT/'scripts/work_unit_gate/assignment_source.py').read_text(encoding='utf-8'))
         imported={a.name.split('.')[0] for n in ast.walk(tree) if isinstance(n,ast.Import) for a in n.names}
         self.assertTrue(imported.isdisjoint({'subprocess','requests','pickle'}))
         methods={n.func.attr for n in ast.walk(tree) if isinstance(n,ast.Call) and isinstance(n.func,ast.Attribute)}
