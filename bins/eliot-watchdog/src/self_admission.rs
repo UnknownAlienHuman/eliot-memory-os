@@ -1,11 +1,12 @@
 //! Watchdog SCM self-admission cell — bounded timing and identity gate only.
 
 //!
-//! Architecture: `docs/architecture/ELIOT_ARCHITECTURE.md` handles `A0.3`,
-//! `A2.2`, `A8`, and `A13`. Implementation:
-//! `docs/architecture/ELIOT_IMPLEMENTATION.md` handles `I8` (`I8.1`, `I8.2`,
-//! `I8.3`) and `I14` (`I14.6`, `I14.10`). Normative precedence remains in
-//! `docs/ARCHITECTURE_CONTRACT.md`.
+//! Architecture: A0.3 (docs/architecture/A00-03-hard-boundaries.md#a03-hard-boundaries),
+//! A2.2 (docs/architecture/A02-02-roles.md#a22-roles), A8.1 (docs/architecture/A08-01-purpose.md#a81-purpose),
+//! A13.2 (docs/architecture/A13-02-kernel-and-failure-domains.md#a132-kernel-and-failure-domains).
+//! Implementation: I8.1 (docs/architecture/I08-01-process-and-authority.md#i81-process-and-authority),
+//! I8.2 (docs/architecture/I08-02-independent-observation-routes.md#i82-independent-observation-routes).
+//! Normative precedence remains in `docs/ARCHITECTURE_CONTRACT.md`.
 //!
 //! This cell explicitly forbids start/stop/registration mutation and semantic readiness authority.
 //! It owns only timing/bounded wait and same-process identity equality; it does not own

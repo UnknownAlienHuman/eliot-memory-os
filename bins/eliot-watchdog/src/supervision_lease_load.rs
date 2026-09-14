@@ -1,6 +1,6 @@
 //! Fail-closed supervision lease/fence loading for the watchdog composition.
-//! Architecture: `A8. Watchdog` (`ELIOT_ARCHITECTURE.md`), `A5.4. Time и State Fence` (`ELIOT_ARCHITECTURE.md`).
-//! Implementation: `I8. Watchdog implementation contract` (`ELIOT_IMPLEMENTATION.md`), `I4.5. Generation vector and State Fence` (`ELIOT_IMPLEMENTATION.md`).
+//! Architecture: A8.1 (docs/architecture/A08-01-purpose.md#a81-purpose), A13.2 (docs/architecture/A13-02-kernel-and-failure-domains.md#a132-kernel-and-failure-domains).
+//! Implementation: I8.1 (docs/architecture/I08-01-process-and-authority.md#i81-process-and-authority), I8.2 (docs/architecture/I08-02-independent-observation-routes.md#i82-independent-observation-routes).
 //! This module only verifies the current lease against the retained Host journal, Kernel ORS and
 //! watchdog publication bundle and re-checks identity/contour after verification. It never mints
 //! authority, never selects an alternate current owner, and fails closed on any lease/fence mismatch.

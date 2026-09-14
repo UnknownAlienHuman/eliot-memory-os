@@ -1,10 +1,7 @@
 //! Adapter configuration materialization cell for `eliot-store-surreal`.
 //!
-//! Architecture: `docs/architecture/ELIOT_ARCHITECTURE.md` R2 Canonical
-//! substrate, `ARCH-AUTH-01` explicit scoped authority, `ARCH-SEC-02` one
-//! canonical transition path, and `ARCH-RES-01` local failure/global recovery.
-//! Implementation: `docs/architecture/ELIOT_IMPLEMENTATION.md:I2.23`
-//! capability-family topology and crate extraction decisions, plus the
+//! Architecture: ARCH-AUTH-01, ARCH-SEC-02, ARCH-RES-01.
+//! Implementation: I2.23 (docs/architecture/I02-23-capability-family-topology-and-crate-extraction-decisions.md#i223-capability-family-topology-and-crate-extraction-decisions), plus the
 //! Store/provider credential boundary (`StoreLaunchConfig`/`credential_ref`
 //! through Windows Credential Manager `read_credential` versus provider
 //! `SurrealAdapterConfig`/`password` separation).
