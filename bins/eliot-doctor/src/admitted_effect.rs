@@ -23,6 +23,7 @@
 use std::collections::BTreeSet;
 use std::sync::{Arc, Mutex};
 
+use eliot_contracts::EpochId;
 use eliot_doctor_core::{
     AdapterReceiptStatus, ArtifactBinding, CONTRACT_NAME, CONTRACT_VERSION, CleanupDisposition,
     ClosedRepairRequest, DoctorDisposition, DoctorError, EffectDisposition, EffectIntent,
@@ -618,6 +619,12 @@ pub struct AttemptInputs<'a, C> {
     pub manifest: &'a RepairRecipeManifest,
     /// The Kernel-issued attempt identity string for this one shot.
     pub attempt_id: &'a str,
+    /// Live Kernel authority epoch retained from the authenticated
+    /// bootstrap. The attempt identity is bound against this epoch (never
+    /// envelope bytes), so a foreign lineage fails closed here instead of
+    /// binding. Threaded from the dispatch presentation; see
+    /// `bind_attempt_on_epoch` (T6-D1 admission cutover, issue #461).
+    pub epoch: &'a EpochId,
     /// Bounded evidence sink handed to the single dispatch.
     pub sink: Arc<EvidenceCollector>,
     /// The Kernel-issued permit-bound process request for this attempt.
@@ -640,6 +647,10 @@ pub struct ReconcileInputs<'a> {
     pub operation_id: OperationId,
     /// The presented reconciliation key; must equal the effect digest.
     pub reconciliation_key: &'a str,
+    /// Live Kernel authority epoch retained from the authenticated
+    /// bootstrap, bound exactly like the execution path so a foreign
+    /// lineage cannot reconcile an identity it could not have bound.
+    pub epoch: &'a EpochId,
     /// Admission time used for the closed validation round.
     pub now: OffsetDateTime,
 }
@@ -683,6 +694,7 @@ impl<E: ProcessExecutor + 'static> AutomaticSafeAdapter<E> {
         request: &ClosedRepairRequest,
         manifest: &RepairRecipeManifest,
         attempt_id: &str,
+        epoch: &EpochId,
         now: OffsetDateTime,
     ) -> Result<(RepairAttemptIdentity, RepairEffectIdentity), AdapterError> {
         if matches!(request.recipe.repair_class, RepairClass::DiagnoseOnly)
@@ -694,7 +706,12 @@ impl<E: ProcessExecutor + 'static> AutomaticSafeAdapter<E> {
         if !request.operations.contains(&self.operation) {
             return Err(AdapterError::Admission(DoctorError::OperationNotAdmitted));
         }
-        let attempt = request.bind_attempt(manifest, attempt_id, &self.operation, now)?;
+        // Lineage-aware binding against the live Kernel epoch retained at
+        // bootstrap (T6-D1 cutover): the fence is proven against the exact
+        // lineaged authority before any identity is minted, so a foreign
+        // lineage fails closed here instead of binding.
+        let attempt =
+            request.bind_attempt_on_epoch(manifest, attempt_id, &self.operation, epoch, now)?;
         let effect = request.bind_effect(&attempt, &self.operation, ADAPTER_EFFECT_SEQ)?;
         Ok((attempt, effect))
     }
@@ -721,11 +738,12 @@ impl<E: ProcessExecutor + 'static> AutomaticSafeAdapter<E> {
             request,
             manifest,
             attempt_id,
+            epoch,
             sink,
             process_request,
             now,
         } = inputs;
-        let (attempt, effect) = self.check_executable(request, manifest, attempt_id, now)?;
+        let (attempt, effect) = self.check_executable(request, manifest, attempt_id, epoch, now)?;
         process_request.validate()?;
         let operation_id = process_request.operation_id().clone();
         let expected_request_digest = process_request.invocation_digest().to_owned();
@@ -825,9 +843,10 @@ impl<E: ProcessExecutor + 'static> AutomaticSafeAdapter<E> {
             attempt_id,
             operation_id,
             reconciliation_key,
+            epoch,
             now,
         } = inputs;
-        let (attempt, effect) = self.check_executable(request, manifest, attempt_id, now)?;
+        let (attempt, effect) = self.check_executable(request, manifest, attempt_id, epoch, now)?;
         if reconciliation_key != effect.digest() {
             return Err(AdapterError::ReconciliationKeyMismatch);
         }

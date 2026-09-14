@@ -58,6 +58,41 @@ fn deny(detail: &str) -> i32 {
     EXIT_KERNEL_ADMISSION_REQUIRED
 }
 
+/// Post-probe composition decision for one one-shot invocation.
+///
+/// The shot drives if and only if the live Kernel advertises the exact
+/// doctor repair-attempt operation (`advertised`) AND the dispatch contour
+/// delivered a session-bound attempt presentation to this invocation
+/// (`attempt_presented`: envelope bytes plus the concrete process request
+/// the real effect adapter binds). Advertisement alone never executes:
+/// without delivered bytes there is no admission to bind, so the shot
+/// fails closed naming the dispatch residual. This argv-only invocation
+/// form carries no attempt bytes by contract (see
+/// `decode_bootstrap_args`), so it always presents `false` here; the
+/// `Drive` arm names the rule the future dispatch contour must satisfy,
+/// and `drive_admitted_attempt` stays the only driver.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum GateDecision {
+    /// Drive the delivered attempt through `drive_admitted_attempt`.
+    Drive,
+    /// Fail closed: the Kernel does not advertise the doctor operation.
+    DenyNotAdvertised,
+    /// Fail closed: advertised, but no session-bound attempt was
+    /// delivered to this invocation.
+    DenyNoPresentedAttempt,
+}
+
+#[must_use]
+const fn gate_after_advertise(advertised: bool, attempt_presented: bool) -> GateDecision {
+    if !advertised {
+        GateDecision::DenyNotAdvertised
+    } else if !attempt_presented {
+        GateDecision::DenyNoPresentedAttempt
+    } else {
+        GateDecision::Drive
+    }
+}
+
 fn bootstrap_and_run_once() -> i32 {
     // Authenticated generation-bound Kernel bootstrap over the protected
     // installation front door. The protected client declaration plus the
@@ -72,10 +107,59 @@ fn bootstrap_and_run_once() -> i32 {
         Err(error) => return deny(&error.to_string()),
     };
     match client.advertise_doctor() {
-        Ok(true) => deny(&format!(
-            "kernel advertises the doctor operation but no session-bound attempt envelope was presented to this one-shot invocation; residual={DOCTOR_DISPATCH_RESIDUAL}"
-        )),
-        Ok(false) => deny("kernel does not advertise the doctor operation"),
+        Ok(advertised) => {
+            // This argv-only invocation form is never presented a
+            // session-bound attempt: envelope bytes plus the concrete
+            // process request arrive only with the dispatch contour named
+            // by the residual, never via argv, stdin, or environment.
+            const ATTEMPT_PRESENTED: bool = false;
+            match gate_after_advertise(advertised, ATTEMPT_PRESENTED) {
+                GateDecision::Drive => deny(&format!(
+                    "kernel advertises the doctor operation and an attempt was presented, but this invocation form carries no session-bound attempt value to drive; residual={DOCTOR_DISPATCH_RESIDUAL}"
+                )),
+                GateDecision::DenyNotAdvertised => {
+                    deny("kernel does not advertise the doctor operation")
+                }
+                GateDecision::DenyNoPresentedAttempt => deny(&format!(
+                    "kernel advertises the doctor operation but no session-bound attempt envelope was presented to this one-shot invocation; residual={DOCTOR_DISPATCH_RESIDUAL}"
+                )),
+            }
+        }
         Err(error) => deny(&error.to_string()),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn closed_kernel_denies_without_effect() {
+        assert_eq!(
+            gate_after_advertise(false, false),
+            GateDecision::DenyNotAdvertised
+        );
+        assert_eq!(
+            gate_after_advertise(false, true),
+            GateDecision::DenyNotAdvertised
+        );
+    }
+
+    #[test]
+    fn advertised_without_presentation_denies_with_residual() {
+        assert_eq!(
+            gate_after_advertise(true, false),
+            GateDecision::DenyNoPresentedAttempt
+        );
+    }
+
+    #[test]
+    fn advertised_with_presentation_is_the_only_drive_arm() {
+        assert_eq!(gate_after_advertise(true, true), GateDecision::Drive);
+    }
+
+    #[test]
+    fn deny_exits_kernel_admission_required() {
+        assert_eq!(deny("test detail"), EXIT_KERNEL_ADMISSION_REQUIRED);
     }
 }
