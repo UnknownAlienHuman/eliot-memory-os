@@ -825,7 +825,12 @@ impl HostComposition {
             ));
         }
         let active_checksum = record_checksum(&HostStateRecord::Kernel(active.clone()))?;
-        let expected_authority = phase_b.launch.authority_state_fence.authority_epoch.value();
+        let expected_authority = phase_b
+            .launch
+            .authority_state_fence
+            .authority_epoch
+            .sequence
+            .get();
         if observation.active_kernel_record_checksum.as_str() != active_checksum
             || observation.fence != active.fence
             || observation.config_digest != phase_b.config_file_digest

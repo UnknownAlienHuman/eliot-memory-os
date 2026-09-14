@@ -30,6 +30,16 @@ fn mock_observation(child: Option<&MockChild>) -> ReconciliationObservation {
     }
 }
 
+#[cfg(windows)]
+fn test_epoch(sequence: u64) -> eliot_contracts::EpochId {
+    eliot_contracts::EpochId::new(
+        eliot_contracts::EpochLineageId::new("550e8400-e29b-41d4-a716-446655440000")
+            .unwrap_or_else(|_| unreachable!()),
+        std::num::NonZeroU64::new(sequence).unwrap_or_else(|| unreachable!()),
+    )
+    .unwrap_or_else(|_| unreachable!())
+}
+
 fn launch_environment(
     kernel: Option<&KernelLaunchBinding>,
 ) -> Result<BTreeMap<String, String>, TestError> {
@@ -848,9 +858,9 @@ fn scm_store_recovery_request_identity_is_stable_and_contour_bound() -> TestResu
 
 #[test]
 fn pulse4_store_rebind_fence_and_pipe_substitution_fails_closed() -> TestResult {
-    use eliot_contracts::{AuthorityEpoch, ResourceGeneration, StateFence};
+    use eliot_contracts::{ResourceGeneration, StateFence};
     use eliot_kernel_service::{HostStoreBootstrapRequirement, StoreRebindHandoff};
-    let fence = StateFence::new(AuthorityEpoch::genesis(), ResourceGeneration::genesis());
+    let fence = StateFence::new(test_epoch(1), ResourceGeneration::genesis());
     let req = HostStoreBootstrapRequirement {
         route_identity: PlatformHandle::new("store_bridge")?,
         canonical_pipe_identity: PlatformHandle::new(r"\\.\pipe\eliot\store")?,
@@ -880,7 +890,7 @@ fn pulse4_store_rebind_fence_and_pipe_substitution_fails_closed() -> TestResult 
         },
         candidate_binding_digest: "f".repeat(64),
         generation: ResourceGeneration::genesis(),
-        authority_epoch: AuthorityEpoch::genesis(),
+        authority_epoch: test_epoch(1),
         store_fence: "a".repeat(64),
     };
     assert!(
@@ -1005,7 +1015,7 @@ fn store_recovery_response_loss_query_preserves_original_digest() -> TestResult 
 
 #[test]
 fn store_recovery_reconciles_only_canonical_committed_inner_rebind() -> TestResult {
-    use eliot_contracts::{AuthorityEpoch, ResourceGeneration, StateFence};
+    use eliot_contracts::{ResourceGeneration, StateFence};
     use eliot_kernel_service::{
         HostStoreBootstrapRequirement, StoreProcessBinding, StoreRebindHandoff,
     };
@@ -1013,13 +1023,13 @@ fn store_recovery_reconciles_only_canonical_committed_inner_rebind() -> TestResu
     let host = super::fresh_host_epoch(PlatformHandle::new("inner-rebind-test")?, None)?;
     let activation_id = super::fresh_identity("inner-rebind-activation")?;
     let activation_generation = super::root_epoch(super::fresh_lineage_id()?);
-    let authority_epoch = AuthorityEpoch::new(7)?;
+    let authority_epoch = test_epoch(7);
     let generation = ResourceGeneration::new(3)?;
     let requirement = HostStoreBootstrapRequirement {
         route_identity: PlatformHandle::new("store_bridge")?,
         canonical_pipe_identity: PlatformHandle::new(r"\\.\pipe\eliot\store")?,
         store_generation: generation,
-        state_fence: StateFence::new(authority_epoch, generation),
+        state_fence: StateFence::new(authority_epoch.clone(), generation),
         launch_nonce: PlatformHandle::new("inner-rebind-launch-nonce")?,
         connection_id: PlatformHandle::new("inner-rebind-connection")?,
         expected_peer_sid: PlatformHandle::new("S-1-5-18")?,
@@ -1046,7 +1056,7 @@ fn store_recovery_reconciles_only_canonical_committed_inner_rebind() -> TestResu
         process_binding: process_binding.clone(),
         candidate_binding_digest: candidate_digest.clone(),
         generation,
-        authority_epoch,
+        authority_epoch: authority_epoch.clone(),
         store_fence: store_fence.clone(),
     };
     let inner_digest = handoff.canonical_request_digest()?;
@@ -1068,7 +1078,7 @@ fn store_recovery_reconciles_only_canonical_committed_inner_rebind() -> TestResu
         process_image_path: PlatformHandle::new(process_binding.process.image_path.clone())?,
         job_name: process_binding.job.clone(),
         generation: generation.value(),
-        authority_epoch: authority_epoch.value(),
+        authority_epoch: authority_epoch.sequence.get(),
         receipt_request_digest: Some(PlatformHandle::new(inner_digest.clone())?),
         receipt_store_fence: Some(PlatformHandle::new(store_fence)?),
     };

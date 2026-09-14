@@ -203,7 +203,7 @@ pub(super) fn phase_b_previous_eliotd_digest(
                 "prior eliotd descriptor is not parseable: {error}"
             ))
         })?;
-    expected.authority_epoch = previous.authority.state_fence.authority_epoch;
+    expected.authority_epoch = previous.authority.state_fence.authority_epoch.clone();
     expected.generation = previous.authority.generation;
     let expected = expected
         .with_computed_digest()

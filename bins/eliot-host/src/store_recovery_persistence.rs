@@ -4,13 +4,13 @@ use serde::Deserialize;
 use uuid::Uuid;
 
 use super::{
-    AuthorityEpoch, HostError, HostInstallationEpoch, HostProcessBinding,
-    HostRuntimeControlOperation, HostRuntimeControlRequest, HostStoreBootstrapRequirement,
-    HostStoreRecoveryReceipt, PlatformHandle, ResourceGeneration, StoreProcessBinding,
-    StoreRebindHandoff, StoreRebindReceipt, StoreRebindRecord, StoreRecoveryInnerBinding,
-    StoreRecoveryReopenFence, StoreRecoveryTerminationEvidence, TerminatedJobChild,
-    read_bounded_runtime_restart_file, read_store_recovery_inner_binding,
-    read_store_recovery_termination_evidence, sha256_json, valid_sha256_text,
+    HostError, HostInstallationEpoch, HostProcessBinding, HostRuntimeControlOperation,
+    HostRuntimeControlRequest, HostStoreBootstrapRequirement, HostStoreRecoveryReceipt,
+    PlatformHandle, ResourceGeneration, StoreProcessBinding, StoreRebindHandoff, StoreRebindReceipt,
+    StoreRebindRecord, StoreRecoveryInnerBinding, StoreRecoveryReopenFence,
+    StoreRecoveryTerminationEvidence, TerminatedJobChild, read_bounded_runtime_restart_file,
+    read_store_recovery_inner_binding, read_store_recovery_termination_evidence, sha256_json,
+    valid_sha256_text,
 };
 
 #[cfg(windows)]
@@ -1122,8 +1122,13 @@ pub(super) fn committed_store_rebind_receipt(
     }
     let generation = ResourceGeneration::new(record.generation)
         .map_err(|error| HostError::RecoveryRequired(error.to_string()))?;
-    let authority_epoch = AuthorityEpoch::new(record.authority_epoch)
-        .map_err(|error| HostError::RecoveryRequired(error.to_string()))?;
+    if record.authority_epoch != requirement.state_fence.authority_epoch.sequence.get() {
+        return Err(HostError::RecoveryRequired(
+            "committed Store rebind epoch does not match the canonical requirement fence"
+                .to_owned(),
+        ));
+    }
+    let authority_epoch = requirement.state_fence.authority_epoch.clone();
     let process_binding = StoreProcessBinding {
         process: HostProcessBinding {
             process_id: record.process_id,

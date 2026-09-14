@@ -278,7 +278,7 @@ pub(super) fn append_store_rebind_terminal<B: JournalBackend>(
                 || receipt.process_binding.process.image_path != record.process_image_path.as_str()
                 || receipt.process_binding.job != record.job_name
                 || receipt.generation.value() != record.generation
-                || receipt.authority_epoch.value() != record.authority_epoch
+                || receipt.authority_epoch.sequence.get() != record.authority_epoch
             {
                 return Err(HostError::RecoveryRequired(
                     "Store rebind startup receipt did not match exact journal identity".to_owned(),

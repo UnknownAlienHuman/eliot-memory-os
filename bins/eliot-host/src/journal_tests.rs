@@ -46,6 +46,16 @@ fn test_supervision_incarnation(
     .unwrap_or_else(|_| unreachable!())
 }
 
+#[cfg(windows)]
+fn test_epoch(sequence: u64) -> EpochId {
+    EpochId::new(
+        EpochLineageId::new("550e8400-e29b-41d4-a716-446655440000")
+            .unwrap_or_else(|_| unreachable!()),
+        std::num::NonZeroU64::new(sequence).unwrap_or_else(|| unreachable!()),
+    )
+    .unwrap_or_else(|_| unreachable!())
+}
+
 struct ImageBackend {
     image: DurableImage,
 }
@@ -260,7 +270,7 @@ fn active_readiness_fixture() -> Result<ReadinessFixture, TestError> {
     let candidate = HostKernelCandidateBinding {
         installation_id: host.installation.clone(),
         host_epoch: AuthorityEpoch::new(host.epoch.current.sequence.get())?,
-        kernel_epoch: AuthorityEpoch::new(2)?,
+        kernel_epoch: test_epoch(2),
         activation_id: activation_id.clone(),
         artifact_hash: kernel_artifact.clone(),
         config_hash: config.clone(),
@@ -321,7 +331,7 @@ fn active_readiness_fixture() -> Result<ReadinessFixture, TestError> {
             owner: "Kernel".to_owned(),
             state: ServiceProcessState::Starting,
             health: HealthVector::healthy(),
-            authority_epoch: candidate.kernel_epoch,
+            authority_epoch: AuthorityEpoch::new(candidate.kernel_epoch.sequence.get())?,
         },
     )?;
     driver.handoff_prepared()?;
@@ -349,7 +359,10 @@ fn active_readiness_fixture() -> Result<ReadinessFixture, TestError> {
         route_identity: PlatformHandle::new(eliot_kernel_service::STORE_ROUTE_IDENTITY)?,
         canonical_pipe_identity: PlatformHandle::new(r"\\.\pipe\eliot\store-readiness")?,
         store_generation: ResourceGeneration::genesis(),
-        state_fence: StateFence::new(candidate.kernel_epoch, ResourceGeneration::genesis()),
+        state_fence: StateFence::new(
+            candidate.kernel_epoch.clone(),
+            ResourceGeneration::genesis(),
+        ),
         launch_nonce: PlatformHandle::new("store-launch-nonce")?,
         connection_id: PlatformHandle::new("store-connection")?,
         expected_peer_sid: PlatformHandle::new("S-1-5-18")?,
@@ -395,7 +408,7 @@ fn readiness_supervision_snapshot(
         host_epoch: fixture.candidate.host_epoch,
         activation_id: eliot_ors::OperationIdentity::new(fixture.candidate.activation_id.as_str())?,
         activation_generation: fixture.activation.generation,
-        kernel_epoch: fixture.candidate.kernel_epoch,
+        kernel_epoch: fixture.candidate.kernel_epoch.clone(),
         watchdog_epoch: AuthorityEpoch::new(1)?,
         generation_binding: eliot_runtime_contracts::SupervisionGenerationBinding {
             target_id: "kernel-readiness".to_owned(),
@@ -406,7 +419,7 @@ fn readiness_supervision_snapshot(
             process_generation: fixture.activation.generation,
         },
         state_fence: StateFence::new(
-            fixture.candidate.kernel_epoch,
+            fixture.candidate.kernel_epoch.clone(),
             fixture.activation.generation,
         ),
         issued_at_ms,
@@ -459,7 +472,7 @@ fn readiness_supervision_snapshot(
         host_epoch: envelope.payload.host_epoch,
         activation_id: envelope.payload.activation_id.clone(),
         activation_generation: envelope.payload.activation_generation,
-        kernel_epoch: envelope.payload.kernel_epoch,
+        kernel_epoch: envelope.payload.kernel_epoch.clone(),
         watchdog_epoch: envelope.payload.watchdog_epoch,
         state_fence: envelope.payload.state_fence.clone(),
         scope_ref: envelope.payload.scope_ref.clone(),
@@ -663,7 +676,7 @@ pub(super) fn liveness_manifest_with_distinct_store_digests()
         generation: generation.clone(),
         authority_generation: ResourceGeneration::genesis(),
         authority_state_fence: StateFence::new(
-            AuthorityEpoch::genesis(),
+            test_epoch(1),
             ResourceGeneration::genesis(),
         ),
         supervision_authority: eliot_installation::SupervisionAuthorityBinding::Provisioned {
@@ -1310,7 +1323,7 @@ fn materialize_descriptor_bound_host_fixture(
         config_descriptor_sha256: launch.eliotd_config_digest.as_str().to_owned(),
         protected_snapshot_digest: launch.protected_snapshot_digest.as_str().to_owned(),
         launch_nonce: eliotd_nonce,
-        authority_epoch: launch.authority_state_fence.authority_epoch,
+        authority_epoch: launch.authority_state_fence.authority_epoch.clone(),
         generation: descriptor_generation,
         descriptor_sha256: String::new(),
     }
@@ -2575,7 +2588,7 @@ fn reconciled_active_readiness_failure_preserves_contour_then_recovers() -> Test
     let candidate = HostKernelCandidateBinding {
         installation_id: host.installation.clone(),
         host_epoch: AuthorityEpoch::new(host.epoch.current.sequence.get())?,
-        kernel_epoch: AuthorityEpoch::new(2)?,
+        kernel_epoch: test_epoch(2),
         activation_id: activation_id.clone(),
         artifact_hash: PlatformHandle::new("a".repeat(64))?,
         config_hash: PlatformHandle::new("c".repeat(64))?,
@@ -2637,7 +2650,7 @@ fn reconciled_active_readiness_failure_preserves_contour_then_recovers() -> Test
             owner: "Kernel".to_owned(),
             state: ServiceProcessState::Starting,
             health: HealthVector::healthy(),
-            authority_epoch: candidate.kernel_epoch,
+            authority_epoch: AuthorityEpoch::new(candidate.kernel_epoch.sequence.get())?,
         },
     )?;
     driver.handoff_prepared()?;
@@ -2675,7 +2688,10 @@ fn reconciled_active_readiness_failure_preserves_contour_then_recovers() -> Test
         route_identity: PlatformHandle::new(eliot_kernel_service::STORE_ROUTE_IDENTITY)?,
         canonical_pipe_identity: PlatformHandle::new(r"\\.\pipe\eliot\store-readiness")?,
         store_generation: ResourceGeneration::genesis(),
-        state_fence: StateFence::new(candidate.kernel_epoch, ResourceGeneration::genesis()),
+        state_fence: StateFence::new(
+            candidate.kernel_epoch.clone(),
+            ResourceGeneration::genesis(),
+        ),
         launch_nonce: PlatformHandle::new("reconcile-store-launch")?,
         connection_id: PlatformHandle::new("reconcile-store-connection")?,
         expected_peer_sid: PlatformHandle::new("S-1-5-18")?,
@@ -2880,7 +2896,7 @@ fn store_rebind_disposition_uses_exact_operation_and_request_identity() -> TestR
         },
         candidate_binding_digest: third.candidate_binding_digest.as_str().to_owned(),
         generation: ResourceGeneration::new(third.generation)?,
-        authority_epoch: AuthorityEpoch::new(third.authority_epoch)?,
+        authority_epoch: test_epoch(third.authority_epoch),
         store_fence: third.store_fence.as_str().to_owned(),
     };
     substituted_receipt.process_binding.process.process_id += 1;
@@ -3247,12 +3263,12 @@ fn store_recovery_committed_inner_crash_reopens_as_fenced_unknown_without_child_
     )?;
 
     let generation = ResourceGeneration::genesis();
-    let authority_epoch = AuthorityEpoch::genesis();
+    let authority_epoch = host.epoch.current.clone();
     let requirement = HostStoreBootstrapRequirement {
         route_identity: PlatformHandle::new(eliot_kernel_service::STORE_ROUTE_IDENTITY)?,
         canonical_pipe_identity: PlatformHandle::new(r"\\.\pipe\eliot\store")?,
         store_generation: generation,
-        state_fence: StateFence::new(authority_epoch, generation),
+        state_fence: StateFence::new(authority_epoch.clone(), generation),
         launch_nonce: PlatformHandle::new("store-recovery-physical-nonce")?,
         connection_id: PlatformHandle::new("store-recovery-physical-connection")?,
         expected_peer_sid: PlatformHandle::new("S-1-5-18")?,
@@ -3276,7 +3292,7 @@ fn store_recovery_committed_inner_crash_reopens_as_fenced_unknown_without_child_
         process_binding: process_binding.clone(),
         candidate_binding_digest: "d".repeat(64),
         generation,
-        authority_epoch,
+        authority_epoch: authority_epoch.clone(),
         store_fence: "e".repeat(64),
     };
     handoff.request_digest = handoff.canonical_request_digest()?;
@@ -3301,7 +3317,7 @@ fn store_recovery_committed_inner_crash_reopens_as_fenced_unknown_without_child_
         process_image_path: PlatformHandle::new(process_binding.process.image_path.clone())?,
         job_name: process_binding.job.clone(),
         generation: generation.value(),
-        authority_epoch: authority_epoch.value(),
+        authority_epoch: authority_epoch.sequence.get(),
         receipt_request_digest: None,
         receipt_store_fence: None,
     };

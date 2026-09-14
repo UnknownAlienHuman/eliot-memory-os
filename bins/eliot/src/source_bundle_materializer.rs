@@ -5,9 +5,10 @@ use std::fs::{self, OpenOptions};
 use std::io::Write;
 use std::path::{Path, PathBuf};
 
+use eliot_contracts::{EpochId, EpochLineageId};
 use eliot_governor::{GovernorLaunchConfig, KernelGenerationExpectation};
 use eliot_installation::{
-    AgentBridgeSourceMaterializationFactory, AgentBridgeSourceMaterializationPlan, AuthorityEpoch,
+    AgentBridgeSourceMaterializationFactory, AgentBridgeSourceMaterializationPlan,
     GenerationPackagePlanner, InstallationEpoch, InstallationError, InstallationProfile,
     InstallationRecoveryStage, LOCAL_SERVICE_SID, PHASE_B_PENDING_MARKER, PackageArtifactDigest,
     PlatformHandle, RedbInstallationTransactionStore, ResourceGeneration, RuntimeLaunchDescriptor,
@@ -34,6 +35,20 @@ use sha2::{Digest, Sha256};
 
 const MAX_EXECUTABLE_BYTES: usize = 512 * 1024 * 1024;
 const ELIOTD_LAUNCH_DESCRIPTOR_WIRE_ID: &str = "eliot.kernel.eliotd-launch";
+/// Lineage used to bind the materializer-pinned genesis scalar to its canonical
+/// [`EpochId`] tuple. The genesis wire remains sequence one; this binary
+/// performs only the mechanical tuple binding and never mints authority.
+const MATERIALIZER_EPOCH_LINEAGE_ID: &str = "550e8400-e29b-41d4-a716-446655440000";
+
+fn materializer_genesis_epoch() -> Result<EpochId, MaterializeError> {
+    let lineage = EpochLineageId::new(MATERIALIZER_EPOCH_LINEAGE_ID)
+        .map_err(|error| MaterializeError::Contract(error.to_string()))?;
+    let sequence = std::num::NonZeroU64::new(1).ok_or_else(|| {
+        MaterializeError::Contract("materializer genesis epoch must be non-zero".to_owned())
+    })?;
+    EpochId::new(lineage, sequence)
+        .map_err(|error| MaterializeError::Contract(error.to_string()))
+}
 
 /// The only source roles admitted to Phase A.
 ///
@@ -565,8 +580,7 @@ fn governor_bytes(
 ) -> Result<Vec<u8>, MaterializeError> {
     let generation_number = ResourceGeneration::new(1)
         .map_err(|error| MaterializeError::Contract(error.to_string()))?;
-    let authority_epoch =
-        AuthorityEpoch::new(1).map_err(|error| MaterializeError::Contract(error.to_string()))?;
+    let authority_epoch = materializer_genesis_epoch()?;
     let protected = sha256_hex(
         format!(
             "governor-protected:{}:{}:{}",
@@ -765,9 +779,8 @@ fn build_typed_bundle(
     )?;
     let authority_generation = ResourceGeneration::new(1)
         .map_err(|error| MaterializeError::Contract(error.to_string()))?;
-    let authority_epoch =
-        AuthorityEpoch::new(1).map_err(|error| MaterializeError::Contract(error.to_string()))?;
-    let authority_state_fence = StateFence::new(authority_epoch, authority_generation);
+    let authority_epoch = materializer_genesis_epoch()?;
+    let authority_state_fence = StateFence::new(authority_epoch.clone(), authority_generation);
     let kernel_arguments = make_args([
         "--work-root".to_owned(),
         roots.kernel_work_root.as_str().to_owned(),

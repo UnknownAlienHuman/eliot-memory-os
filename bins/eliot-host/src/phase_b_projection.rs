@@ -3,7 +3,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use sha2::Digest;
 
 use super::{
-    ActivePhaseBRebindIntent, AuthorityEpoch, AuthoritySnapshotBindingWire, CandidateManifest,
+    ActivePhaseBRebindIntent, AuthoritySnapshotBindingWire, CandidateManifest,
     CredentialAccessReceipt, DispatchAuthorityId, EpochIdentity, EpochLineage, HostError,
     HostInstallationEpoch, HostPhaseBMaterialization, HostPhaseBMaterializationIntent,
     HostPhaseBMaterializationReceipt, HostPhaseBPreparedReceipt, LOCAL_SERVICE_SID, OpaqueLabel,
@@ -324,9 +324,10 @@ pub(super) fn phase_b_build_authority_descriptor(
         },
         predecessor: None,
     };
-    let authority = AuthorityEpoch::new(host.epoch.current.sequence.get())
-        .map_err(|error| HostError::ProcessContour(error.to_string()))?;
-    let state_fence = StateFence::new(authority, runtime.authority_generation);
+    let state_fence = StateFence::new(
+        host.epoch.current.clone(),
+        runtime.authority_generation,
+    );
     let snapshot_fence =
         StateFenceSnapshot::capture(&state_fence, host.epoch.current.sequence.get())
             .map_err(|error| HostError::ProcessContour(error.to_string()))?;
@@ -407,9 +408,10 @@ pub(super) fn phase_b_build_authority_descriptor_for_rebind(
         },
         predecessor: None,
     };
-    let authority = AuthorityEpoch::new(host.epoch.current.sequence.get())
-        .map_err(|error| HostError::ProcessContour(error.to_string()))?;
-    let state_fence = StateFence::new(authority, runtime.authority_generation);
+    let state_fence = StateFence::new(
+        host.epoch.current.clone(),
+        runtime.authority_generation,
+    );
     let snapshot_fence =
         StateFenceSnapshot::capture(&state_fence, host.epoch.current.sequence.get())
             .map_err(|error| HostError::ProcessContour(error.to_string()))?;
