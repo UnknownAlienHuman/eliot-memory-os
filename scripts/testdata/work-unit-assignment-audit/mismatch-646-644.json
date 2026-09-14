@@ -16,12 +16,24 @@
   ],
   "pull_requests": [],
   "repository_records": {
+    "tracked_tree": [
+      "crates/smart/eliot-dreamer-kernel/Cargo.toml",
+      "crates/smart/eliot-dreamer-kernel/src/lib.rs",
+      "workstreams/dreamer/assignments/646-dreamer-core.toml"
+    ],
+    "manifests": [
+      {
+        "path": "crates/smart/eliot-dreamer-kernel/Cargo.toml",
+        "package": "eliot-dreamer-kernel",
+        "plane": "smart"
+      }
+    ],
     "workstreams": [
       {
         "path": "workstreams/dreamer/assignments/646-dreamer-core.toml",
         "internal_issue": 644,
         "package": "eliot-dreamer-core",
-        "physical_package": "eliot-dreamer-kernel"
+        "target_dir": "crates/smart/eliot-dreamer-kernel/"
       }
     ]
   }

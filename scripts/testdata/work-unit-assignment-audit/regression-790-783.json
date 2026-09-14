@@ -1,0 +1,36 @@
+{
+  "schema": "eliot-assignment-snapshot-v1",
+  "header": {
+    "repository": "UnknownAlienHuman/eliot-memory-os",
+    "base_sha": "fb3fc334e113236cb82cf5ca9139fc0970df032b",
+    "complete": true
+  },
+  "issues": [
+    {
+      "number": 789,
+      "state": "open",
+      "title": "Windows IPC unsafe hardening",
+      "dependencies": []
+    }
+  ],
+  "pull_requests": [],
+  "repository_records": {
+    "manifests": [
+      {
+        "path": "crates/platform/eliot-platform-windows/Cargo.toml",
+        "package": "eliot-platform-windows",
+        "plane": "platform"
+      }
+    ],
+    "workstreams": [
+      {
+        "path": "workstreams/kernel/assignments/789-windows-ipc.toml",
+        "internal_issue": 789,
+        "plane": "smart",
+        "target_plane": "kernel",
+        "package": "eliot-platform-windows",
+        "target_dir": "crates/platform/eliot-platform-windows/"
+      }
+    ]
+  }
+}
