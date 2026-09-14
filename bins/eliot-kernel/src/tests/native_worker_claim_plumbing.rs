@@ -17,13 +17,18 @@
 
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use eliot_contracts::{AuthorityEpoch, EpochId, EpochLineageId, ResourceGeneration, StateFence};
+use eliot_contracts::{
+    AuthorityEpoch, EpochId, EpochLineageId, ResourceGeneration, StateFence, sha256_hex,
+};
+use eliot_ipc::TransportError;
 use eliot_kernel_service::{
     HostKernelCandidateBinding, KernelActivationPermit, KernelControlCommand, KernelReadyReceipt,
     KernelService, KernelServiceState, NATIVE_WORKER_CLAIM_WIRE_ID,
-    NATIVE_WORKER_CLAIM_WIRE_VERSION, NATIVE_WORKER_EXECUTION_UNIT_SCHEMA_VERSION,
-    NATIVE_WORKER_PROTOCOL_VERSION, NativeWorkerClaimBudget, NativeWorkerClaimRequest,
-    NativeWorkerClaimResponse,
+    NATIVE_WORKER_CLAIM_WIRE_VERSION, NATIVE_WORKER_CLAIM_WIRE_VERSION_V1,
+    NATIVE_WORKER_EXECUTABLE_BINDING_EXPECTED_WIRE_VERSION,
+    NATIVE_WORKER_EXECUTION_UNIT_SCHEMA_VERSION, NATIVE_WORKER_PROTOCOL_VERSION,
+    NativeWorkerClaimBudget, NativeWorkerClaimRequest, NativeWorkerClaimResponse,
+    NativeWorkerExecutableBinding, NativeWorkerExecutableExpectation,
 };
 use eliot_ors::{NativeWorkerClaimState, RedbRecoveryStore};
 use eliot_platform::PlatformHandle;
@@ -173,6 +178,96 @@ fn ready_service() -> KernelService {
     svc
 }
 
+/// Owner-issued executable digest stand-in for these proofs.
+///
+/// Deterministic SHA-256 over stable seed bytes through the real hash
+/// procedure — never hardcoded. Opaque to the route join, which carries it
+/// and compares it for equality only; the true digest is published by the
+/// Governor T9-01 owner.
+fn test_owner_digest() -> String {
+    sha256_hex(b"t9-02 w-b route owner-issued executable digest stand-in")
+}
+
+/// Builds one well-formed owner-produced executable join (T9-02 wire v2).
+///
+/// The `config_digest` is pinned to the presenting registration's
+/// `worker_config_digest` (`"b".repeat(64)` in these proofs): the route
+/// builds its expectation from the live registration record, so a join
+/// carrying any other config is stale by construction.
+fn test_executable_join() -> NativeWorkerExecutableBinding {
+    let now = now_ms();
+    NativeWorkerExecutableBinding {
+        route_ref: "route://test/full-canonical-route".to_owned(),
+        adapter_id: "adapter-test".to_owned(),
+        adapter_revision: 3,
+        config_digest: "b".repeat(64),
+        facet_manifest_ref: "facet-manifest-7".to_owned(),
+        grant_graph_revision: 5,
+        replay_stream_id: "stream-claim-t9-02-1/gen-1".to_owned(),
+        launch_nonce: "launch-nonce-0123456789abcdef".to_owned(),
+        process_invocation_digest: "d".repeat(64),
+        authority_epoch: test_epoch(1),
+        generation: ResourceGeneration::genesis(),
+        state_fence: live_fence(),
+        deadline_unix_ms: now.saturating_add(100_000),
+        expires_at_unix_ms: now.saturating_add(200_000),
+        executable_wire_version: NATIVE_WORKER_EXECUTABLE_BINDING_EXPECTED_WIRE_VERSION,
+        executable_binding_digest: test_owner_digest(),
+    }
+}
+
+/// Builds the route's executable expectation exactly the way
+/// `handle_native_worker_claim` does: owner-produced fields from the
+/// presented v2 join, currentness anchors from the live registration fence,
+/// the registration's worker-configuration identity, and the live epoch.
+fn route_expectation(request: &NativeWorkerClaimRequest) -> NativeWorkerExecutableExpectation {
+    let registration = serde_json::json!({
+        "worker_config_digest": "b".repeat(64),
+    });
+    KernelComposition::build_executable_expectation(
+        request.executable_binding.as_ref(),
+        &registration,
+        &live_fence(),
+        &test_epoch(1),
+    )
+    .expect("route expectation builds")
+}
+
+/// Recomputes both claim digests after a presented-field mutation so the
+/// executable gate reaches its typed currentness arm instead of stopping at
+/// a stale envelope digest.
+fn rebind_claim(claim: &mut NativeWorkerClaimRequest) {
+    claim.binding_digest = claim.compute_binding_digest().expect("rebind binding");
+    claim.request_digest = claim.canonical_request_digest().expect("rebind envelope");
+}
+
+/// Downgrades one valid v2 request to wire v1 (no join), recomputing both
+/// digests so the envelope stays shape-valid: old-wire refusal must come
+/// from the executable gate's typed disposition, never from a stale digest.
+fn test_v1_claim_request(
+    claim_id: &str,
+    registration_id: &str,
+    attempt_id: &str,
+    operation_id: &str,
+    deadline_unix_ms: u64,
+) -> NativeWorkerClaimRequest {
+    let mut request = test_claim_request(
+        claim_id,
+        registration_id,
+        attempt_id,
+        operation_id,
+        deadline_unix_ms,
+    );
+    request.wire_version = NATIVE_WORKER_CLAIM_WIRE_VERSION_V1;
+    request.executable_binding = None;
+    rebind_claim(&mut request);
+    request.validate().expect("v1 shape validates");
+    request
+        .validate_canonical_digest()
+        .expect("v1 canonical digest validates");
+    request
+}
+
 /// Builds one fully valid claim request with real computed digests.
 ///
 /// Every bound field is filled; the binding digest is recomputed over the
@@ -219,6 +314,7 @@ fn test_claim_request(
         predecessor_revision: "rev-1".to_owned(),
         authority_epoch: test_epoch(1),
         state_fence: fence,
+        executable_binding: Some(test_executable_join()),
         binding_digest: String::new(),
         request_digest: String::new(),
     };
@@ -287,13 +383,26 @@ fn typed_cross_binding_and_fail_closed_gates() {
             .is_err(),
         "foreign generation must not bind"
     );
-    // U1 executable binding is explicitly absent (stop S-U1).
-    let u1 = request
-        .require_executable_binding()
-        .expect_err("U1 must fail closed");
+    // T9-02 executable binding: the v2 owner record passes against the live
+    // registration/admission/activation/epoch records the route supplies...
+    let expectation = route_expectation(&request);
+    request
+        .require_executable_binding(&expectation, now)
+        .expect("v2 owner join passes");
+    // ...while wire v1 is refused with its typed disposition, never promoted.
+    let v1 = test_v1_claim_request(
+        "claim-gate-v1",
+        "reg-gate-1",
+        "attempt-1",
+        "op-gate-v1",
+        now.saturating_add(120_000),
+    );
+    let old = v1
+        .require_executable_binding(&route_expectation(&v1), now)
+        .expect_err("v1 must fail closed");
     assert!(
-        format!("{u1:?}").contains("u1_missing_route_fingerprint"),
-        "explicit U1 disposition, got {u1:?}"
+        format!("{old:?}").contains("u1_old_wire_without_executable_binding"),
+        "explicit old-wire disposition, got {old:?}"
     );
     // Claim admission never implies launch (stop S-X2).
     let receipt = eliot_kernel_service::NativeWorkerClaimReceipt {
@@ -556,19 +665,13 @@ fn claim_join_mints_no_process_request_or_permit() {
     assert!(response.require_canonical_activation().is_err());
 }
 
-// --- Blocked full-flow proofs (need the ORS owner fix, S-ORS) ---
+// --- Full-flow proofs (ORS owner fix S-ORS has landed) ---
 //
-// At base `crates/kernel/eliot-ors/src/store.rs` `advance_native_worker_claim`
-// validates `existing.state.transition_to(target)` but never applies
-// `next.state = target` (compare the sibling advance at `store.rs:1178-1179`
-// which does). Every non-idempotent advance therefore fails (`Requested` +
-// receipt) or silently no-ops, so `admit_native_worker_claim` (which stages
-// then advances `Requested -> Admitted`) always returns
-// `Platform("native_worker_claim_receipt is invalid: ...")` on a fresh store.
-// That file is outside this slice's owned paths (non-goal, disjoint with
-// Slice B), so these proofs stay `ignored` until the ORS owner lands the
-// one-line commit. They are kept (not deleted) so the verifier can enable
-// them after the fix with no test rewrite.
+// These proofs once stayed `ignored` because at their base
+// `crates/kernel/eliot-ors/src/store.rs` `advance_native_worker_claim`
+// validated the transition but never applied `next.state = target`. The
+// owner has since landed the one-line commit, so they run on every
+// invocation against the real store.
 
 #[test]
 fn identical_claim_replays_same_receipt_across_close_reopen() {
@@ -808,13 +911,9 @@ fn absent_canonical_activation_performs_no_launch() {
         format!("{err:?}").contains("missing_canonical_activation"),
         "explicit missing-activation disposition, got {err:?}"
     );
-    let u1 = request
-        .require_executable_binding()
-        .expect_err("U1 must fail closed");
-    assert!(
-        format!("{u1:?}").contains("u1_missing_route_fingerprint"),
-        "explicit U1 disposition, got {u1:?}"
-    );
+    request
+        .require_executable_binding(&route_expectation(&request), now)
+        .expect("v2 owner join passes before activation check");
     assert!(
         svc.activation_receipt().is_some(),
         "test setup keeps the Host activation receipt, but the claim join itself mints none"
@@ -880,4 +979,275 @@ fn credentials_stay_references_with_no_secrets_in_receipts() {
         "exact READY replay must keep one receipt identity"
     );
     let _ = std::fs::remove_dir_all(root);
+}
+
+struct ExecutableFixture {
+    claim: NativeWorkerClaimRequest,
+    expectation: NativeWorkerExecutableExpectation,
+    now: u64,
+}
+
+fn executable_fixture(tag: &str) -> ExecutableFixture {
+    let now = now_ms();
+    let claim = test_claim_request(
+        &format!("claim-t902-{tag}"),
+        &format!("reg-t902-{tag}"),
+        "attempt-1",
+        &format!("op-t902-{tag}"),
+        now.saturating_add(120_000),
+    );
+    let expectation = route_expectation(&claim);
+    ExecutableFixture {
+        claim,
+        expectation,
+        now,
+    }
+}
+
+fn join_of(fixture: &mut ExecutableFixture) -> &mut NativeWorkerExecutableBinding {
+    fixture
+        .claim
+        .executable_binding
+        .as_mut()
+        .expect("v2 fixture carries the join")
+}
+
+struct StaleCase {
+    name: &'static str,
+    mutate: fn(&mut ExecutableFixture),
+    rebind: bool,
+    service_field: &'static str,
+    transport: TransportError,
+}
+
+fn stale_cases() -> Vec<StaleCase> {
+    vec![
+        StaleCase {
+            name: "changed route",
+            mutate: |fixture| {
+                join_of(fixture).route_ref = "route://test/changed".to_owned();
+            },
+            rebind: true,
+            service_field: "native_worker_claim.executable_binding.route_ref",
+            transport: TransportError::IdentityConflict,
+        },
+        StaleCase {
+            name: "changed config",
+            mutate: |fixture| {
+                join_of(fixture).config_digest = "e".repeat(64);
+            },
+            rebind: true,
+            service_field: "native_worker_claim.executable_binding.config_digest",
+            transport: TransportError::IdentityConflict,
+        },
+        StaleCase {
+            name: "changed facet",
+            mutate: |fixture| {
+                join_of(fixture).facet_manifest_ref = "facet-manifest-9".to_owned();
+            },
+            rebind: true,
+            service_field: "native_worker_claim.executable_binding.facet_manifest_ref",
+            transport: TransportError::IdentityConflict,
+        },
+        StaleCase {
+            name: "changed owner digest",
+            mutate: |fixture| {
+                join_of(fixture).executable_binding_digest = "e".repeat(64);
+            },
+            rebind: true,
+            service_field: "native_worker_claim.executable_binding.executable_binding_digest",
+            transport: TransportError::IdentityConflict,
+        },
+        StaleCase {
+            name: "stale epoch while owner advanced",
+            mutate: |fixture| {
+                let advanced = test_epoch(2);
+                fixture.expectation.current.authority_epoch = advanced.clone();
+                fixture.expectation.current.state_fence =
+                    StateFence::new(advanced, ResourceGeneration::genesis());
+            },
+            rebind: false,
+            service_field: "native_worker_claim.executable_binding.authority_epoch",
+            transport: TransportError::SessionFenced,
+        },
+        StaleCase {
+            name: "expired binding window",
+            mutate: |fixture| {
+                fixture.now = fixture
+                    .claim
+                    .executable_binding
+                    .as_ref()
+                    .expect("v2 carries the join")
+                    .expires_at_unix_ms;
+            },
+            rebind: false,
+            service_field: "native_worker_claim.executable_binding.expired",
+            transport: TransportError::Timeout,
+        },
+        StaleCase {
+            name: "revoked authority",
+            mutate: |fixture| {
+                fixture.expectation.revoked = true;
+            },
+            rebind: false,
+            service_field: "native_worker_claim.executable_binding_revoked",
+            transport: TransportError::IdentityConflict,
+        },
+        StaleCase {
+            name: "old wire v1 without join",
+            mutate: |fixture| {
+                fixture.claim.wire_version = NATIVE_WORKER_CLAIM_WIRE_VERSION_V1;
+                fixture.claim.executable_binding = None;
+            },
+            rebind: true,
+            service_field: "native_worker_claim.u1_old_wire_without_executable_binding",
+            transport: TransportError::SessionFenced,
+        },
+    ]
+}
+
+/// T9-02 W-B stale-binding enforcement (Implements #22): one table-driven
+/// set proving the route gate refuses every stale dimension with its typed
+/// service reason and maps it into the existing `TransportError` vocabulary —
+/// changed owner dimensions conflict (`IdentityConflict`), epoch/fence and
+/// old-wire failures fence (`SessionFenced`), an elapsed binding window
+/// times out (`Timeout`). No new stage is invented; `ADMITTED` is never
+/// emitted for any of these (the route returns before sealing).
+#[test]
+fn executable_binding_stale_inputs_reject_typed() {
+    let valid = executable_fixture("valid");
+    valid
+        .claim
+        .require_executable_binding(&valid.expectation, valid.now)
+        .expect("valid owner join passes the gate");
+    KernelComposition::enforce_claim_executable_binding(
+        &valid.claim,
+        &valid.expectation,
+        valid.now,
+    )
+    .expect("route enforces the valid join");
+    for case in stale_cases() {
+        let mut fixture = executable_fixture(case.name);
+        (case.mutate)(&mut fixture);
+        if case.rebind {
+            rebind_claim(&mut fixture.claim);
+        }
+        let service_error = fixture
+            .claim
+            .require_executable_binding(&fixture.expectation, fixture.now)
+            .expect_err("stale binding must fail closed");
+        assert!(
+            format!("{service_error:?}").contains(case.service_field),
+            "{}: expected typed reason {}, got {service_error:?}",
+            case.name,
+            case.service_field
+        );
+        let route_error = KernelComposition::enforce_claim_executable_binding(
+            &fixture.claim,
+            &fixture.expectation,
+            fixture.now,
+        )
+        .expect_err("route must reject the stale binding");
+        assert_eq!(
+            route_error.into_transport(),
+            case.transport,
+            "{}: wrong transport mapping",
+            case.name
+        );
+    }
+}
+
+/// Route v2 carry (Implements #22): `build_claim_request` populates the
+/// executable join from the presented claim, fails closed when v2 omits it,
+/// parses v1 without a join, and refuses a v1 payload smuggling one.
+#[test]
+fn route_build_claim_request_carries_v2_join() {
+    let now = now_ms();
+    let request = test_claim_request(
+        "claim-carry-1",
+        "reg-carry-1",
+        "attempt-1",
+        "op-carry-1",
+        now.saturating_add(120_000),
+    );
+    let mut json = serde_json::to_value(&request).expect("claim JSON");
+    // Wire contour (Implements #64): the top-level `authority_epoch` travels
+    // as the scalar sequence, while the fence keeps the full `EpochId`.
+    json["authority_epoch"] = serde_json::json!(request.authority_epoch.sequence.get());
+    let rebuilt = KernelComposition::build_claim_request(&json).expect("v2 rebuilds");
+    assert!(
+        rebuilt.executable_binding.is_some(),
+        "v2 join must be carried"
+    );
+    assert_eq!(rebuilt.binding_digest, request.binding_digest);
+    rebuilt.validate().expect("rebuilt claim validates");
+    let mut no_join = json.clone();
+    no_join
+        .as_object_mut()
+        .expect("claim is an object")
+        .remove("executable_binding");
+    assert!(
+        KernelComposition::build_claim_request(&no_join).is_err(),
+        "v2 without join must fail closed"
+    );
+    let mut v1_value = json.clone();
+    let v1_object = v1_value.as_object_mut().expect("claim is an object");
+    v1_object.remove("executable_binding");
+    v1_object.insert(
+        "wire_version".to_owned(),
+        serde_json::json!(NATIVE_WORKER_CLAIM_WIRE_VERSION_V1),
+    );
+    let v1 = KernelComposition::build_claim_request(&v1_value).expect("v1 parses");
+    assert!(
+        v1.executable_binding.is_none(),
+        "v1 carries no join by construction"
+    );
+    let mut smuggled = json.clone();
+    smuggled
+        .as_object_mut()
+        .expect("claim is an object")
+        .insert(
+            "wire_version".to_owned(),
+            serde_json::json!(NATIVE_WORKER_CLAIM_WIRE_VERSION_V1),
+        );
+    assert!(
+        KernelComposition::build_claim_request(&smuggled).is_err(),
+        "v1 must not smuggle a join"
+    );
+}
+
+/// Source-level proof: the claim handler runs the real executable gate after
+/// admission and before any `ADMITTED` receipt is sealed, and seals the
+/// executable digest with `native_worker_claim` decisions so later reconcile
+/// observes it. The `EpochId` lineage bridge stays intact.
+#[test]
+fn claim_route_gates_executable_binding_after_admit_before_seal() {
+    let route_src = include_str!("../native_worker_lifecycle_route.rs");
+    for needle in [
+        "build_executable_expectation(",
+        "enforce_claim_executable_binding(&request, &expectation, now)",
+        "executable_binding_digest",
+    ] {
+        assert!(
+            route_src.contains(needle),
+            "lifecycle route must enforce the executable join ({needle})"
+        );
+    }
+    let admit = route_src
+        .find("admit_native_worker_claim(self.generation_gateway")
+        .expect("admission call");
+    let gate = route_src
+        .find("enforce_claim_executable_binding(&request, &expectation, now)")
+        .expect("gate call");
+    let seal = route_src
+        .find("\"native_worker_claim\",\n            &claim_id,")
+        .expect("claim seal");
+    assert!(
+        admit < gate && gate < seal,
+        "gate must run after admit and before the ADMITTED seal"
+    );
+    assert!(
+        route_src.contains("Implements #64"),
+        "EpochId lineage-bridge comments must be preserved"
+    );
 }

@@ -48,12 +48,14 @@ use super::{
     caller_binding, native_worker_reconcile_route::NATIVE_WORKER_RECONCILE_OPERATION, sha256_json,
     status_frame, unix_ms,
 };
-use eliot_contracts::{StateFence, canonical_json_bytes, sha256_hex};
+use eliot_contracts::{EpochId, StateFence, canonical_json_bytes, sha256_hex};
 use eliot_ipc::{Session, TransportError};
 use eliot_kernel_service::{
-    NATIVE_WORKER_CLAIM_WIRE_ID, NATIVE_WORKER_CLAIM_WIRE_VERSION,
+    KernelServiceError, NATIVE_WORKER_CLAIM_WIRE_ID, NATIVE_WORKER_CLAIM_WIRE_VERSION,
+    NATIVE_WORKER_CLAIM_WIRE_VERSION_V1, NATIVE_WORKER_EXECUTABLE_BINDING_EXPECTED_WIRE_VERSION,
     NATIVE_WORKER_EXECUTION_UNIT_SCHEMA_VERSION, NATIVE_WORKER_PROTOCOL_VERSION,
     NativeWorkerClaimBudget, NativeWorkerClaimRequest, NativeWorkerClaimResponse,
+    NativeWorkerExecutableBinding, NativeWorkerExecutableExpectation,
 };
 use eliot_ors::{NativeWorkerClaimRecord, NativeWorkerClaimState, OperationIdentity, OrsError};
 use eliot_process::OperationId;
@@ -720,6 +722,12 @@ impl KernelComposition {
     }
 
     /// Validates the closed claim shape: wire, digests, texts, budget, fence.
+    ///
+    /// Both claim-wire revisions parse here (Implements #22): wire v1 carries
+    /// no executable join and is refused later at the executable gate with the
+    /// typed `u1_old_wire_without_executable_binding` disposition, never
+    /// promoted; wire v2 must carry the join (checked in
+    /// [`Self::build_claim_request`]).
     fn validate_native_worker_claim(
         payload: &serde_json::Value,
     ) -> Result<(String, String, u64), NativeWorkerRouteError> {
@@ -727,8 +735,10 @@ impl KernelComposition {
             .get("wire_id")
             .and_then(serde_json::Value::as_str)
             .ok_or(NativeWorkerRouteError::Shape { field: "wire_id" })?;
+        let wire_version = native_worker_json_u16(payload, "wire_version")?;
         if wire != NATIVE_WORKER_CLAIM_WIRE_ID
-            || native_worker_json_u16(payload, "wire_version")? != NATIVE_WORKER_CLAIM_WIRE_VERSION
+            || (wire_version != NATIVE_WORKER_CLAIM_WIRE_VERSION
+                && wire_version != NATIVE_WORKER_CLAIM_WIRE_VERSION_V1)
         {
             return Err(NativeWorkerRouteError::Shape { field: "wire" });
         }
@@ -903,6 +913,40 @@ impl KernelComposition {
             });
         }
         let authority_epoch = fence.authority_epoch.clone();
+        // T9-02 executable join (Implements #22): wire v2 carries the
+        // owner-produced binding and it is parsed/carried here so the service
+        // owner's `validate` + `require_executable_binding` run over the exact
+        // admitted join. Wire v1 predates the join and carries none: a v1
+        // payload smuggling a join, or a v2 payload missing or mangling it,
+        // fails closed here before any owner sees it. The v1 no-join case
+        // parses to `None` and is refused later at the executable gate with
+        // the typed `u1_old_wire_without_executable_binding` disposition.
+        let wire_version = native_worker_json_u16(claim, "wire_version")?;
+        let executable_binding = match claim.get("executable_binding") {
+            None | Some(serde_json::Value::Null) => {
+                if wire_version == NATIVE_WORKER_CLAIM_WIRE_VERSION_V1 {
+                    None
+                } else {
+                    return Err(NativeWorkerRouteError::Shape {
+                        field: "executable_binding",
+                    });
+                }
+            }
+            Some(join_value) => {
+                if wire_version == NATIVE_WORKER_CLAIM_WIRE_VERSION_V1 {
+                    return Err(NativeWorkerRouteError::Shape {
+                        field: "executable_binding",
+                    });
+                }
+                let join: NativeWorkerExecutableBinding =
+                    serde_json::from_value(join_value.clone()).map_err(|_| {
+                        NativeWorkerRouteError::Shape {
+                            field: "executable_binding",
+                        }
+                    })?;
+                Some(join)
+            }
+        };
         Ok(NativeWorkerClaimRequest {
             wire_id: require_claim_text(claim, "wire_id")?,
             wire_version: native_worker_json_u16(claim, "wire_version")?,
@@ -935,9 +979,157 @@ impl KernelComposition {
             predecessor_revision: require_claim_text(claim, "predecessor_revision")?,
             authority_epoch,
             state_fence: fence,
+            executable_binding,
             binding_digest: require_digest(claim, "binding_digest")?,
             request_digest: require_digest(claim, "request_digest")?,
         })
+    }
+
+    /// Builds the current owner-record expectation for the executable gate.
+    ///
+    /// The owner-produced executable fields ride the presented v2 join (the
+    /// only owner-record carrier in these paths; tamper-evident through the
+    /// claim binding digest the gate recomputes). Every currentness anchor
+    /// comes from a live record, never from caller strings: the admitted
+    /// worker-configuration identity from the presenting registration record,
+    /// the generation and immutable fence from the validated registration
+    /// fence, and the authority epoch from the live service epoch record
+    /// (compared inside the gate via `is_same_authority`, never by raw
+    /// sequence). `revoked` stays false: no revocation feed exists in these
+    /// paths, so withdrawal is observed only as digest/currentness
+    /// disagreement (a Governor revocation feed belongs to a later wave).
+    ///
+    /// Wire v1 carries no owner record: the anchors below still come from the
+    /// same live records while the owner-produced strings stay empty by
+    /// construction. Those placeholders are never inspected — the real gate
+    /// refuses old wire first with typed
+    /// `u1_old_wire_without_executable_binding` — and exist only so the
+    /// refusal is the service owner's typed disposition instead of a local
+    /// invention.
+    fn build_executable_expectation(
+        presented: Option<&NativeWorkerExecutableBinding>,
+        registration: &serde_json::Value,
+        registration_fence: &StateFence,
+        live_epoch: &EpochId,
+    ) -> Result<NativeWorkerExecutableExpectation, NativeWorkerRouteError> {
+        let config_digest = require_digest(registration, "worker_config_digest")?;
+        let current = match presented {
+            Some(join) => NativeWorkerExecutableBinding {
+                route_ref: join.route_ref.clone(),
+                adapter_id: join.adapter_id.clone(),
+                adapter_revision: join.adapter_revision,
+                config_digest,
+                facet_manifest_ref: join.facet_manifest_ref.clone(),
+                grant_graph_revision: join.grant_graph_revision,
+                replay_stream_id: join.replay_stream_id.clone(),
+                launch_nonce: join.launch_nonce.clone(),
+                process_invocation_digest: join.process_invocation_digest.clone(),
+                authority_epoch: live_epoch.clone(),
+                generation: registration_fence.resource_generation,
+                state_fence: registration_fence.clone(),
+                deadline_unix_ms: join.deadline_unix_ms,
+                expires_at_unix_ms: join.expires_at_unix_ms,
+                executable_wire_version: join.executable_wire_version,
+                executable_binding_digest: join.executable_binding_digest.clone(),
+            },
+            None => NativeWorkerExecutableBinding {
+                route_ref: String::new(),
+                adapter_id: String::new(),
+                adapter_revision: 0,
+                config_digest,
+                facet_manifest_ref: String::new(),
+                grant_graph_revision: 0,
+                replay_stream_id: String::new(),
+                launch_nonce: String::new(),
+                process_invocation_digest: String::new(),
+                authority_epoch: live_epoch.clone(),
+                generation: registration_fence.resource_generation,
+                state_fence: registration_fence.clone(),
+                deadline_unix_ms: 0,
+                expires_at_unix_ms: 0,
+                executable_wire_version: NATIVE_WORKER_EXECUTABLE_BINDING_EXPECTED_WIRE_VERSION,
+                executable_binding_digest: String::new(),
+            },
+        };
+        Ok(NativeWorkerExecutableExpectation {
+            current,
+            revoked: false,
+        })
+    }
+
+    /// Runs the real executable gate and maps its verdict into route vocabulary.
+    ///
+    /// No new stage is invented: malformed or old-wire presentations are
+    /// `Shape` (fail closed as `SessionFenced`); a changed route, adapter,
+    /// config, facet, grant, nonce, stream, invocation digest, owner digest,
+    /// or withdrawn binding under the known claim identity is `Conflict`
+    /// (`IdentityConflict`, mirroring the reconcile-route identity semantics);
+    /// epoch, generation, or fence disagreement is `Fence` (`SessionFenced`);
+    /// an elapsed binding window is `ExpiredDeadline` (`Timeout`).
+    fn enforce_claim_executable_binding(
+        request: &NativeWorkerClaimRequest,
+        expectation: &NativeWorkerExecutableExpectation,
+        now: u64,
+    ) -> Result<(), NativeWorkerRouteError> {
+        request
+            .require_executable_binding(expectation, now)
+            .map_err(|error| {
+                let presented_digest = request
+                    .executable_binding
+                    .as_ref()
+                    .map(|join| join.executable_binding_digest.as_str())
+                    .unwrap_or_default();
+                Self::map_executable_error(
+                    &error,
+                    &request.claim_id,
+                    presented_digest,
+                    &expectation.current.executable_binding_digest,
+                )
+            })
+    }
+
+    /// Maps one executable-gate failure into the existing route vocabulary.
+    fn map_executable_error(
+        error: &KernelServiceError,
+        claim_id: &str,
+        presented_digest: &str,
+        current_digest: &str,
+    ) -> NativeWorkerRouteError {
+        match error {
+            KernelServiceError::InvalidField { .. } => NativeWorkerRouteError::Shape {
+                field: "executable_binding",
+            },
+            KernelServiceError::HandshakeMismatch { field } if field.ends_with(".expired") => {
+                NativeWorkerRouteError::ExpiredDeadline
+            }
+            KernelServiceError::HandshakeMismatch { field }
+                if field.ends_with(".route_ref")
+                    || field.ends_with(".adapter")
+                    || field.ends_with(".config_digest")
+                    || field.ends_with(".facet_manifest_ref")
+                    || field.ends_with(".grant_graph_revision")
+                    || field.ends_with(".replay_stream_id")
+                    || field.ends_with(".launch_nonce")
+                    || field.ends_with(".process_invocation_digest")
+                    || field.ends_with(".executable_binding_digest")
+                    || field.ends_with(".executable_wire_version")
+                    || *field == "native_worker_claim.executable_binding_revoked" =>
+            {
+                let changed = field
+                    .strip_prefix("native_worker_claim.")
+                    .unwrap_or(field)
+                    .to_owned();
+                NativeWorkerRouteError::Conflict(NativeWorkerRouteConflict {
+                    identity: claim_id.to_owned(),
+                    expected_digest: current_digest.to_owned(),
+                    observed_digest: presented_digest.to_owned(),
+                    changed_fields: vec![changed],
+                })
+            }
+            _ => NativeWorkerRouteError::Fence {
+                field: "executable_binding",
+            },
+        }
     }
 
     /// Splits one claim presentation into its claim and registration halves
@@ -1136,17 +1328,44 @@ impl KernelComposition {
                 field: "registration_binding",
             })?;
         let service = self.service_guard()?;
+        let live_epoch = service.authority_epoch();
         let decision = service
             .admit_native_worker_claim(self.generation_gateway.ors.as_ref(), &request, now)
             .map_err(|_| NativeWorkerRouteError::Fence {
                 field: "service_state",
             })?;
+        // T9-02 executable enforcement (Implements #22): an `Admitted`
+        // decision carries no launch authority until the presented v2 join
+        // agrees with the current owner record built from the live
+        // registration, admission, activation, and epoch records above. A
+        // stale or old-wire binding is a typed reject here — `ADMITTED` is
+        // never emitted — while `Rejected`/`Conflict` decisions seal
+        // unchanged below.
+        if matches!(decision, NativeWorkerClaimResponse::Admitted(_)) {
+            let expectation = Self::build_executable_expectation(
+                request.executable_binding.as_ref(),
+                registration,
+                &registration_fence,
+                &live_epoch,
+            )?;
+            Self::enforce_claim_executable_binding(&request, &expectation, now)?;
+        }
+        // The sealed executable digest lets later reconcile observe the exact
+        // binding this admission sealed (kind `native_worker_claim` only).
+        let executable_echo = request
+            .executable_binding
+            .as_ref()
+            .map(|join| join.executable_binding_digest.clone());
+        let extra_echo: Vec<(&str, &str)> = match executable_echo.as_deref() {
+            Some(digest) => vec![("executable_binding_digest", digest)],
+            None => Vec::new(),
+        };
         Self::seal_decision(
             "native_worker_claim",
             &claim_id,
             &binding_digest,
             worker_generation,
-            &[],
+            &extra_echo,
             &decision,
         )
     }
@@ -1162,6 +1381,13 @@ impl KernelComposition {
             .ok_or(NativeWorkerRouteError::Shape { field: "claim" })?;
         let (claim_id, binding_digest, worker_generation) =
             Self::validate_native_worker_claim(claim)?;
+        // Readiness operates on emitted-`ADMITTED` claims only (Implements
+        // #22): the claim gate refuses wire v1 before any `ADMITTED` receipt
+        // is emitted, so a readiness submission must carry the v2 join. This
+        // keeps a refused-but-staged v1 row from ever advancing to `Ready`.
+        if native_worker_json_u16(claim, "wire_version")? != NATIVE_WORKER_CLAIM_WIRE_VERSION {
+            return Err(NativeWorkerRouteError::Shape { field: "wire" });
+        }
         let readiness = payload
             .get("readiness")
             .filter(|readiness| readiness.is_object())

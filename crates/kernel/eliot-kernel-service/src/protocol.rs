@@ -27,10 +27,11 @@ mod native_worker_claim;
 mod process_authority_handoff;
 pub use native_worker_claim::{
     NATIVE_WORKER_CLAIM_WIRE_ID, NATIVE_WORKER_CLAIM_WIRE_VERSION,
+    NATIVE_WORKER_CLAIM_WIRE_VERSION_V1, NATIVE_WORKER_EXECUTABLE_BINDING_EXPECTED_WIRE_VERSION,
     NATIVE_WORKER_EXECUTION_UNIT_SCHEMA_VERSION, NATIVE_WORKER_PROTOCOL_VERSION,
     NativeWorkerClaimBudget, NativeWorkerClaimConflict, NativeWorkerClaimReceipt,
     NativeWorkerClaimRejection, NativeWorkerClaimRejectionReason, NativeWorkerClaimRequest,
-    NativeWorkerClaimResponse,
+    NativeWorkerClaimResponse, NativeWorkerExecutableBinding, NativeWorkerExecutableExpectation,
 };
 pub use process_authority_handoff::ProcessAuthorityHandoffDescriptor;
 

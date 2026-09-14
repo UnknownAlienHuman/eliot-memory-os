@@ -34,14 +34,17 @@ pub use ports::{
 pub use protocol::{
     AckPhase, CancelRequest, CheckpointRequest, ClaimBindingDecision, ClaimConflict, DeliveryClass,
     EXECUTION_UNIT_SCHEMA_VERSION, EventAckReceipt, JSON_ENCODING_PROFILE, MAX_CLAIM_TEXT_LEN,
-    MAX_CREDENTIAL_REFERENCES, MAX_INVALIDATION_ENTRIES, MAX_OPERATION_IDENTITY_LEN, NativeAckId,
-    NativeAckRecord, NativeBlockedReport, NativeCancellationEnvelope, NativeCancellationId,
+    MAX_CREDENTIAL_REFERENCES, MAX_INVALIDATION_ENTRIES, MAX_OPERATION_IDENTITY_LEN,
+    NATIVE_WORKER_CLAIM_WIRE_VERSION, NATIVE_WORKER_CLAIM_WIRE_VERSION_V1,
+    NATIVE_WORKER_EXECUTABLE_BINDING_EXPECTED_WIRE_VERSION, NativeAckId, NativeAckRecord,
+    NativeBlockedReport, NativeCancellationEnvelope, NativeCancellationId,
     NativeCheckpointEnvelope, NativeCheckpointId, NativeClaimId, NativeHeartbeatEnvelope,
     NativeHeartbeatId, NativeLifecycleBinding, NativeReadyId, NativeReadyReport,
     NativeRegistrationId, NativeRenewalId, NativeResultEnvelope, NativeResultId, NativeWorkerClaim,
-    NativeWorkerReadiness, NativeWorkerRegistration, PROTOCOL_VERSION, ReadinessBlockDimension,
-    ReconnectRequest, WorkerEventDraft, WorkerEventEnvelope, WorkerEventPayload, WorkerFrame,
-    WorkerFrameBody, WorkerHello, WorkerLifecycle, WorkerReady, WorkerRecovery, WorkerRequest,
+    NativeWorkerExecutableBinding, NativeWorkerExecutableExpectation, NativeWorkerReadiness,
+    NativeWorkerRegistration, PROTOCOL_VERSION, ReadinessBlockDimension, ReconnectRequest,
+    WorkerEventDraft, WorkerEventEnvelope, WorkerEventPayload, WorkerFrame, WorkerFrameBody,
+    WorkerHello, WorkerLifecycle, WorkerReady, WorkerRecovery, WorkerRequest,
 };
 
 pub const PROCESS_CONTRACT_VERSION: &str = PROCESS_CONTRACT_SCHEMA_VERSION;
@@ -226,28 +229,31 @@ where
     ///
     /// First validates the claim/registration cross-binding, then performs
     /// the checked join of the claim with the owner-supplied `hello` and
-    /// `process` via `CapabilityAdmissionRequest::from_claim`. Any mismatch
-    /// fails here, before the admission owner is consulted and before P-03
-    /// starts anything. On a match the call delegates to the same
-    /// downstream path as [`WorkerCore::demand_start`] (admit, grant
-    /// validation including the claim echo, executable-binding gate, P-03
-    /// start, receipt/proof validation, ready). No `ProcessRequest` is
-    /// minted and no grant is sealed by the join itself: only the supplied
-    /// `claim`, `hello`, and `process` are reused.
+    /// `process` via `CapabilityAdmissionRequest::from_claim` (including the
+    /// executable join binding to `hello`/`process`/registration). Any
+    /// mismatch fails here, before the admission owner is consulted and
+    /// before P-03 starts anything. On a match the call delegates to the
+    /// same downstream path as [`WorkerCore::demand_start`] (admit, grant
+    /// validation including the claim echo and the owner-produced executable
+    /// expectation, executable-binding gate, P-03 start, receipt/proof
+    /// validation, ready). No `ProcessRequest` is minted and no grant is
+    /// sealed by the join itself: only the supplied `claim`, `hello`, and
+    /// `process` are reused.
     ///
-    /// The executable-binding gate (`U1`) still fails closed: the Wave-A
-    /// claim contour carries no verifiable route fingerprint, adapter /
-    /// config / facet revisions, introduction references, replay stream,
-    /// claim-bound launch nonce, or effective capability projection, so a
-    /// fully matching projection reaches the real admission call and then
-    /// reports the first absent input instead of starting execution.
+    /// The executable-binding gate enforces the owner-produced T9-02 join:
+    /// a valid owner record passes, while a changed route, adapter, config,
+    /// facet, grant revision, nonce, stream, invocation digest, or owner
+    /// digest, a stale or revoked authority, an epoch/fence/generation
+    /// mismatch, or an expired window is refused with a typed
+    /// [`WorkerError`] before P-03 starts anything.
     ///
     /// # Errors
     ///
     /// Returns the `from_claim` join failure (`InvalidRequest`,
-    /// `StaleEpoch`, `StaleFence`, or `DeadlineExpired`), the downstream
-    /// admission/start/proof failure, or `InvalidRequest("u1_missing_*")`
-    /// for the first absent executable-binding input.
+    /// `UnsupportedVersion`, `StaleEpoch`, `StaleFence`, or
+    /// `DeadlineExpired`), the downstream admission/start/proof failure, or
+    /// the typed executable-join refusal (`InvalidRequest`, `StaleEpoch`,
+    /// `StaleFence`, `DeadlineExpired`, `Revoked`, or `UnsupportedVersion`).
     pub async fn demand_start_claimed(
         &mut self,
         claim: ClaimAdmissionRequest,
@@ -262,9 +268,9 @@ where
 
     /// Shared downstream start path for [`WorkerCore::demand_start`] and
     /// [`WorkerCore::demand_start_claimed`]: lifecycle gate, owner
-    /// validation, admission, grant checks (including the claim echo when
-    /// the request carries one), the U1 executable-binding gate, P-03
-    /// start, and receipt/proof validation.
+    /// validation, admission, grant checks (including the claim echo and the
+    /// executable expectation when the request carries one), the executable
+    /// join gate, P-03 start, and receipt/proof validation.
     #[allow(clippy::too_many_lines)]
     async fn demand_start_inner(
         &mut self,
@@ -311,7 +317,7 @@ where
         };
         validate_grant(&grant, &hello, &process, admission_request.claim())?;
         if let Some(presented) = admission_request.claim() {
-            require_claim_executable_binding(presented, &hello)?;
+            require_claim_executable_binding(presented, &hello, &process, &grant)?;
         }
         let process_binding = ProcessBindingSnapshot::from_request(&process);
 
@@ -1354,15 +1360,27 @@ fn validate_grant(
 /// Re-checks the presented claim against the owner-admitted grant.
 ///
 /// Binds the claim digest (recomputed at admission time), the claimed
-/// operation/generation, and the owner's echo of the exact claim
-/// digest/attempt/operation. A missing or disagreeing echo fails closed:
-/// the echo is inert data, never authority by itself.
+/// operation/generation, the owner's echo of the exact claim
+/// digest/attempt/operation, and — for v2 claims — the owner-produced
+/// executable expectation. A missing or disagreeing echo or expectation
+/// fails closed: both are inert data, never authority by themselves. The
+/// full executable currentness (route, adapter, config, facet, grant,
+/// stream, nonce, invocation, owner digest, epoch, generation, fence,
+/// expiry) is enforced by [`NativeWorkerClaim::require_executable_binding`]
+/// against the grant's expectation using the grant observation time; this
+/// function additionally binds the join's route/stream/nonce/invocation to
+/// the admitted grant so a well-formed but misaddressed join cannot pass on
+/// digest equality alone.
 ///
 /// # Errors
 ///
 /// Returns [`WorkerError::InvalidRequest`] for a digest that no longer
-/// recomputes, or [`WorkerError::AdmissionMismatch`] when the admitted
-/// grant or its claim echo does not name the presented claim.
+/// recomputes or a misaddressed join field,
+/// [`WorkerError::AdmissionMismatch`] when the admitted grant or its claim
+/// echo does not name the presented claim, and the typed executable refusal
+/// (`StaleEpoch`, `StaleFence`, `DeadlineExpired`, `Revoked`,
+/// `UnsupportedVersion`) when the join disagrees with current owner
+/// authority.
 fn validate_grant_claim_binding(
     grant: &CapabilityGrant,
     claim: &ClaimAdmissionRequest,
@@ -1386,36 +1404,77 @@ fn validate_grant_claim_binding(
     if grant.claim_operation_id() != Some(&presented.operation_id) {
         return Err(WorkerError::AdmissionMismatch("claim_operation"));
     }
+    if presented.wire_version == NATIVE_WORKER_CLAIM_WIRE_VERSION_V1 {
+        return Ok(());
+    }
+    let join = presented
+        .executable_binding
+        .as_ref()
+        .ok_or(WorkerError::InvalidRequest("executable_binding"))?;
+    let expected = grant
+        .executable_expectation()
+        .ok_or(WorkerError::InvalidRequest("executable_binding"))?;
+    presented.require_executable_binding(expected, grant.observed_at_unix_ms())?;
+    if join.route_ref != grant.route_ref() {
+        return Err(WorkerError::InvalidRequest("executable_binding.route_ref"));
+    }
+    if join.replay_stream_id != grant.stream_id() {
+        return Err(WorkerError::InvalidRequest(
+            "executable_binding.replay_stream_id",
+        ));
+    }
     Ok(())
 }
 
-/// U1 executable-binding gate: exposes the missing owner-produced join
-/// instead of starting execution without it.
+/// Executable-binding gate: enforces the owner-produced T9-02 join after
+/// admission and grant validation but before P-03 start.
 ///
-/// The Wave-A claim contour structurally lacks every executable-binding
-/// input the start path needs, so the claimed path fails closed here,
-/// after admission and grant validation but before P-03 start. Absent
-/// inputs, in canonical order with evidence:
-/// full `RouteFingerprint` (`route_class` at protocol.rs:777 is an admitted
-/// label only, never equated with a fingerprint); adapter revision and
-/// config revision (registration carries only artifact/config digests,
-/// protocol.rs:638-639); facet revisions; introduction references; replay
-/// stream (lives on `CapabilityAdmissionFacts` at ports.rs:256-257, not on
-/// the claim); claim-bound launch nonce (present only on `WorkerHello` at
-/// protocol.rs:93, unbound to any claim field); effective capability
-/// projection (the claim carries only the `budget` ceiling at
-/// protocol.rs:779). The first absent input is reported; later inputs stay
-/// unreachable until U1 supplies the versioned owner-produced join.
+/// The claimed path fails closed here when the presented v2 join disagrees
+/// with the owner-produced expectation carried by the admitted grant
+/// (route, adapter, config, facet, grant revision, stream, nonce,
+/// invocation digest, owner digest, epoch, generation, fence, expiry, or
+/// revocation), or when the join disagrees with the owner-supplied
+/// `hello`/`process` (route, nonce, invocation digest). Checks follow the
+/// documented absent-input order (route, adapter, config, facet, grant,
+/// stream, nonce, invocation, digest, wire, epoch, generation, fence) so
+/// the first reported field is the first input callers must repair; later
+/// inputs stay unreachable until the earlier ones agree. A v1 claim parses
+/// but never promotes; an unknown wire is rejected as
+/// [`WorkerError::UnsupportedVersion`].
 ///
 /// # Errors
 ///
-/// Always returns [`WorkerError::InvalidRequest`] naming the first absent
-/// executable-binding input until U1 lands.
+/// Returns the typed executable refusal (`InvalidRequest`, `StaleEpoch`,
+/// `StaleFence`, `DeadlineExpired`, `Revoked`, or `UnsupportedVersion`).
 fn require_claim_executable_binding(
-    _claim: &ClaimAdmissionRequest,
-    _hello: &WorkerHello,
+    claim: &ClaimAdmissionRequest,
+    hello: &WorkerHello,
+    process: &ProcessRequest,
+    grant: &CapabilityGrant,
 ) -> Result<(), WorkerError> {
-    Err(WorkerError::InvalidRequest("u1_missing_route_fingerprint"))
+    let presented = claim.claim();
+    let expected = grant
+        .executable_expectation()
+        .ok_or(WorkerError::InvalidRequest("executable_binding"))?;
+    presented.require_executable_binding(expected, grant.observed_at_unix_ms())?;
+    let join = presented
+        .executable_binding
+        .as_ref()
+        .ok_or(WorkerError::InvalidRequest("executable_binding"))?;
+    if join.route_ref != hello.route_ref {
+        return Err(WorkerError::InvalidRequest("executable_binding.route_ref"));
+    }
+    if join.launch_nonce != hello.launch_nonce {
+        return Err(WorkerError::InvalidRequest(
+            "executable_binding.launch_nonce",
+        ));
+    }
+    if join.process_invocation_digest != process.invocation_digest() {
+        return Err(WorkerError::InvalidRequest(
+            "executable_binding.process_invocation_digest",
+        ));
+    }
+    Ok(())
 }
 
 fn validate_start_receipt(
