@@ -11,15 +11,14 @@ use std::sync::Arc;
 use eliot_agent_api::{
     AdmittedRouteReceipt, AgentAttempt, AgentLaunchRequest, AgentResult, AgentWorkUnitBrief,
     AssistantDeltaObservation, AttemptId, AttemptState, AuthorityEnvelope, CONTRACT_VERSION,
-    CancelReason, CancellationState, ClockReading, ContinuityKind, EffectCeiling,
-    ErrorObservation, EventCursor, EventId, ExecutionOutcome, ExecutionStartedObservation,
-    ExecutionUnit, HOST_EVENT_CONTRACT_VERSION, HOST_EVENT_DIGEST_ALGORITHM,
-    HostEventDeliveryDisposition, HostEventNormalizationReceipt, HostEventPrivacyClass,
-    LowercaseSha256, NormalizationCoverage, NormalizedHostEventEnvelope,
-    NormalizedHostEventPayload, NativeSession, PhysicalRouteObservationReceipt,
-    ProviderExecutionBinding, ProviderObservationLineage, ProviderTerminalObservation,
-    ProviderTerminalStatus, QualifiedSourceDigest, QuotaKnowledge, RawSourceRecord,
-    ReasoningSummaryObservation, RestrictedRawSourceHandle, ResultDisposition,
+    CancelReason, CancellationState, ClockReading, ContinuityKind, EffectCeiling, ErrorObservation,
+    EventCursor, EventId, ExecutionOutcome, ExecutionStartedObservation, ExecutionUnit,
+    HOST_EVENT_CONTRACT_VERSION, HOST_EVENT_DIGEST_ALGORITHM, HostEventDeliveryDisposition,
+    HostEventNormalizationReceipt, HostEventPrivacyClass, LowercaseSha256, NativeSession,
+    NormalizationCoverage, NormalizedHostEventEnvelope, NormalizedHostEventPayload,
+    PhysicalRouteObservationReceipt, ProviderExecutionBinding, ProviderObservationLineage,
+    ProviderTerminalObservation, ProviderTerminalStatus, QualifiedSourceDigest, QuotaKnowledge,
+    RawSourceRecord, ReasoningSummaryObservation, RestrictedRawSourceHandle, ResultDisposition,
     RouteContinuationLocator, RouteFingerprint, RouteObservationState, SessionId,
     SessionLifecycleObservation, SessionLifecycleTransition, ToolInvocationObservation,
     ToolOutcomeClass, ToolOutcomeObservation, UnsupportedDisposition, UnsupportedEventObservation,
@@ -824,13 +823,11 @@ fn tool_name_from(params: &Value, method: &str) -> String {
 /// source commitment. Uses the shared canonical-JSON + SHA-256 primitive
 /// (never a new digest algorithm).
 fn digest_value(value: &Value) -> Result<LowercaseSha256, CodexAdapterError> {
-    let bytes = eliot_contracts::canonical_json_bytes(value).map_err(|_| {
-        CodexAdapterError::Contract(eliot_agent_api::ContractError::DigestMismatch)
-    })?;
+    let bytes = eliot_contracts::canonical_json_bytes(value)
+        .map_err(|_| CodexAdapterError::Contract(eliot_agent_api::ContractError::DigestMismatch))?;
     let hex = eliot_contracts::sha256_hex(&bytes);
-    serde_json::from_value(Value::String(hex)).map_err(|_| {
-        CodexAdapterError::Contract(eliot_agent_api::ContractError::DigestMismatch)
-    })
+    serde_json::from_value(Value::String(hex))
+        .map_err(|_| CodexAdapterError::Contract(eliot_agent_api::ContractError::DigestMismatch))
 }
 
 /// Classify the provider terminal status from `params.turn.status`.
@@ -869,9 +866,7 @@ fn tool_outcome_from(params: &Value) -> ToolOutcomeClass {
             ToolOutcomeClass::Succeeded
         }
         Some("failed") | Some("failure") | Some("error") => ToolOutcomeClass::Failed,
-        Some("cancelled") | Some("canceled") | Some("interrupted") => {
-            ToolOutcomeClass::Cancelled
-        }
+        Some("cancelled") | Some("canceled") | Some("interrupted") => ToolOutcomeClass::Cancelled,
         _ => ToolOutcomeClass::Unknown,
     }
 }
@@ -903,14 +898,12 @@ fn unsupported_quarantine(
         .filter(|part| !part.trim().is_empty())
         .unwrap_or("codex");
     ClassifiedCodexPayload {
-        payload: NormalizedHostEventPayload::UnsupportedQuarantined(
-            UnsupportedEventObservation {
-                source_namespace: namespace.to_owned(),
-                source_version: Some(CODEX_WIRE_SCHEMA_VERSION.to_owned()),
-                reason,
-                detail_ref: Some(method.to_owned()),
-            },
-        ),
+        payload: NormalizedHostEventPayload::UnsupportedQuarantined(UnsupportedEventObservation {
+            source_namespace: namespace.to_owned(),
+            source_version: Some(CODEX_WIRE_SCHEMA_VERSION.to_owned()),
+            reason,
+            detail_ref: Some(method.to_owned()),
+        }),
         omitted_fields,
         warnings,
         privacy_class: HostEventPrivacyClass::RestrictedHandleOnly,
@@ -930,12 +923,10 @@ fn classify_codex_payload(
 ) -> Result<ClassifiedCodexPayload, CodexAdapterError> {
     match method {
         "turn/started" | "turn/created" => Ok(ClassifiedCodexPayload {
-            payload: NormalizedHostEventPayload::ExecutionStarted(
-                ExecutionStartedObservation {
-                    execution_unit: bound_unit.clone(),
-                    start_ref: bound_turn.to_owned(),
-                },
-            ),
+            payload: NormalizedHostEventPayload::ExecutionStarted(ExecutionStartedObservation {
+                execution_unit: bound_unit.clone(),
+                start_ref: bound_turn.to_owned(),
+            }),
             omitted_fields: omitted_top_level_keys(params, &["threadId", "thread_id", "turn"]),
             warnings: Vec::new(),
             privacy_class: HostEventPrivacyClass::RedactedSummary,
@@ -951,12 +942,10 @@ fn classify_codex_payload(
             let delta_chars =
                 delta_chars_from(params, &["delta", "text", "content", "message", "output"]);
             Ok(ClassifiedCodexPayload {
-                payload: NormalizedHostEventPayload::AssistantDelta(
-                    AssistantDeltaObservation {
-                        delta_chars,
-                        truncated: false,
-                    },
-                ),
+                payload: NormalizedHostEventPayload::AssistantDelta(AssistantDeltaObservation {
+                    delta_chars,
+                    truncated: false,
+                }),
                 omitted_fields: vec!["raw_delta_text".to_owned()],
                 warnings: Vec::new(),
                 privacy_class: HostEventPrivacyClass::RedactedSummary,
@@ -988,13 +977,11 @@ fn classify_codex_payload(
                 return Err(CodexAdapterError::MalformedWire("tool name"));
             }
             Ok(ClassifiedCodexPayload {
-                payload: NormalizedHostEventPayload::ToolInvocation(
-                    ToolInvocationObservation {
-                        tool_name,
-                        invocation_ref: format!("{bound_turn}:{sequence}"),
-                        arguments_digest: digest_value(params)?,
-                    },
-                ),
+                payload: NormalizedHostEventPayload::ToolInvocation(ToolInvocationObservation {
+                    tool_name,
+                    invocation_ref: format!("{bound_turn}:{sequence}"),
+                    arguments_digest: digest_value(params)?,
+                }),
                 omitted_fields: vec!["raw_arguments".to_owned()],
                 warnings: Vec::new(),
                 privacy_class: HostEventPrivacyClass::RestrictedHandleOnly,
@@ -1263,7 +1250,10 @@ pub fn normalize_codex_event(
     if input.raw_source_bytes.is_empty() || input.raw_source_bytes.len() > MAX_EVENT_BYTES {
         return Err(CodexAdapterError::InvalidInput("raw_source_bytes"));
     }
-    if input.previous_sequence.is_some_and(|previous| input.sequence <= previous) {
+    if input
+        .previous_sequence
+        .is_some_and(|previous| input.sequence <= previous)
+    {
         return Err(CodexAdapterError::Contract(
             eliot_agent_api::ContractError::NonMonotonicEvent,
         ));
@@ -1288,9 +1278,7 @@ pub fn normalize_codex_event(
             let admission = input
                 .admission
                 .ok_or(CodexAdapterError::InvalidInput("admission/lineage"))?;
-            admission
-                .validate()
-                .map_err(CodexAdapterError::Contract)?;
+            admission.validate().map_err(CodexAdapterError::Contract)?;
             observation.validate()?;
             validate_binding_for_codex(&observation.binding)?;
             if observation.sequence != input.sequence {
@@ -1328,77 +1316,72 @@ pub fn normalize_codex_event(
         }
     };
 
-    let (payload, omitted_fields, warnings, privacy_class, coverage) =
-        match execution_observation {
-            Some((observation, _, bound_turn)) => {
-                let classified = classify_codex_payload(
-                    method,
-                    &params,
-                    bound_turn,
-                    input.sequence,
-                    &observation.binding.execution_unit,
-                )?;
-                (
-                    classified.payload,
-                    classified.omitted_fields,
-                    classified.warnings,
-                    classified.privacy_class,
-                    classified.coverage,
-                )
-            }
-            None => {
-                // Session-only path: thread lifecycle stays session-only.
-                // Turn/delta/tool/terminal methods require execution-unit
-                // lineage and fail closed here (no attempt authority invented);
-                // unknown methods quarantine as typed session evidence.
-                match method {
-                    "thread/started" => (
-                        NormalizedHostEventPayload::SessionLifecycle(
-                            SessionLifecycleObservation {
-                                transition: SessionLifecycleTransition::Started,
-                                detail_ref: None,
-                            },
-                        ),
+    let (payload, omitted_fields, warnings, privacy_class, coverage) = match execution_observation {
+        Some((observation, _, bound_turn)) => {
+            let classified = classify_codex_payload(
+                method,
+                &params,
+                bound_turn,
+                input.sequence,
+                &observation.binding.execution_unit,
+            )?;
+            (
+                classified.payload,
+                classified.omitted_fields,
+                classified.warnings,
+                classified.privacy_class,
+                classified.coverage,
+            )
+        }
+        None => {
+            // Session-only path: thread lifecycle stays session-only.
+            // Turn/delta/tool/terminal methods require execution-unit
+            // lineage and fail closed here (no attempt authority invented);
+            // unknown methods quarantine as typed session evidence.
+            match method {
+                "thread/started" => (
+                    NormalizedHostEventPayload::SessionLifecycle(SessionLifecycleObservation {
+                        transition: SessionLifecycleTransition::Started,
+                        detail_ref: None,
+                    }),
+                    Vec::new(),
+                    Vec::new(),
+                    HostEventPrivacyClass::RedactedSummary,
+                    NormalizationCoverage::Complete,
+                ),
+                "thread/resumed" => (
+                    NormalizedHostEventPayload::SessionLifecycle(SessionLifecycleObservation {
+                        transition: SessionLifecycleTransition::Resumed,
+                        detail_ref: None,
+                    }),
+                    Vec::new(),
+                    Vec::new(),
+                    HostEventPrivacyClass::RedactedSummary,
+                    NormalizationCoverage::Complete,
+                ),
+                _ if classify_needs_execution_unit(method, &params) => {
+                    return Err(CodexAdapterError::Contract(
+                        eliot_agent_api::ContractError::BindingMismatch,
+                    ));
+                }
+                _ => {
+                    let classified = unsupported_quarantine(
+                        method,
+                        UnsupportedEventReason::UnknownMethod,
                         Vec::new(),
-                        Vec::new(),
-                        HostEventPrivacyClass::RedactedSummary,
-                        NormalizationCoverage::Complete,
-                    ),
-                    "thread/resumed" => (
-                        NormalizedHostEventPayload::SessionLifecycle(
-                            SessionLifecycleObservation {
-                                transition: SessionLifecycleTransition::Resumed,
-                                detail_ref: None,
-                            },
-                        ),
-                        Vec::new(),
-                        Vec::new(),
-                        HostEventPrivacyClass::RedactedSummary,
-                        NormalizationCoverage::Complete,
-                    ),
-                    _ if classify_needs_execution_unit(method, &params) => {
-                        return Err(CodexAdapterError::Contract(
-                            eliot_agent_api::ContractError::BindingMismatch,
-                        ));
-                    }
-                    _ => {
-                        let classified = unsupported_quarantine(
-                            method,
-                            UnsupportedEventReason::UnknownMethod,
-                            Vec::new(),
-                            omitted_top_level_keys(&params, &[]),
-                        );
-                        (
-                            classified.payload,
-                            classified.omitted_fields,
-                            classified.warnings,
-                            classified.privacy_class,
-                            classified.coverage,
-                        )
-                    }
+                        omitted_top_level_keys(&params, &[]),
+                    );
+                    (
+                        classified.payload,
+                        classified.omitted_fields,
+                        classified.warnings,
+                        classified.privacy_class,
+                        classified.coverage,
+                    )
                 }
             }
-        };
+        }
+    };
 
     let unsupported_disposition = match &payload {
         NormalizedHostEventPayload::UnsupportedQuarantined(_) => {
@@ -1406,13 +1389,10 @@ pub fn normalize_codex_event(
         }
         _ => UnsupportedDisposition::None,
     };
-    let input_digest: LowercaseSha256 =
-        serde_json::from_value(Value::String(eliot_contracts::sha256_hex(
-            input.raw_source_bytes,
-        )))
-        .map_err(|_| {
-            CodexAdapterError::Contract(eliot_agent_api::ContractError::DigestMismatch)
-        })?;
+    let input_digest: LowercaseSha256 = serde_json::from_value(Value::String(
+        eliot_contracts::sha256_hex(input.raw_source_bytes),
+    ))
+    .map_err(|_| CodexAdapterError::Contract(eliot_agent_api::ContractError::DigestMismatch))?;
     let receipt = HostEventNormalizationReceipt {
         normalizer_identity: CODEX_NORMALIZER_IDENTITY.to_owned(),
         normalizer_version: CODEX_NORMALIZER_VERSION.to_owned(),
@@ -1425,9 +1405,7 @@ pub fn normalize_codex_event(
         output_digest: serde_json::from_value(Value::String(
             "0000000000000000000000000000000000000000000000000000000000000000".to_owned(),
         ))
-        .map_err(|_| {
-            CodexAdapterError::Contract(eliot_agent_api::ContractError::DigestMismatch)
-        })?,
+        .map_err(|_| CodexAdapterError::Contract(eliot_agent_api::ContractError::DigestMismatch))?,
         omitted_fields,
         warnings,
         unsupported_disposition,
@@ -2421,13 +2399,8 @@ mod tests {
         admission: &AdmittedRouteReceipt,
         sequence: u64,
         previous_sequence: Option<u64>,
-    ) -> Result<
-        (
-            NormalizedHostEventEnvelope,
-            HostEventNormalizationReceipt,
-        ),
-        CodexAdapterError,
-    > {
+    ) -> Result<(NormalizedHostEventEnvelope, HostEventNormalizationReceipt), CodexAdapterError>
+    {
         // Keep the owned message alive for the input lifetime.
         let message = CodexWireMessage::notification(method, Some(params));
         let raw_source_bytes = serde_json::to_vec(&message)
@@ -2452,13 +2425,8 @@ mod tests {
         sequence: u64,
         previous_sequence: Option<u64>,
         observed_at: ClockReading,
-    ) -> Result<
-        (
-            NormalizedHostEventEnvelope,
-            HostEventNormalizationReceipt,
-        ),
-        CodexAdapterError,
-    > {
+    ) -> Result<(NormalizedHostEventEnvelope, HostEventNormalizationReceipt), CodexAdapterError>
+    {
         let lineage = bound_lineage(binding, sequence).expect("fixture lineage");
         let cursor = EventCursor::new(format!("turn-1:{sequence}")).expect("fixture cursor");
         let event_id = EventId::new(format!("turn-1:{sequence}")).expect("fixture event");
@@ -2466,9 +2434,8 @@ mod tests {
         // To satisfy the borrow checker without unsafe, re-serialize inside:
         // the canonical raw bytes are the JSON serialization of the message.
         // We pass a reference to the local bytes (which lives for the call).
-        let handle =
-            RestrictedRawSourceHandle::new(format!("restricted-codex:turn-1:{sequence}"))
-                .expect("fixture handle");
+        let handle = RestrictedRawSourceHandle::new(format!("restricted-codex:turn-1:{sequence}"))
+            .expect("fixture handle");
         normalize_codex_event(CodexHostEventInput {
             message: &message,
             lineage,
@@ -2635,9 +2602,7 @@ mod tests {
             previous_sequence: None,
             predecessors: Vec::new(),
             raw_source_bytes: &raw,
-            raw_source_handle: RestrictedRawSourceHandle::new(
-                "restricted-codex:session-1",
-            )?,
+            raw_source_handle: RestrictedRawSourceHandle::new("restricted-codex:session-1")?,
             observed_at: clock_at(Some(1_786_000_000_000)),
             delivery: HostEventDeliveryDisposition::BestEffortOrdered,
             admission: None,
@@ -2652,7 +2617,10 @@ mod tests {
         // Session lineage never yields attributable execution binding.
         assert!(session_only.attributable_binding().is_err());
         assert!(envelope.lineage.attributable_binding().is_err());
-        assert_eq!(envelope.producer_adapter_identity, CODEX_NORMALIZER_IDENTITY);
+        assert_eq!(
+            envelope.producer_adapter_identity,
+            CODEX_NORMALIZER_IDENTITY
+        );
         assert_eq!(envelope.adapter_contract_version, CODEX_NORMALIZER_VERSION);
         Ok(())
     }
@@ -2731,10 +2699,7 @@ mod tests {
             envelope.admitted_route_digest.as_ref(),
             Some(&admission.self_digest)
         );
-        assert_eq!(
-            envelope.observed_at.valid_time_ms,
-            Some(1_786_000_000_000)
-        );
+        assert_eq!(envelope.observed_at.valid_time_ms, Some(1_786_000_000_000));
         assert_eq!(envelope.lineage.attributable_binding()?, &binding);
         envelope.validate_for_lineage(&binding, &admission)?;
         // Unknown time stays unknown; causal order is never fabricated.
@@ -2801,7 +2766,10 @@ mod tests {
         )?;
         // Sealed receipt coherence: identity/version/digest/loss/privacy/ceiling.
         assert_eq!(envelope.normalization, receipt);
-        assert_eq!(envelope.producer_adapter_identity, CODEX_NORMALIZER_IDENTITY);
+        assert_eq!(
+            envelope.producer_adapter_identity,
+            CODEX_NORMALIZER_IDENTITY
+        );
         assert_eq!(envelope.adapter_contract_version, CODEX_NORMALIZER_VERSION);
         assert_eq!(receipt.normalizer_identity, CODEX_NORMALIZER_IDENTITY);
         assert_eq!(receipt.normalizer_version, CODEX_NORMALIZER_VERSION);

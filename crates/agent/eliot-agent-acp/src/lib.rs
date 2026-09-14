@@ -1105,13 +1105,12 @@ pub fn normalize_acp_event(
     } else if input.admission.is_some() {
         return Err(AcpAdapterError::InvalidInput("admission/lineage"));
     }
-    let input_digest: LowercaseSha256 =
-        serde_json::from_value(Value::String(eliot_contracts::sha256_hex(
-            input.raw_source_bytes,
-        )))
-        .map_err(|_| {
-            AcpAdapterError::ContractValidation(eliot_agent_api::ContractError::DigestMismatch)
-        })?;
+    let input_digest: LowercaseSha256 = serde_json::from_value(Value::String(
+        eliot_contracts::sha256_hex(input.raw_source_bytes),
+    ))
+    .map_err(|_| {
+        AcpAdapterError::ContractValidation(eliot_agent_api::ContractError::DigestMismatch)
+    })?;
     // The restricted handle plus its qualified digest must validate together
     // before any envelope is minted; a handle without its digest (or vice
     // versa) fails closed here.
@@ -2458,9 +2457,7 @@ mod tests {
         assert_eq!(legacy.lineage, None);
         // Legacy generic payload never deserializes as the closed typed envelope.
         let legacy_wire = serde_json::to_value(&legacy)?;
-        assert!(
-            serde_json::from_value::<NormalizedHostEventEnvelope>(legacy_wire).is_err()
-        );
+        assert!(serde_json::from_value::<NormalizedHostEventEnvelope>(legacy_wire).is_err());
         // Legacy caller-supplied digest/time strings are never qualified source
         // digests or typed clock readings.
         assert!(

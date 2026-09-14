@@ -4,11 +4,11 @@ use eliot_agent_api::{
     AdmittedRouteReceipt, AssistantDeltaObservation, CONTRACT_VERSION, CancellationState,
     ClockReading, ErrorObservation, EventCursor, EventId, ExecutionOutcome,
     HOST_EVENT_CONTRACT_VERSION, HOST_EVENT_DIGEST_ALGORITHM, HostEventDeliveryDisposition,
-    HostEventNormalizationReceipt, HostEventPrivacyClass, LowercaseSha256,
-    NormalizationCoverage, NormalizedHostEventEnvelope, NormalizedHostEventPayload,
-    PhysicalRouteObservationReceipt, ProviderExecutionBinding, ProviderObservationLineage,
-    ProviderTerminalObservation, ProviderTerminalStatus, QualifiedSourceDigest, RawSourceRecord,
-    RestrictedRawSourceHandle, RouteFingerprint, RouteObservationState, SessionLifecycleObservation,
+    HostEventNormalizationReceipt, HostEventPrivacyClass, LowercaseSha256, NormalizationCoverage,
+    NormalizedHostEventEnvelope, NormalizedHostEventPayload, PhysicalRouteObservationReceipt,
+    ProviderExecutionBinding, ProviderObservationLineage, ProviderTerminalObservation,
+    ProviderTerminalStatus, QualifiedSourceDigest, RawSourceRecord, RestrictedRawSourceHandle,
+    RouteFingerprint, RouteObservationState, SessionLifecycleObservation,
     SessionLifecycleTransition, UnsupportedDisposition, UnsupportedEventObservation,
     UnsupportedEventReason, UsageReceipt, WarningObservation, route_divergence_fields,
 };
@@ -1423,18 +1423,16 @@ pub fn normalize_opencode_event(
         ));
     }
     match &input.lineage {
-        ProviderObservationLineage::ExecutionUnitObservation(_) => {
-            match input.admission {
-                Some(admission) => admission
-                    .validate()
-                    .map_err(OpenCodeObservationConversionError::Contract)?,
-                None => {
-                    return Err(OpenCodeObservationConversionError::InvalidInput(
-                        "admission/lineage",
-                    ));
-                }
+        ProviderObservationLineage::ExecutionUnitObservation(_) => match input.admission {
+            Some(admission) => admission
+                .validate()
+                .map_err(OpenCodeObservationConversionError::Contract)?,
+            None => {
+                return Err(OpenCodeObservationConversionError::InvalidInput(
+                    "admission/lineage",
+                ));
             }
-        }
+        },
         ProviderObservationLineage::SessionObservation(_) => {
             if input.admission.is_some() {
                 return Err(OpenCodeObservationConversionError::InvalidInput(
@@ -1446,9 +1444,7 @@ pub fn normalize_opencode_event(
     let input_digest: LowercaseSha256 = serde_json::from_value(Value::String(sha256_hex(
         input.raw_source_bytes,
     )))
-    .map_err(|error| {
-        OpenCodeObservationConversionError::Serialization(error.to_string())
-    })?;
+    .map_err(|error| OpenCodeObservationConversionError::Serialization(error.to_string()))?;
     let raw_record = RawSourceRecord {
         handle: input.raw_source_handle.clone(),
         digest: QualifiedSourceDigest {
@@ -1499,9 +1495,7 @@ pub fn normalize_opencode_event(
         output_digest: serde_json::from_value(Value::String(
             "0000000000000000000000000000000000000000000000000000000000000000".to_owned(),
         ))
-        .map_err(|error| {
-            OpenCodeObservationConversionError::Serialization(error.to_string())
-        })?,
+        .map_err(|error| OpenCodeObservationConversionError::Serialization(error.to_string()))?,
         omitted_fields: omitted_source_fields,
         warnings,
         unsupported_disposition,
@@ -1533,11 +1527,12 @@ pub fn normalize_opencode_event(
         .map_err(|error| OpenCodeObservationConversionError::Serialization(error.to_string()))?;
     match envelope.lineage.attributable_binding() {
         Ok(binding) => {
-            let admission = input
-                .admission
-                .ok_or(OpenCodeObservationConversionError::InvalidInput(
-                    "admission/lineage",
-                ))?;
+            let admission =
+                input
+                    .admission
+                    .ok_or(OpenCodeObservationConversionError::InvalidInput(
+                        "admission/lineage",
+                    ))?;
             envelope
                 .validate_for_lineage(binding, admission)
                 .map_err(OpenCodeObservationConversionError::Contract)?;
@@ -1571,10 +1566,7 @@ fn classify_opencode_event(
     Vec<String>,
 ) {
     let warnings = Vec::new();
-    let is_session_lineage = matches!(
-        lineage,
-        ProviderObservationLineage::SessionObservation(_)
-    );
+    let is_session_lineage = matches!(lineage, ProviderObservationLineage::SessionObservation(_));
     if is_session_lineage {
         match event.event_type.as_str() {
             "server.connected" => (
@@ -1601,22 +1593,18 @@ fn classify_opencode_event(
                     .unwrap_or("unknown");
                 match status_kind {
                     "idle" => (
-                        NormalizedHostEventPayload::SessionLifecycle(
-                            SessionLifecycleObservation {
-                                transition: SessionLifecycleTransition::Suspended,
-                                detail_ref: None,
-                            },
-                        ),
+                        NormalizedHostEventPayload::SessionLifecycle(SessionLifecycleObservation {
+                            transition: SessionLifecycleTransition::Suspended,
+                            detail_ref: None,
+                        }),
                         HostEventPrivacyClass::PublicSummary,
                         warnings,
                     ),
                     "busy" | "retry" => (
-                        NormalizedHostEventPayload::SessionLifecycle(
-                            SessionLifecycleObservation {
-                                transition: SessionLifecycleTransition::Resumed,
-                                detail_ref: None,
-                            },
-                        ),
+                        NormalizedHostEventPayload::SessionLifecycle(SessionLifecycleObservation {
+                            transition: SessionLifecycleTransition::Resumed,
+                            detail_ref: None,
+                        }),
                         HostEventPrivacyClass::PublicSummary,
                         warnings,
                     ),
@@ -1635,14 +1623,12 @@ fn classify_opencode_event(
                 }
             }
             _ => (
-                NormalizedHostEventPayload::UnsupportedQuarantined(
-                    UnsupportedEventObservation {
-                        source_namespace: "opencode".to_owned(),
-                        source_version: None,
-                        reason: UnsupportedEventReason::UnknownMethod,
-                        detail_ref: None,
-                    },
-                ),
+                NormalizedHostEventPayload::UnsupportedQuarantined(UnsupportedEventObservation {
+                    source_namespace: "opencode".to_owned(),
+                    source_version: None,
+                    reason: UnsupportedEventReason::UnknownMethod,
+                    detail_ref: None,
+                }),
                 HostEventPrivacyClass::RestrictedHandleOnly,
                 warnings,
             ),
@@ -1719,14 +1705,12 @@ fn classify_opencode_event(
                 warnings,
             ),
             _ => (
-                NormalizedHostEventPayload::UnsupportedQuarantined(
-                    UnsupportedEventObservation {
-                        source_namespace: "opencode".to_owned(),
-                        source_version: None,
-                        reason: UnsupportedEventReason::UnknownMethod,
-                        detail_ref: None,
-                    },
-                ),
+                NormalizedHostEventPayload::UnsupportedQuarantined(UnsupportedEventObservation {
+                    source_namespace: "opencode".to_owned(),
+                    source_version: None,
+                    reason: UnsupportedEventReason::UnknownMethod,
+                    detail_ref: None,
+                }),
                 HostEventPrivacyClass::RestrictedHandleOnly,
                 warnings,
             ),
@@ -2403,27 +2387,21 @@ mod tests {
         sequence: u64,
     ) -> eliot_agent_api::ProviderObservationLineage {
         use eliot_agent_api::{ExecutionUnitObservation, ProviderObservationLineage};
-        ProviderObservationLineage::ExecutionUnitObservation(Box::new(
-            ExecutionUnitObservation {
-                binding: binding.clone(),
-                cursor: cursor.clone(),
-                sequence,
-            },
-        ))
+        ProviderObservationLineage::ExecutionUnitObservation(Box::new(ExecutionUnitObservation {
+            binding: binding.clone(),
+            cursor: cursor.clone(),
+            sequence,
+        }))
     }
 
-    fn typed_session_lineage() -> Result<
-        eliot_agent_api::ProviderObservationLineage,
-        Box<dyn std::error::Error>,
-    > {
+    fn typed_session_lineage()
+    -> Result<eliot_agent_api::ProviderObservationLineage, Box<dyn std::error::Error>> {
         use eliot_agent_api::{NativeSession, NativeSessionLocator, SessionObservation};
         Ok(
-            eliot_agent_api::ProviderObservationLineage::SessionObservation(
-                SessionObservation {
-                    session_id: None,
-                    native: NativeSession::Native(NativeSessionLocator::new("ses_1")?),
-                },
-            ),
+            eliot_agent_api::ProviderObservationLineage::SessionObservation(SessionObservation {
+                session_id: None,
+                native: NativeSession::Native(NativeSessionLocator::new("ses_1")?),
+            }),
         )
     }
 
@@ -2544,8 +2522,7 @@ mod tests {
         let requested = conversion_route();
         let binding = conversion_binding(&requested)?;
         let admission = conversion_admission(&binding)?;
-        let raw =
-            br#"{"type":"future.unknown-kind","properties":{},"future_extra":7}"#;
+        let raw = br#"{"type":"future.unknown-kind","properties":{},"future_extra":7}"#;
         let wire: OpenCodeEvent = serde_json::from_slice(raw)?;
         assert_eq!(wire.extra.get("future_extra"), Some(&json!(7)));
         let cursor = EventCursor::new("cursor-opencode-quarantine-1")?;
@@ -2571,7 +2548,11 @@ mod tests {
             receipt.coverage,
             eliot_agent_api::NormalizationCoverage::LossyOmission
         );
-        assert!(receipt.omitted_fields.contains(&"extra:future_extra".to_owned()));
+        assert!(
+            receipt
+                .omitted_fields
+                .contains(&"extra:future_extra".to_owned())
+        );
         assert!(
             receipt
                 .warnings
@@ -2624,9 +2605,7 @@ mod tests {
                 predecessors: Vec::new(),
                 lineage: typed_execution_lineage(&binding, &cursor, 0),
                 raw_source_bytes: raw,
-                raw_source_handle: RestrictedRawSourceHandle::new(
-                    "restricted-opencode:frame-f0"
-                )?,
+                raw_source_handle: RestrictedRawSourceHandle::new("restricted-opencode:frame-f0")?,
                 observed_at: ClockReading::default(),
                 delivery: HostEventDeliveryDisposition::DurableOrdered,
                 admission: Some(&admission),
@@ -2643,9 +2622,7 @@ mod tests {
                 predecessors: Vec::new(),
                 lineage: typed_execution_lineage(&binding, &cursor, 1),
                 raw_source_bytes: raw,
-                raw_source_handle: RestrictedRawSourceHandle::new(
-                    "restricted-opencode:frame-f1"
-                )?,
+                raw_source_handle: RestrictedRawSourceHandle::new("restricted-opencode:frame-f1")?,
                 observed_at: ClockReading::default(),
                 delivery: HostEventDeliveryDisposition::DurableOrdered,
                 admission: None,

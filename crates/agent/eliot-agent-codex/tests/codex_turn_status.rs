@@ -1,14 +1,13 @@
 use eliot_agent_api::{
-    AdmittedRouteReceipt, AttemptId, ContractError, EventCursor, EventId, ExecutionUnit,
-    ExecutionUnitObservation, HostEventDeliveryDisposition, LowercaseSha256, NativeSession,
-    NativeSessionLocator, NormalizedHostEventEnvelope, NormalizedHostEventPayload,
-    ProviderExecutionBinding, ProviderObservationLineage, ProviderTerminalStatus,
-    QuotaKnowledge, RestrictedRawSourceHandle, SessionId, SessionObservation,
-    CONTRACT_VERSION,
+    AdmittedRouteReceipt, AttemptId, CONTRACT_VERSION, ContractError, EventCursor, EventId,
+    ExecutionUnit, ExecutionUnitObservation, HostEventDeliveryDisposition, LowercaseSha256,
+    NativeSession, NativeSessionLocator, NormalizedHostEventEnvelope, NormalizedHostEventPayload,
+    ProviderExecutionBinding, ProviderObservationLineage, ProviderTerminalStatus, QuotaKnowledge,
+    RestrictedRawSourceHandle, SessionId, SessionObservation,
 };
 use eliot_agent_codex::{
-    CodexAdapterError, CodexHostEventInput, CodexSessionBinding, CodexWireMessage, codex_route,
-    normalize_codex_event, CODEX_NORMALIZER_IDENTITY, CODEX_NORMALIZER_VERSION,
+    CODEX_NORMALIZER_IDENTITY, CODEX_NORMALIZER_VERSION, CodexAdapterError, CodexHostEventInput,
+    CodexSessionBinding, CodexWireMessage, codex_route, normalize_codex_event,
 };
 use eliot_contracts::{ClockReading, EpochId, EpochLineageId, sha256_hex};
 use serde_json::Value;
@@ -536,15 +535,18 @@ fn terminal_translation_preserves_event_identity_raw_digest_and_payload()
     // enter the public payload.
     let expected_digest = sha256_hex(&raw);
     assert_eq!(envelope.raw_source.digest.digest.as_str(), expected_digest);
-    assert_eq!(envelope.raw_source.handle.as_str(), "restricted-codex:turn-1:1");
+    assert_eq!(
+        envelope.raw_source.handle.as_str(),
+        "restricted-codex:turn-1:1"
+    );
     assert_eq!(receipt.input_digest, envelope.raw_source.digest);
-    assert_eq!(envelope.producer_adapter_identity, CODEX_NORMALIZER_IDENTITY);
+    assert_eq!(
+        envelope.producer_adapter_identity,
+        CODEX_NORMALIZER_IDENTITY
+    );
     assert_eq!(envelope.adapter_contract_version, CODEX_NORMALIZER_VERSION);
     assert_eq!(envelope.normalization, receipt);
-    envelope.validate_for_lineage(
-        envelope.lineage.attributable_binding()?,
-        &admission,
-    )?;
+    envelope.validate_for_lineage(envelope.lineage.attributable_binding()?, &admission)?;
     let payload_value = serde_json::to_value(&envelope.payload)?;
     assert!(!payload_value.to_string().contains("vendor"));
     Ok(())
