@@ -188,3 +188,21 @@ fn matching_revision_preserves_deterministic_compile_path() -> TestResult {
     );
     Ok(())
 }
+
+#[test]
+fn wildcard_asymmetric_fence_is_rejected_at_input_validation() -> TestResult {
+    let task_revision = revision(1)?;
+    // Symmetric-accept case still passes.
+    let symmetric = input(task_revision)?;
+    assert!(symmetric.validate().is_ok());
+    // Old one-directional check accepted input-None vs atom-Some; exact match rejects it.
+    let mut asymmetric = input(task_revision)?;
+    asymmetric.state_fence.task_revision = None;
+    assert!(
+        asymmetric
+            .state_fence
+            .is_compatible_with(&asymmetric.atoms[0].state_fence)
+    );
+    assert_eq!(asymmetric.validate(), Err(ContextError::FenceMismatch));
+    Ok(())
+}
