@@ -289,6 +289,27 @@ async fn serve_connection(
                     return Err(error);
                 }
             }
+            KernelFrameAction::Doctor {
+                request_id,
+                operation,
+                payload,
+            } => {
+                // P-07 Doctor repair intake: one bounded request/response
+                // through the closed P-07 handler
+                // (`KernelComposition::execute_doctor_request`). Frames are
+                // served strictly in receive order on this connection, so a
+                // second activation can never run concurrently with the
+                // first; unknown operations never reach this arm (dispatch
+                // fences them) and any handler failure fences the session
+                // instead of silently dropping the submit.
+                let reply = kernel
+                    .execute_doctor_request(&session, request_id, &operation, payload)
+                    .await?;
+                if let Err(error) = send_checked(&mut front_door, &reply, limits).await {
+                    session.fence();
+                    return Err(error);
+                }
+            }
             KernelFrameAction::Fence(rejection) => {
                 let result = send_checked(&mut front_door, &rejection, limits).await;
                 session.fence();
@@ -445,7 +466,13 @@ async fn serve_admitted_bridge_host_requests(
                 result?;
                 return Ok(());
             }
-            KernelFrameAction::Process { .. } | KernelFrameAction::Daemon { .. } => {
+            KernelFrameAction::Process { .. }
+            | KernelFrameAction::Daemon { .. }
+            | KernelFrameAction::Doctor { .. } => {
+                // Bridge transports never carry process, daemon, or Doctor
+                // authority: the Doctor serves only its own admitted
+                // generation-bound session/connection (T6-D2 P-07), never the
+                // bridge's. Revoke and fence exactly as for the other kinds.
                 kernel.revoke_agent_bridge(&connection_id);
                 return Err(TransportError::SessionFenced);
             }

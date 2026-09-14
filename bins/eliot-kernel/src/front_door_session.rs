@@ -12,6 +12,22 @@
 
 use super::*;
 
+/// Stable module identity of the one-shot Doctor repair worker (T6-D2 P-07).
+///
+/// The Doctor never self-asserts authority through this string:
+/// [`KernelComposition::bind_session`] admits it only over an already
+/// pipe-authenticated peer whose `ClientHello` is proven generation-bound
+/// against the live server policy by
+/// [`KernelComposition::validate_doctor_client_binding`].
+///
+/// NOTE (platform boundary): the OS pipe peer set
+/// (`NamedPipePeerSet`, `MAX_ENTRIES = 3`) admits exactly one Host, Eliotd,
+/// and AgentBridge role and lives in `eliot-platform-windows`, outside Slice-B
+/// scope. A dedicated fourth OS Doctor role needs that platform change; until
+/// then the Doctor rides an already-authenticated pipe peer and is bound at
+/// session scope here. Invalid peer or epoch gets no protected input.
+pub(crate) const DOCTOR_MODULE_ID: &str = "eliot-doctor";
+
 /// The only transport implementation admitted by the Windows-first Kernel.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(super) enum IpcImplementation {
@@ -219,6 +235,13 @@ impl KernelComposition {
         if client.module_bridge_identity == ACTIVE_DAEMON_CALLER {
             self.validate_eliotd_peer(&peer, client)?;
         }
+        if client.module_bridge_identity == DOCTOR_MODULE_ID {
+            // The one-shot Doctor repair worker binds at session scope over
+            // its already pipe-authenticated peer. Generation/epoch/artifact
+            // are proven against live server policy inside; nothing
+            // client-asserted becomes authority.
+            return self.bind_doctor_session(connection_id, peer, client);
+        }
         let policy = self
             .front_door_policy
             .lock()
@@ -322,5 +345,96 @@ impl KernelComposition {
             (_, Some(receipt)) => Ok(receipt.clone()),
             _ => Err(TransportError::SessionFenced),
         }
+    }
+
+    /// Binds an authenticated Doctor repair worker to a least-privilege session.
+    ///
+    /// The presenting pipe peer was already authenticated by the listener's
+    /// peer set; this entry proves the Doctor `ClientHello` generation-bound
+    /// against the live server policy (exact generation, exact artifact,
+    /// same-authority epoch, compatible fence) and then establishes the
+    /// transport session. Capabilities are intersected down to the single
+    /// admitted Doctor wire operation and effects are never session-bound:
+    /// effect authority arrives only per attempt through a Kernel-minted
+    /// recovery lease. The issued `ServerHello` advertises exactly that one
+    /// operation; an invalid peer or epoch fences before any protected input.
+    fn bind_doctor_session(
+        &self,
+        connection_id: impl Into<String>,
+        peer: PeerIdentity,
+        client: &eliot_protocol::ClientHello,
+    ) -> Result<HandshakeResult, eliot_ipc::TransportError> {
+        let connection_id = connection_id.into();
+        if connection_id.trim().is_empty() || connection_id.chars().any(char::is_control) {
+            return Err(TransportError::SessionFenced);
+        }
+        peer.validate()
+            .map_err(|_| TransportError::PeerIdentityUnavailable)?;
+        let policy = self
+            .front_door_policy
+            .lock()
+            .map_err(|_| TransportError::SessionFenced)?
+            .clone();
+        Self::validate_doctor_client_binding(&policy, client)?;
+        let mut session = Session::establish(connection_id, peer, client, policy.protocol_range)?;
+        session.capabilities = vec![DOCTOR_REPAIR_WIRE_ID.to_owned()];
+        session
+            .privacy_classes
+            .retain(|class| policy.allowed_privacy_classes.contains(class));
+        session.effects = Vec::new();
+        let server_hello = eliot_protocol::ServerHello {
+            selected_protocol: session.protocol_version,
+            session_principal_binding: policy.session_principal_binding.clone(),
+            allowed_capabilities: session.capabilities.clone(),
+            allowed_effects: Vec::new(),
+            config_snapshot: policy.config_snapshot.clone(),
+            heartbeat_ms: policy.heartbeat_ms,
+            control_channel: policy.control_channel.clone(),
+            rejection_reason: None,
+            authority_epoch: policy.module_generation.state_fence.authority_epoch.clone(),
+        };
+        server_hello
+            .validate()
+            .map_err(|_| TransportError::SessionFenced)?;
+        Ok(HandshakeResult {
+            capabilities: session.capabilities.clone(),
+            privacy_classes: session.privacy_classes.clone(),
+            effects: Vec::new(),
+            session,
+            server_hello,
+        })
+    }
+
+    /// Proves a Doctor `ClientHello` generation-bound against live server policy.
+    ///
+    /// Every doctor-asserted value is compared against the server-owned
+    /// policy; nothing is copied into authority. The exact generation and
+    /// artifact must match, the epoch must be the same authority, and the
+    /// presented fence must be compatible with the live fence, so a stale or
+    /// foreign generation can never bind.
+    ///
+    /// NOTE (bootstrap binding): there is no doctor launch descriptor on this
+    /// base, so no caller launch nonce is adopted as authority here. Slice A
+    /// binds the doctor bootstrap nonce to the Recovery Manifest record and
+    /// extends this check; until then the live generation/epoch/artifact join
+    /// above plus pipe authentication is the gate.
+    fn validate_doctor_client_binding(
+        policy: &ServerHandshakePolicy,
+        client: &eliot_protocol::ClientHello,
+    ) -> Result<(), TransportError> {
+        if client.module_generation.generation != policy.module_generation.generation
+            || client.module_generation.artifact_id != policy.module_generation.artifact_id
+            || client.artifact_hash != policy.module_generation.artifact_id
+            || !client
+                .authority_epoch
+                .is_same_authority(&policy.module_generation.state_fence.authority_epoch)
+            || !client
+                .module_generation
+                .state_fence
+                .is_compatible_with(&policy.module_generation.state_fence)
+        {
+            return Err(TransportError::SessionFenced);
+        }
+        Ok(())
     }
 }

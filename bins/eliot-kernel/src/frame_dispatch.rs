@@ -2,18 +2,22 @@
 //!
 //! Closed semantic gateway owned by [`crate::KernelComposition::dispatch_frame`].
 //! Validates session/frame identity, fences poisoned generations, and routes
-//! heartbeat / daemon / process frames without fabricating execution outcomes.
+//! heartbeat / daemon / process / Doctor (P-07) frames without fabricating
+//! execution outcomes.
 //!
 //! Architecture: A12.2 Principal, Session и visibility; A12.3 Один governed write path; A13.2 Kernel и failure domains; ARCH-AUTH-01; ARCH-SEC-02
 //! Implementation: I1.2 Обязательные процессы первого полного runtime; I1.8 Exact ownership and call paths; I7.2 Frame; I7.14 Session lifecycle; I14.6 Durable work, admission and execution axes; I15.2 Principal and Session binding
 //! Forbidden authority: must not fabricate execution success, must not accept peer-owned shutdown authority, must not bypass `ServerHandshakePolicy`, generation poison, or state-fence compatibility.
 //! Ordinary module: I2.23 Capability-family topology and crate extraction decisions — ordinary single-file extraction (<10k LOC) owning only `KernelComposition::dispatch_frame` plus inseparable dispatch-only helpers with zero external users.
 
+use super::front_door_session::DOCTOR_MODULE_ID;
 use super::native_worker_lifecycle_route::is_native_worker_operation;
 use super::{
-    ACTIVE_DAEMON_CALLER, Frame, FrameKind, KernelComposition, KernelFrameAction,
+    ACTIVE_DAEMON_CALLER, DOCTOR_REPAIR_WIRE_ID, DoctorAdmissionContext,
+    DoctorRepairAttemptRequest, Frame, FrameKind, KernelComposition, KernelFrameAction,
     KernelServiceState, MessageType, ProcessExecutionRequest, ProtocolPayload, Session,
-    TransportError, caller_binding, probe_ready_state_admitted, status_frame,
+    TransportError, caller_binding, probe_ready_state_admitted, route_doctor_repair, status_frame,
+    unix_ms,
 };
 
 impl KernelComposition {
@@ -237,6 +241,50 @@ impl KernelComposition {
                 }
                 return self.dispatch_host_request_frame(session, frame);
             }
+            if is_doctor_operation(native_operation) {
+                // P-07 Doctor repair-attempt intake rides the same admitted
+                // transport through this closed gateway. New-effect intake
+                // (`Request`/`Execute`) requires `Ready`; control frames
+                // (`Cancel`/`Cancel`) additionally route while `Degraded`, so
+                // a blanket `Ready` gate never destroys cancel/reconcile
+                // recovery capability (host-request `Ready|Degraded` pattern
+                // above). Peer, correlation, and fence joins mirror the
+                // host-request gate; wire/shape/digest joins live in
+                // `dispatch_doctor_frame`. Stale or unauthenticated sessions
+                // fence here and are never granted protected input.
+                let control =
+                    frame.kind == FrameKind::Cancel && frame.message_type == MessageType::Cancel;
+                if control {
+                    if !matches!(
+                        self.service_state()
+                            .map_err(|_| TransportError::SessionFenced)?,
+                        KernelServiceState::Ready | KernelServiceState::Degraded
+                    ) {
+                        return Err(TransportError::SessionFenced);
+                    }
+                } else {
+                    if frame.kind != FrameKind::Request
+                        || frame.message_type != MessageType::Execute
+                    {
+                        return Err(TransportError::SessionFenced);
+                    }
+                    if self
+                        .service_state()
+                        .map_err(|_| TransportError::SessionFenced)?
+                        != KernelServiceState::Ready
+                    {
+                        return Err(TransportError::SessionFenced);
+                    }
+                }
+                session
+                    .peer
+                    .validate()
+                    .map_err(|_| TransportError::PeerIdentityUnavailable)?;
+                if frame.request_id.is_none() || frame.request_identity.is_none() {
+                    return Err(TransportError::SessionFenced);
+                }
+                return self.dispatch_doctor_frame(session, frame);
+            }
             if self
                 .service_state()
                 .map_err(|_| TransportError::SessionFenced)?
@@ -309,4 +357,229 @@ impl KernelComposition {
             )?,
         ))
     }
+}
+
+/// Returns whether the operation string selects the P-07 Doctor repair route.
+///
+/// The operation string is the stable wire identity itself
+/// (`DOCTOR_REPAIR_WIRE_ID`); there is no second dispatch vocabulary and no
+/// generic JSON command routing. Callers must still prove the exact
+/// (`wire_id`, `wire_version`) pair through `route_doctor_repair` on the
+/// decoded typed request: the operation string only selects this closed entry.
+///
+/// INTEGRATOR (Slice A): if `doctor_front_door.rs` introduces kind-suffixed
+/// operation names (submit/cancel/reconcile/rehydrate), extend this predicate
+/// there and rewire the call in `dispatch_frame` above; keep the exact
+/// `route_doctor_repair` wire check in `dispatch_doctor_frame` as authority.
+pub(crate) fn is_doctor_operation(operation: &str) -> bool {
+    operation == DOCTOR_REPAIR_WIRE_ID
+}
+
+impl KernelComposition {
+    /// Dispatches one Doctor repair-attempt frame from an admitted session.
+    ///
+    /// The caller ([`KernelComposition::dispatch_frame`]) has already run the
+    /// closed-gateway gates (generation poison, session/frame identity,
+    /// daemon-session currency) and the per-kind service gate (new-effect
+    /// intake requires `Ready`, control additionally routes while `Degraded`);
+    /// those joins are re-checked here so direct callers cannot bypass them.
+    /// The frame must ride the presenting session's connection, the operation
+    /// string must be the exact Doctor wire identity, and the payload must
+    /// carry the typed [`DoctorRepairAttemptRequest`] under `request` with a
+    /// valid shape, canonical digest, and exact wire version. The validated
+    /// request is forwarded as [`KernelFrameAction::Doctor`]; ledger-bound
+    /// admission itself runs in [`KernelComposition::execute_doctor_request`].
+    /// Unknown operations and mismatched joins fence; nothing is retried
+    /// blindly and no admission is fabricated here.
+    pub(crate) fn dispatch_doctor_frame(
+        &self,
+        session: &Session,
+        frame: &Frame,
+    ) -> Result<KernelFrameAction, TransportError> {
+        let control = frame.kind == FrameKind::Cancel && frame.message_type == MessageType::Cancel;
+        if control {
+            if !matches!(
+                self.service_state()
+                    .map_err(|_| TransportError::SessionFenced)?,
+                KernelServiceState::Ready | KernelServiceState::Degraded
+            ) {
+                return Err(TransportError::SessionFenced);
+            }
+        } else {
+            if frame.kind != FrameKind::Request || frame.message_type != MessageType::Execute {
+                return Err(TransportError::SessionFenced);
+            }
+            if self
+                .service_state()
+                .map_err(|_| TransportError::SessionFenced)?
+                != KernelServiceState::Ready
+            {
+                return Err(TransportError::SessionFenced);
+            }
+        }
+        session
+            .peer
+            .validate()
+            .map_err(|_| TransportError::PeerIdentityUnavailable)?;
+        let request_id = frame
+            .request_id
+            .clone()
+            .ok_or(TransportError::SessionFenced)?;
+        let identity = frame
+            .request_identity
+            .as_ref()
+            .ok_or(TransportError::SessionFenced)?;
+        if !session
+            .module_generation
+            .state_fence
+            .is_compatible_with(&identity.request.state_fence)
+        {
+            return Err(TransportError::SessionFenced);
+        }
+        if frame.connection_id != session.connection_id {
+            return Err(TransportError::SessionFenced);
+        }
+        let payload = match &frame.payload {
+            ProtocolPayload::Json(payload) => payload.clone(),
+            _ => return Err(TransportError::SessionFenced),
+        };
+        let operation = payload
+            .get("operation")
+            .and_then(serde_json::Value::as_str)
+            .ok_or(TransportError::SessionFenced)?;
+        if !is_doctor_operation(operation) {
+            return Err(TransportError::SessionFenced);
+        }
+        let request = doctor_request_from_payload(&payload)?;
+        if operation != request.wire_id
+            || !route_doctor_repair(&request.wire_id, request.wire_version)
+        {
+            return Err(TransportError::SessionFenced);
+        }
+        Ok(KernelFrameAction::Doctor {
+            request_id,
+            operation: operation.to_owned(),
+            payload,
+        })
+    }
+
+    /// Executes one validated Doctor repair-attempt operation (T6-D2 P-07).
+    ///
+    /// Revalidates the closed operation name, the presenting session's Doctor
+    /// binding, and the typed request shape/digest/wire version through the
+    /// existing `doctor.rs` entries, then builds the live admission context
+    /// from Kernel-owned state (service state, `KernelService` authority
+    /// epoch, consumed activation generation) following the
+    /// `host_request_binding` live-authority pattern. Neither the epoch nor
+    /// the generation is ever taken from the request envelope.
+    ///
+    /// INTEGRATOR (Slice A) — EXACT CALL SITE. This build carries no
+    /// production `DoctorRecoveryLedger` and no immutable
+    /// `DoctorRecipeRegistry`, and the doctor bootstrap principal binding is
+    /// owned by Slice A's `doctor_front_door.rs`; the wire therefore stays
+    /// inert here (`DOCTOR_REPAIR_ADVERTISED == false`) and fails closed
+    /// without minting, persisting, or projecting any admission. Replace the
+    /// fail-closed tail below with:
+    ///
+    /// ```text
+    /// let response = eliot_kernel_service::admit_doctor_repair(
+    ///     ledger,      // Slice A production ledger over ORS
+    ///     registry,    // Slice A immutable recipe registry
+    ///     &context,
+    ///     principal,   // Slice A bootstrap-bound doctor principal for `session`
+    ///     &request,
+    ///     now_unix_nanos,
+    /// );
+    /// ```
+    ///
+    /// projecting `DoctorRepairResponse::{Admitted, Rejected, Conflict}` to a
+    /// `status_frame` `Reply` (control frames additionally consult
+    /// `reconcile_doctor_repair_admission` so cancel/reconcile stays
+    /// available while new-effect intake is closed). Until then every
+    /// well-formed request fences here after full validation.
+    pub async fn execute_doctor_request(
+        &self,
+        session: &Session,
+        request_id: super::RequestId,
+        operation: &str,
+        payload: serde_json::Value,
+    ) -> Result<Frame, TransportError> {
+        if !is_doctor_operation(operation) {
+            return Err(TransportError::SessionFenced);
+        }
+        if session.module_generation.module_id.as_str() != DOCTOR_MODULE_ID {
+            return Err(TransportError::SessionFenced);
+        }
+        session
+            .peer
+            .validate()
+            .map_err(|_| TransportError::PeerIdentityUnavailable)?;
+        if !matches!(
+            self.service_state()
+                .map_err(|_| TransportError::SessionFenced)?,
+            KernelServiceState::Ready | KernelServiceState::Degraded
+        ) {
+            return Err(TransportError::SessionFenced);
+        }
+        let request = doctor_request_from_payload(&payload)?;
+        if operation != request.wire_id
+            || !route_doctor_repair(&request.wire_id, request.wire_version)
+        {
+            return Err(TransportError::SessionFenced);
+        }
+        let (service_state, authority_epoch, generation) = {
+            let service = self
+                .service
+                .lock()
+                .map_err(|_| TransportError::SessionFenced)?;
+            let generation = service
+                .activation_receipt()
+                .ok_or(TransportError::SessionFenced)?
+                .generation
+                .value();
+            (service.state(), service.authority_epoch(), generation)
+        };
+        let context = DoctorAdmissionContext::new(service_state, authority_epoch, generation)
+            .map_err(|_| TransportError::SessionFenced)?;
+        let now_unix_nanos = unix_ms().saturating_mul(1_000_000);
+        if now_unix_nanos == 0 {
+            return Err(TransportError::SessionFenced);
+        }
+        // Ledger-bound admission is Slice A's scope (see the INTEGRATOR note
+        // above): fail closed without minting or projecting any admission.
+        let _ = (context, now_unix_nanos, request_id, request);
+        Err(TransportError::SessionFenced)
+    }
+}
+
+/// Decodes the exact typed Doctor repair-attempt request from a P-07 frame
+/// payload.
+///
+/// The payload carries the closed operation string plus the full typed request
+/// under `request`; the request shape, its canonical digest, and its exact
+/// wire version are re-validated through the existing `doctor.rs` entries, so
+/// this is typed dispatch, not generic JSON routing.
+///
+/// INTEGRATOR (Slice A): if `doctor_front_door.rs` nests the request under a
+/// different payload key, adjust this one decode site; the validation chain
+/// below stays unchanged.
+fn doctor_request_from_payload(
+    payload: &serde_json::Value,
+) -> Result<DoctorRepairAttemptRequest, TransportError> {
+    let request_value = payload
+        .get("request")
+        .cloned()
+        .ok_or(TransportError::SessionFenced)?;
+    let request: DoctorRepairAttemptRequest =
+        serde_json::from_value(request_value).map_err(|_| TransportError::SessionFenced)?;
+    request
+        .validate()
+        .map_err(|_| TransportError::SessionFenced)?;
+    request
+        .validate_canonical_digest()
+        .map_err(|_| TransportError::SessionFenced)?;
+    if !route_doctor_repair(&request.wire_id, request.wire_version) {
+        return Err(TransportError::SessionFenced);
+    }
+    Ok(request)
 }
