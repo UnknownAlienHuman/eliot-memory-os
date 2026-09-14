@@ -1,6 +1,17 @@
-//! Bounded `CodeCortex` memory writer — mechanical child of `crates/eliot-engine/src/codecortex.rs` (canonical base `8e1b66d267633052dc2b9eac7776dff743a6827b`, graph `eliot-memory-os-8e1b66d-live`).
+//! Bounded `CodeCortex` memory writer — mechanical child of `crates/eliot-engine/src/codecortex.rs`.
 //!
-//! Architecture anchors: `A12.3` (governed write path) and `A10.8`/`A5.5` (Instrument Plane / Verifier). Implementation anchors: `I12.10` (`CodeCortex` implementation), `I5.4`–`I5.8` + `I5.19` (canonical transition → write envelope → admission → receipt via `WriterHandle`/`WriteAdmissionService`), and `I10.8` (Instrument Plane adapters).
+//! Architecture: A12.3 (docs/architecture/A12-03-one-governed-write-path.md#a123-one-governed-write-path),
+//! A10.8 (docs/architecture/A10-08-verification-and-finish.md#a108-verification-and-finish),
+//! A5.5 (docs/architecture/A05-05-verifier-and-evaluation-contract.md#a55-verifier-and-evaluation-contract).
+//! Implementation: I12.10 (docs/architecture/I12-10-codecortex-implementation.md#i1210-codecortex-implementation),
+//! I5.4 (docs/architecture/I05-04-canonical-transition.md#i54-canonical-transition),
+//! I5.5 (docs/architecture/I05-05-write-envelope.md#i55-write-envelope),
+//! I5.6 (docs/architecture/I05-06-admission-and-staging.md#i56-admission-and-staging),
+//! I5.7 (docs/architecture/I05-07-ordering-and-parallelism.md#i57-ordering-and-parallelism),
+//! I5.8 (docs/architecture/I05-08-canonical-event-and-projections.md#i58-canonical-event-and-projections),
+//! I5.19 (docs/architecture/I05-19-write-submission-execution-and-receipts.md#i519-write-submission-execution-and-receipts),
+//! I10.8 (docs/architecture/I10-08-instrument-plane-canonical-verification-and-code-intelligence.md#i108-instrument-plane-canonical-verification-and-code-intelligence).
+//! Normative precedence remains in `docs/ARCHITECTURE_CONTRACT.md`.
 //!
 //! Ownership: this child owns only `CodeCortexMemoryWriter` and its `write_report` / `write_report_scoped` / `write_report_with_scope` seam that submits the already-bounded `ToolObservationRecord` (`codecortex_internal_report`, `codecortex-d1` scope, `Internal`/`LocalVerified`) via `WriteAdmissionService::admit` → `WriterHandle::submit`. All bounded payload projection (`codecortex-memory-projection-v1`, 96 KiB, evidence limit 12, truncation helpers), `codecortex_observation_command` construction, `full_report_digest` (`blake3`), and admission validation remain in the parent `codecortex` module, which retains `CodeCortexService` composition, adapter execution (`git`/`cargo`/`rg`/`sg`), diagnostics, and scope-binding authority.
 //!

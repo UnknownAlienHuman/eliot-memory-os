@@ -1,8 +1,7 @@
 //! Packet quality finalization — deterministic scoring and identity for the context packet.
 //!
-//! This module owns the contiguous, source-proven packet-quality closure extracted
-//! from `crates/eliot-engine/src/context.rs` (canonical parent `f71070b`,
-//! `origin/main` `f71070b2455483fb102ab196566f9faab5cda1cb`):
+//! This module owns the contiguous packet-quality closure extracted
+//! from `crates/eliot-engine/src/context.rs`:
 //! `PacketQualityService` and its `finalize` plus directly owned private helper
 //! `causal_bridge_missing_hops` in its quality/finalization block. Behavior,
 //! serialization/hash/order/errors remain identical; no compiler, proof
@@ -24,22 +23,21 @@
 //! - **No Dreamer / canonical-write / runtime authority:** no provider invocation,
 //!   Dreamer orchestration, canonical store write, or service lifecycle is moved here.
 //!
-//! # Canonical handles (verified from local authoritative docs)
+//! # Canonical handles
 //!
-//! Source of truth for architecture/implementation handles is the current source
-//! tree `docs/architecture/ELIOT_ARCHITECTURE.md` (`4.5-draft`) and
-//! `docs/architecture/ELIOT_IMPLEMENTATION.md` (`0.29-draft`), plus
-//! `docs/architecture/INDEX.md` (`E:context-compiler`). The persistent graph
-//! `eliot-memory-os-f71070b-live` (61020 nodes / 292342 edges) and docs project
-//! `eliot-architecture-docs-*` are evidence/routing layers only and were
-//! consulted before source inspection per worktree `AGENTS.md`.
-//!
-//! - Architecture: `A7.1` Active Understanding View, `A7.4` Context as
-//!   intervention, `A7.6` Compaction & resume, `A7.9` Context economy.
-//! - Implementation: `I7.11` Context payload profiles and Decision Safety Floor,
-//!   `I7.26` Reversible payload budget and omission handles (each compiled view
-//!   emits `PacketQualityScorecard`), `I7.19` Reactive context sequence,
-//!   `I12.13`–`I12.17` orientation/bounded context/compaction.
+//! Architecture: A7.1 (docs/architecture/A07-01-active-understanding-view.md#a71-active-understanding-view),
+//! A7.4 (docs/architecture/A07-04-context-as-intervention.md#a74-context-as-intervention),
+//! A7.6 (docs/architecture/A07-06-compaction-and-resume.md#a76-compaction-and-resume),
+//! A7.9 (docs/architecture/A07-09-context-economy.md#a79-context-economy).
+//! Implementation: I7.11 (docs/architecture/I07-11-context-payload-profiles-and-decision-safety-floor.md#i711-context-payload-profiles-and-decision-safety-floor),
+//! I7.26 (docs/architecture/I07-26-reversible-payload-budget-and-omission-handles.md#i726-reversible-payload-budget-and-omission-handles),
+//! I7.19 (docs/architecture/I07-19-reactive-context-sequence.md#i719-reactive-context-sequence),
+//! I12.13 (docs/architecture/I12-13-context-compiler.md#i1213-context-compiler),
+//! I12.14 (docs/architecture/I12-14-hot-path.md#i1214-hot-path),
+//! I12.15 (docs/architecture/I12-15-bounded-spreading-activation.md#i1215-bounded-spreading-activation),
+//! I12.16 (docs/architecture/I12-16-context-consistency.md#i1216-context-consistency),
+//! I12.17 (docs/architecture/I12-17-compaction-and-resume.md#i1217-compaction-and-resume).
+//! Normative precedence remains in `docs/ARCHITECTURE_CONTRACT.md`.
 //!
 //! # Import policy
 //!
