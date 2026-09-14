@@ -13,7 +13,9 @@ use serde::{Deserialize, Serialize};
 
 use eliot_contracts::StateFence;
 #[cfg(test)]
-use eliot_contracts::{AuthorityEpoch, ResourceGeneration};
+use eliot_contracts::{EpochId, EpochLineageId, ResourceGeneration};
+#[cfg(test)]
+use std::num::NonZeroU64;
 
 use crate::budget::BudgetLimits;
 use crate::error::{ContractViolation, check_fence, check_text, closed_wire_enum, is_hex64_lower};
@@ -265,6 +267,12 @@ pub fn brief_kinds_distinct() -> bool {
 
 #[cfg(test)]
 pub(crate) fn sample_job() -> DreamJobInput {
+    let epoch = EpochId::new(
+        EpochLineageId::new("550e8400-e29b-41d4-a716-446655440000")
+            .expect("canonical test lineage-A"),
+        NonZeroU64::new(1).expect("non-zero test sequence"),
+    )
+    .expect("valid test epoch");
     DreamJobInput {
         schema_version: DREAM_JOB_SCHEMA_VERSION,
         job_class: JobClass::Orientation,
@@ -277,7 +285,7 @@ pub(crate) fn sample_job() -> DreamJobInput {
         idempotency_key: "idem-1".to_owned(),
         task_id: "task-1".to_owned(),
         scope_id: "scope-1".to_owned(),
-        state_fence: StateFence::new(AuthorityEpoch::genesis(), ResourceGeneration::genesis()),
+        state_fence: StateFence::new(epoch, ResourceGeneration::genesis()),
         privacy_profile: PRIVACY_LOCAL_ONLY.to_owned(),
         contract_ref: "contract-1".to_owned(),
         policy_ref: "policy-1".to_owned(),
@@ -481,12 +489,16 @@ mod tests {
         assert_eq!(back.idempotency_key, "idem-1");
         let back_fence = &back.state_fence;
         let job_fence = &job.state_fence;
-        assert_eq!(back_fence.authority_epoch, job_fence.authority_epoch);
+        assert!(
+            back_fence
+                .authority_epoch
+                .is_same_authority(&job_fence.authority_epoch)
+        );
         assert_eq!(
             back_fence.resource_generation,
             job_fence.resource_generation
         );
-        assert_eq!(back.state_fence.authority_epoch.value(), 1);
+        assert_eq!(back.state_fence.authority_epoch.sequence.get(), 1);
         assert_eq!(back.state_fence.resource_generation.value(), 1);
         assert!(back.validate().is_ok());
         assert_eq!(back.canonical_id(), job.canonical_id());

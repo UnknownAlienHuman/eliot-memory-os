@@ -1,6 +1,7 @@
 #![allow(clippy::unwrap_used)]
 
-use eliot_contracts::{AuthorityEpoch, ResourceGeneration, StateFence, sha256_hex};
+use eliot_contracts::{EpochId, EpochLineageId, ResourceGeneration, StateFence, sha256_hex};
+use std::num::NonZeroU64;
 use eliot_dreamer_candidate_validation::{
     CandidateValidationOutcome, RejectionCode, ValidationPolicy, validate_grounded_dream_draft_at,
 };
@@ -13,6 +14,16 @@ use eliot_dreamer_contracts::{
 };
 
 const MAX: u64 = 1_048_576;
+
+fn fence() -> StateFence {
+    let epoch = EpochId::new(
+        EpochLineageId::new("550e8400-e29b-41d4-a716-446655440000")
+            .expect("canonical test lineage-A"),
+        NonZeroU64::new(1).expect("non-zero test sequence"),
+    )
+    .expect("valid test epoch");
+    StateFence::new(epoch, ResourceGeneration::genesis())
+}
 
 #[allow(clippy::too_many_lines)]
 fn fixture() -> (
@@ -36,7 +47,7 @@ fn fixture() -> (
         idempotency_key: "idempotency-1".to_owned(),
         task_id: "task-1".to_owned(),
         scope_id: "scope-1".to_owned(),
-        state_fence: StateFence::new(AuthorityEpoch::genesis(), ResourceGeneration::genesis()),
+        state_fence: fence(),
         privacy_profile: "local_only".to_owned(),
         contract_ref: "contract-1".to_owned(),
         policy_ref: "policy-1".to_owned(),

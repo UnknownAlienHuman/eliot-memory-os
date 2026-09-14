@@ -1,6 +1,7 @@
 use std::fmt::Debug;
 
-use eliot_contracts::{AuthorityEpoch, ResourceGeneration, StateFence};
+use eliot_contracts::{EpochId, EpochLineageId, ResourceGeneration, StateFence};
+use std::num::NonZeroU64;
 use eliot_dreamer_contracts::{
     BudgetLimits, DreamJobInput, JobClass, Requester, RequesterOrigin, ValidatedDreamDraft,
     ValidationReceipt,
@@ -17,7 +18,13 @@ fn must<T, E: Debug>(result: Result<T, E>) -> T {
 }
 
 fn fence() -> StateFence {
-    StateFence::new(AuthorityEpoch::genesis(), ResourceGeneration::genesis())
+    let epoch = EpochId::new(
+        EpochLineageId::new("550e8400-e29b-41d4-a716-446655440000")
+            .expect("canonical test lineage-A"),
+        NonZeroU64::new(1).expect("non-zero test sequence"),
+    )
+    .expect("valid test epoch");
+    StateFence::new(epoch, ResourceGeneration::genesis())
 }
 
 fn digest(ch: char) -> String {

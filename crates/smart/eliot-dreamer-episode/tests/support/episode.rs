@@ -3,9 +3,10 @@
 use std::collections::BTreeSet;
 
 use eliot_contracts::{
-    ArtifactId, AuthorityEpoch, ClockReading, ProductId, ResourceGeneration, SourceId, StateFence,
-    TaskRevision,
+    ArtifactId, ClockReading, EpochId, EpochLineageId, ProductId, ResourceGeneration, SourceId,
+    StateFence, TaskRevision,
 };
+use std::num::NonZeroU64;
 use eliot_dreamer_contracts::curation::{EpisodePayload, TargetEvidence};
 use eliot_dreamer_contracts::*;
 use eliot_epistemic_contracts::{
@@ -52,7 +53,13 @@ pub fn digest_value(value: &str) -> Digest {
 }
 
 pub fn fence() -> StateFence {
-    StateFence::new(AuthorityEpoch::genesis(), ResourceGeneration::genesis())
+    let epoch = EpochId::new(
+        EpochLineageId::new("550e8400-e29b-41d4-a716-446655440000")
+            .expect("canonical test lineage-A"),
+        NonZeroU64::new(1).expect("non-zero test sequence"),
+    )
+    .expect("valid test epoch");
+    StateFence::new(epoch, ResourceGeneration::genesis())
 }
 
 fn id(value: &str) -> ArtifactId {

@@ -4,7 +4,10 @@
 
 #![allow(clippy::expect_used)]
 
-use eliot_contracts::{AuthorityEpoch, ReceiptId, RequestId, ResourceGeneration, StateFence};
+use eliot_contracts::{
+    EpochId, EpochLineageId, ReceiptId, RequestId, ResourceGeneration, StateFence,
+};
+use std::num::NonZeroU64;
 use eliot_dreamer_contracts::curation::{ClassificationPayload, TargetEvidence, route_payload};
 use eliot_dreamer_contracts::job::{Requester, RequesterOrigin};
 use eliot_dreamer_contracts::{
@@ -50,7 +53,13 @@ fn consumer_shape(
 }
 
 fn fence() -> StateFence {
-    StateFence::new(AuthorityEpoch::genesis(), ResourceGeneration::genesis())
+    let epoch = EpochId::new(
+        EpochLineageId::new("550e8400-e29b-41d4-a716-446655440000")
+            .expect("canonical test lineage-A"),
+        NonZeroU64::new(1).expect("non-zero test sequence"),
+    )
+    .expect("valid test epoch");
+    StateFence::new(epoch, ResourceGeneration::genesis())
 }
 
 fn fixture_job() -> DreamJobInput {

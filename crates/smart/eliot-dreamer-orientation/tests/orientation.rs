@@ -9,9 +9,10 @@
 use std::collections::BTreeSet;
 
 use eliot_contracts::{
-    AuthorityEpoch, ReceiptId, ResourceGeneration, SourceId, StateFence, canonical_json_bytes,
-    sha256_hex,
+    EpochId, EpochLineageId, ReceiptId, ResourceGeneration, SourceId, StateFence,
+    canonical_json_bytes, sha256_hex,
 };
+use std::num::NonZeroU64;
 use eliot_dreamer_contracts::relation::RelationPreservationDimension;
 use eliot_dreamer_contracts::validation::{
     InputPreimage, OutputContext, PROOF_CEILING, VALIDATOR_CONTRACT, budget_digest, bundle_digest,
@@ -48,7 +49,13 @@ fn fixture(
     OrientationPolicy,
     Vec<CurrentEpistemicPositionHandle>,
 ) {
-    let fence = StateFence::new(AuthorityEpoch::genesis(), ResourceGeneration::genesis());
+    let epoch = EpochId::new(
+        EpochLineageId::new("550e8400-e29b-41d4-a716-446655440000")
+            .expect("canonical test lineage-A"),
+        NonZeroU64::new(1).expect("non-zero test sequence"),
+    )
+    .expect("valid test epoch");
+    let fence = StateFence::new(epoch, ResourceGeneration::genesis());
     let job = DreamJobInput {
         schema_version: 1,
         job_class: JobClass::Orientation,

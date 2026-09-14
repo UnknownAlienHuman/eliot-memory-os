@@ -38,8 +38,8 @@ pub use eliot_epistemic_contracts::{
 /// lower-owner dependencies.
 pub mod canonical {
     pub use eliot_contracts::{
-        ArtifactId, AuthorityEpoch, ReceiptId, RequestId, ResourceGeneration, SourceId, StateFence,
-        TaskId, canonical_json_bytes, sha256_hex,
+        ArtifactId, AuthorityEpoch, EpochId, EpochLineageId, ReceiptId, RequestId,
+        ResourceGeneration, SourceId, StateFence, TaskId, canonical_json_bytes, sha256_hex,
     };
     pub use eliot_epistemic_contracts::{
         AbsenceClaim, AbsenceClaimParams, BoundedProof, CausalClaim, CausalClaimParams,

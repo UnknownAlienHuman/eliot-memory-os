@@ -14,8 +14,9 @@
 use std::cell::Cell;
 
 use eliot_contracts::{
-    AuthorityEpoch, ReceiptId, RequestId, ResourceGeneration, StateFence, sha256_hex,
+    EpochId, EpochLineageId, ReceiptId, RequestId, ResourceGeneration, StateFence, sha256_hex,
 };
+use std::num::NonZeroU64;
 use eliot_dreamer_contracts::candidate::DimensionVerdict;
 use eliot_dreamer_contracts::curation::{MergePayload, TargetEvidence};
 use eliot_dreamer_contracts::registry::family_kinds;
@@ -125,8 +126,26 @@ fn closed_registry() -> CurationHandlerRegistry {
     registry
 }
 
+fn test_epoch() -> EpochId {
+    EpochId::new(
+        EpochLineageId::new("550e8400-e29b-41d4-a716-446655440000")
+            .expect("canonical test lineage-A"),
+        NonZeroU64::new(1).expect("non-zero test sequence"),
+    )
+    .expect("valid test epoch")
+}
+
+fn drift_epoch() -> EpochId {
+    EpochId::new(
+        EpochLineageId::new("550e8400-e29b-41d4-a716-446655440001")
+            .expect("canonical test lineage-B"),
+        NonZeroU64::new(1).expect("non-zero test sequence"),
+    )
+    .expect("valid test epoch")
+}
+
 fn fixture_fence() -> StateFence {
-    StateFence::new(AuthorityEpoch::genesis(), ResourceGeneration::genesis())
+    StateFence::new(test_epoch(), ResourceGeneration::genesis())
 }
 
 fn fixture_job(fence: &StateFence) -> DreamJobInput {
@@ -453,7 +472,7 @@ fn altered_item_fence_port_and_result_bindings_fail_closed() {
     // Fence drift between the accepted item and the job fails closed.
     let mut bad_fence = fx.item.clone();
     let generation = ResourceGeneration::new(2).expect("generation");
-    bad_fence.state_fence = StateFence::new(AuthorityEpoch::genesis(), generation);
+    bad_fence.state_fence = StateFence::new(drift_epoch(), generation);
     bad_fence.receipt.state_fence = bad_fence.state_fence.clone();
     let err = invoke(
         &fx.port,

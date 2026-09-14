@@ -655,10 +655,29 @@ pub(crate) fn valid_receipt(draft_digest: &str, fence: StateFence) -> Validation
 #[allow(clippy::expect_used)]
 mod tests {
     use super::*;
-    use eliot_contracts::{AuthorityEpoch, ResourceGeneration};
+    use eliot_contracts::{EpochId, EpochLineageId, ResourceGeneration};
+    use std::num::NonZeroU64;
+
+    fn test_epoch() -> EpochId {
+        EpochId::new(
+            EpochLineageId::new("550e8400-e29b-41d4-a716-446655440000")
+                .expect("canonical test lineage-A"),
+            NonZeroU64::new(1).expect("non-zero test sequence"),
+        )
+        .expect("valid test epoch")
+    }
+
+    fn drift_epoch() -> EpochId {
+        EpochId::new(
+            EpochLineageId::new("550e8400-e29b-41d4-a716-446655440001")
+                .expect("canonical test lineage-B"),
+            NonZeroU64::new(1).expect("non-zero test sequence"),
+        )
+        .expect("valid test epoch")
+    }
 
     fn valid_fence() -> StateFence {
-        StateFence::new(AuthorityEpoch::genesis(), ResourceGeneration::genesis())
+        StateFence::new(test_epoch(), ResourceGeneration::genesis())
     }
 
     fn valid_raw() -> RawProviderOutput {
@@ -1341,7 +1360,7 @@ mod tests {
         assert_malformed(&ctrl_id.validate());
         let next_gen = ResourceGeneration::new(2).expect("non-genesis generation");
         let mut changed_fence = base.clone();
-        changed_fence.state_fence = StateFence::new(AuthorityEpoch::genesis(), next_gen);
+        changed_fence.state_fence = StateFence::new(drift_epoch(), next_gen);
         assert_binding(&changed_fence.validate_binding(&recorded));
         let mut bad_validator = base.clone();
         bad_validator.validator_contract = "   ".to_string();

@@ -2,14 +2,17 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
+use std::num::NonZeroU64;
+
 use eliot_dreamer_contracts::grounding::canonical::{
-    AbsenceClaim, AbsenceClaimParams, ArtifactId, AuthorityEpoch, BoundedProof, CausalClaim,
-    CausalClaimParams, CausalStatus, CoverageDenominator, CoverageDenominatorParams,
-    CoverageReceipt, CoverageReceiptParams, DenominatorKind, EvidenceAuthority, EvidenceFreshness,
-    EvidenceGrade, FrontierRevision, FrontierSpec, LineageRootId, MemberDisposition, MemberOutcome,
-    OwnerLookup, PaginationBounds, PositionAssertability, Precision, PrivacyHandling,
-    QueryRevision, QuerySpec, ResourceGeneration, SnapshotRef, SourceAssurance, SourceId,
-    SourceLineage, SourceRevisionId, StateFence, TaskId, TemporalRecord, ValidityBounds,
+    AbsenceClaim, AbsenceClaimParams, ArtifactId, BoundedProof, CausalClaim, CausalClaimParams,
+    CausalStatus, CoverageDenominator, CoverageDenominatorParams, CoverageReceipt,
+    CoverageReceiptParams, DenominatorKind, EpochId, EpochLineageId, EvidenceAuthority,
+    EvidenceFreshness, EvidenceGrade, FrontierRevision, FrontierSpec, LineageRootId,
+    MemberDisposition, MemberOutcome, OwnerLookup, PaginationBounds, PositionAssertability,
+    Precision, PrivacyHandling, QueryRevision, QuerySpec, ResourceGeneration, SnapshotRef,
+    SourceAssurance, SourceId, SourceLineage, SourceRevisionId, StateFence, TaskId, TemporalRecord,
+    ValidityBounds,
 };
 use eliot_dreamer_contracts::grounding::{
     AllowedReferenceManifest, AttemptIdentity, ClaimKind, GroundingPolicy, MaterialClaim,
@@ -27,7 +30,13 @@ pub fn artifact(value: &str) -> ArtifactId {
 }
 
 pub fn fence() -> StateFence {
-    StateFence::new(AuthorityEpoch::genesis(), ResourceGeneration::genesis())
+    let epoch = EpochId::new(
+        EpochLineageId::new("550e8400-e29b-41d4-a716-446655440000")
+            .expect("canonical test lineage-A"),
+        NonZeroU64::new(1).expect("non-zero test sequence"),
+    )
+    .expect("valid test epoch");
+    StateFence::new(epoch, ResourceGeneration::genesis())
 }
 
 pub fn task() -> TaskId {
