@@ -23,6 +23,13 @@ use std::sync::{Arc, Mutex};
 use thiserror::Error;
 use uuid::Uuid;
 
+mod claim;
+
+pub use claim::{
+    ClaimBindingExpectation, ExpiredRunningReconciliation, reconcile_expired_running,
+    validate_claim_binding,
+};
+
 const JOBS: TableDefinition<&str, &[u8]> = TableDefinition::new("testd_jobs_v1");
 const EVENTS: TableDefinition<&str, &[u8]> = TableDefinition::new("testd_events_v1");
 const META: TableDefinition<&str, &[u8]> = TableDefinition::new("testd_meta_v1");
@@ -1074,6 +1081,11 @@ impl TestdStore {
                 reason: "must be non-zero",
             });
         }
+        // Opportunistic restart recovery: fence-expired running jobs reconcile
+        // to Unknown/RetryWait on absent process evidence instead of blocking
+        // their project head forever. A reconciled job never reruns silently;
+        // it needs a fresh claim, lease, and permit binding.
+        self.reconcile_expired_running_all(now)?;
         let candidates = self.ready_heads(now)?;
         let Some(candidate) = candidates.into_iter().max_by(compare_ready) else {
             return Ok(None);
@@ -1128,6 +1140,168 @@ impl TestdStore {
         Ok(Some(job))
     }
 
+    /// Binds one claimed job to a freshly-issued process permit (preflight).
+    ///
+    /// The durable record is reloaded by id and is the only authority; a
+    /// caller-owned job is never accepted. The live lease, the stable
+    /// operation/process-tree/generation/epoch/invocation/roots tuple, and
+    /// the issuer grant binding must all match exactly, and the presented
+    /// request must pass #100 dispatch validation. On success the consuming
+    /// request is returned for the bins-side starter; this method performs no
+    /// OS start itself. Any binding failure returns a typed [`TestdError`].
+    pub fn bind_claimed_process_start(
+        &self,
+        job_id: &str,
+        lease: &Lease,
+        now: u64,
+        permit: ProcessAdmissionPermit,
+    ) -> Result<ProcessRequest, TestdError> {
+        validate_text(job_id, "job_id")?;
+        let job = self
+            .get(job_id)?
+            .ok_or_else(|| TestdError::Corrupt("job not found".to_owned()))?;
+        job.target_roots.validate()?;
+        let request = permit.request();
+        request
+            .validate()
+            .map_err(|error| TestdError::Contract(error.to_string()))?;
+        let invocation_id = job.invocation.request.request_id.as_str();
+        permit
+            .grant()
+            .validate_for_process(&job.job_id, invocation_id, request)?;
+        let target_root = request
+            .environment()
+            .non_secret()
+            .get("CARGO_TARGET_DIR")
+            .ok_or(TestdError::InvalidBinding)?;
+        let cache_root = request
+            .environment()
+            .non_secret()
+            .get("CARGO_HOME")
+            .ok_or(TestdError::InvalidBinding)?;
+        let expected = ClaimBindingExpectation {
+            operation_id: request.operation_id().as_str(),
+            process_tree_id: request.process_tree_id().as_str(),
+            generation: request.generation().get(),
+            authority_epoch: request.fence().authority_epoch(),
+            invocation_id,
+            allowed_contour_root: permit.grant().contour_root(),
+            source_root: request.working_directory(),
+            target_root: target_root.as_str(),
+            cache_root: cache_root.as_str(),
+        };
+        validate_claim_binding(&job, lease, now, &expected)?;
+        Ok(permit.into_parts().0)
+    }
+
+    /// Recovers one fence-expired running job to Unknown/RetryWait.
+    ///
+    /// Returns `Ok(None)` when the job needs no reconciliation (not running,
+    /// or still under a live fence). Otherwise the attempt is durably closed
+    /// as [`ExecutionStatus::Unknown`] with the lease cleared and bounded
+    /// retry timing applied, so a later attempt requires a fresh claim and
+    /// `bind_claimed_process_start`. The optional process lifecycle is the
+    /// process-evidence check; terminal evidence still lands on `Unknown`
+    /// because only `finish` with a validated receipt may resolve an attempt.
+    pub fn reconcile_expired(
+        &self,
+        job_id: &str,
+        now: u64,
+        evidence: Option<eliot_process::ProcessLifecycle>,
+    ) -> Result<Option<TestJob>, TestdError> {
+        validate_text(job_id, "job_id")?;
+        let job = self
+            .get(job_id)?
+            .ok_or_else(|| TestdError::Corrupt("job not found".to_owned()))?;
+        let Some(decision) = reconcile_expired_running(&job, now, evidence) else {
+            return Ok(None);
+        };
+        self.persist_expiry_reconciliation(job, now, decision)
+            .map(Some)
+    }
+
+    /// Restart sweeper for fence-expired running jobs without live evidence.
+    ///
+    /// Reconciles every running job whose fence no longer holds at `now` to
+    /// Unknown/RetryWait (or Failed once attempts are exhausted), so a daemon
+    /// restart cannot leave a project head blocked behind an orphaned lease
+    /// and can never silently rerun ambiguous work. Callers that hold live
+    /// executor evidence reconcile those jobs explicitly via
+    /// [`TestdStore::reconcile_expired`] instead.
+    pub fn reconcile_expired_running_all(&self, now: u64) -> Result<Vec<TestJob>, TestdError> {
+        let running = {
+            let read = self.database.begin_read().map_err(database)?;
+            let table = read.open_table(JOBS).map_err(database)?;
+            let mut running = Vec::new();
+            for item in table.iter().map_err(database)? {
+                let (key, value) = item.map_err(database)?;
+                let job: TestJob = serde_json::from_slice(value.value())
+                    .map_err(|error| TestdError::Corrupt(error.to_string()))?;
+                if matches!(job.state, JobState::Running) {
+                    running.push(key.value().to_owned());
+                }
+            }
+            running
+        };
+        let mut reconciled = Vec::new();
+        for job_id in running {
+            if let Some(job) = self.reconcile_expired(&job_id, now, None)? {
+                reconciled.push(job);
+            }
+        }
+        Ok(reconciled)
+    }
+
+    fn persist_expiry_reconciliation(
+        &self,
+        mut job: TestJob,
+        now: u64,
+        decision: ExpiredRunningReconciliation,
+    ) -> Result<TestJob, TestdError> {
+        let actor = job
+            .lease
+            .as_ref()
+            .map_or("testd-reconciler", |lease| lease.owner.as_str())
+            .to_owned();
+        let previous = job.state;
+        job.execution = Some(decision.execution);
+        job.lease = None;
+        let terminal = if job.attempts < self.retry.max_attempts {
+            JobState::RetryWait
+        } else {
+            JobState::Failed
+        };
+        job.state = terminal;
+        job.not_before_ms = if terminal == JobState::RetryWait {
+            now.saturating_add(
+                self.retry.delays_ms
+                    [(job.attempts.saturating_sub(1) as usize).min(self.retry.delays_ms.len() - 1)],
+            )
+        } else {
+            now
+        };
+        job.updated_at_ms = now;
+        let write = self.database.begin_write().map_err(database)?;
+        let mut table = write.open_table(JOBS).map_err(database)?;
+        let encoded =
+            serde_json::to_vec(&job).map_err(|error| TestdError::Corrupt(error.to_string()))?;
+        table
+            .insert(job.job_id.as_str(), encoded.as_slice())
+            .map_err(database)?;
+        drop(table);
+        append_event(
+            &write,
+            &job,
+            Some(previous),
+            terminal,
+            &actor,
+            now,
+            Some(decision.reason.to_owned()),
+        )?;
+        write.commit().map_err(database)?;
+        Ok(job)
+    }
+
     /// Completes an attempt, or durably schedules a bounded retry.
     #[allow(clippy::too_many_arguments)]
     pub fn finish(
@@ -1149,6 +1323,10 @@ impl TestdStore {
             .get(job_id)?
             .ok_or_else(|| TestdError::Corrupt("job not found".to_owned()))?;
         if !lease_matches(&job, lease, now) {
+            // Fail closed: an expired or foreign fence never completes an
+            // attempt. Recovery flows through `reconcile_expired`
+            // (Unknown/RetryWait) followed by a fresh claim and
+            // `bind_claimed_process_start`, never through this path.
             return Err(TestdError::LeaseRejected(job_id.to_owned()));
         }
         receipt.validate(&job)?;
@@ -1172,6 +1350,10 @@ impl TestdStore {
             ExecutionStatus::Unknown | ExecutionStatus::Failed
         );
         let terminal = if matches!(execution, ExecutionStatus::Succeeded) {
+            // Local daemon projection only: a local Succeeded never becomes a
+            // canonical Durable Job outcome. Canonical promotion happens
+            // exclusively through the Governor path; this subtree has no
+            // canonical-store authority.
             JobState::Succeeded
         } else if retryable && job.attempts < self.retry.max_attempts {
             JobState::RetryWait
