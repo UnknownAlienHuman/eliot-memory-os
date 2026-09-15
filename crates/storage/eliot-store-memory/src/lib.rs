@@ -9,18 +9,19 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::sync::{Mutex, MutexGuard, TryLockError};
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use eliot_store_api::epistemic_revision::{EpistemicCommit, position_key};
 use eliot_store_api::{
-    CanonicalRequestView, CanonicalStoreClient, CanonicalValidationSnapshot, CommitId, EventId,
-    EventProjectionRelationIntents, EVIDENCE_PACK_MAX_RECORDS, NamedMutationOperation,
+    CanonicalRequestView, CanonicalStoreClient, CanonicalValidationSnapshot, CommitId,
+    EVIDENCE_PACK_MAX_RECORDS, EventId, EventProjectionRelationIntents, NamedMutationOperation,
     NamedReadOperation, NamedReadRequest, NamedReadResponse, OperationId, OperationManifestDigest,
     OrderingHead, OrderingHeadExpectation, OrderingScopeId, OutboxId, OutboxIntent, OutboxState,
     PreparedTransition, ProjectionMode, ProjectionPublicationId, ProjectionPublicationRecord,
     ProjectionStatus, RecoveryRecord, RecoveryRecordKey, RequestMeta, Resubmission, RevisionDelta,
     RevisionHead, RevisionHeadExpectation, RevisionKey, ScopeId, ScopeRevisionView, SplitView,
-    StateFence, StoreError, StoreGenesisRequest, StoreHealth, StoreHealthStatus, StoreRecoveryRequest,
-    StoreRecoverySnapshot, WriteReceipt, WriteReceiptStatus, canonical_json_bytes,
-    canonical_request_hash, generated_operation_manifests, genesis_manifest, is_genesis_fence,
-    issue_genesis_receipt_envelope, issue_store_receipt_envelope,
+    StateFence, StoreError, StoreGenesisRequest, StoreHealth, StoreHealthStatus,
+    StoreRecoveryRequest, StoreRecoverySnapshot, WriteReceipt, WriteReceiptStatus,
+    canonical_json_bytes, canonical_request_hash, generated_operation_manifests, genesis_manifest,
+    is_genesis_fence, issue_genesis_receipt_envelope, issue_store_receipt_envelope,
     named_mutation_operation_name, sha256_hex, validate_genesis_receipt_envelope,
     validate_store_receipt_envelope, verify_canonical_request_hash,
 };
@@ -126,8 +127,29 @@ impl MemoryStore {
             expected_revision_heads,
             expected_ordering_heads,
         )?;
+        let epistemic = EpistemicCommit::from_prepared(ctx, &transition)?;
+        let epistemic_key = epistemic
+            .as_ref()
+            .map(|commit| commit.payload.position_key())
+            .transpose()?;
+        if let (Some(commit), Some(key)) = (&epistemic, &epistemic_key) {
+            let current = state
+                .epistemic_positions
+                .get(key)
+                .map(|(previous, _)| previous.payload.next_revision())
+                .transpose()?;
+            if current != commit.payload.expected_position_revision {
+                return Err(StoreError::RevisionConflict);
+            }
+        }
         let plan = transaction_plan(&state, &transition, &operation_key)?;
         let receipt = transaction_receipt(ctx, &transition, idempotency_key, recomputed, &plan)?;
+        if let (Some(commit), Some(key)) = (epistemic, epistemic_key) {
+            commit.readback(&receipt)?;
+            state
+                .epistemic_positions
+                .insert(key, (commit, receipt.clone()));
+        }
         Ok(commit_transaction(
             &mut state,
             transition,
@@ -195,6 +217,13 @@ fn validate_transaction_state(
     }
     validate_expected_revisions(state, &transition.state_fence, expected_revision_heads)?;
     validate_expected_ordering(state, &transition.state_fence, expected_ordering_heads)?;
+    if transition
+        .named_operations
+        .iter()
+        .any(|command| command.operation == NamedMutationOperation::ApplyEpistemicRevision)
+    {
+        return transition.validate_against_catalogue(&generated_operation_manifests()?);
+    }
     let manifest = state
         .manifests
         .get(transition.operation_manifest_digest.as_str())
@@ -495,7 +524,10 @@ impl MemoryStore {
         // input bound) pre-dispatch, identically to the Surreal adapter's
         // pre-dispatch gate. The older reads keep their legacy
         // reference-contour behavior below.
-        if query.operation == NamedReadOperation::GetEvidencePack {
+        if matches!(
+            query.operation,
+            NamedReadOperation::GetEvidencePack | NamedReadOperation::GetCurrentEpistemicPosition
+        ) {
             let entries = generated_operation_manifests()?;
             query.validate_against_catalogue(&entries)?;
         }
@@ -509,6 +541,24 @@ impl MemoryStore {
         }
         let revision_heads = state.revision_heads.values().cloned().collect::<Vec<_>>();
         let payload = match query.operation {
+            NamedReadOperation::GetCurrentEpistemicPosition => {
+                let scope = query
+                    .scope_id
+                    .as_ref()
+                    .ok_or(StoreError::ManifestMismatch)?;
+                let position = query
+                    .parameters
+                    .get("position")
+                    .and_then(Value::as_str)
+                    .ok_or(StoreError::ManifestMismatch)?;
+                let key = position_key(scope.as_str(), position)?;
+                let view = state
+                    .epistemic_positions
+                    .get(&key)
+                    .map(|(commit, receipt)| commit.readback(receipt))
+                    .transpose()?;
+                serde_json::to_value(view)
+            }
             NamedReadOperation::GetRevisionHeads => serde_json::to_value(&revision_heads),
             NamedReadOperation::GetOrderingHeads => {
                 serde_json::to_value(state.ordering_heads.values().collect::<Vec<_>>())
@@ -587,37 +637,32 @@ impl MemoryStore {
         })?;
         // The catalogue gate already enforces presence and shape; re-check
         // fail-closed so this arm never depends on call order.
-        let subject =
-            query
-                .parameters
-                .get("subject")
-                .and_then(Value::as_str)
-                .ok_or(StoreError::InvalidField {
-                    field: "operation.parameter",
-                    reason: "missing required parameter",
-                })?;
+        let subject = query
+            .parameters
+            .get("subject")
+            .and_then(Value::as_str)
+            .ok_or(StoreError::InvalidField {
+                field: "operation.parameter",
+                reason: "missing required parameter",
+            })?;
         if subject.trim().is_empty() || subject.chars().any(char::is_control) {
             return Err(StoreError::InvalidField {
                 field: "operation.parameter",
                 reason: "subject must be a non-blank string",
             });
         }
-        let bound_raw =
-            query
-                .parameters
-                .get("max_records")
-                .and_then(Value::as_str)
-                .ok_or(StoreError::InvalidField {
-                    field: "operation.parameter",
-                    reason: "missing required parameter",
-                })?;
-        let max_records: u32 =
-            bound_raw
-                .parse()
-                .map_err(|_| StoreError::InvalidField {
-                    field: "operation.parameter",
-                    reason: "max_records must be a positive decimal bound",
-                })?;
+        let bound_raw = query
+            .parameters
+            .get("max_records")
+            .and_then(Value::as_str)
+            .ok_or(StoreError::InvalidField {
+                field: "operation.parameter",
+                reason: "missing required parameter",
+            })?;
+        let max_records: u32 = bound_raw.parse().map_err(|_| StoreError::InvalidField {
+            field: "operation.parameter",
+            reason: "max_records must be a positive decimal bound",
+        })?;
         if max_records == 0 {
             return Err(StoreError::InvalidField {
                 field: "operation.parameter",
@@ -627,16 +672,14 @@ impl MemoryStore {
         if max_records > EVIDENCE_PACK_MAX_RECORDS {
             return Err(StoreError::PayloadTooLarge);
         }
-        let limit =
-            usize::try_from(max_records).map_err(|_| StoreError::PayloadTooLarge)?;
+        let limit = usize::try_from(max_records).map_err(|_| StoreError::PayloadTooLarge)?;
         let matched: Vec<(usize, &eliot_store_api::NamedMutationRequest)> = state
             .named_operations
             .iter()
             .enumerate()
             .filter(|(_, operation)| {
                 operation.operation == NamedMutationOperation::CaptureObservation
-                    && operation.parameters.get("subject").and_then(Value::as_str)
-                        == Some(subject)
+                    && operation.parameters.get("subject").and_then(Value::as_str) == Some(subject)
             })
             .collect();
         let matched_total = matched.len();
@@ -970,6 +1013,7 @@ fn genesis_receipt(
 
 #[derive(Clone, Debug, PartialEq)]
 struct MemoryState {
+    epistemic_positions: BTreeMap<String, (EpistemicCommit, WriteReceipt)>,
     fences: Option<StateFence>,
     recovery_records: BTreeMap<RecoveryRecordKey, RecoveryRecord>,
     recovery_jobs: BTreeMap<RecoveryRecordKey, RecoveryRecord>,
@@ -989,6 +1033,7 @@ struct MemoryState {
 impl Default for MemoryState {
     fn default() -> Self {
         Self {
+            epistemic_positions: BTreeMap::new(),
             fences: None,
             recovery_records: BTreeMap::new(),
             recovery_jobs: BTreeMap::new(),
@@ -2318,10 +2363,7 @@ mod tests {
             provenance.get("matched_total").and_then(Value::as_u64),
             Some(1)
         );
-        assert_eq!(
-            provenance.get("returned").and_then(Value::as_u64),
-            Some(1)
-        );
+        assert_eq!(provenance.get("returned").and_then(Value::as_u64), Some(1));
         assert_eq!(
             provenance.get("max_records").and_then(Value::as_u64),
             Some(10)
@@ -2427,11 +2469,8 @@ mod tests {
         let store = store()?;
 
         // Scope-addressed read without a scope.
-        let query = evidence_pack_query(
-            &state_fence,
-            None,
-            evidence_params("evidence-alpha", "10"),
-        )?;
+        let query =
+            evidence_pack_query(&state_fence, None, evidence_params("evidence-alpha", "10"))?;
         assert_eq!(
             store.execute_named_sync(&query),
             Err(StoreError::InvalidField {
@@ -2521,10 +2560,7 @@ mod tests {
             provenance.get("matched_total").and_then(Value::as_u64),
             Some(3)
         );
-        assert_eq!(
-            provenance.get("returned").and_then(Value::as_u64),
-            Some(2)
-        );
+        assert_eq!(provenance.get("returned").and_then(Value::as_u64), Some(2));
         assert_eq!(
             provenance.get("truncated").and_then(Value::as_bool),
             Some(true)

@@ -70,6 +70,8 @@ use crate::{
 /// passthrough.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ParameterShape {
+    /// The closed versioned candidate/transition payload with position CAS.
+    EpistemicRevision,
     /// A string that must parse as a store [`OperationId`].
     OperationId,
     /// A non-blank text string: the observation subject captured by
@@ -100,6 +102,7 @@ impl ParameterShape {
     #[must_use]
     pub const fn code(self) -> &'static str {
         match self {
+            Self::EpistemicRevision => "eliot.storage.epistemic-revision.v1",
             Self::OperationId => "operation-id",
             Self::Subject => "subject-text",
         }
@@ -258,6 +261,16 @@ static RECONCILE_RECOVERY_PARAMETERS: [ParameterDeclaration; 10] = [
     },
 ];
 static NO_PARAMETERS: [ParameterDeclaration; 0] = [];
+static EPISTEMIC_REVISION_PARAMETERS: [ParameterDeclaration; 1] = [ParameterDeclaration {
+    name: "revision",
+    shape: ParameterShape::EpistemicRevision,
+    required: true,
+}];
+static CURRENT_POSITION_PARAMETERS: [ParameterDeclaration; 1] = [ParameterDeclaration {
+    name: "position",
+    shape: ParameterShape::Subject,
+    required: true,
+}];
 
 /// Returns the canonical operation name bound into manifests and digests.
 ///
@@ -351,11 +364,11 @@ pub const fn declared_read_parameters(
     match operation {
         NamedReadOperation::ResolveWriteReceipt => &RESOLVE_WRITE_RECEIPT_PARAMETERS,
         NamedReadOperation::GetEvidencePack => &GET_EVIDENCE_PACK_PARAMETERS,
+        NamedReadOperation::GetCurrentEpistemicPosition => &CURRENT_POSITION_PARAMETERS,
         NamedReadOperation::GetRevisionHeads
         | NamedReadOperation::GetScopeRevisionView
         | NamedReadOperation::GetOrderingHeads
         | NamedReadOperation::GetTaskState
-        | NamedReadOperation::GetCurrentEpistemicPosition
         | NamedReadOperation::GetUnderstandingProjectionInputs
         | NamedReadOperation::GetAttentionAndProblems
         | NamedReadOperation::GetModuleCatalogState
@@ -390,9 +403,8 @@ pub const fn declared_mutation_parameters(
         NamedMutationOperation::AppendAuditEvent => &APPEND_AUDIT_EVENT_PARAMETERS,
         NamedMutationOperation::ApplyLifecyclePolicy => &APPLY_LIFECYCLE_POLICY_PARAMETERS,
         NamedMutationOperation::ReconcileRecovery => &RECONCILE_RECOVERY_PARAMETERS,
-        NamedMutationOperation::ApplyEpistemicRevision | NamedMutationOperation::UpdateTaskState => {
-            &NO_PARAMETERS
-        }
+        NamedMutationOperation::ApplyEpistemicRevision => &EPISTEMIC_REVISION_PARAMETERS,
+        NamedMutationOperation::UpdateTaskState => &NO_PARAMETERS,
     }
 }
 
@@ -531,6 +543,12 @@ fn check_declared_shape(
     value: &Value,
 ) -> Result<(), StoreError> {
     match declaration.shape {
+        ParameterShape::EpistemicRevision => {
+            let payload: crate::epistemic_revision::EpistemicRevisionPayload =
+                serde_json::from_value(value.clone())
+                    .map_err(|error| StoreError::Serialization(error.to_string()))?;
+            payload.validate()
+        }
         ParameterShape::OperationId => {
             let text = value.as_str().ok_or(StoreError::InvalidField {
                 field: "operation.parameter",

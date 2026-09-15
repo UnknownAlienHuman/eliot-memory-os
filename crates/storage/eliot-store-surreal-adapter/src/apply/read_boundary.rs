@@ -298,6 +298,9 @@ async fn named_read_payload(
     state_fence: &StateFence,
 ) -> Result<Value, AdapterError> {
     match query.operation {
+        NamedReadOperation::GetCurrentEpistemicPosition => {
+            read_epistemic_position(db, &adapter.config, query).await
+        }
         NamedReadOperation::GetRevisionHeads => Ok(to_value(
             &read_all_revision_heads(db, &adapter.config).await?,
         )?),
@@ -333,6 +336,63 @@ async fn named_read_payload(
             operation: format!("{other:?}"),
         }),
     }
+}
+
+#[derive(serde::Deserialize)]
+struct EpistemicPositionRow {
+    epistemic_position_revision: u64,
+    epistemic_payload: String,
+    body: eliot_store_api::WriteReceipt,
+}
+
+const READ_EPISTEMIC_POSITION: &str = r"
+SELECT epistemic_position_revision, epistemic_payload, body FROM write_receipt
+WHERE epistemic_position_key = $epistemic_position_key
+ORDER BY epistemic_position_revision DESC LIMIT 1;
+";
+
+async fn read_epistemic_position(
+    db: &client::RpcTransport,
+    config: &SurrealAdapterConfig,
+    query: &NamedReadRequest,
+) -> Result<Value, AdapterError> {
+    use eliot_store_api::epistemic_revision::{EpistemicCommit, position_key};
+    let scope = query
+        .scope_id
+        .as_ref()
+        .ok_or(StoreError::ManifestMismatch)?;
+    let position = query
+        .parameters
+        .get("position")
+        .and_then(Value::as_str)
+        .ok_or(StoreError::ManifestMismatch)?;
+    let key = position_key(scope.as_str(), position)?;
+    let mut bindings = Map::new();
+    bindings.insert(
+        "epistemic_position_key".to_owned(),
+        Value::String(key.clone()),
+    );
+    let mut response = client::query(
+        db,
+        config,
+        "read.epistemic_position",
+        READ_EPISTEMIC_POSITION,
+        bindings,
+    )
+    .await?;
+    let rows = take_vec::<EpistemicPositionRow>(&mut response, 0)?;
+    let Some(row) = rows.first() else {
+        return Ok(Value::Null);
+    };
+    let commit: EpistemicCommit = serde_json::from_str(&row.epistemic_payload)
+        .map_err(|error| AdapterError::Serialization(error.to_string()))?;
+    if commit.payload.position_key()? != key
+        || commit.payload.next_revision()?.value() != row.epistemic_position_revision
+        || commit.prepared.state_fence != query.state_fence
+    {
+        return Err(StoreError::InvalidReceipt.into());
+    }
+    to_value(&commit.readback(&row.body)?)
 }
 
 /// Reads all persisted capture-evidence rows through the closed SELECT.

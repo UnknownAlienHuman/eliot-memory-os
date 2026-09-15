@@ -170,7 +170,12 @@ struct ActivatedReadDescriptor {
 /// / `max_records` parameters. The head and receipt reads address no scope;
 /// the receipt read addresses its receipt through the declared
 /// `operation_id` parameter.
-const ACTIVATED_READS: [ActivatedReadDescriptor; 5] = [
+const ACTIVATED_READS: [ActivatedReadDescriptor; 6] = [
+    ActivatedReadDescriptor {
+        operation: NamedReadOperation::GetCurrentEpistemicPosition,
+        requires_scope_id: true,
+        scope_kind: SCOPE_KIND_SCOPE,
+    },
     ActivatedReadDescriptor {
         operation: NamedReadOperation::GetRevisionHeads,
         requires_scope_id: false,
@@ -200,13 +205,14 @@ const ACTIVATED_READS: [ActivatedReadDescriptor; 5] = [
 
 /// Returns the activated read operations in canonical declaration order.
 #[must_use]
-pub const fn activated_read_operations() -> [NamedReadOperation; 5] {
+pub const fn activated_read_operations() -> [NamedReadOperation; 6] {
     [
         ACTIVATED_READS[0].operation,
         ACTIVATED_READS[1].operation,
         ACTIVATED_READS[2].operation,
         ACTIVATED_READS[3].operation,
         ACTIVATED_READS[4].operation,
+        ACTIVATED_READS[5].operation,
     ]
 }
 
@@ -226,7 +232,12 @@ struct ActivatedMutationDescriptor {
 /// `RecoverySchema` family. All
 /// four address no scope, mirroring the scope-free read descriptors. Every
 /// other mutation stays known-but-unsupported.
-const ACTIVATED_MUTATIONS: [ActivatedMutationDescriptor; 4] = [
+const ACTIVATED_MUTATIONS: [ActivatedMutationDescriptor; 5] = [
+    ActivatedMutationDescriptor {
+        operation: NamedMutationOperation::ApplyEpistemicRevision,
+        transition_classes: &[TransitionClass::Epistemic],
+        maximum_effect: EffectClass::ReversibleMutation,
+    },
     ActivatedMutationDescriptor {
         operation: NamedMutationOperation::CaptureObservation,
         transition_classes: &[TransitionClass::CaptureCandidate],
@@ -520,10 +531,11 @@ pub fn validate_transition_against_catalogue(
             NamedMutationOperation::CaptureObservation
             | NamedMutationOperation::AppendAuditEvent
             | NamedMutationOperation::ApplyLifecyclePolicy
+            | NamedMutationOperation::ApplyEpistemicRevision
             | NamedMutationOperation::ReconcileRecovery => {
                 validate_typed_mutation_parameters(command.operation, &command.parameters)?;
             }
-            NamedMutationOperation::ApplyEpistemicRevision | NamedMutationOperation::UpdateTaskState => {
+            NamedMutationOperation::UpdateTaskState => {
                 return Err(StoreError::UnknownOperation);
             }
         }
