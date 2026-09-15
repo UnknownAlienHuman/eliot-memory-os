@@ -1,0 +1,1 @@
+{"note":"Worker A fixture: old runtime-generation invalidation requires exact current owner evidence; stale invalidation never activates authority.","requires_current_owner_evidence":true,"stale_invalidation_accepted":false}
