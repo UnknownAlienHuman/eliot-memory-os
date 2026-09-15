@@ -13,15 +13,15 @@
 //! environment, and never claims a repair: without a Kernel-issued admission
 //! it exits 78.
 
-mod dispatch_authority;
-mod dispatched_material;
-mod kernel_client;
-
 use std::io::Write as _;
 
 use eliot_doctor::admitted_effect::{
     BootstrapAction, EXIT_EVIDENCE_FLUSH_FAILED, EXIT_KERNEL_ADMISSION_REQUIRED, EvidenceCollector,
     admission_required_line, decode_bootstrap_args, help_text, version_line,
+};
+use eliot_doctor::{
+    dispatch_authority, dispatched_material,
+    kernel_client::{self, GateDecision, gate_after_advertise},
 };
 use eliot_doctor_core::KernelDoctorClient;
 
@@ -60,44 +60,14 @@ fn deny(detail: &str) -> i32 {
     EXIT_KERNEL_ADMISSION_REQUIRED
 }
 
-/// Post-probe composition decision for one one-shot invocation.
-///
-/// The shot drives if and only if the live Kernel advertises the exact
-/// doctor repair-attempt operation (`advertised`) AND the dispatch contour
-/// delivered a session-bound attempt presentation to this invocation
-/// (`attempt_presented`: a dispatch file validated against the live
-/// bootstrap epoch, carrying the envelope bytes plus the session binding
-/// the real effect adapter binds). Advertisement alone never executes:
-/// without delivered bytes there is no admission to bind, so the shot
-/// fails closed naming the dispatch residual. The presentation is read from
-/// the bins-local dispatch file next to this executable (see
-/// `dispatched_material`), never from argv, stdin, or environment; an
-/// absent or invalid file presents `false` (invalid files additionally deny
-/// with their typed detail before the gate is reached). The `Drive` arm
-/// names the rule the dispatch contour must satisfy, and
-/// `drive_validated_dispatched_attempt` is the only production driver
-/// (`drive_admitted_attempt` remains as the test-reference legacy path).
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum GateDecision {
-    /// Drive the delivered attempt through `drive_validated_dispatched_attempt`.
-    Drive,
-    /// Fail closed: the Kernel does not advertise the doctor operation.
-    DenyNotAdvertised,
-    /// Fail closed: advertised, but no session-bound attempt was
-    /// delivered to this invocation.
-    DenyNoPresentedAttempt,
-}
-
-#[must_use]
-const fn gate_after_advertise(advertised: bool, attempt_presented: bool) -> GateDecision {
-    if !advertised {
-        GateDecision::DenyNotAdvertised
-    } else if !attempt_presented {
-        GateDecision::DenyNoPresentedAttempt
-    } else {
-        GateDecision::Drive
-    }
-}
+// Post-probe composition decision for one one-shot invocation lives in
+// the shared seam (`kernel_client::GateDecision`,
+// `kernel_client::gate_after_advertise`) so the `tests/`
+// second-consumer proof binds the same gate the composition root drives:
+// the shot drives if and only if the live Kernel advertises the exact
+// doctor repair-attempt operation AND the dispatch contour delivered a
+// session-bound attempt presentation validated against the live bootstrap
+// epoch. See the seam docs for the full rule.
 
 fn bootstrap_and_run_once() -> i32 {
     // Authenticated generation-bound Kernel bootstrap over the protected

@@ -31,18 +31,18 @@
 //! - One shot performs at most one submit and at most one effect dispatch.
 //!   A lost submit reply exits the shot without effect and without retry;
 //!   only the executor-owned
-//!   [`reconcile_admitted_unknown`][eliot_doctor::admitted_effect::AutomaticSafeAdapter::reconcile_admitted_unknown]
+//!   [`reconcile_admitted_unknown`][crate::admitted_effect::AutomaticSafeAdapter::reconcile_admitted_unknown]
 //!   path may disposition an unknown outcome, keyed by the same effect
 //!   digest.
 
 use std::sync::Arc;
 
-use eliot_cli::kernel_client::{KernelClient, KernelClientError};
-use eliot_contracts::EpochId;
-use eliot_doctor::admitted_effect::{
+use crate::admitted_effect::{
     AdapterError, AttemptInputs, AutomaticSafeAdapter, EvidenceCollector, OneShotOutcome,
     project_cancelled, project_diagnosis,
 };
+use eliot_cli::kernel_client::{KernelClient, KernelClientError};
+use eliot_contracts::EpochId;
 use eliot_doctor_core::{
     ClosedRepairRequest, DoctorError, EXECUTABLE_BINDING_VERSION, EffectIntent, EffectOutcome,
     ExecutableBinding, KernelAdmission, KernelDoctorClient, RepairClass, RepairRecipeManifest,
@@ -373,7 +373,13 @@ fn parse_live_epoch(health: &serde_json::Value) -> Result<EpochId, DoctorIpcErro
 /// Reports whether the authenticated health reply explicitly advertises the
 /// exact doctor repair-attempt wire. Absent advertisement fields mean not
 /// advertised: the check is fail-closed and never invents authority.
-fn health_advertises_doctor(health: &serde_json::Value) -> bool {
+///
+/// Public so the `tests/` second-consumer proof binds the exact health-frame
+/// key the Kernel contour writes (`doctor_repair_advertised`, see
+/// `bins/eliot-kernel/src/frame_dispatch.rs`) to the one-shot composition
+/// gate (`advertise_doctor`, called from `main.rs`). No behavior change.
+#[must_use]
+pub fn health_advertises_doctor(health: &serde_json::Value) -> bool {
     if health
         .get("doctor_repair_advertised")
         .and_then(serde_json::Value::as_bool)
@@ -611,6 +617,50 @@ where
         .await
 }
 
+/// Post-probe composition decision for one one-shot invocation.
+///
+/// The shot drives if and only if the live Kernel advertises the exact
+/// doctor repair-attempt operation (`advertised`) AND the dispatch contour
+/// delivered a session-bound attempt presentation to this invocation
+/// (`attempt_presented`: a dispatch file validated against the live
+/// bootstrap epoch, carrying the envelope bytes plus the session binding
+/// the real effect adapter binds). Advertisement alone never executes:
+/// without delivered bytes there is no admission to bind, so the shot
+/// fails closed naming the dispatch residual. The presentation is read from
+/// the bins-local dispatch file next to the executable (see
+/// [`crate::dispatched_material`]), never from argv, stdin, or
+/// environment; an absent or invalid file presents `false` (invalid files
+/// additionally deny with their typed detail before the gate is reached).
+/// The `Drive` arm names the rule the dispatch contour must satisfy, and
+/// [`drive_validated_dispatched_attempt`] is the only production driver
+/// ([`drive_admitted_attempt`] remains as the test-reference legacy path).
+///
+/// Shared with the composition root (`main.rs`) so the `tests/`
+/// second-consumer proof binds the same gate the binary drives.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum GateDecision {
+    /// Drive the delivered attempt through `drive_validated_dispatched_attempt`.
+    Drive,
+    /// Fail closed: the Kernel does not advertise the doctor operation.
+    DenyNotAdvertised,
+    /// Fail closed: advertised, but no session-bound attempt was
+    /// delivered to this invocation.
+    DenyNoPresentedAttempt,
+}
+
+/// Maps the post-probe pair to the one-shot composition decision: only an
+/// advertised operation with a delivered session-bound presentation drives.
+#[must_use]
+pub const fn gate_after_advertise(advertised: bool, attempt_presented: bool) -> GateDecision {
+    if !advertised {
+        GateDecision::DenyNotAdvertised
+    } else if !attempt_presented {
+        GateDecision::DenyNoPresentedAttempt
+    } else {
+        GateDecision::Drive
+    }
+}
+
 /// Drives one session-bound dispatched attempt whose concrete intent is
 /// derived ONLY from the Kernel-admitted binding.
 ///
@@ -741,11 +791,11 @@ fn map_rejection(rejection: &DoctorRepairRejection) -> AdapterError {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use eliot_contracts::EpochLineageId;
-    use eliot_doctor::admitted_effect::{
+    use crate::admitted_effect::{
         EXIT_KERNEL_ADMISSION_REQUIRED, EXIT_OK_NO_EFFECT, EXIT_PENDING_VERIFICATION,
         EXIT_RECONCILING, EXIT_UNKNOWN_EFFECT_OUTCOME, ReconcileInputs,
     };
+    use eliot_contracts::EpochLineageId;
     use eliot_doctor_core::{
         BindingArg, ClosedRequestParams, DiagnosticBrief, DoctorDisposition, EvidenceHandle,
         ExecutableBinding, RecoveryLease, RegisteredOperation, RepairRecipe, RepairRecipeIdentity,
@@ -1893,10 +1943,7 @@ mod tests {
             dispatched_test_grant(&live, validated.generation)
         );
         assert_eq!(validated.grant.authority_epoch, live);
-        assert_eq!(
-            crate::gate_after_advertise(true, true),
-            crate::GateDecision::Drive
-        );
+        assert_eq!(gate_after_advertise(true, true), GateDecision::Drive);
         // A malformed grant digest is refused, never a fallback.
         let mut bad_digest = envelope.clone();
         bad_digest.grant.grant_digest = "not-a-digest".to_owned();

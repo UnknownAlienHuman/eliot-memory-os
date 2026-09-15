@@ -1192,6 +1192,7 @@ dependencies = [
  "eliot-doctor-core",
  "eliot-instrument-api",
  "eliot-kernel-service",
+ "eliot-ors",
  "eliot-platform",
  "eliot-process",
  "eliot-process-executor",
