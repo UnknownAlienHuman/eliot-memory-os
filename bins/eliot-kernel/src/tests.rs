@@ -5361,3 +5361,175 @@ async fn c183_probe_ready_shares_store_rebind_gate_and_requires_committed_public
     let _ = replay_fut.await;
     let _ = std::fs::remove_dir_all(dir);
 }
+
+#[cfg(windows)]
+#[tokio::test]
+#[allow(
+    clippy::too_many_lines,
+    reason = "T2-S08K acceptance retains one real supervised eliotd generation through observe/cancel/reconcile with ORS readback plus unknown-identity fencing"
+)]
+async fn daemon_close_reconciles_by_original_identity_with_ors_readback() {
+    // T2-S08K (Implements #100): one actual supervised eliotd generation is
+    // observed, cancelled, and reconciled by its original operation identity,
+    // with a durable ORS cutover readback link. Unknown keeps its identity
+    // and fails fenced with bounded drain instead of blind retry or a fresh
+    // launch. No new launcher is invented; the real executor child below is
+    // the existing `real_executor_receipt_child` fixture (30s sleep).
+    let root = std::env::temp_dir().join(format!(
+        "eliot-kernel-daemon-s08k-reconcile-{}-{}",
+        std::process::id(),
+        unix_ms()
+    ));
+    std::fs::create_dir_all(&root).expect("test work root");
+    std::fs::create_dir_all(root.join("kernel")).expect("kernel work root");
+    let executable = std::env::current_exe().expect("test executable");
+    let executable_sha256 = sha256_hex(&std::fs::read(&executable).expect("read test executable"));
+    let containment_root = executable.parent().expect("test executable parent");
+    let mut launch = test_daemon_launch(&root);
+    launch.executable =
+        PlatformHandle::new(executable.to_string_lossy()).expect("test executable handle");
+    launch.executable_sha256.clone_from(&executable_sha256);
+    launch.working_directory =
+        PlatformHandle::new(containment_root.to_string_lossy()).expect("working directory handle");
+    launch.arguments[7] =
+        PlatformHandle::new(launch.executable_sha256.clone()).expect("executable digest");
+    launch.descriptor_sha256.clear();
+    launch = launch.with_computed_digest().expect("test launch digest");
+    let mut kernel = KernelComposition::new(
+        KernelConfig::new(root.join("kernel"))
+            .with_daemon_launch(launch.clone())
+            .with_kernel_artifact_sha256("c".repeat(64)),
+    )
+    .expect("kernel composition");
+    let kernel_process =
+        observe_named_pipe_peer_process(std::process::id()).expect("Kernel identity");
+    let generation = Generation::new(launch.generation.value()).expect("generation");
+    let attempt = eliotd_launch_attempt_identity(
+        &launch,
+        kernel_process.process_id(),
+        kernel_process.start_time_100ns(),
+        kernel_process.image_path(),
+    )
+    .expect("launch attempt");
+    let operation = eliotd_operation_id(generation, &attempt).expect("operation");
+    let admission = real_executor_admission(
+        &executable,
+        &executable_sha256,
+        operation.as_str(),
+        "tests::real_executor_receipt_child",
+        BTreeMap::from([(REAL_EXECUTOR_CHILD_ENV.to_owned(), "1".to_owned())]),
+    );
+    let (gateway, platform, authority) =
+        real_process_gateway(&root.join("real-executor"), containment_root);
+    let gateway = Arc::new(gateway);
+    let expectation = current_process_named_pipe_expectation().expect("Kernel expectation");
+    let owner = ProcessOwnerBinding::new(
+        ACTIVE_DAEMON_CALLER,
+        stable_owner_principal_digest(
+            expectation.expected_sid(),
+            ACTIVE_DAEMON_CALLER,
+            &launch.authority_epoch,
+            generation,
+        ),
+        launch.authority_epoch.clone(),
+        generation,
+    )
+    .expect("daemon owner");
+    let receipt =
+        start_real_executor_child(&gateway, &platform, &authority, &admission, &owner).await;
+    assert_eq!(
+        receipt.operation_id(),
+        &operation,
+        "supervised child must carry the original operation identity"
+    );
+    gateway
+        .persist_completed(
+            receipt.operation_id(),
+            &process_admission_digest(&admission).expect("admission digest"),
+            &owner,
+            receipt.clone(),
+        )
+        .expect("persist exact completed receipt");
+    kernel.process_gateway = Some(Arc::clone(&gateway));
+    {
+        let mut state = kernel.daemon_runtime.lock().expect("daemon runtime lock");
+        state.status = DaemonRuntimeStatus::Failed("daemon timeout".to_owned());
+        state.receipt = Some(receipt.clone());
+    }
+    kernel
+        .close_previous_daemon_process(&launch, &receipt)
+        .await
+        .expect("exact prior supervised generation closes with reconcile and ORS readback");
+    let closed = gateway
+        .inspect(&owner, receipt.operation_id().clone())
+        .await
+        .expect("closed prior operation inspection");
+    assert_eq!(closed.lifecycle(), ProcessLifecycle::Exited);
+    assert_eq!(closed.binding(), receipt.binding());
+    // Reconcile-by-original-identity: the same operation id returns retained
+    // evidence bound to the exact receipt; no fresh launch is minted.
+    let evidence = gateway
+        .reconcile(&owner, receipt.operation_id().clone())
+        .await
+        .expect("reconcile by original identity");
+    assert_eq!(evidence.operation_id(), receipt.operation_id());
+    assert_eq!(evidence.binding(), receipt.binding());
+    assert_eq!(evidence.view().identity(), Some(receipt.identity()));
+    assert!(
+        matches!(
+            evidence.view().lifecycle(),
+            ProcessLifecycle::Exited | ProcessLifecycle::Failed | ProcessLifecycle::Reconciled
+        ),
+        "reconciled evidence must be terminal, got {:?}",
+        evidence.view().lifecycle()
+    );
+    // Durable ORS readback link: staged reconciliation plus latest committed
+    // cutovers remain readable through the existing generation coordinator.
+    kernel
+        .generation_gateway
+        .ors
+        .reconcile_staged_generation_cutovers(eliot_ors::MAX_RECOVERY_PAGE)
+        .expect("ORS staged cutover reconciliation readback");
+    kernel
+        .generation_gateway
+        .ors
+        .latest_generation_cutovers(eliot_ors::MAX_RECOVERY_PAGE)
+        .expect("ORS latest cutover readback");
+    let snapshot = kernel
+        .generation_route_snapshot()
+        .expect("generation route snapshot");
+    let scope =
+        eliot_kernel_core::RouteScope::new("daemon").expect("daemon route scope");
+    let route = snapshot.route(&scope).expect("active daemon route");
+    assert_eq!(route.active_generation().value(), launch.generation.value());
+    assert_eq!(
+        route.authority_epoch().value(),
+        launch.authority_epoch.sequence.get()
+    );
+    // Unknown keeps identity with bounded drain: a stale receipt is refused
+    // without adoption, and its unknown operation reconciles fenced under the
+    // same identity instead of a fresh launch.
+    let stale = test_process_start_receipt(41_002);
+    assert_ne!(stale.operation_id(), receipt.operation_id());
+    assert!(
+        kernel
+            .close_previous_daemon_process(&launch, &stale)
+            .await
+            .is_err(),
+        "a stale completed receipt must not be adopted for recovery"
+    );
+    assert!(
+        gateway
+            .reconcile(&owner, stale.operation_id().clone())
+            .await
+            .is_err(),
+        "unknown operation must stay unknown under its own identity"
+    );
+    gateway
+        .executor
+        .shutdown()
+        .expect("shutdown recovery proof executor");
+    drop(gateway);
+    drop(kernel);
+    let _ = std::fs::remove_dir_all(root);
+}
