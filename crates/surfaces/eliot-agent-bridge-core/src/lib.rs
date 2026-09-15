@@ -13,8 +13,8 @@ use std::future::Future;
 use std::pin::Pin;
 
 pub use eliot_agent_api::{
-    AttemptId, EventCursor, EventId, HostEventEnvelope, HostEventKind, RouteFingerprint, SessionId,
-    TaskId, WorkUnitId,
+    AttemptId, AttemptState, EventCursor, EventId, HostEventEnvelope, HostEventKind,
+    RouteFingerprint, SessionId, TaskId, WorkUnitId,
 };
 use eliot_contracts::RequestMetadata;
 pub use eliot_observation_contracts::{
@@ -28,6 +28,12 @@ use eliot_skill::{
 };
 use serde::{Deserialize, Deserializer, Serialize, de};
 use thiserror::Error;
+
+mod terminal_inputs;
+pub use terminal_inputs::{
+    AttemptTransition, CanonicalWriteRefs, CoverageFlags, RecoveryDirective, RecoveryDirectiveKind,
+    TERMINAL_JOURNAL_CAPACITY, TerminalReductionInputs, TransportEdge, TransportEdgeKind,
+};
 
 /// Stable A-16 source contract identity.
 pub const CONTRACT_ID: &str = "eliot.surfaces.agent-bridge-core/v1";
@@ -851,6 +857,14 @@ pub struct AgentBridgeCore {
     acknowledged_phases: BTreeMap<EventIdentityKey, AckPhase>,
     pending_deliveries: BTreeMap<EventIdentityKey, PendingDelivery>,
     cursors: BTreeMap<String, u64>,
+    host_journal: Vec<HostEventEnvelope>,
+    attempt_transitions: Vec<AttemptTransition>,
+    recovery_directives: Vec<RecoveryDirective>,
+    canonical_refs: CanonicalWriteRefs,
+    transport_edges: Vec<TransportEdge>,
+    terminal_coverage: CoverageFlags,
+    stale_ui_disposition: Option<String>,
+    error_event_refs: Vec<String>,
 }
 
 impl AgentBridgeCore {
@@ -871,6 +885,14 @@ impl AgentBridgeCore {
             acknowledged_phases: BTreeMap::new(),
             pending_deliveries: BTreeMap::new(),
             cursors: BTreeMap::new(),
+            host_journal: Vec::new(),
+            attempt_transitions: Vec::new(),
+            recovery_directives: Vec::new(),
+            canonical_refs: CanonicalWriteRefs::default(),
+            transport_edges: Vec::new(),
+            terminal_coverage: CoverageFlags::default(),
+            stale_ui_disposition: None,
+            error_event_refs: Vec::new(),
         }
     }
 
@@ -929,6 +951,14 @@ impl AgentBridgeCore {
         self.replay = ReplayLedger::new();
         self.acknowledged_phases.clear();
         self.cursors.clear();
+        self.host_journal.clear();
+        self.attempt_transitions.clear();
+        self.recovery_directives.clear();
+        self.canonical_refs = CanonicalWriteRefs::default();
+        self.transport_edges.clear();
+        self.terminal_coverage = CoverageFlags::default();
+        self.stale_ui_disposition = None;
+        self.error_event_refs.clear();
         self.attach_view().ok_or(BridgeError::NotAttached)
     }
 
@@ -999,6 +1029,7 @@ impl AgentBridgeCore {
         event
             .validate()
             .map_err(|error| BridgeError::ProviderContract(error.to_string()))?;
+        self.observe_host_event(event)?;
         let binding = self.binding()?.clone();
         self.forwarder()?.forward_hook(&binding, event)?;
         Ok(())
@@ -1038,6 +1069,179 @@ impl AgentBridgeCore {
                 required_phase: pending.required_phase,
             })
             .collect()
+    }
+
+    /// Admits one validated host event into the transport journal.
+    ///
+    /// The route fingerprint passes through untouched, the raw and
+    /// normalized payloads stay paired on the retained envelope, and the
+    /// host sequence must increase so the journal preserves observation
+    /// order. The observation is journaled before port forwarding so a
+    /// forwarding failure still leaves immutable diagnostic history. Error
+    /// events are additionally cited in `error_event_refs` without
+    /// affecting any other field.
+    fn observe_host_event(&mut self, event: &HostEventEnvelope) -> Result<(), BridgeError> {
+        if let Some(previous) = self.host_journal.last()
+            && event.sequence <= previous.sequence
+        {
+            return Err(BridgeError::ProviderContract(
+                "host event sequence must increase".to_owned(),
+            ));
+        }
+        if self.host_journal.len() >= TERMINAL_JOURNAL_CAPACITY {
+            self.host_journal.remove(0);
+            self.terminal_coverage = self.terminal_coverage.mark_incomplete_coverage();
+        }
+        if event.kind == HostEventKind::Error {
+            self.error_event_refs
+                .push(event.event_id.as_str().to_owned());
+        }
+        self.host_journal.push(event.clone());
+        Ok(())
+    }
+
+    fn require_attached(&self) -> Result<(), BridgeError> {
+        self.active
+            .as_ref()
+            .map(|_| ())
+            .ok_or(BridgeError::NotAttached)
+    }
+
+    /// Records one observed attempt state transition verbatim.
+    ///
+    /// Legality of the transition is decided by the terminal reducer, not
+    /// the transport.
+    pub fn observe_attempt_transition(
+        &mut self,
+        from: AttemptState,
+        to: AttemptState,
+        sequence: u64,
+    ) -> Result<(), BridgeError> {
+        self.require_attached()?;
+        self.attempt_transitions
+            .push(AttemptTransition::observe(from, to, sequence)?);
+        Ok(())
+    }
+
+    /// Files one typed recovery directive chaining an observed recoverable
+    /// failure to its corrected call.
+    ///
+    /// The directive's `for_event` must reference an already journaled host
+    /// event and `corrected_event` must be a new identity absent from the
+    /// journal, proving the retry/new-identity rule structurally.
+    pub fn prescribe_recovery(&mut self, directive: RecoveryDirective) -> Result<(), BridgeError> {
+        self.require_attached()?;
+        if !self
+            .host_journal
+            .iter()
+            .any(|event| event.event_id.as_str() == directive.for_event())
+        {
+            return Err(BridgeError::InvalidTransition(
+                "recovery directive must reference an observed host event",
+            ));
+        }
+        if self
+            .host_journal
+            .iter()
+            .any(|event| event.event_id.as_str() == directive.corrected_event())
+        {
+            return Err(BridgeError::InvalidTransition(
+                "corrected call must use a new identity not yet present in history",
+            ));
+        }
+        self.recovery_directives.push(directive);
+        Ok(())
+    }
+
+    /// Records the candidate canonical-write submission reference.
+    pub fn record_canonical_submission(
+        &mut self,
+        reference: impl Into<String>,
+    ) -> Result<(), BridgeError> {
+        self.require_attached()?;
+        self.canonical_refs.record_submission(reference)
+    }
+
+    /// Records the candidate canonical-write receipt reference.
+    pub fn record_canonical_receipt(
+        &mut self,
+        reference: impl Into<String>,
+    ) -> Result<(), BridgeError> {
+        self.require_attached()?;
+        self.canonical_refs.record_receipt(reference)
+    }
+
+    /// Records the independent exact-readback reference.
+    pub fn record_canonical_readback(
+        &mut self,
+        reference: impl Into<String>,
+    ) -> Result<(), BridgeError> {
+        self.require_attached()?;
+        self.canonical_refs.record_readback(reference)
+    }
+
+    /// Records one transport edge without resolving it.
+    ///
+    /// Unknown-commit, unconfirmed-cancel, and disconnect edges raise their
+    /// explicit coverage flags; every other edge is carried verbatim.
+    pub fn record_transport_edge(&mut self, edge: TransportEdge) -> Result<(), BridgeError> {
+        self.require_attached()?;
+        match edge.kind() {
+            TransportEdgeKind::UnknownCommit => {
+                self.terminal_coverage = self.terminal_coverage.mark_unknown_commit();
+            }
+            TransportEdgeKind::CancelRequested => {
+                self.terminal_coverage = self.terminal_coverage.mark_cancel_unconfirmed();
+            }
+            TransportEdgeKind::Disconnect => {
+                self.terminal_coverage = self.terminal_coverage.mark_incomplete_coverage();
+            }
+            TransportEdgeKind::Timeout
+            | TransportEdgeKind::ParseFailure
+            | TransportEdgeKind::LateSuccess
+            | TransportEdgeKind::DuplicateCorrectedCall => {}
+        }
+        self.transport_edges.push(edge);
+        Ok(())
+    }
+
+    /// Notes the stale UI/CLI terminal display verbatim.
+    ///
+    /// This is a snapshot of what the surface showed, kept independent of
+    /// the canonical references until the reducer compares them.
+    pub fn note_stale_ui_disposition(
+        &mut self,
+        disposition: impl Into<String>,
+    ) -> Result<(), BridgeError> {
+        self.require_attached()?;
+        let disposition = disposition.into();
+        validate_text(&disposition, "stale_ui_disposition")?;
+        self.stale_ui_disposition = Some(disposition);
+        Ok(())
+    }
+
+    /// Projects the terminal reduction inputs for the external reducer.
+    ///
+    /// History, stale display, error citations, canonical references,
+    /// edges, cursors, and outstanding deliveries are carried as
+    /// independent fields. Nothing here is a terminal disposition.
+    #[must_use]
+    pub fn terminal_reduction_inputs(&self) -> Option<TerminalReductionInputs> {
+        self.active.as_ref().map(|_| {
+            TerminalReductionInputs::new(
+                self.host_journal.last().map(|event| event.route.clone()),
+                self.host_journal.clone(),
+                self.attempt_transitions.clone(),
+                self.recovery_directives.clone(),
+                self.stale_ui_disposition.clone(),
+                self.error_event_refs.clone(),
+                self.canonical_refs.clone(),
+                self.transport_edges.clone(),
+                self.terminal_coverage,
+                self.cursors.clone(),
+                self.outstanding_deliveries(),
+            )
+        })
     }
 
     fn forward_durable(
