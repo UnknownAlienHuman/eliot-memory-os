@@ -210,6 +210,25 @@ const fn millis(ms: u64) -> Duration {
 }
 
 #[cfg(test)]
+use provider_owner::{
+    ProviderCommand, configure_provider_command, provider_environment, reject_occupied_endpoint,
+    require_listener_owner, require_live_child, require_unchanged_identity,
+};
+#[cfg(test)]
+use session::{ProviderAuthentication, authenticate_provider};
+#[cfg(test)]
+use {
+    eliot_platform_windows::ProcessIdentity,
+    secrecy::{ExposeSecret, SecretString},
+    std::{ffi::OsString, path::Path, process::Stdio},
+    tokio::{
+        process::Command,
+        time::{Instant, sleep, timeout},
+    },
+    uuid::Uuid,
+};
+
+#[cfg(test)]
 mod tests {
     #![allow(clippy::expect_used)]
 
@@ -338,6 +357,7 @@ mod tests {
         }
     }
 
+    // WORK_UNIT_CASE: 986/9
     #[tokio::test]
     async fn version_gate_precedes_authentication_and_selection() {
         let spy = AuthenticationSpy::compatible(json!("surrealdb-3.1.4"));
@@ -528,22 +548,3 @@ mod tests {
         }));
     }
 }
-
-#[cfg(test)]
-use provider_owner::{
-    ProviderCommand, configure_provider_command, provider_environment, reject_occupied_endpoint,
-    require_listener_owner, require_live_child, require_unchanged_identity,
-};
-#[cfg(test)]
-use session::{ProviderAuthentication, authenticate_provider};
-#[cfg(test)]
-use {
-    eliot_platform_windows::ProcessIdentity,
-    secrecy::{ExposeSecret, SecretString},
-    std::{ffi::OsString, path::Path, process::Stdio},
-    tokio::{
-        process::Command,
-        time::{Instant, sleep, timeout},
-    },
-    uuid::Uuid,
-};

@@ -1,0 +1,86 @@
+{
+  "issue": 986,
+  "denominator": 16,
+  "base_sha": "67a1af95af0b029cb4bf3005ac98991ae2c7abe0",
+  "source_moves": [
+    {
+      "symbol": "reject_occupied_endpoint",
+      "from": "src/client.rs",
+      "to": "src/client/provider_owner.rs",
+      "old_body_sha256": "d9cc7e96cd698fd64b3f66f1e43cc275473e0479beb9d09b742c04ce0fe6b8bd"
+    },
+    {
+      "symbol": "spawn_provider",
+      "from": "src/client.rs",
+      "to": "src/client/provider_owner.rs",
+      "old_body_sha256": "e8ac250d3031cfdd0f041697c96587caa6880951b8fd5cedd5c351686df1b711"
+    },
+    {
+      "symbol": "configure_provider_command",
+      "from": "src/client.rs",
+      "to": "src/client/provider_owner.rs",
+      "old_body_sha256": "276183967f31d49157e1ed68f69ac787857b8d0e77eb4835352310067debf28e"
+    },
+    {
+      "symbol": "validate_child_process",
+      "from": "src/client.rs",
+      "to": "src/client/provider_owner.rs",
+      "old_body_sha256": "a5a9f8bd44d0623aefd78c9eb695cf12c41e6b95bdd0ae6f71fea5a7790a3fb8"
+    },
+    {
+      "symbol": "require_live_child",
+      "from": "src/client.rs",
+      "to": "src/client/provider_owner.rs",
+      "old_body_sha256": "f354ccdbfca7debf541731052aed9df8b3f5c1bc446d0dc1c4c5635bfc45103b"
+    },
+    {
+      "symbol": "require_listener_owner",
+      "from": "src/client.rs",
+      "to": "src/client/provider_owner.rs",
+      "old_body_sha256": "b1e0f6007af979cedab0d3d1fe56cfe377a058658540906a4e86d3f969f8917a"
+    },
+    {
+      "symbol": "require_unchanged_identity",
+      "from": "src/client.rs",
+      "to": "src/client/provider_owner.rs",
+      "old_body_sha256": "038347dc253e8965a615fa5e368215ed3b2303beb045ba1a37cd188b2014667e"
+    },
+    {
+      "symbol": "provider_environment",
+      "from": "src/client.rs",
+      "to": "src/client/provider_owner.rs",
+      "old_body_sha256": "a51e3995ef0fba6d1d53ff8a6a1187c03c40a2691c5ed692370741fd0c10ec85"
+    },
+    {
+      "symbol": "connect_started_provider",
+      "from": "src/client.rs",
+      "to": "src/client/session.rs",
+      "old_body_sha256": "321920f05781ca81184da357ab8383791d66f2f5f6a3006e9477378e51eca13d"
+    }
+  ],
+  "unchanged_sha256": {
+    "src/client/json_codec.rs": "3b5f4727bf968627f156105fc0887751b2e505aa66af6b584076ba9b12142237",
+    "src/client/rpc_parse.rs": "88377e933845f3f7809aa96980e3bfadeefcd42158e083880f6ec77b03e25343",
+    "src/client/payload_tests.rs": "02d29c190f07393e287e9d1ddcae0e6fad2ced0d42e705cfa0c31979fa06ba62",
+    "src/apply.rs": "2b13c5206cd69c0a2d307739d8503a1969650648088ece6aa79cc107835878c2",
+    "src/plan.rs": "fe6a2e7356fdda434dc386634521002501ea141d4ec4c102e52266d480f83e68",
+    "src/apply/atomic_write.rs": "02b81b894d957cfad81efad877e8694ab96d9310d09c7d7ecddc32bff9b2cf99",
+    "src/config.rs": "9a5bd3989848a3554683f159a5ae5526b85ec8d9330add319f47845d14843d3a",
+    "src/error.rs": "0f0923a82182a8fac526c40e8d4d0302d06fd8b8254d1f2ba8bfc1455a1957a0",
+    "Cargo.toml": "4f1cf3a34058fa4c040cd52c6961956c0ec05daa230d90f472f65ef051024c54"
+  },
+  "callers": [
+    "SurrealStoreAdapter::connect -> apply::client -> RpcTransport::connect -> ProviderOwner::start + RpcSession::connect",
+    "apply::client -> RpcTransport::validate_liveness -> ProviderOwner::validate_liveness",
+    "client::query -> RpcTransport::query -> RpcSession::request -> request_payload",
+    "payload_tests native fixture -> test-only child projection; version/request delegation"
+  ],
+  "scope": [
+    "src/client.rs",
+    "src/client/provider_owner.rs",
+    "src/client/session.rs",
+    "src/lib.rs",
+    "tests/provider_session_ownership.rs",
+    "tests/data/provider_session_ownership.json"
+  ]
+}
