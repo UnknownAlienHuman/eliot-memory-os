@@ -48,18 +48,25 @@ pub use route_receipts::{
     RouteSelectionCandidate, candidate_digest_for, route_divergence_fields,
 };
 
-/// Wire revision v6 converges the six #369 route rows (T4 S4, T4 §5.2):
-/// `CapabilityRouteDecision` is renamed to the candidate-only
-/// `RouteSelectionCandidate` (explicit versioned legacy decoder, never silent
-/// upgrade); the API `RoutingReceipt` migrates to `AdmittedRouteReceipt`
-/// with a recomputed self digest; `ActualRouteReceipt` and
-/// `PhysicalModelAttemptReceipt` merge into the single
-/// `PhysicalRouteObservationReceipt` with requested/observed evidence and
-/// two independent disposition axes; behavior-bearing `RouteFingerprint`
-/// hashes become canonical lowercase 64-hex SHA-256. Breaking: old wires do
-/// not silently upgrade (deny-unknown-fields plus digest/version checks);
-/// direct consumers migrate through the sibling coordinator/wire slices.
-pub const CONTRACT_VERSION: &str = "eliot-agent-api/v6";
+/// Wire revision v7 hardens the #228 effect trio (T4 S-effect, Implements #228):
+/// `ProposedEffect.payload_digest` is the canonical [`LowercaseSha256`]
+/// (64-hex lowercase, rejected at deserialization, never `sha256:payload`);
+/// `AuthorizedEffect.authorized_at`/`expires_at` are typed [`ClockReading`]
+/// (structured valid/known/sequence/monotonic, never bare strings such as
+/// `later` or unzoned timestamps). Breaking from v6: old wires with string
+/// digests/times or `schema_version == "eliot-agent-api/v6"` do not silently
+/// upgrade (deny-unknown-fields plus digest/version checks return
+/// `UnknownContractVersion`/deserialization failure); direct consumers migrate
+/// through the sibling coordinator/wire slices. v6 converged the six #369
+/// route rows (T4 S4, T4 §5.2): `CapabilityRouteDecision` renamed to the
+/// candidate-only `RouteSelectionCandidate`; the API `RoutingReceipt`
+/// migrated to `AdmittedRouteReceipt`; `ActualRouteReceipt` and
+/// `PhysicalModelAttemptReceipt` merged into `PhysicalRouteObservationReceipt`.
+/// `EffectReceipt` is retained as the agent-local candidate observation
+/// (governor `eliot-authority::EffectReceipt` with `CanonicalEffectReceipt`
+/// obligations remains the authoritative owner; no unilateral rename in this
+/// slice, see disposition below).
+pub const CONTRACT_VERSION: &str = "eliot-agent-api/v7";
 
 /// Compatibility spelling retained as an exact alias of the canonical owner.
 pub type AttemptId = AgentAttemptId;
@@ -862,6 +869,9 @@ impl AgentAttempt {
 
 /// A candidate effect returned by an agent.  It has no authority and no
 /// execution receipt until a separate Governor-owned transition accepts it.
+/// `payload_digest` is the canonical [`LowercaseSha256`] (v7, Implements
+/// #228): non-canonical placeholders such as `sha256:payload` or `payload-1`
+/// are rejected at the deserialization boundary, never validated later.
 #[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ProposedEffect {
@@ -869,7 +879,7 @@ pub struct ProposedEffect {
     pub attempt_id: AttemptId,
     pub kind: EffectKind,
     pub scope_ref: String,
-    pub payload_digest: String,
+    pub payload_digest: LowercaseSha256,
     pub rationale_ref: Option<String>,
 }
 
@@ -881,7 +891,6 @@ impl ProposedEffect {
         for (field, value) in [
             ("effect_id", &self.effect_id),
             ("scope_ref", &self.scope_ref),
-            ("payload_digest", &self.payload_digest),
         ] {
             if value.trim().is_empty() {
                 return Err(ContractError::EmptyField(field));
@@ -892,30 +901,48 @@ impl ProposedEffect {
 }
 
 /// Explicit Governor authorization attached to a proposed effect.
+/// `authorized_at`/`expires_at` are typed [`ClockReading`] (v7, Implements
+/// #228): bare strings (`later`, unzoned timestamps) are rejected at the
+/// deserialization boundary; clock ordering is enforced via
+/// [`ClockReading::validate`], never via string comparison.
 #[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct AuthorizedEffect {
     pub proposal: ProposedEffect,
     pub authority_epoch: EpochId,
     pub authorization_ref: String,
-    pub authorized_at: String,
-    pub expires_at: String,
+    pub authorized_at: ClockReading,
+    pub expires_at: ClockReading,
 }
 
 impl AuthorizedEffect {
     pub fn validate(&self, authority: &AuthorityEnvelope) -> Result<(), ContractError> {
         self.proposal.validate_against(&authority.effect_ceiling)?;
         if self.authorization_ref.trim().is_empty()
-            || self.authorized_at.trim().is_empty()
-            || self.expires_at.trim().is_empty()
             || !self.authority_epoch.is_same_authority(&authority.epoch)
         {
             return Err(ContractError::InsufficientAuthority);
         }
+        self.authorized_at
+            .validate()
+            .map_err(|_| ContractError::InvalidClock)?;
+        self.expires_at
+            .validate()
+            .map_err(|_| ContractError::InvalidClock)?;
         Ok(())
     }
 }
 
+/// Agent-local candidate effect observation (Implements #228, narrow slice).
+/// Disposition (pre-agreed, loss-visible, no rename): the authoritative
+/// `EffectReceipt` owner is `crates/governor/eliot-authority/src/effects.rs:351`
+/// (`EffectReceipt { authorized_effect, outcome, canonical_receipt }` with
+/// `CanonicalEffectReceipt` obligations). This `eliot-agent-api::EffectReceipt`
+/// is retained as a bounded agent-local projection only and must not gain new
+/// authority, finish, or cross-lane consumers; unification/rename remains a
+/// governor-lane contract change (residual cross-lane, see PR). `deny_unknown_fields`
+/// is preserved; v6 string wires fail deserialization against v7 typed
+/// effect fields and `schema_version` mismatch.
 #[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct EffectReceipt {
@@ -1316,7 +1343,9 @@ mod tests {
             attempt_id: AttemptId::new("attempt-1")?,
             kind: EffectKind::CanonicalTransition,
             scope_ref: "scope:test".into(),
-            payload_digest: "sha256:payload".into(),
+            payload_digest: fixture_digest(
+                "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            )?,
             rationale_ref: None,
         };
         assert_eq!(
@@ -2124,7 +2153,9 @@ mod tests {
             attempt_id: AttemptId::new("attempt-s5-17-foreign")?,
             kind: EffectKind::Observe,
             scope_ref: "scope:test".into(),
-            payload_digest: "payload-1".into(),
+            payload_digest: fixture_digest(
+                "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+            )?,
             rationale_ref: None,
         };
         // Sanity: the effect itself satisfies the ceiling, so only the
@@ -2170,7 +2201,9 @@ mod tests {
             attempt_id: attempt.clone(),
             kind: EffectKind::Observe,
             scope_ref: "scope:test".into(),
-            payload_digest: "payload-1".into(),
+            payload_digest: fixture_digest(
+                "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+            )?,
             rationale_ref: None,
         };
         let result = AgentResult {
@@ -2195,5 +2228,196 @@ mod tests {
                 .is_ok()
         );
         Ok(())
+    }
+
+    #[test]
+    fn api_case_19_effect_payload_digest_is_canonical_and_rejects_legacy() -> TestResult {
+        // #228 narrow slice (v7): `payload_digest` is `LowercaseSha256`.
+        // Canonical 64-hex lowercase succeeds; placeholders and malformed
+        // digests fail at the deserialization boundary (loss-visible, never
+        // silently upgraded).
+        let attempt = AttemptId::new("attempt-case-19")?;
+        let valid =
+            fixture_digest("eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee")?;
+        let effect = ProposedEffect {
+            effect_id: "effect-case-19".into(),
+            attempt_id: attempt.clone(),
+            kind: EffectKind::Observe,
+            scope_ref: "scope:test".into(),
+            payload_digest: valid,
+            rationale_ref: None,
+        };
+        effect.validate_against(&ceiling())?;
+        // Legacy/placeholder wires are rejected, not migrated.
+        for legacy in [
+            "sha256:payload",
+            "payload-1",
+            "payload-s5c-1",
+            "",
+            "abc",
+            "0123456789ABCDEF0123456789ABCDEF0123456789ABCDEF0123456789ABCDEF",
+        ] {
+            let wire = serde_json::json!({
+                "effect_id": "effect-case-19",
+                "attempt_id": "attempt-case-19",
+                "kind": "observe",
+                "scope_ref": "scope:test",
+                "payload_digest": legacy,
+                "rationale_ref": null,
+            });
+            assert!(
+                serde_json::from_value::<ProposedEffect>(wire).is_err(),
+                "legacy digest must be rejected: {legacy}"
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn api_case_20_authorized_effect_times_are_typed_and_reject_strings() -> TestResult {
+        // #228 narrow slice (v7): `authorized_at`/`expires_at` are
+        // `ClockReading`. Bare strings (`later`, unzoned timestamps) fail
+        // deserialization; structured readings validate via `ClockReading`.
+        let attempt = AttemptId::new("attempt-case-20")?;
+        let proposal = ProposedEffect {
+            effect_id: "effect-case-20".into(),
+            attempt_id: attempt.clone(),
+            kind: EffectKind::Observe,
+            scope_ref: "scope:test".into(),
+            payload_digest: fixture_digest(
+                "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+            )?,
+            rationale_ref: None,
+        };
+        let authorized = AuthorizedEffect {
+            proposal,
+            authority_epoch: test_epoch(TEST_LINEAGE_A, 7),
+            authorization_ref: "auth-case-20".into(),
+            authorized_at: ClockReading {
+                valid_time_ms: Some(1_000),
+                known_time_ms: Some(1_001),
+                transaction_sequence: None,
+                monotonic_ns: None,
+            },
+            expires_at: ClockReading {
+                valid_time_ms: Some(2_000),
+                known_time_ms: Some(2_001),
+                transaction_sequence: None,
+                monotonic_ns: None,
+            },
+        };
+        authorized.validate(&authority()?)?;
+        // String times (zoned, unzoned, or opaque) never deserialize as v7.
+        for legacy_time in [
+            "2026-08-14T00:00:00Z",
+            "2026-08-14T00:00:00",
+            "2026-08-14",
+            "later",
+            "",
+        ] {
+            let wire = serde_json::json!({
+                "proposal": {
+                    "effect_id": "effect-case-20",
+                    "attempt_id": "attempt-case-20",
+                    "kind": "observe",
+                    "scope_ref": "scope:test",
+                    "payload_digest": "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+                    "rationale_ref": null,
+                },
+                "authority_epoch": {
+                    "lineage_id": TEST_LINEAGE_A,
+                    "sequence": 7,
+                },
+                "authorization_ref": "auth-case-20",
+                "authorized_at": legacy_time,
+                "expires_at": legacy_time,
+            });
+            assert!(
+                serde_json::from_value::<AuthorizedEffect>(wire).is_err(),
+                "string time must be rejected: {legacy_time}"
+            );
+        }
+        // Invalid clock ordering (known < valid) fails validation.
+        let mut bad = authorized.clone();
+        bad.authorized_at = ClockReading {
+            valid_time_ms: Some(2_000),
+            known_time_ms: Some(1_000),
+            transaction_sequence: None,
+            monotonic_ns: None,
+        };
+        assert_eq!(
+            bad.validate(&authority()?),
+            Err(ContractError::InvalidClock)
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn api_case_21_v6_effect_wire_and_version_are_rejected_loss_visible() -> TestResult {
+        // #228 narrow slice: v6 string effect wires do not silently upgrade
+        // to v7 typed fields; `schema_version == v6` is rejected as
+        // `UnknownContractVersion` on versioned receipts.
+        assert_eq!(CONTRACT_VERSION, "eliot-agent-api/v7");
+        let v6_effect = serde_json::json!({
+            "effect_id": "effect-case-21",
+            "attempt_id": "attempt-case-21",
+            "kind": "observe",
+            "scope_ref": "scope:test",
+            "payload_digest": "sha256:payload",
+            "rationale_ref": null,
+        });
+        assert!(serde_json::from_value::<ProposedEffect>(v6_effect).is_err());
+        // Versioned route receipts pin the contract version.
+        let route = route()?;
+        let attempt = AttemptId::new("attempt-case-21")?;
+        let lease_id = lease("lease-case-21")?;
+        let fence = StateFence::new(test_epoch(TEST_LINEAGE_A, 1), ResourceGeneration::new(1)?);
+        let mut admission = admitted_fixture(&attempt, &lease_id, &route, &fence)?;
+        admission.schema_version = "eliot-agent-api/v6".to_owned();
+        assert_eq!(
+            admission.validate(),
+            Err(ContractError::UnknownContractVersion)
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn api_case_22_effect_receipt_disposition_and_single_owner() {
+        // #228 narrow slice: api `EffectReceipt` is retained (no unilateral
+        // cross-lane rename); governor `eliot-authority::EffectReceipt` with
+        // `CanonicalEffectReceipt` remains the authoritative owner. This
+        // discriminator keeps the slice bounded and documents the residual.
+        // Note: forbidden literals below are built from fragments so this
+        // discriminator cannot match its own assertion text (cf. api_case_03).
+        let source = include_str!("lib.rs");
+        assert!(source.contains("pub payload_digest: LowercaseSha256"));
+        assert!(source.contains("pub authorized_at: ClockReading"));
+        assert!(source.contains("pub expires_at: ClockReading"));
+        assert!(source.contains("deny_unknown_fields"));
+        // Effect trio hardening landed; legacy string effect fields are gone.
+        let legacy_payload = ["pub payload_digest", ": String"].concat();
+        // `raw_payload_digest: String` is the intentional legacy host-event
+        // quarantine (`HostEventEnvelope`), not the effect trio.
+        assert!(!source.contains(&legacy_payload));
+        assert!(source.contains("governor `eliot-authority::EffectReceipt`"));
+        assert!(source.contains("no unilateral rename"));
+        // S4/S5/S6 landed: no second routing receipt struct, no worker
+        // completion variant, no string epoch/fence in this contract cell.
+        let routing_struct = ["pub ", "struct ", "RoutingReceipt"].concat();
+        assert!(!source.contains(&routing_struct));
+        let verified_variant = ["\n    ", "Verified", "Complete,"].concat();
+        assert!(!source.contains(&verified_variant));
+        let epoch_string = ["AuthorityEpoch", "(String)"].concat();
+        assert!(!source.contains(&epoch_string));
+        let fence_string = ["state_fence", ": String"].concat();
+        assert!(!source.contains(&fence_string));
+        // Canonical receipt taxonomy stays single-owner via re-export.
+        assert!(source.contains("pub use eliot_receipts::ProofCeiling;"));
+        // Behavioral: legacy completion wire never deserializes as a result
+        // disposition (candidate-only enum has no completion variant).
+        let forged_disposition = serde_json::json!("VERIFIED_COMPLETE");
+        assert!(serde_json::from_value::<ResultDisposition>(forged_disposition).is_err());
+        let candidate = serde_json::json!("CANDIDATE_SUCCEEDED");
+        assert!(serde_json::from_value::<ResultDisposition>(candidate).is_ok());
     }
 }
