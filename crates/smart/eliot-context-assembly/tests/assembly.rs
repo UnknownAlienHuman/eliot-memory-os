@@ -1701,3 +1701,614 @@ fn unknown_measurement_cannot_prove_fit() {
         Err(AssemblyError::Contract(ContextError::UnknownMeasurement))
     );
 }
+
+// WORK_UNIT_CASE: 626/25
+#[test]
+fn overflow_preserves_admitted_evidence() {
+    let value = admitted();
+    let context = value.binding.clone();
+    let before = value.clone();
+    let result = assemble_active_view(
+        &value,
+        &recipe(&context),
+        quality(&context),
+        &policy(10),
+        |_bytes| panic!("overflow must precede measurement"),
+    );
+    assert_eq!(result, Err(AssemblyError::Bounds("assembly.final_bytes")));
+    assert_eq!(value, before, "overflow keeps every admitted atom");
+    assert_eq!(value.records.len(), 1);
+    assert_eq!(value.economy.admitted, vec![id("atom")]);
+}
+
+// WORK_UNIT_CASE: 626/26
+#[test]
+fn measurement_port_called_exactly_once_on_final_bytes() {
+    let (value, recipe) = admitted_multi_role();
+    let context = value.binding.clone();
+    let mut calls = 0;
+    let mut seen: Vec<u8> = Vec::new();
+    let view = assemble_active_view(
+        &value,
+        &recipe,
+        quality(&context),
+        &policy(100_000),
+        |bytes| {
+            calls += 1;
+            seen = bytes.to_vec();
+            Ok(measurement(&context, bytes))
+        },
+    )
+    .expect("measured projection");
+    assert_eq!(calls, 1);
+    assert_eq!(seen, view.serialized_bytes);
+    let expected = ActiveUnderstandingView::canonical_output_utf8_bytes(
+        &context,
+        &recipe.recipe_sha256,
+        &eliot_context_contracts::canonical_fence_digest(&context.state_fence)
+            .expect("fence digest"),
+        &view.view.rendered,
+    )
+    .expect("canonical bytes");
+    assert_eq!(expected, view.serialized_bytes.len() as u64);
+
+    let mut refused_calls = 0;
+    let forged = AssemblyPolicy {
+        fence_digest: "b".repeat(64),
+        ..policy(100_000)
+    };
+    let result: Result<_, AssemblyError> = assemble_active_view(
+        &value,
+        &recipe,
+        quality(&context),
+        &forged,
+        |bytes| {
+            refused_calls += 1;
+            Ok(measurement(&context, bytes))
+        },
+    );
+    assert!(result.is_err());
+    assert_eq!(refused_calls, 0, "no local fallback call on refusal");
+}
+
+// WORK_UNIT_CASE: 626/27
+#[test]
+fn source_guard_rejects_local_fallback_estimators() {
+    let value = admitted();
+    let context = value.binding.clone();
+    let content = match &value.records[0].candidate.representation {
+        AtomRepresentation::Whole { content } => content.clone(),
+        other => panic!("fixture must stay whole, got {other:?}"),
+    };
+    let char_count = content.chars().count() as u64;
+    let byte_count = content.len() as u64;
+    assert!(byte_count > char_count, "non-ASCII separates bytes from chars");
+    let view = assemble_active_view(
+        &value,
+        &recipe(&context),
+        quality(&context),
+        &policy(100_000),
+        |bytes| Ok(measurement(&context, bytes)),
+    )
+    .expect("exact bytes");
+    assert_ne!(char_count, view.view.measurement.rendered_utf8_bytes);
+
+    let mut char_measured = measurement(&context, &view.serialized_bytes);
+    char_measured.rendered_utf8_bytes = char_measured
+        .rendered_utf8_bytes
+        .saturating_sub(byte_count - char_count);
+    let result = assemble_active_view(
+        &value,
+        &recipe(&context),
+        quality(&context),
+        &policy(100_000),
+        |_| Ok(char_measured.clone()),
+    );
+    assert_eq!(
+        result,
+        Err(AssemblyError::MeasurementMismatch("rendered_utf8_bytes"))
+    );
+
+    let mut tokenizer_fallback = measurement(&context, &view.serialized_bytes);
+    tokenizer_fallback.status = MeasurementStatus::ExactTokenizer;
+    tokenizer_fallback.tokenizer = None;
+    let result = assemble_active_view(
+        &value,
+        &recipe(&context),
+        quality(&context),
+        &policy(100_000),
+        |_| Ok(tokenizer_fallback.clone()),
+    );
+    assert_eq!(
+        result,
+        Err(AssemblyError::Contract(ContextError::UnknownMeasurement))
+    );
+}
+
+// WORK_UNIT_CASE: 626/29
+#[test]
+fn one_semantic_occurrence_per_admitted_atom() {
+    let (value, recipe) = admitted_multi_role();
+    let context = value.binding.clone();
+    let view = assemble_active_view(
+        &value,
+        &recipe,
+        quality(&context),
+        &policy(100_000),
+        |bytes| Ok(measurement(&context, bytes)),
+    )
+    .expect("single-occurrence projection");
+    assert_eq!(view.view.rendered.len(), 2);
+    for atom in [id("atom"), id("atom-source")] {
+        let occurrences = view
+            .view
+            .rendered
+            .iter()
+            .filter(|rendered| rendered.atom_id == atom)
+            .count();
+        assert_eq!(occurrences, 1, "exactly one semantic occurrence");
+    }
+    let mut rendered_sorted = view.view.rendered.clone();
+    rendered_sorted.sort_by(|left, right| left.atom_id.cmp(&right.atom_id));
+    rendered_sorted.dedup_by(|left, right| left.atom_id == right.atom_id);
+    assert_eq!(rendered_sorted.len(), 2);
+}
+
+// WORK_UNIT_CASE: 626/30
+#[test]
+fn duplicate_rendered_occurrence_is_rejected() {
+    let context = binding();
+    let proof = SelectionIntegrityProof {
+        binding: context,
+        admitted_ids: vec![id("atom")],
+        rendered_ids: vec![id("atom"), id("atom")],
+        omission_evidence: Vec::new(),
+        output_digest: digest(),
+    };
+    assert_eq!(
+        proof.validate(),
+        Err(ContextError::SelectionIntegrityMismatch)
+    );
+
+    let mut duplicated = admitted();
+    duplicated.records.push(duplicated.records[0].clone());
+    let duplicated_context = duplicated.binding.clone();
+    let result = assemble_active_view(
+        &duplicated,
+        &recipe(&duplicated_context),
+        quality(&duplicated_context),
+        &policy(100_000),
+        |_bytes| panic!("duplicate rendered must fail before measurement"),
+    );
+    assert_eq!(
+        result,
+        Err(AssemblyError::Contract(ContextError::Duplicate(
+            "admitted.atom_id"
+        )))
+    );
+}
+
+// WORK_UNIT_CASE: 626/32
+#[test]
+fn missing_omission_coverage_evidence_is_rejected() {
+    let (mut value, omission_recipe) = admitted_with_omission();
+    value.economy.omissions.clear();
+    refresh_economy_receipt(&mut value);
+    let context = value.binding.clone();
+    let result = assemble_active_view(
+        &value,
+        &omission_recipe,
+        quality(&context),
+        &policy_for(&context, 100_000),
+        |_bytes| panic!("missing omission record must fail"),
+    );
+    assert_eq!(
+        result,
+        Err(AssemblyError::Contract(ContextError::EconomyMismatch))
+    );
+
+    let value = admitted();
+    let context = value.binding.clone();
+    let mut thin_quality = quality(&context);
+    thin_quality.results.pop();
+    let result = assemble_active_view(
+        &value,
+        &recipe(&context),
+        thin_quality,
+        &policy(100_000),
+        |_bytes| panic!("missing quality axis must fail"),
+    );
+    assert!(matches!(
+        result,
+        Err(AssemblyError::QualityIncomplete(_))
+    ));
+}
+
+// WORK_UNIT_CASE: 626/33
+#[test]
+fn exact_twelve_quality_dimensions_and_wire_names() {
+    let context = binding();
+    let scorecard = quality(&context);
+    assert_eq!(scorecard.results.len(), 12);
+    let expected = [
+        (
+            QualityDimension::AcceptanceDecisionCoverage,
+            "ACCEPTANCE_DECISION_COVERAGE",
+        ),
+        (
+            QualityDimension::CausalOperationalSufficiency,
+            "CAUSAL_OPERATIONAL_SUFFICIENCY",
+        ),
+        (
+            QualityDimension::ExactAnchorProvenanceCoverage,
+            "EXACT_ANCHOR_PROVENANCE_COVERAGE",
+        ),
+        (
+            QualityDimension::FreshnessStateFenceCoherence,
+            "FRESHNESS_STATE_FENCE_COHERENCE",
+        ),
+        (
+            QualityDimension::RivalsConflictsUnknownsVisibility,
+            "RIVALS_CONFLICTS_UNKNOWNS_VISIBILITY",
+        ),
+        (
+            QualityDimension::NegativeMemoryInvariantCoverage,
+            "NEGATIVE_MEMORY_INVARIANT_COVERAGE",
+        ),
+        (
+            QualityDimension::VerifierActionReadiness,
+            "VERIFIER_ACTION_READINESS",
+        ),
+        (
+            QualityDimension::RouteAccessibilityLayoutRisk,
+            "ROUTE_ACCESSIBILITY_LAYOUT_RISK",
+        ),
+        (
+            QualityDimension::InstructionSufficiency,
+            "INSTRUCTION_SUFFICIENCY",
+        ),
+        (
+            QualityDimension::PayloadHandleReconstructionCost,
+            "PAYLOAD_HANDLE_RECONSTRUCTION_COST",
+        ),
+        (
+            QualityDimension::KnownOmissionsExpansionPaths,
+            "KNOWN_OMISSIONS_EXPANSION_PATHS",
+        ),
+        (
+            QualityDimension::TelemetryMeasurementCostCoverage,
+            "TELEMETRY_MEASUREMENT_COST_COVERAGE",
+        ),
+    ];
+    let mut seen = std::collections::BTreeSet::new();
+    for (dimension, wire) in expected {
+        assert!(seen.insert(dimension), "each dimension appears once");
+        let bytes = eliot_contracts::canonical_json_bytes(&dimension).expect("wire bytes");
+        let text = String::from_utf8(bytes).expect("wire utf-8");
+        assert_eq!(text, format!("\"{wire}\""));
+    }
+    scorecard.validate().expect("twelve-axis closure");
+    let value = admitted();
+    let context = value.binding.clone();
+    assemble_active_view(
+        &value,
+        &recipe(&context),
+        quality(&context),
+        &policy(100_000),
+        |bytes| Ok(measurement(&context, bytes)),
+    )
+    .expect("twelve-axis projection");
+}
+
+// WORK_UNIT_CASE: 626/34
+#[test]
+fn each_quality_dimension_fails_independently() {
+    let value = admitted();
+    let context = value.binding.clone();
+    let base = quality(&context);
+    assert_eq!(base.results.len(), 12);
+    for index in 0..12 {
+        let mut failed = base.clone();
+        failed.results[index].passed = false;
+        failed.results[index].failed_invariant = Some(id("failed-invariant"));
+        failed.results[index].unknown_evidence.clear();
+        for (other, result) in failed.results.iter().enumerate() {
+            if other != index {
+                assert!(result.passed, "other eleven stay unchanged");
+            }
+        }
+        let result = assemble_active_view(
+            &value,
+            &recipe(&context),
+            failed,
+            &policy(100_000),
+            |_bytes| panic!("failed dimension must block before measurement"),
+        );
+        match result {
+            Err(AssemblyError::QualityIncomplete(scorecard)) => {
+                assert_eq!(scorecard.results.len(), 12);
+                assert!(!scorecard.results[index].passed);
+            }
+            other => panic!("dimension {index} must block complete, got {other:?}"),
+        }
+    }
+}
+
+// WORK_UNIT_CASE: 626/35
+#[test]
+fn unknown_mandatory_quality_blocks_complete() {
+    let value = admitted();
+    let context = value.binding.clone();
+    let mut unknown = quality(&context);
+    unknown.results[0].passed = false;
+    unknown.results[0].failed_invariant = None;
+    unknown.results[0].unknown_evidence = vec![id("unknown-evidence")];
+    let result = assemble_active_view(
+        &value,
+        &recipe(&context),
+        unknown,
+        &policy(100_000),
+        |_bytes| panic!("unknown evidence must block before measurement"),
+    );
+    assert!(matches!(
+        result,
+        Err(AssemblyError::QualityIncomplete(_))
+    ));
+
+    let mut qualified_unknown = quality(&context);
+    qualified_unknown.results[1].unknown_evidence = vec![id("unknown-evidence")];
+    let result = assemble_active_view(
+        &value,
+        &recipe(&context),
+        qualified_unknown,
+        &policy(100_000),
+        |_bytes| panic!("passed with unknown evidence must block"),
+    );
+    assert!(matches!(
+        result,
+        Err(AssemblyError::QualityIncomplete(_))
+    ));
+}
+
+// WORK_UNIT_CASE: 626/36
+#[test]
+fn no_scalar_weighted_average_compensation() {
+    let value = admitted();
+    let context = value.binding.clone();
+    let mut compensated = quality(&context);
+    for result in compensated.results.iter_mut().skip(1) {
+        result.evidence.push(id("extra-evidence"));
+    }
+    compensated.results[0].passed = false;
+    compensated.results[0].failed_invariant = Some(id("failed-invariant"));
+    compensated.results[0].unknown_evidence.clear();
+    assert!(
+        !compensated.all_pass().unwrap_or(false),
+        "one failure blocks closure despite extra evidence elsewhere"
+    );
+    let result = assemble_active_view(
+        &value,
+        &recipe(&context),
+        compensated,
+        &policy(100_000),
+        |_bytes| panic!("compensation must not complete"),
+    );
+    assert!(matches!(
+        result,
+        Err(AssemblyError::QualityIncomplete(_))
+    ));
+}
+
+// WORK_UNIT_CASE: 626/37
+#[test]
+fn complete_partial_upstream_material_measurement_stay_distinct() {
+    let complete_value = admitted();
+    let complete_context = complete_value.binding.clone();
+    let complete = assemble_active_view(
+        &complete_value,
+        &recipe(&complete_context),
+        quality(&complete_context),
+        &policy(100_000),
+        |bytes| Ok(measurement(&complete_context, bytes)),
+    );
+    assert!(complete.is_ok(), "complete stays complete");
+
+    let mut missing_value = admitted();
+    missing_value.records[0].candidate.availability = AtomAvailability::Missing;
+    missing_value.floor.members[0].availability = AtomAvailability::Missing;
+    missing_value.floor.members[0].measurement = None;
+    missing_value.floor.providers.dispositions[0].state = AtomAvailability::Missing;
+    let mut missing_recipe = recipe(&missing_value.binding.clone());
+    missing_recipe.denominator.dispositions[0].state = AtomAvailability::Missing;
+    missing_recipe.recipe_sha256 = missing_recipe
+        .canonical_policy_digest()
+        .expect("missing recipe digest");
+    refinalize(&mut missing_value, &missing_recipe.recipe_sha256.clone());
+    let missing_context = missing_value.binding.clone();
+    let upstream = assemble_active_view(
+        &missing_value,
+        &missing_recipe,
+        quality(&missing_context),
+        &policy(100_000),
+        |_| panic!("upstream gap precedes measurement"),
+    );
+    assert!(matches!(upstream, Err(AssemblyError::Incomplete(_))));
+
+    let mut failed_quality = quality(&complete_context);
+    failed_quality.results[0].passed = false;
+    failed_quality.results[0].failed_invariant = Some(id("failed-invariant"));
+    failed_quality.results[0].unknown_evidence.clear();
+    let material = assemble_active_view(
+        &complete_value,
+        &recipe(&complete_context),
+        failed_quality,
+        &policy(100_000),
+        |_| panic!("quality gap precedes measurement"),
+    );
+    assert!(matches!(
+        material,
+        Err(AssemblyError::QualityIncomplete(_))
+    ));
+
+    let tight = assemble_active_view(
+        &complete_value,
+        &recipe(&complete_context),
+        quality(&complete_context),
+        &policy(10),
+        |_| panic!("byte ceiling precedes measurement"),
+    );
+    assert!(matches!(tight, Err(AssemblyError::Bounds(_))));
+
+    let mut bad_bytes = measurement(&complete_context, b"probe");
+    bad_bytes.envelope_digest = digest();
+    bad_bytes.rendered_utf8_bytes = 7;
+    let measured = assemble_active_view(
+        &complete_value,
+        &recipe(&complete_context),
+        quality(&complete_context),
+        &policy(100_000),
+        |_| Ok(bad_bytes.clone()),
+    );
+    assert!(measured.is_err());
+    assert_ne!(upstream, material);
+    assert_ne!(material, tight);
+    assert_ne!(tight, measured);
+}
+
+// WORK_UNIT_CASE: 626/38
+#[test]
+fn unknown_fields_variants_protected_defaults_are_rejected() {
+    let value = admitted();
+    let context = value.binding.clone();
+    let mut bad_schema = recipe(&context);
+    bad_schema.schema_version = eliot_contracts::ContractVersion::new(9, 9, 9);
+    let result = assemble_active_view(
+        &value,
+        &bad_schema,
+        quality(&context),
+        &policy(100_000),
+        |_bytes| panic!("unknown schema must fail"),
+    );
+    assert_eq!(
+        result,
+        Err(AssemblyError::Contract(ContextError::InvalidField(
+            "recipe.schema_version"
+        )))
+    );
+
+    let mut bad_digest = policy(100_000);
+    bad_digest.serializer_options_digest = "NOT-HEX".to_owned();
+    let result = assemble_active_view(
+        &value,
+        &recipe(&context),
+        quality(&context),
+        &bad_digest,
+        |_bytes| panic!("unknown digest shape must fail"),
+    );
+    assert_eq!(
+        result,
+        Err(AssemblyError::Contract(ContextError::InvalidDigest(
+            "assembly.serializer_options_digest"
+        )))
+    );
+
+    let mut unknown_policy = policy(100_000);
+    unknown_policy.measurement_status = MeasurementStatus::Unknown;
+    let result = assemble_active_view(
+        &value,
+        &recipe(&context),
+        quality(&context),
+        &unknown_policy,
+        |_bytes| panic!("unknown measurement status must fail"),
+    );
+    assert_eq!(
+        result,
+        Err(AssemblyError::Contract(ContextError::UnknownMeasurement))
+    );
+}
+
+// WORK_UNIT_CASE: 626/40
+#[test]
+fn successful_views_are_one_to_one_and_within_measured_bounds() {
+    let fixtures: Vec<(AdmittedContextSet, ContextRecipe)> = vec![
+        {
+            let value = admitted();
+            let context = value.binding.clone();
+            let recipe = recipe(&context);
+            (value, recipe)
+        },
+        {
+            let value = admitted_two();
+            let context = value.binding.clone();
+            let recipe = recipe(&context);
+            (value, recipe)
+        },
+        admitted_multi_role(),
+    ];
+    for (value, recipe) in &fixtures {
+        let context = value.binding.clone();
+        let max = 100_000;
+        let view = assemble_active_view(
+            value,
+            recipe,
+            quality(&context),
+            &policy(max),
+            |bytes| Ok(measurement(&context, bytes)),
+        )
+        .expect("bounded one-to-one view");
+        let mut admitted_sorted = view.view.admitted_ids.clone();
+        admitted_sorted.sort();
+        let mut rendered_sorted = view
+            .view
+            .rendered
+            .iter()
+            .map(|atom| atom.atom_id.clone())
+            .collect::<Vec<_>>();
+        rendered_sorted.sort();
+        assert_eq!(admitted_sorted, rendered_sorted);
+        assert_eq!(view.view.rendered.len(), view.view.admitted_ids.len());
+        assert_eq!(
+            view.view.measurement.rendered_utf8_bytes,
+            view.serialized_bytes.len() as u64
+        );
+        assert!(view.serialized_bytes.len() as u64 <= max);
+        assert!(view.view.measurement.proves_fit(100_000).expect("fit"));
+        view.view
+            .validate_against(value)
+            .expect("one-to-one conservation");
+    }
+}
+
+// WORK_UNIT_CASE: 626/41
+#[test]
+fn no_admission_delivery_authority_effect_finish_path() {
+    let value = admitted();
+    let context = value.binding.clone();
+    let view = assemble_active_view(
+        &value,
+        &recipe(&context),
+        quality(&context),
+        &policy(100_000),
+        |bytes| Ok(measurement(&context, bytes)),
+    )
+    .expect("projection-only view");
+    assert_eq!(view.view.binding, value.binding);
+    assert_eq!(view.view.selection.binding, value.binding);
+    assert_eq!(view.view.quality.binding, value.binding);
+    assert_eq!(view.view.measurement.context, value.binding);
+    assert_eq!(view.view.recipe_digest, recipe(&context).recipe_sha256);
+    let replay = assemble_active_view(
+        &value,
+        &recipe(&context),
+        quality(&context),
+        &policy(100_000),
+        |bytes| Ok(measurement(&context, bytes)),
+    )
+    .expect("idempotent replay");
+    assert_eq!(view.view, replay.view, "no effect or Finish transition");
+    assert_eq!(
+        view.view.quality.results.len(),
+        12,
+        "projection carries quality, not delivery or use"
+    );
+}
