@@ -832,3 +832,558 @@ fn text(value: &str, field: &'static str) -> Result<(), ReadError> {
     }
     Ok(())
 }
+
+#[cfg(test)]
+mod evidence_pack_read_tests {
+    //! T11.1 first behaviour tests for `GetEvidencePack` at the read-facade level.
+    //!
+    //! `eliot-store-memory` is intentionally *not* a dependency of this crate
+    //! (a new dependency would rewrite the workspace lockfile owned by another
+    //! lane), so the store side is a minimal in-test [`CanonicalReadClient`]
+    //! that enforces the same rules as the production adapters through the
+    //! real shared functions: request validation, the generated operation
+    //! catalogue gate, fence equality, the declared `subject` / `max_records`
+    //! selectors, and the catalogue [`EVIDENCE_PACK_MAX_RECORDS`] bound. Every
+    //! asserted record, fence, bound, and truncation value is computed from the
+    //! request inputs; nothing is canned and no production logic is altered.
+
+    use std::collections::BTreeMap;
+    use std::future::Future;
+    use std::task::{Context, Poll, Waker};
+
+    use eliot_contracts::{
+        ClockReading, EpochId, EpochLineageId, ProductId, RequestId, RequestMetadata,
+        ResourceGeneration, SourceId, StateFence,
+    };
+    use eliot_store_api::{
+        CanonicalReadClient, EVIDENCE_PACK_MAX_RECORDS, NamedReadOperation, NamedReadRequest,
+        NamedReadResponse, ReadConsistency, RevisionHead, RevisionKey, ScopeId, StoreError,
+        generated_operation_manifests,
+    };
+    use serde_json::{Value, json};
+
+    use super::*;
+
+    /// Payload-shape version minted by the in-test evidence table below. The
+    /// value is local to the test double; the load-bearing assertions compare
+    /// request-derived identity, fence, bound, and truncation fields.
+    const TEST_EVIDENCE_PACK_VERSION: u32 = 1;
+
+    /// Drives the read facade without an async runtime (this crate has none):
+    /// every test future is immediately ready because the in-test client
+    /// performs no I/O.
+    fn block_on<F: Future>(future: F) -> F::Output {
+        let waker = Waker::noop();
+        let mut context = Context::from_waker(waker);
+        let mut pinned = Box::pin(future);
+        loop {
+            match pinned.as_mut().poll(&mut context) {
+                Poll::Ready(output) => return output,
+                Poll::Pending => std::thread::yield_now(),
+            }
+        }
+    }
+
+    fn test_epoch(sequence: u64) -> Result<EpochId, Box<dyn std::error::Error>> {
+        use std::num::NonZeroU64;
+        let lineage = EpochLineageId::new("550e8400-e29b-41d4-a716-446655440000")?;
+        let sequence = NonZeroU64::new(sequence).ok_or(StoreError::InvalidField {
+            field: "test.sequence",
+            reason: "must be non-zero",
+        })?;
+        Ok(EpochId::new(lineage, sequence)?)
+    }
+
+    fn fence() -> Result<StateFence, Box<dyn std::error::Error>> {
+        Ok(StateFence::new(
+            test_epoch(1)?,
+            ResourceGeneration::genesis(),
+        ))
+    }
+
+    fn metadata(fence: &StateFence) -> Result<RequestMetadata, Box<dyn std::error::Error>> {
+        Ok(RequestMetadata {
+            request_id: RequestId::new("request-evidence-1")?,
+            session_id: None,
+            task_id: None,
+            product_id: ProductId::new("product-evidence")?,
+            source_id: SourceId::new("source-evidence")?,
+            state_fence: fence.clone(),
+            clock: ClockReading {
+                valid_time_ms: Some(1),
+                known_time_ms: Some(1),
+                transaction_sequence: None,
+                monotonic_ns: Some(1),
+            },
+        })
+    }
+
+    fn evidence_params(subject: &str, max_records: &str) -> BTreeMap<String, Value> {
+        BTreeMap::from([
+            ("subject".to_owned(), Value::String(subject.to_owned())),
+            (
+                "max_records".to_owned(),
+                Value::String(max_records.to_owned()),
+            ),
+        ])
+    }
+
+    fn verification_intent() -> QueryIntent {
+        QueryIntent {
+            mode: QueryMode::Verification,
+            time_scope: "evidence window for verification".to_owned(),
+            branch_environment_scope: "test branch and environment".to_owned(),
+            freshness_policy: "exact captured records only".to_owned(),
+            required_assurance: "verifier evidence read".to_owned(),
+        }
+    }
+
+    fn evidence_query(
+        scope: Option<&str>,
+        consistency: ReadConsistency,
+        dependencies: BTreeMap<RevisionKey, u64>,
+        parameters: BTreeMap<String, Value>,
+    ) -> Result<QueryRequest, StoreError> {
+        Ok(QueryRequest {
+            intent: verification_intent(),
+            operation: NamedReadOperation::GetEvidencePack,
+            query: "retrieve the exact captured evidence record".to_owned(),
+            exact_resource_uri: None,
+            scope_id: scope.map(ScopeId::new).transpose()?,
+            consistency,
+            dependency_revisions: dependencies,
+            parameters,
+            provenance_handles: Vec::new(),
+        })
+    }
+
+    fn pack_records(payload: &Value) -> Result<&Vec<Value>, StoreError> {
+        payload
+            .get("records")
+            .and_then(Value::as_array)
+            .ok_or(StoreError::Empty {
+                field: "evidence.records",
+            })
+    }
+
+    fn pack_provenance(payload: &Value) -> Result<&serde_json::Map<String, Value>, StoreError> {
+        payload
+            .get("provenance")
+            .and_then(Value::as_object)
+            .ok_or(StoreError::Empty {
+                field: "evidence.provenance",
+            })
+    }
+
+    /// Minimal in-test evidence table. It stores captured subjects in capture
+    /// order and derives every response field from the incoming request using
+    /// the same rule order as the production adapters: request validation,
+    /// catalogue gate, fence equality, scope declaration, selector shape, and
+    /// the explicit bound.
+    struct EvidenceTableClient {
+        fence: StateFence,
+        captured: Vec<String>,
+    }
+
+    impl EvidenceTableClient {
+        fn new(fence: StateFence) -> Self {
+            Self {
+                fence,
+                captured: Vec::new(),
+            }
+        }
+
+        fn capture(&mut self, subject: &str) {
+            self.captured.push(subject.to_owned());
+        }
+    }
+
+    impl CanonicalReadClient for EvidenceTableClient {
+        async fn revision_heads(
+            &self,
+            keys: Vec<RevisionKey>,
+        ) -> Result<Vec<RevisionHead>, StoreError> {
+            keys.into_iter()
+                .map(|key| {
+                    Ok(RevisionHead {
+                        key,
+                        revision: 1,
+                        state_fence: self.fence.clone(),
+                    })
+                })
+                .collect()
+        }
+
+        async fn execute_named(
+            &self,
+            request: NamedReadRequest,
+        ) -> Result<NamedReadResponse, StoreError> {
+            request.validate()?;
+            if request.operation != NamedReadOperation::GetEvidencePack {
+                return Err(StoreError::UnknownOperation);
+            }
+            // Same pre-dispatch gate both production adapters apply.
+            let entries = generated_operation_manifests()?;
+            request.validate_against_catalogue(&entries)?;
+            if request.state_fence != self.fence {
+                return Err(StoreError::FenceMismatch);
+            }
+            // The catalogue gate already enforces the scope declaration;
+            // re-check fail-closed so this arm never depends on call order.
+            let scope_id = request.scope_id.clone().ok_or(StoreError::InvalidField {
+                field: "scope_id",
+                reason: "evidence pack read requires scope_id",
+            })?;
+            let subject = request
+                .parameters
+                .get("subject")
+                .and_then(Value::as_str)
+                .ok_or(StoreError::InvalidField {
+                    field: "operation.parameter",
+                    reason: "missing required parameter",
+                })?;
+            if subject.trim().is_empty() || subject.chars().any(char::is_control) {
+                return Err(StoreError::InvalidField {
+                    field: "operation.parameter",
+                    reason: "subject must be a non-blank string",
+                });
+            }
+            let bound_raw = request
+                .parameters
+                .get("max_records")
+                .and_then(Value::as_str)
+                .ok_or(StoreError::InvalidField {
+                    field: "operation.parameter",
+                    reason: "missing required parameter",
+                })?;
+            let max_records: u32 = bound_raw.parse().map_err(|_| StoreError::InvalidField {
+                field: "operation.parameter",
+                reason: "max_records must be a positive decimal bound",
+            })?;
+            if max_records == 0 {
+                return Err(StoreError::InvalidField {
+                    field: "operation.parameter",
+                    reason: "max_records must be a positive decimal bound",
+                });
+            }
+            if max_records > EVIDENCE_PACK_MAX_RECORDS {
+                return Err(StoreError::PayloadTooLarge);
+            }
+            let limit = usize::try_from(max_records).map_err(|_| StoreError::PayloadTooLarge)?;
+            let matched: Vec<usize> = self
+                .captured
+                .iter()
+                .enumerate()
+                .filter(|(_, captured)| captured.as_str() == subject)
+                .map(|(index, _)| index)
+                .collect();
+            let matched_total = matched.len();
+            let records: Vec<Value> = matched
+                .into_iter()
+                .take(limit)
+                .map(|index| {
+                    json!({
+                        "capture_index": index,
+                        "operation": "CaptureObservation",
+                        "subject": self.captured[index],
+                    })
+                })
+                .collect();
+            let returned = records.len();
+            let payload = json!({
+                "version": TEST_EVIDENCE_PACK_VERSION,
+                "subject": subject,
+                "scope_id": scope_id.as_str(),
+                "records": records,
+                "provenance": {
+                    "state_fence": self.fence,
+                    "matched_total": matched_total,
+                    "returned": returned,
+                    "max_records": max_records,
+                    "truncated": matched_total > returned,
+                },
+            });
+            let response = NamedReadResponse {
+                operation: request.operation,
+                state_fence: self.fence.clone(),
+                revision_heads: vec![RevisionHead {
+                    key: RevisionKey::new(format!("scope:{scope_id}"))?,
+                    revision: 1,
+                    state_fence: self.fence.clone(),
+                }],
+                payload,
+            };
+            response.validate()?;
+            Ok(response)
+        }
+    }
+
+    #[test]
+    fn evidence_pack_query_request_validates_for_verification_intent()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let request = evidence_query(
+            Some("scope-evidence"),
+            ReadConsistency::Eventual,
+            BTreeMap::new(),
+            evidence_params("evidence-alpha", "10"),
+        )?;
+        request.validate()?;
+        Ok(())
+    }
+
+    #[test]
+    fn evidence_pack_query_request_rejects_wrong_intent_and_missing_scope()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let mut request = evidence_query(
+            Some("scope-evidence"),
+            ReadConsistency::Eventual,
+            BTreeMap::new(),
+            evidence_params("evidence-alpha", "10"),
+        )?;
+        request.intent.mode = QueryMode::CurrentPosition;
+        assert!(matches!(
+            request.validate(),
+            Err(ReadError::InvalidIntentOperation { .. })
+        ));
+
+        let unscoped = evidence_query(
+            None,
+            ReadConsistency::Eventual,
+            BTreeMap::new(),
+            evidence_params("evidence-alpha", "10"),
+        )?;
+        assert!(matches!(unscoped.validate(), Err(ReadError::ScopeRequired)));
+        Ok(())
+    }
+
+    #[test]
+    fn evidence_pack_state_context_rejects_non_state_operation()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let fence = fence()?;
+        let ctx = metadata(&fence)?;
+        let service = ReadService::new(EvidenceTableClient::new(fence));
+        let request = StateRequest {
+            operation: NamedReadOperation::GetEvidencePack,
+            scope_id: Some(ScopeId::new("scope-evidence")?),
+            consistency: ReadConsistency::Eventual,
+            dependency_revisions: BTreeMap::new(),
+            parameters: evidence_params("evidence-alpha", "10"),
+            provenance_handles: Vec::new(),
+        };
+        let result = block_on(service.state(&ctx, request));
+        assert!(
+            matches!(result, Err(ReadError::OperationNotAllowed { context, .. }) if context == "state")
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn evidence_pack_query_fails_closed_against_store_catalogue()
+    -> Result<(), Box<dyn std::error::Error>> {
+        // The facade injects the free-text `query` selector into the named
+        // parameters while the closed catalogue admits only `subject` and
+        // `max_records` for `GetEvidencePack` (the same pre-dispatch gate both
+        // production adapters enforce). The read must fail closed here;
+        // success would mean the boundary silently widened.
+        let fence = fence()?;
+        let ctx = metadata(&fence)?;
+        let service = ReadService::new(EvidenceTableClient::new(fence));
+        let request = evidence_query(
+            Some("scope-evidence"),
+            ReadConsistency::Eventual,
+            BTreeMap::new(),
+            evidence_params("evidence-alpha", "10"),
+        )?;
+        match block_on(service.query(&ctx, request)) {
+            Err(ReadError::Store(detail)) => assert!(
+                detail.contains("unknown parameter"),
+                "unexpected store refusal: {detail}"
+            ),
+            other => panic!("evidence pack query must fail closed, observed: {other:?}"),
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn evidence_pack_query_refuses_changed_fence_and_over_bound_request()
+    -> Result<(), Box<dyn std::error::Error>> {
+        // T11.1 acceptance: changing the fence or exceeding the declared bound
+        // must not return a successful current view.
+        let fence = fence()?;
+        let service = ReadService::new(EvidenceTableClient::new(fence.clone()));
+
+        let changed = StateFence::new(test_epoch(2)?, ResourceGeneration::genesis());
+        let changed_ctx = metadata(&changed)?;
+        let fenced = evidence_query(
+            Some("scope-evidence"),
+            ReadConsistency::Eventual,
+            BTreeMap::new(),
+            evidence_params("evidence-alpha", "10"),
+        )?;
+        assert!(block_on(service.query(&changed_ctx, fenced)).is_err());
+
+        let over_bound = (EVIDENCE_PACK_MAX_RECORDS + 1).to_string();
+        let mut dependencies = BTreeMap::new();
+        dependencies.insert(RevisionKey::new("scope:scope-evidence")?, 1);
+        let bounded = evidence_query(
+            Some("scope-evidence"),
+            ReadConsistency::ExactFence,
+            dependencies,
+            evidence_params("evidence-alpha", &over_bound),
+        )?;
+        let ctx = metadata(&fence)?;
+        assert!(block_on(service.query(&ctx, bounded)).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn evidence_pack_store_rules_derive_identity_fence_and_provenance()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let fence = fence()?;
+        let mut client = EvidenceTableClient::new(fence.clone());
+        client.capture("evidence-alpha");
+        client.capture("evidence-beta");
+        client.capture("evidence-alpha");
+        let request = NamedReadRequest {
+            operation: NamedReadOperation::GetEvidencePack,
+            scope_id: Some(ScopeId::new("scope-evidence")?),
+            consistency: ReadConsistency::Eventual,
+            state_fence: fence.clone(),
+            parameters: evidence_params("evidence-alpha", "10"),
+        };
+        let response = block_on(client.execute_named(request))?;
+        assert_eq!(response.operation, NamedReadOperation::GetEvidencePack);
+        assert_eq!(response.state_fence, fence);
+        let payload = &response.payload;
+        assert_eq!(
+            payload.get("subject").and_then(Value::as_str),
+            Some("evidence-alpha")
+        );
+        assert_eq!(
+            payload.get("version").and_then(Value::as_u64),
+            Some(u64::from(TEST_EVIDENCE_PACK_VERSION))
+        );
+        let records = pack_records(payload)?;
+        assert_eq!(records.len(), 2);
+        assert_eq!(
+            records[0].get("capture_index").and_then(Value::as_u64),
+            Some(0)
+        );
+        assert_eq!(
+            records[1].get("capture_index").and_then(Value::as_u64),
+            Some(2)
+        );
+        for record in records {
+            assert_eq!(
+                record.get("operation").and_then(Value::as_str),
+                Some("CaptureObservation")
+            );
+            assert_eq!(
+                record.get("subject").and_then(Value::as_str),
+                Some("evidence-alpha")
+            );
+        }
+        let provenance = pack_provenance(payload)?;
+        assert_eq!(
+            provenance.get("matched_total").and_then(Value::as_u64),
+            Some(2)
+        );
+        assert_eq!(provenance.get("returned").and_then(Value::as_u64), Some(2));
+        assert_eq!(
+            provenance.get("max_records").and_then(Value::as_u64),
+            Some(10)
+        );
+        assert_eq!(
+            provenance.get("truncated").and_then(Value::as_bool),
+            Some(false)
+        );
+        let expected_fence = serde_json::to_value(&fence)
+            .map_err(|error| StoreError::Serialization(error.to_string()))?;
+        assert_eq!(provenance.get("state_fence"), Some(&expected_fence));
+        Ok(())
+    }
+
+    #[test]
+    fn evidence_pack_store_rules_truncate_empty_and_refuse()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let fence = fence()?;
+        let mut client = EvidenceTableClient::new(fence.clone());
+        client.capture("evidence-alpha");
+        client.capture("evidence-alpha");
+
+        let exact = |subject: &str, max_records: &str, fence: &StateFence| {
+            Ok::<_, StoreError>(NamedReadRequest {
+                operation: NamedReadOperation::GetEvidencePack,
+                scope_id: Some(ScopeId::new("scope-evidence")?),
+                consistency: ReadConsistency::Eventual,
+                state_fence: fence.clone(),
+                parameters: evidence_params(subject, max_records),
+            })
+        };
+
+        // Truncation is computed from the inputs with a visible marker.
+        let response = block_on(client.execute_named(exact("evidence-alpha", "1", &fence)?))?;
+        let records = pack_records(&response.payload)?;
+        assert_eq!(records.len(), 1);
+        assert_eq!(
+            records[0].get("capture_index").and_then(Value::as_u64),
+            Some(0)
+        );
+        let provenance = pack_provenance(&response.payload)?;
+        assert_eq!(
+            provenance.get("matched_total").and_then(Value::as_u64),
+            Some(2)
+        );
+        assert_eq!(provenance.get("returned").and_then(Value::as_u64), Some(1));
+        assert_eq!(
+            provenance.get("truncated").and_then(Value::as_bool),
+            Some(true)
+        );
+
+        // An unknown subject is an exact empty result, not an error.
+        let response =
+            block_on(client.execute_named(exact("evidence-never-captured", "10", &fence)?))?;
+        let records = pack_records(&response.payload)?;
+        assert!(records.is_empty());
+        let provenance = pack_provenance(&response.payload)?;
+        assert_eq!(
+            provenance.get("matched_total").and_then(Value::as_u64),
+            Some(0)
+        );
+        assert_eq!(provenance.get("returned").and_then(Value::as_u64), Some(0));
+        assert_eq!(
+            provenance.get("truncated").and_then(Value::as_bool),
+            Some(false)
+        );
+
+        // Over-bound, malformed bound, wrong fence, and missing scope refuse typed.
+        let over_bound = (EVIDENCE_PACK_MAX_RECORDS + 1).to_string();
+        assert_eq!(
+            block_on(client.execute_named(exact("evidence-alpha", &over_bound, &fence)?)),
+            Err(StoreError::PayloadTooLarge)
+        );
+        assert!(matches!(
+            block_on(client.execute_named(exact("evidence-alpha", "0", &fence)?)),
+            Err(StoreError::InvalidField { .. })
+        ));
+        assert!(matches!(
+            block_on(client.execute_named(exact("evidence-alpha", "ten", &fence)?)),
+            Err(StoreError::InvalidField { .. })
+        ));
+        let changed = StateFence::new(test_epoch(2)?, ResourceGeneration::genesis());
+        assert_eq!(
+            block_on(client.execute_named(exact("evidence-alpha", "10", &changed)?)),
+            Err(StoreError::FenceMismatch)
+        );
+        let mut unscoped = exact("evidence-alpha", "10", &fence)?;
+        unscoped.scope_id = None;
+        assert!(matches!(
+            block_on(client.execute_named(unscoped)),
+            Err(StoreError::InvalidField {
+                field: "scope_id",
+                ..
+            })
+        ));
+        Ok(())
+    }
+}
