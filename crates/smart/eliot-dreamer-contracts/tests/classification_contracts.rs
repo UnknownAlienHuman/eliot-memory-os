@@ -4,7 +4,6 @@ use eliot_contracts::{
     ArtifactId, EpochId, EpochLineageId, ReceiptId, RequestId, ResourceGeneration, SourceId,
     StateFence, TaskId,
 };
-use std::num::NonZeroU64;
 use eliot_dreamer_contracts::curation::{ClassificationPayload, TargetEvidence};
 use eliot_dreamer_contracts::*;
 use eliot_evidence::{
@@ -12,6 +11,7 @@ use eliot_evidence::{
     EvidenceFreshness, LifecycleState, Provenance,
 };
 use eliot_receipts::{ProofCeiling, ReceiptIdentity, WorkScopeId};
+use std::num::NonZeroU64;
 
 fn id(v: &str) -> ArtifactId {
     ArtifactId::new(v).expect("fixture id")

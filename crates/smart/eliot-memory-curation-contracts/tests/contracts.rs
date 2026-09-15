@@ -4,8 +4,8 @@ use std::collections::BTreeSet;
 
 use eliot_agent_contracts::AgentAttemptId;
 use eliot_contracts::{
-    EpochId, EpochLineageId, OperationId, PolicyRevision, ProductId, RequestId,
-    ResourceGeneration, SourceId, StateFence, TaskRevision,
+    EpochId, EpochLineageId, OperationId, PolicyRevision, ProductId, RequestId, ResourceGeneration,
+    SourceId, StateFence, TaskRevision,
 };
 use eliot_memory_curation_contracts::*;
 use eliot_receipts::WorkScopeId;
