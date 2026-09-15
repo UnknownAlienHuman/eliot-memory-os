@@ -131,8 +131,7 @@ async fn main() {
             "Host launch must inject the independent native worker executable digest",
         );
     };
-    kernel_config =
-        kernel_config.with_native_worker_artifact_sha256(native_worker_artifact_sha256);
+    kernel_config = kernel_config.with_native_worker_artifact_sha256(native_worker_artifact_sha256);
     let authority_path = options.authority_descriptor.clone();
     let authority_contour = startup_binding::authority_contour(&options.work_root, &authority_path);
     let kernel = Arc::new(
@@ -171,9 +170,8 @@ async fn main() {
             );
         };
         let doctor_ledger = Arc::new(
-            KernelDoctorRecoveryLedger::open(&options.work_root).unwrap_or_else(|error| {
-                exit_error("DOCTOR_LEDGER_FAILURE", &error.to_string())
-            }),
+            KernelDoctorRecoveryLedger::open(&options.work_root)
+                .unwrap_or_else(|error| exit_error("DOCTOR_LEDGER_FAILURE", &error.to_string())),
         );
         if let Err(error) = compose_production_doctor_front_door(doctor_ledger, &doctor_digest) {
             exit_error("DISPATCH_COMPOSITION_FAILURE", &error.to_string());
