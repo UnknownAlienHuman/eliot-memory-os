@@ -3777,10 +3777,9 @@ mod tests {
     /// replays by the retained original, refuses changed terms,
     /// reconciles, and releases; native prepare reserves the real claim
     /// through the live service plus ORS, writes the dispatch file with a
-    /// validated grant, and reconciles by the durable record; the real
-    /// native image prepares to the spawn boundary with the replay-stable
-    /// owner derivation; launch without an executor fails closed
-    /// and reaps.
+    /// validated grant, and reconciles by the durable record; launch
+    /// without an executor fails closed and reaps. The live child-image
+    /// steps run as separate ignored tests (TESTPHASE LIVE-DISPATCH-3).
     #[tokio::test]
     async fn dispatch_contour_lifecycle() {
         let root = temp_root("lifecycle");
@@ -4204,6 +4203,112 @@ mod tests {
             ReconcileLaunchedOutcome::Unknown { .. }
         ));
 
+        // 6. Launch without a configured executor fails closed: no spawn,
+        // no retained slot.
+        let launch_material = TestdLaunchMaterial {
+            request: &testd_request(
+                "job-dispatch-noexec-1",
+                0,
+                &testd_envelope("job-dispatch-noexec-1", Some("test-operation-1"), 1, &epoch),
+            ),
+            executable: material.executable,
+            executable_sha256: material.executable_sha256,
+            working_directory: material.working_directory,
+        };
+        assert!(matches!(
+            launch_admitted_testd_attempt(&kernel, &launch_material, now_nanos).await,
+            Err(DispatchLaunchError::ExecutorUnavailable)
+        ));
+        assert!(
+            !child_dir.join("eliot-testd.admitted-attempt.json").exists(),
+            "failed testd launch reaps its material and releases the slot"
+        );
+        assert!(matches!(
+            reconcile_launched_testd_attempt(
+                &kernel,
+                "job-dispatch-noexec-1",
+                launch_material.request
+            )
+            .expect("reconcile"),
+            ReconcileLaunchedOutcome::Unknown { .. }
+        ));
+
+        // 7. Doctor prepare without its composed side fails closed before
+        // any file or record.
+        let doctor_material = DoctorLaunchMaterial {
+            attempt: &shape_valid_doctor_request(),
+            request_json: &serde_json::json!({}),
+            manifest_json: &serde_json::json!({"manifest": "test"}),
+            executable: &child_dir.join("eliot-doctor.exe"),
+            executable_sha256: &"cd".repeat(32),
+            working_directory: &child_dir,
+        };
+        assert!(matches!(
+            prepare_doctor_launch(&kernel, &doctor_material, now_nanos),
+            Err(DispatchLaunchError::Uncomposed(_))
+        ));
+        assert!(matches!(
+            launch_admitted_doctor_attempt(&kernel, &doctor_material, now_nanos).await,
+            Err(DispatchLaunchError::Uncomposed(_))
+        ));
+        assert!(
+            !child_dir
+                .join("eliot-doctor.dispatched-attempt.json")
+                .exists()
+        );
+
+        // 8. The production Doctor side composes once through the durable
+        // Kernel-owned ledger plus the installed-health-probe registry: the
+        // advertisement flips, and a second composition fails closed
+        // instead of replacing live authority. This runs last because the
+        // earlier steps prove the uncomposed fail-closed shape.
+        let doctor_dir = root.join("doctor-ledger");
+        std::fs::create_dir_all(&doctor_dir).expect("doctor ledger dir");
+        let production_ledger = Arc::new(
+            crate::KernelDoctorRecoveryLedger::open(&doctor_dir).expect("production doctor ledger"),
+        );
+        let installed_doctor_digest =
+            eliot_contracts::sha256_hex(b"eliot-doctor-installed-package-bytes");
+        compose_production_doctor_front_door(
+            Arc::clone(&production_ledger),
+            &installed_doctor_digest,
+        )
+        .expect("production doctor composition");
+        assert!(
+            doctor_repair_advertised(),
+            "composed doctor side must advertise repair"
+        );
+        assert!(matches!(
+            compose_production_doctor_front_door(production_ledger, &installed_doctor_digest),
+            Err(DispatchLaunchError::AlreadyComposed(_))
+        ));
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// DISPATCH-LIVE native-worker image (Implements #461): the real
+    /// `eliot-native-worker` image is admitted through the live service
+    /// plus the real ORS claim table, bound to the protected dispatch file
+    /// with a validated grant, and carried to the spawn boundary with the
+    /// replay-stable owner derivation. Requires the built child binary, so
+    /// it runs in TESTPHASE LIVE-DISPATCH-3 only.
+    #[tokio::test]
+    #[ignore = "live image: run in TESTPHASE LIVE-DISPATCH-3 after cargo build of the child binaries"]
+    async fn dispatch_contour_lifecycle_native_live_image() {
+        let root = temp_root("lifecycle-native-live");
+        let kernel = ready_kernel(&root);
+        let epoch = live_epoch(&kernel);
+        assert_eq!(epoch, test_epoch(1));
+        // Minimal contour for isolation: the contour cell is process-global
+        // set-once state, so tolerate a prior composition when this test
+        // shares its process with the in-process lifecycle test.
+        if let Err(error) = compose_dispatch_contour(PRINCIPAL.to_owned()) {
+            assert!(
+                matches!(error, DispatchLaunchError::AlreadyComposed(_)),
+                "compose contour: {error}"
+            );
+        }
+        let now_nanos = 1_750_000_000_000_000_000u64;
         // 5c. DISPATCH-LIVE W-C E2E (kernel binary): the real
         // `eliot-native-worker` image is admitted through the live service
         // plus the real ORS claim table, bound to the protected dispatch
@@ -4366,7 +4471,31 @@ mod tests {
                 .expect("reconcile"),
             ReconcileLaunchedOutcome::Unknown { .. }
         ));
+        let _ = std::fs::remove_dir_all(root);
+    }
 
+    /// DISPATCH-LIVE testd image (Implements #461): the real `eliot-testd`
+    /// image is admitted through the live service plus the composed
+    /// principal, bound to the protected dispatch file with a validated
+    /// grant, and carried to the spawn boundary. Requires the built child
+    /// binary, so it runs in TESTPHASE LIVE-DISPATCH-3 only.
+    #[tokio::test]
+    #[ignore = "live image: run in TESTPHASE LIVE-DISPATCH-3 after cargo build of the child binaries"]
+    async fn dispatch_contour_lifecycle_testd_live_image() {
+        let root = temp_root("lifecycle-testd-live");
+        let kernel = ready_kernel(&root);
+        let epoch = live_epoch(&kernel);
+        assert_eq!(epoch, test_epoch(1));
+        // Minimal contour for isolation: the contour cell is process-global
+        // set-once state, so tolerate a prior composition when this test
+        // shares its process with the in-process lifecycle test.
+        if let Err(error) = compose_dispatch_contour(PRINCIPAL.to_owned()) {
+            assert!(
+                matches!(error, DispatchLaunchError::AlreadyComposed(_)),
+                "compose contour: {error}"
+            );
+        }
+        let now_nanos = 1_750_000_000_000_000_000u64;
         // 5d. DISPATCH-LIVE testd image (kernel binary, Implements #461):
         // the real `eliot-testd` image is admitted through the live service
         // plus the composed principal, bound to the protected dispatch file
@@ -4494,66 +4623,28 @@ mod tests {
             .expect("reconcile"),
             ReconcileLaunchedOutcome::Unknown { .. }
         ));
+        let _ = std::fs::remove_dir_all(root);
+    }
 
-        // 6. Launch without a configured executor fails closed: no spawn,
-        // no retained slot.
-        let launch_material = TestdLaunchMaterial {
-            request: &testd_request(
-                "job-dispatch-noexec-1",
-                0,
-                &testd_envelope("job-dispatch-noexec-1", Some("test-operation-1"), 1, &epoch),
-            ),
-            executable: material.executable,
-            executable_sha256: material.executable_sha256,
-            working_directory: material.working_directory,
-        };
-        assert!(matches!(
-            launch_admitted_testd_attempt(&kernel, &launch_material, now_nanos).await,
-            Err(DispatchLaunchError::ExecutorUnavailable)
-        ));
-        assert!(
-            !child_dir.join("eliot-testd.admitted-attempt.json").exists(),
-            "failed testd launch reaps its material and releases the slot"
-        );
-        assert!(matches!(
-            reconcile_launched_testd_attempt(
-                &kernel,
-                "job-dispatch-noexec-1",
-                launch_material.request
-            )
-            .expect("reconcile"),
-            ReconcileLaunchedOutcome::Unknown { .. }
-        ));
-
-        // 7. Doctor prepare without its composed side fails closed before
-        // any file or record.
-        let doctor_material = DoctorLaunchMaterial {
-            attempt: &shape_valid_doctor_request(),
-            request_json: &serde_json::json!({}),
-            manifest_json: &serde_json::json!({"manifest": "test"}),
-            executable: &child_dir.join("eliot-doctor.exe"),
-            executable_sha256: &"cd".repeat(32),
-            working_directory: &child_dir,
-        };
-        assert!(matches!(
-            prepare_doctor_launch(&kernel, &doctor_material, now_nanos),
-            Err(DispatchLaunchError::Uncomposed(_))
-        ));
-        assert!(matches!(
-            launch_admitted_doctor_attempt(&kernel, &doctor_material, now_nanos).await,
-            Err(DispatchLaunchError::Uncomposed(_))
-        ));
-        assert!(
-            !child_dir
-                .join("eliot-doctor.dispatched-attempt.json")
-                .exists()
-        );
-
-        // 8. The production Doctor side composes once through the durable
-        // Kernel-owned ledger plus the installed-health-probe registry: the
-        // advertisement flips, and a second composition fails closed
-        // instead of replacing live authority. This runs last because the
-        // earlier steps prove the uncomposed fail-closed shape.
+    /// DISPATCH-LIVE doctor image (Implements #461): the real `eliot-doctor`
+    /// image is staged byte-identical under the test root and bound by its
+    /// real digest, then the admit gate refuses the shape-valid-but-empty
+    /// closed request typed. Requires the built child binary, so it runs
+    /// in TESTPHASE LIVE-DISPATCH-3 only.
+    #[tokio::test]
+    #[ignore = "live image: run in TESTPHASE LIVE-DISPATCH-3 after cargo build of the child binaries"]
+    async fn dispatch_contour_lifecycle_doctor_live_image() {
+        let root = temp_root("lifecycle-doctor-live");
+        let kernel = ready_kernel(&root);
+        // Minimal contour for isolation: the contour cell is process-global
+        // set-once state, so tolerate a prior composition when this test
+        // shares its process with the in-process lifecycle test.
+        if let Err(error) = compose_dispatch_contour(PRINCIPAL.to_owned()) {
+            assert!(
+                matches!(error, DispatchLaunchError::AlreadyComposed(_)),
+                "compose contour: {error}"
+            );
+        }
         let doctor_dir = root.join("doctor-ledger");
         std::fs::create_dir_all(&doctor_dir).expect("doctor ledger dir");
         let production_ledger = Arc::new(
@@ -4561,20 +4652,15 @@ mod tests {
         );
         let installed_doctor_digest =
             eliot_contracts::sha256_hex(b"eliot-doctor-installed-package-bytes");
-        compose_production_doctor_front_door(
-            Arc::clone(&production_ledger),
-            &installed_doctor_digest,
-        )
-        .expect("production doctor composition");
-        assert!(
-            doctor_repair_advertised(),
-            "composed doctor side must advertise repair"
-        );
-        assert!(matches!(
-            compose_production_doctor_front_door(production_ledger, &installed_doctor_digest),
-            Err(DispatchLaunchError::AlreadyComposed(_))
-        ));
-
+        if let Err(error) =
+            compose_production_doctor_front_door(production_ledger, &installed_doctor_digest)
+        {
+            assert!(
+                matches!(error, DispatchLaunchError::AlreadyComposed(_)),
+                "compose doctor side: {error}"
+            );
+        }
+        let now_nanos = 1_750_000_000_000_000_000u64;
         // 8b. DISPATCH-LIVE doctor image (kernel binary, Implements #461):
         // the real `eliot-doctor` image is staged byte-identical under this
         // test root and bound by its real digest, then the admit gate
@@ -4624,7 +4710,6 @@ mod tests {
                 .exists(),
             "refused doctor prepare writes no dispatch material"
         );
-
         let _ = std::fs::remove_dir_all(root);
     }
 
