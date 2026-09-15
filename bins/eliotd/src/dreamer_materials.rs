@@ -171,7 +171,8 @@ impl OrientationMaterialBudget {
 
     /// Checks that every claim fits the budget without resolving bytes.
     pub fn fits(&self, claims: &[AdmittedSourceClaim]) -> Result<(), DreamerMaterialsError> {
-        let count = u64::from(u32::try_from(claims.len()).map_err(|_| DreamerMaterialsError::Budget)?);
+        let count =
+            u64::from(u32::try_from(claims.len()).map_err(|_| DreamerMaterialsError::Budget)?);
         if count > u64::from(self.max_sources) {
             return Err(DreamerMaterialsError::BudgetExceeded);
         }
@@ -271,7 +272,10 @@ pub fn freeze_orientation_manifest(
     budget.fits(claims)?;
     let mut ordered: Vec<&AdmittedSourceClaim> = claims.iter().collect();
     ordered.sort_by(|left, right| left.source_handle.cmp(&right.source_handle));
-    if ordered.windows(2).any(|pair| pair[0].source_handle == pair[1].source_handle) {
+    if ordered
+        .windows(2)
+        .any(|pair| pair[0].source_handle == pair[1].source_handle)
+    {
         return Err(DreamerMaterialsError::DuplicateSource);
     }
     let mut total = 0_u64;
@@ -459,7 +463,10 @@ mod tests {
         let reordered = freeze_orientation_manifest(
             "scope-one",
             &fence,
-            &[test_claim("evidence-a", b"first-bytes"), test_claim("evidence-b", b"second-bytes")],
+            &[
+                test_claim("evidence-a", b"first-bytes"),
+                test_claim("evidence-b", b"second-bytes"),
+            ],
             &test_budget(),
         )?;
         assert_eq!(manifest.manifest_digest, reordered.manifest_digest);
@@ -501,16 +508,20 @@ mod tests {
             Err(DreamerMaterialsError::DigestShape)
         );
         assert_eq!(
-            freeze_orientation_manifest("  ", &fence, &[test_claim("evidence-a", b"bytes")], &budget)
-                .map(|_| ()),
+            freeze_orientation_manifest(
+                "  ",
+                &fence,
+                &[test_claim("evidence-a", b"bytes")],
+                &budget
+            )
+            .map(|_| ()),
             Err(DreamerMaterialsError::Scope)
         );
         Ok(())
     }
 
     #[test]
-    fn freeze_enforces_budget_before_any_resolution()
-    -> Result<(), Box<dyn std::error::Error>> {
+    fn freeze_enforces_budget_before_any_resolution() -> Result<(), Box<dyn std::error::Error>> {
         let fence = test_fence()?;
         let tight = OrientationMaterialBudget {
             max_sources: 1,
@@ -569,12 +580,8 @@ mod tests {
     }
 
     impl AnsweringReadPort {
-        fn query_result(
-            &self,
-            _scope: ScopeId,
-            _subject: &str,
-        ) -> Result<QueryResult, Box<dyn std::error::Error>> {
-            Ok(QueryResult {
+        fn query_result(&self, _scope: ScopeId, _subject: &str) -> QueryResult {
+            QueryResult {
                 intent: QueryIntent {
                     mode: QueryMode::Verification,
                     time_scope: "test window".to_owned(),
@@ -591,7 +598,7 @@ mod tests {
                     disposition: ProvenanceDisposition::Unavailable,
                 },
                 consistency: ReadConsistency::Eventual,
-            })
+            }
         }
     }
 
@@ -612,9 +619,7 @@ mod tests {
             if ctx.state_fence != self.fence {
                 return Err(ReadError::ResponseMismatch);
             }
-            self.query_result(scope, &subject).map_err(|error| {
-                ReadError::Store(error.to_string())
-            })
+            Ok(self.query_result(scope, &subject))
         }
 
         async fn projection_inputs(
@@ -652,7 +657,8 @@ mod tests {
     async fn resolution_verifies_fence_and_digest_over_live_port()
     -> Result<(), Box<dyn std::error::Error>> {
         let fence = test_fence()?;
-        let payload = serde_json::json!({"records": [{"capture_index": 0}], "subject": "evidence-a"});
+        let payload =
+            serde_json::json!({"records": [{"capture_index": 0}], "subject": "evidence-a"});
         let bytes = canonical_json_bytes(&payload)?;
         let claim = test_claim("evidence-a", &bytes);
         let scope = ScopeId::new("scope-one")?;
@@ -669,9 +675,14 @@ mod tests {
         }
         let mut wrong_digest = claim.clone();
         wrong_digest.expected_digest = sha256_hex(&altered);
-        assert_eq!(wrong_digest.expected_byte_length, claim.expected_byte_length);
         assert_eq!(
-            resolve_source_claim(&reads, &ctx, &scope, &wrong_digest).await.map(|_| ()),
+            wrong_digest.expected_byte_length,
+            claim.expected_byte_length
+        );
+        assert_eq!(
+            resolve_source_claim(&reads, &ctx, &scope, &wrong_digest)
+                .await
+                .map(|_| ()),
             Err(DreamerMaterialsError::DigestMismatch)
         );
         let other_fence = StateFence::new(
@@ -683,8 +694,12 @@ mod tests {
         );
         let stale_ctx = test_context(&other_fence)?;
         assert_eq!(
-            resolve_source_claim(&reads, &stale_ctx, &scope, &claim).await.map(|_| ()),
-            Err(DreamerMaterialsError::Resolution(ReadError::ResponseMismatch))
+            resolve_source_claim(&reads, &stale_ctx, &scope, &claim)
+                .await
+                .map(|_| ()),
+            Err(DreamerMaterialsError::Resolution(
+                ReadError::ResponseMismatch
+            ))
         );
         Ok(())
     }

@@ -120,10 +120,9 @@ impl DreamerJobQueue for KernelDreamerJobQueue<'_> {
             .await
             .map_err(kernel_port_error)
             .map_err(CompositionError::Kernel)?;
-        let response: DurableJobResponse =
-            serde_json::from_value(value).map_err(|error| {
-                CompositionError::Kernel(KernelPortError::Contract(error.to_string()))
-            })?;
+        let response: DurableJobResponse = serde_json::from_value(value).map_err(|error| {
+            CompositionError::Kernel(KernelPortError::Contract(error.to_string()))
+        })?;
         response
             .validate_for(&request)
             .map_err(|error| owner_error(format!("dreamer queue response: {error}")))?;
@@ -253,7 +252,9 @@ pub(crate) async fn submit_admitted_orientation<'a>(
         &input.budget,
     )
     .map_err(|error| materials_error(&error))?;
-    manifest.validate().map_err(|error| materials_error(&error))?;
+    manifest
+        .validate()
+        .map_err(|error| materials_error(&error))?;
     for claim in &input.materials {
         resolve_source_claim(reads, ctx, &input.scope, claim)
             .await
@@ -592,8 +593,7 @@ mod tests {
             context
                 .validate()
                 .map_err(|error| CompositionError::Owner(error.to_string()))?;
-            (self.respond)(&request)
-                .map_err(|error| CompositionError::Owner(error.to_string()))
+            (self.respond)(&request).map_err(|error| CompositionError::Owner(error.to_string()))
         }
     }
 
@@ -710,12 +710,22 @@ mod tests {
     #[tokio::test]
     async fn unready_governor_queues_nothing() -> TestResult {
         let fence = test_fence_at(1)?;
-        let (input, _) = submit_input(&fence, &[("evidence-a", serde_json::json!({"records": []}))])?;
+        let (input, _) = submit_input(
+            &fence,
+            &[("evidence-a", serde_json::json!({"records": []}))],
+        )?;
         let (ctx, reads, queue) = harness(&fence, queued_response)?;
-        let error = run_intake(CompositionReadiness::Constructing, &fence, &reads, &ctx, &input, &queue)
-            .await
-            .map(|_| ())
-            .map_err(|error| error.to_string());
+        let error = run_intake(
+            CompositionReadiness::Constructing,
+            &fence,
+            &reads,
+            &ctx,
+            &input,
+            &queue,
+        )
+        .await
+        .map(|_| ())
+        .map_err(|error| error.to_string());
         assert_eq!(error, Err("Governor is not ready".to_owned()));
         assert_eq!(queue_calls(&queue)?, 0);
         assert_eq!(read_calls(&reads)?, 0);
@@ -726,10 +736,21 @@ mod tests {
     async fn stale_fence_queues_nothing() -> TestResult {
         let admitted = test_fence_at(1)?;
         let stale = test_fence_at(2)?;
-        let (input, stored) = submit_input(&stale, &[("evidence-a", serde_json::json!({"records": []}))])?;
+        let (input, stored) = submit_input(
+            &stale,
+            &[("evidence-a", serde_json::json!({"records": []}))],
+        )?;
         let (ctx, mut reads, queue) = harness(&admitted, queued_response)?;
         reads.payloads = stored;
-        let outcome = run_intake(CompositionReadiness::Ready, &admitted, &reads, &ctx, &input, &queue).await;
+        let outcome = run_intake(
+            CompositionReadiness::Ready,
+            &admitted,
+            &reads,
+            &ctx,
+            &input,
+            &queue,
+        )
+        .await;
         assert!(outcome.is_err());
         assert_eq!(queue_calls(&queue)?, 0);
         assert_eq!(read_calls(&reads)?, 0);
@@ -748,7 +769,15 @@ mod tests {
         input.materials[0].expected_digest = sha256_hex(&altered);
         let (ctx, mut reads, queue) = harness(&fence, queued_response)?;
         reads.payloads = stored;
-        let outcome = run_intake(CompositionReadiness::Ready, &fence, &reads, &ctx, &input, &queue).await;
+        let outcome = run_intake(
+            CompositionReadiness::Ready,
+            &fence,
+            &reads,
+            &ctx,
+            &input,
+            &queue,
+        )
+        .await;
         assert!(outcome.is_err());
         assert_eq!(read_calls(&reads)?, 1);
         assert_eq!(queue_calls(&queue)?, 0);
@@ -768,12 +797,22 @@ mod tests {
             operation,
             JobOperationKind::Submit.as_str(),
         )?;
-        let (mut input, stored) =
-            submit_input(&fence, &[("evidence-a", serde_json::json!({"records": []}))])?;
+        let (mut input, stored) = submit_input(
+            &fence,
+            &[("evidence-a", serde_json::json!({"records": []}))],
+        )?;
         input.request = request;
         let (ctx, mut reads, queue) = harness(&fence, queued_response)?;
         reads.payloads = stored;
-        let outcome = run_intake(CompositionReadiness::Ready, &fence, &reads, &ctx, &input, &queue).await;
+        let outcome = run_intake(
+            CompositionReadiness::Ready,
+            &fence,
+            &reads,
+            &ctx,
+            &input,
+            &queue,
+        )
+        .await;
         assert!(outcome.is_err());
         assert_eq!(queue_calls(&queue)?, 0);
         assert_eq!(read_calls(&reads)?, 0);
@@ -797,12 +836,22 @@ mod tests {
             JobOperationKind::Status.as_str(),
         )?;
         request.validate()?;
-        let (mut input, stored) =
-            submit_input(&fence, &[("evidence-a", serde_json::json!({"records": []}))])?;
+        let (mut input, stored) = submit_input(
+            &fence,
+            &[("evidence-a", serde_json::json!({"records": []}))],
+        )?;
         input.request = request;
         let (ctx, mut reads, queue) = harness(&fence, queued_response)?;
         reads.payloads = stored;
-        let outcome = run_intake(CompositionReadiness::Ready, &fence, &reads, &ctx, &input, &queue).await;
+        let outcome = run_intake(
+            CompositionReadiness::Ready,
+            &fence,
+            &reads,
+            &ctx,
+            &input,
+            &queue,
+        )
+        .await;
         assert!(outcome.is_err());
         assert_eq!(queue_calls(&queue)?, 0);
         assert_eq!(read_calls(&reads)?, 0);
@@ -812,12 +861,22 @@ mod tests {
     #[tokio::test]
     async fn admitted_intake_queues_once_and_binds_queued() -> TestResult {
         let fence = test_fence_at(1)?;
-        let (input, stored) = submit_input(&fence, &[("evidence-a", serde_json::json!({"records": [1]}))])?;
+        let (input, stored) = submit_input(
+            &fence,
+            &[("evidence-a", serde_json::json!({"records": [1]}))],
+        )?;
         let (ctx, mut reads, queue) = harness(&fence, queued_response)?;
         reads.payloads = stored;
-        let response = run_intake(CompositionReadiness::Ready, &fence, &reads, &ctx, &input, &queue)
-            .await
-            .map_err(|error| error.to_string())?;
+        let response = run_intake(
+            CompositionReadiness::Ready,
+            &fence,
+            &reads,
+            &ctx,
+            &input,
+            &queue,
+        )
+        .await
+        .map_err(|error| error.to_string())?;
         assert_eq!(response.state, JobState::Queued);
         assert_eq!(response.job_id.as_str(), "job-1");
         response.validate_for(&input.request)?;
@@ -835,10 +894,21 @@ mod tests {
             Ok(response)
         }
         let fence = test_fence_at(1)?;
-        let (input, stored) = submit_input(&fence, &[("evidence-a", serde_json::json!({"records": [1]}))])?;
+        let (input, stored) = submit_input(
+            &fence,
+            &[("evidence-a", serde_json::json!({"records": [1]}))],
+        )?;
         let (ctx, mut reads, queue) = harness(&fence, foreign)?;
         reads.payloads = stored;
-        let outcome = run_intake(CompositionReadiness::Ready, &fence, &reads, &ctx, &input, &queue).await;
+        let outcome = run_intake(
+            CompositionReadiness::Ready,
+            &fence,
+            &reads,
+            &ctx,
+            &input,
+            &queue,
+        )
+        .await;
         assert!(outcome.is_err());
         assert_eq!(queue_calls(&queue)?, 1);
         Ok(())
@@ -847,10 +917,21 @@ mod tests {
     #[tokio::test]
     async fn non_queued_queue_answer_is_rejected() -> TestResult {
         let fence = test_fence_at(1)?;
-        let (input, stored) = submit_input(&fence, &[("evidence-a", serde_json::json!({"records": [1]}))])?;
+        let (input, stored) = submit_input(
+            &fence,
+            &[("evidence-a", serde_json::json!({"records": [1]}))],
+        )?;
         let (ctx, mut reads, queue) = harness(&fence, leased_response)?;
         reads.payloads = stored;
-        let outcome = run_intake(CompositionReadiness::Ready, &fence, &reads, &ctx, &input, &queue).await;
+        let outcome = run_intake(
+            CompositionReadiness::Ready,
+            &fence,
+            &reads,
+            &ctx,
+            &input,
+            &queue,
+        )
+        .await;
         assert!(outcome.is_err());
         assert_eq!(queue_calls(&queue)?, 1);
         Ok(())
