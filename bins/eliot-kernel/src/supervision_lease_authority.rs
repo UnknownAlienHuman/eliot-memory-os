@@ -19,6 +19,12 @@ use eliot_platform_windows::{
     protected_program_data_root,
 };
 use eliot_process::EliotdLiveSupervisionEvidence;
+#[cfg(windows)]
+use eliot_runtime_contracts::{
+    DaemonSupervisionCurrentState, DaemonSupervisionHeartbeatError,
+    DaemonSupervisionRenewalDecision, DaemonSupervisionRenewalOutcome,
+    DaemonSupervisionRenewalReceipt,
+};
 use eliot_runtime_contracts::{
     Ed25519SupervisionLeaseSigner, LeaseState, ProvisionedSupervisionAuthority, SupervisionLease,
     SupervisionLeaseActiveStateBinding, SupervisionLeaseError, SupervisionLeasePredecessorIdentity,
@@ -32,6 +38,8 @@ use crate::KernelBuildError;
 use crate::SupervisionLeaseAuthorityConfig;
 #[cfg(windows)]
 use crate::daemon_supervision::DaemonSupervisionContour;
+#[cfg(windows)]
+use crate::daemon_supervision::DaemonSupervisionProgressState;
 
 #[cfg(windows)]
 use super::sha256_hex;
@@ -729,4 +737,191 @@ pub(super) fn supervision_binding_matches_contour(
         && binding.generation_binding == contour.generation_binding
         && binding.state_fence == contour.state_fence
         && binding.wake_policy == incarnation.wake_policy)
+}
+
+// ============================================================================
+// Wave-2 progress renewal surface (issue #88): typed refusal taxonomy,
+// CurrentState built from the exact ORS predecessor, and renewal receipts.
+// The pure join (`evaluate_daemon_supervision_renewal`) decides; these
+// helpers bind its inputs to durable Kernel authority and assemble its
+// outputs without adding a second timing owner or a health-based renewal.
+
+/// Typed progress-renewal failure: durable authority errors stay distinct
+/// from contract-join refusals so `ReconciliationRequired` (a decision) and
+/// `Expired` / `IDENTITY_CONFLICT` (typed refusals) surface instead of
+/// collapsing into strings.
+#[cfg(windows)]
+#[derive(Debug)]
+pub(crate) enum SupervisionProgressRenewalError {
+    /// Durable authority, ORS, or configuration failure.
+    Authority(SupervisionLeaseAuthorityError),
+    /// Contract-join refusal (`Expired`, `IDENTITY_CONFLICT`, predecessor /
+    /// lineage / cursor / gap reasons).
+    Heartbeat(DaemonSupervisionHeartbeatError),
+}
+
+#[cfg(windows)]
+impl fmt::Display for SupervisionProgressRenewalError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Authority(error) => write!(formatter, "supervision progress authority: {error}"),
+            Self::Heartbeat(error) => write!(formatter, "supervision progress refused: {error}"),
+        }
+    }
+}
+
+#[cfg(windows)]
+impl std::error::Error for SupervisionProgressRenewalError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Authority(error) => Some(error),
+            Self::Heartbeat(error) => Some(error),
+        }
+    }
+}
+
+#[cfg(windows)]
+impl From<OrsError> for SupervisionProgressRenewalError {
+    fn from(error: OrsError) -> Self {
+        Self::Authority(SupervisionLeaseAuthorityError::from(error))
+    }
+}
+
+#[cfg(windows)]
+impl From<SupervisionLeaseAuthorityError> for SupervisionProgressRenewalError {
+    fn from(error: SupervisionLeaseAuthorityError) -> Self {
+        Self::Authority(error)
+    }
+}
+
+#[cfg(windows)]
+impl From<DaemonSupervisionHeartbeatError> for SupervisionProgressRenewalError {
+    fn from(error: DaemonSupervisionHeartbeatError) -> Self {
+        Self::Heartbeat(error)
+    }
+}
+
+/// Builds the exact renewal-join state from the durable ORS predecessor plus
+/// Kernel-owned lineage (contour) and progress continuity (tracker).
+///
+/// The predecessor proof is the exact current snapshot (lease, record,
+/// revision, receipt, envelope digests); the lease window is the durable
+/// binding window. A non-active head fails closed here, and an unadmitted
+/// boot/session binding is a configuration refusal, never a silent default.
+/// `ReconciliationRequired` and `Expired` then surface from the join itself.
+#[cfg(windows)]
+#[allow(
+    clippy::too_many_lines,
+    reason = "CurrentState assembly must bind every predecessor, lineage, window, and progress field explicitly"
+)]
+pub(super) fn daemon_supervision_current_state(
+    snapshot: &SupervisionLeaseSnapshot,
+    contour: &DaemonSupervisionContour,
+    progress: &DaemonSupervisionProgressState,
+) -> Result<DaemonSupervisionCurrentState, SupervisionLeaseAuthorityError> {
+    snapshot
+        .validate()
+        .map_err(SupervisionLeaseAuthorityError::Ors)?;
+    if snapshot.record.state != LeaseState::Active
+        || snapshot.record.projection != eliot_ors::SupervisionLeaseProjection::Active
+    {
+        return Err(SupervisionLeaseAuthorityError::Ors(
+            OrsError::SupervisionLeaseBindingMismatch,
+        ));
+    }
+    let envelope_sha256 = snapshot
+        .record
+        .artifact
+        .envelope_digest()
+        .map_err(|error| SupervisionLeaseAuthorityError::Contract(error.to_string()))?;
+    let boot_id = progress.boot_id.clone().ok_or_else(|| {
+        SupervisionLeaseAuthorityError::Configuration(
+            "daemon progress boot binding is not admitted".to_owned(),
+        )
+    })?;
+    let transport_session_evidence =
+        progress.transport_session_evidence.clone().ok_or_else(|| {
+            SupervisionLeaseAuthorityError::Configuration(
+                "daemon progress transport-session binding is not admitted".to_owned(),
+            )
+        })?;
+    let current = DaemonSupervisionCurrentState {
+        predecessor: SupervisionLeasePredecessorProof {
+            lease_id: snapshot.record.lease_id.as_str().to_owned(),
+            record_id: snapshot.record.record_id.as_str().to_owned(),
+            lease_revision: snapshot.record.revision,
+            receipt_sha256: snapshot.receipt.receipt_sha256.clone(),
+            envelope_sha256,
+        },
+        installation_id: contour.incarnation.installation_id.clone(),
+        activation_id: contour.incarnation.activation_id.clone(),
+        activation_generation: contour.activation.generation,
+        kernel_epoch: contour.activation.authority_epoch.clone(),
+        state_fence: contour.state_fence.clone(),
+        generation_binding: contour.generation_binding.clone(),
+        boot_id,
+        transport_session_evidence,
+        lease_issued_at_ms: snapshot.record.binding.issued_at_ms,
+        lease_expires_at_ms: snapshot.record.binding.expires_at_ms,
+        accepted_cursors: progress.accepted_cursors.clone(),
+        admitted_idle_contract: progress.admitted_idle_contract.clone(),
+        last_monotonic_ms: progress.last_monotonic_ms,
+        last_request_id: progress.last_request_id.clone(),
+        last_observation_sha256: progress.last_observation_sha256.clone(),
+        last_successor_revision: progress.last_successor_revision,
+        reconciliation_pending: progress.reconciliation_pending,
+    };
+    current
+        .validate()
+        .map_err(|error| SupervisionLeaseAuthorityError::Contract(error.to_string()))?;
+    Ok(current)
+}
+
+/// Assembles the durable renewal receipt for a join decision.
+///
+/// A `RENEWED` decision requires the committed successor receipt digest and
+/// the published live-receipt digest together; every other outcome carries
+/// neither, so a blocked renewal (`DegradedNoRenewal`, `ReconciliationRequired`,
+/// `NotDue`, `ExactReplay`) can never be mistaken for advanced authority.
+/// The caller supplies the live-receipt digest after publication; wave 3
+/// (MGR02) owns that publication step on the `ProbeReady` path.
+#[cfg(windows)]
+pub(super) fn daemon_renewal_receipt_for_decision(
+    decision: &DaemonSupervisionRenewalDecision,
+    successor_receipt_sha256: Option<String>,
+    live_receipt_sha256: Option<String>,
+) -> Result<DaemonSupervisionRenewalReceipt, SupervisionLeaseAuthorityError> {
+    decision
+        .validate()
+        .map_err(|error| SupervisionLeaseAuthorityError::Contract(error.to_string()))?;
+    let digests_coherent = match decision.outcome {
+        DaemonSupervisionRenewalOutcome::Renewed => {
+            successor_receipt_sha256.is_some() && live_receipt_sha256.is_some()
+        }
+        DaemonSupervisionRenewalOutcome::ExactReplay
+        | DaemonSupervisionRenewalOutcome::NotDue
+        | DaemonSupervisionRenewalOutcome::DegradedNoRenewal
+        | DaemonSupervisionRenewalOutcome::ReconciliationRequired => {
+            successor_receipt_sha256.is_none() && live_receipt_sha256.is_none()
+        }
+    };
+    if !digests_coherent {
+        return Err(SupervisionLeaseAuthorityError::Configuration(
+            "renewal receipt digests do not match the decision outcome".to_owned(),
+        ));
+    }
+    let receipt = DaemonSupervisionRenewalReceipt {
+        request_id: decision.request_id.clone(),
+        lease_id: decision.lease_id.clone(),
+        outcome: decision.outcome,
+        predecessor_revision: decision.predecessor_revision,
+        successor_revision: decision.successor_revision,
+        predecessor_receipt_sha256: decision.predecessor_receipt_sha256.clone(),
+        successor_receipt_sha256,
+        live_receipt_sha256,
+    };
+    receipt
+        .validate()
+        .map_err(|error| SupervisionLeaseAuthorityError::Contract(error.to_string()))?;
+    Ok(receipt)
 }

@@ -26,8 +26,13 @@ use eliot_process::{
     ProcessTreeId, ResourceLimits, SessionId,
 };
 use eliot_runtime_contracts::{
-    ModuleContract, RegisteredActivityWakePolicy, SupervisionJournalEpoch,
-    SupervisionLeaseIncarnationBinding, SupervisionObservationScope,
+    DAEMON_SUPERVISION_HEARTBEAT_CONTRACT_NAME, DAEMON_SUPERVISION_HEARTBEAT_CONTRACT_VERSION,
+    DAEMON_SUPERVISION_HEARTBEAT_SCHEMA, DaemonChannelCursor, DaemonHeartbeatHealth,
+    DaemonProgressChannel, DaemonProgressDisposition, DaemonProgressObservation,
+    DaemonSupervisionCurrentState, DaemonSupervisionHeartbeatError,
+    DaemonSupervisionRenewalOutcome, DaemonSupervisionRenewalRequest, HealthDimension,
+    ModuleContract, RegisteredActivityWakePolicy, SupervisionGenerationBinding,
+    SupervisionJournalEpoch, SupervisionLeaseIncarnationBinding, SupervisionObservationScope,
     SupervisionSealedKeyFileIdentity,
 };
 use eliot_store_api::{RevisionHead, RevisionKey};
@@ -5499,8 +5504,7 @@ async fn daemon_close_reconciles_by_original_identity_with_ors_readback() {
     let snapshot = kernel
         .generation_route_snapshot()
         .expect("generation route snapshot");
-    let scope =
-        eliot_kernel_core::RouteScope::new("daemon").expect("daemon route scope");
+    let scope = eliot_kernel_core::RouteScope::new("daemon").expect("daemon route scope");
     let route = snapshot.route(&scope).expect("active daemon route");
     assert_eq!(route.active_generation().value(), launch.generation.value());
     assert_eq!(
@@ -5533,4 +5537,296 @@ async fn daemon_close_reconciles_by_original_identity_with_ors_readback() {
     drop(gateway);
     drop(kernel);
     let _ = std::fs::remove_dir_all(root);
+}
+
+#[cfg(windows)]
+#[test]
+#[allow(
+    clippy::too_many_lines,
+    reason = "one focused renewal proof keeps its healthy/blocked/stale legs plus local fixtures in a single deterministic test"
+)]
+fn supervision_lease_renews_from_observed_progress_not_store_health() {
+    // Lease window `[1_000, 61_000)` with `renew_after_ms = 30_000`, so
+    // renewal is due exactly at `DUE_MS`.
+    const ISSUED_MS: u64 = 1_000;
+    const DUE_MS: u64 = 31_000;
+
+    fn test_digest(byte: char) -> String {
+        std::iter::repeat_n(byte, 64).collect()
+    }
+
+    fn test_generation(value: u64) -> ResourceGeneration {
+        ResourceGeneration::new(value).expect("test generation")
+    }
+
+    fn test_binding() -> SupervisionGenerationBinding {
+        SupervisionGenerationBinding {
+            target_id: "eliotd".to_owned(),
+            target_generation: test_generation(1),
+            module_id: "eliotd".to_owned(),
+            module_generation: test_generation(2),
+            process_id: "process-88-w2".to_owned(),
+            process_generation: test_generation(5),
+        }
+    }
+
+    fn test_predecessor() -> SupervisionLeasePredecessorProof {
+        SupervisionLeasePredecessorProof {
+            lease_id: "lease-88-w2".to_owned(),
+            record_id: "record-88-w2".to_owned(),
+            lease_revision: 7,
+            receipt_sha256: test_digest('d'),
+            envelope_sha256: test_digest('e'),
+        }
+    }
+
+    fn test_observation(id: &str) -> DaemonProgressObservation {
+        let kernel_epoch = test_epoch(4);
+        let activation_generation = test_generation(3);
+        DaemonProgressObservation {
+            schema: DAEMON_SUPERVISION_HEARTBEAT_SCHEMA.to_owned(),
+            contract_name: DAEMON_SUPERVISION_HEARTBEAT_CONTRACT_NAME.to_owned(),
+            contract_version: DAEMON_SUPERVISION_HEARTBEAT_CONTRACT_VERSION,
+            observation_id: id.to_owned(),
+            installation_id: "installation-1".to_owned(),
+            activation_id: "activation-1".to_owned(),
+            activation_generation,
+            generation_binding: test_binding(),
+            daemon_artifact_id: "eliotd-artifact-88-w2".to_owned(),
+            daemon_config_digest: test_digest('c'),
+            kernel_epoch: kernel_epoch.clone(),
+            state_fence: StateFence::new(kernel_epoch, activation_generation),
+            boot_id: "boot-88-w2".to_owned(),
+            transport_session_evidence: "session-88-w2".to_owned(),
+            transport_connection_evidence: "connection-88-w2".to_owned(),
+            lease_id: "lease-88-w2".to_owned(),
+            lease_revision: 7,
+            predecessor_receipt_sha256: test_digest('d'),
+            progress_channel: DaemonProgressChannel::Claim,
+            progress_cursor: 8,
+            previous_progress_cursor: 7,
+            observed_monotonic_ms: 2_000,
+            observed_wall_ms: DUE_MS,
+            disposition: DaemonProgressDisposition::ForwardProgress,
+            idle_contract_id: None,
+            waiting_on_dependency: None,
+            evidence_refs: vec!["process:process-88-w2:alive".to_owned()],
+            health: DaemonHeartbeatHealth::healthy(),
+            watchdog_covered: true,
+        }
+    }
+
+    fn test_request(id: &str) -> DaemonSupervisionRenewalRequest {
+        DaemonSupervisionRenewalRequest {
+            request_id: id.to_owned(),
+            observation: test_observation(id),
+            predecessor: test_predecessor(),
+        }
+    }
+
+    fn test_current() -> DaemonSupervisionCurrentState {
+        let kernel_epoch = test_epoch(4);
+        let activation_generation = test_generation(3);
+        DaemonSupervisionCurrentState {
+            predecessor: test_predecessor(),
+            installation_id: "installation-1".to_owned(),
+            activation_id: "activation-1".to_owned(),
+            activation_generation,
+            kernel_epoch: kernel_epoch.clone(),
+            state_fence: StateFence::new(kernel_epoch, activation_generation),
+            generation_binding: test_binding(),
+            boot_id: "boot-88-w2".to_owned(),
+            transport_session_evidence: "session-88-w2".to_owned(),
+            lease_issued_at_ms: ISSUED_MS,
+            lease_expires_at_ms: ISSUED_MS + 60_000,
+            accepted_cursors: vec![DaemonChannelCursor {
+                channel: DaemonProgressChannel::Claim,
+                cursor: 7,
+            }],
+            admitted_idle_contract: None,
+            last_monotonic_ms: 1_500,
+            last_request_id: None,
+            last_observation_sha256: None,
+            last_successor_revision: None,
+            reconciliation_pending: false,
+        }
+    }
+
+    fn test_progress() -> DaemonSupervisionProgressState {
+        DaemonSupervisionProgressState {
+            accepted_cursors: vec![DaemonChannelCursor {
+                channel: DaemonProgressChannel::Claim,
+                cursor: 7,
+            }],
+            admitted_idle_contract: None,
+            boot_id: Some("boot-88-w2".to_owned()),
+            transport_session_evidence: Some("session-88-w2".to_owned()),
+            last_monotonic_ms: 1_500,
+            last_request_id: None,
+            last_observation_sha256: None,
+            last_successor_revision: None,
+            missed_renewals: 0,
+            last_eligible_observation_ms: None,
+            reconciliation_pending: false,
+        }
+    }
+
+    // Healthy observed progress renews exactly one revision. The decision
+    // itself records nothing durable yet: monotonic evidence moves forward
+    // with no miss counted, and the commit half records the renewal.
+    // Wave-2 owner timing (Implements #88): the Kernel renewal policy is the
+    // single timing owner and preserves the established 60s validity / 30s
+    // renewal windows with no parallel defaults.
+    assert_eq!(SUPERVISION_LEASE_RENEWAL_POLICY.validity_ms, 60_000);
+    assert_eq!(SUPERVISION_LEASE_RENEWAL_POLICY.renew_after_ms, 30_000);
+    SUPERVISION_LEASE_RENEWAL_POLICY
+        .validate()
+        .expect("owner renewal policy is coherent");
+    assert_eq!(
+        DaemonSupervisionProgressState::stale_horizon_ms(&SUPERVISION_LEASE_RENEWAL_POLICY),
+        90_000
+    );
+    let mut progress = test_progress();
+    let decision = KernelComposition::decide_daemon_supervision_progress_renewal(
+        &test_request("obs-88-w2-1"),
+        &test_current(),
+        &mut progress,
+        &SUPERVISION_LEASE_RENEWAL_POLICY,
+        DUE_MS,
+    )
+    .expect("healthy progress renews");
+    assert_eq!(decision.outcome, DaemonSupervisionRenewalOutcome::Renewed);
+    assert_eq!(decision.predecessor_revision, 7);
+    assert_eq!(decision.successor_revision, Some(8));
+    assert_eq!(progress.last_monotonic_ms, 2_000);
+    assert_eq!(progress.missed_renewals, 0);
+    assert_eq!(progress.boot_id.as_deref(), Some("boot-88-w2"));
+    let recorded = test_observation("obs-88-w2-1");
+    let recorded_sha256 = recorded.digest().expect("recorded observation digest");
+    progress.record_renewed(&recorded, recorded_sha256.clone(), 8, DUE_MS);
+    assert!(progress.accepted_cursors.contains(&DaemonChannelCursor {
+        channel: DaemonProgressChannel::Claim,
+        cursor: 8,
+    }));
+    assert_eq!(progress.last_request_id.as_deref(), Some("obs-88-w2-1"));
+    assert_eq!(
+        progress.last_observation_sha256.as_deref(),
+        Some(recorded_sha256.as_str())
+    );
+    assert_eq!(progress.last_successor_revision, Some(8));
+    assert_eq!(progress.last_eligible_observation_ms, Some(DUE_MS));
+    // The renewal receipt advances the live receipt once with the committed
+    // successor; a health-only (`StoreHealth`) signal has no observation
+    // identity and can never reach this route.
+    let successor_digest = test_digest('f');
+    let live_digest = test_digest('9');
+    let receipt = daemon_renewal_receipt_for_decision(
+        &decision,
+        Some(successor_digest.clone()),
+        Some(live_digest.clone()),
+    )
+    .expect("renewed receipt carries both digests");
+    assert_eq!(receipt.successor_revision, Some(8));
+    assert_eq!(
+        receipt.successor_receipt_sha256.as_deref(),
+        Some(successor_digest.as_str())
+    );
+    assert_eq!(
+        receipt.live_receipt_sha256.as_deref(),
+        Some(live_digest.as_str())
+    );
+
+    // Exact replay of the recorded renewal echoes without a new transition;
+    // a mutated retry under the same identity reports IDENTITY_CONFLICT.
+    let mut replayed = test_current();
+    replayed.last_request_id = progress.last_request_id.clone();
+    replayed.last_observation_sha256 = progress.last_observation_sha256.clone();
+    replayed.last_successor_revision = progress.last_successor_revision;
+    let mut replay_progress = progress.clone();
+    let replay = KernelComposition::decide_daemon_supervision_progress_renewal(
+        &test_request("obs-88-w2-1"),
+        &replayed,
+        &mut replay_progress,
+        &SUPERVISION_LEASE_RENEWAL_POLICY,
+        DUE_MS,
+    )
+    .expect("exact replay echoes the recorded successor");
+    assert_eq!(replay.outcome, DaemonSupervisionRenewalOutcome::ExactReplay);
+    assert_eq!(replay.successor_revision, Some(8));
+    let mut mutated = test_request("obs-88-w2-1");
+    mutated.observation.progress_cursor = 9;
+    mutated.observation.previous_progress_cursor = 8;
+    let mut conflict_progress = progress.clone();
+    assert!(matches!(
+        KernelComposition::decide_daemon_supervision_progress_renewal(
+            &mutated,
+            &replayed,
+            &mut conflict_progress,
+            &SUPERVISION_LEASE_RENEWAL_POLICY,
+            DUE_MS,
+        ),
+        Err(SupervisionProgressRenewalError::Heartbeat(
+            DaemonSupervisionHeartbeatError::IdentityConflict { .. }
+        ))
+    ));
+
+    // A Failed dimension on degraded progress blocks renewal fail-closed: the
+    // refusal is reported as DegradedNoRenewal with no successor and no
+    // receipt digests, never skipped. Three consecutive blocks trip the
+    // stale-cursor horizon into Expired.
+    let mut degraded_progress = test_progress();
+    for attempt in 0..3 {
+        let id = format!("obs-88-w2-blocked-{attempt}");
+        let mut blocked_request = test_request(&id);
+        blocked_request.observation.disposition = DaemonProgressDisposition::DegradedProgress;
+        blocked_request.observation.health.transport = HealthDimension::Failed;
+        blocked_request.observation.progress_cursor = 7;
+        blocked_request.observation.previous_progress_cursor = 7;
+        let blocked = KernelComposition::decide_daemon_supervision_progress_renewal(
+            &blocked_request,
+            &test_current(),
+            &mut degraded_progress,
+            &SUPERVISION_LEASE_RENEWAL_POLICY,
+            DUE_MS,
+        );
+        if attempt < 2 {
+            let blocked_decision = blocked.expect("degraded progress is reported, not renewed");
+            assert_eq!(
+                blocked_decision.outcome,
+                DaemonSupervisionRenewalOutcome::DegradedNoRenewal
+            );
+            assert_eq!(blocked_decision.successor_revision, None);
+            if attempt == 0 {
+                let blocked_receipt =
+                    daemon_renewal_receipt_for_decision(&blocked_decision, None, None)
+                        .expect("blocked renewal carries no digests");
+                assert_eq!(blocked_receipt.successor_revision, None);
+                assert_eq!(blocked_receipt.successor_receipt_sha256, None);
+                assert_eq!(blocked_receipt.live_receipt_sha256, None);
+            }
+        } else {
+            assert!(matches!(
+                blocked,
+                Err(SupervisionProgressRenewalError::Heartbeat(
+                    DaemonSupervisionHeartbeatError::SupervisionLeaseExpired
+                ))
+            ));
+        }
+    }
+    assert_eq!(degraded_progress.missed_renewals, 3);
+
+    // A stale-expired lease never auto-revives: even healthy observed
+    // progress now fails closed and requires a new admission.
+    assert!(matches!(
+        KernelComposition::decide_daemon_supervision_progress_renewal(
+            &test_request("obs-88-w2-2"),
+            &test_current(),
+            &mut degraded_progress,
+            &SUPERVISION_LEASE_RENEWAL_POLICY,
+            DUE_MS,
+        ),
+        Err(SupervisionProgressRenewalError::Heartbeat(
+            DaemonSupervisionHeartbeatError::SupervisionLeaseExpired
+        ))
+    ));
 }
