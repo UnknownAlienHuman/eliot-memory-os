@@ -105,8 +105,17 @@ pub enum ContextInputsError {
 /// named-read parameters: `epistemic_position` is the required `position`
 /// selector of `GetCurrentEpistemicPosition`, and `evidence_subject` plus
 /// `evidence_max_records` are the required `subject`/`max_records` selectors
-/// of `GetEvidencePack`. `GetUnderstandingProjectionInputs` declares no
-/// parameters, so cue and negative-memory roles share its empty selector.
+/// of `GetEvidencePack`. The store catalogue (T11.3 store activation) declares
+/// bounded exact selectors for the remaining reconstruction reads
+/// (`task_id`+`max_records` for `GetTaskState`, optional
+/// `problem_id`+`max_records` for `GetAttentionAndProblems`,
+/// `selector`+`max_records` for `GetUnderstandingProjectionInputs`,
+/// `skill_id`+`max_records` for `GetCapabilityEvidenceState`); this
+/// reconstruction currently acquires those roles with no parameters, so
+/// against the real catalogue they resolve to per-role `Unavailable`
+/// (fail-closed) until a follow-up threads the closed selectors. Cue and
+/// negative-memory roles share the one understanding-projection acquisition;
+/// only the candidate-stage interpretation differs.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ContextReconstructionRequest {

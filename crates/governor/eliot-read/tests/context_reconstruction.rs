@@ -429,9 +429,12 @@ impl CanonicalReadClient for ReconstructionTableClient {
     ) -> Result<NamedReadResponse, StoreError> {
         request.validate()?;
         // The four T11.3 reads skip only the generated-catalogue pre-gate
-        // (the base manifest activates them in a Store-owned slice); every
-        // other production rule — capability, fence equality, scope
-        // declaration, closed selector shape — applies exactly.
+        // (this test double stands in for the Store-owned activation slice;
+        // production enforces the catalogue's bounded exact selectors
+        // `task_id`/`problem_id`/`selector`/`skill_id` plus `max_records`
+        // pre-dispatch); every other production rule — capability, fence
+        // equality, scope declaration, closed selector shape — applies
+        // exactly.
         if !matches!(
             request.operation,
             NamedReadOperation::GetTaskState
@@ -450,9 +453,10 @@ impl CanonicalReadClient for ReconstructionTableClient {
             field: "scope_id",
             reason: "reconstruction read requires scope_id",
         })?;
-        // Closed selector shape per the catalogue: the four T11.3 reads
-        // declare no parameters, so any supplied key (including an edge or
-        // graph selector) fails closed here before any record is touched.
+        // Closed selector shape for this test double: the four T11.3 reads
+        // take no parameters here (production requires the catalogue's
+        // bounded exact selectors), so any supplied key (including an edge
+        // or graph selector) fails closed here before any record is touched.
         match request.operation {
             NamedReadOperation::GetTaskState
             | NamedReadOperation::GetAttentionAndProblems
