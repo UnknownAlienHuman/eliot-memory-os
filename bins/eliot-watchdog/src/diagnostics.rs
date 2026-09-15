@@ -164,3 +164,75 @@ mod tests {
         assert_eq!(SUBSCRIBER_INSTALLED.get(), Some(&true));
     }
 }
+
+/// Inline unit coverage for the bounded diagnostic helpers (738/2-inline).
+///
+/// Issue #738 explicitly authorizes private-path cases to use inline tests
+/// beside an owned call site without exporting a production test API, so
+/// this module exercises the `pub(crate)` helpers (and the private
+/// `truncate_chars` they share) with minimal plain-value inputs. No
+/// production signature, visibility, dependency, or lint configuration is
+/// changed here.
+#[cfg(test)]
+mod diagnostics_unit_tests {
+    use super::*;
+
+    #[test]
+    fn diagnostic_detail_bound_matches_documented_ceiling() {
+        assert_eq!(DIAGNOSTIC_DETAIL_MAX_CHARS, 512);
+        assert_eq!(truncate_diagnostic_detail("plain"), "plain");
+        let long = "x".repeat(DIAGNOSTIC_DETAIL_MAX_CHARS + 4);
+        let truncated = truncate_diagnostic_detail(&long);
+        assert_eq!(truncated.chars().count(), DIAGNOSTIC_DETAIL_MAX_CHARS);
+        assert_eq!(truncated, "x".repeat(DIAGNOSTIC_DETAIL_MAX_CHARS));
+    }
+
+    #[test]
+    fn diagnostic_identity_bound_matches_documented_ceiling() {
+        assert_eq!(DIAGNOSTIC_IDENTITY_MAX_CHARS, 128);
+        assert_eq!(truncate_diagnostic_identity("plain"), "plain");
+        let long = "y".repeat(DIAGNOSTIC_IDENTITY_MAX_CHARS + 4);
+        let truncated = truncate_diagnostic_identity(&long);
+        assert_eq!(truncated.chars().count(), DIAGNOSTIC_IDENTITY_MAX_CHARS);
+        assert_eq!(
+            truncate_chars("plain", DIAGNOSTIC_IDENTITY_MAX_CHARS),
+            "plain"
+        );
+    }
+
+    #[test]
+    fn spool_error_observation_covers_documented_classes() {
+        assert_eq!(
+            spool_error_observation(&SpoolError::InvalidLease("missing".to_owned())),
+            "unavailable_or_invalid"
+        );
+        assert_eq!(
+            spool_error_observation(&SpoolError::LeaseStale("stale".to_owned())),
+            "stale"
+        );
+        assert_eq!(
+            spool_error_observation(&SpoolError::LeaseFenced("fenced".to_owned())),
+            "fenced"
+        );
+        assert_eq!(
+            spool_error_observation(&SpoolError::InvalidProtectedRoot),
+            "invalid_protected_root"
+        );
+        assert_eq!(
+            spool_error_observation(&SpoolError::Serialization("s".to_owned())),
+            "serialization"
+        );
+        assert_eq!(
+            spool_error_observation(&SpoolError::Database("d".to_owned())),
+            "database"
+        );
+        assert_eq!(
+            spool_error_observation(&SpoolError::Corrupt("c".to_owned())),
+            "corrupt"
+        );
+        assert_eq!(
+            spool_error_observation(&SpoolError::Io(std::io::Error::other("io"))),
+            "spool_io"
+        );
+    }
+}
