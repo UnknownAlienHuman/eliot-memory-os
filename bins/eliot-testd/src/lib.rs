@@ -30,6 +30,7 @@ pub use eliot_testd_core::{
 };
 
 pub mod kernel_client;
+pub mod testd_material;
 pub mod worker;
 pub use kernel_client::{
     KernelTestdIpcClient, TESTD_ADMISSION_ADVERTISED, TESTD_ADMISSION_OPERATION,
