@@ -83,7 +83,7 @@ pub use genesis_owner_packet::{
 mod native_worker_binding;
 pub use native_worker_binding::{
     NATIVE_WORKER_EXECUTABLE_BINDING_WIRE_ID, NATIVE_WORKER_EXECUTABLE_BINDING_WIRE_VERSION,
-    NativeWorkerExecutableBinding,
+    NativeWorkerExecutableBinding, process_invocation_digest_for,
 };
 
 /// The only application write port exposed to the daemon.
@@ -1872,6 +1872,113 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
         binding.binding_digest = digest;
         binding.validate().map_err(CompositionError::Recovery)?;
         Ok(binding)
+    }
+
+    /// Publishes one versioned Governor-owned executable binding projection
+    /// (T9-01 M1) with the R1 production `process_invocation_digest` derived
+    /// from the exact process invocation value.
+    ///
+    /// This is the production producer for the dispatch join: it
+    /// canonicalizes the exact invocation JSON with the same
+    /// `canonical_json_bytes` + `sha256_hex` the wire uses (via
+    /// [`process_invocation_digest_for`]), so the published binding carries
+    /// the real invocation digest, never a placeholder. Canonicalization
+    /// failure fails closed as [`CompositionError::Recovery`]; no digest is
+    /// synthesized. Every other field follows
+    /// [`Self::publish_native_worker_binding`] exactly, including the
+    /// sibling-`commit_canonical` correlation contract (`operation_id` /
+    /// `canonical_request_hash` / `state_fence`).
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "R1 producer joins every T9.md 3.2 denominator field plus the exact invocation value in one versioned projection"
+    )]
+    pub fn publish_native_worker_binding_for_invocation(
+        &self,
+        claim_id: &str,
+        registration_id: &str,
+        installation_id: &str,
+        task_id: &str,
+        work_unit_id: &str,
+        work_scope_id: &str,
+        attempt: u32,
+        lease_id: &str,
+        operation_id: &str,
+        canonical_request_hash: &str,
+        principal_id: &str,
+        session_id: &str,
+        worker_generation: u64,
+        process_tree_id: &str,
+        process_generation: u64,
+        process_fence: &str,
+        route_ref: &str,
+        adapter_id: &str,
+        adapter_revision: u64,
+        artifact_digest: &str,
+        config_digest: &str,
+        protocol_digest: &str,
+        command_ref: &str,
+        facet_manifest_ref: &str,
+        introduction_refs: Vec<String>,
+        supporting_grant_refs: Vec<String>,
+        grant_graph_revision: u64,
+        effective_ceiling: eliot_store_api::EffectClass,
+        credential_refs: Vec<String>,
+        resource_refs: Vec<String>,
+        replay_stream_id: &str,
+        launch_nonce: &str,
+        process_invocation: &serde_json::Value,
+        deadline_unix_ms: u64,
+        expires_at_unix_ms: u64,
+        plan_id: &str,
+        plan_revision: &str,
+        task_revision: u64,
+        config_snapshot_digest: &str,
+        admission_revision_ref: &str,
+    ) -> Result<NativeWorkerExecutableBinding, CompositionError> {
+        let derived = native_worker_binding::process_invocation_digest_for(process_invocation)
+            .map_err(CompositionError::Recovery)?;
+        self.publish_native_worker_binding(
+            claim_id,
+            registration_id,
+            installation_id,
+            task_id,
+            work_unit_id,
+            work_scope_id,
+            attempt,
+            lease_id,
+            operation_id,
+            canonical_request_hash,
+            principal_id,
+            session_id,
+            worker_generation,
+            process_tree_id,
+            process_generation,
+            process_fence,
+            route_ref,
+            adapter_id,
+            adapter_revision,
+            artifact_digest,
+            config_digest,
+            protocol_digest,
+            command_ref,
+            facet_manifest_ref,
+            introduction_refs,
+            supporting_grant_refs,
+            grant_graph_revision,
+            effective_ceiling,
+            credential_refs,
+            resource_refs,
+            replay_stream_id,
+            launch_nonce,
+            &derived,
+            deadline_unix_ms,
+            expires_at_unix_ms,
+            plan_id,
+            plan_revision,
+            task_revision,
+            config_snapshot_digest,
+            admission_revision_ref,
+        )
     }
 
     /// Re-reads Kernel-owned owner projections and publishes a coherent live
@@ -4997,5 +5104,113 @@ mod tests {
             error,
             CompositionError::Authority(P07PortError::Unavailable)
         ));
+    }
+
+    fn r1_publish(
+        composition: &GovernorComposition<FakeKernel>,
+        claim_id: &str,
+        operation_id: &str,
+        invocation: &serde_json::Value,
+    ) -> NativeWorkerExecutableBinding {
+        composition
+            .publish_native_worker_binding_for_invocation(
+                claim_id,
+                "reg-1",
+                "install-1",
+                "task-1",
+                "work-1",
+                "scope:work",
+                1,
+                "lease-1",
+                operation_id,
+                &"c".repeat(64),
+                "principal-1",
+                "session-1",
+                1,
+                "proc-tree-1",
+                1,
+                "process-fence-1",
+                "route-1",
+                "adapter-1",
+                1,
+                &"d".repeat(64),
+                &"e".repeat(64),
+                &"f".repeat(64),
+                "cmd-1",
+                "facet-1",
+                vec!["intro-1".to_owned()],
+                vec!["grant-1".to_owned()],
+                1,
+                eliot_store_api::EffectClass::ReversibleMutation,
+                vec!["cred-1".to_owned()],
+                vec!["res-1".to_owned()],
+                "stream-1",
+                "0123456789abcdef",
+                invocation,
+                100,
+                200,
+                "plan:current",
+                "1",
+                1,
+                &"b".repeat(64),
+                "adm-1",
+            )
+            .expect("R1 publish builds")
+    }
+
+    #[test]
+    fn r1_producer_derives_invocation_digest_from_exact_bytes() {
+        // R1 production producer (Implements #22): the dispatch join carries
+        // the real invocation digest derived from the exact invocation JSON,
+        // never a placeholder. The caller still commits a sibling
+        // `PreparedTransition` via `commit_canonical` correlated by
+        // `operation_id` / `canonical_request_hash` / `state_fence`.
+        let observed = snapshot();
+        let expected =
+            KernelGenerationExpectation::from_snapshot(&observed).expect("expectation");
+        let composition = GovernorComposition::new(
+            Arc::new(activation_fake(&observed)),
+            None,
+            &expected,
+            QueueLimits::default(),
+        )
+        .expect("composition");
+        let invocation = serde_json::json!({
+            "claim_id": "claim-r1-1",
+            "operation_id": "op-r1-1",
+            "argv": ["--check"],
+            "fence": {"generation": 1},
+        });
+        let derived = process_invocation_digest_for(&invocation).expect("derivation builds");
+        assert_eq!(derived.len(), 64);
+        let binding = r1_publish(&composition, "claim-r1-1", "op-r1-1", &invocation);
+        assert_eq!(
+            binding.process_invocation_digest, derived,
+            "published binding must carry the derived invocation digest"
+        );
+        binding.validate().expect("published binding validates");
+        // A mutated invocation derives a different digest, so the join gate
+        // observes the change instead of a stable placeholder.
+        let mutated = serde_json::json!({
+            "claim_id": "claim-r1-1",
+            "operation_id": "op-r1-1",
+            "argv": ["--other"],
+            "fence": {"generation": 1},
+        });
+        let mutated_digest =
+            process_invocation_digest_for(&mutated).expect("mutated derivation builds");
+        assert_ne!(
+            derived, mutated_digest,
+            "mutated invocation must derive a different digest"
+        );
+        let mutated_binding = r1_publish(&composition, "claim-r1-1", "op-r1-1", &mutated);
+        assert_eq!(
+            mutated_binding.process_invocation_digest, mutated_digest,
+            "mutated publish must carry the mutated digest"
+        );
+        assert_ne!(
+            binding.binding_digest, mutated_binding.binding_digest,
+            "invocation change must move the binding digest"
+        );
     }
 }
