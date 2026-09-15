@@ -26,6 +26,10 @@ use crate::{
     CanonicalAdmissionOwner, CompositionError, CompositionReadiness, KernelTransitionPort,
 };
 
+#[cfg(test)]
+#[path = "../../../storage/eliot-store-api/tests/support/epistemic_envelope.rs"]
+mod store_fixture;
+
 /// Frozen proposal inputs survive retry unchanged. The capture envelope is
 /// checked against a real Kernel receipt before its bytes enter the resolver.
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -448,5 +452,182 @@ impl<P: KernelTransitionPort + ?Sized, R: CanonicalReadClient + ?Sized>
             return Err(refused("current position differs from this exact commit"));
         }
         Ok(readback)
+    }
+}
+
+#[cfg(test)]
+mod adaptation_tests {
+    use super::*;
+    use eliot_epistemic_contracts::{
+        ClaimVerdict, CoverageDenominatorParams, DenominatorKind, DisclosureClass,
+        PaginationBounds, PositionAssertability, PositionRequestParams, PrivacyHandling,
+        SnapshotRef, SupportResult,
+    };
+    use eliot_evidence::{
+        Assertability, EpistemicStatus, EvidenceAuthority, EvidenceCoverage, EvidenceEnvelope,
+        EvidenceFreshness, LifecycleState, Provenance,
+    };
+    use std::collections::BTreeSet;
+    type ProofResult<T = ()> = Result<T, Box<dyn std::error::Error>>;
+
+    /// Pure semantic fixture; it asserts no external receipt or daemon proof.
+    fn inputs() -> ProofResult<(
+        ObservationRecord,
+        PositionRequest,
+        CoverageDenominator,
+        ClaimMap,
+    )> {
+        let envelope = super::store_fixture::envelope("adaptation", "position", None, None)?;
+        let commit = EpistemicCommit::from_prepared(&envelope.request, &envelope.prepare()?)?
+            .ok_or("fixture contains no epistemic operation")?;
+        let candidate = commit.payload.candidate;
+        let observation = ObservationRecord {
+            observation_id: eliot_contracts::ArtifactId::new("observed-source")?,
+            source_id: eliot_contracts::SourceId::new("source")?,
+            subject: "sensor reports a warm room".to_owned(),
+            content: "reported reading: 26 C; calibration not verified".to_owned(),
+            observed_at: eliot_contracts::ClockReading {
+                valid_time_ms: Some(1000),
+                known_time_ms: Some(1000),
+                transaction_sequence: None,
+                monotonic_ns: None,
+            },
+            evidence: EvidenceEnvelope {
+                authority: EvidenceAuthority::SourceIdentity,
+                freshness: EvidenceFreshness::ExactCandidate,
+                coverage: EvidenceCoverage::CompleteForScope,
+                status: EpistemicStatus::Observed,
+                assertability: Assertability::NonAssertableUnverified,
+                provenance: Provenance {
+                    source_id: eliot_contracts::SourceId::new("source")?,
+                    capture_route: "test.observed-source".to_owned(),
+                    scope: candidate.scope.clone(),
+                    raw_handle: Some("observed-source".to_owned()),
+                    revision: Some("source-v1".to_owned()),
+                },
+                verification: None,
+                state_fence: candidate.fence.clone(),
+            },
+            lifecycle: LifecycleState::Active,
+        };
+        observation.validate()?;
+        let request = PositionRequest::new(PositionRequestParams {
+            question: observation.subject.clone(),
+            request_id: candidate.request_id.clone(),
+            operation_id: candidate.operation_id.clone(),
+            idempotency_key: candidate.idempotency_key.clone(),
+            work_scope: candidate.work_scope.clone(),
+            proposition: candidate.proposition.clone(),
+            task_id: candidate.task_id.clone(),
+            attempt_id: candidate.attempt_id.clone(),
+            revision: candidate.revision,
+            scope: candidate.scope.clone(),
+            validity: candidate.support[0].validity.clone(),
+            fence: candidate.fence.clone(),
+            records: BTreeSet::from([observation.observation_id.clone()]),
+        })?;
+        let coverage = CoverageDenominator::new(CoverageDenominatorParams {
+            class: "ObservationRecord".to_owned(),
+            schema: "eliot.evidence.observation.v1".to_owned(),
+            revision: "source-v1".to_owned(),
+            scope: request.scope.clone(),
+            fence: request.fence.clone(),
+            members: request.records.clone(),
+            roles: BTreeSet::from(["observed-source".to_owned()]),
+            query: None,
+            frontier: None,
+            snapshot: SnapshotRef::new("pure-test-source", observation.source_id.clone())?,
+            exclusions: Vec::new(),
+            bounds: PaginationBounds::new(0, 1, 1, false)?,
+            validity: request.validity.clone(),
+            kind: DenominatorKind::CompleteScope,
+        })?;
+        let mut claim = candidate.claims[0].clone();
+        claim.statement_digest = digest(&observation.subject)?;
+        claim.coverage_digest.clone_from(&coverage.digest);
+        let claims = ClaimMap::new(
+            candidate.manifest,
+            BTreeSet::from([claim.claim.clone()]),
+            vec![claim],
+            Vec::new(),
+            BTreeSet::new(),
+        )?;
+        Ok((observation, request, coverage, claims))
+    }
+
+    fn propose(
+        observation: &ObservationRecord,
+        request: &PositionRequest,
+        coverage: &CoverageDenominator,
+        claims: &ClaimMap,
+    ) -> Result<EpistemicPositionCandidate, eliot_epistemic_contracts::ContractError> {
+        eliot_epistemic::propose_observed_candidate(
+            request,
+            observation,
+            coverage,
+            claims,
+            None,
+            (DisclosureClass::Open, PrivacyHandling::Unrestricted),
+        )
+    }
+
+    #[test]
+    fn observed_bytes_produce_withheld_candidate_and_exact_proof() -> ProofResult {
+        let (observation, request, coverage, claims) = inputs()?;
+        let candidate = propose(&observation, &request, &coverage, &claims)?;
+        assert_eq!(candidate.support[0].result, SupportResult::Unknown);
+        assert_eq!(candidate.claims[0].verdict, ClaimVerdict::Withheld);
+        assert_eq!(
+            candidate.proposed_assertability,
+            PositionAssertability::UnknownWithheldQuarantined
+        );
+        assert!(candidate.verifier.is_none());
+        assert_eq!(candidate.proof_digest, digest(&observation)?);
+        assert_eq!(candidate.support[0].handles, request.records);
+        let mut changed = observation.clone();
+        changed.content = "reported reading: 27 C; calibration not verified".to_owned();
+        let next = propose(&changed, &request, &coverage, &claims)?;
+        assert_ne!(next.digest, candidate.digest);
+        assert_ne!(next.proof_digest, candidate.proof_digest);
+        assert_eq!(next.support[0].result, SupportResult::Unknown);
+        Ok(())
+    }
+
+    #[test]
+    fn changed_source_identity_scope_or_freshness_cannot_reuse_the_inquiry() -> ProofResult {
+        let (observation, request, coverage, claims) = inputs()?;
+        let mut changed = observation.clone();
+        changed.observation_id = eliot_contracts::ArtifactId::new("another-source")?;
+        assert!(propose(&changed, &request, &coverage, &claims).is_err());
+        changed = observation.clone();
+        changed.subject = "different proposition".to_owned();
+        assert!(propose(&changed, &request, &coverage, &claims).is_err());
+        changed = observation.clone();
+        changed.evidence.provenance.scope = "another-scope".to_owned();
+        assert!(propose(&changed, &request, &coverage, &claims).is_err());
+        changed = observation;
+        changed.evidence.freshness = EvidenceFreshness::KnownOlderSnapshot;
+        assert!(propose(&changed, &request, &coverage, &claims).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn model_authority_and_accepted_claim_cannot_launder_an_observation() -> ProofResult {
+        let (mut observation, request, coverage, claims) = inputs()?;
+        observation.evidence.authority = EvidenceAuthority::ModelInterpretation;
+        assert!(propose(&observation, &request, &coverage, &claims).is_err());
+        observation.evidence.authority = EvidenceAuthority::SourceIdentity;
+        let mut accepted = claims.entries[0].clone();
+        accepted.verdict = ClaimVerdict::Accepted;
+        accepted.audit = eliot_epistemic_contracts::ClaimAuditOutcome::Supported;
+        let claims = ClaimMap::new(
+            claims.manifest,
+            BTreeSet::from([accepted.claim.clone()]),
+            vec![accepted],
+            Vec::new(),
+            BTreeSet::new(),
+        )?;
+        assert!(propose(&observation, &request, &coverage, &claims).is_err());
+        Ok(())
     }
 }

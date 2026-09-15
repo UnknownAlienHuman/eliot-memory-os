@@ -33,18 +33,6 @@ pub fn propose_observed_candidate(
     )
 }
 
-/// Neutral-contract entry to the private resolver/candidate adaptation.
-pub fn resolve_observed_candidate(
-    request: &eliot_epistemic_contracts::PositionRequest,
-    observation: &eliot_evidence::ObservationRecord,
-    candidate: &eliot_epistemic_contracts::EpistemicPositionCandidate,
-) -> Result<
-    eliot_epistemic_contracts::EpistemicPositionCandidate,
-    eliot_epistemic_contracts::ContractError,
-> {
-    candidate_adaptation::observed_candidate(request, observation, candidate)
-}
-
 use std::collections::BTreeSet;
 
 use eliot_contracts::{ArtifactId, ContractVersion, StateFence};
