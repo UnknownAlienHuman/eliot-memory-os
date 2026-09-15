@@ -67,10 +67,11 @@ mod operation_catalogue;
 mod operation_parameters;
 
 pub use operation_catalogue::{
-    ACTIVATED_READ_OWNING_SECTION, GENESIS_OWNING_SECTION, MINIMUM_COMPATIBLE_VERSION,
-    OPERATION_CATALOGUE_PROFILE, OperationKind, READ_MAX_INPUT_BYTES, READ_MAX_OUTPUT_BYTES,
-    READ_TIMEOUT_MS, SCOPE_KIND_NONE, SCOPE_KIND_SCOPE, SINGLE_MANIFEST_OWNING_SECTION,
-    activated_read_operations, generated_operation_manifests, operation_manifest_set_digest,
+    ACTIVATED_READ_OWNING_SECTION, EVIDENCE_PACK_MAX_RECORDS, GENESIS_OWNING_SECTION,
+    MINIMUM_COMPATIBLE_VERSION, OPERATION_CATALOGUE_PROFILE, OperationKind, READ_MAX_INPUT_BYTES,
+    READ_MAX_OUTPUT_BYTES, READ_TIMEOUT_MS, SCOPE_KIND_NONE, SCOPE_KIND_SCOPE,
+    SINGLE_MANIFEST_OWNING_SECTION, activated_read_operations, generated_operation_manifests,
+    operation_manifest_set_digest,
 };
 
 pub use operation_parameters::{

@@ -11,13 +11,13 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use eliot_store_api::{
     CanonicalRequestView, CanonicalStoreClient, CanonicalValidationSnapshot, CommitId, EventId,
-    EventProjectionRelationIntents, NamedMutationOperation, NamedReadOperation, NamedReadRequest,
-    NamedReadResponse, OperationId, OperationManifestDigest, OrderingHead, OrderingHeadExpectation,
-    OrderingScopeId, OutboxId, OutboxIntent, OutboxState, PreparedTransition, ProjectionMode,
-    ProjectionPublicationId, ProjectionPublicationRecord, ProjectionStatus, RecoveryRecord,
-    RecoveryRecordKey, RequestMeta, Resubmission, RevisionDelta, RevisionHead,
-    RevisionHeadExpectation, RevisionKey, ScopeId, ScopeRevisionView, SplitView, StateFence,
-    StoreError, StoreGenesisRequest, StoreHealth, StoreHealthStatus, StoreRecoveryRequest,
+    EventProjectionRelationIntents, EVIDENCE_PACK_MAX_RECORDS, NamedMutationOperation,
+    NamedReadOperation, NamedReadRequest, NamedReadResponse, OperationId, OperationManifestDigest,
+    OrderingHead, OrderingHeadExpectation, OrderingScopeId, OutboxId, OutboxIntent, OutboxState,
+    PreparedTransition, ProjectionMode, ProjectionPublicationId, ProjectionPublicationRecord,
+    ProjectionStatus, RecoveryRecord, RecoveryRecordKey, RequestMeta, Resubmission, RevisionDelta,
+    RevisionHead, RevisionHeadExpectation, RevisionKey, ScopeId, ScopeRevisionView, SplitView,
+    StateFence, StoreError, StoreGenesisRequest, StoreHealth, StoreHealthStatus, StoreRecoveryRequest,
     StoreRecoverySnapshot, WriteReceipt, WriteReceiptStatus, canonical_json_bytes,
     canonical_request_hash, generated_operation_manifests, genesis_manifest, is_genesis_fence,
     issue_genesis_receipt_envelope, issue_store_receipt_envelope,
@@ -28,16 +28,8 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
-/// Maximum evidence records one `GetEvidencePack` read may return.
-///
-/// Handler-side mirror of the `EVIDENCE_PACK_MAX_RECORDS` bound declared
-/// beside the `GetEvidencePack` catalogue row in `eliot-store-api`
-/// (`operation_catalogue.rs`): that module owns the bound but cannot
-/// re-export it without touching the crate root, so every handler pins the
-/// same value here with the same byte-math justification (32 input-bound
-/// subjects fit far below the 3 MiB read output ceiling). The two values
-/// must stay equal; the handler tests pin this copy.
-const EVIDENCE_PACK_MAX_RECORDS: u32 = 32;
+// `EVIDENCE_PACK_MAX_RECORDS` is the canonical bound owned by the
+// `GetEvidencePack` catalogue row in `eliot-store-api`; imported above.
 
 /// Version of the `GetEvidencePack` payload shape built below.
 ///
