@@ -11,7 +11,11 @@
 //! `TransitionClass::CaptureCandidate` with the `EffectClass::Candidate`
 //! ceiling; `ApplyLifecyclePolicy` persists `TransitionClass::LifecyclePolicy`
 //! with the `EffectClass::ReversibleMutation` ceiling; all three carry the
-//! owner-approved schemas), plus the provider-independent genesis bootstrap entry sourced by
+//! owner-approved schemas) plus the `ReconcileRecovery` mutation (AUD-C01:
+//! persists `TransitionClass::RecoverySchema` with the
+//! `EffectClass::ReversibleMutation` ceiling and the owner-approved ten-field
+//! problem-leg recovery schema emitted by the Governor doctor verification
+//! envelope), plus the provider-independent genesis bootstrap entry sourced by
 //! [`genesis_manifest`](crate::genesis_manifest). Every other operation stays
 //! known-but-unsupported and unadvertised: no other mutation on base has a
 //! proven handler, schema, and consumer triple, so C1 advertises no other
@@ -217,10 +221,12 @@ struct ActivatedMutationDescriptor {
 ///
 /// `CaptureObservation` and `AppendAuditEvent` persist the lowest ceiling
 /// (`Candidate`) through the `CaptureCandidate` family; `ApplyLifecyclePolicy`
-/// persists `ReversibleMutation` through the `LifecyclePolicy` family. All
-/// three address no scope, mirroring the scope-free read descriptors. Every
+/// persists `ReversibleMutation` through the `LifecyclePolicy` family;
+/// `ReconcileRecovery` persists `ReversibleMutation` through the
+/// `RecoverySchema` family. All
+/// four address no scope, mirroring the scope-free read descriptors. Every
 /// other mutation stays known-but-unsupported.
-const ACTIVATED_MUTATIONS: [ActivatedMutationDescriptor; 3] = [
+const ACTIVATED_MUTATIONS: [ActivatedMutationDescriptor; 4] = [
     ActivatedMutationDescriptor {
         operation: NamedMutationOperation::CaptureObservation,
         transition_classes: &[TransitionClass::CaptureCandidate],
@@ -234,6 +240,11 @@ const ACTIVATED_MUTATIONS: [ActivatedMutationDescriptor; 3] = [
     ActivatedMutationDescriptor {
         operation: NamedMutationOperation::ApplyLifecyclePolicy,
         transition_classes: &[TransitionClass::LifecyclePolicy],
+        maximum_effect: EffectClass::ReversibleMutation,
+    },
+    ActivatedMutationDescriptor {
+        operation: NamedMutationOperation::ReconcileRecovery,
+        transition_classes: &[TransitionClass::RecoverySchema],
         maximum_effect: EffectClass::ReversibleMutation,
     },
 ];
@@ -300,7 +311,7 @@ fn genesis_entry_spec() -> OperationManifestSpec {
 /// Generates the per-operation manifest descriptors from the declaration table.
 ///
 /// Declaration order is the canonical order: the five activated reads, the
-/// three activated mutations, then the genesis bootstrap entry. Generation is
+/// four activated mutations, then the genesis bootstrap entry. Generation is
 /// pure over crate constants, so the same source always yields byte-identical
 /// entries.
 pub fn generated_operation_manifests() -> Result<Vec<NamedOperationManifest>, StoreError> {
@@ -457,8 +468,8 @@ pub fn validate_read_against_catalogue(
 /// the catalogue set digest, resolve every command (in order, never sorted)
 /// to a mutation entry, stay within that entry's ceiling, carry only the
 /// owner-approved typed parameters for the approved command, and stay within
-/// the entry input bound. Only `CaptureObservation`, `AppendAuditEvent`, and
-/// `ApplyLifecyclePolicy` have activated mutation entries; any other named
+/// the entry input bound. Only `CaptureObservation`, `AppendAuditEvent`,
+/// `ApplyLifecyclePolicy`, and `ReconcileRecovery` have activated mutation entries; any other named
 /// command fails closed here until a later slice proves its handler, schema,
 /// and consumer triple.
 pub fn validate_transition_against_catalogue(
@@ -508,12 +519,11 @@ pub fn validate_transition_against_catalogue(
         match command.operation {
             NamedMutationOperation::CaptureObservation
             | NamedMutationOperation::AppendAuditEvent
-            | NamedMutationOperation::ApplyLifecyclePolicy => {
+            | NamedMutationOperation::ApplyLifecyclePolicy
+            | NamedMutationOperation::ReconcileRecovery => {
                 validate_typed_mutation_parameters(command.operation, &command.parameters)?;
             }
-            NamedMutationOperation::ApplyEpistemicRevision
-            | NamedMutationOperation::UpdateTaskState
-            | NamedMutationOperation::ReconcileRecovery => {
+            NamedMutationOperation::ApplyEpistemicRevision | NamedMutationOperation::UpdateTaskState => {
                 return Err(StoreError::UnknownOperation);
             }
         }

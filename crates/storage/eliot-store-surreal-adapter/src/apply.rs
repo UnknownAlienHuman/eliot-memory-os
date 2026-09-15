@@ -1010,9 +1010,39 @@ mod admitted_operation_gate_tests {
                 ("action".to_owned(), json!("keep")),
                 ("base_view_digest".to_owned(), json!("a".repeat(64))),
                 ("candidate_digest".to_owned(), json!("b".repeat(64))),
-                ("candidate_package_digest".to_owned(), json!("c".repeat(64))),
+                (
+                    "candidate_package_digest".to_owned(),
+                    json!("c".repeat(64)),
+                ),
                 ("skill_id".to_owned(), json!("skill-gate")),
                 ("verifier_ref".to_owned(), json!("verifier-gate")),
+            ]),
+        }
+    }
+
+    fn recovery_operation() -> eliot_store_api::NamedMutationRequest {
+        NamedMutationRequest {
+            operation: NamedMutationOperation::ReconcileRecovery,
+            parameters: BTreeMap::from([
+                ("problem_id".to_owned(), json!("problem-gate")),
+                ("expected_problem_revision".to_owned(), json!("7")),
+                ("attempt_digest".to_owned(), json!("a".repeat(64))),
+                ("effect_digest".to_owned(), json!("b".repeat(64))),
+                (
+                    "operation_manifest_digest".to_owned(),
+                    json!("c".repeat(64)),
+                ),
+                (
+                    "artifact_binding_digest".to_owned(),
+                    json!("b".repeat(64)),
+                ),
+                ("fence_digest".to_owned(), json!("d".repeat(64))),
+                ("observation_operation_id".to_owned(), json!("op-gate")),
+                ("observation_record_id".to_owned(), json!("record-gate")),
+                (
+                    "observation_request_digest".to_owned(),
+                    json!("e".repeat(64)),
+                ),
             ]),
         }
     }
@@ -1059,9 +1089,9 @@ mod admitted_operation_gate_tests {
         );
         // Current set digest but still-unadmitted mutation entry: fail-closed
         // for the remaining mutations. `CaptureObservation`,
-        // `AppendAuditEvent`, and `ApplyLifecyclePolicy` are admitted (their
-        // handler/schema/consumer triples are proven); this proof uses
-        // `ApplyEpistemicRevision` (still unadmitted).
+        // `AppendAuditEvent`, `ApplyLifecyclePolicy`, and `ReconcileRecovery`
+        // are admitted (their handler/schema/consumer triples are proven);
+        // this proof uses `ApplyEpistemicRevision` (still unadmitted).
         let unadmitted = transition_with(
             &fence,
             set_digest.clone(),
@@ -1106,7 +1136,7 @@ mod admitted_operation_gate_tests {
         // lifecycle-policy params passes the pre-stage gate.
         let admitted_lifecycle = transition_with(
             &fence,
-            set_digest,
+            set_digest.clone(),
             TransitionClass::LifecyclePolicy,
             EffectClass::ReversibleMutation,
             vec![lifecycle_operation()],
@@ -1114,6 +1144,19 @@ mod admitted_operation_gate_tests {
         assert!(
             validate_transition(&context, &admitted_lifecycle).is_ok(),
             "admitted ApplyLifecyclePolicy passes the pre-stage gate"
+        );
+        // Admitted `ReconcileRecovery` with current set digest and approved
+        // problem-leg recovery params passes the pre-stage gate.
+        let admitted_recovery = transition_with(
+            &fence,
+            set_digest,
+            TransitionClass::RecoverySchema,
+            EffectClass::ReversibleMutation,
+            vec![recovery_operation()],
+        );
+        assert!(
+            validate_transition(&context, &admitted_recovery).is_ok(),
+            "admitted ReconcileRecovery passes the pre-stage gate"
         );
         // Fence divergence between caller context and transition.
         let manifest = genesis_manifest().expect("genesis entry is active");
