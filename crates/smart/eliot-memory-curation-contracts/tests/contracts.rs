@@ -156,6 +156,139 @@ fn owner_evidence_with_outcome(
     }
 }
 
+fn dimensioned(
+    member_id: MemberId,
+    outcomes: [(CurationDimension, DimensionOutcome); 5],
+) -> MemberDimensions {
+    MemberDimensions {
+        member_id,
+        verdicts: outcomes
+            .into_iter()
+            .map(|(dimension, outcome)| DimensionVerdict {
+                dimension,
+                outcome,
+                finding_ids: BTreeSet::new(),
+            })
+            .collect(),
+    }
+}
+
+fn clear_dimensions(member_id: MemberId) -> MemberDimensions {
+    dimensioned(
+        member_id,
+        [
+            (CurationDimension::Existence, DimensionOutcome::Clear),
+            (CurationDimension::Support, DimensionOutcome::Clear),
+            (CurationDimension::Lifecycle, DimensionOutcome::Clear),
+            (CurationDimension::Accessibility, DimensionOutcome::Clear),
+            (
+                CurationDimension::PermittedInfluence,
+                DimensionOutcome::Clear,
+            ),
+        ],
+    )
+}
+
+#[test]
+fn dimensioned_disposition_has_no_cross_subsidy() {
+    let member = MemberId::new("member-0").expect("member");
+    assert_eq!(
+        clear_dimensions(member.clone())
+            .derive_disposition()
+            .expect("derive"),
+        MemberDisposition::Eligible
+    );
+    for dimension in CurationDimension::ALL {
+        let mut verdicts = clear_dimensions(member.clone());
+        let verdict = verdicts
+            .verdicts
+            .iter_mut()
+            .find(|verdict| verdict.dimension == dimension)
+            .expect("dimension verdict");
+        verdict.outcome = DimensionOutcome::Flagged;
+        verdict
+            .finding_ids
+            .insert(FindingId::new(format!("finding-{dimension:?}")).expect("finding"));
+        assert_eq!(
+            verdicts.derive_disposition().expect("derive"),
+            MemberDisposition::Blocked,
+            "one flagged dimension must block despite four clear dimensions: {dimension:?}"
+        );
+    }
+    let mut protected = clear_dimensions(member.clone());
+    protected
+        .verdicts
+        .iter_mut()
+        .find(|verdict| verdict.dimension == CurationDimension::PermittedInfluence)
+        .expect("influence verdict")
+        .outcome = DimensionOutcome::Protected;
+    assert_eq!(
+        protected.derive_disposition().expect("derive"),
+        MemberDisposition::Protected
+    );
+    let mut reference = clear_dimensions(member);
+    reference
+        .verdicts
+        .iter_mut()
+        .find(|verdict| verdict.dimension == CurationDimension::Lifecycle)
+        .expect("lifecycle verdict")
+        .outcome = DimensionOutcome::Reference;
+    assert_eq!(
+        reference.derive_disposition().expect("derive"),
+        MemberDisposition::PreservedReference
+    );
+}
+
+#[test]
+fn dimensioned_verdicts_reject_shared_findings_and_wrong_counts() {
+    let member = MemberId::new("member-0").expect("member");
+    let finding = FindingId::new("finding-1").expect("finding");
+    let mut shared = clear_dimensions(member.clone());
+    for dimension in [CurationDimension::Existence, CurationDimension::Support] {
+        let verdict = shared
+            .verdicts
+            .iter_mut()
+            .find(|verdict| verdict.dimension == dimension)
+            .expect("dimension verdict");
+        verdict.outcome = DimensionOutcome::Flagged;
+        verdict.finding_ids.insert(finding.clone());
+    }
+    assert!(shared.validate().is_err());
+    assert!(shared.derive_disposition().is_err());
+    let mut short = clear_dimensions(member.clone());
+    short.verdicts.pop();
+    assert!(short.validate().is_err());
+    let mut unflagged_with_findings = clear_dimensions(member);
+    unflagged_with_findings.verdicts[0]
+        .finding_ids
+        .insert(finding);
+    assert!(unflagged_with_findings.validate().is_err());
+}
+
+#[test]
+fn finding_classes_have_exactly_one_owning_dimension() {
+    assert_eq!(
+        FindingClass::ProvenanceGap.dimension(),
+        CurationDimension::Support
+    );
+    assert_eq!(
+        FindingClass::ProtectionGap.dimension(),
+        CurationDimension::PermittedInfluence
+    );
+    assert_eq!(
+        FindingClass::MalformedIncomplete.dimension(),
+        CurationDimension::Existence
+    );
+    let encoded = serde_json::to_string(&clear_dimensions(
+        MemberId::new("member-0").expect("member"),
+    ))
+    .expect("encode");
+    let decoded: MemberDimensions = serde_json::from_str(&encoded).expect("decode");
+    assert!(decoded.validate().is_ok());
+    let malformed = encoded.trim_end_matches('}').to_owned() + ",\"unexpected\":true}";
+    assert!(serde_json::from_str::<MemberDimensions>(&malformed).is_err());
+}
+
 #[test]
 fn complete_source_and_partial_empty_are_distinct() {
     let mut page = source(3, DenominatorCoverage::Complete);
