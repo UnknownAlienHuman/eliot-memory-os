@@ -709,7 +709,6 @@ async fn run_published_daemon(
             config_path,
             supervisor.service_statuses(),
             RuntimeMode::Daemon,
-            true,
         )?;
         let log_service = LogService::new(data_root.join("logs"));
         let _ = log_service.write_event(LogService::event(
@@ -953,23 +952,6 @@ async fn wait_for_stop_marker(marker: &Path) {
     }
 }
 
-pub fn run_runtime_status(config_path: &Path) -> Result<()> {
-    let root = runtime_root(config_path);
-    let report = runtime_status_report(
-        &root,
-        default_service_statuses(),
-        RuntimeMode::DevSingleProcess,
-        false,
-    );
-    let report_service = ReportService::new(root.join("reports"));
-    report_service.write_latest(
-        "runtime",
-        &report,
-        &typed_report_markdown("Runtime Status", &report)?,
-    )?;
-    write_json(&report)
-}
-
 pub fn run_runtime_health(config_path: &Path) -> Result<()> {
     let root = runtime_root(config_path);
     let report = HealthService::report(RuntimeMode::DevSingleProcess, default_service_statuses());
@@ -987,7 +969,6 @@ pub fn run_runtime_report(config_path: &Path) -> Result<()> {
         config_path,
         default_service_statuses(),
         RuntimeMode::DevSingleProcess,
-        false,
     )?;
     write_json(&serde_json::json!({
         "component": "runtime_report",
@@ -1874,16 +1855,12 @@ fn write_runtime_bundle(
     config_path: &Path,
     statuses: Vec<ServiceRuntimeStatus>,
     mode: RuntimeMode,
-    single_instance_owned: bool,
 ) -> Result<RuntimeReportBundle> {
     let root = runtime_root(config_path);
     let report_service = ReportService::new(root.join("reports"));
-    let runtime_status =
-        runtime_status_report(&root, statuses.clone(), mode, single_instance_owned);
     let runtime_health = HealthService::report(mode, statuses);
     let runtime_report = serde_json::json!({
         "component": "runtime_report",
-        "status": runtime_status,
         "health": runtime_health
     });
     let (runtime_report_path, _) = report_service.write_latest(
@@ -1912,25 +1889,6 @@ fn write_runtime_bundle(
         module_report_path,
         logs_report_path,
     })
-}
-
-fn runtime_status_report(
-    root: &Path,
-    services: Vec<ServiceRuntimeStatus>,
-    mode: RuntimeMode,
-    single_instance_owned: bool,
-) -> RuntimeStatusReport {
-    RuntimeStatusReport {
-        component: "runtime_status".to_owned(),
-        mode,
-        pid: std::process::id(),
-        data_root: root.display().to_string(),
-        active_profile: "dev-single-process".to_owned(),
-        single_instance_owned,
-        ipc_enabled: matches!(mode, RuntimeMode::Daemon),
-        services,
-        generated_at: time::OffsetDateTime::now_utc(),
-    }
 }
 
 fn default_service_statuses() -> Vec<ServiceRuntimeStatus> {

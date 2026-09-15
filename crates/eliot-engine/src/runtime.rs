@@ -3,8 +3,8 @@ use eliot_types::{
     AuthorityHeader, CausalityHeader, EliotExchangeEnvelope, EliotLogEvent, ExchangeKind,
     ExchangeParty, LogEventKind, LogLevel, ModuleCapability, ModuleEndpoint, ModuleHealth,
     ModuleKind, ModuleManifest, ModuleRegistryReport, ModuleResourceLimits, ModuleTransport,
-    RedactionInfo, RuntimeHealthReport, RuntimeLogReport, RuntimeMode, RuntimeStatusReport,
-    SchemaRef, ServiceHealthState, ServiceRuntimeStatus, TaintClass,
+    RedactionInfo, RuntimeHealthReport, RuntimeLogReport, RuntimeMode, SchemaRef,
+    ServiceHealthState, ServiceRuntimeStatus, TaintClass,
 };
 use serde::Serialize;
 use serde_json::Value;
@@ -121,26 +121,6 @@ impl ServiceSupervisor {
 
     pub fn shutdown_order(&self) -> &[String] {
         &self.shutdown_order
-    }
-
-    pub fn status_report(
-        &self,
-        mode: RuntimeMode,
-        data_root: &Path,
-        single_instance_owned: bool,
-        ipc_enabled: bool,
-    ) -> RuntimeStatusReport {
-        RuntimeStatusReport {
-            component: "runtime_status".to_owned(),
-            mode,
-            pid: std::process::id(),
-            data_root: data_root.display().to_string(),
-            active_profile: mode_name(mode).to_owned(),
-            single_instance_owned,
-            ipc_enabled,
-            services: self.service_statuses(),
-            generated_at: OffsetDateTime::now_utc(),
-        }
     }
 }
 
@@ -909,16 +889,6 @@ fn module_rejected(reason: &str) -> EngineError {
     EngineError::ServiceNotReady {
         service: "module_registry".to_owned(),
         reason: reason.to_owned(),
-    }
-}
-
-fn mode_name(mode: RuntimeMode) -> &'static str {
-    match mode {
-        RuntimeMode::DevSingleProcess => "dev-single-process",
-        RuntimeMode::Daemon => "daemon",
-        RuntimeMode::StdioShim => "stdio-shim",
-        RuntimeMode::HookCommand => "hook-command",
-        RuntimeMode::AdminCli => "admin-cli",
     }
 }
 

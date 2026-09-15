@@ -2663,6 +2663,36 @@ mod honest_tests {
     }
 
     #[test]
+    fn legacy_healthy_wire_is_not_a_meta_report() {
+        // T13-S3: the retired legacy status wire must never parse as the Meta
+        // report. Old `Healthy` service state is not current readiness, and
+        // there is intentionally no From/decoder from the legacy shape.
+        let legacy = serde_json::json!({
+            "component": "runtime_status",
+            "mode": "dev-single-process",
+            "pid": 1234,
+            "data_root": "C:/Eliot",
+            "active_profile": "dev-single-process",
+            "single_instance_owned": false,
+            "ipc_enabled": false,
+            "services": [
+                {
+                    "service_name": "lifecycle",
+                    "health": "Healthy",
+                    "started": true,
+                    "restart_budget_remaining": 3,
+                    "message": "dev-single-process service ready"
+                }
+            ],
+            "generated_at": "2026-09-15T00:00:00Z"
+        });
+        assert!(
+            serde_json::from_value::<RuntimeStatusReport>(legacy).is_err(),
+            "legacy Healthy-shaped wire must not parse as Meta RuntimeStatusReport"
+        );
+    }
+
+    #[test]
     fn honest_status_is_not_healthy_with_explicit_gaps() {
         let root = temp_root("not-healthy");
         let report = collect(&root);
@@ -3033,6 +3063,12 @@ mod honest_tests {
                 fixture_handle("7".repeat(64)),
                 fixture_handle("--kernel-artifact-sha256"),
                 fixture_handle("d".repeat(64)),
+                fixture_handle("--doctor-artifact-sha256"),
+                fixture_handle("b".repeat(64)),
+                fixture_handle("--testd-artifact-sha256"),
+                fixture_handle("c".repeat(64)),
+                fixture_handle("--native-worker-artifact-sha256"),
+                fixture_handle("6".repeat(64)),
                 fixture_handle("--eliotd-descriptor"),
                 fixture_path(&portable_root, "eliotd.json"),
                 fixture_handle("--eliotd-descriptor-sha256"),
@@ -3068,6 +3104,15 @@ mod honest_tests {
             host_artifact_digest: fixture_handle("8".repeat(64)),
             watchdog_executable_path: fixture_path(&portable_root, "eliot-watchdog.exe"),
             watchdog_artifact_digest: fixture_handle("4".repeat(64)),
+            doctor_artifact_digest: fixture_handle("b".repeat(64)),
+            testd_artifact_digest: fixture_handle("c".repeat(64)),
+            native_worker_artifact_digest: fixture_handle("6".repeat(64)),
+            doctor_executable_path: fixture_path(&portable_root, "eliot-doctor.exe"),
+            testd_executable_path: fixture_path(&portable_root, "eliot-testd.exe"),
+            native_worker_executable_path: fixture_path(
+                &portable_root,
+                "eliot-native-worker.exe",
+            ),
             descriptor_digest: fixture_handle("f".repeat(64)),
         };
         runtime_launch = runtime_launch
@@ -3083,10 +3128,19 @@ mod honest_tests {
             store_bridge_artifact_digest: fixture_handle("1".repeat(64)),
             canonical_store_artifact_digest: fixture_handle("5".repeat(64)),
             host_artifact_digest: fixture_handle("8".repeat(64)),
+            doctor_artifact_digest: fixture_handle("b".repeat(64)),
+            testd_artifact_digest: fixture_handle("c".repeat(64)),
+            native_worker_artifact_digest: fixture_handle("6".repeat(64)),
             kernel_executable_path: fixture_path(&portable_root, "eliot-kernel.exe"),
             store_bridge_executable_path: fixture_path(&portable_root, "eliot-store-surreal.exe"),
             canonical_store_executable_path: fixture_path(&portable_root, "surreal.exe"),
             host_executable_path: fixture_path(&portable_root, "eliot-host.exe"),
+            doctor_executable_path: fixture_path(&portable_root, "eliot-doctor.exe"),
+            testd_executable_path: fixture_path(&portable_root, "eliot-testd.exe"),
+            native_worker_executable_path: fixture_path(
+                &portable_root,
+                "eliot-native-worker.exe",
+            ),
             config_path: fixture_path(&portable_root, "generation.json"),
             dependency_closure_refs: vec![fixture_handle("evidence:dependency-closure")],
             license_refs: vec![fixture_handle("evidence:licenses")],
@@ -3622,10 +3676,16 @@ mod store_currentness_production_tests {
             store_bridge_artifact_digest: dh('1'),
             canonical_store_artifact_digest: dh('5'),
             host_artifact_digest: dh('h'),
+            doctor_artifact_digest: dh('b'),
+            testd_artifact_digest: dh('6'),
+            native_worker_artifact_digest: dh('d'),
             kernel_executable_path: h(&format!("{portable}/kernel.exe")),
             store_bridge_executable_path: h(&format!("{portable}/store.exe")),
             canonical_store_executable_path: h(&format!("{portable}/surreal.exe")),
             host_executable_path: h(&format!("{portable}/host.exe")),
+            doctor_executable_path: h(&format!("{portable}/eliot-doctor.exe")),
+            testd_executable_path: h(&format!("{portable}/eliot-testd.exe")),
+            native_worker_executable_path: h(&format!("{portable}/eliot-native-worker.exe")),
             config_path: h(&format!("{portable}/generation.json")),
             dependency_closure_refs: vec![],
             license_refs: vec![],
@@ -3688,6 +3748,12 @@ mod store_currentness_production_tests {
                 host_artifact_digest: dh('h'),
                 watchdog_executable_path: h(&format!("{portable}/watchdog.exe")),
                 watchdog_artifact_digest: dh('w'),
+                doctor_artifact_digest: dh('b'),
+                testd_artifact_digest: dh('6'),
+                native_worker_artifact_digest: dh('d'),
+                doctor_executable_path: h(&format!("{portable}/eliot-doctor.exe")),
+                testd_executable_path: h(&format!("{portable}/eliot-testd.exe")),
+                native_worker_executable_path: h(&format!("{portable}/eliot-native-worker.exe")),
                 descriptor_digest: dh('f'),
             },
         }
@@ -4136,10 +4202,16 @@ mod live_production_observer_tests {
                 store_bridge_artifact_digest: dh('c'),
                 canonical_store_artifact_digest: dh('5'),
                 host_artifact_digest: dh('h'),
+                doctor_artifact_digest: dh('b'),
+                testd_artifact_digest: dh('6'),
+                native_worker_artifact_digest: dh('d'),
                 kernel_executable_path: h(&format!("{portable}/kernel.exe")),
                 store_bridge_executable_path: h(&format!("{portable}/store.exe")),
                 canonical_store_executable_path: h(&format!("{portable}/surreal.exe")),
                 host_executable_path: h(&format!("{portable}/host.exe")),
+                doctor_executable_path: h(&format!("{portable}/eliot-doctor.exe")),
+                testd_executable_path: h(&format!("{portable}/eliot-testd.exe")),
+                native_worker_executable_path: h(&format!("{portable}/eliot-native-worker.exe")),
                 config_path: h(&format!("{portable}/generation.json")),
                 dependency_closure_refs: vec![],
                 license_refs: vec![],
@@ -4204,6 +4276,12 @@ mod live_production_observer_tests {
                     host_artifact_digest: dh('h'),
                     watchdog_executable_path: h(&format!("{portable}/watchdog.exe")),
                     watchdog_artifact_digest: dh('w'),
+                    doctor_artifact_digest: dh('b'),
+                    testd_artifact_digest: dh('6'),
+                    native_worker_artifact_digest: dh('d'),
+                    doctor_executable_path: h(&format!("{portable}/eliot-doctor.exe")),
+                    testd_executable_path: h(&format!("{portable}/eliot-testd.exe")),
+                    native_worker_executable_path: h(&format!("{portable}/eliot-native-worker.exe")),
                     descriptor_digest: dh('f'),
                 },
             }
