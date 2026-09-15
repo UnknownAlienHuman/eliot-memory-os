@@ -44,7 +44,7 @@ ROOT = Path(__file__).resolve().parents[2]
 if str(ROOT / "scripts") not in sys.path:
     sys.path.insert(0, str(ROOT / "scripts"))
 FIX = ROOT / "scripts" / "testdata" / "work-unit-gate" / "wave-c0"
-BASE_SHA = "fb699df2755db32af9fb535e31f5fde5b27c011e"
+BASE_SHA = "bf219fe3a9615877c6870c0dfbecc1dce97b3904"
 ADMISSION_NOTE = "admitted via #829 (T8-A0) root workspace membership"
 FORBIDDEN_DOWNSTREAM = {
     "eliot-context", "eliot-cues", "eliot-dreamer-core", "eliot-epistemic",
