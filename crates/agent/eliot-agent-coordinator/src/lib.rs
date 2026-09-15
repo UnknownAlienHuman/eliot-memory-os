@@ -14,6 +14,7 @@ mod model_registry;
 mod provider_account_catalogue;
 mod provider_admission;
 mod swarm_controlboard;
+mod swarm_staffing;
 #[cfg(test)]
 mod tests;
 
@@ -36,6 +37,7 @@ pub use crate::provider_account_catalogue::{
 };
 pub use crate::provider_admission::AdmittedProviderCapability;
 pub use crate::swarm_controlboard::*;
+pub use crate::swarm_staffing::*;
 
 /// Snapshot wire revision. A different revision must be migrated by an
 /// external owner before replay.
