@@ -39,6 +39,44 @@ use crate::store_kernel_launch_sequence::{
     StoreKernelLaunchError, StoreLivenessEvidence, launch_store_then_kernel,
 };
 
+/// Verifies that the executable and config locators resolve to the exact
+/// approved canonical paths before any suspended spawn.
+///
+/// Callers pass locators already resolved through `approved_locator`, so the
+/// locator and the approved handle must canonicalize to the same verbatim
+/// path; anything else is a substitution, not a spelling variant. Digest and
+/// lease verification stay with the caller: this check binds paths, not
+/// bytes. The future shared-executor adapter reuses this exact gate before
+/// resume; it never replaces it with a caller-supplied hash comparison.
+#[cfg(windows)]
+fn approved_launch_paths(
+    executable: &Path,
+    approved_executable_path: &PlatformHandle,
+    config_path: &Path,
+    approved_config_path: &PlatformHandle,
+) -> Result<(), HostError> {
+    let approved_executable = std::fs::canonicalize(executable)
+        .map_err(|error| HostError::ProcessContour(error.to_string()))?;
+    let approved_executable_canonical =
+        std::fs::canonicalize(Path::new(approved_executable_path.as_str()))
+            .map_err(|error| HostError::ProcessContour(error.to_string()))?;
+    if approved_executable != executable || approved_executable_canonical != approved_executable {
+        return Err(HostError::ProcessContour(
+            "executable locator is not the approved path".to_owned(),
+        ));
+    }
+    let approved_config = std::fs::canonicalize(config_path)
+        .map_err(|error| HostError::ProcessContour(error.to_string()))?;
+    let approved_config_canonical = std::fs::canonicalize(Path::new(approved_config_path.as_str()))
+        .map_err(|error| HostError::ProcessContour(error.to_string()))?;
+    if approved_config != config_path || approved_config_canonical != approved_config {
+        return Err(HostError::ProcessContour(
+            "config locator is not the approved path".to_owned(),
+        ));
+    }
+    Ok(())
+}
+
 #[cfg(windows)]
 impl HostJobBranches {
     #[allow(
@@ -69,27 +107,12 @@ impl HostJobBranches {
                 "launch locator is not bound to its retained protected file".to_owned(),
             ));
         }
-        let approved_executable = std::fs::canonicalize(executable)
-            .map_err(|error| HostError::ProcessContour(error.to_string()))?;
-        let approved_executable_canonical =
-            std::fs::canonicalize(Path::new(approved_executable_path.as_str()))
-                .map_err(|error| HostError::ProcessContour(error.to_string()))?;
-        if approved_executable != executable || approved_executable_canonical != approved_executable
-        {
-            return Err(HostError::ProcessContour(
-                "executable locator is not the approved path".to_owned(),
-            ));
-        }
-        let approved_config = std::fs::canonicalize(config_path)
-            .map_err(|error| HostError::ProcessContour(error.to_string()))?;
-        let approved_config_canonical =
-            std::fs::canonicalize(Path::new(approved_config_path.as_str()))
-                .map_err(|error| HostError::ProcessContour(error.to_string()))?;
-        if approved_config != config_path || approved_config_canonical != approved_config {
-            return Err(HostError::ProcessContour(
-                "config locator is not the approved path".to_owned(),
-            ));
-        }
+        approved_launch_paths(
+            executable,
+            approved_executable_path,
+            config_path,
+            approved_config_path,
+        )?;
         executable_lease
             .verify()
             .map_err(HostError::ProcessContour)?;
@@ -547,5 +570,115 @@ impl HostJobBranches {
                 Err(HostError::RecoveryRequired(reason))
             }
         }
+    }
+}
+
+#[cfg(all(test, windows))]
+mod approved_path_tests {
+    use super::approved_launch_paths;
+    use crate::HostError;
+    use eliot_platform::PlatformHandle;
+    use std::path::PathBuf;
+
+    struct TempFile {
+        path: PathBuf,
+    }
+
+    impl TempFile {
+        fn create(name: &str) -> Self {
+            let path =
+                std::env::temp_dir().join(format!("eliot-host-bind-{}-{name}", std::process::id()));
+            std::fs::write(&path, b"binding")
+                .unwrap_or_else(|error| panic!("test fixture is not writable: {error}"));
+            Self { path }
+        }
+
+        fn canonical(&self) -> PathBuf {
+            std::fs::canonicalize(&self.path)
+                .unwrap_or_else(|error| panic!("test fixture cannot be canonicalized: {error}"))
+        }
+
+        fn handle(&self) -> PlatformHandle {
+            PlatformHandle::new(self.canonical().to_string_lossy().into_owned())
+                .unwrap_or_else(|error| panic!("test fixture path is not a handle: {error}"))
+        }
+    }
+
+    impl Drop for TempFile {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_file(&self.path);
+        }
+    }
+
+    fn contour_rejected(result: Result<(), HostError>, expected: &str) {
+        let Err(HostError::ProcessContour(reason)) = result else {
+            panic!("substituted locator was accepted");
+        };
+        assert!(
+            reason.contains(expected),
+            "unexpected rejection reason: {reason}"
+        );
+    }
+
+    #[test]
+    fn approves_exact_canonical_locators() {
+        let executable = TempFile::create("bind-ok-exe");
+        let config = TempFile::create("bind-ok-cfg");
+        if let Err(error) = approved_launch_paths(
+            &executable.canonical(),
+            &executable.handle(),
+            &config.canonical(),
+            &config.handle(),
+        ) {
+            panic!("exact canonical locators were rejected: {error}");
+        }
+    }
+
+    #[test]
+    fn rejects_substituted_executable_locator() {
+        let executable = TempFile::create("bind-exe-real");
+        let substitute = TempFile::create("bind-exe-fake");
+        let config = TempFile::create("bind-exe-cfg");
+        contour_rejected(
+            approved_launch_paths(
+                &executable.canonical(),
+                &substitute.handle(),
+                &config.canonical(),
+                &config.handle(),
+            ),
+            "executable locator is not the approved path",
+        );
+    }
+
+    #[test]
+    fn rejects_substituted_config_locator() {
+        let executable = TempFile::create("bind-cfg-exe");
+        let config = TempFile::create("bind-cfg-real");
+        let substitute = TempFile::create("bind-cfg-fake");
+        contour_rejected(
+            approved_launch_paths(
+                &executable.canonical(),
+                &executable.handle(),
+                &config.canonical(),
+                &substitute.handle(),
+            ),
+            "config locator is not the approved path",
+        );
+    }
+
+    #[test]
+    fn rejects_missing_locator_without_spawning() {
+        let executable = TempFile::create("bind-missing-exe");
+        let config = TempFile::create("bind-missing-cfg");
+        let missing =
+            std::env::temp_dir().join(format!("eliot-host-bind-{}-absent", std::process::id()));
+        let Err(HostError::ProcessContour(_)) = approved_launch_paths(
+            &missing,
+            &executable.handle(),
+            &config.canonical(),
+            &config.handle(),
+        ) else {
+            panic!("missing locator was accepted");
+        };
     }
 }
