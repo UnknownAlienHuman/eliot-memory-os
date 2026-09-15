@@ -14,6 +14,7 @@ from pathlib import Path
 from agent_route_bundle_checks import (
     PLUGIN,
     SCHEMA,
+    identity_errors,
     plugin_errors,
     read_json,
     schema_validator,
@@ -74,6 +75,27 @@ def self_test(root: Path) -> None:
         "profile_schema_invalid",
     )
 
+    bad_disposition = copy.deepcopy(profiles["codex"])
+    bad_disposition["disposition"] = "admitted"
+    expect(identity_errors(bad_disposition, "codex"), "route_disposition_invalid")
+
+    bad_digest = copy.deepcopy(profiles["codex"])
+    bad_digest["bundle_identity"] = {"route_profile_sha256": "forged"}
+    expect(identity_errors(bad_digest, "codex"), "route_identity_malformed")
+
+    forged_admission = copy.deepcopy(profiles["opencode"])
+    forged_admission["disposition"] = "live-admitted"
+    expect(identity_errors(forged_admission, "opencode"), "route_disposition_overclaim")
+
+    clean_identity = copy.deepcopy(profiles["claude"])
+    clean_identity["disposition"] = "unavailable-target"
+    clean_identity["bundle_identity"] = {
+        "route_profile_sha256": "0" * 64,
+        "generator_version": "test",
+    }
+    if identity_errors(clean_identity, "claude"):
+        raise AssertionError(f"clean identity failed: {identity_errors(clean_identity, 'claude')}")
+
     additional_property = copy.deepcopy(profiles["claude"])
     additional_property["undeclared"] = True
     expect(
@@ -114,7 +136,7 @@ def self_test(root: Path) -> None:
         plugin_errors(clean_plugin + "\nawait Promise.all([stdout, stderr])\n"),
         "opencode_unbounded_stream_wait",
     )
-    print("AGENT_ROUTE_BUNDLES_SELF_TEST: PASS cases=12")
+    print("AGENT_ROUTE_BUNDLES_SELF_TEST: PASS cases=16")
 
 
 def main() -> int:
