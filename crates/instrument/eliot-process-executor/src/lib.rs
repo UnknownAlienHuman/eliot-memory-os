@@ -13,13 +13,13 @@
 use eliot_instrument_api::EvidenceAxes;
 use eliot_process::{
     CancellationReceipt, CancellationRequest, ContractError, DescendantEvidence, ExitDisposition,
-    ExitStatus, OperationId, PhysicalProcessBinding, ProcessEvidence, ProcessEvidenceSink,
-    ProcessExecutionBinding, ProcessExecutionError, ProcessExecutionView, ProcessExecutor,
-    ProcessHealth, ProcessHealthStatus, ProcessId, ProcessLaunchAdmission, ProcessLifecycle,
-    ProcessRequest, ProcessStartReceipt, ProcessState, ProcessStreamEvidence, ProcessStreamKind,
-    ProcessStreamPolicyBinding, ProcessStreamPrefixPreview, StreamEvidenceGap,
-    StreamPersistenceStatus, StreamTransportStatus, SuspendedLaunchEvidence,
-    SuspendedProcessIdentity, ValidatedDispatch,
+    ExitStatus, ImageId, JobId, OperationId, PhysicalProcessBinding, ProcessEvidence,
+    ProcessEvidenceSink, ProcessExecutionBinding, ProcessExecutionError, ProcessExecutionView,
+    ProcessExecutor, ProcessHealth, ProcessHealthStatus, ProcessId, ProcessLaunchAdmission,
+    ProcessLifecycle, ProcessRequest, ProcessStartReceipt, ProcessState, ProcessStreamEvidence,
+    ProcessStreamKind, ProcessStreamPolicyBinding, ProcessStreamPrefixPreview, ProcessTreeId,
+    SessionId, StreamEvidenceGap, StreamPersistenceStatus, StreamTransportStatus,
+    SuspendedLaunchEvidence, SuspendedProcessIdentity, ValidatedDispatch,
 };
 use sha2::{Digest as _, Sha256};
 use std::collections::BTreeMap;
@@ -157,6 +157,19 @@ enum CaptureFailureDisposition {
 }
 
 #[cfg(windows)]
+impl CaptureFailureDisposition {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::SpawnFailed => "spawn-failed",
+            Self::Timeout => "join-timeout",
+            Self::Panicked => "panicked",
+            Self::Incomplete => "incomplete",
+            Self::ReadFailed => "read-failed",
+        }
+    }
+}
+
+#[cfg(windows)]
 struct DeadlineWatcher {
     stop: Arc<AtomicBool>,
     handle: Option<JoinHandle<()>>,
@@ -204,6 +217,127 @@ struct Operation {
 
 #[cfg(not(windows))]
 struct Operation;
+
+/// One operation-scoped quarantine record.
+///
+/// This keeps the owner/Job lineage, the exact capture-evidence gap, and the
+/// required recovery action together so a per-operation failure never has to
+/// be inferred from executor-wide state.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct QuarantinedOperationRecord {
+    operation_id: OperationId,
+    process_tree_id: ProcessTreeId,
+    job_id: JobId,
+    image_id: ImageId,
+    session_id: SessionId,
+    lifecycle: ProcessLifecycle,
+    evidence_gap: &'static str,
+    capture_failures: Vec<(String, &'static str)>,
+    descendants_complete: Option<bool>,
+    tree_terminated: Option<bool>,
+    cleanup_pending: bool,
+    recovery_action: &'static str,
+}
+
+impl QuarantinedOperationRecord {
+    /// Returns the exact quarantined operation identity.
+    #[must_use]
+    pub const fn operation_id(&self) -> &OperationId {
+        &self.operation_id
+    }
+
+    /// Returns the caller-owned process-tree lineage of the quarantined op.
+    #[must_use]
+    pub const fn process_tree_id(&self) -> &ProcessTreeId {
+        &self.process_tree_id
+    }
+
+    /// Returns the logical Job lineage of the quarantined op.
+    #[must_use]
+    pub const fn job_id(&self) -> &JobId {
+        &self.job_id
+    }
+
+    /// Returns the pinned image lineage of the quarantined op.
+    #[must_use]
+    pub const fn image_id(&self) -> &ImageId {
+        &self.image_id
+    }
+
+    /// Returns the session lineage of the quarantined op.
+    #[must_use]
+    pub const fn session_id(&self) -> &SessionId {
+        &self.session_id
+    }
+
+    /// Returns the fenced lifecycle projection of the quarantined op.
+    #[must_use]
+    pub const fn lifecycle(&self) -> ProcessLifecycle {
+        self.lifecycle
+    }
+
+    /// Returns the exact evidence gap that fenced this operation.
+    #[must_use]
+    pub const fn evidence_gap(&self) -> &'static str {
+        self.evidence_gap
+    }
+
+    /// Returns the per-stream capture failures bound to this operation.
+    #[must_use]
+    pub fn capture_failures(&self) -> &[(String, &'static str)] {
+        &self.capture_failures
+    }
+
+    /// Returns the observed descendant completeness, when a view exists.
+    #[must_use]
+    pub const fn descendants_complete(&self) -> Option<bool> {
+        self.descendants_complete
+    }
+
+    /// Returns the observed tree termination, when a view exists.
+    #[must_use]
+    pub const fn tree_terminated(&self) -> Option<bool> {
+        self.tree_terminated
+    }
+
+    /// Returns whether cleanup/reconciliation is still pending for this op.
+    #[must_use]
+    pub const fn cleanup_pending(&self) -> bool {
+        self.cleanup_pending
+    }
+
+    /// Returns the required explicit recovery action for this op.
+    #[must_use]
+    pub const fn recovery_action(&self) -> &'static str {
+        self.recovery_action
+    }
+}
+
+/// Cheap non-blocking per-dimension executor health projection.
+///
+/// Quarantine is operation-local: one fenced operation never closes
+/// inspection, cancellation, or new starts for independent operations.
+/// A `false` dimension means only that the underlying registry/reservation
+/// mutex is currently contended or poisoned, never that an unrelated
+/// operation failed.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct ExecutorHealthSummary {
+    /// Whether a new operation identity can be reserved right now.
+    pub new_start_ready: bool,
+    /// Whether existing operations remain inspectable right now.
+    pub inspection_available: bool,
+    /// Whether cancellation/containment remains available right now.
+    pub cancellation_available: bool,
+    /// Number of registered operations with incomplete capture/evidence.
+    pub capture_incomplete_operations: usize,
+    /// Number of registered operations awaiting cleanup/reconciliation.
+    pub cleanup_pending_operations: usize,
+    /// Number of registered operations fenced as unknown outcome.
+    pub unknown_outcome_operations: usize,
+    /// Per-operation quarantine records bound to owner/Job lineage,
+    /// evidence gap, and recovery action.
+    pub quarantined_operations: Vec<QuarantinedOperationRecord>,
+}
 
 /// The single governed process executor.  It is deliberately constructed
 /// with an injected authority port so no alternate issuer can be hidden in
@@ -285,6 +419,13 @@ impl WindowsProcessExecutor {
         &self,
         id: OperationId,
     ) -> Result<OperationReservation<'_>, ProcessExecutionError> {
+        // `operations` and `reservations` stay independent dimensions: a
+        // poisoned registry lock never fabricates a reservation entry, and a
+        // poisoned/contended reservation lock never hides or removes a
+        // registered operation.  Duplicate identities fail locally without
+        // stranding a reservation: the `OperationReservation` guard drops at
+        // function exit and releases the id, while registry inserts below
+        // replace only the exact failed identity.
         let operations = self
             .operations
             .lock()
@@ -292,6 +433,9 @@ impl WindowsProcessExecutor {
         if operations.contains_key(&id) {
             return Err(unavailable("operation identity already exists"));
         }
+        // Drop the registry guard before taking the reservation lock so one
+        // contended mutex can never block the independent dimension.
+        drop(operations);
         let mut reservations = self
             .reservations
             .lock()
@@ -303,6 +447,114 @@ impl WindowsProcessExecutor {
             executor: self,
             operation_id: id,
         })
+    }
+
+    /// Returns a cheap non-blocking per-dimension health projection.
+    ///
+    /// Quarantine stays operation-local: a fenced operation is reported in
+    /// `quarantined_operations` with its owner/Job lineage, evidence gap,
+    /// and recovery action, while `new_start_ready`,
+    /// `inspection_available`, and `cancellation_available` keep reflecting
+    /// only whether the shared registry/reservation locks are usable.  One
+    /// quarantined operation never flips the independent dimensions to
+    /// `false`.
+    #[must_use]
+    pub fn operation_health_summary(&self) -> ExecutorHealthSummary {
+        let operations_snapshot = self.operations.lock().ok().map(|registry| {
+            registry
+                .iter()
+                .filter_map(|(id, operation)| {
+                    operation
+                        .lock()
+                        .ok()
+                        .and_then(|guard| quarantined_record(id, &guard))
+                })
+                .collect::<Vec<QuarantinedOperationRecord>>()
+        });
+        let Some(records) = operations_snapshot else {
+            return ExecutorHealthSummary {
+                new_start_ready: false,
+                inspection_available: false,
+                cancellation_available: false,
+                ..ExecutorHealthSummary::default()
+            };
+        };
+        let new_start_ready = self.reservations.try_lock().is_ok();
+        let quarantined_operations = records;
+        let capture_incomplete_operations = quarantined_operations
+            .iter()
+            .filter(|record| {
+                record.evidence_gap() == CAPTURE_EVIDENCE_GAP
+                    || !record.capture_failures().is_empty()
+            })
+            .count();
+        let cleanup_pending_operations = quarantined_operations
+            .iter()
+            .filter(|record| record.cleanup_pending())
+            .count();
+        let unknown_outcome_operations = quarantined_operations
+            .iter()
+            .filter(|record| record.lifecycle() == ProcessLifecycle::UnknownOutcome)
+            .count();
+        ExecutorHealthSummary {
+            new_start_ready,
+            // The registry lock was usable above (we hold its snapshot), so
+            // existing-operation inspection and cancellation/containment stay
+            // available regardless of how many ops are quarantined.
+            inspection_available: true,
+            cancellation_available: true,
+            capture_incomplete_operations,
+            cleanup_pending_operations,
+            unknown_outcome_operations,
+            quarantined_operations,
+        }
+    }
+
+    /// Returns the number of registered operations awaiting
+    /// cleanup/reconciliation without blocking on operation locks.
+    ///
+    /// Registry access failures report `0`; they never fabricate pending
+    /// work and never close the independent inspection/cancel paths.
+    #[must_use]
+    pub fn cleanup_pending_count(&self) -> usize {
+        let Ok(registry) = self.operations.lock() else {
+            return 0;
+        };
+        registry
+            .values()
+            .filter(|operation| {
+                operation.lock().is_ok_and(|guard| {
+                    guard.cleanup_required
+                        || guard.state.view().lifecycle() == ProcessLifecycle::UnknownOutcome
+                })
+            })
+            .count()
+    }
+
+    /// Returns the number of registered operations fenced as unknown
+    /// outcome without blocking on operation locks.
+    #[must_use]
+    pub fn unknown_outcome_count(&self) -> usize {
+        let Ok(registry) = self.operations.lock() else {
+            return 0;
+        };
+        registry
+            .values()
+            .filter(|operation| {
+                operation.lock().is_ok_and(|guard| {
+                    guard.state.view().lifecycle() == ProcessLifecycle::UnknownOutcome
+                })
+            })
+            .count()
+    }
+
+    /// Returns whether a new operation identity can currently be reserved.
+    ///
+    /// This reflects only reservation-lock usability, never the quarantine
+    /// state of unrelated operations.
+    #[must_use]
+    pub fn new_start_ready(&self) -> bool {
+        self.reservations.try_lock().is_ok()
     }
 
     /// Returns the retained non-authoritative stream projections.
@@ -635,32 +887,63 @@ impl ProcessExecutor for WindowsProcessExecutor {
                 capture_failures: capture_failure.into_iter().collect(),
             }));
             if let Some(error) = capture_spawn_error {
-                self.operations
+                // The failed operation stays queryable/cancellable: insert it
+                // into the registry BEFORE returning, fence it as unknown,
+                // and never touch unrelated operations.  `_reservation`
+                // drops here and releases the id; the registry entry keeps
+                // the exact identity reserved for reconcile/shutdown.
+                if self
+                    .operations
                     .lock()
-                    .map_err(|_| unavailable("operation registry lock poisoned"))?
-                    .insert(operation_id.clone(), Arc::clone(&operation));
+                    .map(|mut registry| {
+                        registry.insert(operation_id.clone(), Arc::clone(&operation));
+                    })
+                    .is_err()
+                {
+                    let mut guard = operation
+                        .lock()
+                        .map_err(|_| unavailable("operation lock poisoned"))?;
+                    quarantine_operation(&mut guard);
+                    return Err(ProcessExecutionError::UnknownOutcome);
+                }
                 let mut guard = operation
                     .lock()
                     .map_err(|_| unavailable("operation lock poisoned"))?;
                 quarantine_operation(&mut guard);
+                let _ = quarantine_snapshot(&operation_id, &guard, CAPTURE_EVIDENCE_GAP);
                 return Err(error);
             }
             let Ok(deadline_watcher) = spawn_deadline_watcher(&operation) else {
+                // Same isolation contour as the capture-spawn path: the
+                // watcher-less operation is registered first so it stays
+                // inspectable/cancellable/reconcilable, fenced locally, and
+                // never blocks independent operations.
                 let mut guard = operation
                     .lock()
                     .map_err(|_| unavailable("operation lock poisoned"))?;
                 if finalize_operation(&mut guard, ExitDisposition::Unknown, false).is_err() {
                     quarantine_operation(&mut guard);
                 }
+                quarantine_operation(&mut guard);
+                let _ = quarantine_snapshot(&operation_id, &guard, WATCHER_EVIDENCE_GAP);
                 drop(guard);
-                self.operations
+                if self
+                    .operations
                     .lock()
-                    .map_err(|_| unavailable("operation registry lock poisoned"))?
-                    .insert(operation_id.clone(), Arc::clone(&operation));
+                    .map(|mut registry| {
+                        registry.insert(operation_id.clone(), Arc::clone(&operation));
+                    })
+                    .is_err()
+                {
+                    return Err(ProcessExecutionError::UnknownOutcome);
+                }
                 return Err(ProcessExecutionError::UnknownOutcome);
             };
             let Ok(mut guard) = operation.lock() else {
                 let _ = join_deadline_watcher(deadline_watcher);
+                // The operation was never registered; the reservation guard
+                // releases the identity so a retry with the same id can start
+                // cleanly and no reservation is stranded.
                 return Err(ProcessExecutionError::UnknownOutcome);
             };
             guard.deadline_watcher = Some(deadline_watcher);
@@ -673,10 +956,17 @@ impl ProcessExecutor for WindowsProcessExecutor {
                 Err(_) => false,
             };
             let Ok(mut guard) = operation.lock() else {
+                // Never stranding: the operation was never registered, so the
+                // reservation guard releases the exact identity and a retry
+                // with the same id can start cleanly.
                 return Err(ProcessExecutionError::UnknownOutcome);
             };
             if !published {
+                // Sink-publication failure is operation-local: fence this op,
+                // register it so it stays inspectable/cancellable/
+                // reconcilable, and return without touching unrelated ops.
                 quarantine_operation(&mut guard);
+                let _ = quarantine_snapshot(&operation_id, &guard, SINK_EVIDENCE_GAP);
                 drop(guard);
                 if let Ok(mut registry) = self.operations.lock() {
                     registry
@@ -685,12 +975,26 @@ impl ProcessExecutor for WindowsProcessExecutor {
                 }
                 return Err(ProcessExecutionError::UnknownOutcome);
             }
-            self.operations
+            if self
+                .operations
                 .lock()
-                .map_err(|_| ProcessExecutionError::UnknownOutcome)?
-                .insert(operation_id, Arc::clone(&operation));
-            let Ok(receipt) = ProcessStartReceipt::new(&guard.state) else {
+                .map(|mut registry| {
+                    registry.insert(operation_id.clone(), Arc::clone(&operation));
+                })
+                .is_err()
+            {
+                // A poisoned registry on the success path must not fabricate
+                // success: fence the (unregistered) operation locally and
+                // report unknown while leaving every other operation alone.
                 quarantine_operation(&mut guard);
+                return Err(ProcessExecutionError::UnknownOutcome);
+            }
+            let Ok(receipt) = ProcessStartReceipt::new(&guard.state) else {
+                // The operation is already registered above, so the receipt
+                // failure stays local: fence this op, keep it queryable for
+                // reconcile/shutdown, and never close unrelated paths.
+                quarantine_operation(&mut guard);
+                let _ = quarantine_snapshot(&operation_id, &guard, RECEIPT_EVIDENCE_GAP);
                 return Err(ProcessExecutionError::UnknownOutcome);
             };
             Ok(receipt)
@@ -1029,6 +1333,95 @@ fn fence_unknown(operation: &mut Operation) -> Result<(), ProcessExecutionError>
 fn quarantine_operation(operation: &mut Operation) {
     operation.cleanup_required = true;
     let _ = fence_unknown(operation);
+}
+
+/// Exact evidence-gap labels surfaced per quarantined operation.
+#[cfg(windows)]
+const CAPTURE_EVIDENCE_GAP: &str = "capture-thread spawn failed";
+#[cfg(windows)]
+const SINK_EVIDENCE_GAP: &str = "initial evidence sink publication failed";
+#[cfg(windows)]
+const WATCHER_EVIDENCE_GAP: &str = "deadline watcher unavailable";
+#[cfg(windows)]
+const RECEIPT_EVIDENCE_GAP: &str = "start receipt binding invalid";
+#[cfg(windows)]
+const RECOVERY_ACTION: &str = "reconcile-or-cleanup explicit disposition; shutdown retains owner";
+
+#[cfg(windows)]
+fn quarantine_snapshot(
+    id: &OperationId,
+    operation: &Operation,
+    evidence_gap: &'static str,
+) -> QuarantinedOperationRecord {
+    let view = operation.state.view();
+    let binding = view.binding();
+    let descendants = view.descendants();
+    QuarantinedOperationRecord {
+        operation_id: id.clone(),
+        process_tree_id: binding.process_tree_id().clone(),
+        job_id: binding.job_id().clone(),
+        image_id: binding.image_id().clone(),
+        session_id: binding.session_id().clone(),
+        lifecycle: view.lifecycle(),
+        evidence_gap,
+        capture_failures: operation
+            .capture_failures
+            .iter()
+            .map(|failure| (failure.stream.to_owned(), failure.disposition.as_str()))
+            .collect(),
+        descendants_complete: descendants.map(DescendantEvidence::complete),
+        tree_terminated: descendants.map(DescendantEvidence::tree_terminated),
+        cleanup_pending: operation.cleanup_required
+            || view.lifecycle() == ProcessLifecycle::UnknownOutcome,
+        recovery_action: RECOVERY_ACTION,
+    }
+}
+
+#[cfg(windows)]
+fn quarantined_record(
+    id: &OperationId,
+    operation: &Operation,
+) -> Option<QuarantinedOperationRecord> {
+    if !operation.cleanup_required
+        && operation.state.view().lifecycle() != ProcessLifecycle::UnknownOutcome
+    {
+        return None;
+    }
+    let view = operation.state.view();
+    let binding = view.binding();
+    let descendants = view.descendants();
+    let evidence_gap = if operation.capture_failures.is_empty() {
+        "unknown outcome fenced; cleanup/reconciliation pending"
+    } else {
+        CAPTURE_EVIDENCE_GAP
+    };
+    Some(QuarantinedOperationRecord {
+        operation_id: id.clone(),
+        process_tree_id: binding.process_tree_id().clone(),
+        job_id: binding.job_id().clone(),
+        image_id: binding.image_id().clone(),
+        session_id: binding.session_id().clone(),
+        lifecycle: view.lifecycle(),
+        evidence_gap,
+        capture_failures: operation
+            .capture_failures
+            .iter()
+            .map(|failure| (failure.stream.to_owned(), failure.disposition.as_str()))
+            .collect(),
+        descendants_complete: descendants.map(DescendantEvidence::complete),
+        tree_terminated: descendants.map(DescendantEvidence::tree_terminated),
+        cleanup_pending: operation.cleanup_required
+            || view.lifecycle() == ProcessLifecycle::UnknownOutcome,
+        recovery_action: RECOVERY_ACTION,
+    })
+}
+
+#[cfg(not(windows))]
+fn quarantined_record(
+    _id: &OperationId,
+    _operation: &Operation,
+) -> Option<QuarantinedOperationRecord> {
+    None
 }
 
 #[cfg(windows)]
@@ -2287,6 +2680,231 @@ mod tests {
         let retained = block_on(executor.inspect(operation_id))?;
         assert_eq!(retained.operation_id(), evidence.operation_id());
         assert_eq!(retained.binding(), evidence.binding());
+        Ok(())
+    }
+
+    fn failed_start_request(op_tag: &str) -> Result<ProcessRequest, Box<dyn std::error::Error>> {
+        // Pre-spawn validation failure: the tampered digest fails before any
+        // child exists, so the failing start must release its reservation
+        // without registering an operation.
+        let executable = r"C:\Windows\System32\cmd.exe";
+        let working_directory = std::env::temp_dir().to_string_lossy().into_owned();
+        let generation = Generation::new(1)?;
+        let fence = FencingToken::new(test_epoch(1), generation, format!("fence-82-{op_tag}"))?;
+        let mut authority = DispatchPermitAuthority::activate(
+            DispatchAuthorityId::new(format!("auth-82-{op_tag}"))?,
+            KernelDispatchKey::from_secret_bytes([0x5a; 32])?,
+        );
+        let operation_id = OperationId::new(format!("op-82-{op_tag}"))?;
+        let intent = ProcessIntent::new(
+            operation_id,
+            ProcessTreeId::new(format!("tree-82-{op_tag}"))?,
+            JobId::new(format!("job-82-{op_tag}"))?,
+            ImageId::new(format!("image-82-{op_tag}"))?,
+            SessionId::new(format!("session-82-{op_tag}"))?,
+            generation,
+            executable,
+            "0".repeat(64),
+            vec!["/c".to_owned(), "echo".to_owned(), "hi".to_owned()],
+            working_directory,
+            EnvironmentProjection::default(),
+            ResourceLimits::new(30_000, Some(10_000), Some(512_000_000), 4_096, 4_096, 4)?,
+        )?;
+        let permit = authority.issue(
+            &intent,
+            PermitIssuance::new(
+                ActionLeaseRef::new(format!("lease-82-{op_tag}"))?,
+                fence,
+                revisions(),
+                100,
+                10_000,
+                format!("nonce-82-{op_tag}"),
+            )?,
+        )?;
+        Ok(ProcessRequest::new(intent, permit)?)
+    }
+
+    #[test]
+    fn failed_start_releases_reservation_without_stranding()
+    -> Result<(), Box<dyn std::error::Error>> {
+        // Pure reservation/release logic: runs everywhere, no child spawned.
+        // A pre-spawn start failure must release its exact reservation (the
+        // guard drops on the error path) without registering an operation,
+        // so a retry with a corrected request for the same identity can
+        // reserve cleanly instead of hitting a stranded reservation.
+        let executor = WindowsProcessExecutor::new(Arc::new(DummyPort));
+        let first = failed_start_request("retry-a")?;
+        let operation_id = first.operation_id().clone();
+        let sink: Arc<dyn ProcessEvidenceSink> = Arc::new(RecordingSink::default());
+        assert!(matches!(
+            block_on(executor.start(first, sink)),
+            Err(ProcessExecutionError::Unavailable(_))
+        ));
+        assert!(matches!(
+            block_on(executor.inspect(operation_id.clone())),
+            Err(ProcessExecutionError::NotFound)
+        ));
+        // The reservation was released: reserving the same identity again
+        // must succeed instead of reporting a duplicate.
+        let guard = executor.reserve_operation(operation_id.clone());
+        assert!(guard.is_ok());
+        drop(guard);
+        // And a duplicate reservation held concurrently still fails locally.
+        let first_hold = executor.reserve_operation(operation_id.clone());
+        assert!(first_hold.is_ok());
+        assert!(matches!(
+            executor.reserve_operation(operation_id),
+            Err(ProcessExecutionError::Unavailable(_))
+        ));
+        drop(first_hold);
+        Ok(())
+    }
+
+    #[test]
+    fn health_summary_starts_empty_with_all_paths_available() {
+        // Pure-logic health projection: runs everywhere including Linux.
+        // With no operations registered, per-dimension counts are zero while
+        // every independent dimension stays available.
+        let executor = WindowsProcessExecutor::new(Arc::new(DummyPort));
+        let summary = executor.operation_health_summary();
+        assert!(summary.new_start_ready);
+        assert!(summary.inspection_available);
+        assert!(summary.cancellation_available);
+        assert_eq!(summary.capture_incomplete_operations, 0);
+        assert_eq!(summary.cleanup_pending_operations, 0);
+        assert_eq!(summary.unknown_outcome_operations, 0);
+        assert!(summary.quarantined_operations.is_empty());
+        assert_eq!(executor.cleanup_pending_count(), 0);
+        assert_eq!(executor.unknown_outcome_count(), 0);
+        assert!(executor.new_start_ready());
+    }
+
+    #[test]
+    #[cfg(windows)]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "the quarantined-op lineage/gap/recovery assertions are the issue-82 acceptance surface"
+    )]
+    fn sink_failure_quarantines_one_operation_without_closing_independent_paths()
+    -> Result<(), Box<dyn std::error::Error>> {
+        // Operation-local sink-publication failure in start(): the failed op
+        // is retained as UnknownOutcome, stays queryable/cancellable, and is
+        // surfaced in the health summary while independent start/inspect
+        // dimensions stay available for other operations.
+        let executable = r"C:\Windows\System32\cmd.exe";
+        let digest = super::sha256_file(std::path::Path::new(executable))?;
+        let working_directory = std::env::temp_dir().to_string_lossy().into_owned();
+        let operation_id = OperationId::new("op-82-sink-iso")?;
+        let generation = Generation::new(1)?;
+        let intent = ProcessIntent::new(
+            operation_id.clone(),
+            ProcessTreeId::new("tree-82-sink-iso")?,
+            JobId::new("job-82-sink-iso")?,
+            ImageId::new("image-82-sink-iso")?,
+            SessionId::new("session-82-sink-iso")?,
+            generation,
+            executable,
+            digest,
+            vec![
+                "/c".to_owned(),
+                "ping".to_owned(),
+                "-n".to_owned(),
+                "5".to_owned(),
+                "127.0.0.1".to_owned(),
+            ],
+            working_directory,
+            EnvironmentProjection::default(),
+            ResourceLimits::new(30_000, Some(10_000), Some(512_000_000), 4_096, 4_096, 4)?,
+        )?;
+        let fence = FencingToken::new(test_epoch(1), generation, "fence-82-sink-iso")?;
+        let mut authority = DispatchPermitAuthority::activate(
+            DispatchAuthorityId::new("auth-82-sink-iso")?,
+            KernelDispatchKey::from_secret_bytes([0x5a; 32])?,
+        );
+        let permit = authority.issue(
+            &intent,
+            PermitIssuance::new(
+                ActionLeaseRef::new("lease-82-sink-iso")?,
+                fence.clone(),
+                revisions(),
+                100,
+                10_000,
+                "nonce-82-sink-iso",
+            )?,
+        )?;
+        let request = ProcessRequest::new(intent, permit)?;
+        let context = DispatchValidationContext::new(
+            ClockObservation {
+                valid_time_ms: Some(150),
+                known_time_ms: Some(150),
+                transaction_sequence: None,
+                monotonic_ns: Some(1),
+            },
+            fence,
+            test_epoch(1),
+            revisions(),
+            41,
+        )?;
+        let port = FakePort {
+            authority: Mutex::new(authority),
+            context,
+        };
+        let executor = WindowsProcessExecutor::new(Arc::new(port));
+        let sink_dyn: Arc<dyn ProcessEvidenceSink> = Arc::new(FailingSink);
+        let result = block_on(executor.start(request, sink_dyn));
+        assert!(matches!(result, Err(ProcessExecutionError::UnknownOutcome)));
+        // The failed op stays retained as UnknownOutcome: queryable and
+        // cancellable, never silently dropped.
+        let inspected = block_on(executor.inspect(operation_id.clone()))?;
+        assert_eq!(inspected.lifecycle(), ProcessLifecycle::UnknownOutcome);
+        assert_eq!(inspected.operation_id(), &operation_id);
+        // Health summary reflects exactly one quarantined op bound to its
+        // owner/Job lineage, evidence gap, and recovery action, while the
+        // independent dimensions stay available for other operations.
+        let summary = executor.operation_health_summary();
+        assert!(summary.new_start_ready);
+        assert!(summary.inspection_available);
+        assert!(summary.cancellation_available);
+        assert_eq!(summary.unknown_outcome_operations, 1);
+        assert_eq!(summary.cleanup_pending_operations, 1);
+        assert_eq!(summary.quarantined_operations.len(), 1);
+        let record = &summary.quarantined_operations[0];
+        assert_eq!(record.operation_id(), &operation_id);
+        assert_eq!(record.process_tree_id().as_str(), "tree-82-sink-iso");
+        assert_eq!(record.job_id().as_str(), "job-82-sink-iso");
+        assert_eq!(record.image_id().as_str(), "image-82-sink-iso");
+        assert_eq!(record.session_id().as_str(), "session-82-sink-iso");
+        assert_eq!(record.lifecycle(), ProcessLifecycle::UnknownOutcome);
+        assert!(!record.evidence_gap().is_empty());
+        assert!(record.cleanup_pending());
+        assert!(!record.recovery_action().is_empty());
+        assert!(matches!(record.descendants_complete(), None | Some(false)));
+        assert!(matches!(record.tree_terminated(), None | Some(false)));
+        assert_eq!(executor.unknown_outcome_count(), 1);
+        assert_eq!(executor.cleanup_pending_count(), 1);
+        assert!(executor.new_start_ready());
+        // The quarantined op is retained for containment/cleanup: cancel
+        // either proves closure or keeps the typed unknown via the
+        // reconcile-or-cleanup path, never NotFound and never a fabricated
+        // success.  A contract-level `UnknownOutcomeRequiresReconciliation`
+        // error is the same honest containment signal as `UnknownOutcome`.
+        match block_on(executor.cancel(operation_id.clone())) {
+            Ok(receipt) => {
+                assert_eq!(receipt.status(), CancellationStatus::Completed);
+            }
+            Err(
+                ProcessExecutionError::UnknownOutcome
+                | ProcessExecutionError::Contract(
+                    eliot_process::ContractError::UnknownOutcomeRequiresReconciliation,
+                ),
+            ) => {
+                let view = block_on(executor.inspect(operation_id))?;
+                assert_eq!(view.lifecycle(), ProcessLifecycle::UnknownOutcome);
+            }
+            Err(other) => {
+                return Err(format!("quarantined op must stay cancellable, got {other:?}").into());
+            }
+        }
         Ok(())
     }
 }
