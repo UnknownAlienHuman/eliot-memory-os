@@ -60,15 +60,15 @@ use controlboard_adapters::SharedOperatorReplay;
 use activation_projection::map_activation_snapshot;
 
 pub use daemon_config::DaemonConfig;
-pub use daemon_kernel_client::DaemonKernelClient;
-pub use daemon_kernel_client::OwnerSessionFacts;
 pub(crate) use daemon_kernel_client::kernel_port_error;
+pub use daemon_kernel_client::{DaemonKernelClient, LocalReadSubmitOutcome, OwnerSessionFacts};
 #[cfg(test)]
 pub(crate) use daemon_kernel_client::{KernelClientError, WireOutcome, operation_payload};
 #[cfg(all(test, windows))]
 pub(crate) use daemon_kernel_client::{
     is_pre_admission_pending_rejection, retry_pre_admission, validate_server_hello,
 };
+pub use daemon_kernel_client::{parse_local_read_claimed_pair, parse_local_read_submit_outcome};
 pub(crate) use daemon_kernel_port_adapters::kind_value;
 pub use dreamer_admission::{
     DREAMER_JOB_WIRE_ID, DreamerJobQueue, GovernorDreamerAdapter, KernelDreamerJobQueue,
@@ -85,7 +85,10 @@ pub use dreamer_materials::{
 pub use dreamer_model_adapter::{
     DreamerModelExecution, GovernedDreamerModelAdapter, ModelInvokeInput,
 };
-pub use governor_local_read::{answer_evidence_query, answer_projection_inputs};
+pub use governor_local_read::{
+    answer_evidence_query, answer_projection_inputs, forward_admitted_local_read,
+    serve_admitted_local_read,
+};
 pub(crate) use kernel_authority_client::KernelAuthorityClient;
 pub use kernel_context_read_client::{KernelContextReadClient, ReconstructionReadComposition};
 pub use store_failure_projection::{GovernorStoreFailureProjection, GovernorStoreProjectionError};
