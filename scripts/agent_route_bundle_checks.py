@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+import re
 from pathlib import Path
 from typing import Any
 
@@ -19,6 +20,84 @@ SCHEMA = "integrations/agent-runtimes/route-profile.schema.json"
 README = "integrations/agent-runtimes/README.md"
 PLUGIN = "integrations/opencode/plugins/eliot.js"
 JUSTFILE = "Justfile"
+
+DISPOSITIONS = (
+    "live-admitted",
+    "unavailable-target",
+    "compatibility-with-expiry",
+    "removal",
+)
+IDENTITY_BLOCK_KEYS = ("identity", "bundle_identity", "generation")
+_HEX_DIGEST_RE = re.compile(r"^[0-9a-f]+$")
+_HEX_DIGEST_LENGTHS = frozenset({32, 40, 48, 64, 96, 128})
+_DIGEST_NAME_RE = re.compile(r"(?:^|_)(sha256|sha512|sha384|sha1|md5|digest|hash|blake3)$")
+
+
+def _digest_like(name: str) -> bool:
+    return _DIGEST_NAME_RE.search(str(name).lower().replace("-", "_")) is not None
+
+
+def _identity_node_errors(name: str, value: Any, where: str, out: list[Finding]) -> None:
+    """Validate a Part A disposition/identity field generically.
+
+    Digest-shaped fields must be well-formed lowercase hex, disposition fields
+    must name a known disposition, and version fields must be non-empty strings.
+    Anything else passes through so the identity schema can grow without a
+    checker change. Malformed identity is a hard violation.
+    """
+    normalized = str(name).lower().replace("-", "_")
+    if normalized == "disposition":
+        if value not in DISPOSITIONS:
+            add(out, "route_disposition_invalid", where, repr(value))
+        return
+    if normalized in {"schema_version", "identity_version", "version"}:
+        if not isinstance(value, str) or not value.strip():
+            add(out, "route_identity_malformed", where, f"{name}: version must be a non-empty string")
+        return
+    if _digest_like(name):
+        if isinstance(value, list):
+            if not value:
+                add(out, "route_identity_malformed", where, f"{name}: digest list is empty")
+            for index, child in enumerate(value):
+                _identity_node_errors(name, child, f"{where}#{name}[{index}]", out)
+            return
+        if (
+            not isinstance(value, str)
+            or len(value) not in _HEX_DIGEST_LENGTHS
+            or _HEX_DIGEST_RE.match(value) is None
+        ):
+            add(out, "route_identity_malformed", where, f"{name}: malformed digest (expected lowercase hex)")
+        return
+    if isinstance(value, dict):
+        for key, child in value.items():
+            if not isinstance(key, str) or not key:
+                add(out, "route_identity_malformed", where, "identity mapping requires string keys")
+                continue
+            _identity_node_errors(key, child, where, out)
+    elif isinstance(value, list):
+        for index, child in enumerate(value):
+            _identity_node_errors(name, child, f"{where}#{name}[{index}]", out)
+
+
+def identity_errors(profile: Any, host: str, root: Path | None = None) -> list[Finding]:
+    """Validate declared disposition/identity without ever granting admission.
+
+    A `live-admitted` disposition on a NOT_EXECUTED static profile is treated as
+    a forged admission claim: static files cannot mint route readiness.
+    """
+    relative = PROFILE.format(host=host)
+    out: list[Finding] = []
+    if not isinstance(profile, dict):
+        return out
+    _identity_node_errors("profile", profile, relative, out)
+    if profile.get("disposition") == "live-admitted" and profile.get("evidence_execution_status") == "NOT_EXECUTED":
+        add(
+            out,
+            "route_disposition_overclaim",
+            relative,
+            "static bundle cannot admit an unexecuted route",
+        )
+    return out
 
 
 def read_json(root: Path, relative: str, out: list[Finding]) -> dict[str, Any] | None:
@@ -139,6 +218,7 @@ def verify(root: Path) -> list[Finding]:
         if profile is not None:
             validate_profile_schema(validator, profile, relative, out)
             out.extend(profile_errors(profile, host, root))
+            out.extend(identity_errors(profile, host, root))
     plugin_path = root / PLUGIN
     if not plugin_path.is_file():
         add(out, "opencode_plugin_missing", PLUGIN, "plugin is absent")
