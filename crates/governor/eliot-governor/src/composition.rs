@@ -63,8 +63,14 @@ use thiserror::Error;
 #[path = "authority_recovery.rs"]
 mod authority_recovery;
 pub use authority_recovery::{
-    AuthorityOwner, AuthorityOwnerSnapshot, AuthorityPresentationState, PresentedAuthorityRequest,
-    RetainedAuthorityRequest,
+    AuthorityOwner, AuthorityOwnerSnapshot, AuthorityPresentationState, AuthorityRestoreOutcome,
+    PresentedAuthorityRequest, RetainedAuthorityRequest,
+};
+#[path = "authority_revocation.rs"]
+mod authority_revocation;
+pub use authority_revocation::{
+    authority_revocation_envelope, decode_revocation_history_evidence,
+    revocation_history_read_request,
 };
 #[path = "genesis_owner_packet.rs"]
 mod genesis_owner_packet;
