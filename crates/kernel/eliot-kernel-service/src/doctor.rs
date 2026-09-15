@@ -9,11 +9,13 @@
 //! crate: a versioned wire request, a closed admission gate, a canonical
 //! admission receipt, and typed rejection and conflict answers.
 //!
-//! The operation is unadvertised and inert by default
-//! ([`DOCTOR_REPAIR_ADVERTISED`] is `false`): Doctor's closed executor
-//! fails closed with `KERNEL_ADMISSION_REQUIRED` until the binary slice
-//! wires the front-door dispatch arm through [`route_doctor_repair`].
-//! Nothing here executes a repair, stores credentials, models, or shell
+//! The operation is unadvertised and inert without a composed front-door
+//! owner ([`DOCTOR_REPAIR_ADVERTISED`] is `false`): Doctor's closed executor
+//! fails closed with `KERNEL_ADMISSION_REQUIRED` until the Kernel
+//! composition binds the production ledger, the immutable recipe registry,
+//! and the principal owner through [`ComposedDoctorFrontDoor`], at which
+//! point [`advertise_doctor_repair`] derives `true` from that real composed
+//! state. Nothing here executes a repair, stores credentials, models, or shell
 //! access, or interprets task semantics: Kernel validates immutable
 //! identity, principal, epoch and fence, ordering, transition class,
 //! operation manifest, and generation compatibility only.
@@ -51,9 +53,13 @@ use crate::{KernelServiceError, KernelServiceState, validate_text};
 pub const DOCTOR_REPAIR_WIRE_ID: &str = "eliot.kernel.doctor-repair-attempt";
 /// Current version of the Kernel-owned Doctor repair-attempt wire.
 pub const DOCTOR_REPAIR_WIRE_VERSION: u16 = 1;
-/// Advertisement for the Doctor repair operation: inert until the binary
-/// slice lands. Doctor's closed executor treats `false` as
-/// `KERNEL_ADMISSION_REQUIRED` and performs nothing.
+/// Advertisement for the Doctor repair operation when no front-door owner is
+/// composed: inert by default. Doctor's closed executor treats `false` as
+/// `KERNEL_ADMISSION_REQUIRED` and performs nothing. The composed
+/// advertisement is derived per call from a real
+/// [`ComposedDoctorFrontDoor`] through [`advertise_doctor_repair`]; this
+/// constant is only the uncomposed fail-closed default, never flipped in
+/// place.
 pub const DOCTOR_REPAIR_ADVERTISED: bool = false;
 /// Owner label minted on every S2 recovery lease. The lease is issued by
 /// Kernel admission only; Doctor never supplies lease authority.
@@ -68,12 +74,95 @@ pub const DOCTOR_MAX_ENVELOPE_BYTES: usize = 65_536;
 /// Maximum changed-dimension entries admitted in one Doctor conflict report.
 pub const DOCTOR_CONFLICT_MAX_FIELDS: usize = 32;
 
-/// Returns whether Kernel currently advertises the Doctor repair operation.
+/// Proof that the Kernel composition bound the production Doctor
+/// ledger, the immutable recipe registry, and the principal owner
+/// (DISPATCH-CONTOUR-2 Slice B, issues #461 and #22).
 ///
-/// Always `false` in Slice 2: the tree stays fail-closed until the binary
-/// slice wires the front-door dispatch arm.
-pub fn advertise_doctor_repair() -> bool {
-    DOCTOR_REPAIR_ADVERTISED
+/// Constructed only through [`Self::compose`], which requires all three at
+/// once: a live production ledger reference (possession proves the durable
+/// recovery ledger is composed — the store slice implements
+/// [`DoctorRecoveryLedger`](eliot_ors::DoctorRecoveryLedger) over redb),
+/// a non-empty immutable registry (possession proves the recipe content
+/// authority is composed — Kernel-service mints no recipe here), and bounded
+/// principal text (the Kernel-owned principal the front-door session binds,
+/// never envelope bytes). No authority is minted here: the value only
+/// carries references the supplying composition already owns, and every
+/// admission, conflict, rejection, and reconciliation answer still comes
+/// from the unchanged gate below.
+pub struct ComposedDoctorFrontDoor<'a> {
+    ledger: &'a dyn DoctorRecoveryLedger,
+    registry: &'a DoctorRecipeRegistry,
+    principal_ref: &'a str,
+}
+
+impl<'a> ComposedDoctorFrontDoor<'a> {
+    /// Composes the front-door owner from the production ledger, the
+    /// immutable registry, and the Kernel-owned principal reference.
+    ///
+    /// Fails closed when the principal is not bounded wire text or the
+    /// registry admits no recipe revision.
+    pub fn compose(
+        ledger: &'a dyn DoctorRecoveryLedger,
+        registry: &'a DoctorRecipeRegistry,
+        principal_ref: &'a str,
+    ) -> Result<Self, KernelServiceError> {
+        validate_wire_text(principal_ref, "doctor_repair.principal")?;
+        if registry.recipe_count() == 0 {
+            return Err(KernelServiceError::InvalidField {
+                field: "doctor_repair.registry",
+                reason: "the composed doctor registry admits no recipe",
+            });
+        }
+        Ok(Self {
+            ledger,
+            registry,
+            principal_ref,
+        })
+    }
+
+    /// Returns true exactly when the composed owner advertises the repair
+    /// operation: the immutable registry carries at least one recipe
+    /// revision and a Kernel-owned principal is bound.
+    ///
+    /// Derived from composed state on every call — never a hardcoded
+    /// constant. The value can only exist when [`Self::compose`] already
+    /// proved all three bindings, so `true` here always names a real
+    /// composed owner.
+    #[must_use]
+    pub fn advertises_repair(&self) -> bool {
+        self.registry.recipe_count() > 0 && !self.principal_ref.is_empty()
+    }
+
+    /// Returns the composed production ledger.
+    #[must_use]
+    pub fn ledger(&self) -> &'a dyn DoctorRecoveryLedger {
+        self.ledger
+    }
+
+    /// Returns the composed immutable recipe registry.
+    #[must_use]
+    pub fn registry(&self) -> &'a DoctorRecipeRegistry {
+        self.registry
+    }
+
+    /// Returns the composed Kernel-owned principal reference.
+    #[must_use]
+    pub fn principal_ref(&self) -> &'a str {
+        self.principal_ref
+    }
+}
+
+/// Returns whether Kernel currently advertises the Doctor repair operation
+/// through the given composed front-door owner.
+///
+/// True exactly when a real composition bound the production ledger, a
+/// non-empty immutable registry, and the principal owner
+/// ([`ComposedDoctorFrontDoor::advertises_repair`]). Without a composed
+/// owner the operation stays inert ([`DOCTOR_REPAIR_ADVERTISED`] is `false`)
+/// and Doctor's closed executor keeps failing closed with
+/// `KERNEL_ADMISSION_REQUIRED`.
+pub fn advertise_doctor_repair(owner: &ComposedDoctorFrontDoor<'_>) -> bool {
+    owner.advertises_repair()
 }
 
 /// Routes one wire identity to the Doctor repair admission gate.
@@ -2021,4 +2110,501 @@ pub fn reconcile_doctor_repair_admission(
     );
     Ok(admission.lease_expires_unix_nanos == expected_lease
         && admission.lease_owner == DOCTOR_RECOVERY_LEASE_OWNER)
+}
+
+#[cfg(test)]
+mod tests {
+    #![allow(clippy::expect_used, clippy::unwrap_used)]
+    //! DISPATCH-CONTOUR-2 Slice B behaviour checks (issues #461 and #22).
+    //!
+    //! The ledger below is the same fail-closed in-memory shape used by the
+    //! existing doctor integration tests: it implements the exact
+    //! `DoctorRecoveryLedger` first-writer-wins contract from its trait docs
+    //! (exact replay returns the durable row, changed terms conflict, no row
+    //! is ever overwritten). `eliot-ors` ships no reusable in-memory ledger,
+    //! so this module reuses the existing doctor-test ledger shape instead
+    //! of inventing a new ledger type. Test-only scaffolding, never
+    //! authority.
+    //!
+    //! Proven here: a real composed owner (production ledger reference,
+    //! non-empty immutable registry, Kernel-owned principal) advertises
+    //! `true` through [`advertise_doctor_repair`] while the uncomposed
+    //! default stays `false`; composing with a blank principal fails
+    //! closed; an exact replay under one attempt identity rebuilds the
+    //! original admission digest (lost-reply rule: no recompute under a new
+    //! id); and a foreign-lineage envelope is refused typed, never
+    //! admitted.
+
+    use std::collections::HashMap;
+    use std::num::NonZeroU64;
+    use std::sync::Mutex;
+
+    use eliot_contracts::{EpochId, EpochLineageId};
+    use eliot_doctor_core::{
+        ClosedRepairRequest, ClosedRequestParams, DiagnosticBrief, EvidenceHandle, RecoveryLease,
+        RegisteredOperation, RepairClass, RepairRecipe, RepairRecipeManifest, StateFence,
+    };
+    use eliot_ors::{
+        DoctorAttemptAdmission, DoctorAttemptRecord, DoctorAttemptStageOutcome, DoctorAttemptState,
+        DoctorBudgetLedger, DoctorEffectOutcomeReport, DoctorEffectRecord,
+        DoctorEffectStageOutcome, DoctorEffectState, DoctorLedgerError, DoctorRecoveryLedger,
+        OpaqueLabel, OperationIdentity,
+    };
+    use serde::de::DeserializeOwned;
+
+    use super::*;
+
+    const LINEAGE_A: &str = "550e8400-e29b-41d4-a716-446655440000";
+    const LINEAGE_FOREIGN: &str = "6ba7b810-9dad-11d1-80b4-00c04fd430c8";
+    const EPOCH_SEQUENCE: u64 = 4;
+    const GENERATION: u64 = 7;
+    const NOW_UNIX_NANOS: u64 = 1_700_000_000_000_000_000;
+
+    /// Fail-closed in-memory test ledger. Same shape and contract as the
+    /// ledger in the existing doctor integration tests; see the module
+    /// header.
+    struct TestLedger {
+        attempts: Mutex<HashMap<String, DoctorAttemptRecord>>,
+        effects: Mutex<HashMap<String, DoctorEffectRecord>>,
+        budgets: Mutex<HashMap<String, DoctorBudgetLedger>>,
+    }
+
+    impl TestLedger {
+        fn new() -> Self {
+            Self {
+                attempts: Mutex::new(HashMap::new()),
+                effects: Mutex::new(HashMap::new()),
+                budgets: Mutex::new(HashMap::new()),
+            }
+        }
+    }
+
+    impl DoctorRecoveryLedger for TestLedger {
+        fn stage_doctor_attempt(
+            &self,
+            record: &DoctorAttemptRecord,
+        ) -> Result<DoctorAttemptStageOutcome, DoctorLedgerError> {
+            let storage = |reason: String| DoctorLedgerError::Storage(reason);
+            record
+                .validate()
+                .map_err(|error| storage(error.to_string()))?;
+            let mut attempts = self.attempts.lock().expect("test ledger lock");
+            let key = record.record_key();
+            if let Some(durable) = attempts.get(&key) {
+                if durable.same_binding(record) {
+                    return Ok(DoctorAttemptStageOutcome::Existing(durable.clone()));
+                }
+                return Err(DoctorLedgerError::AttemptIdentityConflict {
+                    attempt_digest: key,
+                });
+            }
+            attempts.insert(key, record.clone());
+            Ok(DoctorAttemptStageOutcome::Stored(record.clone()))
+        }
+
+        fn load_doctor_attempt(
+            &self,
+            attempt_digest: &OperationIdentity,
+        ) -> Result<Option<DoctorAttemptRecord>, DoctorLedgerError> {
+            let attempts = self.attempts.lock().expect("test ledger lock");
+            Ok(attempts.get(attempt_digest.as_str()).cloned())
+        }
+
+        fn advance_doctor_attempt(
+            &self,
+            attempt_digest: &OperationIdentity,
+            target: DoctorAttemptState,
+            admission: Option<&DoctorAttemptAdmission>,
+        ) -> Result<Option<DoctorAttemptRecord>, DoctorLedgerError> {
+            let storage = |reason: String| DoctorLedgerError::Storage(reason);
+            let mut attempts = self.attempts.lock().expect("test ledger lock");
+            let Some(current) = attempts.get_mut(attempt_digest.as_str()) else {
+                return Ok(None);
+            };
+            if current.state == target {
+                let replayed = match (
+                    &current.admission_digest,
+                    current.admitted_at_unix_nanos,
+                    admission,
+                ) {
+                    (Some(digest), Some(at), Some(evidence)) => {
+                        evidence.admission_digest == *digest
+                            && evidence.admitted_at_unix_nanos == at
+                    }
+                    (None, None, None) => true,
+                    _ => false,
+                };
+                if !replayed {
+                    return Err(DoctorLedgerError::AttemptIdentityConflict {
+                        attempt_digest: attempt_digest.as_str().to_owned(),
+                    });
+                }
+                return Ok(Some(current.clone()));
+            }
+            let from = current.state;
+            from.transition_to(target)
+                .map_err(|error| storage(error.to_string()))?;
+            match (from, target) {
+                (
+                    DoctorAttemptState::Requested,
+                    DoctorAttemptState::Admitted | DoctorAttemptState::Cancelled,
+                ) => {
+                    let evidence = admission
+                        .ok_or_else(|| storage("admission evidence is required".to_owned()))?;
+                    evidence
+                        .validate()
+                        .map_err(|error| storage(error.to_string()))?;
+                    current.admission_digest = Some(evidence.admission_digest.clone());
+                    current.admitted_at_unix_nanos = Some(evidence.admitted_at_unix_nanos);
+                }
+                (DoctorAttemptState::Requested, DoctorAttemptState::Expired) => {
+                    if admission.is_some() {
+                        return Err(storage("an expired intent carries no admission".to_owned()));
+                    }
+                }
+                _ => {
+                    if admission.is_some() {
+                        return Err(storage(
+                            "admission evidence binds only on first admission".to_owned(),
+                        ));
+                    }
+                }
+            }
+            current.state = target;
+            current
+                .validate()
+                .map_err(|error| storage(error.to_string()))?;
+            Ok(Some(current.clone()))
+        }
+
+        fn stage_doctor_effect(
+            &self,
+            record: &DoctorEffectRecord,
+        ) -> Result<DoctorEffectStageOutcome, DoctorLedgerError> {
+            let storage = |reason: String| DoctorLedgerError::Storage(reason);
+            record
+                .validate()
+                .map_err(|error| storage(error.to_string()))?;
+            let mut effects = self.effects.lock().expect("test ledger lock");
+            let key = record.record_key();
+            if let Some(durable) = effects.get(&key) {
+                if durable.same_binding(record) {
+                    return Ok(DoctorEffectStageOutcome::Existing(durable.clone()));
+                }
+                return Err(DoctorLedgerError::EffectIdentityConflict { effect_digest: key });
+            }
+            effects.insert(key, record.clone());
+            Ok(DoctorEffectStageOutcome::Stored(record.clone()))
+        }
+
+        fn load_doctor_effect(
+            &self,
+            effect_digest: &OperationIdentity,
+        ) -> Result<Option<DoctorEffectRecord>, DoctorLedgerError> {
+            let effects = self.effects.lock().expect("test ledger lock");
+            Ok(effects.get(effect_digest.as_str()).cloned())
+        }
+
+        fn record_doctor_effect_outcome(
+            &self,
+            effect_digest: &OperationIdentity,
+            report: &DoctorEffectOutcomeReport,
+        ) -> Result<Option<DoctorEffectRecord>, DoctorLedgerError> {
+            let storage = |reason: String| DoctorLedgerError::Storage(reason);
+            report
+                .validate()
+                .map_err(|error| storage(error.to_string()))?;
+            let mut effects = self.effects.lock().expect("test ledger lock");
+            let Some(current) = effects.get_mut(effect_digest.as_str()) else {
+                return Ok(None);
+            };
+            if report.unknown {
+                match current.state {
+                    DoctorEffectState::Intended => {
+                        current.state = DoctorEffectState::Unknown;
+                        current.reconciliation_key =
+                            Some(current.effect_digest.as_str().to_owned());
+                    }
+                    DoctorEffectState::Unknown | DoctorEffectState::Reconciling => {}
+                    DoctorEffectState::Reported => {
+                        return Err(DoctorLedgerError::EffectIdentityConflict {
+                            effect_digest: effect_digest.as_str().to_owned(),
+                        });
+                    }
+                }
+            } else {
+                let outcome = report.outcome_digest.clone().ok_or_else(|| {
+                    storage("a known outcome carries its exact digest".to_owned())
+                })?;
+                match current.state {
+                    DoctorEffectState::Intended
+                    | DoctorEffectState::Unknown
+                    | DoctorEffectState::Reconciling => {
+                        current.state = DoctorEffectState::Reported;
+                        current.outcome_digest = Some(outcome);
+                        current
+                            .adapter_receipt_digest
+                            .clone_from(&report.adapter_receipt_digest);
+                        current.reconciliation_key = None;
+                    }
+                    DoctorEffectState::Reported => {
+                        if current.outcome_digest.as_deref() != Some(outcome.as_str()) {
+                            return Err(DoctorLedgerError::EffectIdentityConflict {
+                                effect_digest: effect_digest.as_str().to_owned(),
+                            });
+                        }
+                    }
+                }
+            }
+            current
+                .validate()
+                .map_err(|error| storage(error.to_string()))?;
+            Ok(Some(current.clone()))
+        }
+
+        fn load_doctor_budget(
+            &self,
+            scope_key: &OpaqueLabel,
+        ) -> Result<Option<DoctorBudgetLedger>, DoctorLedgerError> {
+            let budgets = self.budgets.lock().expect("test ledger lock");
+            Ok(budgets.get(scope_key.as_str()).cloned())
+        }
+
+        fn store_doctor_budget(
+            &self,
+            ledger: &DoctorBudgetLedger,
+        ) -> Result<(), DoctorLedgerError> {
+            ledger
+                .validate()
+                .map_err(|error| DoctorLedgerError::Storage(error.to_string()))?;
+            let mut budgets = self.budgets.lock().expect("test ledger lock");
+            budgets.insert(ledger.record_key(), ledger.clone());
+            Ok(())
+        }
+    }
+
+    fn test_epoch(lineage: &str, sequence: u64) -> EpochId {
+        EpochId::new(
+            EpochLineageId::new(lineage).expect("valid test lineage"),
+            NonZeroU64::new(sequence).expect("non-zero test sequence"),
+        )
+        .expect("valid test epoch")
+    }
+
+    /// Builds a `time` value from its tuple encoding without naming the
+    /// type: this crate must not grow a `time` dependency for one contour,
+    /// mirroring the gate itself.
+    fn fixture_time<T: DeserializeOwned>(value: serde_json::Value) -> T {
+        serde_json::from_value(value).expect("fixture time value")
+    }
+
+    fn manifest() -> RepairRecipeManifest {
+        RepairRecipeManifest {
+            manifest_id: "manifest".to_owned(),
+            manifest_revision: 1,
+            operations: vec![RegisteredOperation {
+                operation_id: "restart".to_owned(),
+                adapter_id: "adapter".to_owned(),
+                description: "restart the component".to_owned(),
+                definition_digest: "c".repeat(64),
+            }],
+        }
+    }
+
+    fn auto_recipe() -> RepairRecipe {
+        RepairRecipe {
+            recipe_id: "restart-disk".to_owned(),
+            revision: 3,
+            problem_classes: ["disk-failure".to_owned()].into_iter().collect(),
+            components: ["disk-0".to_owned()].into_iter().collect(),
+            repair_class: RepairClass::AutomaticSafe,
+            prerequisites: vec!["precondition".to_owned()],
+            required_authority: "kernel.recovery".to_owned(),
+            allowed_effects: ["restart".to_owned()].into_iter().collect(),
+            operations: vec!["restart".to_owned()],
+            expected_observables: vec!["healthy".to_owned()],
+            verification_contract: vec!["verify".to_owned()],
+            rollback_or_compensation: vec!["rollback".to_owned()],
+            attempt_budget: 8,
+            cooldown: fixture_time(serde_json::json!([30, 0])),
+            stop_conditions: vec!["stop".to_owned()],
+        }
+    }
+
+    fn production_registry() -> DoctorRecipeRegistry {
+        DoctorRecipeRegistry::production_one_shot(manifest(), auto_recipe())
+            .expect("valid production one-shot registry")
+    }
+
+    fn context() -> DoctorAdmissionContext {
+        DoctorAdmissionContext::new(
+            KernelServiceState::Ready,
+            test_epoch(LINEAGE_A, EPOCH_SEQUENCE),
+            GENERATION,
+        )
+        .expect("valid test context")
+    }
+
+    fn brief() -> DiagnosticBrief {
+        DiagnosticBrief {
+            problem_id: "problem-1".to_owned(),
+            component: "disk-0".to_owned(),
+            failure_class: "disk-failure".to_owned(),
+            symptom: "symptom".to_owned(),
+            impact: "impact".to_owned(),
+            evidence: vec![EvidenceHandle::new("ev-1", "a".repeat(64)).unwrap()],
+            unknowns: Vec::new(),
+        }
+    }
+
+    fn lease() -> RecoveryLease {
+        RecoveryLease {
+            lease_id: "lease-1".to_owned(),
+            owner: "kernel".to_owned(),
+            expires_at: fixture_time(serde_json::json!([2030, 1, 0, 0, 0, 0, 0, 0, 0])),
+            allowed_effects: ["restart".to_owned()].into_iter().collect(),
+        }
+    }
+
+    fn closed_envelope(recipe: RepairRecipe, epoch: EpochId) -> ClosedRepairRequest {
+        let manifest = manifest();
+        let operation = manifest.resolve("restart").unwrap();
+        ClosedRepairRequest::for_effect(ClosedRequestParams {
+            request_id: "job-1".to_owned(),
+            brief: brief(),
+            recipe,
+            operations: vec![operation],
+            fence: StateFence::new(epoch, GENERATION, "b".repeat(64)).unwrap(),
+            lease: lease(),
+            approval: None,
+            budget_units: 1,
+            deadline: fixture_time(serde_json::json!([2030, 1, 0, 0, 0, 0, 0, 0, 0])),
+            cancellation: false,
+            escalation_target: "operator".to_owned(),
+        })
+        .unwrap()
+    }
+
+    fn wire_request(
+        envelope: &ClosedRepairRequest,
+        attempt_id: &str,
+    ) -> DoctorRepairAttemptRequest {
+        DoctorRepairAttemptRequest {
+            wire_id: DOCTOR_REPAIR_WIRE_ID.to_owned(),
+            wire_version: DOCTOR_REPAIR_WIRE_VERSION,
+            attempt_id: attempt_id.to_owned(),
+            effect_seq: 0,
+            closed_request_json: serde_json::to_string(envelope).unwrap(),
+            target_resource_digest: "1".repeat(64),
+            request_digest: String::new(),
+        }
+        .with_computed_digest()
+        .unwrap()
+    }
+
+    fn owner<'ledger>(
+        ledger: &'ledger TestLedger,
+        registry: &'ledger DoctorRecipeRegistry,
+    ) -> ComposedDoctorFrontDoor<'ledger> {
+        ComposedDoctorFrontDoor::compose(ledger, registry, "kernel.doctor-test-principal")
+            .expect("valid composed test owner")
+    }
+
+    #[test]
+    fn composed_owner_advertises_true_while_uncomposed_default_stays_false() {
+        // The bare default is the inert fail-closed advertisement.
+        assert!(!DOCTOR_REPAIR_ADVERTISED);
+        let ledger = TestLedger::new();
+        let registry = production_registry();
+        let composed = owner(&ledger, &registry);
+        // True derives from the real composed state (non-empty registry
+        // plus bound principal), never from a flipped constant.
+        assert!(composed.advertises_repair());
+        assert!(advertise_doctor_repair(&composed));
+        assert_eq!(composed.registry().recipe_count(), 1);
+        assert_eq!(composed.principal_ref(), "kernel.doctor-test-principal");
+    }
+
+    #[test]
+    fn compose_fails_closed_on_blank_principal() {
+        let ledger = TestLedger::new();
+        let registry = production_registry();
+        assert!(
+            ComposedDoctorFrontDoor::compose(&ledger, &registry, "   ").is_err(),
+            "a blank principal binds no front-door owner"
+        );
+    }
+
+    #[test]
+    fn exact_replay_rebuilds_the_original_admission_digest() {
+        // Lost-reply rule: a launched-but-unreconciled attempt reconciles by
+        // its original identity — the replay rebuilds the exact same
+        // admission instead of minting a second one under a new id.
+        let ledger = TestLedger::new();
+        let registry = production_registry();
+        let context = context();
+        let envelope = closed_envelope(auto_recipe(), test_epoch(LINEAGE_A, EPOCH_SEQUENCE));
+        let request = wire_request(&envelope, "attempt-replay-1");
+        let first = admit_doctor_repair(
+            &ledger,
+            &registry,
+            &context,
+            "kernel.doctor-test-principal",
+            &request,
+            NOW_UNIX_NANOS,
+        )
+        .expect("first admission");
+        let DoctorRepairResponse::Admitted(first_admission) = first else {
+            panic!("first presentation must be admitted, got {first:?}");
+        };
+        // A later retry — even at a later wall-clock time — rebuilds the
+        // identical admission bound to the durable admission time.
+        let replay = admit_doctor_repair(
+            &ledger,
+            &registry,
+            &context,
+            "kernel.doctor-test-principal",
+            &request,
+            NOW_UNIX_NANOS + 1_000_000,
+        )
+        .expect("replay admission");
+        let DoctorRepairResponse::Admitted(replay_admission) = replay else {
+            panic!("exact replay must be admitted, got {replay:?}");
+        };
+        assert_eq!(
+            replay_admission.admission_digest, first_admission.admission_digest,
+            "replay must reconcile by the original admission identity"
+        );
+        assert_eq!(replay_admission.attempt_id, first_admission.attempt_id);
+        assert_eq!(
+            replay_admission.admitted_at_unix_nanos, first_admission.admitted_at_unix_nanos,
+            "replay must not recompute under a new admission time"
+        );
+    }
+
+    #[test]
+    fn foreign_lineage_envelope_is_refused_typed_never_admitted() {
+        let ledger = TestLedger::new();
+        let registry = production_registry();
+        let context = context();
+        let foreign = closed_envelope(auto_recipe(), test_epoch(LINEAGE_FOREIGN, EPOCH_SEQUENCE));
+        let request = wire_request(&foreign, "attempt-foreign-1");
+        let response = admit_doctor_repair(
+            &ledger,
+            &registry,
+            &context,
+            "kernel.doctor-test-principal",
+            &request,
+            NOW_UNIX_NANOS,
+        )
+        .expect("foreign lineage must answer typed, not fail mechanically");
+        let DoctorRepairResponse::Rejected(rejection) = response else {
+            panic!("foreign lineage must be refused, got {response:?}");
+        };
+        assert_eq!(
+            rejection.reason,
+            DoctorRepairRejectionReason::StaleEpoch,
+            "a foreign lineage fails closed as a stale epoch"
+        );
+    }
 }
