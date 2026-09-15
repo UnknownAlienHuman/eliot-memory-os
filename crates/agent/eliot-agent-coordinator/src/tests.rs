@@ -2732,7 +2732,9 @@ fn s5_per_effect_attempt_mismatch_rejects() -> TestResult {
         attempt_id: AttemptId::new("attempt-s5c-foreign")?,
         kind: EffectKind::Observe,
         scope_ref: "scope-work-s5c".to_owned(),
-        payload_digest: "payload-s5c-1".to_owned(),
+        payload_digest: serde_json::from_value(serde_json::json!(
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+        ))?,
         rationale_ref: None,
     };
     submission.result.proposed_effects = vec![foreign_effect];
@@ -4017,5 +4019,39 @@ fn production_restore_reverifies_against_fresh_kernel_evidence() -> TestResult {
         .err(),
         Some(CoordinatorError::StaleProviderBinding)
     );
+    Ok(())
+}
+
+#[test]
+fn coordinator_case_12_effect_payload_digest_is_canonical() -> TestResult {
+    // #228 narrow slice consumer proof: coordinator intake carries the v7
+    // canonical `LowercaseSha256` effect digest; legacy placeholders never
+    // deserialize as `ProposedEffect`.
+    let digest: LowercaseSha256 = serde_json::from_value(serde_json::json!(
+        "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+    ))?;
+    let effect = ProposedEffect {
+        effect_id: "effect-case-12".to_owned(),
+        attempt_id: AttemptId::new("attempt-case-12")?,
+        kind: EffectKind::Observe,
+        scope_ref: "scope-work-case-12".to_owned(),
+        payload_digest: digest,
+        rationale_ref: None,
+    };
+    let ceiling = EffectCeiling {
+        scope_ref: "scope-work-case-12".to_owned(),
+        allowed: BTreeSet::from([EffectKind::Observe]),
+        max_external_effects: 0,
+    };
+    effect.validate_against(&ceiling)?;
+    let legacy = serde_json::json!({
+        "effect_id": "effect-case-12",
+        "attempt_id": "attempt-case-12",
+        "kind": "observe",
+        "scope_ref": "scope-work-case-12",
+        "payload_digest": "payload-case-12",
+        "rationale_ref": null,
+    });
+    assert!(serde_json::from_value::<ProposedEffect>(legacy).is_err());
     Ok(())
 }
