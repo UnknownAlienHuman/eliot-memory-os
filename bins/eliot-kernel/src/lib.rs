@@ -72,14 +72,16 @@ pub use supervision_lease_authority::{
     KernelSupervisionLeaseAuthority, ProtectedSupervisionLeaseSigner,
     SupervisionLeaseAuthorityError,
 };
+#[cfg(windows)]
+use supervision_lease_authority::{
+    SupervisionProgressRenewalError, daemon_renewal_receipt_for_decision,
+    daemon_supervision_current_state, supervision_binding_matches_contour,
+    supervision_operation_identity,
+};
 #[cfg(all(test, windows))]
 pub(crate) use supervision_lease_authority::{
     supervision_authority_root_spec, verification_context_for_supervision_payload,
     verify_superseded_supervision_replay,
-};
-#[cfg(windows)]
-use supervision_lease_authority::{
-    supervision_binding_matches_contour, supervision_operation_identity,
 };
 
 #[cfg(test)]
@@ -118,7 +120,8 @@ use daemon_supervision::EliotdSupervisionSuccessorEvidence;
 use daemon_supervision::{DaemonRuntimeState, DaemonRuntimeStatus, daemon_status_proves_ready};
 #[cfg(windows)]
 use daemon_supervision::{
-    DaemonSupervisionContour, EliotdLiveReceiptDisposition, classify_eliotd_live_receipt_transition,
+    DaemonSupervisionContour, DaemonSupervisionProgressState, EliotdLiveReceiptDisposition,
+    classify_eliotd_live_receipt_transition,
 };
 use generation_recovery::OrsGenerationCoordinator;
 #[cfg(test)]
@@ -171,6 +174,14 @@ pub use dispatch_launch::{
 /// The production redb owner composed through
 /// [`dispatch_launch::compose_production_doctor_front_door`].
 pub use doctor_recovery_ledger::{KernelDoctorRecoveryLedger, doctor_recovery_ledger_path};
+/// K2 Dreamer wire seam for the front-door dispatch/driver arms (T12-05).
+///
+/// The dispatch arm (`frame_dispatch`) and the driver arm
+/// (`front_door_driver`) depend only on this closed wire identity plus the
+/// K0 request/response types. Slice K2 routes through the K1 gateway
+/// (`KernelStoreGateway::dreamer_job`); no process is spawned here and no
+/// worker binding is invented (worker handoff is T12-09).
+pub use dreamer_job_dispatch::DREAMER_JOB_WIRE_ID;
 use eliot_contracts::{
     ArtifactId, AuthorityEpoch, ContractId, RequestId, ResourceGeneration, StateFence,
 };
@@ -221,14 +232,6 @@ pub use eliot_kernel_service::{
     TestdAdmissionResponse, handle_testd_admission_attempt, reconcile_testd_admission,
     route_testd_admission,
 };
-/// K2 Dreamer wire seam for the front-door dispatch/driver arms (T12-05).
-///
-/// The dispatch arm (`frame_dispatch`) and the driver arm
-/// (`front_door_driver`) depend only on this closed wire identity plus the
-/// K0 request/response types. Slice K2 routes through the K1 gateway
-/// (`KernelStoreGateway::dreamer_job`); no process is spawned here and no
-/// worker binding is invented (worker handoff is T12-09).
-pub use dreamer_job_dispatch::DREAMER_JOB_WIRE_ID;
 /// P-07 native-worker claim wire seam for the front-door dispatch/driver arms
 /// (DISPATCH-CAUSE-FIX, issues #461/#20/#22).
 ///
@@ -301,6 +304,13 @@ use eliot_runtime::{Runtime, RuntimeConfig, ShutdownOutcome};
 pub use eliot_runtime_contracts::SupervisionLeasePredecessorIdentity;
 #[cfg(windows)]
 use eliot_runtime_contracts::SupervisionLeaseTerminalDisposition;
+#[cfg(windows)]
+use eliot_runtime_contracts::{
+    DaemonSupervisionCurrentState, DaemonSupervisionHeartbeatError,
+    DaemonSupervisionRenewalDecision, DaemonSupervisionRenewalOutcome,
+    DaemonSupervisionRenewalPolicy, DaemonSupervisionRenewalReceipt,
+    DaemonSupervisionRenewalRequest, evaluate_daemon_supervision_renewal,
+};
 #[cfg(test)]
 pub use eliot_runtime_contracts::{
     Ed25519SupervisionLeaseSigner, ProvisionedSupervisionAuthority, SupervisionLease,
@@ -347,10 +357,27 @@ pub const KERNEL_STORE_REBIND_PRODUCTION_DISCRIMINATOR: &str =
     "eliot-kernel::production-store-rebind:v1";
 const STORE_BRIDGE_ROUTE: &str = "store_bridge";
 const ACTIVE_DAEMON_CALLER: &str = "eliotd";
+/// Wave-2 single timing owner for supervision-lease renewal (Implements #88).
+///
+/// `DaemonSupervisionRenewalPolicy` owns every renewal bound; the retired
+/// parallel `SUPERVISION_LEASE_VALIDITY_MS` / `SUPERVISION_LEASE_RENEW_AFTER_MS`
+/// constants must not be reintroduced beside it. The windows preserve the
+/// established lease shape (60s validity, renewal due after 30s); the
+/// observation freshness bounds match the wave-1 contract proof values.
+/// Watchdog coverage stays opt-in until wave 3 reports per-tick
+/// `watchdog_covered` from the daemon; the stale-cursor horizon (three missed
+/// renewal intervals, see `DaemonSupervisionProgressState`) applies
+/// regardless. `StoreHealth` (`health_view::daemon_health`) remains a separate
+/// evidence-only view and never renews.
 #[cfg(windows)]
-const SUPERVISION_LEASE_VALIDITY_MS: u64 = 60_000;
-#[cfg(windows)]
-const SUPERVISION_LEASE_RENEW_AFTER_MS: u64 = 30_000;
+pub(crate) const SUPERVISION_LEASE_RENEWAL_POLICY: DaemonSupervisionRenewalPolicy =
+    DaemonSupervisionRenewalPolicy {
+        validity_ms: 60_000,
+        renew_after_ms: 30_000,
+        max_observation_age_ms: 10_000,
+        max_wall_skew_ms: 5_000,
+        require_watchdog_coverage: false,
+    };
 const ELIOTD_RECEIPT_PENDING_DEPENDENCY: &str = "eliotd-process-receipt";
 const ELIOTD_RECEIPT_PENDING_REASON: &str = "exact launched process receipt publication is pending";
 #[cfg(windows)]
@@ -1973,21 +2000,27 @@ impl KernelComposition {
     fn active_supervision_binding(
         contour: &DaemonSupervisionContour,
         issued_at_ms: u64,
+        policy: &DaemonSupervisionRenewalPolicy,
     ) -> Result<eliot_ors::SupervisionLeaseBinding, SupervisionLeaseAuthorityError> {
         if issued_at_ms == 0 {
             return Err(SupervisionLeaseAuthorityError::Configuration(
                 "supervision issue time is zero".to_owned(),
             ));
         }
+        policy.validate().map_err(|error| {
+            SupervisionLeaseAuthorityError::Configuration(format!(
+                "supervision renewal policy rejected: {error}"
+            ))
+        })?;
         let expires_at_ms = issued_at_ms
-            .checked_add(SUPERVISION_LEASE_VALIDITY_MS)
+            .checked_add(policy.validity_ms)
             .ok_or_else(|| {
                 SupervisionLeaseAuthorityError::Configuration(
                     "supervision validity interval overflowed".to_owned(),
                 )
             })?;
         let renew_before_ms = issued_at_ms
-            .checked_add(SUPERVISION_LEASE_RENEW_AFTER_MS)
+            .checked_add(policy.renew_after_ms)
             .ok_or_else(|| {
                 SupervisionLeaseAuthorityError::Configuration(
                     "supervision renewal interval overflowed".to_owned(),
@@ -2150,7 +2183,11 @@ impl KernelComposition {
             }
             stage
         } else {
-            let binding = Self::active_supervision_binding(contour, now_ms)?;
+            let binding = Self::active_supervision_binding(
+                contour,
+                now_ms,
+                &SUPERVISION_LEASE_RENEWAL_POLICY,
+            )?;
             authority.prepare(SupervisionLeasePrepareRequest {
                 ticket_id: supervision_operation_identity("commit-ticket", lease_id, None)?,
                 operation_id: supervision_operation_identity("commit-operation", lease_id, None)?,
@@ -2207,7 +2244,11 @@ impl KernelComposition {
             }
             stage
         } else {
-            let binding = Self::active_supervision_binding(contour, now_ms)?;
+            let binding = Self::active_supervision_binding(
+                contour,
+                now_ms,
+                &SUPERVISION_LEASE_RENEWAL_POLICY,
+            )?;
             authority.prepare(SupervisionLeasePrepareRequest {
                 ticket_id: supervision_operation_identity(
                     "renew-ticket",
@@ -2237,6 +2278,203 @@ impl KernelComposition {
         Ok(renewed)
     }
 
+    /// Pure progress-renewal decision (issue #88, wave 2): joins one daemon
+    /// observation request against the exact Kernel current state through the
+    /// single timing owner, and advances Kernel-owned progress continuity.
+    ///
+    /// Check order: owner policy coherence, stale-cursor horizon (expired
+    /// leases never auto-revive, even for eligible observations), Kernel
+    /// binding pinning from shape-valid observations only, then the contract
+    /// join. `Renewed` records nothing here: the caller records via
+    /// [`DaemonSupervisionProgressState::record_renewed`] only after the ORS
+    /// commit and post-verify both succeed. Every other non-renewing outcome
+    /// updates continuity (`DegradedNoRenewal` and join refusals count a
+    /// miss; `ReconciliationRequired` latches the flag; `NotDue` and exact
+    /// replay change nothing). `StoreHealth` never reaches this route: it
+    /// carries no observation identity and fails request validation.
+    #[cfg(windows)]
+    pub(crate) fn decide_daemon_supervision_progress_renewal(
+        request: &DaemonSupervisionRenewalRequest,
+        current: &DaemonSupervisionCurrentState,
+        progress: &mut DaemonSupervisionProgressState,
+        policy: &DaemonSupervisionRenewalPolicy,
+        now_ms: u64,
+    ) -> Result<DaemonSupervisionRenewalDecision, SupervisionProgressRenewalError> {
+        policy.validate().map_err(|error| {
+            SupervisionProgressRenewalError::Authority(
+                SupervisionLeaseAuthorityError::Configuration(format!(
+                    "supervision renewal policy rejected: {error}"
+                )),
+            )
+        })?;
+        if progress.stale_renewal_expired(policy, now_ms) {
+            return Err(DaemonSupervisionHeartbeatError::SupervisionLeaseExpired.into());
+        }
+        if request.observation.validate().is_ok() {
+            progress.admit_boot_session_binding(&request.observation);
+            progress.advance_monotonic_ms(request.observation.observed_monotonic_ms);
+        }
+        let decision = match evaluate_daemon_supervision_renewal(request, current, policy, now_ms) {
+            Ok(decision) => decision,
+            Err(error) => {
+                progress.note_missed_renewal();
+                if progress.stale_renewal_expired(policy, now_ms) {
+                    return Err(DaemonSupervisionHeartbeatError::SupervisionLeaseExpired.into());
+                }
+                return Err(error.into());
+            }
+        };
+        match decision.outcome {
+            DaemonSupervisionRenewalOutcome::Renewed
+            | DaemonSupervisionRenewalOutcome::ExactReplay
+            | DaemonSupervisionRenewalOutcome::NotDue => {}
+            DaemonSupervisionRenewalOutcome::DegradedNoRenewal => {
+                progress.note_missed_renewal();
+                if progress.stale_renewal_expired(policy, now_ms) {
+                    return Err(DaemonSupervisionHeartbeatError::SupervisionLeaseExpired.into());
+                }
+            }
+            DaemonSupervisionRenewalOutcome::ReconciliationRequired => {
+                progress.note_reconciliation_pending();
+            }
+        }
+        Ok(decision)
+    }
+
+    /// Typed progress renewal entry (issue #88, wave 2): renews the current
+    /// supervision lease from an observed daemon progress request, not from
+    /// `StoreHealth`.
+    ///
+    /// The entry loads the exact ORS predecessor, surfaces natural expiry
+    /// with the typed refusal before signature work, checks the contour
+    /// binding, builds the join state from the exact predecessor plus
+    /// Kernel-owned continuity, decides through the single timing owner,
+    /// and commits exactly one successor on `Renewed` (resuming the exact
+    /// staged ticket when one is already staged, i.e. reconcile-by-identity).
+    /// A failed commit latches reconciliation-pending and propagates, so an
+    /// unknown durable outcome never mints a second successor. Non-renewing
+    /// decisions return the unchanged head with their complete receipt and no
+    /// commit. On `Renewed` the receipt is `None` by construction: the caller
+    /// completes it with the committed successor receipt digest plus the
+    /// published live-receipt digest via `daemon_renewal_receipt_for_decision`
+    /// after live-receipt publication, so a renewal can never ship without
+    /// its publication evidence.
+    #[cfg(windows)]
+    #[allow(
+        dead_code,
+        reason = "wave 3 (MGR02) wires the eliotd per-tick DaemonProgressObservation into this typed progress route; ProbeReady keeps the policy-driven legacy renew until then"
+    )]
+    fn renew_current_supervision_with_progress(
+        authority: &KernelSupervisionLeaseAuthority,
+        contour: &DaemonSupervisionContour,
+        request: &DaemonSupervisionRenewalRequest,
+        progress: &mut DaemonSupervisionProgressState,
+        policy: &DaemonSupervisionRenewalPolicy,
+        now_ms: u64,
+    ) -> Result<
+        (
+            SupervisionLeaseSnapshot,
+            DaemonSupervisionRenewalDecision,
+            Option<DaemonSupervisionRenewalReceipt>,
+        ),
+        SupervisionProgressRenewalError,
+    > {
+        let lease_id = contour.incarnation.supervision_lease_id.as_str();
+        let current_snapshot =
+            authority
+                .current_snapshot(lease_id)?
+                .ok_or(SupervisionLeaseAuthorityError::Ors(
+                    OrsError::SupervisionLeaseBindingMismatch,
+                ))?;
+        if now_ms >= current_snapshot.record.binding.expires_at_ms {
+            return Err(DaemonSupervisionHeartbeatError::SupervisionLeaseExpired.into());
+        }
+        authority.verify_active_snapshot(&current_snapshot, lease_id, now_ms)?;
+        if !supervision_binding_matches_contour(&current_snapshot.record.binding, contour)? {
+            return Err(SupervisionLeaseAuthorityError::Ors(
+                OrsError::SupervisionLeaseBindingMismatch,
+            )
+            .into());
+        }
+        let current = daemon_supervision_current_state(&current_snapshot, contour, progress)?;
+        let decision = Self::decide_daemon_supervision_progress_renewal(
+            request, &current, progress, policy, now_ms,
+        )?;
+        if decision.outcome != DaemonSupervisionRenewalOutcome::Renewed {
+            let receipt = daemon_renewal_receipt_for_decision(&decision, None, None)?;
+            return Ok((current_snapshot, decision, Some(receipt)));
+        }
+        let successor_revision =
+            decision
+                .successor_revision
+                .ok_or(SupervisionLeaseAuthorityError::Configuration(
+                    "renewed progress decision is missing its successor revision".to_owned(),
+                ))?;
+        let observation_sha256 = request
+            .observation
+            .digest()
+            .map_err(SupervisionProgressRenewalError::Heartbeat)?;
+        let stage = if let Some(stage) = authority.staged_snapshot(lease_id)? {
+            if stage.ticket.operation != SupervisionLeaseOperation::Renew
+                || stage.ticket.expected_revision != Some(current_snapshot.record.revision)
+                || stage.ticket.previous_receipt_sha256.as_deref()
+                    != Some(current_snapshot.receipt.receipt_sha256.as_str())
+                || stage.ticket.binding.state != LeaseState::Active
+                || !supervision_binding_matches_contour(&stage.ticket.binding, contour)?
+                || now_ms >= stage.ticket.binding.expires_at_ms
+            {
+                return Err(SupervisionLeaseAuthorityError::Ors(
+                    OrsError::SupervisionLeaseTicketConflict,
+                )
+                .into());
+            }
+            stage
+        } else {
+            let binding = Self::active_supervision_binding(contour, now_ms, policy)?;
+            authority.prepare(SupervisionLeasePrepareRequest {
+                ticket_id: supervision_operation_identity(
+                    "renew-ticket",
+                    lease_id,
+                    Some(&current_snapshot.receipt.receipt_sha256),
+                )?,
+                operation_id: supervision_operation_identity(
+                    "renew-operation",
+                    lease_id,
+                    Some(&current_snapshot.receipt.receipt_sha256),
+                )?,
+                lease_id: OperationIdentity::new(lease_id.to_owned())?,
+                expected_revision: Some(current_snapshot.record.revision),
+                operation: SupervisionLeaseOperation::Renew,
+                binding,
+            })?
+        };
+        let renewed = match authority.commit_active(&stage.ticket) {
+            Ok(renewed) => renewed,
+            Err(error) => {
+                progress.note_reconciliation_pending();
+                return Err(error.into());
+            }
+        };
+        authority.verify_active_snapshot(&renewed, lease_id, now_ms)?;
+        if renewed.record.revision != successor_revision
+            || renewed.record.revision <= current_snapshot.record.revision
+            || !supervision_binding_matches_contour(&renewed.record.binding, contour)?
+        {
+            progress.note_reconciliation_pending();
+            return Err(SupervisionLeaseAuthorityError::Ors(
+                OrsError::SupervisionLeaseBindingMismatch,
+            )
+            .into());
+        }
+        progress.record_renewed(
+            &request.observation,
+            observation_sha256,
+            successor_revision,
+            now_ms,
+        );
+        Ok((renewed, decision, None))
+    }
+
     #[cfg(windows)]
     fn establish_daemon_supervision(
         &self,
@@ -2253,6 +2491,16 @@ impl KernelComposition {
         Ok((contour, snapshot))
     }
 
+    // Wave-3 handoff (MGR02, `eliotd` per-tick observation, Implements #88):
+    // this ProbeReady path still renews through the policy-driven legacy
+    // `renew_current_supervision` because the daemon does not yet submit a
+    // per-tick `DaemonProgressObservation`. Wave 3 must build that observation
+    // in `eliotd`, retain a `DaemonSupervisionProgressState` for the active
+    // lease, build the join state with `daemon_supervision_current_state`,
+    // and call `renew_current_supervision_with_progress` here instead, then
+    // assemble the receipt with `daemon_renewal_receipt_for_decision` after
+    // live-receipt publication. `StoreHealth` (`health_view::daemon_health`)
+    // stays evidence-only and must never be passed as renewal evidence.
     #[cfg(windows)]
     fn renew_daemon_supervision_for_probe(
         &self,

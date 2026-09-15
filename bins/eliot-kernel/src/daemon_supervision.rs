@@ -10,6 +10,10 @@ use eliot_contracts::StateFence;
 use eliot_kernel_service::{KernelActivationReceipt, KernelServiceError};
 use eliot_ors::{SupervisionLeaseOperation, SupervisionLeaseSnapshot};
 use eliot_process::{EliotdLiveReadyEvidence, EliotdLiveReceipt, ProcessStartReceipt};
+#[cfg(windows)]
+use eliot_runtime_contracts::{
+    DaemonChannelCursor, DaemonProgressObservation, DaemonSupervisionRenewalPolicy,
+};
 use eliot_runtime_contracts::{
     LeaseState, SupervisionGenerationBinding, SupervisionLeaseIncarnationBinding,
     SupervisionLeasePredecessorIdentity,
@@ -149,4 +153,157 @@ pub(crate) fn classify_eliotd_live_receipt_transition(
         return Ok(EliotdLiveReceiptDisposition::ReplaceRenewalPredecessor);
     }
     Err(KernelServiceError::ReadinessNotProven)
+}
+
+// ============================================================================
+// Kernel-owned daemon progress continuity (issue #88, wave 2).
+//
+// The Kernel retains per-channel accepted cursors, the last accepted monotonic
+// evidence, the last recorded renewal identity, a consecutive-miss counter,
+// and the reconciliation flag. The daemon (wave 3, `eliotd` per-tick
+// observation) submits candidate observations; it never writes this state.
+// `StoreHealth` carries no cursor and therefore can never advance it.
+//
+// Owner defaults enforced with this state (see
+// `SUPERVISION_LEASE_RENEWAL_POLICY` for the timing owner):
+// - stale-cursor horizon: three missed renewal intervals
+//   (`3 * renew_after_ms`) with no eligible observation, or three consecutive
+//   blocked renewals, expires the lease (`SupervisionLeaseExpired`). An
+//   expired lease requires a new admission; it never auto-revives.
+// - a `Failed` health dimension on a degraded observation blocks renewal
+//   fail-closed (`DegradedNoRenewal`, reported, no successor, never skipped).
+// - `NoProgress` / `ObservationGap` / rollback / skew / stale
+//   generation-session-epoch-fence-boot / predecessor mismatch all fail
+//   closed through the contract join; exact replay stays idempotent and a
+//   mutated retry reports `IDENTITY_CONFLICT`.
+//
+// Wave-3 handoff (MGR02): the `eliotd` per-tick observation producer binds
+// this tracker to the live runtime (retention + first-use boot/session
+// pinning below stays valid); this file owns the shape, not the producer.
+
+/// Consecutive blocked renewals (or equivalent silence) that stale-expire a
+/// supervision lease. The time horizon is the same count of renewal
+/// intervals: `3 * renew_after_ms`.
+#[cfg(windows)]
+pub(crate) const SUPERVISION_PROGRESS_STALE_MISSED_INTERVALS: u64 = 3;
+
+/// Kernel-owned progress continuity for one supervised daemon generation.
+#[cfg(windows)]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct DaemonSupervisionProgressState {
+    /// Last cursor accepted by the Kernel per progress channel.
+    pub(crate) accepted_cursors: Vec<DaemonChannelCursor>,
+    /// Currently admitted idle contract, when one is admitted.
+    pub(crate) admitted_idle_contract: Option<String>,
+    /// Boot identity pinned on first use; later mismatch fails closed.
+    pub(crate) boot_id: Option<String>,
+    /// Transport-session binding pinned on first use; reconnects need an
+    /// explicit rebinding path (mismatch fails closed until then).
+    pub(crate) transport_session_evidence: Option<String>,
+    /// Last accepted monotonic evidence in milliseconds (never regresses).
+    pub(crate) last_monotonic_ms: u64,
+    /// Request identity of the last recorded renewal, if any.
+    pub(crate) last_request_id: Option<String>,
+    /// Canonical digest of the last recorded observation, if any.
+    pub(crate) last_observation_sha256: Option<String>,
+    /// Successor revision created by the last recorded renewal, if any.
+    pub(crate) last_successor_revision: Option<u64>,
+    /// Consecutive blocked renewals with no eligible observation.
+    pub(crate) missed_renewals: u64,
+    /// Decision time of the last eligible observation that renewed, if any.
+    pub(crate) last_eligible_observation_ms: Option<u64>,
+    /// True while an unknown ORS/live-receipt publication outcome is still
+    /// unreconciled; blocks every new successor until exact reconciliation.
+    pub(crate) reconciliation_pending: bool,
+}
+
+#[cfg(windows)]
+impl DaemonSupervisionProgressState {
+    /// Returns the stale-expiry horizon in milliseconds for a policy.
+    pub(crate) fn stale_horizon_ms(policy: &DaemonSupervisionRenewalPolicy) -> u64 {
+        policy
+            .renew_after_ms
+            .saturating_mul(SUPERVISION_PROGRESS_STALE_MISSED_INTERVALS)
+    }
+
+    /// Returns true once the lease must expire instead of retrying: three
+    /// consecutive blocked renewals, or silence past the stale horizon with
+    /// no eligible observation. A lease with no recorded eligibility yet
+    /// (first renewal) is never stale on time alone.
+    pub(crate) fn stale_renewal_expired(
+        &self,
+        policy: &DaemonSupervisionRenewalPolicy,
+        now_ms: u64,
+    ) -> bool {
+        if self.missed_renewals >= SUPERVISION_PROGRESS_STALE_MISSED_INTERVALS {
+            return true;
+        }
+        self.last_eligible_observation_ms.is_some_and(|eligible| {
+            now_ms.saturating_sub(eligible) >= Self::stale_horizon_ms(policy)
+        })
+    }
+
+    /// Pins the Kernel-owned boot/session continuity from the first
+    /// shape-valid observation. Later observations must match exactly; a
+    /// changed boot or session fails closed in the renewal join.
+    pub(crate) fn admit_boot_session_binding(&mut self, observation: &DaemonProgressObservation) {
+        if self.boot_id.is_none() {
+            self.boot_id = Some(observation.boot_id.clone());
+        }
+        if self.transport_session_evidence.is_none() {
+            self.transport_session_evidence = Some(observation.transport_session_evidence.clone());
+        }
+    }
+
+    /// Advances the last accepted monotonic evidence; it never regresses, so
+    /// rolled-back observations stay detectable after refusals.
+    pub(crate) fn advance_monotonic_ms(&mut self, observed_monotonic_ms: u64) {
+        self.last_monotonic_ms = self.last_monotonic_ms.max(observed_monotonic_ms);
+    }
+
+    /// Records one blocked (non-renewing) evaluation. The request identity is
+    /// deliberately not recorded: refusals re-evaluate deterministically, and
+    /// only recorded renewals participate in replay/identity-conflict.
+    pub(crate) fn note_missed_renewal(&mut self) {
+        self.missed_renewals = self.missed_renewals.saturating_add(1);
+    }
+
+    /// Records a verified renewal: advances the channel cursor, the
+    /// monotonic evidence, and the idempotency triple, resets the miss
+    /// counter, stamps eligibility, and clears reconciliation. Call only
+    /// after the ORS commit and post-verify both succeed.
+    pub(crate) fn record_renewed(
+        &mut self,
+        observation: &DaemonProgressObservation,
+        observation_sha256: String,
+        successor_revision: u64,
+        now_ms: u64,
+    ) {
+        if let Some(entry) = self
+            .accepted_cursors
+            .iter_mut()
+            .find(|entry| entry.channel == observation.progress_channel)
+        {
+            entry.cursor = observation.progress_cursor;
+        } else {
+            self.accepted_cursors.push(DaemonChannelCursor {
+                channel: observation.progress_channel,
+                cursor: observation.progress_cursor,
+            });
+        }
+        self.advance_monotonic_ms(observation.observed_monotonic_ms);
+        self.last_request_id = Some(observation.observation_id.clone());
+        self.last_observation_sha256 = Some(observation_sha256);
+        self.last_successor_revision = Some(successor_revision);
+        self.missed_renewals = 0;
+        self.last_eligible_observation_ms = Some(now_ms);
+        self.reconciliation_pending = false;
+    }
+
+    /// Marks the durable outcome unknown after a failed renew commit. The
+    /// renewal join then reports `ReconciliationRequired` instead of minting
+    /// a successor until exact reconciliation.
+    pub(crate) fn note_reconciliation_pending(&mut self) {
+        self.reconciliation_pending = true;
+    }
 }
