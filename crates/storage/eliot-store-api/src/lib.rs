@@ -56,11 +56,12 @@ pub use request_hash::{
 };
 
 pub use store_failure::{
-    LegacyStoreFailureV1, MAX_STORE_FAILURE_DETAIL_LEN, MAX_STORE_FAILURE_REFERENCE_LEN,
-    MAX_STORE_FAILURE_RETRY_AFTER_MS, MAX_STORE_REASON_CODE_LEN, STORE_FAILURE_CONTRACT_REVISION,
-    StoreConflictObservation, StoreFailure, StoreFailureContractError, StoreFailureDisposition,
-    StoreFailureIdentityContext, StoreFailureRequestContext, StoreMutationDisposition,
-    StoreReasonCode, StoreRecoveryAction, StoreRetryDirective, decode_legacy_store_failure_v1,
+    ErasureFailureKind, LegacyStoreFailureV1, MAX_STORE_FAILURE_DETAIL_LEN,
+    MAX_STORE_FAILURE_REFERENCE_LEN, MAX_STORE_FAILURE_RETRY_AFTER_MS, MAX_STORE_REASON_CODE_LEN,
+    STORE_FAILURE_CONTRACT_REVISION, StoreConflictObservation, StoreFailure,
+    StoreFailureContractError, StoreFailureDisposition, StoreFailureIdentityContext,
+    StoreFailureRequestContext, StoreMutationDisposition, StoreReasonCode, StoreRecoveryAction,
+    StoreRetryDirective, decode_legacy_store_failure_v1, erasure_store_failure,
 };
 
 pub use wire::{
@@ -70,12 +71,13 @@ pub use wire::{
     CAPABILITY_DREAMER_JOB_RECONCILE, CAPABILITY_DREAMER_JOB_RENEW,
     CAPABILITY_DREAMER_JOB_REQUEST_CANCEL, CAPABILITY_DREAMER_JOB_RESUME,
     CAPABILITY_DREAMER_JOB_START, CAPABILITY_DREAMER_JOB_STATUS, CAPABILITY_DREAMER_JOB_SUBMIT,
-    CAPABILITY_HEALTH, CAPABILITY_INITIALIZE_GENESIS, CAPABILITY_NAMED_READ,
-    CAPABILITY_ORDERING_HEADS, CAPABILITY_READINESS, CAPABILITY_RECEIPT, CAPABILITY_RECOVERY,
-    CAPABILITY_REVISION_HEADS, CAPABILITY_VALIDATION_SNAPSHOT, EFFECTS, ReadinessReceipt,
-    ReadinessStatus, StoreRequest, StoreResponse, StoreWireError, decode_request_frame,
-    decode_request_frame_with_authority, decode_response_frame, dreamer_job_capability,
-    request_frame, request_frame_with_payload_authority, response_frame,
+    CAPABILITY_ERASURE_INTENT, CAPABILITY_HEALTH, CAPABILITY_INITIALIZE_GENESIS,
+    CAPABILITY_NAMED_READ, CAPABILITY_ORDERING_HEADS, CAPABILITY_READINESS, CAPABILITY_RECEIPT,
+    CAPABILITY_RECOVERY, CAPABILITY_REVISION_HEADS, CAPABILITY_VALIDATION_SNAPSHOT, EFFECTS,
+    ErasureSurfaceRequest, ReadinessReceipt, ReadinessStatus, StoreRequest, StoreResponse,
+    StoreWireError, decode_request_frame, decode_request_frame_with_authority,
+    decode_response_frame, dreamer_job_capability, request_frame,
+    request_frame_with_payload_authority, response_frame,
 };
 
 mod operation_catalogue;
@@ -2116,6 +2118,178 @@ pub enum StoreError {
     Serialization(String),
 }
 
+/// Closed canonical store surfaces covered by one erasure intent (issue #688).
+///
+/// These are the only surfaces the neutral store port addresses. They restate
+/// the I05-14 retention-and-erasure enumeration in store-neutral vocabulary
+/// without importing the erasure orchestration crate: the orchestration layer
+/// depends on this neutral port, never the reverse. Declaration order is the
+/// deterministic canonical order.
+#[derive(
+    Clone, Copy, Debug, Eq, Hash, JsonSchema, Ord, PartialEq, PartialOrd, Serialize, Deserialize,
+)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE", deny_unknown_fields)]
+pub enum ErasureSurfaceKind {
+    /// Observations and canonical payload.
+    Observations,
+    /// Projections, indexes and derived material.
+    Projections,
+    /// Caches, ORS copies, checkpoints and pending transitions.
+    Caches,
+    /// Backups, snapshots and restore-suppression state.
+    Backups,
+    /// Provider-side copies.
+    ProviderCopies,
+    /// Route residues and logs.
+    RouteResidues,
+}
+
+/// Durable neutral erasure intent recorded before any destructive dispatch.
+///
+/// The store never invents this record: it carries the stable operation
+/// identity, the digest binding the exact admitted request bytes, the subject,
+/// the surface plan in deterministic canonical order, and the
+/// policy/closure/fence binding. Every planned surface starts `NotAttempted`
+/// (see [`ErasureIntentRecord::initial_state`]) and advances only through
+/// owner-reported [`ErasureSurfaceOutcome`] values aggregated by
+/// [`aggregate_erasure_outcomes`].
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct ErasureIntentRecord {
+    pub operation_id: OperationId,
+    pub request_digest: String,
+    pub subject: String,
+    pub surfaces: Vec<ErasureSurfaceKind>,
+    pub policy_digest: String,
+    pub closure_digest: String,
+    pub state_fence: StateFence,
+}
+
+impl ErasureIntentRecord {
+    /// Validates the frozen intent without performing any destructive effect.
+    pub fn validate(&self) -> Result<(), StoreError> {
+        validate_text(self.operation_id.as_str(), "erasure.operation_id")?;
+        validate_digest(&self.request_digest, "erasure.request_digest")?;
+        validate_text(&self.subject, "erasure.subject")?;
+        if self.surfaces.is_empty() {
+            return Err(StoreError::Empty {
+                field: "erasure.surfaces",
+            });
+        }
+        let mut seen = BTreeSet::new();
+        for surface in &self.surfaces {
+            if !seen.insert(*surface) {
+                return Err(StoreError::Duplicate {
+                    field: "erasure.surfaces",
+                });
+            }
+        }
+        if self.surfaces.windows(2).any(|pair| pair[0] > pair[1]) {
+            return Err(StoreError::InvalidField {
+                field: "erasure.surfaces",
+                reason: "must be deterministic canonical surface order",
+            });
+        }
+        validate_digest(&self.policy_digest, "erasure.policy_digest")?;
+        validate_digest(&self.closure_digest, "erasure.closure_digest")?;
+        self.state_fence.validate().map_err(StoreError::Foundation)
+    }
+
+    /// Returns the NotAttempted-per-surface initial state in canonical order.
+    ///
+    /// This is the only state a freshly recorded intent may carry: no surface
+    /// is attempted before the intent is durable.
+    #[must_use]
+    pub fn initial_state(&self) -> Vec<(ErasureSurfaceKind, StoreMutationDisposition)> {
+        self.surfaces
+            .iter()
+            .map(|surface| (*surface, StoreMutationDisposition::NotAttempted))
+            .collect()
+    }
+}
+
+/// Per-surface erasure outcome reported by the owning surface.
+///
+/// Mirrors the `{Purged, Incomplete, Unknown}` domain: `Purged` proves removal
+/// of the named surface, while `Incomplete` and `Unknown` preserve the surface
+/// that must block a complete result. An `Unknown` surface keeps its possible
+/// effect explicit so the same operation is reconciled before retry.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE", deny_unknown_fields)]
+pub enum ErasureSurfaceOutcome {
+    Purged { surface: ErasureSurfaceKind },
+    Incomplete { surface: ErasureSurfaceKind },
+    Unknown { surface: ErasureSurfaceKind },
+}
+
+impl ErasureSurfaceOutcome {
+    /// Returns the surface this outcome reports on.
+    #[must_use]
+    pub const fn surface(self) -> ErasureSurfaceKind {
+        match self {
+            Self::Purged { surface } | Self::Incomplete { surface } | Self::Unknown { surface } => {
+                surface
+            }
+        }
+    }
+}
+
+/// Fail-closed aggregation over per-surface erasure outcomes.
+///
+/// Returns the committed surfaces in deterministic canonical order only when
+/// every planned surface reports [`ErasureSurfaceOutcome::Purged`] with no
+/// extras and no duplicates. Any `Unknown` surface refuses with
+/// [`ErasureFailureKind::Unknown`], which takes precedence over
+/// [`ErasureFailureKind::Incomplete`]; any `Incomplete` surface — including an
+/// empty, duplicate, misordered, missing, extra, or duplicated outcome entry —
+/// refuses with `Incomplete`. Either refusal must prevent a complete purge
+/// result; callers never map these refusals to success.
+#[must_use = "an erasure refusal must never be dropped"]
+pub fn aggregate_erasure_outcomes(
+    planned: &[ErasureSurfaceKind],
+    outcomes: &[ErasureSurfaceOutcome],
+) -> Result<Vec<ErasureSurfaceKind>, ErasureFailureKind> {
+    if planned.is_empty() {
+        return Err(ErasureFailureKind::Incomplete);
+    }
+    let mut seen = BTreeSet::new();
+    for surface in planned {
+        if !seen.insert(*surface) {
+            return Err(ErasureFailureKind::Incomplete);
+        }
+    }
+    if planned.windows(2).any(|pair| pair[0] > pair[1]) {
+        return Err(ErasureFailureKind::Incomplete);
+    }
+    let mut by_surface = BTreeMap::new();
+    for outcome in outcomes {
+        if by_surface.insert(outcome.surface(), *outcome).is_some() {
+            return Err(ErasureFailureKind::Incomplete);
+        }
+    }
+    if by_surface.len() != planned.len() {
+        return Err(ErasureFailureKind::Incomplete);
+    }
+    for surface in planned {
+        if !by_surface.contains_key(surface) {
+            return Err(ErasureFailureKind::Incomplete);
+        }
+    }
+    if by_surface
+        .values()
+        .any(|outcome| matches!(outcome, ErasureSurfaceOutcome::Unknown { .. }))
+    {
+        return Err(ErasureFailureKind::Unknown);
+    }
+    if by_surface
+        .values()
+        .any(|outcome| matches!(outcome, ErasureSurfaceOutcome::Incomplete { .. }))
+    {
+        return Err(ErasureFailureKind::Incomplete);
+    }
+    Ok(planned.to_vec())
+}
+
 /// Canonical store boundary.  Only these store-neutral types cross into an
 /// adapter; SDK/query/credential/table types remain adapter-private.
 #[allow(async_fn_in_trait)]
@@ -2838,6 +3012,155 @@ mod tests {
                 ..
             }))
         ));
+        Ok(())
+    }
+
+    fn erasure_test_fence() -> StateFence {
+        fence()
+    }
+
+    fn erasure_intent_record() -> ErasureIntentRecord {
+        ErasureIntentRecord {
+            operation_id: id("erasure-op-1").expect("operation id"),
+            request_digest: "c".repeat(64),
+            subject: "subject-1".to_owned(),
+            surfaces: vec![
+                ErasureSurfaceKind::Observations,
+                ErasureSurfaceKind::Projections,
+                ErasureSurfaceKind::Caches,
+            ],
+            policy_digest: "d".repeat(64),
+            closure_digest: "e".repeat(64),
+            state_fence: erasure_test_fence(),
+        }
+    }
+
+    #[test]
+    fn erasure_aggregate_is_fail_closed_with_unknown_precedence() {
+        let planned = vec![
+            ErasureSurfaceKind::Observations,
+            ErasureSurfaceKind::Projections,
+        ];
+        let purged: Vec<ErasureSurfaceOutcome> = planned
+            .iter()
+            .map(|surface| ErasureSurfaceOutcome::Purged { surface: *surface })
+            .collect();
+        assert_eq!(
+            aggregate_erasure_outcomes(&planned, &purged).expect("all purged commits"),
+            planned
+        );
+
+        let unknown_mixed = vec![
+            ErasureSurfaceOutcome::Unknown {
+                surface: ErasureSurfaceKind::Observations,
+            },
+            ErasureSurfaceOutcome::Incomplete {
+                surface: ErasureSurfaceKind::Projections,
+            },
+        ];
+        assert_eq!(
+            aggregate_erasure_outcomes(&planned, &unknown_mixed),
+            Err(crate::ErasureFailureKind::Unknown)
+        );
+
+        let incomplete_only = vec![
+            ErasureSurfaceOutcome::Purged {
+                surface: ErasureSurfaceKind::Observations,
+            },
+            ErasureSurfaceOutcome::Incomplete {
+                surface: ErasureSurfaceKind::Projections,
+            },
+        ];
+        assert_eq!(
+            aggregate_erasure_outcomes(&planned, &incomplete_only),
+            Err(crate::ErasureFailureKind::Incomplete)
+        );
+
+        let missing = vec![ErasureSurfaceOutcome::Purged {
+            surface: ErasureSurfaceKind::Observations,
+        }];
+        assert_eq!(
+            aggregate_erasure_outcomes(&planned, &missing),
+            Err(crate::ErasureFailureKind::Incomplete)
+        );
+
+        let duplicate = vec![
+            ErasureSurfaceOutcome::Purged {
+                surface: ErasureSurfaceKind::Observations,
+            },
+            ErasureSurfaceOutcome::Purged {
+                surface: ErasureSurfaceKind::Observations,
+            },
+        ];
+        assert_eq!(
+            aggregate_erasure_outcomes(&planned, &duplicate),
+            Err(crate::ErasureFailureKind::Incomplete)
+        );
+
+        let extra = vec![
+            ErasureSurfaceOutcome::Purged {
+                surface: ErasureSurfaceKind::Observations,
+            },
+            ErasureSurfaceOutcome::Purged {
+                surface: ErasureSurfaceKind::Projections,
+            },
+            ErasureSurfaceOutcome::Purged {
+                surface: ErasureSurfaceKind::Caches,
+            },
+        ];
+        assert_eq!(
+            aggregate_erasure_outcomes(&planned, &extra),
+            Err(crate::ErasureFailureKind::Incomplete)
+        );
+
+        assert_eq!(
+            aggregate_erasure_outcomes(&[], &[]),
+            Err(crate::ErasureFailureKind::Incomplete)
+        );
+
+        let intent = erasure_intent_record();
+        let initial: Vec<ErasureSurfaceKind> = intent
+            .initial_state()
+            .iter()
+            .map(|(surface, _)| *surface)
+            .collect();
+        assert_eq!(initial, intent.surfaces);
+        assert!(
+            intent
+                .initial_state()
+                .iter()
+                .all(|(_, disposition)| *disposition == StoreMutationDisposition::NotAttempted)
+        );
+    }
+
+    #[test]
+    fn erasure_surface_request_validates_plan_and_intent_capability() -> Result<(), StoreError> {
+        use crate::ErasureSurfaceRequest;
+        let intent = erasure_intent_record();
+        let request = ErasureSurfaceRequest {
+            identity: OperationIdentity {
+                operation_id: intent.operation_id.clone(),
+                idempotency_key: "erasure-retry-1".to_owned(),
+                canonical_request_hash: intent.request_digest.clone(),
+            },
+            surfaces: intent.surfaces.clone(),
+            intent,
+        };
+        request.validate()?;
+        request.validate_for_dispatch(&[crate::CAPABILITY_ERASURE_INTENT])?;
+
+        assert_eq!(
+            request.validate_for_dispatch(&[]),
+            Err(StoreError::UnknownOperation)
+        );
+
+        let mut narrowed = request.clone();
+        narrowed.surfaces.pop();
+        assert!(narrowed.validate().is_err());
+
+        let mut conflicted = request.clone();
+        conflicted.identity.canonical_request_hash = "f".repeat(64);
+        assert_eq!(conflicted.validate(), Err(StoreError::IdentityConflict));
         Ok(())
     }
 }
