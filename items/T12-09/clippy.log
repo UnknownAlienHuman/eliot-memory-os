@@ -1,0 +1,319 @@
+warning: item in documentation is missing backticks
+  --> crates\surfaces\eliot-mcp\src\host.rs:92:68
+   |
+92 |     "Opaque resource observation supplied by the host. It is not a NativeResourceLease or filesystem grant."
+   |                                                                    ^^^^^^^^^^^^^^^^^^^
+   |
+   = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.97.0/index.html#doc_markdown
+   = note: `-W clippy::doc-markdown` implied by `-W clippy::pedantic`
+   = help: to override `-W clippy::pedantic` add `#[allow(clippy::doc_markdown)]`
+   = note: this warning originates in the macro `opaque_host_id` (in Nightly builds, run with -Z macro-backtrace for more info)
+help: try
+   |
+92 -     "Opaque resource observation supplied by the host. It is not a NativeResourceLease or filesystem grant."
+92 +     "Opaque resource observation supplied by the host. It is not a `NativeResourceLease` or filesystem grant."
+   |
+
+warning: item in documentation is missing backticks
+  --> crates\surfaces\eliot-mcp\src\host_gateway.rs:24:5
+   |
+24 | /// RequestIdentity issuance, absolute deadline, idempotency, authority/fence
+   |     ^^^^^^^^^^^^^^^
+   |
+   = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.97.0/index.html#doc_markdown
+help: try
+   |
+24 - /// RequestIdentity issuance, absolute deadline, idempotency, authority/fence
+24 + /// `RequestIdentity` issuance, absolute deadline, idempotency, authority/fence
+   |
+
+warning: `eliot-mcp` (lib) generated 2 warnings (run `cargo clippy --fix --lib -p eliot-mcp -- ` to apply 1 suggestion)
+warning: this function has too many lines (101/100)
+    --> crates\kernel\eliot-platform-windows\src\package_staging.rs:3256:1
+     |
+3256 | / fn walk_trusted_source_tree_with_root<F>(
+3257 | |     root: &Path,
+3258 | |     retained_root: Option<&std::fs::File>,
+3259 | |     mut on_file: F,
+...    |
+3266 | |         FileIdentity,
+3267 | |     ) -> Result<(), PackageStagingError>,
+     | |_________________________________________^
+     |
+     = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.97.0/index.html#too_many_lines
+     = note: `-W clippy::too-many-lines` implied by `-W clippy::pedantic`
+     = help: to override `-W clippy::pedantic` add `#[allow(clippy::too_many_lines)]`
+
+warning: `eliot-platform-windows` (lib) generated 1 warning
+warning: these match arms have identical bodies
+    --> crates\kernel\eliot-ors\src\store.rs:1832:17
+     |
+1832 |                 (Some(..), Some(..), None) => true,
+     |                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+1833 |                 (None, None, None) => true,
+     |                 ^^^^^^^^^^^^^^^^^^^^^^^^^^
+     |
+     = help: if this is unintentional make the arms return different values
+     = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.97.0/index.html#match_same_arms
+     = note: `-W clippy::match-same-arms` implied by `-W clippy::pedantic`
+     = help: to override `-W clippy::pedantic` add `#[allow(clippy::match_same_arms)]`
+help: otherwise merge the patterns into a single arm
+     |
+1832 ~                 (Some(..), Some(..), None) | (None, None, None) => true,
+1833 ~                 _ => false,
+     |
+
+warning: `eliot-ors` (lib) generated 1 warning
+warning: this argument is passed by value, but not consumed in the function body
+   --> crates\kernel\eliot-kernel-core\src\grant_activation_port.rs:298:23
+    |
+298 |         active_epoch: EpochId,
+    |                       ^^^^^^^
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.97.0/index.html#needless_pass_by_value
+    = note: `-W clippy::needless-pass-by-value` implied by `-W clippy::pedantic`
+    = help: to override `-W clippy::pedantic` add `#[allow(clippy::needless_pass_by_value)]`
+help: consider taking a reference instead
+    |
+298 |         active_epoch: &EpochId,
+    |                       +
+
+warning: this argument is passed by value, but not consumed in the function body
+   --> crates\kernel\eliot-kernel-core\src\grant_activation_port.rs:367:23
+    |
+367 |         active_epoch: EpochId,
+    |                       ^^^^^^^
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.97.0/index.html#needless_pass_by_value
+help: consider taking a reference instead
+    |
+367 |         active_epoch: &EpochId,
+    |                       +
+
+warning: this argument is passed by value, but not consumed in the function body
+   --> crates\kernel\eliot-kernel-core\src\grant_activation_port.rs:481:23
+    |
+481 |         active_epoch: EpochId,
+    |                       ^^^^^^^
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.97.0/index.html#needless_pass_by_value
+help: consider taking a reference instead
+    |
+481 |         active_epoch: &EpochId,
+    |                       +
+
+warning: this argument is passed by value, but not consumed in the function body
+   --> crates\kernel\eliot-kernel-core\src\grant_activation_port.rs:544:23
+    |
+544 |         active_epoch: EpochId,
+    |                       ^^^^^^^
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.97.0/index.html#needless_pass_by_value
+help: consider taking a reference instead
+    |
+544 |         active_epoch: &EpochId,
+    |                       +
+
+warning: used `expect()` on a `Result` value
+  --> crates\kernel\eliot-installation\src\agent_bridge_profile.rs:51:5
+   |
+51 | /     EpochId::new(
+52 | |         EpochLineageId::new(INSTALLATION_LINEAGE_A).expect("canonical installation lineage-A"),
+53 | |         NonZeroU64::new(sequence).expect("non-zero installation sequence"),
+54 | |     )
+55 | |     .expect("valid installation epoch")
+   | |_______________________________________^
+   |
+   = note: if this value is an `Err`, it will panic
+   = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.97.0/index.html#expect_used
+   = note: requested on the command line with `-W clippy::expect-used`
+
+warning: used `expect()` on a `Result` value
+  --> crates\kernel\eliot-installation\src\agent_bridge_profile.rs:52:9
+   |
+52 |         EpochLineageId::new(INSTALLATION_LINEAGE_A).expect("canonical installation lineage-A"),
+   |         ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+   |
+   = note: if this value is an `Err`, it will panic
+   = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.97.0/index.html#expect_used
+
+warning: used `expect()` on an `Option` value
+  --> crates\kernel\eliot-installation\src\agent_bridge_profile.rs:53:9
+   |
+53 |         NonZeroU64::new(sequence).expect("non-zero installation sequence"),
+   |         ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+   |
+   = note: if this value is `None`, it will panic
+   = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.97.0/index.html#expect_used
+
+warning: used `expect()` on a `Result` value
+  --> crates\kernel\eliot-installation\src\package_planner.rs:31:5
+   |
+31 | /     EpochId::new(
+32 | |         EpochLineageId::new(PACKAGE_PLANNER_LINEAGE_A).expect("canonical planner lineage-A"),
+33 | |         NonZeroU64::new(sequence).expect("non-zero planner sequence"),
+34 | |     )
+35 | |     .expect("valid planner epoch")
+   | |__________________________________^
+   |
+   = note: if this value is an `Err`, it will panic
+   = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.97.0/index.html#expect_used
+
+warning: used `expect()` on a `Result` value
+  --> crates\kernel\eliot-installation\src\package_planner.rs:32:9
+   |
+32 |         EpochLineageId::new(PACKAGE_PLANNER_LINEAGE_A).expect("canonical planner lineage-A"),
+   |         ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+   |
+   = note: if this value is an `Err`, it will panic
+   = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.97.0/index.html#expect_used
+
+warning: used `expect()` on an `Option` value
+  --> crates\kernel\eliot-installation\src\package_planner.rs:33:9
+   |
+33 |         NonZeroU64::new(sequence).expect("non-zero planner sequence"),
+   |         ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+   |
+   = note: if this value is `None`, it will panic
+   = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.97.0/index.html#expect_used
+
+warning: item in documentation is missing backticks
+   --> crates\kernel\eliot-installation\src\redb_state.rs:115:62
+    |
+115 | /// Opens (or creates) the registry writer file with bounded AlreadyOpen
+    |                                                              ^^^^^^^^^^^
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.97.0/index.html#doc_markdown
+    = note: `-W clippy::doc-markdown` implied by `-W clippy::pedantic`
+    = help: to override `-W clippy::pedantic` add `#[allow(clippy::doc_markdown)]`
+help: try
+    |
+115 - /// Opens (or creates) the registry writer file with bounded AlreadyOpen
+115 + /// Opens (or creates) the registry writer file with bounded `AlreadyOpen`
+    |
+
+warning: item in documentation is missing backticks
+   --> crates\kernel\eliot-installation\src\redb_state.rs:129:58
+    |
+129 | /// Opens the existing registry writer file with bounded AlreadyOpen retry.
+    |                                                          ^^^^^^^^^^^
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.97.0/index.html#doc_markdown
+help: try
+    |
+129 - /// Opens the existing registry writer file with bounded AlreadyOpen retry.
+129 + /// Opens the existing registry writer file with bounded `AlreadyOpen` retry.
+    |
+
+warning: item in documentation is missing backticks
+   --> crates\kernel\eliot-installation\src\redb_state.rs:143:52
+    |
+143 | /// Opens the registry read-only file with bounded AlreadyOpen retry. This is
+    |                                                    ^^^^^^^^^^^
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.97.0/index.html#doc_markdown
+help: try
+    |
+143 - /// Opens the registry read-only file with bounded AlreadyOpen retry. This is
+143 + /// Opens the registry read-only file with bounded `AlreadyOpen` retry. This is
+    |
+
+warning: this function has too many lines (114/100)
+    --> crates\kernel\eliot-installation\src\lib.rs:5112:5
+     |
+5112 | /     fn credential_observation(
+5113 | |         &self,
+5114 | |         request: &InstallationEffectRequest,
+5115 | |         operation: HostCredentialControlOperation,
+5116 | |     ) -> Result<InstallationEffectObservation, PortError> {
+     | |_________________________________________________________^
+     |
+     = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.97.0/index.html#too_many_lines
+     = note: `-W clippy::too-many-lines` implied by `-W clippy::pedantic`
+     = help: to override `-W clippy::pedantic` add `#[allow(clippy::too_many_lines)]`
+
+warning: `eliot-kernel-core` (lib) generated 4 warnings
+warning: `eliot-installation` (lib) generated 10 warnings (run `cargo clippy --fix --lib -p eliot-installation -- ` to apply 3 suggestions)
+warning: this argument is passed by value, but not consumed in the function body
+   --> crates\kernel\eliot-kernel-service\src\protocol\native_worker_claim.rs:656:26
+    |
+656 |         authority_epoch: EpochId,
+    |                          ^^^^^^^
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.97.0/index.html#needless_pass_by_value
+    = note: `-W clippy::needless-pass-by-value` implied by `-W clippy::pedantic`
+    = help: to override `-W clippy::pedantic` add `#[allow(clippy::needless_pass_by_value)]`
+help: consider taking a reference instead
+    |
+656 |         authority_epoch: &EpochId,
+    |                          +
+
+warning: large size difference between variants
+    --> crates\kernel\eliot-kernel-service\src\protocol\native_worker_claim.rs:1113:1
+     |
+1113 | / pub enum NativeWorkerClaimResponse {
+1114 | |     /// The claim was admitted; the receipt is the admission proof.
+1115 | |     Admitted(NativeWorkerClaimReceipt),
+     | |     ---------------------------------- the largest variant contains at least 312 bytes
+1116 | |     /// The claim was refused for the named typed reason.
+...    |
+1119 | |     Conflict(NativeWorkerClaimConflict),
+     | |     ----------------------------------- the second-largest variant contains at least 96 bytes
+1120 | | }
+     | |_^ the entire enum is at least 312 bytes
+     |
+     = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.97.0/index.html#large_enum_variant
+     = note: `-W clippy::large-enum-variant` implied by `-W clippy::all`
+     = help: to override `-W clippy::all` add `#[allow(clippy::large_enum_variant)]`
+help: consider boxing the large fields or introducing indirection in some other way to reduce the total size of the enum
+     |
+1115 -     Admitted(NativeWorkerClaimReceipt),
+1115 +     Admitted(Box<NativeWorkerClaimReceipt>),
+     |
+
+warning: large size difference between variants
+    --> crates\kernel\eliot-kernel-service\src\protocol.rs:2161:1
+     |
+2161 | / pub enum ProcessExecutionResponse {
+2162 | |     /// Exact receipt after a child was admitted and resumed.
+2163 | |     Started(ProcessStartReceipt),
+2164 | |     /// Current non-authoritative operation projection.
+2165 | |     Status(ProcessExecutionView),
+     | |     ---------------------------- the second-largest variant contains at least 1096 bytes
+...    |
+2169 | |     Reconciled(ProcessEvidence),
+     | |     --------------------------- the largest variant contains at least 3000 bytes
+2170 | |     /// Bounded provider-neutral rejection.
+2171 | |     Rejected(ProcessExecutionRejection),
+2172 | | }
+     | |_^ the entire enum is at least 3000 bytes
+     |
+     = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.97.0/index.html#large_enum_variant
+help: consider boxing the large fields or introducing indirection in some other way to reduce the total size of the enum
+     |
+2169 -     Reconciled(ProcessEvidence),
+2169 +     Reconciled(Box<ProcessEvidence>),
+     |
+
+warning: `eliot-kernel-service` (lib) generated 3 warnings
+    Checking eliot-kernel v0.1.0 (C:\Development\Rust\projects\eliot-swarm\item-T12-09\bins\eliot-kernel)
+bins\eliot-kernel\src\host_request_route.rs:1260:18: warning: constant `WATCHDOG_SPOOL_BATCH_ROUTE` is never used
+bins\eliot-kernel\src\host_request_route.rs:1282:15: warning: function `validate_watchdog_spool_batch_envelope` is never used
+bins\eliot-kernel\src\control_plane.rs:106:63: warning: this `if` has identical blocks
+bins\eliot-kernel\src\control_plane.rs:108:24: warning: this if-then-else expression returns a bool literal
+bins\eliot-kernel\src\front_door_session.rs:25:9: warning: item in documentation is missing backticks
+bins\eliot-kernel\src\front_door_session.rs:41:9: warning: item in documentation is missing backticks
+bins\eliot-kernel\src\native_worker_lifecycle_route.rs:864:9: warning: this `if` statement can be collapsed
+bins\eliot-kernel\src\native_worker_lifecycle_route.rs:877:9: warning: this `if` statement can be collapsed
+bins\eliot-kernel\src\native_worker_lifecycle_route.rs:1018:5: warning: this function has too many lines (180/100)
+bins\eliot-kernel\src\native_worker_lifecycle_route.rs:1103:9: warning: this `if` statement can be collapsed
+bins\eliot-kernel\src\native_worker_lifecycle_route.rs:1114:9: warning: this `if` statement can be collapsed
+bins\eliot-kernel\src\native_worker_lifecycle_route.rs:1125:9: warning: this `if` statement can be collapsed
+bins\eliot-kernel\src\native_worker_lifecycle_route.rs:1136:9: warning: this `if` statement can be collapsed
+bins\eliot-kernel\src\native_worker_lifecycle_route.rs:1198:9: warning: this `if` statement can be collapsed
+bins\eliot-kernel\src\native_worker_lifecycle_route.rs:1439:17: warning: these match arms have identical bodies
+bins\eliot-kernel\src\native_worker_lifecycle_route.rs:1459:17: warning: these match arms have identical bodies
+warning: `eliot-kernel` (lib) generated 16 warnings (run `cargo clippy --fix --lib -p eliot-kernel -- ` to apply 10 suggestions)
+bins\eliot-kernel\src\notify_operation_identity.rs:162:21: warning: used `expect_err()` on a `Result` value
+warning: `eliot-kernel` (lib test) generated 15 warnings (14 duplicates)
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 5.53s
