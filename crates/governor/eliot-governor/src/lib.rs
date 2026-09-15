@@ -59,7 +59,10 @@ pub use controlboard_projection::{
 /// the daemon composition root can name the exact envelope type without a
 /// second canonical dependency path.
 pub use eliot_canonical::CanonicalWriteEnvelope;
-pub use observation_reconciliation::GovernorObservationReconciliation;
+pub use observation_reconciliation::{
+    GovernorObservationReconciliation, WatchdogAdmittedEntry, WatchdogEntryAdmission,
+    WatchdogEntryKind,
+};
 pub use operator_reconciliation::{GovernorOperatorReconciliation, operator_command_envelope};
 pub use skill_lifecycle::GovernorSkillLifecycle;
 /// Task lifecycle domain types re-exported so the daemon composition root
