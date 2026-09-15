@@ -45,6 +45,7 @@ mod observation_adapters;
 mod skill_lifecycle_adapters;
 mod skill_surface_adapters;
 mod store_failure_projection;
+mod task_lifecycle_adapters;
 
 pub use activation_projection::AgentActivationResolver;
 
@@ -508,6 +509,32 @@ impl DaemonComposition {
         }
         Ok(skill_lifecycle_adapters::ForwardingSkillLifecycle::new(
             self.governor.skill_lifecycle(),
+        ))
+    }
+
+    /// Borrows the single Governor task lifecycle owner as a forwarding
+    /// adapter over the closed [`TaskCommand`](eliot_governor::TaskCommand) path.
+    ///
+    /// The adapter forwards the exact admitted identity, operation identity,
+    /// proposal, context, and command to the Governor canonical task path
+    /// and returns only typed results. No policy, admission, or semantic
+    /// rules live here; a duplicate, stale revision, stale fence, or illegal
+    /// transition fails closed in the Governor owner. Publication happens
+    /// only via the Governor `refresh_from_kernel` at the returned receipt
+    /// revision. Callers take a fresh adapter per operation so a Governor
+    /// refresh surfaces as an exact-view mismatch instead of silent
+    /// divergence.
+    pub fn task_lifecycle(
+        &self,
+    ) -> Result<task_lifecycle_adapters::ForwardingTaskLifecycle<'_, dyn eliot_governor::KernelGenerationPort>, DaemonError>
+    {
+        if self.readiness() != eliot_governor::CompositionReadiness::Ready {
+            return Err(DaemonError::Composition(
+                eliot_governor::CompositionError::NotReady,
+            ));
+        }
+        Ok(task_lifecycle_adapters::ForwardingTaskLifecycle::new(
+            self.governor.task_lifecycle(),
         ))
     }
 

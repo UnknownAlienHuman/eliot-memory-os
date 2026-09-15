@@ -5,7 +5,7 @@
 //! activated operation. The table activates exactly the five reads with
 //! proven adapter handlers, parameter shapes, and consumers on base
 //! (`GetRevisionHeads`, `GetOrderingHeads`, `GetScopeRevisionView`,
-//! `ResolveWriteReceipt`, `GetEvidencePack`), the three `CaptureObservation` /
+//! `ResolveWriteReceipt`, `GetEvidencePack`), the four `CaptureObservation` /
 //! `AppendAuditEvent` / `ApplyLifecyclePolicy` mutations (AUD-C01:
 //! `CaptureObservation` and `AppendAuditEvent` persist
 //! `TransitionClass::CaptureCandidate` with the `EffectClass::Candidate`
@@ -15,7 +15,12 @@
 //! persists `TransitionClass::RecoverySchema` with the
 //! `EffectClass::ReversibleMutation` ceiling and the owner-approved ten-field
 //! problem-leg recovery schema emitted by the Governor doctor verification
-//! envelope), plus the provider-independent genesis bootstrap entry sourced by
+//! envelope), plus the `UpdateTaskState` mutation (AUD-C01: persists
+//! `TransitionClass::TaskControl` with the `EffectClass::ReversibleMutation`
+//! ceiling and the owner-approved six-field task-control schema emitted by
+//! the Governor task lifecycle envelope
+//! (`crates/governor/eliot-governor/src/task_lifecycle.rs`, `task_envelope`)),
+//! plus the provider-independent genesis bootstrap entry sourced by
 //! [`genesis_manifest`](crate::genesis_manifest). Every other operation stays
 //! known-but-unsupported and unadvertised: no other mutation on base has a
 //! proven handler, schema, and consumer triple, so C1 advertises no other
@@ -86,7 +91,7 @@ pub const OPERATION_CATALOGUE_PROFILE: &str = "eliot.storage.operation-profile.v
 pub const ACTIVATED_READ_OWNING_SECTION: &str = "I5.17";
 
 /// Owning section for the activated mutation entries: the same command-family
-/// activation section that owns the read entries (AUD-C01 activates the three
+/// activation section that owns the read entries (AUD-C01 activates the five
 /// proven mutations under it).
 pub const ACTIVATED_MUTATION_OWNING_SECTION: &str = "I5.17";
 
@@ -223,10 +228,11 @@ struct ActivatedMutationDescriptor {
 /// (`Candidate`) through the `CaptureCandidate` family; `ApplyLifecyclePolicy`
 /// persists `ReversibleMutation` through the `LifecyclePolicy` family;
 /// `ReconcileRecovery` persists `ReversibleMutation` through the
-/// `RecoverySchema` family. All
-/// four address no scope, mirroring the scope-free read descriptors. Every
+/// `RecoverySchema` family; `UpdateTaskState` persists `ReversibleMutation`
+/// through the `TaskControl` family. All
+/// five address no scope, mirroring the scope-free read descriptors. Every
 /// other mutation stays known-but-unsupported.
-const ACTIVATED_MUTATIONS: [ActivatedMutationDescriptor; 4] = [
+const ACTIVATED_MUTATIONS: [ActivatedMutationDescriptor; 5] = [
     ActivatedMutationDescriptor {
         operation: NamedMutationOperation::CaptureObservation,
         transition_classes: &[TransitionClass::CaptureCandidate],
@@ -245,6 +251,11 @@ const ACTIVATED_MUTATIONS: [ActivatedMutationDescriptor; 4] = [
     ActivatedMutationDescriptor {
         operation: NamedMutationOperation::ReconcileRecovery,
         transition_classes: &[TransitionClass::RecoverySchema],
+        maximum_effect: EffectClass::ReversibleMutation,
+    },
+    ActivatedMutationDescriptor {
+        operation: NamedMutationOperation::UpdateTaskState,
+        transition_classes: &[TransitionClass::TaskControl],
         maximum_effect: EffectClass::ReversibleMutation,
     },
 ];
@@ -311,7 +322,7 @@ fn genesis_entry_spec() -> OperationManifestSpec {
 /// Generates the per-operation manifest descriptors from the declaration table.
 ///
 /// Declaration order is the canonical order: the five activated reads, the
-/// four activated mutations, then the genesis bootstrap entry. Generation is
+/// five activated mutations, then the genesis bootstrap entry. Generation is
 /// pure over crate constants, so the same source always yields byte-identical
 /// entries.
 pub fn generated_operation_manifests() -> Result<Vec<NamedOperationManifest>, StoreError> {
@@ -469,7 +480,7 @@ pub fn validate_read_against_catalogue(
 /// to a mutation entry, stay within that entry's ceiling, carry only the
 /// owner-approved typed parameters for the approved command, and stay within
 /// the entry input bound. Only `CaptureObservation`, `AppendAuditEvent`,
-/// `ApplyLifecyclePolicy`, and `ReconcileRecovery` have activated mutation entries; any other named
+/// `ApplyLifecyclePolicy`, `ReconcileRecovery`, and `UpdateTaskState` have activated mutation entries; any other named
 /// command fails closed here until a later slice proves its handler, schema,
 /// and consumer triple.
 pub fn validate_transition_against_catalogue(
@@ -520,10 +531,11 @@ pub fn validate_transition_against_catalogue(
             NamedMutationOperation::CaptureObservation
             | NamedMutationOperation::AppendAuditEvent
             | NamedMutationOperation::ApplyLifecyclePolicy
-            | NamedMutationOperation::ReconcileRecovery => {
+            | NamedMutationOperation::ReconcileRecovery
+            | NamedMutationOperation::UpdateTaskState => {
                 validate_typed_mutation_parameters(command.operation, &command.parameters)?;
             }
-            NamedMutationOperation::ApplyEpistemicRevision | NamedMutationOperation::UpdateTaskState => {
+            NamedMutationOperation::ApplyEpistemicRevision => {
                 return Err(StoreError::UnknownOperation);
             }
         }

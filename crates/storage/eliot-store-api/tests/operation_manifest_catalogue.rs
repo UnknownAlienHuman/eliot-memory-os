@@ -71,7 +71,7 @@ fn evidence_pack_params() -> BTreeMap<String, Value> {
 #[test]
 fn activated_typed_reads_pass_catalogue_validation() {
     let entries = generated_operation_manifests().unwrap();
-    assert_eq!(entries.len(), 10);
+    assert_eq!(entries.len(), 11);
 
     // The closed name mapping is the single owner for code, manifests, wire.
     for operation in [
@@ -485,12 +485,34 @@ fn recovery_plan(set_digest: &OperationManifestDigest) -> eliot_store_api::Prepa
     plan
 }
 
+fn task_state_params() -> BTreeMap<String, Value> {
+    BTreeMap::from([
+        ("task_id".to_owned(), json!("task-1")),
+        ("event_id".to_owned(), json!("task-event-1")),
+        ("from".to_owned(), json!("PROPOSED")),
+        ("to".to_owned(), json!("OPEN")),
+        ("expected_revision".to_owned(), json!("1")),
+        ("actor_ref".to_owned(), json!("actor-1")),
+    ])
+}
+
+fn task_state_plan(set_digest: &OperationManifestDigest) -> eliot_store_api::PreparedTransition {
+    let mut plan = mutation_plan(set_digest);
+    plan.transition_class = TransitionClass::TaskControl;
+    plan.requested_effect_ceiling = EffectClass::ReversibleMutation;
+    plan.named_operations = vec![NamedMutationRequest {
+        operation: NamedMutationOperation::UpdateTaskState,
+        parameters: task_state_params(),
+    }];
+    plan
+}
+
 #[test]
 fn approved_capture_plan_passes_and_stale_digest_fails_manifest_mismatch() {
     let entries = generated_operation_manifests().unwrap();
     let set_digest = operation_manifest_set_digest(&entries).unwrap();
 
-    // AUD-C01 activates exactly four mutations: the approved CaptureObservation
+    // AUD-C01 activates exactly five mutations: the approved CaptureObservation
     // plan binds the set digest and passes the whole catalogue path.
     let plan = mutation_plan(&set_digest);
     assert!(plan.validate_against_catalogue(&entries).is_ok());
@@ -507,7 +529,7 @@ fn approved_capture_plan_passes_and_stale_digest_fails_manifest_mismatch() {
 #[test]
 fn capture_observation_passes_whole_path() {
     let entries = generated_operation_manifests().unwrap();
-    assert_eq!(entries.len(), 10);
+    assert_eq!(entries.len(), 11);
     let set_digest = operation_manifest_set_digest(&entries).unwrap();
 
     // Approved owner-shaped subject params pass catalogue validation.
@@ -554,7 +576,7 @@ fn capture_observation_passes_whole_path() {
 #[test]
 fn append_audit_event_passes_whole_path() {
     let entries = generated_operation_manifests().unwrap();
-    assert_eq!(entries.len(), 10);
+    assert_eq!(entries.len(), 11);
     let set_digest = operation_manifest_set_digest(&entries).unwrap();
 
     // Approved receipt-bound audit params pass catalogue validation without bypass.
@@ -565,7 +587,7 @@ fn append_audit_event_passes_whole_path() {
 #[test]
 fn apply_lifecycle_policy_passes_whole_path() {
     let entries = generated_operation_manifests().unwrap();
-    assert_eq!(entries.len(), 10);
+    assert_eq!(entries.len(), 11);
     let set_digest = operation_manifest_set_digest(&entries).unwrap();
 
     // Approved lifecycle-policy params pass catalogue validation without bypass.
@@ -576,7 +598,7 @@ fn apply_lifecycle_policy_passes_whole_path() {
 #[test]
 fn reconcile_recovery_passes_whole_path() {
     let entries = generated_operation_manifests().unwrap();
-    assert_eq!(entries.len(), 10);
+    assert_eq!(entries.len(), 11);
     let set_digest = operation_manifest_set_digest(&entries).unwrap();
 
     // Approved problem-leg recovery params pass catalogue validation without bypass.
@@ -618,6 +640,38 @@ fn reconcile_recovery_passes_whole_path() {
         failure.mutation_disposition,
         StoreMutationDisposition::NotAttempted
     );
+}
+
+#[test]
+fn update_task_state_passes_whole_path() {
+    let entries = generated_operation_manifests().unwrap();
+    assert_eq!(entries.len(), 11);
+    let set_digest = operation_manifest_set_digest(&entries).unwrap();
+
+    // Approved task-control params pass catalogue validation without bypass.
+    let plan = task_state_plan(&set_digest);
+    assert!(plan.validate_against_catalogue(&entries).is_ok());
+
+    // The proposing shape omits the predecessor `from` and still passes:
+    // the optional field is absent, never defaulted.
+    let mut proposing = task_state_plan(&set_digest);
+    proposing.named_operations[0]
+        .parameters
+        .remove("from");
+    assert!(proposing.validate_against_catalogue(&entries).is_ok());
+
+    // A missing required task-control field fails closed.
+    let mut missing = task_state_params();
+    missing.remove("expected_revision");
+    let mut plan = task_state_plan(&set_digest);
+    plan.named_operations[0].parameters = missing;
+    assert!(matches!(
+        plan.validate_against_catalogue(&entries),
+        Err(StoreError::InvalidField {
+            field: "operation.parameter",
+            ..
+        })
+    ));
 }
 
 #[test]
