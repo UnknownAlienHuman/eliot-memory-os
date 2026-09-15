@@ -34,8 +34,19 @@
 
 mod activation_outcome;
 mod composition;
+mod context_inputs;
+mod cue_composition;
 mod epistemic_composition;
 pub use epistemic_composition::{GovernorEpistemicComposition, ObservedEpistemicProposal};
+pub use context_inputs::{
+    ContextInputsError, ContextReconstructionRequest, GovernorContextInputs, ROLE_AFFORDANCES,
+    ROLE_ATTENTION_CONFLICT, ROLE_CUE_ACTIVATION, ROLE_EPISTEMIC_POSITION, ROLE_EVIDENCE_ASSURANCE,
+    ROLE_NEGATIVE_MEMORY, ROLE_TASK_FRAME, RoleAcquisition, SevenRoleInputs,
+};
+pub use cue_composition::{
+    CueCacheKey, CueCompositionError, CueReconstruction, CueReconstructionCache,
+    MAX_CACHED_CUE_RECONSTRUCTIONS, evidence_projection_payload, reconstruct_cue_snapshot,
+};
 mod controlboard_projection;
 mod observation_reconciliation;
 mod operator_reconciliation;
