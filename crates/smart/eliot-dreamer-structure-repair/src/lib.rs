@@ -66,8 +66,8 @@ use eliot_contracts::{canonical_json_bytes, sha256_hex};
 use eliot_dreamer_contracts::CurationRejectionCode;
 use eliot_dreamer_contracts::candidate::DimensionVerdict;
 use eliot_dreamer_contracts::{
-    CurationKind, CurationPayload, GroundedDreamDraft, PRESERVATION_DIMENSIONS, PreservationDimension,
-    PreservationReport, ValidatedCurationItem, check_fence, is_hex64_lower,
+    CurationKind, CurationPayload, GroundedDreamDraft, PRESERVATION_DIMENSIONS,
+    PreservationDimension, PreservationReport, ValidatedCurationItem, check_fence, is_hex64_lower,
 };
 
 // ---------------------------------------------------------------------------
@@ -1143,7 +1143,11 @@ fn validate_prior_shapes(prior: &PriorTransition) -> Result<(), StructureRepairE
         check_bounded_text(revision, "prior.premerge-revision", MAX_ID_BYTES)?;
     }
     check_identity(&prior.merged_id, "prior.merged")?;
-    check_bounded_text(&prior.merged_revision, "prior.merged-revision", MAX_ID_BYTES)?;
+    check_bounded_text(
+        &prior.merged_revision,
+        "prior.merged-revision",
+        MAX_ID_BYTES,
+    )?;
     check_fence(&prior.fence).map_err(|err| StructureRepairError::Shape {
         field: "prior.fence".to_owned(),
         detail: redact(&err.to_string()),
@@ -1158,7 +1162,9 @@ fn validate_prior_shapes(prior: &PriorTransition) -> Result<(), StructureRepairE
 }
 
 /// Validates structural text shapes, orderings, and member identity order.
-fn validate_structural_shapes(structural: &StructuralProjection) -> Result<(), StructureRepairError> {
+fn validate_structural_shapes(
+    structural: &StructuralProjection,
+) -> Result<(), StructureRepairError> {
     check_identity(&structural.subject_id, "structural.subject")?;
     check_bounded_text(
         &structural.subject_revision,
@@ -1253,7 +1259,9 @@ fn validate_structural_shapes(structural: &StructuralProjection) -> Result<(), S
 }
 
 /// Validates dependency shapes and deterministic dependent ordering.
-fn validate_dependency_shapes(dependency: &DependencyProjection) -> Result<(), StructureRepairError> {
+fn validate_dependency_shapes(
+    dependency: &DependencyProjection,
+) -> Result<(), StructureRepairError> {
     bound_list_length(
         "dependency.dependents",
         dependency.dependents.len(),
@@ -1291,11 +1299,7 @@ fn validate_policy_shapes(policy: &StructureRepairPolicy) -> Result<(), Structur
             detail: "policy_revision must be explicit, not defaulted".to_owned(),
         });
     }
-    check_bounded_text(
-        &policy.allocator_owner,
-        "policy.allocator",
-        MAX_ID_BYTES,
-    )?;
+    check_bounded_text(&policy.allocator_owner, "policy.allocator", MAX_ID_BYTES)?;
     check_bounded_text(&policy.repair_note, "policy.repair-note", MAX_NOTE_BYTES)?;
     Ok(())
 }
@@ -1607,7 +1611,11 @@ fn check_partition_cover(
                     detail: "a member is assigned to more than one partition".to_owned(),
                 });
             }
-            if structural.unresolved_residue.iter().any(|held| held == member) {
+            if structural
+                .unresolved_residue
+                .iter()
+                .any(|held| held == member)
+            {
                 return Err(StructureRepairError::Order {
                     phase: "structural.residue".to_owned(),
                     detail: "a member is both partitioned and held as residue".to_owned(),
@@ -1646,8 +1654,7 @@ fn check_partition_cover(
     want.sort();
     if accounted != want {
         return Err(StructureRepairError::Denominator {
-            detail: "partitions plus residue must account for every member exactly once"
-                .to_owned(),
+            detail: "partitions plus residue must account for every member exactly once".to_owned(),
         });
     }
     Ok(())
@@ -1742,7 +1749,8 @@ fn judge_merge(
     dependency: &DependencyProjection,
     policy: &StructureRepairPolicy,
 ) -> SemanticJudgement {
-    let similarity_overreach = mentions_any(&lowered(&structural.equivalence_note), SIMILARITY_MARKERS);
+    let similarity_overreach =
+        mentions_any(&lowered(&structural.equivalence_note), SIMILARITY_MARKERS);
     let equivalent = !structural.equivalence_refs.is_empty() && !similarity_overreach;
     let faithfulness_ok = equivalent && structural.unresolved_distinctions.is_empty();
     let ceiling_ok = !ceilings_raise(structural);
@@ -1751,8 +1759,7 @@ fn judge_merge(
     let provenance_ok = !structural.counterexample_refs.is_empty()
         && !structural.minority_refs.is_empty()
         && !structural.residual_refs.is_empty();
-    let closure_ok =
-        dependency.closure_complete && !has_unknown_dependent(dependency);
+    let closure_ok = dependency.closure_complete && !has_unknown_dependent(dependency);
     let basis_note = if structural.equivalence_refs.is_empty() {
         "no equivalence refs: shared lineage stays lineage-only".to_owned()
     } else if similarity_overreach {
@@ -1827,18 +1834,16 @@ fn judge_split(
             children_evidenced = false;
         }
     }
-    let faithfulness_ok =
-        children_evidenced && structural.partitions.len() >= 2;
+    let faithfulness_ok = children_evidenced && structural.partitions.len() >= 2;
     let ceiling_ok = !ceilings_raise(structural);
     let compatible = members_compatible(structural);
     let lineage_ok = !structural.raw_history_refs.is_empty();
     let provenance_ok = !structural.counterexample_refs.is_empty()
         && !structural.minority_refs.is_empty()
         && !structural.residual_refs.is_empty();
-    let residue_open = !structural.unresolved_residue.is_empty()
-        || !structural.unresolved_distinctions.is_empty();
-    let closure_ok =
-        dependency.closure_complete && !has_unknown_dependent(dependency);
+    let residue_open =
+        !structural.unresolved_residue.is_empty() || !structural.unresolved_distinctions.is_empty();
+    let closure_ok = dependency.closure_complete && !has_unknown_dependent(dependency);
     let basis_note = "split boundaries grounded in per-child discriminators".to_owned();
     let (outcome, note) = if has_unknown_dependent(dependency) {
         (
@@ -1931,14 +1936,12 @@ fn judge_reversal(
     };
     let ceiling_ok = !ceilings_raise(structural);
     let compatible = members_compatible(structural);
-    let lineage_ok =
-        ancestry_ok && premerge_covers && !structural.raw_history_refs.is_empty();
+    let lineage_ok = ancestry_ok && premerge_covers && !structural.raw_history_refs.is_empty();
     let provenance_ok = !structural.counterexample_refs.is_empty()
         && !structural.minority_refs.is_empty()
         && !structural.residual_refs.is_empty();
     let residue_open = !structural.unresolved_residue.is_empty();
-    let closure_ok =
-        dependency.closure_complete && !has_unknown_dependent(dependency);
+    let closure_ok = dependency.closure_complete && !has_unknown_dependent(dependency);
     let reversibility_ok = !prior.has_unknown_effects;
     let basis_note = "reversal grounded in the exact prior merge receipt".to_owned();
     let (outcome, note) = if !revision_moved {
@@ -2128,11 +2131,7 @@ fn disposition_for_kind(kind: &str) -> DependentDispositionKind {
     let value = lowered_kind.as_str();
     if value == "unknown" {
         DependentDispositionKind::BlockedUnknown
-    } else if value == "summary"
-        || value == "view"
-        || value == "concept"
-        || value == "procedure"
-    {
+    } else if value == "summary" || value == "view" || value == "concept" || value == "procedure" {
         DependentDispositionKind::ScopedSemanticDuplication
     } else if value == "relation" || value == "cue" || value == "index" || value == "claim" {
         DependentDispositionKind::Retarget
@@ -2181,7 +2180,11 @@ fn build_member_dispositions(
             (RepairSubtype::Split | RepairSubtype::Reversal, RepairOutcome::Complete) => {
                 let mut holder: Option<String> = None;
                 for partition in &structural.partitions {
-                    if partition.member_ids.iter().any(|id| id == &member.member_id) {
+                    if partition
+                        .member_ids
+                        .iter()
+                        .any(|id| id == &member.member_id)
+                    {
                         holder = Some(child_handle(&partition.partition_basename));
                     }
                 }
@@ -2194,10 +2197,7 @@ fn build_member_dispositions(
                         };
                         (kind, handle)
                     }
-                    None => (
-                        MemberDispositionKind::ResidueHeld,
-                        member.member_id.clone(),
-                    ),
+                    None => (MemberDispositionKind::ResidueHeld, member.member_id.clone()),
                 }
             }
             _ => {
@@ -2206,10 +2206,7 @@ fn build_member_dispositions(
                     .iter()
                     .any(|held| held == &member.member_id)
                 {
-                    (
-                        MemberDispositionKind::ResidueHeld,
-                        member.member_id.clone(),
-                    )
+                    (MemberDispositionKind::ResidueHeld, member.member_id.clone())
                 } else {
                     (
                         MemberDispositionKind::RetainedWithHistory,
@@ -2223,13 +2220,19 @@ fn build_member_dispositions(
                 format!("member {} proposed for {}", member.member_id, target)
             }
             MemberDispositionKind::RestoredToPremerge => {
-                format!("member {} proposed for restore to {}", member.member_id, target)
+                format!(
+                    "member {} proposed for restore to {}",
+                    member.member_id, target
+                )
             }
             MemberDispositionKind::ResidueHeld => {
                 format!("member {} held as unresolved residue", member.member_id)
             }
             MemberDispositionKind::RetainedWithHistory => {
-                format!("member {} retained with revision {}", member.member_id, member.revision)
+                format!(
+                    "member {} retained with revision {}",
+                    member.member_id, member.revision
+                )
             }
         };
         out.push(MemberDisposition {
@@ -2260,22 +2263,40 @@ fn build_dependent_dispositions(
         let kind = disposition_for_kind(&dependent.dependent_kind);
         let reason = match kind {
             DependentDispositionKind::UnchangedWithEvidence => {
-                format!("dependent {} unchanged with evidence", dependent.dependent_id)
+                format!(
+                    "dependent {} unchanged with evidence",
+                    dependent.dependent_id
+                )
             }
             DependentDispositionKind::Retarget => {
-                format!("dependent {} proposed for {}", dependent.dependent_id, target_handle)
+                format!(
+                    "dependent {} proposed for {}",
+                    dependent.dependent_id, target_handle
+                )
             }
             DependentDispositionKind::ScopedSemanticDuplication => {
-                format!("dependent {} scoped-duplicated under {}", dependent.dependent_id, target_handle)
+                format!(
+                    "dependent {} scoped-duplicated under {}",
+                    dependent.dependent_id, target_handle
+                )
             }
             DependentDispositionKind::InvalidateRebuildVerify => {
-                format!("dependent {} invalidates for owner rebuild", dependent.dependent_id)
+                format!(
+                    "dependent {} invalidates for owner rebuild",
+                    dependent.dependent_id
+                )
             }
             DependentDispositionKind::QuarantineReconcileByOwner => {
-                format!("dependent {} quarantined for owner reconcile", dependent.dependent_id)
+                format!(
+                    "dependent {} quarantined for owner reconcile",
+                    dependent.dependent_id
+                )
             }
             DependentDispositionKind::BlockedUnknown => {
-                format!("dependent {} blocks on unknown mutation", dependent.dependent_id)
+                format!(
+                    "dependent {} blocks on unknown mutation",
+                    dependent.dependent_id
+                )
             }
         };
         out.push(DependentDisposition {
@@ -2315,9 +2336,9 @@ fn build_rollback(
         ));
     }
     let inverse_note = match subtype {
-        RepairSubtype::Merge => format!(
-            "inverse: split {target_handle} back into retained members"
-        ),
+        RepairSubtype::Merge => {
+            format!("inverse: split {target_handle} back into retained members")
+        }
         RepairSubtype::Split => format!(
             "inverse: rejoin child allocations into {}",
             structural.subject_id
@@ -2327,7 +2348,10 @@ fn build_rollback(
                 "forward guard: re-apply {} only through its owner",
                 prior.prior_operation_id
             ),
-            None => format!("no inverse without the prior transition for {}", structural.subject_id),
+            None => format!(
+                "no inverse without the prior transition for {}",
+                structural.subject_id
+            ),
         },
     };
     steps.push(format!("inverse owned externally: {inverse_note}"));
@@ -2354,11 +2378,7 @@ fn build_invalidation(
             disposition.inverse_note
         ));
     }
-    bound_list_length(
-        "invalidation.entries",
-        entries.len(),
-        MAX_DEPENDENTS,
-    )?;
+    bound_list_length("invalidation.entries", entries.len(), MAX_DEPENDENTS)?;
     Ok(InvalidationPlan {
         entries,
         verifier: structural.verifier.clone(),
@@ -2438,10 +2458,19 @@ pub fn compute_candidate_digest(
         ));
     }
     if let Some(prior) = &structural.prior_transition {
-        parts.push(format!("prior:{}|{}", prior.prior_operation_id, prior.prior_receipt_digest));
-        parts.push(format!("merged:{}@{}", prior.merged_id, prior.merged_revision));
+        parts.push(format!(
+            "prior:{}|{}",
+            prior.prior_operation_id, prior.prior_receipt_digest
+        ));
+        parts.push(format!(
+            "merged:{}@{}",
+            prior.merged_id, prior.merged_revision
+        ));
     }
-    parts.push(format!("policy:{}@{}", policy.policy_id, policy.policy_revision));
+    parts.push(format!(
+        "policy:{}@{}",
+        policy.policy_id, policy.policy_revision
+    ));
     parts.push(format!("allocator:{}", policy.allocator_owner));
     parts.push(format!("bundle:{}", frozen.bundle_digest));
     parts.push(format!("manifest:{}", frozen.manifest_digest));
@@ -2504,7 +2533,8 @@ fn emit_candidate(
         "typed allocation request for the repair subject; the owner issues or declines",
     )?;
     let target_handle = target_allocation.requested_handle.clone();
-    let mut child_allocations: Vec<AllocationRequest> = Vec::with_capacity(structural.partitions.len());
+    let mut child_allocations: Vec<AllocationRequest> =
+        Vec::with_capacity(structural.partitions.len());
     let mut child_handles: Vec<String> = Vec::with_capacity(structural.partitions.len());
     if matches!(subtype, RepairSubtype::Split | RepairSubtype::Reversal) {
         for partition in &structural.partitions {
@@ -2638,7 +2668,9 @@ pub fn propose_structure_repair(
             provenance_ok: false,
             note: "cancelled or past-deadline requests emit no effect".to_owned(),
         };
-        return emit_candidate(subtype, early, &judgement, structural, dependency, policy, frozen);
+        return emit_candidate(
+            subtype, early, &judgement, structural, dependency, policy, frozen,
+        );
     }
     let preliminary = compute_candidate_digest(
         subtype,
@@ -2669,13 +2701,7 @@ pub fn propose_structure_repair(
             note: "repair identity already known; original records unchanged".to_owned(),
         };
         return emit_candidate(
-            subtype,
-            duplicate,
-            &judgement,
-            structural,
-            dependency,
-            policy,
-            frozen,
+            subtype, duplicate, &judgement, structural, dependency, policy, frozen,
         );
     }
     let judgement = match subtype {
@@ -2707,5 +2733,577 @@ pub fn outcome_rejection_hint(outcome: &RepairOutcome) -> Option<CurationRejecti
         | RepairOutcome::Stale
         | RepairOutcome::Rejected
         | RepairOutcome::Abstention => Some(CurationRejectionCode::IdentityMismatch),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use eliot_contracts::{EpochId, EpochLineageId, ResourceGeneration};
+    use eliot_dreamer_contracts::curation::{
+        MergePayload, RepairPayload, SplitPayload, TargetEvidence,
+    };
+    use eliot_dreamer_contracts::job::{Requester, RequesterOrigin};
+    use eliot_dreamer_contracts::{AtomicityMode, ClaimResidue, SupportState, TargetDenominator};
+    use std::num::NonZeroU64;
+
+    /// Returns the test state fence at genesis.
+    fn test_fence() -> eliot_contracts::StateFence {
+        let Some(sequence) = NonZeroU64::new(1) else {
+            panic!("non-zero test sequence");
+        };
+        let lineage = match EpochLineageId::new("550e8400-e29b-41d4-a716-446655440000") {
+            Ok(lineage) => lineage,
+            Err(err) => panic!("canonical test lineage: {err:?}"),
+        };
+        let epoch = match EpochId::new(lineage, sequence) {
+            Ok(epoch) => epoch,
+            Err(err) => panic!("valid test epoch: {err:?}"),
+        };
+        eliot_contracts::StateFence::new(epoch, ResourceGeneration::genesis())
+    }
+
+    /// Returns a valid A-05 receipt for the test job and digests.
+    fn test_receipt() -> eliot_dreamer_contracts::ValidationReceipt {
+        eliot_dreamer_contracts::ValidationReceipt {
+            schema_version: 1,
+            validator_contract: "a05-validator".to_owned(),
+            validator_policy: "policy-7".to_owned(),
+            job_id: "job-1".to_owned(),
+            draft_digest: "a".repeat(64),
+            bundle_digest: "b".repeat(64),
+            manifest_digest: "c".repeat(64),
+            task_id: "task-1".to_owned(),
+            scope_id: "scope-1".to_owned(),
+            input_digest: "d".repeat(64),
+            output_digest: "e".repeat(64),
+            terminal_disposition: "accepted".to_owned(),
+            proof_ceiling: "candidate-only".to_owned(),
+            state_fence: test_fence(),
+            preservation_digest: "f".repeat(64),
+            budget_digest: "0".repeat(64),
+        }
+    }
+
+    /// Returns a grounded draft bound to the test receipt digests.
+    fn test_grounded() -> GroundedDreamDraft {
+        GroundedDreamDraft {
+            schema_version: 1,
+            job_id: "job-1".to_owned(),
+            draft_digest: "a".repeat(64),
+            residues: vec![ClaimResidue {
+                claim: "mem-a and mem-b describe one identity".to_owned(),
+                state: SupportState::Supported,
+                detail: "eq-1 and eq-2 ground the equivalence".to_owned(),
+            }],
+            coverage_note: "one claim accounted".to_owned(),
+        }
+    }
+
+    /// Returns the frozen bundle bound to the test receipt digests.
+    fn test_frozen() -> FrozenBundle {
+        FrozenBundle {
+            bundle_digest: "b".repeat(64),
+            manifest_digest: "c".repeat(64),
+        }
+    }
+
+    /// Returns one source member with shared type, owner, and schema.
+    fn test_member(id: &str, revision: &str) -> MemberRecord {
+        MemberRecord {
+            member_id: id.to_owned(),
+            revision: revision.to_owned(),
+            source_ref: format!("src-{id}"),
+            raw_episode_ref: format!("raw-{id}"),
+            evidence_digest: sha256_hex(id.as_bytes()),
+            record_type: "record.memory".to_owned(),
+            owner: "owner-1".to_owned(),
+            schema: "schema-v1".to_owned(),
+        }
+    }
+
+    /// Returns a merge curation item bound to the test receipt.
+    fn merge_item() -> ValidatedCurationItem {
+        ValidatedCurationItem {
+            receipt: test_receipt(),
+            kind_spelling: "merge".to_owned(),
+            family_spelling: "structure_repair".to_owned(),
+            payload: CurationPayload::Merge(MergePayload {
+                left: "mem-a".to_owned(),
+                right: "mem-b".to_owned(),
+                merged: "mem-merged".to_owned(),
+                target_evidence: TargetEvidence {
+                    targets: vec![
+                        "mem-a".to_owned(),
+                        "mem-b".to_owned(),
+                        "mem-merged".to_owned(),
+                    ],
+                    evidence_refs: vec!["e-1".to_owned()],
+                },
+            }),
+            denominator: TargetDenominator {
+                mode: AtomicityMode::AllOrNothing,
+                members: vec![
+                    "mem-a".to_owned(),
+                    "mem-b".to_owned(),
+                    "mem-merged".to_owned(),
+                ],
+                expected_total: 3,
+            },
+            source_digest: "1".repeat(64),
+            task_id: "task-1".to_owned(),
+            scope_id: "scope-1".to_owned(),
+            state_fence: test_fence(),
+            job_digest: "2".repeat(64),
+            requester: Requester {
+                origin: RequesterOrigin::Human,
+                principal: "op-1".to_owned(),
+                session: None,
+            },
+            budget_note: "within budget".to_owned(),
+        }
+    }
+
+    /// Returns a split curation item bound to the test receipt.
+    fn split_item() -> ValidatedCurationItem {
+        ValidatedCurationItem {
+            receipt: test_receipt(),
+            kind_spelling: "split".to_owned(),
+            family_spelling: "structure_repair".to_owned(),
+            payload: CurationPayload::Split(SplitPayload {
+                whole: "mem-ab".to_owned(),
+                first: "mem-a".to_owned(),
+                second: "mem-b".to_owned(),
+                target_evidence: TargetEvidence {
+                    targets: vec!["mem-a".to_owned(), "mem-ab".to_owned(), "mem-b".to_owned()],
+                    evidence_refs: vec!["e-1".to_owned()],
+                },
+            }),
+            denominator: TargetDenominator {
+                mode: AtomicityMode::AllOrNothing,
+                members: vec!["mem-a".to_owned(), "mem-ab".to_owned(), "mem-b".to_owned()],
+                expected_total: 3,
+            },
+            source_digest: "1".repeat(64),
+            task_id: "task-1".to_owned(),
+            scope_id: "scope-1".to_owned(),
+            state_fence: test_fence(),
+            job_digest: "2".repeat(64),
+            requester: Requester {
+                origin: RequesterOrigin::Human,
+                principal: "op-1".to_owned(),
+                session: None,
+            },
+            budget_note: "within budget".to_owned(),
+        }
+    }
+
+    /// Returns a nonidentity A-30 repair item that must fail distinctly here.
+    fn repair_item() -> ValidatedCurationItem {
+        ValidatedCurationItem {
+            receipt: test_receipt(),
+            kind_spelling: "repair".to_owned(),
+            family_spelling: "memory_repair".to_owned(),
+            payload: CurationPayload::Repair(RepairPayload {
+                target: "mem-a".to_owned(),
+                repair: "relink".to_owned(),
+                target_evidence: TargetEvidence {
+                    targets: vec!["mem-a".to_owned()],
+                    evidence_refs: vec!["e-1".to_owned()],
+                },
+            }),
+            denominator: TargetDenominator {
+                mode: AtomicityMode::AllOrNothing,
+                members: vec!["mem-a".to_owned()],
+                expected_total: 1,
+            },
+            source_digest: "1".repeat(64),
+            task_id: "task-1".to_owned(),
+            scope_id: "scope-1".to_owned(),
+            state_fence: test_fence(),
+            job_digest: "2".repeat(64),
+            requester: Requester {
+                origin: RequesterOrigin::Human,
+                principal: "op-1".to_owned(),
+                session: None,
+            },
+            budget_note: "within budget".to_owned(),
+        }
+    }
+
+    /// Returns a valid merge structural projection over two sources.
+    fn merge_structural() -> StructuralProjection {
+        StructuralProjection {
+            subject_id: "mem-merged".to_owned(),
+            subject_revision: "rev-2".to_owned(),
+            record_type: "record.memory".to_owned(),
+            owner: "owner-1".to_owned(),
+            schema: "schema-v1".to_owned(),
+            members: vec![test_member("mem-a", "rev-1"), test_member("mem-b", "rev-1")],
+            equivalence_note:
+                "mem-a and mem-b carry scoped semantic equivalence for task-1 in scope-1".to_owned(),
+            equivalence_refs: vec!["eq-1".to_owned(), "eq-2".to_owned()],
+            unresolved_distinctions: Vec::new(),
+            counterexample_refs: vec!["ce-1".to_owned()],
+            minority_refs: vec!["min-1".to_owned()],
+            residual_refs: vec!["res-1".to_owned()],
+            shared_lineage_refs: vec!["lin-1".to_owned()],
+            support_ceiling: "support stays at level-2 without change".to_owned(),
+            authority_ceiling: "authority stays at owner-1 without change".to_owned(),
+            privacy_ceiling: "privacy stays at scope-1 without change".to_owned(),
+            requested_target_basename: "mem-merged".to_owned(),
+            partitions: Vec::new(),
+            unresolved_residue: Vec::new(),
+            prior_transition: None,
+            raw_history_refs: vec!["raw-1".to_owned(), "raw-2".to_owned()],
+            ancestry_refs: Vec::new(),
+            known_subject_ids: Vec::new(),
+            known_candidate_digests: Vec::new(),
+            duplicate_of: None,
+            verifier: "verifier-7".to_owned(),
+        }
+    }
+
+    /// Returns one requested child partition holding a single member.
+    fn test_partition(basename: &str, member: &str) -> PartitionRequest {
+        PartitionRequest {
+            partition_basename: basename.to_owned(),
+            member_ids: vec![member.to_owned()],
+            discriminator: format!("discriminator for {basename} in scope-1"),
+            counterexamples: vec!["ce-1".to_owned()],
+        }
+    }
+
+    /// Returns a valid two-part split structural projection.
+    fn split_structural() -> StructuralProjection {
+        let mut structural = merge_structural();
+        structural.subject_id = "mem-ab".to_owned();
+        structural.subject_revision = "rev-3".to_owned();
+        structural.members = vec![test_member("mem-a", "rev-1"), test_member("mem-b", "rev-2")];
+        structural.equivalence_note =
+            "split boundary grounded in per-child discriminators for scope-1".to_owned();
+        structural.equivalence_refs = Vec::new();
+        structural.requested_target_basename = "mem-ab".to_owned();
+        structural.partitions = vec![
+            test_partition("mem-a", "mem-a"),
+            test_partition("mem-b", "mem-b"),
+        ];
+        structural.raw_history_refs = vec!["raw-1".to_owned()];
+        structural
+    }
+
+    /// Returns the exact prior false merge inverted by the reversal test.
+    fn test_prior() -> PriorTransition {
+        PriorTransition {
+            prior_operation_id: "merge-op-9".to_owned(),
+            prior_idempotency_key: "idem-9".to_owned(),
+            prior_receipt_digest: "9".repeat(64),
+            premerge_ids: vec!["mem-a".to_owned(), "mem-b".to_owned()],
+            premerge_revisions: vec!["rev-1".to_owned(), "rev-2".to_owned()],
+            merged_id: "mem-ab".to_owned(),
+            merged_revision: "rev-2".to_owned(),
+            fence: test_fence(),
+            authority: "owner-1".to_owned(),
+            reconciliation_note: "no later effects observed under rev-3".to_owned(),
+            has_later_writes: false,
+            has_unknown_effects: false,
+        }
+    }
+
+    /// Returns a valid reversal structural projection with prior ancestry.
+    fn reversal_structural() -> StructuralProjection {
+        let mut structural = split_structural();
+        structural.prior_transition = Some(test_prior());
+        structural.ancestry_refs = vec!["mem-ab".to_owned()];
+        structural
+    }
+
+    /// Returns a closed dependency projection over three dependents.
+    fn test_dependency() -> DependencyProjection {
+        DependencyProjection {
+            dependents: vec![
+                DependentRef {
+                    dependent_id: "dep-audit".to_owned(),
+                    dependent_kind: "audit".to_owned(),
+                    endpoint: "ep-audit".to_owned(),
+                    relation: "audits".to_owned(),
+                    owner: "owner-a".to_owned(),
+                    revision: "r-1".to_owned(),
+                },
+                DependentRef {
+                    dependent_id: "dep-cue".to_owned(),
+                    dependent_kind: "cue".to_owned(),
+                    endpoint: "ep-cue".to_owned(),
+                    relation: "cues".to_owned(),
+                    owner: "owner-c".to_owned(),
+                    revision: "r-1".to_owned(),
+                },
+                DependentRef {
+                    dependent_id: "dep-view".to_owned(),
+                    dependent_kind: "view".to_owned(),
+                    endpoint: "ep-view".to_owned(),
+                    relation: "summarizes".to_owned(),
+                    owner: "owner-v".to_owned(),
+                    revision: "r-1".to_owned(),
+                },
+            ],
+            closure_complete: true,
+            closure_note: "all three dependents closed with evidence".to_owned(),
+        }
+    }
+
+    /// Returns a valid governing policy for the test proposals.
+    fn test_policy() -> StructureRepairPolicy {
+        StructureRepairPolicy {
+            policy_id: "policy-7".to_owned(),
+            policy_revision: 2,
+            max_members: MAX_MEMBERS,
+            max_dependents: MAX_DEPENDENTS,
+            max_partitions: MAX_PARTITIONS,
+            max_evidence_items: MAX_EVIDENCE_ITEMS,
+            allow_partial: false,
+            cancelled: false,
+            observation_time_ms: Some(1_700_000_000_000),
+            deadline_ms: Some(1_800_000_000_000),
+            allocator_owner: "allocator-1".to_owned(),
+            repair_note: "repair the subject for task-1 in scope-1".to_owned(),
+        }
+    }
+
+    /// Proposes a merge or panics with the typed error for debugging.
+    fn propose_merge(
+        structural: &StructuralProjection,
+    ) -> Result<StructureRepairCandidate, StructureRepairError> {
+        propose_structure_repair(
+            &merge_item(),
+            &test_frozen(),
+            &test_grounded(),
+            structural,
+            &test_dependency(),
+            &test_policy(),
+        )
+    }
+
+    // WORK_UNIT_CASE: 665/1
+    #[test]
+    fn case_01_valid_merge_completes_with_rewrite_manifest() {
+        let candidate = match propose_merge(&merge_structural()) {
+            Ok(candidate) => candidate,
+            Err(err) => panic!("valid merge proposal: {err:?}"),
+        };
+        assert_eq!(candidate.subtype, RepairSubtype::Merge);
+        assert_eq!(candidate.outcome, RepairOutcome::Complete);
+        assert_eq!(candidate.subject_id, "mem-merged");
+        assert_eq!(
+            candidate.target_allocation.requested_handle,
+            "alloc:mem-merged"
+        );
+        assert_eq!(candidate.target_allocation.owner, "allocator-1");
+        assert!(candidate.child_allocations.is_empty());
+        assert_eq!(candidate.member_dispositions.len(), 2);
+        for disposition in &candidate.member_dispositions {
+            assert_eq!(
+                disposition.kind,
+                MemberDispositionKind::RetargetToAllocation
+            );
+            assert_eq!(disposition.target, "alloc:mem-merged");
+        }
+        assert_eq!(candidate.dependent_dispositions.len(), 3);
+        assert!(candidate.equivalence.equivalent);
+        assert!(candidate.preservation.overall().is_ok());
+        assert!(is_hex64_lower(&candidate.candidate_digest));
+        assert_eq!(outcome_rejection_hint(&candidate.outcome), None);
+    }
+
+    // WORK_UNIT_CASE: 665/19
+    #[test]
+    fn case_19_two_part_split_completes_with_exact_cover() {
+        let structural = split_structural();
+        let first = match propose_structure_repair(
+            &split_item(),
+            &test_frozen(),
+            &test_grounded(),
+            &structural,
+            &test_dependency(),
+            &test_policy(),
+        ) {
+            Ok(candidate) => candidate,
+            Err(err) => panic!("valid split proposal: {err:?}"),
+        };
+        assert_eq!(first.subtype, RepairSubtype::Split);
+        assert_eq!(first.outcome, RepairOutcome::Complete);
+        assert_eq!(first.child_allocations.len(), 2);
+        assert_eq!(first.target_allocation.requested_handle, "alloc:mem-ab");
+        let mut assigned: Vec<String> = Vec::new();
+        for partition in &structural.partitions {
+            for member in &partition.member_ids {
+                assigned.push(member.clone());
+            }
+        }
+        assigned.sort();
+        assert_eq!(assigned, vec!["mem-a".to_owned(), "mem-b".to_owned()]);
+        assert!(structural.unresolved_residue.is_empty());
+        assert!(first.preservation.overall().is_ok());
+        let second = match propose_structure_repair(
+            &split_item(),
+            &test_frozen(),
+            &test_grounded(),
+            &structural,
+            &test_dependency(),
+            &test_policy(),
+        ) {
+            Ok(candidate) => candidate,
+            Err(err) => panic!("split replay proposal: {err:?}"),
+        };
+        assert_eq!(first.candidate_digest, second.candidate_digest);
+        assert!(is_hex64_lower(&first.candidate_digest));
+    }
+
+    // WORK_UNIT_CASE: 665/33
+    #[test]
+    fn case_33_clean_inverse_reversal_completes() {
+        let structural = reversal_structural();
+        let candidate = match propose_structure_repair(
+            &split_item(),
+            &test_frozen(),
+            &test_grounded(),
+            &structural,
+            &test_dependency(),
+            &test_policy(),
+        ) {
+            Ok(candidate) => candidate,
+            Err(err) => panic!("clean inverse reversal: {err:?}"),
+        };
+        assert_eq!(candidate.subtype, RepairSubtype::Reversal);
+        assert_eq!(candidate.outcome, RepairOutcome::Complete);
+        assert_eq!(candidate.member_dispositions.len(), 2);
+        for disposition in &candidate.member_dispositions {
+            assert_eq!(disposition.kind, MemberDispositionKind::RestoredToPremerge);
+        }
+        assert!(candidate.preservation.overall().is_ok());
+        assert!(is_hex64_lower(&candidate.candidate_digest));
+        let mut drifted = structural.clone();
+        if let Some(prior) = drifted.prior_transition.as_mut() {
+            prior.merged_revision = "rev-9".to_owned();
+        }
+        let other = match propose_structure_repair(
+            &split_item(),
+            &test_frozen(),
+            &test_grounded(),
+            &drifted,
+            &test_dependency(),
+            &test_policy(),
+        ) {
+            Ok(candidate) => candidate,
+            Err(err) => panic!("drifted prior reversal: {err:?}"),
+        };
+        assert_eq!(other.outcome, RepairOutcome::Complete);
+        assert_ne!(other.candidate_digest, candidate.candidate_digest);
+    }
+
+    // WORK_UNIT_CASE: 665/3
+    #[test]
+    fn case_03_nonidentity_a30_repair_rejected_distinctly() {
+        let err = match propose_structure_repair(
+            &repair_item(),
+            &test_frozen(),
+            &test_grounded(),
+            &merge_structural(),
+            &test_dependency(),
+            &test_policy(),
+        ) {
+            Ok(candidate) => panic!("A-30 repair must fail: {:?}", candidate.outcome),
+            Err(err) => err,
+        };
+        match err {
+            StructureRepairError::Binding { field, .. } => assert_eq!(field, "kind_spelling"),
+            other => panic!("distinct A-30 binding expected: {other:?}"),
+        }
+    }
+
+    // WORK_UNIT_CASE: 665/4
+    #[test]
+    fn case_04_bundle_mismatch_fails_closed_without_effect() {
+        let mut frozen = test_frozen();
+        frozen.bundle_digest = "0".repeat(64);
+        let err = match propose_structure_repair(
+            &merge_item(),
+            &frozen,
+            &test_grounded(),
+            &merge_structural(),
+            &test_dependency(),
+            &test_policy(),
+        ) {
+            Ok(candidate) => panic!("mismatched bundle must fail: {:?}", candidate.outcome),
+            Err(err) => err,
+        };
+        match err {
+            StructureRepairError::Binding { field, .. } => assert_eq!(field, "bundle_digest"),
+            other => panic!("bundle binding expected: {other:?}"),
+        }
+    }
+
+    // WORK_UNIT_CASE: 665/5
+    #[test]
+    fn case_05_replay_duplicate_identity_disposes_without_effect() {
+        let mut structural = merge_structural();
+        structural.known_subject_ids = vec!["mem-merged".to_owned()];
+        let candidate = match propose_merge(&structural) {
+            Ok(candidate) => candidate,
+            Err(err) => panic!("duplicate request stays inert: {err:?}"),
+        };
+        assert_eq!(candidate.outcome, RepairOutcome::Duplicate);
+        assert_eq!(candidate.subject_id, "mem-merged");
+        for disposition in &candidate.member_dispositions {
+            assert_eq!(disposition.kind, MemberDispositionKind::RetainedWithHistory);
+        }
+        assert!(is_hex64_lower(&candidate.candidate_digest));
+        assert_eq!(
+            outcome_rejection_hint(&candidate.outcome),
+            Some(CurationRejectionCode::IdentityMismatch)
+        );
+    }
+
+    // WORK_UNIT_CASE: 665/11
+    #[test]
+    fn case_11_shared_lineage_without_equivalence_stays_insufficient() {
+        let mut structural = merge_structural();
+        structural.equivalence_refs = Vec::new();
+        structural.shared_lineage_refs = vec!["lin-1".to_owned(), "lin-2".to_owned()];
+        structural.equivalence_note = "mem-a and mem-b share lineage lin-1 in scope-1".to_owned();
+        let candidate = match propose_merge(&structural) {
+            Ok(candidate) => candidate,
+            Err(err) => panic!("lineage-only request stays inert: {err:?}"),
+        };
+        assert_eq!(candidate.outcome, RepairOutcome::Insufficient);
+        assert!(!candidate.equivalence.equivalent);
+        assert_eq!(
+            candidate.equivalence.shared_lineage_refs,
+            vec!["lin-1".to_owned(), "lin-2".to_owned()]
+        );
+        for disposition in &candidate.member_dispositions {
+            assert_eq!(disposition.kind, MemberDispositionKind::RetainedWithHistory);
+        }
+        assert_eq!(
+            outcome_rejection_hint(&candidate.outcome),
+            Some(CurationRejectionCode::UnsupportedPrecision)
+        );
+    }
+
+    // WORK_UNIT_CASE: 665/45
+    #[test]
+    fn case_45_rollback_and_invalidation_closure_present() {
+        let candidate = match propose_merge(&merge_structural()) {
+            Ok(candidate) => candidate,
+            Err(err) => panic!("valid merge proposal: {err:?}"),
+        };
+        assert_eq!(candidate.outcome, RepairOutcome::Complete);
+        assert_eq!(candidate.rollback.steps.len(), 6);
+        assert_eq!(candidate.rollback.verifier, "verifier-7");
+        assert!(!candidate.rollback.inverse_note.trim().is_empty());
+        assert_eq!(candidate.invalidation.entries.len(), 3);
+        assert_eq!(candidate.invalidation.verifier, "verifier-7");
+        assert_eq!(candidate.verifier, "verifier-7");
+        assert_eq!(candidate.note, REPAIR_PROOF_NOTE);
     }
 }
