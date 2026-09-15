@@ -213,6 +213,9 @@ pub struct FinishContext {
     pub closure_authority_ref: Option<String>,
     /// Current descendant/effect reconciliation result.
     pub descendant_closure: DescendantClosure,
+    /// Current evidence rehydrated from canonical state. This is the sole
+    /// evidence source for derivation; callers never supply evidence.
+    pub evidence: FinishEvidence,
 }
 
 impl FinishContext {
@@ -233,15 +236,27 @@ impl FinishContext {
         if let Some(reference) = &self.closure_authority_ref {
             text(reference, "finish_context.closure_authority_ref")?;
         }
-        self.descendant_closure.validate()
+        self.descendant_closure.validate()?;
+        self.evidence.validate()?;
+        if self.evidence.task_id != self.task_id {
+            return Err(FinishError::Canonical(CanonicalError::TaskBindingMismatch));
+        }
+        if self.evidence.current_task_revision != self.current_task_revision {
+            return Err(FinishError::Canonical(CanonicalError::StaleTaskRevision));
+        }
+        Ok(())
     }
 }
 
-/// Strict public finish input.  It contains a candidate draft and rehydrated
-/// evidence only; there is intentionally no accepted completion-proof field.
+/// Strict public finish input.  It contains a candidate draft only; evidence
+/// is never accepted from the caller and is rehydrated exclusively by the
+/// service from current canonical state ([`FinishContext::evidence`]).
+/// There is intentionally no accepted completion-proof field.
 /// A caller-supplied `completion_proof` value is captured solely so that
 /// [`FinishService::evaluate`] can reject it with
 /// [`FinishError::CallerProofRejected`].  The canonical path never sets it.
+/// A caller-supplied `evidence` value is not captured at all: it is rejected
+/// at deserialization by `deny_unknown_fields`.
 #[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct FinishAttempt {
@@ -251,8 +266,6 @@ pub struct FinishAttempt {
     pub state_fence: StateFence,
     /// Caller candidate; the canonical crate derives the decision.
     pub draft: FinishAttemptDraft,
-    /// Evidence rehydrated by the service from current canonical state.
-    pub evidence: FinishEvidence,
     /// Explicit lifecycle disposition requested by the owner.
     pub closure_intent: FinishClosureIntent,
     /// Legacy caller-supplied proof, captured only for rejection.  This is
@@ -270,7 +283,6 @@ impl FinishAttempt {
         text(&self.attempt_id, "finish_attempt.attempt_id")?;
         self.state_fence.validate()?;
         self.draft.validate()?;
-        self.evidence.validate()?;
         validate_closure_intent(self.draft.requested_outcome, self.closure_intent)
     }
 
@@ -490,16 +502,14 @@ impl FinishService {
         if attempt.state_fence != context.current_state_fence {
             return Err(FinishError::FenceMismatch);
         }
-        if attempt.draft.task_id != context.task_id || attempt.evidence.task_id != context.task_id {
+        if attempt.draft.task_id != context.task_id {
             return Err(FinishError::Canonical(CanonicalError::TaskBindingMismatch));
         }
-        if attempt.draft.expected_task_revision != context.current_task_revision
-            || attempt.evidence.current_task_revision != context.current_task_revision
-        {
+        if attempt.draft.expected_task_revision != context.current_task_revision {
             return Err(FinishError::Canonical(CanonicalError::StaleTaskRevision));
         }
 
-        let mut evidence = attempt.evidence.clone();
+        let mut evidence = context.evidence.clone();
         let unresolved_descendant_refs = context.descendant_closure.unresolved_refs();
         if !unresolved_descendant_refs.is_empty() {
             evidence
@@ -699,22 +709,25 @@ mod tests {
                 remaining_unknowns_declared_by_caller: vec![],
                 rationale_candidate: "all required work is complete".to_owned(),
             },
-            evidence: FinishEvidence {
-                task_id: "task-1".to_owned(),
-                current_task_revision: 1,
-                acceptance: vec![AcceptanceCoverage {
-                    item_id: "acceptance-1".to_owned(),
-                    satisfied: true,
-                    evidence_refs: vec!["evidence-1".to_owned()],
-                    verifier_run_refs: vec![],
-                    requires_verifier: false,
-                }],
-                executed_verifier_run_refs: vec![],
-                stale_verifier_run_refs: vec![],
-                unresolved_effect_refs: vec![],
-            },
             closure_intent: FinishClosureIntent::Continue,
             completion_proof: None,
+        }
+    }
+
+    fn evidence() -> FinishEvidence {
+        FinishEvidence {
+            task_id: "task-1".to_owned(),
+            current_task_revision: 1,
+            acceptance: vec![AcceptanceCoverage {
+                item_id: "acceptance-1".to_owned(),
+                satisfied: true,
+                evidence_refs: vec!["evidence-1".to_owned()],
+                verifier_run_refs: vec![],
+                requires_verifier: false,
+            }],
+            executed_verifier_run_refs: vec![],
+            stale_verifier_run_refs: vec![],
+            unresolved_effect_refs: vec![],
         }
     }
 
@@ -732,6 +745,7 @@ mod tests {
             descendant_closure: DescendantClosure::Complete {
                 receipt_ref: "descendant-receipt".to_owned(),
             },
+            evidence: evidence(),
         }
     }
 
@@ -785,5 +799,75 @@ mod tests {
             service.evaluate(attempt(), &context()),
             Ok(FinishAdmission::Accepted { .. })
         ));
+    }
+
+    #[test]
+    fn caller_evidence_rejected_and_decision_derives_from_rehydrated_state() {
+        let wire = serde_json::to_value(attempt()).expect("canonical fixture serializes");
+        assert!(
+            !wire
+                .as_object()
+                .is_none_or(|object| object.contains_key("evidence")),
+            "wire FinishAttempt must not carry evidence"
+        );
+        let mut injected = wire;
+        injected["evidence"] = serde_json::json!({
+            "task_id": "task-1",
+            "current_task_revision": 1,
+            "acceptance": [],
+        });
+        let rejected = serde_json::from_value::<FinishAttempt>(injected)
+            .expect_err("caller-supplied evidence must be rejected");
+        assert!(
+            rejected.to_string().contains("unknown field"),
+            "evidence must be an unknown field, got: {rejected}"
+        );
+
+        let mut healthy_service = FinishService::default();
+        let healthy = healthy_service
+            .evaluate(attempt(), &context())
+            .expect("healthy rehydrated evidence evaluates");
+        let healthy_receipt = match healthy {
+            FinishAdmission::Accepted { receipt } => receipt,
+            FinishAdmission::Replayed { .. } => panic!("first evaluation cannot replay"),
+        };
+        assert_eq!(
+            healthy_receipt.decision.outcome,
+            FinishDecisionOutcome::VerifiedComplete
+        );
+
+        let gapped_context = FinishContext {
+            evidence: FinishEvidence {
+                acceptance: vec![AcceptanceCoverage {
+                    item_id: "acceptance-1".to_owned(),
+                    satisfied: true,
+                    evidence_refs: vec!["evidence-1".to_owned()],
+                    verifier_run_refs: vec!["verifier-run-1".to_owned()],
+                    requires_verifier: true,
+                }],
+                executed_verifier_run_refs: vec![],
+                ..evidence()
+            },
+            ..context()
+        };
+        let mut gapped_service = FinishService::default();
+        let gapped = gapped_service
+            .evaluate(attempt(), &gapped_context)
+            .expect("gapped rehydrated evidence evaluates");
+        let gapped_receipt = match gapped {
+            FinishAdmission::Accepted { receipt } => receipt,
+            FinishAdmission::Replayed { .. } => panic!("first evaluation cannot replay"),
+        };
+        assert_eq!(
+            gapped_receipt.decision.outcome,
+            FinishDecisionOutcome::FailedVerification,
+            "a verifier-not-executed must never support VERIFIED_COMPLETE"
+        );
+        assert_ne!(
+            gapped_receipt.decision.outcome,
+            FinishDecisionOutcome::VerifiedComplete
+        );
+        assert_eq!(gapped_receipt.decision.proof.task_id, "task-1");
+        assert_eq!(gapped_receipt.decision.proof.task_revision, 1);
     }
 }
