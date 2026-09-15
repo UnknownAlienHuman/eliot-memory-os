@@ -831,7 +831,7 @@ pub(super) fn project_daemon_position_response(
     }))
 }
 
-/// Closed T11.3 role denominator for one task-bound ContextReconstruction.
+/// Closed T11.3 role denominator for one task-bound `ContextReconstruction`.
 ///
 /// The seven provider-role keys follow the T11 acquisition table: task frame,
 /// critical attention, current epistemic position, cue activation,
@@ -892,10 +892,14 @@ impl RoleReadout {
 /// Shared shape check for the four T11.3 task-bound reads (`GetTaskState`,
 /// `GetAttentionAndProblems`, `GetUnderstandingProjectionInputs`,
 /// `GetCapabilityEvidenceState`): scope-bound, `ExactFence` against the exact
-/// admitted fence, and no parameters — the closed store catalogue declares
-/// none, so any supplied parameter fails closed here with the catalogue
-/// remaining the downstream authority. A fence change surfaces as a mismatch,
-/// never as a previous generation served as current.
+/// admitted fence, and no parameters. The closed store catalogue (T11.3 store
+/// activation) declares bounded exact selectors for these reads
+/// (`task_id`+`max_records`, optional `problem_id`+`max_records`,
+/// `selector`+`max_records`, `skill_id`+`max_records`), so a parameter-free
+/// plan does not pass catalogue validation: it reports unadmitted through
+/// [`context_reconstruction_role_admission`] and production dispatch must not
+/// call it until a follow-up threads the closed selectors. A fence change
+/// surfaces as a mismatch, never as a previous generation served as current.
 fn plan_daemon_reconstruction_role_read(
     fence: &eliot_contracts::StateFence,
     scope_id: &str,
@@ -1117,13 +1121,15 @@ pub(super) fn project_daemon_capability_evidence_response(
     )
 }
 
-/// Plans the closed six-read ContextReconstruction closure for the daemon.
+/// Plans the closed six-read `ContextReconstruction` closure for the daemon.
 ///
-/// Canonical role order: the four parameter-free T11.3 role reads, then the
+/// Canonical role order: the four T11.3 role reads (currently parameter-free
+/// plans; the store catalogue requires their bounded exact selectors, so they
+/// report unadmitted until a follow-up threads them), then the
 /// T11.1 evidence-pack read (explicit `subject`/`max_records` selectors) and
 /// the T11.2 position read (explicit `position` selector, doubling as the
 /// activation evidence). This mirrors the Governor read facade's
-/// ContextReconstruction intent gate without depending on it: `bins/eliotd`
+/// `ContextReconstruction` intent gate without depending on it: `bins/eliotd`
 /// owns no `eliot-read` dependency, so the six operations are listed
 /// explicitly here and must stay in parity with that gate. Free text never
 /// becomes a selector and no second consistency algorithm lives here. The

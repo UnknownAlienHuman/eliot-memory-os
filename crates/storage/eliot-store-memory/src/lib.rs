@@ -545,21 +545,18 @@ impl MemoryStore {
         Ok(view)
     }
 
-    fn execute_named_sync(
-        &self,
-        query: &NamedReadRequest,
-    ) -> Result<NamedReadResponse, StoreError> {
-        query.validate()?;
-        // Slice T11.1 (issues #18/#19): `GetEvidencePack` is catalogue
-        // activated, so it enforces the generated catalogue (membership,
-        // typed `subject` / `max_records` selectors, scope declaration,
-        // input bound) pre-dispatch, identically to the Surreal adapter's
-        // pre-dispatch gate. T11.2 adds `GetCurrentEpistemicPosition` with
-        // its `position` selector; T11.3 adds the four cognitive reads
-        // (`GetTaskState`, `GetAttentionAndProblems`,
-        // `GetUnderstandingProjectionInputs`, `GetCapabilityEvidenceState`)
-        // with their bounded exact selectors. The older reads keep their
-        // legacy reference-contour behavior below.
+    /// Enforces the generated catalogue pre-dispatch for activated reads.
+    ///
+    /// Slice T11.1 (issues #18/#19): `GetEvidencePack` is catalogue
+    /// activated, so it enforces the generated catalogue (membership,
+    /// typed `subject` / `max_records` selectors, scope declaration,
+    /// input bound) pre-dispatch, identically to the Surreal adapter's
+    /// pre-dispatch gate. T11.2 adds `GetCurrentEpistemicPosition` with
+    /// its `position` selector; T11.3 adds the four cognitive reads
+    /// (`GetTaskState`, `GetAttentionAndProblems`,
+    /// `GetUnderstandingProjectionInputs`, `GetCapabilityEvidenceState`)
+    /// with their bounded exact selectors.
+    fn enforce_catalogue_gate(query: &NamedReadRequest) -> Result<(), StoreError> {
         if matches!(
             query.operation,
             NamedReadOperation::GetEvidencePack
@@ -572,6 +569,16 @@ impl MemoryStore {
             let entries = generated_operation_manifests()?;
             query.validate_against_catalogue(&entries)?;
         }
+        Ok(())
+    }
+
+    fn execute_named_sync(
+        &self,
+        query: &NamedReadRequest,
+    ) -> Result<NamedReadResponse, StoreError> {
+        query.validate()?;
+        // The older reads keep their legacy reference-contour behavior below.
+        Self::enforce_catalogue_gate(query)?;
         let state = self.lock_state()?;
         let fence = match state.fences.clone() {
             Some(fence) => fence,
@@ -3137,6 +3144,10 @@ mod tests {
         Ok((store, fence))
     }
 
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "test helper mirrors the PreparedTransition fields one-to-one"
+    )]
     fn cognitive_transition(
         operation: &str,
         state_fence: &StateFence,
@@ -3237,6 +3248,10 @@ mod tests {
     }
 
     #[test]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "single canonical proof committing one record per cognitive family"
+    )]
     fn t11_3_cognitive_reads_serve_canonical_records() -> Result<(), StoreError> {
         use eliot_store_api::NamedMutationOperation;
         let (store, state_fence) = cognitive_store()?;
