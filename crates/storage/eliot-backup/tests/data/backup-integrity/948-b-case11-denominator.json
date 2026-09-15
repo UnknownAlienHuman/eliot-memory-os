@@ -1,0 +1,1 @@
+{"conflict":"IntegrityMismatch","duplicate":"Duplicate","extra":"UnreferencedBlob","missing":"MissingBlob","note":"Worker B fixture: blob/section denominator. The reachability manifest and the sealed set must reconcile exactly; section digests bind every member."}

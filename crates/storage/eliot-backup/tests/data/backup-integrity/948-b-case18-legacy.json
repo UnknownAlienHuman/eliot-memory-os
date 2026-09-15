@@ -1,0 +1,1 @@
+{"forbidden_inventions":["residency","fence_authority","purge_evidence"],"note":"Worker B fixture: explicit legacy compatibility. A named legacy decoder documents limited historical meaning and never fabricates missing residency, fence, or purge evidence; unmapped legacy bytes refuse, they do not upgrade silently.","valid_dispositions":["HistoricalPreserved","Rejected"]}
