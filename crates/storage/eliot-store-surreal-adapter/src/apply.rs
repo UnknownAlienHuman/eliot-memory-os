@@ -1055,6 +1055,20 @@ mod admitted_operation_gate_tests {
         }
     }
 
+    fn task_state_operation() -> eliot_store_api::NamedMutationRequest {
+        NamedMutationRequest {
+            operation: NamedMutationOperation::UpdateTaskState,
+            parameters: BTreeMap::from([
+                ("task_id".to_owned(), json!("task-gate")),
+                ("event_id".to_owned(), json!("event-gate")),
+                ("from".to_owned(), json!("PROPOSED")),
+                ("to".to_owned(), json!("OPEN")),
+                ("expected_revision".to_owned(), json!("1")),
+                ("actor_ref".to_owned(), json!("actor-gate")),
+            ]),
+        }
+    }
+
     #[test]
     fn genesis_shaped_transition_passes_the_pre_stage_gate() {
         let fence = test_fence(1);
@@ -1097,9 +1111,10 @@ mod admitted_operation_gate_tests {
         );
         // Current set digest but still-unadmitted mutation entry: fail-closed
         // for the remaining mutations. `CaptureObservation`,
-        // `AppendAuditEvent`, `ApplyLifecyclePolicy`, and `ReconcileRecovery`
-        // are admitted (their handler/schema/consumer triples are proven);
-        // this proof uses `ApplyEpistemicRevision` (still unadmitted).
+        // `AppendAuditEvent`, `ApplyLifecyclePolicy`, `ReconcileRecovery`,
+        // and `UpdateTaskState` are admitted (their handler/schema/consumer
+        // triples are proven); this proof uses `ApplyEpistemicRevision`
+        // (still unadmitted).
         let unadmitted = transition_with(
             &fence,
             set_digest.clone(),
@@ -1157,7 +1172,7 @@ mod admitted_operation_gate_tests {
         // problem-leg recovery params passes the pre-stage gate.
         let admitted_recovery = transition_with(
             &fence,
-            set_digest,
+            set_digest.clone(),
             TransitionClass::RecoverySchema,
             EffectClass::ReversibleMutation,
             vec![recovery_operation()],
@@ -1165,6 +1180,19 @@ mod admitted_operation_gate_tests {
         assert!(
             validate_transition(&context, &admitted_recovery).is_ok(),
             "admitted ReconcileRecovery passes the pre-stage gate"
+        );
+        // Admitted `UpdateTaskState` with current set digest and approved
+        // task-control params passes the pre-stage gate.
+        let admitted_task = transition_with(
+            &fence,
+            set_digest,
+            TransitionClass::TaskControl,
+            EffectClass::ReversibleMutation,
+            vec![task_state_operation()],
+        );
+        assert!(
+            validate_transition(&context, &admitted_task).is_ok(),
+            "admitted UpdateTaskState passes the pre-stage gate"
         );
         // Fence divergence between caller context and transition.
         let manifest = genesis_manifest().expect("genesis entry is active");
