@@ -1,10 +1,11 @@
 //! Owner-approved typed parameter contracts for activated named operations.
 //!
-//! Slice C1 (issue #19) activates exactly four named reads with proven
+//! Slice C1 (issue #19) activates exactly five named reads with proven
 //! adapter handlers, parameter shapes, and consumers:
-//! `GetRevisionHeads`, `GetOrderingHeads`, `GetScopeRevisionView`, and
-//! `ResolveWriteReceipt` (see `apply/read_boundary.rs` in the Surreal adapter
-//! and `execute_named_sync` in the memory adapter), plus the three
+//! `GetRevisionHeads`, `GetOrderingHeads`, `GetScopeRevisionView`,
+//! `ResolveWriteReceipt`, and `GetEvidencePack` (see
+//! `apply/read_boundary.rs` in the Surreal adapter and `execute_named_sync`
+//! in the memory adapter), plus the three
 //! `CaptureObservation` / `AppendAuditEvent` / `ApplyLifecyclePolicy`
 //! mutations (AUD-C01: `CaptureObservation` and `AppendAuditEvent` persist
 //! `TransitionClass::CaptureCandidate` with the `EffectClass::Candidate`
@@ -29,8 +30,9 @@
 //! fence, and expiry enforcement stay in slice C2. An explicitly declared
 //! parameter (today `operation_id` for `ResolveWriteReceipt`, `subject`
 //! for `CaptureObservation`, the six receipt-bound fields for
-//! `AppendAuditEvent`, and the six lifecycle-policy fields for
-//! `ApplyLifecyclePolicy`) is owner-approved and therefore supersedes the
+//! `AppendAuditEvent`, the six lifecycle-policy fields for
+//! `ApplyLifecyclePolicy`, and the `subject` / `max_records` evidence-pack
+//! selectors for `GetEvidencePack`) is owner-approved and therefore supersedes the
 //! generic [`CONTROL_FIELD_DENYLIST`](crate::CONTROL_FIELD_DENYLIST) for that
 //! exact name; every undeclared control name is still rejected fail-closed.
 
@@ -51,8 +53,11 @@ use crate::{
 /// `ResolveWriteReceipt` (reused for the receipt-bound `AppendAuditEvent`
 /// `operation_id`) and the non-blank text captured by `CaptureObservation`
 /// as `subject` (reused for the five remaining receipt-bound
-/// `AppendAuditEvent` fields and for the six lifecycle-policy
-/// `ApplyLifecyclePolicy` fields). The enum is closed so a future parameter kind
+/// `AppendAuditEvent` fields, for the six lifecycle-policy
+/// `ApplyLifecyclePolicy` fields, and for the two `GetEvidencePack`
+/// evidence-pack selectors: the exact captured-observation `subject` and the
+/// explicit `max_records` bound carried as its decimal string, mirroring how
+/// `AppendAuditEvent` carries `expected_revision`). The enum is closed so a future parameter kind
 /// is a contract change with a new owner-approved arm, never silent `Value`
 /// passthrough.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -63,9 +68,14 @@ pub enum ParameterShape {
     /// `CaptureObservation`, reused for the non-`operation_id` receipt-bound
     /// `AppendAuditEvent` fields (`idempotency_key`, `session_id`,
     /// `access_digest`, `action_digest`, and `expected_revision` as its
-    /// decimal string) and for the six lifecycle-policy `ApplyLifecyclePolicy`
+    /// decimal string), for the six lifecycle-policy `ApplyLifecyclePolicy`
     /// fields (`action`, `base_view_digest`, `candidate_digest`,
-    /// `candidate_package_digest`, `skill_id`, `verifier_ref`). Length is bounded by the owning manifest entry's
+    /// `candidate_package_digest`, `skill_id`, `verifier_ref`), and for the
+    /// two `GetEvidencePack` selectors (the exact captured-observation
+    /// `subject` and the explicit `max_records` bound as its decimal
+    /// string, range-checked against
+    /// [`EVIDENCE_PACK_MAX_RECORDS`](crate::operation_catalogue::EVIDENCE_PACK_MAX_RECORDS) by
+    /// every handler). Length is bounded by the owning manifest entry's
     /// `max_input_bytes` over the canonical parameter bytes (the same
     /// mechanism that bounds the activated reads), so no separate string
     /// length constant exists here.
@@ -101,6 +111,18 @@ const OPERATION_ID_DECLARATION: ParameterDeclaration = ParameterDeclaration {
 };
 
 static RESOLVE_WRITE_RECEIPT_PARAMETERS: [ParameterDeclaration; 1] = [OPERATION_ID_DECLARATION];
+static GET_EVIDENCE_PACK_PARAMETERS: [ParameterDeclaration; 2] = [
+    ParameterDeclaration {
+        name: "subject",
+        shape: ParameterShape::Subject,
+        required: true,
+    },
+    ParameterDeclaration {
+        name: "max_records",
+        shape: ParameterShape::Subject,
+        required: true,
+    },
+];
 static CAPTURE_OBSERVATION_PARAMETERS: [ParameterDeclaration; 1] = [ParameterDeclaration {
     name: "subject",
     shape: ParameterShape::Subject,
@@ -251,20 +273,24 @@ pub const fn named_mutation_operation_by_name(name: &str) -> Option<NamedMutatio
 
 /// Returns the owner-approved parameter declarations for one read operation.
 ///
-/// Only `ResolveWriteReceipt` declares a parameter on base; every other
-/// variant declares none, so any supplied parameter fails closed.
+/// `ResolveWriteReceipt` declares the required `operation_id` parameter and
+/// `GetEvidencePack` declares the required bounded exact selectors (the
+/// exact captured-observation `subject` and the explicit `max_records`
+/// bound); every other variant declares none, so any supplied parameter
+/// fails closed. Variants without a catalogue entry never reach this table:
+/// they fail as [`StoreError::UnknownOperation`] first.
 #[must_use]
 pub const fn declared_read_parameters(
     operation: NamedReadOperation,
 ) -> &'static [ParameterDeclaration] {
     match operation {
         NamedReadOperation::ResolveWriteReceipt => &RESOLVE_WRITE_RECEIPT_PARAMETERS,
+        NamedReadOperation::GetEvidencePack => &GET_EVIDENCE_PACK_PARAMETERS,
         NamedReadOperation::GetRevisionHeads
         | NamedReadOperation::GetScopeRevisionView
         | NamedReadOperation::GetOrderingHeads
         | NamedReadOperation::GetTaskState
         | NamedReadOperation::GetCurrentEpistemicPosition
-        | NamedReadOperation::GetEvidencePack
         | NamedReadOperation::GetUnderstandingProjectionInputs
         | NamedReadOperation::GetAttentionAndProblems
         | NamedReadOperation::GetModuleCatalogState

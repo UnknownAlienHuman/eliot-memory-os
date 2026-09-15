@@ -11,21 +11,31 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use eliot_store_api::{
     CanonicalRequestView, CanonicalStoreClient, CanonicalValidationSnapshot, CommitId, EventId,
-    EventProjectionRelationIntents, NamedReadOperation, NamedReadRequest, NamedReadResponse,
-    OperationId, OperationManifestDigest, OrderingHead, OrderingHeadExpectation, OrderingScopeId,
-    OutboxId, OutboxIntent, OutboxState, PreparedTransition, ProjectionMode,
-    ProjectionPublicationId, ProjectionPublicationRecord, ProjectionStatus, RecoveryRecord,
-    RecoveryRecordKey, RequestMeta, Resubmission, RevisionDelta, RevisionHead,
-    RevisionHeadExpectation, RevisionKey, ScopeId, ScopeRevisionView, SplitView, StateFence,
-    StoreError, StoreGenesisRequest, StoreHealth, StoreHealthStatus, StoreRecoveryRequest,
+    EventProjectionRelationIntents, EVIDENCE_PACK_MAX_RECORDS, NamedMutationOperation,
+    NamedReadOperation, NamedReadRequest, NamedReadResponse, OperationId, OperationManifestDigest,
+    OrderingHead, OrderingHeadExpectation, OrderingScopeId, OutboxId, OutboxIntent, OutboxState,
+    PreparedTransition, ProjectionMode, ProjectionPublicationId, ProjectionPublicationRecord,
+    ProjectionStatus, RecoveryRecord, RecoveryRecordKey, RequestMeta, Resubmission, RevisionDelta,
+    RevisionHead, RevisionHeadExpectation, RevisionKey, ScopeId, ScopeRevisionView, SplitView,
+    StateFence, StoreError, StoreGenesisRequest, StoreHealth, StoreHealthStatus, StoreRecoveryRequest,
     StoreRecoverySnapshot, WriteReceipt, WriteReceiptStatus, canonical_json_bytes,
-    canonical_request_hash, genesis_manifest, is_genesis_fence, issue_genesis_receipt_envelope,
-    issue_store_receipt_envelope, sha256_hex, validate_genesis_receipt_envelope,
+    canonical_request_hash, generated_operation_manifests, genesis_manifest, is_genesis_fence,
+    issue_genesis_receipt_envelope, issue_store_receipt_envelope,
+    named_mutation_operation_name, sha256_hex, validate_genesis_receipt_envelope,
     validate_store_receipt_envelope, verify_canonical_request_hash,
 };
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
+
+// `EVIDENCE_PACK_MAX_RECORDS` is the canonical bound owned by the
+// `GetEvidencePack` catalogue row in `eliot-store-api`; imported above.
+
+/// Version of the `GetEvidencePack` payload shape built below.
+///
+/// The pack returns exact captured bytes, so consumers match on this version
+/// before interpreting `records` / `provenance`; any shape change bumps it.
+const EVIDENCE_PACK_PAYLOAD_VERSION: u32 = 1;
 
 /// A deterministic reference store with no external authority or I/O.
 ///
@@ -479,6 +489,16 @@ impl MemoryStore {
         query: &NamedReadRequest,
     ) -> Result<NamedReadResponse, StoreError> {
         query.validate()?;
+        // Slice T11.1 (issues #18/#19): `GetEvidencePack` is catalogue
+        // activated, so it enforces the generated catalogue (membership,
+        // typed `subject` / `max_records` selectors, scope declaration,
+        // input bound) pre-dispatch, identically to the Surreal adapter's
+        // pre-dispatch gate. The older reads keep their legacy
+        // reference-contour behavior below.
+        if query.operation == NamedReadOperation::GetEvidencePack {
+            let entries = generated_operation_manifests()?;
+            query.validate_against_catalogue(&entries)?;
+        }
         let state = self.lock_state()?;
         let fence = match state.fences.clone() {
             Some(fence) => fence,
@@ -524,6 +544,10 @@ impl MemoryStore {
                     "state_fence": fence,
                 }))
             }
+            NamedReadOperation::GetEvidencePack => {
+                let payload = Self::evidence_pack_payload(&state, query, &fence)?;
+                serde_json::to_value(&payload)
+            }
             _ => serde_json::to_value(json!({
                 "operation": format!("{:?}", query.operation),
                 "records": state.named_operations,
@@ -538,6 +562,109 @@ impl MemoryStore {
         };
         response.validate()?;
         Ok(response)
+    }
+
+    /// Builds the versioned exact evidence-pack payload for one request.
+    ///
+    /// Reads only actually captured observations: the `CaptureObservation`
+    /// records stored by the commit path, in capture order, filtered by exact
+    /// `subject` match — never substring, never a default subject, never the
+    /// current scope view. Fence equality is enforced by the caller before
+    /// dispatch; the scope selector is required and echoed into the payload;
+    /// the explicit `max_records` bound caps the returned records with a
+    /// visible `truncated` marker plus totals, while an over-bound request
+    /// refuses with [`StoreError::PayloadTooLarge`] instead of returning a
+    /// successful over-bound view. Zero matches are an exact empty result,
+    /// not an error.
+    fn evidence_pack_payload(
+        state: &MemoryState,
+        query: &NamedReadRequest,
+        fence: &StateFence,
+    ) -> Result<Value, StoreError> {
+        let scope_id = query.scope_id.clone().ok_or(StoreError::InvalidField {
+            field: "scope_id",
+            reason: "evidence pack read requires scope_id",
+        })?;
+        // The catalogue gate already enforces presence and shape; re-check
+        // fail-closed so this arm never depends on call order.
+        let subject =
+            query
+                .parameters
+                .get("subject")
+                .and_then(Value::as_str)
+                .ok_or(StoreError::InvalidField {
+                    field: "operation.parameter",
+                    reason: "missing required parameter",
+                })?;
+        if subject.trim().is_empty() || subject.chars().any(char::is_control) {
+            return Err(StoreError::InvalidField {
+                field: "operation.parameter",
+                reason: "subject must be a non-blank string",
+            });
+        }
+        let bound_raw =
+            query
+                .parameters
+                .get("max_records")
+                .and_then(Value::as_str)
+                .ok_or(StoreError::InvalidField {
+                    field: "operation.parameter",
+                    reason: "missing required parameter",
+                })?;
+        let max_records: u32 =
+            bound_raw
+                .parse()
+                .map_err(|_| StoreError::InvalidField {
+                    field: "operation.parameter",
+                    reason: "max_records must be a positive decimal bound",
+                })?;
+        if max_records == 0 {
+            return Err(StoreError::InvalidField {
+                field: "operation.parameter",
+                reason: "max_records must be a positive decimal bound",
+            });
+        }
+        if max_records > EVIDENCE_PACK_MAX_RECORDS {
+            return Err(StoreError::PayloadTooLarge);
+        }
+        let limit =
+            usize::try_from(max_records).map_err(|_| StoreError::PayloadTooLarge)?;
+        let matched: Vec<(usize, &eliot_store_api::NamedMutationRequest)> = state
+            .named_operations
+            .iter()
+            .enumerate()
+            .filter(|(_, operation)| {
+                operation.operation == NamedMutationOperation::CaptureObservation
+                    && operation.parameters.get("subject").and_then(Value::as_str)
+                        == Some(subject)
+            })
+            .collect();
+        let matched_total = matched.len();
+        let records: Vec<Value> = matched
+            .into_iter()
+            .take(limit)
+            .map(|(capture_index, operation)| {
+                json!({
+                    "capture_index": capture_index,
+                    "operation": named_mutation_operation_name(operation.operation),
+                    "parameters": operation.parameters,
+                })
+            })
+            .collect();
+        let returned = records.len();
+        Ok(json!({
+            "version": EVIDENCE_PACK_PAYLOAD_VERSION,
+            "subject": subject,
+            "scope_id": scope_id,
+            "records": records,
+            "provenance": {
+                "state_fence": fence,
+                "matched_total": matched_total,
+                "returned": returned,
+                "max_records": max_records,
+                "truncated": matched_total > returned,
+            },
+        }))
     }
 
     fn health_sync(&self) -> Result<StoreHealth, StoreError> {
@@ -2071,6 +2198,350 @@ mod tests {
         let replay = store.apply_transaction(&ctx, prepared, &[], &[])?;
         assert_eq!(first, replay);
         assert_eq!(before, store.snapshot()?);
+        Ok(())
+    }
+
+    fn capture_with_subject(
+        operation: &str,
+        subject: &str,
+        state_fence: &StateFence,
+        ctx: &RequestMeta,
+    ) -> Result<PreparedTransition, StoreError> {
+        // Captures one real observation through the existing capture path
+        // with an explicit subject, rebinding the canonical request hash for
+        // the exact executable bytes (same pattern as
+        // `transition_with_heads`).
+        let mut prepared = transition(operation, state_fence)?;
+        prepared.named_operations[0]
+            .parameters
+            .insert("subject".to_owned(), json!(subject));
+        let view = CanonicalRequestView::from_apply(ctx, &prepared, &[], &[]);
+        prepared.identity.canonical_request_hash = canonical_request_hash(&view)?;
+        Ok(prepared)
+    }
+
+    fn evidence_params(subject: &str, max_records: &str) -> BTreeMap<String, Value> {
+        BTreeMap::from([
+            ("subject".to_owned(), json!(subject)),
+            ("max_records".to_owned(), json!(max_records)),
+        ])
+    }
+
+    fn evidence_pack_query(
+        state_fence: &StateFence,
+        scope: Option<&str>,
+        parameters: BTreeMap<String, Value>,
+    ) -> Result<NamedReadRequest, StoreError> {
+        Ok(NamedReadRequest {
+            operation: NamedReadOperation::GetEvidencePack,
+            scope_id: scope.map(ScopeId::new).transpose()?,
+            consistency: eliot_store_api::ReadConsistency::Eventual,
+            state_fence: state_fence.clone(),
+            parameters,
+        })
+    }
+
+    fn pack_records(payload: &Value) -> Result<&Vec<Value>, StoreError> {
+        payload
+            .get("records")
+            .and_then(Value::as_array)
+            .ok_or(StoreError::Empty {
+                field: "evidence.records",
+            })
+    }
+
+    fn pack_provenance(payload: &Value) -> Result<&serde_json::Map<String, Value>, StoreError> {
+        payload
+            .get("provenance")
+            .and_then(Value::as_object)
+            .ok_or(StoreError::Empty {
+                field: "evidence.provenance",
+            })
+    }
+
+    #[test]
+    fn evidence_pack_returns_exact_captured_record_with_provenance() -> Result<(), StoreError> {
+        // Slice T11.1: capture one real observation via the existing capture
+        // path, then `GetEvidencePack` returns its exact record (identity)
+        // with fence-bound provenance.
+        let state_fence = fence();
+        let store = store()?;
+        let ctx = metadata(&state_fence)?;
+        let prepared = capture_with_subject("op-evidence-1", "evidence-alpha", &state_fence, &ctx)?;
+        let receipt = store.apply_transaction(&ctx, prepared, &[], &[])?;
+        assert_eq!(receipt.operation_id.as_str(), "op-evidence-1");
+
+        let query = evidence_pack_query(
+            &state_fence,
+            Some("scope-1"),
+            evidence_params("evidence-alpha", "10"),
+        )?;
+        let response = store.execute_named_sync(&query)?;
+        assert_eq!(response.operation, NamedReadOperation::GetEvidencePack);
+        assert_eq!(response.state_fence, state_fence);
+        response.validate()?;
+        let payload = &response.payload;
+        assert_eq!(
+            payload.get("version").and_then(Value::as_u64),
+            Some(u64::from(EVIDENCE_PACK_PAYLOAD_VERSION))
+        );
+        assert_eq!(
+            payload.get("subject").and_then(Value::as_str),
+            Some("evidence-alpha")
+        );
+        let records = pack_records(payload)?;
+        assert_eq!(records.len(), 1);
+        assert_eq!(
+            records[0].get("operation").and_then(Value::as_str),
+            Some("CaptureObservation")
+        );
+        assert_eq!(
+            records[0].get("capture_index").and_then(Value::as_u64),
+            Some(0)
+        );
+        assert_eq!(
+            records[0]
+                .get("parameters")
+                .and_then(|parameters| parameters.get("subject"))
+                .and_then(Value::as_str),
+            Some("evidence-alpha")
+        );
+        let provenance = pack_provenance(payload)?;
+        assert_eq!(
+            provenance.get("state_fence"),
+            Some(
+                &serde_json::to_value(&state_fence)
+                    .map_err(|error| StoreError::Serialization(error.to_string()))?
+            )
+        );
+        assert_eq!(
+            provenance.get("matched_total").and_then(Value::as_u64),
+            Some(1)
+        );
+        assert_eq!(
+            provenance.get("returned").and_then(Value::as_u64),
+            Some(1)
+        );
+        assert_eq!(
+            provenance.get("max_records").and_then(Value::as_u64),
+            Some(10)
+        );
+        assert_eq!(
+            provenance.get("truncated").and_then(Value::as_bool),
+            Some(false)
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn evidence_pack_absence_is_an_exact_empty_result() -> Result<(), StoreError> {
+        // No captured observation matches: an exact empty result, never a
+        // successful current view of unrelated state.
+        let state_fence = fence();
+        let store = store()?;
+        let ctx = metadata(&state_fence)?;
+        let prepared = capture_with_subject("op-evidence-2", "evidence-alpha", &state_fence, &ctx)?;
+        store.apply_transaction(&ctx, prepared, &[], &[])?;
+
+        let query = evidence_pack_query(
+            &state_fence,
+            Some("scope-1"),
+            evidence_params("evidence-missing", "10"),
+        )?;
+        let response = store.execute_named_sync(&query)?;
+        response.validate()?;
+        let records = pack_records(&response.payload)?;
+        assert!(records.is_empty());
+        let provenance = pack_provenance(&response.payload)?;
+        assert_eq!(
+            provenance.get("matched_total").and_then(Value::as_u64),
+            Some(0)
+        );
+        assert_eq!(
+            provenance.get("truncated").and_then(Value::as_bool),
+            Some(false)
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn evidence_pack_wrong_fence_is_refused() -> Result<(), StoreError> {
+        let state_fence = fence();
+        let store = store()?;
+        let ctx = metadata(&state_fence)?;
+        let prepared = capture_with_subject("op-evidence-3", "evidence-alpha", &state_fence, &ctx)?;
+        store.apply_transaction(&ctx, prepared, &[], &[])?;
+
+        let other_fence = StateFence::new(test_epoch(2), ResourceGeneration::genesis());
+        assert_ne!(other_fence, state_fence);
+        let query = evidence_pack_query(
+            &other_fence,
+            Some("scope-1"),
+            evidence_params("evidence-alpha", "10"),
+        )?;
+        assert_eq!(
+            store.execute_named_sync(&query),
+            Err(StoreError::FenceMismatch)
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn evidence_pack_over_bound_request_is_refused() -> Result<(), StoreError> {
+        // An over-bound request refuses with `PayloadTooLarge`: never a
+        // successful over-bound view.
+        let state_fence = fence();
+        let store = store()?;
+        let ctx = metadata(&state_fence)?;
+        let prepared = capture_with_subject("op-evidence-4", "evidence-alpha", &state_fence, &ctx)?;
+        store.apply_transaction(&ctx, prepared, &[], &[])?;
+
+        for bound in [
+            (EVIDENCE_PACK_MAX_RECORDS + 1).to_string(),
+            "1000".to_owned(),
+        ] {
+            let query = evidence_pack_query(
+                &state_fence,
+                Some("scope-1"),
+                evidence_params("evidence-alpha", &bound),
+            )?;
+            assert_eq!(
+                store.execute_named_sync(&query),
+                Err(StoreError::PayloadTooLarge),
+                "bound {bound} exceeds the declared maximum"
+            );
+        }
+        // The exact maximum stays admissible.
+        let query = evidence_pack_query(
+            &state_fence,
+            Some("scope-1"),
+            evidence_params("evidence-alpha", &format!("{EVIDENCE_PACK_MAX_RECORDS}")),
+        )?;
+        assert!(store.execute_named_sync(&query).is_ok());
+        Ok(())
+    }
+
+    #[test]
+    fn evidence_pack_malformed_selectors_fail_closed() -> Result<(), StoreError> {
+        let state_fence = fence();
+        let store = store()?;
+
+        // Scope-addressed read without a scope.
+        let query = evidence_pack_query(
+            &state_fence,
+            None,
+            evidence_params("evidence-alpha", "10"),
+        )?;
+        assert_eq!(
+            store.execute_named_sync(&query),
+            Err(StoreError::InvalidField {
+                field: "scope_id",
+                reason: "scope revision read requires scope_id",
+            })
+        );
+
+        // Missing subject selector.
+        let query = evidence_pack_query(
+            &state_fence,
+            Some("scope-1"),
+            BTreeMap::from([("max_records".to_owned(), json!("10"))]),
+        )?;
+        assert!(matches!(
+            store.execute_named_sync(&query),
+            Err(StoreError::InvalidField {
+                field: "operation.parameter",
+                ..
+            })
+        ));
+
+        // Extra undeclared parameter.
+        let mut extra = evidence_params("evidence-alpha", "10");
+        extra.insert("limit".to_owned(), json!(1));
+        let query = evidence_pack_query(&state_fence, Some("scope-1"), extra)?;
+        assert!(matches!(
+            store.execute_named_sync(&query),
+            Err(StoreError::InvalidField {
+                field: "operation.parameter",
+                ..
+            })
+        ));
+
+        // Zero and non-decimal bounds fail the bound shape.
+        for bound in ["0", "many"] {
+            let query = evidence_pack_query(
+                &state_fence,
+                Some("scope-1"),
+                evidence_params("evidence-alpha", bound),
+            )?;
+            assert!(
+                matches!(
+                    store.execute_named_sync(&query),
+                    Err(StoreError::InvalidField {
+                        field: "operation.parameter",
+                        ..
+                    })
+                ),
+                "bound {bound} must fail closed"
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn evidence_pack_bounds_results_with_visible_truncation() -> Result<(), StoreError> {
+        // Three captures share one subject; a bound of two returns the first
+        // two in capture order with an explicit truncation marker and totals.
+        let state_fence = fence();
+        let store = store()?;
+        let ctx = metadata(&state_fence)?;
+        for index in ["op-bulk-1", "op-bulk-2", "op-bulk-3"] {
+            let prepared = capture_with_subject(index, "evidence-bulk", &state_fence, &ctx)?;
+            store.apply_transaction(&ctx, prepared, &[], &[])?;
+        }
+
+        let query = evidence_pack_query(
+            &state_fence,
+            Some("scope-1"),
+            evidence_params("evidence-bulk", "2"),
+        )?;
+        let response = store.execute_named_sync(&query)?;
+        response.validate()?;
+        let records = pack_records(&response.payload)?;
+        assert_eq!(records.len(), 2);
+        assert_eq!(
+            records[0].get("capture_index").and_then(Value::as_u64),
+            Some(0)
+        );
+        assert_eq!(
+            records[1].get("capture_index").and_then(Value::as_u64),
+            Some(1)
+        );
+        let provenance = pack_provenance(&response.payload)?;
+        assert_eq!(
+            provenance.get("matched_total").and_then(Value::as_u64),
+            Some(3)
+        );
+        assert_eq!(
+            provenance.get("returned").and_then(Value::as_u64),
+            Some(2)
+        );
+        assert_eq!(
+            provenance.get("truncated").and_then(Value::as_bool),
+            Some(true)
+        );
+
+        // A bound covering every match is not truncated.
+        let query = evidence_pack_query(
+            &state_fence,
+            Some("scope-1"),
+            evidence_params("evidence-bulk", "3"),
+        )?;
+        let response = store.execute_named_sync(&query)?;
+        let provenance = pack_provenance(&response.payload)?;
+        assert_eq!(
+            provenance.get("truncated").and_then(Value::as_bool),
+            Some(false)
+        );
         Ok(())
     }
 }

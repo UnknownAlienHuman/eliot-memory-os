@@ -2,7 +2,7 @@
 //!
 //! Pure in-crate proofs only: no Surreal/Blob edge, no authority issuance.
 //! Deferred cases are listed in the owning work report: the global catalogue
-//! beyond the four activated reads, a universal parameter-schema framework,
+//! beyond the five activated reads, a universal parameter-schema framework,
 //! new adapter defaults, C2 enforcement (scope/role/fence/expiry), and the
 //! null/absent/false/zero matrix beyond the activated operations.
 
@@ -61,10 +61,17 @@ fn receipt_params() -> BTreeMap<String, Value> {
     parameters
 }
 
+fn evidence_pack_params() -> BTreeMap<String, Value> {
+    BTreeMap::from([
+        ("subject".to_owned(), json!("observation-1")),
+        ("max_records".to_owned(), json!("10")),
+    ])
+}
+
 #[test]
 fn activated_typed_reads_pass_catalogue_validation() {
     let entries = generated_operation_manifests().unwrap();
-    assert_eq!(entries.len(), 8);
+    assert_eq!(entries.len(), 9);
 
     // The closed name mapping is the single owner for code, manifests, wire.
     for operation in [
@@ -72,6 +79,7 @@ fn activated_typed_reads_pass_catalogue_validation() {
         NamedReadOperation::GetOrderingHeads,
         NamedReadOperation::GetScopeRevisionView,
         NamedReadOperation::ResolveWriteReceipt,
+        NamedReadOperation::GetEvidencePack,
     ] {
         let wire = serde_json::to_value(operation).unwrap();
         assert_eq!(
@@ -99,6 +107,15 @@ fn activated_typed_reads_pass_catalogue_validation() {
         receipt_params(),
     );
     assert!(receipt.validate_against_catalogue(&entries).is_ok());
+
+    // The fifth activated read addresses its scope through the typed scope
+    // field and its evidence through the bounded exact selectors.
+    let pack = read_request(
+        NamedReadOperation::GetEvidencePack,
+        Some("scope-one"),
+        evidence_pack_params(),
+    );
+    assert!(pack.validate_against_catalogue(&entries).is_ok());
 }
 
 #[test]
@@ -189,6 +206,116 @@ fn unknown_extra_and_control_params_fail_closed() {
             ..
         })
     ));
+}
+
+#[test]
+fn evidence_pack_selectors_fail_closed() {
+    let entries = generated_operation_manifests().unwrap();
+
+    // Missing subject selector.
+    let mut missing_subject = BTreeMap::new();
+    missing_subject.insert("max_records".to_owned(), json!("10"));
+    let request = read_request(
+        NamedReadOperation::GetEvidencePack,
+        Some("scope-one"),
+        missing_subject,
+    );
+    assert!(matches!(
+        request.validate_against_catalogue(&entries),
+        Err(StoreError::InvalidField {
+            field: "operation.parameter",
+            ..
+        })
+    ));
+
+    // Missing max_records bound.
+    let mut missing_bound = BTreeMap::new();
+    missing_bound.insert("subject".to_owned(), json!("observation-1"));
+    let request = read_request(
+        NamedReadOperation::GetEvidencePack,
+        Some("scope-one"),
+        missing_bound,
+    );
+    assert!(matches!(
+        request.validate_against_catalogue(&entries),
+        Err(StoreError::InvalidField {
+            field: "operation.parameter",
+            ..
+        })
+    ));
+
+    // Extra undeclared parameter alongside the approved selectors.
+    let mut extra = evidence_pack_params();
+    extra.insert("limit".to_owned(), json!(1));
+    let request = read_request(
+        NamedReadOperation::GetEvidencePack,
+        Some("scope-one"),
+        extra,
+    );
+    assert!(matches!(
+        request.validate_against_catalogue(&entries),
+        Err(StoreError::InvalidField {
+            field: "operation.parameter",
+            ..
+        })
+    ));
+
+    // Control substitution through an undeclared control name.
+    let mut control = evidence_pack_params();
+    control.insert("state_fence".to_owned(), json!("smuggled"));
+    let request = read_request(
+        NamedReadOperation::GetEvidencePack,
+        Some("scope-one"),
+        control,
+    );
+    assert!(matches!(
+        request.validate_against_catalogue(&entries),
+        Err(StoreError::InvalidField {
+            field: "payload.control_field",
+            ..
+        })
+    ));
+
+    // Blank subject fails the declared shape.
+    let mut blank = evidence_pack_params();
+    blank.insert("subject".to_owned(), json!("   "));
+    let request = read_request(NamedReadOperation::GetEvidencePack, Some("scope-one"), blank);
+    assert!(matches!(
+        request.validate_against_catalogue(&entries),
+        Err(StoreError::InvalidField {
+            field: "operation.parameter",
+            ..
+        })
+    ));
+
+    // Scope-addressed read without a scope.
+    let request = read_request(
+        NamedReadOperation::GetEvidencePack,
+        None,
+        evidence_pack_params(),
+    );
+    assert!(matches!(
+        request.validate_against_catalogue(&entries),
+        Err(StoreError::InvalidField {
+            field: "scope_id",
+            ..
+        })
+    ));
+
+    // Declared input bound: a subject larger than the entry's canonical
+    // parameter budget fails closed before dispatch.
+    let mut over_input = BTreeMap::new();
+    over_input.insert("subject".to_owned(), json!("s".repeat(70_000)));
+    over_input.insert("max_records".to_owned(), json!("10"));
+    let request = read_request(
+        NamedReadOperation::GetEvidencePack,
+        Some("scope-one"),
+        over_input,
+    );
+    assert_eq!(
+        request.validate_against_catalogue(&entries),
+        Err(StoreError::PayloadTooLarge)
+    );
 }
 
 fn respec_with(
@@ -342,7 +469,7 @@ fn approved_capture_plan_passes_and_stale_digest_fails_manifest_mismatch() {
 #[test]
 fn capture_observation_passes_whole_path() {
     let entries = generated_operation_manifests().unwrap();
-    assert_eq!(entries.len(), 8);
+    assert_eq!(entries.len(), 9);
     let set_digest = operation_manifest_set_digest(&entries).unwrap();
 
     // Approved owner-shaped subject params pass catalogue validation.
@@ -389,7 +516,7 @@ fn capture_observation_passes_whole_path() {
 #[test]
 fn append_audit_event_passes_whole_path() {
     let entries = generated_operation_manifests().unwrap();
-    assert_eq!(entries.len(), 8);
+    assert_eq!(entries.len(), 9);
     let set_digest = operation_manifest_set_digest(&entries).unwrap();
 
     // Approved receipt-bound audit params pass catalogue validation without bypass.
@@ -400,7 +527,7 @@ fn append_audit_event_passes_whole_path() {
 #[test]
 fn apply_lifecycle_policy_passes_whole_path() {
     let entries = generated_operation_manifests().unwrap();
-    assert_eq!(entries.len(), 8);
+    assert_eq!(entries.len(), 9);
     let set_digest = operation_manifest_set_digest(&entries).unwrap();
 
     // Approved lifecycle-policy params pass catalogue validation without bypass.

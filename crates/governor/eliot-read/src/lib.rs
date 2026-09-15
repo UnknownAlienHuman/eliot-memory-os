@@ -18,7 +18,7 @@ use eliot_contracts::{
     contract_identity as make_contract_identity,
 };
 use eliot_store_api::{
-    CanonicalStoreClient, NamedReadOperation, NamedReadRequest, NamedReadResponse, ReadConsistency,
+    CanonicalReadClient, NamedReadOperation, NamedReadRequest, NamedReadResponse, ReadConsistency,
     RevisionHead, RevisionKey, ScopeId, StoreError,
 };
 use schemars::JsonSchema;
@@ -460,7 +460,7 @@ pub struct ReadService<C> {
     store: C,
 }
 
-impl<C: CanonicalStoreClient> ReadService<C> {
+impl<C: CanonicalReadClient> ReadService<C> {
     /// Creates a read service over the caller-owned store client.
     pub const fn new(store: C) -> Self {
         Self { store }
@@ -542,7 +542,7 @@ impl<C: CanonicalStoreClient> ReadService<C> {
     }
 }
 
-impl<C: CanonicalStoreClient> ReadApi for ReadService<C> {
+impl<C: CanonicalReadClient> ReadApi for ReadService<C> {
     async fn state(
         &self,
         ctx: &RequestMetadata,

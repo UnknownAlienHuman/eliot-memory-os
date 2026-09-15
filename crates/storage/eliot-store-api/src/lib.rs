@@ -67,10 +67,11 @@ mod operation_catalogue;
 mod operation_parameters;
 
 pub use operation_catalogue::{
-    ACTIVATED_READ_OWNING_SECTION, GENESIS_OWNING_SECTION, MINIMUM_COMPATIBLE_VERSION,
-    OPERATION_CATALOGUE_PROFILE, OperationKind, READ_MAX_INPUT_BYTES, READ_MAX_OUTPUT_BYTES,
-    READ_TIMEOUT_MS, SCOPE_KIND_NONE, SCOPE_KIND_SCOPE, SINGLE_MANIFEST_OWNING_SECTION,
-    activated_read_operations, generated_operation_manifests, operation_manifest_set_digest,
+    ACTIVATED_READ_OWNING_SECTION, EVIDENCE_PACK_MAX_RECORDS, GENESIS_OWNING_SECTION,
+    MINIMUM_COMPATIBLE_VERSION, OPERATION_CATALOGUE_PROFILE, OperationKind, READ_MAX_INPUT_BYTES,
+    READ_MAX_OUTPUT_BYTES, READ_TIMEOUT_MS, SCOPE_KIND_NONE, SCOPE_KIND_SCOPE,
+    SINGLE_MANIFEST_OWNING_SECTION, activated_read_operations, generated_operation_manifests,
+    operation_manifest_set_digest,
 };
 
 pub use operation_parameters::{
@@ -2120,6 +2121,46 @@ pub trait CanonicalStoreClient: Send + Sync {
     -> Result<NamedReadResponse, StoreError>;
     /// Reports bounded store health and active manifest identity.
     async fn health(&self) -> Result<StoreHealth, StoreError>;
+}
+
+/// Narrow read-only capability over the canonical store boundary.
+///
+/// Read-only consumers (notably the Governor `ReadService`) depend on this
+/// trait instead of the full [`CanonicalStoreClient`] write capability. The
+/// two methods carry the exact signatures and fail-closed semantics of the
+/// matching [`CanonicalStoreClient`] declarations: `revision_heads` reads
+/// revision heads by stable key, and `execute_named` executes one closed
+/// named read (raw query strings remain impossible here).
+#[allow(async_fn_in_trait)]
+pub trait CanonicalReadClient: Send + Sync {
+    /// Reads revision heads by stable key.
+    async fn revision_heads(&self, keys: Vec<RevisionKey>)
+    -> Result<Vec<RevisionHead>, StoreError>;
+    /// Executes one closed named read; raw query strings are impossible here.
+    async fn execute_named(&self, query: NamedReadRequest)
+    -> Result<NamedReadResponse, StoreError>;
+}
+
+/// Every full store client satisfies the narrow read capability.
+///
+/// This blanket implementation delegates to the matching
+/// [`CanonicalStoreClient`] read declarations, which are retained so the
+/// existing cross-lane `impl CanonicalStoreClient for EbpCanonicalStoreClient`
+/// keeps compiling untouched (blanket impl instead of declaration removal).
+impl<T: CanonicalStoreClient + ?Sized> CanonicalReadClient for T {
+    async fn revision_heads(
+        &self,
+        keys: Vec<RevisionKey>,
+    ) -> Result<Vec<RevisionHead>, StoreError> {
+        CanonicalStoreClient::revision_heads(self, keys).await
+    }
+
+    async fn execute_named(
+        &self,
+        query: NamedReadRequest,
+    ) -> Result<NamedReadResponse, StoreError> {
+        CanonicalStoreClient::execute_named(self, query).await
+    }
 }
 
 #[cfg(test)]
