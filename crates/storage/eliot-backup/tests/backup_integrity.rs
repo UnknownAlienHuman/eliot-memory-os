@@ -117,10 +117,7 @@ fn export_fence(blobs: &[BackupBlob], event_count: u64) -> ExportFence {
             last_sequence,
             count: event_count,
         },
-        blob_reachability_manifest: blobs
-            .iter()
-            .map(|blob| blob.locator.hash.clone())
-            .collect(),
+        blob_reachability_manifest: blobs.iter().map(|blob| blob.locator.hash.clone()).collect(),
         consistent: true,
     }
 }
@@ -263,10 +260,7 @@ fn missing_extra_duplicate_conflicting_blob_members_reject() {
         export_fence: missing_fence,
         ..missing
     };
-    assert_eq!(
-        BackupBundle::build(missing),
-        Err(BackupError::MissingBlob)
-    );
+    assert_eq!(BackupBundle::build(missing), Err(BackupError::MissingBlob));
 
     // Extra: sealed set carries a blob the manifest never referenced.
     let extra_blob = blob_for("extra-bytes", "domain-a", "key-lineage-1");
@@ -337,9 +331,15 @@ fn sealed_envelope_identity_checked_without_opening_key() {
 
     let bundle = BackupBundle::build(degraded_input(vec![blob], Vec::new()))
         .expect("envelope bundle builds");
-    assert_eq!(bundle.manifest.encryption.envelope, "sealed-blob-envelope-v1");
+    assert_eq!(
+        bundle.manifest.encryption.envelope,
+        "sealed-blob-envelope-v1"
+    );
     assert!(!bundle.manifest.encryption.plaintext_keys_present);
-    assert_eq!(bundle.manifest.encryption.key_lineages, vec!["key-lineage-7"]);
+    assert_eq!(
+        bundle.manifest.encryption.key_lineages,
+        vec!["key-lineage-7"]
+    );
 
     // Ciphertext checksum mismatch rejects without attempting decryption.
     let mut tampered = bundle.clone();
@@ -364,8 +364,8 @@ fn absent_decryption_or_capture_evidence_limits_proof() {
     let fixture = load_fixture("948-b-case13-evidence-levels.json");
     assert_eq!(fixture["rule"], "absence-of-evidence-is-never-success");
 
-    let bundle = BackupBundle::build(degraded_input(Vec::new(), Vec::new()))
-        .expect("bundle builds");
+    let bundle =
+        BackupBundle::build(degraded_input(Vec::new(), Vec::new())).expect("bundle builds");
     bundle.validate().expect("archive validates");
     let digest = bundle.bundle_sha256().expect("bundle digest");
     assert_eq!(digest.len(), 64);
@@ -412,7 +412,9 @@ fn purge_integrity_config_policy_module_build_identities_load_bearing() {
     ];
     for (missing_kind, component) in expected {
         let mut input = full_input();
-        input.artifacts.retain(|artifact| artifact.kind != missing_kind);
+        input
+            .artifacts
+            .retain(|artifact| artifact.kind != missing_kind);
         assert_eq!(
             BackupBundle::build(input),
             Err(BackupError::MissingRecoveryComponent(component)),
@@ -462,17 +464,19 @@ fn aggregate_and_per_member_bounds_reject_overflow_truncation_mismatch() {
     assert_eq!(fixture["max_record_bytes"], 33_554_432);
     assert_eq!(fixture["max_sealed_blob_bytes"], 536_870_912);
     assert_eq!(
-        eliot_backup::MAX_RECORD_BYTES, 33_554_432,
+        eliot_backup::MAX_RECORD_BYTES,
+        33_554_432,
         "per-member record bound is load-bearing"
     );
     assert_eq!(
-        eliot_backup::MAX_SEALED_BLOB_BYTES, 536_870_912,
+        eliot_backup::MAX_SEALED_BLOB_BYTES,
+        536_870_912,
         "per-member blob bound is load-bearing"
     );
 
     // Declared-size mismatch: ciphertext digest must match the sealed bytes.
-    let bundle = BackupBundle::build(degraded_input(Vec::new(), Vec::new()))
-        .expect("empty bundle builds");
+    let bundle =
+        BackupBundle::build(degraded_input(Vec::new(), Vec::new())).expect("empty bundle builds");
     let mut blob = blob_for("bound-bytes", "domain-a", "key-lineage-1");
     blob.sealed_sha256 = sha256_hex(b"different-bytes");
     let declared = degraded_input(vec![blob], Vec::new());
@@ -532,9 +536,12 @@ fn aggregate_and_per_member_bounds_reject_overflow_truncation_mismatch() {
 #[test]
 fn set_permutations_stable_and_sequence_changes_visible() {
     let fixture = load_fixture("948-b-case16-ordering.json");
-    assert!(fixture["sequence_visible"].as_array().expect("sequences").contains(
-        &serde_json::json!("canonical_events")
-    ));
+    assert!(
+        fixture["sequence_visible"]
+            .as_array()
+            .expect("sequences")
+            .contains(&serde_json::json!("canonical_events"))
+    );
 
     // The same logical set in a different input order canonicalizes identically.
     let first = BackupBundle::build(degraded_input(
@@ -551,7 +558,10 @@ fn set_permutations_stable_and_sequence_changes_visible() {
         first.bundle_sha256().expect("digest"),
         second.bundle_sha256().expect("digest")
     );
-    assert_eq!(first.encode().expect("encode"), second.encode().expect("encode"));
+    assert_eq!(
+        first.encode().expect("encode"),
+        second.encode().expect("encode")
+    );
 
     // Blob and artifact sets canonicalize under permutation as well. Both
     // inputs share one fence order; only the member input order differs.
@@ -588,7 +598,10 @@ fn set_permutations_stable_and_sequence_changes_visible() {
         first.bundle_sha256().expect("digest"),
         changed.bundle_sha256().expect("digest")
     );
-    assert_ne!(first.encode().expect("encode"), changed.encode().expect("encode"));
+    assert_ne!(
+        first.encode().expect("encode"),
+        changed.encode().expect("encode")
+    );
 }
 
 // WORK_UNIT_CASE: 948/17
@@ -630,8 +643,8 @@ fn duplicate_unknown_protected_raw_fields_reject_before_normalization() {
         Err(BackupError::Duplicate { .. })
     ));
 
-    let bundle = BackupBundle::build(degraded_input(Vec::new(), Vec::new()))
-        .expect("bundle builds");
+    let bundle =
+        BackupBundle::build(degraded_input(Vec::new(), Vec::new())).expect("bundle builds");
     let mut bundle_wire = serde_json::to_value(&bundle).expect("bundle encodes");
     bundle_wire["unknown_future_section"] = serde_json::json!({"forged": true});
     let bundle_bytes = serde_json::to_vec(&bundle_wire).expect("wire encodes");
@@ -640,8 +653,7 @@ fn duplicate_unknown_protected_raw_fields_reject_before_normalization() {
         "unknown bundle fields must reject at the byte boundary"
     );
 
-    let mut fence_wire =
-        serde_json::to_value(&bundle.export_fence).expect("fence encodes");
+    let mut fence_wire = serde_json::to_value(&bundle.export_fence).expect("fence encodes");
     fence_wire["unknown_future_fence"] = serde_json::json!(1);
     assert!(
         serde_json::from_value::<ExportFence>(fence_wire).is_err(),
@@ -661,8 +673,8 @@ fn explicit_legacy_compatibility_cannot_invent_authority() {
     );
 
     // A legacy format label is an explicit refusal, never a silent upgrade.
-    let bundle = BackupBundle::build(degraded_input(Vec::new(), Vec::new()))
-        .expect("bundle builds");
+    let bundle =
+        BackupBundle::build(degraded_input(Vec::new(), Vec::new())).expect("bundle builds");
     let mut legacy_wire = serde_json::to_value(&bundle).expect("bundle encodes");
     legacy_wire["manifest"]["format"] = serde_json::json!("ECXF/0");
     let legacy_bytes = serde_json::to_vec(&legacy_wire).expect("wire encodes");
@@ -701,8 +713,8 @@ fn explicit_legacy_compatibility_cannot_invent_authority() {
 
     // Canonical legacy-epoch import stays loss-visible: missing evidence is
     // suspended history, never fresh residency or fence authority.
-    let legacy = eliot_contracts::LegacyScalarEpoch::new(7, "record-7", "legacy-v1")
-        .expect("legacy scalar");
+    let legacy =
+        eliot_contracts::LegacyScalarEpoch::new(7, "record-7", "legacy-v1").expect("legacy scalar");
     let imported = eliot_contracts::import_legacy_scalar_epoch(
         legacy,
         eliot_contracts::LegacyEpochEvidence::Missing,
@@ -736,11 +748,11 @@ fn bounded_malformed_cases_and_diagnostic_redaction() {
         BackupBundle::decode(b"{not-json"),
         Err(BackupError::Serialization(_))
     ));
-    let bundle = BackupBundle::build(degraded_input(Vec::new(), Vec::new()))
-        .expect("bundle builds");
+    let bundle =
+        BackupBundle::build(degraded_input(Vec::new(), Vec::new())).expect("bundle builds");
     let encoded = bundle.encode().expect("bundle encodes");
-    let mut tampered = serde_json::from_slice::<serde_json::Value>(&encoded)
-        .expect("bundle parses");
+    let mut tampered =
+        serde_json::from_slice::<serde_json::Value>(&encoded).expect("bundle parses");
     tampered["manifest"]["backup_id"] = serde_json::json!("   ");
     assert!(matches!(
         BackupBundle::decode(&serde_json::to_vec(&tampered).expect("wire encodes")),
@@ -762,7 +774,10 @@ fn bounded_malformed_cases_and_diagnostic_redaction() {
     leaky.sealed_sha256 = sha256_hex(b"other-digest");
     let error = leaky.validate().expect_err("digest mismatch must fail");
     let rendered = format!("{error}");
-    assert!(!rendered.contains(secret), "errors must not echo sealed bytes");
+    assert!(
+        !rendered.contains(secret),
+        "errors must not echo sealed bytes"
+    );
     for marker in ["DELETED-CONTENT", "SECRET-KEY", "PASSWORD", "cek-bytes"] {
         assert!(
             !rendered.contains(marker),
@@ -807,11 +822,8 @@ fn real_bundle_round_trip_with_no_foreign_api() {
 
     // The verification path performs no capture/restore/key/Store/network or
     // persistent-state effects: the source boundary contains no I/O surface.
-    let source = std::fs::read(format!(
-        "{}/src/lib.rs",
-        env!("CARGO_MANIFEST_DIR")
-    ))
-    .expect("backup source reads");
+    let source = std::fs::read(format!("{}/src/lib.rs", env!("CARGO_MANIFEST_DIR")))
+        .expect("backup source reads");
     let source_text = String::from_utf8(source).expect("backup source is UTF-8");
     for marker in [
         "std::fs::",
