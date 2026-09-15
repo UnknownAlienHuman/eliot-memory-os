@@ -32,3 +32,7 @@ workspace = true
 
 [dev-dependencies]
 eliot-instrument-api.workspace = true
+# T2-S06 second-consumer proof (test-only): the in-memory durable recovery
+# ledger behind the real Kernel admission gate. Production durability stays
+# with the store slice; this edge never enters the runtime boundary.
+eliot-ors.workspace = true
