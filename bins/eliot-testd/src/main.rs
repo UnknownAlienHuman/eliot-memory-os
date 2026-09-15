@@ -2,19 +2,16 @@
 
 use std::future::Future;
 use std::io::{self, Write};
-use std::sync::Arc;
 use std::task::{Context, Poll, Waker};
 
 use eliot_process::ProcessExecutor;
 use eliot_testd::{
     ADMITTED_WORKER_LEASE_MS, PROTOCOL_VERSION, SERVICE_NAME, TestReceipt, TestdComposition,
-    TestdDerivedIntentParams, TestdDispatchAuthority, compose_process_executor,
-    derive_testd_intent,
+    ValidatedDispatchDriveOutcome, drive_validated_dispatch_material,
     kernel_client::{KernelTestdIpcClient, PresentedAdmission},
-    resolve_testd_tool, run_admitted_one_shot,
+    run_admitted_one_shot,
     testd_material::{ValidatedTestdMaterial, read_testd_material},
 };
-use eliot_testd_core::EvidenceCollector;
 
 const EXIT_KERNEL_ADMISSION_REQUIRED: i32 = 78;
 const KERNEL_ADMISSION_REQUIRED: &str = "KERNEL_ADMISSION_REQUIRED";
@@ -101,13 +98,14 @@ fn bootstrap_and_run_once() -> i32 {
                 return deny();
             };
             // Validated session-bound material drives the bounded admitted
-            // probe: the intent derives only from the admitted profile
-            // binding plus the installed tool bytes, the single permit
-            // issues through the ephemeral dispatch authority, and the real
-            // composed executor runs exactly one start. The closed Kernel
-            // bootstrap and advertisement above still gate production until
-            // the dispatch contour lands; this arm is exercised by the
-            // module tests.
+            // probe through the DISPATCH-WIRE seam
+            // (`drive_validated_dispatch_material` in `eliot-testd`): the
+            // intent derives only from the admitted profile binding plus the
+            // installed tool bytes, the single permit issues through the
+            // ephemeral dispatch authority, and the real composed executor
+            // runs exactly one start. The closed Kernel bootstrap and
+            // advertisement above still gate production until the dispatch
+            // contour lands; this arm is exercised by the module tests.
             drive_material_probe(&material)
         }
         GateDecision::DenyNotAdvertised | GateDecision::DenyNoPresentedAttempt => deny(),
@@ -121,57 +119,35 @@ fn bootstrap_and_run_once() -> i32 {
 /// no value is taken from argv, stdin, or environment. Absence reports
 /// `None` and keeps the exact `DenyNoPresentedAttempt` path; a present but
 /// invalid file is refused fail-closed by the reader (left in place, never
-/// driven) and likewise reports `None`. When the remaining dispatch
-/// bindings land (executable-bound intent plus authority context), this
-/// function remains the single integration point that maps validated
-/// material onto the drive.
+/// driven) and likewise reports `None`. A validated presentation drives
+/// through the DISPATCH-WIRE seam
+/// ([`drive_validated_dispatch_material`][eliot_testd::drive_validated_dispatch_material]);
+/// this function remains the single integration point that maps the
+/// executable-locator file onto that drive.
 fn acquire_presented_admission() -> Option<ValidatedTestdMaterial> {
     read_testd_material().unwrap_or_default()
 }
 
 /// Drives one validated dispatch file through the bounded admitted probe.
 ///
-/// The intent derives only from the admitted profile binding plus the
-/// installed tool bytes (closed registry in `eliot-testd-core`; the fixed
-/// argv, empty environment, and timeout/output caps are never caller
-/// authority), the single permit issues through the ephemeral dispatch
-/// authority over the validated grant, and the real composed executor runs
-/// exactly one start. Cancelled admissions project cancellation without
-/// executing. Every post-derivation outcome maps to a typed non-78 exit;
-/// a refused derivation or issuance (nothing executed) fails the shot
-/// without claiming admission semantics.
+/// Thin binary projection over the DISPATCH-WIRE seam
+/// ([`drive_validated_dispatch_material`][eliot_testd::drive_validated_dispatch_material]):
+/// the intent derives only from the admitted profile binding plus the
+/// installed tool bytes, the single permit issues through the ephemeral
+/// dispatch authority over the validated grant, and the real composed
+/// executor runs exactly one start. Cancelled admissions project
+/// cancellation without executing. Every post-derivation outcome maps to a
+/// typed non-78 exit; a refused derivation or issuance (nothing executed)
+/// fails the shot without claiming admission semantics.
 fn drive_material_probe(material: &ValidatedTestdMaterial) -> i32 {
-    if material.cancelled {
-        return EXIT_ADMITTED_CANCELLED;
-    }
-    let now_ms = now_ms();
-    let Ok(tool) = resolve_testd_tool(eliot_testd_core::TESTD_PROFILE_PROGRAM) else {
-        return EXIT_ADMITTED_DRIVE_FAILED;
-    };
-    let params = TestdDerivedIntentParams {
-        job_id: material.job_id.clone(),
-        operation_id: material.operation_id.clone(),
-        profile: material.profile.clone(),
-        generation: material.generation,
-        session_nonce: material.nonce.clone(),
-        executable_absolute: tool.executable_absolute,
-        executable_sha256: tool.executable_sha256,
-        generation_root: generation_root_cwd(),
-    };
-    let Ok(intent) = derive_testd_intent(&params) else {
-        return EXIT_ADMITTED_DRIVE_FAILED;
-    };
-    let Ok(authority) = TestdDispatchAuthority::new() else {
-        return EXIT_ADMITTED_DRIVE_FAILED;
-    };
-    let Ok(request) = authority.issue(&intent, &material.grant, now_ms) else {
-        return EXIT_ADMITTED_DRIVE_FAILED;
-    };
-    let executor = compose_process_executor(Arc::new(authority));
-    let sink: Arc<dyn eliot_process::ProcessEvidenceSink> = Arc::new(EvidenceCollector::default());
-    match block_on_drive(executor.start(request, sink)) {
-        Ok(_) => EXIT_ADMITTED_COMPLETED,
-        Err(eliot_process::ProcessExecutionError::UnknownOutcome) => {
+    match block_on_drive(drive_validated_dispatch_material(
+        material,
+        &generation_root_cwd(),
+        now_ms(),
+    )) {
+        Ok(ValidatedDispatchDriveOutcome::Completed { .. }) => EXIT_ADMITTED_COMPLETED,
+        Ok(ValidatedDispatchDriveOutcome::Cancelled { .. }) => EXIT_ADMITTED_CANCELLED,
+        Ok(ValidatedDispatchDriveOutcome::ReconcileRequired { .. }) => {
             EXIT_ADMITTED_RECONCILE_REQUIRED
         }
         Err(_) => EXIT_ADMITTED_DRIVE_FAILED,
@@ -391,10 +367,11 @@ mod tests {
     /// The child drive seam no longer waits on doubles: this test stages the
     /// exact documented file shape (seven keys per the `testd_material`
     /// module docs) through the real broker constructors and drives it
-    /// through the real `drive_material_probe` (real tool resolution, real
-    /// `TestdDispatchAuthority`, real composed executor, bounded
-    /// `cargo --version` probe). The testd IPC side now mirrors the doctor
-    /// bootstrap (`KernelTestdIpcClient::connect` +
+    /// through the DISPATCH-WIRE seam (`drive_material_probe` projecting
+    /// `eliot_testd::drive_validated_dispatch_material`: real tool
+    /// resolution, real `TestdDispatchAuthority`, real composed executor,
+    /// bounded `cargo --version` probe). The testd IPC side now mirrors the
+    /// doctor bootstrap (`KernelTestdIpcClient::connect` +
     /// live-health `advertise_testd`), so advertisement flips only when the
     /// composed Kernel advertises; live kernel delivery itself remains DW-A/B
     /// contour work. Runs by default on a host with cargo on PATH and never

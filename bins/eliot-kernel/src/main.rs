@@ -39,6 +39,7 @@ use std::sync::Arc;
 use eliot_kernel::{
     EliotdReceiptRootBinding, KernelBuildError, KernelComposition, KernelConfig,
     KernelDoctorRecoveryLedger, compose_dispatch_contour, compose_production_doctor_front_door,
+    compose_production_native_worker_front_door, compose_production_testd_front_door,
 };
 
 #[cfg(windows)]
@@ -154,12 +155,18 @@ async fn main() {
         // production callers: the testd/native admit sides go live here.
         // The 22-value contour now carries the installed
         // doctor/testd/native-worker digests (fail-closed above, threaded
-        // through `KernelConfig` with no defaults), so the Doctor side
-        // composes here through `compose_production_doctor_front_door`
-        // (durable `KernelDoctorRecoveryLedger` plus
-        // `DoctorRecipeRegistry::production_health_probe`); a malformed
-        // installed-doctor digest keeps `doctor_repair_advertised`
-        // fail-closed instead of composing.
+        // through `KernelConfig` with no defaults), so all three sides
+        // compose here: the Doctor side through
+        // `compose_production_doctor_front_door` (durable
+        // `KernelDoctorRecoveryLedger` plus
+        // `DoctorRecipeRegistry::production_health_probe`), and the testd
+        // plus native-worker sides through
+        // `compose_production_testd_front_door` /
+        // `compose_production_native_worker_front_door` (verified installed
+        // digests recorded on the contour; testd admission stays stateless
+        // and native admission stays with live service plus the ORS claim
+        // table). A malformed installed digest on any side keeps its
+        // advertisement fail-closed instead of composing.
         if let Err(error) = compose_dispatch_contour(startup_binding.installation_id.clone()) {
             exit_error("DISPATCH_COMPOSITION_FAILURE", &error.to_string());
         }
@@ -174,6 +181,24 @@ async fn main() {
                 .unwrap_or_else(|error| exit_error("DOCTOR_LEDGER_FAILURE", &error.to_string())),
         );
         if let Err(error) = compose_production_doctor_front_door(doctor_ledger, &doctor_digest) {
+            exit_error("DISPATCH_COMPOSITION_FAILURE", &error.to_string());
+        }
+        let Some(testd_digest) = options.testd_artifact_sha256.clone() else {
+            exit_error(
+                "TESTD_ARTIFACT_CONTRACT_REQUIRED",
+                "Host launch must inject the independent Testd executable digest",
+            );
+        };
+        if let Err(error) = compose_production_testd_front_door(&testd_digest) {
+            exit_error("DISPATCH_COMPOSITION_FAILURE", &error.to_string());
+        }
+        let Some(native_worker_digest) = options.native_worker_artifact_sha256.clone() else {
+            exit_error(
+                "NATIVE_WORKER_ARTIFACT_CONTRACT_REQUIRED",
+                "Host launch must inject the independent native worker executable digest",
+            );
+        };
+        if let Err(error) = compose_production_native_worker_front_door(&native_worker_digest) {
             exit_error("DISPATCH_COMPOSITION_FAILURE", &error.to_string());
         }
     }

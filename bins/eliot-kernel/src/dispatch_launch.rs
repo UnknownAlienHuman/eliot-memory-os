@@ -629,11 +629,14 @@ struct LaunchRecords {
 }
 
 /// The composed dispatch contour: the Kernel-owned principal owner, the
-/// Doctor front-door state once its production ledger lands, and the
+/// Doctor front-door state once its production ledger lands, the installed
+/// testd/native-worker digests once their production sides compose, and the
 /// retained launch records.
 pub struct ComposedDispatchContour {
     principal_owner: String,
     doctor: Mutex<Option<DoctorFrontDoorState>>,
+    testd_installed_digest: Mutex<Option<String>>,
+    native_worker_installed_digest: Mutex<Option<String>>,
     launches: Mutex<LaunchRecords>,
 }
 
@@ -748,6 +751,8 @@ pub fn compose_dispatch_contour(principal_owner: String) -> Result<(), DispatchL
         .set(ComposedDispatchContour {
             principal_owner,
             doctor: Mutex::new(None),
+            testd_installed_digest: Mutex::new(None),
+            native_worker_installed_digest: Mutex::new(None),
             launches: Mutex::new(LaunchRecords::default()),
         })
         .map_err(|_| DispatchLaunchError::AlreadyComposed("dispatch contour"))?;
@@ -806,6 +811,115 @@ pub fn compose_production_doctor_front_door(
     let registry = DoctorRecipeRegistry::production_health_probe(installed_doctor_digest)
         .map_err(|error| DispatchLaunchError::InvalidMaterial(error.to_string()))?;
     compose_doctor_front_door(ledger, registry)
+}
+
+/// Composes the production testd side from its installed package artifact
+/// digest (Implements #461 DISPATCH-WIRE E2E).
+///
+/// `installed_testd_digest` is the installed testd package artifact digest
+/// (lowercase SHA-256) from the installation manifest through the Host
+/// injection — never minted here. Testd admission is stateless (wire plus
+/// live authority only), so no ledger composition is required: this records
+/// the verified digest on the contour cell from
+/// [`compose_dispatch_contour`] as the production-composed marker the
+/// Kernel launch chain reads back. A malformed digest fails closed with
+/// [`DispatchLaunchError::InvalidMaterial`] before any cell is touched;
+/// a second composition is refused instead of replacing live authority.
+/// This is the production caller `main` uses once the contour carries the
+/// digest, mirroring [`compose_production_doctor_front_door`].
+pub fn compose_production_testd_front_door(
+    installed_testd_digest: &str,
+) -> Result<(), DispatchLaunchError> {
+    require_digest(
+        installed_testd_digest,
+        "installed testd digest must be a lowercase SHA-256 digest",
+    )?;
+    let contour = DISPATCH_CONTOUR
+        .get()
+        .ok_or(DispatchLaunchError::Uncomposed(
+            "compose the dispatch contour before its testd side",
+        ))?;
+    let mut composed = contour
+        .testd_installed_digest
+        .lock()
+        .map_err(|_| DispatchLaunchError::Gate("testd front-door lock poisoned".to_owned()))?;
+    if composed.is_some() {
+        return Err(DispatchLaunchError::AlreadyComposed("testd front door"));
+    }
+    *composed = Some(installed_testd_digest.to_owned());
+    Ok(())
+}
+
+/// Composes the production native-worker side from its installed package
+/// artifact digest (Implements #461 DISPATCH-WIRE E2E).
+///
+/// `installed_native_worker_digest` is the installed native-worker package
+/// artifact digest (lowercase SHA-256) from the installation manifest
+/// through the Host injection — never minted here. Native-worker admission
+/// runs through live service authority plus the ORS claim table, so no
+/// ledger composition is required: this records the verified digest on the
+/// contour cell from [`compose_dispatch_contour`] as the
+/// production-composed marker the Kernel launch chain reads back. A
+/// malformed digest fails closed with
+/// [`DispatchLaunchError::InvalidMaterial`] before any cell is touched;
+/// a second composition is refused instead of replacing live authority.
+/// This is the production caller `main` uses once the contour carries the
+/// digest, mirroring [`compose_production_doctor_front_door`].
+pub fn compose_production_native_worker_front_door(
+    installed_native_worker_digest: &str,
+) -> Result<(), DispatchLaunchError> {
+    require_digest(
+        installed_native_worker_digest,
+        "installed native-worker digest must be a lowercase SHA-256 digest",
+    )?;
+    let contour = DISPATCH_CONTOUR
+        .get()
+        .ok_or(DispatchLaunchError::Uncomposed(
+            "compose the dispatch contour before its native-worker side",
+        ))?;
+    let mut composed = contour.native_worker_installed_digest.lock().map_err(|_| {
+        DispatchLaunchError::Gate("native-worker front-door lock poisoned".to_owned())
+    })?;
+    if composed.is_some() {
+        return Err(DispatchLaunchError::AlreadyComposed(
+            "native-worker front door",
+        ));
+    }
+    *composed = Some(installed_native_worker_digest.to_owned());
+    Ok(())
+}
+
+/// Returns whether the production testd side is composed with its installed
+/// digest.
+///
+/// True exactly when [`compose_production_testd_front_door`] landed after
+/// the contour cell; false in every other case. This is the production-side
+/// marker only: [`testd_admission_advertised`] keeps its contour-cell
+/// semantics unchanged, so the child advertise probe this path never
+/// touches keeps failing closed exactly as before until the contour lands.
+#[must_use]
+pub fn testd_production_composed() -> bool {
+    DISPATCH_CONTOUR.get().is_some_and(|contour| {
+        contour
+            .testd_installed_digest
+            .lock()
+            .is_ok_and(|composed| composed.is_some())
+    })
+}
+
+/// Returns whether the production native-worker side is composed with its
+/// installed digest.
+///
+/// True exactly when [`compose_production_native_worker_front_door`]
+/// landed after the contour cell; false in every other case.
+#[must_use]
+pub fn native_worker_production_composed() -> bool {
+    DISPATCH_CONTOUR.get().is_some_and(|contour| {
+        contour
+            .native_worker_installed_digest
+            .lock()
+            .is_ok_and(|composed| composed.is_some())
+    })
 }
 
 /// Returns the composed dispatch contour, when composition landed.
@@ -3684,6 +3798,47 @@ mod tests {
             Err(eliot_ipc::TransportError::SessionFenced)
         ));
 
+        // 2b. The production testd/native sides compose once through their
+        // installed digests (Implements #461 DISPATCH-WIRE E2E, mirroring
+        // the `main` production order right after the contour): a valid
+        // digest lands and flips only its own production-side marker, a
+        // second composition is refused instead of replacing live
+        // authority, and a malformed digest fails closed even once
+        // composed. The child advertise probe keeps its contour-cell
+        // semantics, so this step changes no admit behavior below.
+        let installed_testd_digest =
+            eliot_contracts::sha256_hex(b"eliot-testd-installed-package-bytes");
+        compose_production_testd_front_door(&installed_testd_digest)
+            .expect("production testd composition");
+        assert!(
+            testd_production_composed(),
+            "composed testd side must report composed"
+        );
+        assert!(matches!(
+            compose_production_testd_front_door(&installed_testd_digest),
+            Err(DispatchLaunchError::AlreadyComposed(_))
+        ));
+        let installed_native_digest =
+            eliot_contracts::sha256_hex(b"eliot-native-worker-installed-package-bytes");
+        compose_production_native_worker_front_door(&installed_native_digest)
+            .expect("production native composition");
+        assert!(
+            native_worker_production_composed(),
+            "composed native side must report composed"
+        );
+        assert!(matches!(
+            compose_production_native_worker_front_door(&installed_native_digest),
+            Err(DispatchLaunchError::AlreadyComposed(_))
+        ));
+        assert!(matches!(
+            compose_production_testd_front_door("not-a-sha256-digest"),
+            Err(DispatchLaunchError::InvalidMaterial(_))
+        ));
+        assert!(matches!(
+            compose_production_native_worker_front_door("not-a-sha256-digest"),
+            Err(DispatchLaunchError::InvalidMaterial(_))
+        ));
+
         // 3. Testd drives through the composed principal: a stale fence
         // answers typed (never fenced), and a live envelope is admitted.
         let stale_frame = kernel
@@ -4158,6 +4313,134 @@ mod tests {
             ReconcileLaunchedOutcome::Unknown { .. }
         ));
 
+        // 5d. DISPATCH-LIVE testd image (kernel binary, Implements #461):
+        // the real `eliot-testd` image is admitted through the live service
+        // plus the composed principal, bound to the protected dispatch file
+        // with a validated grant, and carried to the spawn boundary. No
+        // doubles: the request carries real computed digests and the
+        // executable digest is read from the real image bytes (staged as a
+        // byte-identical copy under this test root, so the dispatch file
+        // never lands in the build tree).
+        let testd_live_dir = root.join("testd-live-child");
+        std::fs::create_dir_all(&testd_live_dir).expect("testd live child dir");
+        let testd_binary = real_testd_binary();
+        let testd_bytes = std::fs::read(&testd_binary).unwrap_or_else(|_| {
+            panic!(
+                "DEPENDS-ON-INTEGRATION: build the testd image first \
+                 (`cargo build -p eliot-testd`); missing {testd_binary:?}"
+            )
+        });
+        let testd_live_digest = eliot_contracts::sha256_hex(&testd_bytes);
+        let staged_testd =
+            testd_live_dir.join(format!("eliot-testd{}", std::env::consts::EXE_SUFFIX));
+        std::fs::write(&staged_testd, &testd_bytes).expect("stage real testd image");
+        assert_eq!(
+            eliot_contracts::sha256_hex(
+                &std::fs::read(&staged_testd).expect("staged testd image reads")
+            ),
+            testd_live_digest,
+            "staged testd image must stay byte-identical to the real binary"
+        );
+        let testd_live_material = TestdLaunchMaterial {
+            request: &testd_request(
+                "job-dispatch-live-img-1",
+                0,
+                &testd_envelope(
+                    "job-dispatch-live-img-1",
+                    Some("test-operation-1"),
+                    1,
+                    &epoch,
+                ),
+            ),
+            executable: &staged_testd,
+            executable_sha256: &testd_live_digest,
+            working_directory: &testd_live_dir,
+        };
+        let testd_live_prepared = prepare_testd_launch(&kernel, &testd_live_material, now_nanos)
+            .expect("live testd prepare");
+        let PreparedTestdLaunch::Ready(testd_live_ready) = testd_live_prepared else {
+            panic!("live testd prepare must be ready");
+        };
+        assert_eq!(testd_live_ready.admission.job_id, "job-dispatch-live-img-1");
+        assert_nonce_shape(&testd_live_ready.nonce);
+        let testd_live_file = testd_live_dir.join(
+            DispatchedWorkerKind::Testd
+                .material_file_name()
+                .expect("testd material file"),
+        );
+        assert_eq!(
+            testd_live_file, testd_live_ready.material_path,
+            "live testd ready carries the protected dispatch path"
+        );
+        let testd_live_json: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&testd_live_file).expect("live testd file"))
+                .expect("live testd file is JSON");
+        let testd_live_object = testd_live_json
+            .as_object()
+            .expect("live testd dispatch object");
+        for key in [
+            "request",
+            "envelope",
+            "admission",
+            "epoch",
+            "generation",
+            "nonce",
+            "grant",
+        ] {
+            assert!(
+                testd_live_object.contains_key(key),
+                "live testd dispatch file carries {key}"
+            );
+        }
+        assert_eq!(
+            testd_live_object["nonce"],
+            serde_json::json!(testd_live_ready.nonce),
+            "live testd dispatch nonce equals the retained session nonce"
+        );
+        let testd_live_grant: DispatchGrant =
+            serde_json::from_value(testd_live_object["grant"].clone())
+                .expect("live testd grant parses");
+        assert_eq!(testd_live_grant.authority_epoch, epoch);
+        testd_live_grant
+            .validate_for_child()
+            .expect("live testd grant validates");
+        // No admitted process authority in isolation: a first launch of a
+        // fresh job fails closed at the spawn boundary (after its own
+        // admit + material write), reaps the file, and releases the slot.
+        let testd_spawn_request = testd_request(
+            "job-dispatch-live-img-2",
+            0,
+            &testd_envelope(
+                "job-dispatch-live-img-2",
+                Some("test-operation-1"),
+                1,
+                &epoch,
+            ),
+        );
+        let testd_spawn_material = TestdLaunchMaterial {
+            request: &testd_spawn_request,
+            executable: &staged_testd,
+            executable_sha256: &testd_live_digest,
+            working_directory: &testd_live_dir,
+        };
+        assert!(matches!(
+            launch_admitted_testd_attempt(&kernel, &testd_spawn_material, now_nanos).await,
+            Err(DispatchLaunchError::ExecutorUnavailable)
+        ));
+        assert!(
+            !testd_live_file.exists(),
+            "failed live testd launch reaps its material and releases the slot"
+        );
+        assert!(matches!(
+            reconcile_launched_testd_attempt(
+                &kernel,
+                "job-dispatch-live-img-2",
+                &testd_spawn_request
+            )
+            .expect("reconcile"),
+            ReconcileLaunchedOutcome::Unknown { .. }
+        ));
+
         // 6. Launch without a configured executor fails closed: no spawn,
         // no retained slot.
         let launch_material = TestdLaunchMaterial {
@@ -4238,6 +4521,56 @@ mod tests {
             Err(DispatchLaunchError::AlreadyComposed(_))
         ));
 
+        // 8b. DISPATCH-LIVE doctor image (kernel binary, Implements #461):
+        // the real `eliot-doctor` image is staged byte-identical under this
+        // test root and bound by its real digest, then the admit gate
+        // refuses the shape-valid-but-empty closed request typed. No
+        // doubles: the digest is read from the real image bytes, and the
+        // refusal proves the live service plus the composed production
+        // side ran (fully admitted envelopes are proven service-side,
+        // where the registry fixtures live). Refusal writes no material
+        // file, retains no slot, and spawns no child.
+        let doctor_live_dir = root.join("doctor-live-child");
+        std::fs::create_dir_all(&doctor_live_dir).expect("doctor live child dir");
+        let doctor_binary = real_doctor_binary();
+        let doctor_bytes = std::fs::read(&doctor_binary).unwrap_or_else(|_| {
+            panic!(
+                "DEPENDS-ON-INTEGRATION: build the doctor image first \
+                 (`cargo build -p eliot-doctor`); missing {doctor_binary:?}"
+            )
+        });
+        let doctor_live_digest = eliot_contracts::sha256_hex(&doctor_bytes);
+        let staged_doctor =
+            doctor_live_dir.join(format!("eliot-doctor{}", std::env::consts::EXE_SUFFIX));
+        std::fs::write(&staged_doctor, &doctor_bytes).expect("stage real doctor image");
+        assert_eq!(
+            eliot_contracts::sha256_hex(
+                &std::fs::read(&staged_doctor).expect("staged doctor image reads")
+            ),
+            doctor_live_digest,
+            "staged doctor image must stay byte-identical to the real binary"
+        );
+        let doctor_live_material = DoctorLaunchMaterial {
+            attempt: &shape_valid_doctor_request(),
+            request_json: &serde_json::json!({}),
+            manifest_json: &serde_json::json!({"manifest": "test"}),
+            executable: &staged_doctor,
+            executable_sha256: &doctor_live_digest,
+            working_directory: &doctor_live_dir,
+        };
+        let doctor_live = prepare_doctor_launch(&kernel, &doctor_live_material, now_nanos)
+            .expect("live doctor prepare answers");
+        assert!(
+            matches!(doctor_live, PreparedDoctorLaunch::Refused(_)),
+            "shape-valid-but-empty doctor request is refused typed, never admitted"
+        );
+        assert!(
+            !doctor_live_dir
+                .join("eliot-doctor.dispatched-attempt.json")
+                .exists(),
+            "refused doctor prepare writes no dispatch material"
+        );
+
         let _ = std::fs::remove_dir_all(root);
     }
 
@@ -4253,6 +4586,28 @@ mod tests {
             "eliot-native-worker{}",
             std::env::consts::EXE_SUFFIX
         ))
+    }
+
+    /// Resolves the real `eliot-doctor` image beside this test executable
+    /// (the `deps`/`debug` layout cargo produces). The digest below binds
+    /// the exact bytes before any launch step reads them, so the path
+    /// itself never confers ownership (`bins/AGENTS.md`).
+    fn real_doctor_binary() -> PathBuf {
+        let exe = std::env::current_exe().expect("test executable path");
+        let deps = exe.parent().expect("deps dir");
+        let profile = deps.parent().expect("profile dir");
+        profile.join(format!("eliot-doctor{}", std::env::consts::EXE_SUFFIX))
+    }
+
+    /// Resolves the real `eliot-testd` image beside this test executable
+    /// (the `deps`/`debug` layout cargo produces). The digest below binds
+    /// the exact bytes before any launch step reads them, so the path
+    /// itself never confers ownership (`bins/AGENTS.md`).
+    fn real_testd_binary() -> PathBuf {
+        let exe = std::env::current_exe().expect("test executable path");
+        let deps = exe.parent().expect("deps dir");
+        let profile = deps.parent().expect("profile dir");
+        profile.join(format!("eliot-testd{}", std::env::consts::EXE_SUFFIX))
     }
 
     /// The heartbeat reply carries the composed advertisement flag through
@@ -4321,6 +4676,25 @@ mod tests {
             Err(DispatchLaunchError::InvalidMaterial(_))
         ));
         let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// Production testd/native sides fail closed before touching any cell
+    /// when the installed digest is malformed (Implements #461
+    /// DISPATCH-WIRE E2E). The digest shape check precedes the contour
+    /// contact, so this proof never writes global state and stays
+    /// order-independent next to the parallel lifecycle test; the
+    /// successful composition path is proven inside the lifecycle
+    /// (step 2b), where the contour order is deterministic.
+    #[test]
+    fn production_testd_and_native_reject_malformed_installed_digests() {
+        assert!(matches!(
+            compose_production_testd_front_door("not-a-sha256-digest"),
+            Err(DispatchLaunchError::InvalidMaterial(_))
+        ));
+        assert!(matches!(
+            compose_production_native_worker_front_door("not-a-sha256-digest"),
+            Err(DispatchLaunchError::InvalidMaterial(_))
+        ));
     }
 
     fn assert_nonce_shape(nonce: &str) {

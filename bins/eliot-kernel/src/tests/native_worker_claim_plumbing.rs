@@ -1157,11 +1157,14 @@ fn executable_binding_stale_inputs_reject_typed() {
     }
 }
 
-/// Route v2 carry (Implements #22): `build_claim_request` populates the
-/// executable join from the presented claim, fails closed when v2 omits it,
-/// parses v1 without a join, and refuses a v1 payload smuggling one.
+/// Route v2 carry (Implements #22 R2): `build_single_shape_request`
+/// populates the executable join from the presented claim halves, fails
+/// closed when v2 omits it, parses v1 without a join, and refuses a v1
+/// payload smuggling one. The single projector is the only builder: the
+/// pre-unification envelope builder is deleted, so every contour builds
+/// from the same `{claim, registration}` halves.
 #[test]
-fn route_build_claim_request_carries_v2_join() {
+fn route_single_shape_request_carries_v2_join() {
     let now = now_ms();
     let request = test_claim_request(
         "claim-carry-1",
@@ -1174,12 +1177,25 @@ fn route_build_claim_request_carries_v2_join() {
     // Wire contour (Implements #64): the top-level `authority_epoch` travels
     // as the scalar sequence, while the fence keeps the full `EpochId`.
     json["authority_epoch"] = serde_json::json!(request.authority_epoch.sequence.get());
-    let rebuilt = KernelComposition::build_claim_request(&json).expect("v2 rebuilds");
+    // Presenting registration the single shape projects the envelope from
+    // (envelope agreement mirrors the route's resource binding).
+    let registration = serde_json::json!({
+        "installation_id": "installation-1",
+        "worker_artifact_digest": "a".repeat(64),
+        "worker_config_digest": "b".repeat(64),
+        "protocol_version": NATIVE_WORKER_PROTOCOL_VERSION,
+        "execution_unit_schema_version": NATIVE_WORKER_EXECUTION_UNIT_SCHEMA_VERSION,
+        "authority_epoch": serde_json::to_value(test_epoch(1)).expect("epoch JSON"),
+        "state_fence": serde_json::to_value(live_fence()).expect("fence JSON"),
+    });
+    let rebuilt =
+        KernelComposition::build_single_shape_request(&json, &registration).expect("v2 rebuilds");
     assert!(
         rebuilt.executable_binding.is_some(),
         "v2 join must be carried"
     );
     assert_eq!(rebuilt.binding_digest, request.binding_digest);
+    assert_eq!(rebuilt.installation_id, "installation-1");
     rebuilt.validate().expect("rebuilt claim validates");
     let mut no_join = json.clone();
     no_join
@@ -1187,17 +1203,21 @@ fn route_build_claim_request_carries_v2_join() {
         .expect("claim is an object")
         .remove("executable_binding");
     assert!(
-        KernelComposition::build_claim_request(&no_join).is_err(),
+        KernelComposition::build_single_shape_request(&no_join, &registration).is_err(),
         "v2 without join must fail closed"
     );
     let mut v1_value = json.clone();
     let v1_object = v1_value.as_object_mut().expect("claim is an object");
     v1_object.remove("executable_binding");
+    // The wire-version mutation invalidates the carried envelope digest, so
+    // the envelope-less v1 contour (digest computed, never carried) applies.
+    v1_object.remove("request_digest");
     v1_object.insert(
         "wire_version".to_owned(),
         serde_json::json!(NATIVE_WORKER_CLAIM_WIRE_VERSION_V1),
     );
-    let v1 = KernelComposition::build_claim_request(&v1_value).expect("v1 parses");
+    let v1 =
+        KernelComposition::build_single_shape_request(&v1_value, &registration).expect("v1 parses");
     assert!(
         v1.executable_binding.is_none(),
         "v1 carries no join by construction"
@@ -1211,7 +1231,7 @@ fn route_build_claim_request_carries_v2_join() {
             serde_json::json!(NATIVE_WORKER_CLAIM_WIRE_VERSION_V1),
         );
     assert!(
-        KernelComposition::build_claim_request(&smuggled).is_err(),
+        KernelComposition::build_single_shape_request(&smuggled, &registration).is_err(),
         "v1 must not smuggle a join"
     );
 }
