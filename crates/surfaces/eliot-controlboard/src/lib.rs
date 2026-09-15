@@ -8,8 +8,10 @@
 
 #![forbid(unsafe_code)]
 
+mod swarm_command;
 mod swarm_read;
 
+pub use swarm_command::*;
 pub use swarm_read::*;
 
 use std::collections::{BTreeSet, HashMap};
@@ -17,6 +19,7 @@ use std::fmt;
 use std::future::Future;
 use std::pin::Pin;
 
+use eliot_agent_coordinator::{HumanModelPreferencePolicy, ModelCatalogueSnapshot, ModelRole};
 use eliot_contracts::{OperationId, RequestMetadata, SessionId};
 use eliot_evaluation_contracts::ObjectiveStatus;
 use eliot_evidence::{EpistemicStatus, EvidenceFreshness};
@@ -118,6 +121,10 @@ pub enum ActionCapability {
     AnswerReview,
     ResolveReview,
     RejectReview,
+    RefreshSwarmCatalogue,
+    ReplaceSwarmPolicy,
+    RequestSwarmLaunch,
+    CancelSwarmAttempt,
 }
 
 /// Visibility selector attached by the canonical owner.
@@ -735,6 +742,26 @@ pub enum OperatorAction {
         review_item_id: String,
         reason: String,
     },
+    RefreshSwarmCatalogue {
+        catalogue: ModelCatalogueSnapshot,
+        reason: String,
+    },
+    ReplaceSwarmPolicy {
+        policy: HumanModelPreferencePolicy,
+        expected_policy_revision: String,
+        expected_policy_digest: String,
+    },
+    RequestSwarmLaunch {
+        catalogue: ModelCatalogueSnapshot,
+        policy: HumanModelPreferencePolicy,
+        task_id: String,
+        plan_revision: String,
+        demand: Vec<ModelRole>,
+    },
+    CancelSwarmAttempt {
+        attempt_id: String,
+        reason: String,
+    },
 }
 
 impl OperatorAction {
@@ -769,6 +796,10 @@ impl OperatorAction {
                 rule_id: item_id, ..
             }
             | Self::RecoveryAction { action_id: item_id } => item_id,
+            Self::RefreshSwarmCatalogue { catalogue, .. } => &catalogue.snapshot_id,
+            Self::ReplaceSwarmPolicy { policy, .. } => &policy.policy_id,
+            Self::RequestSwarmLaunch { task_id, .. } => task_id,
+            Self::CancelSwarmAttempt { attempt_id, .. } => attempt_id,
             Self::StartQuery { query_kind } => query_kind,
         }
     }
@@ -795,10 +826,20 @@ impl OperatorAction {
             } => text(item_id, "action.target_id")?,
             Self::PauseTask { task_id }
             | Self::CancelTask { task_id, .. }
-            | Self::ReplanTask { task_id, .. } => text(task_id, "action.task_id")?,
+            | Self::ReplanTask { task_id, .. }
+            | Self::RequestSwarmLaunch { task_id, .. } => text(task_id, "action.task_id")?,
             Self::ChallengeRule { rule_id, .. } => text(rule_id, "action.rule_id")?,
             Self::StartQuery { query_kind } => text(query_kind, "action.query_kind")?,
             Self::RecoveryAction { action_id } => text(action_id, "action.action_id")?,
+            Self::RefreshSwarmCatalogue { catalogue, .. } => {
+                text(&catalogue.snapshot_id, "action.catalogue_snapshot_id")?;
+            }
+            Self::ReplaceSwarmPolicy { policy, .. } => {
+                text(&policy.policy_id, "action.preference_policy_id")?;
+            }
+            Self::CancelSwarmAttempt { attempt_id, .. } => {
+                text(attempt_id, "action.attempt_id")?;
+            }
         }
         for value in self.textual_reasons() {
             text(value, "action.reason")?;
@@ -811,7 +852,9 @@ impl OperatorAction {
             Self::ResolveAttention { reason, .. }
             | Self::CancelTask { reason, .. }
             | Self::ResolveReview { reason, .. }
-            | Self::RejectReview { reason, .. } => vec![reason],
+            | Self::RejectReview { reason, .. }
+            | Self::RefreshSwarmCatalogue { reason, .. }
+            | Self::CancelSwarmAttempt { reason, .. } => vec![reason],
             Self::ReplanTask { rationale, .. } | Self::ChallengeRule { rationale, .. } => {
                 vec![rationale]
             }
@@ -819,6 +862,12 @@ impl OperatorAction {
             Self::Approve {
                 approval_digest, ..
             } => vec![approval_digest],
+            Self::ReplaceSwarmPolicy {
+                expected_policy_revision,
+                expected_policy_digest,
+                ..
+            } => vec![expected_policy_revision, expected_policy_digest],
+            Self::RequestSwarmLaunch { plan_revision, .. } => vec![plan_revision],
             _ => Vec::new(),
         }
     }
@@ -1008,6 +1057,10 @@ impl OperatorAction {
             Self::AnswerReview { .. } => ActionCapability::AnswerReview,
             Self::ResolveReview { .. } => ActionCapability::ResolveReview,
             Self::RejectReview { .. } => ActionCapability::RejectReview,
+            Self::RefreshSwarmCatalogue { .. } => ActionCapability::RefreshSwarmCatalogue,
+            Self::ReplaceSwarmPolicy { .. } => ActionCapability::ReplaceSwarmPolicy,
+            Self::RequestSwarmLaunch { .. } => ActionCapability::RequestSwarmLaunch,
+            Self::CancelSwarmAttempt { .. } => ActionCapability::CancelSwarmAttempt,
         }
     }
 }
