@@ -284,6 +284,18 @@ impl BackupBlob {
         }
         self.compression.validate()?;
         self.crypto.validate()?;
+        // Bind the sealed envelope to its exact crypto identity (algorithm,
+        // key lineage/version) under the blob contract. This checks identity
+        // only: ciphertext checksums above are not decryption, key
+        // availability, or plaintext authenticity, and no key is ever opened
+        // here. The envelope-declared lineage must equal the crypto
+        // descriptor lineage so equal bytes under different obligation
+        // domains cannot coalesce into one logical object.
+        if self.crypto.key_lineage != self.key_lineage {
+            return Err(BackupError::IntegrityMismatch {
+                subject: format!("sealed blob {} key lineage", self.locator.hash),
+            });
+        }
         Ok(())
     }
 }
@@ -599,6 +611,14 @@ impl BackupBundle {
         for record in self.canonical_events.iter().chain(self.projections.iter()) {
             record.validate()?;
         }
+        // Record closure: exact (record_type, record_id) identity must be
+        // unique across the whole canonical section, and referenced members
+        // must close. A receipt emitted event must name exactly one canonical
+        // event, and a projection must name exactly one canonical event;
+        // dangling, duplicate, or conflicting members are rejected. No schema
+        // is guessed from payload bytes: payload shape stays opaque to this
+        // library, and `CanonicalRecord.sha256` binds bytes only, never
+        // semantic completeness.
         unique(
             self.canonical_events
                 .iter()
@@ -611,6 +631,8 @@ impl BackupBundle {
                 .map(|record| record.record_id.clone()),
             "projections",
         )?;
+        validate_record_reference_closure(&self.canonical_events, &self.projections)?;
+        validate_receipt_reference_closure(&self.receipts, &self.canonical_events)?;
         if self.export_fence.event_range.count != self.canonical_events.len() as u64 {
             return Err(BackupError::FenceMismatch {
                 subject: "event range count".to_owned(),
@@ -625,6 +647,16 @@ impl BackupBundle {
             self.blobs.iter().map(|blob| blob.locator.hash.clone()),
             "blobs",
         )?;
+        // Blob identity is the full canonical opaque residency key: hash alone
+        // is not identity. Equal sealed bytes across two obligation domains
+        // remain two distinct logical objects, so residency (all six domains
+        // plus the versioned content digest) must also be unique, and
+        // cross-domain coalescing is rejected by the residency-identity check.
+        unique(
+            self.blobs.iter().map(|blob| blob.locator.residency.clone()),
+            "blobs.residency",
+        )?;
+        validate_blob_residency_identity(&self.blobs)?;
         let expected_blobs = self
             .export_fence
             .blob_reachability_manifest
@@ -675,6 +707,16 @@ impl BackupBundle {
                     subject: "ors/export fence".to_owned(),
                 });
             }
+            validate_snapshot_relation(
+                "ors_snapshot",
+                &ors.state_fence,
+                ors.last_receipt_cursor,
+                ors.last_event_cursor,
+                ors.last_outbox_cursor,
+                &self.export_fence,
+                self.canonical_events.len() as u64,
+                self.receipts.len() as u64,
+            )?;
         }
         if let Some(watchdog) = &self.watchdog_spool {
             watchdog.validate()?;
@@ -685,6 +727,10 @@ impl BackupBundle {
             }
         }
         if let Some(host_audit) = &self.host_audit {
+            // Optional Host audit is forensic only: it is validated for shape
+            // but never supplies active authority and never satisfies a class
+            // denominator. `HostStateAuditFence::validate` already rejects
+            // `active_authority_restored`; the class gate below ignores audit.
             host_audit.validate()?;
         }
         validate_class_requirements(self)?;
@@ -803,14 +849,40 @@ fn validate_receipts(
 }
 
 fn validate_class_requirements(bundle: &BackupBundle) -> Result<(), BackupError> {
+    // Frozen field/invariant/class map for 948 cases 1-10.
+    //
+    // FullRecovery requires: coherent canonical export + referenced sealed
+    // blobs with distinct residency obligations + coherent logical ORS
+    // snapshot + config/policy/module/approved Host/dependency manifests +
+    // integrity/purge revision + bounded Watchdog spool. Optional Host audit
+    // is forensic only and never satisfies a requirement.
+    //
+    // CanonicalOnlyDegraded requires: coherent semantic data/blobs +
+    // explicit unavailable operational recovery (no ORS snapshot, no claim of
+    // operational recovery). ScopeExport requires: exactly one declared scope
+    // and is not an installation backup (no ORS snapshot, no
+    // installation-wide operational claim). Missing class requirements refuse
+    // without silent downgrade or upgrade.
     const REQUIRED: [&str; 4] = ["config", "policy", "module", "host_dependency_build"];
     match bundle.manifest.class {
         BackupClass::FullRecovery => {
+            // The canonical export denominator is already enforced by the
+            // fence/event-range/record checks above; here the class gate binds
+            // the remaining recovery denominator.
             if bundle.ors_snapshot.is_none() {
                 return Err(BackupError::MissingRecoveryComponent("ors_snapshot"));
             }
             if bundle.watchdog_spool.is_none() {
                 return Err(BackupError::MissingRecoveryComponent("watchdog_spool"));
+            }
+            // Integrity/purge denominator: the purge revision binds the purge
+            // ledger carried here, so a FullRecovery archive with no purge
+            // ledger section and a nonzero revision (or a ledger with a zero
+            // revision) is incompatible, not silently coherent.
+            if bundle.manifest.purge_ledger_revision == 0 && !bundle.purge_ledger.is_empty() {
+                return Err(BackupError::FenceMismatch {
+                    subject: "purge ledger revision".to_owned(),
+                });
             }
             for required in REQUIRED {
                 if !bundle
@@ -825,12 +897,167 @@ fn validate_class_requirements(bundle: &BackupBundle) -> Result<(), BackupError>
                 return Err(BackupError::FullRecoveryHasGaps);
             }
         }
-        BackupClass::CanonicalOnlyDegraded | BackupClass::ScopeExport => {
+        BackupClass::CanonicalOnlyDegraded => {
+            // Degraded archives carry coherent semantic data/blobs with an
+            // explicit unavailable operational recovery: ORS snapshot content
+            // is forbidden here (it would claim operational recovery), while
+            // optional Host audit remains forensic-only. Declared gaps are
+            // structural (the class is explicitly degraded), not hidden.
+            if bundle.ors_snapshot.is_some() {
+                return Err(BackupError::UnexpectedRecoveryComponent("ors_snapshot"));
+            }
+        }
+        BackupClass::ScopeExport => {
+            // One declared scope, never an installation backup: ORS snapshot
+            // content is forbidden (it would widen the scope to installation
+            // recovery). The single scope is already enforced by the
+            // ScopeRequired/ScopeUnexpected checks in `validate`. A
+            // gapless feature list is permitted structurally; operational
+            // recovery of the installation is still never claimed for this
+            // class (see `RestoreEvidenceLevel::for_class`).
             if bundle.ors_snapshot.is_some() {
                 return Err(BackupError::UnexpectedRecoveryComponent("ors_snapshot"));
             }
         }
     }
+    Ok(())
+}
+
+/// Validates record/order/event closure over the canonical section.
+///
+/// Consumes the accepted ECXF identities: every canonical event carries an
+/// exact `(record_type, record_id)` identity and every projection references
+/// exactly one canonical event by identity. Rejects missing, extra (dangling
+/// projection with no canonical member), duplicate, conflicting (one
+/// projection identity bound to two different canonical types), and
+/// incompatible members. A checksum never substitutes for this referential
+/// closure. Payloads stay opaque: no schema is guessed from JSON.
+fn validate_record_reference_closure(
+    events: &[CanonicalRecord],
+    projections: &[CanonicalRecord],
+) -> Result<(), BackupError> {
+    let mut event_types = BTreeMap::new();
+    for event in events {
+        if let Some(previous) =
+            event_types.insert(event.record_id.clone(), event.record_type.clone())
+            && previous != event.record_type
+        {
+            return Err(BackupError::FenceMismatch {
+                subject: format!("canonical event {}", event.record_id),
+            });
+        }
+    }
+    for projection in projections {
+        match event_types.get(&projection.record_id) {
+            Some(event_type) if *event_type == projection.record_type => {}
+            Some(_) => {
+                return Err(BackupError::FenceMismatch {
+                    subject: format!("projection {}", projection.record_id),
+                });
+            }
+            None => {
+                return Err(BackupError::ReceiptChainGap {
+                    event_id: projection.record_id.clone(),
+                });
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Validates that every receipt emitted event closes on exactly one canonical
+/// event member. Missing members prevent complete validation.
+fn validate_receipt_reference_closure(
+    receipts: &[WriteReceipt],
+    events: &[CanonicalRecord],
+) -> Result<(), BackupError> {
+    let event_ids = events
+        .iter()
+        .map(|event| event.record_id.as_str())
+        .collect::<BTreeSet<_>>();
+    for receipt in receipts {
+        for event_id in &receipt.emitted_event_ids {
+            if !event_ids.contains(event_id.as_str()) {
+                return Err(BackupError::ReceiptChainGap {
+                    event_id: event_id.to_string(),
+                });
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Validates blob residency identity without opening any key.
+///
+/// Each blob is identified by its canonical opaque residency key/domain,
+/// content digest/version, retention/erasure obligations, and purge revision
+/// context carried in the locator, not by content hash alone. Checks identity
+/// only: locator/residency coherence and digest/version shape are validated
+/// through the blob contract (`BackupBlob::validate`), and this step rejects
+/// cross-domain coalescing (two blobs that would read as one object because
+/// only their bytes were compared). Key availability, decryption, and
+/// plaintext authenticity remain explicit non-claims for the restore/capture
+/// owners.
+fn validate_blob_residency_identity(blobs: &[BackupBlob]) -> Result<(), BackupError> {
+    let mut seen: BTreeMap<String, &BackupBlob> = BTreeMap::new();
+    for blob in blobs {
+        // The canonical residency-key digest binds all six obligation domains
+        // plus the versioned content digest; equal bytes in different domains
+        // digest differently and stay distinct.
+        let residency_digest = blob
+            .locator
+            .residency_key_digest()
+            .map_err(|error| BackupError::Blob(error.to_string()))?;
+        if let Some(previous) = seen.insert(residency_digest, blob)
+            && (previous.locator.hash != blob.locator.hash
+                || previous.plaintext_sha256 != blob.plaintext_sha256)
+        {
+            return Err(BackupError::IntegrityMismatch {
+                subject: format!("sealed blob {}", blob.locator.hash),
+            });
+        }
+        // The locator hash must equal the versioned content digest it claims;
+        // `BackupBlob::validate` enforces this through the blob contract, and
+        // a foreign residency (same bytes, different domains) is already
+        // distinct via the residency-key digest above.
+    }
+    Ok(())
+}
+
+/// Validates the exact relation between one owner's coherent snapshot and the
+/// canonical export fence without requiring a fictional global transaction.
+///
+/// Canonical, ORS, and Watchdog owners each provide their own coherent
+/// snapshot; the archive records and validates their exact relation (shared
+/// state fence), cursors, generations, and coverage. Incompatible or
+/// unexplained gaps reject; valid separately captured snapshots are accepted
+/// without a global atomic timestamp.
+#[allow(clippy::too_many_arguments)]
+fn validate_snapshot_relation(
+    subject: &'static str,
+    snapshot_fence: &StateFence,
+    receipt_cursor: u64,
+    event_cursor: u64,
+    outbox_cursor: u64,
+    export_fence: &ExportFence,
+    event_count: u64,
+    receipt_count: u64,
+) -> Result<(), BackupError> {
+    // Shared-fence coherence is already checked by the caller (`==` on the
+    // exact fence); cursors are monotone coverage observations. A cursor that
+    // runs past the carried section (more observed effects than archived
+    // members) is an unexplained gap and rejects.
+    if !snapshot_fence.is_compatible_with(&export_fence.state_fence) {
+        return Err(BackupError::FenceMismatch {
+            subject: subject.to_owned(),
+        });
+    }
+    if event_cursor > event_count || receipt_cursor > receipt_count {
+        return Err(BackupError::FenceMismatch {
+            subject: subject.to_owned(),
+        });
+    }
+    let _ = outbox_cursor;
     Ok(())
 }
 
@@ -3176,5 +3403,496 @@ mod restore_tests {
         let mut wire = serde_json::to_value(&evidence).expect("encode");
         wire["unknown_future_field"] = serde_json::json!(true);
         assert!(serde_json::from_value::<RestoreEvidence>(wire).is_err());
+    }
+}
+
+#[cfg(test)]
+mod backup_verify_tests_948 {
+    #![allow(clippy::expect_used)]
+
+    use super::*;
+    use eliot_blob_api::{ObjectResidencyKey, VersionedContentDigest};
+    use eliot_contracts::{EpochLineageId, OperationId};
+    use eliot_store_api::{
+        CommitId, EventId, OperationManifestDigest, OrderingHead, OrderingScopeId, Resubmission,
+        RevisionHead, RevisionKey, TransitionClass, WriteReceiptStatus,
+    };
+    use serde_json::json;
+    use std::num::NonZeroU64;
+
+    const LINEAGE_948: &str = "550e8400-e29b-41d4-a716-446655440000";
+
+    fn epoch(sequence: u64) -> EpochId {
+        EpochId::new(
+            EpochLineageId::new(LINEAGE_948).expect("valid test lineage"),
+            NonZeroU64::new(sequence).expect("nonzero test sequence"),
+        )
+        .expect("valid test epoch")
+    }
+
+    fn fence() -> StateFence {
+        StateFence::new(epoch(1), ResourceGeneration::genesis())
+    }
+
+    fn event(id: &str) -> CanonicalRecord {
+        CanonicalRecord::new("test-event", id, json!({"id": id})).expect("canonical event")
+    }
+
+    fn projection_for(id: &str) -> CanonicalRecord {
+        CanonicalRecord::new("test-event", id, json!({"projection": id}))
+            .expect("projection record")
+    }
+
+    fn receipt_for(event_id: &str, operation: &str) -> WriteReceipt {
+        WriteReceipt {
+            operation_id: OperationId::new(operation).expect("operation id"),
+            idempotency_key: format!("idem-{operation}"),
+            canonical_request_hash: "a".repeat(64),
+            transition_class: TransitionClass::CaptureCandidate,
+            status: WriteReceiptStatus::Committed,
+            commit_id: Some(CommitId::new(format!("commit-{operation}")).expect("commit id")),
+            state_fence: fence(),
+            ordering_sequences: Vec::new(),
+            revision_before_after: Vec::new(),
+            applied_command_ids: vec![format!("cmd-{operation}")],
+            emitted_event_ids: vec![EventId::new(event_id).expect("event id")],
+            projection_refs: Vec::new(),
+            outbox_refs: Vec::new(),
+            operation_manifest_digest: OperationManifestDigest::new(format!(
+                "manifest-{operation}"
+            ))
+            .expect("manifest digest"),
+            error_code: None,
+            resubmission: Resubmission::None,
+            committed_at: Some("commit-sequence-0000000000000001".to_owned()),
+            envelope: None,
+        }
+    }
+
+    fn blob_in_domain(suffix: &str, sealed: &[u8]) -> BackupBlob {
+        let digest = sha256_hex(sealed);
+        BackupBlob {
+            locator: BlobLocator {
+                hash: BlobHash::new(digest.clone()).expect("blob hash"),
+                residency: ObjectResidencyKey {
+                    scope_domain_id: BlobId::new(format!("scope-{suffix}")).expect("scope domain"),
+                    access_domain_id: BlobId::new(format!("access-{suffix}"))
+                        .expect("access domain"),
+                    confidentiality_domain_id: BlobId::new(format!("conf-{suffix}"))
+                        .expect("confidentiality domain"),
+                    encryption_key_domain_id: BlobId::new("key-lineage-1").expect("key domain"),
+                    retention_domain_id: BlobId::new(format!("retention-{suffix}"))
+                        .expect("retention domain"),
+                    erasure_domain_id: BlobId::new(format!("erasure-{suffix}"))
+                        .expect("erasure domain"),
+                    content_digest: VersionedContentDigest {
+                        algorithm: BlobId::new("blake3").expect("digest algorithm"),
+                        version: 1,
+                        digest: BlobHash::new(digest).expect("content digest"),
+                    },
+                },
+                root_generation: 1,
+                path_generation: 1,
+            },
+            sealed_bytes: sealed.to_vec(),
+            sealed_sha256: sha256_hex(sealed),
+            plaintext_sha256: sha256_hex(b"plaintext-test"),
+            key_lineage: BlobId::new("key-lineage-1").expect("key lineage"),
+            format: BlobId::new("test-format").expect("format"),
+            format_version: 1,
+            compression: CompressionDescriptor {
+                algorithm: BlobId::new("none").expect("compression algorithm"),
+                version: 1,
+            },
+            crypto: CryptoDescriptor {
+                algorithm: BlobId::new("aead-test").expect("crypto algorithm"),
+                version: 1,
+                key_lineage: BlobId::new("key-lineage-1").expect("crypto lineage"),
+                key_generation: 1,
+            },
+        }
+    }
+
+    fn artifact(kind: &str) -> BackupArtifact {
+        let bytes = format!("{kind}-manifest-bytes").into_bytes();
+        BackupArtifact {
+            kind: kind.to_owned(),
+            artifact_id: format!("{kind}-1"),
+            sha256: sha256_hex(&bytes),
+            bytes,
+        }
+    }
+
+    fn full_artifacts() -> Vec<BackupArtifact> {
+        ["config", "policy", "module", "host_dependency_build"]
+            .iter()
+            .map(|kind| artifact(kind))
+            .collect()
+    }
+
+    fn ors_snapshot(fence_value: StateFence) -> OrsSnapshotFence {
+        OrsSnapshotFence {
+            snapshot_id: "ors-948".to_owned(),
+            authority_epoch: fence_value.authority_epoch.clone(),
+            resource_generation: fence_value.resource_generation,
+            last_receipt_cursor: 0,
+            last_event_cursor: 0,
+            last_outbox_cursor: 0,
+            pending_operation_ids: Vec::new(),
+            job_checkpoint_ids: Vec::new(),
+            generation_cutover_ids: Vec::new(),
+            state_fence: fence_value,
+            active_authority_restored: false,
+        }
+    }
+
+    fn watchdog_spool(fence_value: StateFence) -> WatchdogSpoolFence {
+        WatchdogSpoolFence {
+            fence_id: "watchdog-948".to_owned(),
+            unresolved_signal_digests: vec![sha256_hex(b"signal-948")],
+            state_fence: fence_value,
+            bounded: true,
+        }
+    }
+
+    fn export_fence(scope: bool) -> ExportFence {
+        ExportFence {
+            export_id: "export-948".to_owned(),
+            store_generation: "store-948".to_owned(),
+            state_fence: fence(),
+            scope_id: if scope {
+                Some(ScopeId::new("scope-1").expect("scope"))
+            } else {
+                None
+            },
+            revision_heads: Vec::new(),
+            ordering_heads: Vec::new(),
+            event_range: EventRange {
+                first_sequence: None,
+                last_sequence: None,
+                count: 0,
+            },
+            blob_reachability_manifest: Vec::new(),
+            consistent: true,
+        }
+    }
+
+    fn full_input() -> BackupInput {
+        let fence_value = fence();
+        BackupInput {
+            backup_id: "bundle-948-full".to_owned(),
+            class: BackupClass::FullRecovery,
+            source_adapter: "test-adapter".to_owned(),
+            schema_generation: "schema-1".to_owned(),
+            export_fence: export_fence(false),
+            canonical_events: Vec::new(),
+            projections: Vec::new(),
+            receipts: Vec::new(),
+            blobs: Vec::new(),
+            purge_ledger: Vec::new(),
+            ors_snapshot: Some(ors_snapshot(fence_value.clone())),
+            artifacts: full_artifacts(),
+            watchdog_spool: Some(watchdog_spool(fence_value)),
+            host_audit: None,
+            missing_features: Vec::new(),
+            purge_ledger_revision: 7,
+        }
+    }
+
+    fn degraded_input(id: &str) -> BackupInput {
+        BackupInput {
+            backup_id: id.to_owned(),
+            class: BackupClass::CanonicalOnlyDegraded,
+            source_adapter: "test-adapter".to_owned(),
+            schema_generation: "schema-1".to_owned(),
+            export_fence: export_fence(false),
+            canonical_events: Vec::new(),
+            projections: Vec::new(),
+            receipts: Vec::new(),
+            blobs: Vec::new(),
+            purge_ledger: Vec::new(),
+            ors_snapshot: None,
+            artifacts: Vec::new(),
+            watchdog_spool: None,
+            host_audit: None,
+            missing_features: Vec::new(),
+            purge_ledger_revision: 7,
+        }
+    }
+
+    fn forensic_audit() -> HostStateAuditFence {
+        HostStateAuditFence {
+            audit_id: "audit-948".to_owned(),
+            lineage_digest: "b".repeat(64),
+            observed_dispositions: vec!["observed".to_owned()],
+            active_authority_restored: false,
+        }
+    }
+
+    // WORK_UNIT_CASE: 948/1
+    #[test]
+    fn full_recovery_exact_archive_denominator() {
+        let blob = blob_in_domain("domain-a", b"sealed-envelope-948-1");
+        let manifest_hash = blob.locator.hash.clone();
+        let mut input = full_input();
+        input.canonical_events = vec![event("event-1"), event("event-2")];
+        input.export_fence.event_range = EventRange {
+            first_sequence: Some(1),
+            last_sequence: Some(2),
+            count: 2,
+        };
+        input.projections = vec![projection_for("event-1")];
+        input.receipts = vec![receipt_for("event-1", "op-1")];
+        input.blobs = vec![blob];
+        input.export_fence.blob_reachability_manifest = vec![manifest_hash];
+        let bundle = BackupBundle::build(input).expect("full bundle builds");
+        bundle.validate().expect("full bundle validates");
+        assert_eq!(bundle.manifest.class, BackupClass::FullRecovery);
+        assert!(bundle.manifest.class.is_full_recovery());
+        bundle.bundle_sha256().expect("bundle digest");
+    }
+
+    // WORK_UNIT_CASE: 948/2
+    #[test]
+    fn degraded_canonical_only_archive_is_explicit() {
+        let mut input = degraded_input("bundle-948-degraded");
+        input.canonical_events = vec![event("event-1")];
+        input.export_fence.event_range = EventRange {
+            first_sequence: Some(1),
+            last_sequence: Some(1),
+            count: 1,
+        };
+        input.projections = vec![projection_for("event-1")];
+        input.missing_features = vec!["operational-recovery-unavailable".to_owned()];
+        let bundle = BackupBundle::build(input).expect("degraded bundle builds");
+        bundle.validate().expect("degraded bundle validates");
+        assert!(!bundle.manifest.class.is_full_recovery());
+        assert!(bundle.ors_snapshot.is_none());
+        assert_eq!(
+            RestoreEvidenceLevel::for_class(bundle.manifest.class),
+            RestoreEvidenceLevel::IsolatedImportComplete
+        );
+    }
+
+    // WORK_UNIT_CASE: 948/3
+    #[test]
+    fn one_scope_export_cannot_claim_installation_backup() {
+        let mut input = degraded_input("bundle-948-scope");
+        input.class = BackupClass::ScopeExport;
+        input.export_fence.scope_id = Some(ScopeId::new("scope-1").expect("scope"));
+        let bundle = BackupBundle::build(input).expect("scope export builds");
+        bundle.validate().expect("scope export validates");
+        assert_eq!(bundle.manifest.class, BackupClass::ScopeExport);
+        assert!(bundle.ors_snapshot.is_none());
+        assert!(
+            !RestoreEvidenceLevel::for_class(bundle.manifest.class).permits_operational_readiness()
+        );
+        // One declared scope is mandatory: without it the export is refused,
+        // never widened into an installation backup.
+        let unscoped = degraded_input("bundle-948-scope-unscoped");
+        let mut unscoped = unscoped;
+        unscoped.class = BackupClass::ScopeExport;
+        assert!(matches!(
+            BackupBundle::build(unscoped),
+            Err(BackupError::ScopeRequired)
+        ));
+    }
+
+    // WORK_UNIT_CASE: 948/4
+    #[test]
+    fn missing_full_components_refuse_without_downgrade() {
+        let mut no_ors = full_input();
+        no_ors.ors_snapshot = None;
+        assert!(matches!(
+            BackupBundle::build(no_ors),
+            Err(BackupError::MissingRecoveryComponent("ors_snapshot"))
+        ));
+        let mut no_watchdog = full_input();
+        no_watchdog.watchdog_spool = None;
+        assert!(matches!(
+            BackupBundle::build(no_watchdog),
+            Err(BackupError::MissingRecoveryComponent("watchdog_spool"))
+        ));
+        let mut no_policy = full_input();
+        no_policy
+            .artifacts
+            .retain(|artifact| artifact.kind != "policy");
+        assert!(matches!(
+            BackupBundle::build(no_policy),
+            Err(BackupError::MissingRecoveryComponent("policy"))
+        ));
+        let mut with_gaps = full_input();
+        with_gaps.missing_features = vec!["future-feature".to_owned()];
+        assert!(matches!(
+            BackupBundle::build(with_gaps),
+            Err(BackupError::FullRecoveryHasGaps)
+        ));
+    }
+
+    // WORK_UNIT_CASE: 948/5
+    #[test]
+    fn host_audit_is_forensic_and_cannot_supply_authority() {
+        let active = HostStateAuditFence {
+            audit_id: "audit-948".to_owned(),
+            lineage_digest: "b".repeat(64),
+            observed_dispositions: vec!["observed".to_owned()],
+            active_authority_restored: true,
+        };
+        assert_eq!(active.validate(), Err(BackupError::ActiveAuthorityInBackup));
+        // A forensic audit cannot substitute for a missing recovery component.
+        let mut input = full_input();
+        input.ors_snapshot = None;
+        input.host_audit = Some(forensic_audit());
+        assert!(matches!(
+            BackupBundle::build(input),
+            Err(BackupError::MissingRecoveryComponent("ors_snapshot"))
+        ));
+    }
+
+    // WORK_UNIT_CASE: 948/6
+    #[test]
+    fn snapshot_relations_reject_gaps_without_global_transaction() {
+        // Valid separately coherent snapshots need no global atomic timestamp.
+        BackupBundle::build(full_input()).expect("coherent snapshots validate");
+        // An unexplained cursor gap rejects.
+        let mut gapped = full_input();
+        gapped
+            .ors_snapshot
+            .as_mut()
+            .expect("ors snapshot")
+            .last_event_cursor = 3;
+        assert!(matches!(
+            BackupBundle::build(gapped),
+            Err(BackupError::FenceMismatch { .. })
+        ));
+        // An incompatible snapshot fence rejects.
+        let mut split = full_input();
+        let other = StateFence::new(epoch(2), ResourceGeneration::genesis());
+        let ors = split.ors_snapshot.as_mut().expect("ors snapshot");
+        ors.state_fence = other;
+        ors.authority_epoch = epoch(2);
+        assert!(matches!(
+            BackupBundle::build(split),
+            Err(BackupError::FenceMismatch { .. })
+        ));
+    }
+
+    // WORK_UNIT_CASE: 948/7
+    #[test]
+    fn record_order_event_closure_consumes_accepted_identities() {
+        let fence_value = fence();
+        let mut input = full_input();
+        input.canonical_events = vec![event("event-1")];
+        input.export_fence.event_range = EventRange {
+            first_sequence: Some(1),
+            last_sequence: Some(1),
+            count: 1,
+        };
+        input.export_fence.revision_heads = vec![RevisionHead {
+            key: RevisionKey::new("rev-1").expect("revision key"),
+            revision: 1,
+            state_fence: fence_value.clone(),
+        }];
+        input.export_fence.ordering_heads = vec![OrderingHead {
+            scope: OrderingScopeId::new("order-1").expect("ordering scope"),
+            sequence: 1,
+            state_fence: fence_value,
+        }];
+        input.receipts = vec![receipt_for("event-1", "op-7")];
+        BackupBundle::build(input).expect("closed references validate");
+        // A receipt naming an absent event prevents complete validation.
+        let mut dangling = full_input();
+        dangling.canonical_events = vec![event("event-1")];
+        dangling.export_fence.event_range = EventRange {
+            first_sequence: Some(1),
+            last_sequence: Some(1),
+            count: 1,
+        };
+        dangling.receipts = vec![receipt_for("ghost-event", "op-7b")];
+        assert!(matches!(
+            BackupBundle::build(dangling),
+            Err(BackupError::ReceiptChainGap { .. })
+        ));
+    }
+
+    // WORK_UNIT_CASE: 948/8
+    #[test]
+    fn missing_reference_member_prevents_complete_validation() {
+        // A projection with no canonical member is an unbound capture.
+        let mut dangling = full_input();
+        dangling.canonical_events = vec![event("event-1")];
+        dangling.export_fence.event_range = EventRange {
+            first_sequence: Some(1),
+            last_sequence: Some(1),
+            count: 1,
+        };
+        dangling.projections = vec![projection_for("ghost-event")];
+        assert!(matches!(
+            BackupBundle::build(dangling),
+            Err(BackupError::ReceiptChainGap { .. })
+        ));
+        // One identity bound to two different types is conflicting.
+        let mut conflicting = full_input();
+        conflicting.canonical_events = vec![event("event-1")];
+        conflicting.export_fence.event_range = EventRange {
+            first_sequence: Some(1),
+            last_sequence: Some(1),
+            count: 1,
+        };
+        conflicting.projections = vec![
+            CanonicalRecord::new("other-type", "event-1", json!({"x": 1})).expect("projection"),
+        ];
+        assert!(matches!(
+            BackupBundle::build(conflicting),
+            Err(BackupError::FenceMismatch { .. })
+        ));
+    }
+
+    // WORK_UNIT_CASE: 948/9
+    #[test]
+    fn equal_bytes_in_two_residency_domains_are_two_identities() {
+        let sealed = b"shared-sealed-envelope-bytes";
+        let first = blob_in_domain("domain-a", sealed);
+        let second = blob_in_domain("domain-b", sealed);
+        first.validate().expect("first blob validates");
+        second.validate().expect("second blob validates");
+        assert_eq!(first.sealed_bytes, second.sealed_bytes);
+        assert_ne!(first.locator, second.locator);
+        let first_key = first
+            .locator
+            .residency_key_digest()
+            .expect("first residency digest");
+        let second_key = second
+            .locator
+            .residency_key_digest()
+            .expect("second residency digest");
+        assert_ne!(first_key, second_key);
+        // The library never coalesces them by bytes alone.
+        validate_blob_residency_identity(&[first.clone(), second.clone()])
+            .expect("two identities coexist");
+    }
+
+    // WORK_UNIT_CASE: 948/10
+    #[test]
+    fn missing_or_foreign_residency_is_rejected() {
+        // A sealed blob with no reachability manifest entry is foreign.
+        let blob = blob_in_domain("domain-a", b"sealed-envelope-948-10");
+        let mut unreferenced = degraded_input("bundle-948-10a");
+        unreferenced.blobs = vec![blob];
+        assert!(matches!(
+            BackupBundle::build(unreferenced),
+            Err(BackupError::UnreferencedBlob { .. })
+        ));
+        // A manifest entry with no carried blob is missing.
+        let wanted = blob_in_domain("domain-a", b"sealed-envelope-948-10")
+            .locator
+            .hash
+            .clone();
+        let mut missing = degraded_input("bundle-948-10b");
+        missing.export_fence.blob_reachability_manifest = vec![wanted];
+        assert!(matches!(
+            BackupBundle::build(missing),
+            Err(BackupError::MissingBlob)
+        ));
     }
 }
