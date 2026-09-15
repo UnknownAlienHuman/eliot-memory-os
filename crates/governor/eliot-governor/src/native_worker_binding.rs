@@ -307,3 +307,62 @@ impl NativeWorkerExecutableBinding {
         Ok(sha256_hex(&self.unsigned_bytes()?))
     }
 }
+
+/// Computes the R1 production `process_invocation_digest` over the exact
+/// process invocation value.
+///
+/// Pure projection helper for the T9-01 production caller
+/// (`GovernorComposition::publish_native_worker_binding`): canonicalizes the
+/// exact invocation JSON with the same `canonical_json_bytes` + `sha256_hex`
+/// the wire uses, so the published binding carries the real invocation
+/// digest, never a placeholder. This changes no signing, no authority, and
+/// no digest scheme; it only gives production callers the one correct way to
+/// derive the field.
+#[allow(
+    dead_code,
+    reason = "R1 derivation helper: the composition publish caller wires in the Governor integration wave; unit-proofed here"
+)]
+pub fn process_invocation_digest_for(invocation: &serde_json::Value) -> Result<String, String> {
+    let bytes = canonical_json_bytes(invocation)
+        .map_err(|error| format!("cannot canonicalize process invocation: {error}"))?;
+    Ok(sha256_hex(&bytes))
+}
+
+#[cfg(test)]
+mod tests {
+    #![allow(
+        clippy::expect_used,
+        clippy::unwrap_used,
+        reason = "tests use expects for fixed-valid binding fixtures"
+    )]
+
+    use super::*;
+
+    #[test]
+    fn invocation_digest_is_stable_and_lowercase_sha256() {
+        let invocation = serde_json::json!({
+            "operation": "op-1",
+            "argv": ["--check"],
+            "fence": {"generation": 1},
+        });
+        let first = process_invocation_digest_for(&invocation).expect("digest");
+        let second = process_invocation_digest_for(&invocation).expect("digest");
+        assert_eq!(first, second);
+        assert_eq!(first.len(), 64);
+        assert!(
+            first
+                .bytes()
+                .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase()),
+            "digest must be lowercase SHA-256"
+        );
+    }
+
+    #[test]
+    fn invocation_digest_changes_when_invocation_changes() {
+        let base = serde_json::json!({"operation": "op-1", "argv": ["--check"]});
+        let changed = serde_json::json!({"operation": "op-1", "argv": ["--other"]});
+        let base_digest = process_invocation_digest_for(&base).expect("digest");
+        let changed_digest = process_invocation_digest_for(&changed).expect("digest");
+        assert_ne!(base_digest, changed_digest);
+    }
+}
