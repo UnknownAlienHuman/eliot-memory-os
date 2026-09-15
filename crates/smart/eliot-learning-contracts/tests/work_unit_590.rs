@@ -655,6 +655,7 @@ fn exactly_two_successful_attempt_learning_outcome_arms() {
 
 // WORK_UNIT_CASE: 590/3
 #[test]
+#[allow(clippy::too_many_lines)]
 fn exact_lifecycle_predecessor_vocabulary() {
     let expected: &[(LifecycleStage, &str, Option<LifecycleStage>)] = &[
         (
@@ -2835,6 +2836,7 @@ fn objective_evaluator_holdout_authority_privacy_cost_generation_smuggling_rejec
 
 // WORK_UNIT_CASE: 590/49
 #[test]
+#[allow(clippy::too_many_lines)]
 fn every_collection_string_item_output_work_boundary_and_one_over() {
     // Delta changes: 1..=128.
     let delta = valid_delta("c49");
