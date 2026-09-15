@@ -541,7 +541,7 @@ fn check_committed_receipt(
                 StoreMutationDisposition::NotAttempted,
                 StoreRetryDirective::DoNotRetry,
                 StoreRecoveryAction::None,
-                &ctx,
+                ctx,
             )?;
             return Err(TaskLifecycleError::Store(failure));
         }
@@ -554,7 +554,7 @@ fn check_committed_receipt(
                 StoreMutationDisposition::NotAttempted,
                 StoreRetryDirective::DoNotRetry,
                 StoreRecoveryAction::None,
-                &ctx,
+                ctx,
             )?;
             return Err(TaskLifecycleError::Store(failure));
         }
@@ -567,7 +567,7 @@ fn check_committed_receipt(
                         StoreMutationDisposition::NotAttempted,
                         StoreRetryDirective::ManualRecovery,
                         StoreRecoveryAction::EscalateInternalDefect,
-                        &ctx,
+                        ctx,
                     )?;
                     return Err(TaskLifecycleError::Store(failure));
                 }
@@ -596,7 +596,7 @@ fn check_committed_receipt(
                 StoreMutationDisposition::NotAttempted,
                 retry,
                 recovery,
-                &ctx,
+                ctx,
             )?;
             return Err(TaskLifecycleError::Store(failure));
         }
