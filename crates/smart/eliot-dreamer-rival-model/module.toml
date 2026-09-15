@@ -1,7 +1,7 @@
 schema_version = 2
 module_id = "smart.dreamer.rival_model"
 crate = "eliot-dreamer-rival-model"
-status = "PROTOTYPE"
+status = "ADMITTED"
 wave = "cognitive-micromodules-wave-01"
 agent_order = 16
 plane = "Smart"
@@ -49,7 +49,7 @@ stop_condition = "Stop if selecting a winner is required; return the unresolved 
 integration_owner = "cognitive-wave-01-integrator"
 implementation_language = "Rust 2024"
 required_verification = ["package proof", "orientation/clarification edge fixtures", "Orientation Product Pulse"]
-workspace_admission = "forbidden until src/lib.rs, package proof and Orientation Product Pulse pass"
+workspace_admission = "admitted via #836 (T8-A4) root workspace membership"
 
 # Acceptance is decided by the owning contract and independent review
 # (I0.10: line/test/type counts are not goals). `scripts/verify-work-unit.py`
