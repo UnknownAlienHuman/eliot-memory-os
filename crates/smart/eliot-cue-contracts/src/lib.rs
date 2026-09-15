@@ -47,6 +47,7 @@ mod normalization;
 mod observation;
 mod relation;
 mod snapshot;
+mod version;
 
 pub use activation::{
     ActivationBounds, ActivationBoundsSpec, ActivationRequest, ActivationRequestSpec,
@@ -75,6 +76,10 @@ pub use normalization::{
 pub use observation::{ObservedCue, SourceHandle};
 pub use relation::RelationEdge;
 pub use snapshot::{CueSnapshot, RebuildIdentity, SnapshotMember};
+pub use version::{
+    ClosedSnapshotRow, ConversionDisposition, CueComparisonKey, CueProjectionDenominator,
+    CueSourceValue, MAX_EDGE_WEIGHT_MILLI, SnapshotEdgeWeight, cue_row_id,
+};
 
 /// Schema revision of this vocabulary. A change to any wire shape changes it.
 pub const CONTRACT_REVISION: &str = "2.0.0";

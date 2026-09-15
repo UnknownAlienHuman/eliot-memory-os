@@ -284,3 +284,110 @@ fn bounds_and_envelope_binding_reject_tampering() -> TestResult {
     assert!(json.get("normalized").is_some());
     Ok(())
 }
+
+fn named_policy(id: &str, kind: CueKind, rule: NormalizationRule) -> NormalizationPolicy {
+    NormalizationPolicy::sealed(
+        "a11-test-policy-owner".to_owned(),
+        id.to_owned(),
+        1,
+        profile(),
+        WorkScopeId::new("scope-1").expect("scope"),
+        fence(),
+        vec![PolicyRule { kind, rule }],
+    )
+    .expect("sealed policy")
+}
+
+#[test]
+fn same_spelling_under_case_policies_keeps_source_but_splits_keys() -> TestResult {
+    let sensitive = named_policy(
+        "policy-case-sensitive",
+        CueKind::FilePath,
+        NormalizationRule::Path {
+            case: CasePolicy::Preserve,
+            separators: SeparatorPolicy::Slash,
+            match_mode: eliot_cue_contracts::MatchMode::Exact,
+        },
+    );
+    let folded = named_policy(
+        "policy-case-insensitive",
+        CueKind::FilePath,
+        NormalizationRule::Path {
+            case: CasePolicy::AsciiInsensitive,
+            separators: SeparatorPolicy::Slash,
+            match_mode: eliot_cue_contracts::MatchMode::Exact,
+        },
+    );
+    let input = observed(CueKind::FilePath, "Src/Main.rs");
+    let kept = capture_cue(&input, &sensitive, &sensitive.profile)?;
+    let lowered = capture_cue(&input, &folded, &folded.profile)?;
+
+    for envelope in [&kept, &lowered] {
+        assert_eq!(envelope.normalized.observed.original_value, "Src/Main.rs");
+        assert_eq!(
+            envelope
+                .normalized
+                .canonical
+                .as_ref()
+                .expect("canonical")
+                .canonical_value,
+            "Src/Main.rs"
+        );
+    }
+    let kept_source = eliot_cue_normalizer::source_value(&input, &sensitive)?;
+    let lowered_source = eliot_cue_normalizer::source_value(&input, &folded)?;
+    assert_eq!(kept_source.canonical_spelling, "Src/Main.rs");
+    assert_eq!(
+        kept_source.canonical_spelling,
+        lowered_source.canonical_spelling
+    );
+    assert_ne!(
+        kept_source.comparison_policy_ref,
+        lowered_source.comparison_policy_ref
+    );
+
+    let kept_key = eliot_cue_normalizer::comparison_key(&kept.normalized)?;
+    let lowered_key = eliot_cue_normalizer::comparison_key(&lowered.normalized)?;
+    assert_eq!(kept_key.normalized_value, "Src/Main.rs");
+    assert_eq!(lowered_key.normalized_value, "src/main.rs");
+    assert_eq!(kept_key.scope, "scope-1");
+    assert_eq!(kept_key.kind, CueKind::FilePath);
+    kept_key.validate().expect("valid key");
+    lowered_key.validate().expect("valid key");
+    Ok(())
+}
+
+#[test]
+fn error_signatures_round_trip_byte_identical() -> TestResult {
+    let p = named_policy(
+        "policy-signatures",
+        CueKind::ErrorSignature,
+        NormalizationRule::Signature {
+            algorithm_ref: "owner.signature.v1".to_owned(),
+            prefix: "sig:".to_owned(),
+            hex_length: 8,
+        },
+    );
+    let input = observed(CueKind::ErrorSignature, "sig:deadbeef");
+    let result = capture_cue(&input, &p, &p.profile)?;
+    let canonical = result
+        .normalized
+        .canonical
+        .as_ref()
+        .expect("canonical")
+        .canonical_value
+        .clone();
+    assert_eq!(canonical, "sig:deadbeef");
+    assert_eq!(result.normalized.comparison_keys[0].key_value, canonical);
+    assert_eq!(
+        result.normalized.comparison_keys[0].match_mode,
+        eliot_cue_contracts::MatchMode::Signature
+    );
+
+    let source = eliot_cue_normalizer::source_value(&input, &p)?;
+    assert_eq!(source.canonical_spelling, "sig:deadbeef");
+    let key = eliot_cue_normalizer::comparison_key(&result.normalized)?;
+    assert_eq!(key.normalized_value, "sig:deadbeef");
+    assert_eq!(key.mode, eliot_cue_contracts::MatchMode::Signature);
+    Ok(())
+}

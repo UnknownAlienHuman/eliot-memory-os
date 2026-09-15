@@ -328,11 +328,7 @@ fn foreign_fence_row_is_cold_without_candidate_claim() {
         test_epoch(),
         ResourceGeneration::new(2).expect("generation"),
     );
-    rows[0].change.observation_digest = rows[0]
-        .change
-        .observation
-        .digest()
-        .expect("change digest");
+    rows[0].change.observation_digest = rows[0].change.observation.digest().expect("change digest");
     let result = eliot_cue_binding::derive_cue_binding_candidates(&receipt, &rows, None, &profile)
         .expect("derive");
     assert!(result.candidates.is_empty());
@@ -374,4 +370,49 @@ fn foreign_origin_link_is_retained_as_cold() {
         result.outcome,
         eliot_cue_binding::BindingOutcome::CandidatesForSuppliedInputs
     );
+}
+
+fn candidate(
+    kind: eliot_cue_contracts::CueKind,
+    value: &str,
+    seed: u8,
+) -> eliot_cue_contracts::CueBindingCandidate {
+    eliot_cue_contracts::CueBindingCandidate::new(
+        eliot_cue_contracts::BindingCandidateId::new(format!("candidate-{seed}"))
+            .expect("candidate id"),
+        eliot_cue_contracts::CanonicalCueIdentity::new(
+            eliot_cue_contracts::CanonicalCueId::new(format!("canonical-{seed}"))
+                .expect("canonical id"),
+            kind,
+            value.to_owned(),
+            seeded(seed),
+        ),
+        eliot_cue_contracts::TargetHandle::new("src/target.rs").expect("target"),
+        eliot_cue_contracts::BindingRole::Names,
+        EvidenceFreshness::ExactCandidate,
+        BindingDisposition::Withheld,
+        seeded(seed + 40),
+    )
+}
+
+#[test]
+fn same_text_in_symbol_and_concept_binds_distinct_row_identities() {
+    let symbol = candidate(CueKind::Symbol, "Task", 1);
+    let concept = candidate(CueKind::Concept, "Task", 2);
+    let symbol_id = eliot_cue_binding::binding_row_id(
+        &symbol,
+        "scope",
+        eliot_cue_contracts::MatchMode::Exact,
+        "task",
+    )
+    .expect("symbol row id");
+    let concept_id = eliot_cue_binding::binding_row_id(
+        &concept,
+        "scope",
+        eliot_cue_contracts::MatchMode::Exact,
+        "task",
+    )
+    .expect("concept row id");
+    assert_ne!(symbol_id, concept_id);
+    assert!(symbol_id.starts_with("cuev2:"));
 }

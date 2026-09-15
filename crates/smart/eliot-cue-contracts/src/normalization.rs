@@ -389,17 +389,9 @@ impl NormalizedCue {
                     field: "comparison_keys",
                 });
             }
-            if !matches!(
-                (
-                    self.canonical.as_ref().map(|value| value.kind),
-                    key.match_mode
-                ),
-                (_, MatchMode::Exact)
-                    | (
-                        Some(CueKind::FilePath | CueKind::DirPath),
-                        MatchMode::Prefix
-                    )
-                    | (Some(CueKind::ErrorSignature), MatchMode::Signature)
+            if !mode_admissible(
+                self.canonical.as_ref().map(|value| value.kind),
+                key.match_mode,
             ) {
                 return Err(CueContractError::Foundation {
                     field: "comparison_key.match_mode",
@@ -484,6 +476,22 @@ impl NormalizedCue {
         }
         Ok(())
     }
+}
+
+/// Whether a match mode is admissible for a cue kind.
+///
+/// Shared by comparison-key validation and the frozen v2 row-identity
+/// function so the two can never disagree about which combinations exist.
+pub(crate) const fn mode_admissible(kind: Option<CueKind>, mode: MatchMode) -> bool {
+    matches!(
+        (kind, mode),
+        (_, MatchMode::Exact)
+            | (
+                Some(CueKind::FilePath | CueKind::DirPath),
+                MatchMode::Prefix
+            )
+            | (Some(CueKind::ErrorSignature), MatchMode::Signature)
+    )
 }
 
 fn validate_text(value: &str, field: &'static str) -> Result<(), CueContractError> {
