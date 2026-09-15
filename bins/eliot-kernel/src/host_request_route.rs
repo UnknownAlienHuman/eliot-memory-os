@@ -49,7 +49,8 @@ use eliot_kernel_service::{AgentBridgeAdmissionDescriptor, KernelServiceState};
 use eliot_ors::{
     CONTRACT_VERSION as ORS_CONTRACT_VERSION, HostRequestKind as OrsHostRequestKind,
     HostRequestRecord, HostRequestState, OpaqueLabel, OperationIdentity, OrsError,
-};use eliot_protocol::{
+};
+use eliot_protocol::{
     AGENT_BRIDGE_PROCESS_BINDING_WIRE_ID, AgentActivationResolutionResult,
     AgentBridgePeerAdmissionReceipt, AgentBridgeProcessBinding, HOST_REQUEST_INVOKE_READ_WIRE_ID,
     HOST_REQUEST_RESULT_BODY_WIRE_ID, HostRequestAdmissionReceipt, HostRequestEnvelope,
@@ -1058,7 +1059,7 @@ pub(crate) fn host_request_tool_from_payload(
 /// when present, else the admitted `session_id` — never an MCP argument),
 /// `subject` is the exact `subject:<exact-subject>` selector (never free
 /// text, never blank), `max_records` is the explicit catalogue bound, and
-/// `intent_mode` is the presented snake_case query mode. `eliot.packet` is
+/// `intent_mode` is the presented `snake_case` query mode. `eliot.packet` is
 /// not a query and yields no selectors; the packet path keeps its
 /// admission-only behaviour untouched.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -1108,8 +1109,7 @@ pub(crate) fn local_read_selectors_from_tool(
         .get("mode")
         .and_then(serde_json::Value::as_str)
         .ok_or(TransportError::SessionFenced)?;
-    if mode.trim().is_empty() || mode.chars().any(char::is_control) || mode == "current_position"
-    {
+    if mode.trim().is_empty() || mode.chars().any(char::is_control) || mode == "current_position" {
         return Err(TransportError::SessionFenced);
     }
     if arguments
@@ -1656,10 +1656,8 @@ mod invoke_read_tool_tests {
         use eliot_contracts::{canonical_json_bytes, sha256_hex};
         let tool = query_tool();
         let envelope = test_envelope("eliot.query", &tool_digest(&tool));
-        let receipt =
-            HostRequestAdmissionReceipt::issue(&envelope).expect("receipt must issue");
-        let mut record =
-            requested_host_request_record(&envelope).expect("record must build");
+        let receipt = HostRequestAdmissionReceipt::issue(&envelope).expect("receipt must issue");
+        let mut record = requested_host_request_record(&envelope).expect("record must build");
 
         // A live row takes the fresh leg: no stored body, no replay.
         assert_eq!(
@@ -1676,8 +1674,7 @@ mod invoke_read_tool_tests {
             "evidence_pack": {"subject": "evidence-alpha"},
             "revision_heads": [{"key": "scope:kernel-session-1", "revision": 3}],
         });
-        let digest =
-            sha256_hex(&canonical_json_bytes(&body).expect("body must canonicalize"));
+        let digest = sha256_hex(&canonical_json_bytes(&body).expect("body must canonicalize"));
         record.result_digest = Some(digest.clone());
         record.result_response = Some(body.clone());
         let replayed = local_read_replay_response(&receipt, &record, &envelope)

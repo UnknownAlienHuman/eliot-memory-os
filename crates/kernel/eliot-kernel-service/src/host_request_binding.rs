@@ -273,9 +273,7 @@ impl AuthenticatedHostSession {
         store_payload: serde_json::Value,
     ) -> Result<(String, serde_json::Value), String> {
         if envelope.identity.capability != "eliot.query" {
-            return Err(
-                "presented capability is not the admitted local-read query".to_owned(),
-            );
+            return Err("presented capability is not the admitted local-read query".to_owned());
         }
         let mode = match intent_mode {
             "verification" => QueryMode::Verification,
@@ -285,9 +283,7 @@ impl AuthenticatedHostSession {
             "change_impact" => QueryMode::ChangeImpact,
             "context_reconstruction" => QueryMode::ContextReconstruction,
             _ => {
-                return Err(
-                    "query intent never admits GetEvidencePack for this mode".to_owned(),
-                );
+                return Err("query intent never admits GetEvidencePack for this mode".to_owned());
             }
         };
         if subject.trim().is_empty() || subject.chars().any(char::is_control) {
@@ -336,15 +332,13 @@ impl AuthenticatedHostSession {
             job: None,
             compatibility_correlation_hint: None,
         };
-        let body =
-            serde_json::to_value(&response).map_err(|error| error.to_string())?;
+        let body = serde_json::to_value(&response).map_err(|error| error.to_string())?;
         let encoded = serde_json::to_vec(&body).map_err(|error| error.to_string())?;
         if encoded.len() > HARD_STRUCTURED_RESPONSE_BYTES {
             return Err("result body exceeds the bounded response ceiling".to_owned());
         }
-        let digest = sha256_hex(
-            &canonical_json_bytes(&response).map_err(|error| error.to_string())?,
-        );
+        let digest =
+            sha256_hex(&canonical_json_bytes(&response).map_err(|error| error.to_string())?);
         HostRequestResultBody {
             wire_id: HOST_REQUEST_RESULT_BODY_WIRE_ID.to_owned(),
             wire_version: HostRequestResultBody::CONTRACT_VERSION,

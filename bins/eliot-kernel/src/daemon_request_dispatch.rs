@@ -14,11 +14,17 @@
 use super::*;
 #[path = "store_receipt_dispatch.rs"]
 mod store_receipt_dispatch;
+use std::collections::BTreeMap;
+
 use eliot_contracts::StateFence;
+use eliot_kernel_service::AuthenticatedHostSession;
+use eliot_ors::{OperationIdentity, OrsError};
+use eliot_protocol::{HostRequestEnvelope, host_request_operation_id};
 use eliot_store_api::{
-    CanonicalRequestView, NamedReadRequest, NamedReadResponse, OrderingHeadExpectation,
-    PreparedTransition, RequestMeta, RevisionHeadExpectation, StoreError, StoreGenesisRequest,
-    StoreRecoveryRequest, StoreRecoverySnapshot, WriteReceipt, verify_canonical_request_hash,
+    CanonicalRequestView, NamedReadOperation, NamedReadRequest, NamedReadResponse,
+    OrderingHeadExpectation, PreparedTransition, ReadConsistency, RequestMeta,
+    RevisionHeadExpectation, StoreError, StoreGenesisRequest, StoreRecoveryRequest,
+    StoreRecoverySnapshot, WriteReceipt, verify_canonical_request_hash,
 };
 use serde::Deserialize;
 
@@ -26,6 +32,19 @@ use serde::Deserialize;
 #[serde(deny_unknown_fields)]
 struct StoreNamedOperation {
     request: NamedReadRequest,
+}
+
+/// Closed local-read envelope for one admitted `eliot.query` (Implements #18).
+///
+/// Carries the exact admitted envelope plus the exact canonical tool bytes it
+/// admits — the same linkage-checked pair as the invoke-read frame payload —
+/// so the read leg re-proves capability + payload-digest binding before any
+/// Gateway IO. `eliot.packet` pairs decode here but are admitted, never read.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct LocalReadOperation {
+    envelope: HostRequestEnvelope,
+    tool: serde_json::Value,
 }
 
 #[derive(Deserialize)]
@@ -151,6 +170,7 @@ impl KernelComposition {
             }
             "receipt" => store_receipt_dispatch::dispatch(self, session, payload).await,
             "store_named" => self.store_named_operation(session, payload).await,
+            "local_read" => self.local_read_operation(session, payload).await,
             "daemon_degraded" => {
                 let reason = payload
                     .get("reason")
@@ -605,6 +625,126 @@ impl KernelComposition {
         Err(TransportError::SessionFenced)
     }
 
+    /// Executes one closed local read for an admitted `eliot.query`.
+    ///
+    /// The `local_read` kind is the GetEvidencePack-only sibling of
+    /// `store_named` on the same authenticated daemon session: no new
+    /// transport, pipe, or listener. Rejection happens before reading —
+    /// linkage plus closed selectors are proven (pure, no IO), then the full
+    /// admission gate runs, then an exact replay of a resulted operation
+    /// serves its stored bounded body without re-dispatch and without Gateway
+    /// IO. Only a fresh admitted query reaches the Gateway, over the admitted
+    /// fence with the explicit scope, exact subject, and catalogue-bound
+    /// `max_records`; the bounded answer is projected through the MCP
+    /// evidence-pack projection and persisted through the ORS result path, so
+    /// the bridge readback and later replays answer `Responded` with the exact
+    /// record instead of a bare `Accepted` admission. `eliot.packet` pairs
+    /// are admitted and returned honestly, never read on this leg.
+    #[cfg(windows)]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "the closed local-read leg keeps linkage, admission, replay, gateway, projection, and persistence joins in one audited order"
+    )]
+    async fn local_read_operation(
+        &self,
+        session: &Session,
+        payload: serde_json::Value,
+    ) -> Result<serde_json::Value, TransportError> {
+        // Closed decode first: unknown fields never reach the read leg.
+        let operation: LocalReadOperation =
+            serde_json::from_value(payload).map_err(|_| TransportError::SessionFenced)?;
+        let envelope = operation.envelope;
+        let tool = operation.tool;
+        // Rejection-before-reading: linkage plus closed selectors next. This
+        // validation is pure, so a changed payload digest, a forged
+        // descriptor, or a malformed selector never reaches Gateway IO.
+        let selectors = host_request_route::check_local_read_admission(&envelope, &tool)?;
+        let (receipt, record) = self.admit_host_request_envelope(&envelope)?;
+        if let Some(replayed) =
+            host_request_route::local_read_replay_response(&receipt, &record, &envelope)?
+        {
+            return Ok(replayed);
+        }
+        let Some(selectors) = selectors else {
+            return Ok(host_request_route::host_request_admitted_response(
+                &receipt, &record,
+            ));
+        };
+        let mut parameters = BTreeMap::new();
+        parameters.insert(
+            "subject".to_owned(),
+            serde_json::Value::String(selectors.subject.clone()),
+        );
+        parameters.insert(
+            "max_records".to_owned(),
+            serde_json::Value::String(selectors.max_records.to_string()),
+        );
+        let read = NamedReadRequest {
+            operation: NamedReadOperation::GetEvidencePack,
+            scope_id: Some(selectors.scope_id.clone()),
+            consistency: ReadConsistency::Eventual,
+            state_fence: envelope.state_fence.clone(),
+            parameters,
+        };
+        if let Err(error) = check_local_read_request(&read) {
+            return Ok(Self::store_error_response_text("local_read", &error));
+        }
+        validate_store_session_fence(session, &read.state_fence)?;
+        let gateway = self.retained_store_gateway()?;
+        let response = match gateway.execute_named(read).await {
+            Ok(response) => response,
+            Err(error) => return Ok(Self::store_error_response_text("local_read", &error)),
+        };
+        if response.operation != NamedReadOperation::GetEvidencePack {
+            return Ok(Self::store_error_response_text(
+                "local_read",
+                "named-read operation does not match request",
+            ));
+        }
+        let (digest, body) = AuthenticatedHostSession::build_local_read_result_body(
+            &envelope,
+            selectors.scope_id.as_str(),
+            &selectors.subject,
+            selectors.max_records,
+            &selectors.intent_mode,
+            response.payload,
+        )
+        .map_err(|_| TransportError::SessionFenced)?;
+        let operation_id = OperationIdentity::new(host_request_operation_id(&envelope))
+            .map_err(|_| TransportError::SessionFenced)?;
+        self.generation_gateway
+            .ors
+            .persist_host_request_result(&operation_id, &envelope.envelope_sha256, &digest, &body)
+            .map_err(|error| match error {
+                OrsError::HostRequestIdentityConflict { .. } => TransportError::IdentityConflict,
+                _ => TransportError::SessionFenced,
+            })?
+            .ok_or(TransportError::SessionFenced)?;
+        let resulted = self
+            .generation_gateway
+            .ors
+            .load_host_request(&operation_id, &envelope.envelope_sha256)
+            .map_err(|_| TransportError::SessionFenced)?
+            .ok_or(TransportError::SessionFenced)?;
+        if host_request_route::local_read_replay_response(&receipt, &resulted, &envelope)?.is_none()
+        {
+            return Err(TransportError::SessionFenced);
+        }
+        Ok(host_request_route::host_request_admitted_response(
+            &receipt, &resulted,
+        ))
+    }
+
+    #[cfg(not(windows))]
+    async fn local_read_operation(
+        &self,
+        _session: &Session,
+        payload: serde_json::Value,
+    ) -> Result<serde_json::Value, TransportError> {
+        let _ = payload;
+        Err(TransportError::SessionFenced)
+    }
+
     #[cfg(windows)]
     fn retained_store_gateway(&self) -> Result<Arc<KernelStoreGateway>, TransportError> {
         self.canonical_store_gateway
@@ -670,6 +810,22 @@ fn store_apply_response(receipt: &WriteReceipt) -> serde_json::Value {
     })
 }
 
+/// Requires a local-read store request to be the closed evidence-pack read.
+///
+/// `local_read` is the `GetEvidencePack`-only sibling of `store_named`: any
+/// other catalogue operation (including the packet projection-inputs read) is
+/// refused here, so the packet path stays unavailable on this leg. Shape
+/// validation is the Store-owned request check, unchanged and never weakened.
+fn check_local_read_request(request: &NamedReadRequest) -> Result<(), String> {
+    if request.operation != NamedReadOperation::GetEvidencePack {
+        return Err(
+            "local_read admits only GetEvidencePack; packet and position reads stay unavailable"
+                .to_owned(),
+        );
+    }
+    request.validate().map_err(|error| error.to_string())
+}
+
 fn store_named_response(response: &NamedReadResponse) -> serde_json::Value {
     serde_json::json!({
         "status": "known",
@@ -731,5 +887,137 @@ mod store_named_dispatch_tests {
             Some(&expected)
         );
         assert_eq!(projected.get("recovery"), Some(&serde_json::Value::Null));
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::expect_used, clippy::unwrap_used)]
+mod local_read_dispatch_tests {
+    use super::*;
+
+    const TEST_LINEAGE: &str = "550e8400-e29b-41d4-a716-446655440000";
+
+    fn tool_digest(tool: &serde_json::Value) -> String {
+        let bytes = eliot_contracts::canonical_json_bytes(tool).expect("tool must canonicalize");
+        eliot_contracts::sha256_hex(&bytes)
+    }
+
+    fn query_tool() -> serde_json::Value {
+        serde_json::json!({"name":"eliot.query","arguments":{
+            "intent":{
+                "mode":"verification",
+                "time_scope":"session-window",
+                "branch_environment_scope":"branch",
+                "freshness_policy":"exact-fence",
+                "required_assurance":"evidence-provenance"
+            },
+            "query":"subject:evidence-alpha",
+            "exact_resource_uri": null
+        }})
+    }
+
+    fn test_fence() -> StateFence {
+        StateFence::new(
+            eliot_contracts::EpochId::new(
+                eliot_contracts::EpochLineageId::new(TEST_LINEAGE).expect("lineage"),
+                std::num::NonZeroU64::new(1).expect("sequence"),
+            )
+            .expect("epoch"),
+            eliot_contracts::ResourceGeneration::genesis(),
+        )
+    }
+
+    fn test_envelope(capability: &str, payload_sha256: &str) -> HostRequestEnvelope {
+        eliot_protocol::HostRequestEnvelope {
+            wire_id: eliot_protocol::HOST_REQUEST_WIRE_ID.to_owned(),
+            wire_version: eliot_protocol::HostRequestEnvelope::CONTRACT_VERSION,
+            kind: eliot_protocol::HostRequestKind::Invocation,
+            connection_id: "conn-test-1".to_owned(),
+            identity: eliot_protocol::HostRequestIdentity {
+                request_id: eliot_contracts::RequestId::new("host-request-1")
+                    .expect("valid request id"),
+                idempotency_key: "host-request-1:invoke".to_owned(),
+                cancellation_id: "host-request-1:invoke:cancel".to_owned(),
+                parent_operation_id: None,
+                deadline_unix_ms: 2_000_000,
+                capability: capability.to_owned(),
+                session_id: Some("kernel-session-1".to_owned()),
+                task_id: None,
+                work_scope_id: None,
+                payload_schema_id: "eliot.mcp.tool-request.v1".to_owned(),
+                payload_sha256: payload_sha256.to_owned(),
+            },
+            state_fence: test_fence(),
+            descriptor_sha256: "d".repeat(64),
+            peer_admission_receipt_sha256: "e".repeat(64),
+            activation_binding: None,
+            envelope_sha256: String::new(),
+        }
+        .with_computed_digest()
+        .expect("envelope must digest")
+    }
+
+    #[test]
+    fn local_read_operation_rejects_unknown_fields() {
+        let tool = query_tool();
+        let envelope = test_envelope("eliot.query", &tool_digest(&tool));
+        let valid = serde_json::json!({"envelope": envelope, "tool": tool});
+        let decoded: LocalReadOperation =
+            serde_json::from_value(valid).expect("closed envelope+tool pair must decode");
+        assert_eq!(decoded.tool, tool);
+        assert_eq!(
+            decoded.envelope.envelope_sha256, envelope.envelope_sha256,
+            "the admitted digest rides the closed carrier"
+        );
+
+        let widened = serde_json::json!({
+            "envelope": envelope,
+            "tool": tool,
+            "unknown_field": null,
+        });
+        assert!(
+            serde_json::from_value::<LocalReadOperation>(widened).is_err(),
+            "deny_unknown_fields must reject a widened local-read envelope"
+        );
+    }
+
+    #[test]
+    fn local_read_gate_admits_only_evidence_pack() {
+        let parameters = BTreeMap::from([
+            (
+                "subject".to_owned(),
+                serde_json::Value::String("evidence-alpha".to_owned()),
+            ),
+            (
+                "max_records".to_owned(),
+                serde_json::Value::String("10".to_owned()),
+            ),
+        ]);
+        let read = NamedReadRequest {
+            operation: NamedReadOperation::GetEvidencePack,
+            scope_id: Some(eliot_store_api::ScopeId::new("scope-1").expect("valid test scope")),
+            consistency: ReadConsistency::Eventual,
+            state_fence: test_fence(),
+            parameters,
+        };
+        assert!(
+            check_local_read_request(&read).is_ok(),
+            "the closed evidence-pack read must pass the gate"
+        );
+
+        // Any other catalogue operation — including the packet
+        // projection-inputs read — stays unavailable on this leg.
+        for operation in [
+            NamedReadOperation::GetCurrentEpistemicPosition,
+            NamedReadOperation::GetRevisionHeads,
+            NamedReadOperation::GetUnderstandingProjectionInputs,
+        ] {
+            let mut other = read.clone();
+            other.operation = operation;
+            assert!(
+                check_local_read_request(&other).is_err(),
+                "non-evidence operations must be refused before any store work"
+            );
+        }
     }
 }
