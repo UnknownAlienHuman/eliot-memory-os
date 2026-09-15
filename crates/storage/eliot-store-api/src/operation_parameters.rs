@@ -6,15 +6,19 @@
 //! `ResolveWriteReceipt`, and `GetEvidencePack` (see
 //! `apply/read_boundary.rs` in the Surreal adapter and `execute_named_sync`
 //! in the memory adapter), plus the three
-//! `CaptureObservation` / `AppendAuditEvent` / `ApplyLifecyclePolicy`
-//! mutations (AUD-C01: `CaptureObservation` and `AppendAuditEvent` persist
+//! `CaptureObservation` / `AppendAuditEvent` / `ApplyLifecyclePolicy` /
+//! `ReconcileRecovery` mutations (AUD-C01: `CaptureObservation` and `AppendAuditEvent` persist
 //! `TransitionClass::CaptureCandidate` with the `EffectClass::Candidate`
 //! ceiling; `CaptureObservation` carries the owner-shaped `subject` string
 //! already used by the adapter receipt/plan fixtures, `AppendAuditEvent`
 //! carries the six receipt-bound operator fields emitted by the Governor
 //! reconciliation, `ApplyLifecyclePolicy` carries the six lifecycle-policy
 //! fields emitted by the Governor skill promotion envelope
-//! (`crates/governor/eliot-governor/src/skill_lifecycle.rs`, `skill_envelope`).
+//! (`crates/governor/eliot-governor/src/skill_lifecycle.rs`, `skill_envelope`),
+//! `ReconcileRecovery` carries the ten problem-leg recovery fields emitted by
+//! the Governor doctor verification envelope
+//! (`crates/governor/eliot-governor/src/observation_reconciliation.rs`,
+//! `recovery_envelope`).
 //! Every other [`NamedReadOperation`](crate::NamedReadOperation) variant and
 //! every other [`NamedMutationOperation`](crate::NamedMutationOperation)
 //! variant stays known-but-unsupported and unadvertised, and no other mutation
@@ -31,7 +35,8 @@
 //! parameter (today `operation_id` for `ResolveWriteReceipt`, `subject`
 //! for `CaptureObservation`, the six receipt-bound fields for
 //! `AppendAuditEvent`, the six lifecycle-policy fields for
-//! `ApplyLifecyclePolicy`, and the `subject` / `max_records` evidence-pack
+//! `ApplyLifecyclePolicy`, the ten problem-leg recovery fields for
+//! `ReconcileRecovery`, and the `subject` / `max_records` evidence-pack
 //! selectors for `GetEvidencePack`) is owner-approved and therefore supersedes the
 //! generic [`CONTROL_FIELD_DENYLIST`](crate::CONTROL_FIELD_DENYLIST) for that
 //! exact name; every undeclared control name is still rejected fail-closed.
@@ -51,13 +56,16 @@ use crate::{
 ///
 /// Slice C1 needs exactly two shapes: the `operation_id` string consumed by
 /// `ResolveWriteReceipt` (reused for the receipt-bound `AppendAuditEvent`
-/// `operation_id`) and the non-blank text captured by `CaptureObservation`
+/// `operation_id` and for the problem-leg `ReconcileRecovery`
+/// `observation_operation_id`) and the non-blank text captured by `CaptureObservation`
 /// as `subject` (reused for the five remaining receipt-bound
 /// `AppendAuditEvent` fields, for the six lifecycle-policy
-/// `ApplyLifecyclePolicy` fields, and for the two `GetEvidencePack`
+/// `ApplyLifecyclePolicy` fields, for the nine remaining problem-leg
+/// `ReconcileRecovery` fields, and for the two `GetEvidencePack`
 /// evidence-pack selectors: the exact captured-observation `subject` and the
 /// explicit `max_records` bound carried as its decimal string, mirroring how
-/// `AppendAuditEvent` carries `expected_revision`). The enum is closed so a future parameter kind
+/// `AppendAuditEvent` carries `expected_revision` and how `ReconcileRecovery`
+/// carries `expected_problem_revision`). The enum is closed so a future parameter kind
 /// is a contract change with a new owner-approved arm, never silent `Value`
 /// passthrough.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -70,7 +78,12 @@ pub enum ParameterShape {
     /// `access_digest`, `action_digest`, and `expected_revision` as its
     /// decimal string), for the six lifecycle-policy `ApplyLifecyclePolicy`
     /// fields (`action`, `base_view_digest`, `candidate_digest`,
-    /// `candidate_package_digest`, `skill_id`, `verifier_ref`), and for the
+    /// `candidate_package_digest`, `skill_id`, `verifier_ref`), for the nine
+    /// non-`observation_operation_id` problem-leg `ReconcileRecovery` fields
+    /// (`problem_id`, `expected_problem_revision` as its decimal string,
+    /// `attempt_digest`, `effect_digest`, `operation_manifest_digest`,
+    /// `artifact_binding_digest`, `fence_digest`, `observation_record_id`,
+    /// and `observation_request_digest`), and for the
     /// two `GetEvidencePack` selectors (the exact captured-observation
     /// `subject` and the explicit `max_records` bound as its decimal
     /// string, range-checked against
@@ -192,6 +205,58 @@ static APPLY_LIFECYCLE_POLICY_PARAMETERS: [ParameterDeclaration; 6] = [
         required: true,
     },
 ];
+static RECONCILE_RECOVERY_PARAMETERS: [ParameterDeclaration; 10] = [
+    ParameterDeclaration {
+        name: "problem_id",
+        shape: ParameterShape::Subject,
+        required: true,
+    },
+    ParameterDeclaration {
+        name: "expected_problem_revision",
+        shape: ParameterShape::Subject,
+        required: true,
+    },
+    ParameterDeclaration {
+        name: "attempt_digest",
+        shape: ParameterShape::Subject,
+        required: true,
+    },
+    ParameterDeclaration {
+        name: "effect_digest",
+        shape: ParameterShape::Subject,
+        required: true,
+    },
+    ParameterDeclaration {
+        name: "operation_manifest_digest",
+        shape: ParameterShape::Subject,
+        required: true,
+    },
+    ParameterDeclaration {
+        name: "artifact_binding_digest",
+        shape: ParameterShape::Subject,
+        required: true,
+    },
+    ParameterDeclaration {
+        name: "fence_digest",
+        shape: ParameterShape::Subject,
+        required: true,
+    },
+    ParameterDeclaration {
+        name: "observation_operation_id",
+        shape: ParameterShape::OperationId,
+        required: true,
+    },
+    ParameterDeclaration {
+        name: "observation_record_id",
+        shape: ParameterShape::Subject,
+        required: true,
+    },
+    ParameterDeclaration {
+        name: "observation_request_digest",
+        shape: ParameterShape::Subject,
+        required: true,
+    },
+];
 static NO_PARAMETERS: [ParameterDeclaration; 0] = [];
 
 /// Returns the canonical operation name bound into manifests and digests.
@@ -309,7 +374,11 @@ pub const fn declared_read_parameters(
 /// `action_digest`, `expected_revision`); `ApplyLifecyclePolicy` declares the
 /// six required lifecycle-policy fields (`action`, `base_view_digest`,
 /// `candidate_digest`, `candidate_package_digest`, `skill_id`,
-/// `verifier_ref`); every other variant declares none,
+/// `verifier_ref`); `ReconcileRecovery` declares the ten required
+/// problem-leg recovery fields (`problem_id`, `expected_problem_revision`,
+/// `attempt_digest`, `effect_digest`, `operation_manifest_digest`,
+/// `artifact_binding_digest`, `fence_digest`, `observation_operation_id`,
+/// `observation_record_id`, `observation_request_digest`); every other variant declares none,
 /// so any supplied parameter fails closed. Variants without a catalogue entry
 /// never reach this table: they fail as [`StoreError::UnknownOperation`] first.
 #[must_use]
@@ -320,9 +389,10 @@ pub const fn declared_mutation_parameters(
         NamedMutationOperation::CaptureObservation => &CAPTURE_OBSERVATION_PARAMETERS,
         NamedMutationOperation::AppendAuditEvent => &APPEND_AUDIT_EVENT_PARAMETERS,
         NamedMutationOperation::ApplyLifecyclePolicy => &APPLY_LIFECYCLE_POLICY_PARAMETERS,
-        NamedMutationOperation::ApplyEpistemicRevision
-        | NamedMutationOperation::UpdateTaskState
-        | NamedMutationOperation::ReconcileRecovery => &NO_PARAMETERS,
+        NamedMutationOperation::ReconcileRecovery => &RECONCILE_RECOVERY_PARAMETERS,
+        NamedMutationOperation::ApplyEpistemicRevision | NamedMutationOperation::UpdateTaskState => {
+            &NO_PARAMETERS
+        }
     }
 }
 
