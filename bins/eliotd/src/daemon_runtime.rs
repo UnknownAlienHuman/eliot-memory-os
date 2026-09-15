@@ -176,6 +176,11 @@ pub(super) fn run() -> Result<(), String> {
     // the intake wiring before readiness is reported; no thread, no transport,
     // no start() contour or run-loop change.
     attach_dreamer_intake(&composition, &kernel)?;
+    // T12-07: gated Dreamer model-call registration at the same attach site. The
+    // readiness-gated accessor plus the fence-bound model route-context check prove
+    // the model wiring before readiness is reported; no thread, no transport, no
+    // provider credentials, no start() contour or run-loop change.
+    attach_dreamer_model(&composition)?;
     kernel.report_ready().map_err(|error| error.to_string())?;
     let status = composition.status();
     write_json(&ready_message(&status))?;
@@ -239,6 +244,24 @@ fn attach_dreamer_intake(
         .map_err(|error| error.to_string())?;
     let _context = adapter
         .dreamer_route_context()
+        .map_err(|error| error.to_string())?;
+    Ok(())
+}
+
+/// Attaches the T12-07 governed Dreamer model-call registration (gated, no lifecycle change).
+///
+/// Post-`start` attach-style check at the single site holding the composition: builds the
+/// [`GovernedDreamerModelAdapter`](eliotd::GovernedDreamerModelAdapter) through the
+/// readiness-gated accessor and validates the fence-bound model route context. Fails closed
+/// before `report_ready` when the Governor is not ready or the admitted fence cannot bind
+/// a context. No thread, no transport, no provider execution or credentials, no `start()`
+/// contour or run-loop change.
+fn attach_dreamer_model(composition: &DaemonComposition) -> Result<(), String> {
+    let adapter = composition
+        .dreamer_model()
+        .map_err(|error| error.to_string())?;
+    let _context = adapter
+        .model_route_context()
         .map_err(|error| error.to_string())?;
     Ok(())
 }
