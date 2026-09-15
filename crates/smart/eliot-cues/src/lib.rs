@@ -1,5 +1,11 @@
 //! Deterministic cue projection contracts.
 //!
+//! Temporary compatibility facade (issue #40): canonical-preserving
+//! normalization migrates to `eliot-cue-normalizer`, binding/index/activation
+//! to their named cells. Snapshot construction (`CueSnapshot`/`CueRuntime`)
+//! has no admitted cell yet and stays here until one is proposed. The facade
+//! is retained without deletion until consumers migrate (after T8-A4).
+//!
 //! This crate owns neither memory nor the understanding model.  It stores only
 //! references to canonical records and immutable graph edges supplied by their
 //! owners.  A published snapshot is the sole input to matching and bounded
@@ -186,21 +192,34 @@ impl CueKey {
     }
 }
 
+/// Temporary facade seam for canonical-preserving normalization (issue #40).
+///
+/// Contract owner: `eliot-cue-normalizer` behind `eliot-cue-contracts`. Every
+/// observation normalizes through this one seam until the
+/// `eliot-cues -> eliot-cue-normalizer` compile edge is admitted; do not add a
+/// second normalization copy. Known facade divergence, retained for fixture
+/// equivalence: path values are unconditionally lowercased here, which the
+/// donor map rejects as a destructive overgeneralization — the cell decides
+/// case per policy.
 fn normalize_value(kind: CueKind, value: &str) -> String {
     let value = value.trim().replace('\\', "/");
     match kind {
-        CueKind::FilePath | CueKind::DirPath => {
-            let mut out = Vec::new();
-            for part in value.split('/') {
-                if !part.is_empty() && part != "." {
-                    out.push(part);
-                }
-            }
-            lower(&out.join("/"))
-        }
+        CueKind::FilePath | CueKind::DirPath => normalize_path_value(&value),
         CueKind::Symbol => lower(&value.replace("::::", "::").replace(":::", "::")),
         _ => lower(&value.split_whitespace().collect::<Vec<_>>().join(" ")),
     }
+}
+
+/// Path branch of the facade normalization seam: separator folding, `.`
+/// removal and case folding in one deterministic order.
+fn normalize_path_value(value: &str) -> String {
+    let mut out = Vec::new();
+    for part in value.split('/') {
+        if !part.is_empty() && part != "." {
+            out.push(part);
+        }
+    }
+    lower(&out.join("/"))
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, JsonSchema)]
