@@ -220,7 +220,7 @@ enum InstallationCommand {
         #[arg(long)]
         transaction_id: Option<String>,
     },
-    /// Materialize an exact nine-role Phase-A source bundle and feed it through
+    /// Materialize an exact twelve-role Phase-A source bundle and feed it through
     /// the publication-bound generation planner. `--store` is required because
     /// the durable transaction store is the sole authority for a generated plan.
     MaterializeSourceBundle {
@@ -236,6 +236,12 @@ enum InstallationCommand {
         surreal: PathBuf,
         #[arg(long, value_parser = absolute_path)]
         eliotd: PathBuf,
+        #[arg(long, value_parser = absolute_path)]
+        eliot_doctor: PathBuf,
+        #[arg(long, value_parser = absolute_path)]
+        eliot_testd: PathBuf,
+        #[arg(long, value_parser = absolute_path)]
+        eliot_native_worker: PathBuf,
         /// Optional explicit external agent-bridge executable source. Must be
         /// supplied together with `--agent-bridge-account`.
         #[arg(long, value_parser = absolute_path)]
@@ -1160,6 +1166,9 @@ fn run_installation(command: InstallationCommand) -> Result<i32> {
             eliot_store_surreal,
             surreal,
             eliotd,
+            eliot_doctor,
+            eliot_testd,
+            eliot_native_worker,
             agent_bridge_exe,
             agent_bridge_account,
             output_bundle,
@@ -1183,6 +1192,9 @@ fn run_installation(command: InstallationCommand) -> Result<i32> {
             eliot_store_surreal,
             surreal,
             eliotd,
+            eliot_doctor,
+            eliot_testd,
+            eliot_native_worker,
             output_bundle,
             output,
             store,
@@ -1403,6 +1415,9 @@ fn run_installation_materialize_source_bundle(
     eliot_store_surreal: PathBuf,
     surreal: PathBuf,
     eliotd: PathBuf,
+    eliot_doctor: PathBuf,
+    eliot_testd: PathBuf,
+    eliot_native_worker: PathBuf,
     output_bundle: PathBuf,
     output: PathBuf,
     store: PathBuf,
@@ -1427,6 +1442,9 @@ fn run_installation_materialize_source_bundle(
         eliot_store_surreal_exe: eliot_store_surreal,
         surreal_exe: surreal,
         eliotd_exe: eliotd,
+        eliot_doctor_exe: eliot_doctor,
+        eliot_testd_exe: eliot_testd,
+        eliot_native_worker_exe: eliot_native_worker,
         agent_bridge_exe,
         agent_bridge_account,
         output_bundle: output_bundle.clone(),
