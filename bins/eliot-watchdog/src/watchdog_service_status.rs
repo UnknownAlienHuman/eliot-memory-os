@@ -242,6 +242,12 @@ pub(super) fn set_service_status_stopped() {
 /// Publishes one typed `SERVICE_STOPPED` for a start failure: Win32 1066 plus
 /// the per-class specific code from [`WatchdogStopCode::specific`].
 pub(super) fn publish_stopped_with_code(handle: &ServiceStatusHandle, code: WatchdogStopCode) {
+    tracing::debug!(
+        event = "watchdog.scm_status_stopped",
+        failure_class = code.failure_class(),
+        specific = code.specific(),
+        "publishing SERVICE_STOPPED with typed stop code"
+    );
     publish_service_status(
         handle,
         SERVICE_STOPPED,
@@ -262,6 +268,14 @@ pub(super) fn publish_service_status(
     checkpoint: u32,
     wait_hint: u32,
 ) {
+    tracing::debug!(
+        event = "watchdog.scm_status_publish",
+        state = state,
+        win32_error = win32_error,
+        specific_error = specific_error,
+        checkpoint = checkpoint,
+        "publishing SCM service status"
+    );
     let report = ServiceStatusReport::new(
         state,
         controls,
@@ -335,6 +349,11 @@ pub(super) fn persist_start_failure(
         None => (None, None, std::env::temp_dir()),
     };
     let capsule = build_start_failure_capsule(code, detail, installation_id, plan_generation);
+    tracing::debug!(
+        event = "watchdog.start_failure_persisted",
+        failure_class = code.failure_class(),
+        "persisted bounded start-failure capsule receipt"
+    );
     let _ = std::fs::write(root.join(START_FAILURE_CAPSULE_FILE_NAME), capsule);
 }
 

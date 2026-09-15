@@ -144,6 +144,7 @@ impl HostIdentityMonitor {
     /// one SCM query; a second status/PID query is deliberately not used.
     #[must_use]
     pub fn observe(&mut self) -> HostObservation {
+        let _span = tracing::debug_span!("watchdog.host_observe").entered();
         if self.require_image_lease
             && self.expected_image_lease.is_none()
             && let Some(expected_image) = self.expected_image.as_deref()
@@ -157,6 +158,11 @@ impl HostIdentityMonitor {
                     lease.verify_stable_identity().is_err() || lease.verify_path_identity().is_err()
                 }))
         {
+            tracing::debug!(
+                event = "watchdog.host_observed",
+                observation = "unknown",
+                "host image lease unavailable; observation stays unknown"
+            );
             return HostObservation {
                 state: HostObservationState::Unknown,
                 identity: None,
@@ -167,8 +173,19 @@ impl HostIdentityMonitor {
                 WatchdogRuntimeReadback::Unknown,
                 read_host_registration_runtime,
             );
-            return self.observe_runtime_readback(runtime);
+            let observation = self.observe_runtime_readback(runtime);
+            tracing::debug!(
+                event = "watchdog.host_observed",
+                observation = crate::diagnostics::host_observation_diagnostic(&observation.state),
+                "host observation reconciled without lifecycle authority"
+            );
+            return observation;
         }
+        tracing::debug!(
+            event = "watchdog.host_observed",
+            observation = "unknown",
+            "no registration readback required; observation stays unknown"
+        );
         HostObservation {
             state: HostObservationState::Unknown,
             identity: None,
@@ -348,13 +365,29 @@ impl HostObservationSource for LiveHostObservationSource {
 pub(super) fn read_host_registration_runtime(
     approved: &ApprovedHostRegistration,
 ) -> WatchdogRuntimeReadback {
+    let _span = tracing::debug_span!("watchdog.host_registration_readback").entered();
     let registration = &approved.request;
     let Some(root) = registration.binary_path().parent() else {
+        tracing::debug!(
+            event = "watchdog.host_readback",
+            observation = "unknown",
+            "approved registration has no package root; readback stays unknown"
+        );
         return WatchdogRuntimeReadback::Unknown;
     };
     let Ok(platform) = WindowsPlatform::new(root.to_path_buf()) else {
+        tracing::debug!(
+            event = "watchdog.host_readback",
+            observation = "unknown",
+            "platform root unavailable; readback stays unknown"
+        );
         return WatchdogRuntimeReadback::Unknown;
     };
+    tracing::debug!(
+        event = "watchdog.host_readback",
+        observation = "attempted",
+        "attempting read-only SCM registration readback"
+    );
     project_service_runtime_inspection(platform.inspect_service_registration_runtime(registration))
 }
 

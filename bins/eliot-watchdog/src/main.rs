@@ -40,6 +40,9 @@ static PROCESS_BOOTSTRAP: OnceLock<Result<Option<ServiceBootstrapArguments>, Str
     OnceLock::new();
 
 fn main() {
+    eliot_watchdog::install_subscriber();
+    let startup_span = tracing::info_span!("watchdog.startup");
+    let _startup_guard = startup_span.enter();
     let _ = PROCESS_BOOTSTRAP.set(parse_process_bootstrap());
     #[cfg(windows)]
     match run_as_scm_service() {
@@ -50,6 +53,12 @@ fn main() {
                 "StartServiceCtrlDispatcherW failed with Win32 error {error} (0x{error:08X})"
             );
             let _ = writeln!(io::stderr().lock(), "{SERVICE_NAME}: {detail}");
+            tracing::error!(
+                event = "watchdog.startup_failed",
+                failure_class = WatchdogStopCode::DispatcherFailed.failure_class(),
+                detail = truncate_startup_detail(&detail).as_str(),
+                "SCM dispatcher failed"
+            );
             persist_start_failure(
                 WatchdogStopCode::DispatcherFailed,
                 &detail,
@@ -64,6 +73,19 @@ fn main() {
     }
 }
 
+/// Bounds free-text startup detail for diagnostics.
+///
+/// Mirrors the 512-character capsule bound; the registration nonce never
+/// enters the detail strings used here.
+fn truncate_startup_detail(value: &str) -> String {
+    const MAX_CHARS: usize = 512;
+    if value.chars().count() > MAX_CHARS {
+        value.chars().take(MAX_CHARS).collect()
+    } else {
+        value.to_owned()
+    }
+}
+
 /// Typed console exit for a `run_watchdog` failure without an SCM handle.
 ///
 /// Windows carries the 1066 marker as the process exit code and the typed
@@ -73,11 +95,22 @@ fn report_console_runtime_failure(error: &str) -> ! {
     #[cfg(windows)]
     {
         let code = classify_runtime_error(error);
+        tracing::error!(
+            event = "watchdog.console_runtime_failed",
+            failure_class = code.failure_class(),
+            detail = truncate_startup_detail(error).as_str(),
+            "console runtime failed"
+        );
         persist_start_failure(code, error, captured_bootstrap_for_capsule());
         std::process::exit(CONSOLE_PROCESS_EXIT_CODE);
     }
     #[cfg(not(windows))]
     {
+        tracing::error!(
+            event = "watchdog.console_runtime_failed",
+            detail = truncate_startup_detail(error).as_str(),
+            "console runtime failed"
+        );
         let _ = error;
         std::process::exit(1);
     }
@@ -162,6 +195,7 @@ extern "system" fn watchdog_service_main(
     service_arg_count: u32,
     service_arg_vector: *mut *mut u16,
 ) {
+    let _scm_span = tracing::info_span!("watchdog.scm_lifecycle").entered();
     let handle = match register_service_control_handler(SERVICE_NAME, service_control) {
         Ok(handle) => handle,
         Err(registration) => {
@@ -170,6 +204,12 @@ extern "system" fn watchdog_service_main(
                 "RegisterServiceCtrlHandlerExW failed with Win32 error {error} (0x{error:08X})"
             );
             let _ = writeln!(io::stderr().lock(), "{SERVICE_NAME}: {detail}");
+            tracing::error!(
+                event = "watchdog.scm_register_failed",
+                failure_class = WatchdogStopCode::ScmRegisterNull.failure_class(),
+                detail = truncate_startup_detail(&detail).as_str(),
+                "SCM control-handler registration failed"
+            );
             persist_start_failure(
                 WatchdogStopCode::ScmRegisterNull,
                 &detail,
@@ -188,6 +228,13 @@ extern "system" fn watchdog_service_main(
     if let Err(error) = service_launch_options(service_arg_count, service_arg_vector) {
         let detail = format!("invalid SCM ServiceMain argv: {error}");
         let _ = writeln!(io::stderr().lock(), "{SERVICE_NAME}: {detail}");
+        tracing::error!(
+            event = "watchdog.scm_stage_failed",
+            stage = "service_main_argv",
+            failure_class = WatchdogStopCode::InvalidScmArgv.failure_class(),
+            detail = truncate_startup_detail(&detail).as_str(),
+            "SCM ServiceMain argv validation failed"
+        );
         persist_start_failure(
             WatchdogStopCode::InvalidScmArgv,
             &detail,
@@ -204,6 +251,13 @@ extern "system" fn watchdog_service_main(
             let code = classify_bootstrap_launch_error(&error);
             let detail = format!("invalid SCM launch registration: {error}");
             let _ = writeln!(io::stderr().lock(), "{SERVICE_NAME}: {detail}");
+            tracing::error!(
+                event = "watchdog.scm_stage_failed",
+                stage = "process_bootstrap",
+                failure_class = code.failure_class(),
+                detail = truncate_startup_detail(&detail).as_str(),
+                "SCM process bootstrap validation failed"
+            );
             persist_start_failure(code, &detail, captured_bootstrap_for_capsule());
             publish_stopped_with_code(&handle, code);
             return;
@@ -214,6 +268,12 @@ extern "system" fn watchdog_service_main(
     if let Err(error) = run_watchdog(stop_signal, Some(&validated_launch)) {
         let code = classify_runtime_error(&error);
         let _ = writeln!(io::stderr().lock(), "{SERVICE_NAME}: {error}");
+        tracing::error!(
+            event = "watchdog.runtime_failed",
+            failure_class = code.failure_class(),
+            detail = truncate_startup_detail(&error).as_str(),
+            "watchdog runtime failed"
+        );
         persist_start_failure(code, &error, captured_bootstrap_for_capsule());
         publish_stopped_with_code(&handle, code);
     }
