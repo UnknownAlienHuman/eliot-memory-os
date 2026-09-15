@@ -15,6 +15,7 @@ use eliot_platform::PlatformHandle;
 use eliot_platform_windows::{
     current_process_named_pipe_expectation, observe_named_pipe_peer_process,
 };
+use eliot_kernel_core::RouteScope;
 use eliot_process::{
     CancellationStatus, Generation, ProcessExecutionError, ProcessLifecycle, ProcessOwnerBinding,
     ProcessStartReceipt,
@@ -203,7 +204,8 @@ impl KernelComposition {
         }
         match view.lifecycle() {
             ProcessLifecycle::Exited | ProcessLifecycle::Failed | ProcessLifecycle::Reconciled => {
-                Ok(())
+                self.reconcile_closed_daemon_process(gateway, &owner, launch, receipt)
+                    .await
             }
             ProcessLifecycle::Running => {
                 let cancellation = gateway
@@ -231,7 +233,8 @@ impl KernelComposition {
                         "eliotd previous process tree closure was not proven".to_owned(),
                     ));
                 }
-                Ok(())
+                self.reconcile_closed_daemon_process(gateway, &owner, launch, receipt)
+                    .await
             }
             ProcessLifecycle::Created
             | ProcessLifecycle::Starting
@@ -241,6 +244,91 @@ impl KernelComposition {
                 "eliotd previous process is not in a known terminal state".to_owned(),
             )),
         }
+    }
+
+    /// Reconciles one already-closed supervised `eliotd` generation by its
+    /// original operation identity and links the ORS cutover readback.
+    ///
+    /// T2-S08K (Implements #100): the close path observes (`inspect`) and
+    /// cancels (`cancel`) the exact supervised generation, then reconciles it
+    /// without minting a fresh operation identity. Unknown keeps its original
+    /// identity and fails fenced for bounded drain instead of blind retry.
+    /// The durable link is a read-only ORS projection through the existing
+    /// generation coordinator contour (`reconcile_staged_*` +
+    /// `latest_generation_cutovers`, as seeded by `recover` at startup) plus
+    /// the active daemon-route projection check. No new launcher, no new
+    /// public process signature, no Doctor/epoch edits.
+    #[cfg(windows)]
+    async fn reconcile_closed_daemon_process(
+        &self,
+        gateway: &super::ProcessExecutionGateway,
+        owner: &ProcessOwnerBinding,
+        launch: &EliotdLaunchDescriptor,
+        receipt: &ProcessStartReceipt,
+    ) -> Result<(), KernelBuildError> {
+        let evidence = match gateway
+            .reconcile(owner, receipt.operation_id().clone())
+            .await
+        {
+            Ok(evidence) => evidence,
+            Err(ProcessExecutionError::NotFound | ProcessExecutionError::UnknownOutcome) => {
+                return Err(KernelBuildError::Service(
+                    "eliotd previous process outcome is unknown; recovery is fenced".to_owned(),
+                ));
+            }
+            Err(error) => return Err(KernelBuildError::Service(error.to_string())),
+        };
+        if evidence.operation_id() != receipt.operation_id()
+            || evidence.binding() != receipt.binding()
+        {
+            return Err(KernelBuildError::Service(
+                "eliotd previous process reconcile binding changed".to_owned(),
+            ));
+        }
+        if evidence.view().identity() != Some(receipt.identity()) {
+            return Err(KernelBuildError::Service(
+                "eliotd previous process reconcile identity changed".to_owned(),
+            ));
+        }
+        if !matches!(
+            evidence.view().lifecycle(),
+            ProcessLifecycle::Exited | ProcessLifecycle::Failed | ProcessLifecycle::Reconciled
+        ) {
+            return Err(KernelBuildError::Service(
+                "eliotd previous process reconcile was not terminal".to_owned(),
+            ));
+        }
+        self.generation_gateway
+            .ors
+            .reconcile_staged_generation_cutovers(eliot_ors::MAX_RECOVERY_PAGE)
+            .map_err(|error| {
+                KernelBuildError::Service(format!(
+                    "eliotd ORS staged cutover reconciliation failed: {error}"
+                ))
+            })?;
+        self.generation_gateway
+            .ors
+            .latest_generation_cutovers(eliot_ors::MAX_RECOVERY_PAGE)
+            .map_err(|error| {
+                KernelBuildError::Service(format!("eliotd ORS cutover readback failed: {error}"))
+            })?;
+        let scope =
+            RouteScope::new("daemon").map_err(|error| KernelBuildError::Service(error.to_string()))?;
+        let generations = self
+            .generations
+            .lock()
+            .map_err(|_| KernelBuildError::Service("generation lock poisoned".to_owned()))?;
+        let route = generations
+            .route(&scope)
+            .map_err(|error| KernelBuildError::Service(error.to_string()))?;
+        if route.active_generation().value() != launch.generation.value()
+            || route.authority_epoch().value() != launch.authority_epoch.sequence.get()
+        {
+            return Err(KernelBuildError::Service(
+                "eliotd supervised generation is not the active daemon route".to_owned(),
+            ));
+        }
+        Ok(())
     }
 
     /// Performs one Kernel-owned bounded recovery of a failed daemon
