@@ -4,6 +4,7 @@ use std::num::NonZeroU64;
 use eliot_contracts::{ArtifactId, EpochId, EpochLineageId, ResourceGeneration, StateFence};
 use eliot_cues::{
     CueError, CueKey, CueKind, CueRecord, CueSnapshot, CueStrength, Freshness, InvalidationCause,
+    MatchMode, ObservedCue,
 };
 use eliot_evidence::LifecycleState;
 
@@ -99,6 +100,35 @@ fn archived_rows_cannot_be_suppressed() -> TestResult {
             to: LifecycleState::Suppressed,
         })
     ));
+    Ok(())
+}
+
+#[test]
+fn facade_normalization_seam_keeps_single_path_shape() -> TestResult {
+    let key = CueKey::new("scope", CueKind::FilePath, r"Src\.\Lib/RS.rs")?;
+    assert_eq!(key.value, "src/lib/rs.rs");
+    assert_eq!(key.mode, MatchMode::Exact);
+    Ok(())
+}
+
+#[test]
+fn observed_cues_normalize_through_the_single_facade_seam() -> TestResult {
+    let observed = ObservedCue {
+        scope: " scope ".to_owned(),
+        kind: CueKind::Symbol,
+        value: "Foo::::Bar".to_owned(),
+    };
+    let key = observed.normalize()?;
+    assert_eq!(key.scope, "scope");
+    assert_eq!(key.value, "foo::bar");
+    let dir = ObservedCue {
+        scope: "scope".to_owned(),
+        kind: CueKind::DirPath,
+        value: r"SRC\Sub".to_owned(),
+    };
+    let dir_key = dir.normalize()?;
+    assert_eq!(dir_key.value, "src/sub");
+    assert_eq!(dir_key.mode, MatchMode::Prefix);
     Ok(())
 }
 

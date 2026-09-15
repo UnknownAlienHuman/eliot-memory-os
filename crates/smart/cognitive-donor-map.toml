@@ -31,13 +31,19 @@ extraction_proof = "Context assembly rendering via crates/smart/eliot-context-as
 path = "crates/smart/eliot-cues"
 disposition = "SPLIT_AND_RETAIN_AS_TEMPORARY_FACADE"
 targets = ["eliot-cue-contracts", "eliot-cue-normalizer", "eliot-cue-binding", "eliot-cue-index", "eliot-cue-activation"]
+# GAP(#40): rebuildable snapshot construction has no admitted contract cell yet;
+# CueSnapshot/CueRuntime stay in this facade until a snapshot cell is proposed.
+# No snapshot target name is listed here; inventing one would fake the boundary.
 rationale = "Retain deterministic matching, bounded spreading and trace shape; split canonical normalization, binding proposals, admitted projection construction and hot evaluation."
 rejected_overgeneralization = "Destructive canonical-path lowercasing, candidate bindings bypassing Governor admission, session delivery state in the pure evaluator, or graph-edge minimums for exact firing."
 
 [[donor]]
 path = "crates/smart/eliot-dreamer-core"
 disposition = "SPLIT_AND_RETAIN_AS_TEMPORARY_FACADE"
-targets = ["eliot-dreamer-contracts", "eliot-dreamer-bundle", "eliot-dreamer-candidate-validation", "eliot-dreamer-orientation", "eliot-dreamer-clarification", "eliot-dreamer-architecture-brief", "eliot-dreamer-implementation-brief", "eliot-dreamer-classification", "eliot-dreamer-relation", "eliot-dreamer-episode", "eliot-dreamer-concept", "eliot-dreamer-procedure", "eliot-dreamer-failure", "eliot-dreamer-structure-repair", "eliot-dreamer-reconsolidation", "eliot-dreamer-accessibility", "eliot-dreamer-memory-repair", "eliot-dreamer-curation", "eliot-dreamer-conflict-analysis", "eliot-dreamer-development-diagnosis", "eliot-dreamer-maintenance-plan", "eliot-dreamer-configuration-plan", "eliot-dreamer-orchestration-plan"]
+# REPAIR(#40): claim-grounding, rival-model and probe-plan were omitted from this
+# target list. All three exist as C1 cells, are named by cognitive-edge-map.toml,
+# and are the #836 (T8-A4) admission leaves alongside bundle/candidate-validation.
+targets = ["eliot-dreamer-contracts", "eliot-dreamer-bundle", "eliot-dreamer-claim-grounding", "eliot-dreamer-candidate-validation", "eliot-dreamer-rival-model", "eliot-dreamer-probe-plan", "eliot-dreamer-orientation", "eliot-dreamer-clarification", "eliot-dreamer-architecture-brief", "eliot-dreamer-implementation-brief", "eliot-dreamer-classification", "eliot-dreamer-relation", "eliot-dreamer-episode", "eliot-dreamer-concept", "eliot-dreamer-procedure", "eliot-dreamer-failure", "eliot-dreamer-structure-repair", "eliot-dreamer-reconsolidation", "eliot-dreamer-accessibility", "eliot-dreamer-memory-repair", "eliot-dreamer-curation", "eliot-dreamer-conflict-analysis", "eliot-dreamer-development-diagnosis", "eliot-dreamer-maintenance-plan", "eliot-dreamer-configuration-plan", "eliot-dreamer-orchestration-plan"]
 rationale = "Retain candidate-only ceiling, bounded draft validation, lineage and preservation concepts; separate top-level job classes from shared sub-handlers and move each transformation, diagnosis or planning function behind an independent boundary."
 rejected_overgeneralization = "One generator that mixes job contracts, bundle construction, validation, self-query authority domains, subtype semantics, scheduling or promotion."
 
