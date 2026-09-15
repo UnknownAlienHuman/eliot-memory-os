@@ -2208,6 +2208,249 @@ mod tests {
         Ok(())
     }
 
+    /// Test-only executor standing in for the production
+    /// `WindowsProcessExecutor`: it consumes the presented permit through the
+    /// same real `DoctorDispatchAuthority` that minted it (the broker pattern
+    /// the Drive arm wires by `Arc`), then stages real validated process
+    /// state exactly like the existing fake executor. The minting authority
+    /// carries the grant-bound issuance, so the contour replay check passes;
+    /// the fixed-issuance fake executor cannot consume a grant-minted permit.
+    struct AuthorityBackedExecutor {
+        authority: Arc<crate::dispatch_authority::DoctorDispatchAuthority>,
+        state: Mutex<FakeExecutorState>,
+    }
+
+    impl AuthorityBackedExecutor {
+        fn new(authority: Arc<crate::dispatch_authority::DoctorDispatchAuthority>) -> Self {
+            Self {
+                authority,
+                state: Mutex::new(FakeExecutorState {
+                    starts: 0,
+                    inspections: 0,
+                    reconciliations: 0,
+                    process: None,
+                }),
+            }
+        }
+
+        fn lock(&self) -> std::sync::MutexGuard<'_, FakeExecutorState> {
+            match self.state.lock() {
+                Ok(guard) => guard,
+                Err(error) => error.into_inner(),
+            }
+        }
+    }
+
+    impl ProcessExecutor for AuthorityBackedExecutor {
+        async fn start(
+            &self,
+            request: ProcessRequest,
+            sink: Arc<dyn ProcessEvidenceSink>,
+        ) -> Result<ProcessStartReceipt, ProcessExecutionError> {
+            use eliot_process_executor::DispatchValidationPort as _;
+
+            let mut state = self.lock();
+            state.starts += 1;
+            request.validate()?;
+            let intent = request.intent().clone();
+            let observed = SuspendedProcessIdentity::new(
+                ProcessId::new("process-9")?,
+                intent.process_tree_id().clone(),
+                intent.job_id().clone(),
+                intent.image_id().clone(),
+                intent.session_id().clone(),
+                intent.generation(),
+                PhysicalProcessBinding::new(
+                    4242,
+                    11,
+                    intent.executable(),
+                    "Local\\Eliot-Doctor-Test",
+                )?,
+                120,
+                intent.executable_sha256(),
+            )?;
+            let validated = self.authority.validate_and_consume(request, observed)?;
+            let mut process = ProcessState::from_validated(&validated);
+            process.mark_resumed(
+                151,
+                ProcessHealth::new(ProcessHealthStatus::Healthy, true, 151, None)?,
+            )?;
+            sink.record(ProcessEvidence::new(
+                process.view(),
+                None,
+                None,
+                observed_axes(),
+            )?)?;
+            let receipt = ProcessStartReceipt::new(&process)?;
+            let descendants = exit_descendants(&process, true)?;
+            process.exit(
+                ExitStatus::new(ExitDisposition::Completed, Some(0), None, 200)?,
+                descendants,
+            )?;
+            state.process = Some(process);
+            Ok(receipt)
+        }
+
+        async fn inspect(
+            &self,
+            _operation_id: OperationId,
+        ) -> Result<ProcessExecutionView, ProcessExecutionError> {
+            let mut state = self.lock();
+            state.inspections += 1;
+            state
+                .process
+                .as_ref()
+                .map(ProcessState::view)
+                .ok_or(ProcessExecutionError::NotFound)
+        }
+
+        async fn cancel(
+            &self,
+            _operation_id: OperationId,
+        ) -> Result<eliot_process::CancellationReceipt, ProcessExecutionError> {
+            let mut state = self.lock();
+            let process = state
+                .process
+                .as_mut()
+                .ok_or(ProcessExecutionError::NotFound)?;
+            Ok(process.cancel(&CancellationRequest::new(process.binding().clone()))?)
+        }
+
+        async fn reconcile(
+            &self,
+            _operation_id: OperationId,
+        ) -> Result<ProcessEvidence, ProcessExecutionError> {
+            let mut state = self.lock();
+            state.reconciliations += 1;
+            let process = state
+                .process
+                .as_mut()
+                .ok_or(ProcessExecutionError::NotFound)?;
+            let identity = process
+                .view()
+                .identity()
+                .ok_or(ProcessExecutionError::NotFound)?
+                .clone();
+            let descendants = DescendantEvidence::new(
+                process.binding().clone(),
+                identity.process_id().clone(),
+                vec![ProcessId::new("descendant-9")?],
+                true,
+                true,
+                Some("evidence-doctor-9".to_owned()),
+            )?;
+            process.reconcile(descendants)?;
+            Ok(ProcessEvidence::new(
+                process.view(),
+                None,
+                None,
+                observed_axes(),
+            )?)
+        }
+    }
+
+    /// Production Drive closure through the real dispatch authority
+    /// (DISPATCH-WIRE doctor live E2E, issue #461): validated dispatch-file
+    /// material carrying the `Kernel`-issued launch grant drives exactly one
+    /// registered automatic-safe effect via
+    /// [`drive_validated_dispatched_attempt`], which derives the intent only
+    /// from the admitted manifest binding, mints the one-shot permit
+    /// in-process through the real `DoctorDispatchAuthority` (broker pattern:
+    /// grant digest, epoch, and fence build the local context,
+    /// `ProcessRequest::new` binds the permit, and the executor consumes it
+    /// behind `DispatchValidationPort`), then runs the single consuming
+    /// effect on the executor. Test doubles stay in this module; production
+    /// never uses them.
+    #[tokio::test]
+    async fn validated_grant_drives_one_effect_through_real_authority() {
+        if let Err(detail) = drive_validated_grant_through_real_authority().await {
+            panic!("validated grant must drive one effect: {detail}");
+        }
+    }
+
+    async fn drive_validated_grant_through_real_authority() -> Result<(), String> {
+        use crate::dispatch_authority::DoctorDispatchAuthority;
+
+        let now = OffsetDateTime::now_utc();
+        let now_ms = u64::try_from(now.unix_timestamp_nanos() / 1_000_000)
+            .map_err(|error| error.to_string())?;
+        let (request, manifest) = effect_request(now);
+        let epoch = test_epoch();
+        let generation = request.fence.generation;
+        let envelope = DispatchedAttemptEnvelope {
+            attempt: test_envelope(&request, ATTEMPT_ID, EFFECT_SEQ),
+            request,
+            manifest,
+            epoch: epoch.clone(),
+            generation,
+            nonce: dispatched_test_nonce(),
+            grant: DispatchGrant {
+                grant_digest: digest(0x61),
+                authority_epoch: epoch.clone(),
+                fence_generation: generation,
+                fence_nonce: "doctor-launch-fence-test01".to_owned(),
+                idempotency_key: "doctor-launch-lease-test01".to_owned(),
+                expires_at: now_ms.saturating_add(60_000),
+            },
+        };
+        let path = write_dispatched_temp(&envelope, "real-authority")?;
+        let validated = read_dispatched_material_from(&path, &epoch)
+            .map_err(|error| error.to_string())?
+            .ok_or_else(|| "valid grant material must present".to_owned())?;
+        if path.exists() {
+            remove_dispatched_temp(&path);
+            return Err("validated material must be consumed once".to_owned());
+        }
+        let admission = honest_admission(
+            &validated.request,
+            &validated.manifest,
+            ATTEMPT_ID,
+            EFFECT_SEQ,
+            &validated.epoch,
+            now,
+        );
+        let expected_effect = admission.effect_digest.clone();
+        let mut transport = FakeTransport::admitting(admission);
+        let authority =
+            Arc::new(DoctorDispatchAuthority::new().map_err(|error| error.to_string())?);
+        let executor = Arc::new(AuthorityBackedExecutor::new(Arc::clone(&authority)));
+        let outcome = drive_validated_dispatched_attempt(
+            &mut transport,
+            &authority,
+            Arc::clone(&executor),
+            Arc::new(EvidenceCollector::new()),
+            &validated,
+            std::path::Path::new("C:/eliot/doctor"),
+            now,
+            now_ms,
+        )
+        .await
+        .map_err(|error| error.to_string())?;
+        if !matches!(
+            outcome.disposition,
+            DoctorDisposition::RepairedPendingVerification { .. }
+        ) {
+            return Err(format!(
+                "expected pending verification, got {:?}",
+                outcome.disposition
+            ));
+        }
+        if outcome.exit_code() != EXIT_PENDING_VERIFICATION {
+            return Err(format!("expected exit 10, got {}", outcome.exit_code()));
+        }
+        if outcome.report.effect_digest != expected_effect {
+            return Err("effect digest must equal the admitted digest".to_owned());
+        }
+        if transport.submits != 1 {
+            return Err(format!("expected one submit, got {}", transport.submits));
+        }
+        if executor.lock().starts != 1 {
+            return Err("expected exactly one effect dispatch".to_owned());
+        }
+        remove_dispatched_temp(&path);
+        Ok(())
+    }
+
     #[test]
     fn binding_digest_binds_escape_rejected_and_drive_derives_intent() {
         // Single behaviour check (DISPATCH-FINISH): the admitted binding
