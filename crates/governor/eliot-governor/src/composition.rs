@@ -21,6 +21,7 @@ use crate::observation_reconciliation::GovernorObservationReconciliation;
 use crate::operator_reconciliation::GovernorOperatorReconciliation;
 use crate::owner_projection_refresh::{coherence_result, compare_scope_heads};
 use crate::skill_lifecycle::GovernorSkillLifecycle;
+use crate::task_lifecycle::GovernorTaskLifecycle;
 use crate::{
     Governor, GovernorConfig, GovernorState, QueueLimits, STARTUP_ORDER, ServiceId,
     ServiceObservation,
@@ -1596,6 +1597,27 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
     pub fn skill_lifecycle(&self) -> GovernorSkillLifecycle<'_, P> {
         GovernorSkillLifecycle::new(
             &self.owners.skill,
+            &self.owners.canonical,
+            self.kernel.as_ref(),
+        )
+    }
+
+    /// Borrows the single task lifecycle owner as a canonical
+    /// [`GovernorTaskLifecycle`](crate::GovernorTaskLifecycle) adapter.
+    ///
+    /// The adapter reads the current `task: TaskLifecycleOwner` owner
+    /// (recovered via the `Task` recovery owner) together with the canonical
+    /// admission owner and the retained neutral Kernel port. It creates no
+    /// per-caller owner; proposals and guarded transitions validate against
+    /// a scratch clone (including the task-revision compare-and-swap base
+    /// and the exact legal-transition rule), commit through the existing
+    /// canonical path as one `UpdateTaskState` / `TaskControl` transition,
+    /// and publish only via `refresh_from_kernel` at the returned receipt
+    /// revisions.
+    #[must_use]
+    pub fn task_lifecycle(&self) -> GovernorTaskLifecycle<'_, P> {
+        GovernorTaskLifecycle::new(
+            &self.owners.task,
             &self.owners.canonical,
             self.kernel.as_ref(),
         )
