@@ -28,6 +28,77 @@ use eliot_store_api::{
 };
 use serde::Deserialize;
 
+fn observe_daemon_request(event: &'static str, outcome: &'static str) {
+    use super::kernel_diagnostics::{KERNEL_DIAGNOSTICS_TARGET, bound_field};
+    let event_bound = bound_field(event);
+    let outcome_bound = bound_field(outcome);
+    tracing::info!(
+        target: KERNEL_DIAGNOSTICS_TARGET,
+        event = event_bound.text(),
+        outcome = outcome_bound.text(),
+        "daemon request observation"
+    );
+}
+
+fn observe_daemon_operation(operation: &str, outcome: &'static str) {
+    use super::kernel_diagnostics::{KERNEL_DIAGNOSTICS_TARGET, bound_field};
+    let op_bound = bound_field(operation);
+    let outcome_bound = bound_field(outcome);
+    tracing::info!(
+        target: KERNEL_DIAGNOSTICS_TARGET,
+        event = "kernel.daemon_request_operation",
+        operation = op_bound.text(),
+        outcome = outcome_bound.text(),
+        "daemon request operation observation"
+    );
+}
+
+fn daemon_terminal_code(error: &TransportError) -> &'static str {
+    match error {
+        TransportError::SessionFenced => "daemon_fenced",
+        TransportError::PeerIdentityUnavailable => "daemon_peer_unavailable",
+        TransportError::Timeout => "daemon_timeout",
+        TransportError::UnknownRequest => "daemon_unknown_request",
+        TransportError::UnknownOutcome => "daemon_unknown_outcome",
+        TransportError::IdentityConflict => "daemon_identity_conflict",
+        TransportError::Cancelled => "daemon_cancelled",
+        TransportError::Backpressure => "daemon_backpressure",
+        TransportError::InvalidLimits => "daemon_invalid_limits",
+        TransportError::UnauthenticatedPeer => "daemon_unauthenticated_peer",
+        TransportError::InvalidPipeName => "daemon_invalid_pipe",
+        TransportError::RegistryFull => "daemon_registry_full",
+        TransportError::Io(_) => "daemon_io",
+        TransportError::PlanGap { .. } => "daemon_plan_gap",
+        TransportError::Protocol(_) => "daemon_protocol",
+    }
+}
+
+fn trusted_daemon_operation(operation: &str) -> &'static str {
+    match operation {
+        "snapshot" => "snapshot",
+        "daemon_ready" => "daemon_ready",
+        "health" => "health",
+        "store_recovery" => "store_recovery",
+        "store_initialize_genesis" => "store_initialize_genesis",
+        "apply_prepared" => "apply_prepared",
+        "receipt" => "receipt",
+        "store_named" => "store_named",
+        "local_read" => "local_read",
+        "daemon_degraded" => "daemon_degraded",
+        "daemon_fatal" => "daemon_fatal",
+        "agent_activation_claim" => "agent_activation_claim",
+        "agent_activation_submit" => "agent_activation_submit",
+        "agent_activation_reconcile" => "agent_activation_reconcile",
+        "local_read_claim" => "local_read_claim",
+        "local_read_result" => "local_read_result",
+        "agent_host_request_submit" => "agent_host_request_submit",
+        "agent_host_request_cancel" => "agent_host_request_cancel",
+        "agent_host_request_reconcile" => "agent_host_request_reconcile",
+        "agent_host_request_rehydrate" => "agent_host_request_rehydrate",
+        _ => "untrusted_operation",
+    }
+}
+
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct StoreNamedOperation {
@@ -85,6 +156,39 @@ impl KernelComposition {
         operation: &str,
         payload: serde_json::Value,
     ) -> Result<Frame, TransportError> {
+        observe_daemon_request("kernel.daemon_request_received", "attempt");
+        observe_daemon_operation(trusted_daemon_operation(operation), "received");
+        let result = self
+            .execute_daemon_request_inner(session, request_id, operation, &payload)
+            .await;
+        match &result {
+            Ok(_) => {
+                observe_daemon_request("kernel.daemon_request_validated", "success");
+                observe_daemon_request("kernel.daemon_request_admitted", "success");
+                observe_daemon_operation(trusted_daemon_operation(operation), "dispatched");
+                observe_daemon_request("kernel.daemon_response_prepared", "success");
+                observe_daemon_request("kernel.daemon_response_delivered", "success");
+            }
+            Err(error) => {
+                observe_daemon_request("kernel.daemon_request_validated", "fenced");
+                observe_daemon_operation(trusted_daemon_operation(operation), "fenced");
+                super::kernel_diagnostics::observe_terminal_error(daemon_terminal_code(error));
+            }
+        }
+        result
+    }
+
+    #[allow(
+        clippy::too_many_lines,
+        reason = "the closed daemon dispatcher keeps authenticated lifecycle operations and their exact response projection in one audited gateway"
+    )]
+    async fn execute_daemon_request_inner(
+        &self,
+        session: &Session,
+        request_id: RequestId,
+        operation: &str,
+        payload: &serde_json::Value,
+    ) -> Result<Frame, TransportError> {
         if session.module_generation.module_id.as_str() != ACTIVE_DAEMON_CALLER {
             return Err(TransportError::SessionFenced);
         }
@@ -128,7 +232,7 @@ impl KernelComposition {
                     {
                         return Err(TransportError::SessionFenced);
                     }
-                    let ready = Self::eliotd_live_ready_evidence(session, &request_id, &payload)
+                    let ready = Self::eliotd_live_ready_evidence(session, &request_id, payload)
                         .map_err(|_| TransportError::SessionFenced)?;
                     {
                         let mut state = self
@@ -159,18 +263,21 @@ impl KernelComposition {
                 .await
                 .map_err(|_| TransportError::SessionFenced)
                 .map(|health| Self::daemon_health_response(&health)),
-            "store_recovery" => self.store_recovery_operation(session, payload).await,
+            "store_recovery" => {
+                self.store_recovery_operation(session, payload.clone())
+                    .await
+            }
             "store_initialize_genesis" => {
-                self.store_initialize_genesis_operation(session, payload)
+                self.store_initialize_genesis_operation(session, payload.clone())
                     .await
             }
             "apply_prepared" => {
-                self.store_apply_operation(session, request_id.clone(), payload)
+                self.store_apply_operation(session, request_id.clone(), payload.clone())
                     .await
             }
-            "receipt" => store_receipt_dispatch::dispatch(self, session, payload).await,
-            "store_named" => self.store_named_operation(session, payload).await,
-            "local_read" => self.local_read_operation(session, payload).await,
+            "receipt" => store_receipt_dispatch::dispatch(self, session, payload.clone()).await,
+            "store_named" => self.store_named_operation(session, payload.clone()).await,
+            "local_read" => self.local_read_operation(session, payload.clone()).await,
             "daemon_degraded" => {
                 let reason = payload
                     .get("reason")
@@ -402,7 +509,7 @@ impl KernelComposition {
                 // connection/descriptor/fence/generation/durability join; a
                 // changed binding under a known identity conflicts, an unknown
                 // parent is unknown, and an elapsed deadline times out there.
-                let envelope = host_request_route::host_request_envelope_from_payload(&payload)?;
+                let envelope = host_request_route::host_request_envelope_from_payload(payload)?;
                 let (receipt, record) = self.admit_host_request_envelope(&envelope)?;
                 Ok(host_request_route::host_request_admitted_response(
                     &receipt, &record,
@@ -410,7 +517,7 @@ impl KernelComposition {
             }
             #[cfg(windows)]
             "agent_host_request_cancel" => {
-                let envelope = host_request_route::host_request_envelope_from_payload(&payload)?;
+                let envelope = host_request_route::host_request_envelope_from_payload(payload)?;
                 let (receipt, record) = self.cancel_host_request(&envelope)?;
                 Ok(host_request_route::host_request_admitted_response(
                     &receipt, &record,
@@ -418,7 +525,7 @@ impl KernelComposition {
             }
             #[cfg(windows)]
             "agent_host_request_reconcile" => {
-                let envelope = host_request_route::host_request_envelope_from_payload(&payload)?;
+                let envelope = host_request_route::host_request_envelope_from_payload(payload)?;
                 let (receipt, record) = self.reconcile_host_request(&envelope)?;
                 Ok(host_request_route::host_request_admitted_response(
                     &receipt, &record,
@@ -426,8 +533,8 @@ impl KernelComposition {
             }
             #[cfg(windows)]
             "agent_host_request_rehydrate" => {
-                let envelope = host_request_route::host_request_envelope_from_payload(&payload)?;
-                let receipt = host_request_route::host_request_receipt_from_payload(&payload)?;
+                let envelope = host_request_route::host_request_envelope_from_payload(payload)?;
+                let receipt = host_request_route::host_request_receipt_from_payload(payload)?;
                 let record = self.rehydrate_host_request(&envelope, &receipt)?;
                 Ok(host_request_route::host_request_rehydrated_response(
                     &record,

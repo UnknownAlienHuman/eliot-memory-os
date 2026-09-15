@@ -17,7 +17,31 @@ use super::{
     Session, SessionId, TransportError,
 };
 
+fn observe_session_guard(event: &'static str, outcome: &'static str) {
+    use super::kernel_diagnostics::{KERNEL_DIAGNOSTICS_TARGET, bound_field};
+    let event_bound = bound_field(event);
+    let outcome_bound = bound_field(outcome);
+    tracing::info!(
+        target: KERNEL_DIAGNOSTICS_TARGET,
+        event = event_bound.text(),
+        outcome = outcome_bound.text(),
+        "daemon session guard observation"
+    );
+}
+
 pub(crate) fn caller_binding(
+    session: &Session,
+) -> Result<(ProcessOwnerBinding, ProcessSessionBinding), TransportError> {
+    observe_session_guard("kernel.session_guard_bind", "attempt");
+    let result = caller_binding_inner(session);
+    match &result {
+        Ok(_) => observe_session_guard("kernel.session_guard_bind", "success"),
+        Err(_) => observe_session_guard("kernel.session_guard_bind", "fenced"),
+    }
+    result
+}
+
+fn caller_binding_inner(
     session: &Session,
 ) -> Result<(ProcessOwnerBinding, ProcessSessionBinding), TransportError> {
     session
@@ -61,6 +85,16 @@ pub(crate) fn caller_binding(
 /// one-shot Doctor module has no durable process-session contour on this
 /// base, so it admits nothing here and stays fail-closed at the seams.
 pub(crate) fn process_session_class_for_module(module_id: &str) -> Option<ProcessSessionClass> {
+    observe_session_guard("kernel.session_class_resolve", "attempt");
+    let result = process_session_class_for_module_inner(module_id);
+    match &result {
+        Some(_) => observe_session_guard("kernel.session_class_resolve", "success"),
+        None => observe_session_guard("kernel.session_class_resolve", "fenced"),
+    }
+    result
+}
+
+fn process_session_class_for_module_inner(module_id: &str) -> Option<ProcessSessionClass> {
     if module_id == ACTIVE_DAEMON_CALLER {
         Some(ProcessSessionClass::EliotdGeneration)
     } else if module_id == TESTD_MODULE_ID {
@@ -85,6 +119,23 @@ pub(crate) fn process_session_class_for_module(module_id: &str) -> Option<Proces
 /// domain-separated digest is one-way; no session value is ever parsed back
 /// into a connection.
 pub(crate) fn durable_caller_session_id(
+    class: ProcessSessionClass,
+    module_id: &str,
+    peer_sid: &str,
+    peer_session: &str,
+    generation: Generation,
+) -> Result<eliot_process::SessionId, TransportError> {
+    observe_session_guard("kernel.session_durable_id", "attempt");
+    let result =
+        durable_caller_session_id_inner(class, module_id, peer_sid, peer_session, generation);
+    match &result {
+        Ok(_) => observe_session_guard("kernel.session_durable_id", "success"),
+        Err(_) => observe_session_guard("kernel.session_durable_id", "fenced"),
+    }
+    result
+}
+
+fn durable_caller_session_id_inner(
     class: ProcessSessionClass,
     module_id: &str,
     peer_sid: &str,
@@ -121,6 +172,19 @@ impl KernelComposition {
     /// two pipes for one principal resolve to one durable session with two
     /// distinct ephemeral bindings.
     pub(crate) fn admitted_process_caller_session(
+        &self,
+        session: &Session,
+    ) -> Result<ProcessCallerSession, TransportError> {
+        observe_session_guard("kernel.session_admitted_caller", "attempt");
+        let result = self.admitted_process_caller_session_inner(session);
+        match &result {
+            Ok(_) => observe_session_guard("kernel.session_admitted_caller", "success"),
+            Err(_) => observe_session_guard("kernel.session_admitted_caller", "fenced"),
+        }
+        result
+    }
+
+    fn admitted_process_caller_session_inner(
         &self,
         session: &Session,
     ) -> Result<ProcessCallerSession, TransportError> {
@@ -164,6 +228,17 @@ impl KernelComposition {
     /// no admitted daemon session and Start stays fenced.
     #[cfg(windows)]
     fn admitted_eliotd_session_id(&self) -> Result<SessionId, TransportError> {
+        observe_session_guard("kernel.session_eliotd_id", "attempt");
+        let result = self.admitted_eliotd_session_id_inner();
+        match &result {
+            Ok(_) => observe_session_guard("kernel.session_eliotd_id", "success"),
+            Err(_) => observe_session_guard("kernel.session_eliotd_id", "fenced"),
+        }
+        result
+    }
+
+    #[cfg(windows)]
+    fn admitted_eliotd_session_id_inner(&self) -> Result<SessionId, TransportError> {
         let launch = self
             .active_daemon_launch()
             .map_err(|_| TransportError::SessionFenced)?
@@ -185,6 +260,8 @@ impl KernelComposition {
     /// no daemon session can be admitted.
     #[cfg(not(windows))]
     fn admitted_eliotd_session_id(&self) -> Result<SessionId, TransportError> {
+        observe_session_guard("kernel.session_eliotd_id", "attempt");
+        observe_session_guard("kernel.session_eliotd_id", "fenced");
         Err(TransportError::SessionFenced)
     }
 
@@ -204,12 +281,39 @@ impl KernelComposition {
         &self,
         session: &Session,
     ) -> Result<ProcessTransportRebindReceipt, TransportError> {
+        observe_session_guard("kernel.session_rebind", "attempt");
+        let result = self.rebind_process_transport_inner(session);
+        match &result {
+            Ok(_) => observe_session_guard("kernel.session_rebind", "success"),
+            Err(_) => observe_session_guard("kernel.session_rebind", "fenced"),
+        }
+        result
+    }
+
+    fn rebind_process_transport_inner(
+        &self,
+        session: &Session,
+    ) -> Result<ProcessTransportRebindReceipt, TransportError> {
         let caller = self.admitted_process_caller_session(session)?;
         ProcessTransportRebindReceipt::mint(&caller, &session.connection_id, session.session_epoch)
             .map_err(|_| TransportError::SessionFenced)
     }
     #[cfg(windows)]
     pub(crate) fn require_current_daemon_session(
+        &self,
+        session: &Session,
+    ) -> Result<(), TransportError> {
+        observe_session_guard("kernel.session_current_guard", "attempt");
+        let result = self.require_current_daemon_session_inner(session);
+        match &result {
+            Ok(()) => observe_session_guard("kernel.session_current_guard", "success"),
+            Err(_) => observe_session_guard("kernel.session_current_guard", "fenced"),
+        }
+        result
+    }
+
+    #[cfg(windows)]
+    fn require_current_daemon_session_inner(
         &self,
         session: &Session,
     ) -> Result<(), TransportError> {

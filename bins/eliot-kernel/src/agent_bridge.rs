@@ -30,6 +30,38 @@ use eliot_protocol::{
     ProtocolPayload,
 };
 
+fn observe_bridge(event: &'static str, outcome: &'static str) {
+    use super::kernel_diagnostics::{KERNEL_DIAGNOSTICS_TARGET, bound_field};
+    let event_bound = bound_field(event);
+    let outcome_bound = bound_field(outcome);
+    tracing::info!(
+        target: KERNEL_DIAGNOSTICS_TARGET,
+        event = event_bound.text(),
+        outcome = outcome_bound.text(),
+        "agent bridge observation"
+    );
+}
+
+fn bridge_terminal_code(error: &TransportError) -> &'static str {
+    match error {
+        TransportError::SessionFenced => "bridge_fenced",
+        TransportError::PeerIdentityUnavailable => "bridge_peer_unavailable",
+        TransportError::Timeout => "bridge_timeout",
+        TransportError::UnknownRequest => "bridge_unknown_request",
+        TransportError::UnknownOutcome => "bridge_unknown_outcome",
+        TransportError::IdentityConflict => "bridge_identity_conflict",
+        TransportError::Cancelled => "bridge_cancelled",
+        TransportError::Backpressure => "bridge_backpressure",
+        TransportError::InvalidLimits => "bridge_invalid_limits",
+        TransportError::UnauthenticatedPeer => "bridge_unauthenticated_peer",
+        TransportError::InvalidPipeName => "bridge_invalid_pipe",
+        TransportError::RegistryFull => "bridge_registry_full",
+        TransportError::Io(_) => "bridge_io",
+        TransportError::PlanGap { .. } => "bridge_plan_gap",
+        TransportError::Protocol(_) => "bridge_protocol",
+    }
+}
+
 impl KernelComposition {
     /// Reports whether the exact bounded peer-set selection and Host-approved
     /// bridge profile admit this authenticated OS peer. A positive result is
@@ -41,7 +73,9 @@ impl KernelComposition {
         selection: &NamedPipePeerSelection,
         peer: &PeerIdentity,
     ) -> bool {
-        self.agent_bridge_profile
+        observe_bridge("kernel.bridge_peer_observed", "attempt");
+        let admitted = self
+            .agent_bridge_profile
             .lock()
             .ok()
             .and_then(|profile| profile.clone())
@@ -50,7 +84,13 @@ impl KernelComposition {
                     && selection.module_id() == AGENT_BRIDGE_MODULE_ID
                     && selection.profile_id() == Some(profile.admission.profile_id.as_str())
                     && Self::validate_agent_bridge_peer(&profile.admission, peer).is_ok()
-            })
+            });
+        if admitted {
+            observe_bridge("kernel.bridge_peer_observed", "admitted");
+        } else {
+            observe_bridge("kernel.bridge_peer_observed", "not_admitted");
+        }
+        admitted
     }
 
     #[cfg(windows)]
@@ -58,6 +98,7 @@ impl KernelComposition {
         admission: &AgentBridgeAdmissionDescriptor,
         peer: &PeerIdentity,
     ) -> Result<(), TransportError> {
+        observe_bridge("kernel.bridge_peer_validate", "attempt");
         admission
             .validate()
             .map_err(|_| TransportError::SessionFenced)?;
@@ -212,6 +253,28 @@ impl KernelComposition {
         selection: &NamedPipePeerSelection,
         peer: PeerIdentity,
     ) -> Result<AgentBridgeHandshake, TransportError> {
+        observe_bridge("kernel.bridge_connect", "attempt");
+        let result = self.begin_agent_bridge_inner(selection, peer);
+        match &result {
+            Ok(_) => {
+                observe_bridge("kernel.bridge_connect", "success");
+                observe_bridge("kernel.bridge_attach", "success");
+                observe_bridge("kernel.bridge_readiness", "success");
+            }
+            Err(error) => {
+                observe_bridge("kernel.bridge_connect", "fenced");
+                super::kernel_diagnostics::observe_terminal_error(bridge_terminal_code(error));
+            }
+        }
+        result
+    }
+
+    #[cfg(windows)]
+    fn begin_agent_bridge_inner(
+        &self,
+        selection: &NamedPipePeerSelection,
+        peer: PeerIdentity,
+    ) -> Result<AgentBridgeHandshake, TransportError> {
         let profile = self
             .agent_bridge_profile
             .lock()
@@ -314,6 +377,24 @@ impl KernelComposition {
         connection_id: &str,
         frame: &Frame,
     ) -> Result<eliot_protocol::AgentBridgePeerAdmissionReceipt, TransportError> {
+        observe_bridge("kernel.bridge_hello_accept", "attempt");
+        let result = self.accept_agent_bridge_hello_inner(connection_id, frame);
+        match &result {
+            Ok(_) => observe_bridge("kernel.bridge_hello_accept", "success"),
+            Err(error) => {
+                observe_bridge("kernel.bridge_hello_reject", "fenced");
+                super::kernel_diagnostics::observe_terminal_error(bridge_terminal_code(error));
+            }
+        }
+        result
+    }
+
+    #[cfg(windows)]
+    fn accept_agent_bridge_hello_inner(
+        &self,
+        connection_id: &str,
+        frame: &Frame,
+    ) -> Result<eliot_protocol::AgentBridgePeerAdmissionReceipt, TransportError> {
         let mut connections = self
             .agent_bridge_connections
             .lock()
@@ -354,6 +435,23 @@ impl KernelComposition {
         &self,
         connection_id: &str,
     ) -> Result<Frame, TransportError> {
+        observe_bridge("kernel.bridge_receipt_prepared", "attempt");
+        let result = self.agent_bridge_admission_receipt_frame_inner(connection_id);
+        match &result {
+            Ok(_) => observe_bridge("kernel.bridge_receipt_prepared", "success"),
+            Err(error) => {
+                observe_bridge("kernel.bridge_receipt_prepared", "fenced");
+                super::kernel_diagnostics::observe_terminal_error(bridge_terminal_code(error));
+            }
+        }
+        result
+    }
+
+    #[cfg(windows)]
+    fn agent_bridge_admission_receipt_frame_inner(
+        &self,
+        connection_id: &str,
+    ) -> Result<Frame, TransportError> {
         let connections = self
             .agent_bridge_connections
             .lock()
@@ -379,6 +477,7 @@ impl KernelComposition {
         connection_id: &str,
         frame: &Frame,
     ) -> Result<AgentActivationResolutionTicket, TransportError> {
+        observe_bridge("kernel.bridge_activation_enqueue", "attempt");
         let (request, receipt) = {
             let connections = self
                 .agent_bridge_connections
@@ -507,6 +606,7 @@ impl KernelComposition {
     pub(super) fn claim_agent_activation_ticket(
         &self,
     ) -> Result<Option<AgentActivationResolutionTicket>, TransportError> {
+        observe_bridge("kernel.bridge_activation_claim", "attempt");
         let mut pending = self
             .agent_activation_pending
             .lock()
@@ -519,6 +619,7 @@ impl KernelComposition {
         &self,
         decision: AgentActivationResolutionDecision,
     ) -> Result<(), TransportError> {
+        observe_bridge("kernel.bridge_activation_submit", "attempt");
         decision
             .validate()
             .map_err(|_| TransportError::SessionFenced)?;
@@ -745,6 +846,7 @@ impl KernelComposition {
         &self,
         submit: AgentActivationResultSubmit,
     ) -> Result<AgentActivationResultAck, TransportError> {
+        observe_bridge("kernel.bridge_activation_result_submit", "attempt");
         // Unknown submission versions are rejected before any inner result
         // field is adopted.
         submit
@@ -816,6 +918,7 @@ impl KernelComposition {
         &self,
         query: &AgentActivationResultReconcile,
     ) -> Result<AgentActivationResultAck, TransportError> {
+        observe_bridge("kernel.bridge_activation_reconcile", "attempt");
         query
             .validate()
             .map_err(|_| TransportError::SessionFenced)?;
@@ -1622,15 +1725,22 @@ impl KernelComposition {
     /// Validates one closed bridge activation operation and emits the sole
     /// R13.1b typed denial. No Kernel `Session` or semantic authority is made.
     #[cfg(windows)]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "the activation response keeps request, receipt, and replay checks ordered with its diagnostic terminal"
+    )]
     pub fn agent_bridge_activation_response(
         &self,
         connection_id: &str,
         frame: &Frame,
     ) -> Result<Frame, TransportError> {
-        let mut connections = self
-            .agent_bridge_connections
-            .lock()
-            .map_err(|_| TransportError::SessionFenced)?;
+        observe_bridge("kernel.bridge_activation_request", "attempt");
+        let Ok(mut connections) = self.agent_bridge_connections.lock() else {
+            let err = TransportError::SessionFenced;
+            observe_bridge("kernel.bridge_activation_request", "fenced");
+            super::kernel_diagnostics::observe_terminal_error(bridge_terminal_code(&err));
+            return Err(err);
+        };
         let result = (|| {
             let state = connections
                 .get_mut(connection_id)
@@ -1714,6 +1824,13 @@ impl KernelComposition {
             }
             state.accepted_transport = None;
         }
+        match &result {
+            Ok(_) => observe_bridge("kernel.bridge_activation_request", "success"),
+            Err(error) => {
+                observe_bridge("kernel.bridge_activation_request", "fenced");
+                super::kernel_diagnostics::observe_terminal_error(bridge_terminal_code(error));
+            }
+        }
         result
     }
 
@@ -1731,6 +1848,7 @@ impl KernelComposition {
     /// terminal records, stay under their owner's continuation rules.
     #[cfg(windows)]
     pub fn revoke_agent_bridge(&self, connection_id: &str) {
+        observe_bridge("kernel.bridge_cleanup", "attempt");
         if let Ok(mut connections) = self.agent_bridge_connections.lock()
             && let Some(mut state) = connections.remove(connection_id)
         {
@@ -1762,5 +1880,6 @@ impl KernelComposition {
         }
         self.fence_host_requests_for_connection(connection_id);
         self.agent_activation_changed.notify_waiters();
+        observe_bridge("kernel.bridge_cleanup", "complete");
     }
 }

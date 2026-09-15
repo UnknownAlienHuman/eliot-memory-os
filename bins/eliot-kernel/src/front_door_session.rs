@@ -12,6 +12,56 @@
 
 use super::*;
 
+fn observe_front_door_session(event: &'static str, outcome: &'static str) {
+    use super::kernel_diagnostics::{KERNEL_DIAGNOSTICS_TARGET, bound_field};
+    let event_bound = bound_field(event);
+    let outcome_bound = bound_field(outcome);
+    tracing::info!(
+        target: KERNEL_DIAGNOSTICS_TARGET,
+        event = event_bound.text(),
+        outcome = outcome_bound.text(),
+        "front-door session observation"
+    );
+}
+
+#[cfg(windows)]
+fn observe_peer_snapshot(revision: u64, outcome: &'static str) {
+    use super::kernel_diagnostics::{KERNEL_DIAGNOSTICS_TARGET, bound_field};
+    let outcome_bound = bound_field(outcome);
+    tracing::info!(
+        target: KERNEL_DIAGNOSTICS_TARGET,
+        event = "kernel.front_door_peer_set_snapshot",
+        revision = revision,
+        outcome = outcome_bound.text(),
+        "front-door peer-set snapshot observation"
+    );
+}
+
+#[cfg(windows)]
+fn peer_set_terminal_code(_: &KernelBuildError) -> &'static str {
+    "peer_set_fenced"
+}
+
+fn transport_terminal_code(error: &eliot_ipc::TransportError) -> &'static str {
+    match error {
+        eliot_ipc::TransportError::SessionFenced => "session_fenced",
+        eliot_ipc::TransportError::PeerIdentityUnavailable => "peer_identity_unavailable",
+        eliot_ipc::TransportError::UnauthenticatedPeer => "unauthenticated_peer",
+        eliot_ipc::TransportError::Timeout => "timeout",
+        eliot_ipc::TransportError::UnknownRequest => "unknown_request",
+        eliot_ipc::TransportError::UnknownOutcome => "unknown_outcome",
+        eliot_ipc::TransportError::IdentityConflict => "identity_conflict",
+        eliot_ipc::TransportError::Cancelled => "cancelled",
+        eliot_ipc::TransportError::Backpressure => "backpressure",
+        eliot_ipc::TransportError::InvalidLimits => "invalid_limits",
+        eliot_ipc::TransportError::InvalidPipeName => "invalid_pipe_name",
+        eliot_ipc::TransportError::RegistryFull => "registry_full",
+        eliot_ipc::TransportError::Io(_) => "transport_io",
+        eliot_ipc::TransportError::PlanGap { .. } => "plan_gap",
+        eliot_ipc::TransportError::Protocol(_) => "protocol",
+    }
+}
+
 /// Stable module identity of the one-shot Doctor repair worker (T6-D2 P-07).
 ///
 /// The Doctor never self-asserts authority through this string:
@@ -22,7 +72,7 @@ use super::*;
 ///
 /// NOTE (platform boundary): the OS pipe peer set
 /// (`NamedPipePeerSet`, `MAX_ENTRIES = 3`) admits exactly one Host, Eliotd,
-/// and AgentBridge role and lives in `eliot-platform-windows`, outside Slice-B
+/// and `AgentBridge` role and lives in `eliot-platform-windows`, outside Slice-B
 /// scope. A dedicated fourth OS Doctor role needs that platform change; until
 /// then the Doctor rides an already-authenticated pipe peer and is bound at
 /// session scope here. Invalid peer or epoch gets no protected input.
@@ -38,7 +88,7 @@ pub(crate) const DOCTOR_MODULE_ID: &str = "eliot-doctor";
 ///
 /// NOTE (platform boundary): the OS pipe peer set
 /// (`NamedPipePeerSet`, `MAX_ENTRIES = 3`) admits exactly one Host, Eliotd,
-/// and AgentBridge role and lives in `eliot-platform-windows`, outside Slice-B
+/// and `AgentBridge` role and lives in `eliot-platform-windows`, outside Slice-B
 /// scope. A dedicated fourth OS testd role needs that platform change; until
 /// then testd rides an already-authenticated pipe peer and is bound at
 /// session scope here. Invalid peer or epoch gets no protected input.
@@ -125,7 +175,7 @@ impl KernelComposition {
     /// the promoted Host descriptor while PID/start/session are observed by
     /// the platform adapter for each pipe handle.
     #[cfg(windows)]
-    pub fn front_door_peer_set(
+    fn front_door_peer_set_inner(
         &self,
         host_expectation: &NamedPipePeerExpectation,
     ) -> Result<NamedPipePeerSet, KernelBuildError> {
@@ -225,12 +275,37 @@ impl KernelComposition {
             .map_err(|error| KernelBuildError::Principal(error.to_string()))
     }
 
+    /// Builds the immutable, bounded peer set for the production front door.
+    ///
+    /// Diagnostic wrapper around [`Self::front_door_peer_set_inner`]: emits
+    /// one peer-set observation per attempt plus the single designated
+    /// terminal on failure. No transport, authentication, or peer-set
+    /// semantics change; sink failure never changes the result.
+    #[cfg(windows)]
+    pub fn front_door_peer_set(
+        &self,
+        host_expectation: &NamedPipePeerExpectation,
+    ) -> Result<NamedPipePeerSet, KernelBuildError> {
+        observe_front_door_session("kernel.front_door_peer_set_build", "attempt");
+        let result = self.front_door_peer_set_inner(host_expectation);
+        match &result {
+            Ok(_) => {
+                observe_front_door_session("kernel.front_door_peer_set_build", "success");
+            }
+            Err(error) => {
+                observe_front_door_session("kernel.front_door_peer_set_build", "fenced");
+                super::kernel_diagnostics::observe_terminal_error(peer_set_terminal_code(error));
+            }
+        }
+        result
+    }
+
     /// Returns a peer set paired with the exact revision observed before and
     /// after construction. Monotonic revisions make this snapshot safe from
     /// publishing a stale DACL under a newer revision during concurrent Host
     /// activation or eliotd lifecycle changes.
     #[cfg(windows)]
-    pub fn front_door_peer_set_snapshot(
+    fn front_door_peer_set_snapshot_inner(
         &self,
         host_expectation: &NamedPipePeerExpectation,
     ) -> Result<(u64, NamedPipePeerSet), KernelBuildError> {
@@ -247,8 +322,42 @@ impl KernelComposition {
         ))
     }
 
+    /// Returns a peer set paired with the exact revision observed before and
+    /// after construction.
+    ///
+    /// Diagnostic wrapper: preserves the exact revision pair, emits the
+    /// snapshot observation with the retained revision, and keeps one
+    /// designated terminal per underlying failure. A peer-set propagation
+    /// failure already emitted its terminal inside `front_door_peer_set`,
+    /// so only the continuous-churn failure emits here.
+    #[cfg(windows)]
+    pub fn front_door_peer_set_snapshot(
+        &self,
+        host_expectation: &NamedPipePeerExpectation,
+    ) -> Result<(u64, NamedPipePeerSet), KernelBuildError> {
+        observe_front_door_session("kernel.front_door_peer_set_snapshot", "attempt");
+        let result = self.front_door_peer_set_snapshot_inner(host_expectation);
+        match &result {
+            Ok((revision, _)) => {
+                observe_peer_snapshot(*revision, "success");
+            }
+            Err(error) => {
+                let is_churn = matches!(error, KernelBuildError::Principal(reason) if reason.contains("changed continuously"));
+                if is_churn {
+                    observe_peer_snapshot(self.agent_bridge_peer_set_revision(), "fenced");
+                    super::kernel_diagnostics::observe_terminal_error(peer_set_terminal_code(
+                        error,
+                    ));
+                } else {
+                    observe_front_door_session("kernel.front_door_peer_set_snapshot", "fenced");
+                }
+            }
+        }
+        result
+    }
+
     /// Binds an authenticated local peer to the selected principal/session.
-    pub fn bind_session(
+    fn bind_session_inner(
         &self,
         connection_id: impl Into<String>,
         peer: PeerIdentity,
@@ -301,12 +410,39 @@ impl KernelComposition {
         Session::establish_with_server(connection_id, peer, client, &policy)
     }
 
+    /// Binds an authenticated local peer to the selected principal/session.
+    ///
+    /// Diagnostic wrapper: decode/reject/accept stay distinct, acceptance
+    /// never implies request admission, and exactly one terminal is emitted
+    /// per failed handshake. Subordinate doctor/testd/native/eliotd
+    /// validations emit info only; this wrapper owns the terminal.
+    pub fn bind_session(
+        &self,
+        connection_id: impl Into<String>,
+        peer: PeerIdentity,
+        client: &eliot_protocol::ClientHello,
+    ) -> Result<HandshakeResult, eliot_ipc::TransportError> {
+        observe_front_door_session("kernel.front_door_handshake_decode", "attempt");
+        let result = self.bind_session_inner(connection_id, peer, client);
+        match &result {
+            Ok(_) => {
+                observe_front_door_session("kernel.front_door_handshake_accept", "success");
+            }
+            Err(error) => {
+                observe_front_door_session("kernel.front_door_handshake_reject", "fenced");
+                super::kernel_diagnostics::observe_terminal_error(transport_terminal_code(error));
+            }
+        }
+        result
+    }
+
     #[cfg(windows)]
     fn validate_eliotd_peer(
         &self,
         peer: &PeerIdentity,
         client: &eliot_protocol::ClientHello,
     ) -> Result<(), TransportError> {
+        observe_front_door_session("kernel.front_door_eliotd_peer_validate", "attempt");
         let launch = self
             .active_daemon_launch()
             .map_err(|_| TransportError::SessionFenced)?
@@ -416,6 +552,7 @@ impl KernelComposition {
         peer: PeerIdentity,
         client: &eliot_protocol::ClientHello,
     ) -> Result<HandshakeResult, eliot_ipc::TransportError> {
+        observe_front_door_session("kernel.front_door_doctor_bind", "attempt");
         let connection_id = connection_id.into();
         if connection_id.trim().is_empty() || connection_id.chars().any(char::is_control) {
             return Err(TransportError::SessionFenced);
@@ -507,6 +644,7 @@ impl KernelComposition {
         peer: PeerIdentity,
         client: &eliot_protocol::ClientHello,
     ) -> Result<HandshakeResult, eliot_ipc::TransportError> {
+        observe_front_door_session("kernel.front_door_testd_bind", "attempt");
         let connection_id = connection_id.into();
         if connection_id.trim().is_empty() || connection_id.chars().any(char::is_control) {
             return Err(TransportError::SessionFenced);
@@ -602,6 +740,7 @@ impl KernelComposition {
         peer: PeerIdentity,
         client: &eliot_protocol::ClientHello,
     ) -> Result<HandshakeResult, eliot_ipc::TransportError> {
+        observe_front_door_session("kernel.front_door_native_worker_bind", "attempt");
         let connection_id = connection_id.into();
         if connection_id.trim().is_empty() || connection_id.chars().any(char::is_control) {
             return Err(TransportError::SessionFenced);
