@@ -7,6 +7,9 @@ license.workspace = true
 description = "Deterministic verifier planning, execution coordination, and result normalization"
 
 [dependencies]
+eliot-contracts.workspace = true
+eliot-instrument-api.workspace = true
+eliot-instrument-nextest = { path = "../eliot-instrument-nextest", version = "0.1.0" }
 eliot-types.workspace = true
 sha2.workspace = true
 serde.workspace = true

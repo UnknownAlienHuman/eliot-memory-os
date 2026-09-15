@@ -3,9 +3,8 @@ use eliot_types::verification::VerificationRun;
 use eliot_types::{
     FlakeReport, ProjectId, StatefulDbIsolationReport, TestCostClass, TestCostReport, TestIntent,
     TestInventory, TestKind, TestMetadata, TestStatefulness, TestSuiteProfile,
-    VerificationCommandResult, VerificationCommandStatus, VerificationDecision,
-    VerificationDoctorStatus, VerificationPlan, VerificationRunStatus, VerificationRuntimeClass,
-    VerificationVerdict,
+    VerificationCommandStatus, VerificationDecision, VerificationDoctorStatus, VerificationPlan,
+    VerificationRunStatus, VerificationRuntimeClass, VerificationVerdict,
 };
 use std::collections::BTreeSet;
 use time::OffsetDateTime;
@@ -13,6 +12,8 @@ use time::OffsetDateTime;
 #[path = "test_cost.rs"]
 mod test_cost;
 pub use test_cost::TestCostService;
+
+mod current;
 
 mod report_clusters;
 pub use report_clusters::{FlakeDetectionService, StatefulDbTestIsolationService};
@@ -148,32 +149,15 @@ impl VerificationRunnerService {
                 "verification plan contains unknown commands",
             ));
         }
-        let command_results = plan
-            .required_commands
-            .iter()
-            .map(|command| VerificationCommandResult {
-                command: command.clone(),
-                status: VerificationCommandStatus::Passed,
-                duration_ms: estimated_command_duration_ms(command),
-                stdout_ref: Some(format!("profile-command:{command}")),
-                stderr_ref: None,
-                parsed_test_count: parsed_test_count(command),
-                warnings: if plan.profile_id == "dev-fast" {
-                    vec!["dev-fast is not valid for DONE_VERIFIED".to_owned()]
-                } else {
-                    Vec::new()
-                },
-            })
-            .collect::<Vec<_>>();
-        Ok(VerificationRun {
-            run_id: new_id("verification-run"),
-            plan_id: plan.plan_id.clone(),
-            profile_id: plan.profile_id.clone(),
-            started_at: OffsetDateTime::now_utc(),
-            finished_at: Some(OffsetDateTime::now_utc()),
-            command_results,
-            status: VerificationRunStatus::Passed,
-        })
+        // Legacy promotion removed (T7-S2): a `Passed` run fabricated without
+        // executing anything can never satisfy a finish gate. Callers must run
+        // the admitted invocation through the registered nextest provider and
+        // evaluate it with `run_current`, which binds the admitted plan, the
+        // admitted invocation, and digest-checked raw evidence together.
+        Err(rejected(
+            "verification-runner",
+            "legacy profile-record promotion without execution was removed (T7-S2); run the admitted invocation through the registered nextest provider and evaluate it with run_current",
+        ))
     }
 }
 
@@ -672,28 +656,6 @@ fn runtime_class_for(profile_id: &str) -> VerificationRuntimeClass {
         "change-gate" | "provider-gate" | "service-gate" => VerificationRuntimeClass::Medium,
         "deep" => VerificationRuntimeClass::Deep,
         _ => VerificationRuntimeClass::Full,
-    }
-}
-
-fn estimated_command_duration_ms(command: &str) -> u64 {
-    if command == "just verify" {
-        850_000
-    } else if command.contains("historical-") && command.contains("closeout") {
-        12_000
-    } else if command.contains("cargo audit") || command.contains("cargo deny") {
-        3_000
-    } else {
-        500
-    }
-}
-
-fn parsed_test_count(command: &str) -> Option<u64> {
-    if command == "just verify" {
-        Some(397)
-    } else if command.contains("cargo test") {
-        Some(12)
-    } else {
-        None
     }
 }
 
