@@ -89,6 +89,76 @@ pub const TESTD_MAX_ENVELOPE_BYTES: usize = 65_536;
 /// Maximum changed-dimension entries admitted in one testd conflict report.
 pub const TESTD_CONFLICT_MAX_FIELDS: usize = 32;
 
+/// The single admitted testd profile in this slice.
+///
+/// Mirrors `TESTD_ADMITTED_PROFILE` in `eliot-testd-core` (canonical
+/// owner; this crate carries no `eliot-testd-core` dependency, so the
+/// value is mirrored, not imported). In this slice the `cargo-test`
+/// profile executes the bounded `cargo --version` tool probe.
+pub const TESTD_ADMITTED_PROFILE: &str = "cargo-test";
+/// Relative program for the admitted probe, mirrored from `eliot-testd-core`.
+pub const TESTD_PROFILE_PROGRAM: &str = "cargo";
+/// Fixed argv for the admitted probe, mirrored from `eliot-testd-core`.
+pub const TESTD_PROFILE_ARGV: &[&str] = &["--version"];
+/// Bounded wall timeout for the probe in milliseconds, mirrored.
+pub const TESTD_PROFILE_WALL_TIMEOUT_MS: u64 = 15_000;
+/// Bounded CPU ceiling for the probe in milliseconds, mirrored.
+pub const TESTD_PROFILE_CPU_TIME_MS: u64 = 5_000;
+/// Bounded memory ceiling for the probe in bytes, mirrored.
+pub const TESTD_PROFILE_MEMORY_BYTES: u64 = 256 * 1024 * 1024;
+/// Bounded stdout capture for the probe in bytes, mirrored.
+pub const TESTD_PROFILE_STDOUT_BYTES: u64 = 64 * 1024;
+/// Bounded stderr capture for the probe in bytes, mirrored.
+pub const TESTD_PROFILE_STDERR_BYTES: u64 = 64 * 1024;
+/// Bounded descendant ceiling for the probe, mirrored.
+pub const TESTD_PROFILE_MAX_DESCENDANTS: u32 = 4;
+
+/// Computes the canonical definition digest over the static admitted
+/// profile fields.
+///
+/// Mirrors `testd_definition_digest` in `eliot-testd-core` (canonical
+/// owner of the registry): the canonical shape (field names and JSON
+/// representation) must stay identical there, because
+/// `canonical_json_bytes` sorts object keys and only the field set and
+/// values must agree. Excludes the per-host installed artifact digest,
+/// which binds later at Drive time through the intent's
+/// `executable_sha256`, so this value is stable across hosts.
+fn testd_profile_definition_digest() -> Result<String, KernelServiceError> {
+    #[derive(Serialize)]
+    struct Canonical<'a> {
+        cpu_time_ms: Option<u64>,
+        env_allowlist: &'a [String],
+        fixed_argv: &'a [String],
+        max_descendants: u32,
+        memory_bytes: Option<u64>,
+        profile: &'a str,
+        program_path: &'a str,
+        stderr_bytes: u64,
+        stdout_bytes: u64,
+        wall_timeout_ms: u64,
+    }
+    let empty: Vec<String> = Vec::new();
+    let argv: Vec<String> = TESTD_PROFILE_ARGV.iter().map(ToString::to_string).collect();
+    let canonical = Canonical {
+        cpu_time_ms: Some(TESTD_PROFILE_CPU_TIME_MS),
+        env_allowlist: &empty,
+        fixed_argv: &argv,
+        max_descendants: TESTD_PROFILE_MAX_DESCENDANTS,
+        memory_bytes: Some(TESTD_PROFILE_MEMORY_BYTES),
+        profile: TESTD_ADMITTED_PROFILE,
+        program_path: TESTD_PROFILE_PROGRAM,
+        stderr_bytes: TESTD_PROFILE_STDERR_BYTES,
+        stdout_bytes: TESTD_PROFILE_STDOUT_BYTES,
+        wall_timeout_ms: TESTD_PROFILE_WALL_TIMEOUT_MS,
+    };
+    canonical_json_bytes(&canonical)
+        .map(|bytes| sha256_hex(&bytes))
+        .map_err(|_| KernelServiceError::InvalidField {
+            field: "testd_admission.profile_binding_digest",
+            reason: "cannot canonicalize profile binding",
+        })
+}
+
 /// Returns whether Kernel currently advertises the testd admission operation.
 ///
 /// Always `false` in this slice: the tree stays fail-closed until the binary
@@ -304,11 +374,16 @@ impl TestdAdmissionAttemptRequest {
 ///
 /// This is the front-door admission receipt only: it carries the wire
 /// identity, the bound job and request digests, the admitted operation, and
-/// cancellation. The admission digest is canonical over every field, so
-/// rebuilding with the durable admission time reproduces the exact same
-/// admission on replay. Durable job state (payload binding, sequencing,
-/// leases) lives in the testd owner's store; this receipt binds the
-/// front-door admission, never the durable job row.
+/// cancellation, plus the admitted profile record (`profile` and
+/// `profile_binding_digest`). The closed front-door envelope stays
+/// `{job_id, operation_id, cancellation, fence}`: the executable binding
+/// (relative program, fixed argv, environment allowlist, timeout/output
+/// caps) rides this admitted profile record instead, and the admission
+/// digest is canonical over every field, so a substituted profile or
+/// widened binding fails the digest. Rebuilding with the durable admission
+/// time reproduces the exact same admission on replay. Durable job state
+/// (payload binding, sequencing, leases) lives in the testd owner's store;
+/// this receipt binds the front-door admission, never the durable job row.
 #[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct TestdAdmission {
@@ -323,6 +398,14 @@ pub struct TestdAdmission {
     /// Admitted operation. Cancelled admissions carry the presented
     /// operation but bind no process identity.
     pub operation_id: String,
+    /// Admitted testd profile. Exactly one profile is admitted in this
+    /// slice (`TESTD_ADMITTED_PROFILE`); anything else is refused.
+    pub profile: String,
+    /// Canonical definition digest over the static admitted profile
+    /// fields (relative program, fixed argv, environment allowlist,
+    /// timeout/output caps). The per-host installed artifact digest binds
+    /// later at Drive time through the intent's `executable_sha256`.
+    pub profile_binding_digest: String,
     /// Whether the job was admitted cancelled; cancelled admissions never
     /// stage execution work.
     pub cancelled: bool,
@@ -345,6 +428,8 @@ impl TestdAdmission {
             job_id: &'a str,
             request_digest: &'a str,
             operation_id: &'a str,
+            profile: &'a str,
+            profile_binding_digest: &'a str,
             cancelled: bool,
             admitted_at_unix_nanos: u64,
         }
@@ -354,6 +439,8 @@ impl TestdAdmission {
             job_id: &self.job_id,
             request_digest: &self.request_digest,
             operation_id: &self.operation_id,
+            profile: &self.profile,
+            profile_binding_digest: &self.profile_binding_digest,
             cancelled: self.cancelled,
             admitted_at_unix_nanos: self.admitted_at_unix_nanos,
         };
@@ -385,11 +472,27 @@ impl TestdAdmission {
         ] {
             validate_wire_text(text, field)?;
         }
+        if self.profile != TESTD_ADMITTED_PROFILE {
+            return Err(KernelServiceError::InvalidField {
+                field: "testd_admission.profile",
+                reason: "testd admits only the closed cargo-test tool-probe profile",
+            });
+        }
         for (digest, field) in [
             (&self.request_digest, "testd_admission.request_digest"),
+            (
+                &self.profile_binding_digest,
+                "testd_admission.profile_binding_digest",
+            ),
             (&self.admission_digest, "testd_admission.admission_digest"),
         ] {
             validate_wire_digest(digest, field)?;
+        }
+        if self.profile_binding_digest != testd_profile_definition_digest()? {
+            return Err(KernelServiceError::InvalidField {
+                field: "testd_admission.profile_binding_digest",
+                reason: "profile binding digest mismatch",
+            });
         }
         if self.admitted_at_unix_nanos == 0 {
             return Err(KernelServiceError::InvalidField {
@@ -753,7 +856,9 @@ fn testd_job_conflict(
 ///
 /// Rebuilding with the durable admission time reproduces the exact same
 /// admission on replay. Cancelled admissions carry the presented operation
-/// but bind no process identity.
+/// but bind no process identity. The admitted profile record is closed:
+/// exactly one profile exists in this slice, so the gate binds it without
+/// taking executable authority from the caller.
 fn build_testd_admission(
     request: &TestdAdmissionAttemptRequest,
     operation_id: &str,
@@ -766,6 +871,8 @@ fn build_testd_admission(
         job_id: request.job_id.clone(),
         request_digest: request.request_digest.clone(),
         operation_id: operation_id.to_owned(),
+        profile: TESTD_ADMITTED_PROFILE.to_owned(),
+        profile_binding_digest: testd_profile_definition_digest()?,
         cancelled,
         admitted_at_unix_nanos,
         admission_digest: String::new(),
@@ -940,6 +1047,12 @@ pub fn reconcile_testd_admission(
         return Ok(false);
     }
     if admission.cancelled != envelope.cancellation {
+        return Ok(false);
+    }
+    if admission.profile != TESTD_ADMITTED_PROFILE {
+        return Ok(false);
+    }
+    if admission.profile_binding_digest != testd_profile_definition_digest()? {
         return Ok(false);
     }
     let Some(operation_id) = envelope.operation_id.as_deref() else {

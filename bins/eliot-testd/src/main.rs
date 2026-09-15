@@ -1,38 +1,24 @@
 #![forbid(unsafe_code)]
 
+use std::future::Future;
 use std::io::{self, Write};
+use std::sync::Arc;
+use std::task::{Context, Poll, Waker};
 
 use eliot_process::ProcessExecutor;
 use eliot_testd::{
     ADMITTED_WORKER_LEASE_MS, PROTOCOL_VERSION, SERVICE_NAME, TestReceipt, TestdComposition,
+    TestdDerivedIntentParams, TestdDispatchAuthority, compose_process_executor,
+    derive_testd_intent,
     kernel_client::{KernelTestdIpcClient, PresentedAdmission},
-    run_admitted_one_shot,
+    resolve_testd_tool, run_admitted_one_shot,
     testd_material::{ValidatedTestdMaterial, read_testd_material},
 };
+use eliot_testd_core::EvidenceCollector;
 
 const EXIT_KERNEL_ADMISSION_REQUIRED: i32 = 78;
 const KERNEL_ADMISSION_REQUIRED: &str = "KERNEL_ADMISSION_REQUIRED";
 const OPERATION: &str = "eliot.instrument.test.execute";
-
-/// Residual: the admitted material carries no executable binding, so no
-/// [`ProcessIntent`][eliot_process::ProcessIntent] can be derived without
-/// inventing authority. The kernel `TestdAdmissionEnvelope` is exactly
-/// `{job_id, operation_id, cancellation, fence}` (no executable, argv,
-/// working directory, environment, or limits;
-/// `crates/kernel/eliot-kernel-service/src/testd_front_door.rs`), the
-/// concrete [`ProcessRequest`][eliot_process::ProcessRequest] is
-/// `Serialize`-only by design (neither `Clone` nor `Deserialize`, so the
-/// contour never serializes it and this child never deserializes it;
-/// `crates/kernel/eliot-process/src/lib.rs`), and this binary owns no
-/// registry mapping an admitted profile to an executable binding.
-const TESTD_INTENT_RESIDUAL: &str = "issue-20 testd dispatch: admitted material carries no executable binding for ProcessIntent (envelope is job/operation/cancellation/fence only; ProcessRequest is Serialize-only; no profile registry in this binary)";
-/// Residual: the broker-mirror dispatch authority cannot be constructed in
-/// this composition root. `DispatchValidationContext::new` requires
-/// `eliot_platform::ClockObservation`
-/// (`crates/kernel/eliot-process/src/lib.rs`), and this binary has no
-/// `eliot-platform` dependency and takes none; any `validate_and_consume`
-/// without that context would forge validation.
-const TESTD_AUTHORITY_RESIDUAL: &str = "issue-20 testd dispatch: DispatchValidationContext requires eliot_platform::ClockObservation, which this composition root does not depend on; no validate_and_consume without it";
 
 /// Admitted-path terminal codes.
 ///
@@ -114,16 +100,15 @@ fn bootstrap_and_run_once() -> i32 {
             let Some(material) = presented else {
                 return deny();
             };
-            // The file validated, so this invocation carries admitted
-            // session-bound material. Dispatch still cannot drive: building
-            // the in-process permit needs an executable-bound ProcessIntent
-            // plus a ClockObservation-bound validation context, and the
-            // admitted material supplies neither (see TESTD_INTENT_RESIDUAL
-            // and TESTD_AUTHORITY_RESIDUAL). The denial below names both
-            // exact absences instead of the former generic dispatch
-            // residual; the worker itself stays the admitted one-shot driver
-            // and is exercised through `run_admitted_one_shot`.
-            deny_presented_without_dispatch(&material)
+            // Validated session-bound material drives the bounded admitted
+            // probe: the intent derives only from the admitted profile
+            // binding plus the installed tool bytes, the single permit
+            // issues through the ephemeral dispatch authority, and the real
+            // composed executor runs exactly one start. The closed Kernel
+            // bootstrap and advertisement above still gate production until
+            // the dispatch contour lands; this arm is exercised by the
+            // module tests.
+            drive_material_probe(&material)
         }
         GateDecision::DenyNotAdvertised | GateDecision::DenyNoPresentedAttempt => deny(),
     }
@@ -144,20 +129,87 @@ fn acquire_presented_admission() -> Option<ValidatedTestdMaterial> {
     read_testd_material().unwrap_or_default()
 }
 
-/// Denies a presented-but-undrivable admission without effect.
+/// Drives one validated dispatch file through the bounded admitted probe.
 ///
-/// The material validated, so admission is genuinely presented; execution is
-/// refused only because the two remaining dispatch bindings are absent (see
-/// `TESTD_INTENT_RESIDUAL` and `TESTD_AUTHORITY_RESIDUAL`). Prints the
-/// exact residuals instead of the former generic dispatch residual and exits
-/// 78 like every other pre-drive denial. No admitted outcome ever exits 78.
-fn deny_presented_without_dispatch(material: &ValidatedTestdMaterial) -> i32 {
-    let _ = writeln!(
-        io::stderr(),
-        "{KERNEL_ADMISSION_REQUIRED}: service={SERVICE_NAME} protocol={PROTOCOL_VERSION} operation={OPERATION} job={} presented=admitted-material residual_intent={TESTD_INTENT_RESIDUAL} residual_authority={TESTD_AUTHORITY_RESIDUAL}",
-        material.job_id,
-    );
-    EXIT_KERNEL_ADMISSION_REQUIRED
+/// The intent derives only from the admitted profile binding plus the
+/// installed tool bytes (closed registry in `eliot-testd-core`; the fixed
+/// argv, empty environment, and timeout/output caps are never caller
+/// authority), the single permit issues through the ephemeral dispatch
+/// authority over the validated grant, and the real composed executor runs
+/// exactly one start. Cancelled admissions project cancellation without
+/// executing. Every post-derivation outcome maps to a typed non-78 exit;
+/// a refused derivation or issuance (nothing executed) fails the shot
+/// without claiming admission semantics.
+fn drive_material_probe(material: &ValidatedTestdMaterial) -> i32 {
+    if material.cancelled {
+        return EXIT_ADMITTED_CANCELLED;
+    }
+    let now_ms = now_ms();
+    let Ok(tool) = resolve_testd_tool(eliot_testd_core::TESTD_PROFILE_PROGRAM) else {
+        return EXIT_ADMITTED_DRIVE_FAILED;
+    };
+    let params = TestdDerivedIntentParams {
+        job_id: material.job_id.clone(),
+        operation_id: material.operation_id.clone(),
+        profile: material.profile.clone(),
+        generation: material.generation,
+        session_nonce: material.nonce.clone(),
+        executable_absolute: tool.executable_absolute,
+        executable_sha256: tool.executable_sha256,
+        generation_root: generation_root_cwd(),
+    };
+    let Ok(intent) = derive_testd_intent(&params) else {
+        return EXIT_ADMITTED_DRIVE_FAILED;
+    };
+    let Ok(authority) = TestdDispatchAuthority::new() else {
+        return EXIT_ADMITTED_DRIVE_FAILED;
+    };
+    let Ok(request) = authority.issue(&intent, &material.grant, now_ms) else {
+        return EXIT_ADMITTED_DRIVE_FAILED;
+    };
+    let executor = compose_process_executor(Arc::new(authority));
+    let sink: Arc<dyn eliot_process::ProcessEvidenceSink> = Arc::new(EvidenceCollector::default());
+    match block_on_drive(executor.start(request, sink)) {
+        Ok(_) => EXIT_ADMITTED_COMPLETED,
+        Err(eliot_process::ProcessExecutionError::UnknownOutcome) => {
+            EXIT_ADMITTED_RECONCILE_REQUIRED
+        }
+        Err(_) => EXIT_ADMITTED_DRIVE_FAILED,
+    }
+}
+
+/// Working directory for the bounded probe: the dispatch locator
+/// directory (the executable directory carrying the material file), which
+/// exists by construction when material was delivered.
+///
+/// Deferred: the production contour delivers the admitted generation
+/// (source) root for the working directory; the bounded `cargo --version`
+/// probe reads no working directory, so the existing locator directory is
+/// the honest closed stand-in. The derivation re-validates it as an
+/// existing directory before any start.
+fn generation_root_cwd() -> String {
+    if let Some(path) = eliot_testd::testd_material::testd_material_path()
+        && let Some(directory) = path.parent()
+        && directory.is_dir()
+    {
+        return directory.to_string_lossy().into_owned();
+    }
+    std::env::temp_dir().to_string_lossy().into_owned()
+}
+
+/// Minimal std-only driver for the single executor future, mirroring
+/// `worker::block_on_one_shot`: resolves futures that progress without an
+/// external reactor. This binary takes no async runtime dependency.
+fn block_on_drive<F: Future>(future: F) -> F::Output {
+    let waker = Waker::noop();
+    let mut context = Context::from_waker(waker);
+    let mut pinned = Box::pin(future);
+    loop {
+        match pinned.as_mut().poll(&mut context) {
+            Poll::Ready(output) => return output,
+            Poll::Pending => std::thread::yield_now(),
+        }
+    }
 }
 
 /// Drives one admitted one-shot through the worker and projects the typed
@@ -178,6 +230,14 @@ fn drive_admitted<E: ProcessExecutor + 'static>(
     presented: PresentedAdmission,
     executor: &E,
 ) -> i32 {
+    // Closed-profile gate: the admitted drive derives its executable
+    // binding from the registry; an unregistered profile or caller argv
+    // never reaches the worker.
+    if !eliot_testd_core::is_admitted_testd_profile(&presented.invocation.profile)
+        || !presented.invocation.arguments.is_empty()
+    {
+        return EXIT_ADMITTED_DRIVE_FAILED;
+    }
     match run_admitted_one_shot(
         composition,
         presented,
@@ -299,6 +359,11 @@ mod tests {
         };
         assert_eq!(material.job_id, "job-testd-dcf-1");
         assert_eq!(material.operation_id, "testd-op-1");
+        assert_eq!(material.profile, "cargo-test");
+        let Ok(expected_binding) = eliot_testd_core::testd_definition_digest() else {
+            panic!("profile binding digest must compute");
+        };
+        assert_eq!(material.profile_binding_digest, expected_binding);
         assert!(material.epoch.is_same_authority(&live));
         assert_eq!(material.generation, 1);
         assert!(!material.cancelled);
@@ -385,8 +450,11 @@ mod tests {
         );
         let admitted_at = dcf_test_now_nanos();
         assert_ne!(admitted_at, 0);
+        let Ok(profile_binding_digest) = eliot_testd_core::testd_definition_digest() else {
+            panic!("profile binding digest must compute");
+        };
         let admission_digest = dcf_canonical_hex(
-            &serde_json::json!({"wire_id": TESTD_MATERIAL_WIRE_ID, "wire_version": TESTD_MATERIAL_WIRE_VERSION, "job_id": "job-testd-dcf-1", "request_digest": request_digest, "operation_id": "testd-op-1", "cancelled": false, "admitted_at_unix_nanos": admitted_at}),
+            &serde_json::json!({"wire_id": TESTD_MATERIAL_WIRE_ID, "wire_version": TESTD_MATERIAL_WIRE_VERSION, "job_id": "job-testd-dcf-1", "request_digest": request_digest, "operation_id": "testd-op-1", "profile": "cargo-test", "profile_binding_digest": profile_binding_digest, "cancelled": false, "admitted_at_unix_nanos": admitted_at}),
         );
         let Ok(epoch_json) = serde_json::to_string(grant_epoch) else {
             panic!("test epoch must serialize");
@@ -413,7 +481,7 @@ mod tests {
         let file = serde_json::json!({
             "request": {"wire_id": TESTD_MATERIAL_WIRE_ID, "wire_version": TESTD_MATERIAL_WIRE_VERSION, "job_id": "job-testd-dcf-1", "attempt_seq": 0, "closed_request_json": closed_request_json, "target_resource_digest": target_resource_digest, "request_digest": request_digest},
             "envelope": envelope,
-            "admission": {"wire_id": TESTD_MATERIAL_WIRE_ID, "wire_version": TESTD_MATERIAL_WIRE_VERSION, "job_id": "job-testd-dcf-1", "request_digest": request_digest, "operation_id": "testd-op-1", "cancelled": false, "admitted_at_unix_nanos": admitted_at, "admission_digest": admission_digest},
+            "admission": {"wire_id": TESTD_MATERIAL_WIRE_ID, "wire_version": TESTD_MATERIAL_WIRE_VERSION, "job_id": "job-testd-dcf-1", "request_digest": request_digest, "operation_id": "testd-op-1", "profile": "cargo-test", "profile_binding_digest": profile_binding_digest, "cancelled": false, "admitted_at_unix_nanos": admitted_at, "admission_digest": admission_digest},
             "epoch": epoch_value,
             "generation": 1,
             "nonce": nonce,

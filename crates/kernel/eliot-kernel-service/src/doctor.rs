@@ -275,6 +275,11 @@ impl DoctorRecipeRegistry {
     ///
     /// Validates the manifest, every recipe, and every bound identity, and
     /// rejects empty sets and duplicate `(recipe_id, revision)` pairs.
+    /// Every recipe binding must equal the admitted manifest binding for
+    /// the same operation: a recipe bound to a different program, argv,
+    /// env, or caps than the manifest admits fails closed here, before any
+    /// admission. The binding comes from the installed package manifest
+    /// through the supplying composition; Kernel-service mints none.
     pub fn register(
         manifest: RepairRecipeManifest,
         recipes: Vec<RepairRecipe>,
@@ -286,6 +291,24 @@ impl DoctorRecipeRegistry {
         let manifest_digest = manifest.digest();
         let mut registered = Vec::with_capacity(recipes.len());
         for recipe in recipes {
+            recipe.validate()?;
+            for (operation_id, recipe_binding) in &recipe.executable_bindings {
+                let Some(manifest_operation) = manifest
+                    .operations
+                    .iter()
+                    .find(|entry| entry.operation_id == *operation_id)
+                else {
+                    return Err(DoctorRegistryError::Contract(
+                        eliot_doctor_core::DoctorError::ManifestMismatch,
+                    ));
+                };
+                manifest_operation.validate()?;
+                if *recipe_binding != manifest_operation.binding {
+                    return Err(DoctorRegistryError::Contract(
+                        eliot_doctor_core::DoctorError::ManifestMismatch,
+                    ));
+                }
+            }
             let identity = RepairRecipeIdentity::bind(&recipe)?;
             if registered.iter().any(|entry: &RegisteredDoctorRecipe| {
                 entry.recipe.recipe_id == recipe.recipe_id
@@ -1001,6 +1024,35 @@ fn check_doctor_operation<'e>(
         return Err((
             DoctorRepairRejectionReason::EffectNotAuthorized,
             "doctor_repair.lease",
+        ));
+    }
+    // The registered recipe binding for the admitted operation must equal
+    // the admitted manifest binding: registration already proved this, and
+    // the gate re-proves it so a registry built before the binding rule
+    // cannot admit a diverged executable.
+    let Some(recipe_binding) = recipe.executable_bindings.get(operation.operation_id()) else {
+        return Err((
+            DoctorRepairRejectionReason::EffectNotAuthorized,
+            "doctor_repair.allowed_effects",
+        ));
+    };
+    let Some(manifest_operation) = registry
+        .manifest()
+        .operations
+        .iter()
+        .find(|entry| entry.operation_id == *operation.operation_id())
+    else {
+        return Err((
+            DoctorRepairRejectionReason::OperationNotAdmitted,
+            "doctor_repair.operation_manifest",
+        ));
+    };
+    if *recipe_binding != manifest_operation.binding
+        || operation.definition_digest() != manifest_operation.binding.digest()
+    {
+        return Err((
+            DoctorRepairRejectionReason::RecipeDigestMismatch,
+            "doctor_repair.recipe_digest",
         ));
     }
     if matches!(recipe.repair_class, RepairClass::Guarded)
@@ -2193,8 +2245,9 @@ mod tests {
 
     use eliot_contracts::{AuthorityEpoch, EpochId, EpochLineageId, ResourceGeneration};
     use eliot_doctor_core::{
-        ClosedRepairRequest, ClosedRequestParams, DiagnosticBrief, EvidenceHandle, RecoveryLease,
-        RegisteredOperation, RepairClass, RepairRecipe, RepairRecipeManifest, StateFence,
+        BindingArg, ClosedRepairRequest, ClosedRequestParams, DiagnosticBrief, EvidenceHandle,
+        ExecutableBinding, RecoveryLease, RegisteredOperation, RepairClass, RepairRecipe,
+        RepairRecipeManifest, StateFence,
     };
     use eliot_ors::{
         DoctorAttemptAdmission, DoctorAttemptRecord, DoctorAttemptStageOutcome, DoctorAttemptState,
@@ -2468,7 +2521,24 @@ mod tests {
         serde_json::from_value(value).expect("fixture time value")
     }
 
+    fn test_binding() -> ExecutableBinding {
+        let binding = ExecutableBinding {
+            artifact_digest: "a".repeat(64),
+            program: "eliot-doctor.exe".to_owned(),
+            argv: vec![BindingArg::Literal {
+                value: "--version".to_owned(),
+            }],
+            env: std::collections::BTreeMap::new(),
+            timeout_ms: 5_000,
+            max_stdout_bytes: 65_536,
+            max_stderr_bytes: 65_536,
+        };
+        binding.validate().expect("test binding validates");
+        binding
+    }
+
     fn manifest() -> RepairRecipeManifest {
+        let binding = test_binding();
         RepairRecipeManifest {
             manifest_id: "manifest".to_owned(),
             manifest_revision: 1,
@@ -2476,12 +2546,14 @@ mod tests {
                 operation_id: "restart".to_owned(),
                 adapter_id: "adapter".to_owned(),
                 description: "restart the component".to_owned(),
-                definition_digest: "c".repeat(64),
+                definition_digest: binding.digest(),
+                binding,
             }],
         }
     }
 
     fn auto_recipe() -> RepairRecipe {
+        let binding = test_binding();
         RepairRecipe {
             recipe_id: "restart-disk".to_owned(),
             revision: 3,
@@ -2498,6 +2570,7 @@ mod tests {
             attempt_budget: 8,
             cooldown: fixture_time(serde_json::json!([30, 0])),
             stop_conditions: vec!["stop".to_owned()],
+            executable_bindings: [("restart".to_owned(), binding)].into_iter().collect(),
         }
     }
 

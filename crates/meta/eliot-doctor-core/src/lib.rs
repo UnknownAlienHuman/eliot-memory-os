@@ -3,7 +3,7 @@
 use blake3::Hasher;
 use eliot_contracts::{EpochId, ResourceGeneration, StateFence as CanonicalStateFence};
 use serde::{Deserialize, Serialize};
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use thiserror::Error;
 use time::{Duration, OffsetDateTime};
 
@@ -200,6 +200,13 @@ pub struct RepairRecipe {
     pub attempt_budget: u32,
     pub cooldown: Duration,
     pub stop_conditions: Vec<String>,
+    /// Closed executable bindings keyed by operation id. Diagnose-only
+    /// recipes carry none; effect recipes carry exactly one binding per
+    /// listed operation, each keyed under an allowed effect. The digest
+    /// binds every entry, so Kernel admission binds the exact program,
+    /// argv template, env allowlist, and caps.
+    #[serde(default)]
+    pub executable_bindings: BTreeMap<String, ExecutableBinding>,
 }
 
 impl RepairRecipe {
@@ -226,10 +233,34 @@ impl RepairRecipe {
         if self.cooldown.is_negative() {
             return Err(DoctorError::InvalidBudget);
         }
-        if matches!(self.repair_class, RepairClass::DiagnoseOnly)
-            && (!self.allowed_effects.is_empty() || !self.operations.is_empty())
-        {
-            return Err(DoctorError::DiagnoseEffects);
+        if matches!(self.repair_class, RepairClass::DiagnoseOnly) {
+            if !self.allowed_effects.is_empty() || !self.operations.is_empty() {
+                return Err(DoctorError::DiagnoseEffects);
+            }
+            if !self.executable_bindings.is_empty() {
+                return Err(DoctorError::DiagnoseEffects);
+            }
+        } else {
+            // Every listed operation carries exactly one validated binding
+            // under an allowed effect; no unbound operation may execute.
+            let listed: BTreeSet<&str> = self.operations.iter().map(String::as_str).collect();
+            if self.executable_bindings.len() != listed.len() {
+                return Err(DoctorError::MissingField("executable bindings"));
+            }
+            for operation in &self.operations {
+                let Some(binding) = self.executable_bindings.get(operation) else {
+                    return Err(DoctorError::MissingField("executable bindings"));
+                };
+                binding.validate()?;
+                if !self.allowed_effects.contains(operation) {
+                    return Err(DoctorError::EffectAuthorizationMismatch);
+                }
+            }
+            for key in self.executable_bindings.keys() {
+                if !listed.contains(key.as_str()) {
+                    return Err(DoctorError::MissingField("executable bindings"));
+                }
+            }
         }
         Ok(())
     }
@@ -286,6 +317,7 @@ impl RepairRecipe {
             &self.rollback_or_compensation,
         );
         hash_list(&mut hasher, b"stop_conditions", &self.stop_conditions);
+        hash_bindings(&mut hasher, &self.executable_bindings);
         hasher.finalize().to_hex().to_string()
     }
     pub fn applies_to(&self, brief: &DiagnosticBrief) -> bool {
@@ -759,6 +791,8 @@ pub enum DoctorError {
         from: &'static str,
         to: &'static str,
     },
+    #[error("invalid executable binding in {0}")]
+    InvalidBinding(&'static str),
 }
 
 // ============================================================================
@@ -1080,6 +1114,19 @@ fn hash_recipe_body(hasher: &mut Hasher, recipe: &RepairRecipe) {
         &recipe.rollback_or_compensation,
     );
     hash_list(hasher, b"stop_conditions", &recipe.stop_conditions);
+    hash_bindings(hasher, &recipe.executable_bindings);
+}
+
+fn hash_bindings(hasher: &mut Hasher, bindings: &BTreeMap<String, ExecutableBinding>) {
+    hash_field(
+        hasher,
+        b"executable_bindings",
+        &(bindings.len() as u64).to_le_bytes(),
+    );
+    for (operation_id, binding) in bindings {
+        hash_field(hasher, b"bound_operation", operation_id.as_bytes());
+        hash_executable_binding(hasher, binding);
+    }
 }
 
 fn repair_class_tag(class: RepairClass) -> u8 {
@@ -1148,18 +1195,316 @@ impl RepairOperationRef {
     }
 }
 
+/// Domain separator binding `ExecutableBinding` digests to one meaning.
+pub const EXECUTABLE_BINDING_DOMAIN: &str = "eliot.doctor.executable.v1";
+/// Canonical encoding version for `ExecutableBinding`.
+pub const EXECUTABLE_BINDING_VERSION: u8 = 1;
+/// Maximum program path length in bytes (relative to the installed
+/// generation root).
+pub const MAX_BINDING_PROGRAM_LEN: usize = 256;
+/// Maximum argv template entries (literals plus slots).
+pub const MAX_BINDING_ARGV_ENTRIES: usize = 64;
+/// Maximum length of one argv literal or one resolved slot value.
+pub const MAX_BINDING_ARGV_VALUE_LEN: usize = 256;
+/// Maximum env allowlist entries (explicit list, no inherit).
+pub const MAX_BINDING_ENV_ENTRIES: usize = 32;
+/// Maximum env name length in bytes.
+pub const MAX_BINDING_ENV_NAME_LEN: usize = 128;
+/// Maximum env value length in bytes.
+pub const MAX_BINDING_ENV_VALUE_LEN: usize = 1024;
+/// Maximum child wall timeout in milliseconds (30s).
+pub const MAX_BINDING_TIMEOUT_MS: u64 = 30_000;
+/// Maximum captured stdout/stderr bytes per stream (1MiB).
+pub const MAX_BINDING_OUTPUT_BYTES: u64 = 1_048_576;
+
+/// Closed slot filled only from `ClosedRepairRequest` typed fields.
+///
+/// Each variant names one validated request field with its bound: text slots
+/// re-validate via `text` (non-blank, no control) plus the argv value bound,
+/// numeric slots render as decimal and are bounded by their admission checks
+/// (`fence.generation` non-zero via the canonical fence, `budget_units`
+/// non-zero via the closed validation). No caller-bytes passthrough exists:
+/// the template is fixed in the admitted binding and slots resolve only here.
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum BindingSlot {
+    RequestId,
+    ProblemId,
+    Component,
+    FailureClass,
+    RecipeId,
+    FenceGeneration,
+    BudgetUnits,
+}
+
+/// One argv template fragment: a fixed literal from the admitted binding, or
+/// a closed slot filled from validated request fields.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum BindingArg {
+    Literal { value: String },
+    Slot { slot: BindingSlot },
+}
+
+/// Closed executable binding for one registered named effect.
+///
+/// The program runs with its working directory always the installed
+/// generation root (never caller-supplied): `program` is a relative path
+/// below that root (absolute paths, `..` escape, and empty paths are
+/// rejected fail-closed). `artifact_digest` pins the exact installed package
+/// artifact bytes (lowercase SHA-256); the governed executor re-hashes the
+/// file before start. `argv` is a fixed template of literals plus closed
+/// slots (no caller-bytes passthrough). `env` is an explicit allowlist with
+/// no inheritance and no secret material. Timeouts and output caps are
+/// bounded. The canonical `digest()` binds every load-bearing field and is
+/// stored as the operation `definition_digest`, so Kernel admission binds it
+/// via the manifest and recipe digests.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct ExecutableBinding {
+    pub artifact_digest: String,
+    pub program: String,
+    pub argv: Vec<BindingArg>,
+    pub env: BTreeMap<String, String>,
+    pub timeout_ms: u64,
+    pub max_stdout_bytes: u64,
+    pub max_stderr_bytes: u64,
+}
+
+impl ExecutableBinding {
+    pub fn validate(&self) -> Result<(), DoctorError> {
+        hex_digest(&self.artifact_digest, "executable artifact digest")?;
+        validate_binding_program(&self.program)?;
+        if self.argv.len() > MAX_BINDING_ARGV_ENTRIES {
+            return Err(DoctorError::InvalidBinding("argv"));
+        }
+        for arg in &self.argv {
+            match arg {
+                BindingArg::Literal { value } => {
+                    if value.is_empty()
+                        || value.len() > MAX_BINDING_ARGV_VALUE_LEN
+                        || value.chars().any(char::is_control)
+                    {
+                        return Err(DoctorError::InvalidBinding("argv literal"));
+                    }
+                }
+                BindingArg::Slot { .. } => {}
+            }
+        }
+        if self.env.len() > MAX_BINDING_ENV_ENTRIES {
+            return Err(DoctorError::InvalidBinding("env"));
+        }
+        for (name, value) in &self.env {
+            validate_binding_env_name(name)?;
+            if value.len() > MAX_BINDING_ENV_VALUE_LEN
+                || value.chars().any(char::is_control)
+                || looks_like_secret_value(value)
+            {
+                return Err(DoctorError::InvalidBinding("env value"));
+            }
+        }
+        if self.timeout_ms == 0 || self.timeout_ms > MAX_BINDING_TIMEOUT_MS {
+            return Err(DoctorError::InvalidBinding("timeout"));
+        }
+        if self.max_stdout_bytes == 0
+            || self.max_stdout_bytes > MAX_BINDING_OUTPUT_BYTES
+            || self.max_stderr_bytes == 0
+            || self.max_stderr_bytes > MAX_BINDING_OUTPUT_BYTES
+        {
+            return Err(DoctorError::InvalidBinding("output caps"));
+        }
+        Ok(())
+    }
+    /// Canonical digest binding every load-bearing field.
+    pub fn digest(&self) -> String {
+        let mut hasher = Hasher::new();
+        hash_field(&mut hasher, b"domain", EXECUTABLE_BINDING_DOMAIN.as_bytes());
+        hash_field(&mut hasher, b"version", &[EXECUTABLE_BINDING_VERSION]);
+        hash_field(
+            &mut hasher,
+            b"artifact_digest",
+            self.artifact_digest.as_bytes(),
+        );
+        hash_field(&mut hasher, b"program", self.program.as_bytes());
+        hash_field(
+            &mut hasher,
+            b"argv_count",
+            &(self.argv.len() as u64).to_le_bytes(),
+        );
+        for arg in &self.argv {
+            match arg {
+                BindingArg::Literal { value } => {
+                    hash_field(&mut hasher, b"argv_literal", value.as_bytes());
+                }
+                BindingArg::Slot { slot } => {
+                    hash_field(
+                        &mut hasher,
+                        b"argv_slot",
+                        &[match slot {
+                            BindingSlot::RequestId => 0,
+                            BindingSlot::ProblemId => 1,
+                            BindingSlot::Component => 2,
+                            BindingSlot::FailureClass => 3,
+                            BindingSlot::RecipeId => 4,
+                            BindingSlot::FenceGeneration => 5,
+                            BindingSlot::BudgetUnits => 6,
+                        }],
+                    );
+                }
+            }
+        }
+        hash_field(
+            &mut hasher,
+            b"env_count",
+            &(self.env.len() as u64).to_le_bytes(),
+        );
+        for (name, value) in &self.env {
+            hash_field(&mut hasher, b"env_name", name.as_bytes());
+            hash_field(&mut hasher, b"env_value", value.as_bytes());
+        }
+        hash_field(&mut hasher, b"timeout_ms", &self.timeout_ms.to_le_bytes());
+        hash_field(
+            &mut hasher,
+            b"max_stdout_bytes",
+            &self.max_stdout_bytes.to_le_bytes(),
+        );
+        hash_field(
+            &mut hasher,
+            b"max_stderr_bytes",
+            &self.max_stderr_bytes.to_le_bytes(),
+        );
+        hasher.finalize().to_hex().to_string()
+    }
+    /// Resolves the fixed argv template against validated request fields.
+    ///
+    /// Literals pass through (they were validated at binding admission);
+    /// slots fill only from typed `ClosedRepairRequest` fields with bounds
+    /// (non-blank, no control, argv length bound; numerics from admission-
+    /// checked non-zero fields). No argv, stdin, or environment byte ever
+    /// enters here.
+    pub fn resolve_argv(&self, request: &ClosedRepairRequest) -> Result<Vec<String>, DoctorError> {
+        let mut out = Vec::with_capacity(self.argv.len());
+        for arg in &self.argv {
+            match arg {
+                BindingArg::Literal { value } => out.push(value.clone()),
+                BindingArg::Slot { slot } => {
+                    let value = match slot {
+                        BindingSlot::RequestId => request.request_id.clone(),
+                        BindingSlot::ProblemId => request.brief.problem_id.clone(),
+                        BindingSlot::Component => request.brief.component.clone(),
+                        BindingSlot::FailureClass => request.brief.failure_class.clone(),
+                        BindingSlot::RecipeId => request.recipe.recipe_id.clone(),
+                        BindingSlot::FenceGeneration => request.fence.generation.to_string(),
+                        BindingSlot::BudgetUnits => request.budget_units.to_string(),
+                    };
+                    if value.trim().is_empty()
+                        || value.len() > MAX_BINDING_ARGV_VALUE_LEN
+                        || value.chars().any(char::is_control)
+                    {
+                        return Err(DoctorError::InvalidBinding("argv slot"));
+                    }
+                    // Numeric slots must be admission-checked non-zero.
+                    match slot {
+                        BindingSlot::FenceGeneration if request.fence.generation == 0 => {
+                            return Err(DoctorError::InvalidBinding("argv slot"));
+                        }
+                        BindingSlot::BudgetUnits if request.budget_units == 0 => {
+                            return Err(DoctorError::InvalidBinding("argv slot"));
+                        }
+                        _ => {}
+                    }
+                    out.push(value);
+                }
+            }
+        }
+        Ok(out)
+    }
+}
+
+fn validate_binding_program(program: &str) -> Result<(), DoctorError> {
+    if program.trim().is_empty() || program.len() > MAX_BINDING_PROGRAM_LEN {
+        return Err(DoctorError::InvalidBinding("program"));
+    }
+    if program.chars().any(char::is_control) {
+        return Err(DoctorError::InvalidBinding("program"));
+    }
+    // Absolute paths are rejected on both platforms: POSIX `/`, Windows
+    // `\`, UNC, and drive-letter (`C:`) prefixes. `Path::is_absolute` alone
+    // is platform-dependent, so the wire rules are enforced explicitly.
+    if program.starts_with('/') || program.starts_with('\\') {
+        return Err(DoctorError::InvalidBinding("program"));
+    }
+    let bytes = program.as_bytes();
+    if bytes.len() >= 2 && bytes[1] == b':' {
+        return Err(DoctorError::InvalidBinding("program"));
+    }
+    for segment in program.split(['/', '\\']) {
+        if segment.is_empty() || segment == "." || segment == ".." {
+            return Err(DoctorError::InvalidBinding("program"));
+        }
+    }
+    Ok(())
+}
+
+fn validate_binding_env_name(name: &str) -> Result<(), DoctorError> {
+    if name.is_empty() || name.len() > MAX_BINDING_ENV_NAME_LEN {
+        return Err(DoctorError::InvalidBinding("env name"));
+    }
+    if !name
+        .bytes()
+        .all(|b| b.is_ascii_uppercase() || b.is_ascii_digit() || b == b'_')
+    {
+        return Err(DoctorError::InvalidBinding("env name"));
+    }
+    if !(name.as_bytes()[0].is_ascii_uppercase() || name.as_bytes()[0] == b'_') {
+        return Err(DoctorError::InvalidBinding("env name"));
+    }
+    let upper = name.to_ascii_uppercase();
+    for marker in [
+        "PASSWORD",
+        "PASSWD",
+        "TOKEN",
+        "SECRET",
+        "PRIVATE_KEY",
+        "API_KEY",
+        "CREDENTIAL",
+    ] {
+        if upper.contains(marker) {
+            return Err(DoctorError::InvalidBinding("env name"));
+        }
+    }
+    Ok(())
+}
+
+fn looks_like_secret_value(value: &str) -> bool {
+    let lower = value.to_ascii_lowercase();
+    lower.contains("bearer ") || lower.contains("sk-") || lower.contains("-----begin ")
+}
+
+fn hash_executable_binding(hasher: &mut Hasher, binding: &ExecutableBinding) {
+    hash_field(
+        hasher,
+        b"binding_artifact_digest",
+        binding.artifact_digest.as_bytes(),
+    );
+    hash_field(hasher, b"binding_program", binding.program.as_bytes());
+    hash_field(hasher, b"binding_digest", binding.digest().as_bytes());
+}
+
 /// One registered named operation inside a Kernel/Governor manifest.
 ///
 /// `description` is human-readable and intentionally non-executable: it is
 /// never consulted for resolution, admission, or identity, and it is
 /// excluded from the manifest digest so editorial text changes cannot
-/// alter authority. Only `definition_digest` binds the executable meaning.
+/// alter authority. `definition_digest` binds the executable meaning: it
+/// must equal `binding.digest()`, so the manifest and recipe digests bind
+/// the exact program, argv template, env allowlist, and caps.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct RegisteredOperation {
     pub operation_id: String,
     pub adapter_id: String,
     pub description: String,
     pub definition_digest: String,
+    pub binding: ExecutableBinding,
 }
 
 impl RegisteredOperation {
@@ -1167,7 +1512,12 @@ impl RegisteredOperation {
         text(&self.operation_id, "operation id")?;
         text(&self.adapter_id, "adapter id")?;
         text(&self.description, "operation description")?;
-        hex_digest(&self.definition_digest, "operation definition digest")
+        hex_digest(&self.definition_digest, "operation definition digest")?;
+        self.binding.validate()?;
+        if self.definition_digest != self.binding.digest() {
+            return Err(DoctorError::InvalidManifest);
+        }
+        Ok(())
     }
 }
 
@@ -1198,7 +1548,9 @@ impl RepairRecipeManifest {
     }
     /// Digest of the load-bearing manifest content: identity, revision,
     /// and every registered operation except its non-executable
-    /// description. Deterministic across serialization and restart.
+    /// description. The executable binding enters explicitly, so a tampered
+    /// program path or argv changes the digest and fails admission.
+    /// Deterministic across serialization and restart.
     pub fn digest(&self) -> String {
         let mut hasher = Hasher::new();
         hash_field(&mut hasher, b"domain", MANIFEST_IDENTITY_DOMAIN.as_bytes());
@@ -1226,6 +1578,7 @@ impl RepairRecipeManifest {
                 b"definition_digest",
                 operation.definition_digest.as_bytes(),
             );
+            hash_executable_binding(&mut hasher, &operation.binding);
         }
         hasher.finalize().to_hex().to_string()
     }
@@ -1260,6 +1613,89 @@ impl RepairRecipeManifest {
             Err(DoctorError::ManifestMismatch)
         }
     }
+}
+
+/// Stable operation id for the read-only installed-health probe.
+pub const HEALTH_PROBE_OPERATION_ID: &str = "probe-installed-health";
+/// Stable recipe id for the read-only installed-health probe.
+pub const HEALTH_PROBE_RECIPE_ID: &str = "probe-installed-health";
+/// Adapter carrying the health probe (the closed automatic-safe executor).
+pub const HEALTH_PROBE_ADAPTER_ID: &str = "automatic-safe";
+/// Relative program for the health probe below the installed generation
+/// root: the Doctor binary itself. The working directory is always the
+/// generation root, never caller-supplied.
+pub const HEALTH_PROBE_PROGRAM: &str = "eliot-doctor.exe";
+
+/// Builds the closed executable binding for the read-only installed-health
+/// probe from the installed package artifact digest.
+///
+/// The probe runs the installed Doctor binary with `--version` only: no
+/// writes, no shell, bounded timeout and output caps, empty env (no
+/// inherit). `artifact_digest` is the installed package artifact digest
+/// (lowercase SHA-256) from the installation manifest — never invented
+/// here. Fails closed on a malformed digest.
+pub fn health_probe_binding(artifact_digest: &str) -> Result<ExecutableBinding, DoctorError> {
+    let binding = ExecutableBinding {
+        artifact_digest: artifact_digest.to_owned(),
+        program: HEALTH_PROBE_PROGRAM.to_owned(),
+        argv: vec![BindingArg::Literal {
+            value: "--version".to_owned(),
+        }],
+        env: BTreeMap::new(),
+        timeout_ms: 5_000,
+        max_stdout_bytes: 65_536,
+        max_stderr_bytes: 65_536,
+    };
+    binding.validate()?;
+    Ok(binding)
+}
+
+/// Builds the admitted manifest revision carrying the health probe binding.
+pub fn health_probe_manifest(artifact_digest: &str) -> Result<RepairRecipeManifest, DoctorError> {
+    let binding = health_probe_binding(artifact_digest)?;
+    let operation = RegisteredOperation {
+        operation_id: HEALTH_PROBE_OPERATION_ID.to_owned(),
+        adapter_id: HEALTH_PROBE_ADAPTER_ID.to_owned(),
+        description: "read-only probe of the installed generation artifact digest and version line"
+            .to_owned(),
+        definition_digest: binding.digest(),
+        binding,
+    };
+    let manifest = RepairRecipeManifest {
+        manifest_id: "doctor-health-probe".to_owned(),
+        manifest_revision: 1,
+        operations: vec![operation],
+    };
+    manifest.validate()?;
+    Ok(manifest)
+}
+
+/// Builds the automatic-safe health probe recipe bound to the installed
+/// artifact digest.
+pub fn health_probe_recipe(artifact_digest: &str) -> Result<RepairRecipe, DoctorError> {
+    let binding = health_probe_binding(artifact_digest)?;
+    let recipe = RepairRecipe {
+        recipe_id: HEALTH_PROBE_RECIPE_ID.to_owned(),
+        revision: 1,
+        problem_classes: ["installed-health".to_owned()].into_iter().collect(),
+        components: ["doctor-generation".to_owned()].into_iter().collect(),
+        repair_class: RepairClass::AutomaticSafe,
+        prerequisites: Vec::new(),
+        required_authority: "kernel.doctor-recovery".to_owned(),
+        allowed_effects: [HEALTH_PROBE_OPERATION_ID.to_owned()].into_iter().collect(),
+        operations: vec![HEALTH_PROBE_OPERATION_ID.to_owned()],
+        expected_observables: vec!["version-line".to_owned()],
+        verification_contract: vec!["version-line-matches-admitted-artifact".to_owned()],
+        rollback_or_compensation: Vec::new(),
+        attempt_budget: 3,
+        cooldown: Duration::seconds(60),
+        stop_conditions: vec!["probe-failed".to_owned()],
+        executable_bindings: [(HEALTH_PROBE_OPERATION_ID.to_owned(), binding)]
+            .into_iter()
+            .collect(),
+    };
+    recipe.validate()?;
+    Ok(recipe)
 }
 
 /// Owned construction parameters for a `ClosedRepairRequest`.
@@ -1431,6 +1867,30 @@ impl ClosedRepairRequest {
                 return Err(DoctorError::EffectNotLeased(
                     operation.operation_id().to_owned(),
                 ));
+            }
+            // The recipe binding for this operation must equal the admitted
+            // manifest binding: a tampered program path or argv changes the
+            // binding digest, hence the manifest digest and the recipe
+            // digest, and fails here instead of executing.
+            let Some(recipe_binding) = self
+                .recipe
+                .executable_bindings
+                .get(operation.operation_id())
+            else {
+                return Err(DoctorError::MissingField("executable bindings"));
+            };
+            let Some(manifest_operation) = manifest
+                .operations
+                .iter()
+                .find(|entry| entry.operation_id == *operation.operation_id())
+            else {
+                return Err(DoctorError::OperationNotAdmitted);
+            };
+            if *recipe_binding != manifest_operation.binding {
+                return Err(DoctorError::AdmissionMismatch);
+            }
+            if operation.definition_digest() != manifest_operation.binding.digest() {
+                return Err(DoctorError::AdmissionMismatch);
             }
         }
         if matches!(self.recipe.repair_class, RepairClass::Guarded)
@@ -2189,11 +2649,35 @@ mod tests {
         OffsetDateTime::UNIX_EPOCH + Duration::seconds(100)
     }
 
+    fn test_binding() -> ExecutableBinding {
+        let binding = ExecutableBinding {
+            artifact_digest: "a".repeat(64),
+            program: "eliot-doctor.exe".to_owned(),
+            argv: vec![BindingArg::Literal {
+                value: "--version".to_owned(),
+            }],
+            env: BTreeMap::new(),
+            timeout_ms: 5_000,
+            max_stdout_bytes: 65_536,
+            max_stderr_bytes: 65_536,
+        };
+        binding.validate().expect("test binding validates");
+        binding
+    }
+
     fn request(class: RepairClass, effects: &[&str]) -> RepairRequest {
         let operations = if class == RepairClass::DiagnoseOnly {
             Vec::new()
         } else {
             effects.iter().map(|value| (*value).to_owned()).collect()
+        };
+        let executable_bindings = if matches!(class, RepairClass::DiagnoseOnly) {
+            BTreeMap::new()
+        } else {
+            effects
+                .iter()
+                .map(|effect| ((*effect).to_owned(), test_binding()))
+                .collect()
         };
         let recipe = RepairRecipe {
             recipe_id: "recipe".into(),
@@ -2211,6 +2695,7 @@ mod tests {
             attempt_budget: 1,
             cooldown: Duration::ZERO,
             stop_conditions: vec!["stop".into()],
+            executable_bindings,
         };
         RepairRequest {
             request_id: "job-1".into(),
@@ -2295,7 +2780,7 @@ mod tests {
         let baseline = recipe.digest();
         assert_eq!(
             baseline,
-            "d29350b431ed108d5b7606ae6009b77711e3da50bb229d419b389bbbbe999cbd"
+            "9f2a3161046a93e068362e6fa7e411e964234ec8794a185008dc84bef811d6ee"
         );
 
         let mut changed = recipe.clone();
@@ -2306,8 +2791,22 @@ mod tests {
         changed.operations.push("reconnect".into());
         assert_ne!(changed.digest(), baseline);
 
-        let mut changed = recipe;
+        let mut changed = recipe.clone();
         changed.components.insert("other-component".into());
+        assert_ne!(changed.digest(), baseline);
+
+        // The executable binding enters the digest: a tampered program path
+        // or timeout changes identity instead of executing silently.
+        let mut changed = recipe.clone();
+        if let Some(binding) = changed.executable_bindings.get_mut("restart") {
+            binding.program = "tampered.exe".to_owned();
+        }
+        assert_ne!(changed.digest(), baseline);
+
+        let mut changed = recipe;
+        if let Some(binding) = changed.executable_bindings.get_mut("restart") {
+            binding.timeout_ms = 1_000;
+        }
         assert_ne!(changed.digest(), baseline);
     }
 

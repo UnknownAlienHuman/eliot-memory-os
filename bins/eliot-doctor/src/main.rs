@@ -20,12 +20,12 @@ mod kernel_client;
 use std::io::Write as _;
 
 use eliot_doctor::admitted_effect::{
-    BootstrapAction, EXIT_EVIDENCE_FLUSH_FAILED, EXIT_KERNEL_ADMISSION_REQUIRED,
+    BootstrapAction, EXIT_EVIDENCE_FLUSH_FAILED, EXIT_KERNEL_ADMISSION_REQUIRED, EvidenceCollector,
     admission_required_line, decode_bootstrap_args, help_text, version_line,
 };
 use eliot_doctor_core::KernelDoctorClient;
 
-use kernel_client::{DOCTOR_DISPATCH_RESIDUAL, KernelDoctorIpcClient};
+use kernel_client::KernelDoctorIpcClient;
 
 fn main() {
     std::process::exit(run(&std::env::args().collect::<Vec<String>>()));
@@ -106,10 +106,10 @@ fn bootstrap_and_run_once() -> i32 {
     // argv, stdin, or environment value participates in authority.
     // The admitted attempt envelope plus the Kernel-issued launch grant
     // arrive with the dispatch contour and are validated by
-    // `dispatched_material`; the concrete process request is issued
-    // in-process by the local dispatch authority once an honest admitted
-    // intent source exists, and driven by
-    // `kernel_client::drive_admitted_attempt`.
+    // `dispatched_material`; the concrete process intent is derived
+    // in-process ONLY from the Kernel-admitted executable binding, issued
+    // by the local dispatch authority, and driven on the real
+    // `WindowsProcessExecutor` (broker-mirror).
     let mut client = match KernelDoctorIpcClient::connect() {
         Ok(client) => client,
         Err(error) => return deny(&error.to_string()),
@@ -124,26 +124,106 @@ fn bootstrap_and_run_once() -> i32 {
             // stdin, or environment. A missing file presents nothing; a
             // present but invalid file denies here with its typed detail.
             let live_epoch = client.live_epoch().cloned();
-            let attempt_presented = match live_epoch {
+            let validated = match live_epoch {
                 Some(ref epoch) => match dispatched_material::read_dispatched_material(epoch) {
-                    Ok(material) => material.is_some(),
+                    Ok(material) => material,
                     Err(error) => return deny(&error.to_string()),
                 },
-                None => false,
+                None => None,
             };
-            match gate_after_advertise(advertised, attempt_presented) {
-                GateDecision::Drive => deny(&format!(
-                    "kernel advertises the doctor operation and a session-bound attempt file with a validated launch grant is present, but no honest ProcessIntent source exists: the admitted manifest carries no executable binding (operation records bind only an operation id, adapter id, and definition digest) and none is invented here, so the local dispatch authority cannot issue; residual={DOCTOR_DISPATCH_RESIDUAL}"
-                )),
+            match gate_after_advertise(advertised, validated.is_some()) {
+                GateDecision::Drive => {
+                    let material = validated.expect("gate proved a presentation exists");
+                    drive_presented_attempt(&mut client, material)
+                }
                 GateDecision::DenyNotAdvertised => {
                     deny("kernel does not advertise the doctor operation")
                 }
-                GateDecision::DenyNoPresentedAttempt => deny(&format!(
-                    "kernel advertises the doctor operation but no session-bound attempt envelope was presented to this one-shot invocation; residual={DOCTOR_DISPATCH_RESIDUAL}"
-                )),
+                GateDecision::DenyNoPresentedAttempt => deny(
+                    "kernel advertises the doctor operation but no session-bound attempt envelope was presented to this one-shot invocation",
+                ),
             }
         }
         Err(error) => deny(&error.to_string()),
+    }
+}
+
+/// Drives one validated session-bound presentation to exactly one typed
+/// outcome: the intent derives ONLY from the admitted binding, the permit
+/// issues through the child dispatch authority, and the effect runs on the
+/// real governed executor. Missing/refused admission stays exit 78 without
+/// effect; post-admission outcomes emit their typed report and exit.
+fn drive_presented_attempt(
+    client: &mut KernelDoctorIpcClient,
+    material: dispatched_material::ValidatedDispatchedAttempt,
+) -> i32 {
+    use std::sync::Arc;
+
+    use eliot_process_executor::WindowsProcessExecutor;
+
+    use dispatch_authority::DoctorDispatchAuthority;
+    use kernel_client::drive_validated_dispatched_attempt;
+
+    let generation_root = match std::env::current_exe()
+        .ok()
+        .and_then(|path| path.parent().map(std::path::Path::to_path_buf))
+    {
+        Some(root) => root,
+        None => {
+            return deny("dispatch executable locator is unavailable");
+        }
+    };
+    let authority = match DoctorDispatchAuthority::new() {
+        Ok(authority) => Arc::new(authority),
+        Err(error) => return deny(&error.to_string()),
+    };
+    let concrete_clone = Arc::clone(&authority);
+    let executor_authority: Arc<dyn eliot_process_executor::DispatchValidationPort> =
+        concrete_clone;
+    let executor = WindowsProcessExecutor::new(executor_authority);
+    let sink = Arc::new(EvidenceCollector::new());
+    let now_ms = match std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH) {
+        Ok(elapsed) => u64::try_from(elapsed.as_millis()).unwrap_or(u64::MAX),
+        Err(_) => return deny("dispatch clock is unavailable"),
+    };
+    let now = time::OffsetDateTime::now_utc();
+    let runtime = match tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+    {
+        Ok(runtime) => runtime,
+        Err(error) => return deny(&error.to_string()),
+    };
+    match runtime.block_on(drive_validated_dispatched_attempt(
+        client,
+        &authority,
+        Arc::new(executor),
+        sink,
+        &material,
+        &generation_root,
+        now,
+        now_ms,
+    )) {
+        Ok(outcome) => {
+            let code = outcome.exit_code();
+            let mut stdout = std::io::stdout().lock();
+            match writeln!(stdout, "{}", outcome.wire) {
+                Ok(()) => match stdout.flush() {
+                    Ok(()) => code,
+                    Err(_) => EXIT_EVIDENCE_FLUSH_FAILED,
+                },
+                Err(_) => EXIT_EVIDENCE_FLUSH_FAILED,
+            }
+        }
+        Err(error) => {
+            let code = error.exit_code();
+            if code == EXIT_KERNEL_ADMISSION_REQUIRED {
+                deny(&error.to_string())
+            } else {
+                let _ = writeln!(std::io::stderr(), "doctor drive failed: {error}");
+                code
+            }
+        }
     }
 }
 
@@ -164,7 +244,7 @@ mod tests {
     }
 
     #[test]
-    fn advertised_without_presentation_denies_with_residual() {
+    fn advertised_without_presentation_denies() {
         assert_eq!(
             gate_after_advertise(true, false),
             GateDecision::DenyNoPresentedAttempt

@@ -10,9 +10,9 @@ use std::num::NonZeroU64;
 
 use eliot_contracts::{EpochId, EpochLineageId};
 use eliot_doctor_core::{
-    AttemptIdentityBinding, ClosedRepairRequest, ClosedRequestParams, DiagnosticBrief,
-    EvidenceHandle, RecoveryLease, RegisteredOperation, RepairAttemptIdentity, RepairClass,
-    RepairRecipe, RepairRecipeIdentity, RepairRecipeManifest, StateFence,
+    AttemptIdentityBinding, BindingArg, ClosedRepairRequest, ClosedRequestParams, DiagnosticBrief,
+    EvidenceHandle, ExecutableBinding, RecoveryLease, RegisteredOperation, RepairAttemptIdentity,
+    RepairClass, RepairRecipe, RepairRecipeIdentity, RepairRecipeManifest, StateFence,
 };
 use time::{Duration, OffsetDateTime};
 
@@ -31,7 +31,24 @@ fn now() -> OffsetDateTime {
     OffsetDateTime::UNIX_EPOCH + Duration::seconds(100)
 }
 
+fn test_binding() -> ExecutableBinding {
+    let binding = ExecutableBinding {
+        artifact_digest: "a".repeat(64),
+        program: "eliot-doctor.exe".to_owned(),
+        argv: vec![BindingArg::Literal {
+            value: "--version".to_owned(),
+        }],
+        env: std::collections::BTreeMap::new(),
+        timeout_ms: 5_000,
+        max_stdout_bytes: 65_536,
+        max_stderr_bytes: 65_536,
+    };
+    binding.validate().expect("test binding validates");
+    binding
+}
+
 fn manifest() -> RepairRecipeManifest {
+    let binding = test_binding();
     RepairRecipeManifest {
         manifest_id: "manifest".to_owned(),
         manifest_revision: 1,
@@ -39,7 +56,8 @@ fn manifest() -> RepairRecipeManifest {
             operation_id: "restart".to_owned(),
             adapter_id: "adapter".to_owned(),
             description: "restart the component".to_owned(),
-            definition_digest: "c".repeat(64),
+            definition_digest: binding.digest(),
+            binding,
         }],
     }
 }
@@ -61,6 +79,9 @@ fn recipe() -> RepairRecipe {
         attempt_budget: 8,
         cooldown: Duration::seconds(30),
         stop_conditions: vec!["stop".to_owned()],
+        executable_bindings: [("restart".to_owned(), test_binding())]
+            .into_iter()
+            .collect(),
     }
 }
 

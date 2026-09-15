@@ -601,3 +601,52 @@ pub(crate) fn sha256_bytes(input: &[u8]) -> [u8; 32] {
     }
     digest
 }
+
+#[cfg(test)]
+mod tests {
+    //! R1 byte-identity: the child derivation matches the owner-side mirror
+    //! (`bins/eliot-kernel/src/dispatch_launch.rs`) for the same fixed vector.
+    //! Both files assert the same literals; agreement here is the interop proof.
+
+    use super::*;
+
+    #[test]
+    fn child_dispatch_derivation_matches_owner_vector() {
+        let epoch_json = serde_json::json!({
+            "lineage_id": "550e8400-e29b-41d4-a716-446655440000",
+            "sequence": 3,
+        });
+        let authority = NativeWorkerDispatchAuthority::new(
+            "claim-dispatch-r1-001",
+            "operation-dispatch-r1-001",
+            7,
+            &epoch_json,
+            "launch-nonce-r1-0001-abcdef0123",
+        )
+        .expect("child derivation builds");
+        assert_eq!(
+            authority.derivation_base,
+            "[\"eliot-native-worker-dispatch/v1\",\"claim-dispatch-r1-001\",\"operation-dispatch-r1-001\",7,{\"lineage_id\":\"550e8400-e29b-41d4-a716-446655440000\",\"sequence\":3},\"launch-nonce-r1-0001-abcdef0123\"]"
+        );
+        assert_eq!(
+            hex_bytes(&tagged_hash("key", &authority.derivation_base)),
+            "4c82b9a89995676ac0d0114db3615a47a8de2f9e59080c59d8354af881211f16"
+        );
+        assert_eq!(
+            format!(
+                "native-worker-dispatch-authority-{}",
+                hex_bytes(&tagged_hash("authority", &authority.derivation_base))
+            ),
+            "native-worker-dispatch-authority-4354a8cb909128f86c445a7c19de3e0345b5b1f63e5dfbfe3a20ce6e6da3a6ff"
+        );
+        assert_eq!(
+            hex_bytes(&tagged_hash("head", &authority.derivation_base)),
+            "d0fb93eaece8fc98051cd9501616d9c9f4eb8f755cc010931a6b2b80aac32197"
+        );
+        assert_eq!(
+            DISPATCH_DERIVATION_DOMAIN,
+            "eliot-native-worker-dispatch/v1"
+        );
+        assert_eq!(LAUNCH_GRANT_HEAD, "launch-grant");
+    }
+}
