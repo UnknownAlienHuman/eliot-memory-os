@@ -448,13 +448,30 @@ mod ownership_tests {
         async fn cleanup(mut self) {
             self.stop_child().await;
             self.adapter.take();
-            std::fs::remove_dir_all(&self.root).expect("remove isolated fixture");
+            remove_fixture(&self.root).await;
         }
         fn observed_identity(&self) -> ProcessIdentity {
             WindowsPlatform::new(self.root.clone())
                 .expect("platform")
                 .process_identity(self.transport().provider.provider_process_id)
                 .expect("observed identity")
+        }
+    }
+    async fn remove_fixture(root: &Path) {
+        // Windows can keep an exiting image mapped briefly after its process
+        // becomes unqueryable. A failed delete is not proof of resource release.
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            match std::fs::remove_dir_all(root) {
+                Ok(()) => return,
+                Err(error)
+                    if matches!(error.raw_os_error(), Some(5 | 32))
+                        && Instant::now() < deadline =>
+                {
+                    sleep(Duration::from_millis(20)).await;
+                }
+                Err(error) => panic!("isolated fixture cleanup failed: {error}"),
+            }
         }
     }
     async fn selected(session: &RpcSession) -> Value {
@@ -659,7 +676,7 @@ mod ownership_tests {
         drop(session);
         // This is observed forced exit only; no clean-shutdown status or receipt is produced.
         drop(platform);
-        std::fs::remove_dir_all(&h.root).expect("remove isolated fixture after observed exit");
+        remove_fixture(&h.root).await;
     }
 
     // WORK_UNIT_CASE: 986/12
