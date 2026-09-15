@@ -22,8 +22,8 @@ use eliot_receipts::{
 };
 pub use eliot_receipts::{EffectClass, ReceiptEnvelope};
 pub use eliot_security_contracts::{
-    DisclosureDependencyClosure, InfluenceDependencyClosure, PurgeLedgerEntry,
-    SelectionIntegrityReceipt, SourceAssurance, TransformationLineage,
+    DisclosureDependencyClosure, InfluenceDependencyClosure, InfluenceState, PurgeLedgerEntry,
+    RevocationReason, SelectionIntegrityReceipt, SourceAssurance, TransformationLineage,
 };
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
@@ -79,6 +79,7 @@ pub use wire::{
 
 mod operation_catalogue;
 mod operation_parameters;
+mod revocation_history;
 
 pub use operation_catalogue::{
     ACTIVATED_READ_OWNING_SECTION, EVIDENCE_PACK_MAX_RECORDS, GENESIS_OWNING_SECTION,
@@ -93,6 +94,11 @@ pub use operation_parameters::{
     named_mutation_operation_by_name, named_mutation_operation_name, named_read_operation_by_name,
     named_read_operation_name, parameter_schema_digest, project_parameter_schema,
     validate_typed_read_parameters,
+};
+
+pub use revocation_history::{
+    REVOCATION_HISTORY_MAX_RECORDS, REVOCATION_HISTORY_PAYLOAD_VERSION, RecordedRevocation,
+    RevocationHistoryPayload, parse_revocation_history_payload,
 };
 
 /// Stable identity of this contract surface.
@@ -610,6 +616,11 @@ pub enum NamedReadOperation {
     GetMailbox,
     GetAuditRange,
     ResolveWriteReceipt,
+    /// CURRENT authority revocation history (issue #686). Known-but-
+    /// unsupported until a store-owned slice activates its catalogue row
+    /// with proven handlers; the typed parameters and payload contract
+    /// (`revocation_history`) are already closed.
+    GetAuthorityRevocationHistory,
 }
 
 /// Closed mutation catalogue activated by the current contract catalogue.
@@ -624,6 +635,10 @@ pub enum NamedMutationOperation {
     ApplyLifecyclePolicy,
     ReconcileRecovery,
     AppendAuditEvent,
+    /// Durable authority-revocation record (issue #686). Known-but-
+    /// unsupported until a store-owned slice activates its catalogue row
+    /// with proven handlers; the typed parameters are already closed.
+    RecordAuthorityRevocation,
 }
 
 impl NamedMutationOperation {
@@ -634,7 +649,9 @@ impl NamedMutationOperation {
             Self::ApplyEpistemicRevision => TransitionClass::Epistemic,
             Self::UpdateTaskState => TransitionClass::TaskControl,
             Self::ApplyLifecyclePolicy => TransitionClass::LifecyclePolicy,
-            Self::ReconcileRecovery => TransitionClass::RecoverySchema,
+            Self::ReconcileRecovery | Self::RecordAuthorityRevocation => {
+                TransitionClass::RecoverySchema
+            }
         }
     }
 }
