@@ -28,6 +28,7 @@ eliot-receipts.workspace = true
 eliot-runtime-contracts.workspace = true
 eliot-skill.workspace = true
 eliot-store-api.workspace = true
+eliot-task.workspace = true
 eliot-watchdog-core.workspace = true
 serde.workspace = true
 serde_json.workspace = true

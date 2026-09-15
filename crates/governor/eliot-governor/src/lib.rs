@@ -39,6 +39,7 @@ mod observation_reconciliation;
 mod operator_reconciliation;
 mod owner_projection_refresh;
 mod skill_lifecycle;
+mod task_lifecycle;
 
 pub use activation_outcome::*;
 pub use composition::*;
@@ -52,6 +53,7 @@ pub use eliot_canonical::CanonicalWriteEnvelope;
 pub use observation_reconciliation::GovernorObservationReconciliation;
 pub use operator_reconciliation::{GovernorOperatorReconciliation, operator_command_envelope};
 pub use skill_lifecycle::GovernorSkillLifecycle;
+pub use task_lifecycle::{GovernorTaskLifecycle, TaskLifecycleError};
 
 use std::collections::BTreeMap;
 
