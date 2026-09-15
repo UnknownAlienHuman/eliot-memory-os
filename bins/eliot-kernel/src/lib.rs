@@ -274,9 +274,10 @@ pub use eliot_process::EliotdLiveSupervisionEvidence;
 use eliot_process::{
     ActionLeaseRef, DispatchAuthorityId, EliotdLiveReadyEvidence, EliotdLiveReceipt,
     EnvironmentInheritance, EnvironmentProjection, FencingToken, Generation, ImageId, JobId,
-    KernelDispatchKey, ProcessExecutionAdmissionRequest, ProcessExecutionError, ProcessIntent,
-    ProcessOwnerBinding, ProcessSessionBinding, ProcessStartReceipt, ProcessTreeId, ResourceLimits,
-    SessionId,
+    KernelDispatchKey, ProcessCallerSession, ProcessExecutionAdmissionRequest,
+    ProcessExecutionError, ProcessIntent, ProcessOwnerBinding, ProcessSessionBinding,
+    ProcessSessionClass, ProcessStartReceipt, ProcessTransportRebindReceipt, ProcessTreeId,
+    ResourceLimits, SessionId,
 };
 #[cfg(test)]
 use eliot_process::{

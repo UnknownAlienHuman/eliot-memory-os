@@ -45,6 +45,7 @@ fn test_epoch(sequence: u64) -> eliot_contracts::EpochId {
 
 mod activation;
 mod process_execution;
+mod process_session_binding;
 
 #[test]
 fn daemon_health_response_matches_the_eliotd_typed_value_contract() {

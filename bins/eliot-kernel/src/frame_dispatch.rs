@@ -421,11 +421,21 @@ impl KernelComposition {
                 }
 
                 // A pipe connection is replaceable transport routing, not a
-                // durable process/effect Session. Until #79 composes an exact
-                // process-owner/session binding, no Start request can cross
-                // this gateway. In particular, copying `connection_id` into
-                // `ProcessIntent.session_id` no longer grants launch authority.
-                return Err(TransportError::SessionFenced);
+                // durable process/effect Session. A Start crosses this gateway
+                // only when `intent.session_id` validates against the
+                // server-derived admitted process-owner/session binding
+                // (issue #79): copying `connection_id` into
+                // `ProcessIntent.session_id` never grants launch authority,
+                // and anything not admitted/validated stays
+                // `SessionFenced` fail-closed below.
+                let caller = self.admitted_process_caller_session(session)?;
+                eliot_process::validate_process_intent_session(
+                    admission.intent(),
+                    &caller,
+                    caller.owner(),
+                    admission.state_fence(),
+                )
+                .map_err(|_| TransportError::SessionFenced)?;
             }
             let (_, session_binding) = caller_binding(session)?;
             return Ok(KernelFrameAction::Process {
