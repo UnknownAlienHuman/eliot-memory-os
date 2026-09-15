@@ -33,6 +33,7 @@
 #![forbid(unsafe_code)]
 
 mod activation_outcome;
+mod canonical_projections;
 mod composition;
 mod epistemic_composition;
 pub use epistemic_composition::{GovernorEpistemicComposition, ObservedEpistemicProposal};
@@ -44,6 +45,12 @@ mod skill_lifecycle;
 mod task_lifecycle;
 
 pub use activation_outcome::*;
+pub use canonical_projections::{
+    GOVERNOR_PROJECTIONS_SCHEMA_VERSION, GovernorAffordanceProjection,
+    GovernorContinuityProjection, GovernorProjectionError, GovernorProjectionSet,
+    GovernorSafetyProjection, GovernorTaskProjection, ProjectionOmission,
+    compose_canonical_projections,
+};
 pub use composition::*;
 pub use controlboard_projection::{
     ControlBoardGovernorSnapshot, ControlBoardOwnerBinding, ControlBoardProjectionError,
