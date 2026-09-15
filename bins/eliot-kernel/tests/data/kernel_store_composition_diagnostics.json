@@ -1,0 +1,227 @@
+{
+  "contract": "F-LOG-KERNEL-2 kernel store and composition diagnostics",
+  "issue": 899,
+  "facade_issue": 895,
+  "target": "eliot_kernel::diagnostics",
+  "note": "Pins the five-file Store/composition boundary inventory exercised by tests/kernel_store_composition_diagnostics.rs. Each boundary binds file, function, stage, fixed detail prefix, and covering test case 1..26. Details contain only fixed vocabulary plus numeric epoch/generation; no raw paths, pipes, credentials, queries, frames, or error strings.",
+  "entrypoint_event": "kernel.entrypoint_stage",
+  "terminal_event": "kernel.terminal_error",
+  "max_field_bytes": 256,
+  "max_detail_bytes": 1024,
+  "event_log_sink": "unavailable",
+  "stdout_protocol_contamination": false,
+  "files": [
+    "bins/eliot-kernel/src/canonical_store_runtime.rs",
+    "bins/eliot-kernel/src/composition_bootstrap.rs",
+    "bins/eliot-kernel/src/kernel_build_contract.rs",
+    "bins/eliot-kernel/src/kernel_config.rs",
+    "bins/eliot-kernel/src/store_receipt_dispatch.rs"
+  ],
+  "stages": {
+    "launch_config": "launch_config",
+    "store_bootstrap": "store_bootstrap",
+    "composition": "composition",
+    "supervision_authority": "supervision_authority",
+    "shutdown_drain": "shutdown_drain"
+  },
+  "terminal_codes": [
+    "PLATFORM",
+    "TRANSPORT",
+    "RUNTIME",
+    "ORS",
+    "CORE",
+    "SERVICE",
+    "STORE_BOOTSTRAP_REQUIRED",
+    "STORE_ALREADY_CONNECTED",
+    "PRINCIPAL",
+    "SESSION_FENCED",
+    "STORE_UNKNOWN",
+    "STORE_ERROR"
+  ],
+  "boundaries": [
+    {
+      "case": 1,
+      "file": "bins/eliot-kernel/src/kernel_config.rs",
+      "function": "KernelConfig::new",
+      "stage": "launch_config",
+      "detail_prefix": "kernel.config.candidate"
+    },
+    {
+      "case": 2,
+      "file": "bins/eliot-kernel/src/kernel_config.rs",
+      "function": "KernelConfig::with_store_bootstrap",
+      "stage": "store_bootstrap",
+      "detail_prefix": "kernel.config.store_bootstrap_injected"
+    },
+    {
+      "case": 3,
+      "file": "bins/eliot-kernel/src/kernel_config.rs",
+      "function": "KernelConfig::new",
+      "stage": "launch_config",
+      "detail_prefix": "kernel.config.candidate",
+      "redaction": "no raw work_root/pipe values"
+    },
+    {
+      "case": 4,
+      "file": "bins/eliot-kernel/src/canonical_store_runtime.rs",
+      "function": "KernelComposition::store_bootstrap",
+      "stage": "store_bootstrap",
+      "detail_prefix": "kernel.store.bootstrap_requested"
+    },
+    {
+      "case": 5,
+      "file": "bins/eliot-kernel/src/canonical_store_runtime.rs",
+      "function": "KernelComposition::install_store_bootstrap",
+      "stage": "store_bootstrap",
+      "detail_prefix": "kernel.store.bootstrap_rejected"
+    },
+    {
+      "case": 6,
+      "file": "bins/eliot-kernel/src/composition_bootstrap.rs",
+      "function": "KernelComposition::assemble",
+      "stage": "composition",
+      "detail_prefix": "kernel.composition.constructed_not_ready"
+    },
+    {
+      "case": 7,
+      "file": "bins/eliot-kernel/src/composition_bootstrap.rs",
+      "function": "KernelComposition::assemble",
+      "stage": "store_bootstrap",
+      "detail_prefix": "kernel.composition.route_registered:store_bridge"
+    },
+    {
+      "case": 8,
+      "file": "bins/eliot-kernel/src/composition_bootstrap.rs",
+      "function": "KernelComposition::assemble",
+      "stage": "composition",
+      "detail_prefix": "kernel.composition.dependencies_validated"
+    },
+    {
+      "case": 9,
+      "file": "bins/eliot-kernel/src/store_receipt_dispatch.rs",
+      "function": "store_receipt_dispatch::dispatch",
+      "stage": "store_bootstrap",
+      "detail_prefix": "kernel.store.receipt_rejected:fence"
+    },
+    {
+      "case": 10,
+      "file": "bins/eliot-kernel/src/composition_bootstrap.rs",
+      "function": "KernelComposition::assemble",
+      "stage": "composition",
+      "detail_prefix": "kernel.composition.dependencies_validated"
+    },
+    {
+      "case": 11,
+      "file": "bins/eliot-kernel/src/store_receipt_dispatch.rs",
+      "function": "store_receipt_dispatch::dispatch",
+      "stage": "store_bootstrap",
+      "detail_prefix": "kernel.store.receipt_prepared"
+    },
+    {
+      "case": 12,
+      "file": "bins/eliot-kernel/src/store_receipt_dispatch.rs",
+      "function": "store_receipt_dispatch::dispatch",
+      "stage": "store_bootstrap",
+      "detail_prefix": "kernel.store.receipt_rejected:not_submitted"
+    },
+    {
+      "case": 13,
+      "file": "bins/eliot-kernel/src/canonical_store_runtime.rs",
+      "function": "store_rebind_record_is_pending",
+      "stage": "store_bootstrap",
+      "detail_prefix": "kernel.store.rebind_pending_unknown"
+    },
+    {
+      "case": 14,
+      "file": "bins/eliot-kernel/src/store_receipt_dispatch.rs",
+      "function": "store_receipt_dispatch::dispatch",
+      "stage": "store_bootstrap",
+      "detail_prefix": "kernel.store.receipt_fence_validated"
+    },
+    {
+      "case": 15,
+      "file": "bins/eliot-kernel/src/canonical_store_runtime.rs",
+      "function": "store_rebind_record_matches",
+      "stage": "store_bootstrap",
+      "detail_prefix": "kernel.store.rebind_record_mismatched"
+    },
+    {
+      "case": 16,
+      "file": "bins/eliot-kernel/src/canonical_store_runtime.rs",
+      "function": "store_rebind_receipt_from_ors_record",
+      "stage": "store_bootstrap",
+      "detail_prefix": "kernel.store.rebind_receipt_rejected"
+    },
+    {
+      "case": 17,
+      "file": "bins/eliot-kernel/src/canonical_store_runtime.rs",
+      "function": "KernelComposition::install_store_bootstrap",
+      "stage": "store_bootstrap",
+      "detail_prefix": "kernel.store.bootstrap_validated:replay"
+    },
+    {
+      "case": 18,
+      "file": "bins/eliot-kernel/src/canonical_store_runtime.rs",
+      "function": "store_rebind_record_matches",
+      "stage": "store_bootstrap",
+      "detail_prefix": "kernel.store.rebind_record_mismatched"
+    },
+    {
+      "case": 19,
+      "file": "bins/eliot-kernel/src/store_receipt_dispatch.rs",
+      "function": "store_receipt_dispatch::dispatch",
+      "stage": "store_bootstrap",
+      "detail_prefix": "kernel.store.receipt_response_delivered"
+    },
+    {
+      "case": 20,
+      "file": "bins/eliot-kernel/src/store_receipt_dispatch.rs",
+      "function": "store_receipt_dispatch::dispatch",
+      "stage": "store_bootstrap",
+      "detail_prefix": "kernel.store.receipt_query_failed"
+    },
+    {
+      "case": 21,
+      "file": "bins/eliot-kernel/src/composition_bootstrap.rs",
+      "function": "KernelComposition::new",
+      "stage": "composition",
+      "detail_prefix": "kernel.composition.build_failed",
+      "terminal": "kernel.terminal_error"
+    },
+    {
+      "case": 22,
+      "file": "bins/eliot-kernel/src/kernel_build_contract.rs",
+      "function": "EliotdReceiptRootBinding::new",
+      "stage": "composition",
+      "detail_prefix": "kernel.build.eliotd_receipt_binding_rejected"
+    },
+    {
+      "case": 23,
+      "file": "bins/eliot-kernel/src/composition_bootstrap.rs",
+      "function": "KernelComposition::assemble",
+      "stage": "composition",
+      "redaction": "credential/environment/connection/query canaries absent"
+    },
+    {
+      "case": 24,
+      "file": "bins/eliot-kernel/src/store_receipt_dispatch.rs",
+      "function": "store_receipt_dispatch::dispatch",
+      "stage": "store_bootstrap",
+      "redaction": "frame/source/user/model/payload canaries absent"
+    },
+    {
+      "case": 25,
+      "file": "bins/eliot-kernel/src/composition_bootstrap.rs",
+      "function": "KernelComposition::new",
+      "stage": "composition",
+      "noninterference": "sink failure preserves build results"
+    },
+    {
+      "case": 26,
+      "file": "bins/eliot-kernel/src/composition_bootstrap.rs",
+      "function": "KernelComposition::assemble",
+      "stage": "composition",
+      "ordering": "semantic fields and causal order preserved"
+    }
+  ]
+}
