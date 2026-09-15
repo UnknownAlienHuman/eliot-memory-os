@@ -1896,13 +1896,27 @@ pub(crate) fn kernel_transition(
     };
     let same = current.kernel_generation == next.kernel_generation;
     if !same {
-        let authority_advances = current
-            .process
-            .as_ref()
-            .zip(next.process.as_ref())
-            .is_some_and(|(prior, candidate)| {
-                candidate.authority_epoch.value() > prior.authority_epoch.value()
-            });
+        // T6-E4-A host scalar closure: scalar process ordering is
+        // intra-lineage only. Cross-lineage numeric ordering is forbidden,
+        // so the scalar `>` below is gated on the typed epoch tuple proving
+        // same lineage via `relation_to`. The typed direct-child check
+        // remains the admission authority; this gate ensures a larger scalar
+        // from another lineage can never satisfy `authority_advances`.
+        let same_kernel_lineage = !matches!(
+            next.kernel_generation
+                .current
+                .relation_to(&current.kernel_generation.current),
+            eliot_contracts::EpochRelation::UnrelatedLineage
+        );
+        let authority_advances = same_kernel_lineage
+            && current
+                .process
+                .as_ref()
+                .zip(next.process.as_ref())
+                .is_some_and(|(prior_process, candidate_process)| {
+                    candidate_process.authority_epoch.value()
+                        > prior_process.authority_epoch.value()
+                });
         if !epoch_transition_is_direct_child_of(
             &next.kernel_generation,
             &current.kernel_generation,
@@ -2262,5 +2276,59 @@ fn illegal(
         machine,
         from: format!("{from:?}"),
         to: format!("{to:?}"),
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::expect_used)]
+mod host_scalar_closure_tests {
+    use std::num::NonZeroU64;
+
+    use eliot_contracts::{EpochId, EpochLineageId, EpochRelation};
+
+    use super::epoch_transition_is_direct_child_of;
+
+    const LINEAGE_A: &str = "550e8400-e29b-41d4-a716-446655440000";
+    const LINEAGE_B: &str = "550e8400-e29b-41d4-a716-446655440001";
+
+    fn lineage(value: &str) -> EpochLineageId {
+        EpochLineageId::new(value).expect("valid test lineage")
+    }
+
+    fn epoch(lineage_value: &str, sequence: u64) -> EpochId {
+        EpochId::new(
+            lineage(lineage_value),
+            NonZeroU64::new(sequence).expect("non-zero test sequence"),
+        )
+        .expect("valid test epoch")
+    }
+
+    /// T6-E4-A: same-lineage seq+1 advances via the typed tuple;
+    /// changed-lineage equal-seq is unrelated and fails typed (callers map
+    /// `Ok(false)` to `StaleFence`; lineage mismatches elsewhere map to
+    /// `EpochLineageConflict`). No scalar ordering is consulted here.
+    #[test]
+    fn same_lineage_direct_child_advances_cross_lineage_equal_seq_rejected() {
+        let parent_epoch = epoch(LINEAGE_A, 1);
+        let parent = eliot_contracts::EpochTransition::genesis(lineage(LINEAGE_A));
+        let child = eliot_contracts::EpochTransition::direct_child(&parent_epoch)
+            .expect("direct child mint");
+        assert!(epoch(LINEAGE_A, 2).is_direct_child_of(&parent_epoch));
+        assert!(
+            epoch_transition_is_direct_child_of(&child, &parent).expect("validated transitions")
+        );
+
+        let foreign_genesis = eliot_contracts::EpochTransition::genesis(lineage(LINEAGE_B));
+        let foreign_epoch = epoch(LINEAGE_B, 1);
+        assert!(!foreign_epoch.is_same_authority(&parent_epoch));
+        assert!(!foreign_epoch.is_direct_child_of(&parent_epoch));
+        assert_eq!(
+            foreign_epoch.relation_to(&parent_epoch),
+            EpochRelation::UnrelatedLineage
+        );
+        assert!(
+            !epoch_transition_is_direct_child_of(&foreign_genesis, &parent)
+                .expect("validated transitions")
+        );
     }
 }
