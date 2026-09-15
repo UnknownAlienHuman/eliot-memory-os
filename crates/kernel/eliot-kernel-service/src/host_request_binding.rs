@@ -40,8 +40,9 @@ use eliot_mcp::{
     ApplicationRequest, CompatibilityCorrelation, HostCancellationPortOutcome,
     HostCancellationRequest, HostInvocationPortOutcome, HostInvocationRequest, HostOperationHandle,
     KernelGovernorPort, KernelHostRequestPort, MAX_HOST_DEADLINE_PREFERENCE_MS, McpCore,
-    McpProtocolVersion, McpResponse, PortFailure, RequestSecurityContext, ResponseKind,
-    ToolRequest, TransportRequestContext,
+    McpProtocolVersion, McpResponse, PortFailure, QueryInput, QueryIntent, QueryMode,
+    RequestSecurityContext, ResponseKind, ToolRequest, TransportRequestContext,
+    plan_evidence_pack_query, project_evidence_pack_projection,
 };
 use eliot_ors::{
     CONTRACT_VERSION as ORS_CONTRACT_VERSION, HostRequestKind as OrsHostRequestKind,
@@ -50,11 +51,13 @@ use eliot_ors::{
 };
 use eliot_protocol::{
     AGENT_BRIDGE_PROCESS_BINDING_WIRE_ID, AgentActivationResolutionResult,
-    AgentBridgePeerAdmissionReceipt, AgentBridgeProcessBinding, HostRequestAdmissionReceipt,
-    HostRequestEnvelope, HostRequestKind, RequestIdentity, host_request_operation_id,
+    AgentBridgePeerAdmissionReceipt, AgentBridgeProcessBinding, HARD_STRUCTURED_RESPONSE_BYTES,
+    HOST_REQUEST_RESULT_BODY_WIRE_ID, HostRequestAdmissionReceipt, HostRequestEnvelope,
+    HostRequestKind, HostRequestResultBody, RequestIdentity, host_request_operation_id,
 };
-use eliot_receipts::{RequestBinding, SessionBinding};
+use eliot_receipts::{ProofCeiling, RequestBinding, SessionBinding};
 use eliot_security_contracts::{EffectCeiling, InstructionTaint, PrivacyClass};
+use eliot_store_api::EVIDENCE_PACK_MAX_RECORDS;
 
 use crate::protocol::AgentBridgeAdmissionDescriptor;
 use crate::{KernelService, KernelServiceError, KernelServiceState};
@@ -228,6 +231,125 @@ impl AuthenticatedHostSession {
     #[must_use]
     pub const fn descriptor(&self) -> &AgentBridgeAdmissionDescriptor {
         &self.descriptor
+    }
+
+    /// Builds the exact bounded local-read result body for one admitted query.
+    ///
+    /// Session-namespaced constructor (Implements #18: local read result): it
+    /// reads no live session state — the admitted fence travels inside
+    /// `envelope` — but the result it builds is bound to the presenting
+    /// envelope's request identity, so only the session that admitted the
+    /// envelope can persist and serve it through the ORS result path.
+    ///
+    /// Runs the existing evidence-pack planning half
+    /// (`plan_evidence_pack_query`) over the explicit `scope_id`/`subject`/
+    /// `max_records` selectors, projects the exact store payload unchanged
+    /// through `project_evidence_pack_projection`, wraps the projection as a
+    /// read-only `Projection` response under the `ScopedVerification` ceiling,
+    /// and returns the canonical digest binding the exact bounded bytes. The
+    /// caller persists the pair with `persist_host_request_result` and serves
+    /// exact replays via `readback_responded` without re-dispatch; a forged or
+    /// substituted body fails the digest binding here before anything is
+    /// persisted. `eliot.packet` never reaches this constructor.
+    ///
+    /// Intent fixed strings mirror the Governor `evidence_query` port
+    /// (`ReadService::evidence_query`); only the mode travels as a parameter
+    /// and `CurrentPosition` (plus any unknown mode) is refused fail-closed
+    /// because it never admits `GetEvidencePack`. `max_records` must be the
+    /// explicit decimal bound within `EVIDENCE_PACK_MAX_RECORDS`; the body
+    /// must fit `HARD_STRUCTURED_RESPONSE_BYTES`.
+    ///
+    /// # Errors
+    ///
+    /// Returns a bounded reason string when the envelope is not an admitted
+    /// `eliot.query`, when any selector is blank, malformed, or over-bound,
+    /// or when the bounded body cannot be canonicalized.
+    pub fn build_local_read_result_body(
+        envelope: &HostRequestEnvelope,
+        scope_id: &str,
+        subject: &str,
+        max_records: u32,
+        intent_mode: &str,
+        store_payload: serde_json::Value,
+    ) -> Result<(String, serde_json::Value), String> {
+        if envelope.identity.capability != "eliot.query" {
+            return Err("presented capability is not the admitted local-read query".to_owned());
+        }
+        let mode = match intent_mode {
+            "verification" => QueryMode::Verification,
+            "provenance" => QueryMode::Provenance,
+            "navigation" => QueryMode::Navigation,
+            "historical_reconstruction" => QueryMode::HistoricalReconstruction,
+            "change_impact" => QueryMode::ChangeImpact,
+            "context_reconstruction" => QueryMode::ContextReconstruction,
+            _ => {
+                return Err("query intent never admits GetEvidencePack for this mode".to_owned());
+            }
+        };
+        if subject.trim().is_empty() || subject.chars().any(char::is_control) {
+            return Err("evidence subject must be exact and non-blank".to_owned());
+        }
+        if scope_id.trim().is_empty() || scope_id.chars().any(char::is_control) {
+            return Err("evidence scope must be explicit and non-blank".to_owned());
+        }
+        if max_records == 0 || max_records > EVIDENCE_PACK_MAX_RECORDS {
+            return Err("max_records must be within the catalogue bound".to_owned());
+        }
+        let input = QueryInput {
+            intent: QueryIntent {
+                mode,
+                time_scope: "governor local evidence window".to_owned(),
+                branch_environment_scope: "governor local branch and environment".to_owned(),
+                freshness_policy: "exact captured records only".to_owned(),
+                required_assurance: "verifier evidence read".to_owned(),
+            },
+            query: format!("subject:{subject}"),
+            exact_resource_uri: None,
+        };
+        let plan = plan_evidence_pack_query(&input, scope_id, &max_records.to_string())
+            .map_err(|error| error.to_string())?;
+        let projection = project_evidence_pack_projection(&plan, store_payload);
+        let request_id = envelope.identity.request_id.as_str().to_owned();
+        let idempotency_key = envelope.identity.idempotency_key.clone();
+        let canonical_request_sha256 = sha256_hex(
+            &canonical_json_bytes(&(
+                envelope.envelope_sha256.clone(),
+                request_id.clone(),
+                idempotency_key.clone(),
+            ))
+            .map_err(|error| error.to_string())?,
+        );
+        let response = McpResponse {
+            request_id,
+            idempotency_key,
+            canonical_request_sha256,
+            kind: ResponseKind::Projection,
+            canonical_tool_name: "eliot.query".to_owned(),
+            content: projection.content,
+            artifacts: Vec::new(),
+            proof_ceiling: ProofCeiling::ScopedVerification,
+            resource: None,
+            job: None,
+            compatibility_correlation_hint: None,
+        };
+        let body = serde_json::to_value(&response).map_err(|error| error.to_string())?;
+        let encoded = serde_json::to_vec(&body).map_err(|error| error.to_string())?;
+        if encoded.len() > HARD_STRUCTURED_RESPONSE_BYTES {
+            return Err("result body exceeds the bounded response ceiling".to_owned());
+        }
+        let digest =
+            sha256_hex(&canonical_json_bytes(&response).map_err(|error| error.to_string())?);
+        HostRequestResultBody {
+            wire_id: HOST_REQUEST_RESULT_BODY_WIRE_ID.to_owned(),
+            wire_version: HostRequestResultBody::CONTRACT_VERSION,
+            operation_id: host_request_operation_id(envelope),
+            request_sha256: envelope.envelope_sha256.clone(),
+            result_digest: digest.clone(),
+            response: body.clone(),
+        }
+        .validate()
+        .map_err(|error| error.to_string())?;
+        Ok((digest, body))
     }
 }
 
@@ -1389,5 +1511,264 @@ mod local_read_result_tests {
 
     fn ors_operation_id_for_test() -> OperationIdentity {
         OperationIdentity::new(format!("hostreq:{}", "d".repeat(64))).expect("valid operation")
+    }
+}
+
+#[cfg(test)]
+#[allow(
+    clippy::expect_used,
+    clippy::unwrap_used,
+    reason = "test fixtures use expect for fail-fast setup, mirroring local_read_result_tests"
+)]
+mod local_read_build_tests {
+    use super::*;
+    use eliot_contracts::{EpochLineageId, ResourceGeneration};
+    use serde_json::json;
+    use std::num::NonZeroU64;
+
+    const TEST_LINEAGE: &str = "550e8400-e29b-41d4-a716-446655440000";
+
+    const QUERY_JSON: &str = r#"{
+        "protocol_version":"2026-07-28",
+        "correlation_id":"host-request-1",
+        "client_capabilities":{"tasks":false},
+        "tool":{"name":"eliot.query","arguments":{
+            "intent":{
+                "mode":"verification",
+                "time_scope":"session-window",
+                "branch_environment_scope":"branch",
+                "freshness_policy":"exact-fence",
+                "required_assurance":"evidence-provenance"
+            },
+            "query":"subject:evidence-alpha",
+            "exact_resource_uri":null
+        }},
+        "deadline_preference_ms":5000,
+        "observed_context":{
+            "host_session_hint":"host-turn-1",
+            "observed_resource_refs":[],
+            "event_cursors":[],
+            "trace_context":{}
+        }
+    }"#;
+
+    fn test_fence() -> StateFence {
+        let epoch = EpochId::new(
+            EpochLineageId::new(TEST_LINEAGE).expect("valid test lineage"),
+            NonZeroU64::new(3).expect("nonzero test sequence"),
+        )
+        .expect("valid test epoch");
+        StateFence::new(epoch, ResourceGeneration::new(7).expect("nonzero test generation"))
+    }
+
+    fn test_query_pair() -> (HostInvocationRequest, HostRequestEnvelope) {
+        use eliot_contracts::RequestId;
+        let request: HostInvocationRequest =
+            serde_json::from_str(QUERY_JSON).expect("fixture must deserialize");
+        request.validate().expect("fixture must validate");
+        let payload_digest =
+            canonical_payload_digest(&request.tool).expect("tool must digest");
+        let envelope = eliot_protocol::HostRequestEnvelope {
+            wire_id: eliot_protocol::HOST_REQUEST_WIRE_ID.to_owned(),
+            wire_version: eliot_protocol::HostRequestEnvelope::CONTRACT_VERSION,
+            kind: eliot_protocol::HostRequestKind::Invocation,
+            connection_id: "conn-test-1".to_owned(),
+            identity: eliot_protocol::HostRequestIdentity {
+                request_id: RequestId::new("host-request-1").expect("valid test request id"),
+                idempotency_key: "host-request-1:invoke".to_owned(),
+                cancellation_id: "host-request-1:invoke:cancel".to_owned(),
+                parent_operation_id: None,
+                deadline_unix_ms: 2_000_000,
+                capability: "eliot.query".to_owned(),
+                session_id: Some("kernel-session-1".to_owned()),
+                task_id: None,
+                work_scope_id: None,
+                payload_schema_id: "eliot.mcp.tool-request.v1".to_owned(),
+                payload_sha256: payload_digest,
+            },
+            state_fence: test_fence(),
+            descriptor_sha256: "d".repeat(64),
+            peer_admission_receipt_sha256: "e".repeat(64),
+            activation_binding: None,
+            envelope_sha256: String::new(),
+        }
+        .with_computed_digest()
+        .expect("envelope must digest");
+        (request, envelope)
+    }
+
+    fn evidence_payload() -> serde_json::Value {
+        json!({
+            "version": 1,
+            "subject": "evidence-alpha",
+            "scope_id": "scope-1",
+            "records": [
+                {
+                    "capture_index": 0,
+                    "operation": "CaptureObservation",
+                    "parameters": {"subject": "evidence-alpha"},
+                },
+            ],
+            "provenance": {
+                "matched_total": 1,
+                "returned": 1,
+                "max_records": 10,
+                "truncated": false,
+            },
+        })
+    }
+
+    #[test]
+    fn build_serves_exact_bounded_body_with_revision() {
+        let (request, envelope) = test_query_pair();
+        let payload = evidence_payload();
+        let (digest, body) = AuthenticatedHostSession::build_local_read_result_body(
+            &envelope,
+            "scope-1",
+            "evidence-alpha",
+            10,
+            "verification",
+            payload.clone(),
+        )
+        .expect("admitted query must build its bounded body");
+
+        // The digest binds the exact bounded bytes: determinism is the proof.
+        let decoded: McpResponse =
+            serde_json::from_value(body.clone()).expect("body must decode");
+        let recomputed = sha256_hex(
+            &canonical_json_bytes(&decoded).expect("built body must canonicalize"),
+        );
+        assert_eq!(recomputed, digest);
+
+        // The projection half is exact: kind, ceiling, identity, and the
+        // store payload crossing unchanged with its revision.
+        assert_eq!(body["kind"], json!("PROJECTION"));
+        assert_eq!(body["canonical_tool_name"], json!("eliot.query"));
+        assert_eq!(body["request_id"], json!("host-request-1"));
+        assert_eq!(body["idempotency_key"], json!("host-request-1:invoke"));
+        assert_eq!(body["proof_ceiling"], json!("SCOPED_VERIFICATION"));
+        assert_eq!(body["content"]["operation"], json!("GetEvidencePack"));
+        assert_eq!(body["content"]["subject"], json!("evidence-alpha"));
+        assert_eq!(body["content"]["scope_id"], json!("scope-1"));
+        assert_eq!(body["content"]["evidence_pack"], payload);
+
+        // The built pair feeds the exact readback without re-dispatch: the
+        // bridge `eliot.query` for this captured subject answers Responded
+        // with these bytes instead of a bare Accepted admission.
+        match readback_responded(&envelope, &request, body.clone(), &digest) {
+            Ok(HostInvocationPortOutcome::Responded { response, .. }) => {
+                assert_eq!(
+                    serde_json::to_value(&*response).expect("served must serialize"),
+                    body,
+                    "readback must serve the built body verbatim"
+                );
+            }
+            other => panic!("expected exact responded readback, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn build_is_deterministic_and_rejects_forgery_before_serving() {
+        let (_, envelope) = test_query_pair();
+        let payload = evidence_payload();
+        let first = AuthenticatedHostSession::build_local_read_result_body(
+            &envelope,
+            "scope-1",
+            "evidence-alpha",
+            10,
+            "verification",
+            payload.clone(),
+        )
+        .expect("first build must succeed");
+        let second = AuthenticatedHostSession::build_local_read_result_body(
+            &envelope,
+            "scope-1",
+            "evidence-alpha",
+            10,
+            "verification",
+            payload,
+        )
+        .expect("second build must succeed");
+        assert_eq!(
+            first, second,
+            "identical inputs build byte-identical results with no dispatch"
+        );
+
+        // A substituted body never shares the stored digest.
+        let mut tampered: McpResponse =
+            serde_json::from_value(first.1.clone()).expect("built body must decode");
+        tampered.content = json!({"tampered": true});
+        let tampered_digest = sha256_hex(
+            &canonical_json_bytes(&tampered).expect("tampered must canonicalize"),
+        );
+        assert_ne!(
+            tampered_digest, first.0,
+            "a changed payload must never share the stored digest"
+        );
+    }
+
+    #[test]
+    fn build_rejects_non_query_and_over_bound_before_serving() {
+        let (_, envelope) = test_query_pair();
+        let payload = evidence_payload();
+        let build = |envelope: &HostRequestEnvelope,
+                     scope: &str,
+                     subject: &str,
+                     max: u32,
+                     mode: &str| {
+            AuthenticatedHostSession::build_local_read_result_body(
+                envelope,
+                scope,
+                subject,
+                max,
+                mode,
+                payload.clone(),
+            )
+        };
+
+        // A non-query capability is never a local read.
+        let mut other = envelope.clone();
+        other.identity.capability = "eliot.state".to_owned();
+        assert!(
+            build(&other, "scope-1", "evidence-alpha", 10, "verification").is_err(),
+            "non-query capability must be rejected before serving"
+        );
+
+        // The explicit bound is catalogue-closed: zero and over-bound fail.
+        assert!(
+            build(&envelope, "scope-1", "evidence-alpha", 0, "verification").is_err(),
+            "zero bound must be rejected before serving"
+        );
+        assert!(
+            build(
+                &envelope,
+                "scope-1",
+                "evidence-alpha",
+                EVIDENCE_PACK_MAX_RECORDS + 1,
+                "verification",
+            )
+            .is_err(),
+            "over-bound request must be rejected before serving"
+        );
+
+        // Position intent never admits GetEvidencePack; unknown modes fail too.
+        assert!(
+            build(&envelope, "scope-1", "evidence-alpha", 10, "current_position").is_err(),
+            "position intent must be rejected before serving"
+        );
+        assert!(
+            build(&envelope, "scope-1", "evidence-alpha", 10, "freeform").is_err(),
+            "unknown mode must be rejected before serving"
+        );
+
+        // Blank selectors prove nothing.
+        assert!(
+            build(&envelope, "scope-1", "   ", 10, "verification").is_err(),
+            "blank subject must be rejected before serving"
+        );
+        assert!(
+            build(&envelope, "  ", "evidence-alpha", 10, "verification").is_err(),
+            "blank scope must be rejected before serving"
+        );
     }
 }

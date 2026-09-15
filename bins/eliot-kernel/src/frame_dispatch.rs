@@ -112,6 +112,7 @@ impl KernelComposition {
                         | "apply_prepared"
                         | "receipt"
                         | "store_named"
+                        | "local_read"
                 )
             {
                 if !probe_ready_state_admitted(
