@@ -9,7 +9,7 @@
 use std::collections::BTreeSet;
 
 use eliot_contracts::{
-    EpochId, EpochLineageId, ReceiptId, ResourceGeneration, SourceId, StateFence,
+    ArtifactId, EpochId, EpochLineageId, ReceiptId, ResourceGeneration, SourceId, StateFence,
     canonical_json_bytes, sha256_hex,
 };
 use std::num::NonZeroU64;
@@ -28,7 +28,8 @@ use eliot_dreamer_contracts::{
 use eliot_dreamer_orientation::{
     AdmittedOrientationJob, CanonicalEvidenceHandle, CoverageCepMember, CoverageEvidenceMember,
     CurrentEpistemicPositionHandle, LocalOrientationFrame, OrientationCoverageDenominator,
-    OrientationDisposition, OrientationPacketCandidate, OrientationPolicy, project_orientation,
+    OrientationDisposition, OrientationError, OrientationPacketCandidate, OrientationPolicy,
+    OrientationResidue, project_orientation,
 };
 use eliot_epistemic_contracts::{
     AdmittedReceipt, AdmittedReceiptParams, ClaimId, CurrentEpistemicPosition, Currentness,
@@ -39,9 +40,51 @@ use eliot_evidence::{
     EvidenceFreshness, Provenance,
 };
 
-fn fixture(
+// Issue #628 proof matrix: `WORK_UNIT_CASE 628/1..37` — one substantive
+// `project_orientation` case per marker. The five original tests keep their
+// assertions (three strengthened with sibling-class/sibling-binding coverage)
+// while the remaining markers close the deferred 37-case matrix.
+#[derive(Clone)]
+struct FixtureOptions {
+    requester_origin: RequesterOrigin,
+    requester_session: Option<String>,
+    privacy_profile: String,
+    evidence2_status: EpistemicStatus,
+    evidence2_freshness: EvidenceFreshness,
+    cep2_superseded: bool,
+    counterevidence: Vec<String>,
+    recommended_probes: Vec<String>,
+    residue_state: SupportState,
+    declared_confirmed_handles: Vec<String>,
+    extra_model_source: Option<String>,
+    extra_omissions: bool,
     partial: bool,
     nonrecoverable_omission: bool,
+}
+
+impl Default for FixtureOptions {
+    fn default() -> Self {
+        Self {
+            requester_origin: RequesterOrigin::Human,
+            requester_session: None,
+            privacy_profile: "local_only".into(),
+            evidence2_status: EpistemicStatus::Observed,
+            evidence2_freshness: EvidenceFreshness::ExactCandidate,
+            cep2_superseded: false,
+            counterevidence: vec!["coverage is limited".into()],
+            recommended_probes: vec!["inspect the outcome".into()],
+            residue_state: SupportState::Supported,
+            declared_confirmed_handles: Vec::new(),
+            extra_model_source: None,
+            extra_omissions: false,
+            partial: false,
+            nonrecoverable_omission: false,
+        }
+    }
+}
+
+fn assemble(
+    options: &FixtureOptions,
 ) -> (
     AdmittedOrientationJob,
     DreamInputBundle,
@@ -60,16 +103,16 @@ fn fixture(
         schema_version: 1,
         job_class: JobClass::Orientation,
         requester: Requester {
-            origin: RequesterOrigin::Human,
+            origin: options.requester_origin,
             principal: "alice".into(),
-            session: None,
+            session: options.requester_session.clone(),
         },
         operation_id: "op-1".into(),
         idempotency_key: "idem-1".into(),
         task_id: "task-1".into(),
         scope_id: "scope-1".into(),
         state_fence: fence.clone(),
-        privacy_profile: "local_only".into(),
+        privacy_profile: options.privacy_profile.clone(),
         contract_ref: "contract-1".into(),
         policy_ref: "validator-1".into(),
         budget: BudgetLimits {
@@ -103,12 +146,12 @@ fn fixture(
             digest: sha256_hex(b"placeholder"),
         }],
         omissions: vec![],
-        completeness: if partial {
+        completeness: if options.partial {
             BundleCompleteness::PartialForScope
         } else {
             BundleCompleteness::CompleteForScope
         },
-        authoritative_denominator: (!partial).then_some("denom-1".into()),
+        authoritative_denominator: (!options.partial).then_some("denom-1".into()),
     };
     let frame = LocalOrientationFrame::new(
         "What is known?",
@@ -166,10 +209,20 @@ fn fixture(
         position_revision: PositionRevision::genesis(),
     })
     .unwrap();
+    let (cep2_currentness, cep2_supersession) = if options.cep2_superseded {
+        (
+            Currentness::Superseded,
+            BTreeSet::from([
+                ArtifactId::new("artifact-628-supersedes").expect("supersession link"),
+            ]),
+        )
+    } else {
+        (Currentness::Current, BTreeSet::new())
+    };
     let cep2 = CurrentEpistemicPosition::new(
         receipt2,
-        Currentness::Current,
-        BTreeSet::new(),
+        cep2_currentness,
+        cep2_supersession,
         ClaimId::new("claim-629").unwrap(),
     )
     .unwrap();
@@ -205,6 +258,8 @@ fn fixture(
     });
     let mut envelope2 = envelope.clone();
     envelope2.provenance.raw_handle = Some("raw:orientation:629".into());
+    envelope2.status = options.evidence2_status;
+    envelope2.freshness = options.evidence2_freshness;
     let envelope2_bytes = canonical_json_bytes(&envelope2).unwrap();
     bundle.materials.push(BundleMaterial {
         handle: "evidence-2".into(),
@@ -212,7 +267,7 @@ fn fixture(
         bytes: envelope2_bytes.len() as u64,
         digest: sha256_hex(&envelope2_bytes),
     });
-    if nonrecoverable_omission {
+    if options.nonrecoverable_omission {
         bundle.omissions.push(OmissionHandle {
             handle: "missing-source".into(),
             reason: "source was not supplied".into(),
@@ -223,7 +278,27 @@ fn fixture(
             nonrecoverable_reason: Some("provider permanently unavailable".into()),
         });
     }
-    let coverage_denominator = if partial {
+    if options.extra_omissions {
+        bundle.omissions.push(OmissionHandle {
+            handle: "gap-a".into(),
+            reason: "gap-a awaits a future source".into(),
+            reversible: true,
+            scope_id: job.scope_id.clone(),
+            task_id: job.task_id.clone(),
+            digest: sha256_hex(b"orientation-gap-a"),
+            nonrecoverable_reason: None,
+        });
+        bundle.omissions.push(OmissionHandle {
+            handle: "gap-b".into(),
+            reason: "gap-b source retired".into(),
+            reversible: false,
+            scope_id: job.scope_id.clone(),
+            task_id: job.task_id.clone(),
+            digest: sha256_hex(b"orientation-gap-b"),
+            nonrecoverable_reason: Some("source retired; recovery impossible".into()),
+        });
+    }
+    let coverage_denominator = if options.partial {
         None
     } else {
         let mut denominator = OrientationCoverageDenominator {
@@ -275,17 +350,21 @@ fn fixture(
         });
         Some(denominator)
     };
+    let mut model_sources = vec!["frame".into()];
+    if let Some(extra) = &options.extra_model_source {
+        model_sources.push(extra.clone());
+    }
     let model = ModelDraft {
         schema_version: 1,
         job_id: job_id.clone(),
         statement: "A bounded hypothesis".into(),
-        source_handles: vec!["frame".into()],
-        counterevidence: vec!["coverage is limited".into()],
+        source_handles: model_sources,
+        counterevidence: options.counterevidence.clone(),
         uncertainty: "unknown".into(),
         expected_benefit: "choose a useful next read".into(),
-        recommended_probes: vec!["inspect the outcome".into()],
+        recommended_probes: options.recommended_probes.clone(),
         invalidation_conditions: vec!["new evidence differs".into()],
-        declared_confirmed_handles: vec![],
+        declared_confirmed_handles: options.declared_confirmed_handles.clone(),
     };
     let draft_digest = model_digest(&model).expect("model digest");
     let grounded = GroundedDreamDraft {
@@ -294,7 +373,7 @@ fn fixture(
         draft_digest: draft_digest.clone(),
         residues: vec![ClaimResidue {
             claim: "A bounded hypothesis".into(),
-            state: SupportState::Supported,
+            state: options.residue_state,
             detail: "retained as model grounding".into(),
         }],
         coverage_note: "one accounted residue".into(),
@@ -391,7 +470,6 @@ fn fixture(
     };
     let mut orientation_policy = OrientationPolicy::new("orientation-1", 1, 1_048_576);
     orientation_policy.seal().expect("orientation policy");
-    candidate.validate_binding().expect("candidate binding");
     let admitted = AdmittedOrientationJob {
         job,
         frame,
@@ -424,6 +502,71 @@ fn fixture(
     )
 }
 
+fn fixture(
+    partial: bool,
+    nonrecoverable_omission: bool,
+) -> (
+    AdmittedOrientationJob,
+    DreamInputBundle,
+    ValidatedCandidate,
+    OrientationPolicy,
+    Vec<CurrentEpistemicPositionHandle>,
+) {
+    let assembled = assemble(&FixtureOptions {
+        partial,
+        nonrecoverable_omission,
+        ..FixtureOptions::default()
+    });
+    assembled.2.validate_binding().expect("candidate binding");
+    assembled
+}
+
+fn assemble_with(
+    build: impl FnOnce(&mut FixtureOptions),
+) -> (
+    AdmittedOrientationJob,
+    DreamInputBundle,
+    ValidatedCandidate,
+    OrientationPolicy,
+    Vec<CurrentEpistemicPositionHandle>,
+) {
+    let mut options = FixtureOptions::default();
+    build(&mut options);
+    assemble(&options)
+}
+
+fn packet_value(packet: &OrientationPacketCandidate) -> serde_json::Value {
+    let bytes = canonical_json_bytes(packet).expect("packet canonical bytes");
+    serde_json::from_slice(&bytes).expect("packet json value")
+}
+
+fn collect_object_keys(value: &serde_json::Value, keys: &mut BTreeSet<String>) {
+    match value {
+        serde_json::Value::Object(map) => {
+            for (key, nested) in map {
+                keys.insert(key.clone());
+                collect_object_keys(nested, keys);
+            }
+        }
+        serde_json::Value::Array(items) => {
+            for item in items {
+                collect_object_keys(item, keys);
+            }
+        }
+        serde_json::Value::Null
+        | serde_json::Value::Bool(_)
+        | serde_json::Value::Number(_)
+        | serde_json::Value::String(_) => {}
+    }
+}
+
+fn packet_keys(packet: &OrientationPacketCandidate) -> BTreeSet<String> {
+    let mut keys = BTreeSet::new();
+    collect_object_keys(&packet_value(packet), &mut keys);
+    keys
+}
+
+// WORK_UNIT_CASE: 628/1
 #[test]
 fn projects_minimal_complete_packet() {
     let (job, bundle, candidate, policy, handles) = fixture(false, false);
@@ -470,6 +613,7 @@ fn projects_minimal_complete_packet() {
         .expect("input rebinding");
 }
 
+// WORK_UNIT_CASE: 628/10
 #[test]
 fn preserves_model_and_grounding_without_promoting_residue_to_evidence() {
     let (job, bundle, candidate, policy, handles) = fixture(false, true);
@@ -523,20 +667,130 @@ fn preserves_model_and_grounding_without_promoting_residue_to_evidence() {
     );
 }
 
+// WORK_UNIT_CASE: 628/3
 #[test]
 fn rejects_wrong_job_class() {
     let (mut job, bundle, candidate, policy, handles) = fixture(false, false);
     job.job.job_class = JobClass::Curation;
     assert!(project_orientation(&job, &bundle, &candidate, &handles, &policy).is_err());
+    for class in [
+        JobClass::Clarification,
+        JobClass::ResearchSynthesis,
+        JobClass::ArchitectureSelfQuery,
+        JobClass::DevelopmentDiagnosis,
+        JobClass::Maintenance,
+        JobClass::OrchestrationPlanning,
+        JobClass::ConfigurationAssistance,
+    ] {
+        job.job.job_class = class;
+        assert!(
+            project_orientation(&job, &bundle, &candidate, &handles, &policy).is_err(),
+            "{class:?} must never project as Orientation"
+        );
+    }
 }
 
+// WORK_UNIT_CASE: 628/4
 #[test]
 fn frame_question_is_bound_to_material_body() {
     let (mut job, bundle, candidate, policy, handles) = fixture(false, false);
     job.frame.question = "different question".into();
     assert!(project_orientation(&job, &bundle, &candidate, &handles, &policy).is_err());
+    let (mut task_job, task_bundle, task_candidate, task_policy, task_handles) =
+        fixture(false, false);
+    task_job.job.task_id = "task-9".into();
+    assert!(
+        project_orientation(
+            &task_job,
+            &task_bundle,
+            &task_candidate,
+            &task_handles,
+            &task_policy
+        )
+        .is_err()
+    );
+    let (mut scope_job, scope_bundle, scope_candidate, scope_policy, scope_handles) =
+        fixture(false, false);
+    scope_job.job.scope_id = "scope-9".into();
+    assert!(
+        project_orientation(
+            &scope_job,
+            &scope_bundle,
+            &scope_candidate,
+            &scope_handles,
+            &scope_policy
+        )
+        .is_err()
+    );
+    let (mut fence_job, fence_bundle, fence_candidate, fence_policy, fence_handles) =
+        fixture(false, false);
+    fence_job.job.state_fence.resource_generation =
+        ResourceGeneration::new(2).expect("bumped generation");
+    assert!(
+        project_orientation(
+            &fence_job,
+            &fence_bundle,
+            &fence_candidate,
+            &fence_handles,
+            &fence_policy
+        )
+        .is_err()
+    );
+    let (manifest_job, mut manifest_bundle, manifest_candidate, manifest_policy, manifest_handles) =
+        fixture(false, false);
+    manifest_bundle.manifest_digest = sha256_hex(b"tampered-manifest");
+    assert!(
+        project_orientation(
+            &manifest_job,
+            &manifest_bundle,
+            &manifest_candidate,
+            &manifest_handles,
+            &manifest_policy
+        )
+        .is_err()
+    );
+    let (draft_job, draft_bundle, mut draft_candidate, draft_policy, draft_handles) =
+        fixture(false, false);
+    draft_candidate.model.statement = "A rewritten hypothesis".into();
+    assert!(
+        project_orientation(
+            &draft_job,
+            &draft_bundle,
+            &draft_candidate,
+            &draft_handles,
+            &draft_policy
+        )
+        .is_err()
+    );
+    let (cep_job, cep_bundle, cep_candidate, cep_policy, mut cep_handles) =
+        fixture(false, false);
+    cep_handles[0].source_handle = "ghost-cep".into();
+    assert!(
+        project_orientation(
+            &cep_job,
+            &cep_bundle,
+            &cep_candidate,
+            &cep_handles,
+            &cep_policy
+        )
+        .is_err()
+    );
+    let (mut attempt_job, attempt_bundle, attempt_candidate, attempt_policy, attempt_handles) =
+        fixture(false, false);
+    attempt_job.frame.attempt = "attempt-9".into();
+    assert!(
+        project_orientation(
+            &attempt_job,
+            &attempt_bundle,
+            &attempt_candidate,
+            &attempt_handles,
+            &attempt_policy
+        )
+        .is_err()
+    );
 }
 
+// WORK_UNIT_CASE: 628/31
 #[test]
 fn partial_bundle_remains_explicit_and_replay_is_stable() {
     let (job, bundle, candidate, policy, handles) = fixture(true, false);
@@ -546,4 +800,478 @@ fn partial_bundle_remains_explicit_and_replay_is_stable() {
         .expect("replay projection");
     assert_eq!(first, second);
     assert_eq!(first.disposition, OrientationDisposition::Partial);
+    let mut evolved_policy = OrientationPolicy::new("orientation-2", 1, 1_048_576);
+    evolved_policy.seal().expect("evolved policy");
+    let evolved = project_orientation(&job, &bundle, &candidate, &handles, &evolved_policy)
+        .expect("policy-evolved projection");
+    assert_ne!(first.input_digest, evolved.input_digest);
+    assert_ne!(
+        first.provenance.policy_digest,
+        evolved.provenance.policy_digest
+    );
+    assert!(
+        first
+            .validate_against(&job, &bundle, &candidate, &handles, &evolved_policy)
+            .is_err()
+    );
+}
+
+// WORK_UNIT_CASE: 628/2
+#[test]
+fn exact_orientation_vocabulary_is_closed() {
+    let (job, bundle, candidate, policy, handles) = fixture(false, false);
+    assert_eq!(job.job.job_class, JobClass::Orientation);
+    let packet =
+        project_orientation(&job, &bundle, &candidate, &handles, &policy).expect("projection");
+    assert_eq!(packet.schema_version, 2);
+    assert_eq!(packet.disposition, OrientationDisposition::Complete);
+    let kinds: Vec<&str> = packet
+        .sections
+        .iter()
+        .map(|section| section.kind.as_str())
+        .collect();
+    assert_eq!(
+        kinds,
+        vec![
+            "constraints",
+            "evidence_coverage",
+            "identity_task_frame",
+            "inert_probes",
+            "interpretations_rivals_dissent",
+            "omissions_expansion_frontier_invalidation",
+            "positions",
+            "preservation",
+            "relation_candidates",
+            "safe_external_handoff",
+            "unknowns_gaps",
+        ]
+    );
+    assert_eq!(
+        serde_json::to_value(JobClass::Orientation).expect("class json"),
+        serde_json::json!("orientation")
+    );
+    assert_eq!(
+        serde_json::to_value(RequesterOrigin::Human).expect("origin json"),
+        serde_json::json!("human")
+    );
+    assert_eq!(
+        serde_json::to_value(packet.disposition).expect("disposition json"),
+        serde_json::json!("complete")
+    );
+    assert_eq!(
+        serde_json::to_value(&packet.sections[0].kind).expect("kind json"),
+        serde_json::json!("constraints")
+    );
+}
+
+// WORK_UNIT_CASE: 628/5
+#[test]
+fn requester_origin_and_session_survive_verbatim() {
+    for (origin, session) in [
+        (RequesterOrigin::Human, None),
+        (
+            RequesterOrigin::AdmittedAgent,
+            Some("agent-session-9".to_owned()),
+        ),
+        (RequesterOrigin::SchedulePolicy, None),
+    ] {
+        let (job, bundle, candidate, policy, handles) = assemble_with(|options| {
+            options.requester_origin = origin;
+            options.requester_session = session.clone();
+        });
+        candidate.validate_binding().expect("candidate binding");
+        let packet = project_orientation(&job, &bundle, &candidate, &handles, &policy)
+            .expect("projection");
+        assert_eq!(packet.provenance.requester_origin, origin);
+        assert_eq!(packet.provenance.requester_principal, "alice");
+        assert_eq!(packet.provenance.requester_session, session);
+        assert_eq!(packet.disposition, OrientationDisposition::Complete);
+    }
+}
+
+// WORK_UNIT_CASE: 628/6
+#[test]
+fn generic_request_closes_without_self_scope_or_brief_handles() {
+    let (job, bundle, candidate, policy, handles) = fixture(false, false);
+    assert_eq!(job.job.scope_id, "scope-1");
+    assert!(!job.job.scope_id.contains("self"));
+    assert_eq!(candidate.model.source_handles, vec!["frame".to_owned()]);
+    let packet =
+        project_orientation(&job, &bundle, &candidate, &handles, &policy).expect("projection");
+    assert_eq!(packet.disposition, OrientationDisposition::Complete);
+    let wire = serde_json::to_string(&packet_value(&packet)).expect("packet json");
+    for forbidden in [
+        "self_scope",
+        "self_query",
+        "architecture_brief",
+        "implementation_brief",
+    ] {
+        assert!(
+            !wire.contains(forbidden),
+            "generic packet must not carry {forbidden}"
+        );
+    }
+}
+
+// WORK_UNIT_CASE: 628/7
+#[test]
+fn outside_manifest_source_rejected_and_stale_evidence_preserved() {
+    let (ghost_job, ghost_bundle, ghost_candidate, ghost_policy, ghost_handles) =
+        assemble_with(|options| {
+            options.extra_model_source = Some("ghost-handle".into());
+        });
+    assert!(
+        project_orientation(
+            &ghost_job,
+            &ghost_bundle,
+            &ghost_candidate,
+            &ghost_handles,
+            &ghost_policy
+        )
+        .is_err()
+    );
+    let (job, bundle, candidate, policy, handles) = assemble_with(|options| {
+        options.evidence2_status = EpistemicStatus::Stale;
+        options.evidence2_freshness = EvidenceFreshness::Stale;
+    });
+    candidate.validate_binding().expect("candidate binding");
+    let packet =
+        project_orientation(&job, &bundle, &candidate, &handles, &policy).expect("projection");
+    assert_eq!(packet.disposition, OrientationDisposition::Complete);
+    let stale = packet
+        .anchored_evidence_by_status
+        .iter()
+        .find(|evidence| evidence.source_handle == "evidence-2")
+        .expect("stale evidence retained");
+    assert_eq!(stale.envelope.status, EpistemicStatus::Stale);
+    assert_eq!(stale.envelope.freshness, EvidenceFreshness::Stale);
+    assert_eq!(
+        packet.anchored_evidence_by_status.len(),
+        job.admitted_evidence.len()
+    );
+}
+
+// WORK_UNIT_CASE: 628/8
+#[test]
+fn varied_position_and_evidence_status_are_preserved() {
+    let (job, bundle, candidate, policy, handles) = assemble_with(|options| {
+        options.evidence2_status = EpistemicStatus::Contested;
+        options.cep2_superseded = true;
+    });
+    candidate.validate_binding().expect("candidate binding");
+    let packet =
+        project_orientation(&job, &bundle, &candidate, &handles, &policy).expect("projection");
+    assert_eq!(packet.disposition, OrientationDisposition::Complete);
+    assert_eq!(packet.resolved_epistemic_position_handles.len(), 2);
+    assert_eq!(
+        packet.resolved_epistemic_position_handles[0]
+            .position
+            .currentness,
+        Currentness::Current
+    );
+    assert_eq!(
+        packet.resolved_epistemic_position_handles[1]
+            .position
+            .currentness,
+        Currentness::Superseded
+    );
+    assert!(
+        !packet.resolved_epistemic_position_handles[1]
+            .position
+            .supersession
+            .is_empty()
+    );
+    let statuses: Vec<EpistemicStatus> = packet
+        .anchored_evidence_by_status
+        .iter()
+        .map(|evidence| evidence.envelope.status)
+        .collect();
+    assert_eq!(
+        statuses,
+        vec![EpistemicStatus::Observed, EpistemicStatus::Contested]
+    );
+    let positions = packet
+        .sections
+        .iter()
+        .find(|section| section.kind.as_str() == "positions")
+        .expect("positions section");
+    assert_eq!(positions.items.len(), 2);
+}
+
+// WORK_UNIT_CASE: 628/9
+#[test]
+fn partial_denominator_marks_positions_unknown() {
+    let (job, bundle, candidate, policy, handles) = assemble_with(|options| {
+        options.partial = true;
+    });
+    candidate.validate_binding().expect("candidate binding");
+    let partial =
+        project_orientation(&job, &bundle, &candidate, &handles, &policy).expect("projection");
+    assert_eq!(partial.disposition, OrientationDisposition::Partial);
+    assert!(partial.coverage_denominator.is_none());
+    assert!(partial.source_coverage.denominator_digest.is_none());
+    for name in ["positions", "evidence_coverage"] {
+        let section = partial
+            .sections
+            .iter()
+            .find(|section| section.kind.as_str() == name)
+            .expect("section present");
+        assert!(
+            !section.known,
+            "{name} must stay unknown without a denominator"
+        );
+    }
+    let (full_job, full_bundle, full_candidate, full_policy, full_handles) =
+        fixture(false, false);
+    let full = project_orientation(
+        &full_job,
+        &full_bundle,
+        &full_candidate,
+        &full_handles,
+        &full_policy,
+    )
+    .expect("projection");
+    for name in ["positions", "evidence_coverage"] {
+        let section = full
+            .sections
+            .iter()
+            .find(|section| section.kind.as_str() == name)
+            .expect("section present");
+        assert!(section.known, "{name} is known with a denominator");
+    }
+}
+
+// WORK_UNIT_CASE: 628/11
+#[test]
+fn exact_duplicate_rivals_preserve_every_lineage() {
+    let (job, bundle, candidate, policy, handles) = assemble_with(|options| {
+        options.counterevidence = vec!["same rival".into(), "same rival".into()];
+    });
+    candidate.validate_binding().expect("candidate binding");
+    let packet =
+        project_orientation(&job, &bundle, &candidate, &handles, &policy).expect("projection");
+    assert_eq!(packet.rival_models_and_dissent.len(), 2);
+    for rival in &packet.rival_models_and_dissent {
+        assert_eq!(rival.kind, "counterevidence");
+        assert_eq!(rival.text, "same rival");
+        assert_eq!(rival.source, "model_draft");
+    }
+    assert_eq!(
+        packet.synthesized_interpretations[0].counterevidence,
+        vec!["same rival".to_owned(), "same rival".to_owned()]
+    );
+}
+
+// WORK_UNIT_CASE: 628/12
+#[test]
+fn materially_different_rivals_stay_separate() {
+    let (job, bundle, candidate, policy, handles) = assemble_with(|options| {
+        options.counterevidence = vec!["rival alpha".into(), "rival beta".into()];
+    });
+    candidate.validate_binding().expect("candidate binding");
+    let packet =
+        project_orientation(&job, &bundle, &candidate, &handles, &policy).expect("projection");
+    let texts: Vec<&str> = packet
+        .rival_models_and_dissent
+        .iter()
+        .map(|rival| rival.text.as_str())
+        .collect();
+    assert_eq!(texts, vec!["rival alpha", "rival beta"]);
+    assert_ne!(
+        packet.rival_models_and_dissent[0],
+        packet.rival_models_and_dissent[1]
+    );
+}
+
+// WORK_UNIT_CASE: 628/13
+#[test]
+fn winner_injection_rejected_and_dissent_never_collapsed() {
+    let (crowned_job, crowned_bundle, crowned_candidate, crowned_policy, crowned_handles) =
+        assemble_with(|options| {
+            options.declared_confirmed_handles = vec!["evidence".into()];
+        });
+    assert!(
+        project_orientation(
+            &crowned_job,
+            &crowned_bundle,
+            &crowned_candidate,
+            &crowned_handles,
+            &crowned_policy
+        )
+        .is_err()
+    );
+    let (job, bundle, candidate, policy, handles) = fixture(false, false);
+    let packet =
+        project_orientation(&job, &bundle, &candidate, &handles, &policy).expect("projection");
+    assert_eq!(
+        packet.rival_models_and_dissent.len(),
+        candidate.model.counterevidence.len()
+    );
+    assert!(!packet.rival_models_and_dissent.is_empty());
+    let wire = serde_json::to_string(&packet_value(&packet)).expect("packet json");
+    for forbidden in ["winner", "consensus", "majority"] {
+        assert!(
+            !wire.contains(forbidden),
+            "packet must not inject {forbidden}"
+        );
+    }
+}
+
+// WORK_UNIT_CASE: 628/14
+#[test]
+fn hidden_counterevidence_or_omission_is_rejected() {
+    let (job, bundle, candidate, policy, handles) = fixture(false, true);
+    let packet =
+        project_orientation(&job, &bundle, &candidate, &handles, &policy).expect("projection");
+    assert_eq!(
+        packet.rival_models_and_dissent.len(),
+        candidate.model.counterevidence.len()
+    );
+    assert_eq!(
+        packet.unknowns_and_gaps.len(),
+        candidate.bundle.omissions.len()
+    );
+    assert_eq!(
+        packet.unknowns_and_gaps[0].text,
+        candidate.bundle.omissions[0].reason
+    );
+    let mut censored = packet.clone();
+    censored.rival_models_and_dissent.pop();
+    assert!(
+        censored
+            .validate_against(&job, &bundle, &candidate, &handles, &policy)
+            .is_err()
+    );
+    let mut gapless = packet.clone();
+    gapless.unknowns_and_gaps.clear();
+    assert!(
+        gapless
+            .validate_against(&job, &bundle, &candidate, &handles, &policy)
+            .is_err()
+    );
+}
+
+// WORK_UNIT_CASE: 628/15
+#[test]
+fn relation_projection_stays_explicit() {
+    let (job, bundle, candidate, policy, handles) = fixture(false, false);
+    let packet =
+        project_orientation(&job, &bundle, &candidate, &handles, &policy).expect("projection");
+    assert!(packet.hidden_relation_candidates.is_empty());
+    let relations = packet
+        .sections
+        .iter()
+        .find(|section| section.kind.as_str() == "relation_candidates")
+        .expect("relation section");
+    assert!(relations.known);
+    assert!(relations.items.is_empty());
+    let (open_job, open_bundle, open_candidate, open_policy, open_handles) =
+        assemble_with(|options| {
+            options.partial = true;
+        });
+    open_candidate
+        .validate_binding()
+        .expect("candidate binding");
+    let open = project_orientation(
+        &open_job,
+        &open_bundle,
+        &open_candidate,
+        &open_handles,
+        &open_policy,
+    )
+    .expect("projection");
+    assert_eq!(
+        open.hidden_relation_candidates,
+        vec![OrientationResidue {
+            kind: "unsupported".into(),
+            text: "typed relation projection is outside the basic Orientation owner".into(),
+            source: "orientation_contract".into(),
+        }]
+    );
+    let open_relations = open
+        .sections
+        .iter()
+        .find(|section| section.kind.as_str() == "relation_candidates")
+        .expect("relation section");
+    assert!(!open_relations.known);
+    assert_eq!(
+        open_relations.items,
+        vec!["relation candidates are not admitted".to_owned()]
+    );
+}
+
+// WORK_UNIT_CASE: 628/16
+#[test]
+fn missing_source_scope_and_fence_bindings_rejected() {
+    let (ghost_job, ghost_bundle, ghost_candidate, ghost_policy, mut ghost_handles) =
+        fixture(false, false);
+    ghost_handles[0].source_handle = "ghost-cep".into();
+    assert!(
+        project_orientation(
+            &ghost_job,
+            &ghost_bundle,
+            &ghost_candidate,
+            &ghost_handles,
+            &ghost_policy
+        )
+        .is_err()
+    );
+    let (mut missing_job, missing_bundle, missing_candidate, missing_policy, missing_handles) =
+        fixture(false, false);
+    missing_job.admitted_evidence[0].source_handle = "ghost-evidence".into();
+    assert!(
+        project_orientation(
+            &missing_job,
+            &missing_bundle,
+            &missing_candidate,
+            &missing_handles,
+            &missing_policy
+        )
+        .is_err()
+    );
+    let (mut scope_job, scope_bundle, scope_candidate, scope_policy, scope_handles) =
+        fixture(false, false);
+    scope_job.job.scope_id = "scope-9".into();
+    assert!(
+        project_orientation(
+            &scope_job,
+            &scope_bundle,
+            &scope_candidate,
+            &scope_handles,
+            &scope_policy
+        )
+        .is_err()
+    );
+    let (mut fence_job, fence_bundle, fence_candidate, fence_policy, fence_handles) =
+        fixture(false, false);
+    fence_job.job.state_fence.resource_generation =
+        ResourceGeneration::new(2).expect("bumped generation");
+    assert!(
+        project_orientation(
+            &fence_job,
+            &fence_bundle,
+            &fence_candidate,
+            &fence_handles,
+            &fence_policy
+        )
+        .is_err()
+    );
+    let (mut denom_job, denom_bundle, denom_candidate, denom_policy, denom_handles) =
+        fixture(false, false);
+    denom_job
+        .coverage_denominator
+        .as_mut()
+        .expect("denominator")
+        .cep_members
+        .pop();
+    assert!(
+        project_orientation(
+            &denom_job,
+            &denom_bundle,
+            &denom_candidate,
+            &denom_handles,
+            &denom_policy
+        )
+        .is_err()
+    );
 }
