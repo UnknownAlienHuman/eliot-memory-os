@@ -110,3 +110,68 @@ needed_by = ["eliot-context-candidates", "future provider-contribution consumers
 missing_contract = "Versioned owner-neutral ProviderContribution with complete denominator, fence, scope and omission semantics."
 forbidden_workaround = "prose-invented provider contribution type or generic JSON treated as a contribution contract"
 resolution_evidence = ["versioned owner-neutral contribution contract", "producer fixtures", "complete-denominator and scope/fence tests", "Governor ownership acceptance"]
+
+[[challenge]]
+id = "CC-W9-MEMORY-QUALITY"
+status = "OPEN_PROVIDER_CONFORMANCE"
+required_owner = "Governor/Memory OS canonical read owner"
+needed_by = ["eliot-memory-quality"]
+depends_on = ["CC-004", "CC-008", "CC-MEMORY-PROJECTION-SCHEMA"]
+missing_contract = "Versioned owner-neutral MemoryProjectionRecord read set and admitted task/continuity/safety-negative-memory/affordance projections consumed by MemoryEcologyAssessment, with complete denominator, fence, scope and omission semantics."
+forbidden_workaround = "Smart querying storage or treating cue hits, retrieval, popularity, completion, delivery, tool availability, or model agreement as applicability, support, utility, or understanding"
+resolution_evidence = ["versioned owner-neutral projection contract", "bounded provider read-set fixtures", "complete-denominator recheck per cognitive-wave-09 MemoryEcologyAssessment denominator_rule", "Governor/store provider and memory-quality consumer Edge proof"]
+proof_ceiling = "STATIC_CONTRACT_REGISTRATION_ONLY"
+implementation_support = "TARGET"
+evidence_execution_status = "NOT_EXECUTED"
+
+[[challenge]]
+id = "CC-W9-MEMORY-REVISION"
+status = "OPEN_PROVIDER_CONFORMANCE"
+required_owner = "Governor canonical observation owner"
+needed_by = ["eliot-dreamer-memory-revision"]
+depends_on = ["CC-004", "CC-FAILURE-OBSERVATION-SCHEMA", "CC-MEMORY-PROJECTION-SCHEMA"]
+missing_contract = "Versioned owner-neutral FailureObservation and MemoryRevisionEvidence refs consumed by NegativeMemoryExtinctionCandidate, with complete dependency-closure denominator, fence, scope and omission semantics."
+forbidden_workaround = "suppressing negative memory only because it rarely changed an action, rewriting history, or claiming purge-grade safety for a reversible candidate"
+resolution_evidence = ["versioned owner-neutral observation/revision contracts", "producer fixtures", "closure-denominator recheck per cognitive-wave-09 NegativeMemoryExtinctionCandidate denominator_rule", "Governor transition-path Edge proof"]
+proof_ceiling = "STATIC_CONTRACT_REGISTRATION_ONLY"
+implementation_support = "TARGET"
+evidence_execution_status = "NOT_EXECUTED"
+
+[[challenge]]
+id = "CC-W9-COGNITIVE-QUALITY"
+status = "OPEN_PROVIDER_CONFORMANCE"
+required_owner = "Governor/Meta outcome and experiment owners"
+needed_by = ["eliot-cognitive-quality"]
+depends_on = ["CC-007", "eliot-learning-contracts::UseAttributionCandidate", "eliot-learning-contracts::ImprovementExperimentCandidate"]
+missing_contract = "Versioned owner-neutral Skill execution evidence, tool-definition versions, Durable Job and route-usage/curation/outcome receipts, and SystemObservationJournal/EliotSystemExperienceBank/AgentFeedbackReceipt projections consumed by CognitiveQualityAssessment, with per-sub-assessment denominators and no aggregate score."
+forbidden_workaround = "installed/delivered/executed/useful conflation, retrieval/repetition/agreement as Skill reinforcement, elegant-but-unused synthesis as utility, active-generation self-modification, self-verification, or model-rated improvement"
+resolution_evidence = ["versioned execution/receipt/projection contracts", "per-attempt HarnessActivationReceipt fixtures", "per-sub-assessment denominator recheck per cognitive-wave-09 CognitiveQualityAssessment denominator_rule", "Governor/Meta ownership acceptance and Edge proof"]
+proof_ceiling = "STATIC_CONTRACT_REGISTRATION_ONLY"
+implementation_support = "TARGET"
+evidence_execution_status = "NOT_EXECUTED"
+
+[[challenge]]
+id = "CC-W9-UNDERSTANDING"
+status = "OPEN_PROVIDER_CONFORMANCE"
+required_owner = "Architecture/Implementation accepted-source projection owner"
+needed_by = ["eliot-understanding-assessment"]
+depends_on = ["CC-004", "CC-006", "eliot-context-contracts::ActiveUnderstandingView"]
+missing_contract = "Versioned accepted-source projection and already-compiled ActiveUnderstandingView consumed by CommonGroundAssessment and ScopedUnderstandingAssessment, with question/task-family State-Fence denominator, rival/prediction/discriminator/verifier closure, and held-out discipline for product claims."
+forbidden_workaround = "summary similarity or native continuation state as Common Ground, graphs/prose/delivery/agreement as LOCALLY_ADEQUATE, fixed graph/edge/context thresholds as proof, or a second ContextCompiler invocation/admission pass"
+resolution_evidence = ["accepted-source manifest with edition identity", "ActiveUnderstandingView contract fixtures", "denominator recheck per cognitive-wave-09 UnderstandingAssessment denominator_rule", "Governor/context consumer Edge proof"]
+proof_ceiling = "STATIC_CONTRACT_REGISTRATION_ONLY"
+implementation_support = "TARGET"
+evidence_execution_status = "NOT_EXECUTED"
+
+[[challenge]]
+id = "CC-W9-REV12-HANDOFF"
+status = "OPEN_PROVIDER_CONFORMANCE"
+required_owner = "Wave 1 projection contract owner"
+needed_by = ["eliot-memory-quality", "eliot-dreamer-memory-revision", "eliot-cognitive-quality", "eliot-understanding-assessment"]
+depends_on = ["cognitive-rev12-contract-schema-freeze.toml"]
+missing_contract = "Handoff for #223: file cognitive-rev12-contract-schema-freeze.toml is absent repo-wide at base 03b04bc5 (rg exit 1, dual-glob zero); downstream Rust implementation, package Module Proof, real provider-consumer Edge Proof, and named Product Pulses for the four W9 crates stay NOT_EXECUTED until that freeze or equivalent versioned upstream projection types exist. This absence does not block the STATIC_FIELD_CONTRACT_ONLY freeze itself."
+forbidden_workaround = "implementing W9 Rust types from prose, inventing upstream denominators, or treating this static freeze as implementation/edge/pulse proof"
+resolution_evidence = ["cognitive-rev12-contract-schema-freeze.toml or equivalent versioned upstream projection freeze", "producer fixtures", "W9 Module Proof per crate", "real provider-consumer Edge proof per edge", "named W9 Product Pulse execution"]
+proof_ceiling = "STATIC_CONTRACT_REGISTRATION_ONLY"
+implementation_support = "TARGET"
+evidence_execution_status = "NOT_EXECUTED"
