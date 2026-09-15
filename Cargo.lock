@@ -1150,6 +1150,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "eliot-dreamer-cycle"
+version = "0.1.0"
+dependencies = [
+ "eliot-agent-contracts",
+ "eliot-contracts",
+ "eliot-dreamer-contracts",
+ "eliot-receipts",
+ "schemars",
+ "serde",
+ "thiserror",
+]
+
+[[package]]
 name = "eliot-ecxf"
 version = "0.1.0"
 dependencies = [
