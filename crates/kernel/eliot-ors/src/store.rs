@@ -1418,12 +1418,19 @@ impl RedbRecoveryStore {
             if same_digest && same_body {
                 return Ok(Some(existing));
             }
-            return Err(OrsError::HostRequestIdentityConflict {
-                operation_id: operation_id.as_str().to_owned(),
-                request_digest: request_digest.to_owned(),
-            });
-        }
-        if existing.state == crate::HostRequestState::Terminal {
+            // Legacy digest-only row completed by the exact same digest: the
+            // matching digest proves the same result, so binding the missing
+            // body is monotonic completion, not an overwrite. Anything else
+            // under the same identity stays a conflict.
+            let completes_legacy =
+                same_digest && existing.result_response.is_none();
+            if !completes_legacy {
+                return Err(OrsError::HostRequestIdentityConflict {
+                    operation_id: operation_id.as_str().to_owned(),
+                    request_digest: request_digest.to_owned(),
+                });
+            }
+        } else if existing.state == crate::HostRequestState::Terminal {
             let same_digest = existing.result_digest.as_deref() == Some(result_digest);
             let same_body = existing.result_response.as_ref() == Some(result_response);
             if same_digest && same_body {
@@ -7279,6 +7286,57 @@ mod host_request_result_tests {
                 HostRequestState::Terminal,
                 Some("1".repeat(64).as_str()),
             ),
+            Err(OrsError::HostRequestIdentityConflict { .. })
+        ));
+
+        drop(store);
+        let _ = std::fs::remove_file(path);
+        Ok(())
+    }
+
+    #[test]
+    fn legacy_digest_only_row_completes_with_exact_body() -> Result<(), OrsError> {
+        let (store, path) = temp_store();
+        let digest = "d".repeat(64);
+        let operation =
+            OperationIdentity::new(format!("hostreq:{digest}")).expect("valid operation");
+        store.stage_host_request(&requested_fixture(operation.as_str(), &digest))?;
+        for target in [
+            HostRequestState::Admitted,
+            HostRequestState::Routed,
+            HostRequestState::Submitted,
+        ] {
+            store
+                .advance_host_request(&operation, &digest, target, None)?
+                .expect("walk must advance");
+        }
+        let result_digest = "f".repeat(64);
+        let legacy = store
+            .advance_host_request(
+                &operation,
+                &digest,
+                HostRequestState::ResultReceived,
+                Some(result_digest.as_str()),
+            )?
+            .expect("legacy row must store");
+        assert_eq!(legacy.state, HostRequestState::ResultReceived);
+        assert!(legacy.result_response.is_none());
+        // The legacy row still loads (compatibility, never served as a body).
+        let loaded = store
+            .load_host_request(&operation, &digest)?
+            .expect("legacy row must load");
+        assert_eq!(loaded, legacy);
+
+        // Completing it with the exact same digest binds the missing body;
+        // anything else stays a conflict.
+        let body = json!({"completed": "legacy-body"});
+        let completed = store
+            .persist_host_request_result(&operation, &digest, &result_digest, &body)?
+            .expect("exact-digest completion must store");
+        assert_eq!(completed.result_digest.as_deref(), Some(result_digest.as_str()));
+        assert_eq!(completed.result_response.as_ref(), Some(&body));
+        assert!(matches!(
+            store.persist_host_request_result(&operation, &digest, &"0".repeat(64), &body,),
             Err(OrsError::HostRequestIdentityConflict { .. })
         ));
 

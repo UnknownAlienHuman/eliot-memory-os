@@ -2768,18 +2768,18 @@ impl HostRequestRecord {
                 validate_digest(result, "host_request_result_digest")?;
                 validate_result_response(body)?;
             }
-            (HostRequestState::Terminal, None, None) => {}
+            // Legacy digest-only row (produced by the digest-only advance
+            // before the bounded body existed): loads for compatibility but
+            // is never served as a body until completed by an exact-digest
+            // persist. Digests in any other state remain rejected as before.
+            (HostRequestState::ResultReceived | HostRequestState::Terminal, Some(result), None) => {
+                validate_digest(result, "host_request_result_digest")?;
+            }
             (_, None, None) => {}
-            (_, Some(_), None) | (_, None, Some(_)) => {
+            (_, Some(_), _) | (_, None, Some(_)) => {
                 return Err(OrsError::InvalidField {
                     field: "host_request_result_digest",
                     reason: "result digest and body must be present together, only for received or terminal states",
-                });
-            }
-            (_, Some(_), Some(_)) => {
-                return Err(OrsError::InvalidField {
-                    field: "host_request_result_digest",
-                    reason: "result only for received or terminal states",
                 });
             }
         }
