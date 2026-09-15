@@ -422,6 +422,20 @@ impl<P: KernelJobPort> KernelSupervisedComposition<P> {
     }
 }
 
+/// T12-08 consumer-linkage prerequisite for issue #702.
+///
+/// Real production references to the five T8-A4-admitted leaves so package
+/// resolution succeeds. Linkage only, not a working job path: no stage
+/// modules, no job execution, and no reference to the still-excluded
+/// `eliot-dreamer-orientation` leaf.
+pub fn admitted_leaf_linkage() {
+    let _ = eliot_dreamer_bundle::plan_bundle;
+    let _ = eliot_dreamer_candidate_validation::validate_grounded_dream_draft_at;
+    let _ = eliot_dreamer_claim_grounding::ground_draft;
+    let _ = eliot_dreamer_rival_model::structure_rival_models;
+    let _ = eliot_dreamer_probe_plan::ProbePlan::new;
+}
+
 #[cfg(test)]
 struct StoredJob {
     input: DreamJobInput,
