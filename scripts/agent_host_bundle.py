@@ -132,6 +132,16 @@ def _validate_identity_node(name: str, value: Any, location: str) -> None:
     """
     normalized = str(name).lower().replace("-", "_")
     if normalized == "disposition":
+        if isinstance(value, dict):
+            # Specified Part A shape is a disposition BLOCK carrying the scalar
+            # under its own "disposition" key plus digests/versions/metadata.
+            # Recurse so the inner scalar, digest-likes, and versions validate
+            # exactly like a scalar disposition site. A block never admits.
+            for key, child in value.items():
+                if not isinstance(key, str) or not key:
+                    raise BundleError(f"{location}: identity mapping requires string keys")
+                _validate_identity_node(key, child, f"{location}.{key}")
+            return
         if value not in DISPOSITIONS:
             raise BundleError(f"{location}: unknown disposition {value!r}")
         return
