@@ -13,6 +13,9 @@
 //! durable-job, apply/recovery/genesis, or fabricated success path.
 
 use super::{KernelComposition, Session, TransportError, validate_store_session_fence};
+use crate::kernel_diagnostics::{
+    EntrypointStage, observe_entrypoint_with_detail, observe_terminal_error,
+};
 use serde::Deserialize;
 
 #[cfg(windows)]
@@ -34,18 +37,96 @@ pub(super) async fn dispatch(
     session: &Session,
     payload: serde_json::Value,
 ) -> Result<serde_json::Value, TransportError> {
-    let operation: StoreReceiptOperation =
-        serde_json::from_value(payload).map_err(|_| TransportError::SessionFenced)?;
-    validate_store_session_fence(session, &operation.state_fence)?;
-    let gateway = kernel.retained_store_gateway()?;
+    // F-LOG-KERNEL-2 (#899): receipt query/readback/validation boundary.
+    // Request correlation (transport payload) stays separate from stable
+    // operation identity (owner-validated fence/operation). One terminal per
+    // failed receipt operation; Store commit versus Kernel response delivery
+    // stay distinct. Only fixed phases plus the stable `receipt` kind are
+    // emitted, never payload bodies, fences, queries, or error strings.
+    observe_entrypoint_with_detail(
+        EntrypointStage::StoreBootstrap,
+        "kernel.store.receipt_requested",
+    );
+    let Ok(operation): Result<StoreReceiptOperation, _> = serde_json::from_value(payload) else {
+        observe_entrypoint_with_detail(
+            EntrypointStage::StoreBootstrap,
+            "kernel.store.receipt_rejected:prepare",
+        );
+        observe_terminal_error("SESSION_FENCED");
+        return Err(TransportError::SessionFenced);
+    };
+    observe_entrypoint_with_detail(
+        EntrypointStage::StoreBootstrap,
+        "kernel.store.receipt_prepared",
+    );
+    if validate_store_session_fence(session, &operation.state_fence).is_err() {
+        observe_entrypoint_with_detail(
+            EntrypointStage::StoreBootstrap,
+            "kernel.store.receipt_rejected:fence",
+        );
+        observe_terminal_error("SESSION_FENCED");
+        return Err(TransportError::SessionFenced);
+    }
+    observe_entrypoint_with_detail(
+        EntrypointStage::StoreBootstrap,
+        "kernel.store.receipt_fence_validated",
+    );
+    let Ok(gateway) = kernel.retained_store_gateway() else {
+        // Prepared but not submitted: deterministic pre-send refusal
+        // proves no Store send occurred.
+        observe_entrypoint_with_detail(
+            EntrypointStage::StoreBootstrap,
+            "kernel.store.receipt_rejected:not_submitted",
+        );
+        observe_terminal_error("SESSION_FENCED");
+        return Err(TransportError::SessionFenced);
+    };
+    observe_entrypoint_with_detail(
+        EntrypointStage::StoreBootstrap,
+        "kernel.store.receipt_submitted",
+    );
     match gateway
         .receipt(&operation.state_fence, operation.operation_id)
         .await
     {
-        Ok(receipt) => Ok(store_receipt_response(receipt.as_ref())),
-        Err(error) => Ok(KernelComposition::store_error_response_text(
-            "receipt", &error,
-        )),
+        Ok(receipt) => {
+            observe_entrypoint_with_detail(
+                EntrypointStage::StoreBootstrap,
+                "kernel.store.receipt_returned",
+            );
+            let response = store_receipt_response(receipt.as_ref());
+            observe_entrypoint_with_detail(
+                EntrypointStage::StoreBootstrap,
+                "kernel.store.receipt_response_delivered",
+            );
+            Ok(response)
+        }
+        Err(error) => {
+            // Store query failed but Kernel delivery of the typed error
+            // projection succeeds: commit versus delivery stay distinct.
+            // The owner error string is never emitted, only the stable
+            // projection outcome.
+            let unknown = error == eliot_store_api::StoreError::MissingReceiptEnvelope.to_string();
+            if unknown {
+                observe_entrypoint_with_detail(
+                    EntrypointStage::StoreBootstrap,
+                    "kernel.store.receipt_unknown",
+                );
+            } else {
+                observe_entrypoint_with_detail(
+                    EntrypointStage::StoreBootstrap,
+                    "kernel.store.receipt_query_failed",
+                );
+            }
+            observe_terminal_error(if unknown {
+                "STORE_UNKNOWN"
+            } else {
+                "STORE_ERROR"
+            });
+            Ok(KernelComposition::store_error_response_text(
+                "receipt", &error,
+            ))
+        }
     }
 }
 
@@ -56,6 +137,11 @@ pub(super) async fn dispatch(
     payload: serde_json::Value,
 ) -> Result<serde_json::Value, TransportError> {
     let _ = payload;
+    observe_entrypoint_with_detail(
+        EntrypointStage::StoreBootstrap,
+        "kernel.store.receipt_rejected:unsupported",
+    );
+    observe_terminal_error("SESSION_FENCED");
     Err(TransportError::SessionFenced)
 }
 

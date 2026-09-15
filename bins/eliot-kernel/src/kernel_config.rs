@@ -18,6 +18,7 @@ use super::{
     AgentBridgeAdmissionDescriptor, DEFAULT_PIPE_NAME, EliotdLaunchDescriptor,
     EliotdReceiptRootBinding, HostStoreBootstrapRequirement, PathBuf,
 };
+use crate::kernel_diagnostics::{EntrypointStage, observe_entrypoint_with_detail};
 
 /// Explicit construction input for the Kernel process.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -75,6 +76,9 @@ pub struct KernelConfig {
 impl KernelConfig {
     /// Creates the production configuration using the canonical pipe.
     pub fn new(work_root: impl Into<PathBuf>) -> Self {
+        // F-LOG-KERNEL-2 (#899): candidate construction observation only.
+        // No validation, no readiness, no raw work-root/pipe values.
+        observe_entrypoint_with_detail(EntrypointStage::LaunchConfig, "kernel.config.candidate");
         Self {
             work_root: work_root.into(),
             pipe_name: DEFAULT_PIPE_NAME.to_owned(),
@@ -98,6 +102,13 @@ impl KernelConfig {
     /// Injects the Host-approved canonical-store bootstrap requirement.
     #[must_use]
     pub fn with_store_bootstrap(mut self, requirement: HostStoreBootstrapRequirement) -> Self {
+        // F-LOG-KERNEL-2 (#899): bootstrap-requirement injection observation.
+        // The requirement itself is retained verbatim; only a fixed phase
+        // label is emitted, never raw pipe/connection/credential material.
+        observe_entrypoint_with_detail(
+            EntrypointStage::StoreBootstrap,
+            "kernel.config.store_bootstrap_injected",
+        );
         self.store_bootstrap = Some(requirement);
         self
     }
@@ -114,6 +125,11 @@ impl KernelConfig {
     /// Injects the exact approved `eliotd` child launch descriptor.
     #[must_use]
     pub fn with_daemon_launch(mut self, launch: EliotdLaunchDescriptor) -> Self {
+        // F-LOG-KERNEL-2 (#899): daemon-launch injection observation only.
+        observe_entrypoint_with_detail(
+            EntrypointStage::Composition,
+            "kernel.config.daemon_launch_injected",
+        );
         self.daemon_launch = Some(launch);
         self
     }
