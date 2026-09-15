@@ -15,8 +15,8 @@ use sha2::{Digest, Sha256};
 use thiserror::Error;
 
 use crate::{
-    ApplicationRequest, ContractViolation, McpProtocolVersion, ToolRequest, TypedRejection,
-    decode_protected_request_bytes, validate_proof_ceiling,
+    ApplicationRequest, ContractViolation, McpProtocolVersion, QueryInput, QueryMode, ToolRequest,
+    TypedRejection, decode_protected_request_bytes, validate_proof_ceiling,
 };
 
 /// Default and optional local transport profiles. This is validation only.
@@ -301,6 +301,135 @@ pub trait KernelGovernorPort {
 
     /// Evaluate one validated and explicitly bound request.
     fn dispatch(&self, request: &ForwardedRequest) -> Result<PortProjection, PortFailure>;
+}
+
+/// Closed T11.1 evidence-pack query plan derived from an explicit-intent
+/// `eliot.query`.
+///
+/// This is the pure planning half of the `KernelGovernorPort::dispatch` seam
+/// for `ToolRequest::Query`: it maps a validated `QueryInput` with explicit
+/// read intent into the store catalogue's closed selectors
+/// (`subject`/`max_records` for `GetEvidencePack`) without importing store
+/// types, so this crate stays transport-only and the store catalogue remains
+/// the authority. Free-text `query` is intent data, never a selector: T11.1
+/// requires the exact form `subject:<exact-subject>`; anything else fails
+/// closed instead of becoming a substring search or a forwarded `query`
+/// parameter.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct EvidencePackQueryPlan {
+    /// Exact captured-observation subject (never a substring, never blank).
+    pub subject: String,
+    /// Explicit `max_records` bound carried as its decimal string.
+    pub max_records: String,
+    /// Exact scope the read is bound to.
+    pub scope_id: String,
+}
+
+impl EvidencePackQueryPlan {
+    /// Closed operation name this plan executes.
+    #[must_use]
+    pub const fn operation_name() -> &'static str {
+        "GetEvidencePack"
+    }
+}
+
+/// Plans one closed `GetEvidencePack` read from an explicit-intent query.
+///
+/// `scope_id` comes from the trusted active session binding (never from MCP
+/// arguments alone) and `max_records` is the caller's explicit decimal bound;
+/// the store enforces the catalogue `EVIDENCE_PACK_MAX_RECORDS` cap. Fails
+/// closed when the intent is `CurrentPosition` (which never admits
+/// `GetEvidencePack`), when `exact_resource_uri` is present (exact expansion
+/// uses the resource path, not a query), or when `query` is not the exact
+/// `subject:<exact-subject>` selector form.
+pub fn plan_evidence_pack_query(
+    input: &QueryInput,
+    scope_id: &str,
+    max_records: &str,
+) -> Result<EvidencePackQueryPlan, BridgeError> {
+    if matches!(input.intent.mode, QueryMode::CurrentPosition) {
+        return Err(BridgeError::Port(PortFailure::Unsupported {
+            capability: "GetEvidencePack".to_owned(),
+            reason: "CurrentPosition intent never admits GetEvidencePack".to_owned(),
+        }));
+    }
+    if input.exact_resource_uri.is_some() {
+        return Err(BridgeError::invalid(
+            "query.exact_resource_uri",
+            "exact resource expansion uses the resource path, not eliot.query",
+        ));
+    }
+    if scope_id.trim().is_empty() || scope_id.chars().any(char::is_control) {
+        return Err(BridgeError::invalid(
+            "query.scope_id",
+            "must be non-blank and contain no control characters",
+        ));
+    }
+    if max_records.trim().is_empty() || max_records.chars().any(char::is_control) {
+        return Err(BridgeError::invalid(
+            "query.max_records",
+            "must be a non-blank decimal bound",
+        ));
+    }
+    let bound: u32 = max_records.trim().parse().map_err(|_| {
+        BridgeError::invalid(
+            "query.max_records",
+            "must be a positive decimal bound",
+        )
+    })?;
+    if bound == 0 {
+        return Err(BridgeError::invalid(
+            "query.max_records",
+            "must be a positive decimal bound",
+        ));
+    }
+    let subject = input
+        .query
+        .strip_prefix("subject:")
+        .map(str::trim)
+        .filter(|subject| !subject.is_empty() && !subject.chars().any(char::is_control))
+        .ok_or_else(|| {
+            BridgeError::invalid(
+                "query.query",
+                "T11.1 requires the exact form `subject:<exact-subject>`; free-text search is not an exact selector",
+            )
+        })?;
+    Ok(EvidencePackQueryPlan {
+        subject: subject.to_owned(),
+        max_records: max_records.trim().to_owned(),
+        scope_id: scope_id.trim().to_owned(),
+    })
+}
+
+/// Projects a successful evidence-pack payload into a bounded `Projection`.
+///
+/// Kind is always `Projection` (read-only owner state, never a candidate);
+/// proof ceiling is `ScopedVerification` (the strongest ceiling MCP
+/// projections may claim); no `CurrentPosition` claim is expressed. The exact
+/// store payload crosses unchanged under `evidence_pack` with its
+/// subject/scope identity.
+#[must_use]
+#[allow(
+    clippy::needless_pass_by_value,
+    reason = "payload moves into the JSON projection; clippy cannot see through json!"
+)]
+pub fn project_evidence_pack_projection(
+    plan: &EvidencePackQueryPlan,
+    payload: Value,
+) -> PortProjection {
+    PortProjection {
+        kind: ProjectionKind::Projection,
+        content: json!({
+            "operation": EvidencePackQueryPlan::operation_name(),
+            "subject": plan.subject,
+            "scope_id": plan.scope_id,
+            "evidence_pack": payload,
+        }),
+        artifacts: Vec::new(),
+        proof_ceiling: ProofCeiling::ScopedVerification,
+        resource: None,
+        durable_job: None,
+    }
 }
 
 /// Closed non-authoritative projection classes returned by the injected port.
@@ -1520,4 +1649,146 @@ fn hex_digest(bytes: &[u8]) -> String {
         value.push(char::from(HEX[usize::from(byte & 0x0f)]));
     }
     value
+}
+
+#[cfg(test)]
+#[allow(
+    clippy::expect_used,
+    clippy::unwrap_used,
+    clippy::too_many_lines,
+    reason = "T11.1 planning tests: every asserted subject, bound, scope, intent gate, and projection value is derived from the test inputs; nothing is canned"
+)]
+mod evidence_pack_query_plan_tests {
+    //! T11.1 `eliot.query` planning tests at the MCP dispatch seam.
+    //!
+    //! The planner maps explicit-intent `QueryInput` to the store catalogue's
+    //! closed `subject`/`max_records` selectors without ever forwarding free
+    //! text. Every asserted subject, bound, scope, intent gate, and projection
+    //! shape is derived from the test inputs; nothing is canned.
+
+    use super::*;
+    use crate::{QueryInput, QueryIntent};
+
+    fn verification_intent(mode: QueryMode) -> QueryIntent {
+        QueryIntent {
+            mode,
+            time_scope: "evidence window for verification".to_owned(),
+            branch_environment_scope: "test branch and environment".to_owned(),
+            freshness_policy: "exact captured records only".to_owned(),
+            required_assurance: "verifier evidence read".to_owned(),
+        }
+    }
+
+    fn input(mode: QueryMode, query: &str) -> QueryInput {
+        QueryInput {
+            intent: verification_intent(mode),
+            query: query.to_owned(),
+            exact_resource_uri: None,
+        }
+    }
+
+    #[test]
+    fn plans_exact_subject_with_explicit_bound_and_scope() {
+        let plan = plan_evidence_pack_query(
+            &input(QueryMode::Verification, "subject:evidence-alpha"),
+            "scope-evidence",
+            "10",
+        )
+        .expect("exact selector plans");
+        assert_eq!(plan.subject, "evidence-alpha");
+        assert_eq!(plan.max_records, "10");
+        assert_eq!(plan.scope_id, "scope-evidence");
+        assert_eq!(
+            EvidencePackQueryPlan::operation_name(),
+            "GetEvidencePack"
+        );
+    }
+
+    #[test]
+    fn verification_family_intents_plan_but_current_position_never_does() {
+        for mode in [
+            QueryMode::HistoricalReconstruction,
+            QueryMode::Provenance,
+            QueryMode::Navigation,
+            QueryMode::Verification,
+            QueryMode::ChangeImpact,
+            QueryMode::ContextReconstruction,
+        ] {
+            plan_evidence_pack_query(&input(mode, "subject:evidence-alpha"), "scope-evidence", "8")
+                .expect("verification family admits GetEvidencePack");
+        }
+        match plan_evidence_pack_query(
+            &input(QueryMode::CurrentPosition, "subject:evidence-alpha"),
+            "scope-evidence",
+            "8",
+        ) {
+            Err(BridgeError::Port(PortFailure::Unsupported { capability, .. })) => {
+                assert_eq!(capability, "GetEvidencePack");
+            }
+            other => panic!("CurrentPosition must never admit GetEvidencePack: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn rejects_free_text_resource_uri_and_bad_bounds() {
+        // Free text without the exact `subject:` form is not a selector.
+        assert!(matches!(
+            plan_evidence_pack_query(
+                &input(QueryMode::Verification, "retrieve the exact evidence"),
+                "scope-evidence",
+                "8",
+            ),
+            Err(BridgeError::InvalidArgument { field, .. }) if field == "query.query"
+        ));
+        // Exact expansion uses the resource path, not a query.
+        let mut with_uri = input(QueryMode::Verification, "subject:evidence-alpha");
+        with_uri.exact_resource_uri = Some("eliot://resource/evidence-1".to_owned());
+        assert!(matches!(
+            plan_evidence_pack_query(&with_uri, "scope-evidence", "8"),
+            Err(BridgeError::InvalidArgument { field, .. })
+                if field == "query.exact_resource_uri"
+        ));
+        // Zero, non-numeric, and blank bounds fail closed before transport.
+        for bound in ["0", "ten", "  "] {
+            assert!(
+                plan_evidence_pack_query(
+                    &input(QueryMode::Verification, "subject:evidence-alpha"),
+                    "scope-evidence",
+                    bound,
+                )
+                .is_err(),
+                "bound {bound:?} must fail closed"
+            );
+        }
+        assert!(matches!(
+            plan_evidence_pack_query(
+                &input(QueryMode::Verification, "subject:evidence-alpha"),
+                "  ",
+                "8",
+            ),
+            Err(BridgeError::InvalidArgument { field, .. }) if field == "query.scope_id"
+        ));
+    }
+
+    #[test]
+    fn projects_bounded_projection_without_current_position_claim() {
+        let plan = plan_evidence_pack_query(
+            &input(QueryMode::Verification, "subject:evidence-alpha"),
+            "scope-evidence",
+            "8",
+        )
+        .expect("exact selector plans");
+        let payload = json!({"version": 1, "records": []});
+        let projection = project_evidence_pack_projection(&plan, payload.clone());
+        assert_eq!(projection.kind, ProjectionKind::Projection);
+        assert_eq!(projection.proof_ceiling, ProofCeiling::ScopedVerification);
+        assert!(projection.proof_ceiling.is_at_most(ProofCeiling::ScopedVerification));
+        assert_eq!(projection.content["operation"], "GetEvidencePack");
+        assert_eq!(projection.content["subject"], "evidence-alpha");
+        assert_eq!(projection.content["scope_id"], "scope-evidence");
+        assert_eq!(projection.content["evidence_pack"], payload);
+        assert!(projection.artifacts.is_empty());
+        assert!(projection.resource.is_none());
+        assert!(projection.durable_job.is_none());
+    }
 }

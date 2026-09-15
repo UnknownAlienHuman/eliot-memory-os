@@ -732,12 +732,28 @@ fn operation_matches_intent(operation: NamedReadOperation, mode: QueryMode) -> b
 }
 
 fn query_parameters(request: &QueryRequest) -> Result<BTreeMap<String, Value>, ReadError> {
-    let mut parameters = request.parameters.clone();
-    insert_exact_parameter(&mut parameters, "query", &request.query)?;
-    if let Some(uri) = &request.exact_resource_uri {
-        insert_exact_parameter(&mut parameters, "exact_resource_uri", uri.as_str())?;
+    // T11.1: free-text `query` is explicit intent data only, never a store
+    // selector. The closed catalogue admits only owner-declared selectors
+    // (e.g. `subject`/`max_records` for `GetEvidencePack`); forwarding free
+    // text as a `query` parameter always fails the catalogue gate with
+    // "unknown parameter" and can never return the acceptance read. Callers
+    // supply closed selectors in `request.parameters`; a smuggled `query` or
+    // `exact_resource_uri` key fails closed here before transport, and a
+    // `QueryRequest`-level `exact_resource_uri` fails closed because exact
+    // expansion uses `ResourceRequest`, not `QueryRequest`.
+    if request.parameters.contains_key("query") {
+        return Err(ReadError::DuplicateField("named_parameters".to_owned()));
     }
-    Ok(parameters)
+    if request.parameters.contains_key("exact_resource_uri") {
+        return Err(ReadError::DuplicateField("named_parameters".to_owned()));
+    }
+    if request.exact_resource_uri.is_some() {
+        return Err(ReadError::InvalidField {
+            field: "query.exact_resource_uri".to_owned(),
+            reason: "exact resource expansion uses ResourceRequest, not QueryRequest".to_owned(),
+        });
+    }
+    Ok(request.parameters.clone())
 }
 
 fn insert_exact_parameter(
@@ -1178,28 +1194,114 @@ mod evidence_pack_read_tests {
     }
 
     #[test]
-    fn evidence_pack_query_fails_closed_against_store_catalogue()
+    fn evidence_pack_query_returns_exact_record_without_forwarding_free_text()
     -> Result<(), Box<dyn std::error::Error>> {
-        // The facade injects the free-text `query` selector into the named
-        // parameters while the closed catalogue admits only `subject` and
-        // `max_records` for `GetEvidencePack` (the same pre-dispatch gate both
-        // production adapters enforce). The read must fail closed here;
-        // success would mean the boundary silently widened.
+        // T11.1 (#1465 residual fix): free-text `query` is explicit intent
+        // data only and is never forwarded as a store selector. The closed
+        // catalogue admits only `subject`/`max_records` for `GetEvidencePack`;
+        // the facade forwards exactly those closed parameters. The free-text
+        // below deliberately differs from the subject to prove it is not used
+        // as a selector: the exact captured record still returns.
         let fence = fence()?;
         let ctx = metadata(&fence)?;
-        let service = ReadService::new(EvidenceTableClient::new(fence));
+        let mut client = EvidenceTableClient::new(fence.clone());
+        client.capture("evidence-alpha");
+        let service = ReadService::new(client);
         let request = evidence_query(
             Some("scope-evidence"),
             ReadConsistency::Eventual,
             BTreeMap::new(),
             evidence_params("evidence-alpha", "10"),
         )?;
+        let result = block_on(service.query(&ctx, request))?;
+        assert_eq!(result.operation, NamedReadOperation::GetEvidencePack);
+        assert_eq!(result.state_fence, fence);
+        assert_eq!(
+            result.payload.get("subject").and_then(Value::as_str),
+            Some("evidence-alpha")
+        );
+        let records = pack_records(&result.payload)?;
+        assert_eq!(records.len(), 1);
+        assert_eq!(
+            records[0].get("subject").and_then(Value::as_str),
+            Some("evidence-alpha")
+        );
+        let provenance = pack_provenance(&result.payload)?;
+        assert_eq!(
+            provenance.get("matched_total").and_then(Value::as_u64),
+            Some(1)
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn evidence_pack_query_rejects_smuggled_free_text_and_resource_uri_params()
+    -> Result<(), Box<dyn std::error::Error>> {
+        // #1465 residual preserved: a caller that smuggles free text as a
+        // `query` store parameter, or an `exact_resource_uri` store parameter,
+        // still fails closed at the catalogue gate ("unknown parameter") —
+        // success would mean the boundary silently widened.
+        let fence_one = fence()?;
+        let ctx = metadata(&fence_one)?;
+        let service = ReadService::new(EvidenceTableClient::new(fence_one));
+        let mut smuggled = evidence_params("evidence-alpha", "10");
+        smuggled.insert("query".to_owned(), Value::String("free text".to_owned()));
+        let request = evidence_query(
+            Some("scope-evidence"),
+            ReadConsistency::Eventual,
+            BTreeMap::new(),
+            smuggled,
+        )?;
         match block_on(service.query(&ctx, request)) {
-            Err(ReadError::Store(detail)) => assert!(
-                detail.contains("unknown parameter"),
-                "unexpected store refusal: {detail}"
-            ),
-            other => panic!("evidence pack query must fail closed, observed: {other:?}"),
+            Err(ReadError::DuplicateField(field)) => assert_eq!(field, "named_parameters"),
+            other => panic!("smuggled query param must fail closed, observed: {other:?}"),
+        }
+
+        let fence_two = fence()?;
+        let ctx = metadata(&fence_two)?;
+        let service = ReadService::new(EvidenceTableClient::new(fence_two));
+        let mut smuggled_uri = evidence_params("evidence-alpha", "10");
+        smuggled_uri.insert(
+            "exact_resource_uri".to_owned(),
+            Value::String("eliot://resource/1".to_owned()),
+        );
+        let request = evidence_query(
+            Some("scope-evidence"),
+            ReadConsistency::Eventual,
+            BTreeMap::new(),
+            smuggled_uri,
+        )?;
+        match block_on(service.query(&ctx, request)) {
+            Err(ReadError::DuplicateField(field)) => assert_eq!(field, "named_parameters"),
+            other => {
+                panic!("smuggled exact_resource_uri param must fail closed, observed: {other:?}")
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn evidence_pack_query_rejects_request_level_exact_resource_uri()
+    -> Result<(), Box<dyn std::error::Error>> {
+        // Exact expansion uses `ResourceRequest`, never `QueryRequest`: a
+        // request-level `exact_resource_uri` on a query fails closed before
+        // transport instead of being silently forwarded to the catalogue.
+        let fence = fence()?;
+        let ctx = metadata(&fence)?;
+        let service = ReadService::new(EvidenceTableClient::new(fence));
+        let mut request = evidence_query(
+            Some("scope-evidence"),
+            ReadConsistency::Eventual,
+            BTreeMap::new(),
+            evidence_params("evidence-alpha", "10"),
+        )?;
+        request.exact_resource_uri =
+            Some(EliotResourceUri::new("eliot://resource/evidence-1")?);
+        match block_on(service.query(&ctx, request)) {
+            Err(ReadError::InvalidField { field, .. }) => {
+                assert_eq!(field, "query.exact_resource_uri");
+            }
+            other => panic!("query-level exact_resource_uri must fail closed, observed: {other:?}"),
         }
         Ok(())
     }
