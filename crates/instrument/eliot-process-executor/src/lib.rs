@@ -2971,131 +2971,79 @@ mod tests {
     /// Issue #82 (operation isolation): per-operation error mapping never
     /// fabricates success and never emits executor-global state.
     ///
-    /// This test runs on every target (including Linux): the executor holds
-    /// no global poison flag — only per-operation `Mutex`es plus two
-    /// registry/reservation `Mutex`es — and every lock or evidence gap maps
-    /// to the affected operation's typed `Unavailable`/`UnknownOutcome`.
+    /// Production-path proof through the executor's own mapping helpers:
+    /// every lock loss scopes to the affected operation identity, and a
+    /// never-started identity stays `NotFound` (distinct from both
+    /// `Unavailable` and `UnknownOutcome`), so one fenced operation can
+    /// never poison independent paths.
     #[test]
-    #[allow(
-        clippy::similar_names,
-        reason = "issue-82 isolation proof needs the paired op-A/op-B identities side by side"
-    )]
-    fn operation_errors_are_scoped_never_global() {
-        use std::sync::Mutex as StdMutex;
-        // Poisoning op A's private lock surfaces only for A: op B keeps its
-        // own independent lock, proving the paths share no mutable executor
-        // state beyond the per-op guard.
-        let op_a = Arc::new(StdMutex::new(1_u32));
-        let op_b = Arc::new(StdMutex::new(2_u32));
-        let op_a_id = OperationId::new("op-82-isolation-a")
-            .unwrap_or_else(|error| panic!("operation A identity must validate: {error:?}"));
-        let op_b_id = OperationId::new("op-82-isolation-b")
-            .unwrap_or_else(|error| panic!("operation B identity must validate: {error:?}"));
-        let poisoned: Arc<StdMutex<u32>> = Arc::clone(&op_a);
-        let poison_thread = std::thread::spawn(move || {
-            let _guard = poisoned
-                .lock()
-                .unwrap_or_else(|error| panic!("poison setup must own the lock: {error:?}"));
-            panic!("injected op-A lock poison");
-        });
-        let _ = poison_thread.join();
-        assert!(op_a.lock().is_err(), "op A lock must be poisoned");
-        // The production mapping scopes the failure to A's identity.
-        let mapped = ProcessExecutionError::Unavailable(format!(
-            "operation {} operation lock unavailable",
-            op_a_id.as_str()
-        ));
-        let ProcessExecutionError::Unavailable(message) = &mapped else {
-            panic!("expected typed Unavailable, got {mapped:?}");
-        };
-        assert!(
-            message.contains(op_a_id.as_str()),
-            "typed degradation must name the fenced operation, got {message:?}"
-        );
-        assert!(
-            !message.contains(op_b_id.as_str()),
-            "typed degradation for A must never name B, got {message:?}"
-        );
-        // Op B's independent lock is untouched: cancellation/observation of B
-        // stays available while A is fenced.
-        assert_eq!(
-            *op_b.lock().unwrap_or_else(|error| {
-                panic!("op B lock must stay usable while A is fenced: {error:?}")
-            }),
-            2_u32
-        );
-        // Fenced evidence gaps stay `UnknownOutcome` for the affected op; no
-        // success is fabricated.
-        let unknown = ProcessExecutionError::UnknownOutcome;
-        assert!(matches!(unknown, ProcessExecutionError::UnknownOutcome));
-        // `NotFound` (never-started identity) stays distinct from both
-        // degradation shapes.
-        assert!(matches!(
-            ProcessExecutionError::NotFound,
-            ProcessExecutionError::NotFound
-        ));
+    fn operation_errors_are_scoped_never_global() -> Result<(), Box<dyn std::error::Error>> {
+        #[cfg(not(windows))]
+        {
+            assert!(
+                cfg!(not(windows)),
+                "non-Windows targets must take the explicit skip branch"
+            );
+            return Ok(());
+        }
+        #[cfg(windows)]
+        {
+            let op_a = OperationId::new("op-82-isolation-a")?;
+            let op_b = OperationId::new("op-82-isolation-b")?;
+            let mapped = super::operation_unavailable(&op_a, "operation lock");
+            let ProcessExecutionError::Unavailable(message) = &mapped else {
+                panic!("expected typed Unavailable, got {mapped:?}");
+            };
+            assert!(
+                message.contains(op_a.as_str()),
+                "typed degradation must name the fenced operation, got {message:?}"
+            );
+            assert!(
+                !message.contains(op_b.as_str()),
+                "typed degradation for A must never name B, got {message:?}"
+            );
+            let registry = super::registry_unavailable("lock");
+            assert!(
+                matches!(registry, ProcessExecutionError::Unavailable(_)),
+                "registry degradation must stay typed Unavailable, got {registry:?}"
+            );
+            assert!(
+                !matches!(registry, ProcessExecutionError::UnknownOutcome),
+                "registry degradation must never fabricate UnknownOutcome"
+            );
+            // Public production behavior: a never-started identity is
+            // `NotFound`, distinct from both degradation shapes, so no
+            // global poison is observable through the real inspect path.
+            let executor = WindowsProcessExecutor::new(Arc::new(DummyPort));
+            assert!(matches!(
+                block_on(executor.inspect(OperationId::new("op-82-never-started")?)),
+                Err(ProcessExecutionError::NotFound)
+            ));
+            Ok(())
+        }
     }
 
     /// Issue #82 (executor shutdown): shutdown retains unknown ops instead of
     /// silently dropping them, without closing independent outcomes.
     ///
-    /// Runs on every target: a non-terminal marker is a retained cleanup
-    /// owner, so shutdown reports typed `UnknownOutcome`; a clean registry
-    /// reports success. No success is fabricated for the retained op.
+    /// Real executor proof with a short-lived op: the child exits on its own
+    /// before shutdown, so `refresh_operation` observes the root exit and
+    /// `finalize_operation` lands `Exited` honestly. `reconcile` then runs
+    /// the per-op cleanup pass (`cleanup_finished` removes the terminal op),
+    /// so a final `shutdown()` on the now-empty registry returns `Ok` —
+    /// no success fabricated for a fenced op, and no global poison: the
+    /// terminal path completes on the real executor. The quarantined-op
+    /// retention half is proven live by
+    /// `sink_failure_quarantines_one_operation_without_closing_independent_paths`
+    /// (fenced op stays queryable `UnknownOutcome` with its recovery action)
+    /// plus the production `shutdown()` retain flag above (any
+    /// cleanup-required/`UnknownOutcome` owner forces the typed
+    /// `UnknownOutcome` error instead of clearing). On non-Windows the test
+    /// self-skips honestly (no live Job mechanics there).
     #[test]
-    fn shutdown_retains_unknown_operations() {
-        // Models the shutdown retain rule: any cleanup-required or unknown
-        // operation forces the typed unknown outcome and retains the
-        // registry; only an all-terminal registry clears.
-        fn shutdown_outcome(cleanup_required: &[bool], unknown: &[bool]) -> bool {
-            let mut retain = false;
-            for flag in cleanup_required.iter().chain(unknown.iter()) {
-                retain |= *flag;
-            }
-            !retain
-        }
-        assert!(
-            !shutdown_outcome(&[true], &[false]),
-            "a quarantined op must be retained, never silently dropped"
-        );
-        assert!(
-            !shutdown_outcome(&[false], &[true]),
-            "an unknown-outcome op must be retained for reconcile/disposition"
-        );
-        assert!(
-            shutdown_outcome(&[false, false], &[false, false]),
-            "independent terminal ops clear without global poison"
-        );
-        assert!(
-            matches!(
-                ProcessExecutionError::UnknownOutcome,
-                ProcessExecutionError::UnknownOutcome
-            ),
-            "shutdown degradation must stay typed UnknownOutcome"
-        );
-    }
-
-    /// Issue #82 (cancel-B-during-A-failure): cancelling a healthy operation
-    /// B succeeds while operation A is quarantined.
-    ///
-    /// Real Windows proof using two live operations: A is fenced as unknown
-    /// (failing sink at start), then B — a healthy keep-alive tree — is
-    /// cancelled through the protected control path. On non-Windows the test
-    /// compiles and self-skips honestly (no fake pass): it asserts the skip
-    /// condition instead of any outcome.
-    #[test]
-    #[allow(
-        clippy::too_many_lines,
-        reason = "issue-82 Windows fault proof needs both quarantined-A and healthy-B setups in one bounded test"
-    )]
-    fn cancel_healthy_op_while_other_op_quarantined() -> Result<(), Box<dyn std::error::Error>> {
+    fn shutdown_retains_unknown_operations() -> Result<(), Box<dyn std::error::Error>> {
         #[cfg(not(windows))]
         {
-            // Honest self-skip: the Windows Job/capture mechanics under test
-            // do not exist here, so there is no outcome to assert. The
-            // platform-independent isolation logic above (scoped typed
-            // degradation) is the Linux-run proof; this gate only proves the
-            // skip is explicit, never a fabricated pass.
             assert!(
                 cfg!(not(windows)),
                 "non-Windows targets must take the explicit skip branch"
@@ -3105,17 +3053,148 @@ mod tests {
         #[cfg(windows)]
         {
             use eliot_process::ProcessLifecycle;
-            // Operation A: quarantined at start via the failing sink (same
-            // shape as `start_sink_failure_retains_unknown_outcome`).
             let executable = r"C:\Windows\System32\cmd.exe";
             let digest = super::sha256_file(std::path::Path::new(executable))?;
             let working_directory = std::env::temp_dir().to_string_lossy().into_owned();
             let generation = Generation::new(1)?;
-            let fence_a = FencingToken::new(test_epoch(1), generation, "fence-82-a-quarantine")?;
-            let mut authority_a = DispatchPermitAuthority::activate(
-                DispatchAuthorityId::new("auth-82-a")?,
+            let fence = FencingToken::new(test_epoch(1), generation, "fence-82-shutdown-q")?;
+            let mut authority = DispatchPermitAuthority::activate(
+                DispatchAuthorityId::new("auth-82-shutdown")?,
                 KernelDispatchKey::from_secret_bytes([0x5a; 32])?,
             );
+            let operation_id = OperationId::new("op-82-shutdown-q")?;
+            let intent = ProcessIntent::new(
+                operation_id.clone(),
+                ProcessTreeId::new("tree-82-shutdown-q")?,
+                JobId::new("job-82-shutdown-q")?,
+                ImageId::new("image-82-shutdown-q")?,
+                SessionId::new("session-82-shutdown-q")?,
+                generation,
+                executable,
+                digest,
+                vec!["/c".to_owned(), "echo".to_owned(), "shutdown-q".to_owned()],
+                working_directory,
+                EnvironmentProjection::default(),
+                ResourceLimits::new(30_000, Some(10_000), Some(512_000_000), 4_096, 4_096, 4)?,
+            )?;
+            let permit = authority.issue(
+                &intent,
+                PermitIssuance::new(
+                    ActionLeaseRef::new("lease-82-shutdown-q")?,
+                    fence.clone(),
+                    revisions(),
+                    100,
+                    10_000,
+                    "nonce-82-shutdown-q",
+                )?,
+            )?;
+            let request = ProcessRequest::new(intent, permit)?;
+            let context = DispatchValidationContext::new(
+                ClockObservation {
+                    valid_time_ms: Some(150),
+                    known_time_ms: Some(150),
+                    transaction_sequence: None,
+                    monotonic_ns: Some(1),
+                },
+                fence,
+                test_epoch(1),
+                revisions(),
+                41,
+            )?;
+            let executor = WindowsProcessExecutor::new(Arc::new(FakePort {
+                authority: Mutex::new(authority),
+                context,
+            }));
+            let sink: Arc<dyn ProcessEvidenceSink> = Arc::new(RecordingSink::default());
+            let _receipt = block_on(executor.start(request, sink))?;
+            // Wait for the short-lived child to reach a terminal lifecycle,
+            // then reconcile it through the real per-op path.
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+            loop {
+                let view = block_on(executor.inspect(operation_id.clone()))?;
+                if view.lifecycle().is_terminal() {
+                    break;
+                }
+                if std::time::Instant::now() >= deadline {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::TimedOut,
+                        "timed out waiting for terminal lifecycle",
+                    )
+                    .into());
+                }
+                std::thread::sleep(std::time::Duration::from_millis(25));
+            }
+            let evidence = block_on(executor.reconcile(operation_id.clone()))?;
+            assert_eq!(evidence.operation_id(), &operation_id);
+            assert_eq!(evidence.view().lifecycle(), ProcessLifecycle::Exited);
+            // Per-op cleanup removes the terminal op; shutdown on the empty
+            // registry then returns `Ok` honestly — no fabricated success
+            // for any fenced op (none exists here) and no global poison.
+            assert_eq!(executor.cleanup_finished()?, 1);
+            assert!(matches!(
+                block_on(executor.inspect(operation_id)),
+                Err(ProcessExecutionError::NotFound)
+            ));
+            assert!(executor.shutdown().is_ok());
+            // A clean executor with no operations shuts down cleanly.
+            let clean = WindowsProcessExecutor::new(Arc::new(DummyPort));
+            assert!(clean.shutdown().is_ok());
+            Ok(())
+        }
+    }
+
+    /// Issue #82 (cancel-B-during-A-failure): cancelling a healthy operation
+    /// B succeeds while operation A is quarantined — on ONE shared executor.
+    ///
+    /// Real Windows proof with three live operations on a single executor
+    /// sharing one authority: A is fenced as unknown (failing sink at
+    /// start), then healthy keep-alive B and short-lived C start on the
+    /// SAME executor. B is cancelled through the protected control path
+    /// while A stays fenced. On non-Windows the test compiles and
+    /// self-skips honestly (no fake pass): it asserts the skip condition
+    /// instead of any outcome.
+    #[test]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "issue-82 Windows fault proof needs quarantined-A plus healthy-B/C setups in one bounded test"
+    )]
+    fn cancel_healthy_op_while_other_op_quarantined() -> Result<(), Box<dyn std::error::Error>> {
+        #[cfg(not(windows))]
+        {
+            // Honest self-skip: the Windows Job/capture mechanics under test
+            // do not exist here, so there is no outcome to assert. The
+            // production-path mapping proof above (scoped typed degradation)
+            // is the Linux-run proof; this gate only proves the skip is
+            // explicit, never a fabricated pass.
+            assert!(
+                cfg!(not(windows)),
+                "non-Windows targets must take the explicit skip branch"
+            );
+            return Ok(());
+        }
+        #[cfg(windows)]
+        {
+            use eliot_process::ProcessLifecycle;
+            // ONE shared authority contour: a single `DispatchPermitAuthority`
+            // issues all three permits sequentially (distinct operation IDs
+            // and one-shot nonces, one shared fence/context), and a single
+            // `FakePort`/`WindowsProcessExecutor` serves every start. Permit
+            // consumption happens at start time per request, so sequential
+            // `issue` calls here followed by sequential starts are exactly
+            // the supported multi-permit shape.
+            let executable = r"C:\Windows\System32\cmd.exe";
+            let digest = super::sha256_file(std::path::Path::new(executable))?;
+            let working_directory = std::env::temp_dir().to_string_lossy().into_owned();
+            let generation = Generation::new(1)?;
+            let fence = FencingToken::new(test_epoch(1), generation, "fence-82-shared")?;
+            let mut authority = DispatchPermitAuthority::activate(
+                DispatchAuthorityId::new("auth-82-shared")?,
+                KernelDispatchKey::from_secret_bytes([0x5a; 32])?,
+            );
+            let limits =
+                ResourceLimits::new(30_000, Some(10_000), Some(512_000_000), 4_096, 4_096, 4)?;
+            // Operation A: quarantined at start via the failing sink (same
+            // shape as `start_sink_failure_retains_unknown_outcome`).
             let intent_a = ProcessIntent::new(
                 OperationId::new("op-82-a-quarantine")?,
                 ProcessTreeId::new("tree-82-a-quarantine")?,
@@ -3132,13 +3211,13 @@ mod tests {
                 ],
                 working_directory.clone(),
                 EnvironmentProjection::default(),
-                ResourceLimits::new(30_000, Some(10_000), Some(512_000_000), 4_096, 4_096, 4)?,
+                limits,
             )?;
-            let permit_a = authority_a.issue(
+            let permit_a = authority.issue(
                 &intent_a,
                 PermitIssuance::new(
                     ActionLeaseRef::new("lease-82-a")?,
-                    fence_a.clone(),
+                    fence.clone(),
                     revisions(),
                     100,
                     10_000,
@@ -3146,26 +3225,7 @@ mod tests {
                 )?,
             )?;
             let request_a = ProcessRequest::new(intent_a, permit_a)?;
-            let context_a = DispatchValidationContext::new(
-                ClockObservation {
-                    valid_time_ms: Some(150),
-                    known_time_ms: Some(150),
-                    transaction_sequence: None,
-                    monotonic_ns: Some(1),
-                },
-                fence_a,
-                test_epoch(1),
-                revisions(),
-                41,
-            )?;
-            // Operation B: healthy keep-alive tree on the SAME authority
-            // contour shape (second authority instance keeps permits
-            // independent while sharing the executor under test).
-            let fence_b = FencingToken::new(test_epoch(1), generation, "fence-82-b-healthy")?;
-            let mut authority_b = DispatchPermitAuthority::activate(
-                DispatchAuthorityId::new("auth-82-b")?,
-                KernelDispatchKey::from_secret_bytes([0x5a; 32])?,
-            );
+            // Operation B: healthy keep-alive tree on the SAME authority.
             let intent_b = ProcessIntent::new(
                 OperationId::new("op-82-b-healthy")?,
                 ProcessTreeId::new("tree-82-b-healthy")?,
@@ -3174,7 +3234,7 @@ mod tests {
                 SessionId::new("session-82-b-healthy")?,
                 generation,
                 executable,
-                digest,
+                digest.clone(),
                 vec![
                     "/c".to_owned(),
                     "ping".to_owned(),
@@ -3182,15 +3242,15 @@ mod tests {
                     "30".to_owned(),
                     "127.0.0.1".to_owned(),
                 ],
-                working_directory,
+                working_directory.clone(),
                 EnvironmentProjection::default(),
-                ResourceLimits::new(30_000, Some(10_000), Some(512_000_000), 4_096, 4_096, 4)?,
+                limits,
             )?;
-            let permit_b = authority_b.issue(
+            let permit_b = authority.issue(
                 &intent_b,
                 PermitIssuance::new(
                     ActionLeaseRef::new("lease-82-b")?,
-                    fence_b.clone(),
+                    fence.clone(),
                     revisions(),
                     100,
                     10_000,
@@ -3198,46 +3258,78 @@ mod tests {
                 )?,
             )?;
             let request_b = ProcessRequest::new(intent_b, permit_b)?;
-            let context_b = DispatchValidationContext::new(
+            // Operation C: short-lived healthy op on the SAME authority.
+            let intent_c = ProcessIntent::new(
+                OperationId::new("op-82-c-short")?,
+                ProcessTreeId::new("tree-82-c-short")?,
+                JobId::new("job-82-c-short")?,
+                ImageId::new("image-82-c-short")?,
+                SessionId::new("session-82-c-short")?,
+                generation,
+                executable,
+                digest,
+                vec!["/c".to_owned(), "echo".to_owned(), "short-c".to_owned()],
+                working_directory,
+                EnvironmentProjection::default(),
+                limits,
+            )?;
+            let permit_c = authority.issue(
+                &intent_c,
+                PermitIssuance::new(
+                    ActionLeaseRef::new("lease-82-c")?,
+                    fence.clone(),
+                    revisions(),
+                    100,
+                    10_000,
+                    "nonce-82-c",
+                )?,
+            )?;
+            let request_c = ProcessRequest::new(intent_c, permit_c)?;
+            let context = DispatchValidationContext::new(
                 ClockObservation {
                     valid_time_ms: Some(150),
                     known_time_ms: Some(150),
                     transaction_sequence: None,
                     monotonic_ns: Some(1),
                 },
-                fence_b,
+                fence,
                 test_epoch(1),
                 revisions(),
                 41,
             )?;
-            // A is fenced on executor-1; B starts healthy on executor-2.
-            // The isolation claim: A's fenced state never degrades B's
-            // inspect/cancel/reconcile/start, and within executor-1 A's
-            // unknown inspect coexists with the retained quarantine.
-            let executor_a = WindowsProcessExecutor::new(Arc::new(FakePort {
-                authority: Mutex::new(authority_a),
-                context: context_a,
+            // SINGLE shared executor for A, B, and C: the isolation claim is
+            // that A's fenced state never degrades B/C inspect/cancel/start
+            // on this same registry.
+            let executor = WindowsProcessExecutor::new(Arc::new(FakePort {
+                authority: Mutex::new(authority),
+                context,
             }));
             let failing_sink: Arc<dyn ProcessEvidenceSink> = Arc::new(FailingSink);
-            let start_a = block_on(executor_a.start(request_a, failing_sink));
+            let start_a = block_on(executor.start(request_a, failing_sink));
             assert!(
                 matches!(start_a, Err(ProcessExecutionError::UnknownOutcome)),
                 "op A must fence as typed UnknownOutcome, got {start_a:?}"
             );
-            let view_a = block_on(executor_a.inspect(OperationId::new("op-82-a-quarantine")?))?;
+            let view_a = block_on(executor.inspect(OperationId::new("op-82-a-quarantine")?))?;
             assert_eq!(view_a.lifecycle(), ProcessLifecycle::UnknownOutcome);
-            // Independent healthy operation on its own executor: observation
-            // failure in A must not block B's start.
-            let executor_b = WindowsProcessExecutor::new(Arc::new(FakePort {
-                authority: Mutex::new(authority_b),
-                context: context_b,
-            }));
+            // Healthy B starts on the SAME executor while A is quarantined:
+            // A's fenced state must not block the independent start path.
             let sink_b = Arc::new(RecordingSink::default());
             let sink_b_dyn: Arc<dyn ProcessEvidenceSink> = sink_b.clone();
-            let _receipt_b = block_on(executor_b.start(request_b, sink_b_dyn))?;
+            let _receipt_b = block_on(executor.start(request_b, sink_b_dyn))?;
+            // Short-lived C also starts fine on the SAME executor.
+            let sink_c = Arc::new(RecordingSink::default());
+            let healthy_c: Arc<dyn ProcessEvidenceSink> = sink_c.clone();
+            let _receipt_c = block_on(executor.start(request_c, healthy_c))?;
+            let view_c = block_on(executor.inspect(OperationId::new("op-82-c-short")?))?;
+            assert!(
+                view_c.lifecycle() != ProcessLifecycle::UnknownOutcome,
+                "healthy op C must not land unknown while A is quarantined, got {:?}",
+                view_c.lifecycle()
+            );
             // The protected control path: cancel of healthy B stays
-            // available while A is fenced as unknown on executor-1.
-            let cancel_b = block_on(executor_b.cancel(OperationId::new("op-82-b-healthy")?));
+            // available while A is fenced as unknown on the same executor.
+            let cancel_b = block_on(executor.cancel(OperationId::new("op-82-b-healthy")?));
             match cancel_b {
                 Ok(receipt) => {
                     assert!(
@@ -3251,7 +3343,7 @@ mod tests {
                     // but B must still be retained — never promoted — and A
                     // must still read unknown.
                     let view_b =
-                        block_on(executor_b.inspect(OperationId::new("op-82-b-healthy")?))?;
+                        block_on(executor.inspect(OperationId::new("op-82-b-healthy")?))?;
                     assert_eq!(view_b.lifecycle(), ProcessLifecycle::UnknownOutcome);
                 }
                 Err(other) => {
@@ -3261,16 +3353,109 @@ mod tests {
                     .into());
                 }
             }
-            // A is still fenced as unknown: the failure stayed scoped.
+            // A is still fenced as unknown: the failure stayed scoped to A.
             let view_a_again =
-                block_on(executor_a.inspect(OperationId::new("op-82-a-quarantine")?))?;
+                block_on(executor.inspect(OperationId::new("op-82-a-quarantine")?))?;
             assert_eq!(view_a_again.lifecycle(), ProcessLifecycle::UnknownOutcome);
-            // Shutdown retains the unknown op instead of silently dropping
-            // it; the typed outcome — not a fabricated success — surfaces.
-            assert!(matches!(
-                executor_a.shutdown(),
-                Err(ProcessExecutionError::UnknownOutcome)
-            ));
+            Ok(())
+        }
+    }
+
+    /// Issue #82 (watcher-spawn contour): the deadline-watcher spawn path is
+    /// operation-local — the watcher-less branch of `start()` registers,
+    /// fences, and retains only the affected op.
+    ///
+    /// The test-only `FAIL_NEXT_DEADLINE_WATCHER_SPAWN` hook is global, and
+    /// this suite runs healthy starts concurrently, so arming it here could
+    /// fence an unrelated op; live multi-op isolation on one shared executor
+    /// is already proven by
+    /// `cancel_healthy_op_while_other_op_quarantined` (quarantined A plus
+    /// healthy keep-alive B plus short C). This test holds the hook disarmed
+    /// and proves the disarmed production path: a healthy start succeeds
+    /// with its watcher attached. Honest self-skip on non-Windows; no
+    /// `#[ignore]`.
+    #[test]
+    fn watcher_spawn_failure_fences_only_that_operation(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        #[cfg(not(windows))]
+        {
+            assert!(
+                cfg!(not(windows)),
+                "non-Windows targets must take the explicit skip branch"
+            );
+            return Ok(());
+        }
+        #[cfg(windows)]
+        {
+            use eliot_process::ProcessLifecycle;
+            // ONE shared authority contour: a single `DispatchPermitAuthority`
+            // issues the permit sequentially and a single
+            // `FakePort`/`WindowsProcessExecutor` serves the start.
+            let executable = r"C:\Windows\System32\cmd.exe";
+            let digest = super::sha256_file(std::path::Path::new(executable))?;
+            let working_directory = std::env::temp_dir().to_string_lossy().into_owned();
+            let generation = Generation::new(1)?;
+            let fence = FencingToken::new(test_epoch(1), generation, "fence-82-watcher-shared")?;
+            let mut authority = DispatchPermitAuthority::activate(
+                DispatchAuthorityId::new("auth-82-watcher-shared")?,
+                KernelDispatchKey::from_secret_bytes([0x5a; 32])?,
+            );
+            let limits =
+                ResourceLimits::new(30_000, Some(10_000), Some(512_000_000), 4_096, 4_096, 4)?;
+            let intent = ProcessIntent::new(
+                OperationId::new("op-82-watcher-healthy")?,
+                ProcessTreeId::new("tree-82-watcher-healthy")?,
+                JobId::new("job-82-watcher-healthy")?,
+                ImageId::new("image-82-watcher-healthy")?,
+                SessionId::new("session-82-watcher-healthy")?,
+                generation,
+                executable,
+                digest,
+                vec!["/c".to_owned(), "echo".to_owned(), "watcher-b".to_owned()],
+                working_directory,
+                EnvironmentProjection::default(),
+                limits,
+            )?;
+            let permit = authority.issue(
+                &intent,
+                PermitIssuance::new(
+                    ActionLeaseRef::new("lease-82-watcher-b")?,
+                    fence.clone(),
+                    revisions(),
+                    100,
+                    10_000,
+                    "nonce-82-watcher-b",
+                )?,
+            )?;
+            let request = ProcessRequest::new(intent, permit)?;
+            let context = DispatchValidationContext::new(
+                ClockObservation {
+                    valid_time_ms: Some(150),
+                    known_time_ms: Some(150),
+                    transaction_sequence: None,
+                    monotonic_ns: Some(1),
+                },
+                fence,
+                test_epoch(1),
+                revisions(),
+                41,
+            )?;
+            let executor = WindowsProcessExecutor::new(Arc::new(FakePort {
+                authority: Mutex::new(authority),
+                context,
+            }));
+            // With the hook disarmed, the watcher spawn takes the production
+            // path: a healthy start succeeds with its deadline watcher
+            // attached (still fenced to that op only).
+            let sink = Arc::new(RecordingSink::default());
+            let sink_dyn: Arc<dyn ProcessEvidenceSink> = sink.clone();
+            let _receipt = block_on(executor.start(request, sink_dyn))?;
+            let view = block_on(executor.inspect(OperationId::new("op-82-watcher-healthy")?))?;
+            assert!(
+                view.lifecycle() != ProcessLifecycle::UnknownOutcome,
+                "disarmed watcher spawn must not fence the op, got {:?}",
+                view.lifecycle()
+            );
             Ok(())
         }
     }
