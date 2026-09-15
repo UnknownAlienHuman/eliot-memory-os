@@ -15,7 +15,7 @@ use crate::error::AdapterError;
 use crate::plan::{ApplyPlan, EvidenceRecord, PayloadAuthorityRecord};
 use crate::schema;
 use eliot_store_api::epistemic_revision::EpistemicCommit;
-use eliot_store_api::{OrderingHead, RevisionHead, WriteReceipt};
+use eliot_store_api::{OrderingHead, RevisionHead, ScopeId, StateFence, StoreError, WriteReceipt};
 
 // Read and compare in the same transaction as the fence CAS and receipt.
 // The fence CAS serializes racing writers even when the position is absent.
@@ -28,6 +28,34 @@ IF ($position_before[0].epistemic_position_revision ?? 0) != $expected_position_
     THROW 'epistemic_position_cas_conflict';
 };
 ";
+
+// 688-B erasure intent-before-dispatch statements. These closed templates live
+// in this apply-owned writer (a sibling of `schema`, inside the admitted
+// apply/schema SurrealQL contour): the intent upsert opens the same atomic
+// transaction as the destructive statements; one `DELETE` per store-owned
+// surface removes only the selected subject's capture rows admitted under the
+// exact recorded scope; the outcome seal persists the exact per-surface
+// outcomes for idempotent same-operation replay.
+
+/// Upsert of one durable erasure-intent row: creates the row when absent,
+/// refuses with `erasure_intent_conflict` when the same `operation_id`
+/// already names a different intent. First statement of the erasure atomic
+/// transaction — before any destructive statement.
+const TX_ERASURE_INTENT: &str = "LET $erasure_existing = (SELECT VALUE { operation_id: operation_id, subject: subject, scope_id: scope_id, surfaces: surfaces, state_fence: state_fence, operation_count: operation_count } FROM ONLY type::record($erasure_table, $erasure_operation_id)); IF type::is_object($erasure_existing) { IF $erasure_existing != $erasure_intent_expected { THROW 'erasure_intent_conflict'; }; } ELSE { CREATE type::record($erasure_table, $erasure_operation_id) CONTENT $erasure_intent_record; };";
+
+/// Deletes exactly the selected subject's capture rows admitted under the
+/// exact recorded scope. `{i}` selects the binding index. Exact subject/scope
+/// match only — never substring, never a default scope.
+const TX_ERASURE_DELETE_EVIDENCE: &str = "DELETE write_receipt WHERE $erasure_subject{i} IN evidence_records.subject AND $erasure_scope{i} = $erasure_scope_expected{i};";
+
+/// Seals one completed operation with its exact per-surface outcomes. Last
+/// statement before commit; same-operation replay reads this row and returns
+/// the stored outcomes without duplicate destructive work (the single
+/// completion marker for the intent row above — never a second ledger).
+const TX_ERASURE_OUTCOME: &str = "LET $erasure_outcome_existing = (SELECT VALUE { operation_id: operation_id, outcomes: outcomes } FROM ONLY type::record($erasure_outcome_table, $erasure_outcome_id)); IF type::is_object($erasure_outcome_existing) { IF $erasure_outcome_existing.outcomes != $erasure_outcomes { THROW 'erasure_intent_conflict'; }; } ELSE { CREATE type::record($erasure_outcome_table, $erasure_outcome_id) CONTENT $erasure_outcome_record; };";
+
+/// Reads one sealed erasure-outcome row by exact operation id.
+const READ_ERASURE_OUTCOME: &str = "SELECT VALUE { operation_id: operation_id, outcomes: outcomes } FROM ONLY type::record($erasure_outcome_table, $erasure_outcome_id);";
 
 #[allow(
     clippy::too_many_arguments,
@@ -405,6 +433,404 @@ pub(super) fn ordering_write_template(initial_state: bool, exists: bool) -> &'st
     } else {
         schema::TX_UPSERT_ORDERING
     }
+}
+
+/// 688-B local intent/outcome model for the Surreal apply path.
+///
+/// Local model only: depends solely on existing `eliot-store-api` types plus
+/// this module (the neutral purge port is defined in a parallel subtask and
+/// is not yet on this base; the adapter never imports `eliot-erasure`). All
+/// `SurrealQL` stays in `apply`/`schema` modules; the public boundary carries
+/// store-api types only.
+#[derive(
+    Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd, serde::Serialize, serde::Deserialize,
+)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum SurrealErasureSurface {
+    CanonicalPayload,
+    Projection,
+    Index,
+    Blob,
+    OperationalRecovery,
+    ProviderCopy,
+    BackupRestorePath,
+    RouteContinuation,
+}
+
+impl SurrealErasureSurface {
+    /// Surfaces whose evidence lives in the store-owned receipt rows below.
+    ///
+    /// Every other surface is out of store scope: the adapter marks it
+    /// `Incomplete` (never `Purged`) instead of claiming foreign removal.
+    #[must_use]
+    pub const fn is_store_owned(self) -> bool {
+        match self {
+            Self::CanonicalPayload | Self::Projection | Self::Index => true,
+            Self::Blob
+            | Self::OperationalRecovery
+            | Self::ProviderCopy
+            | Self::BackupRestorePath
+            | Self::RouteContinuation => false,
+        }
+    }
+}
+
+/// Per-surface erasure outcome for one operation.
+///
+/// `NotAttempted` is the registry state after intent recording, before
+/// dispatch. `Unknown` preserves an ambiguous effect (e.g. lost provider
+/// response) for same-operation reconciliation: it is stored and replayed,
+/// never retried blindly and never promoted into suppression.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum SurrealSurfaceOutcome {
+    NotAttempted { surface: SurrealErasureSurface },
+    Purged { surface: SurrealErasureSurface },
+    Incomplete { surface: SurrealErasureSurface },
+    Unknown { surface: SurrealErasureSurface },
+}
+
+impl SurrealSurfaceOutcome {
+    /// Returns the surface this outcome reports on.
+    #[must_use]
+    pub const fn surface(self) -> SurrealErasureSurface {
+        match self {
+            Self::NotAttempted { surface }
+            | Self::Purged { surface }
+            | Self::Incomplete { surface }
+            | Self::Unknown { surface } => surface,
+        }
+    }
+}
+
+/// Durable erasure intent recorded BEFORE any destructive dispatch.
+///
+/// `operation_id` is the caller-supplied stable identity (never regenerated
+/// on retry); `subject` + `scope_id` name the exact admitted pair;
+/// `surfaces` is the exact admitted denominator; `state_fence` pins the
+/// fence the destructive calls execute under.
+#[derive(Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SurrealErasureIntent {
+    pub operation_id: String,
+    pub subject: String,
+    pub scope_id: ScopeId,
+    pub surfaces: Vec<SurrealErasureSurface>,
+    pub state_fence: StateFence,
+}
+
+impl SurrealErasureIntent {
+    /// Fail-closed validation of the frozen intent.
+    pub fn validate(&self) -> Result<(), StoreError> {
+        validate_erasure_text(&self.operation_id, "erasure.operation_id")?;
+        validate_erasure_text(&self.subject, "erasure.subject")?;
+        self.state_fence
+            .validate()
+            .map_err(StoreError::Foundation)?;
+        if self.surfaces.is_empty() {
+            return Err(StoreError::Empty {
+                field: "erasure.surfaces",
+            });
+        }
+        let mut seen = std::collections::BTreeSet::new();
+        for surface in &self.surfaces {
+            if !seen.insert(*surface) {
+                return Err(StoreError::Duplicate {
+                    field: "erasure.surfaces",
+                });
+            }
+        }
+        Ok(())
+    }
+}
+
+fn validate_erasure_text(value: &str, field: &'static str) -> Result<(), StoreError> {
+    if value.trim().is_empty() || value.chars().any(char::is_control) {
+        return Err(StoreError::InvalidField {
+            field,
+            reason: "blank or control character",
+        });
+    }
+    Ok(())
+}
+
+/// Address of one durable erasure-intent row: (`erasure_intent`,
+/// `erasure-intent-<operation_id>`). One row per operation; no second ledger.
+#[must_use]
+pub(crate) fn erasure_intent_record_id(operation_id: &str) -> String {
+    format!("erasure-intent-{operation_id}")
+}
+
+/// Address of one sealed erasure-outcome row: (`erasure_outcome`,
+/// `erasure-outcome-<operation_id>`). The single completion marker for the
+/// intent row above — never a second ledger.
+#[must_use]
+pub(crate) fn erasure_outcome_record_id(operation_id: &str) -> String {
+    format!("erasure-outcome-{operation_id}")
+}
+
+/// Intent-before-dispatch transaction template (688-B, pure).
+///
+/// Statement order inside one `BEGIN`/`COMMIT` pair: (1) the intent upsert
+/// that creates the durable intent row when absent and refuses when the same
+/// id already names different bytes; (2) one destructive `DELETE` per
+/// store-owned surface, each deleting only the selected subject's capture
+/// rows admitted under the exact recorded scope; (3) the outcome seal that
+/// persists the exact per-surface outcomes for idempotent replay.
+///
+/// All `SurrealQL` stays inside the local `TX_ERASURE_*` templates above:
+/// this builder composes closed statement constants owned by this apply
+/// writer (inside the admitted apply/schema contour), never caller-supplied
+/// query text. `Unknown`-outcome surfaces are preserved for
+/// reconciliation: they appear in the sealed outcomes but emit no destructive
+/// statement. Fail-closed: with no recorded intent this template is never
+/// built (the caller refuses with `ReceiptNotFound` before any provider I/O);
+/// a lost commit response is `UnknownOutcome` for same-operation
+/// reconciliation, never a blind retry.
+#[must_use]
+pub(crate) fn erasure_transaction_template(store_owned_surface_count: usize) -> String {
+    let mut sql = String::from(schema::TX_BEGIN);
+    sql.push_str(TX_ERASURE_INTENT);
+    for index in 0..store_owned_surface_count {
+        sql.push_str(&schema::indexed(TX_ERASURE_DELETE_EVIDENCE, index));
+    }
+    sql.push_str(TX_ERASURE_OUTCOME);
+    sql.push_str(schema::TX_COMMIT);
+    sql
+}
+
+/// Builds the intent-row bindings for [`erasure_transaction_template`].
+///
+/// Returns the bindings map plus the sealed per-surface outcomes:
+/// store-owned surfaces report `Purged`, every other surface reports
+/// `Incomplete` (foreign removal is never claimed). A surface that already
+/// carries a terminal non-`NotAttempted` outcome keeps it verbatim
+/// (partial-resume identity; `Unknown` is preserved, never cleared).
+pub(crate) fn erasure_transaction_bindings(
+    intent: &SurrealErasureIntent,
+    prior_outcomes: &[SurrealSurfaceOutcome],
+) -> Result<(Map<String, Value>, Vec<SurrealSurfaceOutcome>), AdapterError> {
+    intent.validate().map_err(AdapterError::Store)?;
+    let mut bindings = Map::new();
+    let surfaces: Vec<String> = intent
+        .surfaces
+        .iter()
+        .map(|surface| format!("{surface:?}"))
+        .collect();
+    let intent_value = json!({
+        "operation_id": intent.operation_id,
+        "subject": intent.subject,
+        "scope_id": intent.scope_id.to_string(),
+        "surfaces": surfaces,
+        "state_fence": intent.state_fence,
+        "operation_count": intent.surfaces.len(),
+    });
+    bindings.insert("erasure_table".to_owned(), json!("erasure_intent"));
+    bindings.insert(
+        "erasure_operation_id".to_owned(),
+        json!(erasure_intent_record_id(&intent.operation_id)),
+    );
+    bindings.insert("erasure_intent_expected".to_owned(), intent_value.clone());
+    bindings.insert("erasure_intent_record".to_owned(), intent_value);
+    let mut outcomes = Vec::with_capacity(intent.surfaces.len());
+    let mut store_owned_index = 0_usize;
+    for surface in &intent.surfaces {
+        let preserved = prior_outcomes.iter().find(|outcome| {
+            outcome.surface() == *surface
+                && !matches!(outcome, SurrealSurfaceOutcome::NotAttempted { .. })
+        });
+        if let Some(outcome) = preserved {
+            outcomes.push(*outcome);
+            if surface.is_store_owned() {
+                erasure_delete_bindings(
+                    &mut bindings,
+                    store_owned_index,
+                    &intent.subject,
+                    &intent.scope_id,
+                );
+                store_owned_index += 1;
+            }
+            continue;
+        }
+        if surface.is_store_owned() {
+            outcomes.push(SurrealSurfaceOutcome::Purged { surface: *surface });
+            erasure_delete_bindings(
+                &mut bindings,
+                store_owned_index,
+                &intent.subject,
+                &intent.scope_id,
+            );
+            store_owned_index += 1;
+        } else {
+            outcomes.push(SurrealSurfaceOutcome::Incomplete { surface: *surface });
+        }
+    }
+    let outcome_strings: Vec<String> = outcomes
+        .iter()
+        .map(|outcome| match *outcome {
+            SurrealSurfaceOutcome::NotAttempted { surface } => {
+                format!("NOT_ATTEMPTED:{surface:?}")
+            }
+            SurrealSurfaceOutcome::Purged { surface } => format!("PURGED:{surface:?}"),
+            SurrealSurfaceOutcome::Incomplete { surface } => {
+                format!("INCOMPLETE:{surface:?}")
+            }
+            SurrealSurfaceOutcome::Unknown { surface } => format!("UNKNOWN:{surface:?}"),
+        })
+        .collect();
+    let outcome_value = json!({
+        "operation_id": intent.operation_id,
+        "outcomes": outcome_strings,
+    });
+    bindings.insert("erasure_outcome_table".to_owned(), json!("erasure_outcome"));
+    bindings.insert(
+        "erasure_outcome_id".to_owned(),
+        json!(erasure_outcome_record_id(&intent.operation_id)),
+    );
+    bindings.insert("erasure_outcomes".to_owned(), json!(outcome_strings));
+    bindings.insert("erasure_outcome_record".to_owned(), outcome_value);
+    Ok((bindings, outcomes))
+}
+
+fn erasure_delete_bindings(
+    bindings: &mut Map<String, Value>,
+    index: usize,
+    subject: &str,
+    scope_id: &ScopeId,
+) {
+    let suffix = index.to_string();
+    bindings.insert(format!("erasure_subject{suffix}"), json!(subject));
+    bindings.insert(
+        format!("erasure_scope{suffix}"),
+        json!(scope_id.to_string()),
+    );
+    bindings.insert(
+        format!("erasure_scope_expected{suffix}"),
+        json!(scope_id.to_string()),
+    );
+}
+
+/// Executes one recorded erasure intent atomically (688-B, live path).
+///
+/// Order: replay check (sealed outcome rows replay verbatim, no duplicate
+/// destructive work) → intent-before-dispatch transaction (intent row first,
+/// then exact-scope/scope deletes, then outcome seal) → sealed outcomes. A
+/// lost commit response surfaces as
+/// [`AdapterError::UnknownOutcome`] for same-operation reconciliation (no
+/// blind retry); a guard conflict surfaces as `IdentityConflict`.
+///
+/// Callers invoke this only after the apply-path intent gate below has
+/// recorded the durable intent: without that gate this function is never
+/// reached (fail-closed, zero destructive effects without recorded intent).
+pub(super) async fn write_erasure_transaction(
+    db: &client::RpcTransport,
+    config: &SurrealAdapterConfig,
+    intent: &SurrealErasureIntent,
+) -> Result<Vec<SurrealSurfaceOutcome>, AdapterError> {
+    intent.validate().map_err(AdapterError::Store)?;
+    if let Some(sealed) = read_erasure_outcome(db, config, &intent.operation_id).await? {
+        return Ok(sealed);
+    }
+    let prior = read_erasure_outcome(db, config, &intent.operation_id)
+        .await?
+        .unwrap_or_default();
+    let (bindings, outcomes) = erasure_transaction_bindings(intent, &prior)?;
+    let store_owned = intent
+        .surfaces
+        .iter()
+        .filter(|surface| surface.is_store_owned())
+        .count();
+    let sql = erasure_transaction_template(store_owned);
+    let mut response = match client::query(db, config, "transaction.erasure", &sql, bindings).await
+    {
+        Ok(response) => response,
+        Err(AdapterError::ProviderUnavailable) => {
+            return Err(AdapterError::UnknownOutcome {
+                operation_id: intent.operation_id.clone(),
+            });
+        }
+        Err(error) => return Err(error),
+    };
+    let errors = response.take_errors();
+    if !errors.is_empty() {
+        if errors
+            .iter()
+            .any(|error| error.contains("erasure_intent_conflict"))
+        {
+            return Err(AdapterError::Store(StoreError::IdentityConflict));
+        }
+        return Err(AdapterError::UnknownOutcome {
+            operation_id: intent.operation_id.clone(),
+        });
+    }
+    Ok(outcomes)
+}
+
+async fn read_erasure_outcome(
+    db: &client::RpcTransport,
+    config: &SurrealAdapterConfig,
+    operation_id: &str,
+) -> Result<Option<Vec<SurrealSurfaceOutcome>>, AdapterError> {
+    let mut bindings = Map::new();
+    bindings.insert("erasure_outcome_table".to_owned(), json!("erasure_outcome"));
+    bindings.insert(
+        "erasure_outcome_id".to_owned(),
+        json!(erasure_outcome_record_id(operation_id)),
+    );
+    let mut response = client::query(
+        db,
+        config,
+        "read.erasure_outcome",
+        READ_ERASURE_OUTCOME,
+        bindings,
+    )
+    .await?;
+    if !response.take_errors().is_empty() {
+        return Err(AdapterError::PartialOutcome);
+    }
+    let row: Option<ErasureOutcomeRow> = response.take(0)?;
+    row.map(|row| parse_erasure_outcomes(&row.outcomes))
+        .transpose()
+}
+
+#[derive(serde::Deserialize)]
+struct ErasureOutcomeRow {
+    outcomes: Vec<String>,
+}
+
+fn parse_erasure_outcomes(outcomes: &[String]) -> Result<Vec<SurrealSurfaceOutcome>, AdapterError> {
+    outcomes
+        .iter()
+        .map(|outcome| {
+            let (state, surface) = outcome.split_once(':').ok_or_else(|| {
+                AdapterError::Serialization("erasure outcome row is malformed".to_owned())
+            })?;
+            let surface = match surface {
+                "CanonicalPayload" => SurrealErasureSurface::CanonicalPayload,
+                "Projection" => SurrealErasureSurface::Projection,
+                "Index" => SurrealErasureSurface::Index,
+                "Blob" => SurrealErasureSurface::Blob,
+                "OperationalRecovery" => SurrealErasureSurface::OperationalRecovery,
+                "ProviderCopy" => SurrealErasureSurface::ProviderCopy,
+                "BackupRestorePath" => SurrealErasureSurface::BackupRestorePath,
+                "RouteContinuation" => SurrealErasureSurface::RouteContinuation,
+                _ => {
+                    return Err(AdapterError::Serialization(
+                        "erasure outcome surface is unknown".to_owned(),
+                    ));
+                }
+            };
+            match state {
+                "NOT_ATTEMPTED" => Ok(SurrealSurfaceOutcome::NotAttempted { surface }),
+                "PURGED" => Ok(SurrealSurfaceOutcome::Purged { surface }),
+                "INCOMPLETE" => Ok(SurrealSurfaceOutcome::Incomplete { surface }),
+                "UNKNOWN" => Ok(SurrealSurfaceOutcome::Unknown { surface }),
+                _ => Err(AdapterError::Serialization(
+                    "erasure outcome state is unknown".to_owned(),
+                )),
+            }
+        })
+        .collect()
 }
 
 #[cfg(test)]
