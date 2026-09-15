@@ -686,6 +686,31 @@ impl DaemonComposition {
         )
     }
 
+    /// Borrows the Governor Dreamer orientation intake adapter over the retained owners plus
+    /// the daemon-held Kernel client (T12-06, integration #702, semantic #18).
+    ///
+    /// Mirrors [`Self::context_read_client`]: readiness is checked first, then a fresh
+    /// [`GovernorDreamerAdapter`] is built over the composition and the caller-held
+    /// [`DaemonKernelClient`]. The composition retains no client and no thread — the caller
+    /// (the single daemon runtime holding both the concrete client and this composition, as
+    /// with [`Self::note_owner_session_binding`]) passes the already-connected client per
+    /// call, so a Governor refresh surfaces as an exact fence mismatch instead of silent
+    /// divergence. Intake itself stays fail-closed: without a ready Governor, an exact fence,
+    /// and digest-matching sources, nothing queues and no model edge is touched.
+    ///
+    /// Wiring decision (recorded per brief §5 T12-06): post-`start` attach-style accessor, not
+    /// a `start()` signature change — `start()` keeps its exact `(config, kernel:
+    /// Arc<dyn KernelGenerationPort>, authority_activation)` contour.
+    pub fn dreamer_admission<'a>(
+        &'a self,
+        kernel: &'a Arc<DaemonKernelClient>,
+    ) -> Result<GovernorDreamerAdapter<'a>, DaemonError> {
+        if self.readiness() != CompositionReadiness::Ready {
+            return Err(DaemonError::Composition(CompositionError::NotReady));
+        }
+        Ok(GovernorDreamerAdapter::new(self, kernel))
+    }
+
     /// Stops the one daemon owner and releases protected handles together.
     pub fn shutdown(mut self) -> Result<(), DaemonError> {
         if !self.started {

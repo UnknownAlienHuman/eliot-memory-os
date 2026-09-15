@@ -171,6 +171,11 @@ pub(super) fn run() -> Result<(), String> {
     if let Some(facts) = kernel.owner_session_facts() {
         composition.note_owner_session_binding(facts);
     }
+    // T12-06: gated Dreamer intake registration at the same attach site. The
+    // readiness-gated accessor plus the fence-bound route-context check prove
+    // the intake wiring before readiness is reported; no thread, no transport,
+    // no start() contour or run-loop change.
+    attach_dreamer_intake(&composition, &kernel)?;
     kernel.report_ready().map_err(|error| error.to_string())?;
     let status = composition.status();
     write_json(&ready_message(&status))?;
@@ -216,6 +221,26 @@ pub(super) fn run() -> Result<(), String> {
             format!("{error}; shutdown: {shutdown_error}"),
         )),
     }
+}
+
+/// Attaches the T12-06 Governor Dreamer intake registration (gated, no lifecycle change).
+///
+/// Post-`start` attach-style check at the single site holding both the concrete client and the
+/// composition: builds the [`GovernorDreamerAdapter`](eliotd::GovernorDreamerAdapter) through
+/// the readiness-gated accessor and validates the fence-bound route context. Fails closed
+/// before `report_ready` when the Governor is not ready or the admitted fence cannot bind a
+/// context. No thread, no transport, no `start()` contour or run-loop change.
+fn attach_dreamer_intake(
+    composition: &DaemonComposition,
+    kernel: &Arc<DaemonKernelClient>,
+) -> Result<(), String> {
+    let adapter = composition
+        .dreamer_admission(kernel)
+        .map_err(|error| error.to_string())?;
+    let _context = adapter
+        .dreamer_route_context()
+        .map_err(|error| error.to_string())?;
+    Ok(())
 }
 
 fn report_terminal_failure(kernel: &DaemonKernelClient, reason: String) -> String {
