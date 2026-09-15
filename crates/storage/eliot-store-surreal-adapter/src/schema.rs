@@ -19,7 +19,9 @@ pub(crate) mod table {
     pub(crate) const OUTBOX_EVENT: &str = "outbox_event";
     pub(crate) const CANONICAL_FENCE: &str = "canonical_fence";
     pub(crate) const RECOVERY_OWNER: &str = "recovery_owner";
-    #[cfg(test)]
+    /// Dreamer ledger lives inside this existing table (S1 #775); the
+    /// versioned Dreamer namespace plus discriminated keys separate it from
+    /// other recovery users without a new table or migration.
     pub(crate) const RECOVERY_JOB: &str = "recovery_job";
 }
 
@@ -255,7 +257,13 @@ pub(crate) fn forward_migration_expected_bindings() -> Vec<&'static str> {
 
 /// Closed read templates. Results select `body` values so they deserialize
 /// back into store-API types without a `SurrealDB` `id` field.
-pub(crate) const READ_SCHEMA_META: &str = "SELECT * FROM ONLY schema_meta:current;";
+///
+/// `READ_SCHEMA_META` projects the exact `SchemaMetaRecord` columns for the
+/// same reason: `SELECT *` returns the provider `id` alongside the declared
+/// fields, which fails the record's closed deserialization against a real
+/// provider (S1 #775 real-provider proof). The projection carries every
+/// validated column and drops only the undeclared provider identity.
+pub(crate) const READ_SCHEMA_META: &str = "SELECT VALUE { generation: generation, migrations: migrations, compatible_bridge_range: compatible_bridge_range, migration_state: migration_state, migration_id: migration_id, migration_checksum_sha256: migration_checksum_sha256, updated_at: updated_at } FROM ONLY schema_meta:current;";
 
 pub(crate) const READ_FENCE: &str = "SELECT VALUE { state_fence: state_fence, next_commit_sequence: next_commit_sequence, next_outbox_sequence: next_outbox_sequence } FROM ONLY canonical_fence:current;";
 
@@ -302,3 +310,52 @@ pub(crate) const TX_GENESIS_CREATE_OWNER: &str =
 pub(crate) const TX_GENESIS_CREATE_RECEIPT: &str =
     "CREATE type::record($receipt_table, $receipt_operation_id) CONTENT $receipt;";
 pub(crate) const TX_GENESIS_COMMIT: &str = "COMMIT TRANSACTION;";
+
+/// Dreamer ledger physical layout (S1, owner #775).
+///
+/// One versioned namespace inside the existing `recovery_job` table carries
+/// four discriminated key families; a single provider transaction commits one
+/// job row plus its event, operation-idempotency and receipt rows atomically.
+/// No new table, field, index or migration: the existing
+/// `(namespace, key)` UNIQUE index plus deterministic record IDs provide the
+/// insert-if-absent primitive, and the typed outer `revision`/`state_fence`
+/// columns provide the compare-and-swap primitive over otherwise-opaque
+/// canonical payload bytes.
+pub(crate) mod dreamer {
+    /// Versioned Dreamer namespace inside `recovery_job`.
+    pub(crate) const NAMESPACE: &str = "dreamer-job-v1";
+    /// Key discriminators inside the Dreamer namespace. Values avoid `:`:
+    /// bound colon-bearing strings in the indexed `key` column mis-coerce to
+    /// record IDs on the pinned provider (S1 #775 real-provider proof), while
+    /// the opaque `schema` column is unaffected.
+    pub(crate) const KEY_JOB_PREFIX: &str = "job_";
+    pub(crate) const KEY_EVENT_PREFIX: &str = "event_";
+    pub(crate) const KEY_OPERATION_PREFIX: &str = "op_";
+    pub(crate) const KEY_RECEIPT_PREFIX: &str = "receipt_";
+    /// Versioned payload schemas; keys already discriminate, schemas aid
+    /// debugging and forward migration without a DDL change.
+    pub(crate) const SCHEMA_LEDGER_RECORD: &str = "eliot.storage.dreamer-job.v1:ledger-record";
+    pub(crate) const SCHEMA_LEDGER_EVENT: &str = "eliot.storage.dreamer-job.v1:ledger-event";
+    pub(crate) const SCHEMA_MUTATION: &str = "eliot.storage.dreamer-job.v1:mutation";
+    pub(crate) const SCHEMA_RECEIPT: &str = "eliot.storage.dreamer-job.v1:receipt";
+    /// CAS conflict marker thrown when the expected outer revision/fence no
+    /// longer matches (concurrent winner committed first).
+    pub(crate) const CAS_CONFLICT: &str = "dreamer_job_cas_conflict";
+}
+
+/// Reads one Dreamer row by exact namespace/key. Returns zero or one
+/// `RecoveryRecord` in canonical column shape.
+pub(crate) const READ_DREAMER_BY_KEY: &str = "SELECT VALUE { namespace: namespace, key: key, state_fence: state_fence, revision: revision, schema: schema, payload: payload, value_digest: value_digest } FROM recovery_job WHERE namespace = $dreamer_namespace AND key = $dreamer_key LIMIT 1;";
+
+/// Creates one Dreamer row by deterministic record ID. `{i}` selects the
+/// binding index for the four-row atomic commit.
+///
+/// The record is projected field-by-field (instead of `CONTENT $record`)
+/// because the `payload` column is `TYPE bytes`: bound JSON byte arrays only
+/// coerce through an explicit `<bytes>` cast on the pinned provider (S1 #775
+/// real-provider proof), while reads return plain arrays.
+pub(crate) const TX_DREAMER_CREATE: &str = "CREATE type::record($dreamer_table{i}, $dreamer_id{i}) CONTENT { namespace: $dreamer_record{i}.namespace, key: $dreamer_record{i}.key, state_fence: $dreamer_record{i}.state_fence, revision: $dreamer_record{i}.revision, schema: $dreamer_record{i}.schema, payload: <bytes>$dreamer_record{i}.payload, value_digest: $dreamer_record{i}.value_digest };";
+
+/// Compare-and-swaps one Dreamer job row on outer revision plus fence.
+/// `{i}` selects the binding index (always 0 for the single job row).
+pub(crate) const TX_DREAMER_CAS_JOB: &str = "LET $dreamer_cas{i} = (UPDATE type::record($dreamer_table{i}, $dreamer_id{i}) CONTENT { namespace: $dreamer_record{i}.namespace, key: $dreamer_record{i}.key, state_fence: $dreamer_record{i}.state_fence, revision: $dreamer_record{i}.revision, schema: $dreamer_record{i}.schema, payload: <bytes>$dreamer_record{i}.payload, value_digest: $dreamer_record{i}.value_digest } WHERE namespace = $dreamer_namespace{i} AND key = $dreamer_key{i} AND revision = $dreamer_expected_revision{i} AND state_fence = $dreamer_expected_fence{i} RETURN AFTER); IF array::len($dreamer_cas{i} ?? []) != 1 { THROW 'dreamer_job_cas_conflict'; };";
