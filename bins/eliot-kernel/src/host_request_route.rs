@@ -52,8 +52,10 @@ use eliot_ors::{
 };
 use eliot_protocol::{
     AGENT_BRIDGE_PROCESS_BINDING_WIRE_ID, AgentActivationResolutionResult,
-    AgentBridgePeerAdmissionReceipt, AgentBridgeProcessBinding, HostRequestAdmissionReceipt,
-    HostRequestEnvelope, HostRequestKind, host_request_operation_id,
+    AgentBridgePeerAdmissionReceipt, AgentBridgeProcessBinding, HOST_REQUEST_INVOKE_READ_WIRE_ID,
+    HOST_REQUEST_RESULT_BODY_WIRE_ID, HostRequestAdmissionReceipt, HostRequestEnvelope,
+    HostRequestInvokeReadPayload, HostRequestKind, HostRequestResultBody,
+    host_request_operation_id,
 };
 
 /// Prefix of the deterministic opaque operation handle derived by
@@ -77,6 +79,16 @@ pub(crate) const AGENT_HOST_REQUEST_SUBMIT_OPERATION: &str = "agent_host_request
 pub(crate) const AGENT_HOST_REQUEST_CANCEL_OPERATION: &str = "agent_host_request_cancel";
 pub(crate) const AGENT_HOST_REQUEST_RECONCILE_OPERATION: &str = "agent_host_request_reconcile";
 pub(crate) const AGENT_HOST_REQUEST_REHYDRATE_OPERATION: &str = "agent_host_request_rehydrate";
+/// Closed invoke-read entry for local reads (Implements #18: local read result).
+///
+/// Carries the exact envelope plus the exact canonical tool bytes it admits,
+/// so tool linkage (capability + payload digest) is re-checked before any
+/// read and the exact bounded result with its revision can be served back
+/// from the durable record without re-dispatch. The envelope stays
+/// digest-only in spirit; the tool bytes only prove the presented operation
+/// is the admitted one.
+pub(crate) const AGENT_HOST_REQUEST_INVOKE_READ_OPERATION: &str =
+    "agent_host_request_invoke_read";
 
 /// Returns whether the operation string selects the P-04 host-request route.
 pub(crate) fn is_host_request_operation(operation: &str) -> bool {
@@ -86,6 +98,7 @@ pub(crate) fn is_host_request_operation(operation: &str) -> bool {
             | AGENT_HOST_REQUEST_CANCEL_OPERATION
             | AGENT_HOST_REQUEST_RECONCILE_OPERATION
             | AGENT_HOST_REQUEST_REHYDRATE_OPERATION
+            | AGENT_HOST_REQUEST_INVOKE_READ_OPERATION
     )
 }
 
@@ -241,6 +254,58 @@ impl KernelComposition {
             return Err(TransportError::SessionFenced);
         }
         self.admit_host_request_envelope(envelope)
+    }
+
+    /// Admits one typed invoke-read envelope with its canonical tool bytes.
+    ///
+    /// The closed `Invocation` kind is the only kind accepted here. Tool
+    /// linkage (capability + payload digest over the presented bytes) is
+    /// checked at decode time, and the full admission gate (connection,
+    /// descriptor, fence, deadline, durability) runs before anything is read
+    /// back, so a changed payload digest or forged descriptor is rejected
+    /// before reading. An exact replay of a resulted operation serves the
+    /// stored bounded result with its revision without re-dispatch; a live
+    /// operation returns its admission receipt honestly.
+    ///
+    /// No semantic dispatch happens here: producing a fresh answer for
+    /// `eliot.query`/`eliot.packet` requires the Governor read owner
+    /// (`ReadService::query` over the canonical store), which lives outside
+    /// this binary's lane (see the module HANDOFF below). This entry owns
+    /// admission, linkage rejection, and exact readback; the
+    /// `KernelHostRequestBinder::invoke_admitted` persist/readback pair owns
+    /// the dispatch-then-store leg wherever a Governor is injected.
+    pub fn invoke_read_host_request(
+        &self,
+        envelope: &HostRequestEnvelope,
+        tool: &serde_json::Value,
+    ) -> Result<(HostRequestAdmissionReceipt, HostRequestRecord), TransportError> {
+        if envelope.kind != HostRequestKind::Invocation {
+            return Err(TransportError::SessionFenced);
+        }
+        HostRequestInvokeReadPayload {
+            wire_id: HOST_REQUEST_INVOKE_READ_WIRE_ID.to_owned(),
+            wire_version: HostRequestInvokeReadPayload::CONTRACT_VERSION,
+            envelope: envelope.clone(),
+            tool: tool.clone(),
+        }
+        .validate()
+        .map_err(|_| TransportError::SessionFenced)?;
+        let (receipt, record) = self.admit_host_request_envelope(envelope)?;
+        // Coherence gate before serving: a resulted record must carry a
+        // digest-bound body, otherwise the row is never served as an answer.
+        if let (Some(digest), Some(body)) = (&record.result_digest, &record.result_response) {
+            HostRequestResultBody {
+                wire_id: HOST_REQUEST_RESULT_BODY_WIRE_ID.to_owned(),
+                wire_version: HostRequestResultBody::CONTRACT_VERSION,
+                operation_id: receipt.operation_id.clone(),
+                request_sha256: envelope.envelope_sha256.clone(),
+                result_digest: digest.clone(),
+                response: body.clone(),
+            }
+            .validate()
+            .map_err(|_| TransportError::SessionFenced)?;
+        }
+        Ok((receipt, record))
     }
 
     /// Rehydrates one previously admitted host request after restart or an
@@ -895,6 +960,15 @@ impl KernelComposition {
                 let record = self.rehydrate_host_request(&envelope, &receipt)?;
                 host_request_rehydrated_response(&record)
             }
+            AGENT_HOST_REQUEST_INVOKE_READ_OPERATION => {
+                let tool = host_request_tool_from_payload(&payload)?;
+                let (receipt, record) = self.invoke_read_host_request(&envelope, &tool)?;
+                // The durable record carries the result pair when the
+                // operation already received its bounded answer, so the
+                // admitted shape is the result-bearing response: no second
+                // shape, no duplicated body, no frame-ceiling risk.
+                host_request_admitted_response(&receipt, &record)
+            }
             _ => return Err(TransportError::SessionFenced),
         };
         let mut reply = status_frame(session, FrameKind::Response, MessageType::Result, value)?;
@@ -950,6 +1024,32 @@ pub(crate) fn host_request_envelope_from_payload(
         .validate()
         .map_err(|_| TransportError::SessionFenced)?;
     Ok(envelope)
+}
+
+/// Decodes the exact canonical tool bytes from an invoke-read payload.
+///
+/// The payload carries the closed operation string plus the full typed
+/// envelope and the opaque canonical tool JSON. Linkage (capability +
+/// payload digest over the presented bytes) is enforced by the
+/// [`HostRequestInvokeReadPayload`] contract, so a changed payload is
+/// rejected here before any read.
+pub(crate) fn host_request_tool_from_payload(
+    payload: &serde_json::Value,
+) -> Result<serde_json::Value, TransportError> {
+    let envelope = host_request_envelope_from_payload(payload)?;
+    let tool = payload
+        .get("tool")
+        .cloned()
+        .ok_or(TransportError::SessionFenced)?;
+    HostRequestInvokeReadPayload {
+        wire_id: HOST_REQUEST_INVOKE_READ_WIRE_ID.to_owned(),
+        wire_version: HostRequestInvokeReadPayload::CONTRACT_VERSION,
+        envelope,
+        tool: tool.clone(),
+    }
+    .validate()
+    .map_err(|_| TransportError::SessionFenced)?;
+    Ok(tool)
 }
 
 /// Decodes the exact typed admission receipt from a rehydrate payload.
@@ -1161,5 +1261,113 @@ mod watchdog_spool_batch_tests {
             128,
         );
         assert_eq!(stale, Err(TransportError::SessionFenced));
+    }
+}
+
+#[cfg(test)]
+#[allow(
+    clippy::expect_used,
+    clippy::unwrap_used,
+    reason = "test fixtures use expect for fail-fast setup"
+)]
+mod invoke_read_tool_tests {
+    use super::*;
+    use eliot_protocol::{HOST_REQUEST_WIRE_ID, HostRequestIdentity};
+
+    const TEST_LINEAGE: &str = "550e8400-e29b-41d4-a716-446655440000";
+
+    fn tool_digest(tool: &serde_json::Value) -> String {
+        let bytes = eliot_contracts::canonical_json_bytes(tool).expect("tool must canonicalize");
+        eliot_contracts::sha256_hex(&bytes)
+    }
+
+    fn test_envelope(capability: &str, payload_sha256: &str) -> HostRequestEnvelope {
+        use std::num::NonZeroU64;
+        let lineage = eliot_contracts::EpochLineageId::new(TEST_LINEAGE).expect("test lineage");
+        let epoch = eliot_contracts::EpochId::new(lineage, NonZeroU64::new(3).expect("nonzero"))
+            .expect("test epoch");
+        let fence = eliot_contracts::StateFence::new(
+            epoch,
+            eliot_contracts::ResourceGeneration::new(7).expect("nonzero generation"),
+        );
+        HostRequestEnvelope {
+            wire_id: HOST_REQUEST_WIRE_ID.to_owned(),
+            wire_version: HostRequestEnvelope::CONTRACT_VERSION,
+            kind: HostRequestKind::Invocation,
+            connection_id: "conn-test-1".to_owned(),
+            identity: HostRequestIdentity {
+                request_id: eliot_contracts::RequestId::new("host-request-1")
+                    .expect("valid request id"),
+                idempotency_key: "host-request-1:invoke".to_owned(),
+                cancellation_id: "host-request-1:invoke:cancel".to_owned(),
+                parent_operation_id: None,
+                deadline_unix_ms: 2_000_000,
+                capability: capability.to_owned(),
+                session_id: Some("kernel-session-1".to_owned()),
+                task_id: None,
+                work_scope_id: None,
+                payload_schema_id: "eliot.mcp.tool-request.v1".to_owned(),
+                payload_sha256: payload_sha256.to_owned(),
+            },
+            state_fence: fence,
+            descriptor_sha256: "d".repeat(64),
+            peer_admission_receipt_sha256: "e".repeat(64),
+            activation_binding: None,
+            envelope_sha256: String::new(),
+        }
+        .with_computed_digest()
+        .expect("envelope must digest")
+    }
+
+    fn query_tool() -> serde_json::Value {
+        serde_json::json!({"name":"eliot.query","arguments":{
+            "intent":{
+                "mode":"verification",
+                "time_scope":"session-window",
+                "branch_environment_scope":"branch",
+                "freshness_policy":"exact-fence",
+                "required_assurance":"evidence-provenance"
+            },
+            "query":"subject:evidence-alpha",
+            "exact_resource_uri": null
+        }})
+    }
+
+    #[test]
+    fn invoke_read_rejects_changed_payload_before_reading() {
+        let tool = query_tool();
+        let envelope = test_envelope("eliot.query", &tool_digest(&tool));
+        let payload = serde_json::json!({"operation": AGENT_HOST_REQUEST_INVOKE_READ_OPERATION, "envelope": envelope, "tool": tool});
+        let decoded =
+            host_request_tool_from_payload(&payload).expect("admitted tool bytes must decode");
+        assert_eq!(decoded, tool);
+
+        // A changed payload under the same envelope digest is rejected before
+        // any read: the digest no longer binds the presented bytes.
+        let mut changed = tool.clone();
+        changed["arguments"]["query"] = serde_json::json!("subject:forged-subject");
+        let forged = serde_json::json!({"operation": AGENT_HOST_REQUEST_INVOKE_READ_OPERATION, "envelope": envelope, "tool": changed});
+        assert_eq!(
+            host_request_tool_from_payload(&forged),
+            Err(TransportError::SessionFenced),
+            "changed payload digest must be rejected before reading"
+        );
+
+        // A tool bound to another capability is rejected the same way.
+        let other_envelope = test_envelope("eliot.state", &tool_digest(&tool));
+        let mismatched = serde_json::json!({"operation": AGENT_HOST_REQUEST_INVOKE_READ_OPERATION, "envelope": other_envelope, "tool": tool});
+        assert_eq!(
+            host_request_tool_from_payload(&mismatched),
+            Err(TransportError::SessionFenced),
+            "capability mismatch must be rejected before reading"
+        );
+
+        // A missing tool carries no linkage proof at all.
+        let missing = serde_json::json!({"operation": AGENT_HOST_REQUEST_INVOKE_READ_OPERATION, "envelope": envelope});
+        assert_eq!(
+            host_request_tool_from_payload(&missing),
+            Err(TransportError::SessionFenced),
+            "missing tool bytes must be rejected before reading"
+        );
     }
 }
