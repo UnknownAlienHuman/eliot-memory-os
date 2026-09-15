@@ -320,6 +320,9 @@ mod ownership_tests {
     use tokio::net::TcpStream;
     use tokio::process::Command;
 
+    #[path = "test_readiness.rs"]
+    mod test_readiness;
+
     struct Harness {
         root: PathBuf,
         config: SurrealAdapterConfig,
@@ -415,8 +418,15 @@ mod ownership_tests {
         }
         async fn start() -> Self {
             let mut harness = Self::provision().await;
-            harness.construct();
-            harness.adapter().connect().await.expect("connect");
+            // Bounded readiness retry (PR #1488 pattern): slow provider
+            // authentication waits up to ~30s with 100ms backoff instead of
+            // failing on the first attempt. Last error is preserved on timeout.
+            test_readiness::connect_with_readiness_retry(
+                &harness.root,
+                &harness.config,
+                &mut harness.adapter,
+            )
+            .await;
             harness
         }
         fn adapter(&self) -> &SurrealStoreAdapter {
