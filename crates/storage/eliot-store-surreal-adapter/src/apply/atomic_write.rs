@@ -12,7 +12,7 @@ use serde_json::{Map, Value, json};
 use crate::client;
 use crate::config::SurrealAdapterConfig;
 use crate::error::AdapterError;
-use crate::plan::{ApplyPlan, PayloadAuthorityRecord};
+use crate::plan::{ApplyPlan, EvidenceRecord, PayloadAuthorityRecord};
 use crate::schema;
 use eliot_store_api::{OrderingHead, RevisionHead, WriteReceipt};
 
@@ -228,6 +228,15 @@ pub(super) async fn write_transaction(
             // the transition claimed no authority; receipt `body` readback
             // selects `body` only, so this field changes no read path.
             "payload_authority": payload_authority_binding(&plan.payload_authority)?,
+            // Recoverable capture evidence (T11.1, #19): full subject +
+            // exact bytes + provenance per `CaptureObservation`, persisted
+            // atomically with the receipt so the closed evidence SELECT can
+            // serve `GetEvidencePack` with memory parity. Empty when the
+            // transition carries no capture; pre-change receipts lack this
+            // field and read as absent (never as an error).
+            "evidence_records": evidence_binding(&plan.evidence_records)?,
+            "commit_sequence": plan.commit_sequence,
+            "named_operation_count": transition.named_operations.len(),
         }),
     );
 
@@ -290,6 +299,41 @@ fn payload_authority_binding(records: &[PayloadAuthorityRecord]) -> Result<Value
                 "digest_hex": record.digest_hex,
                 "byte_len": record.byte_len,
                 "bytes_utf8": bytes_utf8,
+            }))
+        })
+        .collect::<Result<Vec<_>, AdapterError>>()
+        .map(Value::Array)
+}
+
+/// Renders the recoverable capture-evidence array for the receipt record
+/// binding (T11.1, #19).
+///
+/// Each entry carries the full recoverable record — subject selector,
+/// complete admitted parameters, and exact bytes with version/encoding/
+/// digest/length provenance — plus the durable capture order
+/// (`commit_sequence`, `operation_index`) and the transition's total
+/// operation count. Bytes that are not valid UTF-8 JSON fail closed here
+/// instead of being lossily coerced into the binding.
+fn evidence_binding(records: &[EvidenceRecord]) -> Result<Value, AdapterError> {
+    records
+        .iter()
+        .map(|record| {
+            let bytes_utf8 = String::from_utf8(record.bytes.clone()).map_err(|_| {
+                AdapterError::Serialization(
+                    "evidence record bytes are not valid UTF-8 JSON".to_owned(),
+                )
+            })?;
+            Ok(json!({
+                "operation_index": record.operation_index,
+                "subject": record.subject,
+                "parameters": record.parameters,
+                "version": record.version,
+                "encoding": record.encoding,
+                "digest_hex": record.digest_hex,
+                "byte_len": record.byte_len,
+                "bytes_utf8": bytes_utf8,
+                "commit_sequence": record.commit_sequence,
+                "named_operation_count": record.named_operation_count,
             }))
         })
         .collect::<Result<Vec<_>, AdapterError>>()
@@ -375,6 +419,109 @@ mod authority_binding_tests {
         assert!(
             payload_authority_binding(&[record]).is_err(),
             "non-UTF-8 bytes never coerce into the binding"
+        );
+    }
+
+    #[test]
+    fn evidence_binding_persists_full_recoverable_record() {
+        use crate::plan::{plan_apply, select_apply_plan};
+        use eliot_store_api::{
+            EffectClass, EventProjectionRelationIntents, NamedMutationOperation,
+            NamedMutationRequest, OperationIdentity, OperationManifestDigest, OrderingScopeId,
+            ScopeId, SecurityContext, TransitionClass,
+        };
+        use serde_json::json;
+        use std::collections::BTreeMap;
+
+        fn transition() -> eliot_store_api::PreparedTransition {
+            use eliot_contracts::{EpochId, EpochLineageId, ResourceGeneration};
+            use std::num::NonZeroU64;
+            let lineage =
+                EpochLineageId::new("550e8400-e29b-41d4-a716-446655440000").expect("lineage");
+            let epoch =
+                EpochId::new(lineage, NonZeroU64::new(1).expect("non-zero")).expect("epoch");
+            eliot_store_api::PreparedTransition {
+                identity: OperationIdentity {
+                    operation_id: eliot_store_api::OperationId::new("op-evidence-bind")
+                        .expect("operation"),
+                    idempotency_key: "idem-evidence-bind".to_owned(),
+                    canonical_request_hash: "a".repeat(64),
+                },
+                state_fence: eliot_store_api::StateFence::new(epoch, ResourceGeneration::genesis()),
+                scope_id: ScopeId::new("scope-1").expect("scope"),
+                task_id: None,
+                ordering_scopes: vec![OrderingScopeId::new("scope-1").expect("ordering")],
+                transition_class: TransitionClass::CaptureCandidate,
+                requested_effect_ceiling: EffectClass::Candidate,
+                admission_contract_set_digest: "b".repeat(64),
+                operation_manifest_digest: OperationManifestDigest::new("manifest-1")
+                    .expect("manifest"),
+                named_operations: vec![NamedMutationRequest {
+                    operation: NamedMutationOperation::CaptureObservation,
+                    parameters: BTreeMap::from([("subject".to_owned(), json!("evidence-alpha"))]),
+                }],
+                event_projection_relation_intents: EventProjectionRelationIntents {
+                    event_ids: Vec::new(),
+                    projection_kinds: Vec::new(),
+                    relation_kinds: Vec::new(),
+                },
+                security: SecurityContext::default(),
+                required_proof_and_approval_refs: Vec::new(),
+            }
+        }
+
+        // Real planner output — never a canned row — binds subject, full
+        // parameters, exact bytes, and provenance together.
+        let transition = transition();
+        let plan = plan_apply(&transition, &[], &[], 7, 1).expect("plan applies");
+        let bound = evidence_binding(&plan.evidence_records).expect("binding renders");
+        let entries = bound.as_array().expect("binding is an array");
+        assert_eq!(entries.len(), 1);
+        assert_eq!(
+            entries[0].get("subject").and_then(Value::as_str),
+            Some("evidence-alpha")
+        );
+        assert_eq!(
+            entries[0]
+                .get("parameters")
+                .and_then(|parameters| parameters.get("subject"))
+                .and_then(Value::as_str),
+            Some("evidence-alpha"),
+            "full parameters travel, never a subject-only projection"
+        );
+        let bytes_utf8 = entries[0]
+            .get("bytes_utf8")
+            .and_then(Value::as_str)
+            .expect("bytes travel as one opaque string");
+        let decoded: BTreeMap<String, Value> =
+            serde_json::from_str(bytes_utf8).expect("bytes parse");
+        assert_eq!(
+            decoded, plan.evidence_records[0].parameters,
+            "persisted bytes recover the exact parameters"
+        );
+        assert_eq!(
+            entries[0].get("commit_sequence").and_then(Value::as_u64),
+            Some(7)
+        );
+        // Authority path keeps the original raw bytes verbatim.
+        let raw = br#"{"subject":"evidence-alpha"}"#;
+        let authority =
+            ExactJsonBytes::parse(PayloadSource::NamedOperationParameter, raw).expect("parses");
+        let bound_plan = select_apply_plan(&transition, &[Some(authority)], &[], &[], 7, 1)
+            .expect("bound applies");
+        let bound_rendered =
+            evidence_binding(&bound_plan.evidence_records).expect("bound binding renders");
+        assert_eq!(
+            bound_rendered.as_array().expect("array")[0]
+                .get("bytes_utf8")
+                .and_then(Value::as_str),
+            Some(std::str::from_utf8(raw).expect("UTF-8")),
+            "original authority bytes are preserved, never re-serialized"
+        );
+        assert_eq!(
+            evidence_binding(&[]).expect("empty renders"),
+            Value::Array(Vec::new()),
+            "non-capture transitions persist an empty evidence array"
         );
     }
 }
