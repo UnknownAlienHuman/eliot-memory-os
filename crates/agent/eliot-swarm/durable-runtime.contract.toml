@@ -1,0 +1,114 @@
+schema = "eliot.swarm.durable-runtime.v1"
+authority = "NON_NORMATIVE_IMPLEMENTATION_CONTRACT"
+status = "READY_AFTER_ADAPTER_REGISTRY"
+implementation_support = "COORDINATION_CONTRACT_PRESENT_DURABLE_RUNTIME_EDGE_MISSING"
+evidence_execution_status = "SOURCE_AUDIT_EXECUTED_TESTS_NOT_EXECUTED"
+proof_ceiling = "DURABLE_SWARM_EDGE_CANDIDATE"
+issue = 1126
+adapter_registry_issue = 874
+native_worker_issue = 22
+provider_contract_issue_refs = [361, 368, 369, 370, 371]
+product_pulse_issue = 11
+base_branch = "main"
+base_sha = "8ebf8b41847391c340393d56aeb14dd4f2b5e37b"
+normative_pair_ref = "docs/normative-pair.toml"
+
+[documentation]
+architecture = [
+  "docs/architecture/A10-04-delegation.md#a104-delegation",
+  "docs/architecture/A10-07-swarm-and-concilium.md#a107-swarm-and-concilium",
+  "docs/architecture/A13-02-kernel-and-failure-domains.md#a132-kernel-and-failure-domains",
+]
+implementation = [
+  "docs/architecture/I05-27-canonical-operation-identity-and-effect-identity.md#i527-canonical-operation-identity-and-effect-identity",
+  "docs/architecture/I09-09-agentswarm-launch-and-no-lost-child-contract.md#i99-agentswarm-launch-and-no-lost-child-contract",
+  "docs/architecture/I10-15-agent-execution-fabric-and-durable-swarm.md#i1015-agent-execution-fabric-and-durable-swarm",
+  "docs/architecture/I14-13-idle-drain-and-cancellation.md#i1413-idle-drain-and-cancellation",
+  "docs/architecture/I14-20-canonical-runtime-lifecycle-vocabulary.md#i1420-canonical-runtime-lifecycle-vocabulary",
+  "docs/architecture/I15-02-principal-and-session-binding.md#i152-principal-and-session-binding",
+]
+anchors = ["ARCH-SWM-02", "ARCH-AUTH-01", "ARCH-LIFE-01", "ARCH-RES-01", "ARCH-OBS-01", "ARCH-FIN-01"]
+
+[confirmed_gap]
+observations = [
+  "eliot-swarm exposes coordination contracts but no accepted production edge binds one Governor Durable Job to native provider attempts and exact restart reconciliation.",
+  "No current composition proves a frozen finite child denominator, one parent/child identity graph and no-lost-child accounting across daemon/native-worker loss.",
+  "Provider selection/execution belongs to #874/#22; the swarm must consume that boundary instead of constructing provider clients directly.",
+  "No complete current Edge proves hierarchical cancellation, unknown-result reconciliation and candidate-only aggregation without a second Task/Finish owner.",
+]
+discriminator = "Submit a finite multi-provider swarm, lose the daemon/native-worker after at least one child launch and recover. Current product has no accepted durable owner path proving that every child and possible result/effect remains accounted for."
+
+[causal_property]
+statement = "One admitted Durable Job owns one immutable finite swarm plan and every child attempt from admission through terminal or exact unknown/reconciling state; no child disappears and swarm aggregation cannot become semantic truth, authority or Finish."
+
+[scope]
+primary_paths = [
+  "crates/agent/eliot-swarm/src/**",
+  "crates/agent/eliot-agent-coordinator/src/**swarm**",
+  "crates/governor/eliot-maintenance/src/**swarm** or the accepted Durable Job owner adapter",
+  "crates/kernel/eliot-ors/src/**swarm**",
+  "bins/eliotd/src/**swarm**",
+  "bins/eliot-native-worker/src/**swarm**",
+  "focused swarm runtime/replay tests",
+]
+read_only_contracts = [
+  "crates/agent/eliot-agent-contracts/src/**",
+  "crates/agent/eliot-agent-api/src/**",
+  "bins/eliot-native-worker/adapter-registry.contract.toml",
+  "crates/foundation/eliot-contracts/src/**operation**",
+]
+forbidden_ownership = [
+  "second Task, Durable Job, Session, authority, canonical or Finish owner",
+  "direct provider SDK, credential, executable or shell selection",
+  "majority/confidence promotion to truth",
+  "blind relaunch after unknown process/result outcome",
+]
+
+[what_to_do]
+steps = [
+  "Bind the existing swarm coordination surface to one Governor Durable Job and Kernel/ORS recovery owner.",
+  "Define one immutable finite SwarmPlan with exact child denominator, dependency DAG, identities, budgets, deadlines and stop/cancel rules before launch.",
+  "Launch children only through the admitted #874 adapter registry and #22 native-worker generation.",
+  "Persist child admission/launch intent, process/result state, cancellation and reconciliation before aggregate progress changes.",
+  "Implement restart rehydration, exact replay and no-lost-child hierarchical cancellation/drain.",
+  "Aggregate provider-neutral candidate results with explicit coverage/disagreement/unknown axes and hand them to Governor admission/verification.",
+]
+
+[how_to_do]
+steps = [
+  "Reuse accepted Durable Job, execution-unit, attempt, operation/effect, route, event and candidate-result contracts; do not define swarm-private replacements.",
+  "Freeze parent job/attempt, plan revision, exact child IDs, DAG edges, provider/route classes, resource envelopes, expected schemas, forbidden effects and proof ceiling before any launch.",
+  "Derive each child attempt/cancellation identity from parent, plan revision, child slot and State Fence.",
+  "Persist launch intent before native-worker dispatch and attach exact adapter registry entry, artifact/config/protocol generation and process receipt afterward.",
+  "Rehydrate every nonterminal child and reconcile exact process/result identity before any relaunch; timeout alone cannot convert unknown into absent or failed.",
+  "Exact retry returns the same child result; changed prompt/provider/route/model/budget/capability or plan revision requires a new identity and explicit parent revision.",
+  "During cancellation/drain, stop new admissions, cancel exact active children, observe cleanup and retain unknown descendants until reconciled.",
+  "Keep execution, delivery, evidence coverage, disagreement, cost, latency, verification applicability and cleanup as independent aggregate axes.",
+  "Send only candidate results/evidence to Governor; swarm cannot write canonical state, issue authority or invoke Finish.",
+]
+
+[acceptance]
+criteria = [
+  "A non-test composition connects swarm coordination to one Durable Job owner and the admitted native adapter registry.",
+  "Every plan has a finite immutable child denominator and acyclic dependency graph before launch.",
+  "Every child carries exact parent/plan/attempt/cancel/fence/route/provider/process-generation lineage.",
+  "Launch intent is durable before process execution and every launched child survives restart accounting.",
+  "Daemon/native-worker crash rehydrates active/unknown children and reconciles before relaunch.",
+  "Exact replay is idempotent and changed same-identity child input conflicts.",
+  "Cancellation/drain accounts for every child/descendant and unresolved cleanup/effect blocks false terminal success.",
+  "Provider/route replacement cannot revive stale child authority or substitute a result for the same attempt.",
+  "Aggregate state preserves partial, conflicting, failed, missing and unknown coverage without scalar coercion.",
+  "Swarm output remains candidate-only and creates no Task Finish, truth, authority, Session or canonical write.",
+  "Budget/deadline/resource exhaustion is bounded, local and visible.",
+]
+
+[verification]
+commands = [
+  "cargo fmt --all -- --check",
+  "cargo check --locked -p eliot-swarm -p eliot-agent-coordinator -p eliot-agent-contracts -p eliot-native-worker-core -p eliot-native-worker --all-targets",
+  "cargo test --locked -p eliot-swarm -p eliot-agent-coordinator -p eliot-agent-contracts -p eliot-native-worker-core -p eliot-native-worker --all-targets",
+  "cargo clippy --locked -p eliot-swarm -p eliot-agent-coordinator -p eliot-agent-contracts -p eliot-native-worker-core -p eliot-native-worker --all-targets -- -D warnings",
+  "cargo tree --locked -p eliot-swarm --edges normal",
+  "git diff --check",
+]
+edge_proof = "Run a finite multi-provider swarm with child success/failure/disagreement, daemon and native-worker restart, lost result acknowledgement, route revocation, cancellation, descendant cleanup and exact reconciliation."
