@@ -10,17 +10,17 @@ use std::sync::{Mutex, MutexGuard, TryLockError};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use eliot_store_api::{
-    CanonicalRequestView, CanonicalStoreClient, CanonicalValidationSnapshot, CommitId, EventId,
-    EventProjectionRelationIntents, EVIDENCE_PACK_MAX_RECORDS, NamedMutationOperation,
+    CanonicalRequestView, CanonicalStoreClient, CanonicalValidationSnapshot, CommitId,
+    EVIDENCE_PACK_MAX_RECORDS, EventId, EventProjectionRelationIntents, NamedMutationOperation,
     NamedReadOperation, NamedReadRequest, NamedReadResponse, OperationId, OperationManifestDigest,
     OrderingHead, OrderingHeadExpectation, OrderingScopeId, OutboxId, OutboxIntent, OutboxState,
     PreparedTransition, ProjectionMode, ProjectionPublicationId, ProjectionPublicationRecord,
     ProjectionStatus, RecoveryRecord, RecoveryRecordKey, RequestMeta, Resubmission, RevisionDelta,
     RevisionHead, RevisionHeadExpectation, RevisionKey, ScopeId, ScopeRevisionView, SplitView,
-    StateFence, StoreError, StoreGenesisRequest, StoreHealth, StoreHealthStatus, StoreRecoveryRequest,
-    StoreRecoverySnapshot, WriteReceipt, WriteReceiptStatus, canonical_json_bytes,
-    canonical_request_hash, generated_operation_manifests, genesis_manifest, is_genesis_fence,
-    issue_genesis_receipt_envelope, issue_store_receipt_envelope,
+    StateFence, StoreError, StoreGenesisRequest, StoreHealth, StoreHealthStatus,
+    StoreRecoveryRequest, StoreRecoverySnapshot, WriteReceipt, WriteReceiptStatus,
+    canonical_json_bytes, canonical_request_hash, generated_operation_manifests, genesis_manifest,
+    is_genesis_fence, issue_genesis_receipt_envelope, issue_store_receipt_envelope,
     named_mutation_operation_name, sha256_hex, validate_genesis_receipt_envelope,
     validate_store_receipt_envelope, verify_canonical_request_hash,
 };
@@ -378,7 +378,15 @@ fn commit_transaction(
         .extend(transition.event_projection_relation_intents.relation_kinds);
     state
         .named_operations
-        .extend(transition.named_operations.clone());
+        .extend(
+            transition
+                .named_operations
+                .into_iter()
+                .map(|operation| ScopedNamedOperation {
+                    scope_id: transition.scope_id.clone(),
+                    operation,
+                }),
+        );
     state.receipts_by_idempotency.insert(
         receipt.idempotency_key.clone(),
         (
@@ -550,7 +558,7 @@ impl MemoryStore {
             }
             _ => serde_json::to_value(json!({
                 "operation": format!("{:?}", query.operation),
-                "records": state.named_operations,
+                "records": state.named_operations.iter().map(|record| &record.operation).collect::<Vec<_>>(),
             })),
         };
         let payload = payload.map_err(|error| StoreError::Serialization(error.to_string()))?;
@@ -568,9 +576,9 @@ impl MemoryStore {
     ///
     /// Reads only actually captured observations: the `CaptureObservation`
     /// records stored by the commit path, in capture order, filtered by exact
-    /// `subject` match — never substring, never a default subject, never the
-    /// current scope view. Fence equality is enforced by the caller before
-    /// dispatch; the scope selector is required and echoed into the payload;
+    /// scope and `subject` match — never substring or a default scope.
+    /// The commit path retains each operation's admitted scope. The current
+    /// fence gates the read, not the visibility of historical observations;
     /// the explicit `max_records` bound caps the returned records with a
     /// visible `truncated` marker plus totals, while an over-bound request
     /// refuses with [`StoreError::PayloadTooLarge`] instead of returning a
@@ -587,37 +595,32 @@ impl MemoryStore {
         })?;
         // The catalogue gate already enforces presence and shape; re-check
         // fail-closed so this arm never depends on call order.
-        let subject =
-            query
-                .parameters
-                .get("subject")
-                .and_then(Value::as_str)
-                .ok_or(StoreError::InvalidField {
-                    field: "operation.parameter",
-                    reason: "missing required parameter",
-                })?;
+        let subject = query
+            .parameters
+            .get("subject")
+            .and_then(Value::as_str)
+            .ok_or(StoreError::InvalidField {
+                field: "operation.parameter",
+                reason: "missing required parameter",
+            })?;
         if subject.trim().is_empty() || subject.chars().any(char::is_control) {
             return Err(StoreError::InvalidField {
                 field: "operation.parameter",
                 reason: "subject must be a non-blank string",
             });
         }
-        let bound_raw =
-            query
-                .parameters
-                .get("max_records")
-                .and_then(Value::as_str)
-                .ok_or(StoreError::InvalidField {
-                    field: "operation.parameter",
-                    reason: "missing required parameter",
-                })?;
-        let max_records: u32 =
-            bound_raw
-                .parse()
-                .map_err(|_| StoreError::InvalidField {
-                    field: "operation.parameter",
-                    reason: "max_records must be a positive decimal bound",
-                })?;
+        let bound_raw = query
+            .parameters
+            .get("max_records")
+            .and_then(Value::as_str)
+            .ok_or(StoreError::InvalidField {
+                field: "operation.parameter",
+                reason: "missing required parameter",
+            })?;
+        let max_records: u32 = bound_raw.parse().map_err(|_| StoreError::InvalidField {
+            field: "operation.parameter",
+            reason: "max_records must be a positive decimal bound",
+        })?;
         if max_records == 0 {
             return Err(StoreError::InvalidField {
                 field: "operation.parameter",
@@ -627,17 +630,22 @@ impl MemoryStore {
         if max_records > EVIDENCE_PACK_MAX_RECORDS {
             return Err(StoreError::PayloadTooLarge);
         }
-        let limit =
-            usize::try_from(max_records).map_err(|_| StoreError::PayloadTooLarge)?;
+        let limit = usize::try_from(max_records).map_err(|_| StoreError::PayloadTooLarge)?;
         let matched: Vec<(usize, &eliot_store_api::NamedMutationRequest)> = state
             .named_operations
             .iter()
             .enumerate()
-            .filter(|(_, operation)| {
-                operation.operation == NamedMutationOperation::CaptureObservation
-                    && operation.parameters.get("subject").and_then(Value::as_str)
+            .filter(|(_, record)| {
+                record.scope_id == scope_id
+                    && record.operation.operation == NamedMutationOperation::CaptureObservation
+                    && record
+                        .operation
+                        .parameters
+                        .get("subject")
+                        .and_then(Value::as_str)
                         == Some(subject)
             })
+            .map(|(index, record)| (index, &record.operation))
             .collect();
         let matched_total = matched.len();
         let records: Vec<Value> = matched
@@ -969,6 +977,12 @@ fn genesis_receipt(
 }
 
 #[derive(Clone, Debug, PartialEq)]
+struct ScopedNamedOperation {
+    scope_id: ScopeId,
+    operation: eliot_store_api::NamedMutationRequest,
+}
+
+#[derive(Clone, Debug, PartialEq)]
 struct MemoryState {
     fences: Option<StateFence>,
     recovery_records: BTreeMap<RecoveryRecordKey, RecoveryRecord>,
@@ -980,7 +994,7 @@ struct MemoryState {
     projections: BTreeMap<String, ProjectionPublicationRecord>,
     outbox: BTreeMap<String, OutboxIntent>,
     relations: BTreeSet<String>,
-    named_operations: Vec<eliot_store_api::NamedMutationRequest>,
+    named_operations: Vec<ScopedNamedOperation>,
     manifests: BTreeMap<String, eliot_store_api::NamedOperationManifest>,
     next_commit_sequence: u64,
     next_outbox_sequence: u64,
@@ -1030,7 +1044,11 @@ impl MemoryState {
             projections: self.projections.values().cloned().collect(),
             outbox: self.outbox.values().cloned().collect(),
             relations: self.relations.iter().cloned().collect(),
-            named_operations: self.named_operations.clone(),
+            named_operations: self
+                .named_operations
+                .iter()
+                .map(|record| record.operation.clone())
+                .collect(),
         }
     }
 }
@@ -2260,6 +2278,122 @@ mod tests {
     }
 
     #[test]
+    fn evidence_pack_isolates_scopes_with_the_same_subject() -> Result<(), StoreError> {
+        let state_fence = fence();
+        let ctx = metadata(&state_fence)?;
+        let store = store()?;
+        for (index, scope) in ["scope-other", "scope-1"].into_iter().enumerate() {
+            let mut capture = capture_with_subject(
+                &format!("scope-capture-{index}"),
+                "shared-subject",
+                &state_fence,
+                &ctx,
+            )?;
+            capture.scope_id = ScopeId::new(scope)?;
+            capture.ordering_scopes = vec![OrderingScopeId::new(scope)?];
+            capture.identity.canonical_request_hash = canonical_request_hash(
+                &CanonicalRequestView::from_apply(&ctx, &capture, &[], &[]),
+            )?;
+            store.apply_transaction(&ctx, capture.clone(), &[], &[])?;
+            // Exact replay must not add an observation or shift its identity.
+            store.apply_transaction(&ctx, capture, &[], &[])?;
+        }
+        for (scope, expected_index) in [
+            ("scope-other", Some(0)),
+            ("scope-1", Some(1)),
+            ("scope-missing", None),
+        ] {
+            let response = store.execute_named_sync(&evidence_pack_query(
+                &state_fence,
+                Some(scope),
+                evidence_params("shared-subject", "1"),
+            )?)?;
+            let records = pack_records(&response.payload)?;
+            assert_eq!(records.len(), usize::from(expected_index.is_some()));
+            if let Some(index) = expected_index {
+                assert_eq!(records[0]["capture_index"], json!(index));
+            }
+            assert_eq!(
+                response.payload["provenance"]["matched_total"],
+                json!(records.len())
+            );
+            assert_eq!(response.payload["provenance"]["truncated"], json!(false));
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn evidence_pack_preserves_history_after_current_fence_advances() -> Result<(), StoreError> {
+        let initial = fence();
+        let ctx = metadata(&initial)?;
+        let store = store()?;
+        let receipt = store.apply_transaction(
+            &ctx,
+            capture_with_subject("historical-capture", "historical-subject", &initial, &ctx)?,
+            &[],
+            &[],
+        )?;
+        let query = evidence_pack_query(
+            &initial,
+            Some("scope-1"),
+            evidence_params("historical-subject", "1"),
+        )?;
+        let before = store.execute_named_sync(&query)?;
+        assert_eq!(pack_records(&before.payload)?.len(), 1);
+        let mut current = initial.clone();
+        for component in 0..5 {
+            match component {
+                0 => current.authority_epoch = test_epoch(2),
+                1 => {
+                    current.resource_generation =
+                        ResourceGeneration::new(2).map_err(StoreError::Foundation)?;
+                }
+                2 => {
+                    current.task_revision = Some(
+                        eliot_contracts::TaskRevision::new(2).map_err(StoreError::Foundation)?,
+                    );
+                }
+                3 => {
+                    current.policy_revision = Some(
+                        eliot_contracts::PolicyRevision::new(2).map_err(StoreError::Foundation)?,
+                    );
+                }
+                _ => {
+                    current.integration_revision = Some(
+                        eliot_contracts::IntegrationRevision::new(2)
+                            .map_err(StoreError::Foundation)?,
+                    );
+                }
+            }
+            // Fixture installs the new current fence. Historical observations
+            // and receipts stay untouched; lifecycle admission is outside this test.
+            store.lock_state()?.fences = Some(current.clone());
+            let mut current_query = query.clone();
+            current_query.state_fence = current.clone();
+            let response = store.execute_named_sync(&current_query)?;
+            assert_eq!(response.payload["records"], before.payload["records"]);
+            assert_eq!(response.payload["provenance"]["matched_total"], json!(1));
+            assert_eq!(
+                response.payload["provenance"]["state_fence"],
+                json!(current)
+            );
+            assert_eq!(response.state_fence, current);
+            assert_eq!(
+                store.execute_named_sync(&query),
+                Err(StoreError::FenceMismatch)
+            );
+            assert_eq!(
+                store
+                    .lock_state()?
+                    .receipts_by_operation
+                    .get("historical-capture"),
+                Some(&receipt),
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
     fn evidence_pack_returns_exact_captured_record_with_provenance() -> Result<(), StoreError> {
         // Slice T11.1: capture one real observation via the existing capture
         // path, then `GetEvidencePack` returns its exact record (identity)
@@ -2318,10 +2452,7 @@ mod tests {
             provenance.get("matched_total").and_then(Value::as_u64),
             Some(1)
         );
-        assert_eq!(
-            provenance.get("returned").and_then(Value::as_u64),
-            Some(1)
-        );
+        assert_eq!(provenance.get("returned").and_then(Value::as_u64), Some(1));
         assert_eq!(
             provenance.get("max_records").and_then(Value::as_u64),
             Some(10)
@@ -2427,11 +2558,8 @@ mod tests {
         let store = store()?;
 
         // Scope-addressed read without a scope.
-        let query = evidence_pack_query(
-            &state_fence,
-            None,
-            evidence_params("evidence-alpha", "10"),
-        )?;
+        let query =
+            evidence_pack_query(&state_fence, None, evidence_params("evidence-alpha", "10"))?;
         assert_eq!(
             store.execute_named_sync(&query),
             Err(StoreError::InvalidField {
@@ -2521,10 +2649,7 @@ mod tests {
             provenance.get("matched_total").and_then(Value::as_u64),
             Some(3)
         );
-        assert_eq!(
-            provenance.get("returned").and_then(Value::as_u64),
-            Some(2)
-        );
+        assert_eq!(provenance.get("returned").and_then(Value::as_u64), Some(2));
         assert_eq!(
             provenance.get("truncated").and_then(Value::as_bool),
             Some(true)
