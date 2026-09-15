@@ -140,8 +140,10 @@ GATE: PASS.
 ## 5. Push SHA + readiness
 
 - Pre-report HEAD (source gate): `839b1cb3984dcc2ab079f505b253558d59ff4686`
-- Post-report HEAD (pushed): `4ee085513b86b09aa162c5255d94446ec4d8cff6`
-  (`origin/work/830-context-admission-denominator` equals HEAD).
+- Chain: source-gate HEAD `839b1cb3` -> report body `4ee08551` -> SHA-record
+  `83d6b98c`. Final HEAD = the commit carrying this file version
+  (`git rev-parse origin/work/830-context-admission-denominator` equals local HEAD;
+  this final commit touches only this line).
 - Ready-for-verifier: YES (scoped nine-package gate PASS, diff exactly 7 source files
   in claimed dirs, root admission cleanly deferred with justification).
 - Residual steps for manager/owner (NOT done here): record owner-default-6 scoped gate
