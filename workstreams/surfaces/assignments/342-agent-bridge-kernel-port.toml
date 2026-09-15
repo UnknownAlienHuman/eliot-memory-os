@@ -1,0 +1,124 @@
+schema = "eliot.agent-work-unit.v1"
+authority = "NON_NORMATIVE_IMPLEMENTATION_ALLOCATION"
+routing_authority = "owning_issue_and_normative_pair_only"
+status = "READY_AFTER_ACTIVATION_V2_RECEIVER"
+implementation_support = "INERT_HOST_CONTRACT_WITH_UNAVAILABLE_PRODUCTION_PORT"
+evidence_execution_status = "SOURCE_AND_ISSUE_INSPECTED_TESTS_NOT_EXECUTED"
+proof_ceiling = "AGENT_BRIDGE_KERNEL_HOST_REQUEST_EDGE_CANDIDATE_ONLY"
+issue = 342
+parent_bridge_issue = 77
+activation_receiver_issue = 1095
+activation_producer_issue = 839
+input_bound_issue = 977
+parent_product_issue = 11
+normative_pair_ref = "docs/normative-pair.toml"
+
+[work_unit]
+cell_id = "surface.agent-bridge-kernel-host-request-port"
+causal_property = "One validated inert Agent Bridge host request is submitted, cancelled, replayed, reconciled, and answered through the exact authenticated Kernel operation identity while preserving principal, Session, task, WorkScope, StateFence, deadline, effect, and candidate-result boundaries."
+current_discriminator = "The host request contract and bridge handlers exist, but the production KernelHostRequestPort remains unavailable/unbound, so a valid bridge request cannot reach the real Kernel/Governor operation path."
+primary_issue_url = "https://github.com/UnknownAlienHuman/eliot-memory-os/issues/342"
+
+[documentation]
+architecture = [
+  "https://github.com/UnknownAlienHuman/eliot-memory-os/blob/main/docs/architecture/A10-01-agent-interaction-loop.md#a101-agent-interaction-loop",
+  "https://github.com/UnknownAlienHuman/eliot-memory-os/blob/main/docs/architecture/A12-02-principal-session-and-visibility.md#a122-principal-session-and-visibility",
+]
+implementation = [
+  "https://github.com/UnknownAlienHuman/eliot-memory-os/blob/main/docs/architecture/I07-01-eliot-bridge-protocol-ebp1.md#i71-eliot-bridge-protocol-ebp1",
+  "https://github.com/UnknownAlienHuman/eliot-memory-os/blob/main/docs/architecture/I07-02-frame.md#i72-frame",
+  "https://github.com/UnknownAlienHuman/eliot-memory-os/blob/main/docs/architecture/I07-17-scope-and-task-onboarding.md#i717-scope-and-task-onboarding",
+  "https://github.com/UnknownAlienHuman/eliot-memory-os/blob/main/docs/architecture/I07-20-agent-facing-error-contract.md#i720-agent-facing-error-contract",
+  "https://github.com/UnknownAlienHuman/eliot-memory-os/blob/main/docs/architecture/I07-24-tool-surface-economy-and-cognitive-exposure.md#i724-tool-surface-economy-and-cognitive-exposure",
+  "https://github.com/UnknownAlienHuman/eliot-memory-os/blob/main/docs/architecture/I14-20-canonical-runtime-lifecycle-vocabulary.md#i1420-canonical-runtime-lifecycle-vocabulary",
+  "https://github.com/UnknownAlienHuman/eliot-memory-os/blob/main/docs/architecture/I15-02-principal-and-session-binding.md#i152-principal-and-session-binding",
+]
+anchors = ["ARCH-AUTH-01", "ARCH-PORT-01", "ARCH-SEC-02", "ARCH-SWM-02", "ARCH-RES-04", "ARCH-OBS-01"]
+
+[current_source]
+confirmed = [
+  "Agent Bridge owns an inert bounded host contract and request dispatcher, not semantic or authority state.",
+  "A production KernelHostRequestPort implementation and composition binding are absent or explicitly unavailable.",
+  "The bridge input-bounding work remains separately owned by #977 and must compose before deserialization/dispatch.",
+  "Typed activation result transport is split between #1095 and #839 and must remain the onboarding owner rather than a bridge-local substitute.",
+]
+
+[scope]
+primary_paths = [
+  "crates/surfaces/eliot-mcp/src/host_gateway.rs",
+  "exact Agent Bridge composition and request-dispatch spans in bins/eliot-agent-bridge/src/**",
+  "exact Kernel host-request client/adapter and response mapping",
+  "directly relevant tests and finite fixtures",
+]
+serialized_dependencies = ["#977 bounded input", "#1095 Kernel activation result", "#839 daemon producer", "#77 full Agent Bridge", "#15/#18 Kernel/Governor", "#11 Product proof"]
+forbidden = [
+  "raw ForwardFrame or generic arbitrary protocol forwarding",
+  "bridge-local Session, task, WorkScope, authority, retry, Store, provider, or Finish owner",
+  "caller-selected Kernel pipe, principal, Session, scope, fence, capability, or operation authority",
+  "ambient credentials or broad inherited environment",
+  "blind retry after possible submission/effect",
+  "automatic workflow triggers",
+]
+
+[[waves]]
+id = "A"
+what = "Define and bind one authenticated production KernelHostRequestPort."
+how = [
+  "Construct the port only from the current installation, admitted Agent Bridge artifact/process generation, authenticated peer/connection, principal binding, AuthorityEpoch, StateFence, protocol revision, and permitted host operations.",
+  "Use closed typed host invocation and cancellation requests; do not expose raw frame forwarding or generic operation strings.",
+  "Keep bridge transport identity distinct from durable Kernel Session and semantic task identity.",
+]
+
+[[waves]]
+id = "B"
+what = "Submit and reconcile exact host operations."
+how = [
+  "Bind invocation to RequestIdentity, operation/effect identity, correlation, principal/Session, task/WorkScope, StateFence, deadline, cancellation, payload schema/digest, capability and privacy/effect ceiling.",
+  "Persist or delegate durable pending/unknown state to Kernel before acknowledging possible submission.",
+  "After a lost acknowledgement, reconcile the exact operation before retry; changed payload or owner binding under one identity conflicts.",
+]
+
+[[waves]]
+id = "C"
+what = "Preserve typed onboarding, cancellation, and result semantics."
+how = [
+  "Map all activation v2 outcomes through #1095/#839 without local defaulting or timeout coercion.",
+  "Cancellation targets only the exact still-cancellable operation and cannot erase a possibly committed external effect.",
+  "Return transport acceptance, semantic result, effect/commit status, evidence/candidate payload, and recovery directive as distinct fields.",
+]
+
+[[waves]]
+id = "D"
+what = "Compose bounded ingress and fail-closed recovery."
+how = [
+  "Run #977 record/JSON/typed validation before any Kernel port call and invoke zero handlers for malformed/oversized input.",
+  "On bridge, Kernel, daemon, Session, fence, deadline, or permit loss, reject new effects, close exact owned handles, and retain reconciling operations.",
+  "Expose bounded diagnostics without credentials, private payloads, or authority-bearing raw frames.",
+]
+
+[acceptance]
+criteria = [
+  "A real non-test KernelHostRequestPort implementation and production Agent Bridge composition caller exist.",
+  "A valid bounded host request reaches one exact Kernel operation; invalid, stale, oversized, malformed, unauthorized, or foreign input invokes zero Kernel operations.",
+  "Caller input cannot choose the Kernel endpoint, principal, Session, task, WorkScope, StateFence, capability, authority, or effect ceiling.",
+  "Transport connection/request identity remains distinct from Kernel Session, semantic task, physical attempt, and effect identity.",
+  "Exact replay is idempotent; changed same-identity payload, operation, principal, Session, scope, fence, deadline, or capability conflicts.",
+  "Possible submission/effect without acknowledgement remains unknown/reconciling and never triggers blind retry.",
+  "All seven activation v2 dispositions remain exact and immediately agent-visible.",
+  "Cancellation affects only the exact operation and preserves possible/unknown effects for reconciliation.",
+  "Raw ForwardFrame, arbitrary operation strings, permissive JSON authority, ambient secrets, and bridge-local semantic ownership are absent from production.",
+  "Bridge/Kernel/daemon restart and fence change preserve one terminal or exact reconciling result without orphaned handles.",
+  "Agent Bridge cannot write canonical state, issue authority, select task semantics, call providers, or produce VERIFIED_COMPLETE.",
+]
+
+[verification]
+commands = [
+  "cargo fmt --all -- --check",
+  "cargo check --locked -p eliot-mcp -p eliot-agent-bridge -p eliot-kernel-service -p eliot-kernel --all-targets",
+  "cargo test --locked -p eliot-mcp -p eliot-agent-bridge -p eliot-kernel-service -p eliot-kernel --all-targets",
+  "cargo clippy --locked -p eliot-mcp -p eliot-agent-bridge -p eliot-kernel-service -p eliot-kernel --all-targets -- -D warnings",
+  "python scripts/verify-agent-bridge-protocol.py",
+  "git diff --check",
+]
+edge_proof = "Run one real Agent Bridge host request through Kernel/Governor plus malformed/oversized input, all activation outcomes, replay/conflict, cancellation, lost acknowledgement, restart, stale fence, and unknown-effect reconciliation."
+product_proof = "Issues #77 and #11 remain open until installed attach/onboarding and Product evidence execute."
