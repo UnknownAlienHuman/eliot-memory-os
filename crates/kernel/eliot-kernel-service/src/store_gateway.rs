@@ -1121,23 +1121,19 @@ mod live_surreal_evidence_pack_e2e {
     //!   — the T11.1 acceptance live: one real capture, then `eliot.query`
     //!   returns the exact record/provenance with an explicit `Verification`
     //!   intent (free-text `query` stays intent data, never a selector), and
-    //!   wrong-fence / over-bound requests fail. This test is BLOCKED on the
-    //!   store substrate (see below) and currently fails at the capture step;
-    //!   it must not be weakened, ignored, or deleted.
+    //!   wrong-fence / over-bound requests fail. Green on base `67a1af95`
+    //!   (with `#1480`): the prior colon-binding substrate block no longer
+    //!   reproduces here; captures commit and the acceptance holds. The test
+    //!   must not be weakened, ignored, or deleted.
     //!
-    //! BLOCKED EDGE (store lane, not this item): `SurrealDB` 3.1.4 parses
-    //! colon-bearing strings in RPC `query` bindings into record pointers
-    //! (`RETURN $v` with `{"v":"scope:scope-t11-live"}` yields thing
-    //! `scope:scope`; dash-only strings survive). The adapter derives every
-    //! revision key as `scope:{scope_id}` (`plan.rs:644`) and writes it
-    //! through `type::record($revision_table, $revision_key)` plus a `TYPE
-    //! string` field (`schema.rs:186-187`, `apply/atomic_write.rs`), so NO
-    //! live capture can commit: the provider answers `Couldn't coerce value
-    //! for field revision_key ... Expected string but found scope:scope` and
-    //! the transaction rolls back atomically (`UnknownOutcome`). Fixing the
-    //! binding-safe key encoding belongs to the adapter owner
-    //! (`crates/storage/eliot-store-surreal-adapter/`, ASTRA T11.2); the
-    //! daemon-half proof above turns green unchanged once captures commit.
+    //! Prior substrate note (retained for traceability, not a current block):
+    //! on the older base the live capture rolled back with `Couldn't coerce
+    //! value for field revision_key ... Expected string but found
+    //! scope:scope` (`SurrealDB` 3.1.4 RPC `query` colon-binding coercion via
+    //! `scope:{scope_id}` keys in `plan.rs`, `schema.rs`, `apply/atomic_write.rs`).
+    //! That belonged to the adapter owner
+    //! (`crates/storage/eliot-store-surreal-adapter/`, ASTRA T11.2) and was
+    //! never touched here; on `67a1af95` the live capture commits unchanged.
 
     use std::collections::BTreeMap;
     use std::num::NonZeroU64;
