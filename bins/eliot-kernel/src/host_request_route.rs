@@ -49,14 +49,14 @@ use eliot_kernel_service::{AgentBridgeAdmissionDescriptor, KernelServiceState};
 use eliot_ors::{
     CONTRACT_VERSION as ORS_CONTRACT_VERSION, HostRequestKind as OrsHostRequestKind,
     HostRequestRecord, HostRequestState, OpaqueLabel, OperationIdentity, OrsError,
-};
-use eliot_protocol::{
+};use eliot_protocol::{
     AGENT_BRIDGE_PROCESS_BINDING_WIRE_ID, AgentActivationResolutionResult,
     AgentBridgePeerAdmissionReceipt, AgentBridgeProcessBinding, HOST_REQUEST_INVOKE_READ_WIRE_ID,
     HOST_REQUEST_RESULT_BODY_WIRE_ID, HostRequestAdmissionReceipt, HostRequestEnvelope,
     HostRequestInvokeReadPayload, HostRequestKind, HostRequestResultBody,
     host_request_operation_id,
 };
+use eliot_store_api::{EVIDENCE_PACK_MAX_RECORDS, ScopeId};
 
 /// Prefix of the deterministic opaque operation handle derived by
 /// [`host_request_operation_id`]. A parent operation reference carries the
@@ -1052,6 +1052,152 @@ pub(crate) fn host_request_tool_from_payload(
     Ok(tool)
 }
 
+/// Closed local-read selectors for one admitted `eliot.query` tool.
+///
+/// `scope_id` is the trusted Kernel-issued scope (envelope `work_scope_id`
+/// when present, else the admitted `session_id` — never an MCP argument),
+/// `subject` is the exact `subject:<exact-subject>` selector (never free
+/// text, never blank), `max_records` is the explicit catalogue bound, and
+/// `intent_mode` is the presented snake_case query mode. `eliot.packet` is
+/// not a query and yields no selectors; the packet path keeps its
+/// admission-only behaviour untouched.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct LocalReadSelectors {
+    pub(crate) scope_id: ScopeId,
+    pub(crate) subject: String,
+    pub(crate) max_records: u32,
+    pub(crate) intent_mode: String,
+}
+
+/// Derives the closed local-read selectors from one linked envelope+tool pair.
+///
+/// Returns `Ok(None)` for `eliot.packet` (non-goal: the packet path keeps its
+/// admission-only behaviour and never reaches the read leg). Fails closed as
+/// `SessionFenced` for any other tool name, for a capability mismatch, for a
+/// `CurrentPosition` intent (which never admits `GetEvidencePack`), for a
+/// present `exact_resource_uri` (exact expansion uses the resource path, not
+/// a query), for a non-exact `subject:` selector, and for a missing or blank
+/// trusted scope. Mirrors the `plan_evidence_pack_query` rules field-for-field
+/// without taking an MCP edge; linkage (capability + payload digest) must
+/// already be proven by the caller through [`HostRequestInvokeReadPayload`].
+/// Pure: deriving selectors performs no store IO.
+pub(crate) fn local_read_selectors_from_tool(
+    envelope: &HostRequestEnvelope,
+    tool: &serde_json::Value,
+) -> Result<Option<LocalReadSelectors>, TransportError> {
+    let object = tool.as_object().ok_or(TransportError::SessionFenced)?;
+    let name = object
+        .get("name")
+        .and_then(serde_json::Value::as_str)
+        .ok_or(TransportError::SessionFenced)?;
+    if name == "eliot.packet" {
+        return Ok(None);
+    }
+    if name != "eliot.query" || envelope.identity.capability != name {
+        return Err(TransportError::SessionFenced);
+    }
+    let arguments = object
+        .get("arguments")
+        .and_then(serde_json::Value::as_object)
+        .ok_or(TransportError::SessionFenced)?;
+    let intent = arguments
+        .get("intent")
+        .and_then(serde_json::Value::as_object)
+        .ok_or(TransportError::SessionFenced)?;
+    let mode = intent
+        .get("mode")
+        .and_then(serde_json::Value::as_str)
+        .ok_or(TransportError::SessionFenced)?;
+    if mode.trim().is_empty() || mode.chars().any(char::is_control) || mode == "current_position"
+    {
+        return Err(TransportError::SessionFenced);
+    }
+    if arguments
+        .get("exact_resource_uri")
+        .is_some_and(|value| !value.is_null())
+    {
+        return Err(TransportError::SessionFenced);
+    }
+    let subject = arguments
+        .get("query")
+        .and_then(serde_json::Value::as_str)
+        .and_then(|query| query.strip_prefix("subject:"))
+        .map(str::trim)
+        .filter(|subject| !subject.is_empty() && !subject.chars().any(char::is_control))
+        .ok_or(TransportError::SessionFenced)?;
+    let scope_text = envelope
+        .identity
+        .work_scope_id
+        .as_deref()
+        .filter(|scope| !scope.trim().is_empty())
+        .or_else(|| {
+            envelope
+                .identity
+                .session_id
+                .as_deref()
+                .filter(|scope| !scope.trim().is_empty())
+        })
+        .ok_or(TransportError::SessionFenced)?;
+    let scope_id = ScopeId::new(scope_text).map_err(|_| TransportError::SessionFenced)?;
+    Ok(Some(LocalReadSelectors {
+        scope_id,
+        subject: subject.to_owned(),
+        max_records: EVIDENCE_PACK_MAX_RECORDS,
+        intent_mode: mode.to_owned(),
+    }))
+}
+
+/// Validates one local-read admission before any store read (no IO).
+///
+/// Runs the exact invoke-read linkage gate ([`HostRequestInvokeReadPayload`])
+/// plus the closed selector derivation, so a changed payload digest, a forged
+/// descriptor or capability, or a malformed selector is rejected before the
+/// caller performs any Gateway IO. Pure: validation performs no IO by
+/// construction, which is the rejection-before-reading proof.
+pub(crate) fn check_local_read_admission(
+    envelope: &HostRequestEnvelope,
+    tool: &serde_json::Value,
+) -> Result<Option<LocalReadSelectors>, TransportError> {
+    HostRequestInvokeReadPayload {
+        wire_id: HOST_REQUEST_INVOKE_READ_WIRE_ID.to_owned(),
+        wire_version: HostRequestInvokeReadPayload::CONTRACT_VERSION,
+        envelope: envelope.clone(),
+        tool: tool.clone(),
+    }
+    .validate()
+    .map_err(|_| TransportError::SessionFenced)?;
+    local_read_selectors_from_tool(envelope, tool)
+}
+
+/// Serves an exact replay of a resulted operation without re-dispatch (no IO).
+///
+/// Returns the admitted response when the durable record already carries both
+/// halves of the digest-bound result pair (validated through
+/// [`HostRequestResultBody`]); `None` for live or half-present rows, which
+/// take the fresh-answer leg instead of serving a partial answer. A forged
+/// pair fails closed instead of serving. Pure: readback performs no dispatch
+/// and no store IO by construction.
+pub(crate) fn local_read_replay_response(
+    receipt: &HostRequestAdmissionReceipt,
+    record: &HostRequestRecord,
+    envelope: &HostRequestEnvelope,
+) -> Result<Option<serde_json::Value>, TransportError> {
+    let (Some(digest), Some(body)) = (&record.result_digest, &record.result_response) else {
+        return Ok(None);
+    };
+    HostRequestResultBody {
+        wire_id: HOST_REQUEST_RESULT_BODY_WIRE_ID.to_owned(),
+        wire_version: HostRequestResultBody::CONTRACT_VERSION,
+        operation_id: receipt.operation_id.clone(),
+        request_sha256: envelope.envelope_sha256.clone(),
+        result_digest: digest.clone(),
+        response: body.clone(),
+    }
+    .validate()
+    .map_err(|_| TransportError::SessionFenced)?;
+    Ok(Some(host_request_admitted_response(receipt, record)))
+}
+
 /// Decodes the exact typed admission receipt from a rehydrate payload.
 ///
 /// The receipt is re-validated against the presenting envelope by
@@ -1368,6 +1514,209 @@ mod invoke_read_tool_tests {
             host_request_tool_from_payload(&missing),
             Err(TransportError::SessionFenced),
             "missing tool bytes must be rejected before reading"
+        );
+    }
+
+    fn packet_tool() -> serde_json::Value {
+        serde_json::json!({"name":"eliot.packet","arguments":{
+            "packet_ref": null,
+            "material_refs": []
+        }})
+    }
+
+    #[test]
+    fn local_read_selectors_serve_exact_triple_for_captured_subject() {
+        let tool = query_tool();
+        let envelope = test_envelope("eliot.query", &tool_digest(&tool));
+        let selectors = local_read_selectors_from_tool(&envelope, &tool)
+            .expect("admitted query must yield selectors")
+            .expect("eliot.query is a local read");
+        assert_eq!(selectors.subject, "evidence-alpha");
+        assert_eq!(selectors.scope_id.as_str(), "kernel-session-1");
+        assert_eq!(selectors.max_records, 32);
+        assert_eq!(selectors.intent_mode, "verification");
+    }
+
+    #[test]
+    fn local_read_packet_yields_no_selectors_and_keeps_admission_path() {
+        let tool = packet_tool();
+        let envelope = test_envelope("eliot.packet", &tool_digest(&tool));
+        assert_eq!(
+            local_read_selectors_from_tool(&envelope, &tool)
+                .expect("packet must not fail selector derivation"),
+            None,
+            "packet stays on the admission-only leg and never reaches the read"
+        );
+    }
+
+    #[test]
+    fn local_read_rejects_non_exact_selectors_before_reading() {
+        let tool = query_tool();
+        let envelope = test_envelope("eliot.query", &tool_digest(&tool));
+
+        // Free-text query is never an exact selector.
+        let mut free_text = tool.clone();
+        free_text["arguments"]["query"] = serde_json::json!("evidence alpha");
+        assert_eq!(
+            local_read_selectors_from_tool(&envelope, &free_text),
+            Err(TransportError::SessionFenced),
+            "free-text query must be rejected before reading"
+        );
+
+        // CurrentPosition intent never admits GetEvidencePack.
+        let mut position = tool.clone();
+        position["arguments"]["intent"]["mode"] = serde_json::json!("current_position");
+        assert_eq!(
+            local_read_selectors_from_tool(&envelope, &position),
+            Err(TransportError::SessionFenced),
+            "position intent must be rejected before reading"
+        );
+
+        // Exact resource expansion uses the resource path, not a query.
+        let mut with_uri = tool.clone();
+        with_uri["arguments"]["exact_resource_uri"] =
+            serde_json::json!("eliot://resource/evidence-1");
+        assert_eq!(
+            local_read_selectors_from_tool(&envelope, &with_uri),
+            Err(TransportError::SessionFenced),
+            "exact resource URI must be rejected before reading"
+        );
+
+        // A blank subject proves nothing.
+        let mut blank = tool.clone();
+        blank["arguments"]["query"] = serde_json::json!("subject:   ");
+        assert_eq!(
+            local_read_selectors_from_tool(&envelope, &blank),
+            Err(TransportError::SessionFenced),
+            "blank subject must be rejected before reading"
+        );
+
+        // A foreign tool name is never the admitted operation.
+        let mut foreign = tool.clone();
+        foreign["name"] = serde_json::json!("eliot.state");
+        assert_eq!(
+            local_read_selectors_from_tool(&envelope, &foreign),
+            Err(TransportError::SessionFenced),
+            "foreign tool name must be rejected before reading"
+        );
+
+        // No trusted scope, no read: neither work scope nor session is bound.
+        let mut noscope = test_envelope("eliot.query", &tool_digest(&tool));
+        noscope.identity.work_scope_id = None;
+        noscope.identity.session_id = None;
+        assert_eq!(
+            local_read_selectors_from_tool(&noscope, &tool),
+            Err(TransportError::SessionFenced),
+            "missing trusted scope must be rejected before reading"
+        );
+    }
+
+    #[test]
+    fn check_local_read_admission_rejects_forgery_without_io() {
+        let tool = query_tool();
+        let envelope = test_envelope("eliot.query", &tool_digest(&tool));
+        assert!(
+            check_local_read_admission(&envelope, &tool)
+                .expect("admitted query must validate")
+                .is_some(),
+            "the admitted query carries selectors"
+        );
+
+        // A changed payload under the same envelope digest is rejected before
+        // any read: the digest no longer binds the presented bytes.
+        let mut changed = tool.clone();
+        changed["arguments"]["query"] = serde_json::json!("subject:forged-subject");
+        assert_eq!(
+            check_local_read_admission(&envelope, &changed),
+            Err(TransportError::SessionFenced),
+            "changed payload digest must be rejected before reading"
+        );
+
+        // A tool bound to another capability is rejected the same way.
+        let other_envelope = test_envelope("eliot.state", &tool_digest(&tool));
+        assert_eq!(
+            check_local_read_admission(&other_envelope, &tool),
+            Err(TransportError::SessionFenced),
+            "capability mismatch must be rejected before reading"
+        );
+
+        // Packet passes linkage and yields no selectors: admission-only leg.
+        let packet = packet_tool();
+        let packet_envelope = test_envelope("eliot.packet", &tool_digest(&packet));
+        assert_eq!(
+            check_local_read_admission(&packet_envelope, &packet)
+                .expect("packet linkage must validate"),
+            None,
+            "packet keeps the admission-only path"
+        );
+    }
+
+    #[test]
+    fn local_read_replay_serves_exact_result_without_redispatch() {
+        use eliot_contracts::{canonical_json_bytes, sha256_hex};
+        let tool = query_tool();
+        let envelope = test_envelope("eliot.query", &tool_digest(&tool));
+        let receipt =
+            HostRequestAdmissionReceipt::issue(&envelope).expect("receipt must issue");
+        let mut record =
+            requested_host_request_record(&envelope).expect("record must build");
+
+        // A live row takes the fresh leg: no stored body, no replay.
+        assert_eq!(
+            local_read_replay_response(&receipt, &record, &envelope)
+                .expect("live row must not fail"),
+            None,
+            "live operations never serve a stored body"
+        );
+
+        // A resulted row serves its exact bounded body with the revision inline.
+        let body = serde_json::json!({
+            "operation": "GetEvidencePack",
+            "subject": "evidence-alpha",
+            "evidence_pack": {"subject": "evidence-alpha"},
+            "revision_heads": [{"key": "scope:kernel-session-1", "revision": 3}],
+        });
+        let digest =
+            sha256_hex(&canonical_json_bytes(&body).expect("body must canonicalize"));
+        record.result_digest = Some(digest.clone());
+        record.result_response = Some(body.clone());
+        let replayed = local_read_replay_response(&receipt, &record, &envelope)
+            .expect("resulted row must serve")
+            .expect("resulted row must replay");
+        assert_eq!(
+            replayed["value"]["record"]["result_digest"],
+            serde_json::json!(digest),
+            "the replay carries the exact stored digest"
+        );
+        assert_eq!(
+            replayed["value"]["record"]["result_response"], body,
+            "the replay carries the exact stored body"
+        );
+        let again = local_read_replay_response(&receipt, &record, &envelope)
+            .expect("replay must be repeatable")
+            .expect("replay must stay exact");
+        assert_eq!(
+            replayed, again,
+            "replay is byte-exact across calls with no dispatch"
+        );
+
+        // A forged digest fails closed instead of serving.
+        let mut forged = record.clone();
+        forged.result_digest = Some("0".repeat(64));
+        assert_eq!(
+            local_read_replay_response(&receipt, &forged, &envelope),
+            Err(TransportError::SessionFenced),
+            "forged digest must be rejected before serving"
+        );
+
+        // A half-present pair never serves as an answer.
+        let mut half = record.clone();
+        half.result_response = None;
+        assert_eq!(
+            local_read_replay_response(&receipt, &half, &envelope)
+                .expect("half-present pair must not fail"),
+            None,
+            "a half-present pair takes the fresh leg, never a partial serve"
         );
     }
 }
