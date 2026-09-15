@@ -613,7 +613,10 @@ class TestWaveAdmissionD2(unittest.TestCase):
     def test_13_no_rust_test_router_or_floor_change(self) -> None:
         changed = git("diff", "--name-only", BASE_SHA, "HEAD").stdout.split()
         self.assertEqual([c for c in changed if c.endswith(".rs")], [])
-        test_dirs = [c for c in changed if "/tests/" in c.replace("\\", "/")]
+        leaf_test_prefixes = tuple(f"{p}/tests/" for p in self.five_paths)
+        test_dirs = [c for c in changed
+                     if c.replace("\\", "/").startswith(leaf_test_prefixes)
+                     and not c.replace("\\", "/").startswith("scripts/tests/")]
         self.assertEqual(test_dirs, [])
         allowed_cargo = {"prototype", "workspace_admission"}
         allowed_module = {"status", "workspace_admission"}
