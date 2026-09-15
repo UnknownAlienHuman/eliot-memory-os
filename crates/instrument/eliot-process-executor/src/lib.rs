@@ -171,12 +171,22 @@ impl CaptureFailureDisposition {
 
 #[cfg(windows)]
 struct DeadlineWatcher {
+    /// Operation-bound owner identity (`deadline-watcher:<operation-id>`)
+    /// minted at spawn. The watcher thread enforces the wall deadline for
+    /// exactly this operation; the owner travels with the watcher so
+    /// restart/shutdown containment attributes every join to one op.
+    owner: String,
     stop: Arc<AtomicBool>,
     handle: Option<JoinHandle<()>>,
 }
 
 #[cfg(windows)]
 impl DeadlineWatcher {
+    /// Returns the operation-bound owner identity of this watcher.
+    fn owner(&self) -> &str {
+        &self.owner
+    }
+
     fn stop_and_join(mut self) -> Result<(), ProcessExecutionError> {
         self.stop.store(true, Ordering::Release);
         let Some(handle) = self.handle.take() else {
@@ -209,6 +219,17 @@ struct Operation {
     stderr_thread: Option<JoinHandle<()>>,
     deadline: Instant,
     deadline_watcher: Option<DeadlineWatcher>,
+    /// Operation-bound watcher owner identity minted when the deadline
+    /// watcher spawns (`deadline-watcher:<operation-id>`). Retained after
+    /// the watcher joins so health/quarantine/shutdown projections keep
+    /// attributing wall-time enforcement ownership to exactly one op.
+    deadline_watcher_owner: Option<String>,
+    /// Whether the complete Job tree was terminated through the admitted
+    /// process owner because the deadline watcher could not be installed
+    /// after resume. Part of the fail-closed evidence: reconcile/shutdown
+    /// can distinguish "child never had autonomous enforcement" from
+    /// "child was contained and the tree was torn down".
+    watcher_fail_closed_contained: bool,
     timed_out: bool,
     cleanup_required: bool,
     termination: Option<TerminatedJobChild>,
@@ -233,6 +254,19 @@ pub struct QuarantinedOperationRecord {
     lifecycle: ProcessLifecycle,
     evidence_gap: &'static str,
     capture_failures: Vec<(String, &'static str)>,
+    /// Operation-bound deadline-watcher owner (`deadline-watcher:<op>`) when
+    /// wall-time enforcement was installed for this op; `None` when the
+    /// watcher never started. Exposes watcher identity/ownership through the
+    /// health/quarantine projection instead of hiding it in executor state.
+    deadline_watcher_owner: Option<String>,
+    /// Whether wall-time enforcement is autonomously installed for this op.
+    /// `false` means the admitted deadline relies on external polling or has
+    /// no live watcher — the exact signal issue #83 requires separated from
+    /// stream-capture health.
+    wall_time_enforcement_installed: bool,
+    /// Whether the Job tree was terminated through the admitted process
+    /// owner on the fail-closed watcher-spawn path (issue #83 §2).
+    watcher_fail_closed_contained: bool,
     descendants_complete: Option<bool>,
     tree_terminated: Option<bool>,
     cleanup_pending: bool,
@@ -288,6 +322,34 @@ impl QuarantinedOperationRecord {
         &self.capture_failures
     }
 
+    /// Returns the operation-bound deadline-watcher owner bound to this op.
+    ///
+    /// `Some("deadline-watcher:<operation-id>")` when wall-time enforcement
+    /// was installed for this operation; `None` when the watcher never
+    /// started (issue #83 watcher identity/ownership record).
+    #[must_use]
+    pub fn deadline_watcher_owner(&self) -> Option<&str> {
+        self.deadline_watcher_owner.as_deref()
+    }
+
+    /// Returns whether autonomous wall-time enforcement is installed.
+    ///
+    /// This is the wall-time dimension required by issue #83 §5, kept
+    /// separate from stream-capture health: a `false` here with empty
+    /// `capture_failures` means the op lost (or never gained) its deadline
+    /// watcher, not that its streams are broken.
+    #[must_use]
+    pub const fn wall_time_enforcement_installed(&self) -> bool {
+        self.wall_time_enforcement_installed
+    }
+
+    /// Returns whether the Job tree was terminated through the admitted
+    /// process owner on the fail-closed watcher-spawn path.
+    #[must_use]
+    pub const fn watcher_fail_closed_contained(&self) -> bool {
+        self.watcher_fail_closed_contained
+    }
+
     /// Returns the observed descendant completeness, when a view exists.
     #[must_use]
     pub const fn descendants_complete(&self) -> Option<bool> {
@@ -330,6 +392,10 @@ pub struct ExecutorHealthSummary {
     pub cancellation_available: bool,
     /// Number of registered operations with incomplete capture/evidence.
     pub capture_incomplete_operations: usize,
+    /// Number of registered operations whose autonomous wall-time
+    /// enforcement is missing (watcher never installed or lost), kept
+    /// separate from `capture_incomplete_operations` per issue #83 §5.
+    pub wall_time_enforcement_missing_operations: usize,
     /// Number of registered operations awaiting cleanup/reconciliation.
     pub cleanup_pending_operations: usize,
     /// Number of registered operations fenced as unknown outcome.
@@ -488,6 +554,14 @@ impl WindowsProcessExecutor {
                     || !record.capture_failures().is_empty()
             })
             .count();
+        // Wall-time enforcement health is a separate dimension from
+        // stream-capture health (issue #83 §5): a missing watcher fences
+        // with `WATCHER_EVIDENCE_GAP` and counts here even when both
+        // streams are complete.
+        let wall_time_enforcement_missing_operations = quarantined_operations
+            .iter()
+            .filter(|record| !record.wall_time_enforcement_installed())
+            .count();
         let cleanup_pending_operations = quarantined_operations
             .iter()
             .filter(|record| record.cleanup_pending())
@@ -504,9 +578,35 @@ impl WindowsProcessExecutor {
             inspection_available: true,
             cancellation_available: true,
             capture_incomplete_operations,
+            wall_time_enforcement_missing_operations,
             cleanup_pending_operations,
             unknown_outcome_operations,
             quarantined_operations,
+        }
+    }
+
+    /// Returns the number of registered operations whose autonomous
+    /// wall-time enforcement is missing (issue #83 §5), without blocking on
+    /// operation locks. Registry access failures report `0`.
+    #[must_use]
+    pub fn wall_time_enforcement_missing_count(&self) -> usize {
+        #[cfg(windows)]
+        {
+            let Ok(registry) = self.operations.lock() else {
+                return 0;
+            };
+            registry
+                .values()
+                .filter(|operation| {
+                    operation.lock().is_ok_and(|guard| {
+                        guard.deadline_watcher.is_none() && guard.deadline_watcher_owner.is_none()
+                    })
+                })
+                .count()
+        }
+        #[cfg(not(windows))]
+        {
+            0
         }
     }
 
@@ -555,6 +655,52 @@ impl WindowsProcessExecutor {
     #[must_use]
     pub fn new_start_ready(&self) -> bool {
         self.reservations.try_lock().is_ok()
+    }
+
+    /// Returns the operation-bound deadline-watcher owner for one op.
+    ///
+    /// `Some("deadline-watcher:<operation-id>")` once the watcher spawns;
+    /// `None` while the watcher never started (issue #83 watcher
+    /// identity/ownership record, queryable per op).
+    #[must_use]
+    pub fn deadline_watcher_owner(&self, id: &OperationId) -> Option<String> {
+        #[cfg(windows)]
+        {
+            self.operation(id).ok().and_then(|operation| {
+                operation
+                    .lock()
+                    .ok()
+                    .and_then(|guard| guard.deadline_watcher_owner.clone())
+            })
+        }
+        #[cfg(not(windows))]
+        {
+            let _ = (self.operation(id), id);
+            None
+        }
+    }
+
+    /// Returns whether autonomous wall-time enforcement is installed for one
+    /// op. Separate from stream-capture health and from the operation result
+    /// per issue #83 §5: `Some(true)` means a deadline watcher was installed
+    /// for this op (live or already joined after terminal close);
+    /// `Some(false)` means the admitted deadline has no watcher owner;
+    /// `None` means the op is absent/unlockable.
+    #[must_use]
+    pub fn wall_time_enforcement_installed(&self, id: &OperationId) -> Option<bool> {
+        #[cfg(windows)]
+        {
+            self.operation(id).ok().and_then(|operation| {
+                operation.lock().ok().map(|guard| {
+                    guard.deadline_watcher.is_some() || guard.deadline_watcher_owner.is_some()
+                })
+            })
+        }
+        #[cfg(not(windows))]
+        {
+            let _ = (self.operation(id), id);
+            None
+        }
     }
 
     /// Returns the retained non-authoritative stream projections.
@@ -701,11 +847,32 @@ impl WindowsProcessExecutor {
                     quarantine_operation(&mut guard);
                     retain_cleanup_owners = true;
                 }
+                // Shutdown containment attributes every watcher join to its
+                // operation-bound owner (issue #83: restart/shutdown can
+                // identify and contain every watcher/Job owner): the owner
+                // stays on the op after the thread is taken, so the join
+                // below is per-op identifiable even while the thread runs.
                 if let Some(watcher) = guard.deadline_watcher.take() {
-                    watcher_owners.push((id.clone(), Arc::clone(operation), watcher));
+                    let owner_label = guard
+                        .deadline_watcher_owner
+                        .clone()
+                        .unwrap_or_else(|| deadline_watcher_owner_id(id));
+                    watcher_owners.push((id.clone(), Arc::clone(operation), owner_label, watcher));
                 }
             }
-            for (id, operation, watcher) in watcher_owners {
+            for (id, operation, owner_label, watcher) in watcher_owners {
+                let expected = deadline_watcher_owner_id(&id);
+                // Owner check first: a mismatched watcher must never join (or
+                // drop) another op's enforcement thread. Fence this op and
+                // retain it; every other op already got its own attempt.
+                if owner_label != expected || watcher.owner() != expected {
+                    let mut guard = operation
+                        .lock()
+                        .map_err(|_| operation_unavailable(&id, "operation lock"))?;
+                    quarantine_operation(&mut guard);
+                    retain_cleanup_owners = true;
+                    continue;
+                }
                 if join_deadline_watcher(watcher).is_err() {
                     let mut guard = operation
                         .lock()
@@ -893,6 +1060,8 @@ impl ProcessExecutor for WindowsProcessExecutor {
                 stderr_thread,
                 deadline,
                 deadline_watcher: None,
+                deadline_watcher_owner: None,
+                watcher_fail_closed_contained: false,
                 timed_out: false,
                 cleanup_required: false,
                 termination: None,
@@ -925,17 +1094,30 @@ impl ProcessExecutor for WindowsProcessExecutor {
                 let _ = quarantine_snapshot(&operation_id, &guard, CAPTURE_EVIDENCE_GAP);
                 return Err(error);
             }
-            let Ok(deadline_watcher) = spawn_deadline_watcher(&operation) else {
-                // Same isolation contour as the capture-spawn path: the
-                // watcher-less operation is registered first so it stays
-                // inspectable/cancellable/reconcilable, fenced locally, and
-                // never blocks independent operations.
+            // Mint the operation-bound watcher owner BEFORE installing the
+            // thread so ownership is queryable from the moment enforcement
+            // exists (issue #83 §1), then hand the minted owner to the
+            // watcher spawn. The watcher thread owns the wall deadline
+            // independently of inspect()/reconcile() polling.
+            let watcher_owner = deadline_watcher_owner_id(&operation_id);
+            let Ok(deadline_watcher) = spawn_deadline_watcher(&operation_id, &operation) else {
+                // Fail closed AFTER resume (issue #83 §2): the child is
+                // already running, so terminate/contain the COMPLETE Job
+                // tree through the admitted process owner
+                // (`finalize_operation` → `terminate_in_place` with
+                // descendant/exit evidence), THEN fence locally as
+                // UnknownOutcome and return the typed unknown/failed start —
+                // never a normal receipt. The op is registered first so it
+                // stays inspectable/cancellable/reconcilable, and no
+                // unrelated op is touched (#82 operation-local contour).
                 let mut guard = operation
                     .lock()
                     .map_err(|_| unavailable("operation lock poisoned"))?;
                 if finalize_operation(&mut guard, ExitDisposition::Unknown, false).is_err() {
-                    quarantine_operation(&mut guard);
+                    // Finalize already stored partial termination/cleanup
+                    // evidence on the op; fall through to fencing.
                 }
+                guard.watcher_fail_closed_contained = true;
                 quarantine_operation(&mut guard);
                 let _ = quarantine_snapshot(&operation_id, &guard, WATCHER_EVIDENCE_GAP);
                 drop(guard);
@@ -959,6 +1141,11 @@ impl ProcessExecutor for WindowsProcessExecutor {
                 return Err(ProcessExecutionError::UnknownOutcome);
             };
             guard.deadline_watcher = Some(deadline_watcher);
+            // Bind the minted owner to the operation only after the thread
+            // installed successfully, so a queryable owner always implies a
+            // real enforcement thread (receipt publication under #84 happens
+            // below, after ALL mandatory control owners are installed).
+            guard.deadline_watcher_owner = Some(watcher_owner);
             let view = guard.state.view();
             let sink = Arc::clone(&guard.sink);
             drop(guard);
@@ -1375,7 +1562,7 @@ const CAPTURE_EVIDENCE_GAP: &str = "capture-thread spawn failed";
 #[cfg(windows)]
 const SINK_EVIDENCE_GAP: &str = "initial evidence sink publication failed";
 #[cfg(windows)]
-const WATCHER_EVIDENCE_GAP: &str = "deadline watcher unavailable";
+const WATCHER_EVIDENCE_GAP: &str = "deadline watcher spawn failed";
 #[cfg(windows)]
 const RECEIPT_EVIDENCE_GAP: &str = "start receipt binding invalid";
 #[cfg(windows)]
@@ -1403,6 +1590,9 @@ fn quarantine_snapshot(
             .iter()
             .map(|failure| (failure.stream.to_owned(), failure.disposition.as_str()))
             .collect(),
+        deadline_watcher_owner: operation.deadline_watcher_owner.clone(),
+        wall_time_enforcement_installed: operation.deadline_watcher_owner.is_some(),
+        watcher_fail_closed_contained: operation.watcher_fail_closed_contained,
         descendants_complete: descendants.map(DescendantEvidence::complete),
         tree_terminated: descendants.map(DescendantEvidence::tree_terminated),
         cleanup_pending: operation.cleanup_required
@@ -1424,11 +1614,17 @@ fn quarantined_record(
     let view = operation.state.view();
     let binding = view.binding();
     let descendants = view.descendants();
-    let evidence_gap = if operation.capture_failures.is_empty() {
-        "unknown outcome fenced; cleanup/reconciliation pending"
-    } else {
-        CAPTURE_EVIDENCE_GAP
-    };
+    // Wall-time enforcement health is an explicit dimension, separate from
+    // stream-capture health (issue #83 §5): a missing watcher owner surfaces
+    // the watcher gap even when both streams are complete.
+    let evidence_gap =
+        if operation.deadline_watcher_owner.is_none() && operation.watcher_fail_closed_contained {
+            WATCHER_EVIDENCE_GAP
+        } else if operation.capture_failures.is_empty() {
+            "unknown outcome fenced; cleanup/reconciliation pending"
+        } else {
+            CAPTURE_EVIDENCE_GAP
+        };
     Some(QuarantinedOperationRecord {
         operation_id: id.clone(),
         process_tree_id: binding.process_tree_id().clone(),
@@ -1442,6 +1638,9 @@ fn quarantined_record(
             .iter()
             .map(|failure| (failure.stream.to_owned(), failure.disposition.as_str()))
             .collect(),
+        deadline_watcher_owner: operation.deadline_watcher_owner.clone(),
+        wall_time_enforcement_installed: operation.deadline_watcher_owner.is_some(),
+        watcher_fail_closed_contained: operation.watcher_fail_closed_contained,
         descendants_complete: descendants.map(DescendantEvidence::complete),
         tree_terminated: descendants.map(DescendantEvidence::tree_terminated),
         cleanup_pending: operation.cleanup_required
@@ -1458,8 +1657,19 @@ fn quarantined_record(
     None
 }
 
+/// Mints the operation-bound deadline-watcher owner identity.
+///
+/// Pure helper (no I/O, no locks) so receipt publication order (#84) and
+/// watcher installation order can both be audited against the same minted
+/// value: `deadline-watcher:<operation-id>`.
+#[cfg(windows)]
+fn deadline_watcher_owner_id(operation_id: &OperationId) -> String {
+    format!("deadline-watcher:{}", operation_id.as_str())
+}
+
 #[cfg(windows)]
 fn spawn_deadline_watcher(
+    operation_id: &OperationId,
     operation: &Arc<Mutex<Operation>>,
 ) -> Result<DeadlineWatcher, ProcessExecutionError> {
     #[cfg(test)]
@@ -1467,12 +1677,20 @@ fn spawn_deadline_watcher(
         return Err(unavailable("injected deadline watcher spawn failure"));
     }
 
+    // Operation-bound owner minted BEFORE the thread exists so every join,
+    // shutdown sweep, and quarantine projection attributes this watcher to
+    // exactly one operation (issue #83 §1).
+    let owner = deadline_watcher_owner_id(operation_id);
+    let thread_owner = owner.clone();
     let stop = Arc::new(AtomicBool::new(false));
     let thread_stop = Arc::clone(&stop);
     let operation = Arc::downgrade(operation);
     let handle = thread::Builder::new()
         .name("eliot-p04-deadline".to_owned())
         .spawn(move || {
+            // Autonomous wall-time enforcement: this loop owns the admitted
+            // deadline and fences the operation on breach every 25ms without
+            // waiting for any inspect()/reconcile() poll (issue #83 §4).
             loop {
                 if thread_stop.load(Ordering::Acquire) {
                     return;
@@ -1490,6 +1708,12 @@ fn spawn_deadline_watcher(
                 if guard.state.view().lifecycle().is_terminal() {
                     return;
                 }
+                // Enforce ownership: only refresh the op this watcher was
+                // minted for. A mismatched owner is a logic error, never a
+                // reason to touch another op's Job.
+                if guard.deadline_watcher_owner.as_deref() != Some(thread_owner.as_str()) {
+                    return;
+                }
                 if refresh_operation(&mut guard).is_err() {
                     // A failed observation is an external-state gap, not a
                     // reason to detach the Job.  Fence the operation as
@@ -1502,6 +1726,7 @@ fn spawn_deadline_watcher(
         })
         .map_err(|error| unavailable(format!("deadline watcher spawn failed: {error}")))?;
     Ok(DeadlineWatcher {
+        owner,
         stop,
         handle: Some(handle),
     })
