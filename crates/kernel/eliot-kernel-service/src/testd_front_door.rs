@@ -167,6 +167,19 @@ pub fn advertise_testd_admission() -> bool {
     TESTD_ADMISSION_ADVERTISED
 }
 
+/// Returns whether Kernel advertises the testd admission operation through
+/// the composed dispatch contour.
+///
+/// The inert [`TESTD_ADMISSION_ADVERTISED`] default never flips in place:
+/// this path returns `true` only when `dispatch_contour_composed` proves
+/// the binary-slice contour cell holds the Kernel-owned principal owner
+/// (testd admission is stateless, so the contour cell is the only
+/// composition it needs). An uncomposed Kernel keeps failing closed.
+#[must_use]
+pub fn advertise_testd_admission_when_composed(dispatch_contour_composed: bool) -> bool {
+    dispatch_contour_composed
+}
+
 /// Routes one wire identity to the testd admission gate.
 ///
 /// Returns `true` only for the exact
@@ -1089,4 +1102,20 @@ pub fn reconcile_testd_admission(
 #[must_use]
 pub fn is_testd_diagnosis_only_envelope(envelope: &TestdAdmissionEnvelope) -> bool {
     envelope.operation_id.is_none()
+}
+
+#[cfg(test)]
+mod tests {
+    #![allow(clippy::expect_used, clippy::unwrap_used, clippy::panic)]
+
+    use super::*;
+
+    /// The inert default never flips in place: the composed-aware path
+    /// advertises only through the composed contour cell.
+    #[test]
+    fn testd_advertisement_flips_only_when_composed() {
+        assert!(!advertise_testd_admission());
+        assert!(!advertise_testd_admission_when_composed(false));
+        assert!(advertise_testd_admission_when_composed(true));
+    }
 }
