@@ -1105,6 +1105,305 @@ impl DurableJobRecord {
     }
 }
 
+/// Pure request-response binding: one owner-issued answer to one closed
+/// `DurableJobRequest`.  Shape and validation only; it never persists a job,
+/// issues authority, opens a transport, or launches a worker.
+///
+/// Denominator coverage (T12-00):
+/// - fresh correlation plus stable operation/idempotency/hash: exact echo of
+///   the answered `request_identity` (fresh transport correlation plus stable
+///   `OperationBinding` and `canonical_request_hash`; a retry keeps the stable
+///   half while the fresh half must match the answered request);
+/// - job/attempt/scope/fence/epoch/generation: `job_id`, `attempt_id`, `scope`
+///   (epoch and generation ride inside the scope fence and generation);
+/// - exact record revision: `revision`;
+/// - separate mutation disposition vs semantic lifecycle: `disposition`
+///   (`None` for pure observations such as `Status`) vs `state`;
+/// - owner receipt reference/digest: `receipt_id` (reference) plus the echoed
+///   `canonical_request_hash` (digest);
+/// - result-under-verification/result/checkpoint/lease: optional projections
+///   bound below;
+/// - bounded selection coverage/frontier: `selection_coverage` /
+///   `selection_frontier` (`LeaseNext` only);
+/// - separate applicability: the echoed identity binds which fresh request and
+///   which stable mutation this response applies to; the per-kind content
+///   rules in [`DurableJobResponse::validate_for`] enforce it.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct DurableJobResponse {
+    /// Exact identity of the answered request: fresh correlation plus stable
+    /// mutation binding and canonical digest.
+    pub request_identity: DurableRequestIdentity,
+    /// Job bound by this response.
+    pub job_id: TaskId,
+    /// Attempt bound by this response.
+    pub attempt_id: ArtifactId,
+    /// Scope/epoch/generation/fence projection for the bound job.
+    pub scope: WorkScopeBinding,
+    /// Exact record revision observed for this response.
+    pub revision: u64,
+    /// Semantic lifecycle state, separate from the mutation disposition.
+    pub state: JobState,
+    /// Store/transport mutation outcome; `None` for pure observations.
+    pub disposition: Option<MutationDisposition>,
+    /// Owner receipt reference when the owner issued one.
+    pub receipt_id: Option<ReceiptId>,
+    /// Active lease projection when the bound state carries one.
+    pub lease: Option<JobLease>,
+    /// Checkpoint history when the owner retains one.
+    pub checkpoint: Option<JobCheckpoint>,
+    /// Result currently under verification (`Verifying` only).
+    pub result_under_verification: Option<OpaqueContentRef>,
+    /// Terminal outcome (terminal states only).
+    pub outcome: Option<JobOutcome>,
+    /// Bounded candidate coverage for `LeaseNext` selection.
+    pub selection_coverage: Vec<String>,
+    /// Opaque frontier cursor for `LeaseNext` selection.
+    pub selection_frontier: Option<String>,
+}
+
+impl DurableJobResponse {
+    /// Validates response shape without binding it to a request.
+    pub fn validate(&self) -> Result<(), DurableJobError> {
+        self.request_identity.validate()?;
+        if self.revision == 0 {
+            return Err(DurableJobError::InvalidField {
+                field: "revision",
+                reason: "must be positive",
+            });
+        }
+        self.scope
+            .state_fence
+            .validate()
+            .map_err(DurableJobError::Foundation)?;
+        if self.scope.resource_generation != self.scope.state_fence.resource_generation {
+            return Err(DurableJobError::FenceMismatch);
+        }
+        if let Some(lease) = &self.lease {
+            lease.validate_shape()?;
+            if lease.job_id != self.job_id
+                || lease.attempt_id != self.attempt_id
+                || lease.resource_generation != self.scope.resource_generation
+                || lease.state_fence != self.scope.state_fence
+            {
+                return Err(DurableJobError::FenceMismatch);
+            }
+        }
+        if matches!(
+            self.state,
+            JobState::Leased | JobState::Running | JobState::Checkpointed | JobState::Verifying
+        ) && self.lease.is_none()
+        {
+            return Err(DurableJobError::LeaseInvalid);
+        }
+        if self.state == JobState::Checkpointed && self.checkpoint.is_none() {
+            return Err(DurableJobError::InvalidField {
+                field: "checkpoint",
+                reason: "checkpointed responses require a checkpoint",
+            });
+        }
+        if let Some(checkpoint) = &self.checkpoint {
+            checkpoint.validate()?;
+            if checkpoint.state_fence != self.scope.state_fence {
+                return Err(DurableJobError::FenceMismatch);
+            }
+        }
+        if self.state == JobState::Verifying && self.result_under_verification.is_none() {
+            return Err(DurableJobError::InvalidField {
+                field: "result_under_verification",
+                reason: "verifying responses require a result under verification",
+            });
+        }
+        if let Some(result) = &self.result_under_verification {
+            result.validate("result_under_verification.sha256")?;
+            if self.state != JobState::Verifying {
+                return Err(DurableJobError::InvalidField {
+                    field: "result_under_verification",
+                    reason: "only admitted while verifying",
+                });
+            }
+        }
+        if let Some(outcome) = &self.outcome {
+            outcome.validate()?;
+            if outcome.state != self.state {
+                return Err(DurableJobError::OutcomeMismatch);
+            }
+        }
+        if self.state.is_terminal() && self.outcome.is_none() {
+            return Err(DurableJobError::InvalidOutcome);
+        }
+        if !self.state.is_terminal() && self.outcome.is_some() {
+            return Err(DurableJobError::InvalidOutcome);
+        }
+        if self.disposition == Some(MutationDisposition::Committed) && self.receipt_id.is_none() {
+            return Err(DurableJobError::InvalidField {
+                field: "receipt_id",
+                reason: "committed mutation requires owner receipt",
+            });
+        }
+        validate_text_list(&self.selection_coverage, "selection_coverage")?;
+        if let Some(frontier) = &self.selection_frontier {
+            bounded_text(frontier, "selection_frontier")?;
+        }
+        Ok(())
+    }
+
+    /// Validates that this response answers `request`: exact identity echo
+    /// (fresh correlation plus stable operation/idempotency/hash), per-kind
+    /// job/scope/revision binding, disposition presence, and selection rules.
+    /// Changed content under the same identity fails; an exact replay passes.
+    pub fn validate_for(&self, request: &DurableJobRequest) -> Result<(), DurableJobError> {
+        request.validate()?;
+        self.validate()?;
+        if self.request_identity != request.request_identity {
+            return Err(DurableJobError::OperationMismatch);
+        }
+        if self.scope.state_fence != request.request_identity.operation.state_fence {
+            return Err(DurableJobError::FenceMismatch);
+        }
+        let is_status = matches!(request.operation, JobOperation::Status { .. });
+        if is_status != self.disposition.is_none() {
+            // `Status` is a pure observation with no mutation disposition;
+            // every other operation must carry one.
+            return Err(DurableJobError::OperationMismatch);
+        }
+        let is_lease_next = matches!(request.operation, JobOperation::LeaseNext { .. });
+        if !is_lease_next
+            && (!self.selection_coverage.is_empty() || self.selection_frontier.is_some())
+        {
+            // Only `LeaseNext` performs selection; exact and direct
+            // operations carry no coverage or frontier.
+            return Err(DurableJobError::OperationMismatch);
+        }
+        self.validate_response_operation(&request.operation)
+    }
+
+    /// Binds response content to one closed operation: job/scope/revision,
+    /// published outcome, reconciled disposition, and selection coverage.
+    fn validate_response_operation(
+        &self,
+        operation: &JobOperation,
+    ) -> Result<(), DurableJobError> {
+        match operation {
+            JobOperation::Submit { submission } => {
+                if self.job_id != submission.job_id || self.attempt_id != submission.attempt_id {
+                    return Err(DurableJobError::OperationMismatch);
+                }
+                if self.scope != submission.work_scope {
+                    return Err(DurableJobError::FenceMismatch);
+                }
+                // Any positive revision is admitted: an idempotent resubmit
+                // may return the already-advanced record.
+                Ok(())
+            }
+            JobOperation::LeaseNext { selector } => {
+                if self.scope.scope_id != selector.scope_id {
+                    return Err(DurableJobError::OperationMismatch);
+                }
+                if self.revision != selector.expected_revision {
+                    return Err(DurableJobError::OperationMismatch);
+                }
+                self.validate_response_selection()
+            }
+            JobOperation::LeaseExact { selector, job_id } => {
+                if self.job_id != *job_id || self.scope.scope_id != selector.scope_id {
+                    return Err(DurableJobError::OperationMismatch);
+                }
+                if self.revision != selector.expected_revision {
+                    return Err(DurableJobError::OperationMismatch);
+                }
+                Ok(())
+            }
+            JobOperation::Renew { lease, .. }
+            | JobOperation::Start { lease, .. }
+            | JobOperation::Checkpoint { lease, .. }
+            | JobOperation::Resume { lease, .. } => {
+                validate_response_lease(self, lease)?;
+                if self.revision < lease.revision {
+                    // Record history only moves forward past the lease pin.
+                    return Err(DurableJobError::OperationMismatch);
+                }
+                Ok(())
+            }
+            JobOperation::BeginVerification { lease, .. } => {
+                validate_response_lease(self, lease)?;
+                if self.revision < lease.revision || self.state != JobState::Verifying {
+                    return Err(DurableJobError::OperationMismatch);
+                }
+                Ok(())
+            }
+            JobOperation::Publish { lease, outcome, .. } => {
+                validate_response_lease(self, lease)?;
+                if self.revision < lease.revision {
+                    return Err(DurableJobError::OperationMismatch);
+                }
+                if self.outcome.as_ref() != Some(outcome.as_ref()) {
+                    return Err(DurableJobError::OperationMismatch);
+                }
+                Ok(())
+            }
+            JobOperation::Status {
+                job_id,
+                attempt_id,
+                expected_revision,
+                ..
+            } => {
+                if self.job_id != *job_id || self.attempt_id != *attempt_id {
+                    return Err(DurableJobError::OperationMismatch);
+                }
+                if self.revision != *expected_revision {
+                    return Err(DurableJobError::OperationMismatch);
+                }
+                Ok(())
+            }
+            JobOperation::RequestCancel {
+                job_id, attempt_id, ..
+            } => {
+                if self.job_id != *job_id || self.attempt_id != *attempt_id {
+                    return Err(DurableJobError::OperationMismatch);
+                }
+                Ok(())
+            }
+            JobOperation::Reconcile { mutation } => {
+                if self.job_id != mutation.job_id || self.attempt_id != mutation.attempt_id {
+                    return Err(DurableJobError::OperationMismatch);
+                }
+                if self.disposition != Some(mutation.disposition) {
+                    return Err(DurableJobError::OperationMismatch);
+                }
+                Ok(())
+            }
+        }
+    }
+
+    /// Requires `LeaseNext` coverage to name the bound job.
+    fn validate_response_selection(&self) -> Result<(), DurableJobError> {
+        if self.selection_coverage.is_empty()
+            || !self
+                .selection_coverage
+                .iter()
+                .any(|candidate| candidate.as_str() == self.job_id.as_str())
+        {
+            return Err(DurableJobError::OperationMismatch);
+        }
+        Ok(())
+    }
+}
+
+/// Binds a lease-carrying response to its pinned lease identity and fence.
+fn validate_response_lease(
+    response: &DurableJobResponse,
+    lease: &JobLease,
+) -> Result<(), DurableJobError> {
+    if response.job_id != lease.job_id || response.attempt_id != lease.attempt_id {
+        return Err(DurableJobError::OperationMismatch);
+    }
+    if response.scope.state_fence != lease.state_fence {
+        return Err(DurableJobError::FenceMismatch);
+    }
+    Ok(())
+}
+
 /// Validation failures remain bounded and do not echo supplied payloads.
 #[derive(Clone, Debug, Eq, Error, PartialEq)]
 pub enum DurableJobError {

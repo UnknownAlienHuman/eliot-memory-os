@@ -49,9 +49,9 @@ pub mod dreamer_job;
 pub use dreamer_job::{
     AdmissionRef, CancellationState, DURABLE_JOB_CANONICAL_ENCODING, DURABLE_JOB_CONTRACT_NAME,
     DURABLE_JOB_CONTRACT_VERSION, DurableJobError, DurableJobRecord, DurableJobRequest,
-    DurableRequestIdentity, JobCapability, JobCheckpoint, JobLease, JobOperation, JobOperationKind,
-    JobOutcome, JobRole, JobState, JobSubmission, LeaseSelector, MutationDisposition,
-    MutationReconciliation, OpaqueContentRef, durable_job_contract_identity,
+    DurableJobResponse, DurableRequestIdentity, JobCapability, JobCheckpoint, JobLease,
+    JobOperation, JobOperationKind, JobOutcome, JobRole, JobState, JobSubmission, LeaseSelector,
+    MutationDisposition, MutationReconciliation, OpaqueContentRef, durable_job_contract_identity,
 };
 
 /// Stable identity of this protocol surface.
