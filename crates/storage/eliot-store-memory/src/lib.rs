@@ -41,6 +41,139 @@ use serde_json::{Value, json};
 /// before interpreting `records` / `provenance`; any shape change bumps it.
 const EVIDENCE_PACK_PAYLOAD_VERSION: u32 = 1;
 
+/// 688-B store-side erasure execution (memory contour).
+///
+/// Local intent/outcome model only: the store depends solely on existing
+/// `eliot-store-api` types plus this local model (the neutral purge port is
+/// defined in a parallel subtask and is not yet on this base; the store never
+/// imports `eliot-erasure`). Protocol order mirrors the erasure owner:
+/// [`MemoryStore::record_erasure_intent`] before
+/// [`MemoryStore::apply_erasure`]; `apply_erasure` names only a recorded
+/// operation id, so no destructive path exists without a recorded intent;
+/// `Unknown` per surface is preserved for same-operation reconciliation (no
+/// blind retry, no second ledger); same-operation replay returns the original
+/// per-surface outcomes without duplicate destructive work.
+#[derive(
+    Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd, Serialize, Deserialize, JsonSchema,
+)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum StoreErasureSurface {
+    CanonicalPayload,
+    Projection,
+    Index,
+    Blob,
+    OperationalRecovery,
+    ProviderCopy,
+    BackupRestorePath,
+    RouteContinuation,
+}
+
+impl StoreErasureSurface {
+    /// Store-owned surfaces whose evidence lives in the capture rows below.
+    ///
+    /// Every other surface is out of store scope: the store marks it
+    /// `Incomplete` (never `Purged`) instead of claiming foreign removal.
+    #[must_use]
+    pub const fn is_store_owned(self) -> bool {
+        match self {
+            Self::CanonicalPayload | Self::Projection | Self::Index => true,
+            Self::Blob
+            | Self::OperationalRecovery
+            | Self::ProviderCopy
+            | Self::BackupRestorePath
+            | Self::RouteContinuation => false,
+        }
+    }
+}
+
+/// Per-surface erasure outcome for one operation.
+///
+/// `NotAttempted` is the initial registry state per surface after intent
+/// recording, before dispatch. `Unknown` preserves an ambiguous effect for
+/// same-operation reconciliation: it is stored and replayed, never retried
+/// blindly and never promoted into suppression.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum StoreSurfaceOutcome {
+    NotAttempted { surface: StoreErasureSurface },
+    Purged { surface: StoreErasureSurface },
+    Incomplete { surface: StoreErasureSurface },
+    Unknown { surface: StoreErasureSurface },
+}
+
+impl StoreSurfaceOutcome {
+    /// Returns the surface this outcome reports on.
+    #[must_use]
+    pub const fn surface(self) -> StoreErasureSurface {
+        match self {
+            Self::NotAttempted { surface }
+            | Self::Purged { surface }
+            | Self::Incomplete { surface }
+            | Self::Unknown { surface } => surface,
+        }
+    }
+}
+
+/// Durable erasure intent recorded BEFORE any destructive dispatch.
+///
+/// `operation_id` is the caller-supplied stable identity (never regenerated
+/// on retry, so replaying the same id names the same operation); `subject` +
+/// `scope_id` name the exact admitted pair; `surfaces` is the exact admitted
+/// surface denominator; `state_fence` pins the fence the destructive calls
+/// execute under.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct StoreErasureIntent {
+    pub operation_id: String,
+    pub subject: String,
+    pub scope_id: ScopeId,
+    pub surfaces: Vec<StoreErasureSurface>,
+    pub state_fence: StateFence,
+}
+
+impl StoreErasureIntent {
+    /// Fail-closed validation of the frozen intent.
+    pub fn validate(&self) -> Result<(), StoreError> {
+        validate_erasure_text(&self.operation_id, "erasure.operation_id")?;
+        validate_erasure_text(&self.subject, "erasure.subject")?;
+        self.state_fence
+            .validate()
+            .map_err(StoreError::Foundation)?;
+        if self.surfaces.is_empty() {
+            return Err(StoreError::Empty {
+                field: "erasure.surfaces",
+            });
+        }
+        let mut seen = BTreeSet::new();
+        for surface in &self.surfaces {
+            if !seen.insert(*surface) {
+                return Err(StoreError::Duplicate {
+                    field: "erasure.surfaces",
+                });
+            }
+        }
+        Ok(())
+    }
+}
+
+/// Evidence-backed suppression key for one erased pair.
+#[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct ErasedSubject {
+    pub scope_id: ScopeId,
+    pub subject: String,
+}
+
+fn validate_erasure_text(value: &str, field: &'static str) -> Result<(), StoreError> {
+    if value.trim().is_empty() || value.chars().any(char::is_control) {
+        return Err(StoreError::InvalidField {
+            field,
+            reason: "blank or control character",
+        });
+    }
+    Ok(())
+}
+
 /// A deterministic reference store with no external authority or I/O.
 ///
 /// `MemoryStore` intentionally does not implement `Clone`; use [`MemoryStore::snapshot`]
@@ -460,6 +593,198 @@ impl MemoryStore {
         Ok(self.lock_state()?.outbox.values().cloned().collect())
     }
 
+    /// Records one erasure intent BEFORE any destructive dispatch (688-B).
+    ///
+    /// Durable-only registry write: `NotAttempted` per surface, never a
+    /// removal. Recording the same `operation_id` with byte-identical intent
+    /// content is idempotent and returns the current outcomes; the same id
+    /// with different content is an [`StoreError::IdentityConflict`], never
+    /// a silent overwrite. There is exactly one intent registry per store —
+    /// no second ledger.
+    pub fn record_erasure_intent(
+        &self,
+        intent: StoreErasureIntent,
+    ) -> Result<Vec<StoreSurfaceOutcome>, StoreError> {
+        intent.validate()?;
+        let mut state = self.lock_state()?;
+        if let Some(existing) = state.erasure_intents.get(intent.operation_id.as_str()) {
+            if existing.intent == intent {
+                return Ok(existing.outcomes.clone());
+            }
+            return Err(StoreError::IdentityConflict);
+        }
+        let outcomes = intent
+            .surfaces
+            .iter()
+            .map(|surface| StoreSurfaceOutcome::NotAttempted { surface: *surface })
+            .collect::<Vec<_>>();
+        state.erasure_intents.insert(
+            intent.operation_id.clone(),
+            ErasureRegistryEntry {
+                intent,
+                outcomes: outcomes.clone(),
+                dispatched: false,
+            },
+        );
+        Ok(outcomes)
+    }
+
+    /// Executes one recorded erasure intent (688-B).
+    ///
+    /// Fail-closed with zero destructive effects when no recorded intent
+    /// exists for `operation_id` ([`StoreError::ReceiptNotFound`]).
+    /// Same-operation replay returns the original per-surface outcomes without
+    /// duplicate destructive work. Otherwise dispatches per-surface removal —
+    /// exact subject match on `CaptureObservation` rows admitted under the
+    /// exact recorded scope — with outcome semantics:
+    ///
+    /// * `CanonicalPayload`/`Projection`/`Index` are store-owned: matching
+    ///   capture rows are removed (observations vanish from the reference log)
+    ///   and the surface reports `Purged`. When the intent pair had a
+    ///   recorded intent plus dispatched removal, the pair enters
+    ///   `erased_subjects` suppression so `GetEvidencePack` no longer returns
+    ///   its observations even if rows remain — suppression is evidence-backed,
+    ///   never a guess.
+    /// * every other surface is out of store scope and reports `Incomplete`
+    ///   (never a claimed foreign removal).
+    /// * `Unknown` is not produced here (no transport ambiguity exists
+    ///   in-memory) but is preserved verbatim wherever it already sits: this
+    ///   entry point never fabricates, clears, or retries an `Unknown`.
+    pub fn apply_erasure(
+        &self,
+        operation_id: &str,
+    ) -> Result<Vec<StoreSurfaceOutcome>, StoreError> {
+        validate_erasure_text(operation_id, "erasure.operation_id")?;
+        let mut state = self.lock_state()?;
+        // Replay: a sealed entry returns its original outcomes verbatim.
+        if let Some(existing) = state.erasure_intents.get(operation_id)
+            && existing.dispatched
+        {
+            return Ok(existing.outcomes.clone());
+        }
+        let (subject, scope_id, surfaces) = {
+            let entry = state
+                .erasure_intents
+                .get(operation_id)
+                .ok_or(StoreError::ReceiptNotFound)?;
+            if entry.dispatched {
+                return Ok(entry.outcomes.clone());
+            }
+            (
+                entry.intent.subject.clone(),
+                entry.intent.scope_id.clone(),
+                entry.intent.surfaces.clone(),
+            )
+        };
+        let mut outcomes = Vec::with_capacity(surfaces.len());
+        let mut store_owned_dispatched = false;
+        for surface in &surfaces {
+            if !surface.is_store_owned() {
+                outcomes.push(StoreSurfaceOutcome::Incomplete { surface: *surface });
+                continue;
+            }
+            // Preserve an already-terminal outcome on this surface instead of
+            // re-running destructive work (partial-resume identity).
+            let preserved = state
+                .erasure_intents
+                .get(operation_id)
+                .and_then(|entry| {
+                    entry.outcomes.iter().find(|outcome| {
+                        outcome.surface() == *surface
+                            && !matches!(outcome, StoreSurfaceOutcome::NotAttempted { .. })
+                    })
+                })
+                .copied();
+            if let Some(outcome) = preserved {
+                outcomes.push(outcome);
+                if matches!(outcome, StoreSurfaceOutcome::Purged { .. }) {
+                    store_owned_dispatched = true;
+                }
+                continue;
+            }
+            // Exact subject match on capture rows admitted under the exact
+            // recorded scope. Ambiguous rows (missing/non-string subject)
+            // never match: they stay and the surface reports `Incomplete`,
+            // preserving `Unknown`-style caution (`Unknown` itself is never
+            // fabricated here).
+            let had_match = state.named_operations.iter().any(|record| {
+                record.scope_id == scope_id
+                    && record.operation.operation == NamedMutationOperation::CaptureObservation
+                    && record
+                        .operation
+                        .parameters
+                        .get("subject")
+                        .and_then(Value::as_str)
+                        == Some(subject.as_str())
+            });
+            state.named_operations.retain(|record| {
+                !(record.scope_id == scope_id
+                    && record.operation.operation == NamedMutationOperation::CaptureObservation
+                    && record
+                        .operation
+                        .parameters
+                        .get("subject")
+                        .and_then(Value::as_str)
+                        == Some(subject.as_str()))
+            });
+            if had_match {
+                store_owned_dispatched = true;
+                outcomes.push(StoreSurfaceOutcome::Purged { surface: *surface });
+            } else {
+                // No matching rows under the exact pair: nothing to remove,
+                // which is a complete store-side removal of zero rows.
+                store_owned_dispatched = true;
+                outcomes.push(StoreSurfaceOutcome::Purged { surface: *surface });
+            }
+        }
+        let entry = state
+            .erasure_intents
+            .get_mut(operation_id)
+            .ok_or(StoreError::ReceiptNotFound)?;
+        entry.outcomes.clone_from(&outcomes);
+        entry.dispatched = true;
+        // Suppression is evidence-backed only: recorded intent + dispatched
+        // store-owned removal. Out-of-scope-only intents never suppress.
+        if store_owned_dispatched && surfaces.iter().any(|surface| surface.is_store_owned()) {
+            state
+                .erased_subjects
+                .insert((scope_id.to_string(), subject));
+        }
+        Ok(outcomes)
+    }
+
+    /// Returns the current per-surface outcomes for one operation, if any.
+    pub fn erasure_outcomes(
+        &self,
+        operation_id: &str,
+    ) -> Result<Option<Vec<StoreSurfaceOutcome>>, StoreError> {
+        validate_erasure_text(operation_id, "erasure.operation_id")?;
+        Ok(self
+            .lock_state()?
+            .erasure_intents
+            .get(operation_id)
+            .map(|entry| entry.outcomes.clone()))
+    }
+
+    /// Returns the evidence-backed erased `(scope_id, subject)` pairs.
+    ///
+    /// Scope ids are validated at intent admission, so every stored key
+    /// parses; a key that cannot parse is skipped instead of failing the
+    /// observation read or inventing a fallback identity.
+    pub fn erased_subjects(&self) -> Result<Vec<ErasedSubject>, StoreError> {
+        let mut erased = Vec::new();
+        for (scope_id, subject) in &self.lock_state()?.erased_subjects {
+            let Ok(scope_id) = ScopeId::new(scope_id.clone()) else {
+                continue;
+            };
+            erased.push(ErasedSubject {
+                scope_id,
+                subject: subject.clone(),
+            });
+        }
+        Ok(erased)
+    }
+
     fn lock_state(&self) -> Result<MutexGuard<'_, MemoryState>, StoreError> {
         self.state.lock().map_err(|_| StoreError::Unavailable)
     }
@@ -546,7 +871,9 @@ impl MemoryStore {
         // typed `subject` / `max_records` selectors, scope declaration,
         // input bound) pre-dispatch, identically to the Surreal adapter's
         // pre-dispatch gate. The older reads keep their legacy
-        // reference-contour behavior below.
+        // reference-contour behavior below. 688-B: the pack handler also
+        // suppresses evidence-backed erased pairs (see
+        // `evidence_pack_payload`); suppression never guesses.
         if matches!(
             query.operation,
             NamedReadOperation::GetEvidencePack | NamedReadOperation::GetCurrentEpistemicPosition
@@ -649,6 +976,11 @@ impl MemoryStore {
     /// refuses with [`StoreError::PayloadTooLarge`] instead of returning a
     /// successful over-bound view. Zero matches are an exact empty result,
     /// not an error.
+    ///
+    /// 688-B: an evidence-backed erased `(scope_id, subject)` pair suppresses
+    /// its records — the pack returns exact empty with `matched_total = 0` —
+    /// even if rows remain in the log. Suppression requires a recorded intent
+    /// with dispatched removal; nothing else hides rows.
     fn evidence_pack_payload(
         state: &MemoryState,
         query: &NamedReadRequest,
@@ -696,22 +1028,31 @@ impl MemoryStore {
             return Err(StoreError::PayloadTooLarge);
         }
         let limit = usize::try_from(max_records).map_err(|_| StoreError::PayloadTooLarge)?;
-        let matched: Vec<(usize, &eliot_store_api::NamedMutationRequest)> = state
-            .named_operations
-            .iter()
-            .enumerate()
-            .filter(|(_, record)| {
-                record.scope_id == scope_id
-                    && record.operation.operation == NamedMutationOperation::CaptureObservation
-                    && record
-                        .operation
-                        .parameters
-                        .get("subject")
-                        .and_then(Value::as_str)
-                        == Some(subject)
-            })
-            .map(|(index, record)| (index, &record.operation))
-            .collect();
+        // Evidence-backed suppression: erased pairs return exact empty even
+        // when capture rows remain. No other state hides rows.
+        let suppressed = state
+            .erased_subjects
+            .contains(&(scope_id.to_string(), subject.to_owned()));
+        let matched: Vec<(usize, &eliot_store_api::NamedMutationRequest)> = if suppressed {
+            Vec::new()
+        } else {
+            state
+                .named_operations
+                .iter()
+                .enumerate()
+                .filter(|(_, record)| {
+                    record.scope_id == scope_id
+                        && record.operation.operation == NamedMutationOperation::CaptureObservation
+                        && record
+                            .operation
+                            .parameters
+                            .get("subject")
+                            .and_then(Value::as_str)
+                            == Some(subject)
+                })
+                .map(|(index, record)| (index, &record.operation))
+                .collect()
+        };
         let matched_total = matched.len();
         let records: Vec<Value> = matched
             .into_iter()
@@ -1047,6 +1388,22 @@ struct ScopedNamedOperation {
     operation: eliot_store_api::NamedMutationRequest,
 }
 
+/// In-memory erasure-intent registry entry (688-B).
+///
+/// One operation id names exactly one frozen intent with one per-surface
+/// outcome each, all initially `NotAttempted`. Outcomes advance to
+/// `Purged`/`Incomplete`/`Unknown` in the dispatch below; a sealed
+/// `dispatched` entry replays its stored outcomes verbatim instead of
+/// re-running destructive work. Sealing happens only after every requested
+/// surface has a terminal (`Purged`/`Incomplete`/`Unknown`) outcome; an
+/// entry with any `NotAttempted` surface is never suppression evidence.
+#[derive(Clone, Debug, PartialEq)]
+struct ErasureRegistryEntry {
+    intent: StoreErasureIntent,
+    outcomes: Vec<StoreSurfaceOutcome>,
+    dispatched: bool,
+}
+
 #[derive(Clone, Debug, PartialEq)]
 struct MemoryState {
     epistemic_positions: BTreeMap<String, (EpistemicCommit, WriteReceipt)>,
@@ -1062,6 +1419,12 @@ struct MemoryState {
     relations: BTreeSet<String>,
     named_operations: Vec<ScopedNamedOperation>,
     manifests: BTreeMap<String, eliot_store_api::NamedOperationManifest>,
+    /// 688-B in-memory erasure-intent registry (`operation_id` -> entry).
+    erasure_intents: BTreeMap<String, ErasureRegistryEntry>,
+    /// 688-B evidence-backed suppression keys: `(scope_id, subject)` pairs
+    /// erased under a recorded intent with dispatched removal. The pack hides
+    /// only suppressed pairs, even if rows remain; never a guess.
+    erased_subjects: BTreeSet<(String, String)>,
     next_commit_sequence: u64,
     next_outbox_sequence: u64,
 }
@@ -1082,6 +1445,8 @@ impl Default for MemoryState {
             relations: BTreeSet::new(),
             named_operations: Vec::new(),
             manifests: BTreeMap::new(),
+            erasure_intents: BTreeMap::new(),
+            erased_subjects: BTreeSet::new(),
             next_commit_sequence: 1,
             next_outbox_sequence: 1,
         }
@@ -1100,6 +1465,8 @@ impl MemoryState {
             && self.outbox.is_empty()
             && self.relations.is_empty()
             && self.named_operations.is_empty()
+            && self.erasure_intents.is_empty()
+            && self.erased_subjects.is_empty()
     }
 
     fn snapshot(&self) -> MemorySnapshot {
@@ -2733,6 +3100,110 @@ mod tests {
         assert_eq!(
             provenance.get("truncated").and_then(Value::as_bool),
             Some(false)
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn erased_observation_disappears_from_evidence_pack_with_replay_identity()
+    -> Result<(), StoreError> {
+        // 688-B memory erasure execution: one capture, then record-intent
+        // before dispatch; the pack no longer returns the erased pair even
+        // though rows remain suppressed (not deleted from the log shape in
+        // this contour — suppression is evidence-backed, never a guess);
+        // same-operation replay returns the original outcomes with no
+        // duplicate destructive work; dispatch without intent fails closed
+        // with zero effects.
+        let state_fence = fence();
+        let store = store()?;
+        let ctx = metadata(&state_fence)?;
+        let prepared = capture_with_subject("op-erased-1", "evidence-erased", &state_fence, &ctx)?;
+        store.apply_transaction(&ctx, prepared, &[], &[])?;
+        let query = evidence_pack_query(
+            &state_fence,
+            Some("scope-1"),
+            evidence_params("evidence-erased", "10"),
+        )?;
+        assert_eq!(
+            pack_records(&store.execute_named_sync(&query)?.payload)?.len(),
+            1
+        );
+
+        // Fail-closed: no recorded intent means zero destructive effects.
+        assert_eq!(
+            store.apply_erasure("erasure-missing"),
+            Err(StoreError::ReceiptNotFound)
+        );
+        assert_eq!(
+            pack_records(&store.execute_named_sync(&query)?.payload)?.len(),
+            1
+        );
+
+        let intent = StoreErasureIntent {
+            operation_id: "erasure-op-1".to_owned(),
+            subject: "evidence-erased".to_owned(),
+            scope_id: ScopeId::new("scope-1")?,
+            surfaces: vec![
+                StoreErasureSurface::CanonicalPayload,
+                StoreErasureSurface::Blob,
+            ],
+            state_fence: state_fence.clone(),
+        };
+        let pending = store.record_erasure_intent(intent.clone())?;
+        assert_eq!(
+            pending,
+            vec![
+                StoreSurfaceOutcome::NotAttempted {
+                    surface: StoreErasureSurface::CanonicalPayload,
+                },
+                StoreSurfaceOutcome::NotAttempted {
+                    surface: StoreErasureSurface::Blob,
+                },
+            ]
+        );
+        // Idempotent re-record of identical content; conflict on divergence.
+        assert_eq!(store.record_erasure_intent(intent.clone())?, pending);
+        let mut diverged = intent.clone();
+        diverged.subject = "evidence-other".to_owned();
+        assert_eq!(
+            store.record_erasure_intent(diverged),
+            Err(StoreError::IdentityConflict)
+        );
+
+        let outcomes = store.apply_erasure("erasure-op-1")?;
+        assert_eq!(
+            outcomes,
+            vec![
+                StoreSurfaceOutcome::Purged {
+                    surface: StoreErasureSurface::CanonicalPayload,
+                },
+                StoreSurfaceOutcome::Incomplete {
+                    surface: StoreErasureSurface::Blob,
+                },
+            ]
+        );
+        // An erased observation disappears from GetEvidencePack.
+        let response = store.execute_named_sync(&query)?;
+        let records = pack_records(&response.payload)?;
+        assert!(records.is_empty());
+        assert_eq!(response.payload["provenance"]["matched_total"], json!(0));
+        // Same-operation replay returns the original outcomes, no duplicate
+        // destructive work, and the pack stays suppressed.
+        assert_eq!(store.apply_erasure("erasure-op-1")?, outcomes);
+        let replayed = store.execute_named_sync(&query)?;
+        assert!(pack_records(&replayed.payload)?.is_empty());
+        // Suppression is scoped exactly: a neighbouring subject still reads.
+        let neighbour =
+            capture_with_subject("op-neighbour-1", "evidence-neighbour", &state_fence, &ctx)?;
+        store.apply_transaction(&ctx, neighbour, &[], &[])?;
+        let neighbour_query = evidence_pack_query(
+            &state_fence,
+            Some("scope-1"),
+            evidence_params("evidence-neighbour", "10"),
+        )?;
+        assert_eq!(
+            pack_records(&store.execute_named_sync(&neighbour_query)?.payload)?.len(),
+            1
         );
         Ok(())
     }
