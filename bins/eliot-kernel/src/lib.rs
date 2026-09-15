@@ -108,6 +108,7 @@ mod host_request_route;
 mod native_worker_lifecycle_route;
 mod native_worker_reconcile_route;
 mod native_worker_replay_route;
+pub mod notify_operation_identity;
 mod provider_capability_route;
 mod runtime_identity;
 use daemon_session_guard::caller_binding;
