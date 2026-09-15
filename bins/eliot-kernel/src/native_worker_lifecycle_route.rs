@@ -1941,7 +1941,24 @@ impl KernelComposition {
             .get("claim")
             .filter(|claim| claim.is_object())
             .ok_or(NativeWorkerRouteError::Shape { field: "claim" })?;
-        let request = Self::build_claim_request(claim)?;
+        // Single-shape (R2): when the readiness presentation carries its
+        // presenting registration (`{claim, registration, readiness}` — the
+        // same worker-core halves the child submits at claim time), build
+        // through the single-shape projector so the SAME shape admits at
+        // claim and ready. Without a presenting registration (pre-unification
+        // `{claim, readiness}`), fall back to the old envelope builder; the
+        // old builder stays for that compat path and is not deleted here.
+        let request = match payload
+            .get("registration")
+            .filter(|registration| registration.is_object())
+        {
+            Some(registration) => {
+                Self::validate_native_worker_registration(registration)?;
+                Self::require_claim_registration_resource_binding(claim, registration)?;
+                Self::build_single_shape_request(claim, registration)?
+            }
+            None => Self::build_claim_request(claim)?,
+        };
         let report = readiness.get("payload").cloned().unwrap_or_default();
         let ready_registration_id = require_op_id(&report, "registration_id")?;
         let ready_worker_generation = require_nonzero_u64(&report, "worker_generation")?;
@@ -2439,6 +2456,118 @@ mod single_shape_proof {
         assert!(
             KernelComposition::build_single_shape_request(&rewired, split_registration).is_err(),
             "rewired envelope must not build"
+        );
+    }
+
+    /// R2 readiness: a readiness-style `{claim, registration}` presentation
+    /// (worker-core halves, no envelope duplication) builds through the
+    /// single-shape projector, while the old envelope builder fails closed
+    /// on the same envelope-less claim. This proves the ready path prefers
+    /// the single claim shape when the presenting registration rides along;
+    /// without a registration the route keeps the old builder as compat.
+    #[test]
+    fn readiness_single_shape_prefers_projected_envelope() {
+        let fence_value = serde_json::to_value(fence()).expect("fence json");
+        let epoch_value = serde_json::to_value(epoch(1)).expect("epoch json");
+        let join = serde_json::json!({
+            "route_ref": "route://test/full-canonical-route",
+            "adapter_id": "adapter-test",
+            "adapter_revision": 3,
+            "config_digest": "b".repeat(64),
+            "facet_manifest_ref": "facet-manifest-7",
+            "grant_graph_revision": 5,
+            "replay_stream_id": "stream-ready-1/gen-1",
+            "launch_nonce": "launch-nonce-0123456789abcdef",
+            "process_invocation_digest": "d".repeat(64),
+            "authority_epoch": epoch_value,
+            "generation": serde_json::to_value(fence().resource_generation).expect("gen"),
+            "state_fence": fence_value,
+            "deadline_unix_ms": 9_000_000_000_000u64,
+            "expires_at_unix_ms": 9_000_000_100_000u64,
+            "executable_wire_version": NATIVE_WORKER_EXECUTABLE_BINDING_EXPECTED_WIRE_VERSION,
+            "executable_binding_digest": "e".repeat(64),
+        });
+        let draft = serde_json::json!({
+            "attempt_id": "attempt-ready-1",
+            "authority_epoch": epoch_value,
+            "budget": {"context_tokens": 8, "wall_time_ms": 1000, "output_bytes": 1024, "cost_microunits": 10, "max_depth": 2, "max_descendants": 4},
+            "cancellation_policy_id": "cancel-1",
+            "claim_id": "claim-ready-1",
+            "deadline_unix_ms": 9_000_000_000_000u64,
+            "decision_id": "decision-1",
+            "executable_binding": join,
+            "expected_result_schema": "result-schema",
+            "expected_result_schema_version": 1,
+            "operation_id": "op-ready-1",
+            "parent_job_id": "parent-job-1",
+            "predecessor_revision": "rev-1",
+            "registration_id": "reg-ready-1",
+            "route_class": "test-route",
+            "state_fence": fence_value,
+            "task_id": "task-1",
+            "work_scope_id": "scope-1",
+            "worker_generation": 1,
+        });
+        let binding_digest = {
+            let bytes = eliot_contracts::canonical_json_bytes(&draft).expect("canonical");
+            eliot_contracts::sha256_hex(&bytes)
+        };
+        let claim = serde_json::json!({
+            "claim_id": "claim-ready-1",
+            "registration_id": "reg-ready-1",
+            "worker_generation": 1,
+            "parent_job_id": "parent-job-1",
+            "task_id": "task-1",
+            "work_scope_id": "scope-1",
+            "decision_id": "decision-1",
+            "attempt_id": "attempt-ready-1",
+            "operation_id": "op-ready-1",
+            "route_class": "test-route",
+            "budget": {"context_tokens": 8, "wall_time_ms": 1000, "output_bytes": 1024, "cost_microunits": 10, "max_depth": 2, "max_descendants": 4},
+            "deadline_unix_ms": 9_000_000_000_000u64,
+            "cancellation_policy_id": "cancel-1",
+            "expected_result_schema": "result-schema",
+            "expected_result_schema_version": 1,
+            "predecessor_revision": "rev-1",
+            "authority_epoch": epoch_value,
+            "state_fence": fence_value,
+            "wire_version": NATIVE_WORKER_CLAIM_WIRE_VERSION,
+            "executable_binding": draft.get("executable_binding").cloned().unwrap(),
+            "binding_digest": binding_digest,
+        });
+        let registration = serde_json::json!({
+            "registration_id": "reg-ready-1",
+            "installation_id": "installation-1",
+            "worker_artifact_digest": "a".repeat(64),
+            "worker_config_digest": "b".repeat(64),
+            "protocol_version": NATIVE_WORKER_PROTOCOL_VERSION,
+            "worker_generation": 1,
+            "process_id": 4242,
+            "process_start_100ns": 120,
+            "process_image_digest": "a".repeat(64),
+            "principal_ref": "principal-1",
+            "session_id": "session-operation-1",
+            "connection_id": "connection-1",
+            "authority_epoch": epoch_value,
+            "state_fence": fence_value,
+            "lease_id": "lease-1",
+            "lease_expires_at_unix_ms": 9_000_000_200_000u64,
+            "renewal_id": "renewal-1",
+            "execution_unit_schema_version": NATIVE_WORKER_EXECUTION_UNIT_SCHEMA_VERSION,
+            "resource_limits": {"wall_timeout_ms": 30000, "stdout_bytes": 4096, "stderr_bytes": 4096, "max_descendants": 4},
+            "invalidation_set": [],
+        });
+        // Single shape projects the envelope from the presenting registration.
+        let projected = KernelComposition::build_single_shape_request(&claim, &registration)
+            .expect("readiness claim builds single-shape");
+        assert_eq!(projected.binding_digest, binding_digest);
+        assert_eq!(projected.installation_id, "installation-1");
+        projected.validate().expect("projected request validates");
+        // The old envelope builder requires the duplicated envelope the
+        // worker-core halves omit by construction, so it fails closed here.
+        assert!(
+            KernelComposition::build_claim_request(&claim).is_err(),
+            "envelope-less readiness claim must not build via the old envelope builder"
         );
     }
 }
