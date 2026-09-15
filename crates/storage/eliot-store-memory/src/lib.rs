@@ -140,14 +140,12 @@ impl MemoryStore {
                 .epistemic_positions
                 .get(key)
                 .map(|(previous, _)| previous.payload.candidate.digest.as_str());
-            if predecessor
-                != commit
-                    .payload
-                    .candidate
-                    .predecessor
-                    .as_ref()
-                    .map(|id| id.as_str())
-            {
+            let predecessor_matches = match (&commit.payload.candidate.predecessor, predecessor) {
+                (None, None) => true,
+                (Some(expected), Some(actual)) => expected.as_str() == actual,
+                _ => false,
+            };
+            if !predecessor_matches {
                 return Err(StoreError::RevisionConflict);
             }
             let current = state
