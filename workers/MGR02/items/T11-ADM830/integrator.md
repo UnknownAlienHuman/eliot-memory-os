@@ -140,8 +140,8 @@ GATE: PASS.
 ## 5. Push SHA + readiness
 
 - Pre-report HEAD (source gate): `839b1cb3984dcc2ab079f505b253558d59ff4686`
-- Post-report HEAD: see commit for `workers/MGR02/items/T11-ADM830/integrator.md`
-  (recorded at push time).
+- Post-report HEAD (pushed): `4ee085513b86b09aa162c5255d94446ec4d8cff6`
+  (`origin/work/830-context-admission-denominator` equals HEAD).
 - Ready-for-verifier: YES (scoped nine-package gate PASS, diff exactly 7 source files
   in claimed dirs, root admission cleanly deferred with justification).
 - Residual steps for manager/owner (NOT done here): record owner-default-6 scoped gate
