@@ -777,6 +777,56 @@ function Assert-UnsignedSignedPerFileLink([object]$UnsignedBaselineEntry, [strin
     return $evidence
 }
 
+function Get-VerifiedStagedGenerationBinding([object]$Release, [object]$Runtime) {
+    # Part B generation_binding contract (item 1228 of #1227; invoke:1070-1080
+    # repetition semantics).  The build emits generation_binding in RELEASE.json
+    # + runtime/RUNTIME_ARTIFACTS.json (WRITER-1228-A); the finalizer carries that
+    # exact staged block through signing into SIGNING_VERIFIED.json so invoke's
+    # verifiedBinding leg can satisfy its byte-compare.  Fail-closed on absent
+    # or inconsistent staged binding; no silent default.
+    if (-not $Release -or -not $Runtime) {
+        throw 'staged generation binding requires RELEASE and RUNTIME_ARTIFACTS manifests'
+    }
+    $releaseProp = $Release.PSObject.Properties['generation_binding']
+    $runtimeProp = $Runtime.PSObject.Properties['generation_binding']
+    $releaseBinding = if ($releaseProp) { $releaseProp.Value } else { $null }
+    $runtimeBinding = if ($runtimeProp) { $runtimeProp.Value } else { $null }
+    if (-not $releaseBinding -or -not $runtimeBinding) {
+        throw 'staged bundle does not declare an explicit generation_binding (pre-generation-binding bundle refused; see #1227 Part A/B: bundle → manifest → generation)'
+    }
+    $releaseJson = [string]($releaseBinding | ConvertTo-Json -Depth 12 -Compress)
+    $runtimeJson = [string]($runtimeBinding | ConvertTo-Json -Depth 12 -Compress)
+    if ($releaseJson -cne $runtimeJson) {
+        throw 'staged generation_binding is not exactly repeated across RELEASE/RUNTIME_ARTIFACTS'
+    }
+    foreach ($field in @('generation', 'registry_generation', 'config_generation', 'schema_generation', 'rollback_generation', 'install_authoritative_cli')) {
+        # StrictMode-safe read: missing NoteProperty must surface as the
+        # explicit malformed-field refusal below, not a PropertyNotFound error.
+        $fieldProp = $releaseBinding.PSObject.Properties[$field]
+        $value = if ($fieldProp) { [string]$fieldProp.Value } else { '' }
+        if ([string]::IsNullOrWhiteSpace($value) -or $value.IndexOf([char]0) -ge 0 -or $value -match '[\r\n]') {
+            throw "staged generation_binding field is missing or malformed: $field"
+        }
+    }
+    $declaredGeneration = [string]$releaseBinding.generation
+    if ([System.IO.Path]::IsPathRooted($declaredGeneration) -or
+        @($declaredGeneration -split '[\\/]').Where({ $_ -eq '.' -or $_ -eq '..' -or $_ -eq '' }).Count -ne 0) {
+        throw 'staged generation_binding.generation must be a canonical non-traversing relative identity'
+    }
+    foreach ($field in @('registry_generation', 'config_generation', 'schema_generation', 'rollback_generation')) {
+        $declared = [string]$releaseBinding.$field
+        if ([System.IO.Path]::IsPathRooted($declared) -or
+            @($declared -split '[\\/]').Where({ $_ -eq '.' -or $_ -eq '..' -or $_ -eq '' }).Count -ne 0) {
+            throw "staged generation_binding field must be a canonical non-traversing identity: $field"
+        }
+    }
+    $declaredCli = ([string]$releaseBinding.install_authoritative_cli).Replace('\', '/')
+    if ($declaredCli -cne 'runtime/eliot.exe') {
+        throw 'staged generation_binding.install_authoritative_cli must be exactly runtime/eliot.exe'
+    }
+    return $releaseBinding
+}
+
 function Get-ReleaseDeterministicTestAggregatorWiring {
     # Deterministic aggregator wiring definition (Part B, #1227 gap i).
     # Defines — never executes — the exact deterministic suite set.  The
@@ -1055,6 +1105,11 @@ function New-AuthenticodeSigningPlan(
         [string]$runtime.signature_evidence -ne 'not-issued') {
         throw 'UnsignedBundle is not at the explicit unsigned signing boundary'
     }
+    # Part B generation_binding contract (item 1228 of #1227): fail closed at
+    # plan time — before any mutation — when the staged manifests lack an
+    # exactly-repeated generation_binding.  Matches invoke:1070-1080
+    # repetition semantics; no silent default.
+    [void](Get-VerifiedStagedGenerationBinding $release $runtime)
 
     $roles = @(Get-AuthenticodeRoleDefinitions)
     $seen = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
@@ -2193,6 +2248,11 @@ function Update-SignedReleaseManifests([string]$Bundle, [object]$Plan, [object]$
     $releasePath = Join-Path $Bundle 'RELEASE.json'
     $runtime = Get-Content -LiteralPath $runtimePath -Raw | ConvertFrom-Json
     $release = Get-Content -LiteralPath $releasePath -Raw | ConvertFrom-Json
+    # Part B generation_binding contract (item 1228 of #1227): copy the exact
+    # staged block into SIGNING_VERIFIED.json.  Fail-closed when the staged
+    # manifests lack an exactly-repeated binding; no silent default.  Matches
+    # invoke:1070-1080 repetition semantics (ConvertTo-Json -Compress -cne).
+    $stagedGenerationBinding = Get-VerifiedStagedGenerationBinding $release $runtime
     $signatureEvidence = ConvertTo-SignatureEvidence $Plan $Certificate $RoleEvidence
     $byPath = @{}
     foreach ($receipt in $RoleEvidence) { $byPath[[string]$receipt.role_path] = $receipt }
@@ -2220,6 +2280,9 @@ function Update-SignedReleaseManifests([string]$Bundle, [object]$Plan, [object]$
     Set-ObjectProperty $runtime 'signature_evidence' $signatureEvidence
     Set-ObjectProperty $runtime 'signed_scope' $script:AuthenticodeSigningScope
     Set-ObjectProperty $runtime 'artifacts' @($runtimeArtifacts)
+    # Preserve the exact staged generation_binding through signing so the
+    # RELEASE/RUNTIME_ARTIFACTS repetition invoke byte-compares is retained.
+    Set-ObjectProperty $runtime 'generation_binding' $stagedGenerationBinding
     Set-JsonFile $runtimePath $runtime
 
     $releaseArtifacts = foreach ($artifact in @($release.runtime_artifacts)) {
@@ -2246,6 +2309,9 @@ function Update-SignedReleaseManifests([string]$Bundle, [object]$Plan, [object]$
     Set-ObjectProperty $release 'signed_scope' $script:AuthenticodeSigningScope
     Set-ObjectProperty $release 'public_distribution_ready' $true
     Set-ObjectProperty $release 'runtime_artifacts' @($releaseArtifacts)
+    # Preserve the exact staged generation_binding through signing so the
+    # RELEASE/RUNTIME_ARTIFACTS repetition invoke byte-compares is retained.
+    Set-ObjectProperty $release 'generation_binding' $stagedGenerationBinding
     Set-JsonFile $releasePath $release
 
     $unsignedMarker = Join-Path $Bundle 'SIGNING_REQUIRED.txt'
@@ -2256,6 +2322,7 @@ function Update-SignedReleaseManifests([string]$Bundle, [object]$Plan, [object]$
             schema = 'eliot-authenticode-signing-verification-v1'
             source_commit = [string]$release.source_commit
             version = [string]$release.version
+            generation_binding = $stagedGenerationBinding
             signature_evidence = $signatureEvidence
         })
 
@@ -2320,6 +2387,24 @@ function Test-FinalizedReleaseBundle(
     $checksumEvidence = $checksum.signature_evidence | ConvertTo-Json -Depth 12 -Compress
     if ($releaseEvidence -cne $runtimeEvidence -or $releaseEvidence -cne $checksumEvidence) {
         throw 'RELEASE.json, RUNTIME_ARTIFACTS.json, and SHA256SUMS.json do not share exact signature evidence'
+    }
+    # Part B generation_binding contract (item 1228 of #1227): the finalized
+    # bundle must repeat the exact staged block across RELEASE,
+    # RUNTIME_ARTIFACTS, and SIGNING_VERIFIED so invoke:1076-1080 byte-compare
+    # succeeds.  Reuses the staged two-way verification, then binds the
+    # verified leg exactly.
+    $finalBinding = Get-VerifiedStagedGenerationBinding $release $runtime
+    $finalBindingJson = [string]($finalBinding | ConvertTo-Json -Depth 12 -Compress)
+    # StrictMode-safe read: a missing verified leg must surface as the
+    # explicit refusal below, not a PropertyNotFound error.
+    $verifiedProp = $verified.PSObject.Properties['generation_binding']
+    $verifiedBinding = if ($verifiedProp) { $verifiedProp.Value } else { $null }
+    if (-not $verifiedBinding) {
+        throw 'finalized bundle does not declare an explicit generation_binding in SIGNING_VERIFIED (pre-generation-binding bundle refused; see #1227 Part A/B: bundle → manifest → generation)'
+    }
+    $verifiedBindingJson = [string]($verifiedBinding | ConvertTo-Json -Depth 12 -Compress)
+    if ($finalBindingJson -cne $verifiedBindingJson) {
+        throw 'signed generation_binding is not exactly repeated across RELEASE/RUNTIME_ARTIFACTS/SIGNING_VERIFIED'
     }
     $roles = @(Get-AuthenticodeRoleDefinitions)
     $evidenceRoles = @($release.signature_evidence.roles)
