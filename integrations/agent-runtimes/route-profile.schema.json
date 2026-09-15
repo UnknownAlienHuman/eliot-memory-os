@@ -19,7 +19,8 @@
     "coordination",
     "probe_requirements",
     "known_gaps",
-    "source_refs"
+    "source_refs",
+    "disposition"
   ],
   "properties": {
     "$schema": { "type": "string" },
@@ -70,7 +71,8 @@
       "type": "array",
       "minItems": 1,
       "items": { "type": "string", "format": "uri" }
-    }
+    },
+    "disposition": { "$ref": "#/$defs/disposition" }
   },
   "$defs": {
     "host_surface": {
@@ -267,6 +269,43 @@
         "decision_owner": { "const": "task_controller_or_human" },
         "transcript_policy": { "const": "no_whole_sibling_transcript_by_default" },
         "result_authority": { "const": "candidate_only_until_governed_transition" }
+      }
+    },
+    "disposition": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "disposition",
+        "route_id",
+        "admittable",
+        "admitted",
+        "proof_ceiling",
+        "expiry_condition",
+        "per_attempt_receipt",
+        "required_probes",
+        "non_admittable_reasons"
+      ],
+      "properties": {
+        "disposition": {
+          "enum": ["live-admitted", "unavailable-target", "compatibility-with-expiry", "removal"]
+        },
+        "route_id": { "type": "string", "minLength": 3 },
+        "admittable": { "const": false },
+        "admitted": { "const": false },
+        "proof_ceiling": { "type": "string", "minLength": 8 },
+        "expiry_condition": { "type": "string", "minLength": 8 },
+        "per_attempt_receipt": { "const": true },
+        "required_probes": {
+          "type": "array",
+          "minItems": 1,
+          "items": { "type": "string", "minLength": 3 }
+        },
+        "non_admittable_reasons": {
+          "type": "array",
+          "minItems": 1,
+          "items": { "type": "string", "minLength": 3 }
+        },
+        "bundle_generation": { "type": "string", "minLength": 3 }
       }
     }
   }
