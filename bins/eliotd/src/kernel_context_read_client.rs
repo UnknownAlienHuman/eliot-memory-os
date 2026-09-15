@@ -1,9 +1,13 @@
-//! Kernel-backed read-only context client for the daemon (T11.1, widened T11.2).
+//! Kernel-backed read-only context client for the daemon (T11.1, widened T11.2–T11.3).
 //!
 //! Architecture: A2.3 (contract -> ports -> adapters layering), A13.2
 //! (Kernel failure-domain ownership).
 //! Implementation: T11.1 one real cognitive named read through the daemon;
-//! T11.2 adds the exact current-epistemic-position readback.
+//! T11.2 adds the exact current-epistemic-position readback; T11.3 admits the
+//! four task-bound reconstruction reads (`GetTaskState`,
+//! `GetAttentionAndProblems`, `GetUnderstandingProjectionInputs`,
+//! `GetCapabilityEvidenceState`) through the same fresh
+//! operation/scope/fence-bound capability.
 //!
 //! This module owns only the read-only [`CanonicalReadClient`] adapter over
 //! the already-authenticated [`DaemonKernelClient`]: a fresh
@@ -13,8 +17,12 @@
 //! the stable/exact re-read and churn detection) or the Governor epistemic
 //! composition (which owns position CAS). It owns no transport
 //! beyond the retained client, no Store, no semantic authority, and no write
-//! capability: only [`NamedReadOperation::GetEvidencePack`] and
-//! [`NamedReadOperation::GetCurrentEpistemicPosition`] pass
+//! capability: only [`NamedReadOperation::GetEvidencePack`],
+//! [`NamedReadOperation::GetCurrentEpistemicPosition`],
+//! [`NamedReadOperation::GetTaskState`],
+//! [`NamedReadOperation::GetAttentionAndProblems`],
+//! [`NamedReadOperation::GetUnderstandingProjectionInputs`] and
+//! [`NamedReadOperation::GetCapabilityEvidenceState`] pass
 //! [`CanonicalReadClient::execute_named`]; every other named operation fails
 //! closed as [`StoreError::UnknownOperation`] before any transport.
 //!
@@ -103,10 +111,12 @@ impl KernelContextReadClient {
         &self.kernel
     }
 
-    /// Checks the T11.1+T11.2 execute capability before any transport is touched:
-    /// `GetEvidencePack` (scope-bound, structurally valid) or
+    /// Checks the T11.1–T11.3 execute capability before any transport is touched:
+    /// `GetEvidencePack` (scope-bound, structurally valid),
     /// `GetCurrentEpistemicPosition` (scope-bound, `ExactFence`, `position`
-    /// Subject required, structurally valid).
+    /// Subject required, structurally valid), or one of the four task-bound
+    /// reconstruction reads (scope-bound, `ExactFence`, no parameters per the
+    /// closed catalogue, structurally valid).
     fn check_execute_capability(request: &NamedReadRequest) -> Result<(), StoreError> {
         match request.operation {
             NamedReadOperation::GetEvidencePack => {
@@ -118,6 +128,12 @@ impl KernelContextReadClient {
                 }
                 request.validate()?;
                 Ok(())
+            }
+            NamedReadOperation::GetTaskState
+            | NamedReadOperation::GetAttentionAndProblems
+            | NamedReadOperation::GetUnderstandingProjectionInputs
+            | NamedReadOperation::GetCapabilityEvidenceState => {
+                Self::check_reconstruction_capability(request)
             }
             NamedReadOperation::GetCurrentEpistemicPosition => {
                 if request.scope_id.is_none() {
@@ -292,6 +308,37 @@ impl KernelContextReadClient {
         Ok(result)
     }
 
+    /// Checks one T11.3 task-bound reconstruction read before any transport.
+    ///
+    /// The closed store catalogue declares no parameters for these four
+    /// operations, so any supplied parameter fails closed here (the catalogue
+    /// remains the authority downstream). `ExactFence` is required because a
+    /// reconstruction closure binds one compatible read generation: a fence
+    /// change must surface as a mismatch, never as a previous generation
+    /// served as current.
+    fn check_reconstruction_capability(request: &NamedReadRequest) -> Result<(), StoreError> {
+        if request.scope_id.is_none() {
+            return Err(StoreError::InvalidField {
+                field: "scope_id",
+                reason: "reconstruction read requires an exact scope",
+            });
+        }
+        if request.consistency != ReadConsistency::ExactFence {
+            return Err(StoreError::InvalidField {
+                field: "operation.consistency",
+                reason: "reconstruction read requires ExactFence",
+            });
+        }
+        if !request.parameters.is_empty() {
+            return Err(StoreError::InvalidField {
+                field: "operation.parameter",
+                reason: "reconstruction read declares no parameters",
+            });
+        }
+        request.validate()?;
+        Ok(())
+    }
+
     /// Checks an execute response against the exact request it answers:
     /// structural validity plus operation identity and fence equality.
     fn check_execute_response(
@@ -418,13 +465,15 @@ impl CanonicalReadClient for KernelContextReadClient {
     /// Executes one closed cognitive read through the Kernel route.
     ///
     /// Fresh capability per call: the operation must be `GetEvidencePack`
-    /// (scope-bound) or `GetCurrentEpistemicPosition` (scope-bound,
-    /// `ExactFence`, `position` Subject required), the request must validate,
-    /// and its fence must equal the currently admitted snapshot fence —
-    /// otherwise this fails closed before transport. The response validates
-    /// exactly and must echo the requested operation and fence. Consistency
-    /// (stable / exact re-read, churn detection) stays with the Governor
-    /// `ReadService` or epistemic-composition caller; this method performs no
+    /// (scope-bound), `GetCurrentEpistemicPosition` (scope-bound,
+    /// `ExactFence`, `position` Subject required), or one of the four
+    /// task-bound reconstruction reads (scope-bound, `ExactFence`, no
+    /// parameters), the request must validate, and its fence must equal the
+    /// currently admitted snapshot fence — otherwise this fails closed before
+    /// transport. The response validates exactly and must echo the requested
+    /// operation and fence. Consistency (stable / exact re-read, churn
+    /// detection) stays with the Governor `ReadService` or
+    /// epistemic/reconstruction-composition caller; this method performs no
     /// second implementation.
     async fn execute_named(
         &self,
@@ -442,6 +491,137 @@ impl CanonicalReadClient for KernelContextReadClient {
             .map_err(Self::map_kernel_error)?;
         Self::check_execute_response(&query, &response)?;
         Ok(response)
+    }
+}
+
+/// Borrowed T11.3 reconstruction read composition over daemon-held clients.
+///
+/// Attach-style wiring mirroring `DaemonComposition::epistemic_composition`
+/// (and the generic borrow shape of
+/// `GovernorEpistemicComposition<'_, P, R>`): readiness is checked by the
+/// composition-root accessor, then this borrow pins the exact admitted fence
+/// observed from the retained Kernel snapshot at borrow time together with
+/// the task-bound scope. The composition retains no client beyond the
+/// borrowed references and spawns no thread — the caller (the single daemon
+/// runtime holding both concrete clients) passes the already-connected
+/// clients per borrow, so a Governor refresh between borrow and execute
+/// surfaces as an exact fence mismatch instead of silent divergence.
+///
+/// Planning of evidence/position selectors stays with the daemon runtime
+/// planners; this borrow plans only the four parameter-free reconstruction
+/// reads and validates their responses against the borrow-time fence. The
+/// borrow-time pin is a second layer behind
+/// [`KernelContextReadClient::execute_named`]'s call-time fence check: a
+/// response matching neither fails closed, so a previous generation is never
+/// served as current. No `composition.rs` change is involved: this uses only
+/// the retained snapshot fence plus the two borrowed clients.
+pub struct ReconstructionReadComposition<'a, K: ?Sized, R: ?Sized> {
+    kernel: &'a K,
+    reads: &'a R,
+    admitted_fence: StateFence,
+    scope: ScopeId,
+}
+
+impl<'a, K: ?Sized, R: ?Sized> ReconstructionReadComposition<'a, K, R> {
+    /// Borrows the retained clients with the exact admitted fence and scope.
+    #[must_use]
+    pub const fn borrow(
+        kernel: &'a K,
+        reads: &'a R,
+        admitted_fence: StateFence,
+        scope: ScopeId,
+    ) -> Self {
+        Self {
+            kernel,
+            reads,
+            admitted_fence,
+            scope,
+        }
+    }
+
+    /// Borrows the retained Kernel client.
+    #[must_use]
+    pub const fn kernel(&self) -> &'a K {
+        self.kernel
+    }
+
+    /// Borrows the retained read client.
+    #[must_use]
+    pub const fn reads(&self) -> &'a R {
+        self.reads
+    }
+
+    /// Returns the fence pinned at borrow time.
+    #[must_use]
+    pub const fn admitted_fence(&self) -> &StateFence {
+        &self.admitted_fence
+    }
+
+    /// Returns the task-bound scope pinned at borrow time.
+    #[must_use]
+    pub const fn scope(&self) -> &ScopeId {
+        &self.scope
+    }
+
+    /// Plans one parameter-free reconstruction read against the pinned fence.
+    ///
+    /// Only the four T11.3 reconstruction operations plan here; every other
+    /// operation fails closed as [`StoreError::UnknownOperation`] before any
+    /// transport. The request carries the borrow-time fence with `ExactFence`
+    /// consistency and no parameters, matching the closed catalogue.
+    pub fn plan_role_request(
+        &self,
+        operation: NamedReadOperation,
+    ) -> Result<NamedReadRequest, StoreError> {
+        if !matches!(
+            operation,
+            NamedReadOperation::GetTaskState
+                | NamedReadOperation::GetAttentionAndProblems
+                | NamedReadOperation::GetUnderstandingProjectionInputs
+                | NamedReadOperation::GetCapabilityEvidenceState
+        ) {
+            return Err(StoreError::UnknownOperation);
+        }
+        let request = NamedReadRequest {
+            operation,
+            scope_id: Some(self.scope.clone()),
+            consistency: ReadConsistency::ExactFence,
+            state_fence: self.admitted_fence.clone(),
+            parameters: BTreeMap::new(),
+        };
+        request.validate()?;
+        Ok(request)
+    }
+
+    /// Checks a reconstruction response against the borrow-time pin.
+    ///
+    /// The response must validate structurally, echo the planned operation
+    /// (which must itself be one of the four reconstruction reads), and carry
+    /// the exact borrow-time fence. A Governor refresh between borrow and
+    /// execute fails closed here even if the call-time fence check passed an
+    /// earlier generation.
+    pub fn check_role_response(
+        &self,
+        operation: NamedReadOperation,
+        response: &NamedReadResponse,
+    ) -> Result<(), StoreError> {
+        if !matches!(
+            operation,
+            NamedReadOperation::GetTaskState
+                | NamedReadOperation::GetAttentionAndProblems
+                | NamedReadOperation::GetUnderstandingProjectionInputs
+                | NamedReadOperation::GetCapabilityEvidenceState
+        ) {
+            return Err(StoreError::UnknownOperation);
+        }
+        response.validate()?;
+        if response.operation != operation {
+            return Err(StoreError::UnknownOperation);
+        }
+        if response.state_fence != self.admitted_fence {
+            return Err(StoreError::FenceMismatch);
+        }
+        Ok(())
     }
 }
 
@@ -511,16 +691,33 @@ mod tests {
         })
     }
 
+    fn reconstruction_request(
+        operation: NamedReadOperation,
+        fence: &StateFence,
+    ) -> Result<NamedReadRequest, Box<dyn std::error::Error>> {
+        Ok(NamedReadRequest {
+            operation,
+            scope_id: Some(ScopeId::new("governor")?),
+            consistency: ReadConsistency::ExactFence,
+            state_fence: fence.clone(),
+            parameters: BTreeMap::new(),
+        })
+    }
+
     #[test]
-    fn execute_capability_rejects_non_evidence_operations_before_transport()
+    fn execute_capability_rejects_truly_unsupported_operations_before_transport()
     -> Result<(), Box<dyn std::error::Error>> {
         let fence = test_fence(1)?;
-        let mut request = evidence_request(&fence)?;
-        request.operation = NamedReadOperation::GetTaskState;
-        assert!(matches!(
-            KernelContextReadClient::check_execute_capability(&request),
-            Err(StoreError::UnknownOperation)
-        ));
+        // T11.3 admits the four reconstruction reads; they no longer fail here.
+        for operation in [
+            NamedReadOperation::GetTaskState,
+            NamedReadOperation::GetAttentionAndProblems,
+            NamedReadOperation::GetUnderstandingProjectionInputs,
+            NamedReadOperation::GetCapabilityEvidenceState,
+        ] {
+            let admitted = reconstruction_request(operation, &fence)?;
+            KernelContextReadClient::check_execute_capability(&admitted)?;
+        }
 
         let mut receipt = evidence_request(&fence)?;
         receipt.operation = NamedReadOperation::ResolveWriteReceipt;
@@ -528,6 +725,62 @@ mod tests {
             KernelContextReadClient::check_execute_capability(&receipt),
             Err(StoreError::UnknownOperation)
         ));
+
+        let mut mailbox = reconstruction_request(NamedReadOperation::GetTaskState, &fence)?;
+        mailbox.operation = NamedReadOperation::GetMailbox;
+        assert!(matches!(
+            KernelContextReadClient::check_execute_capability(&mailbox),
+            Err(StoreError::UnknownOperation)
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn reconstruction_capability_requires_scope_exact_fence_and_no_parameters()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let fence = test_fence(1)?;
+        for operation in [
+            NamedReadOperation::GetTaskState,
+            NamedReadOperation::GetAttentionAndProblems,
+            NamedReadOperation::GetUnderstandingProjectionInputs,
+            NamedReadOperation::GetCapabilityEvidenceState,
+        ] {
+            let request = reconstruction_request(operation, &fence)?;
+            KernelContextReadClient::check_execute_capability(&request)?;
+
+            let mut unscoped = reconstruction_request(operation, &fence)?;
+            unscoped.scope_id = None;
+            assert!(matches!(
+                KernelContextReadClient::check_execute_capability(&unscoped),
+                Err(StoreError::InvalidField {
+                    field: "scope_id",
+                    ..
+                })
+            ));
+
+            let mut eventual = reconstruction_request(operation, &fence)?;
+            eventual.consistency = ReadConsistency::Eventual;
+            assert!(matches!(
+                KernelContextReadClient::check_execute_capability(&eventual),
+                Err(StoreError::InvalidField {
+                    field: "operation.consistency",
+                    ..
+                })
+            ));
+
+            let mut with_params = reconstruction_request(operation, &fence)?;
+            with_params.parameters.insert(
+                "subject".to_owned(),
+                serde_json::Value::String("smuggled".to_owned()),
+            );
+            assert!(matches!(
+                KernelContextReadClient::check_execute_capability(&with_params),
+                Err(StoreError::InvalidField {
+                    field: "operation.parameter",
+                    ..
+                })
+            ));
+        }
         Ok(())
     }
 
@@ -646,5 +899,104 @@ mod tests {
             )),
             StoreError::Serialization(_)
         ));
+    }
+
+    struct StandInClients;
+
+    fn test_composition<'a>(
+        kernel: &'a StandInClients,
+        reads: &'a StandInClients,
+        fence: &'a StateFence,
+    ) -> Result<
+        ReconstructionReadComposition<'a, StandInClients, StandInClients>,
+        Box<dyn std::error::Error>,
+    > {
+        // The generic borrow shape mirrors `GovernorEpistemicComposition`: the
+        // production caller passes the concrete daemon clients while tests
+        // borrow inert stand-ins, so the fence pinning and role gating stay
+        // provable without transport.
+        Ok(ReconstructionReadComposition::borrow(
+            kernel,
+            reads,
+            fence.clone(),
+            ScopeId::new("governor")?,
+        ))
+    }
+
+    #[test]
+    fn reconstruction_composition_plans_only_the_four_role_reads()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let fence = test_fence(1)?;
+        let kernel = StandInClients;
+        let reads = StandInClients;
+        let composition = test_composition(&kernel, &reads, &fence)?;
+        assert_eq!(composition.admitted_fence(), &fence);
+        assert_eq!(composition.scope().as_str(), "governor");
+        for operation in [
+            NamedReadOperation::GetTaskState,
+            NamedReadOperation::GetAttentionAndProblems,
+            NamedReadOperation::GetUnderstandingProjectionInputs,
+            NamedReadOperation::GetCapabilityEvidenceState,
+        ] {
+            let planned = composition.plan_role_request(operation)?;
+            assert_eq!(planned.operation, operation);
+            assert_eq!(planned.consistency, ReadConsistency::ExactFence);
+            assert_eq!(planned.state_fence, fence);
+            assert_eq!(
+                planned.scope_id.as_ref().map(ScopeId::as_str),
+                Some("governor")
+            );
+            assert!(planned.parameters.is_empty());
+            KernelContextReadClient::check_execute_capability(&planned)?;
+        }
+        for operation in [
+            NamedReadOperation::GetEvidencePack,
+            NamedReadOperation::GetCurrentEpistemicPosition,
+            NamedReadOperation::GetMailbox,
+        ] {
+            assert!(matches!(
+                composition.plan_role_request(operation),
+                Err(StoreError::UnknownOperation)
+            ));
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn reconstruction_composition_pins_the_borrow_time_fence()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let fence = test_fence(1)?;
+        let kernel = StandInClients;
+        let reads = StandInClients;
+        let composition = test_composition(&kernel, &reads, &fence)?;
+        let operation = NamedReadOperation::GetTaskState;
+        let exact = NamedReadResponse {
+            operation,
+            state_fence: fence.clone(),
+            revision_heads: Vec::new(),
+            payload: json!({"version": 1}),
+        };
+        composition.check_role_response(operation, &exact)?;
+
+        let mut wrong_operation = exact.clone();
+        wrong_operation.operation = NamedReadOperation::GetAttentionAndProblems;
+        assert!(matches!(
+            composition.check_role_response(operation, &wrong_operation),
+            Err(StoreError::UnknownOperation)
+        ));
+
+        // A Governor refresh between borrow and execute fails closed: the
+        // refreshed generation never validates against the borrow-time pin.
+        let mut refreshed = exact.clone();
+        refreshed.state_fence = test_fence(2)?;
+        assert!(matches!(
+            composition.check_role_response(operation, &refreshed),
+            Err(StoreError::FenceMismatch)
+        ));
+        assert!(matches!(
+            composition.check_role_response(NamedReadOperation::GetMailbox, &exact),
+            Err(StoreError::UnknownOperation)
+        ));
+        Ok(())
     }
 }
