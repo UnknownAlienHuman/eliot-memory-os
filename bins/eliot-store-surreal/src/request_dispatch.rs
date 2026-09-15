@@ -316,14 +316,13 @@ impl StoreDispatchBackend for StoreComposition {
                     transition.identity.operation_id.clone(),
                     transition.identity.idempotency_key.clone(),
                 );
-                match self
-                    .apply(
-                        &context,
-                        transition,
-                        expected_revision_heads,
-                        expected_ordering_heads,
-                    )
-                    .await
+                match Box::pin(self.apply(
+                    &context,
+                    transition,
+                    expected_revision_heads,
+                    expected_ordering_heads,
+                ))
+                .await
                 {
                     Ok(receipt) => response_for_transaction_receipt(receipt, failure_context),
                     Err(error) => map_composition_error(error, failure_context),
