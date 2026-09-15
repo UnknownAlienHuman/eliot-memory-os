@@ -2346,23 +2346,23 @@ mod tests {
                 0 => current.authority_epoch = test_epoch(2),
                 1 => {
                     current.resource_generation =
-                        ResourceGeneration::new(2).map_err(StoreError::Foundation)?
+                        ResourceGeneration::new(2).map_err(StoreError::Foundation)?;
                 }
                 2 => {
                     current.task_revision = Some(
                         eliot_contracts::TaskRevision::new(2).map_err(StoreError::Foundation)?,
-                    )
+                    );
                 }
                 3 => {
                     current.policy_revision = Some(
                         eliot_contracts::PolicyRevision::new(2).map_err(StoreError::Foundation)?,
-                    )
+                    );
                 }
                 _ => {
                     current.integration_revision = Some(
                         eliot_contracts::IntegrationRevision::new(2)
                             .map_err(StoreError::Foundation)?,
-                    )
+                    );
                 }
             }
             // Fixture installs the new current fence. Historical observations
