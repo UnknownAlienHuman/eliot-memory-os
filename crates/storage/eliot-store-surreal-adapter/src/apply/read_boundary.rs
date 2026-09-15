@@ -355,8 +355,12 @@ async fn read_evidence_records(
         schema::READ_ALL_RECEIPTS,
     );
     let mut response = client::query(db, config, "read.evidence_records", &sql, Map::new()).await?;
-    let mut rows = take_vec::<EvidenceReceiptRow>(&mut response, 0)?;
-    let receipts = take_vec::<WriteReceipt>(&mut response, 1)?;
+    if !response.take_errors().is_empty() {
+        return Err(StoreError::Serialization("evidence snapshot query failed".to_owned()).into());
+    }
+    // SurrealDB 3 retains the BEGIN result at index 0 (null).
+    let mut rows = take_vec::<EvidenceReceiptRow>(&mut response, 1)?;
+    let receipts = take_vec::<WriteReceipt>(&mut response, 2)?;
     let mut by_commit = BTreeMap::new();
     for receipt in receipts {
         if let Some(marker) = &receipt.committed_at
@@ -839,7 +843,7 @@ mod admitted_read_tests {
         let mut wrong_scope_query = query.clone();
         wrong_scope_query.scope_id = Some(ScopeId::new("other").expect("scope"));
         let absent =
-            evidence_pack_payload(&wrong_scope_query, &fence, &[row.clone()]).expect("empty");
+            evidence_pack_payload(&wrong_scope_query, &fence, std::slice::from_ref(&row)).expect("empty");
         assert_eq!(absent["provenance"]["matched_total"], json!(0));
         let mut no_receipt = row.clone();
         no_receipt.receipt = None;
