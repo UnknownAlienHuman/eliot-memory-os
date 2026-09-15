@@ -2422,7 +2422,11 @@ dependencies = [
 name = "eliot-store-memory"
 version = "0.1.0"
 dependencies = [
+ "eliot-canonical",
  "eliot-contracts",
+ "eliot-epistemic-contracts",
+ "eliot-evidence",
+ "eliot-receipts",
  "eliot-store-api",
  "schemars",
  "serde",

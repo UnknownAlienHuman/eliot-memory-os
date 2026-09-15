@@ -5,6 +5,9 @@
 
 #![forbid(unsafe_code)]
 
+#[cfg(test)]
+mod epistemic_tests;
+
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::{Mutex, MutexGuard, TryLockError};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -133,6 +136,20 @@ impl MemoryStore {
             .map(|commit| commit.payload.position_key())
             .transpose()?;
         if let (Some(commit), Some(key)) = (&epistemic, &epistemic_key) {
+            let predecessor = state
+                .epistemic_positions
+                .get(key)
+                .map(|(previous, _)| previous.payload.candidate.digest.as_str());
+            if predecessor
+                != commit
+                    .payload
+                    .candidate
+                    .predecessor
+                    .as_ref()
+                    .map(|id| id.as_str())
+            {
+                return Err(StoreError::RevisionConflict);
+            }
             let current = state
                 .epistemic_positions
                 .get(key)

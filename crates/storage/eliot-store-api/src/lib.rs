@@ -1842,7 +1842,24 @@ fn receipt_task(
     {
         return Err(StoreError::InvalidReceipt);
     }
-    match (&context.task_id, state_fence.task_revision) {
+    // Epistemic admission carries its exact task revision in the frozen
+    // payload. The daemon generation fence may deliberately be unscoped;
+    // do not substitute the independently advancing Store/position revision.
+    let task_revision =
+        match epistemic_revision::EpistemicCommit::from_prepared(context, transition)? {
+            Some(commit) => {
+                let revision = commit.payload.candidate.revision;
+                if state_fence
+                    .task_revision
+                    .is_some_and(|bound| bound != revision)
+                {
+                    return Err(StoreError::InvalidReceipt);
+                }
+                Some(revision)
+            }
+            None => state_fence.task_revision,
+        };
+    match (&context.task_id, task_revision) {
         (Some(task_id), Some(task_revision)) => Ok(Some(TaskBinding {
             task_id: task_id.clone(),
             task_revision,

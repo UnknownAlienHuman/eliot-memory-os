@@ -71,7 +71,7 @@ fn evidence_pack_params() -> BTreeMap<String, Value> {
 #[test]
 fn activated_typed_reads_pass_catalogue_validation() {
     let entries = generated_operation_manifests().unwrap();
-    assert_eq!(entries.len(), 11);
+    assert_eq!(entries.len(), 13);
 
     // The closed name mapping is the single owner for code, manifests, wire.
     for operation in [
@@ -80,6 +80,7 @@ fn activated_typed_reads_pass_catalogue_validation() {
         NamedReadOperation::GetScopeRevisionView,
         NamedReadOperation::ResolveWriteReceipt,
         NamedReadOperation::GetEvidencePack,
+        NamedReadOperation::GetCurrentEpistemicPosition,
     ] {
         let wire = serde_json::to_value(operation).unwrap();
         assert_eq!(
@@ -116,6 +117,16 @@ fn activated_typed_reads_pass_catalogue_validation() {
         evidence_pack_params(),
     );
     assert!(pack.validate_against_catalogue(&entries).is_ok());
+
+    let position = read_request(
+        NamedReadOperation::GetCurrentEpistemicPosition,
+        Some("scope-one"),
+        BTreeMap::from([("position".to_owned(), json!("position-one"))]),
+    );
+    assert!(position.validate_against_catalogue(&entries).is_ok());
+    let mut foreign = position;
+    foreign.scope_id = None;
+    assert!(foreign.validate_against_catalogue(&entries).is_err());
 }
 
 #[test]
@@ -279,7 +290,11 @@ fn evidence_pack_selectors_fail_closed() {
     // Blank subject fails the declared shape.
     let mut blank = evidence_pack_params();
     blank.insert("subject".to_owned(), json!("   "));
-    let request = read_request(NamedReadOperation::GetEvidencePack, Some("scope-one"), blank);
+    let request = read_request(
+        NamedReadOperation::GetEvidencePack,
+        Some("scope-one"),
+        blank,
+    );
     assert!(matches!(
         request.validate_against_catalogue(&entries),
         Err(StoreError::InvalidField {
@@ -427,10 +442,7 @@ fn lifecycle_params() -> BTreeMap<String, Value> {
         ("action".to_owned(), json!("keep")),
         ("base_view_digest".to_owned(), json!("a".repeat(64))),
         ("candidate_digest".to_owned(), json!("b".repeat(64))),
-        (
-            "candidate_package_digest".to_owned(),
-            json!("c".repeat(64)),
-        ),
+        ("candidate_package_digest".to_owned(), json!("c".repeat(64))),
         ("skill_id".to_owned(), json!("skill-1")),
         ("verifier_ref".to_owned(), json!("verifier-1")),
     ])
@@ -457,15 +469,9 @@ fn recovery_params() -> BTreeMap<String, Value> {
             "operation_manifest_digest".to_owned(),
             json!("c".repeat(64)),
         ),
-        (
-            "artifact_binding_digest".to_owned(),
-            json!("b".repeat(64)),
-        ),
+        ("artifact_binding_digest".to_owned(), json!("b".repeat(64))),
         ("fence_digest".to_owned(), json!("d".repeat(64))),
-        (
-            "observation_operation_id".to_owned(),
-            json!("operation-1"),
-        ),
+        ("observation_operation_id".to_owned(), json!("operation-1")),
         ("observation_record_id".to_owned(), json!("record-1")),
         (
             "observation_request_digest".to_owned(),
@@ -529,7 +535,7 @@ fn approved_capture_plan_passes_and_stale_digest_fails_manifest_mismatch() {
 #[test]
 fn capture_observation_passes_whole_path() {
     let entries = generated_operation_manifests().unwrap();
-    assert_eq!(entries.len(), 11);
+    assert_eq!(entries.len(), 13);
     let set_digest = operation_manifest_set_digest(&entries).unwrap();
 
     // Approved owner-shaped subject params pass catalogue validation.
@@ -576,7 +582,7 @@ fn capture_observation_passes_whole_path() {
 #[test]
 fn append_audit_event_passes_whole_path() {
     let entries = generated_operation_manifests().unwrap();
-    assert_eq!(entries.len(), 11);
+    assert_eq!(entries.len(), 13);
     let set_digest = operation_manifest_set_digest(&entries).unwrap();
 
     // Approved receipt-bound audit params pass catalogue validation without bypass.
@@ -587,7 +593,7 @@ fn append_audit_event_passes_whole_path() {
 #[test]
 fn apply_lifecycle_policy_passes_whole_path() {
     let entries = generated_operation_manifests().unwrap();
-    assert_eq!(entries.len(), 11);
+    assert_eq!(entries.len(), 13);
     let set_digest = operation_manifest_set_digest(&entries).unwrap();
 
     // Approved lifecycle-policy params pass catalogue validation without bypass.
@@ -598,7 +604,7 @@ fn apply_lifecycle_policy_passes_whole_path() {
 #[test]
 fn reconcile_recovery_passes_whole_path() {
     let entries = generated_operation_manifests().unwrap();
-    assert_eq!(entries.len(), 11);
+    assert_eq!(entries.len(), 13);
     let set_digest = operation_manifest_set_digest(&entries).unwrap();
 
     // Approved problem-leg recovery params pass catalogue validation without bypass.
@@ -645,7 +651,7 @@ fn reconcile_recovery_passes_whole_path() {
 #[test]
 fn update_task_state_passes_whole_path() {
     let entries = generated_operation_manifests().unwrap();
-    assert_eq!(entries.len(), 11);
+    assert_eq!(entries.len(), 13);
     let set_digest = operation_manifest_set_digest(&entries).unwrap();
 
     // Approved task-control params pass catalogue validation without bypass.
@@ -680,16 +686,41 @@ fn still_unactivated_mutation_is_refused() {
     let set_digest = operation_manifest_set_digest(&entries).unwrap();
 
     // A still-unadmitted mutation has no catalogue entry and fails closed.
+    // T11.2 activates both UpdateTaskState and ApplyEpistemicRevision, so the
+    // remaining unactivated mutation is RecordAuthorityRevocation.
     let mut plan = mutation_plan(&set_digest);
-    plan.transition_class = TransitionClass::Epistemic;
+    plan.transition_class = TransitionClass::RecoverySchema;
     plan.named_operations = vec![NamedMutationRequest {
-        operation: NamedMutationOperation::ApplyEpistemicRevision,
+        operation: NamedMutationOperation::RecordAuthorityRevocation,
         parameters: BTreeMap::new(),
     }];
     assert_eq!(
         plan.validate_against_catalogue(&entries),
         Err(StoreError::UnknownOperation)
     );
+}
+
+#[test]
+fn epistemic_revision_requires_its_closed_typed_payload() {
+    let entries = generated_operation_manifests().unwrap();
+    let set_digest = operation_manifest_set_digest(&entries).unwrap();
+    let mut plan = mutation_plan(&set_digest);
+    plan.transition_class = TransitionClass::Epistemic;
+    plan.named_operations = vec![NamedMutationRequest {
+        operation: NamedMutationOperation::ApplyEpistemicRevision,
+        parameters: BTreeMap::new(),
+    }];
+    assert!(matches!(
+        plan.validate_against_catalogue(&entries),
+        Err(StoreError::InvalidField {
+            field: "operation.parameter",
+            ..
+        })
+    ));
+    plan.named_operations[0]
+        .parameters
+        .insert("revision".to_owned(), json!({"status":"supported"}));
+    assert!(plan.validate_against_catalogue(&entries).is_err());
 }
 
 fn genesis_context() -> eliot_store_api::RequestMeta {

@@ -20,10 +20,11 @@ use eliot_store_api::{OrderingHead, RevisionHead, WriteReceipt};
 // Read and compare in the same transaction as the fence CAS and receipt.
 // The fence CAS serializes racing writers even when the position is absent.
 const EPISTEMIC_CAS: &str = r"
-LET $position_before = (SELECT epistemic_position_revision FROM write_receipt
+LET $position_before = (SELECT epistemic_position_revision, epistemic_candidate_digest FROM write_receipt
     WHERE epistemic_position_key = $epistemic_position_key
     ORDER BY epistemic_position_revision DESC LIMIT 1);
-IF ($position_before[0].epistemic_position_revision ?? 0) != $expected_position_revision {
+IF ($position_before[0].epistemic_position_revision ?? 0) != $expected_position_revision
+    OR ($position_before[0].epistemic_candidate_digest ?? '') != $expected_predecessor_digest {
     THROW 'epistemic_position_cas_conflict';
 };
 ";
@@ -63,17 +64,26 @@ pub(super) async fn write_transaction(
         commit.readback(receipt)?;
         sql.push_str(EPISTEMIC_CAS);
         bindings.insert(
+            "expected_predecessor_digest".to_owned(),
+            json!(
+                commit
+                    .payload
+                    .candidate
+                    .predecessor
+                    .as_ref()
+                    .map_or("", |id| id.as_str())
+            ),
+        );
+        bindings.insert(
             "epistemic_position_key".to_owned(),
             json!(commit.payload.position_key()?),
         );
         bindings.insert(
             "expected_position_revision".to_owned(),
-            json!(
-                commit
-                    .payload
-                    .expected_position_revision
-                    .map_or(0, |revision| revision.value())
-            ),
+            json!(commit.payload.expected_position_revision.map_or(
+                0,
+                eliot_store_api::epistemic_revision::PositionRevision::value
+            )),
         );
     }
 
@@ -273,7 +283,8 @@ pub(super) async fn write_transaction(
             "commit_sequence": plan.commit_sequence,
             "named_operation_count": transition.named_operations.len(),
             "epistemic_position_key": epistemic.as_ref().map(|commit| commit.payload.position_key()).transpose()?,
-            "epistemic_position_revision": epistemic.as_ref().map(|commit| commit.payload.next_revision().map(|revision| revision.value())).transpose()?,
+            "epistemic_position_revision": epistemic.as_ref().map(|commit| commit.payload.next_revision().map(eliot_store_api::epistemic_revision::PositionRevision::value)).transpose()?,
+            "epistemic_candidate_digest": epistemic.as_ref().map(|commit| &commit.payload.candidate.digest),
             "epistemic_payload": epistemic.as_ref().map(serde_json::to_string).transpose()
                 .map_err(|error| AdapterError::Serialization(error.to_string()))?,
         }),

@@ -257,7 +257,7 @@ const ACTIVATED_MUTATIONS: [ActivatedMutationDescriptor; 6] = [
     ActivatedMutationDescriptor {
         operation: NamedMutationOperation::ApplyEpistemicRevision,
         transition_classes: &[TransitionClass::Epistemic],
-        maximum_effect: EffectClass::ReversibleMutation,
+        maximum_effect: TransitionClass::Epistemic.maximum_effect(),
     },
     ActivatedMutationDescriptor {
         operation: NamedMutationOperation::CaptureObservation,

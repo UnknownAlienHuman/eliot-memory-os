@@ -34,6 +34,8 @@
 
 mod activation_outcome;
 mod composition;
+mod epistemic_composition;
+pub use epistemic_composition::{GovernorEpistemicComposition, ObservedEpistemicProposal};
 mod controlboard_projection;
 mod observation_reconciliation;
 mod operator_reconciliation;
