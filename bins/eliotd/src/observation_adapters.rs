@@ -418,6 +418,53 @@ mod tests {
         }
     }
 
+    /// Rejects identity/transition binding and head mismatches like the
+    /// neutral port contract requires, before any test receipt is issued.
+    fn check_test_bindings(
+        identity: &eliot_protocol::RequestIdentity,
+        transition: &PreparedTransition,
+        expected_revision_heads: &[RevisionHeadExpectation],
+        expected_ordering_heads: &[OrderingHeadExpectation],
+    ) -> Result<(), KernelPortError> {
+        identity
+            .validate()
+            .map_err(|error| KernelPortError::Contract(error.to_string()))?;
+        transition
+            .validate()
+            .map_err(|error| KernelPortError::Contract(error.to_string()))?;
+        if identity.request.metadata.state_fence != transition.state_fence
+            || identity.request.state_fence != transition.state_fence
+        {
+            return Err(KernelPortError::Contract(
+                "test gateway: identity fence does not match transition".to_owned(),
+            ));
+        }
+        if identity.idempotency_key != transition.identity.idempotency_key {
+            return Err(KernelPortError::Contract(
+                "test gateway: identity idempotency does not match transition".to_owned(),
+            ));
+        }
+        for head in expected_revision_heads {
+            head.validate()
+                .map_err(|error| KernelPortError::Contract(error.to_string()))?;
+            if head.state_fence != transition.state_fence {
+                return Err(KernelPortError::Contract(
+                    "test gateway: revision head fence mismatch".to_owned(),
+                ));
+            }
+        }
+        for head in expected_ordering_heads {
+            head.validate()
+                .map_err(|error| KernelPortError::Contract(error.to_string()))?;
+            if head.state_fence != transition.state_fence {
+                return Err(KernelPortError::Contract(
+                    "test gateway: ordering head fence mismatch".to_owned(),
+                ));
+            }
+        }
+        Ok(())
+    }
+
     impl KernelGenerationSnapshotProvider for GenesisKernel {
         fn snapshot(&self) -> &KernelGenerationSnapshot {
             &self.snapshot
@@ -434,42 +481,12 @@ mod tests {
         ) -> KernelPortFuture<'a, WriteReceipt> {
             let identity = identity.clone();
             Box::pin(async move {
-                identity
-                    .validate()
-                    .map_err(|error| KernelPortError::Contract(error.to_string()))?;
-                transition
-                    .validate()
-                    .map_err(|error| KernelPortError::Contract(error.to_string()))?;
-                if identity.request.metadata.state_fence != transition.state_fence
-                    || identity.request.state_fence != transition.state_fence
-                {
-                    return Err(KernelPortError::Contract(
-                        "test gateway: identity fence does not match transition".to_owned(),
-                    ));
-                }
-                if identity.idempotency_key != transition.identity.idempotency_key {
-                    return Err(KernelPortError::Contract(
-                        "test gateway: identity idempotency does not match transition".to_owned(),
-                    ));
-                }
-                for head in &expected_revision_heads {
-                    head.validate()
-                        .map_err(|error| KernelPortError::Contract(error.to_string()))?;
-                    if head.state_fence != transition.state_fence {
-                        return Err(KernelPortError::Contract(
-                            "test gateway: revision head fence mismatch".to_owned(),
-                        ));
-                    }
-                }
-                for head in &expected_ordering_heads {
-                    head.validate()
-                        .map_err(|error| KernelPortError::Contract(error.to_string()))?;
-                    if head.state_fence != transition.state_fence {
-                        return Err(KernelPortError::Contract(
-                            "test gateway: ordering head fence mismatch".to_owned(),
-                        ));
-                    }
-                }
+                check_test_bindings(
+                    &identity,
+                    &transition,
+                    &expected_revision_heads,
+                    &expected_ordering_heads,
+                )?;
                 let key = transition.identity.operation_id.as_str().to_owned();
                 let hash = transition.identity.canonical_request_hash.clone();
                 let mut committed = self.committed.lock().expect("committed lock");
