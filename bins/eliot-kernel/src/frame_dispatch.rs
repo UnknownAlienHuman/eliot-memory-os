@@ -11,6 +11,7 @@
 //! Ordinary module: I2.23 Capability-family topology and crate extraction decisions — ordinary single-file extraction (<10k LOC) owning only `KernelComposition::dispatch_frame` plus inseparable dispatch-only helpers with zero external users.
 
 use super::front_door_session::{DOCTOR_MODULE_ID, TESTD_MODULE_ID};
+use super::dreamer_job_dispatch::is_dreamer_operation;
 use super::native_worker_lifecycle_route::is_native_worker_operation;
 use super::{
     ACTIVE_DAEMON_CALLER, DOCTOR_REPAIR_WIRE_ID, DoctorRepairAttemptRequest, Frame, FrameKind,
@@ -337,6 +338,36 @@ impl KernelComposition {
                     return Err(TransportError::SessionFenced);
                 }
                 return self.dispatch_testd_frame(session, frame);
+            }
+            if is_dreamer_operation(native_operation) {
+                // T12-05 K2 Dreamer requester routing rides the same admitted
+                // transport through this closed gateway. Intake
+                // (`Request`/`Execute`) requires `Ready`; peer, correlation,
+                // and fence joins mirror the testd gate above; envelope,
+                // role, and fence joins live in `dispatch_dreamer_frame`.
+                // Stale or unauthenticated sessions fence here and are never
+                // granted protected input. No process is spawned on this
+                // path (worker handoff is T12-09).
+                if frame.kind != FrameKind::Request
+                    || frame.message_type != MessageType::Execute
+                {
+                    return Err(TransportError::SessionFenced);
+                }
+                if self
+                    .service_state()
+                    .map_err(|_| TransportError::SessionFenced)?
+                    != KernelServiceState::Ready
+                {
+                    return Err(TransportError::SessionFenced);
+                }
+                session
+                    .peer
+                    .validate()
+                    .map_err(|_| TransportError::PeerIdentityUnavailable)?;
+                if frame.request_id.is_none() || frame.request_identity.is_none() {
+                    return Err(TransportError::SessionFenced);
+                }
+                return self.dispatch_dreamer_frame(session, frame);
             }
             if self
                 .service_state()

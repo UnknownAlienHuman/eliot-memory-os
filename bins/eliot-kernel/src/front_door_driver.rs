@@ -331,6 +331,28 @@ async fn serve_connection(
                     return Err(error);
                 }
             }
+            KernelFrameAction::Dreamer {
+                request_id,
+                operation,
+                payload,
+            } => {
+                // T12-05 K2 Dreamer requester routing: one bounded
+                // request/response through the closed K2 handler
+                // (`KernelComposition::execute_dreamer_request`). Frames are
+                // served strictly in receive order on this connection, so a
+                // second call can never run concurrently with the first;
+                // unknown operations never reach this arm (dispatch fences
+                // them) and any handler failure fences the session instead
+                // of silently dropping the submit. No process is spawned
+                // here.
+                let reply = kernel
+                    .execute_dreamer_request(&session, request_id, &operation, payload)
+                    .await?;
+                if let Err(error) = send_checked(&mut front_door, &reply, limits).await {
+                    session.fence();
+                    return Err(error);
+                }
+            }
             KernelFrameAction::Fence(rejection) => {
                 let result = send_checked(&mut front_door, &rejection, limits).await;
                 session.fence();
@@ -490,13 +512,16 @@ async fn serve_admitted_bridge_host_requests(
             KernelFrameAction::Process { .. }
             | KernelFrameAction::Daemon { .. }
             | KernelFrameAction::Doctor { .. }
-            | KernelFrameAction::Testd { .. } => {
-                // Bridge transports never carry process, daemon, Doctor, or
-                // testd authority: the Doctor serves only its own admitted
-                // generation-bound session/connection (T6-D2 P-07), testd
-                // serves only its own admitted generation-bound
-                // session/connection (T6-X1 P-07), never the bridge's. Revoke
-                // and fence exactly as for the other kinds.
+            | KernelFrameAction::Testd { .. }
+            | KernelFrameAction::Dreamer { .. } => {
+                // Bridge transports never carry process, daemon, Doctor,
+                // testd, or Dreamer authority: the Doctor serves only its own
+                // admitted generation-bound session/connection (T6-D2 P-07),
+                // testd serves only its own admitted generation-bound
+                // session/connection (T6-X1 P-07), and Dreamer serves only
+                // its own admitted eliotd requester session/connection
+                // (T12-05 K2), never the bridge's. Revoke and fence exactly
+                // as for the other kinds.
                 kernel.revoke_agent_bridge(&connection_id);
                 return Err(TransportError::SessionFenced);
             }
