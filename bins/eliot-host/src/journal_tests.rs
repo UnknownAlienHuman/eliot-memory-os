@@ -717,6 +717,12 @@ pub(super) fn liveness_manifest_with_distinct_store_digests()
             handle("9".repeat(64)),
             handle("--kernel-artifact-sha256"),
             kernel_digest.clone(),
+            handle("--doctor-artifact-sha256"),
+            handle("b".repeat(64)),
+            handle("--testd-artifact-sha256"),
+            handle("c".repeat(64)),
+            handle("--native-worker-artifact-sha256"),
+            handle("d".repeat(64)),
             handle("--eliotd-descriptor"),
             path(&portable, "eliotd.json"),
             handle("--eliotd-descriptor-sha256"),
@@ -752,6 +758,12 @@ pub(super) fn liveness_manifest_with_distinct_store_digests()
         host_artifact_digest: handle("e".repeat(64)),
         watchdog_executable_path: path(&portable, "eliot-watchdog.exe"),
         watchdog_artifact_digest: handle("7".repeat(64)),
+        doctor_artifact_digest: handle("b".repeat(64)),
+        testd_artifact_digest: handle("c".repeat(64)),
+        native_worker_artifact_digest: handle("d".repeat(64)),
+        doctor_executable_path: path(&portable, "eliot-doctor.exe"),
+        testd_executable_path: path(&portable, "eliot-testd.exe"),
+        native_worker_executable_path: path(&portable, "eliot-native-worker.exe"),
         descriptor_digest: handle("0".repeat(64)),
     };
     runtime_launch = runtime_launch.with_computed_digest()?;
@@ -762,10 +774,16 @@ pub(super) fn liveness_manifest_with_distinct_store_digests()
         store_bridge_artifact_digest: bridge_digest,
         canonical_store_artifact_digest: provider_digest,
         host_artifact_digest: handle("e".repeat(64)),
+        doctor_artifact_digest: handle("b".repeat(64)),
+        testd_artifact_digest: handle("c".repeat(64)),
+        native_worker_artifact_digest: handle("d".repeat(64)),
         kernel_executable_path: path(&portable, "eliot-kernel.exe"),
         store_bridge_executable_path: bridge_path,
         canonical_store_executable_path: provider_path,
         host_executable_path: host_path,
+        doctor_executable_path: path(&portable, "eliot-doctor.exe"),
+        testd_executable_path: path(&portable, "eliot-testd.exe"),
+        native_worker_executable_path: path(&portable, "eliot-native-worker.exe"),
         config_path,
         dependency_closure_refs: vec![handle("evidence:dependency-closure")],
         license_refs: vec![handle("evidence:licenses")],
@@ -1331,7 +1349,7 @@ fn materialize_descriptor_bound_host_fixture(
         &descriptor_bytes,
     )?;
     launch.eliotd_descriptor_digest = descriptor_digest.clone();
-    launch.kernel_arguments[15] = descriptor_digest;
+    launch.kernel_arguments[21] = descriptor_digest;
     launch.descriptor_digest = PlatformHandle::new(launch.compute_digest()?)?;
     Ok(())
 }
