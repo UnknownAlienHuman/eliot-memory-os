@@ -1,0 +1,21 @@
+package eliot:current@9.9.9;
+
+interface probe-version-api {
+  record probe-input {
+    schema-revision: u32,
+  }
+
+  variant probe-error {
+    bad(probe-bad),
+  }
+
+  record probe-bad {
+    human-detail: string,
+  }
+
+  run: func(input: probe-input) -> result<probe-input, probe-error>;
+}
+
+world probe-version {
+  export probe-version-api;
+}

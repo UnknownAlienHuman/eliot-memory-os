@@ -1,0 +1,292 @@
+package eliot:current@0.1.0;
+
+// ELIOT typed current ABI — context-admission world.
+// Package: eliot:current@0.1.0. World: context-admission. Interface: admission.
+// Native owner: #584/#608 (eliot-context-contracts, eliot-context-admission).
+// Consumer: #638. Operation: admit_context (pure membership/representation decision).
+// Loss wire names (native SCREAMING_SNAKE -> WIT kebab):
+//   NON_DROPPABLE -> non-droppable, HANDLE_ONLY -> handle-only,
+//   EXTRACTIVE -> extractive, SUMMARIZABLE -> summarizable.
+// Incomplete code: DECISION_CONTEXT_INCOMPLETE -> decision-context-incomplete (distinct from error).
+
+interface admission {
+  type artifact-id = string;
+  type digest-hex = string;
+
+  enum loss-policy {
+    non-droppable,
+    handle-only,
+    extractive,
+    summarizable,
+  }
+
+  enum representation-kind {
+    whole,
+    handle,
+    extractive,
+    summary,
+  }
+
+  enum atom-availability {
+    present-current,
+    missing,
+    stale,
+    blocked,
+    unavailable,
+    omitted,
+    exhausted,
+    unknown,
+    known-empty,
+    partial,
+  }
+
+  enum privacy-class {
+    open,
+    restricted,
+    confidential,
+  }
+
+  enum authority-class {
+    none,
+    observer,
+    proposer,
+  }
+
+  enum admission-disposition {
+    include-member,
+    handle-only,
+    revalidate,
+    suppress,
+    quarantine,
+    unavailable,
+    blocked,
+    over-budget,
+  }
+
+  enum omission-reason-kind {
+    over-budget,
+    policy,
+    stale-source,
+    blocked-source,
+    conflict,
+    non-recoverable,
+  }
+
+  enum non-recoverable-reason {
+    policy-forbidden,
+    source-withdrawn,
+    conflict-unresolvable,
+  }
+
+  enum proof-ceiling {
+    observation,
+    candidate-only,
+    admission,
+    assembly,
+    activation,
+    screen,
+    cycle,
+    handler,
+  }
+
+  record measurement-ref {
+    serializer: string,
+    schema-revision: string,
+    route: string,
+    model: string,
+    tokenizer: string,
+    input-digest: digest-hex,
+  }
+
+  record capacity-limits {
+    total-capacity: u64,
+    fixed-overhead: u64,
+    output-reserve: u64,
+    review-reserve: u64,
+  }
+
+  record provider-role {
+    provider: string,
+    role: string,
+  }
+
+  record provider-disposition {
+    slot: provider-role,
+    disposition: admission-disposition,
+  }
+
+  record atom-representation {
+    kind: representation-kind,
+    content: string,
+    manifest: list<string>,
+    source-digest: digest-hex,
+    handle: artifact-id,
+  }
+
+  record context-candidate {
+    atom-id: artifact-id,
+    source-digest: digest-hex,
+    source-revision: string,
+    semantic-role: string,
+    provider-role: provider-role,
+    loss-policy: loss-policy,
+    representation: atom-representation,
+    measurement: measurement-ref,
+    privacy: privacy-class,
+    authority: authority-class,
+    availability: atom-availability,
+  }
+
+  record admitted-atom {
+    atom-id: artifact-id,
+    representation: atom-representation,
+    measurement: measurement-ref,
+  }
+
+  record expansion-handle {
+    atom-id: artifact-id,
+    decision-digest: digest-hex,
+    task-id: string,
+    scope-id: string,
+    fence-epoch: string,
+    source-revision: string,
+    handle: artifact-id,
+    expiry-ms: option<s64>,
+  }
+
+  record omission-record {
+    atom-id: artifact-id,
+    reason: omission-reason-kind,
+    non-recoverable: option<non-recoverable-reason>,
+    measured-cost: u64,
+    expansion: option<expansion-handle>,
+    decision-revision: string,
+    policy-revision: string,
+    digest: digest-hex,
+  }
+
+  record economy-allocations {
+    required-allocation: u64,
+    optional-allocation: u64,
+    headroom: u64,
+  }
+
+  record economy-receipt {
+    requested: list<artifact-id>,
+    admitted: list<artifact-id>,
+    displaced: list<artifact-id>,
+    omitted: list<artifact-id>,
+    blocked: list<artifact-id>,
+    applied-rule: string,
+    allocations: economy-allocations,
+    capacity: capacity-limits,
+    decision-digest: digest-hex,
+  }
+
+  record provider-gap {
+    slot: provider-role,
+    state: atom-availability,
+  }
+
+  // First-class incomplete outcome; code must be decision-context-incomplete.
+  // Never converts to thinner complete success.
+  record decision-incomplete {
+    code: string,
+    missing: list<artifact-id>,
+    stale: list<artifact-id>,
+    blocked: list<artifact-id>,
+    unavailable: list<artifact-id>,
+    omitted: list<artifact-id>,
+    exhausted: list<artifact-id>,
+    unknown: list<artifact-id>,
+    known-empty: list<artifact-id>,
+    partial: list<artifact-id>,
+    provider-gaps: list<provider-gap>,
+    oversized: list<artifact-id>,
+    failed-floor-rule: artifact-id,
+    measurements: list<artifact-id>,
+    reopening-requirements: list<string>,
+    proof-ceiling: proof-ceiling,
+  }
+
+  record admitted-context-set {
+    operation-id: string,
+    task-id: string,
+    attempt-id: string,
+    scope-id: string,
+    fence-epoch: string,
+    fence-generation: u64,
+    recipe-digest: digest-hex,
+    recipe-revision: string,
+    members: list<admitted-atom>,
+    dispositions: list<provider-disposition>,
+    omissions: list<omission-record>,
+    economy: economy-receipt,
+    frontier: list<artifact-id>,
+    proof-ceiling: proof-ceiling,
+    canonical-digest: digest-hex,
+  }
+
+  variant admission-result {
+    admitted(admitted-context-set),
+    incomplete(decision-incomplete),
+  }
+
+  record admission-request {
+    schema-revision: u32,
+    operation-id: string,
+    task-id: string,
+    attempt-id: string,
+    scope-id: string,
+    fence-epoch: string,
+    fence-generation: u64,
+    candidates: list<context-candidate>,
+    recipe-digest: digest-hex,
+    recipe-revision: string,
+    provider-denominator: list<provider-role>,
+    capacity: capacity-limits,
+    measurements: list<measurement-ref>,
+    deadline-ms: option<s64>,
+    cancelled: bool,
+    predecessor-digest: option<digest-hex>,
+    invalidation: option<string>,
+  }
+
+  record abi-descriptor {
+    world-name: string,
+    package-id: string,
+    abi-revision: u32,
+    native-contract: string,
+    native-revision: string,
+    abi-digest: string,
+  }
+
+  variant admission-error {
+    malformed(admission-malformed),
+    denominator-mismatch(admission-denominator),
+    stale-fence(admission-fence),
+    capacity-exceeded(admission-capacity),
+    unknown-measurement(admission-measurement),
+    omission-handle-invalid(admission-omission),
+    economy-mismatch(admission-economy),
+    unsupported-schema(admission-schema),
+    internal(admission-internal),
+  }
+
+  record admission-malformed { field: string, human-detail: string }
+  record admission-denominator { human-detail: string }
+  record admission-fence { human-detail: string }
+  record admission-capacity { human-detail: string }
+  record admission-measurement { human-detail: string }
+  record admission-omission { human-detail: string }
+  record admission-economy { human-detail: string }
+  record admission-schema { want-revision: u32, got-revision: u32, human-detail: string }
+  record admission-internal { human-detail: string }
+
+  admit: func(request: admission-request) -> result<admission-result, admission-error>;
+  describe: func() -> abi-descriptor;
+}
+
+world context-admission {
+  export admission;
+}

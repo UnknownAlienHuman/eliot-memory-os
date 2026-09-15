@@ -1,0 +1,91 @@
+package eliot:current@0.1.0;
+
+// ELIOT typed current ABI — shared descriptor contract.
+// Package: eliot:current@0.1.0 (versioned current set, distinct from legacy eliot:wasm@1.0.0).
+// Native map: docs/architecture/I14-19-wasm-components.md; version policy: explicit
+// version/compatibility decision required for any signature/field/variant change.
+// Matching a version label alone is not ABI equality. Digest excludes abi-digest value.
+//
+// Frozen file set (issue #756):
+// - bins/eliot-wasm-host/wit/typed/descriptor.wit
+// - bins/eliot-wasm-host/wit/typed/context-admission.wit
+// - bins/eliot-wasm-host/wit/typed/context-assembly.wit
+// - bins/eliot-wasm-host/wit/typed/cue-activation.wit
+// - bins/eliot-wasm-host/wit/typed/dreamer-handler.wit
+// - bins/eliot-wasm-host/wit/typed/memory-curation-screen.wit
+// - bins/eliot-wasm-host/wit/typed/dreamer-cycle.wit
+
+interface descriptor {
+  // Closed version triple for one world ABI revision.
+  record version {
+    major: u32,
+    minor: u32,
+    patch: u32,
+  }
+
+  // Exact world/native/ABI identity. abi-digest is sha256 of the normalized
+  // ABI payload with the abi-digest value itself excluded (no fixed point).
+  record abi-descriptor {
+    world-name: string,
+    package-id: string,
+    abi-revision: u32,
+    native-contract: string,
+    native-revision: string,
+    abi-digest: string,
+  }
+
+  // Closed completeness states preserved across worlds.
+  enum completeness {
+    complete,
+    partial,
+    incomplete,
+    unknown,
+  }
+
+  // Maximum proof a result supports; candidate-only never implies admission.
+  enum proof-ceiling {
+    observation,
+    candidate-only,
+    admission,
+    assembly,
+    activation,
+    screen,
+    cycle,
+    handler,
+  }
+
+  // Generic eligibility used by read-only screens.
+  enum eligibility {
+    eligible,
+    ineligible,
+    unknown,
+  }
+
+  // Bounded human detail is non-authoritative; machine status is the variant case.
+  record human-detail {
+    note: string,
+  }
+
+  describe: func(descriptor: abi-descriptor) -> result<abi-descriptor, descriptor-error>;
+
+  variant descriptor-error {
+    malformed-identity(descriptor-malformed),
+    unsupported-version(descriptor-version),
+    internal(descriptor-internal),
+  }
+
+  record descriptor-malformed {
+    field: string,
+    human-detail: string,
+  }
+
+  record descriptor-version {
+    want-package: string,
+    got-package: string,
+    human-detail: string,
+  }
+
+  record descriptor-internal {
+    human-detail: string,
+  }
+}

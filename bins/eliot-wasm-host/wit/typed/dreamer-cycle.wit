@@ -1,0 +1,164 @@
+package eliot:current@0.1.0;
+
+// ELIOT typed current ABI — dreamer-cycle world.
+// Package: eliot:current@0.1.0. World: dreamer-cycle. Interface: cycle.
+// Native owner: #806 (eliot-dreamer-cycle, pure bounded controller transition).
+// Consumer: #644. Transports immutable state and inert requests only; no
+// executable capabilities, durable scheduling, authority mutation or completion.
+// Native contract precedes this world; no native->WIT prerequisite cycle.
+
+interface cycle {
+  type artifact-id = string;
+  type digest-hex = string;
+
+  enum cycle-phase {
+    validated,
+    bundle-validated,
+    screened,
+    model-observed,
+    grounding-validated,
+    common-validated,
+    handler-observed,
+    intrinsic-output-checked,
+    external-admission,
+    closure-observed,
+  }
+
+  enum outcome-disposition {
+    accepted,
+    rejected,
+    not-attempted,
+    completed,
+    partial,
+    failed-before-effect,
+    unknown,
+    cancelled,
+    expired,
+    superseded,
+    unavailable,
+    stale,
+  }
+
+  enum request-kind {
+    bundle-validation,
+    curation-screen,
+    model-invocation,
+    grounding,
+    common-validation,
+    semantic-handler,
+    intrinsic-output,
+    external-admission,
+    closure,
+    effect-reconciliation,
+    clarification,
+  }
+
+  enum step-disposition {
+    advanced,
+    waiting,
+    blocked,
+    stale,
+    cancelled,
+    expired,
+  }
+
+  record pending-request {
+    request-id: string,
+    operation-id: string,
+    idempotency-key: string,
+    kind: request-kind,
+  }
+
+  record observed-outcome {
+    request-id: string,
+    operation-id: string,
+    disposition: outcome-disposition,
+    evidence-digest: digest-hex,
+  }
+
+  record inert-owner-request {
+    request-id: string,
+    operation-id: string,
+    kind: request-kind,
+    target-note: string,
+  }
+
+  record dreamer-state {
+    schema-version: u32,
+    phase: cycle-phase,
+    revision: u32,
+    state-digest: digest-hex,
+    pending: list<pending-request>,
+    observed: list<observed-outcome>,
+    fence-epoch: string,
+    fence-generation: u64,
+  }
+
+  record cycle-policy {
+    schema-version: u32,
+    policy-revision: string,
+    max-records: u16,
+    max-requests: u16,
+    max-canonical-bytes: u32,
+  }
+
+  record cycle-step-input {
+    schema-revision: u32,
+    operation-id: string,
+    task-id: string,
+    scope-id: string,
+    fence-epoch: string,
+    fence-generation: u64,
+    state: dreamer-state,
+    policy: cycle-policy,
+    deadline-ms: option<s64>,
+    cancelled: bool,
+    predecessor-digest: option<digest-hex>,
+  }
+
+  record cycle-step-result {
+    operation-id: string,
+    from-phase: cycle-phase,
+    to-phase: cycle-phase,
+    disposition: step-disposition,
+    state: dreamer-state,
+    emitted: list<inert-owner-request>,
+    frontier: list<artifact-id>,
+    proof-ceiling: string,
+    result-digest: digest-hex,
+  }
+
+  variant cycle-outcome {
+    stepped(cycle-step-result),
+  }
+
+  record abi-descriptor {
+    world-name: string,
+    package-id: string,
+    abi-revision: u32,
+    native-contract: string,
+    native-revision: string,
+    abi-digest: string,
+  }
+
+  variant cycle-error {
+    malformed(cycle-malformed),
+    stale-transition(cycle-stale),
+    bound-exceeded(cycle-bound),
+    unsupported-schema(cycle-schema),
+    internal(cycle-internal),
+  }
+
+  record cycle-malformed { field: string, human-detail: string }
+  record cycle-stale { human-detail: string }
+  record cycle-bound { human-detail: string }
+  record cycle-schema { want-revision: u32, got-revision: u32, human-detail: string }
+  record cycle-internal { human-detail: string }
+
+  step: func(input: cycle-step-input) -> result<cycle-outcome, cycle-error>;
+  describe: func() -> abi-descriptor;
+}
+
+world dreamer-cycle {
+  export cycle;
+}
