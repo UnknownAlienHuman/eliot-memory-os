@@ -1010,10 +1010,7 @@ mod admitted_operation_gate_tests {
                 ("action".to_owned(), json!("keep")),
                 ("base_view_digest".to_owned(), json!("a".repeat(64))),
                 ("candidate_digest".to_owned(), json!("b".repeat(64))),
-                (
-                    "candidate_package_digest".to_owned(),
-                    json!("c".repeat(64)),
-                ),
+                ("candidate_package_digest".to_owned(), json!("c".repeat(64))),
                 ("skill_id".to_owned(), json!("skill-gate")),
                 ("verifier_ref".to_owned(), json!("verifier-gate")),
             ]),

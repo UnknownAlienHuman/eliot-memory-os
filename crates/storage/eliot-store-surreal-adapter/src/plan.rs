@@ -6,17 +6,19 @@
 //! reference store so two stores produce equivalent receipts from the same
 //! inputs.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 
 use eliot_store_api::{
     CanonicalRequestView, CommitId, EventId, EventProjectionRelationIntents, ExactJsonBytes,
-    OrderingHead, OrderingHeadExpectation, OrderingScopeId, OutboxId, OutboxIntent, OutboxState,
+    NamedMutationOperation, OrderingHead, OrderingHeadExpectation, OrderingScopeId, OutboxId,
+    OutboxIntent, OutboxState, PAYLOAD_AUTHORITY_VERSION, PayloadEncoding, PayloadSource,
     PreparedTransition, ProjectionMode, ProjectionPublicationId, ProjectionPublicationRecord,
     ProjectionStatus, RequestMeta, Resubmission, RevisionDelta, RevisionHead,
     RevisionHeadExpectation, RevisionKey, SplitView, StoreError, WriteReceipt, WriteReceiptStatus,
     canonical_json_bytes, canonical_request_hash, issue_store_receipt_envelope, sha256_hex,
     validate_store_receipt_envelope, verify_canonical_request_hash,
 };
+use serde_json::Value;
 
 use crate::error::AdapterError;
 
@@ -35,6 +37,32 @@ pub(crate) struct PayloadAuthorityRecord {
     pub(crate) digest_hex: String,
     pub(crate) byte_len: usize,
     pub(crate) bytes: Vec<u8>,
+}
+
+/// Recoverable evidence record for one `CaptureObservation` (T11.1, #19).
+///
+/// Carries the full recoverable content, never a lossy projection: the exact
+/// subject selector, the complete admitted parameters, and the exact bytes
+/// with their version/encoding/digest/length provenance. When the transition
+/// supplied an [`ExactJsonBytes`] authority, `bytes` are those original raw
+/// bytes; otherwise they are the canonical JSON of the admitted parameters
+/// (the only exact representation available on the legacy path, sufficient
+/// for the memory-parity `parameters` readback and for T13 full-content
+/// recovery). `commit_sequence` plus `operation_index` give the durable
+/// capture order; `named_operation_count` is the transition's total operation
+/// count so readers can reconstruct global capture identity.
+#[derive(Clone, Debug)]
+pub(crate) struct EvidenceRecord {
+    pub(crate) operation_index: usize,
+    pub(crate) subject: String,
+    pub(crate) parameters: BTreeMap<String, Value>,
+    pub(crate) version: u16,
+    pub(crate) encoding: String,
+    pub(crate) digest_hex: String,
+    pub(crate) byte_len: usize,
+    pub(crate) bytes: Vec<u8>,
+    pub(crate) commit_sequence: u64,
+    pub(crate) named_operation_count: usize,
 }
 
 /// Planned durable effects of one committed transition.
@@ -56,6 +84,11 @@ pub(crate) struct ApplyPlan {
     /// legacy transitions. Queryable `projection_records` and outbox bodies
     /// are derivatives of these authorities, never replacements for them.
     pub(crate) payload_authority: Vec<PayloadAuthorityRecord>,
+    /// Recoverable `CaptureObservation` evidence persisted alongside the
+    /// receipt for the `GetEvidencePack` closed read (T11.1, #19). Present
+    /// for every capture regardless of authority presence; empty when the
+    /// transition carries no capture.
+    pub(crate) evidence_records: Vec<EvidenceRecord>,
 }
 
 /// Computes the durable effects of a transition from current heads and the
@@ -206,6 +239,7 @@ pub(crate) fn plan_apply_with_payload_authority(
         &payload_digest,
         next_outbox_sequence,
     )?;
+    let evidence_records = evidence_records(transition, authorities, commit_sequence)?;
 
     Ok(ApplyPlan {
         commit_sequence,
@@ -221,6 +255,7 @@ pub(crate) fn plan_apply_with_payload_authority(
         next_commit_sequence,
         next_outbox_sequence,
         payload_authority: records,
+        evidence_records,
     })
 }
 
@@ -265,6 +300,92 @@ fn payload_authority_records(
                 bytes: authority.bytes.clone(),
             });
         }
+    }
+    Ok(records)
+}
+
+/// Builds the recoverable `CaptureObservation` evidence for one transition.
+///
+/// Runs after [`payload_authority_records`] so supplied authorities are
+/// already validated against the queryable parameters. Every capture is
+/// persisted regardless of authority presence: with an authority the original
+/// raw bytes travel verbatim; without one the canonical JSON of the admitted
+/// parameters is the exact recoverable representation (the legacy path has no
+/// original bytes, only the admitted `Value`). A missing or blank subject
+/// fails closed here instead of persisting an unselectable record.
+fn evidence_records(
+    transition: &PreparedTransition,
+    authorities: &[Option<ExactJsonBytes>],
+    commit_sequence: u64,
+) -> Result<Vec<EvidenceRecord>, StoreError> {
+    if authorities.len() != transition.named_operations.len() {
+        return Err(StoreError::InvalidField {
+            field: "payload.authority",
+            reason: "payload authority count does not match named operations",
+        });
+    }
+    let named_operation_count = transition.named_operations.len();
+    let mut records = Vec::new();
+    for (index, (operation, authority)) in transition
+        .named_operations
+        .iter()
+        .zip(authorities.iter())
+        .enumerate()
+    {
+        if operation.operation != NamedMutationOperation::CaptureObservation {
+            continue;
+        }
+        let subject = operation
+            .parameters
+            .get("subject")
+            .and_then(Value::as_str)
+            .ok_or(StoreError::InvalidField {
+                field: "operation.parameter",
+                reason: "missing required parameter",
+            })?;
+        if subject.trim().is_empty() || subject.chars().any(char::is_control) {
+            return Err(StoreError::InvalidField {
+                field: "operation.parameter",
+                reason: "subject must be a non-blank string",
+            });
+        }
+        let (version, encoding, digest_hex, byte_len, bytes) = if let Some(authority) = authority {
+            (
+                authority.version,
+                authority.encoding.mnemonic().to_owned(),
+                authority.digest_hex(),
+                authority.byte_len(),
+                authority.bytes.clone(),
+            )
+        } else {
+            let canonical = canonical_json_bytes(&operation.parameters)
+                .map_err(|error| StoreError::Serialization(error.to_string()))?;
+            let bound = ExactJsonBytes::parse(PayloadSource::NamedOperationParameter, &canonical)?;
+            (
+                bound.version,
+                bound.encoding.mnemonic().to_owned(),
+                bound.digest_hex(),
+                bound.byte_len(),
+                bound.bytes.clone(),
+            )
+        };
+        // Legacy fallback provenance uses the canonical authority version;
+        // keep the single owner: the derived bytes must carry the current
+        // authority version, never a hardcoded constant.
+        debug_assert_eq!(version, PAYLOAD_AUTHORITY_VERSION);
+        debug_assert_eq!(encoding, PayloadEncoding::Utf8Json.mnemonic());
+        records.push(EvidenceRecord {
+            operation_index: index,
+            subject: subject.to_owned(),
+            parameters: operation.parameters.clone(),
+            version,
+            encoding,
+            digest_hex,
+            byte_len,
+            bytes,
+            commit_sequence,
+            named_operation_count,
+        });
     }
     Ok(records)
 }

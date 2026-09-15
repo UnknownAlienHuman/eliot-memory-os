@@ -2,9 +2,11 @@
 //! Implementation: I5.1, I5.3, I5.9, I2.2, I2.23.
 //! Ownership: bounded physical named-read execution and validation only; no semantic command-catalog, write/transition, authority, policy, retry, or default ownership.
 
+use std::collections::BTreeMap;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use serde_json::{Map, Value};
+use serde::Deserialize;
+use serde_json::{Map, Value, json};
 
 use crate::SurrealStoreAdapter;
 use crate::client;
@@ -14,9 +16,11 @@ use crate::plan;
 use crate::plan::validate_revision_heads;
 use crate::schema;
 use eliot_store_api::{
-    CanonicalValidationSnapshot, NamedReadOperation, NamedReadRequest, NamedReadResponse,
-    OperationId, OrderingHead, OrderingScopeId, RevisionHead, RevisionKey, ScopeId,
-    ScopeRevisionView, StoreError, generated_operation_manifests,
+    CanonicalValidationSnapshot, EVIDENCE_PACK_MAX_RECORDS, ExactJsonBytes, NamedReadOperation,
+    NamedReadRequest, NamedReadResponse, OperationId, OrderingHead, OrderingScopeId,
+    PAYLOAD_AUTHORITY_VERSION, PayloadEncoding, PayloadSource, RevisionHead, RevisionKey, ScopeId,
+    ScopeRevisionView, StateFence, StoreError, generated_operation_manifests,
+    named_mutation_operation_name,
 };
 
 use super::{
@@ -27,6 +31,44 @@ use super::{
 };
 
 pub(super) const READ_VALIDATION_SNAPSHOT: &str = "BEGIN TRANSACTION; SELECT * FROM ONLY schema_meta:current; SELECT VALUE { state_fence: state_fence, next_commit_sequence: next_commit_sequence, next_outbox_sequence: next_outbox_sequence } FROM ONLY canonical_fence:current; SELECT VALUE body FROM revision_head; COMMIT TRANSACTION;";
+
+/// Version of the `GetEvidencePack` payload shape built below.
+///
+/// Must stay equal to the reference handler's version in
+/// `eliot-store-memory`: consumers match on this version before interpreting
+/// `records` / `provenance`; any shape change bumps it on both sides.
+const EVIDENCE_PACK_PAYLOAD_VERSION: u32 = 1;
+
+/// One receipt row of the closed evidence SELECT (see
+/// [`schema::READ_EVIDENCE_RECORDS`](crate::schema::READ_EVIDENCE_RECORDS)).
+///
+/// Pre-change receipts lack all three fields (they read as `NONE`); the
+/// boundary treats a missing array as empty, never as an error. Those
+/// pre-change captures had no recoverable bytes persisted and stay absent
+/// from the pack — only post-change captures are served.
+#[derive(Clone, Debug, Deserialize)]
+struct EvidenceReceiptRow {
+    commit_sequence: Option<u64>,
+    named_operation_count: Option<usize>,
+    evidence_records: Option<Vec<EvidenceRecordRow>>,
+}
+
+/// One recoverable capture as persisted by the atomic writer (see
+/// `atomic_write::evidence_binding`). Strict: a malformed post-change record
+/// fails closed at deserialization, never as a silent empty.
+#[derive(Clone, Debug, Deserialize)]
+struct EvidenceRecordRow {
+    operation_index: usize,
+    subject: String,
+    parameters: BTreeMap<String, Value>,
+    version: u16,
+    encoding: String,
+    digest_hex: String,
+    byte_len: usize,
+    bytes_utf8: String,
+    commit_sequence: u64,
+    named_operation_count: usize,
+}
 
 /// Enforces the active generated catalogue on one named read before dispatch
 /// (slice C2, issue #19).
@@ -219,16 +261,10 @@ pub(crate) async fn execute_named(
     ensure_ready(adapter, db).await?;
 
     let fence = read_fence(db, &adapter.config).await?;
-    let state_fence = match &fence {
-        Some(fence) => fence.state_fence.clone(),
-        None => query.state_fence.clone(),
-    };
-    if fence.is_some() && state_fence != query.state_fence {
-        return Err(AdapterError::Store(StoreError::FenceMismatch));
-    }
+    let state_fence = resolve_state_fence(fence.as_ref(), &query.state_fence)?;
 
     let revision_heads = read_all_revision_heads(db, &adapter.config).await?;
-    let payload = named_read_payload(adapter, db, &query).await?;
+    let payload = named_read_payload(adapter, db, &query, &state_fence).await?;
     let response = NamedReadResponse {
         operation: query.operation,
         state_fence,
@@ -239,10 +275,27 @@ pub(crate) async fn execute_named(
     Ok(response)
 }
 
+/// Resolves the read fence for one named read (pure, shared by all reads).
+///
+/// Empty stores read through the query fence; otherwise the durable fence
+/// must equal the query fence exactly, or the read refuses with
+/// [`StoreError::FenceMismatch`] — never a successful stale view.
+fn resolve_state_fence(
+    fence: Option<&FenceRecord>,
+    query_fence: &StateFence,
+) -> Result<StateFence, AdapterError> {
+    match fence {
+        None => Ok(query_fence.clone()),
+        Some(fence) if fence.state_fence == *query_fence => Ok(fence.state_fence.clone()),
+        Some(_) => Err(AdapterError::Store(StoreError::FenceMismatch)),
+    }
+}
+
 async fn named_read_payload(
     adapter: &SurrealStoreAdapter,
     db: &client::RpcTransport,
     query: &NamedReadRequest,
+    state_fence: &StateFence,
 ) -> Result<Value, AdapterError> {
     match query.operation {
         NamedReadOperation::GetRevisionHeads => Ok(to_value(
@@ -272,10 +325,215 @@ async fn named_read_payload(
                 &read_receipt_by_operation(db, &adapter.config, &operation_id).await?,
             )?)
         }
+        NamedReadOperation::GetEvidencePack => {
+            let rows = read_evidence_records(db, &adapter.config).await?;
+            evidence_pack_payload(query, state_fence, &rows).map_err(AdapterError::Store)
+        }
         other => Err(AdapterError::NamedOperationUnavailable {
             operation: format!("{other:?}"),
         }),
     }
+}
+
+/// Reads all persisted capture-evidence rows through the closed SELECT.
+///
+/// One row per receipt; pre-change receipts carry no evidence array and
+/// contribute nothing (they had no recoverable bytes persisted). The Rust
+/// boundary assigns capture identity and filters by exact subject — never a
+/// substring match in the query string.
+async fn read_evidence_records(
+    db: &client::RpcTransport,
+    config: &SurrealAdapterConfig,
+) -> Result<Vec<EvidenceReceiptRow>, AdapterError> {
+    let mut response = client::query(
+        db,
+        config,
+        "read.evidence_records",
+        schema::READ_EVIDENCE_RECORDS,
+        Map::new(),
+    )
+    .await?;
+    take_vec::<EvidenceReceiptRow>(&mut response, 0)
+}
+
+/// Validates one persisted evidence record against its own provenance.
+///
+/// The writer bound the exact bytes to version/encoding/digest/length and to
+/// the admitted parameters; any durable mismatch (substituted bytes,
+/// truncated length, wrong encoding, or row/record order disagreement) fails
+/// closed here instead of serving a lossy projection. This keeps the full
+/// recoverable record (subject + exact bytes + provenance) honest for T13
+/// while the pack itself returns the memory-parity `parameters` projection.
+fn validate_evidence_record(
+    row: &EvidenceReceiptRow,
+    record: &EvidenceRecordRow,
+) -> Result<(), StoreError> {
+    if record.version != PAYLOAD_AUTHORITY_VERSION {
+        return Err(StoreError::Serialization(
+            "evidence record version mismatch".to_owned(),
+        ));
+    }
+    if record.encoding != PayloadEncoding::Utf8Json.mnemonic() {
+        return Err(StoreError::Serialization(
+            "evidence record encoding mismatch".to_owned(),
+        ));
+    }
+    if record.byte_len != record.bytes_utf8.len() {
+        return Err(StoreError::Serialization(
+            "evidence record length mismatch".to_owned(),
+        ));
+    }
+    let bound = ExactJsonBytes::parse(
+        PayloadSource::NamedOperationParameter,
+        record.bytes_utf8.as_bytes(),
+    )?;
+    if bound.digest_hex() != record.digest_hex || bound.byte_len() != record.byte_len {
+        return Err(StoreError::Serialization(
+            "evidence record digest mismatch".to_owned(),
+        ));
+    }
+    if bound.decode_object_parameters()? != record.parameters {
+        return Err(StoreError::Serialization(
+            "evidence record bytes do not match parameters".to_owned(),
+        ));
+    }
+    if let Some(commit_sequence) = row.commit_sequence
+        && commit_sequence != record.commit_sequence
+    {
+        return Err(StoreError::Serialization(
+            "evidence record commit order mismatch".to_owned(),
+        ));
+    }
+    if let Some(named_operation_count) = row.named_operation_count
+        && named_operation_count != record.named_operation_count
+    {
+        return Err(StoreError::Serialization(
+            "evidence record operation count mismatch".to_owned(),
+        ));
+    }
+    Ok(())
+}
+
+/// Builds the versioned exact evidence-pack payload for one request.
+///
+/// Parity with the reference `MemoryStore::evidence_pack_payload`: exact
+/// `subject` match only (never substring, never a default), explicit
+/// `max_records` decimal-string bound with over-bound
+/// [`StoreError::PayloadTooLarge`] refusal, identity
+/// (`capture_index` / `operation` / `parameters`), envelope `version = 1`
+/// plus `provenance{state_fence, matched_total, returned, max_records,
+/// truncated}`, and zero matches as an exact empty — never an error.
+///
+/// `capture_index` is the global operation position reconstructed from the
+/// durable capture order: receipts walk in `commit_sequence` order,
+/// accumulating each receipt's total operation count, so interleaved
+/// non-capture operations consume indices exactly as the reference global
+/// `named_operations` vector does. Pre-change receipts (no evidence array)
+/// contribute zero to the walk and serve nothing; on a fresh store the walk
+/// starts at zero and matches the reference exactly.
+fn evidence_pack_payload(
+    query: &NamedReadRequest,
+    state_fence: &StateFence,
+    rows: &[EvidenceReceiptRow],
+) -> Result<Value, StoreError> {
+    let scope_id = query.scope_id.clone().ok_or(StoreError::InvalidField {
+        field: "scope_id",
+        reason: "evidence pack read requires scope_id",
+    })?;
+    // The catalogue gate already enforces presence and shape; re-check
+    // fail-closed so this arm never depends on call order (mirrors the
+    // reference handler).
+    let subject = query
+        .parameters
+        .get("subject")
+        .and_then(Value::as_str)
+        .ok_or(StoreError::InvalidField {
+            field: "operation.parameter",
+            reason: "missing required parameter",
+        })?;
+    if subject.trim().is_empty() || subject.chars().any(char::is_control) {
+        return Err(StoreError::InvalidField {
+            field: "operation.parameter",
+            reason: "subject must be a non-blank string",
+        });
+    }
+    let bound_raw = query
+        .parameters
+        .get("max_records")
+        .and_then(Value::as_str)
+        .ok_or(StoreError::InvalidField {
+            field: "operation.parameter",
+            reason: "missing required parameter",
+        })?;
+    let max_records: u32 = bound_raw.parse().map_err(|_| StoreError::InvalidField {
+        field: "operation.parameter",
+        reason: "max_records must be a positive decimal bound",
+    })?;
+    if max_records == 0 {
+        return Err(StoreError::InvalidField {
+            field: "operation.parameter",
+            reason: "max_records must be a positive decimal bound",
+        });
+    }
+    if max_records > EVIDENCE_PACK_MAX_RECORDS {
+        return Err(StoreError::PayloadTooLarge);
+    }
+    let limit = usize::try_from(max_records).map_err(|_| StoreError::PayloadTooLarge)?;
+
+    // Durable capture order: receipts by commit_sequence (pre-change rows
+    // without a sequence sort first and contribute zero), evidence within a
+    // receipt by operation_index.
+    let mut ordered: Vec<&EvidenceReceiptRow> = rows.iter().collect();
+    ordered.sort_by_key(|row| row.commit_sequence.unwrap_or(0));
+    let mut indexed: Vec<(u64, &EvidenceRecordRow)> = Vec::new();
+    let mut operation_base: u64 = 0;
+    for row in ordered {
+        let mut records: Vec<&EvidenceRecordRow> = row
+            .evidence_records
+            .as_ref()
+            .map_or(Vec::new(), |records| records.iter().collect());
+        records.sort_by_key(|record| record.operation_index);
+        for record in records {
+            validate_evidence_record(row, record)?;
+            let capture_index = operation_base.saturating_add(record.operation_index as u64);
+            indexed.push((capture_index, record));
+        }
+        operation_base =
+            operation_base.saturating_add(row.named_operation_count.unwrap_or(0) as u64);
+    }
+    // Exact subject match only — never substring, never a default.
+    let matched: Vec<(u64, &EvidenceRecordRow)> = indexed
+        .into_iter()
+        .filter(|(_, record)| record.subject == subject)
+        .collect();
+    let matched_total = matched.len();
+    let records: Vec<Value> = matched
+        .into_iter()
+        .take(limit)
+        .map(|(capture_index, record)| {
+            json!({
+                "capture_index": capture_index,
+                "operation": named_mutation_operation_name(
+                    eliot_store_api::NamedMutationOperation::CaptureObservation,
+                ),
+                "parameters": record.parameters,
+            })
+        })
+        .collect();
+    let returned = records.len();
+    Ok(json!({
+        "version": EVIDENCE_PACK_PAYLOAD_VERSION,
+        "subject": subject,
+        "scope_id": scope_id,
+        "records": records,
+        "provenance": {
+            "state_fence": state_fence,
+            "matched_total": matched_total,
+            "returned": returned,
+            "max_records": max_records,
+            "truncated": matched_total > returned,
+        },
+    }))
 }
 
 async fn read_all_revision_heads(
@@ -430,5 +688,350 @@ mod admitted_read_tests {
             BTreeMap::new(),
         );
         assert!(validate_named_against_active_catalogue(&missing_scope).is_err());
+    }
+
+    // --- T11.1 GetEvidencePack behaviour (real plan outputs, no canned rows) ---
+
+    fn capture_transition(
+        operation_id: &str,
+        subject: &str,
+    ) -> eliot_store_api::PreparedTransition {
+        use eliot_store_api::{
+            EffectClass, EventProjectionRelationIntents, NamedMutationOperation,
+            NamedMutationRequest, OperationIdentity, OperationManifestDigest, OrderingScopeId,
+            SecurityContext, TransitionClass,
+        };
+        let fence = test_fence();
+        eliot_store_api::PreparedTransition {
+            identity: OperationIdentity {
+                operation_id: eliot_store_api::OperationId::new(operation_id).expect("operation"),
+                idempotency_key: format!("idem-{operation_id}"),
+                canonical_request_hash: "a".repeat(64),
+            },
+            state_fence: fence,
+            scope_id: ScopeId::new("scope-1").expect("scope"),
+            task_id: None,
+            ordering_scopes: vec![OrderingScopeId::new("scope-1").expect("ordering")],
+            transition_class: TransitionClass::CaptureCandidate,
+            requested_effect_ceiling: EffectClass::Candidate,
+            admission_contract_set_digest: "b".repeat(64),
+            operation_manifest_digest: OperationManifestDigest::new("manifest-1")
+                .expect("manifest digest"),
+            named_operations: vec![NamedMutationRequest {
+                operation: NamedMutationOperation::CaptureObservation,
+                parameters: BTreeMap::from([("subject".to_owned(), json!(subject))]),
+            }],
+            event_projection_relation_intents: EventProjectionRelationIntents {
+                event_ids: Vec::new(),
+                projection_kinds: Vec::new(),
+                relation_kinds: Vec::new(),
+            },
+            security: SecurityContext::default(),
+            required_proof_and_approval_refs: Vec::new(),
+        }
+    }
+
+    /// Plans one capture through the real planner and renders its durable
+    /// receipt row (the same shape `write_transaction` persists and the
+    /// closed SELECT returns). Never a canned row: bytes, digest, and order
+    /// all come from [`crate::plan`].
+    fn evidence_row_for(
+        operation_id: &str,
+        subject: &str,
+        commit_sequence: u64,
+    ) -> EvidenceReceiptRow {
+        use crate::plan::plan_apply;
+        let transition = capture_transition(operation_id, subject);
+        let plan = plan_apply(&transition, &[], &[], commit_sequence, 1).expect("plan applies");
+        assert_eq!(
+            plan.evidence_records.len(),
+            1,
+            "one capture plans exactly one evidence record"
+        );
+        let record = &plan.evidence_records[0];
+        EvidenceReceiptRow {
+            commit_sequence: Some(plan.commit_sequence),
+            named_operation_count: Some(transition.named_operations.len()),
+            evidence_records: Some(vec![EvidenceRecordRow {
+                operation_index: record.operation_index,
+                subject: record.subject.clone(),
+                parameters: record.parameters.clone(),
+                version: record.version,
+                encoding: record.encoding.clone(),
+                digest_hex: record.digest_hex.clone(),
+                byte_len: record.byte_len,
+                bytes_utf8: String::from_utf8(record.bytes.clone()).expect("UTF-8 bytes"),
+                commit_sequence: record.commit_sequence,
+                named_operation_count: record.named_operation_count,
+            }]),
+        }
+    }
+
+    fn evidence_query(subject: &str, max_records: &str) -> NamedReadRequest {
+        read_request(
+            NamedReadOperation::GetEvidencePack,
+            Some(ScopeId::new("scope-1").expect("scope")),
+            BTreeMap::from([
+                ("subject".to_owned(), json!(subject)),
+                ("max_records".to_owned(), json!(max_records)),
+            ]),
+        )
+    }
+
+    #[test]
+    fn evidence_pack_returns_exact_captured_record_with_provenance() {
+        let fence = test_fence();
+        let rows = vec![evidence_row_for("op-evidence-1", "evidence-alpha", 1)];
+        let query = evidence_query("evidence-alpha", "10");
+        assert!(
+            validate_named_against_active_catalogue(&query).is_ok(),
+            "activated pack passes the gate"
+        );
+        let payload = evidence_pack_payload(&query, &fence, &rows).expect("pack builds");
+        assert_eq!(
+            payload.get("version").and_then(Value::as_u64),
+            Some(u64::from(EVIDENCE_PACK_PAYLOAD_VERSION))
+        );
+        assert_eq!(
+            payload.get("subject").and_then(Value::as_str),
+            Some("evidence-alpha")
+        );
+        let records = payload
+            .get("records")
+            .and_then(Value::as_array)
+            .expect("records array");
+        assert_eq!(records.len(), 1);
+        assert_eq!(
+            records[0].get("operation").and_then(Value::as_str),
+            Some("CaptureObservation")
+        );
+        assert_eq!(
+            records[0].get("capture_index").and_then(Value::as_u64),
+            Some(0)
+        );
+        assert_eq!(
+            records[0]
+                .get("parameters")
+                .and_then(|parameters| parameters.get("subject"))
+                .and_then(Value::as_str),
+            Some("evidence-alpha")
+        );
+        let provenance = payload
+            .get("provenance")
+            .and_then(Value::as_object)
+            .expect("provenance object");
+        assert_eq!(
+            provenance.get("state_fence"),
+            Some(&serde_json::to_value(&fence).expect("fence serializes"))
+        );
+        assert_eq!(
+            provenance.get("matched_total").and_then(Value::as_u64),
+            Some(1)
+        );
+        assert_eq!(provenance.get("returned").and_then(Value::as_u64), Some(1));
+        assert_eq!(
+            provenance.get("max_records").and_then(Value::as_u64),
+            Some(10)
+        );
+        assert_eq!(
+            provenance.get("truncated").and_then(Value::as_bool),
+            Some(false)
+        );
+    }
+
+    #[test]
+    fn evidence_pack_absence_is_an_exact_empty_result() {
+        let fence = test_fence();
+        let rows = vec![evidence_row_for("op-evidence-2", "evidence-alpha", 1)];
+        let query = evidence_query("evidence-missing", "10");
+        let payload = evidence_pack_payload(&query, &fence, &rows).expect("empty pack builds");
+        let records = payload
+            .get("records")
+            .and_then(Value::as_array)
+            .expect("records array");
+        assert!(records.is_empty(), "unknown subject is empty, not an error");
+        let provenance = payload
+            .get("provenance")
+            .and_then(Value::as_object)
+            .expect("provenance object");
+        assert_eq!(
+            provenance.get("matched_total").and_then(Value::as_u64),
+            Some(0)
+        );
+        assert_eq!(
+            provenance.get("truncated").and_then(Value::as_bool),
+            Some(false)
+        );
+    }
+
+    #[test]
+    fn evidence_pack_wrong_fence_is_refused_by_the_shared_resolver() {
+        use eliot_contracts::{EpochId, EpochLineageId};
+        use std::num::NonZeroU64;
+        let fence = test_fence();
+        let fence_record = FenceRecord {
+            state_fence: fence.clone(),
+            next_commit_sequence: 2,
+            next_outbox_sequence: 1,
+        };
+        assert_eq!(
+            resolve_state_fence(Some(&fence_record), &fence).expect("matching fence resolves"),
+            fence
+        );
+        assert!(resolve_state_fence(None, &fence).is_ok());
+        let other = {
+            let lineage =
+                EpochLineageId::new("550e8400-e29b-41d4-a716-446655440000").expect("lineage");
+            let epoch =
+                EpochId::new(lineage, NonZeroU64::new(2).expect("non-zero")).expect("epoch");
+            eliot_store_api::StateFence::new(epoch, eliot_contracts::ResourceGeneration::genesis())
+        };
+        assert_ne!(other, fence);
+        assert_eq!(
+            resolve_state_fence(Some(&fence_record), &other),
+            Err(AdapterError::Store(StoreError::FenceMismatch)),
+            "the pre-dispatch fence check refuses a changed fence before any evidence read"
+        );
+    }
+
+    #[test]
+    fn evidence_pack_over_bound_request_is_refused() {
+        let fence = test_fence();
+        let rows = vec![evidence_row_for("op-evidence-4", "evidence-alpha", 1)];
+        for bound in [
+            (EVIDENCE_PACK_MAX_RECORDS + 1).to_string(),
+            "1000".to_owned(),
+        ] {
+            let query = evidence_query("evidence-alpha", &bound);
+            assert_eq!(
+                evidence_pack_payload(&query, &fence, &rows),
+                Err(StoreError::PayloadTooLarge),
+                "bound {bound} exceeds the declared maximum"
+            );
+        }
+        let query = evidence_query("evidence-alpha", &format!("{EVIDENCE_PACK_MAX_RECORDS}"));
+        assert!(
+            evidence_pack_payload(&query, &fence, &rows).is_ok(),
+            "the exact maximum stays admissible"
+        );
+    }
+
+    #[test]
+    fn evidence_pack_exact_subject_match_never_substring() {
+        let fence = test_fence();
+        let rows = vec![evidence_row_for("op-exact-1", "observation-1", 1)];
+        // Substring and superstring selectors match nothing — never a
+        // successful view of a neighbouring subject.
+        for selector in ["observation", "observation-1-extra", "OBSERVATION-1"] {
+            let query = evidence_query(selector, "10");
+            let payload = evidence_pack_payload(&query, &fence, &rows).expect("non-match builds");
+            assert!(
+                payload
+                    .get("records")
+                    .and_then(Value::as_array)
+                    .is_some_and(Vec::is_empty),
+                "selector {selector} must not substring-match"
+            );
+        }
+        let query = evidence_query("observation-1", "10");
+        let payload = evidence_pack_payload(&query, &fence, &rows).expect("exact builds");
+        assert_eq!(
+            payload
+                .get("records")
+                .and_then(Value::as_array)
+                .map(Vec::len),
+            Some(1)
+        );
+    }
+
+    #[test]
+    fn evidence_pack_bounds_results_with_visible_truncation() {
+        let fence = test_fence();
+        let rows = vec![
+            evidence_row_for("op-bulk-1", "evidence-bulk", 1),
+            evidence_row_for("op-bulk-2", "evidence-bulk", 2),
+            evidence_row_for("op-bulk-3", "evidence-bulk", 3),
+        ];
+        let query = evidence_query("evidence-bulk", "2");
+        let payload = evidence_pack_payload(&query, &fence, &rows).expect("bounded pack builds");
+        let records = payload
+            .get("records")
+            .and_then(Value::as_array)
+            .expect("records array");
+        assert_eq!(records.len(), 2);
+        assert_eq!(
+            records[0].get("capture_index").and_then(Value::as_u64),
+            Some(0)
+        );
+        assert_eq!(
+            records[1].get("capture_index").and_then(Value::as_u64),
+            Some(1)
+        );
+        let provenance = payload
+            .get("provenance")
+            .and_then(Value::as_object)
+            .expect("provenance object");
+        assert_eq!(
+            provenance.get("matched_total").and_then(Value::as_u64),
+            Some(3)
+        );
+        assert_eq!(provenance.get("returned").and_then(Value::as_u64), Some(2));
+        assert_eq!(
+            provenance.get("truncated").and_then(Value::as_bool),
+            Some(true)
+        );
+        let query = evidence_query("evidence-bulk", "3");
+        let payload = evidence_pack_payload(&query, &fence, &rows).expect("full pack builds");
+        assert_eq!(
+            payload
+                .get("provenance")
+                .and_then(Value::as_object)
+                .and_then(|provenance| provenance.get("truncated"))
+                .and_then(Value::as_bool),
+            Some(false)
+        );
+    }
+
+    #[test]
+    fn evidence_pack_malformed_selectors_fail_closed() {
+        let fence = test_fence();
+        let rows = vec![evidence_row_for("op-malformed-1", "evidence-alpha", 1)];
+        // Missing scope on a scope-addressed read.
+        let query = read_request(
+            NamedReadOperation::GetEvidencePack,
+            None,
+            BTreeMap::from([
+                ("subject".to_owned(), json!("evidence-alpha")),
+                ("max_records".to_owned(), json!("10")),
+            ]),
+        );
+        assert!(matches!(
+            evidence_pack_payload(&query, &fence, &rows),
+            Err(StoreError::InvalidField {
+                field: "scope_id",
+                ..
+            })
+        ));
+        // Missing subject selector.
+        let query = read_request(
+            NamedReadOperation::GetEvidencePack,
+            Some(ScopeId::new("scope-1").expect("scope")),
+            BTreeMap::from([("max_records".to_owned(), json!("10"))]),
+        );
+        assert!(matches!(
+            evidence_pack_payload(&query, &fence, &rows),
+            Err(StoreError::InvalidField { .. })
+        ));
+        // Zero and non-decimal bounds fail the bound shape.
+        for bound in ["0", "many"] {
+            let query = evidence_query("evidence-alpha", bound);
+            assert!(
+                matches!(
+                    evidence_pack_payload(&query, &fence, &rows),
+                    Err(StoreError::InvalidField { .. })
+                ),
+                "bound {bound} must fail closed"
+            );
+        }
     }
 }
