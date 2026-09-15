@@ -7,9 +7,8 @@ fn routing_owner_mismatch_is_rejected_after_resealing() {
     let (policy, admitted, draft, boundary) = valid_inputs();
     let mut decision = decide(&policy, &admitted, &draft, &boundary);
     {
-        let candidate = match decision.candidate.as_mut() {
-            Some(value) => value,
-            None => panic!("candidate expected"),
+        let Some(candidate) = decision.candidate.as_mut() else {
+            panic!("candidate expected");
         };
         candidate.routing = RoutingRecommendation::Human {
             principal: "human-1".to_owned(),
@@ -31,9 +30,8 @@ fn candidate_id_must_bind_the_decision_input_digest() {
     let (policy, admitted, draft, boundary) = valid_inputs();
     let mut decision = decide(&policy, &admitted, &draft, &boundary);
     {
-        let candidate = match decision.candidate.as_mut() {
-            Some(value) => value,
-            None => panic!("candidate expected"),
+        let Some(candidate) = decision.candidate.as_mut() else {
+            panic!("candidate expected");
         };
         candidate.candidate_id = digest('9');
         must(candidate.seal(&policy));
@@ -51,13 +49,11 @@ fn each_finite_option_must_name_the_atomic_variable() {
     let (policy, admitted, draft, boundary) = valid_inputs();
     let mut decision = decide(&policy, &admitted, &draft, &boundary);
     {
-        let candidate = match decision.candidate.as_mut() {
-            Some(value) => value,
-            None => panic!("candidate expected"),
+        let Some(candidate) = decision.candidate.as_mut() else {
+            panic!("candidate expected");
         };
-        let options = match &mut candidate.variable.answer_schema {
-            AnswerSchema::Choice { options } => options,
-            _ => panic!("choice schema expected"),
+        let AnswerSchema::Choice { options } = &mut candidate.variable.answer_schema else {
+            panic!("choice schema expected");
         };
         options[0].referenced_variables.clear();
         must(candidate.seal(&policy));
