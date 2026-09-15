@@ -295,6 +295,29 @@ class ToolchainTests(unittest.TestCase):
             self.assertIn("PASS", captured.getvalue())
         self.assertEqual(results, [0, 0])
 
+    # WORK_UNIT_CASE: 870/17 (salvaged from 870B: base 870/4 already covers
+    # guest-declared-once; this binds the same property to the stable
+    # declaration entry points. 870B's overwrite of this file is discarded.)
+    def test_pinned_guest_target_declared_once(self):
+        raw = VALID
+        declared = check.parse_declaration(raw)
+        self.assertEqual(declared.channel, "1.97.1")
+        self.assertIn(check.HOST_TARGET, declared.targets)
+        self.assertEqual(declared.targets.count(check.GUEST_TARGET), 1)
+        self.assertEqual(check.GUEST_TARGET, "wasm32-wasip2")
+        live = check.read_declaration(ROOT)
+        self.assertEqual(live.targets.count(check.GUEST_TARGET), 1)
+        self.assertEqual(live.digest, declared.digest)
+
+    # WORK_UNIT_CASE: 870/18 (salvaged from 870B)
+    def test_absent_manifest_fails_closed(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            with self.assertRaises(check.ToolchainError) as failure:
+                check.read_declaration(root)
+            self.assertEqual(str(failure.exception), "TOOLCHAIN_UNAVAILABLE")
+            self.assertEqual([p.name for p in root.iterdir()], [])
+
 
 if __name__ == "__main__":
     unittest.main()
