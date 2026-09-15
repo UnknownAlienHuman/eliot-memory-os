@@ -171,12 +171,22 @@ impl CaptureFailureDisposition {
 
 #[cfg(windows)]
 struct DeadlineWatcher {
+    /// Operation-bound owner identity (`deadline-watcher:<operation-id>`)
+    /// minted at spawn. The watcher thread enforces the wall deadline for
+    /// exactly this operation; the owner travels with the watcher so
+    /// restart/shutdown containment attributes every join to one op.
+    owner: String,
     stop: Arc<AtomicBool>,
     handle: Option<JoinHandle<()>>,
 }
 
 #[cfg(windows)]
 impl DeadlineWatcher {
+    /// Returns the operation-bound owner identity of this watcher.
+    fn owner(&self) -> &str {
+        &self.owner
+    }
+
     fn stop_and_join(mut self) -> Result<(), ProcessExecutionError> {
         self.stop.store(true, Ordering::Release);
         let Some(handle) = self.handle.take() else {
@@ -209,6 +219,17 @@ struct Operation {
     stderr_thread: Option<JoinHandle<()>>,
     deadline: Instant,
     deadline_watcher: Option<DeadlineWatcher>,
+    /// Operation-bound watcher owner identity minted when the deadline
+    /// watcher spawns (`deadline-watcher:<operation-id>`). Retained after
+    /// the watcher joins so health/quarantine/shutdown projections keep
+    /// attributing wall-time enforcement ownership to exactly one op.
+    deadline_watcher_owner: Option<String>,
+    /// Whether the complete Job tree was terminated through the admitted
+    /// process owner because the deadline watcher could not be installed
+    /// after resume. Part of the fail-closed evidence: reconcile/shutdown
+    /// can distinguish "child never had autonomous enforcement" from
+    /// "child was contained and the tree was torn down".
+    watcher_fail_closed_contained: bool,
     timed_out: bool,
     cleanup_required: bool,
     termination: Option<TerminatedJobChild>,
@@ -233,6 +254,19 @@ pub struct QuarantinedOperationRecord {
     lifecycle: ProcessLifecycle,
     evidence_gap: &'static str,
     capture_failures: Vec<(String, &'static str)>,
+    /// Operation-bound deadline-watcher owner (`deadline-watcher:<op>`) when
+    /// wall-time enforcement was installed for this op; `None` when the
+    /// watcher never started. Exposes watcher identity/ownership through the
+    /// health/quarantine projection instead of hiding it in executor state.
+    deadline_watcher_owner: Option<String>,
+    /// Whether wall-time enforcement is autonomously installed for this op.
+    /// `false` means the admitted deadline relies on external polling or has
+    /// no live watcher — the exact signal issue #83 requires separated from
+    /// stream-capture health.
+    wall_time_enforcement_installed: bool,
+    /// Whether the Job tree was terminated through the admitted process
+    /// owner on the fail-closed watcher-spawn path (issue #83 §2).
+    watcher_fail_closed_contained: bool,
     descendants_complete: Option<bool>,
     tree_terminated: Option<bool>,
     cleanup_pending: bool,
@@ -288,6 +322,34 @@ impl QuarantinedOperationRecord {
         &self.capture_failures
     }
 
+    /// Returns the operation-bound deadline-watcher owner bound to this op.
+    ///
+    /// `Some("deadline-watcher:<operation-id>")` when wall-time enforcement
+    /// was installed for this operation; `None` when the watcher never
+    /// started (issue #83 watcher identity/ownership record).
+    #[must_use]
+    pub fn deadline_watcher_owner(&self) -> Option<&str> {
+        self.deadline_watcher_owner.as_deref()
+    }
+
+    /// Returns whether autonomous wall-time enforcement is installed.
+    ///
+    /// This is the wall-time dimension required by issue #83 §5, kept
+    /// separate from stream-capture health: a `false` here with empty
+    /// `capture_failures` means the op lost (or never gained) its deadline
+    /// watcher, not that its streams are broken.
+    #[must_use]
+    pub const fn wall_time_enforcement_installed(&self) -> bool {
+        self.wall_time_enforcement_installed
+    }
+
+    /// Returns whether the Job tree was terminated through the admitted
+    /// process owner on the fail-closed watcher-spawn path.
+    #[must_use]
+    pub const fn watcher_fail_closed_contained(&self) -> bool {
+        self.watcher_fail_closed_contained
+    }
+
     /// Returns the observed descendant completeness, when a view exists.
     #[must_use]
     pub const fn descendants_complete(&self) -> Option<bool> {
@@ -330,6 +392,10 @@ pub struct ExecutorHealthSummary {
     pub cancellation_available: bool,
     /// Number of registered operations with incomplete capture/evidence.
     pub capture_incomplete_operations: usize,
+    /// Number of registered operations whose autonomous wall-time
+    /// enforcement is missing (watcher never installed or lost), kept
+    /// separate from `capture_incomplete_operations` per issue #83 §5.
+    pub wall_time_enforcement_missing_operations: usize,
     /// Number of registered operations awaiting cleanup/reconciliation.
     pub cleanup_pending_operations: usize,
     /// Number of registered operations fenced as unknown outcome.
@@ -488,6 +554,14 @@ impl WindowsProcessExecutor {
                     || !record.capture_failures().is_empty()
             })
             .count();
+        // Wall-time enforcement health is a separate dimension from
+        // stream-capture health (issue #83 §5): a missing watcher fences
+        // with `WATCHER_EVIDENCE_GAP` and counts here even when both
+        // streams are complete.
+        let wall_time_enforcement_missing_operations = quarantined_operations
+            .iter()
+            .filter(|record| !record.wall_time_enforcement_installed())
+            .count();
         let cleanup_pending_operations = quarantined_operations
             .iter()
             .filter(|record| record.cleanup_pending())
@@ -504,9 +578,35 @@ impl WindowsProcessExecutor {
             inspection_available: true,
             cancellation_available: true,
             capture_incomplete_operations,
+            wall_time_enforcement_missing_operations,
             cleanup_pending_operations,
             unknown_outcome_operations,
             quarantined_operations,
+        }
+    }
+
+    /// Returns the number of registered operations whose autonomous
+    /// wall-time enforcement is missing (issue #83 §5), without blocking on
+    /// operation locks. Registry access failures report `0`.
+    #[must_use]
+    pub fn wall_time_enforcement_missing_count(&self) -> usize {
+        #[cfg(windows)]
+        {
+            let Ok(registry) = self.operations.lock() else {
+                return 0;
+            };
+            registry
+                .values()
+                .filter(|operation| {
+                    operation.lock().is_ok_and(|guard| {
+                        guard.deadline_watcher.is_none() && guard.deadline_watcher_owner.is_none()
+                    })
+                })
+                .count()
+        }
+        #[cfg(not(windows))]
+        {
+            0
         }
     }
 
@@ -555,6 +655,52 @@ impl WindowsProcessExecutor {
     #[must_use]
     pub fn new_start_ready(&self) -> bool {
         self.reservations.try_lock().is_ok()
+    }
+
+    /// Returns the operation-bound deadline-watcher owner for one op.
+    ///
+    /// `Some("deadline-watcher:<operation-id>")` once the watcher spawns;
+    /// `None` while the watcher never started (issue #83 watcher
+    /// identity/ownership record, queryable per op).
+    #[must_use]
+    pub fn deadline_watcher_owner(&self, id: &OperationId) -> Option<String> {
+        #[cfg(windows)]
+        {
+            self.operation(id).ok().and_then(|operation| {
+                operation
+                    .lock()
+                    .ok()
+                    .and_then(|guard| guard.deadline_watcher_owner.clone())
+            })
+        }
+        #[cfg(not(windows))]
+        {
+            let _ = (self.operation(id), id);
+            None
+        }
+    }
+
+    /// Returns whether autonomous wall-time enforcement is installed for one
+    /// op. Separate from stream-capture health and from the operation result
+    /// per issue #83 §5: `Some(true)` means a deadline watcher was installed
+    /// for this op (live or already joined after terminal close);
+    /// `Some(false)` means the admitted deadline has no watcher owner;
+    /// `None` means the op is absent/unlockable.
+    #[must_use]
+    pub fn wall_time_enforcement_installed(&self, id: &OperationId) -> Option<bool> {
+        #[cfg(windows)]
+        {
+            self.operation(id).ok().and_then(|operation| {
+                operation.lock().ok().map(|guard| {
+                    guard.deadline_watcher.is_some() || guard.deadline_watcher_owner.is_some()
+                })
+            })
+        }
+        #[cfg(not(windows))]
+        {
+            let _ = (self.operation(id), id);
+            None
+        }
     }
 
     /// Returns the retained non-authoritative stream projections.
@@ -701,11 +847,32 @@ impl WindowsProcessExecutor {
                     quarantine_operation(&mut guard);
                     retain_cleanup_owners = true;
                 }
+                // Shutdown containment attributes every watcher join to its
+                // operation-bound owner (issue #83: restart/shutdown can
+                // identify and contain every watcher/Job owner): the owner
+                // stays on the op after the thread is taken, so the join
+                // below is per-op identifiable even while the thread runs.
                 if let Some(watcher) = guard.deadline_watcher.take() {
-                    watcher_owners.push((id.clone(), Arc::clone(operation), watcher));
+                    let owner_label = guard
+                        .deadline_watcher_owner
+                        .clone()
+                        .unwrap_or_else(|| deadline_watcher_owner_id(id));
+                    watcher_owners.push((id.clone(), Arc::clone(operation), owner_label, watcher));
                 }
             }
-            for (id, operation, watcher) in watcher_owners {
+            for (id, operation, owner_label, watcher) in watcher_owners {
+                let expected = deadline_watcher_owner_id(&id);
+                // Owner check first: a mismatched watcher must never join (or
+                // drop) another op's enforcement thread. Fence this op and
+                // retain it; every other op already got its own attempt.
+                if owner_label != expected || watcher.owner() != expected {
+                    let mut guard = operation
+                        .lock()
+                        .map_err(|_| operation_unavailable(&id, "operation lock"))?;
+                    quarantine_operation(&mut guard);
+                    retain_cleanup_owners = true;
+                    continue;
+                }
                 if join_deadline_watcher(watcher).is_err() {
                     let mut guard = operation
                         .lock()
@@ -893,6 +1060,8 @@ impl ProcessExecutor for WindowsProcessExecutor {
                 stderr_thread,
                 deadline,
                 deadline_watcher: None,
+                deadline_watcher_owner: None,
+                watcher_fail_closed_contained: false,
                 timed_out: false,
                 cleanup_required: false,
                 termination: None,
@@ -925,17 +1094,30 @@ impl ProcessExecutor for WindowsProcessExecutor {
                 let _ = quarantine_snapshot(&operation_id, &guard, CAPTURE_EVIDENCE_GAP);
                 return Err(error);
             }
-            let Ok(deadline_watcher) = spawn_deadline_watcher(&operation) else {
-                // Same isolation contour as the capture-spawn path: the
-                // watcher-less operation is registered first so it stays
-                // inspectable/cancellable/reconcilable, fenced locally, and
-                // never blocks independent operations.
+            // Mint the operation-bound watcher owner BEFORE installing the
+            // thread so ownership is queryable from the moment enforcement
+            // exists (issue #83 §1), then hand the minted owner to the
+            // watcher spawn. The watcher thread owns the wall deadline
+            // independently of inspect()/reconcile() polling.
+            let watcher_owner = deadline_watcher_owner_id(&operation_id);
+            let Ok(deadline_watcher) = spawn_deadline_watcher(&operation_id, &operation) else {
+                // Fail closed AFTER resume (issue #83 §2): the child is
+                // already running, so terminate/contain the COMPLETE Job
+                // tree through the admitted process owner
+                // (`finalize_operation` → `terminate_in_place` with
+                // descendant/exit evidence), THEN fence locally as
+                // UnknownOutcome and return the typed unknown/failed start —
+                // never a normal receipt. The op is registered first so it
+                // stays inspectable/cancellable/reconcilable, and no
+                // unrelated op is touched (#82 operation-local contour).
                 let mut guard = operation
                     .lock()
                     .map_err(|_| unavailable("operation lock poisoned"))?;
                 if finalize_operation(&mut guard, ExitDisposition::Unknown, false).is_err() {
-                    quarantine_operation(&mut guard);
+                    // Finalize already stored partial termination/cleanup
+                    // evidence on the op; fall through to fencing.
                 }
+                guard.watcher_fail_closed_contained = true;
                 quarantine_operation(&mut guard);
                 let _ = quarantine_snapshot(&operation_id, &guard, WATCHER_EVIDENCE_GAP);
                 drop(guard);
@@ -959,6 +1141,11 @@ impl ProcessExecutor for WindowsProcessExecutor {
                 return Err(ProcessExecutionError::UnknownOutcome);
             };
             guard.deadline_watcher = Some(deadline_watcher);
+            // Bind the minted owner to the operation only after the thread
+            // installed successfully, so a queryable owner always implies a
+            // real enforcement thread (receipt publication under #84 happens
+            // below, after ALL mandatory control owners are installed).
+            guard.deadline_watcher_owner = Some(watcher_owner);
             let view = guard.state.view();
             let sink = Arc::clone(&guard.sink);
             drop(guard);
@@ -1375,7 +1562,7 @@ const CAPTURE_EVIDENCE_GAP: &str = "capture-thread spawn failed";
 #[cfg(windows)]
 const SINK_EVIDENCE_GAP: &str = "initial evidence sink publication failed";
 #[cfg(windows)]
-const WATCHER_EVIDENCE_GAP: &str = "deadline watcher unavailable";
+const WATCHER_EVIDENCE_GAP: &str = "deadline watcher spawn failed";
 #[cfg(windows)]
 const RECEIPT_EVIDENCE_GAP: &str = "start receipt binding invalid";
 #[cfg(windows)]
@@ -1403,6 +1590,9 @@ fn quarantine_snapshot(
             .iter()
             .map(|failure| (failure.stream.to_owned(), failure.disposition.as_str()))
             .collect(),
+        deadline_watcher_owner: operation.deadline_watcher_owner.clone(),
+        wall_time_enforcement_installed: operation.deadline_watcher_owner.is_some(),
+        watcher_fail_closed_contained: operation.watcher_fail_closed_contained,
         descendants_complete: descendants.map(DescendantEvidence::complete),
         tree_terminated: descendants.map(DescendantEvidence::tree_terminated),
         cleanup_pending: operation.cleanup_required
@@ -1424,11 +1614,17 @@ fn quarantined_record(
     let view = operation.state.view();
     let binding = view.binding();
     let descendants = view.descendants();
-    let evidence_gap = if operation.capture_failures.is_empty() {
-        "unknown outcome fenced; cleanup/reconciliation pending"
-    } else {
-        CAPTURE_EVIDENCE_GAP
-    };
+    // Wall-time enforcement health is an explicit dimension, separate from
+    // stream-capture health (issue #83 §5): a missing watcher owner surfaces
+    // the watcher gap even when both streams are complete.
+    let evidence_gap =
+        if operation.deadline_watcher_owner.is_none() && operation.watcher_fail_closed_contained {
+            WATCHER_EVIDENCE_GAP
+        } else if operation.capture_failures.is_empty() {
+            "unknown outcome fenced; cleanup/reconciliation pending"
+        } else {
+            CAPTURE_EVIDENCE_GAP
+        };
     Some(QuarantinedOperationRecord {
         operation_id: id.clone(),
         process_tree_id: binding.process_tree_id().clone(),
@@ -1442,6 +1638,9 @@ fn quarantined_record(
             .iter()
             .map(|failure| (failure.stream.to_owned(), failure.disposition.as_str()))
             .collect(),
+        deadline_watcher_owner: operation.deadline_watcher_owner.clone(),
+        wall_time_enforcement_installed: operation.deadline_watcher_owner.is_some(),
+        watcher_fail_closed_contained: operation.watcher_fail_closed_contained,
         descendants_complete: descendants.map(DescendantEvidence::complete),
         tree_terminated: descendants.map(DescendantEvidence::tree_terminated),
         cleanup_pending: operation.cleanup_required
@@ -1458,21 +1657,47 @@ fn quarantined_record(
     None
 }
 
+/// Mints the operation-bound deadline-watcher owner identity.
+///
+/// Pure helper (no I/O, no locks) so receipt publication order (#84) and
+/// watcher installation order can both be audited against the same minted
+/// value: `deadline-watcher:<operation-id>`.
+#[cfg(windows)]
+fn deadline_watcher_owner_id(operation_id: &OperationId) -> String {
+    format!("deadline-watcher:{}", operation_id.as_str())
+}
+
 #[cfg(windows)]
 fn spawn_deadline_watcher(
+    operation_id: &OperationId,
     operation: &Arc<Mutex<Operation>>,
 ) -> Result<DeadlineWatcher, ProcessExecutionError> {
     #[cfg(test)]
     if FAIL_NEXT_DEADLINE_WATCHER_SPAWN.swap(false, Ordering::AcqRel) {
         return Err(unavailable("injected deadline watcher spawn failure"));
     }
+    // Issue-83 identity-scoped injection: fails exactly the armed operation
+    // identity (test-only; production callers never arm it). An unrelated
+    // concurrent start takes the production spawn and leaves the arm intact.
+    #[cfg(test)]
+    if s83_should_fail_watcher_spawn(operation_id) {
+        return Err(unavailable("injected deadline watcher spawn failure"));
+    }
 
+    // Operation-bound owner minted BEFORE the thread exists so every join,
+    // shutdown sweep, and quarantine projection attributes this watcher to
+    // exactly one operation (issue #83 §1).
+    let owner = deadline_watcher_owner_id(operation_id);
+    let thread_owner = owner.clone();
     let stop = Arc::new(AtomicBool::new(false));
     let thread_stop = Arc::clone(&stop);
     let operation = Arc::downgrade(operation);
     let handle = thread::Builder::new()
         .name("eliot-p04-deadline".to_owned())
         .spawn(move || {
+            // Autonomous wall-time enforcement: this loop owns the admitted
+            // deadline and fences the operation on breach every 25ms without
+            // waiting for any inspect()/reconcile() poll (issue #83 §4).
             loop {
                 if thread_stop.load(Ordering::Acquire) {
                     return;
@@ -1490,6 +1715,12 @@ fn spawn_deadline_watcher(
                 if guard.state.view().lifecycle().is_terminal() {
                     return;
                 }
+                // Enforce ownership: only refresh the op this watcher was
+                // minted for. A mismatched owner is a logic error, never a
+                // reason to touch another op's Job.
+                if guard.deadline_watcher_owner.as_deref() != Some(thread_owner.as_str()) {
+                    return;
+                }
                 if refresh_operation(&mut guard).is_err() {
                     // A failed observation is an external-state gap, not a
                     // reason to detach the Job.  Fence the operation as
@@ -1502,6 +1733,7 @@ fn spawn_deadline_watcher(
         })
         .map_err(|error| unavailable(format!("deadline watcher spawn failed: {error}")))?;
     Ok(DeadlineWatcher {
+        owner,
         stop,
         handle: Some(handle),
     })
@@ -1514,6 +1746,38 @@ fn join_deadline_watcher(watcher: DeadlineWatcher) -> Result<(), ProcessExecutio
 
 #[cfg(all(test, windows))]
 static FAIL_NEXT_DEADLINE_WATCHER_SPAWN: AtomicBool = AtomicBool::new(false);
+
+/// One-shot set of operation identities whose next watcher spawn fails.
+/// Empty means the hook is disarmed. Membership makes the injection exact
+/// under parallelism: an unrelated concurrent start takes the production
+/// spawn (its identity is not a member) and can neither steal nor be
+/// fenced by another op's arm. Test-only: production code paths that read
+/// this helper never arm it.
+#[cfg(all(test, windows))]
+static FAIL_WATCHER_SPAWN_FOR: std::sync::Mutex<std::collections::BTreeSet<String>> =
+    std::sync::Mutex::new(std::collections::BTreeSet::new());
+
+#[cfg(all(test, windows))]
+fn s83_arm_watcher_failure_for(operation_id: &OperationId) {
+    if let Ok(mut guard) = FAIL_WATCHER_SPAWN_FOR.lock() {
+        guard.insert(operation_id.as_str().to_owned());
+    }
+}
+
+#[cfg(all(test, windows))]
+fn s83_disarm_watcher_failure_for(operation_id: &OperationId) {
+    if let Ok(mut guard) = FAIL_WATCHER_SPAWN_FOR.lock() {
+        guard.remove(operation_id.as_str());
+    }
+}
+
+#[cfg(all(test, windows))]
+fn s83_should_fail_watcher_spawn(operation_id: &OperationId) -> bool {
+    match FAIL_WATCHER_SPAWN_FOR.lock() {
+        Ok(mut guard) => guard.remove(operation_id.as_str()),
+        Err(_) => false,
+    }
+}
 
 #[cfg(windows)]
 fn join_streams(operation: &mut Operation) -> bool {
@@ -3455,6 +3719,606 @@ mod tests {
                 view.lifecycle() != ProcessLifecycle::UnknownOutcome,
                 "disarmed watcher spawn must not fence the op, got {:?}",
                 view.lifecycle()
+            );
+            Ok(())
+        }
+    }
+
+    /// Issue #83 shared fixture: keep-alive argv using only cmd internals
+    /// (no external spawn), proven by `cancel_under_pressure_proves_tree_
+    /// closure_or_typed_unknown` to hold the tree open in this executor's
+    /// closed child environment, first with pressure output then with an
+    /// internal infinite keep-alive. The child never exits on its own, so
+    /// any terminal state below must come from enforcement or control.
+    #[cfg(windows)]
+    fn s83_keepalive_bat(tag: &str) -> Result<std::path::PathBuf, Box<dyn std::error::Error>> {
+        let bat_path = std::env::temp_dir().join(format!("eliot-83-{tag}-keepalive.bat"));
+        std::fs::write(
+            &bat_path,
+            "@echo off\r\nfor /L %%i in (1,1,300) do (\r\necho KEEPALIVE-%%i-0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ\r\n)\r\nfor /L %%i in (1,0,2) do rem\r\n",
+        )?;
+        Ok(bat_path)
+    }
+
+    /// Issue #83 shared keep-alive argv for one pre-written bat path.
+    #[cfg(windows)]
+    fn s83_keepalive_argv(bat_path: &std::path::Path) -> Vec<String> {
+        vec!["/c".to_owned(), bat_path.to_string_lossy().into_owned()]
+    }
+
+    /// Issue #83 shared authorized-request builder: issues one exact permit
+    /// from the caller-owned authority against the caller-owned fence,
+    /// mirroring `s04_authorized_request` with an explicit admitted wall
+    /// deadline. The shared-authority shape lets one test fence op A while
+    /// the same executor still serves healthy op B (no global poison).
+    #[cfg(windows)]
+    fn s83_issue(
+        op_tag: &str,
+        argv: Vec<String>,
+        wall_timeout_ms: u64,
+        generation: Generation,
+        fence: &FencingToken,
+        authority: &mut DispatchPermitAuthority,
+    ) -> Result<ProcessRequest, Box<dyn std::error::Error>> {
+        let executable = r"C:\Windows\System32\cmd.exe";
+        let digest = super::sha256_file(std::path::Path::new(executable))?;
+        let working_directory = std::env::temp_dir().to_string_lossy().into_owned();
+        let intent = ProcessIntent::new(
+            OperationId::new(format!("op-83-{op_tag}"))?,
+            ProcessTreeId::new(format!("tree-83-{op_tag}"))?,
+            JobId::new(format!("job-83-{op_tag}"))?,
+            ImageId::new(format!("image-83-{op_tag}"))?,
+            SessionId::new(format!("session-83-{op_tag}"))?,
+            generation,
+            executable,
+            digest,
+            argv,
+            working_directory,
+            EnvironmentProjection::default(),
+            ResourceLimits::new(
+                wall_timeout_ms,
+                Some(10_000),
+                Some(512_000_000),
+                4_096,
+                4_096,
+                4,
+            )?,
+        )?;
+        let permit = authority.issue(
+            &intent,
+            PermitIssuance::new(
+                ActionLeaseRef::new(format!("lease-83-{op_tag}"))?,
+                fence.clone(),
+                revisions(),
+                100,
+                10_000,
+                format!("nonce-83-{op_tag}"),
+            )?,
+        )?;
+        Ok(ProcessRequest::new(intent, permit)?)
+    }
+
+    /// Issue #83 single-operation contour: fresh authority, fence, context,
+    /// and executor around one exact request, mirroring `s04_start` with an
+    /// explicit admitted wall deadline.
+    #[cfg(windows)]
+    fn s83_parts(
+        op_tag: &str,
+        argv: Vec<String>,
+        wall_timeout_ms: u64,
+    ) -> Result<
+        (WindowsProcessExecutor, ProcessRequest, OperationId),
+        Box<dyn std::error::Error>,
+    > {
+        let generation = Generation::new(1)?;
+        let fence = FencingToken::new(test_epoch(1), generation, format!("fence-83-{op_tag}"))?;
+        let mut authority = DispatchPermitAuthority::activate(
+            DispatchAuthorityId::new(format!("auth-83-{op_tag}"))?,
+            KernelDispatchKey::from_secret_bytes([0x5a; 32])?,
+        );
+        let request = s83_issue(
+            op_tag,
+            argv,
+            wall_timeout_ms,
+            generation,
+            &fence,
+            &mut authority,
+        )?;
+        let operation_id = request.operation_id().clone();
+        let context = DispatchValidationContext::new(
+            ClockObservation {
+                valid_time_ms: Some(150),
+                known_time_ms: Some(150),
+                transaction_sequence: None,
+                monotonic_ns: Some(1),
+            },
+            fence,
+            test_epoch(1),
+            revisions(),
+            41,
+        )?;
+        let executor = WindowsProcessExecutor::new(Arc::new(FakePort {
+            authority: Mutex::new(authority),
+            context,
+        }));
+        Ok((executor, request, operation_id))
+    }
+
+    /// Test-only injection helpers (`FAIL_NEXT_DEADLINE_WATCHER_SPAWN` plus
+    /// the identity-scoped arm below) and shared keep-alive builders. The
+    /// legacy one-shot flag keeps Worker A's existing
+    /// `watcher_spawn_failure_fences_only_that_operation` shape untouched;
+    /// the identity-scoped arm makes the new issue-83 injections exact at
+    /// any thread count.
+    ///
+    /// Issue #83 §§1-2 (fail closed): an injected deadline-watcher spawn
+    /// failure after resume contains the Job tree and returns a typed
+    /// unknown/failed start — never a normal receipt. The op stays
+    /// registered with `watcher_fail_closed_contained` evidence visible
+    /// through the public quarantine projection. Honest self-skip on
+    /// non-Windows; no `#[ignore]`.
+    #[test]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "issue-83 fail-closed acceptance needs start-failure plus owner, quarantine, and cancel evidence in one bounded test"
+    )]
+    fn issue83_watcher_spawn_failure_is_fail_closed_unknown(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        #[cfg(not(windows))]
+        {
+            assert!(
+                cfg!(not(windows)),
+                "non-Windows targets must take the explicit skip branch"
+            );
+            return Ok(());
+        }
+        #[cfg(windows)]
+        {
+            // Everything is built BEFORE arming: the gated helper below arms
+            // the global one-shot hook behind the serial gate, so the
+            // injection provably covers this start at any thread count.
+            let bat_path = s83_keepalive_bat("watcher-fail")?;
+            let outcome: Result<(), Box<dyn std::error::Error>> = (|| {
+                let (executor, request, operation_id) =
+                    s83_parts("watcher-fail", s83_keepalive_argv(&bat_path), 30_000)?;
+                let sink = Arc::new(RecordingSink::default());
+                let sink_dyn: Arc<dyn ProcessEvidenceSink> = sink.clone();
+                // Identity-scoped injection: arm exactly this op, so the
+                // failure provably covers THIS start at any thread count —
+                // an unrelated concurrent start can neither steal it nor be
+                // fenced by it. Disarm deterministically afterwards: if this
+                // start failed before the watcher spawn, the arm would
+                // otherwise stay live and fence an unrelated op.
+                super::s83_arm_watcher_failure_for(&operation_id);
+                let start_result = block_on(executor.start(request, sink_dyn));
+                super::s83_disarm_watcher_failure_for(&operation_id);
+                // NEVER a normal receipt: the failed start is typed unknown.
+                assert!(
+                    matches!(
+                        start_result,
+                        Err(ProcessExecutionError::UnknownOutcome)
+                    ),
+                    "watcher-spawn failure must fail closed as UnknownOutcome, got {start_result:?}"
+                );
+                // No start evidence may be fabricated for the failed op.
+                assert_eq!(sink.recorded_len(), 0);
+                // The op stays registered: inspect routes to it with the
+                // typed unknown instead of NotFound (which is reserved for
+                // never-registered identities).
+                assert!(matches!(
+                    block_on(executor.inspect(operation_id.clone())),
+                    Err(ProcessExecutionError::UnknownOutcome)
+                ));
+                // Watcher identity/ownership: no owner was ever minted, so
+                // the admitted deadline has no autonomous enforcement —
+                // reported separately from stream-capture health per §5.
+                assert_eq!(executor.deadline_watcher_owner(&operation_id), None);
+                assert_eq!(
+                    executor.wall_time_enforcement_installed(&operation_id),
+                    Some(false)
+                );
+                // Fail-closed containment evidence through the public
+                // quarantine projection: exactly this op, the watcher gap,
+                // the contained tree, and the explicit recovery action.
+                let summary = executor.operation_health_summary();
+                assert!(summary.new_start_ready);
+                assert!(summary.inspection_available);
+                assert!(summary.cancellation_available);
+                assert_eq!(summary.unknown_outcome_operations, 1);
+                assert_eq!(summary.wall_time_enforcement_missing_operations, 1);
+                assert_eq!(summary.cleanup_pending_operations, 1);
+                assert_eq!(summary.quarantined_operations.len(), 1);
+                let record = &summary.quarantined_operations[0];
+                assert_eq!(record.operation_id(), &operation_id);
+                assert_eq!(record.lifecycle(), ProcessLifecycle::UnknownOutcome);
+                assert_eq!(record.evidence_gap(), super::WATCHER_EVIDENCE_GAP);
+                assert_eq!(record.deadline_watcher_owner(), None);
+                assert!(!record.wall_time_enforcement_installed());
+                assert!(record.watcher_fail_closed_contained());
+                assert!(record.cleanup_pending());
+                assert!(!record.recovery_action().is_empty());
+                assert!(record.descendants_complete().is_some());
+                assert!(record.tree_terminated().is_some());
+                assert_eq!(executor.unknown_outcome_count(), 1);
+                assert_eq!(executor.wall_time_enforcement_missing_count(), 1);
+                assert_eq!(executor.cleanup_pending_count(), 1);
+                // Cancel still routes to the retained op with a typed
+                // outcome — never NotFound, never a fabricated success.
+                match block_on(executor.cancel(operation_id.clone())) {
+                    Err(
+                        ProcessExecutionError::UnknownOutcome
+                        | ProcessExecutionError::Contract(
+                            eliot_process::ContractError::UnknownOutcomeRequiresReconciliation,
+                        ),
+                    ) => {}
+                    other => {
+                        return Err(format!(
+                            "fail-closed op must stay typed-unknown on cancel, got {other:?}"
+                        )
+                        .into());
+                    }
+                }
+                Ok(())
+            })();
+            let _ = std::fs::remove_file(&bat_path);
+            outcome
+        }
+    }
+
+    /// Issue #83 §4 (no-poll autonomous deadline): a successfully started op
+    /// is terminated at its admitted wall deadline even when nobody calls
+    /// `inspect()`. The bat keep-alive (cmd internals only, proven by
+    /// `cancel_under_pressure...` to hold the tree open in this closed
+    /// child environment) would run ~29s against a 1500ms admitted
+    /// deadline; the test sleeps past the deadline with zero polls, then a
+    /// single `inspect` must observe terminal timed-out enforcement.
+    /// Honest self-skip on non-Windows; no `#[ignore]`.
+    #[test]
+    fn issue83_no_poll_deadline_enforced_autonomously(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        #[cfg(not(windows))]
+        {
+            assert!(
+                cfg!(not(windows)),
+                "non-Windows targets must take the explicit skip branch"
+            );
+            return Ok(());
+        }
+        #[cfg(windows)]
+        {
+            let bat_path = std::env::temp_dir().join("eliot-83-nopoll-keepalive.bat");
+            std::fs::write(
+                &bat_path,
+                "@echo off\r\nfor /L %%i in (1,1,200) do (\r\necho NOPOLL-KEEPALIVE-%%i-0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ\r\n)\r\nfor /L %%i in (1,0,2) do rem\r\n",
+            )?;
+            let argv = vec!["/c".to_owned(), bat_path.to_string_lossy().into_owned()];
+            let (executor, request, operation_id) = s83_parts("no-poll-deadline", argv, 1_500)?;
+            let sink = Arc::new(RecordingSink::default());
+            let sink_dyn: Arc<dyn ProcessEvidenceSink> = sink.clone();
+            let outcome = block_on(executor.start(request, sink_dyn));
+            let _receipt = outcome?;
+            let outcome: Result<(), Box<dyn std::error::Error>> = (|| {
+                // Enforcement ownership is installed at start, before any
+                // observation happens.
+                let expected_owner =
+                    format!("deadline-watcher:{}", operation_id.as_str());
+                assert_eq!(
+                    executor.deadline_watcher_owner(&operation_id),
+                    Some(expected_owner)
+                );
+                assert_eq!(
+                    executor.wall_time_enforcement_installed(&operation_id),
+                    Some(true)
+                );
+                // NOBODY polls here: sleep well past the admitted deadline
+                // with zero `inspect()`/`reconcile()` calls, then observe
+                // exactly once.
+                std::thread::sleep(std::time::Duration::from_secs(5));
+                let view = block_on(executor.inspect(operation_id.clone()))?;
+                assert!(
+                    view.lifecycle().is_terminal(),
+                    "autonomous deadline must leave a terminal lifecycle, got {:?}",
+                    view.lifecycle()
+                );
+                assert_eq!(view.lifecycle(), ProcessLifecycle::Exited);
+                let Some(exit) = view.exit() else {
+                    panic!("autonomous deadline enforcement must leave an exit observation");
+                };
+                assert_eq!(exit.disposition(), ExitDisposition::ResourceLimit);
+                // The deadline kill is honest: no unknown fence, no
+                // quarantine, and enforcement stays attributed to this op's
+                // watcher owner.
+                assert_eq!(executor.unknown_outcome_count(), 0);
+                assert_eq!(executor.wall_time_enforcement_missing_count(), 0);
+                assert_eq!(
+                    executor.deadline_watcher_owner(&operation_id),
+                    Some(format!("deadline-watcher:{}", operation_id.as_str()))
+                );
+                Ok(())
+            })();
+            let _ = std::fs::remove_file(&bat_path);
+            outcome
+        }
+    }
+
+    /// Issue #83 §6 with #82 (no global poison): watcher-A failure on ONE
+    /// shared executor leaves healthy op B inspectable and cancellable. Both
+    /// permits are issued sequentially from one authority (distinct operation
+    /// identities and one-shot nonces); A is fenced via the one-shot watcher
+    /// hook with requests pre-built, then the hook is disarmed so B takes the
+    /// production path. Honest self-skip on non-Windows; no `#[ignore]`.
+    #[test]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "issue-83 shared-executor fault proof needs fenced-A plus healthy-B setups with per-op evidence in one bounded test"
+    )]
+    fn issue83_watcher_a_failure_leaves_b_healthy() -> Result<(), Box<dyn std::error::Error>> {
+        #[cfg(not(windows))]
+        {
+            assert!(
+                cfg!(not(windows)),
+                "non-Windows targets must take the explicit skip branch"
+            );
+            return Ok(());
+        }
+        #[cfg(windows)]
+        {
+            let bat_a = s83_keepalive_bat("a-watcher-fail")?;
+            let bat_b = s83_keepalive_bat("b-healthy")?;
+            let generation = Generation::new(1)?;
+            let fence = FencingToken::new(test_epoch(1), generation, "fence-83-shared")?;
+            let mut authority = DispatchPermitAuthority::activate(
+                DispatchAuthorityId::new("auth-83-shared")?,
+                KernelDispatchKey::from_secret_bytes([0x5a; 32])?,
+            );
+            // Both requests are fully built BEFORE arming: the global
+            // one-shot window below covers only A's start call.
+            let request_a = s83_issue(
+                "a-watcher-fail",
+                s83_keepalive_argv(&bat_a),
+                30_000,
+                generation,
+                &fence,
+                &mut authority,
+            )?;
+            let operation_a = request_a.operation_id().clone();
+            let request_b = s83_issue(
+                "b-healthy",
+                s83_keepalive_argv(&bat_b),
+                30_000,
+                generation,
+                &fence,
+                &mut authority,
+            )?;
+            let operation_b = request_b.operation_id().clone();
+            let context = DispatchValidationContext::new(
+                ClockObservation {
+                    valid_time_ms: Some(150),
+                    known_time_ms: Some(150),
+                    transaction_sequence: None,
+                    monotonic_ns: Some(1),
+                },
+                fence,
+                test_epoch(1),
+                revisions(),
+                41,
+            )?;
+            // SINGLE shared executor for A and B: the isolation claim is that
+            // A's fenced state never degrades B's start/inspect/cancel on
+            // this same registry.
+            let executor = WindowsProcessExecutor::new(Arc::new(FakePort {
+                authority: Mutex::new(authority),
+                context,
+            }));
+            let sink_a = Arc::new(RecordingSink::default());
+            let sink_a_dyn: Arc<dyn ProcessEvidenceSink> = sink_a.clone();
+            // Identity-scoped injection for A only: B's later start can
+            // neither steal it nor be fenced by it, at any thread count.
+            super::s83_arm_watcher_failure_for(&operation_a);
+            let start_a = block_on(executor.start(request_a, sink_a_dyn));
+            super::s83_disarm_watcher_failure_for(&operation_a);
+            assert!(
+                matches!(start_a, Err(ProcessExecutionError::UnknownOutcome)),
+                "op A must fence as typed UnknownOutcome, got {start_a:?}"
+            );
+            assert!(matches!(
+                block_on(executor.inspect(operation_a.clone())),
+                Err(ProcessExecutionError::UnknownOutcome)
+            ));
+            // Healthy B starts on the SAME executor while A is fenced: A's
+            // watcher failure must not block the independent start path.
+            let sink_healthy = Arc::new(RecordingSink::default());
+            let sink_healthy_dyn: Arc<dyn ProcessEvidenceSink> = sink_healthy.clone();
+            let _receipt_b = block_on(executor.start(request_b, sink_healthy_dyn))?;
+            let view_b = block_on(executor.inspect(operation_b.clone()))?;
+            assert_eq!(view_b.lifecycle(), ProcessLifecycle::Running);
+            // B got its own watcher owner despite A's failure: enforcement
+            // installation is per-op, never globally poisoned.
+            let expected_b_owner = format!("deadline-watcher:{}", operation_b.as_str());
+            assert_eq!(
+                executor.deadline_watcher_owner(&operation_b),
+                Some(expected_b_owner)
+            );
+            assert_eq!(
+                executor.wall_time_enforcement_installed(&operation_b),
+                Some(true)
+            );
+            // A is still fenced with its own fail-closed evidence, and every
+            // quarantined record belongs to A or B — the failure stayed
+            // scoped while independent paths stayed available.
+            let outcome: Result<(), Box<dyn std::error::Error>> = (|| {
+                // The protected control path: cancel of healthy B stays
+                // available while A is fenced as unknown on the same
+                // executor. Both typed arms are honest for B itself:
+                // proven closure, or the bounded-contention unknown
+                // (`UnknownOutcome` for unproven tree closure, or the
+                // descendant-evidence `InvalidValue` mapped from the same
+                // containment path) — never `NotFound`, never fabricated
+                // success.
+                match block_on(executor.cancel(operation_b.clone())) {
+                    Ok(receipt) => {
+                        assert_eq!(receipt.status(), CancellationStatus::Completed);
+                        assert_eq!(receipt.lifecycle(), ProcessLifecycle::Exited);
+                    }
+                    Err(
+                        ProcessExecutionError::UnknownOutcome
+                        | ProcessExecutionError::Contract(_),
+                    ) => {
+                        // Bounded contention on B's own tree: B is fenced as
+                        // unknown but stays retained — never promoted — and
+                        // A must still read unknown.
+                        let retained = block_on(executor.inspect(operation_b.clone()))?;
+                        assert_eq!(retained.lifecycle(), ProcessLifecycle::UnknownOutcome);
+                    }
+                    Err(other) => {
+                        return Err(format!(
+                            "cancel of healthy B during A's watcher quarantine must stay available, got {other:?}"
+                        )
+                        .into());
+                    }
+                }
+                let summary = executor.operation_health_summary();
+                assert!(summary.new_start_ready);
+                assert!(summary.inspection_available);
+                assert!(summary.cancellation_available);
+                let Some(record_a) = summary
+                    .quarantined_operations
+                    .iter()
+                    .find(|record| record.operation_id() == &operation_a)
+                else {
+                    panic!("op A must stay quarantined with its fail-closed evidence");
+                };
+                assert!(record_a.watcher_fail_closed_contained());
+                assert_eq!(record_a.evidence_gap(), super::WATCHER_EVIDENCE_GAP);
+                for record in &summary.quarantined_operations {
+                    assert!(
+                        record.operation_id() == &operation_a
+                            || record.operation_id() == &operation_b,
+                        "quarantine must stay scoped to the fenced identities, got {:?}",
+                        record.operation_id()
+                    );
+                }
+                Ok(())
+            })();
+            let _ = std::fs::remove_file(&bat_a);
+            let _ = std::fs::remove_file(&bat_b);
+            outcome
+        }
+    }
+
+    /// Issue #83 (cancellation race): cancel a healthy running op immediately
+    /// after start — no settle wait, so cancellation meets a live tree — and
+    /// assert the typed cancellation receipt with post-finalize descendant
+    /// evidence. Bounded contention may honestly fence as unknown instead;
+    /// both arms are typed, never `NotFound`, never fabricated success.
+    /// Honest self-skip on non-Windows; no `#[ignore]`.
+    #[test]
+    fn issue83_cancel_healthy_op_returns_typed_receipt(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        #[cfg(not(windows))]
+        {
+            assert!(
+                cfg!(not(windows)),
+                "non-Windows targets must take the explicit skip branch"
+            );
+            return Ok(());
+        }
+        #[cfg(windows)]
+        {
+            let bat_path = s83_keepalive_bat("cancel-race")?;
+            let (executor, request, operation_id) =
+                s83_parts("cancel-race", s83_keepalive_argv(&bat_path), 30_000)?;
+            let sink = Arc::new(RecordingSink::default());
+            let sink_dyn: Arc<dyn ProcessEvidenceSink> = sink.clone();
+            let outcome: Result<(), Box<dyn std::error::Error>> = (|| {
+                let _receipt = block_on(executor.start(request, sink_dyn))?;
+                // Race cancel immediately against the running child: no
+                // settle wait, so cancellation meets a live tree.
+                match block_on(executor.cancel(operation_id.clone())) {
+                    Ok(receipt) => {
+                        // Post-finalize receipt: tree closure is proven at
+                        // the cancel boundary (`Exited` lifecycle with the
+                        // `Cancelled` exit disposition plus complete
+                        // descendant evidence — there is no `Cancelled`
+                        // lifecycle variant).
+                        assert_eq!(receipt.status(), CancellationStatus::Completed);
+                        assert_eq!(receipt.lifecycle(), ProcessLifecycle::Exited);
+                        let Some(descendants) = receipt.descendants() else {
+                            panic!(
+                                "cancel receipt must carry post-finalize descendant evidence"
+                            );
+                        };
+                        assert!(descendants.complete() && descendants.tree_terminated());
+                        let view = block_on(executor.inspect(operation_id.clone()))?;
+                        assert_eq!(view.lifecycle(), ProcessLifecycle::Exited);
+                        assert_eq!(view.cancellation(), CancellationStatus::Completed);
+                        let Some(exit) = view.exit() else {
+                            panic!("expected an exit observation after cancel");
+                        };
+                        assert_eq!(exit.disposition(), ExitDisposition::Cancelled);
+                    }
+                    Err(ProcessExecutionError::UnknownOutcome) => {
+                        // Tree closure could not be proven within the
+                        // existing waits: the operation stays retained as
+                        // unknown, never promoted to a fabricated success.
+                        let view = block_on(executor.inspect(operation_id.clone()))?;
+                        assert_eq!(view.lifecycle(), ProcessLifecycle::UnknownOutcome);
+                    }
+                    Err(other) => {
+                        return Err(format!(
+                            "cancel must prove closure or stay unknown, got {other:?}"
+                        )
+                        .into());
+                    }
+                }
+                Ok(())
+            })();
+            let _ = std::fs::remove_file(&bat_path);
+            outcome
+        }
+    }
+
+    /// Issue #83 (process exits during setup): a quick-exit child
+    /// (`cmd /c exit 0`) starts through the full path — resume, capture,
+    /// watcher — and reconciles to terminal without any unknown fence. The
+    /// setup race (child already gone before first observation) must project
+    /// an honest `Completed` exit, never an unknown outcome. Honest
+    /// self-skip on non-Windows; no `#[ignore]`.
+    #[test]
+    fn issue83_quick_exit_reconciles_without_unknown_fence(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        #[cfg(not(windows))]
+        {
+            assert!(
+                cfg!(not(windows)),
+                "non-Windows targets must take the explicit skip branch"
+            );
+            return Ok(());
+        }
+        #[cfg(windows)]
+        {
+            let argv = vec!["/c".to_owned(), "exit".to_owned(), "0".to_owned()];
+            let (executor, request, operation_id) =
+                s83_parts("quick-exit", argv, 30_000)?;
+            let sink = Arc::new(RecordingSink::default());
+            let sink_dyn: Arc<dyn ProcessEvidenceSink> = sink.clone();
+            // The quick-exit child starts through the full path and reports a
+            // normal receipt — never an unknown fence for a setup race.
+            let _receipt = block_on(executor.start(request, sink_dyn))?;
+            s04_wait_terminal(&executor, &operation_id)?;
+            let evidence = block_on(executor.reconcile(operation_id.clone()))?;
+            assert_eq!(evidence.operation_id(), &operation_id);
+            assert_eq!(evidence.view().lifecycle(), ProcessLifecycle::Exited);
+            let Some(exit) = evidence.view().exit() else {
+                panic!("quick-exit reconcile must carry an exit observation");
+            };
+            assert_eq!(exit.disposition(), ExitDisposition::Completed);
+            // No unknown fence anywhere: the setup race stayed exact.
+            assert_eq!(executor.unknown_outcome_count(), 0);
+            assert_eq!(executor.cleanup_pending_count(), 0);
+            assert_eq!(
+                executor.wall_time_enforcement_installed(&operation_id),
+                Some(true)
             );
             Ok(())
         }
