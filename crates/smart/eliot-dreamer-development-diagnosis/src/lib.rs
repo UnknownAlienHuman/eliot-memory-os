@@ -3082,7 +3082,7 @@ mod tests {
 
     // WORK_UNIT_CASE: 675/21
     #[test]
-    fn case_21_mandatory_conflict_analysis_missing_yields_insufficiency() {
+    fn case_21_mandatory_conflict_missing_yields_insufficiency() {
         let job = test_job();
         let draft = test_draft();
         let product = test_product();
