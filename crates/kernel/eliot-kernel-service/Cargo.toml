@@ -37,6 +37,12 @@ thiserror.workspace = true
 [dev-dependencies]
 eliot-ors.workspace = true
 eliot-platform-windows.workspace = true
+# T11.1-DAEMON live E2E (test-only): the real Surreal adapter on a temp root
+# (never the memory adapter) plus the Governor read facade under test. These
+# edges never enter the production dependency graph or the runtime boundary.
+eliot-store-surreal-adapter.workspace = true
+eliot-read = { path = "../../governor/eliot-read" }
+secrecy.workspace = true
 
 [lints]
 workspace = true

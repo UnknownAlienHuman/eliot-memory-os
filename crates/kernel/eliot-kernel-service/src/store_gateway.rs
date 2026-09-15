@@ -1027,3 +1027,679 @@ mod named_read_gateway_tests {
         let _ = std::fs::remove_dir_all(&scratch);
     }
 }
+
+#[cfg(test)]
+#[allow(
+    clippy::expect_used,
+    clippy::unwrap_used,
+    clippy::too_many_lines,
+    reason = "T11.1 live-Surreal daemon-half E2E: every asserted identity, fence, bound, and payload value is derived from runtime inputs and the live provider; nothing is canned"
+)]
+mod live_surreal_evidence_pack_e2e {
+    //! T11.1 daemon-half live proof against the real embedded Surreal store.
+    //!
+    //! Unlike `named_read_gateway_tests` (a loopback transport replaying
+    //! Surreal-conformant frames), this module boots a REAL `surreal.exe`
+    //! provider on an isolated temp root, drives the production
+    //! [`SurrealStoreAdapter`](eliot_store_surreal_adapter::SurrealStoreAdapter)
+    //! (schema migration, one `CaptureObservation` mutation, one
+    //! `GetEvidencePack` named read), and serves the `eliot.query`
+    //! acceptance through the production Governor
+    //! [`ReadService`](eliot_read::ReadService) — the exact service type
+    //! `DaemonComposition::context_read_client` pairs with the daemon's
+    //! `KernelContextReadClient` over the same `CanonicalReadClient`
+    //! interface. The memory adapter is never used here; it remains the
+    //! reference handler only.
+    //!
+    //! Coverage in two tests sharing one fixture builder:
+    //!
+    //! * `daemon_query_gates_fail_closed_before_store_io` — the #1465
+    //!   residuals through the real `ReadService` over a real (unconnected)
+    //!   adapter instance: smuggled `query`/`exact_resource_uri` parameters
+    //!   and a `QueryRequest`-level `exact_resource_uri` fail closed, and
+    //!   `state()` rejects `GetEvidencePack`. These gates sit before any
+    //!   transport by contract, so no provider is needed; this test is green.
+    //! * `live_surreal_capture_then_eliot_query_returns_exact_evidence_pack`
+    //!   — the T11.1 acceptance live: one real capture, then `eliot.query`
+    //!   returns the exact record/provenance with an explicit `Verification`
+    //!   intent (free-text `query` stays intent data, never a selector), and
+    //!   wrong-fence / over-bound requests fail. This test is BLOCKED on the
+    //!   store substrate (see below) and currently fails at the capture step;
+    //!   it must not be weakened, ignored, or deleted.
+    //!
+    //! BLOCKED EDGE (store lane, not this item): `SurrealDB` 3.1.4 parses
+    //! colon-bearing strings in RPC `query` bindings into record pointers
+    //! (`RETURN $v` with `{"v":"scope:scope-t11-live"}` yields thing
+    //! `scope:scope`; dash-only strings survive). The adapter derives every
+    //! revision key as `scope:{scope_id}` (`plan.rs:644`) and writes it
+    //! through `type::record($revision_table, $revision_key)` plus a `TYPE
+    //! string` field (`schema.rs:186-187`, `apply/atomic_write.rs`), so NO
+    //! live capture can commit: the provider answers `Couldn't coerce value
+    //! for field revision_key ... Expected string but found scope:scope` and
+    //! the transaction rolls back atomically (`UnknownOutcome`). Fixing the
+    //! binding-safe key encoding belongs to the adapter owner
+    //! (`crates/storage/eliot-store-surreal-adapter/`, ASTRA T11.2); the
+    //! daemon-half proof above turns green unchanged once captures commit.
+
+    use std::collections::BTreeMap;
+    use std::num::NonZeroU64;
+    use std::path::{Path, PathBuf};
+    use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+    use eliot_contracts::{
+        ClockReading, EpochId, EpochLineageId, ProductId, RequestId, RequestMetadata,
+        ResourceGeneration, SourceId, StateFence,
+    };
+    use eliot_platform_windows::{RetainedProcessPathLease, WindowsPlatform};
+    use eliot_read::{
+        EliotResourceUri, QueryIntent, QueryMode, QueryRequest, ReadApi, ReadError, ReadService,
+        StateRequest,
+    };
+    use eliot_store_api::{
+        EVIDENCE_PACK_MAX_RECORDS, EffectClass,
+        EventProjectionRelationIntents, NamedMutationOperation, NamedMutationRequest,
+        NamedReadOperation, OperationId, OperationIdentity, PreparedTransition, ReadConsistency,
+        ScopeId, OrderingScopeId, TransitionClass, WriteReceiptStatus, generated_operation_manifests,
+        operation_manifest_set_digest, sha256_hex,
+    };
+    use eliot_store_surreal_adapter::{
+        PINNED_SURREALDB_MAJOR, SchemaGeneration, SemanticReadiness, SurrealAdapterConfig,
+        SurrealStoreAdapter,
+    };
+    use serde_json::{Value, json};
+
+    const TEST_LINEAGE: &str = "550e8400-e29b-41d4-a716-446655440000";
+    const DEFAULT_PROVIDER_EXE: &str = r"C:\Tools\SurrealDB\surreal.exe";
+    const PROVIDER_EXE_OVERRIDE_ENV: &str = "ELIOT_T11_SURREAL_EXE";
+
+    fn provider_exe() -> PathBuf {
+        std::env::var_os(PROVIDER_EXE_OVERRIDE_ENV).map_or_else(
+            || PathBuf::from(DEFAULT_PROVIDER_EXE),
+            PathBuf::from,
+        )
+    }
+
+    fn live_fence() -> StateFence {
+        let lineage = EpochLineageId::new(TEST_LINEAGE).expect("test lineage parses");
+        let epoch = EpochId::new(lineage, NonZeroU64::new(1).expect("nonzero sequence"))
+            .expect("test epoch builds");
+        StateFence::new(epoch, ResourceGeneration::genesis())
+    }
+
+    fn wrong_fence() -> StateFence {
+        let lineage = EpochLineageId::new(TEST_LINEAGE).expect("test lineage parses");
+        let epoch = EpochId::new(lineage, NonZeroU64::new(2).expect("nonzero sequence"))
+            .expect("changed epoch builds");
+        StateFence::new(epoch, ResourceGeneration::genesis())
+    }
+
+    fn now_ms() -> i64 {
+        i64::try_from(
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map_or(0, |elapsed| elapsed.as_millis()),
+        )
+        .unwrap_or(i64::MAX)
+    }
+
+    fn live_clock() -> ClockReading {
+        let observed = now_ms();
+        ClockReading {
+            valid_time_ms: Some(observed),
+            known_time_ms: Some(observed),
+            transaction_sequence: None,
+            monotonic_ns: None,
+        }
+    }
+
+    fn live_context(fence: &StateFence, tag: &str) -> RequestMetadata {
+        RequestMetadata {
+            request_id: RequestId::new(format!("t11-live-{tag}")).expect("request identity"),
+            session_id: None,
+            task_id: None,
+            product_id: ProductId::new("t11-live-product").expect("product identity"),
+            source_id: SourceId::new("t11-live-source").expect("source identity"),
+            state_fence: fence.clone(),
+            clock: live_clock(),
+        }
+    }
+
+    fn live_capture_transition(
+        fence: &StateFence,
+        scope: &ScopeId,
+        subject: &str,
+        tag: &str,
+    ) -> PreparedTransition {
+        let entries = generated_operation_manifests().expect("operation catalogue generates");
+        let set_digest = operation_manifest_set_digest(&entries).expect("set digest computes");
+        PreparedTransition {
+            identity: OperationIdentity {
+                operation_id: OperationId::new(format!("op-t11-live-{tag}"))
+                    .expect("operation identity"),
+                idempotency_key: format!("idem-t11-live-{tag}"),
+                canonical_request_hash: sha256_hex(format!("op-t11-live-{tag}").as_bytes()),
+            },
+            state_fence: fence.clone(),
+            scope_id: scope.clone(),
+            task_id: None,
+            ordering_scopes: vec![OrderingScopeId::new(scope.as_str()).expect("ordering scope")],
+            transition_class: TransitionClass::CaptureCandidate,
+            requested_effect_ceiling: EffectClass::Candidate,
+            admission_contract_set_digest: set_digest.as_str().to_owned(),
+            operation_manifest_digest: set_digest,
+            named_operations: vec![NamedMutationRequest {
+                operation: NamedMutationOperation::CaptureObservation,
+                parameters: BTreeMap::from([("subject".to_owned(), json!(subject))]),
+            }],
+            event_projection_relation_intents: EventProjectionRelationIntents {
+                event_ids: Vec::new(),
+                projection_kinds: Vec::new(),
+                relation_kinds: Vec::new(),
+            },
+            security: eliot_store_api::SecurityContext::default(),
+            required_proof_and_approval_refs: Vec::new(),
+        }
+    }
+
+    fn verification_intent() -> QueryIntent {
+        QueryIntent {
+            mode: QueryMode::Verification,
+            time_scope: "t11-live-session-window".to_owned(),
+            branch_environment_scope: "t11-live-branch".to_owned(),
+            freshness_policy: "t11-live-exact-fence".to_owned(),
+            required_assurance: "t11-live-evidence-provenance".to_owned(),
+        }
+    }
+
+    fn evidence_parameters(subject: &str, max_records: &str) -> BTreeMap<String, Value> {
+        BTreeMap::from([
+            ("subject".to_owned(), Value::String(subject.to_owned())),
+            (
+                "max_records".to_owned(),
+                Value::String(max_records.to_owned()),
+            ),
+        ])
+    }
+
+    fn live_query(
+        scope: &ScopeId,
+        subject: &str,
+        max_records: &str,
+        free_text: &str,
+    ) -> QueryRequest {
+        QueryRequest {
+            intent: verification_intent(),
+            operation: NamedReadOperation::GetEvidencePack,
+            query: free_text.to_owned(),
+            exact_resource_uri: None,
+            scope_id: Some(scope.clone()),
+            consistency: ReadConsistency::Eventual,
+            dependency_revisions: BTreeMap::new(),
+            parameters: evidence_parameters(subject, max_records),
+            provenance_handles: Vec::new(),
+        }
+    }
+
+    fn live_roots(suffix: &str) -> (PathBuf, PathBuf, PathBuf, PathBuf) {
+        // The suffix keeps parallel tests in one process (same pid) on
+        // disjoint roots: sharing a root would let one test's cleanup
+        // remove another test's live provider files mid-run.
+        let root = std::env::temp_dir()
+            .join(format!("eliot-t11-live-surreal-{}-{suffix}", std::process::id()));
+        let data = root.join("data");
+        let work = root.join("work");
+        let tmp = root.join("tmp");
+        for dir in [&root, &data, &work, &tmp] {
+            std::fs::create_dir_all(dir).expect("live temp root creates");
+        }
+        (root, data, work, tmp)
+    }
+
+    fn free_loopback_port() -> u16 {
+        std::net::TcpListener::bind("127.0.0.1:0")
+            .expect("loopback probe binds")
+            .local_addr()
+            .expect("probe address reads")
+            .port()
+    }
+
+    /// Creates the provider root user on a FRESH data root, then stops.
+    ///
+    /// The adapter's canonical argv carries no `--user/--pass` (credentials
+    /// never enter argv or the environment), so a fresh datastore must first
+    /// observe its installation root user exactly once — the same bootstrap
+    /// the Host-managed installation performs. This fixture spawns the
+    /// provider briefly with the test credential, waits for its bound
+    /// endpoint, then kills and reaps it; the adapter spawns and owns its own
+    /// provider child afterwards. The child is always reaped (`kill_on_drop`
+    /// plus explicit `kill`/`wait`), never orphaned.
+    async fn bootstrap_root_user(
+        exe: &Path,
+        work: &Path,
+        data: &Path,
+        bind: &str,
+        username: &str,
+        password: &str,
+    ) {
+        let data_url = format!("surrealkv://{}", data.to_string_lossy().replace('\\', "/"));
+        let mut child = tokio::process::Command::new(exe)
+            .args([
+                "start",
+                "--no-banner",
+                "--bind",
+                bind,
+                "--username",
+                username,
+                "--password",
+                password,
+                &data_url,
+            ])
+            .current_dir(work)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .kill_on_drop(true)
+            .spawn()
+            .expect("bootstrap provider spawns");
+        let mut bound = false;
+        for _ in 0..300 {
+            if child
+                .try_wait()
+                .expect("bootstrap child polls")
+                .is_some()
+            {
+                panic!("bootstrap provider exited before binding {bind}");
+            }
+            if matches!(
+                tokio::time::timeout(
+                    Duration::from_millis(200),
+                    tokio::net::TcpStream::connect(bind)
+                )
+                .await,
+                Ok(Ok(_))
+            ) {
+                bound = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        assert!(bound, "bootstrap provider never bound {bind}");
+        child.kill().await.expect("bootstrap provider kills");
+        child.wait().await.expect("bootstrap provider reaps");
+    }
+
+    fn live_lease(work: &Path, exe: &Path, exe_digest: &str) -> RetainedProcessPathLease {
+        let platform =
+            WindowsPlatform::new(Path::new(r"C:\")).expect("platform binds the system root");
+        platform
+            .retain_process_path_lease(exe, work, exe_digest)
+            .expect("provider lease retains")
+    }
+
+    struct LiveAdapterParts {
+        adapter: SurrealStoreAdapter,
+        root: PathBuf,
+        bind: String,
+        username: String,
+        password: String,
+        work: PathBuf,
+        data: PathBuf,
+        exe: PathBuf,
+    }
+
+    /// Builds a real adapter on an isolated temp root without connecting.
+    ///
+    /// Construction is pure (catalogue digest + lease validation); no
+    /// provider spawns here. Callers that need live I/O bootstrap the root
+    /// user and call `connect` themselves.
+    fn build_adapter(tag: &str) -> LiveAdapterParts {
+        let exe = provider_exe();
+        assert!(
+            exe.is_file(),
+            "the live proof requires a real SurrealDB provider; set {PROVIDER_EXE_OVERRIDE_ENV} or install it at {}",
+            exe.display()
+        );
+        let exe_bytes = std::fs::read(&exe).expect("provider bytes read");
+        let exe_digest = sha256_hex(&exe_bytes);
+        let roots_digest = sha256_hex(format!("t11-live-roots-{tag}").as_bytes());
+        let (root, data, work, tmp) = live_roots(tag);
+        let port = free_loopback_port();
+        let bind = format!("127.0.0.1:{port}");
+        let username = "t11-live-provider".to_owned();
+        let password = format!("t11-live-provider-password-{tag}");
+        let mut config = SurrealAdapterConfig {
+            endpoint: format!("ws://{bind}/rpc"),
+            namespace: "eliot".to_owned(),
+            database: "eliot".to_owned(),
+            username: username.clone(),
+            password: secrecy::SecretString::new(password.clone().into()),
+            provider_bind_address: bind.clone(),
+            installation_id: "t11-live-installation".to_owned(),
+            installation_profile: "portable_dev".to_owned(),
+            runtime_state_roots_digest: roots_digest,
+            provider_executable_path: exe.to_string_lossy().into_owned(),
+            provider_artifact_digest: exe_digest.clone(),
+            provider_arguments: Vec::new(),
+            store_data_root: data.to_string_lossy().into_owned(),
+            store_work_root: work.to_string_lossy().into_owned(),
+            store_temp_root: tmp.to_string_lossy().into_owned(),
+            connect_timeout_ms: 60_000,
+            query_timeout_ms: 30_000,
+            expected_provider_major: PINNED_SURREALDB_MAJOR,
+            expected_schema_generation: SchemaGeneration::v2(),
+        };
+        config.provider_arguments = config.expected_provider_arguments();
+        config.validate().expect("live adapter config validates");
+        let lease = live_lease(&work, &exe, &exe_digest);
+        let adapter = SurrealStoreAdapter::new(config, lease).expect("live adapter constructs");
+        LiveAdapterParts {
+            adapter,
+            root,
+            bind,
+            username,
+            password,
+            work,
+            data,
+            exe,
+        }
+    }
+
+    #[tokio::test]
+    async fn daemon_query_gates_fail_closed_before_store_io() {
+        // #1465 residuals through the production facade over a real adapter
+        // instance. Every check below fails before any transport by
+        // contract, so this test needs no provider and stays green while
+        // the live capture substrate is blocked (see module docs).
+        let tag = format!("gates-p{}", std::process::id());
+        let subject = format!("t11-live-observation-{tag}");
+        let scope = ScopeId::new("scope-t11-live").expect("scope parses");
+        let fence = live_fence();
+        let parts = build_adapter(&tag);
+        let service = ReadService::new(parts.adapter);
+
+        // Free text is intent data only — a smuggled `query` selector fails
+        // the closed catalogue gate before any transport.
+        let mut smuggled = evidence_parameters(&subject, "10");
+        smuggled.insert("query".to_owned(), Value::String(subject.clone()));
+        let smuggled_request = QueryRequest {
+            intent: verification_intent(),
+            operation: NamedReadOperation::GetEvidencePack,
+            query: "unrelated prose".to_owned(),
+            exact_resource_uri: None,
+            scope_id: Some(scope.clone()),
+            consistency: ReadConsistency::Eventual,
+            dependency_revisions: BTreeMap::new(),
+            parameters: smuggled,
+            provenance_handles: Vec::new(),
+        };
+        assert!(
+            matches!(
+                service
+                    .query(
+                        &live_context(&fence, &format!("query-smuggled-{tag}")),
+                        smuggled_request
+                    )
+                    .await,
+                Err(ReadError::DuplicateField(_))
+            ),
+            "a smuggled `query` parameter must fail closed"
+        );
+
+        // Exact expansion belongs to `ResourceRequest`, never to
+        // `QueryRequest` — both the parameter key and the request-level
+        // selector fail closed on this path.
+        let mut smuggled_uri = evidence_parameters(&subject, "10");
+        smuggled_uri.insert(
+            "exact_resource_uri".to_owned(),
+            Value::String("eliot://evidence/pack".to_owned()),
+        );
+        let smuggled_uri_request = QueryRequest {
+            intent: verification_intent(),
+            operation: NamedReadOperation::GetEvidencePack,
+            query: "unrelated prose".to_owned(),
+            exact_resource_uri: None,
+            scope_id: Some(scope.clone()),
+            consistency: ReadConsistency::Eventual,
+            dependency_revisions: BTreeMap::new(),
+            parameters: smuggled_uri,
+            provenance_handles: Vec::new(),
+        };
+        assert!(
+            matches!(
+                service
+                    .query(
+                        &live_context(&fence, &format!("query-smuggled-uri-{tag}")),
+                        smuggled_uri_request
+                    )
+                    .await,
+                Err(ReadError::DuplicateField(_))
+            ),
+            "a smuggled `exact_resource_uri` parameter must fail closed"
+        );
+        let request_level_uri = QueryRequest {
+            intent: verification_intent(),
+            operation: NamedReadOperation::GetEvidencePack,
+            query: "unrelated prose".to_owned(),
+            exact_resource_uri: Some(
+                EliotResourceUri::new("eliot://evidence/pack").expect("test URI parses"),
+            ),
+            scope_id: Some(scope.clone()),
+            consistency: ReadConsistency::Eventual,
+            dependency_revisions: BTreeMap::new(),
+            parameters: evidence_parameters(&subject, "10"),
+            provenance_handles: Vec::new(),
+        };
+        assert!(
+            matches!(
+                service
+                    .query(
+                        &live_context(&fence, &format!("query-request-uri-{tag}")),
+                        request_level_uri
+                    )
+                    .await,
+                Err(ReadError::InvalidField { .. })
+            ),
+            "a request-level `exact_resource_uri` must fail closed on the query path"
+        );
+
+        // `state()` owns current-state operations only — `GetEvidencePack`
+        // is rejected before any transport.
+        let state_rejected = service
+            .state(
+                &live_context(&fence, &format!("state-pack-{tag}")),
+                StateRequest {
+                    operation: NamedReadOperation::GetEvidencePack,
+                    scope_id: Some(scope.clone()),
+                    consistency: ReadConsistency::Eventual,
+                    dependency_revisions: BTreeMap::new(),
+                    parameters: evidence_parameters(&subject, "10"),
+                    provenance_handles: Vec::new(),
+                },
+            )
+            .await;
+        match state_rejected {
+            Err(ReadError::OperationNotAllowed { operation, context }) => {
+                assert_eq!(operation, NamedReadOperation::GetEvidencePack);
+                assert_eq!(context, "state");
+            }
+            other => panic!("state(GetEvidencePack) must fail closed, observed: {other:?}"),
+        }
+
+        drop(service);
+        let _ = std::fs::remove_dir_all(&parts.root);
+    }
+
+    #[tokio::test]
+    async fn live_surreal_capture_then_eliot_query_returns_exact_evidence_pack() {
+        let tag = format!("p{}", std::process::id());
+        let subject = format!("t11-live-observation-{tag}");
+        let scope = ScopeId::new("scope-t11-live").expect("scope parses");
+        let fence = live_fence();
+
+        let parts = build_adapter(&tag);
+        let LiveAdapterParts {
+            adapter,
+            root,
+            bind,
+            username,
+            password,
+            work,
+            data,
+            exe,
+        } = parts;
+        bootstrap_root_user(&exe, &work, &data, &bind, &username, &password).await;
+        adapter.connect().await.expect("live adapter connects");
+
+        assert!(
+            matches!(
+                adapter.probe_readiness().await.expect("readiness probes"),
+                SemanticReadiness::MigrationRequired { .. }
+            ),
+            "a fresh temp-root provider must observe MigrationRequired before migration"
+        );
+        adapter
+            .apply_migration(
+                &SurrealStoreAdapter::v2_baseline_migration(),
+                &live_clock(),
+                &fence,
+            )
+            .await
+            .expect("v2 baseline migrates");
+        assert!(
+            matches!(
+                adapter.probe_readiness().await.expect("readiness re-probes"),
+                SemanticReadiness::Ready { .. }
+            ),
+            "the migrated provider must observe Ready before capture"
+        );
+
+        // Existing capture path: one real observation through the production
+        // atomic writer on the live provider.
+        let ctx = live_context(&fence, &format!("capture-{tag}"));
+        let transition = live_capture_transition(&fence, &scope, &subject, &tag);
+        let receipt = adapter
+            .apply_prepared(&ctx, transition, Vec::new(), Vec::new())
+            .await
+            .expect("live capture commits");
+        assert_eq!(receipt.status, WriteReceiptStatus::Committed);
+        assert_eq!(receipt.state_fence, fence);
+
+        // `eliot.query` acceptance: the Governor read facade over the SAME
+        // live adapter returns the exact record/provenance. Free text is
+        // deliberately unrelated prose — it must never become a selector.
+        let service = ReadService::new(adapter);
+        let result = service
+            .query(
+                &live_context(&fence, &format!("query-{tag}")),
+                live_query(
+                    &scope,
+                    &subject,
+                    "10",
+                    "summarize everything captured for the operator in prose",
+                ),
+            )
+            .await
+            .expect("live eliot.query reads its exact pack");
+        assert_eq!(result.operation, NamedReadOperation::GetEvidencePack);
+        assert_eq!(result.state_fence, fence);
+        assert_eq!(result.intent, verification_intent());
+        assert_eq!(
+            result.payload.get("subject"),
+            Some(&Value::String(subject.clone()))
+        );
+        let records = result
+            .payload
+            .get("records")
+            .and_then(Value::as_array)
+            .expect("records array present");
+        assert_eq!(records.len(), 1, "exact subject yields its one record");
+        assert_eq!(records[0].get("capture_index"), Some(&json!(0)));
+        assert_eq!(
+            records[0].get("operation"),
+            Some(&json!("CaptureObservation"))
+        );
+        assert_eq!(
+            records[0]
+                .get("parameters")
+                .and_then(|parameters| parameters.get("subject")),
+            Some(&Value::String(subject.clone()))
+        );
+        let provenance = result
+            .payload
+            .get("provenance")
+            .and_then(Value::as_object)
+            .expect("provenance present");
+        assert_eq!(provenance.get("matched_total"), Some(&json!(1)));
+        assert_eq!(provenance.get("returned"), Some(&json!(1)));
+        assert_eq!(provenance.get("truncated"), Some(&json!(false)));
+        let expected_fence = serde_json::to_value(&fence).expect("fence encodes");
+        assert_eq!(provenance.get("state_fence"), Some(&expected_fence));
+        for head in &result.revision_heads {
+            assert_eq!(
+                head.state_fence, fence,
+                "every observed head stays on the admitted fence"
+            );
+        }
+
+        // Acceptance negative: a changed fence must not return a successful
+        // current view.
+        let fenced = service
+            .query(
+                &live_context(&wrong_fence(), &format!("query-wrong-fence-{tag}")),
+                live_query(&scope, &subject, "10", "unrelated prose"),
+            )
+            .await;
+        match fenced {
+            Err(ReadError::Store(message)) => assert!(
+                message.contains("state fence mismatch"),
+                "wrong-fence refusal must surface the typed mismatch, observed: {message}"
+            ),
+            other => panic!("wrong fence must fail closed, observed: {other:?}"),
+        }
+
+        // Acceptance negative: exceeding the declared bound must not return
+        // a successful current view.
+        let over_bound = service
+            .query(
+                &live_context(&fence, &format!("query-over-bound-{tag}")),
+                live_query(
+                    &scope,
+                    &subject,
+                    &(EVIDENCE_PACK_MAX_RECORDS + 1).to_string(),
+                    "unrelated prose",
+                ),
+            )
+            .await;
+        match over_bound {
+            Err(ReadError::Store(message)) => assert!(
+                message.contains("payload exceeds named-operation limit"),
+                "over-bound refusal must surface the typed limit, observed: {message}"
+            ),
+            other => panic!("over-bound request must fail closed, observed: {other:?}"),
+        }
+
+        // An admitted state operation still serves on the same live store
+        // (`GetEvidencePack` rejection is covered in
+        // `daemon_query_gates_fail_closed_before_store_io`).
+        let state_view = service
+            .state(
+                &live_context(&fence, &format!("state-heads-{tag}")),
+                StateRequest {
+                    operation: NamedReadOperation::GetRevisionHeads,
+                    scope_id: None,
+                    consistency: ReadConsistency::Eventual,
+                    dependency_revisions: BTreeMap::new(),
+                    parameters: BTreeMap::new(),
+                    provenance_handles: Vec::new(),
+                },
+            )
+            .await
+            .expect("admitted state operation still serves on the live store");
+        assert_eq!(state_view.operation, NamedReadOperation::GetRevisionHeads);
+        assert_eq!(state_view.state_fence, fence);
+
+        drop(service);
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        let _ = std::fs::remove_dir_all(&root);
+    }
+}
