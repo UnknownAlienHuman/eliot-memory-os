@@ -95,6 +95,7 @@ mod daemon_request_dispatch;
 mod daemon_runtime;
 mod daemon_session_guard;
 mod daemon_supervision;
+mod dispatch_launch;
 mod frame_dispatch;
 mod front_door_listener;
 mod front_door_session;
@@ -134,6 +135,23 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+/// DISPATCH-CONTOUR-2 Slice B launch contour (issues #461 and #22).
+///
+/// The composed dispatch owner plus admit-then-launch through the admitted
+/// process executor, parameterized once for the Doctor and testd one-shot
+/// workers. The front-door dispatch arm admits through this contour; the
+/// production caller composes and launches through it.
+pub use dispatch_launch::{
+    ChildStartOutcome, DispatchLaunchError, DispatchedWorkerKind, DoctorLaunchMaterial,
+    DoctorLaunchOutcome, DoctorLaunchSkip, PreparedDoctorLaunch, PreparedTestdLaunch,
+    ReadyDoctorLaunch, ReadyTestdLaunch, ReconcileLaunchedOutcome, SpawnedChild,
+    TestdLaunchMaterial, TestdLaunchOutcome, TestdLaunchSkip, UncertainSpawn,
+    compose_dispatch_contour, compose_doctor_front_door, dispatch_contour,
+    doctor_repair_advertised, launch_admitted_doctor_attempt, launch_admitted_testd_attempt,
+    prepare_doctor_launch, prepare_testd_launch, reconcile_launched_doctor_attempt,
+    reconcile_launched_testd_attempt, release_launched_attempt, start_ready_doctor_launch,
+    start_ready_testd_launch,
+};
 use eliot_contracts::{
     ArtifactId, AuthorityEpoch, ContractId, RequestId, ResourceGeneration, StateFence,
 };
@@ -160,23 +178,29 @@ use eliot_kernel_service::{
 /// P-07 Doctor wire seam for the front-door dispatch/driver arms (T6-D2 Slice B).
 ///
 /// The dispatch arm (`frame_dispatch`) and the session binder
-/// (`front_door_session`) depend only on these existing `doctor.rs` symbols.
-/// Slice A's `doctor_front_door.rs` handler plugs into the marked call site in
-/// `frame_dispatch::execute_doctor_request` without changing this seam.
+/// (`front_door_session`) depend only on these existing `doctor.rs` /
+/// `doctor_front_door.rs` symbols. Slice B admits through the composed
+/// dispatch contour (`dispatch_launch`, over `handle_doctor_repair_attempt`)
+/// at the marked call site in `frame_dispatch::execute_doctor_request`.
 pub use eliot_kernel_service::{
-    DOCTOR_REPAIR_WIRE_ID, DOCTOR_REPAIR_WIRE_VERSION, DoctorAdmissionContext,
-    DoctorRepairAttemptRequest, route_doctor_repair,
+    AuthenticatedDoctorSession, ComposedDoctorFrontDoor, DOCTOR_REPAIR_WIRE_ID,
+    DOCTOR_REPAIR_WIRE_VERSION, DoctorAdmissionContext, DoctorRecipeRegistry,
+    DoctorRepairAdmission, DoctorRepairAttemptRequest, DoctorRepairResponse,
+    advertise_doctor_repair, handle_doctor_repair_attempt, route_doctor_repair,
 };
 /// P-07 testd wire seam for the front-door dispatch/driver arms (T6-X1 Slice B).
 ///
 /// The dispatch arm (`frame_dispatch`) and the session binder
 /// (`front_door_session`) depend only on these existing
-/// `testd_front_door.rs` symbols. The `testd_front_door.rs` handler plugs
-/// into the marked call site in `frame_dispatch::execute_testd_request`
-/// without changing this seam.
+/// `testd_front_door.rs` symbols. Slice B admits through the composed
+/// dispatch contour (`dispatch_launch`, over
+/// `handle_testd_admission_attempt`) at the marked call site in
+/// `frame_dispatch::execute_testd_request`.
 pub use eliot_kernel_service::{
-    TESTD_ADMISSION_WIRE_ID, TESTD_ADMISSION_WIRE_VERSION, TestdAdmissionAttemptRequest,
-    TestdAdmissionContext, route_testd_admission,
+    AuthenticatedTestdSession, TESTD_ADMISSION_WIRE_ID, TESTD_ADMISSION_WIRE_VERSION,
+    TestdAdmission, TestdAdmissionAttemptRequest, TestdAdmissionContext, TestdAdmissionEnvelope,
+    TestdAdmissionResponse, handle_testd_admission_attempt, reconcile_testd_admission,
+    route_testd_admission,
 };
 #[cfg(test)]
 use eliot_ors::CanonicalEvidenceProvider;

@@ -13,12 +13,11 @@
 use super::front_door_session::{DOCTOR_MODULE_ID, TESTD_MODULE_ID};
 use super::native_worker_lifecycle_route::is_native_worker_operation;
 use super::{
-    ACTIVE_DAEMON_CALLER, DOCTOR_REPAIR_WIRE_ID, DoctorAdmissionContext,
-    DoctorRepairAttemptRequest, Frame, FrameKind, KernelComposition, KernelFrameAction,
-    KernelServiceState, MessageType, ProcessExecutionRequest, ProtocolPayload, Session,
-    TESTD_ADMISSION_WIRE_ID, TestdAdmissionAttemptRequest, TestdAdmissionContext, TransportError,
-    caller_binding, probe_ready_state_admitted, route_doctor_repair, route_testd_admission,
-    status_frame, unix_ms,
+    ACTIVE_DAEMON_CALLER, DOCTOR_REPAIR_WIRE_ID, DoctorRepairAttemptRequest, Frame, FrameKind,
+    KernelComposition, KernelFrameAction, KernelServiceState, MessageType, ProcessExecutionRequest,
+    ProtocolPayload, Session, TESTD_ADMISSION_WIRE_ID, TestdAdmissionAttemptRequest,
+    TransportError, caller_binding, probe_ready_state_admitted, route_doctor_repair,
+    route_testd_admission, status_frame, unix_ms,
 };
 
 impl KernelComposition {
@@ -71,6 +70,14 @@ impl KernelComposition {
                 serde_json::json!({
                     "status": "OPEN",
                     "authority_epoch": session.authority_epoch,
+                    // Doctor advertisement through the real composed
+                    // front-door owner (DISPATCH-CONTOUR-2 Slice B): true
+                    // exactly when the contour cell holds the production
+                    // ledger, a non-empty immutable registry, and the
+                    // principal owner. The one-shot Doctor's advertise
+                    // probe reads this key fail-closed.
+                    "doctor_repair_advertised":
+                        super::dispatch_launch::doctor_repair_advertised(),
                 }),
             )?));
         }
@@ -523,30 +530,36 @@ impl KernelComposition {
     ///
     /// Revalidates the closed operation name, the presenting session's Doctor
     /// binding, and the typed request shape/digest/wire version through the
-    /// existing `doctor.rs` entries, then builds the live admission context
-    /// from Kernel-owned state (service state, `KernelService` authority
-    /// epoch, consumed activation generation) following the
-    /// `host_request_binding` live-authority pattern. Neither the epoch nor
-    /// the generation is ever taken from the request envelope.
+    /// existing `doctor.rs` entries, then admits through the composed
+    /// dispatch contour
+    /// ([`dispatch_launch::admit_doctor_repair_attempt`](super::dispatch_launch::admit_doctor_repair_attempt)):
+    /// the contour binds the Doctor session from live Kernel state plus its
+    /// composed principal owner and delegates to the unchanged
+    /// `handle_doctor_repair_attempt` gate over the production ledger and
+    /// the immutable registry. Neither the epoch nor the generation is ever
+    /// taken from the request envelope.
     ///
-    /// INTEGRATOR (T6-D2 B->A) — REWIRE RECORD. Attempted to replace the
-    /// fail-closed tail with `eliot_kernel_service::handle_doctor_repair_attempt`
-    /// (Slice A `doctor_front_door.rs`, over `admit_doctor_repair`): no
-    /// production `DoctorRecoveryLedger` accessor exists in bins scope (only
-    /// `TestLedger` in kernel-service tests; `RedbRecoveryStore` implements
-    /// `OperationalRecoveryStore`, not the Doctor ledger), no immutable
-    /// `DoctorRecipeRegistry` accessor exists, and no bootstrap-bound doctor
-    /// principal accessor exists for `AuthenticatedDoctorSession::bind`.
-    /// Fabricating any of them would violate authority, so admission stays
-    /// fail-closed without minting, persisting, or projecting any admission.
-    /// Control-frame `reconcile_doctor_repair_admission` likewise stays
-    /// unavailable here: it needs a retained admission plus envelope which
-    /// this frame path does not carry. No new constants, no relaxations, no
-    /// silent tuple drop.
+    /// REWIRED (T6-D2 Slice B): the fail-closed tail is replaced by the
+    /// composed admission above. Admitted, rejected, and conflicted answers
+    /// return as typed reply frames; only mechanical failures (uncomposed
+    /// contour, fenced generation, closed admission, ledger storage) fence
+    /// the session. Cancellation envelopes admit-as-cancelled through the
+    /// same gate (the separate control entry stays available to direct API
+    /// callers; the frame path cannot distinguish control from submit
+    /// frames, and inventing a wire bit for it is refused). An exact replay
+    /// under one attempt identity rebuilds the original admission — the
+    /// lost-reply rule — and never spawns here: spawning is the explicit
+    /// [`dispatch_launch::launch_admitted_doctor_attempt`](super::dispatch_launch::launch_admitted_doctor_attempt)
+    /// seam, keeping the admission and execution axes separate (I14.6). No
+    /// new constants, no relaxations.
+    #[allow(
+        clippy::unused_async,
+        reason = "the front-door driver awaits this handler uniformly with the daemon/testd arms; spawning stays in the explicit async launch seam"
+    )]
     pub async fn execute_doctor_request(
         &self,
         session: &Session,
-        _request_id: super::RequestId,
+        request_id: super::RequestId,
         operation: &str,
         payload: serde_json::Value,
     ) -> Result<Frame, TransportError> {
@@ -573,28 +586,33 @@ impl KernelComposition {
         {
             return Err(TransportError::SessionFenced);
         }
-        let (service_state, authority_epoch, generation) = {
-            let service = self
-                .service
-                .lock()
-                .map_err(|_| TransportError::SessionFenced)?;
-            let generation = service
-                .activation_receipt()
-                .ok_or(TransportError::SessionFenced)?
-                .generation
-                .value();
-            (service.state(), service.authority_epoch(), generation)
-        };
-        let _context = DoctorAdmissionContext::new(service_state, authority_epoch, generation)
-            .map_err(|_| TransportError::SessionFenced)?;
         let now_unix_nanos = unix_ms().saturating_mul(1_000_000);
         if now_unix_nanos == 0 {
             return Err(TransportError::SessionFenced);
         }
-        // Explicit fail-closed (see rewire record above): the validated
-        // context and request are retained but never admitted. No
-        // `let _ = (...)` silent-drop placeholder.
-        Err(TransportError::SessionFenced)
+        // Admit through the composed contour: uncomposed contours,
+        // stale sessions, and mechanical gate failures fence here, while
+        // every typed answer (admitted, rejected, conflict) projects to a
+        // reply frame below.
+        let response = {
+            let service = self
+                .service
+                .lock()
+                .map_err(|_| TransportError::SessionFenced)?;
+            super::dispatch_launch::admit_doctor_repair_attempt(&service, &request, now_unix_nanos)
+                .map_err(|_| TransportError::SessionFenced)?
+        };
+        let mut reply = status_frame(
+            session,
+            FrameKind::Response,
+            MessageType::Result,
+            serde_json::to_value(&response).map_err(|_| TransportError::SessionFenced)?,
+        )?;
+        reply.request_id = Some(request_id);
+        reply
+            .validate()
+            .map_err(|_| TransportError::SessionFenced)?;
+        Ok(reply)
     }
 }
 
@@ -722,29 +740,37 @@ impl KernelComposition {
     ///
     /// Revalidates the closed operation name, the presenting session's testd
     /// binding, and the typed request shape/digest/wire version through the
-    /// existing `testd_front_door.rs` entries, then builds the live admission
-    /// context from Kernel-owned state (service state, `KernelService`
-    /// authority epoch, consumed activation generation) following the
-    /// `host_request_binding` live-authority pattern. Neither the epoch nor
-    /// the generation is ever taken from the request envelope.
+    /// existing `testd_front_door.rs` entries, then admits through the
+    /// composed dispatch contour
+    /// ([`dispatch_launch::admit_testd_attempt`](super::dispatch_launch::admit_testd_attempt)):
+    /// the contour binds the testd session from live Kernel state plus its
+    /// composed principal owner and delegates to the unchanged
+    /// `handle_testd_admission_attempt` gate. Testd admission is stateless
+    /// (wire plus live authority only), so no ledger composition is
+    /// required. Neither the epoch nor the generation is ever taken from
+    /// the request envelope.
     ///
-    /// INTEGRATOR (T6-X1 B->A) — REWIRE RECORD. Attempted to replace the
-    /// fail-closed tail with `eliot_kernel_service::handle_testd_admission_attempt`
-    /// (Slice B `testd_front_door.rs`): no bootstrap-bound testd principal
-    /// accessor exists in bins scope for `AuthenticatedTestdSession::bind`
-    /// (only the transport `Session` plus the generation-bound
-    /// `front_door_session` module binding), and no production testd job
-    /// ledger accessor exists here (the durable job store is owned by the
-    /// testd binary). Fabricating a principal string or a durable store
-    /// would violate authority, so admission stays fail-closed without
-    /// minting, persisting, or projecting any admission. Control-frame
-    /// `reconcile_testd_admission` likewise stays unavailable here: it needs
-    /// a retained admission plus envelope which this frame path does not
-    /// carry. No new constants, no relaxations, no silent tuple drop.
+    /// REWIRED (T6-X1 Slice B): the fail-closed tail is replaced by the
+    /// composed admission above. Admitted, rejected, and conflicted answers
+    /// return as typed reply frames; only mechanical failures (uncomposed
+    /// contour, fenced generation, closed admission) fence the session.
+    /// Cancellation envelopes admit-as-cancelled through the same gate (the
+    /// separate control entry stays available to direct API callers). An
+    /// exact resubmit re-derives the admission from the same wire and live
+    /// authority — the lost-reply rule at the launch layer returns the
+    /// retained original instead of recomputing under a new id (see
+    /// [`dispatch_launch::launch_admitted_testd_attempt`](super::dispatch_launch::launch_admitted_testd_attempt)).
+    /// Spawning stays in that explicit launch seam, keeping the admission
+    /// and execution axes separate (I14.6). No new constants, no
+    /// relaxations.
+    #[allow(
+        clippy::unused_async,
+        reason = "the front-door driver awaits this handler uniformly with the daemon/doctor arms; spawning stays in the explicit async launch seam"
+    )]
     pub async fn execute_testd_request(
         &self,
         session: &Session,
-        _request_id: super::RequestId,
+        request_id: super::RequestId,
         operation: &str,
         payload: serde_json::Value,
     ) -> Result<Frame, TransportError> {
@@ -771,28 +797,33 @@ impl KernelComposition {
         {
             return Err(TransportError::SessionFenced);
         }
-        let (service_state, authority_epoch, generation) = {
-            let service = self
-                .service
-                .lock()
-                .map_err(|_| TransportError::SessionFenced)?;
-            let generation = service
-                .activation_receipt()
-                .ok_or(TransportError::SessionFenced)?
-                .generation
-                .value();
-            (service.state(), service.authority_epoch(), generation)
-        };
-        let _context = TestdAdmissionContext::new(service_state, authority_epoch, generation)
-            .map_err(|_| TransportError::SessionFenced)?;
         let now_unix_nanos = unix_ms().saturating_mul(1_000_000);
         if now_unix_nanos == 0 {
             return Err(TransportError::SessionFenced);
         }
-        // Explicit fail-closed (see rewire record above): the validated
-        // context and request are retained but never admitted. No
-        // `let _ = (...)` silent-drop placeholder.
-        Err(TransportError::SessionFenced)
+        // Admit through the composed contour: uncomposed contours,
+        // stale sessions, and mechanical gate failures fence here, while
+        // every typed answer (admitted, rejected, conflict) projects to a
+        // reply frame below.
+        let response = {
+            let service = self
+                .service
+                .lock()
+                .map_err(|_| TransportError::SessionFenced)?;
+            super::dispatch_launch::admit_testd_attempt(&service, &request, now_unix_nanos)
+                .map_err(|_| TransportError::SessionFenced)?
+        };
+        let mut reply = status_frame(
+            session,
+            FrameKind::Response,
+            MessageType::Result,
+            serde_json::to_value(&response).map_err(|_| TransportError::SessionFenced)?,
+        )?;
+        reply.request_id = Some(request_id);
+        reply
+            .validate()
+            .map_err(|_| TransportError::SessionFenced)?;
+        Ok(reply)
     }
 }
 
