@@ -1935,6 +1935,7 @@ mod tests {
     }
 
     mod self_admission_and_gap;
+    mod s08w_recovery_containment;
 
     fn heartbeat(sequence: u64) -> WatchdogSpoolEntry {
         WatchdogSpoolEntry {
