@@ -455,6 +455,144 @@ pub trait ReadApi {
     ) -> Result<ResourceContent, ReadError>;
 }
 
+/// Local Governor read port for daemon-side query/packet serving.
+///
+/// This is the MGR02-owned port for `eliot.query` / `eliot.packet` answers
+/// (HANDOFF-LRR-GOV, #18). It must not be confused with `KernelGovernorPort`
+/// in `eliot-mcp` (MGR01-owned): this trait lives in `eliot-read` and is
+/// blanket-implemented over `ReadService<C: CanonicalReadClient>` so no
+/// second consistency algorithm is created.
+#[allow(async_fn_in_trait)]
+pub trait LocalReadPort {
+    /// Answers one bounded evidence query live.
+    ///
+    /// Builds a `Verification`-intent `GetEvidencePack` request (`Eventual`,
+    /// no dependencies, `subject` + decimal `max_records` selectors) and
+    /// delegates to [`ReadApi::query`]. The exact record/provenance returns
+    /// on success; a wrong fence or an over-bound request is refused
+    /// fail-closed by the facade/store gates.
+    async fn evidence_query(
+        &self,
+        ctx: &RequestMetadata,
+        scope: ScopeId,
+        subject: String,
+        max_records: u32,
+    ) -> Result<QueryResult, ReadError>;
+    /// Answers one projection-inputs read (port-shape only until storage
+    /// activates the operation).
+    ///
+    /// Validates `packet_ref` / `material_refs` and the facade request shape
+    /// (`ContextReconstruction` intent + `GetUnderstandingProjectionInputs`),
+    /// then fails closed with a typed `Unavailable` store error until MGR04
+    /// (#19) activates the catalogue row, parameter schema, and adapter
+    /// handlers. Never a stub, never canned data, never `Ok`-empty
+    /// masquerading as success.
+    async fn projection_inputs(
+        &self,
+        ctx: &RequestMetadata,
+        scope: ScopeId,
+        packet_ref: Option<String>,
+        material_refs: Vec<String>,
+    ) -> Result<QueryResult, ReadError>;
+}
+
+impl<C: CanonicalReadClient> LocalReadPort for ReadService<C> {
+    async fn evidence_query(
+        &self,
+        ctx: &RequestMetadata,
+        scope: ScopeId,
+        subject: String,
+        max_records: u32,
+    ) -> Result<QueryResult, ReadError> {
+        text(&subject, "subject")?;
+        if max_records == 0 {
+            return Err(ReadError::InvalidField {
+                field: "max_records".to_owned(),
+                reason: "must be a positive decimal bound".to_owned(),
+            });
+        }
+        let intent = QueryIntent {
+            mode: QueryMode::Verification,
+            time_scope: "governor local evidence window".to_owned(),
+            branch_environment_scope: "governor local branch and environment".to_owned(),
+            freshness_policy: "exact captured records only".to_owned(),
+            required_assurance: "verifier evidence read".to_owned(),
+        };
+        let mut parameters = BTreeMap::new();
+        parameters.insert("subject".to_owned(), Value::String(subject.clone()));
+        parameters.insert(
+            "max_records".to_owned(),
+            Value::String(max_records.to_string()),
+        );
+        let request = QueryRequest {
+            intent,
+            operation: NamedReadOperation::GetEvidencePack,
+            query: format!("subject:{subject}"),
+            exact_resource_uri: None,
+            scope_id: Some(scope),
+            consistency: ReadConsistency::Eventual,
+            dependency_revisions: BTreeMap::new(),
+            parameters,
+            provenance_handles: Vec::new(),
+        };
+        ReadApi::query(self, ctx, request).await
+    }
+
+    async fn projection_inputs(
+        &self,
+        ctx: &RequestMetadata,
+        scope: ScopeId,
+        packet_ref: Option<String>,
+        material_refs: Vec<String>,
+    ) -> Result<QueryResult, ReadError> {
+        ctx.validate().map_err(|error| ReadError::InvalidField {
+            field: "request_metadata".to_owned(),
+            reason: error.to_string(),
+        })?;
+        if let Some(ref packet) = packet_ref {
+            text(packet, "packet.packet_ref")?;
+        }
+        {
+            let mut seen = BTreeSet::new();
+            for material in &material_refs {
+                text(material, "packet.material_refs")?;
+                if !seen.insert(material.clone()) {
+                    return Err(ReadError::DuplicateField("packet.material_refs".to_owned()));
+                }
+            }
+        }
+        let intent = QueryIntent {
+            mode: QueryMode::ContextReconstruction,
+            time_scope: "governor local projection window".to_owned(),
+            branch_environment_scope: "governor local branch and environment".to_owned(),
+            freshness_policy: "exact projection inputs only".to_owned(),
+            required_assurance: "context reconstruction read".to_owned(),
+        };
+        let query_text = match &packet_ref {
+            Some(packet) => format!("packet:{packet}"),
+            None => "packet:projection-inputs".to_owned(),
+        };
+        // Facade-valid shape today (scope-bound, admitted intent/operation);
+        // no `packet_ref` / `material_refs` parameter mapping exists until
+        // MGR04 (#19) declares the storage schema, so no selectors cross.
+        let request = QueryRequest {
+            intent,
+            operation: NamedReadOperation::GetUnderstandingProjectionInputs,
+            query: query_text,
+            exact_resource_uri: None,
+            scope_id: Some(scope),
+            consistency: ReadConsistency::Eventual,
+            dependency_revisions: BTreeMap::new(),
+            parameters: BTreeMap::new(),
+            provenance_handles: Vec::new(),
+        };
+        request.validate()?;
+        // Storage has no catalogue row, parameter schema, or adapter handler
+        // for this operation on base: fail closed, never `Ok`-empty.
+        Err(ReadError::Store(StoreError::Unavailable.to_string()))
+    }
+}
+
 /// Governor read service over a store-neutral canonical client.
 pub struct ReadService<C> {
     store: C,
@@ -1486,6 +1624,81 @@ mod evidence_pack_read_tests {
                 ..
             })
         ));
+        Ok(())
+    }
+
+    #[test]
+    fn local_port_evidence_query_returns_exact_record() -> Result<(), Box<dyn std::error::Error>> {
+        // HANDOFF-LRR-GOV Query cut: the port returns the exact record and
+        // provenance live through `ReadService::query`.
+        let fence = fence()?;
+        let ctx = metadata(&fence)?;
+        let mut client = EvidenceTableClient::new(fence.clone());
+        client.capture("evidence-alpha");
+        let service = ReadService::new(client);
+        let scope = ScopeId::new("scope-evidence")?;
+        let result =
+            block_on(service.evidence_query(&ctx, scope, "evidence-alpha".to_owned(), 10))?;
+        assert_eq!(result.operation, NamedReadOperation::GetEvidencePack);
+        assert_eq!(result.state_fence, fence);
+        assert_eq!(result.consistency, ReadConsistency::Eventual);
+        assert_eq!(
+            result.payload.get("subject").and_then(Value::as_str),
+            Some("evidence-alpha")
+        );
+        let records = pack_records(&result.payload)?;
+        assert_eq!(records.len(), 1);
+        assert_eq!(
+            records[0].get("subject").and_then(Value::as_str),
+            Some("evidence-alpha")
+        );
+        let provenance = pack_provenance(&result.payload)?;
+        assert_eq!(
+            provenance.get("matched_total").and_then(Value::as_u64),
+            Some(1)
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn local_port_refuses_wrong_fence_over_bound_and_unactivated_projection()
+    -> Result<(), Box<dyn std::error::Error>> {
+        // HANDOFF-LRR-GOV fail-closed cut: a wrong fence or an over-bound
+        // request never returns success, and projection inputs stay
+        // `Unavailable` (never `Ok`-empty, never canned) until MGR04 (#19)
+        // activates the storage operation.
+        let fence = fence()?;
+        let ctx = metadata(&fence)?;
+        let service = ReadService::new(EvidenceTableClient::new(fence.clone()));
+
+        let changed = StateFence::new(test_epoch(2)?, ResourceGeneration::genesis());
+        let changed_ctx = metadata(&changed)?;
+        let scope = ScopeId::new("scope-evidence")?;
+        assert!(
+            block_on(service.evidence_query(
+                &changed_ctx,
+                scope.clone(),
+                "evidence-alpha".to_owned(),
+                10,
+            ))
+            .is_err()
+        );
+
+        let over_bound = EVIDENCE_PACK_MAX_RECORDS + 1;
+        assert!(
+            block_on(service.evidence_query(
+                &ctx,
+                scope.clone(),
+                "evidence-alpha".to_owned(),
+                over_bound,
+            ))
+            .is_err()
+        );
+
+        match block_on(service.projection_inputs(&ctx, scope, None, Vec::new())) {
+            Err(ReadError::Store(message)) if message == StoreError::Unavailable.to_string() => {}
+            other => panic!("projection inputs must fail closed Unavailable, observed: {other:?}"),
+        }
         Ok(())
     }
 }
