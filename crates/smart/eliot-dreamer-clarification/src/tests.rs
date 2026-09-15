@@ -18,12 +18,13 @@ fn must<T, E: Debug>(result: Result<T, E>) -> T {
 }
 
 fn fence() -> StateFence {
-    let epoch = EpochId::new(
-        EpochLineageId::new("550e8400-e29b-41d4-a716-446655440000")
-            .expect("canonical test lineage-A"),
-        NonZeroU64::new(1).expect("non-zero test sequence"),
-    )
-    .expect("valid test epoch");
+    let lineage = must(EpochLineageId::new(
+        "550e8400-e29b-41d4-a716-446655440000",
+    ));
+    let Some(sequence) = NonZeroU64::new(1) else {
+        panic!("non-zero test sequence must be constructible");
+    };
+    let epoch = must(EpochId::new(lineage, sequence));
     StateFence::new(epoch, ResourceGeneration::genesis())
 }
 
@@ -95,9 +96,11 @@ fn validated_draft(job: &DreamJobInput) -> ValidatedDreamDraft {
 }
 
 fn policy() -> ClarificationPolicy {
-    let mut value = ClarificationPolicy::default();
-    value.observation_time_ms = 1_000;
-    value.candidate_ttl_ms = 5_000;
+    let mut value = ClarificationPolicy {
+        observation_time_ms: 1_000,
+        candidate_ttl_ms: 5_000,
+        ..ClarificationPolicy::default()
+    };
     must(value.seal());
     value
 }
@@ -260,9 +263,8 @@ fn valid_atomic_choice_question() {
     let (policy, admitted, draft, boundary) = valid_inputs();
     let decision = decide(&policy, &admitted, &draft, &boundary);
     assert_eq!(decision.disposition, ClarificationDisposition::Candidate);
-    let candidate = match decision.candidate {
-        Some(value) => value,
-        None => panic!("candidate expected"),
+    let Some(candidate) = decision.candidate else {
+        panic!("candidate expected");
     };
     assert_eq!(candidate.variable.variable_id, "decision-1");
     assert!(candidate.question.ends_with('?'));
@@ -422,9 +424,8 @@ fn no_safe_continuation_yields_blocked_without_answer_fallback() {
     });
     let admitted = admitted_with(vec![item], &policy);
     let decision = decide(&policy, &admitted, &validated_draft(&admitted.job), &boundary());
-    let candidate = match decision.candidate {
-        Some(value) => value,
-        None => panic!("candidate expected"),
+    let Some(candidate) = decision.candidate else {
+        panic!("candidate expected");
     };
     assert!(matches!(
         candidate.fallback,
@@ -568,9 +569,8 @@ fn nonanswer_states_are_distinct() {
 fn task_local_agent_route_requires_current_capability() {
     let (policy, admitted, draft, boundary) = valid_inputs();
     let decision = decide(&policy, &admitted, &draft, &boundary);
-    let candidate = match decision.candidate {
-        Some(value) => value,
-        None => panic!("candidate expected"),
+    let Some(candidate) = decision.candidate else {
+        panic!("candidate expected");
     };
     assert!(matches!(
         candidate.routing,
@@ -587,9 +587,8 @@ fn human_owned_choice_routes_to_explicit_human_boundary() {
         &policy,
     );
     let decision = decide(&policy, &admitted, &validated_draft(&admitted.job), &boundary());
-    let candidate = match decision.candidate {
-        Some(value) => value,
-        None => panic!("candidate expected"),
+    let Some(candidate) = decision.candidate else {
+        panic!("candidate expected");
     };
     assert!(matches!(candidate.routing, RoutingRecommendation::Human { .. }));
 }
@@ -712,9 +711,8 @@ fn executable_instruction_remains_inert_and_unrendered() {
 fn unanswered_fallback_preserves_unknown_without_assumed_answer() {
     let (policy, admitted, draft, boundary) = valid_inputs();
     let decision = decide(&policy, &admitted, &draft, &boundary);
-    let candidate = match decision.candidate {
-        Some(value) => value,
-        None => panic!("candidate expected"),
+    let Some(candidate) = decision.candidate else {
+        panic!("candidate expected");
     };
     assert!(matches!(candidate.fallback, UnansweredFallback::PartialResult { .. }));
 }
@@ -724,9 +722,8 @@ fn unanswered_fallback_preserves_unknown_without_assumed_answer() {
 fn expiry_fence_and_policy_bind_candidate_invalidation() {
     let (policy, admitted, draft, boundary) = valid_inputs();
     let decision = decide(&policy, &admitted, &draft, &boundary);
-    let mut candidate = match decision.candidate {
-        Some(value) => value,
-        None => panic!("candidate expected"),
+    let Some(mut candidate) = decision.candidate else {
+        panic!("candidate expected");
     };
     candidate.invalidation.policy_digest = digest('9');
     assert!(candidate.validate(&policy).is_err());
@@ -816,10 +813,10 @@ fn malformed_input_is_bounded_and_does_not_panic() {
         serde_json::from_str::<ClarificationDecision>("{not-json")
     });
     assert!(outcome.is_ok());
-    match outcome {
-        Ok(result) => assert!(result.is_err()),
-        Err(_) => panic!("JSON rejection panicked"),
-    }
+    let Ok(result) = outcome else {
+        panic!("JSON rejection panicked");
+    };
+    assert!(result.is_err());
 }
 
 // WORK_UNIT_CASE: 630/35
@@ -827,9 +824,8 @@ fn malformed_input_is_bounded_and_does_not_panic() {
 fn emitted_candidate_has_exactly_one_decision_variable() {
     let (policy, admitted, draft, boundary) = valid_inputs();
     let decision = decide(&policy, &admitted, &draft, &boundary);
-    let candidate = match decision.candidate {
-        Some(value) => value,
-        None => panic!("candidate expected"),
+    let Some(candidate) = decision.candidate else {
+        panic!("candidate expected");
     };
     assert_eq!(
         candidate.variable.component_ids,
@@ -842,9 +838,8 @@ fn emitted_candidate_has_exactly_one_decision_variable() {
 fn every_valid_answer_maps_to_exactly_one_branch() {
     let (policy, admitted, draft, boundary) = valid_inputs();
     let decision = decide(&policy, &admitted, &draft, &boundary);
-    let candidate = match decision.candidate {
-        Some(value) => value,
-        None => panic!("candidate expected"),
+    let Some(candidate) = decision.candidate else {
+        panic!("candidate expected");
     };
     assert_eq!(candidate.variable.branches.len(), 2);
     must(candidate.validate(&policy));

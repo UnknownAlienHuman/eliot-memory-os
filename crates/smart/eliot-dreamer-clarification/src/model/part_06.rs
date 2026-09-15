@@ -229,10 +229,7 @@ impl ClarificationCandidate {
         }
         self.variable.validate(policy)?;
         if let AnswerSchema::BoundedText { max_bytes, .. } = &self.variable.answer_schema {
-            let policy_limit = match u32::try_from(policy.max_text_bytes) {
-                Ok(value) => value,
-                Err(_) => u32::MAX,
-            };
+            let policy_limit = u32::try_from(policy.max_text_bytes).unwrap_or(u32::MAX);
             if *max_bytes == 0 || *max_bytes > policy_limit {
                 return Err(ClarificationError::UnsupportedAnswerSchema {
                     reason: "bounded text exceeds the policy byte limit".to_owned(),
