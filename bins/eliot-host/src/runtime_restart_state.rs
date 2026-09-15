@@ -22,6 +22,29 @@ use super::host_durable_persistence::{sync_dir, write_durable_file};
 #[cfg(all(test, windows))]
 use super::host_durable_persistence::ordering;
 
+#[cfg(all(test, windows))]
+mod pending_write_fault {
+    use std::cell::Cell;
+
+    thread_local! {
+        static WRITE_FAULT: Cell<bool> = const { Cell::new(false) };
+    }
+
+    /// Inject a one-shot failure of the next runtime-restart temp-file write.
+    /// Thread-local and consumed once, so parallel tests stay isolated.
+    pub(super) fn inject_write_fault() {
+        WRITE_FAULT.with(|slot| slot.set(true));
+    }
+
+    pub(super) fn clear_write_fault() {
+        WRITE_FAULT.with(|slot| slot.set(false));
+    }
+
+    pub(super) fn take_write_fault() -> bool {
+        WRITE_FAULT.with(|slot| slot.replace(false))
+    }
+}
+
 #[cfg(windows)]
 pub(super) fn runtime_restart_store_dir(host_state_root: &Path) -> PathBuf {
     host_state_root.join("runtime-restarts")
@@ -168,6 +191,7 @@ fn sync_runtime_restart_store_dir(dir: &Path) -> Result<(), HostError> {
 }
 
 #[cfg(windows)]
+#[allow(clippy::too_many_lines)]
 pub(super) fn persist_runtime_restart_pending(
     host_state_root: &Path,
     request: &HostRuntimeControlRequest,
@@ -207,6 +231,15 @@ pub(super) fn persist_runtime_restart_pending(
         Uuid::new_v4().simple()
     ));
     let publication = (|| {
+        #[cfg(all(test, windows))]
+        {
+            if pending_write_fault::take_write_fault() {
+                ordering::record("pending_file_write_fault_injected");
+                return Err(HostError::Platform(
+                    "injected runtime restart pending file flush failure".to_owned(),
+                ));
+            }
+        }
         write_durable_file(&tmp, &bytes)?;
         #[cfg(all(test, windows))]
         ordering::record("pending_hardlink_attempt");
@@ -321,6 +354,15 @@ pub(super) fn persist_runtime_restart_receipt(
     ));
     let bytes = serde_json::to_vec(receipt).map_err(|e| HostError::Platform(e.to_string()))?;
     let publication = (|| {
+        #[cfg(all(test, windows))]
+        {
+            if pending_write_fault::take_write_fault() {
+                ordering::record("receipt_file_write_fault_injected");
+                return Err(HostError::Platform(
+                    "injected runtime restart receipt file flush failure".to_owned(),
+                ));
+            }
+        }
         write_durable_file(&tmp, &bytes)?;
         #[cfg(all(test, windows))]
         ordering::record("receipt_hardlink_attempt");
@@ -494,6 +536,172 @@ mod durability_repair_tests {
         };
         receipt.receipt_digest = receipt.computed_digest()?;
         Ok(receipt)
+    }
+
+    fn fresh_request(
+        label: &str,
+        digest: &str,
+    ) -> Result<super::super::HostRuntimeControlRequest, Box<dyn std::error::Error>> {
+        Ok(super::super::HostRuntimeControlRequest::new_with_mutation_digest(
+            HostRuntimeControlOperation::RestartKernel,
+            PlatformHandle::new(label)?,
+            PlatformHandle::new(digest.to_owned())?,
+        )?)
+    }
+
+    #[test]
+    fn runtime_restart_pending_file_flush_failure_is_not_success() -> TestResult {
+        let root = temp_root("rr-pending-flush")?;
+        let host = test_host()?;
+        let digest = "c4".repeat(32);
+        let request = fresh_request("rr-pending-flush", &digest)?;
+        ordering::clear();
+        test_fault::clear_sync_fault();
+        pending_write_fault::clear_write_fault();
+        pending_write_fault::inject_write_fault();
+        let result = persist_runtime_restart_pending(&root, &request, &host);
+        assert!(result.is_err(), "injected file flush failure is not success");
+        let log = ordering::take_log();
+        assert!(
+            log.contains(&"pending_file_write_fault_injected".to_owned()),
+            "fault injection must be visible: {log:?}"
+        );
+        assert!(
+            !runtime_restart_pending_path(&root, &digest).exists(),
+            "a failed temp-file write must not publish a pending record"
+        );
+        test_fault::clear_sync_fault();
+        pending_write_fault::clear_write_fault();
+        assert_eq!(
+            persist_runtime_restart_pending(&root, &request, &host)?,
+            RuntimeRestartPendingPublication::Created
+        );
+        let _ = std::fs::remove_dir_all(&root);
+        Ok(())
+    }
+
+    #[test]
+    fn runtime_restart_receipt_file_flush_failure_is_not_success() -> TestResult {
+        let root = temp_root("rr-receipt-flush")?;
+        let host = test_host()?;
+        let digest = "d2".repeat(32);
+        let request = fresh_request("rr-receipt-flush", &digest)?;
+        test_fault::clear_sync_fault();
+        pending_write_fault::clear_write_fault();
+        persist_runtime_restart_pending(&root, &request, &host)?;
+        let receipt = make_receipt(&digest)?;
+        ordering::clear();
+        pending_write_fault::inject_write_fault();
+        let result = persist_runtime_restart_receipt(&root, &receipt);
+        assert!(result.is_err(), "injected file flush failure is not success");
+        assert!(
+            !runtime_restart_receipt_path(&root, &digest).exists(),
+            "a failed temp-file write must not publish a receipt"
+        );
+        assert!(
+            runtime_restart_pending_path(&root, &digest).exists(),
+            "pending evidence must remain when the receipt write fails"
+        );
+        let log = ordering::take_log();
+        assert!(
+            log.contains(&"receipt_file_write_fault_injected".to_owned()),
+            "fault injection must be visible: {log:?}"
+        );
+        test_fault::clear_sync_fault();
+        pending_write_fault::clear_write_fault();
+        let _ = std::fs::remove_dir_all(&root);
+        Ok(())
+    }
+
+    #[test]
+    fn runtime_restart_pending_exact_record_replays() -> TestResult {
+        let root = temp_root("rr-pending-replay")?;
+        let host = test_host()?;
+        let digest = "c5".repeat(32);
+        let request = fresh_request("rr-pending-replay", &digest)?;
+        test_fault::clear_sync_fault();
+        pending_write_fault::clear_write_fault();
+        ordering::clear();
+        assert_eq!(
+            persist_runtime_restart_pending(&root, &request, &host)?,
+            RuntimeRestartPendingPublication::Created
+        );
+        ordering::clear();
+        assert_eq!(
+            persist_runtime_restart_pending(&root, &request, &host)?,
+            RuntimeRestartPendingPublication::Replay
+        );
+        let log = ordering::take_log();
+        assert!(
+            log.iter().any(|e| e == "dir_sync_success"),
+            "replay must re-confirm the directory entry: {log:?}"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+        Ok(())
+    }
+
+    #[test]
+    fn runtime_restart_pending_conflicting_record_is_fail_closed() -> TestResult {
+        let root = temp_root("rr-pending-conflict")?;
+        let host = test_host()?;
+        let digest = "c6".repeat(32);
+        let request = fresh_request("rr-pending-conflict", &digest)?;
+        test_fault::clear_sync_fault();
+        pending_write_fault::clear_write_fault();
+        persist_runtime_restart_pending(&root, &request, &host)?;
+        let conflicting = fresh_request("rr-pending-conflict-other", &digest)?;
+        let result = persist_runtime_restart_pending(&root, &conflicting, &host);
+        assert!(
+            matches!(result, Err(crate::HostError::RecoveryRequired(_))),
+            "a conflicting pending record must fail closed: {result:?}"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+        Ok(())
+    }
+
+    #[test]
+    fn runtime_restart_receipt_exact_record_replays() -> TestResult {
+        let root = temp_root("rr-receipt-replay")?;
+        let host = test_host()?;
+        let digest = "d3".repeat(32);
+        let request = fresh_request("rr-receipt-replay", &digest)?;
+        test_fault::clear_sync_fault();
+        pending_write_fault::clear_write_fault();
+        persist_runtime_restart_pending(&root, &request, &host)?;
+        let receipt = make_receipt(&digest)?;
+        persist_runtime_restart_receipt(&root, &receipt)?;
+        ordering::clear();
+        persist_runtime_restart_receipt(&root, &receipt)?;
+        let log = ordering::take_log();
+        assert!(
+            log.iter().any(|e| e == "dir_sync_success"),
+            "receipt replay must re-confirm the directory entry: {log:?}"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+        Ok(())
+    }
+
+    #[test]
+    fn runtime_restart_receipt_conflicting_record_is_fail_closed() -> TestResult {
+        let root = temp_root("rr-receipt-conflict")?;
+        let host = test_host()?;
+        let digest = "d4".repeat(32);
+        let request = fresh_request("rr-receipt-conflict", &digest)?;
+        test_fault::clear_sync_fault();
+        pending_write_fault::clear_write_fault();
+        persist_runtime_restart_pending(&root, &request, &host)?;
+        let receipt = make_receipt(&digest)?;
+        persist_runtime_restart_receipt(&root, &receipt)?;
+        let mut conflicting = receipt.clone();
+        conflicting.request_digest = PlatformHandle::new("9".repeat(64))?;
+        conflicting.receipt_digest = conflicting.computed_digest()?;
+        let result = persist_runtime_restart_receipt(&root, &conflicting);
+        assert!(
+            matches!(result, Err(crate::HostError::RecoveryRequired(_))),
+            "a conflicting receipt must fail closed: {result:?}"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+        Ok(())
     }
 
     #[test]
