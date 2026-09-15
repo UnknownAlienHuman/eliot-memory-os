@@ -729,9 +729,9 @@ pub fn validate_request_frame(
 /// the adapter's pre-commit gate. Genesis is an explicit closed admitted
 /// path bound to the active genesis entry — not a wildcard: the seed must
 /// satisfy its context contract while the entry exists. Recovery, receipt,
-/// head, snapshot, health, and readiness requests keep their own bounded
-/// validation (already run by the wire decode) and perform no canonical
-/// mutation.
+/// head, snapshot, health, readiness, and Dreamer ledger requests keep their
+/// own bounded validation (already run by the wire decode) and perform no
+/// canonical mutation.
 fn enforce_admitted_operation(request: &Request) -> Result<(), String> {
     match request {
         Request::Named { request } => {
@@ -752,13 +752,21 @@ fn enforce_admitted_operation(request: &Request) -> Result<(), String> {
                 .validate_for_context(context)
                 .map_err(|error| error.to_string())
         }
+        // Health, readiness, head, snapshot, recovery, and receipt requests
+        // keep their own bounded validation and perform no canonical
+        // mutation. Dreamer ledger requests join them here: the wire decode
+        // already ran the closed S0 shape plus identity binding,
+        // `validate_request_frame` already enforced the exact per-operation
+        // session capability, and Dreamer operations live outside the
+        // generated named/apply catalogue.
         Request::Health
         | Request::Readiness
         | Request::Recovery { .. }
         | Request::Receipt { .. }
         | Request::RevisionHeads { .. }
         | Request::OrderingHeads { .. }
-        | Request::ValidationSnapshot => Ok(()),
+        | Request::ValidationSnapshot
+        | Request::DreamerJob { .. } => Ok(()),
     }
 }
 
@@ -908,6 +916,12 @@ mod tests {
                 handle(eliot_installation::PHASE_B_PENDING_MARKER),
                 handle("--kernel-artifact-sha256"),
                 handle("1".repeat(64)),
+                handle("--doctor-artifact-sha256"),
+                handle("5".repeat(64)),
+                handle("--testd-artifact-sha256"),
+                handle("6".repeat(64)),
+                handle("--native-worker-artifact-sha256"),
+                handle("7".repeat(64)),
                 handle("--eliotd-descriptor"),
                 handle(r"C:\ProgramData\Eliot\eliotd.json"),
                 handle("--eliotd-descriptor-sha256"),
@@ -935,6 +949,14 @@ mod tests {
             host_artifact_digest: handle("c".repeat(64)),
             watchdog_executable_path: handle(r"C:\ProgramData\Eliot\bin\eliot-watchdog.exe"),
             watchdog_artifact_digest: handle("4".repeat(64)),
+            doctor_executable_path: handle(r"C:\ProgramData\Eliot\bin\eliot-doctor.exe"),
+            doctor_artifact_digest: handle("5".repeat(64)),
+            testd_executable_path: handle(r"C:\ProgramData\Eliot\bin\eliot-testd.exe"),
+            testd_artifact_digest: handle("6".repeat(64)),
+            native_worker_executable_path: handle(
+                r"C:\ProgramData\Eliot\bin\eliot-native-worker.exe",
+            ),
+            native_worker_artifact_digest: handle("7".repeat(64)),
             descriptor_digest: handle("0".repeat(64)),
         };
         reseal_runtime_launch(&mut descriptor);
@@ -1357,6 +1379,18 @@ mod tests {
             &[
                 eliot_store_api::CAPABILITY_RECOVERY,
                 eliot_store_api::CAPABILITY_INITIALIZE_GENESIS,
+                eliot_store_api::CAPABILITY_DREAMER_JOB_SUBMIT,
+                eliot_store_api::CAPABILITY_DREAMER_JOB_LEASE_NEXT,
+                eliot_store_api::CAPABILITY_DREAMER_JOB_LEASE_EXACT,
+                eliot_store_api::CAPABILITY_DREAMER_JOB_RENEW,
+                eliot_store_api::CAPABILITY_DREAMER_JOB_START,
+                eliot_store_api::CAPABILITY_DREAMER_JOB_CHECKPOINT,
+                eliot_store_api::CAPABILITY_DREAMER_JOB_RESUME,
+                eliot_store_api::CAPABILITY_DREAMER_JOB_BEGIN_VERIFICATION,
+                eliot_store_api::CAPABILITY_DREAMER_JOB_PUBLISH,
+                eliot_store_api::CAPABILITY_DREAMER_JOB_STATUS,
+                eliot_store_api::CAPABILITY_DREAMER_JOB_REQUEST_CANCEL,
+                eliot_store_api::CAPABILITY_DREAMER_JOB_RECONCILE,
             ]
         );
     }
@@ -1890,5 +1924,210 @@ mod tests {
             ),
             "closed genesis path passes ingress"
         );
+    }
+
+    fn dreamer_submit_request(
+        fence: &StateFence,
+        context: &RequestMeta,
+        transport_key: &str,
+        operation_id: &str,
+        idempotency_key: &str,
+    ) -> eliot_protocol::dreamer_job::DurableJobRequest {
+        use eliot_protocol::dreamer_job::{DurableRequestIdentity, JobOperation, JobRole};
+        let fence_json = serde_json::to_value(fence).expect("fence json");
+        let scope = serde_json::json!({
+            "scope_id": "scope-dreamer-s2",
+            "product_id": "product-dispatch",
+            "resource_generation": 1,
+            "state_fence": fence_json.clone(),
+        });
+        let opaque = |revision: &str| {
+            serde_json::json!({
+                "contract": {
+                    "name": "eliot.smart.dreamer.contracts",
+                    "version": {"major": 1, "minor": 0, "patch": 0},
+                    "shape_sha256": "0".repeat(64),
+                },
+                "source_revision": revision,
+                "byte_length": 8,
+                "sha256": "1".repeat(64),
+                "artifact_id": format!("artifact-{revision}"),
+            })
+        };
+        let operation = {
+            let submission: eliot_protocol::dreamer_job::JobSubmission =
+                serde_json::from_value(serde_json::json!({
+                    "job_id": "job-bridge",
+                    "attempt_id": "attempt-bridge",
+                    "work_scope": scope.clone(),
+                    "semantic_input": opaque("input-bridge"),
+                    "output_contract": opaque("output-bridge"),
+                    "admission": {
+                        "authority": {
+                            "authority_id": "kernel",
+                            "authority_owner": "kernel",
+                            "authority_epoch": fence_json.get("authority_epoch").cloned().unwrap_or(serde_json::Value::Null),
+                            "state_fence": fence_json.clone(),
+                            "allowed_effect": "CANDIDATE",
+                            "proof_ceiling": "CANDIDATE_ARTIFACT",
+                        },
+                        "requester_principal": "requester-bridge",
+                        "session": null,
+                        "scope": scope,
+                        "capability": "dreamer.submit",
+                        "route_class": "bounded",
+                        "budget_units": 1,
+                        "deadline_unix_ms": 600_000,
+                        "validity_epoch": fence_json.get("authority_epoch").cloned().unwrap_or(serde_json::Value::Null),
+                        "resource_generation": 1,
+                        "admission_receipt": "admission-bridge",
+                    },
+                    "cancellation_id": "cancel-bridge",
+                }))
+                .expect("submission");
+            JobOperation::Submit {
+                submission: Box::new(submission),
+            }
+        };
+        let kind = operation.kind().as_str().to_owned();
+        let context_json = serde_json::to_value(context).expect("context json");
+        let mut identity: DurableRequestIdentity = serde_json::from_value(serde_json::json!({
+            "request": {
+                "request": {"metadata": context_json, "state_fence": fence_json.clone()},
+                "idempotency_key": transport_key,
+                "deadline_unix_ms": 600_000,
+                "cancellation_id": "cancel-bridge",
+            },
+            "operation": {
+                "operation_id": operation_id,
+                "request_id": "originating-bridge",
+                "idempotency_key": idempotency_key,
+                "operation_kind": kind,
+                "effect": "CANDIDATE",
+                "state_fence": fence_json,
+            },
+            "canonical_request_hash": "0".repeat(64),
+        }))
+        .expect("identity");
+        identity.canonical_request_hash = DurableRequestIdentity::digest_for(
+            &identity.operation,
+            &identity.request,
+            &operation,
+            JobRole::Requester,
+        )
+        .expect("hash");
+        let request = eliot_protocol::dreamer_job::DurableJobRequest {
+            request_identity: identity,
+            role: JobRole::Requester,
+            operation,
+        };
+        request.validate().expect("request validates");
+        request
+    }
+
+    fn session_without_capability(config: &StoreLaunchConfig, withheld: &str) -> StoreEbpSession {
+        let identity = StoreHandshakeIdentity::new("manifest-test", serde_json::json!({}));
+        let frame = client_hello_frame(config);
+        let ProtocolPayload::Json(payload) = frame.payload.clone() else {
+            panic!("hello payload");
+        };
+        let mut hello: ClientHello = serde_json::from_value(payload).expect("client hello");
+        hello
+            .capabilities
+            .retain(|capability| capability.as_str() != withheld);
+        let filtered =
+            eliot_ipc::client_hello_frame("connection-test", &hello).expect("filtered hello");
+        admit_handshake(filtered, TransportLimits::default(), config, &identity)
+            .expect("handshake admits")
+            .0
+    }
+
+    #[test]
+    fn dreamer_submit_capability_denied_before_dispatch_without_write() {
+        // The session below never admitted `store.dreamer_job.submit`, so the
+        // existing session mechanism rejects the frame before any dispatch or
+        // backend write can happen: `validate_request_frame` returns `Err`,
+        // and the transport loop only dispatches `Ok` requests.
+        let config = config();
+        let mut session =
+            session_without_capability(&config, eliot_store_api::CAPABILITY_DREAMER_JOB_SUBMIT);
+        let fence = config.runtime_launch.authority_state_fence.clone();
+        let context = request_meta(fence.clone());
+        let request = dreamer_submit_request(
+            &fence,
+            &context,
+            "transport-dreamer-bridge",
+            "op-dreamer-bridge",
+            "idem-dreamer-bridge",
+        );
+        assert_eq!(
+            eliot_store_api::dreamer_job_capability(&request.operation),
+            eliot_store_api::CAPABILITY_DREAMER_JOB_SUBMIT
+        );
+        let identity = session_identity(&context, "transport-dreamer-bridge");
+        let frame = ingress_frame(
+            &session,
+            &context,
+            identity,
+            Request::DreamerJob {
+                context: context.clone(),
+                request,
+            },
+        );
+        let error = validate_request_frame(&mut session, &frame).expect_err("withheld capability");
+        assert!(
+            error.contains("capability is not admitted")
+                && error.contains(eliot_store_api::CAPABILITY_DREAMER_JOB_SUBMIT),
+            "capability rejection before dispatch, never generic: {error}"
+        );
+    }
+
+    #[test]
+    fn dreamer_working_edge_capabilities_are_advertised() {
+        // S2 registration proof: the handshake denominator carries exactly
+        // the per-operation capabilities of the S1 working edge
+        // (Submit/LeaseExact/Status, owner #775), and the wire maps each
+        // Dreamer request to the same string the session gate enforces.
+        for capability in [
+            eliot_store_api::CAPABILITY_DREAMER_JOB_SUBMIT,
+            eliot_store_api::CAPABILITY_DREAMER_JOB_LEASE_EXACT,
+            eliot_store_api::CAPABILITY_DREAMER_JOB_STATUS,
+        ] {
+            assert!(
+                CAPABILITIES.contains(&capability),
+                "working-edge capability is advertised: {capability}"
+            );
+        }
+        let fence = StateFence::new(test_epoch(1), ResourceGeneration::genesis());
+        let context = request_meta(fence.clone());
+        let request = dreamer_submit_request(
+            &fence,
+            &context,
+            "transport-dreamer-advertised",
+            "op-dreamer-advertised",
+            "idem-dreamer-advertised",
+        );
+        assert_eq!(
+            Request::DreamerJob { context, request }.capability(),
+            eliot_store_api::CAPABILITY_DREAMER_JOB_SUBMIT
+        );
+    }
+
+    #[test]
+    fn dreamer_request_passes_admitted_operation_gate() {
+        // The S2 `lib.rs` registration keeps session-validated Dreamer
+        // requests on the admitted path: wire decode plus the per-operation
+        // session capability already gate shape and authority, and Dreamer
+        // operations live outside the generated named/apply catalogue.
+        let fence = StateFence::new(test_epoch(1), ResourceGeneration::genesis());
+        let context = request_meta(fence.clone());
+        let request = dreamer_submit_request(
+            &fence,
+            &context,
+            "transport-dreamer-gate",
+            "op-dreamer-gate",
+            "idem-dreamer-gate",
+        );
+        assert!(enforce_admitted_operation(&Request::DreamerJob { context, request }).is_ok());
     }
 }
