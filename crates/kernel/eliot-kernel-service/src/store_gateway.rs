@@ -13,7 +13,7 @@
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use eliot_contracts::{OperationId, RequestMetadata, StateFence};
+use eliot_contracts::{EpochId, OperationId, RequestMetadata, StateFence};
 use eliot_ipc::NamedPipeTransport;
 use eliot_kernel_core::GenerationRoute;
 use eliot_store_api::{
@@ -129,6 +129,13 @@ pub struct KernelStoreGateway {
     service: Arc<Mutex<KernelService>>,
     store: Arc<EbpCanonicalStoreClient<NamedPipeTransport>>,
     route: GenerationRoute,
+    /// Canonical epoch the scalar route contour was bound to at composition
+    /// (Implements #64): the route's sequence projection is only meaningful
+    /// under this exact `(lineage_id, sequence)` tuple. Route currency is
+    /// proven with `is_same_authority` against live authority — never by
+    /// coercing a sequence to `u64`. `None` (a poisoned service lock at
+    /// bind time) fails every later gate closed.
+    route_epoch: Option<EpochId>,
     flight: GatewayFlight,
 }
 
@@ -150,10 +157,17 @@ impl KernelStoreGateway {
         store: Arc<EbpCanonicalStoreClient<NamedPipeTransport>>,
         route: GenerationRoute,
     ) -> Self {
+        // Bind the scalar route contour to its canonical lineage at
+        // composition (Implements #64): the sequence inside `route` was
+        // minted by the Host-approved bootstrap for the live tuple observed
+        // here, so snapshot that tuple as the route's canonical mirror. Mint
+        // stays Host-owned; the gateway only pins and re-checks the tuple.
+        let route_epoch = service.lock().map(|guard| guard.authority_epoch()).ok();
         Self {
             service,
             store,
             route,
+            route_epoch,
             flight: GatewayFlight::new(),
         }
     }
@@ -220,13 +234,16 @@ impl KernelStoreGateway {
             if self.is_fenced() {
                 return Err("canonical-store gateway is fenced for rebind".to_owned());
             }
-            // Lineage-aware route gate (Implements #64): the scalar
-            // `GenerationRoute` contour (core residual) is compared by exact
-            // sequence projection, while canonical fencing uses the live
-            // `EpochId` tuple. Cross-lineage same-sequence routes never
-            // authorize through the canonical gate below.
+            // Canonical route/epoch mirror (Implements #64): route currency
+            // is the exact-tuple match between the composition-bound route
+            // epoch and live authority — never a scalar `sequence.get()`
+            // coercion. Cross-lineage same-sequence routes never authorize:
+            // the bound tuple carries its lineage.
             let live_epoch = service.authority_epoch();
-            if self.route.authority_epoch().value() != live_epoch.sequence.get()
+            if self
+                .route_epoch
+                .as_ref()
+                .is_none_or(|bound| !bound.is_same_authority(&live_epoch))
                 || self.route.active_generation() != transition.state_fence.resource_generation
             {
                 return Err(
@@ -236,7 +253,10 @@ impl KernelStoreGateway {
             let lease = service
                 .acquire_admission()
                 .map_err(|error| error.to_string())?;
-            if lease.authority_epoch() != transition.state_fence.authority_epoch {
+            if !lease
+                .authority_epoch()
+                .is_same_authority(&transition.state_fence.authority_epoch)
+            {
                 return Err("canonical-store route authority epoch is stale".to_owned());
             }
             lease
@@ -366,12 +386,15 @@ impl KernelStoreGateway {
         if service.generation_fenced() {
             return Err("Kernel generation is fenced".to_owned());
         }
-        // Lineage-aware route gate (Implements #64): the scalar
-        // `GenerationRoute` contour (core residual) is compared by exact
-        // sequence projection, while canonical fencing uses exact-tuple
-        // `is_same_authority`. Cross-lineage same-sequence fences fail closed.
+        // Canonical route/epoch mirror (Implements #64): the bound route
+        // epoch must be the exact live tuple and the presented fence must
+        // match it exactly. No scalar projection participates: equal
+        // sequences across lineages fail closed here.
         let live_epoch = service.authority_epoch();
-        if self.route.authority_epoch().value() != live_epoch.sequence.get()
+        if self
+            .route_epoch
+            .as_ref()
+            .is_none_or(|bound| !bound.is_same_authority(&live_epoch))
             || !live_epoch.is_same_authority(&state_fence.authority_epoch)
         {
             return Err("canonical-store route is outside the active Kernel epoch".to_owned());

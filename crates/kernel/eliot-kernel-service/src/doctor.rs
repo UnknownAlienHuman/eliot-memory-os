@@ -31,8 +31,9 @@
 //! an exact retry rebuilds the identical admission.
 
 use std::collections::BTreeSet;
+use std::num::NonZeroU64;
 
-use eliot_contracts::{EpochId, canonical_json_bytes, sha256_hex};
+use eliot_contracts::{EpochId, EpochLineageId, canonical_json_bytes, sha256_hex};
 use eliot_doctor_core::{
     AttemptIdentityBinding, ClosedRepairRequest, RepairClass, RepairOperationRef, RepairRecipe,
     RepairRecipeIdentity, RepairRecipeManifest, canonical_fence, check_fence_against_epoch,
@@ -1204,6 +1205,42 @@ fn doctor_envelope_digests(
     Ok((sha256_hex(&evidence), sha256_hex(&intent)))
 }
 
+/// Reconstructs the canonical authority epoch bound in one staged row.
+///
+/// Slice E4-B (issue #64): the `epoch_lineage` column is the authority — a
+/// staged row without one carries only an unbound legacy scalar and binds
+/// no authority, so it fails closed here. The `u64` column is migration
+/// evidence only (a legacy-scalar sequence projection in the
+/// `import_legacy_scalar_epoch` sense): it must equal the lineage sequence
+/// exactly, otherwise the row is corrupt and fails closed. Authority
+/// readers must use the returned `EpochId` tuple through
+/// `is_same_authority` and never the bare `u64`. Mint stays Host-owned;
+/// the Kernel only stages the Host-approved live tuple and fences the old
+/// one via the `canonical_epoch` switch.
+fn staged_attempt_authority_epoch(
+    record: &DoctorAttemptRecord,
+) -> Result<EpochId, KernelServiceError> {
+    let malformed = |reason: &'static str| KernelServiceError::InvalidField {
+        field: "doctor_repair.epoch_lineage",
+        reason,
+    };
+    let lineage = record
+        .epoch_lineage
+        .as_ref()
+        .ok_or(malformed("staged attempt carries no bound epoch lineage"))?;
+    if record.authority_epoch == 0 || record.authority_epoch != lineage.current.epoch {
+        return Err(malformed(
+            "staged scalar epoch is not the lineage projection",
+        ));
+    }
+    let lineage_id = EpochLineageId::new(lineage.current.lineage_id.as_str())
+        .map_err(|_| malformed("staged epoch lineage is not a valid lineage"))?;
+    let sequence = NonZeroU64::new(record.authority_epoch).ok_or(malformed(
+        "staged scalar epoch is not the lineage projection",
+    ))?;
+    EpochId::new(lineage_id, sequence).map_err(|_| malformed("staged epoch is not canonical"))
+}
+
 /// Builds the staged attempt row for bound identities.
 ///
 /// T6-D1 admission cutover (issue #461): the row carries the live lineage
@@ -1211,9 +1248,13 @@ fn doctor_envelope_digests(
 /// generation projections come from the live context — not the envelope —
 /// because the gate proved them equal to the presented fence
 /// (`is_same_authority` plus generation equality). `fence_digest` stays
-/// the opaque echo for exact-replay comparison. The `authority_epoch`
-/// column keeps its `u64` sequence projection with `epoch_lineage` as the
-/// authority; widening the column type is a migration owned by T6-E4.
+/// the opaque echo for exact-replay comparison. Slice E4-B (issue #64)
+/// completes the widening on the Kernel side: the `epoch_lineage` tuple is
+/// the authority and is proven exact against the live context before the
+/// row is returned, while the `u64` column is retained only as
+/// legacy-scalar migration evidence (see `staged_attempt_authority_epoch`);
+/// widening the ORS column type itself is deferred to the ORS-owning
+/// migration.
 fn build_staged_doctor_attempt(
     request: &DoctorRepairAttemptRequest,
     terms: &ValidatedDoctorTerms<'_>,
@@ -1242,9 +1283,10 @@ fn build_staged_doctor_attempt(
         principal_ref: OpaqueLabel::new(session_principal)
             .map_err(|error| KernelServiceError::Platform(error.to_string()))?,
         fence_digest: terms.envelope.fence.digest.clone(),
-        // Sequence projection of the live context epoch only; the
-        // `epoch_lineage` field below is the authority. Gate-proven equal
-        // to the presented fence sequence.
+        // Legacy-scalar evidence projection of the live context epoch only
+        // (a legacy-scalar sequence value in the `import_legacy_scalar_epoch`
+        // sense). Authority is the `epoch_lineage` tuple below — never this
+        // bare `u64`; `staged_attempt_authority_epoch` proves the two agree.
         authority_epoch: context.authority_epoch.sequence.get(),
         // Live context generation; gate-proven equal to the presented
         // fence generation.
@@ -1274,6 +1316,16 @@ fn build_staged_doctor_attempt(
         admitted_at_unix_nanos: None,
         commit_order: 0,
     };
+    // Canonical-as-authority proof (Implements #64): the staged tuple must
+    // be exactly the live context tuple before the row is returned. The
+    // `same_binding` continuity and `AttemptIdentityConflict` rules below
+    // then compare that tuple, never a bare scalar.
+    let staged_authority = staged_attempt_authority_epoch(&staged)?;
+    if !staged_authority.is_same_authority(&context.authority_epoch) {
+        return Err(KernelServiceError::HandshakeMismatch {
+            field: "doctor_repair.authority_epoch",
+        });
+    }
     staged
         .validate()
         .map_err(|error| KernelServiceError::Platform(error.to_string()))?;
@@ -2139,7 +2191,7 @@ mod tests {
     use std::num::NonZeroU64;
     use std::sync::Mutex;
 
-    use eliot_contracts::{EpochId, EpochLineageId};
+    use eliot_contracts::{AuthorityEpoch, EpochId, EpochLineageId, ResourceGeneration};
     use eliot_doctor_core::{
         ClosedRepairRequest, ClosedRequestParams, DiagnosticBrief, EvidenceHandle, RecoveryLease,
         RegisteredOperation, RepairClass, RepairRecipe, RepairRecipeManifest, StateFence,
@@ -2150,15 +2202,33 @@ mod tests {
         DoctorEffectStageOutcome, DoctorEffectState, DoctorLedgerError, DoctorRecoveryLedger,
         OpaqueLabel, OperationIdentity,
     };
+    use eliot_platform::{KernelActivationNonce, PlatformHandle};
+    use eliot_runtime_contracts::{
+        HealthVector, RegisteredActivityWakePolicy, ServiceProcessState, SupervisionJournalEpoch,
+        SupervisionLeaseIncarnationBinding, SupervisionObservationScope,
+    };
     use serde::de::DeserializeOwned;
 
     use super::*;
+    use crate::protocol::{
+        HostFileIdentity, HostJobBinding, HostJobIdentity, HostJobRoot, HostKernelCandidateBinding,
+        HostProcessBinding, KERNEL_CONTROL_PIPE, KernelActivationPermit, KernelReadyReceipt,
+        ProcessObservation, RestartBudget,
+    };
+    use crate::{
+        AuthenticatedDoctorSession, KernelActivationReceipt, KernelControlCommand, KernelService,
+        handle_doctor_repair_attempt,
+    };
 
     const LINEAGE_A: &str = "550e8400-e29b-41d4-a716-446655440000";
     const LINEAGE_FOREIGN: &str = "6ba7b810-9dad-11d1-80b4-00c04fd430c8";
     const EPOCH_SEQUENCE: u64 = 4;
     const GENERATION: u64 = 7;
     const NOW_UNIX_NANOS: u64 = 1_700_000_000_000_000_000;
+    /// Post-restore admission time: past the recipe cooldown so the second
+    /// distinct attempt admits on its own budget terms (replay would reuse
+    /// the durable admission time instead).
+    const POST_RESTORE_NANOS: u64 = NOW_UNIX_NANOS + 60_000_000_000;
 
     /// Fail-closed in-memory test ledger. Same shape and contract as the
     /// ledger in the existing doctor integration tests; see the module
@@ -2510,6 +2580,216 @@ mod tests {
             .expect("valid composed test owner")
     }
 
+    /// Bounded platform handle for the Kernel rig below (mirrors the
+    /// lifecycle service tests; the candidate shape is Host-owned).
+    fn service_handle(value: &str) -> PlatformHandle {
+        PlatformHandle::new(value).expect("valid test handle")
+    }
+
+    fn service_supervision() -> SupervisionLeaseIncarnationBinding {
+        SupervisionLeaseIncarnationBinding {
+            supervision_lease_scope_id: "eliot-supervision-scope:v1:test".to_owned(),
+            supervision_lease_id: String::new(),
+            scope_ref_digest: String::new(),
+            installation_id: "installation-1".to_owned(),
+            host_epoch: SupervisionJournalEpoch {
+                lineage_id: "host-lineage-1".to_owned(),
+                sequence: 1,
+            },
+            activation_id: "activation-1".to_owned(),
+            activation_generation: SupervisionJournalEpoch {
+                lineage_id: "activation-lineage-1".to_owned(),
+                sequence: 1,
+            },
+            kernel_generation: SupervisionJournalEpoch {
+                lineage_id: "kernel-lineage-1".to_owned(),
+                sequence: 1,
+            },
+            watchdog_epoch: SupervisionJournalEpoch {
+                lineage_id: "watchdog-lineage-1".to_owned(),
+                sequence: 1,
+            },
+            observation_scope: SupervisionObservationScope {
+                targets: vec!["eliot-kernel".to_owned()],
+                sensor_profile: "eliot-runtime-live-v3".to_owned(),
+                claimed_coverage: vec!["process".to_owned(), "job".to_owned()],
+                governance_axis: "runtime-live-v3".to_owned(),
+            },
+            wake_policy: RegisteredActivityWakePolicy::Disabled,
+            predecessor: None,
+        }
+        .with_derived_ids()
+        .expect("valid test supervision incarnation")
+    }
+
+    /// Host-owned candidate binding adopting the given Kernel epoch.
+    fn kernel_candidate(kernel_epoch: EpochId) -> HostKernelCandidateBinding {
+        HostKernelCandidateBinding {
+            installation_id: service_handle("installation-1"),
+            host_epoch: AuthorityEpoch::new(1).expect("valid test host epoch"),
+            kernel_epoch,
+            activation_id: service_handle("activation-1"),
+            artifact_hash: service_handle("artifact-1"),
+            config_hash: service_handle("config-1"),
+            job_object_id: service_handle("Local\\Eliot-Host-Kernel-test"),
+            pipe_identity: service_handle(KERNEL_CONTROL_PIPE),
+            host_process: HostProcessBinding {
+                process_id: 7,
+                start_time_100ns: 9,
+                image_path: "C:\\\\eliot\\\\host.exe".to_owned(),
+            },
+            job_binding: HostJobBinding {
+                job: HostJobIdentity {
+                    name: "Local\\Eliot-Host-Kernel-test".to_owned(),
+                },
+                root: HostJobRoot {
+                    process: HostProcessBinding {
+                        process_id: 42,
+                        start_time_100ns: 10,
+                        image_path: "C:\\\\eliot\\\\kernel.exe".to_owned(),
+                    },
+                    executable: HostFileIdentity {
+                        volume_serial_number: 1,
+                        file_index: 2,
+                    },
+                },
+            },
+            supervision_incarnation: service_supervision(),
+            restart_budget: RestartBudget::new(1, 1).expect("valid test restart budget"),
+            agent_bridge_admission: None,
+            containment_action: None,
+        }
+    }
+
+    /// Activation permit bound to the candidate at the live test generation
+    /// (the Doctor fence generation), so the bound session generation agrees
+    /// with the presented fence.
+    fn candidate_permit(candidate: &HostKernelCandidateBinding) -> KernelActivationPermit {
+        KernelActivationPermit {
+            operation_id: service_handle("activation-operation-1"),
+            candidate_binding_digest: candidate.compute_digest().expect("candidate digest"),
+            prior_kernel_disposition_digest: "b".repeat(64),
+            journal_transaction_id: service_handle("journal-transaction-1"),
+            journal_sequence: 7,
+            generation: ResourceGeneration::new(GENERATION).expect("valid test generation"),
+            authority_epoch: candidate.kernel_epoch.clone(),
+            activation_nonce: KernelActivationNonce::new(service_handle(&"a".repeat(64)))
+                .expect("valid test nonce"),
+        }
+    }
+
+    fn service_ready_receipt(
+        candidate: &HostKernelCandidateBinding,
+        activation: &KernelActivationReceipt,
+        evidence: &str,
+    ) -> KernelReadyReceipt {
+        KernelReadyReceipt {
+            activation_id: candidate.activation_id.clone(),
+            activation_operation_id: activation.operation_id.clone(),
+            activation_nonce_digest: activation.activation_nonce_digest.clone(),
+            process: ProcessObservation {
+                process_id: service_handle("pid:42:start:10"),
+                job_object_id: candidate.job_object_id.clone(),
+                state: ServiceProcessState::Ready,
+                health: HealthVector::healthy(),
+                evidence_refs: vec![service_handle("process-evidence")],
+            },
+            health: HealthVector::healthy(),
+            evidence_refs: vec![service_handle(evidence)],
+        }
+    }
+
+    /// Drives a reconciled service to `Ready` through the exact activation
+    /// nonce consumption the front-door session requires.
+    fn rig_service_ready(
+        service: &mut KernelService,
+        candidate: &HostKernelCandidateBinding,
+    ) -> KernelActivationReceipt {
+        let permit = candidate_permit(candidate);
+        let generation = ResourceGeneration::new(GENERATION).expect("valid test generation");
+        service
+            .reconcile(candidate.clone())
+            .expect("reconcile adopts the Host lineage");
+        service
+            .apply(KernelControlCommand::Shadow)
+            .expect("shadow transition");
+        service
+            .apply(KernelControlCommand::PrepareHandoff)
+            .expect("handoff transition");
+        let activation = service
+            .activate_permit(&permit, generation, "c".repeat(64))
+            .expect("permit consumption");
+        let receipt = service_ready_receipt(candidate, &activation, "ready-cutover");
+        service.publish_ready(receipt).expect("readiness");
+        activation
+    }
+
+    /// Admits one envelope fenced at the given epoch through a live session,
+    /// returning the admission (panics on any refusal: the caller proves
+    /// admission, refusals are proven by dedicated assertions).
+    fn admit_fenced_attempt(
+        ledger: &TestLedger,
+        registry: &DoctorRecipeRegistry,
+        service: &KernelService,
+        session: &AuthenticatedDoctorSession,
+        epoch: EpochId,
+        attempt_id: &str,
+        now_unix_nanos: u64,
+    ) -> DoctorRepairAdmission {
+        let envelope = closed_envelope(auto_recipe(), epoch);
+        let request = wire_request(&envelope, attempt_id);
+        let response = handle_doctor_repair_attempt(
+            ledger,
+            registry,
+            service,
+            session,
+            &request,
+            now_unix_nanos,
+        )
+        .expect("attempt admission answers");
+        let DoctorRepairResponse::Admitted(admission) = response else {
+            panic!("attempt {attempt_id} must admit, got {response:?}");
+        };
+        *admission
+    }
+
+    /// Proves a pre-restore session fails closed once live authority moved:
+    /// both the context re-validation and the handle entry refuse with an
+    /// exact-tuple `HandshakeMismatch` before any ledger input.
+    fn assert_old_session_fenced(
+        ledger: &TestLedger,
+        registry: &DoctorRecipeRegistry,
+        service: &KernelService,
+        session_old: &AuthenticatedDoctorSession,
+        request_old: &DoctorRepairAttemptRequest,
+    ) {
+        let stale = session_old.admission_context(service);
+        assert!(
+            matches!(
+                stale,
+                Err(KernelServiceError::HandshakeMismatch {
+                    field: "doctor_repair.authority_epoch"
+                })
+            ),
+            "old session after restore must fail closed, got {stale:?}"
+        );
+        let stale_handle = handle_doctor_repair_attempt(
+            ledger,
+            registry,
+            service,
+            session_old,
+            request_old,
+            POST_RESTORE_NANOS,
+        );
+        assert!(
+            matches!(
+                stale_handle,
+                Err(KernelServiceError::HandshakeMismatch { .. })
+            ),
+            "old session handle after restore must fail closed, got {stale_handle:?}"
+        );
+    }
+
     #[test]
     fn composed_owner_advertises_true_while_uncomposed_default_stays_false() {
         // The bare default is the inert fail-closed advertisement.
@@ -2605,6 +2885,116 @@ mod tests {
             rejection.reason,
             DoctorRepairRejectionReason::StaleEpoch,
             "a foreign lineage fails closed as a stale epoch"
+        );
+    }
+
+    #[test]
+    fn restore_cutover_fences_old_doctor_session_and_admits_new_tuple() {
+        // Slice E4-B (issue #64): epoch mint stays Host-owned — the Kernel
+        // only adopts the Host-approved tuple through `reconcile`, and the
+        // `canonical_epoch` switch fences every old Doctor session through
+        // exact-tuple `is_same_authority` re-checks. Proves on one service
+        // instance: same-lineage+1 synchronizes; cross-lineage equal-seq
+        // fails closed; the pre-restore session is fenced after the
+        // restore; a new session with the new tuple admits and stages the
+        // canonical tuple as its authority.
+        let mut service = KernelService::new([0xE4; 32], 2, 4).expect("kernel service");
+        service
+            .synchronize_authority_epoch(test_epoch(LINEAGE_A, 2))
+            .expect("same-lineage forward sync must succeed");
+        assert!(
+            service
+                .authority_epoch()
+                .is_same_authority(&test_epoch(LINEAGE_A, 2))
+        );
+        let cross = service.synchronize_authority_epoch(test_epoch(LINEAGE_FOREIGN, 2));
+        assert!(
+            matches!(
+                cross,
+                Err(KernelServiceError::HandshakeMismatch {
+                    field: "authority_epoch"
+                })
+            ),
+            "cross-lineage equal-seq sync must fail closed, got {cross:?}"
+        );
+
+        // Pre-restore session on lineage-A admits.
+        rig_service_ready(&mut service, &kernel_candidate(test_epoch(LINEAGE_A, 2)));
+        let session_old =
+            AuthenticatedDoctorSession::bind(&service, "kernel.doctor-cutover-principal")
+                .expect("pre-restore session binds");
+        let ledger = TestLedger::new();
+        let registry = production_registry();
+        let request_old = wire_request(
+            &closed_envelope(auto_recipe(), test_epoch(LINEAGE_A, 2)),
+            "attempt-cutover-old",
+        );
+        let response_old = handle_doctor_repair_attempt(
+            &ledger,
+            &registry,
+            &service,
+            &session_old,
+            &request_old,
+            NOW_UNIX_NANOS,
+        )
+        .expect("pre-restore admission");
+        assert!(
+            matches!(response_old, DoctorRepairResponse::Admitted(_)),
+            "pre-restore session must admit, got {response_old:?}"
+        );
+
+        // Host-owned restore mint: a globally distinct lineage. The Kernel
+        // adopts and fences via `reconcile` (Ready drains and stops first;
+        // mint itself is never a Kernel operation).
+        service
+            .apply(KernelControlCommand::Drain)
+            .expect("drain before restore");
+        service
+            .apply(KernelControlCommand::Stop)
+            .expect("stop before restore");
+        rig_service_ready(
+            &mut service,
+            &kernel_candidate(test_epoch(LINEAGE_FOREIGN, 2)),
+        );
+        assert!(
+            service
+                .authority_epoch()
+                .is_same_authority(&test_epoch(LINEAGE_FOREIGN, 2))
+        );
+
+        // The old session is fenced: its tuple no longer matches live.
+        assert_old_session_fenced(&ledger, &registry, &service, &session_old, &request_old);
+
+        // A new session with the new tuple admits, and its staged row
+        // carries the canonical tuple as authority (the `u64` column is
+        // only the legacy-scalar evidence projection).
+        let session_new =
+            AuthenticatedDoctorSession::bind(&service, "kernel.doctor-cutover-principal")
+                .expect("post-restore session binds");
+        let admission_new = admit_fenced_attempt(
+            &ledger,
+            &registry,
+            &service,
+            &session_new,
+            test_epoch(LINEAGE_FOREIGN, 2),
+            "attempt-cutover-new",
+            POST_RESTORE_NANOS,
+        );
+        let attempt_identity = OperationIdentity::new(admission_new.attempt_digest.as_str())
+            .expect("admission digest binds");
+        let row = ledger
+            .load_doctor_attempt(&attempt_identity)
+            .expect("ledger read")
+            .expect("staged row present");
+        let row_authority =
+            staged_attempt_authority_epoch(&row).expect("staged row carries canonical authority");
+        assert!(
+            row_authority.is_same_authority(&test_epoch(LINEAGE_FOREIGN, 2)),
+            "staged row authority must be the new canonical tuple"
+        );
+        assert_eq!(
+            row.authority_epoch, 2,
+            "the u64 column is only the evidence projection"
         );
     }
 }
