@@ -37,6 +37,7 @@ use eliot_contracts::{EpochId, EpochLineageId, canonical_json_bytes, sha256_hex}
 use eliot_doctor_core::{
     AttemptIdentityBinding, ClosedRepairRequest, RepairClass, RepairOperationRef, RepairRecipe,
     RepairRecipeIdentity, RepairRecipeManifest, canonical_fence, check_fence_against_epoch,
+    health_probe_manifest, health_probe_recipe,
 };
 use eliot_ors::{
     DoctorAttemptAdmission, DoctorAttemptRecord, DoctorAttemptState, DoctorBudgetDecision,
@@ -269,6 +270,30 @@ impl DoctorRecipeRegistry {
             return Err(DoctorRegistryError::NotAutomaticSafe);
         }
         Self::register(manifest, vec![recipe])
+    }
+
+    /// Builds the closed one-shot registry for the installed-health probe.
+    ///
+    /// `installed_artifact_digest` is the installed package artifact digest
+    /// (lowercase SHA-256) read from the installed package manifest by the
+    /// supplying composition — the Kernel/Governor composition root that
+    /// owns the installation manifest. Kernel-service mints no digest here:
+    /// the digest flows into the health-probe builders unchanged, a
+    /// malformed digest fails closed through [`Self::register`], and the
+    /// manifest/recipe pair flows into [`Self::production_one_shot`]
+    /// unchanged, so advertisement still derives only from the composed
+    /// owner ([`ComposedDoctorFrontDoor`]).
+    ///
+    /// Composition-root call (DEPENDS-ON-W-C, `bins/eliot-kernel`): read the
+    /// installed digest from the installation manifest, then
+    /// `DoctorRecipeRegistry::production_health_probe(&digest)` and hand the
+    /// registry to `compose_doctor_front_door(ledger, registry)`.
+    pub fn production_health_probe(
+        installed_artifact_digest: &str,
+    ) -> Result<Self, DoctorRegistryError> {
+        let manifest = health_probe_manifest(installed_artifact_digest)?;
+        let recipe = health_probe_recipe(installed_artifact_digest)?;
+        Self::production_one_shot(manifest, recipe)
     }
 
     /// Registers one immutable manifest revision with its recipe set.
@@ -2246,8 +2271,8 @@ mod tests {
     use eliot_contracts::{AuthorityEpoch, EpochId, EpochLineageId, ResourceGeneration};
     use eliot_doctor_core::{
         BindingArg, ClosedRepairRequest, ClosedRequestParams, DiagnosticBrief, EvidenceHandle,
-        ExecutableBinding, RecoveryLease, RegisteredOperation, RepairClass, RepairRecipe,
-        RepairRecipeManifest, StateFence,
+        ExecutableBinding, HEALTH_PROBE_OPERATION_ID, RecoveryLease, RegisteredOperation,
+        RepairClass, RepairRecipe, RepairRecipeManifest, StateFence,
     };
     use eliot_ors::{
         DoctorAttemptAdmission, DoctorAttemptRecord, DoctorAttemptStageOutcome, DoctorAttemptState,
@@ -2628,6 +2653,42 @@ mod tests {
         .unwrap()
     }
 
+    fn probe_envelope(
+        recipe: RepairRecipe,
+        operation: RepairOperationRef,
+        epoch: EpochId,
+    ) -> ClosedRepairRequest {
+        ClosedRepairRequest::for_effect(ClosedRequestParams {
+            request_id: "job-probe-1".to_owned(),
+            brief: DiagnosticBrief {
+                problem_id: "problem-probe-1".to_owned(),
+                component: "doctor-generation".to_owned(),
+                failure_class: "installed-health".to_owned(),
+                symptom: "installed generation health is unproven".to_owned(),
+                impact: "bounded read-only probe".to_owned(),
+                evidence: vec![
+                    EvidenceHandle::new("ev-probe-1", sha256_hex(b"probe-evidence-1")).unwrap(),
+                ],
+                unknowns: Vec::new(),
+            },
+            recipe,
+            operations: vec![operation],
+            fence: StateFence::new(epoch, GENERATION, sha256_hex(b"probe-fence-1")).unwrap(),
+            lease: RecoveryLease {
+                lease_id: "lease-probe-1".to_owned(),
+                owner: "kernel".to_owned(),
+                expires_at: fixture_time(serde_json::json!([2030, 1, 0, 0, 0, 0, 0, 0, 0])),
+                allowed_effects: [HEALTH_PROBE_OPERATION_ID.to_owned()].into_iter().collect(),
+            },
+            approval: None,
+            budget_units: 1,
+            deadline: fixture_time(serde_json::json!([2030, 1, 0, 0, 0, 0, 0, 0, 0])),
+            cancellation: false,
+            escalation_target: "operator".to_owned(),
+        })
+        .unwrap()
+    }
+
     fn wire_request(
         envelope: &ClosedRepairRequest,
         attempt_id: &str,
@@ -2885,6 +2946,71 @@ mod tests {
         assert!(
             ComposedDoctorFrontDoor::compose(&ledger, &registry, "   ").is_err(),
             "a blank principal binds no front-door owner"
+        );
+    }
+
+    /// Installed-manifest probe wiring (Part 1, doctor side): the supplying
+    /// composition's installed artifact digest flows through the health-probe
+    /// builders into [`DoctorRecipeRegistry::production_one_shot`] via
+    /// [`DoctorRecipeRegistry::production_health_probe`], the composed owner
+    /// advertises, and the real [`admit_doctor_repair`] gate admits one probe
+    /// attempt whose reply digests equal the independently recomputed
+    /// lineage-aware attempt/effect bindings. No test doubles: the digest is
+    /// derived at test time, and registry, owner, and admission are the
+    /// production types and functions over the file's exact-trait-contract
+    /// ledger. The composition-root call itself lives outside this slice
+    /// (DEPENDS-ON-W-C); the live-binary drive stays DEPENDS-ON-INTEGRATION.
+    #[test]
+    fn installed_health_probe_wiring_admits_one_probe_attempt() {
+        let installed_artifact_digest = sha256_hex(b"eliot-doctor-installed-package-bytes");
+        let registry = DoctorRecipeRegistry::production_health_probe(&installed_artifact_digest)
+            .expect("probe registry builds from the installed digest");
+        assert_eq!(registry.recipe_count(), 1);
+        let ledger = TestLedger::new();
+        let composed = owner(&ledger, &registry);
+        assert!(advertise_doctor_repair(&composed));
+        let manifest = health_probe_manifest(&installed_artifact_digest)
+            .expect("probe manifest builds from the installed digest");
+        assert_eq!(registry.manifest_digest(), manifest.digest());
+        let recipe =
+            health_probe_recipe(&installed_artifact_digest).expect("probe recipe builds");
+        let operation = manifest
+            .resolve(HEALTH_PROBE_OPERATION_ID)
+            .expect("probe operation resolves");
+        let epoch = test_epoch(LINEAGE_A, EPOCH_SEQUENCE);
+        let envelope = probe_envelope(recipe, operation.clone(), epoch.clone());
+        let request = wire_request(&envelope, "attempt-probe-1");
+        let response = admit_doctor_repair(
+            &ledger,
+            &registry,
+            &context(),
+            "kernel.doctor-test-principal",
+            &request,
+            NOW_UNIX_NANOS,
+        )
+        .expect("probe admission answers");
+        let DoctorRepairResponse::Admitted(admission) = response else {
+            panic!("probe presentation must be admitted, got {response:?}");
+        };
+        assert_eq!(admission.operation_id, HEALTH_PROBE_OPERATION_ID);
+        assert_eq!(
+            admission.recipe_digest,
+            RepairRecipeIdentity::bind(&envelope.recipe)
+                .expect("probe recipe identity")
+                .digest()
+        );
+        assert_eq!(admission.manifest_digest, manifest.digest());
+        let now = fixture_time(serde_json::json!([2026, 1, 0, 0, 0, 0, 0, 0, 0]));
+        let bound_attempt = envelope
+            .bind_attempt_on_epoch(&manifest, "attempt-probe-1", &operation, &epoch, now)
+            .expect("probe attempt binds on the live epoch");
+        assert_eq!(admission.attempt_digest, bound_attempt.digest());
+        let bound_effect = envelope
+            .bind_effect(&bound_attempt, &operation, 0)
+            .expect("probe effect binds");
+        assert_eq!(
+            admission.effect_digest.as_deref(),
+            Some(bound_effect.digest())
         );
     }
 
