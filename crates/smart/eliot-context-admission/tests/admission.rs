@@ -475,7 +475,15 @@ fn required_missing_stale_unknown_and_oversized_are_exact_gaps() {
     let unavailable_id = stale_unavailable.candidates.candidates[1].atom_id.clone();
     stale_unavailable.candidates.candidates[1].availability = AtomAvailability::Unavailable;
     stale_unavailable.candidates.denominator.dispositions[1].state = AtomAvailability::Unavailable;
+    stale_unavailable.candidates.denominator.dispositions[1].evidence = Some(ProofBinding {
+        evidence_id: id("optional-unavailable-reason"),
+        ceiling: ProofCeiling::Observation,
+    });
     stale_unavailable.recipe.denominator.dispositions[1].state = AtomAvailability::Unavailable;
+    stale_unavailable.recipe.denominator.dispositions[1].evidence = Some(ProofBinding {
+        evidence_id: id("optional-unavailable-reason"),
+        ceiling: ProofCeiling::Observation,
+    });
     stale_unavailable
         .floor
         .floor
@@ -527,7 +535,10 @@ fn required_missing_stale_unknown_and_oversized_are_exact_gaps() {
                 .provider_role
                 .clone(),
             state: AtomAvailability::Unavailable,
-            evidence: None,
+            evidence: Some(ProofBinding {
+                evidence_id: id("optional-unavailable-reason"),
+                ceiling: ProofCeiling::Observation,
+            }),
         });
     stale_unavailable.candidates.candidates[0]
         .dependencies
@@ -631,7 +642,15 @@ fn unknown_optional_is_visible_without_inventing_zero_cost() {
     let mut unavailable = input_with_optional(AdmissionMeasuredCost::ExactUtf8Bytes { value: 1 });
     unavailable.candidates.candidates[1].availability = AtomAvailability::Unavailable;
     unavailable.candidates.denominator.dispositions[1].state = AtomAvailability::Unavailable;
+    unavailable.candidates.denominator.dispositions[1].evidence = Some(ProofBinding {
+        evidence_id: id("optional-unavailable-reason"),
+        ceiling: ProofCeiling::Observation,
+    });
     unavailable.recipe.denominator.dispositions[1].state = AtomAvailability::Unavailable;
+    unavailable.recipe.denominator.dispositions[1].evidence = Some(ProofBinding {
+        evidence_id: id("optional-unavailable-reason"),
+        ceiling: ProofCeiling::Observation,
+    });
     unavailable.recipe.recipe_sha256 = unavailable
         .recipe
         .canonical_policy_digest()

@@ -376,7 +376,7 @@ impl ProviderRoleDenominator {
         }
         let mut seen = std::collections::BTreeSet::new();
         for disposition in &self.dispositions {
-            disposition.slot.validate()?;
+            disposition.validate()?;
             let key = (disposition.slot.provider.clone(), disposition.slot.role);
             if !expected.contains(&key) || !seen.insert(key) {
                 return Err(ContextError::DenominatorMismatch);
@@ -399,6 +399,27 @@ pub struct ProviderDisposition {
     pub state: AtomAvailability,
     /// Evidence for the state, if available.
     pub evidence: Option<ProofBinding>,
+}
+
+impl ProviderDisposition {
+    /// Validate slot identity and require evidence for blocked/unavailable.
+    ///
+    /// A `Blocked` or `Unavailable` slot without named evidence cannot
+    /// support a coverage or absence claim, so it fails closed. All other
+    /// states preserve the previous acceptance shape.
+    pub fn validate(&self) -> Result<(), ContextError> {
+        self.slot.validate()?;
+        if matches!(
+            self.state,
+            AtomAvailability::Blocked | AtomAvailability::Unavailable
+        ) && self.evidence.is_none()
+        {
+            return Err(ContextError::MissingField(
+                "denominator.dispositions.evidence",
+            ));
+        }
+        Ok(())
+    }
 }
 
 /// Independent route capacity components.
