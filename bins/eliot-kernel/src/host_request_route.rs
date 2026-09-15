@@ -727,6 +727,7 @@ fn requested_host_request_record(
         deadline_unix_ms: envelope.identity.deadline_unix_ms,
         state: HostRequestState::Requested,
         result_digest: None,
+        result_response: None,
         commit_order: 0,
     })
 }

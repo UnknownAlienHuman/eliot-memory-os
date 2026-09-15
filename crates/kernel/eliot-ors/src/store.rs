@@ -364,6 +364,26 @@ pub trait OperationalRecoveryStore: Send + Sync {
         target: crate::HostRequestState,
         result_digest: Option<&str>,
     ) -> Result<Option<crate::HostRequestRecord>, OrsError>;
+    /// Persists one bounded local-read result body alongside its digest
+    /// (Implements #18: local read result).
+    ///
+    /// Atomically walks the mechanical lifecycle (`Admitted` → `Routed` →
+    /// `Submitted` → `ResultReceived`, or a direct legal edge such as
+    /// `Unknown`/`Reconciling`/`Submitted`/`PossiblyEffected` →
+    /// `ResultReceived`) and stores the exact bounded response JSON with its
+    /// digest. An exact replay (same digest and byte-identical body) returns
+    /// the durable record unchanged without re-dispatch; a changed digest or
+    /// body under the same identity fails as
+    /// [`OrsError::HostRequestIdentityConflict`] and never overwrites the
+    /// durable row. Rejection happens before any readback: the caller must
+    /// have already validated tool linkage and descriptor binding.
+    fn persist_host_request_result(
+        &self,
+        operation_id: &crate::OperationIdentity,
+        request_digest: &str,
+        result_digest: &str,
+        result_response: &serde_json::Value,
+    ) -> Result<Option<crate::HostRequestRecord>, OrsError>;
     /// Loads one host-request operation by exact operation/request identity.
     fn load_host_request(
         &self,
@@ -1348,6 +1368,100 @@ impl RedbRecoveryStore {
         next.state = target;
         next.result_digest = effective_result;
         if target.is_terminal() && next.commit_order == 0 {
+            next.commit_order = Self::next_operational_order(&write)?;
+        }
+        next.validate()?;
+        if next != existing {
+            let payload = encode(&next)?;
+            let mut table = write.open_table(HOST_REQUESTS).map_err(storage)?;
+            table
+                .insert(key.as_str(), payload.as_str())
+                .map_err(storage)?;
+        }
+        write.commit().map_err(storage)?;
+        Ok(Some(next))
+    }
+
+    /// Persists one bounded local-read result body alongside its digest.
+    ///
+    /// See [`OperationalRecoveryStore::persist_host_request_result`] for the
+    /// replay/conflict contract. The lifecycle walk stays inside the existing
+    /// transition table: no new edge is introduced, so the anti-blind-retry
+    /// fence is unchanged. A `Requested` operation cannot receive a result
+    /// (it must be admitted first); terminal states without a result cannot
+    /// gain one.
+    pub fn persist_host_request_result(
+        &self,
+        operation_id: &crate::OperationIdentity,
+        request_digest: &str,
+        result_digest: &str,
+        result_response: &serde_json::Value,
+    ) -> Result<Option<crate::HostRequestRecord>, OrsError> {
+        crate::model::validate_digest(result_digest, "host_request_result_digest")?;
+        let key = format!("{}::{}", operation_id.as_str(), request_digest);
+        let write = self.database.begin_write().map_err(storage)?;
+        let existing: Option<crate::HostRequestRecord> = {
+            let table = write.open_table(HOST_REQUESTS).map_err(storage)?;
+            table
+                .get(key.as_str())
+                .map_err(storage)?
+                .map(|value| decode(value.value()))
+                .transpose()?
+        };
+        let Some(existing) = existing else {
+            return Ok(None);
+        };
+        existing.validate()?;
+        if existing.state == crate::HostRequestState::ResultReceived {
+            let same_digest = existing.result_digest.as_deref() == Some(result_digest);
+            let same_body = existing.result_response.as_ref() == Some(result_response);
+            if same_digest && same_body {
+                return Ok(Some(existing));
+            }
+            return Err(OrsError::HostRequestIdentityConflict {
+                operation_id: operation_id.as_str().to_owned(),
+                request_digest: request_digest.to_owned(),
+            });
+        }
+        if existing.state == crate::HostRequestState::Terminal {
+            let same_digest = existing.result_digest.as_deref() == Some(result_digest);
+            let same_body = existing.result_response.as_ref() == Some(result_response);
+            if same_digest && same_body {
+                return Ok(Some(existing));
+            }
+            // A terminal record either carries this exact result already
+            // (handled above) or must never gain or replace one here.
+            if existing.result_digest.is_some() || existing.result_response.is_some() {
+                return Err(OrsError::HostRequestIdentityConflict {
+                    operation_id: operation_id.as_str().to_owned(),
+                    request_digest: request_digest.to_owned(),
+                });
+            }
+            return Err(OrsError::InvalidTransition);
+        }
+        // Walk the mechanical lifecycle to `ResultReceived` inside the
+        // existing table: direct when legal, otherwise via the canonical
+        // `Admitted -> Routed -> Submitted` progression the synchronous local
+        // dispatch stands in for (no router/submitter exists on this path).
+        let mut state = existing.state;
+        loop {
+            if state == crate::HostRequestState::ResultReceived {
+                break;
+            }
+            let next = if state == crate::HostRequestState::Admitted {
+                crate::HostRequestState::Routed
+            } else if state == crate::HostRequestState::Routed {
+                crate::HostRequestState::Submitted
+            } else {
+                crate::HostRequestState::ResultReceived
+            };
+            state = state.transition_to(next)?;
+        }
+        let mut next = existing.clone();
+        next.state = crate::HostRequestState::ResultReceived;
+        next.result_digest = Some(result_digest.to_owned());
+        next.result_response = Some(result_response.clone());
+        if next.commit_order == 0 {
             next.commit_order = Self::next_operational_order(&write)?;
         }
         next.validate()?;
@@ -6266,6 +6380,22 @@ impl OperationalRecoveryStore for RedbRecoveryStore {
         )
     }
 
+    fn persist_host_request_result(
+        &self,
+        operation_id: &crate::OperationIdentity,
+        request_digest: &str,
+        result_digest: &str,
+        result_response: &serde_json::Value,
+    ) -> Result<Option<crate::HostRequestRecord>, OrsError> {
+        RedbRecoveryStore::persist_host_request_result(
+            self,
+            operation_id,
+            request_digest,
+            result_digest,
+            result_response,
+        )
+    }
+
     fn load_host_request(
         &self,
         operation_id: &crate::OperationIdentity,
@@ -6538,6 +6668,22 @@ impl<S: OperationalRecoveryStore> OrsCoordinator<S> {
     ) -> Result<Option<HostRequestRecord>, OrsError> {
         self.store
             .advance_host_request(operation_id, request_digest, target, result_digest)
+    }
+
+    /// Persists one bounded local-read result body alongside its digest.
+    pub fn persist_host_request_result(
+        &self,
+        operation_id: &crate::OperationIdentity,
+        request_digest: &str,
+        result_digest: &str,
+        result_response: &serde_json::Value,
+    ) -> Result<Option<HostRequestRecord>, OrsError> {
+        self.store.persist_host_request_result(
+            operation_id,
+            request_digest,
+            result_digest,
+            result_response,
+        )
     }
 
     /// Loads one host-request operation by exact operation/request identity.
