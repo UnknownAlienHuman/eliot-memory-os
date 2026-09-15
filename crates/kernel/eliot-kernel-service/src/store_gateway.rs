@@ -16,6 +16,7 @@ use std::time::Duration;
 use eliot_contracts::{EpochId, OperationId, RequestMetadata, StateFence};
 use eliot_ipc::NamedPipeTransport;
 use eliot_kernel_core::GenerationRoute;
+use eliot_protocol::dreamer_job::{DurableJobRequest, DurableJobResponse};
 use eliot_store_api::{
     CanonicalRequestView, CanonicalStoreClient, CanonicalValidationSnapshot,
     OrderingHeadExpectation, PreparedTransition, RequestMeta, RevisionHeadExpectation,
@@ -360,6 +361,63 @@ impl KernelStoreGateway {
         let result = self
             .store
             .initialize_genesis(context, request)
+            .await
+            .map_err(|error| error.to_string());
+        drop(lease);
+        result
+    }
+
+    /// Applies one closed Dreamer ledger operation through the active Kernel
+    /// generation route (T12-04 K1, owner #779). Public input/output remain
+    /// exactly the S0 K0 types. Gates mirror `initialize_genesis` (flight
+    /// enter, fence, validation, active route, fence equality, one admission
+    /// lease, a single store call, deterministic release), except the caller
+    /// rule: the closed K0 `JobRole` projection decides, never the
+    /// `eliotd` source check. The presented role agrees with the operation
+    /// but grants nothing by itself; K2 binds the authenticated principal.
+    /// Unknown outcome handling stays owned by the EBP client, which
+    /// reconciles the exact admitted operation identity.
+    pub async fn dreamer_job(
+        &self,
+        context: &RequestMeta,
+        request: DurableJobRequest,
+    ) -> Result<DurableJobResponse, String> {
+        let _flight = self.flight.enter()?;
+        if self.is_fenced() {
+            return Err("canonical-store gateway is fenced for rebind".to_owned());
+        }
+        context.validate().map_err(|error| error.to_string())?;
+        request.validate().map_err(|error| error.to_string())?;
+        if !request.role.permits(request.operation.kind()) {
+            return Err("dreamer job caller role does not permit the operation".to_owned());
+        }
+        self.validate_active_route(&context.state_fence)?;
+        if request.request_identity.operation.state_fence != context.state_fence {
+            return Err("dreamer job request fence does not match request metadata".to_owned());
+        }
+
+        let lease = {
+            let service = self
+                .service
+                .lock()
+                .map_err(|_| "Kernel service lock poisoned".to_owned())?;
+            if service.generation_fenced() {
+                return Err("Kernel generation is fenced".to_owned());
+            }
+            let lease = service
+                .acquire_admission()
+                .map_err(|error| error.to_string())?;
+            if lease.authority_epoch() != context.state_fence.authority_epoch {
+                return Err("dreamer job route authority epoch is stale".to_owned());
+            }
+            lease
+        };
+        if self.is_fenced() {
+            return Err("canonical-store gateway is fenced for rebind".to_owned());
+        }
+        let result = self
+            .store
+            .dreamer_job(context, request)
             .await
             .map_err(|error| error.to_string());
         drop(lease);

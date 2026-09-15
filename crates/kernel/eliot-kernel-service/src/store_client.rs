@@ -11,6 +11,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use eliot_contracts::{ArtifactId, ContractId, ContractVersion, StateFence};
 use eliot_ipc::{DeliveryOutcome, TransportError, TransportLimits};
+use eliot_protocol::dreamer_job::{DurableJobRequest, DurableJobResponse};
 use eliot_protocol::{ClientHello, Frame, ProtocolRange, ProtocolVersion, ServerHello};
 use eliot_runtime_contracts::{ModuleContract, ModuleGeneration, ModuleGenerationState};
 use eliot_store_api::{
@@ -20,7 +21,8 @@ use eliot_store_api::{
     RecoveryRecordKey, RequestMeta, RevisionHead, RevisionHeadExpectation, RevisionKey, ScopeId,
     ScopeRevisionView, StoreError, StoreGenesisRequest, StoreHealth, StoreRecoveryRequest,
     StoreRecoverySnapshot, StoreRequest, StoreResponse, StoreWireError, WriteReceipt,
-    validate_genesis_receipt_envelope, verify_canonical_request_hash,
+    dreamer_job_capability, map_durable_error, validate_genesis_receipt_envelope,
+    verify_canonical_request_hash,
 };
 use thiserror::Error;
 use tokio::sync::Mutex;
@@ -239,6 +241,29 @@ impl<T: EbpStoreTransport + 'static> EbpCanonicalStoreClient<T> {
         self.validate_genesis_receipt(context, request, &receipt)?;
         Ok(receipt)
     }
+
+    /// Reconciles one uncertain Dreamer ledger mutation by its exact admitted
+    /// identity (T12-04 K1, owner #779).
+    ///
+    /// A `WriteReceipt` proves only that the mutation committed; it never
+    /// carries the ledger answer, so even a successful exact lookup stays
+    /// unknown for the job response: the caller must follow up with a ledger
+    /// `Status`/`Reconcile` observation. The query still pins the admitted
+    /// operation id and canonical hash with fresh transport correlation, and
+    /// its typed outcome is preserved: a substituted receipt surfaces the
+    /// identity/digest conflict, while an absent or unreachable receipt stays
+    /// `MissingReceiptEnvelope` (still unknown — never `Unavailable`, which
+    /// would invite a same-identity write retry after a possible commit).
+    async fn reconcile_dreamer_job(
+        &self,
+        operation_id: &OperationId,
+        canonical_request_hash: &str,
+    ) -> Result<DurableJobResponse, StoreError> {
+        let _ = self
+            .receipt_exact(operation_id.clone(), canonical_request_hash)
+            .await?;
+        Err(StoreError::MissingReceiptEnvelope)
+    }
 }
 
 impl<T: EbpStoreTransport + 'static> CanonicalStoreClient for EbpCanonicalStoreClient<T> {
@@ -371,6 +396,71 @@ impl<T: EbpStoreTransport + 'static> CanonicalStoreClient for EbpCanonicalStoreC
             // admitted operation in `execute_raw`; reconcile exactly it.
             Err(error) if error.is_unknown_outcome_failure() => {
                 self.reconcile_genesis(context, &request).await
+            }
+            Err(error) => Err(error.into_store_error()),
+        }
+    }
+
+    /// Applies one closed Dreamer ledger operation (T12-04 K1, owner #779).
+    ///
+    /// Public input/output remain exactly the S0 K0 types. The call validates
+    /// the context and the K0 request (including the closed role projection),
+    /// pins the fence to the Host-approved requirement and the admitted
+    /// operation, checks the exact per-operation wire capability admitted by
+    /// the handshake, executes exactly once, and binds the answer with
+    /// [`DurableJobResponse::validate_for`]. A wrong-variant, misbound, or
+    /// fence-divergent answer observed after the single send is an uncertain
+    /// observation reconciled by the exact admitted identity — never success
+    /// and never a blind retry. Typed failures keep their mapped directive
+    /// (`into_store_error`); only unknown outcomes reconcile.
+    async fn dreamer_job(
+        &self,
+        ctx: &RequestMeta,
+        request: DurableJobRequest,
+    ) -> Result<DurableJobResponse, StoreError> {
+        ctx.validate().map_err(StoreError::Foundation)?;
+        request.validate().map_err(map_durable_error)?;
+        if ctx.state_fence != self.requirement.state_fence
+            || ctx.state_fence != request.request_identity.operation.state_fence
+        {
+            return Err(StoreError::FenceMismatch);
+        }
+        // Per-operation capability admitted by the handshake pin: the closed
+        // K0 vocabulary maps every kind, so a missing entry is a contract
+        // defect, never a default-allowed operation.
+        if !CAPABILITIES.contains(&dreamer_job_capability(&request.operation)) {
+            return Err(StoreError::UnknownOperation);
+        }
+        let operation_id = request.request_identity.operation.operation_id.clone();
+        let canonical_request_hash = request.request_identity.canonical_request_hash.clone();
+        let transport_key = request.request_identity.request.idempotency_key.clone();
+        let result = self
+            .execute_raw(
+                StoreRequest::DreamerJob {
+                    context: ctx.clone(),
+                    request: request.clone(),
+                },
+                Some(ctx),
+                &transport_key,
+            )
+            .await;
+        match result {
+            Ok(StoreResponse::DreamerJob { response }) => match response.validate_for(&request) {
+                Ok(()) => Ok(response),
+                Err(_) => {
+                    self.reconcile_dreamer_job(&operation_id, &canonical_request_hash)
+                        .await
+                }
+            },
+            Ok(_) | Err(RequestFailure::Unknown { .. }) => {
+                self.reconcile_dreamer_job(&operation_id, &canonical_request_hash)
+                    .await
+            }
+            // A typed unknown-outcome failure was already bound to the
+            // admitted operation in `execute_raw`; reconcile exactly it.
+            Err(error) if error.is_unknown_outcome_failure() => {
+                self.reconcile_dreamer_job(&operation_id, &canonical_request_hash)
+                    .await
             }
             Err(error) => Err(error.into_store_error()),
         }
