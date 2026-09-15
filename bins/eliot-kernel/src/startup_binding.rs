@@ -2,7 +2,7 @@
 //!
 //! Binary-private parsing, validation, and bounded lease reads for the
 //! `eliot-kernel` entry: host-injected `KernelStartupBinding`, the exact
-//! 16-value launch contour, neutral store-bootstrap and `eliotd` descriptor
+//! 22-value launch contour, neutral store-bootstrap and `eliotd` descriptor
 //! preparation, and the authority-contour projection. Zero composition
 //! contact: this module never constructs, reads, or drives
 //! `KernelComposition`; `main` calls the `pub(crate)` parsers and passes the
@@ -185,6 +185,9 @@ pub(crate) struct KernelLaunchOptions {
     daemon_descriptor: Option<PathBuf>,
     pub(crate) daemon_sha256: Option<String>,
     pub(crate) kernel_artifact_sha256: Option<String>,
+    pub(crate) doctor_artifact_sha256: Option<String>,
+    pub(crate) testd_artifact_sha256: Option<String>,
+    pub(crate) native_worker_artifact_sha256: Option<String>,
 }
 
 pub(crate) struct PreparedStoreBootstrap {
@@ -215,6 +218,12 @@ where
             authority_digest,
             kernel_artifact_flag,
             kernel_artifact_digest,
+            doctor_artifact_flag,
+            doctor_artifact_digest,
+            testd_artifact_flag,
+            testd_artifact_digest,
+            native_worker_artifact_flag,
+            native_worker_artifact_digest,
             daemon_flag,
             daemon_path,
             daemon_digest_flag,
@@ -225,16 +234,25 @@ where
             && authority_flag == "--authority-descriptor"
             && authority_digest_flag == "--authority-descriptor-sha256"
             && kernel_artifact_flag == "--kernel-artifact-sha256"
+            && doctor_artifact_flag == "--doctor-artifact-sha256"
+            && testd_artifact_flag == "--testd-artifact-sha256"
+            && native_worker_artifact_flag == "--native-worker-artifact-sha256"
             && daemon_flag == "--eliotd-descriptor"
             && daemon_digest_flag == "--eliotd-descriptor-sha256" =>
         {
             let store_digest = store_digest.to_string_lossy();
             let authority_digest = authority_digest.to_string_lossy();
             let kernel_artifact_digest = kernel_artifact_digest.to_string_lossy();
+            let doctor_artifact_digest = doctor_artifact_digest.to_string_lossy();
+            let testd_artifact_digest = testd_artifact_digest.to_string_lossy();
+            let native_worker_artifact_digest = native_worker_artifact_digest.to_string_lossy();
             let daemon_digest = daemon_digest.to_string_lossy();
             if !is_lower_sha256(&store_digest)
                 || !is_lower_sha256(&authority_digest)
                 || !is_lower_sha256(&kernel_artifact_digest)
+                || !is_lower_sha256(&doctor_artifact_digest)
+                || !is_lower_sha256(&testd_artifact_digest)
+                || !is_lower_sha256(&native_worker_artifact_digest)
                 || !is_lower_sha256(&daemon_digest)
             {
                 return Err(invalid_input(
@@ -252,10 +270,13 @@ where
                 daemon_descriptor: Some(PathBuf::from(daemon_path)),
                 daemon_sha256: Some(daemon_digest.into_owned()),
                 kernel_artifact_sha256: Some(kernel_artifact_digest.into_owned()),
+                doctor_artifact_sha256: Some(doctor_artifact_digest.into_owned()),
+                testd_artifact_sha256: Some(testd_artifact_digest.into_owned()),
+                native_worker_artifact_sha256: Some(native_worker_artifact_digest.into_owned()),
             })
         }
         _ => Err(invalid_input(
-            "expected the exact mandatory 16-value Host launch contour",
+            "expected the exact mandatory 22-value Host launch contour",
         )),
     }
 }
@@ -436,6 +457,12 @@ mod tests {
             root.0.join("authority.json").into_os_string(),
             "--authority-descriptor-sha256".into(),
             digest.clone().into(),
+            "--doctor-artifact-sha256".into(),
+            digest.clone().into(),
+            "--testd-artifact-sha256".into(),
+            digest.clone().into(),
+            "--native-worker-artifact-sha256".into(),
+            digest.clone().into(),
             "--eliotd-descriptor".into(),
             root.0.join("eliotd.json").into_os_string(),
             "--eliotd-descriptor-sha256".into(),
@@ -461,14 +488,76 @@ mod tests {
             digest.clone().into(),
             "--kernel-artifact-sha256".into(),
             digest.clone().into(),
+            "--doctor-artifact-sha256".into(),
+            digest.clone().into(),
+            "--testd-artifact-sha256".into(),
+            digest.clone().into(),
+            "--native-worker-artifact-sha256".into(),
+            digest.clone().into(),
             "--eliotd-descriptor".into(),
             root.0.join("eliotd.json").into_os_string(),
             "--eliotd-descriptor-sha256".into(),
             digest.clone().into(),
         ])
         .expect("integrated args");
-        assert_eq!(options.kernel_artifact_sha256, Some(digest));
+        assert_eq!(options.kernel_artifact_sha256, Some(digest.clone()));
+        assert_eq!(options.doctor_artifact_sha256, Some(digest.clone()));
+        assert_eq!(options.testd_artifact_sha256, Some(digest.clone()));
+        assert_eq!(options.native_worker_artifact_sha256, Some(digest.clone()));
         assert_eq!(options.daemon_descriptor, Some(root.0.join("eliotd.json")));
+    }
+
+    #[test]
+    fn launch_args_reject_missing_dispatch_artifact_domains() {
+        let root = TempRoot::new();
+        let digest = "a".repeat(64);
+        // 16-value legacy contour without doctor/testd/native-worker must fail.
+        let legacy = parse_launch_options([
+            "--work-root".into(),
+            root.0.join("work").into_os_string(),
+            "--store-bootstrap".into(),
+            root.0.join("store-bootstrap.json").into_os_string(),
+            "--store-bootstrap-sha256".into(),
+            digest.clone().into(),
+            "--authority-descriptor".into(),
+            root.0.join("authority.json").into_os_string(),
+            "--authority-descriptor-sha256".into(),
+            digest.clone().into(),
+            "--kernel-artifact-sha256".into(),
+            digest.clone().into(),
+            "--eliotd-descriptor".into(),
+            root.0.join("eliotd.json").into_os_string(),
+            "--eliotd-descriptor-sha256".into(),
+            digest.clone().into(),
+        ]);
+        assert!(
+            legacy.is_err(),
+            "16-value contour without dispatch digests must be rejected"
+        );
+        // Missing only the native-worker digest must also fail.
+        let missing_one = parse_launch_options([
+            "--work-root".into(),
+            root.0.join("work").into_os_string(),
+            "--store-bootstrap".into(),
+            root.0.join("store-bootstrap.json").into_os_string(),
+            "--store-bootstrap-sha256".into(),
+            digest.clone().into(),
+            "--authority-descriptor".into(),
+            root.0.join("authority.json").into_os_string(),
+            "--authority-descriptor-sha256".into(),
+            digest.clone().into(),
+            "--kernel-artifact-sha256".into(),
+            digest.clone().into(),
+            "--doctor-artifact-sha256".into(),
+            digest.clone().into(),
+            "--testd-artifact-sha256".into(),
+            digest.clone().into(),
+            "--eliotd-descriptor".into(),
+            root.0.join("eliotd.json").into_os_string(),
+            "--eliotd-descriptor-sha256".into(),
+            digest.into(),
+        ]);
+        assert!(missing_one.is_err());
     }
 
     #[test]
@@ -501,6 +590,12 @@ mod tests {
             digest_b.into(),
             "--kernel-artifact-sha256".into(),
             "c".repeat(64).into(),
+            "--doctor-artifact-sha256".into(),
+            "e".repeat(64).into(),
+            "--testd-artifact-sha256".into(),
+            "f".repeat(64).into(),
+            "--native-worker-artifact-sha256".into(),
+            "a".repeat(64).into(),
             "--eliotd-descriptor".into(),
             root.0.join("eliotd.json").into_os_string(),
             "--eliotd-descriptor-sha256".into(),
