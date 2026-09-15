@@ -5,11 +5,15 @@
 //! so a consumer can surface an exact reason without crossing the secret
 //! boundary.
 
-use eliot_contracts::ContractError;
+use eliot_contracts::{AuthorityEpoch, ContractError};
 use eliot_process::ContractError as ProcessContractError;
 use eliot_receipts::ReceiptError;
 use eliot_runtime_contracts::RuntimeContractError;
 use thiserror::Error;
+
+use crate::module::control_reserve_front_door::{
+    CapacityBottleneck, ControlOperationClass, EmergencyOperationClass, NormalWorkClass,
+};
 
 /// Typed failure surface owned by the Kernel decision core.
 #[derive(Debug, Error)]
@@ -83,8 +87,96 @@ pub enum KernelError {
     },
 
     /// The control reserve is exhausted; no control permit can be granted.
+    ///
+    /// Migration-only surface for pre-slice-A callers (`FrontDoor::acquire_control`,
+    /// `FrontDoor::authorize`) that hold the protected partition without a typed
+    /// operation binding. New callers must use the typed partition acquisitions on
+    /// [`crate::FrontDoor`] and receive the per-bottleneck dispositions below.
+    /// Slice B (issue #65 service wave) migrates the remaining legacy holders.
     #[error("control reserve exhausted")]
     ControlReserveExhausted,
+
+    /// Normal workload admission is backpressured at the named bottleneck.
+    ///
+    /// The protected and emergency partitions are untouched by this disposition
+    /// (contract `BACKPRESSURED_NORMAL`, issue #65): saturating normal work leaves
+    /// demonstrable capacity for cancellation, fencing, health, drain,
+    /// problem/incident and recovery. Callers shed, defer or quarantine the named
+    /// normal work; they must not retry it against the protected reserve.
+    #[error(
+        "normal capacity exhausted at {bottleneck:?} for {work_class:?} operation {operation_id} owner {owner} epoch {epoch:?}: backpressure normal work"
+    )]
+    NormalCapacityExhausted {
+        /// Bottleneck whose normal partition is saturated.
+        bottleneck: CapacityBottleneck,
+        /// Normal work class that was shed.
+        work_class: NormalWorkClass,
+        /// Operation that was denied admission.
+        operation_id: String,
+        /// Owner that requested admission.
+        owner: String,
+        /// Front-door epoch observed at denial.
+        epoch: AuthorityEpoch,
+    },
+
+    /// The protected control reserve is exhausted at the named bottleneck.
+    ///
+    /// Only closed [`ControlOperationClass`] operations can observe this
+    /// disposition (contract `PROTECTED_RESERVE_EXHAUSTED`, issue #65). Normal
+    /// work is never admitted through this path: a normal Store write, named
+    /// read, agent admission or module job cannot construct the typed request.
+    #[error(
+        "protected reserve exhausted at {bottleneck:?} for {operation:?} operation {operation_id} owner {owner} epoch {epoch:?}"
+    )]
+    ProtectedReserveExhausted {
+        /// Bottleneck whose protected partition is saturated.
+        bottleneck: CapacityBottleneck,
+        /// Control operation that was denied the reserve.
+        operation: ControlOperationClass,
+        /// Operation that was denied admission.
+        operation_id: String,
+        /// Owner that requested admission.
+        owner: String,
+        /// Front-door epoch observed at denial.
+        epoch: AuthorityEpoch,
+    },
+
+    /// The preallocated emergency last-resort slot is unavailable.
+    ///
+    /// Emitted while a protected path still remains to record the gap (contract
+    /// `EMERGENCY_SLOT_UNAVAILABLE`, issue #65). Only closed
+    /// [`EmergencyOperationClass`] operations (reserve-loss/gap record, entering
+    /// manual recovery) can observe this disposition.
+    #[error(
+        "emergency slot unavailable at {bottleneck:?} for {operation:?} operation {operation_id} owner {owner} epoch {epoch:?}"
+    )]
+    EmergencySlotUnavailable {
+        /// Bottleneck whose emergency slot is held.
+        bottleneck: CapacityBottleneck,
+        /// Emergency operation that was denied the slot.
+        operation: EmergencyOperationClass,
+        /// Operation that was denied admission.
+        operation_id: String,
+        /// Owner that requested admission.
+        owner: String,
+        /// Front-door epoch observed at denial.
+        epoch: AuthorityEpoch,
+    },
+
+    /// No control path remains: the system explicitly loses its control guarantee.
+    ///
+    /// Emitted when the emergency last-resort slot is unavailable and the
+    /// protected reserve is also exhausted, so the gap cannot be recorded through
+    /// any remaining path (A13.5, I14.3, contract `CONTROL_GUARANTEE_LOST`,
+    /// issue #65). This is an incident/manual-recovery boundary, never a
+    /// warning-only metric and never a healthy status.
+    #[error("control guarantee lost at {bottleneck:?}: {detail}")]
+    ControlGuaranteeLost {
+        /// Bottleneck at which the last-resort path was lost.
+        bottleneck: CapacityBottleneck,
+        /// Exact lost guarantee for post-recovery recording.
+        detail: String,
+    },
 
     /// An idempotency key conflicts with a prior, different request.
     #[error("idempotency key conflict")]

@@ -254,6 +254,13 @@ impl KernelStoreGateway {
             let lease = service
                 .acquire_admission()
                 .map_err(|error| error.to_string())?;
+            // Slices A+B (#65): `apply_prepared` is normal Store work
+            // (`CANONICAL_WRITE` maps to `NORMAL_WORKLOAD`). The normal lease
+            // above holds a Slice A typed normal permit from the disjoint
+            // normal partition, so this path never consumes the protected
+            // reserve. Protected cancellation / fencing / health / drain /
+            // problem / incident / recovery stays on
+            // `acquire_protected_control` / `issue_control_receipt`.
             if !lease
                 .authority_epoch()
                 .is_same_authority(&transition.state_fence.authority_epoch)
@@ -377,6 +384,9 @@ impl KernelStoreGateway {
             let lease = service
                 .acquire_admission()
                 .map_err(|error| error.to_string())?;
+            // Slices A+B (#65): genesis is normal Store work holding the
+            // typed `NORMAL_WORKLOAD` normal lease; see the `apply` path
+            // note and `lifecycle.rs:acquire_admission`.
             if lease.authority_epoch() != request.state_fence.authority_epoch {
                 return Err("genesis route authority epoch is stale".to_owned());
             }
@@ -434,6 +444,10 @@ impl KernelStoreGateway {
             let lease = service
                 .acquire_admission()
                 .map_err(|error| error.to_string())?;
+            // Slices A+B (#65): Dreamer-job Store admission rides the typed
+            // `NORMAL_WORKLOAD` normal lease; protected work stays on
+            // `acquire_protected_control`. See
+            // `lifecycle.rs:acquire_admission`.
             if lease.authority_epoch() != context.state_fence.authority_epoch {
                 return Err("dreamer job route authority epoch is stale".to_owned());
             }
