@@ -722,7 +722,7 @@ fn validate_historical_request_binding(
     Ok(())
 }
 
-fn validate_text(value: &str, field: &'static str) -> Result<(), CycleError> {
+pub(crate) fn validate_text(value: &str, field: &'static str) -> Result<(), CycleError> {
     if value.trim().is_empty()
         || value.len() > MAX_TEXT_BYTES
         || value.chars().any(char::is_control)
@@ -735,7 +735,7 @@ fn validate_text(value: &str, field: &'static str) -> Result<(), CycleError> {
     Ok(())
 }
 
-fn is_digest(value: &str) -> bool {
+pub(crate) fn is_digest(value: &str) -> bool {
     value.len() == 64
         && value
             .bytes()
@@ -750,7 +750,7 @@ fn policy_digest(value: &CyclePolicy) -> Result<String, CycleError> {
     Ok(eliot_contracts::sha256_hex(&bytes))
 }
 
-fn job_digest(value: &DreamJobInput) -> Result<String, CycleError> {
+pub(crate) fn job_digest(value: &DreamJobInput) -> Result<String, CycleError> {
     let bytes = eliot_contracts::canonical_json_bytes(value)
         .map_err(|error| CycleError::Encoding(error.to_string()))?;
     Ok(eliot_contracts::sha256_hex(&bytes))
@@ -762,4 +762,40 @@ fn state_digest(value: &DreamerCycleState) -> Result<String, CycleError> {
     let bytes = eliot_contracts::canonical_json_bytes(&value)
         .map_err(|error| CycleError::Encoding(error.to_string()))?;
     Ok(eliot_contracts::sha256_hex(&bytes))
+}
+
+/// Checks that a frozen state is bound to the exact frozen policy supplied
+/// with it. This mirrors the identity section of the one-snapshot controller
+/// transition so samples and plans cannot drift to a different policy.
+pub(crate) fn check_frozen_binding(
+    state: &DreamerCycleState,
+    policy: &CyclePolicy,
+) -> Result<(), CycleError> {
+    if state.job.state_fence != policy.state_fence {
+        return Err(CycleError::BindingMismatch {
+            field: "cycle_policy.state_fence",
+            reason: "policy fence differs from cycle job",
+        });
+    }
+    let job_deadline = state
+        .job
+        .deadline_ms
+        .map(i64::try_from)
+        .transpose()
+        .map_err(|_| CycleError::BindingMismatch {
+            field: "job.deadline_ms",
+            reason: "deadline does not fit the controller time domain",
+        })?;
+    if state.job.policy_ref != policy.policy_id.as_str()
+        || state.policy_id != policy.policy_id
+        || state.policy_revision != policy.policy_revision
+        || state.policy_digest != policy.canonical_digest
+        || job_deadline != policy.deadline_ms
+    {
+        return Err(CycleError::BindingMismatch {
+            field: "cycle_policy.identity",
+            reason: "state, job and policy identity differ",
+        });
+    }
+    Ok(())
 }

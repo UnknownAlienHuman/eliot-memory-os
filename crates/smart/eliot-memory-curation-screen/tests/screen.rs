@@ -8,7 +8,9 @@ use eliot_contracts::{
     ResourceGeneration, SourceId, StateFence, TaskRevision,
 };
 use eliot_memory_curation_contracts::*;
-use eliot_memory_curation_screen::{CurationScreenError, screen_memory_curation};
+use eliot_memory_curation_screen::{
+    CurationScreenError, assess_dimensions, screen_memory_curation,
+};
 use eliot_receipts::WorkScopeId;
 
 fn digest() -> Digest {
@@ -372,6 +374,160 @@ fn fully_observed_partial_denominator_is_partial_and_ineligible() {
             .eligibility
             .iter()
             .all(|item| item.status == EligibilityStatus::IncompleteTruncated)
+    );
+}
+
+#[test]
+fn screen_dispositions_agree_with_dimension_derivation() {
+    let mut snapshot = source(3, DenominatorCoverage::Complete);
+    snapshot.members[0]
+        .evidence
+        .provenance
+        .insert(ArtifactId::new("prov-0").expect("artifact"));
+    snapshot.members[1].evidence.provenance.clear();
+    snapshot.members[2]
+        .evidence
+        .provenance
+        .insert(ArtifactId::new("prov-2").expect("artifact"));
+    let reference = snapshot.members[2].member_id.clone();
+    snapshot.partition = MemberPartition {
+        changed_targets: [
+            snapshot.members[0].member_id.clone(),
+            snapshot.members[1].member_id.clone(),
+        ]
+        .into_iter()
+        .collect(),
+        immutable_references: [reference].into_iter().collect(),
+    };
+    let profile = profile(vec![rule(
+        "provenance_gap_v1",
+        FindingClass::ProvenanceGap,
+        1,
+    )]);
+    let request = request(&snapshot, profile);
+    let evidence = snapshot
+        .members
+        .iter()
+        .enumerate()
+        .map(|(index, member)| {
+            evidence(
+                &snapshot,
+                member.member_id.clone(),
+                &format!("evidence-{index}"),
+                ProtectionEvidenceState::CurrentVerified,
+                if index == 1 {
+                    ProtectionOutcome::Present
+                } else {
+                    ProtectionOutcome::Absent
+                },
+                false,
+            )
+        })
+        .collect::<Vec<_>>();
+    let result = screen_memory_curation(&request, &snapshot, &evidence).expect("screen");
+    assert!(result.validate().is_ok());
+    for member in &result.coverage.members {
+        let assessment = result
+            .protection
+            .iter()
+            .find(|item| item.member_id == member.member_id)
+            .expect("protection assessment");
+        let dimensions = assess_dimensions(
+            &member.member_id,
+            assessment,
+            &result.findings,
+            request
+                .partition
+                .immutable_references
+                .contains(&member.member_id),
+            true,
+            true,
+        )
+        .expect("dimension assessment");
+        assert_eq!(
+            dimensions.derive_disposition().expect("derive"),
+            member.disposition,
+            "emitted disposition must equal the dimension derivation"
+        );
+    }
+    let eligible = result
+        .coverage
+        .members
+        .iter()
+        .find(|item| item.disposition == MemberDisposition::Eligible)
+        .expect("eligible member");
+    let eligible_dimensions = assess_dimensions(
+        &eligible.member_id,
+        result
+            .protection
+            .iter()
+            .find(|item| item.member_id == eligible.member_id)
+            .expect("protection assessment"),
+        &result.findings,
+        false,
+        true,
+        true,
+    )
+    .expect("dimension assessment");
+    assert!(
+        eligible_dimensions
+            .verdicts
+            .iter()
+            .all(|verdict| verdict.outcome == DimensionOutcome::Clear)
+    );
+}
+
+#[test]
+fn provenance_gap_taints_only_the_support_dimension() {
+    let snapshot = source(1, DenominatorCoverage::Complete);
+    let request = request(
+        &snapshot,
+        profile(vec![rule(
+            "provenance_gap_v1",
+            FindingClass::ProvenanceGap,
+            1,
+        )]),
+    );
+    let evidence = vec![evidence(
+        &snapshot,
+        snapshot.members[0].member_id.clone(),
+        "evidence-0",
+        ProtectionEvidenceState::CurrentVerified,
+        ProtectionOutcome::Absent,
+        false,
+    )];
+    let result = screen_memory_curation(&request, &snapshot, &evidence).expect("screen");
+    assert_eq!(result.findings.len(), 1);
+    assert_eq!(
+        result.coverage.members[0].disposition,
+        MemberDisposition::Blocked
+    );
+    let assessment = result.protection.first().expect("protection assessment");
+    let dimensions = assess_dimensions(
+        &snapshot.members[0].member_id,
+        assessment,
+        &result.findings,
+        false,
+        true,
+        true,
+    )
+    .expect("dimension assessment");
+    for verdict in &dimensions.verdicts {
+        if verdict.dimension == CurationDimension::Support {
+            assert_eq!(verdict.outcome, DimensionOutcome::Flagged);
+            assert_eq!(verdict.finding_ids.len(), 1);
+        } else {
+            assert_eq!(
+                verdict.outcome,
+                DimensionOutcome::Clear,
+                "finding must not leak into {dimension:?}",
+                dimension = verdict.dimension
+            );
+        }
+    }
+    assert_eq!(
+        dimensions.derive_disposition().expect("derive"),
+        MemberDisposition::Blocked
     );
 }
 

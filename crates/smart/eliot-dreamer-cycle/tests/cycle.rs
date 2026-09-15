@@ -13,9 +13,10 @@ use eliot_dreamer_contracts::{
     TargetDenominator, TypedCurationHandlerRequest, TypedCurationHandlerResult, ValidationReceipt,
 };
 use eliot_dreamer_cycle::{
-    CyclePhase, CyclePolicy, DreamerCycleState, ExpectedArtifact, ObservedOutcome,
-    OutcomeDisposition, PendingRequest, PhasePolicyRule, RequestKind, StepDisposition,
-    step_dreamer_cycle, step_dreamer_cycle_at,
+    CycleError, CyclePhase, CyclePolicy, DreamerCycleState, ExpectedArtifact, ExperimentKind,
+    ObservedOutcome, OutcomeDisposition, PendingRequest, PhasePolicyRule, PlanHorizon, RequestKind,
+    SampleLimits, StepDisposition, plan_cycle, sample_cycle, step_dreamer_cycle,
+    step_dreamer_cycle_at,
 };
 use eliot_receipts::{
     AuthorityBinding, CausalBinding, EffectClass, OperationBinding, ProofCeiling, ReceiptCore,
@@ -1082,4 +1083,110 @@ fn rejected_common_validation_blocks_without_advancing() {
     assert_eq!(step.next_state.pending[0].request_id, request.request_id);
     assert_eq!(step.next_state.outcomes.len(), 1);
     assert!(step.requests.is_empty());
+}
+
+#[test]
+fn cycle_sample_carries_explicit_denominator_and_omissions() {
+    let fence = fence();
+    let policy = policy(&fence, "op-kind");
+    let first = pending(&policy);
+    let mut state = state(&policy, first);
+    for tag in ["b", "c"] {
+        let mut extra = pending(&policy);
+        set_phase_identity(&mut extra, tag);
+        state.pending.push(extra);
+    }
+    state.seal().unwrap();
+    let partial = sample_cycle(&state, &policy, &SampleLimits { max_sampled: 2 }).unwrap();
+    assert_eq!(partial.denominator.pending_total, 3);
+    assert_eq!(partial.sampled_pending.len(), 2);
+    assert_eq!(partial.omitted_pending.len(), 1);
+    assert!(!partial.complete);
+    assert!(partial.validate(&state, &policy).is_ok());
+    let full = sample_cycle(&state, &policy, &SampleLimits { max_sampled: 8 }).unwrap();
+    assert!(full.complete);
+    assert!(full.omitted_pending.is_empty());
+    assert!(full.validate(&state, &policy).is_ok());
+    let mut tampered = full;
+    tampered.complete = false;
+    assert!(tampered.validate(&state, &policy).is_err());
+}
+
+#[test]
+fn cycle_plan_covers_exactly_one_adjacent_phase_with_one_experiment_per_target() {
+    let fence = fence();
+    let policy = policy(&fence, "op-kind");
+    let request = pending(&policy);
+    let state = state(&policy, request);
+    let sample = sample_cycle(&state, &policy, &SampleLimits { max_sampled: 8 }).unwrap();
+    let plan = plan_cycle(&sample, &state, &policy, None).unwrap();
+    assert_eq!(plan.from_phase, CyclePhase::Validated);
+    assert_eq!(plan.to_phase, CyclePhase::BundleValidated);
+    assert_eq!(plan.horizon, PlanHorizon::OneCycle);
+    assert_eq!(plan.experiments.len(), 1);
+    assert_eq!(plan.experiments[0].kind, ExperimentKind::ClarificationProbe);
+    assert_eq!(plan.requests.len(), 1);
+    assert!(plan.validate(&sample, &state, &policy).is_ok());
+    let mut duplicated = plan.clone();
+    duplicated
+        .experiments
+        .push(duplicated.experiments[0].clone());
+    duplicated.plan_digest = duplicated.computed_digest().unwrap();
+    assert!(duplicated.validate(&sample, &state, &policy).is_err());
+    let mut stretched = plan.clone();
+    stretched.to_phase = CyclePhase::Screened;
+    stretched.plan_digest = stretched.computed_digest().unwrap();
+    assert!(stretched.validate(&sample, &state, &policy).is_err());
+    let encoded = String::from_utf8(canonical_json_bytes(&plan).unwrap()).unwrap();
+    for forbidden in [
+        "DurableJob",
+        "WakeIntent",
+        "RuntimeLease",
+        "schedule",
+        "Researcher",
+        "Storage",
+        "self-enqueue",
+        "route_reservation",
+    ] {
+        assert!(!encoded.contains(forbidden), "forbidden field {forbidden}");
+    }
+}
+
+#[test]
+fn cycle_plan_rejects_terminal_phase_and_reconciles_observed_targets() {
+    let fence = fence();
+    let policy = policy(&fence, "op-kind");
+    let request = pending(&policy);
+    let mut terminal = state(&policy, request);
+    terminal.phase = CyclePhase::ClosureObserved;
+    terminal.seal().unwrap();
+    let sample = sample_cycle(&terminal, &policy, &SampleLimits { max_sampled: 8 }).unwrap();
+    assert!(matches!(
+        plan_cycle(&sample, &terminal, &policy, None),
+        Err(CycleError::PhaseViolation(_))
+    ));
+    let request = pending(&policy);
+    let mut observed_state = state(&policy, request.clone());
+    let accepted = outcome(
+        &request,
+        receipt(
+            &request,
+            ReceiptDisposition::Success {
+                proof: ProofCeiling::Observation,
+            },
+            None,
+        ),
+        OutcomeDisposition::Accepted,
+        false,
+    );
+    observed_state.outcomes.push(accepted);
+    observed_state.seal().unwrap();
+    let sample = sample_cycle(&observed_state, &policy, &SampleLimits { max_sampled: 8 }).unwrap();
+    let plan = plan_cycle(&sample, &observed_state, &policy, None).unwrap();
+    assert_eq!(plan.experiments.len(), 1);
+    assert_eq!(
+        plan.experiments[0].kind,
+        ExperimentKind::ReconciliationProbe
+    );
+    assert!(plan.validate(&sample, &observed_state, &policy).is_ok());
 }
