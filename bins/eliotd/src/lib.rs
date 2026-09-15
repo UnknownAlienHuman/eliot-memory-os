@@ -38,6 +38,7 @@ mod controlboard_adapters;
 mod daemon_config;
 mod daemon_kernel_client;
 mod daemon_kernel_port_adapters;
+mod governor_local_read;
 mod kernel_authority_client;
 mod kernel_context_read_client;
 mod kernel_recovery_client;
@@ -67,6 +68,7 @@ pub(crate) use daemon_kernel_client::{
 };
 pub(crate) use daemon_kernel_port_adapters::kind_value;
 pub(crate) use kernel_authority_client::KernelAuthorityClient;
+pub use governor_local_read::{answer_evidence_query, answer_projection_inputs};
 pub use kernel_context_read_client::KernelContextReadClient;
 pub use store_failure_projection::{GovernorStoreFailureProjection, GovernorStoreProjectionError};
 
