@@ -1656,7 +1656,11 @@ impl RedbRecoveryStore {
     /// The transition table owns the anti-blind-retry fence: `Unknown` may
     /// only become `Reconciling`, neither `Unknown` nor `Reconciling` returns
     /// to `Requested`, and `Terminal` is absorbing. An exact repeat of an
-    /// applied advance returns the durable record unchanged. An unknown
+    /// applied advance returns the durable record unchanged: a same-state
+    /// repeat carrying the bound admission evidence is accepted, and a
+    /// same-state repeat carrying no evidence re-observes the durable row
+    /// without touching the bound admission. Conflicting evidence fails
+    /// without overwriting. An unknown
     /// attempt returns `Ok(None)`; this method never invents a record.
     /// Admission evidence binds the admission digest on
     /// `Requested -> Admitted` and `Requested -> Cancelled`, is accepted
@@ -1699,6 +1703,12 @@ impl RedbRecoveryStore {
                     evidence.validate().map_err(map_ors_to_doctor)?;
                     evidence.admission_digest == *digest && evidence.admitted_at_unix_nanos == at
                 }
+                // A same-state re-observation that presents no evidence
+                // changes nothing: the bound admission is returned
+                // unchanged, so an at-least-once retry of an applied
+                // non-admission advance stays idempotent. Conflicting
+                // evidence below still fails without overwriting.
+                (Some(..), Some(..), None) => true,
                 (None, None, None) => true,
                 _ => false,
             };

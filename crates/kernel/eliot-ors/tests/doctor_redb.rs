@@ -305,3 +305,352 @@ fn doctor_redb_ledger_is_durable_across_restart() -> Result<(), Box<dyn std::err
     let _ = std::fs::remove_file(&path);
     Ok(())
 }
+
+#[test]
+fn doctor_redb_ledger_rejects_guards_and_stays_idempotent() -> Result<(), Box<dyn std::error::Error>>
+{
+    let path = temp_path();
+    let _ = std::fs::remove_file(&path);
+    let store = RedbRecoveryStore::open(&path)?;
+
+    // Unknown identities invent nothing.
+    let missing_attempt = label(&digest('8'))?;
+    assert!(
+        DoctorRecoveryLedger::load_doctor_attempt(&store, &missing_attempt)?.is_none(),
+        "missing attempt must load as none"
+    );
+    assert!(
+        DoctorRecoveryLedger::advance_doctor_attempt(
+            &store,
+            &missing_attempt,
+            DoctorAttemptState::Admitted,
+            None,
+        )?
+        .is_none(),
+        "missing attempt must advance as none"
+    );
+    let missing_effect = label(&digest('9'))?;
+    assert!(
+        DoctorRecoveryLedger::load_doctor_effect(&store, &missing_effect)?.is_none(),
+        "missing effect must load as none"
+    );
+    let some_report = DoctorEffectOutcomeReport {
+        outcome_digest: Some(digest('0')),
+        adapter_receipt_digest: None,
+        unknown: false,
+    };
+    assert!(
+        DoctorRecoveryLedger::record_doctor_effect_outcome(&store, &missing_effect, &some_report)?
+            .is_none(),
+        "missing effect must record as none"
+    );
+    assert!(
+        DoctorRecoveryLedger::load_doctor_budget(&store, &label(&digest('7'))?)?.is_none(),
+        "missing budget must load as none"
+    );
+
+    // Staging validates shape before persisting.
+    let mut unstaged_state = staged_attempt('0')?;
+    unstaged_state.state = DoctorAttemptState::Admitted;
+    assert!(
+        DoctorRecoveryLedger::stage_doctor_attempt(&store, &unstaged_state).is_err(),
+        "non-requested staging must fail"
+    );
+    let mut unstaged_effect = staged_effect('1', 'd')?;
+    unstaged_effect.state = DoctorEffectState::Reported;
+    assert!(
+        DoctorRecoveryLedger::stage_doctor_effect(&store, &unstaged_effect).is_err(),
+        "non-intended staging must fail"
+    );
+
+    // Guarded attempt D: evidence and transition rules fail closed.
+    let staged_d = staged_attempt('d')?;
+    match DoctorRecoveryLedger::stage_doctor_attempt(&store, &staged_d)? {
+        DoctorAttemptStageOutcome::Stored(_) => {}
+        DoctorAttemptStageOutcome::Existing(_) => assert!(false, "attempt D must store first"),
+    }
+    let admission_d = DoctorAttemptAdmission {
+        admission_digest: "d4".repeat(32),
+        admitted_at_unix_nanos: ADMITTED_AT_B,
+    };
+    assert!(
+        DoctorRecoveryLedger::advance_doctor_attempt(
+            &store,
+            &staged_d.attempt_digest,
+            DoctorAttemptState::Admitted,
+            None,
+        )
+        .is_err(),
+        "admission without evidence must fail"
+    );
+    assert!(
+        DoctorRecoveryLedger::advance_doctor_attempt(
+            &store,
+            &staged_d.attempt_digest,
+            DoctorAttemptState::Terminal,
+            None,
+        )
+        .is_err(),
+        "requested to terminal must fail"
+    );
+    assert!(
+        DoctorRecoveryLedger::advance_doctor_attempt(
+            &store,
+            &staged_d.attempt_digest,
+            DoctorAttemptState::Expired,
+            Some(&admission_d),
+        )
+        .is_err(),
+        "expiry with evidence must fail"
+    );
+    let admitted_d = DoctorRecoveryLedger::advance_doctor_attempt(
+        &store,
+        &staged_d.attempt_digest,
+        DoctorAttemptState::Admitted,
+        Some(&admission_d),
+    )?
+    .ok_or("attempt D admission disappeared")?;
+    assert_eq!(admitted_d.state, DoctorAttemptState::Admitted);
+    assert!(
+        DoctorRecoveryLedger::advance_doctor_attempt(
+            &store,
+            &staged_d.attempt_digest,
+            DoctorAttemptState::EffectIntended,
+            Some(&admission_d),
+        )
+        .is_err(),
+        "evidence on a non-admission advance must fail"
+    );
+
+    // Same-state re-observation without evidence stays idempotent and
+    // never touches the bound admission.
+    let reobserved = DoctorRecoveryLedger::advance_doctor_attempt(
+        &store,
+        &staged_d.attempt_digest,
+        DoctorAttemptState::Admitted,
+        None,
+    )?
+    .ok_or("idempotent re-observation disappeared")?;
+    assert_eq!(reobserved, admitted_d);
+
+    // Conflicting admission evidence fails and never overwrites.
+    let conflicting_admission = DoctorAttemptAdmission {
+        admission_digest: "d5".repeat(32),
+        admitted_at_unix_nanos: ADMITTED_AT_B,
+    };
+    match DoctorRecoveryLedger::advance_doctor_attempt(
+        &store,
+        &staged_d.attempt_digest,
+        DoctorAttemptState::Admitted,
+        Some(&conflicting_admission),
+    ) {
+        Err(DoctorLedgerError::AttemptIdentityConflict { .. }) => {}
+        Ok(_) => assert!(false, "conflicting admission must fail"),
+        Err(_) => assert!(false, "wrong admission error"),
+    }
+    let durable_d = DoctorRecoveryLedger::load_doctor_attempt(&store, &staged_d.attempt_digest)?
+        .ok_or("attempt D lost after admission conflict")?;
+    assert_eq!(durable_d, admitted_d);
+
+    // Forward progress with evidence-free retries stays idempotent.
+    let intended_d = DoctorRecoveryLedger::advance_doctor_attempt(
+        &store,
+        &staged_d.attempt_digest,
+        DoctorAttemptState::EffectIntended,
+        None,
+    )?
+    .ok_or("effect-intended disappeared")?;
+    let intended_replay = DoctorRecoveryLedger::advance_doctor_attempt(
+        &store,
+        &staged_d.attempt_digest,
+        DoctorAttemptState::EffectIntended,
+        None,
+    )?
+    .ok_or("effect-intended replay disappeared")?;
+    assert_eq!(intended_replay, intended_d);
+
+    // Effect unknown flow reconciles under its original identity.
+    let effect_e = staged_effect('e', 'd')?;
+    match DoctorRecoveryLedger::stage_doctor_effect(&store, &effect_e)? {
+        DoctorEffectStageOutcome::Stored(_) => {}
+        DoctorEffectStageOutcome::Existing(_) => assert!(false, "effect E must store first"),
+    }
+    let unknown_report = DoctorEffectOutcomeReport {
+        outcome_digest: None,
+        adapter_receipt_digest: None,
+        unknown: true,
+    };
+    let unknown_e = DoctorRecoveryLedger::record_doctor_effect_outcome(
+        &store,
+        &effect_e.effect_digest,
+        &unknown_report,
+    )?
+    .ok_or("unknown effect disappeared")?;
+    assert_eq!(unknown_e.state, DoctorEffectState::Unknown);
+    assert_eq!(
+        unknown_e.reconciliation_key.as_deref(),
+        Some(effect_e.effect_digest.as_str())
+    );
+    assert_eq!(unknown_e.commit_order, 0);
+    let known_report = DoctorEffectOutcomeReport {
+        outcome_digest: Some("0e".repeat(32)),
+        adapter_receipt_digest: Some("e0".repeat(32)),
+        unknown: false,
+    };
+    let reported_e = DoctorRecoveryLedger::record_doctor_effect_outcome(
+        &store,
+        &effect_e.effect_digest,
+        &known_report,
+    )?
+    .ok_or("reconciled effect disappeared")?;
+    assert_eq!(reported_e.state, DoctorEffectState::Reported);
+    assert_eq!(
+        reported_e.outcome_digest.as_deref(),
+        Some("0e".repeat(32).as_str())
+    );
+    assert_eq!(reported_e.reconciliation_key, None);
+    assert!(reported_e.commit_order != 0);
+    let reported_replay = DoctorRecoveryLedger::record_doctor_effect_outcome(
+        &store,
+        &effect_e.effect_digest,
+        &known_report,
+    )?
+    .ok_or("reported replay disappeared")?;
+    assert_eq!(reported_replay, reported_e);
+    // Same outcome with a different receipt re-observes the durable row.
+    let receipt_variant = DoctorEffectOutcomeReport {
+        outcome_digest: Some("0e".repeat(32)),
+        adapter_receipt_digest: Some("e1".repeat(32)),
+        unknown: false,
+    };
+    let reported_variant = DoctorRecoveryLedger::record_doctor_effect_outcome(
+        &store,
+        &effect_e.effect_digest,
+        &receipt_variant,
+    )?
+    .ok_or("receipt variant disappeared")?;
+    assert_eq!(reported_variant, reported_e);
+    // Unknown or divergent reports on a reported effect conflict.
+    match DoctorRecoveryLedger::record_doctor_effect_outcome(
+        &store,
+        &effect_e.effect_digest,
+        &unknown_report,
+    ) {
+        Err(DoctorLedgerError::EffectIdentityConflict { .. }) => {}
+        Ok(_) => assert!(false, "unknown on reported must conflict"),
+        Err(_) => assert!(false, "wrong reported error"),
+    }
+    let divergent_report = DoctorEffectOutcomeReport {
+        outcome_digest: Some("0f".repeat(32)),
+        adapter_receipt_digest: None,
+        unknown: false,
+    };
+    match DoctorRecoveryLedger::record_doctor_effect_outcome(
+        &store,
+        &effect_e.effect_digest,
+        &divergent_report,
+    ) {
+        Err(DoctorLedgerError::EffectIdentityConflict { .. }) => {}
+        Ok(_) => assert!(false, "divergent outcome must conflict"),
+        Err(_) => assert!(false, "wrong divergent error"),
+    }
+    let durable_e = DoctorRecoveryLedger::load_doctor_effect(&store, &effect_e.effect_digest)?
+        .ok_or("effect E lost after outcome conflicts")?;
+    assert_eq!(durable_e, reported_e);
+
+    // Cancelled attempts bind admission, then close with a commit order.
+    let mut staged_c = staged_attempt('c')?;
+    staged_c.cancelled = true;
+    match DoctorRecoveryLedger::stage_doctor_attempt(&store, &staged_c)? {
+        DoctorAttemptStageOutcome::Stored(_) => {}
+        DoctorAttemptStageOutcome::Existing(_) => assert!(false, "attempt C must store first"),
+    }
+    let admission_c = DoctorAttemptAdmission {
+        admission_digest: "c4".repeat(32),
+        admitted_at_unix_nanos: ADMITTED_AT,
+    };
+    let cancelled_c = DoctorRecoveryLedger::advance_doctor_attempt(
+        &store,
+        &staged_c.attempt_digest,
+        DoctorAttemptState::Cancelled,
+        Some(&admission_c),
+    )?
+    .ok_or("cancellation disappeared")?;
+    assert_eq!(cancelled_c.state, DoctorAttemptState::Cancelled);
+    assert!(cancelled_c.commit_order != 0);
+    let terminal_c = DoctorRecoveryLedger::advance_doctor_attempt(
+        &store,
+        &staged_c.attempt_digest,
+        DoctorAttemptState::Terminal,
+        None,
+    )?
+    .ok_or("cancelled terminal disappeared")?;
+    assert_eq!(terminal_c.state, DoctorAttemptState::Terminal);
+    assert_eq!(terminal_c.commit_order, cancelled_c.commit_order);
+    let terminal_replay = DoctorRecoveryLedger::advance_doctor_attempt(
+        &store,
+        &staged_c.attempt_digest,
+        DoctorAttemptState::Terminal,
+        None,
+    )?
+    .ok_or("terminal replay disappeared")?;
+    assert_eq!(terminal_replay, terminal_c);
+
+    // Expired attempts close without admission and keep their order. The
+    // base validator (doctor.rs admission coherence) requires every
+    // post-expiry state to carry the immutable admission, so the
+    // Expired -> Terminal advance fails closed instead of inventing
+    // evidence; the Expired row itself is the durable close.
+    let staged_f = staged_attempt('f')?;
+    match DoctorRecoveryLedger::stage_doctor_attempt(&store, &staged_f)? {
+        DoctorAttemptStageOutcome::Stored(_) => {}
+        DoctorAttemptStageOutcome::Existing(_) => assert!(false, "attempt F must store first"),
+    }
+    let expired_f = DoctorRecoveryLedger::advance_doctor_attempt(
+        &store,
+        &staged_f.attempt_digest,
+        DoctorAttemptState::Expired,
+        None,
+    )?
+    .ok_or("expiry disappeared")?;
+    assert_eq!(expired_f.state, DoctorAttemptState::Expired);
+    assert!(expired_f.commit_order != 0);
+    assert!(
+        DoctorRecoveryLedger::advance_doctor_attempt(
+            &store,
+            &staged_f.attempt_digest,
+            DoctorAttemptState::Terminal,
+            None,
+        )
+        .is_err(),
+        "expired close carries no admission to bind"
+    );
+    let durable_f = DoctorRecoveryLedger::load_doctor_attempt(&store, &staged_f.attempt_digest)?
+        .ok_or("expired attempt lost after terminal refusal")?;
+    assert_eq!(durable_f, expired_f);
+
+    // Budgets replace by scope key and validate shape before persisting.
+    let scope = label(&digest('6'))?;
+    let mut budget = DoctorBudgetLedger::pristine(scope.clone());
+    budget.note_admission(ADMITTED_AT)?;
+    DoctorRecoveryLedger::store_doctor_budget(&store, &budget)?;
+    let mut updated = budget.clone();
+    updated.note_admission(ADMITTED_AT_B)?;
+    DoctorRecoveryLedger::store_doctor_budget(&store, &updated)?;
+    let loaded = DoctorRecoveryLedger::load_doctor_budget(&store, &scope)?
+        .ok_or("replaced budget disappeared")?;
+    assert_eq!(loaded, updated);
+    let mut invalid = updated.clone();
+    invalid.contract_version = 999;
+    assert!(
+        DoctorRecoveryLedger::store_doctor_budget(&store, &invalid).is_err(),
+        "invalid budget must fail"
+    );
+    let durable_budget = DoctorRecoveryLedger::load_doctor_budget(&store, &scope)?
+        .ok_or("budget lost after invalid store")?;
+    assert_eq!(durable_budget, updated);
+
+    drop(store);
+    let _ = std::fs::remove_file(&path);
+    Ok(())
+}
