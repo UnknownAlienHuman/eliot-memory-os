@@ -1141,3 +1141,563 @@ fn changed_role_required_protected_state_fails() {
         Err(AssemblyError::Contract(ContextError::DenominatorMismatch))
     );
 }
+
+// WORK_UNIT_CASE: 626/13
+#[test]
+fn splitting_merging_whole_atoms_fails() {
+    let mut value = admitted();
+    value.records[0].candidate.representation = AtomRepresentation::Extractive {
+        content: "whole goal matériél".to_owned(),
+        manifest: vec!["field".to_owned()],
+    };
+    let context = value.binding.clone();
+    let result = assemble_active_view(
+        &value,
+        &recipe(&context),
+        quality(&context),
+        &policy(100_000),
+        |_bytes| panic!("split representation must fail before measurement"),
+    );
+    assert_eq!(
+        result,
+        Err(AssemblyError::Contract(ContextError::WholeUnitRequired))
+    );
+
+    let mut merged = admitted();
+    merged.records[0].candidate.representation = AtomRepresentation::Summary {
+        content: "merged summary".to_owned(),
+        source_digest: digest(),
+    };
+    let merged_context = merged.binding.clone();
+    let result = assemble_active_view(
+        &merged,
+        &recipe(&merged_context),
+        quality(&merged_context),
+        &policy(100_000),
+        |_bytes| panic!("merged summary must fail before measurement"),
+    );
+    assert_eq!(
+        result,
+        Err(AssemblyError::Contract(ContextError::WholeUnitRequired))
+    );
+}
+
+// WORK_UNIT_CASE: 626/14
+#[test]
+fn provider_store_never_invoked_projection_is_pure() {
+    let value = admitted();
+    let context = value.binding.clone();
+    let before = value.clone();
+    let mut calls = 0;
+    let first = assemble_active_view(
+        &value,
+        &recipe(&context),
+        quality(&context),
+        &policy(100_000),
+        |bytes| {
+            calls += 1;
+            Ok(measurement(&context, bytes))
+        },
+    )
+    .expect("pure projection");
+    assert_eq!(calls, 1);
+    assert_eq!(value, before, "admitted inputs stay immutable");
+    let mut replay_calls = 0;
+    let second = assemble_active_view(
+        &value,
+        &recipe(&context),
+        quality(&context),
+        &policy(100_000),
+        |bytes| {
+            replay_calls += 1;
+            Ok(measurement(&context, bytes))
+        },
+    )
+    .expect("replay projection");
+    assert_eq!(replay_calls, 1);
+    assert_eq!(first.serialized_bytes, second.serialized_bytes);
+    assert_eq!(first.view.output_digest, second.view.output_digest);
+}
+
+// WORK_UNIT_CASE: 626/15
+#[test]
+fn no_ranking_compression_summary_implementation() {
+    let value = admitted_two();
+    let context = value.binding.clone();
+    let view = assemble_active_view(
+        &value,
+        &recipe(&context),
+        quality(&context),
+        &policy(100_000),
+        |bytes| Ok(measurement(&context, bytes)),
+    )
+    .expect("exact projection");
+    for record in &value.records {
+        let rendered = view
+            .view
+            .rendered
+            .iter()
+            .find(|atom| atom.atom_id == record.candidate.atom_id)
+            .expect("every admitted atom rendered once");
+        assert_eq!(
+            rendered.representation, record.candidate.representation,
+            "no compression or summary rewrite"
+        );
+        assert!(
+            matches!(
+                rendered.representation,
+                AtomRepresentation::Whole { .. }
+            ),
+            "only whole units pass a NonDroppable route"
+        );
+    }
+
+    let mut summarized = admitted();
+    summarized.records[0].candidate.representation = AtomRepresentation::Summary {
+        content: "lossy".to_owned(),
+        source_digest: digest(),
+    };
+    let summarized_context = summarized.binding.clone();
+    let result = assemble_active_view(
+        &summarized,
+        &recipe(&summarized_context),
+        quality(&summarized_context),
+        &policy(100_000),
+        |_bytes| panic!("summary must not rank as a substitute"),
+    );
+    assert_eq!(
+        result,
+        Err(AssemblyError::Contract(ContextError::WholeUnitRequired))
+    );
+}
+
+// WORK_UNIT_CASE: 626/16
+#[test]
+fn normative_layout_and_stable_tiebreak_enforced() {
+    let first = admitted_two();
+    let context = first.binding.clone();
+    let left = assemble_active_view(
+        &first,
+        &recipe(&context),
+        quality(&context),
+        &policy(100_000),
+        |bytes| Ok(measurement(&context, bytes)),
+    )
+    .expect("ordered projection");
+    assert_eq!(left.view.rendered.len(), 2);
+    assert!(
+        left.view.rendered[0].atom_id < left.view.rendered[1].atom_id,
+        "same role/provider tie-breaks on atom identity"
+    );
+
+    let mut reversed = admitted_two();
+    reversed.records.reverse();
+    reversed.admissions.reverse();
+    reversed.economy.measurement.digest = reversed
+        .canonical_payload_digest()
+        .expect("reversed digest");
+    refresh_economy_receipt(&mut reversed);
+    let right = assemble_active_view(
+        &reversed,
+        &recipe(&context),
+        quality(&context),
+        &policy(100_000),
+        |bytes| Ok(measurement(&context, bytes)),
+    )
+    .expect("reversed projection");
+    assert_eq!(left.view.rendered, right.view.rendered);
+    assert_eq!(left.serialized_bytes, right.serialized_bytes);
+
+    let (multi, multi_recipe) = admitted_multi_role();
+    let multi_context = multi.binding.clone();
+    let ordered = assemble_active_view(
+        &multi,
+        &multi_recipe,
+        quality(&multi_context),
+        &policy(100_000),
+        |bytes| Ok(measurement(&multi_context, bytes)),
+    )
+    .expect("multi-role layout");
+    assert_eq!(ordered.view.rendered[0].role, SemanticRole::Goal);
+    assert_eq!(ordered.view.rendered[1].role, SemanticRole::Source);
+}
+
+fn binding_with_revision() -> ContextBinding {
+    let mut revised = binding();
+    revised.state_fence.task_revision =
+        Some(eliot_contracts::TaskRevision::new(1).expect("revision"));
+    revised
+}
+
+fn decision_for(context: &ContextBinding) -> DecisionRevision {
+    DecisionRevision {
+        decision_id: context.decision_id.clone(),
+        recipe_revision: eliot_contracts::TaskRevision::new(1).expect("revision"),
+        policy_sha256: digest(),
+    }
+}
+
+fn admitted_with_omission() -> (AdmittedContextSet, ContextRecipe) {
+    let context = binding_with_revision();
+    let candidate = candidate(&binding());
+    let mut owned = candidate;
+    owned.binding = context.clone();
+    let atom_id = owned.atom_id.clone();
+    let provider = role();
+    let floor = DecisionSafetyFloor {
+        binding: context.clone(),
+        mandatory_atoms: vec![atom_id.clone()],
+        mandatory_roles: vec![SemanticRole::Goal],
+        providers: ProviderRoleDenominator {
+            requested: vec![provider.clone()],
+            dispositions: vec![ProviderDisposition {
+                slot: provider.clone(),
+                state: AtomAvailability::PresentCurrent,
+                evidence: None,
+            }],
+        },
+        members: vec![SafetyFloorMember {
+            atom_id: atom_id.clone(),
+            role: SemanticRole::Goal,
+            availability: AtomAvailability::PresentCurrent,
+            measurement: Some(owned.measurement.clone()),
+            required_dependencies: Vec::new(),
+        }],
+        interpretation_dependencies: Vec::new(),
+        rule_evidence: id("floor-rule"),
+        capacity: CapacityLimits {
+            route_capacity: 100_000,
+            fixed_overhead: 2,
+            output_reserve: 3,
+            review_reserve: 4,
+        },
+    };
+    let omission = OmissionRecord {
+        atom_id: id("displaced-atom"),
+        source_id: id("displaced-source"),
+        provider_role: provider,
+        decision: decision_for(&context),
+        task_revision: eliot_contracts::TaskRevision::new(1).expect("revision"),
+        reason: OmissionReason::Capacity,
+        competing_constraint: "route capacity".to_owned(),
+        measured_cost: Some(4),
+        allowed_representation: LossPolicy::NonDroppable,
+        expansion: None,
+        non_recoverable_reason: Some(NonRecoverableReason::SourceUnavailable),
+        authorization_requirement: "decision owner".to_owned(),
+        privacy_requirement: "restricted".to_owned(),
+        proof_requirement: "observation".to_owned(),
+        expires: None,
+        invalidation: None,
+        digest: digest(),
+    };
+    let mut value = AdmittedContextSet {
+        binding: context.clone(),
+        records: vec![AdmittedAtom {
+            candidate: owned,
+            disposition: AdmissionDisposition::Include,
+            rule_evidence: id("admission-rule"),
+        }],
+        admissions: vec![AdmissionRecord {
+            atom_id: atom_id.clone(),
+            provider_role: role(),
+            disposition: AdmissionDisposition::Include,
+            rule_evidence: id("admission-rule"),
+        }],
+        floor,
+        economy: ContextEconomyReceipt {
+            binding: context.clone(),
+            decision_id: context.decision_id.clone(),
+            measurement: MeasurementRef {
+                digest: digest(),
+                serializer: "fixture-serde-v1".to_owned(),
+            },
+            requested: vec![atom_id.clone(), id("displaced-atom")],
+            admitted: vec![atom_id],
+            displaced: vec![id("displaced-atom")],
+            omissions: vec![omission],
+            applied_rule: id("economy-rule"),
+            allocations: EconomyAllocations {
+                fixed_overhead: 2,
+                output_reserve: 3,
+                review_reserve: 4,
+                admitted_required: 0,
+                admitted_optional: 0,
+                remaining_headroom: 100_000 - 9,
+                route_capacity: 100_000,
+            },
+            recipe_digest: digest(),
+            receipt_digest: digest(),
+        },
+    };
+    let recipe = recipe(&context);
+    refinalize(&mut value, &recipe.recipe_sha256.clone());
+    (value, recipe)
+}
+
+// WORK_UNIT_CASE: 626/17
+#[test]
+fn omission_expansion_records_are_retained() {
+    let (value, recipe) = admitted_with_omission();
+    let context = value.binding.clone();
+    let view = assemble_active_view(
+        &value,
+        &recipe,
+        quality(&context),
+        &policy_for(&context, 100_000),
+        |bytes| Ok(measurement(&context, bytes)),
+    )
+    .expect("omission-preserving projection");
+    assert_eq!(view.view.rendered.len(), 1);
+    assert_eq!(
+        view.view.selection.omission_evidence,
+        vec![id("displaced-atom")]
+    );
+    assert_eq!(value.economy.omissions.len(), 1);
+    assert_eq!(
+        value.economy.omissions[0].reason,
+        OmissionReason::Capacity
+    );
+    view.view
+        .validate_against(&value)
+        .expect("omission evidence conserved");
+}
+
+// WORK_UNIT_CASE: 626/18
+#[test]
+fn missing_changed_crosstask_expansion_handle_fails() {
+    let (mut value, omission_recipe) = admitted_with_omission();
+    let context = value.binding.clone();
+    let handle = ExpansionHandle {
+        handle_id: id("handle-displaced"),
+        atom_id: id("displaced-atom"),
+        source_id: id("displaced-source"),
+        source_revision: "revision-displaced".to_owned(),
+        context: context.clone(),
+        decision: decision_for(&context),
+        policy: LossPolicy::NonDroppable,
+        provider_role: role(),
+        handle_digest: digest(),
+        expires: None,
+        invalidation: None,
+    };
+    value.economy.omissions[0].expansion = Some(handle);
+    value.economy.omissions[0].non_recoverable_reason = None;
+    refinalize(&mut value, &omission_recipe.recipe_sha256.clone());
+    value
+        .validate()
+        .expect("bound expansion handle validates");
+
+    let mut wrong_atom = value.clone();
+    wrong_atom.economy.omissions[0]
+        .expansion
+        .as_mut()
+        .expect("expansion")
+        .atom_id = id("other-atom");
+    refresh_economy_receipt(&mut wrong_atom);
+    let wrong_context = wrong_atom.binding.clone();
+    let result = assemble_active_view(
+        &wrong_atom,
+        &recipe(&wrong_context),
+        quality(&wrong_context),
+        &policy_for(&wrong_context, 100_000),
+        |_bytes| panic!("changed handle must fail before measurement"),
+    );
+    assert_eq!(
+        result,
+        Err(AssemblyError::Contract(ContextError::OmissionHandleInvalid))
+    );
+
+    let mut cross_task = value.clone();
+    cross_task.economy.omissions[0]
+        .expansion
+        .as_mut()
+        .expect("expansion")
+        .context
+        .decision_id = eliot_contracts::DecisionId::new("other-decision").expect("decision");
+    refresh_economy_receipt(&mut cross_task);
+    let cross_context = cross_task.binding.clone();
+    let result = assemble_active_view(
+        &cross_task,
+        &recipe(&cross_context),
+        quality(&cross_context),
+        &policy_for(&cross_context, 100_000),
+        |_bytes| panic!("cross-task handle must fail before measurement"),
+    );
+    assert_eq!(
+        result,
+        Err(AssemblyError::Contract(ContextError::OmissionHandleInvalid))
+    );
+}
+
+// WORK_UNIT_CASE: 626/19
+#[test]
+fn final_utf8_measurement_includes_non_ascii_bytes() {
+    let value = admitted();
+    let context = value.binding.clone();
+    let content = match &value.records[0].candidate.representation {
+        AtomRepresentation::Whole { content } => content.clone(),
+        other => panic!("fixture must stay whole, got {other:?}"),
+    };
+    assert!(
+        content.contains('é'),
+        "fixture keeps non-ASCII proof content"
+    );
+    let view = assemble_active_view(
+        &value,
+        &recipe(&context),
+        quality(&context),
+        &policy(100_000),
+        |bytes| Ok(measurement(&context, bytes)),
+    )
+    .expect("utf-8 projection");
+    assert_eq!(
+        view.view.measurement.rendered_utf8_bytes,
+        view.serialized_bytes.len() as u64
+    );
+    assert!(
+        view.serialized_bytes.len() > content.chars().count(),
+        "byte length exceeds scalar count for non-ASCII"
+    );
+    assert!(
+        view.serialized_bytes
+            .windows(2)
+            .any(|pair| pair == [0xC3, 0xA9]),
+        "serialized bytes carry UTF-8 for é"
+    );
+    assert_eq!(
+        SerializedContextMeasurement::utf8_bytes("é"),
+        2,
+        "exact UTF-8 byte identity"
+    );
+}
+
+// WORK_UNIT_CASE: 626/20
+#[test]
+fn estimate_and_exact_observation_identities_are_distinct() {
+    let value = admitted();
+    let context = value.binding.clone();
+    let exact = assemble_active_view(
+        &value,
+        &recipe(&context),
+        quality(&context),
+        &policy(100_000),
+        |bytes| Ok(measurement(&context, bytes)),
+    )
+    .expect("exact projection");
+    let exact_bytes = exact.view.measurement.rendered_utf8_bytes;
+    assert!(exact.view.measurement.stu_estimate.is_none());
+    assert!(exact.view.measurement.tokenizer.is_none());
+    assert_eq!(exact.view.measurement.status, MeasurementStatus::ExactUtf8);
+
+    let mut estimated = measurement(&context, &exact.serialized_bytes);
+    estimated.status = MeasurementStatus::ConservativeStu;
+    estimated.stu_estimate = Some(StuEstimate {
+        value: exact_bytes + 500,
+        empirical: false,
+    });
+    assert_ne!(
+        estimated.stu_estimate.map(|estimate| estimate.value),
+        Some(exact_bytes)
+    );
+    let result = assemble_active_view(
+        &value,
+        &recipe(&context),
+        quality(&context),
+        &policy(100_000),
+        |_| Ok(estimated.clone()),
+    );
+    assert_eq!(
+        result,
+        Err(AssemblyError::Contract(ContextError::UnknownMeasurement))
+    );
+}
+
+// WORK_UNIT_CASE: 626/22
+#[test]
+fn protected_output_review_headroom_not_consumed() {
+    let value = admitted();
+    let context = value.binding.clone();
+    let exact = assemble_active_view(
+        &value,
+        &recipe(&context),
+        quality(&context),
+        &policy(100_000),
+        |bytes| Ok(measurement(&context, bytes)),
+    )
+    .expect("headroom projection");
+    assert_eq!(exact.view.measurement.fixed_overhead, 2);
+    assert_eq!(exact.view.measurement.output_reserve, 3);
+    assert_eq!(exact.view.measurement.review_reserve, 4);
+    assert!(
+        exact
+            .view
+            .measurement
+            .proves_fit(100_000)
+            .expect("fit proves")
+    );
+    let fit_bytes = exact.serialized_bytes.len() as u64;
+    let snug = assemble_active_view(
+        &value,
+        &recipe(&context),
+        quality(&context),
+        &policy(fit_bytes),
+        |bytes| Ok(measurement(&context, bytes)),
+    )
+    .expect("exact fit keeps reserves");
+    assert_eq!(snug.view.measurement.fixed_overhead, 2);
+
+    let mut consumed = measurement(&context, &exact.serialized_bytes);
+    consumed.output_reserve = 30;
+    let result = assemble_active_view(
+        &value,
+        &recipe(&context),
+        quality(&context),
+        &policy(100_000),
+        |_| Ok(consumed.clone()),
+    );
+    assert_eq!(
+        result,
+        Err(AssemblyError::MeasurementMismatch("capacity_reserves"))
+    );
+}
+
+// WORK_UNIT_CASE: 626/23
+#[test]
+fn unknown_measurement_cannot_prove_fit() {
+    let value = admitted();
+    let context = value.binding.clone();
+    for status in [MeasurementStatus::Unknown, MeasurementStatus::Unavailable] {
+        let mut unknown = measurement(&context, b"probe");
+        unknown.status = status;
+        unknown.envelope_digest = digest();
+        unknown.rendered_utf8_bytes = 5;
+        let result = assemble_active_view(
+            &value,
+            &recipe(&context),
+            quality(&context),
+            &policy(100_000),
+            |_| Ok(unknown.clone()),
+        );
+        assert_eq!(
+            result,
+            Err(AssemblyError::Contract(ContextError::UnknownMeasurement)),
+            "status {status:?} never proves fit"
+        );
+    }
+
+    let mut stu_without_estimate = measurement(&context, b"probe");
+    stu_without_estimate.status = MeasurementStatus::ConservativeStu;
+    stu_without_estimate.stu_estimate = None;
+    let result = assemble_active_view(
+        &value,
+        &recipe(&context),
+        quality(&context),
+        &policy(100_000),
+        |_| Ok(stu_without_estimate.clone()),
+    );
+    assert_eq!(
+        result,
+        Err(AssemblyError::Contract(ContextError::UnknownMeasurement))
+    );
+}
