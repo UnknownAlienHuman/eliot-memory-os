@@ -27,6 +27,8 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
+pub mod epistemic_revision;
+
 /// Stable identity of this Governor contract surface.
 pub const CONTRACT_NAME: &str = "eliot.governor.canonical";
 /// Current wire revision of this contract surface.

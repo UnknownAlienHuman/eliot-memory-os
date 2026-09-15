@@ -6,6 +6,33 @@
 
 #![forbid(unsafe_code)]
 
+mod candidate_adaptation;
+
+/// Constructs an inert observed/withheld proposal using the private resolver.
+pub fn propose_observed_candidate(
+    request: &eliot_epistemic_contracts::PositionRequest,
+    observation: &eliot_evidence::ObservationRecord,
+    coverage: &eliot_epistemic_contracts::CoverageDenominator,
+    claims: &eliot_epistemic_contracts::ClaimMap,
+    predecessor: Option<eliot_epistemic_contracts::PredecessorId>,
+    disclosure: (
+        eliot_epistemic_contracts::DisclosureClass,
+        eliot_epistemic_contracts::PrivacyHandling,
+    ),
+) -> Result<
+    eliot_epistemic_contracts::EpistemicPositionCandidate,
+    eliot_epistemic_contracts::ContractError,
+> {
+    candidate_adaptation::propose_observed_candidate(
+        request,
+        observation,
+        coverage,
+        claims,
+        predecessor,
+        disclosure,
+    )
+}
+
 use std::collections::BTreeSet;
 
 use eliot_contracts::{ArtifactId, ContractVersion, StateFence};

@@ -24,6 +24,8 @@ use crate::temporal::TemporalRecord;
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
 pub enum ClaimVerdict {
+    /// Observation retained while its proposition remains unverified.
+    Withheld,
     /// The claim is accepted within its bounds.
     Accepted,
     /// The claim is rejected within its bounds.
@@ -237,7 +239,8 @@ impl ClaimEntry {
             });
         }
         match (self.verdict, self.audit) {
-            (
+            (ClaimVerdict::Withheld, ClaimAuditOutcome::NotVerifiableInScope)
+            | (
                 ClaimVerdict::Accepted,
                 ClaimAuditOutcome::Supported | ClaimAuditOutcome::PartiallySupported,
             )

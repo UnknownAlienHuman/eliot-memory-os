@@ -79,6 +79,69 @@ use SupportResult::{Contradicted, Partial, Supported, Unsupported};
 
 type CaseResult = Result<(), ContractError>;
 
+#[test]
+fn withheld_observation_is_neither_supported_nor_rejected() -> CaseResult {
+    let mut entry = claim_entry("claim-open", None, false, None, BTreeSet::new())?;
+    entry.verdict = ClaimVerdict::Withheld;
+    entry.audit = ClaimAuditOutcome::NotVerifiableInScope;
+    entry.grade = GradeAssignment::unknown("source was observed; proposition was not verified")?;
+    entry.validate()?;
+    let encoded = encoded(&entry)?;
+    let decoded: ClaimEntry = parse(&encoded)?;
+    assert_eq!(decoded, entry);
+    for unsupported_audit in [
+        ClaimAuditOutcome::Supported,
+        ClaimAuditOutcome::Unsupported,
+        ClaimAuditOutcome::Contradicted,
+    ] {
+        entry.audit = unsupported_audit;
+        assert!(entry.validate().is_err());
+    }
+    Ok(())
+}
+
+#[test]
+fn first_position_requires_explicit_absence_without_invented_support() -> CaseResult {
+    let mut candidate = candidate()?;
+    let delta = SupportDelta::new(
+        request()?.records,
+        BTreeSet::new(),
+        BTreeSet::new(),
+        BTreeSet::from(["new source capture".to_owned()]),
+    )?;
+    let mut movement = transition_with(|params| {
+        params.candidate_digest.clone_from(&candidate.digest);
+        params.before_support = SupportResult::Unknown;
+        params.before_assertability = PositionAssertability::UnknownWithheldQuarantined;
+        params.after_assertability = candidate.proposed_assertability;
+        params
+            .evidence_refs
+            .clone_from(&candidate.support[0].handles);
+        params.delta = delta;
+    })?;
+    movement.validate_closed(&request()?, &candidate, &[], &candidate.support)?;
+    movement.before_support = SupportResult::Supported;
+    movement.digest = movement.compute_digest()?;
+    assert_eq!(
+        movement.validate_closed(&request()?, &candidate, &[], &candidate.support),
+        Err(ContractError::ArithmeticMismatch {
+            field: "transition.before_support"
+        })
+    );
+    movement.before_support = SupportResult::Unknown;
+    candidate.predecessor = Some(PredecessorId::new("missing-prior-position")?);
+    candidate.digest = candidate.compute_digest()?;
+    movement.candidate_digest.clone_from(&candidate.digest);
+    movement.digest = movement.compute_digest()?;
+    assert_eq!(
+        movement.validate_closed(&request()?, &candidate, &[], &candidate.support),
+        Err(ContractError::MissingReference {
+            field: "transition.before"
+        })
+    );
+    Ok(())
+}
+
 // Asserts exact variant-plus-field equality in one line via `assert_eq!`.
 macro_rules! expect_err {
     ($result:expr, $variant:ident, $field:expr) => {

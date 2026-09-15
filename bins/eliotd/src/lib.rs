@@ -606,8 +606,9 @@ impl DaemonComposition {
     /// client per call, so a Governor refresh surfaces as an exact fence
     /// mismatch instead of silent divergence. The returned
     /// [`KernelContextReadClient`] implements `CanonicalReadClient` for
-    /// `GetEvidencePack` only and composes with the Governor `ReadService`
-    /// consistency algorithm; no second consistency implementation lives here.
+    /// `GetEvidencePack` and `GetCurrentEpistemicPosition` and composes with
+    /// the Governor `ReadService` consistency algorithm or the Governor
+    /// epistemic position CAS; no second consistency implementation lives here.
     ///
     /// Wiring decision (recorded per brief §4.1): post-`start` attach-style
     /// accessor, not a `start()` signature change — `start()` keeps its exact
@@ -623,6 +624,50 @@ impl DaemonComposition {
             ));
         }
         Ok(KernelContextReadClient::new(Arc::clone(kernel)))
+    }
+
+    /// Borrows the Governor epistemic composition over the retained owners
+    /// plus daemon-held Kernel and read clients (T11.2).
+    ///
+    /// Mirrors [`Self::context_read_client`]: readiness is checked first,
+    /// then the activation snapshot is read via the public
+    /// `GovernorComposition::read_unique_agent_activation(now)`, and a fresh
+    /// [`eliot_governor::GovernorEpistemicComposition`] is borrowed from the
+    /// public `owners().canonical`, the activation snapshot, the daemon-held
+    /// [`DaemonKernelClient`] (as `&impl KernelTransitionPort`), the
+    /// caller-held [`KernelContextReadClient`] (as `&impl CanonicalReadClient`),
+    /// and `readiness()`. The composition retains no client and no thread —
+    /// the caller (the single daemon runtime holding both the concrete client
+    /// and this composition) passes the already-connected clients per call,
+    /// so a Governor refresh surfaces as an exact fence mismatch instead of
+    /// silent divergence. No `composition.rs` change is involved: this uses
+    /// only the public `owners()`/`read_unique_agent_activation()`/`readiness()`
+    /// surface plus the associated `borrow` constructor inside
+    /// `epistemic_composition.rs`.
+    pub fn epistemic_composition<'a>(
+        &'a self,
+        kernel: &'a Arc<DaemonKernelClient>,
+        reads: &'a KernelContextReadClient,
+        now: u64,
+    ) -> Result<
+        eliot_governor::GovernorEpistemicComposition<'a, DaemonKernelClient, KernelContextReadClient>,
+        DaemonError,
+    > {
+        if self.readiness() != eliot_governor::CompositionReadiness::Ready {
+            return Err(DaemonError::Composition(
+                eliot_governor::CompositionError::NotReady,
+            ));
+        }
+        let activation = self.governor.read_unique_agent_activation(now)?;
+        Ok(
+            eliot_governor::GovernorEpistemicComposition::borrow(
+                &self.governor.owners().canonical,
+                activation,
+                kernel.as_ref(),
+                reads,
+                self.readiness(),
+            ),
+        )
     }
 
     /// Stops the one daemon owner and releases protected handles together.

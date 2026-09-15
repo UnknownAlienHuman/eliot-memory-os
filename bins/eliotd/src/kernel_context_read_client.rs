@@ -1,17 +1,20 @@
-//! Kernel-backed read-only context client for the daemon (T11.1).
+//! Kernel-backed read-only context client for the daemon (T11.1, widened T11.2).
 //!
 //! Architecture: A2.3 (contract -> ports -> adapters layering), A13.2
 //! (Kernel failure-domain ownership).
-//! Implementation: T11.1 one real cognitive named read through the daemon.
+//! Implementation: T11.1 one real cognitive named read through the daemon;
+//! T11.2 adds the exact current-epistemic-position readback.
 //!
 //! This module owns only the read-only [`CanonicalReadClient`] adapter over
 //! the already-authenticated [`DaemonKernelClient`]: a fresh
 //! operation/scope/fence-bound capability per call with exact
 //! [`NamedReadResponse`] validation. It performs no consistency algorithm of
 //! its own — callers compose it with the Governor `ReadService` (which owns
-//! the stable/exact re-read and churn detection). It owns no transport
+//! the stable/exact re-read and churn detection) or the Governor epistemic
+//! composition (which owns position CAS). It owns no transport
 //! beyond the retained client, no Store, no semantic authority, and no write
-//! capability: only [`NamedReadOperation::GetEvidencePack`] passes
+//! capability: only [`NamedReadOperation::GetEvidencePack`] and
+//! [`NamedReadOperation::GetCurrentEpistemicPosition`] pass
 //! [`CanonicalReadClient::execute_named`]; every other named operation fails
 //! closed as [`StoreError::UnknownOperation`] before any transport.
 //!
@@ -55,20 +58,52 @@ impl KernelContextReadClient {
         &self.kernel
     }
 
-    /// Checks the T11.1 execute capability before any transport is touched:
-    /// `GetEvidencePack` only, scope-bound, structurally valid.
+    /// Checks the T11.1+T11.2 execute capability before any transport is touched:
+    /// `GetEvidencePack` (scope-bound, structurally valid) or
+    /// `GetCurrentEpistemicPosition` (scope-bound, `ExactFence`, `position`
+    /// Subject required, structurally valid).
     fn check_execute_capability(request: &NamedReadRequest) -> Result<(), StoreError> {
-        if request.operation != NamedReadOperation::GetEvidencePack {
-            return Err(StoreError::UnknownOperation);
+        match request.operation {
+            NamedReadOperation::GetEvidencePack => {
+                if request.scope_id.is_none() {
+                    return Err(StoreError::InvalidField {
+                        field: "scope_id",
+                        reason: "GetEvidencePack requires an exact scope",
+                    });
+                }
+                request.validate()?;
+                Ok(())
+            }
+            NamedReadOperation::GetCurrentEpistemicPosition => {
+                if request.scope_id.is_none() {
+                    return Err(StoreError::InvalidField {
+                        field: "scope_id",
+                        reason: "GetCurrentEpistemicPosition requires an exact scope",
+                    });
+                }
+                if request.consistency != ReadConsistency::ExactFence {
+                    return Err(StoreError::InvalidField {
+                        field: "operation.consistency",
+                        reason: "GetCurrentEpistemicPosition requires ExactFence",
+                    });
+                }
+                request.validate()?;
+                let position = request.parameters.get("position").and_then(|value| value.as_str());
+                match position {
+                    Some(text)
+                        if !text.trim().is_empty()
+                            && !text.chars().any(char::is_control) => {}
+                    _ => {
+                        return Err(StoreError::InvalidField {
+                            field: "operation.parameter",
+                            reason: "position must be a non-blank string",
+                        });
+                    }
+                }
+                Ok(())
+            }
+            _ => Err(StoreError::UnknownOperation),
         }
-        if request.scope_id.is_none() {
-            return Err(StoreError::InvalidField {
-                field: "scope_id",
-                reason: "GetEvidencePack requires an exact scope",
-            });
-        }
-        request.validate()?;
-        Ok(())
     }
 
     /// Checks an execute response against the exact request it answers:
@@ -155,15 +190,17 @@ impl CanonicalReadClient for KernelContextReadClient {
             .collect())
     }
 
-    /// Executes one closed `GetEvidencePack` read through the Kernel route.
+    /// Executes one closed cognitive read through the Kernel route.
     ///
-    /// Fresh capability per call: the operation must be `GetEvidencePack`,
-    /// the scope must be present, the request must validate, and its fence
-    /// must equal the currently admitted snapshot fence — otherwise this
-    /// fails closed before transport. The response validates exactly and
-    /// must echo the requested operation and fence. Consistency (stable /
-    /// exact re-read, churn detection) stays with the Governor `ReadService`
-    /// caller; this method performs no second implementation.
+    /// Fresh capability per call: the operation must be `GetEvidencePack`
+    /// (scope-bound) or `GetCurrentEpistemicPosition` (scope-bound,
+    /// `ExactFence`, `position` Subject required), the request must validate,
+    /// and its fence must equal the currently admitted snapshot fence —
+    /// otherwise this fails closed before transport. The response validates
+    /// exactly and must echo the requested operation and fence. Consistency
+    /// (stable / exact re-read, churn detection) stays with the Governor
+    /// `ReadService` or epistemic-composition caller; this method performs no
+    /// second implementation.
     async fn execute_named(
         &self,
         query: NamedReadRequest,
@@ -235,6 +272,20 @@ mod tests {
         }
     }
 
+    fn position_request(
+        fence: &StateFence,
+    ) -> Result<NamedReadRequest, Box<dyn std::error::Error>> {
+        let mut parameters = BTreeMap::new();
+        parameters.insert("position".to_owned(), json!("position-one"));
+        Ok(NamedReadRequest {
+            operation: NamedReadOperation::GetCurrentEpistemicPosition,
+            scope_id: Some(ScopeId::new("governor")?),
+            consistency: ReadConsistency::ExactFence,
+            state_fence: fence.clone(),
+            parameters,
+        })
+    }
+
     #[test]
     fn execute_capability_rejects_non_evidence_operations_before_transport()
     -> Result<(), Box<dyn std::error::Error>> {
@@ -264,6 +315,56 @@ mod tests {
             KernelContextReadClient::check_execute_capability(&request),
             Err(StoreError::InvalidField {
                 field: "scope_id",
+                ..
+            })
+        ));
+        let mut position = position_request(&fence)?;
+        position.scope_id = None;
+        assert!(matches!(
+            KernelContextReadClient::check_execute_capability(&position),
+            Err(StoreError::InvalidField {
+                field: "scope_id",
+                ..
+            })
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn position_capability_requires_exact_fence_and_subject_position()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let fence = test_fence(1)?;
+        let request = position_request(&fence)?;
+        KernelContextReadClient::check_execute_capability(&request)?;
+
+        let mut eventual = position_request(&fence)?;
+        eventual.consistency = ReadConsistency::Eventual;
+        assert!(matches!(
+            KernelContextReadClient::check_execute_capability(&eventual),
+            Err(StoreError::InvalidField {
+                field: "operation.consistency",
+                ..
+            })
+        ));
+
+        let mut missing = position_request(&fence)?;
+        missing.parameters.remove("position");
+        assert!(matches!(
+            KernelContextReadClient::check_execute_capability(&missing),
+            Err(StoreError::InvalidField {
+                field: "operation.parameter",
+                ..
+            })
+        ));
+
+        let mut blank = position_request(&fence)?;
+        blank
+            .parameters
+            .insert("position".to_owned(), json!("   "));
+        assert!(matches!(
+            KernelContextReadClient::check_execute_capability(&blank),
+            Err(StoreError::InvalidField {
+                field: "operation.parameter",
                 ..
             })
         ));
