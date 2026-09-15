@@ -10,12 +10,15 @@
 //! Distinct from Claude Code plugin (`claude.code.plugin`), hook host
 //! (`claude.code.hooks`), MCP surface (`claude.code.mcp`), Desktop extension
 //! (`claude.desktop.extension`), and the deferred remote Managed Agents route
-//! (`claude.managed-agents.remote`).  Wave 1 excludes supervised process
-//! launch, credentials / User Broker wiring, SDK execution, event
-//! normalization, cancellation / cleanup / reconciliation, model catalogue /
-//! selection receipts, `WorkItem` / child policy, live auth / model execution,
-//! route admission, and Product Pulse.  No Python service and no runtime hot
-//! path are introduced here.
+//! (`claude.managed-agents.remote`).  Governed sidecar execution behind these
+//! contracts lives in [`execution`]: binding-checked factory admission, one
+//! immutable sidecar generation through the shared `ProcessExecutor` contour,
+//! bounded streaming IO, raw-evidence lineage, cancellation / cleanup, and
+//! exact unknown-outcome reconciliation.  Still excluded: credential / User
+//! Broker wiring (references only, never raw secrets), SDK-internal model
+//! execution, task / finish / route-admission authority, model catalogue /
+//! selection receipts, `WorkItem` / child policy, live auth, and Product
+//! Pulse.  No Python service and no runtime hot path are introduced here.
 //!
 //! Transport is newline-delimited JSON (NDJSON): one UTF-8 JSON object per
 //! line, `\n`-terminated, no shell interpolation, no credential leakage.
@@ -30,6 +33,8 @@
 
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
+
+pub mod execution;
 
 // ---------------------------------------------------------------------------
 // Protocol versioning
@@ -120,6 +125,28 @@ pub enum ClaudeSidecarError {
     UnknownOutcomeRequiresReconcile { attempt_id: String },
     #[error("admission denied: {0}")]
     AdmissionDenied(String),
+    #[error("provider execution binding does not match the admitted attempt: {0}")]
+    BindingMismatch(String),
+    #[error("adapter descriptor mismatch: {0}")]
+    DescriptorMismatch(String),
+    #[error("idempotency conflict: {0}")]
+    IdempotencyConflict(String),
+    #[error("sidecar process already started for this attempt")]
+    ProcessAlreadyStarted,
+    #[error("process receipt operation mismatch: expected {expected}, observed {observed}")]
+    OperationMismatch { expected: String, observed: String },
+    #[error("sidecar deadline exceeded: deadline_ms={deadline_ms}, observed_ms={observed_ms}")]
+    DeadlineExceeded { deadline_ms: u64, observed_ms: u64 },
+    #[error("stream frame addresses the wrong request: expected {expected}, observed {observed}")]
+    WrongRequest { expected: String, observed: String },
+    #[error("process executor unavailable: {0}")]
+    ExecutorUnavailable(String),
+    #[error("process operation not found")]
+    OperationNotFound,
+    #[error("unknown outcome requires an explicit reconciliation reason")]
+    MissingUnknownReason,
+    #[error("process executor rejected the operation: {0}")]
+    ExecutorRejected(String),
 }
 
 // ---------------------------------------------------------------------------
