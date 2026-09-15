@@ -1,4 +1,4 @@
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 
 use eliot_contracts::{StateFence, canonical_json_bytes, sha256_hex};
 use eliot_evidence::EvidenceEnvelope;
@@ -114,22 +114,242 @@ impl ErasureRequest {
     }
 }
 
+/// Durable erasure intent recorded BEFORE any destructive dispatch.
+///
+/// The `operation_id` is the caller-supplied `request_id`, never regenerated
+/// on retry, so replaying the same intent id names the same operation.
+/// `request_digest` binds the exact admitted request bytes: the same id with
+/// a different digest is an [`ErasureError::IntentConflict`], never a silent
+/// overwrite. `locations` is the exact admitted surface denominator for this
+/// operation; `expected_revision` and `state_fence` pin the revision and
+/// fence the destructive calls must execute under.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct ErasureIntent {
+    pub operation_id: String,
+    pub request_id: String,
+    pub request_digest: String,
+    pub subject_ref: String,
+    pub scope: String,
+    pub locations: Vec<PurgeLocation>,
+    pub expected_revision: u64,
+    pub state_fence: StateFence,
+}
+
+impl ErasureIntent {
+    /// Builds the durable intent for one admitted request.
+    ///
+    /// Recomputes the canonical request digest and refuses a supplied digest
+    /// that does not match: supplied strings cannot prove authorization or
+    /// durable commit. The operation id is the caller-supplied request id so
+    /// retries name the same operation without minting a new one.
+    pub fn new(request: &ErasureRequest, request_digest: &str) -> Result<Self, ErasureError> {
+        request.validate()?;
+        digest(request_digest, "request_digest")?;
+        let recomputed = request.request_digest()?;
+        if recomputed != request_digest {
+            return Err(ErasureError::InvalidField("request_digest"));
+        }
+        let intent = Self {
+            operation_id: request.request_id.clone(),
+            request_id: request.request_id.clone(),
+            request_digest: request_digest.to_string(),
+            subject_ref: request.subject_ref.clone(),
+            scope: request.scope.clone(),
+            locations: request.locations.clone(),
+            expected_revision: request.expected_revision,
+            state_fence: request.state_fence.clone(),
+        };
+        intent.validate()?;
+        Ok(intent)
+    }
+
+    /// Fail-closed validation of the frozen intent.
+    pub fn validate(&self) -> Result<(), ErasureError> {
+        text(&self.operation_id, "operation_id")?;
+        text(&self.request_id, "request_id")?;
+        if self.operation_id != self.request_id {
+            return Err(ErasureError::InvalidField("operation_id"));
+        }
+        digest(&self.request_digest, "request_digest")?;
+        text(&self.subject_ref, "subject_ref")?;
+        text(&self.scope, "scope")?;
+        self.state_fence
+            .validate()
+            .map_err(|_| ErasureError::InvalidField("state_fence"))?;
+        if self.locations.is_empty() {
+            return Err(ErasureError::EmptyLocations);
+        }
+        let mut seen = BTreeSet::new();
+        for location in &self.locations {
+            if !seen.insert(location_code(*location)) {
+                return Err(ErasureError::DuplicateLocation);
+            }
+        }
+        Ok(())
+    }
+}
+
+/// Durable proof that an intent was recorded before dispatch.
+///
+/// Returned by [`ErasureBackend::record_intent`]; the orchestration keeps it
+/// only as ordering evidence and never treats it as erasure proof.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct IntentReceipt {
+    pub operation_id: String,
+    pub request_digest: String,
+}
+
+/// Per-surface erasure outcome, supplied as a typed value.
+///
+/// Live Store/provider owners will produce these per surface in their own
+/// integration slices; this crate never invents store-surface writes and only
+/// aggregates outcomes passed in. `Purged` carries the location whose removal
+/// the owning surface proved; `Incomplete` and `Unknown` preserve the
+/// location that must block a complete result. An `Unknown` surface keeps its
+/// possible effect explicit so the same operation is reconciled before retry.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum SurfaceOutcome {
+    Purged { location: PurgeLocation },
+    Incomplete { location: PurgeLocation },
+    Unknown { location: PurgeLocation },
+}
+
+impl SurfaceOutcome {
+    /// The location this outcome reports on.
+    #[must_use]
+    pub const fn location(&self) -> PurgeLocation {
+        match *self {
+            Self::Purged { location }
+            | Self::Incomplete { location }
+            | Self::Unknown { location } => location,
+        }
+    }
+}
+
+/// Fail-closed aggregation over per-surface outcomes.
+///
+/// Returns the exact committed locations (in canonical order) only when every
+/// requested location reports [`SurfaceOutcome::Purged`] with no extras and
+/// no duplicates. One `Incomplete` surface — including a missing, extra, or
+/// duplicated outcome entry — yields [`ErasureError::IncompleteErasure`];
+/// one `Unknown` surface yields [`ErasureError::UnknownSurface`]. Unknown
+/// takes precedence when both are present because it requires reconciling
+/// the same operation before retry. Either refusal must prevent a
+/// `PurgeState::Purged` result; callers never map these errors to `Ok`.
+pub fn aggregate_surface_outcomes(
+    requested: &[PurgeLocation],
+    outcomes: &[SurfaceOutcome],
+) -> Result<Vec<PurgeLocation>, ErasureError> {
+    if requested.is_empty() {
+        return Err(ErasureError::EmptyLocations);
+    }
+    let mut requested_codes = BTreeSet::new();
+    for location in requested {
+        if !requested_codes.insert(location_code(*location)) {
+            return Err(ErasureError::DuplicateLocation);
+        }
+    }
+    let mut by_location: BTreeMap<u8, SurfaceOutcome> = BTreeMap::new();
+    for outcome in outcomes {
+        let code = location_code(outcome.location());
+        if by_location.insert(code, *outcome).is_some() {
+            return Err(ErasureError::IncompleteErasure);
+        }
+    }
+    if by_location.len() != requested_codes.len() {
+        return Err(ErasureError::IncompleteErasure);
+    }
+    for code in &requested_codes {
+        if !by_location.contains_key(code) {
+            return Err(ErasureError::IncompleteErasure);
+        }
+    }
+    let mut unknown_seen = false;
+    let mut incomplete_seen = false;
+    for outcome in by_location.values() {
+        match outcome {
+            SurfaceOutcome::Purged { .. } => {}
+            SurfaceOutcome::Incomplete { .. } => incomplete_seen = true,
+            SurfaceOutcome::Unknown { .. } => unknown_seen = true,
+        }
+    }
+    if unknown_seen {
+        return Err(ErasureError::UnknownSurface);
+    }
+    if incomplete_seen {
+        return Err(ErasureError::IncompleteErasure);
+    }
+    let mut committed: Vec<PurgeLocation> = by_location
+        .values()
+        .map(SurfaceOutcome::location)
+        .collect();
+    committed.sort_by_key(|location| location_code(*location));
+    Ok(committed)
+}
+
 /// The backend is the existing storage/evidence owner.  Implementations must
-/// make `erase` and `append_purge_ledger` durable in their own transaction
-/// boundary; this orchestration layer never caches or duplicates that state.
+/// make intent recording, erasure, and ledger appends durable in their own
+/// transaction boundary; this orchestration layer never caches or duplicates
+/// that state.
+///
+/// Protocol order, enforced by [`execute`]: `current_revision`, then
+/// `completed_receipt` (replay check), then `record_intent` (durable intent),
+/// then `erase` (destructive dispatch under the recorded intent), then the
+/// fail-closed outcome aggregation, then `append_purge_ledger` (only on
+/// aggregate success), then `note_completed` (seals the replayable result).
+/// No destructive call happens before `record_intent` succeeds.
 pub trait ErasureBackend {
     type Error: std::error::Error + Send + Sync + 'static;
 
     fn current_revision(&self, subject_ref: &str, scope: &str) -> Result<u64, Self::Error>;
 
-    /// Removes every requested location and returns the locations actually
-    /// removed.  A successful result is required to be exact, not a subset.
+    /// Records the durable intent before any destructive call.
+    ///
+    /// The default refuses with [`ErasureError::UnsupportedIntent`] so a
+    /// backend without intent durability fails closed with zero destructive
+    /// calls instead of erasing first. Implementations must persist the
+    /// intent under its stable `operation_id`; recording the same intent
+    /// twice with identical content is idempotent, while the same id with
+    /// different content must yield [`ErasureError::IntentConflict`].
+    fn record_intent(&mut self, _intent: ErasureIntent) -> Result<IntentReceipt, ErasureError> {
+        Err(ErasureError::UnsupportedIntent)
+    }
+
+    /// Loads a previously sealed completion for replay identity.
+    ///
+    /// The default refuses with [`ErasureError::UnsupportedIntent`]; a
+    /// backend that cannot prove prior completion must not claim replay.
+    fn completed_receipt(
+        &self,
+        _operation_id: &str,
+    ) -> Result<Option<ErasureReceipt>, ErasureError> {
+        Err(ErasureError::UnsupportedIntent)
+    }
+
+    /// Seals a completed receipt for future exact replays.
+    ///
+    /// Called once per operation after the purge ledger append, before
+    /// returning success. The default refuses so an unsealed completion
+    /// cannot be misreported as replayable.
+    fn note_completed(&mut self, _receipt: ErasureReceipt) -> Result<(), ErasureError> {
+        Err(ErasureError::UnsupportedIntent)
+    }
+
+    /// Removes every requested location under the recorded intent and
+    /// returns the per-surface outcomes.
+    ///
+    /// Takes the durable [`ErasureIntent`] so no destructive path exists
+    /// without a recorded intent. A successful result carries one outcome
+    /// per requested location; transport failures are `Err`, while
+    /// per-surface `Incomplete`/`Unknown` states are `Ok` outcomes that the
+    /// fail-closed aggregation refuses.
     fn erase(
         &mut self,
-        subject_ref: &str,
-        scope: &str,
-        locations: &[PurgeLocation],
-    ) -> Result<Vec<PurgeLocation>, Self::Error>;
+        intent: &ErasureIntent,
+    ) -> Result<Vec<SurfaceOutcome>, Self::Error>;
 
     fn append_purge_ledger(&mut self, entry: PurgeLedgerEntry) -> Result<(), Self::Error>;
 }
@@ -143,6 +363,13 @@ pub struct ErasureReceipt {
 }
 
 /// Executes one exact-fence erasure against the already-authoritative backend.
+///
+/// Intent and replay identity are durable before destructive dispatch:
+/// the intent is built and recorded first, an exact replay of a completed
+/// intent returns the original receipt with no second destructive dispatch,
+/// and only then does erasure fan out under the recorded intent. Per-surface
+/// outcomes aggregate fail-closed — one incomplete or unknown surface
+/// prevents a `Purged` result and no ledger entry is appended on refusal.
 pub fn execute<B: ErasureBackend>(
     backend: &mut B,
     request: &ErasureRequest,
@@ -159,16 +386,27 @@ pub fn execute<B: ErasureBackend>(
         });
     }
 
-    let erased = backend
-        .erase(&request.subject_ref, &request.scope, &request.locations)
+    let intent = ErasureIntent::new(request, &request_digest)?;
+
+    if let Some(prior) = backend.completed_receipt(&intent.operation_id)? {
+        if prior.request_digest != request_digest {
+            return Err(ErasureError::IntentConflict);
+        }
+        return Ok(prior);
+    }
+
+    backend.record_intent(intent.clone())?;
+
+    let outcomes = backend
+        .erase(&intent)
         .map_err(|error| ErasureError::Backend(Box::new(error)))?;
-    ensure_exact_locations(&request.locations, &erased)?;
+    let purged_locations = aggregate_surface_outcomes(&intent.locations, &outcomes)?;
     let tombstone_digest = tombstone_digest(request, &request_digest);
     let purge = PurgeLedgerEntry {
         purge_id: format!("purge-{request_digest}"),
         subject_ref: request.subject_ref.clone(),
         scope: request.scope.clone(),
-        purged_locations: erased,
+        purged_locations,
         tombstone_digest,
         state: PurgeState::Purged,
         state_fence: request.state_fence.clone(),
@@ -178,23 +416,13 @@ pub fn execute<B: ErasureBackend>(
     backend
         .append_purge_ledger(purge.clone())
         .map_err(|error| ErasureError::Backend(Box::new(error)))?;
-    Ok(ErasureReceipt {
+    let receipt = ErasureReceipt {
         request_id: request.request_id.clone(),
         request_digest,
         purge,
-    })
-}
-
-fn ensure_exact_locations(
-    requested: &[PurgeLocation],
-    erased: &[PurgeLocation],
-) -> Result<(), ErasureError> {
-    let requested: BTreeSet<_> = requested.iter().copied().map(location_code).collect();
-    let erased: BTreeSet<_> = erased.iter().copied().map(location_code).collect();
-    if requested != erased {
-        return Err(ErasureError::IncompleteErasure);
-    }
-    Ok(())
+    };
+    backend.note_completed(receipt.clone())?;
+    Ok(receipt)
 }
 
 fn tombstone_digest(request: &ErasureRequest, request_digest: &str) -> String {
@@ -265,6 +493,12 @@ pub enum ErasureError {
     RevisionMismatch { expected: u64, observed: u64 },
     #[error("backend did not erase the exact requested locations")]
     IncompleteErasure,
+    #[error("one or more erasure surfaces report unknown outcome; reconcile the same operation")]
+    UnknownSurface,
+    #[error("erasure backend does not implement durable intent")]
+    UnsupportedIntent,
+    #[error("erasure intent conflicts with the already-recorded operation")]
+    IntentConflict,
     #[error("generated purge ledger entry is invalid")]
     InvalidLedger,
     #[error("erasure scope snapshot is invalid")]
