@@ -40,6 +40,7 @@ mod daemon_kernel_client;
 mod daemon_kernel_port_adapters;
 mod dreamer_admission;
 mod dreamer_materials;
+mod dreamer_model_adapter;
 mod governor_local_read;
 mod kernel_authority_client;
 mod kernel_context_read_client;
@@ -80,6 +81,9 @@ pub use dreamer_materials::{
     ORIENTATION_MATERIAL_PRIVACY_ADMITTED, ORIENTATION_MATERIAL_ROUTE_ADMITTED,
     OrientationMaterialBudget, freeze_orientation_manifest, resolve_source_claim,
     verify_resolved_bytes,
+};
+pub use dreamer_model_adapter::{
+    DreamerModelExecution, GovernedDreamerModelAdapter, ModelInvokeInput,
 };
 pub use governor_local_read::{answer_evidence_query, answer_projection_inputs};
 pub(crate) use kernel_authority_client::KernelAuthorityClient;
@@ -709,6 +713,26 @@ impl DaemonComposition {
             return Err(DaemonError::Composition(CompositionError::NotReady));
         }
         Ok(GovernorDreamerAdapter::new(self, kernel))
+    }
+
+    /// Borrows the Governor Dreamer model-call adapter over the retained owners (T12-07,
+    /// integration #702, semantic #18).
+    ///
+    /// Mirrors [`Self::dreamer_admission`]: readiness is checked first, then a fresh
+    /// [`GovernedDreamerModelAdapter`] is built over the composition. Unlike the T12-06
+    /// intake adapter this slice performs no Kernel reads — the current account catalogue,
+    /// explicit Human policy, admission, and binding arrive threaded per call and execution
+    /// leaves through the caller-supplied [`DreamerModelExecution`] port — so no Kernel
+    /// client is retained here.
+    ///
+    /// Wiring decision (recorded per brief §5 T12-07): post-`start` attach-style accessor,
+    /// not a `start()` signature change — `start()` keeps its exact `(config, kernel:
+    /// Arc<dyn KernelGenerationPort>, authority_activation)` contour.
+    pub fn dreamer_model(&self) -> Result<GovernedDreamerModelAdapter<'_>, DaemonError> {
+        if self.readiness() != CompositionReadiness::Ready {
+            return Err(DaemonError::Composition(CompositionError::NotReady));
+        }
+        Ok(GovernedDreamerModelAdapter::new(self))
     }
 
     /// Stops the one daemon owner and releases protected handles together.
