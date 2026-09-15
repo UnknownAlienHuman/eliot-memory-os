@@ -646,3 +646,498 @@ fn forged_fence_digest_is_rejected_as_invalid_fence() {
         Err(AssemblyError::Contract(ContextError::InvalidFence))
     );
 }
+
+// ---- 626 proof helpers (package-local, real contracts only) ----
+
+fn provider_role_named(provider: &str, role: SemanticRole) -> ProviderRole {
+    ProviderRole {
+        provider: ProviderId::new(provider).expect("fixture provider"),
+        role,
+    }
+}
+
+fn candidate_named(
+    context: &ContextBinding,
+    atom: &str,
+    snapshot: &str,
+    provider: &str,
+    role: SemanticRole,
+    content: &str,
+) -> ContextCandidate {
+    let mut base = candidate(context);
+    base.atom_id = id(atom);
+    base.provider_role = provider_role_named(provider, role);
+    base.source.source_id =
+        eliot_contracts::SourceId::new(format!("source-{atom}")).expect("fixture source id");
+    base.source.owner = ProviderId::new(provider).expect("fixture owner");
+    base.source.snapshot_id = id(snapshot);
+    base.source.revision = format!("revision-{atom}");
+    base.representation = AtomRepresentation::Whole {
+        content: content.to_owned(),
+    };
+    base
+}
+
+/// Reconcile economy allocations/receipts after record/admission changes.
+/// Caller must have set `economy.requested/admitted/displaced/omissions`
+/// and `economy.recipe_digest` consistently beforehand.
+fn refinalize(value: &mut AdmittedContextSet, recipe_digest: &str) {
+    value.economy.recipe_digest = recipe_digest.to_owned();
+    let capacity = value.floor.capacity;
+    value.economy.allocations.admitted_required = 0;
+    value.economy.allocations.admitted_optional = 0;
+    value.economy.allocations.remaining_headroom =
+        capacity.route_capacity - capacity.fixed_overhead - capacity.output_reserve - capacity.review_reserve;
+    refresh_economy_receipt(value);
+    let payload_bytes = value
+        .canonical_payload_utf8_bytes()
+        .expect("admitted payload");
+    value.economy.allocations.admitted_required = payload_bytes;
+    value.economy.allocations.remaining_headroom = capacity.route_capacity
+        - capacity.fixed_overhead
+        - capacity.output_reserve
+        - capacity.review_reserve
+        - payload_bytes;
+    refresh_economy_receipt(value);
+    value.economy.measurement.digest = value
+        .canonical_payload_digest()
+        .expect("admitted digest");
+    refresh_economy_receipt(value);
+}
+
+fn admitted_multi_role() -> (AdmittedContextSet, ContextRecipe) {
+    let context = binding();
+    let first = candidate(&context);
+    let first_id = first.atom_id.clone();
+    let first_role = role();
+    let second_role = provider_role_named("second-provider", SemanticRole::Source);
+    let mut second = candidate(&context);
+    second.atom_id = id("atom-source");
+    second.provider_role = second_role.clone();
+    second.source.source_id =
+        eliot_contracts::SourceId::new("source-atom-source").expect("fixture source");
+    second.source.owner = ProviderId::new("second-provider").expect("fixture owner");
+    second.source.snapshot_id = id("snapshot-source");
+    second.source.revision = "revision-atom-source".to_owned();
+    second.representation = AtomRepresentation::Whole {
+        content: "second source material".to_owned(),
+    };
+    let floor = DecisionSafetyFloor {
+        binding: context.clone(),
+        mandatory_atoms: vec![first_id.clone(), id("atom-source")],
+        mandatory_roles: vec![SemanticRole::Goal, SemanticRole::Source],
+        providers: ProviderRoleDenominator {
+            requested: vec![first_role.clone(), second_role.clone()],
+            dispositions: vec![
+                ProviderDisposition {
+                    slot: first_role.clone(),
+                    state: AtomAvailability::PresentCurrent,
+                    evidence: None,
+                },
+                ProviderDisposition {
+                    slot: second_role.clone(),
+                    state: AtomAvailability::PresentCurrent,
+                    evidence: None,
+                },
+            ],
+        },
+        members: vec![
+            SafetyFloorMember {
+                atom_id: first_id.clone(),
+                role: SemanticRole::Goal,
+                availability: AtomAvailability::PresentCurrent,
+                measurement: Some(first.measurement.clone()),
+                required_dependencies: Vec::new(),
+            },
+            SafetyFloorMember {
+                atom_id: id("atom-source"),
+                role: SemanticRole::Source,
+                availability: AtomAvailability::PresentCurrent,
+                measurement: Some(second.measurement.clone()),
+                required_dependencies: Vec::new(),
+            },
+        ],
+        interpretation_dependencies: Vec::new(),
+        rule_evidence: id("floor-rule"),
+        capacity: CapacityLimits {
+            route_capacity: 100_000,
+            fixed_overhead: 2,
+            output_reserve: 3,
+            review_reserve: 4,
+        },
+    };
+    let mut value = AdmittedContextSet {
+        binding: context.clone(),
+        records: vec![
+            AdmittedAtom {
+                candidate: first,
+                disposition: AdmissionDisposition::Include,
+                rule_evidence: id("admission-rule"),
+            },
+            AdmittedAtom {
+                candidate: second,
+                disposition: AdmissionDisposition::Include,
+                rule_evidence: id("admission-rule-source"),
+            },
+        ],
+        admissions: vec![
+            AdmissionRecord {
+                atom_id: first_id.clone(),
+                provider_role: first_role.clone(),
+                disposition: AdmissionDisposition::Include,
+                rule_evidence: id("admission-rule"),
+            },
+            AdmissionRecord {
+                atom_id: id("atom-source"),
+                provider_role: second_role.clone(),
+                disposition: AdmissionDisposition::Include,
+                rule_evidence: id("admission-rule-source"),
+            },
+        ],
+        floor,
+        economy: ContextEconomyReceipt {
+            binding: context.clone(),
+            decision_id: context.decision_id.clone(),
+            measurement: MeasurementRef {
+                digest: digest(),
+                serializer: "fixture-serde-v1".to_owned(),
+            },
+            requested: vec![first_id, id("atom-source")],
+            admitted: vec![id("atom"), id("atom-source")],
+            displaced: Vec::new(),
+            omissions: Vec::new(),
+            applied_rule: id("economy-rule"),
+            allocations: EconomyAllocations {
+                fixed_overhead: 2,
+                output_reserve: 3,
+                review_reserve: 4,
+                admitted_required: 0,
+                admitted_optional: 0,
+                remaining_headroom: 100_000 - 9,
+                route_capacity: 100_000,
+            },
+            recipe_digest: digest(),
+            receipt_digest: digest(),
+        },
+    };
+    let mut recipe = recipe(&context);
+    recipe.denominator = ProviderRoleDenominator {
+        requested: vec![first_role, second_role],
+        dispositions: vec![
+            ProviderDisposition {
+                slot: role(),
+                state: AtomAvailability::PresentCurrent,
+                evidence: None,
+            },
+            ProviderDisposition {
+                slot: provider_role_named("second-provider", SemanticRole::Source),
+                state: AtomAvailability::PresentCurrent,
+                evidence: None,
+            },
+        ],
+    };
+    recipe.mandatory_roles = vec![SemanticRole::Goal, SemanticRole::Source];
+    recipe.role_policies = vec![
+        RoleLossRule {
+            role: SemanticRole::Goal,
+            loss_policy: LossPolicy::NonDroppable,
+            required: true,
+            allowed_representations: vec![RepresentationKind::Whole],
+        },
+        RoleLossRule {
+            role: SemanticRole::Source,
+            loss_policy: LossPolicy::NonDroppable,
+            required: true,
+            allowed_representations: vec![RepresentationKind::Whole],
+        },
+    ];
+    recipe.recipe_sha256 = recipe
+        .canonical_policy_digest()
+        .expect("multi-role recipe digest");
+    refinalize(&mut value, &recipe.recipe_sha256.clone());
+    (value, recipe)
+}
+
+// WORK_UNIT_CASE: 626/2
+#[test]
+fn multi_role_provider_set_is_deterministic() {
+    let (value, recipe) = admitted_multi_role();
+    let context = value.binding.clone();
+    let left = assemble_active_view(
+        &value,
+        &recipe,
+        quality(&context),
+        &policy(100_000),
+        |bytes| Ok(measurement(&context, bytes)),
+    )
+    .expect("multi-role projection");
+    let right = assemble_active_view(
+        &value,
+        &recipe,
+        quality(&context),
+        &policy(100_000),
+        |bytes| Ok(measurement(&context, bytes)),
+    )
+    .expect("repeat projection");
+    assert_eq!(left.view.rendered.len(), 2);
+    assert_eq!(left.serialized_bytes, right.serialized_bytes);
+    assert_eq!(left.view.output_digest, right.view.output_digest);
+    assert_eq!(left.view.rendered, right.view.rendered);
+    let roles: Vec<_> = left.view.rendered.iter().map(|atom| atom.role).collect();
+    assert!(roles.contains(&SemanticRole::Goal));
+    assert!(roles.contains(&SemanticRole::Source));
+    assert!(left.view.rendered[0].role <= left.view.rendered[1].role);
+    left.view
+        .validate_against(&value)
+        .expect("multi-role conservation");
+}
+
+// WORK_UNIT_CASE: 626/4
+#[test]
+fn denominator_mismatch_is_rejected() {
+    let value = admitted();
+    let context = value.binding.clone();
+    let mut foreign = recipe(&context);
+    let slot = provider_role_named("foreign-provider", SemanticRole::Goal);
+    foreign.denominator = ProviderRoleDenominator {
+        requested: vec![slot.clone()],
+        dispositions: vec![ProviderDisposition {
+            slot,
+            state: AtomAvailability::PresentCurrent,
+            evidence: None,
+        }],
+    };
+    foreign.recipe_sha256 = foreign
+        .canonical_policy_digest()
+        .expect("foreign recipe digest");
+    let result = assemble_active_view(
+        &value,
+        &foreign,
+        quality(&context),
+        &policy(100_000),
+        |bytes| Ok(measurement(&context, bytes)),
+    );
+    assert_eq!(
+        result,
+        Err(AssemblyError::Contract(ContextError::DenominatorMismatch))
+    );
+
+    let mut broken = admitted();
+    broken.economy.admitted.clear();
+    refresh_economy_receipt(&mut broken);
+    let broken_context = broken.binding.clone();
+    let result = assemble_active_view(
+        &broken,
+        &recipe(&broken_context),
+        quality(&broken_context),
+        &policy(100_000),
+        |bytes| Ok(measurement(&broken_context, bytes)),
+    );
+    assert_eq!(
+        result,
+        Err(AssemblyError::Contract(ContextError::EconomyMismatch))
+    );
+}
+
+// WORK_UNIT_CASE: 626/5
+#[test]
+fn duplicate_atom_identity_is_rejected() {
+    let mut value = admitted();
+    let duplicate = value.records[0].clone();
+    value.records.push(duplicate);
+    let context = value.binding.clone();
+    let result = assemble_active_view(
+        &value,
+        &recipe(&context),
+        quality(&context),
+        &policy(100_000),
+        |_bytes| panic!("duplicate must fail before measurement"),
+    );
+    assert_eq!(
+        result,
+        Err(AssemblyError::Contract(ContextError::Duplicate(
+            "admitted.atom_id"
+        )))
+    );
+}
+
+// WORK_UNIT_CASE: 626/6
+#[test]
+fn missing_admitted_material_yields_exact_incomplete() {
+    let mut value = admitted();
+    value.records[0].candidate.availability = AtomAvailability::Missing;
+    value.floor.members[0].availability = AtomAvailability::Missing;
+    value.floor.members[0].measurement = None;
+    value.floor.providers.dispositions[0].state = AtomAvailability::Missing;
+    let mut missing_recipe = recipe(&value.binding.clone());
+    missing_recipe.denominator.dispositions[0].state = AtomAvailability::Missing;
+    missing_recipe.recipe_sha256 = missing_recipe
+        .canonical_policy_digest()
+        .expect("missing recipe digest");
+    refinalize(&mut value, &missing_recipe.recipe_sha256.clone());
+    let context = value.binding.clone();
+    let result = assemble_active_view(
+        &value,
+        &missing_recipe,
+        quality(&context),
+        &policy(100_000),
+        |_bytes| panic!("incomplete floor must precede measurement"),
+    );
+    match result {
+        Err(AssemblyError::Incomplete(incomplete)) => {
+            assert_eq!(
+                incomplete.code,
+                ContextErrorCode::DecisionContextIncomplete
+            );
+            assert_eq!(incomplete.missing, vec![id("atom")]);
+        }
+        other => panic!("expected exact incomplete, got {other:?}"),
+    }
+}
+
+// WORK_UNIT_CASE: 626/7
+#[test]
+fn nonadmitted_rendering_material_is_rejected() {
+    let mut value = admitted();
+    let context = value.binding.clone();
+    let mut outsider = candidate(&context);
+    outsider.atom_id = id("outsider");
+    outsider.source.snapshot_id = id("snapshot-outsider");
+    value.records.push(AdmittedAtom {
+        candidate: outsider,
+        disposition: AdmissionDisposition::Include,
+        rule_evidence: id("admission-rule-outsider"),
+    });
+    let result = assemble_active_view(
+        &value,
+        &recipe(&context),
+        quality(&context),
+        &policy(100_000),
+        |_bytes| panic!("nonadmitted material must fail before measurement"),
+    );
+    assert_eq!(
+        result,
+        Err(AssemblyError::Contract(ContextError::DenominatorMismatch))
+    );
+}
+
+// WORK_UNIT_CASE: 626/10
+#[test]
+fn dropping_admitted_atom_to_fit_fails_selection_integrity() {
+    let value = admitted_two();
+    let context = value.binding.clone();
+    let full = assemble_active_view(
+        &value,
+        &recipe(&context),
+        quality(&context),
+        &policy(100_000),
+        |bytes| Ok(measurement(&context, bytes)),
+    )
+    .expect("two-atom projection");
+    assert_eq!(full.view.rendered.len(), 2);
+    let tight = assemble_active_view(
+        &value,
+        &recipe(&context),
+        quality(&context),
+        &policy(full.serialized_bytes.len() as u64 - 1),
+        |_bytes| panic!("tight bound must fail before measurement"),
+    );
+    assert_eq!(tight, Err(AssemblyError::Bounds("assembly.final_bytes")));
+
+    let proof = SelectionIntegrityProof {
+        binding: context,
+        admitted_ids: vec![id("atom"), id("atom-two")],
+        rendered_ids: vec![id("atom")],
+        omission_evidence: Vec::new(),
+        output_digest: digest(),
+    };
+    assert_eq!(
+        proof.validate(),
+        Err(ContextError::SelectionIntegrityMismatch)
+    );
+}
+
+// WORK_UNIT_CASE: 626/11
+#[test]
+fn adding_omitted_atom_fails() {
+    let mut value = admitted();
+    let context = value.binding.clone();
+    let injected = candidate_named(
+        &context,
+        "injected",
+        "snapshot-injected",
+        "injected-provider",
+        SemanticRole::Source,
+        "injected similar material",
+    );
+    value.records.push(AdmittedAtom {
+        candidate: injected,
+        disposition: AdmissionDisposition::Include,
+        rule_evidence: id("admission-rule-injected"),
+    });
+    value.admissions.push(AdmissionRecord {
+        atom_id: id("injected"),
+        provider_role: provider_role_named("injected-provider", SemanticRole::Source),
+        disposition: AdmissionDisposition::Include,
+        rule_evidence: id("admission-rule-injected"),
+    });
+    value.economy.requested.push(id("injected"));
+    value.economy.admitted.push(id("injected"));
+    let digest = recipe(&context).recipe_sha256.clone();
+    refinalize(&mut value, &digest);
+    let result = assemble_active_view(
+        &value,
+        &recipe(&context),
+        quality(&context),
+        &policy(100_000),
+        |_bytes| panic!("injected atom must fail membership"),
+    );
+    assert_eq!(
+        result,
+        Err(AssemblyError::Contract(ContextError::DenominatorMismatch))
+    );
+}
+
+// WORK_UNIT_CASE: 626/12
+#[test]
+fn changed_role_required_protected_state_fails() {
+    let mut value = admitted();
+    value.records[0].candidate.provider_role.role = SemanticRole::Source;
+    let context = value.binding.clone();
+    let result = assemble_active_view(
+        &value,
+        &recipe(&context),
+        quality(&context),
+        &policy(100_000),
+        |_bytes| panic!("changed role must fail before measurement"),
+    );
+    assert_eq!(
+        result,
+        Err(AssemblyError::Contract(ContextError::IdentityConflict))
+    );
+
+    let value = admitted();
+    let context = value.binding.clone();
+    let mut widened = recipe(&context);
+    widened.mandatory_roles.push(SemanticRole::Source);
+    widened.role_policies.push(RoleLossRule {
+        role: SemanticRole::Source,
+        loss_policy: LossPolicy::NonDroppable,
+        required: true,
+        allowed_representations: vec![RepresentationKind::Whole],
+    });
+    widened.recipe_sha256 = widened
+        .canonical_policy_digest()
+        .expect("widened recipe digest");
+    let result = assemble_active_view(
+        &value,
+        &widened,
+        quality(&context),
+        &policy(100_000),
+        |_bytes| panic!("widened mandatory roles must fail denominator"),
+    );
+    assert_eq!(
+        result,
+        Err(AssemblyError::Contract(ContextError::DenominatorMismatch))
+    );
+}
