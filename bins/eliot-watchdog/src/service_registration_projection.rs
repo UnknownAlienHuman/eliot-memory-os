@@ -119,6 +119,12 @@ pub(crate) fn read_approved_service_registration(
     ),
     SpoolError,
 > {
+    let _span = tracing::debug_span!("watchdog.read_approved_registration").entered();
+    tracing::debug!(
+        event = "watchdog.registration_projection_attempted",
+        observation = "attempted",
+        "attempting installer-approved registration projection"
+    );
     let (registry, manifest) = crate::read_registry_for_bootstrap(bootstrap)?;
     let (approval, request) = approved_service_registration(&registry, &manifest, role)?;
     Ok((manifest, approval, request))
@@ -131,6 +137,12 @@ pub(crate) fn validate_bound_service_registrations(
     expected_watchdog_request: &ServiceRegistrationRequest,
     bootstrap: &ServiceBootstrapArguments,
 ) -> Result<(), SpoolError> {
+    let _span = tracing::debug_span!("watchdog.validate_bound_registrations").entered();
+    tracing::debug!(
+        event = "watchdog.registration_validation_attempted",
+        observation = "attempted",
+        "validating bound service registrations"
+    );
     let (_, host_request) =
         approved_service_registration(registry, manifest, InstallerServiceRole::Host)?;
     let (_, watchdog_request) =

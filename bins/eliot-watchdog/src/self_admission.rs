@@ -141,6 +141,12 @@ where
     P: WatchdogSelfAdmissionProbe,
     S: WatchdogSelfAdmissionStatus,
 {
+    let _span = tracing::debug_span!("watchdog.self_admission").entered();
+    tracing::debug!(
+        event = "watchdog.self_admission_requested",
+        observation = "requested",
+        "watchdog self-admission requested"
+    );
     admit_watchdog_self_start_with_deadline(probe, status, WATCHDOG_SELF_ADMISSION_DEADLINE_MS)
 }
 
@@ -163,6 +169,7 @@ where
     P: WatchdogSelfAdmissionProbe,
     S: WatchdogSelfAdmissionStatus,
 {
+    let _deadline_span = tracing::debug_span!("watchdog.self_admission_deadline").entered();
     let expected = probe
         .current_process_identity()
         .ok_or(WatchdogSelfAdmissionError::CurrentProcessUnavailable)?;
