@@ -152,6 +152,11 @@ members = [
   "crates/smart/eliot-dreamer-maintenance-plan",
   "crates/smart/eliot-dreamer-configuration-plan",
   "crates/smart/eliot-dreamer-orchestration-plan",
+  "crates/smart/eliot-dreamer-bundle",  # agent_order 4
+  "crates/smart/eliot-dreamer-candidate-validation",  # agent_order 5
+  "crates/smart/eliot-dreamer-claim-grounding",  # agent_order 14
+  "crates/smart/eliot-dreamer-rival-model",  # agent_order 16
+  "crates/smart/eliot-dreamer-probe-plan",  # agent_order 17
 ]
 
 # Capability cells declared by `[package.metadata.eliot]` with `agent_order`
@@ -166,15 +171,10 @@ members = [
 # Single-cell admission (#806/T8-A806) follows the same serialized turn for
 # eliot-dreamer-cycle (standalone nonmember; never in `exclude`).
 exclude = [
-  "crates/smart/eliot-dreamer-bundle",  # agent_order 4
-  "crates/smart/eliot-dreamer-candidate-validation",  # agent_order 5
   "crates/smart/eliot-dreamer-orientation",  # agent_order 6
   "crates/smart/eliot-dreamer-clarification",  # agent_order 7
   "crates/smart/eliot-dreamer-architecture-brief",  # agent_order 8
   "crates/smart/eliot-dreamer-implementation-brief",  # agent_order 9
-  "crates/smart/eliot-dreamer-claim-grounding",  # agent_order 14
-  "crates/smart/eliot-dreamer-rival-model",  # agent_order 16
-  "crates/smart/eliot-dreamer-probe-plan",  # agent_order 17
   "crates/smart/eliot-dreamer-failure",  # agent_order 26
   "crates/smart/eliot-dreamer-structure-repair",  # agent_order 27
   "crates/smart/eliot-dreamer-reconsolidation",  # agent_order 28
