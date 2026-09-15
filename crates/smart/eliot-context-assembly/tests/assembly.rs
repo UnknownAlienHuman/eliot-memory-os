@@ -662,7 +662,7 @@ fn candidate_named(
     snapshot: &str,
     provider: &str,
     role: SemanticRole,
-    content: &str,
+    body: &str,
 ) -> ContextCandidate {
     let mut base = candidate(context);
     base.atom_id = id(atom);
@@ -673,7 +673,7 @@ fn candidate_named(
     base.source.snapshot_id = id(snapshot);
     base.source.revision = format!("revision-{atom}");
     base.representation = AtomRepresentation::Whole {
-        content: content.to_owned(),
+        content: body.to_owned(),
     };
     base
 }
@@ -682,7 +682,7 @@ fn candidate_named(
 /// Caller must have set `economy.requested/admitted/displaced/omissions`
 /// and `economy.recipe_digest` consistently beforehand.
 fn refinalize(value: &mut AdmittedContextSet, recipe_digest: &str) {
-    value.economy.recipe_digest = recipe_digest.to_owned();
+    recipe_digest.clone_into(&mut value.economy.recipe_digest);
     let capacity = value.floor.capacity;
     value.economy.allocations.admitted_required = 0;
     value.economy.allocations.admitted_optional = 0;
@@ -705,6 +705,7 @@ fn refinalize(value: &mut AdmittedContextSet, recipe_digest: &str) {
     refresh_economy_receipt(value);
 }
 
+#[allow(clippy::too_many_lines)]
 fn admitted_multi_role() -> (AdmittedContextSet, ContextRecipe) {
     let context = binding();
     let first = candidate(&context);
@@ -718,7 +719,7 @@ fn admitted_multi_role() -> (AdmittedContextSet, ContextRecipe) {
         eliot_contracts::SourceId::new("source-atom-source").expect("fixture source");
     second.source.owner = ProviderId::new("second-provider").expect("fixture owner");
     second.source.snapshot_id = id("snapshot-source");
-    second.source.revision = "revision-atom-source".to_owned();
+    "revision-atom-source".clone_into(&mut second.source.revision);
     second.representation = AtomRepresentation::Whole {
         content: "second source material".to_owned(),
     };
@@ -1535,12 +1536,12 @@ fn missing_changed_crosstask_expansion_handle_fails() {
 fn final_utf8_measurement_includes_non_ascii_bytes() {
     let value = admitted();
     let context = value.binding.clone();
-    let content = match &value.records[0].candidate.representation {
+    let material = match &value.records[0].candidate.representation {
         AtomRepresentation::Whole { content } => content.clone(),
         other => panic!("fixture must stay whole, got {other:?}"),
     };
     assert!(
-        content.contains('é'),
+        material.contains('é'),
         "fixture keeps non-ASCII proof content"
     );
     let view = assemble_active_view(
@@ -1556,7 +1557,7 @@ fn final_utf8_measurement_includes_non_ascii_bytes() {
         view.serialized_bytes.len() as u64
     );
     assert!(
-        view.serialized_bytes.len() > content.chars().count(),
+        view.serialized_bytes.len() > material.chars().count(),
         "byte length exceeds scalar count for non-ASCII"
     );
     assert!(
@@ -1776,12 +1777,12 @@ fn measurement_port_called_exactly_once_on_final_bytes() {
 fn source_guard_rejects_local_fallback_estimators() {
     let value = admitted();
     let context = value.binding.clone();
-    let content = match &value.records[0].candidate.representation {
+    let material = match &value.records[0].candidate.representation {
         AtomRepresentation::Whole { content } => content.clone(),
         other => panic!("fixture must stay whole, got {other:?}"),
     };
-    let char_count = content.chars().count() as u64;
-    let byte_count = content.len() as u64;
+    let char_count = material.chars().count() as u64;
+    let byte_count = material.len() as u64;
     assert!(byte_count > char_count, "non-ASCII separates bytes from chars");
     let view = assemble_active_view(
         &value,
