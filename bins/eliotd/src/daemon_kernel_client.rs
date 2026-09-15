@@ -700,11 +700,7 @@ impl DaemonKernelClient {
     /// admission carries no result body by design), fails to decode, or fails
     /// its own digest binding; `NotAdmitted` / `Unknown` for transport
     /// outcomes via [`kernel_port_error`].
-    #[allow(
-        dead_code,
-        reason = "staged forwarding transport for the local_read serving arm; the capability twin gates and serves locally while the kernel-caller bridge that forwards admitted pairs lands in a follow-up"
-    )]
-    pub(super) async fn local_read_async(
+    pub(crate) async fn local_read_async(
         &self,
         envelope: HostRequestEnvelope,
         tool: serde_json::Value,
@@ -810,6 +806,7 @@ mod tests {
     use serde_json::{Value, json};
 
     use crate::KernelLaunchBinding;
+    use crate::forward_admitted_local_read;
     use crate::kernel_context_read_client::KernelContextReadClient;
 
     const TEST_LINEAGE: &str = "550e8400-e29b-41d4-a716-446655440000";
@@ -1121,18 +1118,24 @@ mod tests {
             "packet must stay admission-only as Unavailable, got {admitted_only:?}"
         );
 
-        // The forwarding transport fails closed before transport: a wrong
-        // fence is Contract (not a Kernel round-trip), never Ok-empty.
-        let transport_fenced =
-            runtime.block_on(client.local_read_async(wrong_envelope, tool.clone()));
+        // The production forwarding bridge fails closed before transport: a
+        // wrong fence is Contract (not a Kernel round-trip), never Ok-empty.
+        let transport_fenced = runtime.block_on(forward_admitted_local_read(
+            &client,
+            wrong_envelope,
+            tool.clone(),
+        ));
         assert!(
             matches!(transport_fenced, Err(KernelPortError::Contract(_))),
             "a wrong fence must fail the local_read transport closed as Contract, got {transport_fenced:?}"
         );
 
         // A malformed pair is Contract before transport is touched.
-        let malformed =
-            runtime.block_on(client.local_read_async(envelope.clone(), json!("not-an-object")));
+        let malformed = runtime.block_on(forward_admitted_local_read(
+            &client,
+            envelope.clone(),
+            json!("not-an-object"),
+        ));
         assert!(
             matches!(malformed, Err(KernelPortError::Contract(_))),
             "a malformed pair must fail the local_read transport closed as Contract, got {malformed:?}"

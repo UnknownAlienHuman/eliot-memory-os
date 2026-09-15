@@ -85,7 +85,10 @@ pub use dreamer_materials::{
 pub use dreamer_model_adapter::{
     DreamerModelExecution, GovernedDreamerModelAdapter, ModelInvokeInput,
 };
-pub use governor_local_read::{answer_evidence_query, answer_projection_inputs};
+pub use governor_local_read::{
+    answer_evidence_query, answer_projection_inputs, forward_admitted_local_read,
+    serve_admitted_local_read,
+};
 pub(crate) use kernel_authority_client::KernelAuthorityClient;
 pub use kernel_context_read_client::KernelContextReadClient;
 pub use store_failure_projection::{GovernorStoreFailureProjection, GovernorStoreProjectionError};
