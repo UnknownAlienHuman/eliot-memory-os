@@ -1,0 +1,1 @@
+{"forbidden_surface":["capture","restore","key_service","Store","network","persistent_state"],"note":"Worker B fixture: real BackupBundle build/encode/decode/validate round-trip with no capture/restore/key/Store/network/state API. Positive and negative vectors exercise the exact public constructors only.","round_trip":"build-encode-decode-validate"}
