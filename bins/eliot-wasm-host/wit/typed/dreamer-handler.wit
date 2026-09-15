@@ -1,0 +1,262 @@
+package eliot:current@0.1.0;
+
+// ELIOT typed current ABI — dreamer-handler world.
+// Package: eliot:current@0.1.0. World: dreamer-handler. Interface: handler.
+// Native owner: A-03 #578 validated request/result envelope with exact subtype payloads.
+// Consumers: #632 Orientation, #634 ResearchSynthesis, #636 Curation.
+// One common validated candidate-only envelope plus exhaustive typed payload
+// discriminators. Subtypes cannot interchange by shape. Unknown is explicit
+// unsupported, never fallback. No post-handler A-05 invocation encoded.
+// Curation carries typed registry identity/data only; no callable objects.
+
+interface handler {
+  type artifact-id = string;
+  type digest-hex = string;
+
+  enum job-class {
+    orientation,
+    curation,
+    clarification,
+    research-synthesis,
+    architecture-self-query,
+    development-diagnosis,
+    maintenance,
+    orchestration-planning,
+    configuration-assistance,
+  }
+
+  enum requester-origin {
+    human,
+    admitted-agent,
+    schedule-policy,
+  }
+
+  enum preservation-dimension {
+    coverage,
+    faithfulness,
+    lineage,
+    reversibility,
+    authority-ceiling,
+    dependency-closure,
+    provenance-retention,
+  }
+
+  enum curation-kind {
+    classification,
+    relation,
+    episode,
+    concept,
+    procedure,
+    failure,
+    merge,
+    split,
+    reconsolidation,
+    accessibility,
+    repair,
+  }
+
+  enum curation-family {
+    classification,
+    relation,
+    episode,
+    concept,
+    procedure,
+    failure,
+    structure-repair,
+    reconsolidation,
+    accessibility,
+    memory-repair,
+  }
+
+  enum candidate-disposition {
+    candidate,
+    duplicate,
+    conflict,
+    abstention,
+    partial,
+    blocked,
+    unsupported,
+    internal-defect,
+  }
+
+  record requester {
+    principal: string,
+    origin: requester-origin,
+    session: string,
+  }
+
+  record budget-limits {
+    max-input-bytes: u32,
+    max-output-bytes: u32,
+    max-candidates: u16,
+    max-work: u64,
+    max-depth: u8,
+  }
+
+  record dimension-verdict {
+    dimension: preservation-dimension,
+    passed: bool,
+    known: bool,
+    note: string,
+  }
+
+  record preservation-report {
+    verdicts: list<dimension-verdict>,
+  }
+
+  // Orientation subtype payload: self-contained, requires no later output.
+  record orientation-payload {
+    summary: string,
+    findings: list<string>,
+    unknowns: list<string>,
+  }
+
+  // ResearchSynthesis subtype: governed ResearchPack -> candidate ResearchBrief.
+  // Preserves claims/counterclaims, citations, lineage, rivals, unknowns, probes,
+  // inert concilium recommendation. Never invents evidence.
+  record research-pack-ref {
+    pack-digest: digest-hex,
+    source-denominator: list<artifact-id>,
+    question: string,
+    authorized-sources: list<artifact-id>,
+  }
+
+  record research-claim {
+    claim-id: artifact-id,
+    support: list<artifact-id>,
+    counterclaim: list<artifact-id>,
+    citations: list<artifact-id>,
+  }
+
+  record research-brief {
+    pack: research-pack-ref,
+    claims: list<research-claim>,
+    rivals: list<string>,
+    unknowns: list<string>,
+    probes: list<string>,
+    concilium-note: string,
+    disposition: candidate-disposition,
+  }
+
+  record research-payload {
+    pack: research-pack-ref,
+    brief: research-brief,
+  }
+
+  // Curation subtype: closed per-kind payload discriminators.
+  record classification-payload {
+    label: string,
+    confidence-bps: u32,
+    targets: list<string>,
+    evidence-refs: list<string>,
+  }
+
+  record relation-payload {
+    from-handle: string,
+    to-handle: string,
+    predicate: string,
+    evidence-refs: list<string>,
+  }
+
+  record generic-curation-payload {
+    kind: curation-kind,
+    targets: list<string>,
+    evidence-refs: list<string>,
+    note: string,
+  }
+
+  variant curation-payload {
+    classification(classification-payload),
+    relation(relation-payload),
+    generic(generic-curation-payload),
+  }
+
+  record curation-request-ref {
+    family: curation-family,
+    kinds: list<curation-kind>,
+    handler-id: string,
+    registry-digest: digest-hex,
+    payload: curation-payload,
+  }
+
+  // Exhaustive subtype discriminator; unknown is explicit unsupported.
+  variant handler-subtype {
+    orientation(orientation-payload),
+    research-synthesis(research-payload),
+    curation(curation-request-ref),
+    unsupported(unsupported-subtype),
+  }
+
+  record unsupported-subtype {
+    want-kind: string,
+    human-detail: string,
+  }
+
+  record validated-candidate {
+    schema-revision: u32,
+    operation-id: string,
+    job: job-class,
+    requester: requester,
+    task-id: string,
+    attempt-id: string,
+    scope-id: string,
+    fence-epoch: string,
+    fence-generation: u64,
+    bundle-digest: digest-hex,
+    manifest-digest: digest-hex,
+    grounding-digest: digest-hex,
+    validation-receipt: digest-hex,
+    subtype: handler-subtype,
+    budget: budget-limits,
+    preservation: preservation-report,
+    deadline-ms: option<s64>,
+    cancelled: bool,
+  }
+
+  record handler-result-body {
+    operation-id: string,
+    job: job-class,
+    subtype: handler-subtype,
+    disposition: candidate-disposition,
+    preservation: preservation-report,
+    output-digest: digest-hex,
+    proof-ceiling: string,
+    frontier: list<artifact-id>,
+  }
+
+  variant handler-outcome {
+    handled(handler-result-body),
+  }
+
+  record abi-descriptor {
+    world-name: string,
+    package-id: string,
+    abi-revision: u32,
+    native-contract: string,
+    native-revision: string,
+    abi-digest: string,
+  }
+
+  variant handler-error {
+    malformed(handler-malformed),
+    kind-mismatch(handler-kind),
+    unsupported-subtype-error(handler-unsupported),
+    budget-exceeded(handler-budget),
+    unsupported-schema(handler-schema),
+    internal(handler-internal),
+  }
+
+  record handler-malformed { field: string, human-detail: string }
+  record handler-kind { want-kind: string, got-kind: string, human-detail: string }
+  record handler-unsupported { want-kind: string, human-detail: string }
+  record handler-budget { human-detail: string }
+  record handler-schema { want-revision: u32, got-revision: u32, human-detail: string }
+  record handler-internal { human-detail: string }
+
+  handle: func(candidate: validated-candidate) -> result<handler-outcome, handler-error>;
+  describe: func() -> abi-descriptor;
+}
+
+world dreamer-handler {
+  export handler;
+}

@@ -1,0 +1,23 @@
+package eliot:current@0.1.0;
+
+interface probe-api {
+  record probe-input {
+    schema-revision: u32,
+    operation-id: string,
+  }
+
+  variant probe-error {
+    malformed(probe-malformed),
+  }
+
+  record probe-malformed {
+    field: string,
+    human-detail: string,
+  }
+
+  probe: func(input: probe-input) -> result<probe-input, probe-error>;
+}
+
+world probe-ok {
+  export probe-api;
+}
