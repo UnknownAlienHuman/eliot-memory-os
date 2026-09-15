@@ -2663,6 +2663,36 @@ mod honest_tests {
     }
 
     #[test]
+    fn legacy_healthy_wire_is_not_a_meta_report() {
+        // T13-S3: the retired legacy status wire must never parse as the Meta
+        // report. Old `Healthy` service state is not current readiness, and
+        // there is intentionally no From/decoder from the legacy shape.
+        let legacy = serde_json::json!({
+            "component": "runtime_status",
+            "mode": "dev-single-process",
+            "pid": 1234,
+            "data_root": "C:/Eliot",
+            "active_profile": "dev-single-process",
+            "single_instance_owned": false,
+            "ipc_enabled": false,
+            "services": [
+                {
+                    "service_name": "lifecycle",
+                    "health": "Healthy",
+                    "started": true,
+                    "restart_budget_remaining": 3,
+                    "message": "dev-single-process service ready"
+                }
+            ],
+            "generated_at": "2026-09-15T00:00:00Z"
+        });
+        assert!(
+            serde_json::from_value::<RuntimeStatusReport>(legacy).is_err(),
+            "legacy Healthy-shaped wire must not parse as Meta RuntimeStatusReport"
+        );
+    }
+
+    #[test]
     fn honest_status_is_not_healthy_with_explicit_gaps() {
         let root = temp_root("not-healthy");
         let report = collect(&root);

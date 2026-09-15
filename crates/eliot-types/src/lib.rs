@@ -343,7 +343,7 @@ pub use runtime::{
     ModuleEndpoint, ModuleHealth, ModuleKind, ModuleManifest, ModuleRegistryReport,
     ModuleResourceLimits, ModuleTransport, RedactionInfo, RuntimeConfig, RuntimeHealthReport,
     RuntimeIpcConfig, RuntimeLocalConfig, RuntimeLogReport, RuntimeLoggingConfig, RuntimeMode,
-    RuntimeModulesConfig, RuntimeStatusReport, SchemaRef, ServiceHealthState, ServiceRuntimeStatus,
+    RuntimeModulesConfig, SchemaRef, ServiceHealthState, ServiceRuntimeStatus,
 };
 pub use runtime_supervision::{
     AdapterCircuitState, DESCENDANTS_AT_ROOT_EXIT_SCHEMA_VERSION, DescendantFileIdentity,
