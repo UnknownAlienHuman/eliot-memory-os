@@ -16,11 +16,17 @@ use super::*;
 mod store_receipt_dispatch;
 use eliot_contracts::StateFence;
 use eliot_store_api::{
-    CanonicalRequestView, OrderingHeadExpectation, PreparedTransition, RequestMeta,
-    RevisionHeadExpectation, StoreError, StoreGenesisRequest, StoreRecoveryRequest,
-    StoreRecoverySnapshot, WriteReceipt, verify_canonical_request_hash,
+    CanonicalRequestView, NamedReadRequest, NamedReadResponse, OrderingHeadExpectation,
+    PreparedTransition, RequestMeta, RevisionHeadExpectation, StoreError, StoreGenesisRequest,
+    StoreRecoveryRequest, StoreRecoverySnapshot, WriteReceipt, verify_canonical_request_hash,
 };
 use serde::Deserialize;
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct StoreNamedOperation {
+    request: NamedReadRequest,
+}
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -144,6 +150,7 @@ impl KernelComposition {
                     .await
             }
             "receipt" => store_receipt_dispatch::dispatch(self, session, payload).await,
+            "store_named" => self.store_named_operation(session, payload).await,
             "daemon_degraded" => {
                 let reason = payload
                     .get("reason")
@@ -567,6 +574,38 @@ impl KernelComposition {
     }
 
     #[cfg(windows)]
+    async fn store_named_operation(
+        &self,
+        session: &Session,
+        payload: serde_json::Value,
+    ) -> Result<serde_json::Value, TransportError> {
+        let operation: StoreNamedOperation =
+            serde_json::from_value(payload).map_err(|_| TransportError::SessionFenced)?;
+        if let Err(error) = operation.request.validate() {
+            return Ok(Self::store_error_response_text(
+                "store_named",
+                &error.to_string(),
+            ));
+        }
+        validate_store_session_fence(session, &operation.request.state_fence)?;
+        let gateway = self.retained_store_gateway()?;
+        match gateway.execute_named(operation.request).await {
+            Ok(response) => Ok(store_named_response(&response)),
+            Err(error) => Ok(Self::store_error_response_text("store_named", &error)),
+        }
+    }
+
+    #[cfg(not(windows))]
+    async fn store_named_operation(
+        &self,
+        _session: &Session,
+        payload: serde_json::Value,
+    ) -> Result<serde_json::Value, TransportError> {
+        let _ = payload;
+        Err(TransportError::SessionFenced)
+    }
+
+    #[cfg(windows)]
     fn retained_store_gateway(&self) -> Result<Arc<KernelStoreGateway>, TransportError> {
         self.canonical_store_gateway
             .lock()
@@ -629,4 +668,68 @@ fn store_apply_response(receipt: &WriteReceipt) -> serde_json::Value {
         "value": { "kind": "write_receipt", "value": receipt },
         "recovery": null,
     })
+}
+
+fn store_named_response(response: &NamedReadResponse) -> serde_json::Value {
+    serde_json::json!({
+        "status": "known",
+        "value": { "kind": "store_named", "value": response },
+        "recovery": null,
+    })
+}
+
+#[cfg(test)]
+#[allow(clippy::expect_used, clippy::unwrap_used)]
+mod store_named_dispatch_tests {
+    use super::*;
+
+    #[test]
+    fn store_named_operation_rejects_unknown_fields_and_projects_typed_response() {
+        let fence = StateFence::new(
+            eliot_contracts::EpochId::new(
+                eliot_contracts::EpochLineageId::new("550e8400-e29b-41d4-a716-446655440000")
+                    .expect("lineage"),
+                std::num::NonZeroU64::new(1).expect("sequence"),
+            )
+            .expect("epoch"),
+            eliot_contracts::ResourceGeneration::genesis(),
+        );
+        let request = NamedReadRequest {
+            operation: eliot_store_api::NamedReadOperation::GetEvidencePack,
+            scope_id: None,
+            consistency: eliot_store_api::ReadConsistency::ExactFence,
+            state_fence: fence.clone(),
+            parameters: std::collections::BTreeMap::new(),
+        };
+        let mut payload = serde_json::to_value(&request).expect("request encodes");
+        if let serde_json::Value::Object(map) = &mut payload {
+            map.insert("unknown_field".to_owned(), serde_json::Value::Null);
+        }
+        let rejected: Result<StoreNamedOperation, _> = serde_json::from_value(serde_json::json!({
+            "request": payload,
+        }));
+        assert!(
+            rejected.is_err(),
+            "deny_unknown_fields must reject a widened named-read envelope"
+        );
+
+        let response = NamedReadResponse {
+            operation: eliot_store_api::NamedReadOperation::GetEvidencePack,
+            state_fence: fence,
+            revision_heads: Vec::new(),
+            payload: serde_json::json!({ "version": 1 }),
+        };
+        let projected = store_named_response(&response);
+        assert_eq!(projected.get("status"), Some(&serde_json::json!("known")));
+        assert_eq!(
+            projected.get("value").and_then(|value| value.get("kind")),
+            Some(&serde_json::json!("store_named"))
+        );
+        let expected = serde_json::to_value(&response).expect("response encodes");
+        assert_eq!(
+            projected.get("value").and_then(|value| value.get("value")),
+            Some(&expected)
+        );
+        assert_eq!(projected.get("recovery"), Some(&serde_json::Value::Null));
+    }
 }
