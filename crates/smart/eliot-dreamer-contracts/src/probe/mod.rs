@@ -1,9 +1,19 @@
 //! Canonical A-03 declarations consumed by the pure A-17b probe planner.
 
+pub mod affordance;
 pub mod bounds;
 pub mod objective;
 pub mod result;
 pub(crate) mod validation;
+
+pub use affordance::{
+    AffordanceKind, AffordanceTarget, AuthorityDimension, ConsentDimension, ContextDimension,
+    CostDimension, EffectDimension, FeasibilityDimension, HumanAttentionDimension,
+    INQUIRY_AFFORDANCE_SCHEMA_VERSION, INQUIRY_AFFORDANCE_SET_SCHEMA_VERSION, InformationDimension,
+    InquiryAffordanceDescriptor, InquiryAffordanceDescriptorParams, InquiryAffordanceSet,
+    InquiryAffordanceSetParams, LatencyDimension, PrivacyDimension, ResourceDimension,
+    ReversibilityDimension,
+};
 
 pub use bounds::{
     MAX_PROBE_BRANCHES, MAX_PROBE_ITEMS, MAX_PROBE_TEXT_BYTES, MAX_PROBE_UPDATES_PER_BRANCH,

@@ -112,9 +112,15 @@ pub use failure::{
 };
 pub use job::{DreamJobInput, JobClass, Requester, RequesterOrigin, parse_job_class};
 pub use probe::{
-    GapUpdateMeaning, PossibleResultSchema, PossibleResultValue, ProbeObjective,
-    ProbeObjectiveOrigin, ProbeObjectiveRef, ProbeObjectiveTarget, ProbeOwnerRef, ResultBranch,
-    ResultTarget, ResultUpdate, RivalUpdateMeaning,
+    AffordanceKind, AffordanceTarget, AuthorityDimension, ConsentDimension, ContextDimension,
+    CostDimension, EffectDimension, FeasibilityDimension, GapUpdateMeaning,
+    HumanAttentionDimension, INQUIRY_AFFORDANCE_SCHEMA_VERSION,
+    INQUIRY_AFFORDANCE_SET_SCHEMA_VERSION, InformationDimension, InquiryAffordanceDescriptor,
+    InquiryAffordanceDescriptorParams, InquiryAffordanceSet, InquiryAffordanceSetParams,
+    LatencyDimension, PossibleResultSchema, PossibleResultValue, PrivacyDimension, ProbeObjective,
+    ProbeObjectiveOrigin, ProbeObjectiveRef, ProbeObjectiveTarget, ProbeOwnerRef,
+    ResourceDimension, ResultBranch, ResultTarget, ResultUpdate, ReversibilityDimension,
+    RivalUpdateMeaning,
 };
 pub use registry::{
     AtomicityMode, CURATION_FAMILIES, CurationFamily, CurationHandlerDescriptor,
@@ -133,14 +139,18 @@ pub use relation::{
 };
 pub use rival::{
     ClaimDeclarations, CommonModeDisclosure, ConditionAssumptionRef, CurrentPositionAvailability,
-    CurrentPositionBinding, DeclarationAvailability, ForecastAvailability, MaterialClaimRef,
-    PredictionAvailability, RIVAL_DECLARATION_SET_SCHEMA_VERSION, RIVAL_MODEL_SCHEMA_VERSION,
-    RIVAL_PREDICTION_SCHEMA_VERSION, RelatedRivalModelReference, RivalAssumptionSlot,
-    RivalClaimSlot, RivalCoverageDeclaration, RivalCoverageReceipt, RivalDeclarationSet,
-    RivalDeclarationSetParams, RivalDependency, RivalForecast, RivalModelDeclaration,
-    RivalModelDeclarationParams, RivalModelRef, RivalModelSlot, RivalPrediction,
+    CurrentPositionBinding, DeclarationAvailability, DiscriminatorPeerAddress,
+    ForecastAvailability, MaterialClaimRef, PredictionAvailability,
+    RIVAL_DECLARATION_SET_SCHEMA_VERSION, RIVAL_MODEL_SCHEMA_VERSION,
+    RIVAL_MODEL_SET_SCHEMA_VERSION, RIVAL_PREDICTION_SCHEMA_VERSION, RelatedRivalModelReference,
+    RequirementFacet, RequirementReason, RetainedDiscriminator, RivalAssumptionSlot,
+    RivalClaimSlot, RivalCoverageDeclaration, RivalCoverageReceipt, RivalCoverageStatus,
+    RivalCoverageSummary, RivalDeclarationSet, RivalDeclarationSetParams, RivalDeclarationSetRef,
+    RivalDependency, RivalForecast, RivalModelDeclaration, RivalModelDeclarationParams,
+    RivalModelRef, RivalModelSet, RivalModelSetParams, RivalModelSlot, RivalPrediction,
     RivalPredictionParams, RivalPredictionRef, RivalPredictionSlot, RivalSourceSlot,
-    SuppliedLineage, TemporalAvailability, VerifierAvailability,
+    SuppliedLineage, TemporalAvailability, UnresolvedDiscriminatorRequirement,
+    VerifierAvailability,
 };
 pub use screen::{ScreenBinding, ScreenEligibility, ScreenReference, ScreenState};
 pub use self_query::{
