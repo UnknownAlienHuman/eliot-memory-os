@@ -1,0 +1,1 @@
+{"note":"Worker A fixture: ORS suspension is not resolution. Suspended import with unknown unresolved effects must not validate as operationally ready.","operationally_validated":false,"ors_suspended":true,"unresolved_effect_reconciliation":"unknown"}

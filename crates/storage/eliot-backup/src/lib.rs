@@ -835,6 +835,15 @@ fn validate_class_requirements(bundle: &BackupBundle) -> Result<(), BackupError>
 }
 
 /// Context for compiling an isolated restore plan.
+///
+/// `target_authority_epoch`/`target_resource_generation` are caller-proposed
+/// planning inputs only. They are not accepted owner-issued authority: the
+/// caller cannot mint authority by incrementing an integer. `RestorePlan::compile`
+/// and `RestoredFence::validate` check that the proposal advances the observed
+/// source lineage under the lineage-aware rule (same lineage must advance;
+/// a new lineage must be genesis at sequence 1 with a newer generation), and
+/// production composition must attach exact owner-issued lineage evidence
+/// (see [`RestoreOwnerEpoch`]/[`ObservedLineageLimit`]) before cutover.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct RestoreContext {
@@ -971,8 +980,12 @@ pub struct RestoreAppliedEffect {
 
 /// Result of reconciling an intent whose effect may have happened before a
 /// process restart. Only an exact applied receipt may resume the transaction.
+/// `Unknown` (the fail-closed default) and `NotApplied` carry no payload by
+/// construction: an unknown possible effect stays unknown and is distinct
+/// from not-attempted and success.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
+#[allow(clippy::large_enum_variant)]
 pub enum RestoreReconciliation {
     Applied(RestoreAppliedEffect),
     NotApplied,
@@ -1531,20 +1544,14 @@ fn validate_applied_effect(
         .as_ref()
         .ok_or(BackupError::RestoreEvidenceIncomplete)?;
     evidence.validate()?;
+    let expected_level = RestoreEvidenceLevel::for_class(bundle.manifest.class);
+    if evidence.evidence_level() != expected_level {
+        return Err(BackupError::RestoreEvidenceLevelMismatch);
+    }
     if sha256(evidence)? != applied.receipt.evidence_sha256 {
         return Err(BackupError::FinalizeEvidenceMismatch);
     }
-    if bundle.ors_snapshot.is_some() && !evidence.ors_suspended {
-        return Err(BackupError::RestoreEvidenceIncomplete);
-    }
-    if evidence.target_id != plan.target.target_id
-        || !evidence
-            .authority_epoch
-            .is_same_authority(&plan.restored_fence.authority_epoch)
-        || evidence.resource_generation != plan.restored_fence.resource_generation
-    {
-        return Err(BackupError::FinalizeEvidenceMismatch);
-    }
+    evidence.validate_against_plan(plan, bundle)?;
     Ok(Some(RestoreReceipt {
         receipt_id: format!("restore-receipt-{}", plan.plan_id),
         plan_id: plan.plan_id.clone(),
@@ -1552,13 +1559,447 @@ fn validate_applied_effect(
         target_id: plan.target.target_id.clone(),
         restored_fence: plan.restored_fence.clone(),
         effect_receipt_sha256: sha256(&applied.receipt)?,
+        evidence_level: RestoreEvidenceLevel::for_class(bundle.manifest.class),
         canonical_only: bundle.manifest.class != BackupClass::FullRecovery,
-        operational_recovery_ready: bundle.manifest.class == BackupClass::FullRecovery,
+        operational_recovery_ready: false,
         cutover_performed: false,
     }))
 }
 
+/// Distinct restore proof ceilings. Archive class validity, isolated import,
+/// effect reconciliation, operational validation, and cutover are different
+/// evidence levels; no later level is inferred from an enum class or Boolean.
+///
+/// - `ArchiveValid`: the bundle passed archive/build verification only.
+/// - `IsolatedImportComplete`: the isolated root imported bytes, purge,
+///   receipts, and projections with no active authority.
+/// - `ReconciliationRequired`: import is staged but external effects remain
+///   unresolved; operational claims and cutover are forbidden.
+/// - `OperationallyValidated`: the exact owner issued bounded validation
+///   evidence for the isolated root (outside this library).
+/// - `Cutover`: a separate Human/System Owner authorization (outside this
+///   library; this library never emits it).
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RestoreEvidenceLevel {
+    ArchiveValid,
+    IsolatedImportComplete,
+    ReconciliationRequired,
+    OperationallyValidated,
+    Cutover,
+}
+
+impl RestoreEvidenceLevel {
+    /// Returns the highest level this library may certify for one class.
+    #[must_use]
+    pub const fn for_class(class: BackupClass) -> Self {
+        match class {
+            // A full archive can be valid while its isolated import still
+            // requires effect reconciliation (I5.13/ORS suspension rule); a
+            // scope transfer can never report installation recovery.
+            BackupClass::FullRecovery => Self::ReconciliationRequired,
+            BackupClass::CanonicalOnlyDegraded | BackupClass::ScopeExport => {
+                Self::IsolatedImportComplete
+            }
+        }
+    }
+
+    /// Returns whether this level may assert operational recovery readiness.
+    ///
+    /// Only owner-issued [`OperationalValidationEvidence`] at
+    /// `OperationallyValidated` (and a separate cutover authority at
+    /// `Cutover`) may do so; the levels this library emits never qualify.
+    #[must_use]
+    pub const fn permits_operational_readiness(self) -> bool {
+        match self {
+            Self::ArchiveValid | Self::IsolatedImportComplete | Self::ReconciliationRequired => {
+                false
+            }
+            Self::OperationallyValidated | Self::Cutover => true,
+        }
+    }
+}
+
+/// Exact trust binding under which an owner identity was authenticated.
+///
+/// The binding is the minimal composition-boundary receipt reference (owner
+/// identity plus the transport/session/key material that authenticated it);
+/// arbitrary decoded data never certifies itself through a local hash.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct OwnerTrustBinding {
+    pub owner_id: String,
+    pub trust_binding_ref: String,
+}
+
+impl OwnerTrustBinding {
+    pub fn validate(&self) -> Result<(), BackupError> {
+        text(&self.owner_id, "owner.owner_id")?;
+        text(&self.trust_binding_ref, "owner.trust_binding_ref")?;
+        Ok(())
+    }
+}
+
+/// One attributable owner obligation for a restore evidence bundle.
+///
+/// Each applicable obligation is represented either by the minimal exact
+/// existing owner receipt/reference (an opaque, owner-issued, authenticated
+/// string whose issuer is named in `owner_id`) or by an explicit
+/// [`RestoreObligationState::MissingCapability`]. Execution of unresolved
+/// obligations belongs to the real owner integration (#960/#961); its absence
+/// must not be hidden as successful library execution. UI/broker invalidation
+/// belongs to the real runtime owner when that integration is present.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RestoreOwnerObligation {
+    pub owner_id: String,
+    pub evidence_ref: String,
+    pub state: RestoreObligationState,
+}
+
+/// Attributable state of one owner obligation.
+///
+/// `Satisfied` carries no payload beyond the owner-issued reference on the
+/// enclosing obligation: the reference itself is the minimal exact owner
+/// receipt. `NotAttempted`/`Unknown` preserve the class/capability/identity
+/// distinction required by diagnostics; unknown possible effect stays unknown.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RestoreObligationState {
+    Satisfied,
+    NotAttempted,
+    Unknown,
+    MissingCapability,
+}
+
+/// Observed lineage ceiling bound by the exact owner contract.
+///
+/// The library validates candidate epochs against every relevant observed
+/// limit; it never mints authority by incrementing an integer. New epochs must
+/// exceed all relevant observed authority lineages under their owner's
+/// contract before the owner issues [`RestoreOwnerEpoch`].
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ObservedLineageLimit {
+    pub owner_id: String,
+    pub observed_epoch: EpochId,
+    pub observed_generation: ResourceGeneration,
+}
+
+impl ObservedLineageLimit {
+    pub fn validate(&self) -> Result<(), BackupError> {
+        text(&self.owner_id, "lineage_limit.owner_id")?;
+        Ok(())
+    }
+}
+
+/// Exact owner-issued new-epoch evidence.
+///
+/// Authenticated at the real owner/composition boundary. A caller-proposed
+/// target epoch (see [`RestoreContext`]) is planning input, not accepted
+/// authority; only this owner-issued value may support cutover, and cutover
+/// itself remains a separate authorization (#961) outside this library.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RestoreOwnerEpoch {
+    pub owner: OwnerTrustBinding,
+    pub new_epoch: EpochId,
+    pub new_generation: ResourceGeneration,
+    pub supersedes: Vec<ObservedLineageLimit>,
+}
+
+impl RestoreOwnerEpoch {
+    pub fn validate(&self) -> Result<(), BackupError> {
+        self.owner.validate()?;
+        if self.supersedes.is_empty() {
+            return Err(BackupError::RestoreEvidenceIncomplete);
+        }
+        for limit in &self.supersedes {
+            limit.validate()?;
+            let same_lineage = self.new_epoch.lineage_id == limit.observed_epoch.lineage_id;
+            let advances = if same_lineage {
+                self.new_epoch.sequence.get() > limit.observed_epoch.sequence.get()
+            } else {
+                self.new_epoch.sequence.get() == 1
+            };
+            if !advances || self.new_generation <= limit.observed_generation {
+                return Err(BackupError::StaleRestoreLineage);
+            }
+        }
+        // The exact-tuple rule (`EpochId::is_same_authority`): equal sequences
+        // from different lineages are unrelated and never authorize, so a
+        // candidate that reuses an observed sequence under a different lineage
+        // with a non-genesis sequence is rejected above.
+        Ok(())
+    }
+}
+
+/// Bounded owner-issued validation evidence for an isolated root.
+///
+/// Transport acknowledgement, content equality, checksum validity, a phase
+/// count, or a self-asserted `active_authority_restored = false` is
+/// insufficient operational proof. Only the exact owner named in `owner` may
+/// issue this evidence, and only for the exact isolated destination named in
+/// `target_ref`.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct OperationalValidationEvidence {
+    pub owner: OwnerTrustBinding,
+    pub target_ref: String,
+    pub validation_digest: String,
+    pub observed_at_state_fence: StateFence,
+}
+
+impl OperationalValidationEvidence {
+    pub fn validate(&self) -> Result<(), BackupError> {
+        self.owner.validate()?;
+        text(&self.target_ref, "operational.target_ref")?;
+        digest(&self.validation_digest, "operational.validation_digest")?;
+        self.observed_at_state_fence
+            .validate()
+            .map_err(|error| BackupError::Foundation(error.to_string()))?;
+        Ok(())
+    }
+}
+
+/// Complete current owner-issued denominator for a known-zero unresolved
+/// count.
+///
+/// A complete known-zero unresolved count requires a complete current
+/// owner-issued denominator: `expected_total` is the exact owner-issued count
+/// of known reconciliation items and `reconciled_refs` names each reconciled
+/// item. Suspension is not resolution.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ReconciliationDenominator {
+    pub owner_id: String,
+    pub denominator_ref: String,
+    pub expected_total: u64,
+    pub reconciled_refs: Vec<String>,
+}
+
+impl ReconciliationDenominator {
+    pub fn validate(&self) -> Result<(), BackupError> {
+        text(&self.owner_id, "reconciliation.owner_id")?;
+        text(&self.denominator_ref, "reconciliation.denominator_ref")?;
+        unique(
+            self.reconciled_refs.iter().cloned(),
+            "reconciliation.reconciled_refs",
+        )?;
+        for reference in &self.reconciled_refs {
+            text(reference, "reconciliation.reconciled_ref")?;
+        }
+        if self.reconciled_refs.len() as u64 != self.expected_total {
+            return Err(BackupError::RestoreEvidenceIncomplete);
+        }
+        Ok(())
+    }
+
+    /// Returns whether the denominator proves known-zero unresolved work.
+    #[must_use]
+    pub fn is_known_zero(&self) -> bool {
+        // `validate` already enforces `reconciled == expected_total`; a
+        // zero total with zero reconciled refs is the only known-zero shape.
+        self.expected_total == 0 && self.reconciled_refs.is_empty()
+    }
+}
+
+/// Separately attributable owner obligations bound to one restore.
+///
+/// Every field is load-bearing: each applicable obligation carries the minimal
+/// exact existing owner receipt/reference or an explicit missing capability.
+/// `watchdog_spool`/`external_source`/`ui_broker` default to
+/// `MissingCapability` so absent evidence fails closed instead of reading as
+/// success; `MissingCapability` is a typed explicit state, not success.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RestoreObligations {
+    pub purge: RestoreOwnerObligation,
+    pub canonical_validation: RestoreOwnerObligation,
+    pub reference_validation: RestoreOwnerObligation,
+    pub blob_validation: RestoreOwnerObligation,
+    pub ors_suspension: RestoreOwnerObligation,
+    pub unresolved_effect_reconciliation: RestoreOwnerObligation,
+    pub watchdog_signals: RestoreOwnerObligation,
+    pub external_source_revalidation: RestoreOwnerObligation,
+    pub runtime_invalidation: RestoreOwnerObligation,
+    pub session_invalidation: RestoreOwnerObligation,
+    pub lease_invalidation: RestoreOwnerObligation,
+    pub route_invalidation: RestoreOwnerObligation,
+    pub user_broker_invalidation: RestoreOwnerObligation,
+}
+
+impl RestoreObligations {
+    pub fn validate(&self) -> Result<(), BackupError> {
+        for obligation in self.all() {
+            text(&obligation.owner_id, "obligation.owner_id")?;
+            text(&obligation.evidence_ref, "obligation.evidence_ref")?;
+            // `MissingCapability` and `NotAttempted`/`Unknown` are explicit
+            // typed states; only structurally invalid identities fail here.
+            // Unsatisfied applicable obligations gate readiness in
+            // `RestoreEvidence::operationally_validated_by_owner`.
+        }
+        Ok(())
+    }
+
+    fn all(&self) -> [&RestoreOwnerObligation; 13] {
+        [
+            &self.purge,
+            &self.canonical_validation,
+            &self.reference_validation,
+            &self.blob_validation,
+            &self.ors_suspension,
+            &self.unresolved_effect_reconciliation,
+            &self.watchdog_signals,
+            &self.external_source_revalidation,
+            &self.runtime_invalidation,
+            &self.session_invalidation,
+            &self.lease_invalidation,
+            &self.route_invalidation,
+            &self.user_broker_invalidation,
+        ]
+    }
+
+    /// Returns whether every obligation is satisfied by its exact owner.
+    #[must_use]
+    pub fn all_satisfied(&self) -> bool {
+        self.all()
+            .iter()
+            .all(|obligation| obligation.state == RestoreObligationState::Satisfied)
+    }
+}
+
+/// Full provenance and identity binding for one isolated restore.
+///
+/// Binds transaction/phase/operation identity, source archive/class/digest,
+/// source and isolated destination, expected predecessor, current
+/// schema/build/purge revision, owner identity/trust binding,
+/// generation/epoch, and bounded validation evidence. A supplied journal
+/// object is not automatically an admitted durable journal: production
+/// composition must bind the current persistent owner, exact
+/// database/installation/generation, journal identity, and receipt
+/// (see [`RestoreJournalAdmission`]).
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RestoreProvenance {
+    pub transaction_id: String,
+    pub plan_id: String,
+    pub operation_id: String,
+    pub phase: RestorePhase,
+    pub source_archive_id: String,
+    pub source_class: BackupClass,
+    pub source_digest: String,
+    pub source_endpoint_ref: String,
+    pub isolated_destination_ref: String,
+    pub expected_predecessor_ref: String,
+    pub schema_revision: String,
+    pub build_manifest_digest: String,
+    pub purge_ledger_revision: u64,
+    pub owner: OwnerTrustBinding,
+    pub observed_generation: ResourceGeneration,
+    pub observed_epoch: EpochId,
+    pub validation_digest: String,
+}
+
+impl RestoreProvenance {
+    pub fn validate(&self) -> Result<(), BackupError> {
+        text(&self.transaction_id, "provenance.transaction_id")?;
+        text(&self.plan_id, "provenance.plan_id")?;
+        text(&self.operation_id, "provenance.operation_id")?;
+        text(&self.source_archive_id, "provenance.source_archive_id")?;
+        digest(&self.source_digest, "provenance.source_digest")?;
+        text(&self.source_endpoint_ref, "provenance.source_endpoint_ref")?;
+        text(
+            &self.isolated_destination_ref,
+            "provenance.isolated_destination_ref",
+        )?;
+        text(
+            &self.expected_predecessor_ref,
+            "provenance.expected_predecessor_ref",
+        )?;
+        text(&self.schema_revision, "provenance.schema_revision")?;
+        digest(
+            &self.build_manifest_digest,
+            "provenance.build_manifest_digest",
+        )?;
+        digest(&self.validation_digest, "provenance.validation_digest")?;
+        self.owner.validate()?;
+        Ok(())
+    }
+}
+
+/// Production admission binding for the durable journal behind a restore.
+///
+/// An in-memory fixture has only fixture proof; a supplied journal object is
+/// not automatically an admitted durable journal. Production composition must
+/// bind the current persistent owner, exact database/installation/generation,
+/// journal identity, and receipt. There is no no-op production fallback.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RestoreJournalAdmission {
+    pub persistent_owner: OwnerTrustBinding,
+    pub database_ref: String,
+    pub installation_ref: String,
+    pub generation: ResourceGeneration,
+    pub journal_identity_ref: String,
+    pub admission_receipt_ref: String,
+    pub fixture_proof_only: bool,
+}
+
+impl RestoreJournalAdmission {
+    pub fn validate(&self) -> Result<(), BackupError> {
+        self.persistent_owner.validate()?;
+        text(&self.database_ref, "journal.database_ref")?;
+        text(&self.installation_ref, "journal.installation_ref")?;
+        text(&self.journal_identity_ref, "journal.journal_identity_ref")?;
+        text(&self.admission_receipt_ref, "journal.admission_receipt_ref")?;
+        Ok(())
+    }
+
+    /// Returns whether this admission may back a production
+    /// durable-recovery claim. Fixture-only journals never qualify.
+    #[must_use]
+    pub const fn admits_production_durable_recovery(&self) -> bool {
+        !self.fixture_proof_only
+    }
+}
+
 /// Evidence returned by the isolated target after all restore steps complete.
+///
+/// Boolean import claims alone are not proof of reconciliation, operational
+/// readiness, or cutover. Every evidence value carries:
+///
+/// - [`RestoreProvenance`]: transaction/phase/operation identity, source
+///   archive/class/digest, source and isolated destination, expected
+///   predecessor, schema/build/purge revision, owner identity/trust binding,
+///   generation/epoch, and bounded validation evidence;
+/// - [`RestoreObligations`]: separately attributable owner obligations (purge,
+///   canonical/reference/blob validation, ORS suspension, unresolved-effect
+///   reconciliation, Watchdog signals, external-source revalidation,
+///   runtime/session/lease/route/UserBroker invalidation), each as the minimal
+///   exact owner receipt/reference or an explicit missing capability;
+/// - [`ObservedLineageLimit`]s plus optional owner-issued
+///   [`RestoreOwnerEpoch`]: proposal-vs-authority separation for epochs (this
+///   library validates, never mints);
+/// - optional [`ReconciliationDenominator`]: the complete current
+///   owner-issued denominator required for a known-zero unresolved count
+///   (suspension is not resolution);
+/// - optional [`OperationalValidationEvidence`]: bounded owner-issued
+///   validation evidence for the isolated root (only the exact named owner
+///   may issue it).
+///
+/// Old sessions/leases/routes/epochs are preserved only as
+/// historical/suspended evidence (see
+/// [`RestoreHistoricalAuthority`]); no library output activates them,
+/// unblocks effects, performs cutover, or retires the source. Closed current
+/// schemas reject unknown/duplicate fields; valid historical archives are
+/// preserved through explicit compatibility/disposition
+/// ([`RestoreArchiveDisposition`]), not silent reinterpretation.
+//
+// The six import-claim booleans are a fixed wire-compatibility surface, not a
+// fungible flag bag: each names one distinct isolated-import gate checked in
+// `validate`, and collapsing them would break the frozen archive/evidence
+// shape. They never assert reconciliation, readiness, or cutover on their own.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 #[allow(clippy::struct_excessive_bools)]
@@ -1573,6 +2014,14 @@ pub struct RestoreEvidence {
     pub active_authority_restored: bool,
     pub authority_epoch: EpochId,
     pub resource_generation: ResourceGeneration,
+    pub provenance: RestoreProvenance,
+    pub obligations: RestoreObligations,
+    pub observed_lineage_limits: Vec<ObservedLineageLimit>,
+    pub owner_epoch: Option<RestoreOwnerEpoch>,
+    pub reconciliation_denominator: Option<ReconciliationDenominator>,
+    pub operational_validation: Option<OperationalValidationEvidence>,
+    pub historical_authority: Vec<RestoreHistoricalAuthority>,
+    pub archive_disposition: RestoreArchiveDisposition,
 }
 
 impl RestoreEvidence {
@@ -1587,11 +2036,196 @@ impl RestoreEvidence {
         {
             return Err(BackupError::RestoreEvidenceIncomplete);
         }
+        self.provenance.validate()?;
+        if self.provenance.observed_epoch.lineage_id != self.authority_epoch.lineage_id
+            || self.provenance.observed_epoch.sequence != self.authority_epoch.sequence
+            || self.provenance.observed_generation != self.resource_generation
+            || self.provenance.isolated_destination_ref != self.target_id
+        {
+            return Err(BackupError::FinalizeEvidenceMismatch);
+        }
+        self.provenance.owner.validate()?;
+        self.obligations.validate()?;
+        if self.observed_lineage_limits.is_empty() {
+            return Err(BackupError::RestoreEvidenceIncomplete);
+        }
+        for limit in &self.observed_lineage_limits {
+            limit.validate()?;
+        }
+        unique(
+            self.observed_lineage_limits
+                .iter()
+                .map(|limit| limit.owner_id.clone()),
+            "evidence.observed_lineage_limits",
+        )?;
+        if let Some(owner_epoch) = &self.owner_epoch {
+            owner_epoch.validate()?;
+        }
+        if let Some(denominator) = &self.reconciliation_denominator {
+            denominator.validate()?;
+        }
+        if let Some(operational) = &self.operational_validation {
+            operational.validate()?;
+            if operational.target_ref != self.target_id {
+                return Err(BackupError::FinalizeEvidenceMismatch);
+            }
+        }
+        for historical in &self.historical_authority {
+            historical.validate()?;
+        }
+        self.archive_disposition.validate()?;
+        Ok(())
+    }
+
+    /// Returns the highest proof level this library may certify from the
+    /// archive class carried in provenance. Never inferred from a Boolean.
+    #[must_use]
+    pub fn evidence_level(&self) -> RestoreEvidenceLevel {
+        RestoreEvidenceLevel::for_class(self.provenance.source_class)
+    }
+
+    /// Validates identity bindings against the compiled plan and bundle.
+    pub fn validate_against_plan(
+        &self,
+        plan: &RestorePlan,
+        bundle: &BackupBundle,
+    ) -> Result<(), BackupError> {
+        if self.target_id != plan.target.target_id
+            || !self
+                .authority_epoch
+                .is_same_authority(&plan.restored_fence.authority_epoch)
+            || self.resource_generation != plan.restored_fence.resource_generation
+        {
+            return Err(BackupError::FinalizeEvidenceMismatch);
+        }
+        if self.provenance.plan_id != plan.plan_id
+            || self.provenance.source_archive_id != bundle.manifest.backup_id
+            || self.provenance.source_class != bundle.manifest.class
+            || self.provenance.source_digest != bundle.bundle_sha256()?
+            || self.provenance.purge_ledger_revision != bundle.manifest.purge_ledger_revision
+            || self.provenance.schema_revision != bundle.manifest.schema_generation
+        {
+            return Err(BackupError::FinalizeEvidenceMismatch);
+        }
+        if bundle.ors_snapshot.is_some()
+            && (!self.ors_suspended
+                || self.obligations.ors_suspension.state != RestoreObligationState::Satisfied)
+        {
+            return Err(BackupError::RestoreEvidenceIncomplete);
+        }
+        Ok(())
+    }
+
+    /// Returns owner-issued operational validation only when every gate holds:
+    /// isolated root with no active authority, all obligations satisfied by
+    /// their exact owners, a complete current denominator proving known-zero
+    /// unresolved work, and bounded validation evidence from the exact owner
+    /// for this exact isolated destination. Otherwise returns
+    /// [`BackupError::RestoreEvidenceIncomplete`] (fail-closed); absence of
+    /// evidence is never success.
+    pub fn operationally_validated_by_owner(
+        &self,
+    ) -> Result<&OperationalValidationEvidence, BackupError> {
+        let operational = self
+            .operational_validation
+            .as_ref()
+            .ok_or(BackupError::RestoreEvidenceIncomplete)?;
+        if !self.isolated_root || self.active_authority_restored {
+            return Err(BackupError::RestoreEvidenceIncomplete);
+        }
+        if !self.obligations.all_satisfied() {
+            return Err(BackupError::RestoreEvidenceIncomplete);
+        }
+        match &self.reconciliation_denominator {
+            Some(denominator) if denominator.is_known_zero() => {}
+            _ => return Err(BackupError::RestoreEvidenceIncomplete),
+        }
+        operational.validate()?;
+        if operational.target_ref != self.target_id {
+            return Err(BackupError::FinalizeEvidenceMismatch);
+        }
+        Ok(operational)
+    }
+}
+
+/// Historical/suspended authority preserved as evidence only.
+///
+/// Old sessions, leases, routes, broker registrations, and epochs return only
+/// in this shape. No library output may activate them, unblock effects,
+/// perform cutover, or retire the source.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RestoreHistoricalAuthority {
+    pub kind: RestoreHistoricalKind,
+    pub historical_ref: String,
+    pub suspended: bool,
+}
+
+impl RestoreHistoricalAuthority {
+    pub fn validate(&self) -> Result<(), BackupError> {
+        text(&self.historical_ref, "historical.historical_ref")?;
+        if !self.suspended {
+            return Err(BackupError::HistoricalAuthorityActivated);
+        }
         Ok(())
     }
 }
 
+/// Closed kind vocabulary for preserved historical authority.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RestoreHistoricalKind {
+    Session,
+    Lease,
+    Route,
+    UserBrokerRegistration,
+    AuthorityEpoch,
+    OrsOperation,
+    WatchdogSignal,
+}
+
+/// Explicit compatibility/disposition for the source archive.
+///
+/// Valid historical archives are preserved through this explicit disposition,
+/// never through silent reinterpretation or fabricated missing evidence.
+/// Closed current schemas reject unknown/duplicate fields at the byte
+/// boundary (all evidence structs use `deny_unknown_fields`); legacy bytes
+/// decode only into this dispositional envelope.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RestoreArchiveDisposition {
+    pub disposition: RestoreArchiveDispositionKind,
+    pub compatibility_ref: String,
+}
+
+impl RestoreArchiveDisposition {
+    pub fn validate(&self) -> Result<(), BackupError> {
+        text(
+            &self.compatibility_ref,
+            "archive_disposition.compatibility_ref",
+        )?;
+        Ok(())
+    }
+}
+
+/// Closed disposition vocabulary for source archives.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RestoreArchiveDispositionKind {
+    Current,
+    HistoricalPreserved,
+    Rejected,
+}
+
 /// Immutable receipt of an isolated restore. It is not a cutover receipt.
+///
+/// `operational_recovery_ready` is always `false` from this library: only the
+/// exact owner named in [`OperationalValidationEvidence`] may assert
+/// operational readiness (at [`RestoreEvidenceLevel::OperationallyValidated`])
+/// for the exact isolated destination, and cutover requires a separate
+/// Human/System Owner authorization (at [`RestoreEvidenceLevel::Cutover`]).
+/// `cutover_performed` is always `false` here. `canonical_only` distinguishes
+/// degraded/scope imports from full archives without upgrading them.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct RestoreReceipt {
@@ -1601,13 +2235,53 @@ pub struct RestoreReceipt {
     pub target_id: String,
     pub restored_fence: RestoredFence,
     pub effect_receipt_sha256: String,
+    pub evidence_level: RestoreEvidenceLevel,
     pub canonical_only: bool,
     pub operational_recovery_ready: bool,
     pub cutover_performed: bool,
 }
 
+impl RestoreReceipt {
+    pub fn validate(&self) -> Result<(), BackupError> {
+        text(&self.receipt_id, "restore.receipt.receipt_id")?;
+        text(&self.plan_id, "restore.receipt.plan_id")?;
+        digest(&self.bundle_sha256, "restore.receipt.bundle_sha256")?;
+        text(&self.target_id, "restore.receipt.target_id")?;
+        self.restored_fence
+            .validate()
+            .map_err(|_| BackupError::RestoreEvidenceIncomplete)?;
+        digest(
+            &self.effect_receipt_sha256,
+            "restore.receipt.effect_receipt_sha256",
+        )?;
+        if self.cutover_performed {
+            return Err(BackupError::CutoverNotAuthorized);
+        }
+        if self.operational_recovery_ready {
+            if self.evidence_level != RestoreEvidenceLevel::OperationallyValidated {
+                return Err(BackupError::RestoreEvidenceLevelMismatch);
+            }
+        } else if self.evidence_level.permits_operational_readiness() {
+            return Err(BackupError::RestoreEvidenceLevelMismatch);
+        }
+        Ok(())
+    }
+}
+
 /// Provider-owned isolated restore target. Implementations must not make the
 /// target current authority as part of any method in this trait.
+///
+/// The historical per-step methods below (`prepare_isolated`,
+/// `apply_purge_ledger`, `import_sealed_blob`, `import_canonical_event`,
+/// `import_receipt`, `import_projection`, `suspend_ors_operations`,
+/// `rebuild_projections`, `verify_receipt_event_chain`, `finalize_isolated`)
+/// are the exact historical seam retained for owner adapters (#960/#961); no
+/// new per-obligation target methods are invented here. Each applicable owner
+/// obligation (purge, canonical/reference/blob validation, ORS suspension,
+/// unresolved-effect reconciliation, Watchdog signals, external-source
+/// revalidation, runtime/session/lease/route/UserBroker invalidation) is
+/// represented in [`RestoreEvidence`] by the minimal exact existing owner
+/// receipt/reference or an explicit missing capability.
 pub trait RestoreTarget {
     /// Applies one exact intent and returns a target-observed receipt. The
     /// default is fail-closed so legacy targets cannot mint coordinator-side
@@ -1715,6 +2389,16 @@ pub enum BackupError {
     RestoreEvidenceIncomplete,
     #[error("restore target evidence does not match the plan")]
     FinalizeEvidenceMismatch,
+    #[error("restore evidence level does not match the archive class ceiling")]
+    RestoreEvidenceLevelMismatch,
+    #[error("required class capability is absent before target dispatch")]
+    RestoreCapabilityUnsupported { capability: &'static str },
+    #[error("required class capability was not attempted")]
+    RestoreCapabilityNotAttempted { capability: &'static str },
+    #[error("historical authority must remain suspended and never activate")]
+    HistoricalAuthorityActivated,
+    #[error("cutover requires a separate Human/System Owner authorization")]
+    CutoverNotAuthorized,
     #[error("record or artifact exceeds the {field} limit of {limit} bytes")]
     LimitExceeded { field: &'static str, limit: usize },
     #[error("foundation contract: {0}")]
@@ -1746,6 +2430,7 @@ mod restore_tests {
     use std::num::NonZeroU64;
 
     const TEST_LINEAGE_A: &str = "550e8400-e29b-41d4-a716-446655440000";
+    const TEST_LINEAGE_B: &str = "550e8400-e29b-41d4-a716-446655440001";
 
     fn test_epoch(sequence: u64) -> EpochId {
         EpochId::new(
@@ -1753,6 +2438,126 @@ mod restore_tests {
             NonZeroU64::new(sequence).expect("nonzero test sequence"),
         )
         .expect("valid test epoch")
+    }
+
+    fn test_epoch_in(lineage: &str, sequence: u64) -> EpochId {
+        EpochId::new(
+            EpochLineageId::new(lineage).expect("valid test lineage"),
+            NonZeroU64::new(sequence).expect("nonzero test sequence"),
+        )
+        .expect("valid test epoch")
+    }
+
+    fn test_owner(owner_id: &str) -> OwnerTrustBinding {
+        OwnerTrustBinding {
+            owner_id: owner_id.to_owned(),
+            trust_binding_ref: format!("trust-binding-{owner_id}-session-1"),
+        }
+    }
+
+    fn test_obligation(owner_id: &str, state: RestoreObligationState) -> RestoreOwnerObligation {
+        RestoreOwnerObligation {
+            owner_id: owner_id.to_owned(),
+            evidence_ref: format!("receipt-{owner_id}-1"),
+            state,
+        }
+    }
+
+    fn test_obligations(
+        ors: RestoreObligationState,
+        unresolved: RestoreObligationState,
+        broker: RestoreObligationState,
+    ) -> RestoreObligations {
+        RestoreObligations {
+            purge: test_obligation("purge-owner", RestoreObligationState::Satisfied),
+            canonical_validation: test_obligation(
+                "canonical-owner",
+                RestoreObligationState::Satisfied,
+            ),
+            reference_validation: test_obligation(
+                "reference-owner",
+                RestoreObligationState::Satisfied,
+            ),
+            blob_validation: test_obligation("blob-owner", RestoreObligationState::Satisfied),
+            ors_suspension: test_obligation("ors-owner", ors),
+            unresolved_effect_reconciliation: test_obligation("reconciliation-owner", unresolved),
+            watchdog_signals: test_obligation("watchdog-owner", RestoreObligationState::Satisfied),
+            external_source_revalidation: test_obligation(
+                "external-source-owner",
+                RestoreObligationState::Satisfied,
+            ),
+            runtime_invalidation: test_obligation(
+                "runtime-owner",
+                RestoreObligationState::Satisfied,
+            ),
+            session_invalidation: test_obligation(
+                "session-owner",
+                RestoreObligationState::Satisfied,
+            ),
+            lease_invalidation: test_obligation("lease-owner", RestoreObligationState::Satisfied),
+            route_invalidation: test_obligation("route-owner", RestoreObligationState::Satisfied),
+            user_broker_invalidation: test_obligation("user-broker-owner", broker),
+        }
+    }
+
+    fn test_provenance(bundle: &BackupBundle, plan: &RestorePlan) -> RestoreProvenance {
+        RestoreProvenance {
+            transaction_id: plan.transaction().expect("transaction").transaction_id,
+            plan_id: plan.plan_id.clone(),
+            operation_id: "restore-operation-1".to_owned(),
+            phase: RestorePhase::FinalizeIsolatedRoot,
+            source_archive_id: bundle.manifest.backup_id.clone(),
+            source_class: bundle.manifest.class,
+            source_digest: bundle.bundle_sha256().expect("bundle digest"),
+            source_endpoint_ref: "source-adapter-test".to_owned(),
+            isolated_destination_ref: plan.target.target_id.clone(),
+            expected_predecessor_ref: "predecessor-receipt-0".to_owned(),
+            schema_revision: bundle.manifest.schema_generation.clone(),
+            build_manifest_digest: sha256_hex(b"test-build-manifest"),
+            purge_ledger_revision: bundle.manifest.purge_ledger_revision,
+            owner: test_owner("restore-owner"),
+            observed_generation: plan.restored_fence.resource_generation,
+            observed_epoch: plan.restored_fence.authority_epoch.clone(),
+            validation_digest: sha256_hex(b"bounded-validation-evidence"),
+        }
+    }
+
+    fn test_evidence(bundle: &BackupBundle, plan: &RestorePlan) -> RestoreEvidence {
+        RestoreEvidence {
+            target_id: plan.target.target_id.clone(),
+            isolated_root: true,
+            purge_applied: true,
+            blobs_imported: true,
+            projections_rebuilt: true,
+            receipt_event_chain_verified: true,
+            ors_suspended: false,
+            active_authority_restored: false,
+            authority_epoch: plan.restored_fence.authority_epoch.clone(),
+            resource_generation: plan.restored_fence.resource_generation,
+            provenance: test_provenance(bundle, plan),
+            obligations: test_obligations(
+                RestoreObligationState::NotAttempted,
+                RestoreObligationState::Unknown,
+                RestoreObligationState::MissingCapability,
+            ),
+            observed_lineage_limits: vec![ObservedLineageLimit {
+                owner_id: "restore-owner".to_owned(),
+                observed_epoch: plan
+                    .restored_fence
+                    .source_state_fence
+                    .authority_epoch
+                    .clone(),
+                observed_generation: plan.restored_fence.source_state_fence.resource_generation,
+            }],
+            owner_epoch: None,
+            reconciliation_denominator: None,
+            operational_validation: None,
+            historical_authority: Vec::new(),
+            archive_disposition: RestoreArchiveDisposition {
+                disposition: RestoreArchiveDispositionKind::Current,
+                compatibility_ref: "ecxf-1-current".to_owned(),
+            },
+        }
     }
 
     #[derive(Default)]
@@ -1903,18 +2708,7 @@ mod restore_tests {
             _restored_fence: &RestoredFence,
         ) -> Result<RestoreEvidence, BackupError> {
             self.calls.push("finalize");
-            Ok(RestoreEvidence {
-                target_id: "target".to_owned(),
-                isolated_root: true,
-                purge_applied: true,
-                blobs_imported: true,
-                projections_rebuilt: true,
-                receipt_event_chain_verified: true,
-                ors_suspended: false,
-                active_authority_restored: false,
-                authority_epoch: test_epoch(2),
-                resource_generation: ResourceGeneration::new(2).expect("generation"),
-            })
+            Err(BackupError::RestoreTargetReceiptRequired)
         }
     }
 
@@ -1930,19 +2724,12 @@ mod restore_tests {
     }
 
     fn applied_effect(intent: &RestoreIntent) -> RestoreAppliedEffect {
+        // `plan()` always builds the same canonical-degraded bundle/context, so
+        // the finalize evidence can be reconstructed deterministically here.
         let final_evidence = if matches!(intent.phase, RestorePhase::FinalizeIsolatedRoot) {
-            Some(RestoreEvidence {
-                target_id: "target".to_owned(),
-                isolated_root: true,
-                purge_applied: true,
-                blobs_imported: true,
-                projections_rebuilt: true,
-                receipt_event_chain_verified: true,
-                ors_suspended: false,
-                active_authority_restored: false,
-                authority_epoch: test_epoch(2),
-                resource_generation: ResourceGeneration::new(2).expect("generation"),
-            })
+            let plan = plan();
+            let bundle = bundle_for(&plan);
+            Some(test_evidence(&bundle, &plan))
         } else {
             None
         };
@@ -2056,6 +2843,13 @@ mod restore_tests {
             .execute_with_journal(&bundle, &mut target, &mut journal)
             .expect("restore");
         assert!(!receipt.cutover_performed);
+        assert!(!receipt.operational_recovery_ready);
+        assert_eq!(
+            receipt.evidence_level,
+            RestoreEvidenceLevel::IsolatedImportComplete
+        );
+        assert!(receipt.canonical_only);
+        receipt.validate().expect("receipt validates");
         assert_eq!(&target.calls[..2], &["prepare", "purge"]);
     }
 
@@ -2277,5 +3071,110 @@ mod restore_tests {
             validate_journal_record(&record, &record.journal_key, &transaction, &phases),
             Err(BackupError::RestorePhaseMismatch)
         );
+    }
+
+    #[test]
+    fn evidence_levels_are_distinct_per_class_without_operational_inference() {
+        assert_eq!(
+            RestoreEvidenceLevel::for_class(BackupClass::FullRecovery),
+            RestoreEvidenceLevel::ReconciliationRequired
+        );
+        assert_eq!(
+            RestoreEvidenceLevel::for_class(BackupClass::CanonicalOnlyDegraded),
+            RestoreEvidenceLevel::IsolatedImportComplete
+        );
+        assert_eq!(
+            RestoreEvidenceLevel::for_class(BackupClass::ScopeExport),
+            RestoreEvidenceLevel::IsolatedImportComplete
+        );
+        assert_ne!(
+            RestoreEvidenceLevel::for_class(BackupClass::FullRecovery),
+            RestoreEvidenceLevel::for_class(BackupClass::CanonicalOnlyDegraded)
+        );
+        for level in [
+            RestoreEvidenceLevel::ArchiveValid,
+            RestoreEvidenceLevel::IsolatedImportComplete,
+            RestoreEvidenceLevel::ReconciliationRequired,
+        ] {
+            assert!(!level.permits_operational_readiness());
+        }
+    }
+
+    #[test]
+    fn known_zero_requires_complete_current_denominator() {
+        let complete = ReconciliationDenominator {
+            owner_id: "reconciliation-owner".to_owned(),
+            denominator_ref: "denominator-current-1".to_owned(),
+            expected_total: 0,
+            reconciled_refs: Vec::new(),
+        };
+        complete.validate().expect("complete denominator");
+        assert!(complete.is_known_zero());
+        let partial = ReconciliationDenominator {
+            owner_id: "reconciliation-owner".to_owned(),
+            denominator_ref: "denominator-current-1".to_owned(),
+            expected_total: 2,
+            reconciled_refs: vec!["item-1".to_owned()],
+        };
+        assert_eq!(
+            partial.validate(),
+            Err(BackupError::RestoreEvidenceIncomplete)
+        );
+        assert!(!partial.is_known_zero());
+    }
+
+    #[test]
+    fn owner_epoch_validates_lineage_authority_without_minting() {
+        let candidate = RestoreOwnerEpoch {
+            owner: test_owner("epoch-owner"),
+            new_epoch: test_epoch(2),
+            new_generation: ResourceGeneration::new(2).expect("generation"),
+            supersedes: vec![ObservedLineageLimit {
+                owner_id: "epoch-owner".to_owned(),
+                observed_epoch: test_epoch(1),
+                observed_generation: ResourceGeneration::genesis(),
+            }],
+        };
+        candidate.validate().expect("advancing epoch");
+        // Cross-lineage reuse of an observed non-genesis sequence is not newer.
+        let cross_lineage = RestoreOwnerEpoch {
+            owner: test_owner("epoch-owner"),
+            new_epoch: test_epoch_in(TEST_LINEAGE_B, 2),
+            new_generation: ResourceGeneration::new(2).expect("generation"),
+            supersedes: vec![ObservedLineageLimit {
+                owner_id: "epoch-owner".to_owned(),
+                observed_epoch: test_epoch(1),
+                observed_generation: ResourceGeneration::genesis(),
+            }],
+        };
+        assert_eq!(
+            cross_lineage.validate(),
+            Err(BackupError::StaleRestoreLineage)
+        );
+    }
+
+    #[test]
+    fn journal_admission_separates_fixture_proof_from_production() {
+        let fixture = RestoreJournalAdmission {
+            persistent_owner: test_owner("journal-owner"),
+            database_ref: "memory-fixture".to_owned(),
+            installation_ref: "installation-fixture".to_owned(),
+            generation: ResourceGeneration::genesis(),
+            journal_identity_ref: "journal-fixture-1".to_owned(),
+            admission_receipt_ref: "admission-fixture-1".to_owned(),
+            fixture_proof_only: true,
+        };
+        fixture.validate().expect("fixture admission");
+        assert!(!fixture.admits_production_durable_recovery());
+    }
+
+    #[test]
+    fn closed_evidence_rejects_unknown_fields_at_decode() {
+        let plan = plan();
+        let bundle = bundle_for(&plan);
+        let evidence = test_evidence(&bundle, &plan);
+        let mut wire = serde_json::to_value(&evidence).expect("encode");
+        wire["unknown_future_field"] = serde_json::json!(true);
+        assert!(serde_json::from_value::<RestoreEvidence>(wire).is_err());
     }
 }
