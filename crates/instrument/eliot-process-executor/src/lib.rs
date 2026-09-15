@@ -1486,6 +1486,12 @@ impl ProcessExecutor for WindowsProcessExecutor {
                 .map_err(|_| operation_unavailable(&operation_id, "operation lock"))?;
             if let Err(error) = refresh_operation(&mut guard) {
                 quarantine_operation(&mut guard);
+                // A fenced op already surfaces its honest typed outcome; a
+                // live op that failed observation here fences above and
+                // likewise reports unknown instead of any contract error.
+                if guard.state.view().lifecycle() == ProcessLifecycle::UnknownOutcome {
+                    return Err(ProcessExecutionError::UnknownOutcome);
+                }
                 return Err(error);
             }
             Ok(guard.state.view())
@@ -1584,6 +1590,15 @@ impl ProcessExecutor for WindowsProcessExecutor {
                 .map_err(|_| operation_unavailable(&operation_id, "operation lock"))?;
             if let Err(error) = refresh_operation(&mut guard) {
                 quarantine_operation(&mut guard);
+                // Same redundant-fence mapping as `inspect` (see above): a
+                // natural-exit `UnknownOutcome` computed by
+                // `refresh_operation` races the `quarantine_operation` fence
+                // through `ProcessState::exit`, and the losing fence must
+                // surface the honest typed outcome, never an
+                // `InvalidTransition` contract error.
+                if guard.state.view().lifecycle() == ProcessLifecycle::UnknownOutcome {
+                    return Err(ProcessExecutionError::UnknownOutcome);
+                }
                 return Err(error);
             }
             if guard.state.view().lifecycle() == ProcessLifecycle::UnknownOutcome {
