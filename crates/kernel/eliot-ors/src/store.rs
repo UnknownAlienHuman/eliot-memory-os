@@ -98,6 +98,9 @@ const REPLAY_STREAMS: TableDefinition<&str, &str> = TableDefinition::new("ors_re
 const REPLAY_REQUESTS: TableDefinition<&str, &str> = TableDefinition::new("ors_replay_requests_v1");
 const REPLAY_EVENTS: TableDefinition<&str, &str> = TableDefinition::new("ors_replay_events_v1");
 const REPLAY_ACKS: TableDefinition<&str, &str> = TableDefinition::new("ors_replay_acks_v1");
+const DOCTOR_ATTEMPTS: TableDefinition<&str, &str> = TableDefinition::new("ors_doctor_attempts_v1");
+const DOCTOR_EFFECTS: TableDefinition<&str, &str> = TableDefinition::new("ors_doctor_effects_v1");
+const DOCTOR_BUDGETS: TableDefinition<&str, &str> = TableDefinition::new("ors_doctor_budgets_v1");
 const NEXT_GLOBAL_ORDER: &str = "next_global_order";
 const SUPERVISION_STAGE_RESOLUTION_SCHEMA_KEY: &str = "supervision_stage_resolution_schema";
 const SUPERVISION_STAGE_RESOLUTION_SCHEMA_V1: &str = "eliot.ors.supervision-stage-resolution.v1";
@@ -566,6 +569,41 @@ impl persistence_codec::PersistedValue for crate::StoreFailureRetentionRecord {
 
     fn validate_persisted(&self) -> Result<(), OrsError> {
         self.validate()
+    }
+}
+
+impl persistence_codec::PersistedValue for crate::DoctorAttemptRecord {
+    const RECORD_TYPE: &'static str = "doctor_attempt";
+
+    fn validate_persisted(&self) -> Result<(), OrsError> {
+        self.validate()
+    }
+}
+
+impl persistence_codec::PersistedValue for crate::DoctorEffectRecord {
+    const RECORD_TYPE: &'static str = "doctor_effect";
+
+    fn validate_persisted(&self) -> Result<(), OrsError> {
+        self.validate()
+    }
+}
+
+impl persistence_codec::PersistedValue for crate::DoctorBudgetLedger {
+    const RECORD_TYPE: &'static str = "doctor_budget";
+
+    fn validate_persisted(&self) -> Result<(), OrsError> {
+        self.validate()
+    }
+}
+
+fn doctor_storage(error: impl std::fmt::Display) -> crate::DoctorLedgerError {
+    crate::DoctorLedgerError::Storage(error.to_string())
+}
+
+fn map_ors_to_doctor(error: OrsError) -> crate::DoctorLedgerError {
+    match error {
+        OrsError::Encoding(reason) => crate::DoctorLedgerError::Encoding(reason),
+        other => crate::DoctorLedgerError::Storage(other.to_string()),
     }
 }
 
@@ -1543,6 +1581,376 @@ impl RedbRecoveryStore {
         }
         write.commit().map_err(storage)?;
         Ok(Some(next))
+    }
+
+    /// Stages one Doctor attempt intent before any admission.
+    ///
+    /// Persist-before-ack: the `Requested` record is durably inserted before
+    /// the Kernel admission gate may bind an admission receipt. An exact
+    /// replay under the same attempt digest returns the durable row
+    /// unchanged; a changed binding under the same digest fails with
+    /// [`crate::DoctorLedgerError::AttemptIdentityConflict`] and never
+    /// overwrites the durable row. This table is disjoint from every other
+    /// ORS table: one writer per state.
+    pub fn stage_doctor_attempt(
+        &self,
+        record: &crate::DoctorAttemptRecord,
+    ) -> Result<crate::DoctorAttemptStageOutcome, crate::DoctorLedgerError> {
+        record.validate().map_err(map_ors_to_doctor)?;
+        if record.state != crate::DoctorAttemptState::Requested {
+            return Err(doctor_storage("staging requires the requested state"));
+        }
+        let write = self.database.begin_write().map_err(doctor_storage)?;
+        let existing = {
+            let mut table = write.open_table(DOCTOR_ATTEMPTS).map_err(doctor_storage)?;
+            let key = record.record_key();
+            if let Some(existing) = table.get(key.as_str()).map_err(doctor_storage)? {
+                let existing: crate::DoctorAttemptRecord =
+                    decode(existing.value()).map_err(map_ors_to_doctor)?;
+                if !existing.same_binding(record) {
+                    return Err(crate::DoctorLedgerError::AttemptIdentityConflict {
+                        attempt_digest: key,
+                    });
+                }
+                Some(existing)
+            } else {
+                let payload = encode(record).map_err(map_ors_to_doctor)?;
+                table
+                    .insert(key.as_str(), payload.as_str())
+                    .map_err(doctor_storage)?;
+                None
+            }
+        };
+        write.commit().map_err(doctor_storage)?;
+        Ok(match existing {
+            Some(durable) => crate::DoctorAttemptStageOutcome::Existing(durable),
+            None => crate::DoctorAttemptStageOutcome::Stored(record.clone()),
+        })
+    }
+
+    /// Loads one Doctor attempt by exact attempt digest.
+    pub fn load_doctor_attempt(
+        &self,
+        attempt_digest: &crate::OperationIdentity,
+    ) -> Result<Option<crate::DoctorAttemptRecord>, crate::DoctorLedgerError> {
+        let read = self.database.begin_read().map_err(doctor_storage)?;
+        let table = read.open_table(DOCTOR_ATTEMPTS).map_err(doctor_storage)?;
+        table
+            .get(attempt_digest.as_str())
+            .map_err(doctor_storage)?
+            .map(|value| {
+                let record: crate::DoctorAttemptRecord =
+                    decode(value.value()).map_err(map_ors_to_doctor)?;
+                if record.attempt_digest != *attempt_digest {
+                    return Err(doctor_storage(
+                        "doctor attempt identity does not match its key",
+                    ));
+                }
+                Ok(record)
+            })
+            .transpose()
+    }
+
+    /// Advances one staged Doctor attempt to its next mechanical state.
+    ///
+    /// The transition table owns the anti-blind-retry fence: `Unknown` may
+    /// only become `Reconciling`, neither `Unknown` nor `Reconciling` returns
+    /// to `Requested`, and `Terminal` is absorbing. An exact repeat of an
+    /// applied advance returns the durable record unchanged. An unknown
+    /// attempt returns `Ok(None)`; this method never invents a record.
+    /// Admission evidence binds the admission digest on
+    /// `Requested -> Admitted` and `Requested -> Cancelled`, is accepted
+    /// unchanged on an exact replay of an applied advance, and can never
+    /// overwrite a bound admission. The ORS write transaction assigns the
+    /// monotonic commit order atomically when the attempt first reaches a
+    /// terminal state; the caller never supplies it.
+    pub fn advance_doctor_attempt(
+        &self,
+        attempt_digest: &crate::OperationIdentity,
+        target: crate::DoctorAttemptState,
+        admission: Option<&crate::DoctorAttemptAdmission>,
+    ) -> Result<Option<crate::DoctorAttemptRecord>, crate::DoctorLedgerError> {
+        let write = self.database.begin_write().map_err(doctor_storage)?;
+        let key = attempt_digest.as_str().to_owned();
+        let existing: Option<crate::DoctorAttemptRecord> = {
+            let table = write.open_table(DOCTOR_ATTEMPTS).map_err(doctor_storage)?;
+            table
+                .get(key.as_str())
+                .map_err(doctor_storage)?
+                .map(|value| decode(value.value()))
+                .transpose()
+                .map_err(map_ors_to_doctor)?
+        };
+        let Some(existing) = existing else {
+            return Ok(None);
+        };
+        if existing.attempt_digest != *attempt_digest {
+            return Err(doctor_storage(
+                "doctor attempt identity does not match its key",
+            ));
+        }
+        if existing.state == target {
+            let replayed = match (
+                &existing.admission_digest,
+                existing.admitted_at_unix_nanos,
+                admission,
+            ) {
+                (Some(digest), Some(at), Some(evidence)) => {
+                    evidence.validate().map_err(map_ors_to_doctor)?;
+                    evidence.admission_digest == *digest && evidence.admitted_at_unix_nanos == at
+                }
+                (None, None, None) => true,
+                _ => false,
+            };
+            if !replayed {
+                return Err(crate::DoctorLedgerError::AttemptIdentityConflict {
+                    attempt_digest: key,
+                });
+            }
+            return Ok(Some(existing));
+        }
+        let from = existing.state;
+        from.transition_to(target).map_err(map_ors_to_doctor)?;
+        let mut next = existing.clone();
+        match (from, target) {
+            (
+                crate::DoctorAttemptState::Requested,
+                crate::DoctorAttemptState::Admitted | crate::DoctorAttemptState::Cancelled,
+            ) => {
+                let evidence =
+                    admission.ok_or_else(|| doctor_storage("admission evidence is required"))?;
+                evidence.validate().map_err(map_ors_to_doctor)?;
+                next.admission_digest = Some(evidence.admission_digest.clone());
+                next.admitted_at_unix_nanos = Some(evidence.admitted_at_unix_nanos);
+            }
+            (crate::DoctorAttemptState::Requested, crate::DoctorAttemptState::Expired) => {
+                if admission.is_some() {
+                    return Err(doctor_storage("an expired intent carries no admission"));
+                }
+            }
+            _ => {
+                if admission.is_some() {
+                    return Err(doctor_storage(
+                        "admission evidence binds only on first admission",
+                    ));
+                }
+            }
+        }
+        next.state = target;
+        if target.is_terminal() && next.commit_order == 0 {
+            next.commit_order = Self::next_operational_order(&write).map_err(map_ors_to_doctor)?;
+        }
+        next.validate().map_err(map_ors_to_doctor)?;
+        if next != existing {
+            let payload = encode(&next).map_err(map_ors_to_doctor)?;
+            let mut table = write.open_table(DOCTOR_ATTEMPTS).map_err(doctor_storage)?;
+            table
+                .insert(key.as_str(), payload.as_str())
+                .map_err(doctor_storage)?;
+        }
+        write.commit().map_err(doctor_storage)?;
+        Ok(Some(next))
+    }
+
+    /// Stages one Doctor effect intent before execution.
+    ///
+    /// Persist-before-effect: the `Intended` record is durably inserted
+    /// before the named effect adapter may run. An exact replay under the
+    /// same effect digest returns the durable row unchanged; a changed
+    /// intent under the same digest fails with
+    /// [`crate::DoctorLedgerError::EffectIdentityConflict`] and never
+    /// overwrites the durable row.
+    pub fn stage_doctor_effect(
+        &self,
+        record: &crate::DoctorEffectRecord,
+    ) -> Result<crate::DoctorEffectStageOutcome, crate::DoctorLedgerError> {
+        record.validate().map_err(map_ors_to_doctor)?;
+        if record.state != crate::DoctorEffectState::Intended {
+            return Err(doctor_storage("staging requires the intended state"));
+        }
+        let write = self.database.begin_write().map_err(doctor_storage)?;
+        let existing = {
+            let mut table = write.open_table(DOCTOR_EFFECTS).map_err(doctor_storage)?;
+            let key = record.record_key();
+            if let Some(existing) = table.get(key.as_str()).map_err(doctor_storage)? {
+                let existing: crate::DoctorEffectRecord =
+                    decode(existing.value()).map_err(map_ors_to_doctor)?;
+                if !existing.same_binding(record) {
+                    return Err(crate::DoctorLedgerError::EffectIdentityConflict {
+                        effect_digest: key,
+                    });
+                }
+                Some(existing)
+            } else {
+                let payload = encode(record).map_err(map_ors_to_doctor)?;
+                table
+                    .insert(key.as_str(), payload.as_str())
+                    .map_err(doctor_storage)?;
+                None
+            }
+        };
+        write.commit().map_err(doctor_storage)?;
+        Ok(match existing {
+            Some(durable) => crate::DoctorEffectStageOutcome::Existing(durable),
+            None => crate::DoctorEffectStageOutcome::Stored(record.clone()),
+        })
+    }
+
+    /// Loads one Doctor effect by exact effect digest.
+    pub fn load_doctor_effect(
+        &self,
+        effect_digest: &crate::OperationIdentity,
+    ) -> Result<Option<crate::DoctorEffectRecord>, crate::DoctorLedgerError> {
+        let read = self.database.begin_read().map_err(doctor_storage)?;
+        let table = read.open_table(DOCTOR_EFFECTS).map_err(doctor_storage)?;
+        table
+            .get(effect_digest.as_str())
+            .map_err(doctor_storage)?
+            .map(|value| {
+                let record: crate::DoctorEffectRecord =
+                    decode(value.value()).map_err(map_ors_to_doctor)?;
+                if record.effect_digest != *effect_digest {
+                    return Err(doctor_storage(
+                        "doctor effect identity does not match its key",
+                    ));
+                }
+                Ok(record)
+            })
+            .transpose()
+    }
+
+    /// Binds the exact outcome or unknown state to one Doctor effect.
+    ///
+    /// A known report on `Intended`, `Unknown`, or `Reconciling` moves the
+    /// effect to `Reported`; an unknown report on `Intended` moves it to
+    /// `Unknown` with the effect digest as its reconciliation key. An exact
+    /// repeat of an applied report returns the durable record unchanged; a
+    /// different outcome under the same effect digest fails with
+    /// [`crate::DoctorLedgerError::EffectIdentityConflict`]. An unknown
+    /// effect returns `Ok(None)`; this method never invents a record and
+    /// never retries blindly. The ORS write transaction assigns the
+    /// monotonic commit order atomically when the effect first reaches its
+    /// terminal state.
+    pub fn record_doctor_effect_outcome(
+        &self,
+        effect_digest: &crate::OperationIdentity,
+        report: &crate::DoctorEffectOutcomeReport,
+    ) -> Result<Option<crate::DoctorEffectRecord>, crate::DoctorLedgerError> {
+        report.validate().map_err(map_ors_to_doctor)?;
+        let write = self.database.begin_write().map_err(doctor_storage)?;
+        let key = effect_digest.as_str().to_owned();
+        let existing: Option<crate::DoctorEffectRecord> = {
+            let table = write.open_table(DOCTOR_EFFECTS).map_err(doctor_storage)?;
+            table
+                .get(key.as_str())
+                .map_err(doctor_storage)?
+                .map(|value| decode(value.value()))
+                .transpose()
+                .map_err(map_ors_to_doctor)?
+        };
+        let Some(existing) = existing else {
+            return Ok(None);
+        };
+        if existing.effect_digest != *effect_digest {
+            return Err(doctor_storage(
+                "doctor effect identity does not match its key",
+            ));
+        }
+        let mut next = existing.clone();
+        if report.unknown {
+            match existing.state {
+                crate::DoctorEffectState::Intended => {
+                    next.state = crate::DoctorEffectState::Unknown;
+                    next.reconciliation_key = Some(existing.effect_digest.as_str().to_owned());
+                }
+                crate::DoctorEffectState::Unknown | crate::DoctorEffectState::Reconciling => {}
+                crate::DoctorEffectState::Reported => {
+                    return Err(crate::DoctorLedgerError::EffectIdentityConflict {
+                        effect_digest: key,
+                    });
+                }
+            }
+        } else {
+            let outcome = report
+                .outcome_digest
+                .clone()
+                .ok_or_else(|| doctor_storage("a known outcome carries its exact digest"))?;
+            match existing.state {
+                crate::DoctorEffectState::Intended
+                | crate::DoctorEffectState::Unknown
+                | crate::DoctorEffectState::Reconciling => {
+                    next.state = crate::DoctorEffectState::Reported;
+                    next.outcome_digest = Some(outcome);
+                    next.adapter_receipt_digest
+                        .clone_from(&report.adapter_receipt_digest);
+                    next.reconciliation_key = None;
+                }
+                crate::DoctorEffectState::Reported => {
+                    if existing.outcome_digest.as_deref() != Some(outcome.as_str()) {
+                        return Err(crate::DoctorLedgerError::EffectIdentityConflict {
+                            effect_digest: key,
+                        });
+                    }
+                }
+            }
+        }
+        if next.state.is_terminal() && next.commit_order == 0 {
+            next.commit_order = Self::next_operational_order(&write).map_err(map_ors_to_doctor)?;
+        }
+        next.validate().map_err(map_ors_to_doctor)?;
+        if next != existing {
+            let payload = encode(&next).map_err(map_ors_to_doctor)?;
+            let mut table = write.open_table(DOCTOR_EFFECTS).map_err(doctor_storage)?;
+            table
+                .insert(key.as_str(), payload.as_str())
+                .map_err(doctor_storage)?;
+        }
+        write.commit().map_err(doctor_storage)?;
+        Ok(Some(next))
+    }
+
+    /// Loads one Doctor budget ledger by exact scope key.
+    pub fn load_doctor_budget(
+        &self,
+        scope_key: &crate::OpaqueLabel,
+    ) -> Result<Option<crate::DoctorBudgetLedger>, crate::DoctorLedgerError> {
+        let read = self.database.begin_read().map_err(doctor_storage)?;
+        let table = read.open_table(DOCTOR_BUDGETS).map_err(doctor_storage)?;
+        table
+            .get(scope_key.as_str())
+            .map_err(doctor_storage)?
+            .map(|value| {
+                let ledger: crate::DoctorBudgetLedger =
+                    decode(value.value()).map_err(map_ors_to_doctor)?;
+                if ledger.scope_key != *scope_key {
+                    return Err(doctor_storage("doctor budget scope does not match its key"));
+                }
+                Ok(ledger)
+            })
+            .transpose()
+    }
+
+    /// Persists one Doctor budget ledger row, replacing the prior row.
+    ///
+    /// Ledgers are Kernel-derived from durable admissions and outcomes,
+    /// never caller-supplied authority: this method validates shape and
+    /// replaces the row for its scope key so budget, cooldown, and
+    /// quarantine enforcement survives restarts.
+    pub fn store_doctor_budget(
+        &self,
+        ledger: &crate::DoctorBudgetLedger,
+    ) -> Result<(), crate::DoctorLedgerError> {
+        ledger.validate().map_err(map_ors_to_doctor)?;
+        let write = self.database.begin_write().map_err(doctor_storage)?;
+        {
+            let mut table = write.open_table(DOCTOR_BUDGETS).map_err(doctor_storage)?;
+            let key = ledger.record_key();
+            let payload = encode(ledger).map_err(map_ors_to_doctor)?;
+            table
+                .insert(key.as_str(), payload.as_str())
+                .map_err(doctor_storage)?;
+        }
+        write.commit().map_err(doctor_storage)
     }
 
     /// Reads the retained events of one stream, optionally scoped to one
@@ -3719,6 +4127,9 @@ impl RedbRecoveryStore {
             drop(write.open_table(REPLAY_REQUESTS).map_err(storage)?);
             drop(write.open_table(REPLAY_EVENTS).map_err(storage)?);
             drop(write.open_table(REPLAY_ACKS).map_err(storage)?);
+            drop(write.open_table(DOCTOR_ATTEMPTS).map_err(storage)?);
+            drop(write.open_table(DOCTOR_EFFECTS).map_err(storage)?);
+            drop(write.open_table(DOCTOR_BUDGETS).map_err(storage)?);
             if initialize_resolution_schema {
                 let mut meta = write.open_table(META).map_err(storage)?;
                 meta.insert(
@@ -5931,6 +6342,67 @@ impl OperationalRecoveryStore for RedbRecoveryStore {
         request_id: &str,
     ) -> Result<Option<WorkerReplayRequestRecord>, OrsError> {
         RedbRecoveryStore::load_replay_request_record(self, stream_id, request_id)
+    }
+}
+
+impl crate::DoctorRecoveryLedger for RedbRecoveryStore {
+    fn stage_doctor_attempt(
+        &self,
+        record: &crate::DoctorAttemptRecord,
+    ) -> Result<crate::DoctorAttemptStageOutcome, crate::DoctorLedgerError> {
+        RedbRecoveryStore::stage_doctor_attempt(self, record)
+    }
+
+    fn load_doctor_attempt(
+        &self,
+        attempt_digest: &crate::OperationIdentity,
+    ) -> Result<Option<crate::DoctorAttemptRecord>, crate::DoctorLedgerError> {
+        RedbRecoveryStore::load_doctor_attempt(self, attempt_digest)
+    }
+
+    fn advance_doctor_attempt(
+        &self,
+        attempt_digest: &crate::OperationIdentity,
+        target: crate::DoctorAttemptState,
+        admission: Option<&crate::DoctorAttemptAdmission>,
+    ) -> Result<Option<crate::DoctorAttemptRecord>, crate::DoctorLedgerError> {
+        RedbRecoveryStore::advance_doctor_attempt(self, attempt_digest, target, admission)
+    }
+
+    fn stage_doctor_effect(
+        &self,
+        record: &crate::DoctorEffectRecord,
+    ) -> Result<crate::DoctorEffectStageOutcome, crate::DoctorLedgerError> {
+        RedbRecoveryStore::stage_doctor_effect(self, record)
+    }
+
+    fn load_doctor_effect(
+        &self,
+        effect_digest: &crate::OperationIdentity,
+    ) -> Result<Option<crate::DoctorEffectRecord>, crate::DoctorLedgerError> {
+        RedbRecoveryStore::load_doctor_effect(self, effect_digest)
+    }
+
+    fn record_doctor_effect_outcome(
+        &self,
+        effect_digest: &crate::OperationIdentity,
+        report: &crate::DoctorEffectOutcomeReport,
+    ) -> Result<Option<crate::DoctorEffectRecord>, crate::DoctorLedgerError> {
+        RedbRecoveryStore::record_doctor_effect_outcome(self, effect_digest, report)
+    }
+
+    fn load_doctor_budget(
+        &self,
+        scope_key: &crate::OpaqueLabel,
+    ) -> Result<Option<crate::DoctorBudgetLedger>, crate::DoctorLedgerError> {
+        RedbRecoveryStore::load_doctor_budget(self, scope_key)
+    }
+
+    fn store_doctor_budget(
+        &self,
+        ledger: &crate::DoctorBudgetLedger,
+    ) -> Result<(), crate::DoctorLedgerError> {
+        RedbRecoveryStore::store_doctor_budget(self, ledger)
     }
 }
 
