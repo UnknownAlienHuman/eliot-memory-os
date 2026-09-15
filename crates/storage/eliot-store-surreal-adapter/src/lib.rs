@@ -49,7 +49,7 @@ pub use readiness::{CompiledMigration, MigrationReceipt, SemanticReadiness};
 /// store.
 pub struct SurrealStoreAdapter {
     pub(crate) config: SurrealAdapterConfig,
-    pub(crate) provider_process_lease: RetainedProcessPathLease,
+    pub(crate) provider_process_lease: std::sync::Arc<RetainedProcessPathLease>,
     pub(crate) client: tokio::sync::OnceCell<Result<client::RpcTransport, AdapterError>>,
     pub(crate) write_lock: tokio::sync::Mutex<()>,
     /// Immutable closed operation manifest admitted by this adapter instance.
@@ -60,8 +60,8 @@ impl fmt::Debug for SurrealStoreAdapter {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
             .debug_struct("SurrealStoreAdapter")
-            .field("config", &self.config)
-            .field("provider_process_lease", &self.provider_process_lease)
+            .field("config", &"private")
+            .field("provider_process_lease", &"retained")
             .field("connected", &self.client.get().is_some_and(Result::is_ok))
             .field("write_lock", &"private")
             .field("operation_manifest", &self.operation_manifest)
@@ -106,7 +106,7 @@ impl SurrealStoreAdapter {
             .ok_or(AdapterError::Store(StoreError::UnknownOperation))?;
         Ok(Self {
             config,
-            provider_process_lease,
+            provider_process_lease: std::sync::Arc::new(provider_process_lease),
             client: tokio::sync::OnceCell::new(),
             write_lock: tokio::sync::Mutex::new(()),
             operation_manifest,
@@ -132,7 +132,7 @@ impl SurrealStoreAdapter {
         manifest.validate()?;
         Ok(Self {
             config,
-            provider_process_lease,
+            provider_process_lease: std::sync::Arc::new(provider_process_lease),
             client: tokio::sync::OnceCell::new(),
             write_lock: tokio::sync::Mutex::new(()),
             operation_manifest: manifest,
