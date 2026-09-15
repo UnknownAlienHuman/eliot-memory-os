@@ -14,8 +14,8 @@ use std::time::Duration;
 use eliot_agent_bridge_core::{
     AgentBridgeCore, AttachBinding, AttachRequest, AttachView, BridgeError, ConnectionId,
     CursorPolicy, DemandId, EventForwardStatus, EventPortOutcome, HostActivationPort,
-    HostEventEnvelope, McpForwardingPort, ProviderFailure, ProviderReadiness,
-    ReconciliationPortOutcome, ReconnectRequest,
+    HostEventEnvelope, McpForwardingPort, OutstandingDeliveryView, ProviderFailure,
+    ProviderReadiness, ReconciliationPortOutcome, ReconnectRequest,
 };
 use eliot_mcp::KernelHostRequestPort;
 use eliot_protocol::{
@@ -355,6 +355,19 @@ impl BridgeRunner {
     #[must_use]
     pub fn attach_view(&self) -> Option<AttachView> {
         self.core.attach_view()
+    }
+    /// Read-only view of durable in-flight deliveries for bounded Stop accounting.
+    ///
+    /// Returns the exact core-retained outstanding identities (stream, event,
+    /// sequence) without completing, acknowledging, or recomputing anything:
+    /// the stdio Stop path reports them verbatim so a pending delivery is
+    /// reconciled under its original identity instead of being dropped and
+    /// re-issued under a new id. Empty in production while the forwarding
+    /// port stays unadmitted; non-empty only when a test or future admitted
+    /// forwarder holds durable deliveries below the required ack phase.
+    #[must_use]
+    pub fn outstanding_deliveries(&self) -> Vec<OutstandingDeliveryView> {
+        self.core.outstanding_deliveries()
     }
 }
 
