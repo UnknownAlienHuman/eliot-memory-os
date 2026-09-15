@@ -292,7 +292,7 @@ async fn assert_readback(
     let pack = adapter
         .execute_named(NamedReadRequest {
             operation: NamedReadOperation::GetEvidencePack,
-            scope_id: None,
+            scope_id: Some(ScopeId::new("scope").expect("scope")),
             consistency: ReadConsistency::ExactFence,
             state_fence: ctx.state_fence.clone(),
             parameters: BTreeMap::from([
@@ -344,19 +344,19 @@ async fn assert_readback(
         row["evidence_records"][0]["parameters"],
         authority.projection_value().expect("parameters")
     );
+    let mut matrix_read = transport
+        .query(
+            "test.matrix_read",
+            "SELECT VALUE payload FROM ONLY codec_probe:matrix;",
+            Map::new(),
+        )
+        .await
+        .expect("matrix read");
+    assert!(matrix_read.take_errors().is_empty());
+    assert_eq!(matrix_read.take::<Value>(0).expect("matrix"), matrix());
 }
 
-#[tokio::test]
-async fn real_surreal_payload_commit_exact_read_reopen_and_export() {
-    let mut harness = Harness::start().await;
-    let ctx = context();
-    let transport = harness
-        .adapter()
-        .client
-        .get()
-        .expect("connected")
-        .as_ref()
-        .expect("transport");
+async fn assert_codec(transport: &RpcTransport) {
     println!(
         "ISSUE-10 version={}",
         transport.version().await.expect("version")
@@ -408,6 +408,32 @@ async fn real_surreal_payload_commit_exact_read_reopen_and_export() {
             .is_err()
     );
 
+    // The active CaptureObservation contract admits only `subject` text.
+    // Exercise arbitrary object/array projections at this same private codec
+    // boundary without inventing a new canonical operation parameter.
+    let mut matrix_write = transport
+        .query(
+            "test.matrix_write",
+            "CREATE codec_probe:matrix SET payload = $value;",
+            Map::from_iter([("value".into(), values.clone())]),
+        )
+        .await
+        .expect("matrix write");
+    assert!(matrix_write.take_errors().is_empty());
+}
+
+#[tokio::test]
+async fn real_surreal_payload_commit_exact_read_reopen_and_export() {
+    let mut harness = Harness::start().await;
+    let ctx = context();
+    let transport = harness
+        .adapter()
+        .client
+        .get()
+        .expect("connected")
+        .as_ref()
+        .expect("transport");
+    assert_codec(transport).await;
     harness
         .adapter()
         .apply_migration(
@@ -417,10 +443,7 @@ async fn real_surreal_payload_commit_exact_read_reopen_and_export() {
         )
         .await
         .expect("baseline schema");
-    let raw = format!(
-        " {{\n  \"subject\": \"memory:operator-runtime-proof\", \"payload\": {}\n }} ",
-        values
-    );
+    let raw = " {\n  \"subject\": \"memory:operator-runtime-proof\"\n } ";
     let authority = ExactJsonBytes::parse(PayloadSource::NamedOperationParameter, raw.as_bytes())
         .expect("exact authority");
     let transition = transition(&ctx, &authority);

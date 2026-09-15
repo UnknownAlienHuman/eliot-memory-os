@@ -5,7 +5,7 @@
 //! (always starting with `[`, never a record-like prefix), then decode it with
 //! the RFC 8259 JSON decoder before executing the unchanged named operation.
 //! No payload bytes are replaced and no persistent encoding is introduced:
-//! ExactJsonBytes remains the versioned, digest-bound canonical authority.
+//! `ExactJsonBytes` remains the versioned, digest-bound canonical authority.
 
 use std::fmt::Write;
 
