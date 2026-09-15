@@ -1,12 +1,17 @@
-//! T9-07 four-factory registry wiring proof (WRITER-A).
+//! T9-07 four-factory registry wiring proof (WRITER-A, bound by INTEGRATOR-T9-07).
 //!
 //! Real factories with controlled external seams: no live credentials, no
 //! network, no spawned processes. The P-03 executor is an in-memory
 //! recording double (its `start` is never reached on any refusal path);
 //! opencode uses a loopback endpoint plus a non-credential policy directory;
-//! ACP uses caller-owned in-memory handles; Claude evaluates only its inert
-//! skeleton. Every test owns a [`FactoryLedger`] proving exactly which
-//! factory constructed, and none on any refusal.
+//! ACP uses caller-owned in-memory handles; Claude constructs the real
+//! `ClaudeSidecarFactory` over the forwarded executor while `prepare` with
+//! live owner records stays a drive step. Every test owns a [`FactoryLedger`]
+//! proving exactly which factory constructed, and none on any refusal.
+//!
+//! The registry is imported from the crate (`lib.rs` owns `mod
+//! adapter_registry`); there is exactly one compilation of the module, so
+//! these types are identical to the ones the admitted seam resolves.
 //!
 //! One substantive test exists per proven `WORK_UNIT_CASE` marker below.
 //! Markers are never written for unproven cases; the deferred numbers are
@@ -14,19 +19,9 @@
 
 #![allow(clippy::too_many_lines)]
 
-#[path = "../src/adapter_registry.rs"]
-mod adapter_registry;
-
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::{Arc, Mutex, MutexGuard};
 
-use adapter_registry::{
-    ACP_FACTORY_ID, AcpFactorySeams, AdapterIdentity, AdapterRegistry, CLAUDE_FACTORY_ID,
-    CLAUDE_SKELETON_RESIDUAL, CODEX_FACTORY_ID, CodexFactorySeams, FACTORY_REVISION, FactoryEntry,
-    FactoryLedger, OPENCODE_FACTORY_ID, OpencodeFactorySeams, RegistryError, SecretRef,
-    ValidatedDispatch, invoke_acp_factory, invoke_claude_factory, invoke_codex_factory,
-    invoke_opencode_factory, validate_admitted_dispatch,
-};
 use eliot_agent_claude::{
     CLAUDE_SIDECAR_PROTOCOL_VERSION, ClaudeAllowedTool, ClaudeArgv, ClaudeEnvAllowlist,
     ClaudePermissionMode, ClaudeRequestKind, ClaudeSidecarLaunchPlan, ClaudeSidecarRequest,
@@ -34,6 +29,13 @@ use eliot_agent_claude::{
 use eliot_contracts::{
     DecisionId, EpochId, EpochLineageId, ResourceGeneration, SessionId, StateFence, TaskId,
     sha256_hex,
+};
+use eliot_native_worker::adapter_registry::{
+    ACP_FACTORY_ID, AcpFactorySeams, AdapterIdentity, AdapterRegistry, CLAUDE_FACTORY_ID,
+    CODEX_FACTORY_ID, ClaudeFactorySeams, CodexFactorySeams, FACTORY_REVISION, FactoryEntry,
+    FactoryLedger, OPENCODE_FACTORY_ID, OpencodeFactorySeams, RegistryError, SecretRef,
+    ValidatedDispatch, invoke_acp_factory, invoke_claude_factory, invoke_codex_factory,
+    invoke_opencode_factory, validate_admitted_dispatch,
 };
 use eliot_native_worker_core::{
     AttemptId, BudgetEnvelope, ClaimAdmissionRequest, EXECUTION_UNIT_SCHEMA_VERSION,
@@ -551,10 +553,20 @@ fn one_entry_per_identity_revision() {
         Some(AdapterIdentity::Claude)
     );
     assert_eq!(AdapterIdentity::parse("eliot-agent-unknown"), None);
-    assert!(AdapterIdentity::Opencode.is_capable());
-    assert!(AdapterIdentity::Codex.is_capable());
-    assert!(AdapterIdentity::Acp.is_capable());
-    assert!(!AdapterIdentity::Claude.is_capable());
+    // All four entries are capable: each identity plus revision resolves to
+    // its named entry (INTEGRATOR-T9-07: the Claude skeleton refusal is
+    // removed; `execution::prepare` plus `ClaudeSidecarFactory::new` exist).
+    for (factory_id, identity) in [
+        (OPENCODE_FACTORY_ID, AdapterIdentity::Opencode),
+        (CODEX_FACTORY_ID, AdapterIdentity::Codex),
+        (ACP_FACTORY_ID, AdapterIdentity::Acp),
+        (CLAUDE_FACTORY_ID, AdapterIdentity::Claude),
+    ] {
+        match registry.resolve(factory_id, FACTORY_REVISION) {
+            Ok(entry) => assert_eq!(entry.identity(), identity),
+            Err(error) => panic!("{factory_id} must resolve capable, got {error:?}"),
+        }
+    }
     let entry = FactoryEntry::new(AdapterIdentity::Codex, FACTORY_REVISION)
         .unwrap_or_else(|| panic!("nonzero revision must build"));
     assert_eq!(entry.identity(), AdapterIdentity::Codex);
@@ -620,42 +632,48 @@ fn unknown_factory_rejected() {
     assert_eq!(fixtures.executor.starts(), 0);
 }
 
-// WORK_UNIT_CASE 7: incompatible entries are rejected with typed reasons.
+// WORK_UNIT_CASE 7: the Claude entry resolves capable with deferred prepare.
 #[test]
-fn incompatible_factory_rejected() {
+fn claude_factory_capable_with_deferred_prepare() {
     let registry = AdapterRegistry::four_factory();
-    // The Claude skeleton carries valid bindings yet can never serve.
+    // The Claude entry carries valid bindings and resolves like the other
+    // three (INTEGRATOR-T9-07: `execution::prepare`,
+    // `ClaudeSidecarFactory::new`, and `admit_with_port` all exist, so the
+    // skeleton refusal is removed; live `prepare` stays a drive step).
     let claude = admitted(CLAUDE_FACTORY_ID, "case-7");
     let valid = validated(&claude);
     match registry.resolve(CLAUDE_FACTORY_ID, FACTORY_REVISION) {
-        Err(RegistryError::Incompatible { reason, .. }) => {
-            assert!(reason.contains("crates/agent/eliot-agent-claude/src/lib.rs"));
-        }
-        other => panic!("claude entry must be incompatible, got {other:?}"),
+        Ok(entry) => assert_eq!(entry.identity(), AdapterIdentity::Claude),
+        Err(error) => panic!("claude entry must resolve capable, got {error:?}"),
     }
-    let ledger = FactoryLedger::new();
-    match invoke_claude_factory(&registry, &valid, &claude_request(), &ledger) {
-        Err(RegistryError::Incompatible { reason, .. }) => {
-            assert!(reason.contains("crates/agent/eliot-agent-claude/src/lib.rs"));
-        }
-        other => panic!("claude invoke must stay incompatible, got {other:?}"),
-    }
-    assert!(ledger.calls().is_empty());
+    let mut ledger = FactoryLedger::new();
+    let seams = ClaudeFactorySeams {
+        executor: Arc::new(RecordingExecutor::new()),
+    };
+    let attempt =
+        match invoke_claude_factory(&registry, &valid, &seams, &claude_request(), &mut ledger) {
+            Ok(attempt) => attempt,
+            Err(error) => panic!("claude invoke must construct, got {error:?}"),
+        };
+    assert_eq!(attempt.adapter(), AdapterIdentity::Claude);
+    assert_eq!(attempt.claim_id(), valid.claim_id());
+    assert_eq!(ledger.calls_for(AdapterIdentity::Claude), 1);
 
-    // A known identity with a foreign revision is equally refused.
-    match registry.resolve(CODEX_FACTORY_ID, FACTORY_REVISION + 1) {
+    // A known identity with a foreign revision is still refused.
+    match registry.resolve(CLAUDE_FACTORY_ID, FACTORY_REVISION + 1) {
         Err(RegistryError::Incompatible { .. }) => {}
         other => panic!("revision mismatch must be incompatible, got {other:?}"),
     }
 
-    // A malformed skeleton request fails its own shape before resolution.
+    // A malformed factory request fails its own shape with no construction.
     let mut broken = claude_request();
     broken.protocol_version = "v0".to_owned();
-    match invoke_claude_factory(&registry, &valid, &broken, &ledger) {
+    let mut fresh = FactoryLedger::new();
+    match invoke_claude_factory(&registry, &valid, &seams, &broken, &mut fresh) {
         Err(RegistryError::BadInput { .. }) => {}
-        other => panic!("malformed skeleton must fail input checks, got {other:?}"),
+        other => panic!("malformed request must fail input checks, got {other:?}"),
     }
-    assert!(CLAUDE_SKELETON_RESIDUAL.contains("crates/agent/eliot-agent-claude/src/lib.rs"));
+    assert!(fresh.calls().is_empty());
 }
 
 // WORK_UNIT_CASE 9: bad claims are refused pre-factory with ledger proof.
@@ -822,17 +840,23 @@ fn no_rerank_fallback_or_substitution() {
     }
     assert!(ledger.calls().is_empty());
 
-    // An incompatible entry does not fall through to a capable one: the
-    // Claude refusal leaves every capable ledger at zero.
-    let claude = admitted(CLAUDE_FACTORY_ID, "case-11b");
-    let claude_valid = validated(&claude);
-    match invoke_claude_factory(&registry, &claude_valid, &claude_request(), &ledger) {
-        Err(RegistryError::Incompatible { .. }) => {}
-        other => panic!("claude must stay incompatible, got {other:?}"),
+    // A codex-resolved dispatch presented to the Claude factory is likewise
+    // refused as substitution: capability comes from naming, never from
+    // fallback, even though the Claude entry is capable.
+    let claude_seams = ClaudeFactorySeams {
+        executor: Arc::clone(&fixtures.executor),
+    };
+    match invoke_claude_factory(
+        &registry,
+        &valid,
+        &claude_seams,
+        &claude_request(),
+        &mut ledger,
+    ) {
+        Err(RegistryError::SubstitutionRefused { .. }) => {}
+        other => panic!("cross-factory claude invoke must refuse, got {other:?}"),
     }
-    assert_eq!(ledger.calls_for(AdapterIdentity::Opencode), 0);
-    assert_eq!(ledger.calls_for(AdapterIdentity::Codex), 0);
-    assert_eq!(ledger.calls_for(AdapterIdentity::Acp), 0);
+    assert!(ledger.calls().is_empty());
 
     // The named factory still constructs explicitly afterwards: capability
     // comes from naming, never from fallback.
@@ -854,6 +878,7 @@ fn deterministic_attempt_per_capable_adapter() {
         (OPENCODE_FACTORY_ID, AdapterIdentity::Opencode, "case-30a"),
         (CODEX_FACTORY_ID, AdapterIdentity::Codex, "case-30b"),
         (ACP_FACTORY_ID, AdapterIdentity::Acp, "case-30c"),
+        (CLAUDE_FACTORY_ID, AdapterIdentity::Claude, "case-30d"),
     ];
     for (factory_id, identity, tag) in cases {
         let fixtures = admitted(factory_id, tag);
@@ -880,9 +905,15 @@ fn deterministic_attempt_per_capable_adapter() {
                 },
                 &mut ledger,
             ),
-            AdapterIdentity::Claude => {
-                panic!("claude is the typed-incompatible entry, never attempted here")
-            }
+            AdapterIdentity::Claude => invoke_claude_factory(
+                &registry,
+                &valid,
+                &ClaudeFactorySeams {
+                    executor: Arc::clone(&fixtures.executor),
+                },
+                &claude_request(),
+                &mut ledger,
+            ),
         };
         let attempt = match attempt {
             Ok(attempt) => attempt,
@@ -932,9 +963,15 @@ fn deterministic_attempt_per_capable_adapter() {
                 },
                 &mut replay,
             ),
-            AdapterIdentity::Claude => {
-                panic!("claude is the typed-incompatible entry, never attempted here")
-            }
+            AdapterIdentity::Claude => invoke_claude_factory(
+                &registry,
+                &valid,
+                &ClaudeFactorySeams {
+                    executor: Arc::clone(&fixtures.executor),
+                },
+                &claude_request(),
+                &mut replay,
+            ),
         };
         match again {
             Ok(again) => assert_eq!(attempt, again),

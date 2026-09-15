@@ -914,8 +914,11 @@ mod tests {
     ) -> NativeWorkerExecutableBinding {
         NativeWorkerExecutableBinding {
             route_ref: hello_value.route_ref.clone(),
-            adapter_id: "adapter-test".to_owned(),
-            adapter_revision: 3,
+            // INTEGRATOR-T9-07: the bound seam resolves the projected join
+            // through the live four-factory registry, so the fixture must
+            // present a real registered identity plus revision.
+            adapter_id: eliot_native_worker::adapter_registry::CODEX_FACTORY_ID.to_owned(),
+            adapter_revision: eliot_native_worker::adapter_registry::FACTORY_REVISION,
             config_digest: registration.worker_config_digest.clone(),
             facet_manifest_ref: "facet-manifest-7".to_owned(),
             grant_graph_revision: 5,
@@ -1096,14 +1099,21 @@ mod tests {
             claim_value.binding_digest
         );
 
-        // T9-07 (WRITER-B): the validated material resolves to exactly one
-        // factory through the registry seam — no default, no ambiguity.
+        // T9-07 (WRITER-B, bound by INTEGRATOR-T9-07): the validated
+        // material resolves to exactly one factory through the live
+        // registry — no default, no ambiguity.
         let selection = match select_factory_for_admitted(&material) {
             Ok(selection) => selection,
             Err(error) => panic!("factory selection must resolve, got {error:?}"),
         };
-        assert_eq!(selection.adapter_id, "adapter-test");
-        assert_eq!(selection.adapter_revision, 3);
+        assert_eq!(
+            selection.adapter_id,
+            eliot_native_worker::adapter_registry::CODEX_FACTORY_ID
+        );
+        assert_eq!(
+            selection.adapter_revision,
+            eliot_native_worker::adapter_registry::FACTORY_REVISION
+        );
         assert_eq!(selection.route_ref, "route-1");
         assert_eq!(
             selection.process_invocation_digest,

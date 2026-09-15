@@ -14,7 +14,7 @@
 //! eliot-agent-opencode @ 1 (capable; OpenCodeClient::new + catalogue fns)
 //! eliot-agent-codex    @ 1 (capable; CodexAdapter::<E>::new + attach seam)
 //! eliot-agent-acp      @ 1 (capable; AcpWire + AcpProcessBinding + admission seam)
-//! eliot-agent-claude   @ 1 (skeleton; always Incompatible, see residual below)
+//! eliot-agent-claude   @ 1 (capable; ClaudeSidecarFactory::<E>::new + prepare/admit_with_port seam)
 //! ```
 //!
 //! There is no unified factory trait upstream; each factory is composed from
@@ -34,10 +34,23 @@
 //!   and the real `AcpProcessBinding::new` over the forwarded executor, and
 //!   pins `AcpAdmission::validate`/`admit` with compile-time signature
 //!   assertions.
-//! - claude validates the inert launch-plan shape at runtime and always
-//!   refuses with [`RegistryError::Incompatible`] carrying
-//!   [`CLAUDE_SKELETON_RESIDUAL`]. The skeleton is never faked into a
-//!   capable factory.
+//! - claude constructs the real `ClaudeSidecarFactory::<E>::new` over the
+//!   forwarded P-03 executor (pure: stores the handle, starts nothing),
+//!   validates the inert launch-plan shape at runtime, and pins
+//!   `execution::prepare` plus `admit_with_port` with compile-time signature
+//!   assertions. `prepare` with the live X4 binding plus agent attempt records
+//!   belongs to the agent-plane caller that owns those records, not to this
+//!   contour.
+//!
+//! INTEGRATOR-T9-07 correction (issue #874): Writer A misread the Claude
+//! crate as a skeleton with no execution constructor. In fact
+//! `crates/agent/eliot-agent-claude/src/execution.rs` supplies
+//! `ClaudeFactoryInput` (:208-232), `prepare()` (:352), and
+//! `ClaudeSidecarFactory` with `::new` (:919-929), `pub mod execution` is
+//! declared (`src/lib.rs:37`), and `admit_with_port` lives at
+//! `src/lib.rs:1300`. The Claude entry therefore gets the same
+//! signature-pinned, deferred-invocation treatment as the other three; the
+//! always-`Incompatible` skeleton refusal is removed.
 //!
 //! ## Validation order (all fail-closed, all before any factory effect)
 //!
@@ -115,15 +128,6 @@ pub const CLAUDE_FACTORY_ID: &str = "eliot-agent-claude";
 /// Revisions are owner-produced; a bump is an #874 follow-up that changes
 /// this constant together with its proof, never a silent local repair.
 pub const FACTORY_REVISION: u64 = 1;
-/// ContractChallenge-style residual for the Claude entry.
-///
-/// `crates/agent/eliot-agent-claude/src/lib.rs` supplies only the Wave-1
-/// bounded NDJSON contract and native skeleton (`ClaudeSidecarLaunchPlan`,
-/// `AdmittedHandle`, `admit_with_port`); per its `AGENTS.md:33` it has no
-/// production composition caller and no execution constructor capable of
-/// serving the admitted contour. The Claude registry entry therefore always
-/// resolves to [`RegistryError::Incompatible`] and never constructs.
-pub const CLAUDE_SKELETON_RESIDUAL: &str = "ContractChallenge-style residual (issue-22 T9-07): crates/agent/eliot-agent-claude/src/lib.rs supplies only the Wave-1 bounded NDJSON contract and native skeleton (ClaudeSidecarLaunchPlan/AdmittedHandle/admit_with_port) with no production composition caller (AGENTS.md:33) and no execution constructor capable of serving the admitted contour; the Claude factory entry always refuses as incompatible and must be completed by its owning crate, not faked here";
 
 /// Maximum factory-call records retained by one [`FactoryLedger`].
 pub const MAX_FACTORY_CALLS: usize = 16;
@@ -143,7 +147,7 @@ pub enum AdapterIdentity {
     Codex,
     /// `eliot-agent-acp` ACP v1 compatibility cell (capable).
     Acp,
-    /// `eliot-agent-claude` sidecar skeleton (not capable).
+    /// `eliot-agent-claude` local sidecar (capable).
     Claude,
 }
 
@@ -157,12 +161,6 @@ impl AdapterIdentity {
             Self::Acp => ACP_FACTORY_ID,
             Self::Claude => CLAUDE_FACTORY_ID,
         }
-    }
-
-    /// Returns false only for the Claude skeleton entry.
-    #[must_use]
-    pub const fn is_capable(self) -> bool {
-        !matches!(self, Self::Claude)
     }
 
     /// Parses a canonical identity; returns `None` for anything else.
@@ -233,8 +231,8 @@ impl FactoryEntry {
 /// Typed fail-closed registry failure.
 ///
 /// Reason-code mapping (I07-20): `Unknown` is `ADAPTER_UNAVAILABLE` /
-/// `ROUTE_UNAVAILABLE`; a revision mismatch is `ROUTE_MISMATCH`; the Claude
-/// entry is `ADAPTER_INCOMPATIBLE`; `BadClaim` preserves the production
+/// `ROUTE_UNAVAILABLE`; a revision mismatch is `ROUTE_MISMATCH`;
+/// `Incompatible` is `ADAPTER_INCOMPATIBLE`; `BadClaim` preserves the production
 /// [`WorkerError`] dimension (`InvalidRequest`, `StaleEpoch`, `StaleFence`,
 /// `DeadlineExpired`, `Revoked`, `UnsupportedVersion`, admission mismatch);
 /// `AlreadyStarted` guards single-start ownership.
@@ -463,10 +461,9 @@ impl AdapterRegistry {
     ///
     /// # Errors
     ///
-    /// Returns `Unknown`/`Ambiguous` from identity resolution,
-    /// `Incompatible` for a revision mismatch or for the Claude skeleton
-    /// entry, and `BadInput` for a malformed projection. No fallback is
-    /// attempted on any failure.
+    /// Returns `Unknown`/`Ambiguous` from identity resolution and
+    /// `Incompatible` for a revision mismatch. No fallback is attempted on
+    /// any failure.
     pub fn resolve(
         &self,
         adapter_id: &str,
@@ -493,12 +490,6 @@ impl AdapterRegistry {
             return Err(RegistryError::Incompatible {
                 adapter_id: truncate_detail(adapter_id),
                 reason: truncate_detail("adapter revision does not match the registered factory"),
-            });
-        }
-        if !identity.is_capable() {
-            return Err(RegistryError::Incompatible {
-                adapter_id: truncate_detail(adapter_id),
-                reason: truncate_detail(CLAUDE_SKELETON_RESIDUAL),
             });
         }
         Ok(entry)
@@ -1061,29 +1052,41 @@ fn assert_acp_entries<E, T>() {
     let _ = AcpAdmission::admit as fn(AcpAdmission) -> Result<AcpAdmission, AcpAdmissionError>;
 }
 
-/// Invokes the Claude entry: always a typed incompatible refusal.
+/// Controlled Claude seams: the forwarded P-03 executor behind `Arc`.
+#[derive(Clone, Debug)]
+pub struct ClaudeFactorySeams<E> {
+    /// Forwarded process executor; construction stores it without starting.
+    pub executor: Arc<E>,
+}
+
+/// Invokes exactly the named Claude factory.
 ///
-/// Validates the inert launch-plan shape through its real public entries
-/// (proving the skeleton was evaluated, not skipped), pins `admit_with_port`
-/// by compile-time signature assertion, and then refuses with
-/// [`CLAUDE_SKELETON_RESIDUAL`]. Nothing is constructed and the ledger is
-/// never touched.
+/// Constructs the real `ClaudeSidecarFactory::<E>::new` over the forwarded
+/// executor (pure: stores the handle, starts nothing), validates the inert
+/// launch-plan shape through its real public entries, and pins
+/// `execution::prepare` plus `admit_with_port` by compile-time signature
+/// assertion. `prepare` with the live X4 binding plus agent attempt records
+/// belongs to the agent-plane caller that owns those records; the drive step
+/// performs the single P-03 start.
 ///
 /// # Errors
 ///
-/// Returns `BadInput` for a malformed skeleton request and `Incompatible`
-/// otherwise.
-pub fn invoke_claude_factory(
+/// Returns ledger, resolution, substitution, and input failures without any
+/// factory effect on any failure path.
+pub fn invoke_claude_factory<E>(
     registry: &AdapterRegistry,
     validated: &ValidatedDispatch,
+    seams: &ClaudeFactorySeams<E>,
     request: &ClaudeSidecarRequest,
-    ledger: &FactoryLedger,
-) -> Result<FactoryAttempt, RegistryError> {
-    let _ = eliot_agent_claude::admit_with_port
-        as fn(
-            &dyn eliot_agent_claude::ClaudeLaunchPort,
-            &ClaudeSidecarRequest,
-        ) -> Result<eliot_agent_claude::AdmittedHandle, ClaudeSidecarError>;
+    ledger: &mut FactoryLedger,
+) -> Result<FactoryAttempt, RegistryError>
+where
+    E: ProcessExecutor,
+{
+    let _entry = begin_invoke(registry, validated, AdapterIdentity::Claude, ledger)?;
+    assert_claude_entries::<E>();
+    let _factory =
+        eliot_agent_claude::execution::ClaudeSidecarFactory::new(Arc::clone(&seams.executor));
     request
         .validate()
         .map_err(|error| RegistryError::BadInput {
@@ -1096,16 +1099,29 @@ pub fn invoke_claude_factory(
             detail: truncate_detail(&error.to_string()),
         })?;
     }
-    if ledger.contains_operation(&validated.operation_id) {
-        return Err(RegistryError::AlreadyStarted {
-            operation_id: validated.operation_id.clone(),
-        });
-    }
-    match registry.resolve_by_identity(CLAUDE_FACTORY_ID) {
-        Ok(_) => Err(RegistryError::Incompatible {
-            adapter_id: CLAUDE_FACTORY_ID.to_owned(),
-            reason: truncate_detail(CLAUDE_SKELETON_RESIDUAL),
-        }),
-        Err(error) => Err(error),
-    }
+    commit_invoke(ledger, AdapterIdentity::Claude, validated)
+}
+
+/// Pins the Claude entries reachable from this contour at build time.
+///
+/// `prepare` (with the live X4 binding plus agent attempt) and the
+/// single-take `launch` run at the Writer-B drive step behind the
+/// owner-record boundary; they are pinned here so a signature drift fails
+/// the build instead of silently detaching the factory.
+fn assert_claude_entries<E>()
+where
+    E: ProcessExecutor,
+{
+    let _ = eliot_agent_claude::execution::ClaudeSidecarFactory::<E>::new
+        as fn(Arc<E>) -> eliot_agent_claude::execution::ClaudeSidecarFactory<E>;
+    let _ = eliot_agent_claude::execution::prepare
+        as fn(
+            eliot_agent_claude::execution::ClaudeFactoryInput,
+        )
+            -> Result<eliot_agent_claude::execution::ClaudeFactoryOutcome, ClaudeSidecarError>;
+    let _ = eliot_agent_claude::admit_with_port
+        as fn(
+            &dyn eliot_agent_claude::ClaudeLaunchPort,
+            &ClaudeSidecarRequest,
+        ) -> Result<eliot_agent_claude::AdmittedHandle, ClaudeSidecarError>;
 }

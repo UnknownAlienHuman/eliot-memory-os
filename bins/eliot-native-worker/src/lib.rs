@@ -19,6 +19,14 @@ use thiserror::Error;
 
 mod kernel_admission_client;
 
+/// Private finite immutable four-factory adapter registry, owned by this
+/// crate so the admitted seam and the wiring proof address identical types.
+///
+/// `pub` (rather than crate-private) so the `tests/` wiring proof imports
+/// the same module instead of compiling a second copy via `#[path]`, which
+/// would fork the types and void the proof.
+pub mod adapter_registry;
+
 pub use kernel_admission_client::{
     KernelNativeWorkerClient, KernelReplayPort, KernelReplayTransport,
     NATIVE_WORKER_CANCEL_OBSERVE_OPERATION, NATIVE_WORKER_CHECKPOINT_OPERATION,
@@ -332,71 +340,37 @@ where
     Ok(ready)
 }
 
-/// WRITER-B → WRITER-A INTEGRATOR SEAM (T9-07, issue #874; supersedes PR #1125).
-///
-/// ASSUMED SIGNATURE (binding for the integrator):
-///
-/// ```text
-/// pub fn select_factory_for_admitted(
-///     material: &eliot_native_worker::admitted_material::ValidatedAdmittedMaterial,
-/// ) -> Result<eliot_native_worker::FactorySelection, eliot_native_worker::NativeWorkerError>
-/// ```
-///
-/// with
+/// Admitted factory-resolution seam (T9-07, issue #874; supersedes PR #1125).
+/// BOUND by INTEGRATOR-T9-07: this is the single resolution function. It
+/// projects the owner-produced v2 executable join (`adapter_id`,
+/// `adapter_revision`, `route_ref`, plus the carried digests) already bound
+/// by [`admitted_material::read_admitted_material`], then backs the projected
+/// identity with the live [`adapter_registry::AdapterRegistry`] —
 ///
 /// ```text
-/// pub struct FactorySelection {
-///     pub adapter_id: String,
-///     pub adapter_revision: u64,
-///     pub route_ref: String,
-///     pub config_digest: String,
-///     pub replay_stream_id: String,
-///     pub process_invocation_digest: String,
-/// }
+/// run() -> select_factory_for_admitted() -> AdapterRegistry::four_factory().resolve()
 /// ```
 ///
-/// WHAT THIS FUNCTION IS: the closed envelope projection that resolves one
-/// validated admitted route to exactly one factory identity. It projects the
-/// owner-produced v2 executable join (`adapter_id`, `adapter_revision`,
-/// `route_ref`, plus the carried digests) already bound by
-/// [`admitted_material::read_admitted_material`], and refuses anything that
-/// does not resolve to exactly one factory. It mints nothing, admits nothing,
-/// and starts nothing: the downstream `from_claim` join, executable gate,
-/// grant checks, and receipt/proof validation in
-/// [`drive_admitted_claimed`] re-prove everything before any process starts.
-///
-/// WHAT WRITER A's `bins/eliot-native-worker/src/adapter_registry.rs` MUST
-/// SATISFY (that file does not exist on base `bf219fe`; it is Writer-A owned
-/// and disjoint from this change): backing the projected identity with the
-/// live registry without weakening this fail-closed projection. The assumed
-/// Writer-A-side projection is
-///
-/// ```text
-/// pub fn resolve_admitted_factory(
-///     selection: &eliot_native_worker::FactorySelection,
-/// ) -> Result<ResolvedAdmittedFactory, eliot_native_worker::NativeWorkerError>
-/// ```
-///
-/// where `ResolvedAdmittedFactory` composes the exact `E`/`A`/`R`/`C` ports
-/// for the selected adapter. INTEGRATOR BINDING (choose one, keep fail-closed
-/// and keep exit 78 for every refusal):
-/// (a) keep this function as the closed envelope projection and add the
-/// `resolve_admitted_factory` lookup in `adapter_registry.rs`, calling it
-/// from the binary after this selection; or (b) replace this function body
-/// with the registry-backed lookup while preserving this exact signature,
-/// this exact fail-closed refusal family, and the 78 mapping in the binary.
-/// The integrator must not equate the admitted `route_class` label with a
-/// full route fingerprint, must not default a factory, and must not let an
-/// ambiguous or unknown route resolve.
+/// — and refuses anything that does not resolve to exactly one registered
+/// factory. The hypothetical second function from the Writer-B draft
+/// (`resolve_admitted_factory`) was never created; no duplicate resolution
+/// path exists. This seam mints nothing, admits nothing, and starts nothing:
+/// the downstream `from_claim` join, executable gate, grant checks, and
+/// receipt/proof validation in [`drive_admitted_claimed`] re-prove everything
+/// before any process starts. It never equates the admitted `route_class`
+/// label with a full route fingerprint, never defaults a factory, and never
+/// lets an ambiguous or unknown route resolve.
 ///
 /// FAIL-CLOSED FAMILY (every variant maps to exit 78 in the binary via the
 /// typed `KERNEL_ADMISSION_REQUIRED` denial, never the deferred line and
 /// never a drive): the claim carries no v2 executable join (old wire can
 /// never select a factory); the join route does not equal the presented
 /// hello route; the join nonce is not the session nonce; the factory identity
-/// is blank; the adapter revision is zero. Full shape, digest, epoch, fence,
-/// and window checks stay with the envelope reader and the drive; this seam
-/// is the route-resolution projection only.
+/// is blank; the adapter revision is zero; the projected identity plus
+/// revision matches no live registry entry (unknown, ambiguous, or revision
+/// mismatch). Full shape, digest, epoch, fence, and window checks stay with
+/// the envelope reader and the drive; this seam is the route-resolution
+/// projection plus the live registry lookup only.
 ///
 /// HONESTY BOUNDARY (issue #874 binding): this seam resolves the factory
 /// identity only. It does not derive the executor-bound `ProcessRequest`
@@ -427,12 +401,28 @@ pub struct FactorySelection {
 
 /// Resolves one validated admitted route to exactly one factory identity.
 ///
-/// See the [`FactorySelection`] integrator seam documentation for the binding
-/// contract, the Writer-A-side assumption, and the honesty boundary.
+/// See the [`FactorySelection`] seam documentation for the binding contract
+/// and the honesty boundary.
 pub fn select_factory_for_admitted(
     material: &admitted_material::ValidatedAdmittedMaterial,
 ) -> Result<FactorySelection, NativeWorkerError> {
-    select_factory_from_presented(material.admission.claim(), &material.hello, &material.nonce)
+    let selection = select_factory_from_presented(
+        material.admission.claim(),
+        &material.hello,
+        &material.nonce,
+    )?;
+    // Back the projected identity with the live four-factory registry: an
+    // unknown, ambiguous, or revision-mismatched projection is a refused
+    // presentation (typed 78 in the binary), never a default and never a
+    // drive. The admitted arm never emits the deferred line.
+    adapter_registry::AdapterRegistry::four_factory()
+        .resolve(&selection.adapter_id, selection.adapter_revision)
+        .map_err(|error| {
+            NativeWorkerError::KernelAdmissionRequired(format!(
+                "admitted factory unresolved: {error}"
+            ))
+        })?;
+    Ok(selection)
 }
 
 /// Projects one presented claim plus hello plus session nonce to exactly one
