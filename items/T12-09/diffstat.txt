@@ -1,0 +1,11 @@
+ items/T12-09/diffstat.txt | 8 --------
+ 1 file changed, 8 deletions(-)
+## work/702-dreamer-launch-leaseexact
+M  bins/eliot-kernel/src/dispatch_launch.rs
+A  bins/eliot-kernel/src/dreamer_dispatch_launch.rs
+M  bins/eliot-kernel/src/dreamer_job_dispatch.rs
+A  items/T12-09/clippy.log
+AM items/T12-09/diffstat.txt
+A  items/T12-09/fmt-mine.log
+A  items/T12-09/test.log
+A  items/T12-09/writer.md

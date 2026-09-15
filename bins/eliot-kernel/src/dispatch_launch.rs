@@ -1,10 +1,15 @@
-//! Kernel dispatch-launch contour for one-shot Doctor, testd, and native-worker workers.
+//! Kernel dispatch-launch contour for one-shot Doctor, testd, native-worker,
+//! and Dreamer workers.
 //!
 //! DISPATCH-CONTOUR-2 Slice B (issues #461 and #22) plus DISPATCH-CAUSE-FIX:
 //! Kernel-side launch of admitted Doctor, testd, and native-worker attempts
 //! through the admitted
 //! [`ProcessExecutionGateway`](crate::process_execution::ProcessExecutionGateway),
 //! plus the composed front-door owner the dispatch arms admit through.
+//! T12-09 (issue #702) wires the Dreamer arm through the same contour:
+//! admitted Dreamer launch through the admitted process executor with
+//! protected dispatch material, launch-once lineage, and worker-side
+//! `LeaseExact` claim fencing (see [`dreamer_dispatch_launch`]).
 //!
 //! Contour (built once, parameterized by [`DispatchedWorkerKind`]):
 //!
@@ -76,6 +81,15 @@
 //! `NativeWorkerClaimRecord` stays the reconcile authority (see
 //! `native_worker_lifecycle_route::NATIVE_WORKER_CLAIM_OPERATION`).
 //!
+//! Dreamer delivery (T12-09, Implements #702): the contour records one
+//! launch lineage for the exact queued job/attempt and writes
+//! `eliot-dreamer.admitted-job.json` (job/attempt/revision/scope/fence +
+//! epoch + generation + nonce + grant) through the same helper; the durable
+//! Store Dreamer ledger (K1 gateway) stays the terminal authority, while the
+//! lineage table enforces launch-once per job identity and fences the
+//! worker-side `LeaseExact` claim. Material, lineage, and validation live in
+//! [`dreamer_dispatch_launch`]; the arm below wires them to this contour.
+//!
 //! Architecture: ARCH-MOD-01, A13.2, A13.3; I7.5 launch nonce, I15.2
 //! Principal and Session binding, I14.6 admission and execution axes.
 //! Forbidden authority: no minted ledger/registry/principal, no invented
@@ -101,7 +115,24 @@ use eliot_ors::{
     NativeWorkerClaimRecord, OperationIdentity,
 };
 use eliot_process::OperationId;
+use eliot_protocol::dreamer_job::{DurableJobResponse, JobState};
 use serde::{Deserialize, Serialize};
+
+/// Protected Dreamer dispatch-launch material and launch lineage (T12-09).
+///
+/// Sibling-file seam: the Dreamer envelope, nonce, validation, and
+/// launch-once lineage table live here so the contour core above stays
+/// untouched; the Dreamer arm below wires them to the admitted executor.
+/// Declared with an explicit path so no neighbouring composition root needs
+/// to change for this slice.
+#[path = "dreamer_dispatch_launch.rs"]
+pub(crate) mod dreamer_dispatch_launch;
+
+use dreamer_dispatch_launch::{
+    DreamerChildBinding, DreamerDispatchedEnvelope, DreamerLaunchKeys, DreamerLaunchPhase,
+    DreamerLaunchRecord, DreamerLeaseExpectation, DreamerMaterialError, DreamerReconcileOutcome,
+    DreamerReserveOutcome,
+};
 
 use super::doctor_recovery_ledger::KernelDoctorRecoveryLedger;
 use super::front_door_session::{DOCTOR_MODULE_ID, NATIVE_MODULE_ID, TESTD_MODULE_ID};
@@ -116,12 +147,15 @@ use super::{
 /// One-shot worker kind served by the dispatch-launch contour.
 ///
 /// The contour is built once and parameterized by this enum: Doctor, testd,
-/// and the native worker share admission-through-composed-owner (Doctor via
-/// its ledger port, testd stateless via the principal owner, native via the
-/// ORS claim table through `KernelService::admit_native_worker_claim`),
-/// nonce minting, spawn through the admitted gateway, launch retention, and
-/// reconcile-by-original-identity. They differ only in the delivery
-/// endpoint the child already reads (see [`Self::material_file_name`]).
+/// the native worker, and Dreamer share admission-through-composed-owner
+/// (Doctor via its ledger port, testd stateless via the principal owner,
+/// native via the ORS claim table through
+/// `KernelService::admit_native_worker_claim`, Dreamer via its durable
+/// `QUEUED` ledger response plus live authority through
+/// [`prepare_dreamer_launch`]), nonce minting, spawn through the admitted
+/// gateway, launch retention, and reconcile-by-original-identity. They
+/// differ only in the delivery endpoint the child already reads (see
+/// [`Self::material_file_name`]).
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum DispatchedWorkerKind {
     /// The one-shot Doctor repair worker (`eliot-doctor`).
@@ -130,6 +164,8 @@ pub enum DispatchedWorkerKind {
     Testd,
     /// The one-shot native-worker claim worker (`eliot-native-worker`).
     NativeWorker,
+    /// The one-shot Dreamer job worker (`eliot-dreamer`, T12-09).
+    Dreamer,
 }
 
 impl DispatchedWorkerKind {
@@ -144,6 +180,7 @@ impl DispatchedWorkerKind {
             Self::Doctor => DOCTOR_MODULE_ID,
             Self::Testd => TESTD_MODULE_ID,
             Self::NativeWorker => NATIVE_MODULE_ID,
+            Self::Dreamer => dreamer_dispatch_launch::DREAMER_MODULE_ID,
         }
     }
 
@@ -154,6 +191,7 @@ impl DispatchedWorkerKind {
             Self::Doctor => eliot_kernel_service::DOCTOR_REPAIR_WIRE_ID,
             Self::Testd => eliot_kernel_service::TESTD_ADMISSION_WIRE_ID,
             Self::NativeWorker => NATIVE_WORKER_CLAIM_WIRE_ID,
+            Self::Dreamer => super::dreamer_job_dispatch::DREAMER_JOB_WIRE_ID,
         }
     }
 
@@ -180,12 +218,18 @@ impl DispatchedWorkerKind {
     /// authority for the value. No other writer exists on this base (the
     /// residual in `admitted_material` names this Kernel half as the gap),
     /// so this seam is the single writer.
+    ///
+    /// `Some` for Dreamer (T12-09): the exact
+    /// [`DREAMER_MATERIAL_FILE_NAME`](dreamer_dispatch_launch::DREAMER_MATERIAL_FILE_NAME)
+    /// literal the MGR02 child reader derives from its executable
+    /// directory. The child reader stays the authority for the value.
     #[must_use]
     pub const fn material_file_name(self) -> Option<&'static str> {
         match self {
             Self::Doctor => Some("eliot-doctor.dispatched-attempt.json"),
             Self::Testd => Some("eliot-testd.admitted-attempt.json"),
             Self::NativeWorker => Some("eliot-native-worker.admitted-claim.json"),
+            Self::Dreamer => Some(dreamer_dispatch_launch::DREAMER_MATERIAL_FILE_NAME),
         }
     }
 
@@ -196,6 +240,7 @@ impl DispatchedWorkerKind {
             Self::Doctor => "doctor-dispatch",
             Self::Testd => "testd-dispatch",
             Self::NativeWorker => "native-worker-dispatch",
+            Self::Dreamer => dreamer_dispatch_launch::DREAMER_NONCE_PREFIX,
         }
     }
 
@@ -206,6 +251,7 @@ impl DispatchedWorkerKind {
             Self::Doctor => "doctor-launch",
             Self::Testd => "testd-launch",
             Self::NativeWorker => "native-worker-launch",
+            Self::Dreamer => dreamer_dispatch_launch::DREAMER_OPERATION_PREFIX,
         }
     }
 }
@@ -3528,6 +3574,509 @@ pub fn reconcile_launched_native_worker_attempt(
         kind: DispatchedWorkerKind::NativeWorker,
         identity: claim_id.to_owned(),
     })
+}
+
+/// Caller-supplied Dreamer launch material: the job/attempt lookup keys, the
+/// Kernel-loaded admitted `QUEUED` ledger response, plus the
+/// composition-pinned child binary binding.
+///
+/// Only the keys arrive from the caller; scope, fence, revision, epoch, and
+/// generation always bind from `queued` plus live authority, never from
+/// caller bytes. Like Doctor/Testd/native, nothing travels via argv, stdin,
+/// or the environment; the admitted job plus the launch grant travels only
+/// over the protected dispatch file
+/// (`eliot-dreamer.admitted-job.json`, see
+/// [`DispatchedWorkerKind::material_file_name`]). No executable bytes are
+/// taken from caller input: the child binding (path/digest/workdir) stays
+/// composition-pinned.
+#[allow(
+    dead_code,
+    reason = "production call-in lands with the manager-serialized lib.rs re-export; tests drive it meanwhile"
+)]
+pub struct DreamerLaunchMaterial<'a> {
+    /// Job/attempt lookup keys; must be answered by `queued`.
+    pub keys: DreamerLaunchKeys<'a>,
+    /// Admitted `QUEUED` ledger response loaded Kernel-side through the
+    /// existing K1 gateway (no new transport or pipe). The durable Store
+    /// ledger stays the terminal authority; this arm binds from the
+    /// response and never mints ledger state.
+    pub queued: &'a DurableJobResponse,
+    /// Composition-pinned child binary anchor.
+    pub child: DreamerChildBinding<'a>,
+}
+
+/// Why a prepared Dreamer launch produced no child.
+#[allow(
+    dead_code,
+    reason = "production call-in lands with the manager-serialized lib.rs re-export; tests drive it meanwhile"
+)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum DreamerLaunchSkip {
+    /// The admitted response is not `QUEUED` (already leased, running, or
+    /// terminal): nothing to drive, no child spawned.
+    NotQueued,
+}
+
+/// A prepared Dreamer launch: admitted, lineage-bound, and (unless skipped)
+/// written to the protected dispatch file, ready to spawn.
+#[allow(
+    dead_code,
+    reason = "production call-in lands with the manager-serialized lib.rs re-export; tests drive it meanwhile"
+)]
+#[allow(
+    clippy::large_enum_variant,
+    reason = "Ready carries the full spawn binding like PreparedDoctorLaunch::Ready; boxing it would diverge from the sibling seam shape"
+)]
+pub enum PreparedDreamerLaunch {
+    /// Ready to spawn through the admitted executor.
+    Ready(ReadyDreamerLaunch),
+    /// An exact resubmit under one job identity: carries the RETAINED
+    /// original record (original nonce, operation, and grant digest), never
+    /// a recomputed one. No second worker may spawn from this outcome.
+    ReplayOriginal {
+        /// The original lineage for the job identity.
+        record: Box<DreamerLaunchRecord>,
+    },
+    /// Admitted but needing no child; carries the response and the reason.
+    Skipped {
+        /// The admitted response for the job identity.
+        response: Box<DurableJobResponse>,
+        /// Why no child was spawned.
+        skip: DreamerLaunchSkip,
+    },
+    /// The admitted response does not answer the presented keys; carries
+    /// the reason, never a lineage.
+    Refused(String),
+}
+
+/// A Dreamer launch ready to spawn: every authority check passed and the
+/// dispatch file carries exactly what the child reader validates.
+#[allow(
+    dead_code,
+    reason = "production call-in lands with the manager-serialized lib.rs re-export; tests drive it meanwhile"
+)]
+pub struct ReadyDreamerLaunch {
+    /// Exact queued job identity (lineage key for spawn settle).
+    pub job_id: String,
+    /// The I7.5/I15.2 launch nonce written to the dispatch file.
+    pub nonce: String,
+    /// Deterministic child operation identity derived from the lineage, so
+    /// the admitted executor replays (never double-spawns) an identical
+    /// launch.
+    pub operation_id: OperationId,
+    /// Protected dispatch file path the child reads.
+    pub material_path: PathBuf,
+    /// Composition-pinned child executable path.
+    pub executable: PathBuf,
+    /// Expected SHA-256 digest of the child executable image.
+    pub executable_sha256: String,
+    /// Composition-pinned child working directory.
+    pub working_directory: PathBuf,
+    /// Live authority epoch bound at launch.
+    pub authority_epoch: EpochId,
+    /// Live activation generation bound at launch.
+    pub generation: Generation,
+}
+
+/// Outcome of one Dreamer admit-then-launch call.
+#[allow(
+    dead_code,
+    reason = "production call-in lands with the manager-serialized lib.rs re-export; tests drive it meanwhile"
+)]
+pub enum DreamerLaunchOutcome {
+    /// The child was spawned through the admitted executor.
+    Launched {
+        /// The launch nonce retained for the claim-time session proof.
+        nonce: String,
+        /// Child process operation identity.
+        operation_id: OperationId,
+        /// The admitted process-start receipt (boxed: receipts dwarf the
+        /// other outcomes).
+        receipt: Box<ProcessStartReceipt>,
+    },
+    /// The spawn outcome is unknown: retained as unreconciled under the
+    /// original job identity — reconcile later, never blind-retry.
+    LaunchUnknown {
+        /// The launch nonce retained for the session proof.
+        nonce: String,
+        /// Child process operation identity.
+        operation_id: OperationId,
+    },
+    /// An exact resubmit under one job identity: carries the retained
+    /// original record, and no second child is spawned.
+    ReplayOriginal {
+        /// The original lineage for the job identity.
+        record: Box<DreamerLaunchRecord>,
+    },
+    /// Admitted but needing no child; carries the response and the reason.
+    NotLaunched {
+        /// The admitted response for the job identity.
+        response: Box<DurableJobResponse>,
+        /// Why no child was spawned.
+        skip: DreamerLaunchSkip,
+    },
+    /// The admitted response does not answer the presented keys; carries
+    /// the reason, never a lineage.
+    Refused(String),
+}
+
+/// Maps a contour error into the Dreamer launch error: caller-material
+/// defects stay `InvalidMaterial`, everything else fails closed as `Gate`.
+#[allow(
+    dead_code,
+    reason = "production call-in lands with the manager-serialized lib.rs re-export; tests drive it meanwhile"
+)]
+fn dreamer_launch_error(error: DispatchLaunchError) -> DreamerMaterialError {
+    match error {
+        DispatchLaunchError::InvalidMaterial(detail) => {
+            DreamerMaterialError::InvalidMaterial(detail)
+        }
+        other => DreamerMaterialError::Gate(other.to_string()),
+    }
+}
+
+/// Admits one Dreamer job and prepares its launch: lineage-bound material
+/// written to the protected dispatch file, ready to spawn.
+///
+/// Sequence: validate the caller keys plus the composition-pinned child
+/// binding; validate the Kernel-loaded `QUEUED` response through its owning
+/// K0 contract and require it to answer the presented job/attempt (anything
+/// else is `Refused`, never staged); skip non-`QUEUED` responses without
+/// spawning; reserve the original job identity single-flight (exact
+/// resubmits return the retained original record, changed terms under one
+/// identity refuse); mint the replay-stable nonce plus the shared launch
+/// grant through the contour entries; closed-loop prove the staged envelope
+/// against the exact child contract plus a parse readback; write through
+/// [`write_material_file`]. Nothing is spawned here:
+/// [`launch_admitted_dreamer_attempt`] spawns the returned
+/// [`ReadyDreamerLaunch`] through the admitted executor.
+#[allow(
+    dead_code,
+    reason = "production call-in lands with the manager-serialized lib.rs re-export; tests drive it meanwhile"
+)]
+#[allow(
+    clippy::too_many_lines,
+    reason = "admit, reserve, nonce, grant, closed-loop proof, and material-write stay in one ordered authority path so no launch step can run before its gate"
+)]
+pub fn prepare_dreamer_launch(
+    kernel: &KernelComposition,
+    material: &DreamerLaunchMaterial<'_>,
+    now_unix_nanos: u64,
+) -> Result<PreparedDreamerLaunch, DreamerMaterialError> {
+    use dreamer_dispatch_launch::{
+        dreamer_material_bytes, mint_dreamer_nonce, note_dreamer_material_path,
+        parse_dreamer_material_bytes, release_dreamer_reservation, reserve_dreamer_launch,
+        validate_dreamer_child_binding, validate_dreamer_launch_keys, validate_dreamer_material,
+    };
+    if now_unix_nanos == 0 {
+        return Err(DreamerMaterialError::InvalidMaterial(
+            "admission time must be non-zero".to_owned(),
+        ));
+    }
+    validate_dreamer_launch_keys(&material.keys)?;
+    validate_dreamer_child_binding(&material.child)?;
+    let material_dir = material.child.executable.parent().ok_or_else(|| {
+        DreamerMaterialError::InvalidMaterial(
+            "dreamer child executable has no parent directory".to_owned(),
+        )
+    })?;
+    material
+        .queued
+        .validate()
+        .map_err(|error| DreamerMaterialError::InvalidMaterial(error.to_string()))?;
+    if material.queued.state != JobState::Queued {
+        return Ok(PreparedDreamerLaunch::Skipped {
+            response: Box::new(material.queued.clone()),
+            skip: DreamerLaunchSkip::NotQueued,
+        });
+    }
+    if material.queued.job_id.as_str() != material.keys.job_id
+        || material.queued.attempt_id.as_str() != material.keys.attempt_id
+    {
+        return Ok(PreparedDreamerLaunch::Refused(
+            "admitted dreamer response does not answer the presented job attempt".to_owned(),
+        ));
+    }
+    let (authority_epoch, generation) = {
+        let service = kernel
+            .service
+            .lock()
+            .map_err(|_| DreamerMaterialError::Gate("kernel service lock poisoned".to_owned()))?;
+        let epoch = service.authority_epoch();
+        let generation = service
+            .activation_receipt()
+            .map_or(0, |receipt| receipt.generation.value());
+        (epoch, generation)
+    };
+    if generation == 0 {
+        return Err(DreamerMaterialError::Gate(
+            "live activation generation is unavailable".to_owned(),
+        ));
+    }
+    let generation = Generation::new(generation)
+        .map_err(|error| DreamerMaterialError::Gate(error.to_string()))?;
+    let scope_id = material.queued.scope.scope_id.as_str().to_owned();
+    let fence = material.queued.scope.state_fence.clone();
+    let revision = material.queued.revision;
+    let nonce = mint_dreamer_nonce(
+        material.keys.job_id,
+        material.keys.attempt_id,
+        revision,
+        &authority_epoch,
+        generation.get(),
+        material.child.executable_sha256,
+    )?;
+    let identity_digest = super::sha256_hex(
+        format!(
+            "dreamer-launch|{}|{}|{revision}",
+            material.keys.job_id, material.keys.attempt_id
+        )
+        .as_bytes(),
+    );
+    let operation_id = OperationId::new(format!(
+        "{}-{}-{}",
+        DispatchedWorkerKind::Dreamer.operation_prefix(),
+        generation.get(),
+        short_identity(&identity_digest).map_err(dreamer_launch_error)?
+    ))
+    .map_err(|error| DreamerMaterialError::Gate(error.to_string()))?;
+    let grant = dispatch_grant_for(
+        DispatchedWorkerKind::Dreamer,
+        &identity_digest,
+        &authority_epoch,
+        generation,
+        now_unix_nanos,
+    )
+    .map_err(dreamer_launch_error)?;
+    // Single-flight reservation under the original job identity: a
+    // reserved or launched identity replays by that identity instead of
+    // spawning a second child. The reservation releases below when the
+    // closed-loop proof or the material write fails.
+    let record = DreamerLaunchRecord {
+        job_id: material.keys.job_id.to_owned(),
+        attempt_id: material.keys.attempt_id.to_owned(),
+        revision,
+        scope_id: scope_id.clone(),
+        fence: fence.clone(),
+        executable_sha256: material.child.executable_sha256.to_owned(),
+        material_path: None,
+        nonce: nonce.clone(),
+        operation_id: operation_id_string(&operation_id),
+        grant_digest: grant.grant_digest.clone(),
+        phase: DreamerLaunchPhase::Reserved,
+    };
+    if let DreamerReserveOutcome::ReplayOriginal(retained) = reserve_dreamer_launch(record)? {
+        return Ok(PreparedDreamerLaunch::ReplayOriginal { record: retained });
+    }
+    let envelope = DreamerDispatchedEnvelope {
+        job_id: material.keys.job_id.to_owned(),
+        attempt_id: material.keys.attempt_id.to_owned(),
+        revision,
+        scope_id,
+        fence,
+        epoch: authority_epoch.clone(),
+        generation: generation.get(),
+        nonce: nonce.clone(),
+        grant,
+    };
+    // Closed-loop proof before staging: the envelope must satisfy the exact
+    // child contract under the live epoch, and the staged bytes must parse
+    // back byte-identical through the closed shape.
+    let validated = validate_dreamer_material(&envelope, &authority_epoch).inspect_err(|_| {
+        release_dreamer_reservation(material.keys.job_id);
+    })?;
+    if validated.generation != generation.get()
+        || validated.epoch != authority_epoch
+        || validated.nonce != nonce
+    {
+        release_dreamer_reservation(material.keys.job_id);
+        return Err(DreamerMaterialError::InvalidMaterial(
+            "dreamer launch invariant failed before staging".to_owned(),
+        ));
+    }
+    let bytes = dreamer_material_bytes(&envelope).inspect_err(|_| {
+        release_dreamer_reservation(material.keys.job_id);
+    })?;
+    let roundtrip = parse_dreamer_material_bytes(&bytes).inspect_err(|_| {
+        release_dreamer_reservation(material.keys.job_id);
+    })?;
+    if roundtrip != envelope {
+        release_dreamer_reservation(material.keys.job_id);
+        return Err(DreamerMaterialError::Io(
+            "dreamer dispatch material readback disagrees with its binding".to_owned(),
+        ));
+    }
+    let Some(file_name) = DispatchedWorkerKind::Dreamer.material_file_name() else {
+        release_dreamer_reservation(material.keys.job_id);
+        return Err(DreamerMaterialError::Gate(
+            "dreamer defines no dispatch material file".to_owned(),
+        ));
+    };
+    let material_path = material_dir.to_path_buf().join(file_name);
+    if let Err(error) = write_material_file(&material_path, &bytes) {
+        release_dreamer_reservation(material.keys.job_id);
+        return Err(DreamerMaterialError::Io(error.to_string()));
+    }
+    note_dreamer_material_path(material.keys.job_id, material_path.clone());
+    Ok(PreparedDreamerLaunch::Ready(ReadyDreamerLaunch {
+        job_id: material.keys.job_id.to_owned(),
+        nonce,
+        operation_id,
+        material_path,
+        executable: material.child.executable.to_path_buf(),
+        executable_sha256: material.child.executable_sha256.to_owned(),
+        working_directory: material.child.working_directory.to_path_buf(),
+        authority_epoch,
+        generation,
+    }))
+}
+
+/// Spawns one prepared Dreamer launch through the admitted process gateway.
+///
+/// Same seam shape as the Doctor/testd/native spawns: empty argv,
+/// secret-free environment, bounded limits, pinned path proof, Kernel-owned
+/// process owner. The admitted-job material travels only over the protected
+/// dispatch file the child reads; a spawn failure reaps the file
+/// best-effort so a stale presentation never lingers.
+#[allow(
+    dead_code,
+    reason = "production call-in lands with the manager-serialized lib.rs re-export; tests drive it meanwhile"
+)]
+pub async fn start_ready_dreamer_launch(
+    kernel: &KernelComposition,
+    ready: &ReadyDreamerLaunch,
+) -> Result<ChildStartOutcome, DreamerMaterialError> {
+    match spawn_ready_child(
+        kernel,
+        &SpawnInputs {
+            kind: DispatchedWorkerKind::Dreamer,
+            operation_id: &ready.operation_id,
+            executable: &ready.executable,
+            executable_sha256: &ready.executable_sha256,
+            working_directory: &ready.working_directory,
+            generation: ready.generation,
+            authority_epoch: &ready.authority_epoch,
+            material_path: Some(ready.material_path.as_path()),
+        },
+    )
+    .await
+    .map_err(dreamer_launch_error)?
+    {
+        SpawnOutcome::Started(receipt) => Ok(ChildStartOutcome::Started(Box::new(SpawnedChild {
+            receipt: *receipt,
+            operation_id: ready.operation_id.clone(),
+        }))),
+        SpawnOutcome::Unknown(operation_id) => {
+            Ok(ChildStartOutcome::Unknown(UncertainSpawn { operation_id }))
+        }
+    }
+}
+
+/// Admits one Dreamer job, then launches the real `eliot-dreamer` binary
+/// through the admitted process executor.
+///
+/// Admit-then-launch in one seam, mirroring the testd/native calls: prepare
+/// admits and reserves the original job identity plus writes the
+/// admitted-job material, then the ready launch spawns and the identity is
+/// retained. Exact resubmits return the retained original record without
+/// spawning; refusals and skips return as outcomes; a failed spawn reaps
+/// the file and releases the reservation; an unknown spawn outcome retains
+/// the launch as unreconciled for
+/// [`reconcile_launched_dreamer_attempt`].
+#[allow(
+    dead_code,
+    reason = "production call-in lands with the manager-serialized lib.rs re-export; tests drive it meanwhile"
+)]
+pub async fn launch_admitted_dreamer_attempt(
+    kernel: &KernelComposition,
+    material: &DreamerLaunchMaterial<'_>,
+    now_unix_nanos: u64,
+) -> Result<DreamerLaunchOutcome, DreamerMaterialError> {
+    use dreamer_dispatch_launch::{release_dreamer_reservation, retain_dreamer_launch_as};
+    let prepared = prepare_dreamer_launch(kernel, material, now_unix_nanos)?;
+    let ready = match prepared {
+        PreparedDreamerLaunch::Ready(ready) => ready,
+        PreparedDreamerLaunch::ReplayOriginal { record } => {
+            return Ok(DreamerLaunchOutcome::ReplayOriginal { record });
+        }
+        PreparedDreamerLaunch::Skipped { response, skip } => {
+            return Ok(DreamerLaunchOutcome::NotLaunched { response, skip });
+        }
+        PreparedDreamerLaunch::Refused(reason) => {
+            return Ok(DreamerLaunchOutcome::Refused(reason));
+        }
+    };
+    let job_id = ready.job_id.clone();
+    let material_path = ready.material_path.clone();
+    match start_ready_dreamer_launch(kernel, &ready).await {
+        Ok(ChildStartOutcome::Started(spawned)) => {
+            retain_dreamer_launch_as(&job_id, DreamerLaunchPhase::Launched, Some(material_path))?;
+            Ok(DreamerLaunchOutcome::Launched {
+                nonce: ready.nonce,
+                operation_id: ready.operation_id,
+                receipt: Box::new(spawned.receipt),
+            })
+        }
+        Ok(ChildStartOutcome::Unknown(uncertain)) => {
+            // The uncertain spawn carries the same deterministic operation
+            // identity the reservation holds; reconciliation always names
+            // the original lineage.
+            debug_assert_eq!(uncertain.operation_id.as_str(), ready.operation_id.as_str());
+            retain_dreamer_launch_as(
+                &job_id,
+                DreamerLaunchPhase::Unreconciled,
+                Some(material_path),
+            )?;
+            Ok(DreamerLaunchOutcome::LaunchUnknown {
+                nonce: ready.nonce,
+                operation_id: ready.operation_id,
+            })
+        }
+        Err(error) => {
+            reap_material_file(&material_path);
+            release_dreamer_reservation(&job_id);
+            Err(error)
+        }
+    }
+}
+
+/// Reconciles one launched-but-unreconciled Dreamer job by its original job
+/// identity.
+///
+/// The presented expectation must reproduce the retained lineage exactly
+/// under still-current authority; no new lineage is minted, no new job id
+/// is computed, and no second child is spawned. A converged lineage reaps
+/// the dispatch file best-effort and closes the slot; anything still
+/// outstanding stays unreconciled for a later call. Unknown identities
+/// report unknown instead of inventing state.
+///
+/// Note: durable job terminality lives in the Store Dreamer ledger, so an
+/// operator release through
+/// [`dreamer_dispatch_launch::release_dreamer_launch`] (or a process
+/// restart) is the only slot release besides this reconcile — the same
+/// shape as the testd arm.
+#[allow(
+    dead_code,
+    reason = "production call-in lands with the manager-serialized lib.rs re-export; tests drive it meanwhile"
+)]
+pub fn reconcile_launched_dreamer_attempt(
+    kernel: &KernelComposition,
+    expected: &DreamerLeaseExpectation,
+) -> Result<DreamerReconcileOutcome, DreamerMaterialError> {
+    let live_epoch = kernel
+        .service
+        .lock()
+        .map_err(|_| DreamerMaterialError::Gate("kernel service lock poisoned".to_owned()))?
+        .authority_epoch();
+    let outcome = dreamer_dispatch_launch::reconcile_dreamer_launch(expected, &live_epoch)?;
+    if let DreamerReconcileOutcome::Reconciled {
+        material_path: Some(path),
+        ..
+    } = &outcome
+    {
+        reap_material_file(path);
+    }
+    Ok(outcome)
 }
 
 #[cfg(test)]

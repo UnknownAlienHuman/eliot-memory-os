@@ -1,18 +1,27 @@
-//! Closed Dreamer job dispatch (T12-05 K2, owner #781).
+//! Closed Dreamer job dispatch (T12-05 K2, owner #781; T12-09 bound-worker
+//! claim, Implements #702).
 //!
-//! Routes one authenticated `eliotd` requester operation per frame through
+//! Routes one authenticated operation per frame through
 //! the K1 gateway ([`KernelStoreGateway::dreamer_job`](eliot_kernel_service::KernelStoreGateway::dreamer_job))
-//! using the K0 types (`eliot_protocol::dreamer_job`). The authenticated
-//! role is derived from the actual session (the `eliotd` module, plus the
-//! current daemon session on Windows) and is always [`JobRole::Requester`]:
-//! no Dreamer worker binding exists yet (worker handoff is T12-09), so
-//! worker operations stay fail-closed here. A presented [`JobRole`] must
-//! agree with the derived role and must permit the operation kind; a payload
-//! value never grants rights.
+//! using the K0 types (`eliot_protocol::dreamer_job`). Two authenticated
+//! callers exist, derived from the actual session only:
+//!
+//! * the `eliotd` requester ([`JobRole::Requester`]): `Submit`, `Status`,
+//!   `RequestCancel`, `Reconcile`;
+//! * the managed Dreamer worker (`eliot-dreamer`, `T12-09`,
+//!   [`JobRole::Worker`]): exactly `LeaseExact` for the queued job its
+//!   launch lineage recorded, and nothing else.
+//!
+//! A presented [`JobRole`] must agree with the derived role and must permit
+//! the operation kind; a payload value never grants rights. The worker claim
+//! additionally requires a retained launch lineage for the exact job/scope/
+//! revision/fence
+//! ([`dreamer_launch_permits_lease`](super::dispatch_launch::dreamer_dispatch_launch::dreamer_launch_permits_lease)):
+//! a tampered, foreign, or unlaunched claim fences before any store call.
 //!
 //! No process is spawned inside this handler: admission and execution stay
 //! on the K1 axis, while launch remains the explicit dispatch-launch seam
-//! owned by MGR02. No second launch identity is minted.
+//! in [`super::dispatch_launch`]. No second launch identity is minted.
 //!
 //! Architecture: A12.2 Principal, Session and visibility; A13.2 Kernel and
 //! failure domains; I1.8 Exact ownership and call paths.
@@ -23,8 +32,11 @@
 //! presented role as authority, must not spawn a worker, must not retry a
 //! store call blindly.
 
+use super::dispatch_launch::dreamer_dispatch_launch::{
+    DREAMER_MODULE_ID, dreamer_launch_permits_lease,
+};
 use super::*;
-use eliot_protocol::dreamer_job::{DurableJobRequest, DurableJobResponse, JobRole};
+use eliot_protocol::dreamer_job::{DurableJobRequest, DurableJobResponse, JobOperation, JobRole};
 use eliot_store_api::RequestMeta;
 use serde::Deserialize;
 
@@ -188,6 +200,76 @@ impl KernelComposition {
         Ok(())
     }
 
+    /// Admits one managed-worker `LeaseExact` claim against the presenting
+    /// Dreamer session (T12-09, Implements #702).
+    ///
+    /// The role is derived from the actual authenticated session only: the
+    /// `eliot-dreamer` module yields [`JobRole::Worker`], and only
+    /// `LeaseExact` is admitted on this arm (launch/claim only — every other
+    /// worker operation fences here even though the K0 projection would
+    /// permit it, so a managed child can never Renew, Start, Checkpoint, or
+    /// Publish through this path without its exact claim). The presented
+    /// role must equal the derived one, the session must carry the Dreamer
+    /// wire capability, and the session fence must equal the admitted
+    /// context fence. Finally the claim must reproduce a retained launch
+    /// lineage exactly (job, scope, revision, fence): a tampered, foreign,
+    /// replayed-beyond-terminal, or unlaunched claim fences before any store
+    /// call. Neither the epoch nor the generation is ever taken from the
+    /// envelope, and no process is spawned here.
+    fn admit_dreamer_worker_lease(
+        session: &Session,
+        envelope: &DreamerJobEnvelope,
+    ) -> Result<(), TransportError> {
+        if session.module_generation.module_id.as_str() != DREAMER_MODULE_ID {
+            return Err(TransportError::SessionFenced);
+        }
+        if !session
+            .capabilities
+            .iter()
+            .any(|capability| capability == DREAMER_JOB_WIRE_ID)
+        {
+            return Err(TransportError::SessionFenced);
+        }
+        let derived = JobRole::Worker;
+        if envelope.request.role != derived {
+            return Err(TransportError::SessionFenced);
+        }
+        let JobOperation::LeaseExact { selector, job_id } = &envelope.request.operation else {
+            return Err(TransportError::SessionFenced);
+        };
+        if !derived.permits(envelope.request.operation.kind()) {
+            return Err(TransportError::SessionFenced);
+        }
+        if session.module_generation.state_fence != envelope.context.state_fence {
+            return Err(TransportError::SessionFenced);
+        }
+        if !dreamer_launch_permits_lease(
+            job_id.as_str(),
+            selector.scope_id.as_str(),
+            selector.expected_revision,
+            &selector.expected_fence,
+        ) {
+            return Err(TransportError::SessionFenced);
+        }
+        Ok(())
+    }
+
+    /// Admits one decoded K2 envelope against the presenting session,
+    /// routing to the requester arm or the bound-worker claim arm by the
+    /// authenticated session module. Anything that is neither the `eliotd`
+    /// requester nor the bound Dreamer worker fences.
+    fn admit_dreamer_envelope(
+        &self,
+        session: &Session,
+        envelope: &DreamerJobEnvelope,
+    ) -> Result<(), TransportError> {
+        if session.module_generation.module_id.as_str() == DREAMER_MODULE_ID {
+            Self::admit_dreamer_worker_lease(session, envelope)
+        } else {
+            self.admit_dreamer_caller(session, envelope)
+        }
+    }
+
     /// Dispatches one Dreamer job frame from an admitted session.
     ///
     /// The caller ([`KernelComposition::dispatch_frame`]) has already run the
@@ -245,7 +327,7 @@ impl KernelComposition {
             _ => return Err(TransportError::SessionFenced),
         };
         let envelope = dreamer_envelope_from_payload(&payload)?;
-        self.admit_dreamer_caller(session, &envelope)?;
+        self.admit_dreamer_envelope(session, &envelope)?;
         Ok(KernelFrameAction::Dreamer {
             request_id,
             operation: DREAMER_JOB_WIRE_ID.to_owned(),
@@ -253,11 +335,12 @@ impl KernelComposition {
         })
     }
 
-    /// Executes one validated Dreamer job operation (T12-05 K2).
+    /// Executes one validated Dreamer job operation (T12-05 K2, T12-09
+    /// bound-worker claim).
     ///
     /// Revalidates everything the dispatch path proved (closed operation
-    /// name, the presenting session's `eliotd` binding, the typed envelope
-    /// shape/fence/role joins), then performs exactly one
+    /// name, the presenting session's `eliotd`-or-Dreamer binding, the typed
+    /// envelope shape/fence/role/lineage joins), then performs exactly one
     /// [`KernelStoreGateway::dreamer_job`](eliot_kernel_service::KernelStoreGateway::dreamer_job)
     /// call through the retained canonical gateway and projects the answer
     /// with the frame's correlation identity echoed. A response that does
@@ -276,7 +359,8 @@ impl KernelComposition {
         if !is_dreamer_operation(operation) {
             return Err(TransportError::SessionFenced);
         }
-        if session.module_generation.module_id.as_str() != ACTIVE_DAEMON_CALLER {
+        let module = session.module_generation.module_id.as_str();
+        if module != ACTIVE_DAEMON_CALLER && module != DREAMER_MODULE_ID {
             return Err(TransportError::SessionFenced);
         }
         session
@@ -291,7 +375,7 @@ impl KernelComposition {
             return Err(TransportError::SessionFenced);
         }
         let envelope = dreamer_envelope_from_payload(&payload)?;
-        self.admit_dreamer_caller(session, &envelope)?;
+        self.admit_dreamer_envelope(session, &envelope)?;
         #[cfg(windows)]
         {
             let gateway = self
@@ -388,6 +472,7 @@ mod dreamer_job_dispatch_tests {
     };
     use eliot_protocol::dreamer_job::{
         DurableJobRequest, DurableJobResponse, DurableRequestIdentity, JobOperation, JobRole,
+        JobState,
     };
     use eliot_protocol::{
         EncodingProfile, Frame, FrameKind, MessageType, ProtocolPayload, ProtocolVersion,
@@ -395,12 +480,21 @@ mod dreamer_job_dispatch_tests {
     };
     use eliot_runtime_contracts::{HealthVector, ServiceProcessState};
     use eliot_store_api::RequestMeta;
-    use std::collections::BTreeMap;
+    use std::collections::{BTreeMap, BTreeSet};
     use std::num::NonZeroU64;
     use std::path::{Path, PathBuf};
     use std::sync::Mutex;
 
     use crate::KernelConfig;
+    use crate::dispatch_launch::dreamer_dispatch_launch::{
+        DREAMER_MODULE_ID, DreamerChildBinding, DreamerLaunchKeys, DreamerLeaseExpectation,
+        DreamerMaterialError, DreamerReconcileOutcome, dreamer_launch_permits_lease,
+        parse_dreamer_material_bytes, release_dreamer_launch, validate_dreamer_material,
+    };
+    use crate::dispatch_launch::{
+        DreamerLaunchMaterial, PreparedDreamerLaunch, launch_admitted_dreamer_attempt,
+        prepare_dreamer_launch, reconcile_launched_dreamer_attempt,
+    };
 
     const LINEAGE: &str = "550e8400-e29b-41d4-a716-446655440000";
     const SUBMIT_OPERATION_JSON: &str = include_str!(
@@ -728,6 +822,68 @@ mod dreamer_job_dispatch_tests {
         }
     }
 
+    /// Binds the managed Dreamer worker session: the only caller the K2
+    /// bound-worker arm derives a role for. Capabilities are intersected
+    /// down to the single Dreamer wire operation with no session effects,
+    /// mirroring the dedicated front-door binds Doctor/testd use.
+    fn dreamer_worker_session(kernel: &KernelComposition) -> Session {
+        let policy = kernel
+            .front_door_policy
+            .lock()
+            .expect("front-door policy")
+            .clone();
+        let peer = PeerIdentity::authenticated_for_test(
+            eliot_ipc::ProcessBinding::from_observation(7, 9, r"C:\eliot\host.exe".to_owned())
+                .expect("process binding"),
+            "S-1-5-18".to_owned(),
+            "0".to_owned(),
+        )
+        .expect("peer");
+        let mut module_generation = policy.module_generation.clone();
+        module_generation.module_id =
+            eliot_contracts::ContractId::new(DREAMER_MODULE_ID).expect("module id");
+        Session {
+            connection_id: "dreamer-worker-conn".to_owned(),
+            protocol_version: ProtocolVersion::CURRENT,
+            peer,
+            authority_epoch: policy.module_generation.state_fence.authority_epoch.clone(),
+            module_generation,
+            launch_nonce: policy.launch_nonce.clone(),
+            capabilities: vec![DREAMER_JOB_WIRE_ID.to_owned()],
+            privacy_classes: policy.allowed_privacy_classes.clone(),
+            effects: Vec::new(),
+            session_epoch: 1,
+            state: eliot_ipc::SessionState::Open,
+        }
+    }
+
+    /// Builds one worker `LeaseExact` claim for the exact queued values: the
+    /// job/scope/revision the ledger bound, under the live fence. Forgery
+    /// cases override one of the three denominators.
+    fn lease_exact_request(
+        job_id: &str,
+        scope_id: &str,
+        revision: u64,
+        fence: &StateFence,
+        tag: &str,
+    ) -> K2Request {
+        let mut operation_value: serde_json::Value =
+            serde_json::from_str(LEASE_EXACT_OPERATION_JSON).expect("lease fixture");
+        operation_value["job_id"] = serde_json::Value::String(job_id.to_owned());
+        operation_value["selector"]["scope_id"] =
+            serde_json::Value::String(scope_id.to_owned());
+        operation_value["selector"]["expected_revision"] = serde_json::Value::from(revision);
+        build_k2_request_from_value(
+            &mut operation_value,
+            JobRole::Worker,
+            fence,
+            &format!("k2-ctx-{tag}"),
+            &format!("op-k2-{tag}"),
+            &format!("idem-k2-{tag}"),
+            &format!("transport-k2-{tag}"),
+        )
+    }
+
     fn dreamer_payload(k2: &K2Request) -> serde_json::Value {
         serde_json::json!({
             "operation": DREAMER_JOB_WIRE_ID,
@@ -794,6 +950,7 @@ mod dreamer_job_dispatch_tests {
     struct FakeDreamerLedger {
         calls: Mutex<Vec<DurableJobRequest>>,
         jobs: Mutex<BTreeMap<String, StoredK2Job>>,
+        leased: Mutex<BTreeSet<String>>,
         refusal: Mutex<Option<String>>,
     }
 
@@ -802,6 +959,7 @@ mod dreamer_job_dispatch_tests {
             Self {
                 calls: Mutex::new(Vec::new()),
                 jobs: Mutex::new(BTreeMap::new()),
+                leased: Mutex::new(BTreeSet::new()),
                 refusal: Mutex::new(None),
             }
         }
@@ -810,6 +968,7 @@ mod dreamer_job_dispatch_tests {
             Self {
                 calls: Mutex::new(Vec::new()),
                 jobs: Mutex::new(BTreeMap::new()),
+                leased: Mutex::new(BTreeSet::new()),
                 refusal: Mutex::new(Some(message.to_owned())),
             }
         }
@@ -915,6 +1074,74 @@ mod dreamer_job_dispatch_tests {
                             "disposition": null,
                             "receipt_id": null,
                             "lease": null,
+                            "checkpoint": null,
+                            "result_under_verification": null,
+                            "outcome": null,
+                            "selection_coverage": [],
+                            "selection_frontier": null,
+                        }),
+                    )
+                    .map_err(|error| error.to_string())?;
+                    response
+                        .validate_for(&request)
+                        .map_err(|error| error.to_string())?;
+                    Ok(response)
+                }
+                JobOperation::LeaseExact { selector, job_id } => {
+                    let key = Self::job_key(&serde_json::to_value(job_id).expect("job json"));
+                    let stored = self
+                        .jobs
+                        .lock()
+                        .expect("jobs lock")
+                        .get(&key)
+                        .cloned()
+                        .ok_or_else(|| "dreamer test ledger: unknown job".to_owned())?;
+                    // The selector must reproduce the queued record exactly:
+                    // scope, revision, and fence. The K2 lineage gate already
+                    // enforces this; the ledger re-proves it.
+                    let selector_scope =
+                        serde_json::to_value(&selector.scope_id).expect("selector scope json");
+                    let selector_fence = serde_json::to_value(&selector.expected_fence)
+                        .expect("selector fence json");
+                    if stored.scope.get("scope_id") != Some(&selector_scope)
+                        || stored.revision != selector.expected_revision
+                        || stored.scope.get("state_fence") != Some(&selector_fence)
+                    {
+                        return Err("dreamer test ledger: lease selector mismatch".to_owned());
+                    }
+                    if !self.leased.lock().expect("leased lock").insert(key.clone()) {
+                        return Err("dreamer test ledger: job already leased".to_owned());
+                    }
+                    let response: DurableJobResponse = serde_json::from_value(
+                        serde_json::json!({
+                            "request_identity": serde_json::to_value(&request.request_identity)
+                                .expect("identity json"),
+                            "job_id": stored.job.clone(),
+                            "attempt_id": stored.attempt.clone(),
+                            "scope": stored.scope.clone(),
+                            "revision": stored.revision,
+                            "state": "LEASED",
+                            "disposition": "COMMITTED",
+                            "receipt_id": format!(
+                                "dreamer-receipt-lease-{}",
+                                request.request_identity.operation.operation_id.as_str()
+                            ),
+                            "lease": {
+                                "job_id": stored.job.clone(),
+                                "attempt_id": stored.attempt.clone(),
+                                "lease_id": {
+                                    "namespace": "eliot.governor.work-lease",
+                                    "revision": "v1",
+                                    "value": "lease-t12-09-01",
+                                },
+                                "owner_artifact_id": serde_json::to_value(&selector.worker_artifact_id)
+                                    .expect("worker json"),
+                                "resource_generation": stored.scope.get("resource_generation").cloned().unwrap_or(serde_json::Value::from(1)),
+                                "state_fence": stored.scope.get("state_fence").cloned().unwrap_or(serde_json::Value::Null),
+                                "issued_at_unix_ms": 100,
+                                "expires_at_unix_ms": 60000,
+                                "revision": stored.revision,
+                            },
                             "checkpoint": null,
                             "result_under_verification": null,
                             "outcome": null,
@@ -1502,6 +1729,323 @@ mod dreamer_job_dispatch_tests {
                 "marker must fence: {marker}"
             );
         }
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// T12-09 protected Dreamer launch + `LeaseExact` claim (Implements
+    /// #702): a real managed child claims the exact queued job through the
+    /// bound-worker arm; a tampered/foreign/replayed claim spawns no second
+    /// worker; termination and no-orphan are observed on reconcile and on
+    /// failed spawn. This proves launch/claim only, not model completion.
+    ///
+    /// The Store peer is the only test double (the in-memory ledger above,
+    /// extended with an exact `LeaseExact` arm): every role, fence, wire,
+    /// lineage, material, and correlation gate on the path is the real
+    /// production code, and every denial below reaches zero new store calls
+    /// by construction.
+    #[tokio::test]
+    async fn managed_child_claims_exact_queued_job_forged_replay_denied() {
+        let root = temp_root("dreamer-launch-claim");
+        let kernel = ready_kernel(&root);
+        let requester = eliotd_session(&kernel);
+        let fence = requester.module_generation.state_fence.clone();
+        let ledger = FakeDreamerLedger::new();
+
+        // 1. Requester Submit -> durable QUEUED through the real K2 path.
+        let submit = build_k2_request_raw(
+            SUBMIT_OPERATION_JSON,
+            JobRole::Requester,
+            &fence,
+            "k2-ctx-t1209-submit",
+            "op-k2-t1209-submit",
+            "idem-k2-t1209-submit",
+            "transport-k2-t1209-submit",
+        );
+        submit.request.validate().expect("submit validates");
+        let frame = dreamer_frame(&requester, "frame-t1209-submit-1", dreamer_payload(&submit));
+        let reply = dispatch_then_project(&kernel, &ledger, &requester, &frame)
+            .await
+            .expect("submit projects");
+        let queued = reply_response(&reply);
+        queued
+            .validate_for(&submit.request)
+            .expect("submit response answers its request");
+        assert_eq!(ledger.call_count(), 1);
+        let job_id = queued.job_id.as_str().to_owned();
+        let attempt_id = queued.attempt_id.as_str().to_owned();
+        let scope_id = queued.scope.scope_id.as_str().to_owned();
+        let revision = queued.revision;
+
+        // 2. Kernel records one launch lineage and stages the protected
+        // handoff next to the composition-pinned child anchor. No spawn
+        // happens here.
+        let child_dir = root.join("dreamer-child");
+        std::fs::create_dir_all(&child_dir).expect("child dir");
+        let executable = child_dir.join("eliot-dreamer.exe");
+        let executable_sha256 = crate::sha256_hex(b"eliot-dreamer-installed-package-bytes");
+        let now_nanos = super::super::unix_ms().saturating_mul(1_000_000).max(1);
+        let material = DreamerLaunchMaterial {
+            keys: DreamerLaunchKeys {
+                job_id: &job_id,
+                attempt_id: &attempt_id,
+            },
+            queued: &queued,
+            child: DreamerChildBinding {
+                executable: &executable,
+                executable_sha256: &executable_sha256,
+                working_directory: &child_dir,
+            },
+        };
+        let prepared = prepare_dreamer_launch(&kernel, &material, now_nanos).expect("prepare");
+        let (nonce, operation_string, material_path) = match prepared {
+            PreparedDreamerLaunch::Ready(ready) => (
+                ready.nonce.clone(),
+                ready.operation_id.as_str().to_owned(),
+                ready.material_path.clone(),
+            ),
+            _ => panic!("fresh admitted job must prepare ready"),
+        };
+        assert!(material_path.exists(), "protected handoff must be staged");
+        let staged = std::fs::read(&material_path).expect("staged bytes");
+        // The staged bytes satisfy the exact child contract under live
+        // authority: never caller bytes, always the bound lineage.
+        let live_epoch = kernel
+            .service
+            .lock()
+            .expect("service lock")
+            .authority_epoch();
+        let envelope = parse_dreamer_material_bytes(&staged).expect("staged parses closed");
+        let validated =
+            validate_dreamer_material(&envelope, &live_epoch).expect("staged validates");
+        assert_eq!(validated.job_id, job_id);
+        assert_eq!(validated.attempt_id, attempt_id);
+        assert_eq!(validated.nonce, nonce);
+        let grant_digest = validated.grant.grant_digest.clone();
+
+        // 3. The managed child claims the exact queued job through the real
+        // bound-worker arm: one dispatch, one store call, one lease.
+        let worker = dreamer_worker_session(&kernel);
+        let claim = lease_exact_request(&job_id, &scope_id, revision, &fence, "claim-1");
+        claim.request.validate().expect("worker claim is K0-valid");
+        let frame = dreamer_frame(&worker, "frame-t1209-claim-1", dreamer_payload(&claim));
+        let calls_before = ledger.call_count();
+        let reply = dispatch_then_project(&kernel, &ledger, &worker, &frame)
+            .await
+            .expect("exact claim projects");
+        let claimed = reply_response(&reply);
+        claimed
+            .validate_for(&claim.request)
+            .expect("claim response answers its request");
+        assert_eq!(claimed.state, JobState::Leased);
+        assert!(
+            claimed.lease.is_some(),
+            "the managed child holds exactly one lease"
+        );
+        assert_eq!(
+            ledger.call_count(),
+            calls_before + 1,
+            "exactly one store call per admitted claim"
+        );
+
+        // 4. Forged, foreign, and off-arm claims fence with zero new store
+        // calls: no second worker can be started this way.
+        let denials = [
+            // Foreign job identity under the live fence.
+            lease_exact_request(
+                "job-t1209-foreign-01",
+                &scope_id,
+                revision,
+                &fence,
+                "denied-job",
+            ),
+            // Foreign scope under the exact job.
+            lease_exact_request(
+                &job_id,
+                "scope-t1209-foreign",
+                revision,
+                &fence,
+                "denied-scope",
+            ),
+            // Wrong revision under the exact job and scope.
+            lease_exact_request(&job_id, &scope_id, revision + 1, &fence, "denied-rev"),
+            // Worker-presented observation (Status) is off the claim-only arm.
+            build_k2_request_raw(
+                STATUS_OPERATION_JSON,
+                JobRole::Worker,
+                &fence,
+                "k2-ctx-denied-status",
+                "op-k2-denied-status",
+                "idem-k2-denied-status",
+                "transport-k2-denied-status",
+            ),
+        ];
+        for (index, denied) in denials.iter().enumerate() {
+            denied
+                .request
+                .validate()
+                .expect("denied claim stays K0-valid");
+            let frame = dreamer_frame(
+                &worker,
+                &format!("frame-t1209-denied-{index}"),
+                dreamer_payload(denied),
+            );
+            assert!(
+                matches!(
+                    dispatch_then_project(&kernel, &ledger, &worker, &frame).await,
+                    Err(TransportError::SessionFenced)
+                ),
+                "forged claim {index} must fence"
+            );
+        }
+        // The exact claim shape from a foreign module fences as well.
+        let mut foreign_session = dreamer_worker_session(&kernel);
+        foreign_session.module_generation.module_id =
+            eliot_contracts::ContractId::new("eliot-testd").expect("module id");
+        foreign_session.connection_id = "dreamer-foreign-conn".to_owned();
+        let exact = lease_exact_request(&job_id, &scope_id, revision, &fence, "denied-module");
+        let frame = dreamer_frame(
+            &foreign_session,
+            "frame-t1209-denied-module",
+            dreamer_payload(&exact),
+        );
+        assert!(
+            matches!(
+                dispatch_then_project(&kernel, &ledger, &foreign_session, &frame).await,
+                Err(TransportError::SessionFenced)
+            ),
+            "foreign module must fence"
+        );
+        assert_eq!(
+            ledger.call_count(),
+            calls_before + 1,
+            "no denied claim may reach the store"
+        );
+
+        // 5. Exact replay wins no second worker: the store refuses typed
+        // (the single lease stands) and the launch replays its retained
+        // original with byte-identical material.
+        let replay_frame =
+            dreamer_frame(&worker, "frame-t1209-claim-replay", dreamer_payload(&claim));
+        let reply = dispatch_then_project(&kernel, &ledger, &worker, &replay_frame)
+            .await
+            .expect("replay reaches the ledger as a typed refusal");
+        let body = reply_json(&reply);
+        assert_eq!(
+            body.get("status").and_then(serde_json::Value::as_str),
+            Some("error"),
+            "replayed claim is a typed refusal, never a second lease"
+        );
+        let replayed =
+            prepare_dreamer_launch(&kernel, &material, now_nanos + 5_000_000).expect("replay");
+        match replayed {
+            PreparedDreamerLaunch::ReplayOriginal { record } => {
+                assert_eq!(record.nonce, nonce, "replay keeps the original nonce");
+                assert_eq!(
+                    record.operation_id, operation_string,
+                    "replay keeps the original operation"
+                );
+            }
+            _ => panic!("replay must return the retained original"),
+        }
+        assert_eq!(
+            std::fs::read(&material_path).expect("material readback"),
+            staged,
+            "replay keeps byte-identical material"
+        );
+
+        // 6. Termination/no-orphan: reconcile closes the slot and reaps the
+        // staged file; a stale release never frees, the exact one does.
+        let expectation = DreamerLeaseExpectation {
+            job_id: job_id.clone(),
+            attempt_id: attempt_id.clone(),
+            revision,
+            scope_id: scope_id.clone(),
+            fence: fence.clone(),
+        };
+        let outcome = reconcile_launched_dreamer_attempt(&kernel, &expectation).expect("reconcile");
+        assert!(
+            matches!(outcome, DreamerReconcileOutcome::Reconciled { .. }),
+            "exact expectation reconciles"
+        );
+        assert!(
+            !material_path.exists(),
+            "reconciled launch reaps its material"
+        );
+        assert!(
+            !dreamer_launch_permits_lease(&job_id, &scope_id, revision, &fence),
+            "closed lineage permits no further claim"
+        );
+        assert!(
+            release_dreamer_launch(&job_id, &"00".repeat(32))
+                .expect("stale release")
+                .is_none(),
+            "stale release never frees the slot"
+        );
+        assert!(
+            release_dreamer_launch(&job_id, &grant_digest)
+                .expect("exact release")
+                .is_some(),
+            "exact release frees the slot"
+        );
+        assert!(
+            matches!(
+                reconcile_launched_dreamer_attempt(&kernel, &expectation).expect("reconcile"),
+                DreamerReconcileOutcome::Unknown { .. }
+            ),
+            "released lineage reports unknown"
+        );
+
+        // 7. A failed spawn leaves no orphan: a fresh lineage prepares, the
+        // missing executor fails closed, the file is reaped, and no slot
+        // remains.
+        let resubmit = build_k2_request_raw(
+            SUBMIT_OPERATION_JSON,
+            JobRole::Requester,
+            &fence,
+            "k2-ctx-t1209-resubmit",
+            "op-k2-t1209-resubmit",
+            "idem-k2-t1209-resubmit",
+            "transport-k2-t1209-resubmit",
+        );
+        let frame = dreamer_frame(
+            &requester,
+            "frame-t1209-resubmit-1",
+            dreamer_payload(&resubmit),
+        );
+        let reply = dispatch_then_project(&kernel, &ledger, &requester, &frame)
+            .await
+            .expect("resubmit projects");
+        let queued_again = reply_response(&reply);
+        let material_again = DreamerLaunchMaterial {
+            keys: DreamerLaunchKeys {
+                job_id: &job_id,
+                attempt_id: &attempt_id,
+            },
+            queued: &queued_again,
+            child: DreamerChildBinding {
+                executable: &executable,
+                executable_sha256: &executable_sha256,
+                working_directory: &child_dir,
+            },
+        };
+        let launched =
+            launch_admitted_dreamer_attempt(&kernel, &material_again, now_nanos + 9_000_000).await;
+        assert!(
+            matches!(launched, Err(DreamerMaterialError::Gate(_))),
+            "launch without a configured executor fails closed"
+        );
+        assert!(
+            !material_path.exists(),
+            "failed launch reaps its material and releases the slot"
+        );
+        assert!(
+            matches!(
+                reconcile_launched_dreamer_attempt(&kernel, &expectation).expect("reconcile"),
+                DreamerReconcileOutcome::Unknown { .. }
+            ),
+            "failed launch retains no slot"
+        );
 
         let _ = std::fs::remove_dir_all(root);
     }
