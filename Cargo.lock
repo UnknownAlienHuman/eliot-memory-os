@@ -1252,6 +1252,25 @@ dependencies = [
 ]
 
 [[package]]
+name = "eliot-dreamer-configuration-plan"
+version = "0.1.0"
+dependencies = [
+ "eliot-contracts",
+ "eliot-dreamer-contracts",
+ "eliot-evidence",
+]
+
+[[package]]
+name = "eliot-dreamer-conflict-analysis"
+version = "0.1.0"
+dependencies = [
+ "eliot-contracts",
+ "eliot-dreamer-contracts",
+ "eliot-epistemic-contracts",
+ "eliot-evidence",
+]
+
+[[package]]
 name = "eliot-dreamer-contracts"
 version = "0.1.0"
 dependencies = [
@@ -1296,6 +1315,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "eliot-dreamer-development-diagnosis"
+version = "0.1.0"
+dependencies = [
+ "eliot-contracts",
+ "eliot-dreamer-contracts",
+ "eliot-evidence",
+]
+
+[[package]]
 name = "eliot-dreamer-episode"
 version = "0.1.0"
 dependencies = [
@@ -1309,6 +1337,24 @@ dependencies = [
  "schemars",
  "serde",
  "serde_json",
+]
+
+[[package]]
+name = "eliot-dreamer-maintenance-plan"
+version = "0.1.0"
+dependencies = [
+ "eliot-contracts",
+ "eliot-dreamer-contracts",
+ "eliot-evidence",
+]
+
+[[package]]
+name = "eliot-dreamer-orchestration-plan"
+version = "0.1.0"
+dependencies = [
+ "eliot-contracts",
+ "eliot-dreamer-contracts",
+ "eliot-evidence",
 ]
 
 [[package]]
