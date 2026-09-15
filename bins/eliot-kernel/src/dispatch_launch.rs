@@ -3606,9 +3606,65 @@ mod tests {
         eliot_contracts::StateFence::new(test_epoch(1), ResourceGeneration::genesis())
     }
 
-    fn native_executable_join() -> eliot_kernel_service::NativeWorkerExecutableBinding {
+    /// Exact process invocation value the R1 Governor producer canonicalizes.
+    ///
+    /// The same `canonical_json_bytes` + `sha256_hex` the Governor
+    /// `process_invocation_digest_for` helper runs, so the join below carries
+    /// the real record digest into the dispatch gate instead of a placeholder.
+    fn native_test_invocation(claim_id: &str, operation_id: &str) -> serde_json::Value {
+        serde_json::json!({
+            "claim_id": claim_id,
+            "operation_id": operation_id,
+            "argv": ["--check"],
+            "fence": {"generation": 1},
+        })
+    }
+
+    /// Derives the R1 production `process_invocation_digest` from the exact
+    /// invocation bytes (never canned).
+    fn native_test_invocation_digest(claim_id: &str, operation_id: &str) -> String {
+        let invocation = native_test_invocation(claim_id, operation_id);
+        let bytes =
+            eliot_contracts::canonical_json_bytes(&invocation).expect("canonical invocation");
+        eliot_contracts::sha256_hex(&bytes)
+    }
+
+    /// Derives the opaque owner-produced executable digest from the real
+    /// published binding material through the real hash procedure.
+    ///
+    /// Carried by value and compared for equality only (the route never
+    /// recomputes the Governor domain); derived here from the claim-bound
+    /// nonce plus the real invocation digest so no stand-in seed remains on
+    /// the exercised path.
+    fn native_test_owner_digest(
+        claim_id: &str,
+        operation_id: &str,
+        nonce: &str,
+        invocation_digest: &str,
+    ) -> String {
+        let material = serde_json::json!({
+            "claim_id": claim_id,
+            "operation_id": operation_id,
+            "launch_nonce": nonce,
+            "process_invocation_digest": invocation_digest,
+        });
+        let bytes =
+            eliot_contracts::canonical_json_bytes(&material).expect("canonical owner material");
+        eliot_contracts::sha256_hex(&bytes)
+    }
+
+    fn native_executable_join_for(
+        claim_id: &str,
+        operation_id: &str,
+    ) -> eliot_kernel_service::NativeWorkerExecutableBinding {
         // Fixed times bound to the lifecycle admit time (1_750_000_000_000
         // ms): well-formed (deadline < expiry, non-zero) and live at admit.
+        // Both digests are derived from the real binding record through the
+        // production canonical procedure, never canned.
+        let nonce = "launch-nonce-0123456789abcdef";
+        let invocation_digest = native_test_invocation_digest(claim_id, operation_id);
+        let owner_digest =
+            native_test_owner_digest(claim_id, operation_id, nonce, &invocation_digest);
         eliot_kernel_service::NativeWorkerExecutableBinding {
             route_ref: "route://test/full-canonical-route".to_owned(),
             adapter_id: "adapter-test".to_owned(),
@@ -3617,8 +3673,8 @@ mod tests {
             facet_manifest_ref: "facet-manifest-7".to_owned(),
             grant_graph_revision: 5,
             replay_stream_id: "stream-claim-t9-02-1/gen-1".to_owned(),
-            launch_nonce: "launch-nonce-0123456789abcdef".to_owned(),
-            process_invocation_digest: "d".repeat(64),
+            launch_nonce: nonce.to_owned(),
+            process_invocation_digest: invocation_digest,
             authority_epoch: test_epoch(1),
             generation: ResourceGeneration::genesis(),
             state_fence: native_live_fence(),
@@ -3626,9 +3682,7 @@ mod tests {
             expires_at_unix_ms: 1_750_000_200_000,
             executable_wire_version:
                 eliot_kernel_service::NATIVE_WORKER_EXECUTABLE_BINDING_EXPECTED_WIRE_VERSION,
-            executable_binding_digest: eliot_contracts::sha256_hex(
-                b"dispatch-launch native owner digest stand-in",
-            ),
+            executable_binding_digest: owner_digest,
         }
     }
 
@@ -3676,7 +3730,7 @@ mod tests {
             predecessor_revision: "rev-1".to_owned(),
             authority_epoch: test_epoch(1),
             state_fence: native_live_fence(),
-            executable_binding: Some(native_executable_join()),
+            executable_binding: Some(native_executable_join_for(claim_id, operation_id)),
             binding_digest: String::new(),
             request_digest: String::new(),
         };
@@ -4951,5 +5005,102 @@ mod tests {
             "eliot-native-worker-dispatch/v1"
         );
         assert_eq!(NATIVE_WORKER_DISPATCH_LAUNCH_GRANT_HEAD, "launch-grant");
+    }
+
+    /// R1 Governor-sourced digest feed (Implements #22): the executable join
+    /// carries the real invocation digest derived from the exact invocation
+    /// bytes plus the opaque owner digest derived from the real binding
+    /// material. Matching digests validate; a mutated invocation digest is
+    /// well-formed but different (the gate observes it as `Conflict`); a
+    /// missing digest fails the closed shape (typed refusal, never silent).
+    #[test]
+    fn native_executable_join_carries_real_derived_digests() {
+        let join = native_executable_join_for("claim-r1-join-1", "op-r1-join-1");
+        for digest in [
+            &join.process_invocation_digest,
+            &join.executable_binding_digest,
+        ] {
+            assert_eq!(digest.len(), 64, "join digests are SHA-256 hex");
+            assert!(
+                digest
+                    .bytes()
+                    .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase()),
+                "join digests are lowercase hex"
+            );
+        }
+        // The carried invocation digest equals the production forward
+        // computation over the exact invocation value.
+        let expected_invocation = native_test_invocation("claim-r1-join-1", "op-r1-join-1");
+        let expected_bytes =
+            eliot_contracts::canonical_json_bytes(&expected_invocation).expect("canonical");
+        assert_eq!(
+            join.process_invocation_digest,
+            eliot_contracts::sha256_hex(&expected_bytes),
+            "join must carry the derived invocation digest"
+        );
+        join.validate().expect("derived join validates");
+        // The claim-bound request carrying the derived join validates with
+        // real computed envelope digests.
+        let request = native_claim_request(
+            "claim-r1-join-1",
+            "reg-r1-join-1",
+            "attempt-r1-join-1",
+            "op-r1-join-1",
+        );
+        let presented = request
+            .executable_binding
+            .as_ref()
+            .expect("claim carries the join");
+        assert_eq!(
+            presented.process_invocation_digest, join.process_invocation_digest,
+            "claim must carry the derived join digest"
+        );
+        // A mutated invocation digest stays well-formed so the gate reaches
+        // its typed currentness arm (`Conflict` on
+        // `.process_invocation_digest`) instead of stopping at shape.
+        let mut mutated = request.clone();
+        let mutated_join = mutated
+            .executable_binding
+            .as_mut()
+            .expect("mutated claim carries the join");
+        let mutated_invocation = serde_json::json!({
+            "claim_id": "claim-r1-join-1",
+            "operation_id": "op-r1-join-1",
+            "argv": ["--mutated"],
+            "fence": {"generation": 1},
+        });
+        let mutated_bytes =
+            eliot_contracts::canonical_json_bytes(&mutated_invocation).expect("canonical");
+        mutated_join.process_invocation_digest = eliot_contracts::sha256_hex(&mutated_bytes);
+        assert_ne!(
+            mutated_join.process_invocation_digest, join.process_invocation_digest,
+            "mutated invocation must derive a different digest"
+        );
+        mutated_join.validate().expect("mutated join stays well-formed");
+        mutated.binding_digest = mutated
+            .compute_binding_digest()
+            .expect("rebind mutated binding");
+        mutated.request_digest = mutated
+            .canonical_request_digest()
+            .expect("rebind mutated envelope");
+        mutated.validate().expect("mutated claim stays shape-valid");
+        // A missing digest fails the closed join shape: typed refusal, never
+        // a silent admit.
+        let mut missing = request.clone();
+        missing
+            .executable_binding
+            .as_mut()
+            .expect("missing claim carries the join")
+            .process_invocation_digest
+            .clear();
+        assert!(
+            missing
+                .executable_binding
+                .as_ref()
+                .expect("join present")
+                .validate()
+                .is_err(),
+            "missing invocation digest must fail the closed shape"
+        );
     }
 }
