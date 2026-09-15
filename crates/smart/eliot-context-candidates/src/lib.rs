@@ -29,6 +29,11 @@
 //! Absent Governor-owned schemas (Task Frame, negative memory, affordance)
 //! cross as opaque versioned role handles. A missing required projection
 //! stays an explicit missing/partial disposition, never filler.
+//!
+//! Issue #43 designs the eighth applicable-memory slot at the input boundary
+//! ([`MemoryInput`], [`eight_slots`]): the slot shape, availability mapping,
+//! and denominator check land here, while mapper adoption of the eight-slot
+//! denominator waits for #41 to merge. The mapped denominator stays seven.
 
 #![forbid(unsafe_code)]
 
@@ -44,8 +49,10 @@ pub use derive::{
 pub use eliot_context_contracts::ContextError;
 pub use inputs::{
     AttentionInput, CandidateBounds, CandidatePolicy, CandidateRequest, CueActivationResult,
-    CueInput, EpistemicInput, EvidenceInput, MemberMeasurement, OpaqueMember, OpaqueProjection,
-    ProjectionSchema, ProjectionState,
+    CueInput, EpistemicInput, EvidenceInput, MAX_MEMORY_CUE_HITS, MEMORY_PROVIDER,
+    MemberMeasurement, MemoryExclusion, MemoryInput, OpaqueMember, OpaqueProjection,
+    ProjectionSchema, ProjectionState, check_denominator_is_seven_or_eight, eight_slots,
+    memory_availability,
 };
 pub use mapper::{
     ContextCandidateSetResult, FrontierRecord, MAX_FRONTIER_TEXT_BYTES, MemberDisposition,

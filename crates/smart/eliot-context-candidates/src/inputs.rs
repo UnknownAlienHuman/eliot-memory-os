@@ -8,13 +8,24 @@
 //! (Governor-owned schemas are absent on current main and are never invented
 //! here), four bind their exact owner contracts.
 //!
-//! Every record uses `deny_unknown_fields`: an eighth provider, an unknown
-//! current field or an unknown variant is rejected at the boundary, never
-//! absorbed.
+//! Issue #43 designs the eighth provider slot (applicable memory) at this
+//! input boundary without changing the mapped denominator yet: [`MemoryInput`]
+//! carries the evaluated `ApplicableMemorySet` shape structurally (binding,
+//! slot state, applicable/excluded handles, advisory cue hits,
+//! denominator/truncation flags) because the typed
+//! `eliot-memory-projection-contracts` dependency can only land with
+//! workspace admission (registry flip deferred). The mapper still enforces
+//! the seven-slot denominator; [`eight_slots`] and
+//! [`check_denominator_is_seven_or_eight`] name the migration target the
+//! mapper adopts after #41 merges. No eighth provider, unknown field, or
+//! unknown variant is absorbed silently anywhere.
+//!
+//! Every record uses `deny_unknown_fields`: an unknown current field or an
+//! unknown variant is rejected at the boundary, never absorbed.
 
 use eliot_context_contracts::{
     AtomAvailability, AuthorityClass, ContextBinding, ContextError, ContextRecipe, MeasurementRef,
-    PrivacyClass, ProofBinding, ProviderId, SourceSnapshot,
+    PrivacyClass, ProofBinding, ProviderId, ProviderRole, SemanticRole, SourceSnapshot,
 };
 use eliot_contracts::{ArtifactId, ContractVersion, RequestId, StateFence, TaskId};
 use eliot_cue_contracts::{ActivationResult, Completeness};
@@ -518,4 +529,164 @@ pub fn check_denominator_is_seven(recipe: &ContextRecipe) -> Result<(), ContextE
         return Err(ContextError::DenominatorMismatch);
     }
     Ok(())
+}
+
+/// Provider identity of the eighth applicable-memory slot (issue #43).
+///
+/// The constant lives here rather than in [`crate::vocabulary`] because that
+/// module owns the closed seven-slot map held by #41; vocabulary adoption of
+/// the eighth slot moves there when the mapper adopts the eight-slot
+/// denominator after #41 merges.
+pub const MEMORY_PROVIDER: &str = "eliot.memory-applicability.v1";
+
+/// Hard ceiling on advisory cue-hit handles carried by one memory input.
+///
+/// This mirrors the evaluator advisory bound structurally; the typed import
+/// lands with workspace admission.
+pub const MAX_MEMORY_CUE_HITS: usize = 512;
+
+/// One excluded applicable-memory handle with its substantive reason.
+///
+/// The reason travels as a bounded reason class (never a cue-hit flag):
+/// the typed `ExclusionReason` enum lives in
+/// `eliot-memory-projection-contracts` and is imported directly once that
+/// crate is workspace-admitted. A cue hit on an excluded handle is recorded
+/// on `cue_hit` and never promotes the handle into `applicable`.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct MemoryExclusion {
+    /// Exact canonical handle of the excluded record.
+    pub handle: ArtifactId,
+    /// Stable bounded exclusion reason class.
+    pub reason: String,
+    /// Whether advisory cue-hit evidence named this record.
+    pub cue_hit: bool,
+}
+
+impl MemoryExclusion {
+    /// Validate the exclusion shape.
+    pub fn validate(&self) -> Result<(), ContextError> {
+        check_text(&self.reason, "memory.exclusion.reason")
+    }
+}
+
+/// Eighth-slot input: the evaluated applicable-memory set in structural form.
+///
+/// The binding reuses the exact shared task/scope/fence identity every other
+/// slot binds; `state` reuses the slot-state vocabulary so the memory slot
+/// degrades exactly like the opaque Governor projections (missing/partial
+/// stays visible, never filler). `applicable` names records the evaluator
+/// admitted; `excluded` names records it refused with exact reason classes.
+/// `cue_hits` is advisory evidence only.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct MemoryInput {
+    /// Shared task/scope/fence/decision identity; must equal the request task.
+    pub binding: ContextBinding,
+    /// Completeness state of the memory slot projection.
+    pub state: ProjectionState,
+    /// Applicable record handles admitted by the evaluator.
+    pub applicable: Vec<ArtifactId>,
+    /// Excluded record handles with exact reason classes.
+    pub excluded: Vec<MemoryExclusion>,
+    /// Advisory cue-hit handles; flags only, never proof.
+    pub cue_hits: Vec<ArtifactId>,
+    /// Whether the evaluated set carried a known denominator. An unknown
+    /// denominator with applicable members is contradictory input (the
+    /// evaluator fails closed on unknown denominators) and is rejected.
+    pub denominator_known: bool,
+    /// Whether the evaluated set was truncated; travels explicitly.
+    pub truncated: bool,
+}
+
+impl MemoryInput {
+    /// Validate the memory slot shape: binding, slot-state/member coherence,
+    /// handle uniqueness across applicable/excluded/cue lists, and the
+    /// unknown-denominator closure rule.
+    pub fn validate(&self) -> Result<(), ContextError> {
+        self.binding.validate()?;
+        self.state.validate()?;
+        if self.applicable.len() > MAX_PROJECTION_MEMBERS {
+            return Err(ContextError::Bounds {
+                field: "memory.applicable",
+            });
+        }
+        if !self.state.allows_members() && !self.applicable.is_empty() {
+            return Err(ContextError::InvalidField("memory.applicable"));
+        }
+        if !self.denominator_known && !self.applicable.is_empty() {
+            return Err(ContextError::InvalidField("memory.applicable"));
+        }
+        let mut seen = std::collections::BTreeSet::new();
+        for handle in &self.applicable {
+            if !seen.insert(handle.clone()) {
+                return Err(ContextError::Duplicate("memory.applicable"));
+            }
+        }
+        for exclusion in &self.excluded {
+            exclusion.validate()?;
+            if !seen.insert(exclusion.handle.clone()) {
+                return Err(ContextError::Duplicate("memory.handles"));
+            }
+        }
+        if self.cue_hits.len() > MAX_MEMORY_CUE_HITS {
+            return Err(ContextError::Bounds {
+                field: "memory.cue_hits",
+            });
+        }
+        let mut seen_hits = std::collections::BTreeSet::new();
+        for handle in &self.cue_hits {
+            if !seen_hits.insert(handle.clone()) {
+                return Err(ContextError::Duplicate("memory.cue_hits"));
+            }
+        }
+        Ok(())
+    }
+}
+
+/// Returns the slot availability of a memory input for disposition derivation.
+///
+/// Availability reflects the slot projection state only, exactly like
+/// [`cue_availability`]: it never promotes an excluded record and never
+/// demotes an applicable one on cue evidence.
+#[must_use]
+pub fn memory_availability(input: &MemoryInput) -> AtomAvailability {
+    input.state.availability()
+}
+
+/// Return the eight requested provider/role slots in canonical order.
+///
+/// The seven canonical slots keep their order and roles; the memory slot
+/// joins last with the `Evidence` semantic role under its distinct provider
+/// identity. The shared role is provisional: mapper adoption after #41
+/// decides whether memory atoms merge into evidence emission or form their
+/// own emission, but the denominator slot identity is stable now.
+pub fn eight_slots() -> Result<Vec<ProviderRole>, ContextError> {
+    let mut slots = crate::seven_slots()?;
+    slots.push(ProviderRole {
+        provider: ProviderId::new(MEMORY_PROVIDER)
+            .map_err(|_| ContextError::InvalidField("memory.provider"))?,
+        role: SemanticRole::Evidence,
+    });
+    Ok(slots)
+}
+
+/// Validate that a recipe denominator is exactly the seven- or eight-slot
+/// vocabulary.
+///
+/// Order-insensitive. A seven-slot recipe stays valid with the memory slot
+/// explicitly missing; an eight-slot recipe must name the exact memory
+/// slot. Anything else is a denominator mismatch, never silent absorption.
+pub fn check_denominator_is_seven_or_eight(recipe: &ContextRecipe) -> Result<(), ContextError> {
+    let mut seven = crate::seven_slots()?;
+    let mut eight = eight_slots()?;
+    let mut actual = recipe.denominator.requested.clone();
+    seven.sort();
+    eight.sort();
+    actual.sort();
+    if actual == seven || actual == eight {
+        Ok(())
+    } else {
+        Err(ContextError::DenominatorMismatch)
+    }
 }
