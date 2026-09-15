@@ -33,9 +33,9 @@ rather than memory, is:
 | Manifest | `unsafe_code` | `unsafe_op_in_unsafe_fn` |
 |---|---|---|
 | `crates/kernel/eliot-platform-windows/Cargo.toml:47` | `allow` | `deny` (`:48`) |
-| `crates/eliot-windows-ipc/Cargo.toml:28` | `allow` | `deny` (`:29`) |
+| `crates/eliot-windows-ipc/Cargo.toml:29` | `allow` | `deny` (`:30`) |
 | `crates/kernel/eliot-ipc/Cargo.toml:28` | `allow` | unset |
-| `bins/eliot-host/Cargo.toml:43` | `allow` | unset |
+| `bins/eliot-host/Cargo.toml:44` | `allow` | unset |
 | `bins/eliot-watchdog/Cargo.toml:40` | `allow` | unset |
 
 The workspace root (`Cargo.toml:333`) sets `unsafe_code = "forbid"`, so these
@@ -288,8 +288,8 @@ manifest widening is a scope-drift defect. No other ADR was modified, and
   this change (`Test-Path` returned false) and follows the full 0009 shape:
   title, Status, Context, Decision, Consequences, Acceptance evidence.
 - The five-row denominator above reproduces the actual manifests:
-  `eliot-platform-windows:47`, `eliot-windows-ipc:28`, `eliot-ipc:28`,
-  `eliot-host:43`, `eliot-watchdog:40`, with the workspace root forbidding
+  `eliot-platform-windows:47`, `eliot-windows-ipc:29`, `eliot-ipc:28`,
+  `eliot-host:44`, `eliot-watchdog:40`, with the workspace root forbidding
   `unsafe_code` at `Cargo.toml:333` and no `eliot-platform-unix` member
   present.
 - Each of the four exception manifests carries exactly one comment
