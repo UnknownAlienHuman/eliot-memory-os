@@ -1225,6 +1225,36 @@ dependencies = [
 ]
 
 [[package]]
+name = "eliot-dreamer-bundle"
+version = "0.1.0"
+dependencies = [
+ "eliot-context-contracts",
+ "eliot-contracts",
+ "eliot-dreamer-contracts",
+ "eliot-evidence",
+ "eliot-security-contracts",
+]
+
+[[package]]
+name = "eliot-dreamer-candidate-validation"
+version = "0.1.0"
+dependencies = [
+ "eliot-contracts",
+ "eliot-dreamer-contracts",
+ "schemars",
+ "serde",
+ "serde_json",
+ "thiserror",
+]
+
+[[package]]
+name = "eliot-dreamer-claim-grounding"
+version = "0.1.0"
+dependencies = [
+ "eliot-dreamer-contracts",
+]
+
+[[package]]
 name = "eliot-dreamer-classification"
 version = "0.1.0"
 dependencies = [
@@ -1358,6 +1388,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "eliot-dreamer-probe-plan"
+version = "0.1.0"
+dependencies = [
+ "eliot-dreamer-contracts",
+ "schemars",
+ "serde",
+]
+
+[[package]]
 name = "eliot-dreamer-procedure"
 version = "0.1.0"
 dependencies = [
@@ -1376,6 +1415,17 @@ dependencies = [
  "eliot-evidence",
  "eliot-receipts",
  "schemars",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
+name = "eliot-dreamer-rival-model"
+version = "0.1.0"
+dependencies = [
+ "eliot-dreamer-contracts",
+ "eliot-epistemic-contracts",
+ "eliot-evaluation-contracts",
  "serde",
  "serde_json",
 ]
