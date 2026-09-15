@@ -26,10 +26,11 @@ use eliot_process::{
 };
 use eliot_process_executor::{DispatchValidationPort, WindowsProcessExecutor};
 use eliot_testd_core::{
-    KernelProcessAdmissionEvidence, KernelProcessAdmissionProvider, KernelProcessAdmissionRequest,
-    Lease, ProcessAdmissionPermit, RetryPolicy, TargetRoots, TestJob, TestdError, TestdStore,
-    is_admitted_testd_profile, issue_process_admission, testd_profile_binding,
-    testd_profile_environment, testd_profile_resource_limits, validate_running_lease,
+    EvidenceCollector, KernelProcessAdmissionEvidence, KernelProcessAdmissionProvider,
+    KernelProcessAdmissionRequest, Lease, ProcessAdmissionPermit, RetryPolicy, TargetRoots,
+    TestJob, TestdError, TestdStore, is_admitted_testd_profile, issue_process_admission,
+    testd_profile_binding, testd_profile_environment, testd_profile_resource_limits,
+    validate_running_lease,
 };
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
@@ -886,6 +887,106 @@ pub fn resolve_testd_tool(program_path: &str) -> Result<ResolvedTestdTool, Testd
     })
 }
 
+/// Typed outcome of driving one validated dispatch file through the bounded
+/// admitted probe ([`drive_validated_dispatch_material`]).
+///
+/// HONEST-STOP: every post-derivation outcome is typed here; a refused
+/// derivation or issuance (nothing executed) is `Err(TestdError)`, never an
+/// invented outcome. Cancellation projects without executing.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum ValidatedDispatchDriveOutcome {
+    /// The single consuming start completed; verification owns disposition.
+    Completed {
+        /// Echo of the admitted job identity.
+        job_id: String,
+    },
+    /// A cancelled admission was projected without executing.
+    Cancelled {
+        /// Echo of the admitted job identity.
+        job_id: String,
+    },
+    /// Executor-owned unknown outcome: reconcile by the exact digest, never
+    /// blind-retry.
+    ReconcileRequired {
+        /// Echo of the admitted job identity.
+        job_id: String,
+    },
+}
+
+/// Drives one validated dispatch file through the bounded admitted probe.
+///
+/// Broker pattern (mirroring `bins/eliot-user-broker` via the doctor copy):
+/// the grant digest/epoch/fence arrive in the validated material, the
+/// [`TestdDispatchAuthority`] issues from exactly that grant over a real
+/// [`ClockObservation`](eliot_platform::ClockObservation), the
+/// [`ProcessIntent`](eliot_process::ProcessIntent) derives only from the
+/// admitted profile binding plus the installed tool bytes (never from argv,
+/// stdin, or environment), the [`ProcessRequest`](eliot_process::ProcessRequest)
+/// is built in-process, and the real composed [`WindowsProcessExecutor`]
+/// runs exactly one start. No mock, fake, or canned digest participates.
+///
+/// DISPATCH-WIRE seam for W3 (`bins/eliot-kernel`, issue #461):
+/// - Kernel main (W3-owned; this crate never edits it) composes the testd
+///   side via installed digests: it stages the real built `eliot-testd`
+///   image under the launch root, reads the staged bytes for the executable
+///   digest (mirroring the native up-to-spawn template in
+///   `bins/eliot-kernel/src/dispatch_launch.rs`), writes the seven-key
+///   admitted-attempt file next to the staged image, and spawns the real
+///   binary. The child binary reaches this function through its
+///   `drive_material_probe` after the closed Kernel bootstrap and
+///   advertisement gate.
+/// - The Kernel-launch E2E lives in W3-owned `dispatch_launch.rs` tests and
+///   follows the up-to-spawn template there; the child-side drive readiness
+///   here (real tool resolution, real dispatch authority, real composed
+///   executor, bounded `cargo --version` probe) is what that test drives.
+///   Advertisement flips only via the dispatch contour
+///   (`TESTD_ADMISSION_ADVERTISED`); this function never invents it.
+///
+/// Caller contract: `generation_root` is the admitted working directory. The
+/// binary passes its dispatch-locator directory (the honest closed stand-in
+/// for the bounded probe, which reads no working directory); the production
+/// contour delivers the admitted generation root.
+pub async fn drive_validated_dispatch_material(
+    material: &crate::testd_material::ValidatedTestdMaterial,
+    generation_root: &str,
+    now_unix_ms: u64,
+) -> Result<ValidatedDispatchDriveOutcome, TestdError> {
+    if material.cancelled {
+        return Ok(ValidatedDispatchDriveOutcome::Cancelled {
+            job_id: material.job_id.clone(),
+        });
+    }
+    let tool = resolve_testd_tool(eliot_testd_core::TESTD_PROFILE_PROGRAM)?;
+    let params = TestdDerivedIntentParams {
+        job_id: material.job_id.clone(),
+        operation_id: material.operation_id.clone(),
+        profile: material.profile.clone(),
+        generation: material.generation,
+        session_nonce: material.nonce.clone(),
+        executable_absolute: tool.executable_absolute,
+        executable_sha256: tool.executable_sha256,
+        generation_root: generation_root.to_owned(),
+    };
+    let intent = derive_testd_intent(&params)?;
+    let authority = TestdDispatchAuthority::new()?;
+    let request = authority.issue(&intent, &material.grant, now_unix_ms)?;
+    let executor = compose_process_executor(Arc::new(authority));
+    let sink: Arc<dyn ProcessEvidenceSink> = Arc::new(EvidenceCollector::default());
+    match executor.start(request, sink).await {
+        Ok(_) => Ok(ValidatedDispatchDriveOutcome::Completed {
+            job_id: material.job_id.clone(),
+        }),
+        Err(ProcessExecutionError::UnknownOutcome) => {
+            Ok(ValidatedDispatchDriveOutcome::ReconcileRequired {
+                job_id: material.job_id.clone(),
+            })
+        }
+        Err(error) => Err(TestdError::Contract(truncate_dispatch_detail(
+            &error.to_string(),
+        ))),
+    }
+}
+
 /// Drives exactly one admitted one-shot claim through the worker.
 ///
 /// Thin binary entry used by `main` on the admitted path: durable claim,
@@ -1525,5 +1626,66 @@ mod tests {
             Err(eliot_process::ProcessExecutionError::Unavailable(_))
         ));
         std::fs::remove_dir_all(&cwd).expect("probe cwd must clean");
+    }
+
+    /// The dispatch-wire drive seam projects cancellation without executing:
+    /// a cancelled [`ValidatedTestdMaterial`](super::testd_material::ValidatedTestdMaterial)
+    /// returns `Cancelled` before tool resolution, intent derivation, or any
+    /// start. The live `Completed` path is proven through the binary's
+    /// child-side E2E, which now drives [`super::drive_validated_dispatch_material`].
+    #[test]
+    fn validated_dispatch_drive_projects_cancel_without_executing() {
+        use std::task::{Context, Poll, Waker};
+
+        fn block_on_cancel_test<F: std::future::Future>(future: F) -> F::Output {
+            let waker = Waker::noop();
+            let mut context = Context::from_waker(waker);
+            let mut pinned = Box::pin(future);
+            loop {
+                match pinned.as_mut().poll(&mut context) {
+                    Poll::Ready(output) => return output,
+                    Poll::Pending => std::thread::yield_now(),
+                }
+            }
+        }
+
+        let epoch = test_epoch(7);
+        let generation = Generation::new(1).unwrap();
+        let fence = FencingToken::new(epoch.clone(), generation, "fence-1").unwrap();
+        let material = super::testd_material::ValidatedTestdMaterial {
+            job_id: "job-testd-cancel-1".to_owned(),
+            operation_id: "testd-op-1".to_owned(),
+            profile: "cargo-test".to_owned(),
+            profile_binding_digest: "a".repeat(64),
+            request_digest: "b".repeat(64),
+            admission_digest: "c".repeat(64),
+            epoch,
+            generation: 1,
+            nonce: "testd-dispatch-cancel-01".to_owned(),
+            grant_digest: "d".repeat(64),
+            grant: super::testd_material::DispatchGrant {
+                grant_digest: "d".repeat(64),
+                authority_epoch: test_epoch(7),
+                fence_generation: 1,
+                fence_nonce: "fence-1".to_owned(),
+                idempotency_key: "lease-1".to_owned(),
+                expires_at: 2,
+            },
+            fence,
+            cancelled: true,
+        };
+        let outcome = block_on_cancel_test(super::drive_validated_dispatch_material(
+            &material,
+            "C:\\unused-generation-root",
+            1,
+        ));
+        assert!(
+            matches!(
+                outcome,
+                Ok(super::ValidatedDispatchDriveOutcome::Cancelled { ref job_id })
+                if job_id == "job-testd-cancel-1"
+            ),
+            "cancelled material must project cancellation without executing, got {outcome:?}"
+        );
     }
 }
