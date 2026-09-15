@@ -110,6 +110,7 @@ impl KernelComposition {
                         | "store_initialize_genesis"
                         | "apply_prepared"
                         | "receipt"
+                        | "store_named"
                 )
             {
                 if !probe_ready_state_admitted(
