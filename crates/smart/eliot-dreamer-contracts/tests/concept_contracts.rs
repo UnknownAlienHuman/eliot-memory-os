@@ -4,7 +4,6 @@ use eliot_contracts::{
     ArtifactId, EpochId, EpochLineageId, ReceiptId, ResourceGeneration, SourceId, StateFence,
     TaskId,
 };
-use std::num::NonZeroU64;
 use eliot_dreamer_contracts::{
     AtomicityMode, BudgetUsage, BundleCompleteness, BundleMaterial, ConceptApplicability,
     ConceptCandidate, ConceptCase, ConceptCaseKind, ConceptCoverage, ConceptCriterion,
@@ -23,6 +22,7 @@ use eliot_evidence::{
     EvidenceFreshness, Provenance,
 };
 use eliot_receipts::{ProofCeiling, ReceiptIdentity, WorkScopeId};
+use std::num::NonZeroU64;
 
 fn fence() -> StateFence {
     let epoch = EpochId::new(

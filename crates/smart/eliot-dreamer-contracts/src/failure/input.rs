@@ -772,9 +772,9 @@ mod tests {
     use crate::relation::{RelationPreservationDimension, RelationPreservationVerdict};
     use crate::screen::ScreenState;
     use eliot_contracts::{
-        ArtifactId, ClockReading, ContractId, ContractVersion, EpochId, EpochLineageId, OperationId,
-        ProductId, RequestId, ResourceGeneration, SourceId, StateFence, TaskId, TaskRevision,
-        TransactionSequence, sha256_hex,
+        ArtifactId, ClockReading, ContractId, ContractVersion, EpochId, EpochLineageId,
+        OperationId, ProductId, RequestId, ResourceGeneration, SourceId, StateFence, TaskId,
+        TaskRevision, TransactionSequence, sha256_hex,
     };
     use eliot_evidence::{
         Assertability, EpistemicStatus, EvidenceAuthority, EvidenceCoverage, EvidenceEnvelope,
@@ -813,10 +813,7 @@ mod tests {
         StateFence::new(test_epoch(), ResourceGeneration::genesis())
     }
     fn distinct_fence(generation: u64) -> StateFence {
-        StateFence::new(
-            test_epoch(),
-            ResourceGeneration::new(generation).unwrap(),
-        )
+        StateFence::new(test_epoch(), ResourceGeneration::new(generation).unwrap())
     }
     fn digest(value: &[u8]) -> String {
         sha256_hex(value)

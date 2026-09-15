@@ -986,6 +986,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "eliot-context-contracts"
+version = "0.1.0"
+dependencies = [
+ "eliot-agent-contracts",
+ "eliot-contracts",
+ "eliot-evidence",
+ "eliot-protocol",
+ "eliot-receipts",
+ "schemars",
+ "serde",
+ "serde_json",
+ "sha2 0.10.9",
+ "thiserror",
+]
+
+[[package]]
 name = "eliot-contracts"
 version = "0.1.0"
 dependencies = [
@@ -1022,6 +1038,20 @@ dependencies = [
  "eliot-contracts",
  "schemars",
  "serde",
+ "thiserror",
+]
+
+[[package]]
+name = "eliot-cue-contracts"
+version = "0.1.0"
+dependencies = [
+ "eliot-contracts",
+ "eliot-evidence",
+ "eliot-receipts",
+ "eliot-security-contracts",
+ "schemars",
+ "serde",
+ "serde_json",
  "thiserror",
 ]
 
@@ -1085,6 +1115,25 @@ dependencies = [
  "eliot-contracts",
  "serde",
  "serde_json",
+ "thiserror",
+]
+
+[[package]]
+name = "eliot-dreamer-contracts"
+version = "0.1.0"
+dependencies = [
+ "blake3",
+ "eliot-context-contracts",
+ "eliot-contracts",
+ "eliot-epistemic-contracts",
+ "eliot-evaluation-contracts",
+ "eliot-evidence",
+ "eliot-receipts",
+ "eliot-security-contracts",
+ "schemars",
+ "serde",
+ "serde_json",
+ "sha2 0.10.9",
  "thiserror",
 ]
 
@@ -1163,6 +1212,7 @@ dependencies = [
  "eliot-receipts",
  "schemars",
  "serde",
+ "serde_json",
  "thiserror",
 ]
 
@@ -1555,6 +1605,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "eliot-learning-contracts"
+version = "0.1.0"
+dependencies = [
+ "eliot-agent-contracts",
+ "eliot-contracts",
+ "eliot-evidence",
+ "eliot-receipts",
+ "schemars",
+ "serde",
+ "serde_json",
+ "thiserror",
+]
+
+[[package]]
 name = "eliot-live-canary"
 version = "0.1.0"
 dependencies = [
@@ -1609,6 +1673,20 @@ name = "eliot-memory-curation"
 version = "0.1.0"
 dependencies = [
  "blake3",
+ "schemars",
+ "serde",
+ "serde_json",
+ "thiserror",
+]
+
+[[package]]
+name = "eliot-memory-curation-contracts"
+version = "0.1.0"
+dependencies = [
+ "eliot-agent-contracts",
+ "eliot-contracts",
+ "eliot-evidence",
+ "eliot-receipts",
  "schemars",
  "serde",
  "serde_json",

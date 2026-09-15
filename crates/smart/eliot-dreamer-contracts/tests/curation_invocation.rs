@@ -16,7 +16,6 @@ use std::cell::Cell;
 use eliot_contracts::{
     EpochId, EpochLineageId, ReceiptId, RequestId, ResourceGeneration, StateFence, sha256_hex,
 };
-use std::num::NonZeroU64;
 use eliot_dreamer_contracts::candidate::DimensionVerdict;
 use eliot_dreamer_contracts::curation::{MergePayload, TargetEvidence};
 use eliot_dreamer_contracts::registry::family_kinds;
@@ -32,6 +31,7 @@ use eliot_dreamer_contracts::{
 };
 use eliot_dreamer_contracts::{ClaimResidue, SupportState};
 use eliot_dreamer_contracts::{OmissionHandle, job};
+use std::num::NonZeroU64;
 
 /// Faithful test double for the new A-03 trait: counts real calls, verifies
 /// it observed the selected binding, and echoes the accepted payload facets
