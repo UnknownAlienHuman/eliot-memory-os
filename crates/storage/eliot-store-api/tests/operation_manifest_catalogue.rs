@@ -71,7 +71,7 @@ fn evidence_pack_params() -> BTreeMap<String, Value> {
 #[test]
 fn activated_typed_reads_pass_catalogue_validation() {
     let entries = generated_operation_manifests().unwrap();
-    assert_eq!(entries.len(), 9);
+    assert_eq!(entries.len(), 10);
 
     // The closed name mapping is the single owner for code, manifests, wire.
     for operation in [
@@ -447,12 +447,50 @@ fn lifecycle_plan(set_digest: &OperationManifestDigest) -> eliot_store_api::Prep
     plan
 }
 
+fn recovery_params() -> BTreeMap<String, Value> {
+    BTreeMap::from([
+        ("problem_id".to_owned(), json!("problem-1")),
+        ("expected_problem_revision".to_owned(), json!("7")),
+        ("attempt_digest".to_owned(), json!("a".repeat(64))),
+        ("effect_digest".to_owned(), json!("b".repeat(64))),
+        (
+            "operation_manifest_digest".to_owned(),
+            json!("c".repeat(64)),
+        ),
+        (
+            "artifact_binding_digest".to_owned(),
+            json!("b".repeat(64)),
+        ),
+        ("fence_digest".to_owned(), json!("d".repeat(64))),
+        (
+            "observation_operation_id".to_owned(),
+            json!("operation-1"),
+        ),
+        ("observation_record_id".to_owned(), json!("record-1")),
+        (
+            "observation_request_digest".to_owned(),
+            json!("e".repeat(64)),
+        ),
+    ])
+}
+
+fn recovery_plan(set_digest: &OperationManifestDigest) -> eliot_store_api::PreparedTransition {
+    let mut plan = mutation_plan(set_digest);
+    plan.transition_class = TransitionClass::RecoverySchema;
+    plan.requested_effect_ceiling = EffectClass::ReversibleMutation;
+    plan.named_operations = vec![NamedMutationRequest {
+        operation: NamedMutationOperation::ReconcileRecovery,
+        parameters: recovery_params(),
+    }];
+    plan
+}
+
 #[test]
 fn approved_capture_plan_passes_and_stale_digest_fails_manifest_mismatch() {
     let entries = generated_operation_manifests().unwrap();
     let set_digest = operation_manifest_set_digest(&entries).unwrap();
 
-    // AUD-C01 activates exactly three mutations: the approved CaptureObservation
+    // AUD-C01 activates exactly four mutations: the approved CaptureObservation
     // plan binds the set digest and passes the whole catalogue path.
     let plan = mutation_plan(&set_digest);
     assert!(plan.validate_against_catalogue(&entries).is_ok());
@@ -469,7 +507,7 @@ fn approved_capture_plan_passes_and_stale_digest_fails_manifest_mismatch() {
 #[test]
 fn capture_observation_passes_whole_path() {
     let entries = generated_operation_manifests().unwrap();
-    assert_eq!(entries.len(), 9);
+    assert_eq!(entries.len(), 10);
     let set_digest = operation_manifest_set_digest(&entries).unwrap();
 
     // Approved owner-shaped subject params pass catalogue validation.
@@ -516,7 +554,7 @@ fn capture_observation_passes_whole_path() {
 #[test]
 fn append_audit_event_passes_whole_path() {
     let entries = generated_operation_manifests().unwrap();
-    assert_eq!(entries.len(), 9);
+    assert_eq!(entries.len(), 10);
     let set_digest = operation_manifest_set_digest(&entries).unwrap();
 
     // Approved receipt-bound audit params pass catalogue validation without bypass.
@@ -527,12 +565,59 @@ fn append_audit_event_passes_whole_path() {
 #[test]
 fn apply_lifecycle_policy_passes_whole_path() {
     let entries = generated_operation_manifests().unwrap();
-    assert_eq!(entries.len(), 9);
+    assert_eq!(entries.len(), 10);
     let set_digest = operation_manifest_set_digest(&entries).unwrap();
 
     // Approved lifecycle-policy params pass catalogue validation without bypass.
     let plan = lifecycle_plan(&set_digest);
     assert!(plan.validate_against_catalogue(&entries).is_ok());
+}
+
+#[test]
+fn reconcile_recovery_passes_whole_path() {
+    let entries = generated_operation_manifests().unwrap();
+    assert_eq!(entries.len(), 10);
+    let set_digest = operation_manifest_set_digest(&entries).unwrap();
+
+    // Approved problem-leg recovery params pass catalogue validation without bypass.
+    let plan = recovery_plan(&set_digest);
+    assert!(plan.validate_against_catalogue(&entries).is_ok());
+
+    // An exact replay fixture (same operation identity and idempotency key)
+    // binds the same digest path instead of creating a second submission.
+    let replay = recovery_plan(&set_digest);
+    assert_eq!(replay.identity.operation_id, plan.identity.operation_id);
+    assert_eq!(
+        replay.identity.idempotency_key,
+        plan.identity.idempotency_key
+    );
+    assert!(replay.validate_against_catalogue(&entries).is_ok());
+    assert_eq!(
+        replay.operation_manifest_digest,
+        plan.operation_manifest_digest
+    );
+
+    // The same idempotency key with a different operation identity is the
+    // IdentityConflict path (I5.5): the store's existing failure mapping
+    // classifies it as Conflict with no attempted mutation, so no record is
+    // created and no database is needed to prove the classification.
+    let mut conflicted = recovery_plan(&set_digest);
+    conflicted.identity.operation_id = OperationId::new("operation-2").unwrap();
+    assert_ne!(conflicted.identity.operation_id, plan.identity.operation_id);
+    assert_eq!(
+        conflicted.identity.idempotency_key,
+        plan.identity.idempotency_key
+    );
+    let failure = StoreFailure::from_store_error(
+        StoreError::IdentityConflict,
+        StoreFailureIdentityContext::default(),
+    )
+    .unwrap();
+    assert_eq!(failure.disposition, StoreFailureDisposition::Conflict);
+    assert_eq!(
+        failure.mutation_disposition,
+        StoreMutationDisposition::NotAttempted
+    );
 }
 
 #[test]
