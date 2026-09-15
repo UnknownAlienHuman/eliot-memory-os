@@ -87,8 +87,8 @@ use eliot_kernel_service::{
     KernelService, KernelServiceError, NATIVE_WORKER_CLAIM_WIRE_ID, NativeWorkerClaimReceipt,
     NativeWorkerClaimRequest, NativeWorkerClaimResponse, TestdAdmission,
     TestdAdmissionAttemptRequest, TestdAdmissionEnvelope, TestdAdmissionResponse,
-    advertise_doctor_repair, handle_doctor_repair_attempt, handle_testd_admission_attempt,
-    reconcile_testd_admission,
+    advertise_doctor_repair, advertise_testd_admission_when_composed, handle_doctor_repair_attempt,
+    handle_testd_admission_attempt, reconcile_testd_admission,
 };
 use eliot_ors::{
     DoctorAttemptRecord, DoctorEffectRecord, DoctorLedgerError, DoctorRecoveryLedger,
@@ -97,6 +97,7 @@ use eliot_ors::{
 use eliot_process::OperationId;
 use serde::{Deserialize, Serialize};
 
+use super::doctor_recovery_ledger::KernelDoctorRecoveryLedger;
 use super::front_door_session::{DOCTOR_MODULE_ID, NATIVE_MODULE_ID, TESTD_MODULE_ID};
 use super::runtime_identity::stable_owner_principal_digest;
 use super::{
@@ -787,6 +788,26 @@ pub fn compose_doctor_front_door<L: DoctorRecoveryLedger + 'static>(
     Ok(())
 }
 
+/// Composes the production Doctor front-door state from the durable
+/// Kernel-owned ledger plus the installed-health-probe registry.
+///
+/// `installed_doctor_digest` is the installed Doctor package artifact
+/// digest (lowercase SHA-256) from the installation manifest through the
+/// Host injection — never minted here. A malformed digest fails closed
+/// with [`DispatchLaunchError::InvalidMaterial`] before any cell is
+/// touched; otherwise this delegates to [`compose_doctor_front_door`],
+/// so the contour-first, non-empty-registry, and set-once rules hold
+/// unchanged. This is the production caller `main` uses once the contour
+/// carries the digest.
+pub fn compose_production_doctor_front_door(
+    ledger: Arc<KernelDoctorRecoveryLedger>,
+    installed_doctor_digest: &str,
+) -> Result<(), DispatchLaunchError> {
+    let registry = DoctorRecipeRegistry::production_health_probe(installed_doctor_digest)
+        .map_err(|error| DispatchLaunchError::InvalidMaterial(error.to_string()))?;
+    compose_doctor_front_door(ledger, registry)
+}
+
 /// Returns the composed dispatch contour, when composition landed.
 pub fn dispatch_contour() -> Option<&'static ComposedDispatchContour> {
     DISPATCH_CONTOUR.get()
@@ -816,6 +837,22 @@ pub fn doctor_repair_advertised() -> bool {
         contour.principal_owner.as_str(),
     )
     .is_ok_and(|owner| advertise_doctor_repair(&owner))
+}
+
+/// Returns whether the Kernel currently advertises the testd admission
+/// operation.
+///
+/// True exactly when the dispatch contour cell is composed: testd admission
+/// is stateless (wire plus live authority only), so no ledger composition
+/// is required — only the contour cell from [`compose_dispatch_contour`]
+/// for the Kernel-owned principal. The inert
+/// `TESTD_ADMISSION_ADVERTISED` default never flips in place; this path
+/// flips only through the composed contour, via
+/// `advertise_testd_admission_when_composed`.
+#[must_use]
+pub fn testd_admission_advertised() -> bool {
+    let composed = DISPATCH_CONTOUR.get().is_some();
+    advertise_testd_admission_when_composed(composed)
 }
 
 /// Admits exactly one Doctor repair attempt through the composed front-door
@@ -3566,7 +3603,9 @@ mod tests {
 
     /// Ordered contour lifecycle: uncomposed arms fence; partial
     /// composition still fences the Doctor side; testd admits end-to-end;
-    /// the heartbeat carries the composed flag; testd prepare reserves,
+    /// the production Doctor side composes once (durable ledger plus
+    /// health-probe registry) and refuses a second composition; the
+    /// heartbeat carries the composed flag; testd prepare reserves,
     /// replays by the retained original, refuses changed terms,
     /// reconciles, and releases; native prepare reserves the real claim
     /// through the live service plus ORS, writes the dispatch file with a
@@ -4173,6 +4212,32 @@ mod tests {
                 .exists()
         );
 
+        // 8. The production Doctor side composes once through the durable
+        // Kernel-owned ledger plus the installed-health-probe registry: the
+        // advertisement flips, and a second composition fails closed
+        // instead of replacing live authority. This runs last because the
+        // earlier steps prove the uncomposed fail-closed shape.
+        let doctor_dir = root.join("doctor-ledger");
+        std::fs::create_dir_all(&doctor_dir).expect("doctor ledger dir");
+        let production_ledger = Arc::new(
+            crate::KernelDoctorRecoveryLedger::open(&doctor_dir).expect("production doctor ledger"),
+        );
+        let installed_doctor_digest =
+            eliot_contracts::sha256_hex(b"eliot-doctor-installed-package-bytes");
+        compose_production_doctor_front_door(
+            Arc::clone(&production_ledger),
+            &installed_doctor_digest,
+        )
+        .expect("production doctor composition");
+        assert!(
+            doctor_repair_advertised(),
+            "composed doctor side must advertise repair"
+        );
+        assert!(matches!(
+            compose_production_doctor_front_door(production_ledger, &installed_doctor_digest),
+            Err(DispatchLaunchError::AlreadyComposed(_))
+        ));
+
         let _ = std::fs::remove_dir_all(root);
     }
 
@@ -4232,6 +4297,29 @@ mod tests {
             }
             _ => panic!("heartbeat must reply"),
         }
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// Testd advertisement mirrors the contour cell exactly: the inert
+    /// default never flips in place, so the flag equals the live composed
+    /// state whatever the parallel lifecycle test has composed so far.
+    #[test]
+    fn testd_advertisement_mirrors_the_composed_contour_cell() {
+        assert_eq!(testd_admission_advertised(), dispatch_contour().is_some());
+    }
+
+    /// Production Doctor composition fails closed before touching any cell
+    /// when the installed digest is malformed: no ledger, registry, or
+    /// principal is minted, and the global contour is never contacted.
+    #[test]
+    fn production_doctor_compose_rejects_a_malformed_installed_digest() {
+        let root = temp_root("production-digest");
+        let ledger =
+            Arc::new(crate::KernelDoctorRecoveryLedger::open(&root).expect("doctor ledger opens"));
+        assert!(matches!(
+            compose_production_doctor_front_door(ledger, "not-a-sha256-digest"),
+            Err(DispatchLaunchError::InvalidMaterial(_))
+        ));
         let _ = std::fs::remove_dir_all(root);
     }
 

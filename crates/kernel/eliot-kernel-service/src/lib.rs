@@ -95,9 +95,9 @@ pub use testd_front_door::{
     TESTD_ADMISSION_WIRE_VERSION, TESTD_CONFLICT_MAX_FIELDS, TESTD_MAX_ENVELOPE_BYTES,
     TestdAdmission, TestdAdmissionAttemptRequest, TestdAdmissionConflict, TestdAdmissionContext,
     TestdAdmissionEnvelope, TestdAdmissionRejection, TestdAdmissionRejectionReason,
-    TestdAdmissionResponse, advertise_testd_admission, handle_testd_admission_attempt,
-    handle_testd_cancellation, is_testd_diagnosis_only_envelope, reconcile_testd_admission,
-    reconcile_testd_delivery, route_testd_admission,
+    TestdAdmissionResponse, advertise_testd_admission, advertise_testd_admission_when_composed,
+    handle_testd_admission_attempt, handle_testd_cancellation, is_testd_diagnosis_only_envelope,
+    reconcile_testd_admission, reconcile_testd_delivery, route_testd_admission,
 };
 
 /// Boxed future for provider-neutral Kernel process operations.

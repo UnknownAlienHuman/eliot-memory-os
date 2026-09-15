@@ -36,7 +36,10 @@
 use std::io::{self, Write};
 use std::sync::Arc;
 
-use eliot_kernel::{EliotdReceiptRootBinding, KernelBuildError, KernelComposition, KernelConfig};
+use eliot_kernel::{
+    EliotdReceiptRootBinding, KernelBuildError, KernelComposition, KernelConfig,
+    KernelDoctorRecoveryLedger, compose_dispatch_contour, compose_production_doctor_front_door,
+};
 
 #[cfg(windows)]
 mod front_door_driver;
@@ -108,6 +111,27 @@ async fn main() {
     };
     kernel_config =
         kernel_config.with_eliotd_descriptor_artifact_sha256(eliotd_descriptor_artifact_sha256);
+    let Some(doctor_artifact_sha256) = options.doctor_artifact_sha256.clone() else {
+        exit_error(
+            "DOCTOR_ARTIFACT_CONTRACT_REQUIRED",
+            "Host launch must inject the independent Doctor executable digest",
+        );
+    };
+    kernel_config = kernel_config.with_doctor_artifact_sha256(doctor_artifact_sha256);
+    let Some(testd_artifact_sha256) = options.testd_artifact_sha256.clone() else {
+        exit_error(
+            "TESTD_ARTIFACT_CONTRACT_REQUIRED",
+            "Host launch must inject the independent Testd executable digest",
+        );
+    };
+    kernel_config = kernel_config.with_testd_artifact_sha256(testd_artifact_sha256);
+    let Some(native_worker_artifact_sha256) = options.native_worker_artifact_sha256.clone() else {
+        exit_error(
+            "NATIVE_WORKER_ARTIFACT_CONTRACT_REQUIRED",
+            "Host launch must inject the independent native worker executable digest",
+        );
+    };
+    kernel_config = kernel_config.with_native_worker_artifact_sha256(native_worker_artifact_sha256);
     let authority_path = options.authority_descriptor.clone();
     let authority_contour = startup_binding::authority_contour(&options.work_root, &authority_path);
     let kernel = Arc::new(
@@ -121,6 +145,38 @@ async fn main() {
             Err(error) => exit_build_error(&error),
         },
     );
+    #[cfg(windows)]
+    {
+        // DISPATCH-WIRE E1 (issue #461): compose the production
+        // dispatch contour with the principal from the authenticated Host
+        // startup binding (the installation identity — never a
+        // request-envelope value). This answers the #1467 residual of zero
+        // production callers: the testd/native admit sides go live here.
+        // The 22-value contour now carries the installed
+        // doctor/testd/native-worker digests (fail-closed above, threaded
+        // through `KernelConfig` with no defaults), so the Doctor side
+        // composes here through `compose_production_doctor_front_door`
+        // (durable `KernelDoctorRecoveryLedger` plus
+        // `DoctorRecipeRegistry::production_health_probe`); a malformed
+        // installed-doctor digest keeps `doctor_repair_advertised`
+        // fail-closed instead of composing.
+        if let Err(error) = compose_dispatch_contour(startup_binding.installation_id.clone()) {
+            exit_error("DISPATCH_COMPOSITION_FAILURE", &error.to_string());
+        }
+        let Some(doctor_digest) = options.doctor_artifact_sha256.clone() else {
+            exit_error(
+                "DOCTOR_ARTIFACT_CONTRACT_REQUIRED",
+                "Host launch must inject the independent Doctor executable digest",
+            );
+        };
+        let doctor_ledger = Arc::new(
+            KernelDoctorRecoveryLedger::open(&options.work_root)
+                .unwrap_or_else(|error| exit_error("DOCTOR_LEDGER_FAILURE", &error.to_string())),
+        );
+        if let Err(error) = compose_production_doctor_front_door(doctor_ledger, &doctor_digest) {
+            exit_error("DISPATCH_COMPOSITION_FAILURE", &error.to_string());
+        }
+    }
     if !kernel.process_execution_configured() {
         exit_error(
             "PROCESS_AUTHORITY_CONFIGURATION_REQUIRED",
