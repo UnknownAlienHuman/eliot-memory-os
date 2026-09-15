@@ -2810,6 +2810,7 @@ dependencies = [
  "eliot-platform",
  "eliot-platform-windows",
  "eliot-protocol",
+ "eliot-read",
  "eliot-receipts",
  "eliot-runtime-contracts",
  "eliot-skill",

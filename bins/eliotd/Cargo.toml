@@ -24,6 +24,7 @@ eliot-maintenance.workspace = true
 eliot-platform.workspace = true
 eliot-platform-windows.workspace = true
 eliot-protocol.workspace = true
+eliot-read = { path = "../../crates/governor/eliot-read" }
 eliot-receipts.workspace = true
 eliot-runtime-contracts.workspace = true
 eliot-skill.workspace = true
