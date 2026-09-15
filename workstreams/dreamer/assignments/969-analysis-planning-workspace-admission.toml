@@ -1,0 +1,137 @@
+schema = "eliot.agent-work-unit.v1"
+authority = "NON_NORMATIVE_WORKSPACE_ADMISSION_ALLOCATION"
+status = "READY_AFTER_PACKAGE_PROOFS"
+implementation_support = "STANDALONE_ANALYSIS_AND_PLANNING_PACKAGES_PRESENT_WORKSPACE_ADMISSION_OPEN"
+evidence_execution_status = "ISSUE_FAMILY_AND_PACKAGE_ROUTING_INSPECTED_TESTS_NOT_EXECUTED"
+proof_ceiling = "DREAMER_ANALYSIS_PLANNING_WORKSPACE_ADMISSION_CANDIDATE_ONLY"
+issue = 969
+package_issue_refs = [673, 675, 677, 679, 681]
+dreamer_runtime_issue = 1100
+parent_product_issue = 11
+normative_pair_ref = "docs/normative-pair.toml"
+
+[work_unit]
+cell_id = "dreamer.workspace-admission.analysis-and-planning-handlers"
+causal_property = "Independently proved conflict-analysis, development-diagnosis, maintenance, configuration and orchestration planning packages enter the root Cargo workspace in one serialized dependency-safe change without changing their semantic owners, proof ceilings, activation state or Product support."
+current_discriminator = "The five analysis/planning packages are developed as standalone crates under #673/#675/#677/#679/#681, but they are not yet admitted into one current root-workspace dependency, lockfile and test graph."
+primary_issue_url = "https://github.com/UnknownAlienHuman/eliot-memory-os/issues/969"
+
+[documentation]
+implementation = [
+  "https://github.com/UnknownAlienHuman/eliot-memory-os/blob/main/docs/architecture/I02-03-workspace-topology-and-dependency-direction.md#i23-workspace-topology-and-dependency-direction",
+  "https://github.com/UnknownAlienHuman/eliot-memory-os/blob/main/docs/architecture/I02-08-package-metadata-source-ownership-and-generated-registry.md#i28-package-metadata-source-ownership-and-generated-registry",
+  "https://github.com/UnknownAlienHuman/eliot-memory-os/blob/main/docs/architecture/I02-18-build-test-and-artifact-graph.md#i218-build-test-and-artifact-graph",
+  "https://github.com/UnknownAlienHuman/eliot-memory-os/blob/main/docs/architecture/I02-23-capability-family-topology-and-crate-extraction-decisions.md#i223-capability-family-topology-and-crate-extraction-decisions",
+  "https://github.com/UnknownAlienHuman/eliot-memory-os/blob/main/docs/architecture/I09-02-dreamer-service-responsibilities.md#i92-dreamer-service-responsibilities",
+  "https://github.com/UnknownAlienHuman/eliot-memory-os/blob/main/docs/architecture/I09-03-job-classes.md#i93-job-classes",
+  "https://github.com/UnknownAlienHuman/eliot-memory-os/blob/main/docs/architecture/I09-07-memory-transformation-validation.md#i97-memory-transformation-validation",
+  "https://github.com/UnknownAlienHuman/eliot-memory-os/blob/main/docs/architecture/I10-15-agent-execution-fabric-and-durable-swarm.md#i1015-agent-execution-fabric-and-durable-swarm",
+  "https://github.com/UnknownAlienHuman/eliot-memory-os/blob/main/docs/architecture/I14-20-canonical-runtime-lifecycle-vocabulary.md#i1420-canonical-runtime-lifecycle-vocabulary",
+  "https://github.com/UnknownAlienHuman/eliot-memory-os/blob/main/docs/architecture/I18-04-test-tiers.md#i184-test-tiers",
+]
+anchors = ["ARCH-MOD-01", "ARCH-MOD-02", "ARCH-MOD-03", "ARCH-DRM-02", "ARCH-SWM-02", "ARCH-GROUND-01"]
+
+[packages]
+expected = [
+  "crates/smart/eliot-dreamer-conflict-analysis",
+  "crates/smart/eliot-dreamer-development-diagnosis",
+  "crates/smart/eliot-dreamer-maintenance-plan",
+  "crates/smart/eliot-dreamer-configuration-plan",
+  "crates/smart/eliot-dreamer-orchestration-plan",
+]
+
+[scope]
+primary_paths = [
+  "root Cargo.toml workspace membership and shared dependencies only where the exact admitted packages require them",
+  "Cargo.lock",
+  "the five package manifests and package-local metadata/instructions",
+  "workspace build/test graph and capability-registry inputs",
+  "focused workspace-admission tests and finite fixtures",
+]
+forbidden = [
+  "semantic implementation hidden inside the admission PR",
+  "weakening, ignoring or deleting package tests to make workspace checks pass",
+  "copied public contracts or compatibility shims that become second owners",
+  "provider/model, Kernel, Store, process, network or filesystem effects",
+  "issue, branch, worktree, agent, job, schedule or route creation from orchestration planning",
+  "ambient configuration reads or writes from configuration planning",
+  "majority/confidence winner selection from conflict analysis",
+  "workspace membership treated as implementation, runtime or Product support",
+  "parallel root-manifest or lockfile admission branches",
+  "automatic GitHub workflow triggers",
+]
+
+[[waves]]
+id = "A"
+what = "Prove every candidate package independently before admission."
+how = [
+  "Require each owning Issue/PR to remove placeholder and NOT_IMPLEMENTED state and pass its declared fmt, test, Clippy and documentation suite.",
+  "Verify exact package name/version/edition/rust-version/license/source owner/public contract/module metadata and no unresolved temporary path dependency.",
+  "Reject marker-only source, ignored or zero-selected tests, duplicate semantics, permissive fallback APIs and unresolved owning Issues.",
+]
+
+[[waves]]
+id = "B"
+what = "Freeze dependency direction and semantic-owner boundaries."
+how = [
+  "Build normal, build and dev dependency graphs for the five packages and current workspace.",
+  "Require foundation -> owner-neutral contract -> pure analysis/planning candidate direction without cycles or sibling backreferences.",
+  "Reuse existing canonical contracts and typed errors; do not copy structures merely to avoid a dependency error.",
+  "Keep every package pure and candidate-only; all live evidence acquisition, runtime state, authority, effects and admission remain external owners.",
+]
+
+[[waves]]
+id = "C"
+what = "Perform one serialized workspace and lockfile admission."
+how = [
+  "Rebase once onto current main after every required package proof and prior admission wave are current.",
+  "Modify root membership/shared dependencies once and regenerate Cargo.lock only through accepted Cargo commands.",
+  "Review every lockfile package/version/source change and reject unrelated upgrades or source substitutions.",
+  "Update build/test graph and #13 capability-registry inputs while leaving Dreamer process dispatch to #1100.",
+]
+
+[[waves]]
+id = "D"
+what = "Prove package-specific semantic ceilings and workspace closure."
+how = [
+  "Conflict analysis must preserve dissent, conflicts and unknowns and never select a winner by count, confidence or recency.",
+  "Development diagnosis must remain falsifiable, Product-bound and anti-proxy; compile/activity metrics cannot become user outcome.",
+  "Maintenance plans must be finite, owner-bound and non-executing with complete stop, verifier and rollback contracts.",
+  "Configuration plans must bind one exact immutable base and typed delta without reading or mutating ambient configuration.",
+  "Orchestration plans must remain inert candidates and cannot create Issues, branches, worktrees, agents, jobs, processes, schedules, routes or authority.",
+  "Run every package suite and the affected workspace graph from one exact source, lockfile and toolchain identity.",
+]
+
+[acceptance]
+criteria = [
+  "All five owning package Issues are implemented and independently tested before root admission.",
+  "Every package appears exactly once in Cargo metadata with exact manifest and source identity and no package-name/version/source ambiguity.",
+  "Normal dependency direction is acyclic and contains no Kernel, Store, provider/model, process, network, filesystem, UI, authority, effect or Finish leakage.",
+  "Shared public types retain exactly one owner and no copied compatibility type becomes a second semantic contract.",
+  "Conflict analysis preserves every position, objection, source, minority view and unresolved assumption and cannot vote away dissent.",
+  "Development diagnosis requires a real Product gap, current discriminator, complete repair history and falsifiable rivals rather than proxy progress.",
+  "Maintenance output is finite, owner-bound and cannot schedule or execute itself.",
+  "Configuration output is bound to one exact immutable base and cannot read, merge or mutate ambient current state.",
+  "Orchestration output is candidate-only and exposes no issue, branch, worktree, agent, job, process, schedule, route, authority, effect or Finish API.",
+  "Root Cargo.toml and Cargo.lock change in one serialized admission branch after current-main rebase.",
+  "Every lockfile change is explained by the admitted graph; no unrelated dependency upgrade or registry/source change is included.",
+  "Each package remains independently testable by manifest path after workspace admission.",
+  "Package tests, affected workspace tests, Clippy, docs and dependency-boundary checks pass from one exact source/lock/toolchain identity.",
+  "Workspace metadata, build/test graph and capability registry account for every admitted package and proof entrypoint.",
+  "No runtime registry, provider route, live configuration, canonical mutation, authority, effect, task scheduling or Finish path is introduced.",
+  "Workspace membership changes no ImplementationSupport, EvidenceExecutionStatus, runtime support or Product status by itself.",
+]
+
+[verification]
+commands = [
+  "cargo fmt --all -- --check",
+  "cargo metadata --locked --format-version 1",
+  "cargo check --locked -p eliot-dreamer-conflict-analysis -p eliot-dreamer-development-diagnosis -p eliot-dreamer-maintenance-plan -p eliot-dreamer-configuration-plan -p eliot-dreamer-orchestration-plan --all-targets",
+  "cargo test --locked -p eliot-dreamer-conflict-analysis -p eliot-dreamer-development-diagnosis -p eliot-dreamer-maintenance-plan -p eliot-dreamer-configuration-plan -p eliot-dreamer-orchestration-plan --all-targets",
+  "cargo clippy --locked -p eliot-dreamer-conflict-analysis -p eliot-dreamer-development-diagnosis -p eliot-dreamer-maintenance-plan -p eliot-dreamer-configuration-plan -p eliot-dreamer-orchestration-plan --all-targets -- -D warnings",
+  "cargo doc --locked -p eliot-dreamer-conflict-analysis -p eliot-dreamer-development-diagnosis -p eliot-dreamer-maintenance-plan -p eliot-dreamer-configuration-plan -p eliot-dreamer-orchestration-plan --no-deps",
+  "python scripts/audit-architecture-boundaries.py",
+  "git diff --check",
+]
+edge_proof = "Not established by workspace admission; real Dreamer dispatch and consumer composition remain #1100."
+product_proof = "Issue #11 remains open; root membership is source/build evidence only."
