@@ -1,0 +1,164 @@
+schema = "eliot.agent-work-unit.v1"
+authority = "NON_NORMATIVE_INTEGRATION_ALLOCATION"
+routing_authority = "owning_issue_and_normative_pair_only"
+status = "BLOCKED_UNTIL_ALL_PACKAGE_PROOFS_PASS"
+implementation_support = "STANDALONE_PACKAGES_NOT_YET_ADMITTED"
+evidence_execution_status = "SOURCE_AND_ISSUE_INSPECTED_TESTS_NOT_EXECUTED"
+proof_ceiling = "DREAMER_JOB_WORKSPACE_ADMISSION_CANDIDATE_ONLY"
+issue = 969
+dreamer_runtime_issue = 1100
+registry_issue = 13
+baseline_issue = 750
+parent_product_issue = 11
+normative_pair_ref = "docs/normative-pair.toml"
+
+[work_unit]
+cell_id = "dreamer.non-curation-job-workspace-admission"
+causal_property = "Every standalone non-Curation Dreamer job family enters the root workspace only after its own semantic contract, owned tests, deterministic candidate identity, dependency boundary, proof ceiling, and owning Issue are complete; one serialized integrator changes root Cargo metadata and binds the fixed nine-job-class runtime registry."
+current_discriminator = "Conflict Analysis, Development Diagnosis, Maintenance Plan, Configuration Plan, and Orchestration Plan remain standalone with package-local implementation/proof work still open. Their owning contracts delegate shared root workspace admission to issue #969, but no accepted serialized admission change exists."
+primary_issue_url = "https://github.com/UnknownAlienHuman/eliot-memory-os/issues/969"
+
+[documentation]
+architecture = [
+  "https://github.com/UnknownAlienHuman/eliot-memory-os/blob/main/docs/architecture/A09-dreamer.md#a9-dreamer",
+]
+implementation = [
+  "https://github.com/UnknownAlienHuman/eliot-memory-os/blob/main/docs/architecture/I02-03-workspace-topology-and-dependency-direction.md#i23-workspace-topology-and-dependency-direction",
+  "https://github.com/UnknownAlienHuman/eliot-memory-os/blob/main/docs/architecture/I02-08-package-metadata-source-ownership-and-generated-registry.md#i28-package-metadata-source-ownership-and-generated-registry",
+  "https://github.com/UnknownAlienHuman/eliot-memory-os/blob/main/docs/architecture/I02-18-build-test-and-artifact-graph.md#i218-build-test-and-artifact-graph",
+  "https://github.com/UnknownAlienHuman/eliot-memory-os/blob/main/docs/architecture/I02-22-parallel-build-cache-artifact-and-environment-lanes.md#i222-parallel-build-cache-artifact-and-environment-lanes",
+  "https://github.com/UnknownAlienHuman/eliot-memory-os/blob/main/docs/architecture/I02-23-capability-family-topology-and-crate-extraction-decisions.md#i223-capability-family-topology-and-crate-extraction-decisions",
+  "https://github.com/UnknownAlienHuman/eliot-memory-os/blob/main/docs/architecture/I09-02-dreamer-service-responsibilities.md#i92-dreamer-service-responsibilities",
+  "https://github.com/UnknownAlienHuman/eliot-memory-os/blob/main/docs/architecture/I09-03-job-classes.md#i93-job-classes",
+  "https://github.com/UnknownAlienHuman/eliot-memory-os/blob/main/docs/architecture/I09-04-dreamer-input-bundle.md#i94-dreamer-input-bundle",
+  "https://github.com/UnknownAlienHuman/eliot-memory-os/blob/main/docs/architecture/I09-05-dream-packet.md#i95-dream-packet",
+  "https://github.com/UnknownAlienHuman/eliot-memory-os/blob/main/docs/architecture/I09-07-memory-transformation-validation.md#i97-memory-transformation-validation",
+  "https://github.com/UnknownAlienHuman/eliot-memory-os/blob/main/docs/architecture/I18-04-test-tiers.md#i184-test-tiers",
+]
+anchors = ["ARCH-DRM-01", "ARCH-DRM-02", "ARCH-DRM-03", "ARCH-DRM-04", "ARCH-MOD-01", "ARCH-MOD-02", "ARCH-GROUND-01"]
+
+[package_denominator]
+paths = [
+  "crates/smart/eliot-dreamer-conflict-analysis",
+  "crates/smart/eliot-dreamer-development-diagnosis",
+  "crates/smart/eliot-dreamer-maintenance-plan",
+  "crates/smart/eliot-dreamer-configuration-plan",
+  "crates/smart/eliot-dreamer-orchestration-plan",
+]
+job_classes = [
+  "ConflictAnalysis",
+  "DevelopmentDiagnosis",
+  "MaintenancePlan",
+  "ConfigurationPlan",
+  "OrchestrationPlan",
+]
+
+[current_source]
+confirmed = [
+  "The five packages remain outside the root workspace until their package-local implementation and proof Issues complete.",
+  "Their owning contracts prohibit local root Cargo.toml/Cargo.lock edits and delegate admission to #969.",
+  "Standalone package proof cannot establish compatibility with the canonical nine-job-class registry, shared input/result envelopes, root feature resolution, lockfile closure, reverse consumers, or production Dreamer composition.",
+  "Root Cargo.toml and Cargo.lock require one serialized integrator and cannot be edited independently by the five packages.",
+]
+
+[scope]
+primary_paths = [
+  "root Cargo.toml",
+  "root Cargo.lock",
+  "exact package Cargo.toml/module.toml metadata required for admission",
+  "generated capability-cell/package registry inputs required by #13",
+  "fixed Dreamer job-class registry and one #1100 runtime composition consumer",
+  "directly relevant workspace conformance fixtures",
+]
+read_only_package_paths = [
+  "all source/tests under package_denominator; package behavior remains owned by each package Issue",
+]
+serialized_dependencies = [
+  "#673 Conflict Analysis",
+  "#675 Development Diagnosis",
+  "#677 Maintenance Plan",
+  "#679 Configuration Plan",
+  "#681 Orchestration Plan",
+  "#13 capability registry",
+  "#750 ordinary baseline",
+  "#1100 Dreamer runtime",
+  "#11 Product proof",
+]
+forbidden = [
+  "admitting a NOT_IMPLEMENTED, placeholder, empty, unowned, zero-test, or unexecuted package",
+  "changing package semantics, public contracts, or acceptance criteria in the admission PR",
+  "creating a tenth Dreamer job class, generic fallback, Other variant, prose dispatch, or dynamic handler discovery",
+  "redefining shared job/input/result/identity contracts inside the packages",
+  "using workspace membership or compilation as implementation-support, runtime, or Product proof",
+  "parallel root Cargo.toml/Cargo.lock writers",
+  "automatic workflow triggers",
+]
+
+[[waves]]
+id = "A"
+what = "Freeze the exact five-package denominator and current package-proof receipts."
+how = [
+  "For every package, record owning Issue/PR, current source tree, public contract/schema revisions, implementation-support state, executed package check/test/Clippy/doc receipts, owned test denominator, proof ceiling, dependency closure, local instructions, and unresolved blind boundaries.",
+  "Reject missing, stale, changed-tree, NOT_IMPLEMENTED, placeholder, zero-test, ignored-only, unknown-owner, failed, unexecuted, or incomplete load-bearing evidence.",
+  "Keep each package's Module Proof distinct from the combined workspace-admission receipt.",
+]
+
+[[waves]]
+id = "B"
+what = "Validate shared ownership and fixed job-class topology before root edits."
+how = [
+  "Prove the canonical Dreamer job enum remains the fixed nine-class vocabulary and each of these five classes maps to exactly one package/owner.",
+  "Prove shared job, bundle, packet, candidate/result, identity, policy, evidence, error, and lifecycle types have one lowest-dependency owner and are imported rather than redefined.",
+  "Prove packages remain pure candidate/planning/analysis owners with no direct Store/provider/process/authority/canonical/effect/Finish dependency.",
+  "Reject dependency cycles, semantic-owner overlap, generic fallback, dynamic dispatch by prose, undeclared optional dependencies, or test-only dependencies in normal closure.",
+]
+
+[[waves]]
+id = "C"
+what = "Perform one serialized root workspace, registry, and lockfile admission."
+how = [
+  "Add all qualifying members explicitly in deterministic order and do not use a broad glob.",
+  "Update shared workspace dependencies only for real shared dependencies with exact versions/features/default-feature policy.",
+  "Regenerate Cargo.lock once from the accepted root manifest and account for every new package/version/feature edge.",
+  "Update #13 registry inputs and the fixed #1100 Dreamer runtime job registry in the same identity-bound change.",
+]
+
+[[waves]]
+id = "D"
+what = "Prove combined job registry, dispatch, replay, failure, and ordinary-test behavior."
+how = [
+  "Run root metadata, check, test, Clippy, docs, dependency boundary, feature, duplicate-type, job-class coverage, exact-one-owner dispatch, replay/conflict, cancellation, partial/unknown, and no-fallback tests.",
+  "Construct the production job registry and dispatch one valid fixture per admitted job class, while stale/foreign/malformed/unadmitted inputs call zero job owners.",
+  "Re-run #750 and account for every new package/target/test row without hiding previous failures, exclusions, or zero-selected targets.",
+]
+
+[acceptance]
+criteria = [
+  "The exact five-package denominator is frozen and every package has one current owning Issue/PR and executed proof bound to its current source tree.",
+  "No package with NOT_IMPLEMENTED, placeholder, missing owner/contract, zero owned tests, failed/unexecuted checks, or unresolved load-bearing blind boundary is admitted.",
+  "The canonical Dreamer registry remains exactly nine job classes and each of these five classes maps to one package/owner with no overlap, Other, generic fallback, or prose/dynamic discovery.",
+  "Shared job/bundle/packet/result/identity/error/lifecycle contracts have one owner and no duplicate ontology enters the workspace.",
+  "Dependency direction remains acyclic and the packages contain no direct Store/provider/process/authority/canonical/effect/Finish closure.",
+  "Root members are explicit and deterministic; future package directories cannot enter automatically.",
+  "Cargo.lock changes are fully explained by the reviewed manifest closure and every dependency/version/feature edge is accounted for.",
+  "Locked metadata, workspace check/test/Clippy/docs, package proofs, dependency/feature audits, fixed-registry coverage, exact dispatch, replay/conflict, and no-fallback tests pass.",
+  "Stale, malformed, unadmitted, foreign-fence, expired, cancelled, partial, and unknown inputs invoke zero unintended job owners and remain typed.",
+  "#750 includes every newly admitted package/target/test and loses no previous denominator row.",
+  "#13 resolves every package to one capability cell, contract owner, state/statelessness, proof entrypoint, and proof ceiling while keeping workspace admission separate from runtime/Product support.",
+  "#1100 remains the production execution owner and #11 remains installed Product-proof owner.",
+]
+
+[verification]
+commands = [
+  "cargo metadata --locked --all-features --format-version 1",
+  "cargo fmt --all -- --check",
+  "cargo check --locked --workspace --all-targets",
+  "cargo test --locked --workspace --all-targets --no-fail-fast",
+  "cargo clippy --locked --workspace --all-targets -- -D warnings",
+  "cargo doc --locked --workspace --no-deps",
+  "python scripts/audit-architecture-boundaries.py",
+  "python scripts/crate_reachability_inventory.py --repo-root . --output .eliot/dreamer-job-workspace-admission.json",
+  "git diff --check",
+]
+edge_proof = "Build the fixed nine-job-class registry and dispatch all five newly admitted classes plus stale, malformed, foreign-fence, cancelled, partial, unknown, replay/conflict, and owner-error fixtures under one current source identity."
+product_proof = "Issue #1100 owns runtime execution and #11 owns installed Product proof; this PR establishes root-workspace and registry/source admission only."
