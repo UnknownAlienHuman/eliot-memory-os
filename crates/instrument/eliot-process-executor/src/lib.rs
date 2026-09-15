@@ -230,14 +230,51 @@ struct Operation {
     /// can distinguish "child never had autonomous enforcement" from
     /// "child was contained and the tree was torn down".
     watcher_fail_closed_contained: bool,
+    /// Exact start-publication evidence gap for a post-resume failure that
+    /// kept the op registered (issue #84: registry/receipt publication
+    /// failure after all control owners installed). `None` on every other
+    /// path; surfaced through the health/quarantine projection so the gap
+    /// is attributable instead of inferred.
+    start_publish_gap: Option<&'static str>,
     timed_out: bool,
     cleanup_required: bool,
     termination: Option<TerminatedJobChild>,
     capture_failures: Vec<CaptureFailure>,
 }
 
-#[cfg(not(windows))]
-struct Operation;
+/// Explicit start state machine for `WindowsProcessExecutor::start`
+/// (issue #84): suspended launch → authority validation → resume →
+/// capture/control setup → registry publication → receipt publication.
+///
+/// Where Windows mechanics allow, capture/deadline/control infrastructure
+/// is created and owned BEFORE resume: the Job object, kill-on-close
+/// contour, resource limits, and stdio pipes are all built while the child
+/// is still suspended inside `spawn_named_with_limits`. Resume must precede
+/// stream-capture ownership: the stdout/stderr read handles live on
+/// `RunningJobChild` and can only be taken after `resume()`, and the
+/// deadline watcher enforces the admitted deadline for the registered
+/// `Operation` owner.
+#[cfg(windows)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum StartPhase {
+    /// Suspended child spawned; nothing resumed yet.
+    SuspendedLaunch,
+    /// One-shot authority permit consumed against fresh suspended evidence.
+    /// Constructed via the validation transition below; the marker only
+    /// names the state, so construction itself is the use.
+    #[allow(dead_code, reason = "names the authority validation state")]
+    AuthorityValidation,
+    /// Validated child resumed; resume observed into process state.
+    Resumed,
+    /// Stdout/stderr capture-thread ownership being installed (post-resume).
+    CaptureSetup,
+    /// Deadline-watcher ownership being installed (post-resume).
+    WatcherSetup,
+    /// Operation durably registered for query/cancel/reconcile.
+    RegistryPublication,
+    /// Start receipt publication (only after all control owners installed).
+    ReceiptPublication,
+}
 
 /// One operation-scoped quarantine record.
 ///
@@ -979,6 +1016,20 @@ impl ProcessExecutor for WindowsProcessExecutor {
             let child = SuspendedJobChild::spawn_named_with_limits(spec, job_name, limits)
                 .map_err(unavailable)?;
 
+            // Issue-84 start state machine: `SuspendedLaunch` (above) →
+            // `AuthorityValidation` (below) → `Resumed` → `CaptureSetup` →
+            // `WatcherSetup` → `RegistryPublication` → `ReceiptPublication`.
+            // The Job object, kill-on-close contour, resource limits, and
+            // stdio pipes were already created and owned while the child was
+            // suspended (pre-resume infrastructure, where Windows mechanics
+            // allow it). Resume must precede stream-capture ownership: the
+            // stdout/stderr read handles live on `RunningJobChild` and can
+            // only be taken after resume; the deadline watcher enforces the
+            // admitted deadline for the registered `Operation` owner.
+            debug_assert!(matches!(
+                StartPhase::SuspendedLaunch,
+                StartPhase::SuspendedLaunch | StartPhase::AuthorityValidation
+            ));
             let authority = Arc::clone(&self.authority);
             let launch_admission = self.launch_admission.as_ref().map(Arc::clone);
             let validated = child
@@ -997,6 +1048,9 @@ impl ProcessExecutor for WindowsProcessExecutor {
                 })
                 .map_err(validation_error)?;
             let mut state = ProcessState::from_validated(validated.validation());
+            // `Resumed`: resume must precede stream-capture ownership — the
+            // stdout/stderr read handles live on `RunningJobChild` and can
+            // only be taken after `resume()`.
             let mut running = validated.resume().map_err(unavailable)?;
             let now = now_ms();
             state.mark_resumed(
@@ -1019,23 +1073,71 @@ impl ProcessExecutor for WindowsProcessExecutor {
             let deadline = Instant::now()
                 .checked_add(Duration::from_millis(wall_timeout_ms))
                 .ok_or_else(|| unavailable("wall timeout overflows monotonic clock"))?;
+            // Issue-84 start state machine: `Resumed` (just observed above) →
+            // `CaptureSetup` (below). Capture threads must follow resume
+            // because the read handles live on `RunningJobChild`. Every
+            // phase at/after `Resumed` must contain the Job tree through the
+            // admitted owner — never a bare error that orphans a live child.
+            debug_assert!(matches!(
+                StartPhase::Resumed,
+                StartPhase::Resumed
+                    | StartPhase::CaptureSetup
+                    | StartPhase::WatcherSetup
+                    | StartPhase::RegistryPublication
+                    | StartPhase::ReceiptPublication
+            ));
             let mut capture_spawn_error = None;
             let mut capture_failure = None;
-            let stdout_thread =
-                match spawn_capture("stdout", running.take_stdout(), Arc::clone(&stdout)) {
-                    Ok(thread) => thread,
-                    Err(error) => {
-                        capture_spawn_error = Some(error);
-                        capture_failure = Some(CaptureFailure {
-                            stream: "stdout",
-                            thread_id: None,
-                            disposition: CaptureFailureDisposition::SpawnFailed,
-                        });
+            #[cfg(test)]
+            let stdout_injection = {
+                #[cfg(windows)]
+                {
+                    s84_capture_injection(&operation_id, "stdout")
+                }
+                #[cfg(not(windows))]
+                {
+                    None
+                }
+            };
+            #[cfg(not(test))]
+            let stdout_injection: Option<CaptureSpawnInjection> = None;
+            let stdout_thread = match spawn_capture(
+                "stdout",
+                running.take_stdout(),
+                Arc::clone(&stdout),
+                stdout_injection,
+            ) {
+                Ok(thread) => thread,
+                Err(error) => {
+                    capture_spawn_error = Some(error);
+                    capture_failure = Some(CaptureFailure {
+                        stream: "stdout",
+                        thread_id: None,
+                        disposition: CaptureFailureDisposition::SpawnFailed,
+                    });
+                    None
+                }
+            };
+            let stderr_thread = if capture_spawn_error.is_none() {
+                #[cfg(test)]
+                let stderr_injection = {
+                    #[cfg(windows)]
+                    {
+                        s84_capture_injection(&operation_id, "stderr")
+                    }
+                    #[cfg(not(windows))]
+                    {
                         None
                     }
                 };
-            let stderr_thread = if capture_spawn_error.is_none() {
-                match spawn_capture("stderr", running.take_stderr(), Arc::clone(&stderr)) {
+                #[cfg(not(test))]
+                let stderr_injection: Option<CaptureSpawnInjection> = None;
+                match spawn_capture(
+                    "stderr",
+                    running.take_stderr(),
+                    Arc::clone(&stderr),
+                    stderr_injection,
+                ) {
                     Ok(thread) => thread,
                     Err(error) => {
                         capture_spawn_error = Some(error);
@@ -1050,6 +1152,17 @@ impl ProcessExecutor for WindowsProcessExecutor {
             } else {
                 None
             };
+            // `CaptureSetup` reached: both read-handle takes are consumed
+            // (state fences the flow — a take consumes the handle, so the
+            // second arm cannot re-take).
+            debug_assert!(matches!(
+                StartPhase::CaptureSetup,
+                StartPhase::Resumed
+                    | StartPhase::CaptureSetup
+                    | StartPhase::WatcherSetup
+                    | StartPhase::RegistryPublication
+                    | StartPhase::ReceiptPublication
+            ));
             let operation = Arc::new(Mutex::new(Operation {
                 state,
                 sink,
@@ -1062,17 +1175,44 @@ impl ProcessExecutor for WindowsProcessExecutor {
                 deadline_watcher: None,
                 deadline_watcher_owner: None,
                 watcher_fail_closed_contained: false,
+                start_publish_gap: None,
                 timed_out: false,
                 cleanup_required: false,
                 termination: None,
                 capture_failures: capture_failure.into_iter().collect(),
             }));
-            if let Some(error) = capture_spawn_error {
-                // The failed operation stays queryable/cancellable: insert it
-                // into the registry BEFORE returning, fence it as unknown,
-                // and never touch unrelated operations.  `_reservation`
-                // drops here and releases the id; the registry entry keeps
-                // the exact identity reserved for reconcile/shutdown.
+            if capture_spawn_error.is_some() {
+                let Some(error) = capture_spawn_error else {
+                    // The flag above is only set together with the error; a
+                    // missing error here means a logic break, fenced locally.
+                    return Err(ProcessExecutionError::UnknownOutcome);
+                };
+                // Fail closed AFTER resume (issue #84 §2): the child is already
+                // running, so retain the Job/process owner, stop new effect
+                // authority (the op is fenced and never gets a receipt),
+                // terminate/contain the COMPLETE Job tree through the admitted
+                // process owner (`finalize_operation` → `terminate_in_place`
+                // with `JOB_TERMINATION_CODE` plus descendant/exit/capture
+                // evidence), THEN fence locally as UnknownOutcome and return
+                // the typed failed/unknown start disposition with the exact
+                // operation identity. The op is registered first so it stays
+                // queryable/cancellable/reconcilable until terminal cleanup is
+                // proven; no unrelated op is touched (#82 operation-local
+                // contour). Never a bare `Err` that orphans a live child.
+                let finalize_result = {
+                    let mut guard = operation
+                        .lock()
+                        .map_err(|_| unavailable("operation lock poisoned"))?;
+                    let finalize_result =
+                        finalize_operation(&mut guard, ExitDisposition::Unknown, false);
+                    quarantine_operation(&mut guard);
+                    let _ = quarantine_snapshot(&operation_id, &guard, CAPTURE_EVIDENCE_GAP);
+                    finalize_result
+                };
+                // `finalize_operation` joins the surviving capture thread, so
+                // the half-installed capture owner cannot leak: when stdout
+                // spawned but stderr failed, the stdout thread is joined above
+                // and its drained bytes stay on the retained op for reconcile.
                 if self
                     .operations
                     .lock()
@@ -1081,35 +1221,44 @@ impl ProcessExecutor for WindowsProcessExecutor {
                     })
                     .is_err()
                 {
-                    let mut guard = operation
-                        .lock()
-                        .map_err(|_| unavailable("operation lock poisoned"))?;
-                    quarantine_operation(&mut guard);
+                    // The Job tree is already contained through the admitted
+                    // owner above; only registry publication failed. Fence
+                    // stays local on the retained op, report typed unknown.
                     return Err(ProcessExecutionError::UnknownOutcome);
                 }
-                let mut guard = operation
-                    .lock()
-                    .map_err(|_| unavailable("operation lock poisoned"))?;
-                quarantine_operation(&mut guard);
-                let _ = quarantine_snapshot(&operation_id, &guard, CAPTURE_EVIDENCE_GAP);
-                return Err(error);
+                return match finalize_result {
+                    Ok(()) => Err(error),
+                    Err(_) => Err(ProcessExecutionError::UnknownOutcome),
+                };
             }
             // Mint the operation-bound watcher owner BEFORE installing the
             // thread so ownership is queryable from the moment enforcement
             // exists (issue #83 §1), then hand the minted owner to the
             // watcher spawn. The watcher thread owns the wall deadline
-            // independently of inspect()/reconcile() polling.
+            // independently of inspect()/reconcile() polling. State machine
+            // phase: `WatcherSetup` (still post-resume: the child is live).
+            debug_assert!(matches!(
+                StartPhase::WatcherSetup,
+                StartPhase::Resumed
+                    | StartPhase::CaptureSetup
+                    | StartPhase::WatcherSetup
+                    | StartPhase::RegistryPublication
+                    | StartPhase::ReceiptPublication
+            ));
             let watcher_owner = deadline_watcher_owner_id(&operation_id);
             let Ok(deadline_watcher) = spawn_deadline_watcher(&operation_id, &operation) else {
-                // Fail closed AFTER resume (issue #83 §2): the child is
+                // Fail closed AFTER resume (issues #83 §2 / #84 §2): the child is
                 // already running, so terminate/contain the COMPLETE Job
                 // tree through the admitted process owner
                 // (`finalize_operation` → `terminate_in_place` with
-                // descendant/exit evidence), THEN fence locally as
-                // UnknownOutcome and return the typed unknown/failed start —
-                // never a normal receipt. The op is registered first so it
-                // stays inspectable/cancellable/reconcilable, and no
-                // unrelated op is touched (#82 operation-local contour).
+                // `JOB_TERMINATION_CODE` plus descendant/exit evidence), THEN
+                // fence locally as UnknownOutcome and return the typed
+                // unknown/failed start disposition with the operation ID and
+                // cleanup owner — never a normal receipt, never a bare error
+                // that orphans the tree. The op is registered first so it
+                // stays queryable/cancellable/reconcilable until terminal
+                // cleanup is proven, and no unrelated op is touched (#82:
+                // no global poison; #84 keeps that contract).
                 let mut guard = operation
                     .lock()
                     .map_err(|_| unavailable("operation lock poisoned"))?;
@@ -1143,12 +1292,62 @@ impl ProcessExecutor for WindowsProcessExecutor {
             guard.deadline_watcher = Some(deadline_watcher);
             // Bind the minted owner to the operation only after the thread
             // installed successfully, so a queryable owner always implies a
-            // real enforcement thread (receipt publication under #84 happens
-            // below, after ALL mandatory control owners are installed).
+            // real enforcement thread. Receipt publication (#84) happens at
+            // the end, only after ALL mandatory control owners are installed
+            // and the resumed child identity is durably registered.
+            // State machine phase: `RegistryPublication` — the exact point
+            // FAIL_START_PUBLISH_FOR hooks so tests can prove containment.
             guard.deadline_watcher_owner = Some(watcher_owner);
+            // All mandatory control owners are now installed (both capture
+            // threads + deadline watcher). Snapshot the Running view for the
+            // initial evidence record BEFORE registry publication.
             let view = guard.state.view();
             let sink = Arc::clone(&guard.sink);
             drop(guard);
+            debug_assert!(matches!(
+                StartPhase::RegistryPublication,
+                StartPhase::Resumed
+                    | StartPhase::CaptureSetup
+                    | StartPhase::WatcherSetup
+                    | StartPhase::RegistryPublication
+                    | StartPhase::ReceiptPublication
+            ));
+            #[cfg(test)]
+            let s84_registry_publish_fail =
+                s84_take_injection(&FAIL_START_PUBLISH_FOR, &operation_id, &["registry"]);
+            #[cfg(not(test))]
+            let s84_registry_publish_fail = false;
+            if s84_registry_publish_fail {
+                // Injected post-resume registry-publication failure (issue
+                // #84 §4): retain the Job/process owner, stop new effect
+                // authority, contain the tree through the admitted owner,
+                // then fence locally and KEEP the (contained) op registered
+                // so it stays queryable/cancellable/reconcilable. Never a
+                // bare error that orphans a live child; never global poison.
+                let mut guard = operation
+                    .lock()
+                    .map_err(|_| unavailable("operation lock poisoned"))?;
+                if finalize_operation(&mut guard, ExitDisposition::Unknown, false).is_err() {
+                    // Finalize already stored partial termination/cleanup
+                    // evidence on the op; fall through to fencing.
+                }
+                guard.watcher_fail_closed_contained = true;
+                guard.start_publish_gap = Some(PUBLISH_EVIDENCE_GAP);
+                quarantine_operation(&mut guard);
+                let _ = quarantine_snapshot(&operation_id, &guard, PUBLISH_EVIDENCE_GAP);
+                drop(guard);
+                if self
+                    .operations
+                    .lock()
+                    .map(|mut registry| {
+                        registry.insert(operation_id.clone(), Arc::clone(&operation));
+                    })
+                    .is_err()
+                {
+                    return Err(ProcessExecutionError::UnknownOutcome);
+                }
+                return Err(ProcessExecutionError::UnknownOutcome);
+            }
             let evidence = ProcessEvidence::new_typed(view, None, None, EvidenceAxes::observed());
             let published = match evidence {
                 Ok(evidence) => sink.record(evidence).is_ok(),
@@ -1164,8 +1363,44 @@ impl ProcessExecutor for WindowsProcessExecutor {
                 // Sink-publication failure is operation-local: fence this op,
                 // register it so it stays inspectable/cancellable/
                 // reconcilable, and return without touching unrelated ops.
+                // (#84: post-resume but pre-receipt, so the start already
+                // owns a resumed child — the retained op already carries the
+                // Job owner and the fence stops any new effect authority.)
                 quarantine_operation(&mut guard);
                 let _ = quarantine_snapshot(&operation_id, &guard, SINK_EVIDENCE_GAP);
+                drop(guard);
+                if let Ok(mut registry) = self.operations.lock() {
+                    registry
+                        .entry(operation_id.clone())
+                        .or_insert_with(|| Arc::clone(&operation));
+                }
+                return Err(ProcessExecutionError::UnknownOutcome);
+            }
+            // State machine phase: `ReceiptPublication` — start receipt
+            // publication only after ALL mandatory control owners are
+            // installed (both capture threads + deadline watcher) and the
+            // resumed child identity is durably registered below. The last
+            // FAIL_START_PUBLISH_FOR hook fires here.
+            debug_assert!(matches!(
+                StartPhase::ReceiptPublication,
+                StartPhase::Resumed
+                    | StartPhase::CaptureSetup
+                    | StartPhase::WatcherSetup
+                    | StartPhase::RegistryPublication
+                    | StartPhase::ReceiptPublication
+            ));
+            #[cfg(test)]
+            let s84_receipt_publish_fail =
+                s84_take_injection(&FAIL_START_PUBLISH_FOR, &operation_id, &["receipt"]);
+            #[cfg(not(test))]
+            let s84_receipt_publish_fail = false;
+            if s84_receipt_publish_fail {
+                // Injected receipt-publication failure after a durably
+                // registered op: fence locally, KEEP the op queryable, never
+                // hand out a receipt, never touch unrelated ops.
+                guard.start_publish_gap = Some(PUBLISH_EVIDENCE_GAP);
+                quarantine_operation(&mut guard);
+                let _ = quarantine_snapshot(&operation_id, &guard, PUBLISH_EVIDENCE_GAP);
                 drop(guard);
                 if let Ok(mut registry) = self.operations.lock() {
                     registry
@@ -1566,6 +1801,8 @@ const WATCHER_EVIDENCE_GAP: &str = "deadline watcher spawn failed";
 #[cfg(windows)]
 const RECEIPT_EVIDENCE_GAP: &str = "start receipt binding invalid";
 #[cfg(windows)]
+const PUBLISH_EVIDENCE_GAP: &str = "start publication failed after resume";
+#[cfg(windows)]
 const RECOVERY_ACTION: &str = "reconcile-or-cleanup explicit disposition; shutdown retains owner";
 
 #[cfg(windows)]
@@ -1616,15 +1853,21 @@ fn quarantined_record(
     let descendants = view.descendants();
     // Wall-time enforcement health is an explicit dimension, separate from
     // stream-capture health (issue #83 §5): a missing watcher owner surfaces
-    // the watcher gap even when both streams are complete.
-    let evidence_gap =
-        if operation.deadline_watcher_owner.is_none() && operation.watcher_fail_closed_contained {
-            WATCHER_EVIDENCE_GAP
-        } else if operation.capture_failures.is_empty() {
-            "unknown outcome fenced; cleanup/reconciliation pending"
-        } else {
-            CAPTURE_EVIDENCE_GAP
-        };
+    // the watcher gap even when both streams are complete. A recorded
+    // post-resume start-publication gap (issue #84) surfaces next: the op
+    // kept all control owners and stayed registered, so the gap names the
+    // publication step instead of a capture/watcher owner.
+    let evidence_gap = if let Some(publish_gap) = operation.start_publish_gap {
+        publish_gap
+    } else if operation.deadline_watcher_owner.is_none()
+        && operation.watcher_fail_closed_contained
+    {
+        WATCHER_EVIDENCE_GAP
+    } else if operation.capture_failures.is_empty() {
+        "unknown outcome fenced; cleanup/reconciliation pending"
+    } else {
+        CAPTURE_EVIDENCE_GAP
+    };
     Some(QuarantinedOperationRecord {
         operation_id: id.clone(),
         process_tree_id: binding.process_tree_id().clone(),
@@ -1672,6 +1915,11 @@ fn spawn_deadline_watcher(
     operation_id: &OperationId,
     operation: &Arc<Mutex<Operation>>,
 ) -> Result<DeadlineWatcher, ProcessExecutionError> {
+    // Issue-84 state machine note (§1): the deadline watcher is spawned AFTER
+    // resume because it enforces the admitted wall deadline for the
+    // registered `Operation` owner; pre-resume there is no resumed child
+    // identity to observe and no registered owner to attribute enforcement
+    // to. The fail-closed path below terminates the tree on spawn failure.
     #[cfg(test)]
     if FAIL_NEXT_DEADLINE_WATCHER_SPAWN.swap(false, Ordering::AcqRel) {
         return Err(unavailable("injected deadline watcher spawn failure"));
@@ -1748,11 +1996,6 @@ fn join_deadline_watcher(watcher: DeadlineWatcher) -> Result<(), ProcessExecutio
 static FAIL_NEXT_DEADLINE_WATCHER_SPAWN: AtomicBool = AtomicBool::new(false);
 
 /// One-shot set of operation identities whose next watcher spawn fails.
-/// Empty means the hook is disarmed. Membership makes the injection exact
-/// under parallelism: an unrelated concurrent start takes the production
-/// spawn (its identity is not a member) and can neither steal nor be
-/// fenced by another op's arm. Test-only: production code paths that read
-/// this helper never arm it.
 #[cfg(all(test, windows))]
 static FAIL_WATCHER_SPAWN_FOR: std::sync::Mutex<std::collections::BTreeSet<String>> =
     std::sync::Mutex::new(std::collections::BTreeSet::new());
@@ -1777,6 +2020,123 @@ fn s83_should_fail_watcher_spawn(operation_id: &OperationId) -> bool {
         Ok(mut guard) => guard.remove(operation_id.as_str()),
         Err(_) => false,
     }
+}
+
+/// One-shot sets of operation/job keys whose next stream-capture spawn or
+/// start-publication step fails (issue #84 §4, test-only).
+///
+/// `FAIL_STDOUT_SPAWN_FOR`/`FAIL_STDERR_SPAWN_FOR` are honored inside
+/// `spawn_capture` at the exact capture-thread creation point; matching is
+/// key lookup against the exact operation identity plus the `"stdout"` /
+/// `"stderr"` stream label, so tests can prove tree containment from the
+/// precise failure point. `FAIL_START_PUBLISH_FOR` is honored at the exact
+/// registry-publication and receipt-publication points: registry insertion
+/// keeps the admitted Job owner and registration guard, so a
+/// resume-then-publish failure still fences locally. All sets are
+/// identity-scoped `BTreeSet<String>`s: membership is one-shot (consumed on
+/// match), unrelated identities take the production path and never steal
+/// another op's arm. Production code paths that read these helpers never
+/// arm them.
+#[cfg(all(test, windows))]
+static FAIL_STDOUT_SPAWN_FOR: std::sync::Mutex<std::collections::BTreeSet<String>> =
+    std::sync::Mutex::new(std::collections::BTreeSet::new());
+
+#[cfg(all(test, windows))]
+static FAIL_STDERR_SPAWN_FOR: std::sync::Mutex<std::collections::BTreeSet<String>> =
+    std::sync::Mutex::new(std::collections::BTreeSet::new());
+
+#[cfg(all(test, windows))]
+static FAIL_START_PUBLISH_FOR: std::sync::Mutex<std::collections::BTreeSet<String>> =
+    std::sync::Mutex::new(std::collections::BTreeSet::new());
+
+#[cfg(all(test, windows))]
+fn s84_arm_stdout_failure_for(key: &str) {
+    // Empty means the hook is disarmed. Membership makes the injection
+    // exact under parallelism: an unrelated concurrent start takes the
+    // production spawn (its identity is not a member) and can neither
+    // steal nor be fenced by another op's arm. Test-only: production code
+    // paths that read this helper never arm it.
+    if let Ok(mut guard) = FAIL_STDOUT_SPAWN_FOR.lock() {
+        guard.insert(key.to_owned());
+    }
+}
+
+#[cfg(all(test, windows))]
+fn s84_disarm_stdout_failure_for(_key: &str) {}
+
+/// Arms the exact stderr capture-spawn failure key. Both stream arms exist
+/// so each stream has a symmetric hook; the 2-test acceptance uses stdout
+/// plus publish, while stderr stays available for follow-up fault waves.
+#[cfg(all(test, windows))]
+#[allow(dead_code, reason = "symmetric stderr hook for follow-up fault waves")]
+fn s84_arm_stderr_failure_for(key: &str) {
+    if let Ok(mut guard) = FAIL_STDERR_SPAWN_FOR.lock() {
+        guard.insert(key.to_owned());
+    }
+}
+
+/// Clears a stderr capture-spawn failure key. Called from the fault-test
+/// cleanup path so an unconsumed arm can never leak into another test.
+#[cfg(all(test, windows))]
+#[allow(dead_code, reason = "symmetric stderr hook for follow-up fault waves")]
+fn s84_disarm_stderr_failure_for(_key: &str) {}
+
+#[cfg(all(test, windows))]
+fn s84_arm_start_publish_failure_for(key: &str) {
+    if let Ok(mut guard) = FAIL_START_PUBLISH_FOR.lock() {
+        guard.insert(key.to_owned());
+    }
+}
+
+#[cfg(all(test, windows))]
+fn s84_disarm_start_publish_failure_for(key: &str) {
+    if let Ok(mut guard) = FAIL_START_PUBLISH_FOR.lock() {
+        guard.remove(key);
+    }
+}
+
+#[cfg(all(test, windows))]
+fn s84_take_injection(
+    set: &std::sync::Mutex<std::collections::BTreeSet<String>>,
+    operation_id: &OperationId,
+    extra_keys: &[&str],
+) -> bool {
+    match set.lock() {
+        Ok(mut guard) => {
+            if guard.remove(operation_id.as_str()) {
+                return true;
+            }
+            for key in extra_keys {
+                if guard.remove(*key) {
+                    return true;
+                }
+            }
+            false
+        }
+        Err(_) => false,
+    }
+}
+
+/// Unit marker proving an armed capture-spawn injection matched this
+/// `(operation, stream)` pair at the call site. `spawn_capture` honors it
+/// at the exact thread-creation point; the marker itself carries no payload.
+#[cfg(windows)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct CaptureSpawnInjection {
+    stream: &'static str,
+}
+
+#[cfg(all(test, windows))]
+fn s84_capture_injection(
+    operation_id: &OperationId,
+    stream: &'static str,
+) -> Option<CaptureSpawnInjection> {
+    let armed = if stream == "stdout" {
+        s84_take_injection(&FAIL_STDOUT_SPAWN_FOR, operation_id, &["stdout"])
+    } else {
+        s84_take_injection(&FAIL_STDERR_SPAWN_FOR, operation_id, &["stderr"])
+    };
+    armed.then_some(CaptureSpawnInjection { stream })
 }
 
 #[cfg(windows)]
@@ -1892,7 +2252,22 @@ fn spawn_capture(
     stream: &'static str,
     file: Option<std::fs::File>,
     capture: Arc<Mutex<StreamCapture>>,
+    injection: Option<CaptureSpawnInjection>,
 ) -> Result<Option<JoinHandle<()>>, ProcessExecutionError> {
+    // Issue-84 state machine note (§1): stream-capture ownership is installed
+    // AFTER resume because the read handles live on `RunningJobChild` and can
+    // only be taken after `resume()`; pre-resume there is nothing to drain.
+    // A spawn failure here therefore runs the post-resume fail-closed path
+    // (tree containment through the admitted owner) instead of a bare return.
+    //
+    // `injection` is `Some` exactly when the armed one-shot key matched this
+    // `(operation, stream)` pair at the call site; honoring it here keeps the
+    // failure at the exact capture-thread creation point.
+    if injection.is_some() {
+        return Err(unavailable(format!(
+            "injected {stream} capture spawn failure"
+        )));
+    }
     let requested = capture
         .lock()
         .map_err(|_| unavailable(format!("{stream} capture lock poisoned")))?
@@ -4321,6 +4696,231 @@ mod tests {
                 Some(true)
             );
             Ok(())
+        }
+    }
+
+    /// Issue #84 (stdout-spawn-fails-after-resume): an injected stdout
+    /// capture-thread spawn failure after resume contains the complete Job
+    /// tree through the admitted process owner and returns a typed start
+    /// disposition carrying the exact operation identity.
+    ///
+    /// The failed op stays registered as typed `UnknownOutcome` with its
+    /// capture-evidence gap, descendant/exit/capture evidence, and cleanup
+    /// owner — queryable/cancellable/reconcilable until terminal cleanup is
+    /// proven. Independent dimensions stay available (no global poison, per
+    /// #82). Honest self-skip on non-Windows; no `#[ignore]`.
+    #[test]
+    fn issue84_stdout_spawn_failure_contains_job_tree(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        #[cfg(not(windows))]
+        {
+            assert!(
+                cfg!(not(windows)),
+                "non-Windows targets must take the explicit skip branch"
+            );
+            return Ok(());
+        }
+        #[cfg(windows)]
+        {
+            let bat_path = s83_keepalive_bat("84-stdout-fail")?;
+            let outcome: Result<(), Box<dyn std::error::Error>> = (|| {
+                let (executor, request, operation_id) = s83_parts(
+                    "84-stdout-fail",
+                    s83_keepalive_argv(&bat_path),
+                    30_000,
+                )?;
+                let sink = Arc::new(RecordingSink::default());
+                let sink_dyn: Arc<dyn ProcessEvidenceSink> = sink.clone();
+                // Identity-scoped injection: arm exactly this op's stdout
+                // spawn, so the failure provably covers THIS start at any
+                // thread count. An unrelated concurrent start can neither
+                // steal it nor be fenced by it. The match consumes the arm;
+                // the residual entry below is only belt-and-braces for a
+                // start that failed before the capture point.
+                super::s84_arm_stdout_failure_for(operation_id.as_str());
+                let start_result = block_on(executor.start(request, sink_dyn));
+                super::s84_disarm_stdout_failure_for(operation_id.as_str());
+                super::s84_disarm_stdout_failure_for("stdout");
+                // Typed failed/unknown start disposition: either the exact
+                // capture spawn error (tree contained cleanly) or typed
+                // `UnknownOutcome` (tree contained but closure evidence
+                // unproven). Never a normal receipt, never a bare orphan.
+                match &start_result {
+                    Err(
+                        ProcessExecutionError::Unavailable(_)
+                        | ProcessExecutionError::UnknownOutcome,
+                    ) => {}
+                    other => {
+                        return Err(format!(
+                            "stdout-spawn failure must return a typed failed/unknown start, got {other:?}"
+                        )
+                        .into());
+                    }
+                }
+                // No receipt publication for the failed start.
+                assert_eq!(sink.recorded_len(), 0);
+                // The op stays registered with the exact identity: inspect
+                // routes to it with typed unknown instead of NotFound
+                // (reserved for never-registered identities). The operation
+                // ID travels with the typed disposition — the caller can
+                // query/cancel/reconcile exactly this op.
+                assert!(matches!(
+                    block_on(executor.inspect(operation_id.clone())),
+                    Err(ProcessExecutionError::UnknownOutcome)
+                ));
+                // Fail-closed containment evidence through the public
+                // quarantine projection: exactly this op, the capture gap
+                // with the stdout `spawn-failed` record, descendant/exit
+                // evidence from `finalize_operation`, and the explicit
+                // recovery action. The Job tree was terminated through the
+                // admitted process owner, so the op must carry termination
+                // evidence (complete + tree-terminated descendants or the
+                // fenced unknown that still proves the containment attempt).
+                let summary = executor.operation_health_summary();
+                assert!(summary.new_start_ready);
+                assert!(summary.inspection_available);
+                assert!(summary.cancellation_available);
+                assert_eq!(summary.unknown_outcome_operations, 1);
+                assert_eq!(summary.cleanup_pending_operations, 1);
+                assert_eq!(summary.quarantined_operations.len(), 1);
+                let record = &summary.quarantined_operations[0];
+                assert_eq!(record.operation_id(), &operation_id);
+                assert_eq!(record.lifecycle(), ProcessLifecycle::UnknownOutcome);
+                assert_eq!(record.evidence_gap(), super::CAPTURE_EVIDENCE_GAP);
+                assert!(
+                    record
+                        .capture_failures()
+                        .iter()
+                        .any(|(stream, disposition)| stream == "stdout"
+                            && *disposition == "spawn-failed"),
+                    "expected the stdout spawn-failed capture record, got {:?}",
+                    record.capture_failures()
+                );
+                assert!(record.cleanup_pending());
+                assert!(!record.recovery_action().is_empty());
+                assert!(record.descendants_complete().is_some());
+                assert!(record.tree_terminated().is_some());
+                assert_eq!(executor.unknown_outcome_count(), 1);
+                assert_eq!(executor.cleanup_pending_count(), 1);
+                // Cancel still routes to the retained op with a typed
+                // outcome — never NotFound, never a fabricated success.
+                match block_on(executor.cancel(operation_id.clone())) {
+                    Err(
+                        ProcessExecutionError::UnknownOutcome
+                        | ProcessExecutionError::Contract(
+                            eliot_process::ContractError::UnknownOutcomeRequiresReconciliation,
+                        ),
+                    ) => {}
+                    other => {
+                        return Err(format!(
+                            "fail-closed op must stay typed-unknown on cancel, got {other:?}"
+                        )
+                        .into());
+                    }
+                }
+                Ok(())
+            })();
+            let _ = std::fs::remove_file(&bat_path);
+            outcome
+        }
+    }
+
+    /// Issue #84 (registry-publish-fails): an injected start-publication
+    /// failure after resume — with all mandatory control owners installed —
+    /// retains a cancellable/reconcilable op instead of orphaning it.
+    ///
+    /// The resumed child identity is fenced locally, the op stays
+    /// registered with the publication evidence gap, and independent
+    /// dimensions stay available (no global poison, per #82). Honest
+    /// self-skip on non-Windows; no `#[ignore]`.
+    #[test]
+    fn issue84_registry_publish_failure_retains_reconcilable_op(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        #[cfg(not(windows))]
+        {
+            assert!(
+                cfg!(not(windows)),
+                "non-Windows targets must take the explicit skip branch"
+            );
+            return Ok(());
+        }
+        #[cfg(windows)]
+        {
+            let bat_path = s83_keepalive_bat("84-publish-fail")?;
+            let outcome: Result<(), Box<dyn std::error::Error>> = (|| {
+                let (executor, request, operation_id) = s83_parts(
+                    "84-publish-fail",
+                    s83_keepalive_argv(&bat_path),
+                    30_000,
+                )?;
+                let sink = Arc::new(RecordingSink::default());
+                let sink_dyn: Arc<dyn ProcessEvidenceSink> = sink.clone();
+                // Identity-scoped injection at the exact registry-publication
+                // point: all capture/watcher owners are already installed,
+                // only publication fails. The extra `"registry"` key covers
+                // the same hook when armed by stream label.
+                super::s84_arm_start_publish_failure_for(operation_id.as_str());
+                let start_result = block_on(executor.start(request, sink_dyn));
+                super::s84_disarm_start_publish_failure_for(operation_id.as_str());
+                super::s84_disarm_start_publish_failure_for("registry");
+                super::s84_disarm_start_publish_failure_for("receipt");
+                // NEVER a normal receipt: the failed start is typed unknown
+                // even though every control owner installed cleanly.
+                assert!(
+                    matches!(
+                        start_result,
+                        Err(ProcessExecutionError::UnknownOutcome)
+                    ),
+                    "publish failure must fail closed as UnknownOutcome, got {start_result:?}"
+                );
+                // The op stays registered: inspect routes to it with the
+                // typed unknown instead of NotFound.
+                assert!(matches!(
+                    block_on(executor.inspect(operation_id.clone())),
+                    Err(ProcessExecutionError::UnknownOutcome)
+                ));
+                // Publication-evidence gap through the public quarantine
+                // projection: exactly this op stays
+                // cancellable/reconcilable with its cleanup owner.
+                let summary = executor.operation_health_summary();
+                assert!(summary.new_start_ready);
+                assert!(summary.inspection_available);
+                assert!(summary.cancellation_available);
+                assert_eq!(summary.unknown_outcome_operations, 1);
+                assert_eq!(summary.cleanup_pending_operations, 1);
+                assert_eq!(summary.quarantined_operations.len(), 1);
+                let record = &summary.quarantined_operations[0];
+                assert_eq!(record.operation_id(), &operation_id);
+                assert_eq!(record.lifecycle(), ProcessLifecycle::UnknownOutcome);
+                assert_eq!(record.evidence_gap(), super::PUBLISH_EVIDENCE_GAP);
+                assert!(record.cleanup_pending());
+                assert!(!record.recovery_action().is_empty());
+                assert_eq!(executor.unknown_outcome_count(), 1);
+                assert_eq!(executor.cleanup_pending_count(), 1);
+                match block_on(executor.cancel(operation_id.clone())) {
+                    Err(
+                        ProcessExecutionError::UnknownOutcome
+                        | ProcessExecutionError::Contract(
+                            eliot_process::ContractError::UnknownOutcomeRequiresReconciliation,
+                        ),
+                    ) => {}
+                    other => {
+                        return Err(format!(
+                            "publish-failed op must stay typed-unknown on cancel, got {other:?}"
+                        )
+                        .into());
+                    }
+                }
+                // Reconcile routes to the retained op (typed unknown — the
+                // contained tree cannot prove a success), never NotFound.
+                assert!(matches!(
+                    block_on(executor.reconcile(operation_id.clone())),
+                    Err(ProcessExecutionError::UnknownOutcome)
+                ));
+                Ok(())
+            })();
+            let _ = std::fs::remove_file(&bat_path);
+            outcome
         }
     }
 }
