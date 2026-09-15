@@ -1,0 +1,17 @@
+{
+  "contract": "F-LOG-KERNEL-0 kernel structured diagnostics facade",
+  "issue": 895,
+  "target": "eliot_kernel::diagnostics",
+  "note": "Pins the entrypoint observation vocabulary exercised by the focused contract tests. The full 24-case matrix (complete entrypoint/error/propagation inventory, per-stage failure distinctions, canary sweeps) is deferred to the owning follow-ups; this fixture covers only the facade-init and single-observation proofs.",
+  "stages": {
+    "startup": "startup",
+    "launch_config": "launch_config"
+  },
+  "entrypoint_event": "kernel.entrypoint_stage",
+  "terminal_event": "kernel.terminal_error",
+  "terminal_code_sample": "INVALID_CONFIGURATION",
+  "max_field_bytes": 256,
+  "max_detail_bytes": 1024,
+  "event_log_sink": "unavailable",
+  "stdout_protocol_contamination": false
+}

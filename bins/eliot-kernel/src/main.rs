@@ -41,6 +41,9 @@ use eliot_kernel::{
     KernelDoctorRecoveryLedger, compose_dispatch_contour, compose_production_doctor_front_door,
     compose_production_native_worker_front_door, compose_production_testd_front_door,
 };
+use eliot_kernel::kernel_diagnostics::{
+    EntrypointStage, install_kernel_diagnostics, observe_entrypoint, observe_terminal_error,
+};
 
 #[cfg(windows)]
 mod front_door_driver;
@@ -51,19 +54,29 @@ mod startup_binding;
 #[allow(clippy::too_many_lines)]
 #[tokio::main]
 async fn main() {
+    // F-LOG-KERNEL-0 (#895): install the process-global diagnostics
+    // subscriber before any entrypoint observation. Best-effort by
+    // contract: diagnostics never gate startup, so both the first install
+    // and an AlreadyOwned re-init continue into the launch funnel.
+    let _ = install_kernel_diagnostics();
+    observe_entrypoint(EntrypointStage::Startup);
     let options = match startup_binding::parse_launch_options(std::env::args_os().skip(1)) {
         Ok(options) => options,
         Err(error) => exit_error("INVALID_CONFIGURATION", &error.to_string()),
     };
+    observe_entrypoint(EntrypointStage::LaunchConfig);
     #[cfg(windows)]
     let startup_binding = match startup_binding::KernelStartupBinding::from_environment() {
         Ok(binding) => binding,
         Err(error) => exit_error("PRINCIPAL_FAILURE", &error),
     };
+    #[cfg(windows)]
+    observe_entrypoint(EntrypointStage::HostStartupBinding);
     let prepared_store = match startup_binding::prepare_store_bootstrap(&options) {
         Ok(prepared) => prepared,
         Err(error) => exit_error("INVALID_STORE_BOOTSTRAP", &error),
     };
+    observe_entrypoint(EntrypointStage::StoreBootstrap);
     let daemon_launch = match startup_binding::prepare_eliotd_launch(&options) {
         Ok(Some(launch)) => Some(launch),
         Ok(None) => exit_error(
@@ -72,6 +85,7 @@ async fn main() {
         ),
         Err(error) => exit_error("INVALID_ELIOTD_LAUNCH", &error),
     };
+    observe_entrypoint(EntrypointStage::EliotdLaunch);
     let mut kernel_config =
         KernelConfig::new(options.work_root.clone()).require_descriptor_supervision_authority();
     #[cfg(windows)]
@@ -153,6 +167,7 @@ async fn main() {
             Err(error) => exit_build_error(&error),
         },
     );
+    observe_entrypoint(EntrypointStage::Composition);
     #[cfg(windows)]
     {
         // DISPATCH-WIRE E1 (issue #461): compose the production
@@ -209,18 +224,24 @@ async fn main() {
             exit_error("DISPATCH_COMPOSITION_FAILURE", &error.to_string());
         }
     }
+    #[cfg(windows)]
+    observe_entrypoint(EntrypointStage::DispatchComposition);
     if !kernel.process_execution_configured() {
         exit_error(
             "PROCESS_AUTHORITY_CONFIGURATION_REQUIRED",
             "Host/installation must inject the external process authority handoff before Kernel readiness",
         );
     }
+    observe_entrypoint(EntrypointStage::ProcessAuthority);
     if kernel.supervision_lease_authority().is_none() {
         exit_error(
             "SUPERVISION_AUTHORITY_CONFIGURATION_REQUIRED",
             "Host/installation must inject the installer-provisioned supervision authority before Kernel readiness",
         );
     }
+    observe_entrypoint(EntrypointStage::SupervisionAuthority);
+    #[cfg(windows)]
+    observe_entrypoint(EntrypointStage::FrontDoorLoop);
     #[cfg(windows)]
     front_door_driver::run_front_door_loop(Arc::clone(&kernel), &startup_binding).await;
     #[cfg(not(windows))]
@@ -232,7 +253,9 @@ async fn main() {
         );
     }
     match kernel.shutdown().await {
-        Ok(outcome) if outcome.no_orphans => {}
+        Ok(outcome) if outcome.no_orphans => {
+            observe_entrypoint(EntrypointStage::ShutdownDrain);
+        }
         Ok(outcome) => exit_error(
             "SHUTDOWN_INCOMPLETE",
             &format!("runtime shutdown outcome: {outcome:?}"),
@@ -246,6 +269,10 @@ pub(crate) fn exit_build_error(error: &KernelBuildError) -> ! {
 }
 
 pub(crate) fn exit_error(code: &str, detail: &str) -> ! {
+    // F-LOG-KERNEL-0 (#895): the single terminal error boundary. One
+    // underlying failed operation yields exactly one terminal diagnostic
+    // record here; receipt framing and the exit below are unchanged.
+    observe_terminal_error(code);
     write_error(code, detail);
     std::process::exit(1);
 }
