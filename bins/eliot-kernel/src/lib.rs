@@ -44,6 +44,10 @@ mod composition_bootstrap;
 mod control_plane;
 mod kernel_build_contract;
 mod kernel_config;
+/// Kernel structured diagnostics facade (F-LOG-KERNEL-0, #895): compiled
+/// once here and imported by the binary; later leaves extend through their
+/// own serialized turns, never a second copy.
+pub mod kernel_diagnostics;
 mod process_execution;
 mod process_execution_client;
 mod supervision_lease_authority;
