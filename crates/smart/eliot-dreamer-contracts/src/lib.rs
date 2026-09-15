@@ -24,6 +24,7 @@ pub mod error;
 pub mod failure;
 pub mod grounding;
 pub mod job;
+pub mod model_route;
 pub mod probe;
 pub mod registry;
 pub mod rejection;
@@ -111,6 +112,11 @@ pub use failure::{
     failure_result_digest, seal_failure, validate_failure,
 };
 pub use job::{DreamJobInput, JobClass, Requester, RequesterOrigin, parse_job_class};
+pub use model_route::{
+    CostUsageReceipt, MAX_ALLOWED_ROUTES, MAX_NOTE_CHARS, MAX_ROUTE_CHARS,
+    MODEL_ROUTE_SCHEMA_VERSION, ModelRouteDisposition, ModelRouteOutcome, ModelRoutePrivacy,
+    ModelRouteRequest, bundle_digest_of,
+};
 pub use probe::{
     AffordanceKind, AffordanceTarget, AuthorityDimension, ConsentDimension, ContextDimension,
     CostDimension, EffectDimension, FeasibilityDimension, GapUpdateMeaning,

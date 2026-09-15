@@ -10,6 +10,7 @@
 mod admission;
 mod admission_input;
 mod atom;
+mod canonical_projections;
 mod economy;
 mod error;
 mod identity;
@@ -36,6 +37,11 @@ pub use atom::{
     AdmissionDisposition, AdmittedAtom, AtomAvailability, AtomRepresentation, AuthorityClass,
     CapacityLimits, ContextCandidate, ContextRecipe, LossPolicy, MeasurementRef, PrivacyClass,
     ProviderDisposition, ProviderRoleDenominator, RepresentationKind, RoleLossRule,
+};
+pub use canonical_projections::{
+    AffordanceProjection, CANONICAL_PROJECTIONS_SCHEMA_VERSION, CanonicalProjectionSet,
+    ContinuityProjection, MAX_PROJECTION_ENTRIES, MAX_PROJECTION_TEXT, MAX_SET_OMISSIONS,
+    SafetyProjection, TaskProjection,
 };
 pub use economy::{ContextEconomyReceipt, EconomyAllocations};
 pub use error::{
