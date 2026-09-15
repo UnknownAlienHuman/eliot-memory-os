@@ -328,6 +328,7 @@ fn recipe(context: &ContextBinding) -> ContextRecipe {
     recipe
 }
 
+// WORK_UNIT_CASE: 626/1
 #[test]
 fn assembles_exact_admitted_projection_and_measures_once() {
     let value = admitted();
@@ -353,6 +354,7 @@ fn assembles_exact_admitted_projection_and_measures_once() {
     );
 }
 
+// WORK_UNIT_CASE: 626/8
 #[test]
 fn non_public_admitted_privacy_is_refused_before_measurement() {
     for privacy in [
@@ -384,6 +386,7 @@ fn non_public_admitted_privacy_is_refused_before_measurement() {
     }
 }
 
+// WORK_UNIT_CASE: 626/9
 #[test]
 fn canonical_payload_matches_a15_digest_and_order() {
     let first = admitted_two();
@@ -434,6 +437,7 @@ fn canonical_payload_matches_a15_digest_and_order() {
     );
 }
 
+// WORK_UNIT_CASE: 626/24
 #[test]
 fn measurement_mismatch_is_typed_and_rejected() {
     let value = admitted();
@@ -476,6 +480,7 @@ fn measurement_mismatch_is_typed_and_rejected() {
     );
 }
 
+// WORK_UNIT_CASE: 626/21
 #[test]
 fn output_byte_limit_is_checked_before_measurement() {
     let value = admitted();
@@ -503,6 +508,7 @@ fn output_byte_limit_is_checked_before_measurement() {
     assert_eq!(result, Err(AssemblyError::Bounds("assembly.final_bytes")));
 }
 
+// WORK_UNIT_CASE: 626/39
 #[test]
 fn oversized_nested_material_is_rejected_before_rendering() {
     let mut value = admitted();
@@ -520,6 +526,7 @@ fn oversized_nested_material_is_rejected_before_rendering() {
     assert_eq!(result, Err(AssemblyError::Bounds("representation.content")));
 }
 
+// WORK_UNIT_CASE: 626/28
 #[test]
 fn rendered_fields_and_quality_binding_are_retained() {
     let value = admitted();
@@ -580,6 +587,7 @@ fn rendered_fields_and_quality_binding_are_retained() {
     );
 }
 
+// WORK_UNIT_CASE: 626/3
 #[test]
 fn fence_digest_binds_to_admitted_state_fence() {
     let value = admitted();
@@ -600,6 +608,7 @@ fn fence_digest_binds_to_admitted_state_fence() {
         .expect("fence-bound view");
 }
 
+// WORK_UNIT_CASE: 626/31
 #[test]
 fn forged_fence_digest_is_rejected_as_invalid_fence() {
     let value = admitted();
