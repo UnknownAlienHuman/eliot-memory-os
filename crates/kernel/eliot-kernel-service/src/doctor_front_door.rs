@@ -312,3 +312,25 @@ pub fn is_doctor_diagnosis_only_envelope(envelope: &ClosedRepairRequest) -> bool
     matches!(envelope.recipe.repair_class, RepairClass::DiagnoseOnly)
         && envelope.operations.is_empty()
 }
+
+#[cfg(test)]
+mod tests {
+    #![allow(clippy::expect_used, clippy::unwrap_used, clippy::panic)]
+
+    use crate::{DoctorRecipeRegistry, DoctorRegistryError};
+
+    /// An empty recipe set never composes: the registry constructor fails
+    /// closed, so neither [`ComposedDoctorFrontDoor`](crate::ComposedDoctorFrontDoor)
+    /// nor the dispatch contour can bind an owner that advertises repair.
+    #[test]
+    fn empty_registry_composition_fails_closed() {
+        let installed_artifact_digest =
+            eliot_contracts::sha256_hex(b"eliot-doctor-test-package-bytes");
+        let manifest = eliot_doctor_core::health_probe_manifest(&installed_artifact_digest)
+            .expect("probe manifest builds");
+        match DoctorRecipeRegistry::register(manifest, Vec::new()) {
+            Err(DoctorRegistryError::EmptyRegistry) => {}
+            other => panic!("empty registry must fail closed, got {other:?}"),
+        }
+    }
+}
