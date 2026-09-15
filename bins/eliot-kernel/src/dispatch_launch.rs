@@ -3568,7 +3568,11 @@ mod tests {
     /// composition still fences the Doctor side; testd admits end-to-end;
     /// the heartbeat carries the composed flag; testd prepare reserves,
     /// replays by the retained original, refuses changed terms,
-    /// reconciles, and releases; launch without an executor fails closed
+    /// reconciles, and releases; native prepare reserves the real claim
+    /// through the live service plus ORS, writes the dispatch file with a
+    /// validated grant, and reconciles by the durable record; the real
+    /// native image prepares to the spawn boundary with the replay-stable
+    /// owner derivation; launch without an executor fails closed
     /// and reaps.
     #[tokio::test]
     async fn dispatch_contour_lifecycle() {
@@ -3952,6 +3956,169 @@ mod tests {
             ReconcileLaunchedOutcome::Unknown { .. }
         ));
 
+        // 5c. DISPATCH-LIVE W-C E2E (kernel binary): the real
+        // `eliot-native-worker` image is admitted through the live service
+        // plus the real ORS claim table, bound to the protected dispatch
+        // file with a validated grant, and carried to the spawn boundary
+        // with the owner dispatch derivation every Governor join publisher
+        // must source. No doubles: the claim request carries real computed
+        // digests and the executable digest is read from the real image
+        // bytes (staged as a byte-identical copy under this test root, so
+        // the dispatch file never lands in the build tree).
+        //
+        // DEPENDS-ON-INTEGRATION: the final spawn-to-`Ready` step needs the
+        // admitted process authority plus a live Kernel front door for the
+        // child's register/claim/readiness submits, so this step proves
+        // everything up to the spawn boundary in isolation and asserts the
+        // exact fail-closed (`ExecutorUnavailable`, file reaped, slot
+        // released) when no executor is configured.
+        let live_child_dir = root.join("native-live-child");
+        std::fs::create_dir_all(&live_child_dir).expect("live child dir");
+        let live_binary = real_native_worker_binary();
+        let live_bytes = std::fs::read(&live_binary).unwrap_or_else(|_| {
+            panic!(
+                "DEPENDS-ON-INTEGRATION: build the native worker image first \
+                 (`cargo build -p eliot-native-worker`); missing {live_binary:?}"
+            )
+        });
+        let live_digest = eliot_contracts::sha256_hex(&live_bytes);
+        let staged_binary = live_child_dir.join(format!(
+            "eliot-native-worker{}",
+            std::env::consts::EXE_SUFFIX
+        ));
+        std::fs::write(&staged_binary, &live_bytes).expect("stage real image");
+        assert_eq!(
+            eliot_contracts::sha256_hex(
+                &std::fs::read(&staged_binary).expect("staged image reads")
+            ),
+            live_digest,
+            "staged image must stay byte-identical to the real binary"
+        );
+        let live_request = native_claim_request(
+            "claim-dispatch-live-1",
+            "reg-dispatch-live-1",
+            "attempt-dispatch-live-1",
+            "op-dispatch-live-1",
+        );
+        let live_material = NativeWorkerLaunchMaterial {
+            request: &live_request,
+            executable: &staged_binary,
+            executable_sha256: &live_digest,
+            working_directory: &live_child_dir,
+        };
+        let live_prepared =
+            prepare_native_worker_launch(&kernel, &live_material, now_nanos).expect("prepare");
+        let PreparedNativeWorkerLaunch::Ready(live_ready) = live_prepared else {
+            panic!("live native prepare must be ready");
+        };
+        assert_eq!(live_ready.receipt.claim_id, "claim-dispatch-live-1");
+        assert_nonce_shape(&live_ready.nonce);
+        let live_file = live_child_dir.join(
+            DispatchedWorkerKind::NativeWorker
+                .material_file_name()
+                .expect("native material file"),
+        );
+        assert_eq!(
+            live_file, live_ready.material_path,
+            "live native ready carries the protected dispatch path"
+        );
+        let live_json: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&live_file).expect("live dispatch file"))
+                .expect("live dispatch file is JSON");
+        let live_object = live_json.as_object().expect("live dispatch object");
+        for key in [
+            "request",
+            "receipt",
+            "epoch",
+            "generation",
+            "nonce",
+            "grant",
+        ] {
+            assert!(
+                live_object.contains_key(key),
+                "live dispatch file carries {key}"
+            );
+        }
+        assert_eq!(
+            live_object["nonce"],
+            serde_json::json!(live_ready.nonce),
+            "live dispatch nonce equals the retained session nonce"
+        );
+        let live_grant: DispatchGrant =
+            serde_json::from_value(live_object["grant"].clone()).expect("live grant parses");
+        assert_eq!(live_grant.authority_epoch, epoch);
+        live_grant
+            .validate_for_child()
+            .expect("live grant validates");
+        // R1 owner record (Implements #22): the derivation every Governor
+        // join publisher must source runs over the live admitted material
+        // here. Deterministic: an exact recompute agrees bit-for-bit, so a
+        // replay re-derives the identical owner record.
+        let live_first = native_worker_dispatch_derivation(
+            &live_request.claim_id,
+            &live_request.operation_id,
+            live_request.worker_generation,
+            &epoch,
+            &live_ready.nonce,
+        )
+        .expect("owner derivation builds over live material");
+        let live_replay = native_worker_dispatch_derivation(
+            &live_request.claim_id,
+            &live_request.operation_id,
+            live_request.worker_generation,
+            &epoch,
+            &live_ready.nonce,
+        )
+        .expect("owner derivation replays");
+        assert_eq!(live_first, live_replay, "owner derivation is replay-stable");
+        assert_eq!(
+            live_first.authority_id.len(),
+            NATIVE_WORKER_DISPATCH_AUTHORITY_PREFIX.len() + 64
+        );
+        assert!(
+            live_first
+                .authority_id
+                .starts_with(NATIVE_WORKER_DISPATCH_AUTHORITY_PREFIX),
+            "owner authority carries the child-identical prefix"
+        );
+        for digest in [&live_first.key_hex, &live_first.head_digest] {
+            assert_eq!(digest.len(), 64, "derivation digests are SHA-256 hex");
+            assert!(
+                digest
+                    .bytes()
+                    .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase()),
+                "derivation digests are lowercase hex"
+            );
+        }
+        // No admitted process authority in isolation: a first launch of a
+        // fresh claim fails closed at the spawn boundary (after its own
+        // admit + material write), reaps the file, and releases the slot.
+        let live_spawn_request = native_claim_request(
+            "claim-dispatch-live-2",
+            "reg-dispatch-live-2",
+            "attempt-dispatch-live-2",
+            "op-dispatch-live-2",
+        );
+        let live_spawn_material = NativeWorkerLaunchMaterial {
+            request: &live_spawn_request,
+            executable: &staged_binary,
+            executable_sha256: &live_digest,
+            working_directory: &live_child_dir,
+        };
+        assert!(matches!(
+            launch_admitted_native_worker_attempt(&kernel, &live_spawn_material, now_nanos).await,
+            Err(DispatchLaunchError::ExecutorUnavailable)
+        ));
+        assert!(
+            !live_file.exists(),
+            "failed live launch reaps its material and releases the slot"
+        );
+        assert!(matches!(
+            reconcile_launched_native_worker_attempt(&kernel, "claim-dispatch-live-2")
+                .expect("reconcile"),
+            ReconcileLaunchedOutcome::Unknown { .. }
+        ));
+
         // 6. Launch without a configured executor fails closed: no spawn,
         // no retained slot.
         let launch_material = TestdLaunchMaterial {
@@ -4007,6 +4174,20 @@ mod tests {
         );
 
         let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// Resolves the real `eliot-native-worker` image beside this test
+    /// executable (the `deps`/`debug` layout cargo produces). The digest
+    /// below binds the exact bytes before any launch step reads them, so
+    /// the path itself never confers ownership (`bins/AGENTS.md`).
+    fn real_native_worker_binary() -> PathBuf {
+        let exe = std::env::current_exe().expect("test executable path");
+        let deps = exe.parent().expect("deps dir");
+        let profile = deps.parent().expect("profile dir");
+        profile.join(format!(
+            "eliot-native-worker{}",
+            std::env::consts::EXE_SUFFIX
+        ))
     }
 
     /// The heartbeat reply carries the composed advertisement flag through

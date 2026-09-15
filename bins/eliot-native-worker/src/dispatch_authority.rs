@@ -609,6 +609,61 @@ mod tests {
     //! Both files assert the same literals; agreement here is the interop proof.
 
     use super::*;
+    use eliot_process::{
+        EnvironmentInheritance, EnvironmentProjection, Generation, ImageId, JobId, OperationId,
+        ProcessTreeId, ResourceLimits, SessionId as ProcessSessionId,
+    };
+
+    /// Unwraps one issuance fixture without `expect` (this module carries
+    /// no test `expect` allow, and none is added): a fixture failure
+    /// panics with the failing step named.
+    fn must<T, E: std::fmt::Debug>(result: Result<T, E>, what: &str) -> T {
+        match result {
+            Ok(value) => value,
+            Err(error) => panic!("dispatch-r1 issuance fixture failed ({what}): {error:?}"),
+        }
+    }
+
+    /// Builds the canonical test intent for one issuance pin: every identity
+    /// fixed, the executable bound to the real test-binary bytes (never a
+    /// canned digest), arg-less argv, and a secret-free environment.
+    fn issuance_intent() -> ProcessIntent {
+        let exe = must(std::env::current_exe(), "test executable path");
+        let image_bytes = must(std::fs::read(&exe), "test image reads");
+        let image_digest = hex_bytes(&sha256_bytes(&image_bytes));
+        let generation = must(Generation::new(7), "issuance generation");
+        let environment = must(
+            EnvironmentProjection::new(BTreeMap::new(), Vec::new(), EnvironmentInheritance::None),
+            "issuance environment",
+        );
+        let limits = must(
+            ResourceLimits::new(30_000, None, None, 4_096, 4_096, 4),
+            "issuance limits",
+        );
+        must(
+            ProcessIntent::new(
+                must(
+                    OperationId::new("operation-dispatch-r1-001"),
+                    "operation id",
+                ),
+                must(ProcessTreeId::new("tree-dispatch-r1-001"), "tree id"),
+                must(JobId::new("parent-job-dispatch-r1-001"), "job id"),
+                must(ImageId::new("image-dispatch-r1-001"), "image id"),
+                must(
+                    ProcessSessionId::new("session-dispatch-r1-001"),
+                    "session id",
+                ),
+                generation,
+                std::env::temp_dir().to_string_lossy().into_owned(),
+                image_digest,
+                Vec::new(),
+                std::env::temp_dir().to_string_lossy().into_owned(),
+                environment,
+                limits,
+            ),
+            "issuance intent builds",
+        )
+    }
 
     #[test]
     fn child_dispatch_derivation_matches_owner_vector() {
@@ -648,5 +703,109 @@ mod tests {
             "eliot-native-worker-dispatch/v1"
         );
         assert_eq!(LAUNCH_GRANT_HEAD, "launch-grant");
+    }
+
+    /// R1 issuance pin (Implements #22): two independent authorities
+    /// derived from identical admitted material must issue byte-identical
+    /// invocation digests through the production issuance entries — this
+    /// replay-stability is what lets the owner publish the matching join.
+    /// A distinct launch nonce must diverge. Real constructors, real
+    /// crypto, no transport, no doubles.
+    #[test]
+    fn dispatch_issuance_is_replay_stable_and_nonce_bound() {
+        use eliot_contracts::EpochId;
+
+        let epoch_json = serde_json::json!({
+            "lineage_id": "550e8400-e29b-41d4-a716-446655440000",
+            "sequence": 3,
+        });
+        let epoch: EpochId = must(
+            serde_json::from_value(epoch_json.clone()),
+            "issuance epoch parses",
+        );
+        let fence = must(
+            FencingToken::new(
+                epoch,
+                must(Generation::new(7), "fence generation"),
+                "fence-r1-001".to_owned(),
+            ),
+            "issuance fence builds",
+        );
+        let lease = must(
+            ActionLeaseRef::new("lease-r1-001".to_owned()),
+            "issuance lease builds",
+        );
+        let grant_image = hex_bytes(&sha256_bytes(b"dispatch-r1 grant identity"));
+        // Fixed freshness window: wall-clock never enters the permit, only
+        // the file-derived window the Kernel proves at admission.
+        let issued_at = 4_000_000_000_000_u64;
+        let expires_at = 4_000_001_000_000_u64;
+        let now_ms = 4_000_000_500_000_u64;
+        let grant = must(
+            ValidatedDispatchGrant::new(fence, lease, grant_image, issued_at, expires_at),
+            "issuance grant validates",
+        );
+
+        let nonce = "launch-nonce-r1-0001-abcdef0123";
+        let first = must(
+            NativeWorkerDispatchAuthority::new(
+                "claim-dispatch-r1-001",
+                "operation-dispatch-r1-001",
+                7,
+                &epoch_json,
+                nonce,
+            ),
+            "first authority derives",
+        );
+        let second = must(
+            NativeWorkerDispatchAuthority::new(
+                "claim-dispatch-r1-001",
+                "operation-dispatch-r1-001",
+                7,
+                &epoch_json,
+                nonce,
+            ),
+            "second authority derives",
+        );
+        let intent = issuance_intent();
+        let first_process = must(
+            first.issue(&intent, &grant, nonce, now_ms),
+            "first issuance",
+        );
+        let second_process = must(
+            second.issue(&intent, &grant, nonce, now_ms),
+            "second issuance",
+        );
+        assert_eq!(
+            first_process.invocation_digest(),
+            second_process.invocation_digest(),
+            "identical admitted material must issue the identical invocation digest"
+        );
+        assert_eq!(
+            first_process.invocation_digest().len(),
+            64,
+            "invocation digest is SHA-256 hex"
+        );
+
+        let other_nonce = "launch-nonce-r1-0002-abcdef0123";
+        let other = must(
+            NativeWorkerDispatchAuthority::new(
+                "claim-dispatch-r1-001",
+                "operation-dispatch-r1-001",
+                7,
+                &epoch_json,
+                other_nonce,
+            ),
+            "third authority derives",
+        );
+        let other_process = must(
+            other.issue(&intent, &grant, other_nonce, now_ms),
+            "third issuance",
+        );
+        assert_ne!(
+            first_process.invocation_digest(),
+            other_process.invocation_digest(),
+            "a distinct launch nonce must issue a distinct invocation digest"
+        );
     }
 }

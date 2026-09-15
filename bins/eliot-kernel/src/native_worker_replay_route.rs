@@ -379,7 +379,10 @@ impl KernelComposition {
         let (claim_id, _binding_digest, _generation) = Self::validate_native_worker_claim(claim)?;
         Self::require_message_identity(identity, &claim_id)?;
         Self::require_claim_deadline(claim, now)?;
-        let request = Self::build_claim_request(claim)?;
+        // R2 single shape (Implements #22): the replay frame already carries
+        // the registration half, so the request projects the envelope from
+        // it by construction — the same halves the child submits admit here.
+        let request = Self::build_single_shape_request(claim, registration)?;
         let registration_fence: StateFence =
             serde_json::from_value(registration.get("state_fence").cloned().ok_or(
                 NativeWorkerRouteError::Shape {
