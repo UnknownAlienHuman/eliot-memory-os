@@ -2080,6 +2080,18 @@ fn hex_sha256(bytes: &[u8]) -> String {
     output
 }
 
+/// Versioned wire revision for every CAS request/effect commitment.
+///
+/// Commitments bind this exact revision into their canonical bytes, so a
+/// future CAS wire revision is a different commitment, never a silent
+/// reinterpretation of `s-04-cas-v1` bytes. Legacy shapes are preserved only
+/// under this explicit version.
+pub const BLOB_CAS_WIRE_VERSION: &str = "s-04-cas-v1";
+/// Deterministic domain separator for CAS request commitments.
+pub const BLOB_CAS_REQUEST_DOMAIN: &str = "eliot.storage.blob.cas";
+/// Deterministic domain separator for CAS effect commitments.
+pub const BLOB_CAS_EFFECT_DOMAIN: &str = "eliot.storage.blob.cas.effect";
+
 /// The only targets admitted by the v1 journal CAS contract.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
@@ -2089,6 +2101,12 @@ pub enum BlobCasNamespace {
 }
 
 /// Capability reported before a backend considers a CAS mutation.
+///
+/// `AtomicCompareAndReplace` means the backend holds a real conditional
+/// primitive behind its stable serialization boundary. `UnsupportedAtomicCas`
+/// is a typed **pre-mutation** state: no target byte was compared, written,
+/// or retried under this operation. It is never transient provider
+/// unavailability and never authorizes a blind retry.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
 pub enum BlobCasCapability {
@@ -2097,6 +2115,11 @@ pub enum BlobCasCapability {
 }
 
 /// Expected or observed SHA-256 state of a journal object.
+///
+/// `Missing` is a positively observed absence at the declared journal target,
+/// not a default. Unknown fields, unknown `kind` tags, and non-canonical
+/// digests are rejected at the wire boundary; no protected default is ever
+/// substituted.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum BlobCasState {
     Missing,
@@ -2157,6 +2180,11 @@ impl<'de> Deserialize<'de> for BlobCasState {
 }
 
 /// Durability requested or observed by one journal CAS operation.
+///
+/// `NotRequested`/`Requested` are the only request-side values; `Confirmed`
+/// and `Unconfirmed` are observed values carried on receipts and uncertain
+/// outcomes. `Unconfirmed` never decodes as `Confirmed`, and an unconfirmed
+/// write never decodes as a durable apply.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
 pub enum BlobCasDurability {
@@ -2168,6 +2196,12 @@ pub enum BlobCasDurability {
 
 /// Narrow v1 request for a control-plane journal CAS. Replacement bytes remain
 /// private to the backend; their exact SHA-256 and length are committed here.
+///
+/// The request binds the full operation identity (operation, request,
+/// idempotency via `context`), the journal namespace/target, the expected
+/// state, the replacement digest/length, the backend generation fence, and
+/// the requested durability. No token, raw content, filesystem handle, or
+/// platform lock authority is representable in this type.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 pub struct BlobCasRequest {
     pub context: BlobReceiptContext,
@@ -2212,6 +2246,10 @@ struct BlobCasRequestCommitment<'a> {
 }
 
 impl BlobCasRequest {
+    /// Intrinsic constructor: validates operation/lease identities,
+    /// kind-payload compatibility, journal-namespace/target bounds, digest
+    /// shapes, generation fences, and the deterministic canonical commitment
+    /// encoding. Performs no I/O and holds no lock, store, or authority.
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         context: BlobReceiptContext,
@@ -2236,6 +2274,15 @@ impl BlobCasRequest {
             requested_durability,
         };
         value.validate()?;
+        // Deterministic canonical encoding: the same validated request always
+        // yields the same commitment bytes (byte-identical digest on repeat).
+        let first = value.request_commitment_sha256()?;
+        let second = value.request_commitment_sha256()?;
+        if first != second {
+            return Err(BlobError::InvalidContract(
+                "CAS request commitment encoding is not deterministic".to_owned(),
+            ));
+        }
         Ok(value)
     }
 
@@ -2281,8 +2328,8 @@ impl BlobCasRequest {
     pub fn request_commitment_sha256(&self) -> Result<String, BlobError> {
         self.validate()?;
         canonical_json_sha256(&(
-            "eliot.storage.blob.cas",
-            "s-04-cas-v1",
+            BLOB_CAS_REQUEST_DOMAIN,
+            BLOB_CAS_WIRE_VERSION,
             BlobCasRequestCommitment {
                 context: &self.context,
                 root_lease: &self.root_lease,
@@ -2300,6 +2347,13 @@ impl BlobCasRequest {
     /// Rejects replay under a changed operation or request commitment. The
     /// operation id is a distinct step identity even when all other bytes are
     /// equal; parent/causal links remain owned by the receipt context.
+    ///
+    /// Reusing one operation identity (`operation_id` + `idempotency_key`)
+    /// with a changed expected state, replacement digest/length, target,
+    /// namespace, generation fence, or durability is an `IdentityConflict`:
+    /// I05-27 requires the changed canonical payload to conflict rather than
+    /// transition. A changed operation identity with otherwise equal bytes is
+    /// also an `IdentityConflict` (distinct step, no shared apply evidence).
     pub fn validate_exact_replay(&self, replay: &Self) -> Result<(), BlobError> {
         self.validate()?;
         replay.validate()?;
@@ -2402,6 +2456,14 @@ pub enum BlobCasSuccessKind {
 
 /// Authority-issued evidence for one applied CAS or exact supported no-op.
 /// Private fields prevent callers from minting effect evidence.
+///
+/// The receipt binds the full operation identity (`operation_id`,
+/// `request_id`, `idempotency_key`), the journal namespace/target, the
+/// expected state, the replacement digest/length, the backend generation
+/// fence, and the requested/observed durability behind the canonical
+/// `s-04-cas-v1` request/effect commitments. A later digest match on the
+/// target alone is not proof which operation committed: only the retained
+/// operation-bound receipt distinguishes same-byte writers.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 pub struct BlobCasReceipt {
     receipt: Receipt,
@@ -2420,6 +2482,10 @@ pub struct BlobCasReceipt {
 }
 
 impl BlobCasReceipt {
+    /// Constructs operation-bound durable evidence from an independently
+    /// verified receipt. The verified binding must identify this exact
+    /// operation, request, idempotency key, generations, proof, and
+    /// `CONFIRMED` observed durability; receipt construction performs no I/O.
     #[allow(clippy::too_many_arguments)]
     pub fn from_verified(
         verified: &VerifiedBlobReceipt,
@@ -2599,8 +2665,8 @@ fn cas_effect_commitment_sha256(
     // previous state named by `request.expected`, then classified the result
     // as Applied or the exact expected==replacement NoOp.
     canonical_json_sha256(&(
-        "eliot.storage.blob.cas.effect",
-        "s-04-cas-v1",
+        BLOB_CAS_EFFECT_DOMAIN,
+        BLOB_CAS_WIRE_VERSION,
         request_commitment_sha256,
         &request.expected,
         &request.replacement_sha256,
@@ -2645,6 +2711,21 @@ fn require_cas_artifacts(
 /// Lossless CAS result vocabulary. Failed outcomes map to [`BlobError`] only
 /// through the typed `CasFailure` variant; no state is flattened to transient
 /// provider unavailability.
+///
+/// Disposition invariants (lossless, decode-stable):
+/// - `UnsupportedAtomicCas` is a not-attempted pre-mutation state. It never
+///   decodes as `ProviderUnavailable` (transient, blind-retry eligible) and
+///   never authorizes a blind retry under any operation identity.
+/// - `UnknownOutcome` is an uncertain possible write. It never decodes as
+///   `NotAttempted` and never decodes as `Applied`/`NoOp`.
+/// - `DurabilityUnconfirmed` is an installed-but-unproven write. It never
+///   decodes as `Applied`/`NoOp`.
+/// - `ExpectedStateConflict` (byte/value mismatch under one operation
+///   identity) and `IdentityConflict` (same operation identity reused with a
+///   changed canonical payload) are distinct and never merge.
+/// - `Applied`/`NoOp` carry operation-bound durable evidence whose digest
+///   match alone is not proof of which operation committed: only the retained
+///   operation receipt distinguishes same-byte writers.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum BlobCasOutcome {
     Applied {
@@ -2691,6 +2772,33 @@ pub enum BlobCasOutcome {
 }
 
 impl BlobCasOutcome {
+    /// Returns the operation-bound request carried by every outcome variant.
+    #[must_use]
+    pub fn request(&self) -> &BlobCasRequest {
+        match self {
+            Self::Applied { receipt } | Self::NoOp { receipt } => receipt.request(),
+            Self::ExpectedStateConflict { request, .. }
+            | Self::IdentityConflict { request }
+            | Self::NotFound { request }
+            | Self::NotAttempted { request }
+            | Self::UnsupportedAtomicCas { request }
+            | Self::UnknownOutcome { request, .. }
+            | Self::DurabilityUnconfirmed { request, .. }
+            | Self::Internal { request, .. } => request,
+        }
+    }
+
+    /// Decodes this outcome into the lossless public [`BlobError`] surface.
+    ///
+    /// Successful `Applied`/`NoOp` receipts stay `Ok`; every other
+    /// disposition becomes the exact typed `BlobError::CasFailure` variant
+    /// with the same name. This mapping never produces
+    /// `BlobError::ProviderUnavailable`: `UnsupportedAtomicCas` is a typed
+    /// pre-mutation capability state, not transient unavailability, and
+    /// `UnknownOutcome`/`DurabilityUnconfirmed` require same-operation
+    /// reconciliation rather than blind retry. Successful receipts never
+    /// decode as `NotAttempted`, and unknown commits never decode as
+    /// `NotAttempted` or as successful applies.
     pub fn into_blob_result(self) -> Result<Self, BlobError> {
         match self {
             Self::Applied { receipt } if receipt.success() == BlobCasSuccessKind::Applied => {
@@ -2781,8 +2889,16 @@ pub enum BlobCasFailure {
     NotFound { request: Box<BlobCasRequest> },
     #[error("CAS was not attempted")]
     NotAttempted { request: Box<BlobCasRequest> },
+    /// Typed pre-mutation state: the backend holds no conditional primitive
+    /// for this target, so the mutation was never compared, written, or
+    /// retried under this operation. Distinct from `NotAttempted` (a capable
+    /// backend that did not attempt this step) and never eligible for blind
+    /// retry as transient `ProviderUnavailable`.
     #[error("atomic CAS is unsupported")]
     UnsupportedAtomicCas { request: Box<BlobCasRequest> },
+    /// Uncertain possible write: the commit may or may not have installed.
+    /// Never decodes as `NotAttempted` and never decodes as a successful
+    /// `Applied`/`NoOp`; recovery must reconcile under the same operation.
     #[error("CAS outcome is unknown")]
     UnknownOutcome {
         request: Box<BlobCasRequest>,
@@ -2792,6 +2908,9 @@ pub enum BlobCasFailure {
         observed_backend_generation: Option<u64>,
         observed_durability: BlobCasDurability,
     },
+    /// Installed-but-unproven write: the replacement is visible but the
+    /// required durability boundary was not confirmed. Never decodes as a
+    /// durable `Applied`/`NoOp`.
     #[error("CAS durability is unconfirmed")]
     DurabilityUnconfirmed {
         request: Box<BlobCasRequest>,
@@ -2807,6 +2926,57 @@ pub enum BlobCasFailure {
     },
     #[error("CAS success kind did not match its outcome wrapper")]
     SuccessKindMismatch { request: Box<BlobCasRequest> },
+}
+
+impl BlobCasFailure {
+    /// Returns the operation-bound request carried by every failure variant.
+    ///
+    /// Every applicable CAS value binds exact operation/idempotency, journal
+    /// namespace/target, expected state, replacement digest/length,
+    /// backend generation fence, and requested durability through this
+    /// request; observed generations/durability travel on the
+    /// `UnknownOutcome`/`DurabilityUnconfirmed` variants only.
+    #[must_use]
+    pub fn request(&self) -> &BlobCasRequest {
+        match self {
+            Self::ExpectedStateConflict { request, .. }
+            | Self::IdentityConflict { request }
+            | Self::NotFound { request }
+            | Self::NotAttempted { request }
+            | Self::UnsupportedAtomicCas { request }
+            | Self::UnknownOutcome { request, .. }
+            | Self::DurabilityUnconfirmed { request, .. }
+            | Self::Internal { request, .. }
+            | Self::SuccessKindMismatch { request } => request,
+        }
+    }
+
+    /// Reports whether a blind retry under a new operation identity is safe.
+    ///
+    /// Always `false`: no CAS disposition authorizes a blind retry. Conflict
+    /// and not-found outcomes require an explicit re-read and a new operation
+    /// identity; `NotAttempted` and `UnsupportedAtomicCas` require the backend
+    /// to attempt or declare capability first (`UnsupportedAtomicCas` is never
+    /// transient `ProviderUnavailable` and never becomes retry-eligible by
+    /// waiting); `UnknownOutcome`/`DurabilityUnconfirmed`/`Internal` require
+    /// same-operation reconciliation.
+    #[must_use]
+    pub const fn blind_retry_safe(&self) -> bool {
+        false
+    }
+
+    /// Reports whether this failure authorizes a blind retry as transient
+    /// provider unavailability.
+    ///
+    /// Always `false`: no CAS disposition degrades to transient
+    /// `ProviderUnavailable`. `UnsupportedAtomicCas` is a pre-mutation
+    /// capability state, `UnknownOutcome`/`DurabilityUnconfirmed` require
+    /// same-operation reconciliation, and conflict outcomes require an
+    /// explicit re-read/re-issue under a new operation identity.
+    #[must_use]
+    pub const fn retryable_as_transient_unavailable(&self) -> bool {
+        false
+    }
 }
 
 /// The precise operation phase at which the storage provider reported a
