@@ -286,6 +286,31 @@ def self_test() -> None:
             )
             route_path.write_text(json.dumps(_route_profile("codex")), encoding="utf-8")
 
+            route = _read_json(route_path)
+            route["disposition"] = {
+                "disposition": "unavailable-target",
+                "route_id": "codex.app-server.stdio",
+                "proof_ceiling": "DETERMINISTIC_PACKAGE_SHAPE_ONLY",
+                "expiry_condition": "reprobe-before-admission",
+                "per_attempt_receipt": True,
+                "required_probes": ["smoke-probe"],
+                "non_admittable_reasons": ["not-probed"],
+                "route_profile_sha256": "0" * 64,
+                "bundle_generation": "test-generation-1",
+            }
+            route_path.write_text(json.dumps(route), encoding="utf-8")
+            blocked_receipt = materialize_host_bundle(root, "codex", scratch / "disposition-block")
+            _assert_bundle(scratch / "disposition-block", "codex", blocked_receipt)
+
+            route = _read_json(route_path)
+            route["disposition"] = {"disposition": "admitted"}
+            route_path.write_text(json.dumps(route), encoding="utf-8")
+            _expect_failure(
+                "blocked bad disposition",
+                lambda: materialize_host_bundle(root, "codex", scratch / "blocked-bad-disposition"),
+            )
+            route_path.write_text(json.dumps(_route_profile("codex")), encoding="utf-8")
+
             manifest_path = root / MANIFEST_PATH
             manifest = _read_json(manifest_path)
             manifest["hosts"]["codex"]["payload"][0]["source"] = "../escape.json"
@@ -376,7 +401,7 @@ def main() -> int:
     arguments = parser.parse_args()
     if arguments.self_test:
         self_test()
-        print("AGENT_HOST_BUNDLES_SELF_TEST: PASS cases=11")
+        print("AGENT_HOST_BUNDLES_SELF_TEST: PASS cases=13")
     else:
         verify_current_tree(arguments.root.resolve())
         print("AGENT_HOST_BUNDLES_VERIFY: PASS hosts=4")

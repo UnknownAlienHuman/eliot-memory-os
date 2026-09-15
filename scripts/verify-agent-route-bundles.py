@@ -12,6 +12,7 @@ import json
 from pathlib import Path
 
 from agent_route_bundle_checks import (
+    DISPOSITIONS,
     PLUGIN,
     SCHEMA,
     identity_errors,
@@ -96,6 +97,45 @@ def self_test(root: Path) -> None:
     if identity_errors(clean_identity, "claude"):
         raise AssertionError(f"clean identity failed: {identity_errors(clean_identity, 'claude')}")
 
+    clean_block = {
+        "route_id": "codex.app-server.stdio",
+        "proof_ceiling": "DETERMINISTIC_PACKAGE_SHAPE_ONLY",
+        "expiry_condition": "reprobe-before-admission",
+        "per_attempt_receipt": True,
+        "required_probes": ["smoke-probe"],
+        "non_admittable_reasons": ["not-probed"],
+        "route_profile_sha256": "0" * 64,
+        "bundle_generation": "test-generation-1",
+    }
+    for scalar in DISPOSITIONS:
+        if scalar == "live-admitted":
+            continue
+        blocked = copy.deepcopy(profiles["codex"])
+        blocked["disposition"] = {**clean_block, "disposition": scalar}
+        blocked_findings = identity_errors(blocked, "codex")
+        if blocked_findings:
+            raise AssertionError(f"blocked {scalar} disposition failed: {blocked_findings}")
+        scalar_profile = copy.deepcopy(profiles["codex"])
+        scalar_profile["disposition"] = scalar
+        scalar_findings = identity_errors(scalar_profile, "codex")
+        if scalar_findings:
+            raise AssertionError(f"scalar {scalar} disposition failed: {scalar_findings}")
+
+    live_blocked = copy.deepcopy(profiles["codex"])
+    live_blocked["disposition"] = {**clean_block, "disposition": "live-admitted"}
+    live_block_findings = identity_errors(live_blocked, "codex")
+    expect(live_block_findings, "route_disposition_overclaim")
+    if any(code == "route_disposition_invalid" for code, _, _ in live_block_findings):
+        raise AssertionError(f"live-admitted block misflagged as invalid: {live_block_findings}")
+
+    bad_block_scalar = copy.deepcopy(profiles["codex"])
+    bad_block_scalar["disposition"] = {**clean_block, "disposition": "admitted"}
+    expect(identity_errors(bad_block_scalar, "codex"), "route_disposition_invalid")
+
+    bad_block_digest = copy.deepcopy(profiles["codex"])
+    bad_block_digest["disposition"] = {**clean_block, "route_profile_sha256": "forged"}
+    expect(identity_errors(bad_block_digest, "codex"), "route_identity_malformed")
+
     additional_property = copy.deepcopy(profiles["claude"])
     additional_property["undeclared"] = True
     expect(
@@ -136,7 +176,7 @@ def self_test(root: Path) -> None:
         plugin_errors(clean_plugin + "\nawait Promise.all([stdout, stderr])\n"),
         "opencode_unbounded_stream_wait",
     )
-    print("AGENT_ROUTE_BUNDLES_SELF_TEST: PASS cases=16")
+    print("AGENT_ROUTE_BUNDLES_SELF_TEST: PASS cases=26")
 
 
 def main() -> int:
