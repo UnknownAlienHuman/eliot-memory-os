@@ -546,7 +546,7 @@ fn check_committed_receipt(
             return Err(TaskLifecycleError::Store(failure));
         }
         if receipt.transition_class != TransitionClass::TaskControl
-            || receipt.operation_manifest_digest != manifest_digest
+            || receipt.operation_manifest_digest != *manifest_digest
         {
             let failure = store_failure(
                 StoreFailureDisposition::DeterministicRejection,
