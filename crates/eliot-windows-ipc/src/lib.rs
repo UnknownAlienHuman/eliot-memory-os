@@ -424,11 +424,31 @@ fn query_process_image(process: HANDLE) -> io::Result<PathBuf> {
             "process image buffer is too large",
         )
     })?;
-    // SAFETY: the process handle is live and the UTF-16 output buffer has `chars` elements.
+    // SAFETY: `process` is a live retained handle (every constructor wraps it
+    // in `OwnedHandle` before any query); `image` owns `chars` initialized
+    // `u16` slots and both pointers are live only for this call. The callee
+    // retains nothing; the returned length is validated by
+    // `truncate_image_buffer` below.
     let queried =
         unsafe { QueryFullProcessImageNameW(process, 0, image.as_mut_ptr(), &raw mut chars) };
-    if queried == 0 || chars == 0 {
+    if queried == 0 {
         return Err(io::Error::last_os_error());
+    }
+    truncate_image_buffer(image, chars)
+}
+
+/// Truncates a `QueryFullProcessImageNameW` output buffer to its reported length.
+///
+/// `chars` must be non-zero and strictly below the buffer length: a return
+/// equal to or larger than the buffer means the image was truncated (no room
+/// for the NUL) or the length is corrupt, so it fails closed instead of
+/// exposing trailing NULs.
+fn truncate_image_buffer(mut image: Vec<u16>, chars: u32) -> io::Result<PathBuf> {
+    if chars == 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "process image length is invalid",
+        ));
     }
     let chars = usize::try_from(chars).map_err(|_| {
         io::Error::new(
@@ -436,6 +456,12 @@ fn query_process_image(process: HANDLE) -> io::Result<PathBuf> {
             "process image length is invalid",
         )
     })?;
+    if chars >= image.len() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "process image length exceeds its buffer",
+        ));
+    }
     image.truncate(chars);
     Ok(PathBuf::from(OsString::from_wide(&image)))
 }
@@ -565,7 +591,7 @@ impl RecoverableProcess {
 /// Owns a Windows Job Object configured to kill the complete provider process
 /// tree when the guard is explicitly terminated or dropped.
 pub struct ProcessTreeGuard {
-    job: windows_sys::Win32::Foundation::HANDLE,
+    job: OwnedHandle,
 }
 
 impl ProcessTreeGuard {
@@ -582,11 +608,11 @@ impl ProcessTreeGuard {
                 "PID must be non-zero",
             ));
         }
-        // SAFETY: null name and security pointers request an unnamed job owned by this process.
-        let job = unsafe { CreateJobObjectW(ptr::null(), ptr::null()) };
-        if job.is_null() {
-            return Err(io::Error::last_os_error());
-        }
+        // SAFETY: null name and security pointers request an unnamed job owned
+        // by this process. `OwnedHandle::new` rejects both failure sentinels,
+        // so only a live job reaches the configuration below; every early
+        // return drops it exactly once with no manual close path.
+        let job = OwnedHandle::new(unsafe { CreateJobObjectW(ptr::null(), ptr::null()) })?;
         let mut info = JOBOBJECT_EXTENDED_LIMIT_INFORMATION::default();
         info.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
         let info_size = u32::try_from(std::mem::size_of_val(&info)).map_err(|_| {
@@ -598,36 +624,27 @@ impl ProcessTreeGuard {
         // SAFETY: `job` is live and `info` has the exact structure required by the selected class.
         let configured = unsafe {
             SetInformationJobObject(
-                job,
+                job.0,
                 JobObjectExtendedLimitInformation,
                 (&raw const info).cast(),
                 info_size,
             )
         };
         if configured == 0 {
-            let error = io::Error::last_os_error();
-            // SAFETY: `job` was created above and is closed exactly once on this error path.
-            unsafe { CloseHandle(job) };
-            return Err(error);
+            return Err(io::Error::last_os_error());
         }
         // SAFETY: numeric PID is provided by the freshly spawned child.
-        let process = unsafe { OpenProcess(PROCESS_SET_QUOTA | PROCESS_TERMINATE, 0, pid) };
-        if process.is_null() {
-            let error = io::Error::last_os_error();
-            // SAFETY: `job` was created above and is closed exactly once on this error path.
-            unsafe { CloseHandle(job) };
-            return Err(error);
-        }
+        // `OwnedHandle::new` rejects both failure sentinels, so only a live
+        // process reaches the assignment; it is dropped exactly once below.
+        let process = OwnedHandle::new(unsafe {
+            OpenProcess(PROCESS_SET_QUOTA | PROCESS_TERMINATE, 0, pid)
+        })?;
         // SAFETY: both handles are live for the duration of the call.
-        let assigned = unsafe { AssignProcessToJobObject(job, process) };
-        let assign_error = (assigned == 0).then(io::Error::last_os_error);
-        // SAFETY: `process` is no longer needed after assignment and is owned here.
-        unsafe { CloseHandle(process) };
-        if let Some(error) = assign_error {
-            // SAFETY: `job` was created above and is closed exactly once on this error path.
-            unsafe { CloseHandle(job) };
-            return Err(error);
+        let assigned = unsafe { AssignProcessToJobObject(job.0, process.0) };
+        if assigned == 0 {
+            return Err(io::Error::last_os_error());
         }
+        drop(process);
         Ok(Self { job })
     }
 
@@ -637,19 +654,12 @@ impl ProcessTreeGuard {
     ///
     /// Returns an error when Windows cannot terminate the Job Object.
     pub fn terminate(&self, exit_code: u32) -> io::Result<()> {
-        // SAFETY: `self.job` remains live until Drop.
-        let terminated = unsafe { TerminateJobObject(self.job, exit_code) };
+        // SAFETY: `self.job` is a live `OwnedHandle` that outlives this call.
+        let terminated = unsafe { TerminateJobObject(self.job.0, exit_code) };
         if terminated == 0 {
             return Err(io::Error::last_os_error());
         }
         Ok(())
-    }
-}
-
-impl Drop for ProcessTreeGuard {
-    fn drop(&mut self) {
-        // SAFETY: `self.job` is uniquely owned and closed exactly once here.
-        unsafe { CloseHandle(self.job) };
     }
 }
 
@@ -1020,6 +1030,23 @@ struct ProcThreadAttributeList {
 
 impl ProcThreadAttributeList {
     fn for_inherited_handles(handles: &[HANDLE]) -> io::Result<Self> {
+        // An empty slice would hand a dangling pointer to the attribute API,
+        // so it fails closed before any FFI call.
+        if handles.is_empty() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "at least one inheritable handle is required",
+            ));
+        }
+        let handle_bytes = handles
+            .len()
+            .checked_mul(std::mem::size_of::<HANDLE>())
+            .ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "process handle list is too large",
+                )
+            })?;
         let mut bytes = 0_usize;
         // SAFETY: the documented sizing call uses a null list and writes only
         // the required byte count.
@@ -1037,9 +1064,8 @@ impl ProcThreadAttributeList {
         if unsafe { InitializeProcThreadAttributeList(list, 1, 0, &raw mut bytes) } == 0 {
             return Err(io::Error::last_os_error());
         }
-        let handle_bytes = std::mem::size_of_val(handles);
-        // SAFETY: the attribute list is initialized, `handles` is live for the
-        // call, and the exact HANDLE array size is supplied.
+        // SAFETY: the attribute list is initialized, `handles` is non-empty
+        // and live for the call, and `handle_bytes` is its checked exact size.
         if unsafe {
             UpdateProcThreadAttribute(
                 list,
@@ -1089,19 +1115,30 @@ struct SuspendedProcessGuard {
 
 impl SuspendedProcessGuard {
     fn new(information: PROCESS_INFORMATION) -> io::Result<Self> {
-        if information.hProcess.is_null() || information.hThread.is_null() {
-            if !information.hProcess.is_null() {
+        // Both failure sentinels are rejected up front: a null handle was
+        // never opened, and `INVALID_HANDLE_VALUE` (-1) aliases the
+        // current-process pseudo-handle, so it must never reach
+        // `TerminateProcess` in the cleanup below.
+        let process_valid =
+            !information.hProcess.is_null() && information.hProcess != INVALID_HANDLE_VALUE;
+        let thread_valid =
+            !information.hThread.is_null() && information.hThread != INVALID_HANDLE_VALUE;
+        if !process_valid || !thread_valid {
+            if process_valid {
                 // SAFETY: `hProcess` was returned by CreateProcessW and is
-                // uniquely owned on this error path.
+                // uniquely owned on this error path (both sentinels rejected
+                // above). Termination plus a bounded wait prevents a suspended
+                // orphan before the error returns.
                 unsafe {
                     TerminateProcess(information.hProcess, 1);
                     WaitForSingleObject(information.hProcess, 5_000);
                     CloseHandle(information.hProcess);
                 }
             }
-            if !information.hThread.is_null() {
+            if thread_valid {
                 // SAFETY: `hThread` was returned by CreateProcessW and is
-                // uniquely owned on this error path.
+                // uniquely owned on this error path (both sentinels rejected
+                // above).
                 unsafe {
                     CloseHandle(information.hThread);
                 }
@@ -1120,6 +1157,12 @@ impl SuspendedProcessGuard {
 
     fn into_handles(mut self) -> (OwnedHandle, OwnedHandle) {
         self.armed = false;
+        debug_assert!(!self.process.is_null() && self.process != INVALID_HANDLE_VALUE);
+        debug_assert!(!self.thread.is_null() && self.thread != INVALID_HANDLE_VALUE);
+        // SAFETY: both handles were proven live by `new`'s dual-sentinel
+        // rejection; the fields are private and never mutated before this
+        // single transfer, and `armed = false` disables the Drop cleanup, so
+        // ownership moves into the two `OwnedHandle`s exactly once.
         (OwnedHandle(self.process), OwnedHandle(self.thread))
     }
 }
@@ -1646,6 +1689,45 @@ fn open_current_process_snapshot(pid: u32) -> io::Result<CurrentJobProcessSnapsh
     })
 }
 
+/// Views the first `count` process IDs of a `JobObjectBasicProcessIdList`
+/// buffer without lending provenance from its trailing `[usize; 1]` field.
+///
+/// The slice is derived from the whole-buffer base pointer in whole `usize`
+/// words with an exact bounds check, so it stays inside the live `buffer`.
+fn job_id_slice(buffer: &[usize], count: usize) -> io::Result<&[usize]> {
+    let word = std::mem::size_of::<usize>();
+    let list_offset = std::mem::size_of::<JOBOBJECT_BASIC_PROCESS_ID_LIST>()
+        .checked_sub(word)
+        .ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                "Job process list layout is invalid",
+            )
+        })?;
+    if list_offset % word != 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "Job process list layout is invalid",
+        ));
+    }
+    let needed = (list_offset / word).checked_add(count).ok_or_else(|| {
+        io::Error::new(io::ErrorKind::InvalidData, "Job process list is too large")
+    })?;
+    if needed > buffer.len() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "Job process list exceeded its supplied buffer",
+        ));
+    }
+    // SAFETY: the caller guarantees `buffer` starts with a kernel-initialized
+    // `JOBOBJECT_BASIC_PROCESS_ID_LIST` followed by at least `count` further
+    // initialized `usize` PIDs (proven by the exact bounds check above, with
+    // `count <= capacity` proven by the caller). The word-aligned base pointer
+    // keeps alignment; the slice is shared, overlaps no mutable borrow, and is
+    // copied out before return.
+    Ok(unsafe { std::slice::from_raw_parts(buffer.as_ptr().add(list_offset / word), count) })
+}
+
 fn job_process_ids(job: HANDLE) -> io::Result<Vec<u32>> {
     let mut capacity = 16_usize;
     loop {
@@ -1680,7 +1762,10 @@ fn job_process_ids(job: HANDLE) -> io::Result<Vec<u32>> {
                 &raw mut returned,
             )
         };
-        // SAFETY: the buffer is aligned and large enough for the fixed header on every path.
+        // SAFETY: `buffer` is `Vec<usize>` (pointer-aligned) and always holds
+        // at least the fixed header: capacity starts at 16 entries and only
+        // grows, so this header read stays in bounds on both paths and
+        // overlaps no live mutable borrow.
         let header = unsafe { &*buffer.as_ptr().cast::<JOBOBJECT_BASIC_PROCESS_ID_LIST>() };
         if queried != 0 {
             let count = usize::try_from(header.NumberOfProcessIdsInList).map_err(|_| {
@@ -1692,8 +1777,7 @@ fn job_process_ids(job: HANDLE) -> io::Result<Vec<u32>> {
                     "Job process list exceeded its supplied buffer",
                 ));
             }
-            // SAFETY: Windows reported `count` initialized entries within the supplied buffer.
-            let ids = unsafe { std::slice::from_raw_parts(header.ProcessIdList.as_ptr(), count) };
+            let ids = job_id_slice(&buffer, count)?;
             return ids
                 .iter()
                 .copied()
@@ -1800,8 +1884,10 @@ pub fn process_is_alive(pid: u32) -> io::Result<bool> {
         return Ok(false);
     }
     // SAFETY: OpenProcess receives a numeric PID and returns an owned handle.
+    // Failure is NULL per its contract; `INVALID_HANDLE_VALUE` is rejected
+    // alongside it so neither sentinel can reach the query below.
     let handle = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid) };
-    if handle.is_null() {
+    if handle.is_null() || handle == INVALID_HANDLE_VALUE {
         let error = io::Error::last_os_error();
         if error.raw_os_error() == i32::try_from(ERROR_INVALID_PARAMETER).ok() {
             return Ok(false);
@@ -3008,6 +3094,59 @@ mod tests {
     fn sid_validation_rejects_sddl_injection() {
         assert!(validate_sid("S-1-5-21-1234").is_ok());
         assert!(validate_sid("S-1-5-21)(A;;GA;;;WD").is_err());
+    }
+
+    #[test]
+    fn image_buffer_truncation_bound_fails_closed() -> Result<(), Box<dyn std::error::Error>> {
+        let buffer = vec![u16::from(b'a'), u16::from(b'b'), 0_u16, 0_u16];
+        assert_eq!(
+            super::truncate_image_buffer(buffer.clone(), 2)?,
+            std::path::PathBuf::from("ab")
+        );
+        for bad in [0_u32, 4, 5, u32::MAX] {
+            let Err(error) = super::truncate_image_buffer(buffer.clone(), bad) else {
+                panic!("truncated image length must fail closed");
+            };
+            assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn inherited_handle_list_rejects_empty_before_ffi() {
+        let Err(error) = super::ProcThreadAttributeList::for_inherited_handles(&[]) else {
+            panic!("empty handle list must fail closed before any FFI call");
+        };
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
+    }
+
+    #[test]
+    fn suspended_guard_rejects_sentinel_handles_without_cleanup()
+    -> Result<(), Box<dyn std::error::Error>> {
+        use windows_sys::Win32::Foundation::INVALID_HANDLE_VALUE;
+        use windows_sys::Win32::System::Threading::PROCESS_INFORMATION;
+        // Both sentinels are rejected; with no live handle there is nothing to
+        // terminate or close. `INVALID_HANDLE_VALUE` (-1) aliases the
+        // current-process pseudo-handle, so surviving this loop proves the
+        // cleanup cannot terminate the test process itself.
+        for (process, thread) in [
+            (std::ptr::null_mut(), std::ptr::null_mut()),
+            (INVALID_HANDLE_VALUE, INVALID_HANDLE_VALUE),
+            (std::ptr::null_mut(), INVALID_HANDLE_VALUE),
+            (INVALID_HANDLE_VALUE, std::ptr::null_mut()),
+        ] {
+            let information = PROCESS_INFORMATION {
+                hProcess: process,
+                hThread: thread,
+                ..PROCESS_INFORMATION::default()
+            };
+            let Err(error) = super::SuspendedProcessGuard::new(information) else {
+                panic!("sentinel process handles must fail closed");
+            };
+            assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+        }
+        assert!(process_is_alive(std::process::id())?);
+        Ok(())
     }
 
     #[test]
