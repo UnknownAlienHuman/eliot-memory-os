@@ -740,6 +740,309 @@ impl ProcessSessionBinding {
     }
 }
 
+/// Typed durable process-execution session class (issue #79).
+///
+/// A process caller session is never a transport connection: each class names
+/// the exact durable identity family that owns the execution session, while
+/// the replaceable pipe connection stays in the separate ephemeral
+/// [`ProcessSessionBinding`]. The class travels only inside the server-derived
+/// [`ProcessCallerSession`]; it is never parsed from a wire string, and no
+/// `connection_id` value is ever promoted into it.
+#[derive(
+    Clone, Copy, Debug, Eq, JsonSchema, Ord, PartialEq, PartialOrd, Serialize, Deserialize,
+)]
+#[serde(rename_all = "snake_case")]
+pub enum ProcessSessionClass {
+    /// Service-owned daemon generation (`eliotd` launch lineage).
+    EliotdGeneration,
+    /// Interactive User Broker session (stable SID plus broker session identity).
+    UserBrokerSession,
+    /// Test daemon attempt (testd job plus attempt lineage).
+    TestdAttempt,
+    /// Native worker attempt (worker claim plus attempt lineage).
+    NativeWorkerAttempt,
+}
+
+impl ProcessSessionClass {
+    /// Returns the stable class name used in diagnostics and receipts.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::EliotdGeneration => "eliotd_generation",
+            Self::UserBrokerSession => "user_broker_session",
+            Self::TestdAttempt => "testd_attempt",
+            Self::NativeWorkerAttempt => "native_worker_attempt",
+        }
+    }
+}
+
+/// Durable admitted process-caller session (issue #79).
+///
+/// Server-derived binding of the exact [`ProcessOwnerBinding`] to the exact
+/// durable execution [`SessionId`]. It is constructed only from admitted
+/// Kernel state (active daemon launch, authenticated peer identity, front-door
+/// policy generation) and never from `connection_id` or any other
+/// wire-supplied transport value. A reconnect preserves this binding while the
+/// ephemeral [`ProcessSessionBinding`] changes; a detach, revoke, logoff, or
+/// authority-epoch change invalidates it even if the pipe stays alive.
+#[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ProcessCallerSession {
+    class: ProcessSessionClass,
+    owner: ProcessOwnerBinding,
+    session_id: SessionId,
+}
+
+impl ProcessCallerSession {
+    /// Binds an exact owner to an exact durable session under one class.
+    ///
+    /// Callers must supply server-admitted values only: this constructor
+    /// cannot tell a transport `connection_id` from a durable session by
+    /// shape, so the invariant "never wire-supplied" is upheld by
+    /// constructing exclusively from Kernel-admitted state at the
+    /// dispatch seams.
+    pub fn new(
+        class: ProcessSessionClass,
+        owner: ProcessOwnerBinding,
+        session_id: SessionId,
+    ) -> Result<Self, ContractError> {
+        let session = Self {
+            class,
+            owner,
+            session_id,
+        };
+        session.validate()?;
+        Ok(session)
+    }
+
+    /// Validates the admitted binding without granting authority.
+    pub fn validate(&self) -> Result<(), ContractError> {
+        self.session_id.validate()?;
+        validate_opaque_id(
+            "caller_session_owner_module",
+            self.owner.module_id().to_owned(),
+        )?;
+        validate_hex_digest(
+            "caller_session_owner_principal",
+            self.owner.principal_digest(),
+        )?;
+        Ok(())
+    }
+
+    /// Returns the durable session class.
+    pub const fn class(&self) -> ProcessSessionClass {
+        self.class
+    }
+
+    /// Returns the exact admitted owner.
+    pub const fn owner(&self) -> &ProcessOwnerBinding {
+        &self.owner
+    }
+
+    /// Returns the exact durable session identity (never a `connection_id`).
+    pub const fn session_id(&self) -> &SessionId {
+        &self.session_id
+    }
+}
+
+/// Validates `intent.session_id` against the admitted durable caller session.
+///
+/// The intent session is authorized only by equality with the server-derived
+/// admitted binding; it is never compared against the transport
+/// `connection_id`, so copying a connection ID into a [`ProcessIntent`] can
+/// never authorize launch. The sealed effect digest is untouched: this check
+/// reads `session_id` but never rewrites it.
+///
+/// Distinct fail-closed failures:
+/// - wrong process owner (module or principal differs) →
+///   [`ContractError::DispatchBindingMismatch`];
+/// - stale authority epoch on the presented owner or the admission fence →
+///   [`ContractError::StaleAuthorityEpoch`];
+/// - stale fence/owner generation → [`ContractError::FenceMismatch`];
+/// - stale or foreign durable session (including a copied `connection_id`) →
+///   [`ContractError::StaleProcessSession`].
+pub fn validate_process_intent_session(
+    intent: &ProcessIntent,
+    admitted: &ProcessCallerSession,
+    presented_owner: &ProcessOwnerBinding,
+    fence: &FencingToken,
+) -> Result<(), ContractError> {
+    admitted.validate()?;
+    if presented_owner.module_id() != admitted.owner.module_id()
+        || presented_owner.principal_digest() != admitted.owner.principal_digest()
+    {
+        return Err(ContractError::DispatchBindingMismatch);
+    }
+    if !presented_owner
+        .authority_epoch()
+        .is_same_authority(admitted.owner.authority_epoch())
+        || !fence
+            .authority_epoch()
+            .is_same_authority(admitted.owner.authority_epoch())
+    {
+        return Err(ContractError::StaleAuthorityEpoch);
+    }
+    if presented_owner.generation() != admitted.owner.generation()
+        || fence.generation() != admitted.owner.generation()
+    {
+        return Err(ContractError::FenceMismatch);
+    }
+    if intent.session_id() != admitted.session_id() {
+        return Err(ContractError::StaleProcessSession);
+    }
+    Ok(())
+}
+
+/// Validates that the presented ephemeral transport binding is exactly the
+/// currently established one.
+///
+/// Transport identity authorizes routing and replay fencing only: a mismatch
+/// fails with [`ContractError::StaleTransportBinding`] and never promotes the
+/// presenting pipe into process ownership.
+pub fn validate_process_transport_binding(
+    presented: &ProcessSessionBinding,
+    current: &ProcessSessionBinding,
+) -> Result<(), ContractError> {
+    if presented != current {
+        return Err(ContractError::StaleTransportBinding);
+    }
+    Ok(())
+}
+
+/// Explicit Kernel receipt rebinding replaceable transport to an unchanged
+/// durable caller session (issue #79, I7.14–I7.15).
+///
+/// Minted server-side when a reconnect (or a fresh pipe for the same
+/// principal) binds a new `(connection_id, session_epoch)` pair to the
+/// already-admitted [`ProcessCallerSession`]. The durable session, owner, and
+/// class never change across the rebind, so the sealed intent/effect digest
+/// is preserved by construction. The receipt digest seals the whole binding:
+/// a receipt cannot be transplanted across sessions, owners, connections, or
+/// epochs. Fencing the superseded transport remains the front-door's duty;
+/// this receipt only proves the new binding.
+#[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ProcessTransportRebindReceipt {
+    class: ProcessSessionClass,
+    owner: ProcessOwnerBinding,
+    session_id: SessionId,
+    connection_id: String,
+    session_epoch: u64,
+    authority_epoch: EpochId,
+    receipt_digest: String,
+}
+
+impl ProcessTransportRebindReceipt {
+    /// Mints a rebind receipt for the new transport of an admitted caller.
+    ///
+    /// `connection_id` and `session_epoch` are the freshly established
+    /// transport values; a zero transport epoch is stale transport material
+    /// and fails with [`ContractError::StaleTransportBinding`].
+    pub fn mint(
+        caller: &ProcessCallerSession,
+        connection_id: impl Into<String>,
+        session_epoch: u64,
+    ) -> Result<Self, ContractError> {
+        caller.validate()?;
+        let connection_id = validate_opaque_id("rebind_connection_id", connection_id.into())?;
+        if session_epoch == 0 {
+            return Err(ContractError::StaleTransportBinding);
+        }
+        let mut receipt = Self {
+            class: caller.class,
+            owner: caller.owner.clone(),
+            session_id: caller.session_id.clone(),
+            connection_id,
+            session_epoch,
+            authority_epoch: caller.owner.authority_epoch.clone(),
+            receipt_digest: String::new(),
+        };
+        receipt.receipt_digest = receipt.compute_digest()?;
+        Ok(receipt)
+    }
+
+    /// Validates the receipt shape and its sealing digest.
+    pub fn validate(&self) -> Result<(), ContractError> {
+        self.session_id.validate()?;
+        validate_opaque_id("rebind_connection_id", self.connection_id.clone())?;
+        if self.session_epoch == 0 {
+            return Err(ContractError::StaleTransportBinding);
+        }
+        validate_stored_digest(
+            "rebind_receipt_digest",
+            &self.receipt_digest,
+            self.compute_digest()?,
+        )
+    }
+
+    /// Returns true only when this receipt rebinds transport for exactly
+    /// `caller` without changing durable identity.
+    pub fn rebinds(&self, caller: &ProcessCallerSession) -> bool {
+        self.validate().is_ok()
+            && self.class == caller.class
+            && self.owner == caller.owner
+            && self.session_id == caller.session_id
+    }
+
+    /// Returns the durable session class carried across the rebind.
+    pub const fn class(&self) -> ProcessSessionClass {
+        self.class
+    }
+
+    /// Returns the admitted owner carried across the rebind.
+    pub const fn owner(&self) -> &ProcessOwnerBinding {
+        &self.owner
+    }
+
+    /// Returns the unchanged durable session identity.
+    pub const fn session_id(&self) -> &SessionId {
+        &self.session_id
+    }
+
+    /// Returns the newly bound transport connection identity (routing only).
+    pub fn connection_id(&self) -> &str {
+        &self.connection_id
+    }
+
+    /// Returns the newly bound transport session epoch (routing only).
+    pub const fn session_epoch(&self) -> u64 {
+        self.session_epoch
+    }
+
+    /// Returns the authority epoch fenced at rebind time.
+    pub const fn authority_epoch(&self) -> &EpochId {
+        &self.authority_epoch
+    }
+
+    /// Returns the sealing digest over the whole rebind binding.
+    pub fn receipt_digest(&self) -> &str {
+        &self.receipt_digest
+    }
+
+    fn compute_digest(&self) -> Result<String, ContractError> {
+        #[derive(Serialize)]
+        struct RebindMaterial<'a> {
+            class: &'a str,
+            module_id: &'a str,
+            principal_digest: &'a str,
+            authority_epoch: &'a EpochId,
+            generation: Generation,
+            session_id: &'a SessionId,
+            connection_id: &'a str,
+            session_epoch: u64,
+        }
+        hash_serialized(&RebindMaterial {
+            class: self.class.as_str(),
+            module_id: self.owner.module_id(),
+            principal_digest: self.owner.principal_digest(),
+            authority_epoch: &self.authority_epoch,
+            generation: self.owner.generation(),
+            session_id: &self.session_id,
+            connection_id: &self.connection_id,
+            session_epoch: self.session_epoch,
+        })
+    }
+}
+
 impl ProcessExecutionAdmissionRequest {
     /// Creates an inert, bounded admission request.
     pub fn new(
@@ -2447,6 +2750,16 @@ pub enum ContractError {
     /// The active authority epoch changed.
     #[error("STALE_AUTHORITY_EPOCH")]
     StaleAuthorityEpoch,
+    /// The presented durable process session does not match the admitted
+    /// caller binding. A transport `connection_id` copied into the intent
+    /// always fails here; transport identity never authorizes a session.
+    #[error("STALE_PROCESS_SESSION")]
+    StaleProcessSession,
+    /// The presented transport binding is stale or belongs to another
+    /// connection. Transport identity authorizes routing only, never
+    /// process ownership.
+    #[error("STALE_TRANSPORT_BINDING")]
+    StaleTransportBinding,
     /// A required revision head changed.
     #[error("dispatch permit revision heads are stale")]
     StaleRevisionHeads,
@@ -3765,6 +4078,336 @@ mod tests {
         ready.validate()?;
         let ready_value = serde_json::to_value(&ready)?;
         assert_eq!(ready_value["authority_epoch"], serde_json::json!(3));
+        Ok(())
+    }
+
+    fn caller_owner(
+        module: &str,
+        epoch_sequence: u64,
+        generation: u64,
+    ) -> Result<ProcessOwnerBinding, ContractError> {
+        ProcessOwnerBinding::new(
+            module,
+            "a".repeat(64),
+            test_epoch(CANONICAL_LINEAGE_A, epoch_sequence)?,
+            Generation::new(generation)?,
+        )
+    }
+
+    fn caller_fence(epoch_sequence: u64, generation: u64) -> Result<FencingToken, ContractError> {
+        FencingToken::new(
+            test_epoch(CANONICAL_LINEAGE_A, epoch_sequence)?,
+            Generation::new(generation)?,
+            format!("caller-fence-{epoch_sequence}-{generation}"),
+        )
+    }
+
+    fn caller_session(
+        class: ProcessSessionClass,
+        module: &str,
+        session: &str,
+        epoch_sequence: u64,
+        generation: u64,
+    ) -> Result<ProcessCallerSession, ContractError> {
+        ProcessCallerSession::new(
+            class,
+            caller_owner(module, epoch_sequence, generation)?,
+            SessionId::new(session)?,
+        )
+    }
+
+    fn intent_with_session(session: &str) -> Result<ProcessIntent, ContractError> {
+        let seed = intent()?;
+        ProcessIntent::new(
+            seed.operation_id().clone(),
+            seed.process_tree_id().clone(),
+            seed.job_id().clone(),
+            seed.image_id().clone(),
+            SessionId::new(session)?,
+            seed.generation(),
+            seed.executable(),
+            seed.executable_sha256(),
+            seed.argv().to_vec(),
+            seed.working_directory(),
+            seed.environment().clone(),
+            *seed.resource_limits(),
+        )
+    }
+
+    #[test]
+    fn session_class_names_are_stable() {
+        assert_eq!(
+            ProcessSessionClass::EliotdGeneration.as_str(),
+            "eliotd_generation"
+        );
+        assert_eq!(
+            ProcessSessionClass::UserBrokerSession.as_str(),
+            "user_broker_session"
+        );
+        assert_eq!(ProcessSessionClass::TestdAttempt.as_str(), "testd_attempt");
+        assert_eq!(
+            ProcessSessionClass::NativeWorkerAttempt.as_str(),
+            "native_worker_attempt"
+        );
+    }
+
+    #[test]
+    fn each_session_class_validates_its_exact_binding() -> TestResult {
+        for (class, module) in [
+            (ProcessSessionClass::EliotdGeneration, "eliotd"),
+            (ProcessSessionClass::UserBrokerSession, "eliot-user-broker"),
+            (ProcessSessionClass::TestdAttempt, "eliot-testd"),
+            (
+                ProcessSessionClass::NativeWorkerAttempt,
+                "eliot-native-worker",
+            ),
+        ] {
+            let admitted = caller_session(class, module, "session-1", 7, 1)?;
+            assert_eq!(admitted.class(), class);
+            validate_process_intent_session(
+                &intent()?,
+                &admitted,
+                &caller_owner(module, 7, 1)?,
+                &caller_fence(7, 1)?,
+            )?;
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn copied_connection_id_never_authorizes_launch() -> TestResult {
+        let admitted = caller_session(
+            ProcessSessionClass::UserBrokerSession,
+            "eliot-user-broker",
+            "session-1",
+            7,
+            1,
+        )?;
+        // The admitted durable session is never the transport connection.
+        assert_ne!(admitted.session_id().as_str(), "pipe-conn-9");
+        let forged = intent_with_session("pipe-conn-9")?;
+        assert!(matches!(
+            validate_process_intent_session(
+                &forged,
+                &admitted,
+                &caller_owner("eliot-user-broker", 7, 1)?,
+                &caller_fence(7, 1)?,
+            ),
+            Err(ContractError::StaleProcessSession)
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn foreign_session_fails_with_stale_process_session() -> TestResult {
+        let admitted = caller_session(
+            ProcessSessionClass::TestdAttempt,
+            "eliot-testd",
+            "session-1",
+            7,
+            1,
+        )?;
+        let foreign = intent_with_session("session-2")?;
+        assert!(matches!(
+            validate_process_intent_session(
+                &foreign,
+                &admitted,
+                &caller_owner("eliot-testd", 7, 1)?,
+                &caller_fence(7, 1)?,
+            ),
+            Err(ContractError::StaleProcessSession)
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn wrong_owner_module_or_principal_fails_with_binding_mismatch() -> TestResult {
+        let admitted = caller_session(
+            ProcessSessionClass::UserBrokerSession,
+            "eliot-user-broker",
+            "session-1",
+            7,
+            1,
+        )?;
+        let current = intent()?;
+        let fence = caller_fence(7, 1)?;
+        // A different module can never present this binding.
+        assert!(matches!(
+            validate_process_intent_session(
+                &current,
+                &admitted,
+                &caller_owner("eliot-testd", 7, 1)?,
+                &fence,
+            ),
+            Err(ContractError::DispatchBindingMismatch)
+        ));
+        // A different principal under the same module cannot either.
+        let foreign_principal = ProcessOwnerBinding::new(
+            "eliot-user-broker",
+            "b".repeat(64),
+            test_epoch(CANONICAL_LINEAGE_A, 7)?,
+            Generation::new(1)?,
+        )?;
+        assert!(matches!(
+            validate_process_intent_session(&current, &admitted, &foreign_principal, &fence,),
+            Err(ContractError::DispatchBindingMismatch)
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn stale_epoch_fails_with_stale_authority_epoch() -> TestResult {
+        let admitted = caller_session(
+            ProcessSessionClass::EliotdGeneration,
+            "eliotd",
+            "session-1",
+            7,
+            1,
+        )?;
+        let current = intent()?;
+        // A presented owner from a superseded epoch fences even for the
+        // same principal and module.
+        assert!(matches!(
+            validate_process_intent_session(
+                &current,
+                &admitted,
+                &caller_owner("eliotd", 6, 1)?,
+                &caller_fence(7, 1)?,
+            ),
+            Err(ContractError::StaleAuthorityEpoch)
+        ));
+        // A fence carried from a superseded epoch fences as well.
+        assert!(matches!(
+            validate_process_intent_session(
+                &current,
+                &admitted,
+                &caller_owner("eliotd", 7, 1)?,
+                &caller_fence(6, 1)?,
+            ),
+            Err(ContractError::StaleAuthorityEpoch)
+        ));
+        // Cross-lineage equal sequences never authorize.
+        let cross_lineage_owner = ProcessOwnerBinding::new(
+            "eliotd",
+            "a".repeat(64),
+            test_epoch(CANONICAL_LINEAGE_B, 7)?,
+            Generation::new(1)?,
+        )?;
+        assert!(matches!(
+            validate_process_intent_session(
+                &current,
+                &admitted,
+                &cross_lineage_owner,
+                &caller_fence(7, 1)?,
+            ),
+            Err(ContractError::StaleAuthorityEpoch)
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn stale_generation_fails_with_fence_mismatch() -> TestResult {
+        let admitted = caller_session(
+            ProcessSessionClass::NativeWorkerAttempt,
+            "eliot-native-worker",
+            "session-1",
+            7,
+            1,
+        )?;
+        let current = intent()?;
+        assert!(matches!(
+            validate_process_intent_session(
+                &current,
+                &admitted,
+                &caller_owner("eliot-native-worker", 7, 2)?,
+                &caller_fence(7, 1)?,
+            ),
+            Err(ContractError::FenceMismatch)
+        ));
+        assert!(matches!(
+            validate_process_intent_session(
+                &current,
+                &admitted,
+                &caller_owner("eliot-native-worker", 7, 1)?,
+                &caller_fence(7, 2)?,
+            ),
+            Err(ContractError::FenceMismatch)
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn transport_binding_mismatch_is_stale_transport() -> TestResult {
+        let current = ProcessSessionBinding::new("pipe-conn-9", 3)?;
+        assert!(validate_process_transport_binding(&current, &current).is_ok());
+        let other_pipe = ProcessSessionBinding::new("pipe-conn-10", 3)?;
+        assert!(matches!(
+            validate_process_transport_binding(&other_pipe, &current),
+            Err(ContractError::StaleTransportBinding)
+        ));
+        let other_epoch = ProcessSessionBinding::new("pipe-conn-9", 4)?;
+        assert!(matches!(
+            validate_process_transport_binding(&other_epoch, &current),
+            Err(ContractError::StaleTransportBinding)
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn rebind_receipt_preserves_durable_session_across_connections() -> TestResult {
+        let caller = caller_session(
+            ProcessSessionClass::UserBrokerSession,
+            "eliot-user-broker",
+            "session-1",
+            7,
+            1,
+        )?;
+        let before = intent()?;
+        let first = ProcessTransportRebindReceipt::mint(&caller, "pipe-conn-9", 3)?;
+        let second = ProcessTransportRebindReceipt::mint(&caller, "pipe-conn-10", 4)?;
+        first.validate()?;
+        second.validate()?;
+        assert!(first.rebinds(&caller));
+        assert!(second.rebinds(&caller));
+        // The durable session never changes across the rebind, so the sealed
+        // intent/effect identity is preserved by construction.
+        assert_eq!(first.session_id(), second.session_id());
+        assert_eq!(first.session_id().as_str(), before.session_id().as_str());
+        assert_ne!(first.connection_id(), second.connection_id());
+        assert_ne!(first.receipt_digest(), second.receipt_digest());
+        Ok(())
+    }
+
+    #[test]
+    fn rebind_receipt_rejects_stale_transport_and_tampering() -> TestResult {
+        let caller = caller_session(
+            ProcessSessionClass::EliotdGeneration,
+            "eliotd",
+            "session-1",
+            7,
+            1,
+        )?;
+        assert!(matches!(
+            ProcessTransportRebindReceipt::mint(&caller, "pipe-conn-9", 0),
+            Err(ContractError::StaleTransportBinding)
+        ));
+        let receipt = ProcessTransportRebindReceipt::mint(&caller, "pipe-conn-9", 3)?;
+        let mut tampered_value = serde_json::to_value(&receipt)?;
+        tampered_value["connection_id"] = serde_json::json!("pipe-conn-10");
+        let tampered: ProcessTransportRebindReceipt = serde_json::from_value(tampered_value)?;
+        assert!(matches!(
+            tampered.validate(),
+            Err(ContractError::DigestMismatch { .. })
+        ));
+        assert!(!tampered.rebinds(&caller));
+        let foreign = caller_session(
+            ProcessSessionClass::EliotdGeneration,
+            "eliotd",
+            "session-2",
+            7,
+            1,
+        )?;
+        assert!(!receipt.rebinds(&foreign));
         Ok(())
     }
 }

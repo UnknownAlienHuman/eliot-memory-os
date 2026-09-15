@@ -25,11 +25,13 @@ use super::ImageId;
 use super::JobId;
 use super::KernelBuildError;
 use super::KernelComposition;
+use super::ProcessCallerSession;
 use super::ProcessExecutionAdmissionRequest;
 use super::ProcessExecutionError;
 use super::ProcessIntent;
 use super::ProcessOwnerBinding;
 use super::ProcessPathProof;
+use super::ProcessSessionClass;
 use super::ProcessStartReceipt;
 use super::ProcessTreeId;
 use super::ResourceLimits;
@@ -149,6 +151,29 @@ impl KernelComposition {
         )
         .map_err(|error| KernelBuildError::Service(error.to_string()))?;
         let proof = Self::retain_eliotd_path_proof(&launch, &admission)?;
+        // Issue #79: the service-owned launch joins the same typed session
+        // validation the frame gateway enforces. The admitted caller session
+        // carries the just-minted intent session under the daemon-generation
+        // class (server-minted, never wire-supplied); any future mint skew
+        // between intent, owner, and fence fails here instead of spawning an
+        // unbound process.
+        let caller_session = ProcessCallerSession::new(
+            ProcessSessionClass::EliotdGeneration,
+            owner.clone(),
+            admission.intent().session_id().clone(),
+        )
+        .map_err(|error| {
+            KernelBuildError::Service(format!("eliotd caller session binding failed: {error}"))
+        })?;
+        eliot_process::validate_process_intent_session(
+            admission.intent(),
+            &caller_session,
+            &owner,
+            admission.state_fence(),
+        )
+        .map_err(|error| {
+            KernelBuildError::Service(format!("eliotd intent session binding failed: {error}"))
+        })?;
         {
             let mut state = self.daemon_runtime.lock().map_err(|_| {
                 KernelBuildError::Service("daemon runtime lock poisoned".to_owned())

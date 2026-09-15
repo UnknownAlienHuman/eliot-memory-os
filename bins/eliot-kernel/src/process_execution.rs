@@ -1389,6 +1389,35 @@ pub(crate) fn authorize_process_owner(
     Ok(())
 }
 
+/// Maps a typed process session validation failure to a bounded stable
+/// rejection (issue #79).
+///
+/// Stale transport, stale session, stale epoch/fence, and wrong owner each
+/// keep a distinct wire code so callers can tell a superseded pipe from a
+/// foreign session without trusting the pipe. Any other contract failure
+/// keeps the existing generic contract projection.
+pub(crate) fn process_session_rejection(
+    error: eliot_process::ContractError,
+) -> eliot_kernel_service::ProcessExecutionRejection {
+    let code = match &error {
+        eliot_process::ContractError::StaleProcessSession => "STALE_PROCESS_SESSION",
+        eliot_process::ContractError::StaleTransportBinding => "STALE_TRANSPORT_BINDING",
+        eliot_process::ContractError::StaleAuthorityEpoch => "STALE_AUTHORITY_EPOCH",
+        eliot_process::ContractError::StaleStateFence
+        | eliot_process::ContractError::FenceMismatch => "STALE_PROCESS_FENCE",
+        eliot_process::ContractError::DispatchBindingMismatch => "PROCESS_OWNER_MISMATCH",
+        _ => {
+            return eliot_kernel_service::ProcessExecutionRejection::from_error(
+                &ProcessExecutionError::Contract(error),
+            );
+        }
+    };
+    eliot_kernel_service::ProcessExecutionRejection {
+        code: code.to_owned(),
+        detail: error.to_string().chars().take(512).collect(),
+    }
+}
+
 impl KernelComposition {
     pub async fn execute_process_request(
         &self,
@@ -1405,13 +1434,46 @@ impl KernelComposition {
                 },
             );
         };
-        if session_binding != expected_session_binding {
+        if eliot_process::validate_process_transport_binding(
+            &session_binding,
+            &expected_session_binding,
+        )
+        .is_err()
+        {
             return ProcessExecutionResponse::Rejected(
                 eliot_kernel_service::ProcessExecutionRejection {
                     code: "SESSION_BINDING_MISMATCH".to_owned(),
                     detail: "process operation session binding does not match the established authenticated session".to_owned(),
                 },
             );
+        }
+        // Issue #79: the intent session must validate against the
+        // server-derived admitted process-owner/session binding, never
+        // against the presenting pipe. Identity validates before authority
+        // dispatch: a copied `connection_id`, a foreign or stale session, a
+        // stale epoch/fence, and a wrong owner each reject with a distinct
+        // typed code, while cancel and reconcile below stay on
+        // operation/owner identity.
+        if let ProcessExecutionRequest::Start(admission) = &request {
+            let caller = match self.admitted_process_caller_session(session) {
+                Ok(caller) => caller,
+                Err(error) => {
+                    return ProcessExecutionResponse::Rejected(
+                        eliot_kernel_service::ProcessExecutionRejection {
+                            code: "ADMITTED_CALLER_SESSION_REQUIRED".to_owned(),
+                            detail: error.to_string().chars().take(512).collect(),
+                        },
+                    );
+                }
+            };
+            if let Err(error) = eliot_process::validate_process_intent_session(
+                admission.intent(),
+                &caller,
+                &owner,
+                admission.state_fence(),
+            ) {
+                return ProcessExecutionResponse::Rejected(process_session_rejection(error));
+            }
         }
         let Some(gateway) = &self.process_gateway else {
             return ProcessExecutionResponse::Rejected(
