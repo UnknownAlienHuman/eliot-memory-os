@@ -1,0 +1,67 @@
+{
+  "suite": "durable_work",
+  "issue": 698,
+  "description": "Owner-controlled profile for the durable staged-work and no-lost-child proof. The accepted runner executes exactly expected_sequences seeded sequences; no worker filter or flag lowers the count.",
+  "expected_sequences": 10000,
+  "base_seed": 6980311,
+  "min_steps": 6,
+  "max_steps": 14,
+  "admission": {
+    "task_id": "task-1",
+    "session_id": "session-1",
+    "task_revision": "1",
+    "cell_id": "swarm-cell-1",
+    "scope_prefix": "scope-dw",
+    "route_class": "test-route-class",
+    "contract_note": "admission receipts are VERIFICATION/SUCCESS/SCOPED_VERIFICATION owned by Governor with operation durable.work.admit and one artifact bound to the payload digest"
+  },
+  "budgets": [
+    { "dimension": "COMPUTE_STEPS", "limit": 64 },
+    { "dimension": "COST_MICROUNITS", "limit": 64 },
+    { "dimension": "EVIDENCE_BYTES", "limit": 64 }
+  ],
+  "bounds": {
+    "max_retries": 2,
+    "max_children": 3,
+    "max_depth": 2,
+    "max_pending_reviews": 2
+  },
+  "phases": [
+    "ADMITTED_NOT_STAGED",
+    "STAGED_NOT_ASSIGNED",
+    "ASSIGNED",
+    "LAUNCH_REQUESTED",
+    "LAUNCH_NOT_ATTEMPTED",
+    "RUNNING",
+    "CHECKPOINTED",
+    "CANCELLATION_REQUESTED",
+    "COMPLETION_CANDIDATE",
+    "TERMINAL",
+    "UNKNOWN_OUTCOME",
+    "QUARANTINED"
+  ],
+  "terminal_kinds": [
+    "COMPLETED",
+    "FAILED_PROVED_NO_EFFECT",
+    "FAILED_EXHAUSTED",
+    "CANCELLED_BEFORE_LAUNCH",
+    "CANCELLED_AFTER_EFFECT",
+    "PARTIAL"
+  ],
+  "fault_stages": [
+    "stage",
+    "assign",
+    "launch-intent",
+    "launch-outcome",
+    "heartbeat",
+    "checkpoint",
+    "cancel",
+    "complete"
+  ],
+  "reviews": {
+    "required_review": "review-required-1",
+    "optional_review": "review-optional-1",
+    "artifact": "artifact-dw-1",
+    "artifact_revision": "rev-1"
+  }
+}

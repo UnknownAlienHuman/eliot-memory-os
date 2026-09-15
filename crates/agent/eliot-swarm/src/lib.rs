@@ -3357,9 +3357,7 @@ pub mod durable_work {
         ))
     }
 
-    fn validate_definition_text(
-        definition: &AdmittedWorkDefinition,
-    ) -> Result<(), SwarmError> {
+    fn validate_definition_text(definition: &AdmittedWorkDefinition) -> Result<(), SwarmError> {
         for (field, value) in [
             ("parent_task_id", definition.parent_task_id.as_str()),
             ("cell_id", definition.cell_id.as_str()),
@@ -3465,9 +3463,7 @@ pub mod durable_work {
     /// Replays an ordered record log into its tip. Duplicate trailing delivery
     /// of the exact tip is idempotent; gaps, reorders, digest breaks, schema
     /// drift or a changed definition digest all fail closed.
-    pub fn replay_records(
-        records: &[DurableWorkRecord],
-    ) -> Result<DurableWorkRecord, SwarmError> {
+    pub fn replay_records(records: &[DurableWorkRecord]) -> Result<DurableWorkRecord, SwarmError> {
         let Some(first) = records.first() else {
             return Err(SwarmError::InvalidSnapshot);
         };
@@ -3582,14 +3578,13 @@ pub mod durable_work {
         }
 
         fn begin_transition(
-            &self,
             current: &DurableWorkRecord,
             phase: WorkUnitPhase,
             operation_key: String,
         ) -> DurableWorkRecord {
             let mut next = current.clone();
             next.sequence = current.sequence.saturating_add(1);
-            next.prev_digest = current.digest.clone();
+            next.prev_digest.clone_from(&current.digest);
             next.phase = phase;
             next.operation_key = operation_key;
             next.digest.clear();
@@ -3611,10 +3606,8 @@ pub mod durable_work {
             if receipt.sequence != record.sequence || receipt.digest != record.digest {
                 return Err(SwarmError::InvalidSnapshot);
             }
-            self.applied_operations
-                .insert(record.operation_key.clone());
-            self.units
-                .insert(record.work_id.clone(), record.clone());
+            self.applied_operations.insert(record.operation_key.clone());
+            self.units.insert(record.work_id.clone(), record.clone());
             Ok(record)
         }
 
@@ -3628,7 +3621,11 @@ pub mod durable_work {
             }
         }
 
-        fn route_request_key(route_class: &str, fence_digest: &str, epoch: u64) -> Result<String, SwarmError> {
+        fn route_request_key(
+            route_class: &str,
+            fence_digest: &str,
+            epoch: u64,
+        ) -> Result<String, SwarmError> {
             digest(&(route_class, fence_digest, epoch))
         }
 
@@ -3647,13 +3644,13 @@ pub mod durable_work {
                 fence_digest: record.state_fence_digest.clone(),
                 epoch: record.authority_epoch,
             };
-            let grant = self
-                .catalogue()?
-                .lookup(&request)
-                .map_err(|error| SwarmError::Provider {
-                    provider: RequiredProvider::RouteCatalogue,
-                    source: error,
-                })?;
+            let grant =
+                self.catalogue()?
+                    .lookup(&request)
+                    .map_err(|error| SwarmError::Provider {
+                        provider: RequiredProvider::RouteCatalogue,
+                        source: error,
+                    })?;
             if grant.route_id.trim().is_empty()
                 || grant.fingerprint.trim().is_empty()
                 || grant.evidence_digest.trim().is_empty()
@@ -3670,8 +3667,9 @@ pub mod durable_work {
         pub fn admit(
             &mut self,
             definition: AdmittedWorkDefinition,
-            operation_key: String,
+            operation_key: impl Into<String>,
         ) -> Result<DurableWorkRecord, SwarmError> {
+            let operation_key = operation_key.into();
             self.check_operation(&operation_key)?;
             validate_definition_text(&definition)?;
             let definition_hash = definition_digest(&definition)?;
@@ -3698,25 +3696,25 @@ pub mod durable_work {
             }
             let record = DurableWorkRecord {
                 schema_version: DURABLE_WORK_SCHEMA_VERSION,
-                work_id: definition.work_id.clone(),
+                work_id: definition.work_id,
                 sequence: 1,
                 phase: WorkUnitPhase::AdmittedNotStaged,
                 terminal: None,
                 definition_digest: definition_hash,
-                payload_digest: definition.payload_digest.clone(),
-                parent_task_id: definition.parent_task_id.clone(),
-                cell_id: definition.cell_id.clone(),
-                attempt_ref: definition.attempt_ref.clone(),
-                task_id: definition.task_id.clone(),
-                session_id: definition.session_id.clone(),
-                scope_id: definition.scope_id.clone(),
-                state_fence_digest: definition.state_fence_digest.clone(),
+                payload_digest: definition.payload_digest,
+                parent_task_id: definition.parent_task_id,
+                cell_id: definition.cell_id,
+                attempt_ref: definition.attempt_ref,
+                task_id: definition.task_id,
+                session_id: definition.session_id,
+                scope_id: definition.scope_id,
+                state_fence_digest: definition.state_fence_digest,
                 authority_epoch: definition.authority_epoch,
                 term: definition.term,
                 owner: None,
                 route: None,
-                route_class: definition.route_class.clone(),
-                dependencies: definition.dependencies.clone(),
+                route_class: definition.route_class,
+                dependencies: definition.dependencies,
                 launch: None,
                 effect: EffectCertainty::NoEffect,
                 budgets,
@@ -3755,8 +3753,9 @@ pub mod durable_work {
         pub fn stage_work(
             &mut self,
             work_id: &WorkUnitId,
-            operation_key: String,
+            operation_key: impl Into<String>,
         ) -> Result<DurableWorkRecord, SwarmError> {
+            let operation_key = operation_key.into();
             self.check_operation(&operation_key)?;
             let current = self.get(work_id)?;
             if current.phase != WorkUnitPhase::AdmittedNotStaged {
@@ -3779,7 +3778,7 @@ pub mod durable_work {
                 }
             })?;
             let mut next =
-                self.begin_transition(&current, WorkUnitPhase::StagedNotAssigned, operation_key);
+                Self::begin_transition(&current, WorkUnitPhase::StagedNotAssigned, operation_key);
             next.route = Some(route);
             self.commit(next)
         }
@@ -3790,8 +3789,9 @@ pub mod durable_work {
             &mut self,
             work_id: &WorkUnitId,
             owner: OwnerBinding,
-            operation_key: String,
+            operation_key: impl Into<String>,
         ) -> Result<DurableWorkRecord, SwarmError> {
+            let operation_key = operation_key.into();
             self.check_operation(&operation_key)?;
             validate_text(&owner.worker_id, "worker_id")?;
             validate_text(&owner.process_id, "process_id")?;
@@ -3805,8 +3805,7 @@ pub mod durable_work {
             if current.route.is_none() {
                 return Err(SwarmError::IllegalTransition);
             }
-            let mut next =
-                self.begin_transition(&current, WorkUnitPhase::Assigned, operation_key);
+            let mut next = Self::begin_transition(&current, WorkUnitPhase::Assigned, operation_key);
             next.owner = Some(owner);
             self.commit(next)
         }
@@ -3820,8 +3819,9 @@ pub mod durable_work {
         pub fn request_launch(
             &mut self,
             work_id: &WorkUnitId,
-            operation_key: String,
+            operation_key: impl Into<String>,
         ) -> Result<DurableWorkRecord, SwarmError> {
+            let operation_key = operation_key.into();
             self.check_operation(&operation_key)?;
             let current = self.get(work_id)?;
             if current.phase != WorkUnitPhase::Assigned {
@@ -3847,7 +3847,7 @@ pub mod durable_work {
                 fence_digest: current.state_fence_digest.clone(),
             };
             let mut intent_record =
-                self.begin_transition(&current, WorkUnitPhase::LaunchRequested, operation_key);
+                Self::begin_transition(&current, WorkUnitPhase::LaunchRequested, operation_key);
             intent_record.launch = Some(PersistedLaunch {
                 operation_id: operation_id.clone(),
                 attempt_id: attempt_id.clone(),
@@ -3860,7 +3860,7 @@ pub mod durable_work {
                 Ok(LaunchOutcome::Started { child }) => {
                     validate_text(&child.child_id, "child_id")?;
                     validate_text(&child.process_identity, "process_identity")?;
-                    let mut next = self.begin_transition(
+                    let mut next = Self::begin_transition(
                         &intent_record,
                         WorkUnitPhase::Running,
                         format!("{operation_id}:started"),
@@ -3875,7 +3875,7 @@ pub mod durable_work {
                 }
                 Ok(LaunchOutcome::Refused { reason }) => {
                     validate_text(&reason, "refusal_reason")?;
-                    let mut next = self.begin_transition(
+                    let mut next = Self::begin_transition(
                         &intent_record,
                         WorkUnitPhase::LaunchNotAttempted,
                         format!("{operation_id}:refused"),
@@ -3892,11 +3892,13 @@ pub mod durable_work {
                     Ok(committed)
                 }
                 Ok(LaunchOutcome::Unknown)
-                | Err(ProviderError::Unknown)
-                | Err(ProviderError::Timeout)
-                | Err(ProviderError::Failed)
-                | Err(ProviderError::Unavailable) => {
-                    let mut next = self.begin_transition(
+                | Err(
+                    ProviderError::Unknown
+                    | ProviderError::Timeout
+                    | ProviderError::Failed
+                    | ProviderError::Unavailable,
+                ) => {
+                    let mut next = Self::begin_transition(
                         &intent_record,
                         WorkUnitPhase::UnknownOutcome,
                         format!("{operation_id}:unknown"),
@@ -3925,7 +3927,7 @@ pub mod durable_work {
         pub fn heartbeat(
             &mut self,
             work_id: &WorkUnitId,
-            signal: HeartbeatSignal,
+            signal: &HeartbeatSignal,
         ) -> Result<DurableWorkRecord, SwarmError> {
             validate_text(&signal.worker_id, "worker_id")?;
             validate_text(&signal.fence_digest, "fence_digest")?;
@@ -3957,7 +3959,7 @@ pub mod durable_work {
             if signal.sequence != current.heartbeat_sequence.saturating_add(1) {
                 return Err(SwarmError::ReplayDetected);
             }
-            let mut next = self.begin_transition(
+            let mut next = Self::begin_transition(
                 &current,
                 current.phase,
                 format!("{}:heartbeat:{}", work_id.as_str(), signal.sequence),
@@ -3973,8 +3975,9 @@ pub mod durable_work {
             &mut self,
             work_id: &WorkUnitId,
             checkpoint: WorkCheckpoint,
-            operation_key: String,
+            operation_key: impl Into<String>,
         ) -> Result<DurableWorkRecord, SwarmError> {
+            let operation_key = operation_key.into();
             self.check_operation(&operation_key)?;
             validate_text(&checkpoint.checkpoint_id, "checkpoint_id")?;
             validate_text(&checkpoint.input_digest, "input_digest")?;
@@ -3994,11 +3997,8 @@ pub mod durable_work {
             {
                 return Err(SwarmError::BindingMismatch);
             }
-            let mut next = self.begin_transition(
-                &current,
-                WorkUnitPhase::Checkpointed,
-                operation_key,
-            );
+            let mut next =
+                Self::begin_transition(&current, WorkUnitPhase::Checkpointed, operation_key);
             next.checkpoint = Some(checkpoint);
             self.commit(next)
         }
@@ -4010,9 +4010,10 @@ pub mod durable_work {
         pub fn resume(
             &mut self,
             work_id: &WorkUnitId,
-            remaining_work: Vec<String>,
-            operation_key: String,
+            remaining_work: &[String],
+            operation_key: impl Into<String>,
         ) -> Result<DurableWorkRecord, SwarmError> {
+            let operation_key = operation_key.into();
             self.check_operation(&operation_key)?;
             let current = self.get(work_id)?;
             if current.phase != WorkUnitPhase::Checkpointed {
@@ -4027,11 +4028,8 @@ pub mod durable_work {
                 || checkpoint.input_digest != current.payload_digest
                 || checkpoint.route_fingerprint != route.fingerprint
             {
-                let mut quarantined = self.begin_transition(
-                    &current,
-                    WorkUnitPhase::Quarantined,
-                    operation_key,
-                );
+                let mut quarantined =
+                    Self::begin_transition(&current, WorkUnitPhase::Quarantined, operation_key);
                 quarantined.checkpoint = Some(checkpoint);
                 let committed = self.commit(quarantined)?;
                 if committed.effect != EffectCertainty::PossibleEffect {
@@ -4039,8 +4037,7 @@ pub mod durable_work {
                 }
                 return Err(SwarmError::StaleLineage);
             }
-            let next =
-                self.begin_transition(&current, WorkUnitPhase::Running, operation_key);
+            let next = Self::begin_transition(&current, WorkUnitPhase::Running, operation_key);
             self.commit(next)
         }
 
@@ -4051,8 +4048,9 @@ pub mod durable_work {
         pub fn request_safe_restart(
             &mut self,
             definition: AdmittedWorkDefinition,
-            operation_key: String,
+            operation_key: impl Into<String>,
         ) -> Result<DurableWorkRecord, SwarmError> {
+            let operation_key = operation_key.into();
             self.check_operation(&operation_key)?;
             validate_definition_text(&definition)?;
             let current = self.get(&definition.work_id)?;
@@ -4064,25 +4062,22 @@ pub mod durable_work {
             }
             validate_admission_receipt(&definition, self.ports.verifier)?;
             let route = self.lookup_route_from_definition(&definition)?;
-            let mut next = self.begin_transition(
-                &current,
-                WorkUnitPhase::StagedNotAssigned,
-                operation_key,
-            );
+            let mut next =
+                Self::begin_transition(&current, WorkUnitPhase::StagedNotAssigned, operation_key);
             next.definition_digest = definition_digest(&definition)?;
-            next.payload_digest = definition.payload_digest.clone();
-            next.parent_task_id = definition.parent_task_id.clone();
-            next.cell_id = definition.cell_id.clone();
-            next.attempt_ref = definition.attempt_ref.clone();
-            next.task_id = definition.task_id.clone();
-            next.session_id = definition.session_id.clone();
-            next.state_fence_digest = definition.state_fence_digest.clone();
+            next.payload_digest = definition.payload_digest;
+            next.parent_task_id = definition.parent_task_id;
+            next.cell_id = definition.cell_id;
+            next.attempt_ref = definition.attempt_ref;
+            next.task_id = definition.task_id;
+            next.session_id = definition.session_id;
+            next.state_fence_digest = definition.state_fence_digest;
             next.authority_epoch = definition.authority_epoch;
             next.term = definition.term;
             next.owner = None;
             next.route = Some(route);
-            next.route_class = definition.route_class.clone();
-            next.dependencies = definition.dependencies.clone();
+            next.route_class = definition.route_class;
+            next.dependencies = definition.dependencies;
             next.launch = None;
             next.effect = EffectCertainty::NoEffect;
             next.heartbeat_sequence = 0;
@@ -4127,20 +4122,17 @@ pub mod durable_work {
             }
             let request = RouteRequest {
                 route_class: definition.route_class.clone(),
-                requirements_digest: digest(&(
-                    &definition.payload_digest,
-                    &definition.budgets,
-                ))?,
+                requirements_digest: digest(&(&definition.payload_digest, &definition.budgets))?,
                 fence_digest: definition.state_fence_digest.clone(),
                 epoch: definition.authority_epoch,
             };
-            let grant = self
-                .catalogue()?
-                .lookup(&request)
-                .map_err(|error| SwarmError::Provider {
-                    provider: RequiredProvider::RouteCatalogue,
-                    source: error,
-                })?;
+            let grant =
+                self.catalogue()?
+                    .lookup(&request)
+                    .map_err(|error| SwarmError::Provider {
+                        provider: RequiredProvider::RouteCatalogue,
+                        source: error,
+                    })?;
             if grant.route_id.trim().is_empty()
                 || grant.fingerprint.trim().is_empty()
                 || grant.evidence_digest.trim().is_empty()
@@ -4159,17 +4151,17 @@ pub mod durable_work {
         pub fn request_cancel(
             &mut self,
             work_id: &WorkUnitId,
-            operation_key: String,
+            operation_key: impl Into<String>,
         ) -> Result<DurableWorkRecord, SwarmError> {
+            let operation_key = operation_key.into();
             self.check_operation(&operation_key)?;
             let current = self.get(work_id)?;
             match current.phase {
-                WorkUnitPhase::StagedNotAssigned | WorkUnitPhase::Assigned => {
-                    let mut next = self.begin_transition(
-                        &current,
-                        WorkUnitPhase::Terminal,
-                        operation_key,
-                    );
+                WorkUnitPhase::AdmittedNotStaged
+                | WorkUnitPhase::StagedNotAssigned
+                | WorkUnitPhase::Assigned => {
+                    let mut next =
+                        Self::begin_transition(&current, WorkUnitPhase::Terminal, operation_key);
                     next.terminal = Some(TerminalKind::CancelledBeforeLaunch);
                     next.effect = EffectCertainty::ProvedNoEffect;
                     next.cancellation = CancellationPhase::Observed;
@@ -4181,7 +4173,7 @@ pub mod durable_work {
                 | WorkUnitPhase::Checkpointed
                 | WorkUnitPhase::LaunchRequested
                 | WorkUnitPhase::UnknownOutcome => {
-                    let mut requested = self.begin_transition(
+                    let mut requested = Self::begin_transition(
                         &current,
                         WorkUnitPhase::CancellationRequested,
                         operation_key,
@@ -4200,17 +4192,14 @@ pub mod durable_work {
         ) -> Result<DurableWorkRecord, SwarmError> {
             let launch = requested.launch.clone().unwrap_or(PersistedLaunch {
                 operation_id: format!("{}:no-launch", requested.work_id.as_str()),
-                attempt_id: AgentAttemptId::new(format!(
-                    "{}-attempt",
-                    requested.work_id.as_str()
-                ))
-                .map_err(|_| SwarmError::Contract)?,
+                attempt_id: AgentAttemptId::new(format!("{}-attempt", requested.work_id.as_str()))
+                    .map_err(|_| SwarmError::Contract)?,
                 child: None,
                 executor_called: false,
             });
             let Some(child) = launch.child.clone() else {
                 if launch.executor_called {
-                    let mut next = self.begin_transition(
+                    let mut next = Self::begin_transition(
                         requested,
                         WorkUnitPhase::UnknownOutcome,
                         format!("{}:cancel-uncertain", requested.work_id.as_str()),
@@ -4218,7 +4207,7 @@ pub mod durable_work {
                     next.effect = EffectCertainty::PossibleEffect;
                     return self.commit(next);
                 }
-                let mut next = self.begin_transition(
+                let mut next = Self::begin_transition(
                     requested,
                     WorkUnitPhase::Terminal,
                     format!("{}:cancel-before-start", requested.work_id.as_str()),
@@ -4233,7 +4222,7 @@ pub mod durable_work {
             let cancel_outcome = self.executor()?.cancel(&child);
             match cancel_outcome {
                 Ok(CancelOutcome::CancelledBeforeStart) => {
-                    let mut next = self.begin_transition(
+                    let mut next = Self::begin_transition(
                         requested,
                         WorkUnitPhase::Terminal,
                         format!("{}:cancel-before-start", requested.work_id.as_str()),
@@ -4245,10 +4234,8 @@ pub mod durable_work {
                     self.release_scope(&committed);
                     Ok(committed)
                 }
-                Ok(CancelOutcome::CancelRequested { .. }) | Ok(CancelOutcome::Unknown) => {
-                    self.observe_after_cancel(requested, Some(&child))
-                }
-                Err(ProviderError::Unknown) | Err(ProviderError::Timeout) => {
+                Ok(CancelOutcome::CancelRequested { .. } | CancelOutcome::Unknown)
+                | Err(ProviderError::Unknown | ProviderError::Timeout) => {
                     self.observe_after_cancel(requested, Some(&child))
                 }
                 Err(error) => Err(SwarmError::Provider {
@@ -4273,7 +4260,7 @@ pub mod durable_work {
                     validate_text(&exit.child.process_identity, "process_identity")?;
                     match &exit.effects {
                         ExitEffects::PossibleEffect { .. } => {
-                            let mut next = self.begin_transition(
+                            let mut next = Self::begin_transition(
                                 requested,
                                 WorkUnitPhase::UnknownOutcome,
                                 format!("{}:cancel-uncertain", requested.work_id.as_str()),
@@ -4284,7 +4271,7 @@ pub mod durable_work {
                         }
                         ExitEffects::ProvedNoEffect { .. }
                         | ExitEffects::CleanWithArtifacts { .. } => {
-                            let mut next = self.begin_transition(
+                            let mut next = Self::begin_transition(
                                 requested,
                                 WorkUnitPhase::Terminal,
                                 format!("{}:cancel-after-effect", requested.work_id.as_str()),
@@ -4299,8 +4286,10 @@ pub mod durable_work {
                         }
                     }
                 }
-                Ok(_) | Err(_) => {
-                    let mut next = self.begin_transition(
+                Ok(ObserveOutcome::Running { .. }) => Ok(requested.clone()),
+                Ok(ObserveOutcome::Unknown)
+                | Err(ProviderError::Unknown | ProviderError::Timeout) => {
+                    let mut next = Self::begin_transition(
                         requested,
                         WorkUnitPhase::UnknownOutcome,
                         format!("{}:cancel-uncertain", requested.work_id.as_str()),
@@ -4308,6 +4297,10 @@ pub mod durable_work {
                     next.effect = EffectCertainty::PossibleEffect;
                     self.commit(next)
                 }
+                Err(error) => Err(SwarmError::Provider {
+                    provider: RequiredProvider::WorkExecutor,
+                    source: error,
+                }),
             }
         }
 
@@ -4329,7 +4322,10 @@ pub mod durable_work {
             ) {
                 return Err(SwarmError::IllegalTransition);
             }
-            let launch = current.launch.clone().ok_or(SwarmError::IllegalTransition)?;
+            let launch = current
+                .launch
+                .clone()
+                .ok_or(SwarmError::IllegalTransition)?;
             let Some(child) = launch.child.clone() else {
                 return Err(SwarmError::IllegalTransition);
             };
@@ -4384,15 +4380,14 @@ pub mod durable_work {
                 .launch
                 .as_ref()
                 .and_then(|bound| bound.child.as_ref())
+                && recorded.process_identity != exit.child.process_identity
             {
-                if recorded.process_identity != exit.child.process_identity {
-                    return Ok(current.clone());
-                }
+                return Ok(current.clone());
             }
             match &exit.effects {
                 ExitEffects::CleanWithArtifacts { artifacts_digest } => {
                     validate_text(artifacts_digest, "artifacts_digest")?;
-                    let mut next = self.begin_transition(
+                    let mut next = Self::begin_transition(
                         current,
                         WorkUnitPhase::CompletionCandidate,
                         format!("{}:exit-candidate", current.work_id.as_str()),
@@ -4404,7 +4399,7 @@ pub mod durable_work {
                 }
                 ExitEffects::ProvedNoEffect { proof_digest } => {
                     validate_text(proof_digest, "proof_digest")?;
-                    let mut next = self.begin_transition(
+                    let mut next = Self::begin_transition(
                         current,
                         WorkUnitPhase::Terminal,
                         format!("{}:exit-no-effect", current.work_id.as_str()),
@@ -4418,7 +4413,7 @@ pub mod durable_work {
                 }
                 ExitEffects::PossibleEffect { detail } => {
                     validate_text(detail, "effect_detail")?;
-                    let mut next = self.begin_transition(
+                    let mut next = Self::begin_transition(
                         current,
                         WorkUnitPhase::UnknownOutcome,
                         format!("{}:exit-uncertain", current.work_id.as_str()),
@@ -4437,7 +4432,7 @@ pub mod durable_work {
             if current.phase == WorkUnitPhase::UnknownOutcome {
                 return Ok(current.clone());
             }
-            let mut next = self.begin_transition(
+            let mut next = Self::begin_transition(
                 current,
                 WorkUnitPhase::UnknownOutcome,
                 format!("{}:observed-unknown", current.work_id.as_str()),
@@ -4455,8 +4450,9 @@ pub mod durable_work {
             &mut self,
             work_id: &WorkUnitId,
             result: WorkerResult,
-            operation_key: String,
+            operation_key: impl Into<String>,
         ) -> Result<DurableWorkRecord, SwarmError> {
+            let operation_key = operation_key.into();
             self.check_operation(&operation_key)?;
             validate_text(&result.artifacts_digest, "artifacts_digest")?;
             validate_text(&result.output_ref, "output_ref")?;
@@ -4477,11 +4473,8 @@ pub mod durable_work {
             if let Some(evidence) = &result.evidence_digest {
                 validate_text(evidence, "evidence_digest")?;
             }
-            let mut next = self.begin_transition(
-                &current,
-                WorkUnitPhase::CompletionCandidate,
-                operation_key,
-            );
+            let mut next =
+                Self::begin_transition(&current, WorkUnitPhase::CompletionCandidate, operation_key);
             next.result_digest = Some(result.artifacts_digest);
             self.commit(next)
         }
@@ -4517,17 +4510,28 @@ pub mod durable_work {
                         .launch
                         .as_ref()
                         .and_then(|bound| bound.child.as_ref());
-                    if let Some(known) = recorded {
-                        if *known != child {
-                            return Ok((current, ReconcileOutcome::StaleIgnored));
-                        }
+                    if let Some(known) = recorded
+                        && *known != child
+                    {
+                        return Ok((current, ReconcileOutcome::StaleIgnored));
                     }
-                    if current.phase == WorkUnitPhase::Running {
+                    if matches!(
+                        current.phase,
+                        WorkUnitPhase::Running
+                            | WorkUnitPhase::Checkpointed
+                            | WorkUnitPhase::CancellationRequested
+                    ) {
                         return Ok((current, ReconcileOutcome::Reattached));
                     }
-                    let mut next = self.begin_transition(
+                    let target = match current.phase {
+                        WorkUnitPhase::Running
+                        | WorkUnitPhase::Checkpointed
+                        | WorkUnitPhase::CancellationRequested => current.phase,
+                        _ => WorkUnitPhase::Running,
+                    };
+                    let mut next = Self::begin_transition(
                         &current,
-                        WorkUnitPhase::Running,
+                        target,
                         format!("{}:reattached", work_id.as_str()),
                     );
                     if let Some(bound) = next.launch.as_mut() {
@@ -4546,25 +4550,23 @@ pub mod durable_work {
                         .as_ref()
                         .and_then(|bound| bound.child.as_ref())
                         .map(|child| child.process_identity.clone());
-                    if let Some(known) = recorded_identity {
-                        if known != exit.child.process_identity {
-                            return Ok((current, ReconcileOutcome::StaleIgnored));
-                        }
+                    if let Some(known) = recorded_identity
+                        && known != exit.child.process_identity
+                    {
+                        return Ok((current, ReconcileOutcome::StaleIgnored));
                     }
-                    let before = current.phase;
                     let committed = self.apply_exit(&current, exit)?;
-                    let outcome = if committed.phase == WorkUnitPhase::Terminal {
-                        ReconcileOutcome::ProvedNoEffectTerminal
-                    } else if committed.digest == current.digest || committed.phase == before {
+                    let outcome = if committed.digest == current.digest {
                         ReconcileOutcome::AlreadyApplied
+                    } else if committed.phase == WorkUnitPhase::Terminal {
+                        ReconcileOutcome::ProvedNoEffectTerminal
                     } else {
                         ReconcileOutcome::ExitedApplied
                     };
                     Ok((committed, outcome))
                 }
                 Ok(ObserveOutcome::Unknown)
-                | Err(ProviderError::Unknown)
-                | Err(ProviderError::Timeout) => {
+                | Err(ProviderError::Unknown | ProviderError::Timeout) => {
                     if current.phase == WorkUnitPhase::UnknownOutcome {
                         return Ok((current, ReconcileOutcome::StillUnknownBlocked));
                     }
@@ -4585,8 +4587,9 @@ pub mod durable_work {
             &mut self,
             parent_id: &WorkUnitId,
             child_id: &WorkUnitId,
-            operation_key: String,
+            operation_key: impl Into<String>,
         ) -> Result<DurableWorkRecord, SwarmError> {
+            let operation_key = operation_key.into();
             self.check_operation(&operation_key)?;
             let parent = self.get(parent_id)?;
             let child = self.get(child_id)?;
@@ -4602,14 +4605,9 @@ pub mod durable_work {
                 return Err(SwarmError::IllegalTransition);
             }
             if child.parent.is_some() || parent.children.contains(child_id) {
-                if child.parent.as_ref() == Some(parent_id)
-                    && !parent.children.contains(child_id)
-                {
-                    let mut next_parent = self.begin_transition(
-                        &parent,
-                        parent.phase,
-                        operation_key,
-                    );
+                if child.parent.as_ref() == Some(parent_id) && !parent.children.contains(child_id) {
+                    let mut next_parent =
+                        Self::begin_transition(&parent, parent.phase, operation_key);
                     next_parent.children.insert(child_id.clone());
                     return self.commit(next_parent);
                 }
@@ -4622,7 +4620,7 @@ pub mod durable_work {
             if child_depth > parent.max_depth {
                 return Err(SwarmError::IllegalTransition);
             }
-            let mut next_child = self.begin_transition(
+            let mut next_child = Self::begin_transition(
                 &child,
                 child.phase,
                 format!("{}:adopted", child_id.as_str()),
@@ -4630,11 +4628,7 @@ pub mod durable_work {
             next_child.parent = Some(parent_id.clone());
             next_child.depth = child_depth;
             self.commit(next_child)?;
-            let mut next_parent = self.begin_transition(
-                &parent,
-                parent.phase,
-                operation_key,
-            );
+            let mut next_parent = Self::begin_transition(&parent, parent.phase, operation_key);
             next_parent.children.insert(child_id.clone());
             self.commit(next_parent)
         }
@@ -4659,9 +4653,7 @@ pub mod durable_work {
                     WorkUnitPhase::LaunchNotAttempted => {
                         ChildDisposition::Terminal(TerminalKind::CancelledBeforeLaunch)
                     }
-                    WorkUnitPhase::UnknownOutcome => {
-                        ChildDisposition::UnknownBlocked
-                    }
+                    WorkUnitPhase::UnknownOutcome => ChildDisposition::UnknownBlocked,
                     WorkUnitPhase::Quarantined => ChildDisposition::Stale,
                     _ => ChildDisposition::Running,
                 };
@@ -4675,10 +4667,7 @@ pub mod durable_work {
         /// each, every required review resolved, and no unresolved effect.
         /// One unresolved or unconsumed child blocks the parent; late evidence
         /// is retained without completing the wrong attempt.
-        pub fn close_parent(
-            &self,
-            parent_id: &WorkUnitId,
-        ) -> Result<ParentCandidate, SwarmError> {
+        pub fn close_parent(&self, parent_id: &WorkUnitId) -> Result<ParentCandidate, SwarmError> {
             let parent = self.get(parent_id)?;
             if parent.phase != WorkUnitPhase::CompletionCandidate {
                 return Err(SwarmError::IllegalTransition);
@@ -4687,7 +4676,12 @@ pub mod durable_work {
                 return Err(SwarmError::EffectUnresolved);
             }
             for review in &parent.reviews {
-                if review.required && review.state != ReviewState::Resolved {
+                if review.required
+                    && !matches!(
+                        review.state,
+                        ReviewState::Resolved | ReviewState::Superseded
+                    )
+                {
                     return Err(SwarmError::ReviewBlocksClosure);
                 }
             }
@@ -4740,8 +4734,9 @@ pub mod durable_work {
         pub fn note_timeout(
             &mut self,
             work_id: &WorkUnitId,
-            operation_key: String,
+            operation_key: impl Into<String>,
         ) -> Result<DurableWorkRecord, SwarmError> {
+            let operation_key = operation_key.into();
             self.check_operation(&operation_key)?;
             let current = self.get(work_id)?;
             if !matches!(
@@ -4752,7 +4747,7 @@ pub mod durable_work {
             ) {
                 return Err(SwarmError::IllegalTransition);
             }
-            let mut next = self.begin_transition(&current, current.phase, operation_key);
+            let mut next = Self::begin_transition(&current, current.phase, operation_key);
             next.timeout_count = current.timeout_count.saturating_add(1);
             self.commit(next)
         }
@@ -4762,8 +4757,9 @@ pub mod durable_work {
         pub fn note_retry(
             &mut self,
             work_id: &WorkUnitId,
-            operation_key: String,
+            operation_key: impl Into<String>,
         ) -> Result<(DurableWorkRecord, RetryOutcome), SwarmError> {
+            let operation_key = operation_key.into();
             self.check_operation(&operation_key)?;
             let current = self.get(work_id)?;
             if !matches!(
@@ -4775,16 +4771,13 @@ pub mod durable_work {
                 return Err(SwarmError::IllegalTransition);
             }
             if current.retry_count < current.max_retries {
-                let mut next = self.begin_transition(&current, current.phase, operation_key);
+                let mut next = Self::begin_transition(&current, current.phase, operation_key);
                 next.retry_count = current.retry_count.saturating_add(1);
                 let committed = self.commit(next)?;
                 Ok((committed, RetryOutcome::Scheduled))
             } else {
-                let mut next = self.begin_transition(
-                    &current,
-                    WorkUnitPhase::Terminal,
-                    operation_key,
-                );
+                let mut next =
+                    Self::begin_transition(&current, WorkUnitPhase::Terminal, operation_key);
                 next.terminal = Some(TerminalKind::FailedExhausted);
                 let committed = self.commit(next)?;
                 self.release_scope(&committed);
@@ -4816,15 +4809,16 @@ pub mod durable_work {
             work_id: &WorkUnitId,
             dimension: BudgetDimension,
             amount: u64,
-            operation_key: String,
+            operation_key: impl Into<String>,
         ) -> Result<DurableWorkRecord, SwarmError> {
+            let operation_key = operation_key.into();
             self.check_operation(&operation_key)?;
             if amount == 0 {
                 return Err(SwarmError::Contract);
             }
             let current = self.get(work_id)?;
             Self::require_live(&current)?;
-            let mut next = self.begin_transition(&current, current.phase, operation_key);
+            let mut next = Self::begin_transition(&current, current.phase, operation_key);
             let account = Self::budget_account_mut(&mut next, dimension)?;
             if amount > account.remaining() {
                 return Err(SwarmError::BudgetExceeded);
@@ -4839,15 +4833,16 @@ pub mod durable_work {
             work_id: &WorkUnitId,
             dimension: BudgetDimension,
             amount: u64,
-            operation_key: String,
+            operation_key: impl Into<String>,
         ) -> Result<DurableWorkRecord, SwarmError> {
+            let operation_key = operation_key.into();
             self.check_operation(&operation_key)?;
             if amount == 0 {
                 return Err(SwarmError::Contract);
             }
             let current = self.get(work_id)?;
             Self::require_live(&current)?;
-            let mut next = self.begin_transition(&current, current.phase, operation_key);
+            let mut next = Self::begin_transition(&current, current.phase, operation_key);
             let account = Self::budget_account_mut(&mut next, dimension)?;
             if amount > account.remaining() {
                 return Err(SwarmError::BudgetExceeded);
@@ -4862,15 +4857,16 @@ pub mod durable_work {
             work_id: &WorkUnitId,
             dimension: BudgetDimension,
             amount: u64,
-            operation_key: String,
+            operation_key: impl Into<String>,
         ) -> Result<DurableWorkRecord, SwarmError> {
+            let operation_key = operation_key.into();
             self.check_operation(&operation_key)?;
             if amount == 0 {
                 return Err(SwarmError::Contract);
             }
             let current = self.get(work_id)?;
             Self::require_live(&current)?;
-            let mut next = self.begin_transition(&current, current.phase, operation_key);
+            let mut next = Self::begin_transition(&current, current.phase, operation_key);
             let account = Self::budget_account_mut(&mut next, dimension)?;
             if amount > account.reserved {
                 return Err(SwarmError::Contract);
@@ -4886,8 +4882,9 @@ pub mod durable_work {
             &mut self,
             work_id: &WorkUnitId,
             proposal: ReviewProposal,
-            operation_key: String,
+            operation_key: impl Into<String>,
         ) -> Result<DurableWorkRecord, SwarmError> {
+            let operation_key = operation_key.into();
             self.check_operation(&operation_key)?;
             validate_text(&proposal.artifact_id, "artifact_id")?;
             validate_text(&proposal.artifact_revision, "artifact_revision")?;
@@ -4905,10 +4902,7 @@ pub mod durable_work {
                 .reviews
                 .iter()
                 .filter(|review| {
-                    matches!(
-                        review.state,
-                        ReviewState::Delivered | ReviewState::Answered
-                    )
+                    matches!(review.state, ReviewState::Delivered | ReviewState::Answered)
                 })
                 .count();
             let state = if pending >= current.max_pending_reviews as usize {
@@ -4916,7 +4910,7 @@ pub mod durable_work {
             } else {
                 ReviewState::Delivered
             };
-            let mut next = self.begin_transition(&current, current.phase, operation_key);
+            let mut next = Self::begin_transition(&current, current.phase, operation_key);
             next.message_sequence = next.message_sequence.saturating_add(1);
             let message = PeerMessage {
                 work_id: work_id.clone(),
@@ -4926,19 +4920,17 @@ pub mod durable_work {
                 kind: PeerMessageKind::ReviewItem,
                 payload_digest: proposal.content_digest.clone(),
             };
-            let receipt = self.peer()?.post(&message).map_err(|error| {
-                SwarmError::Provider {
+            let receipt = self
+                .peer()?
+                .post(&message)
+                .map_err(|error| SwarmError::Provider {
                     provider: RequiredProvider::PeerChannel,
                     source: error,
-                }
-            })?;
+                })?;
             if receipt.sequence != message.sequence {
                 return Err(SwarmError::InvalidSnapshot);
             }
-            next.messages.push(PostedPeerMessage {
-                message,
-                receipt,
-            });
+            next.messages.push(PostedPeerMessage { message, receipt });
             next.reviews.push(ReviewRecord {
                 review_id: proposal.review_id,
                 artifact_id: proposal.artifact_id,
@@ -4955,12 +4947,13 @@ pub mod durable_work {
             review_id: &ClaimId,
             from: &[ReviewState],
             to: ReviewState,
-            operation_key: String,
+            operation_key: impl Into<String>,
         ) -> Result<DurableWorkRecord, SwarmError> {
+            let operation_key = operation_key.into();
             self.check_operation(&operation_key)?;
             let current = self.get(work_id)?;
             Self::require_live(&current)?;
-            let mut next = self.begin_transition(&current, current.phase, operation_key);
+            let mut next = Self::begin_transition(&current, current.phase, operation_key);
             let Some(review) = next
                 .reviews
                 .iter_mut()
@@ -4980,7 +4973,7 @@ pub mod durable_work {
             &mut self,
             work_id: &WorkUnitId,
             review_id: &ClaimId,
-            operation_key: String,
+            operation_key: impl Into<String>,
         ) -> Result<DurableWorkRecord, SwarmError> {
             self.review_transition(
                 work_id,
@@ -4996,7 +4989,7 @@ pub mod durable_work {
             &mut self,
             work_id: &WorkUnitId,
             review_id: &ClaimId,
-            operation_key: String,
+            operation_key: impl Into<String>,
         ) -> Result<DurableWorkRecord, SwarmError> {
             self.review_transition(
                 work_id,
@@ -5012,7 +5005,7 @@ pub mod durable_work {
             &mut self,
             work_id: &WorkUnitId,
             review_id: &ClaimId,
-            operation_key: String,
+            operation_key: impl Into<String>,
         ) -> Result<DurableWorkRecord, SwarmError> {
             self.review_transition(
                 work_id,
@@ -5029,7 +5022,7 @@ pub mod durable_work {
             &mut self,
             work_id: &WorkUnitId,
             review_id: &ClaimId,
-            operation_key: String,
+            operation_key: impl Into<String>,
         ) -> Result<DurableWorkRecord, SwarmError> {
             self.review_transition(
                 work_id,
@@ -5038,6 +5031,94 @@ pub mod durable_work {
                 ReviewState::Expired,
                 operation_key,
             )
+        }
+
+        /// Supersedes a visible review obligation with a replacement item.
+        /// The old item stays retained as superseded and the replacement is
+        /// posted through the peer channel; only a resolved required
+        /// replacement unblocks closure.
+        pub fn supersede_review(
+            &mut self,
+            work_id: &WorkUnitId,
+            old_review_id: &ClaimId,
+            replacement: ReviewProposal,
+            operation_key: impl Into<String>,
+        ) -> Result<DurableWorkRecord, SwarmError> {
+            let operation_key = operation_key.into();
+            self.check_operation(&operation_key)?;
+            validate_text(&replacement.artifact_id, "artifact_id")?;
+            validate_text(&replacement.artifact_revision, "artifact_revision")?;
+            validate_text(&replacement.content_digest, "content_digest")?;
+            let current = self.get(work_id)?;
+            Self::require_live(&current)?;
+            if current
+                .reviews
+                .iter()
+                .any(|review| review.review_id == replacement.review_id)
+            {
+                return Err(SwarmError::Duplicate("review_id"));
+            }
+            let mut next = Self::begin_transition(&current, current.phase, operation_key);
+            let Some(old) = next
+                .reviews
+                .iter_mut()
+                .find(|review| &review.review_id == old_review_id)
+            else {
+                return Err(SwarmError::ReviewUnknown);
+            };
+            if !matches!(
+                old.state,
+                ReviewState::Delivered
+                    | ReviewState::Answered
+                    | ReviewState::Expired
+                    | ReviewState::Overflowed
+            ) {
+                return Err(SwarmError::IllegalTransition);
+            }
+            if old.required && !replacement.required {
+                return Err(SwarmError::Contract);
+            }
+            old.state = ReviewState::Superseded;
+            let pending = next
+                .reviews
+                .iter()
+                .filter(|review| {
+                    matches!(review.state, ReviewState::Delivered | ReviewState::Answered)
+                })
+                .count();
+            let state = if pending >= next.max_pending_reviews as usize {
+                ReviewState::Overflowed
+            } else {
+                ReviewState::Delivered
+            };
+            next.message_sequence = next.message_sequence.saturating_add(1);
+            let message = PeerMessage {
+                work_id: work_id.clone(),
+                artifact_id: replacement.artifact_id.clone(),
+                artifact_revision: replacement.artifact_revision.clone(),
+                sequence: next.message_sequence,
+                kind: PeerMessageKind::ReviewItem,
+                payload_digest: replacement.content_digest.clone(),
+            };
+            let receipt = self
+                .peer()?
+                .post(&message)
+                .map_err(|error| SwarmError::Provider {
+                    provider: RequiredProvider::PeerChannel,
+                    source: error,
+                })?;
+            if receipt.sequence != message.sequence {
+                return Err(SwarmError::InvalidSnapshot);
+            }
+            next.messages.push(PostedPeerMessage { message, receipt });
+            next.reviews.push(ReviewRecord {
+                review_id: replacement.review_id,
+                artifact_id: replacement.artifact_id,
+                artifact_revision: replacement.artifact_revision,
+                required: replacement.required,
+                state,
+            });
+            self.commit(next)
         }
 
         /// Acknowledges a posted peer message. Acknowledgement changes
@@ -5070,8 +5151,9 @@ pub mod durable_work {
             artifact_id: String,
             artifact_revision: String,
             payload_digest: String,
-            operation_key: String,
+            operation_key: impl Into<String>,
         ) -> Result<DurableWorkRecord, SwarmError> {
+            let operation_key = operation_key.into();
             self.check_operation(&operation_key)?;
             if kind == PeerMessageKind::ReviewItem {
                 return Err(SwarmError::IllegalTransition);
@@ -5081,7 +5163,7 @@ pub mod durable_work {
             validate_text(&payload_digest, "payload_digest")?;
             let current = self.get(work_id)?;
             Self::require_live(&current)?;
-            let mut next = self.begin_transition(&current, current.phase, operation_key);
+            let mut next = Self::begin_transition(&current, current.phase, operation_key);
             next.message_sequence = next.message_sequence.saturating_add(1);
             let message = PeerMessage {
                 work_id: work_id.clone(),
@@ -5091,12 +5173,13 @@ pub mod durable_work {
                 kind,
                 payload_digest,
             };
-            let receipt = self.peer()?.post(&message).map_err(|error| {
-                SwarmError::Provider {
+            let receipt = self
+                .peer()?
+                .post(&message)
+                .map_err(|error| SwarmError::Provider {
                     provider: RequiredProvider::PeerChannel,
                     source: error,
-                }
-            })?;
+                })?;
             if receipt.sequence != message.sequence {
                 return Err(SwarmError::InvalidSnapshot);
             }
@@ -5113,8 +5196,9 @@ pub mod durable_work {
             &mut self,
             work_id: &WorkUnitId,
             verdict: ExternalVerdict,
-            operation_key: String,
+            operation_key: impl Into<String>,
         ) -> Result<DurableWorkRecord, SwarmError> {
+            let operation_key = operation_key.into();
             self.check_operation(&operation_key)?;
             let current = self.get(work_id)?;
             if current.phase != WorkUnitPhase::CompletionCandidate {
@@ -5127,11 +5211,8 @@ pub mod durable_work {
                     {
                         return Err(SwarmError::EffectUnresolved);
                     }
-                    let mut next = self.begin_transition(
-                        &current,
-                        WorkUnitPhase::Terminal,
-                        operation_key,
-                    );
+                    let mut next =
+                        Self::begin_transition(&current, WorkUnitPhase::Terminal, operation_key);
                     next.terminal = Some(TerminalKind::Completed);
                     let committed = self.commit(next)?;
                     self.release_scope(&committed);
@@ -5143,11 +5224,8 @@ pub mod durable_work {
                     {
                         return Err(SwarmError::EffectUnresolved);
                     }
-                    let mut next = self.begin_transition(
-                        &current,
-                        WorkUnitPhase::Terminal,
-                        operation_key,
-                    );
+                    let mut next =
+                        Self::begin_transition(&current, WorkUnitPhase::Terminal, operation_key);
                     next.terminal = Some(TerminalKind::Partial);
                     let committed = self.commit(next)?;
                     self.release_scope(&committed);
@@ -5155,7 +5233,7 @@ pub mod durable_work {
                 }
                 ExternalVerdict::FailedVerification => {
                     let mut next =
-                        self.begin_transition(&current, WorkUnitPhase::Running, operation_key);
+                        Self::begin_transition(&current, WorkUnitPhase::Running, operation_key);
                     next.result_digest = None;
                     self.commit(next)
                 }
@@ -5163,11 +5241,8 @@ pub mod durable_work {
                     if current.effect == EffectCertainty::PossibleEffect {
                         return Err(SwarmError::EffectUnresolved);
                     }
-                    let mut next = self.begin_transition(
-                        &current,
-                        WorkUnitPhase::Terminal,
-                        operation_key,
-                    );
+                    let mut next =
+                        Self::begin_transition(&current, WorkUnitPhase::Terminal, operation_key);
                     next.terminal = Some(TerminalKind::CancelledAfterEffect);
                     next.cancellation = CancellationPhase::Observed;
                     let committed = self.commit(next)?;
@@ -5186,8 +5261,9 @@ pub mod durable_work {
             &mut self,
             work_id: &WorkUnitId,
             expected_sequence: u64,
-            operation_key: String,
+            operation_key: impl Into<String>,
         ) -> Result<(DurableWorkRecord, UncertainPersistOutcome), SwarmError> {
+            let operation_key = operation_key.into();
             if self.applied_operations.contains(&operation_key) {
                 return Err(SwarmError::DuplicateOperation);
             }
@@ -5226,10 +5302,7 @@ pub mod durable_work {
         /// verifies schema, digest chain and order, rehydrates ownership,
         /// budgets, children, checkpoints, uncertainty and reviews, and keeps
         /// uncertain scopes blocked.
-        pub fn reload(
-            &mut self,
-            work_id: &WorkUnitId,
-        ) -> Result<DurableWorkRecord, SwarmError> {
+        pub fn reload(&mut self, work_id: &WorkUnitId) -> Result<DurableWorkRecord, SwarmError> {
             let log = self
                 .store()?
                 .load(work_id)
@@ -5259,4 +5332,3 @@ pub mod durable_work {
 #[cfg(test)]
 #[path = "repair_tests.rs"]
 mod tests;
-
