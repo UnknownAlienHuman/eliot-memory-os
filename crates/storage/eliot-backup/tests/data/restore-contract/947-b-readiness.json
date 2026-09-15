@@ -1,0 +1,1 @@
+{"degraded_permits_operational_readiness":false,"full_recovery_permits_operational_readiness":false,"note":"Worker B fixture: archive class alone never sets operational readiness; degraded/scope cannot upgrade."}

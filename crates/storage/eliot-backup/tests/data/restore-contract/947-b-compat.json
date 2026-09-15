@@ -1,0 +1,1 @@
+{"closed_decoding":"reject_unknown_fields","disposition":"explicit","max_record_bytes":33554432,"note":"Worker B fixture: closed current schemas reject unknown fields; legacy archives persist only through explicit disposition; diagnostics stay bounded and redacted."}
