@@ -1,0 +1,125 @@
+schema = "eliot.agent-work-unit.v1"
+authority = "NON_NORMATIVE_WORKSPACE_ADMISSION_ALLOCATION"
+status = "READY_AFTER_PACKAGE_PROOFS"
+implementation_support = "STANDALONE_PACKAGES_AND_ISSUES_PRESENT_WORKSPACE_ADMISSION_OPEN"
+evidence_execution_status = "ISSUE_FAMILY_AND_PACKAGE_ROUTING_INSPECTED_TESTS_NOT_EXECUTED"
+proof_ceiling = "DREAMER_MEMORY_HANDLER_WORKSPACE_ADMISSION_CANDIDATE_ONLY"
+issue = 966
+package_issue_refs = [665, 667, 669, 671, 684]
+dreamer_runtime_issue = 1100
+parent_product_issue = 11
+normative_pair_ref = "docs/normative-pair.toml"
+
+[work_unit]
+cell_id = "dreamer.workspace-admission.memory-and-curation-handlers"
+causal_property = "Independently proved memory/curation handler packages enter the root Cargo workspace in one serialized dependency-safe change without altering their semantic owner, public contract, proof ceiling, activation state or Product support."
+current_discriminator = "Structure repair, reconsolidation, accessibility/influence adjustment, typed memory repair and Curation fan-in are developed as standalone packages under #665/#667/#669/#671/#684; they are not root-workspace members and therefore lack one current lockfile/dependency/test admission proof."
+primary_issue_url = "https://github.com/UnknownAlienHuman/eliot-memory-os/issues/966"
+
+[documentation]
+implementation = [
+  "https://github.com/UnknownAlienHuman/eliot-memory-os/blob/main/docs/architecture/I02-03-workspace-topology-and-dependency-direction.md#i23-workspace-topology-and-dependency-direction",
+  "https://github.com/UnknownAlienHuman/eliot-memory-os/blob/main/docs/architecture/I02-08-package-metadata-source-ownership-and-generated-registry.md#i28-package-metadata-source-ownership-and-generated-registry",
+  "https://github.com/UnknownAlienHuman/eliot-memory-os/blob/main/docs/architecture/I02-18-build-test-and-artifact-graph.md#i218-build-test-and-artifact-graph",
+  "https://github.com/UnknownAlienHuman/eliot-memory-os/blob/main/docs/architecture/I02-23-capability-family-topology-and-crate-extraction-decisions.md#i223-capability-family-topology-and-crate-extraction-decisions",
+  "https://github.com/UnknownAlienHuman/eliot-memory-os/blob/main/docs/architecture/I09-02-dreamer-service-responsibilities.md#i92-dreamer-service-responsibilities",
+  "https://github.com/UnknownAlienHuman/eliot-memory-os/blob/main/docs/architecture/I09-06-candidate-kinds.md#i96-candidate-kinds",
+  "https://github.com/UnknownAlienHuman/eliot-memory-os/blob/main/docs/architecture/I09-07-memory-transformation-validation.md#i97-memory-transformation-validation",
+  "https://github.com/UnknownAlienHuman/eliot-memory-os/blob/main/docs/architecture/I18-04-test-tiers.md#i184-test-tiers",
+]
+anchors = ["ARCH-MOD-01", "ARCH-MOD-02", "ARCH-MOD-03", "ARCH-DRM-02", "ARCH-GROUND-01"]
+
+[packages]
+expected = [
+  "crates/smart/eliot-dreamer-structure-repair",
+  "crates/smart/eliot-dreamer-reconsolidation",
+  "crates/smart/eliot-dreamer-accessibility",
+  "crates/smart/eliot-dreamer-memory-repair",
+  "crates/smart/eliot-dreamer-curation",
+]
+
+[scope]
+primary_paths = [
+  "root Cargo.toml workspace membership and shared dependencies only where exact current packages require them",
+  "Cargo.lock",
+  "the five package manifests and package-local metadata/instructions",
+  "workspace/build/test graph and capability-registry inputs",
+  "focused workspace-admission tests/fixtures",
+]
+forbidden = [
+  "semantic implementation hidden inside the admission PR",
+  "weakening or deleting package tests to make workspace checks pass",
+  "duplicate public types or compatibility shims that become second owners",
+  "adding runtime consumers, routes, authority or effects",
+  "workspace membership treated as implementation/runtime/Product support",
+  "parallel workspace-admission branches modifying the same root manifest/lockfile",
+  "automatic GitHub workflow triggers",
+]
+
+[[waves]]
+id = "A"
+what = "Prove every candidate package is independently complete before admission."
+how = [
+  "Require the owning package Issue/PR to remove placeholder and NOT_IMPLEMENTED state and pass its declared fmt/test/Clippy/doc acceptance suite.",
+  "Verify exact package name/version/rust-version/edition/license/source owner/public contract/module metadata and no unresolved temporary path dependency.",
+  "Reject a package with ignored/zero-selected tests, marker-only source, duplicate semantics or unresolved owning Issue.",
+]
+
+[[waves]]
+id = "B"
+what = "Freeze dependency direction and shared-type ownership."
+how = [
+  "Build the normal/build/dev dependency graph for the five packages and current workspace.",
+  "Require foundation -> contract -> pure handler/fan-in direction without cycles, Store/provider/Kernel/runtime leakage or sibling backreferences.",
+  "Reuse existing owner-neutral contracts; do not copy structs/enums merely to avoid a dependency error.",
+  "Keep Curation fan-in dependent only on public handler ports/contracts, never concrete runtime effects.",
+]
+
+[[waves]]
+id = "C"
+what = "Perform one serialized workspace and lockfile admission."
+how = [
+  "Modify root membership/shared-dependency entries once after rebasing onto current main and resolving all previously admitted packages.",
+  "Generate the lockfile only through locked Cargo-compatible commands and review every added/changed package/version/source.",
+  "Update build/test graph and #13 capability-registry inputs while preserving package-local standalone commands.",
+  "Do not add Dreamer runtime dispatch; #1100 remains the consumer/integration owner.",
+]
+
+[[waves]]
+id = "D"
+what = "Prove package, workspace and boundary closure."
+how = [
+  "Run each package suite, the affected workspace graph, Clippy/docs and dependency-boundary checks from the same source/lock/toolchain identity.",
+  "Verify root workspace resolution contains each expected package exactly once and no stale standalone duplicate or hidden exclusion remains.",
+  "Record workspace admission as source/build evidence only; runtime execution and Product proof remain #1100/#11.",
+]
+
+[acceptance]
+criteria = [
+  "All five expected package Issues are implemented and independently tested before root admission.",
+  "Every package appears exactly once in Cargo metadata with exact manifest/source identity and no duplicate package name/version/source ambiguity.",
+  "Normal dependency direction is acyclic and contains no Kernel, Store, provider/model, process, UI, authority, effect or Finish leakage.",
+  "Shared public types retain one owner and no copied compatibility type becomes a second semantic contract.",
+  "Curation preserves exactly eleven wire kinds and ten handler families and cannot call a fallback or concrete effect owner.",
+  "Root Cargo.toml and Cargo.lock are changed in one serialized admission branch after current-main rebase.",
+  "Every lockfile addition/change is explained by the admitted package graph; no unrelated upgrade or source change is included.",
+  "Each package remains independently testable by manifest path after workspace admission.",
+  "Package tests, affected workspace tests, Clippy, docs and dependency-boundary checks pass from one exact source/lock/toolchain identity.",
+  "Workspace metadata/build/test/capability-registry projections account for every admitted package and proof entrypoint.",
+  "No runtime registry, route, provider, canonical mutation, authority, effect or task Finish is introduced.",
+  "Workspace membership does not change ImplementationSupport, EvidenceExecutionStatus, runtime support or Product status by itself.",
+]
+
+[verification]
+commands = [
+  "cargo fmt --all -- --check",
+  "cargo metadata --locked --format-version 1",
+  "cargo check --locked -p eliot-dreamer-structure-repair -p eliot-dreamer-reconsolidation -p eliot-dreamer-accessibility -p eliot-dreamer-memory-repair -p eliot-dreamer-curation --all-targets",
+  "cargo test --locked -p eliot-dreamer-structure-repair -p eliot-dreamer-reconsolidation -p eliot-dreamer-accessibility -p eliot-dreamer-memory-repair -p eliot-dreamer-curation --all-targets",
+  "cargo clippy --locked -p eliot-dreamer-structure-repair -p eliot-dreamer-reconsolidation -p eliot-dreamer-accessibility -p eliot-dreamer-memory-repair -p eliot-dreamer-curation --all-targets -- -D warnings",
+  "cargo doc --locked -p eliot-dreamer-structure-repair -p eliot-dreamer-reconsolidation -p eliot-dreamer-accessibility -p eliot-dreamer-memory-repair -p eliot-dreamer-curation --no-deps",
+  "python scripts/audit-architecture-boundaries.py",
+  "git diff --check",
+]
+edge_proof = "Not established by workspace admission; real Dreamer dispatch and handler composition remain #1100."
+product_proof = "Issue #11 remains open; root membership is source/build evidence only."
