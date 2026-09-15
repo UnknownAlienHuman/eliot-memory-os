@@ -195,6 +195,11 @@ impl KernelComposition {
     /// freshly established `(connection_id, session_epoch)` to it without
     /// rewriting the intent or effect digest. Fencing the superseded
     /// transport remains the front-door's duty.
+    ///
+    /// This remains Kernel-private until the front-door reconnect contour
+    /// wires it; the session-identity tests exercise it as the explicit
+    /// rebind seam meanwhile.
+    #[allow(dead_code)]
     pub(crate) fn rebind_process_transport(
         &self,
         session: &Session,
