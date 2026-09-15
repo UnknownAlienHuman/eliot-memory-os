@@ -277,6 +277,17 @@ pub(crate) const READ_ALL_REVISION_HEADS: &str = "SELECT VALUE body FROM revisio
 
 pub(crate) const READ_ALL_ORDERING_HEADS: &str = "SELECT VALUE body FROM ordering_head;";
 
+/// Closed evidence-pack read: one row per receipt with its durable capture
+/// order and recoverable evidence array (T11.1, #19).
+///
+/// Pre-change receipts lack `commit_sequence` / `evidence_records` /
+/// `named_operation_count` (they read as `NONE`); the Rust boundary treats a
+/// missing array as empty, never as an error. Filtering by exact subject,
+/// bound enforcement, and capture-index assignment all happen in Rust for
+/// byte-exact parity with the reference handler — never as a substring match
+/// in the query string.
+pub(crate) const READ_EVIDENCE_RECORDS: &str = "SELECT VALUE { commit_sequence: commit_sequence, named_operation_count: named_operation_count, evidence_records: evidence_records } FROM write_receipt;";
+
 pub(crate) const READ_RECOVERY_OWNER_BY_KEY: &str = "SELECT VALUE { namespace: namespace, key: key, state_fence: state_fence, revision: revision, schema: schema, payload: payload, value_digest: value_digest } FROM recovery_owner WHERE namespace = $recovery_namespace{i} AND key = $recovery_key{i} LIMIT 1;";
 pub(crate) const READ_ALL_RECOVERY_JOBS: &str = "SELECT VALUE { namespace: namespace, key: key, state_fence: state_fence, revision: revision, schema: schema, payload: payload, value_digest: value_digest } FROM recovery_job;";
 pub(crate) const READ_ALL_RECEIPTS: &str = "SELECT VALUE body FROM write_receipt;";
