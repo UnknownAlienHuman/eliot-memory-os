@@ -183,6 +183,7 @@ impl AssessmentResult {
     }
 
     /// Validate both canonical owner records and the local digest.
+    #[allow(clippy::too_many_lines)]
     pub fn validate(&self) -> Result<(), crate::ActivationAssessmentError> {
         crate::bounds::bounded_serialized_len(
             self,
