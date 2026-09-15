@@ -311,7 +311,15 @@ fn take_schema_meta(
     response: &mut client::RpcResults,
     index: usize,
 ) -> Result<Option<SchemaMetaRecord>, AdapterError> {
-    if !response.take_errors().is_empty() {
+    let errors = response.take_errors();
+    if !errors.is_empty() {
+        // S1 #775 real-provider compatibility: reads against never-defined
+        // tables observe absent-table, which preflight translates into
+        // "not yet migrated" (`None`). Every other error class keeps its
+        // existing reconciling disposition.
+        if errors.iter().all(|error| client::is_absent_table(error)) {
+            return Ok(None);
+        }
         return Err(AdapterError::PartialOutcome);
     }
     match take_optional(response, index) {

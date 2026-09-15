@@ -18,6 +18,7 @@
 mod apply;
 mod client;
 mod config;
+mod dreamer_job;
 mod error;
 mod health;
 mod plan;
@@ -350,6 +351,18 @@ impl CanonicalStoreClient for SurrealStoreAdapter {
 
     async fn health(&self) -> Result<StoreHealth, StoreError> {
         apply::health(self).await
+    }
+
+    async fn dreamer_job(
+        &self,
+        ctx: &RequestMeta,
+        request: eliot_protocol::dreamer_job::DurableJobRequest,
+    ) -> Result<eliot_protocol::dreamer_job::DurableJobResponse, StoreError> {
+        // Boxed: the ledger future holds multi-kilobyte canonical payloads
+        // across provider awaits, exceeding the default future-size lint.
+        Box::pin(dreamer_job::dreamer_job(self, ctx, request))
+            .await
+            .map_err(AdapterError::into_store_error)
     }
 }
 

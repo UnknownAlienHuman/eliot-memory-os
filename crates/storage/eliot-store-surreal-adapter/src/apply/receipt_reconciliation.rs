@@ -194,6 +194,14 @@ pub(super) async fn read_fence(
         Map::new(),
     )
     .await?;
+    // S1 #775 real-provider compatibility: a never-defined fence table
+    // observes absent-table, which preflight translates into `None`. Draining
+    // leaves statement values untouched, so every other observation decodes
+    // below with exactly its prior disposition.
+    let errors = response.take_errors();
+    if !errors.is_empty() && errors.iter().all(|error| client::is_absent_table(error)) {
+        return Ok(None);
+    }
     take_optional::<FenceRecord>(&mut response, 0)
 }
 

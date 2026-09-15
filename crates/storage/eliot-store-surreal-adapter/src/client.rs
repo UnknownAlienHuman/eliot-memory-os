@@ -32,6 +32,7 @@ use uuid::Uuid;
 
 use crate::config::{StoreDataRootLease, SurrealAdapterConfig};
 use crate::error::AdapterError;
+use crate::schema;
 use eliot_platform_windows::{
     ProcessIdentity, RetainedProcessPathLease, is_eliot_governor_running,
     observe_loopback_tcp_listener_owner,
@@ -102,6 +103,44 @@ pub(crate) async fn query(
     transport.query(operation, statement, bindings).await
 }
 
+/// Classifies one provider statement error from a Dreamer ledger transaction.
+///
+/// The Dreamer CAS marker plus Surreal duplicate/unique/exists observations
+/// mean a concurrent winner committed first (deterministic conflict, safe to
+/// re-read and classify as replay vs stale). Any other statement error leaves
+/// the commit outcome ambiguous. Transport loss itself never reaches here; it
+/// surfaces as `ProviderUnavailable` from `query`.
+#[must_use]
+pub(crate) fn is_dreamer_conflict(error: &str) -> bool {
+    const DUPLICATE_MARKERS: &[&str] = &[
+        "already exists",
+        "alreadyexists",
+        "duplicate",
+        "unique",
+        "rj_namespace_key",
+    ];
+    let folded = error.to_ascii_lowercase();
+    if folded.contains(&schema::dreamer::CAS_CONFLICT.to_ascii_lowercase()) {
+        return true;
+    }
+    DUPLICATE_MARKERS
+        .iter()
+        .any(|marker| folded.contains(&marker.to_ascii_lowercase()))
+}
+
+/// Reports whether a provider statement error observes an absent table.
+///
+/// `SurrealDB` answers reads against never-defined tables with a per-statement
+/// `ERR` ("The table '...' does not exist") rather than an empty result.
+/// Preflight reads translate exactly this observation into `None` (not yet
+/// migrated), restoring the designed `Empty`/`MigrationRequired` paths; every
+/// other error class keeps its existing disposition.
+#[must_use]
+pub(crate) fn is_absent_table(error: &str) -> bool {
+    let folded = error.to_ascii_lowercase();
+    folded.contains("does not exist") && folded.contains("table")
+}
+
 impl RpcResults {
     fn from_value(value: &Value) -> Result<Self, AdapterError> {
         let statements = value.as_array().ok_or_else(|| {
@@ -119,7 +158,6 @@ impl RpcResults {
         }
         Ok(Self { values, errors })
     }
-
     pub(crate) fn take<T: DeserializeOwned>(&mut self, index: usize) -> Result<T, AdapterError> {
         let value = self.values.get(index).cloned().ok_or_else(|| {
             AdapterError::Serialization(format!("missing RPC statement result at index {index}"))
