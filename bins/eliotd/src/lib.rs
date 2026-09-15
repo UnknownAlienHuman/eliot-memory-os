@@ -38,6 +38,7 @@ mod controlboard_adapters;
 mod daemon_config;
 mod daemon_kernel_client;
 mod daemon_kernel_port_adapters;
+mod dreamer_admission;
 mod dreamer_materials;
 mod governor_local_read;
 mod kernel_authority_client;
@@ -61,6 +62,10 @@ pub use daemon_config::DaemonConfig;
 pub use daemon_kernel_client::DaemonKernelClient;
 pub use daemon_kernel_client::OwnerSessionFacts;
 pub(crate) use daemon_kernel_client::kernel_port_error;
+pub use dreamer_admission::{
+    DREAMER_JOB_WIRE_ID, DreamerJobQueue, GovernorDreamerAdapter, KernelDreamerJobQueue,
+    OrientationSubmitInput,
+};
 pub use dreamer_materials::{
     AdmittedSourceClaim, DreamerMaterialsError, FrozenOrientationManifest,
     ORIENTATION_EVIDENCE_MAX_RECORDS, ORIENTATION_MATERIAL_MAX_SOURCE_BYTES,
