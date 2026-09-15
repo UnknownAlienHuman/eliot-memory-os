@@ -513,7 +513,7 @@ impl DaemonComposition {
     }
 
     /// Borrows the single Governor task lifecycle owner as a forwarding
-    /// adapter over the closed [`TaskCommand`](eliot_task::TaskCommand) path.
+    /// adapter over the closed [`TaskCommand`](eliot_governor::TaskCommand) path.
     ///
     /// The adapter forwards the exact admitted identity, operation identity,
     /// proposal, context, and command to the Governor canonical task path

@@ -14,7 +14,7 @@
 //!   fence. A stale fence fails closed in the Governor owner, never as a
 //!   local default.
 //! - `propose_task` and `apply_task` forward the exact admitted identity,
-//!   operation identity, proposal, context, and [`TaskCommand`](eliot_task::TaskCommand)
+//!   operation identity, proposal, context, and [`TaskCommand`](eliot_governor::TaskCommand)
 //!   to the Governor canonical path. The command enum is closed: only the
 //!   owner-defined transitions commit, and only a `Committed` store receipt
 //!   counts as admission; rejected, cancelled and dead-letter outcomes stay
@@ -31,7 +31,10 @@
 
 #![forbid(unsafe_code)]
 
-use eliot_governor::{GovernorTaskLifecycle, KernelTransitionPort, TaskLifecycleError};
+use eliot_governor::{
+    GovernorTaskLifecycle, KernelTransitionPort, TaskCommand, TaskCommandContext, TaskLifecycleError,
+    TaskProposal, TaskRecord,
+};
 
 /// Forwards the task-command path to the single Governor task owner.
 ///
@@ -56,7 +59,7 @@ impl<P: KernelTransitionPort + ?Sized> ForwardingTaskLifecycle<'_, P> {
         &self,
         ctx: &eliot_contracts::RequestMetadata,
         task_id: &eliot_contracts::TaskId,
-    ) -> Result<Option<eliot_task::TaskRecord>, TaskLifecycleError> {
+    ) -> Result<Option<TaskRecord>, TaskLifecycleError> {
         self.inner.view(ctx, task_id)
     }
 
@@ -66,7 +69,7 @@ impl<P: KernelTransitionPort + ?Sized> ForwardingTaskLifecycle<'_, P> {
         &self,
         identity: &eliot_protocol::RequestIdentity,
         operation_id: eliot_contracts::OperationId,
-        proposal: eliot_task::TaskProposal,
+        proposal: TaskProposal,
     ) -> Result<eliot_store_api::WriteReceipt, TaskLifecycleError> {
         self.inner
             .propose_task(identity, operation_id, proposal)
@@ -80,8 +83,8 @@ impl<P: KernelTransitionPort + ?Sized> ForwardingTaskLifecycle<'_, P> {
         identity: &eliot_protocol::RequestIdentity,
         operation_id: eliot_contracts::OperationId,
         task_id: eliot_contracts::TaskId,
-        context: eliot_task::TaskCommandContext,
-        command: eliot_task::TaskCommand,
+        context: TaskCommandContext,
+        command: TaskCommand,
     ) -> Result<eliot_store_api::WriteReceipt, TaskLifecycleError> {
         self.inner
             .apply_task(identity, operation_id, task_id, context, command)
