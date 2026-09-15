@@ -27,7 +27,7 @@ $ErrorActionPreference = 'Stop'
 if ($MyInvocation.InvocationName -eq '.') {
     throw 'the canonical production materialize launcher cannot be dot-sourced'
 }
-$script:ProductionCliSigningScope = 'runtime-materializer-six-plus-cli-pe-roles'
+$script:ProductionCliSigningScope = 'runtime-materializer-nine-plus-cli-pe-roles'
 $script:ProductionCliSigningPolicy = 'authenticode-rfc3161'
 $script:ProductionCliVerifier = 'SignTool(/pa,/all,/v,/tw)+Get-AuthenticodeSignature/WinTrust+RFC3161-CMS'
 $script:ProductionCliCodeSigningEku = '1.3.6.1.5.5.7.3.3'
@@ -42,6 +42,9 @@ $script:ProductionMaterializedRoles = @(
     [pscustomobject]@{ name = 'eliot-store-surreal.exe'; executable = $true }
     [pscustomobject]@{ name = 'surreal.exe'; executable = $true }
     [pscustomobject]@{ name = 'eliotd.exe'; executable = $true }
+    [pscustomobject]@{ name = 'eliot-doctor.exe'; executable = $true }
+    [pscustomobject]@{ name = 'eliot-testd.exe'; executable = $true }
+    [pscustomobject]@{ name = 'eliot-native-worker.exe'; executable = $true }
     [pscustomobject]@{ name = 'generation.json'; executable = $false }
     [pscustomobject]@{ name = 'eliotd-governor.json'; executable = $false }
     [pscustomobject]@{ name = 'eliotd.json'; executable = $false }
@@ -1242,7 +1245,7 @@ function Get-ProductionMaterializeReadback([object]$Contract, [object]$Receipt) 
             $fact = $receiptFiles[$index]
             if ([string]$fact.relative_path -cne [string]$definition.name -or
                 [bool]$fact.executable -ne [bool]$definition.executable) {
-                throw 'materialized nine-role receipt is missing, reordered, or substituted'
+                throw 'materialized twelve-role receipt is missing, reordered, or substituted'
             }
             $rolePath = Join-Path ([string]$Contract.output_bundle) ([string]$definition.name)
             $handle = [EliotReleaseNativeFileSystem]::OpenFileReadFence($rolePath)

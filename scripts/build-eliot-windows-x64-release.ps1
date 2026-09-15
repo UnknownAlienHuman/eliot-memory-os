@@ -52,6 +52,24 @@ $runtimeArtifactDefinitions = @(
         role = 'daemon'
         relative_path = 'runtime/eliotd.exe'
     }
+    [pscustomobject]@{
+        package = 'eliot-doctor'
+        binary = 'eliot-doctor'
+        role = 'doctor'
+        relative_path = 'runtime/eliot-doctor.exe'
+    }
+    [pscustomobject]@{
+        package = 'eliot-testd'
+        binary = 'eliot-testd'
+        role = 'testd'
+        relative_path = 'runtime/eliot-testd.exe'
+    }
+    [pscustomobject]@{
+        package = 'eliot-native-worker'
+        binary = 'eliot-native-worker'
+        role = 'native_worker'
+        relative_path = 'runtime/eliot-native-worker.exe'
+    }
 )
 
 function Get-RuntimeArtifactDefinitions {
@@ -444,6 +462,9 @@ function Test-ReleaseBundle([string]$Path) {
         'runtime/eliot-kernel.exe',
         'runtime/eliot-store-surreal.exe',
         'runtime/eliotd.exe',
+        'runtime/eliot-doctor.exe',
+        'runtime/eliot-testd.exe',
+        'runtime/eliot-native-worker.exe',
         'runtime/surreal.exe',
         'runtime/RUNTIME_ARTIFACTS.json',
         'operator/Eliot.Operator.exe',
