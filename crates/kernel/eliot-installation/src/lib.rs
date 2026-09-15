@@ -944,6 +944,12 @@ pub struct CandidateManifest {
     pub canonical_store_artifact_digest: PlatformHandle,
     /// SHA-256 digest of the approved Host image.
     pub host_artifact_digest: PlatformHandle,
+    /// SHA-256 digest of the approved Doctor image.
+    pub doctor_artifact_digest: PlatformHandle,
+    /// SHA-256 digest of the approved Testd image.
+    pub testd_artifact_digest: PlatformHandle,
+    /// SHA-256 digest of the approved native worker image.
+    pub native_worker_artifact_digest: PlatformHandle,
     /// Canonical installation-approved Kernel executable path.
     pub kernel_executable_path: PlatformHandle,
     /// Canonical installation-approved eliot-store-surreal bridge path.
@@ -952,6 +958,12 @@ pub struct CandidateManifest {
     pub canonical_store_executable_path: PlatformHandle,
     /// Canonical installation-approved Host executable path.
     pub host_executable_path: PlatformHandle,
+    /// Canonical installation-approved Doctor executable path.
+    pub doctor_executable_path: PlatformHandle,
+    /// Canonical installation-approved Testd executable path.
+    pub testd_executable_path: PlatformHandle,
+    /// Canonical installation-approved native worker executable path.
+    pub native_worker_executable_path: PlatformHandle,
     /// Canonical installation-approved generation configuration path.
     pub config_path: PlatformHandle,
     /// Executable/dependency closure evidence.
@@ -974,7 +986,7 @@ pub struct CandidateManifest {
     /// Runtime Live canary artifact-set evidence reference.
     ///
     /// This is a content-addressed, domain-separated SHA-256 over the
-    /// canonical generation and exact ordered nine-file Phase-A facts. It is not a
+    /// canonical generation and exact ordered twelve-file Phase-A facts. It is not a
     /// production release signature; production signing remains unclaimed.
     pub signature_ref: PlatformHandle,
     /// Digest of the exact mutable root topology approved by this manifest.
@@ -1150,6 +1162,18 @@ pub struct RuntimeLaunchDescriptor {
     pub watchdog_executable_path: PlatformHandle,
     /// SHA-256 digest of the Watchdog image.
     pub watchdog_artifact_digest: PlatformHandle,
+    /// SHA-256 digest of the approved Doctor image.
+    pub doctor_artifact_digest: PlatformHandle,
+    /// SHA-256 digest of the approved Testd image.
+    pub testd_artifact_digest: PlatformHandle,
+    /// SHA-256 digest of the approved native worker image.
+    pub native_worker_artifact_digest: PlatformHandle,
+    /// Explicit installation-approved Doctor executable path.
+    pub doctor_executable_path: PlatformHandle,
+    /// Explicit installation-approved Testd executable path.
+    pub testd_executable_path: PlatformHandle,
+    /// Explicit installation-approved native worker executable path.
+    pub native_worker_executable_path: PlatformHandle,
     /// SHA-256 of the descriptor fields excluding this digest.
     pub descriptor_digest: PlatformHandle,
 }
@@ -1487,6 +1511,12 @@ impl RuntimeLaunchDescriptor {
             self.authority_descriptor_digest.as_str().to_owned(),
             "--kernel-artifact-sha256".to_owned(),
             self.kernel_artifact_digest.as_str().to_owned(),
+            "--doctor-artifact-sha256".to_owned(),
+            self.doctor_artifact_digest.as_str().to_owned(),
+            "--testd-artifact-sha256".to_owned(),
+            self.testd_artifact_digest.as_str().to_owned(),
+            "--native-worker-artifact-sha256".to_owned(),
+            self.native_worker_artifact_digest.as_str().to_owned(),
             "--eliotd-descriptor".to_owned(),
             self.eliotd_descriptor_path.as_str().to_owned(),
             "--eliotd-descriptor-sha256".to_owned(),
@@ -1546,6 +1576,33 @@ impl RuntimeLaunchDescriptor {
         Ok((&self.host_executable_path, &self.host_artifact_digest))
     }
 
+    /// Returns the three dispatch child image digests from the launch
+    /// descriptor: Doctor, Testd, and native worker. Validated exactly like
+    /// `kernel_artifact_digest`; never defaulted.
+    pub fn dispatch_child_artifact_digests(
+        &self,
+    ) -> Result<(&PlatformHandle, &PlatformHandle, &PlatformHandle), InstallationError> {
+        self.validate()?;
+        Ok((
+            &self.doctor_artifact_digest,
+            &self.testd_artifact_digest,
+            &self.native_worker_artifact_digest,
+        ))
+    }
+
+    /// Returns the three dispatch child executable paths from the launch
+    /// descriptor: Doctor, Testd, and native worker.
+    pub fn dispatch_child_paths(
+        &self,
+    ) -> Result<(&PlatformHandle, &PlatformHandle, &PlatformHandle), InstallationError> {
+        self.validate()?;
+        Ok((
+            &self.doctor_executable_path,
+            &self.testd_executable_path,
+            &self.native_worker_executable_path,
+        ))
+    }
+
     fn unsigned_bytes(&self) -> Result<Vec<u8>, InstallationError> {
         #[derive(Serialize)]
         struct Unsigned<'a> {
@@ -1584,6 +1641,12 @@ impl RuntimeLaunchDescriptor {
             host_artifact_digest: &'a PlatformHandle,
             watchdog_executable_path: &'a PlatformHandle,
             watchdog_artifact_digest: &'a PlatformHandle,
+            doctor_artifact_digest: &'a PlatformHandle,
+            testd_artifact_digest: &'a PlatformHandle,
+            native_worker_artifact_digest: &'a PlatformHandle,
+            doctor_executable_path: &'a PlatformHandle,
+            testd_executable_path: &'a PlatformHandle,
+            native_worker_executable_path: &'a PlatformHandle,
         }
         serde_json::to_vec(&Unsigned {
             profile: self.profile,
@@ -1621,6 +1684,12 @@ impl RuntimeLaunchDescriptor {
             host_artifact_digest: &self.host_artifact_digest,
             watchdog_executable_path: &self.watchdog_executable_path,
             watchdog_artifact_digest: &self.watchdog_artifact_digest,
+            doctor_artifact_digest: &self.doctor_artifact_digest,
+            testd_artifact_digest: &self.testd_artifact_digest,
+            native_worker_artifact_digest: &self.native_worker_artifact_digest,
+            doctor_executable_path: &self.doctor_executable_path,
+            testd_executable_path: &self.testd_executable_path,
+            native_worker_executable_path: &self.native_worker_executable_path,
         })
         .map_err(|error| InstallationError::InvalidField {
             field: "manifest.runtime_launch".to_owned(),
@@ -1826,6 +1895,69 @@ impl RuntimeLaunchDescriptor {
             &self.watchdog_artifact_digest,
             "runtime_launch.watchdog_artifact_digest",
         )?;
+        approved_path(
+            &self.doctor_executable_path,
+            "runtime_launch.doctor_executable_path",
+        )?;
+        approved_filename(
+            &self.doctor_executable_path,
+            "eliot-doctor.exe",
+            "runtime_launch.doctor_executable_path",
+        )?;
+        runtime_sha256_handle(
+            &self.doctor_artifact_digest,
+            "runtime_launch.doctor_artifact_digest",
+        )?;
+        approved_path(
+            &self.testd_executable_path,
+            "runtime_launch.testd_executable_path",
+        )?;
+        approved_filename(
+            &self.testd_executable_path,
+            "eliot-testd.exe",
+            "runtime_launch.testd_executable_path",
+        )?;
+        runtime_sha256_handle(
+            &self.testd_artifact_digest,
+            "runtime_launch.testd_artifact_digest",
+        )?;
+        approved_path(
+            &self.native_worker_executable_path,
+            "runtime_launch.native_worker_executable_path",
+        )?;
+        approved_filename(
+            &self.native_worker_executable_path,
+            "eliot-native-worker.exe",
+            "runtime_launch.native_worker_executable_path",
+        )?;
+        runtime_sha256_handle(
+            &self.native_worker_artifact_digest,
+            "runtime_launch.native_worker_artifact_digest",
+        )?;
+        if self.doctor_executable_path == self.testd_executable_path
+            || self.doctor_executable_path == self.native_worker_executable_path
+            || self.testd_executable_path == self.native_worker_executable_path
+            || self.doctor_executable_path == self.host_executable_path
+            || self.doctor_executable_path == self.watchdog_executable_path
+            || self.doctor_executable_path == self.store_bridge_executable_path
+            || self.doctor_executable_path == self.canonical_store_executable_path
+            || self.doctor_executable_path == self.eliotd_executable_path
+            || self.testd_executable_path == self.host_executable_path
+            || self.testd_executable_path == self.watchdog_executable_path
+            || self.testd_executable_path == self.store_bridge_executable_path
+            || self.testd_executable_path == self.canonical_store_executable_path
+            || self.testd_executable_path == self.eliotd_executable_path
+            || self.native_worker_executable_path == self.host_executable_path
+            || self.native_worker_executable_path == self.watchdog_executable_path
+            || self.native_worker_executable_path == self.store_bridge_executable_path
+            || self.native_worker_executable_path == self.canonical_store_executable_path
+            || self.native_worker_executable_path == self.eliotd_executable_path
+        {
+            return Err(InstallationError::Duplicate {
+                kind: "runtime_launch.named_artifact_paths".to_owned(),
+                identity: "aliased dispatch executable path".to_owned(),
+            });
+        }
         match (self.profile, &self.portable_root) {
             (InstallationProfile::PortableDev, Some(root)) => {
                 approved_path(root, "runtime_launch.portable_root")?;
@@ -1866,6 +1998,18 @@ impl RuntimeLaunchDescriptor {
             (
                 &self.host_executable_path,
                 "runtime_launch.host_executable_path",
+            ),
+            (
+                &self.doctor_executable_path,
+                "runtime_launch.doctor_executable_path",
+            ),
+            (
+                &self.testd_executable_path,
+                "runtime_launch.testd_executable_path",
+            ),
+            (
+                &self.native_worker_executable_path,
+                "runtime_launch.native_worker_executable_path",
             ),
             (&self.store_config_path, "runtime_launch.store_config_path"),
             (
@@ -1932,6 +2076,18 @@ impl RuntimeLaunchDescriptor {
             (
                 &self.host_executable_path,
                 "runtime_launch.host_executable_path",
+            ),
+            (
+                &self.doctor_executable_path,
+                "runtime_launch.doctor_executable_path",
+            ),
+            (
+                &self.testd_executable_path,
+                "runtime_launch.testd_executable_path",
+            ),
+            (
+                &self.native_worker_executable_path,
+                "runtime_launch.native_worker_executable_path",
             ),
         ] {
             self.runtime_state_roots
@@ -2007,6 +2163,18 @@ impl CandidateManifest {
             "manifest.canonical_store_artifact_digest",
         )?;
         sha256_handle(&self.host_artifact_digest, "manifest.host_artifact_digest")?;
+        sha256_handle(
+            &self.doctor_artifact_digest,
+            "manifest.doctor_artifact_digest",
+        )?;
+        sha256_handle(
+            &self.testd_artifact_digest,
+            "manifest.testd_artifact_digest",
+        )?;
+        sha256_handle(
+            &self.native_worker_artifact_digest,
+            "manifest.native_worker_artifact_digest",
+        )?;
         approved_path(
             &self.kernel_executable_path,
             "manifest.kernel_executable_path",
@@ -2049,12 +2217,72 @@ impl CandidateManifest {
         self.runtime_launch
             .runtime_state_roots
             .reject_mutable_alias(&self.host_executable_path, "manifest.host_executable_path")?;
+        approved_path(
+            &self.doctor_executable_path,
+            "manifest.doctor_executable_path",
+        )?;
+        approved_filename(
+            &self.doctor_executable_path,
+            "eliot-doctor.exe",
+            "manifest.doctor_executable_path",
+        )?;
+        self.runtime_launch
+            .runtime_state_roots
+            .reject_mutable_alias(
+                &self.doctor_executable_path,
+                "manifest.doctor_executable_path",
+            )?;
+        approved_path(
+            &self.testd_executable_path,
+            "manifest.testd_executable_path",
+        )?;
+        approved_filename(
+            &self.testd_executable_path,
+            "eliot-testd.exe",
+            "manifest.testd_executable_path",
+        )?;
+        self.runtime_launch
+            .runtime_state_roots
+            .reject_mutable_alias(
+                &self.testd_executable_path,
+                "manifest.testd_executable_path",
+            )?;
+        approved_path(
+            &self.native_worker_executable_path,
+            "manifest.native_worker_executable_path",
+        )?;
+        approved_filename(
+            &self.native_worker_executable_path,
+            "eliot-native-worker.exe",
+            "manifest.native_worker_executable_path",
+        )?;
+        self.runtime_launch
+            .runtime_state_roots
+            .reject_mutable_alias(
+                &self.native_worker_executable_path,
+                "manifest.native_worker_executable_path",
+            )?;
         if self.kernel_executable_path == self.store_bridge_executable_path
             || self.kernel_executable_path == self.canonical_store_executable_path
             || self.kernel_executable_path == self.host_executable_path
+            || self.kernel_executable_path == self.doctor_executable_path
+            || self.kernel_executable_path == self.testd_executable_path
+            || self.kernel_executable_path == self.native_worker_executable_path
             || self.store_bridge_executable_path == self.canonical_store_executable_path
             || self.store_bridge_executable_path == self.host_executable_path
+            || self.store_bridge_executable_path == self.doctor_executable_path
+            || self.store_bridge_executable_path == self.testd_executable_path
+            || self.store_bridge_executable_path == self.native_worker_executable_path
             || self.canonical_store_executable_path == self.host_executable_path
+            || self.canonical_store_executable_path == self.doctor_executable_path
+            || self.canonical_store_executable_path == self.testd_executable_path
+            || self.canonical_store_executable_path == self.native_worker_executable_path
+            || self.host_executable_path == self.doctor_executable_path
+            || self.host_executable_path == self.testd_executable_path
+            || self.host_executable_path == self.native_worker_executable_path
+            || self.doctor_executable_path == self.testd_executable_path
+            || self.doctor_executable_path == self.native_worker_executable_path
+            || self.testd_executable_path == self.native_worker_executable_path
         {
             return Err(InstallationError::Duplicate {
                 kind: "manifest.named_artifact_paths".to_owned(),
@@ -2100,10 +2328,23 @@ impl CandidateManifest {
         if self.runtime_launch.eliotd_executable_path == self.kernel_executable_path
             || self.runtime_launch.eliotd_executable_path == self.store_bridge_executable_path
             || self.runtime_launch.eliotd_executable_path == self.canonical_store_executable_path
+            || self.runtime_launch.eliotd_executable_path == self.doctor_executable_path
+            || self.runtime_launch.eliotd_executable_path == self.testd_executable_path
+            || self.runtime_launch.eliotd_executable_path == self.native_worker_executable_path
         {
             return Err(InstallationError::Duplicate {
                 kind: "manifest.named_artifact_paths".to_owned(),
                 identity: "eliotd executable aliases another approved executable".to_owned(),
+            });
+        }
+        if self.runtime_launch.doctor_executable_path == self.config_path
+            || self.runtime_launch.testd_executable_path == self.config_path
+            || self.runtime_launch.native_worker_executable_path == self.config_path
+        {
+            return Err(InstallationError::InvalidField {
+                field: "manifest.runtime_launch.dispatch_executable_path".to_owned(),
+                reason: "dispatch executables must be distinct from the approved Store config"
+                    .to_owned(),
             });
         }
         handle(
@@ -2148,6 +2389,21 @@ impl CandidateManifest {
             &self.host_executable_path,
             "manifest.host_executable_path",
         )?;
+        reject_authority_alias(
+            &self.runtime_launch.authority_descriptor_path,
+            &self.doctor_executable_path,
+            "manifest.doctor_executable_path",
+        )?;
+        reject_authority_alias(
+            &self.runtime_launch.authority_descriptor_path,
+            &self.testd_executable_path,
+            "manifest.testd_executable_path",
+        )?;
+        reject_authority_alias(
+            &self.runtime_launch.authority_descriptor_path,
+            &self.native_worker_executable_path,
+            "manifest.native_worker_executable_path",
+        )?;
         if self.runtime_launch.canonical_store_executable_path
             != self.canonical_store_executable_path
         {
@@ -2163,6 +2419,14 @@ impl CandidateManifest {
                 != self.canonical_store_artifact_digest
             || self.runtime_launch.host_executable_path != self.host_executable_path
             || self.runtime_launch.host_artifact_digest != self.host_artifact_digest
+            || self.runtime_launch.doctor_executable_path != self.doctor_executable_path
+            || self.runtime_launch.doctor_artifact_digest != self.doctor_artifact_digest
+            || self.runtime_launch.testd_executable_path != self.testd_executable_path
+            || self.runtime_launch.testd_artifact_digest != self.testd_artifact_digest
+            || self.runtime_launch.native_worker_executable_path
+                != self.native_worker_executable_path
+            || self.runtime_launch.native_worker_artifact_digest
+                != self.native_worker_artifact_digest
         {
             return Err(InstallationError::InvalidField {
                 field: "manifest.runtime_launch.artifact_bindings".to_owned(),
@@ -2258,6 +2522,35 @@ impl CandidateManifest {
             &self.store_bridge_executable_path,
             &self.config_path,
         )
+    }
+
+    /// Returns the three dispatch child image digests: Doctor, Testd, and
+    /// native worker. Each digest is validated exactly like
+    /// `kernel_artifact_digest`; a missing or placeholder value fails closed
+    /// and is never defaulted.
+    pub fn dispatch_child_artifact_digests(
+        &self,
+    ) -> Result<(&PlatformHandle, &PlatformHandle, &PlatformHandle), InstallationError> {
+        self.validate()?;
+        Ok((
+            &self.doctor_artifact_digest,
+            &self.testd_artifact_digest,
+            &self.native_worker_artifact_digest,
+        ))
+    }
+
+    /// Returns the three dispatch child executable paths: Doctor, Testd, and
+    /// native worker. These mirror `host_child_paths` for the Kernel-owned
+    /// dispatch contour.
+    pub fn dispatch_child_paths(
+        &self,
+    ) -> Result<(&PlatformHandle, &PlatformHandle, &PlatformHandle), InstallationError> {
+        self.validate()?;
+        Ok((
+            &self.doctor_executable_path,
+            &self.testd_executable_path,
+            &self.native_worker_executable_path,
+        ))
     }
 }
 

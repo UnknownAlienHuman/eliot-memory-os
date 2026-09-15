@@ -39,6 +39,14 @@ pub struct KernelConfig {
     /// Digest of the exact retained eliotd descriptor file bytes supplied by
     /// Host. This is distinct from the descriptor's internal unsigned digest.
     pub eliotd_descriptor_artifact_sha256: Option<String>,
+    /// Independent digest of the approved Doctor image injected by Host.
+    /// Missing fails closed once the dispatch contour is required; no
+    /// in-memory or test signer is fabricated by the production composition.
+    pub doctor_artifact_sha256: Option<String>,
+    /// Independent digest of the approved Testd image injected by Host.
+    pub testd_artifact_sha256: Option<String>,
+    /// Independent digest of the approved native worker image injected by Host.
+    pub native_worker_artifact_sha256: Option<String>,
     /// Host-owned manifest root where the Kernel must publish the eliotd
     /// receipt. This is intentionally separate from `work_root`: integrated
     /// manifests use distinct Kernel and Host state roots.
@@ -69,6 +77,9 @@ impl KernelConfig {
             daemon_launch: None,
             kernel_artifact_sha256: None,
             eliotd_descriptor_artifact_sha256: None,
+            doctor_artifact_sha256: None,
+            testd_artifact_sha256: None,
+            native_worker_artifact_sha256: None,
             eliotd_receipt_binding: None,
             agent_bridge_admission: None,
             #[cfg(windows)]
@@ -115,6 +126,27 @@ impl KernelConfig {
         self
     }
 
+    /// Injects the independently approved Doctor executable digest.
+    #[must_use]
+    pub fn with_doctor_artifact_sha256(mut self, digest: impl Into<String>) -> Self {
+        self.doctor_artifact_sha256 = Some(digest.into());
+        self
+    }
+
+    /// Injects the independently approved Testd executable digest.
+    #[must_use]
+    pub fn with_testd_artifact_sha256(mut self, digest: impl Into<String>) -> Self {
+        self.testd_artifact_sha256 = Some(digest.into());
+        self
+    }
+
+    /// Injects the independently approved native worker executable digest.
+    #[must_use]
+    pub fn with_native_worker_artifact_sha256(mut self, digest: impl Into<String>) -> Self {
+        self.native_worker_artifact_sha256 = Some(digest.into());
+        self
+    }
+
     /// Injects the exact Host-owned manifest root for the durable eliotd
     /// receipt. No environment or current-directory fallback is permitted.
     #[must_use]
@@ -152,5 +184,38 @@ impl KernelConfig {
     pub fn require_descriptor_supervision_authority(mut self) -> Self {
         self.require_descriptor_supervision_authority = true;
         self
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::expect_used)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn dispatch_artifact_digests_are_injected_without_defaults() {
+        let config = KernelConfig::new(std::path::PathBuf::from("/tmp/work"));
+        assert!(config.doctor_artifact_sha256.is_none());
+        assert!(config.testd_artifact_sha256.is_none());
+        assert!(config.native_worker_artifact_sha256.is_none());
+        let config = config
+            .with_doctor_artifact_sha256("a".repeat(64))
+            .with_testd_artifact_sha256("b".repeat(64))
+            .with_native_worker_artifact_sha256("c".repeat(64));
+        assert_eq!(
+            config.doctor_artifact_sha256,
+            Some("a".repeat(64)),
+            "doctor digest must be retained exactly"
+        );
+        assert_eq!(
+            config.testd_artifact_sha256,
+            Some("b".repeat(64)),
+            "testd digest must be retained exactly"
+        );
+        assert_eq!(
+            config.native_worker_artifact_sha256,
+            Some("c".repeat(64)),
+            "native worker digest must be retained exactly"
+        );
     }
 }
