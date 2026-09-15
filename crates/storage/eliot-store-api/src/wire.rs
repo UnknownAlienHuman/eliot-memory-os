@@ -11,6 +11,7 @@ use eliot_contracts::RequestId;
 use eliot_protocol::{
     EncodingProfile, Frame, FrameKind, MessageType, ProtocolPayload, ProtocolVersion,
     RequestIdentity,
+    dreamer_job::{DurableJobRequest, DurableJobResponse},
 };
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
@@ -20,8 +21,8 @@ use crate::{
     MAX_STORE_FAILURE_DETAIL_LEN, NamedReadRequest, NamedReadResponse, OperationId, OrderingHead,
     OrderingHeadExpectation, OrderingScopeId, PreparedTransition, RequestMeta, RevisionHead,
     RevisionHeadExpectation, RevisionKey, StoreError, StoreGenesisRequest, StoreHealth,
-    StoreRecoveryRequest, StoreRecoverySnapshot, WriteReceipt, json_shape_name,
-    verify_canonical_request_hash,
+    StoreRecoveryRequest, StoreRecoverySnapshot, WriteReceipt, dreamer_job::map_durable_error,
+    json_shape_name, verify_canonical_request_hash,
 };
 use schemars::JsonSchema;
 
@@ -38,6 +39,18 @@ pub const CAPABILITY_ORDERING_HEADS: &str = "store.ordering_heads";
 pub const CAPABILITY_VALIDATION_SNAPSHOT: &str = "store.validation_snapshot";
 pub const CAPABILITY_RECOVERY: &str = "store.recovery";
 pub const CAPABILITY_INITIALIZE_GENESIS: &str = "store.initialize_genesis";
+pub const CAPABILITY_DREAMER_JOB_SUBMIT: &str = "store.dreamer_job.submit";
+pub const CAPABILITY_DREAMER_JOB_LEASE_NEXT: &str = "store.dreamer_job.lease_next";
+pub const CAPABILITY_DREAMER_JOB_LEASE_EXACT: &str = "store.dreamer_job.lease_exact";
+pub const CAPABILITY_DREAMER_JOB_RENEW: &str = "store.dreamer_job.renew";
+pub const CAPABILITY_DREAMER_JOB_START: &str = "store.dreamer_job.start";
+pub const CAPABILITY_DREAMER_JOB_CHECKPOINT: &str = "store.dreamer_job.checkpoint";
+pub const CAPABILITY_DREAMER_JOB_RESUME: &str = "store.dreamer_job.resume";
+pub const CAPABILITY_DREAMER_JOB_BEGIN_VERIFICATION: &str = "store.dreamer_job.begin_verification";
+pub const CAPABILITY_DREAMER_JOB_PUBLISH: &str = "store.dreamer_job.publish";
+pub const CAPABILITY_DREAMER_JOB_STATUS: &str = "store.dreamer_job.status";
+pub const CAPABILITY_DREAMER_JOB_REQUEST_CANCEL: &str = "store.dreamer_job.request_cancel";
+pub const CAPABILITY_DREAMER_JOB_RECONCILE: &str = "store.dreamer_job.reconcile";
 
 /// Capabilities advertised by the canonical store process.
 pub const CAPABILITIES: &[&str] = &[
@@ -51,7 +64,43 @@ pub const CAPABILITIES: &[&str] = &[
     CAPABILITY_VALIDATION_SNAPSHOT,
     CAPABILITY_RECOVERY,
     CAPABILITY_INITIALIZE_GENESIS,
+    CAPABILITY_DREAMER_JOB_SUBMIT,
+    CAPABILITY_DREAMER_JOB_LEASE_NEXT,
+    CAPABILITY_DREAMER_JOB_LEASE_EXACT,
+    CAPABILITY_DREAMER_JOB_RENEW,
+    CAPABILITY_DREAMER_JOB_START,
+    CAPABILITY_DREAMER_JOB_CHECKPOINT,
+    CAPABILITY_DREAMER_JOB_RESUME,
+    CAPABILITY_DREAMER_JOB_BEGIN_VERIFICATION,
+    CAPABILITY_DREAMER_JOB_PUBLISH,
+    CAPABILITY_DREAMER_JOB_STATUS,
+    CAPABILITY_DREAMER_JOB_REQUEST_CANCEL,
+    CAPABILITY_DREAMER_JOB_RECONCILE,
 ];
+
+/// Returns the exact per-operation capability for one closed Dreamer job
+/// operation kind. The shared transport envelope is unchanged; only the
+/// advertised capability varies per operation.
+#[must_use]
+pub fn dreamer_job_capability(
+    operation: &eliot_protocol::dreamer_job::JobOperation,
+) -> &'static str {
+    use eliot_protocol::dreamer_job::JobOperation as Op;
+    match operation {
+        Op::Submit { .. } => CAPABILITY_DREAMER_JOB_SUBMIT,
+        Op::LeaseNext { .. } => CAPABILITY_DREAMER_JOB_LEASE_NEXT,
+        Op::LeaseExact { .. } => CAPABILITY_DREAMER_JOB_LEASE_EXACT,
+        Op::Renew { .. } => CAPABILITY_DREAMER_JOB_RENEW,
+        Op::Start { .. } => CAPABILITY_DREAMER_JOB_START,
+        Op::Checkpoint { .. } => CAPABILITY_DREAMER_JOB_CHECKPOINT,
+        Op::Resume { .. } => CAPABILITY_DREAMER_JOB_RESUME,
+        Op::BeginVerification { .. } => CAPABILITY_DREAMER_JOB_BEGIN_VERIFICATION,
+        Op::Publish { .. } => CAPABILITY_DREAMER_JOB_PUBLISH,
+        Op::Status { .. } => CAPABILITY_DREAMER_JOB_STATUS,
+        Op::RequestCancel { .. } => CAPABILITY_DREAMER_JOB_REQUEST_CANCEL,
+        Op::Reconcile { .. } => CAPABILITY_DREAMER_JOB_RECONCILE,
+    }
+}
 
 /// Effects exposed by the canonical store process.
 pub const EFFECTS: &[&str] = &["read", "canonical_write"];
@@ -169,6 +218,10 @@ pub enum StoreRequest {
         scopes: Vec<OrderingScopeId>,
     },
     ValidationSnapshot,
+    DreamerJob {
+        context: RequestMeta,
+        request: DurableJobRequest,
+    },
 }
 
 impl StoreRequest {
@@ -223,11 +276,19 @@ impl StoreRequest {
             Self::OrderingHeads { scopes } => {
                 bounded_unique(scopes, "ordering_scopes", Clone::clone)
             }
+            Self::DreamerJob { context, request } => {
+                context.validate().map_err(StoreError::Foundation)?;
+                request.validate().map_err(map_durable_error)?;
+                if context.state_fence != request.request_identity.operation.state_fence {
+                    return Err(StoreError::FenceMismatch);
+                }
+                Ok(())
+            }
         }
     }
 
     #[must_use]
-    pub const fn capability(&self) -> &'static str {
+    pub fn capability(&self) -> &'static str {
         match self {
             Self::Health => CAPABILITY_HEALTH,
             Self::Readiness => CAPABILITY_READINESS,
@@ -239,6 +300,7 @@ impl StoreRequest {
             Self::ValidationSnapshot => CAPABILITY_VALIDATION_SNAPSHOT,
             Self::Recovery { .. } => CAPABILITY_RECOVERY,
             Self::InitializeGenesis { .. } => CAPABILITY_INITIALIZE_GENESIS,
+            Self::DreamerJob { request, .. } => dreamer_job_capability(&request.operation),
         }
     }
 
@@ -369,9 +431,45 @@ impl StoreRequest {
                 }
                 Ok(())
             }
+            Self::DreamerJob { context, request } => {
+                validate_dreamer_identity(context, request, identity)
+            }
             _ => Ok(()),
         }
     }
+}
+
+fn validate_dreamer_identity(
+    context: &RequestMeta,
+    request: &DurableJobRequest,
+    identity: &RequestIdentity,
+) -> Result<(), StoreWireError> {
+    if context != &identity.request.metadata {
+        return Err(StoreWireError::Identity(
+            "dreamer context does not match request identity metadata".to_owned(),
+        ));
+    }
+    // Preserve the K0 stable-versus-fresh split: the K0 hash covers stable
+    // mutation fields while the fresh transport correlation (`request_id`)
+    // must still bind frame, outer identity, and inner K0 correlation.
+    if request.request_identity.request.request.metadata != identity.request.metadata {
+        return Err(StoreWireError::Identity(
+            "dreamer request correlation does not match request identity metadata".to_owned(),
+        ));
+    }
+    if request.request_identity.request.idempotency_key != identity.idempotency_key {
+        return Err(StoreWireError::Identity(
+            "dreamer transport idempotency key does not match request identity".to_owned(),
+        ));
+    }
+    if request.request_identity.operation.state_fence != identity.request.state_fence
+        || context.state_fence != identity.request.state_fence
+    {
+        return Err(StoreWireError::Identity(
+            "dreamer request fence does not match request identity".to_owned(),
+        ));
+    }
+    Ok(())
 }
 
 /// Closed semantic store response catalogue.
@@ -407,6 +505,9 @@ pub enum StoreResponse {
     },
     Genesis {
         receipt: WriteReceipt,
+    },
+    DreamerJob {
+        response: DurableJobResponse,
     },
     /// Typed provider-neutral failure introduced by the v2 failure contract.
     Failure {
@@ -506,6 +607,9 @@ impl StoreResponse {
                 snapshot.validate().map_err(StoreWireError::Store)
             }
             Self::Recovery { snapshot } => snapshot.validate().map_err(StoreWireError::Store),
+            Self::DreamerJob { response } => response
+                .validate()
+                .map_err(|error| StoreWireError::Store(map_durable_error(error))),
             Self::Genesis { receipt } => {
                 if receipt.transition_class != crate::TransitionClass::RecoverySchema {
                     return Err(StoreWireError::Store(StoreError::InvalidField {
@@ -1052,6 +1156,18 @@ mod tests {
             CAPABILITY_VALIDATION_SNAPSHOT,
             CAPABILITY_RECOVERY,
             CAPABILITY_INITIALIZE_GENESIS,
+            CAPABILITY_DREAMER_JOB_SUBMIT,
+            CAPABILITY_DREAMER_JOB_LEASE_NEXT,
+            CAPABILITY_DREAMER_JOB_LEASE_EXACT,
+            CAPABILITY_DREAMER_JOB_RENEW,
+            CAPABILITY_DREAMER_JOB_START,
+            CAPABILITY_DREAMER_JOB_CHECKPOINT,
+            CAPABILITY_DREAMER_JOB_RESUME,
+            CAPABILITY_DREAMER_JOB_BEGIN_VERIFICATION,
+            CAPABILITY_DREAMER_JOB_PUBLISH,
+            CAPABILITY_DREAMER_JOB_STATUS,
+            CAPABILITY_DREAMER_JOB_REQUEST_CANCEL,
+            CAPABILITY_DREAMER_JOB_RECONCILE,
         ];
 
         assert_eq!(CAPABILITIES, EXPECTED);

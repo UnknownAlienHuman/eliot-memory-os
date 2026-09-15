@@ -30,10 +30,18 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use thiserror::Error;
 
+mod dreamer_job;
 mod payload_authority;
 mod request_hash;
 mod store_failure;
 mod wire;
+
+pub use dreamer_job::{
+    DREAMER_JOB_LEDGER_SCHEMA, DreamerJobExpectedState, DreamerJobLedgerEvent,
+    DreamerJobLedgerRecord, DreamerJobMutationIdentity, MAX_DREAMER_JOB_HISTORY,
+    MAX_DREAMER_JOB_QUEUE_KEY_BYTES, MAX_DREAMER_JOB_TEXT_BYTES, dreamer_job_queue_key,
+    map_durable_error, validate_ledger_bundle,
+};
 
 pub use payload_authority::{
     CONTROL_FIELD_DENYLIST, CanonicalJson, ExactJsonBytes, MAX_EXACT_JSON_BYTES,
@@ -55,11 +63,17 @@ pub use store_failure::{
 };
 
 pub use wire::{
-    CAPABILITIES, CAPABILITY_APPLY, CAPABILITY_HEALTH, CAPABILITY_INITIALIZE_GENESIS,
-    CAPABILITY_NAMED_READ, CAPABILITY_ORDERING_HEADS, CAPABILITY_READINESS, CAPABILITY_RECEIPT,
-    CAPABILITY_RECOVERY, CAPABILITY_REVISION_HEADS, CAPABILITY_VALIDATION_SNAPSHOT, EFFECTS,
-    ReadinessReceipt, ReadinessStatus, StoreRequest, StoreResponse, StoreWireError,
-    decode_request_frame, decode_request_frame_with_authority, decode_response_frame,
+    CAPABILITIES, CAPABILITY_APPLY, CAPABILITY_DREAMER_JOB_BEGIN_VERIFICATION,
+    CAPABILITY_DREAMER_JOB_CHECKPOINT, CAPABILITY_DREAMER_JOB_LEASE_EXACT,
+    CAPABILITY_DREAMER_JOB_LEASE_NEXT, CAPABILITY_DREAMER_JOB_PUBLISH,
+    CAPABILITY_DREAMER_JOB_RECONCILE, CAPABILITY_DREAMER_JOB_RENEW,
+    CAPABILITY_DREAMER_JOB_REQUEST_CANCEL, CAPABILITY_DREAMER_JOB_RESUME,
+    CAPABILITY_DREAMER_JOB_START, CAPABILITY_DREAMER_JOB_STATUS, CAPABILITY_DREAMER_JOB_SUBMIT,
+    CAPABILITY_HEALTH, CAPABILITY_INITIALIZE_GENESIS, CAPABILITY_NAMED_READ,
+    CAPABILITY_ORDERING_HEADS, CAPABILITY_READINESS, CAPABILITY_RECEIPT, CAPABILITY_RECOVERY,
+    CAPABILITY_REVISION_HEADS, CAPABILITY_VALIDATION_SNAPSHOT, EFFECTS, ReadinessReceipt,
+    ReadinessStatus, StoreRequest, StoreResponse, StoreWireError, decode_request_frame,
+    decode_request_frame_with_authority, decode_response_frame, dreamer_job_capability,
     request_frame, request_frame_with_payload_authority, response_frame,
 };
 
@@ -2121,6 +2135,25 @@ pub trait CanonicalStoreClient: Send + Sync {
     -> Result<NamedReadResponse, StoreError>;
     /// Reports bounded store health and active manifest identity.
     async fn health(&self) -> Result<StoreHealth, StoreError>;
+    /// Applies one closed Dreamer ledger operation (S0 named family).
+    ///
+    /// The default body validates the K0 request shape and then refuses with
+    /// [`StoreError::Unavailable`] without manufacturing durable evidence.
+    /// Unadvertised per-operation capabilities fail as
+    /// [`StoreError::UnknownOperation`] through the K0 role check; no
+    /// successful default body exists. Real persistence lands in S1 (#775).
+    async fn dreamer_job(
+        &self,
+        ctx: &RequestMeta,
+        request: eliot_protocol::dreamer_job::DurableJobRequest,
+    ) -> Result<eliot_protocol::dreamer_job::DurableJobResponse, StoreError> {
+        ctx.validate().map_err(StoreError::Foundation)?;
+        request.validate().map_err(map_durable_error)?;
+        if ctx.state_fence != request.request_identity.operation.state_fence {
+            return Err(StoreError::FenceMismatch);
+        }
+        Err(StoreError::Unavailable)
+    }
 }
 
 /// Narrow read-only capability over the canonical store boundary.
@@ -2687,8 +2720,25 @@ mod tests {
     #[test]
     fn recovery_and_genesis_caps_are_advertised_after_validation_snapshot() {
         assert_eq!(
-            &CAPABILITIES[8..],
+            &CAPABILITIES[8..10],
             &[CAPABILITY_RECOVERY, CAPABILITY_INITIALIZE_GENESIS]
+        );
+        assert_eq!(
+            &CAPABILITIES[10..],
+            &[
+                CAPABILITY_DREAMER_JOB_SUBMIT,
+                CAPABILITY_DREAMER_JOB_LEASE_NEXT,
+                CAPABILITY_DREAMER_JOB_LEASE_EXACT,
+                CAPABILITY_DREAMER_JOB_RENEW,
+                CAPABILITY_DREAMER_JOB_START,
+                CAPABILITY_DREAMER_JOB_CHECKPOINT,
+                CAPABILITY_DREAMER_JOB_RESUME,
+                CAPABILITY_DREAMER_JOB_BEGIN_VERIFICATION,
+                CAPABILITY_DREAMER_JOB_PUBLISH,
+                CAPABILITY_DREAMER_JOB_STATUS,
+                CAPABILITY_DREAMER_JOB_REQUEST_CANCEL,
+                CAPABILITY_DREAMER_JOB_RECONCILE,
+            ]
         );
     }
 
