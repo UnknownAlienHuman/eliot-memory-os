@@ -90,6 +90,10 @@ remove_when = "The R13 harness is moved to the Instrument/conformance boundary o
 kind = "direct_process_launch"
 path = "bins/eliot-kernel/src/tests.rs"
 issue = 15
+class = "test"
+cfg = "windows"
+items = ["external_agent_bridge_os_process_receives_typed_semantic_resolution_denial"]
+operation = "construct"
 reason = "Kernel composition tests still create native processes outside the declared process owner."
 remove_when = "Kernel process fixtures execute through the shared ProcessExecutor test seam and retain equivalent no-orphan/fencing coverage."
 
