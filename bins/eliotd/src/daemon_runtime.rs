@@ -636,6 +636,121 @@ fn activation_deadline_expired(now: u64, deadline: u64) -> bool {
     now >= deadline
 }
 
+/// Plans one closed T11.1 `GetEvidencePack` read for the daemon query path.
+///
+/// This is the registration half of the `eliot.query` plumbing: the caller
+/// holds the already-connected [`DaemonKernelClient`] and the
+/// [`DaemonComposition`] (see `context_read_client`), and calls this pure
+/// planner with the exact admitted fence plus explicit `scope_id`/`subject`/
+/// `max_records` selectors. The returned [`NamedReadRequest`] travels the
+/// single `store_named` transport via [`KernelContextReadClient`]; free text
+/// never becomes a selector and no second consistency algorithm lives here.
+///
+/// For T11.1 the consistency is `Eventual` with no dependency revisions, so
+/// this is exactly the `ReadService` fast path (no stable re-read, no churn
+/// check); when the `eliot-read` dependency is available the caller should
+/// delegate to `ReadService::query` with a `Verification` intent instead of
+/// calling `execute_named` directly. The store catalogue remains the
+/// authority: this planner validates shape only, and the closed
+/// `subject`/`max_records` membership plus the `EVIDENCE_PACK_MAX_RECORDS`
+/// cap are enforced by the adapters.
+#[allow(
+    dead_code,
+    reason = "T11.1 registration API; production bridge dispatch calls it once the manifest admits the query route"
+)]
+pub(super) fn plan_daemon_evidence_read(
+    fence: &eliot_contracts::StateFence,
+    scope_id: &str,
+    subject: &str,
+    max_records: &str,
+) -> Result<eliot_store_api::NamedReadRequest, String> {
+    if subject.trim().is_empty() || subject.chars().any(char::is_control) {
+        return Err("daemon evidence read subject must be non-blank with no control characters"
+            .to_owned());
+    }
+    if max_records.trim().is_empty() || max_records.chars().any(char::is_control) {
+        return Err("daemon evidence read max_records must be a non-blank decimal bound".to_owned());
+    }
+    let bound: u32 = max_records
+        .trim()
+        .parse()
+        .map_err(|_| "daemon evidence read max_records must be a positive decimal bound".to_owned())?;
+    if bound == 0 {
+        return Err(
+            "daemon evidence read max_records must be a positive decimal bound".to_owned(),
+        );
+    }
+    let scope = eliot_store_api::ScopeId::new(scope_id)
+        .map_err(|error| format!("daemon evidence read scope: {error}"))?;
+    let mut parameters = std::collections::BTreeMap::new();
+    parameters.insert(
+        "subject".to_owned(),
+        serde_json::Value::String(subject.trim().to_owned()),
+    );
+    parameters.insert(
+        "max_records".to_owned(),
+        serde_json::Value::String(max_records.trim().to_owned()),
+    );
+    let request = eliot_store_api::NamedReadRequest {
+        operation: eliot_store_api::NamedReadOperation::GetEvidencePack,
+        scope_id: Some(scope),
+        consistency: eliot_store_api::ReadConsistency::Eventual,
+        state_fence: fence.clone(),
+        parameters,
+    };
+    request
+        .validate()
+        .map_err(|error| format!("daemon evidence read request: {error}"))?;
+    Ok(request)
+}
+
+/// Projects a successful evidence-pack response into the daemon query content.
+///
+/// Returns the exact record/provenance shape the `eliot.query` caller
+/// receives: the store payload crosses unchanged under `evidence_pack` with
+/// its subject/scope identity. Fails closed when the operation is not
+/// `GetEvidencePack`, the fence does not match the admitted fence, or the
+/// payload lacks the versioned `records`/`provenance` shape.
+#[allow(
+    dead_code,
+    reason = "T11.1 registration API; production bridge dispatch calls it once the manifest admits the query route"
+)]
+pub(super) fn project_daemon_evidence_response(
+    response: &eliot_store_api::NamedReadResponse,
+    admitted_fence: &eliot_contracts::StateFence,
+    expected_subject: &str,
+) -> Result<serde_json::Value, String> {
+    if response.operation != eliot_store_api::NamedReadOperation::GetEvidencePack {
+        return Err("daemon evidence response operation must be GetEvidencePack".to_owned());
+    }
+    if response.state_fence != *admitted_fence {
+        return Err("daemon evidence response fence does not match the admitted fence".to_owned());
+    }
+    response
+        .validate()
+        .map_err(|error| format!("daemon evidence response: {error}"))?;
+    let subject = response
+        .payload
+        .get("subject")
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| "daemon evidence payload misses its subject".to_owned())?;
+    if subject != expected_subject {
+        return Err("daemon evidence payload subject does not match the requested subject"
+            .to_owned());
+    }
+    if response.payload.get("records").and_then(serde_json::Value::as_array).is_none() {
+        return Err("daemon evidence payload misses its records array".to_owned());
+    }
+    if response.payload.get("provenance").and_then(serde_json::Value::as_object).is_none() {
+        return Err("daemon evidence payload misses its provenance".to_owned());
+    }
+    Ok(serde_json::json!({
+        "operation": "GetEvidencePack",
+        "subject": subject,
+        "evidence_pack": response.payload,
+    }))
+}
+
 fn ready_message(status: &DaemonStatus) -> ReadyMessage {
     ReadyMessage::Ready {
         service: SERVICE_NAME,
@@ -888,5 +1003,90 @@ mod tests {
             other => panic!("expected typed Unknown, got {other:?}"),
         }
         assert_eq!(resolver_calls.get(), 1);
+    }
+
+    #[test]
+    #[allow(
+        clippy::expect_used,
+        clippy::unwrap_used,
+        clippy::too_many_lines,
+        reason = "T11.1 registration test: every asserted subject, bound, scope, fence, and projection value is derived from the test inputs; nothing is canned"
+    )]
+    fn daemon_evidence_read_plans_closed_request_and_projects_exact_response() {
+        use std::num::NonZeroU64;
+
+        use eliot_contracts::{EpochId, EpochLineageId, ResourceGeneration, StateFence};
+
+        const LINEAGE: &str = "550e8400-e29b-41d4-a716-446655440000";
+        let epoch = EpochId::new(
+            EpochLineageId::new(LINEAGE).expect("valid lineage"),
+            NonZeroU64::new(1).expect("nonzero sequence"),
+        )
+        .expect("valid epoch");
+        let fence = StateFence::new(epoch, ResourceGeneration::genesis());
+
+        // Closed planning: exact subject + explicit bound + scope + fence.
+        let request =
+            plan_daemon_evidence_read(&fence, "scope-evidence", "evidence-alpha", "10")
+                .expect("closed evidence read plans");
+        assert_eq!(
+            request.operation,
+            eliot_store_api::NamedReadOperation::GetEvidencePack
+        );
+        assert_eq!(request.state_fence, fence);
+        // The planned request passes the real catalogue gate: only
+        // `subject`/`max_records` cross, so generation never reports an
+        // unknown parameter.
+        let entries = eliot_store_api::generated_operation_manifests()
+            .expect("catalogue generates");
+        request
+            .validate_against_catalogue(&entries)
+            .expect("planned request is catalogue-closed");
+
+        // Free text, blank scope, and bad bounds fail closed before transport.
+        assert!(plan_daemon_evidence_read(&fence, "scope-evidence", "  ", "10").is_err());
+        assert!(plan_daemon_evidence_read(&fence, "  ", "evidence-alpha", "10").is_err());
+        for bound in ["0", "ten", "  "] {
+            assert!(
+                plan_daemon_evidence_read(&fence, "scope-evidence", "evidence-alpha", bound)
+                    .is_err(),
+                "bound {bound:?} must fail closed"
+            );
+        }
+
+        // Projection: exact record/provenance crosses unchanged; wrong
+        // subject, wrong fence, or malformed payload fails closed.
+        let response = eliot_store_api::NamedReadResponse {
+            operation: eliot_store_api::NamedReadOperation::GetEvidencePack,
+            state_fence: fence.clone(),
+            revision_heads: Vec::new(),
+            payload: serde_json::json!({
+                "version": 1,
+                "subject": "evidence-alpha",
+                "records": [{"capture_index": 0}],
+                "provenance": {"matched_total": 1},
+            }),
+        };
+        let projected =
+            project_daemon_evidence_response(&response, &fence, "evidence-alpha")
+                .expect("exact response projects");
+        assert_eq!(projected["subject"], "evidence-alpha");
+        assert_eq!(projected["evidence_pack"], response.payload);
+        assert!(
+            project_daemon_evidence_response(&response, &fence, "evidence-beta").is_err(),
+            "wrong subject must fail closed"
+        );
+        let changed = StateFence::new(
+            EpochId::new(
+                EpochLineageId::new(LINEAGE).expect("valid lineage"),
+                NonZeroU64::new(2).expect("nonzero sequence"),
+            )
+            .expect("valid epoch"),
+            ResourceGeneration::genesis(),
+        );
+        assert!(
+            project_daemon_evidence_response(&response, &changed, "evidence-alpha").is_err(),
+            "changed fence must fail closed"
+        );
     }
 }
