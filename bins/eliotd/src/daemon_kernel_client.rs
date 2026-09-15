@@ -22,6 +22,7 @@ use eliot_protocol::{
     ProtocolVersion, RequestIdentity,
 };
 use eliot_receipts::RequestBinding;
+use eliot_store_api::{NamedReadRequest, NamedReadResponse};
 
 #[cfg(windows)]
 use eliot_ipc::{DeliveryOutcome, NamedPipeTransport, TransportLimits};
@@ -620,6 +621,59 @@ impl DaemonKernelClient {
                 .transact_async_with_identity(operation, payload, identity)
                 .await
         })
+    }
+
+    /// Executes one closed named read through the authenticated Kernel route.
+    ///
+    /// Mirrors the `receipt` / `store_recovery` transport template: the
+    /// request validates before any transport is touched, the call travels as
+    /// the `"store_named"` operation with a fresh operation-bound identity,
+    /// and the typed response is decoded through the closed
+    /// `"store_named"` kind before exact validation. Kernel remains the route
+    /// and fence authority; this method performs no consistency algorithm and
+    /// no catalogue widening — callers enforce the operation/scope
+    /// capability (T11.1 activates `GetEvidencePack` only at the
+    /// `CanonicalReadClient` boundary).
+    ///
+    /// Errors: `Contract` when the request is malformed, the admitted fence
+    /// does not bind the request, the Kernel kind is unexpected, the payload
+    /// does not decode, the response does not validate, or the response
+    /// substitutes the operation or fence; `NotAdmitted` / `Unknown` for
+    /// transport outcomes via [`kernel_port_error`].
+    pub(super) async fn store_named_async(
+        &self,
+        request: NamedReadRequest,
+    ) -> Result<NamedReadResponse, KernelPortError> {
+        request
+            .validate()
+            .map_err(|error| KernelPortError::Contract(error.to_string()))?;
+        if self.snapshot.state_fence() != request.state_fence {
+            return Err(KernelPortError::Contract(
+                "daemon named read fence does not match the admitted snapshot".to_owned(),
+            ));
+        }
+        let value = self
+            .transact_async(
+                "store_named",
+                serde_json::json!({
+                    "request": request,
+                }),
+            )
+            .await
+            .map_err(kernel_port_error)?;
+        let value = super::kind_value(&value, "store_named")?;
+        let response: NamedReadResponse = serde_json::from_value(value)
+            .map_err(|error| KernelPortError::Contract(error.to_string()))?;
+        response
+            .validate()
+            .map_err(|error| KernelPortError::Contract(error.to_string()))?;
+        if response.operation != request.operation || response.state_fence != request.state_fence {
+            return Err(KernelPortError::Contract(
+                "daemon named read response does not match the requested operation and active state fence"
+                    .to_owned(),
+            ));
+        }
+        Ok(response)
     }
 
     fn clone_for_future(&self) -> Arc<Self> {
