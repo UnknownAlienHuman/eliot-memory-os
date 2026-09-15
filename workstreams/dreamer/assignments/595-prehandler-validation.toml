@@ -1,0 +1,141 @@
+schema = "eliot.agent-work-unit.v1"
+authority = "NON_NORMATIVE_IMPLEMENTATION_ALLOCATION"
+status = "READY_FOR_IMPLEMENTATION"
+implementation_support = "COMMON_VALIDATION_DECLARED_EXACT_OWNER_AND_CONSUMER_PROOF_OPEN"
+evidence_execution_status = "ISSUE_AND_PIPELINE_ROUTING_INSPECTED_TESTS_NOT_EXECUTED"
+proof_ceiling = "DREAMER_COMMON_VALIDATION_MODULE_AND_EDGE_CANDIDATE_ONLY"
+issue = 595
+bundle_issue = 593
+screen_issue = 588
+grounding_issue = 602
+fan_in_issue = 684
+controller_issue = 806
+runtime_issue = 1100
+parent_product_issue = 11
+normative_pair_ref = "docs/normative-pair.toml"
+
+[work_unit]
+cell_id = "dreamer.common-pre-handler-validation"
+causal_property = "One grounded structured Dream Packet is subjected exactly once to the closed common A-05 structural, identity, evidence, bound, policy and authority-ceiling checks before exactly one native semantic handler; the validator neither reruns upstream stages nor implements handler-specific semantics, mutation or effects."
+current_discriminator = "The governed pipeline requires common validation after grounding and before native semantic dispatch, and #684 expects an already validated batch. No accepted proof yet establishes one sole A-05 owner, exactly-once execution, complete item accounting and a strict boundary between common and handler-specific validation."
+primary_issue_url = "https://github.com/UnknownAlienHuman/eliot-memory-os/issues/595"
+
+[documentation]
+architecture = [
+  "https://github.com/UnknownAlienHuman/eliot-memory-os/blob/main/docs/architecture/A09-dreamer.md#a9-dreamer",
+  "https://github.com/UnknownAlienHuman/eliot-memory-os/blob/main/docs/architecture/A12-02-principal-session-and-visibility.md#a122-principal-session-and-visibility",
+]
+implementation = [
+  "https://github.com/UnknownAlienHuman/eliot-memory-os/blob/main/docs/architecture/I09-02-dreamer-service-responsibilities.md#i92-dreamer-service-responsibilities",
+  "https://github.com/UnknownAlienHuman/eliot-memory-os/blob/main/docs/architecture/I09-03-job-classes.md#i93-job-classes",
+  "https://github.com/UnknownAlienHuman/eliot-memory-os/blob/main/docs/architecture/I09-04-dreamer-input-bundle.md#i94-dreamer-input-bundle",
+  "https://github.com/UnknownAlienHuman/eliot-memory-os/blob/main/docs/architecture/I09-05-dream-packet.md#i95-dream-packet",
+  "https://github.com/UnknownAlienHuman/eliot-memory-os/blob/main/docs/architecture/I09-06-candidate-kinds.md#i96-candidate-kinds",
+  "https://github.com/UnknownAlienHuman/eliot-memory-os/blob/main/docs/architecture/I09-07-memory-transformation-validation.md#i97-memory-transformation-validation",
+  "https://github.com/UnknownAlienHuman/eliot-memory-os/blob/main/docs/architecture/I12-26-memory-admission-and-retrieval-trace.md#i1226-memory-admission-and-retrieval-trace",
+  "https://github.com/UnknownAlienHuman/eliot-memory-os/blob/main/docs/architecture/I07-20-agent-facing-error-contract.md#i720-agent-facing-error-contract",
+  "https://github.com/UnknownAlienHuman/eliot-memory-os/blob/main/docs/architecture/I15-02-principal-and-session-binding.md#i152-principal-and-session-binding",
+  "https://github.com/UnknownAlienHuman/eliot-memory-os/blob/main/docs/architecture/I15-04-secrets.md#i154-secrets",
+]
+anchors = ["ARCH-DRM-02", "ARCH-DRM-03", "ARCH-GROUND-01", "ARCH-AUTH-01", "ARCH-SEC-01", "ARCH-RES-04"]
+
+[current_source]
+confirmed = [
+  "Common A-05 validation is a distinct stage after #602 grounding and before one native semantic handler.",
+  "The #684 Curation fan-in explicitly consumes an already A-05-validated batch and must not invoke or recompute common validation.",
+  "The common validator must preserve exact #593 bundle, #588 screen and #602 grounding receipts and cannot repair their output.",
+  "Candidate-kind-specific semantic invariants remain owned by the exact native handlers rather than a growing generic validator.",
+]
+
+[scope]
+primary_paths = [
+  "the exact common pre-handler validation package/cell owned by #595",
+  "shared validated Dream Packet and validation-receipt contracts only when an owning defect is proven",
+  "exact #593 bundle, #588 screen, #602 grounding, #684 fan-in and native-handler adapters",
+  "focused schema, identity, bound, policy, denominator, replay and exactly-once fixtures",
+]
+serialized_dependencies = [
+  "#593 frozen input bundle",
+  "#588 Curation screen where applicable",
+  "#602 grounding",
+  "#684 Curation fan-in and all native semantic handlers",
+  "#806 pure controller",
+  "#1100 runtime composition",
+]
+forbidden = [
+  "model/provider/tool invocation or source acquisition",
+  "Store, graph, index, cache, filesystem or ambient configuration query",
+  "screening or grounding recomputation, repair or fallback",
+  "candidate-kind-specific semantic algorithm or sibling-handler selection",
+  "candidate application, ID allocation, canonical mutation, authority, effect or task Finish",
+  "generic untyped payload maps, trial decoding, Other variants or warning-only validation",
+  "automatic GitHub workflow triggers",
+]
+
+[[waves]]
+id = "A"
+what = "Freeze one exact common-validation input and item denominator."
+how = [
+  "Bind validation to job/request/task/attempt/scope/fence, job class, controller and phase operation identity, original model draft, frozen bundle, exact source-assurance/screen/grounding receipts, candidate/item denominator, policy/config revisions, deadlines, budgets, privacy/effect ceilings and freshness/invalidation evidence.",
+  "Preserve original draft and upstream receipt bytes/digests; reject mixed boundaries, missing predecessors, duplicate item identity and same-ID changed content before item validation.",
+  "Separate all-or-nothing and explicitly admitted partial-batch modes in the input contract.",
+]
+
+[[waves]]
+id = "B"
+what = "Apply only the closed common A-05 checks."
+how = [
+  "Validate protocol/schema/version, canonical encoding/digest, required identities and lineage, closed job and candidate kinds, payload shape, unknown-field rejection, string/collection/nesting bounds, denominator completeness, exact target/evidence/allocation roles, screen eligibility, grounding coverage, policy/config currentness, deadline/cancellation and privacy/effect/authority ceilings.",
+  "Reject generic maps, unbounded extensions, prose classifications, implicit defaults, hidden omissions and payload-controlled authority.",
+  "Do not decide whether a structurally valid relation, episode, procedure, conflict, repair, configuration or plan is semantically correct; emit it only as commonly validated input for the exact owner.",
+]
+
+[[waves]]
+id = "C"
+what = "Produce exact per-item and batch dispositions without repair or fallback."
+how = [
+  "Give every expected item one accepted-for-handler, rejected, blocked, stale, conflicted, unknown, unprocessed or not-applicable disposition using the existing closed vocabulary.",
+  "For all-or-nothing mode, any required non-accepted item blocks every handler dispatch; for explicit partial mode, retain exact accepted/rejected/blocked/unprocessed accounting and frontier identity.",
+  "A failed item is never silently removed, rewritten, assigned to another candidate kind or sent to a fallback handler.",
+  "Validation failure invokes zero semantic handlers and zero external effects.",
+]
+
+[[waves]]
+id = "D"
+what = "Emit one immutable validation receipt and enforce exactly-once consumption."
+how = [
+  "Bind receipt identity to the complete original input, upstream receipts, item denominator/dispositions, policy/config, all independent bounds, omissions, blind boundaries, freshness and invalidation set.",
+  "#806 records one validation phase operation; #684 or the exact native dispatcher consumes this receipt and rejects absent, stale, mismatched or already-consumed identities rather than rerunning validation.",
+  "Native handlers may enforce their own semantic invariants but cannot weaken, override or recalculate common A-05 acceptance.",
+  "Exact replay returns the same receipt; changed same-identity draft, upstream receipt, item, policy, bound or fence conflicts.",
+]
+
+[acceptance]
+criteria = [
+  "One package/cell is the sole common A-05 pre-handler validation owner with closed typed input, item disposition and immutable receipt contracts.",
+  "Validation binds exact job/task/attempt/scope/fence, phase operation, draft, bundle, screen, grounding, denominator, policy/config, deadline, budget, privacy/effect and invalidation identities.",
+  "Original draft and upstream receipt bytes/digests are retained and cannot be repaired, replaced or synthesized by validation.",
+  "All common protocol/schema/version, identity/lineage, candidate-kind/payload-shape, bound, denominator, role, screen, grounding, policy, deadline/cancel and ceiling checks execute before dispatch.",
+  "Unknown fields, generic maps, implicit defaults, unbounded extensions, prose classifications, hidden omissions and payload-controlled authority fail closed.",
+  "The common validator contains no candidate-kind-specific semantic algorithm and cannot choose a sibling/fallback handler.",
+  "Every expected item receives exactly one terminal or explicit blocking disposition; no item disappears from the denominator.",
+  "All-or-nothing mode invokes zero handlers when any required item is not accepted; partial mode preserves complete accepted/rejected/blocked/unprocessed accounting.",
+  "Validation failure invokes zero handlers, Store/model/tool calls, mutations, authority or effects.",
+  "Receipt identity covers the complete input, predecessors, item dispositions, policy/config, independent bounds, omissions, freshness and invalidation set.",
+  "Common validation executes at most once per exact phase operation and downstream consumers cannot rerun or bypass it.",
+  "Native handlers may add semantic checks but cannot weaken, override or reinterpret common validation.",
+  "Exact replay is deterministic; changed same-identity draft/predecessor/item/policy/bound/fence conflicts.",
+  "No source acquisition, model/provider/tool, Store/graph/config query, grounding/screen repair, semantic dispatch fallback, candidate application, ID allocation, canonical write, authority, effect or Finish API exists.",
+  "Fixtures cover malformed schema, unknown field, duplicate item, wrong digest, mixed receipts, role confusion, ineligible target, unsupported grounding, oversize input, all-or-nothing blocking, explicit partial mode, replay and duplicate-consumption rejection.",
+]
+
+[verification]
+commands = [
+  "cargo fmt --all -- --check",
+  "cargo check --locked -p <dreamer-common-validator-owner> --all-targets",
+  "cargo test --locked -p <dreamer-common-validator-owner> --all-targets",
+  "cargo clippy --locked -p <dreamer-common-validator-owner> --all-targets -- -D warnings",
+  "git diff --check",
+]
+edge_proof = "Compose #593/#588/model/#602 through #806/#1100 into common validation and every native dispatcher, proving exactly one validation, zero bypass/fallback and zero handler calls on blocked batches."
+product_proof = "Issue #11 remains open; common structural validation cannot prove native semantic correctness or Product behavior."
