@@ -606,7 +606,11 @@ function Get-AuthenticodeRoleDefinitions {
     # CLI is an additional trust role: it is the install-authoritative front
     # door named by the production handoff, but it is not a Phase-A payload
     # role.  Governor, Operator UI, and other payload remain outside this
-    # exact signing scope.
+    # exact signing scope and fail closed via
+    # Assert-CompleteCodeBearingDenominator until #1189 (legacy retirement)
+    # + #1217 (provider/host-integration route) land.  This script never
+    # deletes governor/Codex payload; it refuses to finalize a bundle that
+    # contains unmanifested/unsigned executables.
     @(
         [ordered]@{ role = 'cli'; path = 'runtime/eliot.exe' }
         [ordered]@{ role = 'host'; path = 'runtime/eliot-host.exe' }
@@ -618,6 +622,200 @@ function Get-AuthenticodeRoleDefinitions {
         [ordered]@{ role = 'doctor'; path = 'runtime/eliot-doctor.exe' }
         [ordered]@{ role = 'testd'; path = 'runtime/eliot-testd.exe' }
         [ordered]@{ role = 'native_worker'; path = 'runtime/eliot-native-worker.exe' }
+    )
+}
+
+function Get-CodeBearingExecutableExtensions {
+    # Closed code-bearing denominator (Part B, #1227 gap f).  Every file
+    # with one of these extensions is executable code and requires an
+    # explicit trusted-signature disposition via
+    # Get-AuthenticodeRoleDefinitions.  Operator payload (.dll/.exe/.winmd),
+    # plugin/governor binaries (.exe/.dll), and runtime PEs all fall in this
+    # set.  All other extensions carry an explicit non-executable disposition
+    # (data, manifests, resources, docs) and must never be executed.
+    # GATED (#1189/#1217): legacy eliot-governor/Codex bridge binaries remain
+    # canonical on disk at this base; they are NOT deleted here.  They fail
+    # closed in Assert-CompleteCodeBearingDenominator as
+    # unmanifested/unsigned executables until their owners land retirement or
+    # an explicit signed role.
+    @('.exe', '.dll', '.sys', '.drv', '.efi', '.scr', '.cpl', '.ocx', '.ax', '.winmd', '.node')
+}
+
+function Test-IsCodeBearingReleasePath([string]$RelativePath) {
+    $normalized = ([string]$RelativePath).Replace('\', '/')
+    $extension = [System.IO.Path]::GetExtension($normalized)
+    if ([string]::IsNullOrWhiteSpace($extension)) { return $false }
+    foreach ($candidate in @(Get-CodeBearingExecutableExtensions)) {
+        if ($extension -ieq $candidate) { return $true }
+    }
+    return $false
+}
+
+function Test-IsPeImageHeader([string]$Path) {
+    # Lightweight MZ+PE header probe for hidden executables that evade the
+    # extension denominator (for example an .exe renamed to .dat).  Returns
+    # $true only for a bounded PE image; never throws for non-PE files.
+    try {
+        $stream = [System.IO.File]::Open(
+            [string]$Path,
+            [System.IO.FileMode]::Open,
+            [System.IO.FileAccess]::Read,
+            [System.IO.FileShare]::Read)
+        try {
+            if ($stream.Length -lt 256) { return $false }
+            $header = [byte[]]::new(256)
+            $read = $stream.Read($header, 0, 256)
+            if ($read -lt 64) { return $false }
+            if ($header[0] -ne 0x4d -or $header[1] -ne 0x5a) { return $false }
+            $peOffset = [System.BitConverter]::ToInt32($header, 0x3c)
+            if ($peOffset -lt 64 -or $peOffset + 6 -gt $stream.Length) { return $false }
+            if ($peOffset + 6 -le 256) {
+                return ($header[$peOffset] -eq 0x50 -and $header[$peOffset + 1] -eq 0x45 -and
+                    $header[$peOffset + 2] -eq 0 -and $header[$peOffset + 3] -eq 0)
+            }
+            $stream.Seek([int64]$peOffset, [System.IO.SeekOrigin]::Begin) | Out-Null
+            $sig = [byte[]]::new(4)
+            if ($stream.Read($sig, 0, 4) -ne 4) { return $false }
+            return ($sig[0] -eq 0x50 -and $sig[1] -eq 0x45 -and $sig[2] -eq 0 -and $sig[3] -eq 0)
+        }
+        finally { $stream.Dispose() }
+    }
+    catch { return $false }
+}
+
+function Assert-CompleteCodeBearingDenominator([string]$Bundle) {
+    # Fail-closed complete denominator (Part B, #1227 gaps f/h): every
+    # code-bearing file in the bundle must be an exact signed role.
+    # Non-executable files carry an explicit non-executable disposition by
+    # falling outside the closed extension set AND failing the PE-header
+    # probe.  Any unmanifested/unsigned executable — including Operator
+    # Eliot.Operator.exe + .dll/.winmd deps and plugin/governor
+    # code-bearing files outside the 10 PE roles — fails finalization here,
+    # before any signing mutation.
+    $resolved = Get-FullyQualifiedWindowsPath $Bundle 'code-bearing denominator bundle'
+    $roles = @(Get-AuthenticodeRoleDefinitions)
+    $roleSet = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
+    foreach ($role in $roles) { [void]$roleSet.Add((([string]$role.path).Replace('\', '/'))) }
+    $inventory = @(Get-ReleaseFileInventory $resolved)
+    foreach ($entry in $inventory) {
+        $relative = ([string]$entry.path).Replace('\', '/')
+        if ($relative -ieq $script:StagingOwnerMarker) { continue }
+        $isCodeBearing = Test-IsCodeBearingReleasePath $relative
+        $candidate = Join-Path $resolved ($relative.Replace('/', '\'))
+        if (-not $isCodeBearing) {
+            if (Test-IsPeImageHeader $candidate) {
+                throw "release bundle contains a hidden PE executable outside the exact signing scope: $relative (rename does not confer non-executable disposition; see #1227 gaps f/h)"
+            }
+            continue
+        }
+        if (-not $roleSet.Contains($relative)) {
+            throw "release bundle contains an unmanifested code-bearing executable outside the exact signing scope: $relative (expected one of the exact Authenticode roles; Operator/plugin/governor legacy gated on #1189/#1217 — retirement or explicit signed role required, never silent adoption)"
+        }
+    }
+    foreach ($role in $roles) {
+        if (-not (Test-IsCodeBearingReleasePath ([string]$role.path))) {
+            throw "signing role is not a code-bearing executable path: $($role.path)"
+        }
+    }
+}
+
+function Assert-AuthorSignerPublisherDisjointness([object]$Plan, [object]$UnsignedRelease) {
+    # Author→Signer→Publisher disjointness (Part B, #1227 gap g; preserved +
+    # strengthened; create-new/atomic fencing itself is unchanged below).
+    # - Author: unsigned bundle producer, evidenced by source_commit +
+    #   SIGNING_REQUIRED.txt + signed=false/not-issued boundary.
+    # - Signer: code-signing key holder, evidenced ONLY by explicit
+    #   store/thumbprint/timestamp (never from bundle bytes).
+    # - Publisher: finalizer publication, evidenced by a distinct
+    #   create-new SignedBundle path (staging token fencing enforced in
+    #   New-OwnedStagingDirectory/PublishDirectoryHandleCreateNew).
+    # The three evidence domains must each be present, well-formed, and
+    # pairwise distinct; conflation fails closed.
+    if (-not $Plan -or -not $UnsignedRelease) {
+        throw 'Author/Signer/Publisher disjointness requires a signing plan and unsigned release evidence'
+    }
+    $sourceCommit = [string]$UnsignedRelease.source_commit
+    if ([string]::IsNullOrWhiteSpace($sourceCommit) -or $sourceCommit -cnotmatch '^[0-9a-f]{40}$') {
+        throw 'Author evidence source_commit must be an exact 40-hex commit'
+    }
+    if ($UnsignedRelease.signed -ne $false -or
+        [string]$UnsignedRelease.signature_evidence -cne 'not-issued') {
+        throw 'Author boundary must be explicit unsigned (signed=false, signature_evidence=not-issued)'
+    }
+    $thumbprint = Get-NormalizedThumbprint ([string]$Plan.certificate_thumbprint) 'CertificateThumbprint'
+    [void](Assert-ExplicitCertificateStore ([string]$Plan.certificate_store_location))
+    [void](Assert-ExplicitRfc3161TimestampUrl ([string]$Plan.timestamp_url))
+    if ([string]::Equals($thumbprint, $sourceCommit, [System.StringComparison]::OrdinalIgnoreCase)) {
+        throw 'Signer thumbprint must not equal the Author source_commit'
+    }
+    $unsignedBundle = [string]$Plan.unsigned_bundle
+    $signedBundle = [string]$Plan.signed_bundle
+    if ([string]::IsNullOrWhiteSpace($unsignedBundle) -or [string]::IsNullOrWhiteSpace($signedBundle) -or
+        [string]::Equals($unsignedBundle, $signedBundle, [System.StringComparison]::OrdinalIgnoreCase)) {
+        throw 'Publisher SignedBundle must be a distinct create-only path from the Author UnsignedBundle'
+    }
+    $leaf = Split-Path -Leaf $signedBundle
+    if ([string]::IsNullOrWhiteSpace($leaf) -or $leaf -ne (Split-Path -Leaf $signedBundle) -or
+        $leaf.Contains('\') -or $leaf.Contains('/') -or $leaf -eq '.' -or $leaf -eq '..') {
+        throw 'Publisher SignedBundle leaf must be one relative name under the retained parent'
+    }
+    if ([string]$Plan.signer_eku -cne $script:AuthenticodeCodeSigningEku -or
+        [string]$Plan.signing_scope -cne $script:AuthenticodeSigningScope) {
+        throw 'Signer EKU/scope binding must be the exact Authenticode/RFC3161 policy'
+    }
+}
+
+function Assert-UnsignedSignedPerFileLink([object]$UnsignedBaselineEntry, [string]$SignedPath) {
+    # Explicit unsigned↔signed per-file link (Part B, #1227 gap h): only the
+    # Authenticode certificate table, checksum, and certificate-directory
+    # bytes may change.  Delegates to the exact PE layout proof and binds the
+    # normalized image hash back to the unsigned baseline.
+    $evidence = Assert-PeCertificateTableOnlyDelta $UnsignedBaselineEntry $SignedPath
+    if ([string]$evidence.normalized_image_sha256 -cne [string]$UnsignedBaselineEntry.normalized_image_sha256) {
+        throw "unsigned↔signed per-file link broken: $($UnsignedBaselineEntry.role_path)"
+    }
+    return $evidence
+}
+
+function Get-ReleaseDeterministicTestAggregatorWiring {
+    # Deterministic aggregator wiring definition (Part B, #1227 gap i).
+    # Defines — never executes — the exact deterministic suite set.  The
+    # future aggregator (owner: release-test lane; NOT this script) must run
+    # every deterministic suite, report a nonzero exact count per suite, and
+    # fail closed on zero counts or missing suites.  Live cert/HSM signing is
+    # NEVER part of the deterministic set; it remains a separate manual gate
+    # requiring an explicit live certificate/HSM and must never be silently
+    # reported as executed.
+    @(
+        [ordered]@{
+            suite = 'release-security-smoke'
+            path = 'tests/release-security/run-tests.ps1'
+            kind = 'deterministic'
+            live_cert_required = $false
+            nonzero_exact_count_required = $true
+        }
+        [ordered]@{
+            suite = 'finalize-signing'
+            path = 'tests/release-security/finalize-signing-tests.ps1'
+            kind = 'deterministic'
+            live_cert_required = $false
+            nonzero_exact_count_required = $true
+        }
+        [ordered]@{
+            suite = 'trusted-cli-launch'
+            path = 'tests/release-security/trusted-cli-launch-tests.ps1'
+            kind = 'deterministic'
+            live_cert_required = $false
+            nonzero_exact_count_required = $true
+        }
+        [ordered]@{
+            suite = 'trusted-cli-live-signing'
+            path = 'tests/release-security/trusted-cli-live-signing-tests.ps1'
+            kind = 'live-cert-hsm-gated'
+            live_cert_required = $true
+            nonzero_exact_count_required = $false
+            gate = 'manual-live-cert-hsm-only; never in deterministic aggregator; never silently reported as executed'
+        }
     )
 }
 
@@ -875,6 +1073,21 @@ function New-AuthenticodeSigningPlan(
         }
     }
 
+    # Part B (#1227 gaps f/g/h): fail closed here — before any mutation —
+    # on any code-bearing file outside the exact 10 PE roles (Operator DLLs,
+    # plugin/governor executables, hidden PEs), and enforce
+    # Author→Signer→Publisher evidence disjointness at plan time.
+    [void](Assert-CompleteCodeBearingDenominator $source)
+    [void](Assert-AuthorSignerPublisherDisjointness ([pscustomobject][ordered]@{
+                unsigned_bundle = $source
+                signed_bundle = $destination
+                certificate_store_location = [string]$store.location
+                certificate_thumbprint = [string]$thumbprint
+                timestamp_url = [string]$timestamp
+                signer_eku = $script:AuthenticodeCodeSigningEku
+                signing_scope = $script:AuthenticodeSigningScope
+            }) $release)
+
     [ordered]@{
         schema = 'eliot-authenticode-signing-plan-v1'
         unsigned_bundle = $source
@@ -986,6 +1199,13 @@ function Assert-AuthenticodeReadback(
         (Get-CertificateThumbprint $timestamp) -cne [string]$TimestampEvidence.timestamp_certificate_thumbprint -or
         [string]$timestamp.Subject -cne [string]$TimestampEvidence.timestamp_certificate_subject) {
         throw "RFC3161 token proof does not match WinTrust timestamp readback for $Path"
+    }
+    # Part B strengthening (gap g): Signer and RFC3161 TSA must be distinct
+    # evidence domains.  A self-timestamped token (signer == TSA) fails
+    # closed; the timestamp authority must be an independent time source.
+    if ((Get-CertificateThumbprint $timestamp) -eq (Get-CertificateThumbprint $signer) -or
+        [string]$timestamp.Subject -ceq [string]$signer.Subject) {
+        throw "RFC3161 timestamp authority must be distinct from the Authenticode signer for $Path"
     }
     if (-not $SignToolEvidence) {
         throw "independent signtool /tw verification is missing for $Path"
@@ -1387,6 +1607,9 @@ function Assert-RuntimeArtifactBindings([string]$Bundle) {
 
 function New-ReleaseFinalizationBaseline([string]$Bundle) {
     [void](Assert-RuntimeArtifactBindings $Bundle)
+    # Part B: the unsigned baseline is only valid over a complete
+    # code-bearing denominator.  Extra executables fail here, not later.
+    [void](Assert-CompleteCodeBearingDenominator $Bundle)
     $peRoles = foreach ($role in @(Get-AuthenticodeRoleDefinitions)) {
         Get-UnsignedPeBaselineEvidence (Join-Path $Bundle $role.path) ([string]$role.path)
     }
@@ -1455,11 +1678,17 @@ function Assert-ExactFinalizationDelta([object]$Baseline, [string]$FinalBundle) 
     $peEvidence = foreach ($role in @(Get-AuthenticodeRoleDefinitions)) {
         $peBaseline = @($Baseline.pe_roles | Where-Object { [string]$_.role_path -eq [string]$role.path })
         if ($peBaseline.Count -ne 1) { throw "PE baseline is missing or duplicated: $($role.path)" }
-        $evidence = Assert-PeCertificateTableOnlyDelta $peBaseline[0] (Join-Path $FinalBundle $role.path)
+        # Part B explicit unsigned↔signed per-file link: only declared
+        # Authenticode bytes may change (certificate table + checksum +
+        # cert directory); any other image delta fails closed.
+        $evidence = Assert-UnsignedSignedPerFileLink $peBaseline[0] (Join-Path $FinalBundle $role.path)
         $evidence['role_path'] = [string]$role.path
         [pscustomobject]$evidence
     }
     [void](Assert-RuntimeArtifactBindings $FinalBundle)
+    # Part B: the signed bundle must also satisfy the complete denominator;
+    # signing must never introduce an unmanifested executable.
+    [void](Assert-CompleteCodeBearingDenominator $FinalBundle)
     [ordered]@{
         signed_roles_changed = $rolePaths.Count
         manifests_changed = $manifestPaths.Count
@@ -2056,6 +2285,10 @@ function Test-FinalizedReleaseBundle(
 ) {
     $resolved = Assert-ExistingBundleDirectory $Path 'SignedBundle'
     Assert-NoReleaseSecrets $resolved
+    # Part B: fail closed on any unmanifested/unsigned executable in the
+    # signed bundle (complete denominator, gap f).  Signing must never
+    # introduce or retain code outside the exact 10 PE roles.
+    [void](Assert-CompleteCodeBearingDenominator $resolved)
     foreach ($required in @(
             'RELEASE.json',
             'runtime/RUNTIME_ARTIFACTS.json',
@@ -2323,8 +2556,13 @@ function Invoke-ReleaseBundleFinalization {
             $receipt = Assert-AuthenticodeReadback $readback $Plan $path $signerSubject ([string]$role.path) $timestampEvidence $signToolEvidence
             $peBaseline = @($baseline.pe_roles | Where-Object { [string]$_.role_path -eq [string]$role.path })
             if ($peBaseline.Count -ne 1) { throw "PE baseline is missing or duplicated: $($role.path)" }
-            $peEvidence = Assert-PeCertificateTableOnlyDelta $peBaseline[0] $path
+            # Part B explicit unsigned↔signed per-file link (gap h).
+            $peEvidence = Assert-UnsignedSignedPerFileLink $peBaseline[0] $path
             foreach ($property in $peEvidence.GetEnumerator()) { $receipt[$property.Key] = $property.Value }
+            # Bind the unsigned baseline hash into the signed receipt so the
+            # unsigned↔signed link is auditable per file (no live data).
+            $receipt.unsigned_normalized_image_sha256 = [string]$peBaseline[0].normalized_image_sha256
+            $receipt.unsigned_bytes = [int64]$peBaseline[0].unsigned_bytes
             $receipt.role = [string]$role.role
             [void]$roleEvidence.Add([pscustomobject]$receipt)
         }
