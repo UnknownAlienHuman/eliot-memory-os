@@ -493,6 +493,109 @@ impl StoreFailure {
     }
 }
 
+/// Closed erasure refusal reported by the fail-closed surface aggregation.
+///
+/// This is the only erasure-specific taxonomy added by the store port: every
+/// variant maps into the existing typed [`StoreFailure`] via
+/// [`ErasureFailureKind::store_failure`]. No new public error taxonomy exists
+/// beyond this mapping. `Unknown` never maps to success: it always becomes
+/// `UnknownOutcome` with exact-operation reconciliation.
+#[derive(
+    Clone, Copy, Debug, Eq, Hash, JsonSchema, Ord, PartialEq, PartialOrd, Serialize, Deserialize,
+)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE", deny_unknown_fields)]
+pub enum ErasureFailureKind {
+    /// At least one required surface is incomplete (or the outcome set is
+    /// empty, duplicated, misordered, missing, or extra).
+    Incomplete,
+    /// At least one required surface reports unknown outcome; takes
+    /// precedence over [`Self::Incomplete`].
+    Unknown,
+    /// The backend does not implement durable intent; refuses with zero
+    /// destructive calls.
+    UnsupportedIntent,
+    /// The same operation identity carries a different admitted digest.
+    IntentConflict,
+}
+
+impl ErasureFailureKind {
+    /// Returns the stable additive reason token for this refusal.
+    #[must_use]
+    pub const fn reason_code(self) -> &'static str {
+        match self {
+            Self::Incomplete => "ERASURE_SURFACE_INCOMPLETE",
+            Self::Unknown => "ERASURE_SURFACE_UNKNOWN",
+            Self::UnsupportedIntent => "ERASURE_INTENT_UNSUPPORTED",
+            Self::IntentConflict => "ERASURE_INTENT_CONFLICT",
+        }
+    }
+
+    /// Maps this refusal into the existing typed [`StoreFailure`].
+    ///
+    /// * `Incomplete` becomes `Unavailable` with a `Partial` mutation: some
+    ///   destructive work may have happened and manual recovery owns the rest.
+    /// * `Unknown` becomes `UnknownOutcome` with an `Unknown` mutation and
+    ///   exact-operation reconciliation; it is never success.
+    /// * `UnsupportedIntent` becomes `Unsupported` with no attempted mutation.
+    /// * `IntentConflict` becomes `Conflict` requiring a new identity after
+    ///   the condition changes.
+    pub fn store_failure(
+        self,
+        context: &StoreFailureIdentityContext,
+    ) -> Result<StoreFailure, StoreFailureContractError> {
+        let mut failure = StoreFailure::base(context);
+        let (disposition, mutation, retry, recovery) = match self {
+            Self::Incomplete => (
+                StoreFailureDisposition::Unavailable,
+                StoreMutationDisposition::Partial,
+                StoreRetryDirective::ManualRecovery,
+                StoreRecoveryAction::EnterManualRecovery,
+            ),
+            Self::Unknown => {
+                if failure.operation_id.is_none() {
+                    return Err(StoreFailureContractError::MissingOperationIdentity);
+                }
+                (
+                    StoreFailureDisposition::UnknownOutcome,
+                    StoreMutationDisposition::Unknown,
+                    StoreRetryDirective::ReconcileExactOperation,
+                    StoreRecoveryAction::ReconcileUnknownOutcome,
+                )
+            }
+            Self::UnsupportedIntent => (
+                StoreFailureDisposition::Unsupported,
+                StoreMutationDisposition::NotAttempted,
+                StoreRetryDirective::DoNotRetry,
+                StoreRecoveryAction::None,
+            ),
+            Self::IntentConflict => (
+                StoreFailureDisposition::Conflict,
+                StoreMutationDisposition::NotAttempted,
+                StoreRetryDirective::NewIdentityAfterCondition,
+                StoreRecoveryAction::None,
+            ),
+        };
+        failure.disposition = disposition;
+        failure.reason_code = StoreReasonCode::new(self.reason_code())?;
+        failure.mutation_disposition = mutation;
+        failure.retry_directive = retry;
+        failure.recovery_action = recovery;
+        failure.validate()?;
+        Ok(failure)
+    }
+}
+
+/// Maps one erasure refusal into the existing typed [`StoreFailure`].
+///
+/// Thin free-function form of [`ErasureFailureKind::store_failure`] for
+/// call sites that hold the kind by value.
+pub fn erasure_store_failure(
+    kind: ErasureFailureKind,
+    context: &StoreFailureIdentityContext,
+) -> Result<StoreFailure, StoreFailureContractError> {
+    kind.store_failure(context)
+}
+
 fn invalid(field: &'static str, reason: &'static str) -> StoreFailureContractError {
     StoreFailureContractError::Invalid { field, reason }
 }
