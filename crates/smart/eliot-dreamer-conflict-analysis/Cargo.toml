@@ -12,7 +12,7 @@ path = "src/lib.rs"
 
 [package.metadata.eliot]
 prototype = true
-source_status = "NOT_IMPLEMENTED"
+source_status = "IMPLEMENTED"
 workspace_admission = "pending_agent_implementation_and_proof"
 functional_cell = "smart.dreamer.conflict_analysis"
 source_layer = "C1"
@@ -24,7 +24,7 @@ agent_order = 39
 eliot-contracts = { path = "../../foundation/eliot-contracts" }
 eliot-evidence = { path = "../../foundation/eliot-evidence" }
 eliot-dreamer-contracts = { path = "../eliot-dreamer-contracts" }
-eliot-dreamer-candidate-validation = { path = "../eliot-dreamer-candidate-validation" }
+eliot-epistemic-contracts = { path = "../eliot-epistemic-contracts" }
 
 [lints]
 workspace = true
