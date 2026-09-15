@@ -23,7 +23,7 @@ use super::*;
 use crate::{SchemaGeneration, SurrealStoreAdapter};
 
 #[path = "test_readiness.rs"]
-mod test_readiness;
+pub(super) mod test_readiness;
 
 struct Harness {
     root: PathBuf,
@@ -123,8 +123,12 @@ impl Harness {
         // Bounded readiness retry (PR #1488 pattern): slow provider
         // authentication waits up to ~30s with 100ms backoff instead of
         // failing on the first attempt. Last error is preserved on timeout.
-        test_readiness::connect_with_readiness_retry(&self.root, &self.config, &mut self.adapter)
-            .await;
+        test_readiness::connect_with_readiness_retry(
+            Path::new(&self.root),
+            &self.config,
+            &mut self.adapter,
+        )
+        .await;
     }
 
     fn adapter(&self) -> &SurrealStoreAdapter {

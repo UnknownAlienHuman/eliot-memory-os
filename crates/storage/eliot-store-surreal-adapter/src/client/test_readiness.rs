@@ -6,13 +6,14 @@
 //! dropped before each retry because `SurrealStoreAdapter.client` caches its
 //! first connection outcome; no migration or canonical operation has run yet.
 //!
-//! Test-only: this file is included via `#[path]` from `payload_tests` and
-//! `ownership_tests` harnesses only. It is never declared from production
+//! Test-only: this file is included once via `#[path]` from the
+//! `payload_tests` harness (`pub(super)` to `client`) and reused from the
+//! `ownership_tests` harness. It is never declared from production
 //! code, adds no public API, no new dependency, no `#[ignore]`, and no
 //! crate-wide serialization.
 #![allow(clippy::expect_used, clippy::large_futures)]
 
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::time::Duration;
 use tokio::time::{Instant, sleep};
 
@@ -27,12 +28,12 @@ use crate::{SurrealAdapterConfig, SurrealStoreAdapter};
 /// then `connect()` is bounded by the shared deadline via `timeout_at`.
 /// On success the live adapter is left in `slot`; on timeout the slot is
 /// cleared and a panic reports the last observed error.
-pub(super) async fn connect_with_readiness_retry(
-    root: &PathBuf,
+pub(crate) async fn connect_with_readiness_retry(
+    root: &Path,
     config: &SurrealAdapterConfig,
     slot: &mut Option<SurrealStoreAdapter>,
 ) {
-    let platform = WindowsPlatform::new(root.clone()).expect("platform");
+    let platform = WindowsPlatform::new(root.to_path_buf()).expect("platform");
     let deadline = Instant::now() + Duration::from_secs(30);
     let mut last_error = None;
     loop {

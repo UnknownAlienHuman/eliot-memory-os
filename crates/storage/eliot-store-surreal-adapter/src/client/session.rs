@@ -320,8 +320,7 @@ mod ownership_tests {
     use tokio::net::TcpStream;
     use tokio::process::Command;
 
-    #[path = "test_readiness.rs"]
-    mod test_readiness;
+    use super::super::payload_tests::test_readiness::connect_with_readiness_retry;
 
     struct Harness {
         root: PathBuf,
@@ -421,12 +420,10 @@ mod ownership_tests {
             // Bounded readiness retry (PR #1488 pattern): slow provider
             // authentication waits up to ~30s with 100ms backoff instead of
             // failing on the first attempt. Last error is preserved on timeout.
-            test_readiness::connect_with_readiness_retry(
-                &harness.root,
-                &harness.config,
-                &mut harness.adapter,
-            )
-            .await;
+            // Shared helper lives in `payload_tests::test_readiness` (test-only,
+            // single definition) to avoid duplicating the retry loop.
+            connect_with_readiness_retry(&harness.root, &harness.config, &mut harness.adapter)
+                .await;
             harness
         }
         fn adapter(&self) -> &SurrealStoreAdapter {
