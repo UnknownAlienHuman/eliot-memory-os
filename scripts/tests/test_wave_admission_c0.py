@@ -34,6 +34,7 @@ import json
 import re
 import subprocess
 import sys
+import tempfile
 import tomllib
 import unittest
 from collections import Counter
@@ -76,6 +77,13 @@ def git(*args: str) -> subprocess.CompletedProcess:
     return subprocess.run(
         ["git", "-C", str(ROOT), *args],
         capture_output=True, text=True, timeout=120,
+    )
+
+
+def git_bytes(*args: str) -> subprocess.CompletedProcess:
+    return subprocess.run(
+        ["git", "-C", str(ROOT), *args],
+        capture_output=True, text=False, timeout=120,
     )
 
 
@@ -181,6 +189,54 @@ def validate_challenges(open_entries: list[dict], six_names: set[str]) -> list[s
 def validate_single_writer(writers: list[str]) -> list[str]:
     if len(writers) != 1:
         return [f"expected exactly one root/lock/index writer, found {len(writers)}"]
+    return []
+
+
+FMT_ONLY_RS_ALLOWLIST = frozenset({
+    "crates/smart/eliot-dreamer-contracts/src/failure/input.rs",
+    "crates/smart/eliot-dreamer-contracts/tests/classification_contracts.rs",
+    "crates/smart/eliot-dreamer-contracts/tests/concept_contracts.rs",
+    "crates/smart/eliot-dreamer-contracts/tests/consumer_and_source_proof.rs",
+    "crates/smart/eliot-dreamer-contracts/tests/curation_invocation.rs",
+    "crates/smart/eliot-dreamer-contracts/tests/failure_contracts.rs",
+    "crates/smart/eliot-dreamer-contracts/tests/relation_contracts.rs",
+    "crates/smart/eliot-memory-curation-contracts/tests/contracts.rs",
+})
+
+
+def validate_fmt_only_rs_scope(changed_rs: list[str]) -> list[str]:
+    """Exact-scope gate: the diff may touch .rs only inside the allowlist."""
+    errors: list[str] = []
+    extra = sorted(set(changed_rs) - FMT_ONLY_RS_ALLOWLIST)
+    missing = sorted(FMT_ONLY_RS_ALLOWLIST - set(changed_rs))
+    if extra:
+        errors.append(f"non-allowlisted .rs changed: {extra}")
+    if missing:
+        errors.append(f"allowlisted fmt-only .rs absent from diff: {missing}")
+    return errors
+
+
+def rustfmt_derivation_errors(rel: str, base_raw: bytes, live_raw: bytes,
+                              edition: str) -> list[str]:
+    """Fmt-only proof: live bytes must equal rustfmt(base bytes), byte-exact.
+
+    rustfmt is semantics-preserving by construction, so byte-equality with
+    rustfmt(base) proves zero semantic change (no added/removed ``pub``,
+    ``allow``, identifier, or item) while permitting import-order moves,
+    trailing-comma normalization, and width rewraps. Returns [] on proof,
+    else human-readable errors.
+    """
+    with tempfile.TemporaryDirectory(prefix="wave-c0-fmt-") as tmp:
+        probe = Path(tmp) / "probe.rs"
+        probe.write_bytes(base_raw)
+        fmt = subprocess.run(
+            ["rustfmt", "--edition", edition, str(probe)],
+            capture_output=True, text=True, timeout=120,
+        )
+        if fmt.returncode != 0:
+            return [f"rustfmt failed on base copy of {rel}: {fmt.stderr[-1000:]}"]
+        if probe.read_bytes() != live_raw:
+            return [f"semantic drift in {rel}: live bytes != rustfmt(base bytes)"]
     return []
 
 
@@ -493,7 +549,35 @@ class TestWaveAdmissionC0(unittest.TestCase):
         names = git("diff", "--name-only", BASE_SHA, "HEAD")
         self.assertEqual(names.returncode, 0, names.stderr)
         changed = names.stdout.split()
-        self.assertEqual([c for c in changed if c.endswith(".rs")], [])
+        changed_rs = sorted(c for c in changed if c.endswith(".rs"))
+        # Exact-scope leg: precisely the 8 fmt-only .rs, nothing more or less.
+        self.assertEqual(validate_fmt_only_rs_scope(changed_rs), [])
+        self.assertEqual(changed_rs, sorted(FMT_ONLY_RS_ALLOWLIST))
+        # Fmt-only proof leg per file: live bytes == rustfmt(base bytes).
+        edition = str(root_workspace()["package"]["edition"])
+        for rel in changed_rs:
+            base = git_bytes("show", f"{BASE_SHA}:{rel}")
+            self.assertEqual(base.returncode, 0, base.stderr)
+            live = read_bytes(rel)
+            self.assertEqual(
+                rustfmt_derivation_errors(rel, base.stdout, live, edition), [])
+        # Repo-formatted leg: scoped cargo fmt check must pass.
+        fmt_check = cargo("fmt", "-p", "eliot-dreamer-contracts",
+                          "-p", "eliot-memory-curation-contracts",
+                          "--", "--check")
+        self.assertEqual(fmt_check.returncode, 0,
+                         (fmt_check.stderr or "")[-2000:])
+        # Negative legs through the same validators (no label-echo oracles).
+        self.assertTrue(validate_fmt_only_rs_scope(
+            changed_rs + ["crates/smart/eliot-cue-contracts/src/lib.rs"]))
+        self.assertTrue(validate_fmt_only_rs_scope(changed_rs[:-1]))
+        probe_rel = changed_rs[0]
+        probe_base = git_bytes("show", f"{BASE_SHA}:{probe_rel}")
+        self.assertEqual(probe_base.returncode, 0, probe_base.stderr)
+        mutated = (probe_base.stdout
+                   + b"\n#[allow(dead_code)]\npub fn fmt_only_probe_rejector() {}\n")
+        self.assertTrue(rustfmt_derivation_errors(
+            probe_rel, mutated, read_bytes(probe_rel), edition))
         allowed_cargo = {"prototype", "workspace_admission"}
         allowed_module = {"status", "workspace_admission"}
         for item in self.six:
