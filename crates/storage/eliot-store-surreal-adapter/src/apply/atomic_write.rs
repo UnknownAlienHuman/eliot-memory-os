@@ -37,24 +37,35 @@ IF ($position_before[0].epistemic_position_revision ?? 0) != $expected_position_
 // exact recorded scope; the outcome seal persists the exact per-surface
 // outcomes for idempotent same-operation replay.
 
+// 688-FIX: the erasure items below form the intent-before-dispatch live path
+// owned by the real-Surreal round-trip integration slice. No admitted erasure
+// dispatch exists on this base (the neutral purge port lives in a parallel
+// subtask and is not yet on this base), so wiring a caller here would widen
+// scope; each item carries `allow(dead_code)` until that slice wires it. The
+// pure template/binding helpers are additionally exercised by the wired
+// erasure unit test in `apply.rs`.
 /// Upsert of one durable erasure-intent row: creates the row when absent,
 /// refuses with `erasure_intent_conflict` when the same `operation_id`
 /// already names a different intent. First statement of the erasure atomic
 /// transaction — before any destructive statement.
+#[allow(dead_code)]
 const TX_ERASURE_INTENT: &str = "LET $erasure_existing = (SELECT VALUE { operation_id: operation_id, subject: subject, scope_id: scope_id, surfaces: surfaces, state_fence: state_fence, operation_count: operation_count } FROM ONLY type::record($erasure_table, $erasure_operation_id)); IF type::is_object($erasure_existing) { IF $erasure_existing != $erasure_intent_expected { THROW 'erasure_intent_conflict'; }; } ELSE { CREATE type::record($erasure_table, $erasure_operation_id) CONTENT $erasure_intent_record; };";
 
 /// Deletes exactly the selected subject's capture rows admitted under the
 /// exact recorded scope. `{i}` selects the binding index. Exact subject/scope
 /// match only — never substring, never a default scope.
+#[allow(dead_code)]
 const TX_ERASURE_DELETE_EVIDENCE: &str = "DELETE write_receipt WHERE $erasure_subject{i} IN evidence_records.subject AND $erasure_scope{i} = $erasure_scope_expected{i};";
 
 /// Seals one completed operation with its exact per-surface outcomes. Last
 /// statement before commit; same-operation replay reads this row and returns
 /// the stored outcomes without duplicate destructive work (the single
 /// completion marker for the intent row above — never a second ledger).
+#[allow(dead_code)]
 const TX_ERASURE_OUTCOME: &str = "LET $erasure_outcome_existing = (SELECT VALUE { operation_id: operation_id, outcomes: outcomes } FROM ONLY type::record($erasure_outcome_table, $erasure_outcome_id)); IF type::is_object($erasure_outcome_existing) { IF $erasure_outcome_existing.outcomes != $erasure_outcomes { THROW 'erasure_intent_conflict'; }; } ELSE { CREATE type::record($erasure_outcome_table, $erasure_outcome_id) CONTENT $erasure_outcome_record; };";
 
 /// Reads one sealed erasure-outcome row by exact operation id.
+#[allow(dead_code)]
 const READ_ERASURE_OUTCOME: &str = "SELECT VALUE { operation_id: operation_id, outcomes: outcomes } FROM ONLY type::record($erasure_outcome_table, $erasure_outcome_id);";
 
 #[allow(
@@ -442,6 +453,7 @@ pub(super) fn ordering_write_template(initial_state: bool, exists: bool) -> &'st
 /// is not yet on this base; the adapter never imports `eliot-erasure`). All
 /// `SurrealQL` stays in `apply`/`schema` modules; the public boundary carries
 /// store-api types only.
+#[allow(dead_code)]
 #[derive(
     Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd, serde::Serialize, serde::Deserialize,
 )]
@@ -462,6 +474,7 @@ impl SurrealErasureSurface {
     ///
     /// Every other surface is out of store scope: the adapter marks it
     /// `Incomplete` (never `Purged`) instead of claiming foreign removal.
+    #[allow(dead_code)]
     #[must_use]
     pub const fn is_store_owned(self) -> bool {
         match self {
@@ -481,6 +494,7 @@ impl SurrealErasureSurface {
 /// dispatch. `Unknown` preserves an ambiguous effect (e.g. lost provider
 /// response) for same-operation reconciliation: it is stored and replayed,
 /// never retried blindly and never promoted into suppression.
+#[allow(dead_code)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
 pub enum SurrealSurfaceOutcome {
@@ -492,6 +506,7 @@ pub enum SurrealSurfaceOutcome {
 
 impl SurrealSurfaceOutcome {
     /// Returns the surface this outcome reports on.
+    #[allow(dead_code)]
     #[must_use]
     pub const fn surface(self) -> SurrealErasureSurface {
         match self {
@@ -509,6 +524,7 @@ impl SurrealSurfaceOutcome {
 /// on retry); `subject` + `scope_id` name the exact admitted pair;
 /// `surfaces` is the exact admitted denominator; `state_fence` pins the
 /// fence the destructive calls execute under.
+#[allow(dead_code)]
 #[derive(Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct SurrealErasureIntent {
@@ -521,6 +537,7 @@ pub struct SurrealErasureIntent {
 
 impl SurrealErasureIntent {
     /// Fail-closed validation of the frozen intent.
+    #[allow(dead_code)]
     pub fn validate(&self) -> Result<(), StoreError> {
         validate_erasure_text(&self.operation_id, "erasure.operation_id")?;
         validate_erasure_text(&self.subject, "erasure.subject")?;
@@ -544,6 +561,7 @@ impl SurrealErasureIntent {
     }
 }
 
+#[allow(dead_code)]
 fn validate_erasure_text(value: &str, field: &'static str) -> Result<(), StoreError> {
     if value.trim().is_empty() || value.chars().any(char::is_control) {
         return Err(StoreError::InvalidField {
@@ -556,6 +574,7 @@ fn validate_erasure_text(value: &str, field: &'static str) -> Result<(), StoreEr
 
 /// Address of one durable erasure-intent row: (`erasure_intent`,
 /// `erasure-intent-<operation_id>`). One row per operation; no second ledger.
+#[allow(dead_code)]
 #[must_use]
 pub(crate) fn erasure_intent_record_id(operation_id: &str) -> String {
     format!("erasure-intent-{operation_id}")
@@ -564,6 +583,7 @@ pub(crate) fn erasure_intent_record_id(operation_id: &str) -> String {
 /// Address of one sealed erasure-outcome row: (`erasure_outcome`,
 /// `erasure-outcome-<operation_id>`). The single completion marker for the
 /// intent row above — never a second ledger.
+#[allow(dead_code)]
 #[must_use]
 pub(crate) fn erasure_outcome_record_id(operation_id: &str) -> String {
     format!("erasure-outcome-{operation_id}")
@@ -587,6 +607,7 @@ pub(crate) fn erasure_outcome_record_id(operation_id: &str) -> String {
 /// built (the caller refuses with `ReceiptNotFound` before any provider I/O);
 /// a lost commit response is `UnknownOutcome` for same-operation
 /// reconciliation, never a blind retry.
+#[allow(dead_code)]
 #[must_use]
 pub(crate) fn erasure_transaction_template(store_owned_surface_count: usize) -> String {
     let mut sql = String::from(schema::TX_BEGIN);
@@ -606,6 +627,11 @@ pub(crate) fn erasure_transaction_template(store_owned_surface_count: usize) -> 
 /// `Incomplete` (foreign removal is never claimed). A surface that already
 /// carries a terminal non-`NotAttempted` outcome keeps it verbatim
 /// (partial-resume identity; `Unknown` is preserved, never cleared).
+/// A preserved terminal outcome replays verbatim AND emits no destructive
+/// statement for that surface: the transaction template is rendered from the
+/// count of `erasure_subject{i}` bindings below, so a replayed-`Unknown`
+/// (or any replayed terminal) surface contributes zero `DELETE`s.
+#[allow(dead_code)]
 pub(crate) fn erasure_transaction_bindings(
     intent: &SurrealErasureIntent,
     prior_outcomes: &[SurrealSurfaceOutcome],
@@ -640,16 +666,10 @@ pub(crate) fn erasure_transaction_bindings(
                 && !matches!(outcome, SurrealSurfaceOutcome::NotAttempted { .. })
         });
         if let Some(outcome) = preserved {
+            // Terminal replay: keep the stored outcome verbatim and emit no
+            // destructive statement for this surface (no `erasure_subject{i}`
+            // bindings, so the rendered template carries no `DELETE` for it).
             outcomes.push(*outcome);
-            if surface.is_store_owned() {
-                erasure_delete_bindings(
-                    &mut bindings,
-                    store_owned_index,
-                    &intent.subject,
-                    &intent.scope_id,
-                );
-                store_owned_index += 1;
-            }
             continue;
         }
         if surface.is_store_owned() {
@@ -692,6 +712,7 @@ pub(crate) fn erasure_transaction_bindings(
     Ok((bindings, outcomes))
 }
 
+#[allow(dead_code)]
 fn erasure_delete_bindings(
     bindings: &mut Map<String, Value>,
     index: usize,
@@ -722,23 +743,35 @@ fn erasure_delete_bindings(
 /// Callers invoke this only after the apply-path intent gate below has
 /// recorded the durable intent: without that gate this function is never
 /// reached (fail-closed, zero destructive effects without recorded intent).
+#[allow(dead_code)]
 pub(super) async fn write_erasure_transaction(
     db: &client::RpcTransport,
     config: &SurrealAdapterConfig,
     intent: &SurrealErasureIntent,
 ) -> Result<Vec<SurrealSurfaceOutcome>, AdapterError> {
     intent.validate().map_err(AdapterError::Store)?;
-    if let Some(sealed) = read_erasure_outcome(db, config, &intent.operation_id).await? {
+    // Single sealed-outcome read: a sealed row replays verbatim with no
+    // duplicate destructive work; the unsealed case (`None`) binds against an
+    // empty prior so the transaction emits the full store-owned `DELETE` set.
+    let sealed = read_erasure_outcome(db, config, &intent.operation_id).await?;
+    if let Some(sealed) = sealed {
         return Ok(sealed);
     }
-    let prior = read_erasure_outcome(db, config, &intent.operation_id)
-        .await?
-        .unwrap_or_default();
+    let prior: Vec<SurrealSurfaceOutcome> = Vec::new();
     let (bindings, outcomes) = erasure_transaction_bindings(intent, &prior)?;
-    let store_owned = intent
-        .surfaces
-        .iter()
-        .filter(|surface| surface.is_store_owned())
+    // 688-FIX: render the template from the emitted `erasure_subject{i}`
+    // bindings (not from the intent denominator), so a replayed terminal
+    // outcome — preserved verbatim above with no bindings — contributes zero
+    // `DELETE`s. On the fresh path every store-owned surface emits bindings,
+    // so this equals the intent's store-owned count.
+    let store_owned = bindings
+        .keys()
+        .filter(|key| {
+            key.starts_with("erasure_subject")
+                && key["erasure_subject".len()..]
+                    .bytes()
+                    .all(|byte| byte.is_ascii_digit())
+        })
         .count();
     let sql = erasure_transaction_template(store_owned);
     let mut response = match client::query(db, config, "transaction.erasure", &sql, bindings).await
@@ -766,6 +799,7 @@ pub(super) async fn write_erasure_transaction(
     Ok(outcomes)
 }
 
+#[allow(dead_code)]
 async fn read_erasure_outcome(
     db: &client::RpcTransport,
     config: &SurrealAdapterConfig,
@@ -793,11 +827,13 @@ async fn read_erasure_outcome(
         .transpose()
 }
 
+#[allow(dead_code)]
 #[derive(serde::Deserialize)]
 struct ErasureOutcomeRow {
     outcomes: Vec<String>,
 }
 
+#[allow(dead_code)]
 fn parse_erasure_outcomes(outcomes: &[String]) -> Result<Vec<SurrealSurfaceOutcome>, AdapterError> {
     outcomes
         .iter()
