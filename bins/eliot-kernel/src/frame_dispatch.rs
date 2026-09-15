@@ -10,8 +10,8 @@
 //! Forbidden authority: must not fabricate execution success, must not accept peer-owned shutdown authority, must not bypass `ServerHandshakePolicy`, generation poison, or state-fence compatibility.
 //! Ordinary module: I2.23 Capability-family topology and crate extraction decisions — ordinary single-file extraction (<10k LOC) owning only `KernelComposition::dispatch_frame` plus inseparable dispatch-only helpers with zero external users.
 
-use super::front_door_session::{DOCTOR_MODULE_ID, TESTD_MODULE_ID};
 use super::dreamer_job_dispatch::is_dreamer_operation;
+use super::front_door_session::{DOCTOR_MODULE_ID, TESTD_MODULE_ID};
 use super::native_worker_lifecycle_route::is_native_worker_operation;
 use super::{
     ACTIVE_DAEMON_CALLER, DOCTOR_REPAIR_WIRE_ID, DoctorRepairAttemptRequest, Frame, FrameKind,
@@ -21,7 +21,80 @@ use super::{
     route_testd_admission, status_frame, unix_ms,
 };
 
+fn observe_frame(event: &'static str, outcome: &'static str) {
+    use super::kernel_diagnostics::{KERNEL_DIAGNOSTICS_TARGET, bound_field};
+    let event_bound = bound_field(event);
+    let outcome_bound = bound_field(outcome);
+    tracing::info!(
+        target: KERNEL_DIAGNOSTICS_TARGET,
+        event = event_bound.text(),
+        outcome = outcome_bound.text(),
+        "frame dispatch observation"
+    );
+}
+
+fn frame_terminal_code(error: &TransportError) -> &'static str {
+    match error {
+        TransportError::SessionFenced => "frame_fenced",
+        TransportError::PeerIdentityUnavailable => "frame_peer_unavailable",
+        TransportError::Timeout => "frame_timeout",
+        TransportError::UnknownRequest => "frame_unknown_request",
+        TransportError::UnknownOutcome => "frame_unknown_outcome",
+        TransportError::IdentityConflict => "frame_identity_conflict",
+        TransportError::Cancelled => "frame_cancelled",
+        TransportError::Backpressure => "frame_backpressure",
+        TransportError::InvalidLimits => "frame_invalid_limits",
+        TransportError::UnauthenticatedPeer => "frame_unauthenticated_peer",
+        TransportError::InvalidPipeName => "frame_invalid_pipe",
+        TransportError::RegistryFull => "frame_registry_full",
+        TransportError::Io(_) => "frame_io",
+        TransportError::PlanGap { .. } => "frame_plan_gap",
+        TransportError::Protocol(_) => "frame_protocol",
+    }
+}
+
 impl KernelComposition {
+    /// Runs the currently admitted, deliberately closed semantic gateway.
+    ///
+    /// Heartbeats are handled locally. Other validated frames, including
+    /// shutdown requests, are rejected and fenced until the durable
+    /// execution gateway is supplied; this boundary never fabricates
+    /// execution success or accepts a peer-owned shutdown authority.
+    ///
+    /// Diagnostic wrapper: received/validated/admitted/dispatched stay
+    /// distinct, decode uses only trusted identities, and exactly one
+    /// terminal is emitted per failed dispatch. Subordinate route helpers
+    /// emit info only.
+    pub fn dispatch_frame(
+        &self,
+        session: &Session,
+        frame: &Frame,
+    ) -> Result<KernelFrameAction, TransportError> {
+        observe_frame("kernel.frame_received", "attempt");
+        let result = self.dispatch_frame_inner(session, frame);
+        match &result {
+            Ok(action) => {
+                let outcome = match action {
+                    KernelFrameAction::Reply(_) => "replied",
+                    KernelFrameAction::Daemon { .. } => "daemon_admitted",
+                    KernelFrameAction::Process { .. } => "process_admitted",
+                    KernelFrameAction::Doctor { .. } => "doctor_admitted",
+                    KernelFrameAction::Testd { .. } => "testd_admitted",
+                    KernelFrameAction::Dreamer { .. } => "dreamer_admitted",
+                    KernelFrameAction::Fence(_) => "fenced_reply",
+                };
+                observe_frame("kernel.frame_validated", "success");
+                observe_frame("kernel.frame_admitted", "success");
+                observe_frame("kernel.frame_dispatched", outcome);
+            }
+            Err(error) => {
+                observe_frame("kernel.frame_decode_reject", "fenced");
+                super::kernel_diagnostics::observe_terminal_error(frame_terminal_code(error));
+            }
+        }
+        result
+    }
+
     /// Runs the currently admitted, deliberately closed semantic gateway.
     ///
     /// Heartbeats are handled locally. Other validated frames, including
@@ -32,7 +105,7 @@ impl KernelComposition {
         clippy::too_many_lines,
         reason = "the closed dispatch matrix keeps session, identity, and service-state gates in one auditable order"
     )]
-    pub fn dispatch_frame(
+    fn dispatch_frame_inner(
         &self,
         session: &Session,
         frame: &Frame,
@@ -351,9 +424,7 @@ impl KernelComposition {
                 // Stale or unauthenticated sessions fence here and are never
                 // granted protected input. No process is spawned on this
                 // path (worker handoff is T12-09).
-                if frame.kind != FrameKind::Request
-                    || frame.message_type != MessageType::Execute
-                {
+                if frame.kind != FrameKind::Request || frame.message_type != MessageType::Execute {
                     return Err(TransportError::SessionFenced);
                 }
                 if self
@@ -504,6 +575,7 @@ impl KernelComposition {
         session: &Session,
         frame: &Frame,
     ) -> Result<KernelFrameAction, TransportError> {
+        observe_frame("kernel.frame_doctor_dispatch", "attempt");
         let control = frame.kind == FrameKind::Cancel && frame.message_type == MessageType::Cancel;
         if control {
             if !matches!(
@@ -608,6 +680,31 @@ impl KernelComposition {
         operation: &str,
         payload: serde_json::Value,
     ) -> Result<Frame, TransportError> {
+        observe_frame("kernel.frame_doctor_execute", "attempt");
+        let result = self
+            .execute_doctor_request_inner(session, request_id, operation, &payload)
+            .await;
+        match &result {
+            Ok(_) => observe_frame("kernel.frame_doctor_execute", "success"),
+            Err(error) => {
+                observe_frame("kernel.frame_doctor_execute", "fenced");
+                super::kernel_diagnostics::observe_terminal_error(frame_terminal_code(error));
+            }
+        }
+        result
+    }
+
+    #[allow(
+        clippy::unused_async,
+        reason = "the front-door driver awaits this handler uniformly with the daemon/testd arms; spawning stays in the explicit async launch seam"
+    )]
+    async fn execute_doctor_request_inner(
+        &self,
+        session: &Session,
+        request_id: super::RequestId,
+        operation: &str,
+        payload: &serde_json::Value,
+    ) -> Result<Frame, TransportError> {
         if !is_doctor_operation(operation) {
             return Err(TransportError::SessionFenced);
         }
@@ -625,7 +722,7 @@ impl KernelComposition {
         ) {
             return Err(TransportError::SessionFenced);
         }
-        let request = doctor_request_from_payload(&payload)?;
+        let request = doctor_request_from_payload(payload)?;
         if operation != request.wire_id
             || !route_doctor_repair(&request.wire_id, request.wire_version)
         {
@@ -714,6 +811,7 @@ impl KernelComposition {
         session: &Session,
         frame: &Frame,
     ) -> Result<KernelFrameAction, TransportError> {
+        observe_frame("kernel.frame_testd_dispatch", "attempt");
         let control = frame.kind == FrameKind::Cancel && frame.message_type == MessageType::Cancel;
         if control {
             if !matches!(
@@ -819,6 +917,31 @@ impl KernelComposition {
         operation: &str,
         payload: serde_json::Value,
     ) -> Result<Frame, TransportError> {
+        observe_frame("kernel.frame_testd_execute", "attempt");
+        let result = self
+            .execute_testd_request_inner(session, request_id, operation, &payload)
+            .await;
+        match &result {
+            Ok(_) => observe_frame("kernel.frame_testd_execute", "success"),
+            Err(error) => {
+                observe_frame("kernel.frame_testd_execute", "fenced");
+                super::kernel_diagnostics::observe_terminal_error(frame_terminal_code(error));
+            }
+        }
+        result
+    }
+
+    #[allow(
+        clippy::unused_async,
+        reason = "the front-door driver awaits this handler uniformly with the daemon/doctor arms; spawning stays in the explicit async launch seam"
+    )]
+    async fn execute_testd_request_inner(
+        &self,
+        session: &Session,
+        request_id: super::RequestId,
+        operation: &str,
+        payload: &serde_json::Value,
+    ) -> Result<Frame, TransportError> {
         if !is_testd_operation(operation) {
             return Err(TransportError::SessionFenced);
         }
@@ -836,7 +959,7 @@ impl KernelComposition {
         ) {
             return Err(TransportError::SessionFenced);
         }
-        let request = testd_request_from_payload(&payload)?;
+        let request = testd_request_from_payload(payload)?;
         if operation != request.wire_id
             || !route_testd_admission(&request.wire_id, request.wire_version)
         {
