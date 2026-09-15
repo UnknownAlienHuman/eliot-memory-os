@@ -12,6 +12,10 @@ path = "src/lib.rs"
 
 [dependencies]
 eliot-dreamer-contracts = { path = "../eliot-dreamer-contracts" }
+# Serialization infrastructure only: canonical digests and closed wire shapes.
+# No rival-model, evaluation, epistemic, provider, or serde_json families.
+serde = { version = "1.0.228", features = ["derive"] }
+schemars = { version = "1.2.1", features = ["derive"] }
 
 [package.metadata.eliot]
 prototype = true
