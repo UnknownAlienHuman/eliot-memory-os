@@ -291,5 +291,30 @@
     "https://github.com/UnknownAlienHuman/eliot-memory-os/blob/main/integrations/antigravity/integration.json",
     "https://github.com/UnknownAlienHuman/eliot-memory-os/blob/main/plugin/eliot-antigravity-official/plugin.json",
     "https://github.com/UnknownAlienHuman/eliot-memory-os/issues/9"
-  ]
+  ],
+  "disposition": {
+    "disposition": "unavailable-target",
+    "route_id": "antigravity.exec.persistent-ndjson",
+    "bundle_generation": "1217-A.1",
+    "admittable": false,
+    "admitted": false,
+    "proof_ceiling": "The persistent stream may execute one bounded candidate attempt only after exact probes; plugin presence and terminal prose do not prove child closure or task completion.",
+    "expiry_condition": "No expiry; static unavailable-target. Admission requires persistent headless and Python SDK adapter implementation and live probes. The agy fallback antigravity.agy.readonly-diff remains a candidate unified-diff fallback only under a read-only boundary with unknown-outcome non-redispatch; it cannot mutate the worktree or prove a full lifecycle integration.",
+    "per_attempt_receipt": true,
+    "required_probes": [
+      "pin exact plugin schema, CLI/SDK version, account profile, executable/package hash, and model catalogue",
+      "prove persistent stdin, ordered NDJSON events, permission handling, terminal result, cancellation, and process-tree cleanup",
+      "prove native child agents remain disabled until child-event and descendant-closure coverage is observed",
+      "prove the legacy agy fallback remains read-only and unknown outcomes are non-redispatchable"
+    ],
+    "non_admittable_reasons": [
+      "implementation_support=PARTIAL is non-admittable",
+      "evidence_execution_status=NOT_EXECUTED is non-admittable",
+      "execution_routes[primary].status=target is non-admittable",
+      "execution_routes[alternative].status=target is non-admittable",
+      "event_contract.coverage_status=documented_not_observed is non-admittable",
+      "event_contract.coverage_status=unprobed is non-admittable",
+      "event_contract.coverage_status=partial without live admission is non-admittable"
+    ]
+  }
 }
