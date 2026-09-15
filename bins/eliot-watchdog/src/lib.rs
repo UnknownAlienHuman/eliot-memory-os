@@ -10,9 +10,7 @@
 #[cfg(test)]
 use std::ffi::OsString;
 use std::future::Future;
-#[cfg(test)]
-use std::path::Path;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::pin::Pin;
 #[cfg(test)]
 use std::sync::Arc;
@@ -45,7 +43,6 @@ use eliot_runtime_contracts::{VerifiedSupervisionLease, WatchdogAdmissionTemplat
 use eliot_watchdog_core::{Epoch, Watchdog};
 use thiserror::Error;
 
-#[cfg(test)]
 use redb::Database;
 
 #[cfg(test)]
@@ -84,9 +81,14 @@ use watchdog_publication_readback::{
     verify_against_durable_current,
 };
 pub(crate) use watchdog_spool::{
-    SPOOL_EXPORT_CURSOR_SCHEMA_VERSION, SpoolAppendOutcome, WatchdogSpool,
+    SPOOL_EXPORT_CURSOR_SCHEMA_VERSION, WatchdogSpool, watchdog_spool_path,
 };
-pub use watchdog_spool::{WatchdogSpoolEntry, WatchdogSpoolExportLimits, WatchdogSpoolPayload};
+pub use watchdog_spool::{
+    SpoolAppendOutcome, WatchdogSpoolEntry, WatchdogSpoolExportLimits, WatchdogSpoolPayload,
+};
+pub use watchdog_spool::export_driver::{
+    WatchdogEntryView, WatchdogExportSink, export_once, watchog_entry_views, watchdog_entry_views,
+};
 
 #[cfg(test)]
 impl WatchdogSpool {
@@ -105,7 +107,7 @@ impl WatchdogSpool {
 #[cfg(test)]
 pub(crate) use watchdog_spool::{
     SPOOL_HIGH_WATER_KEY, SPOOL_HIGH_WATER_TABLE, SPOOL_SCHEMA_VERSION, SPOOL_TABLE,
-    WatchdogSpoolHeader, encode_entry, encode_high_water, validate_header, watchdog_spool_path,
+    WatchdogSpoolHeader, encode_entry, encode_high_water, validate_header,
 };
 
 #[cfg(test)]
@@ -264,7 +266,17 @@ pub struct GapRecoveryDisposition {
 pub struct IndependentKernelSensor {
     watchdog: Mutex<Option<Watchdog>>,
     spool: WatchdogSpool,
-    runtime_binding: WatchdogRuntimeBinding,
+    /// Retained installer-approved binding and its no-follow leases for
+    /// production sensors; `None` for test-constructed sensors, which carry no
+    /// protected leases. Export identities always come from the stored fields
+    /// below so both contours export identically.
+    _runtime_binding: Option<WatchdogRuntimeBinding>,
+    /// Owning installation bound at construction, from the retained binding's
+    /// selected manifest in production or explicit in tests.
+    installation_id: String,
+    /// Watchdog generation bound at construction, from the retained binding's
+    /// selected manifest in production or explicit in tests.
+    watchdog_generation: u64,
 }
 
 impl IndependentKernelSensor {
@@ -279,6 +291,18 @@ impl IndependentKernelSensor {
         watchdog_epoch: u64,
     ) -> Result<Self, SpoolError> {
         let spool = WatchdogSpool::open_runtime_binding(&binding)?;
+        let installation_id = binding
+            .selected_manifest
+            .runtime_launch
+            .installation_epoch
+            .installation
+            .as_str()
+            .to_owned();
+        let watchdog_generation = binding
+            .selected_manifest
+            .runtime_launch
+            .authority_generation
+            .value();
         let watchdog = Watchdog::new(
             eliot_watchdog_core::WatchdogConfig::default(),
             Epoch(watchdog_epoch),
@@ -287,7 +311,9 @@ impl IndependentKernelSensor {
         Ok(Self {
             watchdog: Mutex::new(Some(watchdog)),
             spool,
-            runtime_binding: binding,
+            _runtime_binding: Some(binding),
+            installation_id,
+            watchdog_generation,
         })
     }
 
@@ -302,10 +328,24 @@ impl IndependentKernelSensor {
         binding: WatchdogRuntimeBinding,
     ) -> Result<Self, SpoolError> {
         let spool = WatchdogSpool::open_runtime_binding(&binding)?;
+        let installation_id = binding
+            .selected_manifest
+            .runtime_launch
+            .installation_epoch
+            .installation
+            .as_str()
+            .to_owned();
+        let watchdog_generation = binding
+            .selected_manifest
+            .runtime_launch
+            .authority_generation
+            .value();
         Ok(Self {
             watchdog: Mutex::new(None),
             spool,
-            runtime_binding: binding,
+            _runtime_binding: Some(binding),
+            installation_id,
+            watchdog_generation,
         })
     }
 
@@ -378,20 +418,8 @@ impl IndependentKernelSensor {
         sink_id: &str,
         limits: WatchdogSpoolExportLimits,
     ) -> Result<(WatchdogSpoolExportBatch, Vec<Vec<u8>>), SpoolError> {
-        let installation_id = self
-            .runtime_binding
-            .selected_manifest
-            .runtime_launch
-            .installation_epoch
-            .installation
-            .as_str()
-            .to_owned();
-        let watchdog_generation = self
-            .runtime_binding
-            .selected_manifest
-            .runtime_launch
-            .authority_generation
-            .value();
+        let installation_id = self.installation_id.clone();
+        let watchdog_generation = self.watchdog_generation;
         let watchdog_epoch = self
             .watchdog
             .lock()
@@ -462,10 +490,11 @@ impl IndependentKernelSensor {
     /// Compacts durably acknowledged spool records below the stored export
     /// cursor and returns the number of records removed.
     ///
-    /// This is the Wave C compaction entry point; no production path calls it
-    /// yet. The caller passes the live acknowledged sequence it read from the
-    /// stored cursor, and the spool refuses to compact on any divergence.
-    /// There is no semantic interpretation here and no canonical store write.
+    /// This is the Wave C compaction entry point, driven by
+    /// [`crate::export_once`] after every successful acknowledgement. The
+    /// caller passes the live acknowledged sequence it read from the stored
+    /// cursor, and the spool refuses to compact on any divergence. There is
+    /// no semantic interpretation here and no canonical store write.
     ///
     /// # Errors
     ///
@@ -476,6 +505,99 @@ impl IndependentKernelSensor {
         stored_cursor_acknowledged: u64,
     ) -> Result<u64, SpoolError> {
         self.spool.compact_below_cursor(stored_cursor_acknowledged)
+    }
+
+    /// Opens a test-only sensor over an unprotected state directory with
+    /// explicit export identities.
+    ///
+    /// Opens (or creates) `watchdog.redb` directly under `state_dir` with no
+    /// protected-root lease, no registry, and no supervision authority — the
+    /// same storage shape as the crate-internal test spool, made public only
+    /// so Wave C integration tests can drive the real export,
+    /// acknowledgement, and compaction paths without inventing canned batches.
+    /// Production must use [`Self::open_runtime_binding`] or
+    /// [`Self::open_runtime_binding_without_epoch`]; this constructor never
+    /// runs in production.
+    ///
+    /// Identity rules mirror the core cursor contract exactly, neither
+    /// stricter nor laxer: `installation_id` must be non-empty and
+    /// `watchdog_generation` nonzero because the acknowledgement validators
+    /// require both, while the epoch passes through verbatim because the core
+    /// contract admits zero as the explicit initial epoch.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SpoolError`] when an identity is unusable or the spool file
+    /// cannot be created, opened, or recovered.
+    pub fn open_for_export_driver_test(
+        state_dir: &Path,
+        installation_id: &str,
+        watchdog_generation: u64,
+        watchdog_epoch: u64,
+    ) -> Result<Self, SpoolError> {
+        if installation_id.is_empty() {
+            return Err(SpoolError::InvalidLease(
+                "watchdog export test sensor requires a non-empty installation id".to_owned(),
+            ));
+        }
+        if watchdog_generation == 0 {
+            return Err(SpoolError::InvalidLease(
+                "watchdog export test sensor requires a nonzero watchdog generation".to_owned(),
+            ));
+        }
+        let database = Database::create(watchdog_spool_path(state_dir))
+            .map_err(|error| SpoolError::Database(error.to_string()))?;
+        let spool = WatchdogSpool {
+            database,
+            _path_lease: None,
+        };
+        spool.initialize_or_recover()?;
+        let watchdog = Watchdog::new(
+            eliot_watchdog_core::WatchdogConfig::default(),
+            Epoch(watchdog_epoch),
+        )
+        .map_err(|_| SpoolError::InvalidLease("watchdog epoch is invalid".to_owned()))?;
+        Ok(Self {
+            watchdog: Mutex::new(Some(watchdog)),
+            spool,
+            _runtime_binding: None,
+            installation_id: installation_id.to_owned(),
+            watchdog_generation,
+        })
+    }
+
+    /// Appends one test-only spool record through the real retention path.
+    ///
+    /// Delegates directly to the spool owner, so header, high-water, pressure,
+    /// and bounded-frame validation behave exactly as in production. Test-only:
+    /// production records arrive through supervision admission, never here.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SpoolError`] when the retained state fails validation or the
+    /// record exceeds the bounded frame.
+    pub fn append_spool_entry_for_export_driver_test(
+        &self,
+        observed_at_ms: u64,
+        payload: WatchdogSpoolPayload,
+    ) -> Result<SpoolAppendOutcome, SpoolError> {
+        self.spool.append(observed_at_ms, payload)
+    }
+
+    /// Reads the retained spool records in sequence order without mutating
+    /// any spool state.
+    ///
+    /// Read-only observation for Wave C integration tests to prove compaction
+    /// boundaries. Test-only: production readers use
+    /// [`Self::readback`] against the retained binding.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SpoolError`] when the retained state fails validation.
+    pub fn retained_spool_entries_for_export_driver_test(
+        &self,
+    ) -> Result<Vec<WatchdogSpoolEntry>, SpoolError> {
+        self.spool.readback()
     }
 
     fn record_heartbeat(

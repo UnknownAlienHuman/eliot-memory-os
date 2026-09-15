@@ -21,6 +21,7 @@ use redb::{Database, ReadableDatabase, ReadableTable, TableDefinition, WriteTran
 use crate::{SERVICE_NAME, SpoolError, WatchdogRuntimeBinding, current_unix_ms};
 
 mod codec;
+pub mod export_driver;
 
 pub use codec::{WatchdogSpoolEntry, WatchdogSpoolPayload};
 pub(crate) use codec::{WatchdogSpoolHeader, encode_entry, encode_high_water, validate_header};
@@ -84,8 +85,10 @@ pub(crate) const SPOOL_EXPORT_CURSOR_TABLE: TableDefinition<u64, &[u8]> =
 pub(crate) const SPOOL_EXPORT_CURSOR_IDENTITY_MAX: usize = 1024;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum SpoolAppendOutcome {
+pub enum SpoolAppendOutcome {
+    /// Record stored without retention pressure.
     Stored,
+    /// Retention pressure evicted older records to admit the new one.
     Pressure { evicted_records: u64 },
 }
 
@@ -740,17 +743,19 @@ impl WatchdogSpool {
 
     /// Compacts durably acknowledged records below the stored export cursor.
     ///
-    /// This is the Wave C compaction entry point; no production path calls it
-    /// yet. Only retained entries at or below the acknowledged sequence are
-    /// candidates, and a `Gap` or `Recovery` boundary entry at or above the
-    /// cursor is never removed: it is retained until a later acknowledgement
-    /// advances past it. Before removing, the retained `Gap` and `Recovery`
-    /// payloads are scanned and removal stops below the first unresolved
-    /// marker above the cursor, so compaction can never cross an unresolved
-    /// gap. The header high-water marker and `next_sequence` are never
-    /// touched; only the entry rows plus the header `first_sequence`,
-    /// `record_count`, and `byte` counters move, and the header is
-    /// revalidated before commit.
+    /// This is the Wave C compaction entry point, driven by
+    /// [`export_driver::export_once`](export_driver::export_once) after every
+    /// successful acknowledgement (and directly by callers holding the stored
+    /// acknowledged sequence). Only retained entries at or below the
+    /// acknowledged sequence are candidates, and a `Gap` or `Recovery`
+    /// boundary entry at or above the cursor is never removed: it is retained
+    /// until a later acknowledgement advances past it. Before removing, the
+    /// retained `Gap` and `Recovery` payloads are scanned and removal stops
+    /// below the first unresolved marker above the cursor, so compaction can
+    /// never cross an unresolved gap. The header high-water marker and
+    /// `next_sequence` are never touched; only the entry rows plus the header
+    /// `first_sequence`, `record_count`, and `byte` counters move, and the
+    /// header is revalidated before commit.
     ///
     /// # Errors
     ///
