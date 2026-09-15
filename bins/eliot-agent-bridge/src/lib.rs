@@ -12,10 +12,11 @@ use std::rc::Rc;
 use std::time::Duration;
 
 use eliot_agent_bridge_core::{
-    AgentBridgeCore, AttachBinding, AttachRequest, AttachView, BridgeError, ConnectionId,
-    CursorPolicy, DemandId, EventForwardStatus, EventPortOutcome, HostActivationPort,
+    AgentBridgeCore, AttachBinding, AttachRequest, AttachView, AttemptState, BridgeError,
+    ConnectionId, CursorPolicy, DemandId, EventForwardStatus, EventPortOutcome, HostActivationPort,
     HostEventEnvelope, McpForwardingPort, OutstandingDeliveryView, ProviderFailure,
-    ProviderReadiness, ReconciliationPortOutcome, ReconnectRequest,
+    ProviderReadiness, ReconciliationPortOutcome, ReconnectRequest, RecoveryDirective,
+    TerminalReductionInputs, TransportEdge,
 };
 use eliot_mcp::KernelHostRequestPort;
 use eliot_protocol::{
@@ -368,6 +369,61 @@ impl BridgeRunner {
     #[must_use]
     pub fn outstanding_deliveries(&self) -> Vec<OutstandingDeliveryView> {
         self.core.outstanding_deliveries()
+    }
+    /// Records one observed attempt state transition verbatim for the
+    /// terminal reducer. The transport decides no legality here.
+    pub fn observe_attempt_transition(
+        &mut self,
+        from: AttemptState,
+        to: AttemptState,
+        sequence: u64,
+    ) -> Result<(), BridgeError> {
+        self.core.observe_attempt_transition(from, to, sequence)
+    }
+    /// Files one typed recovery directive chaining an observed recoverable
+    /// failure to its corrected call under the retry/new-identity rule.
+    pub fn prescribe_recovery(&mut self, directive: RecoveryDirective) -> Result<(), BridgeError> {
+        self.core.prescribe_recovery(directive)
+    }
+    /// Records the candidate canonical-write submission reference.
+    pub fn record_canonical_submission(
+        &mut self,
+        reference: impl Into<String>,
+    ) -> Result<(), BridgeError> {
+        self.core.record_canonical_submission(reference)
+    }
+    /// Records the candidate canonical-write receipt reference.
+    pub fn record_canonical_receipt(
+        &mut self,
+        reference: impl Into<String>,
+    ) -> Result<(), BridgeError> {
+        self.core.record_canonical_receipt(reference)
+    }
+    /// Records the independent exact-readback reference.
+    pub fn record_canonical_readback(
+        &mut self,
+        reference: impl Into<String>,
+    ) -> Result<(), BridgeError> {
+        self.core.record_canonical_readback(reference)
+    }
+    /// Records one terminal-relevant transport edge without resolving it.
+    pub fn record_transport_edge(&mut self, edge: TransportEdge) -> Result<(), BridgeError> {
+        self.core.record_transport_edge(edge)
+    }
+    /// Notes the stale UI/CLI terminal display verbatim, independent of
+    /// the canonical references until reduction.
+    pub fn note_stale_ui_disposition(
+        &mut self,
+        disposition: impl Into<String>,
+    ) -> Result<(), BridgeError> {
+        self.core.note_stale_ui_disposition(disposition)
+    }
+    /// Projects the terminal reduction inputs for the external reducer.
+    /// History and terminal evidence stay independent; nothing here is a
+    /// terminal disposition.
+    #[must_use]
+    pub fn terminal_reduction_inputs(&self) -> Option<TerminalReductionInputs> {
+        self.core.terminal_reduction_inputs()
     }
 }
 
