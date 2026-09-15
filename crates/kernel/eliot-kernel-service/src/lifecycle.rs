@@ -8,8 +8,8 @@ use eliot_contracts::{
     sha256_hex,
 };
 use eliot_kernel_core::{
-    AuthorityGrantRequest, ControlPermit, FrontDoor, KernelAuthority, KernelAuthorityKey,
-    KernelError, RouteScope,
+    AuthorityGrantRequest, ControlOperationClass, ControlPermit, FrontDoor, KernelAuthority,
+    KernelAuthorityKey, KernelError, NormalWorkClass, RouteScope,
 };
 use eliot_ors::{
     NativeWorkerClaimAdmission, NativeWorkerClaimRecord, NativeWorkerClaimState, OpaqueLabel,
@@ -226,26 +226,30 @@ pub enum KernelServiceError {
     Core(#[from] KernelError),
 }
 
-/// A held normal-work admission lease (Slice B, Implements #65).
+/// A held normal-work admission lease (Slices A+B, Implements #65).
 ///
 /// Normal Store/daemon work (`apply_prepared`, `initialize_genesis`, ordinary
-/// daemon admission) holds this lease. It is explicitly NOT backed by the
-/// protected control reserve: acquiring it never consumes a [`ControlPermit`],
-/// so normal saturation cannot starve cancellation, fencing, health/drain,
-/// problem/incident, or recovery work.
+/// daemon admission) holds this lease. It holds one Slice A typed normal
+/// permit ([`eliot_kernel_core::CapacityClass::NormalWorkload`],
+/// [`NormalWorkClass::CanonicalWrite`]) drawn from the normal partition only,
+/// so normal saturation backpressures as
+/// [`KernelError::NormalCapacityExhausted`] without ever consuming the
+/// protected control reserve: cancellation, fencing, health/drain,
+/// problem/incident, or recovery work keeps demonstrable capacity.
 ///
 /// The lease remains bound to the exact activation identity and canonical
 /// authority epoch observed at admission; gateways re-check
 /// [`AdmissionLease::authority_epoch`] against the live fence before any
 /// Store effect.
 ///
-/// TODO(#65-integrator): rewire this lease to the Slice A typed normal permit
-/// (`CapacityClass::NORMAL_WORKLOAD`) once WRITER-65A lands its split in
-/// `crates/kernel/eliot-kernel-core/src/module/control_reserve_front_door.rs`
-/// (`FrontDoor::acquire_control`). Do not duplicate `CapacityClass` here;
-/// consume the Slice A type directly at `lifecycle.rs:acquire_admission`.
+/// Integrator rewire (#65): the former permit-less lease now consumes the
+/// Slice A typed normal path at [`KernelService::acquire_admission`]. The
+/// generic admission uses `CanonicalWrite`; per-path classes (`Interactive`
+/// for named reads, `ModelJob`/`Swarm` for jobs/agents) remain a follow-up
+/// once callers carry their work class.
 #[derive(Debug)]
 pub struct AdmissionLease {
+    permit: ControlPermit,
     activation_id: String,
     authority_epoch: EpochId,
 }
@@ -261,11 +265,16 @@ impl AdmissionLease {
         self.authority_epoch.clone()
     }
 
-    /// Releases the logical normal admission held by this lease.
+    /// Returns the held typed normal permit for instrumentation.
+    #[must_use]
+    pub const fn control_permit(&self) -> &ControlPermit {
+        &self.permit
+    }
+
+    /// Releases the held normal-work capacity.
     ///
-    /// Normal admission holds no protected control capacity, so release is a
-    /// named drop only; it never returns a [`ControlPermit`]. Provided for
-    /// transition gateways that model release as a named step.
+    /// Dropping a lease also releases the permit; this explicit operation is
+    /// provided for transition gateways that model release as a named step.
     pub fn release(self) {
         drop(self);
     }
@@ -275,17 +284,21 @@ impl AdmissionLease {
 ///
 /// Only the closed protected operation family holds this lease:
 /// cancellation, fencing, health/readiness control, drain, problem/incident,
-/// and recovery work. Acquiring consumes one [`ControlPermit`] from the
+/// and recovery work. Acquiring consumes one Slice A typed protected permit
+/// ([`eliot_kernel_core::CapacityClass::ProtectedControl`]) from the
 /// protected reserve and releasing returns it on drop, so consumption and
 /// release are observable via [`KernelService::available_control`] and bound
 /// to the exact operation and canonical epoch carried by the lease.
+/// Saturation surfaces [`KernelError::ProtectedReserveExhausted`] (via
+/// [`KernelServiceError::Core`]), never the legacy scalar.
 ///
-/// TODO(#65-integrator): rewire this lease to the Slice A typed protected
-/// permit (`CapacityClass::PROTECTED_CONTROL`) once WRITER-65A lands its
-/// split in
-/// `crates/kernel/eliot-kernel-core/src/module/control_reserve_front_door.rs`
-/// (`FrontDoor::acquire_control`). Do not duplicate `CapacityClass` here;
-/// consume the Slice A type directly at `lifecycle.rs:acquire_protected_control`.
+/// Integrator rewire (#65): the former legacy `acquire_control` holder now
+/// consumes the Slice A typed protected path at
+/// [`KernelService::acquire_protected_control`] with the operation class
+/// classified from the `operation_id` prefix. Residual: crate-root export of
+/// this type via `eliot-kernel-service/src/lib.rs` is deferred (that file is
+/// outside the MGR01-65 claim); external callers name the lease through
+/// [`KernelService::acquire_protected_control`] in a follow-up.
 #[derive(Debug)]
 pub struct ProtectedControlLease {
     permit: ControlPermit,
@@ -322,6 +335,49 @@ impl ProtectedControlLease {
     /// provided for transition gateways that model release as a named step.
     pub fn release(self) {
         drop(self);
+    }
+}
+
+/// Operation identity attributed to generic normal admission.
+///
+/// [`KernelService::acquire_admission`] carries no per-call work class, so it
+/// binds the Slice A typed normal permit to this stable operation label with
+/// the live activation as owner. Store write paths (`CANONICAL_WRITE`) are
+/// the dominant holders; per-path labels remain a follow-up.
+const NORMAL_ADMISSION_OPERATION: &str = "normal-admission";
+
+/// Classifies one protected `operation_id` into the closed Slice A
+/// [`ControlOperationClass`] family (issue #65).
+///
+/// Only the `<family>:<opaque-suffix>` labels below typecheck against the
+/// protected partition; anything else fails closed with `InvalidField` and
+/// consumes no capacity, so ordinary workload can never borrow a protected
+/// label to reach the reserve.
+fn classify_protected_operation(
+    operation_id: &str,
+) -> Result<ControlOperationClass, KernelServiceError> {
+    let family = operation_id.split(':').next().unwrap_or(operation_id);
+    match family {
+        "cancellation" | "cancel" => Ok(ControlOperationClass::CancelOperation),
+        "fencing" | "fence" => Ok(ControlOperationClass::FenceStaleOwner),
+        "revoke" | "revocation" => Ok(ControlOperationClass::RevokeAuthority),
+        "health" | "readiness" => Ok(ControlOperationClass::HealthReadinessControl),
+        "telemetry" => Ok(ControlOperationClass::CriticalTelemetry),
+        "attention" => Ok(ControlOperationClass::CriticalAttentionTransition),
+        "problem" => Ok(ControlOperationClass::ProblemTransition),
+        "incident" => Ok(ControlOperationClass::IncidentTransition),
+        "notification" => Ok(ControlOperationClass::PersistentNotificationTransition),
+        "shutdown" => Ok(ControlOperationClass::SafeShutdown),
+        "drain" => Ok(ControlOperationClass::Drain),
+        "recovery" => Ok(ControlOperationClass::Recovery),
+        "containment" => Ok(ControlOperationClass::Containment),
+        "reconciliation" | "unknown-outcome" => {
+            Ok(ControlOperationClass::UnknownOutcomeReconciliation)
+        }
+        _ => Err(KernelServiceError::InvalidField {
+            field: "protected_operation.operation_id",
+            reason: "operation family is outside the closed protected control set",
+        }),
     }
 }
 
@@ -1168,12 +1224,14 @@ impl KernelService {
 
     /// Acquires one normal-work admission lease for a normal admitted operation.
     ///
-    /// Slice B enforcement (Implements #65): normal Store/daemon admission
+    /// Slice A+B enforcement (Implements #65): normal Store/daemon admission
     /// (`apply_prepared`, `initialize_genesis`, ordinary daemon work) holds
-    /// this lease and MUST NOT consume the protected control reserve, so
-    /// normal saturation leaves [`Self::available_control`] unchanged. Only
-    /// `Ready` admits normal work; `Degraded` keeps normal closed while
-    /// protected control stays open via [`Self::acquire_protected_control`].
+    /// one typed normal permit (`NORMAL_WORKLOAD` / `CanonicalWrite`) drawn
+    /// from the normal partition only, so normal saturation backpressures
+    /// with `NormalCapacityExhausted` while leaving
+    /// [`Self::available_control`] unchanged. Only `Ready` admits normal
+    /// work; `Degraded` keeps normal closed while protected control stays
+    /// open via [`Self::acquire_protected_control`].
     pub fn acquire_admission(&self) -> Result<AdmissionLease, KernelServiceError> {
         if self.generation_fenced {
             return Err(KernelServiceError::GenerationFenced);
@@ -1185,8 +1243,13 @@ impl KernelService {
             .candidate
             .as_ref()
             .ok_or(KernelServiceError::AdmissionClosed(self.state))?;
+        let owner = candidate.activation_id.as_str();
+        let permit = self
+            .front_door
+            .acquire_normal(NormalWorkClass::CanonicalWrite, owner, NORMAL_ADMISSION_OPERATION)?;
         Ok(AdmissionLease {
-            activation_id: candidate.activation_id.as_str().to_owned(),
+            permit,
+            activation_id: owner.to_owned(),
             authority_epoch: self.canonical_epoch.clone(),
         })
     }
@@ -1195,12 +1258,15 @@ impl KernelService {
     ///
     /// Only the closed protected family may hold this lease: cancellation,
     /// fencing, health/readiness control, drain, problem/incident, and
-    /// recovery work. It consumes exactly one protected [`ControlPermit`]
-    /// while held (observable via [`Self::available_control`]) and is bound
-    /// to the given operation identity plus the live activation/epoch, so
-    /// consumption and release are attributable per operation/epoch.
-    /// `Ready` and `Degraded` both admit protected work; every other state
-    /// fails closed.
+    /// recovery work. It consumes exactly one typed protected permit
+    /// (`PROTECTED_CONTROL`) while held (observable via
+    /// [`Self::available_control`]) and is bound to the given operation
+    /// identity plus the live activation/epoch, so consumption and release
+    /// are attributable per operation/epoch. Saturation surfaces
+    /// [`KernelError::ProtectedReserveExhausted`]. `Ready` and `Degraded`
+    /// both admit protected work; every other state fails closed. An
+    /// `operation_id` outside the closed family fails closed with
+    /// `InvalidField` and consumes nothing.
     pub fn acquire_protected_control(
         &self,
         operation_id: &str,
@@ -1215,17 +1281,16 @@ impl KernelService {
             return Err(KernelServiceError::AdmissionClosed(self.state));
         }
         crate::validate_text(operation_id, "protected_operation.operation_id")?;
+        let operation = classify_protected_operation(operation_id)?;
         let candidate = self
             .candidate
             .as_ref()
             .ok_or(KernelServiceError::AdmissionClosed(self.state))?;
-        let permit = self
-            .front_door
-            .acquire_control()
-            .map_err(|error| match error {
-                KernelError::ControlReserveExhausted => KernelServiceError::ControlReserveExhausted,
-                other => KernelServiceError::Core(other),
-            })?;
+        let permit = self.front_door.acquire_protected(
+            operation,
+            candidate.activation_id.as_str(),
+            operation_id,
+        )?;
         Ok(ProtectedControlLease {
             permit,
             operation_id: operation_id.to_owned(),
@@ -1239,6 +1304,13 @@ impl KernelService {
     /// Protected-pool path: consumes one protected [`ControlPermit`] for the
     /// duration of issuance. Normal work must use [`Self::acquire_admission`]
     /// and never this path.
+    ///
+    /// Residual (#65): this stays on the legacy `acquire_control` migration
+    /// path because generic receipt issuance carries no closed
+    /// [`ControlOperationClass`] label to typecheck against
+    /// `acquire_protected`. Migrating it requires attributing each caller to
+    /// the closed family; the legacy error mapping is kept so
+    /// `host_request_binding` and other matchers keep compiling.
     pub fn issue_control_receipt(
         &self,
         authority_id: ContractId,
@@ -2577,9 +2649,14 @@ mod tests {
     #[test]
     fn normal_admission_never_consumes_protected_reserve(
     ) -> Result<(), Box<dyn std::error::Error>> {
-        // Slice B enforcement (Implements #65): normal Store/daemon admission
-        // holds no protected `ControlPermit`; only the closed protected
-        // family consumes the reserve, observably bound to operation/epoch.
+        use eliot_kernel_core::CapacityClass;
+
+        // Slices A+B enforcement (Implements #65): normal Store/daemon
+        // admission holds a typed `NORMAL_WORKLOAD` permit from the disjoint
+        // normal partition; only the closed protected family consumes the
+        // protected reserve, observably bound to operation/epoch. The normal
+        // partition itself is bounded (capacity 1 here), so normal leases
+        // are held sequentially while protected assertions need the slot.
         let mut service = KernelService::new([77; 32], 1, 4)?;
         let candidate = candidate();
         let activation = activate(&mut service, candidate.clone());
@@ -2587,8 +2664,10 @@ mod tests {
         assert_eq!(service.available_control(), 1);
 
         let normal_one = service.acquire_admission()?;
-        assert_eq!(service.available_control(), 1);
-        let normal_two = service.acquire_admission()?;
+        assert_eq!(
+            normal_one.control_permit().capacity_class(),
+            CapacityClass::NormalWorkload
+        );
         assert_eq!(service.available_control(), 1);
         assert_eq!(
             normal_one.activation_id(),
@@ -2600,11 +2679,32 @@ mod tests {
                 .is_same_authority(&service.authority_epoch())
         );
         drop(normal_one);
+        let normal_two = service.acquire_admission()?;
+        assert_eq!(
+            normal_two.control_permit().capacity_class(),
+            CapacityClass::NormalWorkload
+        );
+        assert_eq!(service.available_control(), 1);
         drop(normal_two);
         assert_eq!(service.available_control(), 1);
+        // The bounded normal partition backpressures independently with the
+        // typed disposition while the protected reserve is untouched.
+        let held_normal = service.acquire_admission()?;
+        assert!(matches!(
+            service.acquire_admission(),
+            Err(KernelServiceError::Core(
+                KernelError::NormalCapacityExhausted { .. }
+            ))
+        ));
+        assert_eq!(service.available_control(), 1);
+        drop(held_normal);
 
         let protected = service.acquire_protected_control("cancellation:op-1")?;
         assert_eq!(protected.operation_id(), "cancellation:op-1");
+        assert_eq!(
+            protected.control_permit().capacity_class(),
+            CapacityClass::ProtectedControl
+        );
         assert!(
             protected
                 .authority_epoch()
@@ -2613,11 +2713,23 @@ mod tests {
         assert_eq!(service.available_control(), 0);
         assert!(matches!(
             service.acquire_protected_control("fencing:op-2"),
-            Err(KernelServiceError::ControlReserveExhausted)
+            Err(KernelServiceError::Core(
+                KernelError::ProtectedReserveExhausted { .. }
+            ))
+        ));
+        // A label outside the closed protected family fails closed and
+        // consumes nothing.
+        assert!(matches!(
+            service.acquire_protected_control("store-write:op-9"),
+            Err(KernelServiceError::InvalidField { .. })
         ));
         // Exhausted protected reserve must not block normal admission:
         // the pools are disjoint by construction.
         let normal_during_exhaustion = service.acquire_admission()?;
+        assert_eq!(
+            normal_during_exhaustion.control_permit().capacity_class(),
+            CapacityClass::NormalWorkload
+        );
         assert_eq!(service.available_control(), 0);
         drop(normal_during_exhaustion);
         drop(protected);

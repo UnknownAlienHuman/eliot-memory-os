@@ -254,16 +254,13 @@ impl KernelStoreGateway {
             let lease = service
                 .acquire_admission()
                 .map_err(|error| error.to_string())?;
-            // Slice B (#65): `apply_prepared` is normal Store work
+            // Slices A+B (#65): `apply_prepared` is normal Store work
             // (`CANONICAL_WRITE` maps to `NORMAL_WORKLOAD`). The normal lease
-            // above holds no protected `ControlPermit`, so this path never
-            // consumes the final protected slot. Protected cancellation /
-            // fencing / health / drain / problem / incident / recovery stays
-            // on `acquire_protected_control` / `issue_control_receipt`.
-            // TODO(#65-integrator): rewire to Slice A
-            // `CapacityClass::NORMAL_WORKLOAD` typed permit once WRITER-65A
-            // lands in `control_reserve_front_door.rs`; see
-            // `lifecycle.rs:acquire_admission`.
+            // above holds a Slice A typed normal permit from the disjoint
+            // normal partition, so this path never consumes the protected
+            // reserve. Protected cancellation / fencing / health / drain /
+            // problem / incident / recovery stays on
+            // `acquire_protected_control` / `issue_control_receipt`.
             if !lease
                 .authority_epoch()
                 .is_same_authority(&transition.state_fence.authority_epoch)
@@ -387,9 +384,9 @@ impl KernelStoreGateway {
             let lease = service
                 .acquire_admission()
                 .map_err(|error| error.to_string())?;
-            // Slice B (#65): genesis is normal Store work. The normal lease
-            // holds no protected `ControlPermit`; see the `apply` path note
-            // and `lifecycle.rs:acquire_admission` for the Slice A rewire.
+            // Slices A+B (#65): genesis is normal Store work holding the
+            // typed `NORMAL_WORKLOAD` normal lease; see the `apply` path
+            // note and `lifecycle.rs:acquire_admission`.
             if lease.authority_epoch() != request.state_fence.authority_epoch {
                 return Err("genesis route authority epoch is stale".to_owned());
             }
@@ -447,10 +444,10 @@ impl KernelStoreGateway {
             let lease = service
                 .acquire_admission()
                 .map_err(|error| error.to_string())?;
-            // Slice B (#65): Dreamer-job Store admission rides the normal
-            // lease (no protected `ControlPermit`); protected work stays on
-            // `acquire_protected_control`. See `lifecycle.rs:acquire_admission`
-            // for the Slice A `NORMAL_WORKLOAD` rewire.
+            // Slices A+B (#65): Dreamer-job Store admission rides the typed
+            // `NORMAL_WORKLOAD` normal lease; protected work stays on
+            // `acquire_protected_control`. See
+            // `lifecycle.rs:acquire_admission`.
             if lease.authority_epoch() != context.state_fence.authority_epoch {
                 return Err("dreamer job route authority epoch is stale".to_owned());
             }
