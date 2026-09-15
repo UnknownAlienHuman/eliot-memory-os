@@ -1345,22 +1345,85 @@ impl StateFenceSnapshot {
         Ok(())
     }
 
-    /// Lineage-bound validation against an [`EpochLineage`] gate (Implements #64).
+    /// Lineage-bound validation against an [`EpochLineage`] gate (Implements #64, T6-E4-C).
     ///
     /// The `u64` contour is intentionally retained (donor precedent: no silent
-    /// widening without a migration receipt). This additive check requires the
-    /// snapshot's observed sequence to equal the lineage's current epoch AND
-    /// the lineage edge itself to validate via existing `EpochLineage` gates
-    /// (non-zero, predecessor ordering). Cross-lineage numeric equality alone
-    /// never authorizes; callers holding a canonical [`EpochId`] must additionally
-    /// enforce exact-tuple `is_same_authority` at their own boundary.
+    /// widening without a migration receipt). This check requires the
+    /// snapshot's observed sequence to equal the lineage's current epoch AND,
+    /// when the canonical JSON binds an `authority_epoch` lineage tuple, that
+    /// tuple to agree exactly: equal sequences from different lineages are
+    /// unrelated and fail as `FenceMismatch`. Legacy scalar fences without a
+    /// bound lineage tuple keep the sequence-only check as a residual; callers
+    /// holding a canonical [`EpochId`] must use [`Self::validate_against_epoch`]
+    /// for exact-tuple `is_same_authority` enforcement at their own boundary.
     pub fn validate_against_lineage(&self, lineage: &EpochLineage) -> Result<(), OrsError> {
         self.validate()?;
         lineage.validate()?;
         if self.observed_authority_epoch != lineage.current.epoch {
             return Err(OrsError::FenceMismatch);
         }
+        let (bound_lineage, bound_sequence) = self.fence_epoch_tuple()?;
+        if let Some(bound_sequence) = bound_sequence
+            && bound_sequence != self.observed_authority_epoch
+        {
+            return Err(OrsError::FenceMismatch);
+        }
+        if let Some(bound_lineage) = bound_lineage
+            && bound_lineage != lineage.current.lineage_id.as_str()
+        {
+            return Err(OrsError::FenceMismatch);
+        }
         Ok(())
+    }
+
+    /// Exact-tuple validation against a canonical [`EpochId`] (Implements #64, T6-E4-C).
+    ///
+    /// Requires `observed_authority_epoch == expected.sequence.get()` AND the
+    /// canonical JSON's bound `authority_epoch.lineage_id` to equal
+    /// `expected.lineage_id`: the `is_same_authority` spelling across the
+    /// `u64` contour boundary. Legacy scalar fences without a bound lineage
+    /// tuple fail closed here; use [`Self::validate_against_lineage`] only for
+    /// the residual contour path.
+    pub fn validate_against_epoch(&self, expected: &EpochId) -> Result<(), OrsError> {
+        self.validate()?;
+        if self.observed_authority_epoch != expected.sequence.get() {
+            return Err(OrsError::FenceMismatch);
+        }
+        let (bound_lineage, bound_sequence) = self.fence_epoch_tuple()?;
+        match (bound_lineage, bound_sequence) {
+            (Some(lineage_id), Some(sequence))
+                if lineage_id == expected.lineage_id.as_str()
+                    && sequence == expected.sequence.get() => {}
+            _ => return Err(OrsError::FenceMismatch),
+        }
+        Ok(())
+    }
+
+    /// Extracts the bound `(lineage_id, sequence)` tuple from the canonical
+    /// fence JSON when it carries the migrated `EpochId` object shape.
+    ///
+    /// Returns `(None, None)` for legacy scalar fences
+    /// (`{"authority_epoch": N}`) or fences without an `authority_epoch`
+    /// member; those stay readable through [`Self::validate_against_lineage`]
+    /// but never satisfy [`Self::validate_against_epoch`].
+    fn fence_epoch_tuple(&self) -> Result<(Option<String>, Option<u64>), OrsError> {
+        let parsed: Value = serde_json::from_str(&self.canonical_json)
+            .map_err(|error| OrsError::Encoding(error.to_string()))?;
+        let Some(authority) = parsed.get("authority_epoch") else {
+            return Ok((None, None));
+        };
+        if let Some(sequence) = authority.as_u64() {
+            return Ok((None, Some(sequence)));
+        }
+        if let Some(object) = authority.as_object() {
+            let lineage_id = object
+                .get("lineage_id")
+                .and_then(Value::as_str)
+                .map(str::to_owned);
+            let sequence = object.get("sequence").and_then(Value::as_u64);
+            return Ok((lineage_id, sequence));
+        }
+        Ok((None, None))
     }
 }
 
@@ -1381,7 +1444,19 @@ pub struct EpochLineage {
 }
 
 impl EpochLineage {
-    /// Validates the explicit lineage edge.
+    /// Validates the explicit lineage edge (Implements #64, T6-E4-C).
+    ///
+    /// Same-lineage succession requires the exact direct-child step
+    /// (`current.epoch == predecessor.epoch + 1`, overflow-closed via
+    /// `checked_add`): a same-lineage jump of `+2` or more, a stall, or a
+    /// backward step fails as `InvalidEpochLineage`. This mirrors the
+    /// canonical `EpochId::is_direct_child_of` / `EpochTransition::validate`
+    /// one-step rule without naming the canonical `EpochLineageId` contour
+    /// (this contour keeps `OpaqueLabel` labels, so it cannot delegate
+    /// directly). Cross-lineage predecessors stay allowed with no numeric
+    /// ordering: restore / break-glass mints a new lineage whose predecessor
+    /// names the fenced old tuple, and equal sequences across lineages stay
+    /// unrelated.
     pub fn validate(&self) -> Result<(), OrsError> {
         self.current.validate()?;
         if let Some(predecessor) = &self.predecessor {
@@ -1389,9 +1464,14 @@ impl EpochLineage {
         }
         if let Some(predecessor) = &self.predecessor
             && predecessor.lineage_id == self.current.lineage_id
-            && predecessor.epoch >= self.current.epoch
         {
-            return Err(OrsError::InvalidEpochLineage);
+            let expected = predecessor
+                .epoch
+                .checked_add(1)
+                .ok_or(OrsError::InvalidEpochLineage)?;
+            if self.current.epoch != expected {
+                return Err(OrsError::InvalidEpochLineage);
+            }
         }
         Ok(())
     }

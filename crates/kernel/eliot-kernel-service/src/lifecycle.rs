@@ -50,6 +50,37 @@ fn genesis_epoch() -> EpochId {
     )
     .unwrap_or_else(|_| unreachable!())
 }
+
+/// Projects a canonical sync target to the scalar control-reserve fence.
+///
+/// Canonical-first (Implements #64): the same-lineage and non-regression
+/// rule is proven on the exact `(lineage_id, sequence)` tuple before any
+/// scalar value exists, so a cross-lineage target can never project to a
+/// scalar fence. The scalar control-reserve fence (`FrontDoor` /
+/// `KernelAuthority`, both core-owned scalar residuals) only follows the
+/// canonical decision for receipt-fencing compatibility; it never
+/// authorizes canonical work. Epoch mint stays Host-owned: the Kernel only
+/// adopts a Host-approved tuple through `reconcile`, and the
+/// `canonical_epoch` switch fences the old tuple — every old session fails
+/// its exact-tuple `is_same_authority` re-check from then on.
+fn scalar_fence_for_canonical_target(
+    target: &EpochId,
+    current: &EpochId,
+) -> Result<AuthorityEpoch, KernelServiceError> {
+    if target.lineage_id != current.lineage_id {
+        return Err(KernelServiceError::HandshakeMismatch {
+            field: "authority_epoch",
+        });
+    }
+    if target.sequence.get() < current.sequence.get() {
+        return Err(KernelServiceError::HandshakeMismatch {
+            field: "authority_epoch_regression",
+        });
+    }
+    AuthorityEpoch::new(target.sequence.get()).map_err(|_| KernelServiceError::HandshakeMismatch {
+        field: "authority_epoch_corrupt",
+    })
+}
 const GENERATION_FENCE_REASON_SUBSTITUTED: &str =
     "generation fence reason was invalid; canonical reason substituted";
 
@@ -456,6 +487,9 @@ impl KernelService {
         self.transition(KernelServiceState::Reconciling)?;
         // Adopt the Host-approved Kernel lineage (Implements #64): the live
         // canonical epoch becomes the candidate's exact tuple from here on.
+        // Mint stays Host-owned — the Kernel never mints a lineage here; it
+        // only adopts and fences via this `canonical_epoch` switch, so every
+        // session bound to the previous tuple fails closed from then on.
         self.canonical_epoch = candidate.kernel_epoch.clone();
         self.candidate = Some(candidate);
         self.activation_receipt = None;
@@ -1044,15 +1078,11 @@ impl KernelService {
                 field: "authority_epoch_oversized",
             });
         }
-        // Retain the scalar control-reserve fence alongside the canonical
-        // epoch (donor precedent: no silent widening of the core). The
-        // sequence contour is the exact tuple projection, never a
-        // cross-lineage coercion.
-        let scalar_target = AuthorityEpoch::new(target.sequence.get()).map_err(|_| {
-            KernelServiceError::HandshakeMismatch {
-                field: "authority_epoch_corrupt",
-            }
-        })?;
+        // The scalar control-reserve fence follows the canonical decision
+        // (core residual: no silent widening of the core). Projection goes
+        // through the canonical-first companion only — never a bare
+        // `AuthorityEpoch::new(sequence)` coercion.
+        let scalar_target = scalar_fence_for_canonical_target(&target, &current)?;
         let front_door_epoch = self.front_door.synchronize_epoch(scalar_target)?;
         let mirrored = self.authority.synchronize_epoch(scalar_target)?;
         if front_door_epoch != mirrored || mirrored != scalar_target {

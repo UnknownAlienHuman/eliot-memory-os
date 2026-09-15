@@ -363,13 +363,28 @@ fn apply(
             if state.kernel.is_none()
                 && let Some(prior) = state.prior_kernel.as_ref()
             {
-                let authority_advances = prior
-                    .process
-                    .as_ref()
-                    .zip(next.process.as_ref())
-                    .is_some_and(|(prior, candidate)| {
-                        candidate.authority_epoch.value() > prior.authority_epoch.value()
-                    });
+                // T6-E4-A host scalar closure: scalar process ordering is
+                // intra-lineage only. Cross-lineage numeric ordering is
+                // forbidden, so the scalar `>` below is gated on the typed
+                // epoch tuple proving same lineage via `relation_to`. The
+                // typed direct-child check remains the admission authority;
+                // this gate ensures a larger scalar from another lineage can
+                // never satisfy `authority_advances` on its own.
+                let same_kernel_lineage = !matches!(
+                    next.kernel_generation
+                        .current
+                        .relation_to(&prior.kernel_generation.current),
+                    eliot_contracts::EpochRelation::UnrelatedLineage
+                );
+                let authority_advances = same_kernel_lineage
+                    && prior
+                        .process
+                        .as_ref()
+                        .zip(next.process.as_ref())
+                        .is_some_and(|(prior_process, candidate_process)| {
+                            candidate_process.authority_epoch.value()
+                                > prior_process.authority_epoch.value()
+                        });
                 if !epoch_transition_is_direct_child_of(
                     &next.kernel_generation,
                     &prior.kernel_generation,
