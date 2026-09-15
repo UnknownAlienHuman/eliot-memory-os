@@ -8,8 +8,9 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use eliot_epistemic_contracts::{
     AdmittedReceipt, AdmittedReceiptParams, CurrentEpistemicPosition, Currentness,
-    EpistemicPositionCandidate, EpistemicTransition, PositionId, PositionRevision,
+    EpistemicPositionCandidate, EpistemicTransition,
 };
+pub use eliot_epistemic_contracts::{PositionId, PositionRevision};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -44,6 +45,15 @@ impl EpistemicRevisionPayload {
         }
         self.candidate.validate().map_err(contract_error)?;
         self.transition.validate().map_err(contract_error)?;
+        PositionId::new(self.position.as_str()).map_err(contract_error)?;
+        if self.expected_position_revision.is_some() != self.candidate.predecessor.is_some()
+            || self.candidate.scope != self.candidate.work_scope.scope_id.as_str()
+        {
+            return Err(invalid(
+                "epistemic.predecessor",
+                "absence and predecessor bindings disagree",
+            ));
+        }
         if self
             .expected_position_revision
             .is_some_and(|revision| revision.value() == 0)
@@ -95,6 +105,10 @@ impl EpistemicRevisionPayload {
             || prepared.scope_id.as_str() != self.candidate.scope
             || prepared.task_id.as_deref() != Some(self.candidate.task_id.as_str())
             || prepared.state_fence != self.candidate.fence
+            || prepared
+                .state_fence
+                .task_revision
+                .is_some_and(|revision| revision != self.candidate.revision)
         {
             return Err(invalid(
                 "epistemic.binding",
@@ -252,6 +266,7 @@ fn invalid(field: &'static str, reason: &'static str) -> StoreError {
     StoreError::InvalidField { field, reason }
 }
 
+#[allow(clippy::needless_pass_by_value)] // Result::map_err consumes the source error.
 fn contract_error(error: eliot_epistemic_contracts::ContractError) -> StoreError {
     StoreError::Serialization(error.to_string())
 }

@@ -1622,6 +1622,21 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
         )
     }
 
+    /// Uses the existing owners and the daemon's Kernel-bound read capability.
+    pub fn epistemic_composition<'a, R: eliot_store_api::CanonicalReadClient + ?Sized>(
+        &'a self,
+        reads: &'a R,
+        now: u64,
+    ) -> Result<crate::GovernorEpistemicComposition<'a, P, R>, CompositionError> {
+        Ok(crate::GovernorEpistemicComposition {
+            canonical: &self.owners.canonical,
+            activation: self.read_unique_agent_activation(now)?,
+            kernel: self.kernel.as_ref(),
+            reads,
+            readiness: self.readiness,
+        })
+    }
+
     /// Borrows the single operator-command reconciliation owner as a canonical
     /// [`GovernorOperatorReconciliation`] adapter.
     ///

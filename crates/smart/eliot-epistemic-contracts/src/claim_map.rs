@@ -239,8 +239,8 @@ impl ClaimEntry {
             });
         }
         match (self.verdict, self.audit) {
-            (ClaimVerdict::Withheld, ClaimAuditOutcome::NotVerifiableInScope) => Ok(()),
-            (
+            (ClaimVerdict::Withheld, ClaimAuditOutcome::NotVerifiableInScope)
+            | (
                 ClaimVerdict::Accepted,
                 ClaimAuditOutcome::Supported | ClaimAuditOutcome::PartiallySupported,
             )

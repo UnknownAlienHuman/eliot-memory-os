@@ -1018,10 +1018,7 @@ mod admitted_operation_gate_tests {
                 ("action".to_owned(), json!("keep")),
                 ("base_view_digest".to_owned(), json!("a".repeat(64))),
                 ("candidate_digest".to_owned(), json!("b".repeat(64))),
-                (
-                    "candidate_package_digest".to_owned(),
-                    json!("c".repeat(64)),
-                ),
+                ("candidate_package_digest".to_owned(), json!("c".repeat(64))),
                 ("skill_id".to_owned(), json!("skill-gate")),
                 ("verifier_ref".to_owned(), json!("verifier-gate")),
             ]),
@@ -1040,10 +1037,7 @@ mod admitted_operation_gate_tests {
                     "operation_manifest_digest".to_owned(),
                     json!("c".repeat(64)),
                 ),
-                (
-                    "artifact_binding_digest".to_owned(),
-                    json!("b".repeat(64)),
-                ),
+                ("artifact_binding_digest".to_owned(), json!("b".repeat(64))),
                 ("fence_digest".to_owned(), json!("d".repeat(64))),
                 ("observation_operation_id".to_owned(), json!("op-gate")),
                 ("observation_record_id".to_owned(), json!("record-gate")),
@@ -1095,12 +1089,22 @@ mod admitted_operation_gate_tests {
             validate_transition(&context, &stale),
             Err(AdapterError::Store(StoreError::ManifestMismatch))
         );
-        // Current set digest but still-unadmitted mutation entry: fail-closed
-        // for the remaining mutations. `CaptureObservation`,
-        // `AppendAuditEvent`, `ApplyLifecyclePolicy`, and `ReconcileRecovery`
-        // are admitted (their handler/schema/consumer triples are proven);
-        // this proof uses `ApplyEpistemicRevision` (still unadmitted).
+        // The remaining unactivated mutation still fails closed before staging.
         let unadmitted = transition_with(
+            &fence,
+            set_digest.clone(),
+            TransitionClass::TaskControl,
+            EffectClass::Candidate,
+            vec![NamedMutationRequest {
+                operation: NamedMutationOperation::UpdateTaskState,
+                parameters: BTreeMap::new(),
+            }],
+        );
+        assert_eq!(
+            validate_transition(&context, &unadmitted),
+            Err(AdapterError::Store(StoreError::UnknownOperation))
+        );
+        let missing_epistemic_payload = transition_with(
             &fence,
             set_digest.clone(),
             TransitionClass::Epistemic,
@@ -1110,10 +1114,13 @@ mod admitted_operation_gate_tests {
                 parameters: BTreeMap::new(),
             }],
         );
-        assert_eq!(
-            validate_transition(&context, &unadmitted),
-            Err(AdapterError::Store(StoreError::UnknownOperation))
-        );
+        assert!(matches!(
+            validate_transition(&context, &missing_epistemic_payload),
+            Err(AdapterError::Store(StoreError::InvalidField {
+                field: "operation.parameter",
+                ..
+            }))
+        ));
         // Admitted `CaptureObservation` with current set digest and approved
         // subject params passes the pre-stage gate.
         let admitted = transition_with(
