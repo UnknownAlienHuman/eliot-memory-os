@@ -5,7 +5,7 @@
 //! `GetRevisionHeads`, `GetOrderingHeads`, `GetScopeRevisionView`,
 //! `ResolveWriteReceipt`, and `GetEvidencePack` (see
 //! `apply/read_boundary.rs` in the Surreal adapter and `execute_named_sync`
-//! in the memory adapter), plus the three
+//! in the memory adapter), plus the four
 //! `CaptureObservation` / `AppendAuditEvent` / `ApplyLifecyclePolicy` /
 //! `ReconcileRecovery` mutations (AUD-C01: `CaptureObservation` and `AppendAuditEvent` persist
 //! `TransitionClass::CaptureCandidate` with the `EffectClass::Candidate`
@@ -18,7 +18,13 @@
 //! `ReconcileRecovery` carries the ten problem-leg recovery fields emitted by
 //! the Governor doctor verification envelope
 //! (`crates/governor/eliot-governor/src/observation_reconciliation.rs`,
-//! `recovery_envelope`).
+//! `recovery_envelope`)) plus the `UpdateTaskState` mutation (AUD-C01:
+//! persists `TransitionClass::TaskControl` with the
+//! `EffectClass::ReversibleMutation` ceiling and carries the six task-control
+//! fields emitted by the Governor task lifecycle envelope
+//! (`crates/governor/eliot-governor/src/task_lifecycle.rs`, `task_envelope`:
+//! `task_id`, `event_id`, optional `from`, `to`, `expected_revision`,
+//! `actor_ref`).
 //! Every other [`NamedReadOperation`](crate::NamedReadOperation) variant and
 //! every other [`NamedMutationOperation`](crate::NamedMutationOperation)
 //! variant stays known-but-unsupported and unadvertised, and no other mutation
@@ -36,7 +42,9 @@
 //! for `CaptureObservation`, the six receipt-bound fields for
 //! `AppendAuditEvent`, the six lifecycle-policy fields for
 //! `ApplyLifecyclePolicy`, the ten problem-leg recovery fields for
-//! `ReconcileRecovery`, and the `subject` / `max_records` evidence-pack
+//! `ReconcileRecovery`, the six task-control fields for `UpdateTaskState`
+//! (`task_id`, `event_id`, optional `from`, `to`, `expected_revision`,
+//! `actor_ref`), and the `subject` / `max_records` evidence-pack
 //! selectors for `GetEvidencePack`) is owner-approved and therefore supersedes the
 //! generic [`CONTROL_FIELD_DENYLIST`](crate::CONTROL_FIELD_DENYLIST) for that
 //! exact name; every undeclared control name is still rejected fail-closed.
@@ -61,7 +69,8 @@ use crate::{
 /// as `subject` (reused for the five remaining receipt-bound
 /// `AppendAuditEvent` fields, for the six lifecycle-policy
 /// `ApplyLifecyclePolicy` fields, for the nine remaining problem-leg
-/// `ReconcileRecovery` fields, and for the two `GetEvidencePack`
+/// `ReconcileRecovery` fields, for the six task-control `UpdateTaskState`
+/// fields, and for the two `GetEvidencePack`
 /// evidence-pack selectors: the exact captured-observation `subject` and the
 /// explicit `max_records` bound carried as its decimal string, mirroring how
 /// `AppendAuditEvent` carries `expected_revision` and how `ReconcileRecovery`
@@ -82,9 +91,13 @@ pub enum ParameterShape {
     /// non-`observation_operation_id` problem-leg `ReconcileRecovery` fields
     /// (`problem_id`, `expected_problem_revision` as its decimal string,
     /// `attempt_digest`, `effect_digest`, `operation_manifest_digest`,
-    /// `artifact_binding_digest`, `fence_digest`, `observation_record_id`,
-    /// and `observation_request_digest`), and for the
-    /// two `GetEvidencePack` selectors (the exact captured-observation
+/// `artifact_binding_digest`, `fence_digest`, `observation_record_id`,
+/// and `observation_request_digest`), for the six task-control
+/// `UpdateTaskState` fields (`task_id`, `event_id`, `from`, `to`,
+/// `expected_revision` as its decimal string, and `actor_ref`; `from` is
+/// optional because the proposing transition carries no predecessor state),
+/// and for the
+/// two `GetEvidencePack` selectors (the exact captured-observation
     /// `subject` and the explicit `max_records` bound as its decimal
     /// string, range-checked against
     /// [`EVIDENCE_PACK_MAX_RECORDS`](crate::operation_catalogue::EVIDENCE_PACK_MAX_RECORDS) by
@@ -259,6 +272,47 @@ static RECONCILE_RECOVERY_PARAMETERS: [ParameterDeclaration; 10] = [
 ];
 static NO_PARAMETERS: [ParameterDeclaration; 0] = [];
 
+/// Owner-approved task-control fields emitted by the Governor task lifecycle
+/// envelope (`crates/governor/eliot-governor/src/task_lifecycle.rs`,
+/// `task_envelope`): the transitioned `task_id`, the admitted `event_id`, the
+/// predecessor state `from` (absent on propose, which has no predecessor),
+/// the target state `to`, the owner-checked compare-and-swap base
+/// `expected_revision` as its decimal string (`"1"` on propose, the current
+/// task revision on apply, mirroring how `AppendAuditEvent` carries
+/// `expected_revision`), and the admitted `actor_ref`.
+static UPDATE_TASK_STATE_PARAMETERS: [ParameterDeclaration; 6] = [
+    ParameterDeclaration {
+        name: "task_id",
+        shape: ParameterShape::Subject,
+        required: true,
+    },
+    ParameterDeclaration {
+        name: "event_id",
+        shape: ParameterShape::Subject,
+        required: true,
+    },
+    ParameterDeclaration {
+        name: "from",
+        shape: ParameterShape::Subject,
+        required: false,
+    },
+    ParameterDeclaration {
+        name: "to",
+        shape: ParameterShape::Subject,
+        required: true,
+    },
+    ParameterDeclaration {
+        name: "expected_revision",
+        shape: ParameterShape::Subject,
+        required: true,
+    },
+    ParameterDeclaration {
+        name: "actor_ref",
+        shape: ParameterShape::Subject,
+        required: true,
+    },
+];
+
 /// Returns the canonical operation name bound into manifests and digests.
 ///
 /// The spelling matches the `PascalCase` serde wire form of each variant, so
@@ -378,7 +432,10 @@ pub const fn declared_read_parameters(
 /// problem-leg recovery fields (`problem_id`, `expected_problem_revision`,
 /// `attempt_digest`, `effect_digest`, `operation_manifest_digest`,
 /// `artifact_binding_digest`, `fence_digest`, `observation_operation_id`,
-/// `observation_record_id`, `observation_request_digest`); every other variant declares none,
+/// `observation_record_id`, `observation_request_digest`); `UpdateTaskState`
+/// declares the six required-except-`from` task-control fields (`task_id`,
+/// `event_id`, optional `from`, `to`, `expected_revision`, `actor_ref`);
+/// every other variant declares none,
 /// so any supplied parameter fails closed. Variants without a catalogue entry
 /// never reach this table: they fail as [`StoreError::UnknownOperation`] first.
 #[must_use]
@@ -390,9 +447,8 @@ pub const fn declared_mutation_parameters(
         NamedMutationOperation::AppendAuditEvent => &APPEND_AUDIT_EVENT_PARAMETERS,
         NamedMutationOperation::ApplyLifecyclePolicy => &APPLY_LIFECYCLE_POLICY_PARAMETERS,
         NamedMutationOperation::ReconcileRecovery => &RECONCILE_RECOVERY_PARAMETERS,
-        NamedMutationOperation::ApplyEpistemicRevision | NamedMutationOperation::UpdateTaskState => {
-            &NO_PARAMETERS
-        }
+        NamedMutationOperation::UpdateTaskState => &UPDATE_TASK_STATE_PARAMETERS,
+        NamedMutationOperation::ApplyEpistemicRevision => &NO_PARAMETERS,
     }
 }
 
