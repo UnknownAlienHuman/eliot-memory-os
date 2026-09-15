@@ -9,6 +9,7 @@ description = "Governor-owned canonical state and semantic transition admission"
 [dependencies]
 eliot-contracts = { workspace = true }
 eliot-store-api = { workspace = true }
+eliot-epistemic-contracts = { path = "../../smart/eliot-epistemic-contracts" }
 schemars.workspace = true
 serde.workspace = true
 serde_json.workspace = true

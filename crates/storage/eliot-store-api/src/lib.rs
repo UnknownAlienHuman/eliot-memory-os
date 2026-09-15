@@ -31,6 +31,7 @@ use serde_json::Value;
 use thiserror::Error;
 
 mod dreamer_job;
+pub mod epistemic_revision;
 mod payload_authority;
 mod request_hash;
 mod store_failure;

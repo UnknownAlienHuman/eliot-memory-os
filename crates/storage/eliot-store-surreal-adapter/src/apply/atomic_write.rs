@@ -14,7 +14,19 @@ use crate::config::SurrealAdapterConfig;
 use crate::error::AdapterError;
 use crate::plan::{ApplyPlan, EvidenceRecord, PayloadAuthorityRecord};
 use crate::schema;
+use eliot_store_api::epistemic_revision::EpistemicCommit;
 use eliot_store_api::{OrderingHead, RevisionHead, WriteReceipt};
+
+// Read and compare in the same transaction as the fence CAS and receipt.
+// The fence CAS serializes racing writers even when the position is absent.
+const EPISTEMIC_CAS: &str = r"
+LET $position_before = (SELECT epistemic_position_revision FROM write_receipt
+    WHERE epistemic_position_key = $epistemic_position_key
+    ORDER BY epistemic_position_revision DESC LIMIT 1);
+IF ($position_before[0].epistemic_position_revision ?? 0) != $expected_position_revision {
+    THROW 'epistemic_position_cas_conflict';
+};
+";
 
 #[allow(
     clippy::too_many_arguments,
@@ -41,6 +53,29 @@ pub(super) async fn write_transaction(
     })?;
     let mut sql = String::from(schema::TX_BEGIN);
     let mut bindings = Map::new();
+    let context = &receipt
+        .require_reconciliation_envelope()?
+        .core
+        .request
+        .metadata;
+    let epistemic = EpistemicCommit::from_prepared(context, transition)?;
+    if let Some(commit) = &epistemic {
+        commit.readback(receipt)?;
+        sql.push_str(EPISTEMIC_CAS);
+        bindings.insert(
+            "epistemic_position_key".to_owned(),
+            json!(commit.payload.position_key()?),
+        );
+        bindings.insert(
+            "expected_position_revision".to_owned(),
+            json!(
+                commit
+                    .payload
+                    .expected_position_revision
+                    .map_or(0, |revision| revision.value())
+            ),
+        );
+    }
 
     sql.push_str(if initial_state {
         schema::TX_CREATE_FENCE
@@ -237,6 +272,10 @@ pub(super) async fn write_transaction(
             "evidence_records": evidence_binding(&plan.evidence_records)?,
             "commit_sequence": plan.commit_sequence,
             "named_operation_count": transition.named_operations.len(),
+            "epistemic_position_key": epistemic.as_ref().map(|commit| commit.payload.position_key()).transpose()?,
+            "epistemic_position_revision": epistemic.as_ref().map(|commit| commit.payload.next_revision().map(|revision| revision.value())).transpose()?,
+            "epistemic_payload": epistemic.as_ref().map(serde_json::to_string).transpose()
+                .map_err(|error| AdapterError::Serialization(error.to_string()))?,
         }),
     );
 
@@ -261,6 +300,7 @@ pub(super) async fn write_transaction(
 
 fn is_transaction_conflict(error: &str) -> bool {
     [
+        "epistemic_position_cas_conflict",
         "canonical_fence_cas_conflict",
         "canonical_fence_create_conflict",
         "revision_head_cas_conflict",

@@ -5,7 +5,8 @@
 //! `GetRevisionHeads`, `GetOrderingHeads`, `GetScopeRevisionView`,
 //! `ResolveWriteReceipt`, and `GetEvidencePack` (see
 //! `apply/read_boundary.rs` in the Surreal adapter and `execute_named_sync`
-//! in the memory adapter), plus the four
+//! in the memory adapter), plus T11.2 `GetCurrentEpistemicPosition` with its
+//! `position` selector, plus the four
 //! `CaptureObservation` / `AppendAuditEvent` / `ApplyLifecyclePolicy` /
 //! `ReconcileRecovery` mutations (AUD-C01: `CaptureObservation` and `AppendAuditEvent` persist
 //! `TransitionClass::CaptureCandidate` with the `EffectClass::Candidate`
@@ -24,7 +25,9 @@
 //! fields emitted by the Governor task lifecycle envelope
 //! (`crates/governor/eliot-governor/src/task_lifecycle.rs`, `task_envelope`:
 //! `task_id`, `event_id`, optional `from`, `to`, `expected_revision`,
-//! `actor_ref`).
+//! `actor_ref`) plus the `ApplyEpistemicRevision` mutation (T11.2: persists
+//! `TransitionClass::Epistemic` with the `EffectClass::ReversibleMutation`
+//! ceiling and carries the single `revision` epistemic-revision payload).
 //! Every other [`NamedReadOperation`](crate::NamedReadOperation) variant and
 //! every other [`NamedMutationOperation`](crate::NamedMutationOperation)
 //! variant stays known-but-unsupported and unadvertised, and no other mutation
@@ -79,6 +82,8 @@ use crate::{
 /// passthrough.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ParameterShape {
+    /// The closed versioned candidate/transition payload with position CAS.
+    EpistemicRevision,
     /// A string that must parse as a store [`OperationId`].
     OperationId,
     /// A non-blank text string: the observation subject captured by
@@ -120,6 +125,7 @@ impl ParameterShape {
     #[must_use]
     pub const fn code(self) -> &'static str {
         match self {
+            Self::EpistemicRevision => "eliot.storage.epistemic-revision.v1",
             Self::OperationId => "operation-id",
             Self::Subject => "subject-text",
         }
@@ -278,6 +284,16 @@ static RECONCILE_RECOVERY_PARAMETERS: [ParameterDeclaration; 10] = [
     },
 ];
 static NO_PARAMETERS: [ParameterDeclaration; 0] = [];
+static EPISTEMIC_REVISION_PARAMETERS: [ParameterDeclaration; 1] = [ParameterDeclaration {
+    name: "revision",
+    shape: ParameterShape::EpistemicRevision,
+    required: true,
+}];
+static CURRENT_POSITION_PARAMETERS: [ParameterDeclaration; 1] = [ParameterDeclaration {
+    name: "position",
+    shape: ParameterShape::Subject,
+    required: true,
+}];
 
 /// Owner-approved authority-revocation fields emitted by the Governor
 /// authority-revocation envelope
@@ -477,7 +493,8 @@ pub const fn named_mutation_operation_by_name(name: &str) -> Option<NamedMutatio
 /// exact captured-observation `subject` and the explicit `max_records`
 /// bound); `GetAuthorityRevocationHistory` declares the required bounded
 /// exact selectors (the exact revoked `origin_ref` and the explicit
-/// `max_records` bound); every other variant declares none, so any supplied parameter
+/// `max_records` bound); `GetCurrentEpistemicPosition` declares the required
+/// `position` selector; every other variant declares none, so any supplied parameter
 /// fails closed. Variants without a catalogue entry never reach this table:
 /// they fail as [`StoreError::UnknownOperation`] first.
 #[must_use]
@@ -490,11 +507,11 @@ pub const fn declared_read_parameters(
         NamedReadOperation::GetAuthorityRevocationHistory => {
             &GET_AUTHORITY_REVOCATION_HISTORY_PARAMETERS
         }
+        NamedReadOperation::GetCurrentEpistemicPosition => &CURRENT_POSITION_PARAMETERS,
         NamedReadOperation::GetRevisionHeads
         | NamedReadOperation::GetScopeRevisionView
         | NamedReadOperation::GetOrderingHeads
         | NamedReadOperation::GetTaskState
-        | NamedReadOperation::GetCurrentEpistemicPosition
         | NamedReadOperation::GetUnderstandingProjectionInputs
         | NamedReadOperation::GetAttentionAndProblems
         | NamedReadOperation::GetModuleCatalogState
@@ -523,7 +540,8 @@ pub const fn declared_read_parameters(
 /// `RecordAuthorityRevocation` declares the seven required
 /// authority-revocation fields (`origin_ref`, `closure_id`,
 /// `closure_revision`, `affected_digest`, `affected_count`,
-/// `invalidation_reason`, `fence_digest`);
+/// `invalidation_reason`, `fence_digest`); `ApplyEpistemicRevision` declares
+/// the required `revision` epistemic-revision payload;
 /// every other variant declares none,
 /// so any supplied parameter fails closed. Variants without a catalogue entry
 /// never reach this table: they fail as [`StoreError::UnknownOperation`] first.
@@ -540,7 +558,7 @@ pub const fn declared_mutation_parameters(
         NamedMutationOperation::RecordAuthorityRevocation => {
             &RECORD_AUTHORITY_REVOCATION_PARAMETERS
         }
-        NamedMutationOperation::ApplyEpistemicRevision => &NO_PARAMETERS,
+        NamedMutationOperation::ApplyEpistemicRevision => &EPISTEMIC_REVISION_PARAMETERS,
     }
 }
 
@@ -679,6 +697,12 @@ fn check_declared_shape(
     value: &Value,
 ) -> Result<(), StoreError> {
     match declaration.shape {
+        ParameterShape::EpistemicRevision => {
+            let payload: crate::epistemic_revision::EpistemicRevisionPayload =
+                serde_json::from_value(value.clone())
+                    .map_err(|error| StoreError::Serialization(error.to_string()))?;
+            payload.validate()
+        }
         ParameterShape::OperationId => {
             let text = value.as_str().ok_or(StoreError::InvalidField {
                 field: "operation.parameter",

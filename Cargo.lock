@@ -888,6 +888,7 @@ name = "eliot-canonical"
 version = "0.1.0"
 dependencies = [
  "eliot-contracts",
+ "eliot-epistemic-contracts",
  "eliot-store-api",
  "schemars",
  "serde",
@@ -1466,6 +1467,9 @@ dependencies = [
  "eliot-contracts",
  "eliot-coordination",
  "eliot-doctor-core",
+ "eliot-epistemic",
+ "eliot-epistemic-contracts",
+ "eliot-evidence",
  "eliot-finish",
  "eliot-maintenance",
  "eliot-module-registry",
@@ -2402,6 +2406,7 @@ name = "eliot-store-api"
 version = "0.1.0"
 dependencies = [
  "eliot-contracts",
+ "eliot-epistemic-contracts",
  "eliot-evidence",
  "eliot-protocol",
  "eliot-receipts",

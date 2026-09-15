@@ -2,10 +2,10 @@
 //!
 //! This module owns the single Rust declaration table that generates one
 //! [`NamedOperationManifest`](crate::NamedOperationManifest) descriptor per
-//! activated operation. The table activates exactly the five reads with
+//! activated operation. The table activates exactly the six reads with
 //! proven adapter handlers, parameter shapes, and consumers on base
 //! (`GetRevisionHeads`, `GetOrderingHeads`, `GetScopeRevisionView`,
-//! `ResolveWriteReceipt`, `GetEvidencePack`), the four `CaptureObservation` /
+//! `ResolveWriteReceipt`, `GetEvidencePack`, `GetCurrentEpistemicPosition`), the four `CaptureObservation` /
 //! `AppendAuditEvent` / `ApplyLifecyclePolicy` mutations (AUD-C01:
 //! `CaptureObservation` and `AppendAuditEvent` persist
 //! `TransitionClass::CaptureCandidate` with the `EffectClass::Candidate`
@@ -20,6 +20,9 @@
 //! ceiling and the owner-approved six-field task-control schema emitted by
 //! the Governor task lifecycle envelope
 //! (`crates/governor/eliot-governor/src/task_lifecycle.rs`, `task_envelope`)),
+//! plus the `ApplyEpistemicRevision` mutation (T11.2: persists
+//! `TransitionClass::Epistemic` with the `EffectClass::ReversibleMutation`
+//! ceiling and the owner-approved epistemic-revision payload),
 //! plus the provider-independent genesis bootstrap entry sourced by
 //! [`genesis_manifest`](crate::genesis_manifest). Every other operation stays
 //! known-but-unsupported and unadvertised: no other mutation on base has a
@@ -186,7 +189,12 @@ struct ActivatedReadDescriptor {
 /// / `max_records` parameters. The head and receipt reads address no scope;
 /// the receipt read addresses its receipt through the declared
 /// `operation_id` parameter.
-const ACTIVATED_READS: [ActivatedReadDescriptor; 5] = [
+const ACTIVATED_READS: [ActivatedReadDescriptor; 6] = [
+    ActivatedReadDescriptor {
+        operation: NamedReadOperation::GetCurrentEpistemicPosition,
+        requires_scope_id: true,
+        scope_kind: SCOPE_KIND_SCOPE,
+    },
     ActivatedReadDescriptor {
         operation: NamedReadOperation::GetRevisionHeads,
         requires_scope_id: false,
@@ -216,13 +224,14 @@ const ACTIVATED_READS: [ActivatedReadDescriptor; 5] = [
 
 /// Returns the activated read operations in canonical declaration order.
 #[must_use]
-pub const fn activated_read_operations() -> [NamedReadOperation; 5] {
+pub const fn activated_read_operations() -> [NamedReadOperation; 6] {
     [
         ACTIVATED_READS[0].operation,
         ACTIVATED_READS[1].operation,
         ACTIVATED_READS[2].operation,
         ACTIVATED_READS[3].operation,
         ACTIVATED_READS[4].operation,
+        ACTIVATED_READS[5].operation,
     ]
 }
 
@@ -240,10 +249,16 @@ struct ActivatedMutationDescriptor {
 /// persists `ReversibleMutation` through the `LifecyclePolicy` family;
 /// `ReconcileRecovery` persists `ReversibleMutation` through the
 /// `RecoverySchema` family; `UpdateTaskState` persists `ReversibleMutation`
-/// through the `TaskControl` family. All
-/// five address no scope, mirroring the scope-free read descriptors. Every
+/// through the `TaskControl` family; `ApplyEpistemicRevision` persists
+/// `ReversibleMutation` through the `Epistemic` family. All
+/// six address no scope, mirroring the scope-free read descriptors. Every
 /// other mutation stays known-but-unsupported.
-const ACTIVATED_MUTATIONS: [ActivatedMutationDescriptor; 5] = [
+const ACTIVATED_MUTATIONS: [ActivatedMutationDescriptor; 6] = [
+    ActivatedMutationDescriptor {
+        operation: NamedMutationOperation::ApplyEpistemicRevision,
+        transition_classes: &[TransitionClass::Epistemic],
+        maximum_effect: EffectClass::ReversibleMutation,
+    },
     ActivatedMutationDescriptor {
         operation: NamedMutationOperation::CaptureObservation,
         transition_classes: &[TransitionClass::CaptureCandidate],
@@ -332,8 +347,8 @@ fn genesis_entry_spec() -> OperationManifestSpec {
 
 /// Generates the per-operation manifest descriptors from the declaration table.
 ///
-/// Declaration order is the canonical order: the five activated reads, the
-/// five activated mutations, then the genesis bootstrap entry. Generation is
+/// Declaration order is the canonical order: the six activated reads, the
+/// six activated mutations, then the genesis bootstrap entry. Generation is
 /// pure over crate constants, so the same source always yields byte-identical
 /// entries.
 pub fn generated_operation_manifests() -> Result<Vec<NamedOperationManifest>, StoreError> {
@@ -491,7 +506,7 @@ pub fn validate_read_against_catalogue(
 /// to a mutation entry, stay within that entry's ceiling, carry only the
 /// owner-approved typed parameters for the approved command, and stay within
 /// the entry input bound. Only `CaptureObservation`, `AppendAuditEvent`,
-/// `ApplyLifecyclePolicy`, `ReconcileRecovery`, and `UpdateTaskState` have activated mutation entries; any other named
+/// `ApplyLifecyclePolicy`, `ReconcileRecovery`, `UpdateTaskState`, and `ApplyEpistemicRevision` have activated mutation entries; any other named
 /// command fails closed here until a later slice proves its handler, schema,
 /// and consumer triple.
 pub fn validate_transition_against_catalogue(
@@ -543,11 +558,11 @@ pub fn validate_transition_against_catalogue(
             | NamedMutationOperation::AppendAuditEvent
             | NamedMutationOperation::ApplyLifecyclePolicy
             | NamedMutationOperation::ReconcileRecovery
-            | NamedMutationOperation::UpdateTaskState => {
+            | NamedMutationOperation::UpdateTaskState
+            | NamedMutationOperation::ApplyEpistemicRevision => {
                 validate_typed_mutation_parameters(command.operation, &command.parameters)?;
             }
-            NamedMutationOperation::ApplyEpistemicRevision
-            | NamedMutationOperation::RecordAuthorityRevocation => {
+            NamedMutationOperation::RecordAuthorityRevocation => {
                 return Err(StoreError::UnknownOperation);
             }
         }
