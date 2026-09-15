@@ -13,6 +13,7 @@
 //! environment, and never claims a repair: without a Kernel-issued admission
 //! it exits 78.
 
+mod dispatch_authority;
 mod dispatched_material;
 mod kernel_client;
 
@@ -103,8 +104,11 @@ fn bootstrap_and_run_once() -> i32 {
     // live ServerHello authority/epoch/generation/artifact checks inside
     // the IPC client bind this process to the exact Kernel generation; no
     // argv, stdin, or environment value participates in authority.
-    // The admitted attempt envelope plus the concrete process request
-    // arrive with the dispatch contour and are driven by
+    // The admitted attempt envelope plus the Kernel-issued launch grant
+    // arrive with the dispatch contour and are validated by
+    // `dispatched_material`; the concrete process request is issued
+    // in-process by the local dispatch authority once an honest admitted
+    // intent source exists, and driven by
     // `kernel_client::drive_admitted_attempt`.
     let mut client = match KernelDoctorIpcClient::connect() {
         Ok(client) => client,
@@ -129,7 +133,7 @@ fn bootstrap_and_run_once() -> i32 {
             };
             match gate_after_advertise(advertised, attempt_presented) {
                 GateDecision::Drive => deny(&format!(
-                    "kernel advertises the doctor operation and a session-bound attempt file validated, but this composition still lacks the executor-bound ProcessRequest delivery (never deserialized, never minted here); residual={DOCTOR_DISPATCH_RESIDUAL}"
+                    "kernel advertises the doctor operation and a session-bound attempt file with a validated launch grant is present, but no honest ProcessIntent source exists: the admitted manifest carries no executable binding (operation records bind only an operation id, adapter id, and definition digest) and none is invented here, so the local dispatch authority cannot issue; residual={DOCTOR_DISPATCH_RESIDUAL}"
                 )),
                 GateDecision::DenyNotAdvertised => {
                     deny("kernel does not advertise the doctor operation")

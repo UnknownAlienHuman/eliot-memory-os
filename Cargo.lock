@@ -1089,6 +1089,7 @@ dependencies = [
  "eliot-kernel-service",
  "eliot-platform",
  "eliot-process",
+ "eliot-process-executor",
  "serde",
  "serde_json",
  "thiserror",
