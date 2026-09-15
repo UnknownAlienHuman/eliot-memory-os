@@ -39,6 +39,7 @@ mod daemon_config;
 mod daemon_kernel_client;
 mod daemon_kernel_port_adapters;
 mod kernel_authority_client;
+mod kernel_context_read_client;
 mod kernel_recovery_client;
 mod kernel_transition_client;
 mod observation_adapters;
@@ -66,6 +67,7 @@ pub(crate) use daemon_kernel_client::{
 };
 pub(crate) use daemon_kernel_port_adapters::kind_value;
 pub(crate) use kernel_authority_client::KernelAuthorityClient;
+pub use kernel_context_read_client::KernelContextReadClient;
 pub use store_failure_projection::{GovernorStoreFailureProjection, GovernorStoreProjectionError};
 
 /// Builds the production P-07 authority adapter over an already-connected
@@ -590,6 +592,37 @@ impl DaemonComposition {
                 self.governor.observation_reconciliation(),
             ),
         )
+    }
+
+    /// Borrows the Kernel-backed read-only context client over the retained
+    /// authenticated route (T11.1).
+    ///
+    /// Mirrors [`Self::observation_reconciliation`]: readiness is checked
+    /// first, then a fresh forwarding adapter is built over the caller-held
+    /// [`DaemonKernelClient`]. The composition retains no client and no
+    /// thread — the caller (the single daemon runtime holding both the
+    /// concrete client and this composition, as with
+    /// [`Self::note_owner_session_binding`]) passes the already-connected
+    /// client per call, so a Governor refresh surfaces as an exact fence
+    /// mismatch instead of silent divergence. The returned
+    /// [`KernelContextReadClient`] implements `CanonicalReadClient` for
+    /// `GetEvidencePack` only and composes with the Governor `ReadService`
+    /// consistency algorithm; no second consistency implementation lives here.
+    ///
+    /// Wiring decision (recorded per brief §4.1): post-`start` attach-style
+    /// accessor, not a `start()` signature change — `start()` keeps its exact
+    /// `(config, kernel: Arc<dyn KernelGenerationPort>, authority_activation)`
+    /// contour.
+    pub fn context_read_client(
+        &self,
+        kernel: &Arc<DaemonKernelClient>,
+    ) -> Result<KernelContextReadClient, DaemonError> {
+        if self.readiness() != eliot_governor::CompositionReadiness::Ready {
+            return Err(DaemonError::Composition(
+                eliot_governor::CompositionError::NotReady,
+            ));
+        }
+        Ok(KernelContextReadClient::new(Arc::clone(kernel)))
     }
 
     /// Stops the one daemon owner and releases protected handles together.
