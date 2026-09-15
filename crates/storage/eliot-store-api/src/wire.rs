@@ -17,12 +17,12 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 use crate::{
-    CanonicalRequestView, CanonicalValidationSnapshot, ExactJsonBytes,
-    MAX_STORE_FAILURE_DETAIL_LEN, NamedReadRequest, NamedReadResponse, OperationId, OrderingHead,
-    OrderingHeadExpectation, OrderingScopeId, PreparedTransition, RequestMeta, RevisionHead,
-    RevisionHeadExpectation, RevisionKey, StoreError, StoreGenesisRequest, StoreHealth,
-    StoreRecoveryRequest, StoreRecoverySnapshot, WriteReceipt, dreamer_job::map_durable_error,
-    json_shape_name, verify_canonical_request_hash,
+    CanonicalRequestView, CanonicalValidationSnapshot, ErasureIntentRecord, ErasureSurfaceKind,
+    ExactJsonBytes, MAX_STORE_FAILURE_DETAIL_LEN, NamedReadRequest, NamedReadResponse, OperationId,
+    OperationIdentity, OrderingHead, OrderingHeadExpectation, OrderingScopeId, PreparedTransition,
+    RequestMeta, RevisionHead, RevisionHeadExpectation, RevisionKey, StoreError,
+    StoreGenesisRequest, StoreHealth, StoreRecoveryRequest, StoreRecoverySnapshot, WriteReceipt,
+    dreamer_job::map_durable_error, json_shape_name, verify_canonical_request_hash,
 };
 use schemars::JsonSchema;
 
@@ -39,6 +39,12 @@ pub const CAPABILITY_ORDERING_HEADS: &str = "store.ordering_heads";
 pub const CAPABILITY_VALIDATION_SNAPSHOT: &str = "store.validation_snapshot";
 pub const CAPABILITY_RECOVERY: &str = "store.recovery";
 pub const CAPABILITY_INITIALIZE_GENESIS: &str = "store.initialize_genesis";
+/// Intent capability gate for neutral erasure dispatch (issue #688).
+///
+/// A store that cannot durably record intent must not advertise this
+/// capability; a request selecting surfaces without this capability refuses
+/// with zero destructive calls.
+pub const CAPABILITY_ERASURE_INTENT: &str = "store.erasure.intent";
 pub const CAPABILITY_DREAMER_JOB_SUBMIT: &str = "store.dreamer_job.submit";
 pub const CAPABILITY_DREAMER_JOB_LEASE_NEXT: &str = "store.dreamer_job.lease_next";
 pub const CAPABILITY_DREAMER_JOB_LEASE_EXACT: &str = "store.dreamer_job.lease_exact";
@@ -1030,6 +1036,108 @@ fn validate_text(value: &str, field: &'static str) -> Result<(), StoreWireError>
         return Err(StoreWireError::Invalid(format!(
             "{field} must be non-blank and contain no control characters"
         )));
+    }
+    Ok(())
+}
+
+/// Closed neutral erasure dispatch wrapper (issue #688).
+///
+/// Carries operation identity, the durable [`ErasureIntentRecord`] recorded
+/// before dispatch, and the selected surfaces in deterministic canonical
+/// order. `validate` runs before any destructive call: the intent must
+/// validate, the selected surfaces must exactly equal the intent's planned
+/// surfaces in canonical order, and the store must advertise
+/// [`CAPABILITY_ERASURE_INTENT`]. A request without that intent capability
+/// refuses with [`StoreError::UnknownOperation`] and zero destructive calls.
+#[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ErasureSurfaceRequest {
+    pub identity: OperationIdentity,
+    pub intent: ErasureIntentRecord,
+    pub surfaces: Vec<ErasureSurfaceKind>,
+}
+
+impl ErasureSurfaceRequest {
+    /// Returns the exact capability required to dispatch this request.
+    #[must_use]
+    pub const fn required_capability() -> &'static str {
+        CAPABILITY_ERASURE_INTENT
+    }
+
+    /// Validates identity, intent and selected surfaces before dispatch.
+    pub fn validate(&self) -> Result<(), StoreError> {
+        validate_erasure_surface_request(self, true)
+    }
+
+    /// Validates the request and refuses when the intent capability is absent.
+    ///
+    /// Pass the store's advertised capabilities: dispatch proceeds only when
+    /// they contain [`CAPABILITY_ERASURE_INTENT`]. A missing capability
+    /// refuses with [`StoreError::UnknownOperation`] and zero destructive
+    /// calls; it never falls back to a degraded dispatch.
+    pub fn validate_for_dispatch(&self, advertised: &[&str]) -> Result<(), StoreError> {
+        validate_erasure_surface_request(self, advertised.contains(&CAPABILITY_ERASURE_INTENT))
+    }
+
+    /// Binds the decoded request to the authenticated EBP identity.
+    pub fn validate_for_identity(
+        &self,
+        request_id: &RequestId,
+        identity: &RequestIdentity,
+    ) -> Result<(), StoreWireError> {
+        self.validate().map_err(StoreWireError::Store)?;
+        identity
+            .validate()
+            .map_err(|error| StoreWireError::Protocol(error.to_string()))?;
+        if request_id != &identity.request.metadata.request_id {
+            return Err(StoreWireError::Identity(
+                "frame request_id does not match request identity metadata".to_owned(),
+            ));
+        }
+        if self.identity.idempotency_key != identity.idempotency_key {
+            return Err(StoreWireError::Identity(
+                "erasure idempotency key does not match request identity".to_owned(),
+            ));
+        }
+        if self.intent.state_fence != identity.request.state_fence {
+            return Err(StoreWireError::Identity(
+                "erasure intent fence does not match request identity".to_owned(),
+            ));
+        }
+        Ok(())
+    }
+}
+
+/// Validates one closed erasure wrapper and its intent capability.
+///
+/// Shared by [`ErasureSurfaceRequest::validate`] (capability assumed present
+/// at the validation stage) and
+/// [`ErasureSurfaceRequest::validate_for_dispatch`] (capability checked
+/// against the advertised set).
+fn validate_erasure_surface_request(
+    request: &ErasureSurfaceRequest,
+    intent_capability: bool,
+) -> Result<(), StoreError> {
+    request.identity.validate()?;
+    request.intent.validate()?;
+    if request.identity.operation_id != request.intent.operation_id
+        || request.identity.canonical_request_hash != request.intent.request_digest
+    {
+        return Err(StoreError::IdentityConflict);
+    }
+    if request.surfaces.is_empty() {
+        return Err(StoreError::Empty {
+            field: "erasure.surfaces",
+        });
+    }
+    if request.surfaces != request.intent.surfaces {
+        return Err(StoreError::InvalidField {
+            field: "erasure.surfaces",
+            reason: "selected surfaces must exactly equal the recorded intent plan",
+        });
+    }
+    if !intent_capability {
+        return Err(StoreError::UnknownOperation);
     }
     Ok(())
 }
