@@ -1,0 +1,53 @@
+{
+  "schema": "eliot.abort-boundary-cases.v1",
+  "issue": 860,
+  "note": "Finite nonsecret abort-boundary fixtures for eliot-platform-windows. Stages are symbolic InstallerRootStage names and codes are numeric Win32 values only; no tokens, SIDs, principals, or secrets appear here or in the bounded stderr evidence records.",
+  "sites": [
+    {
+      "id": "installer-root/scoped-restore-drop",
+      "file": "src/installer_root.rs",
+      "disposition": "retained-fail-stop",
+      "invariant": "token-bound-elevation",
+      "evidence": "emit_abort_boundary_evidence",
+      "typed_stage": "RestorePrivilege"
+    },
+    {
+      "id": "installer-root/dual-failure",
+      "file": "src/installer_root.rs",
+      "disposition": "retained-fail-stop",
+      "invariant": "token-bound-elevation",
+      "evidence": "emit_abort_boundary_evidence",
+      "typed_stage": "RestorePrivilege"
+    },
+    {
+      "id": "peer-auth/impersonation-drop",
+      "file": "src/named_pipe_peer_auth.rs",
+      "disposition": "retained-fail-stop",
+      "invariant": "untrusted-client-token",
+      "evidence": "emit_abort_boundary_evidence",
+      "typed_stage": "RevertToSelf"
+    }
+  ],
+  "fault_cases": [
+    {
+      "id": "restore-privilege-failure",
+      "stage": "RestorePrivilege",
+      "code": 5
+    },
+    {
+      "id": "restore-thread-token-failure",
+      "stage": "RestoreThreadToken",
+      "code": 2
+    },
+    {
+      "id": "bind-thread-token-failure",
+      "stage": "BindThreadToken",
+      "code": 1300
+    },
+    {
+      "id": "enable-privilege-failure",
+      "stage": "EnablePrivilege",
+      "code": 1314
+    }
+  ]
+}
