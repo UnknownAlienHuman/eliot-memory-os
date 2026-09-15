@@ -1,0 +1,142 @@
+schema = "eliot.agent-work-unit.v1"
+authority = "NON_NORMATIVE_IMPLEMENTATION_ALLOCATION"
+status = "READY_FOR_IMPLEMENTATION"
+implementation_support = "STRUCTURED_DREAM_PACKET_DECLARED_GROUNDING_OWNER_PROOF_OPEN"
+evidence_execution_status = "ISSUE_AND_PIPELINE_ROUTING_INSPECTED_TESTS_NOT_EXECUTED"
+proof_ceiling = "DREAMER_GROUNDING_MODULE_AND_EDGE_CANDIDATE_ONLY"
+issue = 602
+bundle_issue = 593
+source_assurance_issue = 692
+screen_issue = 588
+validation_issue = 595
+controller_issue = 806
+runtime_issue = 1100
+parent_product_issue = 11
+normative_pair_ref = "docs/normative-pair.toml"
+
+[work_unit]
+cell_id = "dreamer.structured-draft-grounding"
+causal_property = "One structured provider/model draft is mapped field-by-field onto the exact frozen source and evidence denominator, preserving provenance, counterevidence, assumptions, omissions and unknowns without acquiring new sources, changing semantic meaning, validating the candidate, selecting truth or applying effects."
+current_discriminator = "The governed Dreamer pipeline requires grounding after structured model output and before common A-05 validation, but no accepted implementation/consumer proof yet shows exact source-handle binding, unsupported-claim blocking, counterevidence preservation and zero acquisition or semantic repair."
+primary_issue_url = "https://github.com/UnknownAlienHuman/eliot-memory-os/issues/602"
+
+[documentation]
+architecture = [
+  "https://github.com/UnknownAlienHuman/eliot-memory-os/blob/main/docs/architecture/A09-dreamer.md#a9-dreamer",
+  "https://github.com/UnknownAlienHuman/eliot-memory-os/blob/main/docs/architecture/A10-02-impact-and-authority.md#a102-impact-and-authority",
+]
+implementation = [
+  "https://github.com/UnknownAlienHuman/eliot-memory-os/blob/main/docs/architecture/I00-05-current-system-evidence-and-source-support-model.md#i05-current-system-evidence-and-source-support-model",
+  "https://github.com/UnknownAlienHuman/eliot-memory-os/blob/main/docs/architecture/I09-04-dreamer-input-bundle.md#i94-dreamer-input-bundle",
+  "https://github.com/UnknownAlienHuman/eliot-memory-os/blob/main/docs/architecture/I09-05-dream-packet.md#i95-dream-packet",
+  "https://github.com/UnknownAlienHuman/eliot-memory-os/blob/main/docs/architecture/I09-06-candidate-kinds.md#i96-candidate-kinds",
+  "https://github.com/UnknownAlienHuman/eliot-memory-os/blob/main/docs/architecture/I09-07-memory-transformation-validation.md#i97-memory-transformation-validation",
+  "https://github.com/UnknownAlienHuman/eliot-memory-os/blob/main/docs/architecture/I12-18-prediction-and-calibration.md#i1218-prediction-and-calibration",
+  "https://github.com/UnknownAlienHuman/eliot-memory-os/blob/main/docs/architecture/I12-22-theory-portfolio-and-practical-weighting.md#i1222-theory-portfolio-and-practical-weighting",
+  "https://github.com/UnknownAlienHuman/eliot-memory-os/blob/main/docs/architecture/I12-26-memory-admission-and-retrieval-trace.md#i1226-memory-admission-and-retrieval-trace",
+  "https://github.com/UnknownAlienHuman/eliot-memory-os/blob/main/docs/architecture/I21-06-source-portfolio-coverage-denominator-and-coveragereceipt.md#i216-source-portfolio-coverage-denominator-and-coveragereceipt",
+  "https://github.com/UnknownAlienHuman/eliot-memory-os/blob/main/docs/architecture/I07-20-agent-facing-error-contract.md#i720-agent-facing-error-contract",
+]
+anchors = ["ARCH-DRM-02", "ARCH-DRM-04", "ARCH-GROUND-01", "ARCH-OBS-01", "ARCH-AUTH-01"]
+
+[current_source]
+confirmed = [
+  "Grounding is a distinct stage between structured provider output and common pre-handler validation.",
+  "Research/source acquisition and source assurance are upstream owners; grounding receives one frozen source/evidence denominator and cannot broaden it.",
+  "Model output, provider citations and generated references are candidate assertions, not authoritative sources or proof.",
+  "Common validation and native semantic handlers remain downstream owners; grounding cannot repair or admit a malformed/unsupported candidate.",
+]
+
+[scope]
+primary_paths = [
+  "the exact grounding package/cell owned by #602",
+  "shared Dream Packet grounding and evidence-reference contracts only when an owning defect is proven",
+  "exact #593 bundle, #692 assurance, #588 screen and #595 validation adapters",
+  "focused provenance, counterevidence, unsupported-field, omission and replay fixtures",
+]
+serialized_dependencies = [
+  "#593 frozen input bundle",
+  "#692 source assurance",
+  "#588 Curation screen where applicable",
+  "#595 common validation",
+  "#806 pure controller",
+  "#1100 runtime composition",
+]
+forbidden = [
+  "network, provider, model, tool, Store, graph, index, cache or filesystem acquisition/query",
+  "source creation, citation repair, semantic rewriting or inferred provenance",
+  "truth, support, causality, confidence or majority selection",
+  "common validation, native handler logic, candidate admission or application",
+  "authority, external effect, canonical write, influence change or task Finish",
+  "generic untyped evidence maps, Other variants or warning-only unsupported claims",
+  "automatic GitHub workflow triggers",
+]
+
+[[waves]]
+id = "A"
+what = "Freeze one exact grounding input and evidence universe."
+how = [
+  "Bind grounding to job/request/task/attempt/scope/fence, structured draft identity, model/provider attempt and result identities, frozen bundle, source-assurance receipt, applicable Curation screen receipt, expected source/evidence denominator, policy and freshness/invalidation evidence.",
+  "Preserve the original structured draft bytes/digest and every source/evidence object identity before projection.",
+  "Reject mixed job/bundle/model/source boundaries, duplicate evidence identity, same-ID changed source bytes/metadata and hidden denominator members.",
+]
+
+[[waves]]
+id = "B"
+what = "Ground every load-bearing field to exact evidence or explicit non-evidence."
+how = [
+  "Enumerate every candidate claim, relation, operation, target, assumption, predicted observable, verifier, bound, exception and recommendation that influences downstream semantics.",
+  "Attach exact source/evidence handles, spans/revisions, authoritative lineage, support role and applicability to each grounded field.",
+  "Classify model-derived inference, user instruction, policy constraint, architectural rule, observed fact, counterevidence and unsupported assertion distinctly.",
+  "A provider citation string or plausible reference cannot become a source handle unless it matches an admitted exact member of the frozen denominator.",
+]
+
+[[waves]]
+id = "C"
+what = "Preserve counterevidence, omissions, uncertainty and coverage."
+how = [
+  "Retain all applicable counterevidence, conflicting sources, minority evidence, unknown lineage, unavailable/withheld members and source-assurance blind boundaries.",
+  "Give every load-bearing draft field one grounded, contradicted, unsupported, ambiguous, stale, unavailable, unknown or not-applicable disposition.",
+  "Unsupported or contradicted material remains present and blocks or lowers the exact downstream completeness disposition; it is never silently deleted or rewritten.",
+  "Grounding coverage is computed against the declared field and source denominators, not citation count, token overlap or model confidence.",
+]
+
+[[waves]]
+id = "D"
+what = "Emit one immutable GroundingReceipt and preserve downstream role separation."
+how = [
+  "Bind the receipt digest to original draft, every field disposition/reference, complete evidence/source denominators, counterevidence, omissions, policy, freshness, blind boundaries and invalidation set.",
+  "Canonicalize true sets only and preserve meaningful candidate/source ordering and original text identity.",
+  "#595 consumes the exact receipt and rejects absent, stale or mismatched grounding rather than rerunning acquisition, model generation or grounding.",
+  "Exact replay returns the same receipt; changed same-identity draft, source, field mapping, policy or denominator conflicts.",
+]
+
+[acceptance]
+criteria = [
+  "One package/cell is the sole grounding owner and exposes a closed typed input, per-field disposition and immutable receipt contract.",
+  "Grounding binds exact job/task/attempt/scope/fence, draft/model result, bundle, source assurance, screen, evidence denominator, policy, freshness and invalidation identities.",
+  "Original structured draft and source/evidence identities are preserved and cannot be overwritten by normalized output.",
+  "Every load-bearing claim, relation, operation, target, assumption, predicted observable, verifier, bound, exception and recommendation is grounded or explicitly non-grounded.",
+  "Provider citation text, model output, lexical similarity and confidence cannot manufacture a source, provenance or support handle.",
+  "User instruction, policy, architectural rule, observed fact, model inference, counterevidence and unsupported assertion remain distinct evidence roles.",
+  "Every required source/evidence and candidate-field denominator member is accounted for exactly once; no hidden omission or subset can claim complete grounding.",
+  "Counterevidence, conflicts, minority evidence, unavailable/withheld sources, unknown lineage and blind boundaries remain visible.",
+  "Unsupported, contradicted, stale, ambiguous, unavailable and unknown fields remain present and cannot be silently repaired, deleted or rewritten.",
+  "Grounding completeness is not derived from citation count, token overlap, model confidence, recency or majority.",
+  "Receipt identity covers the complete original draft, mappings, dispositions, denominators, counterevidence, policy, freshness and invalidation set.",
+  "Exact replay is deterministic; changed same-identity draft/source/mapping/policy/denominator conflicts.",
+  "#595 consumes the exact receipt and cannot rerun or bypass grounding.",
+  "No acquisition/query, semantic rewrite, truth selection, validation, handler dispatch, candidate admission/application, canonical write, authority, effect, influence change or Finish API exists.",
+  "Fixtures cover fabricated citation, unsupported claim, contradictory evidence, mixed source boundary, stale source, unknown lineage, partial denominator, exact replay and stale receipt rejection.",
+]
+
+[verification]
+commands = [
+  "cargo fmt --all -- --check",
+  "cargo check --locked -p <dreamer-grounding-owner> --all-targets",
+  "cargo test --locked -p <dreamer-grounding-owner> --all-targets",
+  "cargo clippy --locked -p <dreamer-grounding-owner> --all-targets -- -D warnings",
+  "git diff --check",
+]
+edge_proof = "Compose one model result through #806/#1100 into grounding and #595, proving one grounding execution, preserved counterevidence and zero acquisition or semantic repair."
+product_proof = "Issue #11 remains open; grounding establishes evidence linkage only and cannot prove truth, support or Product behavior."
