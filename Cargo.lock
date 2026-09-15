@@ -1259,8 +1259,12 @@ version = "0.1.0"
 dependencies = [
  "blake3",
  "eliot-contracts",
+ "eliot-instrument-api",
+ "eliot-instrument-nextest",
+ "eliot-instrument-runner",
  "eliot-store",
  "eliot-types",
+ "eliot-verifier",
  "eliot-windows-ipc",
  "serde",
  "serde_json",
@@ -2477,6 +2481,9 @@ dependencies = [
 name = "eliot-verifier"
 version = "0.1.0"
 dependencies = [
+ "eliot-contracts",
+ "eliot-instrument-api",
+ "eliot-instrument-nextest",
  "eliot-types",
  "serde",
  "serde_json",
