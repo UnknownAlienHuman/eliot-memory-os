@@ -275,7 +275,10 @@ impl DispatchGrant {
     pub fn validate_for_child(
         &self,
     ) -> Result<(FencingToken, ActionLeaseRef), DispatchLaunchError> {
-        require_digest(&self.grant_digest, "grant digest must be a lowercase SHA-256 digest")?;
+        require_digest(
+            &self.grant_digest,
+            "grant digest must be a lowercase SHA-256 digest",
+        )?;
         if self.fence_generation == 0 {
             return Err(DispatchLaunchError::InvalidMaterial(
                 "grant fence generation must be non-zero".to_owned(),
@@ -339,8 +342,8 @@ fn dispatch_grant_for(
     // lease + expiry. The epoch serializes via its canonical JSON shape;
     // everything else is fixed-order text, so equal logical grants hash
     // identically on both sides of the boundary.
-    let epoch_json =
-        serde_json::to_string(authority_epoch).map_err(|error| DispatchLaunchError::Gate(error.to_string()))?;
+    let epoch_json = serde_json::to_string(authority_epoch)
+        .map_err(|error| DispatchLaunchError::Gate(error.to_string()))?;
     let mut material = String::with_capacity(256);
     material.push_str(identity_digest);
     material.push('|');
@@ -366,6 +369,124 @@ fn dispatch_grant_for(
     // is ever written: the child will call these same entries.
     grant.validate_for_child()?;
     Ok(grant)
+}
+
+/// Owner-side mirrored native-worker dispatch derivation domain.
+///
+/// Byte-identical to
+/// `bins/eliot-native-worker/src/dispatch_authority.rs::DISPATCH_DERIVATION_DOMAIN`.
+/// The Kernel (owner) runs the identical forward computation so it can publish
+/// the matching T9-02 executable join (`process_invocation_digest`): the child
+/// derives its one-shot permit deterministically because fresh entropy could
+/// never close the join gate (see the child module docs).
+pub const NATIVE_WORKER_DISPATCH_DERIVATION_DOMAIN: &str = "eliot-native-worker-dispatch/v1";
+/// Owner-side authority-identity prefix, byte-identical to the child
+/// (`"native-worker-dispatch-authority-" + hex(SHA-256("authority:" + base))`).
+pub const NATIVE_WORKER_DISPATCH_AUTHORITY_PREFIX: &str = "native-worker-dispatch-authority-";
+/// Owner-side single revision head name, byte-identical to the child
+/// (`LAUNCH_GRANT_HEAD = "launch-grant"`).
+pub const NATIVE_WORKER_DISPATCH_LAUNCH_GRANT_HEAD: &str = "launch-grant";
+
+/// Owner-side mirrored dispatch derivation material for one admitted claim.
+///
+/// Byte-identical to the child
+/// (`bins/eliot-native-worker/src/dispatch_authority.rs:209-249,277-284`):
+/// ```text
+/// base      = ["eliot-native-worker-dispatch/v1", claim_id, operation_id,
+///              worker_generation, authority_epoch_json, launch_nonce]
+/// key       = SHA-256("key:" + base_json)
+/// authority = "native-worker-dispatch-authority-" + hex(SHA-256("authority:" + base_json))
+/// heads     = {"launch-grant": hex(SHA-256("head:" + base_json))}
+/// nonce     = the claim-bound launch nonce (the join `launch_nonce`)
+/// ```
+/// No wall-clock enters the permit: freshness comes from the grant window
+/// (`DispatchGrant::expires_at` over the receipt admission time), never from
+/// `now` at derivation time.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct NativeWorkerDispatchDerivation {
+    /// Canonical derivation base JSON (the exact child `derivation_base`).
+    pub base_json: String,
+    /// Lowercase hex of `SHA-256("key:" + base)` (the child `KernelDispatchKey` bytes).
+    pub key_hex: String,
+    /// Child-identical authority identity string.
+    pub authority_id: String,
+    /// Lowercase hex of `SHA-256("head:" + base)` (the `launch-grant` head value).
+    pub head_digest: String,
+}
+
+/// Builds the owner-side dispatch derivation from typed admitted material.
+///
+/// `authority_epoch` serializes via its canonical JSON shape exactly like the
+/// child (`serde_json::to_value(&claim.authority_epoch)` embedded in the base
+/// array), so equal logical claims hash identically on both sides.
+pub fn native_worker_dispatch_derivation(
+    claim_id: &str,
+    operation_id: &str,
+    worker_generation: u64,
+    authority_epoch: &EpochId,
+    launch_nonce: &str,
+) -> Result<NativeWorkerDispatchDerivation, DispatchLaunchError> {
+    let epoch_json = serde_json::to_value(authority_epoch)
+        .map_err(|error| DispatchLaunchError::Gate(error.to_string()))?;
+    native_worker_dispatch_derivation_from_epoch_json(
+        claim_id,
+        operation_id,
+        worker_generation,
+        &epoch_json,
+        launch_nonce,
+    )
+}
+
+/// Builds the owner-side dispatch derivation from an already-canonical epoch
+/// JSON value (the exact child input shape: the `authority_epoch_json` Value
+/// the child embeds in its base array).
+pub fn native_worker_dispatch_derivation_from_epoch_json(
+    claim_id: &str,
+    operation_id: &str,
+    worker_generation: u64,
+    authority_epoch_json: &serde_json::Value,
+    launch_nonce: &str,
+) -> Result<NativeWorkerDispatchDerivation, DispatchLaunchError> {
+    if claim_id.trim().is_empty()
+        || operation_id.trim().is_empty()
+        || launch_nonce.trim().is_empty()
+    {
+        return Err(DispatchLaunchError::InvalidMaterial(
+            "dispatch derivation identities must be non-blank".to_owned(),
+        ));
+    }
+    let base_json = serde_json::to_string(&serde_json::json!([
+        NATIVE_WORKER_DISPATCH_DERIVATION_DOMAIN,
+        claim_id,
+        operation_id,
+        worker_generation,
+        authority_epoch_json,
+        launch_nonce,
+    ]))
+    .map_err(|error| DispatchLaunchError::Gate(error.to_string()))?;
+    let key_hex = dispatch_tagged_hex("key", &base_json);
+    let authority_id = format!(
+        "{NATIVE_WORKER_DISPATCH_AUTHORITY_PREFIX}{}",
+        dispatch_tagged_hex("authority", &base_json)
+    );
+    let head_digest = dispatch_tagged_hex("head", &base_json);
+    Ok(NativeWorkerDispatchDerivation {
+        base_json,
+        key_hex,
+        authority_id,
+        head_digest,
+    })
+}
+
+/// Hashes one domain-separated derivation input exactly like the child
+/// (`tagged_hash`: `SHA-256(tag + ":" + base_json)`, lowercase hex).
+fn dispatch_tagged_hex(tag: &str, base_json: &str) -> String {
+    let mut material =
+        String::with_capacity(tag.len().saturating_add(1).saturating_add(base_json.len()));
+    material.push_str(tag);
+    material.push(':');
+    material.push_str(base_json);
+    super::sha256_hex(material.as_bytes())
 }
 
 /// Object-safe admission port over the durable Doctor recovery ledger.
@@ -2462,9 +2583,7 @@ pub fn release_launched_attempt(
         launches.by_identity.remove(identity);
     }
     drop(launches);
-    if release
-        && let Some(path) = material_path
-    {
+    if release && let Some(path) = material_path {
         reap_material_file(&path);
     }
     Ok(release)
@@ -2992,7 +3111,8 @@ pub fn reconcile_launched_native_worker_attempt(
         let launches = launches_table(contour)?;
         launches.by_identity.get(claim_id).cloned()
     };
-    let Some(retained) = retained.filter(|record| record.kind == DispatchedWorkerKind::NativeWorker)
+    let Some(retained) =
+        retained.filter(|record| record.kind == DispatchedWorkerKind::NativeWorker)
     else {
         return Ok(ReconcileLaunchedOutcome::Unknown {
             kind: DispatchedWorkerKind::NativeWorker,
@@ -3598,8 +3718,7 @@ mod tests {
                 .expect("testd material file"),
         );
         assert_eq!(
-            testd_file,
-            first_ready.material_path,
+            testd_file, first_ready.material_path,
             "ready carries the protected dispatch path"
         );
         assert!(
@@ -3628,7 +3747,9 @@ mod tests {
             serde_json::from_value(testd_object["grant"].clone()).expect("testd grant parses");
         assert_eq!(testd_grant.authority_epoch, epoch);
         assert_eq!(testd_grant.fence_generation, 1);
-        testd_grant.validate_for_child().expect("testd grant validates");
+        testd_grant
+            .validate_for_child()
+            .expect("testd grant validates");
         assert_eq!(
             testd_object["nonce"],
             serde_json::json!(first_ready.nonce),
@@ -3678,10 +3799,7 @@ mod tests {
         ));
         // Reconcile reaps the dispatch file best-effort so a stale
         // presentation never lingers.
-        assert!(
-            !testd_file.exists(),
-            "reconciled testd material is reaped"
-        );
+        assert!(!testd_file.exists(), "reconciled testd material is reaped");
         // A stale release never frees the slot; the exact release does.
         assert!(
             !release_launched_attempt(
@@ -3774,7 +3892,9 @@ mod tests {
         let native_grant: DispatchGrant =
             serde_json::from_value(native_object["grant"].clone()).expect("native grant parses");
         assert_eq!(native_grant.authority_epoch, epoch);
-        native_grant.validate_for_child().expect("native grant validates");
+        native_grant
+            .validate_for_child()
+            .expect("native grant validates");
         assert_eq!(
             native_object["nonce"],
             serde_json::json!(native_ready.nonce),
@@ -4139,5 +4259,54 @@ mod tests {
             DispatchedWorkerKind::NativeWorker.material_file_name(),
             Some("eliot-native-worker.admitted-claim.json")
         );
+    }
+
+    /// R1 byte-identity: the owner-side mirrored dispatch derivation is
+    /// byte-identical to the child
+    /// (`bins/eliot-native-worker/src/dispatch_authority.rs:209-249,277-284`)
+    /// for a fixed vector. The child test asserts the same literals; both
+    /// sides agreeing here is the interop proof (no wall-clock in the permit).
+    #[test]
+    fn owner_dispatch_derivation_matches_child_vector() {
+        let epoch = test_epoch(3);
+        let epoch_json = serde_json::to_value(&epoch).expect("epoch json");
+        let derived = native_worker_dispatch_derivation(
+            "claim-dispatch-r1-001",
+            "operation-dispatch-r1-001",
+            7,
+            &epoch,
+            "launch-nonce-r1-0001-abcdef0123",
+        )
+        .expect("derivation builds");
+        let from_json = native_worker_dispatch_derivation_from_epoch_json(
+            "claim-dispatch-r1-001",
+            "operation-dispatch-r1-001",
+            7,
+            &epoch_json,
+            "launch-nonce-r1-0001-abcdef0123",
+        )
+        .expect("derivation from epoch json builds");
+        assert_eq!(derived, from_json, "typed and json inputs must agree");
+        assert_eq!(
+            derived.base_json,
+            "[\"eliot-native-worker-dispatch/v1\",\"claim-dispatch-r1-001\",\"operation-dispatch-r1-001\",7,{\"lineage_id\":\"550e8400-e29b-41d4-a716-446655440000\",\"sequence\":3},\"launch-nonce-r1-0001-abcdef0123\"]"
+        );
+        assert_eq!(
+            derived.key_hex,
+            "4c82b9a89995676ac0d0114db3615a47a8de2f9e59080c59d8354af881211f16"
+        );
+        assert_eq!(
+            derived.authority_id,
+            "native-worker-dispatch-authority-4354a8cb909128f86c445a7c19de3e0345b5b1f63e5dfbfe3a20ce6e6da3a6ff"
+        );
+        assert_eq!(
+            derived.head_digest,
+            "d0fb93eaece8fc98051cd9501616d9c9f4eb8f755cc010931a6b2b80aac32197"
+        );
+        assert_eq!(
+            NATIVE_WORKER_DISPATCH_DERIVATION_DOMAIN,
+            "eliot-native-worker-dispatch/v1"
+        );
+        assert_eq!(NATIVE_WORKER_DISPATCH_LAUNCH_GRANT_HEAD, "launch-grant");
     }
 }

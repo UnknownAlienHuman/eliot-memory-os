@@ -23,10 +23,11 @@
 //!   epoch exact tuple, generation, artifact digest, config snapshot
 //!   digest). The live epoch is additionally retained from the authenticated
 //!   health reply and is the only epoch the admitted driver binds against.
-//! - The concrete [`ProcessRequest`] executed by the adapter is an in-memory
-//!   composition value delivered with the dispatch contour. It is never
-//!   deserialized from a wire type, never built from caller surfaces, and
-//!   this module never mints a permit.
+//! - The concrete [`ProcessRequest`] executed by the adapter is derived
+//!   in-memory from the Kernel-admitted executable binding (program,
+//!   argv template, env allowlist, caps) plus the OS-loader generation
+//!   root. It is never deserialized from a wire type, never built from
+//!   caller surfaces, and this module never mints a permit.
 //! - One shot performs at most one submit and at most one effect dispatch.
 //!   A lost submit reply exits the shot without effect and without retry;
 //!   only the executor-owned
@@ -43,15 +44,19 @@ use eliot_doctor::admitted_effect::{
     project_cancelled, project_diagnosis,
 };
 use eliot_doctor_core::{
-    ClosedRepairRequest, DoctorError, EffectIntent, EffectOutcome, KernelAdmission,
-    KernelDoctorClient, RepairClass, RepairRecipeManifest, RepairRequest,
+    ClosedRepairRequest, DoctorError, EXECUTABLE_BINDING_VERSION, EffectIntent, EffectOutcome,
+    ExecutableBinding, KernelAdmission, KernelDoctorClient, RepairClass, RepairRecipeManifest,
+    RepairRequest,
 };
 use eliot_kernel_service::{
-    DOCTOR_REPAIR_WIRE_ID, DOCTOR_REPAIR_WIRE_VERSION, DoctorRepairAttemptRequest,
-    DoctorRepairRejection, DoctorRepairRejectionReason, DoctorRepairResponse, KernelServiceError,
-    route_doctor_repair,
+    DOCTOR_REPAIR_WIRE_ID, DOCTOR_REPAIR_WIRE_VERSION, DoctorRepairAdmission,
+    DoctorRepairAttemptRequest, DoctorRepairRejection, DoctorRepairRejectionReason,
+    DoctorRepairResponse, KernelServiceError, route_doctor_repair,
 };
-use eliot_process::{ProcessExecutor, ProcessRequest};
+use eliot_process::{
+    EnvironmentInheritance, EnvironmentProjection, Generation, ImageId, JobId, OperationId,
+    ProcessExecutor, ProcessIntent, ProcessRequest, ProcessTreeId, ResourceLimits, SessionId,
+};
 use time::OffsetDateTime;
 
 /// Stable operation selector for the Kernel-owned Doctor repair-attempt
@@ -64,12 +69,6 @@ pub const DOCTOR_REPAIR_OPERATION: &str = DOCTOR_REPAIR_WIRE_ID;
     reason = "Slice-C dispatch contour pins this version when the delivery seam lands; asserted by the wire-identity test"
 )]
 pub const DOCTOR_REPAIR_OPERATION_VERSION: u16 = DOCTOR_REPAIR_WIRE_VERSION;
-
-/// Residual naming the follow-up contour that delivers the session-bound
-/// attempt envelope plus the concrete IPC-delivered [`ProcessRequest`] to a
-/// live one-shot invocation. Until it lands, the binary fails closed after
-/// the authenticated bootstrap instead of inventing admission material.
-pub const DOCTOR_DISPATCH_RESIDUAL: &str = "issue-461 slice-C follow-up: kernel dispatch contour delivering the session-bound DoctorRepairAttemptRequest envelope, closed request, manifest, live epoch, and concrete ProcessRequest to the one-shot doctor invocation";
 
 /// Typed failure for the authenticated doctor exchange. Every variant is
 /// fail-closed: the one-shot driver maps each to exit 78 without effect,
@@ -412,6 +411,99 @@ fn health_advertises_doctor(health: &serde_json::Value) -> bool {
         })
 }
 
+/// Derives the single governed [`ProcessIntent`] ONLY from the
+/// Kernel-admitted executable binding plus admitted identities.
+///
+/// Inputs are admitted values only: `binding` from the manifest revision
+/// the Kernel admission bound (`manifest_digest` + `definition_digest`),
+/// `request` after closed validation, `admission` after echo and
+/// attempt/effect digest checks, `adapter_id` from the verified operation
+/// reference, and `generation_root` from the OS loader image path (the
+/// installed generation root, never argv/env). No argv, stdin, or
+/// environment byte enters: argv resolves only from the fixed template
+/// plus typed request slots, env is the explicit allowlist with no
+/// inheritance, cwd is always the generation root, and the executable is
+/// the joined relative program pinned by its artifact digest (re-hashed
+/// by the executor before start).
+pub fn derive_intent_from_admitted_binding(
+    binding: &ExecutableBinding,
+    request: &ClosedRepairRequest,
+    admission: &DoctorRepairAdmission,
+    adapter_id: &str,
+    generation_root: &std::path::Path,
+) -> Result<ProcessIntent, DoctorIpcError> {
+    let contract = |detail: &str| DoctorIpcError::Contract(detail.to_owned());
+    binding
+        .validate()
+        .map_err(|error| contract(&error.to_string()))?;
+    if admission.operation_id.trim().is_empty()
+        || admission.operation_id.chars().any(char::is_control)
+    {
+        return Err(contract("admitted operation id is not well-formed"));
+    }
+    if adapter_id.trim().is_empty() || adapter_id.chars().any(char::is_control) {
+        return Err(contract("admitted adapter id is not well-formed"));
+    }
+    let digest_prefix = admission
+        .attempt_digest
+        .get(..16)
+        .ok_or_else(|| contract("admitted attempt digest is malformed"))?;
+    let operation_id = OperationId::new(admission.operation_id.clone())
+        .map_err(|error| contract(&error.to_string()))?;
+    let tree_id = ProcessTreeId::new(format!("doctor-tree-{digest_prefix}"))
+        .map_err(|error| contract(&error.to_string()))?;
+    let job_id = JobId::new(format!("doctor-job-{digest_prefix}"))
+        .map_err(|error| contract(&error.to_string()))?;
+    let image_id = ImageId::new(format!("{adapter_id}-b{EXECUTABLE_BINDING_VERSION}"))
+        .map_err(|error| contract(&error.to_string()))?;
+    let session_id = SessionId::new(format!("doctor-session-{digest_prefix}"))
+        .map_err(|error| contract(&error.to_string()))?;
+    let generation =
+        Generation::new(request.fence.generation).map_err(|error| contract(&error.to_string()))?;
+    let root_str = generation_root
+        .to_str()
+        .ok_or_else(|| contract("generation root locator is not well-formed"))?;
+    let executable_path = generation_root.join(&binding.program);
+    let executable_str = executable_path
+        .to_str()
+        .ok_or_else(|| contract("admitted program locator is not well-formed"))?;
+    // The join of a validated relative program (no absolute, no `..`, no
+    // empty segments) stays below the generation root by construction.
+    let argv = binding
+        .resolve_argv(request)
+        .map_err(|error| contract(&error.to_string()))?;
+    let environment = EnvironmentProjection::new(
+        binding.env.clone(),
+        Vec::new(),
+        EnvironmentInheritance::None,
+    )
+    .map_err(|error| contract(&error.to_string()))?;
+    let limits = ResourceLimits::new(
+        binding.timeout_ms,
+        None,
+        None,
+        binding.max_stdout_bytes,
+        binding.max_stderr_bytes,
+        0,
+    )
+    .map_err(|error| contract(&error.to_string()))?;
+    ProcessIntent::new(
+        operation_id,
+        tree_id,
+        job_id,
+        image_id,
+        session_id,
+        generation,
+        executable_str.to_owned(),
+        binding.artifact_digest.clone(),
+        argv,
+        root_str.to_owned(),
+        environment,
+        limits,
+    )
+    .map_err(|error| contract(&error.to_string()))
+}
+
 /// Material presented to one one-shot invocation by the dispatch contour.
 ///
 /// Every identity-bearing value arrives with the authenticated dispatch,
@@ -543,6 +635,125 @@ where
     dead_code,
     reason = "Slice-C dispatch contour reaches this mapping through drive_admitted_attempt; exercised by the module tests"
 )]
+/// Drives one session-bound dispatched attempt whose concrete intent is
+/// derived ONLY from the Kernel-admitted binding.
+///
+/// Sequence: prove envelope/closed byte-identity against the validated
+/// dispatch file; route diagnose-only to the read-only projection without
+/// transport or executor; submit once; map refusal/conflict fail-closed;
+/// validate the admission echo plus recomputed attempt/effect digests;
+/// project cancelled without executing; resolve the admitted manifest
+/// binding; derive the governed intent from that binding (never caller
+/// bytes); issue the one-shot permit through the child dispatch authority;
+/// then run the single consuming effect through the bound adapter on the
+/// real executor. A lost submit reply exits without effect and without
+/// retry; executor unknown stays reconcile-by-identity inside the adapter.
+pub async fn drive_validated_dispatched_attempt<T, E>(
+    transport: &mut T,
+    authority: &crate::dispatch_authority::DoctorDispatchAuthority,
+    executor: Arc<E>,
+    sink: Arc<EvidenceCollector>,
+    validated: &crate::dispatched_material::ValidatedDispatchedAttempt,
+    generation_root: &std::path::Path,
+    now: OffsetDateTime,
+    now_ms: u64,
+) -> Result<OneShotOutcome, AdapterError>
+where
+    T: AdmittedDoctorTransport,
+    T::Error: std::error::Error + Send + Sync + 'static,
+    E: ProcessExecutor + 'static,
+{
+    let request = &validated.request;
+    let manifest = &validated.manifest;
+    let attempt_envelope = &validated.attempt;
+    let epoch = &validated.epoch;
+    let envelope: ClosedRepairRequest = serde_json::from_str(&attempt_envelope.closed_request_json)
+        .map_err(|error| {
+            AdapterError::KernelClient(Box::new(DoctorIpcError::Contract(error.to_string())))
+        })?;
+    if envelope != *request {
+        return Err(AdapterError::Admission(DoctorError::IdentityMismatch));
+    }
+    if matches!(request.recipe.repair_class, RepairClass::DiagnoseOnly) {
+        return project_diagnosis(request, manifest, now);
+    }
+    let response = transport
+        .submit_repair_attempt(attempt_envelope)
+        .map_err(AdapterError::from)?;
+    let admission = match response {
+        DoctorRepairResponse::Admitted(admission) => admission,
+        DoctorRepairResponse::Rejected(rejection) => {
+            return Err(map_rejection(&rejection));
+        }
+        DoctorRepairResponse::Conflict(_) => {
+            return Err(AdapterError::Admission(DoctorError::IdentityMismatch));
+        }
+    };
+    admission.validate().map_err(kernel_service_error)?;
+    if admission.attempt_id != attempt_envelope.attempt_id {
+        return Err(AdapterError::Admission(DoctorError::AdmissionMismatch));
+    }
+    if request.cancellation || admission.cancelled {
+        return project_cancelled(request, manifest, now);
+    }
+    if request.operations.len() != 1 {
+        return Err(AdapterError::Admission(DoctorError::OperationNotAdmitted));
+    }
+    let operation = request.operations[0].clone();
+    if operation.operation_id() != admission.operation_id.as_str() {
+        return Err(AdapterError::Admission(
+            DoctorError::EffectAuthorizationMismatch,
+        ));
+    }
+    let bound_attempt = request
+        .bind_attempt_on_epoch(
+            manifest,
+            &attempt_envelope.attempt_id,
+            &operation,
+            epoch,
+            now,
+        )
+        .map_err(AdapterError::Admission)?;
+    if bound_attempt.digest() != admission.attempt_digest {
+        return Err(AdapterError::Admission(DoctorError::AdmissionMismatch));
+    }
+    let bound_effect = request
+        .bind_effect(&bound_attempt, &operation, attempt_envelope.effect_seq)
+        .map_err(AdapterError::Admission)?;
+    if admission.effect_digest.as_deref() != Some(bound_effect.digest()) {
+        return Err(AdapterError::Admission(DoctorError::AdmissionMismatch));
+    }
+    let manifest_operation = manifest
+        .operations
+        .iter()
+        .find(|entry| entry.operation_id == admission.operation_id)
+        .ok_or_else(|| AdapterError::Admission(DoctorError::OperationNotAdmitted))?;
+    let intent = derive_intent_from_admitted_binding(
+        &manifest_operation.binding,
+        request,
+        &admission,
+        &manifest_operation.adapter_id,
+        generation_root,
+    )
+    .map_err(AdapterError::from)?;
+    let process_request = authority
+        .issue(&intent, &validated.grant, now_ms)
+        .map_err(|error| AdapterError::KernelClient(Box::new(error)))?;
+    let adapter = AutomaticSafeAdapter::bind(executor, operation)?;
+    adapter
+        .execute_admitted_attempt(AttemptInputs {
+            client: transport,
+            request,
+            manifest,
+            attempt_id: attempt_envelope.attempt_id.as_str(),
+            epoch,
+            sink,
+            process_request,
+            now,
+        })
+        .await
+}
+
 fn kernel_service_error(error: KernelServiceError) -> AdapterError {
     AdapterError::KernelClient(Box::new(error))
 }
@@ -564,8 +775,9 @@ mod tests {
         EXIT_RECONCILING, EXIT_UNKNOWN_EFFECT_OUTCOME, ReconcileInputs,
     };
     use eliot_doctor_core::{
-        ClosedRequestParams, DiagnosticBrief, DoctorDisposition, EvidenceHandle, RecoveryLease,
-        RegisteredOperation, RepairRecipe, RepairRecipeIdentity, StateFence,
+        BindingArg, ClosedRequestParams, DiagnosticBrief, DoctorDisposition, EvidenceHandle,
+        ExecutableBinding, RecoveryLease, RegisteredOperation, RepairRecipe, RepairRecipeIdentity,
+        StateFence,
     };
     use eliot_instrument_api::EvidenceAxes;
     use eliot_kernel_service::{DOCTOR_RECOVERY_LEASE_OWNER, DoctorRepairAdmission};
@@ -619,7 +831,24 @@ mod tests {
         }
     }
 
+    fn test_binding() -> ExecutableBinding {
+        let binding = ExecutableBinding {
+            artifact_digest: digest(0xc1),
+            program: "eliot-doctor.exe".to_owned(),
+            argv: vec![BindingArg::Literal {
+                value: "--version".to_owned(),
+            }],
+            env: BTreeMap::new(),
+            timeout_ms: 5_000,
+            max_stdout_bytes: 65_536,
+            max_stderr_bytes: 65_536,
+        };
+        binding.validate().expect("test binding validates");
+        binding
+    }
+
     fn effect_recipe() -> RepairRecipe {
+        let binding = test_binding();
         RepairRecipe {
             recipe_id: "recipe-1".to_owned(),
             revision: 1,
@@ -636,6 +865,7 @@ mod tests {
             attempt_budget: 3,
             cooldown: Duration::seconds(60),
             stop_conditions: Vec::new(),
+            executable_bindings: [(OPERATION_ID.to_owned(), binding)].into_iter().collect(),
         }
     }
 
@@ -644,11 +874,13 @@ mod tests {
             allowed_effects: BTreeSet::new(),
             operations: Vec::new(),
             repair_class: RepairClass::DiagnoseOnly,
+            executable_bindings: BTreeMap::new(),
             ..effect_recipe()
         }
     }
 
     fn test_manifest() -> RepairRecipeManifest {
+        let binding = test_binding();
         RepairRecipeManifest {
             manifest_id: "manifest-1".to_owned(),
             manifest_revision: 1,
@@ -656,7 +888,8 @@ mod tests {
                 operation_id: OPERATION_ID.to_owned(),
                 adapter_id: "automatic-safe".to_owned(),
                 description: "reconnect one admitted generation".to_owned(),
-                definition_digest: digest(0xd1),
+                definition_digest: binding.digest(),
+                binding,
             }],
         }
     }
@@ -1973,5 +2206,113 @@ mod tests {
         assert_eq!(executor.lock().starts, 0);
         remove_dispatched_temp(&path);
         Ok(())
+    }
+
+    #[test]
+    fn binding_digest_binds_escape_rejected_and_drive_derives_intent() {
+        // Single behaviour check (DISPATCH-FINISH): the admitted binding
+        // binds the executable (tampering fails closed), relative escape is
+        // rejected, and the Drive intent derives only from admitted material.
+        let now = OffsetDateTime::now_utc();
+        let (request, manifest) = effect_request(now);
+        let epoch = test_epoch();
+        request
+            .validate_closed(&manifest, now)
+            .expect("honest closed request validates");
+
+        // Tampered program path in the manifest binding fails closed: the
+        // definition digest no longer matches, so resolution/admission binds
+        // nothing.
+        let mut tampered = manifest.clone();
+        tampered.operations[0].binding.program = "tampered.exe".to_owned();
+        assert!(
+            request.validate_closed(&tampered, now).is_err(),
+            "a tampered program path must fail closed validation"
+        );
+
+        // Tampered argv template fails the same way.
+        let mut tampered = manifest.clone();
+        tampered.operations[0].binding.argv = vec![BindingArg::Literal {
+            value: "--tampered".to_owned(),
+        }];
+        // Recompute the definition digest would be required to even pass
+        // shape validation; without it the stale digest fails first.
+        assert!(
+            request.validate_closed(&tampered, now).is_err(),
+            "tampered argv must fail closed validation"
+        );
+
+        // Relative-path escape is rejected at binding validation, never
+        // joined below the generation root.
+        for bad in [
+            "/absolute.exe",
+            "C:/absolute.exe",
+            "../escape.exe",
+            "sub/../escape.exe",
+            "",
+        ] {
+            let mut escaped = test_binding();
+            escaped.program = bad.to_owned();
+            assert!(
+                escaped.validate().is_err(),
+                "program {bad:?} must be rejected"
+            );
+        }
+
+        // Drive derives the intent only from admitted material: the honest
+        // admission binds the manifest, and the derived intent pins the
+        // admitted program, digest, argv, root-only cwd, empty env, and caps.
+        let admission = honest_admission(&request, &manifest, ATTEMPT_ID, EFFECT_SEQ, &epoch, now);
+        let operation = manifest.resolve(OPERATION_ID).expect("test operation");
+        let binding = &manifest.operations[0].binding;
+        let root = std::path::Path::new("C:/eliot/doctor");
+        let intent = derive_intent_from_admitted_binding(
+            binding,
+            &request,
+            &admission,
+            operation.adapter_id(),
+            root,
+        )
+        .expect("admitted intent derives");
+        assert!(intent.executable().ends_with("eliot-doctor.exe"));
+        assert_eq!(intent.executable_sha256(), binding.artifact_digest.as_str());
+        assert_eq!(intent.argv(), &["--version".to_owned()]);
+        assert_eq!(intent.working_directory(), "C:/eliot/doctor");
+        assert!(intent.environment().non_secret().is_empty());
+        assert_eq!(intent.resource_limits().wall_timeout_ms(), 5_000);
+        assert_eq!(
+            intent.operation_id().as_str(),
+            admission.operation_id.as_str()
+        );
+
+        // Slots fill only from validated typed request fields (no caller
+        // bytes): a slot template resolves to the admitted request values.
+        {
+            use eliot_doctor_core::BindingSlot;
+            let mut slotted = test_binding();
+            slotted.argv = vec![
+                BindingArg::Literal {
+                    value: "--probe".to_owned(),
+                },
+                BindingArg::Slot {
+                    slot: BindingSlot::RequestId,
+                },
+                BindingArg::Slot {
+                    slot: BindingSlot::FenceGeneration,
+                },
+            ];
+            slotted.validate().expect("slotted binding validates");
+            let argv = slotted
+                .resolve_argv(&request)
+                .expect("slots resolve from typed fields");
+            assert_eq!(
+                argv,
+                vec![
+                    "--probe".to_owned(),
+                    request.request_id.clone(),
+                    request.fence.generation.to_string(),
+                ]
+            );
+        }
     }
 }

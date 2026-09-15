@@ -12,7 +12,9 @@ pub use eliot_instrument_api::KernelProcessAdmissionRequest;
 use eliot_instrument_api::{
     ExecutionStatus, InstrumentInvocation, InstrumentKind, VerificationRun,
 };
-use eliot_process::ProcessRequest;
+use eliot_process::{
+    EnvironmentInheritance, EnvironmentProjection, ProcessRequest, ResourceLimits,
+};
 use redb::{Database, ReadableDatabase, ReadableTable, TableDefinition};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -29,6 +31,298 @@ pub use claim::{
     ClaimBindingExpectation, ExpiredRunningReconciliation, reconcile_expired_running,
     validate_claim_binding,
 };
+
+// ---- Closed testd profile to executable binding registry (issue #20) ----
+//
+// Testd executes only admitted typed Instrument profiles bound to exact
+// executable/environment/artifact/State Fence identities. This registry is
+// the closed profile side of that binding: it maps one admitted profile
+// name to its exact executable meaning. The Doctor design is mirrored
+// (`RepairRecipeManifest` in `eliot-doctor-core`): a closed registry, a
+// per-definition digest, resolution that fails closed on unregistered
+// names, and no public constructor from free-form text.
+//
+// * `profile` is the closed name below; anything else is refused at
+//   registration (`TestdStore::submit`) and at every Drive gate.
+// * `package_artifact_digest` is the lowercase SHA-256 of the installed
+//   tool file bytes, recorded at registration from the installed tool
+//   itself (the Drive resolves the relative program through the platform
+//   tool locator and hashes the file; no digest is hardcoded, because the
+//   installed bytes differ per host).
+// * `program_path` is relative and closed (`cargo` only): absolute paths
+//   and parent traversal are refused, so no caller can redirect execution
+//   by path.
+// * `fixed_argv` is the complete argv. This slice's single profile takes
+//   no typed slots, so any invocation-supplied argument is refused at
+//   registration: there is no caller passthrough. A future profile with
+//   typed slots arrives as a new registry entry with its own slot
+//   validation, never by widening this one.
+// * `env_allowlist` is the exact non-secret environment for the child.
+//   This profile takes none (`EnvironmentInheritance::None` with an empty
+//   map): the bounded probe needs no environment, so none is supplied.
+// * the working directory is never stored here: the Drive always uses the
+//   generation root supplied with the admitted material, never a
+//   caller-chosen directory.
+// * the timeout/output caps are fixed below and bound into the definition
+//   digest, so a widened execution window cannot substitute silently.
+//
+// Two digests separate the host-stable meaning from the installed bytes:
+// [`testd_definition_digest`] covers the static fields only and is bound
+// into the Kernel front-door admission (`TestdAdmission` in
+// `eliot-kernel-service`); [`testd_binding_digest`] additionally covers
+// the installed artifact digest and binds one Drive registration.
+
+/// The single admitted testd profile in this slice.
+///
+/// The name keeps the established `cargo-test` instrument profile spelling
+/// already used across testd fixtures; in this slice it executes the
+/// bounded `cargo --version` tool probe. A real `cargo test` execution with
+/// scoped arguments arrives as a new profile, never by widening this one.
+pub const TESTD_ADMITTED_PROFILE: &str = "cargo-test";
+/// Relative program for the admitted probe, resolved through the platform
+/// tool locator at Drive time. Never absolute, never parent traversal.
+pub const TESTD_PROFILE_PROGRAM: &str = "cargo";
+/// Fixed argv for the admitted probe. No caller slot exists.
+pub const TESTD_PROFILE_ARGV: &[&str] = &["--version"];
+/// Bounded wall timeout for the probe, in milliseconds.
+pub const TESTD_PROFILE_WALL_TIMEOUT_MS: u64 = 15_000;
+/// Bounded CPU ceiling for the probe, in milliseconds.
+pub const TESTD_PROFILE_CPU_TIME_MS: u64 = 5_000;
+/// Bounded memory ceiling for the probe, in bytes.
+pub const TESTD_PROFILE_MEMORY_BYTES: u64 = 256 * 1024 * 1024;
+/// Bounded stdout capture for the probe, in bytes.
+pub const TESTD_PROFILE_STDOUT_BYTES: u64 = 64 * 1024;
+/// Bounded stderr capture for the probe, in bytes.
+pub const TESTD_PROFILE_STDERR_BYTES: u64 = 64 * 1024;
+/// Bounded descendant ceiling for the probe.
+pub const TESTD_PROFILE_MAX_DESCENDANTS: u32 = 4;
+
+/// Closed executable binding for one admitted testd profile.
+///
+/// Values are produced only by [`testd_profile_binding`] against the
+/// closed registry above. There is no public constructor from free-form
+/// text, so an unregistered profile or widened argv/environment/limit
+/// cannot be named here.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TestdExecutableBinding {
+    /// Closed admitted profile name.
+    pub profile: String,
+    /// Lowercase SHA-256 of the installed tool file bytes, recorded at
+    /// registration from the installed tool itself.
+    pub package_artifact_digest: String,
+    /// Relative program path (`cargo` only).
+    pub program_path: String,
+    /// Complete fixed argv (`--version` only).
+    pub fixed_argv: Vec<String>,
+    /// Exact non-secret environment allowlist (empty for this profile).
+    pub env_allowlist: Vec<String>,
+    /// Bounded wall timeout, in milliseconds.
+    pub wall_timeout_ms: u64,
+    /// Bounded CPU ceiling, in milliseconds.
+    pub cpu_time_ms: Option<u64>,
+    /// Bounded memory ceiling, in bytes.
+    pub memory_bytes: Option<u64>,
+    /// Bounded stdout capture, in bytes.
+    pub stdout_bytes: u64,
+    /// Bounded stderr capture, in bytes.
+    pub stderr_bytes: u64,
+    /// Bounded descendant ceiling.
+    pub max_descendants: u32,
+}
+
+impl TestdExecutableBinding {
+    /// Validates the closed binding shape.
+    pub fn validate(&self) -> Result<(), TestdError> {
+        if self.profile != TESTD_ADMITTED_PROFILE {
+            return Err(TestdError::Invalid {
+                field: "profile",
+                reason: "testd admits only the closed cargo-test tool-probe profile",
+            });
+        }
+        if !is_binding_digest(&self.package_artifact_digest) {
+            return Err(TestdError::Invalid {
+                field: "package_artifact_digest",
+                reason: "must be a lowercase SHA-256 digest",
+            });
+        }
+        // Closed by equality: the admitted program is relative by
+        // construction, so absolute paths and parent traversal have no
+        // spelling that validates.
+        if self.program_path != TESTD_PROFILE_PROGRAM {
+            return Err(TestdError::Invalid {
+                field: "program_path",
+                reason: "testd admits only the closed relative tool program",
+            });
+        }
+        let expected_argv: Vec<String> =
+            TESTD_PROFILE_ARGV.iter().map(ToString::to_string).collect();
+        if self.fixed_argv != expected_argv {
+            return Err(TestdError::Invalid {
+                field: "fixed_argv",
+                reason: "the admitted profile takes fixed argv; caller arguments are refused",
+            });
+        }
+        if !self.env_allowlist.is_empty() {
+            return Err(TestdError::Invalid {
+                field: "env_allowlist",
+                reason: "the admitted profile takes no environment passthrough",
+            });
+        }
+        if self.wall_timeout_ms != TESTD_PROFILE_WALL_TIMEOUT_MS
+            || self.cpu_time_ms != Some(TESTD_PROFILE_CPU_TIME_MS)
+            || self.memory_bytes != Some(TESTD_PROFILE_MEMORY_BYTES)
+            || self.stdout_bytes != TESTD_PROFILE_STDOUT_BYTES
+            || self.stderr_bytes != TESTD_PROFILE_STDERR_BYTES
+            || self.max_descendants != TESTD_PROFILE_MAX_DESCENDANTS
+        {
+            return Err(TestdError::Invalid {
+                field: "resource_limits",
+                reason: "the admitted profile takes fixed timeout and output caps",
+            });
+        }
+        Ok(())
+    }
+}
+
+/// Returns true only for the closed admitted testd profile name.
+#[must_use]
+pub fn is_admitted_testd_profile(profile: &str) -> bool {
+    profile == TESTD_ADMITTED_PROFILE
+}
+
+/// Resolves the closed binding for one admitted profile.
+///
+/// The artifact digest is the caller's recorded SHA-256 of the installed
+/// tool file bytes (see [`resolve_testd_tool_digest`] on the bins side);
+/// it is shape-checked here and bound into [`testd_binding_digest`].
+/// An unregistered profile fails with `Invalid` and can never execute.
+pub fn testd_profile_binding(
+    profile: &str,
+    package_artifact_digest: &str,
+) -> Result<TestdExecutableBinding, TestdError> {
+    let binding = TestdExecutableBinding {
+        profile: profile.to_owned(),
+        package_artifact_digest: package_artifact_digest.to_owned(),
+        program_path: TESTD_PROFILE_PROGRAM.to_owned(),
+        fixed_argv: TESTD_PROFILE_ARGV.iter().map(ToString::to_string).collect(),
+        env_allowlist: Vec::new(),
+        wall_timeout_ms: TESTD_PROFILE_WALL_TIMEOUT_MS,
+        cpu_time_ms: Some(TESTD_PROFILE_CPU_TIME_MS),
+        memory_bytes: Some(TESTD_PROFILE_MEMORY_BYTES),
+        stdout_bytes: TESTD_PROFILE_STDOUT_BYTES,
+        stderr_bytes: TESTD_PROFILE_STDERR_BYTES,
+        max_descendants: TESTD_PROFILE_MAX_DESCENDANTS,
+    };
+    binding.validate()?;
+    Ok(binding)
+}
+
+/// Canonical definition digest over the static binding fields.
+///
+/// Excludes the per-host artifact digest, so the value is stable across
+/// hosts and can be bound into the Kernel front-door admission. The
+/// canonical shape (field names and JSON representation) must stay
+/// identical to `testd_profile_definition_digest` in
+/// `crates/kernel/eliot-kernel-service/src/testd_front_door.rs`, which
+/// mirrors these constants without a dependency: `canonical_json_bytes`
+/// sorts object keys, so only the field set and values must agree.
+pub fn testd_definition_digest() -> Result<String, TestdError> {
+    #[derive(Serialize)]
+    struct Canonical<'a> {
+        cpu_time_ms: Option<u64>,
+        env_allowlist: &'a [String],
+        fixed_argv: &'a [String],
+        max_descendants: u32,
+        memory_bytes: Option<u64>,
+        profile: &'a str,
+        program_path: &'a str,
+        stderr_bytes: u64,
+        stdout_bytes: u64,
+        wall_timeout_ms: u64,
+    }
+    let empty: Vec<String> = Vec::new();
+    let argv: Vec<String> = TESTD_PROFILE_ARGV.iter().map(ToString::to_string).collect();
+    let canonical = Canonical {
+        cpu_time_ms: Some(TESTD_PROFILE_CPU_TIME_MS),
+        env_allowlist: &empty,
+        fixed_argv: &argv,
+        max_descendants: TESTD_PROFILE_MAX_DESCENDANTS,
+        memory_bytes: Some(TESTD_PROFILE_MEMORY_BYTES),
+        profile: TESTD_ADMITTED_PROFILE,
+        program_path: TESTD_PROFILE_PROGRAM,
+        stderr_bytes: TESTD_PROFILE_STDERR_BYTES,
+        stdout_bytes: TESTD_PROFILE_STDOUT_BYTES,
+        wall_timeout_ms: TESTD_PROFILE_WALL_TIMEOUT_MS,
+    };
+    eliot_contracts::canonical_json_bytes(&canonical)
+        .map(|bytes| eliot_contracts::sha256_hex(&bytes))
+        .map_err(|_| TestdError::GrantDigestSerialization)
+}
+
+/// Canonical digest over the full binding including the installed
+/// artifact digest. Binds one Drive registration to its exact installed
+/// bytes; a substituted executable fails the comparison.
+pub fn testd_binding_digest(binding: &TestdExecutableBinding) -> Result<String, TestdError> {
+    binding.validate()?;
+    eliot_contracts::canonical_json_bytes(binding)
+        .map(|bytes| eliot_contracts::sha256_hex(&bytes))
+        .map_err(|_| TestdError::GrantDigestSerialization)
+}
+
+/// Proves a presented binding digest names exactly this binding.
+/// A tampered binding (substituted digest, argv, program, environment,
+/// or caps) fails with `InvalidBinding` and executes nothing.
+pub fn validate_testd_binding_digest(
+    binding: &TestdExecutableBinding,
+    expected: &str,
+) -> Result<(), TestdError> {
+    if testd_binding_digest(binding)? != expected {
+        return Err(TestdError::InvalidBinding);
+    }
+    Ok(())
+}
+
+/// Builds the closed resource limits for one validated binding.
+pub fn testd_profile_resource_limits(
+    binding: &TestdExecutableBinding,
+) -> Result<ResourceLimits, TestdError> {
+    binding.validate()?;
+    ResourceLimits::new(
+        binding.wall_timeout_ms,
+        binding.cpu_time_ms,
+        binding.memory_bytes,
+        binding.stdout_bytes,
+        binding.stderr_bytes,
+        binding.max_descendants,
+    )
+    .map_err(|error| TestdError::Contract(error.to_string()))
+}
+
+/// Builds the closed environment projection for one validated binding:
+/// no inherited values and no supplied values for this profile.
+pub fn testd_profile_environment(
+    binding: &TestdExecutableBinding,
+) -> Result<EnvironmentProjection, TestdError> {
+    binding.validate()?;
+    EnvironmentProjection::new(
+        binding
+            .env_allowlist
+            .iter()
+            .map(|key| (key.clone(), String::new()))
+            .collect(),
+        Vec::new(),
+        EnvironmentInheritance::None,
+    )
+    .map_err(|error| TestdError::Contract(error.to_string()))
+}
+
+fn is_binding_digest(value: &str) -> bool {
+    value.len() == 64
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+}
 
 const JOBS: TableDefinition<&str, &[u8]> = TableDefinition::new("testd_jobs_v1");
 const EVENTS: TableDefinition<&str, &[u8]> = TableDefinition::new("testd_events_v1");
@@ -986,6 +1280,22 @@ impl TestdStore {
         grant.validate_for_process(&job_id, invocation.request.request_id.as_str(), &process)?;
         if !matches!(invocation.kind, InstrumentKind::Test) {
             return Err(TestdError::WrongInstrumentKind);
+        }
+        // Closed-profile registration (issue #20): only the admitted
+        // tool-probe profile registers, and it takes no caller arguments:
+        // the fixed argv comes from the registry binding, never from the
+        // invocation.
+        if !is_admitted_testd_profile(&invocation.profile) {
+            return Err(TestdError::Invalid {
+                field: "invocation.profile",
+                reason: "testd admits only the closed cargo-test tool-probe profile",
+            });
+        }
+        if !invocation.arguments.is_empty() {
+            return Err(TestdError::Invalid {
+                field: "invocation.arguments",
+                reason: "the admitted profile takes fixed argv; caller arguments are refused",
+            });
         }
         if invocation.request.request_id.as_str() != process.operation_id().as_str() {
             return Err(TestdError::InvalidBinding);

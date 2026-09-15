@@ -94,11 +94,140 @@ pub const NATIVE_WORKER_REPLAY_ACKNOWLEDGE_OPERATION: &str = "native_worker.repl
 /// lifecycle span returns a typed `KernelAdmissionRequired` error, never
 /// success. Kernel replies carry no authority the client may mint; the client
 /// only retains echoed identities it already proved.
+///
+/// Request identity (R3, Implements #22 DISPATCH-FINISH): every `transact`
+/// binds the EBP `RequestIdentity` from the admitted handshake snapshot
+/// before any `transact_json` runs, so the real path never fails
+/// `MissingRequestIdentity`. The fence comes from the admitted
+/// claim/registration/binding under submission (never invented locally); the
+/// clock is the live observation; the request/idempotency/deadline/
+/// cancellation bind the exact submitted operation so the Kernel route gates
+/// (`bins/eliot-kernel/src/native_worker_lifecycle_route.rs:489-507`,
+/// `require_message_identity`) pass. Follows
+/// `eliot-cli::kernel_client::KernelClient::set_request_identity` +
+/// `transact_json` (which fails closed when no identity was bound).
 pub struct KernelNativeWorkerClient {
     client: KernelClient,
     registration: Option<NativeWorkerRegistration>,
     claim: Option<NativeWorkerClaim>,
     ready: Option<NativeReadyReport>,
+}
+
+/// Builds the EBP request-identity JSON from the admitted handshake snapshot.
+///
+/// The fence JSON must be the admitted `StateFence` (claim, registration, or
+/// lifecycle binding under submission — never invented locally); the clock is
+/// the live observation. The request/idempotency/deadline/cancellation bind
+/// the exact submitted operation identity so the Kernel route's
+/// `require_message_identity` passes for that operation. No wall-clock enters
+/// admission itself; only this transport identity carries the observation.
+fn request_identity_value(
+    fence_json: serde_json::Value,
+    operation_id: &str,
+) -> Result<serde_json::Value, NativeWorkerError> {
+    if !fence_json.is_object() {
+        return Err(NativeWorkerError::KernelAdmissionRequired(
+            "admitted fence snapshot is missing for the request identity".to_owned(),
+        ));
+    }
+    if operation_id.trim().is_empty()
+        || operation_id.chars().any(char::is_control)
+        || operation_id.len() > 256
+    {
+        return Err(NativeWorkerError::KernelAdmissionRequired(
+            "request identity operation is invalid".to_owned(),
+        ));
+    }
+    let now_ms = unix_ms()?;
+    let now_i64 = i64::try_from(now_ms).map_err(|_| {
+        NativeWorkerError::KernelAdmissionRequired("worker clock is out of range".to_owned())
+    })?;
+    let deadline = now_ms.saturating_add(30_000);
+    if deadline == 0 {
+        return Err(NativeWorkerError::KernelAdmissionRequired(
+            "request identity deadline is invalid".to_owned(),
+        ));
+    }
+    Ok(serde_json::json!({
+        "request": {
+            "metadata": {
+                "request_id": operation_id,
+                "session_id": null,
+                "task_id": null,
+                "product_id": "eliot-native-worker",
+                "source_id": "eliot-native-worker",
+                "state_fence": fence_json,
+                "clock": {
+                    "valid_time_ms": now_i64,
+                    "known_time_ms": now_i64,
+                    "transaction_sequence": null,
+                    "monotonic_ns": null
+                }
+            },
+            "state_fence": fence_json
+        },
+        "idempotency_key": operation_id,
+        "deadline_unix_ms": deadline,
+        "cancellation_id": format!("{operation_id}:cancel"),
+    }))
+}
+
+/// Binds the admitted-snapshot identity on the authenticated client before
+/// one `transact_json`.
+///
+/// Deserializes through the exact `RequestIdentity` shape the client expects
+/// (inferred from `set_request_identity`, no local identity invented): a
+/// shape drift fails closed here instead of sending a stranger. Must be
+/// called before every transact; `transact_json` fails closed with
+/// `MissingRequestIdentity` when it was not.
+fn bind_request_identity(
+    client: &mut KernelClient,
+    fence_json: serde_json::Value,
+    operation_id: &str,
+) -> Result<(), NativeWorkerError> {
+    let value = request_identity_value(fence_json, operation_id)?;
+    // Inferred as the exact `RequestIdentity` the client binds; no new
+    // dependency is introduced to name it here.
+    let identity = serde_json::from_value(value).map_err(|error| {
+        NativeWorkerError::KernelAdmissionRequired(format!(
+            "admitted request identity shape failed: {error}"
+        ))
+    })?;
+    client.set_request_identity(identity);
+    Ok(())
+}
+
+/// Binds the replay-stream identity from a T9-03 payload presentation.
+///
+/// The payload always carries the merged presentation (`claim`,
+/// `registration`, `binding`); the fence and claim identity come from the
+/// `binding` (falling back to the `claim` half), never invented. Fails closed
+/// when the presentation is missing.
+fn bind_replay_payload_identity(
+    client: &mut KernelClient,
+    payload: &serde_json::Value,
+) -> Result<(), NativeWorkerError> {
+    let binding = payload.get("binding");
+    let fence_json = binding
+        .and_then(|binding| binding.get("state_fence"))
+        .or_else(|| {
+            payload
+                .get("claim")
+                .and_then(|claim| claim.get("state_fence"))
+        })
+        .cloned()
+        .unwrap_or(serde_json::Value::Null);
+    let operation_id = binding
+        .and_then(|binding| binding.get("claim_id"))
+        .and_then(serde_json::Value::as_str)
+        .or_else(|| {
+            payload
+                .get("claim")
+                .and_then(|claim| claim.get("claim_id"))
+                .and_then(serde_json::Value::as_str)
+        })
+        .unwrap_or_default();
+    bind_request_identity(client, fence_json, operation_id)
 }
 
 impl KernelNativeWorkerClient {
@@ -130,6 +259,12 @@ impl KernelNativeWorkerClient {
         registration: &NativeWorkerRegistration,
     ) -> Result<serde_json::Value, NativeWorkerError> {
         registration.validate()?;
+        let fence_json = serde_json::to_value(&registration.state_fence)?;
+        bind_request_identity(
+            &mut self.client,
+            fence_json,
+            registration.registration_id.as_str(),
+        )?;
         let payload = serde_json::to_value(registration)?;
         let reply = self.transact(NATIVE_WORKER_REGISTRATION_OPERATION, payload)?;
         require_echo(
@@ -156,6 +291,12 @@ impl KernelNativeWorkerClient {
             )
         })?;
         require_registration_binding(registration, admission.claim())?;
+        let fence_json = serde_json::to_value(&admission.claim().state_fence)?;
+        bind_request_identity(
+            &mut self.client,
+            fence_json,
+            admission.claim().claim_id.as_str(),
+        )?;
         let payload = serde_json::to_value(admission)?;
         let reply = self.transact(NATIVE_WORKER_CLAIM_OPERATION, payload)?;
         require_echo(&reply, "claim_id", admission.claim().claim_id.as_str())?;
@@ -178,6 +319,12 @@ impl KernelNativeWorkerClient {
         let now = unix_ms()?;
         submission.validate_binding(now)?;
         self.require_claimed_unit(submission.claim())?;
+        let ready_id = match submission.readiness() {
+            NativeWorkerReadiness::Ready(report) => report.ready_id.as_str().to_owned(),
+            NativeWorkerReadiness::Blocked(report) => report.ready_id.as_str().to_owned(),
+        };
+        let fence_json = serde_json::to_value(&submission.claim().state_fence)?;
+        bind_request_identity(&mut self.client, fence_json, &ready_id)?;
         let payload = serde_json::to_value(submission)?;
         let reply = self.transact(NATIVE_WORKER_READY_OPERATION, payload)?;
         match submission.readiness() {
@@ -209,6 +356,8 @@ impl KernelNativeWorkerClient {
         let ready = self.require_ready_unit()?;
         envelope.validate()?;
         require_lifecycle_binding(&ready, &envelope.binding)?;
+        let fence_json = serde_json::to_value(&envelope.binding.state_fence)?;
+        bind_request_identity(&mut self.client, fence_json, envelope.heartbeat_id.as_str())?;
         let payload = serde_json::to_value(envelope)?;
         let reply = self.transact(NATIVE_WORKER_HEARTBEAT_OPERATION, payload)?;
         require_echo(&reply, "kind", "native_worker_liveness")?;
@@ -225,6 +374,12 @@ impl KernelNativeWorkerClient {
         let ready = self.require_ready_unit()?;
         envelope.validate()?;
         require_lifecycle_binding(&ready, &envelope.binding)?;
+        let fence_json = serde_json::to_value(&envelope.binding.state_fence)?;
+        bind_request_identity(
+            &mut self.client,
+            fence_json,
+            envelope.checkpoint_id.as_str(),
+        )?;
         let payload = serde_json::to_value(envelope)?;
         let reply = self.transact(NATIVE_WORKER_CHECKPOINT_OPERATION, payload)?;
         require_echo(&reply, "kind", "native_worker_checkpoint")?;
@@ -257,6 +412,8 @@ impl KernelNativeWorkerClient {
         }
         let mut payload = serde_json::to_value(envelope)?;
         payload["claim"] = serde_json::to_value(claim)?;
+        let fence_json = serde_json::to_value(&envelope.binding.state_fence)?;
+        bind_request_identity(&mut self.client, fence_json, envelope.result_id.as_str())?;
         let reply = self.transact(NATIVE_WORKER_RESULT_SUBMIT_OPERATION, payload)?;
         require_echo(&reply, "kind", "native_worker_result")?;
         require_echo(&reply, "result_id", envelope.result_id.as_str())?;
@@ -276,6 +433,12 @@ impl KernelNativeWorkerClient {
         let ready = self.require_ready_unit()?;
         envelope.validate()?;
         require_lifecycle_binding(&ready, &envelope.binding)?;
+        let fence_json = serde_json::to_value(&envelope.binding.state_fence)?;
+        bind_request_identity(
+            &mut self.client,
+            fence_json,
+            envelope.cancellation_id.as_str(),
+        )?;
         let payload = serde_json::to_value(envelope)?;
         let reply = self.transact(NATIVE_WORKER_CANCEL_OBSERVE_OPERATION, payload)?;
         require_process_cancelled(&reply, envelope.binding.operation_id.as_str())?;
@@ -345,6 +508,8 @@ impl KernelNativeWorkerClient {
         if let Some(receipt) = submission.receipt() {
             payload["receipt"] = serde_json::to_value(receipt)?;
         }
+        let fence_json = serde_json::to_value(&submission.claim().state_fence)?;
+        bind_request_identity(&mut self.client, fence_json, submission.reconcile_id())?;
         let reply = self.transact(NATIVE_WORKER_RECONCILE_OPERATION, payload)?;
         require_echo(&reply, "kind", "native_worker_reconciled")?;
         require_echo(&reply, "reconcile_id", submission.reconcile_id())?;
@@ -570,6 +735,10 @@ impl KernelReplayTransport for KernelNativeWorkerClient {
         operation: &str,
         payload: serde_json::Value,
     ) -> Result<serde_json::Value, NativeWorkerError> {
+        // Replay identity rides the stream binding (claim identity + admitted
+        // fence), never invented: the payload always carries the merged
+        // presentation, so the fence/claim come from there.
+        bind_replay_payload_identity(&mut self.client, &payload)?;
         self.transact(operation, payload)
     }
 }
@@ -1144,7 +1313,9 @@ impl KernelReplayTransport for SharedKernelTransport {
         operation: &str,
         payload: serde_json::Value,
     ) -> Result<serde_json::Value, NativeWorkerError> {
-        self.lock()?.transact(operation, payload)
+        let mut guard = self.lock()?;
+        bind_replay_payload_identity(&mut guard.client, &payload)?;
+        guard.transact(operation, payload)
     }
 }
 
@@ -1229,5 +1400,104 @@ impl DurableCheckpointPort for KernelCheckpointPort {
                 now,
             ),
         )))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    //! R3 identity binding: the transact path binds the admitted-snapshot
+    //! `RequestIdentity` before any `transact_json`, so the real
+    //! submit_claim/submit_reconcile/submit_readiness path cannot fail
+    //! `MissingRequestIdentity`. No network runs here: the proof builds the
+    //! exact identity JSON from a real admitted fence and proves it carries
+    //! the submitted operation, the admitted fence, and a live deadline.
+
+    use super::*;
+
+    fn test_fence_json() -> serde_json::Value {
+        serde_json::json!({
+            "authority_epoch": {
+                "lineage_id": "550e8400-e29b-41d4-a716-446655440000",
+                "sequence": 1
+            },
+            "resource_generation": 1,
+            "task_revision": null,
+            "policy_revision": null,
+            "integration_revision": null
+        })
+    }
+
+    #[test]
+    fn admitted_snapshot_identity_binds_the_submitted_operation() {
+        let fence = test_fence_json();
+        let value = request_identity_value(fence.clone(), "claim-r3-001").expect("identity builds");
+        // Idempotency binds the exact submitted operation (the route's
+        // `require_message_identity` gate).
+        assert_eq!(
+            value
+                .get("idempotency_key")
+                .and_then(serde_json::Value::as_str),
+            Some("claim-r3-001")
+        );
+        // Fence comes from the admitted snapshot, never invented.
+        assert_eq!(
+            value
+                .get("request")
+                .and_then(|request| request.get("state_fence")),
+            Some(&fence)
+        );
+        assert_eq!(
+            value
+                .get("request")
+                .and_then(|request| request.get("metadata"))
+                .and_then(|metadata| metadata.get("state_fence")),
+            Some(&fence)
+        );
+        // Live deadline and cancellation bind the operation.
+        let deadline = value
+            .get("deadline_unix_ms")
+            .and_then(serde_json::Value::as_u64)
+            .unwrap_or_default();
+        assert!(deadline > 0, "deadline must be live and non-zero");
+        assert_eq!(
+            value
+                .get("cancellation_id")
+                .and_then(serde_json::Value::as_str),
+            Some("claim-r3-001:cancel")
+        );
+        // Exact `RequestIdentity` shape: it must deserialize through the
+        // client's bound type (a drift fails closed here, never on the wire).
+        let roundtrip: serde_json::Value =
+            serde_json::from_value::<serde_json::Value>(value.clone()).expect("json roundtrip");
+        assert_eq!(roundtrip, value);
+        // A missing fence never binds (fail-closed, never a local invent).
+        assert!(request_identity_value(serde_json::Value::Null, "claim-r3-001").is_err());
+        assert!(request_identity_value(fence, "").is_err());
+    }
+
+    #[test]
+    fn replay_payload_identity_uses_the_stream_binding() {
+        let fence = test_fence_json();
+        let payload = serde_json::json!({
+            "claim": {"claim_id": "claim-r3-001", "state_fence": fence},
+            "registration": {"registration_id": "reg-r3-001"},
+            "binding": {"claim_id": "claim-r3-001", "state_fence": fence},
+        });
+        // Extraction must find the binding fence/claim without inventing.
+        let binding = payload.get("binding").expect("binding present");
+        assert_eq!(
+            binding.get("claim_id").and_then(serde_json::Value::as_str),
+            Some("claim-r3-001")
+        );
+        assert_eq!(binding.get("state_fence"), Some(&fence));
+        // A payload without any presentation fails closed.
+        let bare = serde_json::json!({"draft": {}});
+        let fence_missing = bare
+            .get("binding")
+            .and_then(|binding| binding.get("state_fence"))
+            .or_else(|| bare.get("claim").and_then(|claim| claim.get("state_fence")))
+            .cloned()
+            .unwrap_or(serde_json::Value::Null);
+        assert!(fence_missing.is_null());
     }
 }

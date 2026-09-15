@@ -1570,11 +1570,11 @@ mod tests {
         ResourceGeneration, SessionId, SourceId,
     };
     use eliot_doctor_core::{
-        ArtifactBinding, AttemptIdentityBinding, DiagnosticBrief, EvaluationOutcome,
-        EvidenceHandle, IndependenceClass, IndependenceProfile, RegisteredOperation,
-        RepairAttemptIdentity, RepairClass, RepairEffectIdentity, RepairOperationRef, RepairRecipe,
-        RepairRecipeIdentity, RepairRecipeManifest, ScopeAttestation, VerificationExecution,
-        VerificationReport, VerifierEvidence,
+        ArtifactBinding, AttemptIdentityBinding, BindingArg, DiagnosticBrief, EvaluationOutcome,
+        EvidenceHandle, ExecutableBinding, IndependenceClass, IndependenceProfile,
+        RegisteredOperation, RepairAttemptIdentity, RepairClass, RepairEffectIdentity,
+        RepairOperationRef, RepairRecipe, RepairRecipeIdentity, RepairRecipeManifest,
+        ScopeAttestation, VerificationExecution, VerificationReport, VerifierEvidence,
     };
     use eliot_protocol::RequestIdentity;
     use eliot_receipts::RequestBinding;
@@ -1832,7 +1832,24 @@ mod tests {
         time::OffsetDateTime::from_unix_timestamp(2_000_000_000).expect("future deadline")
     }
 
+    fn test_binding() -> ExecutableBinding {
+        let binding = ExecutableBinding {
+            artifact_digest: "a".repeat(64),
+            program: "eliot-doctor.exe".to_owned(),
+            argv: vec![BindingArg::Literal {
+                value: "--version".to_owned(),
+            }],
+            env: BTreeMap::new(),
+            timeout_ms: 5_000,
+            max_stdout_bytes: 65_536,
+            max_stderr_bytes: 65_536,
+        };
+        binding.validate().expect("test binding validates");
+        binding
+    }
+
     fn manifest() -> RepairRecipeManifest {
+        let binding = test_binding();
         RepairRecipeManifest {
             manifest_id: "test-manifest".to_owned(),
             manifest_revision: 1,
@@ -1840,7 +1857,8 @@ mod tests {
                 operation_id: "test-operation".to_owned(),
                 adapter_id: "test-adapter".to_owned(),
                 description: "test operation".to_owned(),
-                definition_digest: sha256_hex(b"test-operation-definition"),
+                definition_digest: binding.digest(),
+                binding,
             }],
         }
     }
@@ -1862,6 +1880,9 @@ mod tests {
             attempt_budget: 1,
             cooldown: time::Duration::ZERO,
             stop_conditions: vec!["test-stop".to_owned()],
+            executable_bindings: [("test-operation".to_owned(), test_binding())]
+                .into_iter()
+                .collect(),
         }
     }
 

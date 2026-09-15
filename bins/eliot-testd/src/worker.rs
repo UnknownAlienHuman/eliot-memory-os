@@ -129,6 +129,19 @@ pub fn drive_admitted_one_shot<E: ProcessExecutor + 'static>(
                 .to_owned(),
         ));
     }
+    // Closed-profile Drive gate (issue #20): only the admitted tool-probe
+    // profile drives, and it takes no caller arguments: the fixed argv
+    // comes from the registry binding, never from the invocation.
+    if !eliot_testd_core::is_admitted_testd_profile(&presented.invocation.profile) {
+        return Err(TestdError::Contract(
+            "testd admits only the closed cargo-test tool-probe profile".to_owned(),
+        ));
+    }
+    if !presented.invocation.arguments.is_empty() {
+        return Err(TestdError::Contract(
+            "the admitted profile takes fixed argv; caller arguments are refused".to_owned(),
+        ));
+    }
     if !presented
         .epoch
         .is_same_authority(&presented.request.authority_epoch)

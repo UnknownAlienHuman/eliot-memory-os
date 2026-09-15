@@ -61,23 +61,21 @@
 //! - The concrete [`ProcessRequest`][eliot_process::ProcessRequest]: it is
 //!   `Serialize`-only by design (neither `Clone` nor `Deserialize`;
 //!   `crates/kernel/eliot-process/src/lib.rs`), so the kernel never
-//!   serializes it into the file and this child never deserializes it.
-//! - The [`ProcessIntent`][eliot_process::ProcessIntent] that issuance
-//!   requires: `ProcessIntent::new` needs an executable path plus hex
-//!   digest, argv, working directory, environment projection, and resource
-//!   limits, and the admitted material carries none of those bindings (the
-//!   envelope is `{job_id, operation_id, cancellation, fence}` only;
-//!   `crates/kernel/eliot-kernel-service/src/testd_front_door.rs`). No
-//!   registry in this binary maps an admitted profile to an executable
-//!   binding, and none is invented here.
-//! - The broker-mirror dispatch authority: `DispatchValidationContext::new`
-//!   requires `eliot_platform::ClockObservation`
-//!   (`crates/kernel/eliot-process/src/lib.rs`), and this composition root
-//!   has no `eliot-platform` dependency and takes none. Any
-//!   `validate_and_consume` without that context would forge validation.
+//!   serializes it into the file and this child never deserializes it. The
+//!   [`ProcessIntent`][eliot_process::ProcessIntent] for the single start
+//!   is derived in the crate root from the admitted profile binding (closed
+//!   registry in `eliot-testd-core` plus the installed tool file hash),
+//!   never from delivered executable authority.
+//! - The broker-mirror dispatch authority: it lives in the crate root
+//!   (`TestdDispatchAuthority`), built over a real
+//!   `eliot_platform::ClockObservation` exactly like the broker/doctor, and
+//!   consumes the validated grant below. Any `validate_and_consume`
+//!   without that context would forge validation.
 //!
-//! Until those two bindings land, even a validated file cannot drive: the
-//! entry keeps the fail-closed path and names both residuals exactly.
+//! With those bindings landed, a validated file drives the bounded admitted
+//! probe: the admission already binds the closed profile record, the grant
+//! already rebuilds through the broker constructors, and the Drive derives
+//! the intent from the binding plus the installed tool bytes.
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -184,7 +182,11 @@ pub struct TestdMaterialEnvelope {
 /// names; canonical owner: `testd_front_door.rs`). Its `operation_id` is the
 /// bounded evidence handle the future drive maps to
 /// `PresentedAdmission.evidence_ref`, and `cancelled` maps to
-/// `PresentedAdmission.cancelled`.
+/// `PresentedAdmission.cancelled`. The admitted profile record (`profile`
+/// plus `profile_binding_digest`) rides here: the closed envelope stays
+/// `{job_id, operation_id, cancellation, fence}`, and the executable
+/// binding (relative program, fixed argv, environment allowlist,
+/// timeout/output caps) is bound through this record's digest instead.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct TestdMaterialAdmission {
@@ -199,6 +201,13 @@ pub struct TestdMaterialAdmission {
     /// Admitted operation. Cancelled admissions carry the presented
     /// operation but bind no process identity.
     pub operation_id: String,
+    /// Admitted testd profile. Exactly one profile is admitted in this
+    /// slice; anything else is refused.
+    pub profile: String,
+    /// Canonical definition digest over the static admitted profile
+    /// fields. The per-host installed artifact digest binds later at Drive
+    /// time through the intent's `executable_sha256`.
+    pub profile_binding_digest: String,
     /// Whether the job was admitted cancelled; cancelled admissions never
     /// stage execution work.
     pub cancelled: bool,
@@ -226,16 +235,20 @@ struct TestdMaterialFile {
 ///
 /// Internal consistency only: every cross-field identity in the file is
 /// re-proved (digests, wire pair, byte-identity, epoch/generation/nonce
-/// binding, grant proof, freshness). The live-bootstrap agreement (presented
-/// epoch against the authenticated Kernel epoch) is owned by the future
-/// drive seam, which carries the live epoch; this value exposes `epoch` and
-/// `generation` for exactly that proof.
+/// binding, grant proof, freshness, admitted profile record). The live-bootstrap
+/// agreement (presented epoch against the authenticated Kernel epoch) is
+/// owned by the future drive seam, which carries the live epoch; this value
+/// exposes `epoch` and `generation` for exactly that proof.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ValidatedTestdMaterial {
     /// Admitted testd job identity.
     pub job_id: String,
     /// Admitted operation: the bounded evidence handle for the future drive.
     pub operation_id: String,
+    /// Admitted testd profile (exactly one is admitted).
+    pub profile: String,
+    /// Canonical definition digest over the static admitted profile fields.
+    pub profile_binding_digest: String,
     /// Canonical digest of the exact admitted request envelope.
     pub request_digest: String,
     /// Canonical digest of the admission receipt.
@@ -250,6 +263,9 @@ pub struct ValidatedTestdMaterial {
     /// Re-proved grant digest binding the grant fields plus the admission
     /// identity digest.
     pub grant_digest: String,
+    /// Validated Kernel-issued launch grant; the dispatch authority
+    /// consumes exactly this value at issuance time.
+    pub grant: DispatchGrant,
     /// Rebuilt fence from the validated grant (broker constructors).
     pub fence: FencingToken,
     /// Whether the job was admitted cancelled; cancelled admissions never
@@ -422,13 +438,16 @@ fn validate_material(
     let (fence, _lease) = validate_grant(&file.grant, &file.admission, now_unix_ms)?;
     Ok(ValidatedTestdMaterial {
         job_id: file.request.job_id,
-        operation_id: file.admission.operation_id,
+        operation_id: file.admission.operation_id.clone(),
+        profile: file.admission.profile.clone(),
+        profile_binding_digest: file.admission.profile_binding_digest.clone(),
         request_digest: file.admission.request_digest,
         admission_digest: file.admission.admission_digest,
         epoch: file.epoch,
         generation: file.generation,
         nonce: file.nonce,
-        grant_digest: file.grant.grant_digest,
+        grant_digest: file.grant.grant_digest.clone(),
+        grant: file.grant,
         fence,
         cancelled: file.admission.cancelled,
     })
@@ -466,8 +485,8 @@ fn validate_request(request: &TestdMaterialRequest) -> Result<(), TestdMaterialE
 }
 
 /// Validates the admission receipt: wire pair, job/digest echo of the
-/// request, non-zero admission time, and canonical digest over the exact
-/// kernel canonical fields.
+/// request, admitted profile record, non-zero admission time, and canonical
+/// digest over the exact kernel canonical fields.
 fn validate_admission(
     admission: &TestdMaterialAdmission,
     request: &TestdMaterialRequest,
@@ -481,6 +500,25 @@ fn validate_admission(
     }
     validate_wire_text(&admission.job_id, "testd_material.job_id")?;
     validate_wire_text(&admission.operation_id, "testd_material.operation_id")?;
+    // Admitted profile record: exactly one profile is admitted, and its
+    // definition digest must equal the closed registry digest. A
+    // substituted profile or widened binding fails here, before any drive.
+    if admission.profile != eliot_testd_core::TESTD_ADMITTED_PROFILE {
+        return Err(TestdMaterialError::Contract(
+            "testd admits only the closed cargo-test tool-probe profile".to_owned(),
+        ));
+    }
+    validate_wire_digest(
+        &admission.profile_binding_digest,
+        "testd_material.profile_binding_digest",
+    )?;
+    let expected_binding = eliot_testd_core::testd_definition_digest()
+        .map_err(|error| TestdMaterialError::Contract(truncate_detail(&error.to_string())))?;
+    if admission.profile_binding_digest != expected_binding {
+        return Err(TestdMaterialError::Contract(
+            "testd_material.profile_binding_digest mismatch".to_owned(),
+        ));
+    }
     if admission.job_id != request.job_id {
         return Err(TestdMaterialError::Contract(
             "testd admission job disagrees with the request job".to_owned(),
@@ -655,7 +693,7 @@ impl TestdMaterialRequest {
 
 impl TestdMaterialAdmission {
     /// Computes the canonical admission digest (exact kernel canonical
-    /// fields).
+    /// fields, including the admitted profile record).
     fn compute_digest(&self) -> Result<String, TestdMaterialError> {
         #[derive(Serialize)]
         struct Canonical<'a> {
@@ -664,6 +702,8 @@ impl TestdMaterialAdmission {
             job_id: &'a str,
             request_digest: &'a str,
             operation_id: &'a str,
+            profile: &'a str,
+            profile_binding_digest: &'a str,
             cancelled: bool,
             admitted_at_unix_nanos: u64,
         }
@@ -673,6 +713,8 @@ impl TestdMaterialAdmission {
             job_id: &self.job_id,
             request_digest: &self.request_digest,
             operation_id: &self.operation_id,
+            profile: &self.profile,
+            profile_binding_digest: &self.profile_binding_digest,
             cancelled: self.cancelled,
             admitted_at_unix_nanos: self.admitted_at_unix_nanos,
         };

@@ -66,16 +66,6 @@ pub const EXIT_EVIDENCE_FLUSH_FAILED: i32 = 74;
 /// and for any caller-supplied authority. Fail-closed without effect.
 pub const EXIT_KERNEL_ADMISSION_REQUIRED: i32 = 78;
 
-/// Residual naming the concurrent Slice 2 owner of the concrete
-/// authenticated Kernel Doctor IPC binding.
-pub const SLICE2_KERNEL_BINDING_RESIDUAL: &str =
-    "issue-461 slice-2 authenticated kernel doctor ipc binding";
-/// Residual naming the shared governed physical contour this adapter
-/// executes through once Slice 2 binds it: the `eliot-process`
-/// `ProcessExecutor` contract with the Windows executor behind the
-/// issue-100 dispatch-validation port.
-pub const PROCESS_CONTOUR_RESIDUAL: &str = "shared governed process contour: eliot-process ProcessExecutor via the windows executor (#100 dispatch validation port)";
-
 /// Effect sequence bound by this adapter. Single-effect attempts only: a
 /// rollback or compensation is another registered effect under a new
 /// admission, never a second sequence number here.
@@ -270,9 +260,7 @@ pub fn help_text() -> String {
          exit 10: effect completed, pending independent verification\n\
          exit 11: effect failed; 12: partial; 13: unknown effect outcome; 14: reconciling\n\
          exit 15: quarantined; 70: internal fail-closed violation\n\
-         exit 74: result/evidence emission failed; 78: kernel admission required\n\
-         residual: {SLICE2_KERNEL_BINDING_RESIDUAL}\n\
-         contour: {PROCESS_CONTOUR_RESIDUAL}\n"
+         exit 74: result/evidence emission failed; 78: kernel admission required\n"
     )
 }
 
@@ -282,12 +270,11 @@ pub fn version_line() -> String {
     format!("{CONTRACT_NAME} {CONTRACT_VERSION}")
 }
 
-/// Renders the stable admission-required stderr line with the detail and
-/// the residuals that name the missing Slice 2 seam.
+/// Renders the stable admission-required stderr line with the detail.
 #[must_use]
 pub fn admission_required_line(detail: &str) -> String {
     format!(
-        "{KERNEL_ADMISSION_REQUIRED}: operation={CONTRACT_NAME} version={CONTRACT_VERSION} detail={detail} residual={SLICE2_KERNEL_BINDING_RESIDUAL} contour={PROCESS_CONTOUR_RESIDUAL}"
+        "{KERNEL_ADMISSION_REQUIRED}: operation={CONTRACT_NAME} version={CONTRACT_VERSION} detail={detail}"
     )
 }
 
@@ -1051,8 +1038,8 @@ mod tests {
     use super::*;
     use eliot_contracts::{EpochId, EpochLineageId};
     use eliot_doctor_core::{
-        ClosedRequestParams, DiagnosticBrief, RecoveryLease, RegisteredOperation, RepairRecipe,
-        StateFence,
+        BindingArg, ClosedRequestParams, DiagnosticBrief, ExecutableBinding, RecoveryLease,
+        RegisteredOperation, RepairRecipe, StateFence,
     };
     use std::num::NonZeroU64;
     use time::Duration;
@@ -1085,6 +1072,22 @@ mod tests {
         }
     }
 
+    fn test_binding() -> ExecutableBinding {
+        let binding = ExecutableBinding {
+            artifact_digest: digest(0xc1),
+            program: "eliot-doctor.exe".to_owned(),
+            argv: vec![BindingArg::Literal {
+                value: "--version".to_owned(),
+            }],
+            env: std::collections::BTreeMap::new(),
+            timeout_ms: 5_000,
+            max_stdout_bytes: 65_536,
+            max_stderr_bytes: 65_536,
+        };
+        binding.validate().expect("test binding validates");
+        binding
+    }
+
     fn test_recipe(class: RepairClass) -> RepairRecipe {
         let (operations, allowed_effects) = match class {
             RepairClass::DiagnoseOnly => (Vec::new(), BTreeSet::new()),
@@ -1092,6 +1095,12 @@ mod tests {
                 vec!["op-reconnect".to_owned()],
                 BTreeSet::from(["op-reconnect".to_owned()]),
             ),
+        };
+        let executable_bindings = match class {
+            RepairClass::DiagnoseOnly => std::collections::BTreeMap::new(),
+            _ => [("op-reconnect".to_owned(), test_binding())]
+                .into_iter()
+                .collect(),
         };
         RepairRecipe {
             recipe_id: "recipe-1".to_owned(),
@@ -1109,10 +1118,12 @@ mod tests {
             attempt_budget: 3,
             cooldown: Duration::seconds(60),
             stop_conditions: Vec::new(),
+            executable_bindings,
         }
     }
 
     fn test_manifest() -> RepairRecipeManifest {
+        let binding = test_binding();
         RepairRecipeManifest {
             manifest_id: "manifest-1".to_owned(),
             manifest_revision: 1,
@@ -1120,7 +1131,8 @@ mod tests {
                 operation_id: "op-reconnect".to_owned(),
                 adapter_id: "automatic-safe".to_owned(),
                 description: "reconnect one admitted generation".to_owned(),
-                definition_digest: digest(0xd1),
+                definition_digest: binding.digest(),
+                binding,
             }],
         }
     }

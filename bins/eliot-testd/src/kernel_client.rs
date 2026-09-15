@@ -38,9 +38,11 @@
 //!   only where the contour requires an existing root; they never decide
 //!   admission, replay, or reconciliation.
 //!
-//! Until the T6-X2 dispatch contour lands, the client fails closed after
-//! the authenticated bootstrap instead of inventing admission material
-//! ([`TESTD_DISPATCH_RESIDUAL`]).
+//! Until the live Kernel dispatch contour lands, the client fails closed
+//! after the authenticated bootstrap instead of inventing admission
+//! material: `connect` reports the closed bootstrap and `advertise_testd`
+//! stays unadvertised, while the Drive path below already derives its
+//! executable binding from the admitted profile registry.
 
 use std::sync::Arc;
 
@@ -65,13 +67,6 @@ pub const TESTD_ADMISSION_OPERATION_VERSION: u16 = 1;
 /// slice lands. Testd fails closed with `KERNEL_ADMISSION_REQUIRED` while
 /// this is `false`.
 pub const TESTD_ADMISSION_ADVERTISED: bool = false;
-
-/// Residual naming the follow-up contour that delivers the session-bound
-/// admission envelope plus the concrete IPC-delivered [`ProcessRequest`] to
-/// a live one-shot invocation. Until it lands, the binary fails closed
-/// after the authenticated bootstrap instead of inventing admission
-/// material.
-pub const TESTD_DISPATCH_RESIDUAL: &str = "issue-20 slice-6 follow-up: kernel dispatch contour delivering the session-bound TestdAdmissionRequest envelope, live epoch, and concrete ProcessRequest to the one-shot testd invocation";
 
 /// Returns whether Kernel currently advertises the testd admission
 /// operation.
@@ -521,13 +516,14 @@ impl KernelTestdIpcClient {
     /// probes health. Retains the live authority epoch echoed by the
     /// authenticated health reply for the lineage-aware identity binding.
     ///
-    /// Until the T6-X2 dispatch contour lands, this fails closed without
+    /// Until the live Kernel dispatch contour lands, this fails closed without
     /// opening ambient state: there is no session-bound admission to bind,
     /// so inventing one would manufacture authority.
     pub fn connect() -> Result<Self, TestdIpcError> {
-        Err(TestdIpcError::Transport(format!(
-            "protected testd front door requires the authenticated dispatch contour; residual={TESTD_DISPATCH_RESIDUAL}"
-        )))
+        Err(TestdIpcError::Transport(
+            "protected testd front door requires the authenticated dispatch contour (live Kernel bootstrap plus advertised testd operation)"
+                .to_owned(),
+        ))
     }
 
     /// Returns the live authority epoch retained from the authenticated
@@ -882,6 +878,25 @@ pub enum TestdDriveOutcome {
     },
 }
 
+/// Closed-profile Drive gate (issue #20): only the admitted tool-probe
+/// profile drives, and it takes no caller arguments: the fixed argv comes
+/// from the registry binding (see `eliot_testd_core`), never from the
+/// invocation. Anything else fails closed before any submit or process
+/// start.
+fn check_drive_profile(invocation: &InstrumentInvocation) -> Result<(), TestdIpcError> {
+    if !eliot_testd_core::is_admitted_testd_profile(&invocation.profile) {
+        return Err(TestdIpcError::Contract(
+            "testd admits only the closed cargo-test tool-probe profile".to_owned(),
+        ));
+    }
+    if !invocation.arguments.is_empty() {
+        return Err(TestdIpcError::Contract(
+            "the admitted profile takes fixed argv; caller arguments are refused".to_owned(),
+        ));
+    }
+    Ok(())
+}
+
 /// Reconciles one unknown testd admission delivery without admitting again.
 ///
 /// Lost-reply path: the caller retains a previously returned admission and,
@@ -959,6 +974,7 @@ where
             job_id: request.job_id.clone(),
         });
     }
+    check_drive_profile(&invocation)?;
     validate_process_binding(&process, &invocation, &epoch, request.generation)?;
     let response = transport
         .submit_testd_admission(&request)

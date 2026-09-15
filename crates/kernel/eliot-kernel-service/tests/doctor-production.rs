@@ -29,8 +29,9 @@ use std::sync::Mutex;
 
 use eliot_contracts::{EpochId, EpochLineageId};
 use eliot_doctor_core::{
-    ClosedRepairRequest, ClosedRequestParams, DiagnosticBrief, EvidenceHandle, RecoveryLease,
-    RegisteredOperation, RepairClass, RepairRecipe, RepairRecipeManifest, StateFence,
+    BindingArg, ClosedRepairRequest, ClosedRequestParams, DiagnosticBrief, EvidenceHandle,
+    ExecutableBinding, RecoveryLease, RegisteredOperation, RepairClass, RepairRecipe,
+    RepairRecipeManifest, StateFence,
 };
 use eliot_kernel_service::{
     DOCTOR_REPAIR_WIRE_ID, DOCTOR_REPAIR_WIRE_VERSION, DoctorAdmissionContext,
@@ -291,7 +292,24 @@ fn fixture_time<T: DeserializeOwned>(value: serde_json::Value) -> T {
     serde_json::from_value(value).expect("fixture time value")
 }
 
+fn test_binding() -> ExecutableBinding {
+    let binding = ExecutableBinding {
+        artifact_digest: "a".repeat(64),
+        program: "eliot-doctor.exe".to_owned(),
+        argv: vec![BindingArg::Literal {
+            value: "--version".to_owned(),
+        }],
+        env: std::collections::BTreeMap::new(),
+        timeout_ms: 5_000,
+        max_stdout_bytes: 65_536,
+        max_stderr_bytes: 65_536,
+    };
+    binding.validate().expect("test binding validates");
+    binding
+}
+
 fn manifest() -> RepairRecipeManifest {
+    let binding = test_binding();
     RepairRecipeManifest {
         manifest_id: "manifest".to_owned(),
         manifest_revision: 1,
@@ -299,7 +317,8 @@ fn manifest() -> RepairRecipeManifest {
             operation_id: "restart".to_owned(),
             adapter_id: "adapter".to_owned(),
             description: "restart the component".to_owned(),
-            definition_digest: "c".repeat(64),
+            definition_digest: binding.digest(),
+            binding,
         }],
     }
 }
@@ -321,6 +340,9 @@ fn auto_recipe() -> RepairRecipe {
         attempt_budget: 8,
         cooldown: fixture_time(serde_json::json!([30, 0])),
         stop_conditions: vec!["stop".to_owned()],
+        executable_bindings: [("restart".to_owned(), test_binding())]
+            .into_iter()
+            .collect(),
     }
 }
 
@@ -340,6 +362,7 @@ fn diagnose_recipe() -> RepairRecipe {
         repair_class: RepairClass::DiagnoseOnly,
         allowed_effects: std::collections::BTreeSet::new(),
         operations: Vec::new(),
+        executable_bindings: std::collections::BTreeMap::new(),
         ..auto_recipe()
     }
 }

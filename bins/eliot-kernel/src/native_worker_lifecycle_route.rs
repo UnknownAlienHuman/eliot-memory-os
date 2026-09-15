@@ -340,6 +340,111 @@ pub(crate) fn require_digest(
     Ok(digest)
 }
 
+/// Checks one `authority_epoch` field against its fence, accepting both wire
+/// contours on the single shape (Implements #22 R2).
+///
+/// The Kernel-service wire carries the epoch as a scalar sequence
+/// (`Implements #64` bridge: sequence must equal the fence tuple sequence,
+/// lineage via the fence). The worker-core single shape
+/// (`ClaimAdmissionRequest`) carries the full `EpochId` object, which must be
+/// the exact same authority as the fence epoch (`is_same_authority`, never a
+/// raw sequence compare). Both enforce the exact-tuple rule; mixed
+/// representations fail closed.
+fn check_authority_epoch_against_fence(
+    container: &serde_json::Value,
+    field: &'static str,
+    fence: &StateFence,
+) -> Result<(), NativeWorkerRouteError> {
+    let epoch_value = container
+        .get(field)
+        .ok_or(NativeWorkerRouteError::Shape { field })?;
+    if epoch_value.is_number() || epoch_value.is_string() {
+        let sequence = native_worker_json_u64(container, field)?;
+        if fence.authority_epoch.sequence.get() != sequence {
+            return Err(NativeWorkerRouteError::Fence {
+                field: "epoch_fence",
+            });
+        }
+        return Ok(());
+    }
+    if epoch_value.is_object() {
+        let epoch: EpochId = serde_json::from_value(epoch_value.clone())
+            .map_err(|_| NativeWorkerRouteError::Shape { field })?;
+        if !epoch.is_same_authority(&fence.authority_epoch) {
+            return Err(NativeWorkerRouteError::Fence {
+                field: "epoch_fence",
+            });
+        }
+        return Ok(());
+    }
+    Err(NativeWorkerRouteError::Shape { field })
+}
+
+/// Compares two `authority_epoch` halves for the split binding, accepting both
+/// contours (scalar-scalar, object-object via exact-tuple, or mixed via
+/// sequence). A lineage mismatch on object-object fails closed.
+fn check_split_epoch_agreement(
+    claim: &serde_json::Value,
+    registration: &serde_json::Value,
+) -> Result<(), NativeWorkerRouteError> {
+    let claim_epoch = claim
+        .get("authority_epoch")
+        .ok_or(NativeWorkerRouteError::Shape {
+            field: "authority_epoch",
+        })?;
+    let registration_epoch =
+        registration
+            .get("authority_epoch")
+            .ok_or(NativeWorkerRouteError::Shape {
+                field: "authority_epoch",
+            })?;
+    if claim_epoch == registration_epoch {
+        // Same JSON (scalar-scalar or identical objects) binds. For objects
+        // this already implies the exact tuple; the fence equality below
+        // re-proves lineage.
+        return Ok(());
+    }
+    // Mixed or differing representations: fall back to sequence agreement so
+    // the single shape stays interoperable during the transition. Object
+    // halves additionally require lineage agreement via their fences (checked
+    // by the caller through fence equality plus the fence-epoch checks).
+    let claim_sequence = if claim_epoch.is_number() || claim_epoch.is_string() {
+        native_worker_json_u64(claim, "authority_epoch")?
+    } else if claim_epoch.is_object() {
+        serde_json::from_value::<EpochId>(claim_epoch.clone())
+            .map_err(|_| NativeWorkerRouteError::Shape {
+                field: "authority_epoch",
+            })?
+            .sequence
+            .get()
+    } else {
+        return Err(NativeWorkerRouteError::Shape {
+            field: "authority_epoch",
+        });
+    };
+    let registration_sequence = if registration_epoch.is_number() || registration_epoch.is_string()
+    {
+        native_worker_json_u64(registration, "authority_epoch")?
+    } else if registration_epoch.is_object() {
+        serde_json::from_value::<EpochId>(registration_epoch.clone())
+            .map_err(|_| NativeWorkerRouteError::Shape {
+                field: "authority_epoch",
+            })?
+            .sequence
+            .get()
+    } else {
+        return Err(NativeWorkerRouteError::Shape {
+            field: "authority_epoch",
+        });
+    };
+    if claim_sequence != registration_sequence {
+        return Err(NativeWorkerRouteError::Fence {
+            field: "epoch_fence",
+        });
+    }
+    Ok(())
+}
+
 /// Exact lifecycle binding every heartbeat/checkpoint/result/cancel message
 /// must carry (Wave-A `NativeLifecycleBinding` projection).
 #[derive(Clone, Debug)]
@@ -688,13 +793,7 @@ impl KernelComposition {
             serde_json::from_value(fence_value).map_err(|_| NativeWorkerRouteError::Shape {
                 field: "state_fence",
             })?;
-        if fence.authority_epoch.sequence.get()
-            != native_worker_json_u64(payload, "authority_epoch")?
-        {
-            return Err(NativeWorkerRouteError::Fence {
-                field: "epoch_fence",
-            });
-        }
+        check_authority_epoch_against_fence(payload, "authority_epoch", &fence)?;
         Ok((registration_id, worker_generation))
     }
 
@@ -742,47 +841,61 @@ impl KernelComposition {
 
     /// Validates the closed claim shape: wire, digests, texts, budget, fence.
     ///
+    /// Single-shape contour (Implements #22 R2): validates the SAME claim
+    /// shape the child submits (`ClaimAdmissionRequest` worker-core halves).
+    /// Kernel-service-only envelope fields (`wire_id`, `protocol_version`,
+    /// `execution_unit_schema_version`, `installation_id`,
+    /// `worker_artifact_digest`, `worker_config_digest`, `request_digest`)
+    /// are required when present (old wire) and sourced from the presenting
+    /// registration when absent (worker-core single shape, by construction).
+    /// Budget, fence, epoch exact-tuple, and v1/v2 executable-join rules run
+    /// identically on both contours.
+    ///
     /// Both claim-wire revisions parse here (Implements #22): wire v1 carries
     /// no executable join and is refused later at the executable gate with the
     /// typed `u1_old_wire_without_executable_binding` disposition, never
     /// promoted; wire v2 must carry the join (checked in
-    /// [`Self::build_claim_request`]).
+    /// [`Self::build_claim_request`] and [`Self::build_single_shape_request`]).
     pub(crate) fn validate_native_worker_claim(
         payload: &serde_json::Value,
     ) -> Result<(String, String, u64), NativeWorkerRouteError> {
-        let wire = payload
-            .get("wire_id")
-            .and_then(serde_json::Value::as_str)
-            .ok_or(NativeWorkerRouteError::Shape { field: "wire_id" })?;
+        // `wire_id` is required on the old wire and implicit on the single
+        // shape (worker-core carries no wire id; the route pins it).
+        if let Some(wire) = payload.get("wire_id").and_then(serde_json::Value::as_str) {
+            if wire != NATIVE_WORKER_CLAIM_WIRE_ID {
+                return Err(NativeWorkerRouteError::Shape { field: "wire" });
+            }
+        }
         let wire_version = native_worker_json_u16(payload, "wire_version")?;
-        if wire != NATIVE_WORKER_CLAIM_WIRE_ID
-            || (wire_version != NATIVE_WORKER_CLAIM_WIRE_VERSION
-                && wire_version != NATIVE_WORKER_CLAIM_WIRE_VERSION_V1)
+        if wire_version != NATIVE_WORKER_CLAIM_WIRE_VERSION
+            && wire_version != NATIVE_WORKER_CLAIM_WIRE_VERSION_V1
         {
             return Err(NativeWorkerRouteError::Shape { field: "wire" });
         }
-        let protocol = payload
+        // Protocol/schema pins ride the registration on the single shape;
+        // when the claim carries them (old wire) they must agree.
+        if let Some(protocol) = payload
             .get("protocol_version")
             .and_then(serde_json::Value::as_str)
-            .ok_or(NativeWorkerRouteError::Shape {
-                field: "protocol_version",
-            })?;
-        if protocol != NATIVE_WORKER_PROTOCOL_VERSION {
-            return Err(NativeWorkerRouteError::Shape {
-                field: "protocol_version",
-            });
-        }
-        if native_worker_json_u16(payload, "execution_unit_schema_version")?
-            != NATIVE_WORKER_EXECUTION_UNIT_SCHEMA_VERSION
         {
-            return Err(NativeWorkerRouteError::Shape {
-                field: "execution_unit_schema_version",
-            });
+            if protocol != NATIVE_WORKER_PROTOCOL_VERSION {
+                return Err(NativeWorkerRouteError::Shape {
+                    field: "protocol_version",
+                });
+            }
+        }
+        if let Some(schema) = payload.get("execution_unit_schema_version") {
+            let version = native_worker_json_u16(payload, "execution_unit_schema_version")?;
+            if version != NATIVE_WORKER_EXECUTION_UNIT_SCHEMA_VERSION {
+                return Err(NativeWorkerRouteError::Shape {
+                    field: "execution_unit_schema_version",
+                });
+            }
+            let _ = schema;
         }
         let claim_id = require_op_id(payload, "claim_id")?;
         for field in [
             "registration_id",
-            "installation_id",
             "parent_job_id",
             "task_id",
             "work_scope_id",
@@ -796,13 +909,22 @@ impl KernelComposition {
         ] {
             require_claim_text(payload, field)?;
         }
-        for field in [
-            "worker_artifact_digest",
-            "worker_config_digest",
-            "binding_digest",
-            "request_digest",
-        ] {
-            require_digest(payload, field)?;
+        // Single-shape optionals: present on the old wire, absent on
+        // worker-core (sourced from the registration by construction).
+        if payload.get("installation_id").is_some() {
+            require_claim_text(payload, "installation_id")?;
+        }
+        for field in ["worker_artifact_digest", "worker_config_digest"] {
+            if payload.get(field).is_some() {
+                require_digest(payload, field)?;
+            }
+        }
+        // `binding_digest` is always required (the strongest local anchor);
+        // `request_digest` only on the old wire (computed by the single-shape
+        // builder).
+        require_digest(payload, "binding_digest")?;
+        if payload.get("request_digest").is_some() {
+            require_digest(payload, "request_digest")?;
         }
         let worker_generation = require_nonzero_u64(payload, "worker_generation")?;
         require_nonzero_u64(payload, "expected_result_schema_version")?;
@@ -830,13 +952,7 @@ impl KernelComposition {
             serde_json::from_value(fence_value).map_err(|_| NativeWorkerRouteError::Shape {
                 field: "state_fence",
             })?;
-        if fence.authority_epoch.sequence.get()
-            != native_worker_json_u64(payload, "authority_epoch")?
-        {
-            return Err(NativeWorkerRouteError::Fence {
-                field: "epoch_fence",
-            });
-        }
+        check_authority_epoch_against_fence(payload, "authority_epoch", &fence)?;
         let binding_digest = require_digest(payload, "binding_digest")?;
         Ok((claim_id, binding_digest, worker_generation))
     }
@@ -1002,6 +1118,215 @@ impl KernelComposition {
             binding_digest: require_digest(claim, "binding_digest")?,
             request_digest: require_digest(claim, "request_digest")?,
         })
+    }
+
+    /// Builds the typed service request from the single shape the child
+    /// submits (Implements #22 R2).
+    ///
+    /// The child submits `ClaimAdmissionRequest` worker-core halves
+    /// (`{claim, registration}` with full `EpochId` objects and no
+    /// Kernel-service envelope duplication). The service owner needs the full
+    /// `NativeWorkerClaimRequest` (wire id, installation/artifact/config,
+    /// protocol/schema, request digest). Those ride the presenting
+    /// registration on the single shape and are projected here by
+    /// construction; when the claim carries them (old wire) they must equal
+    /// the registration (resource binding, checked by the caller). The epoch
+    /// accepts both contours (scalar via the fence lineage, object via exact
+    /// tuple). Budget, fence, v1/v2 join, and binding rules run identically
+    /// to [`Self::build_claim_request`]; the request digest is computed (it
+    /// covers the projected envelope and is not carried on the single shape).
+    pub(crate) fn build_single_shape_request(
+        claim: &serde_json::Value,
+        registration: &serde_json::Value,
+    ) -> Result<NativeWorkerClaimRequest, NativeWorkerRouteError> {
+        let budget_value = claim
+            .get("budget")
+            .filter(|budget| budget.is_object())
+            .ok_or(NativeWorkerRouteError::Shape { field: "budget" })?;
+        let budget = NativeWorkerClaimBudget {
+            context_tokens: require_nonzero_u64(budget_value, "context_tokens")?,
+            wall_time_ms: require_nonzero_u64(budget_value, "wall_time_ms")?,
+            output_bytes: require_nonzero_u64(budget_value, "output_bytes")?,
+            cost_microunits: require_nonzero_u64(budget_value, "cost_microunits")?,
+            max_depth: native_worker_json_u16(budget_value, "max_depth").and_then(|depth| {
+                if depth == 0 {
+                    Err(NativeWorkerRouteError::Shape { field: "max_depth" })
+                } else {
+                    Ok(depth)
+                }
+            })?,
+            max_descendants: native_worker_json_u32(budget_value, "max_descendants")?,
+        };
+        let fence_value =
+            claim
+                .get("state_fence")
+                .cloned()
+                .ok_or(NativeWorkerRouteError::Shape {
+                    field: "state_fence",
+                })?;
+        let fence: StateFence =
+            serde_json::from_value(fence_value).map_err(|_| NativeWorkerRouteError::Shape {
+                field: "state_fence",
+            })?;
+        check_authority_epoch_against_fence(claim, "authority_epoch", &fence)?;
+        // Exact-tuple authority: object contour carries the full `EpochId`;
+        // scalar contour carries only the sequence (lineage via the fence).
+        let authority_epoch = match claim.get("authority_epoch") {
+            Some(value) if value.is_object() => {
+                serde_json::from_value(value.clone()).map_err(|_| {
+                    NativeWorkerRouteError::Shape {
+                        field: "authority_epoch",
+                    }
+                })?
+            }
+            _ => fence.authority_epoch.clone(),
+        };
+        let wire_version = native_worker_json_u16(claim, "wire_version")?;
+        let executable_binding = match claim.get("executable_binding") {
+            None | Some(serde_json::Value::Null) => {
+                if wire_version == NATIVE_WORKER_CLAIM_WIRE_VERSION_V1 {
+                    None
+                } else {
+                    return Err(NativeWorkerRouteError::Shape {
+                        field: "executable_binding",
+                    });
+                }
+            }
+            Some(join_value) => {
+                if wire_version == NATIVE_WORKER_CLAIM_WIRE_VERSION_V1 {
+                    return Err(NativeWorkerRouteError::Shape {
+                        field: "executable_binding",
+                    });
+                }
+                let join: NativeWorkerExecutableBinding =
+                    serde_json::from_value(join_value.clone()).map_err(|_| {
+                        NativeWorkerRouteError::Shape {
+                            field: "executable_binding",
+                        }
+                    })?;
+                Some(join)
+            }
+        };
+        // Wire id: pinned on the single shape, checked on the old wire.
+        let wire_id = match claim.get("wire_id").and_then(serde_json::Value::as_str) {
+            Some(wire) => {
+                if wire != NATIVE_WORKER_CLAIM_WIRE_ID {
+                    return Err(NativeWorkerRouteError::Shape { field: "wire" });
+                }
+                wire.to_owned()
+            }
+            None => NATIVE_WORKER_CLAIM_WIRE_ID.to_owned(),
+        };
+        // Resource envelope: projected from the registration on the single
+        // shape; on the old wire the claim duplicates it and must agree.
+        let installation_id = require_claim_text(registration, "installation_id")?;
+        if let Some(presented) = claim
+            .get("installation_id")
+            .and_then(serde_json::Value::as_str)
+        {
+            if presented != installation_id {
+                return Err(NativeWorkerRouteError::Fence {
+                    field: "installation_binding",
+                });
+            }
+        }
+        let worker_artifact_digest = require_digest(registration, "worker_artifact_digest")?;
+        if let Some(presented) = claim
+            .get("worker_artifact_digest")
+            .and_then(serde_json::Value::as_str)
+        {
+            if presented != worker_artifact_digest {
+                return Err(NativeWorkerRouteError::Fence {
+                    field: "artifact_binding",
+                });
+            }
+        }
+        let worker_config_digest = require_digest(registration, "worker_config_digest")?;
+        if let Some(presented) = claim
+            .get("worker_config_digest")
+            .and_then(serde_json::Value::as_str)
+        {
+            if presented != worker_config_digest {
+                return Err(NativeWorkerRouteError::Fence {
+                    field: "config_binding",
+                });
+            }
+        }
+        let protocol_version = require_claim_text(registration, "protocol_version")?;
+        if let Some(presented) = claim
+            .get("protocol_version")
+            .and_then(serde_json::Value::as_str)
+        {
+            if presented != protocol_version {
+                return Err(NativeWorkerRouteError::Shape {
+                    field: "protocol_version",
+                });
+            }
+        }
+        let execution_unit_schema_version =
+            native_worker_json_u16(registration, "execution_unit_schema_version")?;
+        if claim.get("execution_unit_schema_version").is_some() {
+            let presented = native_worker_json_u16(claim, "execution_unit_schema_version")?;
+            if presented != execution_unit_schema_version {
+                return Err(NativeWorkerRouteError::Shape {
+                    field: "execution_unit_schema_version",
+                });
+            }
+        }
+        let mut request = NativeWorkerClaimRequest {
+            wire_id,
+            wire_version,
+            claim_id: require_op_id(claim, "claim_id")?,
+            registration_id: require_op_id(claim, "registration_id")?,
+            worker_generation: require_nonzero_u64(claim, "worker_generation")?,
+            installation_id,
+            worker_artifact_digest,
+            worker_config_digest,
+            protocol_version,
+            execution_unit_schema_version,
+            parent_job_id: require_claim_text(claim, "parent_job_id")?,
+            task_id: require_claim_text(claim, "task_id")?,
+            work_scope_id: require_claim_text(claim, "work_scope_id")?,
+            decision_id: require_claim_text(claim, "decision_id")?,
+            attempt_id: require_claim_text(claim, "attempt_id")?,
+            operation_id: require_claim_text(claim, "operation_id")?,
+            route_class: require_claim_text(claim, "route_class")?,
+            budget,
+            deadline_unix_ms: require_nonzero_u64(claim, "deadline_unix_ms")?,
+            cancellation_policy_id: require_claim_text(claim, "cancellation_policy_id")?,
+            expected_result_schema: require_claim_text(claim, "expected_result_schema")?,
+            expected_result_schema_version: native_worker_json_u16(
+                claim,
+                "expected_result_schema_version",
+            )?,
+            predecessor_revision: require_claim_text(claim, "predecessor_revision")?,
+            authority_epoch,
+            state_fence: fence,
+            executable_binding,
+            binding_digest: require_digest(claim, "binding_digest")?,
+            request_digest: String::new(),
+        };
+        let computed =
+            request
+                .canonical_request_digest()
+                .map_err(|_| NativeWorkerRouteError::Shape {
+                    field: "request_digest",
+                })?;
+        // Old wire carries its own envelope digest: it must equal the
+        // recomputed canonical digest, otherwise a tampered presentation
+        // fails here before any owner sees it.
+        if let Some(presented) = claim
+            .get("request_digest")
+            .and_then(serde_json::Value::as_str)
+        {
+            if presented != computed {
+                return Err(NativeWorkerRouteError::Shape {
+                    field: "request_digest",
+                });
+            }
+        }
+        request.request_digest = computed;
+        Ok(request)
     }
 
     /// Builds the current owner-record expectation for the executable gate.
@@ -1183,13 +1508,7 @@ impl KernelComposition {
                 field: "generation_binding",
             });
         }
-        if native_worker_json_u64(claim, "authority_epoch")?
-            != native_worker_json_u64(registration, "authority_epoch")?
-        {
-            return Err(NativeWorkerRouteError::Fence {
-                field: "epoch_fence",
-            });
-        }
+        check_split_epoch_agreement(claim, registration)?;
         if claim.get("state_fence") != registration.get("state_fence") {
             return Err(NativeWorkerRouteError::Fence {
                 field: "state_fence",
@@ -1207,30 +1526,63 @@ impl KernelComposition {
     /// A claim rewired onto a foreign worker generation fails here before any
     /// owner stages it, so fresh work is never admitted merely because its
     /// digest shape is well-formed.
+    ///
+    /// Single-shape (R2): the worker-core claim carries no resource envelope
+    /// (installation/artifact/config live only in the registration and are
+    /// projected into the service request by construction). When the claim
+    /// omits them, there is nothing to rewire, so the binding holds by
+    /// construction after the registration shape check; when the claim
+    /// carries them (old wire) they must equal the registration.
     pub(crate) fn require_claim_registration_resource_binding(
         claim: &serde_json::Value,
         registration: &serde_json::Value,
     ) -> Result<(), NativeWorkerRouteError> {
-        if require_claim_text(claim, "installation_id")?
-            != require_claim_text(registration, "installation_id")?
-        {
-            return Err(NativeWorkerRouteError::Fence {
-                field: "installation_binding",
-            });
+        // Installation: required on old wire, implicit on single shape.
+        if claim.get("installation_id").is_some() || registration.get("installation_id").is_some() {
+            let claim_installation = claim
+                .get("installation_id")
+                .and_then(serde_json::Value::as_str);
+            let registration_installation = registration
+                .get("installation_id")
+                .and_then(serde_json::Value::as_str);
+            match (claim_installation, registration_installation) {
+                (Some(left), Some(right)) => {
+                    if require_claim_text(claim, "installation_id")?
+                        != require_claim_text(registration, "installation_id")?
+                    {
+                        let _ = (left, right);
+                        return Err(NativeWorkerRouteError::Fence {
+                            field: "installation_binding",
+                        });
+                    }
+                }
+                (None, None) => {}
+                // Single shape: claim omits the envelope by construction.
+                (None, Some(_)) => {}
+                (Some(_), None) => {
+                    return Err(NativeWorkerRouteError::Fence {
+                        field: "installation_binding",
+                    });
+                }
+            }
         }
-        if require_digest(claim, "worker_artifact_digest")?
-            != require_digest(registration, "worker_artifact_digest")?
-        {
-            return Err(NativeWorkerRouteError::Fence {
-                field: "artifact_binding",
-            });
-        }
-        if require_digest(claim, "worker_config_digest")?
-            != require_digest(registration, "worker_config_digest")?
-        {
-            return Err(NativeWorkerRouteError::Fence {
-                field: "config_binding",
-            });
+        for (field, fence_field) in [
+            ("worker_artifact_digest", "artifact_binding"),
+            ("worker_config_digest", "config_binding"),
+        ] {
+            match (claim.get(field), registration.get(field)) {
+                (Some(_), Some(_)) => {
+                    if require_digest(claim, field)? != require_digest(registration, field)? {
+                        return Err(NativeWorkerRouteError::Fence { field: fence_field });
+                    }
+                }
+                (None, None) => {}
+                // Single shape: claim omits the envelope by construction.
+                (None, Some(_)) => {}
+                (Some(_), None) => {
+                    return Err(NativeWorkerRouteError::Fence { field: fence_field });
+                }
+            }
         }
         Ok(())
     }
@@ -1317,9 +1669,15 @@ impl KernelComposition {
             Self::validate_native_worker_claim(claim)?;
         Self::require_message_identity(identity, &claim_id)?;
         Self::require_claim_deadline(claim, now)?;
-        let request = Self::build_claim_request(claim)?;
-        // Same lineage-aware bridge as `validate_native_worker_claim`: the
-        // registration scalar contour must match its fence tuple exactly.
+        // Single-shape unification (R2): the request projects the
+        // registration envelope (wire/installation/artifact/protocol/schema)
+        // by construction, so the SAME worker-core halves the child submits
+        // admit here. The old `build_claim_request(claim)` stays for the
+        // pre-unification wire tests; the route admits through the single
+        // shape only.
+        let request = Self::build_single_shape_request(claim, registration)?;
+        // Registration epoch must match its fence tuple exactly on both
+        // contours (scalar via sequence, object via exact tuple).
         let registration_fence: StateFence =
             serde_json::from_value(registration.get("state_fence").cloned().ok_or(
                 NativeWorkerRouteError::Shape {
@@ -1329,13 +1687,7 @@ impl KernelComposition {
             .map_err(|_| NativeWorkerRouteError::Shape {
                 field: "state_fence",
             })?;
-        if registration_fence.authority_epoch.sequence.get()
-            != native_worker_json_u64(registration, "authority_epoch")?
-        {
-            return Err(NativeWorkerRouteError::Fence {
-                field: "authority_epoch",
-            });
-        }
+        check_authority_epoch_against_fence(registration, "authority_epoch", &registration_fence)?;
         request
             .validate_presented_under_registration(
                 &require_op_id(registration, "registration_id")?,
@@ -1913,6 +2265,181 @@ impl KernelComposition {
                 field: "session_binding",
             })?;
         Ok((operation_id, session_binding))
+    }
+}
+
+// R2 single-shape proof (Implements #22 DISPATCH-FINISH): the route admits
+// the SAME worker-core halves the child submits, with every check on the
+// single shape. The old `build_claim_request(claim)` stays for the
+// pre-unification wire tests; the route admits through
+// `build_single_shape_request(claim, registration)` only.
+#[cfg(test)]
+mod single_shape_proof {
+    #![allow(clippy::expect_used, clippy::unwrap_used)]
+
+    use super::*;
+
+    fn epoch(sequence: u64) -> EpochId {
+        EpochId::new(
+            eliot_contracts::EpochLineageId::new("550e8400-e29b-41d4-a716-446655440000")
+                .expect("lineage"),
+            std::num::NonZeroU64::new(sequence).expect("sequence"),
+        )
+        .expect("epoch")
+    }
+
+    fn fence() -> StateFence {
+        StateFence::new(
+            epoch(1),
+            eliot_contracts::ResourceGeneration::new(1).expect("generation"),
+        )
+    }
+
+    /// R2: a worker-core single-shape presentation (full `EpochId` objects,
+    /// no Kernel-service envelope duplication) validates and builds a service
+    /// request whose binding digest equals the presented digest and whose
+    /// projected envelope (wire/installation/artifact/protocol/schema)
+    /// validates through the service owner. Old-wire envelope duplication,
+    /// when present, must agree (resource binding); a rewired envelope fails.
+    #[test]
+    fn single_shape_claim_admits_with_projected_envelope() {
+        let fence_value = serde_json::to_value(fence()).expect("fence json");
+        let epoch_value = serde_json::to_value(epoch(1)).expect("epoch json");
+        let join = serde_json::json!({
+            "route_ref": "route://test/full-canonical-route",
+            "adapter_id": "adapter-test",
+            "adapter_revision": 3,
+            "config_digest": "b".repeat(64),
+            "facet_manifest_ref": "facet-manifest-7",
+            "grant_graph_revision": 5,
+            "replay_stream_id": "stream-single-1/gen-1",
+            "launch_nonce": "launch-nonce-0123456789abcdef",
+            "process_invocation_digest": "d".repeat(64),
+            "authority_epoch": epoch_value,
+            "generation": serde_json::to_value(fence().resource_generation).expect("gen"),
+            "state_fence": fence_value,
+            "deadline_unix_ms": 9_000_000_000_000u64,
+            "expires_at_unix_ms": 9_000_000_100_000u64,
+            "executable_wire_version": NATIVE_WORKER_EXECUTABLE_BINDING_EXPECTED_WIRE_VERSION,
+            "executable_binding_digest": "e".repeat(64),
+        });
+        // Binding digest over the shared 18-field set (same procedure both
+        // sides use; envelope-only fields are excluded, so stripping them
+        // keeps the digest).
+        let draft = serde_json::json!({
+            "attempt_id": "attempt-single-1",
+            "authority_epoch": epoch_value,
+            "budget": {"context_tokens": 8, "wall_time_ms": 1000, "output_bytes": 1024, "cost_microunits": 10, "max_depth": 2, "max_descendants": 4},
+            "cancellation_policy_id": "cancel-1",
+            "claim_id": "claim-single-1",
+            "deadline_unix_ms": 9_000_000_000_000u64,
+            "decision_id": "decision-1",
+            "executable_binding": join,
+            "expected_result_schema": "result-schema",
+            "expected_result_schema_version": 1,
+            "operation_id": "op-single-1",
+            "parent_job_id": "parent-job-1",
+            "predecessor_revision": "rev-1",
+            "registration_id": "reg-single-1",
+            "route_class": "test-route",
+            "state_fence": fence_value,
+            "task_id": "task-1",
+            "work_scope_id": "scope-1",
+            "worker_generation": 1,
+        });
+        let binding_digest = {
+            let bytes = eliot_contracts::canonical_json_bytes(&draft).expect("canonical");
+            eliot_contracts::sha256_hex(&bytes)
+        };
+        let claim = serde_json::json!({
+            "claim_id": "claim-single-1",
+            "registration_id": "reg-single-1",
+            "worker_generation": 1,
+            "parent_job_id": "parent-job-1",
+            "task_id": "task-1",
+            "work_scope_id": "scope-1",
+            "decision_id": "decision-1",
+            "attempt_id": "attempt-single-1",
+            "operation_id": "op-single-1",
+            "route_class": "test-route",
+            "budget": {"context_tokens": 8, "wall_time_ms": 1000, "output_bytes": 1024, "cost_microunits": 10, "max_depth": 2, "max_descendants": 4},
+            "deadline_unix_ms": 9_000_000_000_000u64,
+            "cancellation_policy_id": "cancel-1",
+            "expected_result_schema": "result-schema",
+            "expected_result_schema_version": 1,
+            "predecessor_revision": "rev-1",
+            "authority_epoch": epoch_value,
+            "state_fence": fence_value,
+            "wire_version": NATIVE_WORKER_CLAIM_WIRE_VERSION,
+            "executable_binding": draft.get("executable_binding").cloned().unwrap(),
+            "binding_digest": binding_digest,
+        });
+        let registration = serde_json::json!({
+            "registration_id": "reg-single-1",
+            "installation_id": "installation-1",
+            "worker_artifact_digest": "a".repeat(64),
+            "worker_config_digest": "b".repeat(64),
+            "protocol_version": NATIVE_WORKER_PROTOCOL_VERSION,
+            "worker_generation": 1,
+            "process_id": 4242,
+            "process_start_100ns": 120,
+            "process_image_digest": "a".repeat(64),
+            "principal_ref": "principal-1",
+            "session_id": "session-operation-1",
+            "connection_id": "connection-1",
+            "authority_epoch": epoch_value,
+            "state_fence": fence_value,
+            "lease_id": "lease-1",
+            "lease_expires_at_unix_ms": 9_000_000_200_000u64,
+            "renewal_id": "renewal-1",
+            "execution_unit_schema_version": NATIVE_WORKER_EXECUTION_UNIT_SCHEMA_VERSION,
+            "resource_limits": {"wall_timeout_ms": 30000, "stdout_bytes": 4096, "stderr_bytes": 4096, "max_descendants": 4},
+            "invalidation_set": [],
+        });
+        // Split binds (same registration/generation/epoch/fence).
+        let payload = serde_json::json!({"claim": claim, "registration": registration});
+        let (split_claim, split_registration) =
+            KernelComposition::split_claim_presentation(&payload).expect("split binds");
+        KernelComposition::validate_native_worker_registration(split_registration)
+            .expect("registration validates");
+        KernelComposition::require_claim_registration_resource_binding(
+            split_claim,
+            split_registration,
+        )
+        .expect("resource binds by construction on the single shape");
+        let (claim_id, digest, generation) =
+            KernelComposition::validate_native_worker_claim(split_claim)
+                .expect("single-shape claim validates");
+        assert_eq!(claim_id, "claim-single-1");
+        assert_eq!(digest, binding_digest);
+        assert_eq!(generation, 1);
+        // Builder projects the envelope and computes the request digest.
+        let request =
+            KernelComposition::build_single_shape_request(split_claim, split_registration)
+                .expect("single-shape builds");
+        assert_eq!(request.binding_digest, binding_digest);
+        assert_eq!(request.wire_id, NATIVE_WORKER_CLAIM_WIRE_ID);
+        assert_eq!(request.installation_id, "installation-1");
+        request.validate().expect("built request validates");
+        request
+            .validate_canonical_digest()
+            .expect("built request digest binds");
+        // A rewired envelope (claim duplicates a foreign artifact) fails the
+        // resource binding even though its shape is well-formed.
+        let mut rewired = split_claim.clone();
+        rewired["worker_artifact_digest"] = serde_json::Value::String("f".repeat(64));
+        assert!(
+            KernelComposition::require_claim_registration_resource_binding(
+                &rewired,
+                split_registration
+            )
+            .is_err(),
+            "foreign artifact must not bind"
+        );
+        assert!(
+            KernelComposition::build_single_shape_request(&rewired, split_registration).is_err(),
+            "rewired envelope must not build"
+        );
     }
 }
 
