@@ -1,0 +1,161 @@
+schema = "eliot.agent-work-unit.v1"
+authority = "NON_NORMATIVE_IMPLEMENTATION_ALLOCATION"
+routing_authority = "owning_issue_and_normative_pair_only"
+status = "READY_FOR_IMPLEMENTATION_AFTER_PROVIDER_CATALOG_AND_ADAPTER_BINDINGS"
+implementation_support = "ROUTE_AND_PROVIDER_CONTRACTS_FRAGMENTED_PHYSICAL_ATTEMPT_ENFORCEMENT_UNPROVED"
+evidence_execution_status = "CURRENT_ROUTE_COORDINATOR_PROVIDER_AND_RUNTIME_DEPENDENCIES_INSPECTED_TESTS_NOT_EXECUTED"
+proof_ceiling = "MODEL_PORTFOLIO_SELECTION_AND_EXECUTION_EDGE_CANDIDATE_ONLY"
+issue = 69
+provider_catalog_issue = 265
+provider_adapter_disposition_issue = 1109
+native_worker_issue = 22
+dreamer_runtime_issue = 1100
+kernel_issue = 15
+governor_issue = 18
+parent_product_issue = 11
+base_branch = "main"
+base_sha = "8ebf8b41847391c340393d56aeb14dd4f2b5e37b"
+normative_pair_ref = "docs/normative-pair.toml"
+
+[work_unit]
+cell_id = "agent.model-portfolio-selection-and-attempt-enforcement"
+causal_property = "One logical model decision is admitted against one immutable current Model Portfolio snapshot and produces one exact route-selection receipt; every physical provider attempt must match that receipt's provider, model, account/credential reference, capability, privacy, budget, deadline, tool and artifact/protocol identities, and no fallback or retry may escape an unknown or possibly executed attempt."
+current_discriminator = "The repository contains route/provider/coordinator contracts and provider-specific packages, but current provider admission and adapter composition are incomplete. No accepted live edge proves that the physical model attempt is forced to match one immutable portfolio selection receipt, that stale catalogue/quota/price/capability evidence fails closed, or that fallback cannot change route after possible work."
+primary_issue_url = "https://github.com/UnknownAlienHuman/eliot-memory-os/issues/69"
+
+[documentation]
+architecture = [
+  "https://github.com/UnknownAlienHuman/eliot-memory-os/blob/main/docs/architecture/A10-04-delegation.md#a104-delegation",
+  "https://github.com/UnknownAlienHuman/eliot-memory-os/blob/main/docs/architecture/A12-02-principal-session-and-visibility.md#a122-principal-session-and-visibility",
+  "https://github.com/UnknownAlienHuman/eliot-memory-os/blob/main/docs/architecture/A13-02-kernel-and-failure-domains.md#a132-kernel-and-failure-domains",
+]
+implementation = [
+  "https://github.com/UnknownAlienHuman/eliot-memory-os/blob/main/docs/architecture/I03-04-capability-and-route-registry.md#i34-capability-and-route-registry",
+  "https://github.com/UnknownAlienHuman/eliot-memory-os/blob/main/docs/architecture/I03-06-model-route-and-portfolio-policy.md#i36-model-route-and-portfolio-policy",
+  "https://github.com/UnknownAlienHuman/eliot-memory-os/blob/main/docs/architecture/I05-27-canonical-operation-identity-and-effect-identity.md#i527-canonical-operation-and-effect-identity",
+  "https://github.com/UnknownAlienHuman/eliot-memory-os/blob/main/docs/architecture/I07-20-agent-facing-error-contract.md#i720-agent-facing-error-contract",
+  "https://github.com/UnknownAlienHuman/eliot-memory-os/blob/main/docs/architecture/I09-08-background-policy.md#i98-background-policy",
+  "https://github.com/UnknownAlienHuman/eliot-memory-os/blob/main/docs/architecture/I10-11-external-model-bridges.md#i1011-external-model-bridges",
+  "https://github.com/UnknownAlienHuman/eliot-memory-os/blob/main/docs/architecture/I10-15-agent-execution-fabric-and-durable-swarm.md#i1015-agent-execution-fabric-and-durable-swarm",
+  "https://github.com/UnknownAlienHuman/eliot-memory-os/blob/main/docs/architecture/I14-20-canonical-runtime-lifecycle-vocabulary.md#i1420-canonical-runtime-lifecycle-vocabulary",
+  "https://github.com/UnknownAlienHuman/eliot-memory-os/blob/main/docs/architecture/I14-21-unknown-commit-recovery.md#i1421-unknown-commit-recovery",
+  "https://github.com/UnknownAlienHuman/eliot-memory-os/blob/main/docs/architecture/I15-04-secrets.md#i154-secrets",
+]
+anchors = ["ARCH-AUTH-01", "ARCH-PORT-01", "ARCH-SEC-01", "ARCH-OBS-01", "ARCH-RES-04", "ARCH-SWM-02"]
+
+[current_source]
+confirmed = [
+  "Agent coordination and route/provider contracts exist, but current production provider verification and adapter construction remain incomplete.",
+  "Issue #265 owns current account/catalogue/quota/liveness evidence and cannot itself mint route authority.",
+  "Issue #1109 owns live-consumer or retirement dispositions for provider adapter packages; issue #22 owns the admitted native-worker execution generation.",
+  "Dreamer and swarm execution paths depend on one provider-neutral admitted attempt contract rather than direct vendor selection.",
+  "No open PR was found that tracks #69 as the complete immutable portfolio-selection and physical-attempt enforcement edge.",
+  "Provider availability, model name, quota visibility, process liveness and credential presence are observations, not an admission receipt.",
+]
+
+[scope]
+primary_paths = [
+  "the existing owner-neutral model route/portfolio/capability contract package selected after dependency review",
+  "crates/agent/eliot-agent-coordinator/src/** exact route selection/admission spans",
+  "current provider catalogue/account projection from #265",
+  "exact provider-neutral execution-unit and attempt/result contracts",
+  "exact native-worker/provider-adapter factory binding from #22/#1109",
+  "Dreamer/swarm consumers only at the route-selection/attempt boundary",
+  "directly relevant tests and finite provider/catalogue fixtures",
+]
+serialized_dependencies = [
+  "#265 current provider/account catalogue",
+  "#1109 provider adapter disposition",
+  "#22 native-worker execution",
+  "#1100 Dreamer runtime",
+  "#15 Kernel admission/fencing",
+  "#18 Governor policy/admission",
+  "#11 Product proof",
+]
+forbidden = [
+  "vendor SDK types, raw credentials or provider-specific errors in public portfolio contracts",
+  "caller/model/agent choosing an unadmitted provider/model/account or widening tools/privacy/effects",
+  "route authority inferred from provider name, model alias, catalogue presence, liveness, quota or credential availability",
+  "silent fallback after possible provider work or unknown outcome",
+  "retrying a changed provider/model/config/input under the same logical or physical attempt identity",
+  "combining cost, latency, quality, privacy, capability and availability into one compensating scalar",
+  "provider adapter owning task policy, canonical state, authority, budget expansion or Finish",
+  "logging or serializing raw API keys, cookies, access tokens or account secrets",
+  "automatic workflow triggers",
+]
+
+[[waves]]
+id = "A"
+what = "Define one immutable current ModelPortfolioSnapshot and selection request/receipt contract."
+how = [
+  "Bind portfolio identity to normative/policy revision, provider and model catalogue revisions, account/capacity observations, pricing/quota evidence, capability and tool schemas, context/reasoning profiles, privacy/data-residency classes, credential-reference classes, adapter artifact/protocol generations, invalidation set and evaluated-at/expiry boundary.",
+  "Keep availability, capability, quality/evidence, privacy, cost, quota, latency and support as independent axes; one strong axis cannot compensate for a failed mandatory axis.",
+  "Define a closed RouteSelectionRequest with exact task/job/attempt/scope/fence, logical decision, required capability/tools/context/reasoning, privacy, budget, deadline, effect ceiling, allowed providers/models/accounts and fallback policy.",
+  "Emit one deterministic RouteSelectionReceipt naming the exact selected route/model/account/adapter/config revisions, independent constraints, rejected alternatives/reasons and proof ceiling.",
+]
+
+[[waves]]
+id = "B"
+what = "Enforce currentness, deterministic selection and fail-closed constraints."
+how = [
+  "Validate every required portfolio/catalogue/account/capability/privacy/cost/quota/adapter observation against the same current boundary before selection.",
+  "Reject stale, expired, conflicted, unknown, unavailable, unsupported, over-budget, privacy-incompatible, tool-incompatible and context/reasoning-incompatible routes before attempt creation.",
+  "Use stable deterministic tie-breaking only among routes that independently satisfy every mandatory constraint; retain the complete eligible/rejected denominator and rationale.",
+  "Model aliases, provider marketing names and newest timestamps cannot substitute for exact immutable provider/model/config identities.",
+  "Catalogue or quota uncertainty produces a blocked/partial result, not an optimistic route.",
+]
+
+[[waves]]
+id = "C"
+what = "Bind the physical provider attempt to the exact selection receipt."
+how = [
+  "Create one PhysicalAttempt identity derived from logical decision, selection receipt, provider/model/account/config/adapter generation, canonical input digest, tools/capabilities, privacy, budget, deadline and StateFence.",
+  "Construct the provider adapter only through the admitted native-worker/factory registry and resolve only an opaque authorized credential reference.",
+  "Before provider work, verify the execution unit exactly matches the receipt; any provider/model/config/account/tool/privacy/budget/input/fence change requires a new selection and new attempt identity.",
+  "Persist attempt intent before possible provider work and retain accepted, started, streaming, terminal candidate, rejected-before-work, cancelled-before-work, possible-work, unknown/reconciling and terminal failure separately.",
+  "Record exact token/usage/cost/latency/provider observation and raw-output evidence or omission handle without letting provider metadata change admission.",
+]
+
+[[waves]]
+id = "D"
+what = "Close retry, fallback, quota change, revocation and unknown-outcome behavior."
+how = [
+  "Fallback is allowed only if the prior physical attempt is proven not started/not effected and the immutable fallback policy names the next eligible route; the fallback receives a new route receipt and attempt identity.",
+  "After possible provider work, timeout, disconnect, stream loss or missing result acknowledgement, reconcile the same attempt before any retry or route switch.",
+  "Rate limit, quota exhaustion and capacity loss are typed attempt/catalogue observations and cannot become empty success or automatic model downgrade.",
+  "Credential/account/route/adapter revocation or portfolio invalidation fences new work immediately and leaves active possible-work attempts in exact cancellation/reconciliation state.",
+  "Exact replay of one completed attempt returns the same candidate/result/usage identity; changed same-identity output or usage is a conflict.",
+  "Return candidate output to the owning Dreamer/Governor path; portfolio/adapter cannot promote truth, support, canonical state or Finish.",
+]
+
+[acceptance]
+criteria = [
+  "One versioned current ModelPortfolioSnapshot contains exact provider/model/account/capability/tool/context/reasoning/privacy/cost/quota/adapter identities and a complete invalidation set.",
+  "Availability, capability, quality/evidence, privacy, cost, quota, latency and support remain independent and non-compensating.",
+  "Every selection request binds exact task/job/attempt/scope/fence/logical-decision requirements, budgets, deadline, privacy, tools and allowed fallback policy.",
+  "Selection is deterministic over the complete current eligible denominator and retains every rejected alternative with a stable reason.",
+  "Stale, expired, unknown, conflicted, unavailable, unsupported, over-budget or privacy/tool/context-incompatible routes cannot be selected.",
+  "Catalogue presence, provider/model name, newest timestamp, liveness, quota visibility or credential presence cannot create admission.",
+  "Every physical attempt exactly matches one selection receipt across provider, model, account, config, adapter generation, input, tools, privacy, budget, deadline and fence.",
+  "Caller/model/provider cannot widen or substitute any selected route field before or during execution.",
+  "Raw credentials never enter portfolio/attempt state, argv, logs, diagnostics or model-visible context.",
+  "Attempt intent is durable before possible provider work and possible-work/unknown states cannot become not-started or successful absence.",
+  "Fallback occurs only after proven no-work and receives a new route receipt and physical attempt identity.",
+  "Unknown/potential provider work blocks retry and route substitution until exact reconciliation.",
+  "Rate limit, quota exhaustion, capacity loss, credential revocation and adapter invalidation remain typed and non-successful.",
+  "Exact replay is idempotent; changed same-identity input, route, output or usage conflicts.",
+  "Usage/cost/latency evidence is bound to the exact attempt and cannot retroactively authorize it.",
+  "Portfolio and provider adapters own no task policy, canonical write, authority expansion, support promotion or VERIFIED_COMPLETE decision.",
+  "Focused selection/currentness/fallback/reconciliation tests pass, followed by one real retained provider Edge and installed Product evidence under #11.",
+]
+
+[verification]
+commands = [
+  "cargo fmt --all -- --check",
+  "cargo check --locked -p eliot-agent-coordinator -p eliot-agent-contracts -p eliot-native-worker-core -p eliot-native-worker --all-targets",
+  "cargo test --locked -p eliot-agent-coordinator -p eliot-agent-contracts -p eliot-native-worker-core -p eliot-native-worker --all-targets",
+  "cargo clippy --locked -p eliot-agent-coordinator -p eliot-agent-contracts -p eliot-native-worker-core -p eliot-native-worker --all-targets -- -D warnings",
+  "git diff --check",
+]
+edge_proof = "Run one real retained provider under an exact portfolio receipt plus stale catalogue, privacy mismatch, over-budget, tool/context mismatch, rate limit, credential revocation, proven-no-work fallback and unknown-outcome reconciliation cases."
+product_proof = "This establishes the Model Portfolio selection/execution Edge candidate only; model quality or Product support remains #11."
