@@ -18,6 +18,17 @@
 //! [`CanonicalReadClient::execute_named`]; every other named operation fails
 //! closed as [`StoreError::UnknownOperation`] before any transport.
 //!
+//! The local-read serving arm ([`KernelContextReadClient::execute_local_read`])
+//! twins that gate shape for an admitted envelope+tool pair: the closed
+//! `eliot.query` selectors serve exactly one bounded
+//! [`LocalReadPort::evidence_query`](eliot_read::LocalReadPort::evidence_query),
+//! while `eliot.packet` stays admission-only (`Unavailable`, MGR04 #19) and a
+//! wrong fence fails closed before any read. The port and the admitted fence
+//! stay per-call parameters, so the composition retains no client and no
+//! thread; the `local_read` forwarding transport
+//! (`DaemonKernelClient::local_read_async`) stays with the future
+//! kernel-caller bridge.
+//!
 //! Forbidden authority: no raw query strings (impossible by construction —
 //! only the closed [`NamedReadOperation`] crosses), no second consistency
 //! implementation, no fake full [`CanonicalStoreClient`] with
@@ -26,13 +37,18 @@
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
+use eliot_contracts::{ClockReading, ProductId, RequestId, RequestMetadata, SourceId, StateFence};
 use eliot_governor::{KernelGenerationSnapshotProvider, KernelPortError};
+use eliot_protocol::{
+    HOST_REQUEST_INVOKE_READ_WIRE_ID, HostRequestEnvelope, HostRequestInvokeReadPayload,
+};
+use eliot_read::{LocalReadPort, QueryResult, ReadError};
 use eliot_store_api::{
-    CanonicalReadClient, NamedReadOperation, NamedReadRequest, NamedReadResponse, ReadConsistency,
-    RevisionHead, RevisionKey, StoreError,
+    CanonicalReadClient, EVIDENCE_PACK_MAX_RECORDS, NamedReadOperation, NamedReadRequest,
+    NamedReadResponse, ReadConsistency, RevisionHead, RevisionKey, ScopeId, StoreError,
 };
 
-use super::DaemonKernelClient;
+use super::{DaemonKernelClient, SERVICE_NAME};
 
 /// Read-only Kernel-backed adapter implementing [`CanonicalReadClient`].
 ///
@@ -44,6 +60,35 @@ use super::DaemonKernelClient;
 pub struct KernelContextReadClient {
     kernel: Arc<DaemonKernelClient>,
 }
+
+/// Closed local-read selectors for one admitted `eliot.query` pair.
+///
+/// Mirrors the MGR01 Kernel derivation (`local_read_selectors_from_tool`):
+/// the trusted envelope scope (work scope else session — never an MCP
+/// argument), the exact `subject:` selector (never free text), and the
+/// catalogue `max_records` bound. The Kernel re-admits authoritatively on
+/// its leg; these selectors shape only the local `evidence_query` call.
+struct LocalReadSelectors {
+    scope: ScopeId,
+    subject: String,
+    max_records: u32,
+}
+
+/// Query intent modes that admit the `GetEvidencePack` read.
+///
+/// Mirrors the MGR01 result-body allowlist
+/// (`build_local_read_result_body`): only these `snake_case` modes reach the
+/// evidence-pack plan. `current_position` (plus blank, control-bearing, or
+/// unknown modes) never admits `GetEvidencePack` and fails closed here
+/// before any read.
+const LOCAL_READ_QUERY_MODES: [&str; 6] = [
+    "verification",
+    "provenance",
+    "navigation",
+    "historical_reconstruction",
+    "change_impact",
+    "context_reconstruction",
+];
 
 impl KernelContextReadClient {
     /// Wraps an already-connected authenticated Kernel client.
@@ -88,11 +133,13 @@ impl KernelContextReadClient {
                     });
                 }
                 request.validate()?;
-                let position = request.parameters.get("position").and_then(|value| value.as_str());
+                let position = request
+                    .parameters
+                    .get("position")
+                    .and_then(|value| value.as_str());
                 match position {
                     Some(text)
-                        if !text.trim().is_empty()
-                            && !text.chars().any(char::is_control) => {}
+                        if !text.trim().is_empty() && !text.chars().any(char::is_control) => {}
                     _ => {
                         return Err(StoreError::InvalidField {
                             field: "operation.parameter",
@@ -104,6 +151,145 @@ impl KernelContextReadClient {
             }
             _ => Err(StoreError::UnknownOperation),
         }
+    }
+
+    /// Checks the local-read execute capability before any read is served:
+    /// the pair must prove its closed linkage, name the admitted
+    /// `eliot.query` capability, and carry the closed evidence selectors.
+    /// `eliot.packet` is admission-only and fails closed as
+    /// [`StoreError::Unavailable`] (MGR04 #19 owns storage activation); any
+    /// other tool fails closed as [`StoreError::UnknownOperation`], mirroring
+    /// [`check_execute_capability`](Self::check_execute_capability).
+    fn check_local_read_capability(
+        envelope: &HostRequestEnvelope,
+        tool: &serde_json::Value,
+    ) -> Result<LocalReadSelectors, StoreError> {
+        HostRequestInvokeReadPayload {
+            wire_id: HOST_REQUEST_INVOKE_READ_WIRE_ID.to_owned(),
+            wire_version: HostRequestInvokeReadPayload::CONTRACT_VERSION,
+            envelope: envelope.clone(),
+            tool: tool.clone(),
+        }
+        .validate()
+        .map_err(|error| StoreError::Serialization(error.to_string()))?;
+        match tool
+            .as_object()
+            .and_then(|object| object.get("name"))
+            .and_then(serde_json::Value::as_str)
+        {
+            Some("eliot.query") => {}
+            Some("eliot.packet") => return Err(StoreError::Unavailable),
+            _ => return Err(StoreError::UnknownOperation),
+        }
+        let arguments = tool
+            .as_object()
+            .and_then(|object| object.get("arguments"))
+            .and_then(serde_json::Value::as_object)
+            .ok_or(StoreError::InvalidField {
+                field: "operation.parameter",
+                reason: "query arguments must be an object",
+            })?;
+        let mode = arguments
+            .get("intent")
+            .and_then(serde_json::Value::as_object)
+            .and_then(|intent| intent.get("mode"))
+            .and_then(serde_json::Value::as_str)
+            .ok_or(StoreError::InvalidField {
+                field: "operation.parameter",
+                reason: "query intent mode must be an exact string",
+            })?;
+        if !LOCAL_READ_QUERY_MODES.contains(&mode) {
+            return Err(StoreError::InvalidField {
+                field: "operation.parameter",
+                reason: "query intent never admits the evidence pack for this mode",
+            });
+        }
+        if arguments
+            .get("exact_resource_uri")
+            .is_some_and(|value| !value.is_null())
+        {
+            return Err(StoreError::InvalidField {
+                field: "operation.parameter",
+                reason: "exact resource reads use the resource path, not a query",
+            });
+        }
+        let subject = arguments
+            .get("query")
+            .and_then(serde_json::Value::as_str)
+            .and_then(|query| query.strip_prefix("subject:"))
+            .map(str::trim)
+            .filter(|subject| !subject.is_empty() && !subject.chars().any(char::is_control))
+            .ok_or(StoreError::InvalidField {
+                field: "operation.parameter",
+                reason: "query must be one exact subject selector",
+            })?;
+        let scope_text = envelope
+            .identity
+            .work_scope_id
+            .as_deref()
+            .filter(|scope| !scope.trim().is_empty())
+            .or_else(|| {
+                envelope
+                    .identity
+                    .session_id
+                    .as_deref()
+                    .filter(|scope| !scope.trim().is_empty())
+            })
+            .ok_or(StoreError::InvalidField {
+                field: "scope_id",
+                reason: "local read requires an exact trusted scope",
+            })?;
+        let scope = ScopeId::new(scope_text).map_err(|_| StoreError::InvalidField {
+            field: "scope_id",
+            reason: "local read requires an exact trusted scope",
+        })?;
+        Ok(LocalReadSelectors {
+            scope,
+            subject: subject.to_owned(),
+            max_records: EVIDENCE_PACK_MAX_RECORDS,
+        })
+    }
+
+    /// Answers one admitted `eliot.query` through the Governor read port.
+    ///
+    /// Twin of [`execute_named`](CanonicalReadClient::execute_named) for the
+    /// envelope+tool pair: the capability gate runs before any read, the
+    /// envelope fence must equal the caller-observed admitted fence, and the
+    /// closed selectors serve exactly one bounded `evidence_query` whose
+    /// answer must echo the evidence operation and the admitted fence.
+    /// `eliot.packet` stays admission-only (`Unavailable`); a wrong fence or
+    /// a substituted answer fails closed, never `Ok`-empty.
+    ///
+    /// The port and the fence stay per-call parameters (rather than retained
+    /// state) so the composition retains no client and no thread: callers
+    /// pass the live read service and the currently admitted fence per call,
+    /// so a Governor refresh surfaces as an exact fence mismatch instead of
+    /// silent divergence.
+    pub async fn execute_local_read(
+        reads: &impl LocalReadPort,
+        admitted_fence: &StateFence,
+        envelope: &HostRequestEnvelope,
+        tool: &serde_json::Value,
+    ) -> Result<QueryResult, ReadError> {
+        let selectors = Self::check_local_read_capability(envelope, tool)?;
+        if envelope.state_fence != *admitted_fence {
+            return Err(ReadError::Store(StoreError::FenceMismatch.to_string()));
+        }
+        let ctx = local_read_context(admitted_fence)?;
+        let result = reads
+            .evidence_query(
+                &ctx,
+                selectors.scope,
+                selectors.subject,
+                selectors.max_records,
+            )
+            .await?;
+        if result.operation != NamedReadOperation::GetEvidencePack
+            || result.state_fence != *admitted_fence
+        {
+            return Err(ReadError::ResponseMismatch);
+        }
+        Ok(result)
     }
 
     /// Checks an execute response against the exact request it answers:
@@ -138,6 +324,45 @@ impl KernelContextReadClient {
             KernelPortError::NotAdmitted(_) => StoreError::Unavailable,
         }
     }
+}
+
+/// Builds the fence-bound read metadata for one local-read bridge call.
+///
+/// Mirrors the dreamer route context: the admitted fence travels in `ctx` so
+/// the facade and store gates refuse any substituted fence fail-closed.
+fn local_read_context(admitted_fence: &StateFence) -> Result<RequestMetadata, ReadError> {
+    let context = RequestMetadata {
+        request_id: RequestId::new("eliotd:local-read:evidence-query").map_err(|error| {
+            ReadError::InvalidField {
+                field: "request_metadata".to_owned(),
+                reason: error.to_string(),
+            }
+        })?,
+        session_id: None,
+        task_id: None,
+        product_id: ProductId::new(SERVICE_NAME).map_err(|error| ReadError::InvalidField {
+            field: "request_metadata".to_owned(),
+            reason: error.to_string(),
+        })?,
+        source_id: SourceId::new(SERVICE_NAME).map_err(|error| ReadError::InvalidField {
+            field: "request_metadata".to_owned(),
+            reason: error.to_string(),
+        })?,
+        state_fence: admitted_fence.clone(),
+        clock: ClockReading {
+            valid_time_ms: None,
+            known_time_ms: None,
+            transaction_sequence: None,
+            monotonic_ns: None,
+        },
+    };
+    context
+        .validate()
+        .map_err(|error| ReadError::InvalidField {
+            field: "request_metadata".to_owned(),
+            reason: error.to_string(),
+        })?;
+    Ok(context)
 }
 
 #[allow(async_fn_in_trait)]
@@ -358,9 +583,7 @@ mod tests {
         ));
 
         let mut blank = position_request(&fence)?;
-        blank
-            .parameters
-            .insert("position".to_owned(), json!("   "));
+        blank.parameters.insert("position".to_owned(), json!("   "));
         assert!(matches!(
             KernelContextReadClient::check_execute_capability(&blank),
             Err(StoreError::InvalidField {
