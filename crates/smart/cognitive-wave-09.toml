@@ -1,0 +1,665 @@
+schema_version = 6
+wave_id = "cognitive-micromodules-wave-09"
+status = "PROTOTYPE_ASSIGNMENT_GATED"
+base_commit = "03b04bc57fd7b22c16f6366fa292b96a91034d5a"
+normative_pair = "ELIOT Architecture 4.5-draft + Implementation 0.29-draft; English edition 2026-08-28"
+pair_key = "sha256:105558fc8957e150fab407b4fc5818ec49dc784f23f246f42dc9d3ca5843196b"
+purpose = "Freeze owner-neutral field-complete public contracts for W9 meta-quality and understanding cells 76-86 without implementation, admission, or runtime authority."
+proof_ceiling = "STATIC_FIELD_CONTRACT_ONLY"
+implementation_support = "TARGET"
+evidence_execution_status = "NOT_EXECUTED"
+integration_owner = "cognitive-wave-integrator"
+agent_rule = "One agent receives one module manifest, frozen one-hop contracts, exact write scope, proof ceiling and named Product Pulse or Edge proof."
+workspace_rule = "Prototype packages stay outside the root workspace until implementation, package proof, affected Edge proof, current-main ancestry and integration review."
+authority_rule = "No prototype owns canonical state, runtime scheduling, evaluator state, policy, authority, finish or external effects."
+dependency_rule = "Assignment depends_on lists logical contract prerequisites; Cargo dependencies are narrower and exist only for public types actually imported."
+supersession_rule = "The stale cognitive-crates-prototypes-01 branch is not an assignment source."
+scope_rule = "Cells 76-86 are TO-BE-CREATED static assignments grounded in I12-21/I12-19/I07-25/I09-16/I16-23/I06-16/A00-07/A06-07/I12-34; orders 1-43 are never renumbered or reused."
+disjointness_rule = "This catalogue does not modify bins/, 233 memory-curation/dreamer-cycle files, 246 cue normalizer/binding/index/activation files, retired eliot-understanding paths, root Cargo.toml/Cargo.lock, workflows, normative prose, or generated indexes."
+
+[[stage]]
+id = "W9_MEMORY_QUALITY"
+orders = [76, 78]
+gate = "Memory ecology, gravity, and lifecycle-economics assessments are frozen as owner-neutral field contracts with exact denominators; no support/influence promotion."
+
+[[stage]]
+id = "W9_NEGATIVE_MEMORY_REVISION"
+orders = [79, 79]
+gate = "Negative-memory extinction is frozen as an advisory activation/influence candidate preserving history; no purge, no narrative rewrite."
+
+[[stage]]
+id = "W9_COGNITIVE_QUALITY"
+orders = [80, 84]
+gate = "Skill lifecycle, tool-surface, Dreamer economics, EliotSelfQualityView, bottleneck diagnosis, and advisory intervention are frozen as candidate-only assessments; no aggregate score, no self-promotion."
+
+[[stage]]
+id = "W9_UNDERSTANDING_ASSESSMENT"
+orders = [85, 86]
+gate = "Common Ground and scoped understanding are frozen as public causal-inheritance assessments with LOCALLY_ADEQUATE discipline; no global score, no second compilation."
+
+[[product_pulse]]
+id = "W9_MEMORY_QUALITY_PULSE_01"
+scenario = "One bounded memory scope yields a MemoryEcologyAssessment with exact denominator, gravity/cost fields, and maintenance aggregates consumed as an immutable projection."
+status = "NOT_EXECUTED"
+proof_ceiling = "Exact-scenario Product proof only"
+
+[[product_pulse]]
+id = "W9_COGNITIVE_QUALITY_PULSE_01"
+scenario = "One Skill revision and one Dreamer job family yield lifecycle, tool-surface, economics, self-quality, bottleneck, and intervention candidates with exact denominators and no aggregate score."
+status = "NOT_EXECUTED"
+proof_ceiling = "Exact-scenario Product proof only"
+
+[[product_pulse]]
+id = "W9_UNDERSTANDING_PULSE_01"
+scenario = "One question/task family at one State Fence yields a CommonGroundAssessment and ScopedUnderstandingAssessment with rival-aware prediction-before-observation and held-out discipline where product claims apply."
+status = "NOT_EXECUTED"
+proof_ceiling = "Exact-scenario Product proof only"
+
+[[assignment]]
+order = 76
+crate = "eliot-memory-quality"
+manifest = "crates/smart/eliot-memory-quality/module.toml"
+functional_cell = "smart.memory.ecology"
+depends_on = []
+product_pulse = "W9_MEMORY_QUALITY_PULSE_01"
+package_action = "create_prototype_crate"
+
+[[assignment]]
+order = 77
+crate = "eliot-memory-quality"
+manifest = "crates/smart/eliot-memory-quality/module.toml"
+functional_cell = "smart.memory.gravity"
+depends_on = ["eliot-memory-quality"]
+product_pulse = "W9_MEMORY_QUALITY_PULSE_01"
+package_action = "create_prototype_crate"
+
+[[assignment]]
+order = 78
+crate = "eliot-memory-quality"
+manifest = "crates/smart/eliot-memory-quality/module.toml"
+functional_cell = "smart.memory.lifecycle_economics"
+depends_on = ["eliot-memory-quality"]
+product_pulse = "W9_MEMORY_QUALITY_PULSE_01"
+package_action = "create_prototype_crate"
+
+[[assignment]]
+order = 79
+crate = "eliot-dreamer-memory-revision"
+manifest = "crates/smart/eliot-dreamer-memory-revision/module.toml"
+functional_cell = "smart.dreamer.memory_revision"
+depends_on = []
+product_pulse = "W9_MEMORY_QUALITY_PULSE_01"
+package_action = "create_prototype_crate"
+
+[[assignment]]
+order = 80
+crate = "eliot-cognitive-quality"
+manifest = "crates/smart/eliot-cognitive-quality/module.toml"
+functional_cell = "smart.skill.lifecycle"
+depends_on = []
+product_pulse = "W9_COGNITIVE_QUALITY_PULSE_01"
+package_action = "create_prototype_crate"
+
+[[assignment]]
+order = 81
+crate = "eliot-cognitive-quality"
+manifest = "crates/smart/eliot-cognitive-quality/module.toml"
+functional_cell = "smart.tool.surface"
+depends_on = ["eliot-cognitive-quality"]
+product_pulse = "W9_COGNITIVE_QUALITY_PULSE_01"
+package_action = "create_prototype_crate"
+
+[[assignment]]
+order = 82
+crate = "eliot-cognitive-quality"
+manifest = "crates/smart/eliot-cognitive-quality/module.toml"
+functional_cell = "smart.dreamer.job_economics"
+depends_on = ["eliot-cognitive-quality"]
+product_pulse = "W9_COGNITIVE_QUALITY_PULSE_01"
+package_action = "create_prototype_crate"
+
+[[assignment]]
+order = 83
+crate = "eliot-cognitive-quality"
+manifest = "crates/smart/eliot-cognitive-quality/module.toml"
+functional_cell = "smart.self.quality_view"
+depends_on = ["eliot-cognitive-quality"]
+product_pulse = "W9_COGNITIVE_QUALITY_PULSE_01"
+package_action = "create_prototype_crate"
+
+[[assignment]]
+order = 84
+crate = "eliot-cognitive-quality"
+manifest = "crates/smart/eliot-cognitive-quality/module.toml"
+functional_cell = "smart.self.intervention_candidate"
+depends_on = ["eliot-cognitive-quality"]
+product_pulse = "W9_COGNITIVE_QUALITY_PULSE_01"
+package_action = "create_prototype_crate"
+
+[[assignment]]
+order = 85
+crate = "eliot-understanding-assessment"
+manifest = "crates/smart/eliot-understanding-assessment/module.toml"
+functional_cell = "smart.understanding.common_ground"
+depends_on = []
+product_pulse = "W9_UNDERSTANDING_PULSE_01"
+package_action = "create_prototype_crate"
+
+[[assignment]]
+order = 86
+crate = "eliot-understanding-assessment"
+manifest = "crates/smart/eliot-understanding-assessment/module.toml"
+functional_cell = "smart.understanding.scoped_assessment"
+depends_on = ["eliot-understanding-assessment"]
+product_pulse = "W9_UNDERSTANDING_PULSE_01"
+package_action = "create_prototype_crate"
+
+[assignment_output]
+required = ["implementation in declared scope", "package/module proof", "affected Edge proof", "named Product Pulse when applicable", "donor trace", "ContractChallenges", "merge/remove recommendation"]
+
+[[agent_brief]]
+order = 76
+crate = "eliot-memory-quality"
+functional_cell = "smart.memory.ecology"
+objective = "Assess memory ecology per item and cluster from immutable owner-produced projections only; emit MemoryEcologyAssessment with exact denominator."
+write_scope = ["crates/smart/eliot-memory-quality/**"]
+inputs = ["immutable MemoryProjectionRecord read set by handle (CC-008)", "admitted task/continuity/safety projections by handle (CC-004)"]
+outputs = ["MemoryEcologyAssessment"]
+forbidden = ["canonical state", "lifecycle transition", "support/influence promotion", "retrieval/popularity as utility", "aggregate intelligence score", "store queries in Smart"]
+stop_condition = "Stop and return ContractChallenge when an owner-neutral input projection is missing, denominator is incomplete, or promotion/authority is required."
+proof_ceiling = "STATIC_FIELD_CONTRACT_ONLY"
+implementation_support = "TARGET"
+evidence_execution_status = "NOT_EXECUTED"
+
+[[agent_brief]]
+order = 77
+crate = "eliot-memory-quality"
+functional_cell = "smart.memory.gravity"
+objective = "Assess context-dominance/gravity and maintenance/storage/curation cost as observed influence-ladder position with exact denominator; never infer support from low use."
+write_scope = ["crates/smart/eliot-memory-quality/**"]
+inputs = ["immutable MemoryProjectionRecord read set by handle (CC-008)", "HarnessActivationReceipt candidates by handle"]
+outputs = ["MemoryEcologyAssessment gravity section"]
+forbidden = ["canonical state", "support reduction from low use", "retrieval/repetition as reinforcement", "aggregate score", "effect/authority"]
+stop_condition = "Stop and return ContractChallenge when gravity inputs lack denominator, fence, scope, or omission semantics."
+proof_ceiling = "STATIC_FIELD_CONTRACT_ONLY"
+implementation_support = "TARGET"
+evidence_execution_status = "NOT_EXECUTED"
+
+[[agent_brief]]
+order = 78
+crate = "eliot-memory-quality"
+functional_cell = "smart.memory.lifecycle_economics"
+objective = "Project whole-trajectory lifecycle economics and maintenance aggregates as candidate evidence with exact amortization horizon and exclusions."
+write_scope = ["crates/smart/eliot-memory-quality/**"]
+inputs = ["immutable curation/cost/attempt projections by handle"]
+outputs = ["MemoryLifecycleEconomicsProfile candidate", "maintenance aggregates", "cold-capture counter-metrics"]
+forbidden = ["universal fixed thresholds", "hidden-cost local improvement as net improvement", "auto-promotion/auto-deletion", "authority/finish"]
+stop_condition = "Stop and return ContractChallenge when cost/coverage inputs lack complete denominator or horizon."
+proof_ceiling = "STATIC_FIELD_CONTRACT_ONLY"
+implementation_support = "TARGET"
+evidence_execution_status = "NOT_EXECUTED"
+
+[[agent_brief]]
+order = 79
+crate = "eliot-dreamer-memory-revision"
+functional_cell = "smart.dreamer.memory_revision"
+objective = "Propose one advisory negative-memory extinction candidate narrowing activation/influence only; preserve original failure history verbatim."
+write_scope = ["crates/smart/eliot-dreamer-memory-revision/**"]
+inputs = ["immutable FailureObservation by handle (CC-FAILURE-OBSERVATION-SCHEMA)", "MemoryRevisionEvidence refs by handle", "admitted task/safety projections by handle (CC-004)"]
+outputs = ["NegativeMemoryExtinctionCandidate"]
+forbidden = ["physical purge without full closure", "narrative rewrite", "suppression from rare action-change alone", "canonical writes", "effect/authority"]
+stop_condition = "Stop and return ContractChallenge when failure/revision inputs lack denominator or when irreversible extinction is requested without adequate adjudication."
+proof_ceiling = "STATIC_FIELD_CONTRACT_ONLY"
+implementation_support = "TARGET"
+evidence_execution_status = "NOT_EXECUTED"
+
+[[agent_brief]]
+order = 80
+crate = "eliot-cognitive-quality"
+functional_cell = "smart.skill.lifecycle"
+objective = "Maintain one derived SkillLifecycleView per Skill revision from execution evidence; lifecycle changes remain reversible candidates."
+write_scope = ["crates/smart/eliot-cognitive-quality/**"]
+inputs = ["immutable Skill execution evidence by handle", "HarnessActivationReceipt candidates by handle"]
+outputs = ["SkillLifecycleView candidate"]
+forbidden = ["installed/delivered/executed/useful conflation", "retrieval/repetition/agreement as reinforcement", "Skill/tool/config mutation", "authority/finish"]
+stop_condition = "Stop and return ContractChallenge when execution evidence lacks exact steps/artifacts/verifiers or denominator."
+proof_ceiling = "STATIC_FIELD_CONTRACT_ONLY"
+implementation_support = "TARGET"
+evidence_execution_status = "NOT_EXECUTED"
+
+[[agent_brief]]
+order = 81
+crate = "eliot-cognitive-quality"
+functional_cell = "smart.tool.surface"
+objective = "Assess tool-surface fit from exact tool-definition versions, eligibility/activation/adherence checkpoints, and false-activation history; mark stale before material use on definition change."
+write_scope = ["crates/smart/eliot-cognitive-quality/**"]
+inputs = ["immutable tool-definition versions by handle", "HarnessActivationReceipt candidates by handle"]
+outputs = ["ToolSurfaceAssessment candidate"]
+forbidden = ["tool availability as utility proof", "silent scope widening", "scheduler/effect ownership"]
+stop_condition = "Stop and return ContractChallenge when tool-definition or activation inputs lack version/fence/denominator."
+proof_ceiling = "STATIC_FIELD_CONTRACT_ONLY"
+implementation_support = "TARGET"
+evidence_execution_status = "NOT_EXECUTED"
+
+[[agent_brief]]
+order = 82
+crate = "eliot-cognitive-quality"
+functional_cell = "smart.dreamer.job_economics"
+objective = "Project Dreamer job/family economics from durable job, route-usage, curation, and outcome receipts; promotion requires declared downstream utility exceeding full cost plus measured harms."
+write_scope = ["crates/smart/eliot-cognitive-quality/**"]
+inputs = ["immutable Durable Job receipts by handle", "route-usage/curation/outcome receipts by handle"]
+outputs = ["DreamerJobEconomics candidate"]
+forbidden = ["new ownership of jobs/routes", "single intelligence score", "elegant-but-unused synthesis as utility", "autonomous schedule promotion"]
+stop_condition = "Stop and return ContractChallenge when job/cost/outcome inputs lack held-out/live window or complete cost ledger."
+proof_ceiling = "STATIC_FIELD_CONTRACT_ONLY"
+implementation_support = "TARGET"
+evidence_execution_status = "NOT_EXECUTED"
+
+[[agent_brief]]
+order = 83
+crate = "eliot-cognitive-quality"
+functional_cell = "smart.self.quality_view"
+objective = "Project one problem-oriented EliotSelfQualityView with counter-metrics and learning-bottleneck diagnosis; identify failing contours, never emit a global score."
+write_scope = ["crates/smart/eliot-cognitive-quality/**"]
+inputs = ["immutable SystemObservationJournal/EliotSystemExperienceBank/AgentFeedbackReceipt projections by handle", "product/runtime evidence by handle"]
+outputs = ["EliotSelfQualityView candidate", "LearningBottleneckDiagnosis candidate"]
+forbidden = ["second projection ownership", "global intelligence score", "silent system rewrite", "self-certification", "self-promotion"]
+stop_condition = "Stop and return ContractChallenge when observation coverage lacks ObligationProfile comparison or bottleneck inputs lack denominators."
+proof_ceiling = "STATIC_FIELD_CONTRACT_ONLY"
+implementation_support = "TARGET"
+evidence_execution_status = "NOT_EXECUTED"
+
+[[agent_brief]]
+order = 84
+crate = "eliot-cognitive-quality"
+functional_cell = "smart.self.intervention_candidate"
+objective = "Propose one advisory SelfQualityInterventionReceipt with causal hypothesis, rivals, discriminator, authority refs, rollback, and terminal disposition; recurring same-hypothesis failure yields Mechanism Review."
+write_scope = ["crates/smart/eliot-cognitive-quality/**"]
+inputs = ["immutable Problem/ImprovementCandidate refs by handle", "applicable verifier/Product Pulse refs by handle"]
+outputs = ["SelfQualityInterventionReceipt candidate"]
+forbidden = ["equivalent retry without changed hypothesis/discriminator", "activity/summary volume as closure", "task finish", "authority promotion"]
+stop_condition = "Stop and return ContractChallenge when causal hypothesis lacks rivals/discriminator or authority/rollback scope is missing."
+proof_ceiling = "STATIC_FIELD_CONTRACT_ONLY"
+implementation_support = "TARGET"
+evidence_execution_status = "NOT_EXECUTED"
+
+[[agent_brief]]
+order = 85
+crate = "eliot-understanding-assessment"
+functional_cell = "smart.understanding.common_ground"
+objective = "Check Common Ground as public causal inheritance survival across model/harness change; tacit competence requires requalification."
+write_scope = ["crates/smart/eliot-understanding-assessment/**"]
+inputs = ["immutable ActiveUnderstandingView by handle (contract_only)", "accepted-source projection by handle (CC-006)"]
+outputs = ["CommonGroundAssessment candidate"]
+forbidden = ["summary similarity as Common Ground", "native continuation state as inheritance", "second ContextCompiler invocation", "mutable UnderstandingState", "second admission pass"]
+stop_condition = "Stop and return ContractChallenge when compiled-view or accepted-source inputs lack handles or when a second compilation/admission is required."
+proof_ceiling = "STATIC_FIELD_CONTRACT_ONLY"
+implementation_support = "TARGET"
+evidence_execution_status = "NOT_EXECUTED"
+
+[[agent_brief]]
+order = 86
+crate = "eliot-understanding-assessment"
+functional_cell = "smart.understanding.scoped_assessment"
+objective = "Emit one ScopedUnderstandingAssessment per question/task family at one State Fence with rival-aware prediction-before-observation and applicable held-out discipline."
+write_scope = ["crates/smart/eliot-understanding-assessment/**"]
+inputs = ["immutable ActiveUnderstandingView by handle (contract_only)", "outcome/verifier evidence by handle"]
+outputs = ["ScopedUnderstandingAssessment"]
+forbidden = ["global understands flag", "single understanding score", "graphs/prose/delivery/agreement as LOCALLY_ADEQUATE", "fixed graph/edge/context thresholds as proof", "model agreement as understanding"]
+stop_condition = "Stop and return ContractChallenge when rival model, pre-observation prediction, discriminator, outcome/verifier, or revision discipline is missing."
+proof_ceiling = "STATIC_FIELD_CONTRACT_ONLY"
+implementation_support = "TARGET"
+evidence_execution_status = "NOT_EXECUTED"
+
+[[field_contract]]
+id = "MemoryEcologyAssessment"
+owner_crate = "eliot-memory-quality"
+family = "memory ecology and memory gravity"
+source_handles = ["I12-21", "I12-34"]
+status = "FROZEN_STATIC_FIELD_CONTRACT"
+proof_ceiling = "STATIC_FIELD_CONTRACT_ONLY"
+implementation_support = "TARGET"
+evidence_execution_status = "NOT_EXECUTED"
+fields = ["subject_item_and_cluster_refs", "retrieval_acknowledgement_verified_use_and_decision_delta_history", "verification_success_contradiction_stale_hit_and_false_activation_history", "horizon_checkpoint_expiry_eviction_regime_and_workload_exposure_denominators", "representation_path_raw_episode_or_typed_relation_or_compiled_view_or_active_context", "historical_recall_and_current_state_outcomes_separately", "outcome_classes_correct_or_wrong_specific_or_abstained_or_unknown", "evaluator_revision_provenance_comparison_intervention_and_uncertainty", "context_dominance_gravity_and_maintenance_storage_curation_cost", "minority_evidence_and_unresolved_discriminators", "where_applies_and_where_not_applies_and_transfer_evidence", "negative_transfer_poisoned_influence_and_suppression_history", "obsolete_current_reopen_cohorts_and_valid_near_match_positive_controls", "residual_distinctions_lost_or_retained_by_compression", "recommended_action_keep_or_narrow_or_split_or_compress_or_suppress_or_archive_or_reactivate_or_review", "influence_ladder_stored_to_outcome_supported_or_refuted", "lifecycle_economics_capture_ingest_read_write_storage_semantic_reconciliation_freshness_retrieval_curation_attention_prevented_errors_missing_coverage_exclusions_amortization_horizon", "maintenance_aggregates_candidate_backlog_stale_conflicted_superseded_cue_coverage_false_activations_unused_cargo_negative_transfer_poisoned_influence_missing_forgetting_promotion_rate_curation_quality_reconstruction_cost_decision_quality", "cold_capture_ratio_time_to_binding_p50_p95_cold_capture_never_bound_binding_rejection_or_rebind_rate", "weak_claim_rate_with_denominator_task_route_corpus_profile_age_operation_mix_evaluator_revision_exclusions_uncertainty"]
+denominator = "evaluated_memory_items over declared_corpus_scope_at_named_horizon_with_workload_exposure_denominator_and_explicit_exclusions"
+denominator_rule = "RECHECK: count evaluated items from retained evidence refs; re-resolve declared scope digest, horizon/checkpoint, workload/exposure denominator, and exclusions; recompute weak_claim_rate and cold-capture ratios from the same inputs. Any Complete coverage state without this exact denominator is invalid."
+complete_rule = "Every Complete state requires the exact independently recheckable denominator above; omission list and fence must be present or the assessment is INCONCLUSIVE."
+fence = "StateFence revisions plus horizon/checkpoint; historical-recall and current-state outcomes recorded separately."
+omission_semantics = "Missing evidence is listed per field as unknown with reason; low use never reduces support; retrieval/repetition/agreement never reinforce support."
+invariants = ["low use never reduces epistemic support", "negative memory and invariants are not suppressed only because they rarely changed an action", "minority evidence stays addressable until discriminator or applicability resolves", "no aggregate intelligence/confidence/utility score", "retrieval/popularity/completion/delivery/tool-availability/model-agreement do not establish utility or support"]
+
+[[field_contract]]
+id = "NegativeMemoryExtinctionCandidate"
+owner_crate = "eliot-dreamer-memory-revision"
+family = "negative-memory extinction candidate"
+source_handles = ["I12-19", "I12-21"]
+status = "FROZEN_STATIC_FIELD_CONTRACT"
+proof_ceiling = "STATIC_FIELD_CONTRACT_ONLY"
+implementation_support = "TARGET"
+evidence_execution_status = "NOT_EXECUTED"
+fields = ["failure_fingerprint_trigger", "failure_fingerprint_failed_action", "failure_fingerprint_affected_scope_resources", "failure_fingerprint_violated_invariant", "failure_fingerprint_evidence", "failure_fingerprint_causal_status", "failure_fingerprint_do_not_repeat_until", "failure_fingerprint_reopen_condition", "failure_fingerprint_discriminative_check", "failure_fingerprint_false_activation_history", "revision_prior_and_new_record_or_model_refs", "revision_reactivation_trigger_and_task_scope", "revision_new_observation_outcome_or_prediction_error", "revision_old_and_new_epistemic_accessibility_and_influence_state", "revision_retained_narrowed_and_lost_distinctions", "revision_retrieval_downstream_use_interference_and_false_recall_checks", "revision_affected_procedures_views_and_dependency_closure", "revision_rollback_reopen_or_no_return_boundary", "revision_verifier_or_review_disposition", "extinction_proposed_activation_influence_narrowing_only", "extinction_evaluation_operation_equals_extinguish_with_evaluator_kind_ground_truth_scope_cohorts_false_delete_retain_block_reopen_counts_abstention_coverage_delayed_ood_noninferiority_replica_restore_uncertainty_terminal_disposition"]
+denominator = "enumerated_affected_procedures_views_and_dependency_closure over independently_re-enumerated_closure_at_named_fence_with_exclusions"
+denominator_rule = "RECHECK: re-enumerate affected procedures/views/dependency closure from retained refs at the named fence; verify false-activation history and valid-near-match positive controls are present; recompute false-delete/false-retain/false-block/reopen counts from the same inputs. Extinction Completeness without this closure is invalid."
+complete_rule = "Every Complete state requires the exact independently recheckable closure denominator above; without adequate adjudication only reversible suppress/quarantine/archive is allowed."
+fence = "Task scope plus StateFence revisions; exact deterministic trigger scope for block/probe."
+omission_semantics = "Missing closure members block completeness; similarity only warns, exact trigger blocks or requires probe."
+invariants = ["extinction narrows influence after new evidence and history remains", "raw episodes and source observations remain immutable", "revision changes current support/applicability/accessibility/influence through forward transitions only", "no second memory system", "recurring failure with the same causal hypothesis yields Mechanism Review rather than another equivalent retry"]
+
+[[field_contract]]
+id = "CognitiveQualityAssessment"
+owner_crate = "eliot-cognitive-quality"
+family = "skill lifecycle, tool-surface, Dreamer economics, EliotSelfQualityView, bottleneck, advisory intervention"
+source_handles = ["I07-25", "I09-16", "I16-23", "I12-34"]
+status = "FROZEN_STATIC_FIELD_CONTRACT"
+proof_ceiling = "STATIC_FIELD_CONTRACT_ONLY"
+implementation_support = "TARGET"
+evidence_execution_status = "NOT_EXECUTED"
+fields = ["skill_ref_and_revision", "skill_task_host_route_and_governance_scope", "skill_applies_when_and_does_not_apply_when", "skill_dependency_and_tool_definition_versions", "skill_delivered_expanded_and_executed_counts", "skill_eligibility_activation_and_activation_latency", "skill_adherence_at_early_mid_and_final_checkpoints", "skill_verified_success_failure_and_uncertain_outcomes", "skill_observed_decision_or_verifier_delta", "skill_false_activation_and_distractor_history", "skill_interactions_ordering_and_mutual_exclusion", "skill_stale_or_quarantine_reason", "skill_proposed_action_keep_or_patch_or_split_or_merge_or_suppress_or_archive_or_quarantine_or_restore", "skill_evidence_review_and_rollback", "tool_surface_eligibility_retrieval_delivery_activation_adherence_per_attempt_with_exact_tool_definition_version", "tool_surface_where_not_apply_stop_and_escalation_first_class", "dreamer_job_accepted_rejected_expired_candidates", "dreamer_job_verified_decision_verifier_and_downstream_outcome_delta", "dreamer_job_false_merge_split_procedure_and_negative_transfer", "dreamer_job_source_coverage_missed_material_evidence_and_unresolved_uncertainty", "dreamer_job_model_agent_swarm_calls_raw_route_usage_and_retries", "dreamer_job_cpu_ram_storage_network_queue_wait_wall_latency_and_human_attention", "dreamer_job_context_reconstruction_savings_without_shifted_cost", "dreamer_job_clarification_usefulness_backlog_age_and_expiry", "dreamer_job_model_route_calibration_rollback_and_invalidation", "self_quality_agent_loop_and_no_progress", "self_quality_observation_coverage_and_integration_gaps", "self_quality_context_packet_size_quality_and_feedback", "self_quality_memory_growth_staleness_duplicates_false_activation_and_use", "self_quality_dreamer_watchdog_doctor_job_utility_and_failures", "self_quality_configuration_maintenance_and_update_outcomes", "self_quality_orphan_descendant_and_unknown_effect_state", "self_quality_product_pulse_and_user_outcome_delta", "self_quality_open_problems_improvement_candidates_and_human_actions", "self_quality_counter_metrics_context_bytes_vs_usefulness_delivery_vs_use_growth_vs_resolved_activity_vs_progress_cost_vs_delta_maintenance_vs_recurrence_resolution_latency", "bottleneck_diagnosis_update_quality_high_activation_low_or_activation_high_adherence_low_or_adherence_high_no_delta_or_delta_present_outcome_worse_or_immediate_gain_retention_regression", "intervention_id_and_trigger_observation_refs", "intervention_affected_capability_scope_and_owner", "intervention_causal_hypothesis_rivals_and_discriminator", "intervention_selected_action_observe_or_repair_or_configure_or_reroute_or_experiment_or_abstain_or_escalate", "intervention_candidate_change_and_authority_refs", "intervention_proof_ceiling_verifier_and_counter_metrics", "intervention_rollback_and_validity_scope", "intervention_immediate_and_delayed_outcomes", "intervention_terminal_disposition_retained_or_narrowed_or_rolled_back_or_reopened_or_escalated_or_inconclusive", "intervention_system_observation_and_experience_writeback_refs"]
+denominator = "per_sub_assessment_denominators: skill_counts_over_task_host_route_scope_with_tool_versions; job_window_over_declared_job_family_with_full_cost_ledger; self_quality_observations_over_obligation_profile; intervention_scope_closure_over_affected_capability"
+denominator_rule = "RECHECK: for Skill/tool-surface recompute delivered/expanded/executed and eligibility/activation/adherence from per-attempt HarnessActivationReceipt refs at the named scope; for Dreamer economics re-resolve the declared job/job-family window and full compute/storage/context/Human cost ledger plus held-out/live outcome refs; for SelfQuality compare observations against the ObservationObligationProfile; for intervention re-enumerate the affected capability closure. Each Complete sub-assessment requires its own exact denominator; aggregate counts never substitute for per-attempt receipts."
+complete_rule = "Every Complete state requires the exact independently recheckable per-sub-assessment denominator above; installed != delivered != executed != useful; acknowledgement is not use; use is not adherence; adherence is not benefit."
+fence = "Task/host/route/governance scope plus StateFence; tool-definition versions pin staleness."
+omission_semantics = "Silence about adherence is unknown, not compliance; shared success may remain distributed or uncertain; missing observability stays unknown."
+invariants = ["no aggregate intelligence/confidence/utility score and no aggregate learning score", "retrieval/repetition/model-agreement do not reinforce a Skill", "Dreamer/Curator proposals remain reversible candidates until governed promotion", "recurring failure without changed hypothesis or discriminator opens Mechanism Review", "one model's delete recommendation is never its own oracle", "proof depth follows effect per I12-21 lifecycle rules"]
+
+[[field_contract]]
+id = "UnderstandingAssessment"
+owner_crate = "eliot-understanding-assessment"
+family = "Common Ground and scoped understanding"
+source_handles = ["I06-16", "A00-07", "A06-07", "I12-34"]
+status = "FROZEN_STATIC_FIELD_CONTRACT"
+proof_ceiling = "STATIC_FIELD_CONTRACT_ONLY"
+implementation_support = "TARGET"
+evidence_execution_status = "NOT_EXECUTED"
+fields = ["common_ground_terminology_compatibility", "common_ground_reference_compatibility", "common_ground_commitment_compatibility", "common_ground_action_consequence_compatibility", "common_ground_goals_decisions_invariants_rivals_unknowns_survival_after_model_harness_change", "common_ground_public_inheritance_transfer_refs", "common_ground_requalification_scope_for_tacit_competence", "scoped_subject_route_or_coupled_system", "scoped_question_and_task_family", "scoped_product_and_state_fence", "scoped_current_model_and_rivals", "scoped_material_unknowns", "scoped_pre_probe_predictions_fixed_before_observation", "scoped_selected_discriminator_or_action", "scoped_observed_outcome_and_verifier", "scoped_model_revision_after_outcome", "scoped_counterfactual_or_held_out_evidence", "scoped_transfer_boundary_and_requalification", "scoped_onboarding_slice_and_missing_inputs", "scoped_status_not_onboarded_or_untested_or_locally_adequate_or_refuted_or_inconclusive_or_stale", "scoped_unanswerable_stale_case_where_applicable", "scoped_counterfactual_intervention_or_state_update_case_where_applicable", "scoped_held_out_compositional_transfer_where_applicable", "scoped_abstention_precision_coverage_where_applicable"]
+denominator = "declared_question_task_family_times_state_fence_with_onboarding_slice_plus_discriminator_plus_outcome_verifier_closure"
+denominator_rule = "RECHECK: re-resolve the declared question/task family, product/State Fence, onboarding slice, and missing inputs; verify a public rival-aware model, a prediction fixed before observation, a discriminative probe/action, applicable outcome/verifier evidence, and revision on failure; for product claims verify held-out or leakage-controlled evidence. Any LOCALLY_ADEQUATE without this exact closure is invalid."
+complete_rule = "Every Complete state and every LOCALLY_ADEQUATE requires the exact independently recheckable denominator above; NOT_ONBOARDED forbids LOCALLY_ADEQUATE until missing inputs resolve."
+fence = "Product and State Fence binding per assessment; transfer requires explicit boundary and requalification."
+omission_semantics = "Graphs, prose quality, self-report, delivery receipts, or correlated-agent agreement cannot set LOCALLY_ADEQUATE; fixed graph/edge/context thresholds cannot establish understanding."
+invariants = ["no global understands flag and no single understanding score", "Common Ground is public causal inheritance, not summary similarity or native continuation state", "LOCALLY_ADEQUATE requires rival-aware model plus prediction before observation plus discriminator plus applicable outcome/verifier plus revision discipline", "product claims additionally require held-out or leakage-controlled evaluation", "no second ContextCompiler invocation, no mutable UnderstandingState, no second admission pass"]
+
+[[ownership]]
+public_type = "MemoryEcologyAssessment"
+owner_crate = "eliot-memory-quality"
+functional_cells = ["smart.memory.ecology", "smart.memory.gravity", "smart.memory.lifecycle_economics"]
+manifest = "crates/smart/eliot-memory-quality/module.toml"
+contract_index = "MemoryEcologyAssessment"
+consumers = ["eliot-dreamer-accessibility (inputs)", "Governor disposition path (candidate only)"]
+
+[[ownership]]
+public_type = "MemoryLifecycleEconomicsProfile"
+owner_crate = "eliot-memory-quality"
+functional_cells = ["smart.memory.lifecycle_economics"]
+manifest = "crates/smart/eliot-memory-quality/module.toml"
+contract_index = "MemoryEcologyAssessment"
+consumers = ["Governor disposition path (candidate only)"]
+
+[[ownership]]
+public_type = "NegativeMemoryExtinctionCandidate"
+owner_crate = "eliot-dreamer-memory-revision"
+functional_cells = ["smart.dreamer.memory_revision"]
+manifest = "crates/smart/eliot-dreamer-memory-revision/module.toml"
+contract_index = "NegativeMemoryExtinctionCandidate"
+consumers = ["Governor transition path (advisory only)"]
+
+[[ownership]]
+public_type = "SkillLifecycleView"
+owner_crate = "eliot-cognitive-quality"
+functional_cells = ["smart.skill.lifecycle"]
+manifest = "crates/smart/eliot-cognitive-quality/module.toml"
+contract_index = "CognitiveQualityAssessment"
+consumers = ["Dreamer/Curator review surface (candidate only)"]
+
+[[ownership]]
+public_type = "DreamerJobEconomics"
+owner_crate = "eliot-cognitive-quality"
+functional_cells = ["smart.dreamer.job_economics"]
+manifest = "crates/smart/eliot-cognitive-quality/module.toml"
+contract_index = "CognitiveQualityAssessment"
+consumers = ["Dreamer route/curation review surface (projection only)"]
+
+[[ownership]]
+public_type = "EliotSelfQualityView"
+owner_crate = "eliot-cognitive-quality"
+functional_cells = ["smart.self.quality_view"]
+manifest = "crates/smart/eliot-cognitive-quality/module.toml"
+contract_index = "CognitiveQualityAssessment"
+consumers = ["Governor/Diagnostic Compiler projection owner (this crate supplies candidates only)"]
+
+[[ownership]]
+public_type = "SelfQualityInterventionReceipt"
+owner_crate = "eliot-cognitive-quality"
+functional_cells = ["smart.self.intervention_candidate"]
+manifest = "crates/smart/eliot-cognitive-quality/module.toml"
+contract_index = "CognitiveQualityAssessment"
+consumers = ["Human/Main Agent/Governor decision owner (candidate only)"]
+
+[[ownership]]
+public_type = "CommonGroundAssessment"
+owner_crate = "eliot-understanding-assessment"
+functional_cells = ["smart.understanding.common_ground"]
+manifest = "crates/smart/eliot-understanding-assessment/module.toml"
+contract_index = "UnderstandingAssessment"
+consumers = ["model/harness-change review path (candidate only)"]
+
+[[ownership]]
+public_type = "ScopedUnderstandingAssessment"
+owner_crate = "eliot-understanding-assessment"
+functional_cells = ["smart.understanding.scoped_assessment"]
+manifest = "crates/smart/eliot-understanding-assessment/module.toml"
+contract_index = "UnderstandingAssessment"
+consumers = ["product acceptance path (candidate only, held-out where applicable)"]
+
+[[field_contract_index]]
+contract_id = "MemoryEcologyAssessment"
+owner_crate = "eliot-memory-quality"
+manifest = "crates/smart/eliot-memory-quality/module.toml"
+denominator_ref = "evaluated_memory_items over declared_corpus_scope_at_named_horizon_with_workload_exposure_denominator_and_explicit_exclusions"
+source_handles = ["I12-21", "I12-34"]
+proof_ceiling = "STATIC_FIELD_CONTRACT_ONLY"
+
+[[field_contract_index]]
+contract_id = "NegativeMemoryExtinctionCandidate"
+owner_crate = "eliot-dreamer-memory-revision"
+manifest = "crates/smart/eliot-dreamer-memory-revision/module.toml"
+denominator_ref = "enumerated_affected_procedures_views_and_dependency_closure over independently_re-enumerated_closure_at_named_fence_with_exclusions"
+source_handles = ["I12-19", "I12-21"]
+proof_ceiling = "STATIC_FIELD_CONTRACT_ONLY"
+
+[[field_contract_index]]
+contract_id = "CognitiveQualityAssessment"
+owner_crate = "eliot-cognitive-quality"
+manifest = "crates/smart/eliot-cognitive-quality/module.toml"
+denominator_ref = "per_sub_assessment_denominators (skill counts; job window with cost ledger; observations over obligation profile; intervention closure)"
+source_handles = ["I07-25", "I09-16", "I16-23", "I12-34"]
+proof_ceiling = "STATIC_FIELD_CONTRACT_ONLY"
+
+[[field_contract_index]]
+contract_id = "UnderstandingAssessment"
+owner_crate = "eliot-understanding-assessment"
+manifest = "crates/smart/eliot-understanding-assessment/module.toml"
+denominator_ref = "declared_question_task_family_times_state_fence_with_onboarding_slice_plus_discriminator_plus_outcome_verifier_closure"
+source_handles = ["I06-16", "A00-07", "A06-07", "I12-34"]
+proof_ceiling = "STATIC_FIELD_CONTRACT_ONLY"
+
+[[crate_manifest]]
+crate = "eliot-memory-quality"
+manifest = "crates/smart/eliot-memory-quality/module.toml"
+status = "PROTOTYPE"
+functional_cells = ["smart.memory.ecology", "smart.memory.gravity", "smart.memory.lifecycle_economics"]
+workspace_admission = "forbidden until implementation, package proof, affected edge proof, current-main rebase and integration-owner review"
+
+[[crate_manifest]]
+crate = "eliot-dreamer-memory-revision"
+manifest = "crates/smart/eliot-dreamer-memory-revision/module.toml"
+status = "PROTOTYPE"
+functional_cells = ["smart.dreamer.memory_revision"]
+workspace_admission = "forbidden until implementation, package proof, affected edge proof, current-main rebase and integration-owner review"
+
+[[crate_manifest]]
+crate = "eliot-cognitive-quality"
+manifest = "crates/smart/eliot-cognitive-quality/module.toml"
+status = "PROTOTYPE"
+functional_cells = ["smart.skill.lifecycle", "smart.tool.surface", "smart.dreamer.job_economics", "smart.self.quality_view", "smart.self.intervention_candidate"]
+workspace_admission = "forbidden until implementation, package proof, affected edge proof, current-main rebase and integration-owner review"
+
+[[crate_manifest]]
+crate = "eliot-understanding-assessment"
+manifest = "crates/smart/eliot-understanding-assessment/module.toml"
+status = "PROTOTYPE"
+functional_cells = ["smart.understanding.common_ground", "smart.understanding.scoped_assessment"]
+workspace_admission = "forbidden until implementation, package proof, affected edge proof, current-main rebase and integration-owner review"
+
+[[validation_gate]]
+id = "W9-TOML-PARSE"
+rule = "Every new or edited TOML parses with python tomllib; field-shape denominators are recheckable by the stated denominator_rule."
+status = "TARGET"
+evidence_execution_status = "NOT_EXECUTED"
+
+[[validation_gate]]
+id = "W9-COMPLETE-REQUIRES-DENOMINATOR"
+rule = "All Complete coverage states and every LOCALLY_ADEQUATE require the exact independently recheckable denominator in their field_contract; otherwise INCONCLUSIVE."
+status = "TARGET"
+evidence_execution_status = "NOT_EXECUTED"
+
+[[validation_gate]]
+id = "W9-NO-ADMISSION-NO-RUNTIME"
+rule = "No root Cargo.toml membership, no Cargo.lock entry, no Rust source, no bins change, no workflow change, no normative prose edit, no hand-edited generated index; workspace_admission stays forbidden."
+status = "TARGET"
+evidence_execution_status = "NOT_EXECUTED"
+
+[[validation_gate]]
+id = "W9-NO-REVIVAL-NO-OVERLAP"
+rule = "Distinct crate eliot-understanding-assessment only; retired eliot-understanding paths are never recreated; 233 memory-curation/dreamer-cycle and 246 cue files are untouched; orders 1-43 are never reused."
+status = "TARGET"
+evidence_execution_status = "NOT_EXECUTED"
+
+[[validation_gate]]
+id = "W9-PROOF-LADDER-CEILING"
+rule = "Transport/Retrieval/Use/DecisionDelta/OutcomeBenefit/Retention/Transfer ceilings per I12-34 apply; per-attempt HarnessActivationReceipt never substitutes for DecisionDelta or benefit; activation without first_qualifying_observable_use_ref proves only delivery."
+status = "TARGET"
+evidence_execution_status = "NOT_EXECUTED"
+
+[[edge]]
+producer = "Governor/Memory OS canonical projection owners"
+contract = "MemoryProjectionRecord read set (CC-008 by handle)"
+consumer = "eliot-memory-quality"
+compile_link = "contract_only"
+
+[[edge]]
+producer = "Governor canonical projection owners"
+contract = "admitted task/continuity/safety-negative-memory/affordance projections (CC-004 by handle)"
+consumer = "eliot-memory-quality, eliot-dreamer-memory-revision"
+compile_link = "contract_only"
+
+[[edge]]
+producer = "Governor canonical observation owner"
+contract = "FailureObservation (CC-FAILURE-OBSERVATION-SCHEMA by handle)"
+consumer = "eliot-dreamer-memory-revision"
+compile_link = "contract_only"
+
+[[edge]]
+producer = "Context/host observations, attempt/verifier evidence"
+contract = "HarnessActivationReceipt candidates"
+consumer = "eliot-memory-quality, eliot-cognitive-quality"
+compile_link = "contract_only"
+
+[[edge]]
+producer = "eliot-context-assembly"
+contract = "eliot-context-contracts::ActiveUnderstandingView"
+consumer = "eliot-understanding-assessment"
+compile_link = "contract_only"
+
+[[edge]]
+producer = "eliot-memory-quality"
+contract = "MemoryEcologyAssessment"
+consumer = "Governor disposition path"
+compile_link = "contract_only"
+
+[[edge]]
+producer = "eliot-dreamer-memory-revision"
+contract = "NegativeMemoryExtinctionCandidate"
+consumer = "Governor transition path"
+compile_link = "contract_only"
+
+[[edge]]
+producer = "eliot-cognitive-quality"
+contract = "CognitiveQualityAssessment (SkillLifecycleView, DreamerJobEconomics, EliotSelfQualityView, SelfQualityInterventionReceipt)"
+consumer = "Dreamer/Curator/Human/Governor review surfaces"
+compile_link = "contract_only"
+
+[[edge]]
+producer = "eliot-understanding-assessment"
+contract = "UnderstandingAssessment (CommonGroundAssessment, ScopedUnderstandingAssessment)"
+consumer = "model/harness-change and product acceptance paths"
+compile_link = "contract_only"
+
+[[forbidden_edge]]
+from = "eliot-understanding-assessment"
+to = "eliot-context-contracts admission algorithm or ContextCompiler"
+reason = "assessment consumes the already-compiled ActiveUnderstandingView; no second compilation or admission pass"
+
+[[forbidden_edge]]
+from = "any W9 crate"
+to = "storage adapter, kernel/daemon implementation, provider SDK, scheduler or effect executor"
+reason = "W9 assessments are deterministic candidate-only projections with no operational authority"
+
+[[donor]]
+path = "docs/architecture/I12-21-memory-ecology-residual-experience-and-transfer.md"
+disposition = "authoritative contract for MemoryEcologyAssessment fields, influence ladder, maintenance aggregates, cold-capture counter-metrics, lifecycle economics, revision evidence, and lifecycle rules"
+targets = ["eliot-memory-quality", "eliot-dreamer-memory-revision"]
+
+[[donor]]
+path = "docs/architecture/I12-19-negative-memory.md"
+disposition = "authoritative contract for FailureFingerprint fields and extinction-narrows-influence rule"
+targets = ["eliot-dreamer-memory-revision"]
+
+[[donor]]
+path = "docs/architecture/I07-25-skill-lifecycle-interaction-and-execution-evidence.md"
+disposition = "authoritative contract for SkillLifecycleView fields and installed/delivered/executed/useful rules"
+targets = ["eliot-cognitive-quality"]
+
+[[donor]]
+path = "docs/architecture/I09-16-dreamer-quality-and-job-economics.md"
+disposition = "authoritative contract for DreamerJobEconomics tracking dimensions and promotion rule"
+targets = ["eliot-cognitive-quality"]
+
+[[donor]]
+path = "docs/architecture/I16-23-eliot-self-quality-and-feedback-observability.md"
+disposition = "authoritative contract for EliotSelfQualityView, counter-metrics, SelfQualityInterventionReceipt, Mechanism Review, and bottleneck table"
+targets = ["eliot-cognitive-quality"]
+
+[[donor]]
+path = "docs/architecture/I06-16-scoped-understanding-assessment.md"
+disposition = "authoritative contract for ScopedUnderstandingAssessment fields, LOCALLY_ADEQUATE evidence minimum, and NOT_ONBOARDED rule"
+targets = ["eliot-understanding-assessment"]
+
+[[donor]]
+path = "docs/architecture/A00-07-core-vocabulary.md"
+disposition = "authoritative definition of Common Ground as verifiable compatibility of terminology/references/commitments/action consequences"
+targets = ["eliot-understanding-assessment"]
+
+[[donor]]
+path = "docs/architecture/A06-07-eliot-self-knowledge.md"
+disposition = "authoritative contract for post-model/harness-change Common Ground check with public inheritance transfer and requalification"
+targets = ["eliot-understanding-assessment"]
+
+[[donor]]
+path = "docs/architecture/I12-34-cognitive-proof-ladder-and-ecological-field-proof.md"
+disposition = "authoritative proof ladder and ceiling rules plus ecological A/B field-test shape for product-level understanding claims"
+targets = ["eliot-memory-quality", "eliot-cognitive-quality", "eliot-understanding-assessment"]
+
+[[donor]]
+path = "crates/smart/eliot-understanding"
+disposition = "RETIRED_DUPLICATE_UNDERSTANDING_FACADE reused by reference only; nothing copied; second ContextCompiler invocation and mutable UnderstandingState rejected"
+targets = ["eliot-understanding-assessment"]
+rejected_overgeneralization = "Independent mutable Understanding State or a second admission pass."
+
+[[deferred]]
+capability = "Rust implementation of the four W9 crates behind the frozen field contracts"
+activation = "frozen upstream owner-neutral projection types, package Module Proof, real provider-consumer Edge Proof, and named Product Pulses"
+
+[[deferred]]
+capability = "W9 Product Pulse execution and ecological field proof"
+activation = "implemented projections, held-out/live windows, matched controls, and Human/Governor decision evidence"
