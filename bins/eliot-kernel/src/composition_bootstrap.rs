@@ -489,6 +489,9 @@ impl KernelComposition {
         let daemon_launch = config.daemon_launch.clone();
         let kernel_artifact_sha256 = config.kernel_artifact_sha256.clone();
         let eliotd_descriptor_artifact_sha256 = config.eliotd_descriptor_artifact_sha256.clone();
+        let doctor_artifact_sha256 = config.doctor_artifact_sha256.clone();
+        let testd_artifact_sha256 = config.testd_artifact_sha256.clone();
+        let native_worker_artifact_sha256 = config.native_worker_artifact_sha256.clone();
         let eliotd_receipt_binding = config.eliotd_receipt_binding.clone();
         if let Some(binding) = &eliotd_receipt_binding {
             binding.validate().map_err(KernelBuildError::Service)?;
@@ -540,6 +543,19 @@ impl KernelComposition {
             return Err(KernelBuildError::Service(
                 "eliotd descriptor artifact digest must be lowercase SHA-256".to_owned(),
             ));
+        }
+        for (digest, label) in [
+            (&doctor_artifact_sha256, "Doctor"),
+            (&testd_artifact_sha256, "Testd"),
+            (&native_worker_artifact_sha256, "native worker"),
+        ] {
+            if let Some(digest) = digest
+                && !is_lower_sha256(digest)
+            {
+                return Err(KernelBuildError::Service(format!(
+                    "{label} artifact digest must be lowercase SHA-256"
+                )));
+            }
         }
         if daemon_launch.is_some() && kernel_artifact_sha256.is_none() {
             return Err(KernelBuildError::Service(
