@@ -325,7 +325,19 @@ impl KernelNativeWorkerClient {
         };
         let fence_json = serde_json::to_value(&submission.claim().state_fence)?;
         bind_request_identity(&mut self.client, fence_json, &ready_id)?;
-        let payload = serde_json::to_value(submission)?;
+        let mut payload = serde_json::to_value(submission)?;
+        // Single-shape (R2, Implements #22): the readiness presentation
+        // carries its presenting registration — the same worker-core halves
+        // the claim path submits — so the Kernel route builds through the
+        // single-shape projector. The registration is the exact retained
+        // registration the claim was admitted under (required above by
+        // `require_claimed_unit`), never invented here.
+        let registration = self.registration.as_ref().ok_or_else(|| {
+            NativeWorkerError::KernelAdmissionRequired(
+                "no exact current native-worker registration".to_owned(),
+            )
+        })?;
+        payload["registration"] = serde_json::to_value(registration)?;
         let reply = self.transact(NATIVE_WORKER_READY_OPERATION, payload)?;
         match submission.readiness() {
             NativeWorkerReadiness::Ready(report) => {
@@ -1530,19 +1542,265 @@ mod tests {
         }
     }
 
-    /// DEPENDS-ON-INTEGRATION: native spawn-to-`Ready` live E2E (DW-C owned).
+    /// DEPENDS-ON-INTEGRATION: native spawn-to-`Ready` live E2E (DW-C owned,
+    /// Implements #22 R2).
     ///
-    /// Once the Kernel contour admits a real claim for a built native-worker
-    /// image and the child submits its typed `ReadinessSubmission` over the
-    /// live front door, the reply must echo the submitted `ready_id`,
-    /// `claim_id`, and admitted decision with no doubles. Ignored until the
-    /// launch edge delivers a real image plus admission on a Windows host;
-    /// it never runs by default and never weakens the fail-closed gate.
+    /// Drives the real client path against a live Kernel front door with no
+    /// doubles: `connect` (transport only) → `submit_registration` (typed
+    /// receipt echo) → `submit_claim` (single-shape `ClaimAdmissionRequest`
+    /// built by the typed constructor, `ADMITTED` decision echo) →
+    /// `submit_readiness` (typed `ReadinessSubmission` with its presenting
+    /// registration, `ready_id` / `claim_id` / `ADMITTED` echoes). The
+    /// fixtures bind the live authority observed from the health probe
+    /// (`authority_epoch`, already bound to the protected declaration by
+    /// the handshake) plus this worker's own first generation and the live
+    /// test image bytes; nothing is invented, so a rotated epoch or an
+    /// advanced kernel generation fails closed here instead of submitting.
+    /// Ignored until a fresh live Kernel (first activation generation)
+    /// serves a Windows host; it never runs by default and never weakens
+    /// the fail-closed gate.
     #[test]
-    #[ignore = "DEPENDS-ON-INTEGRATION: requires live Kernel admission plus a built native-worker image on a Windows host; child side stays fail-closed until then"]
-    fn native_spawn_to_ready_live_echoes_without_doubles() {
-        let client = KernelNativeWorkerClient::connect().expect("live front door must open");
+    #[ignore = "DEPENDS-ON-INTEGRATION: requires a fresh live Kernel at its first activation generation on a Windows host; front-door only, no dispatch file"]
+    fn native_spawn_to_ready_live_echoes_without_doubles() -> Result<(), NativeWorkerError> {
+        use eliot_contracts::{EpochId, StateFence, sha256_hex};
+
+        let mut client = live(KernelNativeWorkerClient::connect(), "front door must open")?;
         assert!(client.registration.is_none());
-        panic!("DEPENDS-ON-INTEGRATION: live Kernel must admit a claim before Ready can submit");
+        // Live authority comes from the health probe the handshake already
+        // bound to the protected declaration — never from argv, stdin, or
+        // the environment.
+        let health = live(
+            client.client.probe().map_err(|error| {
+                NativeWorkerError::KernelAdmissionRequired(format!("live probe: {error}"))
+            }),
+            "health must probe",
+        )?;
+        let live_epoch: EpochId = live(
+            serde_json::from_value(live_some(
+                health.get("authority_epoch").cloned(),
+                "health carries its authority epoch",
+            )?),
+            "live epoch is lineaged",
+        )?;
+        // This worker's own first generation on a fresh live Kernel: the
+        // fence generation is the worker generation this test presents
+        // (never a guessed kernel generation); an advanced kernel fences
+        // the submits below instead of admitting.
+        let fence = StateFence::new(
+            live_epoch.clone(),
+            live(
+                eliot_contracts::ResourceGeneration::new(1),
+                "live generation",
+            )?,
+        );
+        let now = unix_ms()?;
+        // The running test image stands in for the worker image: its bytes
+        // are the exact admitted artifact and configuration material.
+        let image_bytes = std::fs::read(live(std::env::current_exe(), "test image path")?)?;
+        let image_digest = sha256_hex(&image_bytes);
+        let config_digest = sha256_hex(b"eliot-native-worker-live-e2e-config");
+        let registration =
+            live_registration(&live_epoch, &fence, now, &image_digest, &config_digest)?;
+        let registration_reply = live(
+            client.submit_registration(&registration),
+            "registration submits",
+        )?;
+        live_echo(&registration_reply, "registration_id", "reg-live-1");
+        let claim = live_claim(&live_epoch, &fence, now, &registration, &live_epoch)?;
+        let admission = ClaimAdmissionRequest::new(registration, claim.clone())?;
+        let claim_reply = live(client.submit_claim(&admission), "claim admits")?;
+        live_echo(&claim_reply, "claim_id", "claim-live-1");
+        live_echo(
+            &claim_reply,
+            "binding_digest",
+            claim.binding_digest.as_str(),
+        );
+        let report = live_report(&claim, &live_epoch, &fence, now)?;
+        let submission =
+            ReadinessSubmission::new(claim.clone(), NativeWorkerReadiness::Ready(report), now)?;
+        let ready_reply = live(client.submit_readiness(&submission), "readiness submits")?;
+        live_echo(&ready_reply, "kind", "native_worker_ready");
+        live_echo(&ready_reply, "ready_id", "ready-live-1");
+        live_echo(&ready_reply, "claim_id", "claim-live-1");
+        assert!(
+            client.ready.is_some(),
+            "Ready receipt must be retained without doubles"
+        );
+        Ok(())
+    }
+
+    /// Maps one live-fixture build failure into the fail-closed test error.
+    fn live<T, E: std::fmt::Display>(
+        result: Result<T, E>,
+        what: &str,
+    ) -> Result<T, NativeWorkerError> {
+        result.map_err(|error| {
+            NativeWorkerError::KernelAdmissionRequired(format!("live fixture {what}: {error}"))
+        })
+    }
+
+    /// Requires one live-fixture option to be present.
+    fn live_some<T>(option: Option<T>, what: &str) -> Result<T, NativeWorkerError> {
+        option.ok_or_else(|| {
+            NativeWorkerError::KernelAdmissionRequired(format!("live fixture {what} is missing"))
+        })
+    }
+
+    /// Requires one live reply field to echo the submitted identity.
+    fn live_echo(reply: &serde_json::Value, field: &str, expected: &str) {
+        assert_eq!(
+            reply.get(field).and_then(serde_json::Value::as_str),
+            Some(expected),
+            "live reply must echo {field}"
+        );
+    }
+
+    /// Builds the live registration bound to the observed authority.
+    fn live_registration(
+        live_epoch: &eliot_contracts::EpochId,
+        fence: &eliot_contracts::StateFence,
+        now: u64,
+        image_digest: &str,
+        config_digest: &str,
+    ) -> Result<NativeWorkerRegistration, NativeWorkerError> {
+        use eliot_native_worker_core::{
+            EXECUTION_UNIT_SCHEMA_VERSION, NativeRegistrationId, NativeRenewalId, PROTOCOL_VERSION,
+        };
+        use eliot_process::ResourceLimits;
+        Ok(NativeWorkerRegistration {
+            registration_id: live(NativeRegistrationId::new("reg-live-1"), "registration id")?,
+            installation_id: "installation-live-1".to_owned(),
+            worker_artifact_digest: image_digest.to_owned(),
+            worker_config_digest: config_digest.to_owned(),
+            protocol_version: PROTOCOL_VERSION.to_owned(),
+            worker_generation: 1,
+            process_id: std::process::id(),
+            process_start_100ns: now.saturating_mul(10_000).max(1),
+            process_image_digest: image_digest.to_owned(),
+            principal_ref: "principal-live-1".to_owned(),
+            session_id: live(eliot_contracts::SessionId::new("session-live-1"), "session")?,
+            connection_id: "connection-live-1".to_owned(),
+            authority_epoch: live_epoch.clone(),
+            state_fence: fence.clone(),
+            lease_id: "lease-live-1".to_owned(),
+            lease_expires_at_unix_ms: now.saturating_add(3_600_000),
+            renewal_id: live(NativeRenewalId::new("renewal-live-1"), "renewal")?,
+            execution_unit_schema_version: EXECUTION_UNIT_SCHEMA_VERSION,
+            resource_limits: live(
+                ResourceLimits::new(30_000, Some(10_000), Some(512_000_000), 4_096, 4_096, 4),
+                "limits",
+            )?,
+            invalidation_set: std::collections::BTreeSet::new(),
+        })
+    }
+
+    /// Builds the live v2 claim (with its executable join) bound to the
+    /// observed authority and the presenting registration.
+    fn live_claim(
+        live_epoch: &eliot_contracts::EpochId,
+        fence: &eliot_contracts::StateFence,
+        now: u64,
+        registration: &NativeWorkerRegistration,
+        epoch_source: &eliot_contracts::EpochId,
+    ) -> Result<NativeWorkerClaim, NativeWorkerError> {
+        use eliot_contracts::sha256_hex;
+        use eliot_native_worker_core::{
+            AttemptId, BudgetEnvelope, NATIVE_WORKER_CLAIM_WIRE_VERSION,
+            NATIVE_WORKER_EXECUTABLE_BINDING_EXPECTED_WIRE_VERSION, NativeClaimId,
+            NativeWorkerExecutableBinding,
+        };
+        use eliot_process::OperationId;
+
+        // The invocation digest stands in for the dispatched child's real
+        // process invocation digest (which the real child reads from its
+        // dispatch file; this front-door test has none by construction): it
+        // is derived deterministically from the submitted live-bound
+        // identities, covered by the claim binding digest, and compared
+        // against the owner record the route builds from the same presented
+        // join — never a canned constant.
+        let epoch_json = serde_json::to_string(epoch_source)?;
+        let invocation_digest =
+            sha256_hex(format!("live-invocation|reg-live-1|claim-live-1|{epoch_json}").as_bytes());
+        let join = NativeWorkerExecutableBinding {
+            route_ref: "route://test/live-e2e".to_owned(),
+            adapter_id: "adapter-live-test".to_owned(),
+            adapter_revision: 3,
+            config_digest: registration.worker_config_digest.clone(),
+            facet_manifest_ref: "facet-manifest-live-1".to_owned(),
+            grant_graph_revision: 5,
+            replay_stream_id: "stream-live-1/gen-1".to_owned(),
+            launch_nonce: "launch-nonce-live-0123456789abcdef".to_owned(),
+            process_invocation_digest: invocation_digest,
+            authority_epoch: live_epoch.clone(),
+            generation: live(
+                eliot_contracts::ResourceGeneration::new(1),
+                "join generation",
+            )?,
+            state_fence: fence.clone(),
+            deadline_unix_ms: now.saturating_add(120_000),
+            expires_at_unix_ms: now.saturating_add(300_000),
+            executable_wire_version: NATIVE_WORKER_EXECUTABLE_BINDING_EXPECTED_WIRE_VERSION,
+            executable_binding_digest: sha256_hex(b"eliot-native-worker-live-owner-digest"),
+        };
+        live(
+            NativeWorkerClaim {
+                claim_id: live(NativeClaimId::new("claim-live-1"), "claim id")?,
+                registration_id: registration.registration_id.clone(),
+                worker_generation: 1,
+                parent_job_id: "job-live-1".to_owned(),
+                task_id: live(eliot_contracts::TaskId::new("task-live-1"), "task")?,
+                work_scope_id: "scope-live-1".to_owned(),
+                decision_id: live(
+                    eliot_contracts::DecisionId::new("decision-live-1"),
+                    "decision",
+                )?,
+                attempt_id: live(AttemptId::new("attempt-live-1"), "attempt")?,
+                operation_id: live(OperationId::new("op-live-1"), "operation")?,
+                route_class: "test-route-live".to_owned(),
+                budget: BudgetEnvelope {
+                    context_tokens: 8,
+                    wall_time_ms: 1000,
+                    output_bytes: 1024,
+                    cost_microunits: 10,
+                    max_depth: 2,
+                    max_descendants: 4,
+                },
+                deadline_unix_ms: now.saturating_add(600_000),
+                cancellation_policy_id: "cancel-live-1".to_owned(),
+                expected_result_schema: "result-schema-live".to_owned(),
+                expected_result_schema_version: 1,
+                predecessor_revision: "rev-live-0".to_owned(),
+                authority_epoch: live_epoch.clone(),
+                state_fence: fence.clone(),
+                wire_version: NATIVE_WORKER_CLAIM_WIRE_VERSION,
+                executable_binding: Some(join),
+                binding_digest: String::new(),
+            }
+            .with_computed_digest(),
+            "claim digest",
+        )
+    }
+
+    /// Builds the live `Ready` report bound to the admitted claim.
+    fn live_report(
+        claim: &NativeWorkerClaim,
+        live_epoch: &eliot_contracts::EpochId,
+        fence: &eliot_contracts::StateFence,
+        now: u64,
+    ) -> Result<NativeReadyReport, NativeWorkerError> {
+        use eliot_native_worker_core::NativeReadyId;
+
+        Ok(NativeReadyReport {
+            ready_id: live(NativeReadyId::new("ready-live-1"), "ready id")?,
+            claim_id: claim.claim_id.clone(),
+            registration_id: claim.registration_id.clone(),
+            worker_generation: 1,
+            authority_epoch: live_epoch.clone(),
+            state_fence: fence.clone(),
+            claim_binding_digest: claim.binding_digest.clone(),
+            adapter_registry_revision: "test-revision-live-1".to_owned(),
+            credential_refs: Vec::new(),
+            ready_at_unix_ms: now,
+        })
     }
 }

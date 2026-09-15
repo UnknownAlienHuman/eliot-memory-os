@@ -1133,6 +1133,31 @@ pub struct ClaimAdmissionRequest {
 }
 
 impl ClaimAdmissionRequest {
+    /// Builds one registration-bound claim presentation (Implements #22 R2).
+    ///
+    /// This is the single-shape constructor the child uses to present one
+    /// claim under one registration to the Kernel admission owner: both
+    /// halves travel together and the cross-binding (registration identity,
+    /// generation, authority epoch, fence) is validated here, before any
+    /// Kernel admission owner sees the presentation. A rewired or stale
+    /// presentation fails here, never on the wire.
+    ///
+    /// # Errors
+    ///
+    /// Returns the underlying [`WorkerError::validate_binding`] failure for
+    /// a malformed half or a registration/generation/epoch/fence mismatch.
+    pub fn new(
+        registration: NativeWorkerRegistration,
+        claim: NativeWorkerClaim,
+    ) -> Result<Self, WorkerError> {
+        let request = Self {
+            registration,
+            claim,
+        };
+        request.validate_binding()?;
+        Ok(request)
+    }
+
     /// Returns the registration the claim is presented under.
     #[must_use]
     pub const fn registration(&self) -> &NativeWorkerRegistration {
@@ -1275,6 +1300,32 @@ pub struct ReadinessSubmission {
 }
 
 impl ReadinessSubmission {
+    /// Builds one readiness submission bound to its admitted claim
+    /// (Implements #22 R2).
+    ///
+    /// This is the single-shape constructor the child uses to submit one
+    /// typed ready-or-blocked verdict for one admitted claim: the enclosed
+    /// claim and verdict are validated bound together here, before the
+    /// Kernel admission owner sees the submission. The presenting
+    /// registration rides alongside this submission on the wire (the Kernel
+    /// route projects the service request from those same halves); it is
+    /// not duplicated inside this shape by construction.
+    ///
+    /// # Errors
+    ///
+    /// Returns the underlying claim or readiness validation failure,
+    /// including [`WorkerError::DeadlineExpired`] for a ready report past
+    /// the claim deadline.
+    pub fn new(
+        claim: NativeWorkerClaim,
+        readiness: NativeWorkerReadiness,
+        now_unix_ms: u64,
+    ) -> Result<Self, WorkerError> {
+        let submission = Self { claim, readiness };
+        submission.validate_binding(now_unix_ms)?;
+        Ok(submission)
+    }
+
     /// Returns the admitted claim this submission answers.
     #[must_use]
     pub const fn claim(&self) -> &NativeWorkerClaim {
@@ -1306,5 +1357,193 @@ impl ReadinessSubmission {
             }
             NativeWorkerReadiness::Blocked(report) => report.validate_for_claim(&self.claim),
         }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// R2 single-shape constructors (Implements #22 DISPATCH-FINISH).
+//
+// `ClaimAdmissionRequest::new` binds one claim under one registration and
+// `ReadinessSubmission::new` binds one verdict to its admitted claim, both
+// validated before any Kernel admission owner sees them. These are the only
+// typed (non-serde) constructors for the single shape; every other
+// construction path stays byte-identical.
+// ---------------------------------------------------------------------------
+#[cfg(test)]
+mod single_shape_constructors {
+    #![allow(clippy::expect_used, clippy::unwrap_used)]
+
+    use eliot_agent_api::{AttemptId, BudgetEnvelope};
+    use eliot_contracts::{
+        DecisionId, EpochId, EpochLineageId, ResourceGeneration, SessionId, StateFence, TaskId,
+    };
+    use eliot_process::{OperationId, ResourceLimits};
+
+    use super::{ClaimAdmissionRequest, NativeWorkerReadiness, ReadinessSubmission};
+    use crate::protocol::{
+        EXECUTION_UNIT_SCHEMA_VERSION, NATIVE_WORKER_CLAIM_WIRE_VERSION,
+        NATIVE_WORKER_EXECUTABLE_BINDING_EXPECTED_WIRE_VERSION, NativeClaimId, NativeReadyId,
+        NativeReadyReport, NativeRegistrationId, NativeRenewalId, NativeWorkerClaim,
+        NativeWorkerExecutableBinding, NativeWorkerRegistration, PROTOCOL_VERSION,
+    };
+
+    fn epoch() -> EpochId {
+        EpochId::new(
+            EpochLineageId::new("550e8400-e29b-41d4-a716-446655440000").expect("lineage"),
+            std::num::NonZeroU64::new(1).expect("sequence"),
+        )
+        .expect("epoch")
+    }
+
+    fn fence() -> StateFence {
+        StateFence::new(epoch(), ResourceGeneration::new(1).expect("generation"))
+    }
+
+    fn limits() -> ResourceLimits {
+        ResourceLimits::new(30_000, Some(10_000), Some(512_000_000), 4_096, 4_096, 4)
+            .expect("limits")
+    }
+
+    fn registration() -> NativeWorkerRegistration {
+        NativeWorkerRegistration {
+            registration_id: NativeRegistrationId::new("reg-r2-1").expect("registration id"),
+            installation_id: "installation-1".to_owned(),
+            worker_artifact_digest: "a".repeat(64),
+            worker_config_digest: "b".repeat(64),
+            protocol_version: PROTOCOL_VERSION.to_owned(),
+            worker_generation: 1,
+            process_id: 4242,
+            process_start_100ns: 120,
+            process_image_digest: "c".repeat(64),
+            principal_ref: "principal-1".to_owned(),
+            session_id: SessionId::new("session-operation-1").expect("session"),
+            connection_id: "connection-1".to_owned(),
+            authority_epoch: epoch(),
+            state_fence: fence(),
+            lease_id: "lease-1".to_owned(),
+            lease_expires_at_unix_ms: 9_000_000_200_000,
+            renewal_id: NativeRenewalId::new("renewal-1").expect("renewal"),
+            execution_unit_schema_version: EXECUTION_UNIT_SCHEMA_VERSION,
+            resource_limits: limits(),
+            invalidation_set: std::collections::BTreeSet::new(),
+        }
+    }
+
+    fn join(config_digest: &str) -> NativeWorkerExecutableBinding {
+        NativeWorkerExecutableBinding {
+            route_ref: "route://test/r2-constructor".to_owned(),
+            adapter_id: "adapter-test".to_owned(),
+            adapter_revision: 3,
+            config_digest: config_digest.to_owned(),
+            facet_manifest_ref: "facet-manifest-7".to_owned(),
+            grant_graph_revision: 5,
+            replay_stream_id: "stream-r2-1/gen-1".to_owned(),
+            launch_nonce: "launch-nonce-0123456789abcdef".to_owned(),
+            process_invocation_digest: "d".repeat(64),
+            authority_epoch: epoch(),
+            generation: ResourceGeneration::new(1).expect("generation"),
+            state_fence: fence(),
+            deadline_unix_ms: 9_000_000_000_000,
+            expires_at_unix_ms: 9_000_000_100_000,
+            executable_wire_version: NATIVE_WORKER_EXECUTABLE_BINDING_EXPECTED_WIRE_VERSION,
+            executable_binding_digest: "e".repeat(64),
+        }
+    }
+
+    fn claim() -> NativeWorkerClaim {
+        let registration = registration();
+        NativeWorkerClaim {
+            claim_id: NativeClaimId::new("claim-r2-1").expect("claim id"),
+            registration_id: registration.registration_id.clone(),
+            worker_generation: 1,
+            parent_job_id: "parent-job-1".to_owned(),
+            task_id: TaskId::new("task-1").expect("task"),
+            work_scope_id: "scope-1".to_owned(),
+            decision_id: DecisionId::new("decision-1").expect("decision"),
+            attempt_id: AttemptId::new("attempt-r2-1").expect("attempt"),
+            operation_id: OperationId::new("op-r2-1").expect("operation"),
+            route_class: "test-route".to_owned(),
+            budget: BudgetEnvelope {
+                context_tokens: 8,
+                wall_time_ms: 1000,
+                output_bytes: 1024,
+                cost_microunits: 10,
+                max_depth: 2,
+                max_descendants: 4,
+            },
+            deadline_unix_ms: 9_000_000_000_000,
+            cancellation_policy_id: "cancel-1".to_owned(),
+            expected_result_schema: "result-schema".to_owned(),
+            expected_result_schema_version: 1,
+            predecessor_revision: "rev-1".to_owned(),
+            authority_epoch: epoch(),
+            state_fence: fence(),
+            wire_version: NATIVE_WORKER_CLAIM_WIRE_VERSION,
+            executable_binding: Some(join(&registration.worker_config_digest)),
+            binding_digest: String::new(),
+        }
+        .with_computed_digest()
+        .expect("claim digest")
+    }
+
+    fn ready_report(claim: &NativeWorkerClaim) -> NativeReadyReport {
+        NativeReadyReport {
+            ready_id: NativeReadyId::new("ready-r2-1").expect("ready id"),
+            claim_id: claim.claim_id.clone(),
+            registration_id: claim.registration_id.clone(),
+            worker_generation: claim.worker_generation,
+            authority_epoch: claim.authority_epoch.clone(),
+            state_fence: claim.state_fence.clone(),
+            claim_binding_digest: claim.binding_digest.clone(),
+            adapter_registry_revision: "test-revision-1".to_owned(),
+            credential_refs: Vec::new(),
+            ready_at_unix_ms: 9_000_000,
+        }
+    }
+
+    /// R2: the typed constructor binds and validates the same halves the
+    /// child submits, carrying the computed binding digest through.
+    #[test]
+    fn claim_constructor_binds_registration_and_claim() {
+        let registration = registration();
+        let claim = claim();
+        let request = ClaimAdmissionRequest::new(registration.clone(), claim.clone())
+            .expect("typed halves bind");
+        assert_eq!(request.registration(), &registration);
+        assert_eq!(request.claim(), &claim);
+        assert_eq!(request.claim().binding_digest, claim.binding_digest);
+    }
+
+    /// R2: a claim rewired onto a foreign registration fails at
+    /// construction, never on the wire.
+    #[test]
+    fn claim_constructor_refuses_a_rewired_registration() {
+        let claim = claim();
+        let mut foreign = registration();
+        foreign.registration_id =
+            NativeRegistrationId::new("reg-r2-foreign").expect("foreign registration");
+        assert!(ClaimAdmissionRequest::new(foreign, claim.clone()).is_err());
+        assert!(ClaimAdmissionRequest::new(registration(), claim).is_ok());
+    }
+
+    /// R2: the readiness constructor binds one verdict to its admitted
+    /// claim; a ready report past the claim deadline fails closed.
+    #[test]
+    fn readiness_constructor_binds_verdict_to_claim() {
+        let claim = claim();
+        let report = ready_report(&claim);
+        let submission = ReadinessSubmission::new(
+            claim.clone(),
+            NativeWorkerReadiness::Ready(report),
+            9_000_001,
+        )
+        .expect("verdict binds");
+        assert_eq!(submission.claim(), &claim);
+        let stale = ReadinessSubmission::new(
+            claim.clone(),
+            NativeWorkerReadiness::Ready(ready_report(&claim)),
+            9_000_000_000_001,
+        );
+        assert!(stale.is_err(), "ready past its deadline must fail");
     }
 }
