@@ -4,15 +4,15 @@ use eliot_contracts::{canonical_json_bytes, sha256_hex};
 use eliot_dreamer_contracts::ValidatedDreamDraft;
 use serde::Serialize;
 
+use crate::ClarificationError;
 use crate::model::{
     ActiveAgentOrHumanBoundary, AdmittedClarificationJob, AmbiguityAccounting,
-    AmbiguityAccountingStatus, AmbiguityState, CandidateInvalidation,
-    ClarificationAmbiguity, ClarificationCandidate, ClarificationContentClass,
-    ClarificationDecision, ClarificationDisposition, ClarificationPolicy, DecisionOwner,
-    DecisionVariable, MaterialityBasis, NoQuestionReason, RoutingRecommendation,
-    UnansweredFallback, CLARIFICATION_PROOF_CEILING, CLARIFICATION_SCHEMA_VERSION,
+    AmbiguityAccountingStatus, AmbiguityState, CLARIFICATION_PROOF_CEILING,
+    CLARIFICATION_SCHEMA_VERSION, CandidateInvalidation, ClarificationAmbiguity,
+    ClarificationCandidate, ClarificationContentClass, ClarificationDecision,
+    ClarificationDisposition, ClarificationPolicy, DecisionOwner, DecisionVariable,
+    MaterialityBasis, NoQuestionReason, RoutingRecommendation, UnansweredFallback,
 };
-use crate::ClarificationError;
 
 /// Selects and renders zero or one inert atomic clarification candidate.
 ///
@@ -32,12 +32,8 @@ pub fn propose_clarification(
     boundary.validate_for(&admitted_job.job)?;
 
     let validated_draft_digest = canonical_digest(validated_draft)?;
-    let input_digest = decision_input_digest(
-        admitted_job,
-        &validated_draft_digest,
-        boundary,
-        policy,
-    )?;
+    let input_digest =
+        decision_input_digest(admitted_job, &validated_draft_digest, boundary, policy)?;
     let work_units = calculate_work_units(admitted_job)?;
     if work_units > policy.max_work_units {
         return Err(ClarificationError::limit(
@@ -53,9 +49,11 @@ pub fn propose_clarification(
             boundary,
             &input_digest,
             work_units,
-            NoQuestionReason::Cancelled,
-            AmbiguityAccountingStatus::NotSelected,
-            "cancelled_before_selection",
+            NoQuestionSpec {
+                reason: NoQuestionReason::Cancelled,
+                status: AmbiguityAccountingStatus::NotSelected,
+                reason_code: "cancelled_before_selection",
+            },
         );
     }
     if admitted_job
@@ -69,9 +67,11 @@ pub fn propose_clarification(
             boundary,
             &input_digest,
             work_units,
-            NoQuestionReason::Expired,
-            AmbiguityAccountingStatus::NotSelected,
-            "deadline_exhausted",
+            NoQuestionSpec {
+                reason: NoQuestionReason::Expired,
+                status: AmbiguityAccountingStatus::NotSelected,
+                reason_code: "deadline_exhausted",
+            },
         );
     }
 
@@ -90,9 +90,11 @@ pub fn propose_clarification(
             boundary,
             &input_digest,
             work_units,
-            reason,
-            status,
-            reason_code(reason),
+            NoQuestionSpec {
+                reason,
+                status,
+                reason_code: reason_code(reason),
+            },
         );
     }
 
@@ -103,9 +105,11 @@ pub fn propose_clarification(
             boundary,
             &input_digest,
             work_units,
-            NoQuestionReason::DecompositionRequired,
-            AmbiguityAccountingStatus::DecompositionRequired,
-            "multiple_material_unknowns",
+            NoQuestionSpec {
+                reason: NoQuestionReason::DecompositionRequired,
+                status: AmbiguityAccountingStatus::DecompositionRequired,
+                reason_code: "multiple_material_unknowns",
+            },
         );
     }
 
@@ -117,9 +121,11 @@ pub fn propose_clarification(
             boundary,
             &input_digest,
             work_units,
-            NoQuestionReason::DecompositionRequired,
-            AmbiguityAccountingStatus::DecompositionRequired,
-            "compound_decision_variable",
+            NoQuestionSpec {
+                reason: NoQuestionReason::DecompositionRequired,
+                status: AmbiguityAccountingStatus::DecompositionRequired,
+                reason_code: "compound_decision_variable",
+            },
         );
     }
     let variable = &ambiguity.variables[0];
@@ -130,9 +136,11 @@ pub fn propose_clarification(
             boundary,
             &input_digest,
             work_units,
-            NoQuestionReason::SecretOrProtected,
-            AmbiguityAccountingStatus::SecretBlocked,
-            "protected_or_executable_question_material",
+            NoQuestionSpec {
+                reason: NoQuestionReason::SecretOrProtected,
+                status: AmbiguityAccountingStatus::SecretBlocked,
+                reason_code: "protected_or_executable_question_material",
+            },
         );
     }
 
@@ -150,9 +158,11 @@ pub fn propose_clarification(
             boundary,
             &input_digest,
             work_units,
-            NoQuestionReason::DecompositionRequired,
-            AmbiguityAccountingStatus::DecompositionRequired,
-            "hidden_or_compound_decision_variable",
+            NoQuestionSpec {
+                reason: NoQuestionReason::DecompositionRequired,
+                status: AmbiguityAccountingStatus::DecompositionRequired,
+                reason_code: "hidden_or_compound_decision_variable",
+            },
         );
     }
 
@@ -163,9 +173,11 @@ pub fn propose_clarification(
             boundary,
             &input_digest,
             work_units,
-            NoQuestionReason::UnauthorizedResponder,
-            AmbiguityAccountingStatus::UnauthorizedResponder,
-            "responder_boundary_unavailable",
+            NoQuestionSpec {
+                reason: NoQuestionReason::UnauthorizedResponder,
+                status: AmbiguityAccountingStatus::UnauthorizedResponder,
+                reason_code: "responder_boundary_unavailable",
+            },
         );
     };
 
@@ -184,9 +196,11 @@ pub fn propose_clarification(
             boundary,
             &input_digest,
             work_units,
-            NoQuestionReason::Expired,
-            AmbiguityAccountingStatus::NotSelected,
-            "candidate_would_expire_immediately",
+            NoQuestionSpec {
+                reason: NoQuestionReason::Expired,
+                status: AmbiguityAccountingStatus::NotSelected,
+                reason_code: "candidate_would_expire_immediately",
+            },
         );
     }
 
@@ -272,6 +286,7 @@ fn decision_input_digest(
     policy: &ClarificationPolicy,
 ) -> Result<String, ClarificationError> {
     #[derive(Serialize)]
+    #[allow(clippy::struct_field_names)]
     struct Preimage<'a> {
         admission_digest: &'a str,
         validated_draft_digest: &'a str,
@@ -291,15 +306,18 @@ fn calculate_work_units(job: &AdmittedClarificationJob) -> Result<u64, Clarifica
         .map_err(|_| ClarificationError::limit("decision.work_units", usize::MAX))?;
     for ambiguity in &job.ambiguities {
         units = units
-            .checked_add(u64::try_from(ambiguity.variables.len()).map_err(|_| {
-                ClarificationError::limit("decision.work_units", usize::MAX)
-            })?)
+            .checked_add(
+                u64::try_from(ambiguity.variables.len())
+                    .map_err(|_| ClarificationError::limit("decision.work_units", usize::MAX))?,
+            )
             .ok_or_else(|| ClarificationError::invalid("decision.work_units", "overflow"))?;
         for variable in &ambiguity.variables {
             units = units
-                .checked_add(u64::try_from(variable.branches.len()).map_err(|_| {
-                    ClarificationError::limit("decision.work_units", usize::MAX)
-                })?)
+                .checked_add(
+                    u64::try_from(variable.branches.len()).map_err(|_| {
+                        ClarificationError::limit("decision.work_units", usize::MAX)
+                    })?,
+                )
                 .ok_or_else(|| ClarificationError::invalid("decision.work_units", "overflow"))?;
         }
     }
@@ -400,14 +418,16 @@ fn no_unresolved_reason(ambiguities: &[ClarificationAmbiguity]) -> NoQuestionRea
     {
         return NoQuestionReason::StaleInput;
     }
-    if ambiguities.iter().any(|item| {
-        matches!(item.state, AmbiguityState::SafeDefaultAvailable { .. })
-    }) {
+    if ambiguities
+        .iter()
+        .any(|item| matches!(item.state, AmbiguityState::SafeDefaultAvailable { .. }))
+    {
         return NoQuestionReason::SafeFallbackAvailable;
     }
-    if ambiguities.iter().any(|item| {
-        matches!(item.state, AmbiguityState::ResolvedByEvidence { .. })
-    }) {
+    if ambiguities
+        .iter()
+        .any(|item| matches!(item.state, AmbiguityState::ResolvedByEvidence { .. }))
+    {
         return NoQuestionReason::AlreadyAnswerable;
     }
     if !ambiguities.is_empty()
@@ -424,15 +444,9 @@ const fn accounting_status_for_reason(reason: NoQuestionReason) -> AmbiguityAcco
     match reason {
         NoQuestionReason::NoMaterialAmbiguity => AmbiguityAccountingStatus::NonMaterial,
         NoQuestionReason::AlreadyAnswerable => AmbiguityAccountingStatus::ResolvedByEvidence,
-        NoQuestionReason::SafeFallbackAvailable => {
-            AmbiguityAccountingStatus::SafeDefaultAvailable
-        }
-        NoQuestionReason::DecompositionRequired => {
-            AmbiguityAccountingStatus::DecompositionRequired
-        }
-        NoQuestionReason::UnauthorizedResponder => {
-            AmbiguityAccountingStatus::UnauthorizedResponder
-        }
+        NoQuestionReason::SafeFallbackAvailable => AmbiguityAccountingStatus::SafeDefaultAvailable,
+        NoQuestionReason::DecompositionRequired => AmbiguityAccountingStatus::DecompositionRequired,
+        NoQuestionReason::UnauthorizedResponder => AmbiguityAccountingStatus::UnauthorizedResponder,
         NoQuestionReason::SecretOrProtected => AmbiguityAccountingStatus::SecretBlocked,
         NoQuestionReason::StaleInput => AmbiguityAccountingStatus::Stale,
         NoQuestionReason::OutOfScope => AmbiguityAccountingStatus::OutOfScope,
@@ -458,25 +472,27 @@ const fn reason_code(reason: NoQuestionReason) -> &'static str {
     }
 }
 
+#[derive(Clone, Copy)]
+struct NoQuestionSpec {
+    reason: NoQuestionReason,
+    status: AmbiguityAccountingStatus,
+    reason_code: &'static str,
+}
+
 fn no_question_decision(
     job: &AdmittedClarificationJob,
     policy: &ClarificationPolicy,
     boundary: &ActiveAgentOrHumanBoundary,
     input_digest: &str,
     work_units: u64,
-    reason: NoQuestionReason,
-    unresolved_status: AmbiguityAccountingStatus,
-    unresolved_reason: &str,
+    spec: NoQuestionSpec,
 ) -> Result<ClarificationDecision, ClarificationError> {
-    let accounting = accounting_for(
-        job,
-        None,
-        Some(unresolved_status),
-        Some(unresolved_reason),
-    );
+    let accounting = accounting_for(job, None, Some(spec.status), Some(spec.reason_code));
     let mut decision = ClarificationDecision {
         schema_version: CLARIFICATION_SCHEMA_VERSION,
-        disposition: ClarificationDisposition::NoQuestion { reason },
+        disposition: ClarificationDisposition::NoQuestion {
+            reason: spec.reason,
+        },
         candidate: None,
         accounting,
         input_digest: input_digest.to_owned(),
@@ -525,9 +541,7 @@ fn accounting_for(
                     AmbiguityAccountingStatus::SafeDefaultAvailable,
                     "safe_default_available",
                 ),
-                AmbiguityState::Stale { .. } => {
-                    (AmbiguityAccountingStatus::Stale, "stale")
-                }
+                AmbiguityState::Stale { .. } => (AmbiguityAccountingStatus::Stale, "stale"),
                 AmbiguityState::OutOfScope { reason_code } => {
                     (AmbiguityAccountingStatus::OutOfScope, reason_code.as_str())
                 }

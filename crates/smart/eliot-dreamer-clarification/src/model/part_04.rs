@@ -78,7 +78,7 @@ impl ClarificationPolicy {
             ));
         }
         let max_options = usize::from(self.max_options);
-        if max_options < 2 || max_options > HARD_MAX_OPTIONS {
+        if !(2..=HARD_MAX_OPTIONS).contains(&max_options) {
             return Err(ClarificationError::limit(
                 "policy.max_options",
                 HARD_MAX_OPTIONS,

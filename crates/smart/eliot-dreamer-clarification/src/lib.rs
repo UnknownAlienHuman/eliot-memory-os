@@ -15,15 +15,15 @@ mod strict;
 
 pub use error::ClarificationError;
 pub use model::{
-    ActiveAgentBoundary, ActiveAgentOrHumanBoundary, AdmittedClarificationJob,
-    AmbiguityAccounting, AmbiguityAccountingStatus, AmbiguityState, AnswerBranch,
-    AnswerMatcher, AnswerOption, AnswerSchema, CandidateInvalidation, ClarificationAmbiguity,
-    ClarificationCandidate, ClarificationContentClass, ClarificationDecision,
-    ClarificationDisposition, ClarificationPolicy, DecisionOwner, DecisionVariable, HumanBoundary,
-    HumanDecisionKind, MaterialityBasis, MaterialityEvidence, NoQuestionReason, NonAnswerBranches,
-    ReferenceKind, RoutingRecommendation, SourceDenominator, UnansweredFallback,
-    CLARIFICATION_PROOF_CEILING, CLARIFICATION_SCHEMA_VERSION, HARD_MAX_AMBIGUITIES,
-    HARD_MAX_OPTIONS, HARD_MAX_OUTPUT_BYTES, HARD_MAX_TEXT_BYTES,
+    ActiveAgentBoundary, ActiveAgentOrHumanBoundary, AdmittedClarificationJob, AmbiguityAccounting,
+    AmbiguityAccountingStatus, AmbiguityState, AnswerBranch, AnswerMatcher, AnswerOption,
+    AnswerSchema, CLARIFICATION_PROOF_CEILING, CLARIFICATION_SCHEMA_VERSION, CandidateInvalidation,
+    ClarificationAmbiguity, ClarificationCandidate, ClarificationContentClass,
+    ClarificationDecision, ClarificationDisposition, ClarificationPolicy, DecisionOwner,
+    DecisionVariable, HARD_MAX_AMBIGUITIES, HARD_MAX_OPTIONS, HARD_MAX_OUTPUT_BYTES,
+    HARD_MAX_TEXT_BYTES, HumanBoundary, HumanDecisionKind, MaterialityBasis, MaterialityEvidence,
+    NoQuestionReason, NonAnswerBranches, ReferenceKind, RoutingRecommendation, SourceDenominator,
+    UnansweredFallback,
 };
 pub use strict::validate_clarification_decision;
 

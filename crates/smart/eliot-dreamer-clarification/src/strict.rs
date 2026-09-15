@@ -3,11 +3,11 @@ use std::collections::BTreeSet;
 use eliot_contracts::{canonical_json_bytes, sha256_hex};
 use serde::Serialize;
 
+use crate::ClarificationError;
 use crate::model::{
     AnswerSchema, ClarificationCandidate, ClarificationDecision, ClarificationDisposition,
     ClarificationPolicy, DecisionOwner, RoutingRecommendation, UnansweredFallback,
 };
-use crate::ClarificationError;
 
 /// Validates the context-free integrity of a clarification decision.
 ///
@@ -26,7 +26,8 @@ pub(crate) fn validate_decision_cross_envelope(
     decision: &ClarificationDecision,
     policy: &ClarificationPolicy,
 ) -> Result<(), ClarificationError> {
-    let encoded = canonical_json_bytes(decision).map_err(|_| ClarificationError::Canonicalization)?;
+    let encoded =
+        canonical_json_bytes(decision).map_err(|_| ClarificationError::Canonicalization)?;
     if encoded.len() > policy.max_output_bytes {
         return Err(ClarificationError::limit(
             "decision.serialized_output_bytes",
@@ -94,7 +95,10 @@ fn validate_candidate(
     )?;
 
     match &candidate.variable.answer_schema {
-        AnswerSchema::Choice { options } | AnswerSchema::Reference { allowed: options, .. } => {
+        AnswerSchema::Choice { options }
+        | AnswerSchema::Reference {
+            allowed: options, ..
+        } => {
             for option in options {
                 require_exact_variable(
                     &option.referenced_variables,
