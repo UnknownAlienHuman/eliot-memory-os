@@ -12,8 +12,8 @@
 //! `crates/storage/eliot-store-surreal-adapter/tests/epistemic_revision.rs::real_position_cas_exact_replay_and_receipt_readback`
 //! (re-run on this base as the real-Surreal proof) and against the reference
 //! handler by `crates/storage/eliot-store-memory/src/epistemic_tests.rs`.
-//! This file proves the daemon half with the same closed types: the 13-entry
-//! catalogue (6 reads + 6 mutations + genesis), the CEP `position` selector,
+//! This file proves the daemon half with the same closed types: the 17-entry
+//! catalogue (10 reads + 6 mutations + genesis), the CEP `position` selector,
 //! the `ApplyEpistemicRevision` closed payload requirement (admitted) versus
 //! `RecordAuthorityRevocation` (still unactivated), the `IdentityConflict`
 //! without-second-revision disposition, and the exact daemon wiring types
@@ -69,7 +69,7 @@ fn test_fence() -> TestResult<eliot_store_api::StateFence> {
 #[test]
 fn catalogue_activates_position_read_and_revision_write() -> TestResult {
     let entries = generated_operation_manifests().map_err(|error| format!("catalogue: {error}"))?;
-    assert_eq!(entries.len(), 13, "6 reads + 6 mutations + genesis");
+    assert_eq!(entries.len(), 17, "10 reads + 6 mutations + genesis");
     let names: Vec<&str> = entries.iter().map(|entry| entry.name.as_str()).collect();
     assert!(names.contains(&"GetCurrentEpistemicPosition"));
     assert!(names.contains(&"ApplyEpistemicRevision"));
