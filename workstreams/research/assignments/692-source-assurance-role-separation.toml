@@ -1,0 +1,121 @@
+schema = "eliot.agent-work-unit.v1"
+authority = "NON_NORMATIVE_IMPLEMENTATION_ALLOCATION"
+routing_authority = "owning_issue_and_normative_pair_only"
+status = "READY_FOR_IMPLEMENTATION"
+implementation_support = "SOURCE_ASSURANCE_CONTOUR_PRESENT_ROLE_SEPARATION_UNPROVED"
+evidence_execution_status = "SOURCE_AND_ISSUE_INSPECTED_TESTS_NOT_EXECUTED"
+proof_ceiling = "SOURCE_ASSURANCE_MODULE_AND_EDGE_CANDIDATE_ONLY"
+issue = 692
+research_runtime_issue = 24
+dreamer_runtime_issue = 1100
+evidence_issue = 216
+governor_issue = 18
+parent_product_issue = 11
+normative_pair_ref = "docs/normative-pair.toml"
+
+[work_unit]
+cell_id = "research.source-assurance-role-separation"
+causal_property = "One bounded assurance result describes exact source identity, acquisition lineage, coverage, independence, freshness, conflict, blind boundaries, invalidation and applicable support ceiling without acquiring sources, choosing truth, promoting support, widening influence, or deciding task completion."
+current_discriminator = "The source-assurance contour exists under issue #692, but its production consumer and the separation between Research acquisition, provenance, source independence, content support, availability, confidence, and Governor admission remain unproved."
+primary_issue_url = "https://github.com/UnknownAlienHuman/eliot-memory-os/issues/692"
+
+[documentation]
+architecture = [
+  "https://github.com/UnknownAlienHuman/eliot-memory-os/blob/main/docs/architecture/A09-dreamer.md#a9-dreamer",
+  "https://github.com/UnknownAlienHuman/eliot-memory-os/blob/main/docs/architecture/A10-02-impact-and-authority.md#a102-impact-and-authority",
+]
+implementation = [
+  "https://github.com/UnknownAlienHuman/eliot-memory-os/blob/main/docs/architecture/I00-05-current-system-evidence-and-source-support-model.md#i05-current-system-evidence-and-source-support-model",
+  "https://github.com/UnknownAlienHuman/eliot-memory-os/blob/main/docs/architecture/I07-20-agent-facing-error-contract.md#i720-agent-facing-error-contract",
+  "https://github.com/UnknownAlienHuman/eliot-memory-os/blob/main/docs/architecture/I12-18-prediction-and-calibration.md#i1218-prediction-and-calibration",
+  "https://github.com/UnknownAlienHuman/eliot-memory-os/blob/main/docs/architecture/I12-22-theory-portfolio-and-practical-weighting.md#i1222-theory-portfolio-and-practical-weighting",
+  "https://github.com/UnknownAlienHuman/eliot-memory-os/blob/main/docs/architecture/I21-06-source-portfolio-coverage-denominator-and-coveragereceipt.md#i216-source-portfolio-coverage-denominator-and-coveragereceipt",
+]
+anchors = ["ARCH-DRM-04", "ARCH-GROUND-01", "ARCH-OBS-01", "ARCH-AUTH-01", "ARCH-SEC-01"]
+
+[current_source]
+confirmed = [
+  "Research acquisition and provider execution are separately owned by issue #24.",
+  "Current-system observation/support axes are separately owned by issue #216 and the conformance contracts.",
+  "Dreamer may interpret frozen evidence under #1100, while Governor alone admits semantic influence under #18.",
+  "A source-assurance package cannot be treated as implemented merely because provenance, score, citation, or confidence types exist.",
+]
+
+[scope]
+primary_paths = [
+  "the issue #692 source-assurance package and its direct tests",
+  "exact Research evidence-set and coverage receipt contracts",
+  "exact Dreamer consumer adapter required to preserve the assurance envelope",
+  "directly relevant finite fixtures",
+]
+serialized_dependencies = ["#24 Research acquisition", "#216 evidence axes", "#1100 Dreamer runtime", "#18 Governor admission", "#11 Product proof"]
+forbidden = [
+  "network/provider/source acquisition",
+  "truth, support, policy, accessibility, influence, erasure, or Finish promotion",
+  "confidence, source count, citation count, model agreement, or recency used as authority",
+  "generic prose-only assurance result",
+  "hidden omission of unavailable, conflicting, retracted, stale, or unknown sources",
+  "automatic workflow triggers",
+]
+
+[[waves]]
+id = "A"
+what = "Freeze a closed source-assurance input and result contract."
+how = [
+  "Bind exact evidence-set, portfolio, source, acquisition, content, retrieval, provider-route, policy, privacy, evaluated-at, expiry, and invalidation identities.",
+  "Represent expected, acquired, unavailable, withheld, stale, conflicted, retracted, malformed, unsupported-format, and unknown portfolio members explicitly.",
+  "Reject duplicate source identity, changed content under one immutable identity, missing denominator, mixed evaluation boundary, and unknown schema variants.",
+]
+
+[[waves]]
+id = "B"
+what = "Separate provenance, independence, availability, and content support."
+how = [
+  "Group independence by authoritative lineage root, acquisition route, publisher/owner, and common-mode generation rather than citation, message, or agent count.",
+  "Keep source existence, accessibility, acquisition success, content integrity, provenance completeness, independence, relevance, claim support, contradiction, and admissible influence as separate axes.",
+  "Unknown lineage is unknown independence; mirrored or syndicated material does not become independent merely through multiple URLs.",
+]
+
+[[waves]]
+id = "C"
+what = "Calculate coverage and ceilings without scalar coercion."
+how = [
+  "Use the exact frozen expected-source denominator and one disposition per member.",
+  "Preserve blind boundaries, policy/credential exclusions, source-class gaps, geographic/language/time/version gaps, retractions, conflicts, and common-mode risk.",
+  "Emit axis-specific observations and the maximum claim/evidence use supported by the input; do not collapse them into one trust/confidence score.",
+]
+
+[[waves]]
+id = "D"
+what = "Bind consumers, replay, and invalidation."
+how = [
+  "Dreamer receives the immutable assurance result with the exact evidence set and cannot silently broaden coverage or strip dissent.",
+  "Governor receives candidate/evidence metadata only through its normal admission path and independently decides permitted influence.",
+  "Exact replay is deterministic; changed source content, lineage, denominator, policy, retraction, evaluation time, expiry, or invalidation produces a new identity or conflict.",
+]
+
+[acceptance]
+criteria = [
+  "Every expected portfolio member has exactly one explicit disposition and no unavailable/withheld/stale/conflicted/retracted/unknown source disappears.",
+  "Provenance, content integrity, availability, accessibility, independence, relevance, support, contradiction, confidence and permitted influence remain separate fields.",
+  "Independent-source count never exceeds unique authoritative lineage roots and common-mode generation remains visible.",
+  "Multiple URLs, citations, agents, model runs or mirrors cannot manufacture independence or support.",
+  "A successful acquisition or intact hash cannot by itself establish claim support, truth, currentness or influence.",
+  "Unknown lineage, missing denominator, stale/retracted source, mixed evaluation boundary and partial coverage prevent a complete assurance result.",
+  "Coverage and blind-boundary calculations are deterministic and sensitive to every expected-member disposition and policy exclusion.",
+  "Exact replay is idempotent; changed same-identity source content, lineage, denominator, policy, expiry or retraction conflicts.",
+  "Dreamer and Governor consumers preserve the complete assurance envelope and cannot silently broaden or promote it.",
+  "The package performs no source acquisition, Store write, model/provider call, authority issuance, influence change or VERIFIED_COMPLETE decision.",
+  "Focused tests cover duplicates, mirrors, shared lineage, retraction, stale source, unavailable credentialed source, partial denominator, conflicting claims and exact invalidation.",
+]
+
+[verification]
+commands = [
+  "cargo fmt --all -- --check",
+  "cargo check --locked -p eliot-dreamer-source-assurance --all-targets",
+  "cargo test --locked -p eliot-dreamer-source-assurance --all-targets",
+  "cargo clippy --locked -p eliot-dreamer-source-assurance --all-targets -- -D warnings",
+  "git diff --check",
+]
+edge_proof = "Run one frozen Research evidence set through source assurance and Dreamer/Governor adapters with mirrors, common lineage, unavailable source, retraction, conflict, stale evidence and denominator change."
+product_proof = "Issues #24, #1100, #18 and #11 remain open; source-assurance Module Proof alone establishes no Research or Product support."
