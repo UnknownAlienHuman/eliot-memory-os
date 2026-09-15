@@ -128,6 +128,7 @@ members = [
   "crates/smart/eliot-context-contracts",
   "crates/smart/eliot-cue-contracts",
   "crates/smart/eliot-dreamer-contracts",
+  "crates/smart/eliot-dreamer-cycle",
   "crates/smart/eliot-epistemic-contracts",
   "crates/smart/eliot-learning-contracts",
   "crates/smart/eliot-memory-curation-contracts",
@@ -142,6 +143,8 @@ members = [
 # Wave admission (#829/T8-A0) is the single serialized root turn for proved
 # contract cells: package-local proof first, then this one owner moves each
 # from `exclude` to `members`. Leaves never self-promote. See I2.3 and I2.11.
+# Single-cell admission (#806/T8-A806) follows the same serialized turn for
+# eliot-dreamer-cycle (standalone nonmember; never in `exclude`).
 exclude = [
   "crates/smart/eliot-dreamer-bundle",  # agent_order 4
   "crates/smart/eliot-dreamer-candidate-validation",  # agent_order 5
