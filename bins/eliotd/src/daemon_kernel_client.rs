@@ -18,8 +18,10 @@ use eliot_governor::{GovernorLaunchConfig, KernelGenerationSnapshot, KernelPortE
 use eliot_protocol::{
     AgentActivationResolutionDecision, AgentActivationResolutionResult,
     AgentActivationResolutionTicket, AgentActivationResultAck, AgentActivationResultReconcile,
-    AgentActivationResultSubmit, EncodingProfile, Frame, FrameKind, MessageType, ProtocolPayload,
-    ProtocolVersion, RequestIdentity,
+    AgentActivationResultSubmit, EncodingProfile, Frame, FrameKind,
+    HOST_REQUEST_INVOKE_READ_WIRE_ID, HostRequestEnvelope, HostRequestInvokeReadPayload,
+    HostRequestResultBody, MessageType, ProtocolPayload, ProtocolVersion, RequestIdentity,
+    host_request_operation_id,
 };
 use eliot_receipts::RequestBinding;
 use eliot_store_api::{NamedReadRequest, NamedReadResponse};
@@ -676,6 +678,105 @@ impl DaemonKernelClient {
         Ok(response)
     }
 
+    /// Executes one closed local read through the authenticated Kernel route.
+    ///
+    /// Twin of [`store_named_async`](Self::store_named_async): the admitted
+    /// envelope+tool pair proves its closed linkage before any transport is
+    /// touched, the call travels as the `"local_read"` operation with a fresh
+    /// operation-bound identity, and the persisted result body behind the
+    /// admitted receipt+record is decoded through its closed body contract
+    /// with exact envelope binding before return. Kernel remains the
+    /// admission, read, and persistence authority; this method performs no
+    /// admission decision and no consistency algorithm.
+    ///
+    /// Wire note: the `local_read` leg answers the documented admission
+    /// shape (`accepted` plus receipt plus record); the `{kind: local_read}`
+    /// wrapper exists only on the error envelope, which never decodes past
+    /// the frame outcome (surfacing as `Unknown`, never as a body).
+    ///
+    /// Errors: `Contract` when the pair is malformed or unlinked, the
+    /// admitted fence does not bind the envelope, the admitted answer does
+    /// not bind this envelope, or the persisted body is absent (a packet
+    /// admission carries no result body by design), fails to decode, or fails
+    /// its own digest binding; `NotAdmitted` / `Unknown` for transport
+    /// outcomes via [`kernel_port_error`].
+    #[allow(
+        dead_code,
+        reason = "staged forwarding transport for the local_read serving arm; the capability twin gates and serves locally while the kernel-caller bridge that forwards admitted pairs lands in a follow-up"
+    )]
+    pub(super) async fn local_read_async(
+        &self,
+        envelope: HostRequestEnvelope,
+        tool: serde_json::Value,
+    ) -> Result<HostRequestResultBody, KernelPortError> {
+        let pair = HostRequestInvokeReadPayload {
+            wire_id: HOST_REQUEST_INVOKE_READ_WIRE_ID.to_owned(),
+            wire_version: HostRequestInvokeReadPayload::CONTRACT_VERSION,
+            envelope,
+            tool,
+        };
+        pair.validate()
+            .map_err(|error| KernelPortError::Contract(error.to_string()))?;
+        if self.snapshot.state_fence() != pair.envelope.state_fence {
+            return Err(KernelPortError::Contract(
+                "daemon local read fence does not match the admitted snapshot".to_owned(),
+            ));
+        }
+        let value = self
+            .transact_async(
+                "local_read",
+                serde_json::json!({
+                    "envelope": pair.envelope,
+                    "tool": pair.tool,
+                }),
+            )
+            .await
+            .map_err(kernel_port_error)?;
+        let admitted = value.as_object().ok_or_else(|| {
+            KernelPortError::Contract("Kernel local read answer is not an object".to_owned())
+        })?;
+        if admitted.get("accepted") != Some(&serde_json::Value::Bool(true)) {
+            return Err(KernelPortError::Contract(
+                "Kernel local read answer is not an admission".to_owned(),
+            ));
+        }
+        let operation_id = admitted
+            .get("operation_id")
+            .and_then(serde_json::Value::as_str)
+            .ok_or_else(|| {
+                KernelPortError::Contract(
+                    "Kernel local read admission omits the operation handle".to_owned(),
+                )
+            })?;
+        if operation_id != host_request_operation_id(&pair.envelope) {
+            return Err(KernelPortError::Contract(
+                "Kernel local read admission does not bind the admitted envelope".to_owned(),
+            ));
+        }
+        let body_value = admitted
+            .get("record")
+            .and_then(|record| record.get("result_response"))
+            .cloned()
+            .ok_or_else(|| {
+                KernelPortError::Contract(
+                    "Kernel local read admission carries no result body; packet admissions stay admission-only"
+                        .to_owned(),
+                )
+            })?;
+        let body: HostRequestResultBody = serde_json::from_value(body_value)
+            .map_err(|error| KernelPortError::Contract(error.to_string()))?;
+        body.validate()
+            .map_err(|error| KernelPortError::Contract(error.to_string()))?;
+        if body.request_sha256 != pair.envelope.envelope_sha256
+            || body.operation_id != host_request_operation_id(&pair.envelope)
+        {
+            return Err(KernelPortError::Contract(
+                "Kernel local read result does not bind the admitted envelope".to_owned(),
+            ));
+        }
+        Ok(body)
+    }
+
     fn clone_for_future(&self) -> Arc<Self> {
         Arc::new(Self {
             launch: self.launch.clone(),
@@ -685,5 +786,357 @@ impl DaemonKernelClient {
             request_counter: Arc::clone(&self.request_counter),
             validated_session_binding: Mutex::new(self.validated_session_binding()),
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::num::NonZeroU64;
+
+    use eliot_contracts::{EpochId, EpochLineageId, ResourceGeneration, StateFence};
+    use eliot_governor::{
+        GovernorLaunchConfig, KernelGenerationExpectation, KernelGenerationSnapshot,
+        KernelPortError,
+    };
+    use eliot_protocol::{
+        HOST_REQUEST_WIRE_ID, HostRequestEnvelope, HostRequestIdentity, HostRequestKind,
+    };
+    use eliot_read::{ProvenanceDisposition, ReadError, ReadProvenance, ReadService};
+    use eliot_store_api::{
+        CanonicalReadClient, EVIDENCE_PACK_MAX_RECORDS, NamedReadOperation, RevisionHead,
+        RevisionKey, StoreError,
+    };
+    use serde_json::{Value, json};
+
+    use crate::KernelLaunchBinding;
+    use crate::kernel_context_read_client::KernelContextReadClient;
+
+    const TEST_LINEAGE: &str = "550e8400-e29b-41d4-a716-446655440000";
+
+    fn test_epoch(sequence: u64) -> Result<EpochId, Box<dyn std::error::Error>> {
+        let lineage =
+            EpochLineageId::new(TEST_LINEAGE).map_err(|error| format!("lineage: {error}"))?;
+        let sequence = NonZeroU64::new(sequence).ok_or("non-zero test sequence")?;
+        EpochId::new(lineage, sequence).map_err(|error| format!("epoch: {error}").into())
+    }
+
+    fn test_fence(generation: u64) -> Result<StateFence, Box<dyn std::error::Error>> {
+        Ok(StateFence::new(
+            test_epoch(1)?,
+            ResourceGeneration::new(generation).map_err(|error| format!("generation: {error}"))?,
+        ))
+    }
+
+    fn tool_digest(tool: &Value) -> Result<String, Box<dyn std::error::Error>> {
+        let bytes = eliot_contracts::canonical_json_bytes(tool)
+            .map_err(|error| format!("canonical tool bytes: {error}"))?;
+        Ok(eliot_contracts::sha256_hex(&bytes))
+    }
+
+    fn query_tool() -> Value {
+        json!({"name":"eliot.query","arguments":{
+            "intent":{
+                "mode":"verification",
+                "time_scope":"session-window",
+                "branch_environment_scope":"branch",
+                "freshness_policy":"exact-fence",
+                "required_assurance":"evidence-provenance"
+            },
+            "query":"subject:evidence-alpha",
+            "exact_resource_uri": null
+        }})
+    }
+
+    fn packet_tool() -> Value {
+        json!({"name":"eliot.packet","arguments":{
+            "packet_ref": null,
+            "material_refs": []
+        }})
+    }
+
+    fn test_envelope(
+        capability: &str,
+        fence: &StateFence,
+        payload_sha256: &str,
+    ) -> Result<HostRequestEnvelope, Box<dyn std::error::Error>> {
+        HostRequestEnvelope {
+            wire_id: HOST_REQUEST_WIRE_ID.to_owned(),
+            wire_version: HostRequestEnvelope::CONTRACT_VERSION,
+            kind: HostRequestKind::Invocation,
+            connection_id: "conn-test-1".to_owned(),
+            identity: HostRequestIdentity {
+                request_id: eliot_contracts::RequestId::new("host-request-1")
+                    .map_err(|error| format!("request id: {error}"))?,
+                idempotency_key: "host-request-1:invoke".to_owned(),
+                cancellation_id: "host-request-1:invoke:cancel".to_owned(),
+                parent_operation_id: None,
+                deadline_unix_ms: 2_000_000,
+                capability: capability.to_owned(),
+                session_id: Some("kernel-session-1".to_owned()),
+                task_id: None,
+                work_scope_id: None,
+                payload_schema_id: "eliot.mcp.tool-request.v1".to_owned(),
+                payload_sha256: payload_sha256.to_owned(),
+            },
+            state_fence: fence.clone(),
+            descriptor_sha256: "d".repeat(64),
+            peer_admission_receipt_sha256: "e".repeat(64),
+            activation_binding: None,
+            envelope_sha256: String::new(),
+        }
+        .with_computed_digest()
+        .map_err(|error| format!("envelope digest: {error}").into())
+    }
+
+    fn test_client(fence: &StateFence) -> Result<DaemonKernelClient, Box<dyn std::error::Error>> {
+        let epoch = test_epoch(1)?;
+        let generation =
+            ResourceGeneration::new(1).map_err(|error| format!("generation: {error}"))?;
+        Ok(DaemonKernelClient {
+            launch: GovernorLaunchConfig {
+                instance_id: "test-eliotd".to_owned(),
+                kernel: KernelGenerationExpectation {
+                    service: "eliot-kernel".to_owned(),
+                    protocol: "test".to_owned(),
+                    artifact_digest: "a".repeat(64),
+                    protected_snapshot_digest: "b".repeat(64),
+                    principal: "test-principal".to_owned(),
+                    generation,
+                    authority_epoch: epoch.clone(),
+                },
+                protected_snapshot_digest: "b".repeat(64),
+            },
+            kernel_binding: KernelLaunchBinding {
+                kernel_pipe_name: r"\\.\pipe\eliot\test".to_owned(),
+                expected_kernel_sid: "S-1-5-18".to_owned(),
+                expected_kernel_session_id: 0,
+                module_generation: generation,
+                authority_epoch: epoch.clone(),
+                state_fence: fence.clone(),
+                launch_nonce: "test-nonce".to_owned(),
+                kernel_artifact_sha256: "a".repeat(64),
+                daemon_artifact_sha256: "c".repeat(64),
+            },
+            connection_id: "test-connection".to_owned(),
+            snapshot: KernelGenerationSnapshot {
+                service: "eliot-kernel".to_owned(),
+                protocol: "test".to_owned(),
+                generation,
+                authority_epoch: epoch,
+                artifact_digest: "a".repeat(64),
+                protected_snapshot_digest: "b".repeat(64),
+                principal: "test-principal".to_owned(),
+            },
+            request_counter: Arc::new(AtomicU64::new(1)),
+            validated_session_binding: Mutex::new(None),
+        })
+    }
+
+    /// Minimal in-test evidence table. It stores captured subjects in capture
+    /// order and derives every response field from the incoming request: real
+    /// request validation, the closed evidence operation, exact fence
+    /// equality, the declared `subject` / `max_records` selectors, and the
+    /// catalogue bound. Nothing is canned.
+    struct EvidenceTable {
+        fence: StateFence,
+        captured: Vec<String>,
+    }
+
+    impl EvidenceTable {
+        fn new(fence: StateFence) -> Self {
+            Self {
+                fence,
+                captured: Vec::new(),
+            }
+        }
+
+        fn capture(&mut self, subject: &str) {
+            self.captured.push(subject.to_owned());
+        }
+
+        fn selectors(parameters: &BTreeMap<String, Value>) -> Result<(String, u32), StoreError> {
+            let subject = parameters
+                .get("subject")
+                .and_then(Value::as_str)
+                .filter(|subject| !subject.trim().is_empty())
+                .ok_or(StoreError::InvalidField {
+                    field: "operation.parameter",
+                    reason: "evidence subject must be exact",
+                })?;
+            let bound = parameters
+                .get("max_records")
+                .and_then(Value::as_str)
+                .ok_or(StoreError::InvalidField {
+                    field: "operation.parameter",
+                    reason: "max_records must ride as an exact decimal string",
+                })?;
+            let bound: u32 = bound.parse().map_err(|_| StoreError::InvalidField {
+                field: "operation.parameter",
+                reason: "max_records must ride as an exact decimal string",
+            })?;
+            if bound == 0 || bound > EVIDENCE_PACK_MAX_RECORDS {
+                return Err(StoreError::InvalidField {
+                    field: "operation.parameter",
+                    reason: "max_records must be within the catalogue bound",
+                });
+            }
+            Ok((subject.to_owned(), bound))
+        }
+    }
+
+    #[allow(async_fn_in_trait)]
+    impl CanonicalReadClient for EvidenceTable {
+        async fn revision_heads(
+            &self,
+            _keys: Vec<RevisionKey>,
+        ) -> Result<Vec<RevisionHead>, StoreError> {
+            Ok(Vec::new())
+        }
+
+        async fn execute_named(
+            &self,
+            query: NamedReadRequest,
+        ) -> Result<NamedReadResponse, StoreError> {
+            query.validate()?;
+            if query.operation != NamedReadOperation::GetEvidencePack {
+                return Err(StoreError::UnknownOperation);
+            }
+            if query.scope_id.is_none() {
+                return Err(StoreError::InvalidField {
+                    field: "scope_id",
+                    reason: "GetEvidencePack requires an exact scope",
+                });
+            }
+            if query.state_fence != self.fence {
+                return Err(StoreError::FenceMismatch);
+            }
+            let (subject, bound) = Self::selectors(&query.parameters)?;
+            let limit = usize::try_from(bound).map_err(|_| StoreError::InvalidField {
+                field: "operation.parameter",
+                reason: "max_records must be within the catalogue bound",
+            })?;
+            let records: Vec<Value> = self
+                .captured
+                .iter()
+                .filter(|captured| *captured == &subject)
+                .take(limit)
+                .map(|captured| json!({"subject": captured}))
+                .collect();
+            let response = NamedReadResponse {
+                operation: query.operation,
+                state_fence: query.state_fence.clone(),
+                revision_heads: Vec::new(),
+                payload: json!({
+                    "version": 1,
+                    "subject": subject,
+                    "max_records": bound,
+                    "records": records,
+                }),
+            };
+            response.validate()?;
+            Ok(response)
+        }
+    }
+
+    #[test]
+    fn local_read_bridge_serves_captured_evidence_and_fails_closed()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let fence = test_fence(1)?;
+        let client = test_client(&fence)?;
+        assert_eq!(
+            client.snapshot.state_fence(),
+            fence,
+            "the test client must bind the admitted fence or every leg fails before reading"
+        );
+
+        let tool = query_tool();
+        let envelope = test_envelope("eliot.query", &fence, &tool_digest(&tool)?)?;
+
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .map_err(|error| format!("test runtime: {error}"))?;
+
+        // Capture an observation, then bridge eliot.query for the captured
+        // subject: the exact evidence record, provenance, and fence return.
+        let mut table = EvidenceTable::new(fence.clone());
+        table.capture("evidence-alpha");
+        let service = ReadService::new(table);
+        let result = runtime.block_on(KernelContextReadClient::execute_local_read(
+            &service, &fence, &envelope, &tool,
+        ))?;
+        assert_eq!(result.operation, NamedReadOperation::GetEvidencePack);
+        assert_eq!(result.state_fence, fence);
+        let records = result
+            .payload
+            .get("records")
+            .and_then(Value::as_array)
+            .ok_or("evidence records must ride the payload")?;
+        assert_eq!(
+            records.len(),
+            1,
+            "the captured subject reads back exactly once"
+        );
+        assert_eq!(
+            records[0].get("subject").and_then(Value::as_str),
+            Some("evidence-alpha"),
+            "the readback record is the captured evidence, never a substitute"
+        );
+        assert_eq!(
+            result.provenance,
+            ReadProvenance {
+                handles: Vec::new(),
+                disposition: ProvenanceDisposition::Unavailable,
+            },
+            "the readback provenance is the exact facade lineage"
+        );
+
+        // A wrong fence fails closed before any read: FenceMismatch, never
+        // Ok-empty.
+        let wrong = test_fence(2)?;
+        let wrong_envelope = test_envelope("eliot.query", &wrong, &tool_digest(&tool)?)?;
+        let fenced = runtime.block_on(KernelContextReadClient::execute_local_read(
+            &service,
+            &fence,
+            &wrong_envelope,
+            &tool,
+        ));
+        assert!(
+            matches!(fenced, Err(ReadError::Store(ref reason)) if reason == &StoreError::FenceMismatch.to_string()),
+            "a wrong fence must fail closed as FenceMismatch, got {fenced:?}"
+        );
+
+        // Packet pairs stay admission-only: Unavailable, never a read.
+        let packet = packet_tool();
+        let packet_envelope = test_envelope("eliot.packet", &fence, &tool_digest(&packet)?)?;
+        let admitted_only = runtime.block_on(KernelContextReadClient::execute_local_read(
+            &service,
+            &fence,
+            &packet_envelope,
+            &packet,
+        ));
+        assert!(
+            matches!(admitted_only, Err(ReadError::Store(ref reason)) if reason == &StoreError::Unavailable.to_string()),
+            "packet must stay admission-only as Unavailable, got {admitted_only:?}"
+        );
+
+        // The forwarding transport fails closed before transport: a wrong
+        // fence is Contract (not a Kernel round-trip), never Ok-empty.
+        let transport_fenced =
+            runtime.block_on(client.local_read_async(wrong_envelope, tool.clone()));
+        assert!(
+            matches!(transport_fenced, Err(KernelPortError::Contract(_))),
+            "a wrong fence must fail the local_read transport closed as Contract, got {transport_fenced:?}"
+        );
+
+        // A malformed pair is Contract before transport is touched.
+        let malformed =
+            runtime.block_on(client.local_read_async(envelope.clone(), json!("not-an-object")));
+        assert!(
+            matches!(malformed, Err(KernelPortError::Contract(_))),
+            "a malformed pair must fail the local_read transport closed as Contract, got {malformed:?}"
+        );
+        Ok(())
     }
 }
