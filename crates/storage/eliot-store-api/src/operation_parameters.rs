@@ -26,7 +26,7 @@
 //! (`crates/governor/eliot-governor/src/task_lifecycle.rs`, `task_envelope`:
 //! `task_id`, `event_id`, optional `from`, `to`, `expected_revision`,
 //! `actor_ref`) plus the `ApplyEpistemicRevision` mutation (T11.2: persists
-//! `TransitionClass::Epistemic` with the `EffectClass::ReversibleMutation`
+//! `TransitionClass::Epistemic` with the `EffectClass::Candidate`
 //! ceiling and carries the single `revision` epistemic-revision payload).
 //! Every other [`NamedReadOperation`](crate::NamedReadOperation) variant and
 //! every other [`NamedMutationOperation`](crate::NamedMutationOperation)

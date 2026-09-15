@@ -21,7 +21,7 @@
 //! the Governor task lifecycle envelope
 //! (`crates/governor/eliot-governor/src/task_lifecycle.rs`, `task_envelope`)),
 //! plus the `ApplyEpistemicRevision` mutation (T11.2: persists
-//! `TransitionClass::Epistemic` with the `EffectClass::ReversibleMutation`
+//! `TransitionClass::Epistemic` with the `EffectClass::Candidate`
 //! ceiling and the owner-approved epistemic-revision payload),
 //! plus the provider-independent genesis bootstrap entry sourced by
 //! [`genesis_manifest`](crate::genesis_manifest). Every other operation stays

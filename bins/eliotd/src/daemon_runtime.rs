@@ -751,6 +751,86 @@ pub(super) fn project_daemon_evidence_response(
     }))
 }
 
+/// Plans one closed T11.2 `GetCurrentEpistemicPosition` read for the daemon
+/// query path.
+///
+/// This is the registration half of the `eliot.query` CEP plumbing: the caller
+/// holds the already-connected [`DaemonKernelClient`] and the
+/// [`DaemonComposition`] (see `context_read_client`), and calls this pure
+/// planner with the exact admitted fence plus explicit `scope_id`/`position`
+/// selectors. The returned [`NamedReadRequest`] travels the single
+/// `store_named` transport via [`KernelContextReadClient`] with
+/// `ExactFence`; free text never becomes a selector and no second position
+/// resolver lives here. The store catalogue remains the authority: this
+/// planner validates shape only, and the closed `position` membership is
+/// enforced by the adapters.
+#[allow(
+    dead_code,
+    reason = "T11.2 registration API; production bridge dispatch calls it once the manifest admits the query route"
+)]
+pub(super) fn plan_daemon_position_read(
+    fence: &eliot_contracts::StateFence,
+    scope_id: &str,
+    position: &str,
+) -> Result<eliot_store_api::NamedReadRequest, String> {
+    if position.trim().is_empty() || position.chars().any(char::is_control) {
+        return Err("daemon position read position must be non-blank with no control characters"
+            .to_owned());
+    }
+    let scope = eliot_store_api::ScopeId::new(scope_id)
+        .map_err(|error| format!("daemon position read scope: {error}"))?;
+    let mut parameters = std::collections::BTreeMap::new();
+    parameters.insert(
+        "position".to_owned(),
+        serde_json::Value::String(position.trim().to_owned()),
+    );
+    let request = eliot_store_api::NamedReadRequest {
+        operation: eliot_store_api::NamedReadOperation::GetCurrentEpistemicPosition,
+        scope_id: Some(scope),
+        consistency: eliot_store_api::ReadConsistency::ExactFence,
+        state_fence: fence.clone(),
+        parameters,
+    };
+    request
+        .validate()
+        .map_err(|error| format!("daemon position read request: {error}"))?;
+    Ok(request)
+}
+
+/// Projects a successful current-epistemic-position response into the daemon
+/// query content.
+///
+/// Returns the exact admitted wire CEP shape the `eliot.query` caller
+/// receives: the store payload crosses unchanged under
+/// `current_epistemic_position` with its position identity. Fails closed when
+/// the operation is not `GetCurrentEpistemicPosition`, the fence does not
+/// match the admitted fence, or the payload lacks the versioned admitted
+/// position shape.
+#[allow(
+    dead_code,
+    reason = "T11.2 registration API; production bridge dispatch calls it once the manifest admits the query route"
+)]
+pub(super) fn project_daemon_position_response(
+    response: &eliot_store_api::NamedReadResponse,
+    admitted_fence: &eliot_contracts::StateFence,
+    expected_position: &str,
+) -> Result<serde_json::Value, String> {
+    if response.operation != eliot_store_api::NamedReadOperation::GetCurrentEpistemicPosition {
+        return Err("daemon position response operation must be GetCurrentEpistemicPosition".to_owned());
+    }
+    if response.state_fence != *admitted_fence {
+        return Err("daemon position response fence does not match the admitted fence".to_owned());
+    }
+    response
+        .validate()
+        .map_err(|error| format!("daemon position response: {error}"))?;
+    Ok(serde_json::json!({
+        "operation": "GetCurrentEpistemicPosition",
+        "position": expected_position,
+        "current_epistemic_position": response.payload,
+    }))
+}
+
 fn ready_message(status: &DaemonStatus) -> ReadyMessage {
     ReadyMessage::Ready {
         service: SERVICE_NAME,

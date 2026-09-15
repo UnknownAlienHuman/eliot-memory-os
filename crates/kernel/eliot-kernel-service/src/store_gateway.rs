@@ -324,7 +324,8 @@ impl KernelStoreGateway {
     /// admitted request); Governor remains the semantic owner of payload
     /// decoding. Raw query strings are impossible by construction: only the
     /// closed [`eliot_store_api::NamedReadOperation`] catalogue crosses this
-    /// boundary. T11.1 activates `GetEvidencePack` only; no allowlist lives
+    /// boundary. T11.1 activates `GetEvidencePack`; T11.2 additionally
+    /// activates `GetCurrentEpistemicPosition`. No allowlist lives
     /// here because catalogue membership stays owned by the Store adapters.
     pub async fn execute_named(
         &self,
@@ -741,11 +742,72 @@ mod named_read_gateway_tests {
             if let Err(error) = request.validate_against_catalogue(&entries) {
                 return self.typed_failure(request_id, error);
             }
-            if request.operation != NamedReadOperation::GetEvidencePack {
+            if request.operation != NamedReadOperation::GetEvidencePack
+                && request.operation != NamedReadOperation::GetCurrentEpistemicPosition
+            {
                 return self.typed_failure(request_id, StoreError::UnknownOperation);
             }
             if request.state_fence != self.requirement.state_fence {
                 return self.typed_failure(request_id, StoreError::FenceMismatch);
+            }
+            if request.operation == NamedReadOperation::GetCurrentEpistemicPosition {
+                if request.consistency != ReadConsistency::ExactFence {
+                    return self.typed_failure(
+                        request_id,
+                        StoreError::InvalidField {
+                            field: "operation.consistency",
+                            reason: "GetCurrentEpistemicPosition requires ExactFence",
+                        },
+                    );
+                }
+                let Some(scope_id) = request.scope_id.clone() else {
+                    return self.typed_failure(
+                        request_id,
+                        StoreError::InvalidField {
+                            field: "scope_id",
+                            reason: "position read requires scope_id",
+                        },
+                    );
+                };
+                let Some(position) =
+                    request.parameters.get("position").and_then(Value::as_str)
+                else {
+                    return self.typed_failure(
+                        request_id,
+                        StoreError::InvalidField {
+                            field: "operation.parameter",
+                            reason: "missing required parameter",
+                        },
+                    );
+                };
+                if position.trim().is_empty() || position.chars().any(char::is_control) {
+                    return self.typed_failure(
+                        request_id,
+                        StoreError::InvalidField {
+                            field: "operation.parameter",
+                            reason: "position must be a non-blank string",
+                        },
+                    );
+                }
+                let payload = json!({
+                    "position": position,
+                    "scope_id": scope_id,
+                    "state_fence": request.state_fence,
+                });
+                let response = eliot_store_api::NamedReadResponse {
+                    operation: request.operation,
+                    state_fence: request.state_fence.clone(),
+                    revision_heads: Vec::new(),
+                    payload,
+                };
+                if let Err(error) = response.validate() {
+                    return self.typed_failure(request_id, error);
+                }
+                return Self::response(
+                    self.requirement.connection_id.as_str().to_owned(),
+                    request_id.clone(),
+                    StoreResponse::Named { response },
+                );
             }
             let Some(scope_id) = request.scope_id.clone() else {
                 return self.typed_failure(
@@ -1081,6 +1143,125 @@ mod named_read_gateway_tests {
             ),
             Ok(_) => panic!("over-bound request must fail closed"),
         }
+
+        let _ = std::fs::remove_dir_all(&scratch);
+    }
+
+    #[tokio::test]
+    async fn execute_named_get_current_epistemic_position_proves_identity_and_fence() {
+        let position = format!("position-{}", std::process::id());
+        let scratch = std::env::temp_dir().join(format!(
+            "eliot-t11-2-daemon-gateway-{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&scratch).expect("scratch root creates");
+        let captured_path = scratch.join("captured_subjects");
+        std::fs::write(&captured_path, "unused\n").expect("capture stages");
+
+        let fence = test_fence();
+        let bootstrap = requirement(&fence);
+        let service = Arc::new(Mutex::new(
+            crate::KernelService::new([7_u8; 32], 8, 8).expect("kernel service creates"),
+        ));
+        let route = eliot_kernel_core::GenerationRoute::new(
+            RouteScope::new("store_bridge").expect("route scope"),
+            ResourceGeneration::genesis(),
+            AuthorityEpoch::new(1).expect("route epoch"),
+        )
+        .expect("store route binds");
+        let route_epoch = Some(
+            service
+                .lock()
+                .expect("service lock reads")
+                .authority_epoch(),
+        );
+        let transport = LoopbackSurrealTransport {
+            requirement: bootstrap.clone(),
+            pending: None,
+            captured_subjects_path: captured_path.clone(),
+        };
+        let store = EbpCanonicalStoreClient::connect(transport, bootstrap)
+            .await
+            .expect("loopback handshake and readiness");
+        let flight = GatewayFlight::new();
+
+        let request = NamedReadRequest {
+            operation: NamedReadOperation::GetCurrentEpistemicPosition,
+            scope_id: Some(ScopeId::new("scope-epistemic").expect("scope")),
+            consistency: ReadConsistency::ExactFence,
+            state_fence: fence.clone(),
+            parameters: BTreeMap::from([("position".to_owned(), Value::String(position.clone()))]),
+        };
+        let response = execute_named_via(
+            &flight,
+            &service,
+            &route,
+            route_epoch.as_ref(),
+            &store,
+            request,
+        )
+        .await
+        .expect("exact position read passes the gateway");
+        assert_eq!(
+            response.operation,
+            NamedReadOperation::GetCurrentEpistemicPosition
+        );
+        assert_eq!(response.state_fence, fence);
+        assert_eq!(
+            response.payload.get("position"),
+            Some(&Value::String(position.clone()))
+        );
+
+        let changed_fence =
+            eliot_contracts::StateFence::new(test_epoch(2), ResourceGeneration::genesis());
+        let fenced_request = NamedReadRequest {
+            operation: NamedReadOperation::GetCurrentEpistemicPosition,
+            scope_id: Some(ScopeId::new("scope-epistemic").expect("scope")),
+            consistency: ReadConsistency::ExactFence,
+            state_fence: changed_fence,
+            parameters: BTreeMap::from([("position".to_owned(), Value::String(position.clone()))]),
+        };
+        let fenced = execute_named_via(
+            &flight,
+            &service,
+            &route,
+            route_epoch.as_ref(),
+            &store,
+            fenced_request,
+        )
+        .await;
+        assert!(
+            fenced.is_err(),
+            "changed fence must fail closed, observed: {fenced:?}"
+        );
+
+        let eventual = NamedReadRequest {
+            operation: NamedReadOperation::GetCurrentEpistemicPosition,
+            scope_id: Some(ScopeId::new("scope-epistemic").expect("scope")),
+            consistency: ReadConsistency::Eventual,
+            state_fence: fence.clone(),
+            parameters: BTreeMap::from([("position".to_owned(), Value::String(position.clone()))]),
+        };
+        assert!(
+            execute_named_via(&flight, &service, &route, route_epoch.as_ref(), &store, eventual)
+                .await
+                .is_err(),
+            "non-ExactFence position read must fail closed"
+        );
+
+        let missing = NamedReadRequest {
+            operation: NamedReadOperation::GetCurrentEpistemicPosition,
+            scope_id: Some(ScopeId::new("scope-epistemic").expect("scope")),
+            consistency: ReadConsistency::ExactFence,
+            state_fence: fence,
+            parameters: BTreeMap::new(),
+        };
+        assert!(
+            execute_named_via(&flight, &service, &route, route_epoch.as_ref(), &store, missing)
+                .await
+                .is_err(),
+            "missing position selector must fail closed"
+        );
 
         let _ = std::fs::remove_dir_all(&scratch);
     }

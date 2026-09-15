@@ -56,6 +56,37 @@ pub struct GovernorEpistemicComposition<'a, P: ?Sized, R: ?Sized> {
     pub(crate) readiness: CompositionReadiness,
 }
 
+impl<'a, P: ?Sized, R: ?Sized> GovernorEpistemicComposition<'a, P, R> {
+    /// Borrows the canonical admission owner, activation snapshot, Kernel
+    /// transition port, read client, and readiness without touching
+    /// `composition.rs`.
+    ///
+    /// Daemon wiring builds this from the public
+    /// `GovernorComposition::owners()` (for `&CanonicalAdmissionOwner`),
+    /// `read_unique_agent_activation(now)` (for the activation snapshot),
+    /// `readiness()`, plus the daemon-held `Arc<DaemonKernelClient>` (as the
+    /// `&P: KernelTransitionPort`) and a `KernelContextReadClient` (as the
+    /// `&R: CanonicalReadClient`). This mirrors the landed T11.1
+    /// `DaemonComposition::context_read_client` attach-style accessor, which
+    /// avoids `composition.rs` churn held by DISPATCH-R1-GOVERNOR.
+    #[must_use]
+    pub const fn borrow(
+        canonical: &'a CanonicalAdmissionOwner,
+        activation: crate::GovernorActivationSnapshot,
+        kernel: &'a P,
+        reads: &'a R,
+        readiness: CompositionReadiness,
+    ) -> Self {
+        Self {
+            canonical,
+            activation,
+            kernel,
+            reads,
+            readiness,
+        }
+    }
+}
+
 fn refused(error: impl std::fmt::Display) -> CompositionError {
     CompositionError::Owner(format!("epistemic admission: {error}"))
 }
