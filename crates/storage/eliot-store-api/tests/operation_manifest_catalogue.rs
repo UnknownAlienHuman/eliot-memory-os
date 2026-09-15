@@ -71,7 +71,7 @@ fn evidence_pack_params() -> BTreeMap<String, Value> {
 #[test]
 fn activated_typed_reads_pass_catalogue_validation() {
     let entries = generated_operation_manifests().unwrap();
-    assert_eq!(entries.len(), 13);
+    assert_eq!(entries.len(), 17);
 
     // The closed name mapping is the single owner for code, manifests, wire.
     for operation in [
@@ -535,7 +535,7 @@ fn approved_capture_plan_passes_and_stale_digest_fails_manifest_mismatch() {
 #[test]
 fn capture_observation_passes_whole_path() {
     let entries = generated_operation_manifests().unwrap();
-    assert_eq!(entries.len(), 13);
+    assert_eq!(entries.len(), 17);
     let set_digest = operation_manifest_set_digest(&entries).unwrap();
 
     // Approved owner-shaped subject params pass catalogue validation.
@@ -582,7 +582,7 @@ fn capture_observation_passes_whole_path() {
 #[test]
 fn append_audit_event_passes_whole_path() {
     let entries = generated_operation_manifests().unwrap();
-    assert_eq!(entries.len(), 13);
+    assert_eq!(entries.len(), 17);
     let set_digest = operation_manifest_set_digest(&entries).unwrap();
 
     // Approved receipt-bound audit params pass catalogue validation without bypass.
@@ -593,7 +593,7 @@ fn append_audit_event_passes_whole_path() {
 #[test]
 fn apply_lifecycle_policy_passes_whole_path() {
     let entries = generated_operation_manifests().unwrap();
-    assert_eq!(entries.len(), 13);
+    assert_eq!(entries.len(), 17);
     let set_digest = operation_manifest_set_digest(&entries).unwrap();
 
     // Approved lifecycle-policy params pass catalogue validation without bypass.
@@ -604,7 +604,7 @@ fn apply_lifecycle_policy_passes_whole_path() {
 #[test]
 fn reconcile_recovery_passes_whole_path() {
     let entries = generated_operation_manifests().unwrap();
-    assert_eq!(entries.len(), 13);
+    assert_eq!(entries.len(), 17);
     let set_digest = operation_manifest_set_digest(&entries).unwrap();
 
     // Approved problem-leg recovery params pass catalogue validation without bypass.
@@ -651,7 +651,7 @@ fn reconcile_recovery_passes_whole_path() {
 #[test]
 fn update_task_state_passes_whole_path() {
     let entries = generated_operation_manifests().unwrap();
-    assert_eq!(entries.len(), 13);
+    assert_eq!(entries.len(), 17);
     let set_digest = operation_manifest_set_digest(&entries).unwrap();
 
     // Approved task-control params pass catalogue validation without bypass.

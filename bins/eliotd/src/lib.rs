@@ -14,7 +14,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use eliot_contracts::{EpochId, ResourceGeneration, StateFence};
 use eliot_governor::{
     CompositionError, CompositionReadiness, GovernorActivationOutcome, GovernorComposition,
-    GovernorLaunchConfig, KernelGenerationPort, QueueLimits,
+    GovernorLaunchConfig, KernelGenerationPort, KernelGenerationSnapshotProvider, QueueLimits,
 };
 use eliot_platform_windows::{ProtectedPathError, ProtectedRuntimePathLease};
 use eliot_protocol::{
@@ -87,7 +87,7 @@ pub use dreamer_model_adapter::{
 };
 pub use governor_local_read::{answer_evidence_query, answer_projection_inputs};
 pub(crate) use kernel_authority_client::KernelAuthorityClient;
-pub use kernel_context_read_client::KernelContextReadClient;
+pub use kernel_context_read_client::{KernelContextReadClient, ReconstructionReadComposition};
 pub use store_failure_projection::{GovernorStoreFailureProjection, GovernorStoreProjectionError};
 
 /// Builds the production P-07 authority adapter over an already-connected
@@ -733,6 +733,49 @@ impl DaemonComposition {
             return Err(DaemonError::Composition(CompositionError::NotReady));
         }
         Ok(GovernedDreamerModelAdapter::new(self))
+    }
+
+    /// Borrows the Governor reconstruction read composition over the retained
+    /// owners plus daemon-held Kernel and read clients (T11.3).
+    ///
+    /// Mirrors [`Self::epistemic_composition`]: readiness is checked first,
+    /// then the exact admitted fence is snapshotted from the retained Kernel
+    /// client, and a fresh [`ReconstructionReadComposition`] is borrowed over
+    /// the caller-held [`DaemonKernelClient`] and [`KernelContextReadClient`]
+    /// with the task-bound scope. The composition retains no client and no
+    /// thread — the caller (the single daemon runtime holding both the
+    /// concrete client and this composition, as with
+    /// [`Self::note_owner_session_binding`]) passes the already-connected
+    /// clients per call, so a Governor refresh surfaces as an exact fence
+    /// mismatch instead of silent divergence. No `composition.rs` change is
+    /// involved: this uses only the retained snapshot fence plus the two
+    /// borrowed clients.
+    ///
+    /// Wiring decision (mirroring `context_read_client` §4.1): post-`start`
+    /// attach-style accessor, not a `start()` signature change — `start()`
+    /// keeps its exact `(config, kernel: Arc<dyn KernelGenerationPort>,
+    /// authority_activation)` contour.
+    pub fn reconstruction_composition<'a>(
+        &'a self,
+        kernel: &'a Arc<DaemonKernelClient>,
+        reads: &'a KernelContextReadClient,
+        scope: eliot_store_api::ScopeId,
+    ) -> Result<
+        ReconstructionReadComposition<'a, DaemonKernelClient, KernelContextReadClient>,
+        DaemonError,
+    > {
+        if self.readiness() != eliot_governor::CompositionReadiness::Ready {
+            return Err(DaemonError::Composition(
+                eliot_governor::CompositionError::NotReady,
+            ));
+        }
+        let admitted_fence = kernel.snapshot().state_fence();
+        Ok(ReconstructionReadComposition::borrow(
+            kernel.as_ref(),
+            reads,
+            admitted_fence,
+            scope,
+        ))
     }
 
     /// Stops the one daemon owner and releases protected handles together.

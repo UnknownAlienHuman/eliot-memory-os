@@ -12,8 +12,11 @@ eliot-budget.workspace = true
 eliot-canonical.workspace = true
 eliot-change-monitor.workspace = true
 eliot-config.workspace = true
+eliot-context-candidates = { path = "../../smart/eliot-context-candidates" }
 eliot-coordination.workspace = true
 eliot-contracts.workspace = true
+eliot-cue-contracts = { path = "../../smart/eliot-cue-contracts" }
+eliot-cue-index = { path = "../../smart/eliot-cue-index" }
 eliot-doctor-core.workspace = true
 eliot-epistemic = { path = "../../smart/eliot-epistemic" }
 eliot-epistemic-contracts = { path = "../../smart/eliot-epistemic-contracts" }
@@ -25,6 +28,7 @@ eliot-observation.workspace = true
 eliot-observation-contracts.workspace = true
 eliot-problem.workspace = true
 eliot-protocol.workspace = true
+eliot-read = { path = "../eliot-read" }
 eliot-receipts.workspace = true
 eliot-session.workspace = true
 eliot-skill.workspace = true
