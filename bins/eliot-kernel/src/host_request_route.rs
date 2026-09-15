@@ -91,6 +91,20 @@ pub(crate) const AGENT_HOST_REQUEST_REHYDRATE_OPERATION: &str = "agent_host_requ
 pub(crate) const AGENT_HOST_REQUEST_INVOKE_READ_OPERATION: &str =
     "agent_host_request_invoke_read";
 
+/// Bound on queued local-read pairs for the outbound-only eliotd poller.
+///
+/// Mirrors the bounded activation replay/result ledgers (64): the durable ORS
+/// record owns lifecycle state, so eviction only drops daemon-leg queue
+/// memory and never fabricates admission.
+const MAX_QUEUED_LOCAL_READS: usize = 64;
+/// Claim lease for one queued local-read pair, mirroring
+/// `AGENT_ACTIVATION_CLAIM_LEASE_MS`.
+///
+/// A claimed pair is retained with this lease so transient resolver failure
+/// retries the exact pair without allocating a new identity; the lease is
+/// absent from the wire.
+const LOCAL_READ_CLAIM_LEASE_MS: u64 = 1_000;
+
 /// Returns whether the operation string selects the P-04 host-request route.
 pub(crate) fn is_host_request_operation(operation: &str) -> bool {
     matches!(
@@ -108,10 +122,23 @@ pub(crate) fn is_host_request_operation(operation: &str) -> bool {
 /// The durable ORS record owns lifecycle state; this reference only lets
 /// disconnect revocation fence the presenting connection's still-uncertain
 /// operations without enumerating the store.
+///
+/// A queued local-read pair rides this same index so disconnect revocation
+/// still fences it without a new per-Kernel field (residual: move to a
+/// dedicated `Mutex<LocalReadPendingState>` once the composition root
+/// widens to initialize it; see HANDOFF). `local_read_envelope`/`local_read_tool`
+/// are `Some` only for admitted `eliot.query` invoke-reads whose selectors
+/// validated; ordinary indexed operations carry `None` and are never served
+/// to the daemon poller.
 #[derive(Clone, Debug)]
 pub(crate) struct HostRequestOperationRef {
     pub(crate) operation_id: String,
     pub(crate) request_digest: String,
+    pub(crate) local_read_envelope: Option<HostRequestEnvelope>,
+    pub(crate) local_read_tool: Option<serde_json::Value>,
+    /// Private Kernel claim lease for the queued pair, mirroring
+    /// `AgentActivationPending::claim_lease_until_unix_ms`.
+    pub(crate) local_read_claim_lease_until_unix_ms: Option<u64>,
 }
 
 impl KernelComposition {
@@ -292,6 +319,16 @@ impl KernelComposition {
         .validate()
         .map_err(|_| TransportError::SessionFenced)?;
         let (receipt, record) = self.admit_host_request_envelope(envelope)?;
+        // Queue admitted `eliot.query` pairs for the outbound-only eliotd
+        // poller (`local_read_claim`, Implements #18). Packet admissions and
+        // malformed selectors never queue; enqueue is best-effort and never
+        // fails admission (the ORS record is already staged above).
+        if matches!(
+            check_local_read_admission(envelope, tool),
+            Ok(Some(_))
+        ) {
+            let _ = self.enqueue_local_read_pair(envelope, tool);
+        }
         // Coherence gate before serving: a resulted record must carry a
         // digest-bound body, otherwise the row is never served as an answer.
         if let (Some(digest), Some(body)) = (&record.result_digest, &record.result_response) {
@@ -712,8 +749,224 @@ impl KernelComposition {
             .push(HostRequestOperationRef {
                 operation_id: host_request_operation_id(envelope),
                 request_digest: envelope.envelope_sha256.clone(),
+                local_read_envelope: None,
+                local_read_tool: None,
+                local_read_claim_lease_until_unix_ms: None,
             });
         Ok(())
+    }
+}
+
+impl KernelComposition {
+    /// Queues one admitted local-read pair for the daemon poller.
+    ///
+    /// Called best-effort from [`Self::invoke_read_host_request`] after the
+    /// full admission gate, so only linkage-checked `eliot.query` pairs with
+    /// valid selectors arrive here. An exact replay (same operation and
+    /// digest already queued) is idempotent and never duplicates; when the
+    /// bounded queue is full the oldest queued pair is evicted (daemon-leg
+    /// memory only — the durable ORS record is untouched).
+    pub(crate) fn enqueue_local_read_pair(
+        &self,
+        envelope: &HostRequestEnvelope,
+        tool: &serde_json::Value,
+    ) -> Result<(), TransportError> {
+        let mut index = self
+            .host_request_connection_index
+            .lock()
+            .map_err(|_| TransportError::SessionFenced)?;
+        let operation_id = host_request_operation_id(envelope);
+        for refs in index.values() {
+            for candidate in refs {
+                if candidate.operation_id == operation_id
+                    && candidate.request_digest == envelope.envelope_sha256
+                    && candidate.local_read_envelope.is_some()
+                {
+                    return Ok(());
+                }
+            }
+        }
+        let queued = index
+            .values()
+            .flatten()
+            .filter(|candidate| candidate.local_read_envelope.is_some())
+            .count();
+        if queued >= MAX_QUEUED_LOCAL_READS {
+            for refs in index.values_mut() {
+                if let Some(position) = refs
+                    .iter()
+                    .position(|candidate| candidate.local_read_envelope.is_some())
+                {
+                    refs.remove(position);
+                    break;
+                }
+            }
+        }
+        index
+            .entry(envelope.connection_id.clone())
+            .or_default()
+            .push(HostRequestOperationRef {
+                operation_id,
+                request_digest: envelope.envelope_sha256.clone(),
+                local_read_envelope: Some(envelope.clone()),
+                local_read_tool: Some(tool.clone()),
+                local_read_claim_lease_until_unix_ms: None,
+            });
+        Ok(())
+    }
+
+    /// Claims the next admitted local-read pair for the daemon poller.
+    ///
+    /// Mirrors `AgentActivationPendingState::claim_at`: deterministic
+    /// connection-then-fifo order, skipping expired and still-leased pairs,
+    /// granting a bounded claim lease on the returned pair and retaining it
+    /// for transient-failure retry. `None` is a null poll, not an error.
+    /// Pure queue memory: no store IO, so already-resulted pairs are retired
+    /// by [`Self::submit_local_read_result`] (and the sync `local_read` leg)
+    /// rather than re-checked here.
+    pub(crate) fn claim_local_read_pair(
+        &self,
+    ) -> Result<Option<(HostRequestEnvelope, serde_json::Value)>, TransportError> {
+        let mut index = self
+            .host_request_connection_index
+            .lock()
+            .map_err(|_| TransportError::SessionFenced)?;
+        let now = unix_ms();
+        for refs in index.values_mut() {
+            for candidate in refs.iter_mut() {
+                let (Some(envelope), Some(tool)) = (
+                    candidate.local_read_envelope.as_ref(),
+                    candidate.local_read_tool.as_ref(),
+                ) else {
+                    continue;
+                };
+                if activation_deadline_expired(now, envelope.identity.deadline_unix_ms) {
+                    continue;
+                }
+                if candidate
+                    .local_read_claim_lease_until_unix_ms
+                    .is_some_and(|lease_until| now < lease_until)
+                {
+                    continue;
+                }
+                candidate.local_read_claim_lease_until_unix_ms = Some(
+                    now.saturating_add(LOCAL_READ_CLAIM_LEASE_MS)
+                        .min(envelope.identity.deadline_unix_ms),
+                );
+                return Ok(Some((envelope.clone(), tool.clone())));
+            }
+        }
+        Ok(None)
+    }
+
+    /// Retires one queued local-read pair without failing.
+    ///
+    /// Called after a result is persisted (submit and sync legs) so later
+    /// claims skip it. Like disconnect fencing, this never fails: every
+    /// lock/store error is contained because retirement must hold even when
+    /// the store is unavailable.
+    pub(crate) fn retire_local_read_pair(&self, operation_id: &str, request_digest: &str) {
+        let Ok(mut index) = self.host_request_connection_index.lock() else {
+            return;
+        };
+        for refs in index.values_mut() {
+            refs.retain(|candidate| {
+                !(candidate.operation_id == operation_id
+                    && candidate.request_digest == request_digest
+                    && candidate.local_read_envelope.is_some())
+            });
+        }
+    }
+
+    /// Submits one daemon-produced local-read result for its waiting host request.
+    ///
+    /// Validates the closed [`HostRequestResultBody`], binds it to the exact
+    /// stored operation, enforces the absolute deadline bound (expiry is
+    /// [`TransportError::Timeout` — the expected race, projected as a known
+    /// expired outcome by the daemon arm), fence-checks the presenting daemon
+    /// session against the admitted envelope fence (queued full fence when
+    /// present, else the ORS authority/generation), then persists through the
+    /// ORS result path. An exact replay of a resulted operation is idempotent
+    /// even across deadline expiry; a changed body under the same identity is
+    /// [`TransportError::IdentityConflict`]; an unknown operation is
+    /// [`TransportError::UnknownRequest`].
+    pub(crate) fn submit_local_read_result(
+        &self,
+        session: &Session,
+        body: &HostRequestResultBody,
+    ) -> Result<HostRequestRecord, TransportError> {
+        body.validate()
+            .map_err(|_| TransportError::SessionFenced)?;
+        let operation_id = OperationIdentity::new(body.operation_id.clone())
+            .map_err(|_| TransportError::SessionFenced)?;
+        let stored = self
+            .generation_gateway
+            .ors
+            .load_host_request(&operation_id, &body.request_sha256)
+            .map_err(|_| TransportError::SessionFenced)?
+            .ok_or(TransportError::UnknownRequest)?;
+        if stored.operation_id.as_str() != body.operation_id
+            || stored.request_digest != body.request_sha256
+        {
+            return Err(TransportError::SessionFenced);
+        }
+        // Exact replay is idempotent even across deadline expiry: a retained
+        // terminal result never takes the expiry path.
+        if stored.state == HostRequestState::ResultReceived
+            && stored.result_digest.as_deref() == Some(body.result_digest.as_str())
+            && stored.result_response.as_ref() == Some(&body.response)
+        {
+            return Ok(stored);
+        }
+        if activation_deadline_expired(unix_ms(), stored.deadline_unix_ms) {
+            return Err(TransportError::Timeout);
+        }
+        let queued_envelope = {
+            let index = self
+                .host_request_connection_index
+                .lock()
+                .map_err(|_| TransportError::SessionFenced)?;
+            index
+                .values()
+                .flatten()
+                .find(|candidate| {
+                    candidate.operation_id == body.operation_id
+                        && candidate.request_digest == body.request_sha256
+                })
+                .and_then(|candidate| candidate.local_read_envelope.clone())
+        };
+        if let Some(envelope) = queued_envelope {
+            if !session
+                .authority_epoch
+                .is_same_authority(&envelope.state_fence.authority_epoch)
+                || session.module_generation.generation != envelope.state_fence.resource_generation
+                || session.module_generation.state_fence != envelope.state_fence
+            {
+                return Err(TransportError::SessionFenced);
+            }
+        } else if !session
+            .authority_epoch
+            .is_same_authority(&stored.authority_epoch)
+            || session.module_generation.generation.value() != stored.generation
+        {
+            return Err(TransportError::SessionFenced);
+        }
+        let persisted = self
+            .generation_gateway
+            .ors
+            .persist_host_request_result(
+                &operation_id,
+                &body.request_sha256,
+                &body.result_digest,
+                &body.response,
+            )
+            .map_err(|error| match error {
+                OrsError::HostRequestIdentityConflict { .. } => TransportError::IdentityConflict,
+                _ => TransportError::SessionFenced,
+            })?
+            .ok_or(TransportError::UnknownRequest)?;
+        self.retire_local_read_pair(&body.operation_id, &body.request_sha256);
+        Ok(persisted)
     }
 }
 
@@ -758,7 +1011,7 @@ fn bridge_process_binding(
 /// Every identity is preserved opaquely: Session, task, scope, capability,
 /// fence, and payload values become exact bytes or digests for replay
 /// comparison and are never interpreted here.
-fn requested_host_request_record(
+pub(crate) fn requested_host_request_record(
     envelope: &HostRequestEnvelope,
 ) -> Result<HostRequestRecord, TransportError> {
     let label =

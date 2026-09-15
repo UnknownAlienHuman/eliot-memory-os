@@ -19,7 +19,7 @@ use std::collections::BTreeMap;
 use eliot_contracts::StateFence;
 use eliot_kernel_service::AuthenticatedHostSession;
 use eliot_ors::{OperationIdentity, OrsError};
-use eliot_protocol::{HostRequestEnvelope, host_request_operation_id};
+use eliot_protocol::{HostRequestEnvelope, HostRequestResultBody, host_request_operation_id};
 use eliot_store_api::{
     CanonicalRequestView, NamedReadOperation, NamedReadRequest, NamedReadResponse,
     OrderingHeadExpectation, PreparedTransition, ReadConsistency, RequestMeta,
@@ -327,6 +327,67 @@ impl KernelComposition {
                         .map_err(|_| TransportError::SessionFenced)?;
                     self.reconcile_agent_activation_result(&query)
                         .map(|ack| Self::reconciled_activation_daemon_response(&ack))
+                }
+                #[cfg(not(windows))]
+                {
+                    let _ = payload;
+                    Err(TransportError::SessionFenced)
+                }
+            }
+            "local_read_claim" => {
+                // Outbound-only eliotd poller for admitted `eliot.query` pairs
+                // (Implements #18): mirrors `agent_activation_claim` exactly —
+                // same session/auth/ready/fence gates via the dispatcher head
+                // and `frame_dispatch` allowlist, same single-`operation`-key
+                // payload shape, same null poll (not error) when empty.
+                #[cfg(windows)]
+                {
+                    if payload.as_object().is_none_or(|object| object.len() != 1) {
+                        return Err(TransportError::SessionFenced);
+                    }
+                    self.claim_local_read_pair().map(|pair| match pair {
+                        Some((envelope, tool)) => serde_json::json!({
+                            "status": "known",
+                            "value": { "pair": { "envelope": envelope, "tool": tool } },
+                            "recovery": null,
+                        }),
+                        None => serde_json::json!({
+                            "status": "known",
+                            "value": { "pair": null },
+                            "recovery": null,
+                        }),
+                    })
+                }
+                #[cfg(not(windows))]
+                {
+                    let _ = payload;
+                    Err(TransportError::SessionFenced)
+                }
+            }
+            "local_read_result" => {
+                // Daemon submit leg for the claimed pair (Implements #18):
+                // validates plus fence-checks the submitted
+                // `HostRequestResultBody` and binds it to the waiting host
+                // request through the ORS result path. Exact replay stays
+                // idempotent (even across deadline expiry); a changed body
+                // under the same identity conflicts; an elapsed deadline is
+                // the expected race and projects as a known expired outcome
+                // so the caller retains liveness without parsing errors.
+                #[cfg(windows)]
+                {
+                    let result_value = payload
+                        .get("result")
+                        .cloned()
+                        .ok_or(TransportError::SessionFenced)?;
+                    let body: HostRequestResultBody = serde_json::from_value(result_value)
+                        .map_err(|_| TransportError::SessionFenced)?;
+                    match self.submit_local_read_result(session, &body) {
+                        Ok(_) => Ok(Self::accepted_daemon_response()),
+                        Err(TransportError::Timeout) => {
+                            Ok(Self::expired_activation_daemon_response())
+                        }
+                        Err(error) => Err(error),
+                    }
                 }
                 #[cfg(not(windows))]
                 {
@@ -730,6 +791,9 @@ impl KernelComposition {
         {
             return Err(TransportError::SessionFenced);
         }
+        // The sync leg answered this operation: retire any queued async pair
+        // for it so a later `local_read_claim` poll skips it without store IO.
+        self.retire_local_read_pair(operation_id.as_str(), &envelope.envelope_sha256);
         Ok(host_request_route::host_request_admitted_response(
             &receipt, &resulted,
         ))
