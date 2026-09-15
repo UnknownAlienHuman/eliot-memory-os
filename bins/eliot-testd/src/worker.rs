@@ -183,7 +183,10 @@ pub fn drive_admitted_one_shot<E: ProcessExecutor + 'static>(
 /// Drives one claimed job against the presented admission to a deterministic
 /// disposition. The job is already leased to this shot; every path below ends
 /// in `finish` or `cancel` so the lease is always released.
-#[allow(clippy::too_many_arguments)]
+#[allow(
+    clippy::too_many_arguments,
+    reason = "DISPATCH-LIVE residual: one admitted-shot context (composition, store, job, lease, presented material, executor, owner, now); a params-struct refactor is deferred until the dispatch-launch seam fixes the call shape, never a bare allow"
+)]
 fn drive_claimed<E: ProcessExecutor + 'static>(
     composition: &TestdComposition,
     store: &TestdStore,
@@ -282,7 +285,10 @@ fn drive_claimed<E: ProcessExecutor + 'static>(
 /// proof (executor-unknown, failed observation, or a still-running view at
 /// the one-shot boundary) finishes as `Unknown` with evidence so the exact
 /// identity reconciles later under the bounded retry policy.
-#[allow(clippy::too_many_arguments)]
+#[allow(
+    clippy::too_many_arguments,
+    reason = "DISPATCH-LIVE residual: one observation context (store, job, lease, executor, collector, operation, start note, now); a params-struct refactor is deferred until the dispatch-launch seam fixes the call shape, never a bare allow"
+)]
 fn observe_and_finish<E: ProcessExecutor + 'static>(
     store: &TestdStore,
     job: &TestJob,

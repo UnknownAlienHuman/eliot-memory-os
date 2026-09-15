@@ -386,6 +386,47 @@ mod tests {
         }
     }
 
+    /// DEPENDS-ON-INTEGRATION: live delivery seam E2E (needs W-C kernel side).
+    ///
+    /// Once the kernel contour composes (`compose_dispatch_contour`) and
+    /// `prepare_testd_launch` / `launch_admitted_testd_attempt` deliver a
+    /// real `eliot-testd.admitted-attempt.json` next to a spawned
+    /// `eliot-testd`, the child must drive the single registered
+    /// `cargo-test` profile (bounded `cargo --version` probe) with no test
+    /// doubles. This test stages that exact documented file shape (seven
+    /// keys per the `testd_material` module docs) through the real broker
+    /// constructors and drives it through the real `drive_material_probe`
+    /// (real tool resolution, real `TestdDispatchAuthority`, real composed
+    /// executor). Ignored until the W-C launch edge delivers; it never runs
+    /// by default and never weakens the fail-closed gate.
+    #[test]
+    #[ignore = "DEPENDS-ON-INTEGRATION: requires W-C kernel dispatch contour to deliver real material and advertise, on a Windows host with cargo on PATH; child side stays fail-closed until then"]
+    fn dispatch_live_e2e_bounded_probe_runs_without_doubles() {
+        use eliot_testd::testd_material::read_testd_material_from;
+
+        let live = dcf_test_epoch(7);
+        let path = dcf_stage_material(&live, &live, "e2e.admitted-attempt.json");
+        let Ok(staged) = read_testd_material_from(&path) else {
+            panic!("E2E material must validate: read_testd_material delivery is the child-side seam");
+        };
+        let Some(material) = staged else {
+            panic!("E2E material must present: absent delivery keeps DenyNoPresentedAttempt");
+        };
+        assert_eq!(material.profile, "cargo-test");
+        // The Drive arm is the only arm a delivered presentation reaches.
+        assert_eq!(gate_after_advertise(true, true), GateDecision::Drive);
+        // Real drive, no doubles: real installed tool, real dispatch
+        // authority, real composed executor, bounded `cargo --version`.
+        let code = drive_material_probe(&material);
+        assert_eq!(
+            code, EXIT_ADMITTED_COMPLETED,
+            "bounded probe must complete; explicit run needs W-C delivery plus unexpired material on a host with cargo on PATH"
+        );
+        if let Some(parent) = path.parent() {
+            let _ = std::fs::remove_dir_all(parent);
+        }
+    }
+
     fn dcf_test_epoch(sequence: u64) -> eliot_contracts::EpochId {
         use std::num::NonZeroU64;
         let Ok(lineage) =
