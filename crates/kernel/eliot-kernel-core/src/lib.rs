@@ -49,8 +49,10 @@ pub use grant_activation_port::{
     IntentDisposition, IntroductionActivationIntent, IntroductionRevocationIntent,
 };
 pub use module::control_reserve_front_door::{
-    AuthorityDecision, ControlPermit, ControlReserve, DecisionDenialReason, FrontDoor,
-    IdempotencyDisposition, IdempotencyLedger,
+    AuthorityDecision, CapacityBottleneck, CapacityClass, ControlOperationClass, ControlPermit,
+    ControlReserve, DecisionDenialReason, EMERGENCY_PREALLOCATED_SLOTS, EmergencyOperationClass,
+    FRONT_DOOR_BOTTLENECK, FrontDoor, IdempotencyDisposition, IdempotencyLedger, NormalWorkClass,
+    PermitOperation,
 };
 pub use module::epoch_and_fence::{EpochActivation, RouteFence, RouteScope};
 pub use module::generation_routing::{CutoverDecision, GenerationRoute, GenerationRouter};
