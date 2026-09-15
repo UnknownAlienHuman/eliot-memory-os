@@ -1,7 +1,7 @@
 schema_version = 3
 module_id = "smart.dreamer.concept"
 crate = "eliot-dreamer-concept"
-status = "PROTOTYPE"
+status = "ADMITTED"
 wave = "cognitive-micromodules-wave-01"
 agent_order = 24
 plane = "Smart"
@@ -56,7 +56,7 @@ integration_owner = "cognitive-wave-integrator"
 implementation_language = "Rust 2024"
 required_verification = ["module/package proof at the declared proof ceiling", "real provider/consumer fixture for every changed edge", "the named Product Pulse before promotion", "exact donor reuse/rewrite/reject trace"]
 writeback = "return implementation artifact, exact proof evidence, donor disposition, unresolved ContractChallenges and merge/remove recommendation"
-workspace_admission = "forbidden until implementation, package proof, affected edge proof, current-main rebase and integration-owner review"
+workspace_admission = "admitted via #965 (T8-AS1) root workspace membership"
 
 # Acceptance is decided by the owning contract and independent review
 # (I0.10: line/test/type counts are not goals). `scripts/verify-work-unit.py`
