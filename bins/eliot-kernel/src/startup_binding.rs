@@ -186,6 +186,12 @@ pub(crate) struct KernelLaunchOptions {
     pub(crate) daemon_sha256: Option<String>,
     pub(crate) kernel_artifact_sha256: Option<String>,
     pub(crate) doctor_artifact_sha256: Option<String>,
+    /// Host-injected absolute Doctor executable path, digest-bound to
+    /// `doctor_artifact_sha256`. Missing fails closed once the doctor role
+    /// is digested; no path or digest is defaulted. The live image digest
+    /// is re-proved at spawn through the admitted process gateway path
+    /// proof; startup retains the shape-bound anchor only.
+    pub(crate) doctor_executable_path: Option<PathBuf>,
     pub(crate) testd_artifact_sha256: Option<String>,
     pub(crate) native_worker_artifact_sha256: Option<String>,
 }
@@ -220,6 +226,8 @@ where
             kernel_artifact_digest,
             doctor_artifact_flag,
             doctor_artifact_digest,
+            doctor_executable_flag,
+            doctor_executable_path,
             testd_artifact_flag,
             testd_artifact_digest,
             native_worker_artifact_flag,
@@ -235,6 +243,7 @@ where
             && authority_digest_flag == "--authority-descriptor-sha256"
             && kernel_artifact_flag == "--kernel-artifact-sha256"
             && doctor_artifact_flag == "--doctor-artifact-sha256"
+            && doctor_executable_flag == "--doctor-executable-path"
             && testd_artifact_flag == "--testd-artifact-sha256"
             && native_worker_artifact_flag == "--native-worker-artifact-sha256"
             && daemon_flag == "--eliotd-descriptor"
@@ -259,6 +268,18 @@ where
                     "descriptor digests must be lowercase SHA-256",
                 ));
             }
+            let doctor_executable_path = PathBuf::from(doctor_executable_path);
+            if !doctor_executable_path.is_absolute()
+                || doctor_executable_path.as_os_str().is_empty()
+                || doctor_executable_path
+                    .to_string_lossy()
+                    .chars()
+                    .any(char::is_control)
+            {
+                return Err(invalid_input(
+                    "Host launch must inject the exact Doctor executable path bound to the digested doctor role",
+                ));
+            }
             Ok(KernelLaunchOptions {
                 work_root: canonical_directory(work_root)?,
                 store_config: Some(StoreConfigLocator::NeutralDescriptor(PathBuf::from(
@@ -271,12 +292,49 @@ where
                 daemon_sha256: Some(daemon_digest.into_owned()),
                 kernel_artifact_sha256: Some(kernel_artifact_digest.into_owned()),
                 doctor_artifact_sha256: Some(doctor_artifact_digest.into_owned()),
+                doctor_executable_path: Some(doctor_executable_path),
                 testd_artifact_sha256: Some(testd_artifact_digest.into_owned()),
                 native_worker_artifact_sha256: Some(native_worker_artifact_digest.into_owned()),
             })
         }
+        [
+            work_flag,
+            _work_root,
+            store_flag,
+            _descriptor,
+            store_digest_flag,
+            _store_digest,
+            authority_flag,
+            _authority_path,
+            authority_digest_flag,
+            _authority_digest,
+            kernel_artifact_flag,
+            _kernel_artifact_digest,
+            doctor_artifact_flag,
+            _doctor_artifact_digest,
+            testd_artifact_flag,
+            _testd_artifact_digest,
+            native_worker_artifact_flag,
+            _native_worker_artifact_digest,
+            daemon_flag,
+            _daemon_path,
+            daemon_digest_flag,
+            _daemon_digest,
+        ] if work_flag == "--work-root"
+            && store_flag == "--store-bootstrap"
+            && store_digest_flag == "--store-bootstrap-sha256"
+            && authority_flag == "--authority-descriptor"
+            && authority_digest_flag == "--authority-descriptor-sha256"
+            && kernel_artifact_flag == "--kernel-artifact-sha256"
+            && doctor_artifact_flag == "--doctor-artifact-sha256"
+            && testd_artifact_flag == "--testd-artifact-sha256"
+            && native_worker_artifact_flag == "--native-worker-artifact-sha256"
+            && daemon_flag == "--eliotd-descriptor"
+            && daemon_digest_flag == "--eliotd-descriptor-sha256" => Err(invalid_input(
+            "Host launch must inject the exact Doctor executable path bound to the digested doctor role",
+        )),
         _ => Err(invalid_input(
-            "expected the exact mandatory 22-value Host launch contour",
+            "expected the exact mandatory 24-value Host launch contour",
         )),
     }
 }
@@ -475,7 +533,55 @@ mod tests {
     fn launch_args_accept_the_explicit_kernel_and_eliotd_artifact_domains() {
         let root = TempRoot::new();
         let digest = "a".repeat(64);
+        let doctor_path = root.0.join("eliot-doctor.exe");
         let options = parse_launch_options([
+            "--work-root".into(),
+            root.0.join("work").into_os_string(),
+            "--store-bootstrap".into(),
+            root.0.join("store-bootstrap.json").into_os_string(),
+            "--store-bootstrap-sha256".into(),
+            digest.clone().into(),
+            "--authority-descriptor".into(),
+            root.0.join("authority.json").into_os_string(),
+            "--authority-descriptor-sha256".into(),
+            digest.clone().into(),
+            "--kernel-artifact-sha256".into(),
+            digest.clone().into(),
+            "--doctor-artifact-sha256".into(),
+            digest.clone().into(),
+            "--doctor-executable-path".into(),
+            doctor_path.clone().into_os_string(),
+            "--testd-artifact-sha256".into(),
+            digest.clone().into(),
+            "--native-worker-artifact-sha256".into(),
+            digest.clone().into(),
+            "--eliotd-descriptor".into(),
+            root.0.join("eliotd.json").into_os_string(),
+            "--eliotd-descriptor-sha256".into(),
+            digest.clone().into(),
+        ])
+        .expect("integrated args");
+        assert_eq!(options.kernel_artifact_sha256, Some(digest.clone()));
+        assert_eq!(options.doctor_artifact_sha256, Some(digest.clone()));
+        assert_eq!(
+            options.doctor_executable_path,
+            Some(doctor_path),
+            "digest-bound doctor path must be retained exactly"
+        );
+        assert_eq!(options.testd_artifact_sha256, Some(digest.clone()));
+        assert_eq!(options.native_worker_artifact_sha256, Some(digest.clone()));
+        assert_eq!(options.daemon_descriptor, Some(root.0.join("eliotd.json")));
+    }
+
+    #[test]
+    fn launch_args_require_the_digest_bound_doctor_path_anchor() {
+        let root = TempRoot::new();
+        let digest = "a".repeat(64);
+        let doctor_path = root.0.join("eliot-doctor.exe");
+        // The legacy 22-value contour carries a digested doctor role but no
+        // absolute path anchor: it must fail closed naming the doctor role,
+        // never defaulting a path.
+        let missing_path = parse_launch_options([
             "--work-root".into(),
             root.0.join("work").into_os_string(),
             "--store-bootstrap".into(),
@@ -498,13 +604,74 @@ mod tests {
             root.0.join("eliotd.json").into_os_string(),
             "--eliotd-descriptor-sha256".into(),
             digest.clone().into(),
+        ]);
+        let error = missing_path.expect_err("missing doctor path must fail");
+        assert!(
+            error.to_string().to_lowercase().contains("doctor"),
+            "missing path error must name the doctor role, got: {error}"
+        );
+        // A relative path anchor is not digest-bound: it must fail naming
+        // the doctor role instead of being retained.
+        let relative = parse_launch_options([
+            "--work-root".into(),
+            root.0.join("work").into_os_string(),
+            "--store-bootstrap".into(),
+            root.0.join("store-bootstrap.json").into_os_string(),
+            "--store-bootstrap-sha256".into(),
+            digest.clone().into(),
+            "--authority-descriptor".into(),
+            root.0.join("authority.json").into_os_string(),
+            "--authority-descriptor-sha256".into(),
+            digest.clone().into(),
+            "--kernel-artifact-sha256".into(),
+            digest.clone().into(),
+            "--doctor-artifact-sha256".into(),
+            digest.clone().into(),
+            "--doctor-executable-path".into(),
+            "relative/eliot-doctor.exe".into(),
+            "--testd-artifact-sha256".into(),
+            digest.clone().into(),
+            "--native-worker-artifact-sha256".into(),
+            digest.clone().into(),
+            "--eliotd-descriptor".into(),
+            root.0.join("eliotd.json").into_os_string(),
+            "--eliotd-descriptor-sha256".into(),
+            digest.clone().into(),
+        ]);
+        let error = relative.expect_err("relative doctor path must fail");
+        assert!(
+            error.to_string().to_lowercase().contains("doctor"),
+            "relative path error must name the doctor role, got: {error}"
+        );
+        // The digest-bound absolute path is accepted and retained exactly.
+        let accepted = parse_launch_options([
+            "--work-root".into(),
+            root.0.join("work").into_os_string(),
+            "--store-bootstrap".into(),
+            root.0.join("store-bootstrap.json").into_os_string(),
+            "--store-bootstrap-sha256".into(),
+            digest.clone().into(),
+            "--authority-descriptor".into(),
+            root.0.join("authority.json").into_os_string(),
+            "--authority-descriptor-sha256".into(),
+            digest.clone().into(),
+            "--kernel-artifact-sha256".into(),
+            digest.clone().into(),
+            "--doctor-artifact-sha256".into(),
+            digest.clone().into(),
+            "--doctor-executable-path".into(),
+            doctor_path.clone().into_os_string(),
+            "--testd-artifact-sha256".into(),
+            digest.clone().into(),
+            "--native-worker-artifact-sha256".into(),
+            digest.clone().into(),
+            "--eliotd-descriptor".into(),
+            root.0.join("eliotd.json").into_os_string(),
+            "--eliotd-descriptor-sha256".into(),
+            digest.into(),
         ])
-        .expect("integrated args");
-        assert_eq!(options.kernel_artifact_sha256, Some(digest.clone()));
-        assert_eq!(options.doctor_artifact_sha256, Some(digest.clone()));
-        assert_eq!(options.testd_artifact_sha256, Some(digest.clone()));
-        assert_eq!(options.native_worker_artifact_sha256, Some(digest.clone()));
-        assert_eq!(options.daemon_descriptor, Some(root.0.join("eliotd.json")));
+        .expect("digest-bound doctor path must parse");
+        assert_eq!(accepted.doctor_executable_path, Some(doctor_path));
     }
 
     #[test]
@@ -592,6 +759,8 @@ mod tests {
             "c".repeat(64).into(),
             "--doctor-artifact-sha256".into(),
             "e".repeat(64).into(),
+            "--doctor-executable-path".into(),
+            root.0.join("eliot-doctor.exe").into_os_string(),
             "--testd-artifact-sha256".into(),
             "f".repeat(64).into(),
             "--native-worker-artifact-sha256".into(),

@@ -14,9 +14,11 @@
 //!
 //! The [`ProcessIntent`] is supplied by the caller (the Drive arm), never
 //! derived here and never taken from argv, stdin, or environment: this
-//! module mints no executable binding. Until the Drive arm owns an honest
-//! admitted intent source, this seam is exercised by the module tests; the
-//! production Drive arm stays fail-closed (see the dispatch residual).
+//! module mints no executable binding. The production Drive arm
+//! (`drive_validated_dispatched_attempt`, called from the composition root)
+//! supplies the honest admitted intent derived from the Kernel-admitted
+//! executable binding; the module tests exercise the same seam with
+//! test-only intents.
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -37,10 +39,6 @@ use crate::dispatched_material::DispatchGrant;
 /// Typed failure for the local doctor dispatch authority. Every variant is
 /// fail-closed: the one-shot entry maps each to exit 78 without effect.
 #[derive(Clone, Debug, Eq, PartialEq, thiserror::Error)]
-#[allow(
-    dead_code,
-    reason = "DISPATCH-CAUSE-FIX doctor Drive execution awaits an honest admitted intent source; the authority seam lands first and is exercised by the module tests"
-)]
 pub enum DoctorAuthorityError {
     /// The grant, intent, or issuance shape cannot be consumed.
     #[error("doctor dispatch authority refused invalid material: {0}")]
@@ -54,19 +52,11 @@ pub enum DoctorAuthorityError {
 /// process's memory for one shot; the authority instance plus the stored
 /// validation context bind exactly one issued permit to its consuming
 /// validation, mirroring the broker.
-#[allow(
-    dead_code,
-    reason = "DISPATCH-CAUSE-FIX doctor Drive execution awaits an honest admitted intent source; the authority seam lands first and is exercised by the module tests"
-)]
 pub struct DoctorDispatchAuthority {
     authority: Mutex<DispatchPermitAuthority>,
     context: Mutex<Option<DispatchValidationContext>>,
 }
 
-#[allow(
-    dead_code,
-    reason = "DISPATCH-CAUSE-FIX doctor Drive execution awaits an honest admitted intent source; the authority seam lands first and is exercised by the module tests"
-)]
 impl DoctorDispatchAuthority {
     /// Activates one ephemeral doctor authority around fresh in-memory key
     /// material. The authority id names this process invocation; the key
@@ -265,10 +255,10 @@ mod tests {
     }
 
     // Clearly-marked test-only intent scaffolding standing in for the
-    // admitted intent the Drive arm will supply once an honest intent
-    // source exists. Production never builds intents from fixture
-    // executables; this only proves the authority consumes a validated
-    // grant through the real contour constructors.
+    // admitted intent the production Drive arm derives via
+    // derive_intent_from_admitted_binding. Production never builds intents
+    // from fixture executables; this only proves the authority consumes a
+    // validated grant through the real contour constructors.
     fn test_intent() -> Result<ProcessIntent, String> {
         let bad = |error: eliot_process::ContractError| error.to_string();
         let generation = Generation::new(3).map_err(bad)?;
@@ -322,7 +312,8 @@ mod tests {
         assert_eq!(request.generation().get(), grant.fence_generation);
 
         // The port seam behind the real executor type: object-safe and
-        // constructible, so the Drive arm cannot drift implementations.
+        // constructible, so the production Drive arm cannot drift
+        // implementations.
         let _port: Arc<dyn DispatchValidationPort> =
             Arc::new(DoctorDispatchAuthority::new().map_err(|error| error.to_string())?);
         let _executor = executor_for(Arc::new(

@@ -75,10 +75,11 @@ fn deny(detail: &str) -> i32 {
 /// absent or invalid file presents `false` (invalid files additionally deny
 /// with their typed detail before the gate is reached). The `Drive` arm
 /// names the rule the dispatch contour must satisfy, and
-/// `drive_admitted_attempt` stays the only driver.
+/// `drive_validated_dispatched_attempt` is the only production driver
+/// (`drive_admitted_attempt` remains as the test-reference legacy path).
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum GateDecision {
-    /// Drive the delivered attempt through `drive_admitted_attempt`.
+    /// Drive the delivered attempt through `drive_validated_dispatched_attempt`.
     Drive,
     /// Fail closed: the Kernel does not advertise the doctor operation.
     DenyNotAdvertised,

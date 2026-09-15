@@ -147,7 +147,7 @@ use std::time::Duration;
 /// through it.
 pub use dispatch_launch::{
     ChildStartOutcome, DispatchGrant, DispatchLaunchError, DispatchedWorkerKind,
-    DoctorLaunchMaterial, DoctorLaunchOutcome, DoctorLaunchSkip,
+    DoctorChildBinding, DoctorLaunchMaterial, DoctorLaunchOutcome, DoctorLaunchSkip,
     NATIVE_WORKER_DISPATCH_AUTHORITY_PREFIX, NATIVE_WORKER_DISPATCH_DERIVATION_DOMAIN,
     NATIVE_WORKER_DISPATCH_LAUNCH_GRANT_HEAD, NativeWorkerDispatchDerivation,
     NativeWorkerLaunchMaterial, NativeWorkerLaunchOutcome, NativeWorkerLaunchSkip,
@@ -164,6 +164,7 @@ pub use dispatch_launch::{
     reconcile_launched_native_worker_attempt, reconcile_launched_testd_attempt,
     release_launched_attempt, start_ready_doctor_launch, start_ready_native_worker_launch,
     start_ready_testd_launch, testd_admission_advertised, testd_production_composed,
+    trigger_admitted_doctor_launch,
 };
 /// Kernel-owned durable Doctor recovery ledger (DISPATCH-WIRE part D).
 ///

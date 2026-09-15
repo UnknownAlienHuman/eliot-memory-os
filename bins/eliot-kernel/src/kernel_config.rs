@@ -43,6 +43,11 @@ pub struct KernelConfig {
     /// Missing fails closed once the dispatch contour is required; no
     /// in-memory or test signer is fabricated by the production composition.
     pub doctor_artifact_sha256: Option<String>,
+    /// Host-injected absolute Doctor executable path, digest-bound to
+    /// `doctor_artifact_sha256`. Missing fails closed once the doctor role
+    /// is digested; no path is defaulted. Retained for the contour-owned
+    /// trigger call-in; the live image digest is re-proved at spawn.
+    pub doctor_executable_path: Option<PathBuf>,
     /// Independent digest of the approved Testd image injected by Host.
     pub testd_artifact_sha256: Option<String>,
     /// Independent digest of the approved native worker image injected by Host.
@@ -78,6 +83,7 @@ impl KernelConfig {
             kernel_artifact_sha256: None,
             eliotd_descriptor_artifact_sha256: None,
             doctor_artifact_sha256: None,
+            doctor_executable_path: None,
             testd_artifact_sha256: None,
             native_worker_artifact_sha256: None,
             eliotd_receipt_binding: None,
@@ -130,6 +136,14 @@ impl KernelConfig {
     #[must_use]
     pub fn with_doctor_artifact_sha256(mut self, digest: impl Into<String>) -> Self {
         self.doctor_artifact_sha256 = Some(digest.into());
+        self
+    }
+
+    /// Injects the Host-approved absolute Doctor executable path bound to
+    /// the digested doctor role. No default; missing fails closed.
+    #[must_use]
+    pub fn with_doctor_executable_path(mut self, path: PathBuf) -> Self {
+        self.doctor_executable_path = Some(path);
         self
     }
 
@@ -196,16 +210,24 @@ mod tests {
     fn dispatch_artifact_digests_are_injected_without_defaults() {
         let config = KernelConfig::new(std::path::PathBuf::from("/tmp/work"));
         assert!(config.doctor_artifact_sha256.is_none());
+        assert!(config.doctor_executable_path.is_none());
         assert!(config.testd_artifact_sha256.is_none());
         assert!(config.native_worker_artifact_sha256.is_none());
+        let doctor_path = std::path::PathBuf::from("/tmp/eliot-doctor.exe");
         let config = config
             .with_doctor_artifact_sha256("a".repeat(64))
+            .with_doctor_executable_path(doctor_path.clone())
             .with_testd_artifact_sha256("b".repeat(64))
             .with_native_worker_artifact_sha256("c".repeat(64));
         assert_eq!(
             config.doctor_artifact_sha256,
             Some("a".repeat(64)),
             "doctor digest must be retained exactly"
+        );
+        assert_eq!(
+            config.doctor_executable_path,
+            Some(doctor_path),
+            "digest-bound doctor path must be retained exactly"
         );
         assert_eq!(
             config.testd_artifact_sha256,

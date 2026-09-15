@@ -118,10 +118,6 @@ impl From<DoctorIpcError> for AdapterError {
 /// Maps a typed Kernel refusal cause to the closest closed doctor error.
 /// Every mapping stays on the admission axis, so each exits 78 without
 /// effect.
-#[allow(
-    dead_code,
-    reason = "Slice-C dispatch contour reaches this refusal mapping through drive_admitted_attempt; exercised by the module tests"
-)]
 fn rejection_doctor_error(reason: DoctorRepairRejectionReason) -> DoctorError {
     use DoctorRepairRejectionReason as Reason;
     match reason {
@@ -161,10 +157,6 @@ struct RetainedAdmission {
 /// permit, builds no [`ProcessRequest`], and executes nothing.
 pub struct KernelDoctorIpcClient {
     client: KernelClient,
-    #[allow(
-        dead_code,
-        reason = "Slice-C dispatch contour reads the live epoch for the lineage-aware binding; retained at bootstrap"
-    )]
     live_epoch: Option<EpochId>,
     retained: Option<RetainedAdmission>,
 }
@@ -191,10 +183,6 @@ impl KernelDoctorIpcClient {
 
     /// Returns the live authority epoch retained from the authenticated
     /// bootstrap, when the bootstrap completed.
-    #[allow(
-        dead_code,
-        reason = "Slice-C dispatch contour reads the live epoch for the lineage-aware binding; exercised by the module tests"
-    )]
     #[must_use]
     pub fn live_epoch(&self) -> Option<&EpochId> {
         self.live_epoch.as_ref()
@@ -208,10 +196,6 @@ impl KernelDoctorIpcClient {
     /// transport loss before a typed reply becomes
     /// [`DoctorIpcError::UnknownOutcome`], carrying the submit identity for
     /// exact-identity reconciliation instead of a blind retry.
-    #[allow(
-        dead_code,
-        reason = "Slice-C dispatch contour submits through drive_admitted_attempt; exercised by the module tests"
-    )]
     pub fn submit_repair_attempt(
         &mut self,
         request: &DoctorRepairAttemptRequest,
@@ -343,10 +327,6 @@ impl KernelDoctorClient for KernelDoctorIpcClient {
 /// transport failures; they are never mapped to admission or success. A
 /// test double must validate the envelope and echo-check the reply exactly
 /// like [`KernelDoctorIpcClient::submit_repair_attempt`].
-#[allow(
-    dead_code,
-    reason = "Slice-C dispatch contour drives through this transport bound; exercised by the module tests"
-)]
 pub trait AdmittedDoctorTransport: KernelDoctorClient {
     /// Submits one full repair-attempt envelope; the wire selector is a
     /// contract constant, never caller authority.
@@ -631,10 +611,6 @@ where
         .await
 }
 
-#[allow(
-    dead_code,
-    reason = "Slice-C dispatch contour reaches this mapping through drive_admitted_attempt; exercised by the module tests"
-)]
 /// Drives one session-bound dispatched attempt whose concrete intent is
 /// derived ONLY from the Kernel-admitted binding.
 ///
@@ -758,10 +734,6 @@ fn kernel_service_error(error: KernelServiceError) -> AdapterError {
     AdapterError::KernelClient(Box::new(error))
 }
 
-#[allow(
-    dead_code,
-    reason = "Slice-C dispatch contour reaches this mapping through drive_admitted_attempt; exercised by the module tests"
-)]
 fn map_rejection(rejection: &DoctorRepairRejection) -> AdapterError {
     AdapterError::Admission(rejection_doctor_error(rejection.reason))
 }
@@ -2556,6 +2528,401 @@ mod tests {
                     request.fence.generation.to_string(),
                 ]
             );
+        }
+    }
+
+    // ------------------------------------------------------------------
+    // T6-D2 health-probe child path (issue #461): one admitted
+    // health-probe effect through the production validated drive
+    // (dispatch file -> fake transport -> real authority -> stub
+    // executor). Fakes live only in this module; production never uses
+    // them and never deserializes the concrete process request.
+    // ------------------------------------------------------------------
+
+    use eliot_doctor_core::{
+        HEALTH_PROBE_OPERATION_ID, health_probe_manifest, health_probe_recipe,
+    };
+
+    fn health_brief() -> Result<DiagnosticBrief, String> {
+        Ok(DiagnosticBrief {
+            problem_id: "installed-health-probe".to_owned(),
+            component: "doctor-generation".to_owned(),
+            failure_class: "installed-health".to_owned(),
+            symptom: "verify installed generation".to_owned(),
+            impact: "bounded read-only probe".to_owned(),
+            evidence: vec![
+                EvidenceHandle::new("evidence-ref-1", digest(0xe1))
+                    .map_err(|error| error.to_string())?,
+            ],
+            unknowns: Vec::new(),
+        })
+    }
+
+    fn health_request(
+        now: OffsetDateTime,
+    ) -> Result<(ClosedRepairRequest, RepairRecipeManifest), String> {
+        let artifact = digest(0xc1);
+        let manifest =
+            health_probe_manifest(&artifact).map_err(|error| error.to_string())?;
+        let recipe = health_probe_recipe(&artifact).map_err(|error| error.to_string())?;
+        let operation = manifest
+            .resolve(HEALTH_PROBE_OPERATION_ID)
+            .map_err(|error| error.to_string())?;
+        let request = ClosedRepairRequest::for_effect(ClosedRequestParams {
+            request_id: "req-health-probe-1".to_owned(),
+            brief: health_brief()?,
+            recipe,
+            operations: vec![operation],
+            fence: StateFence::new(test_epoch(), 3, digest(0xf1))
+                .map_err(|error| error.to_string())?,
+            lease: RecoveryLease {
+                lease_id: "lease-1".to_owned(),
+                owner: "kernel.doctor-recovery".to_owned(),
+                expires_at: now + Duration::hours(1),
+                allowed_effects: BTreeSet::from([HEALTH_PROBE_OPERATION_ID.to_owned()]),
+            },
+            approval: None,
+            budget_units: 1,
+            deadline: now + Duration::hours(1),
+            cancellation: false,
+            escalation_target: "governor".to_owned(),
+        })
+        .map_err(|error| error.to_string())?;
+        Ok((request, manifest))
+    }
+
+    fn honest_health_admission(
+        request: &ClosedRepairRequest,
+        manifest: &RepairRecipeManifest,
+        attempt_id: &str,
+        effect_seq: u32,
+        epoch: &EpochId,
+        now: OffsetDateTime,
+    ) -> Result<DoctorRepairAdmission, String> {
+        let operation = manifest
+            .resolve(HEALTH_PROBE_OPERATION_ID)
+            .map_err(|error| error.to_string())?;
+        let attempt = request
+            .bind_attempt_on_epoch(manifest, attempt_id, &operation, epoch, now)
+            .map_err(|error| error.to_string())?;
+        let effect = request
+            .bind_effect(&attempt, &operation, effect_seq)
+            .map_err(|error| error.to_string())?;
+        let recipe_identity =
+            RepairRecipeIdentity::bind(&request.recipe).map_err(|error| error.to_string())?;
+        DoctorRepairAdmission {
+            wire_id: DOCTOR_REPAIR_WIRE_ID.to_owned(),
+            wire_version: DOCTOR_REPAIR_WIRE_VERSION,
+            attempt_id: attempt_id.to_owned(),
+            attempt_digest: attempt.digest().to_owned(),
+            effect_digest: Some(effect.digest().to_owned()),
+            recipe_digest: recipe_identity.digest().to_owned(),
+            manifest_digest: manifest.digest(),
+            operation_id: HEALTH_PROBE_OPERATION_ID.to_owned(),
+            lease_id: "doctor-test-lease-1".to_owned(),
+            lease_owner: DOCTOR_RECOVERY_LEASE_OWNER.to_owned(),
+            lease_expires_unix_nanos: nanos(now + Duration::hours(1)),
+            allowed_effects: BTreeSet::from([HEALTH_PROBE_OPERATION_ID.to_owned()]),
+            budget_units: request.budget_units,
+            deadline_unix_nanos: nanos(request.deadline),
+            approval_present: false,
+            cancelled: false,
+            admitted_at_unix_nanos: nanos(now),
+            admission_digest: String::new(),
+        }
+        .with_computed_digest()
+        .map_err(|error| error.to_string())
+    }
+
+    fn health_envelope(
+        now: OffsetDateTime,
+    ) -> Result<(DispatchedAttemptEnvelope, EpochId, u64), String> {
+        let (request, manifest) = health_request(now)?;
+        let epoch = test_epoch();
+        let generation = request.fence.generation;
+        let now_ms = u64::try_from(now.unix_timestamp_nanos() / 1_000_000)
+            .map_err(|error| error.to_string())?;
+        Ok((
+            DispatchedAttemptEnvelope {
+                attempt: test_envelope(&request, ATTEMPT_ID, EFFECT_SEQ),
+                request,
+                manifest,
+                epoch: epoch.clone(),
+                generation,
+                nonce: dispatched_test_nonce(),
+                grant: DispatchGrant {
+                    grant_digest: digest(0x61),
+                    authority_epoch: epoch.clone(),
+                    fence_generation: generation,
+                    fence_nonce: "doctor-launch-fence-test01".to_owned(),
+                    idempotency_key: "doctor-launch-lease-test01".to_owned(),
+                    expires_at: now_ms.saturating_add(60_000),
+                },
+            },
+            epoch,
+            now_ms,
+        ))
+    }
+
+    async fn drive_health_probe_once() -> Result<(), String> {
+        use crate::dispatch_authority::DoctorDispatchAuthority;
+        let now = OffsetDateTime::now_utc();
+        let (envelope, epoch, now_ms) = health_envelope(now)?;
+        let path = write_dispatched_temp(&envelope, "health-probe-drive")?;
+        let validated = read_dispatched_material_from(&path, &epoch)
+            .map_err(|error| error.to_string())?
+            .ok_or_else(|| "valid health material must present".to_owned())?;
+        if path.exists() {
+            remove_dispatched_temp(&path);
+            return Err("validated health material must be consumed once".to_owned());
+        }
+        assert_eq!(validated.generation, validated.request.fence.generation);
+        assert_eq!(validated.attempt.attempt_id, ATTEMPT_ID);
+        let admission =
+            honest_health_admission(&validated.request, &validated.manifest, ATTEMPT_ID, EFFECT_SEQ, &validated.epoch, now)?;
+        let expected_effect = admission.effect_digest.clone();
+        let mut transport = FakeTransport::admitting(admission);
+        let authority = Arc::new(DoctorDispatchAuthority::new().map_err(|error| error.to_string())?);
+        let executor = Arc::new(AuthorityBackedExecutor::new(Arc::clone(&authority)));
+        let outcome = drive_validated_dispatched_attempt(
+            &mut transport,
+            &authority,
+            Arc::clone(&executor),
+            Arc::new(EvidenceCollector::new()),
+            &validated,
+            std::path::Path::new("C:/eliot/doctor"),
+            now,
+            now_ms,
+        )
+        .await
+        .map_err(|error| error.to_string())?;
+        if !matches!(outcome.disposition, DoctorDisposition::RepairedPendingVerification { .. }) {
+            return Err(format!("expected pending verification, got {:?}", outcome.disposition));
+        }
+        if outcome.exit_code() != EXIT_PENDING_VERIFICATION {
+            return Err(format!("expected exit 10, got {}", outcome.exit_code()));
+        }
+        if outcome.report.effect_digest != expected_effect {
+            return Err("effect digest must equal the admitted digest".to_owned());
+        }
+        if outcome.report.evidence_reference.is_none() {
+            return Err("health-probe outcome must carry evidence".to_owned());
+        }
+        if transport.submits != 1 {
+            return Err(format!("expected one submit, got {}", transport.submits));
+        }
+        if executor.lock().starts != 1 {
+            return Err("expected exactly one effect dispatch".to_owned());
+        }
+        let replay_admission =
+            honest_health_admission(&validated.request, &validated.manifest, ATTEMPT_ID, EFFECT_SEQ, &validated.epoch, now)?;
+        if replay_admission.effect_digest != expected_effect {
+            return Err("exact replay must return the same admission".to_owned());
+        }
+        let mut replay_transport = FakeTransport::admitting(replay_admission);
+        match drive_validated_dispatched_attempt(
+            &mut replay_transport,
+            &authority,
+            Arc::clone(&executor),
+            Arc::new(EvidenceCollector::new()),
+            &validated,
+            std::path::Path::new("C:/eliot/doctor"),
+            now,
+            now_ms,
+        )
+        .await
+        {
+            Err(error) if error.exit_code() == EXIT_KERNEL_ADMISSION_REQUIRED => {},
+            Err(error) => return Err(format!("replay must deny with exit 78, got {error}")),
+            Ok(_) => return Err("exact replay must not dispatch a second effect".to_owned()),
+        }
+        if replay_transport.submits != 1 {
+            return Err("replay returns the same admission before the fence denies".to_owned());
+        }
+        if executor.lock().starts != 1 {
+            return Err("replay must cause no second effect dispatch".to_owned());
+        }
+        remove_dispatched_temp(&path);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn health_probe_validated_grant_drives_one_effect_replay_refused() {
+        if let Err(detail) = drive_health_probe_once().await {
+            panic!("health-probe validated drive must hold: {detail}");
+        }
+    }
+
+    async fn deny_health_probe_mutation_and_foreign() -> Result<(), String> {
+        use crate::dispatch_authority::DoctorDispatchAuthority;
+        let now = OffsetDateTime::now_utc();
+        let (envelope, epoch, now_ms) = health_envelope(now)?;
+        let path = write_dispatched_temp(&envelope, "health-probe-mutate")?;
+        let validated = read_dispatched_material_from(&path, &epoch)
+            .map_err(|error| error.to_string())?
+            .ok_or_else(|| "valid health material must present".to_owned())?;
+        let mut mutated = validated.clone();
+        mutated.request.approval = Some("forged-approval".to_owned());
+        let admission =
+            honest_health_admission(&validated.request, &validated.manifest, ATTEMPT_ID, EFFECT_SEQ, &validated.epoch, now)?;
+        let mut transport = FakeTransport::admitting(admission);
+        let authority = Arc::new(DoctorDispatchAuthority::new().map_err(|error| error.to_string())?);
+        let executor = Arc::new(AuthorityBackedExecutor::new(Arc::clone(&authority)));
+        match drive_validated_dispatched_attempt(
+            &mut transport,
+            &authority,
+            Arc::clone(&executor),
+            Arc::new(EvidenceCollector::new()),
+            &mutated,
+            std::path::Path::new("C:/eliot/doctor"),
+            now,
+            now_ms,
+        )
+        .await
+        {
+            Err(AdapterError::Admission(DoctorError::IdentityMismatch)) => {},
+            Err(error) => return Err(format!("changed approval must deny IdentityMismatch, got {error}")),
+            Ok(_) => return Err("changed approval must deny without effect".to_owned()),
+        }
+        if transport.submits != 0 {
+            return Err("mutated terms must deny before any submit".to_owned());
+        }
+        if executor.lock().starts != 0 {
+            return Err("mutated terms must deny without effect".to_owned());
+        }
+        let mut foreign = envelope.clone();
+        foreign.epoch = foreign_epoch();
+        let foreign_path = write_dispatched_temp(&foreign, "health-probe-foreign")?;
+        match read_dispatched_material_from(&foreign_path, &epoch) {
+            Err(DispatchedMaterialError::StaleEpoch { .. }) => {},
+            Err(error) => {
+                remove_dispatched_temp(&foreign_path);
+                return Err(format!("foreign lineage must deny StaleEpoch, got {error}"));
+            }
+            Ok(_) => {
+                remove_dispatched_temp(&foreign_path);
+                return Err("foreign lineage must deny before any submit".to_owned());
+            }
+        }
+        if !foreign_path.exists() {
+            return Err("denied foreign material must be preserved for diagnosis".to_owned());
+        }
+        remove_dispatched_temp(&foreign_path);
+        remove_dispatched_temp(&path);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn health_probe_mutation_and_foreign_lineage_denied() {
+        if let Err(detail) = deny_health_probe_mutation_and_foreign().await {
+            panic!("health-probe mutation and foreign deny must hold: {detail}");
+        }
+    }
+
+    async fn reconcile_health_probe_unknown() -> Result<(), String> {
+        let now = OffsetDateTime::now_utc();
+        let (request, manifest) = health_request(now)?;
+        let epoch = test_epoch();
+        let admission =
+            honest_health_admission(&request, &manifest, ATTEMPT_ID, EFFECT_SEQ, &epoch, now)?;
+        let expected_effect = admission.effect_digest.clone();
+        let envelope = test_envelope(&request, ATTEMPT_ID, EFFECT_SEQ);
+        let mut losing = FakeTransport::losing_reply();
+        match losing.submit_repair_attempt(&envelope) {
+            Err(DoctorIpcError::UnknownOutcome { attempt_id, request_digest }) => {
+                if attempt_id != ATTEMPT_ID || request_digest != envelope.request_digest {
+                    return Err("lost reply must carry the original submit identity".to_owned());
+                }
+            }
+            Err(error) => return Err(format!("lost reply must stay UnknownOutcome, got {error}")),
+            Ok(_) => return Err("lost reply is not a reply".to_owned()),
+        }
+        let mut losing = FakeTransport::losing_reply();
+        let executor = Arc::new(FakeExecutor::new(FakeMode::Success));
+        let presented = PresentedAttempt {
+            attempt: envelope.clone(),
+            request: request.clone(),
+            manifest: manifest.clone(),
+            process: test_process_request(),
+            epoch: epoch.clone(),
+        };
+        match drive_admitted_attempt(&mut losing, Arc::clone(&executor), Arc::new(EvidenceCollector::new()), presented, now).await
+        {
+            Err(AdapterError::KernelClient(_)) => {},
+            Err(error) => return Err(format!("lost reply stays a typed transport failure, got {error}")),
+            Ok(_) => return Err("lost submit reply fails closed without effect".to_owned()),
+        }
+        if losing.submits != 1 || executor.lock().starts != 0 {
+            return Err("lost reply means exactly one submit and zero effect dispatches".to_owned());
+        }
+        let mut transport = FakeTransport::admitting(admission);
+        let executor = Arc::new(FakeExecutor::new(FakeMode::UnknownOnStart));
+        let operation_id = test_process_request().operation_id().clone();
+        let presented = PresentedAttempt {
+            attempt: envelope,
+            request: request.clone(),
+            manifest: manifest.clone(),
+            process: test_process_request(),
+            epoch,
+        };
+        let outcome = drive_admitted_attempt(&mut transport, Arc::clone(&executor), Arc::new(EvidenceCollector::new()), presented, now)
+            .await
+            .map_err(|error| error.to_string())?;
+        let reconciliation_key = match &outcome.disposition {
+            DoctorDisposition::UnknownEffectOutcome { reconciliation_key, .. } => reconciliation_key.clone(),
+            other => return Err(format!("expected unknown outcome, got {other:?}")),
+        };
+        if outcome.exit_code() != EXIT_UNKNOWN_EFFECT_OUTCOME {
+            return Err(format!("expected exit 13, got {}", outcome.exit_code()));
+        }
+        if Some(reconciliation_key.as_str()) != expected_effect.as_deref() {
+            return Err("reconciliation key names the original effect identity".to_owned());
+        }
+        let operation = manifest.resolve(HEALTH_PROBE_OPERATION_ID).map_err(|error| error.to_string())?;
+        let adapter = AutomaticSafeAdapter::bind(Arc::clone(&executor), operation).map_err(|error| error.to_string())?;
+        let reconciled = adapter
+            .reconcile_admitted_unknown(ReconcileInputs {
+                request: &request,
+                manifest: &manifest,
+                attempt_id: ATTEMPT_ID,
+                operation_id: operation_id.clone(),
+                reconciliation_key: reconciliation_key.as_str(),
+                epoch: &test_epoch(),
+                now,
+            })
+            .await
+            .map_err(|error| error.to_string())?;
+        if !matches!(reconciled.disposition, DoctorDisposition::Reconciling { .. }) {
+            return Err(format!("expected reconciling, got {:?}", reconciled.disposition));
+        }
+        if reconciled.exit_code() != EXIT_RECONCILING {
+            return Err(format!("expected exit 14, got {}", reconciled.exit_code()));
+        }
+        if executor.lock().starts != 1 || executor.lock().reconciliations != 1 {
+            return Err("reconcile never retries the effect".to_owned());
+        }
+        match adapter
+            .reconcile_admitted_unknown(ReconcileInputs {
+                request: &request,
+                manifest: &manifest,
+                attempt_id: ATTEMPT_ID,
+                operation_id,
+                reconciliation_key: &digest(0x00),
+                epoch: &test_epoch(),
+                now,
+            })
+            .await
+        {
+            Err(AdapterError::ReconciliationKeyMismatch) => Ok(()),
+            Err(error) => Err(format!("wrong key must deny ReconciliationKeyMismatch, got {error}")),
+            Ok(_) => Err("wrong reconciliation key must deny without effect".to_owned()),
+        }
+    }
+
+    #[tokio::test]
+    async fn health_probe_lost_reply_reconciles_by_original_identity() {
+        if let Err(detail) = reconcile_health_probe_unknown().await {
+            panic!("health-probe lost-reply reconcile must hold: {detail}");
         }
     }
 }

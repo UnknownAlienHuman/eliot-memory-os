@@ -2,10 +2,13 @@
 
 //! Bins-local dispatch-contour material reader for the one-shot Doctor.
 //!
-//! This module binds the already-existing one-shot driver
-//! ([`drive_admitted_attempt`][crate::kernel_client::drive_admitted_attempt])
+//! This module binds the production one-shot driver
+//! ([`drive_validated_dispatched_attempt`][crate::kernel_client::drive_validated_dispatched_attempt])
 //! to session-bound attempt material delivered over a protected file, and
-//! keeps the shot fail-closed until that delivery lands. It owns no wire
+//! keeps the shot fail-closed until that delivery validates. (The legacy
+//! [`drive_admitted_attempt`][crate::kernel_client::drive_admitted_attempt]
+//! path remains as test reference only: it takes an in-memory process
+//! request that production never deserializes.) It owns no wire
 //! contract, mints no authority, and changes no shared type.
 //!
 //! Delivery shape (I7.5/I15.2): each launched child is presented a random
@@ -70,10 +73,11 @@
 //! What this module deliberately does NOT deliver: the concrete
 //! [`ProcessRequest`][eliot_process::ProcessRequest] is an in-memory
 //! composition value that is never deserialized from a wire type and never
-//! minted here, and effect execution needs a concrete executor this
-//! composition root does not own. Those arrive only with the dispatch
-//! launch; until then even a validated file cannot drive, and the entry
-//! denies with the dispatch residual.
+//! minted here. The composition root mints it from the validated material
+//! via the local dispatch authority (from the Kernel-admitted executable
+//! binding only) and runs it on the real governed executor through
+//! [`drive_validated_dispatched_attempt`][crate::kernel_client::drive_validated_dispatched_attempt];
+//! a validated file without that composition still denies fail-closed.
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -164,9 +168,12 @@ pub struct DispatchedAttemptEnvelope {
 /// Session-bound attempt material validated against the live bootstrap.
 ///
 /// Carries exactly the [`PresentedAttempt`][crate::kernel_client::PresentedAttempt]
-/// fields a dispatch file can supply. The concrete process request and the
-/// executor still arrive only with the dispatch launch, so this value alone
-/// never drives.
+/// fields a dispatch file can supply, plus the session nonce and the
+/// Kernel-issued launch grant. The concrete process request is minted from
+/// this value by the composition root via the local dispatch authority and
+/// driven through
+/// [`drive_validated_dispatched_attempt`][crate::kernel_client::drive_validated_dispatched_attempt];
+/// this value alone (without that composition) never drives.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ValidatedDispatchedAttempt {
     /// Validated wire envelope.
