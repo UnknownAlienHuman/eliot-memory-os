@@ -1018,10 +1018,7 @@ mod admitted_operation_gate_tests {
                 ("action".to_owned(), json!("keep")),
                 ("base_view_digest".to_owned(), json!("a".repeat(64))),
                 ("candidate_digest".to_owned(), json!("b".repeat(64))),
-                (
-                    "candidate_package_digest".to_owned(),
-                    json!("c".repeat(64)),
-                ),
+                ("candidate_package_digest".to_owned(), json!("c".repeat(64))),
                 ("skill_id".to_owned(), json!("skill-gate")),
                 ("verifier_ref".to_owned(), json!("verifier-gate")),
             ]),
@@ -1040,10 +1037,7 @@ mod admitted_operation_gate_tests {
                     "operation_manifest_digest".to_owned(),
                     json!("c".repeat(64)),
                 ),
-                (
-                    "artifact_binding_digest".to_owned(),
-                    json!("b".repeat(64)),
-                ),
+                ("artifact_binding_digest".to_owned(), json!("b".repeat(64))),
                 ("fence_digest".to_owned(), json!("d".repeat(64))),
                 ("observation_operation_id".to_owned(), json!("op-gate")),
                 ("observation_record_id".to_owned(), json!("record-gate")),
@@ -1211,6 +1205,93 @@ mod admitted_operation_gate_tests {
         assert_eq!(
             validate_transition(&context, &stale),
             Err(AdapterError::Store(StoreError::ManifestMismatch))
+        );
+    }
+
+    fn revocation_operation() -> eliot_store_api::NamedMutationRequest {
+        NamedMutationRequest {
+            operation: NamedMutationOperation::RecordAuthorityRevocation,
+            parameters: BTreeMap::from([
+                ("origin_ref".to_owned(), json!("root:alpha")),
+                ("closure_id".to_owned(), json!("revocation-686-01")),
+                ("closure_revision".to_owned(), json!("9")),
+                ("affected_digest".to_owned(), json!("a".repeat(64))),
+                ("affected_count".to_owned(), json!("3")),
+                ("invalidation_reason".to_owned(), json!("SOURCE_REVOKED")),
+                ("fence_digest".to_owned(), json!("b".repeat(64))),
+            ]),
+        }
+    }
+
+    /// Issue #686: the revocation-record mutation is known-but-unsupported
+    /// until a store-owned slice activates its catalogue row with proven
+    /// handlers. The closed name spelling holds and the pre-stage gate
+    /// refuses it with typed `UnknownOperation` — never silent success.
+    #[test]
+    fn revocation_record_mutation_fails_closed_until_store_activation() {
+        use eliot_store_api::{named_mutation_operation_by_name, named_mutation_operation_name};
+        assert_eq!(
+            named_mutation_operation_name(NamedMutationOperation::RecordAuthorityRevocation),
+            "RecordAuthorityRevocation"
+        );
+        assert_eq!(
+            named_mutation_operation_by_name("RecordAuthorityRevocation"),
+            Some(NamedMutationOperation::RecordAuthorityRevocation)
+        );
+        assert_eq!(
+            NamedMutationOperation::RecordAuthorityRevocation.transition_class(),
+            TransitionClass::RecoverySchema
+        );
+        let fence = test_fence(1);
+        let context = test_context(&fence);
+        let entries = generated_operation_manifests().expect("active catalogue generates");
+        let set_digest = operation_manifest_set_digest(&entries).expect("set digest computes");
+        let pending = transition_with(
+            &fence,
+            set_digest,
+            TransitionClass::RecoverySchema,
+            EffectClass::ReversibleMutation,
+            vec![revocation_operation()],
+        );
+        assert_eq!(
+            validate_transition(&context, &pending),
+            Err(AdapterError::Store(StoreError::UnknownOperation))
+        );
+    }
+
+    /// Issue #686: the revocation-history read is known-but-unsupported
+    /// until a store-owned slice activates its catalogue row with a proven
+    /// handler. The closed name spelling holds and the read gate refuses it
+    /// with typed `UnknownOperation` — never a successful empty view.
+    #[test]
+    fn revocation_history_read_fails_closed_until_store_activation() {
+        use eliot_store_api::{
+            NamedReadOperation, ReadConsistency, ScopeId, named_read_operation_by_name,
+            named_read_operation_name,
+        };
+        assert_eq!(
+            named_read_operation_name(NamedReadOperation::GetAuthorityRevocationHistory),
+            "GetAuthorityRevocationHistory"
+        );
+        assert_eq!(
+            named_read_operation_by_name("GetAuthorityRevocationHistory"),
+            Some(NamedReadOperation::GetAuthorityRevocationHistory)
+        );
+        let fence = test_fence(1);
+        let entries = generated_operation_manifests().expect("active catalogue generates");
+        let query = eliot_store_api::NamedReadRequest {
+            operation: NamedReadOperation::GetAuthorityRevocationHistory,
+            scope_id: Some(ScopeId::new("governor").expect("scope")),
+            consistency: ReadConsistency::Eventual,
+            state_fence: fence,
+            parameters: BTreeMap::from([
+                ("origin_ref".to_owned(), json!("root:alpha")),
+                ("max_records".to_owned(), json!("8")),
+            ]),
+        };
+        assert_eq!(
+            query.validate_against_catalogue(&entries),
+            Err(StoreError::UnknownOperation)
         );
     }
 }
