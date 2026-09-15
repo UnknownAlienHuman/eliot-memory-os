@@ -1,19 +1,18 @@
 [package]
 name = "eliot-dreamer-candidate-validation"
-version = "0.1.0"
-edition = "2024"
-rust-version = "1.94"
-license = "MIT"
-publish = false
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
 description = "Common lineage, fence, authority-ceiling, preservation, and budget validation for Dreamer model drafts"
 
 [lib]
 path = "src/lib.rs"
 
 [package.metadata.eliot]
-prototype = true
+prototype = false
 source_status = "IMPLEMENTED_PROTOTYPE"
-workspace_admission = "pending_agent_implementation_and_proof"
+workspace_admission = "admitted via #836 (T8-A4) root workspace membership"
 functional_cell = "smart.dreamer.candidate_validation"
 source_layer = "C1"
 runtime_layer = "R6"
@@ -21,38 +20,12 @@ runtime_bundle = "eliot-dreamer"
 agent_order = 5
 
 [dependencies]
-eliot-contracts = { path = "../../foundation/eliot-contracts" }
-eliot-dreamer-contracts = { path = "../eliot-dreamer-contracts" }
+eliot-contracts.workspace = true
+eliot-dreamer-contracts = { path = "../eliot-dreamer-contracts", version = "0.1.0" }
 schemars = { version = "1.2.1", features = ["derive"] }
-serde = { version = "1.0.228", features = ["derive"] }
+serde.workspace = true
 serde_json = { version = "1.0.150" }
-thiserror = "2.0.18"
+thiserror.workspace = true
 
 [lints]
 workspace = true
-
-# Standalone workspace root. Without this, cargo walks above the repository
-# and can bind this package to an unrelated ancestor manifest, so every
-# per-crate `cargo check|test|clippy` fails before it starts. Remove this
-# table when the cell is promoted into the root workspace `members`.
-[workspace]
-
-# Mirrors the root `[workspace.lints]` verbatim so an excluded cell is linted
-# exactly like an admitted one. Keep in sync; the promotion commit drops this
-# whole `[workspace]` table and restores plain inheritance.
-[workspace.lints.rust]
-unsafe_code = "forbid"
-missing_docs = "allow"
-
-[workspace.lints.clippy]
-all = { level = "warn", priority = -1 }
-pedantic = { level = "warn", priority = -1 }
-dbg_macro = "warn"
-expect_used = "warn"
-missing_errors_doc = "allow"
-missing_panics_doc = "allow"
-module_name_repetitions = "allow"
-must_use_candidate = "allow"
-print_stderr = "warn"
-print_stdout = "warn"
-unwrap_used = "warn"
