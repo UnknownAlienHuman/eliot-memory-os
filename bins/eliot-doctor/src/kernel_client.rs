@@ -1492,11 +1492,23 @@ mod tests {
     // ------------------------------------------------------------------
 
     use crate::dispatched_material::{
-        DispatchedAttemptEnvelope, DispatchedMaterialError, read_dispatched_material_from,
+        DispatchGrant, DispatchedAttemptEnvelope, DispatchedMaterialError,
+        read_dispatched_material_from,
     };
 
     fn dispatched_test_nonce() -> String {
         "session-nonce-doctor-test-01".to_owned()
+    }
+
+    fn dispatched_test_grant(epoch: &EpochId, generation: u64) -> DispatchGrant {
+        DispatchGrant {
+            grant_digest: digest(0x61),
+            authority_epoch: epoch.clone(),
+            fence_generation: generation,
+            fence_nonce: "doctor-launch-fence-test01".to_owned(),
+            idempotency_key: "doctor-launch-lease-test01".to_owned(),
+            expires_at: 1_750_000_060_000,
+        }
     }
 
     fn dispatched_valid_envelope(now: OffsetDateTime) -> (DispatchedAttemptEnvelope, EpochId) {
@@ -1504,6 +1516,7 @@ mod tests {
         let epoch = test_epoch();
         let generation = request.fence.generation;
         let attempt = test_envelope(&request, ATTEMPT_ID, EFFECT_SEQ);
+        let grant = dispatched_test_grant(&epoch, generation);
         (
             DispatchedAttemptEnvelope {
                 attempt,
@@ -1512,6 +1525,7 @@ mod tests {
                 epoch: epoch.clone(),
                 generation,
                 nonce: dispatched_test_nonce(),
+                grant,
             },
             epoch,
         )
@@ -1646,6 +1660,71 @@ mod tests {
         let path = write_dispatched_temp(&envelope, "byte-identity")?;
         let error = denied_error(&path, &live)?;
         assert!(matches!(error, DispatchedMaterialError::Contract(_)));
+        remove_dispatched_temp(&path);
+        Ok(())
+    }
+
+    /// Launch-grant gate (DISPATCH-CAUSE-FIX, issue #461): a valid material
+    /// file carrying a real Kernel-issued grant validates end to end and
+    /// reaches the Drive arm with no deny, while a foreign or stale grant
+    /// (wrong digest shape, foreign epoch, or generation mismatch) is
+    /// refused fail-closed before any drive. Real reader, real
+    /// constructors, real assertions; no doubles.
+    #[test]
+    fn dispatched_grant_gates_drive_reach_and_refuses_foreign_grant() -> Result<(), String> {
+        let now = OffsetDateTime::now_utc();
+        let (envelope, live) = dispatched_valid_envelope(now);
+        // A valid file with a real grant reads clean, consumes once, and
+        // presents exactly the Drive half of the entry gate: the read
+        // itself denies nothing, and the composition-root gate maps
+        // (advertised, presented) to Drive.
+        let path = write_dispatched_temp(&envelope, "grant-valid")?;
+        let validated = read_dispatched_material_from(&path, &live)
+            .map_err(|error| error.to_string())?
+            .ok_or_else(|| "valid grant material must present".to_owned())?;
+        assert!(!path.exists());
+        assert_eq!(
+            validated.grant,
+            dispatched_test_grant(&live, validated.generation)
+        );
+        assert_eq!(validated.grant.authority_epoch, live);
+        assert_eq!(
+            crate::gate_after_advertise(true, true),
+            crate::GateDecision::Drive
+        );
+        // A malformed grant digest is refused, never a fallback.
+        let mut bad_digest = envelope.clone();
+        bad_digest.grant.grant_digest = "not-a-digest".to_owned();
+        let path = write_dispatched_temp(&bad_digest, "grant-digest")?;
+        let error = denied_error(&path, &live)?;
+        assert!(
+            matches!(error, DispatchedMaterialError::BadGrant(_)),
+            "expected bad grant, got {error}"
+        );
+        assert!(path.exists());
+        remove_dispatched_temp(&path);
+        // A grant bound to a foreign epoch is refused even though the
+        // envelope epoch itself is live.
+        let mut foreign_grant = envelope.clone();
+        foreign_grant.grant = dispatched_test_grant(&foreign_epoch(), envelope.generation);
+        let path = write_dispatched_temp(&foreign_grant, "grant-epoch")?;
+        let error = denied_error(&path, &live)?;
+        assert!(
+            matches!(error, DispatchedMaterialError::BadGrant(_)),
+            "expected bad grant, got {error}"
+        );
+        assert!(path.exists());
+        remove_dispatched_temp(&path);
+        // A grant whose generation disagrees with the presented session
+        // generation is refused.
+        let mut stale_grant = envelope.clone();
+        stale_grant.grant = dispatched_test_grant(&live, envelope.generation.saturating_add(1));
+        let path = write_dispatched_temp(&stale_grant, "grant-generation")?;
+        let error = denied_error(&path, &live)?;
+        assert!(
+            matches!(error, DispatchedMaterialError::BadGrant(_)),
+            "expected bad grant, got {error}"
+        );
         remove_dispatched_temp(&path);
         Ok(())
     }

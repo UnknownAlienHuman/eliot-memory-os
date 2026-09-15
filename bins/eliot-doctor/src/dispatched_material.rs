@@ -21,7 +21,8 @@
 //! therefore defines the MINIMAL bins-local JSON envelope mirroring the
 //! [`PresentedAttempt`][crate::kernel_client::PresentedAttempt] fields the
 //! driver binds (`attempt`, `request`, `manifest`, `epoch`) plus the
-//! session `nonce` and the claimed `generation`. The envelope is documented
+//! session `nonce`, the claimed `generation`, and the Kernel-issued launch
+//! `grant` the local dispatch authority consumes. The envelope is documented
 //! as bins-local: it is not a contract change, and the kernel delivery half
 //! (`launch_doctor`, WRITER-B) owns its own type and may supersede the
 //! locator once it lands.
@@ -50,6 +51,11 @@
 //! - the presented generation must be non-zero and equal the request fence
 //!   generation (a stale generation is denied here; the Kernel admission
 //!   gate re-proves generation authoritatively at submit);
+//! - the Kernel-issued launch grant must be well-formed through the exact
+//!   broker constructors (`FencingToken::new` with a non-zero generation,
+//!   `ActionLeaseRef::new`), bound to the live epoch as an exact tuple and
+//!   to the presented session generation (a foreign/stale grant is refused
+//!   here, never a fallback);
 //! - the session nonce must be present and well-formed (opaque, bounded);
 //!   the authoritative nonce proof happens kernel-side at submit once the
 //!   dispatch launch lands, so the child never invents it and never drives
@@ -75,6 +81,7 @@ use std::path::{Path, PathBuf};
 use eliot_contracts::EpochId;
 use eliot_doctor_core::{ClosedRepairRequest, RepairRecipeManifest, check_fence_against_epoch};
 use eliot_kernel_service::DoctorRepairAttemptRequest;
+use eliot_process::{ActionLeaseRef, FencingToken, Generation};
 use serde::{Deserialize, Serialize};
 use time::OffsetDateTime;
 
@@ -92,11 +99,43 @@ pub const DISPATCH_NONCE_MIN_LEN: usize = 16;
 /// Session-nonce shape bounds (I7.5): opaque, bounded, never invented here.
 pub const DISPATCH_NONCE_MAX_LEN: usize = 256;
 
+/// Kernel-issued launch-grant material for one dispatched doctor child.
+///
+/// Bins-local mirror of the Kernel half (`bins/eliot-kernel` dispatch
+/// launch): the Kernel never sends the sealed [`ProcessRequest`][eliot_process::ProcessRequest]
+/// (it is `Serialize`-only by design, never `Deserialize`), only these six
+/// fields, all derived Kernel-side from live authority plus the durable
+/// admission identity. Every field is untrusted presenter bytes until
+/// [`read_dispatched_material`] validates it fail-closed; an invalid grant
+/// is a refusal, never a fallback.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DispatchGrant {
+    /// Lowercase SHA-256 binding the grant fields plus the admission
+    /// identity digest; carried child-side as the one-shot nonce plus the
+    /// `launch-grant` revision-head value.
+    pub grant_digest: String,
+    /// Live authority epoch bound at admission (canonical `EpochId`); must
+    /// equal the live bootstrap epoch as an exact tuple.
+    pub authority_epoch: EpochId,
+    /// Live activation generation bound at admission (non-zero); must equal
+    /// the presented session `generation`.
+    pub fence_generation: u64,
+    /// Deterministic per-identity fence nonce for `FencingToken::new`.
+    pub fence_nonce: String,
+    /// Deterministic per-identity lease for `ActionLeaseRef::new`.
+    pub idempotency_key: String,
+    /// Grant expiry in Unix milliseconds for `PermitIssuance::new`
+    /// (non-zero; freshness is enforced at issue time).
+    pub expires_at: u64,
+}
+
 /// Bins-local dispatch envelope (NOT a wire contract change).
 ///
 /// Mirrors the [`PresentedAttempt`][crate::kernel_client::PresentedAttempt]
-/// fields the one-shot driver binds, plus the I7.5 session `nonce` and the
-/// claimed `generation`. The concrete [`ProcessRequest`][eliot_process::ProcessRequest]
+/// fields the one-shot driver binds, plus the I7.5 session `nonce`, the
+/// claimed `generation`, and the Kernel-issued launch `grant` the local
+/// dispatch authority consumes. The concrete [`ProcessRequest`][eliot_process::ProcessRequest]
 /// is intentionally absent: it is never deserialized and never minted here.
 /// Every field is untrusted presenter bytes until
 /// [`read_dispatched_material`] validates it against the live bootstrap.
@@ -118,6 +157,8 @@ pub struct DispatchedAttemptEnvelope {
     pub generation: u64,
     /// I7.5 session nonce; opaque, bounded, never invented here.
     pub nonce: String,
+    /// Kernel-issued launch grant; validated fail-closed, never a fallback.
+    pub grant: DispatchGrant,
 }
 
 /// Session-bound attempt material validated against the live bootstrap.
@@ -140,6 +181,9 @@ pub struct ValidatedDispatchedAttempt {
     pub generation: u64,
     /// Well-formed session nonce.
     pub nonce: String,
+    /// Validated Kernel-issued launch grant bound to the live epoch and the
+    /// presented generation.
+    pub grant: DispatchGrant,
 }
 
 /// Typed failure for the dispatch-file read. Every variant is fail-closed:
@@ -189,6 +233,10 @@ pub enum DispatchedMaterialError {
         "dispatch material nonce is missing or malformed: a well-formed session nonce is required"
     )]
     BadNonce,
+    /// The Kernel-issued launch grant is malformed, foreign, or stale.
+    /// An invalid grant is a refusal, never a fallback.
+    #[error("dispatch material launch grant is invalid or foreign: {0}")]
+    BadGrant(String),
 }
 
 /// Derives the bins-local dispatch file path: the executable directory plus
@@ -327,6 +375,7 @@ fn validate_envelope(
             fence: envelope.request.fence.generation,
         });
     }
+    validate_grant(&envelope.grant, live_epoch, envelope.generation)?;
     Ok(ValidatedDispatchedAttempt {
         attempt: envelope.attempt,
         request: envelope.request,
@@ -334,6 +383,7 @@ fn validate_envelope(
         epoch: envelope.epoch,
         generation: envelope.generation,
         nonce: envelope.nonce,
+        grant: envelope.grant,
     })
 }
 
@@ -347,6 +397,68 @@ fn validate_nonce(nonce: &str) -> Result<(), DispatchedMaterialError> {
             .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.'))
     {
         return Err(DispatchedMaterialError::BadNonce);
+    }
+    Ok(())
+}
+
+/// Validates the Kernel-issued launch grant fail-closed against the live
+/// bootstrap epoch and the presented session generation.
+///
+/// The grant is proved through the exact broker constructors the local
+/// dispatch authority consumes (`FencingToken::new` with a non-zero
+/// `Generation::new`, plus `ActionLeaseRef::new`), then bound: its
+/// authority epoch must equal the live epoch as an exact tuple (a
+/// foreign/stale grant is refused here, before any issue), its fence
+/// generation must equal the presented session generation (the Kernel
+/// writes both from the same live activation generation), and its digest
+/// and expiry must be well-formed. An invalid grant is a refusal, never a
+/// fallback. Freshness against the wall clock is enforced at issue time by
+/// the authority, not here.
+fn validate_grant(
+    grant: &DispatchGrant,
+    live_epoch: &EpochId,
+    presented_generation: u64,
+) -> Result<(), DispatchedMaterialError> {
+    require_lowercase_digest(&grant.grant_digest).map_err(DispatchedMaterialError::BadGrant)?;
+    if grant.expires_at == 0 {
+        return Err(DispatchedMaterialError::BadGrant(
+            "grant expiry must be non-zero".to_owned(),
+        ));
+    }
+    let generation = Generation::new(grant.fence_generation)
+        .map_err(|error| DispatchedMaterialError::BadGrant(truncate_detail(&error.to_string())))?;
+    FencingToken::new(
+        grant.authority_epoch.clone(),
+        generation,
+        grant.fence_nonce.clone(),
+    )
+    .map_err(|error| DispatchedMaterialError::BadGrant(truncate_detail(&error.to_string())))?;
+    ActionLeaseRef::new(grant.idempotency_key.clone())
+        .map_err(|error| DispatchedMaterialError::BadGrant(truncate_detail(&error.to_string())))?;
+    if grant.authority_epoch != *live_epoch {
+        return Err(DispatchedMaterialError::BadGrant(format!(
+            "grant epoch is foreign or stale: presented {presented:?}, live {live_epoch:?}",
+            presented = grant.authority_epoch,
+        )));
+    }
+    if grant.fence_generation != presented_generation {
+        return Err(DispatchedMaterialError::BadGrant(format!(
+            "grant generation {presented} does not equal the presented session generation {presented_generation}",
+            presented = grant.fence_generation,
+        )));
+    }
+    Ok(())
+}
+
+/// Requires a lowercase SHA-256 hex digest, mirroring the Kernel grant
+/// gate: exactly 64 lowercase hex characters.
+fn require_lowercase_digest(value: &str) -> Result<(), String> {
+    if value.len() != 64
+        || !value
+            .bytes()
+            .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+    {
+        return Err("grant digest must be a lowercase SHA-256 digest".to_owned());
     }
     Ok(())
 }

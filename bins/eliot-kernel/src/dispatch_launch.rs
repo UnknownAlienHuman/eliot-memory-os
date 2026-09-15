@@ -1,7 +1,8 @@
-//! Kernel dispatch-launch contour for one-shot Doctor and testd workers.
+//! Kernel dispatch-launch contour for one-shot Doctor, testd, and native-worker workers.
 //!
-//! DISPATCH-CONTOUR-2 Slice B (issues #461 and #22): Kernel-side launch of
-//! admitted Doctor (and testd) attempts through the admitted
+//! DISPATCH-CONTOUR-2 Slice B (issues #461 and #22) plus DISPATCH-CAUSE-FIX:
+//! Kernel-side launch of admitted Doctor, testd, and native-worker attempts
+//! through the admitted
 //! [`ProcessExecutionGateway`](crate::process_execution::ProcessExecutionGateway),
 //! plus the composed front-door owner the dispatch arms admit through.
 //!
@@ -18,47 +19,56 @@
 //! * [`admit_doctor_repair_attempt`] / [`admit_testd_attempt`] admit exactly
 //!   one attempt through the live service plus the composed owner, following
 //!   the `host_request_binding` live-authority pattern. Neither the epoch
-//!   nor the generation is ever taken from the request envelope.
+//!   nor the generation is ever taken from the request envelope. The native
+//!   worker admits through live service authority plus the ORS claim table
+//!   (`KernelService::admit_native_worker_claim`, existing vocabulary).
 //! * [`launch_admitted_doctor_attempt`] admits the attempt, then launches
 //!   the real `eliot-doctor` binary through the admitted process gateway:
 //!   it mints the I7.5/I15.2 launch nonce, writes the session-bound attempt
-//!   material to the protected file the child already reads, builds the
-//!   child process admission with an empty argv (never argv or env
-//!   material), retains the path proof, starts through the gateway, and
-//!   retains the launch record keyed by the original attempt identity.
-//!   [`launch_admitted_testd_attempt`] reuses the same seam shape for
-//!   `eliot-testd` (the #1452 residual: the seam provisions the admitted
-//!   executor and retains the admission context kernel-side).
+//!   material plus the launch grant to the protected file the child already
+//!   reads, builds the child process admission with an empty argv (never
+//!   argv or env material), retains the path proof, starts through the
+//!   gateway, and retains the launch record keyed by the original attempt
+//!   identity. [`launch_admitted_testd_attempt`] reuses the same seam shape
+//!   for `eliot-testd`, writing `eliot-testd.admitted-attempt.json` plus the
+//!   same grant object through [`write_material_file`].
+//!   [`launch_admitted_native_worker_attempt`] reuses the same seam shape
+//!   for `eliot-native-worker`, writing
+//!   `eliot-native-worker.admitted-claim.json` plus the same grant object.
 //! * a launched-but-unreconciled attempt reconciles by its original
 //!   identity through [`reconcile_launched_doctor_attempt`] /
-//!   [`reconcile_launched_testd_attempt`]: the durable admission digest is
-//!   compared, never recomputed under a new id, and no second child is
-//!   spawned for an outstanding launch.
+//!   [`reconcile_launched_testd_attempt`] /
+//!   [`reconcile_launched_native_worker_attempt`]: the durable admission
+//!   digest is compared, never recomputed under a new id, and no second
+//!   child is spawned for an outstanding launch.
 //!
-//! Delivery contract (I7.5/I15.2): each launched Doctor child receives a
-//! launch nonce delivered over the protected dispatch file next to its
-//! executable — never via the command line, stdin, or the environment. The
-//! Doctor file carries exactly what
+//! Delivery contract (I7.5/I15.2): each launched child receives a launch
+//! nonce plus a launch grant delivered over the protected dispatch file
+//! next to its executable — never via the command line, stdin, or the
+//! environment. The Doctor file carries exactly what
 //! `bins/eliot-doctor/src/dispatched_material.rs::read_dispatched_material_from`
 //! validates (envelope bytes plus canonical digest, parsed closed request
 //! with byte-identity, admitted manifest revision, live epoch, fence-bound
-//! generation, well-formed nonce); the nonce is deterministic per
-//! (attempt identity, durable admission time, composed principal), so an
-//! exact replay rewrites byte-identical material and reconciles by the
-//! original identity instead of minting a second session. The testd nonce
-//! is retained kernel-side in the launch record for the submit-time
-//! session proof; it travels to the child with the launch once that
-//! binary defines its reader.
+//! generation, well-formed nonce) plus the additive `grant` object
+//! (`grant_digest`, `authority_epoch`, `fence_generation`, `fence_nonce`,
+//! `idempotency_key`, `expires_at`) the child uses to construct its own
+//! local `DispatchPermitAuthority` (broker pattern). The nonce and grant
+//! are deterministic per (attempt identity, durable admission time,
+//! composed principal), so an exact replay rewrites byte-identical material
+//! and reconciles by the original identity instead of minting a second
+//! session. Testd and native-worker files carry the same `grant` object
+//! alongside their admitted attempt/claim.
 //!
-//! Testd delivery gap: `bins/eliot-testd/src/main.rs::acquire_presented_admission`
-//! presents nothing until its launch seam lands, and that binary accepts no
-//! file, argv, stdin, or environment material by design ("the concrete
-//! process request is never deserialized, so no byte surface can present
-//! it"). The testd half therefore stops at the spawn boundary: admission,
-//! nonce, spawn through the admitted executor, retention, and
-//! reconcile-by-original-identity are all provided, but no material file is
-//! written for testd and the child-side reader remains the recorded gap for
-//! the testd owner (see [`DispatchedWorkerKind::material_file_name`]).
+//! Testd delivery (DISPATCH-CAUSE-FIX): the contour now writes
+//! `eliot-testd.admitted-attempt.json` (request + envelope + admission +
+//! epoch + generation + nonce + grant) through the existing
+//! `write_material_file` helper; the child-side reader lands with Writer-T.
+//!
+//! Native-worker delivery (DISPATCH-CAUSE-FIX): the contour writes
+//! `eliot-native-worker.admitted-claim.json` (request + receipt + epoch +
+//! generation + nonce + grant) through the same helper; the durable ORS
+//! `NativeWorkerClaimRecord` stays the reconcile authority (see
+//! `native_worker_lifecycle_route::NATIVE_WORKER_CLAIM_OPERATION`).
 //!
 //! Architecture: ARCH-MOD-01, A13.2, A13.3; I7.5 launch nonce, I15.2
 //! Principal and Session binding, I14.6 admission and execution axes.
@@ -74,17 +84,20 @@ use eliot_contracts::EpochId;
 use eliot_kernel_service::{
     AuthenticatedDoctorSession, AuthenticatedTestdSession, ComposedDoctorFrontDoor,
     DoctorRecipeRegistry, DoctorRepairAdmission, DoctorRepairAttemptRequest, DoctorRepairResponse,
-    KernelService, KernelServiceError, TestdAdmission, TestdAdmissionAttemptRequest,
-    TestdAdmissionEnvelope, TestdAdmissionResponse, advertise_doctor_repair,
-    handle_doctor_repair_attempt, handle_testd_admission_attempt, reconcile_testd_admission,
+    KernelService, KernelServiceError, NATIVE_WORKER_CLAIM_WIRE_ID, NativeWorkerClaimReceipt,
+    NativeWorkerClaimRequest, NativeWorkerClaimResponse, TestdAdmission,
+    TestdAdmissionAttemptRequest, TestdAdmissionEnvelope, TestdAdmissionResponse,
+    advertise_doctor_repair, handle_doctor_repair_attempt, handle_testd_admission_attempt,
+    reconcile_testd_admission,
 };
 use eliot_ors::{
     DoctorAttemptRecord, DoctorEffectRecord, DoctorLedgerError, DoctorRecoveryLedger,
-    OperationIdentity,
+    NativeWorkerClaimRecord, OperationIdentity,
 };
 use eliot_process::OperationId;
+use serde::{Deserialize, Serialize};
 
-use super::front_door_session::{DOCTOR_MODULE_ID, TESTD_MODULE_ID};
+use super::front_door_session::{DOCTOR_MODULE_ID, NATIVE_MODULE_ID, TESTD_MODULE_ID};
 use super::runtime_identity::stable_owner_principal_digest;
 use super::{
     ActionLeaseRef, EnvironmentInheritance, EnvironmentProjection, FencingToken, Generation,
@@ -95,9 +108,11 @@ use super::{
 
 /// One-shot worker kind served by the dispatch-launch contour.
 ///
-/// The contour is built once and parameterized by this enum: Doctor and
-/// testd share admission-through-composed-owner, nonce minting, spawn
-/// through the admitted gateway, launch retention, and
+/// The contour is built once and parameterized by this enum: Doctor, testd,
+/// and the native worker share admission-through-composed-owner (Doctor via
+/// its ledger port, testd stateless via the principal owner, native via the
+/// ORS claim table through `KernelService::admit_native_worker_claim`),
+/// nonce minting, spawn through the admitted gateway, launch retention, and
 /// reconcile-by-original-identity. They differ only in the delivery
 /// endpoint the child already reads (see [`Self::material_file_name`]).
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -106,6 +121,8 @@ pub enum DispatchedWorkerKind {
     Doctor,
     /// The one-shot testd admission worker (`eliot-testd`).
     Testd,
+    /// The one-shot native-worker claim worker (`eliot-native-worker`).
+    NativeWorker,
 }
 
 impl DispatchedWorkerKind {
@@ -119,6 +136,7 @@ impl DispatchedWorkerKind {
         match self {
             Self::Doctor => DOCTOR_MODULE_ID,
             Self::Testd => TESTD_MODULE_ID,
+            Self::NativeWorker => NATIVE_MODULE_ID,
         }
     }
 
@@ -128,11 +146,11 @@ impl DispatchedWorkerKind {
         match self {
             Self::Doctor => eliot_kernel_service::DOCTOR_REPAIR_WIRE_ID,
             Self::Testd => eliot_kernel_service::TESTD_ADMISSION_WIRE_ID,
+            Self::NativeWorker => NATIVE_WORKER_CLAIM_WIRE_ID,
         }
     }
 
-    /// Returns the dispatch material file name the child already reads, when
-    /// the child defines one.
+    /// Returns the dispatch material file name the child already reads.
     ///
     /// `Some` for Doctor: the exact
     /// `bins/eliot-doctor/src/dispatched_material.rs::DISPATCHED_MATERIAL_FILE_NAME`
@@ -141,17 +159,26 @@ impl DispatchedWorkerKind {
     /// Kernel delivery half owns its write path; the child reader stays the
     /// authority for the value.
     ///
-    /// `None` for testd: that binary defines no material reader
-    /// (`acquire_presented_admission` reports absence by design and accepts
-    /// no file, argv, stdin, or environment material). The testd launch
-    /// therefore writes no file; the child-side reader is the recorded gap
-    /// for the testd owner, and this contour stops at the spawn boundary
-    /// instead of working around it.
+    /// `Some` for testd: `eliot-testd.admitted-attempt.json` next to the
+    /// child executable (DISPATCH-CAUSE-FIX: the testd child reader lands
+    /// with Writer-T; this contour now writes through the existing
+    /// `write_material_file` helper instead of stopping at the spawn
+    /// boundary).
+    ///
+    /// `Some` for the native worker: the exact
+    /// `bins/eliot-native-worker/src/lib.rs::ADMITTED_MATERIAL_FILE_NAME`
+    /// literal (`eliot-native-worker.admitted-claim.json`) the child reader
+    /// derives from its executable directory. Duplicated here because the
+    /// Kernel delivery half owns its write path; the child reader stays the
+    /// authority for the value. No other writer exists on this base (the
+    /// residual in `admitted_material` names this Kernel half as the gap),
+    /// so this seam is the single writer.
     #[must_use]
     pub const fn material_file_name(self) -> Option<&'static str> {
         match self {
             Self::Doctor => Some("eliot-doctor.dispatched-attempt.json"),
-            Self::Testd => None,
+            Self::Testd => Some("eliot-testd.admitted-attempt.json"),
+            Self::NativeWorker => Some("eliot-native-worker.admitted-claim.json"),
         }
     }
 
@@ -161,6 +188,7 @@ impl DispatchedWorkerKind {
         match self {
             Self::Doctor => "doctor-dispatch",
             Self::Testd => "testd-dispatch",
+            Self::NativeWorker => "native-worker-dispatch",
         }
     }
 
@@ -170,8 +198,174 @@ impl DispatchedWorkerKind {
         match self {
             Self::Doctor => "doctor-launch",
             Self::Testd => "testd-launch",
+            Self::NativeWorker => "native-worker-launch",
         }
     }
+}
+
+/// Kernel-issued launch-grant material for one dispatched child.
+///
+/// This is the Kernel half of the merged User Broker pattern
+/// (`bins/eliot-user-broker/src/lib.rs:120-216`): the child constructs its
+/// own local `DispatchPermitAuthority` via `activate`, then builds its
+/// single `ProcessRequest` in-process via `FencingToken::new` +
+/// `PermitIssuance::new` + `DispatchValidationContext::new` +
+/// `ProcessRequest::new` through `WindowsProcessExecutor::new(authority)`.
+/// The Kernel never sends the sealed `ProcessRequest` (which is
+/// `Serialize`-only, never `Deserialize`); it sends only these six
+/// launch-grant fields, all derived Kernel-side from live authority plus
+/// the durable admission identity. No argv/env material, no executable
+/// bytes, no minted ledger/registry/principal.
+///
+/// JSON shape (all three workers share this exact object under the
+/// `grant` key; field names are the contract for Writer-D/Writer-T and the
+/// native child):
+/// ```json
+/// {
+///   "grant_digest": "lowercase-sha256-hex",
+///   "authority_epoch": {"lineage_id": "uuid", "sequence": 1},
+///   "fence_generation": 1,
+///   "fence_nonce": "native-worker-launch-fence-<short>",
+///   "idempotency_key": "native-worker-launch-lease-<short>",
+///   "expires_at": 1750000060000
+/// }
+/// ```
+/// * `grant_digest: String` — lowercase SHA-256 over the canonical grant
+///   binding (identity digest + epoch + generation + fence nonce +
+///   idempotency key + expiry); carried as the child-side `one_shot_nonce`
+///   plus the `launch-grant` revision-head value (both require opaque/hex
+///   shape, which hex satisfies).
+/// * `authority_epoch: EpochId` — canonical lineage-aware epoch
+///   (`eliot_contracts::EpochId`); the child calls
+///   `FencingToken::new(authority_epoch, Generation, fence_nonce)`.
+/// * `fence_generation: u64` — non-zero live activation generation; the
+///   child calls `Generation::new(fence_generation)`.
+/// * `fence_nonce: String` — deterministic per-identity fence nonce
+///   (`<operation_prefix>-fence-<short_identity>`); the child passes it to
+///   `FencingToken::new`.
+/// * `idempotency_key: String` — deterministic per-identity lease
+///   (`<operation_prefix>-lease-<short_identity>`); the child calls
+///   `ActionLeaseRef::new(idempotency_key)`.
+/// * `expires_at: u64` — Unix milliseconds
+///   (`admitted_at_ms.saturating_add(60_000)`); the child passes it as
+///   `PermitIssuance::new(..., issued_at = now_ms, expires_at, ...)`.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DispatchGrant {
+    /// Lowercase SHA-256 binding the grant fields plus the admission
+    /// identity digest.
+    pub grant_digest: String,
+    /// Live authority epoch bound at admission (canonical `EpochId`).
+    pub authority_epoch: EpochId,
+    /// Live activation generation bound at admission (non-zero).
+    pub fence_generation: u64,
+    /// Deterministic per-identity fence nonce for `FencingToken::new`.
+    pub fence_nonce: String,
+    /// Deterministic per-identity lease for `ActionLeaseRef::new`.
+    pub idempotency_key: String,
+    /// Grant expiry in Unix milliseconds for `PermitIssuance::new`.
+    pub expires_at: u64,
+}
+
+impl DispatchGrant {
+    /// Validates the grant shape through the exact broker types the child
+    /// uses: `FencingToken::new`, `ActionLeaseRef::new`, plus digest bounds.
+    /// Returns the fence and lease the child would build (the child
+    /// rebuilds them itself; this only proves the material is well-formed).
+    pub fn validate_for_child(
+        &self,
+    ) -> Result<(FencingToken, ActionLeaseRef), DispatchLaunchError> {
+        require_digest(&self.grant_digest, "grant digest must be a lowercase SHA-256 digest")?;
+        if self.fence_generation == 0 {
+            return Err(DispatchLaunchError::InvalidMaterial(
+                "grant fence generation must be non-zero".to_owned(),
+            ));
+        }
+        if self.expires_at == 0 {
+            return Err(DispatchLaunchError::InvalidMaterial(
+                "grant expiry must be non-zero".to_owned(),
+            ));
+        }
+        let generation = Generation::new(self.fence_generation).map_err(gate_error)?;
+        let fence = FencingToken::new(
+            self.authority_epoch.clone(),
+            generation,
+            self.fence_nonce.clone(),
+        )
+        .map_err(gate_error)?;
+        let lease = ActionLeaseRef::new(self.idempotency_key.clone()).map_err(gate_error)?;
+        Ok((fence, lease))
+    }
+}
+
+/// Builds the deterministic launch grant for one admitted identity.
+///
+/// Inputs are all Kernel-side live authority plus the durable admission
+/// identity: `identity_digest` is the admission-bound digest
+/// (`attempt_digest` for Doctor, `request_digest` for testd,
+/// `binding_digest` for native — all lowercase SHA-256 by contract),
+/// `authority_epoch`/`generation` are the live values bound at admission,
+/// and `admitted_at_unix_nanos` is the durable admission time (for native,
+/// `admitted_at_unix_ms * 1_000_000`). Derivations are replay-stable, so an
+/// exact replay rebuilds byte-identical grant bytes and reconciles by the
+/// original identity instead of minting a second grant.
+fn dispatch_grant_for(
+    kind: DispatchedWorkerKind,
+    identity_digest: &str,
+    authority_epoch: &EpochId,
+    generation: Generation,
+    admitted_at_unix_nanos: u64,
+) -> Result<DispatchGrant, DispatchLaunchError> {
+    require_digest(
+        identity_digest,
+        "grant identity digest must be a lowercase SHA-256 digest",
+    )?;
+    if admitted_at_unix_nanos == 0 {
+        return Err(DispatchLaunchError::InvalidMaterial(
+            "grant admission time must be non-zero".to_owned(),
+        ));
+    }
+    let short = short_identity(identity_digest)?.to_owned();
+    let fence_nonce = format!("{}-fence-{short}", kind.operation_prefix());
+    let idempotency_key = format!("{}-lease-{short}", kind.operation_prefix());
+    let admitted_at_ms = admitted_at_unix_nanos / 1_000_000;
+    let expires_at = admitted_at_ms.saturating_add(60_000);
+    if expires_at == 0 {
+        return Err(DispatchLaunchError::InvalidMaterial(
+            "grant expiry must be non-zero".to_owned(),
+        ));
+    }
+    // Canonical digest binding: identity + epoch + generation + fence +
+    // lease + expiry. The epoch serializes via its canonical JSON shape;
+    // everything else is fixed-order text, so equal logical grants hash
+    // identically on both sides of the boundary.
+    let epoch_json =
+        serde_json::to_string(authority_epoch).map_err(|error| DispatchLaunchError::Gate(error.to_string()))?;
+    let mut material = String::with_capacity(256);
+    material.push_str(identity_digest);
+    material.push('|');
+    material.push_str(&epoch_json);
+    material.push('|');
+    material.push_str(&generation.get().to_string());
+    material.push('|');
+    material.push_str(&fence_nonce);
+    material.push('|');
+    material.push_str(&idempotency_key);
+    material.push('|');
+    material.push_str(&expires_at.to_string());
+    let grant_digest = super::sha256_hex(material.as_bytes());
+    let grant = DispatchGrant {
+        grant_digest,
+        authority_epoch: authority_epoch.clone(),
+        fence_generation: generation.get(),
+        fence_nonce,
+        idempotency_key,
+        expires_at,
+    };
+    // Prove the material satisfies the exact broker constructors before it
+    // is ever written: the child will call these same entries.
+    grant.validate_for_child()?;
+    Ok(grant)
 }
 
 /// Object-safe admission port over the durable Doctor recovery ledger.
@@ -279,7 +473,8 @@ enum LaunchPhase {
 }
 
 /// One retained dispatched attempt, keyed by its original identity
-/// (attempt digest for Doctor, job identity for testd).
+/// (attempt digest for Doctor, job identity for testd, claim identity for
+/// the native worker).
 #[derive(Clone, Debug)]
 struct LaunchRecord {
     kind: DispatchedWorkerKind,
@@ -292,8 +487,15 @@ struct LaunchRecord {
     operation_id: String,
     phase: LaunchPhase,
     /// Retained original testd admission for reconcile-by-identity;
-    /// always `None` for Doctor (the durable ledger is the authority).
+    /// always `None` for Doctor (the durable ledger is the authority) and
+    /// for the native worker (which retains its receipt below).
     testd_admission: Option<TestdAdmission>,
+    /// Retained original native-worker claim receipt for
+    /// reconcile-by-identity; always `None` for Doctor/Testd.
+    native_receipt: Option<NativeWorkerClaimReceipt>,
+    /// Retained original native-worker claim request for binding checks;
+    /// always `None` for Doctor/Testd.
+    native_request: Option<NativeWorkerClaimRequest>,
 }
 
 /// Retained launch records. The durable attempt/effect ledger stays the
@@ -740,15 +942,20 @@ pub enum DoctorLaunchOutcome {
 }
 
 /// Writes the Doctor dispatch file carrying exactly what the child reader
-/// validates.
+/// validates, plus the Kernel-issued launch grant.
 ///
 /// The envelope object holds the wire attempt, the parsed closed request
 /// (byte-identical to the envelope bytes, re-proved by the caller), the
 /// admitted manifest revision, the live epoch, the fence-bound generation,
 /// and the session nonce — the six fields
-/// `read_dispatched_material_from` checks, in the shape it parses with
-/// `deny_unknown_fields`. Files are never read here, and nothing travels
-/// via argv, stdin, or the environment.
+/// `read_dispatched_material_from` checks — plus a seventh `grant` object
+/// carrying the launch-grant material the child needs to construct its own
+/// local `DispatchPermitAuthority` (`grant_digest`, `authority_epoch`,
+/// `fence_generation`, `fence_nonce`, `idempotency_key`, `expires_at`).
+/// Every pre-existing field serializes byte-identically to before; only the
+/// additive `grant` key is new (Writer-D reads the same shape). Files are
+/// never read here, and nothing travels via argv, stdin, or the
+/// environment.
 fn doctor_material_bytes(
     attempt: &DoctorRepairAttemptRequest,
     request_json: &serde_json::Value,
@@ -756,6 +963,7 @@ fn doctor_material_bytes(
     epoch: &EpochId,
     generation: u64,
     nonce: &str,
+    grant: &DispatchGrant,
 ) -> Result<Vec<u8>, DispatchLaunchError> {
     let envelope = serde_json::json!({
         "attempt": attempt,
@@ -764,12 +972,148 @@ fn doctor_material_bytes(
         "epoch": epoch,
         "generation": generation,
         "nonce": nonce,
+        "grant": grant,
     });
     let bytes = serde_json::to_vec(&envelope)
         .map_err(|error| DispatchLaunchError::Io(error.to_string()))?;
     // Mirror the child input bound
     // (`DISPATCHED_MATERIAL_LIMIT_BYTES = 256 KiB`): refuse an unbounded
     // write before touching the protected path.
+    if u64::try_from(bytes.len()).unwrap_or(u64::MAX) > 256 * 1024 {
+        return Err(DispatchLaunchError::Io(
+            "dispatch material exceeds the bounded input limit".to_owned(),
+        ));
+    }
+    Ok(bytes)
+}
+
+/// Writes the testd dispatch file carrying the admitted attempt plus the
+/// Kernel-issued launch grant.
+///
+/// JSON shape for Writer-T (all keys required, `deny_unknown_fields` on
+/// the child side):
+/// ```json
+/// {
+///   "request": TestdAdmissionAttemptRequest,
+///   "envelope": TestdAdmissionEnvelope,
+///   "admission": TestdAdmission,
+///   "epoch": EpochId,
+///   "generation": 1,
+///   "nonce": "testd-dispatch-<hex>",
+///   "grant": DispatchGrant
+/// }
+/// ```
+/// * `request` — the full wire envelope the contour admitted
+///   (`job_id`, `attempt_seq`, `closed_request_json`, digests).
+/// * `envelope` — the parsed `closed_request_json`
+///   (`TestdAdmissionEnvelope`: `job_id`, `operation_id`, `cancellation`,
+///   `fence`); derived Kernel-side by re-parsing, never taken as extra
+///   caller bytes beyond the already-admitted `request`.
+/// * `admission` — the Kernel-issued receipt (`TestdAdmission`); its
+///   `operation_id` is the bounded evidence handle the child maps to
+///   `PresentedAdmission.evidence_ref`, and `cancelled` maps to
+///   `PresentedAdmission.cancelled`.
+/// * `epoch` — the live authority epoch (maps to
+///   `PresentedAdmission.epoch`; never envelope bytes).
+/// * `generation` — the live activation generation (the child proves its
+///   fence generation against this).
+/// * `nonce` — the I7.5/I15.2 session nonce.
+/// * `grant` — the shared `DispatchGrant` object (see its docs).
+///
+/// The concrete `ProcessRequest` is never serialized (it is
+/// `Serialize`-only by design on the child side and `Clone`-only here);
+/// the child rebuilds it in-process from `grant` via `FencingToken::new` +
+/// `PermitIssuance::new` + `DispatchValidationContext::new` +
+/// `ProcessRequest::new`. No executable bytes are taken from caller input:
+/// the child binding (path/digest/workdir) stays composition-pinned like
+/// Doctor.
+fn testd_material_bytes(
+    request: &TestdAdmissionAttemptRequest,
+    envelope: &TestdAdmissionEnvelope,
+    admission: &TestdAdmission,
+    epoch: &EpochId,
+    generation: u64,
+    nonce: &str,
+    grant: &DispatchGrant,
+) -> Result<Vec<u8>, DispatchLaunchError> {
+    let body = serde_json::json!({
+        "request": request,
+        "envelope": envelope,
+        "admission": admission,
+        "epoch": epoch,
+        "generation": generation,
+        "nonce": nonce,
+        "grant": grant,
+    });
+    let bytes =
+        serde_json::to_vec(&body).map_err(|error| DispatchLaunchError::Io(error.to_string()))?;
+    if u64::try_from(bytes.len()).unwrap_or(u64::MAX) > 256 * 1024 {
+        return Err(DispatchLaunchError::Io(
+            "dispatch material exceeds the bounded input limit".to_owned(),
+        ));
+    }
+    Ok(bytes)
+}
+
+/// Writes the native-worker dispatch file carrying the admitted claim plus
+/// the Kernel-issued launch grant.
+///
+/// JSON shape for the native child (all keys required):
+/// ```json
+/// {
+///   "request": NativeWorkerClaimRequest,
+///   "receipt": NativeWorkerClaimReceipt,
+///   "epoch": EpochId,
+///   "generation": 1,
+///   "nonce": "native-worker-dispatch-<hex>",
+///   "grant": DispatchGrant
+/// }
+/// ```
+/// * `request` — the exact `NativeWorkerClaimRequest` the contour admitted
+///   (existing `eliot-kernel-service` vocabulary; never a parallel type).
+/// * `receipt` — the Kernel-issued `NativeWorkerClaimReceipt` (existing
+///   vocabulary; its `receipt_digest` is the admission identity).
+/// * `epoch`/`generation` — the live authority bound at admission.
+/// * `nonce` — the I7.5/I15.2 session nonce (must equal the v2
+///   executable-join launch nonce when the join is present; the caller
+///   request already binds it, and the child re-proves binding).
+/// * `grant` — the shared `DispatchGrant` object.
+///
+/// The concrete `ProcessRequest` plus the composed provider ports arrive
+/// only with the execution context the child builds in-process from `grant`
+/// (same broker pattern as Doctor/Testd); validated claim bytes alone never
+/// drive. Binds to the existing `NativeWorkerClaimRecord` durably
+/// kernel-side (the ORS claim table stages/loads it; see
+/// `native_worker_lifecycle_route::NATIVE_WORKER_CLAIM_OPERATION`): the
+/// material carries the request/receipt projection, while the record stays
+/// the durable authority for reconcile.
+fn native_worker_material_bytes(
+    request: &NativeWorkerClaimRequest,
+    receipt: &NativeWorkerClaimReceipt,
+    epoch: &EpochId,
+    generation: u64,
+    nonce: &str,
+    grant: &DispatchGrant,
+) -> Result<Vec<u8>, DispatchLaunchError> {
+    // Bind to the existing claim vocabulary without inventing a parallel
+    // one: the lifecycle route owns `native_worker.claim`, and ORS owns the
+    // record. Referencing the operation here keeps the dispatch seam on the
+    // same vocabulary (a mismatched operation name fails closed at the
+    // route; the dispatch seam never mints its own).
+    debug_assert_eq!(
+        crate::native_worker_lifecycle_route::NATIVE_WORKER_CLAIM_OPERATION,
+        "native_worker.claim"
+    );
+    let body = serde_json::json!({
+        "request": request,
+        "receipt": receipt,
+        "epoch": epoch,
+        "generation": generation,
+        "nonce": nonce,
+        "grant": grant,
+    });
+    let bytes =
+        serde_json::to_vec(&body).map_err(|error| DispatchLaunchError::Io(error.to_string()))?;
     if u64::try_from(bytes.len()).unwrap_or(u64::MAX) > 256 * 1024 {
         return Err(DispatchLaunchError::Io(
             "dispatch material exceeds the bounded input limit".to_owned(),
@@ -978,6 +1322,8 @@ pub fn prepare_doctor_launch(
                 operation_id: operation_id_string(&operation_id),
                 phase: LaunchPhase::Reserved,
                 testd_admission: None,
+                native_receipt: None,
+                native_request: None,
             },
         );
     }
@@ -989,6 +1335,13 @@ pub fn prepare_doctor_launch(
     };
     let material_dir_owned = material_dir.to_path_buf();
     let material_path = material_dir_owned.join(file_name);
+    let grant = dispatch_grant_for(
+        DispatchedWorkerKind::Doctor,
+        &admission.attempt_digest,
+        &authority_epoch,
+        generation,
+        admission.admitted_at_unix_nanos,
+    )?;
     let bytes = doctor_material_bytes(
         material.attempt,
         material.request_json,
@@ -996,6 +1349,7 @@ pub fn prepare_doctor_launch(
         &authority_epoch,
         generation.get(),
         &nonce,
+        &grant,
     );
     let bytes = match bytes {
         Ok(bytes) => bytes,
@@ -1350,6 +1704,8 @@ pub async fn launch_admitted_doctor_attempt(
                     operation_id: operation_id_string(&ready.operation_id),
                     phase: LaunchPhase::Launched,
                     testd_admission: None,
+                    native_receipt: None,
+                    native_request: None,
                 },
             )?;
             Ok(DoctorLaunchOutcome::Launched {
@@ -1373,6 +1729,8 @@ pub async fn launch_admitted_doctor_attempt(
                     operation_id: operation_id_string(&uncertain.operation_id),
                     phase: LaunchPhase::Unreconciled,
                     testd_admission: None,
+                    native_receipt: None,
+                    native_request: None,
                 },
             )?;
             Ok(DoctorLaunchOutcome::LaunchUnknown {
@@ -1413,6 +1771,8 @@ fn retain_launch(
                 existing.effect_digest.clone_from(&record.effect_digest);
                 existing.material_path.clone_from(&record.material_path);
                 existing.testd_admission.clone_from(&record.testd_admission);
+                existing.native_receipt.clone_from(&record.native_receipt);
+                existing.native_request.clone_from(&record.native_request);
                 existing.phase = record.phase;
             }
         })
@@ -1556,13 +1916,13 @@ pub enum ReconcileLaunchedOutcome {
 /// the composition-pinned child binary binding.
 ///
 /// The closed envelope travels inside `request.closed_request_json` and is
-/// re-parsed (never trusted) at reconcile time. Like Doctor, nothing
-/// travels via argv, stdin, or the environment — and testd additionally
-/// writes no dispatch file, because that binary defines no material reader
-/// (see [`DispatchedWorkerKind::material_file_name`]). The contour carries
-/// the admission context kernel-side in the retained launch record and
-/// stops at the spawn boundary instead of working around the missing
-/// child reader.
+/// re-parsed (never trusted) at prepare and reconcile time. Like Doctor,
+/// nothing travels via argv, stdin, or the environment; the admitted
+/// attempt plus the launch grant travels only over the protected dispatch
+/// file (`eliot-testd.admitted-attempt.json`, see
+/// [`DispatchedWorkerKind::material_file_name`]). No executable bytes are
+/// taken from caller input: the child binding (path/digest/workdir) stays
+/// composition-pinned.
 pub struct TestdLaunchMaterial<'a> {
     /// Full wire envelope: job seed, attempt sequence, opaque closed
     /// envelope bytes, target digest, and canonical digest.
@@ -1625,6 +1985,8 @@ pub struct ReadyTestdLaunch {
     pub executable_sha256: String,
     /// Composition-pinned child working directory.
     pub working_directory: PathBuf,
+    /// Protected dispatch file path the child reads.
+    pub material_path: PathBuf,
     /// Live authority epoch bound at admission.
     pub authority_epoch: EpochId,
     /// Live activation generation bound at admission.
@@ -1680,8 +2042,9 @@ pub enum TestdLaunchOutcome {
 /// jobs without spawning; reconcile exact resubmits by the retained
 /// original admission (changed terms under one job identity refuse with
 /// [`DispatchLaunchError::ChangedTerms`] instead of overwriting); reserve
-/// the job identity single-flight; mint the replay-stable nonce. Nothing
-/// is spawned here and no file is written (the child defines no reader):
+/// the job identity single-flight; mint the replay-stable nonce; write the
+/// admitted attempt plus the launch grant to the protected dispatch file
+/// through [`write_material_file`]. Nothing is spawned here:
 /// [`launch_admitted_testd_attempt`] spawns the returned
 /// [`ReadyTestdLaunch`] through the admitted executor.
 #[allow(
@@ -1698,11 +2061,11 @@ pub fn prepare_testd_launch(
             "admission time must be non-zero".to_owned(),
         ));
     }
-    if material.executable.parent().is_none() {
-        return Err(DispatchLaunchError::InvalidMaterial(
+    let material_dir = material.executable.parent().ok_or_else(|| {
+        DispatchLaunchError::InvalidMaterial(
             "dispatch child executable has no parent directory".to_owned(),
-        ));
-    }
+        )
+    })?;
     require_digest(
         material.executable_sha256,
         "dispatch child executable digest must be a lowercase SHA-256 digest",
@@ -1795,8 +2158,62 @@ pub fn prepare_testd_launch(
                 operation_id: operation_id_string(&operation_id),
                 phase: LaunchPhase::Reserved,
                 testd_admission: Some((*admission).clone()),
+                native_receipt: None,
+                native_request: None,
             },
         );
+    }
+    let Some(file_name) = DispatchedWorkerKind::Testd.material_file_name() else {
+        release_launch(contour, &admission.job_id);
+        return Err(DispatchLaunchError::Gate(
+            "testd defines no dispatch material file".to_owned(),
+        ));
+    };
+    let material_path = material_dir.to_path_buf().join(file_name);
+    // The envelope is derived Kernel-side by re-parsing the already-admitted
+    // closed request; no extra caller bytes are taken (never executable
+    // bytes). A parse failure here releases the reservation fail-closed.
+    let envelope: TestdAdmissionEnvelope =
+        serde_json::from_str(&material.request.closed_request_json).map_err(|_| {
+            release_launch(contour, &admission.job_id);
+            DispatchLaunchError::InvalidMaterial(
+                "testd closed request envelope is not JSON".to_owned(),
+            )
+        })?;
+    let grant = dispatch_grant_for(
+        DispatchedWorkerKind::Testd,
+        &admission.request_digest,
+        &authority_epoch,
+        generation,
+        admission.admitted_at_unix_nanos,
+    )
+    .inspect_err(|_| {
+        release_launch(contour, &admission.job_id);
+    })?;
+    let bytes = testd_material_bytes(
+        material.request,
+        &envelope,
+        &admission,
+        &authority_epoch,
+        generation.get(),
+        &nonce,
+        &grant,
+    );
+    let bytes = match bytes {
+        Ok(bytes) => bytes,
+        Err(error) => {
+            release_launch(contour, &admission.job_id);
+            return Err(error);
+        }
+    };
+    if let Err(error) = write_material_file(&material_path, &bytes) {
+        release_launch(contour, &admission.job_id);
+        return Err(error);
+    }
+    if let Ok(mut launches) = contour.launches.lock()
+        && let Some(record) = launches.by_identity.get_mut(&admission.job_id)
+    {
+        record.material_path = Some(material_path.clone());
     }
     Ok(PreparedTestdLaunch::Ready(ReadyTestdLaunch {
         admission,
@@ -1805,6 +2222,7 @@ pub fn prepare_testd_launch(
         executable: material.executable.to_path_buf(),
         executable_sha256: material.executable_sha256.to_owned(),
         working_directory: material.working_directory.to_path_buf(),
+        material_path,
         authority_epoch,
         generation,
     }))
@@ -1814,10 +2232,9 @@ pub fn prepare_testd_launch(
 ///
 /// Same seam shape as the Doctor spawn: empty argv, secret-free
 /// environment, bounded limits, pinned path proof, Kernel-owned process
-/// owner. The #1452 residual is honored here: the seam provisions the
-/// admitted executor (fail-closed when unconfigured) and retains the
-/// admission context kernel-side; the child-side material reader remains
-/// the recorded testd-owner gap, so no byte surface is invented for it.
+/// owner. The admitted attempt material travels only over the protected
+/// dispatch file the child reads; a spawn failure reaps the file
+/// best-effort so a stale presentation never lingers.
 pub async fn start_ready_testd_launch(
     kernel: &KernelComposition,
     ready: &ReadyTestdLaunch,
@@ -1832,7 +2249,7 @@ pub async fn start_ready_testd_launch(
             working_directory: &ready.working_directory,
             generation: ready.generation,
             authority_epoch: &ready.authority_epoch,
-            material_path: None,
+            material_path: Some(ready.material_path.as_path()),
         },
     )
     .await?
@@ -1880,6 +2297,7 @@ pub async fn launch_admitted_testd_attempt(
     };
     let job_id = ready.admission.job_id.clone();
     let request_digest = ready.admission.request_digest.clone();
+    let material_path = ready.material_path.clone();
     match start_ready_testd_launch(kernel, &ready).await {
         Ok(ChildStartOutcome::Started(spawned)) => {
             retain_launch(
@@ -1890,11 +2308,13 @@ pub async fn launch_admitted_testd_attempt(
                     admission_digest: ready.admission.admission_digest.clone(),
                     request_digest,
                     effect_digest: None,
-                    material_path: None,
+                    material_path: Some(material_path),
                     nonce: ready.nonce.clone(),
                     operation_id: operation_id_string(&ready.operation_id),
                     phase: LaunchPhase::Launched,
                     testd_admission: Some((*ready.admission).clone()),
+                    native_receipt: None,
+                    native_request: None,
                 },
             )?;
             Ok(TestdLaunchOutcome::Launched {
@@ -1913,11 +2333,13 @@ pub async fn launch_admitted_testd_attempt(
                     admission_digest: ready.admission.admission_digest.clone(),
                     request_digest,
                     effect_digest: None,
-                    material_path: None,
+                    material_path: Some(material_path),
                     nonce: ready.nonce.clone(),
                     operation_id: operation_id_string(&uncertain.operation_id),
                     phase: LaunchPhase::Unreconciled,
                     testd_admission: Some((*ready.admission).clone()),
+                    native_receipt: None,
+                    native_request: None,
                 },
             )?;
             Ok(TestdLaunchOutcome::LaunchUnknown {
@@ -1927,6 +2349,7 @@ pub async fn launch_admitted_testd_attempt(
             })
         }
         Err(error) => {
+            reap_material_file(&material_path);
             release_launch(contour, &job_id);
             Err(error)
         }
@@ -1988,6 +2411,9 @@ pub fn reconcile_launched_testd_attempt(
     let binds = reconcile_testd_admission(&admission, request, &envelope, &live_epoch)
         .map_err(gate_error)?;
     if binds {
+        if let Some(path) = retained.material_path.as_deref() {
+            reap_material_file(path);
+        }
         mark_reconciled(contour, job_id)?;
         return Ok(ReconcileLaunchedOutcome::Reconciled {
             kind: DispatchedWorkerKind::Testd,
@@ -2007,8 +2433,10 @@ pub fn reconcile_launched_testd_attempt(
 /// Removes the record for `identity` only when its retained request
 /// digest equals `request_digest`, so a newer reservation is never
 /// released by a stale caller. Returns true when a slot was released.
-/// Documented use: testd slots, whose durable terminality lives in the
-/// testd owner's store and therefore never auto-release kernel-side.
+/// Documented use: testd and native-worker slots, whose durable
+/// terminality lives in the owner store and therefore never auto-release
+/// kernel-side. The dispatch file is reaped best-effort on release so a
+/// stale presentation never lingers for a later invocation.
 pub fn release_launched_attempt(
     kind: DispatchedWorkerKind,
     identity: &str,
@@ -2017,6 +2445,14 @@ pub fn release_launched_attempt(
     let contour = DISPATCH_CONTOUR
         .get()
         .ok_or(DispatchLaunchError::Uncomposed("dispatch contour"))?;
+    let material_path = {
+        let launches = launches_table(contour)?;
+        launches
+            .by_identity
+            .get(identity)
+            .filter(|record| record.kind == kind && record.request_digest == request_digest)
+            .and_then(|record| record.material_path.clone())
+    };
     let mut launches = launches_table(contour)?;
     let release = launches
         .by_identity
@@ -2025,7 +2461,608 @@ pub fn release_launched_attempt(
     if release {
         launches.by_identity.remove(identity);
     }
+    drop(launches);
+    if release
+        && let Some(path) = material_path
+    {
+        reap_material_file(&path);
+    }
     Ok(release)
+}
+
+/// Caller-supplied native-worker launch material: the claim wire request
+/// plus the composition-pinned child binary binding.
+///
+/// The claim request (`NativeWorkerClaimRequest`, existing
+/// `eliot-kernel-service` vocabulary) travels by value; the ORS claim
+/// record (`NativeWorkerClaimRecord`, existing `eliot-ors` vocabulary)
+/// stays the durable authority kernel-side. Like Doctor/Testd, nothing
+/// travels via argv, stdin, or the environment; the admitted claim plus
+/// the launch grant travels only over the protected dispatch file
+/// (`eliot-native-worker.admitted-claim.json`, see
+/// [`DispatchedWorkerKind::material_file_name`]). No executable bytes are
+/// taken from caller input: the child binding (path/digest/workdir) stays
+/// composition-pinned, and the `executable_binding` join inside the request
+/// is validated closed (never minted here).
+pub struct NativeWorkerLaunchMaterial<'a> {
+    /// Full wire envelope: claim/binding digests plus the T9-02
+    /// executable-binding join when present.
+    pub request: &'a NativeWorkerClaimRequest,
+    /// Composition-pinned child executable path.
+    pub executable: &'a Path,
+    /// Expected SHA-256 digest of the child executable image.
+    pub executable_sha256: &'a str,
+    /// Composition-pinned child working directory.
+    pub working_directory: &'a Path,
+}
+
+/// Why a prepared native-worker launch produced no child.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum NativeWorkerLaunchSkip {
+    /// The claim identity is already reserved or launched: the returned
+    /// receipt is the original identity's receipt (rebuilt identically by
+    /// the gate), never a recompute under a new id.
+    LaunchInFlight,
+}
+
+/// A prepared native-worker launch: admitted, nonce-bound, and (unless
+/// skipped) written to the protected dispatch file, ready to spawn.
+#[allow(
+    clippy::large_enum_variant,
+    reason = "Ready carries the full spawn binding like PreparedDoctorLaunch::Ready; boxing it would diverge from the Doctor/Testd seam shape"
+)]
+pub enum PreparedNativeWorkerLaunch {
+    /// Ready to spawn through the admitted executor.
+    Ready(ReadyNativeWorkerLaunch),
+    /// An exact resubmit under one claim identity: carries the RETAINED
+    /// original receipt (original admitted-at time and digest), never the
+    /// just-recomputed one.
+    ReplayOriginal {
+        /// The original receipt for the claim identity.
+        receipt: Box<NativeWorkerClaimReceipt>,
+    },
+    /// Admitted but needing no child; carries the receipt and the reason.
+    Skipped {
+        /// The receipt for the claim identity.
+        receipt: Box<NativeWorkerClaimReceipt>,
+        /// Why no child is spawned.
+        skip: NativeWorkerLaunchSkip,
+    },
+    /// The gate refused or conflicted; carries the typed answer, never a
+    /// receipt (boxed: the response dwarfs the other outcomes).
+    Refused(Box<NativeWorkerClaimResponse>),
+}
+
+/// A native-worker launch ready to spawn: every authority check passed and
+/// the dispatch file carries exactly what the child reader validates.
+pub struct ReadyNativeWorkerLaunch {
+    /// The receipt for the claim identity.
+    pub receipt: Box<NativeWorkerClaimReceipt>,
+    /// The I7.5/I15.2 launch nonce written to the dispatch file.
+    pub nonce: String,
+    /// Deterministic child operation identity derived from the binding
+    /// digest, so the admitted executor replays (never double-spawns) an
+    /// identical launch.
+    pub operation_id: OperationId,
+    /// Protected dispatch file path the child reads.
+    pub material_path: PathBuf,
+    /// Composition-pinned child executable path.
+    pub executable: PathBuf,
+    /// Expected SHA-256 digest of the child executable image.
+    pub executable_sha256: String,
+    /// Composition-pinned child working directory.
+    pub working_directory: PathBuf,
+    /// Live authority epoch bound at admission.
+    pub authority_epoch: EpochId,
+    /// Live activation generation bound at admission.
+    pub generation: Generation,
+}
+
+/// Outcome of one native-worker admit-then-launch call.
+#[allow(
+    clippy::large_enum_variant,
+    reason = "Refused is boxed; Launched carries two boxed receipts plus identities like Doctor/Testd outcomes"
+)]
+pub enum NativeWorkerLaunchOutcome {
+    /// The child was spawned through the admitted executor.
+    Launched {
+        /// The receipt for the claim identity.
+        receipt: Box<NativeWorkerClaimReceipt>,
+        /// The launch nonce retained for the submit-time session proof.
+        nonce: String,
+        /// Child process operation identity.
+        operation_id: OperationId,
+        /// The admitted process-start receipt (boxed: receipts dwarf the
+        /// other outcomes).
+        receipt_process: Box<ProcessStartReceipt>,
+    },
+    /// The spawn outcome is unknown: retained as unreconciled under the
+    /// original claim identity — reconcile later, never blind-retry.
+    LaunchUnknown {
+        /// The receipt for the claim identity.
+        receipt: Box<NativeWorkerClaimReceipt>,
+        /// The launch nonce retained for the session proof.
+        nonce: String,
+        /// Child process operation identity.
+        operation_id: OperationId,
+    },
+    /// An exact resubmit under one claim identity: carries the retained
+    /// original receipt, and no second child is spawned.
+    ReplayOriginal {
+        /// The original receipt for the claim identity.
+        receipt: Box<NativeWorkerClaimReceipt>,
+    },
+    /// Admitted but needing no child; carries the receipt and the reason.
+    NotLaunched {
+        /// The receipt for the claim identity.
+        receipt: Box<NativeWorkerClaimReceipt>,
+        /// Why no child was spawned.
+        skip: NativeWorkerLaunchSkip,
+    },
+    /// The gate refused or conflicted; carries the typed answer (boxed: the
+    /// response dwarfs the other outcomes).
+    Refused(Box<NativeWorkerClaimResponse>),
+}
+
+/// Admits one native-worker claim and prepares its launch: nonce-bound
+/// material written to the protected dispatch file, ready to spawn.
+///
+/// Sequence: validate the child binding plus the closed claim shape and
+/// canonical digest; admit through live service authority plus the ORS
+/// claim table (`KernelService::admit_native_worker_claim` — the existing
+/// vocabulary, never a parallel one; exact replays rebuild the original
+/// receipt); reserve the original claim identity single-flight (changed
+/// terms under one identity refuse with `ChangedTerms`); mint the
+/// replay-stable nonce; write the admitted claim plus the launch grant
+/// through [`write_material_file`]. Nothing is spawned here:
+/// [`launch_admitted_native_worker_attempt`] spawns the returned
+/// [`ReadyNativeWorkerLaunch`] through the admitted executor.
+#[allow(
+    clippy::too_many_lines,
+    reason = "admit, reserve, nonce, and material-write stay in one ordered authority path so no launch step can run before its gate"
+)]
+pub fn prepare_native_worker_launch(
+    kernel: &KernelComposition,
+    material: &NativeWorkerLaunchMaterial<'_>,
+    now_unix_nanos: u64,
+) -> Result<PreparedNativeWorkerLaunch, DispatchLaunchError> {
+    if now_unix_nanos == 0 {
+        return Err(DispatchLaunchError::InvalidMaterial(
+            "admission time must be non-zero".to_owned(),
+        ));
+    }
+    let material_dir = material.executable.parent().ok_or_else(|| {
+        DispatchLaunchError::InvalidMaterial(
+            "dispatch child executable has no parent directory".to_owned(),
+        )
+    })?;
+    require_digest(
+        material.executable_sha256,
+        "dispatch child executable digest must be a lowercase SHA-256 digest",
+    )?;
+    if material.working_directory.as_os_str().is_empty() {
+        return Err(DispatchLaunchError::InvalidMaterial(
+            "dispatch child working directory must be non-blank".to_owned(),
+        ));
+    }
+    material.request.validate().map_err(gate_error)?;
+    material
+        .request
+        .validate_canonical_digest()
+        .map_err(gate_error)?;
+    let contour = DISPATCH_CONTOUR
+        .get()
+        .ok_or(DispatchLaunchError::Uncomposed("native-worker front door"))?;
+    let now_unix_ms = now_unix_nanos / 1_000_000;
+    if now_unix_ms == 0 {
+        return Err(DispatchLaunchError::InvalidMaterial(
+            "admission time must be non-zero milliseconds".to_owned(),
+        ));
+    }
+    let (authority_epoch, generation, response) = {
+        let service = kernel
+            .service
+            .lock()
+            .map_err(|_| DispatchLaunchError::Gate("kernel service lock poisoned".to_owned()))?;
+        let response = service
+            .admit_native_worker_claim(
+                kernel.generation_gateway.ors.as_ref(),
+                material.request,
+                now_unix_ms,
+            )
+            .map_err(gate_error)?;
+        let epoch = service.authority_epoch();
+        let generation = service
+            .activation_receipt()
+            .map_or(0, |receipt| receipt.generation.value());
+        (epoch, generation, response)
+    };
+    if generation == 0 {
+        return Err(DispatchLaunchError::Gate(
+            "live activation generation is unavailable".to_owned(),
+        ));
+    }
+    let receipt = match response {
+        NativeWorkerClaimResponse::Admitted(receipt) => receipt,
+        refused => return Ok(PreparedNativeWorkerLaunch::Refused(Box::new(refused))),
+    };
+    require_digest(
+        &receipt.binding_digest,
+        "native receipt binding digest must be a lowercase SHA-256 digest",
+    )?;
+    require_digest(
+        &receipt.receipt_digest,
+        "native receipt digest must be a lowercase SHA-256 digest",
+    )?;
+    // The admitted receipt must answer the presented request: same claim,
+    // same binding. A rewired receipt never prepares.
+    if receipt.claim_id != material.request.claim_id
+        || receipt.binding_digest != material.request.binding_digest
+    {
+        return Err(DispatchLaunchError::Inconsistent(
+            "native receipt does not answer the presented claim".to_owned(),
+        ));
+    }
+    let admitted_at_nanos = receipt
+        .admitted_at_unix_ms
+        .checked_mul(1_000_000)
+        .filter(|value| *value != 0)
+        .ok_or_else(|| {
+            DispatchLaunchError::Inconsistent("native admission time is not well-formed".to_owned())
+        })?;
+    let nonce = mint_dispatch_nonce(
+        DispatchedWorkerKind::NativeWorker,
+        &receipt.binding_digest,
+        admitted_at_nanos,
+        contour.principal_owner.as_str(),
+    )?;
+    let generation = Generation::new(generation)
+        .map_err(|error| DispatchLaunchError::Gate(error.to_string()))?;
+    let operation_id = OperationId::new(format!(
+        "{}-{}-{}",
+        DispatchedWorkerKind::NativeWorker.operation_prefix(),
+        generation.get(),
+        short_identity(&receipt.binding_digest)?
+    ))
+    .map_err(|error| DispatchLaunchError::Gate(error.to_string()))?;
+    {
+        let mut launches = launches_table(contour)?;
+        if let Some(existing) = launches.by_identity.get(&receipt.claim_id) {
+            if existing.kind != DispatchedWorkerKind::NativeWorker {
+                return Err(DispatchLaunchError::ChangedTerms(format!(
+                    "claim identity {} is already launched for another worker",
+                    receipt.claim_id
+                )));
+            }
+            if existing.request_digest != material.request.request_digest {
+                return Err(DispatchLaunchError::ChangedTerms(format!(
+                    "claim {} presents changed terms under one claim identity",
+                    receipt.claim_id
+                )));
+            }
+            if let Some(retained) = existing.native_receipt.clone() {
+                return Ok(PreparedNativeWorkerLaunch::ReplayOriginal {
+                    receipt: Box::new(retained),
+                });
+            }
+        }
+        launches.by_identity.insert(
+            receipt.claim_id.clone(),
+            LaunchRecord {
+                kind: DispatchedWorkerKind::NativeWorker,
+                identity: receipt.claim_id.clone(),
+                admission_digest: receipt.receipt_digest.clone(),
+                request_digest: material.request.request_digest.clone(),
+                effect_digest: None,
+                material_path: None,
+                nonce: nonce.clone(),
+                operation_id: operation_id_string(&operation_id),
+                phase: LaunchPhase::Reserved,
+                testd_admission: None,
+                native_receipt: Some(receipt.clone()),
+                native_request: Some(material.request.clone()),
+            },
+        );
+    }
+    let Some(file_name) = DispatchedWorkerKind::NativeWorker.material_file_name() else {
+        release_launch(contour, &receipt.claim_id);
+        return Err(DispatchLaunchError::Gate(
+            "native worker defines no dispatch material file".to_owned(),
+        ));
+    };
+    let material_path = material_dir.to_path_buf().join(file_name);
+    let grant = dispatch_grant_for(
+        DispatchedWorkerKind::NativeWorker,
+        &receipt.binding_digest,
+        &authority_epoch,
+        generation,
+        admitted_at_nanos,
+    )
+    .inspect_err(|_| {
+        release_launch(contour, &receipt.claim_id);
+    })?;
+    let bytes = native_worker_material_bytes(
+        material.request,
+        &receipt,
+        &authority_epoch,
+        generation.get(),
+        &nonce,
+        &grant,
+    );
+    let bytes = match bytes {
+        Ok(bytes) => bytes,
+        Err(error) => {
+            release_launch(contour, &receipt.claim_id);
+            return Err(error);
+        }
+    };
+    if let Err(error) = write_material_file(&material_path, &bytes) {
+        release_launch(contour, &receipt.claim_id);
+        return Err(error);
+    }
+    if let Ok(mut launches) = contour.launches.lock()
+        && let Some(record) = launches.by_identity.get_mut(&receipt.claim_id)
+    {
+        record.material_path = Some(material_path.clone());
+    }
+    Ok(PreparedNativeWorkerLaunch::Ready(ReadyNativeWorkerLaunch {
+        receipt: Box::new(receipt),
+        nonce,
+        operation_id,
+        material_path,
+        executable: material.executable.to_path_buf(),
+        executable_sha256: material.executable_sha256.to_owned(),
+        working_directory: material.working_directory.to_path_buf(),
+        authority_epoch,
+        generation,
+    }))
+}
+
+/// Spawns one prepared native-worker launch through the admitted process
+/// gateway.
+///
+/// Same seam shape as the Doctor/testd spawn: empty argv, secret-free
+/// environment, bounded limits, pinned path proof, Kernel-owned process
+/// owner. The admitted-claim material travels only over the protected
+/// dispatch file the child reads; a spawn failure reaps the file
+/// best-effort so a stale presentation never lingers.
+pub async fn start_ready_native_worker_launch(
+    kernel: &KernelComposition,
+    ready: &ReadyNativeWorkerLaunch,
+) -> Result<ChildStartOutcome, DispatchLaunchError> {
+    match spawn_ready_child(
+        kernel,
+        &SpawnInputs {
+            kind: DispatchedWorkerKind::NativeWorker,
+            operation_id: &ready.operation_id,
+            executable: &ready.executable,
+            executable_sha256: &ready.executable_sha256,
+            working_directory: &ready.working_directory,
+            generation: ready.generation,
+            authority_epoch: &ready.authority_epoch,
+            material_path: Some(ready.material_path.as_path()),
+        },
+    )
+    .await?
+    {
+        SpawnOutcome::Started(receipt) => Ok(ChildStartOutcome::Started(Box::new(SpawnedChild {
+            receipt: *receipt,
+            operation_id: ready.operation_id.clone(),
+        }))),
+        SpawnOutcome::Unknown(operation_id) => {
+            Ok(ChildStartOutcome::Unknown(UncertainSpawn { operation_id }))
+        }
+    }
+}
+
+/// Admits one native-worker claim, then launches the real
+/// `eliot-native-worker` binary through the admitted process executor.
+///
+/// Admit-then-launch in one seam, mirroring the testd call: prepare admits
+/// and reserves the original claim identity plus writes the
+/// admitted-claim material, then the ready launch spawns and the identity
+/// is retained. Exact resubmits return the retained original receipt
+/// without spawning; refusals and skips return as outcomes; a failed spawn
+/// reaps the file and releases the reservation; an unknown spawn outcome
+/// retains the launch as unreconciled for
+/// [`reconcile_launched_native_worker_attempt`].
+pub async fn launch_admitted_native_worker_attempt(
+    kernel: &KernelComposition,
+    material: &NativeWorkerLaunchMaterial<'_>,
+    now_unix_nanos: u64,
+) -> Result<NativeWorkerLaunchOutcome, DispatchLaunchError> {
+    let contour = DISPATCH_CONTOUR
+        .get()
+        .ok_or(DispatchLaunchError::Uncomposed("native-worker front door"))?;
+    let prepared = prepare_native_worker_launch(kernel, material, now_unix_nanos)?;
+    let ready = match prepared {
+        PreparedNativeWorkerLaunch::Ready(ready) => ready,
+        PreparedNativeWorkerLaunch::ReplayOriginal { receipt } => {
+            return Ok(NativeWorkerLaunchOutcome::ReplayOriginal { receipt });
+        }
+        PreparedNativeWorkerLaunch::Skipped { receipt, skip } => {
+            return Ok(NativeWorkerLaunchOutcome::NotLaunched { receipt, skip });
+        }
+        PreparedNativeWorkerLaunch::Refused(response) => {
+            return Ok(NativeWorkerLaunchOutcome::Refused(response));
+        }
+    };
+    let claim_id = ready.receipt.claim_id.clone();
+    let request_digest = {
+        let launches = launches_table(contour)?;
+        launches.by_identity.get(&claim_id).map_or_else(
+            || ready.receipt.binding_digest.clone(),
+            |record| record.request_digest.clone(),
+        )
+    };
+    let material_path = ready.material_path.clone();
+    match start_ready_native_worker_launch(kernel, &ready).await {
+        Ok(ChildStartOutcome::Started(spawned)) => {
+            let native_request = {
+                let launches = launches_table(contour)?;
+                launches
+                    .by_identity
+                    .get(&claim_id)
+                    .and_then(|record| record.native_request.clone())
+            };
+            retain_launch(
+                contour,
+                LaunchRecord {
+                    kind: DispatchedWorkerKind::NativeWorker,
+                    identity: claim_id,
+                    admission_digest: ready.receipt.receipt_digest.clone(),
+                    request_digest,
+                    effect_digest: None,
+                    material_path: Some(material_path),
+                    nonce: ready.nonce.clone(),
+                    operation_id: operation_id_string(&ready.operation_id),
+                    phase: LaunchPhase::Launched,
+                    testd_admission: None,
+                    native_receipt: Some((*ready.receipt).clone()),
+                    native_request,
+                },
+            )?;
+            Ok(NativeWorkerLaunchOutcome::Launched {
+                receipt: ready.receipt,
+                nonce: ready.nonce,
+                operation_id: ready.operation_id,
+                receipt_process: Box::new(spawned.receipt),
+            })
+        }
+        Ok(ChildStartOutcome::Unknown(uncertain)) => {
+            let native_request = {
+                let launches = launches_table(contour)?;
+                launches
+                    .by_identity
+                    .get(&claim_id)
+                    .and_then(|record| record.native_request.clone())
+            };
+            retain_launch(
+                contour,
+                LaunchRecord {
+                    kind: DispatchedWorkerKind::NativeWorker,
+                    identity: claim_id,
+                    admission_digest: ready.receipt.receipt_digest.clone(),
+                    request_digest,
+                    effect_digest: None,
+                    material_path: Some(material_path),
+                    nonce: ready.nonce.clone(),
+                    operation_id: operation_id_string(&uncertain.operation_id),
+                    phase: LaunchPhase::Unreconciled,
+                    testd_admission: None,
+                    native_receipt: Some((*ready.receipt).clone()),
+                    native_request,
+                },
+            )?;
+            Ok(NativeWorkerLaunchOutcome::LaunchUnknown {
+                receipt: ready.receipt,
+                nonce: ready.nonce,
+                operation_id: ready.operation_id,
+            })
+        }
+        Err(error) => {
+            reap_material_file(&material_path);
+            release_launch(contour, &claim_id);
+            Err(error)
+        }
+    }
+}
+
+/// Reconciles one launched-but-unreconciled native-worker claim by its
+/// original identity.
+///
+/// Loads the durable ORS claim record (`NativeWorkerClaimRecord`, the
+/// existing vocabulary) by the original claim identity and compares the
+/// bound receipt digest: no new admission is minted, no new claim id is
+/// computed, and no second child is spawned. The retained receipt is then
+/// re-proved against the retained request through the existing service
+/// owner (`KernelService::reconcile_native_worker_claim_admission`) under
+/// live authority (same-authority epoch). A converged receipt reaps the
+/// dispatch file best-effort and closes the slot; anything still
+/// outstanding stays unreconciled for a later call. Unknown identities
+/// report unknown instead of inventing state.
+pub fn reconcile_launched_native_worker_attempt(
+    kernel: &KernelComposition,
+    claim_id: &str,
+) -> Result<ReconcileLaunchedOutcome, DispatchLaunchError> {
+    let contour = DISPATCH_CONTOUR
+        .get()
+        .ok_or(DispatchLaunchError::Uncomposed("native-worker front door"))?;
+    let retained = {
+        let launches = launches_table(contour)?;
+        launches.by_identity.get(claim_id).cloned()
+    };
+    let Some(retained) = retained.filter(|record| record.kind == DispatchedWorkerKind::NativeWorker)
+    else {
+        return Ok(ReconcileLaunchedOutcome::Unknown {
+            kind: DispatchedWorkerKind::NativeWorker,
+            identity: claim_id.to_owned(),
+        });
+    };
+    let (Some(receipt), Some(request)) = (
+        retained.native_receipt.clone(),
+        retained.native_request.clone(),
+    ) else {
+        return Ok(ReconcileLaunchedOutcome::Unknown {
+            kind: DispatchedWorkerKind::NativeWorker,
+            identity: claim_id.to_owned(),
+        });
+    };
+    // Durable truth: the ORS claim record must still bind this receipt.
+    // Uses the existing `NativeWorkerClaimRecord` vocabulary; never a
+    // parallel type.
+    let record_key = OperationIdentity::new(claim_id)
+        .map_err(|error| DispatchLaunchError::InvalidMaterial(error.to_string()))?;
+    let record: Option<NativeWorkerClaimRecord> = kernel
+        .generation_gateway
+        .ors
+        .load_native_worker_claim(&record_key)
+        .map_err(|error| DispatchLaunchError::Gate(error.to_string()))?;
+    let Some(record) = record else {
+        return Ok(ReconcileLaunchedOutcome::Unknown {
+            kind: DispatchedWorkerKind::NativeWorker,
+            identity: claim_id.to_owned(),
+        });
+    };
+    if record.receipt_digest.as_deref() != Some(receipt.receipt_digest.as_str())
+        || record.binding_digest != receipt.binding_digest
+    {
+        return Err(DispatchLaunchError::Inconsistent(
+            "durable native claim cannot reproduce its receipt".to_owned(),
+        ));
+    }
+    let live_epoch = kernel
+        .service
+        .lock()
+        .map_err(|_| DispatchLaunchError::Gate("kernel service lock poisoned".to_owned()))?
+        .authority_epoch();
+    if !receipt.authority_epoch.is_same_authority(&live_epoch) {
+        return Ok(ReconcileLaunchedOutcome::Unreconciled {
+            kind: DispatchedWorkerKind::NativeWorker,
+            identity: claim_id.to_owned(),
+        });
+    }
+    let binds = kernel
+        .service
+        .lock()
+        .map_err(|_| DispatchLaunchError::Gate("kernel service lock poisoned".to_owned()))?
+        .reconcile_native_worker_claim_admission(&receipt, &request)
+        .map_err(gate_error)?;
+    if binds {
+        if let Some(path) = retained.material_path.as_deref() {
+            reap_material_file(path);
+        }
+        mark_reconciled(contour, claim_id)?;
+        return Ok(ReconcileLaunchedOutcome::Reconciled {
+            kind: DispatchedWorkerKind::NativeWorker,
+            identity: claim_id.to_owned(),
+            admission_digest: retained.admission_digest,
+        });
+    }
+    Ok(ReconcileLaunchedOutcome::Unreconciled {
+        kind: DispatchedWorkerKind::NativeWorker,
+        identity: claim_id.to_owned(),
+    })
 }
 
 #[cfg(test)]
@@ -2294,6 +3331,93 @@ mod tests {
         .expect("request digest")
     }
 
+    fn native_live_fence() -> eliot_contracts::StateFence {
+        eliot_contracts::StateFence::new(test_epoch(1), ResourceGeneration::genesis())
+    }
+
+    fn native_executable_join() -> eliot_kernel_service::NativeWorkerExecutableBinding {
+        // Fixed times bound to the lifecycle admit time (1_750_000_000_000
+        // ms): well-formed (deadline < expiry, non-zero) and live at admit.
+        eliot_kernel_service::NativeWorkerExecutableBinding {
+            route_ref: "route://test/full-canonical-route".to_owned(),
+            adapter_id: "adapter-test".to_owned(),
+            adapter_revision: 3,
+            config_digest: "b".repeat(64),
+            facet_manifest_ref: "facet-manifest-7".to_owned(),
+            grant_graph_revision: 5,
+            replay_stream_id: "stream-claim-t9-02-1/gen-1".to_owned(),
+            launch_nonce: "launch-nonce-0123456789abcdef".to_owned(),
+            process_invocation_digest: "d".repeat(64),
+            authority_epoch: test_epoch(1),
+            generation: ResourceGeneration::genesis(),
+            state_fence: native_live_fence(),
+            deadline_unix_ms: 1_750_000_100_000,
+            expires_at_unix_ms: 1_750_000_200_000,
+            executable_wire_version:
+                eliot_kernel_service::NATIVE_WORKER_EXECUTABLE_BINDING_EXPECTED_WIRE_VERSION,
+            executable_binding_digest: eliot_contracts::sha256_hex(
+                b"dispatch-launch native owner digest stand-in",
+            ),
+        }
+    }
+
+    fn native_claim_request(
+        claim_id: &str,
+        registration_id: &str,
+        attempt_id: &str,
+        operation_id: &str,
+    ) -> eliot_kernel_service::NativeWorkerClaimRequest {
+        use eliot_kernel_service::{
+            NATIVE_WORKER_CLAIM_WIRE_ID, NATIVE_WORKER_CLAIM_WIRE_VERSION,
+            NATIVE_WORKER_EXECUTION_UNIT_SCHEMA_VERSION, NATIVE_WORKER_PROTOCOL_VERSION,
+            NativeWorkerClaimBudget,
+        };
+        let mut request = eliot_kernel_service::NativeWorkerClaimRequest {
+            wire_id: NATIVE_WORKER_CLAIM_WIRE_ID.to_owned(),
+            wire_version: NATIVE_WORKER_CLAIM_WIRE_VERSION,
+            claim_id: claim_id.to_owned(),
+            registration_id: registration_id.to_owned(),
+            worker_generation: 1,
+            installation_id: "installation-1".to_owned(),
+            worker_artifact_digest: "a".repeat(64),
+            worker_config_digest: "b".repeat(64),
+            protocol_version: NATIVE_WORKER_PROTOCOL_VERSION.to_owned(),
+            execution_unit_schema_version: NATIVE_WORKER_EXECUTION_UNIT_SCHEMA_VERSION,
+            parent_job_id: "parent-job-1".to_owned(),
+            task_id: "task-1".to_owned(),
+            work_scope_id: "scope-1".to_owned(),
+            decision_id: "decision-1".to_owned(),
+            attempt_id: attempt_id.to_owned(),
+            operation_id: operation_id.to_owned(),
+            route_class: "test-route".to_owned(),
+            budget: NativeWorkerClaimBudget {
+                context_tokens: 8,
+                wall_time_ms: 1_000,
+                output_bytes: 1_024,
+                cost_microunits: 10,
+                max_depth: 2,
+                max_descendants: 4,
+            },
+            deadline_unix_ms: 1_750_000_120_000,
+            cancellation_policy_id: "cancel-1".to_owned(),
+            expected_result_schema: "result-schema".to_owned(),
+            expected_result_schema_version: 1,
+            predecessor_revision: "rev-1".to_owned(),
+            authority_epoch: test_epoch(1),
+            state_fence: native_live_fence(),
+            executable_binding: Some(native_executable_join()),
+            binding_digest: String::new(),
+            request_digest: String::new(),
+        };
+        request.binding_digest = request.compute_binding_digest().expect("binding digest");
+        request.request_digest = request.canonical_request_digest().expect("request digest");
+        request.validate().expect("claim validates");
+        request
+            .validate_canonical_digest()
+            .expect("canonical digest validates");
+        request
+    }
+
     fn shape_valid_doctor_request() -> DoctorRepairAttemptRequest {
         // Shape-valid (wire plus canonical digest) but carrying no closed
         // repair request: the gate refuses it typed without touching any
@@ -2465,6 +3589,51 @@ mod tests {
         };
         assert_eq!(first_ready.admission.job_id, "job-dispatch-launch-1");
         assert_nonce_shape(&first_ready.nonce);
+        // DISPATCH-CAUSE-FIX: testd prepare now writes material (was None).
+        // The file lives next to the child executable and carries the same
+        // grant object the child uses for its local dispatch authority.
+        let testd_file = child_dir.join(
+            DispatchedWorkerKind::Testd
+                .material_file_name()
+                .expect("testd material file"),
+        );
+        assert_eq!(
+            testd_file,
+            first_ready.material_path,
+            "ready carries the protected dispatch path"
+        );
+        assert!(
+            testd_file.exists(),
+            "testd prepare writes the admitted-attempt material file"
+        );
+        let testd_bytes = std::fs::read(&testd_file).expect("read testd material");
+        let testd_json: serde_json::Value =
+            serde_json::from_slice(&testd_bytes).expect("testd material is JSON");
+        let testd_object = testd_json.as_object().expect("testd material object");
+        for key in [
+            "request",
+            "envelope",
+            "admission",
+            "epoch",
+            "generation",
+            "nonce",
+            "grant",
+        ] {
+            assert!(
+                testd_object.contains_key(key),
+                "testd material carries {key}"
+            );
+        }
+        let testd_grant: DispatchGrant =
+            serde_json::from_value(testd_object["grant"].clone()).expect("testd grant parses");
+        assert_eq!(testd_grant.authority_epoch, epoch);
+        assert_eq!(testd_grant.fence_generation, 1);
+        testd_grant.validate_for_child().expect("testd grant validates");
+        assert_eq!(
+            testd_object["nonce"],
+            serde_json::json!(first_ready.nonce),
+            "material nonce equals the retained session nonce"
+        );
         // An exact resubmit reconciles by the retained original admission
         // (original admitted-at time and digest), never a recompute.
         let second = prepare_testd_launch(&kernel, &material, now_nanos + 1_000_000)
@@ -2507,6 +3676,12 @@ mod tests {
             reconcile,
             ReconcileLaunchedOutcome::Reconciled { .. }
         ));
+        // Reconcile reaps the dispatch file best-effort so a stale
+        // presentation never lingers.
+        assert!(
+            !testd_file.exists(),
+            "reconciled testd material is reaped"
+        );
         // A stale release never frees the slot; the exact release does.
         assert!(
             !release_launched_attempt(
@@ -2535,6 +3710,128 @@ mod tests {
             ReconcileLaunchedOutcome::Unknown { .. }
         ));
 
+        // 5b. Native-worker prepare reserves, writes material with the same
+        // grant object, replays by the retained original, reconciles by the
+        // ORS record, and releases. Real admission through the live service
+        // plus the real ORS claim table; no mocks.
+        assert_eq!(
+            DispatchedWorkerKind::NativeWorker.module_id(),
+            "eliot-native-worker"
+        );
+        assert_eq!(
+            DispatchedWorkerKind::NativeWorker.wire_id(),
+            "eliot.kernel.native-worker-claim"
+        );
+        assert_eq!(
+            DispatchedWorkerKind::NativeWorker.material_file_name(),
+            Some("eliot-native-worker.admitted-claim.json")
+        );
+        let native_request =
+            native_claim_request("claim-dispatch-1", "reg-dispatch-1", "attempt-1", "op-1");
+        let native_material = NativeWorkerLaunchMaterial {
+            request: &native_request,
+            executable: &child_dir.join("eliot-native-worker.exe"),
+            executable_sha256: &"ef".repeat(32),
+            working_directory: &child_dir,
+        };
+        let native_first =
+            prepare_native_worker_launch(&kernel, &native_material, now_nanos).expect("prepare");
+        let PreparedNativeWorkerLaunch::Ready(native_ready) = native_first else {
+            panic!("first native prepare must be ready");
+        };
+        assert_eq!(native_ready.receipt.claim_id, "claim-dispatch-1");
+        assert_nonce_shape(&native_ready.nonce);
+        let native_file = child_dir.join(
+            DispatchedWorkerKind::NativeWorker
+                .material_file_name()
+                .expect("native material file"),
+        );
+        assert_eq!(
+            native_file, native_ready.material_path,
+            "native ready carries the protected dispatch path"
+        );
+        assert!(
+            native_file.exists(),
+            "native prepare writes the admitted-claim material file"
+        );
+        let native_bytes = std::fs::read(&native_file).expect("read native material");
+        let native_json: serde_json::Value =
+            serde_json::from_slice(&native_bytes).expect("native material is JSON");
+        let native_object = native_json.as_object().expect("native material object");
+        for key in [
+            "request",
+            "receipt",
+            "epoch",
+            "generation",
+            "nonce",
+            "grant",
+        ] {
+            assert!(
+                native_object.contains_key(key),
+                "native material carries {key}"
+            );
+        }
+        let native_grant: DispatchGrant =
+            serde_json::from_value(native_object["grant"].clone()).expect("native grant parses");
+        assert_eq!(native_grant.authority_epoch, epoch);
+        native_grant.validate_for_child().expect("native grant validates");
+        assert_eq!(
+            native_object["nonce"],
+            serde_json::json!(native_ready.nonce),
+            "native material nonce equals the retained session nonce"
+        );
+        // Exact resubmit replays the original receipt, never a recompute.
+        let native_second =
+            prepare_native_worker_launch(&kernel, &native_material, now_nanos + 1_000_000)
+                .expect("replay prepare");
+        let PreparedNativeWorkerLaunch::ReplayOriginal {
+            receipt: native_replayed,
+        } = native_second
+        else {
+            panic!("exact native resubmit must replay the original");
+        };
+        assert_eq!(
+            native_replayed.receipt_digest, native_ready.receipt.receipt_digest,
+            "native replay reconciles by the original receipt identity"
+        );
+        // Reconcile proves the durable ORS record still binds the receipt.
+        let native_reconcile =
+            reconcile_launched_native_worker_attempt(&kernel, "claim-dispatch-1")
+                .expect("native reconcile");
+        assert!(matches!(
+            native_reconcile,
+            ReconcileLaunchedOutcome::Reconciled { .. }
+        ));
+        assert!(
+            !native_file.exists(),
+            "reconciled native material is reaped"
+        );
+        // Release uses the retained request digest (the ORS-backed binding),
+        // never a recomputed id: stale digests never free the slot.
+        assert!(
+            !release_launched_attempt(
+                DispatchedWorkerKind::NativeWorker,
+                "claim-dispatch-1",
+                &"00".repeat(32),
+            )
+            .expect("stale native release"),
+            "stale native release never frees the slot"
+        );
+        assert!(
+            release_launched_attempt(
+                DispatchedWorkerKind::NativeWorker,
+                "claim-dispatch-1",
+                &native_request.request_digest,
+            )
+            .expect("exact native release"),
+            "exact native release frees the slot"
+        );
+        assert!(matches!(
+            reconcile_launched_native_worker_attempt(&kernel, "claim-dispatch-1")
+                .expect("native reconcile after release"),
+            ReconcileLaunchedOutcome::Unknown { .. }
+        ));
+
         // 6. Launch without a configured executor fails closed: no spawn,
         // no retained slot.
         let launch_material = TestdLaunchMaterial {
@@ -2551,6 +3848,10 @@ mod tests {
             launch_admitted_testd_attempt(&kernel, &launch_material, now_nanos).await,
             Err(DispatchLaunchError::ExecutorUnavailable)
         ));
+        assert!(
+            !child_dir.join("eliot-testd.admitted-attempt.json").exists(),
+            "failed testd launch reaps its material and releases the slot"
+        );
         assert!(matches!(
             reconcile_launched_testd_attempt(
                 &kernel,
@@ -2688,7 +3989,7 @@ mod tests {
 
     /// The Doctor dispatch file carries exactly the six fields the child
     /// reader validates, with the envelope bytes, digest, epoch,
-    /// generation, and nonce bound.
+    /// generation, and nonce bound, plus the additive launch grant.
     #[test]
     fn doctor_material_bytes_carries_exactly_the_child_shape() {
         let attempt = shape_valid_doctor_request();
@@ -2702,13 +4003,32 @@ mod tests {
             PRINCIPAL,
         )
         .expect("nonce");
-        let bytes =
-            doctor_material_bytes(&attempt, &request_json, &manifest_json, &epoch, 7, &nonce)
-                .expect("material bytes");
+        let grant = dispatch_grant_for(
+            DispatchedWorkerKind::Doctor,
+            &"a".repeat(64),
+            &epoch,
+            Generation::new(7).expect("generation"),
+            1_750_000_000_000_000_000,
+        )
+        .expect("grant");
+        let bytes = doctor_material_bytes(
+            &attempt,
+            &request_json,
+            &manifest_json,
+            &epoch,
+            7,
+            &nonce,
+            &grant,
+        )
+        .expect("material bytes");
         assert!(u64::try_from(bytes.len()).unwrap_or(u64::MAX) <= 256 * 1024);
         let envelope: serde_json::Value = serde_json::from_slice(&bytes).expect("envelope json");
         let object = envelope.as_object().expect("envelope object");
-        assert_eq!(object.len(), 6, "exactly the six child-validated fields");
+        assert_eq!(
+            object.len(),
+            7,
+            "six child-validated fields plus the additive grant"
+        );
         for key in [
             "attempt",
             "request",
@@ -2716,6 +4036,7 @@ mod tests {
             "epoch",
             "generation",
             "nonce",
+            "grant",
         ] {
             assert!(object.contains_key(key), "envelope carries {key}");
         }
@@ -2738,16 +4059,50 @@ mod tests {
         assert_eq!(live, epoch);
         assert_eq!(object["generation"], serde_json::json!(7u64));
         assert_eq!(object["nonce"], serde_json::json!(nonce));
+        // Additive grant: exact field names and broker-compatible types.
+        let grant_value = object["grant"].clone();
+        let grant_object = grant_value.as_object().expect("grant object");
+        assert_eq!(grant_object.len(), 6, "grant carries exactly six fields");
+        for key in [
+            "grant_digest",
+            "authority_epoch",
+            "fence_generation",
+            "fence_nonce",
+            "idempotency_key",
+            "expires_at",
+        ] {
+            assert!(grant_object.contains_key(key), "grant carries {key}");
+        }
+        let parsed_grant: DispatchGrant =
+            serde_json::from_value(grant_value).expect("grant parses");
+        assert_eq!(parsed_grant, grant);
+        // The grant validates through the exact broker constructors.
+        let (fence, lease) = parsed_grant.validate_for_child().expect("grant validates");
+        assert!(fence.authority_epoch().is_same_authority(&epoch));
+        assert_eq!(fence.generation().get(), 7);
+        assert_eq!(parsed_grant.fence_generation, 7);
+        assert!(!parsed_grant.fence_nonce.is_empty());
+        assert!(!parsed_grant.idempotency_key.is_empty());
+        assert!(parsed_grant.expires_at > 0);
+        let _ = lease;
     }
 
-    /// The contour parameterizes Doctor vs testd delivery endpoints without
-    /// inventing a second vocabulary.
+    /// The contour parameterizes Doctor vs testd vs native-worker delivery
+    /// endpoints without inventing a second vocabulary.
     #[test]
     fn worker_kinds_share_the_seam_with_split_delivery() {
         assert_eq!(DispatchedWorkerKind::Doctor.module_id(), "eliot-doctor");
         assert_eq!(
             DispatchedWorkerKind::Testd.module_id(),
             DispatchedWorkerKind::Testd.module_id()
+        );
+        assert_eq!(
+            DispatchedWorkerKind::NativeWorker.module_id(),
+            "eliot-native-worker"
+        );
+        assert_eq!(
+            DispatchedWorkerKind::NativeWorker.module_id(),
+            NATIVE_MODULE_ID
         );
         assert_eq!(
             DispatchedWorkerKind::Doctor.wire_id(),
@@ -2758,9 +4113,31 @@ mod tests {
             TESTD_ADMISSION_WIRE_ID
         );
         assert_eq!(
+            DispatchedWorkerKind::NativeWorker.wire_id(),
+            eliot_kernel_service::NATIVE_WORKER_CLAIM_WIRE_ID
+        );
+        assert_eq!(
+            DispatchedWorkerKind::NativeWorker.wire_id(),
+            "eliot.kernel.native-worker-claim"
+        );
+        assert_eq!(
             DispatchedWorkerKind::Doctor.material_file_name(),
             Some("eliot-doctor.dispatched-attempt.json")
         );
-        assert_eq!(DispatchedWorkerKind::Testd.material_file_name(), None);
+        assert_eq!(
+            DispatchedWorkerKind::Testd.material_file_name(),
+            Some("eliot-testd.admitted-attempt.json")
+        );
+        assert_eq!(
+            DispatchedWorkerKind::NativeWorker.material_file_name(),
+            Some("eliot-native-worker.admitted-claim.json")
+        );
+        // The native file name equals the child reader constant by
+        // construction (the child reader stays the authority; this seam
+        // duplicates the literal and the focused test below re-asserts it).
+        assert_eq!(
+            DispatchedWorkerKind::NativeWorker.material_file_name(),
+            Some("eliot-native-worker.admitted-claim.json")
+        );
     }
 }

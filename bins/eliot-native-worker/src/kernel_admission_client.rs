@@ -22,17 +22,21 @@
 //! of process requests or permits. Transport errors stay transport errors:
 //! they are never mapped to readiness, admission, or success.
 
+use std::sync::{Arc, Mutex};
+
 use eliot_cli::kernel_client::{KernelClient, KernelClientError};
 use eliot_native_worker_core::{
-    ClaimAdmissionRequest, DurableReplayPort, DurableRequestDecision, EventAckReceipt,
-    NativeCancellationEnvelope, NativeCheckpointEnvelope, NativeHeartbeatEnvelope,
-    NativeLifecycleBinding, NativeReadyReport, NativeResultEnvelope, NativeWorkerClaim,
-    NativeWorkerReadiness, NativeWorkerRegistration, ProviderFailure, ReadinessSubmission,
-    WorkerEventDraft, WorkerEventEnvelope,
+    CheckpointProviderOutcome, CheckpointReceiptFacts, ClaimAdmissionRequest,
+    DurableCheckpointPort, DurableCheckpointRequest, DurableReplayPort, DurableRequestDecision,
+    EventAckReceipt, NativeCancellationEnvelope, NativeCheckpointEnvelope, NativeCheckpointId,
+    NativeHeartbeatEnvelope, NativeLifecycleBinding, NativeReadyReport, NativeResultEnvelope,
+    NativeWorkerClaim, NativeWorkerReadiness, NativeWorkerRegistration, ProviderFailure,
+    ReadinessSubmission, WorkerEventDraft, WorkerEventEnvelope,
 };
 use serde::{Deserialize, Serialize};
 
 use super::NativeWorkerError;
+use crate::AdmittedLifecycle;
 
 /// Registers (or renews) one worker generation. Paired with the Kernel route.
 pub const NATIVE_WORKER_REGISTRATION_OPERATION: &str = "native_worker.registration";
@@ -1069,4 +1073,161 @@ fn unix_ms() -> Result<u64, NativeWorkerError> {
 
 pub(super) fn kernel_admission_error(error: &KernelClientError) -> NativeWorkerError {
     NativeWorkerError::KernelAdmissionRequired(error.to_string())
+}
+
+/// Shareable handle over one authenticated Kernel front-door session.
+///
+/// The admitted drive needs the same session twice at different times: as
+/// the [`AdmittedLifecycle`] transport (register, claim, reconcile,
+/// readiness) and as the [`KernelReplayTransport`] behind the thin replay
+/// port. Both handles lock the one client, so the retained
+/// registration/claim/Ready echo checks stay coherent. Lock poisoning fails
+/// closed; it never mints, replays, or synthesizes a reply.
+#[derive(Clone)]
+pub struct SharedKernelTransport {
+    /// The single connected client behind both handles.
+    inner: Arc<Mutex<KernelNativeWorkerClient>>,
+}
+
+impl SharedKernelTransport {
+    /// Shares one connected client between the lifecycle and replay handles.
+    #[must_use]
+    pub fn new(client: KernelNativeWorkerClient) -> Self {
+        Self {
+            inner: Arc::new(Mutex::new(client)),
+        }
+    }
+
+    /// Locks the client or fails closed on poison.
+    fn lock(
+        &self,
+    ) -> Result<std::sync::MutexGuard<'_, KernelNativeWorkerClient>, NativeWorkerError> {
+        self.inner.lock().map_err(|_| {
+            NativeWorkerError::KernelAdmissionRequired("Kernel transport lock poisoned".to_owned())
+        })
+    }
+}
+
+impl AdmittedLifecycle for SharedKernelTransport {
+    fn submit_registration(
+        &mut self,
+        registration: &NativeWorkerRegistration,
+    ) -> Result<serde_json::Value, NativeWorkerError> {
+        self.lock()?.submit_registration(registration)
+    }
+
+    fn submit_claim(
+        &mut self,
+        admission: &ClaimAdmissionRequest,
+    ) -> Result<serde_json::Value, NativeWorkerError> {
+        self.lock()?.submit_claim(admission)
+    }
+
+    fn submit_reconcile(
+        &mut self,
+        submission: &crate::ReconcileSubmission,
+    ) -> Result<serde_json::Value, NativeWorkerError> {
+        self.lock()?.submit_reconcile(submission)
+    }
+
+    fn submit_readiness(
+        &mut self,
+        submission: &ReadinessSubmission,
+    ) -> Result<serde_json::Value, NativeWorkerError> {
+        self.lock()?.submit_readiness(submission)
+    }
+}
+
+impl KernelReplayTransport for SharedKernelTransport {
+    fn transact(
+        &mut self,
+        operation: &str,
+        payload: serde_json::Value,
+    ) -> Result<serde_json::Value, NativeWorkerError> {
+        self.lock()?.transact(operation, payload)
+    }
+}
+
+/// Durable checkpoint port over the authenticated Kernel transport.
+///
+/// Builds the checkpoint envelope from the durable request plus the retained
+/// admitted claim (every binding field echoes the claim, so a rewired
+/// request is refused before any transport runs), submits it through the
+/// shared session — the Kernel verdict is authoritative, and a refusal fails
+/// the persist — then seals the request-bound receipt facts the worker
+/// re-validates against the submitted request. Used only for serve-time
+/// checkpoint frames, which arrive after the Ready receipt exists, so the
+/// transport's Ready binding is always satisfied here.
+pub struct KernelCheckpointPort {
+    /// Shared authenticated session.
+    transport: SharedKernelTransport,
+    /// Exact admitted claim every checkpoint is stored under.
+    claim: NativeWorkerClaim,
+}
+
+impl KernelCheckpointPort {
+    /// Binds one exact admitted claim to the checkpoint transport.
+    pub fn new(
+        transport: SharedKernelTransport,
+        claim: NativeWorkerClaim,
+    ) -> Result<Self, NativeWorkerError> {
+        claim.validate().map_err(NativeWorkerError::from)?;
+        Ok(Self { transport, claim })
+    }
+}
+
+impl DurableCheckpointPort for KernelCheckpointPort {
+    fn persist_checkpoint(
+        &mut self,
+        request: &DurableCheckpointRequest,
+    ) -> Result<CheckpointProviderOutcome, ProviderFailure> {
+        let now = unix_ms().map_err(provider_error)?;
+        let checkpoint_id = NativeCheckpointId::new(request.request_id().to_owned())
+            .or_else(|_| {
+                NativeCheckpointId::new(format!(
+                    "native-worker-checkpoint-{}",
+                    request.checkpoint_ref()
+                ))
+            })
+            .map_err(|error| ProviderFailure::new("kernel-checkpoint", error.to_string()))?;
+        let receipt_id = checkpoint_id.as_str().to_owned();
+        let envelope = NativeCheckpointEnvelope {
+            checkpoint_id,
+            binding: NativeLifecycleBinding {
+                claim_id: self.claim.claim_id.clone(),
+                attempt_id: self.claim.attempt_id.clone(),
+                operation_id: self.claim.operation_id.clone(),
+                worker_generation: self.claim.worker_generation,
+                route_class: self.claim.route_class.clone(),
+                predecessor_revision: self.claim.predecessor_revision.clone(),
+                authority_epoch: self.claim.authority_epoch.clone(),
+                state_fence: self.claim.state_fence.clone(),
+            },
+            checkpoint_ref: request.checkpoint_ref().to_owned(),
+            observed_at_unix_ms: now,
+        };
+        envelope
+            .validate()
+            .map_err(|error| ProviderFailure::new("kernel-checkpoint", error.to_string()))?;
+        self.transport
+            .lock()
+            .map_err(provider_error)?
+            .submit_checkpoint(&envelope)
+            .map_err(|error| ProviderFailure::new("kernel-checkpoint", error.to_string()))?;
+        Ok(CheckpointProviderOutcome::Stored(Box::new(
+            CheckpointReceiptFacts::new(
+                receipt_id,
+                request.checkpoint_ref(),
+                request.request_id(),
+                request.stream_id(),
+                request.producer_generation(),
+                request.authority_epoch().clone(),
+                request.state_fence().clone(),
+                request.admission_revision(),
+                request.operation_id().clone(),
+                request.process_request_digest(),
+                now,
+            ),
+        )))
+    }
 }

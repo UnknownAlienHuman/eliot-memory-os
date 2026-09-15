@@ -18,7 +18,9 @@ eliot-cli.workspace = true
 eliot-contracts.workspace = true
 eliot-doctor-core.workspace = true
 eliot-kernel-service.workspace = true
+eliot-platform.workspace = true
 eliot-process.workspace = true
+eliot-process-executor.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
@@ -30,4 +32,3 @@ workspace = true
 
 [dev-dependencies]
 eliot-instrument-api.workspace = true
-eliot-platform.workspace = true

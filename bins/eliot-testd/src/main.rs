@@ -5,13 +5,34 @@ use std::io::{self, Write};
 use eliot_process::ProcessExecutor;
 use eliot_testd::{
     ADMITTED_WORKER_LEASE_MS, PROTOCOL_VERSION, SERVICE_NAME, TestReceipt, TestdComposition,
-    kernel_client::{KernelTestdIpcClient, PresentedAdmission, TESTD_DISPATCH_RESIDUAL},
+    kernel_client::{KernelTestdIpcClient, PresentedAdmission},
     run_admitted_one_shot,
+    testd_material::{ValidatedTestdMaterial, read_testd_material},
 };
 
 const EXIT_KERNEL_ADMISSION_REQUIRED: i32 = 78;
 const KERNEL_ADMISSION_REQUIRED: &str = "KERNEL_ADMISSION_REQUIRED";
 const OPERATION: &str = "eliot.instrument.test.execute";
+
+/// Residual: the admitted material carries no executable binding, so no
+/// [`ProcessIntent`][eliot_process::ProcessIntent] can be derived without
+/// inventing authority. The kernel `TestdAdmissionEnvelope` is exactly
+/// `{job_id, operation_id, cancellation, fence}` (no executable, argv,
+/// working directory, environment, or limits;
+/// `crates/kernel/eliot-kernel-service/src/testd_front_door.rs`), the
+/// concrete [`ProcessRequest`][eliot_process::ProcessRequest] is
+/// `Serialize`-only by design (neither `Clone` nor `Deserialize`, so the
+/// contour never serializes it and this child never deserializes it;
+/// `crates/kernel/eliot-process/src/lib.rs`), and this binary owns no
+/// registry mapping an admitted profile to an executable binding.
+const TESTD_INTENT_RESIDUAL: &str = "issue-20 testd dispatch: admitted material carries no executable binding for ProcessIntent (envelope is job/operation/cancellation/fence only; ProcessRequest is Serialize-only; no profile registry in this binary)";
+/// Residual: the broker-mirror dispatch authority cannot be constructed in
+/// this composition root. `DispatchValidationContext::new` requires
+/// `eliot_platform::ClockObservation`
+/// (`crates/kernel/eliot-process/src/lib.rs`), and this binary has no
+/// `eliot-platform` dependency and takes none; any `validate_and_consume`
+/// without that context would forge validation.
+const TESTD_AUTHORITY_RESIDUAL: &str = "issue-20 testd dispatch: DispatchValidationContext requires eliot_platform::ClockObservation, which this composition root does not depend on; no validate_and_consume without it";
 
 /// Admitted-path terminal codes.
 ///
@@ -82,26 +103,27 @@ fn bootstrap_and_run_once() -> i32 {
         return deny();
     };
     // Session-bound admission arrives only with the dispatch launch as
-    // in-memory state (the concrete process request is never deserialized,
-    // so no byte surface can present it). Until that seam lands, every
-    // invocation reports absence and keeps the fail-closed path.
+    // the validated material file next to this executable (never via argv,
+    // stdin, or environment). Absence reports `None` and keeps the
+    // fail-closed path; a present but invalid file likewise reports `None`
+    // (the reader leaves it in place for forensics) and keeps the same
+    // fail-closed path.
     let presented = acquire_presented_admission();
     match gate_after_advertise(advertised, presented.is_some()) {
         GateDecision::Drive => {
             let Some(material) = presented else {
                 return deny();
             };
-            // The dispatch launch seam provisions the execution context
-            // (durable store handle plus bound executor) alongside the
-            // material; this binary invents neither a store path nor
-            // executor authority, so the drive below stays wired but
-            // unreached until that delivery lands
-            // (residual=`TESTD_DISPATCH_RESIDUAL`). Drive still denies in
-            // bins scope; the worker itself is the admitted one-shot driver
+            // The file validated, so this invocation carries admitted
+            // session-bound material. Dispatch still cannot drive: building
+            // the in-process permit needs an executable-bound ProcessIntent
+            // plus a ClockObservation-bound validation context, and the
+            // admitted material supplies neither (see TESTD_INTENT_RESIDUAL
+            // and TESTD_AUTHORITY_RESIDUAL). The denial below names both
+            // exact absences instead of the former generic dispatch
+            // residual; the worker itself stays the admitted one-shot driver
             // and is exercised through `run_admitted_one_shot`.
-            let _ = material;
-            let _ = TESTD_DISPATCH_RESIDUAL;
-            deny()
+            deny_presented_without_dispatch(&material)
         }
         GateDecision::DenyNotAdvertised | GateDecision::DenyNoPresentedAttempt => deny(),
     }
@@ -109,15 +131,33 @@ fn bootstrap_and_run_once() -> i32 {
 
 /// Reports the session-bound admission presented to this invocation, if any.
 ///
-/// The envelope plus the concrete in-memory process request plus the live
-/// epoch arrive only with the kernel dispatch launch as process-inherited
-/// state, never via argv, stdin, environment, or files. Until that launch
-/// seam lands ([`TESTD_DISPATCH_RESIDUAL`]), no invocation presents material
-/// and this reports absence, keeping the exact `DenyNoPresentedAttempt` path.
-/// When the seam lands, this function is its single integration point: it
-/// will return the delivered [`PresentedAdmission`] instead of absence.
-fn acquire_presented_admission() -> Option<PresentedAdmission> {
-    None
+/// Reads the dispatch-contour material file next to this executable
+/// ([`TESTD_MATERIAL_FILE_NAME`][eliot_testd::testd_material::TESTD_MATERIAL_FILE_NAME]);
+/// no value is taken from argv, stdin, or environment. Absence reports
+/// `None` and keeps the exact `DenyNoPresentedAttempt` path; a present but
+/// invalid file is refused fail-closed by the reader (left in place, never
+/// driven) and likewise reports `None`. When the remaining dispatch
+/// bindings land (executable-bound intent plus authority context), this
+/// function remains the single integration point that maps validated
+/// material onto the drive.
+fn acquire_presented_admission() -> Option<ValidatedTestdMaterial> {
+    read_testd_material().unwrap_or_default()
+}
+
+/// Denies a presented-but-undrivable admission without effect.
+///
+/// The material validated, so admission is genuinely presented; execution is
+/// refused only because the two remaining dispatch bindings are absent (see
+/// `TESTD_INTENT_RESIDUAL` and `TESTD_AUTHORITY_RESIDUAL`). Prints the
+/// exact residuals instead of the former generic dispatch residual and exits
+/// 78 like every other pre-drive denial. No admitted outcome ever exits 78.
+fn deny_presented_without_dispatch(material: &ValidatedTestdMaterial) -> i32 {
+    let _ = writeln!(
+        io::stderr(),
+        "{KERNEL_ADMISSION_REQUIRED}: service={SERVICE_NAME} protocol={PROTOCOL_VERSION} operation={OPERATION} job={} presented=admitted-material residual_intent={TESTD_INTENT_RESIDUAL} residual_authority={TESTD_AUTHORITY_RESIDUAL}",
+        material.job_id,
+    );
+    EXIT_KERNEL_ADMISSION_REQUIRED
 }
 
 /// Drives one admitted one-shot through the worker and projects the typed
@@ -233,6 +273,163 @@ mod tests {
     #[test]
     fn no_presented_material_without_launch_seam() {
         assert!(acquire_presented_admission().is_none());
+    }
+
+    /// Valid dispatch material built through the real broker constructors
+    /// reaches the Drive arm; material with a foreign grant epoch is refused
+    /// fail-closed and left in place.
+    ///
+    /// Every identity here is real: the epoch comes from
+    /// `EpochId::new` over a parsed lineage, the fence and lease come from
+    /// `FencingToken::new` / `ActionLeaseRef::new` / `Generation::new`, and
+    /// every digest is recomputed over the exact kernel canonical shapes
+    /// with `canonical_json_bytes` plus `sha256_hex`. No mock, fake, or
+    /// canned digest participates.
+    #[test]
+    fn valid_material_with_real_grant_reaches_drive_and_foreign_grant_refused() {
+        use eliot_testd::testd_material::read_testd_material_from;
+
+        let live = dcf_test_epoch(7);
+        let valid_path = dcf_stage_material(&live, &live, "valid.admitted-attempt.json");
+        let Ok(material) = read_testd_material_from(&valid_path) else {
+            panic!("valid material must validate");
+        };
+        let Some(material) = material else {
+            panic!("valid material must present");
+        };
+        assert_eq!(material.job_id, "job-testd-dcf-1");
+        assert_eq!(material.operation_id, "testd-op-1");
+        assert!(material.epoch.is_same_authority(&live));
+        assert_eq!(material.generation, 1);
+        assert!(!material.cancelled);
+        assert!(!material.grant_digest.is_empty());
+        // Valid presentation is the only Drive arm.
+        assert_eq!(gate_after_advertise(true, true), GateDecision::Drive);
+        // A validated presentation is consumed once and never replays.
+        assert!(!valid_path.exists());
+
+        // A foreign grant epoch disagrees with the carried epoch and is
+        // refused fail-closed before any drive; the file is left for
+        // forensics instead of consumed.
+        let foreign = dcf_test_epoch(9);
+        let foreign_path = dcf_stage_material(&live, &foreign, "foreign.admitted-attempt.json");
+        assert!(read_testd_material_from(&foreign_path).is_err());
+        assert!(foreign_path.exists());
+
+        if let Some(parent) = valid_path.parent() {
+            let _ = std::fs::remove_dir_all(parent);
+        }
+    }
+
+    fn dcf_test_epoch(sequence: u64) -> eliot_contracts::EpochId {
+        use std::num::NonZeroU64;
+        let Ok(lineage) =
+            eliot_contracts::EpochLineageId::new("550e8400-e29b-41d4-a716-446655440000")
+        else {
+            panic!("test lineage must parse");
+        };
+        let Some(sequence) = NonZeroU64::new(sequence) else {
+            panic!("test sequence must be non-zero");
+        };
+        let Ok(epoch) = eliot_contracts::EpochId::new(lineage, sequence) else {
+            panic!("test epoch must build");
+        };
+        epoch
+    }
+
+    fn dcf_test_now_nanos() -> u64 {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |duration| duration.as_nanos());
+        u64::try_from(nanos).unwrap_or(u64::MAX)
+    }
+
+    fn dcf_canonical_hex(value: &serde_json::Value) -> String {
+        let Ok(bytes) = eliot_contracts::canonical_json_bytes(value) else {
+            panic!("test value must canonicalize");
+        };
+        eliot_contracts::sha256_hex(&bytes)
+    }
+
+    fn dcf_stage_material(
+        epoch: &eliot_contracts::EpochId,
+        grant_epoch: &eliot_contracts::EpochId,
+        file_name: &str,
+    ) -> std::path::PathBuf {
+        use eliot_process::{ActionLeaseRef, FencingToken, Generation};
+        use eliot_testd::testd_material::{TESTD_MATERIAL_WIRE_ID, TESTD_MATERIAL_WIRE_VERSION};
+
+        let Ok(generation) = Generation::new(1) else {
+            panic!("test generation must build");
+        };
+        let Ok(fence) = FencingToken::new(
+            grant_epoch.clone(),
+            generation,
+            "testd-fence-abc123".to_owned(),
+        ) else {
+            panic!("test fence must build");
+        };
+        // The lease rebuilds through the exact broker constructor, so a
+        // malformed lease could never reach the reader.
+        assert!(ActionLeaseRef::new("testd-lease-abc123".to_owned()).is_ok());
+        let Ok(fence_value) = serde_json::to_value(&fence) else {
+            panic!("test fence must serialize");
+        };
+        let envelope = serde_json::json!({"job_id": "job-testd-dcf-1", "operation_id": "testd-op-1", "cancellation": false, "fence": fence_value});
+        let Ok(closed_request_json) = serde_json::to_string(&envelope) else {
+            panic!("test envelope must serialize");
+        };
+        let target_resource_digest = eliot_contracts::sha256_hex(b"testd-target-resource");
+        let request_digest = dcf_canonical_hex(
+            &serde_json::json!({"wire_id": TESTD_MATERIAL_WIRE_ID, "wire_version": TESTD_MATERIAL_WIRE_VERSION, "job_id": "job-testd-dcf-1", "attempt_seq": 0, "closed_request_json": closed_request_json, "target_resource_digest": target_resource_digest}),
+        );
+        let admitted_at = dcf_test_now_nanos();
+        assert_ne!(admitted_at, 0);
+        let admission_digest = dcf_canonical_hex(
+            &serde_json::json!({"wire_id": TESTD_MATERIAL_WIRE_ID, "wire_version": TESTD_MATERIAL_WIRE_VERSION, "job_id": "job-testd-dcf-1", "request_digest": request_digest, "operation_id": "testd-op-1", "cancelled": false, "admitted_at_unix_nanos": admitted_at}),
+        );
+        let Ok(epoch_json) = serde_json::to_string(grant_epoch) else {
+            panic!("test epoch must serialize");
+        };
+        // Kernel expiry is Unix milliseconds (admitted ms plus 60 s);
+        // mirror that unit so the freshness proof is exact.
+        let now_ms = dcf_test_now_nanos() / 1_000_000;
+        let expires_at = now_ms.saturating_add(60_000);
+        assert!(expires_at > now_ms);
+        let mut grant_material = String::with_capacity(256);
+        grant_material.push_str(&request_digest);
+        grant_material.push('|');
+        grant_material.push_str(&epoch_json);
+        grant_material.push_str("|1|testd-fence-abc123|testd-lease-abc123|");
+        grant_material.push_str(&expires_at.to_string());
+        let grant_digest = eliot_contracts::sha256_hex(grant_material.as_bytes());
+        let nonce = format!("testd-dispatch-{}-{admitted_at}", std::process::id());
+        let Ok(epoch_value) = serde_json::to_value(epoch) else {
+            panic!("test epoch must serialize");
+        };
+        let Ok(grant_epoch_value) = serde_json::to_value(grant_epoch) else {
+            panic!("test grant epoch must serialize");
+        };
+        let file = serde_json::json!({
+            "request": {"wire_id": TESTD_MATERIAL_WIRE_ID, "wire_version": TESTD_MATERIAL_WIRE_VERSION, "job_id": "job-testd-dcf-1", "attempt_seq": 0, "closed_request_json": closed_request_json, "target_resource_digest": target_resource_digest, "request_digest": request_digest},
+            "envelope": envelope,
+            "admission": {"wire_id": TESTD_MATERIAL_WIRE_ID, "wire_version": TESTD_MATERIAL_WIRE_VERSION, "job_id": "job-testd-dcf-1", "request_digest": request_digest, "operation_id": "testd-op-1", "cancelled": false, "admitted_at_unix_nanos": admitted_at, "admission_digest": admission_digest},
+            "epoch": epoch_value,
+            "generation": 1,
+            "nonce": nonce,
+            "grant": {"grant_digest": grant_digest, "authority_epoch": grant_epoch_value, "fence_generation": 1, "fence_nonce": "testd-fence-abc123", "idempotency_key": "testd-lease-abc123", "expires_at": expires_at},
+        });
+        let Ok(bytes) = serde_json::to_vec(&file) else {
+            panic!("test material must serialize");
+        };
+        let dir = std::env::temp_dir().join(format!(
+            "eliot-testd-dcf-{}-{admitted_at}",
+            std::process::id()
+        ));
+        let path = dir.join(file_name);
+        assert!(std::fs::create_dir_all(&dir).is_ok());
+        assert!(std::fs::write(&path, bytes).is_ok());
+        path
     }
 
     #[test]
