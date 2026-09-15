@@ -27,7 +27,13 @@
 //! `task_id`, `event_id`, optional `from`, `to`, `expected_revision`,
 //! `actor_ref`) plus the `ApplyEpistemicRevision` mutation (T11.2: persists
 //! `TransitionClass::Epistemic` with the `EffectClass::Candidate`
-//! ceiling and carries the single `revision` epistemic-revision payload).
+//! ceiling and carries the single `revision` epistemic-revision payload),
+//! plus T11.3 (issue #18) the four cognitive reads `GetTaskState`
+//! (`task_id` + `max_records`), `GetAttentionAndProblems` (optional
+//! `problem_id` + `max_records`), `GetUnderstandingProjectionInputs`
+//! (`selector` + `max_records`), and `GetCapabilityEvidenceState`
+//! (`skill_id` + `max_records`), each scope-addressed and bounded like
+//! `GetEvidencePack`.
 //! Every other [`NamedReadOperation`](crate::NamedReadOperation) variant and
 //! every other [`NamedMutationOperation`](crate::NamedMutationOperation)
 //! variant stays known-but-unsupported and unadvertised, and no other mutation
@@ -48,7 +54,12 @@
 //! `ReconcileRecovery`, the six task-control fields for `UpdateTaskState`
 //! (`task_id`, `event_id`, optional `from`, `to`, `expected_revision`,
 //! `actor_ref`), and the `subject` / `max_records` evidence-pack
-//! selectors for `GetEvidencePack`) is owner-approved and therefore supersedes the
+//! selectors for `GetEvidencePack`, the `task_id` / `max_records` selectors
+//! for `GetTaskState`, the optional `problem_id` / `max_records` selectors
+//! for `GetAttentionAndProblems`, the `selector` / `max_records` selectors
+//! for `GetUnderstandingProjectionInputs`, and the `skill_id` /
+//! `max_records` selectors for `GetCapabilityEvidenceState`) is
+//! owner-approved and therefore supersedes the
 //! generic [`CONTROL_FIELD_DENYLIST`](crate::CONTROL_FIELD_DENYLIST) for that
 //! exact name; every undeclared control name is still rejected fail-closed.
 
@@ -294,6 +305,54 @@ static CURRENT_POSITION_PARAMETERS: [ParameterDeclaration; 1] = [ParameterDeclar
     shape: ParameterShape::Subject,
     required: true,
 }];
+static GET_TASK_STATE_PARAMETERS: [ParameterDeclaration; 2] = [
+    ParameterDeclaration {
+        name: "task_id",
+        shape: ParameterShape::Subject,
+        required: true,
+    },
+    ParameterDeclaration {
+        name: "max_records",
+        shape: ParameterShape::Subject,
+        required: true,
+    },
+];
+static GET_ATTENTION_AND_PROBLEMS_PARAMETERS: [ParameterDeclaration; 2] = [
+    ParameterDeclaration {
+        name: "problem_id",
+        shape: ParameterShape::Subject,
+        required: false,
+    },
+    ParameterDeclaration {
+        name: "max_records",
+        shape: ParameterShape::Subject,
+        required: true,
+    },
+];
+static GET_UNDERSTANDING_PROJECTION_INPUTS_PARAMETERS: [ParameterDeclaration; 2] = [
+    ParameterDeclaration {
+        name: "selector",
+        shape: ParameterShape::Subject,
+        required: true,
+    },
+    ParameterDeclaration {
+        name: "max_records",
+        shape: ParameterShape::Subject,
+        required: true,
+    },
+];
+static GET_CAPABILITY_EVIDENCE_STATE_PARAMETERS: [ParameterDeclaration; 2] = [
+    ParameterDeclaration {
+        name: "skill_id",
+        shape: ParameterShape::Subject,
+        required: true,
+    },
+    ParameterDeclaration {
+        name: "max_records",
+        shape: ParameterShape::Subject,
+        required: true,
+    },
+];
 
 /// Owner-approved authority-revocation fields emitted by the Governor
 /// authority-revocation envelope
@@ -494,7 +553,13 @@ pub const fn named_mutation_operation_by_name(name: &str) -> Option<NamedMutatio
 /// bound); `GetAuthorityRevocationHistory` declares the required bounded
 /// exact selectors (the exact revoked `origin_ref` and the explicit
 /// `max_records` bound); `GetCurrentEpistemicPosition` declares the required
-/// `position` selector; every other variant declares none, so any supplied parameter
+/// `position` selector; `GetTaskState` declares the required exact `task_id`
+/// plus the explicit `max_records` bound; `GetAttentionAndProblems` declares
+/// the optional exact `problem_id` filter plus the required `max_records`
+/// bound; `GetUnderstandingProjectionInputs` declares the required exact
+/// `selector` plus the required `max_records` bound; `GetCapabilityEvidenceState`
+/// declares the required exact `skill_id` plus the required `max_records`
+/// bound; every other variant declares none, so any supplied parameter
 /// fails closed. Variants without a catalogue entry never reach this table:
 /// they fail as [`StoreError::UnknownOperation`] first.
 #[must_use]
@@ -508,14 +573,16 @@ pub const fn declared_read_parameters(
             &GET_AUTHORITY_REVOCATION_HISTORY_PARAMETERS
         }
         NamedReadOperation::GetCurrentEpistemicPosition => &CURRENT_POSITION_PARAMETERS,
+        NamedReadOperation::GetTaskState => &GET_TASK_STATE_PARAMETERS,
+        NamedReadOperation::GetAttentionAndProblems => &GET_ATTENTION_AND_PROBLEMS_PARAMETERS,
+        NamedReadOperation::GetUnderstandingProjectionInputs => {
+            &GET_UNDERSTANDING_PROJECTION_INPUTS_PARAMETERS
+        }
+        NamedReadOperation::GetCapabilityEvidenceState => &GET_CAPABILITY_EVIDENCE_STATE_PARAMETERS,
         NamedReadOperation::GetRevisionHeads
         | NamedReadOperation::GetScopeRevisionView
         | NamedReadOperation::GetOrderingHeads
-        | NamedReadOperation::GetTaskState
-        | NamedReadOperation::GetUnderstandingProjectionInputs
-        | NamedReadOperation::GetAttentionAndProblems
         | NamedReadOperation::GetModuleCatalogState
-        | NamedReadOperation::GetCapabilityEvidenceState
         | NamedReadOperation::GetConformanceState
         | NamedReadOperation::GetMailbox
         | NamedReadOperation::GetAuditRange => &NO_PARAMETERS,
