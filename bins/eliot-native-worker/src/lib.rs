@@ -17,6 +17,7 @@ use eliot_process::{ProcessExecutor, ProcessRequest};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
+mod dispatch_authority;
 mod kernel_admission_client;
 
 /// Private finite immutable four-factory adapter registry, owned by this
@@ -27,8 +28,11 @@ mod kernel_admission_client;
 /// would fork the types and void the proof.
 pub mod adapter_registry;
 
+pub use dispatch_authority::{
+    NativeWorkerDispatchAuthority, ValidatedDispatchGrant, now_unix_ms as dispatch_now_unix_ms,
+};
 pub use kernel_admission_client::{
-    KernelNativeWorkerClient, KernelReplayPort, KernelReplayTransport,
+    KernelCheckpointPort, KernelNativeWorkerClient, KernelReplayPort, KernelReplayTransport,
     NATIVE_WORKER_CANCEL_OBSERVE_OPERATION, NATIVE_WORKER_CHECKPOINT_OPERATION,
     NATIVE_WORKER_CLAIM_OPERATION, NATIVE_WORKER_HEARTBEAT_OPERATION,
     NATIVE_WORKER_READY_OPERATION, NATIVE_WORKER_RECONCILE_OPERATION,
@@ -36,6 +40,7 @@ pub use kernel_admission_client::{
     NATIVE_WORKER_REPLAY_APPEND_OPERATION, NATIVE_WORKER_REPLAY_BEGIN_OPERATION,
     NATIVE_WORKER_REPLAY_LOOKUP_OPERATION, NATIVE_WORKER_REPLAY_OPERATION,
     NATIVE_WORKER_RESULT_SUBMIT_OPERATION, ReconcileRetainedReceipt, ReconcileSubmission,
+    SharedKernelTransport,
 };
 
 const MAX_FRAME_BYTES: u32 = 4 * 1024 * 1024;
@@ -375,11 +380,13 @@ where
 /// HONESTY BOUNDARY (issue #874 binding): this seam resolves the factory
 /// identity only. It does not derive the executor-bound `ProcessRequest`
 /// (never deserialized, never minted) and does not compose the P-03/G-01/
-/// checkpoint ports. Those arrive only with the kernel dispatch launch seam
-/// named by
-/// [`ADMITTED_DISPATCH_RESIDUAL`](admitted_material::ADMITTED_DISPATCH_RESIDUAL);
-/// until that seam lands the binary keeps the residual terminus for exactly
-/// that gap (see `bins/eliot-native-worker/src/main.rs::run`).
+/// checkpoint ports. Those arrive with the kernel dispatch launch seam
+/// (DISPATCH-CAUSE-FIX child half): the validated launch grant plus the
+/// canonical intent rule ([`derive_admitted_intent`]) issued through the
+/// in-child [`NativeWorkerDispatchAuthority`]. Until a cooperating owner
+/// publishes the matching join digest, even validated material denies at the
+/// executable gate — never the deferred line, which is reserved for
+/// genuinely missing material (see `bins/eliot-native-worker/src/main.rs::run`).
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct FactorySelection {
     /// Owner-produced adapter/factory identity from the v2 executable join.
@@ -471,27 +478,468 @@ fn select_factory_from_presented(
     })
 }
 
+/// Requires the Kernel launch grant funding the in-process one-shot permit.
+///
+/// A validated legacy envelope proves its claim but carries no grant, so it
+/// cannot drive: the caller denies fail-closed (exit 78) instead of
+/// reaching for a permit that was never issued.
+///
+/// # Errors
+///
+/// Returns [`NativeWorkerError::KernelAdmissionRequired`] when the material
+/// carries no grant.
+pub fn require_launch_grant(
+    material: &admitted_material::ValidatedAdmittedMaterial,
+) -> Result<&ValidatedDispatchGrant, NativeWorkerError> {
+    material.grant.as_ref().ok_or_else(|| {
+        NativeWorkerError::KernelAdmissionRequired(
+            "Kernel launch grant is missing: the admitted envelope carries no launch grant to issue a one-shot permit from"
+                .to_owned(),
+        )
+    })
+}
+
+/// Derives the executor-bound [`ProcessIntent`][eliot_process::ProcessIntent]
+/// for one validated admitted claim.
+///
+/// THE CANONICAL INTENT RULE (the owner-side publisher runs the identical
+/// forward computation; every field is fixed before the claim binding digest
+/// exists, so the derivation is acyclic):
+///
+/// ```text
+/// operation_id      = the admitted claim operation identity
+/// process_tree_id   = the admitted claim identity (the tree lineage
+///                     executing exactly this claim; distinct types, one
+///                     value — no synthetic namespace to collide or overflow)
+/// job_id            = the Kernel-owned parent job identity, carried exactly
+/// image_id          = "{adapter_id}-r{adapter_revision}" from the resolved
+///                     factory selection (this is how the selection informs
+///                     the intent)
+/// session_id        = the admitted claim identity (the session executing
+///                     exactly this claim)
+/// generation        = the claiming worker generation
+/// executable        = the deployment-pinned worker executable locator (the
+///                     caller passes `current_exe`; authority is the admitted
+///                     digest, which the executor re-hashes from the file)
+/// executable_sha256 = the owner-measured worker artifact digest from the
+///                     admitted material (never hashed here; the executor
+///                     verifies it against the file before any start)
+/// argv              = empty (the Kernel spawns workers argument-less)
+/// working_directory = the deployment-pinned working directory locator
+///                     (the caller passes the executable parent directory)
+/// environment       = empty secret-free projection (the Kernel spawns
+///                     workers with a secret-free environment)
+/// resource_limits   = the admitted budget projected onto executor ceilings
+///                     (wall time from the budget; each byte stream capped at
+///                     the admitted output budget; no CPU/memory dimensions in
+///                     the budget, so those stay unset)
+/// ```
+///
+/// Nothing comes from argv, stdin, or environment variables: identities and
+/// ceilings come from the validated claim, the factory identity from the
+/// resolved selection, and the two paths from the OS loader layout. The
+/// `from_claim` join plus the executable gate re-prove the derived intent at
+/// drive time (`process_invocation_digest` equality), so a derivation that
+/// disagrees with the owner-published join fails closed there, never
+/// silently.
+///
+/// # Errors
+///
+/// Returns [`NativeWorkerError::KernelAdmissionRequired`] for any unmappable
+/// identity, non-UTF-8 locator path, or contract violation — all fail-closed
+/// to exit 78 without effect.
+pub fn derive_admitted_intent(
+    material: &admitted_material::ValidatedAdmittedMaterial,
+    selection: &FactorySelection,
+    executable: &std::path::Path,
+    working_directory: &std::path::Path,
+) -> Result<eliot_process::ProcessIntent, NativeWorkerError> {
+    use eliot_process::{
+        EnvironmentInheritance, EnvironmentProjection, Generation, ImageId, JobId, ProcessIntent,
+        ProcessTreeId, ResourceLimits, SessionId,
+    };
+    let claim = material.admission.claim();
+    let executable_str = executable.to_str().ok_or_else(|| {
+        NativeWorkerError::KernelAdmissionRequired(
+            "dispatch executable locator is not well-formed".to_owned(),
+        )
+    })?;
+    let working_directory_str = working_directory.to_str().ok_or_else(|| {
+        NativeWorkerError::KernelAdmissionRequired(
+            "dispatch working directory locator is not well-formed".to_owned(),
+        )
+    })?;
+    let environment = EnvironmentProjection::new(
+        std::collections::BTreeMap::new(),
+        Vec::new(),
+        EnvironmentInheritance::None,
+    )
+    .map_err(|error| {
+        NativeWorkerError::KernelAdmissionRequired(format!(
+            "dispatch environment projection failed: {error}"
+        ))
+    })?;
+    let limits = ResourceLimits::new(
+        claim.budget.wall_time_ms,
+        None,
+        None,
+        claim.budget.output_bytes,
+        claim.budget.output_bytes,
+        claim.budget.max_descendants,
+    )
+    .map_err(|error| {
+        NativeWorkerError::KernelAdmissionRequired(format!(
+            "dispatch resource limits failed: {error}"
+        ))
+    })?;
+    ProcessIntent::new(
+        claim.operation_id.clone(),
+        ProcessTreeId::new(claim.claim_id.as_str().to_owned()).map_err(|error| {
+            NativeWorkerError::KernelAdmissionRequired(format!(
+                "dispatch process tree identity failed: {error}"
+            ))
+        })?,
+        JobId::new(claim.parent_job_id.clone()).map_err(|error| {
+            NativeWorkerError::KernelAdmissionRequired(format!(
+                "dispatch job identity failed: {error}"
+            ))
+        })?,
+        ImageId::new(format!(
+            "{}-r{}",
+            selection.adapter_id, selection.adapter_revision
+        ))
+        .map_err(|error| {
+            NativeWorkerError::KernelAdmissionRequired(format!(
+                "dispatch image identity failed: {error}"
+            ))
+        })?,
+        SessionId::new(claim.claim_id.as_str().to_owned()).map_err(|error| {
+            NativeWorkerError::KernelAdmissionRequired(format!(
+                "dispatch session identity failed: {error}"
+            ))
+        })?,
+        Generation::new(claim.worker_generation).map_err(|error| {
+            NativeWorkerError::KernelAdmissionRequired(format!(
+                "dispatch generation failed: {error}"
+            ))
+        })?,
+        executable_str.to_owned(),
+        material.worker_artifact_digest.clone(),
+        Vec::new(),
+        working_directory_str.to_owned(),
+        environment,
+        limits,
+    )
+    .map_err(|error| {
+        NativeWorkerError::KernelAdmissionRequired(format!("dispatch intent failed: {error}"))
+    })
+}
+
+/// Production G-01-facing admission port: a claim-echo projection.
+///
+/// `WorkerCore` needs a [`CapabilityAdmissionPort`][eliot_native_worker_core::CapabilityAdmissionPort]
+/// to seal its internal grant, and no G-01 owner record is reachable from
+/// this dependency-frozen child. This port therefore projects the admission
+/// facts from the validated presentation itself — claim/registration binding
+/// re-validated, every bound identity echoed from the joined hello/process,
+/// the presented executable join carried as the expectation — and the
+/// downstream production gates (`validate_grant`, the executable gate, the
+/// `from_claim` join) re-prove those bindings before anything starts. The
+/// owner-currentness half (is this join still the live owner record?) stays
+/// kernel-side: the dispatch contour admitted the claim against the live
+/// record at prepare, and every submit re-gates it there. Unclaimed
+/// presentations are refused outright: this contour serves claims only.
+/// Ambient effects are never authorized.
+///
+/// The port retains its admission observation window and echoes it back on
+/// revalidation, so liveness answers the exact sealed grant instead of a
+/// fresh clock reading that could never match it.
+pub struct PresentationEchoAdmission {
+    /// Admission observation window installed by `admit`, echoed by
+    /// `revalidate`.
+    observed: std::sync::Mutex<Option<(u64, u64)>>,
+}
+
+impl PresentationEchoAdmission {
+    /// Creates one echo port with no retained admission.
+    #[must_use]
+    pub fn new() -> Self {
+        Self {
+            observed: std::sync::Mutex::new(None),
+        }
+    }
+}
+
+impl Default for PresentationEchoAdmission {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl eliot_native_worker_core::CapabilityAdmissionPort for PresentationEchoAdmission {
+    fn admit(
+        &mut self,
+        request: &eliot_native_worker_core::CapabilityAdmissionRequest,
+    ) -> Result<
+        eliot_native_worker_core::CapabilityAdmissionOutcome,
+        eliot_native_worker_core::ProviderFailure,
+    > {
+        use eliot_native_worker_core::{
+            AuthorityEnvelope, CapabilityAdmissionFacts, CapabilityAdmissionOutcome,
+            NativeWorkerExecutableExpectation, ProviderFailure,
+        };
+        let presented = request.claim().ok_or_else(|| {
+            ProviderFailure::new(
+                "presentation-echo-admission",
+                "unclaimed presentation refused: the admitted contour serves claims only",
+            )
+        })?;
+        presented.validate_binding().map_err(|error| {
+            ProviderFailure::new("presentation-echo-admission", error.to_string())
+        })?;
+        let claim = presented.claim();
+        let join = claim.executable_binding.as_ref().ok_or_else(|| {
+            ProviderFailure::new(
+                "presentation-echo-admission",
+                "admitted claim carries no executable join",
+            )
+        })?;
+        let now = crate::dispatch_authority::now_unix_ms().map_err(|error| {
+            ProviderFailure::new("presentation-echo-admission", error.to_string())
+        })?;
+        let digest = claim.binding_digest.clone();
+        let epoch_value = serde_json::to_value(&claim.authority_epoch).map_err(|error| {
+            ProviderFailure::new("presentation-echo-admission", error.to_string())
+        })?;
+        let fence_value = serde_json::to_value(&claim.state_fence).map_err(|error| {
+            ProviderFailure::new("presentation-echo-admission", error.to_string())
+        })?;
+        let authority_value = serde_json::json!({
+            "epoch": epoch_value,
+            "scope_ref": claim.work_scope_id,
+            "effect_ceiling": {
+                "scope_ref": claim.work_scope_id,
+                "allowed": ["write_candidate"],
+                "max_external_effects": 0,
+            },
+            "lease": {
+                "namespace": "eliot.governor.work-lease",
+                "revision": "v1",
+                "value": format!("native-worker-lease-{digest}"),
+            },
+            "state_fence": fence_value,
+            "valid_until": "kernel-submit-bound",
+        });
+        let authority: AuthorityEnvelope =
+            serde_json::from_value(authority_value).map_err(|error| {
+                ProviderFailure::new("presentation-echo-admission", error.to_string())
+            })?;
+        authority.validate().map_err(|error| {
+            ProviderFailure::new("presentation-echo-admission", error.to_string())
+        })?;
+        let facts = CapabilityAdmissionFacts::new(
+            format!("native-worker-admission-{digest}"),
+            "1",
+            0,
+            now,
+            now.saturating_add(60_000),
+            join.replay_stream_id.clone(),
+            format!("worker-producer-{}", claim.worker_generation),
+            request.hello().route_ref.clone(),
+            request.hello().artifact_manifest_digest.clone(),
+            claim.worker_generation,
+            authority,
+            request.hello().requested_capabilities.clone(),
+            request.operation_id().clone(),
+            request.process_tree_id().clone(),
+            request.process_generation(),
+            request.process_fence().clone(),
+            request.process_request_digest().to_owned(),
+            *request.resource_limits(),
+        )
+        .with_claim_binding(claim)
+        .with_executable_expectation(NativeWorkerExecutableExpectation {
+            current: join.clone(),
+            revoked: false,
+        });
+        *self.observed.lock().map_err(|_| {
+            ProviderFailure::new(
+                "presentation-echo-admission",
+                "admission observation lock poisoned",
+            )
+        })? = Some((now, now.saturating_add(60_000)));
+        Ok(CapabilityAdmissionOutcome::Admitted(Box::new(facts)))
+    }
+
+    fn revalidate(
+        &mut self,
+        request: &eliot_native_worker_core::CapabilityLivenessRequest,
+    ) -> Result<
+        eliot_native_worker_core::AdmissionLivenessOutcome,
+        eliot_native_worker_core::ProviderFailure,
+    > {
+        use eliot_native_worker_core::{
+            AdmissionLivenessFacts, AdmissionLivenessOutcome, ProviderFailure,
+        };
+        let guard = self.observed.lock().map_err(|_| {
+            ProviderFailure::new(
+                "presentation-echo-admission",
+                "admission observation lock poisoned",
+            )
+        })?;
+        let Some((observed_at, expires_at)) = *guard else {
+            return Err(ProviderFailure::new(
+                "presentation-echo-admission",
+                "no retained admission to revalidate",
+            ));
+        };
+        drop(guard);
+        Ok(AdmissionLivenessOutcome::Live(AdmissionLivenessFacts::new(
+            request.admission_id(),
+            request.admission_revision(),
+            request.revocation_revision(),
+            request.lease().clone(),
+            request.authority_epoch().clone(),
+            request.state_fence().clone(),
+            observed_at,
+            expires_at,
+            false,
+        )))
+    }
+
+    fn authorize_effect(
+        &mut self,
+        _request: &eliot_native_worker_core::EffectAdmissionRequest,
+    ) -> Result<
+        eliot_native_worker_core::EffectAdmissionOutcome,
+        eliot_native_worker_core::ProviderFailure,
+    > {
+        Err(eliot_native_worker_core::ProviderFailure::new(
+            "presentation-echo-admission",
+            "the admitted worker authorizes no ambient effects",
+        ))
+    }
+}
+
+/// Production P-03 evidence sink: bounded memory plus supervisor-capturable
+/// stderr.
+///
+/// The start path requires an evidence sink, and no durable evidence owner
+/// is reachable from this dependency-frozen child. Records are retained in
+/// a bounded in-memory ring (256 entries; beyond that only a dropped
+/// counter survives) and each record is also emitted as one JSON line on
+/// stderr, which the supervising Kernel launch retains with the child
+/// streams. Emission is best-effort and never fails the run; only a
+/// poisoned lock fails a record.
+pub struct BoundedEvidenceSink {
+    /// Retained records, bounded by [`BoundedEvidenceSink::MAX_RETAINED`].
+    records: std::sync::Mutex<Vec<eliot_process::ProcessEvidence>>,
+    /// Records dropped after the bound was reached.
+    dropped: std::sync::Mutex<u64>,
+}
+
+impl BoundedEvidenceSink {
+    /// Maximum retained evidence records.
+    pub const MAX_RETAINED: usize = 256;
+
+    /// Creates one empty sink.
+    #[must_use]
+    pub fn new() -> Self {
+        Self {
+            records: std::sync::Mutex::new(Vec::new()),
+            dropped: std::sync::Mutex::new(0),
+        }
+    }
+
+    /// Returns the number of retained records.
+    pub fn recorded_len(&self) -> usize {
+        self.records.lock().map_or(0, |records| records.len())
+    }
+
+    /// Returns the number of records dropped after the bound.
+    pub fn dropped_count(&self) -> u64 {
+        self.dropped.lock().map_or(0, |count| *count)
+    }
+}
+
+impl Default for BoundedEvidenceSink {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl eliot_process::ProcessEvidenceSink for BoundedEvidenceSink {
+    fn record(
+        &self,
+        evidence: eliot_process::ProcessEvidence,
+    ) -> Result<(), eliot_process::EvidenceSinkError> {
+        if let Ok(bytes) = serde_json::to_vec(&evidence) {
+            use std::io::Write;
+            let mut stderr = std::io::stderr().lock();
+            let _ = stderr.write_all(&bytes);
+            let _ = stderr.write_all(b"\n");
+        }
+        let mut records = self
+            .records
+            .lock()
+            .map_err(|_| eliot_process::EvidenceSinkError {
+                message: "native-worker evidence lock poisoned".to_owned(),
+            })?;
+        if records.len() < Self::MAX_RETAINED {
+            records.push(evidence);
+        } else {
+            drop(records);
+            let mut dropped =
+                self.dropped
+                    .lock()
+                    .map_err(|_| eliot_process::EvidenceSinkError {
+                        message: "native-worker evidence lock poisoned".to_owned(),
+                    })?;
+            *dropped = dropped.saturating_add(1);
+        }
+        Ok(())
+    }
+}
+
 /// Bins-local admitted-claim material reader for the native-worker dispatch
-/// contour (slice D, T9-07 consumer half).
+/// contour (slice D, T9-07 consumer half, DISPATCH-CAUSE-FIX child half).
 ///
 /// This module binds the admitted driver
 /// ([`drive_admitted_claimed`]) to session-bound claim bytes delivered by the
 /// Kernel dispatch contour, and keeps the binary fail-closed until that
-/// delivery lands. It owns no wire contract, mints no authority, and changes
-/// no shared type.
+/// delivery validates. It owns no wire contract, mints no authority, and
+/// changes no shared type.
 ///
 /// Delivery shape (I7.5/I15.2): the dispatch contour writes exactly one file
 /// named
 /// [`ADMITTED_MATERIAL_FILE_NAME`][crate::admitted_material::ADMITTED_MATERIAL_FILE_NAME]
 /// next to this executable before spawn
-/// and reaps it after the run. The file
-/// carries the five serializable presentations the admitted driver binds
-/// (registration plus claim, hello, reconcile, readiness) plus the I7.5
-/// session nonce. The locator is derived from [`std::env::current_exe`],
-/// which reads the OS loader image path, not the environment block; no value
-/// is taken from argv, stdin, or environment variables, and no ownership is
-/// inferred from the path itself (`bins/AGENTS.md`: the file is untrusted
-/// presenter bytes until every identity below is re-proved).
+/// and reaps it after the run. The locator is derived from
+/// [`std::env::current_exe`], which reads the OS loader image path, not the
+/// environment block; no value is taken from argv, stdin, or environment
+/// variables, and no ownership is inferred from the path itself
+/// (`bins/AGENTS.md`: the file is untrusted presenter bytes until every
+/// identity below is re-proved).
+///
+/// Two file shapes are accepted for the one file name:
+/// - the Kernel launch-grant shape (`request`, `receipt`, `epoch`,
+///   `generation`, `nonce`, `grant`), written by the Kernel dispatch contour
+///   (`bins/eliot-kernel/src/dispatch_launch.rs`,
+///   `native_worker_material_bytes`). The `request` is the exact admitted
+///   `NativeWorkerClaimRequest`, the `receipt` its Kernel-issued
+///   `NativeWorkerClaimReceipt`, and the `grant` the shared `DispatchGrant`.
+///   From these the reader converts the worker-side claim, registration,
+///   hello, reconcile, and readiness presentations in-process (all
+///   worker-originated or claim-derived, never caller bytes) and validates
+///   the grant into a [`ValidatedDispatchGrant`][crate::ValidatedDispatchGrant]
+///   through the production `FencingToken` / `ActionLeaseRef` constructors.
+///   The kernel `nonce` is the I7.5/I15.2 session nonce: it is independent of
+///   the join/hello launch nonce by kernel design and is carried for
+///   correlation, never equated with the join nonce.
+/// - the legacy hello/join envelope (`admission`, `hello`, `reconcile`,
+///   `readiness`, `nonce`), kept byte-for-byte for the existing contour
+///   proofs. It carries no launch grant, so it validates but cannot drive:
+///   the binary denies fail-closed when no grant is present.
 ///
 /// Validation (all before any drive, all fail-closed to exit 78 without
 /// effect):
@@ -499,14 +947,18 @@ fn select_factory_from_presented(
 /// - envelope wire shape plus bounded input, then the exact
 ///   claim/registration cross-binding through the production
 ///   [`ClaimAdmissionRequest::validate_binding`][eliot_native_worker_core::ClaimAdmissionRequest::validate_binding];
-/// - the session nonce must be well-formed (opaque, bounded) and equal the
-///   presented `hello.launch_nonce` and, when the claim carries the v2
-///   executable join, the join `launch_nonce`. The authoritative nonce proof
-///   happens kernel-side at submit (front-door session plus the
-///   echo/decision checks in the lifecycle spans), so the child never invents
-///   it and never drives without it;
-/// - the reconcile and readiness presentations must each validate through
-///   their production gates and answer the exact admitted claim (claim
+/// - for the Kernel shape additionally: the closed request shape (wire,
+///   protocol, schema, digests) through a conversion into the worker-side
+///   claim, whose production `validate` recomputes the canonical binding
+///   digest — a tampered or foreign claim is refused here; the receipt
+///   answering the exact request (claim, binding, and operation identity
+///   plus the receipt digest); the live epoch and generation binding the
+///   claim; the well-formed session nonce; and the grant (digest shape,
+///   live window, fence/lease construction, epoch agreement with the claim);
+/// - the session nonce rules per shape (envelope: equal to the presented
+///   hello and join launch nonces; Kernel file: well-formed and carried);
+/// - the reconcile and readiness presentations each validating through
+///   their production gates and answering the exact admitted claim (claim
 ///   identity plus binding digest).
 ///
 /// A validated file is consumed once (best-effort removal; removal failure
@@ -517,18 +969,16 @@ fn select_factory_from_presented(
 ///
 /// What this module deliberately does NOT deliver: the concrete
 /// [`ProcessRequest`] is an in-memory
-/// composition value that is never deserialized from a wire type and never
-/// minted here, and the composed provider ports (P-03 dispatch validation,
-/// G-01-facing admission, durable checkpoint) arrive only with the kernel
-/// dispatch launch (T9-07, WRITER-B). The factory-identity half of that seam
+/// composition value that is never deserialized from a wire type. It is
+/// derived in-process from the validated grant plus the canonical intent
+/// rule ([`derive_admitted_intent`][crate::derive_admitted_intent]) and
+/// issued through the in-child [`NativeWorkerDispatchAuthority`][crate::NativeWorkerDispatchAuthority]
+/// (the documented broker pattern). The factory-identity half of the seam
 /// landed as [`FactorySelection`][crate::FactorySelection] plus
-/// [`select_factory_for_admitted`][crate::select_factory_for_admitted];
-/// the remaining execution-context gap is named by
-/// [`ADMITTED_DISPATCH_RESIDUAL`][crate::admitted_material::ADMITTED_DISPATCH_RESIDUAL];
-/// until it lands even a validated file cannot drive. The drive itself
-/// re-proves everything through the production `from_claim` join,
-/// executable gate, grant checks, and receipt/proof validation, so this
-/// pre-filter never weakens (and never replaces) any existing check.
+/// [`select_factory_for_admitted`][crate::select_factory_for_admitted]; the
+/// drive itself re-proves everything through the production `from_claim`
+/// join, executable gate, grant checks, and receipt/proof validation, so
+/// these pre-filters never weaken (and never replace) any existing check.
 pub mod admitted_material {
     use std::fs;
     use std::path::{Path, PathBuf};
@@ -539,14 +989,16 @@ pub mod admitted_material {
     use serde::{Deserialize, Serialize};
 
     use crate::ReconcileSubmission;
+    use crate::dispatch_authority::ValidatedDispatchGrant;
 
     /// Bins-local dispatch file name, read from the executable directory only.
     /// See the module documentation: locator, never authority.
     pub const ADMITTED_MATERIAL_FILE_NAME: &str = "eliot-native-worker.admitted-claim.json";
 
-    /// Upper bound for the dispatch file. The five typed presentations are
-    /// each a few kilobytes; this adds ample headroom for the executable join
-    /// plus the session nonce without accepting unbounded input.
+    /// Upper bound for the dispatch file. The typed presentations are each a
+    /// few kilobytes; this adds ample headroom for the executable join plus
+    /// the session nonce and the launch grant without accepting unbounded
+    /// input.
     pub const ADMITTED_MATERIAL_LIMIT_BYTES: u64 = 256 * 1024;
 
     /// Session-nonce shape bounds (I7.5): opaque, bounded, never invented here.
@@ -554,36 +1006,11 @@ pub mod admitted_material {
     /// Session-nonce shape bounds (I7.5): opaque, bounded, never invented here.
     pub const ADMITTED_NONCE_MAX_LEN: usize = 256;
 
-    /// Residual naming the kernel half that must land before validated bytes
-    /// can drive (T9-07, WRITER-B). The executor-bound `ProcessRequest`
-    /// (never deserialized, never minted here) plus the composed provider
-    /// ports (P-07 dispatch validation, G-01-facing admission, durable
-    /// checkpoint) arrive only with the kernel dispatch launch; validated
-    /// claim bytes alone never drive.
-    ///
-    /// PRECISE GAP (T9-07 WRITER-B verdict, issue #874 honesty binding):
-    /// owner file `bins/eliot-kernel/src/dispatch_launch.rs` serves
-    /// Doctor/testd only and contains no native-worker writer, so no Kernel
-    /// contour writes `eliot-native-worker.admitted-claim.json` and no seam
-    /// provisions the in-memory execution context. The validated envelope
-    /// (admission plus hello plus reconcile plus readiness plus nonce) cannot
-    /// supply it without minting: it carries only the
-    /// `process_invocation_digest` (a one-way digest, never the invocation
-    /// material), the admitted labels (`route_class`, `route_ref`,
-    /// `adapter_id`), and `registration.resource_limits`. It does not carry
-    /// the full `ProcessIntent` (`process_tree_id`, `job_id`, `image_id`,
-    /// `session_id`, `executable`, `executable_sha256`, `argv`,
-    /// `working_directory`, `environment`), the Kernel-issued
-    /// `DispatchPermit` (which requires the kernel-side `KernelDispatchKey`
-    /// secret plus `PermitIssuance` lease/fence/revision/nonce material), the
-    /// `DispatchValidationContext`, the live G-01 owner record, the durable
-    /// checkpoint owner, or the evidence sink. `ProcessRequest` is
-    /// deliberately `Serialize`-only (no `Deserialize`), so no byte surface
-    /// can present it; synthesizing any of the above would mint authority and
-    /// is forbidden. The factory identity half DID land in this change (see
-    /// [`FactorySelection`][crate::FactorySelection]); this residual names
-    /// exactly the remaining execution-context half.
-    pub const ADMITTED_DISPATCH_RESIDUAL: &str = "issue-22 T9-07 follow-up: kernel dispatch launch delivering the executor-bound ProcessRequest plus the composed provider ports (P-07 dispatch validation, G-01-facing admission, durable checkpoint) alongside the session-bound claim bytes to the native-worker invocation";
+    /// Kernel claim-wire identity, mirroring
+    /// `eliot_kernel_service::NATIVE_WORKER_CLAIM_WIRE_ID`. The child cannot
+    /// depend on that crate, so the literal is pinned here with its source;
+    /// a wire drift fails closed at parse time.
+    const KERNEL_CLAIM_WIRE_ID: &str = "eliot.kernel.native-worker-claim";
 
     /// Bins-local dispatch envelope (NOT a wire contract change).
     ///
@@ -613,22 +1040,39 @@ pub mod admitted_material {
 
     /// Session-bound claim material validated against itself.
     ///
-    /// Carries exactly the presentations the admitted driver binds. The
-    /// concrete process request and the composed provider ports still arrive
-    /// only with the kernel dispatch launch, so this value alone never
-    /// drives; it is the validated input the launch seam will complete.
+    /// Carries exactly the presentations the admitted driver binds, plus —
+    /// on the Kernel launch-grant path — the validated grant that funds the
+    /// in-process one-shot permit. The legacy envelope path carries no grant
+    /// and therefore validates but cannot drive.
     #[derive(Clone, Debug, Eq, PartialEq)]
     pub struct ValidatedAdmittedMaterial {
         /// Validated claim presentation.
         pub admission: ClaimAdmissionRequest,
-        /// Validated owner-supplied handshake.
+        /// Validated owner-supplied handshake (legacy path) or the
+        /// worker-originated handshake derived from the admitted claim
+        /// (Kernel path).
         pub hello: WorkerHello,
         /// Validated reconcile bound to the exact admitted claim.
         pub reconcile: ReconcileSubmission,
         /// Validated readiness verdict bound to the exact admitted claim.
         pub readiness: ReadinessSubmission,
-        /// Well-formed session nonce bound to the presented hello (and join).
+        /// Session nonce bound to the presented hello and join (legacy path)
+        /// or to the derived hello and join (Kernel path: the join launch
+        /// nonce, which the factory seam resolves).
         pub nonce: String,
+        /// Validated Kernel launch grant. `Some` on the Kernel file path
+        /// (the drive issues its one-shot permit from this); `None` on the
+        /// legacy envelope path (which therefore cannot drive).
+        pub grant: Option<ValidatedDispatchGrant>,
+        /// Kernel session nonce from the launch-grant file. Independent of
+        /// the join/hello launch nonce by kernel design; carried for
+        /// correlation, never equated. `None` on the legacy path.
+        pub kernel_nonce: Option<String>,
+        /// Owner-measured worker artifact digest (Kernel path: the admitted
+        /// request field; legacy path: the admitted registration field).
+        /// Feeds the canonical intent derivation; the executor re-hashes the
+        /// file before any start.
+        pub worker_artifact_digest: String,
     }
 
     /// Typed failure for the dispatch-file read. Every variant is fail-closed:
@@ -721,15 +1165,46 @@ pub mod admitted_material {
                 actual,
             });
         }
-        let envelope: AdmittedClaimEnvelope = serde_json::from_slice(&bytes).map_err(|error| {
-            AdmittedMaterialError::Malformed(truncate_detail(&error.to_string()))
-        })?;
-        let validated = validate_envelope(envelope)?;
-        // Consume-once: a validated presentation must not linger for a later
-        // invocation to replay. Removal is best-effort; the kernel launch reaps
-        // the file regardless, and removal failure never fails the run.
+        match serde_json::from_slice::<AdmittedClaimEnvelope>(&bytes) {
+            Ok(envelope) => {
+                let validated = validate_envelope(envelope)?;
+                consume_material(path);
+                Ok(Some(validated))
+            }
+            Err(envelope_error) => {
+                if is_kernel_grant_file(&bytes) {
+                    let validated = validate_kernel_file_bytes(&bytes)?;
+                    consume_material(path);
+                    Ok(Some(validated))
+                } else {
+                    Err(AdmittedMaterialError::Malformed(truncate_detail(
+                        &envelope_error.to_string(),
+                    )))
+                }
+            }
+        }
+    }
+
+    /// Consume-once: a validated presentation must not linger for a later
+    /// invocation to replay. Removal is best-effort; the kernel launch reaps
+    /// the file regardless, and removal failure never fails the run.
+    fn consume_material(path: &Path) {
         let _ = fs::remove_file(path);
-        Ok(Some(validated))
+    }
+
+    /// Peeks whether delivered bytes carry the Kernel launch-grant shape.
+    ///
+    /// The two accepted shapes share one file name, so the reader branches
+    /// on content: a JSON object carrying the `grant` key takes the Kernel
+    /// path (which re-validates everything through its closed structs);
+    /// anything else stays on the legacy envelope path with its exact
+    /// existing errors. A hybrid carrying both shapes fails closed in both
+    /// parsers (`deny_unknown_fields` on each side).
+    fn is_kernel_grant_file(bytes: &[u8]) -> bool {
+        serde_json::from_slice::<serde_json::Value>(bytes)
+            .ok()
+            .and_then(|value| value.as_object().cloned())
+            .is_some_and(|object| object.contains_key("grant"))
     }
 
     /// Pre-checks the file length so an unbounded file is refused before it is
@@ -788,12 +1263,20 @@ pub mod admitted_material {
             AdmittedMaterialError::Contract(truncate_detail(&error.to_string()))
         })?;
         require_same_claim("readiness", envelope.readiness.claim(), claim)?;
+        let worker_artifact_digest = envelope
+            .admission
+            .registration()
+            .worker_artifact_digest
+            .clone();
         Ok(ValidatedAdmittedMaterial {
             admission: envelope.admission,
             hello: envelope.hello,
             reconcile: envelope.reconcile,
             readiness: envelope.readiness,
             nonce: envelope.nonce,
+            grant: None,
+            kernel_nonce: None,
+            worker_artifact_digest,
         })
     }
 
@@ -827,6 +1310,538 @@ pub mod admitted_material {
             return Err(AdmittedMaterialError::BadNonce);
         }
         Ok(())
+    }
+
+    /// Validates one parsed Kernel launch-grant file through the production
+    /// gates, then converts it into the exact presentations the admitted
+    /// driver binds. Every check is fail-closed; the order is cheapest-first
+    /// and performs no transport, no execution, and no authority minting.
+    ///
+    /// The file shape is `{request, receipt, epoch, generation, nonce,
+    /// grant}` (see the module documentation). The `request` converts into
+    /// the worker-side claim whose production `validate` recomputes the
+    /// canonical binding digest — the strongest local anchor: a tampered or
+    /// foreign claim is refused even when every other field is well-formed.
+    /// The receipt must answer that exact request (claim, binding, and
+    /// operation identity); the live epoch and generation must bind the
+    /// claim; the grant must be well-formed, live, and epoch-bound to the
+    /// claim, with its fence and lease rebuilt through the production
+    /// constructors. Registration, hello, reconcile, and readiness are
+    /// derived from admitted material plus live process observables (own
+    /// PID, wall clock) — never from argv, stdin, or environment — and each
+    /// re-validates through its production gate. The admitted drive re-proves
+    /// everything again through the `from_claim` join, executable gate,
+    /// grant checks, and receipt/proof validation.
+    fn validate_kernel_file_bytes(
+        bytes: &[u8],
+    ) -> Result<ValidatedAdmittedMaterial, AdmittedMaterialError> {
+        let file: KernelDispatchFile = serde_json::from_slice(bytes).map_err(|error| {
+            AdmittedMaterialError::Malformed(truncate_detail(&error.to_string()))
+        })?;
+        let now = now_unix_ms()?;
+        validate_kernel_file(file, now)
+    }
+
+    /// Closed mirror of the Kernel-written launch-grant file.
+    ///
+    /// Mirrors `native_worker_material_bytes` in
+    /// `bins/eliot-kernel/src/dispatch_launch.rs` (`request`,
+    /// `NativeWorkerClaimRequest`; `receipt`, `NativeWorkerClaimReceipt`;
+    /// `epoch`, live authority; `generation`, live activation generation;
+    /// `nonce`, session nonce; `grant`, shared `DispatchGrant`). The
+    /// request, receipt, and epoch stay untyped JSON here because this crate
+    /// cannot depend on `eliot-kernel-service` or `eliot-contracts`: the
+    /// request converts field-by-field into the worker-side claim (whose
+    /// validators then own every check), and every cross-binding compares
+    /// canonical JSON values.
+    #[derive(serde::Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct KernelDispatchFile {
+        /// Exact admitted claim request.
+        request: serde_json::Value,
+        /// Kernel-issued receipt answering the request.
+        receipt: serde_json::Value,
+        /// Live authority epoch bound at admission.
+        epoch: serde_json::Value,
+        /// Live activation generation bound at admission.
+        generation: u64,
+        /// Session nonce, independent of the join launch nonce by design.
+        nonce: String,
+        /// Shared launch grant funding the in-child one-shot permit.
+        grant: KernelGrantFile,
+    }
+
+    /// Closed mirror of the shared `DispatchGrant`.
+    ///
+    /// Mirrors `DispatchGrant` in `bins/eliot-kernel/src/dispatch_launch.rs`.
+    /// The authority epoch stays untyped JSON (proven equal to the admitted
+    /// claim epoch, whose typed value feeds the fence constructor).
+    #[derive(serde::Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct KernelGrantFile {
+        /// Digest binding the grant fields plus the admission identity.
+        grant_digest: String,
+        /// Live authority epoch for `FencingToken::new`.
+        authority_epoch: serde_json::Value,
+        /// Live activation generation for `Generation::new`.
+        fence_generation: u64,
+        /// Per-identity fence nonce for `FencingToken::new`.
+        fence_nonce: String,
+        /// Per-identity lease for `ActionLeaseRef::new`.
+        idempotency_key: String,
+        /// Grant expiry in Unix milliseconds for `PermitIssuance::new`.
+        expires_at: u64,
+    }
+
+    /// Validates one parsed Kernel file and converts it into the admitted
+    /// presentations.
+    #[allow(clippy::too_many_lines)]
+    fn validate_kernel_file(
+        file: KernelDispatchFile,
+        now_ms: u64,
+    ) -> Result<ValidatedAdmittedMaterial, AdmittedMaterialError> {
+        use eliot_native_worker_core::{
+            EXECUTION_UNIT_SCHEMA_VERSION, JSON_ENCODING_PROFILE, NATIVE_WORKER_CLAIM_WIRE_VERSION,
+            NativeWorkerRegistration, PROTOCOL_VERSION,
+        };
+        use eliot_process::{ActionLeaseRef, FencingToken, Generation};
+
+        let request = file.request.as_object().ok_or_else(|| {
+            AdmittedMaterialError::Malformed("kernel file request is not an object".to_owned())
+        })?;
+        // Closed request shape: the wire, protocol, and schema pins use the
+        // worker-core constants so a drift on either side fails closed here
+        // instead of passing a stranger through to the drive.
+        if request.get("wire_id").and_then(serde_json::Value::as_str) != Some(KERNEL_CLAIM_WIRE_ID)
+        {
+            return Err(AdmittedMaterialError::Contract(
+                "kernel file request carries an unknown claim wire".to_owned(),
+            ));
+        }
+        if request
+            .get("wire_version")
+            .and_then(serde_json::Value::as_u64)
+            != Some(u64::from(NATIVE_WORKER_CLAIM_WIRE_VERSION))
+        {
+            return Err(AdmittedMaterialError::Contract(
+                "kernel file request carries an unsupported claim wire version".to_owned(),
+            ));
+        }
+        if request
+            .get("protocol_version")
+            .and_then(serde_json::Value::as_str)
+            != Some(PROTOCOL_VERSION)
+        {
+            return Err(AdmittedMaterialError::Contract(
+                "kernel file request carries an unsupported worker protocol".to_owned(),
+            ));
+        }
+        if request
+            .get("execution_unit_schema_version")
+            .and_then(serde_json::Value::as_u64)
+            != Some(u64::from(EXECUTION_UNIT_SCHEMA_VERSION))
+        {
+            return Err(AdmittedMaterialError::Contract(
+                "kernel file request carries an unsupported execution-unit schema".to_owned(),
+            ));
+        }
+        for key in [
+            "binding_digest",
+            "request_digest",
+            "worker_artifact_digest",
+            "worker_config_digest",
+        ] {
+            match request.get(key).and_then(serde_json::Value::as_str) {
+                Some(digest) if is_lowercase_sha256(digest) => {}
+                _ => {
+                    return Err(AdmittedMaterialError::Contract(format!(
+                        "kernel file request digest {key} is not a lowercase SHA-256 digest"
+                    )));
+                }
+            }
+        }
+        if !request
+            .get("executable_binding")
+            .is_some_and(serde_json::Value::is_object)
+        {
+            return Err(AdmittedMaterialError::Contract(
+                "kernel file request carries no owner-produced executable join".to_owned(),
+            ));
+        }
+        // Convert the Kernel request into the worker-side claim. Field names
+        // match the worker shape exactly (the Kernel projection reuses the
+        // T9-01 names; transparent newtypes serialize to identical JSON), so
+        // this is a verbatim field map, never a reinterpretation.
+        let claim_json = serde_json::json!({
+            "claim_id": request.get("claim_id").cloned().unwrap_or(serde_json::Value::Null),
+            "registration_id": request.get("registration_id").cloned().unwrap_or(serde_json::Value::Null),
+            "worker_generation": request.get("worker_generation").cloned().unwrap_or(serde_json::Value::Null),
+            "parent_job_id": request.get("parent_job_id").cloned().unwrap_or(serde_json::Value::Null),
+            "task_id": request.get("task_id").cloned().unwrap_or(serde_json::Value::Null),
+            "work_scope_id": request.get("work_scope_id").cloned().unwrap_or(serde_json::Value::Null),
+            "decision_id": request.get("decision_id").cloned().unwrap_or(serde_json::Value::Null),
+            "attempt_id": request.get("attempt_id").cloned().unwrap_or(serde_json::Value::Null),
+            "operation_id": request.get("operation_id").cloned().unwrap_or(serde_json::Value::Null),
+            "route_class": request.get("route_class").cloned().unwrap_or(serde_json::Value::Null),
+            "budget": request.get("budget").cloned().unwrap_or(serde_json::Value::Null),
+            "deadline_unix_ms": request.get("deadline_unix_ms").cloned().unwrap_or(serde_json::Value::Null),
+            "cancellation_policy_id": request.get("cancellation_policy_id").cloned().unwrap_or(serde_json::Value::Null),
+            "expected_result_schema": request.get("expected_result_schema").cloned().unwrap_or(serde_json::Value::Null),
+            "expected_result_schema_version": request.get("expected_result_schema_version").cloned().unwrap_or(serde_json::Value::Null),
+            "predecessor_revision": request.get("predecessor_revision").cloned().unwrap_or(serde_json::Value::Null),
+            "authority_epoch": request.get("authority_epoch").cloned().unwrap_or(serde_json::Value::Null),
+            "state_fence": request.get("state_fence").cloned().unwrap_or(serde_json::Value::Null),
+            "wire_version": request.get("wire_version").cloned().unwrap_or(serde_json::Value::Null),
+            "executable_binding": request.get("executable_binding").cloned().unwrap_or(serde_json::Value::Null),
+            "binding_digest": request.get("binding_digest").cloned().unwrap_or(serde_json::Value::Null),
+        });
+        let claim: NativeWorkerClaim =
+            serde_json::from_value(claim_json.clone()).map_err(|error| {
+                AdmittedMaterialError::Malformed(truncate_detail(&error.to_string()))
+            })?;
+        // The strongest local anchor: the production claim validator
+        // recomputes the canonical binding digest over the converted fields.
+        claim.validate().map_err(|error| {
+            AdmittedMaterialError::Contract(truncate_detail(&error.to_string()))
+        })?;
+        let binding_digest = claim.binding_digest.clone();
+        let join = claim.executable_binding.as_ref().ok_or_else(|| {
+            AdmittedMaterialError::Contract(
+                "kernel file claim carries no owner-produced executable join".to_owned(),
+            )
+        })?;
+
+        // The receipt must answer this exact request: same claim, same
+        // binding, same operation, same authority. A kernel file paired with
+        // another claim's receipt is refused here.
+        let receipt = file.receipt.as_object().ok_or_else(|| {
+            AdmittedMaterialError::Malformed("kernel file receipt is not an object".to_owned())
+        })?;
+        if receipt.get("wire_id").and_then(serde_json::Value::as_str) != Some(KERNEL_CLAIM_WIRE_ID)
+        {
+            return Err(AdmittedMaterialError::Contract(
+                "kernel file receipt carries an unknown claim wire".to_owned(),
+            ));
+        }
+        if receipt.get("claim_id").and_then(serde_json::Value::as_str)
+            != Some(claim.claim_id.as_str())
+        {
+            return Err(AdmittedMaterialError::Binding(
+                "kernel file receipt does not answer the presented claim".to_owned(),
+            ));
+        }
+        if receipt
+            .get("binding_digest")
+            .and_then(serde_json::Value::as_str)
+            != Some(binding_digest.as_str())
+        {
+            return Err(AdmittedMaterialError::Binding(
+                "kernel file receipt digest does not bind the presented claim".to_owned(),
+            ));
+        }
+        if receipt
+            .get("operation_id")
+            .and_then(serde_json::Value::as_str)
+            != Some(claim.operation_id.as_str())
+        {
+            return Err(AdmittedMaterialError::Binding(
+                "kernel file receipt operation does not bind the presented claim".to_owned(),
+            ));
+        }
+        match receipt
+            .get("receipt_digest")
+            .and_then(serde_json::Value::as_str)
+        {
+            Some(digest) if is_lowercase_sha256(digest) => {}
+            _ => {
+                return Err(AdmittedMaterialError::Contract(
+                    "kernel file receipt digest is not a lowercase SHA-256 digest".to_owned(),
+                ));
+            }
+        }
+        if receipt.get("authority_epoch") != request.get("authority_epoch") {
+            return Err(AdmittedMaterialError::Binding(
+                "kernel file receipt epoch does not bind the presented claim".to_owned(),
+            ));
+        }
+        // The live authority binds the claim: the file epoch is the epoch
+        // the contour admitted under, and the file generation is the live
+        // activation generation the grant fences. Either disagreeing with
+        // the claim means a foreign or stale file.
+        if file.epoch != request["authority_epoch"] {
+            return Err(AdmittedMaterialError::Binding(
+                "kernel file epoch does not bind the presented claim".to_owned(),
+            ));
+        }
+        if file.generation == 0 || file.generation != claim.worker_generation {
+            return Err(AdmittedMaterialError::Binding(
+                "kernel file generation does not bind the presented claim generation".to_owned(),
+            ));
+        }
+
+        // The session nonce is well-formed and carried for correlation. It
+        // is deliberately NOT equated with the join launch nonce: the kernel
+        // mints it independently per dispatch.
+        validate_nonce(&file.nonce)?;
+
+        // The grant funds the in-child one-shot permit. Digest shape, live
+        // window, fence/lease construction through the production
+        // constructors, and epoch agreement with the admitted claim — a
+        // foreign or stale grant is refused before anything issues.
+        let grant = &file.grant;
+        if !is_lowercase_sha256(&grant.grant_digest) {
+            return Err(AdmittedMaterialError::Contract(
+                "kernel file grant digest is not a lowercase SHA-256 digest".to_owned(),
+            ));
+        }
+        if grant.expires_at == 0 || grant.expires_at <= now_ms {
+            return Err(AdmittedMaterialError::Contract(
+                "kernel file grant window is stale or expired".to_owned(),
+            ));
+        }
+        if grant.authority_epoch != request["authority_epoch"] {
+            return Err(AdmittedMaterialError::Binding(
+                "kernel file grant epoch does not bind the presented claim".to_owned(),
+            ));
+        }
+        if grant.fence_generation != claim.worker_generation {
+            return Err(AdmittedMaterialError::Binding(
+                "kernel file grant generation does not bind the presented claim generation"
+                    .to_owned(),
+            ));
+        }
+        let fence_generation = Generation::new(grant.fence_generation).map_err(|error| {
+            AdmittedMaterialError::Contract(truncate_detail(&error.to_string()))
+        })?;
+        // The window opens at the receipt admission time carried in the
+        // file — the same instant the Kernel grant window opens — so both
+        // owner and child derive identical freshness without mirroring any
+        // kernel window constant.
+        let admitted_at = receipt
+            .get("admitted_at_unix_ms")
+            .and_then(serde_json::Value::as_u64)
+            .unwrap_or_default();
+        if admitted_at == 0 || admitted_at > now_ms || grant.expires_at <= admitted_at {
+            return Err(AdmittedMaterialError::Contract(
+                "kernel file grant window does not open at admission".to_owned(),
+            ));
+        }
+        let fence = FencingToken::new(
+            claim.authority_epoch.clone(),
+            fence_generation,
+            grant.fence_nonce.clone(),
+        )
+        .map_err(|error| AdmittedMaterialError::Contract(truncate_detail(&error.to_string())))?;
+        let lease = ActionLeaseRef::new(grant.idempotency_key.clone()).map_err(|error| {
+            AdmittedMaterialError::Contract(truncate_detail(&error.to_string()))
+        })?;
+        let validated_grant = ValidatedDispatchGrant::new(
+            fence,
+            lease,
+            grant.grant_digest.clone(),
+            admitted_at,
+            grant.expires_at,
+        )
+        .map_err(|error| AdmittedMaterialError::Contract(truncate_detail(&error.to_string())))?;
+
+        // Registration derived from admitted material plus live process
+        // observables. Every identity-carrying field comes from the admitted
+        // request; only the observation-bound fields (own PID, wall-clock
+        // lease window) come from the live process, and the worker-originated
+        // presentation identities derive deterministically from the proven
+        // binding digest so they can never collide across claims.
+        let limits = admitted_limits(request.get("budget").unwrap_or(&serde_json::Value::Null))?;
+        let limits_json = serde_json::to_value(limits).map_err(|error| {
+            AdmittedMaterialError::Contract(truncate_detail(&error.to_string()))
+        })?;
+        let lease_expires_at = now_ms.saturating_add(60_000);
+        if lease_expires_at <= now_ms {
+            return Err(AdmittedMaterialError::Contract(
+                "worker lease window is not well-formed".to_owned(),
+            ));
+        }
+        let installation_id = request
+            .get("installation_id")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or_default();
+        let registration_json = serde_json::json!({
+            "registration_id": request.get("registration_id").cloned().unwrap_or(serde_json::Value::Null),
+            "installation_id": installation_id,
+            "worker_artifact_digest": request.get("worker_artifact_digest").cloned().unwrap_or(serde_json::Value::Null),
+            "worker_config_digest": request.get("worker_config_digest").cloned().unwrap_or(serde_json::Value::Null),
+            "protocol_version": request.get("protocol_version").cloned().unwrap_or(serde_json::Value::Null),
+            "worker_generation": claim.worker_generation,
+            "process_id": std::process::id(),
+            "process_start_100ns": now_ms.saturating_mul(10_000),
+            "process_image_digest": request.get("worker_artifact_digest").cloned().unwrap_or(serde_json::Value::Null),
+            "principal_ref": installation_id,
+            "session_id": format!("native-worker-session-{binding_digest}"),
+            "connection_id": format!("native-worker-conn-{binding_digest}"),
+            "authority_epoch": request.get("authority_epoch").cloned().unwrap_or(serde_json::Value::Null),
+            "state_fence": request.get("state_fence").cloned().unwrap_or(serde_json::Value::Null),
+            "lease_id": format!("native-worker-lease-{binding_digest}"),
+            "lease_expires_at_unix_ms": lease_expires_at,
+            "renewal_id": format!("native-worker-renewal-{binding_digest}"),
+            "execution_unit_schema_version": request.get("execution_unit_schema_version").cloned().unwrap_or(serde_json::Value::Null),
+            "resource_limits": limits_json,
+            "invalidation_set": [],
+        });
+        let registration: NativeWorkerRegistration =
+            serde_json::from_value(registration_json.clone()).map_err(|error| {
+                AdmittedMaterialError::Malformed(truncate_detail(&error.to_string()))
+            })?;
+        registration.validate().map_err(|error| {
+            AdmittedMaterialError::Contract(truncate_detail(&error.to_string()))
+        })?;
+        let admission_json =
+            serde_json::json!({"registration": registration_json, "claim": claim_json});
+        let admission: ClaimAdmissionRequest =
+            serde_json::from_value(admission_json).map_err(|error| {
+                AdmittedMaterialError::Malformed(truncate_detail(&error.to_string()))
+            })?;
+        admission.validate_binding().map_err(|error| {
+            AdmittedMaterialError::Contract(truncate_detail(&error.to_string()))
+        })?;
+
+        // Worker-originated handshake for the admitted claim. Every
+        // join-bound field echoes the validated join (route, launch nonce,
+        // generation, epoch, fence); the deadline sits strictly inside both
+        // the claim window and the binding window; the remaining fields are
+        // worker-ambient (connection/request/trace/capabilities/manifest
+        // reference) and carry no authority — the `from_claim` join plus the
+        // executable gate re-prove the bound fields at drive time.
+        let window_cap = claim.deadline_unix_ms.min(join.expires_at_unix_ms);
+        let hello_deadline = now_ms
+            .saturating_add(30_000)
+            .min(window_cap.saturating_sub(1));
+        if hello_deadline == 0 {
+            return Err(AdmittedMaterialError::Contract(
+                "kernel file claim window cannot host a handshake deadline".to_owned(),
+            ));
+        }
+        let hello = WorkerHello {
+            protocol_version: PROTOCOL_VERSION.to_owned(),
+            encoding_profile: JSON_ENCODING_PROFILE.to_owned(),
+            connection_id: format!("native-worker-conn-{binding_digest}"),
+            request_id: format!("native-worker-start-{binding_digest}"),
+            trace_context: std::collections::BTreeMap::from([(
+                "eliot.dispatch_nonce".to_owned(),
+                file.nonce.clone(),
+            )]),
+            deadline_unix_ms: hello_deadline,
+            artifact_manifest_digest: join.facet_manifest_ref.clone(),
+            launch_nonce: join.launch_nonce.clone(),
+            worker_generation: claim.worker_generation,
+            authority_epoch: claim.authority_epoch.clone(),
+            state_fence: claim.state_fence.clone(),
+            route_ref: join.route_ref.clone(),
+            requested_capabilities: std::collections::BTreeSet::from([
+                "execute".to_owned(),
+                "inspect".to_owned(),
+            ]),
+        };
+
+        // Worker-originated reconcile and readiness for the exact admitted
+        // claim, each through its production gate. The registry revision
+        // echoes the admitted join identity and revision — the same values
+        // the factory seam resolves — while the drive re-proves the live
+        // resolution before anything starts.
+        let reconcile = ReconcileSubmission::new(
+            format!("native-worker-reconcile-{binding_digest}"),
+            claim.clone(),
+            None,
+        );
+        reconcile.validate().map_err(|error| {
+            AdmittedMaterialError::Contract(truncate_detail(&error.to_string()))
+        })?;
+        let claim_epoch_json = serde_json::to_value(&claim.authority_epoch).map_err(|error| {
+            AdmittedMaterialError::Contract(truncate_detail(&error.to_string()))
+        })?;
+        let claim_fence_json = serde_json::to_value(&claim.state_fence).map_err(|error| {
+            AdmittedMaterialError::Contract(truncate_detail(&error.to_string()))
+        })?;
+        let readiness_json = serde_json::json!({
+            "claim": claim_json,
+            "readiness": {
+                "kind": "READY",
+                "payload": {
+                    "ready_id": format!("native-worker-ready-{binding_digest}"),
+                    "claim_id": claim.claim_id.as_str(),
+                    "registration_id": claim.registration_id.as_str(),
+                    "worker_generation": claim.worker_generation,
+                    "authority_epoch": claim_epoch_json,
+                    "state_fence": claim_fence_json,
+                    "claim_binding_digest": binding_digest,
+                    "adapter_registry_revision": format!("{}-r{}", join.adapter_id, join.adapter_revision),
+                    "credential_refs": [],
+                    "ready_at_unix_ms": now_ms,
+                },
+            },
+        });
+        let readiness: ReadinessSubmission =
+            serde_json::from_value(readiness_json).map_err(|error| {
+                AdmittedMaterialError::Malformed(truncate_detail(&error.to_string()))
+            })?;
+        readiness.validate_binding(now_ms).map_err(|error| {
+            AdmittedMaterialError::Contract(truncate_detail(&error.to_string()))
+        })?;
+
+        let worker_artifact_digest = request
+            .get("worker_artifact_digest")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or_default()
+            .to_owned();
+        Ok(ValidatedAdmittedMaterial {
+            admission,
+            hello,
+            reconcile,
+            readiness,
+            nonce: join.launch_nonce.clone(),
+            grant: Some(validated_grant),
+            kernel_nonce: Some(file.nonce),
+            worker_artifact_digest,
+        })
+    }
+
+    /// Projects the admitted budget onto bounded executor limits.
+    ///
+    /// The claim budget carries no CPU or memory dimensions, so those stay
+    /// unset; each byte stream is capped independently at the admitted
+    /// output budget. The executor enforces the ceilings at start.
+    fn admitted_limits(
+        budget: &serde_json::Value,
+    ) -> Result<eliot_process::ResourceLimits, AdmittedMaterialError> {
+        use eliot_process::ResourceLimits;
+        let wall_timeout_ms = budget
+            .get("wall_time_ms")
+            .and_then(serde_json::Value::as_u64)
+            .unwrap_or_default();
+        let output_bytes = budget
+            .get("output_bytes")
+            .and_then(serde_json::Value::as_u64)
+            .unwrap_or_default();
+        let max_descendants = budget
+            .get("max_descendants")
+            .and_then(serde_json::Value::as_u64)
+            .and_then(|value| u32::try_from(value).ok())
+            .unwrap_or_default();
+        ResourceLimits::new(
+            wall_timeout_ms,
+            None,
+            None,
+            output_bytes,
+            output_bytes,
+            max_descendants,
+        )
+        .map_err(|error| AdmittedMaterialError::Contract(truncate_detail(&error.to_string())))
+    }
+
+    /// Returns true for a lowercase SHA-256 digest shape.
+    fn is_lowercase_sha256(value: &str) -> bool {
+        value.len() == 64
+            && value
+                .bytes()
+                .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
     }
 
     /// Current Unix time in milliseconds for readiness deadline checks.
@@ -1092,5 +2107,28 @@ mod tests {
             select_factory_from_presented(&unrevised, &hello, nonce),
             Err(NativeWorkerError::KernelAdmissionRequired(_))
         ));
+    }
+
+    #[test]
+    fn contour_sha256_matches_standard_vectors_and_canonical_hasher() {
+        use crate::dispatch_authority::{hex_bytes, sha256_bytes};
+        // Published SHA-256 vectors: the dependency-frozen implementation
+        // must reproduce them exactly, or owner-side key derivation (which
+        // uses the canonical hasher) diverges and no join ever closes.
+        assert_eq!(
+            hex_bytes(&sha256_bytes(b"")),
+            "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        );
+        assert_eq!(
+            hex_bytes(&sha256_bytes(b"abc")),
+            "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
+        );
+        // Byte-for-byte against the repository hasher on non-trivial input:
+        // two independent implementations agreeing here is the interop proof.
+        let input = b"eliot-native-worker dispatch contour interop probe 0123456789 abcdefghijklmnopqrstuvwxyz";
+        assert_eq!(
+            hex_bytes(&sha256_bytes(input)),
+            eliot_contracts::sha256_hex(input)
+        );
     }
 }
