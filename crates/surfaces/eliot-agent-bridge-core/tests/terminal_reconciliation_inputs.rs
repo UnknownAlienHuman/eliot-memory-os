@@ -16,7 +16,7 @@ use eliot_agent_bridge_core::{
     EventPortOutcome, FencingToken, Generation, HostActivationPort, HostEventEnvelope,
     HostEventKind, McpForwardingPort, PrincipalId, ProviderFailure, ProviderReadiness,
     ReconciliationPortOutcome, RecoveryDirective, RecoveryDirectiveKind, RouteFingerprint,
-    SessionId, TaskId, WorkUnitId,
+    SessionId, TaskId, TerminalReductionInputs, WorkUnitId,
 };
 use eliot_agent_bridge_core::{TransportEdge, TransportEdgeKind};
 use eliot_contracts::{EpochId, EpochLineageId};
@@ -204,9 +204,10 @@ fn managed_request() -> Result<AttachRequest, Box<dyn std::error::Error>> {
     ))
 }
 
-#[test]
-fn recoverable_error_then_corrected_call_yields_independent_terminal_inputs()
--> Result<(), Box<dyn std::error::Error>> {
+fn seeded_recovery_core() -> Result<
+    (AgentBridgeCore, TerminalReductionInputs),
+    Box<dyn std::error::Error>,
+> {
     let mut core = bridge()?;
     assert!(core.terminal_reduction_inputs().is_none());
     core.attach(managed_request()?)?;
@@ -293,6 +294,13 @@ fn recoverable_error_then_corrected_call_yields_independent_terminal_inputs()
     let inputs = core
         .terminal_reduction_inputs()
         .ok_or("missing terminal reduction inputs")?;
+    Ok((core, inputs))
+}
+
+#[test]
+fn recoverable_error_then_corrected_call_yields_independent_terminal_inputs()
+-> Result<(), Box<dyn std::error::Error>> {
+    let (_core, inputs) = seeded_recovery_core()?;
 
     // Fingerprint passthrough: the exact host route, untouched.
     assert_eq!(inputs.fingerprint(), Some(&test_route()?));
