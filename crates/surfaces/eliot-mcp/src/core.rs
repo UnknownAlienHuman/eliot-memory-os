@@ -432,6 +432,177 @@ pub fn project_evidence_pack_projection(
     }
 }
 
+/// Closed T11.3 reconstruction query plan derived from an explicit-intent
+/// `eliot.query` with `ContextReconstruction` mode.
+///
+/// This is the pure planning half of the `KernelGovernorPort::dispatch` seam
+/// for `ToolRequest::Query`: it carries only validated strings (task-bound
+/// scope, exact task selector, evidence selectors, position selector) without
+/// importing store types, so this crate stays transport-only and the store
+/// catalogue remains the authority. Free-text `query` is intent data, never a
+/// selector: T11.3 requires the exact form `task:<exact-task-id>`; anything
+/// else fails closed instead of becoming a substring search or a forwarded
+/// `query` parameter. The Governor reconstruction composition behind
+/// `KernelGovernorPort` binds these selectors to the six
+/// ContextReconstruction-admitted named reads; the seven provider-role
+/// dispositions return through
+/// [`project_context_reconstruction_projection`].
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ContextReconstructionQueryPlan {
+    /// Exact task-bound scope (from the trusted active session binding, never
+    /// from MCP arguments alone).
+    pub scope_id: String,
+    /// Exact task identity (never a substring, never blank).
+    pub task_id: String,
+    /// Exact captured-observation subject for the evidence role.
+    pub evidence_subject: String,
+    /// Explicit evidence `max_records` bound carried as its decimal string.
+    pub evidence_max_records: String,
+    /// Exact position selector for the activation-evidence role.
+    pub position: String,
+}
+
+impl ContextReconstructionQueryPlan {
+    /// Closed intent name this plan executes.
+    #[must_use]
+    pub const fn operation_name() -> &'static str {
+        "ContextReconstruction"
+    }
+
+    /// Closed named-read operation names bound by this plan, in canonical
+    /// role order. Spellings match the store catalogue's `PascalCase` wire
+    /// form; the catalogue — not this crate — admits them for execution.
+    #[must_use]
+    pub const fn role_operation_names() -> [&'static str; 6] {
+        [
+            "GetTaskState",
+            "GetAttentionAndProblems",
+            "GetCurrentEpistemicPosition",
+            "GetUnderstandingProjectionInputs",
+            "GetEvidencePack",
+            "GetCapabilityEvidenceState",
+        ]
+    }
+}
+
+/// Plans one closed reconstruction closure from an explicit-intent query.
+///
+/// Only the `ContextReconstruction` intent plans here (any other mode fails
+/// closed as unsupported instead of borrowing the reconstruction closure);
+/// `exact_resource_uri` fails closed because exact expansion uses the
+/// resource path, not a query; `query` must be the exact
+/// `task:<exact-task-id>` selector form. `scope_id` comes from the trusted
+/// active session binding and the store enforces the catalogue
+/// `EVIDENCE_PACK_MAX_RECORDS` cap on the carried bound.
+pub fn plan_context_reconstruction_query(
+    input: &QueryInput,
+    scope_id: &str,
+    evidence_subject: &str,
+    evidence_max_records: &str,
+    position: &str,
+) -> Result<ContextReconstructionQueryPlan, BridgeError> {
+    if !matches!(input.intent.mode, QueryMode::ContextReconstruction) {
+        return Err(BridgeError::Port(PortFailure::Unsupported {
+            capability: "ContextReconstruction".to_owned(),
+            reason: "the reconstruction closure admits only the ContextReconstruction intent"
+                .to_owned(),
+        }));
+    }
+    if input.exact_resource_uri.is_some() {
+        return Err(BridgeError::invalid(
+            "query.exact_resource_uri",
+            "exact resource expansion uses the resource path, not eliot.query",
+        ));
+    }
+    if scope_id.trim().is_empty() || scope_id.chars().any(char::is_control) {
+        return Err(BridgeError::invalid(
+            "query.scope_id",
+            "must be non-blank and contain no control characters",
+        ));
+    }
+    let task_id = input
+        .query
+        .strip_prefix("task:")
+        .map(str::trim)
+        .filter(|task| !task.is_empty() && !task.chars().any(char::is_control))
+        .ok_or_else(|| {
+            BridgeError::invalid(
+                "query.query",
+                "T11.3 requires the exact form `task:<exact-task-id>`; free-text search is not an exact selector",
+            )
+        })?;
+    if evidence_subject.trim().is_empty() || evidence_subject.chars().any(char::is_control) {
+        return Err(BridgeError::invalid(
+            "query.evidence_subject",
+            "must be non-blank and contain no control characters",
+        ));
+    }
+    if evidence_max_records.trim().is_empty() || evidence_max_records.chars().any(char::is_control)
+    {
+        return Err(BridgeError::invalid(
+            "query.evidence_max_records",
+            "must be a non-blank decimal bound",
+        ));
+    }
+    let bound: u32 = evidence_max_records.trim().parse().map_err(|_| {
+        BridgeError::invalid(
+            "query.evidence_max_records",
+            "must be a positive decimal bound",
+        )
+    })?;
+    if bound == 0 {
+        return Err(BridgeError::invalid(
+            "query.evidence_max_records",
+            "must be a positive decimal bound",
+        ));
+    }
+    if position.trim().is_empty() || position.chars().any(char::is_control) {
+        return Err(BridgeError::invalid(
+            "query.position",
+            "must be non-blank and contain no control characters",
+        ));
+    }
+    Ok(ContextReconstructionQueryPlan {
+        scope_id: scope_id.trim().to_owned(),
+        task_id: task_id.to_owned(),
+        evidence_subject: evidence_subject.trim().to_owned(),
+        evidence_max_records: evidence_max_records.trim().to_owned(),
+        position: position.trim().to_owned(),
+    })
+}
+
+/// Projects a successful reconstruction payload into a bounded `Projection`.
+///
+/// Kind is always `Projection` (read-only owner state, never a candidate);
+/// proof ceiling is `ScopedVerification` (the strongest ceiling MCP
+/// projections may claim); no `CurrentPosition` claim is expressed. The exact
+/// owner payload — the seven role dispositions with their fence identity —
+/// crosses unchanged under `context_reconstruction` with its task/scope
+/// identity.
+#[must_use]
+#[allow(
+    clippy::needless_pass_by_value,
+    reason = "payload moves into the JSON projection; clippy cannot see through json!"
+)]
+pub fn project_context_reconstruction_projection(
+    plan: &ContextReconstructionQueryPlan,
+    payload: Value,
+) -> PortProjection {
+    PortProjection {
+        kind: ProjectionKind::Projection,
+        content: json!({
+            "operation": ContextReconstructionQueryPlan::operation_name(),
+            "task_id": plan.task_id,
+            "scope_id": plan.scope_id,
+            "context_reconstruction": payload,
+        }),
+        artifacts: Vec::new(),
+        proof_ceiling: ProofCeiling::ScopedVerification,
+        resource: None,
+        durable_job: None,
+    }
+}
+
 /// Closed non-authoritative projection classes returned by the injected port.
 #[derive(Clone, Copy, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
@@ -1787,6 +1958,191 @@ mod evidence_pack_query_plan_tests {
         assert_eq!(projection.content["subject"], "evidence-alpha");
         assert_eq!(projection.content["scope_id"], "scope-evidence");
         assert_eq!(projection.content["evidence_pack"], payload);
+        assert!(projection.artifacts.is_empty());
+        assert!(projection.resource.is_none());
+        assert!(projection.durable_job.is_none());
+    }
+}
+
+#[cfg(test)]
+#[allow(
+    clippy::expect_used,
+    clippy::unwrap_used,
+    clippy::too_many_lines,
+    reason = "T11.3 planning tests: every asserted task, bound, scope, intent gate, and projection value is derived from the test inputs; nothing is canned"
+)]
+mod context_reconstruction_query_plan_tests {
+    //! T11.3 `eliot.query` planning tests at the MCP dispatch seam.
+    //!
+    //! The planner maps an explicit-intent `QueryInput` with
+    //! `ContextReconstruction` mode to the closed task/evidence/position
+    //! selectors without ever forwarding free text. Every asserted task,
+    //! bound, scope, intent gate, and projection shape is derived from the
+    //! test inputs; nothing is canned.
+
+    use super::*;
+    use crate::{QueryInput, QueryIntent};
+
+    fn reconstruction_intent(mode: QueryMode) -> QueryIntent {
+        QueryIntent {
+            mode,
+            time_scope: "task window for reconstruction".to_owned(),
+            branch_environment_scope: "test branch and environment".to_owned(),
+            freshness_policy: "exact admitted generation only".to_owned(),
+            required_assurance: "reconstruction input read".to_owned(),
+        }
+    }
+
+    fn input(mode: QueryMode, query: &str) -> QueryInput {
+        QueryInput {
+            intent: reconstruction_intent(mode),
+            query: query.to_owned(),
+            exact_resource_uri: None,
+        }
+    }
+
+    fn plan(query: &str) -> Result<ContextReconstructionQueryPlan, BridgeError> {
+        plan_context_reconstruction_query(
+            &input(QueryMode::ContextReconstruction, query),
+            "scope-task",
+            "evidence-alpha",
+            "8",
+            "position-one",
+        )
+    }
+
+    #[test]
+    fn plans_exact_task_with_explicit_selectors_and_scope() {
+        let plan = plan("task:task-7").expect("exact selector plans");
+        assert_eq!(plan.task_id, "task-7");
+        assert_eq!(plan.scope_id, "scope-task");
+        assert_eq!(plan.evidence_subject, "evidence-alpha");
+        assert_eq!(plan.evidence_max_records, "8");
+        assert_eq!(plan.position, "position-one");
+        assert_eq!(
+            ContextReconstructionQueryPlan::operation_name(),
+            "ContextReconstruction"
+        );
+        assert_eq!(
+            ContextReconstructionQueryPlan::role_operation_names(),
+            [
+                "GetTaskState",
+                "GetAttentionAndProblems",
+                "GetCurrentEpistemicPosition",
+                "GetUnderstandingProjectionInputs",
+                "GetEvidencePack",
+                "GetCapabilityEvidenceState",
+            ]
+        );
+    }
+
+    #[test]
+    fn only_context_reconstruction_intent_plans() {
+        for mode in [
+            QueryMode::CurrentPosition,
+            QueryMode::HistoricalReconstruction,
+            QueryMode::Provenance,
+            QueryMode::Navigation,
+            QueryMode::Verification,
+            QueryMode::ChangeImpact,
+        ] {
+            match plan_context_reconstruction_query(
+                &input(mode, "task:task-7"),
+                "scope-task",
+                "evidence-alpha",
+                "8",
+                "position-one",
+            ) {
+                Err(BridgeError::Port(PortFailure::Unsupported { capability, .. })) => {
+                    assert_eq!(capability, "ContextReconstruction");
+                }
+                other => panic!("non-reconstruction intent must fail closed: {other:?}"),
+            }
+        }
+        plan("task:task-7").expect("ContextReconstruction intent plans");
+    }
+
+    #[test]
+    fn rejects_free_text_resource_uri_and_bad_selectors() {
+        // Free text without the exact `task:` form is not a selector.
+        assert!(matches!(
+            plan("retrieve the task context"),
+            Err(BridgeError::InvalidArgument { field, .. }) if field == "query.query"
+        ));
+        // Exact expansion uses the resource path, not a query.
+        let mut with_uri = input(QueryMode::ContextReconstruction, "task:task-7");
+        with_uri.exact_resource_uri = Some("eliot://resource/task-7".to_owned());
+        assert!(matches!(
+            plan_context_reconstruction_query(
+                &with_uri,
+                "scope-task",
+                "evidence-alpha",
+                "8",
+                "position-one",
+            ),
+            Err(BridgeError::InvalidArgument { field, .. })
+                if field == "query.exact_resource_uri"
+        ));
+        // Zero, non-numeric, and blank evidence bounds fail closed.
+        for bound in ["0", "ten", "  "] {
+            assert!(
+                plan_context_reconstruction_query(
+                    &input(QueryMode::ContextReconstruction, "task:task-7"),
+                    "scope-task",
+                    "evidence-alpha",
+                    bound,
+                    "position-one",
+                )
+                .is_err(),
+                "bound {bound:?} must fail closed"
+            );
+        }
+        // Blank scope, subject, and position fail closed before transport.
+        assert!(matches!(
+            plan_context_reconstruction_query(
+                &input(QueryMode::ContextReconstruction, "task:task-7"),
+                "  ",
+                "evidence-alpha",
+                "8",
+                "position-one",
+            ),
+            Err(BridgeError::InvalidArgument { field, .. }) if field == "query.scope_id"
+        ));
+        assert!(matches!(
+            plan_context_reconstruction_query(
+                &input(QueryMode::ContextReconstruction, "task:task-7"),
+                "scope-task",
+                "  ",
+                "8",
+                "position-one",
+            ),
+            Err(BridgeError::InvalidArgument { field, .. })
+                if field == "query.evidence_subject"
+        ));
+        assert!(matches!(
+            plan_context_reconstruction_query(
+                &input(QueryMode::ContextReconstruction, "task:task-7"),
+                "scope-task",
+                "evidence-alpha",
+                "8",
+                "  ",
+            ),
+            Err(BridgeError::InvalidArgument { field, .. }) if field == "query.position"
+        ));
+    }
+
+    #[test]
+    fn projects_bounded_projection_without_current_position_claim() {
+        let plan = plan("task:task-7").expect("exact selector plans");
+        let payload = json!({"roles": [], "state_fence": "fence-1"});
+        let projection = project_context_reconstruction_projection(&plan, payload.clone());
+        assert_eq!(projection.kind, ProjectionKind::Projection);
+        assert_eq!(projection.proof_ceiling, ProofCeiling::ScopedVerification);
+        assert!(projection.proof_ceiling.is_at_most(ProofCeiling::ScopedVerification));
+        assert_eq!(projection.content["operation"], "ContextReconstruction");
+        assert_eq!(projection.content["task_id"], "task-7");
+        assert_eq!(projection.content["scope_id"], "scope-task");
+        assert_eq!(projection.content["context_reconstruction"], payload);
         assert!(projection.artifacts.is_empty());
         assert!(projection.resource.is_none());
         assert!(projection.durable_job.is_none());
