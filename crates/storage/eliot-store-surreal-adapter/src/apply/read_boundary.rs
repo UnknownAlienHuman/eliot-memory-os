@@ -1273,19 +1273,42 @@ mod real_scope_tests {
 
         async fn open(&mut self) {
             let platform = WindowsPlatform::new(self.root.clone()).expect("platform");
-            let lease = platform
-                .retain_process_path_lease(
-                    Path::new(&self.config.provider_executable_path),
-                    Path::new(&self.config.store_work_root),
-                    &self.config.provider_artifact_digest,
+            let deadline = Instant::now() + Duration::from_secs(30);
+            let mut last_error = None;
+            loop {
+                let lease = platform
+                    .retain_process_path_lease(
+                        Path::new(&self.config.provider_executable_path),
+                        Path::new(&self.config.store_work_root),
+                        &self.config.provider_artifact_digest,
+                    )
+                    .expect("process lease");
+                self.adapter =
+                    Some(SurrealStoreAdapter::new(self.config.clone(), lease).expect("adapter"));
+                match tokio::time::timeout_at(deadline, self.adapter().connect()).await {
+                    Ok(Ok(())) => return,
+                    Ok(Err(error)) => last_error = Some(error),
+                    Err(_) => {
+                        self.adapter = None;
+                        panic!(
+                            "authenticated provider readiness timed out; last error: {last_error:?}"
+                        );
+                    }
+                }
+                // The adapter caches its first connection result. Drop the
+                // failed attempt before retrying startup in this isolated root;
+                // no migration or canonical operation has been submitted yet.
+                self.adapter = None;
+                assert!(
+                    Instant::now() < deadline,
+                    "authenticated provider readiness timed out; last error: {last_error:?}"
+                );
+                sleep(
+                    Duration::from_millis(100)
+                        .min(deadline.saturating_duration_since(Instant::now())),
                 )
-                .expect("process lease");
-            self.adapter =
-                Some(SurrealStoreAdapter::new(self.config.clone(), lease).expect("adapter"));
-            self.adapter()
-                .connect()
-                .await
-                .expect("authenticated provider");
+                .await;
+            }
         }
 
         fn adapter(&self) -> &SurrealStoreAdapter {
