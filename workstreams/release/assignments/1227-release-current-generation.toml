@@ -1,0 +1,147 @@
+schema = "eliot.agent-work-unit.v1"
+authority = "NON_NORMATIVE_IMPLEMENTATION_ALLOCATION"
+routing_authority = "owning_issue_and_normative_pair_only"
+status = "READY_AFTER_CURRENT_PAYLOAD_OWNERS"
+implementation_support = "STRONG_SIGNING_MECHANICS_WITH_STALE_PAYLOAD_AND_INCOMPLETE_BUILD_PROVENANCE"
+evidence_execution_status = "RELEASE_SOURCE_AND_TEST_ENTRYPOINTS_INSPECTED_TESTS_NOT_EXECUTED"
+proof_ceiling = "WINDOWS_RELEASE_GENERATION_EDGE_CANDIDATE_ONLY"
+issue = 1227
+registry_issue = 13
+legacy_core_issue = 1189
+integration_issue = 1217
+configuration_issue = 1219
+schema_issue = 1221
+operator_issue = 1137
+workflow_issue = 1225
+parent_product_issue = 11
+base_branch = "main"
+base_sha = "8ebf8b41847391c340393d56aeb14dd4f2b5e37b"
+normative_pair_ref = "docs/normative-pair.toml"
+
+[work_unit]
+cell_id = "release.windows-current-signed-generation"
+causal_property = "One Windows release generation is built from immutable source/dependency/toolchain inputs, contains only current owner-selected artifacts, signs every code-bearing payload, and crosses disjoint Author, Signer and Publisher receipts before installation."
+current_discriminator = "The builder requires legacy eliot-governor and its installed-by-default Codex bridge, recursively copies legacy config/integrations/migrations, accepts unreceipted Operator output, records incomplete build provenance and signs only seven runtime roles while additional executable code remains in the bundle."
+primary_issue_url = "https://github.com/UnknownAlienHuman/eliot-memory-os/issues/1227"
+
+[documentation]
+release = ["docs/release/WINDOWS_X64_RELEASE.md"]
+implementation = [
+  "docs/architecture/I01-02-mandatory-runtime-processes.md#i12-mandatory-runtime-processes",
+  "docs/architecture/I02-08-package-metadata-source-ownership-and-generated-registry.md#i28-package-metadata-source-ownership-and-generated-registry",
+  "docs/architecture/I02-18-build-test-and-artifact-graph.md#i218-build-test-and-artifact-graph",
+  "docs/architecture/I03-10-immutable-config-and-policy-snapshots.md#i310-immutable-config-and-policy-snapshots",
+  "docs/architecture/I14-14-module-hot-replacement.md#i1414-module-hot-replacement",
+  "docs/architecture/I15-04-secrets.md#i154-secrets",
+  "docs/architecture/I18-21-local-and-ci-parity.md#i1821-local-and-ci-parity",
+  "docs/architecture/I18-27-oracle-ownership-and-test-change-governance.md#i1827-oracle-ownership-and-test-change-governance",
+]
+anchors = ["ARCH-MOD-03", "ARCH-SEC-01", "ARCH-SEC-02", "ARCH-RES-01", "ARCH-RES-04", "ARCH-OBS-01", "ARCH-GROUND-01"]
+
+[current_source]
+confirmed = [
+  "Test-ReleaseBundle requires root eliot-governor.exe, a Codex plugin copy of it, complete config/integrations/migrations trees and canonical Skills.",
+  "The builder always builds eliot-app --bin eliot-governor and marks its Codex marketplace plugin INSTALLED_BY_DEFAULT.",
+  "The plugin MCP command executes bin/eliot-governor.exe under codex_controller.",
+  "The bundle recursively copies config, integrations and root migrations that current audits classify as legacy or unowned.",
+  "Declared Authenticode scope contains six materializer roles plus runtime/eliot.exe while root/plugin governor, Operator and code-bearing Operator dependencies are outside that seven-role set.",
+  "OperatorSource is an arbitrary caller path checked for file type and secrets but not exact source/NuGet/SDK/test/publish provenance.",
+  "Rust build uses a working tree check that ignores untracked files and does not record Cargo.lock, rust-toolchain, compiler/linker/SDK or build environment identities.",
+  "Cargo, Git and build tools are selected by command name while only signtool and SurrealDB receive explicit absolute-path treatment.",
+  "tests/release-security/run-tests.ps1 does not itself execute the separate finalizer, trusted-CLI and credentialed live-signing entrypoints.",
+]
+
+[scope]
+primary_paths = [
+  "scripts/build-eliot-windows-x64-release.ps1",
+  "scripts/finalize-eliot-windows-x64-release.ps1",
+  "scripts/invoke-eliot-windows-x64-production.ps1",
+  "tests/release-security/**",
+  "docs/release/**",
+  "exact release/install manifest and CapabilityCellRegistry consumers",
+  "exact Operator, integration, config and schema packaging adapters",
+  "root Cargo/.NET/toolchain locks required for provenance",
+]
+serialized_dependencies = ["#13", "#1189", "#1217", "#1219", "#1221", "#1137", "#1225", "#11"]
+forbidden = [
+  "automatic release triggers",
+  "broad credentials or secret-bearing artifacts",
+  "unsigned executable fallbacks",
+  "arbitrary caller payload directories",
+  "generic recursive packaging by repository presence",
+  "live database-file backup",
+  "legacy runtime revival",
+  "support or Product promotion from signing",
+]
+
+[[waves]]
+id = "A"
+what = "Generate the release payload from current ownership."
+how = [
+  "Use #13 and the accepted installation manifest to enumerate exact capability roles, source/external locks, generations, destinations and proof ceilings.",
+  "Remove legacy governor/plugin and wholesale config/integrations/migrations copying after their owner migrations.",
+  "Reject every unmanifested payload path and code-bearing file.",
+]
+
+[[waves]]
+id = "B"
+what = "Bind complete source and build provenance."
+how = [
+  "Build from an isolated exact commit tree or prove complete tracked/untracked/local-config identity.",
+  "Use frozen dependency resolution and bind Cargo.lock, rust-toolchain, cargo/rustc/linker/Windows SDK, target/features, environment and build-script closure.",
+  "Build Operator from the same source with checked NuGet lock, locked restore, exact SDK/runtime identity, executed conformance tests and one publish receipt.",
+]
+
+[[waves]]
+id = "C"
+what = "Close the signing denominator and independent handoffs."
+how = [
+  "Enumerate every PE, DLL, WinMD and other code-bearing file.",
+  "Require exact Authenticode/RFC3161 evidence for each executable item or one explicit non-executable data disposition.",
+  "Preserve disjoint Author, Signer and Publisher capabilities and link unsigned/signed manifests by exact per-file identity.",
+]
+
+[[waves]]
+id = "D"
+what = "Close release tests, publication and installation evidence."
+how = [
+  "Make the deterministic release-security aggregator invoke every non-secret fixture suite and report exact selected/executed cases.",
+  "Keep certificate/HSM live signing a separate manual gate whose absence remains explicit.",
+  "Bind final publication, installation compatibility/readback and rollback target into the release receipt while keeping Product Pulse separate.",
+]
+
+[acceptance]
+criteria = [
+  "Payload is generated from one current registry/install manifest and contains no unowned path.",
+  "Legacy governor and installed-by-default legacy Codex bridge are absent after migration; any temporary compatibility artifact is signed, bounded and expiring.",
+  "Legacy dev-single-process, .eliot-governor, Store config/schema and orphan root migration are absent.",
+  "Operator is built from exact source under locked NuGet/.NET inputs, executed tests and an immutable publish receipt; arbitrary payload directories cannot be adopted.",
+  "Rust artifacts have isolated complete source identity, frozen dependencies and recorded compiler/linker/SDK/features/environment identity.",
+  "Every code-bearing file has exact trusted signature/timestamp evidence or an explicit non-executable disposition.",
+  "SurrealDB remains exact catalogue/version/digest/architecture bound with explicit trust disposition.",
+  "Author, Signer and Publisher capabilities remain disjoint.",
+  "Unsigned and signed manifests map every changed signature-bearing byte exactly.",
+  "Final publication is create-new, atomic and identity-fenced against existing/reparse/hardlinked/foreign destinations.",
+  "The deterministic security aggregator runs every fixture suite with a nonzero case denominator; live signing remains separately reported.",
+  "Release receipt binds source, Cargo/NuGet/toolchain, external locks, payload, signatures, publisher, registry/config/schema generations and install-authoritative CLI.",
+  "Installation rejects stale or incompatible registry/config/schema/rollback identities before mutation.",
+  "Signing or publication cannot create runtime, semantic, release-acceptance or Product status.",
+  "Release docs, scripts, manifests and tests agree on the current artifact set.",
+]
+
+[verification]
+commands = [
+  "pwsh -NoProfile -File tests/release-security/run-tests.ps1",
+  "pwsh -NoProfile -File tests/release-security/finalize-signing-tests.ps1",
+  "pwsh -NoProfile -File tests/release-security/trusted-cli-launch-tests.ps1",
+  "pwsh -NoProfile -File tests/release-security/trusted-cli-live-signing-tests.ps1 <approved arguments>",
+  "dotnet restore apps/Eliot.Operator/Eliot.Operator.csproj --locked-mode",
+  "dotnet build apps/Eliot.Operator/Eliot.Operator.csproj -c Release -r win-x64 --no-restore",
+  "cargo metadata --locked --all-features --format-version 1",
+  "cargo test --locked -p eliot-installation -p eliot-cli --all-targets",
+  "cargo clippy --locked -p eliot-installation -p eliot-cli --all-targets -- -D warnings",
+  "python scripts/audit-architecture-boundaries.py",
+  "git diff --check",
+]
+edge_proof = "Execute isolated build, unsigned verification, independent signing, publisher finalization, installation and independent installed readback under exact receipts."
+product_proof = "Issue #11 remains mandatory after installation."
