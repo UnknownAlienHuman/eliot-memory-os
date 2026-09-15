@@ -117,10 +117,12 @@ pub use probe::{
     HumanAttentionDimension, INQUIRY_AFFORDANCE_SCHEMA_VERSION,
     INQUIRY_AFFORDANCE_SET_SCHEMA_VERSION, InformationDimension, InquiryAffordanceDescriptor,
     InquiryAffordanceDescriptorParams, InquiryAffordanceSet, InquiryAffordanceSetParams,
-    LatencyDimension, PossibleResultSchema, PossibleResultValue, PrivacyDimension, ProbeObjective,
-    ProbeObjectiveOrigin, ProbeObjectiveRef, ProbeObjectiveTarget, ProbeOwnerRef,
-    ResourceDimension, ResultBranch, ResultTarget, ResultUpdate, ReversibilityDimension,
-    RivalUpdateMeaning,
+    LatencyDimension, PROBE_INPUT_SCHEMA_VERSION, PossibleResultSchema, PossibleResultValue,
+    PrivacyDimension, ProbeAffordanceRef, ProbeCapabilityAvailability, ProbeExternalOwners,
+    ProbeGroundingRef, ProbeInput, ProbeInputParams, ProbeInputRef, ProbeLifecycle, ProbeObjective,
+    ProbeObjectiveOrigin, ProbeObjectiveRef, ProbeObjectiveTarget, ProbeOwnerRef, ProbeParam,
+    ProbeRepeatRef, ProbeSourceRef, ResourceDimension, ResultBranch, ResultTarget, ResultUpdate,
+    ReversibilityDimension, RivalUpdateMeaning,
 };
 pub use registry::{
     AtomicityMode, CURATION_FAMILIES, CurationFamily, CurationHandlerDescriptor,
