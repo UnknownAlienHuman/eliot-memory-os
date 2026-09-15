@@ -8,7 +8,7 @@ use eliot_native_worker::{
     admitted_material::{
         ADMITTED_DISPATCH_RESIDUAL, ValidatedAdmittedMaterial, read_admitted_material,
     },
-    drive_admitted_claimed,
+    drive_admitted_claimed, select_factory_for_admitted,
 };
 use eliot_native_worker_core::{
     CapabilityAdmissionPort, DurableCheckpointPort, DurableReplayPort, WorkerError,
@@ -56,10 +56,13 @@ fn main() {
 /// - transport open but nothing delivered → 78 `PROVIDER_RUNTIME_DEFERRED`
 ///   (preserved fail-closed);
 /// - delivered but invalid → 78 typed `KERNEL_ADMISSION_REQUIRED` denial;
-/// - validated but the kernel dispatch launch seam (T9-07) has not delivered
-///   the in-memory execution context (`ProcessRequest`, never deserialized,
-///   plus the composed provider ports) → 78 typed residual denial, never the
+/// - validated but resolving to no factory (no v2 join, route/nonce/factory
+///   mismatch) → 78 typed `KERNEL_ADMISSION_REQUIRED` denial, never the
 ///   deferred line;
+/// - validated and factory-resolved but the kernel dispatch launch seam
+///   (T9-07) has not delivered the in-memory execution context
+///   (`ProcessRequest`, never deserialized, plus the composed provider
+///   ports) → 78 typed residual denial, never the deferred line;
 /// - driven: `Ready` plus served frames → 0; a Kernel/owner admission refusal
 ///   at submit or in the claim join → 78; any other drive/serve failure → 1.
 ///   The admitted arm never emits `PROVIDER_RUNTIME_DEFERRED`.
@@ -81,16 +84,33 @@ fn run() -> i32 {
         Ok(None) => return deny_absent_material(),
         Err(error) => return deny_invalid_material(&error.to_string()),
     };
-    // Validated claim bytes are present, but the in-memory execution context
-    // (the executor-bound `ProcessRequest` plus the composed P-03 dispatch
-    // validation, G-01-facing admission, and durable checkpoint ports) arrives
-    // only with the kernel dispatch launch seam (T9-07, WRITER-B). This binary
-    // mints none of it: no deserialized process request, no local authority,
-    // no private supervisor. Until that seam lands the validated material
-    // cannot drive, so the run denies with the dispatch residual — never the
-    // deferred line, which is reserved for genuinely missing material.
+    // T9-07 (WRITER-B): the validated route resolves to exactly one factory
+    // through the registry seam (`select_factory_for_admitted`, bound by
+    // Writer A's `src/adapter_registry.rs` at integration). An unresolvable
+    // route is a refused presentation: typed 78 denial, never the deferred
+    // line and never a drive.
+    let selection = match select_factory_for_admitted(&material) {
+        Ok(selection) => selection,
+        Err(error) => return deny_invalid_material(&error.to_string()),
+    };
+    // HONESTY STOP (issue #874 binding): the factory is resolved, but the
+    // in-memory execution context (the executor-bound `ProcessRequest` plus
+    // the composed P-03 dispatch validation, G-01-facing admission, and
+    // durable checkpoint ports) arrives only with the kernel dispatch launch
+    // seam, which has no native-worker writer (owner file
+    // `bins/eliot-kernel/src/dispatch_launch.rs` serves Doctor/testd only).
+    // The validated envelope carries only digests and labels — the
+    // `process_invocation_digest`, never the invocation material; the
+    // admitted route labels, never the live owner record — and
+    // `ProcessRequest` is deliberately `Serialize`-only, so no byte surface
+    // can present it. This binary mints none of it: no deserialized process
+    // request, no local authority, no private supervisor. Until that seam
+    // lands the validated material cannot drive, so the run denies with the
+    // dispatch residual — never the deferred line, which is reserved for
+    // genuinely missing material.
     let _ = &lifecycle;
     let _ = &material;
+    let _ = &selection;
     let _ = ADMITTED_DISPATCH_RESIDUAL;
     deny_dispatch_residual()
 }
@@ -246,6 +266,12 @@ mod tests {
     //! Slice-D behaviour check: Kernel-delivered claim bytes reach `Ready`
     //! and serve, while missing/refused admission stays exit 78.
     //!
+    //! T9-07 (WRITER-B) adds the factory-resolution half: validated material
+    //! resolves to exactly one factory through `select_factory_for_admitted`,
+    //! a rewired route resolves to none (typed 78), and the admitted arm
+    //! never emits the deferred line. The execution-context half (in-memory
+    //! `ProcessRequest` plus composed ports) remains the named residual.
+    //!
     //! Windows-only trusted composition. The REAL admitted
     //! `WindowsProcessExecutor` runs a real bounded child in-process; every
     //! production validator runs (envelope binding, the `from_claim` join,
@@ -269,11 +295,11 @@ mod tests {
         StateFence, TaskId, WorkLeaseId, sha256_hex,
     };
     use eliot_native_worker::admitted_material::{
-        AdmittedClaimEnvelope, read_admitted_material_from,
+        ADMITTED_DISPATCH_RESIDUAL, AdmittedClaimEnvelope, read_admitted_material_from,
     };
     use eliot_native_worker::{
         AdmittedLifecycle, KernelReplayPort, KernelReplayTransport, NativeWorker,
-        NativeWorkerError, drive_admitted_claimed,
+        NativeWorkerError, drive_admitted_claimed, select_factory_for_admitted,
     };
     use eliot_native_worker_core::{
         AdmissionLivenessFacts, AdmissionLivenessOutcome, AuthorityEnvelope, BudgetEnvelope,
@@ -300,8 +326,9 @@ mod tests {
     use eliot_process_executor::{DispatchValidationPort, WindowsProcessExecutor};
 
     use super::{
-        ADMITTED_DRIVE_FAILED_EXIT, KERNEL_ADMISSION_EXIT, block_on, deny_absent_material,
-        deny_dispatch_residual, deny_invalid_material, deny_transport, exit_for_drive_error,
+        ADMITTED_DRIVE_FAILED_EXIT, KERNEL_ADMISSION_EXIT, PROVIDER_RUNTIME_DEFERRED, block_on,
+        deny_absent_material, deny_dispatch_residual, deny_invalid_material, deny_transport,
+        exit_for_drive_error,
     };
 
     /// Fake authenticated lifecycle: validates the exact presentation and
@@ -1069,6 +1096,20 @@ mod tests {
             claim_value.binding_digest
         );
 
+        // T9-07 (WRITER-B): the validated material resolves to exactly one
+        // factory through the registry seam — no default, no ambiguity.
+        let selection = match select_factory_for_admitted(&material) {
+            Ok(selection) => selection,
+            Err(error) => panic!("factory selection must resolve, got {error:?}"),
+        };
+        assert_eq!(selection.adapter_id, "adapter-test");
+        assert_eq!(selection.adapter_revision, 3);
+        assert_eq!(selection.route_ref, "route-1");
+        assert_eq!(
+            selection.process_invocation_digest,
+            process.invocation_digest()
+        );
+
         // The validated material drives the exact admitted contour to `Ready`
         // through the real executor: no deferred line, no exit 78.
         let port = authority_port(authority, process.fence().clone());
@@ -1150,9 +1191,48 @@ mod tests {
         );
         let _ = std::fs::remove_file(&staged);
 
+        // A route-rewired presentation reads (the envelope reader does not
+        // own route selection) but resolves to no factory: typed 78, never
+        // the deferred line, never a drive.
+        let mut rewired = envelope.clone();
+        rewired.hello.route_ref = "rewired-route-slice-d-1".to_owned();
+        let rewired_bytes = match serde_json::to_vec(&rewired) {
+            Ok(bytes) => bytes,
+            Err(error) => panic!("rewired envelope must encode: {error:?}"),
+        };
+        match std::fs::write(&staged, rewired_bytes) {
+            Ok(()) => {}
+            Err(error) => panic!("rewired envelope must stage: {error:?}"),
+        }
+        let rewired_material = match read_admitted_material_from(&staged) {
+            Ok(Some(material)) => material,
+            Ok(None) => panic!("rewired envelope must be present"),
+            Err(error) => panic!("rewired envelope must read: {error:?}"),
+        };
+        let Err(unresolved) = select_factory_for_admitted(&rewired_material) else {
+            panic!("rewired route must not resolve")
+        };
+        assert!(matches!(
+            unresolved,
+            NativeWorkerError::KernelAdmissionRequired(_)
+        ));
+        assert_eq!(
+            deny_invalid_material(&unresolved.to_string()),
+            KERNEL_ADMISSION_EXIT
+        );
+        let _ = std::fs::remove_file(&staged);
+
         // Exit projection: only missing or refused admission exits 78.
         assert_eq!(deny_transport("test detail"), KERNEL_ADMISSION_EXIT);
         assert_eq!(deny_dispatch_residual(), KERNEL_ADMISSION_EXIT);
+        // The admitted arm never emits the deferred line: factory refusals
+        // and the dispatch residual both carry the admission-required code,
+        // which is distinct from the missing-material deferral.
+        assert_ne!(
+            eliot_native_worker::KERNEL_ADMISSION_REQUIRED,
+            PROVIDER_RUNTIME_DEFERRED
+        );
+        assert_ne!(ADMITTED_DISPATCH_RESIDUAL, PROVIDER_RUNTIME_DEFERRED);
         assert_eq!(
             exit_for_drive_error(&NativeWorkerError::KernelAdmissionRequired(
                 "Kernel refused the presentation".to_owned()

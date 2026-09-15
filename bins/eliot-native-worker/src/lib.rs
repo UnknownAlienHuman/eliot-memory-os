@@ -10,8 +10,8 @@ use std::io::{self, Read, Write};
 
 use eliot_native_worker_core::{
     CapabilityAdmissionPort, ClaimAdmissionRequest, DurableCheckpointPort, DurableReplayPort,
-    NativeWorkerRegistration, ReadinessSubmission, WorkerCore, WorkerError, WorkerEventEnvelope,
-    WorkerFrame, WorkerHello, WorkerLifecycle, WorkerReady,
+    NativeWorkerClaim, NativeWorkerRegistration, ReadinessSubmission, WorkerCore, WorkerError,
+    WorkerEventEnvelope, WorkerFrame, WorkerHello, WorkerLifecycle, WorkerReady,
 };
 use eliot_process::{ProcessExecutor, ProcessRequest};
 use serde::{Deserialize, Serialize};
@@ -332,6 +332,155 @@ where
     Ok(ready)
 }
 
+/// WRITER-B → WRITER-A INTEGRATOR SEAM (T9-07, issue #874; supersedes PR #1125).
+///
+/// ASSUMED SIGNATURE (binding for the integrator):
+///
+/// ```text
+/// pub fn select_factory_for_admitted(
+///     material: &eliot_native_worker::admitted_material::ValidatedAdmittedMaterial,
+/// ) -> Result<eliot_native_worker::FactorySelection, eliot_native_worker::NativeWorkerError>
+/// ```
+///
+/// with
+///
+/// ```text
+/// pub struct FactorySelection {
+///     pub adapter_id: String,
+///     pub adapter_revision: u64,
+///     pub route_ref: String,
+///     pub config_digest: String,
+///     pub replay_stream_id: String,
+///     pub process_invocation_digest: String,
+/// }
+/// ```
+///
+/// WHAT THIS FUNCTION IS: the closed envelope projection that resolves one
+/// validated admitted route to exactly one factory identity. It projects the
+/// owner-produced v2 executable join (`adapter_id`, `adapter_revision`,
+/// `route_ref`, plus the carried digests) already bound by
+/// [`admitted_material::read_admitted_material`], and refuses anything that
+/// does not resolve to exactly one factory. It mints nothing, admits nothing,
+/// and starts nothing: the downstream `from_claim` join, executable gate,
+/// grant checks, and receipt/proof validation in
+/// [`drive_admitted_claimed`] re-prove everything before any process starts.
+///
+/// WHAT WRITER A's `bins/eliot-native-worker/src/adapter_registry.rs` MUST
+/// SATISFY (that file does not exist on base `bf219fe`; it is Writer-A owned
+/// and disjoint from this change): backing the projected identity with the
+/// live registry without weakening this fail-closed projection. The assumed
+/// Writer-A-side projection is
+///
+/// ```text
+/// pub fn resolve_admitted_factory(
+///     selection: &eliot_native_worker::FactorySelection,
+/// ) -> Result<ResolvedAdmittedFactory, eliot_native_worker::NativeWorkerError>
+/// ```
+///
+/// where `ResolvedAdmittedFactory` composes the exact `E`/`A`/`R`/`C` ports
+/// for the selected adapter. INTEGRATOR BINDING (choose one, keep fail-closed
+/// and keep exit 78 for every refusal):
+/// (a) keep this function as the closed envelope projection and add the
+/// `resolve_admitted_factory` lookup in `adapter_registry.rs`, calling it
+/// from the binary after this selection; or (b) replace this function body
+/// with the registry-backed lookup while preserving this exact signature,
+/// this exact fail-closed refusal family, and the 78 mapping in the binary.
+/// The integrator must not equate the admitted `route_class` label with a
+/// full route fingerprint, must not default a factory, and must not let an
+/// ambiguous or unknown route resolve.
+///
+/// FAIL-CLOSED FAMILY (every variant maps to exit 78 in the binary via the
+/// typed `KERNEL_ADMISSION_REQUIRED` denial, never the deferred line and
+/// never a drive): the claim carries no v2 executable join (old wire can
+/// never select a factory); the join route does not equal the presented
+/// hello route; the join nonce is not the session nonce; the factory identity
+/// is blank; the adapter revision is zero. Full shape, digest, epoch, fence,
+/// and window checks stay with the envelope reader and the drive; this seam
+/// is the route-resolution projection only.
+///
+/// HONESTY BOUNDARY (issue #874 binding): this seam resolves the factory
+/// identity only. It does not derive the executor-bound `ProcessRequest`
+/// (never deserialized, never minted) and does not compose the P-03/G-01/
+/// checkpoint ports. Those arrive only with the kernel dispatch launch seam
+/// named by
+/// [`ADMITTED_DISPATCH_RESIDUAL`](admitted_material::ADMITTED_DISPATCH_RESIDUAL);
+/// until that seam lands the binary keeps the residual terminus for exactly
+/// that gap (see `bins/eliot-native-worker/src/main.rs::run`).
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct FactorySelection {
+    /// Owner-produced adapter/factory identity from the v2 executable join.
+    pub adapter_id: String,
+    /// Owner-produced adapter revision from the join; always nonzero.
+    pub adapter_revision: u64,
+    /// Full canonical route label from the join, bound to the hello route.
+    pub route_ref: String,
+    /// Lowercase SHA-256 of the admitted worker configuration bytes.
+    pub config_digest: String,
+    /// Replay stream identity bound to the claim generation.
+    pub replay_stream_id: String,
+    /// Lowercase SHA-256 of the exact process invocation the join binds.
+    ///
+    /// Digest only: the invocation material itself is never carried here and
+    /// can never be inverted from this digest.
+    pub process_invocation_digest: String,
+}
+
+/// Resolves one validated admitted route to exactly one factory identity.
+///
+/// See the [`FactorySelection`] integrator seam documentation for the binding
+/// contract, the Writer-A-side assumption, and the honesty boundary.
+pub fn select_factory_for_admitted(
+    material: &admitted_material::ValidatedAdmittedMaterial,
+) -> Result<FactorySelection, NativeWorkerError> {
+    select_factory_from_presented(material.admission.claim(), &material.hello, &material.nonce)
+}
+
+/// Projects one presented claim plus hello plus session nonce to exactly one
+/// factory identity, fail-closed.
+///
+/// `crate`-internal so the [`FactorySelection`] seam stays the single public
+/// projection while tests prove every refusal branch directly.
+fn select_factory_from_presented(
+    claim: &NativeWorkerClaim,
+    hello: &WorkerHello,
+    nonce: &str,
+) -> Result<FactorySelection, NativeWorkerError> {
+    let join = claim.executable_binding.as_ref().ok_or_else(|| {
+        NativeWorkerError::KernelAdmissionRequired(
+            "admitted claim carries no executable join; old wire cannot select a factory"
+                .to_owned(),
+        )
+    })?;
+    if join.route_ref != hello.route_ref {
+        return Err(NativeWorkerError::KernelAdmissionRequired(
+            "admitted route does not bind the presented hello".to_owned(),
+        ));
+    }
+    if join.launch_nonce != nonce {
+        return Err(NativeWorkerError::KernelAdmissionRequired(
+            "admitted factory nonce is not bound to the session material".to_owned(),
+        ));
+    }
+    if join.adapter_id.trim().is_empty() {
+        return Err(NativeWorkerError::KernelAdmissionRequired(
+            "admitted factory identity is missing".to_owned(),
+        ));
+    }
+    if join.adapter_revision == 0 {
+        return Err(NativeWorkerError::KernelAdmissionRequired(
+            "admitted factory revision is missing".to_owned(),
+        ));
+    }
+    Ok(FactorySelection {
+        adapter_id: join.adapter_id.clone(),
+        adapter_revision: join.adapter_revision,
+        route_ref: join.route_ref.clone(),
+        config_digest: join.config_digest.clone(),
+        replay_stream_id: join.replay_stream_id.clone(),
+        process_invocation_digest: join.process_invocation_digest.clone(),
+    })
+}
+
 /// Bins-local admitted-claim material reader for the native-worker dispatch
 /// contour (slice D, T9-07 consumer half).
 ///
@@ -381,9 +530,12 @@ where
 /// composition value that is never deserialized from a wire type and never
 /// minted here, and the composed provider ports (P-03 dispatch validation,
 /// G-01-facing admission, durable checkpoint) arrive only with the kernel
-/// dispatch launch (T9-07, WRITER-B). Those gaps are named by
+/// dispatch launch (T9-07, WRITER-B). The factory-identity half of that seam
+/// landed as [`FactorySelection`][crate::FactorySelection] plus
+/// [`select_factory_for_admitted`][crate::select_factory_for_admitted];
+/// the remaining execution-context gap is named by
 /// [`ADMITTED_DISPATCH_RESIDUAL`][crate::admitted_material::ADMITTED_DISPATCH_RESIDUAL];
-/// until they land even a validated file cannot drive. The drive itself
+/// until it lands even a validated file cannot drive. The drive itself
 /// re-proves everything through the production `from_claim` join,
 /// executable gate, grant checks, and receipt/proof validation, so this
 /// pre-filter never weakens (and never replaces) any existing check.
@@ -418,6 +570,29 @@ pub mod admitted_material {
     /// ports (P-07 dispatch validation, G-01-facing admission, durable
     /// checkpoint) arrive only with the kernel dispatch launch; validated
     /// claim bytes alone never drive.
+    ///
+    /// PRECISE GAP (T9-07 WRITER-B verdict, issue #874 honesty binding):
+    /// owner file `bins/eliot-kernel/src/dispatch_launch.rs` serves
+    /// Doctor/testd only and contains no native-worker writer, so no Kernel
+    /// contour writes `eliot-native-worker.admitted-claim.json` and no seam
+    /// provisions the in-memory execution context. The validated envelope
+    /// (admission plus hello plus reconcile plus readiness plus nonce) cannot
+    /// supply it without minting: it carries only the
+    /// `process_invocation_digest` (a one-way digest, never the invocation
+    /// material), the admitted labels (`route_class`, `route_ref`,
+    /// `adapter_id`), and `registration.resource_limits`. It does not carry
+    /// the full `ProcessIntent` (`process_tree_id`, `job_id`, `image_id`,
+    /// `session_id`, `executable`, `executable_sha256`, `argv`,
+    /// `working_directory`, `environment`), the Kernel-issued
+    /// `DispatchPermit` (which requires the kernel-side `KernelDispatchKey`
+    /// secret plus `PermitIssuance` lease/fence/revision/nonce material), the
+    /// `DispatchValidationContext`, the live G-01 owner record, the durable
+    /// checkpoint owner, or the evidence sink. `ProcessRequest` is
+    /// deliberately `Serialize`-only (no `Deserialize`), so no byte surface
+    /// can present it; synthesizing any of the above would mint authority and
+    /// is forbidden. The factory identity half DID land in this change (see
+    /// [`FactorySelection`][crate::FactorySelection]); this residual names
+    /// exactly the remaining execution-context half.
     pub const ADMITTED_DISPATCH_RESIDUAL: &str = "issue-22 T9-07 follow-up: kernel dispatch launch delivering the executor-bound ProcessRequest plus the composed provider ports (P-07 dispatch validation, G-01-facing admission, durable checkpoint) alongside the session-bound claim bytes to the native-worker invocation";
 
     /// Bins-local dispatch envelope (NOT a wire contract change).
@@ -754,7 +929,19 @@ fn write_frame_to<W: Write>(
 
 #[cfg(test)]
 mod tests {
+    use std::collections::{BTreeMap, BTreeSet};
+    use std::fmt::Debug;
+
     use eliot_cli::kernel_client::KernelClientError;
+    use eliot_contracts::{
+        DecisionId, EpochId, EpochLineageId, ResourceGeneration, StateFence, TaskId,
+    };
+    use eliot_native_worker_core::{
+        AttemptId, BudgetEnvelope, JSON_ENCODING_PROFILE, NATIVE_WORKER_CLAIM_WIRE_VERSION,
+        NATIVE_WORKER_EXECUTABLE_BINDING_EXPECTED_WIRE_VERSION, NativeClaimId,
+        NativeRegistrationId, NativeWorkerExecutableBinding, PROTOCOL_VERSION,
+    };
+    use eliot_process::OperationId;
 
     use super::*;
     use crate::kernel_admission_client::kernel_admission_error;
@@ -767,6 +954,153 @@ mod tests {
             error,
             NativeWorkerError::KernelAdmissionRequired(detail)
                 if detail == "kernel request identity is missing"
+        ));
+    }
+
+    fn load<T, E: Debug>(result: Result<T, E>) -> T {
+        match result {
+            Ok(value) => value,
+            Err(error) => panic!("admitted factory fixture failed: {error:?}"),
+        }
+    }
+
+    fn epoch() -> EpochId {
+        load(EpochId::new(
+            load(EpochLineageId::new("550e8400-e29b-41d4-a716-446655440000")),
+            load(std::num::NonZeroU64::new(1).ok_or("non-zero")),
+        ))
+    }
+
+    fn fence() -> StateFence {
+        StateFence::new(epoch(), load(ResourceGeneration::new(1)))
+    }
+
+    fn join(route: &str, adapter: &str, nonce: &str) -> NativeWorkerExecutableBinding {
+        NativeWorkerExecutableBinding {
+            route_ref: route.to_owned(),
+            adapter_id: adapter.to_owned(),
+            adapter_revision: 3,
+            config_digest: "c".repeat(64),
+            facet_manifest_ref: "facet-manifest-7".to_owned(),
+            grant_graph_revision: 5,
+            replay_stream_id: "claim-1/gen-1".to_owned(),
+            launch_nonce: nonce.to_owned(),
+            process_invocation_digest: "d".repeat(64),
+            authority_epoch: epoch(),
+            generation: load(ResourceGeneration::new(1)),
+            state_fence: fence(),
+            deadline_unix_ms: 8_000,
+            expires_at_unix_ms: 4_000_000_001_000,
+            executable_wire_version: NATIVE_WORKER_EXECUTABLE_BINDING_EXPECTED_WIRE_VERSION,
+            executable_binding_digest: "e".repeat(64),
+        }
+    }
+
+    fn claim_with(route: &str, adapter: &str, nonce: &str, with_join: bool) -> NativeWorkerClaim {
+        NativeWorkerClaim {
+            claim_id: load(NativeClaimId::new("claim-1")),
+            registration_id: load(NativeRegistrationId::new("registration-1")),
+            worker_generation: 1,
+            parent_job_id: "job-parent-1".to_owned(),
+            task_id: load(TaskId::new("task-1")),
+            work_scope_id: "scope-1".to_owned(),
+            decision_id: load(DecisionId::new("decision-1")),
+            attempt_id: load(AttemptId::new("attempt-1")),
+            operation_id: load(OperationId::new("operation-1")),
+            route_class: "test-route".to_owned(),
+            budget: BudgetEnvelope {
+                context_tokens: 100,
+                wall_time_ms: 4_000,
+                output_bytes: 4_096,
+                cost_microunits: 1_000,
+                max_depth: 4,
+                max_descendants: 8,
+            },
+            deadline_unix_ms: 4_000_000_000_000,
+            cancellation_policy_id: "policy-1".to_owned(),
+            expected_result_schema: "result-schema-1".to_owned(),
+            expected_result_schema_version: 1,
+            predecessor_revision: "rev-0".to_owned(),
+            authority_epoch: epoch(),
+            state_fence: fence(),
+            wire_version: NATIVE_WORKER_CLAIM_WIRE_VERSION,
+            executable_binding: with_join.then(|| join(route, adapter, nonce)),
+            binding_digest: "f".repeat(64),
+        }
+    }
+
+    fn hello_with(route: &str, nonce: &str) -> WorkerHello {
+        WorkerHello {
+            protocol_version: PROTOCOL_VERSION.to_owned(),
+            encoding_profile: JSON_ENCODING_PROFILE.to_owned(),
+            connection_id: "connection-1".to_owned(),
+            request_id: "request-1".to_owned(),
+            trace_context: BTreeMap::from([("trace_id".to_owned(), "trace-1".to_owned())]),
+            deadline_unix_ms: 5_000,
+            artifact_manifest_digest: "manifest-digest-1".to_owned(),
+            launch_nonce: nonce.to_owned(),
+            worker_generation: 1,
+            authority_epoch: epoch(),
+            state_fence: fence(),
+            route_ref: route.to_owned(),
+            requested_capabilities: BTreeSet::from(["inspect".to_owned()]),
+        }
+    }
+
+    #[test]
+    fn admitted_factory_selection_resolves_exactly_one_factory() {
+        let nonce = "launch-nonce-factory-0001";
+        let claim = claim_with("route-1", "adapter-test", nonce, true);
+        let hello = hello_with("route-1", nonce);
+        let selection = match select_factory_from_presented(&claim, &hello, nonce) {
+            Ok(selection) => selection,
+            Err(error) => panic!("factory selection must resolve: {error:?}"),
+        };
+        assert_eq!(selection.adapter_id, "adapter-test");
+        assert_eq!(selection.adapter_revision, 3);
+        assert_eq!(selection.route_ref, "route-1");
+        assert_eq!(selection.config_digest, "c".repeat(64));
+        assert_eq!(selection.replay_stream_id, "claim-1/gen-1");
+        assert_eq!(selection.process_invocation_digest, "d".repeat(64));
+    }
+
+    #[test]
+    fn admitted_factory_selection_is_fail_closed() {
+        let nonce = "launch-nonce-factory-0002";
+        let hello = hello_with("route-1", nonce);
+        // Old wire without a join selects nothing.
+        let joinless = claim_with("route-1", "adapter-test", nonce, false);
+        assert!(matches!(
+            select_factory_from_presented(&joinless, &hello, nonce),
+            Err(NativeWorkerError::KernelAdmissionRequired(_))
+        ));
+        // A rewired route selects nothing.
+        let claim = claim_with("route-1", "adapter-test", nonce, true);
+        let rewired = hello_with("rewired-route-1", nonce);
+        assert!(matches!(
+            select_factory_from_presented(&claim, &rewired, nonce),
+            Err(NativeWorkerError::KernelAdmissionRequired(_))
+        ));
+        // A rebound nonce selects nothing.
+        assert!(matches!(
+            select_factory_from_presented(&claim, &hello, "rebound-nonce-factory-0003"),
+            Err(NativeWorkerError::KernelAdmissionRequired(_))
+        ));
+        // A missing factory identity selects nothing.
+        let anonymous = claim_with("route-1", "   ", nonce, true);
+        assert!(matches!(
+            select_factory_from_presented(&anonymous, &hello, nonce),
+            Err(NativeWorkerError::KernelAdmissionRequired(_))
+        ));
+        // A missing factory revision selects nothing.
+        let mut unrevised = claim_with("route-1", "adapter-test", nonce, true);
+        match unrevised.executable_binding.as_mut() {
+            Some(binding) => binding.adapter_revision = 0,
+            None => panic!("fixture must carry a join"),
+        }
+        assert!(matches!(
+            select_factory_from_presented(&unrevised, &hello, nonce),
+            Err(NativeWorkerError::KernelAdmissionRequired(_))
         ));
     }
 }
