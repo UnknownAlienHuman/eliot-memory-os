@@ -97,8 +97,17 @@ fn source_guard_excludes_unowned_semantic_and_public_raw_api_changes() {
         );
     }
     assert!(production.contains("owner: Weak<ProviderOwner>"));
-    for forbidden in ["crate::schema", "crate::plan", "crate::apply", "eliot_store_api", "eliot_protocol"] {
-        assert!(!production.contains(forbidden), "session gained semantic or lifecycle dependencies");
+    for forbidden in [
+        "crate::schema",
+        "crate::plan",
+        "crate::apply",
+        "eliot_store_api",
+        "eliot_protocol",
+    ] {
+        assert!(
+            !production.contains(forbidden),
+            "session gained semantic or lifecycle dependencies"
+        );
     }
     assert!(
         production
