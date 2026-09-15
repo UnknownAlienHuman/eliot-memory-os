@@ -1,18 +1,19 @@
 use std::{collections::BTreeMap, path::Path};
 
 use eliot_agent_api::{
-    AdmittedRouteReceipt, AssistantDeltaObservation, CONTRACT_VERSION, CancellationState,
-    ClockReading, ErrorObservation, EventCursor, EventId, ExecutionOutcome,
-    HOST_EVENT_CONTRACT_VERSION, HOST_EVENT_DIGEST_ALGORITHM, HostEventDeliveryDisposition,
-    HostEventNormalizationReceipt, HostEventPrivacyClass, LowercaseSha256, NormalizationCoverage,
-    NormalizedHostEventEnvelope, NormalizedHostEventPayload, PhysicalRouteObservationReceipt,
-    ProviderExecutionBinding, ProviderObservationLineage, ProviderTerminalObservation,
-    ProviderTerminalStatus, QualifiedSourceDigest, RawSourceRecord, RestrictedRawSourceHandle,
-    RouteFingerprint, RouteObservationState, SessionLifecycleObservation,
-    SessionLifecycleTransition, UnsupportedDisposition, UnsupportedEventObservation,
-    UnsupportedEventReason, UsageReceipt, WarningObservation, route_divergence_fields,
+    AdmittedRouteReceipt, AgentAttempt, AgentAttemptId, AssistantDeltaObservation,
+    CONTRACT_VERSION, CancellationState, ClockReading, ContractError, ErrorObservation,
+    EventCursor, EventId, ExecutionOutcome, HOST_EVENT_CONTRACT_VERSION,
+    HOST_EVENT_DIGEST_ALGORITHM, HostEventDeliveryDisposition, HostEventNormalizationReceipt,
+    HostEventPrivacyClass, LowercaseSha256, NormalizationCoverage, NormalizedHostEventEnvelope,
+    NormalizedHostEventPayload, PhysicalRouteObservationReceipt, ProviderExecutionBinding,
+    ProviderObservationLineage, ProviderTerminalObservation, ProviderTerminalStatus,
+    QualifiedSourceDigest, RawSourceRecord, RestrictedRawSourceHandle, RouteFingerprint,
+    RouteObservationState, SessionLifecycleObservation, SessionLifecycleTransition,
+    UnsupportedDisposition, UnsupportedEventObservation, UnsupportedEventReason, UsageReceipt,
+    WarningObservation, route_divergence_fields,
 };
-use eliot_contracts::{canonical_json_bytes, sha256_hex};
+use eliot_contracts::{ResourceGeneration, StateFence, canonical_json_bytes, sha256_hex};
 use serde::{Deserialize, Deserializer, Serialize, Serializer, de, ser::SerializeMap};
 use serde_json::Value;
 
@@ -1715,6 +1716,292 @@ fn classify_opencode_event(
                 warnings,
             ),
         }
+    }
+}
+
+/// Admitted read-only attempt edge (issue #487).
+///
+/// One externally admitted swarm slot executes exactly one bounded read-only
+/// `OpenCode` [`AgentAttempt`] through the supervised attach-only loopback route
+/// ([`crate::OpenCodeClient::run_read_only`]). This section owns the
+/// admission/binding verification and the candidate-only seal; it owns no
+/// server launch, no process handle, no credential, and no task-finish
+/// authority.
+///
+/// Verification is fail-closed before start: a missing admission, a stale
+/// attempt/lease/fence/generation, a route mismatch (including a no-route
+/// admission), a prompt-model/admission-model divergence, or an already
+/// terminal attempt rejects before any provider call. The seal is
+/// replay-stable: identical admitted inputs reproduce the identical canonical
+/// digest, and the sealed candidate carries [`AuthorityCeiling::CandidateOnly`]
+/// only — it is structurally incapable of expressing task completion (there is
+/// no finish field, and the agent result disposition family has no completion
+/// variant).
+#[derive(Clone, Debug, PartialEq)]
+pub struct AdmittedOpenCodeAttempt {
+    admission: AdmittedRouteReceipt,
+    binding: ProviderExecutionBinding,
+    attempt: AgentAttempt,
+    model: ModelSelection,
+}
+
+/// Fail-closed verification and sealing failures for [`AdmittedOpenCodeAttempt`].
+///
+/// Every variant rejects execution or sealing; none carries provider output,
+/// credentials, or authority beyond the typed mismatch it names.
+#[derive(Debug, thiserror::Error)]
+pub enum AdmittedAttemptError {
+    #[error("admitted route receipt is missing; an unadmitted attempt never executes")]
+    MissingAdmission,
+    #[error("admitted route receipt is invalid: {0}")]
+    AdmissionRejected(ContractError),
+    #[error("provider execution binding is invalid: {0}")]
+    BindingRejected(ContractError),
+    #[error("admitted attempt record is invalid: {0}")]
+    AttemptRejected(ContractError),
+    #[error("admission attempt identity does not match the bound attempt")]
+    AttemptMismatch,
+    #[error("admission lease identity does not match the bound lease")]
+    LeaseMismatch,
+    #[error("admission fence is missing or stale against the current fence")]
+    FenceMismatch,
+    #[error("admission runtime generation is stale against the current generation")]
+    GenerationMismatch,
+    #[error("admission authorizes no route, or a different route than the bound execution")]
+    RouteMismatch,
+    #[error("prompt provider/model differs from the admitted route")]
+    ModelMismatch,
+    #[error("bound attempt is already terminal; a closed attempt never re-executes")]
+    AttemptTerminal,
+    #[error("read-only run request is invalid: {0}")]
+    RequestRejected(RunRequestError),
+    #[error("sealed candidate rejects the run result: {reason}")]
+    SealRejected { reason: &'static str },
+    #[error("admitted attempt digest failed: {0}")]
+    DigestFailed(String),
+    #[error(transparent)]
+    Run(#[from] crate::OpenCodeRunError),
+}
+
+impl AdmittedOpenCodeAttempt {
+    /// Binds one admitted attempt to its exact execution binding, attempt
+    /// record, and admitted provider/model, verifying everything before the
+    /// caller may start execution.
+    ///
+    /// `admission` is `Option` so a missing external decision fails closed
+    /// here ([`AdmittedAttemptError::MissingAdmission`]) instead of executing
+    /// unadmitted. `current_fence` and `runtime_generation` are the live
+    /// runtime context: a stale fence or generation rejects even when the
+    /// admission itself is well-formed.
+    pub fn new(
+        admission: Option<AdmittedRouteReceipt>,
+        binding: ProviderExecutionBinding,
+        attempt: AgentAttempt,
+        model: ModelSelection,
+        current_fence: &StateFence,
+        runtime_generation: ResourceGeneration,
+    ) -> Result<Self, AdmittedAttemptError> {
+        let Some(admission) = admission else {
+            return Err(AdmittedAttemptError::MissingAdmission);
+        };
+        let candidate = Self {
+            admission,
+            binding,
+            attempt,
+            model,
+        };
+        candidate.verify(current_fence, runtime_generation)?;
+        Ok(candidate)
+    }
+
+    /// Re-verifies the full admission/binding/attempt agreement against the
+    /// live fence and generation. The supervised runner calls this immediately
+    /// before dispatch so context that advanced after construction still fails
+    /// closed before any provider call.
+    pub fn verify(
+        &self,
+        current_fence: &StateFence,
+        runtime_generation: ResourceGeneration,
+    ) -> Result<(), AdmittedAttemptError> {
+        self.admission
+            .validate()
+            .map_err(AdmittedAttemptError::AdmissionRejected)?;
+        self.binding
+            .validate_internal()
+            .map_err(AdmittedAttemptError::BindingRejected)?;
+        self.attempt
+            .validate()
+            .map_err(AdmittedAttemptError::AttemptRejected)?;
+        self.binding
+            .validate_against_attempt(&self.attempt)
+            .map_err(AdmittedAttemptError::BindingRejected)?;
+        if let Some(stored) = &self.attempt.provider_binding
+            && stored.execution_unit != self.binding.execution_unit
+        {
+            return Err(AdmittedAttemptError::BindingRejected(
+                ContractError::BindingMismatch,
+            ));
+        }
+        if self.admission.attempt_id != self.binding.attempt_id
+            || self.admission.attempt_id != self.attempt.id
+        {
+            return Err(AdmittedAttemptError::AttemptMismatch);
+        }
+        if self.admission.lease_id != self.binding.lease_id {
+            return Err(AdmittedAttemptError::LeaseMismatch);
+        }
+        if self.admission.state_fence != self.binding.state_fence {
+            return Err(AdmittedAttemptError::FenceMismatch);
+        }
+        if self.admission.runtime_generation != self.binding.runtime_generation {
+            return Err(AdmittedAttemptError::GenerationMismatch);
+        }
+        if self.binding.state_fence != *current_fence {
+            return Err(AdmittedAttemptError::FenceMismatch);
+        }
+        if self.binding.runtime_generation != runtime_generation {
+            return Err(AdmittedAttemptError::GenerationMismatch);
+        }
+        match &self.admission.selected_route {
+            Some(selected) if *selected == self.binding.route => {}
+            _ => return Err(AdmittedAttemptError::RouteMismatch),
+        }
+        if self.binding.route != self.admission.requested_route {
+            return Err(AdmittedAttemptError::RouteMismatch);
+        }
+        if self.model.provider_id != self.binding.route.provider
+            || self.model.model_id != self.binding.route.model
+        {
+            return Err(AdmittedAttemptError::ModelMismatch);
+        }
+        self.model.validate().map_err(|error| {
+            AdmittedAttemptError::RequestRejected(RunRequestError::InvalidModel(error))
+        })?;
+        if self.attempt.state.is_terminal() {
+            return Err(AdmittedAttemptError::AttemptTerminal);
+        }
+        Ok(())
+    }
+
+    /// Fail-closed pre-start check that the presented run request carries the
+    /// exact admitted provider/model in a valid read-only shape. A prompt
+    /// naming any other provider/model rejects before dispatch.
+    pub fn verify_request(&self, request: &ReadOnlyRunRequest) -> Result<(), AdmittedAttemptError> {
+        request
+            .validate()
+            .map_err(AdmittedAttemptError::RequestRejected)?;
+        if request.model != self.model {
+            return Err(AdmittedAttemptError::ModelMismatch);
+        }
+        Ok(())
+    }
+
+    /// Returns the governing admitted-route receipt.
+    pub fn admission(&self) -> &AdmittedRouteReceipt {
+        &self.admission
+    }
+
+    /// Returns the exact provider-execution binding.
+    pub fn binding(&self) -> &ProviderExecutionBinding {
+        &self.binding
+    }
+
+    /// Returns the admitted attempt record.
+    pub fn attempt(&self) -> &AgentAttempt {
+        &self.attempt
+    }
+
+    /// Returns the admitted provider/model identity.
+    pub fn model(&self) -> &ModelSelection {
+        &self.model
+    }
+
+    /// Returns the governing admission digest this attempt executes under.
+    pub fn admitted_route_digest(&self) -> &LowercaseSha256 {
+        &self.admission.self_digest
+    }
+
+    /// Replay-stable canonical digest of the verified admitted inputs: the
+    /// admission receipt, the execution binding, and the admitted model.
+    /// Identical admitted inputs reproduce the identical digest; any
+    /// attempt/lease/fence/generation/route/model difference changes it.
+    pub fn attempt_digest(&self) -> Result<LowercaseSha256, AdmittedAttemptError> {
+        let bytes = canonical_json_bytes(&(&self.admission, &self.binding, &self.model))
+            .map_err(|error| AdmittedAttemptError::DigestFailed(error.to_string()))?;
+        serde_json::from_value(Value::String(sha256_hex(&bytes)))
+            .map_err(|error| AdmittedAttemptError::DigestFailed(error.to_string()))
+    }
+}
+
+/// Sealed candidate-only outcome of one admitted read-only attempt.
+///
+/// This is the only artifact the edge returns: the exact attempt identity, the
+/// governing admission digest, and the canonical digest of the supervised wire
+/// result, under [`AuthorityCeiling::CandidateOnly`]. It carries no finish
+/// field, no task identity, and no completion disposition, so a sealed
+/// candidate can never become a task completion.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AdmittedAttemptCandidate {
+    pub attempt_id: AgentAttemptId,
+    pub admitted_route_digest: LowercaseSha256,
+    pub result_digest: LowercaseSha256,
+    pub authority: AuthorityCeiling,
+    pub status: RunStatus,
+}
+
+impl AdmittedAttemptCandidate {
+    /// Seals one supervised wire result under a verified admission.
+    ///
+    /// Fail-closed: a result claiming anything beyond candidate-only
+    /// authority, a non-succeeded status, a succeeded status without terminal
+    /// candidate output (exit-zero-without-candidate is not success), or a
+    /// requested route differing from the admitted model never seals.
+    pub fn seal(
+        admitted: &AdmittedOpenCodeAttempt,
+        result: &NoAuthorityRunResult,
+    ) -> Result<Self, AdmittedAttemptError> {
+        if !result.candidate_only || result.authority != AuthorityCeiling::CandidateOnly {
+            return Err(AdmittedAttemptError::SealRejected {
+                reason: "run result claims authority beyond candidate-only",
+            });
+        }
+        if result.status != RunStatus::Succeeded {
+            return Err(AdmittedAttemptError::SealRejected {
+                reason: "run result is not a succeeded terminal candidate",
+            });
+        }
+        if result.output.is_none() {
+            return Err(AdmittedAttemptError::SealRejected {
+                reason: "succeeded run carries no terminal candidate output",
+            });
+        }
+        if result.actual_route.requested != *admitted.model() {
+            return Err(AdmittedAttemptError::SealRejected {
+                reason: "run result route differs from the admitted model",
+            });
+        }
+        let bytes = canonical_json_bytes(result)
+            .map_err(|error| AdmittedAttemptError::DigestFailed(error.to_string()))?;
+        let result_digest: LowercaseSha256 =
+            serde_json::from_value(Value::String(sha256_hex(&bytes)))
+                .map_err(|error| AdmittedAttemptError::DigestFailed(error.to_string()))?;
+        Ok(Self {
+            attempt_id: admitted.attempt().id.clone(),
+            admitted_route_digest: admitted.admitted_route_digest().clone(),
+            result_digest,
+            authority: AuthorityCeiling::CandidateOnly,
+            status: RunStatus::Succeeded,
+        })
+    }
+
+    /// Recomputes the canonical digest of this sealed candidate. Re-sealing
+    /// identical inputs reproduces the identical value.
+    pub fn compute_digest(&self) -> Result<LowercaseSha256, AdmittedAttemptError> {
+        let bytes = canonical_json_bytes(self)
+            .map_err(|error| AdmittedAttemptError::DigestFailed(error.to_string()))?;
+        serde_json::from_value(Value::String(sha256_hex(&bytes)))
+            .map_err(|error| AdmittedAttemptError::DigestFailed(error.to_string()))
     }
 }
 
