@@ -15,6 +15,7 @@ mod provider_account_catalogue;
 mod provider_admission;
 mod swarm_command_candidate;
 mod swarm_controlboard;
+mod swarm_launch_bind;
 mod swarm_staffing;
 #[cfg(test)]
 mod tests;
@@ -39,6 +40,7 @@ pub use crate::provider_account_catalogue::{
 pub use crate::provider_admission::AdmittedProviderCapability;
 pub use crate::swarm_command_candidate::*;
 pub use crate::swarm_controlboard::*;
+pub use crate::swarm_launch_bind::*;
 pub use crate::swarm_staffing::*;
 
 /// Snapshot wire revision. A different revision must be migrated by an
