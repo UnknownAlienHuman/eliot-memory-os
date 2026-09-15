@@ -9,7 +9,6 @@ use std::collections::BTreeSet;
 use crate::SurrealStoreAdapter;
 use crate::config::{SchemaGeneration, SurrealAdapterConfig};
 use crate::error::AdapterError;
-use crate::plan::select_apply_plan;
 use crate::plan::{self, build_receipt, validate_receipt_identity, validate_revision_heads};
 use crate::readiness::{CompiledMigration, MigrationReceipt, SemanticReadiness};
 use crate::{client, schema};
@@ -619,7 +618,7 @@ pub(crate) async fn apply_prepared_with_authority(
         &transition.state_fence,
     )?;
 
-    let plan = select_apply_plan(
+    let plan = plan::select_apply_plan(
         &transition,
         authorities,
         &current_revisions,
@@ -645,6 +644,93 @@ pub(crate) async fn apply_prepared_with_authority(
 
     validate_receipt_identity(&receipt, ctx, &transition)?;
     Ok(receipt)
+}
+
+/// 688-B: the adapter's apply-path erasure execution.
+///
+/// The erasure protocol needs the same intent-before-dispatch gate as the
+/// reference store: a `record_erasure_intent` step persists the intent row(s)
+/// in the same atomic transaction BEFORE any destructive statement (see the
+/// intent-before-delete template in `atomic_write`). This gate refuses
+/// fail-closed with zero destructive effects when no recorded intent exists
+/// ([`StoreError::ReceiptNotFound`]), sealing the original per-surface
+/// outcomes for same-operation replay (idempotent on `operation_id`,
+/// `Unknown` preserved for reconciliation, no blind retry, no second
+/// ledger). Destructive statements delete only the selected surfaces for the
+/// exact subject/scope. All `SurrealQL` stays in `apply`/`schema` modules;
+/// this boundary carries store-api types only (plus the local intent/outcome
+/// model in `atomic_write`, since the neutral purge port is defined in a
+/// parallel subtask and is not yet on this base; the adapter never imports
+/// `eliot-erasure`).
+///
+/// `record_surreal_erasure_intent` validates and freezes the intent: in the
+/// live path the returned intent is the durable row the atomic transaction
+/// below opens with, so no destructive statement can precede it.
+///
+/// 688-FIX: live-path entry owned by the real-Surreal round-trip integration
+/// slice (no admitted dispatch on this base; see `atomic_write`). `allow`
+/// holds only here so wiring a caller does not widen scope.
+///
+/// Follow-up integration slice (NOT this contour): `GetEvidencePack`
+/// suppression of sealed erasures plus the `erasure_intent`/`erasure_outcome`
+/// table migration stay with the real-Surreal integration owner.
+#[allow(dead_code)]
+pub(crate) fn record_surreal_erasure_intent(
+    intent: atomic_write::SurrealErasureIntent,
+) -> Result<atomic_write::SurrealErasureIntent, AdapterError> {
+    intent.validate().map_err(AdapterError::Store)?;
+    Ok(intent)
+}
+
+/// 688-B: dispatches one recorded erasure intent through the atomic writer.
+///
+/// Same-operation replay returns the original per-surface outcomes without
+/// duplicate destructive work (the writer's sealed-outcome replay check);
+/// `Unknown` outcomes stay preserved for same-operation reconciliation.
+/// Fail-closed with zero destructive effects when the intent step above
+/// refuses: `write_erasure_transaction` is never reached, so no `DELETE`
+/// can precede the durable intent row.
+///
+/// Follow-up integration slice (NOT this contour): `GetEvidencePack`
+/// suppression of sealed erasures plus the `erasure_intent`/`erasure_outcome`
+/// table migration stay with the real-Surreal integration owner.
+#[allow(dead_code)]
+pub(crate) async fn apply_surreal_erasure(
+    adapter: &SurrealStoreAdapter,
+    intent: &atomic_write::SurrealErasureIntent,
+) -> Result<Vec<atomic_write::SurrealSurfaceOutcome>, AdapterError> {
+    let intent = record_surreal_erasure_intent(intent.clone())?;
+    let db = client(adapter).await?;
+    ensure_ready(adapter, db).await?;
+    let _guard = adapter.write_lock.lock().await;
+    atomic_write::write_erasure_transaction(db, &adapter.config, &intent).await
+}
+
+/// Builds the pure intent-before-delete ordering assertion used by tests:
+/// the intent upsert opens the transaction before every destructive
+/// statement and the outcome seal closes it. Returns the byte offsets of
+/// the three sections inside the rendered template.
+#[allow(dead_code)]
+pub(crate) fn erasure_template_ordering(
+    store_owned_surface_count: usize,
+) -> Result<(usize, usize, usize), AdapterError> {
+    let sql = atomic_write::erasure_transaction_template(store_owned_surface_count);
+    let intent_at = sql.find("erasure_intent").ok_or_else(|| {
+        AdapterError::Serialization("erasure template is missing its intent step".to_owned())
+    })?;
+    let delete_at = sql.find("DELETE").ok_or_else(|| {
+        AdapterError::Serialization("erasure template is missing its delete step".to_owned())
+    })?;
+    let outcome_at = sql.find("erasure_outcome").ok_or_else(|| {
+        AdapterError::Serialization("erasure template is missing its outcome seal".to_owned())
+    })?;
+    if intent_at < delete_at && delete_at < outcome_at {
+        Ok((intent_at, delete_at, outcome_at))
+    } else {
+        Err(AdapterError::Serialization(
+            "erasure template orders intent before delete before outcome seal".to_owned(),
+        ))
+    }
 }
 
 /// Enforces the same admitted operation before staging and commit (slice C2).
@@ -1306,5 +1392,131 @@ mod admitted_operation_gate_tests {
             query.validate_against_catalogue(&entries),
             Err(StoreError::UnknownOperation)
         );
+    }
+}
+
+/// 688-B: memory + Surreal erasure execution (adapter contour).
+///
+/// The intent-before-delete template asserts the whole protocol ordering —
+/// intent row first, destructive deletes second, outcome seal last — and
+/// the bindings assertion pins the sealed per-surface derivation (store
+/// surfaces purge, foreign surfaces stay incomplete, `Unknown` preserved).
+/// The live round-trip stays with integration (not this unit).
+#[cfg(test)]
+mod erasure_execution_tests {
+    use super::atomic_write::{
+        SurrealErasureIntent, SurrealErasureSurface, SurrealSurfaceOutcome,
+        erasure_transaction_bindings, erasure_transaction_template,
+    };
+    use super::{erasure_template_ordering, record_surreal_erasure_intent};
+
+    fn test_fence() -> Result<eliot_store_api::StateFence, Box<dyn std::error::Error>> {
+        use eliot_contracts::{EpochId, EpochLineageId, ResourceGeneration};
+        use std::num::NonZeroU64;
+        let lineage = EpochLineageId::new("550e8400-e29b-41d4-a716-446655440000")
+            .map_err(|error| format!("canonical test lineage-A: {error:?}"))?;
+        let sequence = NonZeroU64::new(1).ok_or("non-zero test sequence")?;
+        let epoch = EpochId::new(lineage, sequence)
+            .map_err(|error| format!("valid test epoch: {error:?}"))?;
+        Ok(eliot_store_api::StateFence::new(
+            epoch,
+            ResourceGeneration::genesis(),
+        ))
+    }
+
+    fn intent() -> Result<SurrealErasureIntent, Box<dyn std::error::Error>> {
+        Ok(SurrealErasureIntent {
+            operation_id: "erasure-op-1".to_owned(),
+            subject: "evidence-alpha".to_owned(),
+            scope_id: eliot_store_api::ScopeId::new("scope-1")
+                .map_err(|error| format!("valid test scope: {error:?}"))?,
+            surfaces: vec![
+                SurrealErasureSurface::CanonicalPayload,
+                SurrealErasureSurface::Blob,
+            ],
+            state_fence: test_fence()?,
+        })
+    }
+
+    #[test]
+    fn erasure_template_records_intent_before_delete_before_outcome_seal()
+    -> Result<(), Box<dyn std::error::Error>> {
+        // Real template + real ordering gate: the intent step opens the
+        // transaction before any destructive statement and the outcome seal
+        // closes it; destructive statements delete only the exact
+        // subject/scope pair.
+        let intent = record_surreal_erasure_intent(intent()?)
+            .map_err(|error| format!("intent records: {error:?}"))?;
+        let store_owned = intent
+            .surfaces
+            .iter()
+            .filter(|surface| surface.is_store_owned())
+            .count();
+        assert_eq!(store_owned, 1);
+        let sql = erasure_transaction_template(store_owned);
+        assert!(sql.starts_with("BEGIN TRANSACTION;"));
+        assert!(sql.ends_with("COMMIT TRANSACTION;"));
+        let (intent_at, delete_at, outcome_at) = erasure_template_ordering(store_owned)
+            .map_err(|error| format!("ordering resolves: {error:?}"))?;
+        assert!(intent_at < delete_at && delete_at < outcome_at);
+        assert_eq!(sql.matches("DELETE").count(), store_owned);
+        assert!(sql.contains("$erasure_subject0"));
+        assert!(sql.contains("$erasure_scope_expected0"));
+        assert!(sql.contains("erasure_intent_conflict"));
+        let (bindings, outcomes) = erasure_transaction_bindings(&intent, &[])
+            .map_err(|error| format!("bindings build: {error:?}"))?;
+        assert!(bindings.contains_key("erasure_table"));
+        assert!(bindings.contains_key("erasure_intent_expected"));
+        assert!(bindings.contains_key("erasure_intent_record"));
+        assert!(bindings.contains_key("erasure_subject0"));
+        assert!(!bindings.contains_key("erasure_subject1"));
+        assert!(bindings.contains_key("erasure_outcome_record"));
+        assert_eq!(
+            outcomes,
+            vec![
+                SurrealSurfaceOutcome::Purged {
+                    surface: SurrealErasureSurface::CanonicalPayload,
+                },
+                SurrealSurfaceOutcome::Incomplete {
+                    surface: SurrealErasureSurface::Blob,
+                },
+            ]
+        );
+        // Same-operation replay keeps a preserved `Unknown` verbatim instead
+        // of re-running destructive work or clearing it: the replay emits no
+        // `erasure_subject{i}` bindings, so the rendered template carries no
+        // `DELETE` for the replayed surface.
+        let prior = vec![SurrealSurfaceOutcome::Unknown {
+            surface: SurrealErasureSurface::CanonicalPayload,
+        }];
+        let (replay_bindings, replayed) = erasure_transaction_bindings(&intent, &prior)
+            .map_err(|error| format!("replay binds: {error:?}"))?;
+        assert_eq!(replayed[0], prior[0]);
+        assert!(
+            !replay_bindings
+                .keys()
+                .any(|key| key.starts_with("erasure_subject")),
+            "replayed-Unknown emits no destructive bindings"
+        );
+        let replay_store_owned = replay_bindings
+            .keys()
+            .filter(|key| {
+                key.starts_with("erasure_subject")
+                    && key["erasure_subject".len()..]
+                        .bytes()
+                        .all(|byte| byte.is_ascii_digit())
+            })
+            .count();
+        let replay_sql = erasure_transaction_template(replay_store_owned);
+        assert_eq!(replay_sql.matches("DELETE").count(), 0);
+        assert!(
+            !replay_sql.contains("DELETE"),
+            "replayed-Unknown renders no DELETE statement"
+        );
+        // No intent, no template: the gate refuses before any provider I/O.
+        let mut missing = intent.clone();
+        missing.operation_id.clear();
+        assert!(record_surreal_erasure_intent(missing).is_err());
+        Ok(())
     }
 }
