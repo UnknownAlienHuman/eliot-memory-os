@@ -36,7 +36,10 @@
 use std::io::{self, Write};
 use std::sync::Arc;
 
-use eliot_kernel::{EliotdReceiptRootBinding, KernelBuildError, KernelComposition, KernelConfig};
+use eliot_kernel::{
+    EliotdReceiptRootBinding, KernelBuildError, KernelComposition, KernelConfig,
+    compose_dispatch_contour,
+};
 
 #[cfg(windows)]
 mod front_door_driver;
@@ -121,6 +124,25 @@ async fn main() {
             Err(error) => exit_build_error(&error),
         },
     );
+    #[cfg(windows)]
+    {
+        // DISPATCH-WIRE part C (issue #461): compose the production
+        // dispatch contour with the principal from the authenticated Host
+        // startup binding (the installation identity — never a
+        // request-envelope value). This answers the #1467 residual of zero
+        // production callers: the testd/native admit sides go live here.
+        // The Doctor side composes through
+        // `compose_production_doctor_front_door` (durable
+        // `KernelDoctorRecoveryLedger` plus
+        // `DoctorRecipeRegistry::production_health_probe`) once the
+        // installed-doctor digest is injected; this 16-value contour does
+        // not carry it yet (installation-manifest and contour extension
+        // belong to the W1/W2 writers), so `doctor_repair_advertised`
+        // stays fail-closed until then.
+        if let Err(error) = compose_dispatch_contour(startup_binding.installation_id.clone()) {
+            exit_error("DISPATCH_COMPOSITION_FAILURE", &error.to_string());
+        }
+    }
     if !kernel.process_execution_configured() {
         exit_error(
             "PROCESS_AUTHORITY_CONFIGURATION_REQUIRED",
