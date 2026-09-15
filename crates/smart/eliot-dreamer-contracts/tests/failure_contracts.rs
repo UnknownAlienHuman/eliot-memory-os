@@ -1,7 +1,6 @@
 #![allow(clippy::unwrap_used)]
 
 use eliot_contracts::{EpochId, EpochLineageId, ResourceGeneration, StateFence};
-use std::num::NonZeroU64;
 use eliot_dreamer_contracts::{
     FailureAction, FailureActionEvidence, FailureComparator, FailureComparisonProfile,
     FailureCoverage, FailureDimension, FailureDimensionDescriptor, FailureDimensionSource,
@@ -9,6 +8,7 @@ use eliot_dreamer_contracts::{
     FailureHistoryEntry, FailureObservationState, FailureOperation, FailureOutcome,
     FailureProfileDefinition, Requester, RequesterOrigin,
 };
+use std::num::NonZeroU64;
 
 fn fence() -> StateFence {
     let epoch = EpochId::new(

@@ -5,7 +5,6 @@ use eliot_contracts::{
     ArtifactId, EpochId, EpochLineageId, ReceiptId, RequestId, ResourceGeneration, SourceId,
     StateFence, TaskId, sha256_hex,
 };
-use std::num::NonZeroU64;
 use eliot_dreamer_contracts::curation::{RelationPayload, TargetEvidence};
 use eliot_dreamer_contracts::encoding::canonical_bytes;
 use eliot_dreamer_contracts::*;
@@ -14,6 +13,7 @@ use eliot_evidence::{
     EvidenceFreshness, LifecycleState, Provenance,
 };
 use eliot_receipts::{ProofCeiling, ReceiptIdentity, WorkScopeId};
+use std::num::NonZeroU64;
 
 fn id(value: &str) -> ArtifactId {
     ArtifactId::new(value).expect("id")

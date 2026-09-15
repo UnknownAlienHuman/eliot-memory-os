@@ -7,7 +7,6 @@
 use eliot_contracts::{
     EpochId, EpochLineageId, ReceiptId, RequestId, ResourceGeneration, StateFence,
 };
-use std::num::NonZeroU64;
 use eliot_dreamer_contracts::curation::{ClassificationPayload, TargetEvidence, route_payload};
 use eliot_dreamer_contracts::job::{Requester, RequesterOrigin};
 use eliot_dreamer_contracts::{
@@ -19,6 +18,7 @@ use eliot_dreamer_contracts::{
     SourceDisposition, SupportState, TargetDenominator, TypedCurationHandlerRequest,
     ValidatedCurationItem, ValidationReceipt, canonical_bytes, digest_hex, family_of, parse_kind,
 };
+use std::num::NonZeroU64;
 
 fn assert_stable(check: impl Fn() -> bool, ctx: &str) {
     assert_eq!(check(), check(), "{ctx} must be stable");
