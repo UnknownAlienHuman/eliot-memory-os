@@ -12,17 +12,67 @@
 //! (projection via `eliot-mcp`, persistence via the existing ORS result
 //! path).
 //!
+//! Production edges out of this module:
+//! [`forward_admitted_local_read`] forwards one admitted `eliot.query` pair
+//! to the Kernel `local_read` leg over the retained authenticated session
+//! and returns the persisted result body; [`serve_admitted_local_read`]
+//! serves one admitted pair through the local twin
+//! ([`KernelContextReadClient::execute_local_read`] over
+//! [`LocalReadPort::evidence_query`]) and returns the exact evidence record.
+//!
 //! Query is fully live (`Verification` + `GetEvidencePack`); projection
 //! inputs stay port-shape fail-closed `Unavailable` until MGR04 (#19)
 //! activates the storage operation.
 
 use std::sync::Arc;
 
-use eliot_contracts::RequestMetadata;
+use eliot_contracts::{RequestMetadata, StateFence};
+use eliot_governor::KernelPortError;
+use eliot_protocol::{HostRequestEnvelope, HostRequestResultBody};
 use eliot_read::{LocalReadPort, QueryResult, ReadError, ReadService};
 use eliot_store_api::ScopeId;
 
-use super::{DaemonComposition, DaemonKernelClient};
+use super::{DaemonComposition, DaemonKernelClient, KernelContextReadClient};
+
+/// Forwards one admitted `eliot.query` pair to the Kernel `local_read` leg.
+///
+/// Production kernel-caller bridge over the retained authenticated session:
+/// the pair proves its closed linkage and fence binding inside
+/// [`DaemonKernelClient::local_read_async`], travels as the `"local_read"`
+/// operation, and the persisted result body behind the admitted receipt+record
+/// returns decoded and envelope-bound. Kernel remains the admission, read, and
+/// persistence authority; this function performs no admission decision and no
+/// consistency algorithm. A wrong fence or malformed pair fails closed before
+/// any transport; a packet admission carries no result body by design.
+pub async fn forward_admitted_local_read(
+    kernel: &DaemonKernelClient,
+    envelope: HostRequestEnvelope,
+    tool: serde_json::Value,
+) -> Result<HostRequestResultBody, KernelPortError> {
+    kernel.local_read_async(envelope, tool).await
+}
+
+/// Serves one admitted `eliot.query` pair through the Governor read port.
+///
+/// Production local-serving edge twinning the Kernel admission mirror: the
+/// closed capability gate runs before any read, the envelope fence must equal
+/// the caller-observed admitted fence, and the closed selectors serve exactly
+/// one bounded [`LocalReadPort::evidence_query`] whose answer must echo the
+/// evidence operation and the admitted fence. Returns the exact evidence
+/// record, never a bare admission. `eliot.packet` stays admission-only
+/// (`Unavailable`, MGR04 #19); a wrong fence or a substituted answer fails
+/// closed, never `Ok`-empty.
+///
+/// The port and the fence stay per-call parameters (rather than retained
+/// state) so the composition retains no client and no thread.
+pub async fn serve_admitted_local_read(
+    reads: &impl LocalReadPort,
+    admitted_fence: &StateFence,
+    envelope: &HostRequestEnvelope,
+    tool: &serde_json::Value,
+) -> Result<QueryResult, ReadError> {
+    KernelContextReadClient::execute_local_read(reads, admitted_fence, envelope, tool).await
+}
 
 /// Answers one bounded Governor evidence query through the local read port.
 ///

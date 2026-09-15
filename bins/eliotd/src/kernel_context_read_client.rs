@@ -34,8 +34,11 @@
 //! wrong fence fails closed before any read. The port and the admitted fence
 //! stay per-call parameters, so the composition retains no client and no
 //! thread; the `local_read` forwarding transport
-//! (`DaemonKernelClient::local_read_async`) stays with the future
-//! kernel-caller bridge.
+//! (`DaemonKernelClient::local_read_async`) is called through the
+//! daemon-runtime kernel-caller bridge
+//! (`governor_local_read::forward_admitted_local_read`), while the serving
+//! edge (`governor_local_read::serve_admitted_local_read`) answers admitted
+//! pairs through this twin.
 //!
 //! Forbidden authority: no raw query strings (impossible by construction —
 //! only the closed [`NamedReadOperation`] crosses), no second consistency

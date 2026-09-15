@@ -25,8 +25,8 @@ use eliot_protocol::{
     AgentActivationResultReconcile,
 };
 use eliotd::{
-    DaemonComposition, DaemonConfig, DaemonKernelClient, DaemonStatus, PROTOCOL_VERSION,
-    SERVICE_NAME,
+    DaemonComposition, DaemonConfig, DaemonKernelClient, DaemonStatus, LocalReadSubmitOutcome,
+    PROTOCOL_VERSION, SERVICE_NAME, forward_admitted_local_read,
 };
 use serde::Serialize;
 use tokio::time::{Instant, Interval, MissedTickBehavior};
@@ -111,6 +111,65 @@ fn decide_activation_tick(flight: &ActivationFlight) -> ActivationTickDecision {
     match flight {
         ActivationFlight::Idle => ActivationTickDecision::StartClaim,
         ActivationFlight::InFlight(_) => ActivationTickDecision::SkipInFlight,
+    }
+}
+
+/// Starts one activation ticket claim step on the shared tick.
+fn start_activation_claim(
+    kernel: &Arc<DaemonKernelClient>,
+) -> Pin<Box<dyn std::future::Future<Output = ActivationCompletion>>> {
+    let kernel_clone = Arc::clone(kernel);
+    Box::pin(async move {
+        let outcome: Result<Option<AgentActivationResolutionTicket>, String> = kernel_clone
+            .claim_agent_activation_ticket()
+            .await
+            .map_err(|error| format!("Kernel activation ticket claim: {error}"));
+        ActivationCompletion::Claim(outcome)
+    })
+}
+
+/// Settled outcome of one local-read poll step (Implements #18: the eliotd
+/// half of the outbound-only `local_read_claim` / `local_read_result`
+/// poller). `IdleBackoff` is the null poll (empty queue, or every pair still
+/// leased/expired); `Accepted` / `Expired` mirror the typed submit outcome.
+enum LocalReadPollOutcome {
+    IdleBackoff,
+    Accepted,
+    Expired,
+}
+
+/// Completion of one in-flight local-read step. Claim, forward, and submit
+/// share one flight branch so health and shutdown stay pollable while the
+/// step is outstanding; the step handles at most one pair per tick.
+enum LocalReadCompletion {
+    Settled(Result<LocalReadPollOutcome, String>),
+}
+
+struct LocalReadFlightState {
+    future: Pin<Box<dyn std::future::Future<Output = LocalReadCompletion>>>,
+}
+
+/// Sole owner of local-read poll state in `run_loop`, mirroring
+/// [`ActivationFlight`]. `Idle` means no local-read work is outstanding;
+/// `InFlight` holds the one pending poll step. No second owner and no second
+/// concurrent local-read step exist.
+enum LocalReadFlight {
+    Idle,
+    InFlight(LocalReadFlightState),
+}
+
+/// Pure tick gate: the local-read timer starts work only when the flight is
+/// idle. The in-flight step is polled in its own `select!` branch.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LocalReadTickDecision {
+    StartPoll,
+    SkipInFlight,
+}
+
+fn decide_local_read_tick(flight: &LocalReadFlight) -> LocalReadTickDecision {
+    match flight {
+        LocalReadFlight::Idle => LocalReadTickDecision::StartPoll,
+        LocalReadFlight::InFlight(_) => LocalReadTickDecision::SkipInFlight,
     }
 }
 
@@ -366,34 +425,30 @@ async fn run_loop(
     // concurrent activation exist: the timer starts work only when idle and
     // the in-flight step is polled only in its own branch below.
     let mut flight = ActivationFlight::Idle;
+    // Sole owner of local-read poll state (Implements #18). The same tick
+    // drives it independently of the activation flight: a null claim backs
+    // off until the next tick, while a claimed pair forwards through the
+    // Kernel `local_read` leg and submits its result body before idling.
+    let mut local_read_flight = LocalReadFlight::Idle;
     loop {
         tokio::select! {
             signal = tokio::signal::ctrl_c() => {
                 signal.map_err(|error| format!("daemon shutdown signal: {error}"))?;
-                return drain_activation_on_shutdown(&mut flight).await;
+                let exit = drain_activation_on_shutdown(&mut flight).await?;
+                drain_local_read_on_shutdown(&mut local_read_flight).await?;
+                return Ok(exit);
             }
             _ = cadence.activation_poll.tick() => {
-                if decide_activation_tick(&flight) != ActivationTickDecision::StartClaim {
-                    continue;
-                }
-                let kernel_clone = Arc::clone(&kernel);
-                let future: Pin<Box<dyn std::future::Future<Output = ActivationCompletion>>> =
-                    Box::pin(async move {
-                        let outcome: Result<
-                            Option<AgentActivationResolutionTicket>,
-                            String,
-                        > = kernel_clone
-                            .claim_agent_activation_ticket()
-                            .await
-                            .map_err(|error| {
-                                format!("Kernel activation ticket claim: {error}")
-                            });
-                        ActivationCompletion::Claim(outcome)
+                // The local-read poller rides the same tick under its own
+                // gate: it must start even while an activation is in flight,
+                // so its gate is checked before the activation early-continue.
+                maybe_start_local_read_poll(&kernel, &mut local_read_flight);
+                if decide_activation_tick(&flight) == ActivationTickDecision::StartClaim {
+                    flight = ActivationFlight::InFlight(ActivationFlightState {
+                        future: start_activation_claim(&kernel),
+                        retained: None,
                     });
-                flight = ActivationFlight::InFlight(ActivationFlightState {
-                    future,
-                    retained: None,
-                });
+                }
             }
             completion = async {
                 match &mut flight {
@@ -466,6 +521,9 @@ async fn run_loop(
                     },
                 }
             }
+            local_read_completion = next_local_read_completion(&mut local_read_flight) => {
+                settle_local_read_completion(local_read_completion, &mut local_read_flight)?;
+            }
             _ = cadence.health_heartbeat.tick() => {
                 KernelTransitionPort::health(&*kernel)
                     .await
@@ -518,6 +576,117 @@ async fn drain_activation_on_shutdown(
                 Ok(RunLoopExit::Shutdown)
             }
         }
+    }
+}
+
+/// Starts one local-read poll step for the outbound-only poller (Implements
+/// #18): claim one queued admitted `eliot.query` pair, forward it through
+/// the Kernel `local_read` leg, and submit its result body. At most one pair
+/// per tick; a null claim backs off until the next tick.
+fn start_local_read_poll(
+    kernel: &Arc<DaemonKernelClient>,
+) -> Pin<Box<dyn std::future::Future<Output = LocalReadCompletion>>> {
+    let kernel_clone = Arc::clone(kernel);
+    Box::pin(async move { LocalReadCompletion::Settled(run_local_read_poll(&kernel_clone).await) })
+}
+
+/// Starts the local-read poll step when its flight is idle. Checked before
+/// the activation gate on every tick so the poller stays live while an
+/// activation is in flight.
+fn maybe_start_local_read_poll(kernel: &Arc<DaemonKernelClient>, flight: &mut LocalReadFlight) {
+    if decide_local_read_tick(flight) == LocalReadTickDecision::StartPoll {
+        *flight = LocalReadFlight::InFlight(LocalReadFlightState {
+            future: start_local_read_poll(kernel),
+        });
+    }
+}
+
+/// Polls the one in-flight local-read step, pending forever while idle so
+/// health and shutdown stay pollable with no step outstanding.
+async fn next_local_read_completion(flight: &mut LocalReadFlight) -> LocalReadCompletion {
+    match flight {
+        LocalReadFlight::Idle => std::future::pending::<LocalReadCompletion>().await,
+        LocalReadFlight::InFlight(state) => (&mut state.future).await,
+    }
+}
+
+/// Settles one completed local-read poll step back to idle. Every outcome —
+/// null-poll backoff, accepted persist, or the expected expiry race (the
+/// next claim reclaims the pair) — simply idles until the next tick; only a
+/// step failure fails the daemon closed.
+fn settle_local_read_completion(
+    completion: LocalReadCompletion,
+    flight: &mut LocalReadFlight,
+) -> Result<(), String> {
+    match completion {
+        LocalReadCompletion::Settled(Ok(_)) => {
+            *flight = LocalReadFlight::Idle;
+            Ok(())
+        }
+        LocalReadCompletion::Settled(Err(error)) => Err(error),
+    }
+}
+
+/// Runs one local-read poll step: `local_read_claim` (pair or null, 1000 ms
+/// Kernel lease, null means backoff), then
+/// [`forward_admitted_local_read`] for the admitted pair, then
+/// `local_read_result` with the returned [`HostRequestResultBody`]
+/// (accepted or the expected expiry race). Exact replays stay idempotent by
+/// Kernel contract. Any step failure fails the daemon closed — a claimed
+/// pair that cannot forward or submit is never silently discarded.
+async fn run_local_read_poll(kernel: &DaemonKernelClient) -> Result<LocalReadPollOutcome, String> {
+    let pair = kernel
+        .claim_local_read_pair_async()
+        .await
+        .map_err(|error| format!("Kernel local-read pair claim: {error}"))?;
+    let Some((envelope, tool)) = pair else {
+        return Ok(LocalReadPollOutcome::IdleBackoff);
+    };
+    let body = forward_admitted_local_read(kernel, envelope, tool)
+        .await
+        .map_err(|error| format!("daemon local-read forward: {error}"))?;
+    match submit_local_read_result_idempotent(kernel, &body).await? {
+        LocalReadSubmitOutcome::Accepted => Ok(LocalReadPollOutcome::Accepted),
+        LocalReadSubmitOutcome::Expired => Ok(LocalReadPollOutcome::Expired),
+    }
+}
+
+/// Submits one forwarded local-read result body, retrying once with the
+/// byte-identical body when the first submit fails.
+///
+/// This is the local-read twin of the activation lost-acknowledgement
+/// reconcile: the retained body is reused verbatim, never recomputed, and no
+/// local replay cache or timer is introduced. The retry is safe because the
+/// Kernel submit leg is exact-replay idempotent — an identical body under the
+/// same identity persists once and replays, never duplicates.
+async fn submit_local_read_result_idempotent(
+    kernel: &DaemonKernelClient,
+    body: &eliot_protocol::HostRequestResultBody,
+) -> Result<LocalReadSubmitOutcome, String> {
+    match kernel.submit_local_read_result_async(body).await {
+        Ok(outcome) => Ok(outcome),
+        Err(first_error) => kernel
+            .submit_local_read_result_async(body)
+            .await
+            .map_err(|error| {
+                format!("Kernel local-read result submit: {first_error}; retry: {error}")
+            }),
+    }
+}
+
+/// Bounded shutdown drain for one in-flight local-read poll. Never starts
+/// new work and retains no local identity: an un-submitted pair's Kernel
+/// claim lease (1000 ms) expires and the pair re-claims on the next loop,
+/// while an already-persisted body exact-replays idempotently on the next
+/// submit — so the drain always settles as plain `Shutdown`, never unknown.
+async fn drain_local_read_on_shutdown(flight: &mut LocalReadFlight) -> Result<RunLoopExit, String> {
+    let previous = std::mem::replace(flight, LocalReadFlight::Idle);
+    let LocalReadFlight::InFlight(state) = previous else {
+        return Ok(RunLoopExit::Shutdown);
+    };
+    match tokio::time::timeout(SHUTDOWN_ACTIVATION_DRAIN, state.future).await {
+        Ok(LocalReadCompletion::Settled(Err(error))) => Err(error),
+        _ => Ok(RunLoopExit::Shutdown),
     }
 }
 
