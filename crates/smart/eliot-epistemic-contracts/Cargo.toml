@@ -1,29 +1,28 @@
 [package]
 name = "eliot-epistemic-contracts"
-version = "0.1.0"
-edition = "2024"
-rust-version = "1.94"
-license = "MIT"
-publish = false
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
 description = "Versioned store-neutral contracts for ELIOT Current Epistemic Position"
 
 [lib]
 path = "src/lib.rs"
 
 [dependencies]
-eliot-contracts = { path = "../../foundation/eliot-contracts", version = "0.1.0" }
-eliot-evidence = { path = "../../foundation/eliot-evidence", version = "0.1.0" }
-eliot-receipts = { path = "../../foundation/eliot-receipts", version = "0.1.0" }
-schemars = { version = "1.2.1", features = ["derive", "uuid1"] }
-serde = { version = "1.0.228", features = ["derive"] }
-thiserror = "2.0.18"
+eliot-contracts.workspace = true
+eliot-evidence.workspace = true
+eliot-receipts.workspace = true
+schemars.workspace = true
+serde.workspace = true
+thiserror.workspace = true
 
 [dev-dependencies]
 serde_json = { version = "1.0.149" }
 
 [package.metadata.eliot]
-prototype = true
-workspace_admission = "pending_agent_implementation"
+prototype = false
+workspace_admission = "admitted via #829 (T8-A0) root workspace membership"
 functional_cell = "smart.epistemic.contracts"
 source_layer = "C1"
 runtime_layer = "R5"
@@ -32,29 +31,3 @@ agent_order = 6
 
 [lints]
 workspace = true
-
-# Standalone workspace root. Without this, cargo walks above the repository
-# and can bind this package to an unrelated ancestor manifest, so every
-# per-crate `cargo check|test|clippy` fails before it starts. Remove this
-# table when the cell is promoted into the root workspace `members`.
-[workspace]
-
-# Mirrors the root `[workspace.lints]` verbatim so an excluded cell is linted
-# exactly like an admitted one. Keep in sync; the promotion commit drops this
-# whole `[workspace]` table and restores plain inheritance.
-[workspace.lints.rust]
-unsafe_code = "forbid"
-missing_docs = "allow"
-
-[workspace.lints.clippy]
-all = { level = "warn", priority = -1 }
-pedantic = { level = "warn", priority = -1 }
-dbg_macro = "warn"
-expect_used = "warn"
-missing_errors_doc = "allow"
-missing_panics_doc = "allow"
-module_name_repetitions = "allow"
-must_use_candidate = "allow"
-print_stderr = "warn"
-print_stdout = "warn"
-unwrap_used = "warn"
