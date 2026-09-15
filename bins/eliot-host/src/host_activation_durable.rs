@@ -762,6 +762,40 @@ impl HostComposition {
             .manifest
             .host_child_artifact_digests()
             .map_err(|error| HostError::ProcessContour(error.to_string()))?;
+        // Dispatch children are validated exactly like Kernel/Store bridge
+        // artifacts. They are not launched by Host, but their digests must be
+        // present and bound before the Kernel contour is admitted; a missing
+        // or placeholder value fails closed here and is never defaulted.
+        let (doctor_artifact, testd_artifact, native_worker_artifact) = pending
+            .manifest
+            .dispatch_child_artifact_digests()
+            .map_err(|error| HostError::ProcessContour(error.to_string()))?;
+        let (doctor_path, testd_path, native_worker_path) = pending
+            .manifest
+            .dispatch_child_paths()
+            .map_err(|error| HostError::ProcessContour(error.to_string()))?;
+        for (digest, label) in [
+            (doctor_artifact, "dispatch.doctor_artifact"),
+            (testd_artifact, "dispatch.testd_artifact"),
+            (native_worker_artifact, "dispatch.native_worker_artifact"),
+        ] {
+            if digest.as_str().len() != 64 {
+                return Err(HostError::ProcessContour(format!(
+                    "{label} must be a bound SHA-256 digest"
+                )));
+            }
+        }
+        for (path, label) in [
+            (doctor_path, "dispatch.doctor_path"),
+            (testd_path, "dispatch.testd_path"),
+            (native_worker_path, "dispatch.native_worker_path"),
+        ] {
+            if path.as_str().is_empty() {
+                return Err(HostError::ProcessContour(format!(
+                    "{label} must be a bound executable path"
+                )));
+            }
+        }
         let pending_manifest_digest = phase_b_manifest_digest(&pending.manifest)?;
         let phase_b = self
             .phase_b
