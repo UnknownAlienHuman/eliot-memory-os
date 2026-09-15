@@ -2,20 +2,20 @@
 
 ## Status
 
-Accepted for issue #728, Wave A, at worktree base
-`1cb9ac63ce0bf2a7606e0c89910fb5a21f1299f2`. This record is the I2.5
+Accepted for issue #728, Wave A, refreshed in place at worktree base
+`725dc5a72c4e411b74b2d11e8f2c3f1ee5247369`. This record is the I2.5
 explicit-crate listing for the current manifest denominator: one canonical
 owner (`eliot-platform-windows`) and four audited exceptions
 (`eliot-windows-ipc`, `eliot-ipc`, `eliot-host`, `eliot-watchdog`).
 
-Residual, stated honestly: this worktree predates the hardening merges for
-#789 (PR #1156, `4baaeaae`), #791 (PR #1157, `04fa44d2`), and #860
-(PR #1158, `455d45f1` per the work-unit record). Merge-base checks in this
-worktree confirm #1156 and #1157 are not ancestors of the base commit, and
-the #1158 merge commit is absent from the local clone. Obligation rows below
-therefore cite that hardening as the target coverage the Wave C/D oracle
-must revalidate at integration; they do not claim the hardened source is
-present in this tree.
+Integration, stated honestly: the hardening merges for #789 (PR #1156,
+`4baaeaae`), #791 (PR #1157, `04fa44d2`), and #860 (PR #1158, `455d45f1`)
+are all ancestors of this base commit, verified with
+`git merge-base --is-ancestor` in this worktree, and the SCM-entry move of
+PR #1362 (`9d5c6543`) is likewise present. Obligation rows below therefore
+cite that hardening as merged, present-tree source. The Wave C/D oracle
+still revalidates every citation against the current source before any claim
+stronger than policy/comment/coverage is made.
 
 ## Context
 
@@ -34,11 +34,11 @@ rather than memory, is:
 |---|---|---|
 | `crates/kernel/eliot-platform-windows/Cargo.toml:47` | `allow` | `deny` (`:48`) |
 | `crates/eliot-windows-ipc/Cargo.toml:28` | `allow` | `deny` (`:29`) |
-| `crates/kernel/eliot-ipc/Cargo.toml:26` | `allow` | unset |
+| `crates/kernel/eliot-ipc/Cargo.toml:28` | `allow` | unset |
 | `bins/eliot-host/Cargo.toml:43` | `allow` | unset |
-| `bins/eliot-watchdog/Cargo.toml:37` | `allow` | unset |
+| `bins/eliot-watchdog/Cargo.toml:40` | `allow` | unset |
 
-The workspace root (`Cargo.toml:331`) sets `unsafe_code = "forbid"`, so these
+The workspace root (`Cargo.toml:333`) sets `unsafe_code = "forbid"`, so these
 five are the complete current denominator: no other member manifest sets
 `allow`. There is no `eliot-platform-unix` workspace member in this tree, so
 the I2.5 unix entry names no current package; admitting one later requires an
@@ -55,7 +55,9 @@ each boundary without widening it: #789 bounds every unsafe family in
 bounds), #791 bounds every unsafe family in `eliot-ipc` (Waves A–C, twelve
 sites: lib wrappers, frame-codec buffer invariants), and #860 types the
 `Drop` paths in `eliot-platform-windows` (single-attempt restore with
-retained fail-stop). All three merged remotely after this worktree's base.
+retained fail-stop). All three have merged and are ancestors of this base
+commit (#1156 `4baaeaae`, #1157 `04fa44d2`, #1158 `455d45f1`), so the bounds
+named above describe present-tree source, not a future integration.
 
 ## Decision
 
@@ -98,7 +100,7 @@ oracle (`safety_coverage`: path, item, span, form, and digest per site with
 operation-specific pointer, buffer, UTF-16, handle, callback, thread,
 impersonation, ABI, and unwind obligations), an adjacent operation-specific
 `// SAFETY:` comment per site, and an owning reviewer; the #860 typed-`Drop`
-hardening is the target coverage. Evidence ceiling: policy plus comment plus
+hardening is merged, present-tree coverage. Evidence ceiling: policy plus comment plus
 source coverage only — no claim of universal undefined-behavior absence.
 Review, removal, and migration trigger: any new unsafe family needs a new
 decision before merge; any family extracted elsewhere shrinks this row.
@@ -137,7 +139,7 @@ must not move), handle-ownership transfer into `OwnedHandle`, `Send` across
 threads, and overly wide oplock or guardian inputs. Required proof:
 operation-specific `// SAFETY:` per site, local invariant tests, an owning
 reviewer, and the #789 Slice A hardening (`OwnedHandle` sentinel plus
-wide-input bounds) as target coverage. Evidence ceiling: policy plus comment
+wide-input bounds) as merged, present-tree coverage. Evidence ceiling: policy plus comment
 plus source coverage only. Review, removal, and migration trigger:
 completion of the I10.8.12 extraction turns this manifest to `forbid`; any
 new family before then is a Contract Challenge, not an edit. Relation to
@@ -170,8 +172,8 @@ Risks: omitted or duplicated `LocalFree`, descriptor use-after-free,
 `borrow_raw` outliving its owner, SDDL content smuggled outside the typed
 expectation, and unwinding between conversion and release. Required proof:
 operation-specific `// SAFETY:` per site, local invariant tests, an owning
-reviewer, and the #791 Waves A–C hardening (twelve bounded sites) as target
-coverage. Evidence ceiling: policy plus comment plus source coverage only;
+reviewer, and the #791 Waves A–C hardening (twelve bounded sites) as merged,
+present-tree coverage. Evidence ceiling: policy plus comment plus source coverage only;
 no IPC-completion or product claim follows. Review, removal, and migration
 trigger: descriptor construction migrating fully into
 `eliot-platform-windows` turns this manifest to `forbid`; a new unsafe
@@ -183,29 +185,41 @@ separate audited FFI bridge.
 ### Row `eliot-host`: SCM entry trampoline (exception 3 of 4)
 
 Package `eliot-host` (`bins/eliot-host`), runtime composition-root plane
-(Host lifecycle and journal boundary, issue #14). Source: `src/main.rs` —
-`unsafe fn service_launch_options` (`:466`, SCM `ServiceMain` argv UTF-16
-walk bounded by `MAX_SERVICE_ARG_UNITS`) and the `SetServiceStatus` calls
-(`:447`, `:462`). Permitted classes: the SCM entry trampoline only —
-reading the service argv vector and writing `SERVICE_STATUS`. The target
-canonical owner for SCM argv mechanics is `eliot-platform-windows`.
+(Host lifecycle and journal boundary, issue #14). Source: since PR #1362
+(`9d5c6543`) the composition root itself carries no unsafe — the crate roots
+(`src/main.rs:1`, `src/lib.rs`) set `#![forbid(unsafe_code)]`, which covers
+the whole crate, and the package contains zero `unsafe` tokens. The SCM entry
+trampoline lives in the canonical owner: `eliot-platform-windows`
+`src/scm_entry.rs` exposes only safe APIs (`run_service_dispatcher`,
+`parse_service_main_argv` bounded by `MAX_SERVICE_ARG_UNITS`,
+`report_service_status`), and the Host `ServiceMain` in `src/main.rs` calls
+them as ordinary safe functions; raw SCM argv pointers never cross the
+package boundary. Permitted classes: the SCM entry trampoline only —
+reading the service argv vector and writing `SERVICE_STATUS`, executed
+inside the canonical owner on the Host's behalf. The canonical owner for SCM
+argv mechanics is `eliot-platform-windows`, and since #1362 it is also the
+actual owner.
 
-This package owns the FFI because a Windows service must enter through the
-SCM `ServiceMain` signature, whose `argv` arrives as raw UTF-16 pointers
-that cannot be read without raw-pointer dereference; everything past the
-trampoline is safe (`HostLaunchOptions::validate_service_main_argv`).
-Prohibited expansion: no further Win32 calls, no handle or pump logic, no
+This package holds the exception slot because a Windows service must still
+enter through the SCM `ServiceMain` signature, whose `argv` arrives as raw
+UTF-16 pointers; the dereference happens exactly once, inside the canonical
+owner's audited `parse_service_main_argv`, and everything past it is safe
+(`HostLaunchOptions::validate_service_main_argv` in
+`src/host_launch_options.rs`). Prohibited expansion: no Win32 calls in the
+bins package beyond the canonical-owner APIs, no handle or pump logic, no
 argv widening — exactly one argument, NUL-terminated, within the length
 bound. Risks: `from_raw_parts` over SCM-owned memory valid only for the
-call, unbounded reads (closed by the bound plus terminator scan), null
-entries, running on the SCM thread, and no unwinding across the boundary.
-Required proof: operation-specific `// SAFETY:` at each block, unit tests
-over the safe validator (null, empty, overlong, multi-arg, non-canonical
-argv), and an owning reviewer. Evidence ceiling: policy plus comment plus
-source coverage only. Review, removal, and migration trigger: extracting the
-argv parser into `eliot-platform-windows` turns this manifest to `forbid`;
-any additional unsafe family is rejected. Relation to I2.5: third instance
-of the separate audited FFI bridge, narrowed to service entry.
+call (confined to `scm_entry.rs`), unbounded reads (closed by the bound plus
+terminator scan), null entries, running on the SCM thread, and no unwinding
+across the boundary. Required proof: operation-specific `// SAFETY:` at each
+block in `scm_entry.rs`, unit tests over the safe validator (null, empty,
+overlong, multi-arg, non-canonical argv), and an owning reviewer. Evidence
+ceiling: policy plus comment plus source coverage only. Review, removal, and
+migration trigger: the argv parser already lives in
+`eliot-platform-windows`; turning this manifest to `forbid` is a follow-up
+manifest decision outside this prose refresh — until then any additional
+unsafe family is rejected. Relation to I2.5: third instance of the separate
+audited FFI bridge, narrowed to service entry.
 
 <a id="row-eliot-watchdog"></a>
 
@@ -213,41 +227,56 @@ of the separate audited FFI bridge, narrowed to service entry.
 
 Package `eliot-watchdog` (`bins/eliot-watchdog`), independent supervision
 plane (issue #16): a separate service outside the Host and Kernel failure
-domain. Source: `src/main.rs` — `unsafe fn service_launch_options`
-(`:212`, same bounded argv shape as Host) and `unsafe extern "system" fn
-service_control` (`:248`). Permitted classes: the SCM entry trampoline and
-the control-handler status dispatch only. The target canonical owner for SCM
-argv mechanics is `eliot-platform-windows`.
+domain. Source: since PR #1362 (`9d5c6543`) the supervision root itself
+carries no unsafe — the crate roots (`src/main.rs:1`, `src/lib.rs`) set
+`#![forbid(unsafe_code)]`, which covers the whole crate, and the package
+contains zero `unsafe` tokens. The SCM entry trampoline and the
+control-handler
+status dispatch live in the canonical owner: `eliot-platform-windows`
+`src/scm_entry.rs` safe APIs (`run_service_dispatcher`,
+`parse_service_main_argv`, `register_service_control_handler`,
+`report_service_status`), called as ordinary safe functions from the
+package's safe code (`src/main.rs` for dispatch and argv parsing,
+`src/watchdog_service_status.rs` for status reporting); the argv validators stay in safe package code
+(`validate_watchdog_service_main_argv`, `validate_watchdog_scm_bootstrap`
+in `src/scm_launch.rs`). Permitted classes: the SCM entry trampoline and
+the control-handler status dispatch only, executed inside the canonical
+owner on Watchdog's behalf. The canonical owner for SCM argv mechanics is
+`eliot-platform-windows`, and since #1362 it is also the actual owner.
 
-This package owns the FFI for the same entry-signature reason as Host, with
-one extra constraint that only Watchdog carries: the entry code must not
-acquire IPC handles, Job memberships, or spool and store writes that would
-couple it into the Host or Kernel failure domain (I8.1, I1.6) — Watchdog
-that cannot survive `eliotd` failure is not supervision. Prohibited
-expansion: no semantic observation, spool writes, or store access inside
-unsafe; no new families; unknown control codes receive a neutral status,
-never a panic across `extern "system"` (which would abort). Risks: the same
-argv lifetime and bound risks as Host, plus control-code dispatch on an SCM
-thread and abort-on-unwind across the system boundary. Required proof:
-operation-specific `// SAFETY:` at each block, unit tests over the safe
-validators (`validate_watchdog_service_main_argv`,
+This package holds the exception slot for the same entry-signature reason
+as Host — the dereference happens exactly once, inside the canonical
+owner's audited `parse_service_main_argv` — with one extra constraint that
+only Watchdog carries: the entry code must not acquire IPC handles, Job
+memberships, or spool and store writes that would couple it into the Host
+or Kernel failure domain (I8.1, I1.6) — Watchdog that cannot survive
+`eliotd` failure is not supervision. Prohibited expansion: no semantic
+observation, spool writes, or store access inside unsafe; no new families;
+unknown control codes receive a neutral status, never a panic across
+`extern "system"` (which would abort). Risks: the same argv lifetime and
+bound risks as Host (confined to `scm_entry.rs`), plus control-code dispatch
+on an SCM thread and abort-on-unwind across the system boundary. Required
+proof: operation-specific `// SAFETY:` at each block in `scm_entry.rs`,
+unit tests over the safe validators (`validate_watchdog_service_main_argv`,
 `validate_watchdog_scm_bootstrap`: null, empty, overlong, multi-arg,
 non-canonical inputs), and an owning reviewer. Evidence ceiling: policy plus
 comment plus source coverage only. Review, removal, and migration trigger:
-shared-parser extraction into `eliot-platform-windows` turns this manifest
-to `forbid`; any coupling of Watchdog entry to Host or Kernel state is a
-defect regardless of memory safety. Relation to I2.5: fourth and last
+the shared parser already lives in `eliot-platform-windows`; turning this
+manifest to `forbid` is a follow-up manifest decision outside this prose
+refresh — meanwhile any coupling of Watchdog entry to Host or Kernel state
+is a defect regardless of memory safety. Relation to I2.5: fourth and last
 instance of the separate audited FFI bridge.
 
 ## Consequences
 
-The manifest Wave B change is four comment lines, one per exception
+The manifest Wave B change was four comment lines, one per exception
 manifest, each pointing at its exact row above; lint values, dependencies,
-features, and ordering are untouched. Operation-specific coverage is Wave C
-writer work and token-identity plus case coverage is Wave D writer work —
-this ADR is the policy they hang from, not their proof. Because the local
-tree predates #1156, #1157, and #1158, integration must revalidate every
-"target coverage" citation above against the merged source before any claim
+features, and ordering were untouched, and this refresh touches no manifest
+at all. Operation-specific coverage is Wave C writer work and token-identity
+plus case coverage is Wave D writer work — this ADR is the policy they hang
+from, not their proof. The #1156, #1157, and #1158 merges are ancestors of
+this base, so the hardening citations above name present-tree source; every
+citation is still revalidated against the current source before any claim
 stronger than policy/comment/coverage is made. Future exceptions need an ADR
 amendment, an owning reviewer, and oracle coverage before merge; silent
 manifest widening is a scope-drift defect. No other ADR was modified, and
@@ -259,16 +288,24 @@ manifest widening is a scope-drift defect. No other ADR was modified, and
   this change (`Test-Path` returned false) and follows the full 0009 shape:
   title, Status, Context, Decision, Consequences, Acceptance evidence.
 - The five-row denominator above reproduces the actual manifests:
-  `eliot-platform-windows:47`, `eliot-windows-ipc:28`, `eliot-ipc:26`,
-  `eliot-host:43`, `eliot-watchdog:37`, with the workspace root forbidding
-  `unsafe_code` at `Cargo.toml:331` and no `eliot-platform-unix` member
+  `eliot-platform-windows:47`, `eliot-windows-ipc:28`, `eliot-ipc:28`,
+  `eliot-host:43`, `eliot-watchdog:40`, with the workspace root forbidding
+  `unsafe_code` at `Cargo.toml:333` and no `eliot-platform-unix` member
   present.
 - Each of the four exception manifests carries exactly one comment
   referencing its exact row anchor (`#row-eliot-windows-ipc`,
   `#row-eliot-ipc`, `#row-eliot-host`, `#row-eliot-watchdog`); missing,
   duplicate, unknown, or stale rows fail closed under the Wave D oracle.
-- `git diff --check` is clean and `git diff --stat` shows comment-only
-  additions in the four manifests.
+- At the original landing, `git diff --check` was clean and
+  `git diff --stat` showed comment-only additions in the four manifests.
+- Refresh (this change, prose-only in this file): Status base is
+  `725dc5a72c4e411b74b2d11e8f2c3f1ee5247369`;
+  `git merge-base --is-ancestor` confirms `4baaeaae` (#1156), `04fa44d2`
+  (#1157), and `455d45f1` (#1158) are all ancestors of base; host/watchdog
+  rows cite `scm_entry.rs` safe-API delegation with
+  `#![forbid(unsafe_code)]` mains. No manifest, source, oracle, or fixture
+  file was modified: `git diff --stat` shows this ADR only, and
+  `git diff --check` is clean.
 - Proof ceiling: this ADR plus manifest comments plus the Wave C/D oracle
   prove ownership, adjacency, and operation-specific coverage only. No
   universal memory-safety, IPC-completion, runtime, or product claim follows
