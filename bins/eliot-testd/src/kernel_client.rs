@@ -40,12 +40,16 @@
 //!
 //! Until the live Kernel dispatch contour lands, the client fails closed
 //! after the authenticated bootstrap instead of inventing admission
-//! material: `connect` reports the closed bootstrap and `advertise_testd`
-//! stays unadvertised, while the Drive path below already derives its
-//! executable binding from the admitted profile registry.
+//! material: `connect` mirrors the doctor bootstrap (`KernelClient::load` →
+//! `probe` → `require_health_open` → `parse_live_epoch`) and fails closed
+//! without ambient authority when the front door is unavailable, while
+//! `advertise_testd` probes live health and flips to `true` only when the
+//! composed Kernel advertises the exact testd wire. The Drive path below
+//! already derives its executable binding from the admitted profile registry.
 
 use std::sync::Arc;
 
+use eliot_cli::kernel_client::{KernelClient, KernelClientError};
 use eliot_contracts::{EpochId, canonical_json_bytes, sha256_hex};
 use eliot_instrument_api::{InstrumentInvocation, InstrumentKind};
 use eliot_process::{ProcessEvidenceSink, ProcessExecutionError, ProcessExecutor, ProcessRequest};
@@ -113,6 +117,12 @@ pub enum TestdIpcError {
         /// Canonical digest of the submitted envelope.
         request_digest: String,
     },
+}
+
+impl From<KernelClientError> for TestdIpcError {
+    fn from(error: KernelClientError) -> Self {
+        Self::Transport(error.to_string())
+    }
 }
 
 /// Validates bounded wire text without carrying platform or secret material.
@@ -512,18 +522,24 @@ impl KernelTestdIpcClient {
     /// Opens the authenticated generation-bound bootstrap: loads the
     /// installation-owned protected front-door declaration, completes the
     /// EBP handshake (the live `ServerHello` is checked against the
-    /// protected authority epoch, generation, artifact, and snapshot), and
-    /// probes health. Retains the live authority epoch echoed by the
-    /// authenticated health reply for the lineage-aware identity binding.
+    /// protected authority epoch, generation, artifact, and snapshot inside
+    /// [`KernelClient`]), and probes health. Retains the live authority
+    /// epoch echoed by the authenticated health reply for the
+    /// lineage-aware identity binding.
     ///
-    /// Until the live Kernel dispatch contour lands, this fails closed without
-    /// opening ambient state: there is no session-bound admission to bind,
-    /// so inventing one would manufacture authority.
+    /// Mirrors `KernelDoctorIpcClient::connect`: the same load → probe →
+    /// `require_health_open` → `parse_live_epoch` sequence, with transport
+    /// failures staying transport failures. Without a live composed Kernel
+    /// front door this fails closed; it never invents an epoch.
     pub fn connect() -> Result<Self, TestdIpcError> {
-        Err(TestdIpcError::Transport(
-            "protected testd front door requires the authenticated dispatch contour (live Kernel bootstrap plus advertised testd operation)"
-                .to_owned(),
-        ))
+        let mut client = KernelClient::load().map_err(TestdIpcError::from)?;
+        let health = client.probe().map_err(TestdIpcError::from)?;
+        require_health_open(&health)?;
+        let live_epoch = parse_live_epoch(&health)?;
+        Ok(Self {
+            live_epoch: Some(live_epoch),
+            retained: None,
+        })
     }
 
     /// Returns the live authority epoch retained from the authenticated
@@ -534,10 +550,17 @@ impl KernelTestdIpcClient {
     }
 
     /// Reports whether the live Kernel advertises the exact testd
-    /// admission wire. Absent advertisement means not advertised: the check
-    /// is fail-closed and never invents authority.
+    /// admission wire. Probes live health over a fresh authenticated
+    /// bootstrap and returns the health advertisement bit: `true` only when
+    /// the composed Kernel explicitly advertises the wire. Absent
+    /// advertisement — or an unavailable front door — means not advertised:
+    /// transport failures stay transport failures and never invent
+    /// authority.
     pub fn advertise_testd(&mut self) -> Result<bool, TestdIpcError> {
-        Ok(advertise_testd_admission())
+        let mut client = KernelClient::load().map_err(TestdIpcError::from)?;
+        let health = client.probe().map_err(TestdIpcError::from)?;
+        require_health_open(&health)?;
+        Ok(health_advertises_testd(&health))
     }
 
     /// Submits one full admission envelope and returns the typed Kernel
@@ -654,10 +677,6 @@ impl AdmittedTestdTransport for KernelTestdIpcClient {
 }
 
 /// Requires the authenticated health reply to report an open Kernel.
-#[allow(
-    dead_code,
-    reason = "dispatch contour probes health once the delivery seam lands; exercised by the module tests"
-)]
 fn require_health_open(health: &serde_json::Value) -> Result<(), TestdIpcError> {
     if health.get("status").and_then(serde_json::Value::as_str) != Some("OPEN") {
         return Err(TestdIpcError::Transport(
@@ -671,10 +690,6 @@ fn require_health_open(health: &serde_json::Value) -> Result<(), TestdIpcError> 
 /// The value travels over the session the handshake already bound to the
 /// protected declaration; it is never taken from argv, stdin, or
 /// environment.
-#[allow(
-    dead_code,
-    reason = "dispatch contour retains the live epoch once the delivery seam lands; exercised by the module tests"
-)]
 fn parse_live_epoch(health: &serde_json::Value) -> Result<EpochId, TestdIpcError> {
     let epoch_value = health.get("authority_epoch").ok_or_else(|| {
         TestdIpcError::Contract("kernel health reply carries no live authority epoch".to_owned())
@@ -689,10 +704,6 @@ fn parse_live_epoch(health: &serde_json::Value) -> Result<EpochId, TestdIpcError
 /// Reports whether the authenticated health reply explicitly advertises the
 /// exact testd admission wire. Absent advertisement fields mean not
 /// advertised: the check is fail-closed and never invents authority.
-#[allow(
-    dead_code,
-    reason = "dispatch contour probes advertisement once the delivery seam lands; exercised by the module tests"
-)]
 fn health_advertises_testd(health: &serde_json::Value) -> bool {
     if health
         .get("testd_admission_advertised")
@@ -1192,11 +1203,17 @@ mod tests {
         let envelope = test_envelope(JOB_ID);
         let refused = client.submit_testd_admission(&envelope);
         assert!(matches!(refused, Err(TestdIpcError::NotAdvertised)));
-        assert_eq!(client.advertise_testd(), Ok(false));
-        assert!(matches!(
-            KernelTestdIpcClient::connect(),
-            Err(TestdIpcError::Transport(_))
-        ));
+        // Live advertisement probes the composed Kernel and never invents
+        // authority: without a composed front door this is either a closed
+        // `Ok(false)` or a transport failure, never `Ok(true)`.
+        assert_ne!(client.advertise_testd(), Ok(true));
+        // Without a live composed front door the bootstrap fails closed as
+        // transport; on a composed host it succeeds with a retained epoch.
+        match KernelTestdIpcClient::connect() {
+            Ok(bootstrapped) => assert!(bootstrapped.live_epoch().is_some()),
+            Err(TestdIpcError::Transport(_)) => {}
+            Err(other) => panic!("connect must stay transport-fail-closed, got {other:?}"),
+        }
     }
 
     #[test]
