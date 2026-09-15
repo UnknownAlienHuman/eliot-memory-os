@@ -2191,6 +2191,54 @@ mod single_shape_proof {
         )
     }
 
+    /// Exact process invocation value the R1 Governor producer canonicalizes.
+    ///
+    /// The same `canonical_json_bytes` + `sha256_hex` the Governor
+    /// `process_invocation_digest_for` helper runs, so the join below carries
+    /// the real record digest into the executable gate instead of a
+    /// placeholder.
+    fn test_invocation(claim_id: &str, operation_id: &str) -> serde_json::Value {
+        serde_json::json!({
+            "claim_id": claim_id,
+            "operation_id": operation_id,
+            "argv": ["--check"],
+            "fence": {"generation": 1},
+        })
+    }
+
+    /// Derives the R1 production `process_invocation_digest` from the exact
+    /// invocation bytes (never canned).
+    fn test_invocation_digest(claim_id: &str, operation_id: &str) -> String {
+        let invocation = test_invocation(claim_id, operation_id);
+        let bytes =
+            eliot_contracts::canonical_json_bytes(&invocation).expect("canonical invocation");
+        eliot_contracts::sha256_hex(&bytes)
+    }
+
+    /// Derives the opaque owner-produced executable digest from the real
+    /// published binding material through the real hash procedure.
+    ///
+    /// Carried by value and compared for equality only (the route never
+    /// recomputes the Governor domain); derived here from the claim-bound
+    /// nonce plus the real invocation digest so no stand-in seed remains on
+    /// the exercised path.
+    fn test_owner_digest(
+        claim_id: &str,
+        operation_id: &str,
+        nonce: &str,
+        invocation_digest: &str,
+    ) -> String {
+        let material = serde_json::json!({
+            "claim_id": claim_id,
+            "operation_id": operation_id,
+            "launch_nonce": nonce,
+            "process_invocation_digest": invocation_digest,
+        });
+        let bytes =
+            eliot_contracts::canonical_json_bytes(&material).expect("canonical owner material");
+        eliot_contracts::sha256_hex(&bytes)
+    }
+
     /// Builds one envelope-less worker-core `{claim, registration}` pair
     /// plus its binding digest (Implements #22 R2).
     ///
@@ -2207,6 +2255,14 @@ mod single_shape_proof {
     ) -> (serde_json::Value, serde_json::Value, String) {
         let fence_value = serde_json::to_value(fence()).expect("fence json");
         let epoch_value = serde_json::to_value(epoch(1)).expect("epoch json");
+        // R1 Governor-sourced digests: derived from the real binding record
+        // through the production canonical procedure, never canned. The
+        // wire-v1 `None` branch of `build_executable_expectation` keeps its
+        // by-construction empty placeholders (refused typed upstream); only
+        // this presented join carries real digests.
+        let nonce = "launch-nonce-0123456789abcdef";
+        let invocation_digest = test_invocation_digest(claim_id, operation_id);
+        let owner_digest = test_owner_digest(claim_id, operation_id, nonce, &invocation_digest);
         let join = serde_json::json!({
             "route_ref": "route://test/full-canonical-route",
             "adapter_id": "adapter-test",
@@ -2215,15 +2271,15 @@ mod single_shape_proof {
             "facet_manifest_ref": "facet-manifest-7",
             "grant_graph_revision": 5,
             "replay_stream_id": replay_stream_id,
-            "launch_nonce": "launch-nonce-0123456789abcdef",
-            "process_invocation_digest": "d".repeat(64),
+            "launch_nonce": nonce,
+            "process_invocation_digest": invocation_digest,
             "authority_epoch": epoch_value,
             "generation": serde_json::to_value(fence().resource_generation).expect("gen"),
             "state_fence": fence_value,
             "deadline_unix_ms": 9_000_000_000_000u64,
             "expires_at_unix_ms": 9_000_000_100_000u64,
             "executable_wire_version": NATIVE_WORKER_EXECUTABLE_BINDING_EXPECTED_WIRE_VERSION,
-            "executable_binding_digest": "e".repeat(64),
+            "executable_binding_digest": owner_digest,
         });
         // Binding digest over the shared 18-field set (same procedure both
         // sides use; envelope-only fields are excluded, so stripping them
@@ -2413,6 +2469,192 @@ mod single_shape_proof {
         assert!(
             KernelComposition::build_single_shape_request(&rewired, &registration).is_err(),
             "rewired envelope must not build"
+        );
+    }
+
+    /// Builds one R1 gate fixture: the typed request plus the live
+    /// registration anchors the expectation is built from.
+    fn r1_gate_fixture() -> (
+        NativeWorkerClaimRequest,
+        serde_json::Value,
+        StateFence,
+        EpochId,
+    ) {
+        let (claim, registration, _) = single_shape_pair(
+            "claim-r1-gate-1",
+            "reg-r1-gate-1",
+            "attempt-r1-gate-1",
+            "op-r1-gate-1",
+            "stream-r1-gate-1/gen-1",
+        );
+        let request = KernelComposition::build_single_shape_request(&claim, &registration)
+            .expect("R1 claim builds single-shape");
+        request.validate().expect("R1 request validates");
+        let fence_value: StateFence = serde_json::from_value(
+            registration
+                .get("state_fence")
+                .cloned()
+                .expect("registration fence"),
+        )
+        .expect("registration fence parses");
+        let live_epoch: EpochId = serde_json::from_value(
+            registration
+                .get("authority_epoch")
+                .cloned()
+                .expect("registration epoch"),
+        )
+        .expect("registration epoch parses");
+        (request, registration, fence_value, live_epoch)
+    }
+
+    /// Recomputes both claim digests after a presented-field mutation so the
+    /// executable gate reaches its typed currentness arm instead of stopping
+    /// at a stale envelope digest.
+    fn r1_rebind(request: &mut NativeWorkerClaimRequest) {
+        request.binding_digest = request
+            .compute_binding_digest()
+            .expect("rebind binding");
+        request.request_digest = request
+            .canonical_request_digest()
+            .expect("rebind envelope");
+    }
+
+    /// R1 Governor-sourced digest feed, admit path (Implements #22): the
+    /// presented join carries the real invocation digest derived from the
+    /// exact invocation bytes, and the gate admits the matching digest.
+    #[test]
+    fn r1_gate_admits_matching_invocation_digest() {
+        let (request, registration, fence_value, live_epoch) = r1_gate_fixture();
+        let presented = request
+            .executable_binding
+            .as_ref()
+            .expect("R1 request carries the join");
+        let expected_invocation = test_invocation("claim-r1-gate-1", "op-r1-gate-1");
+        let expected_bytes =
+            eliot_contracts::canonical_json_bytes(&expected_invocation).expect("canonical");
+        assert_eq!(
+            presented.process_invocation_digest,
+            eliot_contracts::sha256_hex(&expected_bytes),
+            "join must carry the derived invocation digest"
+        );
+        let expectation = KernelComposition::build_executable_expectation(
+            request.executable_binding.as_ref(),
+            &registration,
+            &fence_value,
+            &live_epoch,
+        )
+        .expect("R1 expectation builds");
+        KernelComposition::enforce_claim_executable_binding(
+            &request,
+            &expectation,
+            9_000_000_050_000u64,
+        )
+        .expect("matching digest admits");
+    }
+
+    /// R1 Governor-sourced digest feed, refuse paths (Implements #22): a
+    /// mutated digest is well-formed but `Conflict`s on
+    /// `executable_binding.process_invocation_digest`; a missing join
+    /// (wire v1) is a typed refusal, never a silent admit. The
+    /// `None`-branch empty placeholders stay by construction: the gate
+    /// refuses old wire first with typed
+    /// `u1_old_wire_without_executable_binding`.
+    #[test]
+    fn r1_gate_refuses_mutated_and_missing_digest() {
+        let (request, registration, fence_value, live_epoch) = r1_gate_fixture();
+        let now = 9_000_000_050_000u64;
+        let expectation = KernelComposition::build_executable_expectation(
+            request.executable_binding.as_ref(),
+            &registration,
+            &fence_value,
+            &live_epoch,
+        )
+        .expect("R1 expectation builds");
+        let presented_digest = request
+            .executable_binding
+            .as_ref()
+            .expect("join present")
+            .process_invocation_digest
+            .clone();
+        // Mutated digest: still well-formed, but the gate Conflicts on the
+        // invocation digest field with the current owner digest echoed.
+        let mut mutated = request.clone();
+        let mutated_invocation = serde_json::json!({
+            "claim_id": "claim-r1-gate-1",
+            "operation_id": "op-r1-gate-1",
+            "argv": ["--mutated"],
+            "fence": {"generation": 1},
+        });
+        let mutated_bytes =
+            eliot_contracts::canonical_json_bytes(&mutated_invocation).expect("canonical");
+        let mutated_digest = eliot_contracts::sha256_hex(&mutated_bytes);
+        assert_ne!(
+            mutated_digest, presented_digest,
+            "mutated invocation must derive a different digest"
+        );
+        mutated
+            .executable_binding
+            .as_mut()
+            .expect("mutated carries the join")
+            .process_invocation_digest = mutated_digest;
+        r1_rebind(&mut mutated);
+        mutated.validate().expect("mutated stays shape-valid");
+        let error = KernelComposition::enforce_claim_executable_binding(&mutated, &expectation, now)
+            .expect_err("mutated digest must not dispatch");
+        match error {
+            NativeWorkerRouteError::Conflict(conflict) => {
+                assert_eq!(conflict.identity, "claim-r1-gate-1");
+                assert!(
+                    conflict
+                        .changed_fields
+                        .iter()
+                        .any(|field| field.ends_with(".process_invocation_digest")),
+                    "conflict must name the invocation digest, got {:?}",
+                    conflict.changed_fields
+                );
+                assert_eq!(
+                    conflict.expected_digest, expectation.current.executable_binding_digest,
+                    "conflict must echo the current owner digest"
+                );
+            }
+            other => panic!("expected Conflict, got {other:?}"),
+        }
+        // Missing join (wire v1): the `None`-branch placeholders stay empty
+        // by construction and the gate refuses typed, never silent.
+        let none_expectation = KernelComposition::build_executable_expectation(
+            None,
+            &registration,
+            &fence_value,
+            &live_epoch,
+        )
+        .expect("None expectation builds by construction");
+        assert!(
+            none_expectation.current.process_invocation_digest.is_empty(),
+            "wire-v1 placeholders stay empty by construction"
+        );
+        assert!(
+            none_expectation
+                .current
+                .executable_binding_digest
+                .is_empty(),
+            "wire-v1 owner placeholder stays empty by construction"
+        );
+        let mut old_wire = request.clone();
+        old_wire.wire_version = NATIVE_WORKER_CLAIM_WIRE_VERSION_V1;
+        old_wire.executable_binding = None;
+        r1_rebind(&mut old_wire);
+        let old_error = KernelComposition::enforce_claim_executable_binding(
+            &old_wire,
+            &none_expectation,
+            now,
+        )
+        .expect_err("old wire must not dispatch");
+        assert!(
+            matches!(
+                old_error,
+                NativeWorkerRouteError::Shape { .. } | NativeWorkerRouteError::Fence { .. }
+            ),
+            "missing join must be a typed refusal, got {old_error:?}"
         );
     }
 }
