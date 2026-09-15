@@ -865,8 +865,35 @@ fn operation_matches_intent(operation: NamedReadOperation, mode: QueryMode) -> b
             NamedReadOperation::GetEvidencePack
                 | NamedReadOperation::GetUnderstandingProjectionInputs
                 | NamedReadOperation::GetCurrentEpistemicPosition
+                | NamedReadOperation::GetTaskState
+                | NamedReadOperation::GetAttentionAndProblems
+                | NamedReadOperation::GetCapabilityEvidenceState
         ),
     }
+}
+
+/// Closed named-read operations admitted to [`QueryMode::ContextReconstruction`].
+///
+/// Canonical role order follows the T11 acquisition table: task frame,
+/// critical attention, current epistemic position, understanding-projection
+/// inputs (serving both the cue-activation and negative-memory roles through
+/// distinct closed selectors), evidence pack, and capability evidence
+/// (affordances). Every entry satisfies the facade intent gate for
+/// [`QueryMode::ContextReconstruction`]; any other operation fails that gate
+/// as [`ReadError::InvalidIntentOperation`]. The seven candidate provider
+/// roles bind to these six reads because the understanding projection serves
+/// two roles; role-to-payload projection stays with the owning Governor
+/// reconstruction composition, never with this facade.
+#[must_use]
+pub const fn context_reconstruction_operations() -> [NamedReadOperation; 6] {
+    [
+        NamedReadOperation::GetTaskState,
+        NamedReadOperation::GetAttentionAndProblems,
+        NamedReadOperation::GetCurrentEpistemicPosition,
+        NamedReadOperation::GetUnderstandingProjectionInputs,
+        NamedReadOperation::GetEvidencePack,
+        NamedReadOperation::GetCapabilityEvidenceState,
+    ]
 }
 
 fn query_parameters(request: &QueryRequest) -> Result<BTreeMap<String, Value>, ReadError> {
