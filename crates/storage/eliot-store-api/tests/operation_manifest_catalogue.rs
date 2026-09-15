@@ -64,7 +64,7 @@ fn receipt_params() -> BTreeMap<String, Value> {
 #[test]
 fn activated_typed_reads_pass_catalogue_validation() {
     let entries = generated_operation_manifests().unwrap();
-    assert_eq!(entries.len(), 7);
+    assert_eq!(entries.len(), 8);
 
     // The closed name mapping is the single owner for code, manifests, wire.
     for operation in [
@@ -295,12 +295,37 @@ fn audit_plan(set_digest: &OperationManifestDigest) -> eliot_store_api::Prepared
     plan
 }
 
+fn lifecycle_params() -> BTreeMap<String, Value> {
+    BTreeMap::from([
+        ("action".to_owned(), json!("keep")),
+        ("base_view_digest".to_owned(), json!("a".repeat(64))),
+        ("candidate_digest".to_owned(), json!("b".repeat(64))),
+        (
+            "candidate_package_digest".to_owned(),
+            json!("c".repeat(64)),
+        ),
+        ("skill_id".to_owned(), json!("skill-1")),
+        ("verifier_ref".to_owned(), json!("verifier-1")),
+    ])
+}
+
+fn lifecycle_plan(set_digest: &OperationManifestDigest) -> eliot_store_api::PreparedTransition {
+    let mut plan = mutation_plan(set_digest);
+    plan.transition_class = TransitionClass::LifecyclePolicy;
+    plan.requested_effect_ceiling = EffectClass::ReversibleMutation;
+    plan.named_operations = vec![NamedMutationRequest {
+        operation: NamedMutationOperation::ApplyLifecyclePolicy,
+        parameters: lifecycle_params(),
+    }];
+    plan
+}
+
 #[test]
 fn approved_capture_plan_passes_and_stale_digest_fails_manifest_mismatch() {
     let entries = generated_operation_manifests().unwrap();
     let set_digest = operation_manifest_set_digest(&entries).unwrap();
 
-    // AUD-C01 activates exactly two mutations: the approved CaptureObservation
+    // AUD-C01 activates exactly three mutations: the approved CaptureObservation
     // plan binds the set digest and passes the whole catalogue path.
     let plan = mutation_plan(&set_digest);
     assert!(plan.validate_against_catalogue(&entries).is_ok());
@@ -317,7 +342,7 @@ fn approved_capture_plan_passes_and_stale_digest_fails_manifest_mismatch() {
 #[test]
 fn capture_observation_passes_whole_path() {
     let entries = generated_operation_manifests().unwrap();
-    assert_eq!(entries.len(), 7);
+    assert_eq!(entries.len(), 8);
     let set_digest = operation_manifest_set_digest(&entries).unwrap();
 
     // Approved owner-shaped subject params pass catalogue validation.
@@ -364,11 +389,22 @@ fn capture_observation_passes_whole_path() {
 #[test]
 fn append_audit_event_passes_whole_path() {
     let entries = generated_operation_manifests().unwrap();
-    assert_eq!(entries.len(), 7);
+    assert_eq!(entries.len(), 8);
     let set_digest = operation_manifest_set_digest(&entries).unwrap();
 
     // Approved receipt-bound audit params pass catalogue validation without bypass.
     let plan = audit_plan(&set_digest);
+    assert!(plan.validate_against_catalogue(&entries).is_ok());
+}
+
+#[test]
+fn apply_lifecycle_policy_passes_whole_path() {
+    let entries = generated_operation_manifests().unwrap();
+    assert_eq!(entries.len(), 8);
+    let set_digest = operation_manifest_set_digest(&entries).unwrap();
+
+    // Approved lifecycle-policy params pass catalogue validation without bypass.
+    let plan = lifecycle_plan(&set_digest);
     assert!(plan.validate_against_catalogue(&entries).is_ok());
 }
 
