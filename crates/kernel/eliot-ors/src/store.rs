@@ -364,6 +364,26 @@ pub trait OperationalRecoveryStore: Send + Sync {
         target: crate::HostRequestState,
         result_digest: Option<&str>,
     ) -> Result<Option<crate::HostRequestRecord>, OrsError>;
+    /// Persists one bounded local-read result body alongside its digest
+    /// (Implements #18: local read result).
+    ///
+    /// Atomically walks the mechanical lifecycle (`Admitted` → `Routed` →
+    /// `Submitted` → `ResultReceived`, or a direct legal edge such as
+    /// `Unknown`/`Reconciling`/`Submitted`/`PossiblyEffected` →
+    /// `ResultReceived`) and stores the exact bounded response JSON with its
+    /// digest. An exact replay (same digest and byte-identical body) returns
+    /// the durable record unchanged without re-dispatch; a changed digest or
+    /// body under the same identity fails as
+    /// [`OrsError::HostRequestIdentityConflict`] and never overwrites the
+    /// durable row. Rejection happens before any readback: the caller must
+    /// have already validated tool linkage and descriptor binding.
+    fn persist_host_request_result(
+        &self,
+        operation_id: &crate::OperationIdentity,
+        request_digest: &str,
+        result_digest: &str,
+        result_response: &serde_json::Value,
+    ) -> Result<Option<crate::HostRequestRecord>, OrsError>;
     /// Loads one host-request operation by exact operation/request identity.
     fn load_host_request(
         &self,
@@ -1348,6 +1368,107 @@ impl RedbRecoveryStore {
         next.state = target;
         next.result_digest = effective_result;
         if target.is_terminal() && next.commit_order == 0 {
+            next.commit_order = Self::next_operational_order(&write)?;
+        }
+        next.validate()?;
+        if next != existing {
+            let payload = encode(&next)?;
+            let mut table = write.open_table(HOST_REQUESTS).map_err(storage)?;
+            table
+                .insert(key.as_str(), payload.as_str())
+                .map_err(storage)?;
+        }
+        write.commit().map_err(storage)?;
+        Ok(Some(next))
+    }
+
+    /// Persists one bounded local-read result body alongside its digest.
+    ///
+    /// See [`OperationalRecoveryStore::persist_host_request_result`] for the
+    /// replay/conflict contract. The lifecycle walk stays inside the existing
+    /// transition table: no new edge is introduced, so the anti-blind-retry
+    /// fence is unchanged. A `Requested` operation cannot receive a result
+    /// (it must be admitted first); terminal states without a result cannot
+    /// gain one.
+    pub fn persist_host_request_result(
+        &self,
+        operation_id: &crate::OperationIdentity,
+        request_digest: &str,
+        result_digest: &str,
+        result_response: &serde_json::Value,
+    ) -> Result<Option<crate::HostRequestRecord>, OrsError> {
+        crate::model::validate_digest(result_digest, "host_request_result_digest")?;
+        let key = format!("{}::{}", operation_id.as_str(), request_digest);
+        let write = self.database.begin_write().map_err(storage)?;
+        let existing: Option<crate::HostRequestRecord> = {
+            let table = write.open_table(HOST_REQUESTS).map_err(storage)?;
+            table
+                .get(key.as_str())
+                .map_err(storage)?
+                .map(|value| decode(value.value()))
+                .transpose()?
+        };
+        let Some(existing) = existing else {
+            return Ok(None);
+        };
+        existing.validate()?;
+        if existing.state == crate::HostRequestState::ResultReceived {
+            let same_digest = existing.result_digest.as_deref() == Some(result_digest);
+            let same_body = existing.result_response.as_ref() == Some(result_response);
+            if same_digest && same_body {
+                return Ok(Some(existing));
+            }
+            // Legacy digest-only row completed by the exact same digest: the
+            // matching digest proves the same result, so binding the missing
+            // body is monotonic completion, not an overwrite. Anything else
+            // under the same identity stays a conflict.
+            let completes_legacy =
+                same_digest && existing.result_response.is_none();
+            if !completes_legacy {
+                return Err(OrsError::HostRequestIdentityConflict {
+                    operation_id: operation_id.as_str().to_owned(),
+                    request_digest: request_digest.to_owned(),
+                });
+            }
+        } else if existing.state == crate::HostRequestState::Terminal {
+            let same_digest = existing.result_digest.as_deref() == Some(result_digest);
+            let same_body = existing.result_response.as_ref() == Some(result_response);
+            if same_digest && same_body {
+                return Ok(Some(existing));
+            }
+            // A terminal record either carries this exact result already
+            // (handled above) or must never gain or replace one here.
+            if existing.result_digest.is_some() || existing.result_response.is_some() {
+                return Err(OrsError::HostRequestIdentityConflict {
+                    operation_id: operation_id.as_str().to_owned(),
+                    request_digest: request_digest.to_owned(),
+                });
+            }
+            return Err(OrsError::InvalidTransition);
+        }
+        // Walk the mechanical lifecycle to `ResultReceived` inside the
+        // existing table: direct when legal, otherwise via the canonical
+        // `Admitted -> Routed -> Submitted` progression the synchronous local
+        // dispatch stands in for (no router/submitter exists on this path).
+        let mut state = existing.state;
+        loop {
+            if state == crate::HostRequestState::ResultReceived {
+                break;
+            }
+            let next = if state == crate::HostRequestState::Admitted {
+                crate::HostRequestState::Routed
+            } else if state == crate::HostRequestState::Routed {
+                crate::HostRequestState::Submitted
+            } else {
+                crate::HostRequestState::ResultReceived
+            };
+            state = state.transition_to(next)?;
+        }
+        let mut next = existing.clone();
+        next.state = crate::HostRequestState::ResultReceived;
+        next.result_digest = Some(result_digest.to_owned());
+        next.result_response = Some(result_response.clone());
+        if next.commit_order == 0 {
             next.commit_order = Self::next_operational_order(&write)?;
         }
         next.validate()?;
@@ -6266,6 +6387,22 @@ impl OperationalRecoveryStore for RedbRecoveryStore {
         )
     }
 
+    fn persist_host_request_result(
+        &self,
+        operation_id: &crate::OperationIdentity,
+        request_digest: &str,
+        result_digest: &str,
+        result_response: &serde_json::Value,
+    ) -> Result<Option<crate::HostRequestRecord>, OrsError> {
+        RedbRecoveryStore::persist_host_request_result(
+            self,
+            operation_id,
+            request_digest,
+            result_digest,
+            result_response,
+        )
+    }
+
     fn load_host_request(
         &self,
         operation_id: &crate::OperationIdentity,
@@ -6538,6 +6675,22 @@ impl<S: OperationalRecoveryStore> OrsCoordinator<S> {
     ) -> Result<Option<HostRequestRecord>, OrsError> {
         self.store
             .advance_host_request(operation_id, request_digest, target, result_digest)
+    }
+
+    /// Persists one bounded local-read result body alongside its digest.
+    pub fn persist_host_request_result(
+        &self,
+        operation_id: &crate::OperationIdentity,
+        request_digest: &str,
+        result_digest: &str,
+        result_response: &serde_json::Value,
+    ) -> Result<Option<HostRequestRecord>, OrsError> {
+        self.store.persist_host_request_result(
+            operation_id,
+            request_digest,
+            result_digest,
+            result_response,
+        )
     }
 
     /// Loads one host-request operation by exact operation/request identity.
@@ -6977,6 +7130,217 @@ mod process_start_abort_tests {
                 .state,
             ProcessStartReplayState::Unknown
         );
+        let _ = std::fs::remove_file(path);
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+#[allow(
+    clippy::expect_used,
+    clippy::unwrap_used,
+    reason = "test fixtures use expect for fail-fast setup"
+)]
+mod host_request_result_tests {
+    use super::*;
+    use crate::{HostRequestKind, HostRequestState, OpaqueLabel, OperationIdentity};
+    use eliot_contracts::{EpochId, EpochLineageId};
+    use serde_json::json;
+
+    const TEST_LINEAGE: &str = "550e8400-e29b-41d4-a716-446655440000";
+
+    fn test_epoch() -> EpochId {
+        EpochId::new(
+            EpochLineageId::new(TEST_LINEAGE).expect("valid test lineage"),
+            std::num::NonZeroU64::new(1).expect("nonzero test sequence"),
+        )
+        .expect("valid test epoch")
+    }
+
+    fn requested_fixture(operation: &str, digest: &str) -> crate::HostRequestRecord {
+        let label = |value: &str| OpaqueLabel::new(value.to_owned()).expect("valid test label");
+        crate::HostRequestRecord {
+            contract_version: crate::CONTRACT_VERSION,
+            operation_id: OperationIdentity::new(operation.to_owned()).expect("valid operation"),
+            kind: HostRequestKind::Invocation,
+            request_id: label("req-1"),
+            idempotency_key: label("req-1:invoke"),
+            cancellation_id: label("req-1:invoke:cancel"),
+            parent_operation_id: None,
+            request_digest: digest.to_owned(),
+            payload_digest: "b".repeat(64),
+            connection_ref: label("conn-1"),
+            session_ref: Some(label("session-1")),
+            task_ref: None,
+            scope_ref: None,
+            capability_ref: label("eliot.query"),
+            fence_digest: "c".repeat(64),
+            authority_epoch: test_epoch(),
+            generation: 1,
+            deadline_unix_ms: 9_999_999,
+            state: HostRequestState::Requested,
+            result_digest: None,
+            result_response: None,
+            commit_order: 0,
+        }
+    }
+
+    fn temp_store() -> (RedbRecoveryStore, std::path::PathBuf) {
+        let path = std::env::temp_dir().join(format!(
+            "eliot-host-request-result-{}-{}.redb",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0, |duration| duration.as_nanos())
+        ));
+        let store = RedbRecoveryStore::open(&path).expect("temp store opens");
+        (store, path)
+    }
+
+    #[test]
+    fn persist_result_is_exact_replay_and_rejects_changed_body() -> Result<(), OrsError> {
+        let (store, path) = temp_store();
+        let digest = "d".repeat(64);
+        let operation =
+            OperationIdentity::new(format!("hostreq:{digest}")).expect("valid operation");
+        let staged = store.stage_host_request(&requested_fixture(operation.as_str(), &digest))?;
+        assert_eq!(staged.state, HostRequestState::Requested);
+        let admitted = store
+            .advance_host_request(&operation, &digest, HostRequestState::Admitted, None)?
+            .expect("admitted record must load");
+        assert_eq!(admitted.state, HostRequestState::Admitted);
+
+        // A `Requested` operation must never receive a result before admission.
+        let (early_store, early_path) = temp_store();
+        let early_digest = "e".repeat(64);
+        let early_op =
+            OperationIdentity::new(format!("hostreq:{early_digest}")).expect("valid operation");
+        early_store
+            .stage_host_request(&requested_fixture(early_op.as_str(), &early_digest))?;
+        assert!(matches!(
+            early_store.persist_host_request_result(
+                &early_op,
+                &early_digest,
+                &"f".repeat(64),
+                &json!({"response": "early"}),
+            ),
+            Err(OrsError::InvalidTransition)
+        ));
+        let _ = std::fs::remove_file(early_path);
+
+        let body = json!({
+            "request_id": "req-1",
+            "idempotency_key": "req-1:invoke",
+            "canonical_tool_name": "eliot.query",
+            "content": {
+                "operation": "GetEvidencePack",
+                "evidence_pack": {"subject": "evidence-alpha"},
+                "revision_heads": [{"key": "scope:scope-1", "revision": 3}],
+            },
+        });
+        let result_digest = crate::model::sha256_hex(
+            &serde_json::to_vec(&body).expect("test body must serialize"),
+        );
+        let received = store
+            .persist_host_request_result(&operation, &digest, &result_digest, &body)?
+            .expect("resulted record must load");
+        assert_eq!(received.state, HostRequestState::ResultReceived);
+        assert_eq!(
+            received.result_digest.as_deref(),
+            Some(result_digest.as_str())
+        );
+        assert_eq!(received.result_response.as_ref(), Some(&body));
+        assert_ne!(received.commit_order, 0, "terminal result must order");
+
+        // Exact replay returns the durable row unchanged: no duplicate dispatch.
+        let replay = store
+            .persist_host_request_result(&operation, &digest, &result_digest, &body)?
+            .expect("replay must load");
+        assert_eq!(replay, received);
+
+        // A changed payload digest or a forged body under the same identity is
+        // rejected before any readback and never overwrites the durable row.
+        assert!(matches!(
+            store.persist_host_request_result(&operation, &digest, &"0".repeat(64), &body,),
+            Err(OrsError::HostRequestIdentityConflict { .. })
+        ));
+        assert!(matches!(
+            store.persist_host_request_result(
+                &operation,
+                &digest,
+                &result_digest,
+                &json!({"forged": true}),
+            ),
+            Err(OrsError::HostRequestIdentityConflict { .. })
+        ));
+        let kept = store
+            .load_host_request(&operation, &digest)?
+            .expect("durable row must survive conflicts");
+        assert_eq!(kept, received);
+
+        // The old digest-only advance still requires a digest for received.
+        assert!(matches!(
+            store.advance_host_request(
+                &operation,
+                &digest,
+                HostRequestState::Terminal,
+                Some("1".repeat(64).as_str()),
+            ),
+            Err(OrsError::HostRequestIdentityConflict { .. })
+        ));
+
+        drop(store);
+        let _ = std::fs::remove_file(path);
+        Ok(())
+    }
+
+    #[test]
+    fn legacy_digest_only_row_completes_with_exact_body() -> Result<(), OrsError> {
+        let (store, path) = temp_store();
+        let digest = "d".repeat(64);
+        let operation =
+            OperationIdentity::new(format!("hostreq:{digest}")).expect("valid operation");
+        store.stage_host_request(&requested_fixture(operation.as_str(), &digest))?;
+        for target in [
+            HostRequestState::Admitted,
+            HostRequestState::Routed,
+            HostRequestState::Submitted,
+        ] {
+            store
+                .advance_host_request(&operation, &digest, target, None)?
+                .expect("walk must advance");
+        }
+        let result_digest = "f".repeat(64);
+        let legacy = store
+            .advance_host_request(
+                &operation,
+                &digest,
+                HostRequestState::ResultReceived,
+                Some(result_digest.as_str()),
+            )?
+            .expect("legacy row must store");
+        assert_eq!(legacy.state, HostRequestState::ResultReceived);
+        assert!(legacy.result_response.is_none());
+        // The legacy row still loads (compatibility, never served as a body).
+        let loaded = store
+            .load_host_request(&operation, &digest)?
+            .expect("legacy row must load");
+        assert_eq!(loaded, legacy);
+
+        // Completing it with the exact same digest binds the missing body;
+        // anything else stays a conflict.
+        let body = json!({"completed": "legacy-body"});
+        let completed = store
+            .persist_host_request_result(&operation, &digest, &result_digest, &body)?
+            .expect("exact-digest completion must store");
+        assert_eq!(completed.result_digest.as_deref(), Some(result_digest.as_str()));
+        assert_eq!(completed.result_response.as_ref(), Some(&body));
+        assert!(matches!(
+            store.persist_host_request_result(&operation, &digest, &"0".repeat(64), &body,),
+            Err(OrsError::HostRequestIdentityConflict { .. })
+        ));
+
+        drop(store);
         let _ = std::fs::remove_file(path);
         Ok(())
     }

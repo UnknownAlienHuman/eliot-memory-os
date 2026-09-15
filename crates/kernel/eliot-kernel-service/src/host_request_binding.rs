@@ -310,6 +310,12 @@ impl<'a, P: KernelGovernorPort + ?Sized> KernelHostRequestBinder<'a, P> {
                     operation_handle: handle,
                 });
             }
+            StagedAdmission::ReplayResulted {
+                response,
+                result_digest,
+            } => {
+                return readback_responded(envelope, request, response, &result_digest);
+            }
         }
         let application = self.build_application(request, envelope, now_ms)?;
         let transport = self.session.transport().clone();
@@ -329,6 +335,7 @@ impl<'a, P: KernelGovernorPort + ?Sized> KernelHostRequestBinder<'a, P> {
         if let Some(failure) = plan_gap_from_response(&response)? {
             return Err(failure);
         }
+        self.persist_result(envelope, &response)?;
         let handle =
             HostOperationHandle::new(host_request_operation_id(envelope)).map_err(|_| {
                 PortFailure::TransportBindingRejected {
@@ -339,6 +346,46 @@ impl<'a, P: KernelGovernorPort + ?Sized> KernelHostRequestBinder<'a, P> {
             operation_handle: handle,
             response: Box::new(response),
         })
+    }
+
+    /// Persists one bounded dispatch result as `ResultReceived` (Implements #18).
+    ///
+    /// Decision (documented per item plan): the exact bounded `McpResponse`
+    /// JSON is stored in ORS (`result_response`) beside its canonical digest,
+    /// rather than re-serving via a fresh `ReadService::query` at readback.
+    /// A re-query would repeat store IO under a possibly advanced revision and
+    /// could not prove byte-exactness; the stored body proves the exact
+    /// payload and revision the read owner returned for this envelope without
+    /// any re-dispatch. The revision travels inside the bounded content (the
+    /// read owner embeds `revision_heads` there); the binder preserves it
+    /// opaquely and never interprets it. Runs after `check_response_binding`
+    /// and the plan-gap check, so only admitted Candidate/Projection answers
+    /// are persisted, in the required order: validate → linkage → admit →
+    /// dispatch → response binding → persist.
+    fn persist_result(
+        &self,
+        envelope: &HostRequestEnvelope,
+        response: &McpResponse,
+    ) -> Result<(), PortFailure> {
+        let digest = canonical_result_digest(response)?;
+        let body = serde_json::to_value(response).map_err(|_| {
+            PortFailure::TransportBindingRejected {
+                reason: "kernel result cannot be canonicalized".to_owned(),
+            }
+        })?;
+        let operation_id = ors_operation_id(envelope)?;
+        self.store
+            .persist_host_request_result(
+                &operation_id,
+                &envelope.envelope_sha256,
+                &digest,
+                &body,
+            )
+            .map_err(|error| ors_failure(&error))?
+            .ok_or(PortFailure::TransportBindingRejected {
+                reason: "admitted operation disappeared before result persistence".to_owned(),
+            })?;
+        Ok(())
     }
 
     /// Runs the admission gate and the persist-before-ack ORS staging.
@@ -402,6 +449,12 @@ impl<'a, P: KernelGovernorPort + ?Sized> KernelHostRequestBinder<'a, P> {
             .reconcile_host_request_admission(&receipt, envelope)
             .map_err(|error| kernel_service_failure(&error))?;
         if stored.state.is_terminal() {
+            if let Some((body, digest)) = stored_result_body(&stored) {
+                return Ok(StagedAdmission::ReplayResulted {
+                    response: body,
+                    result_digest: digest,
+                });
+            }
             return Err(terminal_replay_failure(stored.state));
         }
         Ok(StagedAdmission::Replay)
@@ -624,12 +677,22 @@ impl<P: KernelGovernorPort + ?Sized> KernelHostRequestPort for KernelHostRequest
 ///
 /// A fresh admission proceeds to dispatch. A replay of a live operation
 /// returns the stored admission without re-dispatching, so an at-least-once
-/// transport can never duplicate effects through this binder.
+/// transport can never duplicate effects through this binder. A replay of a
+/// resulted operation carries the exact stored bounded body for a
+/// dispatch-free readback.
 enum StagedAdmission {
     /// The envelope was staged and advanced to `Admitted` by this call.
     Fresh,
     /// The envelope replays an already staged live operation.
     Replay,
+    /// The envelope replays an operation that already received its bounded
+    /// result; the stored body is served without re-dispatch.
+    ReplayResulted {
+        /// Exact stored bounded `McpResponse` JSON.
+        response: serde_json::Value,
+        /// Stored canonical result digest binding the body.
+        result_digest: String,
+    },
 }
 
 /// Builds the Kernel-observed bridge process binding from retained state.
@@ -717,6 +780,7 @@ fn requested_host_request_record(
         deadline_unix_ms: envelope.identity.deadline_unix_ms,
         state: HostRequestState::Requested,
         result_digest: None,
+        result_response: None,
         commit_order: 0,
     })
 }
@@ -835,6 +899,9 @@ fn ors_failure(error: &OrsError) -> PortFailure {
 /// Maps one closed-operation replay to its terminal disposition.
 ///
 /// Closed work is never blind-retried as new work through this binder.
+/// `ResultReceived` (and a `Terminal` carrying a result body) never reaches
+/// here: the admit path serves the stored bounded body via
+/// [`StagedAdmission::ReplayResulted`] instead.
 fn terminal_replay_failure(state: HostRequestState) -> PortFailure {
     match state {
         HostRequestState::Expired => PortFailure::DeadlineExceeded,
@@ -843,6 +910,82 @@ fn terminal_replay_failure(state: HostRequestState) -> PortFailure {
             reason: "operation is already terminal; reconcile the exact operation".to_owned(),
         },
     }
+}
+
+/// Returns the stored bounded result body of a resulted operation, if any.
+///
+/// Serves both `ResultReceived` and a `Terminal` that carries a result
+/// forward. Any other state, or a resulted state missing either half of the
+/// digest/body pair, yields `None` so the caller falls back to the existing
+/// terminal/live disposition instead of inventing a response.
+fn stored_result_body(record: &HostRequestRecord) -> Option<(serde_json::Value, String)> {
+    match (&record.state, &record.result_digest, &record.result_response) {
+        (
+            HostRequestState::ResultReceived | HostRequestState::Terminal,
+            Some(digest),
+            Some(body),
+        ) => Some((body.clone(), digest.clone())),
+        _ => None,
+    }
+}
+
+/// Computes the canonical digest binding one bounded dispatch result.
+///
+/// The digest covers the canonical JSON bytes of the exact `McpResponse` the
+/// read owner returned, so the stored body is byte-exact and any forged or
+/// substituted body fails the readback check before it is served.
+fn canonical_result_digest(response: &McpResponse) -> Result<String, PortFailure> {
+    let bytes = canonical_json_bytes(response).map_err(|_| {
+        PortFailure::TransportBindingRejected {
+            reason: "kernel result cannot be canonicalized".to_owned(),
+        }
+    })?;
+    Ok(sha256_hex(&bytes))
+}
+
+/// Serves one exact stored result without re-dispatch (Implements #18).
+///
+/// Reconstructs the bounded `McpResponse` from the stored body, rejects a
+/// forged or substituted body whose canonical digest does not match the
+/// stored digest before serving, re-applies the response binding check
+/// against the presenting envelope, and returns the exact `Responded`
+/// outcome. No dispatch happens here: the stored body is the proof that the
+/// read owner already answered this exact envelope.
+fn readback_responded(
+    envelope: &HostRequestEnvelope,
+    request: &HostInvocationRequest,
+    body: serde_json::Value,
+    result_digest: &str,
+) -> Result<HostInvocationPortOutcome, PortFailure> {
+    let response: McpResponse =
+        serde_json::from_value(body).map_err(|_| PortFailure::TransportBindingRejected {
+            reason: "stored result does not decode to the bounded response".to_owned(),
+        })?;
+    if canonical_result_digest(&response)? != result_digest {
+        return Err(PortFailure::TransportBindingRejected {
+            reason: "stored result digest does not bind the stored body".to_owned(),
+        });
+    }
+    check_response_binding(
+        &response,
+        envelope.identity.request_id.as_str(),
+        &envelope.identity.idempotency_key,
+        request.tool.canonical_name(),
+    )?;
+    if plan_gap_from_response(&response)?.is_some() {
+        return Err(PortFailure::TransportBindingRejected {
+            reason: "stored result does not carry an answerable projection".to_owned(),
+        });
+    }
+    let handle = HostOperationHandle::new(host_request_operation_id(envelope)).map_err(|_| {
+        PortFailure::TransportBindingRejected {
+            reason: "canonical operation handle is invalid".to_owned(),
+        }
+    })?;
+    Ok(HostInvocationPortOutcome::Responded {
+        operation_handle: handle,
+        response: Box::new(response),
+    })
 }
 
 fn check_transport(transport: &TransportRequestContext) -> Result<(), PortFailure> {
@@ -1017,4 +1160,234 @@ fn is_lower_hex64(value: &str) -> bool {
         && value
             .bytes()
             .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+}
+
+#[cfg(test)]
+#[allow(
+    clippy::expect_used,
+    clippy::unwrap_used,
+    reason = "test fixtures use expect for fail-fast setup, mirroring store_client tests"
+)]
+mod local_read_result_tests {
+    use super::*;
+    use eliot_contracts::{EpochLineageId, ResourceGeneration};
+    use serde_json::json;
+    use std::num::NonZeroU64;
+
+    const TEST_LINEAGE: &str = "550e8400-e29b-41d4-a716-446655440000";
+
+    const QUERY_JSON: &str = r#"{
+        "protocol_version":"2026-07-28",
+        "correlation_id":"host-request-1",
+        "client_capabilities":{"tasks":false},
+        "tool":{"name":"eliot.query","arguments":{
+            "intent":{
+                "mode":"verification",
+                "time_scope":"session-window",
+                "branch_environment_scope":"branch",
+                "freshness_policy":"exact-fence",
+                "required_assurance":"evidence-provenance"
+            },
+            "query":"subject:evidence-alpha",
+            "exact_resource_uri":null
+        }},
+        "deadline_preference_ms":5000,
+        "observed_context":{
+            "host_session_hint":"host-turn-1",
+            "observed_resource_refs":[],
+            "event_cursors":[],
+            "trace_context":{}
+        }
+    }"#;
+
+    fn test_fence() -> StateFence {
+        let epoch = EpochId::new(
+            EpochLineageId::new(TEST_LINEAGE).expect("valid test lineage"),
+            NonZeroU64::new(3).expect("nonzero test sequence"),
+        )
+        .expect("valid test epoch");
+        StateFence::new(epoch, ResourceGeneration::new(7).expect("nonzero test generation"))
+    }
+
+    fn test_envelope(request: &HostInvocationRequest) -> HostRequestEnvelope {
+        use eliot_contracts::RequestId;
+        let payload_digest = canonical_payload_digest(&request.tool).expect("tool must digest");
+        eliot_protocol::HostRequestEnvelope {
+            wire_id: eliot_protocol::HOST_REQUEST_WIRE_ID.to_owned(),
+            wire_version: eliot_protocol::HostRequestEnvelope::CONTRACT_VERSION,
+            kind: eliot_protocol::HostRequestKind::Invocation,
+            connection_id: "conn-test-1".to_owned(),
+            identity: eliot_protocol::HostRequestIdentity {
+                request_id: RequestId::new("host-request-1").expect("valid test request id"),
+                idempotency_key: "host-request-1:invoke".to_owned(),
+                cancellation_id: "host-request-1:invoke:cancel".to_owned(),
+                parent_operation_id: None,
+                deadline_unix_ms: 2_000_000,
+                capability: "eliot.query".to_owned(),
+                session_id: Some("kernel-session-1".to_owned()),
+                task_id: None,
+                work_scope_id: None,
+                payload_schema_id: "eliot.mcp.tool-request.v1".to_owned(),
+                payload_sha256: payload_digest,
+            },
+            state_fence: test_fence(),
+            descriptor_sha256: "d".repeat(64),
+            peer_admission_receipt_sha256: "e".repeat(64),
+            activation_binding: None,
+            envelope_sha256: String::new(),
+        }
+        .with_computed_digest()
+        .expect("envelope must digest")
+    }
+
+    fn test_response() -> McpResponse {
+        McpResponse {
+            request_id: "host-request-1".to_owned(),
+            idempotency_key: "host-request-1:invoke".to_owned(),
+            canonical_request_sha256: "a".repeat(64),
+            kind: ResponseKind::Projection,
+            canonical_tool_name: "eliot.query".to_owned(),
+            content: json!({
+                "operation": "GetEvidencePack",
+                "subject": "evidence-alpha",
+                "scope_id": "scope-1",
+                "evidence_pack": {"subject": "evidence-alpha"},
+                "revision_heads": [{"key": "scope:scope-1", "revision": 3}],
+            }),
+            artifacts: Vec::new(),
+            proof_ceiling: eliot_receipts::ProofCeiling::ScopedVerification,
+            resource: None,
+            job: None,
+            compatibility_correlation_hint: None,
+        }
+    }
+
+    #[test]
+    fn readback_serves_exact_body_and_rejects_forgery_before_reading() {
+        let request: HostInvocationRequest =
+            serde_json::from_str(QUERY_JSON).expect("fixture must deserialize");
+        request.validate().expect("fixture must validate");
+        let envelope = test_envelope(&request);
+        envelope.validate().expect("envelope must validate");
+        let response = test_response();
+
+        // The digest binds the exact bounded bytes: determinism is the proof.
+        let digest = canonical_result_digest(&response).expect("digest must compute");
+        assert_eq!(
+            canonical_result_digest(&response).expect("digest must be stable"),
+            digest
+        );
+        let mut changed = response.clone();
+        changed.content = json!({"tampered": true});
+        assert_ne!(
+            canonical_result_digest(&changed).expect("changed body must digest"),
+            digest,
+            "a changed payload must never share the stored digest"
+        );
+
+        // Exact readback returns the bounded result with its revision inline.
+        let body = serde_json::to_value(&response).expect("response must serialize");
+        match readback_responded(&envelope, &request, body.clone(), &digest) {
+            Ok(HostInvocationPortOutcome::Responded {
+                operation_handle,
+                response: served,
+            }) => {
+                assert_eq!(
+                    operation_handle.as_str(),
+                    host_request_operation_id(&envelope).as_str()
+                );
+                assert_eq!(*served, response);
+                assert_eq!(
+                    served.content["revision_heads"][0]["revision"], 3,
+                    "the revision travels inside the bounded body"
+                );
+            }
+            other => panic!("expected exact responded readback, got {other:?}"),
+        }
+
+        // A forged descriptor (wrong digest) and a substituted body are
+        // rejected before anything is served: no duplicate dispatch happens
+        // here by construction, since this path never calls the dispatcher.
+        assert!(
+            readback_responded(&envelope, &request, body.clone(), &"0".repeat(64)).is_err(),
+            "forged digest must be rejected before reading"
+        );
+        let forged_body = serde_json::to_value(&changed).expect("changed must serialize");
+        assert!(
+            readback_responded(&envelope, &request, forged_body, &digest).is_err(),
+            "substituted body must fail the digest binding before serving"
+        );
+
+        // A response bound to another tool or request is never served as this
+        // operation's answer.
+        let mut wrong_tool = response.clone();
+        wrong_tool.canonical_tool_name = "eliot.state".to_owned();
+        let wrong_tool_body =
+            serde_json::to_value(&wrong_tool).expect("wrong-tool must serialize");
+        let wrong_tool_digest =
+            canonical_result_digest(&wrong_tool).expect("wrong-tool must digest");
+        assert!(
+            readback_responded(&envelope, &request, wrong_tool_body, &wrong_tool_digest).is_err(),
+            "tool mismatch must be rejected before serving"
+        );
+    }
+
+    #[test]
+    fn stored_body_serves_only_resulted_states() {
+        let response = test_response();
+        let body = serde_json::to_value(&response).expect("response must serialize");
+        let digest = canonical_result_digest(&response).expect("digest must compute");
+        let label = |value: &str| {
+            OpaqueLabel::new(value.to_owned()).expect("valid test label")
+        };
+        let mut record = HostRequestRecord {
+            contract_version: ORS_CONTRACT_VERSION,
+            operation_id: ors_operation_id_for_test(),
+            kind: OrsHostRequestKind::Invocation,
+            request_id: label("req-1"),
+            idempotency_key: label("req-1:invoke"),
+            cancellation_id: label("req-1:invoke:cancel"),
+            parent_operation_id: None,
+            request_digest: "d".repeat(64),
+            payload_digest: "b".repeat(64),
+            connection_ref: label("conn-1"),
+            session_ref: None,
+            task_ref: None,
+            scope_ref: None,
+            capability_ref: label("eliot.query"),
+            fence_digest: "c".repeat(64),
+            authority_epoch: test_fence().authority_epoch.clone(),
+            generation: 7,
+            deadline_unix_ms: 2_000_000,
+            state: HostRequestState::Admitted,
+            result_digest: None,
+            result_response: None,
+            commit_order: 0,
+        };
+        assert!(
+            stored_result_body(&record).is_none(),
+            "live operations serve admission, never a stored body"
+        );
+        record.state = HostRequestState::ResultReceived;
+        record.result_digest = Some(digest.clone());
+        record.result_response = Some(body.clone());
+        let (served, served_digest) =
+            stored_result_body(&record).expect("resulted state must serve its body");
+        assert_eq!(served, body);
+        assert_eq!(served_digest, digest);
+        record.state = HostRequestState::Terminal;
+        assert!(
+            stored_result_body(&record).is_some(),
+            "terminal carries the result forward for readback"
+        );
+        record.result_response = None;
+        assert!(
+            stored_result_body(&record).is_none(),
+            "a half-present pair must never be served"
+        );
+    }
+
+    fn ors_operation_id_for_test() -> OperationIdentity {
+        OperationIdentity::new(format!("hostreq:{}", "d".repeat(64))).expect("valid operation")
+    }
 }

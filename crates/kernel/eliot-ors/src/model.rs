@@ -2658,6 +2658,20 @@ pub struct HostRequestRecord {
     pub deadline_unix_ms: u64,
     pub state: HostRequestState,
     pub result_digest: Option<String>,
+    /// Exact bounded result body for `ResultReceived`/`Terminal` readback
+    /// (Implements #18: local read result).
+    ///
+    /// Opaque to ORS: the Kernel binder stores the canonical bounded
+    /// `McpResponse` JSON here (payload plus revision carried inside its
+    /// content by the read owner) and serves it verbatim on exact replay
+    /// without re-dispatch. Excluded from [`HostRequestRecord::same_binding`]
+    /// like `result_digest`: ORS-owned progression, not caller binding.
+    /// `None` while no result was received; `Some` exactly when
+    /// `result_digest` is `Some`. Bounded to the protocol structured-response
+    /// ceiling (256 KiB, mirrors `eliot-protocol::HARD_STRUCTURED_RESPONSE_BYTES`
+    /// without adding a layering edge from durable state to the wire crate).
+    #[serde(default)]
+    pub result_response: Option<Value>,
     /// Monotonic ORS order assigned atomically when the operation first
     /// reaches a terminal state. Zero while non-terminal.
     #[serde(default)]
@@ -2745,17 +2759,29 @@ impl HostRequestRecord {
                 reason: "must be greater than zero",
             });
         }
-        match (&self.state, &self.result_digest) {
-            (HostRequestState::ResultReceived | HostRequestState::Terminal, Some(result)) => {
+        match (&self.state, &self.result_digest, &self.result_response) {
+            (
+                HostRequestState::ResultReceived | HostRequestState::Terminal,
+                Some(result),
+                Some(body),
+            ) => {
+                validate_digest(result, "host_request_result_digest")?;
+                validate_result_response(body)?;
+            }
+            // Legacy digest-only row (produced by the digest-only advance
+            // before the bounded body existed): loads for compatibility but
+            // is never served as a body until completed by an exact-digest
+            // persist. Digests in any other state remain rejected as before.
+            (HostRequestState::ResultReceived | HostRequestState::Terminal, Some(result), None) => {
                 validate_digest(result, "host_request_result_digest")?;
             }
-            (_, Some(_)) => {
+            (_, None, None) => {}
+            (_, Some(_), _) | (_, None, Some(_)) => {
                 return Err(OrsError::InvalidField {
                     field: "host_request_result_digest",
-                    reason: "result only for received or terminal states",
+                    reason: "result digest and body must be present together, only for received or terminal states",
                 });
             }
-            (_, None) => {}
         }
         if !self.state.is_terminal() && self.commit_order != 0 {
             return Err(OrsError::InvalidField {
@@ -2798,6 +2824,32 @@ pub(crate) fn validate_digest(value: &str, field: &'static str) -> Result<(), Or
         return Err(OrsError::InvalidField {
             field,
             reason: "must be a lowercase SHA-256 digest",
+        });
+    }
+    Ok(())
+}
+
+/// Bounded size of one stored host-request result body (Implements #18).
+///
+/// Mirrors `eliot-protocol::HARD_STRUCTURED_RESPONSE_BYTES` without adding a
+/// wire-crate edge to durable state.
+pub const MAX_HOST_REQUEST_RESULT_RESPONSE_BYTES: usize = 256 * 1024;
+
+fn validate_result_response(body: &Value) -> Result<(), OrsError> {
+    if !body.is_object() {
+        return Err(OrsError::InvalidField {
+            field: "host_request_result_response",
+            reason: "result body must be a bounded JSON object",
+        });
+    }
+    let encoded = serde_json::to_vec(body).map_err(|_| OrsError::InvalidField {
+        field: "host_request_result_response",
+        reason: "result body must serialize to bounded JSON",
+    })?;
+    if encoded.len() > MAX_HOST_REQUEST_RESULT_RESPONSE_BYTES {
+        return Err(OrsError::InvalidField {
+            field: "host_request_result_response",
+            reason: "result body exceeds the bounded response ceiling",
         });
     }
     Ok(())

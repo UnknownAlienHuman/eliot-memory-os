@@ -3187,6 +3187,180 @@ impl HostRequestAdmissionReceipt {
     }
 }
 
+/// Stable wire identity for a P-04 host-request invoke-read payload.
+pub const HOST_REQUEST_INVOKE_READ_WIRE_ID: &str = "eliot.protocol.host-request-invoke-read";
+/// Current host-request invoke-read payload wire version.
+pub const HOST_REQUEST_INVOKE_READ_WIRE_VERSION: u16 = 1;
+/// Stable wire identity for a P-04 host-request result body.
+pub const HOST_REQUEST_RESULT_BODY_WIRE_ID: &str = "eliot.protocol.host-request-result-body";
+/// Current host-request result body wire version.
+pub const HOST_REQUEST_RESULT_BODY_WIRE_VERSION: u16 = 1;
+
+/// Versioned P-04 invoke-read payload: one exact envelope plus the exact
+/// canonical tool bytes it admits (Implements #18: local read result).
+///
+/// The envelope stays digest-only in spirit: the opaque tool payload still
+/// travels by `payload_schema_id`/`payload_sha256` reference, and this carrier
+/// only proves the presented bytes are the admitted ones. The canonical tool
+/// name must equal the envelope capability and the canonical digest over the
+/// tool bytes must equal the envelope payload digest; anything else is
+/// rejected before any read. The tool value is opaque here (no MCP edge from
+/// the wire crate): it must be a JSON object carrying a non-blank `name`.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct HostRequestInvokeReadPayload {
+    /// Payload wire identity.
+    pub wire_id: String,
+    /// Payload wire version.
+    pub wire_version: u16,
+    /// Exact admitted envelope.
+    pub envelope: HostRequestEnvelope,
+    /// Exact canonical tool bytes (opaque `ToolRequest` JSON).
+    pub tool: Value,
+}
+
+impl HostRequestInvokeReadPayload {
+    /// Current payload contract version.
+    pub const CONTRACT_VERSION: u16 = HOST_REQUEST_INVOKE_READ_WIRE_VERSION;
+
+    /// Validates the closed payload shape and the envelope/tool linkage.
+    pub fn validate(&self) -> Result<(), ProtocolError> {
+        if self.wire_id != HOST_REQUEST_INVOKE_READ_WIRE_ID
+            || self.wire_version != Self::CONTRACT_VERSION
+        {
+            return Err(ProtocolError::InvalidField {
+                field: "host_request_invoke_read.wire",
+                reason: "unsupported host-request invoke-read payload",
+            });
+        }
+        self.envelope.validate()?;
+        let object = self.tool.as_object().ok_or(ProtocolError::InvalidField {
+            field: "host_request_invoke_read.tool",
+            reason: "tool bytes must be a JSON object",
+        })?;
+        let name = object
+            .get("name")
+            .and_then(Value::as_str)
+            .ok_or(ProtocolError::InvalidField {
+                field: "host_request_invoke_read.tool.name",
+                reason: "tool bytes must carry the canonical tool name",
+            })?;
+        bounded_text(
+            name,
+            "host_request_invoke_read.tool.name",
+            MAX_HOST_REQUEST_TEXT_BYTES,
+        )?;
+        if name != self.envelope.identity.capability {
+            return Err(ProtocolError::InvalidField {
+                field: "host_request_invoke_read.tool.name",
+                reason: "presented tool does not match the admitted capability",
+            });
+        }
+        let bytes = canonical_json_bytes(&self.tool).map_err(|error| {
+            ProtocolError::Json(error.to_string())
+        })?;
+        if eliot_contracts::sha256_hex(&bytes) != self.envelope.identity.payload_sha256 {
+            return Err(ProtocolError::InvalidField {
+                field: "host_request_invoke_read.tool",
+                reason: "presented payload does not match the admitted payload digest",
+            });
+        }
+        Ok(())
+    }
+}
+
+/// Versioned P-04 result body: the exact bounded answer bound to one admitted
+/// envelope (Implements #18: local read result).
+///
+/// Carries the opaque bounded response JSON (payload plus revision inside its
+/// content, preserved verbatim from the read owner) with the digests binding
+/// it to the exact operation. `response` must be a JSON object within the
+/// hard structured-response ceiling, and its canonical digest must equal
+/// `result_digest`; a changed payload digest or forged body is rejected
+/// before reading.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct HostRequestResultBody {
+    /// Body wire identity.
+    pub wire_id: String,
+    /// Body wire version.
+    pub wire_version: u16,
+    /// Kernel-derived opaque operation handle (`hostreq:` + envelope digest).
+    pub operation_id: String,
+    /// Digest of the exact admitted envelope.
+    pub request_sha256: String,
+    /// Canonical digest over the exact bounded response bytes.
+    pub result_digest: String,
+    /// Exact bounded response JSON (answer payload plus revision).
+    pub response: Value,
+}
+
+impl HostRequestResultBody {
+    /// Current body contract version.
+    pub const CONTRACT_VERSION: u16 = HOST_REQUEST_RESULT_BODY_WIRE_VERSION;
+
+    /// Validates the closed body shape and the digest binding.
+    pub fn validate(&self) -> Result<(), ProtocolError> {
+        if self.wire_id != HOST_REQUEST_RESULT_BODY_WIRE_ID
+            || self.wire_version != Self::CONTRACT_VERSION
+        {
+            return Err(ProtocolError::InvalidField {
+                field: "host_request_result_body.wire",
+                reason: "unsupported host-request result body",
+            });
+        }
+        bounded_text(
+            &self.operation_id,
+            "host_request_result_body.operation_id",
+            MAX_HOST_REQUEST_TEXT_BYTES,
+        )?;
+        if !self
+            .operation_id
+            .strip_prefix("hostreq:")
+            .is_some_and(|digest| {
+                digest.len() == 64
+                    && digest
+                        .bytes()
+                        .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+            })
+        {
+            return Err(ProtocolError::InvalidField {
+                field: "host_request_result_body.operation_id",
+                reason: "must be the deterministic opaque handle for the envelope digest",
+            });
+        }
+        lowercase_sha256(
+            &self.request_sha256,
+            "host_request_result_body.request_sha256",
+        )?;
+        lowercase_sha256(
+            &self.result_digest,
+            "host_request_result_body.result_digest",
+        )?;
+        if !self.response.is_object() {
+            return Err(ProtocolError::InvalidField {
+                field: "host_request_result_body.response",
+                reason: "result body must be a bounded JSON object",
+            });
+        }
+        let bytes =
+            canonical_json_bytes(&self.response).map_err(|error| ProtocolError::Json(error.to_string()))?;
+        if bytes.len() > HARD_STRUCTURED_RESPONSE_BYTES {
+            return Err(ProtocolError::InvalidField {
+                field: "host_request_result_body.response",
+                reason: "result body exceeds the bounded response ceiling",
+            });
+        }
+        if eliot_contracts::sha256_hex(&bytes) != self.result_digest {
+            return Err(ProtocolError::InvalidField {
+                field: "host_request_result_body.result_digest",
+                reason: "result digest does not bind the exact response bytes",
+            });
+        }
+        Ok(())
+    }
+}
+
 /// Stable typed denial codes for host-request admission control.
 ///
 /// Codes are control values, never human prose: no error text drives routing.

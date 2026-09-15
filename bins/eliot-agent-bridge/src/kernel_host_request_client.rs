@@ -23,15 +23,18 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use eliot_contracts::{
     ClockReading, ProductId, RequestId, RequestMetadata, SourceId, StateFence, canonical_json_bytes,
+    sha256_hex,
 };
 use eliot_mcp::{
     HostCancellationPortOutcome, HostCancellationRequest, HostInvocationPortOutcome,
-    HostInvocationRequest, HostOperationHandle, KernelHostRequestPort, PortFailure, ToolRequest,
+    HostInvocationRequest, HostOperationHandle, KernelHostRequestPort, McpResponse, PortFailure,
+    ToolRequest,
 };
 use eliot_protocol::{
-    EncodingProfile, Frame, FrameKind, HOST_REQUEST_WIRE_ID, HostRequestAdmissionReceipt,
-    HostRequestEnvelope, HostRequestIdentity, HostRequestKind, MessageType, ProtocolPayload,
-    ProtocolVersion, RequestIdentity, host_request_operation_id,
+    EncodingProfile, Frame, FrameKind, HARD_STRUCTURED_RESPONSE_BYTES,
+    HOST_REQUEST_RESULT_BODY_WIRE_ID, HOST_REQUEST_WIRE_ID, HostRequestAdmissionReceipt,
+    HostRequestEnvelope, HostRequestIdentity, HostRequestKind, HostRequestResultBody, MessageType,
+    ProtocolPayload, ProtocolVersion, RequestIdentity, host_request_operation_id,
 };
 use eliot_receipts::RequestBinding;
 use serde::Deserialize;
@@ -44,6 +47,16 @@ use crate::{KernelTransportOwner, SharedTransport};
 /// wiring); the literal is repeated here because the constant is `pub(crate)`
 /// to that binary and this crate takes no new dependencies.
 const AGENT_HOST_REQUEST_SUBMIT_OPERATION: &str = "agent_host_request_submit";
+/// Closed kernel entry that invokes one local read with its canonical tool
+/// bytes (Implements #18: local read result).
+///
+/// Owned by `bins/eliot-kernel/src/host_request_route.rs`; the literal is
+/// repeated here because the constant is `pub(crate)` to that binary and this
+/// crate takes no new dependencies. Carries the exact envelope plus the
+/// canonical `ToolRequest` JSON so the kernel can check tool linkage before
+/// reading and serve the exact bounded result with its revision; the envelope
+/// stays digest-only in spirit.
+const AGENT_HOST_REQUEST_INVOKE_READ_OPERATION: &str = "agent_host_request_invoke_read";
 /// Closed kernel entry that advances the exact parent of one cancellation envelope.
 const AGENT_HOST_REQUEST_CANCEL_OPERATION: &str = "agent_host_request_cancel";
 /// Closed kernel entry that reconciles one exact operation after an unknown delivery.
@@ -107,13 +120,20 @@ impl ParentLink {
 
 /// Minimal tolerant view of the kernel-returned durable record.
 ///
-/// Only the operation join and the state matter here; every other record
-/// field is kernel-owned progression the bridge never interprets. An unknown
-/// future state fails decoding, which fails closed into the unknown-outcome path.
+/// Only the operation join, the state, and the optional result pair matter
+/// here; every other record field is kernel-owned progression the bridge
+/// never interprets. An unknown future state fails decoding, which fails
+/// closed into the unknown-outcome path. `result_digest`/`result_response`
+/// ride the record for `RESULT_RECEIVED` (and a `TERMINAL` carrying a result
+/// forward); any other state carrying them fails decoding the same way.
 #[derive(Clone, Debug, Deserialize)]
 struct AdmittedReplyView {
     operation_id: String,
     state: HostRequestRecordState,
+    #[serde(default)]
+    result_digest: Option<String>,
+    #[serde(default)]
+    result_response: Option<serde_json::Value>,
 }
 
 /// Mirror of the kernel-owned durable host-request states for outcome mapping.
@@ -520,6 +540,44 @@ fn host_request_frame_for_envelope(
     Ok(frame)
 }
 
+/// Returns whether one invocation is a local read served with its canonical
+/// tool bytes (Implements #18: local read result).
+///
+/// `eliot.query` and `eliot.packet` ride the invoke-read entry so the kernel
+/// can check tool linkage before reading and serve the exact bounded result
+/// with its revision; every other tool keeps the admission-only submit entry.
+/// `eliot.packet` parity falls out of the same op because the tool bytes are
+/// opaque here: the kernel, not the pipe, owns their meaning.
+fn invokes_local_read(request: &HostInvocationRequest) -> bool {
+    matches!(
+        request.tool,
+        ToolRequest::Query(_) | ToolRequest::Packet(_)
+    )
+}
+
+/// Builds one invoke-read frame carrying the exact envelope plus the exact
+/// canonical tool bytes it admits.
+///
+/// Reuses the neutral frame identity of
+/// [`host_request_frame_for_envelope`]; only the payload gains the `tool`
+/// bytes. The kernel re-checks capability and payload-digest linkage before
+/// any read, so a changed payload or forged descriptor fails there first.
+fn host_request_invoke_read_frame(
+    request: &HostInvocationRequest,
+    envelope: &HostRequestEnvelope,
+    facts: &TransportFacts,
+) -> Result<Frame, PortFailure> {
+    let mut frame =
+        host_request_frame_for_envelope(AGENT_HOST_REQUEST_INVOKE_READ_OPERATION, envelope, facts)?;
+    let tool = serde_json::to_value(&request.tool).map_err(|_| request_failure())?;
+    let ProtocolPayload::Json(payload) = &mut frame.payload else {
+        return Err(request_failure());
+    };
+    payload["tool"] = tool;
+    frame.validate().map_err(|_| request_failure())?;
+    Ok(frame)
+}
+
 /// Strictly decodes one admitted reply: response/result shape, connection and
 /// request joins, closed `known`/`accepted` status, receipt digest validation
 /// against the exact sent envelope, and the operation join. Any mismatch is
@@ -560,12 +618,94 @@ fn decode_admitted_reply(
     if record.operation_id != receipt.operation_id {
         return None;
     }
+    // A result pair where none belongs (or a half-present pair) fails
+    // decoding into the unknown-outcome path: the bridge never guesses which
+    // half to trust. `RESULT_RECEIVED` must carry both; a `TERMINAL` may
+    // carry both forward; every other state must carry neither.
+    let carries_result =
+        record.result_digest.is_some() || record.result_response.is_some();
+    match (&record.state, carries_result) {
+        (HostRequestRecordState::ResultReceived | HostRequestRecordState::Terminal, true)
+        | (_, false) => {}
+        _ => return None,
+    }
+    if let (Some(digest), Some(body)) = (&record.result_digest, &record.result_response) {
+        HostRequestResultBody {
+            wire_id: HOST_REQUEST_RESULT_BODY_WIRE_ID.to_owned(),
+            wire_version: HostRequestResultBody::CONTRACT_VERSION,
+            operation_id: record.operation_id.clone(),
+            request_sha256: envelope.envelope_sha256.clone(),
+            result_digest: digest.clone(),
+            response: body.clone(),
+        }
+        .validate()
+        .ok()?;
+    }
     Some((receipt, record))
+}
+
+/// Builds the typed rejection for a result-bearing reply whose body does not
+/// bind the admitted request.
+fn invalid_result(detail: &str) -> PortFailure {
+    PortFailure::TransportBindingRejected {
+        reason: format!("kernel result body is not the admitted answer: {detail}"),
+    }
+}
+
+/// Decodes one stored bounded response and checks it against the admitted
+/// request (Implements #18: local read result).
+///
+/// Mirrors `host_gateway.rs:406-436` (bounded size, tool binding) plus the
+/// `check_response_binding` semantics (request/idempotency/tool/digest joins
+/// against the exact sent envelope). Any mismatch is a typed rejection, never
+/// a guessed outcome and never a silent admission.
+fn decode_stored_response(
+    record: &AdmittedReplyView,
+    request: &HostInvocationRequest,
+    envelope: &HostRequestEnvelope,
+) -> Result<McpResponse, PortFailure> {
+    let body = record.result_response.clone().ok_or_else(|| {
+        invalid_result("a received result must carry its bounded body")
+    })?;
+    let encoded = serde_json::to_vec(&body).map_err(|_| invalid_result("unserializable body"))?;
+    if encoded.len() > HARD_STRUCTURED_RESPONSE_BYTES {
+        return Err(invalid_result("body exceeds the bounded ceiling"));
+    }
+    let response: McpResponse =
+        serde_json::from_value(body).map_err(|_| invalid_result("body is not a bounded response"))?;
+    if response.request_id != envelope.identity.request_id.as_str() {
+        return Err(invalid_result("request identity mismatch"));
+    }
+    if response.idempotency_key != envelope.identity.idempotency_key {
+        return Err(invalid_result("idempotency binding mismatch"));
+    }
+    if response.canonical_tool_name != request.tool.canonical_name() {
+        return Err(invalid_result("tool binding mismatch"));
+    }
+    if response.canonical_request_sha256.len() != 64
+        || !response
+            .canonical_request_sha256
+            .bytes()
+            .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+    {
+        return Err(invalid_result("response digest mismatch"));
+    }
+    let digest = record
+        .result_digest
+        .clone()
+        .ok_or_else(|| invalid_result("a received result must carry its digest"))?;
+    let bytes = canonical_json_bytes(&response).map_err(|_| invalid_result("uncanonicalizable"))?;
+    if sha256_hex(&bytes) != digest {
+        return Err(invalid_result("digest does not bind the exact body"));
+    }
+    Ok(response)
 }
 
 fn submit_outcome(
     receipt: &HostRequestAdmissionReceipt,
     record: &AdmittedReplyView,
+    request: &HostInvocationRequest,
+    envelope: &HostRequestEnvelope,
 ) -> Result<HostInvocationPortOutcome, PortFailure> {
     let handle =
         HostOperationHandle::new(receipt.operation_id.clone()).map_err(|_| request_failure())?;
@@ -576,17 +716,36 @@ fn submit_outcome(
         | HostRequestRecordState::Submitted
         | HostRequestRecordState::PossiblyEffected
         | HostRequestRecordState::Unknown
-        | HostRequestRecordState::Reconciling
-        | HostRequestRecordState::ResultReceived => Ok(HostInvocationPortOutcome::Accepted {
+        | HostRequestRecordState::Reconciling => Ok(HostInvocationPortOutcome::Accepted {
             operation_handle: handle,
         }),
+        // A received result with a valid body answers inline; a received
+        // result without one (or with a forged one) fails closed instead of
+        // degrading to a bare admission that would lose the answer.
+        HostRequestRecordState::ResultReceived => {
+            let response = decode_stored_response(record, request, envelope)?;
+            Ok(HostInvocationPortOutcome::Responded {
+                operation_handle: handle,
+                response: Box::new(response),
+            })
+        }
         HostRequestRecordState::Expired => Err(PortFailure::DeadlineExceeded),
         HostRequestRecordState::Cancelled => Err(PortFailure::Cancelled),
-        HostRequestRecordState::Conflicted | HostRequestRecordState::Terminal => {
+        HostRequestRecordState::Terminal => {
+            if record.result_digest.is_some() {
+                let response = decode_stored_response(record, request, envelope)?;
+                return Ok(HostInvocationPortOutcome::Responded {
+                    operation_handle: handle,
+                    response: Box::new(response),
+                });
+            }
             Err(PortFailure::TransportBindingRejected {
                 reason: "operation is already terminal; reconcile the exact operation".to_owned(),
             })
         }
+        HostRequestRecordState::Conflicted => Err(PortFailure::TransportBindingRejected {
+            reason: "operation is already terminal; reconcile the exact operation".to_owned(),
+        }),
     }
 }
 
@@ -629,16 +788,16 @@ impl KernelHostRequestPort for KernelHostRequestClient {
             // record state maps to an owner timeout.
             return self.probe_settles_invocation(&facts, &session, &envelope, now_ms);
         }
-        let frame = host_request_frame_for_envelope(
-            AGENT_HOST_REQUEST_SUBMIT_OPERATION,
-            &envelope,
-            &facts,
-        )?;
+        let frame = if invokes_local_read(request) {
+            host_request_invoke_read_frame(request, &envelope, &facts)?
+        } else {
+            host_request_frame_for_envelope(AGENT_HOST_REQUEST_SUBMIT_OPERATION, &envelope, &facts)?
+        };
         let Ok(reply) = self.exchange(&frame) else {
             return self.probe_settles_invocation(&facts, &session, &envelope, now_ms);
         };
         match decode_admitted_reply(&reply, &envelope) {
-            Some((receipt, record)) => submit_outcome(&receipt, &record),
+            Some((receipt, record)) => submit_outcome(&receipt, &record, request, &envelope),
             None => self.probe_settles_invocation(&facts, &session, &envelope, now_ms),
         }
     }
@@ -763,6 +922,11 @@ impl KernelHostRequestClient {
 }
 
 #[cfg(test)]
+#[allow(
+    clippy::expect_used,
+    clippy::unwrap_used,
+    reason = "test fixtures use expect for fail-fast setup"
+)]
 mod tests {
     use super::*;
     use eliot_contracts::{EpochId, EpochLineageId, ResourceGeneration};
@@ -823,6 +987,16 @@ mod tests {
         envelope: &HostRequestEnvelope,
         receipt: &HostRequestAdmissionReceipt,
     ) -> Frame {
+        admitted_reply_frame_with_state(envelope, receipt, "ADMITTED", None, None)
+    }
+
+    fn admitted_reply_frame_with_state(
+        envelope: &HostRequestEnvelope,
+        receipt: &HostRequestAdmissionReceipt,
+        state: &str,
+        result_digest: Option<&str>,
+        result_response: Option<&serde_json::Value>,
+    ) -> Frame {
         Frame {
             protocol_version: ProtocolVersion::CURRENT,
             encoding_profile: EncodingProfile::JsonV1,
@@ -838,12 +1012,42 @@ mod tests {
                     "receipt": serde_json::to_value(receipt).expect("receipt must serialize"),
                     "record": {
                         "operation_id": receipt.operation_id,
-                        "state": "RESULT_RECEIVED",
+                        "state": state,
+                        "result_digest": result_digest,
+                        "result_response": result_response,
                     },
                 },
             })),
             trace_context: BTreeMap::new(),
         }
+    }
+
+    fn stored_test_response(envelope: &HostRequestEnvelope) -> (serde_json::Value, String) {
+        let body = serde_json::json!({
+            "request_id": envelope.identity.request_id.as_str(),
+            "idempotency_key": envelope.identity.idempotency_key,
+            "canonical_request_sha256": "a".repeat(64),
+            "kind": "PROJECTION",
+            "canonical_tool_name": "eliot.state",
+            "content": {
+                "operation": "GetEvidencePack",
+                "evidence_pack": {"task": "bounded-state"},
+                "revision_heads": [{"key": "scope:scope-1", "revision": 3}],
+            },
+            "artifacts": [],
+            "proof_ceiling": "SCOPED_VERIFICATION",
+            "resource": null,
+            "job": null,
+            "compatibility_correlation_hint": null,
+        });
+        let digest = sha256_hex(
+            &canonical_json_bytes(
+                &serde_json::from_value::<McpResponse>(body.clone())
+                    .expect("test body must decode"),
+            )
+            .expect("test body must canonicalize"),
+        );
+        (body, digest)
     }
 
     #[test]
@@ -894,6 +1098,10 @@ mod tests {
     }
 
     #[test]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "the updated outcome contract covers every state plus forgery cases contiguously"
+    )]
     fn stale_reply_decodes_unknown_and_states_map_typed() {
         let (_, facts, envelope) = test_envelope();
         let receipt = HostRequestAdmissionReceipt::issue(&envelope).expect("receipt must issue");
@@ -958,20 +1166,31 @@ mod tests {
         let record_for = |state| AdmittedReplyView {
             operation_id: receipt.operation_id.clone(),
             state,
+            result_digest: None,
+            result_response: None,
+        };
+        let (request_for_outcome, _, envelope_for_outcome) = test_envelope();
+        let outcome_for = |state| {
+            submit_outcome(
+                &receipt,
+                &record_for(state),
+                &request_for_outcome,
+                &envelope_for_outcome,
+            )
         };
         assert!(matches!(
-            submit_outcome(&receipt, &record_for(HostRequestRecordState::Expired)),
+            outcome_for(HostRequestRecordState::Expired),
             Err(PortFailure::DeadlineExceeded)
         ));
         assert!(matches!(
-            submit_outcome(&receipt, &record_for(HostRequestRecordState::Cancelled)),
+            outcome_for(HostRequestRecordState::Cancelled),
             Err(PortFailure::Cancelled)
         ));
         for state in [
             HostRequestRecordState::Conflicted,
             HostRequestRecordState::Terminal,
         ] {
-            match submit_outcome(&receipt, &record_for(state)) {
+            match outcome_for(state) {
                 Err(PortFailure::TransportBindingRejected { reason }) => {
                     assert!(
                         reason.contains("terminal"),
@@ -981,14 +1200,133 @@ mod tests {
                 other => panic!("expected terminal rejection, got {other:?}"),
             }
         }
-        match submit_outcome(
-            &receipt,
-            &record_for(HostRequestRecordState::ResultReceived),
-        ) {
-            Ok(HostInvocationPortOutcome::Accepted { operation_handle }) => {
+        // New contract (Implements #18): a bare `RESULT_RECEIVED` with no body
+        // fails closed instead of degrading to a bare admission that would
+        // lose the answer. The old pin asserting `Accepted` here is replaced
+        // by this rejection plus the valid-body `Responded` case below; the
+        // test is updated to the new contract, never deleted.
+        match outcome_for(HostRequestRecordState::ResultReceived) {
+            Err(PortFailure::TransportBindingRejected { .. }) => {}
+            other => panic!("expected fail-closed rejection for bodyless result, got {other:?}"),
+        }
+        // A received result with its exact bounded body answers inline with
+        // the payload and revision verbatim.
+        let (request, _, envelope) = test_envelope();
+        let (body, digest) = stored_test_response(&envelope);
+        let received = AdmittedReplyView {
+            operation_id: receipt.operation_id.clone(),
+            state: HostRequestRecordState::ResultReceived,
+            result_digest: Some(digest.clone()),
+            result_response: Some(body.clone()),
+        };
+        match submit_outcome(&receipt, &received, &request, &envelope) {
+            Ok(HostInvocationPortOutcome::Responded {
+                operation_handle,
+                response,
+            }) => {
                 assert_eq!(operation_handle.as_str(), receipt.operation_id.as_str());
+                assert_eq!(response.request_id, "host-request-1");
+                assert_eq!(response.canonical_tool_name, "eliot.state");
+                assert_eq!(response.content["revision_heads"][0]["revision"], 3);
             }
-            other => panic!("expected accepted outcome, got {other:?}"),
+            other => panic!("expected inline responded outcome, got {other:?}"),
+        }
+        // A forged body or digest under the same identity is rejected before
+        // anything is served.
+        let forged_body = AdmittedReplyView {
+            result_response: Some(serde_json::json!({"forged": true})),
+            ..received.clone()
+        };
+        assert!(
+            submit_outcome(&receipt, &forged_body, &request, &envelope).is_err(),
+            "forged body must be rejected before serving"
+        );
+        let forged_digest = AdmittedReplyView {
+            result_digest: Some("0".repeat(64)),
+            ..received.clone()
+        };
+        assert!(
+            submit_outcome(&receipt, &forged_digest, &request, &envelope).is_err(),
+            "forged digest must be rejected before serving"
+        );
+        // A result pair where none belongs never decodes to an outcome.
+        let admitted_with_body = AdmittedReplyView {
+            state: HostRequestRecordState::Admitted,
+            ..received.clone()
+        };
+        let admitted_reply = admitted_reply_frame_with_state(
+            &envelope,
+            &receipt,
+            "ADMITTED",
+            admitted_with_body.result_digest.as_deref(),
+            admitted_with_body.result_response.as_ref(),
+        );
+        assert!(
+            decode_admitted_reply(&admitted_reply, &envelope).is_none(),
+            "a body on a live state must decode to unknown"
+        );
+        // The result-bearing reply itself decodes with its digest binding.
+        let result_reply = admitted_reply_frame_with_state(
+            &envelope,
+            &receipt,
+            "RESULT_RECEIVED",
+            Some(digest.as_str()),
+            Some(&body),
+        );
+        let (_, decoded_result) =
+            decode_admitted_reply(&result_reply, &envelope).expect("result reply must decode");
+        assert_eq!(decoded_result.state, HostRequestRecordState::ResultReceived);
+        assert!(decoded_result.result_digest.is_some());
+    }
+
+    #[test]
+    fn local_read_tools_ride_invoke_read_with_tool_bytes() {
+        let (request, facts, envelope) = test_envelope();
+        assert!(
+            !invokes_local_read(&request),
+            "eliot.state keeps the admission-only submit entry"
+        );
+        for tool_json in [
+            serde_json::json!({"name":"eliot.query","arguments":{
+                "intent":{
+                    "mode":"verification",
+                    "time_scope":"session-window",
+                    "branch_environment_scope":"branch",
+                    "freshness_policy":"exact-fence",
+                    "required_assurance":"evidence-provenance"
+                },
+                "query":"subject:evidence-alpha",
+                "exact_resource_uri": null
+            }}),
+            serde_json::json!({"name":"eliot.packet","arguments":{
+                "packet_ref": null,
+                "material_refs": []
+            }}),
+        ] {
+            let mut value = serde_json::to_value(&request).expect("request must serialize");
+            value["tool"] = tool_json;
+            let read_request: HostInvocationRequest =
+                serde_json::from_value(value).expect("read request must deserialize");
+            read_request.validate().expect("read request must validate");
+            assert!(
+                invokes_local_read(&read_request),
+                "query and packet ride the invoke-read entry"
+            );
+            let frame = host_request_invoke_read_frame(&read_request, &envelope, &facts)
+                .expect("invoke-read frame must build");
+            let payload = match &frame.payload {
+                ProtocolPayload::Json(payload) => payload.clone(),
+                _ => panic!("invoke-read frame must carry JSON"),
+            };
+            assert_eq!(
+                payload.get("operation").and_then(|operation| operation.as_str()),
+                Some(AGENT_HOST_REQUEST_INVOKE_READ_OPERATION)
+            );
+            let tool = payload.get("tool").expect("invoke-read frame must carry tool bytes");
+            assert_eq!(
+                tool.get("name").and_then(|name| name.as_str()),
+                Some(read_request.tool.canonical_name())
+            );
         }
     }
 }
