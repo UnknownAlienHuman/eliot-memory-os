@@ -19,8 +19,8 @@ use eliot_store_api::{
     CanonicalValidationSnapshot, EVIDENCE_PACK_MAX_RECORDS, ExactJsonBytes, NamedReadOperation,
     NamedReadRequest, NamedReadResponse, OperationId, OrderingHead, OrderingScopeId,
     PAYLOAD_AUTHORITY_VERSION, PayloadEncoding, PayloadSource, RevisionHead, RevisionKey, ScopeId,
-    ScopeRevisionView, StateFence, StoreError, generated_operation_manifests,
-    named_mutation_operation_name,
+    ScopeRevisionView, StateFence, StoreError, WriteReceipt, WriteReceiptStatus,
+    generated_operation_manifests, named_mutation_operation_name,
 };
 
 use super::{
@@ -51,6 +51,9 @@ struct EvidenceReceiptRow {
     commit_sequence: Option<u64>,
     named_operation_count: Option<usize>,
     evidence_records: Option<Vec<EvidenceRecordRow>>,
+    /// Joined by the immutable commit marker, never by the caller's scope.
+    #[serde(skip)]
+    receipt: Option<WriteReceipt>,
 }
 
 /// One recoverable capture as persisted by the atomic writer (see
@@ -339,21 +342,35 @@ async fn named_read_payload(
 ///
 /// One row per receipt; pre-change receipts carry no evidence array and
 /// contribute nothing (they had no recoverable bytes persisted). The Rust
-/// boundary assigns capture identity and filters by exact subject — never a
-/// substring match in the query string.
+/// boundary joins the canonical receipt for scope/fence provenance. Both
+/// closed reads share one snapshot; global operation counts remain intact
+/// so filtering never changes an existing capture index.
 async fn read_evidence_records(
     db: &client::RpcTransport,
     config: &SurrealAdapterConfig,
 ) -> Result<Vec<EvidenceReceiptRow>, AdapterError> {
-    let mut response = client::query(
-        db,
-        config,
-        "read.evidence_records",
+    let sql = format!(
+        "BEGIN TRANSACTION; {} {} COMMIT TRANSACTION;",
         schema::READ_EVIDENCE_RECORDS,
-        Map::new(),
-    )
-    .await?;
-    take_vec::<EvidenceReceiptRow>(&mut response, 0)
+        schema::READ_ALL_RECEIPTS,
+    );
+    let mut response = client::query(db, config, "read.evidence_records", &sql, Map::new()).await?;
+    let mut rows = take_vec::<EvidenceReceiptRow>(&mut response, 0)?;
+    let receipts = take_vec::<WriteReceipt>(&mut response, 1)?;
+    let mut by_commit = BTreeMap::new();
+    for receipt in receipts {
+        if let Some(marker) = &receipt.committed_at
+            && by_commit.insert(marker.clone(), receipt).is_some()
+        {
+            return Err(StoreError::InvalidReceipt.into());
+        }
+    }
+    for row in &mut rows {
+        if let Some(sequence) = row.commit_sequence {
+            row.receipt = by_commit.remove(&format!("commit-sequence-{sequence:016}"));
+        }
+    }
+    Ok(rows)
 }
 
 /// Validates one persisted evidence record against its own provenance.
@@ -397,6 +414,11 @@ fn validate_evidence_record(
             "evidence record bytes do not match parameters".to_owned(),
         ));
     }
+    if record.parameters.get("subject").and_then(Value::as_str) != Some(record.subject.as_str())
+        || record.operation_index >= record.named_operation_count
+    {
+        return Err(StoreError::InvalidReceipt);
+    }
     if let Some(commit_sequence) = row.commit_sequence
         && commit_sequence != record.commit_sequence
     {
@@ -417,7 +439,7 @@ fn validate_evidence_record(
 /// Builds the versioned exact evidence-pack payload for one request.
 ///
 /// Parity with the reference `MemoryStore::evidence_pack_payload`: exact
-/// `subject` match only (never substring, never a default), explicit
+/// scope/fence/`subject` match (never substring, never a default), explicit
 /// `max_records` decimal-string bound with over-bound
 /// [`StoreError::PayloadTooLarge`] refusal, identity
 /// (`capture_index` / `operation` / `parameters`), envelope `version = 1`
@@ -479,6 +501,9 @@ fn evidence_pack_payload(
         return Err(StoreError::PayloadTooLarge);
     }
     let limit = usize::try_from(max_records).map_err(|_| StoreError::PayloadTooLarge)?;
+    if query.state_fence != *state_fence {
+        return Err(StoreError::FenceMismatch);
+    }
 
     // Durable capture order: receipts by commit_sequence (pre-change rows
     // without a sequence sort first and contribute zero), evidence within a
@@ -493,10 +518,29 @@ fn evidence_pack_payload(
             .as_ref()
             .map_or(Vec::new(), |records| records.iter().collect());
         records.sort_by_key(|record| record.operation_index);
+        // Legacy receipts without recoverable captures remain absent. A
+        // recoverable capture without its admitted identity fails closed.
+        let in_scope = if records.is_empty() {
+            false
+        } else {
+            let receipt = row.receipt.as_ref().ok_or(StoreError::InvalidReceipt)?;
+            receipt.validate()?;
+            let binding = &receipt.require_reconciliation_envelope()?.core.work_scope;
+            if receipt.status != WriteReceiptStatus::Committed
+                || row.named_operation_count != Some(receipt.applied_command_ids.len())
+            {
+                return Err(StoreError::InvalidReceipt);
+            }
+            binding.scope_id.as_str() == scope_id.as_str()
+                && binding.state_fence == *state_fence
+                && receipt.state_fence == *state_fence
+        };
         for record in records {
             validate_evidence_record(row, record)?;
             let capture_index = operation_base.saturating_add(record.operation_index as u64);
-            indexed.push((capture_index, record));
+            if in_scope {
+                indexed.push((capture_index, record));
+            }
         }
         operation_base =
             operation_base.saturating_add(row.named_operation_count.unwrap_or(0) as u64);
@@ -692,7 +736,7 @@ mod admitted_read_tests {
 
     // --- T11.1 GetEvidencePack behaviour (real plan outputs, no canned rows) ---
 
-    fn capture_transition(
+    pub(super) fn capture_transition(
         operation_id: &str,
         subject: &str,
     ) -> eliot_store_api::PreparedTransition {
@@ -750,6 +794,9 @@ mod admitted_read_tests {
         );
         let record = &plan.evidence_records[0];
         EvidenceReceiptRow {
+            receipt: Some(
+                plan::build_receipt(&capture_context(), &transition, &plan).expect("receipt"),
+            ),
             commit_sequence: Some(plan.commit_sequence),
             named_operation_count: Some(transition.named_operations.len()),
             evidence_records: Some(vec![EvidenceRecordRow {
@@ -767,7 +814,56 @@ mod admitted_read_tests {
         }
     }
 
-    fn evidence_query(subject: &str, max_records: &str) -> NamedReadRequest {
+    pub(super) fn capture_context() -> eliot_store_api::RequestMeta {
+        use eliot_contracts::{ClockReading, ProductId, RequestId, SourceId};
+        eliot_store_api::RequestMeta {
+            request_id: RequestId::new("evidence-scope-request").expect("request"),
+            session_id: None,
+            task_id: None,
+            product_id: ProductId::new("evidence-scope-product").expect("product"),
+            source_id: SourceId::new("evidence-scope-source").expect("source"),
+            state_fence: test_fence(),
+            clock: ClockReading {
+                valid_time_ms: Some(1000),
+                known_time_ms: Some(1001),
+                ..ClockReading::default()
+            },
+        }
+    }
+
+    #[test]
+    fn evidence_pack_requires_receipt_scope_and_fence() {
+        let fence = test_fence();
+        let query = evidence_query("shared-subject", "1");
+        let row = evidence_row_for("scope-provenance", "shared-subject", 1);
+        let mut wrong_scope_query = query.clone();
+        wrong_scope_query.scope_id = Some(ScopeId::new("other").expect("scope"));
+        let absent =
+            evidence_pack_payload(&wrong_scope_query, &fence, &[row.clone()]).expect("empty");
+        assert_eq!(absent["provenance"]["matched_total"], json!(0));
+        let mut no_receipt = row.clone();
+        no_receipt.receipt = None;
+        assert_eq!(
+            evidence_pack_payload(&query, &fence, &[no_receipt]),
+            Err(StoreError::InvalidReceipt)
+        );
+        let mut no_envelope = row.clone();
+        no_envelope.receipt.as_mut().expect("receipt").envelope = None;
+        assert_eq!(
+            evidence_pack_payload(&query, &fence, &[no_envelope]),
+            Err(StoreError::MissingReceiptEnvelope)
+        );
+        let mut other_fence = fence.clone();
+        other_fence.resource_generation =
+            eliot_contracts::ResourceGeneration::new(2).expect("generation");
+        let mut newer_query = query;
+        newer_query.state_fence = other_fence.clone();
+        let absent = evidence_pack_payload(&newer_query, &other_fence, &[row])
+            .expect("old captures excluded");
+        assert_eq!(absent["provenance"]["matched_total"], json!(0));
+    }
+
+    pub(super) fn evidence_query(subject: &str, max_records: &str) -> NamedReadRequest {
         read_request(
             NamedReadOperation::GetEvidencePack,
             Some(ScopeId::new("scope-1").expect("scope")),
@@ -1032,6 +1128,281 @@ mod admitted_read_tests {
                 ),
                 "bound {bound} must fail closed"
             );
+        }
+    }
+}
+
+#[cfg(all(test, windows))]
+mod real_scope_tests {
+    #![allow(clippy::expect_used, clippy::large_futures, clippy::print_stdout)]
+
+    use super::*;
+    use eliot_platform_windows::WindowsPlatform;
+    use eliot_store_api::{
+        CanonicalRequestView, CanonicalStoreClient, canonical_request_hash,
+        operation_manifest_set_digest, sha256_hex,
+    };
+    use futures_util::FutureExt;
+    use secrecy::{ExposeSecret, SecretString};
+    use std::net::TcpListener;
+    use std::path::{Path, PathBuf};
+    use std::process::Stdio;
+    use std::time::Duration;
+    use tokio::net::TcpStream;
+    use tokio::process::Command;
+    use tokio::time::{Instant, sleep};
+
+    struct Harness {
+        root: PathBuf,
+        config: SurrealAdapterConfig,
+        adapter: Option<SurrealStoreAdapter>,
+    }
+
+    impl Harness {
+        async fn start() -> Self {
+            let port = TcpListener::bind("127.0.0.1:0")
+                .expect("loopback")
+                .local_addr()
+                .expect("address")
+                .port();
+            let root =
+                std::env::temp_dir().join(format!("eliot-evidence-scope-{}", uuid::Uuid::new_v4()));
+            let exe = root.join("bin/surreal.exe");
+            let data = root.join("store/data");
+            let work = root.join("store/work");
+            let tmp = root.join("store/tmp");
+            for path in [root.join("bin"), data.clone(), work.clone(), tmp.clone()] {
+                std::fs::create_dir_all(path).expect("isolated root");
+            }
+            let provider = std::env::var_os("ELIOT_TEST_SURREAL_EXE").map_or_else(
+                || PathBuf::from(r"C:\Tools\SurrealDB\surreal.exe"),
+                PathBuf::from,
+            );
+            std::fs::copy(provider, &exe).expect("stage provider");
+            let digest = sha256_hex(&std::fs::read(&exe).expect("provider bytes"));
+            let bind = format!("127.0.0.1:{port}");
+            let mut config = SurrealAdapterConfig {
+                endpoint: format!("ws://{bind}/rpc"),
+                namespace: "scope_test".into(),
+                database: "evidence".into(),
+                username: "scope-test".into(),
+                password: SecretString::new(format!("test-{}", uuid::Uuid::new_v4()).into()),
+                provider_bind_address: bind,
+                installation_id: "evidence-scope-test".into(),
+                installation_profile: "portable_dev".into(),
+                runtime_state_roots_digest: "a".repeat(64),
+                provider_executable_path: exe.to_string_lossy().into_owned(),
+                provider_artifact_digest: digest,
+                provider_arguments: Vec::new(),
+                store_data_root: data.to_string_lossy().into_owned(),
+                store_work_root: work.to_string_lossy().into_owned(),
+                store_temp_root: tmp.to_string_lossy().into_owned(),
+                connect_timeout_ms: 30_000,
+                query_timeout_ms: 30_000,
+                expected_provider_major: crate::PINNED_SURREALDB_MAJOR,
+                expected_schema_generation: SchemaGeneration::v2(),
+            };
+            config.provider_arguments = config.expected_provider_arguments();
+            let mut harness = Self {
+                root,
+                config,
+                adapter: None,
+            };
+            println!(
+                "EVIDENCE-SCOPE provider={} sha256={} root={}",
+                exe.display(),
+                harness.config.provider_artifact_digest,
+                harness.root.display()
+            );
+            // Provision credentials in this fresh root, as installation does.
+            // Secrets go only through the child environment, never argv/logs.
+            let system_root = std::env::var_os("SystemRoot").expect("SystemRoot");
+            let mut child = Command::new(&exe)
+                .args(&harness.config.provider_arguments)
+                .current_dir(&work)
+                .env_clear()
+                .env("SystemRoot", &system_root)
+                .env("WINDIR", &system_root)
+                .env("TEMP", &tmp)
+                .env("TMP", &tmp)
+                .env("SURREAL_USER", &harness.config.username)
+                .env("SURREAL_PASS", harness.config.password.expose_secret())
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .creation_flags(0x0800_0000)
+                .kill_on_drop(true)
+                .spawn()
+                .expect("bootstrap provider");
+            let deadline = Instant::now() + Duration::from_secs(30);
+            loop {
+                assert!(
+                    child.try_wait().expect("child status").is_none(),
+                    "bootstrap exited"
+                );
+                if TcpStream::connect(&harness.config.provider_bind_address)
+                    .await
+                    .is_ok()
+                {
+                    break;
+                }
+                assert!(Instant::now() < deadline, "bootstrap bind timeout");
+                sleep(Duration::from_millis(50)).await;
+            }
+            child.kill().await.expect("stop bootstrap");
+            child.wait().await.expect("reap bootstrap");
+            harness.open().await;
+            harness
+        }
+
+        async fn open(&mut self) {
+            let platform = WindowsPlatform::new(self.root.clone()).expect("platform");
+            let lease = platform
+                .retain_process_path_lease(
+                    Path::new(&self.config.provider_executable_path),
+                    Path::new(&self.config.store_work_root),
+                    &self.config.provider_artifact_digest,
+                )
+                .expect("process lease");
+            self.adapter =
+                Some(SurrealStoreAdapter::new(self.config.clone(), lease).expect("adapter"));
+            self.adapter()
+                .connect()
+                .await
+                .expect("authenticated provider");
+        }
+
+        fn adapter(&self) -> &SurrealStoreAdapter {
+            self.adapter.as_ref().expect("live adapter")
+        }
+
+        async fn close(&mut self) {
+            self.adapter = None;
+            let deadline = Instant::now() + Duration::from_secs(10);
+            while TcpStream::connect(&self.config.provider_bind_address)
+                .await
+                .is_ok()
+            {
+                assert!(
+                    Instant::now() < deadline,
+                    "provider did not release endpoint"
+                );
+                sleep(Duration::from_millis(50)).await;
+            }
+        }
+
+        async fn cleanup(&mut self) {
+            self.close().await;
+            let deadline = Instant::now() + Duration::from_secs(10);
+            while let Err(error) = std::fs::remove_dir_all(&self.root) {
+                assert!(
+                    Instant::now() < deadline,
+                    "test root cleanup failed: {error}"
+                );
+                sleep(Duration::from_millis(50)).await;
+            }
+            assert!(!self.root.exists(), "test root removed");
+        }
+    }
+
+    impl Drop for Harness {
+        fn drop(&mut self) {
+            self.adapter = None;
+            let _ = std::fs::remove_dir_all(&self.root);
+        }
+    }
+
+    async fn assert_scope_reads(adapter: &SurrealStoreAdapter) {
+        for (scope, expected_index) in [
+            ("scope-other", Some(0)),
+            ("scope-1", Some(1)),
+            ("scope-missing", None),
+        ] {
+            let mut query = admitted_read_tests::evidence_query("shared-subject", "1");
+            query.scope_id = Some(ScopeId::new(scope).expect("scope"));
+            let response = adapter
+                .execute_named(query)
+                .await
+                .expect("scoped named read");
+            let records = response.payload["records"].as_array().expect("records");
+            assert_eq!(records.len(), usize::from(expected_index.is_some()));
+            if let Some(index) = expected_index {
+                assert_eq!(records[0]["capture_index"], json!(index));
+                assert_eq!(records[0]["parameters"]["subject"], json!("shared-subject"));
+            }
+            assert_eq!(
+                response.payload["provenance"]["matched_total"],
+                json!(records.len())
+            );
+            assert_eq!(response.payload["provenance"]["truncated"], json!(false));
+        }
+        let query = admitted_read_tests::evidence_query("shared", "1");
+        let response = adapter
+            .execute_named(query)
+            .await
+            .expect("nonmatching subject");
+        assert_eq!(response.payload["provenance"]["matched_total"], json!(0));
+        let mut wrong_fence = admitted_read_tests::evidence_query("shared-subject", "1");
+        wrong_fence.state_fence.resource_generation =
+            eliot_contracts::ResourceGeneration::new(2).expect("generation");
+        assert_eq!(
+            adapter.execute_named(wrong_fence).await,
+            Err(StoreError::FenceMismatch)
+        );
+    }
+
+    #[tokio::test]
+    async fn real_surreal_evidence_pack_isolates_scopes_and_survives_reopen() {
+        let mut harness = Harness::start().await;
+        let result = std::panic::AssertUnwindSafe(async {
+            let ctx = admitted_read_tests::capture_context();
+            harness
+                .adapter()
+                .apply_migration(
+                    &SurrealStoreAdapter::v2_baseline_migration(),
+                    &ctx.clock,
+                    &ctx.state_fence,
+                )
+                .await
+                .expect("migration");
+            for (index, scope) in ["scope-other", "scope-1"].into_iter().enumerate() {
+                let mut capture = admitted_read_tests::capture_transition(
+                    &format!("scope-capture-{index}"),
+                    "shared-subject",
+                );
+                capture.scope_id = ScopeId::new(scope).expect("scope");
+                capture.ordering_scopes = vec![OrderingScopeId::new(scope).expect("ordering")];
+                capture.operation_manifest_digest = operation_manifest_set_digest(
+                    &generated_operation_manifests().expect("catalogue"),
+                )
+                .expect("manifest digest");
+                capture.identity.canonical_request_hash = canonical_request_hash(
+                    &CanonicalRequestView::from_apply(&ctx, &capture, &[], &[]),
+                )
+                .expect("request hash");
+                let receipt = harness
+                    .adapter()
+                    .apply_prepared(&ctx, capture.clone(), vec![], vec![])
+                    .await
+                    .expect("capture");
+                assert_eq!(receipt.status, WriteReceiptStatus::Committed);
+                let replay = harness
+                    .adapter()
+                    .apply_prepared(&ctx, capture, vec![], vec![])
+                    .await
+                    .expect("exact replay");
+                assert_eq!(replay, receipt);
+            }
+            assert_scope_reads(harness.adapter()).await;
+            harness.close().await;
+            harness.open().await;
+            assert_scope_reads(harness.adapter()).await;
+        })
+        .catch_unwind()
+        .await;
+        harness.cleanup().await;
+        if let Err(panic) = result {
+            std::panic::resume_unwind(panic);
         }
     }
 }

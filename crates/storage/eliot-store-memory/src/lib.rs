@@ -10,8 +10,8 @@ use std::sync::{Mutex, MutexGuard, TryLockError};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use eliot_store_api::{
-    CanonicalRequestView, CanonicalStoreClient, CanonicalValidationSnapshot, CommitId, EventId,
-    EventProjectionRelationIntents, EVIDENCE_PACK_MAX_RECORDS, NamedMutationOperation,
+    CanonicalRequestView, CanonicalStoreClient, CanonicalValidationSnapshot, CommitId,
+    EVIDENCE_PACK_MAX_RECORDS, EventId, EventProjectionRelationIntents, NamedMutationOperation,
     NamedReadOperation, NamedReadRequest, NamedReadResponse, OperationId, OperationManifestDigest,
     OrderingHead, OrderingHeadExpectation, OrderingScopeId, OutboxId, OutboxIntent, OutboxState,
     PreparedTransition, ProjectionMode, ProjectionPublicationId, ProjectionPublicationRecord,
@@ -378,7 +378,16 @@ fn commit_transaction(
         .extend(transition.event_projection_relation_intents.relation_kinds);
     state
         .named_operations
-        .extend(transition.named_operations.clone());
+        .extend(
+            transition
+                .named_operations
+                .into_iter()
+                .map(|operation| ScopedNamedOperation {
+                    scope_id: transition.scope_id.clone(),
+                    state_fence: transition.state_fence.clone(),
+                    operation,
+                }),
+        );
     state.receipts_by_idempotency.insert(
         receipt.idempotency_key.clone(),
         (
@@ -550,7 +559,7 @@ impl MemoryStore {
             }
             _ => serde_json::to_value(json!({
                 "operation": format!("{:?}", query.operation),
-                "records": state.named_operations,
+                "records": state.named_operations.iter().map(|record| &record.operation).collect::<Vec<_>>(),
             })),
         };
         let payload = payload.map_err(|error| StoreError::Serialization(error.to_string()))?;
@@ -568,9 +577,8 @@ impl MemoryStore {
     ///
     /// Reads only actually captured observations: the `CaptureObservation`
     /// records stored by the commit path, in capture order, filtered by exact
-    /// `subject` match — never substring, never a default subject, never the
-    /// current scope view. Fence equality is enforced by the caller before
-    /// dispatch; the scope selector is required and echoed into the payload;
+    /// scope, fence and `subject` match — never substring or a default scope.
+    /// The commit path retains each operation's admitted scope and fence;
     /// the explicit `max_records` bound caps the returned records with a
     /// visible `truncated` marker plus totals, while an over-bound request
     /// refuses with [`StoreError::PayloadTooLarge`] instead of returning a
@@ -633,11 +641,18 @@ impl MemoryStore {
             .named_operations
             .iter()
             .enumerate()
-            .filter(|(_, operation)| {
-                operation.operation == NamedMutationOperation::CaptureObservation
-                    && operation.parameters.get("subject").and_then(Value::as_str)
+            .filter(|(_, record)| {
+                record.scope_id == scope_id
+                    && record.state_fence == *fence
+                    && record.operation.operation == NamedMutationOperation::CaptureObservation
+                    && record
+                        .operation
+                        .parameters
+                        .get("subject")
+                        .and_then(Value::as_str)
                         == Some(subject)
             })
+            .map(|(index, record)| (index, &record.operation))
             .collect();
         let matched_total = matched.len();
         let records: Vec<Value> = matched
@@ -969,6 +984,13 @@ fn genesis_receipt(
 }
 
 #[derive(Clone, Debug, PartialEq)]
+struct ScopedNamedOperation {
+    scope_id: ScopeId,
+    state_fence: StateFence,
+    operation: eliot_store_api::NamedMutationRequest,
+}
+
+#[derive(Clone, Debug, PartialEq)]
 struct MemoryState {
     fences: Option<StateFence>,
     recovery_records: BTreeMap<RecoveryRecordKey, RecoveryRecord>,
@@ -980,7 +1002,7 @@ struct MemoryState {
     projections: BTreeMap<String, ProjectionPublicationRecord>,
     outbox: BTreeMap<String, OutboxIntent>,
     relations: BTreeSet<String>,
-    named_operations: Vec<eliot_store_api::NamedMutationRequest>,
+    named_operations: Vec<ScopedNamedOperation>,
     manifests: BTreeMap<String, eliot_store_api::NamedOperationManifest>,
     next_commit_sequence: u64,
     next_outbox_sequence: u64,
@@ -1030,7 +1052,11 @@ impl MemoryState {
             projections: self.projections.values().cloned().collect(),
             outbox: self.outbox.values().cloned().collect(),
             relations: self.relations.iter().cloned().collect(),
-            named_operations: self.named_operations.clone(),
+            named_operations: self
+                .named_operations
+                .iter()
+                .map(|record| record.operation.clone())
+                .collect(),
         }
     }
 }
@@ -2260,6 +2286,51 @@ mod tests {
     }
 
     #[test]
+    fn evidence_pack_isolates_scopes_with_the_same_subject() -> Result<(), StoreError> {
+        let state_fence = fence();
+        let ctx = metadata(&state_fence)?;
+        let store = store()?;
+        for (index, scope) in ["scope-other", "scope-1"].into_iter().enumerate() {
+            let mut capture = capture_with_subject(
+                &format!("scope-capture-{index}"),
+                "shared-subject",
+                &state_fence,
+                &ctx,
+            )?;
+            capture.scope_id = ScopeId::new(scope)?;
+            capture.ordering_scopes = vec![OrderingScopeId::new(scope)?];
+            capture.identity.canonical_request_hash = canonical_request_hash(
+                &CanonicalRequestView::from_apply(&ctx, &capture, &[], &[]),
+            )?;
+            store.apply_transaction(&ctx, capture.clone(), &[], &[])?;
+            // Exact replay must not add an observation or shift its identity.
+            store.apply_transaction(&ctx, capture, &[], &[])?;
+        }
+        for (scope, expected_index) in [
+            ("scope-other", Some(0)),
+            ("scope-1", Some(1)),
+            ("scope-missing", None),
+        ] {
+            let response = store.execute_named_sync(&evidence_pack_query(
+                &state_fence,
+                Some(scope),
+                evidence_params("shared-subject", "1"),
+            )?)?;
+            let records = pack_records(&response.payload)?;
+            assert_eq!(records.len(), usize::from(expected_index.is_some()));
+            if let Some(index) = expected_index {
+                assert_eq!(records[0]["capture_index"], json!(index));
+            }
+            assert_eq!(
+                response.payload["provenance"]["matched_total"],
+                json!(records.len())
+            );
+            assert_eq!(response.payload["provenance"]["truncated"], json!(false));
+        }
+        Ok(())
+    }
+
+    #[test]
     fn evidence_pack_returns_exact_captured_record_with_provenance() -> Result<(), StoreError> {
         // Slice T11.1: capture one real observation via the existing capture
         // path, then `GetEvidencePack` returns its exact record (identity)
@@ -2427,11 +2498,8 @@ mod tests {
         let store = store()?;
 
         // Scope-addressed read without a scope.
-        let query = evidence_pack_query(
-            &state_fence,
-            None,
-            evidence_params("evidence-alpha", "10"),
-        )?;
+        let query =
+            evidence_pack_query(&state_fence, None, evidence_params("evidence-alpha", "10"))?;
         assert_eq!(
             store.execute_named_sync(&query),
             Err(StoreError::InvalidField {
