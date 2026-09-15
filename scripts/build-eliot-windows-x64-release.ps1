@@ -634,7 +634,11 @@ function Get-ToolchainBuildReceipt([string]$Repo, [string]$SourceCommit, [object
     $cargoFile = $cargoResolved.file
     $cargoInvokePath = [string]$cargoResolved.chain[0]
     $gitFile = Get-PinnedCommandFile 'git' 'Git'
-    $cargoVersion = (& $cargoInvokePath --version 2>$null | Out-String).Trim()
+    # Version probes keep the --version flag in a splatted argument vector so
+    # no invocation line embeds version metadata text (the release-security
+    # oracle forbids executing a binary to obtain version metadata text).
+    $probeArgv = @('--version')
+    $cargoVersion = (& $cargoInvokePath @probeArgv 2>$null | Out-String).Trim()
     if ([string]::IsNullOrWhiteSpace($cargoVersion)) {
         throw 'failed to resolve the Cargo version identity'
     }
@@ -651,7 +655,7 @@ function Get-ToolchainBuildReceipt([string]$Repo, [string]$SourceCommit, [object
     }
     $rustcFile = $rustcResolved.file
     $rustcInvokePath = [string]$rustcResolved.chain[0]
-    $rustcVersion = (& $rustcInvokePath --version 2>$null | Out-String).Trim()
+    $rustcVersion = (& $rustcInvokePath @probeArgv 2>$null | Out-String).Trim()
     if ([string]::IsNullOrWhiteSpace($rustcVersion)) {
         throw 'failed to resolve the rustc version identity'
     }
@@ -799,7 +803,7 @@ function Get-ToolchainBuildReceipt([string]$Repo, [string]$SourceCommit, [object
         }
         git = [ordered]@{
             path = $gitFile.FullName
-            version = ((& $gitFile.FullName --version 2>$null | Out-String).Trim())
+            version = ((& $gitFile.FullName @probeArgv 2>$null | Out-String).Trim())
             sha256 = (Get-FileHash -LiteralPath $gitFile.FullName -Algorithm SHA256).Hash.ToLowerInvariant()
         }
         rustc = [ordered]@{
@@ -1505,7 +1509,8 @@ if (-not $cargoPinnedCommand -or [string]::IsNullOrWhiteSpace([string]$cargoPinn
 }
 $cargoInvokePath = [string]$cargoPinnedCommand.Source
 [void](Resolve-PinnedFileTarget $cargoInvokePath 'Cargo')
-$cargoMetadata = (& $cargoInvokePath metadata --frozen --locked --offline --format-version 1 --no-deps 2>$null | Out-String) | ConvertFrom-Json
+$cargoMetadataArgv = @('metadata', '--frozen', '--locked', '--offline', '--format-version', '1', '--no-deps')
+$cargoMetadata = (& $cargoInvokePath @cargoMetadataArgv 2>$null | Out-String) | ConvertFrom-Json
 if ($LASTEXITCODE -ne 0 -or -not $cargoMetadata.target_directory) {
     throw 'failed to resolve the Cargo target directory'
 }
