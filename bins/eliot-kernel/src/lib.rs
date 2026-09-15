@@ -97,6 +97,7 @@ mod daemon_session_guard;
 mod daemon_supervision;
 mod dispatch_launch;
 mod doctor_recovery_ledger;
+mod dreamer_job_dispatch;
 mod frame_dispatch;
 mod front_door_listener;
 mod front_door_session;
@@ -219,6 +220,14 @@ pub use eliot_kernel_service::{
     TestdAdmissionResponse, handle_testd_admission_attempt, reconcile_testd_admission,
     route_testd_admission,
 };
+/// K2 Dreamer wire seam for the front-door dispatch/driver arms (T12-05).
+///
+/// The dispatch arm (`frame_dispatch`) and the driver arm
+/// (`front_door_driver`) depend only on this closed wire identity plus the
+/// K0 request/response types. Slice K2 routes through the K1 gateway
+/// (`KernelStoreGateway::dreamer_job`); no process is spawned here and no
+/// worker binding is invented (worker handoff is T12-09).
+pub use dreamer_job_dispatch::DREAMER_JOB_WIRE_ID;
 /// P-07 native-worker claim wire seam for the front-door dispatch/driver arms
 /// (DISPATCH-CAUSE-FIX, issues #461/#20/#22).
 ///
@@ -695,6 +704,21 @@ pub enum KernelFrameAction {
         /// Closed operation name; must equal `TESTD_ADMISSION_WIRE_ID`.
         operation: String,
         /// Bounded operation payload carrying the typed admission request.
+        payload: serde_json::Value,
+    },
+    /// Execute one authenticated Dreamer job operation (T12-05 K2).
+    /// The operation carries the exact Dreamer wire identity; ledger-bound
+    /// admission itself is owned by the K1 gateway
+    /// (`KernelStoreGateway::dreamer_job`). Intake is `Ready`-gated; the
+    /// authenticated caller is the `eliotd` requester and the presented
+    /// `JobRole` must agree with it, never grant rights. No process is
+    /// spawned inside this handler.
+    Dreamer {
+        /// Correlation identity to echo in the response.
+        request_id: RequestId,
+        /// Closed operation name; must equal `DREAMER_JOB_WIRE_ID`.
+        operation: String,
+        /// Bounded operation payload carrying context plus typed job request.
         payload: serde_json::Value,
     },
     /// Return a typed rejection, then fence the connection.
