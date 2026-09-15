@@ -9,6 +9,8 @@ use eliot_contracts::StateFence;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
+pub(crate) mod kernel_port;
+
 pub const SERVICE_NAME: &str = "eliot-dreamer";
 pub const PROTOCOL_VERSION: &str = "eliot.dreamer.v1";
 pub const KERNEL_ADMISSION_REQUIRED: &str = "KERNEL_ADMISSION_REQUIRED";
@@ -122,14 +124,25 @@ pub trait KernelJobPort {
 }
 
 /// Authenticated production adapter over the installation-owned Kernel client.
+///
+/// The port owns the validated one-shot claim: connecting loads the
+/// installation-owned client, probes the authenticated health handshake,
+/// binds the live authority epoch it echoes, validates the staged dispatch
+/// material presented next to this executable, derives the in-process
+/// dispatch permit exactly once, and performs `LeaseExact` then `Start`
+/// through the authenticated worker session. Any step failing closed refuses
+/// with [`DreamerError::KernelAdmissionRequired`] without effect.
 pub struct AuthenticatedKernelJobPort {
-    client: KernelClient,
+    material: kernel_port::ValidatedDreamerMaterial,
+    admission: KernelJobAdmission,
+    view: JobView,
+    handshake: KernelHandshake,
 }
 
 impl AuthenticatedKernelJobPort {
     pub fn connect() -> Result<Self, DreamerError> {
-        let mut client = KernelClient::load().map_err(|error| kernel_admission_error(&error))?;
-        let health = client
+        let mut session = KernelClient::load().map_err(|error| kernel_admission_error(&error))?;
+        let health = session
             .probe()
             .map_err(|error| kernel_admission_error(&error))?;
         if health.get("status").and_then(serde_json::Value::as_str) != Some("OPEN") {
@@ -137,24 +150,79 @@ impl AuthenticatedKernelJobPort {
                 "Kernel health handshake was not OPEN and fenced".to_owned(),
             ));
         }
-        let _ = client
-            .transact_json(
-                "dreamer.claim",
-                serde_json::json!({ "protocol": PROTOCOL_VERSION }),
-            )
-            .map_err(|error| kernel_admission_error(&error))?;
-        Err(DreamerError::KernelAdmissionRequired(
-            "KernelClient has no session-bound Dreamer job claim contract".to_owned(),
-        ))
+        let live_epoch = kernel_port::live_epoch_from_health(&health)
+            .map_err(|error| port_denied(&error))?;
+        let material = kernel_port::read_material(&live_epoch)
+            .map_err(|error| port_denied(&error))?
+            .ok_or_else(|| {
+                DreamerError::KernelAdmissionRequired(
+                    "no staged dreamer dispatch material was presented".to_owned(),
+                )
+            })?;
+        let (executable, working_directory) = kernel_port::claim_executable_paths()
+            .map_err(|error| port_denied(&error))?;
+        // Derive-and-drop: the sealed request proves the grant binds through
+        // the real contour constructors now. Dropping the ephemeral authority
+        // admits no second issuance in this process; the staged file is
+        // already consumed and claim authority stays Kernel-side.
+        kernel_port::derive_permit(&material, &executable, &working_directory)
+            .map_err(|error| port_denied(&error))?;
+        let mut transport = kernel_port::KernelClaimTransport::new(session);
+        let started =
+            kernel_port::claim_once(&material, &mut transport).map_err(|error| port_denied(&error))?;
+        let admission = claim_admission(&material);
+        admission.validate()?;
+        let handshake = KernelHandshake {
+            authority_epoch: material.epoch.sequence.get(),
+            dreamer_claim_supported: true,
+        };
+        let view = JobView {
+            job_id: started.job_id.as_str().to_owned(),
+            state: JobState::Running,
+            result: None,
+        };
+        Ok(Self {
+            material,
+            admission,
+            view,
+            handshake,
+        })
     }
+
+    /// Returns the Kernel-proved view of the claimed job.
+    #[must_use]
+    pub fn claimed_view(&self) -> &JobView {
+        &self.view
+    }
+}
+
+/// Binds the validated claim to the Kernel-owned admission identity.
+///
+/// The stable half reuses the Kernel-issued grant lineage (idempotency key
+/// plus expiry as the freshness bound, so [`KernelJobAdmission::validate`]
+/// re-proves liveness); the correlation half is derived from the grant
+/// digest. Nothing is taken from argv, stdin, or environment.
+fn claim_admission(material: &kernel_port::ValidatedDreamerMaterial) -> KernelJobAdmission {
+    let short: String = material.grant.grant_digest.chars().take(16).collect();
+    KernelJobAdmission {
+        job_id: material.job_id.clone(),
+        attempt_id: material.attempt_id.clone(),
+        scope_id: material.scope_id.clone(),
+        request_id: format!("dreamer-claim-{short}"),
+        idempotency_key: material.grant.idempotency_key.clone(),
+        cancellation_id: format!("dreamer-claim-{short}:cancel"),
+        deadline_unix_ms: material.grant.expires_at,
+        state_fence: material.fence.clone(),
+    }
+}
+
+fn port_denied(error: &kernel_port::KernelPortError) -> DreamerError {
+    DreamerError::KernelAdmissionRequired(error.to_string())
 }
 
 impl KernelJobPort for AuthenticatedKernelJobPort {
     fn handshake(&mut self) -> Result<KernelHandshake, DreamerError> {
-        let _ = &self.client;
-        Err(DreamerError::KernelAdmissionRequired(
-            "KernelClient has no session-bound Dreamer handshake contract".to_owned(),
-        ))
+        Ok(self.handshake)
     }
 
     fn submit(
@@ -162,30 +230,41 @@ impl KernelJobPort for AuthenticatedKernelJobPort {
         admission: &KernelJobAdmission,
         job: &DreamJobInput,
     ) -> Result<JobView, DreamerError> {
-        let _ = (admission, job);
-        Err(DreamerError::KernelAdmissionRequired(
-            "KernelClient cannot forward a session-bound Dreamer submit".to_owned(),
-        ))
+        let _ = job;
+        self.admission.validate()?;
+        if admission.job_id != self.material.job_id
+            || admission.scope_id != self.material.scope_id
+            || admission.state_fence != self.material.fence
+            || admission.idempotency_key != self.admission.idempotency_key
+        {
+            return Err(DreamerError::KernelAdmissionRequired(
+                "presented admission is not the claimed dreamer job".to_owned(),
+            ));
+        }
+        Ok(self.view.clone())
     }
 
     fn cancel(&mut self, admission: &KernelJobAdmission) -> Result<JobView, DreamerError> {
         let _ = admission;
         Err(DreamerError::KernelAdmissionRequired(
-            "KernelClient cannot forward a session-bound Dreamer cancel".to_owned(),
+            "one-shot dreamer claim admits no cancel yet; worker lifecycle continues in T12-10"
+                .to_owned(),
         ))
     }
 
     fn status(&mut self, admission: &KernelJobAdmission) -> Result<JobView, DreamerError> {
         let _ = admission;
         Err(DreamerError::KernelAdmissionRequired(
-            "KernelClient cannot forward a session-bound Dreamer status".to_owned(),
+            "one-shot dreamer claim admits no status yet; worker lifecycle continues in T12-10"
+                .to_owned(),
         ))
     }
 
     fn reconcile(&mut self, admission: &KernelJobAdmission) -> Result<JobView, DreamerError> {
         let _ = admission;
         Err(DreamerError::KernelAdmissionRequired(
-            "KernelClient cannot forward a session-bound Dreamer reconcile".to_owned(),
+            "one-shot dreamer claim admits no reconcile yet; worker lifecycle continues in T12-10"
+                .to_owned(),
         ))
     }
 }

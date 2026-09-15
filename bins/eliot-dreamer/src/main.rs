@@ -9,20 +9,29 @@ const KERNEL_ADMISSION_EXIT: u8 = 78;
 #[derive(Debug, Serialize)]
 #[serde(tag = "status", rename_all = "snake_case")]
 enum Response {
+    Success { job_id: String, state: String },
     Error { code: &'static str, error: String },
 }
 
 fn main() -> ExitCode {
     let mut output = io::BufWriter::new(io::stdout().lock());
-    let error = match AuthenticatedKernelJobPort::connect() {
-        Ok(_) => DreamerError::KernelAdmissionRequired(
-            "Kernel job claim unexpectedly became available without a session-bound identity"
-                .to_owned(),
-        ),
-        Err(error) => error,
-    };
-    let _ = write_response(&mut output, &error_response(&error));
-    ExitCode::from(KERNEL_ADMISSION_EXIT)
+    match AuthenticatedKernelJobPort::connect() {
+        Ok(port) => {
+            let _ = write_response(&mut output, &success_response(port.claimed_view()));
+            ExitCode::SUCCESS
+        }
+        Err(error) => {
+            let _ = write_response(&mut output, &error_response(&error));
+            ExitCode::from(KERNEL_ADMISSION_EXIT)
+        }
+    }
+}
+
+fn success_response(view: &eliot_dreamer::JobView) -> Response {
+    Response::Success {
+        job_id: view.job_id.clone(),
+        state: "running".to_owned(),
+    }
 }
 
 fn error_response(error: &DreamerError) -> Response {
