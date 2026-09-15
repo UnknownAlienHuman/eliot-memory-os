@@ -28,12 +28,13 @@ mod store_gateway;
 mod testd_front_door;
 
 pub use doctor::{
-    DOCTOR_CONFLICT_MAX_FIELDS, DOCTOR_MAX_ENVELOPE_BYTES, DOCTOR_MAX_LEASE_DURATION_NANOS,
-    DOCTOR_RECOVERY_LEASE_OWNER, DOCTOR_REPAIR_ADVERTISED, DOCTOR_REPAIR_WIRE_ID,
-    DOCTOR_REPAIR_WIRE_VERSION, DoctorAdmissionContext, DoctorRecipeRegistry, DoctorRegistryError,
-    DoctorRepairAdmission, DoctorRepairAttemptRequest, DoctorRepairConflict, DoctorRepairRejection,
-    DoctorRepairRejectionReason, DoctorRepairResponse, RegisteredDoctorRecipe, admit_doctor_repair,
-    advertise_doctor_repair, reconcile_doctor_repair_admission, route_doctor_repair,
+    ComposedDoctorFrontDoor, DOCTOR_CONFLICT_MAX_FIELDS, DOCTOR_MAX_ENVELOPE_BYTES,
+    DOCTOR_MAX_LEASE_DURATION_NANOS, DOCTOR_RECOVERY_LEASE_OWNER, DOCTOR_REPAIR_ADVERTISED,
+    DOCTOR_REPAIR_WIRE_ID, DOCTOR_REPAIR_WIRE_VERSION, DoctorAdmissionContext,
+    DoctorRecipeRegistry, DoctorRegistryError, DoctorRepairAdmission, DoctorRepairAttemptRequest,
+    DoctorRepairConflict, DoctorRepairRejection, DoctorRepairRejectionReason, DoctorRepairResponse,
+    RegisteredDoctorRecipe, admit_doctor_repair, advertise_doctor_repair,
+    reconcile_doctor_repair_admission, route_doctor_repair,
 };
 pub use doctor_front_door::{
     AuthenticatedDoctorSession, handle_doctor_repair_attempt, handle_doctor_repair_cancellation,
