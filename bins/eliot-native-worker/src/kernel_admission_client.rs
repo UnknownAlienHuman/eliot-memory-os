@@ -1500,4 +1500,49 @@ mod tests {
             .unwrap_or(serde_json::Value::Null);
         assert!(fence_missing.is_null());
     }
+
+    /// Close-rule: connecting probes live Kernel health without claiming any
+    /// authority (DW-C owned, Implements #22).
+    ///
+    /// Success proves transport liveness only: a fresh client retains no
+    /// registration, no claim, and no Ready receipt. Without a composed
+    /// front door the bootstrap fails closed as `KernelAdmissionRequired`;
+    /// it never invents authority. Runs by default; no doubles participate.
+    #[test]
+    fn connect_grants_no_authority() {
+        match KernelNativeWorkerClient::connect() {
+            Ok(client) => {
+                assert!(
+                    client.registration.is_none(),
+                    "fresh transport must retain no registration"
+                );
+                assert!(
+                    client.claim.is_none(),
+                    "fresh transport must retain no claimed unit"
+                );
+                assert!(
+                    client.ready.is_none(),
+                    "fresh transport must retain no Ready receipt"
+                );
+            }
+            Err(NativeWorkerError::KernelAdmissionRequired(_)) => {}
+            Err(other) => panic!("connect must stay admission-fail-closed, got {other:?}"),
+        }
+    }
+
+    /// DEPENDS-ON-INTEGRATION: native spawn-to-`Ready` live E2E (DW-C owned).
+    ///
+    /// Once the Kernel contour admits a real claim for a built native-worker
+    /// image and the child submits its typed `ReadinessSubmission` over the
+    /// live front door, the reply must echo the submitted `ready_id`,
+    /// `claim_id`, and admitted decision with no doubles. Ignored until the
+    /// launch edge delivers a real image plus admission on a Windows host;
+    /// it never runs by default and never weakens the fail-closed gate.
+    #[test]
+    #[ignore = "DEPENDS-ON-INTEGRATION: requires live Kernel admission plus a built native-worker image on a Windows host; child side stays fail-closed until then"]
+    fn native_spawn_to_ready_live_echoes_without_doubles() {
+        let client = KernelNativeWorkerClient::connect().expect("live front door must open");
+        assert!(client.registration.is_none());
+        panic!("DEPENDS-ON-INTEGRATION: live Kernel must admit a claim before Ready can submit");
+    }
 }
