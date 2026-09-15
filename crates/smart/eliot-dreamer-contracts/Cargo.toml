@@ -21,10 +21,10 @@ agent_order = 3
 
 [dependencies]
 eliot-contracts.workspace = true
-eliot-context-contracts = { path = "../eliot-context-contracts" }
+eliot-context-contracts = { path = "../eliot-context-contracts", version = "0.1.0" }
 eliot-evaluation-contracts.workspace = true
 eliot-evidence.workspace = true
-eliot-epistemic-contracts = { path = "../eliot-epistemic-contracts" }
+eliot-epistemic-contracts = { path = "../eliot-epistemic-contracts", version = "0.1.0" }
 eliot-receipts.workspace = true
 eliot-security-contracts.workspace = true
 blake3.workspace = true
