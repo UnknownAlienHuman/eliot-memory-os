@@ -1119,6 +1119,33 @@ dependencies = [
 ]
 
 [[package]]
+name = "eliot-dreamer-classification"
+version = "0.1.0"
+dependencies = [
+ "eliot-contracts",
+ "eliot-dreamer-contracts",
+ "eliot-epistemic-contracts",
+ "eliot-evidence",
+ "eliot-receipts",
+ "schemars",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
+name = "eliot-dreamer-concept"
+version = "0.1.0"
+dependencies = [
+ "eliot-contracts",
+ "eliot-dreamer-contracts",
+ "eliot-evidence",
+ "eliot-receipts",
+ "schemars",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "eliot-dreamer-contracts"
 version = "0.1.0"
 dependencies = [
@@ -1160,6 +1187,45 @@ dependencies = [
  "schemars",
  "serde",
  "thiserror",
+]
+
+[[package]]
+name = "eliot-dreamer-episode"
+version = "0.1.0"
+dependencies = [
+ "eliot-contracts",
+ "eliot-dreamer-contracts",
+ "eliot-epistemic-contracts",
+ "eliot-evidence",
+ "eliot-memory-curation-contracts",
+ "eliot-observation-contracts",
+ "eliot-receipts",
+ "schemars",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
+name = "eliot-dreamer-procedure"
+version = "0.1.0"
+dependencies = [
+ "eliot-contracts",
+ "eliot-dreamer-contracts",
+ "eliot-evidence",
+]
+
+[[package]]
+name = "eliot-dreamer-relation"
+version = "0.1.0"
+dependencies = [
+ "eliot-contracts",
+ "eliot-dreamer-contracts",
+ "eliot-epistemic-contracts",
+ "eliot-evidence",
+ "eliot-receipts",
+ "schemars",
+ "serde",
+ "serde_json",
 ]
 
 [[package]]
@@ -1703,6 +1769,19 @@ dependencies = [
  "schemars",
  "serde",
  "serde_json",
+ "thiserror",
+]
+
+[[package]]
+name = "eliot-memory-curation-screen"
+version = "0.1.0"
+dependencies = [
+ "eliot-agent-contracts",
+ "eliot-contracts",
+ "eliot-evidence",
+ "eliot-memory-curation-contracts",
+ "eliot-receipts",
+ "serde",
  "thiserror",
 ]
 
