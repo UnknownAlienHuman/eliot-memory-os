@@ -2478,15 +2478,30 @@ mod windows_transport {
                 maximum: limits.max_frame_bytes,
             })
         })?;
-        if length == 0 || length > limits.max_frame_bytes {
+        // Zero-length and oversize stay distinct terminal observations (coupled
+        // to `FrameDecoder::push`/`decode_frame`): a zero body is
+        // `ZeroLengthFrame`, never fused into `OversizeFrame`.
+        if length == 0 {
+            return Err(TransportError::Protocol(ProtocolError::ZeroLengthFrame));
+        }
+        if length > limits.max_frame_bytes {
             return Err(TransportError::Protocol(ProtocolError::OversizeFrame {
                 actual: length,
                 maximum: limits.max_frame_bytes,
             }));
         }
-        let mut wire = Vec::with_capacity(4 + length);
+        // Exact `4 + length` with overflow check: fail closed before any
+        // body-sized allocation so no attacker-controlled length reaches
+        // `with_capacity`/`resize` unchecked.
+        let total = 4_usize.checked_add(length).ok_or(
+            TransportError::Protocol(ProtocolError::OversizeFrame {
+                actual: usize::MAX,
+                maximum: limits.max_frame_bytes,
+            }),
+        )?;
+        let mut wire = Vec::with_capacity(total);
         wire.extend_from_slice(&prefix);
-        wire.resize(4 + length, 0);
+        wire.resize(total, 0);
         tokio::time::timeout(
             limits.operation_timeout,
             Inner::read_exact_reported(reader, &mut wire[4..]),

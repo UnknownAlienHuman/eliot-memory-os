@@ -1,0 +1,172 @@
+{
+  "work_unit": 791,
+  "family": "ipc-unsafe-boundaries",
+  "wave": "bounded-wave-6",
+  "scope": "crates/kernel/eliot-ipc/src/lib.rs (12 unsafe tokens, 4 families: SDDL conversion x2, LocalFree x3, Tokio SECURITY_ATTRIBUTES handoff x2, borrow_raw x5) + src/frame_codec.rs (zero unsafe tokens; coupled buffer/length/partial-I/O invariants only)",
+  "library": "eliot-ipc",
+  "test_file": "crates/kernel/eliot-ipc/tests/unsafe_family_boundaries.rs",
+  "bounds": {
+    "max_pipe_path_bytes": 240,
+    "max_pipe_name_note": "prefix '\\\\.\\pipe\\eliot\\' plus <=240 path bytes; empty, traversal, separators, NUL, controls rejected by validate_pipe_name before any raw handoff",
+    "max_sddl_utf16_units_incl_nul": 4096,
+    "sddl_note": "encode_sddl_utf16 rejects empty, interior NUL, and oversize before ConvertStringSecurityDescriptorToSecurityDescriptorW; typed-expectation-only input",
+    "max_frame_bytes": "eliot-protocol::MAX_FRAME_BYTES (4194304, fail-closed; zero rejected as ZeroLengthFrame distinct from OversizeFrame)",
+    "wire_total_note": "exact 4 + declared with checked_add; 4+declared == total is the single complete case, > total is Backpressure never truncation"
+  },
+  "sites": [
+    {
+      "site": "PipeSecurityDescriptor::for_principal SDDL conversion (src/lib.rs:1749)",
+      "api": "ConvertStringSecurityDescriptorToSecurityDescriptorW",
+      "bound": "typed-expectation-only SDDL via pipe_security_sddl; encode_sddl_utf16 rejects empty/interior-NUL/oversize over 4096 units; live NUL-terminated buffer for the call; valid out-pointer; ownership transfers only on success with non-null descriptor",
+      "cases": [1, 6]
+    },
+    {
+      "site": "PipeSecurityDescriptor::for_peer_set SDDL conversion (src/lib.rs:1806)",
+      "api": "ConvertStringSecurityDescriptorToSecurityDescriptorW",
+      "bound": "same as for_principal with pipe_security_sddl_for_peer_set sealed peer-set input; encode_sddl_utf16 precondition enforced before the raw call",
+      "cases": [1, 6]
+    },
+    {
+      "site": "PipeSecurityDescriptor::for_principal size-fail release (src/lib.rs:1773)",
+      "api": "LocalFree",
+      "bound": "frame-owned live LocalAlloc descriptor freed exactly once on the pre-Self size-fail path; Self never constructed here so no double-free with Drop",
+      "cases": [6]
+    },
+    {
+      "site": "PipeSecurityDescriptor::for_peer_set size-fail release (src/lib.rs:1830)",
+      "api": "LocalFree",
+      "bound": "same exactly-once pre-Self release as for_principal; success path moves ownership into Self whose Drop frees once",
+      "cases": [6]
+    },
+    {
+      "site": "PipeSecurityDescriptor::drop unique-owner release (src/lib.rs:1889)",
+      "api": "LocalFree",
+      "bound": "private non-Copy/Clone owner; debug_assert non-null; constructors free their own pre-Self failures; Drop runs exactly once per owner (live-OS exact-once proof deferred to audit plus existing Windows tests, no UB probe here)",
+      "cases": [6]
+    },
+    {
+      "site": "NamedPipeServer::create_with_first_instance Tokio handoff (src/lib.rs:1955)",
+      "api": "create_with_security_attributes_raw",
+      "bound": "validate_pipe_name first; security attributes owned by the frame and outliving the synchronous call; OS copies the DACL and retains no pointer; no await inside the borrow",
+      "cases": [1, 6]
+    },
+    {
+      "site": "NamedPipeServer::create_with_peer_set_and_first_instance Tokio handoff (src/lib.rs:1988)",
+      "api": "create_with_security_attributes_raw",
+      "bound": "same validate_pipe_name-first plus live-owner plus OS-copy plus no-await discipline as the principal handoff",
+      "cases": [1, 6]
+    },
+    {
+      "site": "NamedPipeServer::wait_for_authenticated_client borrow (src/lib.rs:2034)",
+      "api": "borrow_raw",
+      "bound": "raw from live self.inner under &mut self so the owner outlives the borrow; both awaits complete before the borrow; sync-only platform call consumes the borrow with no await while borrowed; no move/close/dup/transfer",
+      "cases": [6]
+    },
+    {
+      "site": "NamedPipeServer::wait_for_authenticated_client_with_peer_set borrow (src/lib.rs:2066)",
+      "api": "borrow_raw",
+      "bound": "same outlives-owner plus no-await-while-borrowed plus sync-only platform peer-set call as the principal server borrow",
+      "cases": [6]
+    },
+    {
+      "site": "windows_transport::Inner::authenticate borrow (src/lib.rs:2300)",
+      "api": "borrow_raw",
+      "bound": "raw from live self.client under &mut self; synchronous function so no await can interleave; handle never moved/closed/duplicated/transferred while borrowed",
+      "cases": [6]
+    },
+    {
+      "site": "windows_transport::Inner::authenticate_peer_set borrow (src/lib.rs:2322)",
+      "api": "borrow_raw",
+      "bound": "same &mut self owner-outlives-borrow plus sync-only plus no-transfer discipline as Inner::authenticate",
+      "cases": [6]
+    },
+    {
+      "site": "windows_transport::Inner::authenticate_kernel_front_door borrow (src/lib.rs:2346)",
+      "api": "borrow_raw",
+      "bound": "same owner-outlives plus sync-only plus no-transfer discipline; front-door proof failure maps to UnauthenticatedPeer with no ownership change",
+      "cases": [6]
+    },
+    {
+      "site": "FrameDecoder::push oversize-before-alloc (src/frame_codec.rs)",
+      "api": "FrameDecoder",
+      "bound": "prefix inspected before admitting attacker bytes; declared > max rejected before any body-sized allocation with poisoned-prefix clear for resync; checked_add totals; usize-unrepresentable fails closed",
+      "cases": [4, 5]
+    },
+    {
+      "site": "FrameDecoder::push exact range and one-over (src/frame_codec.rs)",
+      "api": "FrameDecoder",
+      "bound": "exact drain(..total) for one 4+declared frame where total == buffered+incoming; == total is the single complete case; > total is Backpressure never truncation; partial stays buffered",
+      "cases": [2, 3]
+    },
+    {
+      "site": "frame_codec distinct terminals (src/frame_codec.rs)",
+      "api": "ZeroLengthFrame vs OversizeFrame vs Backpressure vs TrailingBytes",
+      "bound": "empty fragment Ok(None) vs partial Ok(None) vs ZeroLengthFrame vs OversizeFrame vs Backpressure (push) / TrailingBytes (decode_frame) never fused",
+      "cases": [4, 5]
+    },
+    {
+      "site": "windows_transport::receive_wire coupled length fix (src/lib.rs)",
+      "api": "validate_pipe_name + FrameDecoder + decode_frame",
+      "bound": "zero length returns ZeroLengthFrame distinct from OversizeFrame; 4+length via checked_add fails closed before with_capacity/resize; oversize rejected before alloc; wire[4..] exact range with read_exact_reported lifetime",
+      "cases": [4, 5]
+    }
+  ],
+  "cases": [
+    {
+      "case": 1,
+      "title": "pipe-name exact maximum and one-over fail closed before raw handoff",
+      "inputs": ["\\\\.\\pipe\\eliot\\kernel\\frontdoor", "<240 x a path> ok", "<241 x a path> rejected", "wrong prefix, empty, traversal, separators, NUL, controls"],
+      "expectation": "validate_pipe_name returns Ok only for the canonical prefix with <=240 path bytes and strict charset; every other form returns InvalidPipeName before create_with_security_attributes_raw"
+    },
+    {
+      "case": 2,
+      "title": "partial prefix then completion uses exact transferred length",
+      "inputs": ["heartbeat wire split in halves", "empty fragment"],
+      "expectation": "FrameDecoder::push returns Ok(None) for empty and first half, Ok(Some(frame)) only when the exact 4+declared bytes arrive; no premature complete frame"
+    },
+    {
+      "case": 3,
+      "title": "one-over trailing is Backpressure never truncation",
+      "inputs": ["exact wire", "wire plus one trailing byte"],
+      "expectation": "push of the exact wire completes; push of wire+1 returns Backpressure; decode_frame of wire+1 returns TrailingBytes; trailing bytes are never silently absorbed"
+    },
+    {
+      "case": 4,
+      "title": "zero, empty, and oversize stay distinct with resync",
+      "inputs": ["[0,0,0,0]", "empty fragment", "declared 4096 with max 2048"],
+      "expectation": "decode_frame zero returns ZeroLengthFrame; empty push returns Ok(None); oversize push returns OversizeFrame and clears so a later valid wire still decodes"
+    },
+    {
+      "case": 5,
+      "title": "bounded malformed input never panics nor reports full success",
+      "inputs": ["empty, short prefix, zero, truncated body, all-0xFF, oversize prefix", "invalid TransportLimits rows"],
+      "expectation": "decode_frame returns Err for every malformed wire; push returns Err or Ok(None) never Ok(Some); invalid limits return InvalidLimits; no panic and no authenticated/full-success state"
+    },
+    {
+      "case": 6,
+      "title": "fixture binds every bounded-wave site and names deferred families",
+      "inputs": ["tests/data/unsafe_family_cases.json"],
+      "expectation": "fixture lists all 12 unsafe sites plus coupled frame-codec bounds with cases 1..6, and enumerates deferred live-OS/cancellation/Send-Sync/unwind/migration families as not implemented in this wave"
+    }
+  ],
+  "deferred_families_not_implemented_this_wave": [
+    "live-OS SDDL conversion success allocation proof (requires real ConvertStringSecurityDescriptorToSecurityDescriptorW success; covered by audit plus existing Windows pipe tests, no UB probe here)",
+    "live-OS LocalFree Drop exact-once proof under panic/timeout/disconnect (audit plus existing tests; no deliberate invalid-pointer execution)",
+    "live-OS Tokio handoff DACL-copy retention proof (OS copies DACL; no retained-pointer observation in this wave)",
+    "live-OS borrow_raw lifetime interleaving with await/cancel/timeout (no await-while-borrowed by construction; racing completion deferred)",
+    "cancellation before submit, pending, after completion, and racing completion (issue 791/10)",
+    "timeout/disconnect unknown-outcome blocks premature reuse (issue 791/11)",
+    "late/duplicate completion isolation for a new frame/session (issue 791/12)",
+    "unsafe Send/Sync/thread-affinity witness where actually present (issue 791/15)",
+    "callback/FFI unwind safety where actually present (issue 791/16)",
+    "no raw entrypoint bypasses the safe wrapper beyond the audited 12 tokens (issue 791/17; full denominator re-scan deferred)",
+    "exact ADR accepted/migration-family match and destination/predecessor evidence (issue 791/18, 791/19; migration remains incomplete until accepted)",
+    "full 22-case matrix remainder (issue 791/1, 791/2, 791/3, 791/5, 791/9, 791/13, 791/14, 791/21, 791/22 beyond the bounded 1..6)"
+  ],
+  "notes": [
+    "Bounded wave only: 6 focused tests proving the bounds added here (pipe-name caps, exact partial/one-over, zero-vs-empty, oversize-before-alloc, no-panic, fixture binding). Remaining families are deferred residuals listed above, not implemented now.",
+    "Real code only: tests call the real public eliot-ipc API; no mocks, no UB probes, no pointer forging, no unsafe in the test file.",
+    "Fail-closed everywhere: invalid or overlong input returns InvalidPipeName/InvalidLimits/ZeroLengthFrame/OversizeFrame/Backpressure/TrailingBytes/PartialFrame; malformed input never panics nor yields Ok(frame).",
+    "frame_codec.rs has zero unsafe tokens and stays that way; the only production change in this wave is the coupled receive_wire distinct-zero plus checked_add total in src/lib.rs."
+  ]
+}
