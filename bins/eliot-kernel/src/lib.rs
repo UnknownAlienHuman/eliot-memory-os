@@ -138,18 +138,23 @@ use std::time::Duration;
 /// DISPATCH-CONTOUR-2 Slice B launch contour (issues #461 and #22).
 ///
 /// The composed dispatch owner plus admit-then-launch through the admitted
-/// process executor, parameterized once for the Doctor and testd one-shot
-/// workers. The front-door dispatch arm admits through this contour; the
-/// production caller composes and launches through it.
+/// process executor, parameterized once for the Doctor, testd, and
+/// native-worker one-shot workers. The front-door dispatch arm admits
+/// through this contour; the production caller composes and launches
+/// through it.
 pub use dispatch_launch::{
-    ChildStartOutcome, DispatchLaunchError, DispatchedWorkerKind, DoctorLaunchMaterial,
-    DoctorLaunchOutcome, DoctorLaunchSkip, PreparedDoctorLaunch, PreparedTestdLaunch,
-    ReadyDoctorLaunch, ReadyTestdLaunch, ReconcileLaunchedOutcome, SpawnedChild,
-    TestdLaunchMaterial, TestdLaunchOutcome, TestdLaunchSkip, UncertainSpawn,
-    compose_dispatch_contour, compose_doctor_front_door, dispatch_contour,
-    doctor_repair_advertised, launch_admitted_doctor_attempt, launch_admitted_testd_attempt,
-    prepare_doctor_launch, prepare_testd_launch, reconcile_launched_doctor_attempt,
-    reconcile_launched_testd_attempt, release_launched_attempt, start_ready_doctor_launch,
+    ChildStartOutcome, DispatchGrant, DispatchLaunchError, DispatchedWorkerKind,
+    DoctorLaunchMaterial, DoctorLaunchOutcome, DoctorLaunchSkip, NativeWorkerLaunchMaterial,
+    NativeWorkerLaunchOutcome, NativeWorkerLaunchSkip, PreparedDoctorLaunch,
+    PreparedNativeWorkerLaunch, PreparedTestdLaunch, ReadyDoctorLaunch, ReadyNativeWorkerLaunch,
+    ReadyTestdLaunch, ReconcileLaunchedOutcome, SpawnedChild, TestdLaunchMaterial,
+    TestdLaunchOutcome, TestdLaunchSkip, UncertainSpawn, compose_dispatch_contour,
+    compose_doctor_front_door, dispatch_contour, doctor_repair_advertised,
+    launch_admitted_doctor_attempt, launch_admitted_native_worker_attempt,
+    launch_admitted_testd_attempt, prepare_doctor_launch, prepare_native_worker_launch,
+    prepare_testd_launch, reconcile_launched_doctor_attempt,
+    reconcile_launched_native_worker_attempt, reconcile_launched_testd_attempt,
+    release_launched_attempt, start_ready_doctor_launch, start_ready_native_worker_launch,
     start_ready_testd_launch,
 };
 use eliot_contracts::{
@@ -201,6 +206,21 @@ pub use eliot_kernel_service::{
     TestdAdmission, TestdAdmissionAttemptRequest, TestdAdmissionContext, TestdAdmissionEnvelope,
     TestdAdmissionResponse, handle_testd_admission_attempt, reconcile_testd_admission,
     route_testd_admission,
+};
+/// P-07 native-worker claim wire seam for the front-door dispatch/driver arms
+/// (DISPATCH-CAUSE-FIX, issues #461/#20/#22).
+///
+/// The session binder (`front_door_session`) and the dispatch contour
+/// (`dispatch_launch`) depend only on these existing
+/// `protocol/native_worker_claim.rs` + `lifecycle.rs` symbols. Slice
+/// DISPATCH-CAUSE-FIX admits through the composed dispatch contour
+/// (`dispatch_launch`, over `KernelService::admit_native_worker_claim`) and
+/// binds the module through the same front-door session mechanism
+/// Doctor/Testd use (no dedicated `AuthenticatedNativeWorkerSession` type
+/// exists on this base).
+pub use eliot_kernel_service::{
+    NATIVE_WORKER_CLAIM_WIRE_ID, NATIVE_WORKER_CLAIM_WIRE_VERSION, NativeWorkerClaimReceipt,
+    NativeWorkerClaimRequest, NativeWorkerClaimResponse,
 };
 #[cfg(test)]
 use eliot_ors::CanonicalEvidenceProvider;

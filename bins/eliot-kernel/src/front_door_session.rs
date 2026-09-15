@@ -44,6 +44,26 @@ pub(crate) const DOCTOR_MODULE_ID: &str = "eliot-doctor";
 /// session scope here. Invalid peer or epoch gets no protected input.
 pub(crate) const TESTD_MODULE_ID: &str = "eliot-testd";
 
+/// Stable module identity of the one-shot native-worker claim worker
+/// (DISPATCH-CAUSE-FIX, issues #461/#20/#22).
+///
+/// The native worker never self-asserts authority through this string:
+/// [`KernelComposition::bind_session`] admits it only over an already
+/// pipe-authenticated peer whose `ClientHello` is proven generation-bound
+/// against the live server policy by
+/// [`KernelComposition::validate_native_worker_client_binding`].
+///
+/// NOTE (front-door reuse): no dedicated `AuthenticatedNativeWorkerSession`
+/// type exists on this base, so the module binds through the same
+/// front-door session mechanism Doctor/Testd use (generation-bound
+/// `ClientHello` proof plus least-privilege capabilities intersected down
+/// to the single admitted native-worker claim wire). See
+/// [`KernelComposition::bind_native_worker_session`].
+///
+/// NOTE (platform boundary): like Doctor/Testd, the native worker rides an
+/// already-authenticated pipe peer until a dedicated OS role lands.
+pub(crate) const NATIVE_MODULE_ID: &str = "eliot-native-worker";
+
 /// The only transport implementation admitted by the Windows-first Kernel.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(super) enum IpcImplementation {
@@ -264,6 +284,15 @@ impl KernelComposition {
             // are proven against live server policy inside; nothing
             // client-asserted becomes authority.
             return self.bind_testd_session(connection_id, peer, client);
+        }
+        if client.module_bridge_identity == NATIVE_MODULE_ID {
+            // The one-shot native-worker claim worker binds at session scope
+            // over its already pipe-authenticated peer through the same
+            // front-door session mechanism Doctor/Testd use: no dedicated
+            // AuthenticatedNativeWorkerSession type exists on this base.
+            // Generation/epoch/artifact are proven against live server
+            // policy inside; nothing client-asserted becomes authority.
+            return self.bind_native_worker_session(connection_id, peer, client);
         }
         let policy = self
             .front_door_policy
@@ -533,6 +562,103 @@ impl KernelComposition {
     /// extends this check; until then the live generation/epoch/artifact join
     /// above plus pipe authentication is the gate.
     fn validate_testd_client_binding(
+        policy: &ServerHandshakePolicy,
+        client: &eliot_protocol::ClientHello,
+    ) -> Result<(), TransportError> {
+        if client.module_generation.generation != policy.module_generation.generation
+            || client.module_generation.artifact_id != policy.module_generation.artifact_id
+            || client.artifact_hash != policy.module_generation.artifact_id
+            || !client
+                .authority_epoch
+                .is_same_authority(&policy.module_generation.state_fence.authority_epoch)
+            || !client
+                .module_generation
+                .state_fence
+                .is_compatible_with(&policy.module_generation.state_fence)
+        {
+            return Err(TransportError::SessionFenced);
+        }
+        Ok(())
+    }
+
+    /// Binds an authenticated native-worker claim worker to a
+    /// least-privilege session.
+    ///
+    /// Reuses the exact Doctor/Testd front-door session mechanism: the
+    /// presenting pipe peer was already authenticated by the listener's peer
+    /// set, and this entry proves the native-worker `ClientHello`
+    /// generation-bound against the live server policy (exact generation,
+    /// exact artifact, same-authority epoch, compatible fence) before
+    /// establishing the transport session. Capabilities are intersected down
+    /// to the single admitted native-worker claim wire
+    /// (`eliot.kernel.native-worker-claim`) and effects are never
+    /// session-bound: execution authority arrives only per claim through a
+    /// Kernel-minted admission. No dedicated
+    /// `AuthenticatedNativeWorkerSession` type exists on this base; this is
+    /// the same session shape Doctor/Testd use.
+    fn bind_native_worker_session(
+        &self,
+        connection_id: impl Into<String>,
+        peer: PeerIdentity,
+        client: &eliot_protocol::ClientHello,
+    ) -> Result<HandshakeResult, eliot_ipc::TransportError> {
+        let connection_id = connection_id.into();
+        if connection_id.trim().is_empty() || connection_id.chars().any(char::is_control) {
+            return Err(TransportError::SessionFenced);
+        }
+        peer.validate()
+            .map_err(|_| TransportError::PeerIdentityUnavailable)?;
+        let policy = self
+            .front_door_policy
+            .lock()
+            .map_err(|_| TransportError::SessionFenced)?
+            .clone();
+        Self::validate_native_worker_client_binding(&policy, client)?;
+        let mut session = Session::establish(connection_id, peer, client, policy.protocol_range)?;
+        session.capabilities = vec![NATIVE_WORKER_CLAIM_WIRE_ID.to_owned()];
+        session
+            .privacy_classes
+            .retain(|class| policy.allowed_privacy_classes.contains(class));
+        session.effects = Vec::new();
+        let server_hello = eliot_protocol::ServerHello {
+            selected_protocol: session.protocol_version,
+            session_principal_binding: policy.session_principal_binding.clone(),
+            allowed_capabilities: session.capabilities.clone(),
+            allowed_effects: Vec::new(),
+            config_snapshot: policy.config_snapshot.clone(),
+            heartbeat_ms: policy.heartbeat_ms,
+            control_channel: policy.control_channel.clone(),
+            rejection_reason: None,
+            authority_epoch: policy.module_generation.state_fence.authority_epoch.clone(),
+        };
+        server_hello
+            .validate()
+            .map_err(|_| TransportError::SessionFenced)?;
+        Ok(HandshakeResult {
+            capabilities: session.capabilities.clone(),
+            privacy_classes: session.privacy_classes.clone(),
+            effects: Vec::new(),
+            session,
+            server_hello,
+        })
+    }
+
+    /// Proves a native-worker `ClientHello` generation-bound against live
+    /// server policy.
+    ///
+    /// Every native-worker-asserted value is compared against the
+    /// server-owned policy; nothing is copied into authority. The exact
+    /// generation and artifact must match, the epoch must be the same
+    /// authority, and the presented fence must be compatible with the live
+    /// fence, so a stale or foreign generation can never bind.
+    ///
+    /// NOTE (bootstrap binding): there is no native-worker launch descriptor
+    /// on this base, so no caller launch nonce is adopted as authority here.
+    /// A later slice binds the native-worker bootstrap nonce to its durable
+    /// claim record and extends this check; until then the live
+    /// generation/epoch/artifact join above plus pipe authentication is the
+    /// gate — the same shape Doctor/Testd use.
+    fn validate_native_worker_client_binding(
         policy: &ServerHandshakePolicy,
         client: &eliot_protocol::ClientHello,
     ) -> Result<(), TransportError> {
