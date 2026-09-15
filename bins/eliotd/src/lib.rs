@@ -62,6 +62,13 @@ pub use daemon_config::DaemonConfig;
 pub use daemon_kernel_client::DaemonKernelClient;
 pub use daemon_kernel_client::OwnerSessionFacts;
 pub(crate) use daemon_kernel_client::kernel_port_error;
+#[cfg(test)]
+pub(crate) use daemon_kernel_client::{KernelClientError, WireOutcome, operation_payload};
+#[cfg(all(test, windows))]
+pub(crate) use daemon_kernel_client::{
+    is_pre_admission_pending_rejection, retry_pre_admission, validate_server_hello,
+};
+pub(crate) use daemon_kernel_port_adapters::kind_value;
 pub use dreamer_admission::{
     DREAMER_JOB_WIRE_ID, DreamerJobQueue, GovernorDreamerAdapter, KernelDreamerJobQueue,
     OrientationSubmitInput,
@@ -74,15 +81,8 @@ pub use dreamer_materials::{
     OrientationMaterialBudget, freeze_orientation_manifest, resolve_source_claim,
     verify_resolved_bytes,
 };
-#[cfg(test)]
-pub(crate) use daemon_kernel_client::{KernelClientError, WireOutcome, operation_payload};
-#[cfg(all(test, windows))]
-pub(crate) use daemon_kernel_client::{
-    is_pre_admission_pending_rejection, retry_pre_admission, validate_server_hello,
-};
-pub(crate) use daemon_kernel_port_adapters::kind_value;
-pub(crate) use kernel_authority_client::KernelAuthorityClient;
 pub use governor_local_read::{answer_evidence_query, answer_projection_inputs};
+pub(crate) use kernel_authority_client::KernelAuthorityClient;
 pub use kernel_context_read_client::KernelContextReadClient;
 pub use store_failure_projection::{GovernorStoreFailureProjection, GovernorStoreProjectionError};
 
