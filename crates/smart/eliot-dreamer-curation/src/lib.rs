@@ -2,10 +2,11 @@
 //!
 //! Pure typed router over an already A-05-validated curation batch, the exact
 //! immutable A-19c screen binding, and an injected A-03 handler registry with
-//! one live port per handler family. Every eligible dispatchable item invokes
-//! exactly one semantic owner; the returned envelope is preserved without
-//! fallback, retry, sibling calls, or semantic recomputation, and the batch
-//! aggregates into a deterministic lineage-preserving candidate set.
+//! one live hub-native port per handler family. Every eligible dispatchable
+//! item invokes exactly one semantic owner; the returned full result content
+//! is sealed and preserved without fallback, retry, sibling calls, or
+//! semantic recomputation, and the batch aggregates into a deterministic
+//! lineage-preserving candidate set.
 //!
 //! Cell `smart.dreamer.curation`, order 31. Inputs are immutable and
 //! caller-supplied; every identity, receipt, screen, registry, policy, budget,
@@ -29,11 +30,12 @@ use eliot_contracts::{StateFence, canonical_json_bytes, sha256_hex};
 use eliot_dreamer_contracts::error::{check_fence, is_hex64_lower, sorted_set_eq};
 use eliot_dreamer_contracts::job::{PRIVACY_GOVERNED_EXTERNAL, PRIVACY_LOCAL_ONLY};
 use eliot_dreamer_contracts::{
-    AtomicityMode, BudgetLimits, BudgetUsage, CURATION_FAMILIES, CandidateDisposition,
-    ContractViolation, CurationFamily, CurationHandlerPort, CurationHandlerRegistry, CurationKind,
-    CurationRejectionCode, Requester, ScreenBinding, ScreenState, TargetDenominator,
-    TypedCurationHandlerRequest, TypedCurationHandlerResult, ValidatedCurationItem,
-    ValidationReceipt, family_of, parse_family,
+    AtomicityMode, BoundCurationCall, BudgetLimits, BudgetUsage, CURATION_FAMILIES,
+    CandidateDisposition, ContractViolation, CurationFamily, CurationHandlerPort,
+    CurationHandlerRegistry, CurationKind, CurationRejectionCode, FullCurationResult,
+    ProducedCurationContent, Requester, ScreenBinding, ScreenState, TargetDenominator,
+    TypedCurationHandlerRequest, ValidatedCurationItem, ValidationReceipt, family_of, parse_family,
+    request_digest_of,
 };
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
@@ -271,17 +273,14 @@ impl core::fmt::Display for CurationRoutingError {
             Self::Port { detail } => write!(f, "port: {detail}"),
             Self::Policy { detail } => write!(f, "policy: {detail}"),
             Self::Denominator { detail } => write!(f, "denominator: {detail}"),
-            Self::Handler {
-                handler_id,
-                detail,
-            } => write!(f, "handler[{handler_id}]: {detail}"),
+            Self::Handler { handler_id, detail } => write!(f, "handler[{handler_id}]: {detail}"),
             Self::HandlerPanicked { handler_id } => {
-                write!(f, "handler[{handler_id}] panicked: terminal, no alternate handler")
+                write!(
+                    f,
+                    "handler[{handler_id}] panicked: terminal, no alternate handler"
+                )
             }
-            Self::Envelope {
-                handler_id,
-                detail,
-            } => write!(f, "envelope[{handler_id}]: {detail}"),
+            Self::Envelope { handler_id, detail } => write!(f, "envelope[{handler_id}]: {detail}"),
             Self::Atomicity { detail } => write!(f, "atomicity: {detail}"),
             Self::Digest { detail } => write!(f, "digest: {detail}"),
         }
@@ -645,49 +644,54 @@ pub fn compute_input_digest(
         })
 }
 
-/// Live semantic owner behind one injected port.
+/// Live semantic owner behind one hub-native port.
 ///
-/// The trait is the production port contract: implementors are the ten
-/// concrete subtype owners (or faithful test doubles counting real calls).
-/// The router calls [`CurationHandler::handle`] exactly once per dispatchable
-/// item and treats any returned error as terminal.
-pub trait CurationHandler {
-    /// Handles one typed curation request, preserving its envelope bindings.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`CurationRoutingError`] when the owner cannot form a
-    /// candidate; the router preserves the failure terminally with no retry,
-    /// no fallback, and no sibling call.
-    fn handle(
-        &self,
-        request: &TypedCurationHandlerRequest,
-    ) -> Result<TypedCurationHandlerResult, CurationRoutingError>;
-}
+/// H1 follow-up migration (deferred by the hub binding): the A-31 local port
+/// trait (`CurationHandler::handle`, typed request in, digest-only result
+/// envelope out) is retired in favor of the hub native binding
+/// [`NativeCurationHandler::handle`] (frozen [`BoundCurationCall`] in, full
+/// [`ProducedCurationContent`] out). Implementors are the ten concrete
+/// subtype owners (or faithful test doubles counting real calls). The router
+/// calls the selected owner exactly once per dispatchable item, validates the
+/// produced content against the bound call, seals a [`FullCurationResult`],
+/// and treats any failure as terminal.
+///
+/// Boundary: the hub `invoke()` acceptance leg (`ValidatedCurationItem::accept`
+/// over job, bundle, grounded draft, and screen) stays at the composition
+/// layer and is not replayed here. It binds the screen `item_digest` to one
+/// per-item digest, while A-31 routes many distinct items under one
+/// batch-shared screen; replaying it per item would fail closed on every
+/// multi-item batch. A-31 keeps its batch-level acceptance (batch envelope,
+/// screen binding, closed registry, owner pins, budgets, sealed input digest,
+/// per-item uniformity and denominator gates) and hands the frozen call view
+/// to the hub handler contract.
+pub use eliot_dreamer_contracts::NativeCurationHandler;
 
-/// One injected live port: an A-03 port descriptor bound to its owner package,
-/// revision, and live handler.
+/// One hub-native live port: an A-03 port descriptor bound to its owner
+/// package, revision, and live hub-native handler.
 ///
 /// Ports are live injection handles, never serialized: digests pin them
 /// instead. No discovery, no default family, no trial decode.
-pub struct InjectedCurationPort<'a> {
+pub struct NativeCurationPort<'a> {
     /// A-03 port identity bound to one owner descriptor.
     pub port: CurationHandlerPort,
     /// Owner package identity; must equal the closed routing table.
     pub owner_package: String,
     /// Owner revision identity; must equal the batch pin for the family.
     pub owner_revision: String,
-    /// Live handler invoked exactly once per dispatched item of the family.
-    pub handler: &'a dyn CurationHandler,
+    /// Live hub-native handler invoked exactly once per dispatched item of
+    /// the family, receiving the frozen hub call view.
+    pub handler: &'a dyn NativeCurationHandler,
 }
 
-/// Exactly one live port per owner family, validated against the registry.
-pub struct CurationPortSet<'a> {
-    /// Ten injected ports, one per canonical family.
-    pub ports: Vec<InjectedCurationPort<'a>>,
+/// Exactly one live hub-native port per owner family, validated against the
+/// registry.
+pub struct NativeCurationPortSet<'a> {
+    /// Ten injected hub-native ports, one per canonical family.
+    pub ports: Vec<NativeCurationPort<'a>>,
 }
 
-impl CurationPortSet<'_> {
+impl NativeCurationPortSet<'_> {
     /// Validates the port set against the closed registry and batch pins.
     ///
     /// Requires exactly ten ports covering each canonical family once, with
@@ -714,7 +718,7 @@ impl CurationPortSet<'_> {
             });
         }
         for family in &families {
-            let matching: Vec<&InjectedCurationPort<'_>> = self
+            let matching: Vec<&NativeCurationPort<'_>> = self
                 .ports
                 .iter()
                 .filter(|port| port.port.descriptor.family == *family)
@@ -726,10 +730,7 @@ impl CurationPortSet<'_> {
             };
             if matching.len() != 1 {
                 return Err(CurationRoutingError::Port {
-                    detail: std::format!(
-                        "duplicate live ports for family {}",
-                        family.as_str()
-                    ),
+                    detail: std::format!("duplicate live ports for family {}", family.as_str()),
                 });
             }
             injected
@@ -738,10 +739,7 @@ impl CurationPortSet<'_> {
                 .map_err(|err| CurationRoutingError::Port {
                     detail: contract_detail(&err),
                 })?;
-            let Some(declared) = registry
-                .handlers
-                .iter()
-                .find(|item| item.family == *family)
+            let Some(declared) = registry.handlers.iter().find(|item| item.family == *family)
             else {
                 return Err(CurationRoutingError::Port {
                     detail: std::format!(
@@ -931,10 +929,14 @@ impl CurationMemberOutcome {
         check_bounded_text(&self.handler_id, "handler_id", MAX_ID_BYTES)
             .map_err(|_| failed("handler_id is blank, controlled, or overlong"))?;
         if family_of(self.kind) != self.family {
-            return Err(failed("member kind and family disagree on the closed mapping"));
+            return Err(failed(
+                "member kind and family disagree on the closed mapping",
+            ));
         }
         if self.rejection_hint != routing_rejection_hint(self.disposition) {
-            return Err(failed("member rejection hint disagrees with its disposition"));
+            return Err(failed(
+                "member rejection hint disagrees with its disposition",
+            ));
         }
         if self.calls > 1 {
             return Err(failed("member calls must be exactly zero or one"));
@@ -1033,7 +1035,8 @@ pub struct CurationCandidateSet {
     pub proof_note: String,
 }
 
-impl CurationCandidateSet {    /// Validates intrinsic set shape, count reconciliation, and digest.
+impl CurationCandidateSet {
+    /// Validates intrinsic set shape, count reconciliation, and digest.
     ///
     /// # Errors
     ///
@@ -1132,7 +1135,9 @@ impl CurationCandidateSet {    /// Validates intrinsic set shape, count reconcil
             || self.blocked != blocked
             || self.unprocessed != unprocessed
         {
-            return Err(failed("accepted, rejected, blocked, and unprocessed must reconcile"));
+            return Err(failed(
+                "accepted, rejected, blocked, and unprocessed must reconcile",
+            ));
         }
         if self.total_handler_calls != total_calls {
             return Err(failed("total handler calls must equal the per-member sum"));
@@ -1177,11 +1182,7 @@ impl CurationCandidateSet {    /// Validates intrinsic set shape, count reconcil
             .map(String::as_str)
             .collect();
         omitted.sort_unstable();
-        let retained_omitted: Vec<&str> = self
-            .omitted_targets
-            .iter()
-            .map(String::as_str)
-            .collect();
+        let retained_omitted: Vec<&str> = self.omitted_targets.iter().map(String::as_str).collect();
         if omitted != retained_omitted {
             return Err(failed(
                 "omitted targets must name exactly the uncovered denominator members",
@@ -1190,9 +1191,9 @@ impl CurationCandidateSet {    /// Validates intrinsic set shape, count reconcil
         if !is_sorted_unique(&self.omitted_targets) {
             return Err(failed("omitted targets must be sorted and unique"));
         }
-        let recomputed = self.compute_set_digest().map_err(|_| {
-            failed("set digest inputs cannot be canonically serialized")
-        })?;
+        let recomputed = self
+            .compute_set_digest()
+            .map_err(|_| failed("set digest inputs cannot be canonically serialized"))?;
         if recomputed != self.set_digest {
             return Err(failed("set digest does not recompute"));
         }
@@ -1202,8 +1203,7 @@ impl CurationCandidateSet {    /// Validates intrinsic set shape, count reconcil
     fn compute_set_digest(&self) -> Result<String, CurationRoutingError> {
         let mut members = Vec::with_capacity(self.members.len());
         for member in &self.members {
-            let mut targets: Vec<&str> =
-                member.targets.iter().map(String::as_str).collect();
+            let mut targets: Vec<&str> = member.targets.iter().map(String::as_str).collect();
             targets.sort_unstable();
             let mut evidence_refs: Vec<&str> =
                 member.evidence_refs.iter().map(String::as_str).collect();
@@ -1316,29 +1316,31 @@ struct SetDigestView<'a> {
 /// the sealed input digest. Cancellation or a breached deadline then returns
 /// an orderly set with the exact unprocessed frontier and zero handler calls.
 /// Otherwise every item is gated against the exact screened denominator and
-/// dispatched to exactly one owner port, called once, with the returned
-/// envelope checked and preserved. Aggregation honors the batch atomicity
+/// dispatched to exactly one hub-native owner port, called once with the
+/// frozen hub call view, with the produced full content validated and sealed.
+/// Aggregation honors the batch atomicity
 /// against the routing policy: all-or-nothing fails on any non-candidate
 /// member, while an explicit-partial policy retains exact accepted, rejected,
 /// blocked, and unprocessed accounting with frontier and omissions.
 ///
 /// A-05 common validation and A-19c screening are never invoked here; only
 /// their sealed outputs are checked. No sibling handler is imported: owners
-/// arrive exclusively through `ports`.
+/// arrive exclusively through `ports` as hub-native handlers behind the frozen
+/// hub call view.
 ///
 /// # Errors
 ///
 /// Returns [`CurationRoutingError`] on any binding, registry, port, budget,
-/// digest, handler, envelope, or atomicity failure. Handler errors, panics,
-/// and envelope mismatches are terminal with no retry, no fallback, and no
-/// sibling call.
+/// digest, handler, content, sealing, or atomicity failure. Handler errors,
+/// content drift, panics, and sealing mismatches are terminal with no retry,
+/// no fallback, and no sibling call.
 #[allow(clippy::too_many_lines)]
 pub fn route_validated_curation(
     batch: &ValidatedCurationBatch,
     screen: &ScreenBinding,
     registry: &CurationHandlerRegistry,
     policy: &RoutingPolicy,
-    ports: &CurationPortSet<'_>,
+    ports: &NativeCurationPortSet<'_>,
 ) -> Result<CurationCandidateSet, CurationRoutingError> {
     batch.validate()?;
     policy.validate()?;
@@ -1383,7 +1385,13 @@ pub fn route_validated_curation(
         });
     }
     if batch.cancelled {
-        return unprocessed_set(batch, screen, &registry_digest, policy, "cancelled before dispatch");
+        return unprocessed_set(
+            batch,
+            screen,
+            &registry_digest,
+            policy,
+            "cancelled before dispatch",
+        );
     }
     if deadline_hit(batch) {
         return unprocessed_set(
@@ -1402,7 +1410,14 @@ pub fn route_validated_curation(
             field: "items",
             detail: "batch index exceeds u32".to_owned(),
         })?;
-        members.push(dispatch_item(batch, screen, ports, position, item)?);
+        members.push(dispatch_item(
+            batch,
+            screen,
+            ports,
+            &registry_digest,
+            position,
+            item,
+        )?);
     }
     aggregate(batch, screen, &registry_digest, policy, members)
 }
@@ -1411,9 +1426,11 @@ fn validate_screen_binding(
     screen: &ScreenBinding,
     batch: &ValidatedCurationBatch,
 ) -> Result<(), CurationRoutingError> {
-    screen.validate().map_err(|_| CurationRoutingError::Screen {
-        detail: std::format!("screen binding is not eligible: {}", screen.state.reason()),
-    })?;
+    screen
+        .validate()
+        .map_err(|_| CurationRoutingError::Screen {
+            detail: std::format!("screen binding is not eligible: {}", screen.state.reason()),
+        })?;
     if screen.state != ScreenState::Eligible {
         return Err(CurationRoutingError::Screen {
             detail: std::format!("screen state is not eligible: {}", screen.state.reason()),
@@ -1518,7 +1535,10 @@ fn check_item_uniformity(batch: &ValidatedCurationBatch) -> Result<(), CurationR
             detail: std::format!("item {position}: {detail}"),
         };
         if item.receipt != batch.receipt {
-            return Err(failed("receipt", "item receipt drifts from the batch receipt"));
+            return Err(failed(
+                "receipt",
+                "item receipt drifts from the batch receipt",
+            ));
         }
         if item.task_id != batch.task_id {
             return Err(failed("task_id", "item task drifts from the batch task"));
@@ -1571,10 +1591,10 @@ fn check_batch_denominator(batch: &ValidatedCurationBatch) -> Result<(), Curatio
 }
 
 fn resolve_port<'port>(
-    ports: &'port CurationPortSet<'port>,
+    ports: &'port NativeCurationPortSet<'port>,
     family: CurationFamily,
-) -> Result<&'port InjectedCurationPort<'port>, CurationRoutingError> {
-    let mut found: Option<&'port InjectedCurationPort<'port>> = None;
+) -> Result<&'port NativeCurationPort<'port>, CurationRoutingError> {
+    let mut found: Option<&'port NativeCurationPort<'port>> = None;
     for port in &ports.ports {
         if port.port.descriptor.family == family {
             if found.is_some() {
@@ -1619,7 +1639,8 @@ fn blocked_member(
 fn dispatch_item(
     batch: &ValidatedCurationBatch,
     screen: &ScreenBinding,
-    ports: &CurationPortSet<'_>,
+    ports: &NativeCurationPortSet<'_>,
+    registry_digest: &str,
     position: u32,
     item: &ValidatedCurationItem,
 ) -> Result<CurationMemberOutcome, CurationRoutingError> {
@@ -1675,27 +1696,42 @@ fn dispatch_item(
         ));
     }
     let handler_id = port.port.descriptor.handler_id.clone();
-    let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        port.handler.handle(&request)
-    }));
-    let result = match outcome {
+    let call = BoundCurationCall {
+        port: port.port.clone(),
+        item: item.clone(),
+        request: request.clone(),
+        registry_digest: registry_digest.to_owned(),
+    };
+    if let Err(err) = call.validate() {
+        return Err(CurationRoutingError::Envelope {
+            handler_id: handler_id.clone(),
+            detail: redact(&err.to_string()),
+        });
+    }
+    let outcome =
+        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| port.handler.handle(&call)));
+    let content: ProducedCurationContent = match outcome {
         Err(_) => {
             return Err(CurationRoutingError::HandlerPanicked {
                 handler_id: handler_id.clone(),
             });
         }
-        Ok(Err(err)) => {
-            return Err(err);
+        Ok(Err(violation)) => {
+            return Err(CurationRoutingError::Handler {
+                handler_id: handler_id.clone(),
+                detail: redact(&violation.to_string()),
+            });
         }
-        Ok(Ok(result)) => result,
+        Ok(Ok(content)) => content,
     };
-    check_result_envelope(&request, &result, &handler_id)?;
-    let request_digest = sha256_hex(
-        &canonical_json_bytes(&request).map_err(|err| CurationRoutingError::Digest {
+    content
+        .validate_for(&call)
+        .map_err(|err| CurationRoutingError::Envelope {
+            handler_id: handler_id.clone(),
             detail: redact(&err.to_string()),
-        })?,
-    );
-    let disposition = RoutingDisposition::from(result.disposition);
+        })?;
+    let result = seal_full_result(item, &call, content)?;
+    let disposition = RoutingDisposition::from(result.content.disposition);
     Ok(CurationMemberOutcome {
         member_id,
         item_index: position,
@@ -1705,52 +1741,65 @@ fn dispatch_item(
         disposition,
         rejection_hint: routing_rejection_hint(disposition),
         calls: 1,
-        request_digest: Some(request_digest),
+        request_digest: Some(result.request_digest.clone()),
         result_digest: Some(result.result_digest.clone()),
         targets: item.payload.facets().targets.clone(),
         evidence_refs: item.payload.facets().evidence_refs.clone(),
-        note: redact("selected owner envelope preserved without recomputation"),
+        note: redact("selected owner content sealed and preserved without recomputation"),
     })
 }
 
-fn check_result_envelope(
-    request: &TypedCurationHandlerRequest,
-    result: &TypedCurationHandlerResult,
-    handler_id: &str,
-) -> Result<(), CurationRoutingError> {
-    let failed = |detail: String| CurationRoutingError::Envelope {
-        handler_id: handler_id.to_owned(),
-        detail,
+/// Seals the produced full content into a hub [`FullCurationResult`].
+///
+/// Identities, fence, and digests are preserved from the frozen bound call;
+/// both digests are recomputed over the canonical content, never trusted from
+/// the handler. A digest alone is never content: the sealed result carries
+/// the complete typed payload, preservation evidence, and role separation.
+///
+/// # Errors
+///
+/// Returns [`CurationRoutingError::Digest`] when canonical serialization
+/// fails and [`CurationRoutingError::Envelope`] when the sealed result does
+/// not validate.
+fn seal_full_result(
+    item: &ValidatedCurationItem,
+    call: &BoundCurationCall,
+    content: ProducedCurationContent,
+) -> Result<FullCurationResult, CurationRoutingError> {
+    let handler_id = call.port.descriptor.handler_id.clone();
+    let request_digest =
+        request_digest_of(&call.request).map_err(|err| CurationRoutingError::Digest {
+            detail: redact(&err.to_string()),
+        })?;
+    let mut result = FullCurationResult {
+        request_id: call.request.request_id.clone(),
+        job_id: call.request.job_id.clone(),
+        scope_id: call.request.scope_id.clone(),
+        task_id: call.request.task_id.clone(),
+        kind: call.request.kind,
+        family: call.request.family,
+        handler_id,
+        port_id: call.port.port_id.clone(),
+        registry_digest: call.registry_digest.clone(),
+        state_fence: item.state_fence.clone(),
+        request_digest,
+        result_digest: String::new(),
+        content,
     };
+    result.result_digest =
+        result
+            .computed_result_digest()
+            .map_err(|err| CurationRoutingError::Digest {
+                detail: redact(&err.to_string()),
+            })?;
+    let handler_id = result.handler_id.clone();
     result
         .validate()
-        .map_err(|err| failed(std::format!("returned envelope is malformed: {err}")))?;
-    if result.kind != request.kind || result.family != request.family {
-        return Err(failed(
-            "returned kind or family drifts from the dispatched request".to_owned(),
-        ));
-    }
-    if result.request_id != request.request_id {
-        return Err(failed(
-            "returned request identity drifts from the dispatched request".to_owned(),
-        ));
-    }
-    if result.handler_id != handler_id {
-        return Err(failed(
-            "returned handler identity is not the selected owner".to_owned(),
-        ));
-    }
-    let recomputed = sha256_hex(
-        &canonical_json_bytes(request).map_err(|err| {
-            failed(std::format!("dispatched request cannot be canonically hashed: {err}"))
-        })?,
-    );
-    if result.request_digest != recomputed {
-        return Err(failed(
-            "returned request digest drifts from the dispatched request".to_owned(),
-        ));
-    }
-    Ok(())
+        .map_err(|err| CurationRoutingError::Envelope {
+            handler_id,
+            detail: redact(&err.to_string()),
+        })?;
+    Ok(result)
 }
 
 fn assemble_set(
@@ -1914,7 +1963,6 @@ fn unprocessed_set(
 mod tests {
     use super::*;
     use eliot_contracts::{EpochId, EpochLineageId, ReceiptId, RequestId, ResourceGeneration};
-    use std::num::NonZeroU64;
     use eliot_dreamer_contracts::CurationHandlerDescriptor;
     use eliot_dreamer_contracts::curation::{
         AccessibilityPayload, ClassificationPayload, ConceptPayload, EpisodePayload,
@@ -1922,6 +1970,8 @@ mod tests {
         RepairPayload, SplitPayload, TargetEvidence,
     };
     use std::cell::Cell;
+    use std::cell::RefCell;
+    use std::num::NonZeroU64;
 
     fn test_fence() -> StateFence {
         let epoch = EpochId::new(
@@ -1961,7 +2011,10 @@ mod tests {
         }
     }
 
-    fn payload_for(kind: CurationKind, targets: &[&str]) -> eliot_dreamer_contracts::CurationPayload {
+    fn payload_for(
+        kind: CurationKind,
+        targets: &[&str],
+    ) -> eliot_dreamer_contracts::CurationPayload {
         use eliot_dreamer_contracts::CurationPayload as Payload;
         match kind {
             CurationKind::Classification => Payload::Classification(ClassificationPayload {
@@ -2007,13 +2060,11 @@ mod tests {
                 second: targets[1].to_owned(),
                 target_evidence: facets(targets),
             }),
-            CurationKind::Reconsolidation => {
-                Payload::Reconsolidation(ReconsolidationPayload {
-                    target: targets[0].to_owned(),
-                    update: "refresh".to_owned(),
-                    target_evidence: facets(targets),
-                })
-            }
+            CurationKind::Reconsolidation => Payload::Reconsolidation(ReconsolidationPayload {
+                target: targets[0].to_owned(),
+                update: "refresh".to_owned(),
+                target_evidence: facets(targets),
+            }),
             CurationKind::Accessibility => Payload::Accessibility(AccessibilityPayload {
                 handle: targets[0].to_owned(),
                 note: "captioned".to_owned(),
@@ -2098,6 +2149,9 @@ mod tests {
         descriptor: CurationHandlerDescriptor,
         calls: Cell<usize>,
         behavior: StubBehavior,
+        counterevidence_refs: Vec<String>,
+        seen_call: RefCell<Option<BoundCurationCall>>,
+        seen_content: RefCell<Option<ProducedCurationContent>>,
     }
 
     impl CountingHandler {
@@ -2106,6 +2160,9 @@ mod tests {
                 descriptor: descriptor_for(family),
                 calls: Cell::new(0),
                 behavior: StubBehavior::Echo(disposition),
+                counterevidence_refs: Vec::new(),
+                seen_call: RefCell::new(None),
+                seen_content: RefCell::new(None),
             }
         }
 
@@ -2114,37 +2171,88 @@ mod tests {
                 descriptor: descriptor_for(family),
                 calls: Cell::new(0),
                 behavior: StubBehavior::TamperKind,
+                counterevidence_refs: Vec::new(),
+                seen_call: RefCell::new(None),
+                seen_content: RefCell::new(None),
+            }
+        }
+
+        fn echoing_with_counterevidence(
+            family: CurationFamily,
+            disposition: CandidateDisposition,
+            counterevidence_refs: Vec<String>,
+        ) -> Self {
+            Self {
+                descriptor: descriptor_for(family),
+                calls: Cell::new(0),
+                behavior: StubBehavior::Echo(disposition),
+                counterevidence_refs,
+                seen_call: RefCell::new(None),
+                seen_content: RefCell::new(None),
             }
         }
     }
 
-    impl CurationHandler for CountingHandler {
+    fn passing_report() -> eliot_dreamer_contracts::PreservationReport {
+        eliot_dreamer_contracts::PreservationReport {
+            verdicts: eliot_dreamer_contracts::PRESERVATION_DIMENSIONS
+                .iter()
+                .map(
+                    |dimension| eliot_dreamer_contracts::candidate::DimensionVerdict {
+                        dimension: eliot_dreamer_contracts::PreservationDimension::parse(dimension)
+                            .expect("known preservation dimension"),
+                        passed: true,
+                        known: true,
+                        note: std::format!("{dimension} holds"),
+                    },
+                )
+                .collect(),
+        }
+    }
+
+    impl NativeCurationHandler for CountingHandler {
         fn handle(
             &self,
-            request: &TypedCurationHandlerRequest,
-        ) -> Result<TypedCurationHandlerResult, CurationRoutingError> {
+            call: &BoundCurationCall,
+        ) -> Result<ProducedCurationContent, eliot_dreamer_contracts::ContractViolation> {
             self.calls.set(self.calls.get().saturating_add(1));
-            let handler_id = self.descriptor.handler_id.clone();
-            let (kind, family, disposition) = match &self.behavior {
-                StubBehavior::Echo(disposition) => (request.kind, request.family, *disposition),
-                StubBehavior::TamperKind => (
-                    CurationKind::Repair,
-                    CurationFamily::MemoryRepair,
-                    CandidateDisposition::Candidate,
-                ),
+            if call.port.descriptor != self.descriptor {
+                return Err(
+                    eliot_dreamer_contracts::ContractViolation::BindingMismatch {
+                        field: "handler_descriptor",
+                        reason: "double observed an unselected binding".to_owned(),
+                    },
+                );
+            }
+            let content = match &self.behavior {
+                StubBehavior::Echo(disposition) => ProducedCurationContent {
+                    payload: call.request.payload.clone(),
+                    disposition: *disposition,
+                    preservation: passing_report(),
+                    support_note: "supported by source-b".to_owned(),
+                    rollback_note: "drop result to roll back".to_owned(),
+                    counterevidence_refs: self.counterevidence_refs.clone(),
+                },
+                StubBehavior::TamperKind => ProducedCurationContent {
+                    payload: eliot_dreamer_contracts::CurationPayload::Split(SplitPayload {
+                        whole: "ab".to_owned(),
+                        first: "a".to_owned(),
+                        second: "b".to_owned(),
+                        target_evidence: TargetEvidence {
+                            targets: vec!["a".to_owned(), "b".to_owned(), "ab".to_owned()],
+                            evidence_refs: vec!["e-1".to_owned()],
+                        },
+                    }),
+                    disposition: CandidateDisposition::Candidate,
+                    preservation: passing_report(),
+                    support_note: "supported by source-b".to_owned(),
+                    rollback_note: "drop result to roll back".to_owned(),
+                    counterevidence_refs: Vec::new(),
+                },
             };
-            let request_digest =
-                sha256_hex(&canonical_json_bytes(request).expect("canonical test request"));
-            let preimage = std::format!("{handler_id}:{request_digest}");
-            Ok(TypedCurationHandlerResult {
-                request_id: request.request_id.clone(),
-                kind,
-                family,
-                disposition,
-                handler_id,
-                request_digest,
-                result_digest: sha256_hex(preimage.as_bytes()),
-            })
+            self.seen_call.replace(Some(call.clone()));
+            self.seen_content.replace(Some(content.clone()));
+            Ok(content)
         }
     }
 
@@ -2161,7 +2269,7 @@ mod tests {
     fn test_ports<'a>(
         handlers: &'a [CountingHandler],
         registry: &CurationHandlerRegistry,
-    ) -> CurationPortSet<'a> {
+    ) -> NativeCurationPortSet<'a> {
         let ports = handlers
             .iter()
             .map(|handler| {
@@ -2171,7 +2279,7 @@ mod tests {
                     .iter()
                     .find(|item| item.family == family)
                     .expect("registry declares the family");
-                InjectedCurationPort {
+                NativeCurationPort {
                     port: CurationHandlerPort {
                         port_id: std::format!("port-{}", family.as_str()),
                         descriptor: declared.clone(),
@@ -2182,7 +2290,7 @@ mod tests {
                 }
             })
             .collect();
-        CurationPortSet { ports }
+        NativeCurationPortSet { ports }
     }
 
     fn test_policy(allow_partial: bool) -> RoutingPolicy {
@@ -2287,6 +2395,292 @@ mod tests {
             .get()
     }
 
+    fn drift_fence() -> StateFence {
+        let epoch = EpochId::new(
+            EpochLineageId::new("550e8400-e29b-41d4-a716-446655440001")
+                .expect("canonical test lineage-B"),
+            NonZeroU64::new(1).expect("non-zero test sequence"),
+        )
+        .expect("valid test epoch");
+        StateFence::new(epoch, ResourceGeneration::genesis())
+    }
+
+    // H1-ORDER: the hub-native binding invokes the selected owner exactly
+    // once and seals its full result content.
+    #[test]
+    fn h1_native_binding_invokes_selected_owner_once_with_full_content() {
+        let registry = full_registry();
+        let handlers = test_handlers();
+        let ports = test_ports(&handlers, &registry);
+        let policy = test_policy(true);
+        let screen = test_screen(&["a", "b", "ab"]);
+        let batch = seal_batch(
+            vec![test_item(CurationKind::Classification, &["a"], &["a"])],
+            &["a", "b", "ab"],
+            AtomicityMode::PerMember,
+            &screen,
+            &registry,
+            &policy,
+        );
+        let set = route_validated_curation(&batch, &screen, &registry, &policy, &ports)
+            .expect("eligible classification routes through the hub binding");
+        assert_eq!(set.members.len(), 1);
+        let member = &set.members[0];
+        assert_eq!(member.disposition, RoutingDisposition::Candidate);
+        assert_eq!(member.calls, 1);
+        assert_eq!(set.accepted, 1);
+        assert_eq!(set.total_handler_calls, 1);
+        let owner = handlers
+            .iter()
+            .find(|item| item.descriptor.family == CurationFamily::Classification)
+            .expect("classification double exists");
+        assert_eq!(owner.calls.get(), 1);
+        for spelling in CURATION_FAMILIES {
+            let family = parse_family(spelling).expect("known family");
+            if family != CurationFamily::Classification {
+                assert_eq!(calls_for(&handlers, family), 0);
+            }
+        }
+        // The double observed the frozen hub call view bound to the registry.
+        let call = owner.seen_call.borrow();
+        let call = call
+            .as_ref()
+            .expect("selected owner observed one bound call");
+        assert_eq!(call.port.port_id, "port-classification");
+        assert_eq!(call.port.descriptor, owner.descriptor);
+        assert_eq!(call.item, batch.items[0]);
+        assert_eq!(call.request.kind, CurationKind::Classification);
+        assert_eq!(call.request.family, CurationFamily::Classification);
+        assert_eq!(call.request.payload, batch.items[0].payload);
+        assert_eq!(
+            call.registry_digest,
+            registry.digest().expect("closed registry digests")
+        );
+        // The double produced full typed content, not a digest alone.
+        let content = owner.seen_content.borrow();
+        let content = content
+            .as_ref()
+            .expect("selected owner produced full content");
+        assert_eq!(content.payload, batch.items[0].payload);
+        assert_eq!(content.disposition, CandidateDisposition::Candidate);
+        assert!(content.preservation.overall().is_ok());
+        assert!(content.counterevidence_refs.is_empty());
+        // Member digests bind the exact frozen call and the sealed content.
+        assert_eq!(
+            member.request_digest.as_deref(),
+            Some(
+                request_digest_of(&call.request)
+                    .expect("request digests")
+                    .as_str()
+            )
+        );
+        let mut expected = FullCurationResult {
+            request_id: call.request.request_id.clone(),
+            job_id: call.request.job_id.clone(),
+            scope_id: call.request.scope_id.clone(),
+            task_id: call.request.task_id.clone(),
+            kind: call.request.kind,
+            family: call.request.family,
+            handler_id: call.port.descriptor.handler_id.clone(),
+            port_id: call.port.port_id.clone(),
+            registry_digest: call.registry_digest.clone(),
+            state_fence: batch.items[0].state_fence.clone(),
+            request_digest: request_digest_of(&call.request).expect("request digests"),
+            result_digest: String::new(),
+            content: content.clone(),
+        };
+        expected.result_digest = expected
+            .computed_result_digest()
+            .expect("sealed digest recomputes");
+        expected.validate().expect("rebuilt seal validates");
+        assert_eq!(
+            member.result_digest.as_deref(),
+            Some(expected.result_digest.as_str())
+        );
+        set.validate().expect("emitted set validates");
+    }
+
+    // H1-ORDER: altered item, fence, and binding drift fail closed with zero
+    // or exactly-once handler calls proving the check order.
+    #[test]
+    fn h1_altered_item_fence_and_binding_fail_closed() {
+        // Altered item identity fails intrinsic validation before dispatch:
+        // the member is blocked with zero handler calls.
+        let registry = full_registry();
+        let handlers = test_handlers();
+        let ports = test_ports(&handlers, &registry);
+        let policy = test_policy(true);
+        let screen = test_screen(&["a", "b", "ab"]);
+        let mut altered = test_item(CurationKind::Classification, &["a"], &["a"]);
+        altered.kind_spelling = "merge".to_owned();
+        let batch = seal_batch(
+            vec![altered],
+            &["a", "b", "ab"],
+            AtomicityMode::PerMember,
+            &screen,
+            &registry,
+            &policy,
+        );
+        let set = route_validated_curation(&batch, &screen, &registry, &policy, &ports)
+            .expect("altered item routes to a blocked member");
+        assert_eq!(set.members.len(), 1);
+        assert_eq!(set.members[0].disposition, RoutingDisposition::Blocked);
+        assert_eq!(set.members[0].calls, 0);
+        assert_eq!(set.total_handler_calls, 0);
+        for handler in &handlers {
+            assert_eq!(handler.calls.get(), 0, "no handler runs for a blocked item");
+        }
+
+        // Fence drift between the item and the batch fails the batch closed
+        // before any handler call.
+        let mut drifted = test_item(CurationKind::Classification, &["a"], &["a"]);
+        drifted.state_fence = drift_fence();
+        let batch = seal_batch(
+            vec![drifted],
+            &["a", "b", "ab"],
+            AtomicityMode::PerMember,
+            &screen,
+            &registry,
+            &policy,
+        );
+        let err = route_validated_curation(&batch, &screen, &registry, &policy, &ports)
+            .expect_err("fence drift must fail");
+        assert!(
+            matches!(
+                err,
+                CurationRoutingError::Binding {
+                    field: "state_fence",
+                    ..
+                }
+            ),
+            "expected a state_fence binding failure, got {err:?}"
+        );
+        for handler in &handlers {
+            assert_eq!(handler.calls.get(), 0, "no handler runs on fence drift");
+        }
+
+        // A live port carrying a valid but unregistered descriptor fails the
+        // port binding with zero handler calls.
+        let batch = seal_batch(
+            vec![test_item(CurationKind::Classification, &["a"], &["a"])],
+            &["a", "b", "ab"],
+            AtomicityMode::PerMember,
+            &screen,
+            &registry,
+            &policy,
+        );
+        let mut rogue_ports = test_ports(&handlers, &registry);
+        rogue_ports.ports[0].port.descriptor.handler_id = "rogue-owner".to_owned();
+        let err = route_validated_curation(&batch, &screen, &registry, &policy, &rogue_ports)
+            .expect_err("unregistered descriptor must fail");
+        assert!(
+            matches!(err, CurationRoutingError::Port { .. }),
+            "expected a port failure, got {err:?}"
+        );
+        for handler in &handlers {
+            assert_eq!(handler.calls.get(), 0, "no handler runs on port drift");
+        }
+    }
+
+    // H1-ORDER: mutable-target versus immutable-evidence roles are rejected
+    // before dispatch, and counterevidence naming a mutable target is
+    // rejected after exactly one handler call.
+    #[test]
+    fn h1_evidence_target_roles_rejected_pre_and_post_call() {
+        // An immutable evidence handle promoted to a mutable target never
+        // dispatches: blocked with zero handler calls.
+        let registry = full_registry();
+        let handlers = test_handlers();
+        let ports = test_ports(&handlers, &registry);
+        let policy = test_policy(true);
+        let screen = test_screen(&["a", "b", "ab"]);
+        let mut promoted = test_item(CurationKind::Classification, &["a"], &["a"]);
+        if let eliot_dreamer_contracts::CurationPayload::Classification(inner) =
+            &mut promoted.payload
+        {
+            inner.target_evidence.targets.push("e-1".to_owned());
+        } else {
+            panic!("classification fixture carries a classification payload");
+        }
+        let batch = seal_batch(
+            vec![promoted],
+            &["a", "b", "ab"],
+            AtomicityMode::PerMember,
+            &screen,
+            &registry,
+            &policy,
+        );
+        let set = route_validated_curation(&batch, &screen, &registry, &policy, &ports)
+            .expect("evidence-as-target routes to a blocked member");
+        assert_eq!(set.members.len(), 1);
+        assert_eq!(set.members[0].disposition, RoutingDisposition::Blocked);
+        assert_eq!(set.members[0].calls, 0);
+        assert_eq!(
+            set.members[0].rejection_hint,
+            routing_rejection_hint(RoutingDisposition::Blocked)
+        );
+        for handler in &handlers {
+            assert_eq!(
+                handler.calls.get(),
+                0,
+                "no handler runs for evidence-as-target"
+            );
+        }
+
+        // Counterevidence naming a mutable target runs the selected handler
+        // once; the hub content check then rejects its output terminally with
+        // no sibling call.
+        let counter_handlers: Vec<CountingHandler> = CURATION_FAMILIES
+            .iter()
+            .map(|spelling| {
+                let family = parse_family(spelling).expect("known family");
+                if family == CurationFamily::StructureRepair {
+                    CountingHandler::echoing_with_counterevidence(
+                        family,
+                        CandidateDisposition::Candidate,
+                        vec!["a".to_owned()],
+                    )
+                } else {
+                    CountingHandler::echoing(family, CandidateDisposition::Candidate)
+                }
+            })
+            .collect();
+        let counter_ports = test_ports(&counter_handlers, &registry);
+        let batch = seal_batch(
+            vec![test_item(
+                CurationKind::Merge,
+                &["a", "b", "ab"],
+                &["a", "b", "ab"],
+            )],
+            &["a", "b", "ab"],
+            AtomicityMode::PerMember,
+            &screen,
+            &registry,
+            &policy,
+        );
+        let err = route_validated_curation(&batch, &screen, &registry, &policy, &counter_ports)
+            .expect_err("counterevidence-as-target must fail");
+        assert!(
+            matches!(err, CurationRoutingError::Envelope { .. }),
+            "expected a terminal envelope failure, got {err:?}"
+        );
+        assert_eq!(
+            calls_for(&counter_handlers, CurationFamily::StructureRepair),
+            1,
+            "the selected port is called once before its content fails"
+        );
+        for spelling in CURATION_FAMILIES {
+            let family = parse_family(spelling).expect("known family");
+            if family != CurationFamily::StructureRepair {
+                assert_eq!(
+                    calls_for(&counter_handlers, family),
+                    0,
+                    "no sibling handler runs after a content rejection"
+                );
+            }
+        }
+    }
+
     // WORK_UNIT_CASE: 684/1
     #[test]
     fn work_unit_684_1_classification_routes_to_classification_owner() {
@@ -2297,12 +2691,18 @@ mod tests {
             family_of(CurationKind::Classification),
             CurationFamily::Classification
         );
-        assert_eq!(family_of(CurationKind::Merge), family_of(CurationKind::Split));
+        assert_eq!(
+            family_of(CurationKind::Merge),
+            family_of(CurationKind::Split)
+        );
         assert_eq!(
             family_of(CurationKind::Merge),
             CurationFamily::StructureRepair
         );
-        assert_eq!(family_of(CurationKind::Repair), CurationFamily::MemoryRepair);
+        assert_eq!(
+            family_of(CurationKind::Repair),
+            CurationFamily::MemoryRepair
+        );
 
         let registry = full_registry();
         let handlers = test_handlers();
@@ -2420,14 +2820,20 @@ mod tests {
         );
 
         let mut overlapping = full_registry();
-        overlapping.handlers.push(descriptor_for(CurationFamily::Relation));
+        overlapping
+            .handlers
+            .push(descriptor_for(CurationFamily::Relation));
         let overlap = route_validated_curation(&batch, &screen, &overlapping, &policy, &ports);
         assert!(
             matches!(overlap, Err(CurationRoutingError::Registry { .. })),
             "overlapping coverage fails closed"
         );
         for handler in &handlers {
-            assert_eq!(handler.calls.get(), 0, "no handler runs on registry failure");
+            assert_eq!(
+                handler.calls.get(),
+                0,
+                "no handler runs on registry failure"
+            );
         }
     }
 
@@ -2547,7 +2953,10 @@ mod tests {
         assert_eq!(set.members[0].disposition, RoutingDisposition::Candidate);
         assert_eq!(set.members[1].disposition, RoutingDisposition::Unsupported);
         assert_eq!(set.members[2].disposition, RoutingDisposition::Blocked);
-        assert_eq!((set.accepted, set.rejected, set.blocked, set.unprocessed), (1, 1, 1, 0));
+        assert_eq!(
+            (set.accepted, set.rejected, set.blocked, set.unprocessed),
+            (1, 1, 1, 0)
+        );
         assert!(set.unprocessed_frontier.is_empty());
         assert_eq!(set.omitted_targets, vec!["ab".to_owned(), "b".to_owned()]);
         assert_eq!(set.total_handler_calls, 2);
@@ -2579,8 +2988,13 @@ mod tests {
             &strict,
         );
         let strict_ports = test_ports(&handlers, &registry);
-        let refused =
-            route_validated_curation(&strict_batch, &strict_screen, &registry, &strict, &strict_ports);
+        let refused = route_validated_curation(
+            &strict_batch,
+            &strict_screen,
+            &registry,
+            &strict,
+            &strict_ports,
+        );
         assert!(
             matches!(refused, Err(CurationRoutingError::Atomicity { .. })),
             "all-or-nothing reports no applied-looking subset"
