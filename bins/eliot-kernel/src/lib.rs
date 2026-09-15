@@ -2863,5 +2863,9 @@ const _: () = {
 #[cfg(test)]
 mod tests;
 
+#[cfg(test)]
+#[path = "tests/local_read_claim.rs"]
+mod local_read_claim_tests;
+
 // Store implementation E2E belongs to the Store/Host boundary. Kernel tests
 // exercise only the neutral descriptor and route/fence behavior.
