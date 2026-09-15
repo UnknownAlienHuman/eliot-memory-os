@@ -18,6 +18,9 @@ use secrecy::{ExposeSecret, SecretString};
 use serde::de::DeserializeOwned;
 use serde_json::{Value, json};
 
+mod json_codec;
+#[cfg(all(test, windows))]
+mod payload_tests;
 mod rpc_parse;
 use rpc_parse::{parse_response, provider_version_from_rpc, rpc_result};
 use tokio::net::TcpStream;
@@ -360,6 +363,7 @@ impl RpcTransport {
         statement: &str,
         bindings: serde_json::Map<String, Value>,
     ) -> Result<RpcResults, AdapterError> {
+        let (statement, bindings, prefix_len) = json_codec::encode_bindings(statement, bindings)?;
         let value = self
             .request(
                 operation,
@@ -367,7 +371,16 @@ impl RpcTransport {
                 json!([statement, Value::Object(bindings)]),
             )
             .await?;
-        RpcResults::from_value(&value)
+        let mut results = RpcResults::from_value(&value)?;
+        if results.values.len() < prefix_len {
+            return Err(AdapterError::Serialization(
+                "RPC query omitted binding decode results".to_owned(),
+            ));
+        }
+        // Keep every error, including decode failures, while preserving the
+        // original operation's statement indexes for its existing consumer.
+        results.values.drain(..prefix_len);
+        Ok(results)
     }
 
     async fn request(
