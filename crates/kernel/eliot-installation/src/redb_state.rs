@@ -504,7 +504,7 @@ pub struct SourceBundlePublicationJournal {
     pub generation: PlatformHandle,
     /// Canonical package manifest digest.
     pub manifest_digest: PlatformHandle,
-    /// Complete nine-role artifact evidence digest.
+    /// Complete twelve-role artifact evidence digest.
     pub evidence_digest: PlatformHandle,
     /// Digest of the complete typed precommit role inventory.
     pub precommit_digest: PlatformHandle,
@@ -533,7 +533,7 @@ pub struct SourceBundlePublicationJournal {
 #[derive(Clone, Debug, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct SourceBundlePublicationRole {
-    /// Canonical nine-role relative path.
+    /// Canonical twelve-role relative path.
     pub relative_path: String,
     /// Whether this role is an executable PE.
     pub executable: bool,
@@ -1917,7 +1917,7 @@ fn validate_publication_journal(
     if journal.precommit_files.len() != SOURCE_BUNDLE_REQUIRED_ROLES.len() {
         return Err(InstallationError::InvalidField {
             field: "publication.precommit_files".to_owned(),
-            reason: "publication journal must retain the exact nine-role inventory".to_owned(),
+            reason: "publication journal must retain the exact twelve-role inventory".to_owned(),
         });
     }
     for (role, (expected_path, expected_executable)) in journal
