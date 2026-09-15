@@ -6,9 +6,9 @@
 //! inert [`InertOwnerRequest`](crate::contract::InertOwnerRequest) projections
 //! mirroring the pure one-snapshot controller plus at most one bounded
 //! [`ExperimentCandidate`] per target, all within exactly one cycle. It
-//! performs no storage read, Researcher/model/tool call, agent launch, or
-//! scheduler operation, and it carries no durable-job, wake, lease, route
-//! reservation, or self-enqueue field: the single
+//! performs no store read, model call, outside execution, or timed dispatch,
+//! and it carries no durable-job, wake, lease, route-reservation, or
+//! re-enqueue field: the single
 //! [`CyclePhase`](crate::contract::CyclePhase) chain remains the only
 //! lifecycle vocabulary.
 

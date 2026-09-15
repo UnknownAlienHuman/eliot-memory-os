@@ -2,8 +2,8 @@
 //!
 //! A [`CycleSample`] selects a bounded deterministic identity scope over the
 //! already-frozen [`DreamerCycleState`](crate::contract::DreamerCycleState)
-//! consumed by the pure one-snapshot controller. It performs no storage read,
-//! Researcher/model/tool call, agent launch, or scheduler operation: every
+//! consumed by the pure one-snapshot controller. It performs no store read,
+//! model call, outside execution, or timed dispatch: every
 //! identity it carries is copied from the supplied frozen snapshot in state
 //! order, and every identity it does not carry remains explicitly listed as
 //! omitted against the complete denominator. It introduces no second

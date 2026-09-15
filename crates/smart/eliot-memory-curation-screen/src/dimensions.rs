@@ -11,7 +11,7 @@ use eliot_memory_curation_contracts::{
 /// assessment, the structural findings observed for the member, the
 /// owner-selected target/reference partition role, and the source
 /// availability/denominator state. No store is read, no model is invoked, no
-/// scalar confidence or utility participates, and no lifecycle transition is
+/// scalar score or ranking signal participates, and no lifecycle transition is
 /// proposed: the lifecycle verdict only records whether the member is a
 /// reversible forward candidate or an immutable reference.
 pub fn assess_dimensions(

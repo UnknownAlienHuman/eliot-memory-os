@@ -10,8 +10,8 @@ use crate::{ContractError, FindingClass, FindingId, MemberDisposition, MemberId}
 /// Each dimension is assessed from its own closed signal family and no
 /// dimension may substitute for another: a `Clear` outcome in one dimension
 /// can never compensate a `Flagged`, `Protected`, or `Unknown` outcome in a
-/// different dimension. No scalar confidence, utility, popularity, retrieval
-/// count, or model agreement participates in any dimension.
+/// different dimension. No scalar score, ranking signal, retrieval count, or
+/// model agreement participates in any dimension.
 #[derive(
     Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize, Deserialize, JsonSchema,
 )]
