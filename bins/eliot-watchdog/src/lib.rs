@@ -56,6 +56,7 @@ const LEASE_FILE_LIMIT: u64 = 1024 * 1024;
 const KERNEL_ORS_FILE_NAME: &str = "kernel-ors.redb";
 const HOST_JOURNAL_FILE_NAME: &str = "host-state-journal.redb";
 
+mod diagnostics;
 mod host_identity_observation;
 mod runtime_manifest_selection;
 mod scm_launch;
@@ -67,6 +68,8 @@ mod watchdog_composition;
 mod watchdog_config;
 mod watchdog_publication_readback;
 mod watchdog_spool;
+
+pub use diagnostics::install_subscriber;
 
 pub use eliot_watchdog_core::{WatchdogSpoolAcknowledgement, WatchdogSpoolExportBatch};
 #[cfg(test)]
@@ -776,10 +779,30 @@ pub fn inspect_approved_host_registration(
 
 fn inspect_host_registration(approved: &ApprovedHostRegistration) -> Result<(), SpoolError> {
     match read_host_registration_runtime(approved) {
-        WatchdogRuntimeReadback::Matching { .. } => Ok(()),
-        other => Err(SpoolError::InvalidLease(format!(
-            "approved Host SCM registration is not an exact read-only runtime match: {other:?}"
-        ))),
+        WatchdogRuntimeReadback::Matching { .. } => {
+            tracing::debug!(
+                event = "watchdog.host_registration_observed",
+                observation = "admitted",
+                "approved Host registration matches runtime readback"
+            );
+            Ok(())
+        }
+        other => {
+            let observation = match &other {
+                WatchdogRuntimeReadback::Matching { .. } => "admitted",
+                WatchdogRuntimeReadback::Absent => "unavailable",
+                WatchdogRuntimeReadback::Mismatched => "mismatched",
+                WatchdogRuntimeReadback::Unknown => "unknown",
+            };
+            tracing::debug!(
+                event = "watchdog.host_registration_observed",
+                observation = observation,
+                "approved Host registration is not an exact runtime match"
+            );
+            Err(SpoolError::InvalidLease(format!(
+                "approved Host SCM registration is not an exact read-only runtime match: {other:?}"
+            )))
+        }
     }
 }
 

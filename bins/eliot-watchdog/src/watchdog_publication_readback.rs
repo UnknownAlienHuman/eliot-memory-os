@@ -38,6 +38,12 @@ pub(super) struct ObservedWatchdogPublication {
 pub(super) fn observe_watchdog_publication(
     path: &Path,
 ) -> Result<ObservedWatchdogPublication, SpoolError> {
+    let _span = tracing::debug_span!("watchdog.observe_publication").entered();
+    tracing::debug!(
+        event = "watchdog.publication_observation_attempted",
+        observation = "attempted",
+        "observing watchdog publication without payload material"
+    );
     let raw = observe_owned_directory_exact(
         path,
         &[
@@ -123,6 +129,12 @@ pub(super) fn observe_watchdog_publication(
 pub(super) fn scan_watchdog_publications(
     host_state_root: &Path,
 ) -> Result<Vec<ObservedWatchdogPublication>, SpoolError> {
+    let _span = tracing::debug_span!("watchdog.scan_publications").entered();
+    tracing::debug!(
+        event = "watchdog.publication_scan_attempted",
+        observation = "attempted",
+        "scanning watchdog publications without payload material"
+    );
     let mut observed = Vec::new();
     for entry in std::fs::read_dir(host_state_root)? {
         let entry = entry?;
@@ -145,6 +157,12 @@ pub(super) fn read_manifest_selected_ors_current(
     selected_manifest: &CandidateManifest,
     lease_id: &eliot_ors::OperationIdentity,
 ) -> Result<Option<SupervisionLeaseSnapshot>, SpoolError> {
+    let _span = tracing::debug_span!("watchdog.read_ors_current").entered();
+    tracing::debug!(
+        event = "watchdog.ors_read_attempted",
+        observation = "attempted",
+        "reading manifest-selected ORS current without payload material"
+    );
     let kernel_ors_path = PathBuf::from(
         selected_manifest
             .runtime_launch
@@ -176,6 +194,12 @@ pub(super) fn verify_against_durable_current(
     envelope: &SignedSupervisionLease,
     durable_current: Option<SupervisionLeaseSnapshot>,
 ) -> Result<VerifiedSupervisionLease, SpoolError> {
+    let _span = tracing::debug_span!("watchdog.verify_durable_current").entered();
+    tracing::debug!(
+        event = "watchdog.lease_verification_attempted",
+        observation = "attempted",
+        "verifying supervision lease against durable current"
+    );
     let durable_current = durable_current.ok_or_else(|| {
         SpoolError::LeaseFenced("Kernel ORS has no current supervision lease".to_owned())
     })?;

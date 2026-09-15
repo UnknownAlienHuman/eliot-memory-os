@@ -100,6 +100,12 @@ impl WatchdogComposition {
         host: Arc<dyn HostObservationSource>,
         shutdown_requested: Arc<AtomicBool>,
     ) -> Result<Self, CompositionError> {
+        let _span = tracing::debug_span!("watchdog.composition_start").entered();
+        tracing::debug!(
+            event = "watchdog.composition_requested",
+            observation = "requested",
+            "watchdog composition requested"
+        );
         config.validate()?;
         let runtime = config.runtime()?;
         let task_admission = admission.clone();
@@ -210,6 +216,12 @@ impl WatchdogComposition {
     /// Returns an error if the supervised watchdog task, shutdown signal, or
     /// externally requested shutdown path fails.
     pub async fn run_until_shutdown(self) -> Result<ShutdownOutcome, TaskFailure> {
+        let _span = tracing::info_span!("watchdog.run_until_shutdown").entered();
+        tracing::info!(
+            event = "watchdog.supervision_running",
+            observation = "admitted",
+            "watchdog supervision running until shutdown"
+        );
         let WatchdogComposition {
             runtime,
             admission,

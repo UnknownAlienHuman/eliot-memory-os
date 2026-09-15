@@ -113,6 +113,12 @@ pub(super) fn load_content_addressed_supervision_lease_bound(
     config: &WatchdogAdmissionConfig,
     expected_template_digest: &str,
 ) -> Result<VerifiedWatchdogAdmission, SpoolError> {
+    let _span = tracing::debug_span!("watchdog.lease_bound_load").entered();
+    tracing::debug!(
+        event = "watchdog.lease_load_attempted",
+        observation = "attempted",
+        "attempting content-addressed supervision lease load"
+    );
     let binding = &source.binding;
     binding
         .host_state_root_lease

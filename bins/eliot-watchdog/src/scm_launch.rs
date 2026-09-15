@@ -246,6 +246,12 @@ where
     I: IntoIterator<Item = S>,
     S: Into<OsString>,
 {
+    let _span = tracing::debug_span!("watchdog.parse_process_argv").entered();
+    tracing::debug!(
+        event = "watchdog.process_argv_parse_attempted",
+        observation = "attempted",
+        "parsing watchdog process argv"
+    );
     let mut full = vec![OsString::from(SERVICE_NAME)];
     full.extend(args.into_iter().map(Into::into));
     parse_watchdog_scm_argv(full)
@@ -264,6 +270,12 @@ where
     I: IntoIterator<Item = S>,
     S: Into<OsString>,
 {
+    let _span = tracing::debug_span!("watchdog.validate_service_main_argv").entered();
+    tracing::debug!(
+        event = "watchdog.service_main_argv_attempted",
+        observation = "attempted",
+        "validating ServiceMain argv"
+    );
     let args = args.into_iter().map(Into::into).collect::<Vec<_>>();
     if args.len() == 1 && args[0].to_str() == Some(SERVICE_NAME) {
         Ok(())
@@ -289,6 +301,12 @@ where
     I: IntoIterator<Item = S>,
     S: Into<OsString>,
 {
+    let _span = tracing::debug_span!("watchdog.scm_launch_validation").entered();
+    tracing::debug!(
+        event = "watchdog.scm_launch_attempted",
+        observation = "attempted",
+        "validating SCM launch registration"
+    );
     let bootstrap = parse_watchdog_scm_argv(args)?;
     validate_watchdog_scm_bootstrap(&bootstrap)
 }
@@ -305,6 +323,12 @@ where
 pub fn validate_watchdog_scm_bootstrap(
     bootstrap: &ServiceBootstrapArguments,
 ) -> Result<ValidatedWatchdogScmLaunch, WatchdogScmLaunchError> {
+    let _span = tracing::debug_span!("watchdog.scm_bootstrap_validation").entered();
+    tracing::debug!(
+        event = "watchdog.scm_bootstrap_attempted",
+        observation = "attempted",
+        "validating SCM bootstrap against installer approval"
+    );
     let (_, _, registration) =
         read_approved_service_registration(bootstrap, InstallerServiceRole::Watchdog)
             .map_err(WatchdogScmLaunchError::from)?;

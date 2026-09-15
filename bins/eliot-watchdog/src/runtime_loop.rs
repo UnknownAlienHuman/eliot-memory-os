@@ -40,6 +40,12 @@ pub(super) fn run_watchdog(
     stop_signal: Arc<AtomicBool>,
     scm_launch: Option<&eliot_watchdog::ValidatedWatchdogScmLaunch>,
 ) -> Result<(), String> {
+    let _runtime_span = tracing::info_span!("watchdog.runtime").entered();
+    tracing::info!(
+        event = "watchdog.startup_requested",
+        observation = "requested",
+        "watchdog runtime requested"
+    );
     let bootstrap = scm_launch
         .map(|launch| launch.bootstrap().clone())
         .ok_or_else(|| "SCM bootstrap is required for Runtime contour selection".to_owned())?;
@@ -55,8 +61,22 @@ pub(super) fn run_watchdog(
     // composition and reloaded before every observation.
     let admission_source = match wait_for_durable_admission(registry_path, bootstrap, &stop_signal)?
     {
-        Some(admission) => Arc::new(admission),
-        None => return Ok(()),
+        Some(admission) => {
+            tracing::info!(
+                event = "watchdog.admission_reconciled",
+                observation = "reconciled",
+                "durable admission reconciled"
+            );
+            Arc::new(admission)
+        }
+        None => {
+            tracing::info!(
+                event = "watchdog.shutdown",
+                disposition = "stop_requested",
+                "shutdown requested before durable admission"
+            );
+            return Ok(());
+        }
     };
     let binding = admission_source.runtime_binding();
     inspect_approved_host_registration(&binding).map_err(|error| error.to_string())?;
@@ -98,6 +118,11 @@ pub(super) fn run_watchdog(
             .map_err(|error| error.to_string())?;
     }
     let readiness = composition.readiness();
+    tracing::info!(
+        event = "watchdog.readiness",
+        observation = "admitted",
+        "watchdog readiness published; startup is not readiness"
+    );
     serde_json::to_writer(&mut io::stdout().lock(), &readiness)
         .map_err(|error| format!("{error:?}"))?;
     writeln!(io::stdout().lock()).map_err(|error| error.to_string())?;
@@ -193,6 +218,12 @@ fn truncate_failure_detail(value: &str) -> String {
 /// contention and will retry. The detail is already truncated and carries no
 /// bootstrap secret (the registration nonce never enters `SpoolError`).
 fn report_transient_registry_lock(detail: &str) {
+    tracing::debug!(
+        event = "watchdog.transient_registry_lock",
+        observation = "attempted",
+        detail = truncate_failure_detail(detail).as_str(),
+        "transient installation-registry lock, retrying"
+    );
     let _ = writeln!(
         io::stderr().lock(),
         "{SERVICE_NAME}: transient installation-registry lock, retrying: {detail}"
@@ -204,6 +235,11 @@ fn report_transient_registry_lock(detail: &str) {
 /// `pending_phase_b_fence_readiness` probe reaches this; a transient lock is
 /// never announced as fenced.
 fn announce_fence_readiness(fence: &WatchdogReadiness) -> Result<(), String> {
+    tracing::info!(
+        event = "watchdog.fence_readiness",
+        observation = "admitted",
+        "pre-Phase-B fence readiness announced"
+    );
     serde_json::to_writer(&mut io::stdout().lock(), fence).map_err(|error| format!("{error:?}"))?;
     writeln!(io::stdout().lock()).map_err(|error| error.to_string())?;
     #[cfg(windows)]
@@ -229,6 +265,7 @@ fn wait_for_durable_admission(
     bootstrap: ServiceBootstrapArguments,
     stop_signal: &AtomicBool,
 ) -> Result<Option<FileWatchdogAdmission>, String> {
+    let _admission_span = tracing::info_span!("watchdog.durable_admission").entered();
     match FileWatchdogAdmission::from_registry(registry_path.clone(), bootstrap.clone()) {
         Ok(admission) => Ok(Some(admission)),
         Err(error) => {

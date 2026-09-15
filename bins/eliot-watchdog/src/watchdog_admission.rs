@@ -114,6 +114,12 @@ impl FileWatchdogAdmission {
         registry_path: impl Into<PathBuf>,
         bootstrap: ServiceBootstrapArguments,
     ) -> Result<Self, SpoolError> {
+        let _span = tracing::debug_span!("watchdog.admission_from_registry").entered();
+        tracing::debug!(
+            event = "watchdog.admission_attempted",
+            observation = "attempted",
+            "attempting watchdog admission from registry"
+        );
         let registry_path = registry_path.into();
         let (installation_id, binding) = load_runtime_binding(&registry_path, &bootstrap)?;
         Ok(Self {
@@ -173,6 +179,12 @@ impl FileWatchdogAdmission {
         registry_path: impl Into<PathBuf>,
         bootstrap: ServiceBootstrapArguments,
     ) -> Result<WatchdogReadiness, SpoolError> {
+        let _span = tracing::debug_span!("watchdog.fence_readiness_probe").entered();
+        tracing::debug!(
+            event = "watchdog.fence_probe_attempted",
+            observation = "attempted",
+            "probing pre-Phase-B fence readiness"
+        );
         let registry_path = registry_path.into();
         let declared_host_root = bootstrap.host_state_root().ok_or_else(|| {
             SpoolError::InvalidLease(

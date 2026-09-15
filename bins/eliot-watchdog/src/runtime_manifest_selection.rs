@@ -22,6 +22,12 @@ pub(crate) fn select_runtime_manifest(
     registry: &ApprovedGenerationRegistry,
     bootstrap: &ServiceBootstrapArguments,
 ) -> Result<CandidateManifest, SpoolError> {
+    let _span = tracing::debug_span!("watchdog.select_runtime_manifest").entered();
+    tracing::debug!(
+        event = "watchdog.manifest_selection_attempted",
+        observation = "attempted",
+        "attempting installer-approved manifest selection"
+    );
     let matching_generations = registry
         .generations()
         .iter()
