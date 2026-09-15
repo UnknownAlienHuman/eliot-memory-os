@@ -230,6 +230,16 @@ impl<T: EbpStoreTransport + 'static> EbpCanonicalStoreClient<T> {
             }
             StoreRequest::InitializeGenesis { request, .. } => Some(request.operation_id.clone()),
             StoreRequest::Receipt { operation_id } => Some(operation_id.clone()),
+            // T12-04 K1 (owner #779): the Dreamer ledger family carries its
+            // stable mutation identity in the K0 request identity. Extracting
+            // it here binds every unknown/transport arm below
+            // (`unknown_or_transport`, `UnknownOutcome` delivery, decode and
+            // response-id mismatch) to the admitted operation, so callers
+            // reconcile exactly it via the same-identity query and never
+            // adopt a peer identity.
+            StoreRequest::DreamerJob { request, .. } => {
+                Some(request.request_identity.operation.operation_id.clone())
+            }
             _ => None,
         };
         let frame = eliot_store_api::request_frame(
