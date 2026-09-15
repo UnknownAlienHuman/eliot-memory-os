@@ -1,0 +1,63 @@
+schema_version = 3
+module_id = "smart.context.measurement"
+crate = "eliot-context-measurement"
+status = "PROTOTYPE"
+wave = "cognitive-micromodules-wave-01"
+agent_order = 20
+plane = "Smart"
+runtime_layer = "R5"
+delivery_depth = "D3b"
+source_layer = "C1"
+runtime_bundle = "eliotd"
+state_class = "stateless"
+hot_path = true
+lifecycle_owner = "smart.context.measurement"
+loc_soft_ceiling = 10000
+loc_policy = "review ceiling only; causal cohesion, proof, owner, build/test closure and replacement boundary decide topology"
+product_objective = "A route receives an exact UTF-8 byte measurement with distinct STU and tokenizer observations."
+causal_property = "exact UTF-8 measurement with distinct STU and tokenizer observations"
+old_failure_or_missing_capability = "absent #704 measurement forces local byte/3 fallback or fabricated tokenizer observation in assembly or Governor"
+discriminator = "rendered bytes are measured exactly as UTF-8; STU remains an estimate and tokenizer remains an observation, never a fallback"
+primary_responsibility = "Measure exact UTF-8 bytes for one canonical rendered payload without STU fallback or fabricated tokenizer observation."
+owned_mutable_state = []
+allowed_effects = []
+inputs = ["canonical rendered payload bytes", "measurement binding and route identity", "capacity reserves", "optional empirical STU and observed tokenizer"]
+outputs = ["SerializedContextMeasurement with ExactUtf8 status", "typed bound/fence/UTF-8 refusal"]
+depends_on = ["eliot-context-contracts", "eliot-contracts"]
+providers = ["A-15 measurement contract", "SHA-256 envelope digest"]
+consumers = ["context assembly", "reactive context plan"]
+non_goals = ["candidate ranking", "retrieval", "model synthesis", "tokenization", "STU estimation"]
+invariants = ["exact bytes never derived from STU", "tokenizer observation never fabricated", "Unknown never conflated with measured zero"]
+failure_behavior = "Return typed ContextError for non-UTF-8 payload, bound excess, or invalid binding; never guess a byte count."
+proof_surface = ["exact multi-byte UTF-8 byte count", "STU/tokenizer distinction", "bound and fence refusal"]
+proof_ceiling = "Module proof only; real provider/consumer edge and Product Pulse remain separate"
+product_pulse = "D3B_REACTIVE_CONTEXT_PULSE_01"
+replacement_boundary = "implementation behind the declared public contract; package ownership creates no runtime or semantic authority"
+merge_rejoin_condition = "merge back when no independent consumer, proof, dependency or replacement seam remains"
+split_trigger = "a second causal responsibility, mutable owner, independent proof surface or independent rollback boundary appears"
+
+[agent_task]
+objective = "Implement the exact UTF-8 measurement operation owned by #704."
+write_scope = ["crates/smart/eliot-context-measurement/**"]
+deliverables = ["public contract/core implementation", "property/adversarial fixtures", "affected edge fixtures"]
+acceptance = ["one declared responsibility only", "bounded deterministic behavior", "visible local degradation"]
+forbidden = ["canonical writes outside the named Governor transition path", "truth/support/authority/policy/finish/effect promotion", "provider or model SDKs in pure cognitive cores", "vendor or storage types in public contracts", "unbounded synchronous work", "silent truncation", "oracle or verifier weakening in the same work unit", "implicit scope widening", "active-generation self-modification"]
+stop_condition = "Stop and return ContractChallenge when the work needs another owner, unbounded traversal, model call or hidden state."
+challenge_path = "return ContractChallenge to the integration owner when owner, discriminator, proof ceiling or dependency boundary is wrong"
+integration_owner = "cognitive-wave-integrator"
+implementation_language = "Rust 2024"
+required_verification = ["module/package proof at the declared proof ceiling", "real provider/consumer fixture for every changed edge", "the named Product Pulse before promotion", "exact donor reuse/rewrite/reject trace"]
+writeback = "return implementation artifact, exact proof evidence, donor disposition, unresolved ContractChallenges and merge/remove recommendation"
+workspace_admission = "forbidden until implementation, package proof, affected edge proof, current-main rebase and integration-owner review"
+
+# Acceptance is decided by the owning contract and independent review
+# (I0.10: line/test/type counts are not goals). `scripts/verify-work-unit.py`
+# is a retired legacy diagnostic that always reports completion=NOT_VERIFIED
+# and never accepts a work unit. This table names the concrete contract and
+# the required exports/tests plus small behaviour checks the reviewer verifies.
+[acceptance]
+require_deny_unknown_fields = true
+forbid_unsafe = true
+required_exports = []
+required_tests = []
+forbidden_patterns = ['serde_json::Value', 'unimplemented!', 'todo!']
