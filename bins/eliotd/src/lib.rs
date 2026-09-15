@@ -38,6 +38,7 @@ mod controlboard_adapters;
 mod daemon_config;
 mod daemon_kernel_client;
 mod daemon_kernel_port_adapters;
+mod dreamer_materials;
 mod governor_local_read;
 mod kernel_authority_client;
 mod kernel_context_read_client;
@@ -60,6 +61,14 @@ pub use daemon_config::DaemonConfig;
 pub use daemon_kernel_client::DaemonKernelClient;
 pub use daemon_kernel_client::OwnerSessionFacts;
 pub(crate) use daemon_kernel_client::kernel_port_error;
+pub use dreamer_materials::{
+    AdmittedSourceClaim, DreamerMaterialsError, FrozenOrientationManifest,
+    ORIENTATION_EVIDENCE_MAX_RECORDS, ORIENTATION_MATERIAL_MAX_SOURCE_BYTES,
+    ORIENTATION_MATERIAL_MAX_SOURCES, ORIENTATION_MATERIAL_MAX_TOTAL_BYTES,
+    ORIENTATION_MATERIAL_PRIVACY_ADMITTED, ORIENTATION_MATERIAL_ROUTE_ADMITTED,
+    OrientationMaterialBudget, freeze_orientation_manifest, resolve_source_claim,
+    verify_resolved_bytes,
+};
 #[cfg(test)]
 pub(crate) use daemon_kernel_client::{KernelClientError, WireOutcome, operation_payload};
 #[cfg(all(test, windows))]
