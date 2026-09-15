@@ -236,6 +236,13 @@ struct Operation {
     /// path; surfaced through the health/quarantine projection so the gap
     /// is attributable instead of inferred.
     start_publish_gap: Option<&'static str>,
+    /// Operation-bound start-phase marker for the issue-84 start state
+    /// machine (suspended launch → authority validation → resume →
+    /// capture/watcher setup → registry/receipt publication). Written by
+    /// `start()` at every transition and read back into the quarantine
+    /// evidence on every post-resume failure path, so the phase names the
+    /// exact containment point instead of being inferred.
+    start_phase: StartPhase,
     timed_out: bool,
     cleanup_required: bool,
     termination: Option<TerminatedJobChild>,
@@ -260,9 +267,6 @@ enum StartPhase {
     /// Suspended child spawned; nothing resumed yet.
     SuspendedLaunch,
     /// One-shot authority permit consumed against fresh suspended evidence.
-    /// Constructed via the validation transition below; the marker only
-    /// names the state, so construction itself is the use.
-    #[allow(dead_code, reason = "names the authority validation state")]
     AuthorityValidation,
     /// Validated child resumed; resume observed into process state.
     Resumed,
@@ -274,6 +278,24 @@ enum StartPhase {
     RegistryPublication,
     /// Start receipt publication (only after all control owners installed).
     ReceiptPublication,
+}
+
+#[cfg(windows)]
+impl StartPhase {
+    /// Stable label naming the exact start-machine step. Written into the
+    /// operation at every transition and read back into the quarantine
+    /// evidence on post-resume failure paths.
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::SuspendedLaunch => "suspended-launch",
+            Self::AuthorityValidation => "authority-validation",
+            Self::Resumed => "resumed",
+            Self::CaptureSetup => "capture-setup",
+            Self::WatcherSetup => "watcher-setup",
+            Self::RegistryPublication => "registry-publication",
+            Self::ReceiptPublication => "receipt-publication",
+        }
+    }
 }
 
 /// One operation-scoped quarantine record.
@@ -304,6 +326,11 @@ pub struct QuarantinedOperationRecord {
     /// Whether the Job tree was terminated through the admitted process
     /// owner on the fail-closed watcher-spawn path (issue #83 §2).
     watcher_fail_closed_contained: bool,
+    /// Start state-machine phase reached when this op was fenced, naming
+    /// the exact containment point (issue #84 §1). Written by `start()` at
+    /// every transition and read back into this record on post-resume
+    /// failure paths.
+    start_phase: &'static str,
     descendants_complete: Option<bool>,
     tree_terminated: Option<bool>,
     cleanup_pending: bool,
@@ -385,6 +412,13 @@ impl QuarantinedOperationRecord {
     #[must_use]
     pub const fn watcher_fail_closed_contained(&self) -> bool {
         self.watcher_fail_closed_contained
+    }
+
+    /// Returns the start state-machine phase reached when this op was
+    /// fenced (issue #84 §1), naming the exact containment point.
+    #[must_use]
+    pub const fn start_phase(&self) -> &'static str {
+        self.start_phase
     }
 
     /// Returns the observed descendant completeness, when a view exists.
@@ -1026,10 +1060,13 @@ impl ProcessExecutor for WindowsProcessExecutor {
             // stdout/stderr read handles live on `RunningJobChild` and can
             // only be taken after resume; the deadline watcher enforces the
             // admitted deadline for the registered `Operation` owner.
-            debug_assert!(matches!(
-                StartPhase::SuspendedLaunch,
-                StartPhase::SuspendedLaunch | StartPhase::AuthorityValidation
-            ));
+            //
+            // `start_phase` is the live state-machine cursor: it is assigned
+            // at every transition below and consumed into the quarantine
+            // evidence on every post-resume failure path, so the
+            // caller → implementation → consumer chain is real.
+            let mut start_phase = StartPhase::SuspendedLaunch;
+            debug_assert_eq!(start_phase, StartPhase::SuspendedLaunch);
             let authority = Arc::clone(&self.authority);
             let launch_admission = self.launch_admission.as_ref().map(Arc::clone);
             let validated = child
@@ -1047,11 +1084,16 @@ impl ProcessExecutor for WindowsProcessExecutor {
                     authority.validate_and_consume(request, observed)
                 })
                 .map_err(validation_error)?;
+            // `AuthorityValidation`: the one-shot permit was consumed against
+            // fresh suspended evidence above.
+            start_phase = StartPhase::AuthorityValidation;
+            debug_assert_eq!(start_phase, StartPhase::AuthorityValidation);
             let mut state = ProcessState::from_validated(validated.validation());
             // `Resumed`: resume must precede stream-capture ownership — the
             // stdout/stderr read handles live on `RunningJobChild` and can
             // only be taken after `resume()`.
             let mut running = validated.resume().map_err(unavailable)?;
+            start_phase = StartPhase::Resumed;
             let now = now_ms();
             state.mark_resumed(
                 now,
@@ -1078,14 +1120,9 @@ impl ProcessExecutor for WindowsProcessExecutor {
             // because the read handles live on `RunningJobChild`. Every
             // phase at/after `Resumed` must contain the Job tree through the
             // admitted owner — never a bare error that orphans a live child.
-            debug_assert!(matches!(
-                StartPhase::Resumed,
-                StartPhase::Resumed
-                    | StartPhase::CaptureSetup
-                    | StartPhase::WatcherSetup
-                    | StartPhase::RegistryPublication
-                    | StartPhase::ReceiptPublication
-            ));
+            debug_assert_eq!(start_phase, StartPhase::Resumed);
+            start_phase = StartPhase::CaptureSetup;
+            debug_assert_eq!(start_phase, StartPhase::CaptureSetup);
             let mut capture_spawn_error = None;
             let mut capture_failure = None;
             #[cfg(test)]
@@ -1155,14 +1192,7 @@ impl ProcessExecutor for WindowsProcessExecutor {
             // `CaptureSetup` reached: both read-handle takes are consumed
             // (state fences the flow — a take consumes the handle, so the
             // second arm cannot re-take).
-            debug_assert!(matches!(
-                StartPhase::CaptureSetup,
-                StartPhase::Resumed
-                    | StartPhase::CaptureSetup
-                    | StartPhase::WatcherSetup
-                    | StartPhase::RegistryPublication
-                    | StartPhase::ReceiptPublication
-            ));
+            debug_assert_eq!(start_phase, StartPhase::CaptureSetup);
             let operation = Arc::new(Mutex::new(Operation {
                 state,
                 sink,
@@ -1176,6 +1206,7 @@ impl ProcessExecutor for WindowsProcessExecutor {
                 deadline_watcher_owner: None,
                 watcher_fail_closed_contained: false,
                 start_publish_gap: None,
+                start_phase,
                 timed_out: false,
                 cleanup_required: false,
                 termination: None,
@@ -1203,6 +1234,7 @@ impl ProcessExecutor for WindowsProcessExecutor {
                     let mut guard = operation
                         .lock()
                         .map_err(|_| unavailable("operation lock poisoned"))?;
+                    guard.start_phase = start_phase;
                     let finalize_result =
                         finalize_operation(&mut guard, ExitDisposition::Unknown, false);
                     quarantine_operation(&mut guard);
@@ -1237,14 +1269,9 @@ impl ProcessExecutor for WindowsProcessExecutor {
             // watcher spawn. The watcher thread owns the wall deadline
             // independently of inspect()/reconcile() polling. State machine
             // phase: `WatcherSetup` (still post-resume: the child is live).
-            debug_assert!(matches!(
-                StartPhase::WatcherSetup,
-                StartPhase::Resumed
-                    | StartPhase::CaptureSetup
-                    | StartPhase::WatcherSetup
-                    | StartPhase::RegistryPublication
-                    | StartPhase::ReceiptPublication
-            ));
+            debug_assert_eq!(start_phase, StartPhase::CaptureSetup);
+            start_phase = StartPhase::WatcherSetup;
+            debug_assert_eq!(start_phase, StartPhase::WatcherSetup);
             let watcher_owner = deadline_watcher_owner_id(&operation_id);
             let Ok(deadline_watcher) = spawn_deadline_watcher(&operation_id, &operation) else {
                 // Fail closed AFTER resume (issues #83 §2 / #84 §2): the child is
@@ -1262,6 +1289,7 @@ impl ProcessExecutor for WindowsProcessExecutor {
                 let mut guard = operation
                     .lock()
                     .map_err(|_| unavailable("operation lock poisoned"))?;
+                guard.start_phase = start_phase;
                 if finalize_operation(&mut guard, ExitDisposition::Unknown, false).is_err() {
                     // Finalize already stored partial termination/cleanup
                     // evidence on the op; fall through to fencing.
@@ -1298,20 +1326,16 @@ impl ProcessExecutor for WindowsProcessExecutor {
             // State machine phase: `RegistryPublication` — the exact point
             // FAIL_START_PUBLISH_FOR hooks so tests can prove containment.
             guard.deadline_watcher_owner = Some(watcher_owner);
+            guard.start_phase = StartPhase::WatcherSetup;
             // All mandatory control owners are now installed (both capture
             // threads + deadline watcher). Snapshot the Running view for the
             // initial evidence record BEFORE registry publication.
             let view = guard.state.view();
             let sink = Arc::clone(&guard.sink);
             drop(guard);
-            debug_assert!(matches!(
-                StartPhase::RegistryPublication,
-                StartPhase::Resumed
-                    | StartPhase::CaptureSetup
-                    | StartPhase::WatcherSetup
-                    | StartPhase::RegistryPublication
-                    | StartPhase::ReceiptPublication
-            ));
+            debug_assert_eq!(start_phase, StartPhase::WatcherSetup);
+            start_phase = StartPhase::RegistryPublication;
+            debug_assert_eq!(start_phase, StartPhase::RegistryPublication);
             #[cfg(test)]
             let s84_registry_publish_fail =
                 s84_take_injection(&FAIL_START_PUBLISH_FOR, &operation_id, &["registry"]);
@@ -1327,6 +1351,7 @@ impl ProcessExecutor for WindowsProcessExecutor {
                 let mut guard = operation
                     .lock()
                     .map_err(|_| unavailable("operation lock poisoned"))?;
+                guard.start_phase = start_phase;
                 if finalize_operation(&mut guard, ExitDisposition::Unknown, false).is_err() {
                     // Finalize already stored partial termination/cleanup
                     // evidence on the op; fall through to fencing.
@@ -1366,6 +1391,7 @@ impl ProcessExecutor for WindowsProcessExecutor {
                 // (#84: post-resume but pre-receipt, so the start already
                 // owns a resumed child — the retained op already carries the
                 // Job owner and the fence stops any new effect authority.)
+                guard.start_phase = start_phase;
                 quarantine_operation(&mut guard);
                 let _ = quarantine_snapshot(&operation_id, &guard, SINK_EVIDENCE_GAP);
                 drop(guard);
@@ -1381,14 +1407,9 @@ impl ProcessExecutor for WindowsProcessExecutor {
             // installed (both capture threads + deadline watcher) and the
             // resumed child identity is durably registered below. The last
             // FAIL_START_PUBLISH_FOR hook fires here.
-            debug_assert!(matches!(
-                StartPhase::ReceiptPublication,
-                StartPhase::Resumed
-                    | StartPhase::CaptureSetup
-                    | StartPhase::WatcherSetup
-                    | StartPhase::RegistryPublication
-                    | StartPhase::ReceiptPublication
-            ));
+            debug_assert_eq!(start_phase, StartPhase::RegistryPublication);
+            start_phase = StartPhase::ReceiptPublication;
+            debug_assert_eq!(start_phase, StartPhase::ReceiptPublication);
             #[cfg(test)]
             let s84_receipt_publish_fail =
                 s84_take_injection(&FAIL_START_PUBLISH_FOR, &operation_id, &["receipt"]);
@@ -1396,8 +1417,21 @@ impl ProcessExecutor for WindowsProcessExecutor {
             let s84_receipt_publish_fail = false;
             if s84_receipt_publish_fail {
                 // Injected receipt-publication failure after a durably
-                // registered op: fence locally, KEEP the op queryable, never
-                // hand out a receipt, never touch unrelated ops.
+                // registered op: contain the COMPLETE Job tree through the
+                // admitted owner (same `finalize_operation` →
+                // `terminate_in_place(JOB_TERMINATION_CODE)` containment as
+                // the capture/registry paths), then fence locally, KEEP the
+                // op queryable, never hand out a receipt, never touch
+                // unrelated ops. The op stays registered UnknownOutcome with
+                // the cleanup owner, same as the other post-resume paths.
+                let mut guard = operation
+                    .lock()
+                    .map_err(|_| unavailable("operation lock poisoned"))?;
+                guard.start_phase = start_phase;
+                if finalize_operation(&mut guard, ExitDisposition::Unknown, false).is_err() {
+                    // Finalize already stored partial termination/cleanup
+                    // evidence on the op; fall through to fencing.
+                }
                 guard.start_publish_gap = Some(PUBLISH_EVIDENCE_GAP);
                 quarantine_operation(&mut guard);
                 let _ = quarantine_snapshot(&operation_id, &guard, PUBLISH_EVIDENCE_GAP);
@@ -1420,6 +1454,7 @@ impl ProcessExecutor for WindowsProcessExecutor {
                 // A poisoned registry on the success path must not fabricate
                 // success: fence the (unregistered) operation locally and
                 // report unknown while leaving every other operation alone.
+                guard.start_phase = start_phase;
                 quarantine_operation(&mut guard);
                 return Err(ProcessExecutionError::UnknownOutcome);
             }
@@ -1427,6 +1462,7 @@ impl ProcessExecutor for WindowsProcessExecutor {
                 // The operation is already registered above, so the receipt
                 // failure stays local: fence this op, keep it queryable for
                 // reconcile/shutdown, and never close unrelated paths.
+                guard.start_phase = start_phase;
                 quarantine_operation(&mut guard);
                 let _ = quarantine_snapshot(&operation_id, &guard, RECEIPT_EVIDENCE_GAP);
                 return Err(ProcessExecutionError::UnknownOutcome);
@@ -1490,6 +1526,17 @@ impl ProcessExecutor for WindowsProcessExecutor {
                 && let Err(error) = finalize_operation(&mut guard, ExitDisposition::Cancelled, true)
             {
                 quarantine_operation(&mut guard);
+                // `finalize_operation` is the same tree-termination path the
+                // start failure routes use: it may have fenced this op as
+                // `UnknownOutcome` while proving the containment attempt, or
+                // it may surface a typed contract error for the same fence.
+                // Surface the honest typed outcome instead of falling through
+                // to a second `cancel()` projection that can never succeed
+                // from `UnknownOutcome` (and would fabricate an
+                // `InvalidTransition` contract error for a contained op).
+                if guard.state.view().lifecycle() == ProcessLifecycle::UnknownOutcome {
+                    return Err(ProcessExecutionError::UnknownOutcome);
+                }
                 return Err(error);
             }
             // Re-read the receipt after the finalize path so the returned
@@ -1753,6 +1800,18 @@ fn finalize_operation(
     if let Err(error) = operation.state.exit(exit, descendants) {
         operation.termination = Some(termination);
         operation.cleanup_required = true;
+        // `ProcessState::exit` computes the `UnknownOutcome` fence internally
+        // whenever tree closure is unproven, but its `ensure_transition`
+        // gate can still reject that fence when the op already sits at
+        // `UnknownOutcome` (e.g. a cancel-then-terminate race: cancel fenced
+        // first, the contained tree termination lands second). The tree IS
+        // contained through the admitted owner here (`terminate_in_place`
+        // above), so map the redundant-fence rejection to the honest typed
+        // `UnknownOutcome` instead of fabricating an `InvalidTransition`
+        // contract error for a contained op.
+        if operation.state.view().lifecycle() == ProcessLifecycle::UnknownOutcome {
+            return Err(ProcessExecutionError::UnknownOutcome);
+        }
         return Err(error.into());
     }
     let _ = operation.child.take();
@@ -1830,6 +1889,7 @@ fn quarantine_snapshot(
         deadline_watcher_owner: operation.deadline_watcher_owner.clone(),
         wall_time_enforcement_installed: operation.deadline_watcher_owner.is_some(),
         watcher_fail_closed_contained: operation.watcher_fail_closed_contained,
+        start_phase: operation.start_phase.as_str(),
         descendants_complete: descendants.map(DescendantEvidence::complete),
         tree_terminated: descendants.map(DescendantEvidence::tree_terminated),
         cleanup_pending: operation.cleanup_required
@@ -1884,6 +1944,7 @@ fn quarantined_record(
         deadline_watcher_owner: operation.deadline_watcher_owner.clone(),
         wall_time_enforcement_installed: operation.deadline_watcher_owner.is_some(),
         watcher_fail_closed_contained: operation.watcher_fail_closed_contained,
+        start_phase: operation.start_phase.as_str(),
         descendants_complete: descendants.map(DescendantEvidence::complete),
         tree_terminated: descendants.map(DescendantEvidence::tree_terminated),
         cleanup_pending: operation.cleanup_required
@@ -2062,7 +2123,11 @@ fn s84_arm_stdout_failure_for(key: &str) {
 }
 
 #[cfg(all(test, windows))]
-fn s84_disarm_stdout_failure_for(_key: &str) {}
+fn s84_disarm_stdout_failure_for(key: &str) {
+    if let Ok(mut guard) = FAIL_STDOUT_SPAWN_FOR.lock() {
+        guard.remove(key);
+    }
+}
 
 /// Arms the exact stderr capture-spawn failure key. Both stream arms exist
 /// so each stream has a symmetric hook; the 2-test acceptance uses stdout
@@ -2079,7 +2144,11 @@ fn s84_arm_stderr_failure_for(key: &str) {
 /// cleanup path so an unconsumed arm can never leak into another test.
 #[cfg(all(test, windows))]
 #[allow(dead_code, reason = "symmetric stderr hook for follow-up fault waves")]
-fn s84_disarm_stderr_failure_for(_key: &str) {}
+fn s84_disarm_stderr_failure_for(key: &str) {
+    if let Ok(mut guard) = FAIL_STDERR_SPAWN_FOR.lock() {
+        guard.remove(key);
+    }
+}
 
 #[cfg(all(test, windows))]
 fn s84_arm_start_publish_failure_for(key: &str) {
@@ -2137,6 +2206,40 @@ fn s84_capture_injection(
         s84_take_injection(&FAIL_STDERR_SPAWN_FOR, operation_id, &["stderr"])
     };
     armed.then_some(CaptureSpawnInjection { stream })
+}
+
+/// Scope guard disarming every key the issue-84 stdout test arms, so an
+/// early return cannot leak an arm into another test running at default
+/// parallelism. The armed key is identity-scoped; the `"stdout"` stream
+/// label covers the same hook when armed by step label.
+#[cfg(all(test, windows))]
+struct S84StdoutArmGuard<'a> {
+    op_key: &'a str,
+}
+
+#[cfg(all(test, windows))]
+impl Drop for S84StdoutArmGuard<'_> {
+    fn drop(&mut self) {
+        s84_disarm_stdout_failure_for(self.op_key);
+        s84_disarm_stdout_failure_for("stdout");
+    }
+}
+
+/// Scope guard disarming every key the issue-84 publish test arms (the
+/// op identity plus both step labels), so an early return cannot leak an
+/// arm into another test running at default parallelism.
+#[cfg(all(test, windows))]
+struct S84PublishArmGuard<'a> {
+    op_key: &'a str,
+}
+
+#[cfg(all(test, windows))]
+impl Drop for S84PublishArmGuard<'_> {
+    fn drop(&mut self) {
+        s84_disarm_start_publish_failure_for(self.op_key);
+        s84_disarm_start_publish_failure_for("registry");
+        s84_disarm_start_publish_failure_for("receipt");
+    }
 }
 
 #[cfg(windows)]
@@ -4735,12 +4838,14 @@ mod tests {
                 // spawn, so the failure provably covers THIS start at any
                 // thread count. An unrelated concurrent start can neither
                 // steal it nor be fenced by it. The match consumes the arm;
-                // the residual entry below is only belt-and-braces for a
-                // start that failed before the capture point.
+                // the scope guard below disarms every key this test arms
+                // (identity + `"stdout"` stream label) on drop, so an early
+                // return cannot leak an arm into another test running at
+                // default parallelism.
+                let op_key = operation_id.as_str().to_owned();
+                let _arm_guard = super::S84StdoutArmGuard { op_key: &op_key };
                 super::s84_arm_stdout_failure_for(operation_id.as_str());
                 let start_result = block_on(executor.start(request, sink_dyn));
-                super::s84_disarm_stdout_failure_for(operation_id.as_str());
-                super::s84_disarm_stdout_failure_for("stdout");
                 // Typed failed/unknown start disposition: either the exact
                 // capture spawn error (tree contained cleanly) or typed
                 // `UnknownOutcome` (tree contained but closure evidence
@@ -4798,6 +4903,7 @@ mod tests {
                 );
                 assert!(record.cleanup_pending());
                 assert!(!record.recovery_action().is_empty());
+                assert_eq!(record.start_phase(), "capture-setup");
                 assert!(record.descendants_complete().is_some());
                 assert!(record.tree_terminated().is_some());
                 assert_eq!(executor.unknown_outcome_count(), 1);
@@ -4857,13 +4963,15 @@ mod tests {
                 let sink_dyn: Arc<dyn ProcessEvidenceSink> = sink.clone();
                 // Identity-scoped injection at the exact registry-publication
                 // point: all capture/watcher owners are already installed,
-                // only publication fails. The extra `"registry"` key covers
-                // the same hook when armed by stream label.
+                // only publication fails. The extra `"registry"`/`"receipt"`
+                // keys cover the same hook when armed by step label; the
+                // scope guard disarms every key this test arms (identity +
+                // both step labels) on drop, so an early return cannot leak
+                // an arm into another test running at default parallelism.
+                let op_key = operation_id.as_str().to_owned();
+                let _arm_guard = super::S84PublishArmGuard { op_key: &op_key };
                 super::s84_arm_start_publish_failure_for(operation_id.as_str());
                 let start_result = block_on(executor.start(request, sink_dyn));
-                super::s84_disarm_start_publish_failure_for(operation_id.as_str());
-                super::s84_disarm_start_publish_failure_for("registry");
-                super::s84_disarm_start_publish_failure_for("receipt");
                 // NEVER a normal receipt: the failed start is typed unknown
                 // even though every control owner installed cleanly.
                 assert!(
@@ -4895,6 +5003,9 @@ mod tests {
                 assert_eq!(record.evidence_gap(), super::PUBLISH_EVIDENCE_GAP);
                 assert!(record.cleanup_pending());
                 assert!(!record.recovery_action().is_empty());
+                assert_eq!(record.start_phase(), "registry-publication");
+                assert!(record.descendants_complete().is_some());
+                assert!(record.tree_terminated().is_some());
                 assert_eq!(executor.unknown_outcome_count(), 1);
                 assert_eq!(executor.cleanup_pending_count(), 1);
                 match block_on(executor.cancel(operation_id.clone())) {
