@@ -132,6 +132,12 @@ members = [
   "crates/smart/eliot-epistemic-contracts",
   "crates/smart/eliot-learning-contracts",
   "crates/smart/eliot-memory-curation-contracts",
+  "crates/smart/eliot-memory-curation-screen",
+  "crates/smart/eliot-dreamer-classification",
+  "crates/smart/eliot-dreamer-relation",
+  "crates/smart/eliot-dreamer-episode",
+  "crates/smart/eliot-dreamer-concept",
+  "crates/smart/eliot-dreamer-procedure",
 ]
 
 # Capability cells declared by `[package.metadata.eliot]` with `agent_order`
@@ -163,12 +169,6 @@ exclude = [
   "crates/smart/eliot-dreamer-probe-plan",  # agent_order 17
   "crates/smart/eliot-context-assembly",  # agent_order 18
   "crates/smart/eliot-reactive-context-plan",  # agent_order 19
-  "crates/smart/eliot-memory-curation-screen",  # agent_order 20
-  "crates/smart/eliot-dreamer-classification",  # agent_order 21
-  "crates/smart/eliot-dreamer-relation",  # agent_order 22
-  "crates/smart/eliot-dreamer-episode",  # agent_order 23
-  "crates/smart/eliot-dreamer-concept",  # agent_order 24
-  "crates/smart/eliot-dreamer-procedure",  # agent_order 25
   "crates/smart/eliot-dreamer-failure",  # agent_order 26
   "crates/smart/eliot-dreamer-structure-repair",  # agent_order 27
   "crates/smart/eliot-dreamer-reconsolidation",  # agent_order 28
