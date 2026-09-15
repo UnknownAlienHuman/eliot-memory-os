@@ -280,6 +280,14 @@ fn cache_key(
 /// the authoritative empty binding set; `Complete` must carry the closed
 /// JSON array of `AdmittedCueBindingProjection`. Any other disposition fails
 /// closed: degraded or unreadable roles never fold into an index.
+///
+/// Integration note: the store's `GetUnderstandingProjectionInputs` read (T11.3
+/// store activation) returns a versioned understanding-inputs envelope
+/// (`{version, selector, scope_id, records, provenance}`), not the
+/// admitted-binding array, so that envelope fails closed here with
+/// [`CueCompositionError::UnexpectedPayload`]. Binding envelope records to
+/// the typed cue families is a follow-up slice; until then only the
+/// authoritative empty builds through this composition.
 fn decoded_bindings(
     inputs: &SevenRoleInputs,
 ) -> Result<Vec<AdmittedCueBindingProjection>, CueCompositionError> {

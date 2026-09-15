@@ -115,8 +115,12 @@ impl KernelContextReadClient {
     /// `GetEvidencePack` (scope-bound, structurally valid),
     /// `GetCurrentEpistemicPosition` (scope-bound, `ExactFence`, `position`
     /// Subject required, structurally valid), or one of the four task-bound
-    /// reconstruction reads (scope-bound, `ExactFence`, no parameters per the
-    /// closed catalogue, structurally valid).
+    /// reconstruction reads (scope-bound, `ExactFence`, currently no
+    /// parameters: this pre-transport gate is deliberately stricter than the
+    /// store catalogue, which declares bounded exact selectors for these
+    /// reads — parameter-carrying requests fail here until a follow-up
+    /// threads the closed selectors, and parameter-free requests fail
+    /// downstream at the catalogue; either way no unvalidated read crosses).
     fn check_execute_capability(request: &NamedReadRequest) -> Result<(), StoreError> {
         match request.operation {
             NamedReadOperation::GetEvidencePack => {
@@ -310,12 +314,19 @@ impl KernelContextReadClient {
 
     /// Checks one T11.3 task-bound reconstruction read before any transport.
     ///
-    /// The closed store catalogue declares no parameters for these four
-    /// operations, so any supplied parameter fails closed here (the catalogue
-    /// remains the authority downstream). `ExactFence` is required because a
-    /// reconstruction closure binds one compatible read generation: a fence
-    /// change must surface as a mismatch, never as a previous generation
-    /// served as current.
+    /// This pre-transport gate currently admits only parameter-free plans and
+    /// rejects any supplied parameter here. The store catalogue (T11.3 store
+    /// activation) declares bounded exact selectors for these four operations
+    /// (`task_id`+`max_records`, optional `problem_id`+`max_records`,
+    /// `selector`+`max_records`, `skill_id`+`max_records`) and remains the
+    /// downstream authority, so neither shape executes end-to-end yet:
+    /// parameter-carrying requests fail at this gate, parameter-free requests
+    /// fail at the catalogue. Threading the closed selectors through this
+    /// gate is a follow-up; until then an unadmitted role reports
+    /// `Unsupported`, distinctly from an authoritative `KnownEmpty`.
+    /// `ExactFence` is required because a reconstruction closure binds one
+    /// compatible read generation: a fence change must surface as a mismatch,
+    /// never as a previous generation served as current.
     fn check_reconstruction_capability(request: &NamedReadRequest) -> Result<(), StoreError> {
         if request.scope_id.is_none() {
             return Err(StoreError::InvalidField {
@@ -509,8 +520,9 @@ impl CanonicalReadClient for KernelContextReadClient {
 ///
 /// Planning of evidence/position selectors stays with the daemon runtime
 /// planners; this borrow plans only the four parameter-free reconstruction
-/// reads and validates their responses against the borrow-time fence. The
-/// borrow-time pin is a second layer behind
+/// reads (which do not satisfy the store catalogue's bounded exact selectors
+/// yet — see [`KernelContextReadClient`]'s capability gate) and validates
+/// their responses against the borrow-time fence. The borrow-time pin is a
 /// [`KernelContextReadClient::execute_named`]'s call-time fence check: a
 /// response matching neither fails closed, so a previous generation is never
 /// served as current. No `composition.rs` change is involved: this uses only
@@ -568,7 +580,10 @@ impl<'a, K: ?Sized, R: ?Sized> ReconstructionReadComposition<'a, K, R> {
     /// Only the four T11.3 reconstruction operations plan here; every other
     /// operation fails closed as [`StoreError::UnknownOperation`] before any
     /// transport. The request carries the borrow-time fence with `ExactFence`
-    /// consistency and no parameters, matching the closed catalogue.
+    /// consistency and no parameters. That shape satisfies this borrow's
+    /// pre-transport gate but not the store catalogue's bounded exact
+    /// selectors, so it reports unadmitted downstream until a follow-up
+    /// threads the closed selectors.
     pub fn plan_role_request(
         &self,
         operation: NamedReadOperation,
