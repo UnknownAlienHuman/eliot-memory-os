@@ -27,6 +27,17 @@
 //! mutation entry and any transition carrying another named command fails
 //! closed against the generated set.
 //!
+//! Issue #686 notes: `RecordAuthorityRevocation` and
+//! `GetAuthorityRevocationHistory` are deliberately known-but-unsupported
+//! here. Their typed parameter contracts
+//! (`operation_parameters::declared_mutation_parameters` /
+//! `declared_read_parameters`) and the Governor decision edge (revocation
+//! envelope, history evidence decoding) are already closed, but catalogue
+//! activation (row, proven per-backend handlers, consumer triple, and the
+//! count-test migration in `tests/operation_manifest_catalogue.rs`) belongs
+//! to a store-owned follow-up slice. Until then both operations fail closed
+//! with [`StoreError::UnknownOperation`] at this gate.
+//!
 //! Authority split (one authority, two mechanisms over the same table):
 //!
 //! * [`generated_operation_manifests`] is the single generator. The genesis
@@ -535,7 +546,8 @@ pub fn validate_transition_against_catalogue(
             | NamedMutationOperation::UpdateTaskState => {
                 validate_typed_mutation_parameters(command.operation, &command.parameters)?;
             }
-            NamedMutationOperation::ApplyEpistemicRevision => {
+            NamedMutationOperation::ApplyEpistemicRevision
+            | NamedMutationOperation::RecordAuthorityRevocation => {
                 return Err(StoreError::UnknownOperation);
             }
         }

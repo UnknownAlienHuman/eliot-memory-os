@@ -91,17 +91,24 @@ pub enum ParameterShape {
     /// non-`observation_operation_id` problem-leg `ReconcileRecovery` fields
     /// (`problem_id`, `expected_problem_revision` as its decimal string,
     /// `attempt_digest`, `effect_digest`, `operation_manifest_digest`,
-/// `artifact_binding_digest`, `fence_digest`, `observation_record_id`,
-/// and `observation_request_digest`), for the six task-control
-/// `UpdateTaskState` fields (`task_id`, `event_id`, `from`, `to`,
-/// `expected_revision` as its decimal string, and `actor_ref`; `from` is
-/// optional because the proposing transition carries no predecessor state),
-/// and for the
-/// two `GetEvidencePack` selectors (the exact captured-observation
+    /// `artifact_binding_digest`, `fence_digest`, `observation_record_id`,
+    /// and `observation_request_digest`), for the six task-control
+    /// `UpdateTaskState` fields (`task_id`, `event_id`, `from`, `to`,
+    /// `expected_revision` as its decimal string, and `actor_ref`; `from` is
+    /// optional because the proposing transition carries no predecessor state),
+    /// for the seven authority-revocation `RecordAuthorityRevocation` fields
+    /// (`origin_ref`, `closure_id`, `closure_revision` as its decimal string,
+    /// `affected_digest`, `affected_count` as its decimal string,
+    /// `invalidation_reason`, `fence_digest`), and for the
+    /// two `GetEvidencePack` selectors (the exact captured-observation
     /// `subject` and the explicit `max_records` bound as its decimal
     /// string, range-checked against
     /// [`EVIDENCE_PACK_MAX_RECORDS`](crate::operation_catalogue::EVIDENCE_PACK_MAX_RECORDS) by
-    /// every handler). Length is bounded by the owning manifest entry's
+    /// every handler), and for the two `GetAuthorityRevocationHistory`
+    /// selectors (the exact revoked `origin_ref` and the explicit
+    /// `max_records` bound as its decimal string, range-checked against
+    /// [`REVOCATION_HISTORY_MAX_RECORDS`](crate::REVOCATION_HISTORY_MAX_RECORDS)
+    /// by every handler). Length is bounded by the owning manifest entry's
     /// `max_input_bytes` over the canonical parameter bytes (the same
     /// mechanism that bounds the activated reads), so no separate string
     /// length constant exists here.
@@ -272,6 +279,75 @@ static RECONCILE_RECOVERY_PARAMETERS: [ParameterDeclaration; 10] = [
 ];
 static NO_PARAMETERS: [ParameterDeclaration; 0] = [];
 
+/// Owner-approved authority-revocation fields emitted by the Governor
+/// authority-revocation envelope
+/// (`crates/governor/eliot-governor/src/authority_revocation.rs`,
+/// `authority_revocation_envelope`, issue #686): the revoked `origin_ref`,
+/// the recorded `closure_id`, the durable history `closure_revision` as its
+/// decimal string (mirroring how `AppendAuditEvent` carries
+/// `expected_revision`), the canonical digest of the sorted affected set
+/// (`affected_digest`), the affected-set size as its decimal string
+/// (`affected_count`), the terminal `invalidation_reason` in its
+/// `SCREAMING_SNAKE_CASE` wire spelling, and the `fence_digest` binding the
+/// record to its state fence.
+static RECORD_AUTHORITY_REVOCATION_PARAMETERS: [ParameterDeclaration; 7] = [
+    ParameterDeclaration {
+        name: "origin_ref",
+        shape: ParameterShape::Subject,
+        required: true,
+    },
+    ParameterDeclaration {
+        name: "closure_id",
+        shape: ParameterShape::Subject,
+        required: true,
+    },
+    ParameterDeclaration {
+        name: "closure_revision",
+        shape: ParameterShape::Subject,
+        required: true,
+    },
+    ParameterDeclaration {
+        name: "affected_digest",
+        shape: ParameterShape::Subject,
+        required: true,
+    },
+    ParameterDeclaration {
+        name: "affected_count",
+        shape: ParameterShape::Subject,
+        required: true,
+    },
+    ParameterDeclaration {
+        name: "invalidation_reason",
+        shape: ParameterShape::Subject,
+        required: true,
+    },
+    ParameterDeclaration {
+        name: "fence_digest",
+        shape: ParameterShape::Subject,
+        required: true,
+    },
+];
+
+/// Owner-approved revocation-history selectors for the
+/// `GetAuthorityRevocationHistory` named read (issue #686): the exact
+/// revoked `origin_ref` and the explicit `max_records` bound carried as its
+/// decimal string, mirroring the `GetEvidencePack` `subject` /
+/// `max_records` selectors and range-checked against
+/// [`REVOCATION_HISTORY_MAX_RECORDS`](crate::REVOCATION_HISTORY_MAX_RECORDS)
+/// by every handler.
+static GET_AUTHORITY_REVOCATION_HISTORY_PARAMETERS: [ParameterDeclaration; 2] = [
+    ParameterDeclaration {
+        name: "origin_ref",
+        shape: ParameterShape::Subject,
+        required: true,
+    },
+    ParameterDeclaration {
+        name: "max_records",
+        shape: ParameterShape::Subject,
+        required: true,
+    },
+];
+
 /// Owner-approved task-control fields emitted by the Governor task lifecycle
 /// envelope (`crates/governor/eliot-governor/src/task_lifecycle.rs`,
 /// `task_envelope`): the transitioned `task_id`, the admitted `event_id`, the
@@ -334,6 +410,7 @@ pub const fn named_read_operation_name(operation: NamedReadOperation) -> &'stati
         NamedReadOperation::GetMailbox => "GetMailbox",
         NamedReadOperation::GetAuditRange => "GetAuditRange",
         NamedReadOperation::ResolveWriteReceipt => "ResolveWriteReceipt",
+        NamedReadOperation::GetAuthorityRevocationHistory => "GetAuthorityRevocationHistory",
     }
 }
 
@@ -359,6 +436,7 @@ pub const fn named_read_operation_by_name(name: &str) -> Option<NamedReadOperati
         b"GetMailbox" => Some(NamedReadOperation::GetMailbox),
         b"GetAuditRange" => Some(NamedReadOperation::GetAuditRange),
         b"ResolveWriteReceipt" => Some(NamedReadOperation::ResolveWriteReceipt),
+        b"GetAuthorityRevocationHistory" => Some(NamedReadOperation::GetAuthorityRevocationHistory),
         _ => None,
     }
 }
@@ -373,6 +451,7 @@ pub const fn named_mutation_operation_name(operation: NamedMutationOperation) ->
         NamedMutationOperation::ApplyLifecyclePolicy => "ApplyLifecyclePolicy",
         NamedMutationOperation::ReconcileRecovery => "ReconcileRecovery",
         NamedMutationOperation::AppendAuditEvent => "AppendAuditEvent",
+        NamedMutationOperation::RecordAuthorityRevocation => "RecordAuthorityRevocation",
     }
 }
 
@@ -386,6 +465,7 @@ pub const fn named_mutation_operation_by_name(name: &str) -> Option<NamedMutatio
         b"ApplyLifecyclePolicy" => Some(NamedMutationOperation::ApplyLifecyclePolicy),
         b"ReconcileRecovery" => Some(NamedMutationOperation::ReconcileRecovery),
         b"AppendAuditEvent" => Some(NamedMutationOperation::AppendAuditEvent),
+        b"RecordAuthorityRevocation" => Some(NamedMutationOperation::RecordAuthorityRevocation),
         _ => None,
     }
 }
@@ -395,7 +475,9 @@ pub const fn named_mutation_operation_by_name(name: &str) -> Option<NamedMutatio
 /// `ResolveWriteReceipt` declares the required `operation_id` parameter and
 /// `GetEvidencePack` declares the required bounded exact selectors (the
 /// exact captured-observation `subject` and the explicit `max_records`
-/// bound); every other variant declares none, so any supplied parameter
+/// bound); `GetAuthorityRevocationHistory` declares the required bounded
+/// exact selectors (the exact revoked `origin_ref` and the explicit
+/// `max_records` bound); every other variant declares none, so any supplied parameter
 /// fails closed. Variants without a catalogue entry never reach this table:
 /// they fail as [`StoreError::UnknownOperation`] first.
 #[must_use]
@@ -405,6 +487,9 @@ pub const fn declared_read_parameters(
     match operation {
         NamedReadOperation::ResolveWriteReceipt => &RESOLVE_WRITE_RECEIPT_PARAMETERS,
         NamedReadOperation::GetEvidencePack => &GET_EVIDENCE_PACK_PARAMETERS,
+        NamedReadOperation::GetAuthorityRevocationHistory => {
+            &GET_AUTHORITY_REVOCATION_HISTORY_PARAMETERS
+        }
         NamedReadOperation::GetRevisionHeads
         | NamedReadOperation::GetScopeRevisionView
         | NamedReadOperation::GetOrderingHeads
@@ -435,6 +520,10 @@ pub const fn declared_read_parameters(
 /// `observation_record_id`, `observation_request_digest`); `UpdateTaskState`
 /// declares the six required-except-`from` task-control fields (`task_id`,
 /// `event_id`, optional `from`, `to`, `expected_revision`, `actor_ref`);
+/// `RecordAuthorityRevocation` declares the seven required
+/// authority-revocation fields (`origin_ref`, `closure_id`,
+/// `closure_revision`, `affected_digest`, `affected_count`,
+/// `invalidation_reason`, `fence_digest`);
 /// every other variant declares none,
 /// so any supplied parameter fails closed. Variants without a catalogue entry
 /// never reach this table: they fail as [`StoreError::UnknownOperation`] first.
@@ -448,6 +537,9 @@ pub const fn declared_mutation_parameters(
         NamedMutationOperation::ApplyLifecyclePolicy => &APPLY_LIFECYCLE_POLICY_PARAMETERS,
         NamedMutationOperation::ReconcileRecovery => &RECONCILE_RECOVERY_PARAMETERS,
         NamedMutationOperation::UpdateTaskState => &UPDATE_TASK_STATE_PARAMETERS,
+        NamedMutationOperation::RecordAuthorityRevocation => {
+            &RECORD_AUTHORITY_REVOCATION_PARAMETERS
+        }
         NamedMutationOperation::ApplyEpistemicRevision => &NO_PARAMETERS,
     }
 }

@@ -16,7 +16,8 @@ use super::CompositionError;
 use eliot_authority::{
     EffectAuthorizer, EffectAuthorizerRecoverySnapshot, GrantActivationRequest, GrantGraph,
     GrantGraphRecoverySnapshot, GrantRevocationRequest, GrantStatus, IntroductionActivationRequest,
-    IntroductionRevocationRequest, IntroductionStatus, P07PortError, SnapshotId,
+    IntroductionRevocationRequest, IntroductionStatus, P07PortError, RevocationHistoryEvidence,
+    SnapshotId, SuppressedGrant,
 };
 use eliot_contracts::{EpochId, StateFence};
 use eliot_receipts::AuthorityBinding;
@@ -125,6 +126,21 @@ pub struct AuthorityOwner {
     pub grants: GrantGraph,
 }
 
+/// Restored authority owner with the exact history-suppressed set.
+///
+/// Returned by
+/// [`AuthorityOwner::from_snapshot_with_revocation_history`]: the owner
+/// never exposes a revoked origin or its dependent grants as effective,
+/// and `suppressed` reports every history-suppressed grant with its
+/// reason.
+#[derive(Clone, Debug)]
+pub struct AuthorityRestoreOutcome {
+    /// Restored authority owner with revocations applied.
+    pub owner: AuthorityOwner,
+    /// Every history-suppressed grant in grant-id order with its reason.
+    pub suppressed: Vec<SuppressedGrant>,
+}
+
 impl AuthorityOwner {
     pub(super) fn from_snapshot(
         snapshot: &AuthorityOwnerSnapshot,
@@ -139,6 +155,54 @@ impl AuthorityOwner {
             state_fence: snapshot.state_fence.clone(),
             effects,
             grants,
+        })
+    }
+
+    /// Restores authority under explicit CURRENT revocation-history
+    /// evidence, applying committed revocations before any grant becomes
+    /// effective (issue #686).
+    ///
+    /// `None` history refuses: unavailable history is not absence of
+    /// revocation and never restores as an empty closure. Stale (fence or
+    /// revision drift, including drift against this snapshot's fence) and
+    /// unknown (invalid, unordered, or non-revoked closure) evidence refuse
+    /// likewise. A revoked origin and its dependent grants stay suppressed
+    /// in the restored owner; unrelated valid grants restore exactly as the
+    /// snapshot carries them, with the exact suppressed set reported.
+    ///
+    /// The legacy [`from_snapshot`](Self::from_snapshot) preserves its
+    /// exact prior behavior for previously-admitted callers.
+    pub fn from_snapshot_with_revocation_history(
+        snapshot: &AuthorityOwnerSnapshot,
+        expected_fence: &StateFence,
+        history: Option<&RevocationHistoryEvidence>,
+    ) -> Result<AuthorityRestoreOutcome, CompositionError> {
+        snapshot.validate_against(expected_fence)?;
+        let evidence = history.ok_or_else(|| {
+            CompositionError::Recovery(
+                "authority revocation history is unavailable; unavailable history is not absence of revocation"
+                    .to_owned(),
+            )
+        })?;
+        if evidence.state_fence != *expected_fence || evidence.state_fence != snapshot.state_fence {
+            return Err(CompositionError::Recovery(
+                "authority revocation history is stale for this recovery fence".to_owned(),
+            ));
+        }
+        let outcome = GrantGraph::from_recovery_snapshot_with_revocation_history(
+            snapshot.grant_graph.clone(),
+            Some(evidence),
+        )
+        .map_err(|error| CompositionError::Recovery(error.to_string()))?;
+        let effects = EffectAuthorizer::from_snapshot(snapshot.effect_authorizer.clone())
+            .map_err(|error| CompositionError::Recovery(error.to_string()))?;
+        Ok(AuthorityRestoreOutcome {
+            owner: Self {
+                state_fence: snapshot.state_fence.clone(),
+                effects,
+                grants: outcome.graph,
+            },
+            suppressed: outcome.suppressed,
         })
     }
 
