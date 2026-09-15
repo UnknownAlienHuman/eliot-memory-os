@@ -43,11 +43,14 @@
 use std::collections::BTreeMap;
 
 use eliot_canonical::CanonicalWriteEnvelope;
-use eliot_contracts::{OperationId, RequestMetadata, TaskId, canonical_json_bytes, sha256_hex};
+use eliot_contracts::{
+    OperationId, RequestMetadata, StateFence, TaskId, TaskRevision, canonical_json_bytes,
+    sha256_hex,
+};
 use eliot_store_api::{
     CONTRACT_VERSION, EffectClass, EventProjectionRelationIntents, NamedMutationOperation,
     NamedMutationRequest, NamedOperationManifest, OperationManifestDigest, OrderingHeadExpectation,
-    OrderingScopeId, ScopeId, SecurityContext, StoreError, StoreFailure,
+    OrderingScopeId, ScopeId, SecurityContext, StoreFailure,
     StoreFailureDisposition, StoreFailureIdentityContext, StoreMutationDisposition,
     StoreReasonCode, StoreRecoveryAction, StoreRetryDirective, TransitionClass, WriteReceipt,
     WriteReceiptStatus,
@@ -439,7 +442,7 @@ impl<P: KernelTransitionPort + ?Sized> GovernorTaskLifecycle<'_, P> {
         let expected_revision = context
             .state_fence
             .task_revision
-            .map_or(current.revision, |revision| revision.value());
+            .map_or(current.revision, TaskRevision::value);
         let mut scratch = self.task.clone();
         let event = scratch.apply(task_id.clone(), context, command)?;
         let record = scratch.task(&task_id).cloned().ok_or_else(|| {
@@ -499,12 +502,38 @@ impl<P: KernelTransitionPort + ?Sized> GovernorTaskLifecycle<'_, P> {
             }
             Err(other) => return Err(TaskLifecycleError::Composition(other)),
         };
+        check_committed_receipt(
+            &receipt,
+            &operation_id,
+            &fence,
+            &identity.idempotency_key,
+            &manifest_digest,
+            &ctx,
+        )?;
+        Ok(receipt)
+    }
+}
+
+/// Validates one issued receipt against the admitted task identity.
+///
+/// The operation identity, fence, idempotency key, transition class, and
+/// manifest digest must agree exactly with the admitted transition, and only
+/// [`WriteReceiptStatus::Committed`] succeeds; every other status stays
+/// pending as a typed [`StoreFailure`], never reported as executed.
+fn check_committed_receipt(
+    receipt: &WriteReceipt,
+    operation_id: &OperationId,
+    fence: &StateFence,
+    idempotency_key: &str,
+    manifest_digest: &OperationManifestDigest,
+    ctx: &StoreFailureIdentityContext,
+) -> Result<(), TaskLifecycleError> {
         receipt
             .validate()
-            .map_err(|error| map_store_error(error, &ctx))?;
-        if receipt.operation_id != operation_id
-            || receipt.state_fence != fence
-            || receipt.idempotency_key != identity.idempotency_key
+            .map_err(|error| map_store_error(error, ctx))?;
+        if receipt.operation_id != *operation_id
+            || receipt.state_fence != *fence
+            || receipt.idempotency_key != idempotency_key
         {
             let failure = store_failure(
                 StoreFailureDisposition::DeterministicRejection,
@@ -571,8 +600,7 @@ impl<P: KernelTransitionPort + ?Sized> GovernorTaskLifecycle<'_, P> {
             )?;
             return Err(TaskLifecycleError::Store(failure));
         }
-        Ok(receipt)
-    }
+        Ok(())
 }
 
 #[cfg(test)]

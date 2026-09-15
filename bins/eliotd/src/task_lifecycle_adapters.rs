@@ -42,20 +42,20 @@ use eliot_governor::{
 /// single Governor owner triple) and forwards each call unchanged. It adds no
 /// validation, retry, or state of its own; every typed success or fail-closed
 /// error comes from the Governor owner.
-pub(crate) struct ForwardingTaskLifecycle<'a, P: ?Sized> {
+pub struct ForwardingTaskLifecycle<'a, P: ?Sized> {
     inner: GovernorTaskLifecycle<'a, P>,
 }
 
 impl<'a, P: ?Sized> ForwardingTaskLifecycle<'a, P> {
     /// Wraps the single Governor task lifecycle owner for forwarding.
-    pub(crate) fn new(inner: GovernorTaskLifecycle<'a, P>) -> Self {
+    pub fn new(inner: GovernorTaskLifecycle<'a, P>) -> Self {
         Self { inner }
     }
 }
 
 impl<P: KernelTransitionPort + ?Sized> ForwardingTaskLifecycle<'_, P> {
     /// Forwards one authenticated task record read to the Governor owner.
-    pub(crate) fn view(
+    pub fn view(
         &self,
         ctx: &eliot_contracts::RequestMetadata,
         task_id: &eliot_contracts::TaskId,
@@ -65,7 +65,7 @@ impl<P: KernelTransitionPort + ?Sized> ForwardingTaskLifecycle<'_, P> {
 
     /// Forwards one task proposal to the Governor canonical path and returns
     /// only the exact issued receipt.
-    pub(crate) async fn propose_task(
+    pub async fn propose_task(
         &self,
         identity: &eliot_protocol::RequestIdentity,
         operation_id: eliot_contracts::OperationId,
@@ -78,7 +78,7 @@ impl<P: KernelTransitionPort + ?Sized> ForwardingTaskLifecycle<'_, P> {
 
     /// Forwards one guarded task command to the Governor canonical path and
     /// returns only the exact issued receipt.
-    pub(crate) async fn apply_task(
+    pub async fn apply_task(
         &self,
         identity: &eliot_protocol::RequestIdentity,
         operation_id: eliot_contracts::OperationId,
