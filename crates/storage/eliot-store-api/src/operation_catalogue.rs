@@ -2,10 +2,12 @@
 //!
 //! This module owns the single Rust declaration table that generates one
 //! [`NamedOperationManifest`](crate::NamedOperationManifest) descriptor per
-//! activated operation. The table activates exactly the six reads with
+//! activated operation. The table activates exactly the ten reads with
 //! proven adapter handlers, parameter shapes, and consumers on base
 //! (`GetRevisionHeads`, `GetOrderingHeads`, `GetScopeRevisionView`,
-//! `ResolveWriteReceipt`, `GetEvidencePack`, `GetCurrentEpistemicPosition`), the four `CaptureObservation` /
+//! `ResolveWriteReceipt`, `GetEvidencePack`, `GetCurrentEpistemicPosition`,
+//! plus T11.3 `GetTaskState`, `GetAttentionAndProblems`,
+//! `GetUnderstandingProjectionInputs`, `GetCapabilityEvidenceState`), the four `CaptureObservation` /
 //! `AppendAuditEvent` / `ApplyLifecyclePolicy` mutations (AUD-C01:
 //! `CaptureObservation` and `AppendAuditEvent` persist
 //! `TransitionClass::CaptureCandidate` with the `EffectClass::Candidate`
@@ -186,10 +188,16 @@ struct ActivatedReadDescriptor {
 /// request field (proven by both adapter handlers); `GetEvidencePack`
 /// addresses its scope the same way (the Governor read facade requires a
 /// scope for it) and addresses its evidence through the declared `subject`
-/// / `max_records` parameters. The head and receipt reads address no scope;
+/// / `max_records` parameters. The T11.3 cognitive reads address their scope
+/// the same way and their records through their declared selectors
+/// (`GetTaskState` via exact `task_id` + `max_records`, `GetAttentionAndProblems`
+/// via optional exact `problem_id` + `max_records`,
+/// `GetUnderstandingProjectionInputs` via exact `selector` + `max_records`,
+/// `GetCapabilityEvidenceState` via exact `skill_id` + `max_records`). The
+/// head and receipt reads address no scope;
 /// the receipt read addresses its receipt through the declared
 /// `operation_id` parameter.
-const ACTIVATED_READS: [ActivatedReadDescriptor; 6] = [
+const ACTIVATED_READS: [ActivatedReadDescriptor; 10] = [
     ActivatedReadDescriptor {
         operation: NamedReadOperation::GetCurrentEpistemicPosition,
         requires_scope_id: true,
@@ -220,11 +228,31 @@ const ACTIVATED_READS: [ActivatedReadDescriptor; 6] = [
         requires_scope_id: true,
         scope_kind: SCOPE_KIND_SCOPE,
     },
+    ActivatedReadDescriptor {
+        operation: NamedReadOperation::GetTaskState,
+        requires_scope_id: true,
+        scope_kind: SCOPE_KIND_SCOPE,
+    },
+    ActivatedReadDescriptor {
+        operation: NamedReadOperation::GetAttentionAndProblems,
+        requires_scope_id: true,
+        scope_kind: SCOPE_KIND_SCOPE,
+    },
+    ActivatedReadDescriptor {
+        operation: NamedReadOperation::GetUnderstandingProjectionInputs,
+        requires_scope_id: true,
+        scope_kind: SCOPE_KIND_SCOPE,
+    },
+    ActivatedReadDescriptor {
+        operation: NamedReadOperation::GetCapabilityEvidenceState,
+        requires_scope_id: true,
+        scope_kind: SCOPE_KIND_SCOPE,
+    },
 ];
 
 /// Returns the activated read operations in canonical declaration order.
 #[must_use]
-pub const fn activated_read_operations() -> [NamedReadOperation; 6] {
+pub const fn activated_read_operations() -> [NamedReadOperation; 10] {
     [
         ACTIVATED_READS[0].operation,
         ACTIVATED_READS[1].operation,
@@ -232,6 +260,10 @@ pub const fn activated_read_operations() -> [NamedReadOperation; 6] {
         ACTIVATED_READS[3].operation,
         ACTIVATED_READS[4].operation,
         ACTIVATED_READS[5].operation,
+        ACTIVATED_READS[6].operation,
+        ACTIVATED_READS[7].operation,
+        ACTIVATED_READS[8].operation,
+        ACTIVATED_READS[9].operation,
     ]
 }
 
@@ -347,7 +379,7 @@ fn genesis_entry_spec() -> OperationManifestSpec {
 
 /// Generates the per-operation manifest descriptors from the declaration table.
 ///
-/// Declaration order is the canonical order: the six activated reads, the
+/// Declaration order is the canonical order: the ten activated reads, the
 /// six activated mutations, then the genesis bootstrap entry. Generation is
 /// pure over crate constants, so the same source always yields byte-identical
 /// entries.

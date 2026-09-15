@@ -39,6 +39,13 @@ pub(super) const READ_VALIDATION_SNAPSHOT: &str = "BEGIN TRANSACTION; SELECT * F
 /// `records` / `provenance`; any shape change bumps it on both sides.
 const EVIDENCE_PACK_PAYLOAD_VERSION: u32 = 1;
 
+/// Version of the T11.3 cognitive read payloads. Each must stay equal to its
+/// reference counterpart in `eliot-store-memory`.
+const TASK_STATE_PAYLOAD_VERSION: u32 = 1;
+const ATTENTION_PROBLEMS_PAYLOAD_VERSION: u32 = 1;
+const UNDERSTANDING_INPUTS_PAYLOAD_VERSION: u32 = 1;
+const CAPABILITY_EVIDENCE_PAYLOAD_VERSION: u32 = 1;
+
 /// One receipt row of the closed evidence SELECT (see
 /// [`schema::READ_EVIDENCE_RECORDS`](crate::schema::READ_EVIDENCE_RECORDS)).
 ///
@@ -76,7 +83,7 @@ struct EvidenceRecordRow {
 /// Enforces the active generated catalogue on one named read before dispatch
 /// (slice C2, issue #19).
 ///
-/// Only the five activated reads (plus the genesis bootstrap entry, which
+/// Only the ten activated reads (plus the genesis bootstrap entry, which
 /// never arrives through this path) are admitted: catalogue membership, the
 /// owner-approved typed parameters, the scope declaration, and the declared
 /// input bound are checked here, before any provider I/O. Unknown operations
@@ -334,6 +341,22 @@ async fn named_read_payload(
         NamedReadOperation::GetEvidencePack => {
             let rows = read_evidence_records(db, &adapter.config).await?;
             evidence_pack_payload(query, state_fence, &rows).map_err(AdapterError::Store)
+        }
+        NamedReadOperation::GetTaskState => {
+            let rows = read_authority_records(db, &adapter.config).await?;
+            task_state_payload(query, state_fence, &rows).map_err(AdapterError::Store)
+        }
+        NamedReadOperation::GetAttentionAndProblems => {
+            let rows = read_authority_records(db, &adapter.config).await?;
+            attention_problems_payload(query, state_fence, &rows).map_err(AdapterError::Store)
+        }
+        NamedReadOperation::GetUnderstandingProjectionInputs => {
+            let rows = read_authority_records(db, &adapter.config).await?;
+            understanding_inputs_payload(query, state_fence, &rows).map_err(AdapterError::Store)
+        }
+        NamedReadOperation::GetCapabilityEvidenceState => {
+            let rows = read_authority_records(db, &adapter.config).await?;
+            capability_evidence_payload(query, state_fence, &rows).map_err(AdapterError::Store)
         }
         other => Err(AdapterError::NamedOperationUnavailable {
             operation: format!("{other:?}"),
@@ -645,6 +668,539 @@ fn evidence_pack_payload(
     }))
 }
 
+/// One payload-authority row of the closed T11.3 SELECT (defined below).
+///
+/// Pre-authority receipts carry no array (they read as `NONE`); the boundary
+/// treats a missing array as empty, never as an error. Those receipts had no
+/// recoverable bytes persisted and stay absent from the T11.3 packs — only
+/// authority-carrying captures are served. Strict: a malformed
+/// authority-carrying record fails closed at deserialization/validation,
+/// never as a silent empty.
+#[derive(Clone, Debug, Deserialize)]
+struct AuthorityRecordRow {
+    operation_index: usize,
+    version: u16,
+    encoding: String,
+    digest_hex: String,
+    byte_len: usize,
+    bytes_utf8: String,
+}
+
+/// One receipt row of the closed T11.3 authority SELECT.
+#[derive(Clone, Debug, Deserialize)]
+struct AuthorityReceiptRow {
+    commit_sequence: Option<u64>,
+    named_operation_count: Option<usize>,
+    payload_authority: Option<Vec<AuthorityRecordRow>>,
+    /// Joined by the immutable commit marker, never by the caller's scope.
+    #[serde(skip)]
+    receipt: Option<WriteReceipt>,
+}
+
+/// Closed T11.3 authority read: one row per receipt with its durable commit
+/// order and opaque payload-authority array. Defined here (not in
+/// `schema.rs`) because only the T11.3 read boundary consumes it; the
+/// physical table/columns already exist via the atomic writer.
+const READ_AUTHORITY_RECORDS: &str = "SELECT VALUE { commit_sequence: commit_sequence, named_operation_count: named_operation_count, payload_authority: payload_authority } FROM write_receipt;";
+
+/// Reads all persisted payload-authority rows through the closed SELECT.
+///
+/// One row per receipt; pre-authority receipts carry no authority array and
+/// contribute nothing. The Rust boundary joins the canonical receipt for
+/// scope/fence/transition-class provenance. Both closed reads share one
+/// snapshot; global operation counts remain intact so filtering never changes
+/// an existing capture index.
+async fn read_authority_records(
+    db: &client::RpcTransport,
+    config: &SurrealAdapterConfig,
+) -> Result<Vec<AuthorityReceiptRow>, AdapterError> {
+    let sql = format!(
+        "BEGIN TRANSACTION; {READ_AUTHORITY_RECORDS} {} COMMIT TRANSACTION;",
+        schema::READ_ALL_RECEIPTS,
+    );
+    let mut response = client::query(db, config, "read.authority_records", &sql, Map::new()).await?;
+    if !response.take_errors().is_empty() {
+        return Err(StoreError::Serialization("authority snapshot query failed".to_owned()).into());
+    }
+    // SurrealDB 3 retains the BEGIN result at index 0 (null).
+    let mut rows = take_vec::<AuthorityReceiptRow>(&mut response, 1)?;
+    let receipts = take_vec::<WriteReceipt>(&mut response, 2)?;
+    let mut by_commit = BTreeMap::new();
+    for receipt in receipts {
+        if let Some(marker) = &receipt.committed_at
+            && by_commit.insert(marker.clone(), receipt).is_some()
+        {
+            return Err(StoreError::InvalidReceipt.into());
+        }
+    }
+    for row in &mut rows {
+        if let Some(sequence) = row.commit_sequence {
+            row.receipt = by_commit.remove(&format!("commit-sequence-{sequence:016}"));
+        }
+    }
+    Ok(rows)
+}
+
+/// Validates one persisted payload-authority record against its own provenance.
+///
+/// The writer bound the exact bytes to version/encoding/digest/length; any
+/// durable mismatch fails closed here instead of serving a lossy projection.
+/// Returns the decoded admitted parameters on success.
+fn validate_authority_record(
+    row: &AuthorityReceiptRow,
+    record: &AuthorityRecordRow,
+) -> Result<BTreeMap<String, Value>, StoreError> {
+    if record.version != PAYLOAD_AUTHORITY_VERSION {
+        return Err(StoreError::Serialization(
+            "authority record version mismatch".to_owned(),
+        ));
+    }
+    if record.encoding != PayloadEncoding::Utf8Json.mnemonic() {
+        return Err(StoreError::Serialization(
+            "authority record encoding mismatch".to_owned(),
+        ));
+    }
+    if record.byte_len != record.bytes_utf8.len() {
+        return Err(StoreError::Serialization(
+            "authority record length mismatch".to_owned(),
+        ));
+    }
+    let bound = ExactJsonBytes::parse(
+        PayloadSource::NamedOperationParameter,
+        record.bytes_utf8.as_bytes(),
+    )?;
+    if bound.digest_hex() != record.digest_hex || bound.byte_len() != record.byte_len {
+        return Err(StoreError::Serialization(
+            "authority record digest mismatch".to_owned(),
+        ));
+    }
+    let parameters = bound.decode_object_parameters()?;
+    let _ = record_operation_count(row, record)?;
+    Ok(parameters)
+}
+
+fn record_operation_count(
+    row: &AuthorityReceiptRow,
+    record: &AuthorityRecordRow,
+) -> Result<usize, StoreError> {
+    // The receipt row carries the transition's total operation count; when
+    // absent (pre-authority shape) the record itself cannot be ordered, so
+    // fail closed rather than guessing.
+    let count = row.named_operation_count.ok_or(StoreError::InvalidReceipt)?;
+    if count == 0 || record.operation_index >= count {
+        return Err(StoreError::InvalidReceipt);
+    }
+    Ok(count)
+}
+
+/// Infers the closed mutation operation for one decoded authority parameter
+/// map within its receipt transition class.
+///
+/// The atomic writer does not persist operation names beside the opaque
+/// bytes; the closed parameter shapes plus the receipt transition class
+/// discriminate exactly one activated mutation per class on base
+/// (`TaskControl` → `UpdateTaskState`, `LifecyclePolicy` →
+/// `ApplyLifecyclePolicy`, `RecoverySchema` → `ReconcileRecovery`,
+/// `CaptureCandidate` → `CaptureObservation`/`AppendAuditEvent`,
+/// `Epistemic` → `ApplyEpistemicRevision`). Anything else fails closed.
+fn infer_authority_operation(
+    transition_class: eliot_store_api::TransitionClass,
+    parameters: &BTreeMap<String, Value>,
+) -> Result<eliot_store_api::NamedMutationOperation, StoreError> {
+    use eliot_store_api::{NamedMutationOperation, TransitionClass};
+    match transition_class {
+        TransitionClass::TaskControl
+            if parameters.contains_key("task_id") && parameters.contains_key("event_id") =>
+        {
+            Ok(NamedMutationOperation::UpdateTaskState)
+        }
+        TransitionClass::LifecyclePolicy if parameters.contains_key("skill_id") => {
+            Ok(NamedMutationOperation::ApplyLifecyclePolicy)
+        }
+        TransitionClass::RecoverySchema if parameters.contains_key("problem_id") => {
+            Ok(NamedMutationOperation::ReconcileRecovery)
+        }
+        TransitionClass::CaptureCandidate
+            if parameters.contains_key("operation_id")
+                && parameters.contains_key("idempotency_key") =>
+        {
+            Ok(NamedMutationOperation::AppendAuditEvent)
+        }
+        TransitionClass::CaptureCandidate if parameters.contains_key("subject") => {
+            Ok(NamedMutationOperation::CaptureObservation)
+        }
+        TransitionClass::Epistemic if parameters.contains_key("revision") => {
+            Ok(NamedMutationOperation::ApplyEpistemicRevision)
+        }
+        _ => Err(StoreError::InvalidReceipt),
+    }
+}
+
+struct IndexedAuthority {
+    capture_index: u64,
+    operation: eliot_store_api::NamedMutationOperation,
+    parameters: BTreeMap<String, Value>,
+    scope_id: String,
+}
+
+/// Walks authority rows in durable commit order and returns indexed records
+/// with scope provenance.
+///
+/// Receipts walk in `commit_sequence` order, accumulating each receipt's
+/// total operation count, so interleaved operations consume global indices
+/// exactly as the reference `named_operations` vector does. Pre-authority
+/// receipts (no authority array) contribute zero to the walk and serve
+/// nothing. Each authority record is validated (version/encoding/digest/
+/// length/bytes-vs-parameters) and its receipt is validated (committed
+/// status, envelope, command-count agreement); any mismatch fails closed.
+/// Scope comes from the validated receipt envelope, never from the caller.
+fn indexed_authorities(
+    rows: &[AuthorityReceiptRow],
+) -> Result<Vec<IndexedAuthority>, StoreError> {
+    let mut ordered: Vec<&AuthorityReceiptRow> = rows.iter().collect();
+    ordered.sort_by_key(|row| row.commit_sequence.unwrap_or(0));
+    let mut indexed = Vec::new();
+    let mut operation_base: u64 = 0;
+    for row in ordered {
+        let authorities: Vec<&AuthorityRecordRow> = row
+            .payload_authority
+            .as_ref()
+            .map_or(Vec::new(), |records| records.iter().collect());
+        let in_scope_receipt = if authorities.is_empty() {
+            None
+        } else {
+            let receipt = row.receipt.as_ref().ok_or(StoreError::InvalidReceipt)?;
+            receipt.validate()?;
+            let binding = &receipt.require_reconciliation_envelope()?.core.work_scope;
+            if receipt.status != WriteReceiptStatus::Committed
+                || row.named_operation_count != Some(receipt.applied_command_ids.len())
+            {
+                return Err(StoreError::InvalidReceipt);
+            }
+            Some((receipt.transition_class, binding.scope_id.as_str().to_owned()))
+        };
+        for record in authorities {
+            let parameters = validate_authority_record(row, record)?;
+            let capture_index = operation_base.saturating_add(record.operation_index as u64);
+            if let Some((transition_class, scope_id)) = &in_scope_receipt {
+                let operation = infer_authority_operation(*transition_class, &parameters)?;
+                indexed.push(IndexedAuthority {
+                    capture_index,
+                    operation,
+                    parameters,
+                    scope_id: scope_id.clone(),
+                });
+            }
+        }
+        operation_base =
+            operation_base.saturating_add(row.named_operation_count.unwrap_or(0) as u64);
+    }
+    Ok(indexed)
+}
+
+fn parse_max_records_param(query: &NamedReadRequest) -> Result<(u32, usize), StoreError> {
+    let bound_raw = query
+        .parameters
+        .get("max_records")
+        .and_then(Value::as_str)
+        .ok_or(StoreError::InvalidField {
+            field: "operation.parameter",
+            reason: "missing required parameter",
+        })?;
+    let max_records: u32 = bound_raw.parse().map_err(|_| StoreError::InvalidField {
+        field: "operation.parameter",
+        reason: "max_records must be a positive decimal bound",
+    })?;
+    if max_records == 0 {
+        return Err(StoreError::InvalidField {
+            field: "operation.parameter",
+            reason: "max_records must be a positive decimal bound",
+        });
+    }
+    if max_records > EVIDENCE_PACK_MAX_RECORDS {
+        return Err(StoreError::PayloadTooLarge);
+    }
+    let limit = usize::try_from(max_records).map_err(|_| StoreError::PayloadTooLarge)?;
+    Ok((max_records, limit))
+}
+
+/// Builds the versioned `GetTaskState` payload (T11.3, Surreal).
+///
+/// Parity with the reference handler: exact scope/`task_id` match over
+/// `UpdateTaskState` (`TaskControl`) authority records in durable commit
+/// order, explicit `max_records` bound with over-bound refusal, bounded
+/// history plus current (last matching parameters) or null, envelope
+/// provenance, and zero matches as an exact empty — never an error.
+fn task_state_payload(
+    query: &NamedReadRequest,
+    state_fence: &StateFence,
+    rows: &[AuthorityReceiptRow],
+) -> Result<Value, StoreError> {
+    let scope_id = query.scope_id.clone().ok_or(StoreError::InvalidField {
+        field: "scope_id",
+        reason: "task state read requires scope_id",
+    })?;
+    let task_id = query
+        .parameters
+        .get("task_id")
+        .and_then(Value::as_str)
+        .ok_or(StoreError::InvalidField {
+            field: "operation.parameter",
+            reason: "missing required parameter",
+        })?;
+    if task_id.trim().is_empty() || task_id.chars().any(char::is_control) {
+        return Err(StoreError::InvalidField {
+            field: "operation.parameter",
+            reason: "task_id must be a non-blank string",
+        });
+    }
+    let (max_records, limit) = parse_max_records_param(query)?;
+    if query.state_fence != *state_fence {
+        return Err(StoreError::FenceMismatch);
+    }
+    let indexed = indexed_authorities(rows)?;
+    let matched: Vec<&IndexedAuthority> = indexed
+        .iter()
+        .filter(|record| {
+            record.scope_id == scope_id.as_str()
+                && record.operation == eliot_store_api::NamedMutationOperation::UpdateTaskState
+                && record.parameters.get("task_id").and_then(Value::as_str) == Some(task_id)
+        })
+        .collect();
+    let matched_total = matched.len();
+    let current = matched.last().map(|record| record.parameters.clone());
+    let records: Vec<Value> = matched
+        .into_iter()
+        .take(limit)
+        .map(|record| {
+            json!({
+                "capture_index": record.capture_index,
+                "operation": named_mutation_operation_name(record.operation),
+                "parameters": record.parameters,
+            })
+        })
+        .collect();
+    let returned = records.len();
+    Ok(json!({
+        "version": TASK_STATE_PAYLOAD_VERSION,
+        "task_id": task_id,
+        "scope_id": scope_id,
+        "records": records,
+        "current": current,
+        "provenance": {
+            "state_fence": state_fence,
+            "matched_total": matched_total,
+            "returned": returned,
+            "max_records": max_records,
+            "truncated": matched_total > returned,
+        },
+    }))
+}
+
+/// Builds the versioned `GetAttentionAndProblems` payload (T11.3, Surreal).
+fn attention_problems_payload(
+    query: &NamedReadRequest,
+    state_fence: &StateFence,
+    rows: &[AuthorityReceiptRow],
+) -> Result<Value, StoreError> {
+    let scope_id = query.scope_id.clone().ok_or(StoreError::InvalidField {
+        field: "scope_id",
+        reason: "attention read requires scope_id",
+    })?;
+    let problem_id = match query.parameters.get("problem_id") {
+        None | Some(Value::Null) => None,
+        Some(Value::String(text)) => {
+            if text.trim().is_empty() || text.chars().any(char::is_control) {
+                return Err(StoreError::InvalidField {
+                    field: "operation.parameter",
+                    reason: "problem_id must be a non-blank string",
+                });
+            }
+            Some(text.as_str())
+        }
+        Some(_) => {
+            return Err(StoreError::InvalidField {
+                field: "operation.parameter",
+                reason: "problem_id must be a non-blank string",
+            });
+        }
+    };
+    let (max_records, limit) = parse_max_records_param(query)?;
+    if query.state_fence != *state_fence {
+        return Err(StoreError::FenceMismatch);
+    }
+    let indexed = indexed_authorities(rows)?;
+    let matched: Vec<&IndexedAuthority> = indexed
+        .iter()
+        .filter(|record| {
+            record.scope_id == scope_id.as_str()
+                && record.operation == eliot_store_api::NamedMutationOperation::ReconcileRecovery
+                && problem_id.is_none_or(|wanted| {
+                    record.parameters.get("problem_id").and_then(Value::as_str) == Some(wanted)
+                })
+        })
+        .collect();
+    let matched_total = matched.len();
+    let records: Vec<Value> = matched
+        .into_iter()
+        .take(limit)
+        .map(|record| {
+            json!({
+                "capture_index": record.capture_index,
+                "operation": named_mutation_operation_name(record.operation),
+                "parameters": record.parameters,
+            })
+        })
+        .collect();
+    let returned = records.len();
+    Ok(json!({
+        "version": ATTENTION_PROBLEMS_PAYLOAD_VERSION,
+        "scope_id": scope_id,
+        "problem_id": problem_id,
+        "records": records,
+        "provenance": {
+            "state_fence": state_fence,
+            "matched_total": matched_total,
+            "returned": returned,
+            "max_records": max_records,
+            "truncated": matched_total > returned,
+        },
+    }))
+}
+
+/// Builds the versioned `GetUnderstandingProjectionInputs` payload (T11.3, Surreal).
+fn understanding_inputs_payload(
+    query: &NamedReadRequest,
+    state_fence: &StateFence,
+    rows: &[AuthorityReceiptRow],
+) -> Result<Value, StoreError> {
+    let scope_id = query.scope_id.clone().ok_or(StoreError::InvalidField {
+        field: "scope_id",
+        reason: "understanding inputs read requires scope_id",
+    })?;
+    let selector = query
+        .parameters
+        .get("selector")
+        .and_then(Value::as_str)
+        .ok_or(StoreError::InvalidField {
+            field: "operation.parameter",
+            reason: "missing required parameter",
+        })?;
+    if selector.trim().is_empty() || selector.chars().any(char::is_control) {
+        return Err(StoreError::InvalidField {
+            field: "operation.parameter",
+            reason: "selector must be a non-blank string",
+        });
+    }
+    let (max_records, limit) = parse_max_records_param(query)?;
+    if query.state_fence != *state_fence {
+        return Err(StoreError::FenceMismatch);
+    }
+    let indexed = indexed_authorities(rows)?;
+    let matched: Vec<&IndexedAuthority> = indexed
+        .iter()
+        .filter(|record| {
+            record.scope_id == scope_id.as_str()
+                && record
+                    .parameters
+                    .values()
+                    .any(|value| value.as_str() == Some(selector))
+        })
+        .collect();
+    let matched_total = matched.len();
+    let records: Vec<Value> = matched
+        .into_iter()
+        .take(limit)
+        .map(|record| {
+            json!({
+                "capture_index": record.capture_index,
+                "operation": named_mutation_operation_name(record.operation),
+                "parameters": record.parameters,
+            })
+        })
+        .collect();
+    let returned = records.len();
+    Ok(json!({
+        "version": UNDERSTANDING_INPUTS_PAYLOAD_VERSION,
+        "selector": selector,
+        "scope_id": scope_id,
+        "records": records,
+        "provenance": {
+            "state_fence": state_fence,
+            "matched_total": matched_total,
+            "returned": returned,
+            "max_records": max_records,
+            "truncated": matched_total > returned,
+        },
+    }))
+}
+
+/// Builds the versioned `GetCapabilityEvidenceState` payload (T11.3, Surreal).
+fn capability_evidence_payload(
+    query: &NamedReadRequest,
+    state_fence: &StateFence,
+    rows: &[AuthorityReceiptRow],
+) -> Result<Value, StoreError> {
+    let scope_id = query.scope_id.clone().ok_or(StoreError::InvalidField {
+        field: "scope_id",
+        reason: "capability evidence read requires scope_id",
+    })?;
+    let skill_id = query
+        .parameters
+        .get("skill_id")
+        .and_then(Value::as_str)
+        .ok_or(StoreError::InvalidField {
+            field: "operation.parameter",
+            reason: "missing required parameter",
+        })?;
+    if skill_id.trim().is_empty() || skill_id.chars().any(char::is_control) {
+        return Err(StoreError::InvalidField {
+            field: "operation.parameter",
+            reason: "skill_id must be a non-blank string",
+        });
+    }
+    let (max_records, limit) = parse_max_records_param(query)?;
+    if query.state_fence != *state_fence {
+        return Err(StoreError::FenceMismatch);
+    }
+    let indexed = indexed_authorities(rows)?;
+    let matched: Vec<&IndexedAuthority> = indexed
+        .iter()
+        .filter(|record| {
+            record.scope_id == scope_id.as_str()
+                && record.operation
+                    == eliot_store_api::NamedMutationOperation::ApplyLifecyclePolicy
+                && record.parameters.get("skill_id").and_then(Value::as_str) == Some(skill_id)
+        })
+        .collect();
+    let matched_total = matched.len();
+    let records: Vec<Value> = matched
+        .into_iter()
+        .take(limit)
+        .map(|record| {
+            json!({
+                "capture_index": record.capture_index,
+                "operation": named_mutation_operation_name(record.operation),
+                "parameters": record.parameters,
+            })
+        })
+        .collect();
+    let returned = records.len();
+    Ok(json!({
+        "version": CAPABILITY_EVIDENCE_PAYLOAD_VERSION,
+        "skill_id": skill_id,
+        "scope_id": scope_id,
+        "records": records,
+        "provenance": {
+            "state_fence": state_fence,
+            "matched_total": matched_total,
+            "returned": returned,
+            "max_records": max_records,
+            "truncated": matched_total > returned,
+        },
+    }))
+}
+
 async fn read_all_revision_heads(
     db: &client::RpcTransport,
     config: &SurrealAdapterConfig,
@@ -734,6 +1290,40 @@ mod admitted_read_tests {
                     ("max_records".to_owned(), json!("10")),
                 ]),
             ),
+            read_request(
+                NamedReadOperation::GetCurrentEpistemicPosition,
+                Some(ScopeId::new("scope-1").expect("scope")),
+                BTreeMap::from([("position".to_owned(), json!("position-1"))]),
+            ),
+            read_request(
+                NamedReadOperation::GetTaskState,
+                Some(ScopeId::new("scope-1").expect("scope")),
+                BTreeMap::from([
+                    ("task_id".to_owned(), json!("task-1")),
+                    ("max_records".to_owned(), json!("10")),
+                ]),
+            ),
+            read_request(
+                NamedReadOperation::GetAttentionAndProblems,
+                Some(ScopeId::new("scope-1").expect("scope")),
+                BTreeMap::from([("max_records".to_owned(), json!("10"))]),
+            ),
+            read_request(
+                NamedReadOperation::GetUnderstandingProjectionInputs,
+                Some(ScopeId::new("scope-1").expect("scope")),
+                BTreeMap::from([
+                    ("selector".to_owned(), json!("task-1")),
+                    ("max_records".to_owned(), json!("10")),
+                ]),
+            ),
+            read_request(
+                NamedReadOperation::GetCapabilityEvidenceState,
+                Some(ScopeId::new("scope-1").expect("scope")),
+                BTreeMap::from([
+                    ("skill_id".to_owned(), json!("skill-1")),
+                    ("max_records".to_owned(), json!("10")),
+                ]),
+            ),
         ] {
             assert!(
                 validate_named_against_active_catalogue(&request).is_ok(),
@@ -768,8 +1358,9 @@ mod admitted_read_tests {
                 ..
             })
         ));
-        // Known-but-unadvertised operation stays unsupported.
-        let unadvertised = read_request(NamedReadOperation::GetTaskState, None, BTreeMap::new());
+        // Known-but-unadvertised operation stays unsupported (T11.3 activates
+        // GetTaskState, so the negative case moves to a still-unsupported op).
+        let unadvertised = read_request(NamedReadOperation::GetMailbox, None, BTreeMap::new());
         assert_eq!(
             validate_named_against_active_catalogue(&unadvertised),
             Err(StoreError::UnknownOperation)
@@ -1205,6 +1796,485 @@ mod admitted_read_tests {
                 "bound {bound} must fail closed"
             );
         }
+    }
+
+    // --- T11.3 cognitive reads (real plan outputs, no canned rows) ---
+
+    /// Task transition shape awaiting operation-aware persistence (see
+    /// `task_state_returns_exact_history_with_current`): kept so the intended
+    /// canonical record shape stays compiler-checked.
+    #[allow(dead_code)]
+    fn task_transition(
+        operation_id: &str,
+        task_id: &str,
+        to: &str,
+    ) -> eliot_store_api::PreparedTransition {
+        use eliot_store_api::{
+            EffectClass, EventProjectionRelationIntents, NamedMutationOperation,
+            NamedMutationRequest, OperationIdentity, OperationManifestDigest, OrderingScopeId,
+            SecurityContext, TransitionClass,
+        };
+        let fence = test_fence();
+        eliot_store_api::PreparedTransition {
+            identity: OperationIdentity {
+                operation_id: eliot_store_api::OperationId::new(operation_id).expect("operation"),
+                idempotency_key: format!("idem-{operation_id}"),
+                canonical_request_hash: "a".repeat(64),
+            },
+            state_fence: fence,
+            scope_id: ScopeId::new("scope-1").expect("scope"),
+            task_id: None,
+            ordering_scopes: vec![OrderingScopeId::new("scope-1").expect("ordering")],
+            transition_class: TransitionClass::TaskControl,
+            requested_effect_ceiling: EffectClass::ReversibleMutation,
+            admission_contract_set_digest: "b".repeat(64),
+            operation_manifest_digest: OperationManifestDigest::new("manifest-1")
+                .expect("manifest digest"),
+            named_operations: vec![NamedMutationRequest {
+                operation: NamedMutationOperation::UpdateTaskState,
+                parameters: BTreeMap::from([
+                    ("task_id".to_owned(), json!(task_id)),
+                    ("event_id".to_owned(), json!(format!("event-{operation_id}"))),
+                    ("to".to_owned(), json!(to)),
+                    ("expected_revision".to_owned(), json!("1")),
+                    ("actor_ref".to_owned(), json!("actor-1")),
+                ]),
+            }],
+            event_projection_relation_intents: EventProjectionRelationIntents {
+                event_ids: Vec::new(),
+                projection_kinds: Vec::new(),
+                relation_kinds: Vec::new(),
+            },
+            security: SecurityContext::default(),
+            required_proof_and_approval_refs: Vec::new(),
+        }
+    }
+
+    /// Recovery transition shape awaiting operation-aware persistence (see
+    /// `attention_problems_filters_and_bounds_with_truncation`).
+    #[allow(dead_code)]
+    fn recovery_transition(
+        operation_id: &str,
+        problem_id: &str,
+    ) -> eliot_store_api::PreparedTransition {
+        use eliot_store_api::{
+            EffectClass, EventProjectionRelationIntents, NamedMutationOperation,
+            NamedMutationRequest, OperationIdentity, OperationManifestDigest, OrderingScopeId,
+            SecurityContext, TransitionClass,
+        };
+        let fence = test_fence();
+        eliot_store_api::PreparedTransition {
+            identity: OperationIdentity {
+                operation_id: eliot_store_api::OperationId::new(operation_id).expect("operation"),
+                idempotency_key: format!("idem-{operation_id}"),
+                canonical_request_hash: "a".repeat(64),
+            },
+            state_fence: fence,
+            scope_id: ScopeId::new("scope-1").expect("scope"),
+            task_id: None,
+            ordering_scopes: vec![OrderingScopeId::new("scope-1").expect("ordering")],
+            transition_class: TransitionClass::RecoverySchema,
+            requested_effect_ceiling: EffectClass::ReversibleMutation,
+            admission_contract_set_digest: "b".repeat(64),
+            operation_manifest_digest: OperationManifestDigest::new("manifest-1")
+                .expect("manifest digest"),
+            named_operations: vec![NamedMutationRequest {
+                operation: NamedMutationOperation::ReconcileRecovery,
+                parameters: BTreeMap::from([
+                    ("problem_id".to_owned(), json!(problem_id)),
+                    ("expected_problem_revision".to_owned(), json!("1")),
+                    ("attempt_digest".to_owned(), json!("a".repeat(64))),
+                    ("effect_digest".to_owned(), json!("b".repeat(64))),
+                    (
+                        "operation_manifest_digest".to_owned(),
+                        json!("c".repeat(64)),
+                    ),
+                    ("artifact_binding_digest".to_owned(), json!("b".repeat(64))),
+                    ("fence_digest".to_owned(), json!("d".repeat(64))),
+                    ("observation_operation_id".to_owned(), json!("op-1")),
+                    ("observation_record_id".to_owned(), json!("record-1")),
+                    (
+                        "observation_request_digest".to_owned(),
+                        json!("e".repeat(64)),
+                    ),
+                ]),
+            }],
+            event_projection_relation_intents: EventProjectionRelationIntents {
+                event_ids: Vec::new(),
+                projection_kinds: Vec::new(),
+                relation_kinds: Vec::new(),
+            },
+            security: SecurityContext::default(),
+            required_proof_and_approval_refs: Vec::new(),
+        }
+    }
+
+    fn lifecycle_transition(
+        operation_id: &str,
+        skill_id: &str,
+    ) -> eliot_store_api::PreparedTransition {
+        use eliot_store_api::{
+            EffectClass, EventProjectionRelationIntents, NamedMutationOperation,
+            NamedMutationRequest, OperationIdentity, OperationManifestDigest, OrderingScopeId,
+            SecurityContext, TransitionClass,
+        };
+        let fence = test_fence();
+        eliot_store_api::PreparedTransition {
+            identity: OperationIdentity {
+                operation_id: eliot_store_api::OperationId::new(operation_id).expect("operation"),
+                idempotency_key: format!("idem-{operation_id}"),
+                canonical_request_hash: "a".repeat(64),
+            },
+            state_fence: fence,
+            scope_id: ScopeId::new("scope-1").expect("scope"),
+            task_id: None,
+            ordering_scopes: vec![OrderingScopeId::new("scope-1").expect("ordering")],
+            transition_class: TransitionClass::LifecyclePolicy,
+            requested_effect_ceiling: EffectClass::ReversibleMutation,
+            admission_contract_set_digest: "b".repeat(64),
+            operation_manifest_digest: OperationManifestDigest::new("manifest-1")
+                .expect("manifest digest"),
+            named_operations: vec![NamedMutationRequest {
+                operation: NamedMutationOperation::ApplyLifecyclePolicy,
+                parameters: BTreeMap::from([
+                    ("action".to_owned(), json!("keep")),
+                    ("base_view_digest".to_owned(), json!("a".repeat(64))),
+                    ("candidate_digest".to_owned(), json!("b".repeat(64))),
+                    ("candidate_package_digest".to_owned(), json!("c".repeat(64))),
+                    ("skill_id".to_owned(), json!(skill_id)),
+                    ("verifier_ref".to_owned(), json!("verifier-1")),
+                ]),
+            }],
+            event_projection_relation_intents: EventProjectionRelationIntents {
+                event_ids: Vec::new(),
+                projection_kinds: Vec::new(),
+                relation_kinds: Vec::new(),
+            },
+            security: SecurityContext::default(),
+            required_proof_and_approval_refs: Vec::new(),
+        }
+    }
+
+    /// Plans one transition through the real planner with its real payload
+    /// authority and renders the durable authority receipt row. Never a
+    /// canned row: bytes, digest, and order all come from [`crate::plan`].
+    fn authority_row_for(
+        transition: &eliot_store_api::PreparedTransition,
+        commit_sequence: u64,
+    ) -> AuthorityReceiptRow {
+        use crate::plan::plan_apply_with_payload_authority;
+        use eliot_store_api::{ExactJsonBytes, PayloadSource, canonical_json_bytes};
+        let raw = canonical_json_bytes(&transition.named_operations[0].parameters)
+            .expect("parameters serialize");
+        let authority = ExactJsonBytes::parse(PayloadSource::NamedOperationParameter, &raw)
+            .expect("authority parses");
+        let plan = plan_apply_with_payload_authority(
+            transition,
+            &[Some(authority)],
+            &[],
+            &[],
+            commit_sequence,
+            1,
+        )
+        .expect("plan applies");
+        assert_eq!(
+            plan.payload_authority.len(),
+            1,
+            "one operation plans exactly one authority record"
+        );
+        let record = &plan.payload_authority[0];
+        AuthorityReceiptRow {
+            receipt: Some(
+                plan::build_receipt(&capture_context(), transition, &plan).expect("receipt"),
+            ),
+            commit_sequence: Some(plan.commit_sequence),
+            named_operation_count: Some(transition.named_operations.len()),
+            payload_authority: Some(vec![AuthorityRecordRow {
+                operation_index: record.operation_index,
+                version: record.version,
+                encoding: record.encoding.clone(),
+                digest_hex: record.digest_hex.clone(),
+                byte_len: record.byte_len,
+                bytes_utf8: String::from_utf8(record.bytes.clone()).expect("UTF-8 bytes"),
+            }]),
+        }
+    }
+
+    fn task_query(task_id: &str, max_records: &str) -> NamedReadRequest {
+        read_request(
+            NamedReadOperation::GetTaskState,
+            Some(ScopeId::new("scope-1").expect("scope")),
+            BTreeMap::from([
+                ("task_id".to_owned(), json!(task_id)),
+                ("max_records".to_owned(), json!(max_records)),
+            ]),
+        )
+    }
+
+    fn attention_query(problem_id: Option<&str>, max_records: &str) -> NamedReadRequest {
+        let mut parameters = BTreeMap::from([("max_records".to_owned(), json!(max_records))]);
+        if let Some(problem_id) = problem_id {
+            parameters.insert("problem_id".to_owned(), json!(problem_id));
+        }
+        read_request(
+            NamedReadOperation::GetAttentionAndProblems,
+            Some(ScopeId::new("scope-1").expect("scope")),
+            parameters,
+        )
+    }
+
+    fn understanding_query(selector: &str, max_records: &str) -> NamedReadRequest {
+        read_request(
+            NamedReadOperation::GetUnderstandingProjectionInputs,
+            Some(ScopeId::new("scope-1").expect("scope")),
+            BTreeMap::from([
+                ("selector".to_owned(), json!(selector)),
+                ("max_records".to_owned(), json!(max_records)),
+            ]),
+        )
+    }
+
+    fn capability_query(skill_id: &str, max_records: &str) -> NamedReadRequest {
+        read_request(
+            NamedReadOperation::GetCapabilityEvidenceState,
+            Some(ScopeId::new("scope-1").expect("scope")),
+            BTreeMap::from([
+                ("skill_id".to_owned(), json!(skill_id)),
+                ("max_records".to_owned(), json!(max_records)),
+            ]),
+        )
+    }
+
+    #[test]
+    fn task_state_returns_exact_history_with_current() {
+        // Surreal persistence gap (reported as residual): `UpdateTaskState`
+        // owner parameters contain `task_id`, which the generic
+        // `ExactJsonBytes` control denylist rejects, so no
+        // operation-aware authority binding exists yet (needs `plan.rs` /
+        // `atomic_write.rs`, unclaimed here). The handler itself is real
+        // (authority-row walk, exact scope/`task_id` match, bound,
+        // history + current, provenance); the reference memory handler
+        // proves the data path end to end. Here we prove the gate, the
+        // exact-empty contract, and filtering against real lifecycle rows.
+        let fence = test_fence();
+        let rows = vec![authority_row_for(
+            &lifecycle_transition("op-task-probe-1", "skill-probe"),
+            1,
+        )];
+        let query = task_query("task-1", "10");
+        assert!(
+            validate_named_against_active_catalogue(&query).is_ok(),
+            "activated task read passes the gate"
+        );
+        let payload = task_state_payload(&query, &fence, &rows).expect("pack builds");
+        assert_eq!(
+            payload.get("version").and_then(Value::as_u64),
+            Some(u64::from(TASK_STATE_PAYLOAD_VERSION))
+        );
+        // Lifecycle rows never match a task selector: exact empty, not error.
+        assert!(
+            payload
+                .get("records")
+                .and_then(Value::as_array)
+                .is_some_and(Vec::is_empty)
+        );
+        assert!(payload.get("current").is_some_and(Value::is_null));
+        // Unknown task over empty rows is also an exact empty.
+        let empty = task_state_payload(
+            &task_query("task-missing", "10"),
+            &fence,
+            &[],
+        )
+        .expect("empty builds");
+        assert!(
+            empty
+                .get("records")
+                .and_then(Value::as_array)
+                .is_some_and(Vec::is_empty)
+        );
+        assert!(empty.get("current").is_some_and(Value::is_null));
+    }
+
+    #[test]
+    fn attention_problems_filters_and_bounds_with_truncation() {
+        // Same persistence gap as task state: `ReconcileRecovery` owner
+        // parameters contain `operation_manifest_digest` (control-denylisted),
+        // so no authority binding exists yet. Handler is real; memory proves
+        // the data path. Here we prove gate, empty contract, and bound
+        // enforcement against real lifecycle rows.
+        let fence = test_fence();
+        let rows = vec![authority_row_for(
+            &lifecycle_transition("op-prob-probe-1", "skill-probe"),
+            1,
+        )];
+        let query = attention_query(Some("problem-1"), "10");
+        assert!(
+            validate_named_against_active_catalogue(&query).is_ok(),
+            "activated attention read passes the gate"
+        );
+        let payload = attention_problems_payload(&query, &fence, &rows).expect("pack builds");
+        assert!(
+            payload
+                .get("records")
+                .and_then(Value::as_array)
+                .is_some_and(Vec::is_empty)
+        );
+        // Unfiltered listing over empty rows is empty with intact provenance.
+        let empty =
+            attention_problems_payload(&attention_query(None, "2"), &fence, &[]).expect("builds");
+        assert_eq!(
+            empty
+                .get("records")
+                .and_then(Value::as_array)
+                .map(Vec::len),
+            Some(0)
+        );
+        assert_eq!(empty["provenance"]["matched_total"], json!(0));
+        assert_eq!(empty["provenance"]["truncated"], json!(false));
+    }
+
+    #[test]
+    fn understanding_inputs_exact_selector_never_substring() {
+        let fence = test_fence();
+        // Authority-compatible families only (capture subject + lifecycle
+        // skill are control-allowlisted; task/recovery selectors are proven
+        // via the reference memory handler until operation-aware persistence
+        // lands).
+        let rows = vec![
+            authority_row_for(&capture_transition("op-und-1", "task-alpha"), 1),
+            authority_row_for(&lifecycle_transition("op-und-2", "skill-alpha"), 2),
+        ];
+        let query = understanding_query("task-alpha", "10");
+        assert!(
+            validate_named_against_active_catalogue(&query).is_ok(),
+            "activated understanding read passes the gate"
+        );
+        let payload = understanding_inputs_payload(&query, &fence, &rows).expect("pack builds");
+        assert_eq!(
+            payload
+                .get("records")
+                .and_then(Value::as_array)
+                .map(Vec::len),
+            Some(1)
+        );
+        // Substring selectors match nothing — never a neighbouring input.
+        for selector in ["task", "task-alpha-extra", "TASK-ALPHA"] {
+            let query = understanding_query(selector, "10");
+            let payload =
+                understanding_inputs_payload(&query, &fence, &rows).expect("non-match builds");
+            assert!(
+                payload
+                    .get("records")
+                    .and_then(Value::as_array)
+                    .is_some_and(Vec::is_empty),
+                "selector {selector} must not substring-match"
+            );
+        }
+    }
+
+    #[test]
+    fn capability_evidence_returns_exact_skill_records() {
+        let fence = test_fence();
+        let rows = vec![
+            authority_row_for(&lifecycle_transition("op-cap-1", "skill-1"), 1),
+            authority_row_for(&lifecycle_transition("op-cap-2", "skill-2"), 2),
+        ];
+        let query = capability_query("skill-1", "10");
+        assert!(
+            validate_named_against_active_catalogue(&query).is_ok(),
+            "activated capability read passes the gate"
+        );
+        let payload = capability_evidence_payload(&query, &fence, &rows).expect("pack builds");
+        assert_eq!(
+            payload.get("version").and_then(Value::as_u64),
+            Some(u64::from(CAPABILITY_EVIDENCE_PAYLOAD_VERSION))
+        );
+        let records = payload
+            .get("records")
+            .and_then(Value::as_array)
+            .expect("records array");
+        assert_eq!(records.len(), 1);
+        assert_eq!(
+            records[0].get("operation").and_then(Value::as_str),
+            Some("ApplyLifecyclePolicy")
+        );
+        assert_eq!(
+            records[0]
+                .get("parameters")
+                .and_then(|parameters| parameters.get("skill_id"))
+                .and_then(Value::as_str),
+            Some("skill-1")
+        );
+    }
+
+    #[test]
+    fn t11_3_malformed_and_over_bound_requests_fail_closed() {
+        let fence = test_fence();
+        // Authority-compatible rows only (lifecycle); task/recovery rows
+        // need operation-aware persistence (see above).
+        let rows = vec![authority_row_for(
+            &lifecycle_transition("op-mal-1", "skill-1"),
+            1,
+        )];
+        // Missing scope on a scope-addressed read.
+        let query = read_request(
+            NamedReadOperation::GetTaskState,
+            None,
+            BTreeMap::from([
+                ("task_id".to_owned(), json!("task-1")),
+                ("max_records".to_owned(), json!("10")),
+            ]),
+        );
+        assert!(matches!(
+            task_state_payload(&query, &fence, &rows),
+            Err(StoreError::InvalidField {
+                field: "scope_id",
+                ..
+            })
+        ));
+        // Missing required selector.
+        let query = read_request(
+            NamedReadOperation::GetCapabilityEvidenceState,
+            Some(ScopeId::new("scope-1").expect("scope")),
+            BTreeMap::from([("max_records".to_owned(), json!("10"))]),
+        );
+        assert!(matches!(
+            capability_evidence_payload(&query, &fence, &rows),
+            Err(StoreError::InvalidField { .. })
+        ));
+        // Zero and non-decimal bounds fail the bound shape.
+        for bound in ["0", "many"] {
+            let query = task_query("task-1", bound);
+            assert!(
+                matches!(
+                    task_state_payload(&query, &fence, &rows),
+                    Err(StoreError::InvalidField { .. })
+                ),
+                "bound {bound} must fail closed"
+            );
+        }
+        // Over-bound requests refuse instead of returning a successful view.
+        for bound in [
+            (EVIDENCE_PACK_MAX_RECORDS + 1).to_string(),
+            "1000".to_owned(),
+        ] {
+            let query = task_query("task-1", &bound);
+            assert_eq!(
+                task_state_payload(&query, &fence, &rows),
+                Err(StoreError::PayloadTooLarge),
+                "bound {bound} exceeds the declared maximum"
+            );
+        }
+        // Wrong fence is refused by the shared resolver contract.
+        let mut other_fence = fence.clone();
+        other_fence.resource_generation =
+            eliot_contracts::ResourceGeneration::new(2).expect("generation");
+        let mut stale_query = task_query("task-1", "10");
+        stale_query.state_fence = fence.clone();
+        assert_eq!(
+            task_state_payload(&stale_query, &other_fence, &rows),
+            Err(StoreError::FenceMismatch)
+        );
     }
 }
 
