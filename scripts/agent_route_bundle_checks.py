@@ -47,6 +47,18 @@ def _identity_node_errors(name: str, value: Any, where: str, out: list[Finding])
     """
     normalized = str(name).lower().replace("-", "_")
     if normalized == "disposition":
+        if isinstance(value, dict):
+            # Specified Part A shape is a disposition BLOCK carrying the scalar
+            # under its own "disposition" key plus digests/versions/metadata.
+            # Recurse so the inner scalar, digest-likes, and versions validate
+            # exactly like a scalar disposition site. Anything else passes
+            # through; a block never grants admission by itself.
+            for key, child in value.items():
+                if not isinstance(key, str) or not key:
+                    add(out, "route_identity_malformed", where, "identity mapping requires string keys")
+                    continue
+                _identity_node_errors(key, child, where, out)
+            return
         if value not in DISPOSITIONS:
             add(out, "route_disposition_invalid", where, repr(value))
         return
@@ -79,6 +91,14 @@ def _identity_node_errors(name: str, value: Any, where: str, out: list[Finding])
             _identity_node_errors(name, child, f"{where}#{name}[{index}]", out)
 
 
+def _effective_disposition(profile: Any) -> Any:
+    """Return the scalar disposition whether declared bare or as a block."""
+    disposition = profile.get("disposition") if isinstance(profile, dict) else None
+    if isinstance(disposition, dict):
+        return disposition.get("disposition")
+    return disposition
+
+
 def identity_errors(profile: Any, host: str, root: Path | None = None) -> list[Finding]:
     """Validate declared disposition/identity without ever granting admission.
 
@@ -90,7 +110,7 @@ def identity_errors(profile: Any, host: str, root: Path | None = None) -> list[F
     if not isinstance(profile, dict):
         return out
     _identity_node_errors("profile", profile, relative, out)
-    if profile.get("disposition") == "live-admitted" and profile.get("evidence_execution_status") == "NOT_EXECUTED":
+    if _effective_disposition(profile) == "live-admitted" and profile.get("evidence_execution_status") == "NOT_EXECUTED":
         add(
             out,
             "route_disposition_overclaim",
