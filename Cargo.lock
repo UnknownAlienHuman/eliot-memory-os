@@ -2462,10 +2462,14 @@ dependencies = [
 name = "eliot-store-surreal-adapter"
 version = "0.1.0"
 dependencies = [
+ "eliot-canonical",
  "eliot-contracts",
+ "eliot-epistemic-contracts",
+ "eliot-evidence",
  "eliot-platform",
  "eliot-platform-windows",
  "eliot-protocol",
+ "eliot-receipts",
  "eliot-store-api",
  "futures-util",
  "schemars",
