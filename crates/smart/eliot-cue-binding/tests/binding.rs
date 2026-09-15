@@ -322,6 +322,46 @@ fn overflow_retains_omitted_identity_and_continuation() {
 }
 
 #[test]
+fn foreign_fence_row_is_cold_without_candidate_claim() {
+    let (receipt, mut rows, profile) = admitted_rows(1, false);
+    rows[0].change.observation.state_fence = StateFence::new(
+        test_epoch(),
+        ResourceGeneration::new(2).expect("generation"),
+    );
+    rows[0].change.observation_digest = rows[0]
+        .change
+        .observation
+        .digest()
+        .expect("change digest");
+    let result = eliot_cue_binding::derive_cue_binding_candidates(&receipt, &rows, None, &profile)
+        .expect("derive");
+    assert!(result.candidates.is_empty());
+    assert_eq!(result.cold.len(), 1);
+    assert_eq!(result.cold[0].reason, ColdReason::IdentityConflict);
+    assert_eq!(result.outcome, eliot_cue_binding::BindingOutcome::Cold);
+}
+
+#[test]
+fn unproved_reuse_hint_is_retained_as_cold_without_adding_targets() {
+    let (receipt, rows, profile) = admitted_rows(1, false);
+    let hint = eliot_cue_binding::ExpectedReuseHint {
+        target: rows[0].target.clone(),
+        evidence_ref: "unproved-evidence-handle".to_owned(),
+    };
+    let result =
+        eliot_cue_binding::derive_cue_binding_candidates(&receipt, &rows, Some(&hint), &profile)
+            .expect("derive");
+    assert_eq!(result.candidates.len(), 1);
+    assert!(
+        result
+            .cold
+            .iter()
+            .any(|cold| cold.reason == ColdReason::HintUnproved)
+    );
+    assert_eq!(result.hint, Some(hint));
+}
+
+#[test]
 fn foreign_origin_link_is_retained_as_cold() {
     let (receipt, mut rows, profile) = admitted_rows(2, false);
     rows[0].change.observation.origin_ref = Some("foreign-handle".into());
