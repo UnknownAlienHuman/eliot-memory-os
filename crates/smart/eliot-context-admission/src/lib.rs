@@ -919,12 +919,13 @@ fn validate_representation(
     {
         return Err(ContextError::WholeUnitRequired);
     }
-    if matches!(
-        candidate.representation.kind(),
-        RepresentationKind::Extractive | RepresentationKind::Summary
-    ) {
-        return Err(ContextError::WholeUnitRequired);
-    }
+    // Selection only: every supplied representation kind already passed
+    // `ContextCandidate::validate` (loss-policy compatibility, non-empty
+    // extract manifest, well-formed summary source digest) and the exact
+    // measurement closure. EXTRACTIVE and SUMMARY forms issued by the
+    // producer are therefore selectable here exactly like WHOLE; nothing is
+    // generated, rewritten, or truncated by this gate. A missing, stale, or
+    // incompatible measurement makes the option unavailable at costing time.
     if let eliot_context_contracts::AtomRepresentation::Handle { handle } =
         &candidate.representation
     {
