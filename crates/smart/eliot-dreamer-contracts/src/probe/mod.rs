@@ -2,6 +2,7 @@
 
 pub mod affordance;
 pub mod bounds;
+pub mod input;
 pub mod objective;
 pub mod result;
 pub(crate) mod validation;
@@ -18,6 +19,11 @@ pub use affordance::{
 pub use bounds::{
     MAX_PROBE_BRANCHES, MAX_PROBE_ITEMS, MAX_PROBE_TEXT_BYTES, MAX_PROBE_UPDATES_PER_BRANCH,
     MAX_PROBE_WIRE_BYTES, PROBE_OBJECTIVE_SCHEMA_VERSION, PROBE_RESULT_SCHEMA_VERSION,
+};
+pub use input::{
+    PROBE_INPUT_SCHEMA_VERSION, ProbeAffordanceRef, ProbeCapabilityAvailability, ProbeExternalOwners,
+    ProbeGroundingRef, ProbeInput, ProbeInputParams, ProbeInputRef, ProbeLifecycle, ProbeParam,
+    ProbeRepeatRef, ProbeSourceRef,
 };
 pub use objective::{
     ProbeObjective, ProbeObjectiveOrigin, ProbeObjectiveRef, ProbeObjectiveTarget, ProbeOwnerRef,
