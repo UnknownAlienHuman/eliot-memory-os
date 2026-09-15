@@ -1906,6 +1906,22 @@ fn nul_terminated_wide(value: &OsStr) -> io::Result<Vec<u16>> {
     Ok(wide.into_iter().chain(std::iter::once(0)).collect())
 }
 
+/// Maximum logical credential-identifier bytes accepted by
+/// `validate_credential_id`. Bounds the `EliotGovernor/{id}` wide target far
+/// below `MAX_WIDE_UNITS_INCL_NUL` so a corrupt identifier fails closed
+/// before any `WinCred` FFI pointer is formed.
+const MAX_CREDENTIAL_ID_BYTES: usize = 240;
+/// Maximum UTF-16 target-name units (excluding the terminating NUL) accepted
+/// when scanning a `CREDENTIALW::TargetName` returned by `WinCred`. Bounds both
+/// the construction of `EliotGovernor/{id}` targets and the read-back scan in
+/// `credential_target_name` so unterminated data fails closed.
+const MAX_CREDENTIAL_TARGET_CHARS: usize = 512;
+/// Maximum `CredEnumerateW` entries accepted into a
+/// `std::slice::from_raw_parts` view. Far above any legitimate per-user
+/// credential store; a corrupt count fails closed instead of forming an
+/// unbounded slice.
+const MAX_CREDENTIAL_ENUM_ENTRIES: usize = 32_768;
+
 /// Validates an Eliot credential identifier against the bounded logical grammar.
 ///
 /// The grammar is: nonempty, `<=` 240 bytes, no leading or trailing `'/'`,
@@ -1917,7 +1933,7 @@ fn nul_terminated_wide(value: &OsStr) -> io::Result<Vec<u16>> {
 /// Returns `InvalidInput` when the identifier violates the grammar.
 pub fn validate_credential_id(credential_id: &str) -> io::Result<()> {
     let valid = !credential_id.is_empty()
-        && credential_id.len() <= 240
+        && credential_id.len() <= MAX_CREDENTIAL_ID_BYTES
         && !credential_id.starts_with('/')
         && !credential_id.ends_with('/')
         && credential_id
@@ -1937,7 +1953,18 @@ pub fn validate_credential_id(credential_id: &str) -> io::Result<()> {
 
 fn credential_target(credential_id: &str) -> io::Result<Vec<u16>> {
     validate_credential_id(credential_id)?;
-    nul_terminated_wide(OsStr::new(&format!("EliotGovernor/{credential_id}")))
+    let namespaced = format!("EliotGovernor/{credential_id}");
+    // Fail closed before FFI: `validate_credential_id` already bounds the id
+    // to 240 bytes, so `EliotGovernor/` + id always fits well below the
+    // 512-unit target scan bound. Reject any future grammar drift that would
+    // widen the pointer input instead of truncating or defaulting.
+    if namespaced.encode_utf16().count() > MAX_CREDENTIAL_TARGET_CHARS {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "credential target exceeds the bounded target length",
+        ));
+    }
+    nul_terminated_wide(OsStr::new(&namespaced))
 }
 
 struct CredentialBuffer(*mut CREDENTIALW);
@@ -1945,8 +1972,15 @@ struct CredentialBuffer(*mut CREDENTIALW);
 impl Drop for CredentialBuffer {
     fn drop(&mut self) {
         if !self.0.is_null() {
-            // SAFETY: `self.0` was allocated by `CredReadW` and remains owned by
-            // this guard until it is released exactly once here.
+            // SAFETY (WORK_UNIT 789, credential family — `CredFree` after
+            // `CredReadW`): `self.0` is non-null (checked above) and holds the
+            // exact allocation `CredReadW` stored into the `&mut raw` out
+            // pointer on its success path. The guard is constructed only on
+            // that path, never copied or cloned, and `Drop` runs exactly once
+            // with `&mut self` (exclusive access, no live borrows of the
+            // `CREDENTIALW` or its blob). `CredFree` is the documented
+            // deallocator for `CredReadW` buffers; `.cast()` preserves the
+            // address as `*mut c_void` without offsetting it.
             unsafe {
                 CredFree(self.0.cast());
             }
@@ -1959,8 +1993,15 @@ struct CredentialArray(*mut *mut CREDENTIALW);
 impl Drop for CredentialArray {
     fn drop(&mut self) {
         if !self.0.is_null() {
-            // SAFETY: `self.0` was allocated by `CredEnumerateW` and remains
-            // owned by this guard until it is released exactly once here.
+            // SAFETY (WORK_UNIT 789, credential family — `CredFree` after
+            // `CredEnumerateW`): `self.0` is non-null (checked above) and
+            // holds the exact array allocation `CredEnumerateW` stored into
+            // the `&mut raw` out pointer on its success path. The guard is
+            // constructed only on that path, never copied or cloned, and
+            // `Drop` runs exactly once with `&mut self` (exclusive access, no
+            // live `from_raw_parts` views or entry borrows). `CredFree` is
+            // the documented deallocator for `CredEnumerateW` arrays;
+            // `.cast()` preserves the address without offsetting it.
             unsafe {
                 CredFree(self.0.cast());
             }
@@ -1969,8 +2010,6 @@ impl Drop for CredentialArray {
 }
 
 fn credential_target_name(target: *const u16) -> io::Result<String> {
-    const MAX_TARGET_CHARS: usize = 512;
-
     if target.is_null() {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
@@ -1978,22 +2017,34 @@ fn credential_target_name(target: *const u16) -> io::Result<String> {
         ));
     }
     let mut length = 0;
-    // SAFETY: the pointer comes from a live `CREDENTIALW` allocation and
-    // WinCred guarantees a NUL-terminated target name. The bounded scan
-    // rejects malformed data rather than reading indefinitely.
+    // SAFETY (WORK_UNIT 789, credential family — bounded NUL scan): `target`
+    // is non-null (checked above) and, per the `CREDENTIALW` contract, points
+    // at the `TargetName` NUL-terminated UTF-16 string inside the live
+    // `CredentialBuffer`/`CredentialArray` allocation that the caller holds
+    // for the whole call, so the base pointer is valid for at least one
+    // `u16` (the terminator). Each `target.add(length)` dereference runs only
+    // while `length < MAX_CREDENTIAL_TARGET_CHARS` (512), so at most 512
+    // aligned `u16` reads occur and the loop cannot run indefinitely; a
+    // missing terminator within the bound fails closed below instead of
+    // over-reading further. No write occurs and no pointer is retained.
     unsafe {
-        while length < MAX_TARGET_CHARS && *target.add(length) != 0 {
+        while length < MAX_CREDENTIAL_TARGET_CHARS && *target.add(length) != 0 {
             length += 1;
         }
     }
-    if length == MAX_TARGET_CHARS {
+    if length == MAX_CREDENTIAL_TARGET_CHARS {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
             "credential target name exceeded the bounded scan",
         ));
     }
-    // SAFETY: the bounded scan above proved `length` readable UTF-16 units
-    // before the terminating NUL in the live credential allocation.
+    // SAFETY (WORK_UNIT 789, credential family — `from_raw_parts` of the
+    // scanned prefix): the scan above observed `length` consecutive non-NUL
+    // units followed by a NUL at `target[length]`, all within the live
+    // credential allocation owned by the caller's guard, proving
+    // `target[..length]` is readable, aligned, non-overlapping with any
+    // mutable borrow, and valid for the returned borrow's lifetime. `length`
+    // excludes the terminator, so the slice never includes the NUL.
     let wide = unsafe { std::slice::from_raw_parts(target, length) };
     String::from_utf16(wide).map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))
 }
@@ -2010,15 +2061,30 @@ fn credential_target_name(target: *const u16) -> io::Result<String> {
 pub fn credential_ids_current_user_with_prefix(prefix: &str) -> io::Result<Vec<String>> {
     let _ = credential_target(prefix)?;
     let full_prefix = format!("EliotGovernor/{prefix}");
+    if full_prefix.encode_utf16().count() + 1 > MAX_CREDENTIAL_TARGET_CHARS {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "credential prefix exceeds the bounded target length",
+        ));
+    }
     let mut filter = nul_terminated_wide(OsStr::new(&format!("{full_prefix}*")))?;
     let mut count = 0_u32;
     let mut raw = ptr::null_mut();
-    // SAFETY: `filter` is NUL-terminated and both out pointers are valid for
-    // the duration of the call.
+    // SAFETY (WORK_UNIT 789, credential family — `CredEnumerateW`): `filter`
+    // is NUL-terminated (built by `nul_terminated_wide`, which rejects
+    // embedded NUL and overlong input) and borrowed mutably for the whole
+    // call, so `filter.as_mut_ptr()` is valid, aligned, and not aliased
+    // during FFI. `&mut count`/`&mut raw` are live exclusive out pointers.
+    // Flags `0` request the default enumeration; the callee retains nothing.
+    // On nonzero return `raw` owns exactly `count` entries until
+    // `CredentialArray` frees it; on zero return `raw` is untouched.
     let enumerated =
         unsafe { CredEnumerateW(filter.as_mut_ptr(), 0, &raw mut count, &raw mut raw) };
     if enumerated == 0 {
-        // SAFETY: this call immediately follows the failed Win32 operation.
+        // SAFETY (WORK_UNIT 789, credential family — `GetLastError`): called
+        // immediately after the failed `CredEnumerateW` with no intervening
+        // Win32 call, so the code belongs to this failure. Reading the
+        // thread-local error value has no pointer/lifetime risk.
         let code = unsafe { GetLastError() };
         if code == ERROR_NOT_FOUND {
             return Ok(Vec::new());
@@ -2028,8 +2094,27 @@ pub fn credential_ids_current_user_with_prefix(prefix: &str) -> io::Result<Vec<S
     let credentials = CredentialArray(raw);
     let count = usize::try_from(count)
         .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "credential count is invalid"))?;
-    // SAFETY: successful `CredEnumerateW` returned an array containing exactly
-    // `count` credential pointers, owned by `credentials`.
+    // Fail closed on a corrupt count before forming any slice: never default
+    // to zero or truncate, and keep the allocation bounded.
+    if count > MAX_CREDENTIAL_ENUM_ENTRIES {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "credential enumeration count exceeds the bound",
+        ));
+    }
+    if count.saturating_mul(std::mem::size_of::<*mut CREDENTIALW>()) > isize::MAX as usize {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "credential enumeration size is invalid",
+        ));
+    }
+    // SAFETY (WORK_UNIT 789, credential family — `from_raw_parts` of the
+    // enumeration array): `CredEnumerateW` succeeded, so per its contract
+    // `credentials.0` is non-null and points at `count` consecutive,
+    // initialized, properly aligned `*mut CREDENTIALW` entries (bounded above
+    // and byte-checked against `isize::MAX`). The array is owned exclusively
+    // by `credentials`, which outlives `entries`, with no mutable aliasing
+    // during the borrow.
     let entries = unsafe { std::slice::from_raw_parts(credentials.0, count) };
     let mut identifiers = Vec::with_capacity(entries.len());
     for entry in entries {
@@ -2039,7 +2124,14 @@ pub fn credential_ids_current_user_with_prefix(prefix: &str) -> io::Result<Vec<S
                 "credential enumeration returned a null entry",
             ));
         }
-        // SAFETY: every non-null entry belongs to the live enumeration buffer.
+        // SAFETY (WORK_UNIT 789, credential family — entry dereference): each
+        // non-null `entry` was just proven to belong to the live enumeration
+        // array owned by `credentials`; dereferencing one level (`**entry`)
+        // reads only the `CREDENTIALW` struct field `TargetName` (a
+        // `*const u16` with `windows-sys` layout matching Win32) without
+        // forming a mutable alias or retaining the pointer. The raw target is
+        // re-validated (null + 512-unit bounded scan) inside
+        // `credential_target_name`.
         let target = credential_target_name(unsafe { (**entry).TargetName })?;
         let identifier = target.strip_prefix("EliotGovernor/").ok_or_else(|| {
             io::Error::new(
@@ -2276,10 +2368,18 @@ pub fn credential_status_current_user(
 ) -> io::Result<CurrentUserCredentialStatus> {
     let target = credential_target(credential_id)?;
     let mut raw = ptr::null_mut();
-    // SAFETY: `target` is NUL-terminated and `raw` is a valid out pointer.
+    // SAFETY (WORK_UNIT 789, credential family — `CredReadW`): `target` is
+    // NUL-terminated (validated id + `nul_terminated_wide` rejects embedded
+    // NUL/overlong input) and borrowed for the whole call, so
+    // `target.as_ptr()` is valid and stable. `&mut raw` is a live exclusive
+    // out pointer. `CRED_TYPE_GENERIC`/`0` request the default read; the
+    // callee retains nothing. On success `raw` owns one `CREDENTIALW`
+    // allocation until `CredentialBuffer` frees it.
     let read = unsafe { CredReadW(target.as_ptr(), CRED_TYPE_GENERIC, 0, &raw mut raw) };
     if read == 0 {
-        // SAFETY: this call immediately follows the failed Win32 operation.
+        // SAFETY (WORK_UNIT 789, credential family — `GetLastError`): called
+        // immediately after the failed `CredReadW` with no intervening Win32
+        // call, so the code belongs to this failure.
         let code = unsafe { GetLastError() };
         if code == ERROR_NOT_FOUND {
             return Ok(CurrentUserCredentialStatus {
@@ -2290,8 +2390,20 @@ pub fn credential_status_current_user(
         }
         return Err(io::Error::from_raw_os_error(code.cast_signed()));
     }
+    if raw.is_null() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "credential read returned a null allocation",
+        ));
+    }
     let buffer = CredentialBuffer(raw);
-    // SAFETY: successful `CredReadW` returned the allocation owned by `buffer`.
+    // SAFETY (WORK_UNIT 789, credential family — `CREDENTIALW` dereference):
+    // `CredReadW` succeeded and `raw` was just proven non-null, so `buffer.0`
+    // points at one initialized `CREDENTIALW` (windows-sys layout matches
+    // Win32) owned exclusively by `buffer`, which outlives `credential`. The
+    // shared borrow overlaps no mutable borrow and reads only
+    // `LastWritten`/`CredentialBlobSize` (plain integers, no pointer
+    // traversal).
     let credential = unsafe { &*buffer.0 };
     let version = (u64::from(credential.LastWritten.dwHighDateTime) << 32)
         | u64::from(credential.LastWritten.dwLowDateTime);
@@ -2312,19 +2424,33 @@ pub fn credential_status_current_user(
 pub fn credential_read_current_user(credential_id: &str) -> io::Result<Option<Vec<u8>>> {
     let target = credential_target(credential_id)?;
     let mut raw = ptr::null_mut();
-    // SAFETY: `target` is NUL-terminated and `raw` is a valid out pointer.
+    // SAFETY (WORK_UNIT 789, credential family — `CredReadW`): same contract
+    // as `credential_status_current_user`: `target` is NUL-terminated and
+    // borrowed for the call, `&mut raw` is a live exclusive out pointer, and
+    // success transfers exactly one `CREDENTIALW` allocation to the caller.
     let read = unsafe { CredReadW(target.as_ptr(), CRED_TYPE_GENERIC, 0, &raw mut raw) };
     if read == 0 {
-        // SAFETY: this call immediately follows the failed Win32 operation.
+        // SAFETY (WORK_UNIT 789, credential family — `GetLastError`): called
+        // immediately after the failed `CredReadW` with no intervening Win32
+        // call, so the code belongs to this failure.
         let code = unsafe { GetLastError() };
         if code == ERROR_NOT_FOUND {
             return Ok(None);
         }
         return Err(io::Error::from_raw_os_error(code.cast_signed()));
     }
+    if raw.is_null() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "credential read returned a null allocation",
+        ));
+    }
     let buffer = CredentialBuffer(raw);
-    // SAFETY: a successful `CredReadW` returns a valid `CREDENTIALW` allocation
-    // owned by `buffer` for the duration of this function.
+    // SAFETY (WORK_UNIT 789, credential family — `CREDENTIALW` dereference):
+    // `CredReadW` succeeded and `raw` was just proven non-null, so `buffer.0`
+    // points at one initialized `CREDENTIALW` owned exclusively by `buffer`,
+    // which outlives `credential`. The shared borrow overlaps no mutable
+    // borrow; only integer/pointer fields are read here.
     let credential = unsafe { &*buffer.0 };
     let blob_size = usize::try_from(credential.CredentialBlobSize).map_err(|_| {
         io::Error::new(
@@ -2340,8 +2466,13 @@ pub fn credential_read_current_user(credential_id: &str) -> io::Result<Option<Ve
             "credential blob is invalid",
         ));
     }
-    // SAFETY: the blob belongs to the credential allocation, and the API
-    // guarantees `CredentialBlobSize` readable bytes on success.
+    // SAFETY (WORK_UNIT 789, credential family — blob `from_raw_parts`):
+    // `credential` is borrowed from the live `buffer` allocation, so
+    // `CredentialBlob` (when `blob_size > 0`, proven non-null above) points at
+    // `blob_size` initialized bytes inside that same allocation (WinCred blob
+    // contract), bounded by `CRED_MAX_CREDENTIAL_BLOB_SIZE` and converted
+    // without truncation. The slice is shared, overlaps no mutable borrow,
+    // and is copied out before the guard drops.
     let bytes = unsafe { std::slice::from_raw_parts(credential.CredentialBlob, blob_size) };
     Ok(Some(bytes.to_vec()))
 }
@@ -2378,8 +2509,16 @@ pub fn credential_write_current_user(credential_id: &str, value: &[u8]) -> io::R
         TargetAlias: ptr::null_mut(),
         UserName: username.as_mut_ptr(),
     };
-    // SAFETY: all pointers in `credential` remain valid for the complete call,
-    // and the blob length is checked against the Win32 maximum.
+    // SAFETY (WORK_UNIT 789, credential family — `CredWriteW`): `target` and
+    // `username` are NUL-terminated (validated id + `nul_terminated_wide`
+    // rejects embedded NUL/overlong input) and borrowed mutably for the whole
+    // call, so both pointers are valid, aligned, and unaliased during FFI.
+    // `CredentialBlob` borrows `value` (non-empty, `<=
+    // CRED_MAX_CREDENTIAL_BLOB_SIZE`, `u32`-checked above) for the call.
+    // Optional pointers are null with zero counts (`AttributeCount = 0`,
+    // null `Comment`/`Attributes`/`TargetAlias`), `Type`/`Persist` are valid
+    // constants, and `&raw const credential` passes a stable address without
+    // moving the struct. The callee retains nothing.
     let written = unsafe { CredWriteW(&raw const credential, 0) };
     if written == 0 {
         return Err(io::Error::last_os_error());
@@ -2397,12 +2536,18 @@ pub fn credential_write_current_user(credential_id: &str, value: &[u8]) -> io::R
 /// Manager failure.
 pub fn credential_delete_current_user(credential_id: &str) -> io::Result<bool> {
     let target = credential_target(credential_id)?;
-    // SAFETY: `target` is NUL-terminated and valid for the complete call.
+    // SAFETY (WORK_UNIT 789, credential family — `CredDeleteW`): `target` is
+    // NUL-terminated (validated id + `nul_terminated_wide` rejects embedded
+    // NUL/overlong input) and borrowed for the whole call, so the pointer is
+    // valid, aligned, and stable. `CRED_TYPE_GENERIC`/`0` select the default
+    // delete; the callee retains nothing.
     let deleted = unsafe { CredDeleteW(target.as_ptr(), CRED_TYPE_GENERIC, 0) };
     if deleted != 0 {
         return Ok(true);
     }
-    // SAFETY: this call immediately follows the failed Win32 operation.
+    // SAFETY (WORK_UNIT 789, credential family — `GetLastError`): called
+    // immediately after the failed `CredDeleteW` with no intervening Win32
+    // call, so the code belongs to this failure.
     let code = unsafe { GetLastError() };
     if code == ERROR_NOT_FOUND {
         Ok(false)

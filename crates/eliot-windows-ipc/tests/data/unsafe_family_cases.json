@@ -1,0 +1,217 @@
+{
+  "work_unit": 789,
+  "family": "credential",
+  "wave": "credential-span-only",
+  "scope": "crates/eliot-windows-ipc/src/lib.rs credential span (validate_credential_id, credential_target, CredentialBuffer/Array + CredFree, credential_target_name scan/from_raw_parts, CredEnumerateW/from_raw_parts, CredReadW/deref/blob from_raw_parts, CredWriteW, CredDeleteW)",
+  "library": "eliot-windows-ipc",
+  "test_file": "crates/eliot-windows-ipc/tests/unsafe_family_boundaries.rs",
+  "bounds": {
+    "max_credential_id_bytes": 240,
+    "max_credential_target_chars": 512,
+    "max_credential_enum_entries": 32768,
+    "max_wide_units_incl_nul": 32768,
+    "blob_limit": "CRED_MAX_CREDENTIAL_BLOB_SIZE (Win32, fail-closed; empty rejected)"
+  },
+  "sites": [
+    {
+      "site": "credential_target construction",
+      "api": "validate_credential_id + nul_terminated_wide",
+      "bound": "id grammar (nonempty, <=240 bytes, no leading/trailing slash, no empty/./.. segments, ASCII alnum plus - _ . /) then namespaced EliotGovernor/{id} re-checked against 512-unit target bound before any FFI pointer is formed",
+      "cases": [1, 2, 3, 4, 5, 6, 7, 8, 9, 10]
+    },
+    {
+      "site": "CredentialBuffer::drop",
+      "api": "CredFree",
+      "bound": "non-null check; exact CredReadW allocation owned exclusively by the guard, freed exactly once with &mut self, address-preserving cast",
+      "cases": [11]
+    },
+    {
+      "site": "CredentialArray::drop",
+      "api": "CredFree",
+      "bound": "non-null check; exact CredEnumerateW array allocation owned exclusively by the guard, freed exactly once with &mut self, address-preserving cast",
+      "cases": [12]
+    },
+    {
+      "site": "credential_target_name bounded scan",
+      "api": "pointer add/deref loop",
+      "bound": "null rejected; base valid for >=1 u16 in live CredentialBuffer/Array allocation; at most 512 aligned u16 reads; missing NUL within bound fails closed",
+      "cases": [9, 12]
+    },
+    {
+      "site": "credential_target_name slice",
+      "api": "std::slice::from_raw_parts(target, length)",
+      "bound": "scan observed length non-NUL units plus NUL at length inside the live allocation; slice excludes the terminator and overlaps no mutable borrow",
+      "cases": [9, 12]
+    },
+    {
+      "site": "credential_ids_current_user_with_prefix enumerate",
+      "api": "CredEnumerateW",
+      "bound": "prefix validated as credential id plus 512-unit filter bound; NUL-terminated filter borrowed for the call; exclusive out pointers; success transfers exactly count entries to CredentialArray",
+      "cases": [10, 12]
+    },
+    {
+      "site": "credential_ids_current_user_with_prefix error code",
+      "api": "GetLastError after CredEnumerateW",
+      "bound": "called immediately after the failed enumerate with no intervening Win32 call",
+      "cases": [10, 12]
+    },
+    {
+      "site": "credential_ids_current_user_with_prefix array view",
+      "api": "std::slice::from_raw_parts(array, count)",
+      "bound": "count via try_from then fail-closed against 32768-entry cap and isize::MAX byte size; array owned exclusively by the guard for the borrow",
+      "cases": [12]
+    },
+    {
+      "site": "credential_ids_current_user_with_prefix entry dereference",
+      "api": "(**entry).TargetName",
+      "bound": "each entry proven non-null in the live array; struct layout from windows-sys; raw target re-validated by credential_target_name; namespace prefix re-checked",
+      "cases": [12]
+    },
+    {
+      "site": "credential_status_current_user read",
+      "api": "CredReadW",
+      "bound": "NUL-terminated validated target borrowed for the call; exclusive out pointer; success transfers one CREDENTIALW allocation to CredentialBuffer",
+      "cases": [10, 11]
+    },
+    {
+      "site": "credential_status_current_user error code",
+      "api": "GetLastError after CredReadW",
+      "bound": "called immediately after the failed read with no intervening Win32 call",
+      "cases": [10, 11]
+    },
+    {
+      "site": "credential_status_current_user dereference",
+      "api": "&*buffer.0",
+      "bound": "success plus explicit non-null check; one initialized CREDENTIALW owned exclusively by the guard; shared borrow reads only integer fields",
+      "cases": [11, 12]
+    },
+    {
+      "site": "credential_read_current_user read",
+      "api": "CredReadW",
+      "bound": "same as status read; success transfers one CREDENTIALW allocation to CredentialBuffer",
+      "cases": [10, 11]
+    },
+    {
+      "site": "credential_read_current_user error code",
+      "api": "GetLastError after CredReadW",
+      "bound": "called immediately after the failed read with no intervening Win32 call",
+      "cases": [10, 11]
+    },
+    {
+      "site": "credential_read_current_user dereference",
+      "api": "&*buffer.0",
+      "bound": "success plus explicit non-null check; one initialized CREDENTIALW owned exclusively by the guard",
+      "cases": [11, 12]
+    },
+    {
+      "site": "credential_read_current_user blob view",
+      "api": "std::slice::from_raw_parts(CredentialBlob, blob_size)",
+      "bound": "blob size via try_from, fail-closed against CRED_MAX_CREDENTIAL_BLOB_SIZE; non-null when size > 0; bytes inside the live allocation, copied before the guard drops",
+      "cases": [11, 12]
+    },
+    {
+      "site": "credential_write_current_user write",
+      "api": "CredWriteW",
+      "bound": "NUL-terminated target/username borrowed for the call; blob borrows non-empty value with length <= CRED_MAX_CREDENTIAL_BLOB_SIZE and u32-checked; nulls only with zero counts; struct passed by stable address",
+      "cases": [10, 11]
+    },
+    {
+      "site": "credential_delete_current_user delete",
+      "api": "CredDeleteW",
+      "bound": "NUL-terminated validated target borrowed for the call; callee retains nothing",
+      "cases": [10, 11]
+    },
+    {
+      "site": "credential_delete_current_user error code",
+      "api": "GetLastError after CredDeleteW",
+      "bound": "called immediately after the failed delete with no intervening Win32 call",
+      "cases": [10, 11]
+    }
+  ],
+  "cases": [
+    {
+      "case": 1,
+      "title": "valid minimal credential id accepted",
+      "inputs": ["a", "abc123", "wipc-789-probe"],
+      "expectation": "validate_credential_id returns Ok; no FFI reached with invalid state"
+    },
+    {
+      "case": 2,
+      "title": "valid nested credential id accepted",
+      "inputs": ["operator-cursor/isolated-abc", "a-b_c.d/e-f_g.h/i"],
+      "expectation": "validate_credential_id returns Ok; namespaced target stays within the 512-unit bound"
+    },
+    {
+      "case": 3,
+      "title": "empty credential id rejected",
+      "inputs": [""],
+      "expectation": "validate_credential_id returns InvalidInput; wrappers fail closed before FFI"
+    },
+    {
+      "case": 4,
+      "title": "overlong credential id rejected",
+      "inputs": ["<241 x a>", "<512 x a>"],
+      "expectation": "validate_credential_id returns InvalidInput for any id longer than 240 bytes; never truncated or defaulted"
+    },
+    {
+      "case": 5,
+      "title": "forged absolute credential id rejected",
+      "inputs": ["/leading", "trailing/"],
+      "expectation": "validate_credential_id returns InvalidInput; absolute paths cannot become WinCred targets"
+    },
+    {
+      "case": 6,
+      "title": "traversal credential id rejected",
+      "inputs": ["a/../b", "a/./b", "a//b", "..", "."],
+      "expectation": "validate_credential_id returns InvalidInput; dot/dot-dot/empty segments cannot escape the EliotGovernor namespace"
+    },
+    {
+      "case": 7,
+      "title": "null credential id rejected",
+      "inputs": ["ab\\u0000cd", "\\u0000"],
+      "expectation": "validate_credential_id returns InvalidInput; interior NUL fails closed before wide conversion"
+    },
+    {
+      "case": 8,
+      "title": "forged charset credential id rejected",
+      "inputs": ["a\\b", "a:b", "a*b", "a b", "caf\\u00e9", "EliotGovernor/x"],
+      "expectation": "validate_credential_id returns InvalidInput; only ASCII alnum plus - _ . / are accepted"
+    },
+    {
+      "case": 9,
+      "title": "wide-input target bound holds at the 240-byte edge",
+      "inputs": ["<240 x a>"],
+      "expectation": "240-byte id validates Ok and its EliotGovernor/ namespaced target stays strictly below the 512-unit scan bound and the wide NUL bound"
+    },
+    {
+      "case": 10,
+      "title": "invalid ids fail closed before WinCred FFI on every entry point",
+      "inputs": ["", "/x", "a/../b", "ab\\u0000cd"],
+      "expectation": "credential_status/read/delete/enumerate/write each return InvalidInput for invalid ids without forming pointers or defaulting to missing"
+    },
+    {
+      "case": 11,
+      "title": "real WinCred valid-absent and blob-bound behavior without mutation",
+      "inputs": ["unique wipc-789-probe id per run", "empty blob", "8192-byte blob"],
+      "expectation": "real CredReadW/CredDeleteW/CredEnumerateW for a unique valid-but-absent id return None/false/absent; empty and oversized writes return InvalidInput before CredWriteW; no credential is created, modified, or deleted"
+    },
+    {
+      "case": 12,
+      "title": "fixture binds every credential-span unsafe site and names deferred families",
+      "inputs": ["tests/data/unsafe_family_cases.json"],
+      "expectation": "fixture lists all 19 credential-span sites with bounds and cases 1..12, and enumerates deferred families (oplock async, pipe/process, job/IOCP/spawn, notify/move, security/pipe-server) as not implemented in this wave"
+    }
+  ],
+  "deferred_families_not_implemented_this_wave": [
+    "oplock async (lib.rs :271/:302/:354)",
+    "pipe/process identity (lib.rs :403/:429/:451)",
+    "job/IOCP/spawn supervision (lib.rs :586-1696)",
+    "notify/move file (lib.rs :1763/:1846)",
+    "security/pipe-server DACL (lib.rs :2443/:2480)"
+  ],
+  "notes": [
+    "Credential span only (lib.rs validate_credential_id through credential_delete_current_user). Other families are deferred residuals listed above, not implemented now.",
+    "Real code only: tests call the real public eliot-windows-ipc API on Windows; no mocks, no UB probes, no pointer forging.",
+    "Fail-closed everywhere: invalid or overlong input returns InvalidInput/InvalidData; enumeration counts and blob sizes are capped before any from_raw_parts view."
+  ]
+}
