@@ -176,7 +176,7 @@ impl HostIdentityMonitor {
             let observation = self.observe_runtime_readback(runtime);
             tracing::debug!(
                 event = "watchdog.host_observed",
-                observation = crate::diagnostics::host_observation_diagnostic(&observation.state),
+                observation = crate::diagnostics::host_observation_diagnostic(observation.state),
                 "host observation reconciled without lifecycle authority"
             );
             return observation;
