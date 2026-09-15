@@ -2807,6 +2807,9 @@ dependencies = [
 name = "eliotd"
 version = "0.1.0"
 dependencies = [
+ "eliot-agent-api",
+ "eliot-agent-contracts",
+ "eliot-agent-coordinator",
  "eliot-authority",
  "eliot-contracts",
  "eliot-controlboard",
@@ -2816,6 +2819,7 @@ dependencies = [
  "eliot-dreamer-claim-grounding",
  "eliot-dreamer-probe-plan",
  "eliot-dreamer-rival-model",
+ "eliot-evaluation-contracts",
  "eliot-governor",
  "eliot-ipc",
  "eliot-maintenance",
@@ -2825,6 +2829,7 @@ dependencies = [
  "eliot-read",
  "eliot-receipts",
  "eliot-runtime-contracts",
+ "eliot-security-contracts",
  "eliot-skill",
  "eliot-store-api",
  "eliot-watchdog-core",
