@@ -4,13 +4,16 @@
 //! adapter handlers, parameter shapes, and consumers:
 //! `GetRevisionHeads`, `GetOrderingHeads`, `GetScopeRevisionView`, and
 //! `ResolveWriteReceipt` (see `apply/read_boundary.rs` in the Surreal adapter
-//! and `execute_named_sync` in the memory adapter), plus the two
-//! `CaptureObservation` / `AppendAuditEvent` mutations (AUD-C01:
+//! and `execute_named_sync` in the memory adapter), plus the three
+//! `CaptureObservation` / `AppendAuditEvent` / `ApplyLifecyclePolicy`
+//! mutations (AUD-C01: `CaptureObservation` and `AppendAuditEvent` persist
 //! `TransitionClass::CaptureCandidate` with the `EffectClass::Candidate`
 //! ceiling; `CaptureObservation` carries the owner-shaped `subject` string
 //! already used by the adapter receipt/plan fixtures, `AppendAuditEvent`
 //! carries the six receipt-bound operator fields emitted by the Governor
-//! reconciliation).
+//! reconciliation, `ApplyLifecyclePolicy` carries the six lifecycle-policy
+//! fields emitted by the Governor skill promotion envelope
+//! (`crates/governor/eliot-governor/src/skill_lifecycle.rs`, `skill_envelope`).
 //! Every other [`NamedReadOperation`](crate::NamedReadOperation) variant and
 //! every other [`NamedMutationOperation`](crate::NamedMutationOperation)
 //! variant stays known-but-unsupported and unadvertised, and no other mutation
@@ -25,8 +28,9 @@
 //! Validation is control-contract only and issues no authority: scope, role,
 //! fence, and expiry enforcement stay in slice C2. An explicitly declared
 //! parameter (today `operation_id` for `ResolveWriteReceipt`, `subject`
-//! for `CaptureObservation`, and the six receipt-bound fields for
-//! `AppendAuditEvent`) is owner-approved and therefore supersedes the
+//! for `CaptureObservation`, the six receipt-bound fields for
+//! `AppendAuditEvent`, and the six lifecycle-policy fields for
+//! `ApplyLifecyclePolicy`) is owner-approved and therefore supersedes the
 //! generic [`CONTROL_FIELD_DENYLIST`](crate::CONTROL_FIELD_DENYLIST) for that
 //! exact name; every undeclared control name is still rejected fail-closed.
 
@@ -47,7 +51,8 @@ use crate::{
 /// `ResolveWriteReceipt` (reused for the receipt-bound `AppendAuditEvent`
 /// `operation_id`) and the non-blank text captured by `CaptureObservation`
 /// as `subject` (reused for the five remaining receipt-bound
-/// `AppendAuditEvent` fields). The enum is closed so a future parameter kind
+/// `AppendAuditEvent` fields and for the six lifecycle-policy
+/// `ApplyLifecyclePolicy` fields). The enum is closed so a future parameter kind
 /// is a contract change with a new owner-approved arm, never silent `Value`
 /// passthrough.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -58,7 +63,9 @@ pub enum ParameterShape {
     /// `CaptureObservation`, reused for the non-`operation_id` receipt-bound
     /// `AppendAuditEvent` fields (`idempotency_key`, `session_id`,
     /// `access_digest`, `action_digest`, and `expected_revision` as its
-    /// decimal string). Length is bounded by the owning manifest entry's
+    /// decimal string) and for the six lifecycle-policy `ApplyLifecyclePolicy`
+    /// fields (`action`, `base_view_digest`, `candidate_digest`,
+    /// `candidate_package_digest`, `skill_id`, `verifier_ref`). Length is bounded by the owning manifest entry's
     /// `max_input_bytes` over the canonical parameter bytes (the same
     /// mechanism that bounds the activated reads), so no separate string
     /// length constant exists here.
@@ -127,6 +134,38 @@ static APPEND_AUDIT_EVENT_PARAMETERS: [ParameterDeclaration; 6] = [
     },
     ParameterDeclaration {
         name: "expected_revision",
+        shape: ParameterShape::Subject,
+        required: true,
+    },
+];
+static APPLY_LIFECYCLE_POLICY_PARAMETERS: [ParameterDeclaration; 6] = [
+    ParameterDeclaration {
+        name: "action",
+        shape: ParameterShape::Subject,
+        required: true,
+    },
+    ParameterDeclaration {
+        name: "base_view_digest",
+        shape: ParameterShape::Subject,
+        required: true,
+    },
+    ParameterDeclaration {
+        name: "candidate_digest",
+        shape: ParameterShape::Subject,
+        required: true,
+    },
+    ParameterDeclaration {
+        name: "candidate_package_digest",
+        shape: ParameterShape::Subject,
+        required: true,
+    },
+    ParameterDeclaration {
+        name: "skill_id",
+        shape: ParameterShape::Subject,
+        required: true,
+    },
+    ParameterDeclaration {
+        name: "verifier_ref",
         shape: ParameterShape::Subject,
         required: true,
     },
@@ -241,7 +280,10 @@ pub const fn declared_read_parameters(
 /// `CaptureObservation` declares the required owner-shaped `subject` string;
 /// `AppendAuditEvent` declares the six required receipt-bound fields
 /// (`operation_id`, `idempotency_key`, `session_id`, `access_digest`,
-/// `action_digest`, `expected_revision`); every other variant declares none,
+/// `action_digest`, `expected_revision`); `ApplyLifecyclePolicy` declares the
+/// six required lifecycle-policy fields (`action`, `base_view_digest`,
+/// `candidate_digest`, `candidate_package_digest`, `skill_id`,
+/// `verifier_ref`); every other variant declares none,
 /// so any supplied parameter fails closed. Variants without a catalogue entry
 /// never reach this table: they fail as [`StoreError::UnknownOperation`] first.
 #[must_use]
@@ -251,9 +293,9 @@ pub const fn declared_mutation_parameters(
     match operation {
         NamedMutationOperation::CaptureObservation => &CAPTURE_OBSERVATION_PARAMETERS,
         NamedMutationOperation::AppendAuditEvent => &APPEND_AUDIT_EVENT_PARAMETERS,
+        NamedMutationOperation::ApplyLifecyclePolicy => &APPLY_LIFECYCLE_POLICY_PARAMETERS,
         NamedMutationOperation::ApplyEpistemicRevision
         | NamedMutationOperation::UpdateTaskState
-        | NamedMutationOperation::ApplyLifecyclePolicy
         | NamedMutationOperation::ReconcileRecovery => &NO_PARAMETERS,
     }
 }

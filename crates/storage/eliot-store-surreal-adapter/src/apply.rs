@@ -1003,6 +1003,23 @@ mod admitted_operation_gate_tests {
         }
     }
 
+    fn lifecycle_operation() -> eliot_store_api::NamedMutationRequest {
+        NamedMutationRequest {
+            operation: NamedMutationOperation::ApplyLifecyclePolicy,
+            parameters: BTreeMap::from([
+                ("action".to_owned(), json!("keep")),
+                ("base_view_digest".to_owned(), json!("a".repeat(64))),
+                ("candidate_digest".to_owned(), json!("b".repeat(64))),
+                (
+                    "candidate_package_digest".to_owned(),
+                    json!("c".repeat(64)),
+                ),
+                ("skill_id".to_owned(), json!("skill-gate")),
+                ("verifier_ref".to_owned(), json!("verifier-gate")),
+            ]),
+        }
+    }
+
     #[test]
     fn genesis_shaped_transition_passes_the_pre_stage_gate() {
         let fence = test_fence(1);
@@ -1044,10 +1061,10 @@ mod admitted_operation_gate_tests {
             Err(AdapterError::Store(StoreError::ManifestMismatch))
         );
         // Current set digest but still-unadmitted mutation entry: fail-closed
-        // for the remaining mutations. `CaptureObservation` and
-        // `AppendAuditEvent` are admitted (their handler/schema/consumer
-        // triples are proven); this proof uses `ApplyEpistemicRevision`
-        // (still unadmitted).
+        // for the remaining mutations. `CaptureObservation`,
+        // `AppendAuditEvent`, and `ApplyLifecyclePolicy` are admitted (their
+        // handler/schema/consumer triples are proven); this proof uses
+        // `ApplyEpistemicRevision` (still unadmitted).
         let unadmitted = transition_with(
             &fence,
             set_digest.clone(),
@@ -1079,7 +1096,7 @@ mod admitted_operation_gate_tests {
         // receipt-bound params passes the pre-stage gate.
         let admitted_audit = transition_with(
             &fence,
-            set_digest,
+            set_digest.clone(),
             TransitionClass::CaptureCandidate,
             EffectClass::Candidate,
             vec![audit_operation()],
@@ -1087,6 +1104,19 @@ mod admitted_operation_gate_tests {
         assert!(
             validate_transition(&context, &admitted_audit).is_ok(),
             "admitted AppendAuditEvent passes the pre-stage gate"
+        );
+        // Admitted `ApplyLifecyclePolicy` with current set digest and approved
+        // lifecycle-policy params passes the pre-stage gate.
+        let admitted_lifecycle = transition_with(
+            &fence,
+            set_digest,
+            TransitionClass::LifecyclePolicy,
+            EffectClass::ReversibleMutation,
+            vec![lifecycle_operation()],
+        );
+        assert!(
+            validate_transition(&context, &admitted_lifecycle).is_ok(),
+            "admitted ApplyLifecyclePolicy passes the pre-stage gate"
         );
         // Fence divergence between caller context and transition.
         let manifest = genesis_manifest().expect("genesis entry is active");
