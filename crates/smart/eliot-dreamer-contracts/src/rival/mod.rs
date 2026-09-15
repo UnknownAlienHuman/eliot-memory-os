@@ -9,6 +9,7 @@ mod validation;
 
 pub mod model;
 pub mod prediction;
+pub mod projection;
 
 pub use model::{
     ClaimDeclarations, CommonModeDisclosure, CurrentPositionAvailability, CurrentPositionBinding,
@@ -23,4 +24,9 @@ pub use prediction::{
     ConditionAssumptionRef, ForecastAvailability, PredictionAvailability,
     RIVAL_PREDICTION_SCHEMA_VERSION, RivalForecast, RivalPrediction, RivalPredictionParams,
     VerifierAvailability,
+};
+pub use projection::{
+    DiscriminatorPeerAddress, RIVAL_MODEL_SET_SCHEMA_VERSION, RequirementFacet, RequirementReason,
+    RetainedDiscriminator, RivalCoverageStatus, RivalCoverageSummary, RivalDeclarationSetRef,
+    RivalModelSet, RivalModelSetParams, UnresolvedDiscriminatorRequirement,
 };
