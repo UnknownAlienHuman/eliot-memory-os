@@ -386,28 +386,29 @@ mod tests {
         }
     }
 
-    /// DEPENDS-ON-INTEGRATION: live delivery seam E2E (needs W-C kernel side).
+    /// Child-side delivery seam E2E (DW-C owned, Implements #20).
     ///
-    /// Once the kernel contour composes (`compose_dispatch_contour`) and
-    /// `prepare_testd_launch` / `launch_admitted_testd_attempt` deliver a
-    /// real `eliot-testd.admitted-attempt.json` next to a spawned
-    /// `eliot-testd`, the child must drive the single registered
-    /// `cargo-test` profile (bounded `cargo --version` probe) with no test
-    /// doubles. This test stages that exact documented file shape (seven
-    /// keys per the `testd_material` module docs) through the real broker
-    /// constructors and drives it through the real `drive_material_probe`
-    /// (real tool resolution, real `TestdDispatchAuthority`, real composed
-    /// executor). Ignored until the W-C launch edge delivers; it never runs
-    /// by default and never weakens the fail-closed gate.
+    /// The child drive seam no longer waits on doubles: this test stages the
+    /// exact documented file shape (seven keys per the `testd_material`
+    /// module docs) through the real broker constructors and drives it
+    /// through the real `drive_material_probe` (real tool resolution, real
+    /// `TestdDispatchAuthority`, real composed executor, bounded
+    /// `cargo --version` probe). The testd IPC side now mirrors the doctor
+    /// bootstrap (`KernelTestdIpcClient::connect` +
+    /// live-health `advertise_testd`), so advertisement flips only when the
+    /// composed Kernel advertises; live kernel delivery itself remains DW-A/B
+    /// contour work. Runs by default on a host with cargo on PATH and never
+    /// weakens the fail-closed gate.
     #[test]
-    #[ignore = "DEPENDS-ON-INTEGRATION: requires W-C kernel dispatch contour to deliver real material and advertise, on a Windows host with cargo on PATH; child side stays fail-closed until then"]
     fn dispatch_live_e2e_bounded_probe_runs_without_doubles() {
         use eliot_testd::testd_material::read_testd_material_from;
 
         let live = dcf_test_epoch(7);
         let path = dcf_stage_material(&live, &live, "e2e.admitted-attempt.json");
         let Ok(staged) = read_testd_material_from(&path) else {
-            panic!("E2E material must validate: read_testd_material delivery is the child-side seam");
+            panic!(
+                "E2E material must validate: read_testd_material delivery is the child-side seam"
+            );
         };
         let Some(material) = staged else {
             panic!("E2E material must present: absent delivery keeps DenyNoPresentedAttempt");
@@ -420,7 +421,7 @@ mod tests {
         let code = drive_material_probe(&material);
         assert_eq!(
             code, EXIT_ADMITTED_COMPLETED,
-            "bounded probe must complete; explicit run needs W-C delivery plus unexpired material on a host with cargo on PATH"
+            "bounded probe must complete on a host with cargo on PATH plus unexpired material"
         );
         if let Some(parent) = path.parent() {
             let _ = std::fs::remove_dir_all(parent);
