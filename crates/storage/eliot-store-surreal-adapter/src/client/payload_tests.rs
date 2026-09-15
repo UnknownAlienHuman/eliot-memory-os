@@ -9,7 +9,6 @@ use std::path::PathBuf;
 use eliot_contracts::{
     ClockReading, EpochId, EpochLineageId, ProductId, RequestId, ResourceGeneration, SourceId,
 };
-use eliot_platform_windows::WindowsPlatform;
 use eliot_store_api::{
     CanonicalRequestView, CanonicalStoreClient, EffectClass, EventProjectionRelationIntents,
     ExactJsonBytes, NamedMutationOperation, NamedMutationRequest, NamedReadOperation,
@@ -22,6 +21,9 @@ use serde_json::Map;
 
 use super::*;
 use crate::{SchemaGeneration, SurrealStoreAdapter};
+
+#[path = "test_readiness.rs"]
+pub(super) mod test_readiness;
 
 struct Harness {
     root: PathBuf,
@@ -118,19 +120,15 @@ impl Harness {
     }
 
     async fn open(&mut self) {
-        let platform = WindowsPlatform::new(self.root.clone()).expect("platform");
-        let lease = platform
-            .retain_process_path_lease(
-                Path::new(&self.config.provider_executable_path),
-                Path::new(&self.config.store_work_root),
-                &self.config.provider_artifact_digest,
-            )
-            .expect("process lease");
-        self.adapter = Some(SurrealStoreAdapter::new(self.config.clone(), lease).expect("adapter"));
-        self.adapter()
-            .connect()
-            .await
-            .expect("authenticated provider");
+        // Bounded readiness retry (PR #1488 pattern): slow provider
+        // authentication waits up to ~30s with 100ms backoff instead of
+        // failing on the first attempt. Last error is preserved on timeout.
+        test_readiness::connect_with_readiness_retry(
+            Path::new(&self.root),
+            &self.config,
+            &mut self.adapter,
+        )
+        .await;
     }
 
     fn adapter(&self) -> &SurrealStoreAdapter {
