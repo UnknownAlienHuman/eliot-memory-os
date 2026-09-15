@@ -794,3 +794,37 @@ fn admitted_view_preserves_protected_fields_and_rejects_injected_content() {
         Err(ContextError::SelectionIntegrityMismatch)
     );
 }
+
+#[test]
+fn blocked_and_unavailable_denominators_require_named_evidence() {
+    denominator(AtomAvailability::PresentCurrent)
+        .validate()
+        .expect("present denominator needs no evidence");
+    denominator(AtomAvailability::Missing)
+        .validate()
+        .expect("missing denominator needs no evidence");
+
+    assert_eq!(
+        denominator(AtomAvailability::Blocked).validate(),
+        Err(ContextError::MissingField(
+            "denominator.dispositions.evidence"
+        ))
+    );
+    assert_eq!(
+        denominator(AtomAvailability::Unavailable).validate(),
+        Err(ContextError::MissingField(
+            "denominator.dispositions.evidence"
+        ))
+    );
+
+    for state in [AtomAvailability::Blocked, AtomAvailability::Unavailable] {
+        let mut evidenced = denominator(state);
+        evidenced.dispositions[0].evidence = Some(ProofBinding {
+            evidence_id: id("named-reason"),
+            ceiling: eliot_receipts::ProofCeiling::Observation,
+        });
+        evidenced
+            .validate()
+            .expect("named blocked/unavailable evidence validates");
+    }
+}

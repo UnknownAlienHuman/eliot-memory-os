@@ -21,7 +21,8 @@ use std::collections::{BTreeMap, BTreeSet};
 use eliot_context_contracts::{
     AtomAvailability, ContextBinding, ContextCandidate, ContextCandidateSet, ContextError,
     ContextRecipe, DecisionRevision, ExpansionHandle, MeasurementRef, OmissionReason,
-    OmissionRecord, ProviderDisposition, ProviderRole, ProviderRoleDenominator, SemanticRole,
+    OmissionRecord, ProofBinding, ProviderDisposition, ProviderRole, ProviderRoleDenominator,
+    SemanticRole,
 };
 use eliot_contracts::{ArtifactId, StateFence, TaskRevision, canonical_json_bytes, sha256_hex};
 use eliot_evidence::{Assertability, EpistemicStatus};
@@ -34,7 +35,7 @@ use crate::derive::{
 };
 use crate::inputs::{
     AttentionInput, CandidatePolicy, CandidateRequest, CueInput, EpistemicInput, EvidenceInput,
-    OpaqueMember, OpaqueProjection, check_denominator_is_seven, cue_availability,
+    OpaqueMember, OpaqueProjection, ProjectionState, check_denominator_is_seven, cue_availability,
 };
 use crate::vocabulary::{
     KIND_MAP_VERSION, KindRule, PROVIDER_AFFORDANCE, PROVIDER_ATTENTION, PROVIDER_CUE,
@@ -66,6 +67,47 @@ const fn worst_state(first: AtomAvailability, second: AtomAvailability) -> AtomA
     } else {
         second
     }
+}
+
+/// Bind the existing projection reason identity as disposition evidence.
+///
+/// Blocked/Unavailable slots carry the owner-supplied reason verbatim as the
+/// evidence identity at the minimal observation ceiling. No proof is
+/// fabricated: the identifier is the supplied reason, never a new claim.
+fn disposition_evidence_for_state(
+    state: &ProjectionState,
+) -> Result<Option<ProofBinding>, ContextError> {
+    let (ProjectionState::Blocked { reason } | ProjectionState::Unavailable { reason }) = state
+    else {
+        return Ok(None);
+    };
+    let evidence_id = ArtifactId::new(reason.clone())
+        .map_err(|_| ContextError::InvalidField("denominator.dispositions.evidence"))?;
+    Ok(Some(ProofBinding {
+        evidence_id,
+        ceiling: ProofCeiling::Observation,
+    }))
+}
+
+/// Bind the existing cue completeness reason identity as disposition evidence.
+fn disposition_evidence_for_cue(
+    input: Option<&CueInput>,
+) -> Result<Option<ProofBinding>, ContextError> {
+    let Some(input) = input else {
+        return Ok(None);
+    };
+    let (eliot_cue_contracts::Completeness::Blocked { reason }
+    | eliot_cue_contracts::Completeness::Unavailable { reason }
+    | eliot_cue_contracts::Completeness::SourceUnavailable { reason }) = &input.result.completeness
+    else {
+        return Ok(None);
+    };
+    let evidence_id = ArtifactId::new(reason.clone())
+        .map_err(|_| ContextError::InvalidField("denominator.dispositions.evidence"))?;
+    Ok(Some(ProofBinding {
+        evidence_id,
+        ceiling: ProofCeiling::Observation,
+    }))
 }
 
 /// Per-provider-slot disposition: exactly one per requested slot.
@@ -732,8 +774,26 @@ pub fn construct_context_candidates(
     push_plain_frontiers(&slots, &edge_tables, &mut frontier)?;
     let unified = unify_members(&slots, &mandatory, per_slot, policy)?;
     let plan = plan_emission(&unified, policy)?;
+    let base_evidences: [Option<ProofBinding>; 7] = [
+        disposition_evidence_for_state(&task_frame.state)?,
+        None,
+        None,
+        disposition_evidence_for_cue(cue_activation_result)?,
+        disposition_evidence_for_state(&negative_memory.state)?,
+        None,
+        disposition_evidence_for_state(&affordances.state)?,
+    ];
     assemble_result(
-        request, recipe, policy, &slots, &mandatory, bases, &unified, &plan, frontier,
+        request,
+        recipe,
+        policy,
+        &slots,
+        &mandatory,
+        bases,
+        &base_evidences,
+        &unified,
+        &plan,
+        frontier,
     )
 }
 
@@ -1327,6 +1387,7 @@ fn assemble_result(
     slots: &[ProviderRole],
     mandatory: &BTreeSet<SemanticRole>,
     bases: [AtomAvailability; 7],
+    base_evidences: &[Option<ProofBinding>; 7],
     unified: &[WorkMember],
     plan: &[EmitDecision],
     mut frontier: Vec<FrontierRecord>,
@@ -1347,10 +1408,11 @@ fn assemble_result(
         dispositions: slots
             .iter()
             .zip(states.iter())
-            .map(|(slot, state)| ProviderDisposition {
+            .zip(base_evidences.iter())
+            .map(|((slot, state), evidence)| ProviderDisposition {
                 slot: slot.clone(),
                 state: *state,
-                evidence: None,
+                evidence: evidence.clone(),
             })
             .collect(),
     };

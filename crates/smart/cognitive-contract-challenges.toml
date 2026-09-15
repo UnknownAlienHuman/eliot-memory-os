@@ -83,3 +83,30 @@ resolution_evidence = ["versioned owner-neutral projection contract", "bounded p
 proof_ceiling = "STATIC_CONTRACT_REGISTRATION_ONLY"
 implementation_support = "TARGET"
 evidence_execution_status = "NOT_EXECUTED"
+
+[[challenge]]
+id = "CC-MEMORY-PROJECTION-SCHEMA"
+status = "OPEN_PROVIDER_CONFORMANCE"
+required_owner = "Governor/Memory OS canonical projection owner"
+needed_by = ["eliot-context-candidates", "future memory projection consumers"]
+missing_contract = "Versioned owner-neutral MemoryQueryIntent, MemorySelectionPolicy, MemorySelectionTrace and MemoryContextProjectionRequest with complete denominator, fence, scope and omission semantics."
+forbidden_workaround = "prose-invented memory query/selection types or generic JSON treated as a projection contract"
+resolution_evidence = ["versioned owner-neutral projection contracts", "producer fixtures", "complete-denominator and scope/fence tests", "Governor/Memory OS ownership acceptance"]
+
+[[challenge]]
+id = "CC-FAILURE-OBSERVATION-SCHEMA"
+status = "OPEN_PROVIDER_CONFORMANCE"
+required_owner = "Governor canonical observation owner"
+needed_by = ["eliot-context-candidates", "future failure-observation consumers"]
+missing_contract = "Versioned owner-neutral exact FailureObservation with complete denominator, fence, scope and omission semantics."
+forbidden_workaround = "prose-invented failure observation type or generic JSON treated as an observation contract"
+resolution_evidence = ["versioned owner-neutral observation contract", "producer fixtures", "complete-denominator and scope/fence tests", "Governor ownership acceptance"]
+
+[[challenge]]
+id = "CC-PROVIDER-CONTRIBUTION-SCHEMA"
+status = "OPEN_PROVIDER_CONFORMANCE"
+required_owner = "Governor canonical projection owners"
+needed_by = ["eliot-context-candidates", "future provider-contribution consumers"]
+missing_contract = "Versioned owner-neutral ProviderContribution with complete denominator, fence, scope and omission semantics."
+forbidden_workaround = "prose-invented provider contribution type or generic JSON treated as a contribution contract"
+resolution_evidence = ["versioned owner-neutral contribution contract", "producer fixtures", "complete-denominator and scope/fence tests", "Governor ownership acceptance"]
