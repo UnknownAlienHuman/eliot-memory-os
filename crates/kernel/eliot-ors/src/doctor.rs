@@ -24,6 +24,9 @@
 //! implements. This module contains no stubs: every constructor, validator,
 //! transition table, and budget evaluation here is complete and executes.
 
+use std::num::NonZeroU64;
+
+use eliot_contracts::{EpochId, EpochLineageId, LegacyScalarEpoch};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
@@ -138,13 +141,26 @@ pub struct DoctorAttemptRecord {
     pub principal_ref: OpaqueLabel,
     /// Opaque echo of the Kernel-supplied state-fence digest.
     pub fence_digest: String,
-    /// Authority epoch at admission time.
+    /// Legacy scalar sequence evidence (Implements #64, T6-E4-C).
+    ///
+    /// Retained only as the `LegacyScalarEpoch::scalar_sequence` projection
+    /// for wire/durable compatibility with the pre-lineage contour; it never
+    /// authorizes on its own. The canonical authority is `epoch_lineage`
+    /// below, and [`DoctorAttemptRecord::validate`] requires both halves to
+    /// agree as an exact tuple. Callers holding a canonical [`EpochId`] must
+    /// use [`DoctorAttemptRecord::validate_against_epoch`]; legacy numerics
+    /// promote to active authority only via
+    /// `import_legacy_scalar_epoch` with `Bound` evidence, never by coercion.
     pub authority_epoch: u64,
     /// Target resource generation at admission time.
     pub generation: u64,
-    /// Explicit epoch lineage fencing this attempt, when the Kernel
-    /// supplied one. `None` preserves the echo path: the epoch and fence
-    /// digests above still bind the attempt exactly.
+    /// Canonical lineage authority fencing this attempt (Implements #64, T6-E4-C).
+    ///
+    /// Required for every actively admitted attempt: `None` rows stay
+    /// deserializable as historical evidence but fail [`DoctorAttemptRecord::validate`]
+    /// and can never stage or re-admit. `Some` must validate under the
+    /// tightened direct-child [`EpochLineage::validate`] edge and its
+    /// `current.epoch` must equal the legacy `authority_epoch` projection above.
     pub epoch_lineage: Option<EpochLineage>,
     /// Opaque digest of the target resource envelope.
     pub target_resource_digest: String,
@@ -216,6 +232,65 @@ impl DoctorAttemptRecord {
             && self.request_digest == other.request_digest
     }
 
+    /// Returns the canonical lineage-aware authority for this attempt.
+    ///
+    /// Bridges the ORS `EpochLineage` contour (`OpaqueLabel` + `u64`) to the
+    /// canonical [`EpochId`] (`EpochLineageId` + `NonZeroU64`) without coercion:
+    /// the lineage UUID must parse and the sequence must be non-zero, and the
+    /// lineage `current.epoch` must equal the legacy `authority_epoch`
+    /// projection. `None` lineage (historical echo rows) fails as
+    /// `InvalidEpochLineage`: readable but never reactivatable.
+    pub fn canonical_authority_epoch(&self) -> Result<EpochId, OrsError> {
+        let lineage = self
+            .epoch_lineage
+            .as_ref()
+            .ok_or(OrsError::InvalidEpochLineage)?;
+        lineage.validate()?;
+        if lineage.current.epoch != self.authority_epoch {
+            return Err(OrsError::EpochMismatch);
+        }
+        let lineage_id = EpochLineageId::new(lineage.current.lineage_id.as_str())
+            .map_err(|_| OrsError::InvalidEpochLineage)?;
+        let sequence =
+            NonZeroU64::new(lineage.current.epoch).ok_or(OrsError::InvalidEpochLineage)?;
+        EpochId::new(lineage_id, sequence).map_err(|_| OrsError::InvalidEpochLineage)
+    }
+
+    /// Returns the legacy scalar evidence projection for migration bookkeeping.
+    ///
+    /// The returned [`LegacyScalarEpoch`] carries only `scalar_sequence` plus
+    /// caller-supplied provenance; it never authorizes. Active promotion
+    /// requires `import_legacy_scalar_epoch` with `Bound` evidence at the
+    /// migration boundary.
+    pub fn legacy_scalar_epoch(
+        &self,
+        source_record_ref: &str,
+        source_contract_revision: &str,
+    ) -> Result<LegacyScalarEpoch, OrsError> {
+        LegacyScalarEpoch::new(
+            self.authority_epoch,
+            source_record_ref,
+            source_contract_revision,
+        )
+        .map_err(|_| OrsError::InvalidField {
+            field: "doctor_attempt_epoch",
+            reason: "legacy scalar must be non-zero with provenance",
+        })
+    }
+
+    /// Requires this attempt's canonical authority to be the exact
+    /// `is_same_authority` tuple of `expected` (Implements #64).
+    ///
+    /// Equal sequences from different lineages fail as `EpochMismatch` and
+    /// never authorize, supersede, or finalize.
+    pub fn validate_against_epoch(&self, expected: &EpochId) -> Result<(), OrsError> {
+        let canonical = self.canonical_authority_epoch()?;
+        if !canonical.is_same_authority(expected) {
+            return Err(OrsError::EpochMismatch);
+        }
+        Ok(())
+    }
+
     /// Validates identity shape and state and admission coherence without
     /// interpreting semantic meaning.
     pub fn validate(&self) -> Result<(), OrsError> {
@@ -224,6 +299,13 @@ impl DoctorAttemptRecord {
     }
 
     /// Validates identity shape and bound terms without interpreting meaning.
+    ///
+    /// T6-E4-C lineage cutover: the canonical authority is the exact
+    /// `epoch_lineage` tuple, and the retained `u64` is only its legacy
+    /// scalar evidence. `None` lineage fails closed (`InvalidEpochLineage`)
+    /// so historical echo rows stay deserializable but can never stage anew;
+    /// `Some` must satisfy the tightened direct-child [`EpochLineage::validate`]
+    /// edge and bind `current.epoch == authority_epoch`, else `EpochMismatch`.
     fn validate_binding(&self) -> Result<(), OrsError> {
         if self.contract_version != DOCTOR_RECORD_CONTRACT_VERSION {
             return Err(OrsError::UnsupportedContractVersion(self.contract_version));
@@ -258,11 +340,13 @@ impl DoctorAttemptRecord {
         if let Some(approval) = &self.approval_digest {
             validate_digest(approval, "doctor_attempt_approval_digest")?;
         }
-        if let Some(lineage) = &self.epoch_lineage {
-            lineage.validate()?;
-            if lineage.current.epoch != self.authority_epoch {
-                return Err(OrsError::EpochMismatch);
-            }
+        let lineage = self
+            .epoch_lineage
+            .as_ref()
+            .ok_or(OrsError::InvalidEpochLineage)?;
+        lineage.validate()?;
+        if lineage.current.epoch != self.authority_epoch {
+            return Err(OrsError::EpochMismatch);
         }
         if self.authority_epoch == 0 || self.generation == 0 {
             return Err(OrsError::InvalidField {
