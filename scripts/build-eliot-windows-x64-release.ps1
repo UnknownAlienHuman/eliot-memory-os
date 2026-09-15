@@ -1428,6 +1428,39 @@ function Test-ReleaseBundle([string]$Path) {
             throw 'RELEASE.json runtime artifact binding differs from RUNTIME_ARTIFACTS.json'
         }
     }
+    $releaseBinding = $release.generation_binding
+    $runtimeBinding = $runtimeManifest.generation_binding
+    if (-not $releaseBinding -or -not $runtimeBinding) {
+        throw 'RELEASE.json/RUNTIME_ARTIFACTS.json must declare an explicit generation_binding (pre-generation-binding bundle refused)'
+    }
+    $releaseBindingJson = [string]($releaseBinding | ConvertTo-Json -Depth 12 -Compress)
+    $runtimeBindingJson = [string]($runtimeBinding | ConvertTo-Json -Depth 12 -Compress)
+    if ($releaseBindingJson -cne $runtimeBindingJson) {
+        throw 'staged generation_binding is not exactly repeated across RELEASE/RUNTIME_ARTIFACTS'
+    }
+    foreach ($field in @('generation', 'registry_generation', 'config_generation', 'schema_generation', 'rollback_generation', 'install_authoritative_cli')) {
+        $value = [string]$releaseBinding.$field
+        if ([string]::IsNullOrWhiteSpace($value) -or $value.IndexOf([char]0) -ge 0 -or $value -match '[\r\n]') {
+            throw "staged generation_binding field is missing or malformed: $field"
+        }
+    }
+    # v1 single-generation semantics (item 1228 of #1227): every generation field
+    # traces to the pinned isolated-tree source commit; the four sub-generations
+    # split into typed owners in the crates/kernel/eliot-installation follow-on.
+    foreach ($field in @('generation', 'registry_generation', 'config_generation', 'schema_generation', 'rollback_generation')) {
+        $declared = [string]$releaseBinding.$field
+        if ([System.IO.Path]::IsPathRooted($declared) -or
+            @($declared -split '[\\/]').Where({ $_ -eq '.' -or $_ -eq '..' -or $_ -eq '' }).Count -ne 0) {
+            throw "staged generation_binding field must be a canonical non-traversing identity: $field"
+        }
+        if ($declared -cne [string]$release.source_commit) {
+            throw "staged generation_binding field is not bound to the release source commit: $field"
+        }
+    }
+    $declaredCli = ([string]$releaseBinding.install_authoritative_cli).Replace('\', '/')
+    if ($declaredCli -cne 'runtime/eliot.exe') {
+        throw 'staged generation_binding.install_authoritative_cli must be exactly runtime/eliot.exe'
+    }
     $runtimeToolchain = $runtimeManifest.toolchain
     if (-not $runtimeToolchain -or
         [string]$runtimeToolchain.cargo_lock_sha256 -cne [string]$releaseToolchain.cargo_lock.sha256 -or
@@ -1532,10 +1565,28 @@ if ([string]$codexPluginManifest.name -ne 'eliot-governor' -or
     $codexPluginBaseVersion -notmatch '^[0-9]+\.[0-9]+\.[0-9]+(?:-[0-9A-Za-z.-]+)?$') {
     throw 'Codex release source must use a cache-neutral base SemVer without +codex metadata'
 }
+# Item 1228 generation_binding (v1 single-generation semantics): one release
+# generation built from one isolated immutable source tree pinned by
+# $sourceCommit (the same variable gated by Assert-IsolatedSourceTree
+# pre-build/post-build). The four sub-generations have no independent typed
+# owners yet, so they are bound to the source commit; the
+# crates/kernel/eliot-installation follow-on splits them into typed owners
+# and then replaces these commit-bound values. No value is invented: every
+# generation field traces to the pinned commit; install_authoritative_cli is
+# the exact literal the invoke gate requires (runtime/eliot.exe).
+$generationBinding = [ordered]@{
+    generation = [string]$sourceCommit
+    registry_generation = [string]$sourceCommit
+    config_generation = [string]$sourceCommit
+    schema_generation = [string]$sourceCommit
+    rollback_generation = [string]$sourceCommit
+    install_authoritative_cli = 'runtime/eliot.exe'
+}
 $plan = [ordered]@{
     component = 'eliot_windows_x64_release'
     version = $Version
     source_commit = $sourceCommit
+    generation_binding = $generationBinding
     architecture = 'windows-x64'
     signed = $false
     source_policy = 'pinned-commit-isolated-tree-only (tracked-clean untracked-rejected no-local-.cargo; cargo --frozen)'
@@ -1633,6 +1684,7 @@ try {
         component = 'eliot_runtime_verified_build_artifacts'
         version = $Version
         source_commit = $sourceCommit
+        generation_binding = $generationBinding
         architecture = 'windows-x64'
         catalog_path = $surrealCatalog.relative_path
         catalog_sha256 = $surrealCatalog.sha256
@@ -1675,6 +1727,7 @@ try {
         component = 'eliot_windows_x64_release'
         version = $Version
         source_commit = $sourceCommit
+        generation_binding = $generationBinding
         governor_version = $Version
         operator_schema_version = $verifiedOperator.schema_version
         operator_protocol_version = $verifiedOperator.protocol_version
