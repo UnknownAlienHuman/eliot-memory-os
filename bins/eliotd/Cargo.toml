@@ -18,6 +18,11 @@ eliot-authority.workspace = true
 eliot-contracts.workspace = true
 eliot-controlboard.workspace = true
 eliot-doctor-core.workspace = true
+eliot-dreamer-bundle = { path = "../../crates/smart/eliot-dreamer-bundle" }
+eliot-dreamer-candidate-validation = { path = "../../crates/smart/eliot-dreamer-candidate-validation" }
+eliot-dreamer-claim-grounding = { path = "../../crates/smart/eliot-dreamer-claim-grounding" }
+eliot-dreamer-probe-plan = { path = "../../crates/smart/eliot-dreamer-probe-plan" }
+eliot-dreamer-rival-model = { path = "../../crates/smart/eliot-dreamer-rival-model" }
 eliot-governor.workspace = true
 eliot-ipc.workspace = true
 eliot-maintenance.workspace = true
