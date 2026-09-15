@@ -147,6 +147,11 @@ members = [
   "crates/smart/eliot-context-assembly",
   "crates/smart/eliot-reactive-context-plan",
   "crates/smart/eliot-context-measurement",
+  "crates/smart/eliot-dreamer-conflict-analysis",
+  "crates/smart/eliot-dreamer-development-diagnosis",
+  "crates/smart/eliot-dreamer-maintenance-plan",
+  "crates/smart/eliot-dreamer-configuration-plan",
+  "crates/smart/eliot-dreamer-orchestration-plan",
 ]
 
 # Capability cells declared by `[package.metadata.eliot]` with `agent_order`
@@ -180,11 +185,6 @@ exclude = [
   "crates/smart/eliot-learning-delta",  # agent_order 34
   "crates/smart/eliot-learning-overlay",  # agent_order 35
   "crates/meta/eliot-learning-activation-assessment",  # agent_order 36
-  "crates/smart/eliot-dreamer-conflict-analysis",  # agent_order 39
-  "crates/smart/eliot-dreamer-development-diagnosis",  # agent_order 40
-  "crates/smart/eliot-dreamer-maintenance-plan",  # agent_order 41
-  "crates/smart/eliot-dreamer-configuration-plan",  # agent_order 42
-  "crates/smart/eliot-dreamer-orchestration-plan",  # agent_order 43
   "crates/foundation/eliot-conformance-contracts",  # prototype dep target for #216 (not a member; admission forbidden until fixture+review)
 ]
 default-members = [
