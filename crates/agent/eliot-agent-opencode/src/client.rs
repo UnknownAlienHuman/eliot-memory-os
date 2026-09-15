@@ -1,11 +1,13 @@
 use crate::{
-    AuthorityCeiling, BasicAuth, HealthResponse, HttpMethod, HttpRequest, LoopbackEndpoint,
-    LoopbackHttpClient, LoopbackHttpError, ModelSelection, NoAuthorityRunResult, OpenCodeEvent,
+    AdmittedAttemptCandidate, AdmittedAttemptError, AdmittedOpenCodeAttempt, AuthorityCeiling,
+    BasicAuth, HealthResponse, HttpMethod, HttpRequest, LoopbackEndpoint, LoopbackHttpClient,
+    LoopbackHttpError, ModelSelection, NoAuthorityRunResult, OpenCodeEvent,
     OpenCodeWireRouteReceipt, ProviderCatalog, QuotaAvailability, ReadOnlyRunRequest,
     RunRequestError, RunStatus, Session, SessionDiff, SessionStatus, SessionStatusMap,
     SseConnection, SseDecodeError, SseDecoder, SseLimits, UnknownFields, UsageAvailability,
     UsageTelemetry,
 };
+use eliot_contracts::{ResourceGeneration, StateFence};
 use serde_json::{Value, json};
 use sha2::{Digest as _, Sha256};
 use std::collections::BTreeSet;
@@ -167,6 +169,19 @@ pub enum OpenCodeRunError {
         cause: String,
         reconciliation: String,
     },
+}
+
+/// Outcome of one admitted read-only attempt: the supervised wire result plus
+/// its candidate-only seal.
+///
+/// The wire result carries the SSE observations for downstream normalization
+/// bound to the exact attempt; the seal carries only attempt/admission/result
+/// digests under the candidate-only ceiling — never launch, process, or
+/// finish authority.
+#[derive(Clone, Debug, PartialEq)]
+pub struct AdmittedAttemptOutcome {
+    pub run: NoAuthorityRunResult,
+    pub candidate: AdmittedAttemptCandidate,
 }
 
 pub struct OpenCodeClient {
@@ -574,6 +589,33 @@ impl OpenCodeClient {
             )
             .await?;
         Ok(self.success_result(request, prepared, projection, collection.events))
+    }
+
+    /// Runs one admitted read-only attempt through the supervised loopback
+    /// route (issue #487).
+    ///
+    /// Fail-closed before start: the admission/binding/attempt agreement is
+    /// re-verified against the live fence and generation, and the presented
+    /// request must carry the exact admitted provider/model in a valid
+    /// read-only shape — all before any session, prompt, or event-stream
+    /// call. Execution reuses exactly [`OpenCodeClient::run_read_only`]:
+    /// attach-only loopback HTTP+SSE against the externally supervised
+    /// server, the read-only `plan` agent ceiling, and no server launch,
+    /// process control, credential exposure, or finish authority. The
+    /// returned seal is candidate-only; unknown outcomes surface as
+    /// [`OpenCodeRunError`] (including `UnknownOutcome`) and never seal.
+    pub async fn run_admitted_read_only(
+        &self,
+        admitted: &AdmittedOpenCodeAttempt,
+        request: &ReadOnlyRunRequest,
+        current_fence: &StateFence,
+        runtime_generation: ResourceGeneration,
+    ) -> Result<AdmittedAttemptOutcome, AdmittedAttemptError> {
+        admitted.verify(current_fence, runtime_generation)?;
+        admitted.verify_request(request)?;
+        let run = self.run_read_only(request).await?;
+        let candidate = AdmittedAttemptCandidate::seal(admitted, &run)?;
+        Ok(AdmittedAttemptOutcome { run, candidate })
     }
 
     async fn prepare_run(
