@@ -31,7 +31,7 @@ pub(super) const READ_VALIDATION_SNAPSHOT: &str = "BEGIN TRANSACTION; SELECT * F
 /// Enforces the active generated catalogue on one named read before dispatch
 /// (slice C2, issue #19).
 ///
-/// Only the four activated reads (plus the genesis bootstrap entry, which
+/// Only the five activated reads (plus the genesis bootstrap entry, which
 /// never arrives through this path) are admitted: catalogue membership, the
 /// owner-approved typed parameters, the scope declaration, and the declared
 /// input bound are checked here, before any provider I/O. Unknown operations
@@ -358,6 +358,14 @@ mod admitted_read_tests {
                 NamedReadOperation::ResolveWriteReceipt,
                 None,
                 BTreeMap::from([("operation_id".to_owned(), json!("op-1"))]),
+            ),
+            read_request(
+                NamedReadOperation::GetEvidencePack,
+                Some(ScopeId::new("scope-1").expect("scope")),
+                BTreeMap::from([
+                    ("subject".to_owned(), json!("observation-1")),
+                    ("max_records".to_owned(), json!("10")),
+                ]),
             ),
         ] {
             assert!(

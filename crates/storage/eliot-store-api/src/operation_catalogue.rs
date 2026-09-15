@@ -2,10 +2,10 @@
 //!
 //! This module owns the single Rust declaration table that generates one
 //! [`NamedOperationManifest`](crate::NamedOperationManifest) descriptor per
-//! activated operation. The table activates exactly the four reads with
+//! activated operation. The table activates exactly the five reads with
 //! proven adapter handlers, parameter shapes, and consumers on base
 //! (`GetRevisionHeads`, `GetOrderingHeads`, `GetScopeRevisionView`,
-//! `ResolveWriteReceipt`), the three `CaptureObservation` /
+//! `ResolveWriteReceipt`, `GetEvidencePack`), the three `CaptureObservation` /
 //! `AppendAuditEvent` / `ApplyLifecyclePolicy` mutations (AUD-C01:
 //! `CaptureObservation` and `AppendAuditEvent` persist
 //! `TransitionClass::CaptureCandidate` with the `EffectClass::Candidate`
@@ -121,6 +121,31 @@ pub const READ_MAX_OUTPUT_BYTES: u32 = 3_145_728;
 /// read timeout on base.
 pub const READ_TIMEOUT_MS: u32 = 30_000;
 
+/// Maximum evidence records one `GetEvidencePack` read may return.
+///
+/// The bound is explicit per request (`max_records` decimal-string selector)
+/// and every handler refuses an over-bound request with
+/// [`StoreError::PayloadTooLarge`](crate::StoreError) instead of returning a
+/// successful over-bound view. 32 keeps the worst case inside
+/// [`READ_MAX_OUTPUT_BYTES`]: each returned record carries one
+/// input-bound subject (at most [`READ_MAX_INPUT_BYTES`] canonical parameter
+/// bytes, the same bound that limits the stored `CaptureObservation`
+/// subjects) plus fixed provenance, so 32 records stay far below the 3 MiB
+/// output ceiling while leaving headroom for the envelope.
+pub const EVIDENCE_PACK_MAX_RECORDS: u32 = 32;
+
+/// Compile-time guard for the bound above: the worst case (every record
+/// carrying a full input-bound subject) stays strictly inside
+/// [`READ_MAX_OUTPUT_BYTES`], so any handler enforcing
+/// [`EVIDENCE_PACK_MAX_RECORDS`] cannot breach the advertised output byte
+/// bound. (The crate root re-export is owned by a follow-up slice; until
+/// then handlers pin the same value locally and must stay equal.)
+const _: () = assert!(
+    (EVIDENCE_PACK_MAX_RECORDS as u64) * (READ_MAX_INPUT_BYTES as u64)
+        < (READ_MAX_OUTPUT_BYTES as u64),
+    "evidence-pack worst case must fit the read output bound"
+);
+
 /// Compatibility floor for generated entries: the current contract is the
 /// first version carrying per-operation manifests.
 pub const MINIMUM_COMPATIBLE_VERSION: ContractVersion = ContractVersion::new(1, 0, 0);
@@ -135,10 +160,13 @@ struct ActivatedReadDescriptor {
 /// The single declaration table for activated reads.
 ///
 /// `GetScopeRevisionView` addresses its scope through the typed `scope_id`
-/// request field (proven by both adapter handlers); the head and receipt
-/// reads address no scope, and the receipt read addresses its receipt through
-/// the declared `operation_id` parameter.
-const ACTIVATED_READS: [ActivatedReadDescriptor; 4] = [
+/// request field (proven by both adapter handlers); `GetEvidencePack`
+/// addresses its scope the same way (the Governor read facade requires a
+/// scope for it) and addresses its evidence through the declared `subject`
+/// / `max_records` parameters. The head and receipt reads address no scope;
+/// the receipt read addresses its receipt through the declared
+/// `operation_id` parameter.
+const ACTIVATED_READS: [ActivatedReadDescriptor; 5] = [
     ActivatedReadDescriptor {
         operation: NamedReadOperation::GetRevisionHeads,
         requires_scope_id: false,
@@ -159,16 +187,22 @@ const ACTIVATED_READS: [ActivatedReadDescriptor; 4] = [
         requires_scope_id: false,
         scope_kind: SCOPE_KIND_NONE,
     },
+    ActivatedReadDescriptor {
+        operation: NamedReadOperation::GetEvidencePack,
+        requires_scope_id: true,
+        scope_kind: SCOPE_KIND_SCOPE,
+    },
 ];
 
 /// Returns the activated read operations in canonical declaration order.
 #[must_use]
-pub const fn activated_read_operations() -> [NamedReadOperation; 4] {
+pub const fn activated_read_operations() -> [NamedReadOperation; 5] {
     [
         ACTIVATED_READS[0].operation,
         ACTIVATED_READS[1].operation,
         ACTIVATED_READS[2].operation,
         ACTIVATED_READS[3].operation,
+        ACTIVATED_READS[4].operation,
     ]
 }
 
@@ -265,7 +299,7 @@ fn genesis_entry_spec() -> OperationManifestSpec {
 
 /// Generates the per-operation manifest descriptors from the declaration table.
 ///
-/// Declaration order is the canonical order: the four activated reads, the
+/// Declaration order is the canonical order: the five activated reads, the
 /// three activated mutations, then the genesis bootstrap entry. Generation is
 /// pure over crate constants, so the same source always yields byte-identical
 /// entries.
