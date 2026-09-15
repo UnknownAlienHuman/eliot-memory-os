@@ -173,6 +173,14 @@ fn validate_erasure_text(value: &str, field: &'static str) -> Result<(), StoreEr
     }
     Ok(())
 }
+/// Version of the `GetTaskState` payload shape (T11.3).
+const TASK_STATE_PAYLOAD_VERSION: u32 = 1;
+/// Version of the `GetAttentionAndProblems` payload shape (T11.3).
+const ATTENTION_PROBLEMS_PAYLOAD_VERSION: u32 = 1;
+/// Version of the `GetUnderstandingProjectionInputs` payload shape (T11.3).
+const UNDERSTANDING_INPUTS_PAYLOAD_VERSION: u32 = 1;
+/// Version of the `GetCapabilityEvidenceState` payload shape (T11.3).
+const CAPABILITY_EVIDENCE_PAYLOAD_VERSION: u32 = 1;
 
 /// A deterministic reference store with no external authority or I/O.
 ///
@@ -870,13 +878,22 @@ impl MemoryStore {
         // activated, so it enforces the generated catalogue (membership,
         // typed `subject` / `max_records` selectors, scope declaration,
         // input bound) pre-dispatch, identically to the Surreal adapter's
-        // pre-dispatch gate. The older reads keep their legacy
-        // reference-contour behavior below. 688-B: the pack handler also
-        // suppresses evidence-backed erased pairs (see
+        // pre-dispatch gate. T11.2 adds `GetCurrentEpistemicPosition` with
+        // its `position` selector; T11.3 adds the four cognitive reads
+        // (`GetTaskState`, `GetAttentionAndProblems`,
+        // `GetUnderstandingProjectionInputs`, `GetCapabilityEvidenceState`)
+        // with their bounded exact selectors. The older reads keep their
+        // legacy reference-contour behavior below. 688-B: the pack handler
+        // also suppresses evidence-backed erased pairs (see
         // `evidence_pack_payload`); suppression never guesses.
         if matches!(
             query.operation,
-            NamedReadOperation::GetEvidencePack | NamedReadOperation::GetCurrentEpistemicPosition
+            NamedReadOperation::GetEvidencePack
+                | NamedReadOperation::GetCurrentEpistemicPosition
+                | NamedReadOperation::GetTaskState
+                | NamedReadOperation::GetAttentionAndProblems
+                | NamedReadOperation::GetUnderstandingProjectionInputs
+                | NamedReadOperation::GetCapabilityEvidenceState
         ) {
             let entries = generated_operation_manifests()?;
             query.validate_against_catalogue(&entries)?;
@@ -946,6 +963,22 @@ impl MemoryStore {
             }
             NamedReadOperation::GetEvidencePack => {
                 let payload = Self::evidence_pack_payload(&state, query, &fence)?;
+                serde_json::to_value(&payload)
+            }
+            NamedReadOperation::GetTaskState => {
+                let payload = Self::task_state_payload(&state, query, &fence)?;
+                serde_json::to_value(&payload)
+            }
+            NamedReadOperation::GetAttentionAndProblems => {
+                let payload = Self::attention_problems_payload(&state, query, &fence)?;
+                serde_json::to_value(&payload)
+            }
+            NamedReadOperation::GetUnderstandingProjectionInputs => {
+                let payload = Self::understanding_inputs_payload(&state, query, &fence)?;
+                serde_json::to_value(&payload)
+            }
+            NamedReadOperation::GetCapabilityEvidenceState => {
+                let payload = Self::capability_evidence_payload(&state, query, &fence)?;
                 serde_json::to_value(&payload)
             }
             _ => serde_json::to_value(json!({
@@ -1069,6 +1102,338 @@ impl MemoryStore {
         Ok(json!({
             "version": EVIDENCE_PACK_PAYLOAD_VERSION,
             "subject": subject,
+            "scope_id": scope_id,
+            "records": records,
+            "provenance": {
+                "state_fence": fence,
+                "matched_total": matched_total,
+                "returned": returned,
+                "max_records": max_records,
+                "truncated": matched_total > returned,
+            },
+        }))
+    }
+
+    /// Parses the explicit `max_records` decimal-string bound shared by the
+    /// T11.3 cognitive reads (same bound as `GetEvidencePack`).
+    fn parse_max_records(query: &NamedReadRequest) -> Result<(u32, usize), StoreError> {
+        let bound_raw = query
+            .parameters
+            .get("max_records")
+            .and_then(Value::as_str)
+            .ok_or(StoreError::InvalidField {
+                field: "operation.parameter",
+                reason: "missing required parameter",
+            })?;
+        let max_records: u32 = bound_raw.parse().map_err(|_| StoreError::InvalidField {
+            field: "operation.parameter",
+            reason: "max_records must be a positive decimal bound",
+        })?;
+        if max_records == 0 {
+            return Err(StoreError::InvalidField {
+                field: "operation.parameter",
+                reason: "max_records must be a positive decimal bound",
+            });
+        }
+        if max_records > EVIDENCE_PACK_MAX_RECORDS {
+            return Err(StoreError::PayloadTooLarge);
+        }
+        let limit = usize::try_from(max_records).map_err(|_| StoreError::PayloadTooLarge)?;
+        Ok((max_records, limit))
+    }
+
+    /// Builds the versioned `GetTaskState` payload for one request (T11.3).
+    ///
+    /// Reads only actually admitted task transitions: the `UpdateTaskState`
+    /// records stored by the commit path, in commit order, filtered by exact
+    /// scope and exact `task_id` match — never substring or a default scope.
+    /// Returns the bounded history plus the current parameters (the last
+    /// matching record) or null when no task transition exists. Zero matches
+    /// are an exact empty result, not an error.
+    fn task_state_payload(
+        state: &MemoryState,
+        query: &NamedReadRequest,
+        fence: &StateFence,
+    ) -> Result<Value, StoreError> {
+        let scope_id = query.scope_id.clone().ok_or(StoreError::InvalidField {
+            field: "scope_id",
+            reason: "task state read requires scope_id",
+        })?;
+        let task_id = query
+            .parameters
+            .get("task_id")
+            .and_then(Value::as_str)
+            .ok_or(StoreError::InvalidField {
+                field: "operation.parameter",
+                reason: "missing required parameter",
+            })?;
+        if task_id.trim().is_empty() || task_id.chars().any(char::is_control) {
+            return Err(StoreError::InvalidField {
+                field: "operation.parameter",
+                reason: "task_id must be a non-blank string",
+            });
+        }
+        let (max_records, limit) = Self::parse_max_records(query)?;
+        let matched: Vec<(usize, &eliot_store_api::NamedMutationRequest)> = state
+            .named_operations
+            .iter()
+            .enumerate()
+            .filter(|(_, record)| {
+                record.scope_id == scope_id
+                    && record.operation.operation == NamedMutationOperation::UpdateTaskState
+                    && record
+                        .operation
+                        .parameters
+                        .get("task_id")
+                        .and_then(Value::as_str)
+                        == Some(task_id)
+            })
+            .map(|(index, record)| (index, &record.operation))
+            .collect();
+        let matched_total = matched.len();
+        let current = matched.last().map(|(_, operation)| operation.parameters.clone());
+        let records: Vec<Value> = matched
+            .into_iter()
+            .take(limit)
+            .map(|(capture_index, operation)| {
+                json!({
+                    "capture_index": capture_index,
+                    "operation": named_mutation_operation_name(operation.operation),
+                    "parameters": operation.parameters,
+                })
+            })
+            .collect();
+        let returned = records.len();
+        Ok(json!({
+            "version": TASK_STATE_PAYLOAD_VERSION,
+            "task_id": task_id,
+            "scope_id": scope_id,
+            "records": records,
+            "current": current,
+            "provenance": {
+                "state_fence": fence,
+                "matched_total": matched_total,
+                "returned": returned,
+                "max_records": max_records,
+                "truncated": matched_total > returned,
+            },
+        }))
+    }
+
+    /// Builds the versioned `GetAttentionAndProblems` payload (T11.3).
+    ///
+    /// Reads only actually admitted problem-leg transitions: the
+    /// `ReconcileRecovery` records stored by the commit path, in commit
+    /// order, filtered by exact scope and, when supplied, exact `problem_id`
+    /// match. Zero matches are an exact empty result, not an error.
+    fn attention_problems_payload(
+        state: &MemoryState,
+        query: &NamedReadRequest,
+        fence: &StateFence,
+    ) -> Result<Value, StoreError> {
+        let scope_id = query.scope_id.clone().ok_or(StoreError::InvalidField {
+            field: "scope_id",
+            reason: "attention read requires scope_id",
+        })?;
+        let problem_id = match query.parameters.get("problem_id") {
+            None | Some(Value::Null) => None,
+            Some(Value::String(text)) => {
+                if text.trim().is_empty() || text.chars().any(char::is_control) {
+                    return Err(StoreError::InvalidField {
+                        field: "operation.parameter",
+                        reason: "problem_id must be a non-blank string",
+                    });
+                }
+                Some(text.as_str())
+            }
+            Some(_) => {
+                return Err(StoreError::InvalidField {
+                    field: "operation.parameter",
+                    reason: "problem_id must be a non-blank string",
+                });
+            }
+        };
+        let (max_records, limit) = Self::parse_max_records(query)?;
+        let matched: Vec<(usize, &eliot_store_api::NamedMutationRequest)> = state
+            .named_operations
+            .iter()
+            .enumerate()
+            .filter(|(_, record)| {
+                record.scope_id == scope_id
+                    && record.operation.operation == NamedMutationOperation::ReconcileRecovery
+                    && problem_id.is_none_or(|wanted| {
+                        record
+                            .operation
+                            .parameters
+                            .get("problem_id")
+                            .and_then(Value::as_str)
+                            == Some(wanted)
+                    })
+            })
+            .map(|(index, record)| (index, &record.operation))
+            .collect();
+        let matched_total = matched.len();
+        let records: Vec<Value> = matched
+            .into_iter()
+            .take(limit)
+            .map(|(capture_index, operation)| {
+                json!({
+                    "capture_index": capture_index,
+                    "operation": named_mutation_operation_name(operation.operation),
+                    "parameters": operation.parameters,
+                })
+            })
+            .collect();
+        let returned = records.len();
+        Ok(json!({
+            "version": ATTENTION_PROBLEMS_PAYLOAD_VERSION,
+            "scope_id": scope_id,
+            "problem_id": problem_id,
+            "records": records,
+            "provenance": {
+                "state_fence": fence,
+                "matched_total": matched_total,
+                "returned": returned,
+                "max_records": max_records,
+                "truncated": matched_total > returned,
+            },
+        }))
+    }
+
+    /// Builds the versioned `GetUnderstandingProjectionInputs` payload (T11.3).
+    ///
+    /// Reads the admitted operation inputs for one scope: every committed
+    /// named operation whose admitted parameters contain the exact `selector`
+    /// as a string parameter value (exact equality, never substring), in
+    /// commit order. Zero matches are an exact empty result, not an error.
+    fn understanding_inputs_payload(
+        state: &MemoryState,
+        query: &NamedReadRequest,
+        fence: &StateFence,
+    ) -> Result<Value, StoreError> {
+        let scope_id = query.scope_id.clone().ok_or(StoreError::InvalidField {
+            field: "scope_id",
+            reason: "understanding inputs read requires scope_id",
+        })?;
+        let selector = query
+            .parameters
+            .get("selector")
+            .and_then(Value::as_str)
+            .ok_or(StoreError::InvalidField {
+                field: "operation.parameter",
+                reason: "missing required parameter",
+            })?;
+        if selector.trim().is_empty() || selector.chars().any(char::is_control) {
+            return Err(StoreError::InvalidField {
+                field: "operation.parameter",
+                reason: "selector must be a non-blank string",
+            });
+        }
+        let (max_records, limit) = Self::parse_max_records(query)?;
+        let matched: Vec<(usize, &eliot_store_api::NamedMutationRequest)> = state
+            .named_operations
+            .iter()
+            .enumerate()
+            .filter(|(_, record)| {
+                record.scope_id == scope_id
+                    && record
+                        .operation
+                        .parameters
+                        .values()
+                        .any(|value| value.as_str() == Some(selector))
+            })
+            .map(|(index, record)| (index, &record.operation))
+            .collect();
+        let matched_total = matched.len();
+        let records: Vec<Value> = matched
+            .into_iter()
+            .take(limit)
+            .map(|(capture_index, operation)| {
+                json!({
+                    "capture_index": capture_index,
+                    "operation": named_mutation_operation_name(operation.operation),
+                    "parameters": operation.parameters,
+                })
+            })
+            .collect();
+        let returned = records.len();
+        Ok(json!({
+            "version": UNDERSTANDING_INPUTS_PAYLOAD_VERSION,
+            "selector": selector,
+            "scope_id": scope_id,
+            "records": records,
+            "provenance": {
+                "state_fence": fence,
+                "matched_total": matched_total,
+                "returned": returned,
+                "max_records": max_records,
+                "truncated": matched_total > returned,
+            },
+        }))
+    }
+
+    /// Builds the versioned `GetCapabilityEvidenceState` payload (T11.3).
+    ///
+    /// Reads only actually admitted capability transitions: the
+    /// `ApplyLifecyclePolicy` records stored by the commit path, in commit
+    /// order, filtered by exact scope and exact `skill_id` match. Zero
+    /// matches are an exact empty result, not an error.
+    fn capability_evidence_payload(
+        state: &MemoryState,
+        query: &NamedReadRequest,
+        fence: &StateFence,
+    ) -> Result<Value, StoreError> {
+        let scope_id = query.scope_id.clone().ok_or(StoreError::InvalidField {
+            field: "scope_id",
+            reason: "capability evidence read requires scope_id",
+        })?;
+        let skill_id = query
+            .parameters
+            .get("skill_id")
+            .and_then(Value::as_str)
+            .ok_or(StoreError::InvalidField {
+                field: "operation.parameter",
+                reason: "missing required parameter",
+            })?;
+        if skill_id.trim().is_empty() || skill_id.chars().any(char::is_control) {
+            return Err(StoreError::InvalidField {
+                field: "operation.parameter",
+                reason: "skill_id must be a non-blank string",
+            });
+        }
+        let (max_records, limit) = Self::parse_max_records(query)?;
+        let matched: Vec<(usize, &eliot_store_api::NamedMutationRequest)> = state
+            .named_operations
+            .iter()
+            .enumerate()
+            .filter(|(_, record)| {
+                record.scope_id == scope_id
+                    && record.operation.operation == NamedMutationOperation::ApplyLifecyclePolicy
+                    && record
+                        .operation
+                        .parameters
+                        .get("skill_id")
+                        .and_then(Value::as_str)
+                        == Some(skill_id)
+            })
+            .map(|(index, record)| (index, &record.operation))
+            .collect();
+        let matched_total = matched.len();
+        let records: Vec<Value> = matched
+            .into_iter()
+            .take(limit)
+            .map(|(capture_index, operation)| {
+                json!({
+                    "capture_index": capture_index,
+                    "operation": named_mutation_operation_name(operation.operation),
+                    "parameters": operation.parameters,
+                })
+            })
+            .collect();
+        let returned = records.len();
+        Ok(json!({
+            "version": CAPABILITY_EVIDENCE_PAYLOAD_VERSION,
+            "skill_id": skill_id,
             "scope_id": scope_id,
             "records": records,
             "provenance": {
@@ -3205,6 +3570,301 @@ mod tests {
             pack_records(&store.execute_named_sync(&neighbour_query)?.payload)?.len(),
             1
         );
+        Ok(())
+    }
+
+    fn manifest_for(
+        classes: Vec<TransitionClass>,
+        effect: EffectClass,
+    ) -> Result<NamedOperationManifest, StoreError> {
+        NamedOperationManifest::new(
+            format!("memory-cognitive-{}-{:?}", classes.len(), classes[0]),
+            eliot_store_api::CONTRACT_VERSION,
+            classes,
+            effect,
+            65_536,
+            3_145_728,
+            1_000,
+        )
+    }
+
+    fn cognitive_store() -> Result<(MemoryStore, StateFence), StoreError> {
+        let fence = self::fence();
+        let store = MemoryStore::new();
+        store.register_manifest(manifest()?)?;
+        store.register_manifest(manifest_for(
+            vec![TransitionClass::TaskControl],
+            EffectClass::ReversibleMutation,
+        )?)?;
+        store.register_manifest(manifest_for(
+            vec![TransitionClass::RecoverySchema],
+            EffectClass::ReversibleMutation,
+        )?)?;
+        store.register_manifest(manifest_for(
+            vec![TransitionClass::LifecyclePolicy],
+            EffectClass::ReversibleMutation,
+        )?)?;
+        Ok((store, fence))
+    }
+
+    fn cognitive_transition(
+        operation: &str,
+        state_fence: &StateFence,
+        ctx: &RequestMeta,
+        manifest_digest: OperationManifestDigest,
+        class: TransitionClass,
+        effect: EffectClass,
+        mutation: eliot_store_api::NamedMutationOperation,
+        parameters: BTreeMap<String, Value>,
+    ) -> Result<PreparedTransition, StoreError> {
+        let operation_id = OperationId::new(operation).map_err(StoreError::Foundation)?;
+        let mut prepared = PreparedTransition {
+            identity: eliot_store_api::OperationIdentity {
+                operation_id,
+                idempotency_key: format!("idem-{operation}"),
+                canonical_request_hash: "a".repeat(64),
+            },
+            state_fence: state_fence.clone(),
+            scope_id: ScopeId::new("scope-1")?,
+            task_id: None,
+            ordering_scopes: vec![OrderingScopeId::new("scope-1")?],
+            transition_class: class,
+            requested_effect_ceiling: effect,
+            admission_contract_set_digest: "a".repeat(64),
+            operation_manifest_digest: manifest_digest,
+            named_operations: vec![eliot_store_api::NamedMutationRequest {
+                operation: mutation,
+                parameters,
+            }],
+            event_projection_relation_intents: EventProjectionRelationIntents {
+                event_ids: vec![],
+                projection_kinds: vec![],
+                relation_kinds: vec![],
+            },
+            security: eliot_store_api::SecurityContext::default(),
+            required_proof_and_approval_refs: vec![],
+        };
+        let view = CanonicalRequestView::from_apply(ctx, &prepared, &[], &[]);
+        prepared.identity.canonical_request_hash = canonical_request_hash(&view)?;
+        Ok(prepared)
+    }
+
+    fn task_params(task_id: &str, to: &str) -> BTreeMap<String, Value> {
+        BTreeMap::from([
+            ("task_id".to_owned(), json!(task_id)),
+            ("event_id".to_owned(), json!(format!("event-{task_id}"))),
+            ("to".to_owned(), json!(to)),
+            ("expected_revision".to_owned(), json!("1")),
+            ("actor_ref".to_owned(), json!("actor-1")),
+        ])
+    }
+
+    fn recovery_params(problem_id: &str) -> BTreeMap<String, Value> {
+        BTreeMap::from([
+            ("problem_id".to_owned(), json!(problem_id)),
+            ("expected_problem_revision".to_owned(), json!("1")),
+            ("attempt_digest".to_owned(), json!("a".repeat(64))),
+            ("effect_digest".to_owned(), json!("b".repeat(64))),
+            (
+                "operation_manifest_digest".to_owned(),
+                json!("c".repeat(64)),
+            ),
+            ("artifact_binding_digest".to_owned(), json!("b".repeat(64))),
+            ("fence_digest".to_owned(), json!("d".repeat(64))),
+            ("observation_operation_id".to_owned(), json!("operation-1")),
+            ("observation_record_id".to_owned(), json!("record-1")),
+            (
+                "observation_request_digest".to_owned(),
+                json!("e".repeat(64)),
+            ),
+        ])
+    }
+
+    fn lifecycle_params(skill_id: &str) -> BTreeMap<String, Value> {
+        BTreeMap::from([
+            ("action".to_owned(), json!("keep")),
+            ("base_view_digest".to_owned(), json!("a".repeat(64))),
+            ("candidate_digest".to_owned(), json!("b".repeat(64))),
+            ("candidate_package_digest".to_owned(), json!("c".repeat(64))),
+            ("skill_id".to_owned(), json!(skill_id)),
+            ("verifier_ref".to_owned(), json!("verifier-1")),
+        ])
+    }
+
+    fn cognitive_query(
+        state_fence: &StateFence,
+        operation: NamedReadOperation,
+        scope: Option<&str>,
+        parameters: BTreeMap<String, Value>,
+    ) -> Result<NamedReadRequest, StoreError> {
+        Ok(NamedReadRequest {
+            operation,
+            scope_id: scope.map(ScopeId::new).transpose()?,
+            consistency: eliot_store_api::ReadConsistency::Eventual,
+            state_fence: state_fence.clone(),
+            parameters,
+        })
+    }
+
+    #[test]
+    fn t11_3_cognitive_reads_serve_canonical_records() -> Result<(), StoreError> {
+        use eliot_store_api::NamedMutationOperation;
+        let (store, state_fence) = cognitive_store()?;
+        let ctx = metadata(&state_fence)?;
+        let task_manifest = manifest_for(
+            vec![TransitionClass::TaskControl],
+            EffectClass::ReversibleMutation,
+        )?;
+        let recovery_manifest = manifest_for(
+            vec![TransitionClass::RecoverySchema],
+            EffectClass::ReversibleMutation,
+        )?;
+        let lifecycle_manifest = manifest_for(
+            vec![TransitionClass::LifecyclePolicy],
+            EffectClass::ReversibleMutation,
+        )?;
+        // Commit one real record per cognitive family through the canonical
+        // apply path (never test-injected receipts).
+        store.apply_transaction(
+            &ctx,
+            cognitive_transition(
+                "op-t11-task-1",
+                &state_fence,
+                &ctx,
+                task_manifest.digest.clone(),
+                TransitionClass::TaskControl,
+                EffectClass::ReversibleMutation,
+                NamedMutationOperation::UpdateTaskState,
+                task_params("task-1", "OPEN"),
+            )?,
+            &[],
+            &[],
+        )?;
+        store.apply_transaction(
+            &ctx,
+            cognitive_transition(
+                "op-t11-prob-1",
+                &state_fence,
+                &ctx,
+                recovery_manifest.digest.clone(),
+                TransitionClass::RecoverySchema,
+                EffectClass::ReversibleMutation,
+                NamedMutationOperation::ReconcileRecovery,
+                recovery_params("problem-1"),
+            )?,
+            &[],
+            &[],
+        )?;
+        store.apply_transaction(
+            &ctx,
+            cognitive_transition(
+                "op-t11-skill-1",
+                &state_fence,
+                &ctx,
+                lifecycle_manifest.digest.clone(),
+                TransitionClass::LifecyclePolicy,
+                EffectClass::ReversibleMutation,
+                NamedMutationOperation::ApplyLifecyclePolicy,
+                lifecycle_params("skill-1"),
+            )?,
+            &[],
+            &[],
+        )?;
+        // GetTaskState returns the exact history plus current.
+        let response = store.execute_named_sync(&cognitive_query(
+            &state_fence,
+            NamedReadOperation::GetTaskState,
+            Some("scope-1"),
+            BTreeMap::from([
+                ("task_id".to_owned(), json!("task-1")),
+                ("max_records".to_owned(), json!("10")),
+            ]),
+        )?)?;
+        assert_eq!(
+            response.payload["records"].as_array().map(Vec::len),
+            Some(1)
+        );
+        assert_eq!(
+            response.payload["current"]["to"],
+            json!("OPEN"),
+        );
+        // Unknown task is an exact empty, not an error.
+        let empty = store.execute_named_sync(&cognitive_query(
+            &state_fence,
+            NamedReadOperation::GetTaskState,
+            Some("scope-1"),
+            BTreeMap::from([
+                ("task_id".to_owned(), json!("task-missing")),
+                ("max_records".to_owned(), json!("10")),
+            ]),
+        )?)?;
+        assert!(empty.payload["records"].as_array().is_some_and(Vec::is_empty));
+        // GetAttentionAndProblems returns the admitted problem record.
+        let response = store.execute_named_sync(&cognitive_query(
+            &state_fence,
+            NamedReadOperation::GetAttentionAndProblems,
+            Some("scope-1"),
+            BTreeMap::from([("max_records".to_owned(), json!("10"))]),
+        )?)?;
+        assert_eq!(
+            response.payload["records"].as_array().map(Vec::len),
+            Some(1)
+        );
+        // GetUnderstandingProjectionInputs matches the exact selector across
+        // families (never substring).
+        let response = store.execute_named_sync(&cognitive_query(
+            &state_fence,
+            NamedReadOperation::GetUnderstandingProjectionInputs,
+            Some("scope-1"),
+            BTreeMap::from([
+                ("selector".to_owned(), json!("task-1")),
+                ("max_records".to_owned(), json!("10")),
+            ]),
+        )?)?;
+        assert_eq!(
+            response.payload["records"].as_array().map(Vec::len),
+            Some(1)
+        );
+        let response = store.execute_named_sync(&cognitive_query(
+            &state_fence,
+            NamedReadOperation::GetUnderstandingProjectionInputs,
+            Some("scope-1"),
+            BTreeMap::from([
+                ("selector".to_owned(), json!("task")),
+                ("max_records".to_owned(), json!("10")),
+            ]),
+        )?)?;
+        assert!(response.payload["records"]
+            .as_array()
+            .is_some_and(Vec::is_empty));
+        // GetCapabilityEvidenceState returns the exact skill record.
+        let response = store.execute_named_sync(&cognitive_query(
+            &state_fence,
+            NamedReadOperation::GetCapabilityEvidenceState,
+            Some("scope-1"),
+            BTreeMap::from([
+                ("skill_id".to_owned(), json!("skill-1")),
+                ("max_records".to_owned(), json!("10")),
+            ]),
+        )?)?;
+        assert_eq!(
+            response.payload["records"].as_array().map(Vec::len),
+            Some(1)
+        );
+        // Over-bound requests refuse instead of returning a view.
+        let over = store.execute_named_sync(&cognitive_query(
+            &state_fence,
+            NamedReadOperation::GetTaskState,
+            Some("scope-1"),
+            BTreeMap::from([
+                ("task_id".to_owned(), json!("task-1")),
+                (
+                    "max_records".to_owned(),
+                    json!((EVIDENCE_PACK_MAX_RECORDS + 1).to_string()),
+                ),
+            ]),
+        )?);
+        assert_eq!(over, Err(StoreError::PayloadTooLarge));
         Ok(())
     }
 }
