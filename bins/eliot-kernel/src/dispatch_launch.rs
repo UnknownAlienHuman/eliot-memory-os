@@ -35,6 +35,12 @@
 //!   [`launch_admitted_native_worker_attempt`] reuses the same seam shape
 //!   for `eliot-native-worker`, writing
 //!   `eliot-native-worker.admitted-claim.json` plus the same grant object.
+//! * [`trigger_admitted_doctor_launch`] is the T6-D2 front-door trigger:
+//!   pre-admit through the composed gate, derive the launch material from
+//!   the composed registry (admitted manifest revision plus installed
+//!   executable digest — never caller bytes), then delegate to the launch
+//!   seam above. The absolute child anchor arrives from the owning
+//!   composition ([`DoctorChildBinding`]).
 //! * a launched-but-unreconciled attempt reconciles by its original
 //!   identity through [`reconcile_launched_doctor_attempt`] /
 //!   [`reconcile_launched_testd_attempt`] /
@@ -2019,6 +2025,194 @@ pub async fn launch_admitted_doctor_attempt(
     }
 }
 
+/// Composition-supplied child binary anchor for the Doctor trigger.
+///
+/// The executable path plus the working directory are the one trigger
+/// input the dispatch contour cannot derive: the contour owns the
+/// principal, the ledger, the immutable registry (including the installed
+/// artifact digest bound into the admitted executable binding), and the
+/// live epoch/generation — but the absolute installed-generation root is
+/// Host installation state. The production composition root supplies it
+/// from Host injection through the installation manifest
+/// (manager-serialized `main` call-in); this struct only carries it.
+/// Never wire bytes, never argv/env discovery.
+#[allow(
+    dead_code,
+    reason = "production call-in lands with the manager-serialized lib.rs re-export; tests drive it meanwhile"
+)]
+pub struct DoctorChildBinding<'a> {
+    /// Absolute path of the composition-pinned `eliot-doctor` executable.
+    /// The dispatch file is staged next to it.
+    pub executable: &'a Path,
+    /// Absolute working directory the child spawns under.
+    pub working_directory: &'a Path,
+}
+
+/// Contour-derived Doctor launch material: the admitted manifest revision
+/// plus the admitted executable digest, both read back from the composed
+/// registry — never caller bytes.
+#[allow(
+    dead_code,
+    reason = "production call-in lands with the manager-serialized lib.rs re-export; tests drive it meanwhile"
+)]
+struct ContourDoctorMaterial {
+    /// The exact admitted manifest revision, serialized from the composed
+    /// registry.
+    manifest_json: serde_json::Value,
+    /// Expected SHA-256 of the child image, from the admitted operation's
+    /// executable binding in the composed registry.
+    executable_sha256: String,
+}
+
+/// Returns a clone of the composed Doctor registry or fails closed.
+///
+/// Cloned (one operation plus one recipe) so the trigger holds no contour
+/// lock across admission and launch.
+#[allow(
+    dead_code,
+    reason = "production call-in lands with the manager-serialized lib.rs re-export; tests drive it meanwhile"
+)]
+fn composed_doctor_registry(
+    contour: &'static ComposedDispatchContour,
+) -> Result<DoctorRecipeRegistry, DispatchLaunchError> {
+    let doctor = contour
+        .doctor
+        .lock()
+        .map_err(|_| DispatchLaunchError::Gate("doctor front-door lock poisoned".to_owned()))?;
+    doctor
+        .as_ref()
+        .map(|state| state.registry.clone())
+        .ok_or(DispatchLaunchError::Uncomposed("doctor front door"))
+}
+
+/// Derives the contour-owned half of [`DoctorLaunchMaterial`] from the
+/// composed registry for one admitted attempt.
+///
+/// Fail-closed: the admission must bind this contour's manifest revision
+/// (`admission.manifest_digest` equals the composed registry digest — a
+/// stale or foreign admission is `Inconsistent`, never staged), and the
+/// admitted operation must resolve to an executable binding in the
+/// composed manifest (an unknown or forged operation is
+/// `InvalidMaterial`, never staged). The returned digest is the installed
+/// artifact digest the supplying composition composed through
+/// [`compose_production_doctor_front_door`]; the caller supplies only the
+/// absolute binary anchor ([`DoctorChildBinding`]).
+#[allow(
+    dead_code,
+    reason = "production call-in lands with the manager-serialized lib.rs re-export; tests drive it meanwhile"
+)]
+fn contour_doctor_material(
+    registry: &DoctorRecipeRegistry,
+    admission: &DoctorRepairAdmission,
+) -> Result<ContourDoctorMaterial, DispatchLaunchError> {
+    if admission.manifest_digest != registry.manifest_digest() {
+        return Err(DispatchLaunchError::Inconsistent(
+            "admitted doctor attempt does not bind the composed manifest revision".to_owned(),
+        ));
+    }
+    let manifest = registry.manifest();
+    let executable_sha256 = manifest
+        .operations
+        .iter()
+        .find(|entry| entry.operation_id == admission.operation_id)
+        .map(|entry| entry.binding.artifact_digest.clone())
+        .ok_or_else(|| {
+            DispatchLaunchError::InvalidMaterial(
+                "admitted doctor operation resolves no composed executable binding".to_owned(),
+            )
+        })?;
+    require_digest(
+        &executable_sha256,
+        "composed doctor executable digest must be a lowercase SHA-256 digest",
+    )?;
+    let manifest_json = serde_json::to_value(manifest)
+        .map_err(|error| DispatchLaunchError::Gate(error.to_string()))?;
+    Ok(ContourDoctorMaterial {
+        manifest_json,
+        executable_sha256,
+    })
+}
+
+/// Admits one Doctor attempt through the composed contour and launches the
+/// admitted effect through the existing launch seam: the T6-D2 front-door
+/// trigger (issue #461, plan slice 5).
+///
+/// Owner: the dispatch contour owns this trigger — not the frame dispatch
+/// arm and not the front-door driver pump. The frame arm
+/// (`frame_dispatch::execute_doctor_request`) admits and replies but never
+/// spawns, keeping the admission and execution axes separate (I14.6); the
+/// driver arm (`front_door_driver`) serves one bounded request/response per
+/// frame and has nowhere to report a spawn. The contour already owns admit
+/// (owner plus ledger plus principal), reserve, nonce, material-write,
+/// spawn, and reconcile-by-identity, so the trigger lives here: pre-admit
+/// through the composed gate, derive the launch material from the composed
+/// contour (admitted manifest revision plus installed executable digest —
+/// never caller bytes), then delegate to
+/// [`launch_admitted_doctor_attempt`] (prepare, start-ready, and launch
+/// through the admitted executor; no second launch path). Reconcile stays
+/// with [`reconcile_launched_doctor_attempt`] by the original identity.
+///
+/// Fail-closed: an uncomposed contour errors before touching state; every
+/// typed refusal or conflict returns as [`DoctorLaunchOutcome::Refused`]
+/// with no file staged and no slot retained; a forged operation or a stale
+/// manifest binding errors before staging any file; a replay rebuilds the
+/// original admission (the lost-reply rule) and the delegated prepare
+/// single-flights it (`LaunchInFlight`) instead of spawning twice — the
+/// concurrent-duplicate case included, since reservation happens inside the
+/// delegated prepare. The absolute child anchor comes from the owning
+/// composition ([`DoctorChildBinding`], supplied by Host injection through
+/// the installation manifest) — never from the wire, argv, or the
+/// environment.
+///
+/// Production call-in (manager-serialized, outside this slice): the
+/// composition root calls this after `execute_doctor_request` admits, with
+/// the Host-injected binding, and reconciles through
+/// `reconcile_launched_doctor_attempt`; both need the `lib.rs`
+/// `dispatch_launch` re-export extended.
+#[allow(
+    dead_code,
+    reason = "production call-in lands with the manager-serialized lib.rs re-export; tests drive it meanwhile"
+)]
+pub async fn trigger_admitted_doctor_launch(
+    kernel: &KernelComposition,
+    attempt: &DoctorRepairAttemptRequest,
+    child: &DoctorChildBinding<'_>,
+    now_unix_nanos: u64,
+) -> Result<DoctorLaunchOutcome, DispatchLaunchError> {
+    if now_unix_nanos == 0 {
+        return Err(DispatchLaunchError::InvalidMaterial(
+            "admission time must be non-zero".to_owned(),
+        ));
+    }
+    let contour = DISPATCH_CONTOUR
+        .get()
+        .ok_or(DispatchLaunchError::Uncomposed("doctor front door"))?;
+    let request_json: serde_json::Value = serde_json::from_str(&attempt.closed_request_json)
+        .map_err(|_| {
+            DispatchLaunchError::InvalidMaterial("closed request envelope is not JSON".to_owned())
+        })?;
+    let response = {
+        let service = kernel
+            .service
+            .lock()
+            .map_err(|_| DispatchLaunchError::Gate("kernel service lock poisoned".to_owned()))?;
+        admit_doctor_repair_attempt(&service, attempt, now_unix_nanos)?
+    };
+    let DoctorRepairResponse::Admitted(admission) = response else {
+        return Ok(DoctorLaunchOutcome::Refused(response));
+    };
+    let derived = contour_doctor_material(&composed_doctor_registry(contour)?, &admission)?;
+    let material = DoctorLaunchMaterial {
+        attempt,
+        request_json: &request_json,
+        manifest_json: &derived.manifest_json,
+        executable: child.executable,
+        executable_sha256: &derived.executable_sha256,
+        working_directory: child.working_directory,
+    };
+    launch_admitted_doctor_attempt(kernel, &material, now_unix_nanos).await
+}
+
 /// Retains one launch record, keeping the first record under an identity.
 ///
 /// Insert-or-keep-first: a concurrent duplicate never overwrites the
@@ -3360,6 +3554,14 @@ mod tests {
     //! refused typed. A bins-side Doctor admit-through-execute proof awaits
     //! the integrator's registry fixture (new dev-dependency or cross-bin
     //! round trip) and is recorded as a residual, not worked around here.
+    //!
+    //! The T6-D2 trigger (plan slice 5) is proven bins-side for every class
+    //! short of a real admission: refusal, replay, and forgery through the
+    //! real gate, contour-material derivation from the composed registry,
+    //! and replay-stable material bytes. The admitted-to-spawn leg awaits
+    //! the same registry-fixture residual plus the production call-in
+    //! (`lib.rs` re-export and the `main` binding injection,
+    //! manager-serialized).
 
     #![allow(clippy::expect_used, clippy::unwrap_used, clippy::too_many_lines)]
 
@@ -4283,6 +4485,197 @@ mod tests {
             Err(DispatchLaunchError::AlreadyComposed(_))
         ));
 
+        // 9. T6-D2 trigger (issue #461, plan slice 5): the contour-owned
+        // trigger refuses without staging and derives contour material.
+        // Shape-valid-but-empty envelopes refuse typed through the real
+        // gate (no admission, no file, no slot); a well-formed wire
+        // forgery with recomputed digests refuses typed the same way; a
+        // tampered digest fails closed before any gate; a replay of a
+        // refused attempt refuses again without staging anything new. The
+        // derived contour material (admitted manifest revision plus
+        // installed executable digest, read back from the composed
+        // registry) flows through the real prepare seam, which refuses
+        // the shape request typed — proving the trigger constructs
+        // exactly what prepare validates.
+        let trigger_child_dir = root.join("doctor-trigger-child");
+        std::fs::create_dir_all(&trigger_child_dir).expect("trigger child dir");
+        let trigger_executable = trigger_child_dir.join("eliot-doctor.exe");
+        let trigger_binding = DoctorChildBinding {
+            executable: &trigger_executable,
+            working_directory: &trigger_child_dir,
+        };
+        let trigger_file = trigger_child_dir.join(
+            DispatchedWorkerKind::Doctor
+                .material_file_name()
+                .expect("doctor material file"),
+        );
+        let trigger_shape_request = |attempt_id: &str| DoctorRepairAttemptRequest {
+            wire_id: eliot_kernel_service::DOCTOR_REPAIR_WIRE_ID.to_owned(),
+            wire_version: eliot_kernel_service::DOCTOR_REPAIR_WIRE_VERSION,
+            attempt_id: attempt_id.to_owned(),
+            effect_seq: 0,
+            closed_request_json: "{}".to_owned(),
+            target_resource_digest: "1".repeat(64),
+            request_digest: String::new(),
+        }
+        .with_computed_digest()
+        .expect("trigger request digest");
+        assert!(
+            matches!(
+                trigger_admitted_doctor_launch(
+                    &kernel,
+                    &trigger_shape_request("attempt-trigger-refused-1"),
+                    &trigger_binding,
+                    now_nanos,
+                )
+                .await,
+                Ok(DoctorLaunchOutcome::Refused(_))
+            ),
+            "shape-valid-but-empty trigger attempt refuses typed"
+        );
+        assert!(
+            !trigger_file.exists(),
+            "refused trigger attempt stages no dispatch material"
+        );
+        let mut forged = trigger_shape_request("attempt-trigger-forged-1");
+        forged.closed_request_json = r#"{"forged":true}"#.to_owned();
+        forged.request_digest = String::new();
+        let forged = forged
+            .with_computed_digest()
+            .expect("forged request digest");
+        assert!(
+            matches!(
+                trigger_admitted_doctor_launch(&kernel, &forged, &trigger_binding, now_nanos,).await,
+                Ok(DoctorLaunchOutcome::Refused(_))
+            ),
+            "well-formed wire forgery refuses typed"
+        );
+        assert!(
+            !trigger_file.exists(),
+            "wire forgery stages no dispatch material"
+        );
+        let mut tampered = trigger_shape_request("attempt-trigger-tampered-1");
+        tampered.request_digest = "00".repeat(32);
+        assert!(
+            matches!(
+                trigger_admitted_doctor_launch(&kernel, &tampered, &trigger_binding, now_nanos,)
+                    .await,
+                Ok(DoctorLaunchOutcome::Refused(_))
+            ),
+            "tampered digest refuses typed before any staging"
+        );
+        assert!(
+            !trigger_file.exists(),
+            "tampered digest stages no dispatch material"
+        );
+        assert!(
+            matches!(
+                trigger_admitted_doctor_launch(
+                    &kernel,
+                    &trigger_shape_request("attempt-trigger-refused-1"),
+                    &trigger_binding,
+                    now_nanos + 5_000_000,
+                )
+                .await,
+                Ok(DoctorLaunchOutcome::Refused(_))
+            ),
+            "replay of a refused attempt refuses again"
+        );
+        assert!(
+            !trigger_file.exists(),
+            "replay of a refusal stages nothing new"
+        );
+        let composed_registry = dispatch_contour()
+            .expect("composed contour")
+            .doctor
+            .lock()
+            .expect("doctor front-door lock")
+            .as_ref()
+            .expect("composed doctor side")
+            .registry
+            .clone();
+        let trigger_admission = DoctorRepairAdmission {
+            wire_id: eliot_kernel_service::DOCTOR_REPAIR_WIRE_ID.to_owned(),
+            wire_version: eliot_kernel_service::DOCTOR_REPAIR_WIRE_VERSION,
+            attempt_id: "attempt-trigger-derived-1".to_owned(),
+            attempt_digest: "ab".repeat(32),
+            effect_digest: Some("cd".repeat(32)),
+            recipe_digest: "ef".repeat(32),
+            manifest_digest: composed_registry.manifest_digest().to_owned(),
+            operation_id: composed_registry.manifest().operations[0].operation_id.clone(),
+            lease_id: "lease-trigger-1".to_owned(),
+            lease_owner: "kernel.doctor-recovery".to_owned(),
+            lease_expires_unix_nanos: now_nanos + 60_000_000_000,
+            allowed_effects: [composed_registry.manifest().operations[0].operation_id.clone()]
+                .into_iter()
+                .collect(),
+            budget_units: 1,
+            deadline_unix_nanos: now_nanos + 60_000_000_000,
+            approval_present: false,
+            cancelled: false,
+            admitted_at_unix_nanos: now_nanos,
+            admission_digest: "12".repeat(32),
+        };
+        let derived = contour_doctor_material(&composed_registry, &trigger_admission)
+            .expect("contour material derives");
+        assert_eq!(
+            derived.manifest_json,
+            serde_json::to_value(composed_registry.manifest()).expect("manifest json"),
+            "derived manifest is the composed manifest revision"
+        );
+        assert_eq!(
+            derived.executable_sha256, installed_doctor_digest,
+            "derived executable digest is the composed installed digest"
+        );
+        let derived_material = DoctorLaunchMaterial {
+            attempt: &trigger_shape_request("attempt-trigger-derived-1"),
+            request_json: &serde_json::json!({}),
+            manifest_json: &derived.manifest_json,
+            executable: &trigger_executable,
+            executable_sha256: &derived.executable_sha256,
+            working_directory: &trigger_child_dir,
+        };
+        assert!(
+            matches!(
+                prepare_doctor_launch(&kernel, &derived_material, now_nanos),
+                Ok(PreparedDoctorLaunch::Refused(_))
+            ),
+            "derived contour material flows through the real prepare seam"
+        );
+        assert!(
+            !trigger_file.exists(),
+            "derived-material refusal stages no dispatch material"
+        );
+        let forged_operation = DoctorRepairAdmission {
+            operation_id: "forged-operation-9".to_owned(),
+            ..trigger_admission.clone()
+        };
+        assert!(
+            matches!(
+                contour_doctor_material(&composed_registry, &forged_operation),
+                Err(DispatchLaunchError::InvalidMaterial(_))
+            ),
+            "forged operation resolves no composed binding"
+        );
+        let stale_manifest = DoctorRepairAdmission {
+            manifest_digest: "00".repeat(32),
+            ..trigger_admission.clone()
+        };
+        assert!(
+            matches!(
+                contour_doctor_material(&composed_registry, &stale_manifest),
+                Err(DispatchLaunchError::Inconsistent(_))
+            ),
+            "stale manifest binding never stages"
+        );
+        assert!(
+            matches!(
+                reconcile_launched_doctor_attempt(&"ff".repeat(32)).expect("reconcile"),
+                ReconcileLaunchedOutcome::Unknown { .. }
+            ),
+            "reconcile reports unknown instead of inventing state"
+        );
+
         let _ = std::fs::remove_dir_all(root);
     }
 
@@ -4987,6 +5380,121 @@ mod tests {
         assert!(!parsed_grant.idempotency_key.is_empty());
         assert!(parsed_grant.expires_at > 0);
         let _ = lease;
+    }
+
+    /// The trigger derives its launch material from the composed registry —
+    /// never caller bytes — and refuses forgeries before staging anything.
+    ///
+    /// Global-state-free: the registry is built locally from the installed
+    /// digest through the real production builders, and the admission is a
+    /// literal carrying the registry's own operation and manifest digest.
+    /// The full trigger-through-gate path runs inside the ordered lifecycle
+    /// test, which owns the process-global contour cell.
+    #[test]
+    fn doctor_trigger_material_comes_from_the_composed_registry() {
+        let installed_digest = eliot_contracts::sha256_hex(b"eliot-doctor-installed-package-bytes");
+        let registry = DoctorRecipeRegistry::production_health_probe(&installed_digest)
+            .expect("probe registry builds from the installed digest");
+        let operation_id = registry.manifest().operations[0].operation_id.clone();
+        let admission = DoctorRepairAdmission {
+            wire_id: eliot_kernel_service::DOCTOR_REPAIR_WIRE_ID.to_owned(),
+            wire_version: eliot_kernel_service::DOCTOR_REPAIR_WIRE_VERSION,
+            attempt_id: "attempt-trigger-standalone-1".to_owned(),
+            attempt_digest: "ab".repeat(32),
+            effect_digest: Some("cd".repeat(32)),
+            recipe_digest: "ef".repeat(32),
+            manifest_digest: registry.manifest_digest().to_owned(),
+            operation_id: operation_id.clone(),
+            lease_id: "lease-trigger-1".to_owned(),
+            lease_owner: "kernel.doctor-recovery".to_owned(),
+            lease_expires_unix_nanos: 1_750_000_060_000_000_000,
+            allowed_effects: [operation_id].into_iter().collect(),
+            budget_units: 1,
+            deadline_unix_nanos: 1_750_000_060_000_000_000,
+            approval_present: false,
+            cancelled: false,
+            admitted_at_unix_nanos: 1_750_000_000_000_000_000,
+            admission_digest: "12".repeat(32),
+        };
+        let derived =
+            contour_doctor_material(&registry, &admission).expect("contour material derives");
+        assert_eq!(
+            derived.manifest_json,
+            serde_json::to_value(registry.manifest()).expect("manifest json"),
+            "derived manifest is the composed manifest revision"
+        );
+        assert_eq!(
+            derived.executable_sha256, installed_digest,
+            "derived executable digest is the composed installed digest"
+        );
+        let forged = DoctorRepairAdmission {
+            operation_id: "forged-operation-9".to_owned(),
+            ..admission.clone()
+        };
+        assert!(
+            matches!(
+                contour_doctor_material(&registry, &forged),
+                Err(DispatchLaunchError::InvalidMaterial(_))
+            ),
+            "forged operation resolves no composed binding"
+        );
+        let stale = DoctorRepairAdmission {
+            manifest_digest: "00".repeat(32),
+            ..admission.clone()
+        };
+        assert!(
+            matches!(
+                contour_doctor_material(&registry, &stale),
+                Err(DispatchLaunchError::Inconsistent(_))
+            ),
+            "stale manifest binding never stages"
+        );
+    }
+
+    /// An exact replay rewrites byte-identical Doctor material: the nonce
+    /// and grant are deterministic per (attempt identity, durable admission
+    /// time, composed principal), so a replay stages nothing new while two
+    /// attempts never share a session.
+    #[test]
+    fn doctor_trigger_material_bytes_are_replay_stable() {
+        let attempt = shape_valid_doctor_request();
+        let request_json = serde_json::json!({});
+        let manifest_json = serde_json::json!({"manifest": "test"});
+        let epoch = test_epoch(1);
+        let now_nanos = 1_750_000_000_000_000_000u64;
+        let material = |identity: &str| {
+            let nonce =
+                mint_dispatch_nonce(DispatchedWorkerKind::Doctor, identity, now_nanos, PRINCIPAL)
+                    .expect("nonce");
+            let grant = dispatch_grant_for(
+                DispatchedWorkerKind::Doctor,
+                identity,
+                &epoch,
+                Generation::new(7).expect("generation"),
+                now_nanos,
+            )
+            .expect("grant");
+            doctor_material_bytes(
+                &attempt,
+                &request_json,
+                &manifest_json,
+                &epoch,
+                7,
+                &nonce,
+                &grant,
+            )
+            .expect("material bytes")
+        };
+        assert_eq!(
+            material(&"a".repeat(64)),
+            material(&"a".repeat(64)),
+            "replay rewrites byte-identical material"
+        );
+        assert_ne!(
+            material(&"a".repeat(64)),
+            material(&"b".repeat(64)),
+            "attempts never share a session"
+        );
     }
 
     /// The contour parameterizes Doctor vs testd vs native-worker delivery
