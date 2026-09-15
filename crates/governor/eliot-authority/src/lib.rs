@@ -11,6 +11,7 @@ mod break_glass;
 mod effects;
 mod grants;
 mod leases;
+mod revocation_history;
 
 pub use activation::{
     GrantActivationRequest, GrantRevocationRequest, IntroductionActivationRequest,
@@ -31,6 +32,10 @@ pub use grants::{
     IntroductionId, IntroductionStatus, LogicalTime, PrincipalRef, ReceiptObligation, SnapshotId,
 };
 pub use leases::{ActionLease, CapabilityToken, LeaseId, TokenId};
+pub use revocation_history::{
+    GrantRestoreOutcome, RevocationHistoryError, RevocationHistoryEvidence, SuppressedGrant,
+    SuppressionCause, ValidatedRevocationClosure,
+};
 
 use std::{error::Error, fmt};
 

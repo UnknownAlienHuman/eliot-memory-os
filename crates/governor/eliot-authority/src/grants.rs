@@ -6,7 +6,8 @@ use eliot_security_contracts::EffectCeiling;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
-use crate::{AuthorityError, validate_text};
+use crate::revocation_history::derive_suppressions;
+use crate::{AuthorityError, GrantRestoreOutcome, RevocationHistoryError, validate_text};
 
 macro_rules! text_id {
     ($name:ident, $field:literal) => {
@@ -440,6 +441,25 @@ impl GrantGraph {
         self.revision
     }
 
+    /// Returns every grant id in deterministic grant-id order.
+    pub(crate) fn ordered_grant_ids(&self) -> Vec<String> {
+        self.grants
+            .keys()
+            .map(|id| id.as_str().to_owned())
+            .collect()
+    }
+
+    /// Returns one grant by its string identity.
+    pub(crate) fn grant(&self, grant_id: &str) -> Option<&CapabilityGrant> {
+        let id = GrantId::new(grant_id).ok()?;
+        self.grants.get(&id)
+    }
+
+    /// Marks one grant revoked without replaying history.
+    pub(crate) fn apply_restored_revocation(&mut self, grant_id: &GrantId) {
+        self.revoked.insert(grant_id.clone());
+    }
+
     pub fn recovery_snapshot(&self) -> Result<GrantGraphRecoverySnapshot, AuthorityError> {
         let grants = self
             .grants
@@ -491,6 +511,57 @@ impl GrantGraph {
             version: _,
         } = snapshot;
         GrantGraphRecoverySnapshot::restore_owned(revision, &grants, revoked)
+    }
+
+    /// Restores a recovery snapshot under explicit CURRENT revocation-history
+    /// evidence, applying all applicable committed revocations before any
+    /// grant becomes effective.
+    ///
+    /// `None` history refuses with
+    /// [`RevocationHistoryError::MissingHistory`]: unavailable history is
+    /// not absence of revocation and never restores as an empty closure.
+    /// Stale (fence or revision drift) and unknown (invalid, unordered, or
+    /// non-revoked closure) evidence refuse likewise. Suppressed grants are
+    /// retained with their full lineage and join the restored revoked set,
+    /// so neither a revoked origin nor its dependent grants can revive; the
+    /// exact suppressed set and reasons are reported in the outcome.
+    /// Unrelated valid grants restore exactly as the snapshot carries them.
+    ///
+    /// The legacy [`from_recovery_snapshot`](Self::from_recovery_snapshot)
+    /// preserves its exact prior behavior for previously-admitted callers.
+    pub fn from_recovery_snapshot_with_revocation_history(
+        snapshot: GrantGraphRecoverySnapshot,
+        history: Option<&crate::RevocationHistoryEvidence>,
+    ) -> Result<GrantRestoreOutcome, RevocationHistoryError> {
+        snapshot
+            .validate_wire()
+            .map_err(RevocationHistoryError::InvalidSnapshot)?;
+        let evidence = history.ok_or(RevocationHistoryError::MissingHistory)?;
+        let closures = evidence.require_current()?;
+        let GrantGraphRecoverySnapshot {
+            revision,
+            grants,
+            revoked,
+            schema: _,
+            version: _,
+        } = snapshot;
+        let mut graph = GrantGraphRecoverySnapshot::restore_owned(revision, &grants, revoked)
+            .map_err(RevocationHistoryError::InvalidSnapshot)?;
+        for grant_id in graph.ordered_grant_ids() {
+            let Some(grant) = graph.grant(&grant_id) else {
+                continue;
+            };
+            if grant.binding.state_fence != evidence.state_fence {
+                return Err(RevocationHistoryError::StaleHistory);
+            }
+        }
+        let suppressed = derive_suppressions(&graph, &closures);
+        for entry in &suppressed {
+            if let Ok(grant_id) = GrantId::new(entry.grant_id.clone()) {
+                graph.apply_restored_revocation(&grant_id);
+            }
+        }
+        Ok(GrantRestoreOutcome { graph, suppressed })
     }
 
     pub fn revoke(&mut self, grant_id: &GrantId) -> Result<(), AuthorityError> {
