@@ -14,10 +14,12 @@
 #![forbid(unsafe_code)]
 
 mod bounds;
+mod dimensions;
 mod protection;
 mod rules;
 mod screen;
 
 pub use bounds::{MAX_INPUT_BYTES, MAX_ITEMS, MAX_OUTPUT_BYTES, MAX_REFERENCES, MAX_WORK_UNITS};
+pub use dimensions::assess_dimensions;
 pub use rules::{SUPPORTED_RULES, SupportedRule};
 pub use screen::{CurationScreenError, screen_memory_curation};
