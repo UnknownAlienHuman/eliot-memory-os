@@ -77,6 +77,68 @@ fn approved_launch_paths(
     Ok(())
 }
 
+/// Builds the exact Kernel child argv by injecting the Host-approved
+/// digest-bound Doctor executable path into the sealed launch descriptor's
+/// stored `kernel_arguments`.
+///
+/// The stored descriptor carries the 22-value contour (digests only); the
+/// Kernel requires the 24-value contour with `--doctor-executable-path`
+/// bound immediately after `--doctor-artifact-sha256`. The path comes from
+/// the sealed installation manifest (never caller bytes); a relative or
+/// empty path fails closed, never defaulted. An already-injected contour
+/// or a missing doctor digest also fails closed instead of replacing live
+/// authority.
+#[cfg(windows)]
+pub(super) fn kernel_arguments_with_doctor_anchor(
+    kernel_arguments: &[PlatformHandle],
+    doctor_executable_path: &PlatformHandle,
+) -> Result<Vec<PlatformHandle>, HostError> {
+    const DOCTOR_DIGEST_FLAG: &str = "--doctor-artifact-sha256";
+    const DOCTOR_PATH_FLAG: &str = "--doctor-executable-path";
+    if kernel_arguments
+        .iter()
+        .any(|argument| argument.as_str() == DOCTOR_PATH_FLAG)
+    {
+        return Err(HostError::ProcessContour(
+            "Kernel launch contour already carries a Doctor path anchor".to_owned(),
+        ));
+    }
+    if !Path::new(doctor_executable_path.as_str()).is_absolute() {
+        return Err(HostError::ProcessContour(
+            "Doctor executable path anchor must be absolute".to_owned(),
+        ));
+    }
+    let path_flag = PlatformHandle::new(DOCTOR_PATH_FLAG)
+        .map_err(|error| HostError::ProcessContour(error.to_string()))?;
+    let mut injected = Vec::with_capacity(kernel_arguments.len().saturating_add(2));
+    let mut index = 0;
+    let mut anchored = false;
+    while index < kernel_arguments.len() {
+        let argument = kernel_arguments[index].clone();
+        injected.push(argument.clone());
+        if argument.as_str() == DOCTOR_DIGEST_FLAG {
+            let digest = kernel_arguments.get(index + 1).cloned().ok_or_else(|| {
+                HostError::ProcessContour(
+                    "Kernel launch contour is missing the digested doctor role".to_owned(),
+                )
+            })?;
+            injected.push(digest);
+            injected.push(path_flag.clone());
+            injected.push(doctor_executable_path.clone());
+            index = index.saturating_add(2);
+            anchored = true;
+            continue;
+        }
+        index = index.saturating_add(1);
+    }
+    if !anchored {
+        return Err(HostError::ProcessContour(
+            "Kernel launch contour is missing the digested doctor role".to_owned(),
+        ));
+    }
+    Ok(injected)
+}
+
 #[cfg(windows)]
 impl HostJobBranches {
     #[allow(
@@ -403,6 +465,12 @@ impl HostJobBranches {
         }
         let (kernel_working_directory, store_working_directory) =
             Self::approved_working_directories(launch, portable_root.as_ref(), &config_path)?;
+        // T6-D2 front-door anchor (issue #461): inject the sealed
+        // digest-bound Doctor executable path into the stored 22-value
+        // contour so the Kernel receives the exact 24-value launch options.
+        // Missing or relative anchors fail closed here, never defaulted.
+        let kernel_arguments =
+            kernel_arguments_with_doctor_anchor(&launch.kernel_arguments, &launch.doctor_executable_path)?;
         let launch_result = launch_store_then_kernel(
             || {
                 Self::launch(
@@ -464,7 +532,7 @@ impl HostJobBranches {
                     approved_config_path,
                     &config_pin,
                     host,
-                    &launch.kernel_arguments,
+                    &kernel_arguments,
                     &kernel_working_directory,
                     self.kernel_launch_binding.as_ref(),
                     Some((
@@ -680,5 +748,60 @@ mod approved_path_tests {
         ) else {
             panic!("missing locator was accepted");
         };
+    }
+
+    /// T6-D2 front-door anchor (issue #461): the sealed digest-bound Doctor
+    /// path is injected immediately after the doctor digest, a relative
+    /// path fails closed, and a contour without the digested doctor role
+    /// fails closed naming the doctor role. Fakes only: synthetic handles,
+    /// no process is spawned.
+    #[test]
+    fn injects_the_digest_bound_doctor_path_anchor() {
+        use super::kernel_arguments_with_doctor_anchor;
+
+        let handle = |value: &str| {
+            PlatformHandle::new(value.to_owned())
+                .unwrap_or_else(|error| panic!("test handle is invalid: {error}"))
+        };
+        let stored = vec![
+            handle("--work-root"),
+            handle(r"C:\work"),
+            handle("--doctor-artifact-sha256"),
+            handle(&"a".repeat(64)),
+            handle("--testd-artifact-sha256"),
+            handle(&"b".repeat(64)),
+        ];
+        let doctor_path = handle(r"C:\install\eliot-doctor.exe");
+        let injected = match kernel_arguments_with_doctor_anchor(&stored, &doctor_path) {
+            Ok(injected) => injected,
+            Err(error) => panic!("absolute doctor anchor must inject: {error}"),
+        };
+        assert_eq!(injected.len(), stored.len() + 2);
+        assert_eq!(injected[2].as_str(), "--doctor-artifact-sha256");
+        assert_eq!(injected[4].as_str(), "--doctor-executable-path");
+        assert_eq!(injected[5], doctor_path);
+        assert_eq!(injected[6].as_str(), "--testd-artifact-sha256");
+
+        let relative = handle(r"relative\eliot-doctor.exe");
+        let Err(HostError::ProcessContour(reason)) =
+            kernel_arguments_with_doctor_anchor(&stored, &relative)
+        else {
+            panic!("relative doctor anchor was accepted");
+        };
+        assert!(
+            reason.to_lowercase().contains("absolute"),
+            "unexpected rejection reason: {reason}"
+        );
+
+        let without_doctor = vec![handle("--work-root"), handle(r"C:\work")];
+        let Err(HostError::ProcessContour(reason)) =
+            kernel_arguments_with_doctor_anchor(&without_doctor, &doctor_path)
+        else {
+            panic!("contour without the digested doctor role was accepted");
+        };
+        assert!(
+            reason.to_lowercase().contains("doctor"),
+            "missing-role error must name the doctor role, got: {reason}"
+        );
     }
 }

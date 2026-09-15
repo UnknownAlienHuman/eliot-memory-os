@@ -119,6 +119,13 @@ async fn main() {
         );
     };
     kernel_config = kernel_config.with_doctor_artifact_sha256(doctor_artifact_sha256);
+    let Some(doctor_executable_path) = options.doctor_executable_path.clone() else {
+        exit_error(
+            "DOCTOR_PATH_CONTRACT_REQUIRED",
+            "Host launch must inject the exact Doctor executable path bound to the digested doctor role",
+        );
+    };
+    kernel_config = kernel_config.with_doctor_executable_path(doctor_executable_path);
     let Some(testd_artifact_sha256) = options.testd_artifact_sha256.clone() else {
         exit_error(
             "TESTD_ARTIFACT_CONTRACT_REQUIRED",
