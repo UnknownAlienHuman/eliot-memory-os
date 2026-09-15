@@ -38,6 +38,8 @@ mod controlboard_adapters;
 mod daemon_config;
 mod daemon_kernel_client;
 mod daemon_kernel_port_adapters;
+mod dreamer_admission;
+mod dreamer_materials;
 mod governor_local_read;
 mod kernel_authority_client;
 mod kernel_context_read_client;
@@ -67,8 +69,20 @@ pub(crate) use daemon_kernel_client::{
     is_pre_admission_pending_rejection, retry_pre_admission, validate_server_hello,
 };
 pub(crate) use daemon_kernel_port_adapters::kind_value;
-pub(crate) use kernel_authority_client::KernelAuthorityClient;
+pub use dreamer_admission::{
+    DREAMER_JOB_WIRE_ID, DreamerJobQueue, GovernorDreamerAdapter, KernelDreamerJobQueue,
+    OrientationSubmitInput,
+};
+pub use dreamer_materials::{
+    AdmittedSourceClaim, DreamerMaterialsError, FrozenOrientationManifest,
+    ORIENTATION_EVIDENCE_MAX_RECORDS, ORIENTATION_MATERIAL_MAX_SOURCE_BYTES,
+    ORIENTATION_MATERIAL_MAX_SOURCES, ORIENTATION_MATERIAL_MAX_TOTAL_BYTES,
+    ORIENTATION_MATERIAL_PRIVACY_ADMITTED, ORIENTATION_MATERIAL_ROUTE_ADMITTED,
+    OrientationMaterialBudget, freeze_orientation_manifest, resolve_source_claim,
+    verify_resolved_bytes,
+};
 pub use governor_local_read::{answer_evidence_query, answer_projection_inputs};
+pub(crate) use kernel_authority_client::KernelAuthorityClient;
 pub use kernel_context_read_client::KernelContextReadClient;
 pub use store_failure_projection::{GovernorStoreFailureProjection, GovernorStoreProjectionError};
 
@@ -670,6 +684,31 @@ impl DaemonComposition {
                 self.readiness(),
             ),
         )
+    }
+
+    /// Borrows the Governor Dreamer orientation intake adapter over the retained owners plus
+    /// the daemon-held Kernel client (T12-06, integration #702, semantic #18).
+    ///
+    /// Mirrors [`Self::context_read_client`]: readiness is checked first, then a fresh
+    /// [`GovernorDreamerAdapter`] is built over the composition and the caller-held
+    /// [`DaemonKernelClient`]. The composition retains no client and no thread — the caller
+    /// (the single daemon runtime holding both the concrete client and this composition, as
+    /// with [`Self::note_owner_session_binding`]) passes the already-connected client per
+    /// call, so a Governor refresh surfaces as an exact fence mismatch instead of silent
+    /// divergence. Intake itself stays fail-closed: without a ready Governor, an exact fence,
+    /// and digest-matching sources, nothing queues and no model edge is touched.
+    ///
+    /// Wiring decision (recorded per brief §5 T12-06): post-`start` attach-style accessor, not
+    /// a `start()` signature change — `start()` keeps its exact `(config, kernel:
+    /// Arc<dyn KernelGenerationPort>, authority_activation)` contour.
+    pub fn dreamer_admission<'a>(
+        &'a self,
+        kernel: &'a Arc<DaemonKernelClient>,
+    ) -> Result<GovernorDreamerAdapter<'a>, DaemonError> {
+        if self.readiness() != CompositionReadiness::Ready {
+            return Err(DaemonError::Composition(CompositionError::NotReady));
+        }
+        Ok(GovernorDreamerAdapter::new(self, kernel))
     }
 
     /// Stops the one daemon owner and releases protected handles together.
