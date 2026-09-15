@@ -22,9 +22,48 @@ use request_input::{
 };
 use serde::{Deserialize, Serialize};
 use std::io::{self, Write};
+use std::sync::mpsc;
+use std::time::Duration;
 
 const INVALID_ARGUMENT_EXIT: i32 = 2;
 const PROVIDER_PORT_EXIT: i32 = 69;
+
+/// Stable identity of the binary-private stdio output profile.
+const STDIO_OUTPUT_PROFILE_ID: &str = "eliot.agent-bridge.stdio-output.v1";
+/// Maximum framed stdout bytes for one response, including the framing newline.
+///
+/// Bridge-local decision: twice the hard structured-response ceiling (256 KiB)
+/// so one bounded structured answer plus its correlated completion receipt and
+/// framing fits, without permitting unbounded accumulation. This is distinct
+/// from the I7.2 4 MiB transport-frame default and from the 1 MiB stdin
+/// outer-record ceiling: a transport frame, a request line, and a response
+/// frame are separate budgets.
+const MAX_OUTPUT_FRAME_BYTES: usize = 524_288;
+/// Maximum responses outstanding on the synchronous stdio transport.
+///
+/// The loop serializes, writes, and flushes exactly one response before the
+/// next dispatch, so no queue ever holds more than one frame. The constant
+/// makes the bound explicit: pipelining a second frame is rejected by
+/// construction rather than by overflow.
+const MAX_OUTSTANDING_RESPONSES: usize = 1;
+const _: () = assert!(
+    MAX_OUTSTANDING_RESPONSES == 1,
+    "stdio stays synchronous with one outstanding frame"
+);
+/// Bounded wall-clock for one stdout write plus flush.
+///
+/// A blocking stdio pipe offers no deadline of its own, so the emission runs
+/// on a joined helper thread and the main loop waits at most this long. A
+/// slow consumer past this bound fails closed with a typed secret-free
+/// stderr diagnostic and terminates instead of blocking forever.
+const STDOUT_WRITE_TIMEOUT: Duration = Duration::from_secs(5);
+/// Maximum outstanding delivery identities reported inside one Stopped frame.
+///
+/// Keeps the terminal drain report itself within the output bound when many
+/// durable deliveries are pending: the first identities keep their exact
+/// original order and the remainder is counted as truncated rather than
+/// dropped silently.
+const MAX_STOP_DRAIN_ITEMS: usize = 32;
 
 /// Closed kernel entry that rehydrates one exact operation from the durable record.
 ///
@@ -103,11 +142,30 @@ enum Response {
     },
     Forwarded,
     Reconciled,
-    Stopped,
+    Stopped {
+        outstanding: usize,
+        drained: usize,
+        truncated: bool,
+        pending: Vec<StopPendingIdentity>,
+    },
     Error {
         code: &'static str,
         detail: String,
     },
+}
+
+/// Original identity of one durable in-flight delivery pending at Stop.
+///
+/// Carries only the exact stream, event, and sequence facts from the core
+/// outstanding view: no payload, no recomputed digest, and no new connection,
+/// session, or request id. The host reconciles each entry under this original
+/// identity; a replacement connection still requires a new admission.
+#[derive(Debug, Clone, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+struct StopPendingIdentity {
+    stream_id: String,
+    event_id: String,
+    sequence: u64,
 }
 
 /// Fail-closed placeholder retained for unit tests only.
@@ -353,7 +411,7 @@ fn main() {
                 &fence_nonce,
             ),
             Ok(Request::Status) => status_response(config.profile, &runner),
-            Ok(Request::Stop) => Response::Stopped,
+            Ok(Request::Stop) => handle_stop(&runner),
             Err(error) => Response::Error {
                 code: "REQUEST_INVALID",
                 detail: error.to_string(),
@@ -379,7 +437,7 @@ fn main() {
             };
             consecutive_invalid = next_invalid;
         }
-        let stop = matches!(response, Response::Stopped);
+        let stop = matches!(response, Response::Stopped { .. });
         let receipt = write_response(&response);
         // A zero-byte emission proves nothing reached the host, so the loop
         // must not continue as if the correlation had been delivered.
@@ -521,6 +579,52 @@ fn handle_reconnect(
     }
 }
 
+/// Builds the terminal Stop response with bounded drain accounting.
+///
+/// Snapshots the exact core-retained outstanding deliveries without
+/// completing, acknowledging, or recomputing anything: each pending entry
+/// keeps its original stream, event, and sequence identity so the host
+/// reconciles it under that identity instead of dropping it and re-issuing
+/// under a new id. `drained` is always zero because this binary owns no
+/// acknowledgement path that could complete a durable delivery; pending
+/// entries stay pending for explicit reconcile. The report itself is bounded
+/// to `MAX_STOP_DRAIN_ITEMS` identities so the terminal frame always fits
+/// `MAX_OUTPUT_FRAME_BYTES`; any remainder is counted via `truncated` rather
+/// than dropped silently. No new connection, session, or request id is
+/// minted here: Stop preserves the live attach binding verbatim.
+fn build_stop_response(pending_all: Vec<StopPendingIdentity>) -> Response {
+    let outstanding = pending_all.len();
+    let truncated = outstanding > MAX_STOP_DRAIN_ITEMS;
+    let pending = pending_all
+        .into_iter()
+        .take(MAX_STOP_DRAIN_ITEMS)
+        .collect::<Vec<_>>();
+    Response::Stopped {
+        outstanding,
+        drained: 0,
+        truncated,
+        pending,
+    }
+}
+
+/// Handles one Stop request by accounting for durable in-flight deliveries.
+///
+/// Reads only: maps the runner's outstanding view into original identities
+/// and shapes the bounded terminal response. Never touches dispatch,
+/// activation, or transport, and never clears core state.
+fn handle_stop(runner: &BridgeRunner) -> Response {
+    let pending = runner
+        .outstanding_deliveries()
+        .iter()
+        .map(|view| StopPendingIdentity {
+            stream_id: view.stream_id().to_owned(),
+            event_id: view.event_id().to_owned(),
+            sequence: view.sequence(),
+        })
+        .collect::<Vec<_>>();
+    build_stop_response(pending)
+}
+
 /// Projects owner-derived bridge liveness without probing the Kernel.
 ///
 /// Every fact comes from the composition or activation owners: the profile
@@ -623,10 +727,15 @@ enum StdioBreakCause {
     Emitted,
     /// Response serialization failed; nothing was written.
     SerializeFailed,
+    /// Framed response exceeds the output bound; nothing was written.
+    OutputTooLarge,
     /// Framed bytes were not fully written.
     WriteFailed,
     /// Bytes were written but the flush failed, so host delivery is unconfirmed.
     FlushFailed,
+    /// Write plus flush did not complete within the output timeout, so host
+    /// delivery is unconfirmed and the leaked writer thread must not be reused.
+    WriteTimeout,
 }
 
 impl StdioWriteReceipt {
@@ -653,36 +762,132 @@ fn emit_bounded_rejection(response: &Response) -> bool {
     receipt.bytes_written() == 0 || receipt.should_break()
 }
 
-fn write_response(response: &Response) -> StdioWriteReceipt {
-    let Ok(mut framed) = serde_json::to_vec(response) else {
-        return StdioWriteReceipt {
-            bytes: 0,
-            flushed: false,
-            cause: StdioBreakCause::SerializeFailed,
-        };
-    };
-    framed.push(b'\n');
-    let bytes = framed.len();
-    let stdout = io::stdout();
-    let mut output = stdout.lock();
-    if output.write_all(&framed).is_err() {
-        return StdioWriteReceipt {
-            bytes: 0,
-            flushed: false,
-            cause: StdioBreakCause::WriteFailed,
-        };
+/// Outcome of waiting for a spawned emission thread.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum AwaitOutcome {
+    /// The operation could not be spawned; nothing ran.
+    SpawnFailed,
+    /// The operation did not report within the bound; it may still be blocked.
+    Timeout,
+    /// The worker died without reporting; delivery is unconfirmed.
+    Disconnected,
+}
+
+/// Runs one owned `'static` operation on a helper thread with a bounded wait.
+///
+/// The operation owns everything it needs (framed bytes for production,
+/// sleeps for tests), so the wait never borrows caller state. A timeout
+/// leaves the helper blocked on the slow consumer: the caller must break
+/// fail-closed and never reuse the contended stream, because the leaked
+/// thread still holds its lock. Secret-free by construction: only the
+/// operation's return value crosses the channel, never request bytes.
+fn await_with_timeout<T>(
+    timeout: Duration,
+    op: impl FnOnce() -> T + Send + 'static,
+) -> Result<T, AwaitOutcome>
+where
+    T: Send + 'static,
+{
+    let (sender, receiver) = mpsc::channel();
+    let spawn = std::thread::Builder::new()
+        .name("eliot-bridge-stdout-write".to_owned())
+        .spawn(move || {
+            let output = op();
+            let _ = sender.send(output);
+        });
+    if spawn.is_err() {
+        return Err(AwaitOutcome::SpawnFailed);
     }
-    if output.flush().is_err() {
-        return StdioWriteReceipt {
+    receiver.recv_timeout(timeout).map_err(|error| match error {
+        mpsc::RecvTimeoutError::Timeout => AwaitOutcome::Timeout,
+        mpsc::RecvTimeoutError::Disconnected => AwaitOutcome::Disconnected,
+    })
+}
+
+/// Serializes one response into its newline-framed stdout bytes with the
+/// output bound enforced before any I/O.
+///
+/// Exactly one frame is produced per call, which enforces
+/// `MAX_OUTSTANDING_RESPONSES == 1` by construction: the synchronous loop
+/// never pipelines a second frame. Oversize frames are refused without
+/// writing a prefix and without including payload bytes in any diagnostic.
+fn frame_response(response: &Response) -> Result<Vec<u8>, StdioBreakCause> {
+    let mut framed = serde_json::to_vec(response).map_err(|_| StdioBreakCause::SerializeFailed)?;
+    framed.push(b'\n');
+    if framed.len() > MAX_OUTPUT_FRAME_BYTES {
+        return Err(StdioBreakCause::OutputTooLarge);
+    }
+    Ok(framed)
+}
+
+fn write_response(response: &Response) -> StdioWriteReceipt {
+    let framed = match frame_response(response) {
+        Ok(framed) => framed,
+        Err(StdioBreakCause::OutputTooLarge) => {
+            emit_error(
+                "STDOUT_RESPONSE_TOO_LARGE",
+                &format!(
+                    "framed response exceeds {MAX_OUTPUT_FRAME_BYTES} bytes for {STDIO_OUTPUT_PROFILE_ID}; emission refused"
+                ),
+            );
+            return StdioWriteReceipt {
+                bytes: 0,
+                flushed: false,
+                cause: StdioBreakCause::OutputTooLarge,
+            };
+        }
+        Err(cause) => {
+            return StdioWriteReceipt {
+                bytes: 0,
+                flushed: false,
+                cause,
+            };
+        }
+    };
+    let bytes = framed.len();
+    let awaited = await_with_timeout(STDOUT_WRITE_TIMEOUT, move || {
+        let stdout = io::stdout();
+        let mut output = stdout.lock();
+        if output.write_all(&framed).is_err() {
+            return Err(StdioBreakCause::WriteFailed);
+        }
+        if output.flush().is_err() {
+            return Err(StdioBreakCause::FlushFailed);
+        }
+        Ok(bytes)
+    });
+    match awaited {
+        Ok(Ok(written)) => StdioWriteReceipt {
+            bytes: written,
+            flushed: true,
+            cause: StdioBreakCause::Emitted,
+        },
+        Ok(Err(StdioBreakCause::FlushFailed)) => StdioWriteReceipt {
             bytes,
             flushed: false,
             cause: StdioBreakCause::FlushFailed,
-        };
-    }
-    StdioWriteReceipt {
-        bytes,
-        flushed: true,
-        cause: StdioBreakCause::Emitted,
+        },
+        Ok(Err(_)) | Err(AwaitOutcome::SpawnFailed | AwaitOutcome::Disconnected) => {
+            StdioWriteReceipt {
+                bytes: 0,
+                flushed: false,
+                cause: StdioBreakCause::WriteFailed,
+            }
+        }
+        Err(AwaitOutcome::Timeout) => {
+            emit_error(
+                "STDOUT_WRITE_TIMEOUT",
+                &format!(
+                    "stdout write plus flush exceeded {} ms for {STDIO_OUTPUT_PROFILE_ID}; slow consumer, emission unconfirmed",
+                    STDOUT_WRITE_TIMEOUT.as_millis()
+                ),
+            );
+            StdioWriteReceipt {
+                bytes: 0,
+                flushed: false,
+                cause: StdioBreakCause::WriteTimeout,
+            }
+        }
     }
 }
 
@@ -805,5 +1010,88 @@ mod tests {
             value["result"]["outcome"]["disposition"],
             Value::String("REJECTED".to_owned())
         );
+    }
+
+    #[test]
+    fn output_bound_refuses_oversize_and_timeout_is_explicit() {
+        let small = Response::Error {
+            code: "REQUEST_INVALID",
+            detail: "bounded".to_owned(),
+        };
+        let framed = frame_response(&small).expect("small frame must fit");
+        assert!(!framed.is_empty());
+        assert!(framed.len() <= MAX_OUTPUT_FRAME_BYTES);
+        assert_eq!(framed.last(), Some(&b'\n'));
+
+        let oversize = Response::Error {
+            code: "REQUEST_INVALID",
+            detail: "X".repeat(MAX_OUTPUT_FRAME_BYTES),
+        };
+        let cause = frame_response(&oversize).expect_err("oversize must be refused");
+        assert_eq!(cause, StdioBreakCause::OutputTooLarge);
+        assert!(!format!("{cause:?}").contains('X'));
+        let receipt = StdioWriteReceipt {
+            bytes: 0,
+            flushed: false,
+            cause,
+        };
+        assert_eq!(receipt.bytes_written(), 0);
+        assert!(receipt.should_break());
+
+        let slow = await_with_timeout(Duration::from_millis(20), || {
+            std::thread::sleep(Duration::from_millis(500));
+            1_u8
+        });
+        assert_eq!(slow, Err(AwaitOutcome::Timeout));
+        let timeout_receipt = StdioWriteReceipt {
+            bytes: 0,
+            flushed: false,
+            cause: StdioBreakCause::WriteTimeout,
+        };
+        assert_eq!(timeout_receipt.bytes_written(), 0);
+        assert!(timeout_receipt.should_break());
+
+        let fast = await_with_timeout(Duration::from_secs(5), || 7_u8)
+            .expect("fast operation must complete");
+        assert_eq!(fast, 7_u8);
+    }
+
+    #[test]
+    fn stop_reports_bounded_drain_with_original_identity() {
+        let clean = build_stop_response(Vec::new());
+        let clean_value = serde_json::to_value(&clean).expect("stop must serialize");
+        assert_eq!(clean_value["status"], Value::String("stopped".to_owned()));
+        assert_eq!(clean_value["outstanding"], Value::from(0_u64));
+        assert_eq!(clean_value["drained"], Value::from(0_u64));
+        assert_eq!(clean_value["truncated"], Value::Bool(false));
+        assert_eq!(clean_value["pending"], Value::Array(Vec::new()));
+
+        let many = (0..(MAX_STOP_DRAIN_ITEMS + 8))
+            .map(|index| StopPendingIdentity {
+                stream_id: format!("stream-{index}"),
+                event_id: format!("event-{index}"),
+                sequence: u64::try_from(index).expect("test index must fit"),
+            })
+            .collect::<Vec<_>>();
+        let total = many.len();
+        let first_stream = many[0].stream_id.clone();
+        let capped_last_stream = many[MAX_STOP_DRAIN_ITEMS - 1].stream_id.clone();
+        let response = build_stop_response(many);
+        let value = serde_json::to_value(&response).expect("stop must serialize");
+        assert_eq!(
+            value["outstanding"],
+            Value::from(u64::try_from(total).expect("count must fit"))
+        );
+        assert_eq!(value["drained"], Value::from(0_u64));
+        assert_eq!(value["truncated"], Value::Bool(true));
+        let pending = value["pending"].as_array().expect("pending must list");
+        assert_eq!(pending.len(), MAX_STOP_DRAIN_ITEMS);
+        assert_eq!(pending[0]["stream_id"], Value::String(first_stream));
+        assert_eq!(
+            pending[MAX_STOP_DRAIN_ITEMS - 1]["stream_id"],
+            Value::String(capped_last_stream)
+        );
+        let framed = frame_response(&response).expect("bounded drain report must fit");
+        assert!(framed.len() <= MAX_OUTPUT_FRAME_BYTES);
     }
 }
