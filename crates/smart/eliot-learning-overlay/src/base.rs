@@ -1,7 +1,10 @@
 use std::collections::BTreeMap;
 
 use eliot_evidence::EvidenceFreshness;
-use eliot_learning_contracts::{Completeness, LearningContractError, SlotDisposition};
+use eliot_learning_contracts::{
+    CampaignLearningStateView, Completeness, LearningContractError, LearningStateViewRecipe,
+    SlotDisposition, SlotProjection, SlotSpec,
+};
 
 use crate::{OverlayComposeInput, OverlayError};
 
@@ -112,24 +115,21 @@ fn validate_shared_lineage(
 
 pub(crate) fn slot_map<'a>(
     input: &'a OverlayComposeInput<'_>,
-) -> Result<
-    BTreeMap<
-        &'a str,
-        (
-            &'a eliot_learning_contracts::SlotSpec,
-            &'a eliot_learning_contracts::SlotProjection,
-        ),
-    >,
-    OverlayError,
-> {
-    let projections: BTreeMap<_, _> = input
-        .view
+) -> Result<BTreeMap<&'a str, (&'a SlotSpec, &'a SlotProjection)>, OverlayError> {
+    slot_map_for(input.recipe, input.view)
+}
+
+pub(crate) fn slot_map_for<'a>(
+    recipe: &'a LearningStateViewRecipe,
+    view: &'a CampaignLearningStateView,
+) -> Result<BTreeMap<&'a str, (&'a SlotSpec, &'a SlotProjection)>, OverlayError> {
+    let projections: BTreeMap<_, _> = view
         .slots
         .iter()
         .map(|slot| (slot.slot_id.as_str(), slot))
         .collect();
     let mut map = BTreeMap::new();
-    for spec in &input.recipe.slots {
+    for spec in &recipe.slots {
         let projection =
             projections
                 .get(spec.slot_id.as_str())
