@@ -5,7 +5,10 @@ use eliot_contracts::ReceiptId;
 use eliot_contracts::{EpochId, EpochLineageId, ResourceGeneration, SourceId, StateFence, TaskId};
 use eliot_cue_contracts::*;
 use eliot_cue_contracts::{PrivacyClass, ProofCeiling, WorkScopeId};
-use eliot_cue_index::{build_cue_snapshot, rebuild_cue_snapshot};
+use eliot_cue_index::{
+    build_cue_snapshot, build_cue_snapshot_closed, rebuild_cue_snapshot,
+    rebuild_cue_snapshot_closed,
+};
 use eliot_evidence::{
     Assertability, EpistemicStatus, EvidenceAuthority, EvidenceCoverage, EvidenceEnvelope,
     EvidenceFreshness, LifecycleState, Provenance, RelationKind,
@@ -321,5 +324,204 @@ fn binding_and_edge_limits_are_checked_before_work() -> TestResult {
             ..
         })
     ));
+    Ok(())
+}
+
+fn projection_with(
+    number: usize,
+    target: &str,
+    kind: CueKind,
+    value: &str,
+    key_value: &str,
+) -> AdmittedCueBindingProjection {
+    let number_u8 = u8::try_from(number).expect("fixture index");
+    let canonical = CanonicalCueIdentity::new(
+        CanonicalCueId::new(format!("canonical-{number}")).expect("canonical id"),
+        kind,
+        value.to_owned(),
+        digest(number_u8 + 10),
+    );
+    let observed = ObservedCue::new(
+        CONTRACT_REVISION.into(),
+        ObservedCueId::new(format!("observed-{number}")).expect("observed id"),
+        kind,
+        value.to_owned(),
+        SourceHandle::new(
+            TargetHandle::new(target).expect("target"),
+            digest(number_u8 + 40),
+            provenance(),
+        ),
+        context(),
+    );
+    let normalized = NormalizedCue::new(
+        CONTRACT_REVISION.into(),
+        observed,
+        profile(),
+        Some(canonical.clone()),
+        vec![ComparisonKey::new(
+            ComparisonKeyId::new(format!("key-{number}")).expect("key id"),
+            profile(),
+            key_value.to_owned(),
+            MatchMode::Exact,
+            ComparisonForm::Exact,
+        )],
+        NormalizationOutcome::Lossless,
+        Vec::new(),
+    );
+    let candidate = CueBindingCandidate::new(
+        BindingCandidateId::new(format!("candidate-{number}")).expect("candidate id"),
+        canonical,
+        TargetHandle::new(target).expect("target"),
+        BindingRole::Names,
+        EvidenceFreshness::ExactCandidate,
+        BindingDisposition::Withheld,
+        digest(number_u8 + 70),
+    );
+    let receipt_digest = digest(number_u8 + 100);
+    let admission = CueBindingAdmissionRef::new(
+        ReceiptIdentity {
+            receipt_id: ReceiptId::new(format!("receipt-{}", receipt_digest.as_str()))
+                .expect("receipt id"),
+            canonical_sha256: receipt_digest.as_str().into(),
+        },
+        candidate.binding_candidate_id.clone(),
+        candidate.digest.clone(),
+        TaskId::new("task-1").expect("task"),
+        WorkScopeId::new("scope-1").expect("scope"),
+        fence(),
+    );
+    AdmittedCueBindingProjection::new(candidate, normalized, admission)
+}
+
+fn denominator(
+    expected_rows: usize,
+    expected_edges: usize,
+    omitted_rows: usize,
+    omitted_edges: usize,
+) -> CueProjectionDenominator {
+    CueProjectionDenominator::new(
+        expected_rows,
+        expected_edges,
+        omitted_rows,
+        omitted_edges,
+        1,
+    )
+}
+
+#[test]
+fn closed_build_freezes_denominator_and_row_identity() -> TestResult {
+    let projections = vec![projection_with(
+        1,
+        "src/a.rs",
+        CueKind::Symbol,
+        "Task",
+        "task",
+    )];
+    let candidate = build_cue_snapshot_closed(
+        &WorkScopeId::new("scope-1")?,
+        SnapshotId::new("snapshot-1")?,
+        profile(),
+        fence(),
+        &projections,
+        &[],
+        None,
+        &denominator(1, 0, 0, 0),
+        &[],
+    )?;
+    candidate.validate()?;
+    assert_eq!(candidate.snapshot.members.len(), 1);
+    let rebuilt = rebuild_cue_snapshot_closed(&candidate, None, &denominator(1, 0, 0, 0), &[])?;
+    assert_eq!(rebuilt.build_digest, candidate.build_digest);
+    // A denominator that disagrees with the built rows fails closed.
+    assert!(
+        build_cue_snapshot_closed(
+            &WorkScopeId::new("scope-1")?,
+            SnapshotId::new("snapshot-1")?,
+            profile(),
+            fence(),
+            &projections,
+            &[],
+            None,
+            &denominator(2, 0, 0, 0),
+            &[],
+        )
+        .is_err()
+    );
+    Ok(())
+}
+
+#[test]
+fn duplicate_semantic_binding_is_rejected_by_closed_build() -> TestResult {
+    let first = projection_with(1, "src/a.rs", CueKind::Symbol, "Shared", "shared-a");
+    let second = projection_with(2, "src/a.rs", CueKind::Symbol, "Shared", "shared-b");
+    let open = build_cue_snapshot(
+        &WorkScopeId::new("scope-1")?,
+        SnapshotId::new("snapshot-1")?,
+        profile(),
+        fence(),
+        &[first, second],
+        &[],
+        None,
+    )?;
+    assert_eq!(
+        open.snapshot.members.len(),
+        2,
+        "the open build keeps both spellings; closure rejects the binding"
+    );
+    let first = projection_with(1, "src/a.rs", CueKind::Symbol, "Shared", "shared-a");
+    let second = projection_with(2, "src/a.rs", CueKind::Symbol, "Shared", "shared-b");
+    assert!(matches!(
+        build_cue_snapshot_closed(
+            &WorkScopeId::new("scope-1")?,
+            SnapshotId::new("snapshot-1")?,
+            profile(),
+            fence(),
+            &[first, second],
+            &[],
+            None,
+            &denominator(2, 0, 0, 0),
+            &[],
+        ),
+        Err(CueContractError::DuplicateIdentity {
+            field: "snapshot.semantic_binding"
+        })
+    ));
+    Ok(())
+}
+
+#[test]
+fn empty_complete_closed_build_differs_from_partial() -> TestResult {
+    let empty = build_cue_snapshot_closed(
+        &WorkScopeId::new("scope-empty")?,
+        SnapshotId::new("snapshot-empty")?,
+        profile(),
+        fence(),
+        &[],
+        &[],
+        None,
+        &denominator(0, 0, 0, 0),
+        &[],
+    )?;
+    assert!(empty.snapshot.members.is_empty());
+    assert!(denominator(0, 0, 0, 0).is_empty_complete());
+
+    // An explicitly partial denominator reconciles but never classifies as
+    // empty-complete; a disagreeing one fails closed.
+    let partial = denominator(1, 0, 1, 0);
+    assert!(!partial.is_empty_complete());
+    assert!(
+        build_cue_snapshot_closed(
+            &WorkScopeId::new("scope-empty")?,
+            SnapshotId::new("snapshot-empty")?,
+            profile(),
+            fence(),
+            &[],
+            &[],
+            None,
+            &denominator(2, 0, 1, 0),
+            &[],
+        )
+        .is_err()
+    );
     Ok(())
 }
