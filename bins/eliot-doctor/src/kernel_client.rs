@@ -796,6 +796,13 @@ mod tests {
     enum FakeVerdict {
         Admitted(DoctorRepairAdmission),
         Rejected(DoctorRepairRejection),
+        /// The submit reached the transport but its typed reply was lost:
+        /// the double reports the exact submit identity for
+        /// exact-identity reconciliation, never a blind retry. Mirrors the
+        /// production `KernelClientError::UnknownOutcome` mapping in
+        /// `submit_repair_attempt`, which carries the request's own
+        /// attempt identity and canonical digest after envelope validation.
+        LostReply,
     }
 
     #[derive(Clone, Debug)]
@@ -826,6 +833,15 @@ mod tests {
         fn refusing(rejection: DoctorRepairRejection) -> Self {
             Self {
                 verdict: Some(FakeVerdict::Rejected(rejection)),
+                advertise: true,
+                submits: 0,
+                retained: None,
+            }
+        }
+
+        fn losing_reply() -> Self {
+            Self {
+                verdict: Some(FakeVerdict::LostReply),
                 advertise: true,
                 submits: 0,
                 retained: None,
@@ -889,6 +905,10 @@ mod tests {
                     }
                     Ok(DoctorRepairResponse::Rejected(rejection))
                 }
+                FakeVerdict::LostReply => Err(DoctorIpcError::UnknownOutcome {
+                    attempt_id: request.attempt_id.clone(),
+                    request_digest: request.request_digest.clone(),
+                }),
             }
         }
     }
@@ -1694,6 +1714,184 @@ mod tests {
         assert_eq!(outcome.report.effect_digest, expected_effect);
         assert_eq!(transport.submits, 1);
         assert_eq!(executor.lock().starts, 1);
+        remove_dispatched_temp(&path);
+        Ok(())
+    }
+
+    /// Dispatch-contour closure (slice C, issue #461): valid dispatch-file
+    /// material presented with advertisement drives exactly one registered
+    /// automatic-safe effect and reconciles by the original identity, a
+    /// lost submit reply keeps that original identity without retry, and
+    /// foreign material is refused fail-closed before any effect. The
+    /// advertisement half of the gate is proven by the composition-root
+    /// truth-table tests; this test proves the presented half end to end
+    /// from the consumed file through the real driver. Test doubles stay
+    /// in this module: production never uses them.
+    #[tokio::test]
+    async fn dispatch_closure_one_effect_reconciles_by_original_identity() {
+        if let Err(detail) = drive_dispatch_closure().await {
+            panic!("dispatch closure must hold: {detail}");
+        }
+    }
+
+    async fn drive_dispatch_closure() -> Result<(), String> {
+        let now = OffsetDateTime::now_utc();
+        let (envelope, live) = dispatched_valid_envelope(now);
+        let path = write_dispatched_temp(&envelope, "closure")?;
+        let validated = read_dispatched_material_from(&path, &live)
+            .map_err(|error| error.to_string())?
+            .ok_or_else(|| "valid file must present material".to_owned())?;
+        // A validated file is consumed once: no later invocation replays it.
+        assert!(!path.exists());
+        let operation_id = test_process_request().operation_id().clone();
+
+        // Valid material drives exactly one effect; the executor-side
+        // unknown outcome reconciles under the SAME effect identity: the
+        // reconciliation key equals the original effect digest, the retry
+        // never happens, and the key is never recomputed under a new id.
+        let admission = honest_admission(
+            &validated.request,
+            &validated.manifest,
+            ATTEMPT_ID,
+            EFFECT_SEQ,
+            &validated.epoch,
+            now,
+        );
+        let expected_effect = admission.effect_digest.clone();
+        let mut transport = FakeTransport::admitting(admission);
+        let executor = Arc::new(FakeExecutor::new(FakeMode::UnknownOnStart));
+        let outcome = drive_admitted_attempt(
+            &mut transport,
+            Arc::clone(&executor),
+            Arc::new(EvidenceCollector::new()),
+            PresentedAttempt {
+                attempt: validated.attempt.clone(),
+                request: validated.request.clone(),
+                manifest: validated.manifest.clone(),
+                process: test_process_request(),
+                epoch: validated.epoch.clone(),
+            },
+            now,
+        )
+        .await
+        .map_err(|error| error.to_string())?;
+        let reconciliation_key = match &outcome.disposition {
+            DoctorDisposition::UnknownEffectOutcome {
+                reconciliation_key, ..
+            } => reconciliation_key.clone(),
+            other => return Err(format!("expected unknown outcome, got {other:?}")),
+        };
+        assert_eq!(outcome.exit_code(), EXIT_UNKNOWN_EFFECT_OUTCOME);
+        assert_eq!(outcome.report.effect_digest, expected_effect);
+        assert_eq!(
+            Some(reconciliation_key.as_str()),
+            expected_effect.as_deref(),
+            "reconcile key names the original effect identity"
+        );
+        assert_eq!(transport.submits, 1);
+        assert_eq!(executor.lock().starts, 1);
+        let operation = validated
+            .manifest
+            .resolve(OPERATION_ID)
+            .map_err(|error| error.to_string())?;
+        let adapter =
+            AutomaticSafeAdapter::bind(Arc::clone(&executor), operation).expect("adapter binds");
+        let reconciled = adapter
+            .reconcile_admitted_unknown(ReconcileInputs {
+                request: &validated.request,
+                manifest: &validated.manifest,
+                attempt_id: ATTEMPT_ID,
+                operation_id,
+                reconciliation_key: reconciliation_key.as_str(),
+                epoch: &validated.epoch,
+                now,
+            })
+            .await
+            .map_err(|error| error.to_string())?;
+        assert!(matches!(
+            reconciled.disposition,
+            DoctorDisposition::Reconciling { .. }
+        ));
+        assert_eq!(reconciled.exit_code(), EXIT_RECONCILING);
+        assert_eq!(
+            reconciled.report.reconciliation_key.as_deref(),
+            Some(reconciliation_key.as_str())
+        );
+        assert_eq!(executor.lock().starts, 1);
+        assert_eq!(executor.lock().reconciliations, 1);
+
+        // A lost submit reply fails closed carrying the ORIGINAL submit
+        // identity for exact-identity reconcile: exactly one submit, zero
+        // effect dispatches, no blind retry.
+        let mut losing = FakeTransport::losing_reply();
+        let lost = losing
+            .submit_repair_attempt(&validated.attempt)
+            .expect_err("lost reply is not a reply");
+        assert_eq!(
+            lost,
+            DoctorIpcError::UnknownOutcome {
+                attempt_id: ATTEMPT_ID.to_owned(),
+                request_digest: validated.attempt.request_digest.clone(),
+            }
+        );
+        let mut losing = FakeTransport::losing_reply();
+        let executor = Arc::new(FakeExecutor::new(FakeMode::Success));
+        let error = drive_admitted_attempt(
+            &mut losing,
+            Arc::clone(&executor),
+            Arc::new(EvidenceCollector::new()),
+            PresentedAttempt {
+                attempt: validated.attempt.clone(),
+                request: validated.request.clone(),
+                manifest: validated.manifest.clone(),
+                process: test_process_request(),
+                epoch: validated.epoch.clone(),
+            },
+            now,
+        )
+        .await
+        .expect_err("lost reply fails closed");
+        assert!(
+            matches!(error, AdapterError::KernelClient(_)),
+            "lost reply stays a typed transport failure, got {error:?}"
+        );
+        assert_eq!(error.exit_code(), EXIT_KERNEL_ADMISSION_REQUIRED);
+        assert_eq!(losing.submits, 1);
+        assert_eq!(executor.lock().starts, 0);
+
+        // Foreign lineage is refused fail-closed before any effect, even
+        // though the envelope submit itself succeeds.
+        let foreign_admission = honest_admission(
+            &validated.request,
+            &validated.manifest,
+            ATTEMPT_ID,
+            EFFECT_SEQ,
+            &validated.epoch,
+            now,
+        );
+        let mut transport = FakeTransport::admitting(foreign_admission);
+        let executor = Arc::new(FakeExecutor::new(FakeMode::Success));
+        let error = drive_admitted_attempt(
+            &mut transport,
+            Arc::clone(&executor),
+            Arc::new(EvidenceCollector::new()),
+            PresentedAttempt {
+                attempt: validated.attempt.clone(),
+                request: validated.request.clone(),
+                manifest: validated.manifest.clone(),
+                process: test_process_request(),
+                epoch: foreign_epoch(),
+            },
+            now,
+        )
+        .await
+        .expect_err("foreign lineage fails closed");
+        assert!(matches!(
+            error,
+            AdapterError::Admission(DoctorError::InvalidFence)
+        ));
+        assert_eq!(error.exit_code(), EXIT_KERNEL_ADMISSION_REQUIRED);
+        assert_eq!(executor.lock().starts, 0);
         remove_dispatched_temp(&path);
         Ok(())
     }
