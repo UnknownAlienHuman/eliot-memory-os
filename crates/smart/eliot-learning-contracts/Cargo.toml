@@ -11,8 +11,8 @@ path = "src/lib.rs"
 
 [package.metadata.eliot]
 prototype = false
-source_status = "NOT_IMPLEMENTED"
-workspace_admission = "admitted via #829 (T8-A0) root workspace membership"
+source_status = "IMPLEMENTED"
+workspace_admission = "ready_for_wave_integration"
 functional_cell = "smart.learning.contracts"
 source_layer = "C0"
 runtime_layer = "R5"
