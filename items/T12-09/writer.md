@@ -212,7 +212,9 @@ Out-of-lane for this writer; MGR02 owns `bins/eliot-dreamer/*`. Exact contract t
 
 - Branch: `work/702-dreamer-launch-leaseexact`
 - Base SHA: `01868163df39bfe06c377be7f21d7d14f74eaafb`
-- (Commit SHA recorded on push below.)
+- Commit SHA: `adacaece6efcfa1a2352b5f0a5d143729720fcbc` (pushed to
+  `origin/work/702-dreamer-launch-leaseexact`; this record's SHA line added in the
+  follow-up evidence commit).
 - Commands (all `--locked`, target dir `C:/Development/Rust/projects/eliot-swarm/MGR01-target-2`):
   - `cargo clippy --locked -p eliot-kernel --all-targets` → exit 0, zero warnings in
     the three files (`items/T12-09/clippy.log`).
