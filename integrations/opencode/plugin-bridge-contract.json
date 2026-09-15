@@ -68,9 +68,17 @@
   },
   "mutation_gate": {
     "applies_when": "attached_task_and_mutating_tool",
+    "tool_identity_ref": "tool_identity.mutating_tools",
     "failure_mode": "fail_closed",
     "explicit_allow_decisions": ["recorded", "allow", "allowed", "pass"],
     "explicit_deny_decision": "deny"
+  },
+  "tool_identity": {
+    "version": "eliot.opencode.tools.v1",
+    "classification": "exact_case_sensitive_allowlist_member",
+    "mutating_tools": ["bash", "edit", "write", "patch"],
+    "read_only_tools": ["read", "grep", "glob", "list", "webfetch", "websearch", "lsp", "codesearch"],
+    "unknown_tools": "fail_closed_without_bridge_dispatch"
   },
   "effect_binding": {
     "schema_version": "eliot.opencode.effect.v1",
@@ -83,6 +91,7 @@
   },
   "skipped_tool_receipt": {
     "applies_when": "attached_task_and_exact_read_only_tool",
+    "tool_identity_ref": "tool_identity.read_only_tools",
     "decision": "skipped",
     "reason": "read_only_tool",
     "transport": "tool.execute.skipped_through_existing_host_event_bridge",
