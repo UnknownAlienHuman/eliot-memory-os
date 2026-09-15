@@ -1,0 +1,1 @@
+{"case": 18, "description": "substantive malformed/property behavior not replaced by test counts or panic suppression", "expected": "reject-typed-error-no-panic", "raw_text_malformed": "{\"protocol_version\": \"v1\", \"message_type\": }", "raw_text_truncated": "{\"protocol_version\": \"v1\", \"message_type\": \"request\""}

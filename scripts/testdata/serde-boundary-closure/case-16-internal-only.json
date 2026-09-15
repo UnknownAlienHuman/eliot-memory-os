@@ -1,0 +1,1 @@
+{"case": 16, "description": "internal-only exceptions exact and invalidated by new callers", "exception": {"callers": ["crates/eliot-engine/src/context.rs"], "reason": "internal-only-no-ingress", "row_id": "internal-row-001"}, "expected": "invalidate-on-new-caller", "new_caller": "bins/eliot-agent-bridge/src/main.rs"}
