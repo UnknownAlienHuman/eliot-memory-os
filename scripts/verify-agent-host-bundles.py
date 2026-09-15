@@ -12,9 +12,13 @@ from typing import Any, Callable
 from agent_host_bundle import (
     BundleError,
     INDEX_VERSION,
+    IDENTITY_VERSION,
     MANIFEST_PATH,
+    canonical_json_bytes,
+    compute_bundle_identity,
     directory_digest,
     materialize_host_bundle,
+    sha256_bytes,
 )
 
 HOSTS = ("codex", "opencode", "claude", "antigravity")
@@ -69,6 +73,58 @@ def _assert_bundle(path: Path, host: str, receipt: dict[str, Any]) -> None:
         raise AssertionError(f"{host}: install plan permits sensitive state copy")
     if plan.get("post_copy_route_admission_required") is not True:
         raise AssertionError(f"{host}: route admission is not required")
+    if plan.get("bundle_sha256") != receipt.get("bundle_sha256"):
+        raise AssertionError(f"{host}: install plan is pinned to a different bundle")
+    if plan.get("bundle_identity") != receipt.get("bundle_identity"):
+        raise AssertionError(f"{host}: install plan is pinned to a different bundle identity")
+    if receipt.get("identity_version") != IDENTITY_VERSION:
+        raise AssertionError(f"{host}: bundle identity version mismatch")
+    for key in (
+        "bundle_identity",
+        "manifest_entry_sha256",
+        "skill_manifest_sha256",
+        "route_profile_sha256",
+        "skill_index_sha256",
+        "bundle_sha256",
+    ):
+        value = receipt.get(key)
+        if not isinstance(value, str) or len(value) != 64 or any(
+            char not in "0123456789abcdef" for char in value
+        ):
+            raise AssertionError(f"{host}: receipt identity field is malformed: {key}")
+    route_bytes = (operator / "route-profile.json").read_bytes()
+    if sha256_bytes(route_bytes) != receipt["route_profile_sha256"]:
+        raise AssertionError(f"{host}: declared route profile digest does not match staged bytes")
+    index_bytes = (operator / "skill-index.json").read_bytes()
+    if sha256_bytes(index_bytes) != receipt["skill_index_sha256"]:
+        raise AssertionError(f"{host}: declared Skill index digest does not match staged bytes")
+    files = receipt.get("files")
+    if not isinstance(files, list) or not files:
+        raise AssertionError(f"{host}: receipt file list is missing")
+    if [entry.get("path") for entry in files] != sorted(entry.get("path") for entry in files):
+        raise AssertionError(f"{host}: receipt file list is not deterministically ordered")
+    for entry in files:
+        if not isinstance(entry, dict) or set(entry) != {"path", "sha256", "bytes"}:
+            raise AssertionError(f"{host}: malformed receipt file entry")
+        staged = path / entry["path"]
+        if not staged.is_file():
+            raise AssertionError(f"{host}: staged bundle file is missing: {entry['path']}")
+        staged_bytes = staged.read_bytes()
+        if len(staged_bytes) != entry["bytes"] or sha256_bytes(staged_bytes) != entry["sha256"]:
+            raise AssertionError(f"{host}: staged bundle file drifted: {entry['path']}")
+    if sha256_bytes(canonical_json_bytes(files)) != receipt["bundle_sha256"]:
+        raise AssertionError(f"{host}: bundle digest does not match file entries")
+    expected_identity = compute_bundle_identity(
+        manifest_entry_sha256=receipt["manifest_entry_sha256"],
+        route_profile_sha256=receipt["route_profile_sha256"],
+        skill_manifest_sha256=receipt["skill_manifest_sha256"],
+        skill_index_sha256=receipt["skill_index_sha256"],
+        payload_entries=files,
+    )
+    if expected_identity != receipt["bundle_identity"]:
+        raise AssertionError(f"{host}: bundle identity does not match recomputation")
+    if receipt.get("declared_identity") not in {"absent", "verified"}:
+        raise AssertionError(f"{host}: declared identity state is invalid")
     if receipt.get("contains_credentials") is not False:
         raise AssertionError(f"{host}: receipt claims credentials")
     if receipt.get("contains_runtime_state") is not False:
@@ -249,6 +305,66 @@ def self_test() -> None:
                 "non-empty output",
                 lambda: materialize_host_bundle(root, "codex", occupied),
             )
+
+            manifest_path = root / MANIFEST_PATH
+            manifest = _read_json(manifest_path)
+            codex_entry = manifest["hosts"]["codex"]
+            route_doc = _read_json(root / "integrations/codex/route-profile.json")
+            route_digest = sha256_bytes(canonical_json_bytes(route_doc) + b"\n")
+            skill_manifest_bytes = (root / "integrations/agent-skills/skill-pack.manifest.json").read_bytes()
+            entry_digest = sha256_bytes(
+                canonical_json_bytes({key: value for key, value in codex_entry.items() if key != "identity"})
+            )
+            codex_entry["identity"] = {
+                "route_profile_sha256": route_digest,
+                "skill_manifest_sha256": sha256_bytes(skill_manifest_bytes),
+                "manifest_entry_sha256": entry_digest,
+            }
+            manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+            declared_receipt = materialize_host_bundle(root, "codex", scratch / "declared")
+            if declared_receipt.get("declared_identity") != "verified":
+                raise AssertionError("declared identity was not verified")
+            _assert_bundle(scratch / "declared", "codex", declared_receipt)
+
+            manifest = _read_json(manifest_path)
+            manifest["hosts"]["codex"]["identity"]["bundle_identity"] = declared_receipt["bundle_identity"]
+            manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+            repinned = materialize_host_bundle(root, "codex", scratch / "repinned")
+            _assert_bundle(scratch / "repinned", "codex", repinned)
+
+            manifest = _read_json(manifest_path)
+            manifest["hosts"]["codex"]["identity"]["route_profile_sha256"] = "0" * 64
+            manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+            _expect_failure(
+                "forged route digest",
+                lambda: materialize_host_bundle(root, "codex", scratch / "forged"),
+            )
+            manifest = _read_json(manifest_path)
+            manifest["hosts"]["codex"]["identity"]["route_profile_sha256"] = "not-hex"
+            manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+            _expect_failure(
+                "malformed identity digest",
+                lambda: materialize_host_bundle(root, "codex", scratch / "malformed"),
+            )
+            manifest = _read_json(manifest_path)
+            del manifest["hosts"]["codex"]["identity"]
+            manifest["hosts"]["codex"]["payload"][0]["source"] = "fixtures\\codex\\plugin.json"
+            manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+            _expect_failure(
+                "backslash traversal",
+                lambda: materialize_host_bundle(root, "codex", scratch / "backslash"),
+            )
+            manifest = _read_json(manifest_path)
+            manifest["hosts"]["codex"]["payload"][0]["source"] = "fixtures/codex/plugin.json"
+            manifest["hosts"]["codex"]["payload"][0]["destination"] = "credentials.json"
+            manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+            _expect_failure(
+                "forbidden destination",
+                lambda: materialize_host_bundle(root, "codex", scratch / "forbidden-dest"),
+            )
+            manifest = _read_json(manifest_path)
+            manifest["hosts"]["codex"]["payload"][0]["destination"] = "plugin.json"
+            manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
     finally:
         shutil.rmtree(root, ignore_errors=True)
 
@@ -260,7 +376,7 @@ def main() -> int:
     arguments = parser.parse_args()
     if arguments.self_test:
         self_test()
-        print("AGENT_HOST_BUNDLES_SELF_TEST: PASS cases=5")
+        print("AGENT_HOST_BUNDLES_SELF_TEST: PASS cases=11")
     else:
         verify_current_tree(arguments.root.resolve())
         print("AGENT_HOST_BUNDLES_VERIFY: PASS hosts=4")
