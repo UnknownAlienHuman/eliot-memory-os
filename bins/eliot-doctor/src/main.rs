@@ -133,8 +133,12 @@ fn bootstrap_and_run_once() -> i32 {
             };
             match gate_after_advertise(advertised, validated.is_some()) {
                 GateDecision::Drive => {
-                    let material = validated.expect("gate proved a presentation exists");
-                    drive_presented_attempt(&mut client, material)
+                    let Some(material) = validated else {
+                        return deny(
+                            "kernel advertises the doctor operation but no session-bound attempt envelope was presented to this one-shot invocation",
+                        );
+                    };
+                    drive_presented_attempt(&mut client, &material)
                 }
                 GateDecision::DenyNotAdvertised => {
                     deny("kernel does not advertise the doctor operation")
@@ -155,7 +159,7 @@ fn bootstrap_and_run_once() -> i32 {
 /// effect; post-admission outcomes emit their typed report and exit.
 fn drive_presented_attempt(
     client: &mut KernelDoctorIpcClient,
-    material: dispatched_material::ValidatedDispatchedAttempt,
+    material: &dispatched_material::ValidatedDispatchedAttempt,
 ) -> i32 {
     use std::sync::Arc;
 
@@ -164,14 +168,11 @@ fn drive_presented_attempt(
     use dispatch_authority::DoctorDispatchAuthority;
     use kernel_client::drive_validated_dispatched_attempt;
 
-    let generation_root = match std::env::current_exe()
+    let Some(generation_root) = std::env::current_exe()
         .ok()
         .and_then(|path| path.parent().map(std::path::Path::to_path_buf))
-    {
-        Some(root) => root,
-        None => {
-            return deny("dispatch executable locator is unavailable");
-        }
+    else {
+        return deny("dispatch executable locator is unavailable");
     };
     let authority = match DoctorDispatchAuthority::new() {
         Ok(authority) => Arc::new(authority),
@@ -199,7 +200,7 @@ fn drive_presented_attempt(
         &authority,
         Arc::new(executor),
         sink,
-        &material,
+        material,
         &generation_root,
         now,
         now_ms,
