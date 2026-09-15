@@ -146,6 +146,12 @@ impl WatchdogSpool {
     pub(crate) fn open_runtime_binding(
         binding: &WatchdogRuntimeBinding,
     ) -> Result<Self, SpoolError> {
+        let _span = tracing::debug_span!("watchdog.spool_open").entered();
+        tracing::debug!(
+            event = "watchdog.spool_open_attempted",
+            observation = "attempted",
+            "opening runtime spool binding without payload material"
+        );
         let path = watchdog_spool_path(binding.watchdog_state_root());
         let path_lease = ProtectedRuntimePathLease::open_or_create_absolute(&path)
             .map_err(|_| SpoolError::InvalidProtectedRoot)?;
@@ -638,6 +644,11 @@ impl WatchdogSpool {
         high_water: u64,
         limits: WatchdogSpoolExportLimits,
     ) -> Result<(WatchdogSpoolExportBatch, Vec<Vec<u8>>), SpoolError> {
+        tracing::debug!(
+            event = "watchdog.spool_export_attempted",
+            observation = "attempted",
+            "exporting spool batch without payload material"
+        );
         limits.validate()?;
         validate_cursor(predecessor, high_water)?;
         let (entries, live_high_water, stored) = self.read_export_snapshot()?;
@@ -685,6 +696,11 @@ impl WatchdogSpool {
         batch: &WatchdogSpoolExportBatch,
         ack: &WatchdogSpoolAcknowledgement,
     ) -> Result<u64, SpoolError> {
+        tracing::debug!(
+            event = "watchdog.spool_ack_attempted",
+            observation = "attempted",
+            "applying spool acknowledgement without payload material"
+        );
         let live_high_water = self.high_water_sequence()?;
         let now_ms = current_unix_ms()?;
         validate_batch(batch, live_high_water)?;
