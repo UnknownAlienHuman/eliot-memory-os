@@ -1,25 +1,24 @@
 [package]
 name = "eliot-dreamer-rival-model"
-version = "0.1.0"
-edition = "2024"
-rust-version = "1.94"
-license = "MIT"
-publish = false
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
 description = "Candidate-only preservation and structuring of rival models for ELIOT Dreamer"
 
 [lib]
 path = "src/lib.rs"
 
 [dependencies]
-eliot-dreamer-contracts = { path = "../eliot-dreamer-contracts" }
-eliot-evaluation-contracts = { path = "../../foundation/eliot-evaluation-contracts" }
-eliot-epistemic-contracts = { path = "../eliot-epistemic-contracts" }
-serde = { version = "1.0.228", features = ["derive"] }
+eliot-dreamer-contracts = { path = "../eliot-dreamer-contracts", version = "0.1.0" }
+eliot-evaluation-contracts.workspace = true
+eliot-epistemic-contracts = { path = "../eliot-epistemic-contracts", version = "0.1.0" }
+serde.workspace = true
 serde_json = { version = "1.0.150" }
 
 [package.metadata.eliot]
-prototype = true
-workspace_admission = "pending_agent_implementation"
+prototype = false
+workspace_admission = "admitted via #836 (T8-A4) root workspace membership"
 functional_cell = "smart.dreamer.rival_model"
 source_layer = "C1"
 runtime_layer = "R6"
@@ -28,29 +27,3 @@ agent_order = 16
 
 [lints]
 workspace = true
-
-# Standalone workspace root. Without this, cargo walks above the repository
-# and can bind this package to an unrelated ancestor manifest, so every
-# per-crate `cargo check|test|clippy` fails before it starts. Remove this
-# table when the cell is promoted into the root workspace `members`.
-[workspace]
-
-# Mirrors the root `[workspace.lints]` verbatim so an excluded cell is linted
-# exactly like an admitted one. Keep in sync; the promotion commit drops this
-# whole `[workspace]` table and restores plain inheritance.
-[workspace.lints.rust]
-unsafe_code = "forbid"
-missing_docs = "allow"
-
-[workspace.lints.clippy]
-all = { level = "warn", priority = -1 }
-pedantic = { level = "warn", priority = -1 }
-dbg_macro = "warn"
-expect_used = "warn"
-missing_errors_doc = "allow"
-missing_panics_doc = "allow"
-module_name_repetitions = "allow"
-must_use_candidate = "allow"
-print_stderr = "warn"
-print_stdout = "warn"
-unwrap_used = "warn"
