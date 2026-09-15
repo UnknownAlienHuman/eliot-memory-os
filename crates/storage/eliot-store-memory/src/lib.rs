@@ -17,10 +17,10 @@ use eliot_store_api::{
     PreparedTransition, ProjectionMode, ProjectionPublicationId, ProjectionPublicationRecord,
     ProjectionStatus, RecoveryRecord, RecoveryRecordKey, RequestMeta, Resubmission, RevisionDelta,
     RevisionHead, RevisionHeadExpectation, RevisionKey, ScopeId, ScopeRevisionView, SplitView,
-    StateFence, StoreError, StoreGenesisRequest, StoreHealth, StoreHealthStatus, StoreRecoveryRequest,
-    StoreRecoverySnapshot, WriteReceipt, WriteReceiptStatus, canonical_json_bytes,
-    canonical_request_hash, generated_operation_manifests, genesis_manifest, is_genesis_fence,
-    issue_genesis_receipt_envelope, issue_store_receipt_envelope,
+    StateFence, StoreError, StoreGenesisRequest, StoreHealth, StoreHealthStatus,
+    StoreRecoveryRequest, StoreRecoverySnapshot, WriteReceipt, WriteReceiptStatus,
+    canonical_json_bytes, canonical_request_hash, generated_operation_manifests, genesis_manifest,
+    is_genesis_fence, issue_genesis_receipt_envelope, issue_store_receipt_envelope,
     named_mutation_operation_name, sha256_hex, validate_genesis_receipt_envelope,
     validate_store_receipt_envelope, verify_canonical_request_hash,
 };
@@ -384,7 +384,6 @@ fn commit_transaction(
                 .into_iter()
                 .map(|operation| ScopedNamedOperation {
                     scope_id: transition.scope_id.clone(),
-                    state_fence: transition.state_fence.clone(),
                     operation,
                 }),
         );
@@ -577,8 +576,9 @@ impl MemoryStore {
     ///
     /// Reads only actually captured observations: the `CaptureObservation`
     /// records stored by the commit path, in capture order, filtered by exact
-    /// scope, fence and `subject` match — never substring or a default scope.
-    /// The commit path retains each operation's admitted scope and fence;
+    /// scope and `subject` match — never substring or a default scope.
+    /// The commit path retains each operation's admitted scope. The current
+    /// fence gates the read, not the visibility of historical observations;
     /// the explicit `max_records` bound caps the returned records with a
     /// visible `truncated` marker plus totals, while an over-bound request
     /// refuses with [`StoreError::PayloadTooLarge`] instead of returning a
@@ -595,37 +595,32 @@ impl MemoryStore {
         })?;
         // The catalogue gate already enforces presence and shape; re-check
         // fail-closed so this arm never depends on call order.
-        let subject =
-            query
-                .parameters
-                .get("subject")
-                .and_then(Value::as_str)
-                .ok_or(StoreError::InvalidField {
-                    field: "operation.parameter",
-                    reason: "missing required parameter",
-                })?;
+        let subject = query
+            .parameters
+            .get("subject")
+            .and_then(Value::as_str)
+            .ok_or(StoreError::InvalidField {
+                field: "operation.parameter",
+                reason: "missing required parameter",
+            })?;
         if subject.trim().is_empty() || subject.chars().any(char::is_control) {
             return Err(StoreError::InvalidField {
                 field: "operation.parameter",
                 reason: "subject must be a non-blank string",
             });
         }
-        let bound_raw =
-            query
-                .parameters
-                .get("max_records")
-                .and_then(Value::as_str)
-                .ok_or(StoreError::InvalidField {
-                    field: "operation.parameter",
-                    reason: "missing required parameter",
-                })?;
-        let max_records: u32 =
-            bound_raw
-                .parse()
-                .map_err(|_| StoreError::InvalidField {
-                    field: "operation.parameter",
-                    reason: "max_records must be a positive decimal bound",
-                })?;
+        let bound_raw = query
+            .parameters
+            .get("max_records")
+            .and_then(Value::as_str)
+            .ok_or(StoreError::InvalidField {
+                field: "operation.parameter",
+                reason: "missing required parameter",
+            })?;
+        let max_records: u32 = bound_raw.parse().map_err(|_| StoreError::InvalidField {
+            field: "operation.parameter",
+            reason: "max_records must be a positive decimal bound",
+        })?;
         if max_records == 0 {
             return Err(StoreError::InvalidField {
                 field: "operation.parameter",
@@ -635,15 +630,13 @@ impl MemoryStore {
         if max_records > EVIDENCE_PACK_MAX_RECORDS {
             return Err(StoreError::PayloadTooLarge);
         }
-        let limit =
-            usize::try_from(max_records).map_err(|_| StoreError::PayloadTooLarge)?;
+        let limit = usize::try_from(max_records).map_err(|_| StoreError::PayloadTooLarge)?;
         let matched: Vec<(usize, &eliot_store_api::NamedMutationRequest)> = state
             .named_operations
             .iter()
             .enumerate()
             .filter(|(_, record)| {
                 record.scope_id == scope_id
-                    && record.state_fence == *fence
                     && record.operation.operation == NamedMutationOperation::CaptureObservation
                     && record
                         .operation
@@ -986,7 +979,6 @@ fn genesis_receipt(
 #[derive(Clone, Debug, PartialEq)]
 struct ScopedNamedOperation {
     scope_id: ScopeId,
-    state_fence: StateFence,
     operation: eliot_store_api::NamedMutationRequest,
 }
 
@@ -2331,6 +2323,77 @@ mod tests {
     }
 
     #[test]
+    fn evidence_pack_preserves_history_after_current_fence_advances() -> Result<(), StoreError> {
+        let initial = fence();
+        let ctx = metadata(&initial)?;
+        let store = store()?;
+        let receipt = store.apply_transaction(
+            &ctx,
+            capture_with_subject("historical-capture", "historical-subject", &initial, &ctx)?,
+            &[],
+            &[],
+        )?;
+        let query = evidence_pack_query(
+            &initial,
+            Some("scope-1"),
+            evidence_params("historical-subject", "1"),
+        )?;
+        let before = store.execute_named_sync(&query)?;
+        assert_eq!(pack_records(&before.payload)?.len(), 1);
+        let mut current = initial.clone();
+        for component in 0..5 {
+            match component {
+                0 => current.authority_epoch = test_epoch(2),
+                1 => {
+                    current.resource_generation =
+                        ResourceGeneration::new(2).map_err(StoreError::Foundation)?
+                }
+                2 => {
+                    current.task_revision = Some(
+                        eliot_contracts::TaskRevision::new(2).map_err(StoreError::Foundation)?,
+                    )
+                }
+                3 => {
+                    current.policy_revision = Some(
+                        eliot_contracts::PolicyRevision::new(2).map_err(StoreError::Foundation)?,
+                    )
+                }
+                _ => {
+                    current.integration_revision = Some(
+                        eliot_contracts::IntegrationRevision::new(2)
+                            .map_err(StoreError::Foundation)?,
+                    )
+                }
+            }
+            // Fixture installs the new current fence. Historical observations
+            // and receipts stay untouched; lifecycle admission is outside this test.
+            store.lock_state()?.fences = Some(current.clone());
+            let mut current_query = query.clone();
+            current_query.state_fence = current.clone();
+            let response = store.execute_named_sync(&current_query)?;
+            assert_eq!(response.payload["records"], before.payload["records"]);
+            assert_eq!(response.payload["provenance"]["matched_total"], json!(1));
+            assert_eq!(
+                response.payload["provenance"]["state_fence"],
+                json!(current)
+            );
+            assert_eq!(response.state_fence, current);
+            assert_eq!(
+                store.execute_named_sync(&query),
+                Err(StoreError::FenceMismatch)
+            );
+            assert_eq!(
+                store
+                    .lock_state()?
+                    .receipts_by_operation
+                    .get("historical-capture"),
+                Some(&receipt),
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
     fn evidence_pack_returns_exact_captured_record_with_provenance() -> Result<(), StoreError> {
         // Slice T11.1: capture one real observation via the existing capture
         // path, then `GetEvidencePack` returns its exact record (identity)
@@ -2389,10 +2452,7 @@ mod tests {
             provenance.get("matched_total").and_then(Value::as_u64),
             Some(1)
         );
-        assert_eq!(
-            provenance.get("returned").and_then(Value::as_u64),
-            Some(1)
-        );
+        assert_eq!(provenance.get("returned").and_then(Value::as_u64), Some(1));
         assert_eq!(
             provenance.get("max_records").and_then(Value::as_u64),
             Some(10)
@@ -2589,10 +2649,7 @@ mod tests {
             provenance.get("matched_total").and_then(Value::as_u64),
             Some(3)
         );
-        assert_eq!(
-            provenance.get("returned").and_then(Value::as_u64),
-            Some(2)
-        );
+        assert_eq!(provenance.get("returned").and_then(Value::as_u64), Some(2));
         assert_eq!(
             provenance.get("truncated").and_then(Value::as_bool),
             Some(true)

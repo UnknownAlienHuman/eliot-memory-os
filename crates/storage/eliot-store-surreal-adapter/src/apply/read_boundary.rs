@@ -443,7 +443,8 @@ fn validate_evidence_record(
 /// Builds the versioned exact evidence-pack payload for one request.
 ///
 /// Parity with the reference `MemoryStore::evidence_pack_payload`: exact
-/// scope/fence/`subject` match (never substring, never a default), explicit
+/// scope/`subject` match (never substring, never a default), current read
+/// fence validation independent of historical write fences, explicit
 /// `max_records` decimal-string bound with over-bound
 /// [`StoreError::PayloadTooLarge`] refusal, identity
 /// (`capture_index` / `operation` / `parameters`), envelope `version = 1`
@@ -535,9 +536,9 @@ fn evidence_pack_payload(
             {
                 return Err(StoreError::InvalidReceipt);
             }
+            // The validated receipt retains its original write fence. Read
+            // freshness does not erase observations admitted under older fences.
             binding.scope_id.as_str() == scope_id.as_str()
-                && binding.state_fence == *state_fence
-                && receipt.state_fence == *state_fence
         };
         for record in records {
             validate_evidence_record(row, record)?;
@@ -836,14 +837,14 @@ mod admitted_read_tests {
     }
 
     #[test]
-    fn evidence_pack_requires_receipt_scope_and_fence() {
+    fn evidence_pack_requires_receipt_scope_and_current_read_fence() {
         let fence = test_fence();
         let query = evidence_query("shared-subject", "1");
         let row = evidence_row_for("scope-provenance", "shared-subject", 1);
         let mut wrong_scope_query = query.clone();
         wrong_scope_query.scope_id = Some(ScopeId::new("other").expect("scope"));
-        let absent =
-            evidence_pack_payload(&wrong_scope_query, &fence, std::slice::from_ref(&row)).expect("empty");
+        let absent = evidence_pack_payload(&wrong_scope_query, &fence, std::slice::from_ref(&row))
+            .expect("empty");
         assert_eq!(absent["provenance"]["matched_total"], json!(0));
         let mut no_receipt = row.clone();
         no_receipt.receipt = None;
@@ -860,11 +861,22 @@ mod admitted_read_tests {
         let mut other_fence = fence.clone();
         other_fence.resource_generation =
             eliot_contracts::ResourceGeneration::new(2).expect("generation");
-        let mut newer_query = query;
+        let mut newer_query = query.clone();
         newer_query.state_fence = other_fence.clone();
-        let absent = evidence_pack_payload(&newer_query, &other_fence, &[row])
-            .expect("old captures excluded");
-        assert_eq!(absent["provenance"]["matched_total"], json!(0));
+        let historical =
+            evidence_pack_payload(&newer_query, &other_fence, std::slice::from_ref(&row))
+                .expect("historical captures remain visible under a current read fence");
+        assert_eq!(historical["provenance"]["matched_total"], json!(1));
+        assert_eq!(historical["provenance"]["state_fence"], json!(other_fence));
+        assert_eq!(
+            historical["records"][0]["parameters"]["subject"],
+            json!("shared-subject")
+        );
+        assert_eq!(
+            evidence_pack_payload(&query, &other_fence, &[row]),
+            Err(StoreError::FenceMismatch),
+            "a historical record cannot authorize a stale read request",
+        );
     }
 
     pub(super) fn evidence_query(subject: &str, max_records: &str) -> NamedReadRequest {
@@ -1316,7 +1328,7 @@ mod real_scope_tests {
         }
     }
 
-    async fn assert_scope_reads(adapter: &SurrealStoreAdapter) {
+    async fn assert_scope_reads(adapter: &SurrealStoreAdapter, current_fence: &StateFence) {
         for (scope, expected_index) in [
             ("scope-other", Some(0)),
             ("scope-1", Some(1)),
@@ -1324,6 +1336,7 @@ mod real_scope_tests {
         ] {
             let mut query = admitted_read_tests::evidence_query("shared-subject", "1");
             query.scope_id = Some(ScopeId::new(scope).expect("scope"));
+            query.state_fence = current_fence.clone();
             let response = adapter
                 .execute_named(query)
                 .await
@@ -1339,20 +1352,73 @@ mod real_scope_tests {
                 json!(records.len())
             );
             assert_eq!(response.payload["provenance"]["truncated"], json!(false));
+            assert_eq!(response.state_fence, *current_fence);
+            assert_eq!(
+                response.payload["provenance"]["state_fence"],
+                json!(current_fence)
+            );
         }
-        let query = admitted_read_tests::evidence_query("shared", "1");
+        let mut query = admitted_read_tests::evidence_query("shared", "1");
+        query.state_fence = current_fence.clone();
         let response = adapter
             .execute_named(query)
             .await
             .expect("nonmatching subject");
         assert_eq!(response.payload["provenance"]["matched_total"], json!(0));
         let mut wrong_fence = admitted_read_tests::evidence_query("shared-subject", "1");
+        wrong_fence.state_fence = current_fence.clone();
         wrong_fence.state_fence.resource_generation =
-            eliot_contracts::ResourceGeneration::new(2).expect("generation");
+            eliot_contracts::ResourceGeneration::new(current_fence.resource_generation.value() + 1)
+                .expect("generation");
         assert_eq!(
             adapter.execute_named(wrong_fence).await,
             Err(StoreError::FenceMismatch)
         );
+    }
+
+    /// Installs only the isolated fixture's current fence using the existing
+    /// closed CAS statement. This is not a Host/Kernel cutover proof; real
+    /// captures, their bytes and immutable receipt envelopes remain untouched.
+    async fn install_fixture_fence(adapter: &SurrealStoreAdapter, current: &StateFence) {
+        let db = crate::apply::client(adapter).await.expect("client");
+        let mut fence = read_fence(db, &adapter.config)
+            .await
+            .expect("read fence")
+            .expect("fence");
+        let mut bindings = Map::new();
+        bindings.insert("fence_table".into(), json!("canonical_fence"));
+        bindings.insert("fence_key".into(), json!("current"));
+        bindings.insert("expected_state_fence".into(), json!(fence.state_fence));
+        bindings.insert(
+            "expected_commit_sequence".into(),
+            json!(fence.next_commit_sequence),
+        );
+        bindings.insert(
+            "expected_outbox_sequence".into(),
+            json!(fence.next_outbox_sequence),
+        );
+        fence.state_fence = current.clone();
+        bindings.insert("fence".into(), to_value(&fence).expect("fence value"));
+        let mut response = client::query(
+            db,
+            &adapter.config,
+            "test.install_read_fence",
+            schema::TX_UPSERT_FENCE,
+            bindings,
+        )
+        .await
+        .expect("fixture fence CAS");
+        assert!(
+            response.take_errors().is_empty(),
+            "fixture fence CAS succeeded"
+        );
+        let observed = read_fence(db, &adapter.config)
+            .await
+            .expect("read fence")
+            .expect("fence");
+        assert_eq!(observed.state_fence, *current);
+        assert_eq!(observed.next_commit_sequence, fence.next_commit_sequence);
+        assert_eq!(observed.next_outbox_sequence, fence.next_outbox_sequence);
     }
 
     #[tokio::test]
@@ -1369,6 +1435,7 @@ mod real_scope_tests {
                 )
                 .await
                 .expect("migration");
+            let mut receipts = Vec::new();
             for (index, scope) in ["scope-other", "scope-1"].into_iter().enumerate() {
                 let mut capture = admitted_read_tests::capture_transition(
                     &format!("scope-capture-{index}"),
@@ -1396,11 +1463,49 @@ mod real_scope_tests {
                     .await
                     .expect("exact replay");
                 assert_eq!(replay, receipt);
+                receipts.push(receipt);
             }
-            assert_scope_reads(harness.adapter()).await;
+            assert_scope_reads(harness.adapter(), &ctx.state_fence).await;
+            let mut current = ctx.state_fence.clone();
+            current.authority_epoch = eliot_contracts::EpochId::new(
+                current.authority_epoch.lineage_id.clone(),
+                std::num::NonZeroU64::new(2).expect("nonzero epoch"),
+            )
+            .expect("epoch");
+            current.resource_generation =
+                eliot_contracts::ResourceGeneration::new(2).expect("generation");
+            current.task_revision =
+                Some(eliot_contracts::TaskRevision::new(2).expect("task revision"));
+            current.policy_revision =
+                Some(eliot_contracts::PolicyRevision::new(2).expect("policy revision"));
+            current.integration_revision =
+                Some(eliot_contracts::IntegrationRevision::new(2).expect("integration revision"));
+            install_fixture_fence(harness.adapter(), &current).await;
+            assert_scope_reads(harness.adapter(), &current).await;
+            assert_eq!(
+                harness
+                    .adapter()
+                    .execute_named(admitted_read_tests::evidence_query("shared-subject", "1"))
+                    .await,
+                Err(StoreError::FenceMismatch),
+                "the old request fence remains refused",
+            );
             harness.close().await;
             harness.open().await;
-            assert_scope_reads(harness.adapter()).await;
+            assert_scope_reads(harness.adapter(), &current).await;
+            for receipt in receipts {
+                let db = crate::apply::client(harness.adapter())
+                    .await
+                    .expect("client");
+                let stored = read_receipt_by_operation(db, &harness.config, &receipt.operation_id)
+                    .await
+                    .expect("historical receipt");
+                assert_eq!(
+                    stored,
+                    Some(receipt),
+                    "historical receipt is immutable after reopen"
+                );
+            }
         })
         .catch_unwind()
         .await;
