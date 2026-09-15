@@ -63,9 +63,13 @@ id = "CC-007"
 status = "DEFERRED_SELF_LEARNING"
 required_owner = "Governor/Meta outcome and experiment owners"
 needed_by = ["future DreamCycle", "use attribution", "usefulness/harm/cost evaluation", "improvement experiment"]
+depends_on = ["eliot-learning-contracts::UseAttributionCandidate", "eliot-learning-contracts::ImprovementExperimentCandidate", "eliot-learning-contracts::PromotionBoundaryCandidate", "eliot.foundation.evaluation-contracts::AttributedMemoryEvaluation", "eliot.evaluation.attributed-memory-use", "eliot.evaluation.memory-outcome-economics"]
 missing_contract = "Candidate use attribution, intervention/control identity, outcome window, confounders, cost/harm/regret dimensions, rollback and promotion authority."
 forbidden_workaround = "active-generation self-modification, self-verification, benchmark-only reward or model-rated improvement"
 resolution_evidence = ["versioned attribution/experiment contracts", "counterfactual and confounder fixtures", "dimensioned evaluation", "Governor promotion gate"]
+proof_ceiling = "STATIC_CONTRACT_REGISTRATION_ONLY"
+implementation_support = "TARGET"
+evidence_execution_status = "NOT_EXECUTED"
 
 [[challenge]]
 id = "CC-008"
