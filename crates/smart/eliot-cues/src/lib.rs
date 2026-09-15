@@ -17,6 +17,10 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use blake3::Hasher;
 use eliot_contracts::{ArtifactId, ContractVersion, StateFence};
+use eliot_cue_contracts::{
+    ConversionDisposition, CueComparisonKey, CueProjectionDenominator, CueSourceValue,
+    ProofCeiling, cue_row_id,
+};
 use eliot_evidence::LifecycleState;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
@@ -99,6 +103,18 @@ pub enum CueError {
     FenceMismatch,
     #[error("cue revision overflow")]
     RevisionOverflow,
+    #[error("duplicate v2 row identity in cue snapshot")]
+    DuplicateRowId,
+    #[error("duplicate semantic binding in cue snapshot")]
+    DuplicateSemanticBinding,
+    #[error("activation edge cites an unknown endpoint")]
+    UnknownEndpoint,
+    #[error("activation edge weight exceeds unity")]
+    InvalidWeight,
+    #[error("activation edge fanout exceeds the bound")]
+    ExcessFanout,
+    #[error("cue snapshot disagrees with its projection denominator")]
+    DenominatorMismatch,
 }
 
 fn valid_text(value: &str) -> bool {
@@ -122,6 +138,24 @@ impl ObservedCue {
     pub fn normalize(&self) -> Result<CueKey, CueError> {
         CueKey::new(&self.scope, self.kind, &self.value)
     }
+    /// Records the lossless v2 source value for this observation.
+    ///
+    /// The spelling is the observed value verbatim. Comparison semantics stay
+    /// in the key; a blank spelling or reference is rejected as
+    /// [`CueError::InvalidValue`].
+    pub fn source_value(
+        &self,
+        source_identity_ref: &str,
+        comparison_policy_ref: &str,
+    ) -> Result<CueSourceValue, CueError> {
+        let value = CueSourceValue::new(
+            self.value.clone(),
+            source_identity_ref.to_owned(),
+            comparison_policy_ref.to_owned(),
+        );
+        value.validate().map_err(|_| CueError::InvalidValue)?;
+        Ok(value)
+    }
 }
 
 /// The only identity used by a projection lookup.
@@ -138,6 +172,28 @@ pub struct CueKey {
 
 impl CueKey {
     pub fn new(scope: &str, kind: CueKind, value: &str) -> Result<Self, CueError> {
+        Self::new_with_case(scope, kind, value, true)
+    }
+    /// Builds a key under an explicit case policy for path and text sources.
+    ///
+    /// `case_sensitive` preserves case and folds separators only; insensitive
+    /// keeps the legacy unconditional lowercase. Error signatures are always
+    /// canonical-folded: an exact canonical signature has no case policy.
+    /// [`CueKey::new`] is retained byte-identical for v1 replay.
+    pub fn with_case_policy(
+        scope: &str,
+        kind: CueKind,
+        value: &str,
+        case_sensitive: bool,
+    ) -> Result<Self, CueError> {
+        Self::new_with_case(scope, kind, value, !case_sensitive)
+    }
+    fn new_with_case(
+        scope: &str,
+        kind: CueKind,
+        value: &str,
+        fold_case: bool,
+    ) -> Result<Self, CueError> {
         if !valid_text(scope) {
             return Err(CueError::InvalidScope);
         }
@@ -149,7 +205,11 @@ impl CueKey {
             CueKind::ErrorSignature => MatchMode::Signature,
             _ => MatchMode::Exact,
         };
-        let normalized = normalize_value(kind, value);
+        let normalized = if fold_case {
+            normalize_value(kind, value)
+        } else {
+            normalize_value_with_case(kind, value, false)
+        };
         if !valid_text(&normalized) {
             return Err(CueError::InvalidValue);
         }
@@ -190,6 +250,44 @@ impl CueKey {
         }
         Ok(Self { mode, ..key })
     }
+    /// Views this key as an explicit v2 comparison key.
+    ///
+    /// The stored value is already normalized comparison material; scope,
+    /// kind, and mode travel unchanged. Source spelling is never recovered
+    /// from a key — v1 bytes retain no spelling to recover.
+    pub fn comparison_key(&self) -> CueComparisonKey {
+        CueComparisonKey::new(
+            self.scope.clone(),
+            contracts_kind(self.kind),
+            contracts_mode(self.mode),
+            self.value.clone(),
+        )
+    }
+}
+
+/// Maps the facade kind to the owner-neutral v2 vocabulary.
+fn contracts_kind(kind: CueKind) -> eliot_cue_contracts::CueKind {
+    match kind {
+        CueKind::FilePath => eliot_cue_contracts::CueKind::FilePath,
+        CueKind::DirPath => eliot_cue_contracts::CueKind::DirPath,
+        CueKind::Symbol => eliot_cue_contracts::CueKind::Symbol,
+        CueKind::ErrorSignature => eliot_cue_contracts::CueKind::ErrorSignature,
+        CueKind::CommandPattern => eliot_cue_contracts::CueKind::CommandPattern,
+        CueKind::Dependency => eliot_cue_contracts::CueKind::Dependency,
+        CueKind::ApiSurface => eliot_cue_contracts::CueKind::ApiSurface,
+        CueKind::TaskClass => eliot_cue_contracts::CueKind::TaskClass,
+        CueKind::Subsystem => eliot_cue_contracts::CueKind::Subsystem,
+        CueKind::Concept => eliot_cue_contracts::CueKind::Concept,
+    }
+}
+
+/// Maps the facade match mode to the owner-neutral v2 vocabulary.
+fn contracts_mode(mode: MatchMode) -> eliot_cue_contracts::MatchMode {
+    match mode {
+        MatchMode::Exact => eliot_cue_contracts::MatchMode::Exact,
+        MatchMode::Prefix => eliot_cue_contracts::MatchMode::Prefix,
+        MatchMode::Signature => eliot_cue_contracts::MatchMode::Signature,
+    }
 }
 
 /// Temporary facade seam for canonical-preserving normalization (issue #40).
@@ -210,16 +308,41 @@ fn normalize_value(kind: CueKind, value: &str) -> String {
     }
 }
 
+/// Explicit-policy branch of the facade normalization seam.
+///
+/// `fold_case` selects the legacy unconditional lowercase (`true`, retained
+/// for v1 replay) or case-preserving comparison material (`false`).
+/// Separator folding and error-signature canonicalization always apply: an
+/// exact canonical signature has no case policy.
+fn normalize_value_with_case(kind: CueKind, value: &str, fold_case: bool) -> String {
+    let value = value.trim().replace('\\', "/");
+    match kind {
+        CueKind::FilePath | CueKind::DirPath => normalize_path_value_with_case(&value, fold_case),
+        CueKind::Symbol if fold_case => lower(&value.replace("::::", "::").replace(":::", "::")),
+        CueKind::Symbol => value.replace("::::", "::").replace(":::", "::"),
+        CueKind::ErrorSignature => lower(&value.split_whitespace().collect::<Vec<_>>().join(" ")),
+        _ if fold_case => lower(&value.split_whitespace().collect::<Vec<_>>().join(" ")),
+        _ => value.split_whitespace().collect::<Vec<_>>().join(" "),
+    }
+}
+
 /// Path branch of the facade normalization seam: separator folding, `.`
 /// removal and case folding in one deterministic order.
 fn normalize_path_value(value: &str) -> String {
+    normalize_path_value_with_case(value, true)
+}
+
+/// Explicit-policy path branch: separator folding and `.` removal always
+/// apply; case folding follows the admitted source policy.
+fn normalize_path_value_with_case(value: &str, fold_case: bool) -> String {
     let mut out = Vec::new();
     for part in value.split('/') {
         if !part.is_empty() && part != "." {
             out.push(part);
         }
     }
-    lower(&out.join("/"))
+    let joined = out.join("/");
+    if fold_case { lower(&joined) } else { joined }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, JsonSchema)]
@@ -274,6 +397,40 @@ impl CueRecord {
             freshness,
             source_revision,
         })
+    }
+    /// Computes the frozen v2 row identity for this record.
+    ///
+    /// Binds scope, kind, mode, normalized comparison key, target identity,
+    /// and the v2 identity-contract revision through the owner-neutral
+    /// function. The legacy [`CueRecord::row_id`] is retained byte-identical
+    /// for replay.
+    pub fn row_id_v2(&self) -> Result<String, CueError> {
+        let target = eliot_cue_contracts::TargetHandle::new(self.target.as_str())
+            .map_err(|_| CueError::MissingTarget)?;
+        cue_row_id(
+            &self.key.scope,
+            contracts_kind(self.key.kind),
+            contracts_mode(self.key.mode),
+            &self.key.value,
+            &target,
+        )
+        .map_err(|_| CueError::InvalidValue)
+    }
+    /// Replay-only v1 migration for one record.
+    ///
+    /// V1 bytes retain only normalized material: source spelling is
+    /// unrecoverable, so conversion is refused by construction and the legacy
+    /// identity is preserved for replay. Re-observation through the
+    /// normalizer is the only path to a v2 identity. Nothing on this record
+    /// changes; in particular lifecycle, strength, freshness, and the
+    /// negative-memory flag are untouched.
+    pub fn migrate_v1(&self) -> V1RowMigration {
+        V1RowMigration {
+            legacy_row_id: self.row_id.clone(),
+            disposition: ConversionDisposition::V1ReplayPreserved {
+                legacy_row_id: self.row_id.clone(),
+            },
+        }
     }
     pub fn transition(&mut self, next: LifecycleState) -> Result<(), CueError> {
         if self.lifecycle != next
@@ -338,6 +495,30 @@ pub struct ActivationEdge {
     pub weight_milli: u16,
 }
 
+/// Replay-only v1 migration for one projection row.
+///
+/// Carries the preserved legacy identity and its explicit conversion
+/// disposition. Never an admission and never a lifecycle, support,
+/// applicability, accessibility, or influence claim.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct V1RowMigration {
+    pub legacy_row_id: String,
+    pub disposition: ConversionDisposition,
+}
+
+/// Replay-only v1 migration for one snapshot.
+///
+/// Every row keeps its v1 bytes and identity; `ceiling` reports the migration
+/// proof ceiling, which is a candidate artifact — not admission, publication,
+/// or delivery.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct V1SnapshotMigration {
+    pub rows: Vec<V1RowMigration>,
+    pub ceiling: ProofCeiling,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct FiredCue {
@@ -394,6 +575,67 @@ impl CueSnapshot {
             return Err(CueError::StaleSnapshot);
         }
         Ok(())
+    }
+    /// Checks closed-snapshot invariants beyond fence and revision ceiling.
+    ///
+    /// Proves: the frozen denominator reconciles present records/edges
+    /// against expected minus omitted counts; v2 row identities are unique;
+    /// semantic bindings (kind, comparison value, target) are unique; every
+    /// edge cites existing endpoints with unity-bounded weight and bounded
+    /// per-node fanout. An explicitly partial denominator validates here; use
+    /// [`CueProjectionDenominator::is_empty_complete`] to distinguish
+    /// empty-complete from partial.
+    pub fn validate_closed(&self, denominator: &CueProjectionDenominator) -> Result<(), CueError> {
+        self.validate()?;
+        denominator
+            .validate()
+            .map_err(|_| CueError::DenominatorMismatch)?;
+        denominator
+            .validate_against(self.records.len(), self.edges.len())
+            .map_err(|_| CueError::DenominatorMismatch)?;
+        let mut seen_ids = BTreeSet::new();
+        for record in &self.records {
+            if !seen_ids.insert(record.row_id_v2()?) {
+                return Err(CueError::DuplicateRowId);
+            }
+        }
+        let mut seen_semantic = BTreeSet::new();
+        for record in &self.records {
+            let semantic = (
+                record.key.kind,
+                record.key.value.clone(),
+                record.target.clone(),
+            );
+            if !seen_semantic.insert(semantic) {
+                return Err(CueError::DuplicateSemanticBinding);
+            }
+        }
+        let endpoints: BTreeSet<_> = self.records.iter().map(|record| &record.target).collect();
+        let mut fanout: BTreeMap<&ArtifactId, usize> = BTreeMap::new();
+        for edge in &self.edges {
+            if !endpoints.contains(&edge.from) || !endpoints.contains(&edge.to) {
+                return Err(CueError::UnknownEndpoint);
+            }
+            if edge.weight_milli > 1000 {
+                return Err(CueError::InvalidWeight);
+            }
+            let count = fanout.entry(&edge.from).or_insert(0);
+            *count += 1;
+            if *count > MAX_FANOUT {
+                return Err(CueError::ExcessFanout);
+            }
+        }
+        Ok(())
+    }
+    /// Replay-only v1 migration for this snapshot.
+    ///
+    /// Preserves every v1 row identity for replay and reports the migration
+    /// ceiling. The snapshot itself is untouched.
+    pub fn migrate_v1_snapshot(&self) -> V1SnapshotMigration {
+        V1SnapshotMigration {
+            rows: self.records.iter().map(CueRecord::migrate_v1).collect(),
+            ceiling: ProofCeiling::CandidateArtifact,
+        }
     }
     #[allow(clippy::needless_pass_by_value)]
     pub fn invalidate(

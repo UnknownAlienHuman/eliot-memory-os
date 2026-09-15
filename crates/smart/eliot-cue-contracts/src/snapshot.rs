@@ -9,8 +9,9 @@ use serde::{Deserialize, Serialize};
 use std::collections::BTreeSet;
 
 use crate::{
-    CanonicalCueIdentity, CueContractError, Digest, MAX_SNAPSHOT_MEMBERS, NormalizationProfile,
-    SnapshotId, SourceHandle, TargetHandle, bounds,
+    CanonicalCueIdentity, ClosedSnapshotRow, CueContractError, CueProjectionDenominator, Digest,
+    MAX_SNAPSHOT_MEMBERS, MatchMode, NormalizationProfile, SnapshotEdgeWeight, SnapshotId,
+    SourceHandle, TargetHandle, bounds,
 };
 
 #[derive(Serialize)]
@@ -45,6 +46,30 @@ impl SnapshotMember {
     pub fn validate(&self) -> Result<(), CueContractError> {
         self.canonical.validate()?;
         bounds::text(self.target.as_str(), "member.target")
+    }
+
+    /// Computes the frozen v2 row identity for this member under one explicit
+    /// comparison key.
+    ///
+    /// Binds scope (caller-supplied), kind (this member's canonical kind),
+    /// mode and normalized value (caller-supplied key material), target (this
+    /// member's target), and the identity-contract revision
+    /// ([`CONTRACT_REVISION`](crate::CONTRACT_REVISION)) through
+    /// [`cue_row_id`](crate::cue_row_id). Same text in different kinds or
+    /// modes therefore yields distinct identities.
+    pub fn row_id(
+        &self,
+        scope: &str,
+        mode: MatchMode,
+        normalized_value: &str,
+    ) -> Result<String, CueContractError> {
+        crate::cue_row_id(
+            scope,
+            self.canonical.kind,
+            mode,
+            normalized_value,
+            &self.target,
+        )
     }
 }
 
@@ -157,6 +182,39 @@ impl CueSnapshot {
     /// Compatibility name for callers that need the canonical digest input.
     pub fn recompute_digest_input(&self) -> Result<Vec<u8>, CueContractError> {
         self.canonical_payload_bytes()
+    }
+
+    /// Checks closed-snapshot invariants beyond rebuildability.
+    ///
+    /// On top of [`Self::validate`] this proves: the frozen denominator
+    /// reconciles present rows/edges against expected minus omitted counts;
+    /// every member is covered by exactly one closed row; frozen row identities
+    /// are unique (`snapshot.row_id`); semantic bindings — same kind, canonical
+    /// value, and target — are unique (`snapshot.semantic_binding`); every edge
+    /// cites existing member endpoints; and every edge carries exactly one
+    /// policy weight within the milli bound. An explicitly partial denominator
+    /// validates here; use
+    /// [`CueProjectionDenominator::is_empty_complete`] to distinguish
+    /// empty-complete from partial.
+    ///
+    /// # Errors
+    /// Fails closed on denominator mismatch, uncovered or double-covered
+    /// members, duplicate row identities, duplicate semantic bindings, missing
+    /// endpoints, missing or duplicate weights, and overweight edges.
+    pub fn validate_closed(
+        &self,
+        rows: &[ClosedSnapshotRow],
+        denominator: &CueProjectionDenominator,
+        edges: &[crate::RelationEdge],
+        weights: &[SnapshotEdgeWeight],
+    ) -> Result<(), CueContractError> {
+        self.validate()?;
+        denominator.validate()?;
+        denominator.validate_against(self.members.len(), edges.len())?;
+        crate::version::validate_closed_rows(&self.members, rows)?;
+        validate_closed_endpoints(&self.members, edges)?;
+        crate::version::validate_closed_weights(edges, weights)?;
+        Ok(())
     }
 
     /// Checks the intrinsic rules this record owns.
@@ -316,4 +374,19 @@ impl CueSnapshot {
         }
         Ok(())
     }
+}
+
+fn validate_closed_endpoints(
+    members: &[SnapshotMember],
+    edges: &[crate::RelationEdge],
+) -> Result<(), CueContractError> {
+    let endpoints: BTreeSet<_> = members.iter().map(|member| member.target.clone()).collect();
+    for edge in edges {
+        if !endpoints.contains(&edge.from) || !endpoints.contains(&edge.to) {
+            return Err(CueContractError::Foundation {
+                field: "snapshot.edge.endpoint",
+            });
+        }
+    }
+    Ok(())
 }
