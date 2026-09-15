@@ -1,0 +1,74 @@
+schema_version = 4
+module_id = "smart.dreamer.curation-wasm"
+crate = "eliot-dreamer-curation-wasm"
+status = "PROTOTYPE"
+wave = "cognitive-micromodules-wave-01"
+agent_order = 31
+plane = "Smart"
+runtime_layer = "R6"
+delivery_depth = "D3a"
+source_layer = "C1"
+runtime_bundle = "eliot-dreamer"
+state_class = "stateless"
+hot_path = false
+lifecycle_owner = "smart.dreamer.curation-wasm"
+loc_soft_ceiling = 10000
+loc_policy = "review ceiling only; causal cohesion, proof, owner, build/test closure and replacement boundary decide topology"
+product_objective = "The accepted native Curation fan-in is invocable as a thin typed wasm32-wasip2 guest without a second Curation owner."
+causal_property = "thin typed WASM adaptation of the Curation fan-in leaf"
+old_failure_or_missing_capability = "Packaging the fan-in required either a speculative private ABI, duplicate native routing logic, or live handler bindings no owner has published."
+discriminator = "One valid typed guest invocation calls native A-31 exactly once through the static registry; rejected ABI/input calls it zero times; every native field, disposition, digest and bound is preserved with no duplicate algorithm and no invented handler."
+primary_responsibility = "Adapt the exact accepted dreamer-handler/Curation arm to one exhaustive typed call of the native A-31 fan-in over the statically registered ten-owner registry."
+owned_mutable_state = []
+allowed_effects = []
+inputs = ["GuestRequest (typed envelope over the native A-31 batch, screen and policy)", "canonical request bytes at the `handle` boundary", "injected live-port set (typed Rust boundary only; no callable objects cross bytes)"]
+outputs = ["GuestResponse (native candidate set or exhaustive typed error)", "component descriptor and import gate verdicts"]
+depends_on = ["eliot-contracts", "eliot-dreamer-contracts", "eliot-dreamer-curation"]
+providers = ["Governor-admitted bundle via the native owner", "bins/eliot-wasm-host dreamer-handler.wit (read-only)", "rust-toolchain.toml pinned target (read-only)"]
+consumers = ["E-HOST/E-RT local-experimental execution (#758/#760, read-only surfaces)"]
+non_goals = ["typed `dreamer-handler` world definition (owner #756)", "Host/runtime/engine implementation (#758/#760)", "toolchain pinning (#870)", "the ten production handler implementations (#653-#671)", "screening, grounding, A-05 validation, handler semantics, canonical mutation, authority/effect, Finish"]
+invariants = ["exactly one native A-31 call per valid typed invocation, zero per rejected invocation", "no wildcard, Other, Value or whole-payload JSON/bytes bridge", "native semantic digests distinct from component/artifact hashes", "no ambient WASI capability in the pure-world import gate", "no live handler invoked outside A-31 dispatch"]
+failure_behavior = "Reject wrong subtype/shape/version/descriptor before native execution; retain the actual native or component error; never promote to success. Dispatchable envelopes without owner-published live ports return the frozen missing-owner error with zero native calls."
+proof_surface = ["14-case proof matrix (WORK_UNIT_CASE 636/1..14)", "native/component full-field and semantic-digest parity", "built-artifact import inspection", "standalone ModuleTestCapsule through the real E-HOST facade"]
+proof_ceiling = "Module proof only; real provider/consumer Edge proof and Product Pulse remain separate"
+product_pulse = "D3A_CURATION_PULSE_01"
+replacement_boundary = "implementation behind the declared public contract; package ownership creates no runtime or semantic authority"
+merge_rejoin_condition = "merge back when no independent consumer, proof, dependency or replacement seam remains"
+split_trigger = "a second causal responsibility, mutable owner, independent proof surface or independent rollback boundary appears"
+
+[[donor]]
+path = "crates/smart/eliot-dreamer-curation/src/lib.rs"
+disposition = "reuse the native A-31 fan-in behind the guest envelope; no logic copied"
+
+[[donor]]
+path = "bins/eliot-wasm-host/wit/typed/dreamer-handler.wit"
+disposition = "read-only ABI source compiled into the descriptor at build time; not copied by hand"
+
+[[donor]]
+path = "docs/architecture/I14-19-wasm-components.md"
+disposition = "authoritative component boundary; typed dreamer-handler arm still owned by #756"
+
+[[donor]]
+path = "crates/smart/eliot-dreamer-orientation-wasm"
+disposition = "structural precedent only (#632): envelope/descriptor/export/proof shape; no logic copied"
+
+[agent_task]
+objective = "Ship one thin exhaustive native-call adapter with zero ambient capability as a component-ready cdylib."
+write_scope = ["crates/smart/eliot-dreamer-curation-wasm/**"]
+deliverables = ["typed guest envelope and exhaustive conversion", "static ten-owner registry composition with frozen missing-port expectations", "dreamer-handler-bound descriptor and pure-world import gate", "14-case parity/capsule proof suite"]
+acceptance = ["one valid typed invocation calls native A-31 exactly once", "rejected calls never reach native", "all native dispositions, kinds, families, digests and bounds preserved"]
+forbidden = ["canonical writes outside the named Governor transition path", "truth/support/authority/policy/finish/effect promotion", "provider or model SDKs in pure cognitive cores", "vendor or storage types in public contracts", "unbounded synchronous work", "silent truncation", "oracle or verifier weakening in the same work unit", "implicit scope widening", "active-generation self-modification"]
+stop_condition = "Stop and return ContractChallenge if the guest requires a private ABI, duplicate routing logic, invented handler semantics, or any Host/runtime/toolchain/handler-owner edit."
+challenge_path = "return ContractChallenge to the integration owner when owner, discriminator, proof ceiling or dependency boundary is wrong"
+integration_owner = "cognitive-wave-integrator"
+implementation_language = "Rust 2024"
+required_verification = ["standalone fmt/test/clippy", "all 14 Issue #636 cases discovered and passed", "wasm32-wasip2 release build", "workspace admission remains separate under this issue's controller"]
+writeback = "return implementation artifact, exact proof evidence, donor disposition, unresolved ContractChallenges and merge/remove recommendation"
+workspace_admission = "forbidden until implementation, package proof, affected Edge proof, current-main ancestry and integration-owner review"
+
+[acceptance]
+require_deny_unknown_fields = true
+forbid_unsafe = true
+required_exports = ["GuestRequest", "GuestResponse", "GuestError", "CallLedger", "ComponentDescriptor", "StaticPortChallenge", "assemble_ports", "handle_request_typed", "handle", "descriptor", "check_wasm_imports", "static_registry"]
+required_tests = ["proof.rs hosts all 14 WORK_UNIT_CASE 636/1..14 cases"]
+forbidden_patterns = ['serde_json::Value', 'unimplemented!', 'todo!', 'std::process', 'std::fs', 'tokio', 'reqwest', 'surrealdb']
