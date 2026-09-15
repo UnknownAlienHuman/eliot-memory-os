@@ -1,0 +1,70 @@
+schema_version = 4
+module_id = "smart.dreamer.research-wasm"
+crate = "eliot-dreamer-research-wasm"
+status = "PROTOTYPE"
+wave = "cognitive-micromodules-wave-01"
+agent_order = 6
+plane = "Smart"
+runtime_layer = "R6"
+delivery_depth = "D3a"
+source_layer = "C1"
+runtime_bundle = "eliot-dreamer"
+state_class = "stateless"
+hot_path = false
+lifecycle_owner = "smart.dreamer.research-wasm"
+loc_soft_ceiling = 10000
+loc_policy = "review ceiling only; causal cohesion, proof, owner, build/test closure and replacement boundary decide topology"
+product_objective = "The accepted native ResearchSynthesis projector is invocable as a thin typed wasm32-wasip2 guest without a second synthesis owner."
+causal_property = "thin typed WASM adaptation of the ResearchSynthesis leaf"
+old_failure_or_missing_capability = "Native #995 eliot-dreamer-research-synthesis is missing entirely; the guest transcribes the readable #756 dreamer-handler ResearchSynthesis arm and stops at the native boundary with an honest ContractChallenge instead of a speculative ABI or duplicate synthesis logic."
+discriminator = "One valid guest invocation reaches the native #995 boundary exactly once; rejected ABI/input calls it zero times; every pack/claim/citation/rival/unknown/probe/concilium field, disposition, digest and bound is preserved with no duplicate algorithm and no fabricated brief."
+primary_responsibility = "Adapt the exact readable guest.wit `run` export and the dreamer-handler ResearchSynthesis arm to one exhaustive typed invocation attempt of the native ResearchSynthesis projector."
+owned_mutable_state = []
+allowed_effects = []
+inputs = ["GuestRequest (typed envelope over the WIT validated-candidate ResearchSynthesis shape)", "canonical request bytes at the `run` boundary"]
+outputs = ["GuestResponse (honest native-unavailable boundary error or exhaustive typed rejection)", "component descriptor and import gate verdicts"]
+depends_on = ["eliot-contracts"]
+providers = ["Governor-admitted bundle via the native owner #995 (missing; ContractChallenge path)", "bins/eliot-wasm-host guest.wit plus wit/typed/dreamer-handler.wit (read-only)", "rust-toolchain.toml pinned target (read-only)"]
+consumers = ["E-HOST/E-RT local-experimental execution (#758/#760, read-only surfaces)"]
+non_goals = ["typed `dreamer-handler` world definition (owner #756)", "native ResearchPack-to-ResearchBrief projector (owner #995)", "Host/runtime/engine implementation (#758/#760)", "toolchain pinning (#870)", "source acquisition, parsing, grounding, claim synthesis, grade promotion, Human interaction, probe execution, mutable state, authority/effect, Finish"]
+invariants = ["exactly one native-boundary attempt per valid invocation, zero per rejected invocation", "no wildcard, Other, Value or whole-payload JSON/bytes bridge", "native semantic digests distinct from component/artifact hashes", "no ambient WASI capability in the pure-world import gate", "no fabricated brief: the adapter never outputs synthesis of its own"]
+failure_behavior = "Reject wrong subtype/shape/version/descriptor before the native boundary; retain the actual boundary or component error; never promote to success."
+proof_surface = ["13-case proof matrix (WORK_UNIT_CASE 634/1..13)", "transcribed WIT arm parity plus frozen native-absent expectations", "built-artifact import inspection", "standalone ModuleTestCapsule through the real E-HOST facade"]
+proof_ceiling = "Module proof only; real provider/consumer Edge proof and Product Pulse remain separate"
+product_pulse = "D3A_RESEARCH_PULSE_01"
+replacement_boundary = "implementation behind the declared public contract; package ownership creates no runtime or semantic authority"
+merge_rejoin_condition = "merge back when no independent consumer, proof, dependency or replacement seam remains"
+split_trigger = "a second causal responsibility, mutable owner, independent proof surface or independent rollback boundary appears"
+
+[[donor]]
+path = "bins/eliot-wasm-host/wit/guest.wit"
+disposition = "read-only ABI source compiled into the descriptor at build time; not copied by hand"
+
+[[donor]]
+path = "bins/eliot-wasm-host/wit/typed/dreamer-handler.wit"
+disposition = "read-only ResearchSynthesis arm transcribed field-for-field into typed conversion; acceptance still owned by #756"
+
+[[donor]]
+path = "docs/architecture/I14-19-wasm-components.md"
+disposition = "authoritative component boundary; native synthesis still owned by #995"
+
+[agent_task]
+objective = "Ship one thin exhaustive native-boundary adapter with zero ambient capability as a component-ready cdylib."
+write_scope = ["crates/smart/eliot-dreamer-research-wasm/**"]
+deliverables = ["typed guest envelope and exhaustive conversion", "dual-WIT-bound descriptor and pure-world import gate", "13-case parity/capsule proof suite"]
+acceptance = ["one valid invocation reaches the native boundary exactly once", "rejected calls never reach the boundary", "all WIT dispositions, pack/claim/citation fields, digests and bounds preserved"]
+forbidden = ["canonical writes outside the named Governor transition path", "truth/support/authority/policy/finish/effect promotion", "provider or model SDKs in pure cognitive cores", "vendor or storage types in public contracts", "unbounded synchronous work", "silent truncation", "oracle or verifier weakening in the same work unit", "implicit scope widening", "active-generation self-modification"]
+stop_condition = "Stop and return ContractChallenge if the guest requires source acquisition, a private ABI, duplicate synthesis logic, or any Host/runtime/toolchain edit."
+challenge_path = "return ContractChallenge to the integration owner when owner, discriminator, proof ceiling or dependency boundary is wrong"
+integration_owner = "cognitive-wave-integrator"
+implementation_language = "Rust 2024"
+required_verification = ["standalone fmt/test/clippy", "all 13 Issue #634 cases discovered and passed", "wasm32-wasip2 release build", "workspace admission remains separate under this issue's controller"]
+writeback = "return implementation artifact, exact proof evidence, donor disposition, unresolved ContractChallenges and merge/remove recommendation"
+workspace_admission = "forbidden until implementation, package proof, affected Edge proof, current-main ancestry and integration-owner review"
+
+[acceptance]
+require_deny_unknown_fields = true
+forbid_unsafe = true
+required_exports = ["GuestRequest", "GuestResponse", "GuestError", "CallLedger", "ComponentDescriptor", "handle_request_typed", "run", "descriptor", "check_wasm_imports"]
+required_tests = ["proof.rs hosts all 13 WORK_UNIT_CASE 634/1..13 cases"]
+forbidden_patterns = ['serde_json::Value', 'unimplemented!', 'todo!', 'std::process', 'std::fs', 'tokio', 'reqwest', 'surrealdb']
