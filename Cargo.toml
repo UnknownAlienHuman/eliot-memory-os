@@ -138,6 +138,15 @@ members = [
   "crates/smart/eliot-dreamer-episode",
   "crates/smart/eliot-dreamer-concept",
   "crates/smart/eliot-dreamer-procedure",
+  "crates/smart/eliot-cue-normalizer",
+  "crates/smart/eliot-cue-binding",
+  "crates/smart/eliot-cue-index",
+  "crates/smart/eliot-cue-activation",
+  "crates/smart/eliot-context-candidates",
+  "crates/smart/eliot-context-admission",
+  "crates/smart/eliot-context-assembly",
+  "crates/smart/eliot-reactive-context-plan",
+  "crates/smart/eliot-context-measurement",
 ]
 
 # Capability cells declared by `[package.metadata.eliot]` with `agent_order`
@@ -158,17 +167,9 @@ exclude = [
   "crates/smart/eliot-dreamer-clarification",  # agent_order 7
   "crates/smart/eliot-dreamer-architecture-brief",  # agent_order 8
   "crates/smart/eliot-dreamer-implementation-brief",  # agent_order 9
-  "crates/smart/eliot-cue-normalizer",  # agent_order 11
-  "crates/smart/eliot-cue-binding",  # agent_order 12
-  "crates/smart/eliot-cue-index",  # agent_order 13
-  "crates/smart/eliot-cue-activation",  # agent_order 14
   "crates/smart/eliot-dreamer-claim-grounding",  # agent_order 14
-  "crates/smart/eliot-context-candidates",  # agent_order 16
   "crates/smart/eliot-dreamer-rival-model",  # agent_order 16
-  "crates/smart/eliot-context-admission",  # agent_order 17
   "crates/smart/eliot-dreamer-probe-plan",  # agent_order 17
-  "crates/smart/eliot-context-assembly",  # agent_order 18
-  "crates/smart/eliot-reactive-context-plan",  # agent_order 19
   "crates/smart/eliot-dreamer-failure",  # agent_order 26
   "crates/smart/eliot-dreamer-structure-repair",  # agent_order 27
   "crates/smart/eliot-dreamer-reconsolidation",  # agent_order 28
