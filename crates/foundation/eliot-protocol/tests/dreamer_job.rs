@@ -6,9 +6,9 @@ use eliot_contracts::{
     StateFence, TaskId,
 };
 use eliot_protocol::{
-    AdmissionRef, CancellationState, DurableJobRecord, DurableJobRequest, DurableRequestIdentity,
-    JobOperation, JobOperationKind, JobRole, JobState, MutationDisposition, MutationReconciliation,
-    OpaqueContentRef, RequestIdentity,
+    AdmissionRef, CancellationState, DurableJobRecord, DurableJobRequest, DurableJobResponse,
+    DurableRequestIdentity, JobOperation, JobOperationKind, JobRole, JobState, LeaseSelector,
+    MutationDisposition, MutationReconciliation, OpaqueContentRef, RequestIdentity,
 };
 use eliot_receipts::{
     AuthorityBinding, EffectClass, OperationBinding, ProofCeiling, RequestBinding,
@@ -218,6 +218,177 @@ fn semantic_unknown_reconciliation_carries_original_operation() {
     assert!(JobState::UnknownOutcome.is_terminal());
 }
 
+#[test]
+fn submit_lease_status_exchange_validates_response() {
+    let bound_scope = scope();
+    // Submit (Requester) → QUEUED record at revision 1.
+    let submit_operation = JobOperation::Submit {
+        submission: Box::new(submission()),
+    };
+    let submit_request = exchange_request(
+        submit_operation,
+        "operation-t12-submit",
+        "stable-t12-submit",
+        JobRole::Requester,
+    );
+    let mut submit_response = base_response(&submit_request, bound_scope.clone());
+    submit_response.disposition = Some(MutationDisposition::Committed);
+    submit_response.receipt_id = Some(ReceiptId::new("submit-receipt").expect("receipt"));
+    round_trip(&submit_response)
+        .validate_for(&submit_request)
+        .expect("submit response");
+
+    // LeaseExact (Worker) → LEASED at the selected revision.
+    let lease_operation = JobOperation::LeaseExact {
+        selector: LeaseSelector {
+            scope_id: bound_scope.scope_id.clone(),
+            expected_revision: 1,
+            expected_fence: fence(),
+            worker_artifact_id: ArtifactId::new("worker").expect("worker"),
+            max_candidates: 8,
+        },
+        job_id: TaskId::new("job").expect("job"),
+    };
+    let lease_request = exchange_request(
+        lease_operation,
+        "operation-t12-lease",
+        "stable-t12-lease",
+        JobRole::Worker,
+    );
+    let mut lease_response = base_response(&lease_request, bound_scope.clone());
+    lease_response.state = JobState::Leased;
+    lease_response.disposition = Some(MutationDisposition::Committed);
+    lease_response.receipt_id = Some(ReceiptId::new("lease-receipt").expect("receipt"));
+    lease_response.lease = Some(lease());
+    round_trip(&lease_response)
+        .validate_for(&lease_request)
+        .expect("lease response");
+
+    // Status (Requester) → pure observation, no mutation disposition.
+    let status_operation = JobOperation::Status {
+        job_id: TaskId::new("job").expect("job"),
+        attempt_id: ArtifactId::new("attempt").expect("attempt"),
+        expected_revision: 1,
+        expected_fence: fence(),
+    };
+    let status_request = exchange_request(
+        status_operation,
+        "operation-t12-status",
+        "stable-t12-status",
+        JobRole::Requester,
+    );
+    let mut status_response = base_response(&status_request, bound_scope);
+    status_response.state = JobState::Leased;
+    status_response.lease = Some(lease());
+    round_trip(&status_response)
+        .validate_for(&status_request)
+        .expect("status response");
+}
+
+#[test]
+fn response_with_same_identity_but_changed_content_fails() {
+    let (request, matching) = status_exchange();
+    matching
+        .validate_for(&request)
+        .expect("matching response validates");
+    let mut changed_revision = matching.clone();
+    changed_revision.revision = 2;
+    assert!(changed_revision.validate_for(&request).is_err());
+    let mut changed_job = matching;
+    changed_job.job_id = TaskId::new("other-job").expect("job");
+    assert!(changed_job.validate_for(&request).is_err());
+}
+
+#[test]
+fn exact_response_replay_validates() {
+    let (request, response) = status_exchange();
+    response
+        .validate_for(&request)
+        .expect("first validation passes");
+    let wire = serde_json::to_string(&response).expect("encode");
+    let replayed: DurableJobResponse = serde_json::from_str(&wire).expect("decode");
+    assert_eq!(replayed, response);
+    replayed
+        .validate_for(&request)
+        .expect("exact replay validates");
+
+    // A fresh transport retry carries new correlation, so the old response
+    // does not apply to it even though the stable commitment is unchanged.
+    let mut retry_identity = request.request_identity.clone();
+    retry_identity.request.request.metadata.request_id =
+        RequestId::new("fresh-retry").expect("request");
+    let retry = DurableJobRequest {
+        request_identity: retry_identity,
+        role: JobRole::Requester,
+        operation: request.operation.clone(),
+    };
+    retry.validate().expect("retry keeps commitment");
+    assert!(response.validate_for(&retry).is_err());
+}
+
+fn status_exchange() -> (DurableJobRequest, DurableJobResponse) {
+    let operation = JobOperation::Status {
+        job_id: TaskId::new("job").expect("job"),
+        attempt_id: ArtifactId::new("attempt").expect("attempt"),
+        expected_revision: 1,
+        expected_fence: fence(),
+    };
+    let request = exchange_request(
+        operation,
+        "operation-t12-replay",
+        "stable-t12-replay",
+        JobRole::Requester,
+    );
+    let mut response = base_response(&request, scope());
+    response.state = JobState::Leased;
+    response.lease = Some(lease());
+    (request, round_trip(&response))
+}
+
+fn exchange_request(
+    operation: JobOperation,
+    operation_id: &str,
+    idempotency: &str,
+    role: JobRole,
+) -> DurableJobRequest {
+    let request = DurableJobRequest {
+        request_identity: identity_as(&operation, operation_id, idempotency, role),
+        role,
+        operation,
+    };
+    request.validate().expect("exchange request");
+    round_trip(&request)
+}
+
+fn base_response(
+    request: &DurableJobRequest,
+    bound_scope: WorkScopeBinding,
+) -> DurableJobResponse {
+    DurableJobResponse {
+        request_identity: request.request_identity.clone(),
+        job_id: TaskId::new("job").expect("job"),
+        attempt_id: ArtifactId::new("attempt").expect("attempt"),
+        scope: bound_scope,
+        revision: 1,
+        state: JobState::Queued,
+        disposition: None,
+        receipt_id: None,
+        lease: None,
+        checkpoint: None,
+        result_under_verification: None,
+        outcome: None,
+        selection_coverage: Vec::new(),
+        selection_frontier: None,
+    }
+}
+
+fn round_trip<T>(value: &T) -> T
+where
+    T: serde::Serialize + serde::de::DeserializeOwned,
+{
+    serde_json::from_str(&serde_json::to_string(value).expect("encode")).expect("decode")
+}
+
 fn submission() -> eliot_protocol::JobSubmission {
     let scope = scope();
     eliot_protocol::JobSubmission {
@@ -255,6 +426,15 @@ fn identity(
     operation_id: &str,
     idempotency: &str,
 ) -> DurableRequestIdentity {
+    identity_as(operation, operation_id, idempotency, JobRole::Requester)
+}
+
+fn identity_as(
+    operation: &JobOperation,
+    operation_id: &str,
+    idempotency: &str,
+    role: JobRole,
+) -> DurableRequestIdentity {
     let fence = fence();
     let request_id = RequestId::new("fresh-request").expect("request");
     let request = RequestBinding {
@@ -284,9 +464,8 @@ fn identity(
         deadline_unix_ms: 100,
         cancellation_id: "cancel".to_owned(),
     };
-    let hash =
-        DurableRequestIdentity::digest_for(&binding, &request, operation, JobRole::Requester)
-            .expect("digest");
+    let hash = DurableRequestIdentity::digest_for(&binding, &request, operation, role)
+        .expect("digest");
     DurableRequestIdentity {
         request,
         operation: binding,
