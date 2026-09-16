@@ -135,6 +135,9 @@ pub enum LocalReadSubmitOutcome {
 pub fn parse_local_read_claimed_pair(
     value: &serde_json::Value,
 ) -> Result<Option<(HostRequestEnvelope, serde_json::Value)>, String> {
+    // #740: receipt span. Records pair presence/absence by identity; the
+    // tool payload value never enters the sink.
+    let _span = tracing::info_span!("eliotd.request_receipt").entered();
     let pair = value
         .get("pair")
         .ok_or_else(|| "Kernel local_read_claim answer omits the pair".to_owned())?;
@@ -173,6 +176,9 @@ pub fn parse_local_read_claimed_pair(
 pub fn parse_local_read_submit_outcome(
     value: &serde_json::Value,
 ) -> Result<LocalReadSubmitOutcome, String> {
+    // #740: submit-outcome span. Accepted/expired stay distinct; anything
+    // else is a contract violation, never a silent accept.
+    let _span = tracing::info_span!("eliotd.local_read_submit").entered();
     let accepted = value
         .get("accepted")
         .and_then(serde_json::Value::as_bool)
@@ -279,6 +285,9 @@ impl DaemonKernelClient {
     }
 
     pub fn connect(config: &super::DaemonConfig) -> Result<Arc<Self>, super::DaemonError> {
+        // #740: handshake span. Transport connect/session validation is not
+        // semantic readiness; readiness is reported separately.
+        let _span = tracing::info_span!("eliotd.kernel_handshake").entered();
         let client = Self {
             launch: config.launch.clone(),
             connection_id: format!(
@@ -347,6 +356,8 @@ impl DaemonKernelClient {
     }
 
     pub fn report_ready(&self) -> Result<(), super::DaemonError> {
+        // #740: readiness span, distinct from the handshake span above.
+        let _span = tracing::info_span!("eliotd.daemon_readiness").entered();
         #[cfg(windows)]
         {
             let runtime = tokio::runtime::Builder::new_current_thread()
@@ -368,6 +379,8 @@ impl DaemonKernelClient {
 
     pub fn report_degraded(&self, reason: impl Into<String>) -> Result<(), super::DaemonError> {
         let reason = reason.into();
+        // #740: owning error record at the degraded-report boundary.
+        let _span = tracing::info_span!("eliotd.kernel_degraded").entered();
         if reason.trim().is_empty() || reason.chars().any(char::is_control) || reason.len() > 512 {
             return Err(super::DaemonError::Kernel(
                 "daemon degradation reason is blank, unbounded, or contains control characters"
@@ -401,6 +414,8 @@ impl DaemonKernelClient {
 
     pub fn report_fatal(&self, reason: impl Into<String>) -> Result<(), super::DaemonError> {
         let reason = reason.into();
+        // #740: owning error record at the fatal-report boundary.
+        let _span = tracing::info_span!("eliotd.kernel_fatal").entered();
         if reason.trim().is_empty() || reason.chars().any(char::is_control) || reason.len() > 512 {
             return Err(super::DaemonError::Kernel(
                 "daemon fatal reason is blank, unbounded, or contains control characters"
