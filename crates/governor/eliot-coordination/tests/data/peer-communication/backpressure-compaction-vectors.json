@@ -1,0 +1,7 @@
+{
+  "scope": "tenant-pressure",
+  "policy_id": "policy-compact-pressure-1",
+  "lineage_receipt": "lineage-pressure-1",
+  "retain_dissent": true,
+  "retain_required_evidence": true
+}

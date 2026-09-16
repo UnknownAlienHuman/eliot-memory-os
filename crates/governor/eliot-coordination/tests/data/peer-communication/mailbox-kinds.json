@@ -1,0 +1,10 @@
+{
+  "message_kinds": ["note", "evidence", "question", "answer", "objection", "review_item", "review_batch", "checkpoint", "conflict_notice", "result", "verifier_result", "cancel_supersede", "attention_escalation", "live_peer_delta", "retraction", "supersession"],
+  "message_kind_count": 16,
+  "board_kinds": ["finding_candidate", "evidence_handle", "unknown", "hypothesis_candidate", "conflict_notice", "decision_request", "verifier_result", "artifact_handle", "blocker"],
+  "board_kind_count": 9,
+  "conflict_types": ["epistemic", "state", "plan", "authority", "artifact", "instruction", "resource", "architecture"],
+  "conflict_type_count": 8,
+  "delta_kinds": ["relevant_finding", "assumption_invalidated", "dependency_discovered", "plan_contradiction", "obstacle", "abandoned_dead_end"],
+  "delta_kind_count": 6
+}
