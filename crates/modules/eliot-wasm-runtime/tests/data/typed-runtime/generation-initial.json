@@ -1,0 +1,12 @@
+{
+  "artifact_digest": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+  "artifact_len": 4096,
+  "abi_digest": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+  "component_version": "0.2.0",
+  "generation": 1,
+  "kit_digest": "0000000000000000000000000000000000000000000000000000000000000000",
+  "module_id": "component-1",
+  "predecessor": null,
+  "scope": "scope-1",
+  "world": "eliot:test/world"
+}
