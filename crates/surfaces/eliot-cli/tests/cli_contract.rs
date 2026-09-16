@@ -535,3 +535,11 @@ fn antigravity_terminal_projection_fails_closed_on_identity_or_disposition_drift
         Err(eliot_cli::antigravity_terminal::TerminalProjectionError::ZeroSequence)
     ));
 }
+
+#[test]
+fn severed_plan_gap_literal_stays_wire_stable() {
+    assert_eq!(eliot_cli::CONTROLBOARD_PLAN_GAP, "PLAN_GAP");
+    assert!(must(CommandCatalogue::current().help_text()).contains("[PLAN_GAP]"));
+    let schema = must(CommandCatalogue::current().schema_json());
+    assert!(schema.contains("\"code\":\"PLAN_GAP\""));
+}
