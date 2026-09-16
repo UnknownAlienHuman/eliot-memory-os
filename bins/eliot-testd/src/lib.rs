@@ -303,10 +303,6 @@ pub struct TestdJobRequest {
     pub priority: i32,
 }
 
-/// Compatibility spelling for older protocol clients; it no longer contains
-/// a private serialized process-request duplicate.
-pub type TestRequest = TestdJobRequest;
-
 /// A candidate receipt returned by testd after durable admission/observation.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -323,9 +319,6 @@ pub struct TestReceipt {
     pub cache_root: String,
     pub state: String,
 }
-
-/// Compatibility export for callers migrating to the neutral core seam.
-pub use eliot_testd_core::KernelProcessAdmissionProvider as ProcessRequestIssuer;
 
 /// Explicit failure issuer used by the standalone line protocol until Kernel
 /// binds a live authority.  It prevents testd from minting local permits.
