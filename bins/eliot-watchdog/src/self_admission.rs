@@ -160,6 +160,10 @@ where
 /// Returns a fail-closed error when the current process identity cannot be
 /// observed, the SCM registration is absent/mismatched/stopped, or the
 /// injected deadline expires before an exact `Starting`/`Running` match.
+#[allow(
+    clippy::too_many_lines,
+    reason = "each fail-closed outcome carries one observation-only timing record without changing the deadline decision"
+)]
 pub fn admit_watchdog_self_start_with_deadline<P, S>(
     probe: &mut P,
     status: &mut S,
@@ -170,9 +174,17 @@ where
     S: WatchdogSelfAdmissionStatus,
 {
     let _deadline_span = tracing::debug_span!("watchdog.self_admission_deadline").entered();
-    let expected = probe
-        .current_process_identity()
-        .ok_or(WatchdogSelfAdmissionError::CurrentProcessUnavailable)?;
+    crate::diagnostics::observe_self_admission_timing("requested", 0, deadline_ms);
+    let expected = probe.current_process_identity().ok_or_else(|| {
+        crate::diagnostics::observe_self_admission_timing(
+            crate::diagnostics::self_admission_error_diagnostic(
+                WatchdogSelfAdmissionError::CurrentProcessUnavailable,
+            ),
+            0,
+            deadline_ms,
+        );
+        WatchdogSelfAdmissionError::CurrentProcessUnavailable
+    })?;
     let started_at = probe.now_ms();
     let deadline = started_at.saturating_add(deadline_ms);
     let mut checkpoint = 1u32;
@@ -180,6 +192,13 @@ where
     loop {
         let now = probe.now_ms();
         if now >= deadline {
+            crate::diagnostics::observe_self_admission_timing(
+                crate::diagnostics::self_admission_error_diagnostic(
+                    WatchdogSelfAdmissionError::Timeout,
+                ),
+                now.saturating_sub(started_at),
+                deadline_ms,
+            );
             return Err(WatchdogSelfAdmissionError::Timeout);
         }
         let observation = probe.inspect();
@@ -189,9 +208,22 @@ where
                 process: Some(ref actual),
                 ..
             } if same_process_identity(actual, &expected) => {
-                if probe.now_ms() >= deadline {
+                let admitted_at = probe.now_ms();
+                if admitted_at >= deadline {
+                    crate::diagnostics::observe_self_admission_timing(
+                        crate::diagnostics::self_admission_error_diagnostic(
+                            WatchdogSelfAdmissionError::Timeout,
+                        ),
+                        admitted_at.saturating_sub(started_at),
+                        deadline_ms,
+                    );
                     return Err(WatchdogSelfAdmissionError::Timeout);
                 }
+                crate::diagnostics::observe_self_admission_timing(
+                    "admitted",
+                    admitted_at.saturating_sub(started_at),
+                    deadline_ms,
+                );
                 return Ok(actual.clone());
             }
             WatchdogRuntimeReadback::Matching {
@@ -200,21 +232,53 @@ where
                 ..
             }
             | WatchdogRuntimeReadback::Mismatched => {
+                crate::diagnostics::observe_self_admission_timing(
+                    crate::diagnostics::self_admission_error_diagnostic(
+                        WatchdogSelfAdmissionError::RegistrationMismatched,
+                    ),
+                    now.saturating_sub(started_at),
+                    deadline_ms,
+                );
                 return Err(WatchdogSelfAdmissionError::RegistrationMismatched);
             }
             WatchdogRuntimeReadback::Matching {
                 state: WatchdogRuntimeState::Stopped,
                 ..
-            } => return Err(WatchdogSelfAdmissionError::ServiceStopped),
+            } => {
+                crate::diagnostics::observe_self_admission_timing(
+                    crate::diagnostics::self_admission_error_diagnostic(
+                        WatchdogSelfAdmissionError::ServiceStopped,
+                    ),
+                    now.saturating_sub(started_at),
+                    deadline_ms,
+                );
+                return Err(WatchdogSelfAdmissionError::ServiceStopped);
+            }
             WatchdogRuntimeReadback::Matching {
                 state: WatchdogRuntimeState::Stopping,
                 ..
-            } => return Err(WatchdogSelfAdmissionError::ServiceStopping),
+            } => {
+                crate::diagnostics::observe_self_admission_timing(
+                    crate::diagnostics::self_admission_error_diagnostic(
+                        WatchdogSelfAdmissionError::ServiceStopping,
+                    ),
+                    now.saturating_sub(started_at),
+                    deadline_ms,
+                );
+                return Err(WatchdogSelfAdmissionError::ServiceStopping);
+            }
             WatchdogRuntimeReadback::Matching {
                 state: WatchdogRuntimeState::Absent,
                 ..
-            } => return Err(WatchdogSelfAdmissionError::RegistrationAbsent),
-            WatchdogRuntimeReadback::Absent => {
+            }
+            | WatchdogRuntimeReadback::Absent => {
+                crate::diagnostics::observe_self_admission_timing(
+                    crate::diagnostics::self_admission_error_diagnostic(
+                        WatchdogSelfAdmissionError::RegistrationAbsent,
+                    ),
+                    now.saturating_sub(started_at),
+                    deadline_ms,
+                );
                 return Err(WatchdogSelfAdmissionError::RegistrationAbsent);
             }
             WatchdogRuntimeReadback::Matching {
@@ -234,6 +298,13 @@ where
         let wait_hint_ms = bounded_wait_hint_ms(wait_hint_ms);
         let remaining_ms = deadline.saturating_sub(probe.now_ms());
         if remaining_ms == 0 {
+            crate::diagnostics::observe_self_admission_timing(
+                crate::diagnostics::self_admission_error_diagnostic(
+                    WatchdogSelfAdmissionError::Timeout,
+                ),
+                deadline_ms,
+                deadline_ms,
+            );
             return Err(WatchdogSelfAdmissionError::Timeout);
         }
         let status_wait_hint_ms = wait_hint_ms.min(u32::try_from(remaining_ms).unwrap_or(u32::MAX));

@@ -329,30 +329,76 @@ pub fn validate_watchdog_scm_bootstrap(
         observation = "attempted",
         "validating SCM bootstrap against installer approval"
     );
+    crate::diagnostics::observe_service_registration(
+        crate::diagnostics::ServiceRegistrationObservation::Requested,
+        "scm bootstrap validation requested",
+    );
     let (_, _, registration) =
-        read_approved_service_registration(bootstrap, InstallerServiceRole::Watchdog)
-            .map_err(WatchdogScmLaunchError::from)?;
-    let executable = std::env::current_exe().map_err(WatchdogScmLaunchError::Executable)?;
+        read_approved_service_registration(bootstrap, InstallerServiceRole::Watchdog).map_err(
+            |error| {
+                crate::diagnostics::observe_service_registration(
+                    crate::diagnostics::ServiceRegistrationObservation::Unknown,
+                    "scm approval readback unknown",
+                );
+                WatchdogScmLaunchError::from(error)
+            },
+        )?;
+    let executable = std::env::current_exe().map_err(|error| {
+        crate::diagnostics::observe_service_registration(
+            crate::diagnostics::ServiceRegistrationObservation::Unknown,
+            "current executable unavailable",
+        );
+        WatchdogScmLaunchError::Executable(error)
+    })?;
     if registration.service_name() != SERVICE_NAME
         || registration.bootstrap() != Some(bootstrap)
         || !windows_paths_equal(registration.binary_path(), &executable)
     {
+        crate::diagnostics::observe_service_registration(
+            crate::diagnostics::ServiceRegistrationObservation::Mismatched,
+            "scm bootstrap mismatched",
+        );
         return Err(WatchdogScmLaunchError::ApprovalMismatch);
     }
     let root = executable.parent().ok_or_else(|| {
+        crate::diagnostics::observe_service_registration(
+            crate::diagnostics::ServiceRegistrationObservation::Unknown,
+            "executable parent unknown",
+        );
         WatchdogScmLaunchError::InvalidArgv("current executable has no parent".to_owned())
     })?;
-    let platform = WindowsPlatform::new(root.to_path_buf())
-        .map_err(|error| WatchdogScmLaunchError::PlatformRoot(error.to_string()))?;
+    let platform = WindowsPlatform::new(root.to_path_buf()).map_err(|error| {
+        crate::diagnostics::observe_service_registration(
+            crate::diagnostics::ServiceRegistrationObservation::Unknown,
+            "platform root unknown",
+        );
+        WatchdogScmLaunchError::PlatformRoot(error.to_string())
+    })?;
     let inspection = project_service_runtime_inspection(
         platform.inspect_service_registration_runtime(&registration),
     );
-    if matches!(
-        inspection,
-        WatchdogRuntimeReadback::Absent | WatchdogRuntimeReadback::Mismatched
-    ) {
+    // SCM acknowledgement is never readiness evidence: the readback is
+    // recorded verbatim (`starting`/`unknown` stay non-ready) and only
+    // `Absent`/`Mismatched` fail closed here. No new readiness is invented.
+    crate::diagnostics::observe_scm_inspection(&inspection, "scm launch inspection read");
+    if matches!(inspection, WatchdogRuntimeReadback::Absent) {
+        crate::diagnostics::observe_service_registration(
+            crate::diagnostics::ServiceRegistrationObservation::Absent,
+            "scm registration absent",
+        );
         return Err(WatchdogScmLaunchError::Registration(inspection));
     }
+    if matches!(inspection, WatchdogRuntimeReadback::Mismatched) {
+        crate::diagnostics::observe_service_registration(
+            crate::diagnostics::ServiceRegistrationObservation::Mismatched,
+            "scm registration mismatched",
+        );
+        return Err(WatchdogScmLaunchError::Registration(inspection));
+    }
+    crate::diagnostics::observe_service_registration(
+        crate::diagnostics::ServiceRegistrationObservation::Observed,
+        "scm bootstrap observed",
+    );
     Ok(ValidatedWatchdogScmLaunch {
         bootstrap: bootstrap.clone(),
         registration,

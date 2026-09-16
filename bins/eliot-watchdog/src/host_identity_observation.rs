@@ -163,6 +163,7 @@ impl HostIdentityMonitor {
                 observation = "unknown",
                 "host image lease unavailable; observation stays unknown"
             );
+            crate::diagnostics::observe_host_observation(HostObservationState::Unknown, false);
             return HostObservation {
                 state: HostObservationState::Unknown,
                 identity: None,
@@ -186,6 +187,7 @@ impl HostIdentityMonitor {
             observation = "unknown",
             "no registration readback required; observation stays unknown"
         );
+        crate::diagnostics::observe_host_observation(HostObservationState::Unknown, false);
         HostObservation {
             state: HostObservationState::Unknown,
             identity: None,
@@ -197,7 +199,14 @@ impl HostIdentityMonitor {
         &mut self,
         runtime: WatchdogRuntimeReadback,
     ) -> HostObservation {
-        match runtime {
+        // SCM acknowledgement is never readiness evidence: only an exact
+        // `Running` match with a handle-bound process identity reaches the
+        // identity comparison. Every other `Matching` state stays without
+        // identity (`Unknown` for Starting/Running-without-process, terminal
+        // absence only for Stopped/Absent). `Mismatched`/`Unknown` stay
+        // `Unknown` verbatim. Identity values (PID/start/image) are preserved
+        // as distinctions via `observe_process_identity`, never logged.
+        let observation = match runtime {
             WatchdogRuntimeReadback::Matching {
                 state: WatchdogRuntimeState::Running,
                 process: Some(process),
@@ -217,7 +226,12 @@ impl HostIdentityMonitor {
                     identity: None,
                 }
             }
-        }
+        };
+        crate::diagnostics::observe_host_observation(
+            observation.state,
+            observation.identity.is_some(),
+        );
+        observation
     }
 
     /// Applies one sealed platform identity. This small seam keeps PID-reuse
