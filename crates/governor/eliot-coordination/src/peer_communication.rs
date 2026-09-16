@@ -36,9 +36,9 @@ pub const MAX_PEER_REFERENCES: usize = 16;
 /// Largest admitted live (non-terminal) queue depth per stream.
 pub const MAX_PEER_STREAM_DEPTH: usize = 256;
 /// Largest admitted live (non-terminal) outbound backlog per sender.
-pub const MAX_PEER_OUTSTANDING_PER_SENDER: usize = 64;
+pub const MAX_PEER_OUTSTANDING_PER_SENDER: usize = 512;
 /// Largest admitted live (non-terminal) inbound backlog per recipient.
-pub const MAX_PEER_OUTSTANDING_PER_RECIPIENT: usize = 64;
+pub const MAX_PEER_OUTSTANDING_PER_RECIPIENT: usize = 512;
 /// Largest admitted board head count per scope.
 pub const MAX_BOARD_ENTRIES_PER_SCOPE: usize = 128;
 /// Largest admitted revision chain per board entry.
@@ -479,7 +479,7 @@ impl AnchorResolution {
     }
 }
 
-/// Privacy classes bound to every peer record (I5.16 privacy_class).
+/// Privacy classes bound to every peer record (I5.16 `privacy_class`).
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum PrivacyClass {
@@ -676,10 +676,7 @@ impl PeerStreamId {
     /// Stable key used in diagnostics and backpressure reports.
     #[must_use]
     pub fn key(&self) -> String {
-        format!(
-            "{}:{}",
-            self.recipient_session_id, self.work_item_id
-        )
+        format!("{}:{}", self.recipient_session_id, self.work_item_id)
     }
 }
 
@@ -719,14 +716,33 @@ pub struct PeerCursor {
 #[serde(deny_unknown_fields)]
 pub enum PeerMessageState {
     Staged,
-    DeliveryAttempted { attempts: u32 },
-    Delivered { endpoint: String },
-    Acknowledged { revision: u64, by_session: String },
-    Consumed { evidence_handle: String, by_session: String },
-    Expired { at: u64 },
-    Cancelled { by_session: String, at: u64 },
-    Unavailable { reason: String },
-    Unknown { reason: String },
+    DeliveryAttempted {
+        attempts: u32,
+    },
+    Delivered {
+        endpoint: String,
+    },
+    Acknowledged {
+        revision: u64,
+        by_session: String,
+    },
+    Consumed {
+        evidence_handle: String,
+        by_session: String,
+    },
+    Expired {
+        at: u64,
+    },
+    Cancelled {
+        by_session: String,
+        at: u64,
+    },
+    Unavailable {
+        reason: String,
+    },
+    Unknown {
+        reason: String,
+    },
 }
 
 impl PeerMessageState {
@@ -819,12 +835,12 @@ impl PeerMessage {
     /// Whether this message still occupies live queue depth.
     #[must_use]
     pub const fn occupies_depth(&self) -> bool {
-        match self.state {
+        matches!(
+            self.state,
             PeerMessageState::Staged
-            | PeerMessageState::DeliveryAttempted { .. }
-            | PeerMessageState::Unknown { .. } => true,
-            _ => false,
-        }
+                | PeerMessageState::DeliveryAttempted { .. }
+                | PeerMessageState::Unknown { .. }
+        )
     }
 
     /// Redacted diagnostic view: inline text survives only for open
@@ -988,6 +1004,24 @@ fn empty_clock() -> ClockReading {
     }
 }
 
+/// Records the attested durability ceiling without ever claiming
+/// persistence the backing port did not attest.
+fn attest_peer_durability(
+    durability: &dyn PeerDurabilityPort,
+) -> Result<PeerDurability, CoordinationError> {
+    match durability.attest() {
+        PeerDurabilityAttestation::Durable { owner_receipt } => {
+            peer_text(&owner_receipt, "owner_receipt")?;
+            Ok(PeerDurability::Durable { owner_receipt })
+        }
+        PeerDurabilityAttestation::VolatileMemoryOnly => Ok(PeerDurability::Volatile),
+        PeerDurabilityAttestation::Unavailable { reason } => {
+            peer_text(&reason, "durability_reason")?;
+            Ok(PeerDurability::Unavailable { reason })
+        }
+    }
+}
+
 fn peer_text(value: &str, field: &'static str) -> Result<(), CoordinationError> {
     if value.trim().is_empty() || value.chars().any(char::is_control) {
         return Err(CoordinationError::InvalidField(field));
@@ -996,11 +1030,15 @@ fn peer_text(value: &str, field: &'static str) -> Result<(), CoordinationError> 
 }
 
 fn peer_epoch_is_stale(requested: &EpochId, known: &EpochId) -> bool {
+    // `relation_to` reports `known` relative to `requested`: a known direct
+    // child (or newer same-lineage epoch) means the request rides a stale
+    // term; an unrelated lineage is never current.
     match requested.relation_to(known) {
-        EpochRelation::Same => false,
-        EpochRelation::DirectChild | EpochRelation::SameLineageNewer => false,
-        EpochRelation::DirectParent
-        | EpochRelation::SameLineageOlder
+        EpochRelation::Same | EpochRelation::DirectParent | EpochRelation::SameLineageOlder => {
+            false
+        }
+        EpochRelation::DirectChild
+        | EpochRelation::SameLineageNewer
         | EpochRelation::UnrelatedLineage => true,
     }
 }
@@ -1009,25 +1047,46 @@ impl CoordinationOwner {
     fn peer_sender(
         &self,
         session_id: &str,
-        epoch: EpochId,
+        epoch: &EpochId,
         fence: &StateFence,
+        now: u64,
     ) -> Result<(), CoordinationError> {
-        let known = self.sessions.get(session_id).ok_or_else(|| {
-            CoordinationError::NotFound {
+        let known = self
+            .sessions
+            .get(session_id)
+            .ok_or_else(|| CoordinationError::NotFound {
                 kind: "session",
                 id: session_id.to_owned(),
-            }
-        })?;
-        if peer_epoch_is_stale(&epoch, &known.authority_epoch) {
+            })?;
+        if peer_epoch_is_stale(epoch, &known.authority_epoch) {
             return Err(CoordinationError::EpochMismatch);
         }
-        if !known.authority_epoch.is_same_authority(&epoch)
+        if !known.authority_epoch.is_same_authority(epoch)
             || !known.state_fence.is_compatible_with(fence)
             || known.state != super::SessionState::Active
         {
             return Err(CoordinationError::FenceMismatch);
         }
+        if known.heartbeat_deadline == 0 || known.last_heartbeat > known.heartbeat_deadline {
+            return Err(CoordinationError::InvalidField("heartbeat_deadline"));
+        }
+        if known.last_heartbeat > now {
+            return Err(CoordinationError::InvalidField("last_heartbeat"));
+        }
+        if now > known.heartbeat_deadline {
+            return Err(CoordinationError::SessionExpired);
+        }
         Ok(())
+    }
+
+    fn peer_recipient_live(&self, session_id: &str, now: u64) -> bool {
+        self.sessions.get(session_id).is_some_and(|known| {
+            known.state == super::SessionState::Active
+                && known.heartbeat_deadline != 0
+                && known.last_heartbeat <= known.heartbeat_deadline
+                && known.last_heartbeat <= now
+                && now <= known.heartbeat_deadline
+        })
     }
 
     fn peer_message_exact_replay(
@@ -1113,18 +1172,10 @@ impl CoordinationOwner {
             .count()
     }
 
-    fn peer_expire_if_due(
-        &mut self,
-        message_id: &str,
-        now: u64,
-    ) -> Result<(), CoordinationError> {
-        let due = self
-            .peer_messages
-            .get(message_id)
-            .is_some_and(|message| {
-                message.state.is_live()
-                    && message.expires_at.is_some_and(|expiry| now >= expiry)
-            });
+    fn peer_expire_if_due(&mut self, message_id: &str, now: u64) -> Result<(), CoordinationError> {
+        let due = self.peer_messages.get(message_id).is_some_and(|message| {
+            message.state.is_live() && message.expires_at.is_some_and(|expiry| now >= expiry)
+        });
         if due {
             if let Some(message) = self.peer_messages.get_mut(message_id) {
                 message.state = PeerMessageState::Expired { at: now };
@@ -1156,19 +1207,14 @@ impl CoordinationOwner {
         Ok(())
     }
 
-    /// Admits one peer mailbox message through the existing owner.
-    ///
-    /// Admission validates identity, role, audience, size, privacy and
-    /// expiry, records through the existing causal event log, and stores the
-    /// attested durability ceiling without ever claiming persistence the
-    /// backing port did not attest. Exact replays return the single semantic
-    /// entry; changed payload/audience/scope/revision/expiry conflict.
-    pub fn enqueue_peer_message(
-        &mut self,
-        draft: EnqueuePeerMessage,
-        clock: &dyn PeerClockPort,
-        durability: &dyn PeerDurabilityPort,
-    ) -> Result<PeerEnqueueReceipt, CoordinationError> {
+    /// Validates one mailbox draft against identity, role, audience, size,
+    /// privacy and expiry. Returns whether the recipient is currently live;
+    /// a lapsed recipient still records, marked unavailable.
+    fn validate_enqueue_draft(
+        &self,
+        draft: &EnqueuePeerMessage,
+        now: u64,
+    ) -> Result<bool, CoordinationError> {
         peer_text(&draft.request_id, "request_id")?;
         peer_text(&draft.message_id, "message_id")?;
         peer_text(&draft.sender_session_id, "sender_session_id")?;
@@ -1178,27 +1224,23 @@ impl CoordinationOwner {
         peer_text(&draft.payload_digest, "payload_digest")?;
         if draft.asserted.is_some() {
             return Err(CoordinationError::PeerAuthorityRejected(
-                draft.message_id,
+                draft.message_id.clone(),
             ));
         }
-        self.common(
-            draft.authority_epoch.clone(),
-            &draft.state_fence,
-        )?;
+        self.common(draft.authority_epoch.clone(), &draft.state_fence)?;
         self.peer_sender(
             &draft.sender_session_id,
-            draft.authority_epoch.clone(),
+            &draft.authority_epoch,
             &draft.state_fence,
+            now,
         )?;
-        let recipient_live = self
-            .sessions
-            .get(&draft.recipient_session_id)
-            .ok_or_else(|| CoordinationError::NotFound {
+        if !self.sessions.contains_key(&draft.recipient_session_id) {
+            return Err(CoordinationError::NotFound {
                 kind: "session",
                 id: draft.recipient_session_id.clone(),
-            })?
-            .state
-            == super::SessionState::Active;
+            });
+        }
+        let recipient_live = self.peer_recipient_live(&draft.recipient_session_id, now);
         if !self.work.contains_key(&draft.work_item_id) {
             return Err(CoordinationError::NotFound {
                 kind: "work_item",
@@ -1206,12 +1248,11 @@ impl CoordinationOwner {
             });
         }
         if draft.privacy == PrivacyClass::Secret
-            && draft
-                .disclosure_handle
-                .as_deref()
-                .is_none_or(str::is_empty)
+            && draft.disclosure_handle.as_deref().is_none_or(str::is_empty)
         {
-            return Err(CoordinationError::PeerPrivacyDenied(draft.message_id));
+            return Err(CoordinationError::PeerPrivacyDenied(
+                draft.message_id.clone(),
+            ));
         }
         if draft.revision == 0 {
             return Err(CoordinationError::InvalidField("revision"));
@@ -1222,7 +1263,11 @@ impl CoordinationOwner {
         if draft.payload_bytes > MAX_PEER_MESSAGE_BYTES {
             return Err(CoordinationError::InvalidField("payload_bytes"));
         }
-        if draft.inline_text.as_ref().is_some_and(|text| text.len() > MAX_PEER_INLINE_TEXT) {
+        if draft
+            .inline_text
+            .as_ref()
+            .is_some_and(|text| text.len() > MAX_PEER_INLINE_TEXT)
+        {
             return Err(CoordinationError::InvalidField("inline_text"));
         }
         if draft.evidence_refs.len() > MAX_PEER_REFERENCES
@@ -1230,11 +1275,7 @@ impl CoordinationOwner {
         {
             return Err(CoordinationError::InvalidField("peer_references"));
         }
-        for reference in draft
-            .evidence_refs
-            .iter()
-            .chain(draft.artifact_refs.iter())
-        {
+        for reference in draft.evidence_refs.iter().chain(draft.artifact_refs.iter()) {
             peer_text(reference, "peer_reference")?;
         }
         if let Some(handle) = draft.payload_handle.as_deref() {
@@ -1246,12 +1287,20 @@ impl CoordinationOwner {
         for marker in &draft.embedded {
             peer_text(&marker.detail, "embedded_marker")?;
         }
-        let now = clock.now_ms();
         if draft.expires_at.is_some_and(|expiry| now >= expiry) {
-            return Err(CoordinationError::PeerExpired(draft.message_id));
+            return Err(CoordinationError::PeerExpired(draft.message_id.clone()));
         }
-        if let Some(replayed) = self.peer_message_exact_replay(&draft.request_id, &draft)? {
-            return Ok(replayed);
+        Ok(recipient_live)
+    }
+
+    /// Replays an identical draft or rejects a changed same-ID draft.
+    /// Returns `None` when the draft is new to the owner.
+    fn replay_enqueue_draft(
+        &self,
+        draft: &EnqueuePeerMessage,
+    ) -> Result<Option<PeerEnqueueReceipt>, CoordinationError> {
+        if let Some(replayed) = self.peer_message_exact_replay(&draft.request_id, draft)? {
+            return Ok(Some(replayed));
         }
         if let Some(stored) = self.peer_messages.get(&draft.message_id) {
             let identical = stored.kind == draft.kind
@@ -1273,28 +1322,33 @@ impl CoordinationOwner {
                     })
                     .cloned()
                     .ok_or(CoordinationError::InvalidState)?;
-                return Ok(PeerEnqueueReceipt {
+                return Ok(Some(PeerEnqueueReceipt {
                     message: stored.clone(),
                     event,
                     durability: stored.durability.clone(),
                     replayed: true,
-                });
+                }));
             }
-            return Err(CoordinationError::Duplicate(draft.message_id));
+            return Err(CoordinationError::PeerSemanticConflict(
+                draft.message_id.clone(),
+            ));
         }
-        let stream = PeerStreamId {
-            recipient_session_id: draft.recipient_session_id.clone(),
-            work_item_id: draft.work_item_id.clone(),
-        };
-        if self.peer_live_depth(&stream) >= MAX_PEER_STREAM_DEPTH {
+        Ok(None)
+    }
+
+    /// Enforces the independent stream-depth and outstanding ceilings.
+    fn check_enqueue_backpressure(
+        &self,
+        draft: &EnqueuePeerMessage,
+        stream: &PeerStreamId,
+    ) -> Result<(), CoordinationError> {
+        if self.peer_live_depth(stream) >= MAX_PEER_STREAM_DEPTH {
             return Err(CoordinationError::PeerBackpressure {
                 scope: stream.key(),
                 limit: MAX_PEER_STREAM_DEPTH,
             });
         }
-        if self.peer_outstanding_from(&draft.sender_session_id)
-            >= MAX_PEER_OUTSTANDING_PER_SENDER
-        {
+        if self.peer_outstanding_from(&draft.sender_session_id) >= MAX_PEER_OUTSTANDING_PER_SENDER {
             return Err(CoordinationError::PeerBackpressure {
                 scope: draft.sender_session_id.clone(),
                 limit: MAX_PEER_OUTSTANDING_PER_SENDER,
@@ -1308,17 +1362,46 @@ impl CoordinationOwner {
                 limit: MAX_PEER_OUTSTANDING_PER_RECIPIENT,
             });
         }
-        let recorded = match durability.attest() {
-            PeerDurabilityAttestation::Durable { owner_receipt } => {
-                peer_text(&owner_receipt, "owner_receipt")?;
-                PeerDurability::Durable { owner_receipt }
-            }
-            PeerDurabilityAttestation::VolatileMemoryOnly => PeerDurability::Volatile,
-            PeerDurabilityAttestation::Unavailable { reason } => {
-                peer_text(&reason, "durability_reason")?;
-                PeerDurability::Unavailable { reason }
-            }
+        Ok(())
+    }
+
+    /// Admits one peer mailbox message through the existing owner.
+    ///
+    /// Admission validates identity, role, audience, size, privacy and
+    /// expiry, records through the existing causal event log, and stores the
+    /// attested durability ceiling without ever claiming persistence the
+    /// backing port did not attest. Exact replays return the single semantic
+    /// entry; changed payload/audience/scope/revision/expiry conflict.
+    pub fn enqueue_peer_message(
+        &mut self,
+        draft: &EnqueuePeerMessage,
+        clock: &dyn PeerClockPort,
+        durability: &dyn PeerDurabilityPort,
+    ) -> Result<PeerEnqueueReceipt, CoordinationError> {
+        let now = clock.now_ms();
+        let recipient_live = self.validate_enqueue_draft(draft, now)?;
+        if let Some(replayed) = self.replay_enqueue_draft(draft)? {
+            return Ok(replayed);
+        }
+        let stream = PeerStreamId {
+            recipient_session_id: draft.recipient_session_id.clone(),
+            work_item_id: draft.work_item_id.clone(),
         };
+        self.check_enqueue_backpressure(draft, &stream)?;
+        let recorded = attest_peer_durability(durability)?;
+        self.admit_enqueue_message(draft, stream, recorded, recipient_live, now)
+    }
+
+    /// Assigns the per-stream sequence and records one validated draft with
+    /// its causal event, durability ceiling and recipient cursor.
+    fn admit_enqueue_message(
+        &mut self,
+        draft: &EnqueuePeerMessage,
+        stream: PeerStreamId,
+        recorded: PeerDurability,
+        recipient_live: bool,
+        now: u64,
+    ) -> Result<PeerEnqueueReceipt, CoordinationError> {
         let head = self
             .peer_streams
             .entry(stream.clone())
@@ -1344,7 +1427,10 @@ impl CoordinationOwner {
             PeerMessageState::Staged
         } else {
             PeerMessageState::Unavailable {
-                reason: format!("recipient session {} is not active", draft.recipient_session_id),
+                reason: format!(
+                    "recipient session {} is not active",
+                    draft.recipient_session_id
+                ),
             }
         };
         let message = PeerMessage {
@@ -1400,11 +1486,13 @@ impl CoordinationOwner {
             recipient_session_id: draft.recipient_session_id.clone(),
             stream,
         };
-        self.peer_cursors.entry(cursor_key.clone()).or_insert(PeerCursor {
-            key: cursor_key,
-            next_expected_seq: 1,
-            last_reconciled_at: now,
-        });
+        self.peer_cursors
+            .entry(cursor_key.clone())
+            .or_insert(PeerCursor {
+                key: cursor_key,
+                next_expected_seq: 1,
+                last_reconciled_at: now,
+            });
         Ok(PeerEnqueueReceipt {
             message,
             event,
@@ -1432,14 +1520,12 @@ impl CoordinationOwner {
         if self.peer_expire_if_due(message_id, now).is_err() {
             return Err(CoordinationError::PeerExpired(message_id.to_owned()));
         }
-        let snapshot = self
-            .peer_messages
-            .get(message_id)
-            .cloned()
-            .ok_or_else(|| CoordinationError::NotFound {
+        let snapshot = self.peer_messages.get(message_id).cloned().ok_or_else(|| {
+            CoordinationError::NotFound {
                 kind: "peer_message",
                 id: message_id.to_owned(),
-            })?;
+            }
+        })?;
         match &snapshot.state {
             PeerMessageState::Delivered { .. }
             | PeerMessageState::Acknowledged { .. }
@@ -1528,19 +1614,15 @@ impl CoordinationOwner {
     ) -> Result<PeerAckReceipt, CoordinationError> {
         peer_text(message_id, "message_id")?;
         peer_text(by_session, "by_session")?;
-        let now = clock.now_ms();
-        let _ = now;
         if self.peer_expire_if_due(message_id, clock.now_ms()).is_err() {
             return Err(CoordinationError::PeerExpired(message_id.to_owned()));
         }
-        let snapshot = self
-            .peer_messages
-            .get(message_id)
-            .cloned()
-            .ok_or_else(|| CoordinationError::NotFound {
+        let snapshot = self.peer_messages.get(message_id).cloned().ok_or_else(|| {
+            CoordinationError::NotFound {
                 kind: "peer_message",
                 id: message_id.to_owned(),
-            })?;
+            }
+        })?;
         if snapshot.stream.recipient_session_id != by_session {
             return Err(CoordinationError::LeaseOwnerMismatch {
                 holder: snapshot.stream.recipient_session_id.clone(),
@@ -1556,17 +1638,14 @@ impl CoordinationOwner {
             | PeerMessageState::Unknown { .. }
             | PeerMessageState::Acknowledged { .. }
             | PeerMessageState::Consumed { .. } => {}
-            PeerMessageState::Staged | PeerMessageState::DeliveryAttempted { .. } => {
-                return Err(CoordinationError::InvalidState);
-            }
-            PeerMessageState::Unavailable { .. } => {
+            PeerMessageState::Staged
+            | PeerMessageState::DeliveryAttempted { .. }
+            | PeerMessageState::Unavailable { .. }
+            | PeerMessageState::Cancelled { .. } => {
                 return Err(CoordinationError::InvalidState);
             }
             PeerMessageState::Expired { .. } => {
                 return Err(CoordinationError::PeerExpired(message_id.to_owned()));
-            }
-            PeerMessageState::Cancelled { .. } => {
-                return Err(CoordinationError::InvalidState);
             }
         }
         if snapshot.state
@@ -1617,14 +1696,12 @@ impl CoordinationOwner {
         if self.peer_expire_if_due(message_id, clock.now_ms()).is_err() {
             return Err(CoordinationError::PeerExpired(message_id.to_owned()));
         }
-        let snapshot = self
-            .peer_messages
-            .get(message_id)
-            .cloned()
-            .ok_or_else(|| CoordinationError::NotFound {
+        let snapshot = self.peer_messages.get(message_id).cloned().ok_or_else(|| {
+            CoordinationError::NotFound {
                 kind: "peer_message",
                 id: message_id.to_owned(),
-            })?;
+            }
+        })?;
         if snapshot.stream.recipient_session_id != by_session {
             return Err(CoordinationError::LeaseOwnerMismatch {
                 holder: snapshot.stream.recipient_session_id.clone(),
@@ -1666,14 +1743,12 @@ impl CoordinationOwner {
         peer_text(message_id, "message_id")?;
         peer_text(by_session, "by_session")?;
         let now = clock.now_ms();
-        let snapshot = self
-            .peer_messages
-            .get(message_id)
-            .cloned()
-            .ok_or_else(|| CoordinationError::NotFound {
+        let snapshot = self.peer_messages.get(message_id).cloned().ok_or_else(|| {
+            CoordinationError::NotFound {
                 kind: "peer_message",
                 id: message_id.to_owned(),
-            })?;
+            }
+        })?;
         if snapshot.sender_session_id != by_session {
             return Err(CoordinationError::LeaseOwnerMismatch {
                 holder: snapshot.sender_session_id.clone(),
@@ -1750,7 +1825,7 @@ impl CoordinationOwner {
     pub fn reconnect_peer_endpoint(
         &mut self,
         session_id: &str,
-        stream: PeerStreamId,
+        stream: &PeerStreamId,
         next_expected_seq: u64,
         clock: &dyn PeerClockPort,
     ) -> Result<PeerReconnectReport, CoordinationError> {
@@ -1763,7 +1838,7 @@ impl CoordinationOwner {
         let now = clock.now_ms();
         let head_next = self
             .peer_streams
-            .get(&stream)
+            .get(stream)
             .map_or(1, |head| head.next_seq);
         if next_expected_seq > head_next {
             return Err(CoordinationError::InvalidField("next_expected_seq"));
@@ -1781,7 +1856,7 @@ impl CoordinationOwner {
         cursor.last_reconciled_at = now;
         let mut replayed = Vec::new();
         for message in self.peer_messages.values_mut() {
-            if message.stream == stream
+            if message.stream == *stream
                 && message.stream.recipient_session_id == session_id
                 && message.stream_seq >= next_expected_seq
                 && matches!(
@@ -1802,7 +1877,7 @@ impl CoordinationOwner {
         replayed.sort();
         let replayed = replayed.into_iter().map(|(_, id)| id).collect();
         let gaps = self
-            .peer_stream_gaps(&stream)
+            .peer_stream_gaps(stream)
             .into_iter()
             .filter(|seq| *seq >= next_expected_seq)
             .collect();
@@ -1833,14 +1908,12 @@ impl CoordinationOwner {
         peer_text(request_id, "request_id")?;
         peer_text(recipient_session_id, "recipient_session_id")?;
         peer_text(scope, "scope")?;
-        let stored = self
-            .peer_messages
-            .get(message_id)
-            .cloned()
-            .ok_or_else(|| CoordinationError::NotFound {
+        let stored = self.peer_messages.get(message_id).cloned().ok_or_else(|| {
+            CoordinationError::NotFound {
                 kind: "peer_message",
                 id: message_id.to_owned(),
-            })?;
+            }
+        })?;
         if stored.stream.recipient_session_id == recipient_session_id && stored.scope == scope {
             return Ok(stored);
         }
@@ -1903,18 +1976,12 @@ impl CoordinationOwner {
             }
         }
         entries.sort();
-        let parts: Vec<&str> = entries
-            .iter()
-            .map(|(_, digest)| digest.as_str())
-            .collect();
+        let parts: Vec<&str> = entries.iter().map(|(_, digest)| digest.as_str()).collect();
         peer_digest_hex(&parts)
     }
 
     /// Reads one admitted peer message as an owned clone.
-    pub fn read_peer_message(
-        &self,
-        message_id: &str,
-    ) -> Result<PeerMessage, CoordinationError> {
+    pub fn read_peer_message(&self, message_id: &str) -> Result<PeerMessage, CoordinationError> {
         peer_text(message_id, "message_id")?;
         self.peer_messages
             .get(message_id)
@@ -2158,38 +2225,30 @@ impl CoordinationOwner {
         }))
     }
 
-    /// Posts one bounded blackboard entry through the existing owner.
-    /// Concurrent proposals stay separate; changed same-ID content
-    /// conflicts instead of merging.
-    #[allow(clippy::too_many_lines)]
-    pub fn post_board_entry(
-        &mut self,
-        draft: PostBoardEntry,
-        clock: &dyn PeerClockPort,
-        durability: &dyn PeerDurabilityPort,
-    ) -> Result<BoardEntryReceipt, CoordinationError> {
+    /// Validates one board post draft against identity, role, privacy and
+    /// anchor shape before any replay or bound check runs.
+    fn validate_post_draft(
+        &self,
+        draft: &PostBoardEntry,
+        now: u64,
+    ) -> Result<(), CoordinationError> {
         peer_text(&draft.request_id, "request_id")?;
         peer_text(&draft.entry_id, "entry_id")?;
         peer_text(&draft.scope, "scope")?;
         peer_text(&draft.author_session_id, "author_session_id")?;
         peer_text(&draft.audience_scope, "audience_scope")?;
         peer_text(&draft.content_digest, "content_digest")?;
-        self.common(
-            draft.authority_epoch.clone(),
-            &draft.state_fence,
-        )?;
+        self.common(draft.authority_epoch.clone(), &draft.state_fence)?;
         self.peer_sender(
             &draft.author_session_id,
-            draft.authority_epoch.clone(),
+            &draft.authority_epoch,
             &draft.state_fence,
+            now,
         )?;
         if draft.privacy == PrivacyClass::Secret
-            && draft
-                .disclosure_handle
-                .as_deref()
-                .is_none_or(str::is_empty)
+            && draft.disclosure_handle.as_deref().is_none_or(str::is_empty)
         {
-            return Err(CoordinationError::PeerPrivacyDenied(draft.entry_id));
+            return Err(CoordinationError::PeerPrivacyDenied(draft.entry_id.clone()));
         }
         if draft.source_refs.len() > MAX_PEER_REFERENCES {
             return Err(CoordinationError::InvalidField("source_refs"));
@@ -2213,11 +2272,25 @@ impl CoordinationOwner {
                 return Err(CoordinationError::InvalidField("anchor_revision"));
             }
         }
+        Ok(())
+    }
+
+    /// Posts one bounded blackboard entry through the existing owner.
+    /// Concurrent proposals stay separate; changed same-ID content
+    /// conflicts instead of merging.
+    pub fn post_board_entry(
+        &mut self,
+        draft: &PostBoardEntry,
+        clock: &dyn PeerClockPort,
+        durability: &dyn PeerDurabilityPort,
+    ) -> Result<BoardEntryReceipt, CoordinationError> {
+        let now = clock.now_ms();
+        self.validate_post_draft(draft, now)?;
         if let Some(replayed) = self.board_exact_replay(&draft.request_id, &draft.entry_id, 1)? {
             return Ok(replayed);
         }
         if self.peer_board_heads.contains_key(&draft.entry_id) {
-            return Err(CoordinationError::Duplicate(draft.entry_id));
+            return Err(CoordinationError::Duplicate(draft.entry_id.clone()));
         }
         if self.board_scope_heads(&draft.scope) >= MAX_BOARD_ENTRIES_PER_SCOPE {
             return Err(CoordinationError::PeerBackpressure {
@@ -2225,18 +2298,7 @@ impl CoordinationOwner {
                 limit: MAX_BOARD_ENTRIES_PER_SCOPE,
             });
         }
-        let now = clock.now_ms();
-        let recorded = match durability.attest() {
-            PeerDurabilityAttestation::Durable { owner_receipt } => {
-                peer_text(&owner_receipt, "owner_receipt")?;
-                PeerDurability::Durable { owner_receipt }
-            }
-            PeerDurabilityAttestation::VolatileMemoryOnly => PeerDurability::Volatile,
-            PeerDurabilityAttestation::Unavailable { reason } => {
-                peer_text(&reason, "durability_reason")?;
-                PeerDurability::Unavailable { reason }
-            }
-        };
+        let recorded = attest_peer_durability(durability)?;
         let entry = BoardEntry {
             entry_id: draft.entry_id.clone(),
             request_id: draft.request_id.clone(),
@@ -2281,10 +2343,8 @@ impl CoordinationOwner {
             .insert((draft.entry_id.clone(), 1), entry.clone());
         self.peer_board_heads
             .insert(draft.entry_id.clone(), entry.clone());
-        self.peer_board_requests.insert(
-            draft.request_id.clone(),
-            format!("{}:1", draft.entry_id),
-        );
+        self.peer_board_requests
+            .insert(draft.request_id.clone(), format!("{}:1", draft.entry_id));
         Ok(BoardEntryReceipt {
             entry,
             event,
@@ -2293,26 +2353,23 @@ impl CoordinationOwner {
         })
     }
 
-    /// Revises one board entry with an exact predecessor. The prior
-    /// revision stays readable; a predecessor mismatch is rejected.
-    pub fn revise_board_entry(
-        &mut self,
-        draft: ReviseBoardEntry,
-        clock: &dyn PeerClockPort,
-        durability: &dyn PeerDurabilityPort,
-    ) -> Result<BoardEntryReceipt, CoordinationError> {
+    /// Validates one board revision draft against identity, role and
+    /// anchor shape before any predecessor or bound check runs.
+    fn validate_revise_draft(
+        &self,
+        draft: &ReviseBoardEntry,
+        now: u64,
+    ) -> Result<(), CoordinationError> {
         peer_text(&draft.request_id, "request_id")?;
         peer_text(&draft.entry_id, "entry_id")?;
         peer_text(&draft.author_session_id, "author_session_id")?;
         peer_text(&draft.content_digest, "content_digest")?;
-        self.common(
-            draft.authority_epoch.clone(),
-            &draft.state_fence,
-        )?;
+        self.common(draft.authority_epoch.clone(), &draft.state_fence)?;
         self.peer_sender(
             &draft.author_session_id,
-            draft.authority_epoch.clone(),
+            &draft.authority_epoch,
             &draft.state_fence,
+            now,
         )?;
         if draft.source_refs.len() > MAX_PEER_REFERENCES {
             return Err(CoordinationError::InvalidField("source_refs"));
@@ -2330,6 +2387,19 @@ impl CoordinationOwner {
                 return Err(CoordinationError::InvalidField("anchor_revision"));
             }
         }
+        Ok(())
+    }
+
+    /// Revises one board entry with an exact predecessor. The prior
+    /// revision stays readable; a predecessor mismatch is rejected.
+    pub fn revise_board_entry(
+        &mut self,
+        draft: &ReviseBoardEntry,
+        clock: &dyn PeerClockPort,
+        durability: &dyn PeerDurabilityPort,
+    ) -> Result<BoardEntryReceipt, CoordinationError> {
+        let now = clock.now_ms();
+        self.validate_revise_draft(draft, now)?;
         let head = self
             .peer_board_heads
             .get(&draft.entry_id)
@@ -2342,10 +2412,7 @@ impl CoordinationOwner {
             return Err(CoordinationError::InvalidState);
         }
         if draft.predecessor_revision != head.revision {
-            if self
-                .peer_board_requests
-                .contains_key(&draft.request_id)
-            {
+            if self.peer_board_requests.contains_key(&draft.request_id) {
                 return Err(CoordinationError::PeerSemanticConflict(
                     draft.entry_id.clone(),
                 ));
@@ -2364,18 +2431,7 @@ impl CoordinationOwner {
                 limit: MAX_BOARD_REVISIONS_PER_ENTRY,
             });
         }
-        let now = clock.now_ms();
-        let recorded = match durability.attest() {
-            PeerDurabilityAttestation::Durable { owner_receipt } => {
-                peer_text(&owner_receipt, "owner_receipt")?;
-                PeerDurability::Durable { owner_receipt }
-            }
-            PeerDurabilityAttestation::VolatileMemoryOnly => PeerDurability::Volatile,
-            PeerDurabilityAttestation::Unavailable { reason } => {
-                peer_text(&reason, "durability_reason")?;
-                PeerDurability::Unavailable { reason }
-            }
-        };
+        let recorded = attest_peer_durability(durability)?;
         let entry = BoardEntry {
             entry_id: head.entry_id.clone(),
             request_id: draft.request_id.clone(),
@@ -2453,6 +2509,22 @@ impl CoordinationOwner {
             })
     }
 
+    /// Reads one compacted tombstone by omission receipt reference.
+    pub fn read_board_tombstone(
+        &self,
+        entry_id: &str,
+        revision: u64,
+    ) -> Result<BoardTombstone, CoordinationError> {
+        peer_text(entry_id, "entry_id")?;
+        self.peer_board_tombstones
+            .get(&(entry_id.to_owned(), revision))
+            .cloned()
+            .ok_or_else(|| CoordinationError::NotFound {
+                kind: "board_tombstone",
+                id: entry_id.to_owned(),
+            })
+    }
+
     /// Retracts one board head. Only the author retracts, and retraction
     /// keeps history visible; it never erases observed evidence.
     pub fn retract_board_entry(
@@ -2515,8 +2587,11 @@ impl CoordinationOwner {
             .into_iter()
             .filter(|entry| !entry.withheld)
             .collect();
-        let start = cursor.min(visible.len() as u64) as usize;
-        let end = (cursor.saturating_add(page_size)).min(visible.len() as u64) as usize;
+        let bound = visible.len();
+        let start = usize::try_from(cursor).unwrap_or(usize::MAX).min(bound);
+        let end = usize::try_from(cursor.saturating_add(page_size))
+            .unwrap_or(usize::MAX)
+            .min(bound);
         let entries = visible[start..end]
             .iter()
             .map(|entry| BoardEntrySummary {
@@ -2557,9 +2632,11 @@ impl CoordinationOwner {
         clock: &dyn PeerClockPort,
     ) -> Result<BoardCompactionReceipt, CoordinationError> {
         peer_text(scope, "scope")?;
-        peer_text(&policy.policy_id, "policy_id")?;
-        peer_text(&policy.lineage_receipt, "lineage_receipt")?;
-        if !policy.retain_dissent || !policy.retain_required_evidence {
+        if policy.policy_id.trim().is_empty()
+            || policy.lineage_receipt.trim().is_empty()
+            || !policy.retain_dissent
+            || !policy.retain_required_evidence
+        {
             return Err(CoordinationError::PeerCompactionRequiresPolicy {
                 scope: scope.to_owned(),
             });
@@ -2572,8 +2649,7 @@ impl CoordinationOwner {
             .peer_board_heads
             .values()
             .filter(|entry| {
-                entry.scope == scope
-                    && matches!(entry.state, BoardEntryState::Retracted { .. })
+                entry.scope == scope && matches!(entry.state, BoardEntryState::Retracted { .. })
             })
             .map(|entry| entry.entry_id.clone())
             .collect();
@@ -2596,8 +2672,9 @@ impl CoordinationOwner {
                 .map(|(_, revision)| *revision)
                 .collect();
             for revision in revisions {
-                if let Some(record) =
-                    self.peer_board_revisions.remove(&(entry_id.clone(), revision))
+                if let Some(record) = self
+                    .peer_board_revisions
+                    .remove(&(entry_id.clone(), revision))
                 {
                     self.peer_board_tombstones.insert(
                         (entry_id.clone(), revision),
@@ -2718,14 +2795,14 @@ pub struct PeerConflictReceipt {
 }
 
 impl CoordinationOwner {
-    /// Records one structured conflict set through the existing owner.
-    /// Two-sided and minority positions are retained together; a lone
-    /// position stays undecided and can never resolve itself.
-    pub fn record_peer_conflict(
-        &mut self,
-        draft: RecordPeerConflict,
-        clock: &dyn PeerClockPort,
-    ) -> Result<PeerConflictReceipt, CoordinationError> {
+    /// Validates one conflict draft: every candidate author must be a live
+    /// bound peer and every position, evidence handle and lineage must be
+    /// well-formed text. No contradiction is ever inferred from prose.
+    fn validate_conflict_draft(
+        &self,
+        draft: &RecordPeerConflict,
+        now: u64,
+    ) -> Result<(), CoordinationError> {
         peer_text(&draft.request_id, "request_id")?;
         peer_text(&draft.conflict_id, "conflict_id")?;
         peer_text(&draft.scope_id, "scope_id")?;
@@ -2740,20 +2817,19 @@ impl CoordinationOwner {
         for candidate in &draft.candidates {
             peer_text(&candidate.position, "position")?;
             peer_text(&candidate.author_session_id, "candidate_author")?;
+            let bound = self
+                .sessions
+                .get(&candidate.author_session_id)
+                .cloned()
+                .ok_or_else(|| CoordinationError::NotFound {
+                    kind: "session",
+                    id: candidate.author_session_id.clone(),
+                })?;
             self.peer_sender(
                 &candidate.author_session_id,
-                self.sessions
-                    .get(&candidate.author_session_id)
-                    .map(|session| session.authority_epoch.clone())
-                    .ok_or_else(|| CoordinationError::NotFound {
-                        kind: "session",
-                        id: candidate.author_session_id.clone(),
-                    })?,
-                &self
-                    .sessions
-                    .get(&candidate.author_session_id)
-                    .map(|session| session.state_fence.clone())
-                    .ok_or(CoordinationError::InvalidState)?,
+                &bound.authority_epoch,
+                &bound.state_fence,
+                now,
             )?;
             for reference in &candidate.evidence_refs {
                 peer_text(reference, "candidate_evidence")?;
@@ -2765,31 +2841,43 @@ impl CoordinationOwner {
         for action in &draft.affected_actions {
             peer_text(action, "affected_action")?;
         }
-        if let Some(indexed) = self.peer_conflict_requests.get(&draft.request_id) {
-            if indexed != &draft.conflict_id {
-                return Err(CoordinationError::PeerSemanticConflict(
-                    draft.conflict_id.clone(),
-                ));
-            }
-            let stored = self
-                .peer_conflicts
-                .get(&draft.conflict_id)
-                .cloned()
-                .ok_or(CoordinationError::InvalidState)?;
-            let event = self
-                .event_by_request
-                .get(&draft.request_id)
-                .cloned()
-                .ok_or(CoordinationError::InvalidState)?;
-            return Ok(PeerConflictReceipt {
-                conflict: stored,
-                event,
-                replayed: true,
-            });
+        Ok(())
+    }
+
+    /// Replays an identical conflict draft. Returns `None` when new.
+    fn replay_conflict_draft(
+        &self,
+        draft: &RecordPeerConflict,
+    ) -> Result<Option<PeerConflictReceipt>, CoordinationError> {
+        let Some(indexed) = self.peer_conflict_requests.get(&draft.request_id) else {
+            return Ok(None);
+        };
+        if indexed != &draft.conflict_id {
+            return Err(CoordinationError::PeerSemanticConflict(
+                draft.conflict_id.clone(),
+            ));
         }
-        if self.peer_conflicts.contains_key(&draft.conflict_id) {
-            return Err(CoordinationError::Duplicate(draft.conflict_id));
-        }
+        let stored = self
+            .peer_conflicts
+            .get(&draft.conflict_id)
+            .cloned()
+            .ok_or(CoordinationError::InvalidState)?;
+        let event = self
+            .event_by_request
+            .get(&draft.request_id)
+            .cloned()
+            .ok_or(CoordinationError::InvalidState)?;
+        Ok(Some(PeerConflictReceipt {
+            conflict: stored,
+            event,
+            replayed: true,
+        }))
+    }
+
+    /// Derives two-sided acceptability and lineage independence from the
+    /// supplied candidates. Distinct authors contest; shared lineage
+    /// exposes a common mode; both stay visible either way.
+    fn conflict_acceptability(draft: &RecordPeerConflict) -> (ArgumentAcceptability, bool) {
         let mut authors = BTreeSet::new();
         for candidate in &draft.candidates {
             authors.insert(candidate.author_session_id.clone());
@@ -2808,7 +2896,26 @@ impl CoordinationOwner {
                 }
             }
         }
+        (acceptability, shared)
+    }
+
+    /// Records one structured conflict set through the existing owner.
+    /// Two-sided and minority positions are retained together; a lone
+    /// position stays undecided and can never resolve itself.
+    pub fn record_peer_conflict(
+        &mut self,
+        draft: &RecordPeerConflict,
+        clock: &dyn PeerClockPort,
+    ) -> Result<PeerConflictReceipt, CoordinationError> {
         let now = clock.now_ms();
+        self.validate_conflict_draft(draft, now)?;
+        if let Some(replayed) = self.replay_conflict_draft(draft)? {
+            return Ok(replayed);
+        }
+        if self.peer_conflicts.contains_key(&draft.conflict_id) {
+            return Err(CoordinationError::Duplicate(draft.conflict_id.clone()));
+        }
+        let (acceptability, shared) = Self::conflict_acceptability(draft);
         let digest = peer_digest_hex(
             &draft
                 .candidates
@@ -2848,7 +2955,12 @@ impl CoordinationOwner {
             created_at: now,
             resolved_at: None,
         };
-        let first_author = draft.candidates[0].author_session_id.clone();
+        let first_author = draft
+            .candidates
+            .first()
+            .ok_or(CoordinationError::InvalidState)?
+            .author_session_id
+            .clone();
         let head_session = self
             .sessions
             .get(&first_author)
@@ -2895,13 +3007,12 @@ impl CoordinationOwner {
         peer_text(&external.issuer, "receipt_issuer")?;
         peer_text(&external.detail, "receipt_detail")?;
         let now = clock.now_ms();
-        let conflict = self
-            .peer_conflicts
-            .get_mut(conflict_id)
-            .ok_or_else(|| CoordinationError::NotFound {
+        let conflict = self.peer_conflicts.get_mut(conflict_id).ok_or_else(|| {
+            CoordinationError::NotFound {
                 kind: "peer_conflict",
                 id: conflict_id.to_owned(),
-            })?;
+            }
+        })?;
         if !matches!(
             conflict.state,
             PeerConflictState::Open | PeerConflictState::Investigating
@@ -2915,10 +3026,7 @@ impl CoordinationOwner {
     }
 
     /// Reads one retained peer conflict as an owned clone.
-    pub fn read_peer_conflict(
-        &self,
-        conflict_id: &str,
-    ) -> Result<PeerConflict, CoordinationError> {
+    pub fn read_peer_conflict(&self, conflict_id: &str) -> Result<PeerConflict, CoordinationError> {
         peer_text(conflict_id, "conflict_id")?;
         self.peer_conflicts
             .get(conflict_id)
@@ -3064,10 +3172,7 @@ pub struct PeerReviewDenominator {
     pub open_conflicts: u64,
 }
 
-fn recommendations_conflict(
-    left: ReviewRecommendation,
-    right: ReviewRecommendation,
-) -> bool {
+fn recommendations_conflict(left: ReviewRecommendation, right: ReviewRecommendation) -> bool {
     let approves = |recommendation: ReviewRecommendation| {
         matches!(
             recommendation,
@@ -3084,20 +3189,19 @@ impl CoordinationOwner {
     /// contiguous; a skipped or repeated revision is rejected.
     pub fn admit_artifact_revision(
         &mut self,
-        draft: AdmitArtifactRevision,
+        draft: &AdmitArtifactRevision,
         clock: &dyn PeerClockPort,
     ) -> Result<PeerArtifactHead, CoordinationError> {
         peer_text(&draft.artifact_id, "artifact_id")?;
         peer_text(&draft.digest, "digest")?;
         peer_text(&draft.author_session_id, "author_session_id")?;
-        self.common(
-            draft.authority_epoch.clone(),
-            &draft.state_fence,
-        )?;
+        self.common(draft.authority_epoch.clone(), &draft.state_fence)?;
+        let now = clock.now_ms();
         self.peer_sender(
             &draft.author_session_id,
-            draft.authority_epoch.clone(),
+            &draft.authority_epoch,
             &draft.state_fence,
+            now,
         )?;
         if draft.revision == 0 {
             return Err(CoordinationError::InvalidField("artifact_revision"));
@@ -3124,17 +3228,18 @@ impl CoordinationOwner {
             }
             return Err(CoordinationError::CausalPredecessorMismatch);
         }
-        let now = clock.now_ms();
         let head = PeerArtifactHead {
             artifact_id: draft.artifact_id.clone(),
             revision: draft.revision,
             digest: draft.digest.clone(),
             admitted_at: now,
         };
-        self.peer_artifact_revisions
-            .insert((draft.artifact_id.clone(), draft.revision), draft.digest);
+        self.peer_artifact_revisions.insert(
+            (draft.artifact_id.clone(), draft.revision),
+            draft.digest.clone(),
+        );
         self.peer_artifact_heads
-            .insert(draft.artifact_id, head.clone());
+            .insert(draft.artifact_id.clone(), head.clone());
         Ok(head)
     }
 
@@ -3145,8 +3250,9 @@ impl CoordinationOwner {
         artifact_id: &str,
         expected: u64,
         author_session_id: &str,
-        epoch: EpochId,
+        epoch: &EpochId,
         fence: &StateFence,
+        clock: &dyn PeerClockPort,
     ) -> Result<u64, CoordinationError> {
         peer_text(artifact_id, "artifact_id")?;
         peer_text(author_session_id, "author_session_id")?;
@@ -3154,7 +3260,8 @@ impl CoordinationOwner {
             return Err(CoordinationError::InvalidField("expected_reviews"));
         }
         self.common(epoch.clone(), fence)?;
-        self.peer_sender(author_session_id, epoch, fence)?;
+        let now = clock.now_ms();
+        self.peer_sender(author_session_id, epoch, fence, now)?;
         if let Some(stored) = self.peer_review_expectations.get(artifact_id) {
             if *stored == expected {
                 return Ok(expected);
@@ -3175,7 +3282,7 @@ impl CoordinationOwner {
     #[allow(clippy::too_many_lines)]
     pub fn submit_peer_review(
         &mut self,
-        draft: SubmitPeerReview,
+        draft: &SubmitPeerReview,
         clock: &dyn PeerClockPort,
         durability: &dyn PeerDurabilityPort,
     ) -> Result<PeerReviewReceipt, CoordinationError> {
@@ -3185,14 +3292,13 @@ impl CoordinationOwner {
         peer_text(&draft.reviewer_session_id, "reviewer_session_id")?;
         peer_text(&draft.operation, "operation")?;
         peer_text(&draft.anchor_field, "anchor_field")?;
-        self.common(
-            draft.authority_epoch.clone(),
-            &draft.state_fence,
-        )?;
+        self.common(draft.authority_epoch.clone(), &draft.state_fence)?;
+        let now = clock.now_ms();
         self.peer_sender(
             &draft.reviewer_session_id,
-            draft.authority_epoch.clone(),
+            &draft.authority_epoch,
             &draft.state_fence,
+            now,
         )?;
         if draft.artifact_revision == 0 {
             return Err(CoordinationError::InvalidField("artifact_revision"));
@@ -3233,7 +3339,7 @@ impl CoordinationOwner {
             });
         }
         if self.peer_reviews.contains_key(&draft.review_id) {
-            return Err(CoordinationError::Duplicate(draft.review_id));
+            return Err(CoordinationError::Duplicate(draft.review_id.clone()));
         }
         let head = self
             .peer_artifact_heads
@@ -3262,7 +3368,6 @@ impl CoordinationOwner {
             }
             PeerReviewLifecycle::PendingDelivery
         };
-        let now = clock.now_ms();
         let standing = if draft.expires_at.is_some_and(|expiry| now >= expiry) {
             PeerReviewStanding::Expired
         } else {
@@ -3272,17 +3377,7 @@ impl CoordinationOwner {
                 ReviewCompleteness::Abstain => PeerReviewStanding::Abstained,
             }
         };
-        let recorded = match durability.attest() {
-            PeerDurabilityAttestation::Durable { owner_receipt } => {
-                peer_text(&owner_receipt, "owner_receipt")?;
-                PeerDurability::Durable { owner_receipt }
-            }
-            PeerDurabilityAttestation::VolatileMemoryOnly => PeerDurability::Volatile,
-            PeerDurabilityAttestation::Unavailable { reason } => {
-                peer_text(&reason, "durability_reason")?;
-                PeerDurability::Unavailable { reason }
-            }
-        };
+        let recorded = attest_peer_durability(durability)?;
         let mut review = AnchoredReview {
             review_id: draft.review_id.clone(),
             request_id: draft.request_id.clone(),
@@ -3323,10 +3418,7 @@ impl CoordinationOwner {
                             existing.lifecycle,
                             PeerReviewLifecycle::Stale | PeerReviewLifecycle::Superseded
                         )
-                        && recommendations_conflict(
-                            existing.recommendation,
-                            draft.recommendation,
-                        )
+                        && recommendations_conflict(existing.recommendation, draft.recommendation)
                 })
                 .cloned()
                 .collect();
@@ -3369,8 +3461,7 @@ impl CoordinationOwner {
                     created_at: now,
                     resolved_at: None,
                 };
-                self.peer_conflicts
-                    .insert(conflict_id.clone(), conflict);
+                self.peer_conflicts.insert(conflict_id.clone(), conflict);
                 review.conflict_id = Some(conflict_id.clone());
                 if let Some(stored_rival) = self.peer_reviews.get_mut(&rival.review_id) {
                     stored_rival.conflict_id = Some(conflict_id);
@@ -3413,14 +3504,12 @@ impl CoordinationOwner {
     ) -> Result<AnchoredReview, CoordinationError> {
         peer_text(review_id, "review_id")?;
         peer_text(by_session, "by_session")?;
-        let stored = self
-            .peer_reviews
-            .get(review_id)
-            .cloned()
-            .ok_or_else(|| CoordinationError::NotFound {
+        let stored = self.peer_reviews.get(review_id).cloned().ok_or_else(|| {
+            CoordinationError::NotFound {
                 kind: "peer_review",
                 id: review_id.to_owned(),
-            })?;
+            }
+        })?;
         if stored.reviewer_session_id != by_session {
             return Err(CoordinationError::LeaseOwnerMismatch {
                 holder: stored.reviewer_session_id.clone(),
@@ -3477,13 +3566,13 @@ impl CoordinationOwner {
                 id: by_session.to_owned(),
             });
         }
-        let stored = self
-            .peer_reviews
-            .get(review_id)
-            .ok_or_else(|| CoordinationError::NotFound {
-                kind: "peer_review",
-                id: review_id.to_owned(),
-            })?;
+        let stored =
+            self.peer_reviews
+                .get(review_id)
+                .ok_or_else(|| CoordinationError::NotFound {
+                    kind: "peer_review",
+                    id: review_id.to_owned(),
+                })?;
         Ok(PeerReviewAckReceipt {
             review_id: review_id.to_owned(),
             lifecycle: stored.lifecycle,
@@ -3538,8 +3627,7 @@ impl CoordinationOwner {
             }
         }
         for conflict in self.peer_conflicts.values() {
-            if conflict.scope_id == artifact_id
-                && matches!(conflict.state, PeerConflictState::Open)
+            if conflict.scope_id == artifact_id && matches!(conflict.state, PeerConflictState::Open)
             {
                 denominator.open_conflicts = denominator.open_conflicts.saturating_add(1);
             }
@@ -3548,10 +3636,7 @@ impl CoordinationOwner {
     }
 
     /// Reads one anchored review as an owned clone.
-    pub fn read_peer_review(
-        &self,
-        review_id: &str,
-    ) -> Result<AnchoredReview, CoordinationError> {
+    pub fn read_peer_review(&self, review_id: &str) -> Result<AnchoredReview, CoordinationError> {
         peer_text(review_id, "review_id")?;
         self.peer_reviews
             .get(review_id)
