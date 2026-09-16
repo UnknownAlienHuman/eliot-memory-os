@@ -2186,12 +2186,12 @@ pub fn outcome_rejection_hint(outcome: &AdjustmentOutcome) -> Option<CurationRej
 mod tests {
     use super::*;
     use eliot_contracts::{EpochId, EpochLineageId, ResourceGeneration};
-    use std::num::NonZeroU64;
     use eliot_dreamer_contracts::candidate::{DimensionVerdict, PreservationDimension};
-    use eliot_dreamer_contracts::curation::{AccessibilityPayload, TargetEvidence};
+    use eliot_dreamer_contracts::curation::{AccessibilityPayload, RepairPayload, TargetEvidence};
     use eliot_dreamer_contracts::{
         AtomicityMode, ClaimResidue, Requester, RequesterOrigin, SupportState, kind_family,
     };
+    use std::num::NonZeroU64;
 
     fn test_fence() -> StateFence {
         let epoch = EpochId::new(
@@ -2729,5 +2729,1461 @@ mod tests {
             result.proposed_snapshot.accessibility,
             AccessibilityStanding::Dormant
         );
+    }
+
+    // Shared builders for the remaining matrix cases; the six cases above are
+    // intentionally left byte-identical.
+
+    fn test_fence_seq(sequence: u64) -> StateFence {
+        let epoch = EpochId::new(
+            EpochLineageId::new("550e8400-e29b-41d4-a716-446655440000")
+                .expect("canonical test lineage-B"),
+            NonZeroU64::new(sequence).expect("non-zero test sequence"),
+        )
+        .expect("valid test epoch");
+        StateFence::new(epoch, ResourceGeneration::genesis())
+    }
+
+    fn many_sorted(prefix: &str, count: usize) -> Vec<String> {
+        (0..count)
+            .map(|index| format!("{prefix}-{index:04}"))
+            .collect()
+    }
+
+    fn path_with(handle: &str, kind: AffectedPathKind) -> AffectedPath {
+        AffectedPath {
+            handle: handle.to_owned(),
+            kind,
+            owner: "owner-access".to_owned(),
+            required: true,
+        }
+    }
+
+    fn disposition_with(handle: &str, disposition: DependentDispositionKind) -> PathDisposition {
+        PathDisposition {
+            handle: handle.to_owned(),
+            disposition,
+            before_identity: format!("{handle}@rev-2"),
+            proposed_identity: format!("{handle}@rev-3"),
+            owner: "owner-access".to_owned(),
+            reason: format!("reconcile {handle} against the proposed state"),
+            verifier: "verifier-7".to_owned(),
+            inverse_note: format!("restore {handle}@rev-2"),
+        }
+    }
+
+    fn two_path_request() -> AdjustmentRequest {
+        let mut request = valid_request();
+        request.affected = vec![
+            path_with("ctx-1", AffectedPathKind::Context),
+            path_with("dep-1", AffectedPathKind::Derivative),
+        ];
+        request.dispositions = vec![
+            disposition_with("ctx-1", DependentDispositionKind::Revalidate),
+            disposition_with("dep-1", DependentDispositionKind::Revalidate),
+        ];
+        request.closure_denominator = TargetDenominator {
+            mode: AtomicityMode::PerMember,
+            members: vec!["ctx-1".to_owned(), "dep-1".to_owned()],
+            expected_total: 2,
+        };
+        request
+    }
+
+    fn accessibility_increase_request() -> AdjustmentRequest {
+        let mut request = valid_request();
+        request.projection.accessibility = AccessibilityStanding::Restricted;
+        request.policy.operation = AdjustmentOperation::Increase;
+        request.policy.direction = AdjustmentDirection::Raise;
+        request.policy.task_local_only = true;
+        if let Some(change) = request.accessibility.as_mut() {
+            change.before_state = AccessibilityStanding::Restricted;
+            change.proposed_state = AccessibilityStanding::Exposed;
+        }
+        request
+    }
+
+    fn influence_half() -> InfluenceChange {
+        InfluenceChange {
+            current_standing: InfluenceStanding::Full,
+            current_policy_id: "policy-7".to_owned(),
+            current_graph_note: "graph g-1".to_owned(),
+            proposed_standing: InfluenceStanding::Bounded,
+            scope: "scope-1".to_owned(),
+            decision_ref: "dec-1".to_owned(),
+            effect_note: "bounds downstream ranking only".to_owned(),
+            review_owner_ref: "owner-review".to_owned(),
+            decision_owner_ref: "owner-decision".to_owned(),
+            preserved_other_axes_note: "support, privacy, and assurance untouched".to_owned(),
+            within_ceilings: true,
+            deletes_subject: false,
+            claims_system_wide: false,
+        }
+    }
+
+    fn influence_increase_request() -> AdjustmentRequest {
+        let mut request = valid_influence_request();
+        request.projection.influence = InfluenceStanding::Bounded;
+        request.policy.operation = AdjustmentOperation::Increase;
+        request.policy.direction = AdjustmentDirection::Raise;
+        if let Some(change) = request.influence.as_mut() {
+            change.current_standing = InfluenceStanding::Bounded;
+            change.proposed_standing = InfluenceStanding::Full;
+            change.within_ceilings = true;
+        }
+        request
+    }
+
+    fn repair_item() -> ValidatedCurationItem {
+        let mut item = test_item();
+        item.kind_spelling = "repair".to_owned();
+        item.family_spelling = kind_family(CurationKind::Repair).to_owned();
+        item.payload = eliot_dreamer_contracts::CurationPayload::Repair(RepairPayload {
+            target: "mem-1".to_owned(),
+            repair: "relink".to_owned(),
+            target_evidence: TargetEvidence {
+                targets: vec!["mem-1".to_owned()],
+                evidence_refs: vec!["e-1".to_owned()],
+            },
+        });
+        item
+    }
+
+    // WORK_UNIT_CASE: 669/2
+    #[test]
+    fn case_02_wrong_curation_subtype_is_rejected() {
+        let mut request = valid_request();
+        request.item = repair_item();
+        request
+            .item
+            .validate()
+            .expect("repair item stays intrinsically valid");
+        assert_eq!(request.item.payload.kind(), CurationKind::Repair);
+        let result = propose_accessibility_or_influence_adjustment(&request)
+            .expect("wrong subtype is an outcome");
+        assert_eq!(result.outcome, AdjustmentOutcome::Rejected);
+        assert_ne!(result.outcome, AdjustmentOutcome::Complete);
+        // Kind/payload drift never reaches an outcome: it fails closed first.
+        let mut drifted = valid_request();
+        drifted.item = repair_item();
+        drifted.item.kind_spelling = "accessibility".to_owned();
+        assert!(drifted.item.validate().is_err());
+        assert!(propose_accessibility_or_influence_adjustment(&drifted).is_err());
+    }
+
+    // WORK_UNIT_CASE: 669/3
+    #[test]
+    fn case_03_missing_or_multiple_axes_are_malformed() {
+        let mut neither = valid_request();
+        neither.accessibility = None;
+        let err = propose_accessibility_or_influence_adjustment(&neither)
+            .expect_err("missing half is malformed");
+        assert!(matches!(err, AccessibilityError::Malformed { phase, .. } if phase == "halves"));
+        let mut both = valid_request();
+        both.influence = Some(influence_half());
+        let err = propose_accessibility_or_influence_adjustment(&both)
+            .expect_err("multiple halves are malformed");
+        assert!(matches!(err, AccessibilityError::Malformed { phase, .. } if phase == "halves"));
+    }
+
+    // WORK_UNIT_CASE: 669/5
+    #[test]
+    fn case_05_axes_stay_independent_across_halves() {
+        let access = valid_request();
+        let result =
+            propose_accessibility_or_influence_adjustment(&access).expect("accessibility parses");
+        assert_eq!(result.outcome, AdjustmentOutcome::Complete);
+        assert_eq!(
+            result.before_snapshot.influence,
+            result.proposed_snapshot.influence
+        );
+        let influence = valid_influence_request();
+        let result =
+            propose_accessibility_or_influence_adjustment(&influence).expect("influence parses");
+        assert_eq!(result.outcome, AdjustmentOutcome::Complete);
+        assert_eq!(
+            result.before_snapshot.accessibility,
+            result.proposed_snapshot.accessibility
+        );
+        assert_eq!(result.before_owners.existence_owner, "owner-existence");
+        assert_eq!(result.before_owners.support_owner, "owner-support");
+        assert_eq!(result.before_owners.privacy_owner, "owner-privacy");
+        assert_eq!(result.before_owners.assurance_owner, "owner-assurance");
+        assert_eq!(result.proposed_owners, result.before_owners);
+    }
+
+    // WORK_UNIT_CASE: 669/6
+    #[test]
+    fn case_06_task_scope_bundle_manifest_grounding_mismatch_fails_safe() {
+        let mut task = valid_request();
+        task.item.task_id = "task-9".to_owned();
+        task.item.receipt.task_id = "task-9".to_owned();
+        let result =
+            propose_accessibility_or_influence_adjustment(&task).expect("task drift is an outcome");
+        assert_eq!(result.outcome, AdjustmentOutcome::Stale);
+        let mut scope = valid_request();
+        scope.item.scope_id = "scope-9".to_owned();
+        scope.item.receipt.scope_id = "scope-9".to_owned();
+        let result = propose_accessibility_or_influence_adjustment(&scope)
+            .expect("scope drift is an outcome");
+        assert_eq!(result.outcome, AdjustmentOutcome::Stale);
+        let mut bundle = valid_request();
+        bundle.frozen_bundle_digest = "0".repeat(64);
+        let result = propose_accessibility_or_influence_adjustment(&bundle)
+            .expect("bundle drift is an outcome");
+        assert_eq!(result.outcome, AdjustmentOutcome::Stale);
+        let mut manifest = valid_request();
+        manifest.frozen_manifest_digest = "0".repeat(64);
+        let result = propose_accessibility_or_influence_adjustment(&manifest)
+            .expect("manifest drift is an outcome");
+        assert_eq!(result.outcome, AdjustmentOutcome::Stale);
+        let mut grounded = valid_request();
+        grounded.grounded.residues.clear();
+        assert!(propose_accessibility_or_influence_adjustment(&grounded).is_err());
+    }
+
+    // WORK_UNIT_CASE: 669/7
+    #[test]
+    fn case_07_replay_is_deterministic_and_changed_ids_conflict() {
+        let request = valid_request();
+        let first =
+            propose_accessibility_or_influence_adjustment(&request).expect("baseline parses");
+        let second =
+            propose_accessibility_or_influence_adjustment(&request).expect("replay parses");
+        assert_eq!(first.proposal_digest, second.proposal_digest);
+        let mut moved = request.clone();
+        moved.projection.subject_revision = "rev-3".to_owned();
+        let stale = propose_accessibility_or_influence_adjustment(&moved)
+            .expect("moved revision is an outcome");
+        assert_eq!(stale.outcome, AdjustmentOutcome::Stale);
+        assert_ne!(stale.proposal_digest, first.proposal_digest);
+        let mut rescoped = valid_influence_request();
+        if let Some(change) = rescoped.influence.as_mut() {
+            change.scope = "scope-9".to_owned();
+        }
+        let result = propose_accessibility_or_influence_adjustment(&rescoped)
+            .expect("rescoped influence is an outcome");
+        assert_eq!(result.outcome, AdjustmentOutcome::Rejected);
+    }
+
+    // WORK_UNIT_CASE: 669/8
+    #[test]
+    fn case_08_pure_call_never_mutates_inputs() {
+        let access = valid_request();
+        let frozen_access = access.clone();
+        let first =
+            propose_accessibility_or_influence_adjustment(&access).expect("accessibility parses");
+        let second = propose_accessibility_or_influence_adjustment(&access).expect("replay parses");
+        assert_eq!(access, frozen_access);
+        assert_eq!(first.proposal_digest, second.proposal_digest);
+        let influence = valid_influence_request();
+        let frozen_influence = influence.clone();
+        let third =
+            propose_accessibility_or_influence_adjustment(&influence).expect("influence parses");
+        let fourth =
+            propose_accessibility_or_influence_adjustment(&influence).expect("replay parses");
+        assert_eq!(influence, frozen_influence);
+        assert_eq!(third.proposal_digest, fourth.proposal_digest);
+    }
+
+    // WORK_UNIT_CASE: 669/10
+    #[test]
+    fn case_10_scoped_dormancy_with_grounded_evidence_completes() {
+        let mut request = valid_request();
+        if let Some(change) = request.accessibility.as_mut() {
+            change.proposed_state = AccessibilityStanding::Dormant;
+            change.global_scope = false;
+        }
+        let result = propose_accessibility_or_influence_adjustment(&request)
+            .expect("scoped dormancy parses");
+        assert_eq!(result.outcome, AdjustmentOutcome::Complete);
+        assert_eq!(
+            result.proposed_snapshot.accessibility,
+            AccessibilityStanding::Dormant
+        );
+        assert_eq!(
+            result.before_snapshot.accessibility,
+            AccessibilityStanding::Exposed
+        );
+    }
+
+    // WORK_UNIT_CASE: 669/11
+    #[test]
+    fn case_11_protected_verifier_visibility_is_required_and_kept() {
+        let mut blank_access = valid_request();
+        if let Some(change) = blank_access.accessibility.as_mut() {
+            change.protected_verifier_access = String::new();
+        }
+        assert!(propose_accessibility_or_influence_adjustment(&blank_access).is_err());
+        let mut blank_verifier = valid_request();
+        blank_verifier.policy.verifier = String::new();
+        assert!(propose_accessibility_or_influence_adjustment(&blank_verifier).is_err());
+        let request = valid_request();
+        let result =
+            propose_accessibility_or_influence_adjustment(&request).expect("guarded move parses");
+        assert_eq!(result.outcome, AdjustmentOutcome::Complete);
+        assert_eq!(result.verifier, "verifier-7");
+        assert!(!result.observable.is_empty());
+    }
+
+    // WORK_UNIT_CASE: 669/12
+    #[test]
+    fn case_12_task_local_increase_completes_but_never_widens_ceilings() {
+        let request = accessibility_increase_request();
+        let result = propose_accessibility_or_influence_adjustment(&request)
+            .expect("task-local increase parses");
+        assert_eq!(result.outcome, AdjustmentOutcome::Complete);
+        assert_eq!(
+            result.proposed_snapshot.accessibility,
+            AccessibilityStanding::Exposed
+        );
+        for flag in 0..4 {
+            let mut widened = request.clone();
+            if let Some(change) = widened.accessibility.as_mut() {
+                match flag {
+                    0 => change.widens_privacy = true,
+                    1 => change.widens_support = true,
+                    2 => change.widens_influence = true,
+                    _ => change.widens_effect = true,
+                }
+            }
+            let result = propose_accessibility_or_influence_adjustment(&widened)
+                .expect("widening is an outcome");
+            assert_eq!(result.outcome, AdjustmentOutcome::Blocked);
+        }
+    }
+
+    // WORK_UNIT_CASE: 669/13
+    #[test]
+    fn case_13_decrease_never_hides_provenance_audit_or_counterevidence() {
+        let request = valid_request();
+        let result =
+            propose_accessibility_or_influence_adjustment(&request).expect("plain decrease parses");
+        assert_eq!(result.outcome, AdjustmentOutcome::Complete);
+        for flag in 0..3 {
+            let mut hidden = request.clone();
+            if let Some(change) = hidden.accessibility.as_mut() {
+                match flag {
+                    0 => change.hides_provenance = true,
+                    1 => change.hides_audit = true,
+                    _ => change.hides_counterevidence = true,
+                }
+            }
+            let result = propose_accessibility_or_influence_adjustment(&hidden)
+                .expect("hiding is an outcome");
+            assert_eq!(result.outcome, AdjustmentOutcome::Blocked);
+        }
+    }
+
+    // WORK_UNIT_CASE: 669/14
+    #[test]
+    fn case_14_zero_or_unknown_use_never_justifies_global_dormancy() {
+        let mut zero = valid_request();
+        zero.usage.retrieval_attempts = 0;
+        zero.usage.retrieval_successes = 0;
+        zero.usage.outcome_observations = 0;
+        zero.usage.outcome_successes = 0;
+        if let Some(change) = zero.accessibility.as_mut() {
+            change.proposed_state = AccessibilityStanding::Dormant;
+            change.global_scope = true;
+        }
+        let result = propose_accessibility_or_influence_adjustment(&zero)
+            .expect("zero-use dormancy is an outcome");
+        assert_eq!(result.outcome, AdjustmentOutcome::Blocked);
+        let mut unknown = valid_request();
+        unknown.usage.unknown_usage = true;
+        if let Some(change) = unknown.accessibility.as_mut() {
+            change.proposed_state = AccessibilityStanding::Dormant;
+            change.global_scope = true;
+        }
+        let result = propose_accessibility_or_influence_adjustment(&unknown)
+            .expect("unknown-use dormancy is an outcome");
+        assert_eq!(result.outcome, AdjustmentOutcome::Blocked);
+    }
+
+    // WORK_UNIT_CASE: 669/15
+    #[test]
+    fn case_15_observation_denominator_bounds_completeness() {
+        let mut thin = valid_request();
+        thin.policy.evidence_minimum = 9;
+        let result = propose_accessibility_or_influence_adjustment(&thin)
+            .expect("thin evidence is an outcome");
+        assert_eq!(result.outcome, AdjustmentOutcome::Partial);
+        let mut met = valid_request();
+        met.policy.evidence_minimum = 3;
+        let result =
+            propose_accessibility_or_influence_adjustment(&met).expect("met minimum parses");
+        assert_eq!(result.outcome, AdjustmentOutcome::Complete);
+        let mut over_retrieved = valid_request();
+        over_retrieved.usage.retrieval_successes = 41;
+        assert!(propose_accessibility_or_influence_adjustment(&over_retrieved).is_err());
+        let mut over_outcome = valid_request();
+        over_outcome.usage.outcome_successes = 4;
+        assert!(propose_accessibility_or_influence_adjustment(&over_outcome).is_err());
+    }
+
+    // WORK_UNIT_CASE: 669/16
+    #[test]
+    fn case_16_mixed_outcomes_permit_bounded_refinement_only() {
+        let mut mixed = valid_request();
+        mixed.usage.outcome_successes = 1;
+        let result =
+            propose_accessibility_or_influence_adjustment(&mixed).expect("mixed evidence parses");
+        assert_eq!(result.outcome, AdjustmentOutcome::Complete);
+        let mut raised = mixed.clone();
+        raised.policy.evidence_minimum = 9;
+        let result = propose_accessibility_or_influence_adjustment(&raised)
+            .expect("raised minimum is an outcome");
+        assert_eq!(result.outcome, AdjustmentOutcome::Partial);
+        assert_ne!(result.outcome, AdjustmentOutcome::Complete);
+    }
+
+    // WORK_UNIT_CASE: 669/17
+    #[test]
+    fn case_17_reopen_keeps_live_triggers_visible_with_conditions() {
+        let mut reopened = valid_request();
+        reopened.protection.negative_memory[0].reopen_evidence_ref = Some("reopen-1".to_owned());
+        let result = propose_accessibility_or_influence_adjustment(&reopened)
+            .expect("reopened trigger parses");
+        assert_eq!(result.outcome, AdjustmentOutcome::Complete);
+        let mut dropped = reopened.clone();
+        dropped.protection.retained_counterevidence_refs.clear();
+        let result = propose_accessibility_or_influence_adjustment(&dropped)
+            .expect("dropped trigger is an outcome");
+        assert_eq!(result.outcome, AdjustmentOutcome::Blocked);
+    }
+
+    // WORK_UNIT_CASE: 669/18
+    #[test]
+    fn case_18_affected_surfaces_carry_an_exact_plan() {
+        let mut request = valid_request();
+        request.affected = vec![
+            path_with("ctx-1", AffectedPathKind::Context),
+            path_with("cue-1", AffectedPathKind::Cue),
+            path_with("dep-1", AffectedPathKind::Derivative),
+        ];
+        request.dispositions = vec![
+            disposition_with("ctx-1", DependentDispositionKind::Revalidate),
+            disposition_with("cue-1", DependentDispositionKind::ReconcileByOwner),
+            disposition_with("dep-1", DependentDispositionKind::Adjust),
+        ];
+        request.closure_denominator = TargetDenominator {
+            mode: AtomicityMode::PerMember,
+            members: vec!["ctx-1".to_owned(), "cue-1".to_owned(), "dep-1".to_owned()],
+            expected_total: 3,
+        };
+        let result =
+            propose_accessibility_or_influence_adjustment(&request).expect("surfaced plan parses");
+        assert_eq!(result.outcome, AdjustmentOutcome::Complete);
+        assert_eq!(result.dispositions.len(), 3);
+        let mut unplanned = request.clone();
+        if let Some(change) = unplanned.accessibility.as_mut() {
+            change.projection_plan = String::new();
+        }
+        assert!(propose_accessibility_or_influence_adjustment(&unplanned).is_err());
+    }
+
+    // WORK_UNIT_CASE: 669/19
+    #[test]
+    fn case_19_exact_inverse_and_expiry_are_mandatory() {
+        let mut no_access_expiry = valid_request();
+        if let Some(change) = no_access_expiry.accessibility.as_mut() {
+            change.expiry_ms = None;
+        }
+        let result = propose_accessibility_or_influence_adjustment(&no_access_expiry)
+            .expect("missing accessibility expiry is an outcome");
+        assert_eq!(result.outcome, AdjustmentOutcome::Blocked);
+        let mut no_influence_expiry = valid_influence_request();
+        no_influence_expiry.policy.expiry_ms = None;
+        let result = propose_accessibility_or_influence_adjustment(&no_influence_expiry)
+            .expect("missing influence expiry is an outcome");
+        assert_eq!(result.outcome, AdjustmentOutcome::Blocked);
+        let mut no_inverse = valid_request();
+        if let Some(change) = no_inverse.accessibility.as_mut() {
+            change.inverse_note = String::new();
+        }
+        assert!(propose_accessibility_or_influence_adjustment(&no_inverse).is_err());
+        let mut no_policy_inverse = valid_request();
+        no_policy_inverse.policy.inverse_note = String::new();
+        assert!(propose_accessibility_or_influence_adjustment(&no_policy_inverse).is_err());
+    }
+
+    // WORK_UNIT_CASE: 669/20
+    #[test]
+    fn case_20_rejected_candidates_apply_nothing() {
+        let mut request = valid_request();
+        request.policy.target_subject = "other-subject".to_owned();
+        let result = propose_accessibility_or_influence_adjustment(&request)
+            .expect("off-target policy is an outcome");
+        assert_eq!(result.outcome, AdjustmentOutcome::Rejected);
+        assert_eq!(result.before_snapshot, result.proposed_snapshot);
+        assert_eq!(result.before_owners, result.proposed_owners);
+        assert!(result.observable.is_empty());
+        assert!(result.verifier.is_empty());
+        assert_eq!(result.expiry_ms, None);
+        assert!(is_hex64_lower(&result.proposal_digest));
+        assert_eq!(
+            outcome_rejection_hint(&result.outcome),
+            Some(CurationRejectionCode::IdentityMismatch)
+        );
+    }
+
+    // WORK_UNIT_CASE: 669/21
+    #[test]
+    fn case_21_bounded_influence_increase_respects_source_ceilings() {
+        let request = influence_increase_request();
+        let result = propose_accessibility_or_influence_adjustment(&request)
+            .expect("ceiled increase parses");
+        assert_eq!(result.outcome, AdjustmentOutcome::Complete);
+        assert_eq!(result.proposed_snapshot.influence, InfluenceStanding::Full);
+        let mut over = request.clone();
+        if let Some(change) = over.influence.as_mut() {
+            change.within_ceilings = false;
+        }
+        let result = propose_accessibility_or_influence_adjustment(&over)
+            .expect("over-ceiling increase is an outcome");
+        assert_eq!(result.outcome, AdjustmentOutcome::Blocked);
+    }
+
+    // WORK_UNIT_CASE: 669/22
+    #[test]
+    fn case_22_quarantined_decrease_is_a_review_candidate_only() {
+        let mut request = valid_influence_request();
+        if let Some(change) = request.influence.as_mut() {
+            change.proposed_standing = InfluenceStanding::Minimal;
+        }
+        if let Some(closure) = request.influence_closure.as_mut() {
+            closure.current_standing = LocalClosureStanding::Quarantined;
+            closure.invalidation_reason = Some(LocalRevocationClass::WrongScope);
+        }
+        let frozen = request.clone();
+        let result = propose_accessibility_or_influence_adjustment(&request)
+            .expect("quarantined decrease parses");
+        assert_eq!(result.outcome, AdjustmentOutcome::Complete);
+        assert_eq!(result.axis, Axis::Influence);
+        assert_eq!(
+            result.proposed_snapshot.influence,
+            InfluenceStanding::Minimal
+        );
+        assert_eq!(request, frozen, "quarantine review never mutates inputs");
+    }
+
+    // WORK_UNIT_CASE: 669/24
+    #[test]
+    fn case_24_unknown_stale_or_mismatched_closure_never_completes() {
+        let mut unknown = valid_influence_request();
+        if let Some(closure) = unknown.influence_closure.as_mut() {
+            closure.current_standing = LocalClosureStanding::Unknown;
+        }
+        let result = propose_accessibility_or_influence_adjustment(&unknown)
+            .expect("unknown standing is an outcome");
+        assert_eq!(result.outcome, AdjustmentOutcome::Blocked);
+        let mut revised = valid_influence_request();
+        if let Some(closure) = revised.influence_closure.as_mut() {
+            closure.closure_revision = "rev-9".to_owned();
+        }
+        let result = propose_accessibility_or_influence_adjustment(&revised)
+            .expect("moved closure revision is an outcome");
+        assert_eq!(result.outcome, AdjustmentOutcome::Stale);
+        let mut rerooted = valid_influence_request();
+        if let Some(closure) = rerooted.influence_closure.as_mut() {
+            closure.root_ref = "other-subject".to_owned();
+        }
+        let result = propose_accessibility_or_influence_adjustment(&rerooted)
+            .expect("rerooted closure is an outcome");
+        assert_eq!(result.outcome, AdjustmentOutcome::Rejected);
+        let mut rescoped = valid_influence_request();
+        if let Some(closure) = rescoped.influence_closure.as_mut() {
+            closure.scope_id = "scope-9".to_owned();
+        }
+        let result = propose_accessibility_or_influence_adjustment(&rescoped)
+            .expect("rescoped closure is an outcome");
+        assert_eq!(result.outcome, AdjustmentOutcome::Rejected);
+        let mut repointed = valid_influence_request();
+        if let Some(closure) = repointed.influence_closure.as_mut() {
+            closure.policy_id = "policy-9".to_owned();
+        }
+        let result = propose_accessibility_or_influence_adjustment(&repointed)
+            .expect("repointed closure is an outcome");
+        assert_eq!(result.outcome, AdjustmentOutcome::Rejected);
+        let mut refenced = valid_influence_request();
+        if let Some(closure) = refenced.influence_closure.as_mut() {
+            closure.state_fence = test_fence_seq(2);
+        }
+        let result = propose_accessibility_or_influence_adjustment(&refenced)
+            .expect("refenced closure is an outcome");
+        assert_eq!(result.outcome, AdjustmentOutcome::Stale);
+    }
+
+    // WORK_UNIT_CASE: 669/25
+    #[test]
+    fn case_25_every_member_is_accounted_or_the_move_blocks() {
+        let mut uncovered = valid_influence_request();
+        if let Some(closure) = uncovered.influence_closure.as_mut() {
+            closure.dependent_refs = vec!["dec-1".to_owned()];
+        }
+        let result = propose_accessibility_or_influence_adjustment(&uncovered)
+            .expect("uncovered member is an outcome");
+        assert_eq!(result.outcome, AdjustmentOutcome::Blocked);
+        let mut short_denom = valid_influence_request();
+        short_denom.closure_denominator = TargetDenominator {
+            mode: AtomicityMode::PerMember,
+            members: vec!["dep-1".to_owned()],
+            expected_total: 1,
+        };
+        let result = propose_accessibility_or_influence_adjustment(&short_denom)
+            .expect("short denominator is an outcome");
+        assert_eq!(result.outcome, AdjustmentOutcome::Blocked);
+        let mut short_disp = valid_influence_request();
+        short_disp
+            .dispositions
+            .retain(|outcome| outcome.handle == "dep-1");
+        let result = propose_accessibility_or_influence_adjustment(&short_disp)
+            .expect("short dispositions are an outcome");
+        assert_eq!(result.outcome, AdjustmentOutcome::Blocked);
+        let mut extra_denom = valid_influence_request();
+        extra_denom.closure_denominator = TargetDenominator {
+            mode: AtomicityMode::PerMember,
+            members: vec!["dec-1".to_owned(), "dep-1".to_owned(), "extra-1".to_owned()],
+            expected_total: 3,
+        };
+        let result = propose_accessibility_or_influence_adjustment(&extra_denom)
+            .expect("unknown member is an outcome");
+        assert_eq!(result.outcome, AdjustmentOutcome::Blocked);
+    }
+
+    // WORK_UNIT_CASE: 669/26
+    #[test]
+    fn case_26_review_and_decision_owners_are_required() {
+        let mut no_review = valid_influence_request();
+        if let Some(change) = no_review.influence.as_mut() {
+            change.review_owner_ref = String::new();
+        }
+        assert!(propose_accessibility_or_influence_adjustment(&no_review).is_err());
+        let mut no_decision = valid_influence_request();
+        if let Some(change) = no_decision.influence.as_mut() {
+            change.decision_owner_ref = String::new();
+        }
+        assert!(propose_accessibility_or_influence_adjustment(&no_decision).is_err());
+        let control = valid_influence_request();
+        let result =
+            propose_accessibility_or_influence_adjustment(&control).expect("owned review parses");
+        assert_eq!(result.outcome, AdjustmentOutcome::Complete);
+    }
+
+    // WORK_UNIT_CASE: 669/27
+    #[test]
+    fn case_27_retrieval_and_model_agreement_never_raise_influence() {
+        let mut retrieved = influence_increase_request();
+        retrieved.usage.retrieval_attempts = 100;
+        retrieved.usage.retrieval_successes = 100;
+        retrieved.usage.outcome_observations = 1;
+        retrieved.usage.outcome_successes = 1;
+        let result = propose_accessibility_or_influence_adjustment(&retrieved)
+            .expect("retrieval-heavy increase is an outcome");
+        assert_eq!(result.outcome, AdjustmentOutcome::Partial);
+        let mut agreed = influence_increase_request();
+        agreed.usage.writer_utility_note = "approved by model agreement for wider use".to_owned();
+        let result = propose_accessibility_or_influence_adjustment(&agreed)
+            .expect("model agreement is an outcome");
+        assert_eq!(result.outcome, AdjustmentOutcome::Blocked);
+    }
+
+    // WORK_UNIT_CASE: 669/28
+    #[test]
+    fn case_28_influence_decrease_never_deletes_or_shifts_other_axes() {
+        let mut deleting = valid_influence_request();
+        if let Some(change) = deleting.influence.as_mut() {
+            change.deletes_subject = true;
+        }
+        let result = propose_accessibility_or_influence_adjustment(&deleting)
+            .expect("deleting decrease is an outcome");
+        assert_eq!(result.outcome, AdjustmentOutcome::Rejected);
+        let request = valid_influence_request();
+        let result =
+            propose_accessibility_or_influence_adjustment(&request).expect("plain decrease parses");
+        assert_eq!(result.outcome, AdjustmentOutcome::Complete);
+        assert_eq!(
+            result.before_snapshot.accessibility,
+            result.proposed_snapshot.accessibility
+        );
+        assert_eq!(result.before_owners, result.proposed_owners);
+    }
+
+    // WORK_UNIT_CASE: 669/29
+    #[test]
+    fn case_29_single_success_never_creates_system_wide_influence() {
+        let mut wide = valid_influence_request();
+        if let Some(change) = wide.influence.as_mut() {
+            change.claims_system_wide = true;
+        }
+        let result = propose_accessibility_or_influence_adjustment(&wide)
+            .expect("system-wide claim is an outcome");
+        assert_eq!(result.outcome, AdjustmentOutcome::Blocked);
+        let request = valid_influence_request();
+        let result = propose_accessibility_or_influence_adjustment(&request)
+            .expect("scoped decrease parses");
+        assert_eq!(result.outcome, AdjustmentOutcome::Complete);
+        assert_eq!(
+            result.proposed_snapshot.influence,
+            InfluenceStanding::Bounded
+        );
+    }
+
+    // WORK_UNIT_CASE: 669/30
+    #[test]
+    fn case_30_revoked_closure_needs_a_reason_and_stays_a_candidate() {
+        let mut request = valid_influence_request();
+        if let Some(closure) = request.influence_closure.as_mut() {
+            closure.current_standing = LocalClosureStanding::Revoked;
+            closure.invalidation_reason = Some(LocalRevocationClass::SourceRevoked);
+        }
+        let frozen = request.clone();
+        let result = propose_accessibility_or_influence_adjustment(&request)
+            .expect("reasoned revocation parses");
+        assert_eq!(result.outcome, AdjustmentOutcome::Complete);
+        assert_eq!(request, frozen, "revocation review never mutates inputs");
+        let mut reasonless = valid_influence_request();
+        if let Some(closure) = reasonless.influence_closure.as_mut() {
+            closure.current_standing = LocalClosureStanding::Revoked;
+        }
+        assert!(propose_accessibility_or_influence_adjustment(&reasonless).is_err());
+    }
+
+    // WORK_UNIT_CASE: 669/31
+    #[test]
+    fn case_31_quarantine_preserves_history_branch_and_renewal() {
+        let mut request = valid_influence_request();
+        if let Some(closure) = request.influence_closure.as_mut() {
+            closure.current_standing = LocalClosureStanding::Quarantined;
+            closure.invalidation_reason = Some(LocalRevocationClass::Poisoned);
+        }
+        let result = propose_accessibility_or_influence_adjustment(&request)
+            .expect("quarantined move parses");
+        assert_eq!(result.outcome, AdjustmentOutcome::Complete);
+        assert_eq!(
+            result.renewal_condition,
+            "reopen when scope-1 frontier advances"
+        );
+        assert_eq!(result.expiry_ms, Some(1_800_000_000_000));
+        assert_eq!(
+            request
+                .influence_closure
+                .as_ref()
+                .expect("closure present")
+                .invalidation_reason,
+            Some(LocalRevocationClass::Poisoned)
+        );
+        let mut no_renewal = valid_request();
+        no_renewal.policy.renewal_condition = String::new();
+        assert!(propose_accessibility_or_influence_adjustment(&no_renewal).is_err());
+    }
+
+    // WORK_UNIT_CASE: 669/32
+    #[test]
+    fn case_32_no_traversal_or_applied_revocation_receipt_exists() {
+        let mut request = valid_influence_request();
+        if let Some(closure) = request.influence_closure.as_mut() {
+            closure.current_standing = LocalClosureStanding::Revoked;
+            closure.invalidation_reason = Some(LocalRevocationClass::SourceRevoked);
+        }
+        let frozen = request.clone();
+        let first = propose_accessibility_or_influence_adjustment(&request)
+            .expect("revocation review parses");
+        let second =
+            propose_accessibility_or_influence_adjustment(&request).expect("replay parses");
+        assert_eq!(request, frozen, "no traversal mutates the closure");
+        assert_eq!(first.proposal_digest, second.proposal_digest);
+        assert_eq!(first.outcome, AdjustmentOutcome::Complete);
+    }
+
+    // WORK_UNIT_CASE: 669/33
+    #[test]
+    fn case_33_every_protection_class_blocks_or_narrows_unsafe_moves() {
+        let mut missing = valid_request();
+        missing.protection.protections[0].satisfied = false;
+        let result = propose_accessibility_or_influence_adjustment(&missing)
+            .expect("missing mandatory is an outcome");
+        assert_eq!(result.outcome, AdjustmentOutcome::Blocked);
+        let mut narrowed = valid_request();
+        narrowed.protection.protections[0].mandatory = false;
+        narrowed.protection.protections[0].satisfied = false;
+        let result =
+            propose_accessibility_or_influence_adjustment(&narrowed).expect("optional gap parses");
+        assert_eq!(result.outcome, AdjustmentOutcome::Complete);
+        let mut unretained = valid_request();
+        unretained.protection.protections.push(ProtectionReason {
+            reason_id: "extra-evidence".to_owned(),
+            trigger: "rival report r-2".to_owned(),
+            mandatory: false,
+            satisfied: true,
+            unknown: false,
+            counterevidence_ref: Some("r-2".to_owned()),
+        });
+        unretained
+            .protection
+            .protections
+            .sort_by(|left, right| left.reason_id.cmp(&right.reason_id));
+        let result = propose_accessibility_or_influence_adjustment(&unretained)
+            .expect("unretained counterevidence is an outcome");
+        assert_eq!(result.outcome, AdjustmentOutcome::Blocked);
+    }
+
+    // WORK_UNIT_CASE: 669/35
+    #[test]
+    fn case_35_exact_triggers_persist_until_extinction_or_reopen() {
+        let mut extinct = valid_request();
+        extinct.protection.negative_memory[0].extinguished = true;
+        extinct.protection.negative_memory[0].extinction_evidence_ref = Some("ext-1".to_owned());
+        let result = propose_accessibility_or_influence_adjustment(&extinct)
+            .expect("extinguished trigger parses");
+        assert_eq!(result.outcome, AdjustmentOutcome::Complete);
+        let mut unevidenced = valid_request();
+        unevidenced.protection.negative_memory[0].extinguished = true;
+        let result = propose_accessibility_or_influence_adjustment(&unevidenced)
+            .expect("unevidenced extinction is an outcome");
+        assert_eq!(result.outcome, AdjustmentOutcome::Blocked);
+        let live = valid_request();
+        let result = propose_accessibility_or_influence_adjustment(&live)
+            .expect("retained live trigger parses");
+        assert_eq!(result.outcome, AdjustmentOutcome::Complete);
+    }
+
+    // WORK_UNIT_CASE: 669/36
+    #[test]
+    fn case_36_prefix_similarity_and_case_never_suppress_exact_triggers() {
+        let mut prefixed = valid_request();
+        prefixed.protection.retained_counterevidence_refs = vec!["m-1-prefix".to_owned()];
+        let result = propose_accessibility_or_influence_adjustment(&prefixed)
+            .expect("prefix-only retention is an outcome");
+        assert_eq!(result.outcome, AdjustmentOutcome::Blocked);
+        let mut cased = valid_request();
+        cased.protection.retained_counterevidence_refs = vec!["M-1".to_owned()];
+        let result = propose_accessibility_or_influence_adjustment(&cased)
+            .expect("case drift is an outcome");
+        assert_eq!(result.outcome, AdjustmentOutcome::Blocked);
+        let mut exact = valid_request();
+        exact.protection.retained_counterevidence_refs =
+            vec!["m-1".to_owned(), "m-1-prefix".to_owned()];
+        let result =
+            propose_accessibility_or_influence_adjustment(&exact).expect("exact retention parses");
+        assert_eq!(result.outcome, AdjustmentOutcome::Complete);
+    }
+
+    // WORK_UNIT_CASE: 669/37
+    #[test]
+    fn case_37_extinction_review_never_deletes_history() {
+        let mut request = valid_request();
+        request.protection.negative_memory[0].extinguished = true;
+        request.protection.negative_memory[0].extinction_evidence_ref = Some("ext-1".to_owned());
+        let result = propose_accessibility_or_influence_adjustment(&request)
+            .expect("extinction review parses");
+        assert_eq!(result.outcome, AdjustmentOutcome::Complete);
+        assert_eq!(request.protection.negative_memory.len(), 1);
+        assert_eq!(request.protection.negative_memory[0].trigger, "m-1");
+        let mut reopened = valid_request();
+        reopened.protection.negative_memory[0].reopen_evidence_ref = Some("reopen-9".to_owned());
+        let result =
+            propose_accessibility_or_influence_adjustment(&reopened).expect("reopen review parses");
+        assert_eq!(result.outcome, AdjustmentOutcome::Complete);
+    }
+
+    // WORK_UNIT_CASE: 669/38
+    #[test]
+    fn case_38_activation_use_and_benefit_are_distinct_evidence() {
+        let mut benefitless = valid_request();
+        benefitless.usage.outcome_successes = 0;
+        let result = propose_accessibility_or_influence_adjustment(&benefitless)
+            .expect("benefitless use parses");
+        assert_eq!(result.outcome, AdjustmentOutcome::Complete);
+        let mut thin = valid_request();
+        thin.usage.outcome_observations = 1;
+        thin.usage.outcome_successes = 1;
+        let result = propose_accessibility_or_influence_adjustment(&thin)
+            .expect("thin outcomes are an outcome");
+        assert_eq!(result.outcome, AdjustmentOutcome::Partial);
+    }
+
+    // WORK_UNIT_CASE: 669/39
+    #[test]
+    fn case_39_self_report_and_guarantee_language_never_authorize() {
+        let mut guaranteed = valid_request();
+        guaranteed.usage.writer_utility_note =
+            "writer reports guaranteed benefit across scopes".to_owned();
+        let result = propose_accessibility_or_influence_adjustment(&guaranteed)
+            .expect("guarantee language is an outcome");
+        assert_eq!(result.outcome, AdjustmentOutcome::Blocked);
+        let mut mandated = valid_request();
+        mandated.usage.writer_utility_note = "downstream results mandates use elsewhere".to_owned();
+        let result = propose_accessibility_or_influence_adjustment(&mandated)
+            .expect("mandate language is an outcome");
+        assert_eq!(result.outcome, AdjustmentOutcome::Blocked);
+        let request = valid_request();
+        let result = propose_accessibility_or_influence_adjustment(&request)
+            .expect("neutral utility parses");
+        assert_eq!(result.outcome, AdjustmentOutcome::Complete);
+    }
+
+    // WORK_UNIT_CASE: 669/40
+    #[test]
+    fn case_40_named_counterevidence_must_stay_retained() {
+        let mut dropped = valid_request();
+        dropped.protection.protections[0].counterevidence_ref = Some("m-2".to_owned());
+        let result = propose_accessibility_or_influence_adjustment(&dropped)
+            .expect("dropped counterevidence is an outcome");
+        assert_eq!(result.outcome, AdjustmentOutcome::Blocked);
+        let mut restored = dropped.clone();
+        restored.protection.retained_counterevidence_refs =
+            vec!["m-1".to_owned(), "m-2".to_owned()];
+        let result = propose_accessibility_or_influence_adjustment(&restored)
+            .expect("restored counterevidence parses");
+        assert_eq!(result.outcome, AdjustmentOutcome::Complete);
+    }
+
+    // WORK_UNIT_CASE: 669/42
+    #[test]
+    fn case_42_dimensions_stay_independent_with_no_averaging() {
+        let mut failed = valid_request();
+        failed.preservation.verdicts[0].passed = false;
+        let result = propose_accessibility_or_influence_adjustment(&failed)
+            .expect("failed dimension is an outcome");
+        assert_eq!(result.outcome, AdjustmentOutcome::Blocked);
+        let mut unknown = valid_request();
+        unknown.preservation.verdicts[3].known = false;
+        let result = propose_accessibility_or_influence_adjustment(&unknown)
+            .expect("unknown dimension is an outcome");
+        assert_eq!(result.outcome, AdjustmentOutcome::Blocked);
+        let request = valid_request();
+        let result = propose_accessibility_or_influence_adjustment(&request)
+            .expect("passing dimensions parse");
+        assert_eq!(result.outcome, AdjustmentOutcome::Complete);
+    }
+
+    // WORK_UNIT_CASE: 669/43
+    #[test]
+    fn case_43_restore_needs_exact_prior_revision_bindings() {
+        let mut restore = valid_request();
+        restore.policy.operation = AdjustmentOperation::Restore;
+        restore.policy.direction = AdjustmentDirection::Lateral;
+        if let Some(change) = restore.accessibility.as_mut() {
+            change.proposed_state = AccessibilityStanding::Restricted;
+        }
+        let result =
+            propose_accessibility_or_influence_adjustment(&restore).expect("bound restore parses");
+        assert_eq!(result.outcome, AdjustmentOutcome::Complete);
+        assert_eq!(
+            result.proposed_snapshot.accessibility,
+            AccessibilityStanding::Restricted
+        );
+        let mut same = valid_request();
+        same.policy.operation = AdjustmentOperation::Restore;
+        same.policy.direction = AdjustmentDirection::Lateral;
+        if let Some(change) = same.accessibility.as_mut() {
+            change.proposed_state = AccessibilityStanding::Exposed;
+        }
+        let result = propose_accessibility_or_influence_adjustment(&same)
+            .expect("same-state restore is an outcome");
+        assert_eq!(result.outcome, AdjustmentOutcome::Rejected);
+        let mut rebound = restore.clone();
+        if let Some(change) = rebound.accessibility.as_mut() {
+            change.before_owner = "other-owner".to_owned();
+        }
+        let result = propose_accessibility_or_influence_adjustment(&rebound)
+            .expect("rebound restore is an outcome");
+        assert_eq!(result.outcome, AdjustmentOutcome::Stale);
+    }
+
+    // WORK_UNIT_CASE: 669/44
+    #[test]
+    fn case_44_missing_inverse_blocks_and_lateral_refinement_passes() {
+        let mut no_inverse = valid_request();
+        if let Some(change) = no_inverse.accessibility.as_mut() {
+            change.inverse_note = String::new();
+        }
+        assert!(propose_accessibility_or_influence_adjustment(&no_inverse).is_err());
+        let mut no_policy_inverse = valid_request();
+        no_policy_inverse.policy.inverse_note = String::new();
+        assert!(propose_accessibility_or_influence_adjustment(&no_policy_inverse).is_err());
+        let mut lateral = valid_request();
+        lateral.policy.operation = AdjustmentOperation::Narrow;
+        lateral.policy.direction = AdjustmentDirection::Lateral;
+        if let Some(change) = lateral.accessibility.as_mut() {
+            change.proposed_state = AccessibilityStanding::Exposed;
+        }
+        let result = propose_accessibility_or_influence_adjustment(&lateral)
+            .expect("lateral refinement parses");
+        assert_eq!(result.outcome, AdjustmentOutcome::Complete);
+        assert_eq!(result.before_snapshot, result.proposed_snapshot);
+    }
+
+    // WORK_UNIT_CASE: 669/45
+    #[test]
+    fn case_45_expiry_and_renewal_are_carried_exactly_never_filled() {
+        let request = valid_request();
+        let result =
+            propose_accessibility_or_influence_adjustment(&request).expect("valid expiry parses");
+        assert_eq!(result.expiry_ms, Some(1_800_000_000_000));
+        assert_eq!(
+            result.renewal_condition,
+            "reopen when scope-1 frontier advances"
+        );
+        assert_eq!(result.window_note, "window w-10");
+        let mut custom = valid_request();
+        if let Some(change) = custom.accessibility.as_mut() {
+            change.expiry_ms = Some(42);
+        }
+        let result =
+            propose_accessibility_or_influence_adjustment(&custom).expect("custom expiry parses");
+        assert_eq!(result.expiry_ms, Some(42));
+        let mut missing = valid_request();
+        if let Some(change) = missing.accessibility.as_mut() {
+            change.expiry_ms = None;
+        }
+        let result = propose_accessibility_or_influence_adjustment(&missing)
+            .expect("missing expiry is an outcome");
+        assert_eq!(result.outcome, AdjustmentOutcome::Blocked);
+    }
+
+    // WORK_UNIT_CASE: 669/46
+    #[test]
+    fn case_46_all_seven_dimensions_must_pass() {
+        let request = valid_request();
+        assert_eq!(request.preservation.verdicts.len(), 7);
+        let result = propose_accessibility_or_influence_adjustment(&request)
+            .expect("seven passing dimensions parse");
+        assert_eq!(result.outcome, AdjustmentOutcome::Complete);
+        let mut short = valid_request();
+        short.preservation.verdicts.pop();
+        assert!(propose_accessibility_or_influence_adjustment(&short).is_err());
+    }
+
+    // WORK_UNIT_CASE: 669/47
+    #[test]
+    fn case_47_each_failed_or_unknown_dimension_blocks_without_revalidation() {
+        for index in 0..7 {
+            let mut failed = valid_request();
+            failed.preservation.verdicts[index].passed = false;
+            let frozen = failed.clone();
+            let result = propose_accessibility_or_influence_adjustment(&failed)
+                .expect("failed dimension is an outcome");
+            assert_eq!(result.outcome, AdjustmentOutcome::Blocked);
+            assert_eq!(failed, frozen, "dimension review never revalidates inputs");
+            let mut unknown = valid_request();
+            unknown.preservation.verdicts[index].known = false;
+            let result = propose_accessibility_or_influence_adjustment(&unknown)
+                .expect("unknown dimension is an outcome");
+            assert_eq!(result.outcome, AdjustmentOutcome::Blocked);
+        }
+    }
+
+    // WORK_UNIT_CASE: 669/48
+    #[test]
+    fn case_48_no_outcome_applies_owner_write_effect_or_finish_state() {
+        let mut rejected = valid_request();
+        rejected.policy.target_subject = "other-subject".to_owned();
+        let result = propose_accessibility_or_influence_adjustment(&rejected)
+            .expect("rejected move is an outcome");
+        assert_eq!(result.outcome, AdjustmentOutcome::Rejected);
+        assert_eq!(result.before_owners, result.proposed_owners);
+        assert_eq!(result.before_owners, test_owners());
+        let mut blocked = valid_influence_request();
+        blocked.protection.protections[0].satisfied = false;
+        let result = propose_accessibility_or_influence_adjustment(&blocked)
+            .expect("blocked move is an outcome");
+        assert_eq!(result.outcome, AdjustmentOutcome::Blocked);
+        assert_eq!(result.before_owners, result.proposed_owners);
+        assert_eq!(result.proposed_owners, test_owners());
+    }
+
+    // WORK_UNIT_CASE: 669/49
+    #[test]
+    fn case_49_terminal_outcomes_stay_distinct_with_exact_hints() {
+        let complete = propose_accessibility_or_influence_adjustment(&valid_request())
+            .expect("baseline parses");
+        assert_eq!(complete.outcome, AdjustmentOutcome::Complete);
+        assert_eq!(outcome_rejection_hint(&complete.outcome), None);
+        let mut thin = valid_request();
+        thin.policy.evidence_minimum = 9;
+        let partial = propose_accessibility_or_influence_adjustment(&thin)
+            .expect("thin evidence is an outcome");
+        assert_eq!(partial.outcome, AdjustmentOutcome::Partial);
+        assert_eq!(
+            outcome_rejection_hint(&partial.outcome),
+            Some(CurationRejectionCode::PreservationFailed)
+        );
+        let mut unauthorized = valid_request();
+        unauthorized.receipt.validator_policy = "policy-9".to_owned();
+        let abstention = propose_accessibility_or_influence_adjustment(&unauthorized)
+            .expect("expired authorization is an outcome");
+        assert_eq!(abstention.outcome, AdjustmentOutcome::Abstention);
+        assert_eq!(
+            outcome_rejection_hint(&abstention.outcome),
+            Some(CurationRejectionCode::LineageMismatch)
+        );
+        let mut moved = valid_request();
+        if let Some(change) = moved.accessibility.as_mut() {
+            change.before_revision = "rev-9".to_owned();
+        }
+        let stale = propose_accessibility_or_influence_adjustment(&moved)
+            .expect("moved revision is an outcome");
+        assert_eq!(stale.outcome, AdjustmentOutcome::Stale);
+        assert_eq!(
+            outcome_rejection_hint(&stale.outcome),
+            Some(CurationRejectionCode::IdentityMismatch)
+        );
+        let mut off_target = valid_request();
+        off_target.policy.target_subject = "other-subject".to_owned();
+        let rejected = propose_accessibility_or_influence_adjustment(&off_target)
+            .expect("off-target policy is an outcome");
+        assert_eq!(rejected.outcome, AdjustmentOutcome::Rejected);
+        assert_eq!(
+            outcome_rejection_hint(&rejected.outcome),
+            Some(CurationRejectionCode::IdentityMismatch)
+        );
+        let mut unguarded = valid_request();
+        unguarded.protection.protections[0].satisfied = false;
+        let blocked = propose_accessibility_or_influence_adjustment(&unguarded)
+            .expect("unguarded move is an outcome");
+        assert_eq!(blocked.outcome, AdjustmentOutcome::Blocked);
+        assert_eq!(
+            outcome_rejection_hint(&blocked.outcome),
+            Some(CurationRejectionCode::PreservationFailed)
+        );
+        let outcomes = [
+            complete.outcome,
+            partial.outcome,
+            abstention.outcome,
+            stale.outcome,
+            rejected.outcome,
+            blocked.outcome,
+        ];
+        let mut seen = std::collections::HashSet::new();
+        for outcome in outcomes {
+            assert!(seen.insert(outcome), "terminal outcomes stay distinct");
+        }
+    }
+
+    // WORK_UNIT_CASE: 669/50
+    #[test]
+    fn case_50_set_order_is_deterministic_and_unsorted_input_fails() {
+        let request = two_path_request();
+        let first =
+            propose_accessibility_or_influence_adjustment(&request).expect("two-path parses");
+        assert_eq!(first.outcome, AdjustmentOutcome::Complete);
+        let second =
+            propose_accessibility_or_influence_adjustment(&request).expect("replay parses");
+        assert_eq!(first.proposal_digest, second.proposal_digest);
+        assert_eq!(first.dispositions, request.dispositions);
+        let mut shuffled_paths = request.clone();
+        shuffled_paths.affected.reverse();
+        assert!(propose_accessibility_or_influence_adjustment(&shuffled_paths).is_err());
+        let mut shuffled_disp = request.clone();
+        shuffled_disp.dispositions.reverse();
+        assert!(propose_accessibility_or_influence_adjustment(&shuffled_disp).is_err());
+        let mut shuffled_refs = valid_request();
+        shuffled_refs.protection.retained_counterevidence_refs =
+            vec!["m-2".to_owned(), "m-1".to_owned()];
+        assert!(propose_accessibility_or_influence_adjustment(&shuffled_refs).is_err());
+        let mut shuffled_closure = valid_influence_request();
+        if let Some(closure) = shuffled_closure.influence_closure.as_mut() {
+            closure.dependent_refs.reverse();
+        }
+        assert!(propose_accessibility_or_influence_adjustment(&shuffled_closure).is_err());
+    }
+
+    // WORK_UNIT_CASE: 669/51
+    #[test]
+    fn case_51_every_independent_bound_fails_closed_one_over() {
+        let mut many_affected = valid_request();
+        let affected_handles = many_sorted("aff", MAX_AFFECTED + 1);
+        many_affected.affected = affected_handles
+            .iter()
+            .map(|handle| path_with(handle, AffectedPathKind::Derivative))
+            .collect();
+        assert!(propose_accessibility_or_influence_adjustment(&many_affected).is_err());
+        let mut many_disp = valid_request();
+        let disp_handles = many_sorted("disp", MAX_AFFECTED + 1);
+        many_disp.dispositions = disp_handles
+            .iter()
+            .map(|handle| disposition_with(handle, DependentDispositionKind::Revalidate))
+            .collect();
+        assert!(propose_accessibility_or_influence_adjustment(&many_disp).is_err());
+        let mut many_prot = valid_request();
+        many_prot.protection.protections = (0..=MAX_PROTECTIONS)
+            .map(|index| ProtectionReason {
+                reason_id: format!("prot-{index:04}"),
+                trigger: "trigger".to_owned(),
+                mandatory: false,
+                satisfied: true,
+                unknown: false,
+                counterevidence_ref: None,
+            })
+            .collect();
+        assert!(propose_accessibility_or_influence_adjustment(&many_prot).is_err());
+        let mut many_neg = valid_request();
+        many_neg.protection.negative_memory = (0..=MAX_NEGATIVE_ENTRIES)
+            .map(|index| NegativeMemoryEntry {
+                trigger: format!("trig-{index:04}"),
+                extinguished: true,
+                extinction_evidence_ref: Some("ext-1".to_owned()),
+                reopen_evidence_ref: None,
+            })
+            .collect();
+        assert!(propose_accessibility_or_influence_adjustment(&many_neg).is_err());
+        let mut many_refs = valid_influence_request();
+        if let Some(closure) = many_refs.influence_closure.as_mut() {
+            closure.dependent_refs = many_sorted("dep", MAX_CLOSURE_REFS + 1);
+        }
+        assert!(propose_accessibility_or_influence_adjustment(&many_refs).is_err());
+        let mut many_retained = valid_request();
+        many_retained.protection.retained_counterevidence_refs =
+            many_sorted("m", MAX_CLOSURE_REFS + 1);
+        assert!(propose_accessibility_or_influence_adjustment(&many_retained).is_err());
+        let mut many_gaps = valid_influence_request();
+        if let Some(closure) = many_gaps.influence_closure.as_mut() {
+            closure.unknown_gaps = many_sorted("gap", MAX_CLOSURE_REFS + 1);
+        }
+        assert!(propose_accessibility_or_influence_adjustment(&many_gaps).is_err());
+        let mut over_retrieved = valid_request();
+        over_retrieved.usage.retrieval_successes = 41;
+        assert!(propose_accessibility_or_influence_adjustment(&over_retrieved).is_err());
+        let mut over_outcome = valid_request();
+        over_outcome.usage.outcome_successes = 4;
+        assert!(propose_accessibility_or_influence_adjustment(&over_outcome).is_err());
+        let mut empty = valid_request();
+        empty.affected.clear();
+        assert!(propose_accessibility_or_influence_adjustment(&empty).is_err());
+        let mut long = valid_request();
+        long.projection.subject_handle = "h".repeat(MAX_HANDLE_BYTES + 1);
+        assert!(propose_accessibility_or_influence_adjustment(&long).is_err());
+        let mut controlled = valid_request();
+        controlled.projection.task_id = "task-\n1".to_owned();
+        assert!(propose_accessibility_or_influence_adjustment(&controlled).is_err());
+        let mut bad_digest = valid_request();
+        bad_digest.frozen_bundle_digest = "not-hex".to_owned();
+        assert!(propose_accessibility_or_influence_adjustment(&bad_digest).is_err());
+        let mut capped = two_path_request();
+        capped.policy.max_affected = 1;
+        assert!(propose_accessibility_or_influence_adjustment(&capped).is_err());
+    }
+
+    // WORK_UNIT_CASE: 669/52
+    #[test]
+    fn case_52_cancelled_deadline_and_moved_policy_stay_stale_or_rejected() {
+        let mut cancelled = valid_request();
+        cancelled.receipt.terminal_disposition = "rejected".to_owned();
+        let result = propose_accessibility_or_influence_adjustment(&cancelled)
+            .expect("cancelled receipt is an outcome");
+        assert_eq!(result.outcome, AdjustmentOutcome::Rejected);
+        let mut unauthorized = valid_request();
+        unauthorized.receipt.validator_policy = "policy-9".to_owned();
+        let result = propose_accessibility_or_influence_adjustment(&unauthorized)
+            .expect("expired authorization is an outcome");
+        assert_eq!(result.outcome, AdjustmentOutcome::Abstention);
+        let mut moved = valid_request();
+        moved.receipt.validator_policy = "policy-9".to_owned();
+        moved.policy.policy_id = "policy-9".to_owned();
+        let result = propose_accessibility_or_influence_adjustment(&moved)
+            .expect("moved policy is an outcome");
+        assert_eq!(result.outcome, AdjustmentOutcome::Stale);
+    }
+
+    // WORK_UNIT_CASE: 669/53
+    #[test]
+    fn case_53_long_values_redact_and_control_chars_reject() {
+        let mut long = valid_request();
+        if let Some(change) = long.accessibility.as_mut() {
+            change.observable = "o".repeat(200);
+        }
+        let result =
+            propose_accessibility_or_influence_adjustment(&long).expect("long observable parses");
+        assert_eq!(result.outcome, AdjustmentOutcome::Complete);
+        assert_eq!(result.observable, format!("{}...", "o".repeat(128)));
+        assert!(result.observable.len() <= MAX_REDACTED_CHARS + 3);
+        let mut controlled = valid_request();
+        if let Some(change) = controlled.accessibility.as_mut() {
+            change.observable = "line one\nline two".to_owned();
+        }
+        assert!(propose_accessibility_or_influence_adjustment(&controlled).is_err());
+    }
+
+    // WORK_UNIT_CASE: 669/54
+    #[test]
+    fn case_54_valid_candidates_move_exactly_one_axis() {
+        let influence = valid_influence_request();
+        let result =
+            propose_accessibility_or_influence_adjustment(&influence).expect("influence parses");
+        assert_eq!(result.outcome, AdjustmentOutcome::Complete);
+        assert_ne!(
+            result.before_snapshot.influence,
+            result.proposed_snapshot.influence
+        );
+        assert_eq!(
+            result.before_snapshot.accessibility,
+            result.proposed_snapshot.accessibility
+        );
+        let mut restore = valid_request();
+        restore.policy.operation = AdjustmentOperation::Restore;
+        restore.policy.direction = AdjustmentDirection::Lateral;
+        if let Some(change) = restore.accessibility.as_mut() {
+            change.proposed_state = AccessibilityStanding::Restricted;
+        }
+        let result =
+            propose_accessibility_or_influence_adjustment(&restore).expect("restore move parses");
+        assert_eq!(result.outcome, AdjustmentOutcome::Complete);
+        assert_ne!(
+            result.before_snapshot.accessibility,
+            result.proposed_snapshot.accessibility
+        );
+        assert_eq!(
+            result.before_snapshot.influence,
+            result.proposed_snapshot.influence
+        );
+        assert_eq!(result.before_owners, result.proposed_owners);
+    }
+
+    // WORK_UNIT_CASE: 669/55
+    #[test]
+    fn case_55_unselected_axes_keep_exact_owner_refs_on_every_outcome() {
+        let mut blocked = valid_request();
+        blocked.protection.protections[0].satisfied = false;
+        let result = propose_accessibility_or_influence_adjustment(&blocked)
+            .expect("blocked move is an outcome");
+        assert_eq!(result.outcome, AdjustmentOutcome::Blocked);
+        assert_eq!(result.proposed_owners, test_owners());
+        let mut partial = valid_request();
+        partial.policy.task_local_only = true;
+        partial.protection.protections[0].unknown = true;
+        partial.protection.protections[0].satisfied = false;
+        let result = propose_accessibility_or_influence_adjustment(&partial)
+            .expect("partial move is an outcome");
+        assert_eq!(result.outcome, AdjustmentOutcome::Partial);
+        assert_eq!(result.proposed_owners, test_owners());
+        let mut rejected = valid_influence_request();
+        if let Some(change) = rejected.influence.as_mut() {
+            change.scope = "scope-9".to_owned();
+        }
+        let result = propose_accessibility_or_influence_adjustment(&rejected)
+            .expect("rejected move is an outcome");
+        assert_eq!(result.outcome, AdjustmentOutcome::Rejected);
+        assert_eq!(result.proposed_owners, test_owners());
+    }
+
+    // WORK_UNIT_CASE: 669/56
+    #[test]
+    fn case_56_complete_influence_binds_full_matching_closure_and_members() {
+        let request = valid_influence_request();
+        let result = propose_accessibility_or_influence_adjustment(&request)
+            .expect("closed influence parses");
+        assert_eq!(result.outcome, AdjustmentOutcome::Complete);
+        let closure = request.influence_closure.as_ref().expect("closure present");
+        assert_eq!(closure.root_ref, request.projection.subject_handle);
+        assert_eq!(closure.scope_id, request.projection.scope_id);
+        assert_eq!(closure.policy_id, request.policy.policy_id);
+        assert_eq!(
+            closure.closure_revision,
+            request.projection.subject_revision
+        );
+        assert!(closure.complete);
+        assert!(closure.unknown_gaps.is_empty());
+        for path in &request.affected {
+            assert!(closure.dependent_refs.contains(&path.handle));
+        }
+        let mut affected: Vec<String> = request
+            .affected
+            .iter()
+            .map(|path| path.handle.clone())
+            .collect();
+        affected.sort_unstable();
+        let mut members = request.closure_denominator.members.clone();
+        members.sort_unstable();
+        assert_eq!(affected, members);
+        let mut disposed: Vec<String> = result
+            .dispositions
+            .iter()
+            .map(|outcome| outcome.handle.clone())
+            .collect();
+        disposed.sort_unstable();
+        assert_eq!(affected, disposed);
+    }
+
+    // WORK_UNIT_CASE: 669/57
+    #[test]
+    fn case_57_no_move_widens_source_or_owner_allowance() {
+        let mut unstated = valid_request();
+        if let Some(change) = unstated.accessibility.as_mut() {
+            change.privacy_ceiling = String::new();
+        }
+        assert!(propose_accessibility_or_influence_adjustment(&unstated).is_err());
+        let mut over = influence_increase_request();
+        if let Some(change) = over.influence.as_mut() {
+            change.within_ceilings = false;
+        }
+        let result = propose_accessibility_or_influence_adjustment(&over)
+            .expect("over-ceiling move is an outcome");
+        assert_eq!(result.outcome, AdjustmentOutcome::Blocked);
+        let request = accessibility_increase_request();
+        let result = propose_accessibility_or_influence_adjustment(&request)
+            .expect("ceiled increase parses");
+        assert_eq!(result.outcome, AdjustmentOutcome::Complete);
+        assert_eq!(
+            result.proposed_snapshot.accessibility,
+            AccessibilityStanding::Exposed
+        );
+    }
+
+    // WORK_UNIT_CASE: 669/58
+    #[test]
+    fn case_58_every_valid_candidate_names_verifier_inverse_and_expiry() {
+        let access = propose_accessibility_or_influence_adjustment(&valid_request())
+            .expect("accessibility parses");
+        assert_eq!(access.outcome, AdjustmentOutcome::Complete);
+        assert!(!access.observable.is_empty());
+        assert!(!access.verifier.is_empty());
+        assert!(!access.window_note.is_empty());
+        assert!(!access.inverse_note.is_empty());
+        assert!(access.expiry_ms.is_some());
+        assert!(!access.renewal_condition.is_empty());
+        assert_eq!(access.dispositions.len(), 1);
+        for outcome in &access.dispositions {
+            assert!(!outcome.owner.is_empty());
+            assert!(!outcome.verifier.is_empty());
+            assert!(!outcome.inverse_note.is_empty());
+            assert!(!outcome.before_identity.is_empty());
+            assert!(!outcome.proposed_identity.is_empty());
+        }
+        let influence = propose_accessibility_or_influence_adjustment(&valid_influence_request())
+            .expect("influence parses");
+        assert_eq!(influence.outcome, AdjustmentOutcome::Complete);
+        assert!(!influence.observable.is_empty());
+        assert!(!influence.verifier.is_empty());
+        assert!(!influence.window_note.is_empty());
+        assert!(!influence.inverse_note.is_empty());
+        assert!(influence.expiry_ms.is_some());
+        assert!(!influence.renewal_condition.is_empty());
+        assert_eq!(influence.dispositions.len(), 2);
+    }
+
+    // WORK_UNIT_CASE: 669/59
+    #[test]
+    fn case_59_bounded_malformed_input_neither_panics_nor_applies() {
+        let mut blank = valid_request();
+        blank.projection.subject_handle = String::new();
+        assert!(propose_accessibility_or_influence_adjustment(&blank).is_err());
+        let mut huge = valid_request();
+        huge.usage.usage_window_note = "w".repeat(2000);
+        assert!(propose_accessibility_or_influence_adjustment(&huge).is_err());
+        let mut crossed = valid_request();
+        crossed.policy.operation = AdjustmentOperation::Increase;
+        crossed.policy.direction = AdjustmentDirection::Lower;
+        assert!(propose_accessibility_or_influence_adjustment(&crossed).is_err());
+        let mut duplicated = two_path_request();
+        duplicated.affected[1].handle = "ctx-1".to_owned();
+        assert!(propose_accessibility_or_influence_adjustment(&duplicated).is_err());
+        let mut flooded = valid_request();
+        flooded.usage.retrieval_successes = u64::MAX;
+        let frozen = flooded.clone();
+        assert!(propose_accessibility_or_influence_adjustment(&flooded).is_err());
+        assert_eq!(flooded, frozen, "malformed input never applies");
     }
 }
