@@ -474,11 +474,64 @@ pub fn assemble_campaign_learning_closure(
         return Ok(ClosureAssembly::Disposition(disposition));
     }
 
+    // Harm is never compensated: harmful or harm-flagged outcomes retire
+    // the campaign from task-local closure (cases 22/37/39/45).
+    if let Some(disposition) = check_harm(
+        &exact_campaign_and_target,
+        &exact_outcome_harm_and_economics_evidence,
+    ) {
+        return Ok(ClosureAssembly::Disposition(disposition));
+    }
+
+    // Measurement identity: attrition, metric/unit, environment window and
+    // post-hoc baseline discipline (cases 24/26/27/28).
+    if let Some(disposition) = check_comparison_identity(
+        &exact_campaign_and_target,
+        &exact_outcome_harm_and_economics_evidence,
+    ) {
+        return Ok(ClosureAssembly::Disposition(disposition));
+    }
+
+    // Confounder denominator, generator/evaluator independence, concurrent
+    // interventions, and no-winner outcome conflicts (cases 29/30/31/32/40).
+    if let Some(disposition) = check_causal_discipline(
+        &exact_campaign_and_target,
+        &exact_overlay_and_activation_assessments,
+        &exact_outcome_harm_and_economics_evidence,
+    ) {
+        return Ok(ClosureAssembly::Disposition(disposition));
+    }
+
     // Economics unknown-is-not-zero gate (minimal for slice A; full in slice B).
     if let Some(disposition) = check_economics_known(
         &exact_campaign_and_target,
         &exact_outcome_harm_and_economics_evidence,
         &closure_policy,
+    ) {
+        return Ok(ClosureAssembly::Disposition(disposition));
+    }
+
+    // Economics identity: one currency/unit frame per campaign (case 36).
+    if let Some(disposition) = check_economics_identity(
+        &exact_campaign_and_target,
+        &exact_outcome_harm_and_economics_evidence,
+    ) {
+        return Ok(ClosureAssembly::Disposition(disposition));
+    }
+
+    // Materially equivalent repeat under unchanged evidence never recommends
+    // a blind repeat (case 41). Superseded priors do not block.
+    let evidence_hex = closure_evidence_digest(
+        &exact_campaign_and_target,
+        &exact_attempt_outcomes_and_deltas,
+        &exact_overlay_and_activation_assessments,
+        &exact_outcome_harm_and_economics_evidence,
+    );
+    if let Some(disposition) = check_repeat(
+        &exact_campaign_and_target,
+        &prior_closure_history,
+        &closure_policy,
+        &evidence_hex,
     ) {
         return Ok(ClosureAssembly::Disposition(disposition));
     }
@@ -1054,6 +1107,438 @@ fn check_economics_known(
     })
 }
 
+fn check_economics_identity(
+    campaign: &CampaignAndTarget,
+    evidence: &OutcomeHarmAndEconomicsEvidence,
+) -> Option<LearningClosureDisposition> {
+    let Some(first) = evidence.economics.first() else {
+        return None;
+    };
+    for record in &evidence.economics[1..] {
+        if record.currency != first.currency || record.unit != first.unit {
+            return Some(inconclusive(
+                campaign,
+                format!(
+                    "attempt {} currency/unit {}/{} vs {}/{}: currency-unit-mismatch",
+                    record.attempt_id,
+                    record.currency,
+                    record.unit,
+                    first.currency,
+                    first.unit
+                ),
+                "economics normalization",
+            ));
+        }
+    }
+    None
+}
+
+/// Bounded inconclusive disposition naming exact missing evidence/owner/debt.
+fn inconclusive(
+    campaign: &CampaignAndTarget,
+    missing: String,
+    debt: &str,
+) -> LearningClosureDisposition {
+    LearningClosureDisposition {
+        disposition: "inconclusive".to_string(),
+        missing_evidence: vec![missing],
+        missing_owner: Some(campaign.evaluator_id.clone()),
+        open_debt: vec![debt.to_string()],
+        retain_ref: campaign.scope_ref.clone(),
+    }
+}
+
+fn check_harm(
+    campaign: &CampaignAndTarget,
+    evidence: &OutcomeHarmAndEconomicsEvidence,
+) -> Option<LearningClosureDisposition> {
+    let mut harms: Vec<String> = Vec::new();
+    for outcome in &evidence.outcomes {
+        if outcome.kind == OutcomeKind::Harmful || outcome.harm.harm_observed {
+            harms.push(format!(
+                "attempt {} {:?} harm {}",
+                outcome.attempt_id,
+                outcome.kind,
+                outcome.harm.harm_ref.as_deref().unwrap_or("unreferenced-harm")
+            ));
+        }
+    }
+    if harms.is_empty() {
+        return None;
+    }
+    Some(LearningClosureDisposition {
+        disposition: "retire-review".to_string(),
+        missing_evidence: harms.clone(),
+        missing_owner: Some(campaign.evaluator_id.clone()),
+        open_debt: harms,
+        retain_ref: campaign.scope_ref.clone(),
+    })
+}
+
+fn check_comparison_identity(
+    campaign: &CampaignAndTarget,
+    evidence: &OutcomeHarmAndEconomicsEvidence,
+) -> Option<LearningClosureDisposition> {
+    // Attrition/selection: measured population must be the predeclared holdout.
+    for outcome in &evidence.outcomes {
+        if outcome.population != campaign.holdout_ref {
+            return Some(inconclusive(
+                campaign,
+                format!(
+                    "attempt {} measured on population {:?}, not predeclared holdout {:?}: attrition-selection-bias",
+                    outcome.attempt_id, outcome.population, campaign.holdout_ref
+                ),
+                "attrition/selection bias",
+            ));
+        }
+    }
+    // Uniform predeclared comparison frame across outcomes.
+    let Some(first) = evidence.outcomes.first() else {
+        return None;
+    };
+    for outcome in &evidence.outcomes[1..] {
+        if outcome.metric != first.metric || outcome.unit != first.unit {
+            return Some(inconclusive(
+                campaign,
+                format!(
+                    "attempt {} metric/unit {}/{} vs {}/{}: metric-identity-mismatch",
+                    outcome.attempt_id, outcome.metric, outcome.unit, first.metric, first.unit
+                ),
+                "metric normalization",
+            ));
+        }
+        if outcome.window != first.window {
+            return Some(inconclusive(
+                campaign,
+                format!(
+                    "attempt {} window {:?} vs {:?}: environment-window-change",
+                    outcome.attempt_id, outcome.window, first.window
+                ),
+                "environment stability",
+            ));
+        }
+        if outcome.baseline_ref != first.baseline_ref {
+            return Some(inconclusive(
+                campaign,
+                format!(
+                    "attempt {} baseline {:?} vs {:?}: post-hoc-baseline",
+                    outcome.attempt_id, outcome.baseline_ref, first.baseline_ref
+                ),
+                "predeclared comparison",
+            ));
+        }
+    }
+    None
+}
+
+fn check_causal_discipline(
+    campaign: &CampaignAndTarget,
+    overlays: &OverlayAndActivationAssessments,
+    evidence: &OutcomeHarmAndEconomicsEvidence,
+) -> Option<LearningClosureDisposition> {
+    // Confounder denominator: every outcome needs its predeclared comparison.
+    for outcome in &evidence.outcomes {
+        if outcome
+            .control_ref
+            .as_deref()
+            .is_none_or(|value| value.trim().is_empty())
+        {
+            return Some(inconclusive(
+                campaign,
+                format!(
+                    "attempt {} lacks control/comparison: confounder-denominator-incomplete",
+                    outcome.attempt_id
+                ),
+                "confounder assessment",
+            ));
+        }
+    }
+    // Same-model generator/evaluator dependence.
+    for outcome in &evidence.outcomes {
+        if outcome.source_id == outcome.evaluator_id {
+            return Some(inconclusive(
+                campaign,
+                format!(
+                    "attempt {} source {:?} is also evaluator: generator-evaluator-dependence",
+                    outcome.attempt_id, outcome.source_id
+                ),
+                "independent evaluation",
+            ));
+        }
+    }
+    // Concurrent intervention: observed action outside the use-linked chain.
+    for assessment in &overlays.assessments {
+        if assessment.stage == LifecycleStage::Action
+            && assessment.observed
+            && !assessment.use_linked
+        {
+            return Some(inconclusive(
+                campaign,
+                format!(
+                    "attempt {} observed action without use linkage: concurrent-intervention-undisclosed",
+                    assessment.attempt_id
+                ),
+                "intervention accounting",
+            ));
+        }
+    }
+    // No-winner conflicts: contradictory outcome kinds for one attempt stay
+    // visible; latest/confidence/source-count never selects a winner.
+    let mut by_attempt: BTreeMap<&str, Vec<&OutcomeKind>> = BTreeMap::new();
+    for outcome in &evidence.outcomes {
+        by_attempt
+            .entry(outcome.attempt_id.as_str())
+            .or_default()
+            .push(&outcome.kind);
+    }
+    for (attempt_id, kinds) in &by_attempt {
+        let first = kinds[0];
+        if kinds.iter().any(|kind| *kind != first) {
+            return Some(inconclusive(
+                campaign,
+                format!(
+                    "attempt {attempt_id} contradictory outcome kinds: conflicting-outcomes-no-winner"
+                ),
+                "conflict resolution",
+            ));
+        }
+    }
+    None
+}
+
+fn check_repeat(
+    campaign: &CampaignAndTarget,
+    history: &PriorClosureHistory,
+    policy: &ClosurePolicy,
+    evidence_hex: &str,
+) -> Option<LearningClosureDisposition> {
+    let prior = history.prior.iter().find(|entry| {
+        !entry.superseded
+            && entry.campaign_id == campaign.campaign_id
+            && entry.digest == evidence_hex
+    })?;
+    Some(LearningClosureDisposition {
+        disposition: "repeat-review".to_string(),
+        missing_evidence: vec![format!(
+            "materially equivalent repeat of closure {} under unchanged evidence; blind repeat not recommended",
+            prior.closure_id
+        )],
+        missing_owner: Some(policy.external_owner_id.clone()),
+        open_debt: vec![format!("repeat-review {}", prior.closure_id)],
+        retain_ref: campaign.scope_ref.clone(),
+    })
+}
+
+/// Evidence fingerprint over the four evidence inputs (no history/policy).
+///
+/// Prior closures record this value; a non-superseded match for the same
+/// campaign means a materially equivalent repeat under unchanged evidence.
+pub fn closure_evidence_digest(
+    exact_campaign_and_target: &CampaignAndTarget,
+    exact_attempt_outcomes_and_deltas: &AttemptOutcomesAndDeltas,
+    exact_overlay_and_activation_assessments: &OverlayAndActivationAssessments,
+    exact_outcome_harm_and_economics_evidence: &OutcomeHarmAndEconomicsEvidence,
+) -> String {
+    let mut hasher = Hasher::new();
+    hash_evidence(
+        &mut hasher,
+        exact_campaign_and_target,
+        exact_attempt_outcomes_and_deltas,
+        exact_overlay_and_activation_assessments,
+        exact_outcome_harm_and_economics_evidence,
+    );
+    hasher.finalize().to_hex().to_string()
+}
+
+fn field(hasher: &mut Hasher, value: &str) {
+    hasher.update(value.as_bytes());
+    hasher.update(b"\x00");
+}
+
+fn hex_bytes(bytes: &[u8]) -> String {
+    bytes.iter().map(|b| format!("{b:02x}")).collect()
+}
+
+#[allow(clippy::too_many_lines)]
+fn hash_evidence(
+    hasher: &mut Hasher,
+    campaign: &CampaignAndTarget,
+    attempts: &AttemptOutcomesAndDeltas,
+    overlays: &OverlayAndActivationAssessments,
+    evidence: &OutcomeHarmAndEconomicsEvidence,
+) {
+    field(hasher, &campaign.campaign_id);
+    field(hasher, &campaign.target_id);
+    field(hasher, &campaign.task_id);
+    field(hasher, &campaign.scope_ref);
+    field(hasher, &campaign.fence_ref);
+    field(hasher, &campaign.objective_ref);
+    field(hasher, &campaign.acceptance_ref);
+    field(hasher, &campaign.evaluator_id);
+    field(hasher, &campaign.holdout_ref);
+    let mut expected: Vec<&str> = attempts
+        .expected_attempt_ids
+        .iter()
+        .map(String::as_str)
+        .collect();
+    expected.sort_unstable();
+    for id in expected {
+        field(hasher, id);
+    }
+    let mut supplied: Vec<&AttemptRecord> = attempts.attempts.iter().collect();
+    supplied.sort_by(|a, b| a.attempt_id.cmp(&b.attempt_id));
+    for attempt in supplied {
+        field(hasher, &attempt.attempt_id);
+        field(
+            hasher,
+            if attempt.consequential {
+                "consequential"
+            } else {
+                "non-consequential"
+            },
+        );
+        field(hasher, status_label(&attempt.status));
+        field(
+            hasher,
+            if attempt.has_outcome {
+                "has-outcome"
+            } else {
+                "no-outcome"
+            },
+        );
+        if let Some(delta) = &attempt.delta {
+            field(hasher, &delta.delta_id);
+            field(hasher, &delta.target_id);
+            field(hasher, &delta.base_state_ref);
+            match &delta.kind {
+                DeltaKind::Changed {
+                    before_ref,
+                    after_ref,
+                } => {
+                    field(hasher, "changed");
+                    field(hasher, before_ref);
+                    field(hasher, after_ref);
+                }
+                DeltaKind::NoChange { evidence_ref } => {
+                    field(hasher, "no-change");
+                    field(hasher, evidence_ref.as_deref().unwrap_or(""));
+                }
+            }
+        } else {
+            field(hasher, "no-delta");
+        }
+    }
+    let mut overlay_refs: Vec<&OverlayRecord> = overlays.overlays.iter().collect();
+    overlay_refs.sort_by(|a, b| a.overlay_id.cmp(&b.overlay_id));
+    for overlay in overlay_refs {
+        field(hasher, &overlay.overlay_id);
+        field(hasher, &overlay.attempt_id);
+        field(hasher, &overlay.base_ref);
+        field(hasher, &overlay.parent_ref);
+        field(hasher, &format!("{:?}", overlay.admission));
+        field(hasher, &overlay.admission_ref);
+    }
+    let mut stage_refs: Vec<&StageAssessment> = overlays.assessments.iter().collect();
+    stage_refs.sort_by(|a, b| {
+        (&a.attempt_id, &a.overlay_id, a.stage).cmp(&(&b.attempt_id, &b.overlay_id, b.stage))
+    });
+    for assessment in stage_refs {
+        field(hasher, &assessment.attempt_id);
+        field(hasher, &assessment.overlay_id);
+        field(hasher, &format!("{:?}", assessment.stage));
+        field(hasher, if assessment.observed { "observed" } else { "missing" });
+        field(
+            hasher,
+            assessment.evidence_ref.as_deref().unwrap_or(""),
+        );
+        field(
+            hasher,
+            if assessment.use_linked {
+                "use-linked"
+            } else {
+                "unlinked"
+            },
+        );
+        field(
+            hasher,
+            if assessment.causally_attributed {
+                "attributed"
+            } else {
+                "unattributed"
+            },
+        );
+        match &assessment.source {
+            EvidenceSource::IndependentVerifier { verifier_id } => {
+                field(hasher, "independent");
+                field(hasher, verifier_id);
+            }
+            EvidenceSource::SelfReport { reporter } => {
+                field(hasher, "self-report");
+                field(hasher, reporter);
+            }
+        }
+    }
+    let mut outcome_refs: Vec<&OutcomeRecord> = evidence.outcomes.iter().collect();
+    outcome_refs.sort_by(|a, b| {
+        (&a.attempt_id, &a.metric).cmp(&(&b.attempt_id, &b.metric))
+    });
+    for outcome in outcome_refs {
+        field(hasher, &outcome.attempt_id);
+        field(hasher, &outcome.metric);
+        field(hasher, &outcome.unit);
+        field(hasher, &outcome.population);
+        field(hasher, &outcome.window);
+        field(hasher, &outcome.source_id);
+        field(hasher, &outcome.evaluator_id);
+        field(hasher, &outcome.baseline_ref);
+        field(hasher, outcome.control_ref.as_deref().unwrap_or(""));
+        field(hasher, &format!("{:?}", outcome.kind));
+        field(
+            hasher,
+            if outcome.harm.harm_observed {
+                "harm"
+            } else {
+                "no-harm"
+            },
+        );
+        field(hasher, outcome.harm.harm_ref.as_deref().unwrap_or(""));
+        field(
+            hasher,
+            if outcome.use_linked {
+                "use-linked"
+            } else {
+                "unlinked"
+            },
+        );
+        match &outcome.causal {
+            CausalAttribution::Attributed { control_ref } => {
+                field(hasher, "attributed");
+                field(hasher, control_ref);
+            }
+            CausalAttribution::CorrelationalOnly => field(hasher, "correlational"),
+            CausalAttribution::None => field(hasher, "no-cause"),
+        }
+    }
+    let mut economics_refs: Vec<&EconomicsRecord> = evidence.economics.iter().collect();
+    economics_refs.sort_by(|a, b| a.attempt_id.cmp(&b.attempt_id));
+    for record in economics_refs {
+        field(hasher, &record.attempt_id);
+        field(
+            hasher,
+            if record.cost_known {
+                "known"
+            } else {
+                "unknown"
+            },
+        );
+        field(hasher, &hex_bytes(&record.cost.to_bits().to_be_bytes()));
+        field(hasher, &record.currency);
+        field(hasher, &record.unit);
+    }
+}
+
+/// Full candidate digest: evidence fingerprint (order-invariant) plus prior
+/// history and policy binding. Any removed load-bearing receipt changes it.
 fn closure_digest(
     campaign: &CampaignAndTarget,
     attempts: &AttemptOutcomesAndDeltas,
@@ -1063,32 +1548,26 @@ fn closure_digest(
     policy: &ClosurePolicy,
 ) -> String {
     let mut hasher = Hasher::new();
-    hasher.update(campaign.campaign_id.as_bytes());
-    hasher.update(campaign.target_id.as_bytes());
-    hasher.update(campaign.task_id.as_bytes());
-    hasher.update(campaign.scope_ref.as_bytes());
-    for attempt in &attempts.attempts {
-        hasher.update(attempt.attempt_id.as_bytes());
-        if let Some(delta) = &attempt.delta {
-            hasher.update(delta.delta_id.as_bytes());
-            hasher.update(delta.base_state_ref.as_bytes());
-        }
+    hash_evidence(&mut hasher, campaign, attempts, overlays, evidence);
+    let mut priors: Vec<&PriorClosure> = history.prior.iter().collect();
+    priors.sort_by(|a, b| {
+        (&a.campaign_id, &a.closure_id, &a.digest)
+            .cmp(&(&b.campaign_id, &b.closure_id, &b.digest))
+    });
+    for prior in priors {
+        field(&mut hasher, &prior.closure_id);
+        field(&mut hasher, &prior.campaign_id);
+        field(&mut hasher, &prior.digest);
+        field(
+            &mut hasher,
+            if prior.superseded {
+                "superseded"
+            } else {
+                "active"
+            },
+        );
     }
-    for overlay in &overlays.overlays {
-        hasher.update(overlay.overlay_id.as_bytes());
-        hasher.update(overlay.admission_ref.as_bytes());
-    }
-    for assessment in &overlays.assessments {
-        hasher.update(assessment.attempt_id.as_bytes());
-        hasher.update(format!("{:?}", assessment.stage).as_bytes());
-    }
-    for outcome in &evidence.outcomes {
-        hasher.update(outcome.attempt_id.as_bytes());
-        hasher.update(outcome.metric.as_bytes());
-    }
-    for prior in &history.prior {
-        hasher.update(prior.digest.as_bytes());
-    }
-    hasher.update(policy.idempotency_key.as_bytes());
+    field(&mut hasher, &policy.idempotency_key);
+    field(&mut hasher, &policy.operation_ref);
     hasher.finalize().to_hex().to_string()
 }
