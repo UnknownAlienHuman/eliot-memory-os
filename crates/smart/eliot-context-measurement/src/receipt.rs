@@ -112,52 +112,57 @@ fn push_optional(out: &mut String, field: &str, value: Option<String>) {
     }
 }
 
-/// Compute the canonical receipt digest for one receipt input.
-pub fn receipt_digest(input: &ReceiptInput) -> String {
-    let mut sorted_candidates = input.candidate_digests.clone();
-    sorted_candidates.sort();
-    let mut out = String::from("eliot-context-measurement-receipt/v1\n");
-    push_field(&mut out, "measurement_id", &input.measurement_id);
-    push_field(&mut out, "contract_revision", &input.contract_revision);
-    push_field(&mut out, "envelope_digest", &input.envelope_digest);
-    push_field(&mut out, "byte_len", &input.byte_len.to_string());
-    push_field(&mut out, "stu", &input.stu.to_string());
-    push_field(&mut out, "serializer_id", &input.serializer_id);
-    push_field(&mut out, "serializer_version", &input.serializer_version);
+/// Encode envelope, byte count and normative STU.
+fn push_envelope_fields(out: &mut String, input: &ReceiptInput) {
+    push_field(out, "measurement_id", &input.measurement_id);
+    push_field(out, "contract_revision", &input.contract_revision);
+    push_field(out, "envelope_digest", &input.envelope_digest);
+    push_field(out, "byte_len", &input.byte_len.to_string());
+    push_field(out, "stu", &input.stu.to_string());
+}
+
+/// Encode serializer, route, tokenizer and estimator identity.
+fn push_route_estimator_fields(
+    out: &mut String,
+    input: &ReceiptInput,
+    sorted_candidates: &[String],
+) {
+    push_field(out, "serializer_id", &input.serializer_id);
+    push_field(out, "serializer_version", &input.serializer_version);
     push_field(
-        &mut out,
+        out,
         "serializer_options_digest",
         &input.serializer_options_digest,
     );
-    push_field(&mut out, "route_id", &input.route_id);
-    push_field(&mut out, "provider_id", &input.provider_id);
-    push_field(&mut out, "model_id", &input.model_id);
-    push_field(&mut out, "tokenizer_id", &input.tokenizer_id);
-    push_field(&mut out, "tokenizer_version", &input.tokenizer_version);
-    push_field(&mut out, "tokenizer_hash", &input.tokenizer_hash);
+    push_field(out, "route_id", &input.route_id);
+    push_field(out, "provider_id", &input.provider_id);
+    push_field(out, "model_id", &input.model_id);
+    push_field(out, "tokenizer_id", &input.tokenizer_id);
+    push_field(out, "tokenizer_version", &input.tokenizer_version);
+    push_field(out, "tokenizer_hash", &input.tokenizer_hash);
     push_field(
-        &mut out,
+        out,
         "tokenizer_config_digest",
         &input.tokenizer_config_digest,
     );
-    push_field(&mut out, "estimator_id", &input.estimator_id);
-    push_field(&mut out, "estimator_revision", &input.estimator_revision);
+    push_field(out, "estimator_id", &input.estimator_id);
+    push_field(out, "estimator_revision", &input.estimator_revision);
     push_field(
-        &mut out,
+        out,
         "estimator_empirical",
         &input.estimator_empirical.to_string(),
     );
-    push_field(
-        &mut out,
-        "candidate_count",
-        &sorted_candidates.len().to_string(),
-    );
-    for candidate in &sorted_candidates {
-        push_field(&mut out, "candidate_digest", candidate);
+    push_field(out, "candidate_count", &sorted_candidates.len().to_string());
+    for candidate in sorted_candidates {
+        push_field(out, "candidate_digest", candidate);
     }
-    push_field(&mut out, "capacity_unit", input.capacity_unit);
+}
+
+/// Encode capacity unit, limit, independent reserves and decision policy.
+fn push_capacity_fields(out: &mut String, input: &ReceiptInput) {
+    push_field(out, "capacity_unit", input.capacity_unit);
     push_optional(
-        &mut out,
+        out,
         "route_capacity",
         input.route_capacity.map(|value| value.to_string()),
     );
@@ -169,75 +174,79 @@ pub fn receipt_digest(input: &ReceiptInput) -> String {
         ("reserve.verifier", input.reserves[4]),
         ("reserve.decision_tail", input.reserves[5]),
     ] {
-        push_field(&mut out, name, &value.to_string());
+        push_field(out, name, &value.to_string());
     }
-    push_optional(&mut out, "policy_id", input.policy_id.clone());
-    push_optional(&mut out, "policy_digest", input.policy_digest.clone());
+    push_optional(out, "policy_id", input.policy_id.clone());
+    push_optional(out, "policy_digest", input.policy_digest.clone());
     push_optional(
-        &mut out,
+        out,
         "policy_numer",
         input.policy_numer.map(|value| value.to_string()),
     );
     push_optional(
-        &mut out,
+        out,
         "policy_denom",
         input.policy_denom.map(|value| value.to_string()),
     );
-    push_field(&mut out, "observation_status", input.observation_status);
+}
+
+/// Encode observation status, count, identity and rewrite evidence.
+fn push_observation_fields(out: &mut String, input: &ReceiptInput) {
+    push_field(out, "observation_status", input.observation_status);
+    push_optional(out, "observation_source", input.source.map(str::to_owned));
     push_optional(
-        &mut out,
-        "observation_source",
-        input.source.map(str::to_owned),
-    );
-    push_optional(
-        &mut out,
+        out,
         "observed_tokens",
         input.observed_tokens.map(|value| value.to_string()),
     );
+    push_optional(out, "observation_id", input.observation_id.clone());
+    push_optional(out, "rewrite_kind", input.rewrite_kind.map(str::to_owned));
+    push_optional(out, "rewrite_evidence", input.rewrite_evidence.clone());
+}
+
+/// Encode totals, fits and both error directions.
+fn push_analysis_fields(out: &mut String, input: &ReceiptInput) {
     push_optional(
-        &mut out,
-        "observation_id",
-        input.observation_id.clone(),
-    );
-    push_optional(
-        &mut out,
-        "rewrite_kind",
-        input.rewrite_kind.map(str::to_owned),
-    );
-    push_optional(
-        &mut out,
-        "rewrite_evidence",
-        input.rewrite_evidence.clone(),
-    );
-    push_optional(
-        &mut out,
+        out,
         "estimated_total",
         input.estimated_total.map(|value| value.to_string()),
     );
     push_optional(
-        &mut out,
+        out,
         "estimated_fit",
         input.estimated_fit.map(|value| value.to_string()),
     );
     push_optional(
-        &mut out,
+        out,
         "observed_total",
         input.observed_total.map(|value| value.to_string()),
     );
     push_optional(
-        &mut out,
+        out,
         "observed_fit",
         input.observed_fit.map(|value| value.to_string()),
     );
     push_optional(
-        &mut out,
+        out,
         "false_safe",
         input.false_safe.map(|value| value.to_string()),
     );
     push_optional(
-        &mut out,
+        out,
         "false_reject",
         input.false_reject.map(|value| value.to_string()),
     );
+}
+
+/// Compute the canonical receipt digest for one receipt input.
+pub fn receipt_digest(input: &ReceiptInput) -> String {
+    let mut sorted_candidates = input.candidate_digests.clone();
+    sorted_candidates.sort();
+    let mut out = String::from("eliot-context-measurement-receipt/v1\n");
+    push_envelope_fields(&mut out, input);
+    push_route_estimator_fields(&mut out, input, &sorted_candidates);
+    push_capacity_fields(&mut out, input);
+    push_observation_fields(&mut out, input);
+    push_analysis_fields(&mut out, input);
     sha256_hex(out.as_bytes())
 }

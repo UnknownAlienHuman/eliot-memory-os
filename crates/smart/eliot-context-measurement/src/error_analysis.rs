@@ -29,7 +29,7 @@ pub struct ErrorAnalysis {
     pub false_reject_or_decomposition: Option<bool>,
     /// Estimated minus observed in the shared unit, when both are known.
     pub signed_error: Option<i128>,
-    /// Absolute error in the shared unit, when both totals are known.
+    /// Absolute error in the shared unit, when both costs are known.
     pub absolute_error: Option<u128>,
     /// Parts-per-million relative error; `None` under the explicit
     /// zero-observation rule or when unrepresentable in [`u64`].
@@ -40,38 +40,36 @@ pub struct ErrorAnalysis {
 
 /// Analyze error directions and magnitudes over one capacity identity.
 ///
-/// Totals must already share the capacity unit and reserve identity; this
-/// function compares them without reloading any policy or observation.
+/// Costs must already share the capacity unit (payload costs without the
+/// identical reserves on both sides, so reserve accounting cannot dilute
+/// the estimate error); this function compares them without reloading any
+/// policy or observation. A zero observed cost triggers the explicit
+/// zero-observation rule for relative error.
 pub fn analyze_error(
-    estimated_total: Option<u64>,
+    estimated_cost: Option<u64>,
     estimated_fit: Option<bool>,
-    observed_total: Option<u64>,
+    observed_cost: Option<u64>,
     observed_fit: Option<bool>,
 ) -> ErrorAnalysis {
-    let (false_safe_overflow, false_reject_or_decomposition) =
-        match (estimated_fit, observed_fit) {
-            (Some(estimated), Some(observed)) => {
-                (Some(estimated && !observed), Some(!estimated && observed))
-            }
-            _ => (None, None),
-        };
-    let (signed_error, absolute_error, relative_error_ppm) =
-        match (estimated_total, observed_total) {
-            (Some(estimated), Some(observed)) => {
-                let signed = i128::from(estimated) - i128::from(observed);
-                let absolute = signed.unsigned_abs();
-                let relative = if observed == 0 {
-                    None
-                } else {
-                    u64::try_from(
-                        absolute.saturating_mul(1_000_000) / u128::from(observed),
-                    )
-                    .ok()
-                };
-                (Some(signed), Some(absolute), relative)
-            }
-            _ => (None, None, None),
-        };
+    let (false_safe_overflow, false_reject_or_decomposition) = match (estimated_fit, observed_fit) {
+        (Some(estimated), Some(observed)) => {
+            (Some(estimated && !observed), Some(!estimated && observed))
+        }
+        _ => (None, None),
+    };
+    let (signed_error, absolute_error, relative_error_ppm) = match (estimated_cost, observed_cost) {
+        (Some(estimated), Some(observed)) => {
+            let signed = i128::from(estimated) - i128::from(observed);
+            let absolute = signed.unsigned_abs();
+            let relative = if observed == 0 {
+                None
+            } else {
+                u64::try_from(absolute.saturating_mul(1_000_000) / u128::from(observed)).ok()
+            };
+            (Some(signed), Some(absolute), relative)
+        }
+        _ => (None, None, None),
+    };
     ErrorAnalysis {
         estimated_fit,
         observed_fit,

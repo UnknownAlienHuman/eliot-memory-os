@@ -164,7 +164,10 @@ pub fn analyze_capacity(
         },
     };
     let estimated_total = estimated_cost
-        .map(|cost| cost.checked_add(total_reserves).ok_or(ContextError::Overflow))
+        .map(|cost| {
+            cost.checked_add(total_reserves)
+                .ok_or(ContextError::Overflow)
+        })
         .transpose()?;
     let (fit, headroom) = fit_headroom(plan.route_capacity, estimated_total);
     // Observed tokens compare only against a token capacity; relabelling
@@ -174,7 +177,10 @@ pub fn analyze_capacity(
         _ => None,
     };
     let observed_total = observed_cost
-        .map(|cost| cost.checked_add(total_reserves).ok_or(ContextError::Overflow))
+        .map(|cost| {
+            cost.checked_add(total_reserves)
+                .ok_or(ContextError::Overflow)
+        })
         .transpose()?;
     let (observed_fit, observed_headroom) = fit_headroom(plan.route_capacity, observed_total);
     Ok(CapacityAnalysis {
