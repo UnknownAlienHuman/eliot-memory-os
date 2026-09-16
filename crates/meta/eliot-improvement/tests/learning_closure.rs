@@ -1419,3 +1419,289 @@ fn case_40_no_winner_by_latest_confidence_source_count() {
         other => panic!("contradictory outcomes must dispose, got {other:?}"),
     }
 }
+
+// WORK_UNIT_CASE: 819/41
+#[test]
+fn case_41_materially_equivalent_repeat_campaign() {
+    let (c, a, o, e, _, p) = complete_inputs();
+    let evidence_hex =
+        learning_closure::closure_evidence_digest(&c, &a, &o, &e);
+    let repeat_history = PriorClosureHistory {
+        prior: vec![PriorClosure {
+            closure_id: "closure-819-first".to_string(),
+            campaign_id: "campaign-819-a".to_string(),
+            digest: evidence_hex.clone(),
+            superseded: false,
+        }],
+    };
+    match learning_closure::assemble_campaign_learning_closure(
+        c.clone(),
+        a.clone(),
+        o.clone(),
+        e.clone(),
+        repeat_history,
+        p.clone(),
+    ) {
+        Ok(ClosureAssembly::Disposition(disposition)) => {
+            assert_eq!(disposition.disposition, "repeat-review");
+            assert!(
+                disposition
+                    .open_debt
+                    .iter()
+                    .any(|m| m.contains("closure-819-first"))
+            );
+        }
+        other => panic!("blind repeat must dispose, got {other:?}"),
+    }
+    // A superseded prior never blocks a fresh closure.
+    let superseded_history = PriorClosureHistory {
+        prior: vec![PriorClosure {
+            closure_id: "closure-819-first".to_string(),
+            campaign_id: "campaign-819-a".to_string(),
+            digest: evidence_hex,
+            superseded: true,
+        }],
+    };
+    match learning_closure::assemble_campaign_learning_closure(c, a, o, e, superseded_history, p)
+    {
+        Ok(ClosureAssembly::Candidate(candidate)) => {
+            assert_eq!(candidate.status, ClosureStatus::ClosedTaskLocal);
+        }
+        other => panic!("superseded repeat must close, got {other:?}"),
+    }
+}
+
+// WORK_UNIT_CASE: 819/42
+#[test]
+fn case_42_external_promotion_review_only_at_proof_ceiling() {
+    let candidate = assemble_complete();
+    assert_eq!(candidate.proof_ceiling, "module-proof-only");
+    assert_eq!(candidate.handoff.requested_class, "task-local-retention");
+    assert_eq!(candidate.handoff.external_owner_id, "governor-819");
+    assert_eq!(candidate.handoff.rollback_owner_id, "rollback-owner-819");
+    assert!(candidate.handoff.active_permit.is_none());
+    assert!(candidate.handoff.promotion_receipt.is_none());
+}
+
+// WORK_UNIT_CASE: 819/43
+#[test]
+fn case_43_candidate_for_review_cannot_become_promoted() {
+    let candidate = assemble_complete();
+    match &candidate.status {
+        ClosureStatus::ClosedTaskLocal
+        | ClosureStatus::Checkpoint
+        | ClosureStatus::OpenDebt
+        | ClosureStatus::NoReusableDelta
+        | ClosureStatus::DelayedDebt => {}
+    }
+    assert_eq!(candidate.status, ClosureStatus::ClosedTaskLocal);
+    assert_eq!(format!("{:?}", candidate.status), "ClosedTaskLocal");
+    assert!(candidate.handoff.promotion_receipt.is_none());
+    assert!(candidate.handoff.active_permit.is_none());
+}
+
+// WORK_UNIT_CASE: 819/44
+#[test]
+fn case_44_insufficient_evidence_disposes_never_fabricates() {
+    // Unavailable attempt: delayed debt stays visible, never dropped. A mutant
+    // that deletes delayed Learning debt must fail the open-debt assert.
+    let (c, mut a, o, e, h, p) = complete_inputs();
+    a.attempts[0].status = AttemptStatus::Stale {
+        reason: "delayed-outcome-819".to_string(),
+    };
+    match learning_closure::assemble_campaign_learning_closure(c, a, o, e, h, p) {
+        Ok(ClosureAssembly::Disposition(disposition)) => {
+            assert_eq!(disposition.disposition, "continue-collect");
+            assert!(!disposition.open_debt.is_empty());
+            assert!(disposition.missing_owner.is_some());
+        }
+        other => panic!("stale attempt must dispose, got {other:?}"),
+    }
+    // Self-reported outcome never fabricates closure.
+    let (c2, a2, mut o2, e2, h2, p2) = complete_inputs();
+    for assessment in &mut o2.assessments {
+        if assessment.attempt_id == "attempt-2" && assessment.stage == LifecycleStage::Outcome {
+            assessment.source = EvidenceSource::SelfReport {
+                reporter: "worker-819".to_string(),
+            };
+        }
+    }
+    match learning_closure::assemble_campaign_learning_closure(c2, a2, o2, e2, h2, p2) {
+        Ok(ClosureAssembly::Disposition(disposition)) => {
+            assert_eq!(disposition.disposition, "inconclusive");
+            assert!(!disposition.open_debt.is_empty());
+        }
+        other => panic!("self-report must dispose, got {other:?}"),
+    }
+    // Unknown cost never fabricates closure.
+    let (c3, a3, o3, mut e3, h3, p3) = complete_inputs();
+    e3.economics[1].cost_known = false;
+    match learning_closure::assemble_campaign_learning_closure(c3, a3, o3, e3, h3, p3) {
+        Ok(ClosureAssembly::Disposition(_)) => {}
+        other => panic!("unknown cost must dispose, got {other:?}"),
+    }
+}
+
+// WORK_UNIT_CASE: 819/45
+#[test]
+fn case_45_reject_retire_disable_review_without_applied_decision() {
+    let (c, a, o, mut e, h, p) = complete_inputs();
+    e.outcomes[0].kind = OutcomeKind::Harmful;
+    e.outcomes[0].harm = HarmRecord {
+        harm_observed: true,
+        harm_ref: Some("harm-819-retire".to_string()),
+    };
+    match learning_closure::assemble_campaign_learning_closure(c, a, o, e, h, p) {
+        Ok(ClosureAssembly::Disposition(disposition)) => {
+            assert_eq!(disposition.disposition, "retire-review");
+            assert_eq!(disposition.retain_ref, "scope-819-a");
+            assert_eq!(
+                disposition.missing_owner,
+                Some("evaluator-819-a".to_string())
+            );
+            assert!(!disposition.open_debt.is_empty());
+        }
+        other => panic!("harm must retire without decision, got {other:?}"),
+    }
+}
+
+// WORK_UNIT_CASE: 819/46
+#[test]
+fn case_46_exact_external_owner_rollback_disable_reopen_expiry() {
+    let candidate = assemble_complete();
+    assert_eq!(candidate.handoff.external_owner_id, "governor-819");
+    assert_eq!(candidate.handoff.rollback_owner_id, "rollback-owner-819");
+    assert_eq!(candidate.handoff.disable_owner_id, "rollback-owner-819");
+    assert_eq!(candidate.handoff.reopen_owner_id, "governor-819");
+    assert_eq!(candidate.handoff.evidence_ref, "scope-819-a");
+    assert_eq!(candidate.handoff.approval_fence_ref, "fence-819-a");
+    assert_eq!(candidate.handoff.expiry_ref, "op-819-a");
+}
+
+// WORK_UNIT_CASE: 819/47
+#[test]
+fn case_47_missing_owner_or_irreversible_control_gap() {
+    let (c, a, o, e, h, mut p) = complete_inputs();
+    p.external_owner_id = String::new();
+    let err = learning_closure::assemble_campaign_learning_closure(
+        c,
+        a,
+        o,
+        e,
+        h,
+        p,
+    )
+    .expect_err("missing external owner must fail");
+    assert_eq!(err, LearningClosureError::MissingField("external_owner_id"));
+
+    let (c2, a2, o2, e2, h2, mut p2) = complete_inputs();
+    p2.rollback_owner_id = String::new();
+    let err2 = learning_closure::assemble_campaign_learning_closure(c2, a2, o2, e2, h2, p2)
+        .expect_err("missing rollback owner must fail");
+    assert_eq!(
+        err2,
+        LearningClosureError::MissingField("rollback_owner_id")
+    );
+
+    let (c3, a3, o3, e3, h3, mut p3) = complete_inputs();
+    p3.idempotency_key = String::new();
+    let err3 = learning_closure::assemble_campaign_learning_closure(c3, a3, o3, e3, h3, p3)
+        .expect_err("missing idempotency key must fail");
+    assert_eq!(err3, LearningClosureError::MissingField("idempotency_key"));
+}
+
+// WORK_UNIT_CASE: 819/48
+#[test]
+fn case_48_no_active_permit_lease_write_or_promotion_receipt() {
+    let candidate = assemble_complete();
+    assert!(candidate.handoff.active_permit.is_none());
+    assert!(candidate.handoff.promotion_receipt.is_none());
+    assert_eq!(candidate.status, ClosureStatus::ClosedTaskLocal);
+    // Dispositions carry retention only, never receipts.
+    let (c, mut a, o, e, h, p) = complete_inputs();
+    a.attempts[0].status = AttemptStatus::Unavailable {
+        reason: "evidence-store-down-819".to_string(),
+    };
+    match learning_closure::assemble_campaign_learning_closure(c, a, o, e, h, p) {
+        Ok(ClosureAssembly::Disposition(disposition)) => {
+            assert_eq!(disposition.retain_ref, "scope-819-a");
+            assert!(disposition.missing_owner.is_some());
+        }
+        other => panic!("unavailable attempt must dispose, got {other:?}"),
+    }
+}
+
+// WORK_UNIT_CASE: 819/49
+#[test]
+fn case_49_independent_item_output_work_deadline_bounds() {
+    let (c, a, o, e, h, mut p) = complete_inputs();
+    p.max_attempts = 1;
+    let err = learning_closure::assemble_campaign_learning_closure(c, a, o, e, h, p)
+        .expect_err("attempt overflow must fail");
+    assert!(matches!(err, LearningClosureError::BoundExceeded { .. }));
+
+    let (c2, a2, o2, e2, h2, mut p2) = complete_inputs();
+    p2.max_bytes = 1;
+    let err2 = learning_closure::assemble_campaign_learning_closure(c2, a2, o2, e2, h2, p2)
+        .expect_err("byte overflow must fail");
+    assert!(matches!(err2, LearningClosureError::BoundExceeded { .. }));
+
+    let (c3, mut a3, o3, e3, h3, p3) = complete_inputs();
+    a3.expected_attempt_ids[0] = String::new();
+    let err3 = learning_closure::assemble_campaign_learning_closure(c3, a3, o3, e3, h3, p3)
+        .expect_err("malformed attempt id must fail");
+    assert!(matches!(err3, LearningClosureError::Malformed { .. }));
+
+    let (c4, a4, o4, e4, h4, mut p4) = complete_inputs();
+    p4.schema_version = 99;
+    let err4 = learning_closure::assemble_campaign_learning_closure(c4, a4, o4, e4, h4, p4)
+        .expect_err("unknown schema must fail");
+    assert_eq!(err4, LearningClosureError::UnsupportedSchema { version: 99 });
+}
+
+// WORK_UNIT_CASE: 819/50
+#[test]
+fn case_50_replay_and_changed_same_id_policy_conflict() {
+    // Replay under identical inputs is byte-identical: no spurious conflict.
+    let (c, a, o, e, h, p) = complete_inputs();
+    let first = match learning_closure::assemble_campaign_learning_closure(
+        c.clone(),
+        a.clone(),
+        o.clone(),
+        e.clone(),
+        h.clone(),
+        p.clone(),
+    ) {
+        Ok(ClosureAssembly::Candidate(candidate)) => candidate,
+        other => panic!("first replay must close, got {other:?}"),
+    };
+    let second = match learning_closure::assemble_campaign_learning_closure(c, a, o, e, h, p.clone())
+    {
+        Ok(ClosureAssembly::Candidate(candidate)) => candidate,
+        other => panic!("second replay must close, got {other:?}"),
+    };
+    assert_eq!(first.digest, second.digest);
+    assert_eq!(first.candidate_id, second.candidate_id);
+    // Changed same-ID record conflicts instead of silently winning.
+    let (c2, mut a2, o2, e2, h2, p2) = complete_inputs();
+    let mut rival = attempt("attempt-1", "target-819-a");
+    rival.has_outcome = false;
+    a2.attempts.push(rival);
+    let err = learning_closure::assemble_campaign_learning_closure(c2, a2, o2, e2, h2, p2)
+        .expect_err("changed same-ID record must fail");
+    assert_eq!(
+        err,
+        LearningClosureError::ConflictingRecord {
+            id: "attempt-1".to_string()
+        }
+    );
+    // Changed policy binds a different digest.
+    let (c3, a3, o3, e3, h3, mut p3) = complete_inputs();
+    p3.idempotency_key = "idem-819-rotated".to_string();
+    let rotated =
+        match learning_closure::assemble_campaign_learning_closure(c3, a3, o3, e3, h3, p3) {
+            Ok(ClosureAssembly::Candidate(candidate)) => candidate,
+            other => panic!("rotated policy must close, got {other:?}"),
+        };
+    assert_ne!(first.digest, rotated.digest);
+}
