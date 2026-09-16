@@ -19,7 +19,6 @@
 //!
 //! [`ComponentEnginePort`]: crate::ports::ComponentEnginePort
 
-use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
 use crate::component_contract::{
