@@ -34,7 +34,7 @@ use eliot_protocol::{ProtocolVersion, ServerHello};
 use std::sync::atomic::Ordering;
 
 mod activation_projection;
-mod agent_fabric;
+pub mod agent_fabric;
 mod controlboard_adapters;
 mod daemon_config;
 mod daemon_kernel_client;
@@ -55,12 +55,14 @@ mod task_lifecycle_adapters;
 
 pub use activation_projection::AgentActivationResolver;
 pub use agent_fabric::{
-    ActivationEvidence, AdmissionAuthorityPort, ActivationAuthorityPort, AgentFabric,
-    AgentFabricDescriptor, AttemptLifecycle, CancellationLifecycle, COORDINATOR_CRATE, DAEMON_CRATE,
-    DispatchAck, DispatchEgressPort, DispatchIntent, FabricAdmission, FabricError, FabricPorts,
-    FabricSnapshot, LedgerEntry, ModelRegistryPort, PeerChannelPort, PeerMessage, PeerReceipt,
-    Reservation, RouteRequirements, SwarmDefinition, SwarmEntryReceipt, WorkerAck,
-    AttemptResultRecord, PREREQ_PORTS, daemon_coordinator_config, plan_candidate, prereq_ports,
+    ActivationAuthorityPort, ActivationEvidence, AdmissionAuthorityPort, AgentFabric,
+    AgentFabricDescriptor, AttemptLifecycle, AttemptResultRecord, COORDINATOR_CRATE,
+    CancellationLifecycle, DAEMON_CRATE, DispatchAck, DispatchEgressPort, DispatchIntent,
+    FABRIC_CAPACITY_IDENTITY, FABRIC_CAPACITY_REVISION, FABRIC_PLAN_GAP_REASON, FabricAdmission,
+    FabricError, FabricPorts, FabricSnapshot, LedgerEntry, ModelRegistryPort, PREREQ_PORTS,
+    PeerChannelPort, PeerMessage, PeerReceipt, Reservation, RouteRequirements, SwarmControlPort,
+    SwarmDefinition, SwarmEntryReceipt, WorkerAck, daemon_coordinator_config, plan_candidate,
+    prereq_ports,
 };
 
 use controlboard_adapters::SharedOperatorReplay;
@@ -560,8 +562,13 @@ impl DaemonComposition {
     /// divergence.
     pub fn task_lifecycle(
         &self,
-    ) -> Result<task_lifecycle_adapters::ForwardingTaskLifecycle<'_, dyn eliot_governor::KernelGenerationPort>, DaemonError>
-    {
+    ) -> Result<
+        task_lifecycle_adapters::ForwardingTaskLifecycle<
+            '_,
+            dyn eliot_governor::KernelGenerationPort,
+        >,
+        DaemonError,
+    > {
         if self.readiness() != eliot_governor::CompositionReadiness::Ready {
             return Err(DaemonError::Composition(
                 eliot_governor::CompositionError::NotReady,
@@ -682,7 +689,11 @@ impl DaemonComposition {
         reads: &'a KernelContextReadClient,
         now: u64,
     ) -> Result<
-        eliot_governor::GovernorEpistemicComposition<'a, DaemonKernelClient, KernelContextReadClient>,
+        eliot_governor::GovernorEpistemicComposition<
+            'a,
+            DaemonKernelClient,
+            KernelContextReadClient,
+        >,
         DaemonError,
     > {
         if self.readiness() != eliot_governor::CompositionReadiness::Ready {
@@ -691,15 +702,13 @@ impl DaemonComposition {
             ));
         }
         let activation = self.governor.read_unique_agent_activation(now)?;
-        Ok(
-            eliot_governor::GovernorEpistemicComposition::borrow(
-                &self.governor.owners().canonical,
-                activation,
-                kernel.as_ref(),
-                reads,
-                self.readiness(),
-            ),
-        )
+        Ok(eliot_governor::GovernorEpistemicComposition::borrow(
+            &self.governor.owners().canonical,
+            activation,
+            kernel.as_ref(),
+            reads,
+            self.readiness(),
+        ))
     }
 
     /// Borrows the Governor Dreamer orientation intake adapter over the retained owners plus
@@ -761,9 +770,9 @@ impl DaemonComposition {
             return Err(DaemonError::Composition(CompositionError::NotReady));
         }
         let fence = self.governor.kernel_snapshot().state_fence().clone();
-        fence
-            .validate()
-            .map_err(|error| DaemonError::Lifecycle(format!("agent fabric admitted fence: {error}")))?;
+        fence.validate().map_err(|error| {
+            DaemonError::Lifecycle(format!("agent fabric admitted fence: {error}"))
+        })?;
         let config = daemon_coordinator_config()
             .map_err(|error| DaemonError::Lifecycle(error.to_string()))?;
         Ok(AgentFabricDescriptor {
@@ -796,8 +805,7 @@ impl DaemonComposition {
         }
         let config = daemon_coordinator_config()
             .map_err(|error| DaemonError::Lifecycle(error.to_string()))?;
-        plan_candidate(&config, request)
-            .map_err(|error| DaemonError::Lifecycle(error.to_string()))
+        plan_candidate(&config, request).map_err(|error| DaemonError::Lifecycle(error.to_string()))
     }
 
     /// Borrows the Governor reconstruction read composition over the retained
