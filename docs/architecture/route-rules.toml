@@ -204,7 +204,7 @@ id = "workspace-governance"
 description = "Workspace build graph, repository policy, tests, scripts, active workstreams, and configuration changes."
 path_globs = [
   "Cargo.toml", "Cargo.lock", "rust-toolchain.toml", "deny.toml", ".typos.toml", "Justfile", "tool-versions.json", "mcpls.toml",
-  ".github/**", "scripts/**", "tests/**", "config/**", "workspace/**", "workstreams/**", "T*.md",
+  ".github/**", "scripts/**", "tests/**", "config/**", "workspace/**", "workstreams/**", "T*.md", "items/**",
 ]
 topic_keywords = ["workspace", "cargo", "repository policy", "workstream", "build graph", "configuration"]
 required_handles = ["A10.4", "A14.8", "I2.17", "I2.20..I2.23", "I17", "I18"]
