@@ -63,17 +63,17 @@ use eliot_protocol::dreamer_job::{
     JobRole, JobState, MutationDisposition,
 };
 use eliot_store_api::{
+    CAPABILITY_DREAMER_JOB_BEGIN_VERIFICATION, CAPABILITY_DREAMER_JOB_CHECKPOINT,
+    CAPABILITY_DREAMER_JOB_LEASE_EXACT, CAPABILITY_DREAMER_JOB_LEASE_NEXT,
+    CAPABILITY_DREAMER_JOB_PUBLISH, CAPABILITY_DREAMER_JOB_RECONCILE, CAPABILITY_DREAMER_JOB_RENEW,
+    CAPABILITY_DREAMER_JOB_REQUEST_CANCEL, CAPABILITY_DREAMER_JOB_RESUME,
+    CAPABILITY_DREAMER_JOB_START, CAPABILITY_DREAMER_JOB_STATUS, CAPABILITY_DREAMER_JOB_SUBMIT,
+    CONTRACT_VERSION, DREAMER_JOB_LEDGER_SCHEMA,
+};
+use eliot_store_api::{
     CanonicalStoreClient, DreamerJobLedgerEvent, DreamerJobLedgerRecord,
     DreamerJobMutationIdentity, MAX_DREAMER_JOB_HISTORY, RecoveryRecord, RequestMeta, StateFence,
     StoreError, StoreRecoveryRequest, dreamer_job_capability, dreamer_job_queue_key,
-};
-use eliot_store_api::{
-    CAPABILITY_DREAMER_JOB_BEGIN_VERIFICATION, CAPABILITY_DREAMER_JOB_CHECKPOINT,
-    CAPABILITY_DREAMER_JOB_LEASE_EXACT, CAPABILITY_DREAMER_JOB_LEASE_NEXT,
-    CAPABILITY_DREAMER_JOB_PUBLISH, CAPABILITY_DREAMER_JOB_RECONCILE,
-    CAPABILITY_DREAMER_JOB_REQUEST_CANCEL, CAPABILITY_DREAMER_JOB_RESUME,
-    CAPABILITY_DREAMER_JOB_RENEW, CAPABILITY_DREAMER_JOB_START, CAPABILITY_DREAMER_JOB_STATUS,
-    CAPABILITY_DREAMER_JOB_SUBMIT, CONTRACT_VERSION, DREAMER_JOB_LEDGER_SCHEMA,
 };
 use eliot_store_surreal_adapter::{
     AdapterError, PINNED_SURREALDB_MAJOR, SchemaGeneration, SurrealAdapterConfig,
@@ -1191,13 +1191,13 @@ async fn case_06_stale_pins_not_applied() {
     let harness = Harness::fresh("case-06").await;
     let job = "job-775-06";
     let attempt = "attempt-775-06";
-    let (_submitted, leased, lease) = submit_and_lease(&harness, "06", job, attempt, "worker-775-06").await;
+    let (_submitted, leased, lease) =
+        submit_and_lease(&harness, "06", job, attempt, "worker-775-06").await;
     let issued = issued_of(&lease);
 
     // Stale fence: the selector fence must equal the admitted scope fence.
     let mut stale_selector: eliot_protocol::dreamer_job::LeaseSelector =
-        serde_json::from_value(lease_selector_json(1, "worker-stale-775-06", 8))
-            .expect("selector");
+        serde_json::from_value(lease_selector_json(1, "worker-stale-775-06", 8)).expect("selector");
     stale_selector.expected_fence =
         serde_json::from_value(foreign_fence_json()).expect("foreign fence");
     let stale_fence = make_request(
@@ -1342,7 +1342,10 @@ async fn lifecycle_step(
     fresh: &str,
 ) -> DurableJobResponse {
     adapter
-        .dreamer_job(&ctx(fresh), make_request(operation, role, op, stable, fresh))
+        .dreamer_job(
+            &ctx(fresh),
+            make_request(operation, role, op, stable, fresh),
+        )
         .await
         .expect("lifecycle step commits")
 }
@@ -1353,12 +1356,14 @@ async fn case_07_verifying_vs_result() {
     let harness = Harness::fresh("case-07").await;
     let job = "job-775-07";
     let attempt = "attempt-775-07";
-    let (_submitted, leased, lease) = submit_and_lease(&harness, "07", job, attempt, "worker-775-07").await;
+    let (_submitted, leased, lease) =
+        submit_and_lease(&harness, "07", job, attempt, "worker-775-07").await;
     let issued = issued_of(&lease);
     let checkpoint = checkpoint_json("checkpoint-775-07-1");
     let adapter = harness.adapter();
 
-    let started = lifecycle_step(adapter,
+    let started = lifecycle_step(
+        adapter,
         lease_op_json("START_JOB", &lease, issued + 1_000),
         JobRole::Worker,
         "operation-775-07-start",
@@ -1387,8 +1392,14 @@ async fn case_07_verifying_vs_result() {
         .expect_err("direct publish is illegal");
     assert!(matches!(direct_error, StoreError::InvalidProjection));
 
-    let checkpointed = lifecycle_step(adapter,
-        checkpoint_op_json(&lease_value_of(&started), &checkpoint, issued + 3_000, false),
+    let checkpointed = lifecycle_step(
+        adapter,
+        checkpoint_op_json(
+            &lease_value_of(&started),
+            &checkpoint,
+            issued + 3_000,
+            false,
+        ),
         JobRole::Worker,
         "operation-775-07-checkpoint",
         "stable-775-07-checkpoint",
@@ -1398,7 +1409,8 @@ async fn case_07_verifying_vs_result() {
     assert_eq!(checkpointed.state, JobState::Checkpointed);
     assert!(checkpointed.checkpoint.is_some());
 
-    let resumed = lifecycle_step(adapter,
+    let resumed = lifecycle_step(
+        adapter,
         checkpoint_op_json(
             &lease_value_of(&checkpointed),
             &checkpoint,
@@ -1413,15 +1425,22 @@ async fn case_07_verifying_vs_result() {
     .await;
     assert_eq!(resumed.state, JobState::Running);
 
-    let checkpointed_again = lifecycle_step(adapter,
-        checkpoint_op_json(&lease_value_of(&resumed), &checkpoint, issued + 5_000, false),
+    let checkpointed_again = lifecycle_step(
+        adapter,
+        checkpoint_op_json(
+            &lease_value_of(&resumed),
+            &checkpoint,
+            issued + 5_000,
+            false,
+        ),
         JobRole::Worker,
         "operation-775-07-checkpoint-2",
         "stable-775-07-checkpoint-2",
         "ctx-775-07-checkpoint-2",
     )
     .await;
-    let verifying = lifecycle_step(adapter,
+    let verifying = lifecycle_step(
+        adapter,
         begin_verify_op_json(
             &lease_value_of(&checkpointed_again),
             &content_ref("result-775-07"),
@@ -1455,7 +1474,8 @@ async fn case_07_verifying_vs_result() {
         .expect_err("empty partial is invalid");
     assert!(matches!(partial_error, StoreError::InvalidReceipt));
 
-    let completed = lifecycle_step(adapter,
+    let completed = lifecycle_step(
+        adapter,
         publish_op_json(
             &lease_value_of(&verifying),
             &outcome_json("COMPLETED", Some(&content_ref("output")), &[], None),
@@ -1837,7 +1857,10 @@ async fn case_12_absence_vs_unknown() {
         )
         .await
         .expect("proven absence resolves");
-    assert_eq!(proven.disposition, Some(MutationDisposition::ProvenNotApplied));
+    assert_eq!(
+        proven.disposition,
+        Some(MutationDisposition::ProvenNotApplied)
+    );
     assert_eq!(proven.state, committed.state);
     assert_eq!(proven.revision, committed.revision);
     assert!(proven.receipt_id.is_none());
@@ -2060,7 +2083,11 @@ async fn case_15_bounded_selection() {
     let adapter = harness.adapter();
     for suffix in ["a", "b", "c"] {
         let submit = make_request(
-            submit_operation(&format!("job-775-15-{suffix}"), &format!("attempt-775-15-{suffix}"), "input-775-15"),
+            submit_operation(
+                &format!("job-775-15-{suffix}"),
+                &format!("attempt-775-15-{suffix}"),
+                "input-775-15",
+            ),
             JobRole::Requester,
             &format!("operation-775-15-submit-{suffix}"),
             &format!("stable-775-15-submit-{suffix}"),
@@ -2210,15 +2237,23 @@ async fn case_16_recovery_completeness() {
     keys.sort_unstable();
     for key in &keys {
         assert!(
-            key.starts_with("job_") || key.starts_with("event_") || key.starts_with("op_") || key.starts_with("receipt_"),
+            key.starts_with("job_")
+                || key.starts_with("event_")
+                || key.starts_with("op_")
+                || key.starts_with("receipt_"),
             "discriminated dreamer key: {key}"
         );
     }
     assert!(keys.iter().any(|key| key.starts_with("job_")));
-    assert_eq!(keys.iter().filter(|key| key.starts_with("event_")).count(), 2);
+    assert_eq!(
+        keys.iter().filter(|key| key.starts_with("event_")).count(),
+        2
+    );
     assert_eq!(keys.iter().filter(|key| key.starts_with("op_")).count(), 2);
     assert_eq!(
-        keys.iter().filter(|key| key.starts_with("receipt_")).count(),
+        keys.iter()
+            .filter(|key| key.starts_with("receipt_"))
+            .count(),
         2
     );
     for record in &snapshot.job_records {
@@ -2253,7 +2288,10 @@ async fn case_17_schema_sufficiency_no_migration() {
     let harness = Harness::fresh("case-17").await;
     let readiness = harness.adapter().probe_readiness().await.expect("ready");
     assert!(
-        matches!(readiness, eliot_store_surreal_adapter::SemanticReadiness::Ready { .. }),
+        matches!(
+            readiness,
+            eliot_store_surreal_adapter::SemanticReadiness::Ready { .. }
+        ),
         "stock v2 baseline is ready, got: {readiness:?}"
     );
     let job = "job-775-17";
@@ -2261,10 +2299,7 @@ async fn case_17_schema_sufficiency_no_migration() {
     let (_submitted, leased, _lease) =
         submit_and_lease(&harness, "17", job, attempt, "worker-775-17").await;
     assert_eq!(leased.state, JobState::Leased);
-    assert_eq!(
-        DREAMER_JOB_LEDGER_SCHEMA,
-        "eliot.storage.dreamer-job.v1"
-    );
+    assert_eq!(DREAMER_JOB_LEDGER_SCHEMA, "eliot.storage.dreamer-job.v1");
     assert_eq!(MAX_DREAMER_JOB_HISTORY, 256);
 }
 
@@ -2275,7 +2310,11 @@ async fn case_18_limits_and_one_over() {
     let adapter = harness.adapter();
     for suffix in ["a", "b"] {
         let submit = make_request(
-            submit_operation(&format!("job-775-18-{suffix}"), &format!("attempt-775-18-{suffix}"), "input-775-18"),
+            submit_operation(
+                &format!("job-775-18-{suffix}"),
+                &format!("attempt-775-18-{suffix}"),
+                "input-775-18",
+            ),
             JobRole::Requester,
             &format!("operation-775-18-submit-{suffix}"),
             &format!("stable-775-18-submit-{suffix}"),
@@ -2391,10 +2430,9 @@ fn case_19_no_secrets_in_errors() {
 #[test]
 fn case_20_malformed_and_delegation() {
     // Fixture rows fail closed without panicking.
-    let malformed: DreamerJobMutationIdentity = serde_json::from_str(include_str!(
-        "data/dreamer-job/malformed-identity.json"
-    ))
-    .expect("fixture parses");
+    let malformed: DreamerJobMutationIdentity =
+        serde_json::from_str(include_str!("data/dreamer-job/malformed-identity.json"))
+            .expect("fixture parses");
     assert!(malformed.validate().is_err());
     let obsolete: DreamerJobMutationIdentity = serde_json::from_str(include_str!(
         "data/dreamer-job/obsolete-operation-kind.json"
@@ -2404,10 +2442,9 @@ fn case_20_malformed_and_delegation() {
         obsolete.validate().expect_err("obsolete kind fails"),
         StoreError::UnknownOperation
     );
-    let bad_digest: RecoveryRecord = serde_json::from_str(include_str!(
-        "data/dreamer-job/bad-digest-record.json"
-    ))
-    .expect("fixture parses");
+    let bad_digest: RecoveryRecord =
+        serde_json::from_str(include_str!("data/dreamer-job/bad-digest-record.json"))
+            .expect("fixture parses");
     assert!(bad_digest.validate().is_err());
 
     // Every closed operation kind delegates to a distinct advertised store
@@ -2437,11 +2474,7 @@ fn case_20_malformed_and_delegation() {
         checkpoint_op_json(&lease, &checkpoint_json("checkpoint-775-20"), 2_000, false),
         checkpoint_op_json(&lease, &checkpoint_json("checkpoint-775-20"), 2_000, true),
         begin_verify_op_json(&lease, &content_ref("result-775-20"), 2_000),
-        publish_op_json(
-            &lease,
-            &outcome_json("FAILED", None, &[], None),
-            2_000,
-        ),
+        publish_op_json(&lease, &outcome_json("FAILED", None, &[], None), 2_000),
         status_operation("job-775-20", "attempt-775-20", 1),
         request_cancel_operation("job-775-20", "attempt-775-20", "probe", 2_000),
         serde_json::from_value(json!({
@@ -2610,8 +2643,7 @@ fn bundle_parts(
         "operation_kind": "SUBMIT_JOB",
     }))
     .expect("mutation");
-    record.last_receipt_id =
-        Some(serde_json::from_value(receipt.clone()).expect("receipt id"));
+    record.last_receipt_id = Some(serde_json::from_value(receipt.clone()).expect("receipt id"));
     record.record_digest = record.compute_digest().expect("digest");
     record.validate().expect("record validates");
     let mut event = valid_ledger_event(job, attempt);
