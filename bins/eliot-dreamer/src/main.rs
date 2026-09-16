@@ -1,7 +1,9 @@
 use std::io::{self, Write};
 use std::process::ExitCode;
 
-use eliot_dreamer::{AuthenticatedKernelJobPort, DreamerError};
+use eliot_dreamer::{
+    AuthenticatedKernelJobPort, DreamerError, JobState, KernelSupervisedComposition,
+};
 use serde::Serialize;
 
 const KERNEL_ADMISSION_EXIT: u8 = 78;
@@ -15,9 +17,28 @@ enum Response {
 
 fn main() -> ExitCode {
     let mut output = io::BufWriter::new(io::stdout().lock());
-    match AuthenticatedKernelJobPort::connect() {
-        Ok(port) => {
-            let _ = write_response(&mut output, &success_response(port.claimed_view()));
+    let port = match AuthenticatedKernelJobPort::connect() {
+        Ok(port) => port,
+        Err(error) => {
+            let _ = write_response(&mut output, &error_response(&error));
+            return ExitCode::from(KERNEL_ADMISSION_EXIT);
+        }
+    };
+    // The claim (`LeaseExact` then `Start`) already proved admission. The
+    // supervised loop confirms the live Kernel-proved disposition through
+    // `Status` and projects exactly that: no hardcoded state, no local
+    // terminal invention. Any denial fails closed with exit 78.
+    let admission = port.claimed_admission().clone();
+    let mut service = match KernelSupervisedComposition::connect(port) {
+        Ok(service) => service,
+        Err(error) => {
+            let _ = write_response(&mut output, &error_response(&error));
+            return ExitCode::from(KERNEL_ADMISSION_EXIT);
+        }
+    };
+    match service.status(&admission) {
+        Ok(view) => {
+            let _ = write_response(&mut output, &success_response(&view));
             ExitCode::SUCCESS
         }
         Err(error) => {
@@ -30,7 +51,22 @@ fn main() -> ExitCode {
 fn success_response(view: &eliot_dreamer::JobView) -> Response {
     Response::Success {
         job_id: view.job_id.clone(),
-        state: "running".to_owned(),
+        state: state_name(view.state).to_owned(),
+    }
+}
+
+/// Projects the proved local disposition. Exhaustive: a new lifecycle state
+/// fails compilation here instead of rendering a wrong receipt.
+fn state_name(state: JobState) -> &'static str {
+    match state {
+        JobState::Queued => "queued",
+        JobState::Running => "running",
+        JobState::Completed => "completed",
+        JobState::Cancelled => "cancelled",
+        JobState::Rejected => "rejected",
+        JobState::Partial => "partial",
+        JobState::Failed => "failed",
+        JobState::Reconciling => "reconciling",
     }
 }
 
@@ -52,7 +88,7 @@ mod tests {
     use super::*;
     use eliot_contracts::{EpochId, EpochLineageId, ResourceGeneration, StateFence};
     use eliot_dreamer::{
-        DreamJobInput, JobClass, JobView, KernelJobAdmission, KernelSupervisedComposition,
+        DreamJobInput, JobClass, JobState, JobView, KernelJobAdmission, KernelSupervisedComposition,
     };
     use std::collections::VecDeque;
     use std::num::NonZeroU64;
@@ -246,6 +282,38 @@ mod tests {
             service.status(&switched).map_err(|error| error.code()),
             Err(eliot_dreamer::KERNEL_ADMISSION_REQUIRED)
         );
+    }
+
+    /// The terminal receipt projects the Kernel-proved disposition: every
+    /// lifecycle state renders under its own name, so a reconciling or
+    /// failed job can never masquerade as running.
+    #[test]
+    fn success_response_projects_proved_state() {
+        for (state, name) in [
+            (JobState::Queued, "queued"),
+            (JobState::Running, "running"),
+            (JobState::Completed, "completed"),
+            (JobState::Cancelled, "cancelled"),
+            (JobState::Rejected, "rejected"),
+            (JobState::Partial, "partial"),
+            (JobState::Failed, "failed"),
+            (JobState::Reconciling, "reconciling"),
+        ] {
+            let response = success_response(&JobView {
+                job_id: "job-1".to_owned(),
+                state,
+                result: None,
+            });
+            let Response::Success {
+                job_id,
+                state: projected,
+            } = response
+            else {
+                panic!("proved view must project a success receipt");
+            };
+            assert_eq!(job_id, "job-1");
+            assert_eq!(projected, name);
+        }
     }
 
     #[test]
