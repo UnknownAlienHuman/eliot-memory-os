@@ -47,24 +47,18 @@ impl KernelComposition {
     }
 
     pub(super) fn daemon_snapshot(&self) -> Result<serde_json::Value, TransportError> {
-        let policy = match self.front_door_policy.lock() {
-            Ok(policy) => policy,
-            Err(_) => {
-                observe_health("kernel.health.snapshot_omitted", "fenced");
-                return Err(TransportError::SessionFenced);
-            }
+        let Ok(policy) = self.front_door_policy.lock() else {
+            observe_health("kernel.health.snapshot_omitted", "fenced");
+            return Err(TransportError::SessionFenced);
         };
-        let kernel_artifact_digest = match policy
+        let Some(kernel_artifact_digest) = policy
             .config_snapshot
             .get("artifact_digest")
             .and_then(serde_json::Value::as_str)
             .filter(|value| !value.trim().is_empty())
-        {
-            Some(kernel_artifact_digest) => kernel_artifact_digest,
-            None => {
-                observe_health("kernel.health.snapshot_omitted", "missing_artifact");
-                return Err(TransportError::SessionFenced);
-            }
+        else {
+            observe_health("kernel.health.snapshot_omitted", "missing_artifact");
+            return Err(TransportError::SessionFenced);
         };
         let protected_snapshot_digest = policy
             .config_snapshot
@@ -100,21 +94,17 @@ impl KernelComposition {
     pub(super) async fn daemon_health(
         &self,
     ) -> Result<eliot_store_api::StoreHealth, KernelServiceError> {
-        let gateway = match self.canonical_store_gateway.lock() {
-            Ok(gateway) => gateway.clone(),
-            Err(_) => {
-                observe_health("kernel.health.store_unavailable", "fenced");
-                return Err(KernelServiceError::Platform(
-                    "store gateway lock poisoned".to_owned(),
-                ));
-            }
+        let gateway = if let Ok(gateway) = self.canonical_store_gateway.lock() {
+            gateway.clone()
+        } else {
+            observe_health("kernel.health.store_unavailable", "fenced");
+            return Err(KernelServiceError::Platform(
+                "store gateway lock poisoned".to_owned(),
+            ));
         };
-        let gateway = match gateway {
-            Some(gateway) => gateway,
-            None => {
-                observe_health("kernel.health.store_absent", "unknown");
-                return Err(KernelServiceError::ReadinessNotProven);
-            }
+        let Some(gateway) = gateway else {
+            observe_health("kernel.health.store_absent", "unknown");
+            return Err(KernelServiceError::ReadinessNotProven);
         };
         match gateway.health().await {
             Ok(health) => {
@@ -138,14 +128,11 @@ impl KernelComposition {
 
     /// Returns the current Kernel service lifecycle state.
     pub fn service_state(&self) -> Result<KernelServiceState, KernelServiceError> {
-        let service = match self.service.lock() {
-            Ok(service) => service,
-            Err(_) => {
-                observe_health("kernel.health.service_state_omitted", "fenced");
-                return Err(KernelServiceError::Platform(
-                    "service lock poisoned".to_owned(),
-                ));
-            }
+        let Ok(service) = self.service.lock() else {
+            observe_health("kernel.health.service_state_omitted", "fenced");
+            return Err(KernelServiceError::Platform(
+                "service lock poisoned".to_owned(),
+            ));
         };
         let state = service.state();
         observe_health("kernel.health.service_state_observed", "success");

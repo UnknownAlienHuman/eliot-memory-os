@@ -110,14 +110,11 @@ pub(crate) fn eliotd_operation_id(
     generation: Generation,
     launch_attempt_identity: &str,
 ) -> Result<eliot_process::OperationId, KernelBuildError> {
-    let short = match launch_attempt_identity.get(..16) {
-        Some(short) => short,
-        None => {
-            observe_identity("kernel.identity.operation_rejected", "rejected");
-            return Err(KernelBuildError::Service(
-                "eliotd launch attempt identity is malformed".to_owned(),
-            ));
-        }
+    let Some(short) = launch_attempt_identity.get(..16) else {
+        observe_identity("kernel.identity.operation_rejected", "rejected");
+        return Err(KernelBuildError::Service(
+            "eliotd launch attempt identity is malformed".to_owned(),
+        ));
     };
     match eliot_process::OperationId::new(format!("eliotd-launch-{}-{short}", generation.get())) {
         Ok(operation_id) => {
