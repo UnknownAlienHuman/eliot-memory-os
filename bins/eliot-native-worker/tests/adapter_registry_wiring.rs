@@ -1,13 +1,14 @@
 //! T9-07 four-factory registry wiring proof (WRITER-A, bound by INTEGRATOR-T9-07).
 //!
-//! Real factories with controlled external seams: no live credentials, no
-//! network, no spawned processes. The P-03 executor is an in-memory
-//! recording double (its `start` is never reached on any refusal path);
-//! opencode uses a loopback endpoint plus a non-credential policy directory;
-//! ACP uses caller-owned in-memory handles; Claude constructs the real
-//! `ClaudeSidecarFactory` over the forwarded executor while `prepare` with
-//! live owner records stays a drive step. Every test owns a [`FactoryLedger`]
-//! proving exactly which factory constructed, and none on any refusal.
+//! Resolution metadata for all four factories plus the one real invoke entry
+//! (Claude) with controlled external seams: no live credentials, no network,
+//! no spawned processes. The P-03 executor is an in-memory recording double
+//! (its `start` is never reached on any refusal path); Claude constructs the
+//! real `ClaudeSidecarFactory` over the forwarded executor while `prepare`
+//! with live owner records stays a drive step. Opencode and ACP keep
+//! resolution entries only (issue #1708): no invoke entry, no seams, no
+//! ledger construction. Every test owns a [`FactoryLedger`] proving exactly
+//! which factory constructed, and none on any refusal.
 //!
 //! The registry is imported from the crate (`lib.rs` owns `mod
 //! adapter_registry`); there is exactly one compilation of the module, so
@@ -31,11 +32,9 @@ use eliot_contracts::{
     sha256_hex,
 };
 use eliot_native_worker::adapter_registry::{
-    ACP_FACTORY_ID, AcpFactorySeams, AdapterIdentity, AdapterRegistry, CLAUDE_FACTORY_ID,
-    CODEX_FACTORY_ID, ClaudeFactorySeams, FACTORY_REVISION, FactoryEntry, FactoryLedger,
-    OPENCODE_FACTORY_ID, OpencodeFactorySeams, RegistryError, SecretRef, ValidatedDispatch,
-    invoke_acp_factory, invoke_claude_factory, invoke_opencode_factory,
-    validate_admitted_dispatch,
+    ACP_FACTORY_ID, AdapterIdentity, AdapterRegistry, CLAUDE_FACTORY_ID, CODEX_FACTORY_ID,
+    ClaudeFactorySeams, FACTORY_REVISION, FactoryEntry, FactoryLedger, OPENCODE_FACTORY_ID,
+    RegistryError, ValidatedDispatch, invoke_claude_factory, validate_admitted_dispatch,
 };
 use eliot_native_worker_core::{
     AttemptId, BudgetEnvelope, ClaimAdmissionRequest, EXECUTION_UNIT_SCHEMA_VERSION,
@@ -115,10 +114,6 @@ impl ProcessExecutor for RecordingExecutor {
         ))
     }
 }
-
-/// Caller-owned in-memory ACP transport handle (never opened).
-#[derive(Clone, Debug)]
-struct MemTransport;
 
 fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
     match mutex.lock() {
@@ -402,18 +397,6 @@ fn validated(fixtures: &AdmittedFixtures) -> ValidatedDispatch {
     ) {
         Ok(valid) => valid,
         Err(error) => panic!("valid registry fixture must validate: {error:?}"),
-    }
-}
-
-fn opencode_seams() -> OpencodeFactorySeams {
-    let credential = match SecretRef::parse("test-scope:registry-opencode-auth") {
-        Ok(reference) => reference,
-        Err(error) => panic!("test credential reference must parse: {error:?}"),
-    };
-    OpencodeFactorySeams {
-        policy_dir: std::env::temp_dir(),
-        endpoint: "http://127.0.0.1:18791".to_owned(),
-        credential,
     }
 }
 
@@ -800,10 +783,11 @@ fn exactly_one_named_factory() {
     let seams = ClaudeFactorySeams {
         executor: Arc::clone(&fixtures.executor),
     };
-    let attempt = match invoke_claude_factory(&registry, &valid, &seams, &claude_request(), &mut ledger) {
-        Ok(attempt) => attempt,
-        Err(error) => panic!("named claude factory must construct: {error:?}"),
-    };
+    let attempt =
+        match invoke_claude_factory(&registry, &valid, &seams, &claude_request(), &mut ledger) {
+            Ok(attempt) => attempt,
+            Err(error) => panic!("named claude factory must construct: {error:?}"),
+        };
     assert_eq!(ledger.calls().len(), 1);
     match ledger.calls().first() {
         Some(call) => {
@@ -822,6 +806,16 @@ fn exactly_one_named_factory() {
     assert_eq!(attempt.operation_id(), valid.operation_id());
     assert_eq!(attempt.attempt_id(), valid.attempt_id());
     assert_eq!(fixtures.executor.starts(), 0);
+
+    // Deterministic: a fresh ledger over identical inputs yields the
+    // identical attempt, without recalling shared state.
+    let mut replay = FactoryLedger::new();
+    let again =
+        match invoke_claude_factory(&registry, &valid, &seams, &claude_request(), &mut replay) {
+            Ok(again) => again,
+            Err(error) => panic!("named claude replay must match: {error:?}"),
+        };
+    assert_eq!(attempt, again);
 }
 
 // WORK_UNIT_CASE 11: no rerank, fallback, or substitution.
@@ -834,7 +828,9 @@ fn no_rerank_fallback_or_substitution() {
 
     // An opencode-resolved dispatch presented to the Claude factory is
     // refused as substitution: capability comes from naming, never from
-    // fallback, even though the Claude entry is capable.
+    // fallback, even though the Claude entry is capable. Opencode has no
+    // invoke entry (issue #1708), so there is no "explicit naming constructs"
+    // leg: the refusal plus the empty ledger is the whole proof.
     let claude_seams = ClaudeFactorySeams {
         executor: Arc::clone(&fixtures.executor),
     };
@@ -849,107 +845,4 @@ fn no_rerank_fallback_or_substitution() {
         other => panic!("cross-factory claude invoke must refuse, got {other:?}"),
     }
     assert!(ledger.calls().is_empty());
-
-    // The named factory still constructs explicitly afterwards: capability
-    // comes from naming, never from fallback.
-    match invoke_opencode_factory(&registry, &valid, &opencode_seams(), &mut ledger) {
-        Ok(_) => {}
-        Err(error) => panic!("explicit naming must construct: {error:?}"),
-    }
-    assert_eq!(ledger.calls().len(), 1);
-}
-
-// WORK_UNIT_CASE 30: one deterministic admitted attempt per capable adapter.
-#[test]
-fn deterministic_attempt_per_capable_adapter() {
-    let registry = AdapterRegistry::four_factory();
-    let cases = [
-        (OPENCODE_FACTORY_ID, AdapterIdentity::Opencode, "case-30a"),
-        (ACP_FACTORY_ID, AdapterIdentity::Acp, "case-30c"),
-        (CLAUDE_FACTORY_ID, AdapterIdentity::Claude, "case-30d"),
-    ];
-    for (factory_id, identity, tag) in cases {
-        let fixtures = admitted(factory_id, tag);
-        let valid = validated(&fixtures);
-        let mut ledger = FactoryLedger::new();
-        let attempt = match identity {
-            AdapterIdentity::Opencode => {
-                invoke_opencode_factory(&registry, &valid, &opencode_seams(), &mut ledger)
-            }
-            AdapterIdentity::Codex => panic!("codex factory has no invoke entry"),
-            AdapterIdentity::Acp => invoke_acp_factory(
-                &registry,
-                &valid,
-                AcpFactorySeams {
-                    executor: RecordingExecutor::new(),
-                    transport: MemTransport,
-                },
-                &mut ledger,
-            ),
-            AdapterIdentity::Claude => invoke_claude_factory(
-                &registry,
-                &valid,
-                &ClaudeFactorySeams {
-                    executor: Arc::clone(&fixtures.executor),
-                },
-                &claude_request(),
-                &mut ledger,
-            ),
-        };
-        let attempt = match attempt {
-            Ok(attempt) => attempt,
-            Err(error) => panic!("{factory_id} must yield one attempt: {error:?}"),
-        };
-        assert_eq!(attempt.adapter(), identity);
-        assert_eq!(ledger.calls_for(identity), 1);
-        assert_eq!(
-            attempt.event().stream_id,
-            format!("{}/gen-1", valid.claim_id())
-        );
-        assert_eq!(
-            attempt.event().event_id,
-            format!("{}/event-1", valid.claim_id())
-        );
-        assert_eq!(attempt.event().sequence, 1);
-        assert_eq!(attempt.terminal().attempt_id, valid.attempt_id());
-        assert_eq!(attempt.terminal().disposition, "constructed");
-        assert_eq!(attempt.reconciliation().claim_id, valid.claim_id());
-        assert_eq!(attempt.reconciliation().operation_id, valid.operation_id());
-        assert_eq!(
-            attempt.reconciliation().binding_digest,
-            valid.binding_digest()
-        );
-
-        // Deterministic: a fresh ledger over identical inputs yields the
-        // identical attempt, without recalling shared state.
-        let mut replay = FactoryLedger::new();
-        let again = match identity {
-            AdapterIdentity::Opencode => {
-                invoke_opencode_factory(&registry, &valid, &opencode_seams(), &mut replay)
-            }
-            AdapterIdentity::Codex => panic!("codex factory has no invoke entry"),
-            AdapterIdentity::Acp => invoke_acp_factory(
-                &registry,
-                &valid,
-                AcpFactorySeams {
-                    executor: RecordingExecutor::new(),
-                    transport: MemTransport,
-                },
-                &mut replay,
-            ),
-            AdapterIdentity::Claude => invoke_claude_factory(
-                &registry,
-                &valid,
-                &ClaudeFactorySeams {
-                    executor: Arc::clone(&fixtures.executor),
-                },
-                &claude_request(),
-                &mut replay,
-            ),
-        };
-        match again {
-            Ok(again) => assert_eq!(attempt, again),
-            Err(error) => panic!("{factory_id} replay must match: {error:?}"),
-        }
-    }
 }

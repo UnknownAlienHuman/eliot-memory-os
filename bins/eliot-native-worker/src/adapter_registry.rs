@@ -11,28 +11,16 @@
 //! adapter crate names as canonical identities:
 //!
 //! ```text
-//! eliot-agent-opencode @ 1 (capable; OpenCodeClient::new + catalogue fns)
-//! eliot-agent-codex    @ 1 (capable; CodexAdapter::<E>::new + attach seam)
-//! eliot-agent-acp      @ 1 (capable; AcpWire + AcpProcessBinding + admission seam)
+//! eliot-agent-opencode @ 1 (resolution only; no invoke entry, issue #1708)
+//! eliot-agent-codex    @ 1 (resolution only; no invoke entry)
+//! eliot-agent-acp      @ 1 (resolution only; no invoke entry, issue #1708)
 //! eliot-agent-claude   @ 1 (capable; ClaudeSidecarFactory::<E>::new + prepare/admit_with_port seam)
 //! ```
 //!
-//! There is no unified factory trait upstream; each factory is composed from
-//! its real per-adapter public entries to the maximum extent reachable
-//! without live credentials or live owner records:
+//! There is no unified factory trait upstream; only the Claude factory is
+//! composed from its real per-adapter public entries in this contour, to the
+//! maximum extent reachable without live credentials or live owner records:
 //!
-//! - opencode validates the run policy directory, the loopback endpoint, and
-//!   the bounded SSE decoder at runtime, and pins `OpenCodeClient::new` plus
-//!   `compile_opencode_model_catalogue` with compile-time signature
-//!   assertions. Client construction with a provider-resolved `BasicAuth`
-//!   stays a Writer-B drive step behind the credential boundary.
-//! - codex has no invoke entry in this contour: `CodexAdapter::<E>::new`,
-//!   `attach`/`begin_attempt` with live Q-01/A-01 records belong to the
-//!   agent-plane caller that owns those records, not to this contour.
-//! - acp constructs the real `AcpWire::new` over the caller-owned transport
-//!   and the real `AcpProcessBinding::new` over the forwarded executor, and
-//!   pins `AcpAdmission::validate`/`admit` with compile-time signature
-//!   assertions.
 //! - claude constructs the real `ClaudeSidecarFactory::<E>::new` over the
 //!   forwarded P-03 executor (pure: stores the handle, starts nothing),
 //!   validates the inert launch-plan shape at runtime, and pins
@@ -40,6 +28,18 @@
 //!   assertions. `prepare` with the live X4 binding plus agent attempt records
 //!   belongs to the agent-plane caller that owns those records, not to this
 //!   contour.
+//!
+//! The other three identities have no invoke entry in this contour:
+//!
+//! - opencode and acp keep registry entries (identity plus revision) as static
+//!   typed resolution metadata consumed by the live admitted seam
+//!   (`select_factory_for_admitted`), but neither constructs anything here:
+//!   the OpenCode/ACP crates are unreachable and no live caller supplies their
+//!   seams, so a construction would record an invocation that never happened
+//!   (issue #1708).
+//! - codex has no invoke entry in this contour: `CodexAdapter::<E>::new`,
+//!   `attach`/`begin_attempt` with live Q-01/A-01 records belong to the
+//!   agent-plane caller that owns those records, not to this contour.
 //!
 //! INTEGRATOR-T9-07 correction (issue #874): Writer A misread the Claude
 //! crate as a skeleton with no execution constructor. In fact
@@ -73,32 +73,27 @@
 //!
 //! No dynamic loading, no raw process spawn, no ambient credentials, and no
 //! unbounded buffers: every collection in this module is a fixed-size array
-//! or a `Vec` guarded by an explicit `MAX_*` bound, and the only
-//! credential-adjacent control type is [`SecretRef`], an opaque validated
-//! reference that is never logged (its `Debug` is redacted) and never
-//! resolved here.
+//! or a `Vec` guarded by an explicit `MAX_*` bound, and no credential value
+//! or credential reference travels through this contour at all.
 //!
 //! ## Writer-B drive wiring
 //!
 //! Resolve once with [`AdapterRegistry::resolve_claim`], validate once with
-//! [`validate_admitted_dispatch`], then call exactly one of
-//! [`invoke_opencode_factory`], [`invoke_acp_factory`], or [`invoke_claude_factory`] with the validated
-//! token and a [`FactoryLedger`]. Retained replay reconciles through the
-//! ledger via [`FactoryLedger::contains_operation`]; it never recalls a
-//! constructor.
+//! [`validate_admitted_dispatch`], then call [`invoke_claude_factory`] with
+//! the validated token and a [`FactoryLedger`]. Retained replay reconciles
+//! through the ledger via [`FactoryLedger::contains_operation`]; it never
+//! recalls a constructor. Opencode, ACP and Codex have no invoke entry in
+//! this contour (see above): nothing here constructs for those identities,
+//! and the downstream drive derives process intent generically through the
+//! executable gate with no factory effect of its own.
 
 #![forbid(unsafe_code)]
 
 use std::sync::Arc;
 
-use eliot_agent_acp::{AcpAdmission, AcpAdmissionError, AcpProcessBinding, AcpWire};
 use eliot_agent_claude::{ClaudeSidecarError, ClaudeSidecarRequest};
 use eliot_agent_codex::CODEX_ADAPTER_ID;
-use eliot_agent_opencode::{
-    BasicAuth, HealthResponse, LoopbackEndpoint, LoopbackEndpointError, OPENCODE_ADAPTER_ID,
-    OpenCodeCatalogueContext, OpenCodeClient, OpenCodeRunError, OpenCodeRunPolicy, ProviderCatalog,
-    SseDecoder, SseLimits, compile_opencode_model_catalogue,
-};
+use eliot_agent_opencode::OPENCODE_ADAPTER_ID;
 use eliot_native_worker_core::{
     CapabilityAdmissionRequest, ClaimAdmissionRequest, NativeWorkerClaim,
     NativeWorkerExecutableExpectation, WorkerError, WorkerHello,
@@ -131,8 +126,6 @@ pub const MAX_FACTORY_CALLS: usize = 16;
 pub const MAX_ADAPTER_ID_LEN: usize = 128;
 /// Maximum error-detail characters carried from third-party validators.
 pub const MAX_DETAIL_CHARS: usize = 256;
-/// Maximum credential-reference characters accepted by [`SecretRef`].
-pub const MAX_SECRET_REF_LEN: usize = 256;
 
 /// One of the four admitted adapter factories.
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
@@ -271,12 +264,6 @@ pub enum RegistryError {
         /// Bounded detail.
         detail: String,
     },
-    /// The credential reference is not a well-formed opaque reference.
-    #[error("invalid credential reference: {detail}")]
-    BadSecretRef {
-        /// Bounded detail (never the presented value).
-        detail: String,
-    },
     /// The operation already constructed its factory; no second constructor.
     #[error("factory already started for operation {operation_id}")]
     AlreadyStarted {
@@ -294,57 +281,6 @@ pub enum RegistryError {
     /// The bounded call ledger is full.
     #[error("factory call ledger is full")]
     LedgerFull,
-}
-
-/// Opaque credential reference for control shapes (I15.4).
-///
-/// Carries `scope:name` reference text only (1..=256 characters, no
-/// whitespace or control characters, at least one `:` separator). Raw secret
-/// values never enter control shapes; resolution happens behind the provider
-/// boundary at the drive step. `Debug` is redacted.
-#[derive(Clone, Eq, PartialEq)]
-pub struct SecretRef(String);
-
-impl SecretRef {
-    /// Validates reference shape without resolving or logging the value.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`RegistryError::BadSecretRef`] for an empty, oversized,
-    /// blank/control-carrying, or separator-less value.
-    pub fn parse(value: &str) -> Result<Self, RegistryError> {
-        if value.is_empty() || value.len() > MAX_SECRET_REF_LEN {
-            return Err(RegistryError::BadSecretRef {
-                detail: "credential reference has an invalid length".to_owned(),
-            });
-        }
-        if value.chars().any(|c| c.is_whitespace() || c.is_control()) {
-            return Err(RegistryError::BadSecretRef {
-                detail: "credential reference carries whitespace or control".to_owned(),
-            });
-        }
-        if !value.contains(':') {
-            return Err(RegistryError::BadSecretRef {
-                detail: "credential reference is not a scoped reference".to_owned(),
-            });
-        }
-        Ok(Self(value.to_owned()))
-    }
-
-    /// Returns the opaque reference text for the provider boundary.
-    #[must_use]
-    pub fn as_str(&self) -> &str {
-        &self.0
-    }
-}
-
-impl std::fmt::Debug for SecretRef {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        formatter
-            .debug_tuple("SecretRef")
-            .field(&"[REDACTED]")
-            .finish()
-    }
 }
 
 /// Private finite immutable four-factory registry.
@@ -876,130 +812,6 @@ fn commit_invoke(
         claim_id: validated.claim_id.clone(),
     })?;
     Ok(finish_attempt(adapter, validated))
-}
-
-/// Controlled opencode seams: absolute policy directory, loopback endpoint
-/// text, and the opaque credential reference. No secret value travels here.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct OpencodeFactorySeams {
-    /// Absolute working directory for `OpenCodeRunPolicy::new`.
-    pub policy_dir: std::path::PathBuf,
-    /// Loopback endpoint text for `LoopbackEndpoint::parse`.
-    pub endpoint: String,
-    /// Opaque credential reference (validated, never resolved here).
-    pub credential: SecretRef,
-}
-
-/// Invokes exactly the named opencode factory.
-///
-/// Validates the credential reference shape, the absolute policy directory,
-/// the loopback endpoint, and the bounded SSE decoder through their real
-/// public entries. `OpenCodeClient::new` (which needs a provider-resolved
-/// `BasicAuth` value) plus `compile_opencode_model_catalogue` are pinned by
-/// compile-time signature assertions below and run at the Writer-B drive
-/// step behind the credential boundary; no HTTP I/O happens here.
-///
-/// # Errors
-///
-/// Returns ledger, resolution, substitution, input, and credential failures
-/// without any factory effect on any failure path.
-pub fn invoke_opencode_factory(
-    registry: &AdapterRegistry,
-    validated: &ValidatedDispatch,
-    seams: &OpencodeFactorySeams,
-    ledger: &mut FactoryLedger,
-) -> Result<FactoryAttempt, RegistryError> {
-    let _entry = begin_invoke(registry, validated, AdapterIdentity::Opencode, ledger)?;
-    assert_opencode_entries();
-    SecretRef::parse(seams.credential.as_str()).map_err(|_| RegistryError::BadSecretRef {
-        detail: "opencode credential reference is malformed".to_owned(),
-    })?;
-    let _policy = OpenCodeRunPolicy::new(seams.policy_dir.clone()).map_err(|error| {
-        RegistryError::BadInput {
-            field: "opencode_policy_dir",
-            detail: truncate_detail(&error.to_string()),
-        }
-    })?;
-    let _endpoint =
-        LoopbackEndpoint::parse(&seams.endpoint).map_err(|error: LoopbackEndpointError| {
-            RegistryError::BadInput {
-                field: "opencode_endpoint",
-                detail: truncate_detail(&error.to_string()),
-            }
-        })?;
-    let decoder = SseDecoder::new(SseLimits::default());
-    if decoder.buffered_bytes() != 0 || decoder.has_partial_frame() {
-        return Err(RegistryError::BadInput {
-            field: "opencode_sse_decoder",
-            detail: "fresh SSE decoder must be empty".to_owned(),
-        });
-    }
-    commit_invoke(ledger, AdapterIdentity::Opencode, validated)
-}
-
-/// Pins the opencode execution entries at build time.
-///
-/// If upstream changes either signature, this crate fails to compile instead
-/// of silently drifting from the real factory seam.
-fn assert_opencode_entries() {
-    let _ = OpenCodeClient::new
-        as fn(
-            LoopbackEndpoint,
-            BasicAuth,
-            OpenCodeRunPolicy,
-        ) -> Result<OpenCodeClient, OpenCodeRunError>;
-    let _ = compile_opencode_model_catalogue
-        as fn(
-            &HealthResponse,
-            &ProviderCatalog,
-            &OpenCodeCatalogueContext,
-        ) -> Result<
-            eliot_agent_opencode::OpenCodeCatalogueCollection,
-            eliot_agent_opencode::OpenCodeCatalogueError,
-        >;
-}
-
-/// Controlled ACP seams: the forwarded executor and the caller-owned
-/// transport handle. Neither is opened here.
-#[derive(Clone, Debug)]
-pub struct AcpFactorySeams<E, T> {
-    /// Forwarded process executor for [`AcpProcessBinding::new`].
-    pub executor: E,
-    /// Caller-owned transport handle for [`AcpWire::new`].
-    pub transport: T,
-}
-
-/// Invokes exactly the named ACP factory.
-///
-/// Constructs the real `AcpWire::new` over the caller-owned transport and
-/// the real `AcpProcessBinding::new` over the forwarded executor (both pure:
-/// store their handles, open nothing), and pins `AcpAdmission::validate` /
-/// `admit` by compile-time signature assertion. Source admission with live
-/// Q-01 records runs at the drive step through the pinned seam.
-///
-/// # Errors
-///
-/// Returns ledger, resolution, substitution, and input failures without any
-/// factory effect on any failure path.
-pub fn invoke_acp_factory<E, T>(
-    registry: &AdapterRegistry,
-    validated: &ValidatedDispatch,
-    seams: AcpFactorySeams<E, T>,
-    ledger: &mut FactoryLedger,
-) -> Result<FactoryAttempt, RegistryError> {
-    let _entry = begin_invoke(registry, validated, AdapterIdentity::Acp, ledger)?;
-    assert_acp_entries::<E, T>();
-    let _wire = AcpWire::new(seams.transport);
-    let _binding = AcpProcessBinding::new(seams.executor);
-    commit_invoke(ledger, AdapterIdentity::Acp, validated)
-}
-
-/// Pins the ACP entries reachable from this contour at build time.
-fn assert_acp_entries<E, T>() {
-    let _ = AcpWire::<T>::new as fn(T) -> AcpWire<T>;
-    let _ = AcpProcessBinding::<E>::new as fn(E) -> AcpProcessBinding<E>;
-    let _ = AcpAdmission::validate as fn(AcpAdmission) -> Result<AcpAdmission, AcpAdmissionError>;
-    let _ = AcpAdmission::admit as fn(AcpAdmission) -> Result<AcpAdmission, AcpAdmissionError>;
 }
 
 /// Controlled Claude seams: the forwarded P-03 executor behind `Arc`.
