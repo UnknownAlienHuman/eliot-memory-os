@@ -139,7 +139,7 @@ impl LegacyCueKindV1MigrationDescriptor {
         "cue",
         "null",
         "relation_edge",
-        "snapshot_member",
+        "binding_candidate",
         "comparison_key",
         "none",
     ];
