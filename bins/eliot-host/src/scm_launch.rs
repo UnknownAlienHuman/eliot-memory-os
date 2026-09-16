@@ -9,6 +9,70 @@ use eliot_platform_windows::{
 
 use super::{HostError, HostLaunchOptions};
 
+// F-LOG-HOST-3 (#978) SCM launch observation helpers.
+//
+// Through the #889 facade only
+// (`super::host_diagnostics::observe_entrypoint_with_detail`,
+// `observe_terminal_error`); the Event Log seam stays typed-Unavailable
+// (`super::windows_event_log::event_log_sink_status`), never implemented here
+// (#984 still open).
+//
+// Observation-only contract: every helper projects facts already produced by
+// the semantic owner. Arguments are static literals only — never service
+// names, digests, paths, PIDs, start-times, nonces, or arbitrary error text —
+// so bounding limits size, not sensitivity (I15.4). Sink outcome never alters
+// result/order/status/cleanup. There is no mutable global dedup cache: one
+// terminal emission per failed SCM bootstrap is enforced by the single
+// outermost guard in `validate_host_scm_bootstrap`; `classify_*` and
+// `resolve_*` correlate by stage order only and never emit a terminal. This
+// mirrors the `HostTerminalGuard` model in `lib.rs` (F-LOG-HOST-1, #891)
+// without touching it.
+fn scm_launch_note_event_log_unavailable() {
+    let _ = super::windows_event_log::event_log_sink_status();
+}
+
+fn scm_launch_observe(detail: &str) {
+    scm_launch_note_event_log_unavailable();
+    super::host_diagnostics::observe_entrypoint_with_detail(
+        super::host_diagnostics::EntrypointStage::ScmDispatch,
+        detail,
+    );
+}
+
+fn scm_launch_observe_terminal(code: &str) {
+    scm_launch_note_event_log_unavailable();
+    super::host_diagnostics::observe_terminal_error(code);
+}
+
+/// Single-terminal guard for one SCM bootstrap validation.
+///
+/// Armed on entry; the single outermost boundary disarms on success. Any
+/// `Err` return drops armed and emits exactly one terminal record with the
+/// operation's frozen code. Emitting here never changes the `Result`.
+/// No dedup cache, no lock, no second evaluation.
+struct ScmLaunchTerminalGuard<'a> {
+    code: &'a str,
+    armed: bool,
+}
+
+impl<'a> ScmLaunchTerminalGuard<'a> {
+    fn armed(code: &'a str) -> Self {
+        Self { code, armed: true }
+    }
+
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for ScmLaunchTerminalGuard<'_> {
+    fn drop(&mut self) {
+        if self.armed {
+            scm_launch_observe_terminal(self.code);
+        }
+    }
+}
+
 /// Per-cause ceiling for the free-text SCM classification detail carried into
 /// stderr and the start-failure capsule. This mirrors the Watchdog
 /// `APPROVAL_DETAIL_MAX_CHARS` budget (the same 512-char width as the Host
@@ -199,27 +263,48 @@ pub fn classify_host_scm_inspection(
     request: &ServiceRegistrationRequest,
     inspection: &ServiceRegistrationRuntimeInspection,
 ) -> Option<HostScmRegistrationCause> {
+    // WORK_UNIT_CASE: 978/5 — classification requested; request vs observed
+    // process and start-identity vs PID stay distinct below.
+    scm_launch_observe("host.scm-launch classification requested");
     match inspection {
         ServiceRegistrationRuntimeInspection::Matching { observation }
             if host_runtime_bootstrap_state_is_admissible(observation.state()) =>
         {
+            // WORK_UNIT_CASE: 978/5 — start-identity observed: the admissible
+            // service identity + state accepts bootstrap; the ephemeral PID is
+            // never identity.
+            scm_launch_observe("host.scm-launch start-identity observed");
             None
         }
         ServiceRegistrationRuntimeInspection::Matching { .. } => {
+            // WORK_UNIT_CASE: 978/5 — admissible start-identity absent; the
+            // observed state cannot bootstrap.
+            scm_launch_observe("host.scm-launch start-identity unknown");
             Some(HostScmRegistrationCause::Unknown {
                 inspection_debug: format!("{inspection:?}"),
             })
         }
-        ServiceRegistrationRuntimeInspection::Absent => Some(HostScmRegistrationCause::Absent {
-            service_name: request.service_name().to_owned(),
-            configuration_digest: request.expected_configuration_digest(),
-        }),
+        ServiceRegistrationRuntimeInspection::Absent => {
+            // WORK_UNIT_CASE: 978/5 — SCM request observed: the canonical
+            // registration request has no observed process.
+            scm_launch_observe("host.scm-launch request observed");
+            Some(HostScmRegistrationCause::Absent {
+                service_name: request.service_name().to_owned(),
+                configuration_digest: request.expected_configuration_digest(),
+            })
+        }
         ServiceRegistrationRuntimeInspection::Mismatched => {
+            // WORK_UNIT_CASE: 978/5 — observed process exists but is not the
+            // requested registration.
+            scm_launch_observe("host.scm-launch process observed");
             Some(HostScmRegistrationCause::Mismatched {
                 inspection_debug: format!("{inspection:?}"),
             })
         }
         ServiceRegistrationRuntimeInspection::Unknown { detail } => {
+            // WORK_UNIT_CASE: 978/5 — ephemeral PID observation; never
+            // promoted into start-identity.
+            scm_launch_observe("host.scm-launch pid observed");
             // Typed payload carry-over: preserve win32_error/stage/state/pid
             // explicitly via the typed rendering plus Debug verbatim. Both
             // stay bounded through truncate_host_scm_cause downstream.
@@ -279,6 +364,9 @@ trait HostScmBootstrapProbe {
 fn resolve_host_scm_inspection_with_probe<P: HostScmBootstrapProbe>(
     probe: &mut P,
 ) -> ServiceRegistrationRuntimeInspection {
+    // WORK_UNIT_CASE: 978/13 — deterministic probe schedule requested; the
+    // injected inspection script drives the bounded re-read loop.
+    scm_launch_observe("host.scm-launch probe requested");
     let mut current = probe.inspect();
     for _ in 1..HOST_SCM_TRANSIENT_MAX_INSPECTIONS {
         let transient = matches!(
@@ -292,6 +380,9 @@ fn resolve_host_scm_inspection_with_probe<P: HostScmBootstrapProbe>(
         probe.sleep_ms(HOST_SCM_TRANSIENT_RETRY_SLEEP_MS);
         current = probe.inspect();
     }
+    // WORK_UNIT_CASE: 978/5 — settled PID observation; start-identity
+    // admission stays with the classifier, never invented here.
+    scm_launch_observe("host.scm-launch pid observed");
     current
 }
 
@@ -339,6 +430,15 @@ impl HostScmBootstrapProbe for WindowsScmBootstrapProbe<'_> {
 pub fn validate_host_scm_bootstrap(
     launch_options: &HostLaunchOptions,
 ) -> Result<ValidatedHostScmLaunch, HostError> {
+    // WORK_UNIT_CASE: 978/5 — SCM bootstrap requested; the single outermost
+    // contour owns the one terminal below (#891 owns nothing here; main.rs
+    // ServiceMain projects the stop receipt without its own diagnostics
+    // terminal).
+    scm_launch_observe("host.scm-launch requested");
+    // WORK_UNIT_CASE: 978/10 — one terminal across the SCM nesting:
+    // classification and probe correlate by stage order only; only this guard
+    // may emit `host-scm-launch-unknown`.
+    let mut scm_terminal = ScmLaunchTerminalGuard::armed("host-scm-launch-unknown");
     let registration_nonce = launch_options.registration_nonce().ok_or_else(|| {
         HostError::Platform("SystemService requires the registration nonce pair".to_owned())
     })?;
@@ -383,6 +483,10 @@ pub fn validate_host_scm_bootstrap(
     if let Some(cause) = classify_host_scm_inspection(&registration, &inspection) {
         return Err(HostError::Platform(cause.detail()));
     }
+    scm_terminal.disarm();
+    // WORK_UNIT_CASE: 978/5 — SCM request admitted against the observed
+    // start-identity; exact error propagation above is unchanged.
+    scm_launch_observe("host.scm-launch admitted");
     Ok(ValidatedHostScmLaunch {
         bootstrap,
         registration,
