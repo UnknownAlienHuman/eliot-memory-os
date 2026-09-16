@@ -1,0 +1,8 @@
+{
+  "scope": "tenant-board",
+  "entry_id": "board-entry-rev-1",
+  "first_digest": "digest-board-rev-1",
+  "second_digest": "digest-board-rev-2",
+  "concurrent_a": "board-entry-par-a",
+  "concurrent_b": "board-entry-par-b"
+}

@@ -1,0 +1,12 @@
+{
+  "message_id": "msg-replay-1",
+  "payload_digest": "digest-replay-aaa111",
+  "changed_payload_digest": "digest-replay-bbb222",
+  "scope": "tenant-replay",
+  "changed_scope": "tenant-replay-other",
+  "revision": 1,
+  "changed_revision": 2,
+  "expiry": 5000,
+  "changed_expiry": 6000,
+  "changed_recipient": "session-replay-intruder"
+}
