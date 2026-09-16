@@ -375,7 +375,14 @@ fn make_request_unchecked(
     idempotency: &str,
     fresh: &str,
 ) -> DurableJobRequest {
-    make_request_unchecked_with_fence(operation, role, operation_id, idempotency, fresh, &fence_json())
+    make_request_unchecked_with_fence(
+        operation,
+        role,
+        operation_id,
+        idempotency,
+        fresh,
+        &fence_json(),
+    )
 }
 
 /// Builds a request against an explicit fence for stale-fence proofs (the
@@ -1218,8 +1225,7 @@ async fn case_06_stale_pins_not_applied() {
     let foreign = foreign_fence_json();
     let mut stale_selector: eliot_protocol::dreamer_job::LeaseSelector =
         serde_json::from_value(lease_selector_json(1, "worker-stale-775-06", 8)).expect("selector");
-    stale_selector.expected_fence =
-        serde_json::from_value(foreign.clone()).expect("foreign fence");
+    stale_selector.expected_fence = serde_json::from_value(foreign.clone()).expect("foreign fence");
     let stale_fence = make_request_unchecked_with_fence(
         JobOperation::LeaseExact {
             selector: stale_selector,
