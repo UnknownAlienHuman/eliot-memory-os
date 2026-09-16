@@ -37,12 +37,11 @@ use eliot_contracts::{
     StateFence, canonical_json_bytes, sha256_hex,
 };
 use eliot_mcp::{
-    ApplicationRequest, CompatibilityCorrelation, HostCancellationPortOutcome,
-    HostCancellationRequest, HostInvocationPortOutcome, HostInvocationRequest, HostOperationHandle,
-    KernelGovernorPort, KernelHostRequestPort, MAX_HOST_DEADLINE_PREFERENCE_MS, McpCore,
-    McpProtocolVersion, McpResponse, PortFailure, QueryInput, QueryIntent, QueryMode,
-    RequestSecurityContext, ResponseKind, ToolRequest, TransportRequestContext,
-    plan_evidence_pack_query, project_evidence_pack_projection,
+    ApplicationRequest, HostCancellationPortOutcome, HostCancellationRequest,
+    HostInvocationPortOutcome, HostInvocationRequest, HostOperationHandle, KernelGovernorPort,
+    KernelHostRequestPort, MAX_HOST_DEADLINE_PREFERENCE_MS, McpCore, McpResponse, PortFailure,
+    QueryInput, QueryIntent, QueryMode, RequestSecurityContext, ResponseKind, ToolRequest,
+    TransportRequestContext, plan_evidence_pack_query, project_evidence_pack_projection,
 };
 use eliot_ors::{
     CONTRACT_VERSION as ORS_CONTRACT_VERSION, HostRequestKind as OrsHostRequestKind,
@@ -330,7 +329,6 @@ impl AuthenticatedHostSession {
             proof_ceiling: ProofCeiling::ScopedVerification,
             resource: None,
             job: None,
-            compatibility_correlation_hint: None,
         };
         let body = serde_json::to_value(&response).map_err(|error| error.to_string())?;
         let encoded = serde_json::to_vec(&body).map_err(|error| error.to_string())?;
@@ -441,12 +439,7 @@ impl<'a, P: KernelGovernorPort + ?Sized> KernelHostRequestBinder<'a, P> {
         }
         let application = self.build_application(request, envelope, now_ms)?;
         let transport = self.session.transport().clone();
-        let compat_hint = if request.protocol_version == McpProtocolVersion::Compat2025_11_25 {
-            request.observed_context.host_session_hint.clone()
-        } else {
-            None
-        };
-        let response = self.dispatch_once(transport, application, compat_hint)?;
+        let response = self.dispatch_once(transport, application)?;
         let expected_tool = request.tool.canonical_name().to_owned();
         check_response_binding(
             &response,
@@ -656,19 +649,8 @@ impl<'a, P: KernelGovernorPort + ?Sized> KernelHostRequestBinder<'a, P> {
         &self,
         transport: TransportRequestContext,
         application: ApplicationRequest,
-        compat_hint: Option<String>,
     ) -> Result<McpResponse, PortFailure> {
-        let result = if application.protocol_version == McpProtocolVersion::Final2026_07_28
-            && compat_hint.is_none()
-        {
-            self.core.execute(self.governor, transport, application)
-        } else {
-            let correlation = CompatibilityCorrelation {
-                transport_session_hint: compat_hint,
-            };
-            self.core
-                .execute_compat(self.governor, transport, application, correlation)
-        };
+        let result = self.core.execute(self.governor, transport, application);
         match result {
             Ok(response) => Ok(response),
             Err(eliot_mcp::BridgeError::Port(failure)) => Err(failure),
@@ -1380,7 +1362,6 @@ mod local_read_result_tests {
             proof_ceiling: eliot_receipts::ProofCeiling::ScopedVerification,
             resource: None,
             job: None,
-            compatibility_correlation_hint: None,
         }
     }
 

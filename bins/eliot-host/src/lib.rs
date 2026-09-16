@@ -29,7 +29,6 @@ mod launch_artifact;
 #[cfg(windows)]
 mod launch_descriptor_validation;
 mod launch_options;
-mod runtime_control;
 mod scm_launch;
 mod store_kernel_launch_sequence;
 /// Host Windows Event Log sink seam (F-LOG-HOST-0, #889): thin bounded
@@ -116,6 +115,14 @@ impl Drop for HostTerminalGuard<'_> {
 }
 
 pub use credential_control::{HostCredentialControl, HostPhaseBRequest, HostPhaseBRequestQueue};
+pub use eliot_host_control_endpoint::{
+    HOST_RUNTIME_CONTROL_PIPE, HostRuntimeControl, HostRuntimeControlQueue,
+};
+use eliot_host_service::runtime_control::runtime_control_unknown_ref;
+pub use eliot_host_service::runtime_control::{
+    HostKernelRestartReceipt, HostRuntimeControlOperation, HostRuntimeControlRequest,
+    HostRuntimeControlResponse, HostStoreRecoveryReceipt,
+};
 #[cfg(windows)]
 use launch_artifact::{
     LaunchLease, approved_locator, approved_phase_b_destination_locator, open_launch_lease,
@@ -131,12 +138,6 @@ use launch_descriptor_validation::{
 };
 pub use launch_options::HostLaunchOptions;
 use launch_options::valid_sha256_text;
-use runtime_control::runtime_control_unknown_ref;
-pub use runtime_control::{
-    HOST_RUNTIME_CONTROL_PIPE, HostKernelRestartReceipt, HostRuntimeControl,
-    HostRuntimeControlOperation, HostRuntimeControlQueue, HostRuntimeControlRequest,
-    HostRuntimeControlResponse, HostStoreRecoveryReceipt,
-};
 pub use scm_launch::{
     HOST_SCM_CAUSE_MAX_CHARS, HostScmRegistrationCause, ValidatedHostScmLaunch,
     classify_host_scm_inspection, validate_host_scm_bootstrap,
@@ -261,7 +262,7 @@ struct HostStoreRebindProductionBoundary;
 struct HostRuntimeControlProductionBoundary;
 const STORE_SEMANTIC_CONFIG_HASH_PENDING: &str = PHASE_B_PENDING_MARKER;
 pub const HOST_RUNTIME_CONTROL_PRODUCTION_DISCRIMINATOR: &str =
-    runtime_control::HOST_RUNTIME_CONTROL_PRODUCTION_DISCRIMINATOR;
+    eliot_host_service::runtime_control::HOST_RUNTIME_CONTROL_PRODUCTION_DISCRIMINATOR;
 
 #[cfg(test)]
 type TestResult = Result<(), Box<dyn std::error::Error>>;

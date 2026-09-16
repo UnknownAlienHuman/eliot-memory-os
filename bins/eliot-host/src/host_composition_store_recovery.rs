@@ -12,7 +12,10 @@ impl HostComposition {
         if self.store_recovery_startup_fence.is_fenced() {
             return HostRuntimeControlResponse::unknown_for(
                 request,
-                runtime_control_unknown_ref(STORE_RECOVERY_CRASH_FENCE_UNKNOWN_REASON, request),
+                eliot_host_service::runtime_control::runtime_control_unknown_ref(
+                    STORE_RECOVERY_CRASH_FENCE_UNKNOWN_REASON,
+                    request,
+                ),
             );
         }
         if self
@@ -23,7 +26,10 @@ impl HostComposition {
         {
             return HostRuntimeControlResponse::unknown_for(
                 request,
-                runtime_control_unknown_ref("store-recovery", request),
+                eliot_host_service::runtime_control::runtime_control_unknown_ref(
+                    "store-recovery",
+                    request,
+                ),
             );
         }
         let result = self.execute_store_recovery(request);
@@ -31,7 +37,10 @@ impl HostComposition {
             Ok(receipt) => HostRuntimeControlResponse::store_recovered_for(request, receipt),
             Err(_error) => HostRuntimeControlResponse::unknown_for(
                 request,
-                runtime_control_unknown_ref("store-recovery", request),
+                eliot_host_service::runtime_control::runtime_control_unknown_ref(
+                    "store-recovery",
+                    request,
+                ),
             ),
         }
     }
@@ -460,7 +469,10 @@ impl HostComposition {
         {
             return HostRuntimeControlResponse::unknown_for(
                 request,
-                runtime_control_unknown_ref("store-recovery-reconcile", request),
+                eliot_host_service::runtime_control::runtime_control_unknown_ref(
+                    "store-recovery-reconcile",
+                    request,
+                ),
             );
         }
         if request.validate().is_err()
@@ -468,13 +480,19 @@ impl HostComposition {
         {
             return HostRuntimeControlResponse::unknown_for(
                 request,
-                runtime_control_unknown_ref("store-recovery-reconcile", request),
+                eliot_host_service::runtime_control::runtime_control_unknown_ref(
+                    "store-recovery-reconcile",
+                    request,
+                ),
             );
         }
         if self.store_recovery_startup_fence.is_fenced() {
             return HostRuntimeControlResponse::unknown_for(
                 request,
-                runtime_control_unknown_ref(STORE_RECOVERY_CRASH_FENCE_UNKNOWN_REASON, request),
+                eliot_host_service::runtime_control::runtime_control_unknown_ref(
+                    STORE_RECOVERY_CRASH_FENCE_UNKNOWN_REASON,
+                    request,
+                ),
             );
         }
         let key = request.mutation_digest.as_str().to_owned();
@@ -486,7 +504,10 @@ impl HostComposition {
             Err(_) => {
                 return HostRuntimeControlResponse::unknown_for(
                     request,
-                    runtime_control_unknown_ref("store-recovery-reconcile-unknown", request),
+                    eliot_host_service::runtime_control::runtime_control_unknown_ref(
+                        "store-recovery-reconcile-unknown",
+                        request,
+                    ),
                 );
             }
         }
@@ -494,13 +515,19 @@ impl HostComposition {
             Ok(true) => {
                 return HostRuntimeControlResponse::unknown_for(
                     request,
-                    runtime_control_unknown_ref("store-recovery-pending", request),
+                    eliot_host_service::runtime_control::runtime_control_unknown_ref(
+                        "store-recovery-pending",
+                        request,
+                    ),
                 );
             }
             Err(_) => {
                 return HostRuntimeControlResponse::unknown_for(
                     request,
-                    runtime_control_unknown_ref("store-recovery-reconcile-snapshot", request),
+                    eliot_host_service::runtime_control::runtime_control_unknown_ref(
+                        "store-recovery-reconcile-snapshot",
+                        request,
+                    ),
                 );
             }
             Ok(false) => {}
@@ -522,7 +549,7 @@ impl HostComposition {
                         Err(_) => {
                             return HostRuntimeControlResponse::unknown_for(
                                 request,
-                                runtime_control_unknown_ref(
+                                eliot_host_service::runtime_control::runtime_control_unknown_ref(
                                     "store-recovery-reconcile-conflict",
                                     request,
                                 ),
@@ -532,7 +559,7 @@ impl HostComposition {
                     Ok(false) => {
                         return HostRuntimeControlResponse::unknown_for(
                             request,
-                            runtime_control_unknown_ref(
+                            eliot_host_service::runtime_control::runtime_control_unknown_ref(
                                 STORE_RECOVERY_CRASH_FENCE_UNKNOWN_REASON,
                                 request,
                             ),
@@ -541,7 +568,7 @@ impl HostComposition {
                     Err(_) => {
                         return HostRuntimeControlResponse::unknown_for(
                             request,
-                            runtime_control_unknown_ref(
+                            eliot_host_service::runtime_control::runtime_control_unknown_ref(
                                 "store-recovery-reconcile-snapshot",
                                 request,
                             ),
@@ -553,7 +580,10 @@ impl HostComposition {
             Err(_) => {
                 return HostRuntimeControlResponse::unknown_for(
                     request,
-                    runtime_control_unknown_ref("store-recovery-reconcile-snapshot", request),
+                    eliot_host_service::runtime_control::runtime_control_unknown_ref(
+                        "store-recovery-reconcile-snapshot",
+                        request,
+                    ),
                 );
             }
         }
@@ -570,20 +600,29 @@ impl HostComposition {
                 }) {
                     return HostRuntimeControlResponse::unknown_for(
                         request,
-                        runtime_control_unknown_ref("store-recovery-pending", request),
+                        eliot_host_service::runtime_control::runtime_control_unknown_ref(
+                            "store-recovery-pending",
+                            request,
+                        ),
                     );
                 }
             }
             Err(_) => {
                 return HostRuntimeControlResponse::unknown_for(
                     request,
-                    runtime_control_unknown_ref("store-recovery-reconcile-snapshot", request),
+                    eliot_host_service::runtime_control::runtime_control_unknown_ref(
+                        "store-recovery-reconcile-snapshot",
+                        request,
+                    ),
                 );
             }
         }
         HostRuntimeControlResponse::unknown_for(
             request,
-            runtime_control_unknown_ref("store-recovery-reconcile-unknown", request),
+            eliot_host_service::runtime_control::runtime_control_unknown_ref(
+                "store-recovery-reconcile-unknown",
+                request,
+            ),
         )
     }
 

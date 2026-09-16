@@ -136,7 +136,7 @@ fn kill_on_close_crash_fence_is_operation_specific_and_never_positive_attach() -
         PlatformHandle::new("store-recovery-crash-fence-query")?,
         PlatformHandle::new("a".repeat(64))?,
     )?;
-    let pending_ref = super::runtime_control_unknown_ref(
+    let pending_ref = eliot_host_service::runtime_control::runtime_control_unknown_ref(
         super::STORE_RECOVERY_CRASH_FENCE_UNKNOWN_REASON,
         &request,
     );
@@ -979,7 +979,10 @@ fn store_recovery_response_loss_query_preserves_original_digest() -> TestResult 
         m.insert(req.mutation_digest.as_str().to_owned(), receipt.clone());
         m
     };
-    let pending_ref = super::runtime_control_unknown_ref("store-recovery-pending", &req);
+    let pending_ref = eliot_host_service::runtime_control::runtime_control_unknown_ref(
+        "store-recovery-pending",
+        &req,
+    );
     assert!(pending_ref.as_str().contains(req.request_digest.as_str()));
     let recovered = map
         .get(req.mutation_digest.as_str())
