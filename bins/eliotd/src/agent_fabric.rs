@@ -18,7 +18,7 @@
 //! a prerequisite owner port has no accepted revision on this base (prereqs
 //! #694 / #696 / #698 / #839 / #837 remain OPEN), the fabric stays generic
 //! over the injected port and the inventory case freezes the missing-port
-//! expectation as a ContractChallenge residual instead of a local substitute.
+//! expectation as a `ContractChallenge` residual instead of a local substitute.
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -39,8 +39,7 @@ pub const COORDINATOR_CRATE: &str = "eliot-agent-coordinator";
 pub const DAEMON_CRATE: &str = "eliotd";
 /// Explicit plan-only gap reason: candidate planning stays available while live
 /// provider admission remains unavailable outside the sealed verifier path.
-pub const FABRIC_PLAN_GAP_REASON: &str =
-    "eliotd agent fabric plans candidates only; live provider admission arrives through the sealed owner path";
+pub const FABRIC_PLAN_GAP_REASON: &str = "eliotd agent fabric plans candidates only; live provider admission arrives through the sealed owner path";
 /// Capacity identity threaded by the daemon fabric composition.
 pub const FABRIC_CAPACITY_IDENTITY: &str = "eliotd-fabric-capacity";
 /// Capacity revision threaded by the daemon fabric composition.
@@ -64,7 +63,9 @@ pub fn prereq_ports() -> Vec<String> {
 
 fn validate_text(value: &str, _field: &'static str) -> Result<(), FabricError> {
     if value.trim().is_empty() || value.chars().any(char::is_control) {
-        return Err(FabricError::Contract("blank or control-bearing text".to_owned()));
+        return Err(FabricError::Contract(
+            "blank or control-bearing text".to_owned(),
+        ));
     }
     Ok(())
 }
@@ -247,7 +248,9 @@ impl RouteRequirements {
     fn validate(&self) -> Result<(), FabricError> {
         validate_text(&self.role, "route_role")?;
         if self.competence.is_empty() {
-            return Err(FabricError::Contract("route competence must not be empty".to_owned()));
+            return Err(FabricError::Contract(
+                "route competence must not be empty".to_owned(),
+            ));
         }
         for item in &self.competence {
             validate_text(item, "route_competence")?;
@@ -637,7 +640,10 @@ impl AgentFabric {
     /// Returns the event names in ledger order.
     #[must_use]
     pub fn ledger_events(&self) -> Vec<String> {
-        self.ledger.iter().map(|entry| entry.event.clone()).collect()
+        self.ledger
+            .iter()
+            .map(|entry| entry.event.clone())
+            .collect()
     }
 
     fn record(&mut self, event: &str, operation: &str) {
@@ -663,24 +669,25 @@ impl AgentFabric {
         request: StaffingPlanRequest,
     ) -> Result<(SwarmDefinition, StaffingPlanCandidate), FabricError> {
         self.record("definition_validated", request.candidate_id.as_str());
-        let candidate = self.coordinator.plan(request.clone())?;
+        // Freeze bytes before planning: identity reuse with different bytes is
+        // a definition conflict, surfaced in fabric vocabulary before the
+        // coordinator owner sees the replay.
         let digest = digest_json(&request)?;
         let key = request.candidate_id.as_str().to_owned();
         if let Some(stored_bytes) = self.definition_bytes.get(&key) {
-            let current_bytes = eliot_contracts::canonical_json_bytes(&request)
-                .map_err(|error| FabricError::Contract(format!("canonical bytes: {error}")))?;
-            let current = eliot_contracts::sha256_hex(&current_bytes);
-            if *stored_bytes != current {
+            if *stored_bytes != digest {
                 return Err(FabricError::DefinitionConflict(format!(
                     "definition {key} reused with different bytes"
                 )));
             }
+            let candidate = self.coordinator.plan(request)?;
             let stored = self.definitions.get(&key).cloned().ok_or_else(|| {
                 FabricError::Contract(format!("definition {key} bytes without record"))
             })?;
             self.record("plan_replayed", &key);
             return Ok((stored, candidate));
         }
+        let candidate = self.coordinator.plan(request.clone())?;
         let definition = SwarmDefinition {
             definition_id: request.candidate_id.clone(),
             definition_digest: digest.clone(),
@@ -775,10 +782,15 @@ impl AgentFabric {
         definition_id: &CandidateId,
     ) -> Result<Reservation, FabricError> {
         let key = definition_id.as_str().to_owned();
-        let definition = self.definitions.get(&key).cloned().ok_or_else(|| {
-            FabricError::Contract(format!("unknown definition {key}"))
-        })?;
-        let reservation = self.ports.admission_authority.stage_reservation(&definition)?;
+        let definition = self
+            .definitions
+            .get(&key)
+            .cloned()
+            .ok_or_else(|| FabricError::Contract(format!("unknown definition {key}")))?;
+        let reservation = self
+            .ports
+            .admission_authority
+            .stage_reservation(&definition)?;
         if reservation.definition_id != *definition_id
             || reservation.definition_digest != definition.definition_digest
         {
@@ -806,22 +818,32 @@ impl AgentFabric {
         &mut self,
         reservation_id: &str,
     ) -> Result<FabricAdmission, FabricError> {
-        let reservation = self.reservations.get(reservation_id).cloned().ok_or_else(|| {
-            FabricError::StaleReservation(format!("unknown reservation {reservation_id}"))
-        })?;
+        let reservation = self
+            .reservations
+            .get(reservation_id)
+            .cloned()
+            .ok_or_else(|| {
+                FabricError::StaleReservation(format!("unknown reservation {reservation_id}"))
+            })?;
         let definition_key = reservation.definition_id.as_str().to_owned();
-        if let Some(existing_id) = self.admission_by_definition.get(&definition_key) {
-            if let Some(existing) = self.admissions.get(existing_id).cloned() {
-                if existing.reservation_id == reservation_id {
-                    self.record("admission_replayed", &existing.admission_id.as_str().to_owned());
-                    return Ok(existing);
-                }
-                return Err(FabricError::DefinitionConflict(format!(
-                    "definition {definition_key} already admitted under a different reservation"
-                )));
+        if let Some(existing) = self
+            .admission_by_definition
+            .get(&definition_key)
+            .and_then(|existing_id| self.admissions.get(existing_id))
+            .cloned()
+        {
+            if existing.reservation_id == reservation_id {
+                self.record("admission_replayed", existing.admission_id.as_str());
+                return Ok(existing);
             }
+            return Err(FabricError::DefinitionConflict(format!(
+                "definition {definition_key} already admitted under a different reservation"
+            )));
         }
-        let receipt = self.ports.admission_authority.commit_admission(&reservation)?;
+        let receipt = self
+            .ports
+            .admission_authority
+            .commit_admission(&reservation)?;
         if receipt.definition_digest
             != self
                 .definitions
@@ -854,7 +876,8 @@ impl AgentFabric {
             self.attempt_states
                 .insert(attempt.as_str().to_owned(), AttemptLifecycle::Admitted);
         }
-        self.admissions.insert(admission_key.clone(), receipt.clone());
+        self.admissions
+            .insert(admission_key.clone(), receipt.clone());
         self.admission_by_definition
             .insert(definition_key, admission_key);
         self.record("admission_committed", receipt.admission_id.as_str());
@@ -874,9 +897,13 @@ impl AgentFabric {
         attempt_id: &AttemptId,
     ) -> Result<ActivationEvidence, FabricError> {
         let admission_key = admission_id.as_str().to_owned();
-        let admission = self.admissions.get(&admission_key).cloned().ok_or_else(|| {
-            FabricError::StaleAdmission(format!("unknown admission {admission_key}"))
-        })?;
+        let admission = self
+            .admissions
+            .get(&admission_key)
+            .cloned()
+            .ok_or_else(|| {
+                FabricError::StaleAdmission(format!("unknown admission {admission_key}"))
+            })?;
         if !admission.attempt_ids.contains(attempt_id) {
             return Err(FabricError::IdentityConflict(
                 "attempt does not belong to this admission".to_owned(),
@@ -931,9 +958,13 @@ impl AgentFabric {
         validate_text(dispatch_id, "dispatch_id")?;
         let admission_key = admission_id.as_str().to_owned();
         let activation_key = format!("{admission_key}/{}", attempt_id.as_str());
-        let evidence = self.activations.get(&activation_key).cloned().ok_or_else(|| {
-            FabricError::NotActivated(format!("no activation for {activation_key}"))
-        })?;
+        let evidence = self
+            .activations
+            .get(&activation_key)
+            .cloned()
+            .ok_or_else(|| {
+                FabricError::NotActivated(format!("no activation for {activation_key}"))
+            })?;
         if let Some(existing) = self.intents.get(dispatch_id).cloned() {
             if existing.admission_id == *admission_id
                 && existing.attempt_id == *attempt_id
@@ -946,9 +977,11 @@ impl AgentFabric {
                 "dispatch {dispatch_id} reused with different bytes"
             )));
         }
-        if self.intent_by_operation.values().any(|operation| {
-            operation == &activation_key
-        }) {
+        if self
+            .intent_by_operation
+            .values()
+            .any(|operation| operation == &activation_key)
+        {
             return Err(FabricError::DuplicateLaunch(format!(
                 "operation {activation_key} already dispatched"
             )));
@@ -977,9 +1010,11 @@ impl AgentFabric {
     /// Returns the egress owner outcome, including typed unavailability and
     /// loss. Loss retains the original operation without false success.
     pub fn emit(&mut self, dispatch_id: &str) -> Result<DispatchAck, FabricError> {
-        let intent = self.intents.get(dispatch_id).cloned().ok_or_else(|| {
-            FabricError::Contract(format!("unknown dispatch {dispatch_id}"))
-        })?;
+        let intent = self
+            .intents
+            .get(dispatch_id)
+            .cloned()
+            .ok_or_else(|| FabricError::Contract(format!("unknown dispatch {dispatch_id}")))?;
         let ack = self.ports.dispatch_egress.emit(&intent)?;
         if ack.dispatch_id != dispatch_id {
             return Err(FabricError::IdentityConflict(
@@ -1067,10 +1102,7 @@ impl AgentFabric {
     /// # Errors
     ///
     /// Returns [`FabricError::Quarantined`] for unknown attempts.
-    pub fn mark_unknown_outcome(
-        &mut self,
-        attempt_id: &AttemptId,
-    ) -> Result<(), FabricError> {
+    pub fn mark_unknown_outcome(&mut self, attempt_id: &AttemptId) -> Result<(), FabricError> {
         let key = attempt_id.as_str().to_owned();
         if !self.attempt_states.contains_key(&key) {
             return Err(FabricError::Quarantined(format!(
