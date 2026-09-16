@@ -11,7 +11,9 @@ use thiserror::Error;
 use time::OffsetDateTime;
 use uuid::Uuid;
 
-mod promotion_input;
+pub mod learning_closure;
+
+pub mod promotion_input;
 
 pub use promotion_input::{
     AGENT_ORDER, CAUSAL_PROPERTY, ClosureBinding, MODULE_ID, PriorPromotionHistory,

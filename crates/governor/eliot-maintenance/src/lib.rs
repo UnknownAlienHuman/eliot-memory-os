@@ -23,6 +23,15 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
+mod improvement_admission;
+
+pub use improvement_admission::{
+    IMPROVEMENT_CLOSURE_MODULE, IMPROVEMENT_PRODUCT_PULSE, IMPROVEMENT_PROMOTION_MODULE,
+    IMPROVEMENT_PROOF_CEILING, IMPROVEMENT_REQUESTED_EFFECT, ImprovementAdmissionDecision,
+    ImprovementAdmissionError, ImprovementAdmissionPolicy, ImprovementCandidateView,
+    ImprovementEvidenceView, ImprovementPulseOutcome, admit_improvement_candidate,
+};
+
 /// Stable wire name for the maintenance governor contract.
 pub const CONTRACT_NAME: &str = "eliot.governor.maintenance";
 /// Current wire revision for the maintenance governor contract.
