@@ -753,3 +753,188 @@ fn proof_20_counts_cannot_prove_causality() {
     assert_eq!(decision.assessment.counts.represented_total, 2);
     assert_eq!(decision.assessment.counts.independent_count, 2);
 }
+
+// WORK_UNIT_CASE: 663/21
+#[test]
+fn proof_21_causal_rivals_confounders() {
+    let (mut input, policy) = prepared();
+    input.proposal.causal.rival_refs = vec!["e-1".to_owned()];
+    input.proposal.causal.confounder_refs = vec!["history-evidence".to_owned()];
+    input.validate().expect("rival/confounder refs validate");
+    let decision = call(&input, &policy).expect("rival path executes");
+    assert_eq!(
+        decision.result.proposal.causal.rival_refs,
+        vec!["e-1".to_owned()]
+    );
+    assert_eq!(
+        decision.result.proposal.causal.confounder_refs,
+        vec!["history-evidence".to_owned()]
+    );
+    assert_eq!(
+        decision.assessment.causal.status,
+        eliot_dreamer_contracts::FailureCausalStatus::Unknown
+    );
+    assert!(!decision.assessment.causal.causal_claim_permitted);
+}
+
+// WORK_UNIT_CASE: 663/22
+#[test]
+fn proof_22_empirical_unknown_mechanism_lower_ceiling() {
+    let (input, policy) = prepared();
+    let decision = call(&input, &policy).expect("empirical path executes");
+    assert_eq!(
+        decision.assessment.causal.status,
+        eliot_dreamer_contracts::FailureCausalStatus::Unknown
+    );
+    assert_eq!(
+        decision.result.proof_ceiling,
+        eliot_receipts::ProofCeiling::CandidateArtifact
+    );
+    assert_eq!(
+        decision.result.handler_result.disposition,
+        decision.result.common_disposition
+    );
+    assert!(decision.result.validate_against(&input).is_ok());
+}
+
+// WORK_UNIT_CASE: 663/23
+#[test]
+fn proof_23_dependent_repetitions_do_not_inflate() {
+    let (mut input, policy) = prepared();
+    input.history.entries[0].independent = false;
+    rebind_history(&mut input);
+    input.validate().expect("dependent history validates");
+    let decision = call(&input, &policy).expect("dependent path executes");
+    assert_eq!(decision.assessment.counts.independent_count, 1);
+    assert_eq!(decision.assessment.counts.represented_total, 2);
+    assert_eq!(decision.result.disposition, FailureDisposition::Hypothesis);
+}
+
+// WORK_UNIT_CASE: 663/24
+#[test]
+fn proof_24_exact_recurrence_denominator() {
+    let (input, policy) = prepared();
+    let decision = call(&input, &policy).expect("denominator executes");
+    assert_eq!(input.history.expected_total, 2);
+    assert_eq!(decision.assessment.counts.expected_total, 2);
+    assert_eq!(decision.assessment.counts.represented_total, 2);
+    assert_eq!(decision.assessment.counts.success_count, 1);
+    let mut bad = input.clone();
+    bad.history.expected_total = 99;
+    bad.proposal.history.expected_total = 99;
+    assert!(call(&bad, &policy).is_err());
+}
+
+// WORK_UNIT_CASE: 663/25
+#[test]
+fn proof_25_same_trigger_success_retained() {
+    let (mut input, policy) = prepared();
+    let baseline = call(&input, &policy).expect("baseline executes");
+    let digest = baseline.assessment.current_trigger_digest.clone();
+    input.history.entries[1].fingerprint_id = input.proposal.fingerprint.clone();
+    input.history.entries[1].trigger_digest = digest.clone();
+    rebind_history(&mut input);
+    input.validate().expect("same-trigger success validates");
+    let decision = call(&input, &policy).expect("same-trigger executes");
+    assert_eq!(decision.assessment.counts.history_trigger_success_count, 1);
+    assert_eq!(decision.assessment.counts.success_count, 1);
+    assert_eq!(decision.assessment.counts.semantic_success_count, 1);
+    assert!(decision.result.validate_against(&input).is_ok());
+}
+
+// WORK_UNIT_CASE: 663/26
+#[test]
+fn proof_26_false_activations_narrow_candidate() {
+    let (mut input, policy) = prepared();
+    input.history.entries[0].false_activation = true;
+    input.history.false_activation_count = 1;
+    rebind_history(&mut input);
+    input.validate().expect("false-activation validates");
+    let decision = call(&input, &policy).expect("false-activation executes");
+    assert_eq!(decision.assessment.counts.false_activation_count, 1);
+    assert!(!decision.assessment.supports_candidate());
+    assert_eq!(decision.result.disposition, FailureDisposition::Partial);
+    assert!(decision
+        .assessment
+        .causal
+        .limitation_refs
+        .contains(&"false_activation_history_retained".to_owned()));
+}
+
+// WORK_UNIT_CASE: 663/27
+#[test]
+fn proof_27_partial_history_no_always_fails() {
+    let (mut input, policy) = prepared();
+    input.history.coverage = FailureCoverage::Partial;
+    input.proposal.history.coverage = FailureCoverage::Partial;
+    rebind_history(&mut input);
+    input.validate().expect("partial history validates");
+    let decision = call(&input, &policy).expect("partial executes");
+    assert_eq!(
+        decision.result.common_disposition,
+        CandidateDisposition::Partial
+    );
+    assert_eq!(decision.assessment.counts.success_count, 1);
+    let coverage = decision
+        .result
+        .final_preservation
+        .verdicts
+        .iter()
+        .find(|v| v.dimension == eliot_dreamer_contracts::RelationPreservationDimension::Coverage)
+        .expect("coverage present");
+    assert!(!coverage.passed);
+}
+
+// WORK_UNIT_CASE: 663/28
+#[test]
+fn proof_28_mitigation_owner_verifier_required() {
+    let (input, policy) = prepared();
+    let decision = call(&input, &policy).expect("mitigation executes");
+    assert_eq!(decision.result.proposal.mitigation.owner, "owner");
+    assert_eq!(
+        decision.result.proposal.mitigation.safe_reattempt_verifier,
+        "verifier-1"
+    );
+    assert!(!decision.result.proposal.mitigation.do_not_repeat_until.is_empty());
+    let (mut input, policy) = prepared();
+    input.proposal.mitigation.owner = String::new();
+    assert!(call(&input, &policy).is_err());
+}
+
+// WORK_UNIT_CASE: 663/29
+#[test]
+fn proof_29_reopen_condition_required() {
+    let (input, policy) = prepared();
+    assert_eq!(input.proposal.lifecycle.reopen_condition, "new evidence");
+    let decision = call(&input, &policy).expect("reopen executes");
+    assert_eq!(
+        decision.result.proposal.lifecycle.reopen_condition,
+        "new evidence"
+    );
+    let (mut input, policy) = prepared();
+    input.proposal.lifecycle.reopen_condition = String::new();
+    assert!(call(&input, &policy).is_err());
+}
+
+// WORK_UNIT_CASE: 663/30
+#[test]
+fn proof_30_extinction_condition_expiry_required() {
+    let (input, policy) = prepared();
+    assert_eq!(
+        input.proposal.lifecycle.extinction_condition,
+        "superseded"
+    );
+    let decision = call(&input, &policy).expect("extinction executes");
+    assert_eq!(
+        decision.result.proposal.lifecycle.extinction_condition,
+        "superseded"
+    );
+    let (mut input, policy) = prepared();
+    input.proposal.lifecycle.extinction_condition = String::new();
+    assert!(call(&input, &policy).is_err());
+    let (mut input, policy) = prepared();
+    input.proposal.lifecycle.expiry_ms = Some(1_000);
+    input.validate().expect("expiry validates");
+    let with_expiry = call(&input, &policy).expect("expiry executes");
+    assert_eq!(with_expiry.result.proposal.lifecycle.expiry_ms, Some(1_000));
+}
