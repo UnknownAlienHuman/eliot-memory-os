@@ -480,9 +480,8 @@ impl ClockReading {
 /// (`epoch_identity.rs:125`; contract `epoch-id.contract.toml`
 /// `[types.EpochId]`). Equal sequences from different lineages are unrelated
 /// and never authorize; a numerically larger sequence from another lineage is
-/// never newer. Scalar [`AuthorityEpoch`] values are never coerced into this
-/// field; legacy numeric records enter only through
-/// [`import_legacy_scalar_epoch`] with explicit evidence.
+/// never newer. No scalar-to-canonical coercion exists and no legacy numeric
+/// import exists; only the structured `(lineage_id, sequence)` tuple binds authority.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct StateFence {
@@ -1188,8 +1187,7 @@ mod tests {
     /// round-trips its lineage-aware epoch wire shape, rejects the exact same
     /// sequence from a different lineage via `is_same_authority` exact-tuple
     /// equality, and quarantines a bare numeric epoch (no `From<u64>`, no
-    /// scalar coercion; legacy numerics enter only via
-    /// `import_legacy_scalar_epoch` with evidence).
+    /// scalar coercion; no legacy numeric import exists).
     #[test]
     fn state_fence_epoch_id_wire_roundtrip_rejects_foreign_lineage() -> TestResult {
         let fence = StateFence::new(
@@ -1215,17 +1213,12 @@ mod tests {
                 .is_same_authority(&foreign.authority_epoch)
         );
 
-        // Bare numeric wire is rejected; legacy numerics stay quarantined.
+        // Bare numeric wire is rejected; no legacy numeric import exists.
         let numeric_wire = serde_json::json!({
             "authority_epoch": 3,
             "resource_generation": 5
         });
         assert!(serde_json::from_value::<StateFence>(numeric_wire).is_err());
-        let legacy = LegacyScalarEpoch::new(3, "record-3", "scalar-v3")?;
-        assert!(matches!(
-            import_legacy_scalar_epoch(legacy, LegacyEpochEvidence::Missing),
-            Ok(LegacyEpochImport::HistoricalSuspended { .. })
-        ));
         Ok(())
     }
 }
