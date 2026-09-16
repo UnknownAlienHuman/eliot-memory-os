@@ -47,8 +47,8 @@ use std::collections::BTreeMap;
 use eliot_contracts::RequestMetadata;
 use eliot_context_candidates::ProjectionState;
 use eliot_read::{
-    BranchEnvironmentScope, FreshnessPolicy, NamedParameters, QueryIntent, QueryMode,
-    QueryRequest, ReadApi, ReadError, RequiredAssurance, StateRequest, TimeScope,
+    BranchEnvironmentScope, FreshnessPolicy, NamedParameters, QueryIntent, QueryMode, QueryRequest,
+    ReadApi, ReadError, RequiredAssurance, StateRequest, TimeScope,
 };
 use eliot_store_api::{
     EVIDENCE_PACK_MAX_RECORDS, NamedReadOperation, ReadConsistency, RevisionHead, RevisionKey,
@@ -810,7 +810,9 @@ mod reconstruction_tests {
         let blocked = classify_read_error(ReadError::MissingDependencies)?;
         assert!(matches!(blocked, ProjectionState::Blocked { .. }));
         // Caller-shape rejections abort instead of becoming dispositions.
-        assert!(classify_read_error(ReadError::EmptyField("parameters.position".to_owned())).is_err());
+        assert!(
+            classify_read_error(ReadError::EmptyField("parameters.position".to_owned())).is_err()
+        );
         Ok(())
     }
 

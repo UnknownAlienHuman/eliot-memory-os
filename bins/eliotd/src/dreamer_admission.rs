@@ -537,7 +537,7 @@ mod tests {
                 .payloads
                 .get(&subject)
                 .cloned()
-                .ok_or_else(|| ReadError::Store(StoreReadFailure::Unavailable))?;
+                .ok_or(ReadError::Store(StoreReadFailure::Unavailable))?;
             Ok(QueryResult {
                 intent: QueryIntent {
                     mode: QueryMode::Verification,

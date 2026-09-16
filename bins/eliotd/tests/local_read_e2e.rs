@@ -275,7 +275,10 @@ async fn admitted_query_serves_the_exact_captured_record() -> TestResult {
     let wrong_envelope = test_envelope("eliot.query", &wrong, &tool_digest(&tool)?)?;
     let fenced = eliotd::serve_admitted_local_read(&service, &fence, &wrong_envelope, &tool).await;
     assert!(
-        matches!(fenced, Err(ReadError::Store(StoreReadFailure::FenceMismatch))),
+        matches!(
+            fenced,
+            Err(ReadError::Store(StoreReadFailure::FenceMismatch))
+        ),
         "a wrong fence must fail closed as FenceMismatch, got {fenced:?}"
     );
 
@@ -285,7 +288,10 @@ async fn admitted_query_serves_the_exact_captured_record() -> TestResult {
     let admitted_only =
         eliotd::serve_admitted_local_read(&service, &fence, &packet_envelope, &packet).await;
     assert!(
-        matches!(admitted_only, Err(ReadError::Store(StoreReadFailure::Unavailable))),
+        matches!(
+            admitted_only,
+            Err(ReadError::Store(StoreReadFailure::Unavailable))
+        ),
         "packet must stay admission-only as Unavailable, got {admitted_only:?}"
     );
 
