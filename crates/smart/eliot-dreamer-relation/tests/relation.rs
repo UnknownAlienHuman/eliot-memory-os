@@ -1847,3 +1847,366 @@ fn work_unit_655_20_invalid_reversal_is_not_an_inverse() {
     case.draft.direction = RelationDirection::Reverse;
     assert!(case.run().is_err());
 }
+
+fn transitive_case() -> Case {
+    let mut case = Case::ready();
+    case.draft.evidence.clear();
+    case.registry.rules[0].permits_transitive = true;
+    case.rebind_registry();
+    let assembled = case.assembled();
+    let one = snapshot(
+        &assembled,
+        "path-1",
+        case.draft.family,
+        case.draft.direction,
+        "source-a",
+        "middle-c",
+    );
+    let two = snapshot(
+        &assembled,
+        "path-2",
+        case.draft.family,
+        case.draft.direction,
+        "middle-c",
+        "target-b",
+    );
+    case.neighborhood.relations.extend([one, two]);
+    case.policy.transitive_path = vec![
+        eliot_dreamer_relation::PathRef {
+            edge_id: "path-1".to_owned(),
+            relation_digest: case.neighborhood.relations[0].relation_digest.clone(),
+        },
+        eliot_dreamer_relation::PathRef {
+            edge_id: "path-2".to_owned(),
+            relation_digest: case.neighborhood.relations[1].relation_digest.clone(),
+        },
+    ];
+    case.reseal();
+    case
+}
+
+// WORK_UNIT_CASE: 655/21
+#[test]
+fn work_unit_655_21_transitivity_allowed_or_forbidden() {
+    // Allowed with complete supplied path evidence: derived candidate.
+    transitive_case().run().expect("registry-allowed derivation");
+    // Same path, registry forbids transitive derivation: fails.
+    let mut case = transitive_case();
+    case.registry.rules[0].permits_transitive = false;
+    case.rebind_registry();
+    case.reseal();
+    assert!(case.run().is_err());
+    // Permitted registry but a disconnected path: fails.
+    let mut case = transitive_case();
+    case.neighborhood.relations[1].source_id = "elsewhere-x".to_owned();
+    assert!(case.run().is_err());
+}
+
+// WORK_UNIT_CASE: 655/22
+#[test]
+fn work_unit_655_22_different_kind_coexists_same_endpoints() {
+    // A different-kind relation between the same endpoints coexists.
+    let mut case = Case::ready();
+    let other = snapshot(
+        &case.assembled(),
+        "other-kind-22",
+        RelationFamily::Contradicts,
+        RelationDirection::Forward,
+        "source-a",
+        "target-b",
+    );
+    case.neighborhood.relations.push(other);
+    let result = case.run().expect("coexisting kinds");
+    assert_eq!(result.disposition, RelationDisposition::Positive);
+    // Same-kind same-identity retention without a proposal is ambiguous.
+    let mut case = Case::ready();
+    let same = snapshot(
+        &case.assembled(),
+        "same-kind-22",
+        RelationFamily::Supports,
+        RelationDirection::Forward,
+        "source-a",
+        "target-b",
+    );
+    case.neighborhood.relations.push(same.clone());
+    let result = case.run().expect("same-kind retention");
+    assert_eq!(result.disposition, RelationDisposition::Ambiguous);
+    assert_eq!(result.closure.candidate.before.as_ref(), Some(&same));
+}
+
+// WORK_UNIT_CASE: 655/23
+#[test]
+fn work_unit_655_23_overlap_supersession_predecessor() {
+    // A dangling predecessor is rejected: no silent supersession.
+    let mut case = Case::ready();
+    let mut orphan = snapshot(
+        &case.assembled(),
+        "orphan-23",
+        case.draft.family,
+        case.draft.direction,
+        "source-a",
+        "target-b",
+    );
+    orphan.predecessor = Some("absent-predecessor".to_owned());
+    case.neighborhood.relations.push(orphan);
+    assert!(case.run().is_err());
+    // An explicit retained predecessor chain is accepted as lineage; the
+    // same-identity retention stays ambiguous rather than silently merging.
+    let mut case = Case::ready();
+    let first = snapshot(
+        &case.assembled(),
+        "first-23",
+        case.draft.family,
+        case.draft.direction,
+        "source-a",
+        "target-b",
+    );
+    let mut second = snapshot(
+        &case.assembled(),
+        "second-23",
+        case.draft.family,
+        case.draft.direction,
+        "source-a",
+        "target-b",
+    );
+    second.predecessor = Some("first-23".to_owned());
+    case.neighborhood.relations.extend([first, second]);
+    let result = case.run().expect("supersession lineage");
+    assert_eq!(result.disposition, RelationDisposition::Ambiguous);
+    // An explicitly omitted predecessor is accepted as lineage.
+    let mut case = Case::ready();
+    let mut omitted = snapshot(
+        &case.assembled(),
+        "omitted-23",
+        case.draft.family,
+        case.draft.direction,
+        "source-a",
+        "target-b",
+    );
+    omitted.predecessor = Some("gone-23".to_owned());
+    case.neighborhood.relations.push(omitted);
+    case.neighborhood.complete = false;
+    case.neighborhood.omitted_refs = vec!["gone-23".to_owned()];
+    let result = case.run().expect("omitted predecessor");
+    assert_eq!(result.disposition, RelationDisposition::Ambiguous);
+}
+
+// WORK_UNIT_CASE: 655/24
+#[test]
+fn work_unit_655_24_incomplete_neighborhood_cannot_prove_uniqueness() {
+    let mut case = Case::ready();
+    case.neighborhood.complete = false;
+    case.neighborhood.omitted_refs = vec!["elsewhere-24".to_owned()];
+    let result = case.run().expect("partial neighborhood");
+    assert_eq!(result.disposition, RelationDisposition::Partial);
+    assert!(result.degradation.is_some());
+    // Full support plus a partial neighborhood is never a positive claim.
+    assert_ne!(result.disposition, RelationDisposition::Positive);
+}
+
+// WORK_UNIT_CASE: 655/25
+#[test]
+fn work_unit_655_25_exact_rival_denominator_and_omitted_rival() {
+    // A declared-but-missing alternative fails.
+    let mut case = Case::ready();
+    case.policy.expected_alternative_refs.push("absent-rival".to_owned());
+    case.reseal();
+    assert!(case.run().is_err());
+    // A retained-but-undeclared alternative fails.
+    let mut case = Case::ready();
+    case.policy
+        .expected_alternative_refs
+        .retain(|reference| reference != "rival-1");
+    case.reseal();
+    assert!(case.run().is_err());
+    // An explicitly omitted alternative is retained as an omission, and the
+    // reduced coverage yields a partial candidate rather than silence.
+    let mut case = Case::ready();
+    case.draft.rivals.clear();
+    case.draft
+        .counterevidence
+        .retain(|evidence| evidence.evidence_id() != "evidence-rival");
+    case.policy.expected_alternative_refs =
+        vec!["rival-1".to_owned(), "no-relation-1".to_owned()];
+    case.policy.omitted_alternative_refs = vec!["rival-1".to_owned()];
+    case.reseal();
+    let result = case.run().expect("omitted rival");
+    assert_eq!(result.disposition, RelationDisposition::Partial);
+}
+
+// WORK_UNIT_CASE: 655/26
+#[test]
+fn work_unit_655_26_tied_rivals_yield_ambiguity() {
+    // A supported rival with no primary support is ambiguity, never a
+    // top-ranked low-confidence positive edge.
+    let mut case = Case::ready();
+    case.draft.evidence.clear();
+    let mut rival = case
+        .draft
+        .counterevidence
+        .iter()
+        .find(|evidence| evidence.evidence_id() == "evidence-rival")
+        .expect("rival evidence")
+        .clone();
+    rival.polarity = RelationEvidencePolarity::Support;
+    case.draft
+        .counterevidence
+        .retain(|evidence| evidence.evidence_id() != "evidence-rival");
+    case.draft.evidence.push(rival);
+    let result = case.run().expect("tied rivals");
+    assert_eq!(result.disposition, RelationDisposition::Ambiguous);
+    assert!(
+        result
+            .closure
+            .candidate
+            .evidence_refs
+            .is_empty()
+    );
+    assert!(
+        result
+            .closure
+            .candidate
+            .rival_refs
+            .contains(&"rival-1".to_owned())
+    );
+}
+
+// WORK_UNIT_CASE: 655/27
+#[test]
+fn work_unit_655_27_no_relation_alternative_retained() {
+    let case = Case::ready();
+    let result = case.run().expect("no-relation retained");
+    assert_eq!(
+        result.closure.candidate.no_relation_ref.as_deref(),
+        Some("no-relation-1")
+    );
+    // Dropping the no-relation alternative breaks the declared denominator.
+    let mut case = Case::ready();
+    case.draft.no_relation_alternative = None;
+    assert!(case.run().is_err());
+}
+
+// WORK_UNIT_CASE: 655/28
+#[test]
+fn work_unit_655_28_repair_handoff_without_execution() {
+    // A same-ID payload change needs merge/split repair: the handler reports
+    // Conflict with full rollback lineage and executes no repair itself.
+    let mut case = Case::ready();
+    let retained = snapshot(
+        &case.assembled(),
+        "repair-28",
+        case.draft.family,
+        case.draft.direction,
+        "source-a",
+        "target-b",
+    );
+    case.neighborhood.relations.push(retained.clone());
+    let mut changed = retained.clone();
+    changed.relation_digest = digest("repaired-payload");
+    case.policy.proposed_snapshot = Some(changed);
+    case.reseal();
+    let before_count = case.neighborhood.relations.len();
+    let result = case.run().expect("repair handoff");
+    assert_eq!(result.disposition, RelationDisposition::Conflict);
+    assert_eq!(result.closure.candidate.before.as_ref(), Some(&retained));
+    assert!(result.closure.candidate.after.is_none());
+    assert!(
+        result
+            .closure
+            .candidate
+            .rollback
+            .rollback_refs
+            .contains(&"repair-28".to_owned())
+    );
+    assert_eq!(
+        result.closure.candidate.rollback.note,
+        "candidate-only reversible relation; no canonical mutation"
+    );
+    // Nothing was repaired: the supplied neighborhood is untouched.
+    assert_eq!(case.neighborhood.relations.len(), before_count);
+}
+
+// WORK_UNIT_CASE: 655/29
+#[test]
+fn work_unit_655_29_rollback_and_raw_history() {
+    let mut case = Case::ready();
+    let first = snapshot(
+        &case.assembled(),
+        "first-29",
+        case.draft.family,
+        case.draft.direction,
+        "source-a",
+        "target-b",
+    );
+    let mut second = snapshot(
+        &case.assembled(),
+        "second-29",
+        case.draft.family,
+        case.draft.direction,
+        "source-a",
+        "target-b",
+    );
+    second.predecessor = Some("first-29".to_owned());
+    case.neighborhood.relations.extend([first, second.clone()]);
+    case.policy.proposed_snapshot = Some(second);
+    case.reseal();
+    let result = case.run().expect("history rollback");
+    assert_eq!(result.disposition, RelationDisposition::Duplicate);
+    assert_eq!(
+        result
+            .closure
+            .candidate
+            .rollback
+            .predecessor
+            .as_deref(),
+        Some("second-29")
+    );
+    assert!(
+        result
+            .closure
+            .candidate
+            .rollback
+            .removal_or_restoration_refs
+            .contains(&"second-29".to_owned())
+    );
+    let history = &result.closure.candidate.rollback.raw_history_refs;
+    for handle in [
+        "source-a",
+        "target-b",
+        "evidence-1",
+        "evidence-rival",
+        "evidence-none",
+    ] {
+        assert!(history.contains(&handle.to_owned()), "missing raw history {handle}");
+    }
+}
+
+// WORK_UNIT_CASE: 655/30
+#[test]
+fn work_unit_655_30_preservation_and_upstream_receipt() {
+    let case = Case::ready();
+    let result = case.run().expect("preserved relation");
+    assert_eq!(
+        result.closure.candidate.preservation.verdicts.len(),
+        RelationPreservationDimension::all().len()
+    );
+    assert_eq!(result.closure.candidate.preservation.verdicts.len(), 7);
+    for dimension in RelationPreservationDimension::all() {
+        let verdict = result
+            .closure
+            .candidate
+            .preservation
+            .verdicts
+            .iter()
+            .find(|verdict| verdict.dimension == *dimension)
+            .expect("dimension verdict");
+        assert!(verdict.passed && verdict.known, "dimension {dimension:?} must pass known");
+    }
+    // The upstream A-05 receipt travels by value; it is validated
+    // intrinsically, never re-executed by this handler.
+    assert_eq!(
+        result.closure.input.item.receipt.validator_contract,
+        "a05-validator"
+    );
+    assert_eq!(result.closure.input.item.receipt, *case.ctx.receipt);
+}
