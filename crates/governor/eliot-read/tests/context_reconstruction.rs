@@ -40,10 +40,13 @@ use std::future::Future;
 use std::task::{Context, Poll, Waker};
 
 use eliot_contracts::{
-    ClockReading, EpochId, EpochLineageId, ProductId, RequestId, RequestMetadata, ResourceGeneration,
-    SourceId, StateFence,
+    ClockReading, EpochId, EpochLineageId, ProductId, RequestId, RequestMetadata,
+    ResourceGeneration, SourceId, StateFence,
 };
-use eliot_read::{QueryIntent, QueryMode, QueryRequest, ReadApi, ReadError, ReadService};
+use eliot_read::{
+    BranchEnvironmentScope, FreshnessPolicy, NamedParameters, QueryIntent, QueryMode, QueryRequest,
+    ReadApi, ReadError, ReadService, RequiredAssurance, TimeScope,
+};
 use eliot_store_api::{
     CanonicalReadClient, EVIDENCE_PACK_MAX_RECORDS, NamedReadOperation, NamedReadRequest,
     NamedReadResponse, ReadConsistency, RevisionHead, RevisionKey, ScopeId, StoreError,
@@ -108,25 +111,23 @@ fn metadata(fence: &StateFence, tag: &str) -> Result<RequestMetadata, Box<dyn st
 fn reconstruction_intent() -> QueryIntent {
     QueryIntent {
         mode: QueryMode::ContextReconstruction,
-        time_scope: "task window for reconstruction".to_owned(),
-        branch_environment_scope: "test branch and environment".to_owned(),
-        freshness_policy: "exact admitted generation only".to_owned(),
-        required_assurance: "reconstruction input read".to_owned(),
+        time_scope: TimeScope::TaskWindow,
+        branch_environment_scope: BranchEnvironmentScope::LocalEnvironment,
+        freshness_policy: FreshnessPolicy::AdmittedGeneration,
+        required_assurance: RequiredAssurance::ReconstructionInputs,
     }
 }
 
 fn reconstruction_query(
     operation: NamedReadOperation,
     scope: Option<&str>,
-    parameters: BTreeMap<String, Value>,
+    parameters: NamedParameters,
 ) -> Result<QueryRequest, StoreError> {
     let mut dependencies = BTreeMap::new();
     dependencies.insert(RevisionKey::new("scope:scope-task-7")?, 1);
     Ok(QueryRequest {
         intent: reconstruction_intent(),
         operation,
-        query: "reconstruct the exact task-bound context".to_owned(),
-        exact_resource_uri: None,
         scope_id: scope.map(ScopeId::new).transpose()?,
         consistency: ReadConsistency::ExactFence,
         dependency_revisions: dependencies,
@@ -135,18 +136,23 @@ fn reconstruction_query(
     })
 }
 
-fn evidence_parameters(subject: &str, max_records: &str) -> BTreeMap<String, Value> {
-    BTreeMap::from([
+fn evidence_parameters(subject: &str, max_records: &str) -> NamedParameters {
+    NamedParameters::from_map(BTreeMap::from([
         ("subject".to_owned(), Value::String(subject.to_owned())),
         (
             "max_records".to_owned(),
             Value::String(max_records.to_owned()),
         ),
-    ])
+    ]))
+    .expect("evidence selectors are closed and bounded")
 }
 
-fn position_parameters(position: &str) -> BTreeMap<String, Value> {
-    BTreeMap::from([("position".to_owned(), Value::String(position.to_owned()))])
+fn position_parameters(position: &str) -> NamedParameters {
+    NamedParameters::from_map(BTreeMap::from([(
+        "position".to_owned(),
+        Value::String(position.to_owned()),
+    )]))
+    .expect("position selector is closed and bounded")
 }
 
 /// Minimal in-test reconstruction table modelling the part-B-activated store
@@ -201,8 +207,7 @@ impl ReconstructionTableClient {
     }
 
     fn capture_position(&mut self, scope: &str, position: &str) {
-        self.positions
-            .insert(scope.to_owned(), position.to_owned());
+        self.positions.insert(scope.to_owned(), position.to_owned());
     }
 
     fn capture_capability(&mut self, scope: &str, affordance: &str) {
@@ -254,10 +259,7 @@ impl ReconstructionTableClient {
     }
 
     fn attention_payload(&self, scope: &ScopeId) -> Value {
-        let problems: &[String] = self
-            .problems
-            .get(scope.as_str())
-            .map_or(&[], Vec::as_slice);
+        let problems: &[String] = self.problems.get(scope.as_str()).map_or(&[], Vec::as_slice);
         json!({
             "version": TEST_RECONSTRUCTION_VERSION,
             "scope_id": scope.as_str(),
@@ -340,7 +342,11 @@ impl ReconstructionTableClient {
             return Err(StoreError::PayloadTooLarge);
         }
         let limit = usize::try_from(max_records).map_err(|_| StoreError::PayloadTooLarge)?;
-        let matched_total = self.evidence.iter().filter(|captured| captured.as_str() == subject).count();
+        let matched_total = self
+            .evidence
+            .iter()
+            .filter(|captured| captured.as_str() == subject)
+            .count();
         let records: Vec<Value> = self
             .evidence
             .iter()
@@ -389,9 +395,7 @@ impl ReconstructionTableClient {
         let admitted = self
             .positions
             .get(scope.as_str())
-            .ok_or(StoreError::Empty {
-                field: "position",
-            })?;
+            .ok_or(StoreError::Empty { field: "position" })?;
         if admitted.as_str() != position {
             return Err(StoreError::InvalidField {
                 field: "operation.parameter",
@@ -469,8 +473,8 @@ impl CanonicalReadClient for ReconstructionTableClient {
                     });
                 }
             }
-            NamedReadOperation::GetEvidencePack | NamedReadOperation::GetCurrentEpistemicPosition => {
-            }
+            NamedReadOperation::GetEvidencePack
+            | NamedReadOperation::GetCurrentEpistemicPosition => {}
             _ => return Err(StoreError::UnknownOperation),
         }
         let payload = match request.operation {
@@ -497,9 +501,7 @@ impl CanonicalReadClient for ReconstructionTableClient {
 /// `Present`.
 fn classify_role(role: &str, payload: &Value) -> &'static str {
     match role {
-        "negative_memory" if payload.get("negative_memory").is_none_or(Value::is_null) => {
-            "missing"
-        }
+        "negative_memory" if payload.get("negative_memory").is_none_or(Value::is_null) => "missing",
         "critical_attention"
             if payload
                 .get("problems")
@@ -514,8 +516,8 @@ fn classify_role(role: &str, payload: &Value) -> &'static str {
 }
 
 #[test]
-fn task_bound_context_reconstruction_reports_seven_roles_plus_activation_with_zero_edges_and_stale_on_invalidation(
-) -> Result<(), Box<dyn std::error::Error>> {
+fn task_bound_context_reconstruction_reports_seven_roles_plus_activation_with_zero_edges_and_stale_on_invalidation()
+-> Result<(), Box<dyn std::error::Error>> {
     let scope = "scope-task-7";
     let fence_one = fence(1)?;
     let ctx_one = metadata(&fence_one, "gen-one")?;
@@ -544,36 +546,41 @@ fn task_bound_context_reconstruction_reports_seven_roles_plus_activation_with_ze
         NamedReadOperation::GetEvidencePack,
         NamedReadOperation::GetCapabilityEvidenceState,
     ] {
-        let request = reconstruction_query(operation, Some(scope), BTreeMap::new())?;
+        let request = reconstruction_query(operation, Some(scope), NamedParameters::new())?;
         request.validate()?;
     }
     let out_of_intent = reconstruction_query(
         NamedReadOperation::GetMailbox,
         Some(scope),
-        BTreeMap::new(),
+        NamedParameters::new(),
     )?;
     assert!(matches!(
         out_of_intent.validate(),
         Err(ReadError::InvalidIntentOperation { .. })
     ));
-    let unscoped = reconstruction_query(NamedReadOperation::GetTaskState, None, BTreeMap::new())?;
-    assert!(matches!(
-        unscoped.validate(),
-        Err(ReadError::ScopeRequired)
-    ));
+    let unscoped = reconstruction_query(
+        NamedReadOperation::GetTaskState,
+        None,
+        NamedParameters::new(),
+    )?;
+    assert!(matches!(unscoped.validate(), Err(ReadError::ScopeRequired)));
 
     // All six role-source reads execute through the canonical
     // `ReadService::query` path against the one admitted binding.
     let task = block_on(service.query(
         &ctx_one,
-        reconstruction_query(NamedReadOperation::GetTaskState, Some(scope), BTreeMap::new())?,
+        reconstruction_query(
+            NamedReadOperation::GetTaskState,
+            Some(scope),
+            NamedParameters::new(),
+        )?,
     ))?;
     let attention = block_on(service.query(
         &ctx_one,
         reconstruction_query(
             NamedReadOperation::GetAttentionAndProblems,
             Some(scope),
-            BTreeMap::new(),
+            NamedParameters::new(),
         )?,
     ))?;
     let position = block_on(service.query(
@@ -589,7 +596,7 @@ fn task_bound_context_reconstruction_reports_seven_roles_plus_activation_with_ze
         reconstruction_query(
             NamedReadOperation::GetUnderstandingProjectionInputs,
             Some(scope),
-            BTreeMap::new(),
+            NamedParameters::new(),
         )?,
     ))?;
     let evidence = block_on(service.query(
@@ -605,7 +612,7 @@ fn task_bound_context_reconstruction_reports_seven_roles_plus_activation_with_ze
         reconstruction_query(
             NamedReadOperation::GetCapabilityEvidenceState,
             Some(scope),
-            BTreeMap::new(),
+            NamedParameters::new(),
         )?,
     ))?;
 
@@ -625,7 +632,10 @@ fn task_bound_context_reconstruction_reports_seven_roles_plus_activation_with_ze
             "cue_activation",
             classify_role(
                 "cue_activation",
-                understanding.payload.get("cue_inputs").unwrap_or(&Value::Null),
+                understanding
+                    .payload
+                    .get("cue_inputs")
+                    .unwrap_or(&Value::Null),
             ),
         ),
         (
@@ -682,11 +692,11 @@ fn task_bound_context_reconstruction_reports_seven_roles_plus_activation_with_ze
     );
     // Zero graph edges: the closure admits only exact selectors, so a
     // smuggled edge selector fails closed before any record is touched.
-    let mut smuggled = BTreeMap::new();
-    smuggled.insert(
+    let smuggled = NamedParameters::from_map(BTreeMap::from([(
         "relation_edges".to_owned(),
         Value::String("edge-1".to_owned()),
-    );
+    )]))
+    .expect("well-formed unknown selector reaches the store gate");
     assert!(
         block_on(service.query(
             &ctx_one,
@@ -710,10 +720,8 @@ fn task_bound_context_reconstruction_reports_seven_roles_plus_activation_with_ze
     ] {
         let parameters = match operation {
             NamedReadOperation::GetEvidencePack => evidence_parameters("evidence-alpha", "8"),
-            NamedReadOperation::GetCurrentEpistemicPosition => {
-                position_parameters("position-one")
-            }
-            _ => BTreeMap::new(),
+            NamedReadOperation::GetCurrentEpistemicPosition => position_parameters("position-one"),
+            _ => NamedParameters::new(),
         };
         let stale = block_on(service.query(
             &ctx_two,
