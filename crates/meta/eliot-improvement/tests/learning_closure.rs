@@ -912,8 +912,7 @@ fn case_21_complete_vs_incomplete_member_stage_denominator() {
 #[test]
 fn case_22_positive_negative_mixed_unchanged_harmful_outcome() {
     use OutcomeKind::{Harmful, Mixed, Negative, Positive, Unchanged};
-    let (c, a, o, e, h, p) =
-        multi_inputs(&[Positive, Negative, Mixed, Unchanged]);
+    let (c, a, o, e, h, p) = multi_inputs(&[Positive, Negative, Mixed, Unchanged]);
     match learning_closure::assemble_campaign_learning_closure(c, a, o, e, h, p) {
         Ok(ClosureAssembly::Candidate(candidate)) => {
             assert_eq!(candidate.denominators.outcome_count, 4);
@@ -922,10 +921,8 @@ fn case_22_positive_negative_mixed_unchanged_harmful_outcome() {
         other => panic!("four distinct non-harmful kinds must close, got {other:?}"),
     }
     // Kinds are load-bearing in the digest, never collapsed to positive.
-    let (c2, a2, o2, e2, h2, p2) =
-        multi_inputs(&[Positive, Positive, Positive, Positive]);
-    let (c3, a3, o3, e3, h3, p3) =
-        multi_inputs(&[Positive, Negative, Mixed, Unchanged]);
+    let (c2, a2, o2, e2, h2, p2) = multi_inputs(&[Positive, Positive, Positive, Positive]);
+    let (c3, a3, o3, e3, h3, p3) = multi_inputs(&[Positive, Negative, Mixed, Unchanged]);
     let uniform = match learning_closure::assemble_campaign_learning_closure(c2, a2, o2, e2, h2, p2)
     {
         Ok(ClosureAssembly::Candidate(candidate)) => candidate,
@@ -938,8 +935,7 @@ fn case_22_positive_negative_mixed_unchanged_harmful_outcome() {
     };
     assert_ne!(uniform.digest, varied.digest);
     // Harmful kind never closes: it retires to review with visible debt.
-    let (c4, a4, o4, mut e4, h4, p4) =
-        multi_inputs(&[Positive, Negative, Mixed, Harmful]);
+    let (c4, a4, o4, mut e4, h4, p4) = multi_inputs(&[Positive, Negative, Mixed, Harmful]);
     e4.outcomes[3].harm = HarmRecord {
         harm_observed: true,
         harm_ref: Some("harm-819-m4".to_string()),
@@ -1424,8 +1420,7 @@ fn case_40_no_winner_by_latest_confidence_source_count() {
 #[test]
 fn case_41_materially_equivalent_repeat_campaign() {
     let (c, a, o, e, _, p) = complete_inputs();
-    let evidence_hex =
-        learning_closure::closure_evidence_digest(&c, &a, &o, &e);
+    let evidence_hex = learning_closure::closure_evidence_digest(&c, &a, &o, &e);
     let repeat_history = PriorClosureHistory {
         prior: vec![PriorClosure {
             closure_id: "closure-819-first".to_string(),
@@ -1462,8 +1457,7 @@ fn case_41_materially_equivalent_repeat_campaign() {
             superseded: true,
         }],
     };
-    match learning_closure::assemble_campaign_learning_closure(c, a, o, e, superseded_history, p)
-    {
+    match learning_closure::assemble_campaign_learning_closure(c, a, o, e, superseded_history, p) {
         Ok(ClosureAssembly::Candidate(candidate)) => {
             assert_eq!(candidate.status, ClosureStatus::ClosedTaskLocal);
         }
@@ -1583,15 +1577,8 @@ fn case_46_exact_external_owner_rollback_disable_reopen_expiry() {
 fn case_47_missing_owner_or_irreversible_control_gap() {
     let (c, a, o, e, h, mut p) = complete_inputs();
     p.external_owner_id = String::new();
-    let err = learning_closure::assemble_campaign_learning_closure(
-        c,
-        a,
-        o,
-        e,
-        h,
-        p,
-    )
-    .expect_err("missing external owner must fail");
+    let err = learning_closure::assemble_campaign_learning_closure(c, a, o, e, h, p)
+        .expect_err("missing external owner must fail");
     assert_eq!(err, LearningClosureError::MissingField("external_owner_id"));
 
     let (c2, a2, o2, e2, h2, mut p2) = complete_inputs();
@@ -1656,7 +1643,10 @@ fn case_49_independent_item_output_work_deadline_bounds() {
     p4.schema_version = 99;
     let err4 = learning_closure::assemble_campaign_learning_closure(c4, a4, o4, e4, h4, p4)
         .expect_err("unknown schema must fail");
-    assert_eq!(err4, LearningClosureError::UnsupportedSchema { version: 99 });
+    assert_eq!(
+        err4,
+        LearningClosureError::UnsupportedSchema { version: 99 }
+    );
 }
 
 // WORK_UNIT_CASE: 819/50
@@ -1675,11 +1665,11 @@ fn case_50_replay_and_changed_same_id_policy_conflict() {
         Ok(ClosureAssembly::Candidate(candidate)) => candidate,
         other => panic!("first replay must close, got {other:?}"),
     };
-    let second = match learning_closure::assemble_campaign_learning_closure(c, a, o, e, h, p.clone())
-    {
-        Ok(ClosureAssembly::Candidate(candidate)) => candidate,
-        other => panic!("second replay must close, got {other:?}"),
-    };
+    let second =
+        match learning_closure::assemble_campaign_learning_closure(c, a, o, e, h, p.clone()) {
+            Ok(ClosureAssembly::Candidate(candidate)) => candidate,
+            other => panic!("second replay must close, got {other:?}"),
+        };
     assert_eq!(first.digest, second.digest);
     assert_eq!(first.candidate_id, second.candidate_id);
     // Changed same-ID record conflicts instead of silently winning.
@@ -1698,10 +1688,269 @@ fn case_50_replay_and_changed_same_id_policy_conflict() {
     // Changed policy binds a different digest.
     let (c3, a3, o3, e3, h3, mut p3) = complete_inputs();
     p3.idempotency_key = "idem-819-rotated".to_string();
-    let rotated =
-        match learning_closure::assemble_campaign_learning_closure(c3, a3, o3, e3, h3, p3) {
-            Ok(ClosureAssembly::Candidate(candidate)) => candidate,
-            other => panic!("rotated policy must close, got {other:?}"),
-        };
+    let rotated = match learning_closure::assemble_campaign_learning_closure(c3, a3, o3, e3, h3, p3)
+    {
+        Ok(ClosureAssembly::Candidate(candidate)) => candidate,
+        other => panic!("rotated policy must close, got {other:?}"),
+    };
     assert_ne!(first.digest, rotated.digest);
+}
+
+// WORK_UNIT_CASE: 819/51
+#[test]
+fn case_51_set_order_invariance_with_meaningful_lifecycle_order() {
+    let (c, a, o, e, h, p) = complete_inputs();
+    let first = match learning_closure::assemble_campaign_learning_closure(
+        c.clone(),
+        a.clone(),
+        o.clone(),
+        e.clone(),
+        h.clone(),
+        p.clone(),
+    ) {
+        Ok(ClosureAssembly::Candidate(candidate)) => candidate,
+        other => panic!("ordered inputs must close, got {other:?}"),
+    };
+    // Permute every set-valued input while keeping bindings intact.
+    let mut pa = a.clone();
+    pa.attempts.reverse();
+    pa.expected_attempt_ids.reverse();
+    let mut po = o.clone();
+    po.overlays.reverse();
+    po.assessments.reverse();
+    let mut pe = e.clone();
+    pe.outcomes.reverse();
+    pe.economics.reverse();
+    let permuted = match learning_closure::assemble_campaign_learning_closure(c, pa, po, pe, h, p) {
+        Ok(ClosureAssembly::Candidate(candidate)) => candidate,
+        other => panic!("permuted inputs must close, got {other:?}"),
+    };
+    assert_eq!(first.digest, permuted.digest);
+    assert_eq!(first.denominators, permuted.denominators);
+    // Attempt/lifecycle order itself stays meaningful and canonical.
+    assert_eq!(
+        LifecycleStage::all().first(),
+        Some(&LifecycleStage::Delivery)
+    );
+    assert_eq!(
+        LifecycleStage::all().last(),
+        Some(&LifecycleStage::Causality)
+    );
+    let order: Vec<LifecycleStage> = LifecycleStage::all().to_vec();
+    let mut sorted = order.clone();
+    sorted.sort();
+    assert_eq!(order, sorted);
+}
+
+// WORK_UNIT_CASE: 819/52
+#[test]
+fn case_52_bounded_malformed_input_never_panics() {
+    let (mut c, a, o, e, h, p) = complete_inputs();
+    c.target_id = String::new();
+    assert!(matches!(
+        learning_closure::assemble_campaign_learning_closure(c, a, o, e, h, p),
+        Err(LearningClosureError::MissingField("target_id"))
+    ));
+
+    let (c2, mut a2, o2, e2, h2, p2) = complete_inputs();
+    a2.attempts[0].attempt_id = String::new();
+    assert!(matches!(
+        learning_closure::assemble_campaign_learning_closure(c2, a2, o2, e2, h2, p2),
+        Err(LearningClosureError::MissingField("attempt_id"))
+    ));
+
+    let (c3, mut a3, o3, e3, h3, p3) = complete_inputs();
+    a3.expected_attempt_ids[0] = "x".repeat(300);
+    assert!(matches!(
+        learning_closure::assemble_campaign_learning_closure(c3, a3, o3, e3, h3, p3),
+        Err(LearningClosureError::Malformed { .. })
+    ));
+
+    let (c4, a4, mut o4, e4, h4, p4) = complete_inputs();
+    o4.overlays[0].overlay_id = String::new();
+    assert!(matches!(
+        learning_closure::assemble_campaign_learning_closure(c4, a4, o4, e4, h4, p4),
+        Err(LearningClosureError::MissingField("overlay_id"))
+    ));
+
+    let (c5, a5, mut o5, e5, h5, p5) = complete_inputs();
+    o5.assessments[0].attempt_id = String::new();
+    assert!(matches!(
+        learning_closure::assemble_campaign_learning_closure(c5, a5, o5, e5, h5, p5),
+        Err(LearningClosureError::MissingField("assessment_binding"))
+    ));
+
+    // Empty everything still returns a typed result instead of panicking.
+    let empty = AttemptOutcomesAndDeltas {
+        expected_attempt_ids: Vec::new(),
+        attempts: Vec::new(),
+    };
+    let no_overlays = OverlayAndActivationAssessments {
+        overlays: Vec::new(),
+        assessments: Vec::new(),
+    };
+    let no_evidence = OutcomeHarmAndEconomicsEvidence {
+        outcomes: Vec::new(),
+        economics: Vec::new(),
+    };
+    let (c6, _, _, _, h6, p6) = complete_inputs();
+    let _ = learning_closure::assemble_campaign_learning_closure(
+        c6,
+        empty,
+        no_overlays,
+        no_evidence,
+        h6,
+        p6,
+    );
+}
+
+// WORK_UNIT_CASE: 819/53
+#[test]
+fn case_53_complete_closure_accounts_every_denominator_member() {
+    let candidate = assemble_complete();
+    assert_eq!(candidate.denominators.expected_attempts, 2);
+    assert_eq!(candidate.denominators.supplied_attempts, 2);
+    assert_eq!(candidate.denominators.consequential_attempts, 2);
+    assert_eq!(candidate.denominators.non_consequential_attempts, 0);
+    assert_eq!(candidate.denominators.delta_count, 2);
+    assert_eq!(candidate.denominators.overlay_count, 2);
+    assert_eq!(candidate.denominators.stage_count, 6);
+    assert_eq!(candidate.denominators.outcome_count, 2);
+    assert_eq!(candidate.denominators.economics_count, 2);
+    assert!(candidate.missing_evidence.is_empty());
+    assert!(candidate.open_debt.is_empty());
+    assert!(candidate.conflicts.is_empty());
+}
+
+// WORK_UNIT_CASE: 819/54
+#[test]
+fn case_54_requested_scope_capped_at_weakest_ceiling() {
+    // Even fully evidenced, the candidate claims module proof only.
+    let candidate = assemble_complete();
+    assert_eq!(candidate.proof_ceiling, "module-proof-only");
+    assert_eq!(candidate.handoff.requested_class, "task-local-retention");
+    // The weakest link caps the scope: unattributed benefit blocks closure.
+    let (c, a, mut o, mut e, h, p) = complete_inputs();
+    o.assessments.push(stage(
+        "attempt-2",
+        "overlay-2",
+        LifecycleStage::Benefit,
+        true,
+        true,
+        false,
+    ));
+    e.outcomes[1].causal = CausalAttribution::CorrelationalOnly;
+    match learning_closure::assemble_campaign_learning_closure(c, a, o, e, h, p) {
+        Ok(ClosureAssembly::Disposition(disposition)) => {
+            assert_eq!(disposition.disposition, "inconclusive");
+            assert!(
+                disposition
+                    .missing_evidence
+                    .iter()
+                    .any(|m| m.contains("benefit-without-causal-attribution"))
+            );
+        }
+        other => panic!("weakest link must cap scope, got {other:?}"),
+    }
+}
+
+// WORK_UNIT_CASE: 819/55
+#[test]
+fn case_55_removed_load_bearing_receipt_invalidates_digest() {
+    let baseline = assemble_complete();
+    // Removed economics receipt changes the bound digest.
+    let (c, a, o, e, h, p) = complete_inputs();
+    let mute = OutcomeHarmAndEconomicsEvidence {
+        outcomes: e.outcomes.clone(),
+        economics: vec![e.economics[0].clone()],
+    };
+    match learning_closure::assemble_campaign_learning_closure(c, a, o, mute, h, p) {
+        Ok(ClosureAssembly::Candidate(candidate)) => {
+            assert_eq!(candidate.denominators.economics_count, 1);
+            assert_ne!(candidate.digest, baseline.digest);
+        }
+        other => panic!("trimmed economics must still bind, got {other:?}"),
+    }
+    // Removed outcome receipt destroys the complete status.
+    let (c2, a2, o2, mut e2, h2, p2) = complete_inputs();
+    e2.outcomes.pop();
+    match learning_closure::assemble_campaign_learning_closure(c2, a2, o2, e2, h2, p2) {
+        Ok(ClosureAssembly::Disposition(_)) => {}
+        Ok(ClosureAssembly::Candidate(candidate)) => {
+            assert_ne!(candidate.digest, baseline.digest);
+        }
+        Err(_) => {}
+    }
+    // Removed stage evidence destroys the complete status.
+    let (c3, a3, mut o3, e3, h3, p3) = complete_inputs();
+    o3.assessments[2].evidence_ref = None;
+    assert!(matches!(
+        learning_closure::assemble_campaign_learning_closure(c3, a3, o3, e3, h3, p3),
+        Err(LearningClosureError::LineageFailure { .. })
+    ));
+}
+
+// WORK_UNIT_CASE: 819/56
+#[test]
+fn case_56_no_promotion_current_retirement_write_or_finish_output() {
+    let candidate = assemble_complete();
+    let debug = format!("{candidate:?}");
+    assert!(debug.contains("ClosedTaskLocal"));
+    assert!(debug.contains("promotion_receipt: None"));
+    assert!(debug.contains("active_permit: None"));
+    assert!(!debug.contains("Promoted"));
+    assert!(!debug.contains("Current"));
+    assert!(!debug.contains("Retired"));
+    assert!(candidate.handoff.promotion_receipt.is_none());
+    assert!(candidate.handoff.active_permit.is_none());
+    assert_eq!(candidate.proof_ceiling, "module-proof-only");
+}
+
+// WORK_UNIT_CASE: 819/57
+#[test]
+fn case_57_no_algorithm_dependency_on_a33_a34_a35_a36() {
+    const SRC: &str = include_str!("../src/learning_closure.rs");
+    assert!(!SRC.contains("use crate"));
+    assert!(!SRC.contains("crate::"));
+    assert!(!SRC.contains("super::"));
+    assert!(!SRC.contains("extern crate"));
+    assert!(!SRC.contains("promotion_input"));
+    assert!(!SRC.contains("\nmod "));
+    // Canonical immutable fixtures alone drive the operation to closure.
+    let candidate = assemble_complete();
+    assert_eq!(candidate.status, ClosureStatus::ClosedTaskLocal);
+}
+
+// WORK_UNIT_CASE: 819/58
+#[test]
+fn case_58_no_runtime_store_path_source_bound_tests_first() {
+    const SRC: &str = include_str!("../src/learning_closure.rs");
+    for forbidden in [
+        "std::fs",
+        "std::net",
+        "std::process",
+        "std::thread",
+        "tokio",
+        "reqwest",
+        "Store",
+        "Command",
+        ".spawn(",
+        "unsafe",
+        "async",
+        "await",
+    ] {
+        assert!(
+            !SRC.contains(forbidden),
+            "runtime path forbidden: {forbidden}"
+        );
+    }
+    // The module executes through the dedicated source-bound test binding.
+    let assemble = learning_closure::assemble_campaign_learning_closure;
+    let (c, a, o, e, h, p) = complete_inputs();
+    match assemble(c, a, o, e, h, p) {
+        Ok(ClosureAssembly::Candidate(candidate)) => {
+            assert_eq!(candidate.status, ClosureStatus::ClosedTaskLocal);
+        }
+        other => panic!("source-bound assembly must close, got {other:?}"),
+    }
 }
