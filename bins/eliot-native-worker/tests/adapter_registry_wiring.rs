@@ -32,10 +32,10 @@ use eliot_contracts::{
 };
 use eliot_native_worker::adapter_registry::{
     ACP_FACTORY_ID, AcpFactorySeams, AdapterIdentity, AdapterRegistry, CLAUDE_FACTORY_ID,
-    CODEX_FACTORY_ID, ClaudeFactorySeams, CodexFactorySeams, FACTORY_REVISION, FactoryEntry,
-    FactoryLedger, OPENCODE_FACTORY_ID, OpencodeFactorySeams, RegistryError, SecretRef,
-    ValidatedDispatch, invoke_acp_factory, invoke_claude_factory, invoke_codex_factory,
-    invoke_opencode_factory, validate_admitted_dispatch,
+    CODEX_FACTORY_ID, ClaudeFactorySeams, FACTORY_REVISION, FactoryEntry, FactoryLedger,
+    OPENCODE_FACTORY_ID, OpencodeFactorySeams, RegistryError, SecretRef, ValidatedDispatch,
+    invoke_acp_factory, invoke_claude_factory, invoke_opencode_factory,
+    validate_admitted_dispatch,
 };
 use eliot_native_worker_core::{
     AttemptId, BudgetEnvelope, ClaimAdmissionRequest, EXECUTION_UNIT_SCHEMA_VERSION,
@@ -590,22 +590,22 @@ fn duplicates_rejected() {
 
     // A second construction for the same live operation is refused without
     // touching any factory: the ledger cannot move.
-    let fixtures = admitted(CODEX_FACTORY_ID, "case-5");
+    let fixtures = admitted(CLAUDE_FACTORY_ID, "case-5");
     let valid = validated(&fixtures);
     let mut ledger = FactoryLedger::new();
-    let seams = CodexFactorySeams {
+    let seams = ClaudeFactorySeams {
         executor: Arc::clone(&fixtures.executor),
     };
-    match invoke_codex_factory(&registry, &valid, &seams, &mut ledger) {
+    match invoke_claude_factory(&registry, &valid, &seams, &claude_request(), &mut ledger) {
         Ok(_) => {}
         Err(error) => panic!("first construction must succeed: {error:?}"),
     }
-    assert_eq!(ledger.calls_for(AdapterIdentity::Codex), 1);
-    match invoke_codex_factory(&registry, &valid, &seams, &mut ledger) {
+    assert_eq!(ledger.calls_for(AdapterIdentity::Claude), 1);
+    match invoke_claude_factory(&registry, &valid, &seams, &claude_request(), &mut ledger) {
         Err(RegistryError::AlreadyStarted { .. }) => {}
         other => panic!("second construction must be refused, got {other:?}"),
     }
-    assert_eq!(ledger.calls_for(AdapterIdentity::Codex), 1);
+    assert_eq!(ledger.calls_for(AdapterIdentity::Claude), 1);
     assert_eq!(fixtures.executor.starts(), 0);
 }
 
@@ -794,30 +794,30 @@ fn bad_claim_rejected_pre_factory_with_ledger_proof() {
 #[test]
 fn exactly_one_named_factory() {
     let registry = AdapterRegistry::four_factory();
-    let fixtures = admitted(CODEX_FACTORY_ID, "case-10");
+    let fixtures = admitted(CLAUDE_FACTORY_ID, "case-10");
     let valid = validated(&fixtures);
     let mut ledger = FactoryLedger::new();
-    let seams = CodexFactorySeams {
+    let seams = ClaudeFactorySeams {
         executor: Arc::clone(&fixtures.executor),
     };
-    let attempt = match invoke_codex_factory(&registry, &valid, &seams, &mut ledger) {
+    let attempt = match invoke_claude_factory(&registry, &valid, &seams, &claude_request(), &mut ledger) {
         Ok(attempt) => attempt,
-        Err(error) => panic!("named codex factory must construct: {error:?}"),
+        Err(error) => panic!("named claude factory must construct: {error:?}"),
     };
     assert_eq!(ledger.calls().len(), 1);
     match ledger.calls().first() {
         Some(call) => {
-            assert_eq!(call.adapter(), AdapterIdentity::Codex);
+            assert_eq!(call.adapter(), AdapterIdentity::Claude);
             assert_eq!(call.operation_id(), valid.operation_id());
             assert_eq!(call.claim_id(), valid.claim_id());
         }
         None => panic!("named construction must record exactly one call"),
     }
-    assert_eq!(ledger.calls_for(AdapterIdentity::Codex), 1);
+    assert_eq!(ledger.calls_for(AdapterIdentity::Claude), 1);
     assert_eq!(ledger.calls_for(AdapterIdentity::Opencode), 0);
     assert_eq!(ledger.calls_for(AdapterIdentity::Acp), 0);
-    assert_eq!(ledger.calls_for(AdapterIdentity::Claude), 0);
-    assert_eq!(attempt.adapter(), AdapterIdentity::Codex);
+    assert_eq!(ledger.calls_for(AdapterIdentity::Codex), 0);
+    assert_eq!(attempt.adapter(), AdapterIdentity::Claude);
     assert_eq!(attempt.claim_id(), valid.claim_id());
     assert_eq!(attempt.operation_id(), valid.operation_id());
     assert_eq!(attempt.attempt_id(), valid.attempt_id());
@@ -828,19 +828,11 @@ fn exactly_one_named_factory() {
 #[test]
 fn no_rerank_fallback_or_substitution() {
     let registry = AdapterRegistry::four_factory();
-    let fixtures = admitted(CODEX_FACTORY_ID, "case-11");
+    let fixtures = admitted(OPENCODE_FACTORY_ID, "case-11");
     let valid = validated(&fixtures);
     let mut ledger = FactoryLedger::new();
 
-    // A codex-resolved dispatch presented to the opencode factory is
-    // refused as substitution, not silently served.
-    match invoke_opencode_factory(&registry, &valid, &opencode_seams(), &mut ledger) {
-        Err(RegistryError::SubstitutionRefused { .. }) => {}
-        other => panic!("cross-factory invoke must refuse, got {other:?}"),
-    }
-    assert!(ledger.calls().is_empty());
-
-    // A codex-resolved dispatch presented to the Claude factory is likewise
+    // An opencode-resolved dispatch presented to the Claude factory is
     // refused as substitution: capability comes from naming, never from
     // fallback, even though the Claude entry is capable.
     let claude_seams = ClaudeFactorySeams {
@@ -860,10 +852,7 @@ fn no_rerank_fallback_or_substitution() {
 
     // The named factory still constructs explicitly afterwards: capability
     // comes from naming, never from fallback.
-    let seams = CodexFactorySeams {
-        executor: Arc::clone(&fixtures.executor),
-    };
-    match invoke_codex_factory(&registry, &valid, &seams, &mut ledger) {
+    match invoke_opencode_factory(&registry, &valid, &opencode_seams(), &mut ledger) {
         Ok(_) => {}
         Err(error) => panic!("explicit naming must construct: {error:?}"),
     }
@@ -876,7 +865,6 @@ fn deterministic_attempt_per_capable_adapter() {
     let registry = AdapterRegistry::four_factory();
     let cases = [
         (OPENCODE_FACTORY_ID, AdapterIdentity::Opencode, "case-30a"),
-        (CODEX_FACTORY_ID, AdapterIdentity::Codex, "case-30b"),
         (ACP_FACTORY_ID, AdapterIdentity::Acp, "case-30c"),
         (CLAUDE_FACTORY_ID, AdapterIdentity::Claude, "case-30d"),
     ];
@@ -888,14 +876,7 @@ fn deterministic_attempt_per_capable_adapter() {
             AdapterIdentity::Opencode => {
                 invoke_opencode_factory(&registry, &valid, &opencode_seams(), &mut ledger)
             }
-            AdapterIdentity::Codex => invoke_codex_factory(
-                &registry,
-                &valid,
-                &CodexFactorySeams {
-                    executor: Arc::clone(&fixtures.executor),
-                },
-                &mut ledger,
-            ),
+            AdapterIdentity::Codex => panic!("codex factory has no invoke entry"),
             AdapterIdentity::Acp => invoke_acp_factory(
                 &registry,
                 &valid,
@@ -946,14 +927,7 @@ fn deterministic_attempt_per_capable_adapter() {
             AdapterIdentity::Opencode => {
                 invoke_opencode_factory(&registry, &valid, &opencode_seams(), &mut replay)
             }
-            AdapterIdentity::Codex => invoke_codex_factory(
-                &registry,
-                &valid,
-                &CodexFactorySeams {
-                    executor: Arc::clone(&fixtures.executor),
-                },
-                &mut replay,
-            ),
+            AdapterIdentity::Codex => panic!("codex factory has no invoke entry"),
             AdapterIdentity::Acp => invoke_acp_factory(
                 &registry,
                 &valid,
