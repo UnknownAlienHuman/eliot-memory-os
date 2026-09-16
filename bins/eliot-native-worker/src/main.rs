@@ -919,7 +919,7 @@ mod tests {
             request_id: "start-claim-1".to_owned(),
             trace_context: BTreeMap::from([("trace_id".to_owned(), "trace-claim-1".to_owned())]),
             deadline_unix_ms: 5_000,
-            artifact_manifest_digest: "manifest-digest-1".to_owned(),
+            artifact_manifest_digest: "facet-manifest-7".to_owned(),
             launch_nonce: "launch-nonce-slice-d-1".to_owned(),
             worker_generation: 1,
             authority_epoch: epoch(),
