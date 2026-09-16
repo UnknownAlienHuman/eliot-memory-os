@@ -26,10 +26,9 @@ use crate::component_contract::{
     ProofCeiling, TYPED_ABI_REVISION, TYPED_ENGINE_IMPLEMENTATION, TYPED_ENGINE_VERSION,
     TYPED_PACKAGE_ID, TypedContractError, TypedWorld, validate_observed,
 };
-use crate::ports::ComponentEnginePort;
+use crate::ports::{ComponentEnginePort, PortError};
 use crate::types::{
-    CapabilityId, EngineInvocation, EngineReport, PortError, Sha256Digest, canonical_digest,
-    validate_text,
+    CapabilityId, EngineInvocation, EngineReport, Sha256Digest, canonical_digest, validate_text,
 };
 
 /// Artifact carriage ceiling matching the Host preflight bound. The kit
@@ -459,5 +458,6 @@ mod capsule_tests {
             oversized,
             Err(TypedContractError::InvalidCapsule("excerpt-bytes".to_owned()))
         );
+        }
     }
 }
