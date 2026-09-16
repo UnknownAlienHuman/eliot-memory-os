@@ -37,12 +37,7 @@ pub const PORTFOLIO_VERSION: &str = "1.0.0";
 /// position `i + 1`. The single owner of this ladder is
 /// `eliot-epistemic-contracts`; the names here are frozen references, not a
 /// second enum.
-pub const GRADE_ORDER: [&str; 4] = [
-    "ORIENTING",
-    "GROUNDED",
-    "CORROBORATED",
-    "SCIENCE_GRADE",
-];
+pub const GRADE_ORDER: [&str; 4] = ["ORIENTING", "GROUNDED", "CORROBORATED", "SCIENCE_GRADE"];
 
 /// Reason codes reused from the I7.20 agent-facing registry for terminal
 /// portfolio results. No new reason owner is introduced here.
@@ -222,6 +217,11 @@ fn push_field(preimage: &mut String, tag: &str, value: &str) {
     preimage.push(':');
     preimage.push_str(value);
     preimage.push(';');
+}
+
+fn push_count(preimage: &mut String, tag: &str, count: usize) {
+    use std::fmt::Write as _;
+    let _ = write!(preimage, "{tag}={count};");
 }
 
 fn freeze(preimage: &str) -> String {
@@ -502,6 +502,7 @@ impl SourceRecord {
     /// Vets and freezes one source record. Summaries stay transformation
     /// artifacts: a derived record without verified raw lineage keeps its
     /// transform cap downstream instead of failing here.
+    #[allow(clippy::too_many_lines)]
     pub fn new(params: SourceRecordParams) -> Result<Self, PortfolioError> {
         text(&params.handle, "source.handle")?;
         text(&params.title, "source.title")?;
@@ -659,7 +660,7 @@ impl SourceRecord {
         if let Some(grade) = self.grade {
             push_field(preimage, "grade", &grade.to_string());
         }
-        preimage.push_str(&format!("domains={};", self.authority_domains.len()));
+        push_count(preimage, "domains", self.authority_domains.len());
         for domain in &self.authority_domains {
             push_field(preimage, "domain", domain);
         }
@@ -805,6 +806,7 @@ pub struct FrozenInquiryParams {
 impl FrozenInquiry {
     /// Validates and freezes one inquiry. Role slots are frozen sorted by
     /// role so declaration order never affects the digest.
+    #[allow(clippy::too_many_lines)]
     pub fn freeze(mut params: FrozenInquiryParams) -> Result<Self, PortfolioError> {
         text(&params.schema, "inquiry.schema")?;
         text(&params.protocol, "inquiry.protocol")?;
@@ -817,12 +819,9 @@ impl FrozenInquiry {
         text(&params.attempt, "inquiry.attempt")?;
         text(&params.scope, "inquiry.scope")?;
         reject_vague(&params.scope, "inquiry.scope")?;
-        params
-            .fence
-            .validate()
-            .map_err(|_| PortfolioError::Blank {
-                field: "inquiry.fence",
-            })?;
+        params.fence.validate().map_err(|_| PortfolioError::Blank {
+            field: "inquiry.fence",
+        })?;
         text(&params.privacy, "inquiry.privacy")?;
         if params.roles.is_empty() {
             return Err(PortfolioError::Blank {
@@ -903,14 +902,14 @@ impl FrozenInquiry {
             "disclosure",
             &format!("{:?}", params.disclosure),
         );
-        preimage.push_str(&format!("roles={};", params.roles.len()));
+        push_count(&mut preimage, "roles", params.roles.len());
         for slot in &params.roles {
             push_field(&mut preimage, "role", &slot.role);
             push_field(&mut preimage, "class", &format!("{:?}", slot.class));
             push_field(&mut preimage, "required", &slot.required.to_string());
             push_field(&mut preimage, "authority_domain", &slot.authority_domain);
         }
-        preimage.push_str(&format!("routes={};", params.routes.len()));
+        push_count(&mut preimage, "routes", params.routes.len());
         for route in &params.routes {
             push_field(&mut preimage, "route", route);
         }
@@ -981,7 +980,7 @@ impl FrozenInquiry {
         let mut preimage = String::from("denominator/v1;");
         push_field(&mut preimage, "inquiry", &self.digest);
         let members = self.denominator_members();
-        preimage.push_str(&format!("members={};", members.len()));
+        push_count(&mut preimage, "members", members.len());
         for member in &members {
             push_field(&mut preimage, "member", member);
         }
@@ -1018,15 +1017,13 @@ pub struct AcquisitionRequest {
 /// the same requests in the same order.
 pub fn plan_acquisition(inquiry: &FrozenInquiry) -> Vec<AcquisitionRequest> {
     let mut requests = Vec::new();
-    let mut route_cursor = 0usize;
-    for member in inquiry.denominator_members() {
+    for (route_cursor, member) in inquiry.denominator_members().into_iter().enumerate() {
         let role = member.split('#').next().unwrap_or(&member).to_owned();
         let route = inquiry
             .routes
             .get(route_cursor % inquiry.routes.len())
             .cloned()
             .unwrap_or_default();
-        route_cursor += 1;
         let mut op_preimage = String::from("acquisition-op/v1;");
         push_field(&mut op_preimage, "inquiry", &inquiry.digest);
         push_field(&mut op_preimage, "member", &member);
@@ -1066,7 +1063,9 @@ impl LineageTable {
     pub fn build(records: &BTreeMap<String, SourceRecord>) -> Self {
         let mut table = Self::default();
         for (handle, record) in records {
-            table.entries.insert(handle.clone(), record.lineage_root.clone());
+            table
+                .entries
+                .insert(handle.clone(), record.lineage_root.clone());
         }
         table
     }
@@ -1089,10 +1088,19 @@ impl LineageTable {
     }
 }
 
+/// Traversal mark for citation-cycle detection.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum TraversalMark {
+    Visiting,
+    Done,
+}
+
 /// Validates the source-level citation graph: derived copies group under
 /// exact roots, circular citations fail, and edges to unrecorded handles fail
 /// as unresolved roots instead of being assumed.
-pub fn check_citation_graph(records: &BTreeMap<String, SourceRecord>) -> Result<(), PortfolioError> {
+pub fn check_citation_graph(
+    records: &BTreeMap<String, SourceRecord>,
+) -> Result<(), PortfolioError> {
     for (handle, record) in records {
         for edge in &record.cites {
             if !records.contains_key(edge) {
@@ -1107,35 +1115,30 @@ pub fn check_citation_graph(records: &BTreeMap<String, SourceRecord>) -> Result<
             }
         }
     }
-    #[derive(Clone, Copy, PartialEq, Eq)]
-    enum Mark {
-        Visiting,
-        Done,
-    }
-    let mut marks: BTreeMap<&str, Mark> = BTreeMap::new();
+    let mut marks: BTreeMap<&str, TraversalMark> = BTreeMap::new();
     for handle in records.keys() {
         let mut stack: Vec<(&str, bool)> = vec![(handle.as_str(), false)];
         while let Some((node, expanded)) = stack.pop() {
             if expanded {
-                marks.insert(node, Mark::Done);
+                marks.insert(node, TraversalMark::Done);
                 continue;
             }
             match marks.get(node) {
-                Some(Mark::Done) => continue,
-                Some(Mark::Visiting) => {
+                Some(TraversalMark::Done) => continue,
+                Some(TraversalMark::Visiting) => {
                     return Err(PortfolioError::CircularCitation {
                         field: "source.cites",
                     });
                 }
                 None => {}
             }
-            marks.insert(node, Mark::Visiting);
+            marks.insert(node, TraversalMark::Visiting);
             stack.push((node, true));
             if let Some(record) = records.get(node) {
                 for edge in &record.cites {
                     match marks.get(edge.as_str()) {
-                        Some(Mark::Done) => {}
-                        Some(Mark::Visiting) => {
+                        Some(TraversalMark::Done) => {}
+                        Some(TraversalMark::Visiting) => {
                             return Err(PortfolioError::CircularCitation {
                                 field: "source.cites",
                             });
@@ -1145,7 +1148,6 @@ pub fn check_citation_graph(records: &BTreeMap<String, SourceRecord>) -> Result<
                 }
             }
         }
-        let _ = handle;
     }
     Ok(())
 }
@@ -1168,11 +1170,7 @@ pub struct GradeDecision {
 /// excluded with an explanation; stale records cap at `ORIENTING`, partial
 /// records cap one rank below their own grade, and unverified transformations
 /// cap at `GROUNDED`. Unknown grades poison the ceiling to unknown.
-pub fn decide_grade(
-    records: &[&SourceRecord],
-    claim_domain: &str,
-    now_ms: i64,
-) -> GradeDecision {
+pub fn decide_grade(records: &[&SourceRecord], claim_domain: &str, now_ms: i64) -> GradeDecision {
     if records.is_empty() {
         return GradeDecision {
             ceiling: None,
@@ -1204,8 +1202,11 @@ pub fn decide_grade(
         };
         let mut capped = own;
         if record.is_stale_at(now_ms) {
-            capped = capped.min(0);
-            limits.push(format!("grade: source {} stale caps ORIENTING", record.handle));
+            capped = 0;
+            limits.push(format!(
+                "grade: source {} stale caps ORIENTING",
+                record.handle
+            ));
         }
         if record.acquisition == SourceDisposition::Partial {
             capped = capped.saturating_sub(1);
@@ -1232,10 +1233,7 @@ pub fn decide_grade(
             },
         };
     }
-    let ceiling = match weakest_ceiling(&ranks) {
-        Ok(ceiling) => ceiling,
-        Err(_) => None,
-    };
+    let ceiling = weakest_ceiling(&ranks).unwrap_or_default();
     if ceiling.is_none() && !limits.iter().any(|l| l.contains("unknown")) {
         limits.push("grade: unknown poisons ceiling".to_owned());
     }
@@ -1347,10 +1345,9 @@ impl CoverageAccount {
         for (member, (disposition, handle)) in &self.outcomes {
             if *disposition == SourceDisposition::Observed
                 && !self.exclusions.contains_key(member)
+                && let Some(handle) = handle
             {
-                if let Some(handle) = handle {
-                    handles.push(handle.clone());
-                }
+                handles.push(handle.clone());
             }
         }
         lineage.independent_support(&handles)
@@ -1370,11 +1367,11 @@ impl CoverageAccount {
     }
 
     fn canonical_into(&self, preimage: &mut String) {
-        preimage.push_str(&format!("expected={};", self.expected.len()));
+        push_count(preimage, "expected", self.expected.len());
         for member in &self.expected {
             push_field(preimage, "expected", member);
         }
-        preimage.push_str(&format!("outcomes={};", self.outcomes.len()));
+        push_count(preimage, "outcomes", self.outcomes.len());
         for (member, (disposition, handle)) in &self.outcomes {
             push_field(preimage, "member", member);
             push_field(preimage, "disposition", disposition.wire_name());
@@ -1382,7 +1379,7 @@ impl CoverageAccount {
                 push_field(preimage, "handle", handle);
             }
         }
-        preimage.push_str(&format!("exclusions={};", self.exclusions.len()));
+        push_count(preimage, "exclusions", self.exclusions.len());
         for (member, reason) in &self.exclusions {
             push_field(preimage, "excluded", member);
             push_field(preimage, "reason", reason);
@@ -1530,15 +1527,14 @@ fn parse_decimal(value: &str) -> Option<i128> {
         Some(parts) => parts,
         None => (unsigned, ""),
     };
-    if head.chars().any(|c| !c.is_ascii_digit())
-        || tail.chars().any(|c| !c.is_ascii_digit())
-    {
+    if head.chars().any(|c| !c.is_ascii_digit()) || tail.chars().any(|c| !c.is_ascii_digit()) {
         return None;
     }
     let scale = tail.len();
-    let mut scaled: i128 = head.parse::<i128>().ok()?.checked_mul(10i128.checked_pow(
-        u32::try_from(scale).ok()?,
-    )?)?;
+    let mut scaled: i128 = head
+        .parse::<i128>()
+        .ok()?
+        .checked_mul(10i128.checked_pow(u32::try_from(scale).ok()?)?)?;
     if !tail.is_empty() {
         scaled = scaled.checked_add(tail.parse::<i128>().ok()?)?;
     }
@@ -1596,9 +1592,7 @@ fn check_numeric(asserted: &str, supported: &str) -> bool {
 /// Checks one structured precision assertion. Unsupported precision,
 /// outside-manifest-style overreach and insufficient coverage remain typed
 /// residue; nothing is inferred.
-pub fn check_precision(
-    assertion: &PrecisionAssertion,
-) -> Result<(), UnsupportedPrecisionItem> {
+pub fn check_precision(assertion: &PrecisionAssertion) -> Result<(), UnsupportedPrecisionItem> {
     text(&assertion.asserted, "precision.asserted").map_err(|_| UnsupportedPrecisionItem {
         asserted: assertion.asserted.clone(),
         highest_supported: assertion.supported.clone(),
@@ -1957,7 +1951,7 @@ impl AuthorizedManifest {
             "denominator_digest",
             &params.denominator_digest,
         );
-        preimage.push_str(&format!("sources={};", params.sources.len()));
+        push_count(&mut preimage, "sources", params.sources.len());
         for (handle, (content, raw)) in &params.sources {
             push_field(&mut preimage, "source", handle);
             push_field(&mut preimage, "content", content);
@@ -1965,7 +1959,7 @@ impl AuthorizedManifest {
                 push_field(&mut preimage, "raw", raw);
             }
         }
-        preimage.push_str(&format!("edges={};", params.dependence_edges.len()));
+        push_count(&mut preimage, "edges", params.dependence_edges.len());
         for (from, to) in &params.dependence_edges {
             push_field(&mut preimage, "from", from);
             push_field(&mut preimage, "to", to);
@@ -2018,8 +2012,7 @@ impl AuthorizedManifest {
     /// Whether `handle` is citable under this manifest: allowlisted and not
     /// revoked or stale.
     pub fn allows(&self, handle: &str) -> bool {
-        self.allowlist.iter().any(|h| h == handle)
-            && !self.revoked.iter().any(|h| h == handle)
+        self.allowlist.iter().any(|h| h == handle) && !self.revoked.iter().any(|h| h == handle)
     }
 
     /// Canonical bytes of the frozen manifest shape (without the digest
@@ -2027,8 +2020,12 @@ impl AuthorizedManifest {
     pub fn canonical_bytes(&self) -> Vec<u8> {
         let mut preimage = String::from("authorized-manifest/v1;");
         push_field(&mut preimage, "inquiry_digest", &self.inquiry_digest);
-        push_field(&mut preimage, "denominator_digest", &self.denominator_digest);
-        preimage.push_str(&format!("sources={};", self.sources.len()));
+        push_field(
+            &mut preimage,
+            "denominator_digest",
+            &self.denominator_digest,
+        );
+        push_count(&mut preimage, "sources", self.sources.len());
         for (handle, (content, raw)) in &self.sources {
             push_field(&mut preimage, "source", handle);
             push_field(&mut preimage, "content", content);
@@ -2036,7 +2033,7 @@ impl AuthorizedManifest {
                 push_field(&mut preimage, "raw", raw);
             }
         }
-        preimage.push_str(&format!("edges={};", self.dependence_edges.len()));
+        push_count(&mut preimage, "edges", self.dependence_edges.len());
         for (from, to) in &self.dependence_edges {
             push_field(&mut preimage, "from", from);
             push_field(&mut preimage, "to", to);
@@ -2052,6 +2049,7 @@ impl AuthorizedManifest {
 /// accounting. Unsupported precision, outside-manifest references and
 /// insufficient coverage remain typed residue. Counterevidence and unknowns
 /// are preserved, never smoothed.
+#[allow(clippy::too_many_lines)]
 pub fn audit_claim(
     claim: &AuditedClaim,
     portfolio: &EvidencePortfolio,
@@ -2071,7 +2069,9 @@ pub fn audit_claim(
             continue;
         }
         let Some(record) = portfolio.records.get(handle) else {
-            residue.push(format!("claim: citation {handle} has no authoritative lineage"));
+            residue.push(format!(
+                "claim: citation {handle} has no authoritative lineage"
+            ));
             continue;
         };
         if !record.covers_domain(&claim.domain) {
@@ -2110,9 +2110,11 @@ pub fn audit_claim(
             ));
         }
     }
-    let counterevidence: Vec<String> = claim.counterclaim_ids.iter().cloned().collect();
-    let unknowns: Vec<String> = claim.unknown_refs.iter().cloned().collect();
-    let outside = residue.iter().any(|r| r.contains("outside frozen manifest"));
+    let counterevidence: Vec<String> = claim.counterclaim_ids.clone();
+    let unknowns: Vec<String> = claim.unknown_refs.clone();
+    let outside = residue
+        .iter()
+        .any(|r| r.contains("outside frozen manifest"));
     let precision_gap = residue.iter().any(|r| r.contains("unsupported precision"));
     let lineage_gap = residue
         .iter()
@@ -2123,7 +2125,7 @@ pub fn audit_claim(
     } else if !counterevidence.is_empty() {
         ClaimOutcome::Contradicted
     } else if !unknowns.is_empty()
-        || (claim.material && supporting.is_empty() && counterevidence.is_empty())
+        || (claim.material && claim.citations.is_empty() && counterevidence.is_empty())
     {
         ClaimOutcome::IncompleteAccounting
     } else if lineage_gap || precision_gap || support_gap {
@@ -2214,30 +2216,22 @@ impl PortfolioOutcome {
     /// outcome class. Only dispositions that may close an inquiry map to
     /// completion; every other disposition stays explicitly open.
     pub fn from_disposition(disposition: CompletionDisposition, detail: String) -> Self {
-        if disposition.may_close_inquiry() {
-            Self::Complete {
+        match disposition {
+            CompletionDisposition::AnsweredWithSupportedResult
+            | CompletionDisposition::NoMatchInCompleteScope => Self::Complete {
                 manifest_digest: detail,
-            }
-        } else {
-            match disposition {
-                CompletionDisposition::IncompleteCoverage
-                | CompletionDisposition::NoNewUsefulEvidence
-                | CompletionDisposition::StaleSourceOrIndex
-                | CompletionDisposition::SourceUnavailable
-                | CompletionDisposition::PolicyOrDisclosureDenied
-                | CompletionDisposition::Inconclusive => Self::Partial {
-                    omissions: vec![detail],
-                },
-                CompletionDisposition::Cancelled => Self::Cancelled {
-                    operation_id: detail,
-                },
-                CompletionDisposition::NoMatchInCompleteScope => Self::Complete {
-                    manifest_digest: detail,
-                },
-                CompletionDisposition::AnsweredWithSupportedResult => Self::Complete {
-                    manifest_digest: detail,
-                },
-            }
+            },
+            CompletionDisposition::Cancelled => Self::Cancelled {
+                operation_id: detail,
+            },
+            CompletionDisposition::IncompleteCoverage
+            | CompletionDisposition::NoNewUsefulEvidence
+            | CompletionDisposition::StaleSourceOrIndex
+            | CompletionDisposition::SourceUnavailable
+            | CompletionDisposition::PolicyOrDisclosureDenied
+            | CompletionDisposition::Inconclusive => Self::Partial {
+                omissions: vec![detail],
+            },
         }
     }
 }

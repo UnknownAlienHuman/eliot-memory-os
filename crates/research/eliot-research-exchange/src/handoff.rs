@@ -95,6 +95,18 @@ impl HandoffTerminal {
     pub const fn is_finished(self) -> bool {
         matches!(self, Self::Finished)
     }
+
+    /// Stable wire spelling of this terminal.
+    #[must_use]
+    pub const fn wire_name(self) -> &'static str {
+        match self {
+            Self::Finished => "FINISHED",
+            Self::PartialOpen => "PARTIAL_OPEN",
+            Self::CancelledClosed => "CANCELLED_CLOSED",
+            Self::FailedClosed => "FAILED_CLOSED",
+            Self::UnknownOpen => "UNKNOWN_OPEN",
+        }
+    }
 }
 
 /// Maps one completion disposition on one exchange status to its honest
@@ -154,6 +166,17 @@ pub enum IngestOutcome {
     ReplayDuplicate,
 }
 
+impl IngestOutcome {
+    /// Stable wire spelling of this outcome.
+    #[must_use]
+    pub const fn wire_name(self) -> &'static str {
+        match self {
+            Self::Accepted => "ACCEPTED",
+            Self::ReplayDuplicate => "REPLAY_DUPLICATE",
+        }
+    }
+}
+
 /// Directive after a timeout or disconnect: possible acquisition or spend is
 /// reconciled through its original operation, never blindly retried.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -165,6 +188,17 @@ pub enum ReconcileDirective {
     },
     /// The operation identity is unknown to this journal.
     UnknownOperation,
+}
+
+impl ReconcileDirective {
+    /// Stable wire spelling of this directive.
+    #[must_use]
+    pub const fn wire_name(&self) -> &'static str {
+        match self {
+            Self::ReconcileViaOriginal { .. } => "RECONCILE_VIA_ORIGINAL",
+            Self::UnknownOperation => "UNKNOWN_OPERATION",
+        }
+    }
 }
 
 /// Append-only journal ingesting each returned owner receipt exactly once
@@ -282,6 +316,11 @@ pub struct HandoffSeal {
     pub seal_digest: String,
 }
 
+fn push_count(preimage: &mut String, tag: &str, count: usize) {
+    use std::fmt::Write as _;
+    let _ = write!(preimage, "{tag}={count};");
+}
+
 fn push_field(preimage: &mut String, tag: &str, value: &str) {
     preimage.push_str(tag);
     preimage.push('=');
@@ -363,15 +402,15 @@ fn seal_preimage(
         &request.allowed_references.digest,
     );
     push_field(&mut preimage, "manifest_revision", manifest_revision);
-    preimage.push_str(&format!("cited={};", cited.len()));
+    push_count(&mut preimage, "cited", cited.len());
     for handle in &cited {
         push_field(&mut preimage, "cited", handle);
     }
-    preimage.push_str(&format!("sources={};", source_digests.len()));
+    push_count(&mut preimage, "sources", source_digests.len());
     for digest in &source_digests {
         push_field(&mut preimage, "source_digest", digest);
     }
-    preimage.push_str(&format!("statements={};", statement_digests.len()));
+    push_count(&mut preimage, "statements", statement_digests.len());
     for digest in &statement_digests {
         push_field(&mut preimage, "statement", digest);
     }
@@ -392,14 +431,10 @@ pub fn seal_handoff(
     manifest_revision: &str,
     expires_ms: i64,
 ) -> Result<HandoffSeal, HandoffError> {
-    if manifest_revision.trim().is_empty()
-        || manifest_revision.chars().any(char::is_control)
-    {
-        return Err(HandoffError::Contract(
-            ResearchContractError::InvalidText {
-                field: "handoff.manifest_revision",
-            },
-        ));
+    if manifest_revision.trim().is_empty() || manifest_revision.chars().any(char::is_control) {
+        return Err(HandoffError::Contract(ResearchContractError::InvalidText {
+            field: "handoff.manifest_revision",
+        }));
     }
     if expires_ms <= 0 {
         return Err(HandoffError::Contract(
@@ -407,13 +442,19 @@ pub fn seal_handoff(
         ));
     }
     request.validate().map_err(HandoffError::Contract)?;
-    bundle.validate_against(request).map_err(HandoffError::Contract)?;
+    bundle
+        .validate_against(request)
+        .map_err(HandoffError::Contract)?;
     for claim in &bundle.claims {
         for citation in &claim.citations {
-            if !bundle
+            let snapshot = bundle
                 .sources
                 .iter()
-                .any(|source| source.source_handle == citation.source_handle)
+                .find(|source| source.source_handle == citation.source_handle)
+                .ok_or(HandoffError::MissingSourceLineage)?;
+            if snapshot.title.trim().is_empty()
+                || snapshot.locator.trim().is_empty()
+                || snapshot.coverage.trim().is_empty()
             {
                 return Err(HandoffError::MissingSourceLineage);
             }
@@ -425,12 +466,7 @@ pub fn seal_handoff(
     let mut cited: Vec<String> = bundle
         .claims
         .iter()
-        .flat_map(|claim| {
-            claim
-                .citations
-                .iter()
-                .map(|c| c.source_handle.clone())
-        })
+        .flat_map(|claim| claim.citations.iter().map(|c| c.source_handle.clone()))
         .collect();
     cited.sort();
     cited.dedup();
@@ -492,7 +528,11 @@ impl<B: ResearchBridge> GovernedExchange<B> {
         manifest_revision: &str,
         expires_ms: i64,
     ) -> Result<HandoffSeal, HandoffError> {
-        let job = self.snapshot().jobs.get(job_id).ok_or(HandoffError::UnknownJob)?;
+        let job = self
+            .snapshot()
+            .jobs
+            .get(job_id)
+            .ok_or(HandoffError::UnknownJob)?;
         let result = job.result.as_ref().ok_or(HandoffError::InvalidTerminal)?;
         if !terminal_of(result.disposition, job.status).is_finished() {
             return Err(HandoffError::InvalidTerminal);
