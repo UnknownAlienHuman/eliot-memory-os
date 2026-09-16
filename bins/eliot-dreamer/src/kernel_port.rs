@@ -1075,6 +1075,72 @@ fn start_request(
     Ok(request)
 }
 
+/// Builds the typed `Status` observation for the claimed job.
+///
+/// The worker role admits `Status` as a pure observation (never a mutation):
+/// the operation binds the exact queued job/attempt/revision under the
+/// admitted fence with the `READ` effect class, and the reply carries no
+/// mutation disposition. The correlation identity rotates per call while the
+/// idempotency key stays derived from the grant, so an exact retry replays
+/// the same observation instead of mutating.
+fn status_request(
+    material: &ValidatedDreamerMaterial,
+    operation_id: &str,
+    now_unix_ms: u64,
+) -> Result<DurableJobRequest, KernelPortError> {
+    let contract = |error: DurableJobError| {
+        KernelPortError::Contract(truncate_detail(&error.to_string()))
+    };
+    let fence_json = serde_json::to_value(&material.fence)
+        .map_err(|error| KernelPortError::Contract(truncate_detail(&error.to_string())))?;
+    let operation_value = serde_json::json!({
+        "operation": "STATUS",
+        "job_id": material.job_id,
+        "attempt_id": material.attempt_id,
+        "expected_revision": material.revision,
+        "expected_fence": fence_json,
+    });
+    let operation: JobOperation = serde_json::from_value(operation_value).map_err(|error| {
+        KernelPortError::Contract(format!(
+            "dreamer status claim shape failed: {}",
+            truncate_detail(&error.to_string())
+        ))
+    })?;
+    let identity_value = serde_json::json!({
+        "request": transport_identity_value(&fence_json, operation_id, now_unix_ms)?,
+        "operation": {
+            "operation_id": operation_id,
+            "request_id": operation_id,
+            "idempotency_key": format!("{}:status", material.grant.idempotency_key),
+            "operation_kind": "STATUS",
+            "effect": "READ",
+            "state_fence": fence_json,
+        },
+        "canonical_request_hash": "0".repeat(64),
+    });
+    let mut identity: DurableRequestIdentity =
+        serde_json::from_value(identity_value).map_err(|error| {
+            KernelPortError::Contract(format!(
+                "dreamer status identity shape failed: {}",
+                truncate_detail(&error.to_string())
+            ))
+        })?;
+    identity.canonical_request_hash = DurableRequestIdentity::digest_for(
+        &identity.operation,
+        &identity.request,
+        &operation,
+        JobRole::Worker,
+    )
+    .map_err(&contract)?;
+    let request = DurableJobRequest {
+        request_identity: identity,
+        role: JobRole::Worker,
+        operation,
+    };
+    request.validate().map_err(&contract)?;
+    Ok(request)
+}
+
 /// Frames one validated claim request for the K2 Dreamer route: the closed
 /// operation string plus the fenced store context under `context` and the
 /// full typed K0 request under `request`.
@@ -1190,6 +1256,30 @@ pub(crate) fn claim_once<T: ClaimTransport>(
         )));
     }
     Ok(started)
+}
+
+/// Observes the Kernel-proved disposition of the claimed job.
+///
+/// Runs only after [`claim_once`]: the `Status` observation binds the exact
+/// claimed job/attempt/revision/fence, proves liveness without effects, and
+/// preserves the exact terminal or reconciling disposition the Kernel
+/// reports. A refused or unbound reply fails closed and never invents a view.
+pub(crate) fn status_once<T: ClaimTransport>(
+    material: &ValidatedDreamerMaterial,
+    transport: &mut T,
+) -> Result<DurableJobResponse, KernelPortError> {
+    let short = short_digest(&material.grant.grant_digest);
+    let operation_id = format!("dreamer-status-{short}");
+    let now_unix_ms = unix_ms()?;
+    let request = status_request(material, &operation_id, now_unix_ms)?;
+    transport.bind_identity(&material.fence, &operation_id)?;
+    let payload = dreamer_payload(
+        &request,
+        &format!("{operation_id}-ctx"),
+        now_unix_ms,
+    )?;
+    let reply = transport.transact(DREAMER_JOB_WIRE_ID, payload)?;
+    checked_response(reply, &request)
 }
 
 #[cfg(test)]
@@ -1360,6 +1450,16 @@ mod tests {
                 let lease = self.lease_projection(request)?;
                 return Self::lease_json(request, &lease);
             }
+            if kind == "STATUS" {
+                // A status observation replays the claimed lease pin with no
+                // mutation disposition and no owner receipt: pure readback.
+                let lease = self.lease_projection(request)?;
+                let mut response = Self::lease_json(request, &lease)?;
+                response["state"] = serde_json::Value::String("RUNNING".to_owned());
+                response["disposition"] = serde_json::Value::Null;
+                response["receipt_id"] = serde_json::Value::Null;
+                return Ok(response);
+            }
             let JobOperation::Start { lease, .. } = &request.operation else {
                 return Err("fake transport start requires the claimed lease".to_owned());
             };
@@ -1399,12 +1499,18 @@ mod tests {
                 if self.calls.iter().any(|call| call == "LEASE_EXACT") {
                     return Err(denied("fake transport refuses a second worker claim".to_owned()));
                 }
-            } else if kind != eliot_protocol::dreamer_job::JobOperationKind::Start {
+            } else if kind == eliot_protocol::dreamer_job::JobOperationKind::Start {
+                if !self.calls.iter().any(|call| call == "LEASE_EXACT") {
+                    return Err(denied("fake transport refuses Start before LeaseExact".to_owned()));
+                }
+            } else if kind == eliot_protocol::dreamer_job::JobOperationKind::Status {
+                if !self.calls.iter().any(|call| call == "START_JOB") {
+                    return Err(denied("fake transport refuses Status before Start".to_owned()));
+                }
+            } else {
                 return Err(denied(
-                    "fake transport admits only LeaseExact then Start".to_owned(),
+                    "fake transport admits only LeaseExact then Start then Status".to_owned(),
                 ));
-            } else if !self.calls.iter().any(|call| call == "LEASE_EXACT") {
-                return Err(denied("fake transport refuses Start before LeaseExact".to_owned()));
             }
             self.calls.push(kind_name.clone());
             self.answer(&request, &kind_name).map_err(denied)
@@ -1460,6 +1566,82 @@ mod tests {
             Err(error) => Err(format!("second claim must fence at the transport, got {error}")),
             Ok(_) => Err("second claim must never start a second worker".to_owned()),
         }
+    }
+
+    /// A staged claim drives `Status` only after `Start`: the observation
+    /// binds the exact claimed job/attempt/revision, carries no mutation
+    /// disposition, replays with identical identity, and refuses before the
+    /// claim completes.
+    #[test]
+    fn staged_claim_status_confirms_running_job() -> Result<(), String> {
+        let live = test_epoch(7)?;
+        let path = stage_material(&valid_envelope_value()?)?;
+        let material = read_material_from(&path, &live)
+            .map_err(|error| error.to_string())?
+            .ok_or_else(|| "staged material must validate".to_owned())?;
+        let now_unix_ms = unix_ms().map_err(|error| error.to_string())?;
+        let mut transport = FakeClaimTransport::fresh(now_unix_ms);
+        let started = claim_once(&material, &mut transport).map_err(|error| error.to_string())?;
+        if started.state != ProtocolJobState::Running {
+            return Err("claim must project the running job".to_owned());
+        }
+        let observed = status_once(&material, &mut transport).map_err(|error| error.to_string())?;
+        if transport.calls != ["LEASE_EXACT", "START_JOB", "STATUS"] {
+            return Err(format!(
+                "claim must run LeaseExact then Start then Status in order, observed {:?}",
+                transport.calls,
+            ));
+        }
+        if observed.state != ProtocolJobState::Running {
+            return Err("status must confirm the running job".to_owned());
+        }
+        if observed.job_id.as_str() != material.job_id
+            || observed.attempt_id.as_str() != material.attempt_id
+            || observed.revision != material.revision
+        {
+            return Err("status must bind the exact claimed job identity".to_owned());
+        }
+        if observed.disposition.is_some() {
+            return Err("status is a pure observation and must carry no mutation disposition".to_owned());
+        }
+        let replayed =
+            status_once(&material, &mut transport).map_err(|error| error.to_string())?;
+        if replayed.revision != observed.revision || replayed.state != observed.state {
+            return Err("exact status replay must return the same checkpoint identity".to_owned());
+        }
+        let mut unclaimed = FakeClaimTransport::fresh(now_unix_ms);
+        match status_once(&material, &mut unclaimed) {
+            Err(KernelPortError::Transport(_)) => Ok(()),
+            Err(error) => Err(format!("status before start must fence at the transport, got {error}")),
+            Ok(_) => Err("status before start must never observe an unclaimed job".to_owned()),
+        }
+    }
+
+    /// Frozen worker-role capability boundary the adapter relies on: the
+    /// child claim port may lease, start, and observe, but cancel origination
+    /// stays Kernel-owned (`RequestCancel` is Requester/Controller-only) and
+    /// semantic submit stays Requester-owned. Consumes the protocol
+    /// projection read-only; pins the assumption so a protocol drift fails
+    /// here instead of silently widening the child.
+    #[test]
+    fn worker_role_capability_freeze() -> Result<(), String> {
+        use eliot_protocol::dreamer_job::{JobOperationKind, JobRole};
+        for kind in [
+            JobOperationKind::LeaseExact,
+            JobOperationKind::Start,
+            JobOperationKind::Status,
+            JobOperationKind::Reconcile,
+        ] {
+            if !JobRole::Worker.permits(kind) {
+                return Err(format!("worker role must admit {kind} on the claim port"));
+            }
+        }
+        for kind in [JobOperationKind::Submit, JobOperationKind::RequestCancel] {
+            if JobRole::Worker.permits(kind) {
+                return Err(format!("worker role must never originate {kind} from the child"));
+            }
+        }
+        Ok(())
     }
 
     fn corrupt_blank_job(value: &mut serde_json::Value) {
