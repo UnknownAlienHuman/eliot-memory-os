@@ -278,6 +278,14 @@ fn rebind_policy(input: &mut eliot_dreamer_contracts::FailureInput, policy: &eli
 fn rebind_job_digest(input: &mut eliot_dreamer_contracts::FailureInput) {
     let digest = digest_hex(&canonical_bytes(&input.job).expect("job bytes"));
     input.item.job_digest = digest;
+    let item_digest = input
+        .item
+        .item_digest(&input.grounded)
+        .expect("item digest recomputes");
+    input.screen.item_digest = item_digest.clone();
+    if let Some(binding) = input.request.screen_binding.as_mut() {
+        binding.item_digest = item_digest;
+    }
 }
 
 fn rebind_history(input: &mut eliot_dreamer_contracts::FailureInput) {
@@ -941,4 +949,240 @@ fn proof_30_extinction_condition_expiry_required() {
     input.validate().expect("expiry validates");
     let with_expiry = call(&input, &policy).expect("expiry executes");
     assert_eq!(with_expiry.result.proposal.lifecycle.expiry_ms, Some(1_000));
+}
+
+// WORK_UNIT_CASE: 663/31
+#[test]
+fn proof_31_absent_instrumentation_no_extinction() {
+    let (mut input, policy) = prepared();
+    input.history.coverage = FailureCoverage::Unknown;
+    input.action_evidence.coverage = FailureCoverage::Partial;
+    input.action_evidence.outcome.coverage = FailureCoverage::Partial;
+    input.action_evidence.outcome.failure_state = Some(FailureObservationState::UnknownOutcome);
+    rebind_outcome(&mut input);
+    rebind_history(&mut input);
+    input.validate().expect("absent instrumentation validates");
+    let decision = call(&input, &policy).expect("absent path executes");
+    assert_eq!(decision.assessment.outcome, OutcomeAssessment::UnknownOutcome);
+    assert_ne!(decision.result.disposition, FailureDisposition::Extinguished);
+    assert_ne!(decision.result.disposition, FailureDisposition::Stale);
+    assert_eq!(decision.result.disposition, FailureDisposition::Partial);
+}
+
+// WORK_UNIT_CASE: 663/32
+#[test]
+fn proof_32_extinction_retains_history() {
+    let (mut input, policy) = prepared();
+    input.proposal.lifecycle.raw_history_refs =
+        vec!["history-failed".to_owned(), "history-control".to_owned()];
+    input.validate().expect("raw history refs validate");
+    let decision = call(&input, &policy).expect("retention executes");
+    assert_eq!(decision.result.input.history.entries.len(), 2);
+    assert_eq!(decision.result.proposal.history.entries.len(), 2);
+    assert!(decision
+        .result
+        .rollback
+        .raw_history_refs
+        .contains(&"history-failed".to_owned()));
+    assert!(decision.result.validate_against(&input).is_ok());
+}
+
+// WORK_UNIT_CASE: 663/33
+#[test]
+fn proof_33_exact_duplicate_idempotent_replay() {
+    let (input, policy) = prepared();
+    let first = call(&input, &policy).expect("first executes");
+    let second = call(&input, &policy).expect("second executes");
+    assert_eq!(first, second);
+    assert_eq!(first.decision_id, second.decision_id);
+    assert_eq!(first.output_digest, second.output_digest);
+    let mut dup = input.clone();
+    let digest = first.assessment.current_trigger_digest.clone();
+    dup.history.entries[0].fingerprint_id = dup.proposal.fingerprint.clone();
+    dup.history.entries[0].trigger_digest = digest;
+    dup.history.entries[0].near_match = false;
+    rebind_history(&mut dup);
+    dup.validate().expect("duplicate history validates");
+    let with_dup = call(&dup, &policy).expect("duplicate executes");
+    assert_eq!(with_dup.assessment.counts.history_trigger_match_count, 1);
+    let replay = call(&dup, &policy).expect("duplicate replay executes");
+    assert_eq!(with_dup, replay);
+}
+
+// WORK_UNIT_CASE: 663/34
+#[test]
+fn proof_34_narrowing_refinement_with_predecessor() {
+    let (mut input, policy) = prepared();
+    let predecessor = "ab".repeat(32);
+    input.proposal.lifecycle.predecessor_fingerprint = Some(predecessor.clone());
+    input.proposal.lifecycle.current_fingerprint_revision = "r2".to_owned();
+    input.validate().expect("predecessor validates");
+    let decision = call(&input, &policy).expect("predecessor executes");
+    assert_eq!(decision.result.rollback.predecessor, Some(predecessor));
+    assert_eq!(
+        decision.result.proposal.lifecycle.current_fingerprint_revision,
+        "r2"
+    );
+    assert!(decision.result.validate_against(&input).is_ok());
+}
+
+// WORK_UNIT_CASE: 663/35
+#[test]
+fn proof_35_unsupported_broadening() {
+    let (mut input, policy) = prepared();
+    input.proposal.comparison.comparator = FailureComparator::Unsupported;
+    input.proposal.comparison.definition.comparator = FailureComparator::Unsupported;
+    // Recompute the retained definition bytes so the join still validates and
+    // the assessment reaches Unsupported on semantic grounds, not on a
+    // malformed envelope.
+    let rebuilt = eliot_dreamer_contracts::FailureProfileDefinition::from_parts(
+        input.proposal.comparison.definition.owner.clone(),
+        input.proposal.comparison.definition.profile_id.clone(),
+        input.proposal.comparison.definition.schema_version,
+        input.proposal.comparison.definition.revision.clone(),
+        FailureComparator::Unsupported,
+        input
+            .proposal
+            .comparison
+            .definition
+            .descriptors
+            .clone(),
+        input.proposal.comparison.definition.source_handle.clone(),
+    )
+    .expect("unsupported definition rebuilds");
+    let old_digest = input.proposal.comparison.definition.definition_digest.clone();
+    let old_handle = input.proposal.comparison.definition.source_handle.clone();
+    input.proposal.comparison.definition = rebuilt;
+    for member in input.source_members.iter_mut() {
+        if member.handle == old_handle {
+            member.bytes = input.proposal.comparison.definition.definition_bytes.clone();
+            member.digest = input.proposal.comparison.definition.definition_digest.clone();
+        }
+    }
+    for material in input.bundle.materials.iter_mut() {
+        if material.handle == old_handle {
+            material.digest = input.proposal.comparison.definition.definition_digest.clone();
+            material.bytes = input.proposal.comparison.definition.definition_bytes.len() as u64;
+        }
+    }
+    assert_ne!(old_digest, input.proposal.comparison.definition.definition_digest);
+    input.validate().expect("unsupported profile validates");
+    let decision = call(&input, &policy).expect("unsupported executes");
+    assert_eq!(decision.assessment.trigger, TriggerAssessment::Unsupported);
+    assert_eq!(decision.result.disposition, FailureDisposition::Unsupported);
+    assert!(!decision.assessment.supports_candidate());
+}
+
+// WORK_UNIT_CASE: 663/36
+#[test]
+fn proof_36_contradictory_history_preserved() {
+    let (input, policy) = prepared();
+    let decision = call(&input, &policy).expect("contradiction executes");
+    assert_eq!(decision.assessment.counts.success_count, 1);
+    assert_eq!(decision.assessment.counts.semantic_success_count, 1);
+    assert_eq!(decision.result.input.history.entries.len(), 2);
+    let failed = decision
+        .result
+        .input
+        .history
+        .entries
+        .iter()
+        .find(|e| !e.semantic_success)
+        .expect("failed entry retained");
+    let success = decision
+        .result
+        .input
+        .history
+        .entries
+        .iter()
+        .find(|e| e.semantic_success)
+        .expect("success entry retained");
+    assert_ne!(failed.fingerprint_id, success.fingerprint_id);
+    assert!(decision.result.validate_against(&input).is_ok());
+}
+
+// WORK_UNIT_CASE: 663/37
+#[test]
+fn proof_37_extinguished_no_silent_reactivation() {
+    let (input, policy) = prepared();
+    let baseline = call(&input, &policy).expect("baseline executes");
+    assert_eq!(baseline.assessment.counts.history_trigger_match_count, 0);
+    // A new invariant yields a new trigger digest without matching history:
+    // the old fingerprint is retained, never silently reactivated.
+    let mut changed = input.clone();
+    changed.proposal.violated_invariant = "fp-new-invariant".to_owned();
+    changed.validate().expect("new invariant validates");
+    let other = call(&changed, &policy).expect("new invariant executes");
+    assert_ne!(baseline.decision_id, other.decision_id);
+    assert_ne!(
+        baseline.assessment.current_trigger_digest,
+        other.assessment.current_trigger_digest
+    );
+    assert_eq!(other.assessment.counts.history_trigger_match_count, 0);
+    assert_eq!(other.result.input.history.entries.len(), 2);
+}
+
+// WORK_UNIT_CASE: 663/38
+#[test]
+fn proof_38_repair_handoff_only() {
+    let (input, policy) = prepared();
+    let decision = call(&input, &policy).expect("handoff executes");
+    assert!(decision.result.rollback.note.contains("candidate-only"));
+    assert_eq!(
+        decision.result.proof_ceiling,
+        eliot_receipts::ProofCeiling::CandidateArtifact
+    );
+    assert_ne!(decision.result.disposition, FailureDisposition::Blocked);
+    assert!(decision.result.validate_against(&input).is_ok());
+}
+
+// WORK_UNIT_CASE: 663/39
+#[test]
+fn proof_39_seven_preservation_dimensions_no_a05_invoke() {
+    let (input, policy) = prepared();
+    let decision = call(&input, &policy).expect("preservation executes");
+    assert_eq!(decision.result.preservation.verdicts.len(), 7);
+    assert_eq!(decision.result.final_preservation.verdicts.len(), 7);
+    assert_eq!(input.preservation, input.proposal.preservation);
+    assert_eq!(input.item.receipt.validator_contract, "a05-validator");
+    let replay = call(&input, &policy).expect("replay executes");
+    assert_eq!(decision, replay);
+}
+
+// WORK_UNIT_CASE: 663/40
+#[test]
+fn proof_40_partial_budget_deadline_cancellation() {
+    let (input, policy) = prepared();
+    let mut cancelled = policy.clone();
+    cancelled.cancellation_requested = true;
+    let cancelled = resealed_policy(cancelled);
+    let mut cancelled_input = input.clone();
+    rebind_policy(&mut cancelled_input, &cancelled);
+    cancelled_input
+        .validate()
+        .expect("cancellation input validates");
+    let decision =
+        call(&cancelled_input, &cancelled).expect("cancellation executes");
+    assert_eq!(decision.result.disposition, FailureDisposition::Cancelled);
+    assert_eq!(
+        decision.result.common_disposition,
+        CandidateDisposition::Abstention
+    );
+    let (mut input, policy) = prepared();
+    input.job.budget.candidates = Some(0);
+    rebind_job_digest(&mut input);
+    // Zero candidates authorizes no work: the envelope itself is rejected,
+    // and the handler independently refuses with a Budget error (no panic).
+    assert!(matches!(
+        call(&input, &policy),
+        Err(ContractViolation::Budget { .. })
+    ));
+    let (mut input, policy) = prepared();
+    input.job.deadline_ms = Some(1_000);
+    rebind_job_digest(&mut input);
+    input.validate().expect("deadline input validates as envelope");
+    assert!(matches!(
+        call(&input, &policy),
+        Err(ContractViolation::Budget { .. })
+    ));
 }
