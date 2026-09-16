@@ -1591,11 +1591,10 @@ fn atomic_switch_moves_admission_target() {
     let mut oracle = passing_oracle();
     let widening = replacement_record_with_extra(2, 'd', Some(1), Some(digest('e')));
     assert_eq!(
-        facade.prepare_replacement(
-            &replacement_prepare("op-17-wide", 1, widening),
-            &mut oracle,
-        ),
-        Err(ReplacementError::IncompatibleCandidate("limit-widening".to_owned()))
+        facade.prepare_replacement(&replacement_prepare("op-17-wide", 1, widening), &mut oracle,),
+        Err(ReplacementError::IncompatibleCandidate(
+            "limit-widening".to_owned()
+        ))
     );
     assert_eq!(oracle.calls, 0);
     must(facade.prepare_replacement(

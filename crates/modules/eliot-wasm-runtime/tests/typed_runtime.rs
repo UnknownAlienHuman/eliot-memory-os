@@ -302,7 +302,9 @@ fn barrier_controlled_concurrent_acquisition_and_single_switch() {
                     .downcast_ref::<String>()
                     .cloned()
                     .or_else(|| {
-                        payload.downcast_ref::<&str>().map(|message| (*message).to_owned())
+                        payload
+                            .downcast_ref::<&str>()
+                            .map(|message| (*message).to_owned())
                     })
                     .unwrap_or_else(|| "non-string panic payload".to_owned());
                 panic!("acquirer {index} failed: {detail}");
