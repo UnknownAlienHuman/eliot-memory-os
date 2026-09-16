@@ -159,30 +159,58 @@ pub fn is_forbidden_import(module: &str, name: &str) -> bool {
         .any(|forbidden| module.contains(forbidden) || name.contains(forbidden))
 }
 
-/// Lists every import of a WebAssembly binary without executing it.
+/// Lists every host-facing import of a WebAssembly binary without executing it.
+///
+/// Both encodings are accepted: a core module (its `ImportSection`) and a
+/// component (its top-level `ComponentImportSection`). Component-level imports
+/// are the host capability surface; nested core-module imports are
+/// intra-component wiring satisfied inside the component, not host grants, so
+/// the gate deliberately does not descend into them.
 pub fn list_wasm_imports(wasm_bytes: &[u8]) -> Result<Vec<WasmImport>, DescriptorError> {
-    if wasm_bytes.len() < 8
-        || wasm_bytes[0..4] != [0x00, 0x61, 0x73, 0x6D]
-        || wasm_bytes[4..8] != [0x01, 0x00, 0x00, 0x00]
-    {
+    if wasm_bytes.len() < 8 || wasm_bytes[0..4] != [0x00, 0x61, 0x73, 0x6D] {
         return Err(DescriptorError::NotWasm);
     }
     let parser = wasmparser::Parser::new(0);
     let mut imports = Vec::new();
     for payload in parser.parse_all(wasm_bytes) {
         let payload = payload.map_err(|error| DescriptorError::Unreadable(error.to_string()))?;
-        if let wasmparser::Payload::ImportSection(reader) = payload {
-            for import in reader.into_imports() {
-                let import =
-                    import.map_err(|error| DescriptorError::Unreadable(error.to_string()))?;
-                imports.push(WasmImport {
-                    module: import.module.to_owned(),
-                    name: import.name.to_owned(),
-                });
+        match payload {
+            wasmparser::Payload::ImportSection(reader) => {
+                for import in reader.into_imports() {
+                    let import =
+                        import.map_err(|error| DescriptorError::Unreadable(error.to_string()))?;
+                    imports.push(WasmImport {
+                        module: import.module.to_owned(),
+                        name: import.name.to_owned(),
+                    });
+                }
             }
+            wasmparser::Payload::ComponentImportSection(reader) => {
+                for import in reader {
+                    let import =
+                        import.map_err(|error| DescriptorError::Unreadable(error.to_string()))?;
+                    imports.push(WasmImport {
+                        module: import.name.name.to_owned(),
+                        name: component_kind_name(&import.ty).to_owned(),
+                    });
+                }
+            }
+            _ => {}
         }
     }
     Ok(imports)
+}
+
+/// Stable kind label for one component import type reference.
+fn component_kind_name(reference: &wasmparser::ComponentTypeRef) -> &'static str {
+    match reference {
+        wasmparser::ComponentTypeRef::Module(_) => "core-module",
+        wasmparser::ComponentTypeRef::Func(_) => "func",
+        wasmparser::ComponentTypeRef::Value(_) => "value",
+        wasmparser::ComponentTypeRef::Type(_) => "type",
+        wasmparser::ComponentTypeRef::Instance(_) => "instance",
+        wasmparser::ComponentTypeRef::Component(_) => "component",
+    }
 }
 
 /// Rejects artifacts importing a forbidden capability before execution.
