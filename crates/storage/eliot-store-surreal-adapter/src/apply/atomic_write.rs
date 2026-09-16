@@ -651,7 +651,10 @@ pub(crate) fn erasure_transaction_bindings(
         "state_fence": intent.state_fence,
         "operation_count": intent.surfaces.len(),
     });
-    bindings.insert("erasure_table".to_owned(), json!("erasure_intent"));
+    bindings.insert(
+        "erasure_table".to_owned(),
+        json!(schema::table::ERASURE_INTENT),
+    );
     bindings.insert(
         "erasure_operation_id".to_owned(),
         json!(erasure_intent_record_id(&intent.operation_id)),
@@ -702,7 +705,10 @@ pub(crate) fn erasure_transaction_bindings(
         "operation_id": intent.operation_id,
         "outcomes": outcome_strings,
     });
-    bindings.insert("erasure_outcome_table".to_owned(), json!("erasure_outcome"));
+    bindings.insert(
+        "erasure_outcome_table".to_owned(),
+        json!(schema::table::ERASURE_OUTCOME),
+    );
     bindings.insert(
         "erasure_outcome_id".to_owned(),
         json!(erasure_outcome_record_id(&intent.operation_id)),
@@ -806,7 +812,10 @@ async fn read_erasure_outcome(
     operation_id: &str,
 ) -> Result<Option<Vec<SurrealSurfaceOutcome>>, AdapterError> {
     let mut bindings = Map::new();
-    bindings.insert("erasure_outcome_table".to_owned(), json!("erasure_outcome"));
+    bindings.insert(
+        "erasure_outcome_table".to_owned(),
+        json!(schema::table::ERASURE_OUTCOME),
+    );
     bindings.insert(
         "erasure_outcome_id".to_owned(),
         json!(erasure_outcome_record_id(operation_id)),
