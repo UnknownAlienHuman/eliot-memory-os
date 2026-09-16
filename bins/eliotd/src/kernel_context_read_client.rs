@@ -296,7 +296,7 @@ impl KernelContextReadClient {
     ) -> Result<QueryResult, ReadError> {
         let selectors = Self::check_local_read_capability(envelope, tool)?;
         if envelope.state_fence != *admitted_fence {
-            return Err(ReadError::Store(StoreError::FenceMismatch.to_string()));
+            return Err(ReadError::Store(StoreError::FenceMismatch.into()));
         }
         let ctx = local_read_context(admitted_fence)?;
         let result = reads
