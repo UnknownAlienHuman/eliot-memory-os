@@ -5,7 +5,7 @@ edition = "2024"
 rust-version = "1.94"
 license = "MIT"
 publish = false
-description = "Measure exact UTF-8 bytes for one canonical rendered context payload without STU fallback or fabricated tokenizer observation."
+description = "Sole serialized-context measurement owner: exact UTF-8 bytes with normative STU=ceil(bytes/3), immutable observation validation and unit-compatible capacity/error analysis."
 
 [lib]
 path = "src/lib.rs"

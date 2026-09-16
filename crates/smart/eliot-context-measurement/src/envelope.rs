@@ -24,10 +24,7 @@ impl SerializerIdentity {
     /// Validate identity texts, options-digest shape and supported revision.
     pub fn validate(&self) -> Result<(), ContextError> {
         validate_identity_text(&self.serializer_id, "measurement.serializer_id")?;
-        validate_identity_text(
-            &self.serializer_version,
-            "measurement.serializer_version",
-        )?;
+        validate_identity_text(&self.serializer_version, "measurement.serializer_version")?;
         validate_digest(
             &self.serializer_options_digest,
             "measurement.serializer_options_digest",
@@ -49,10 +46,7 @@ pub struct ValidatedEnvelope {
 }
 
 /// Validate bounded identity text: bounded length, non-blank, no controls.
-pub(crate) fn validate_identity_text(
-    value: &str,
-    field: &'static str,
-) -> Result<(), ContextError> {
+pub(crate) fn validate_identity_text(value: &str, field: &'static str) -> Result<(), ContextError> {
     if value.len() > MAX_IDENTITY_TEXT_BYTES {
         return Err(ContextError::Bounds { field });
     }

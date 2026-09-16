@@ -130,8 +130,7 @@ pub fn measure_exact_utf8(
             field: "measurement.max_serialized_bytes",
         });
     }
-    let rendered =
-        u64::try_from(payload.len()).map_err(|_| ContextError::Overflow)?;
+    let rendered = u64::try_from(payload.len()).map_err(|_| ContextError::Overflow)?;
     if rendered > MAX_MEASUREMENT_BYTES {
         return Err(ContextError::Bounds {
             field: "measurement.rendered_bytes",
@@ -147,10 +146,7 @@ pub fn measure_exact_utf8(
     params.context.validate()?;
     params.capacity.validate()?;
     preflight_text(&params.serializer_id, "measurement.serializer_id")?;
-    preflight_text(
-        &params.serializer_version,
-        "measurement.serializer_version",
-    )?;
+    preflight_text(&params.serializer_version, "measurement.serializer_version")?;
     preflight_text(&params.route_id, "measurement.route_id")?;
     preflight_text(&params.model_id, "measurement.model_id")?;
     let measurement = SerializedContextMeasurement {
@@ -171,9 +167,7 @@ pub fn measure_exact_utf8(
         output_reserve: params.capacity.output_reserve,
         review_reserve: params.capacity.review_reserve,
         false_safe_overflow: params.false_safe_overflow.clone(),
-        false_rejection_or_decomposition: params
-            .false_rejection_or_decomposition
-            .clone(),
+        false_rejection_or_decomposition: params.false_rejection_or_decomposition.clone(),
         valid_until: params.valid_until.clone(),
     };
     measurement.validate()?;
@@ -282,7 +276,7 @@ pub struct SerializedContextInputs {
 /// Complete result of one serialized-context measurement: the exact A-15
 /// value plus the package-local observation, capacity, error and receipt
 /// analysis.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ContextMeasurement {
     /// Exact A-15 measurement value (status always `ExactUtf8`).
     pub measurement: SerializedContextMeasurement,
@@ -304,6 +298,100 @@ pub struct ContextMeasurement {
     pub receipt_digest: String,
 }
 
+/// Collect every identity role bound in one call for duplicate checks.
+fn collect_identity_roles(inputs: &SerializedContextInputs) -> Vec<(&'static str, &ArtifactId)> {
+    let mut roles = vec![("measurement.measurement_id", &inputs.measurement_id)];
+    if let ObservationInput::Exact(exact) = &inputs.observation {
+        roles.extend(exact.identity_roles());
+    }
+    if let Some(policy) = &inputs.capacity.stu_to_token {
+        roles.push(("capacity.policy_id", &policy.policy_id));
+    }
+    for (field, id) in [
+        (
+            "measurement.false_safe_overflow",
+            &inputs.false_safe_overflow,
+        ),
+        (
+            "measurement.false_rejection_or_decomposition",
+            &inputs.false_rejection_or_decomposition,
+        ),
+        ("measurement.valid_until", &inputs.valid_until),
+    ] {
+        if let Some(id) = id {
+            roles.push((field, id));
+        }
+    }
+    roles
+}
+
+/// Assemble the deterministic receipt input from every load-bearing field.
+fn build_receipt_input(
+    inputs: &SerializedContextInputs,
+    envelope: &ValidatedEnvelope,
+    stu: u64,
+    observed: &ValidatedObservation,
+    analysis: &CapacityAnalysis,
+    error: &ErrorAnalysis,
+) -> ReceiptInput {
+    let policy = inputs.capacity.stu_to_token.as_ref();
+    ReceiptInput {
+        measurement_id: inputs.measurement_id.as_str().to_owned(),
+        contract_revision: CONTEXT_CONTRACT_VERSION.to_string(),
+        envelope_digest: envelope.digest.clone(),
+        byte_len: envelope.byte_len,
+        stu,
+        serializer_id: inputs.serializer.serializer_id.clone(),
+        serializer_version: inputs.serializer.serializer_version.clone(),
+        serializer_options_digest: inputs.serializer.serializer_options_digest.clone(),
+        route_id: inputs.route.route_id.clone(),
+        provider_id: inputs.route.provider_id.clone(),
+        model_id: inputs.route.model_id.clone(),
+        tokenizer_id: inputs.tokenizer.tokenizer_id.clone(),
+        tokenizer_version: inputs.tokenizer.tokenizer_version.clone(),
+        tokenizer_hash: inputs.tokenizer.tokenizer_hash.clone(),
+        tokenizer_config_digest: inputs.tokenizer.tokenizer_config_digest.clone(),
+        estimator_id: inputs.estimator.estimator_id.clone(),
+        estimator_revision: inputs.estimator.estimator_revision.clone(),
+        estimator_empirical: inputs.estimator.empirical,
+        candidate_digests: inputs.estimator.candidate_digests.clone(),
+        capacity_unit: unit_as_str(inputs.capacity.unit),
+        route_capacity: inputs.capacity.route_capacity,
+        reserves: [
+            inputs.capacity.fixed_overhead,
+            inputs.capacity.output_reserve,
+            inputs.capacity.review_reserve,
+            inputs.capacity.tool_reserve,
+            inputs.capacity.verifier_reserve,
+            inputs.capacity.decision_tail_reserve,
+        ],
+        policy_id: policy.map(|policy| policy.policy_id.as_str().to_owned()),
+        policy_digest: policy.map(|policy| policy.policy_digest.clone()),
+        policy_numer: policy.map(|policy| policy.tokens_per_stu_numer),
+        policy_denom: policy.map(|policy| policy.tokens_per_stu_denom),
+        observation_status: observed.status.as_str(),
+        source: observed.source.map(ObservationSource::as_str),
+        observed_tokens: observed.tokens,
+        observation_id: observed
+            .observation_id
+            .as_ref()
+            .map(|id| id.as_str().to_owned()),
+        rewrite_kind: observed
+            .rewrite
+            .as_ref()
+            .map(|rewrite| rewrite.kind.as_str()),
+        rewrite_evidence: observed
+            .rewrite
+            .as_ref()
+            .map(|rewrite| rewrite.evidence_digest.clone()),
+        estimated_total: analysis.estimated_total,
+        estimated_fit: analysis.fit,
+        observed_total: analysis.observed_total,
+        observed_fit: analysis.observed_fit,
+        false_safe: error.false_safe_overflow,
+        false_reject: error.false_reject_or_decomposition,
+    }
+}
 /// Reject identity reuse across distinct roles in one call.
 ///
 /// Roles are compared in sorted role order so the reported duplicate is
@@ -363,37 +451,13 @@ pub fn measure_serialized_context(
         serializer: &inputs.serializer,
     };
     let observed = validate_observation(&inputs.observation, &expectation)?;
-    let mut roles = vec![("measurement.measurement_id", &inputs.measurement_id)];
-    if let ObservationInput::Exact(exact) = &inputs.observation {
-        roles.extend(exact.identity_roles());
-    }
-    if let Some(policy) = &inputs.capacity.stu_to_token {
-        roles.push(("capacity.policy_id", &policy.policy_id));
-    }
-    for (field, id) in [
-        ("measurement.false_safe_overflow", &inputs.false_safe_overflow),
-        (
-            "measurement.false_rejection_or_decomposition",
-            &inputs.false_rejection_or_decomposition,
-        ),
-        ("measurement.valid_until", &inputs.valid_until),
-    ] {
-        if let Some(id) = id {
-            roles.push((field, id));
-        }
-    }
-    check_distinct_identities(&roles)?;
+    check_distinct_identities(&collect_identity_roles(inputs))?;
     let stu = stu_for_bytes(envelope.byte_len)?;
-    let analysis = analyze_capacity(
-        &inputs.capacity,
-        envelope.byte_len,
-        stu,
-        observed.tokens,
-    )?;
+    let analysis = analyze_capacity(&inputs.capacity, envelope.byte_len, stu, observed.tokens)?;
     let error = analyze_error(
-        analysis.estimated_total,
+        analysis.estimated_cost,
         analysis.fit,
-        analysis.observed_total,
+        analysis.observed_cost,
         analysis.observed_fit,
     );
     let tokenizer = match observed.status {
@@ -426,63 +490,13 @@ pub fn measure_serialized_context(
         output_reserve: inputs.capacity.output_reserve,
         review_reserve: inputs.capacity.review_reserve,
         false_safe_overflow: inputs.false_safe_overflow.clone(),
-        false_rejection_or_decomposition: inputs
-            .false_rejection_or_decomposition
-            .clone(),
+        false_rejection_or_decomposition: inputs.false_rejection_or_decomposition.clone(),
         valid_until: inputs.valid_until.clone(),
     };
     measurement.validate()?;
-    let policy = inputs.capacity.stu_to_token.as_ref();
-    let receipt = receipt_digest(&ReceiptInput {
-        measurement_id: inputs.measurement_id.as_str().to_owned(),
-        contract_revision: CONTEXT_CONTRACT_VERSION.to_string(),
-        envelope_digest: envelope.digest.clone(),
-        byte_len: envelope.byte_len,
-        stu,
-        serializer_id: inputs.serializer.serializer_id.clone(),
-        serializer_version: inputs.serializer.serializer_version.clone(),
-        serializer_options_digest: inputs.serializer.serializer_options_digest.clone(),
-        route_id: inputs.route.route_id.clone(),
-        provider_id: inputs.route.provider_id.clone(),
-        model_id: inputs.route.model_id.clone(),
-        tokenizer_id: inputs.tokenizer.tokenizer_id.clone(),
-        tokenizer_version: inputs.tokenizer.tokenizer_version.clone(),
-        tokenizer_hash: inputs.tokenizer.tokenizer_hash.clone(),
-        tokenizer_config_digest: inputs.tokenizer.tokenizer_config_digest.clone(),
-        estimator_id: inputs.estimator.estimator_id.clone(),
-        estimator_revision: inputs.estimator.estimator_revision.clone(),
-        estimator_empirical: inputs.estimator.empirical,
-        candidate_digests: inputs.estimator.candidate_digests.clone(),
-        capacity_unit: unit_as_str(inputs.capacity.unit),
-        route_capacity: inputs.capacity.route_capacity,
-        reserves: [
-            inputs.capacity.fixed_overhead,
-            inputs.capacity.output_reserve,
-            inputs.capacity.review_reserve,
-            inputs.capacity.tool_reserve,
-            inputs.capacity.verifier_reserve,
-            inputs.capacity.decision_tail_reserve,
-        ],
-        policy_id: policy.map(|policy| policy.policy_id.as_str().to_owned()),
-        policy_digest: policy.map(|policy| policy.policy_digest.clone()),
-        policy_numer: policy.map(|policy| policy.tokens_per_stu_numer),
-        policy_denom: policy.map(|policy| policy.tokens_per_stu_denom),
-        observation_status: observed.status.as_str(),
-        source: observed.source.map(ObservationSource::as_str),
-        observed_tokens: observed.tokens,
-        observation_id: observed
-            .observation_id
-            .as_ref()
-            .map(|id| id.as_str().to_owned()),
-        rewrite_kind: observed.rewrite.as_ref().map(|rewrite| rewrite.kind.as_str()),
-        rewrite_evidence: observed.rewrite.as_ref().map(|rewrite| rewrite.evidence_digest.clone()),
-        estimated_total: analysis.estimated_total,
-        estimated_fit: analysis.fit,
-        observed_total: analysis.observed_total,
-        observed_fit: analysis.observed_fit,
-        false_safe: error.false_safe_overflow,
-        false_reject: error.false_reject_or_decomposition,
-    });
+    let receipt = receipt_digest(&build_receipt_input(
+        inputs, &envelope, stu, &observed, &analysis, &error,
+    ));
     Ok(ContextMeasurement {
         measurement,
         stu,
