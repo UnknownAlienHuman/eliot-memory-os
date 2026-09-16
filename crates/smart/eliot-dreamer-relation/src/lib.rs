@@ -249,6 +249,10 @@ fn evaluate_semantics(
 /// A-05 pre-handler receipt, bundle, screen and usage); it is validated
 /// intrinsically and never re-executed. The accepted-item seam is crossed only
 /// by [`seal_relation`] after the candidate has been assembled.
+// The eight-argument arity is the canonical contract: seven decomposed typed
+// records plus the eligibility reference. Bundling them would reintroduce
+// the bundled-input predecessor this form replaces.
+#[allow(clippy::too_many_arguments)]
 pub fn propose_relation(
     validated: &ValidatedCurationItem,
     draft: &GroundedRelationDraft,
