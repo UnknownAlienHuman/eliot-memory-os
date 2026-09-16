@@ -11,6 +11,38 @@ use super::{
 };
 
 #[cfg(windows)]
+// F-LOG-HOST-5 (#980) inner-phase observations for previous projection.
+//
+// Through the #889 facade only
+// (`crate::host_diagnostics::observe_entrypoint_with_detail`); the Event Log
+// seam stays typed-Unavailable
+// (`crate::windows_event_log::event_log_sink_status`), never implemented here
+// (#984 still open).
+//
+// Observation-only contract (mirrors `host_composition_phase_b.rs:30-41`):
+// every call projects a boundary already decided by the semantic owner.
+// Arguments are static literals only — no digests, bytes, paths, or error
+// text are formatted, so no secret material can cross (I15.4) and no extra
+// evaluation runs on the semantic path. Sink outcome never alters result,
+// order, or cleanup. No terminal emission here: one terminal per failed
+// operation stays with the outermost contour (`lib.rs` `HostTerminalGuard` /
+// `host-phase-b-unknown`), while these inner phases correlate by stage order
+// only. A mismatch retains its typed `RecoveryRequired` cause.
+#[cfg(windows)]
+fn phase_b_previous_projection_note_event_log_unavailable() {
+    let _ = crate::windows_event_log::event_log_sink_status();
+}
+
+#[cfg(windows)]
+fn phase_b_previous_projection_observe(detail: &str) {
+    phase_b_previous_projection_note_event_log_unavailable();
+    crate::host_diagnostics::observe_entrypoint_with_detail(
+        crate::host_diagnostics::EntrypointStage::ScmDispatch,
+        detail,
+    );
+}
+
+#[cfg(windows)]
 pub(super) fn phase_b_live_installation_epoch(host: &HostInstallationEpoch) -> InstallationEpoch {
     InstallationEpoch {
         installation: host.installation.clone(),
@@ -134,6 +166,7 @@ pub(super) fn phase_b_previous_config_digest(
     previous_eliotd_digest: Option<&PlatformHandle>,
     provisioned_supervision_authority: &ProvisionedSupervisionAuthority,
 ) -> Result<Option<PlatformHandle>, HostError> {
+    phase_b_previous_projection_observe("host.phase-b prior-projection requested");
     let lease = phase_b_open_existing(profile, portable_root, path)?;
     lease.verify().map_err(HostError::RecoveryRequired)?;
     let current = phase_b_lease_bytes(&lease)?;
@@ -146,12 +179,14 @@ pub(super) fn phase_b_previous_config_digest(
         return Ok(None);
     }
     let previous = previous.ok_or_else(|| {
+        phase_b_previous_projection_observe("host.phase-b prior-projection mismatch retained");
         HostError::RecoveryRequired(
             "Store config is neither the immutable Phase-A template nor an exact prior Phase-B contour"
                 .to_owned(),
         )
     })?;
     let current_value = serde_json::from_slice::<serde_json::Value>(&current).map_err(|error| {
+        phase_b_previous_projection_observe("host.phase-b prior-projection mismatch retained");
         HostError::RecoveryRequired(format!("prior Store config is not valid JSON: {error}"))
     })?;
     if current_value
@@ -163,6 +198,7 @@ pub(super) fn phase_b_previous_config_digest(
             provisioned_supervision_authority,
         )?
     {
+        phase_b_previous_projection_observe("host.phase-b prior-projection mismatch retained");
         return Err(HostError::RecoveryRequired(
             "prior Store config is not the exact previous Host materialization".to_owned(),
         ));
@@ -180,6 +216,7 @@ pub(super) fn phase_b_previous_eliotd_digest(
     template_bytes: &[u8],
     previous: Option<&PhaseBPreviousBinding>,
 ) -> Result<Option<PlatformHandle>, HostError> {
+    phase_b_previous_projection_observe("host.phase-b prior-projection requested");
     let lease = phase_b_open_existing(profile, portable_root, path)?;
     lease.verify().map_err(HostError::RecoveryRequired)?;
     let current = phase_b_lease_bytes(&lease)?;
@@ -192,6 +229,7 @@ pub(super) fn phase_b_previous_eliotd_digest(
         return Ok(None);
     }
     let previous = previous.ok_or_else(|| {
+        phase_b_previous_projection_observe("host.phase-b prior-projection mismatch retained");
         HostError::RecoveryRequired(
             "eliotd descriptor is neither the immutable Phase-A template nor an exact prior Phase-B contour"
                 .to_owned(),
@@ -199,6 +237,7 @@ pub(super) fn phase_b_previous_eliotd_digest(
     })?;
     let mut expected: EliotdLaunchDescriptor =
         serde_json::from_slice(template_bytes).map_err(|error| {
+            phase_b_previous_projection_observe("host.phase-b prior-projection mismatch retained");
             HostError::RecoveryRequired(format!(
                 "prior eliotd descriptor is not parseable: {error}"
             ))
@@ -210,11 +249,13 @@ pub(super) fn phase_b_previous_eliotd_digest(
         .map_err(|error| HostError::ProcessContour(error.to_string()))?;
     let current_descriptor: EliotdLaunchDescriptor =
         serde_json::from_slice(&current).map_err(|error| {
+            phase_b_previous_projection_observe("host.phase-b prior-projection mismatch retained");
             HostError::RecoveryRequired(format!(
                 "prior eliotd descriptor is not parseable: {error}"
             ))
         })?;
     if current_descriptor != expected {
+        phase_b_previous_projection_observe("host.phase-b prior-projection mismatch retained");
         return Err(HostError::RecoveryRequired(
             "prior eliotd descriptor is not the exact previous Host materialization".to_owned(),
         ));
@@ -238,6 +279,7 @@ pub(super) fn phase_b_previous_bootstrap_digest(
     launch_nonce: &PlatformHandle,
     previous: Option<&PhaseBPreviousBinding>,
 ) -> Result<Option<PlatformHandle>, HostError> {
+    phase_b_previous_projection_observe("host.phase-b prior-projection requested");
     let Some(previous) = previous else {
         return Ok(None);
     };
@@ -301,6 +343,7 @@ pub(super) fn phase_b_previous_bootstrap_digest(
         .map_err(|error| HostError::ProcessContour(error.to_string()))?;
     let current_requirement: HostStoreBootstrapRequirement = serde_json::from_slice(&current)
         .map_err(|error| {
+            phase_b_previous_projection_observe("host.phase-b prior-projection mismatch retained");
             HostError::RecoveryRequired(format!("prior Store bootstrap is not parseable: {error}"))
         })?;
     if current_requirement != expected
@@ -308,6 +351,7 @@ pub(super) fn phase_b_previous_bootstrap_digest(
         || expected.state_fence != previous.authority.state_fence
         || expected.store_generation != previous.authority.generation
     {
+        phase_b_previous_projection_observe("host.phase-b prior-projection mismatch retained");
         return Err(HostError::RecoveryRequired(
             "prior Store bootstrap is not the exact previous Host materialization".to_owned(),
         ));

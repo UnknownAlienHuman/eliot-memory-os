@@ -1,0 +1,9 @@
+{
+  "stages": { "scm_dispatch": "scm_dispatch" },
+  "entrypoint_event": "host.entrypoint_stage",
+  "terminal_event": "host.terminal_error",
+  "terminal_code": "host-phase-b-unknown",
+  "inner": "host.phase-b prior-projection mismatch retained",
+  "canaries": ["password", "secret=", "ownership_key", "CredentialSecret", ".expose()", "BEGIN PRIVATE", "token="],
+  "stdout_protocol_contamination": false
+}

@@ -16,6 +16,39 @@ use super::{
 };
 
 #[cfg(windows)]
+// F-LOG-HOST-5 (#980) inner-phase observations for previous authority.
+//
+// Through the #889 facade only
+// (`crate::host_diagnostics::observe_entrypoint_with_detail`); the Event Log
+// seam stays typed-Unavailable
+// (`crate::windows_event_log::event_log_sink_status`), never implemented here
+// (#984 still open).
+//
+// Observation-only contract (mirrors `host_composition_phase_b.rs:30-41`):
+// every call projects a boundary already decided by the semantic owner.
+// Arguments are static literals only — no digests, paths, bytes, or error
+// text are formatted, so no secret material can cross (I15.4) and no extra
+// evaluation runs on the semantic path. Sink outcome never alters result,
+// order, or cleanup. No terminal emission here: one terminal per failed
+// operation stays with the outermost contour (`lib.rs` `HostTerminalGuard` /
+// `host-phase-b-unknown`), while these inner phases correlate by stage order
+// only. A prior receipt is historical evidence only, never a live
+// authorization.
+#[cfg(windows)]
+fn phase_b_previous_authority_note_event_log_unavailable() {
+    let _ = crate::windows_event_log::event_log_sink_status();
+}
+
+#[cfg(windows)]
+fn phase_b_previous_authority_observe(detail: &str) {
+    phase_b_previous_authority_note_event_log_unavailable();
+    crate::host_diagnostics::observe_entrypoint_with_detail(
+        crate::host_diagnostics::EntrypointStage::ScmDispatch,
+        detail,
+    );
+}
+
+#[cfg(windows)]
 #[derive(Clone, Debug)]
 pub(super) struct PhaseBPreviousBinding {
     pub(super) host: HostInstallationEpoch,
@@ -63,6 +96,7 @@ pub(super) fn phase_b_observe_previous_binding(
     portable_root: Option<&UserOwnedRootLease>,
     authority_path: &Path,
 ) -> Result<Option<PhaseBPreviousBinding>, HostError> {
+    phase_b_previous_authority_observe("host.phase-b previous authority requested");
     let lease = match std::fs::symlink_metadata(authority_path) {
         Ok(_) => phase_b_open_existing(
             manifest.runtime_launch.profile,
@@ -71,26 +105,43 @@ pub(super) fn phase_b_observe_previous_binding(
         )?,
         Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
         Err(error) => {
+            phase_b_previous_authority_observe(
+                "host.phase-b previous authority no exact binding retained",
+            );
             return Err(HostError::RecoveryRequired(format!(
                 "Phase-B previous authority cannot be observed: {error}"
             )));
         }
     };
-    lease.verify().map_err(HostError::RecoveryRequired)?;
+    lease.verify().map_err(|error| {
+        phase_b_previous_authority_observe(
+            "host.phase-b previous authority no exact binding retained",
+        );
+        HostError::RecoveryRequired(error)
+    })?;
     let bytes = phase_b_lease_bytes(&lease)?;
     let authority: ProcessAuthorityHandoffDescriptor =
         serde_json::from_slice(&bytes).map_err(|error| {
+            phase_b_previous_authority_observe(
+                "host.phase-b previous authority no exact binding retained",
+            );
             HostError::RecoveryRequired(format!(
                 "Phase-B previous authority descriptor is not parseable: {error}"
             ))
         })?;
     authority.validate_structure().map_err(|error| {
+        phase_b_previous_authority_observe(
+            "host.phase-b previous authority no exact binding retained",
+        );
         HostError::RecoveryRequired(format!(
             "Phase-B previous authority descriptor failed exact ORS validation: {error}"
         ))
     })?;
     let manifest_digest = phase_b_manifest_digest(manifest)?;
     if authority.state_fence.resource_generation != authority.generation {
+        phase_b_previous_authority_observe(
+            "host.phase-b previous authority no exact binding retained",
+        );
         return Err(HostError::RecoveryRequired(
             "Phase-B previous authority has an inconsistent live resource generation".to_owned(),
         ));
@@ -104,6 +155,9 @@ pub(super) fn phase_b_observe_previous_binding(
         )
     });
     let Some((previous_host_epoch, previous_nonce, previous_activation_generation)) = marker else {
+        phase_b_previous_authority_observe(
+            "host.phase-b previous authority no exact binding retained",
+        );
         return Err(HostError::RecoveryRequired(
             "Phase-B previous authority has no exact prior Host binding".to_owned(),
         ));
@@ -116,6 +170,9 @@ pub(super) fn phase_b_observe_previous_binding(
     }
     let authority_digest = PlatformHandle::new(format!("{:x}", Sha256::digest(&bytes)))
         .map_err(|error| HostError::Platform(error.to_string()))?;
+    phase_b_previous_authority_observe(
+        "host.phase-b previous authority historical evidence observed",
+    );
     Ok(Some(PhaseBPreviousBinding {
         host: HostInstallationEpoch {
             installation: host.installation.clone(),
@@ -136,12 +193,16 @@ pub(super) fn phase_b_validate_durable_previous_binding(
     observed: &PhaseBPreviousBinding,
     durable: &PhaseBLiveBinding,
 ) -> Result<(), HostError> {
+    phase_b_previous_authority_observe("host.phase-b previous authority requested");
     let observed_nonce_digest = phase_b_bytes_digest(observed.host.nonce.as_str().as_bytes())?;
     if observed.authority_digest != durable.authority_descriptor_digest
         || observed.host.epoch.current.lineage_id.as_str() != durable.host_epoch_lineage.as_str()
         || observed.host.epoch.current.sequence.get() != durable.host_epoch_sequence
         || observed_nonce_digest != durable.host_process_nonce_digest
     {
+        phase_b_previous_authority_observe(
+            "host.phase-b previous authority no exact binding retained",
+        );
         return Err(HostError::RecoveryRequired(
             "Phase-B destination marker does not match the durable committed Phase-B binding"
                 .to_owned(),
@@ -165,13 +226,20 @@ pub(super) fn phase_b_validate_authority(
     ),
     HostError,
 > {
+    phase_b_previous_authority_observe("host.phase-b previous authority requested");
     let descriptor: ProcessAuthorityHandoffDescriptor =
         serde_json::from_slice(bytes).map_err(|error| {
+            phase_b_previous_authority_observe(
+                "host.phase-b previous authority no exact binding retained",
+            );
             HostError::RecoveryRequired(format!(
                 "Phase-B authority descriptor is not parseable: {error}"
             ))
         })?;
     descriptor.validate_structure().map_err(|error| {
+        phase_b_previous_authority_observe(
+            "host.phase-b previous authority no exact binding retained",
+        );
         HostError::RecoveryRequired(format!(
             "Phase-B authority descriptor failed exact ORS validation: {error}"
         ))
@@ -203,6 +271,9 @@ pub(super) fn phase_b_validate_authority(
         .is_same_authority(&host.epoch.current)
         || descriptor.state_fence.resource_generation != descriptor.generation
     {
+        phase_b_previous_authority_observe(
+            "host.phase-b previous authority no exact binding retained",
+        );
         return Err(HostError::RecoveryRequired(
             "Phase-B authority descriptor is not bound to a consistent live generation and Host epoch"
                 .to_owned(),
@@ -216,6 +287,9 @@ pub(super) fn phase_b_validate_authority(
         .iter()
         .any(|reference| reference == &marker)
     {
+        phase_b_previous_authority_observe(
+            "host.phase-b previous authority no exact binding retained",
+        );
         return Err(HostError::RecoveryRequired(
             "Phase-B authority descriptor is missing the exact Host/activation binding".to_owned(),
         ));
