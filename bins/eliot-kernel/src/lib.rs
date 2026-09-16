@@ -2822,8 +2822,7 @@ impl KernelComposition {
                     drain
                         .as_ref()
                         .err()
-                        .map(|halt| halt.reason)
-                        .unwrap_or("shutdown-incomplete")
+                        .map_or("shutdown-incomplete", |halt| halt.reason)
                         .to_owned(),
                 );
             }
