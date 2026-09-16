@@ -172,15 +172,15 @@ pub fn export_matches_interface(export_name: &str, interface: &str) -> bool {
     if export_name == interface {
         return true;
     }
-    if let Some((_, tail)) = export_name.rsplit_once('/') {
-        if tail == interface {
-            return true;
-        }
+    if let Some((_, tail)) = export_name.rsplit_once('/')
+        && tail == interface
+    {
+        return true;
     }
-    if let Some((_, tail)) = export_name.rsplit_once(':') {
-        if tail == interface {
-            return true;
-        }
+    if let Some((_, tail)) = export_name.rsplit_once(':')
+        && tail == interface
+    {
+        return true;
     }
     false
 }
