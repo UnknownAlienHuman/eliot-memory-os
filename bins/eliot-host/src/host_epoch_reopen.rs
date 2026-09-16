@@ -9,6 +9,31 @@ use super::{
     fresh_host_epoch, fresh_identity, fresh_lineage_id, initial_activation_record, root_epoch,
 };
 
+// F-LOG-HOST-6 (#981) epoch-reopen observation helpers.
+//
+// Through the #889 facade only
+// (`crate::host_diagnostics::observe_entrypoint_with_detail`); the Event Log
+// seam stays typed-Unavailable
+// (`crate::windows_event_log::event_log_sink_status`), never implemented here
+// (#984 still open).
+//
+// Observation-only contract: every helper projects facts already produced by
+// the semantic owner. Arguments are static literals only — never epochs,
+// digests, installation handles, or arbitrary error text — so bounding
+// limits size, not sensitivity (I15.4). These primitives own no terminal: a
+// single terminal per failed open operation is enforced by the outermost
+// `Host::open` boundary in `lib.rs` (#891, `host-open-failed`), while these
+// phases correlate by stage order only. Replayed committed state is observed
+// as readback, never as a second effect. Sink outcome never alters
+// result/order/cleanup.
+fn host_epoch_observe(detail: &str) {
+    let _ = crate::windows_event_log::event_log_sink_status();
+    crate::host_diagnostics::observe_entrypoint_with_detail(
+        crate::host_diagnostics::EntrypointStage::Startup,
+        detail,
+    );
+}
+
 pub(super) fn reopen_existing_epoch<B: JournalBackend>(
     current: HostStateJournalService<B>,
     last_host: &HostInstallationEpoch,
@@ -26,7 +51,9 @@ pub(super) fn reopen_existing_epoch<B: JournalBackend>(
     ),
     HostError,
 > {
+    host_epoch_observe("host.epoch reopen existing requested");
     if last_host.installation != *installation {
+        host_epoch_observe("host.epoch install mismatch observed");
         return Err(HostError::OwnerLeaseRecovery(
             "Host journal installation identity does not match admission".to_owned(),
         ));
@@ -42,6 +69,7 @@ pub(super) fn reopen_existing_epoch<B: JournalBackend>(
         }
     }
     let replayed = current.snapshot()?;
+    host_epoch_observe("host.epoch pending reconcile observed");
     // An exact unresolved Store recovery contour outranks the shutdown marker:
     // a Host crash can occur between any two durable publications, and a
     // clean marker is never permission to attach a lost kill-on-close Job.
@@ -54,12 +82,14 @@ pub(super) fn reopen_existing_epoch<B: JournalBackend>(
     } else {
         StoreRecoveryStartupFence::Clear
     };
+    host_epoch_observe("host.epoch reopen fence observed");
     let active_phase_b_rebind_recovery = active_phase_b_rebind_recovery_kind(active_phase_b_rebind);
     if pending.is_none()
         && active_phase_b_rebind.is_none()
         && replayed.clean_marker.is_none()
         && !store_recovery_startup_fence.is_fenced()
     {
+        host_epoch_observe("host.epoch unclean observed");
         return Err(HostError::OwnerLeaseRecovery(
             "current Host journal epoch is unclean; explicit new-lineage recovery is required"
                 .to_owned(),
@@ -99,6 +129,13 @@ pub(super) fn reopen_existing_epoch<B: JournalBackend>(
     } else {
         child_host_epoch(last_host)?
     };
+    if store_recovery_startup_fence.is_fenced()
+        || pending.is_some_and(|pending| pending.phase_b_prepared.is_some())
+    {
+        host_epoch_observe("host.epoch owner epoch retained");
+    } else {
+        host_epoch_observe("host.epoch owner child epoch observed");
+    }
     let backend = current.into_backend()?;
     Ok((
         HostStateJournalService::from_backend(backend, host.clone())?,
@@ -116,6 +153,7 @@ pub(super) fn persist_pending_recovery(
     pending: &eliot_installation::PendingActivation,
     reason: &str,
 ) -> Result<(), HostError> {
+    host_epoch_observe("host.epoch pending recovery requested");
     let expected_revision = registry.revision();
     let expected_post_revision = if registry.pending_activation().is_some_and(|current| {
         current.approval == pending.approval
@@ -165,15 +203,28 @@ pub(super) fn persist_pending_recovery(
                 )
         });
     *registry = durable;
+    host_epoch_observe("host.epoch recovery readback observed");
     match outcome {
-        Ok(()) if exact_readback => Ok(()),
-        Ok(()) => Err(HostError::RecoveryRequired(format!(
-            "{reason}; recovery disposition succeeded but exact registry readback failed"
-        ))),
-        Err(_error) if exact_readback => Ok(()),
-        Err(error) => Err(HostError::RecoveryRequired(format!(
-            "{reason}; durable recovery disposition failed and exact readback did not confirm it: {error}"
-        ))),
+        Ok(()) if exact_readback => {
+            host_epoch_observe("host.epoch recovery exact readback confirmed");
+            Ok(())
+        }
+        Ok(()) => {
+            host_epoch_observe("host.epoch recovery readback mismatch observed");
+            Err(HostError::RecoveryRequired(format!(
+                "{reason}; recovery disposition succeeded but exact registry readback failed"
+            )))
+        }
+        Err(_error) if exact_readback => {
+            host_epoch_observe("host.epoch recovery exact readback confirmed");
+            Ok(())
+        }
+        Err(error) => {
+            host_epoch_observe("host.epoch recovery disposition failed observed");
+            Err(HostError::RecoveryRequired(format!(
+                "{reason}; durable recovery disposition failed and exact readback did not confirm it: {error}"
+            )))
+        }
     }
 }
 
@@ -195,7 +246,9 @@ pub(super) fn open_production_epoch(
     ),
     HostError,
 > {
+    host_epoch_observe("host.epoch production open requested");
     let backend = RedbJournalBackend::open_at(path).map_err(JournalError::Backend)?;
+    host_epoch_observe("host.epoch backend open observed");
     open_production_epoch_from_backend(
         backend,
         installation,
@@ -228,6 +281,7 @@ pub(super) fn open_production_epoch_from_backend(
         .epochs
         .last()
         .map(|epoch| epoch.host.clone());
+    host_epoch_observe("host.epoch last host observed");
 
     let (
         journal,
@@ -266,6 +320,11 @@ pub(super) fn open_production_epoch_from_backend(
         } else {
             fresh_identity("activation")?
         };
+        if store_recovery_startup_fence.is_fenced() {
+            host_epoch_observe("host.epoch activation retained");
+        } else {
+            host_epoch_observe("host.epoch activation fresh observed");
+        }
         (
             journal,
             host,
@@ -275,6 +334,7 @@ pub(super) fn open_production_epoch_from_backend(
             active_phase_b_rebind_recovery,
         )
     } else if !store_recovery_fences.is_empty() {
+        host_epoch_observe("host.epoch fence without prior observed");
         return Err(HostError::RecoveryRequired(
             "Store recovery fence has no prior Host epoch; manual new-lineage recovery is required"
                 .to_owned(),
@@ -290,7 +350,9 @@ pub(super) fn open_production_epoch_from_backend(
             ActivePhaseBRebindRecoveryKind::None,
         )
     };
-    if !store_recovery_startup_fence.is_fenced() {
+    if store_recovery_startup_fence.is_fenced() {
+        host_epoch_observe("host.epoch activation replay observed");
+    } else {
         append_reconciled(
             &journal,
             HostStateRecord::Activation(initial_activation_record(
@@ -301,6 +363,7 @@ pub(super) fn open_production_epoch_from_backend(
                 "host-open",
             )?),
         )?;
+        host_epoch_observe("host.epoch activation appended");
     }
     Ok((
         journal,
