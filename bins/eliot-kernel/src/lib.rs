@@ -71,6 +71,11 @@ use process_execution::{
     authorize_process_owner, project_store_snapshot, run_process_start,
 };
 pub use process_execution_client::process_execution_client;
+pub(crate) use shutdown_drain::{
+    DRAIN_RECEIPT_DEADLINE, DrainCommitDecision, DrainHalt, DrainWakeDisposition,
+    ShutdownDrainCoordinator, ShutdownPhase, ShutdownTerminal, coordinator_for,
+    reverse_quiescence_order,
+};
 #[cfg(windows)]
 pub use supervision_lease_authority::{
     KernelSupervisionLeaseAuthority, ProtectedSupervisionLeaseSigner,
@@ -118,6 +123,7 @@ mod native_worker_replay_route;
 pub mod notify_operation_identity;
 mod provider_capability_route;
 mod runtime_identity;
+mod shutdown_drain;
 use daemon_session_guard::caller_binding;
 #[cfg(all(windows, test))]
 use daemon_supervision::EliotdSupervisionSuccessorEvidence;
@@ -2776,15 +2782,288 @@ impl KernelComposition {
         Ok(())
     }
 
-    /// Completes the bounded cooperative-then-forced shutdown sequence.
+    /// Completes the ordered I14.23 safe-shutdown sequence through the
+    /// Kernel-owned persisted drain state machine.
+    ///
+    /// Phases run in order: close admissions (`Draining`), revoke authority,
+    /// checkpoint jobs, reconcile canonical-write receipts against a bounded
+    /// deadline, flush ORS staged rows, quiesce modules in reverse dependency
+    /// order, prove the canonical-data lease-zero precondition, linearize the
+    /// `DrainCommit` decision, stop the service, poison the generation
+    /// gateway, and publish the terminal. Any gate failure — including
+    /// deadline expiry with pending work — records an incomplete-shutdown
+    /// terminal retaining the pending work instead of discarding it, while
+    /// runtime shutdown still proceeds. Host carries the linearized decision
+    /// into `DrainCommitRecord`; Watchdog observes it through the journal.
     pub async fn shutdown(&self) -> Result<ShutdownOutcome, ProcessExecutionError> {
+        let coordinator = coordinator_for(&self.work_root);
+        coordinator.request_shutdown();
+        let drain = self.run_shutdown_drain(&coordinator).await;
         let process_result = self
             .process_gateway
             .as_ref()
             .map_or(Ok(()), |gateway| gateway.executor.shutdown());
         let runtime_outcome = self.runtime.shutdown().await;
+        let mut pending = drain
+            .as_ref()
+            .err()
+            .map_or(Vec::new(), |halt| halt.pending.clone());
+        if process_result.is_err() {
+            pending.push("process-gateway-shutdown-failed".to_owned());
+        }
+        if !runtime_outcome.no_orphans {
+            pending.push("runtime-orphans-retained".to_owned());
+        }
+        if drain.is_ok() && pending.is_empty() {
+            coordinator.complete_terminal(ShutdownTerminal::Intentional);
+        } else {
+            if pending.is_empty() {
+                pending.push(
+                    drain
+                        .as_ref()
+                        .err()
+                        .map_or("shutdown-incomplete", |halt| halt.reason)
+                        .to_owned(),
+                );
+            }
+            coordinator.complete_terminal(ShutdownTerminal::Incomplete { pending });
+        }
+        coordinator.observe_published_state();
         process_result?;
         Ok(runtime_outcome)
+    }
+
+    /// Runs the ordered pre-terminal drain phases and returns the linearized
+    /// `DrainCommit` decision. Every failure retains its pending work in the
+    /// returned halt for the incomplete-shutdown terminal.
+    #[allow(
+        clippy::too_many_lines,
+        reason = "the ordered I14.23 drain phases keep one visible admission-to-linearization boundary"
+    )]
+    async fn run_shutdown_drain(
+        &self,
+        coordinator: &Arc<shutdown_drain::ShutdownDrainCoordinator>,
+    ) -> Result<DrainCommitDecision, DrainHalt> {
+        let generation = coordinator.drain_generation();
+        let resumed_note = coordinator
+            .recovery_interrupted()
+            .then_some(":resumed-interrupted");
+        let record = |phase: ShutdownPhase, evidence: String| {
+            coordinator
+                .record_phase(phase, evidence)
+                .map_err(|_| DrainHalt::new("phase-record-rejected"))
+        };
+
+        // AdmissionsClosed: the service gate closes normal admission; the
+        // frame-dispatch Ready gate denies new work from `Draining` on.
+        match self.apply_control(KernelControlCommand::Drain) {
+            Ok(state) => record(
+                ShutdownPhase::AdmissionsClosed,
+                format!(
+                    "service-drain-admitted:{state}{}",
+                    resumed_note.unwrap_or("")
+                ),
+            )?,
+            Err(_) => match self.service_state() {
+                Ok(KernelServiceState::Draining | KernelServiceState::Stopped) => record(
+                    ShutdownPhase::AdmissionsClosed,
+                    format!("service-already-draining{}", resumed_note.unwrap_or("")),
+                )?,
+                _ => return Err(DrainHalt::new("admissions-close-rejected")),
+            },
+        }
+
+        // AuthorityRevoked: with the service `Draining`, no new action
+        // authority is admitted; post-linearization control/cutover authority
+        // is revoked through the generation poison below.
+        match self.service_state() {
+            Ok(KernelServiceState::Draining) => record(
+                ShutdownPhase::AuthorityRevoked,
+                "service-draining:ready-gate-denies-new-admissions;control-revoked-at-commit-via-generation-poison"
+                    .to_owned(),
+            )?,
+            _ => return Err(DrainHalt::new("authority-revoke-unproven")),
+        }
+
+        // JobsCheckpointed: observe the daemon contour under drain. Job
+        // checkpoint/cancel semantics stay Governor-owned (handoff); Kernel
+        // admits no new daemon launches while `Draining`.
+        let daemon_status = self
+            .daemon_runtime
+            .lock()
+            .map(|guard| format!("daemon-status:{:?}", guard.status))
+            .map_err(|_| DrainHalt::new("daemon-contour-unavailable"))?;
+        record(
+            ShutdownPhase::JobsCheckpointed,
+            format!(
+                "{daemon_status};no-new-daemon-launches-while-draining;job-checkpoint-owned-by-eliotd-governor-handoff"
+            ),
+        )?;
+
+        // CanonicalDrainReceiptsReconciled: every pending canonical-write
+        // receipt (ORS store-rebind rows) must resolve before the
+        // linearization point; the bounded wait retains the remainder.
+        for identity in self
+            .pending_rebind_receipts()
+            .map_err(|_| DrainHalt::new("ors-rebind-scan-failed"))?
+        {
+            coordinator.register_pending_receipt(identity);
+        }
+        let remainder = coordinator
+            .reconcile_pending_to_deadline(DRAIN_RECEIPT_DEADLINE, || {
+                self.pending_rebind_receipts().unwrap_or_default()
+            })
+            .await;
+        if !remainder.is_empty() {
+            return Err(DrainHalt::with_pending(
+                "receipt-reconciliation-incomplete",
+                remainder,
+            ));
+        }
+        record(
+            ShutdownPhase::CanonicalDrainReceiptsReconciled,
+            "store-rebind-pending-reconciled-empty;supervision-lease-staging-owned-by-lease-authority-handoff;host-request-staging-owned-by-governor-handoff"
+                .to_owned(),
+        )?;
+
+        // FlushesCompleted: reconcile staged ORS generation cutovers.
+        // Audit/outbox flush stays Governor-owned (handoff); Kernel never
+        // fabricates Governor flush evidence.
+        match self
+            .generation_gateway
+            .ors
+            .reconcile_staged_generation_cutovers(eliot_ors::MAX_RECOVERY_PAGE)
+        {
+            Ok(snapshots) => record(
+                ShutdownPhase::FlushesCompleted,
+                format!(
+                    "ors-staged-cutovers-reconciled:{};audit-outbox-flush-owned-by-eliotd-governor-handoff",
+                    snapshots.len()
+                ),
+            )?,
+            Err(_) => return Err(DrainHalt::new("ors-flush-failed")),
+        }
+
+        // ModulesQuiescedReverse: dependents stop before the stores and
+        // bridges they depend on. The contour is the live composition state:
+        // the store bridge (dependency) ordered before the daemon
+        // (dependent), then reversed for quiescence.
+        let mut dependency_order = Vec::new();
+        #[cfg(windows)]
+        match self.canonical_store_gateway.lock() {
+            Ok(gateway) => {
+                if gateway.is_some() {
+                    dependency_order.push("store-bridge".to_owned());
+                }
+            }
+            Err(_) => return Err(DrainHalt::new("store-contour-unavailable")),
+        }
+        match self.daemon_active_launch.lock() {
+            Ok(launch) => {
+                if launch.is_some() {
+                    dependency_order.push("daemon".to_owned());
+                }
+            }
+            Err(_) => return Err(DrainHalt::new("daemon-contour-unavailable")),
+        }
+        let quiescence = reverse_quiescence_order(&dependency_order)
+            .map_err(|_| DrainHalt::new("module-contour-ambiguous"))?;
+        record(
+            ShutdownPhase::ModulesQuiescedReverse,
+            format!("quiescence-order:{}", quiescence.join(">")),
+        )?;
+
+        // StoreStopLeaseZero: the store-stop request below is admitted only
+        // with no outstanding canonical-data lease.
+        if ShutdownDrainCoordinator::check_lease_zero(
+            self.canonical_store_claimed.load(Ordering::Acquire),
+        )
+        .is_err()
+        {
+            return Err(DrainHalt::with_pending(
+                "canonical-data-lease-outstanding",
+                vec!["canonical-store-lease".to_owned()],
+            ));
+        }
+        #[cfg(windows)]
+        let store_evidence = match self.canonical_store_gateway.lock() {
+            Ok(gateway) => match gateway.as_ref() {
+                Some(gateway) if gateway.is_fenced() => "store-gateway-fenced",
+                Some(_) => "store-gateway-attached-unclaimed",
+                None => "store-gateway-absent",
+            },
+            Err(_) => return Err(DrainHalt::new("store-gateway-unavailable")),
+        };
+        #[cfg(not(windows))]
+        let store_evidence = "store-gateway-absent";
+        record(
+            ShutdownPhase::StoreStopLeaseZero,
+            format!("canonical-leases-zero;{store_evidence}"),
+        )?;
+
+        // DrainCommit linearization point.
+        let authority_epochs_fenced = match self.front_door_policy.lock() {
+            Ok(policy) => {
+                let fence = &policy.module_generation.state_fence;
+                vec![format!(
+                    "{}:{}@{}",
+                    fence.authority_epoch.lineage_id,
+                    fence.authority_epoch.sequence,
+                    fence.resource_generation.value()
+                )]
+            }
+            Err(_) => return Err(DrainHalt::new("authority-fence-unavailable")),
+        };
+        let decision = DrainCommitDecision {
+            generation: generation.clone(),
+            lease_and_pending_snapshot: Vec::new(),
+            authority_epochs_fenced,
+            branches_to_stop: quiescence,
+            wake_disposition: DrainWakeDisposition::QueueNextGeneration,
+            irreversible_stage: "authority-fenced".to_owned(),
+            recovery_owner: "kernel-composition".to_owned(),
+        };
+        coordinator.commit_drain(decision.clone()).map_err(|_| {
+            DrainHalt::with_pending("drain-commit-rejected", coordinator.pending_receipts())
+        })?;
+
+        // Service stop follows linearization; a committed drain without a
+        // clean stop is incomplete recovery state, never a silent success.
+        if self.apply_control(KernelControlCommand::Stop).is_err() {
+            return Err(DrainHalt::with_pending(
+                "service-stop-rejected",
+                coordinator.pending_receipts(),
+            ));
+        }
+
+        // Post-linearization revocation: no further control or cutover
+        // authority is admitted through the poisoned generation gateway.
+        match self.generation_poison.lock() {
+            Ok(mut poison) => {
+                *poison = Some(format!("shutdown-drain:{generation}"));
+            }
+            Err(_) => return Err(DrainHalt::new("authority-revoke-failed")),
+        }
+        record(
+            ShutdownPhase::IntentionalPublished,
+            format!("generation-poisoned;service-stopped;drain-commit-linearized:{generation}"),
+        )?;
+        Ok(decision)
+    }
+
+    /// Lists pending canonical-write receipts (ORS store-rebind rows) as
+    /// drain-gate identities. Read-only: shutdown never mutates staged rows.
+    fn pending_rebind_receipts(&self) -> Result<Vec<String>, String> {
+        let records = self
+            .generation_gateway
+            .ors
+            .load_all_store_rebinds()
+            .map_err(|_| "ors-rebind-scan-failed".to_owned())?;
+        Ok(records
+            .iter()
+            .filter(|record| record.state == eliot_ors::StoreRebindReplayState::Pending)
+            .map(|record| format!("store-rebind:{}", record.operation_id.as_str()))
+            .collect())
     }
 }
 

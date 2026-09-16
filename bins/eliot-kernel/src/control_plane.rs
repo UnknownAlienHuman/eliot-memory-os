@@ -291,6 +291,22 @@ impl KernelComposition {
                 return Err(TransportError::SessionFenced);
             }
         }
+        // I14.23 wake/attach race: a new activation arriving before the
+        // `DrainCommit` linearization point cancels the drain and proceeds;
+        // after linearization it cannot reuse the drained generation (the
+        // service independently fences `Activate` from `Draining`) and must
+        // re-establish a fresh generation through the reconcile path.
+        if matches!(&request.command, KernelControlCommand::Activate(_)) {
+            // Post-linearization activation cannot reuse the drained
+            // generation; the caller re-establishes a fresh generation
+            // through the reconcile path.
+            if coordinator_for(&self.work_root)
+                .on_activate_request()
+                .fences_old_authority()
+            {
+                return Err(TransportError::SessionFenced);
+            }
+        }
         let store_rebind_receipt: Option<eliot_kernel_service::StoreRebindReceipt> = match &request
             .command
         {
@@ -328,6 +344,12 @@ impl KernelComposition {
                         )
                         .map_err(|_| TransportError::SessionFenced)?;
                         self.verify_store_rebind_publication_complete(&receipt)?;
+                        // A reconciled commit resolves the matching drain-gate
+                        // receipt when a shutdown is waiting on it.
+                        coordinator_for(&self.work_root).resolve_pending_receipt(&format!(
+                            "store-rebind:{}",
+                            query.operation_id.as_str()
+                        ));
                         Some(receipt)
                     }
                     Some(record)
@@ -352,6 +374,12 @@ impl KernelComposition {
                         match (removed, after) {
                             (_, None) => {
                                 self.rollback_store_rebind_if_exact_query(query)?;
+                                // The abort removed the staged row, resolving
+                                // the matching drain-gate receipt if any.
+                                coordinator_for(&self.work_root).resolve_pending_receipt(&format!(
+                                    "store-rebind:{}",
+                                    query.operation_id.as_str()
+                                ));
                                 None
                             }
                             (_, Some(after))
@@ -379,6 +407,12 @@ impl KernelComposition {
                                 )
                                 .map_err(|_| TransportError::SessionFenced)?;
                                 self.verify_store_rebind_publication_complete(&receipt)?;
+                                // A reconciled commit resolves the matching
+                                // drain-gate receipt when a shutdown waits.
+                                coordinator_for(&self.work_root).resolve_pending_receipt(&format!(
+                                    "store-rebind:{}",
+                                    query.operation_id.as_str()
+                                ));
                                 Some(receipt)
                             }
                             _ => return Err(TransportError::SessionFenced),
@@ -579,8 +613,13 @@ impl KernelComposition {
     }
 
     /// Requests shutdown without starting a second lifecycle owner.
+    ///
+    /// Records the Kernel-owned I14.23 drain intent (persisted, resumable)
+    /// before closing runtime admission, so a later `shutdown()` observes
+    /// the request even when admission closure wins the race.
     #[must_use]
     pub fn request_shutdown(&self) -> bool {
+        let _ = coordinator_for(&self.work_root).request_shutdown();
         self.runtime.shutdown_handle().request()
     }
 }
