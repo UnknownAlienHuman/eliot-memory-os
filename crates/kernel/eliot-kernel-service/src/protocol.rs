@@ -1929,8 +1929,8 @@ pub fn semantic_store_config_hash_from_json(
         )?;
         // Wire-shape guard (Implements #64): the fenced authority epoch must be
         // the lineage-aware object shape `{lineage_id, sequence}`. A bare
-        // numeric scalar is rejected here; legacy numerics enter only via
-        // `import_legacy_scalar_epoch` with evidence, never via this wire.
+        // numeric scalar is rejected here; no legacy numeric import exists
+        // for this wire — only the structured epoch object shape binds authority.
         let fence_epoch = required_field(&fence, "authority_epoch")?;
         exact_object(&fence_epoch, &["lineage_id", "sequence"])?;
         let roots = required_field(value, "runtime_state_roots")?;
