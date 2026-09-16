@@ -41,7 +41,7 @@ path = "docs/architecture/I09-03-job-classes.md and accepted A-03 self-query con
 disposition = "reuse exact ArchitectureSelfQuery job with ImplementationBrief output profile; no new job discriminator"
 
 [[donor]]
-path = "docs/architecture/I00-05-current-system-evidence-and-source-support-model.md and eliot-conformance-contracts"
+path = "docs/architecture/I00-05-conformance-support-and-evidence-status.md and eliot-conformance-contracts"
 disposition = "reuse exact independent maturity/support/execution/observation/domain vocabulary"
 
 [[donor]]
