@@ -87,9 +87,7 @@ impl ModuleContractKit {
             return Err(TypedContractError::ImportMismatch);
         }
         let single_export = self.declared_exports.first().map(String::as_str);
-        if self.declared_exports.len() != 1
-            || single_export != Some(self.world.interface_name())
-        {
+        if self.declared_exports.len() != 1 || single_export != Some(self.world.interface_name()) {
             return Err(TypedContractError::ExportMismatch);
         }
         Ok(())
@@ -100,8 +98,7 @@ impl ModuleContractKit {
     /// so no self-referential digest exists. No capability is invented:
     /// every byte hashed was supplied by the Governor-admitted kit.
     pub fn digest(&self) -> Result<Sha256Digest, TypedContractError> {
-        canonical_digest(self)
-            .map_err(|error| TypedContractError::Serialization(error.to_string()))
+        canonical_digest(self).map_err(|error| TypedContractError::Serialization(error.to_string()))
     }
 
     /// Checks one sealed engine invocation against this kit: exact world,
@@ -158,8 +155,8 @@ impl ModuleContractKit {
         {
             return Err(TypedContractError::EngineMismatch);
         }
-        let input_len = u64::try_from(invocation.input.len())
-            .map_err(|_| TypedContractError::LimitDenied)?;
+        let input_len =
+            u64::try_from(invocation.input.len()).map_err(|_| TypedContractError::LimitDenied)?;
         if input_len > invocation.limits.max_input_bytes {
             return Err(TypedContractError::LimitDenied);
         }
@@ -209,7 +206,9 @@ impl CapsuleExcerpt {
         validate_text(&path, "excerpt.path")
             .map_err(|_| TypedContractError::InvalidCapsule("excerpt-path".to_owned()))?;
         if content.is_empty() || content.len() > MAX_CAPSULE_EXCERPT_BYTES {
-            return Err(TypedContractError::InvalidCapsule("excerpt-bytes".to_owned()));
+            return Err(TypedContractError::InvalidCapsule(
+                "excerpt-bytes".to_owned(),
+            ));
         }
         Ok(Self { path, content })
     }
@@ -290,27 +289,35 @@ impl CrateContextCapsule {
             validate_text(&excerpt.path, "excerpt.path")
                 .map_err(|_| TypedContractError::InvalidCapsule("excerpt-path".to_owned()))?;
             if excerpt.content.is_empty() || excerpt.content.len() > MAX_CAPSULE_EXCERPT_BYTES {
-                return Err(TypedContractError::InvalidCapsule("excerpt-bytes".to_owned()));
+                return Err(TypedContractError::InvalidCapsule(
+                    "excerpt-bytes".to_owned(),
+                ));
             }
             total = total
                 .checked_add(excerpt.content.len())
                 .ok_or_else(|| TypedContractError::InvalidCapsule("excerpt-total".to_owned()))?;
             if total > MAX_CAPSULE_TOTAL_BYTES {
-                return Err(TypedContractError::InvalidCapsule("excerpt-total".to_owned()));
+                return Err(TypedContractError::InvalidCapsule(
+                    "excerpt-total".to_owned(),
+                ));
             }
             if !self
                 .owned_paths
                 .iter()
                 .any(|owned| path_within(&excerpt.path, owned))
             {
-                return Err(TypedContractError::InvalidCapsule("excerpt-owner".to_owned()));
+                return Err(TypedContractError::InvalidCapsule(
+                    "excerpt-owner".to_owned(),
+                ));
             }
             if self
                 .forbidden_paths
                 .iter()
                 .any(|denied| path_within(&excerpt.path, denied))
             {
-                return Err(TypedContractError::InvalidCapsule("excerpt-forbidden".to_owned()));
+                return Err(TypedContractError::InvalidCapsule(
+                    "excerpt-forbidden".to_owned(),
+                ));
             }
         }
         let complete = matches!(
@@ -318,7 +325,9 @@ impl CrateContextCapsule {
             crate::component_contract::TypedCompleteness::Complete
         );
         if complete && !self.omissions.is_empty() {
-            return Err(TypedContractError::InvalidCapsule("completeness".to_owned()));
+            return Err(TypedContractError::InvalidCapsule(
+                "completeness".to_owned(),
+            ));
         }
         if !complete
             && self.omissions.is_empty()
@@ -327,7 +336,9 @@ impl CrateContextCapsule {
                 crate::component_contract::TypedCompleteness::Partial
             )
         {
-            return Err(TypedContractError::InvalidCapsule("completeness".to_owned()));
+            return Err(TypedContractError::InvalidCapsule(
+                "completeness".to_owned(),
+            ));
         }
         Ok(())
     }
@@ -428,36 +439,38 @@ mod capsule_tests {
             assert_eq!(second, Ok(first.clone()));
             assert_eq!(first.digest(), first.digest());
 
-        let mut wrong_package = first.clone();
-        wrong_package.package_id = "other:package@9.9.9".to_owned();
-        assert!(wrong_package.validate().is_err());
+            let mut wrong_package = first.clone();
+            wrong_package.package_id = "other:package@9.9.9".to_owned();
+            assert!(wrong_package.validate().is_err());
 
-        let mut ambient_import = first.clone();
-        ambient_import
-            .declared_imports
-            .push("wasi:filesystem/types".to_owned());
-        assert_eq!(
-            ambient_import.validate(),
-            Err(TypedContractError::ImportMismatch)
-        );
+            let mut ambient_import = first.clone();
+            ambient_import
+                .declared_imports
+                .push("wasi:filesystem/types".to_owned());
+            assert_eq!(
+                ambient_import.validate(),
+                Err(TypedContractError::ImportMismatch)
+            );
 
-        let mut wrong_export = first.clone();
-        wrong_export.declared_exports = vec!["run".to_owned()];
-        assert_eq!(
-            wrong_export.validate(),
-            Err(TypedContractError::ExportMismatch)
-        );
+            let mut wrong_export = first.clone();
+            wrong_export.declared_exports = vec!["run".to_owned()];
+            assert_eq!(
+                wrong_export.validate(),
+                Err(TypedContractError::ExportMismatch)
+            );
 
-        let excerpt = CapsuleExcerpt::new("crates/a/src.rs".to_owned(), vec![1, 2, 3]);
-        assert!(excerpt.is_ok());
-        let oversized = CapsuleExcerpt::new(
-            "crates/a/src.rs".to_owned(),
-            vec![0; MAX_CAPSULE_EXCERPT_BYTES + 1],
-        );
-        assert_eq!(
-            oversized,
-            Err(TypedContractError::InvalidCapsule("excerpt-bytes".to_owned()))
-        );
+            let excerpt = CapsuleExcerpt::new("crates/a/src.rs".to_owned(), vec![1, 2, 3]);
+            assert!(excerpt.is_ok());
+            let oversized = CapsuleExcerpt::new(
+                "crates/a/src.rs".to_owned(),
+                vec![0; MAX_CAPSULE_EXCERPT_BYTES + 1],
+            );
+            assert_eq!(
+                oversized,
+                Err(TypedContractError::InvalidCapsule(
+                    "excerpt-bytes".to_owned()
+                ))
+            );
         }
     }
 }

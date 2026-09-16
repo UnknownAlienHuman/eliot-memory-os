@@ -47,8 +47,9 @@ const MAX_TYPED_IDENTITY_BYTES: usize = 128;
 const MAX_TYPED_ENVELOPE_BYTES: usize = 1_048_576;
 
 /// The six frozen typed worlds in contract order.
-#[derive(Clone, Copy, Debug, Eq, Hash, JsonSchema, Ord, PartialEq, PartialOrd)]
-#[derive(Serialize, Deserialize)]
+#[derive(
+    Clone, Copy, Debug, Eq, Hash, JsonSchema, Ord, PartialEq, PartialOrd, Serialize, Deserialize,
+)]
 #[serde(rename_all = "kebab-case")]
 pub enum TypedWorld {
     ContextAdmission,
@@ -360,25 +361,13 @@ pub enum TypedContractError {
     #[error("legacy identity cannot satisfy a typed operation: {0}")]
     LegacyRejected(String),
     #[error("typed package mismatch: want {want}, got {got}")]
-    PackageMismatch {
-        want: String,
-        got: String,
-    },
+    PackageMismatch { want: String, got: String },
     #[error("typed world mismatch: want {want}, got {got}")]
-    WorldMismatch {
-        want: String,
-        got: String,
-    },
+    WorldMismatch { want: String, got: String },
     #[error("typed version mismatch: want {want}, got {got}")]
-    VersionMismatch {
-        want: String,
-        got: String,
-    },
+    VersionMismatch { want: String, got: String },
     #[error("typed ABI revision mismatch: want {want}, got {got}")]
-    AbiMismatch {
-        want: u32,
-        got: u32,
-    },
+    AbiMismatch { want: u32, got: u32 },
     #[error("malformed descriptor field: {0}")]
     DescriptorField(String),
     #[error("actual imports disagree with the declared typed contract")]
@@ -580,7 +569,10 @@ mod typed_contract_tests {
             TypedWorld::parse("not-a-world"),
             Err(TypedContractError::UnknownWorld(_))
         ));
-        assert_eq!(TypedVersion::parse(TYPED_WIT_VERSION), Ok(TypedVersion::current()));
+        assert_eq!(
+            TypedVersion::parse(TYPED_WIT_VERSION),
+            Ok(TypedVersion::current())
+        );
         assert!(TypedVersion::parse("9.9.9").is_err());
     }
 }

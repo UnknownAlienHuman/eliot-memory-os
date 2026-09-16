@@ -13,9 +13,7 @@ use sha2::{Digest as _, Sha256};
 use thiserror::Error;
 
 use crate::DEFAULT_GUEST_TARGET;
-use crate::component_contract::{
-    ProofCeiling, TYPED_PACKAGE_ID, TypedContractError, TypedWorld,
-};
+use crate::component_contract::{ProofCeiling, TYPED_PACKAGE_ID, TypedContractError, TypedWorld};
 
 const MAX_TEXT_BYTES: usize = 512;
 
