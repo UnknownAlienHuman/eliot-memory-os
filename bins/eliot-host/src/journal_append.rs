@@ -19,6 +19,31 @@ use eliot_runtime_contracts::{
     HealthDimension, HealthVector, ServiceProcessRecord, ServiceProcessState,
 };
 
+// F-LOG-HOST-6 (#981) journal-append observation helpers.
+//
+// Through the #889 facade only
+// (`crate::host_diagnostics::observe_entrypoint_with_detail`); the Event Log
+// seam stays typed-Unavailable
+// (`crate::windows_event_log::event_log_sink_status`), never implemented here
+// (#984 still open).
+//
+// Observation-only contract: every helper projects facts already produced by
+// the semantic owner. Arguments are static literals only — never records,
+// receipts, digests, or arbitrary error text — so bounding limits size, not
+// sensitivity (I15.4). Requested append, durable observed append, and
+// unknown outcome stay distinct (I14.21): possible loss is never promoted
+// into a receipt. These primitives own no terminal: a single terminal per
+// failed journal operation is enforced by the outermost owner boundary in
+// `lib.rs` (#891) or Host composition (#893), while these phases correlate
+// by stage order only. Sink outcome never alters result/order/cleanup.
+fn host_journal_observe(detail: &str) {
+    let _ = crate::windows_event_log::event_log_sink_status();
+    crate::host_diagnostics::observe_entrypoint_with_detail(
+        crate::host_diagnostics::EntrypointStage::Startup,
+        detail,
+    );
+}
+
 /// Checks every identity that the authoritative Job termination observation
 /// can be compared against in the durable Kernel binding.
 ///
@@ -219,8 +244,12 @@ fn reconcile_unknown_outcome<B: JournalBackend>(
     transaction_id: &PlatformHandle,
 ) -> Result<bool, HostError> {
     match journal.reconcile(transaction_id)? {
-        ReconcileOutcome::Committed => Ok(true),
+        ReconcileOutcome::Committed => {
+            host_journal_observe("host.journal reconcile committed observed");
+            Ok(true)
+        }
         ReconcileOutcome::NotCommitted | ReconcileOutcome::StillUnknown => {
+            host_journal_observe("host.journal reconcile unknown observed");
             Err(HostError::Journal(JournalError::OutcomeUnknown {
                 transaction_id: transaction_id.clone(),
             }))
@@ -232,9 +261,14 @@ pub(super) fn append_reconciled<B: JournalBackend>(
     journal: &HostStateJournalService<B>,
     record: HostStateRecord,
 ) -> Result<AppendReceipt, HostError> {
+    host_journal_observe("host.journal append requested");
     match journal.append(record.clone()) {
-        Ok(receipt) => Ok(receipt),
+        Ok(receipt) => {
+            host_journal_observe("host.journal append durable observed");
+            Ok(receipt)
+        }
         Err(JournalError::OutcomeUnknown { transaction_id }) => {
+            host_journal_observe("host.journal append outcome unknown observed");
             if reconcile_unknown_outcome(journal, &transaction_id)? {
                 journal.append(record).map_err(HostError::Journal)
             } else {
@@ -246,7 +280,10 @@ pub(super) fn append_reconciled<B: JournalBackend>(
                 }))
             }
         }
-        Err(error) => Err(HostError::Journal(error)),
+        Err(error) => {
+            host_journal_observe("host.journal append rejected observed");
+            Err(HostError::Journal(error))
+        }
     }
 }
 
@@ -257,7 +294,9 @@ pub(super) fn append_store_rebind_terminal<B: JournalBackend>(
     state: StoreRebindState,
     receipt: Option<&StoreRebindReceipt>,
 ) -> Result<(), HostError> {
+    host_journal_observe("host.journal rebind terminal requested");
     if record.state == state && state == StoreRebindState::Unknown {
+        host_journal_observe("host.journal rebind unknown noop observed");
         return Ok(());
     }
     match state {
@@ -318,6 +357,7 @@ pub(super) fn append_store_rebind_terminal<B: JournalBackend>(
         }
     ))?;
     append_reconciled(journal, HostStateRecord::StoreRebind(record))?;
+    host_journal_observe("host.journal rebind terminal appended");
     Ok(())
 }
 
@@ -328,6 +368,7 @@ pub(super) fn persist_store_rebind_disposition<B: JournalBackend>(
     request_digest: &str,
     disposition: StoreRebindState,
 ) -> Result<(), HostError> {
+    host_journal_observe("host.journal rebind disposition requested");
     if !matches!(
         disposition,
         StoreRebindState::Aborted | StoreRebindState::Unknown
@@ -354,6 +395,7 @@ pub(super) fn persist_store_rebind_disposition<B: JournalBackend>(
             )
         })?;
     if record.state == StoreRebindState::Unknown && disposition == StoreRebindState::Unknown {
+        host_journal_observe("host.journal rebind unknown noop observed");
         return Ok(());
     }
     let mut terminal = record;
@@ -370,6 +412,7 @@ pub(super) fn persist_store_rebind_disposition<B: JournalBackend>(
     terminal.receipt_request_digest = None;
     terminal.receipt_store_fence = None;
     append_reconciled(journal, HostStateRecord::StoreRebind(terminal))?;
+    host_journal_observe("host.journal rebind disposition appended");
     Ok(())
 }
 
@@ -404,6 +447,7 @@ pub(super) fn append_clean_marker<B: JournalBackend>(
     activation_id: &PlatformHandle,
     activation_generation: &EpochTransition,
 ) -> Result<(), HostError> {
+    host_journal_observe("host.journal clean marker requested");
     let snapshot = journal.snapshot()?;
     append_reconciled(
         journal,

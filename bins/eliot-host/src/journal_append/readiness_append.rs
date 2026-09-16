@@ -32,14 +32,44 @@ use eliot_runtime_contracts::{
     SupervisionLeasePredecessorIdentity,
 };
 
+// F-LOG-HOST-6 (#981) readiness-append observation helpers.
+//
+// Through the #889 facade only
+// (`crate::host_diagnostics::observe_entrypoint_with_detail`); the Event Log
+// seam stays typed-Unavailable
+// (`crate::windows_event_log::event_log_sink_status`), never implemented here
+// (#984 still open).
+//
+// Observation-only contract: every helper projects facts already produced by
+// the semantic owner. Arguments are static literals only — never evidence
+// refs, digests, or arbitrary error text — so bounding limits size, not
+// sensitivity (I15.4). Appended evidence and granted readiness stay
+// distinct: this child observes the evidence funnel; the readiness grant
+// stays with the gate owner (I1.10). These primitives own no terminal: a
+// single terminal per failed readiness operation is enforced by the
+// outermost owner boundary, while these phases correlate by stage order
+// only. Sink outcome never alters result/order/cleanup.
+fn host_readiness_append_observe(detail: &str) {
+    let _ = crate::windows_event_log::event_log_sink_status();
+    crate::host_diagnostics::observe_entrypoint_with_detail(
+        crate::host_diagnostics::EntrypointStage::Startup,
+        detail,
+    );
+}
+
 fn append_reconciled_readiness<B: JournalBackend>(
     journal: &HostStateJournalService<B>,
     observation: KernelReadinessObservationRecord,
     expected: &ReadinessApprovedContour,
 ) -> Result<AppendReceipt, HostError> {
+    host_readiness_append_observe("host.readiness append requested");
     match journal.append_readiness_observation(observation.clone(), expected) {
-        Ok(receipt) => Ok(receipt),
+        Ok(receipt) => {
+            host_readiness_append_observe("host.readiness append durable observed");
+            Ok(receipt)
+        }
         Err(JournalError::OutcomeUnknown { transaction_id }) => {
+            host_readiness_append_observe("host.readiness append outcome unknown observed");
             if super::reconcile_unknown_outcome(journal, &transaction_id)? {
                 journal
                     .append_readiness_observation(observation, expected)
@@ -53,7 +83,10 @@ fn append_reconciled_readiness<B: JournalBackend>(
                 }))
             }
         }
-        Err(error) => Err(HostError::Journal(error)),
+        Err(error) => {
+            host_readiness_append_observe("host.readiness append rejected observed");
+            Err(HostError::Journal(error))
+        }
     }
 }
 
@@ -65,6 +98,7 @@ pub(crate) fn append_authenticated_kernel_readiness<B: JournalBackend>(
     approved_config: &PlatformHandle,
     supervision: &PublishedSupervisionIdentity,
 ) -> Result<AppendReceipt, HostError> {
+    host_readiness_append_observe("host.readiness authenticated requested");
     let snapshot = journal.snapshot()?;
     let active = snapshot.kernel.as_ref().ok_or_else(|| {
         HostError::ProcessContour("readiness admission has no active Kernel record".to_owned())
@@ -95,6 +129,7 @@ pub(crate) fn append_authenticated_kernel_readiness<B: JournalBackend>(
         || active_job.root_volume_serial_number != job.root.executable.volume_serial_number
         || active_job.root_file_index != job.root.executable.file_index
     {
+        host_readiness_append_observe("host.readiness contour mismatch observed");
         return Err(HostError::ProcessContour(
             "Kernel readiness proof is not bound to the active journal contour".to_owned(),
         ));
@@ -113,7 +148,7 @@ pub(crate) fn append_authenticated_kernel_readiness<B: JournalBackend>(
         config_digest: approved_config.clone(),
         store_fence: proof.store_fence.clone(),
     };
-    append_reconciled_readiness(
+    let receipt = append_reconciled_readiness(
         journal,
         KernelReadinessObservationRecord {
             fence: active.fence.clone(),
@@ -145,5 +180,7 @@ pub(crate) fn append_authenticated_kernel_readiness<B: JournalBackend>(
             }),
         },
         &expected,
-    )
+    )?;
+    host_readiness_append_observe("host.readiness evidence appended");
+    Ok(receipt)
 }

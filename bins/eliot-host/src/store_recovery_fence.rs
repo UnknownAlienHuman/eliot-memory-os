@@ -30,6 +30,33 @@ pub(super) struct StoreRecoveryReopenFence {
     pub(super) inner: Option<StoreRecoveryReopenInnerBinding>,
 }
 
+// F-LOG-HOST-6 (#981) recovery-fence observation helpers.
+//
+// Through the #889 facade only
+// (`crate::host_diagnostics::observe_entrypoint_with_detail`); the Event Log
+// seam stays typed-Unavailable
+// (`crate::windows_event_log::event_log_sink_status`), never implemented here
+// (#984 still open).
+//
+// Observation-only contract: every helper projects facts already produced by
+// the semantic owner. Arguments are static literals only — never digests,
+// epochs, or arbitrary error text — so bounding limits size, not
+// sensitivity (I15.4). Fenced and clear stay distinct: the fence lifts only
+// on exact owner clearance, and an absent inner journal record stays a
+// recoverable unknown, never permission for a fresh contour (I14.21).
+// `StoreRecoveryStartupFence` and `ActivePhaseBRebindRecoveryKind` are pure
+// state vocabulary (explicit non-boundaries) and never log. These
+// primitives own no terminal: a single terminal per failed reopen operation
+// is enforced by the outermost owner boundary, while these phases correlate
+// by stage order only. Sink outcome never alters result/order/cleanup.
+fn host_recovery_fence_observe(detail: &str) {
+    let _ = crate::windows_event_log::event_log_sink_status();
+    crate::host_diagnostics::observe_entrypoint_with_detail(
+        crate::host_diagnostics::EntrypointStage::Startup,
+        detail,
+    );
+}
+
 impl StoreRecoveryReopenFence {
     #[cfg(windows)]
     pub(super) fn from_durable(
@@ -38,8 +65,10 @@ impl StoreRecoveryReopenFence {
         termination: Option<StoreRecoveryTerminationEvidence>,
         inner: Option<StoreRecoveryInnerBinding>,
     ) -> Result<Self, HostError> {
+        host_recovery_fence_observe("host.recovery fence requested");
         pending.recover_request()?;
         if pending.mutation_digest != mutation_digest {
+            host_recovery_fence_observe("host.recovery filename mismatch observed");
             return Err(HostError::RecoveryRequired(
                 "Store recovery filename and pending mutation differ".to_owned(),
             ));
@@ -49,13 +78,14 @@ impl StoreRecoveryReopenFence {
         }
         if let Some(inner) = inner.as_ref() {
             let termination = termination.as_ref().ok_or_else(|| {
+                host_recovery_fence_observe("host.recovery inner without termination observed");
                 HostError::RecoveryRequired(
                     "Store recovery inner binding has no termination evidence".to_owned(),
                 )
             })?;
             inner.validate_for_pending(&pending, termination)?;
         }
-        Ok(Self {
+        let fence = Self {
             mutation_digest,
             request_id: pending.request_id,
             request_digest: pending.request_digest,
@@ -72,7 +102,9 @@ impl StoreRecoveryReopenFence {
                 request_digest: binding.store_rebind_request_digest,
                 handoff: binding.handoff,
             }),
-        })
+        };
+        host_recovery_fence_observe("host.recovery fence bound observed");
+        Ok(fence)
     }
 
     pub(super) fn validate_for_reopen(
@@ -84,11 +116,13 @@ impl StoreRecoveryReopenFence {
             || self.host_lineage != last_host.epoch.current.lineage_id.as_str()
             || replayed.host != *last_host
         {
+            host_recovery_fence_observe("host.recovery foreign epoch observed");
             return Err(HostError::RecoveryRequired(
                 "Store recovery fence belongs to another durable Host epoch".to_owned(),
             ));
         }
         let Some(inner) = self.inner.as_ref() else {
+            host_recovery_fence_observe("host.recovery fence no inner observed");
             return Ok(());
         };
         inner
@@ -98,6 +132,7 @@ impl StoreRecoveryReopenFence {
         if inner.handoff.operation_id.as_str() != inner.operation_id
             || inner.handoff.request_digest != inner.request_digest
         {
+            host_recovery_fence_observe("host.recovery handoff substituted observed");
             return Err(HostError::RecoveryRequired(
                 "Store recovery startup handoff identity was substituted".to_owned(),
             ));
@@ -110,30 +145,36 @@ impl StoreRecoveryReopenFence {
             // The inner binding is intentionally published before the journal
             // request/delivery. Absence is therefore a recoverable Unknown,
             // never permission to start a fresh contour.
+            host_recovery_fence_observe("host.recovery inner absent unknown observed");
             return Ok(());
         };
         if records.next().is_some() {
+            host_recovery_fence_observe("host.recovery fence multiple inner observed");
             return Err(HostError::RecoveryRequired(
                 "Store recovery fence matched multiple inner journal records".to_owned(),
             ));
         }
         if record.request_digest.as_str() != inner.request_digest {
+            host_recovery_fence_observe("host.recovery inner digest substituted observed");
             return Err(HostError::RecoveryRequired(
                 "Store recovery inner request digest was substituted".to_owned(),
             ));
         }
         let activation = replayed.activation.as_ref().ok_or_else(|| {
+            host_recovery_fence_observe("host.recovery inner no activation observed");
             HostError::RecoveryRequired(
                 "Store recovery inner record has no durable activation fence".to_owned(),
             )
         })?;
         if record.fence != activation.fence || record.fence.host != *last_host {
+            host_recovery_fence_observe("host.recovery inner wrong activation observed");
             return Err(HostError::RecoveryRequired(
                 "Store recovery inner record is bound to another activation".to_owned(),
             ));
         }
         if record.state == StoreRebindState::Committed {
             let termination = self.termination.as_ref().ok_or_else(|| {
+                host_recovery_fence_observe("host.recovery committed without termination observed");
                 HostError::RecoveryRequired(
                     "committed Store recovery has no exact termination evidence".to_owned(),
                 )
@@ -143,6 +184,7 @@ impl StoreRecoveryReopenFence {
                 && record.process_image_path.as_str() == termination.process_image_path
                 && record.job_name.as_str() == termination.job_name
             {
+                host_recovery_fence_observe("host.recovery predecessor committed observed");
                 return Err(HostError::RecoveryRequired(
                     "committed Store recovery points at the terminated predecessor".to_owned(),
                 ));

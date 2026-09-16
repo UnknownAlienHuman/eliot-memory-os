@@ -1,0 +1,10 @@
+{
+  "stages": { "startup": "startup" },
+  "entrypoint_event": "host.entrypoint_stage",
+  "terminal_event": "host.terminal_error",
+  "outer_terminal": "host-open-failed",
+  "inner_prefixes": ["host.epoch", "host.journal", "host.readiness", "host.restart", "host.recovery"],
+  "helpers": ["host_epoch_observe", "host_journal_observe", "host_readiness_append_observe", "host_readiness_gate_observe", "host_restart_observe", "host_restart_pending_observe", "host_recovery_observe", "host_recovery_fence_observe"],
+  "canaries": ["password", "secret=", "BEGIN PRIVATE", "token=", ".expose()"],
+  "stdout_protocol_contamination": false
+}

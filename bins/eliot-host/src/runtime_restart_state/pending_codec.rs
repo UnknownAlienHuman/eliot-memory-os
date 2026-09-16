@@ -21,6 +21,33 @@ use super::super::{
 };
 use super::read_bounded_runtime_restart_file;
 
+// F-LOG-HOST-6 (#981) pending-codec observation helpers.
+//
+// Through the #889 facade only
+// (`crate::host_diagnostics::observe_entrypoint_with_detail`); the Event Log
+// seam stays typed-Unavailable
+// (`crate::windows_event_log::event_log_sink_status`), never implemented here
+// (#984 still open).
+//
+// Observation-only contract: every helper projects facts already produced by
+// the semantic owner. Arguments are static literals only — never file bytes,
+// digests, or arbitrary error text — so bounding limits size, not
+// sensitivity (I15.4). Corrupt records keep their exact typed failure with
+// no payload bytes in the record. Pure construction
+// (`runtime_restart_pending_identity`, `runtime_restart_pending_payload`)
+// is an explicit non-boundary and never logs. These primitives own no
+// terminal: a single terminal per failed restart operation is enforced by
+// the outermost owner boundary, while these phases correlate by stage order
+// only. Sink outcome never alters result/order/cleanup.
+#[cfg(windows)]
+fn host_restart_pending_observe(detail: &str) {
+    let _ = crate::windows_event_log::event_log_sink_status();
+    crate::host_diagnostics::observe_entrypoint_with_detail(
+        crate::host_diagnostics::EntrypointStage::Startup,
+        detail,
+    );
+}
+
 #[cfg(windows)]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(super) struct RuntimeRestartPendingIdentity {
@@ -73,6 +100,7 @@ pub(super) fn runtime_restart_pending_identity(
 #[cfg(windows)]
 fn runtime_restart_created_at(now: SystemTime) -> Result<String, HostError> {
     let millis = now.duration_since(UNIX_EPOCH).map_err(|error| {
+        host_restart_pending_observe("host.restart clock before epoch observed");
         HostError::RecoveryRequired(format!(
             "runtime restart pending clock precedes Unix epoch: {error}"
         ))
@@ -103,6 +131,7 @@ fn runtime_restart_pending_identity_from_bytes(
     expected_mutation_digest: &str,
 ) -> Result<RuntimeRestartPendingIdentity, HostError> {
     let record = serde_json::from_slice::<RuntimeRestartPendingRecord>(bytes).map_err(|e| {
+        host_restart_pending_observe("host.restart pending malformed observed");
         HostError::RecoveryRequired(format!("runtime restart pending record is malformed: {e}"))
     })?;
     let identity = RuntimeRestartPendingIdentity {
@@ -127,6 +156,7 @@ fn runtime_restart_pending_identity_from_bytes(
         || record.created_at.chars().any(char::is_control)
         || identity.mutation_digest != expected_mutation_digest
     {
+        host_restart_pending_observe("host.restart pending identity malformed observed");
         return Err(HostError::RecoveryRequired(
             "runtime restart pending record identity is malformed".to_owned(),
         ));
@@ -153,6 +183,7 @@ fn runtime_restart_pending_identity_from_bytes(
         ))
     })?;
     if expected_request.request_digest.as_str() != identity.request_digest {
+        host_restart_pending_observe("host.restart pending digest mismatch observed");
         return Err(HostError::RecoveryRequired(
             "runtime restart pending request_digest does not match its operation and mutation"
                 .to_owned(),
@@ -170,12 +201,14 @@ pub(super) fn read_runtime_restart_pending_identity(
         Ok(metadata) => metadata,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
         Err(error) => {
+            host_restart_pending_observe("host.restart pending inspect failed observed");
             return Err(HostError::RecoveryRequired(format!(
                 "runtime restart pending record cannot be inspected: {error}"
             )));
         }
     };
     if !metadata.is_file() || metadata.len() > MAX_PENDING_BYTES {
+        host_restart_pending_observe("host.restart pending too large observed");
         return Err(HostError::RecoveryRequired(
             "runtime restart pending record is malformed or too large".to_owned(),
         ));
@@ -191,12 +224,15 @@ pub(super) fn read_runtime_restart_pending_identity(
         .and_then(|name| name.strip_suffix(".pending.json"))
         .filter(|digest| valid_sha256_text(digest))
         .ok_or_else(|| {
+            host_restart_pending_observe("host.restart pending path unbound observed");
             HostError::RecoveryRequired(
                 "runtime restart pending path is not bound to a lowercase sha256 mutation"
                     .to_owned(),
             )
         })?;
-    runtime_restart_pending_identity_from_bytes(&bytes, expected_mutation_digest).map(Some)
+    let identity = runtime_restart_pending_identity_from_bytes(&bytes, expected_mutation_digest)?;
+    host_restart_pending_observe("host.restart pending read observed");
+    Ok(Some(identity))
 }
 
 #[cfg(test)]
