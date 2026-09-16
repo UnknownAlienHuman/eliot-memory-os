@@ -6,7 +6,7 @@ use eliot_contracts::{
     StateFence, TaskId, sha256_hex,
 };
 use std::num::NonZeroU64;
-use eliot_dreamer_contracts::curation::{RelationPayload, TargetEvidence};
+use eliot_dreamer_contracts::curation::{ClassificationPayload, RelationPayload, TargetEvidence};
 use eliot_dreamer_contracts::encoding::canonical_bytes;
 use eliot_dreamer_contracts::*;
 use eliot_evidence::{
@@ -1214,4 +1214,305 @@ fn replay_permutation_bounds_and_cancel_are_explicit() {
     case.policy.max_evidence = 1;
     case.reseal();
     assert!(case.run().is_err());
+}
+
+// WORK_UNIT_CASE: 655/1
+#[test]
+fn work_unit_655_01_valid_directed_typed_relation() {
+    let case = Case::ready();
+    let result = case.run().expect("valid directed relation");
+    assert_eq!(result.disposition, RelationDisposition::Positive);
+    result.validate().expect("sealed result");
+    let candidate = &result.closure.candidate;
+    assert_eq!(candidate.family, RelationFamily::Supports);
+    assert_eq!(candidate.direction, RelationDirection::Forward);
+    assert_eq!(candidate.source_id, case.source.endpoint_id());
+    assert_eq!(candidate.target_id, case.target.endpoint_id());
+    assert_eq!(candidate.registry_digest, case.registry.digest);
+    assert_eq!(
+        candidate.evidence_refs,
+        vec!["evidence-1".to_owned()]
+    );
+    assert_eq!(result.closure.input.source, case.source);
+    assert_eq!(result.closure.input.target, case.target);
+}
+
+// WORK_UNIT_CASE: 655/2
+#[test]
+fn work_unit_655_02_kind_role_direction_vocabulary() {
+    assert_eq!(RelationFamily::Supports.as_str(), "supports");
+    assert_eq!(
+        RelationFamily::parse("supports").expect("parse"),
+        RelationFamily::Supports
+    );
+    assert!(RelationFamily::parse("correlates_with").is_err());
+    // Family outside the admitted registry denominator and rules fails.
+    let mut case = Case::ready();
+    case.draft.family = RelationFamily::Resembles;
+    case.item.payload = payload_for_relation("resembles");
+    case.rescreen();
+    assert!(case.run().is_err());
+    // Direction against the per-family registry rule fails.
+    let mut case = Case::ready();
+    case.draft.direction = RelationDirection::Reverse;
+    case.rebind_pair();
+    match case.run() {
+        Err(ContractViolation::BindingMismatch { field, .. }) => {
+            assert_eq!(field, "relation.direction");
+        }
+        other => panic!("expected direction rejection, got {other:?}"),
+    }
+}
+
+// WORK_UNIT_CASE: 655/3
+#[test]
+fn work_unit_655_03_wrong_curation_subtype_rejected() {
+    // A genuine classification payload with matching spelling is not Relation.
+    let mut case = Case::ready();
+    case.item.kind_spelling = "classification".to_owned();
+    case.item.family_spelling = "classification".to_owned();
+    case.item.payload = CurationPayload::Classification(ClassificationPayload {
+        label: "label".to_owned(),
+        confidence_bps: 9_000,
+        target_evidence: TargetEvidence {
+            targets: vec!["source-a".to_owned(), "target-b".to_owned()],
+            evidence_refs: vec!["evidence-1".to_owned()],
+        },
+    });
+    case.rescreen();
+    assert!(case.run().is_err());
+    // Kind/payload drift: classification spelling over a relation payload.
+    let mut drift = Case::ready();
+    drift.item.kind_spelling = "classification".to_owned();
+    drift.item.family_spelling = "classification".to_owned();
+    drift.rescreen();
+    assert!(drift.run().is_err());
+    // Relation-string drift between the curation payload and the draft family.
+    let mut relation = Case::ready();
+    relation.item.payload = payload_for_relation("contradicts");
+    relation.rescreen();
+    assert!(relation.run().is_err());
+}
+
+// WORK_UNIT_CASE: 655/4
+#[test]
+fn work_unit_655_04_unadmitted_endpoints_rejected() {
+    // Quarantined source.
+    let mut case = Case::ready();
+    case.source.admitted.lifecycle = LifecycleState::Quarantined;
+    assert!(case.run().is_err());
+    // Extinguished (deleted) target.
+    let mut case = Case::ready();
+    case.target.admitted.lifecycle = LifecycleState::Extinguished;
+    assert!(case.run().is_err());
+    // Archived (superseded lineage) source.
+    let mut case = Case::ready();
+    case.source.admitted.lifecycle = LifecycleState::Archived;
+    assert!(case.run().is_err());
+    // Stale freshness is not current.
+    let mut case = Case::ready();
+    case.source.admitted.freshness = EvidenceFreshness::Stale;
+    assert!(case.run().is_err());
+    // A known older snapshot is not current either.
+    let mut case = Case::ready();
+    case.target.admitted.freshness = EvidenceFreshness::KnownOlderSnapshot;
+    assert!(case.run().is_err());
+    // Rejected epistemic status is inadmissible.
+    let mut case = Case::ready();
+    case.source.status = EpistemicStatus::Rejected;
+    assert!(case.run().is_err());
+}
+
+// WORK_UNIT_CASE: 655/5
+#[test]
+fn work_unit_655_05_endpoint_identity_mismatch_rejected() {
+    // Scope drift breaks the endpoint join.
+    let mut case = Case::ready();
+    case.source.admitted.scope_id = WorkScopeId::new("scope-2").expect("scope");
+    assert!(case.run().is_err());
+    // Task drift breaks the endpoint join.
+    let mut case = Case::ready();
+    case.target.admitted.task_id = TaskId::new("task-2").expect("task");
+    assert!(case.run().is_err());
+    // Fence drift breaks the endpoint join.
+    let mut case = Case::ready();
+    let epoch = EpochId::new(
+        EpochLineageId::new("550e8400-e29b-41d4-a716-446655440001").expect("lineage-B"),
+        NonZeroU64::new(1).expect("non-zero test sequence"),
+    )
+    .expect("valid test epoch");
+    case.source.admitted.state_fence =
+        StateFence::new(epoch, ResourceGeneration::genesis());
+    assert!(case.run().is_err());
+    // Role outside the registry rule.
+    let mut case = Case::ready();
+    case.target.role = "observer".to_owned();
+    assert!(case.run().is_err());
+    // Record family outside the registry rule.
+    let mut case = Case::ready();
+    case.source.record_family = ClassificationRecordFamily::SourceRecord;
+    assert!(case.run().is_err());
+    // Revision drift breaks the closed alternative and disclosure bindings.
+    let mut case = Case::ready();
+    case.source.admitted.target_revision = "rev-2".to_owned();
+    assert!(case.run().is_err());
+}
+
+// WORK_UNIT_CASE: 655/6
+#[test]
+fn work_unit_655_06_self_relation_needs_registry_permission() {
+    fn self_case() -> Case {
+        let mut case = Case::ready();
+        case.target = case.source.clone();
+        case.target.role = "target".to_owned();
+        case.item.payload = CurationPayload::Relation(RelationPayload {
+            from_handle: "source-a".to_owned(),
+            to_handle: "source-a".to_owned(),
+            relation: "supports".to_owned(),
+            target_evidence: TargetEvidence {
+                targets: vec!["source-a".to_owned()],
+                evidence_refs: vec!["evidence-1".to_owned()],
+            },
+        });
+        case.item.denominator = TargetDenominator {
+            mode: AtomicityMode::AllOrNothing,
+            members: vec!["source-a".to_owned()],
+            expected_total: 1,
+        };
+        case.rebind_pair();
+        case.rescreen();
+        case
+    }
+    // Forbidden by default: permitted endpoint equality is a self-relation
+    // rejection, never a duplicate-record error.
+    let forbidden = self_case();
+    match forbidden.run() {
+        Err(ContractViolation::BindingMismatch { field, .. }) => {
+            assert_eq!(field, "relation.self_relation");
+        }
+        other => panic!("expected self-relation rejection, got {other:?}"),
+    }
+    // Permitted by the registry: the same equality proposes normally.
+    let mut permitted = self_case();
+    permitted.registry.rules[0].permits_self_relation = true;
+    permitted.rebind_registry();
+    let result = permitted.run().expect("permitted self relation");
+    assert_ne!(result.disposition, RelationDisposition::Duplicate);
+    result.validate().expect("sealed self relation");
+}
+
+// WORK_UNIT_CASE: 655/7
+#[test]
+fn work_unit_655_07_endpoint_kind_compatibility() {
+    // Record family outside the rule.
+    let mut case = Case::ready();
+    case.source.record_family = ClassificationRecordFamily::DecisionRecord;
+    assert!(case.run().is_err());
+    // Tightened rule: only decision sources accepted.
+    let mut case = Case::ready();
+    case.registry.rules[0].source_record_families =
+        vec![ClassificationRecordFamily::DecisionRecord];
+    case.rebind_registry();
+    assert!(case.run().is_err());
+    // Role outside the rule.
+    let mut case = Case::ready();
+    case.source.role = "witness".to_owned();
+    assert!(case.run().is_err());
+    // Positive control: the admitted pair with registry-valid roles and types.
+    let case = Case::ready();
+    let result = case.run().expect("kind-compatible relation");
+    assert_eq!(result.disposition, RelationDisposition::Positive);
+}
+
+// WORK_UNIT_CASE: 655/8
+#[test]
+fn work_unit_655_08_association_disclosure_violation() {
+    // Independently safe endpoints do not make the association safe.
+    let mut case = Case::ready();
+    case.draft.disclosure_evidence = None;
+    assert!(case.run().is_err());
+    // Explicit denial.
+    let mut case = Case::ready();
+    case.draft
+        .disclosure_evidence
+        .as_mut()
+        .expect("disclosure")
+        .permitted = Some(false);
+    assert!(case.run().is_err());
+    // Permitted flag with a rejecting decision.
+    let mut case = Case::ready();
+    case.draft
+        .disclosure_evidence
+        .as_mut()
+        .expect("disclosure")
+        .decision = EpistemicStatus::Rejected;
+    assert!(case.run().is_err());
+    // An empty owner is not an owner decision.
+    let mut case = Case::ready();
+    case.draft
+        .disclosure_evidence
+        .as_mut()
+        .expect("disclosure")
+        .owner
+        .clear();
+    assert!(case.run().is_err());
+}
+
+// WORK_UNIT_CASE: 655/9
+#[test]
+fn work_unit_655_09_exact_direct_relation_evidence() {
+    let case = Case::ready();
+    let result = case.run().expect("direct evidence relation");
+    assert_eq!(result.disposition, RelationDisposition::Positive);
+    assert_eq!(
+        result.closure.candidate.evidence_refs,
+        vec!["evidence-1".to_owned()]
+    );
+    assert!(
+        result
+            .closure
+            .candidate
+            .counterevidence_refs
+            .is_empty()
+    );
+    // Without direct evidence the relation is not positive.
+    let mut case = Case::ready();
+    case.draft.evidence.clear();
+    let result = case.run().expect("unsupported relation");
+    assert_ne!(result.disposition, RelationDisposition::Positive);
+}
+
+// WORK_UNIT_CASE: 655/10
+#[test]
+fn work_unit_655_10_partial_contradicted_unknown_evidence() {
+    // Contradicted: primary support plus unbound counterevidence.
+    let mut case = Case::ready();
+    let mut counter = case.draft.evidence[0].clone();
+    counter.named.id = id("target-b");
+    counter.named.external_grade = Some(relation_grade_binding("target-b").reference);
+    counter.polarity = RelationEvidencePolarity::Counter;
+    case.draft.counterevidence.push(counter);
+    case.policy
+        .grade_bindings
+        .push(relation_grade_binding("target-b"));
+    case.reseal();
+    let result = case.run().expect("contradicted relation");
+    assert_eq!(result.disposition, RelationDisposition::Conflict);
+    // Unknown polarity stays unknown: abstention, not a positive edge.
+    let mut case = Case::ready();
+    case.draft.evidence[0].polarity = RelationEvidencePolarity::Unknown;
+    let result = case.run().expect("unknown evidence relation");
+    assert_eq!(result.disposition, RelationDisposition::Abstention);
+    assert_eq!(
+        result.unknown_evidence_refs,
+        vec!["evidence-1".to_owned()]
+    );
+    // Partial coverage cannot ground a positive edge.
+    let mut case = Case::ready();
+    case.draft.evidence[0]
+        .named
+        .foundation_evidence_envelope
+        .coverage = EvidenceCoverage::PartialForScope;
+    let result = case.run().expect("partial evidence relation");
+    assert_eq!(result.disposition, RelationDisposition::Abstention);
 }
