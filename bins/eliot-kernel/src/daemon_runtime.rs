@@ -8,6 +8,7 @@
 use std::sync::atomic::Ordering;
 use std::time::Duration;
 
+use eliot_kernel_core::RouteScope;
 use eliot_kernel_service::{
     EliotdLaunchDescriptor, KernelControlCommand, KernelServiceError, KernelServiceState,
 };
@@ -15,7 +16,6 @@ use eliot_platform::PlatformHandle;
 use eliot_platform_windows::{
     current_process_named_pipe_expectation, observe_named_pipe_peer_process,
 };
-use eliot_kernel_core::RouteScope;
 use eliot_process::{
     CancellationStatus, Generation, ProcessExecutionError, ProcessLifecycle, ProcessOwnerBinding,
     ProcessStartReceipt,
@@ -382,8 +382,8 @@ impl KernelComposition {
             .map_err(|error| {
                 KernelBuildError::Service(format!("eliotd ORS cutover readback failed: {error}"))
             })?;
-        let scope =
-            RouteScope::new("daemon").map_err(|error| KernelBuildError::Service(error.to_string()))?;
+        let scope = RouteScope::new("daemon")
+            .map_err(|error| KernelBuildError::Service(error.to_string()))?;
         let generations = self
             .generations
             .lock()
@@ -421,9 +421,9 @@ impl KernelComposition {
             }
             Err(error) => {
                 observe_daemon_runtime("kernel.daemon.recovery_failed", "rejected");
-                super::kernel_diagnostics::observe_terminal_error(
-                    daemon_recovery_terminal_code(&error),
-                );
+                super::kernel_diagnostics::observe_terminal_error(daemon_recovery_terminal_code(
+                    &error,
+                ));
                 Err(error)
             }
         }

@@ -1,0 +1,19 @@
+{
+  "contract": "F-LOG-KERNEL-4 kernel generation/control diagnostics",
+  "issue": 903,
+  "target": "eliot_kernel::diagnostics",
+  "note": "Pins only the observation vocabulary exercised by the single focused integrator test: one generation-snapshot read, one rejected control transition with its stable terminal code, and one rejected generation cutover with its stable terminal code. The broader matrix (daemon-runtime recovery terminals, snapshot/cutover per-variant code sweeps, recovery persist/replay phases, identity/health omission outcomes, canary sweeps, ordering proofs) is deferred to the owning follow-ups.",
+  "terminal_event": "kernel.terminal_error",
+  "generation": {
+    "snapshot_requested": "kernel.generation.snapshot_requested",
+    "snapshot_committed": "kernel.generation.snapshot_committed",
+    "cutover_requested": "kernel.generation.cutover_requested",
+    "cutover_failed": "kernel.generation.cutover_failed",
+    "cutover_uncommitted_terminal": "CUTOVER_PLATFORM"
+  },
+  "control": {
+    "transition_requested": "kernel.control.transition_requested",
+    "transition_failed": "kernel.control.transition_failed",
+    "probe_ready_terminal": "CONTROL_READINESS_NOT_PROVEN"
+  }
+}

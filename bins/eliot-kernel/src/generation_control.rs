@@ -331,14 +331,12 @@ mod tests {
         ));
         let text = capture(|| {
             observe_generation("kernel.generation.cutover_requested", "attempt");
-            let fenced = fence_service_after_generation_failure(
-                &service,
-                "fence-canary-service-reason-903",
-            );
+            let fenced =
+                fence_service_after_generation_failure(&service, "fence-canary-service-reason-903");
             assert!(fenced.is_ok());
-            crate::kernel_diagnostics::observe_terminal_error(
-                generation_cutover_terminal_code(&KernelServiceError::GenerationFenced),
-            );
+            crate::kernel_diagnostics::observe_terminal_error(generation_cutover_terminal_code(
+                &KernelServiceError::GenerationFenced,
+            ));
         });
         for marker in [
             "kernel.generation.cutover_requested",
