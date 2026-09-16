@@ -29,7 +29,7 @@ use std::sync::Arc;
 use eliot_contracts::{RequestMetadata, StateFence};
 use eliot_governor::KernelPortError;
 use eliot_protocol::{HostRequestEnvelope, HostRequestResultBody};
-use eliot_read::{LocalReadPort, QueryResult, ReadError, ReadService};
+use eliot_read::{LocalReadPort, QueryResult, ReadError, ReadService, StoreReadFailure};
 use eliot_store_api::ScopeId;
 
 use super::{DaemonComposition, DaemonKernelClient, KernelContextReadClient};
@@ -90,7 +90,7 @@ pub async fn answer_evidence_query(
 ) -> Result<QueryResult, ReadError> {
     let client = composition
         .context_read_client(kernel)
-        .map_err(|error| ReadError::Store(error.to_string()))?;
+        .map_err(|_| ReadError::Store(StoreReadFailure::Unavailable))?;
     let service = ReadService::new(client);
     service
         .evidence_query(ctx, scope, subject, max_records)
@@ -112,7 +112,7 @@ pub async fn answer_projection_inputs(
 ) -> Result<QueryResult, ReadError> {
     let client = composition
         .context_read_client(kernel)
-        .map_err(|error| ReadError::Store(error.to_string()))?;
+        .map_err(|_| ReadError::Store(StoreReadFailure::Unavailable))?;
     let service = ReadService::new(client);
     service
         .projection_inputs(ctx, scope, packet_ref, material_refs)

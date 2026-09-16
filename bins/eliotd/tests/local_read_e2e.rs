@@ -41,7 +41,7 @@ use eliot_protocol::{
     HOST_REQUEST_RESULT_BODY_WIRE_ID, HOST_REQUEST_WIRE_ID, HostRequestEnvelope,
     HostRequestIdentity, HostRequestKind, HostRequestResultBody,
 };
-use eliot_read::{ProvenanceDisposition, ReadError, ReadProvenance, ReadService};
+use eliot_read::{ProvenanceDisposition, ReadError, ReadProvenance, ReadService, StoreReadFailure};
 use eliot_store_api::{
     CanonicalReadClient, EVIDENCE_PACK_MAX_RECORDS, NamedReadOperation, NamedReadRequest,
     NamedReadResponse, RevisionHead, RevisionKey, StoreError,
@@ -275,7 +275,10 @@ async fn admitted_query_serves_the_exact_captured_record() -> TestResult {
     let wrong_envelope = test_envelope("eliot.query", &wrong, &tool_digest(&tool)?)?;
     let fenced = eliotd::serve_admitted_local_read(&service, &fence, &wrong_envelope, &tool).await;
     assert!(
-        matches!(fenced, Err(ReadError::Store(ref reason)) if reason == &StoreError::FenceMismatch.to_string()),
+        matches!(
+            fenced,
+            Err(ReadError::Store(StoreReadFailure::FenceMismatch))
+        ),
         "a wrong fence must fail closed as FenceMismatch, got {fenced:?}"
     );
 
@@ -285,7 +288,10 @@ async fn admitted_query_serves_the_exact_captured_record() -> TestResult {
     let admitted_only =
         eliotd::serve_admitted_local_read(&service, &fence, &packet_envelope, &packet).await;
     assert!(
-        matches!(admitted_only, Err(ReadError::Store(ref reason)) if reason == &StoreError::Unavailable.to_string()),
+        matches!(
+            admitted_only,
+            Err(ReadError::Store(StoreReadFailure::Unavailable))
+        ),
         "packet must stay admission-only as Unavailable, got {admitted_only:?}"
     );
 
@@ -297,7 +303,7 @@ async fn admitted_query_serves_the_exact_captured_record() -> TestResult {
         eliotd::serve_admitted_local_read(&service, &fence, &position_envelope, &position_tool)
             .await;
     assert!(
-        matches!(rejected, Err(ReadError::Store(ref reason)) if reason == &StoreError::InvalidField { field: "operation.parameter", reason: "query intent never admits the evidence pack for this mode" }.to_string()),
+        matches!(rejected, Err(ReadError::Store(StoreReadFailure::InvalidField { ref field, ref reason })) if field == "operation.parameter" && reason == "query intent never admits the evidence pack for this mode"),
         "a non-evidence mode must fail closed as InvalidField, got {rejected:?}"
     );
     Ok(())

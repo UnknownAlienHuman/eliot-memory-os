@@ -46,7 +46,10 @@ use std::collections::BTreeMap;
 
 use eliot_contracts::RequestMetadata;
 use eliot_context_candidates::ProjectionState;
-use eliot_read::{QueryIntent, QueryMode, QueryRequest, ReadApi, ReadError, StateRequest};
+use eliot_read::{
+    BranchEnvironmentScope, FreshnessPolicy, NamedParameters, QueryIntent, QueryMode, QueryRequest,
+    ReadApi, ReadError, RequiredAssurance, StateRequest, TimeScope,
+};
 use eliot_store_api::{
     EVIDENCE_PACK_MAX_RECORDS, NamedReadOperation, ReadConsistency, RevisionHead, RevisionKey,
     ScopeId, ScopeRevisionView, WriteReceiptStatus,
@@ -349,7 +352,7 @@ impl<R: ReadApi + ?Sized> GovernorContextInputs<'_, R> {
                     scope_id: Some(request.scope_id.clone()),
                     consistency: ReadConsistency::ExactFence,
                     dependency_revisions: request.dependency_revisions.clone(),
-                    parameters: BTreeMap::new(),
+                    parameters: NamedParameters::new(),
                     provenance_handles: Vec::new(),
                 },
             )
@@ -389,7 +392,7 @@ impl<R: ReadApi + ?Sized> GovernorContextInputs<'_, R> {
                     scope_id: Some(request.scope_id.clone()),
                     consistency: ReadConsistency::ExactFence,
                     dependency_revisions: request.dependency_revisions.clone(),
-                    parameters: BTreeMap::new(),
+                    parameters: NamedParameters::new(),
                     provenance_handles: Vec::new(),
                 },
             )
@@ -423,12 +426,10 @@ impl<R: ReadApi + ?Sized> GovernorContextInputs<'_, R> {
                 QueryRequest {
                     intent: reconstruction_intent(),
                     operation,
-                    query: "reconstruct the bounded understanding-projection inputs".to_owned(),
-                    exact_resource_uri: None,
                     scope_id: Some(request.scope_id.clone()),
                     consistency: ReadConsistency::ExactFence,
                     dependency_revisions: request.dependency_revisions.clone(),
-                    parameters: BTreeMap::new(),
+                    parameters: NamedParameters::new(),
                     provenance_handles: Vec::new(),
                 },
             )
@@ -462,15 +463,19 @@ impl<R: ReadApi + ?Sized> GovernorContextInputs<'_, R> {
                 QueryRequest {
                     intent: reconstruction_intent(),
                     operation,
-                    query: "reconstruct the current epistemic position".to_owned(),
-                    exact_resource_uri: None,
                     scope_id: Some(request.scope_id.clone()),
                     consistency: ReadConsistency::ExactFence,
                     dependency_revisions: request.dependency_revisions.clone(),
-                    parameters: BTreeMap::from([(
+                    parameters: NamedParameters::from_map(BTreeMap::from([(
                         "position".to_owned(),
                         Value::String(request.epistemic_position.clone()),
-                    )]),
+                    )]))
+                    .map_err(|error| {
+                        ContextInputsError::RequestRejected(bounded_reason(
+                            "invalid epistemic selectors",
+                            error,
+                        ))
+                    })?,
                     provenance_handles: Vec::new(),
                 },
             )
@@ -515,12 +520,10 @@ impl<R: ReadApi + ?Sized> GovernorContextInputs<'_, R> {
                 QueryRequest {
                     intent: reconstruction_intent(),
                     operation,
-                    query: "reconstruct the bounded evidence pack".to_owned(),
-                    exact_resource_uri: None,
                     scope_id: Some(request.scope_id.clone()),
                     consistency: ReadConsistency::ExactFence,
                     dependency_revisions: request.dependency_revisions.clone(),
-                    parameters: BTreeMap::from([
+                    parameters: NamedParameters::from_map(BTreeMap::from([
                         (
                             "subject".to_owned(),
                             Value::String(request.evidence_subject.clone()),
@@ -529,7 +532,13 @@ impl<R: ReadApi + ?Sized> GovernorContextInputs<'_, R> {
                             "max_records".to_owned(),
                             Value::String(request.evidence_max_records.to_string()),
                         ),
-                    ]),
+                    ]))
+                    .map_err(|error| {
+                        ContextInputsError::RequestRejected(bounded_reason(
+                            "invalid evidence selectors",
+                            error,
+                        ))
+                    })?,
                     provenance_handles: Vec::new(),
                 },
             )
@@ -562,10 +571,10 @@ impl<R: ReadApi + ?Sized> GovernorContextInputs<'_, R> {
 fn reconstruction_intent() -> QueryIntent {
     QueryIntent {
         mode: QueryMode::ContextReconstruction,
-        time_scope: "reconstruction closure under the declared fence".to_owned(),
-        branch_environment_scope: "request scope and fence only".to_owned(),
-        freshness_policy: "exact-fence reads with declared dependency revisions".to_owned(),
-        required_assurance: "input reconstruction only; no admission or proof".to_owned(),
+        time_scope: TimeScope::DeclaredFence,
+        branch_environment_scope: BranchEnvironmentScope::RequestScope,
+        freshness_policy: FreshnessPolicy::ExactFence,
+        required_assurance: RequiredAssurance::InputReconstructionOnly,
     }
 }
 
@@ -760,6 +769,7 @@ fn classify_evidence_payload(
 #[cfg(test)]
 mod reconstruction_tests {
     use super::*;
+    use eliot_read::StoreReadFailure;
 
     type ProofResult<T = ()> = Result<T, Box<dyn std::error::Error>>;
 
@@ -790,7 +800,7 @@ mod reconstruction_tests {
     #[test]
     fn store_and_churn_failures_are_never_empty() -> ProofResult {
         let unavailable =
-            classify_read_error(ReadError::Store("unknown operation".to_owned()))?;
+            classify_read_error(ReadError::Store(StoreReadFailure::UnknownOperation))?;
         assert!(matches!(
             unavailable,
             ProjectionState::Unavailable { .. }
@@ -800,7 +810,9 @@ mod reconstruction_tests {
         let blocked = classify_read_error(ReadError::MissingDependencies)?;
         assert!(matches!(blocked, ProjectionState::Blocked { .. }));
         // Caller-shape rejections abort instead of becoming dispositions.
-        assert!(classify_read_error(ReadError::EmptyField("query.query".to_owned())).is_err());
+        assert!(
+            classify_read_error(ReadError::EmptyField("parameters.position".to_owned())).is_err()
+        );
         Ok(())
     }
 

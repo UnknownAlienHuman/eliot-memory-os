@@ -1,10 +1,21 @@
 //! G-06 Governor read/query contracts and named-read facade.
 //!
-//! This crate owns the semantic read boundary above the store-neutral named
-//! read port. Requests carry explicit intent, scope, consistency and fence
+//! DISPOSITION (#1144, WIRE): this crate is the declared Governor read facade.
+//! It is a stateless projection over the store-neutral named read port
+//! ([`CanonicalReadClient`]): it owns no cache, no freshness state, and no
+//! second consistency algorithm. Every read binds the caller request identity,
+//! scope, consistency, dependency revisions, current [`StateFence`], and exact
+//! source/evidence handles, and returns revision heads with provenance
+//! disposition so callers can revalidate. Real consumers: `eliot-governor`
+//! (`ReadApi` for context/input reconstruction) and `eliotd` (`LocalReadPort`
+//! for `eliot.query` / `eliot.packet` answers).
+//!
+//! Requests carry explicit intent, scope, consistency and fence
 //! dependencies. The facade never accepts raw database query text, writes
 //! canonical state, or treats a payload as proof merely because it was read.
-//! Store payloads remain opaque; callers receive their exact payload together
+//! Intent dimensions are closed enums, named parameters are bounded scalar
+//! selectors, and store failures keep their exact typed identity. Store
+//! payloads remain opaque; callers receive their exact payload together
 //! with revision and provenance disposition so a later layer can apply the
 //! appropriate semantic contract.
 
@@ -29,7 +40,7 @@ use thiserror::Error;
 /// Stable wire name for the Governor read contract.
 pub const CONTRACT_NAME: &str = "eliot.governor.read";
 /// Current wire revision for the Governor read contract.
-pub const CONTRACT_VERSION: ContractVersion = ContractVersion::new(1, 0, 0);
+pub const CONTRACT_VERSION: ContractVersion = ContractVersion::new(2, 0, 0);
 
 /// Closed semantic query modes from the public ELIOT query surface.
 #[derive(Clone, Copy, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
@@ -51,33 +62,77 @@ pub enum QueryMode {
     ContextReconstruction,
 }
 
+/// Closed time-window semantics for a broad query: the window is always
+/// bounded by the request fence, never wall-clock inference.
+#[derive(Clone, Copy, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TimeScope {
+    /// Bounded closure under the exact declared fence.
+    DeclaredFence,
+    /// Bounded captured-evidence window under the declared fence.
+    EvidenceWindow,
+    /// Bounded projection-inputs window under the declared fence.
+    ProjectionWindow,
+    /// Bounded task window under the declared fence.
+    TaskWindow,
+}
+
+/// Closed branch/environment scope for a broad query.
+#[derive(Clone, Copy, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum BranchEnvironmentScope {
+    /// Exactly the request scope and fence, nothing wider.
+    RequestScope,
+    /// The local Governor branch and environment serving the read.
+    LocalEnvironment,
+}
+
+/// Closed freshness behavior for a broad query. Freshness is never inferred:
+/// each variant names the exact revision/fence evidence the read enforces.
+#[derive(Clone, Copy, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FreshnessPolicy {
+    /// Exactly the captured records, no newer or older substitution.
+    ExactCapturedRecords,
+    /// Exact-fence reads with declared dependency revisions.
+    ExactFence,
+    /// Exactly the projection inputs, nothing wider.
+    ProjectionInputsOnly,
+    /// Exactly the admitted generation, never a stale generation as current.
+    AdmittedGeneration,
+}
+
+/// Closed assurance/proof behavior for a broad query. A read never admits,
+/// proves, or finishes work; it only names the allowed read-only use.
+#[derive(Clone, Copy, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RequiredAssurance {
+    /// Verifier-oriented evidence read.
+    VerifierEvidence,
+    /// Input reconstruction read; no admission or proof.
+    ReconstructionInputs,
+    /// Input reconstruction only; explicitly no admission, proof, or finish.
+    InputReconstructionOnly,
+}
+
 /// Explicit assurance semantics for a broad query.
-#[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
+///
+/// Every dimension is a closed enum: free-text intent prose is not a selector
+/// and never crosses this boundary. Agent-facing free text stays at the
+/// calling surface; only these typed dimensions enter the Governor facade.
+#[derive(Clone, Copy, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct QueryIntent {
     /// Semantic query mode.
     pub mode: QueryMode,
-    /// Exact time window or named temporal scope.
-    pub time_scope: String,
+    /// Exact time window, always bounded by the request fence.
+    pub time_scope: TimeScope,
     /// Branch and environment scope.
-    pub branch_environment_scope: String,
+    pub branch_environment_scope: BranchEnvironmentScope,
     /// Required freshness behavior.
-    pub freshness_policy: String,
+    pub freshness_policy: FreshnessPolicy,
     /// Required assurance/proof behavior.
-    pub required_assurance: String,
-}
-
-impl QueryIntent {
-    /// Validates the explicit intent dimensions.
-    pub fn validate(&self) -> Result<(), ReadError> {
-        text(&self.time_scope, "query.intent.time_scope")?;
-        text(
-            &self.branch_environment_scope,
-            "query.intent.branch_environment_scope",
-        )?;
-        text(&self.freshness_policy, "query.intent.freshness_policy")?;
-        text(&self.required_assurance, "query.intent.required_assurance")
-    }
+    pub required_assurance: RequiredAssurance,
 }
 
 /// Immutable exact resource URI used for expansion reads.
@@ -184,6 +239,133 @@ impl ReadProvenance {
     }
 }
 
+/// Closed named-operation selectors for one read.
+///
+/// The transport is the same store-neutral selector map the Store catalogue
+/// gates, but this boundary is closed: at most [`Self::MAX_ENTRIES`] entries,
+/// non-blank control-free keys bounded to [`Self::MAX_KEY_CHARS`] characters,
+/// scalar values only (bounded text, number, boolean — never null, never a
+/// nested array/object filter), and the retired top-level selector names
+/// (`query`, `exact_resource_uri`) rejected so a pre-wire caller cannot
+/// smuggle a free-text selector through the parameter namespace. Per-operation
+/// allowed keys stay owned by the Store operation catalogue, which re-gates
+/// every request before dispatch.
+#[derive(Clone, Debug, Default, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct NamedParameters(BTreeMap<String, Value>);
+
+impl NamedParameters {
+    /// Maximum closed selectors carried by one read request.
+    pub const MAX_ENTRIES: usize = 32;
+    /// Maximum key length in characters.
+    pub const MAX_KEY_CHARS: usize = 128;
+    /// Maximum text selector length in characters.
+    pub const MAX_STRING_CHARS: usize = 8192;
+
+    /// Creates an empty closed selector map.
+    #[must_use]
+    pub fn new() -> Self {
+        Self(BTreeMap::new())
+    }
+
+    /// Wraps an exact selector map after validating every entry.
+    pub fn from_map(map: BTreeMap<String, Value>) -> Result<Self, ReadError> {
+        let parameters = Self(map);
+        parameters.validate()?;
+        Ok(parameters)
+    }
+
+    /// Validates every closed selector entry.
+    pub fn validate(&self) -> Result<(), ReadError> {
+        if self.0.len() > Self::MAX_ENTRIES {
+            return Err(ReadError::InvalidField {
+                field: "named_parameters".to_owned(),
+                reason: "exceeds 32 closed selectors".to_owned(),
+            });
+        }
+        for (name, value) in &self.0 {
+            text(name, "named_parameter")?;
+            if name.chars().count() > Self::MAX_KEY_CHARS {
+                return Err(ReadError::InvalidField {
+                    field: "named_parameter".to_owned(),
+                    reason: "selector name exceeds 128 characters".to_owned(),
+                });
+            }
+            if name == "query" || name == "exact_resource_uri" {
+                return Err(ReadError::DuplicateField("named_parameters".to_owned()));
+            }
+            match value {
+                Value::Null => {
+                    return Err(ReadError::InvalidField {
+                        field: "named_parameter".to_owned(),
+                        reason: "null values are not allowed".to_owned(),
+                    });
+                }
+                Value::String(selector) => {
+                    text(selector, "named_parameter")?;
+                    if selector.chars().count() > Self::MAX_STRING_CHARS {
+                        return Err(ReadError::InvalidField {
+                            field: "named_parameter".to_owned(),
+                            reason: "text selector exceeds 8192 characters".to_owned(),
+                        });
+                    }
+                }
+                Value::Number(_) | Value::Bool(_) => {}
+                Value::Array(_) | Value::Object(_) => {
+                    return Err(ReadError::InvalidField {
+                        field: "named_parameter".to_owned(),
+                        reason: "nested filters are not allowed; closed scalar selectors only"
+                            .to_owned(),
+                    });
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Inserts one exact selector, rejecting collisions and malformed entries.
+    pub fn insert(&mut self, key: String, value: Value) -> Result<(), ReadError> {
+        if self.0.contains_key(&key) {
+            return Err(ReadError::DuplicateField("named_parameters".to_owned()));
+        }
+        let candidate = Self(BTreeMap::from([(key, value)]));
+        candidate.validate()?;
+        self.0.extend(candidate.0);
+        Ok(())
+    }
+
+    /// Inserts one exact text selector owned by the facade itself (for example
+    /// the resource URI an expansion read binds). Caller-supplied collisions
+    /// fail closed so an exact identity can never be shadowed.
+    pub fn insert_exact(&mut self, key: &str, value: &str) -> Result<(), ReadError> {
+        self.insert(key.to_owned(), Value::String(value.to_owned()))
+    }
+
+    /// Returns the underlying selector map for store-neutral dispatch.
+    #[must_use]
+    pub fn as_map(&self) -> &BTreeMap<String, Value> {
+        &self.0
+    }
+
+    /// Consumes the wrapper into the underlying selector map.
+    #[must_use]
+    pub fn into_inner(self) -> BTreeMap<String, Value> {
+        self.0
+    }
+
+    /// Returns the number of closed selectors.
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.0.len()
+    }
+
+    /// Returns true when no selector is bound.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+}
+
 /// Request for one bounded current-state named read.
 #[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -196,8 +378,8 @@ pub struct StateRequest {
     pub consistency: ReadConsistency,
     /// Dependency revisions used for at-least and stable reads.
     pub dependency_revisions: BTreeMap<RevisionKey, u64>,
-    /// Named operation parameters; never a raw query string.
-    pub parameters: BTreeMap<String, Value>,
+    /// Closed named selectors; never a raw query string.
+    pub parameters: NamedParameters,
     /// Exact source/evidence handles for result lineage.
     #[serde(default)]
     pub provenance_handles: Vec<ProvenanceHandle>,
@@ -213,7 +395,7 @@ impl StateRequest {
             });
         }
         validate_dependencies(&self.dependency_revisions)?;
-        validate_parameters(&self.parameters)?;
+        self.parameters.validate()?;
         if requires_scope(self.operation) && self.scope_id.is_none() {
             return Err(ReadError::ScopeRequired);
         }
@@ -223,25 +405,28 @@ impl StateRequest {
 }
 
 /// Request for one explicit-intent query.
+///
+/// There is no free-text query field: the closed named operation plus the
+/// closed selectors in [`NamedParameters`] fully determine the read, and the
+/// typed [`QueryIntent`] names the allowed read-only use. Human query text
+/// stays at the calling agent surface and never crosses this facade, so it
+/// can never be mistaken for a store selector. Exact resource expansion uses
+/// [`ResourceRequest`], never this type.
 #[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct QueryRequest {
-    /// Mandatory semantic intent; exact resources may use [`ResourceRequest`].
+    /// Mandatory semantic intent; exact resources use [`ResourceRequest`].
     pub intent: QueryIntent,
     /// Closed named operation selected by the Governor read model.
     pub operation: NamedReadOperation,
-    /// Human/query text or exact selector, treated as data.
-    pub query: String,
-    /// Optional exact resource selector for a bounded expansion.
-    pub exact_resource_uri: Option<EliotResourceUri>,
     /// Optional scope to which the query is bound.
     pub scope_id: Option<ScopeId>,
     /// Required read consistency.
     pub consistency: ReadConsistency,
     /// Dependency revisions used for consistency validation.
     pub dependency_revisions: BTreeMap<RevisionKey, u64>,
-    /// Closed named parameters; no physical query syntax is accepted.
-    pub parameters: BTreeMap<String, Value>,
+    /// Closed named selectors; no physical query syntax is accepted.
+    pub parameters: NamedParameters,
     /// Exact source/evidence handles for result lineage.
     #[serde(default)]
     pub provenance_handles: Vec<ProvenanceHandle>,
@@ -250,16 +435,11 @@ pub struct QueryRequest {
 impl QueryRequest {
     /// Validates intent, operation semantics and bounded selectors.
     pub fn validate(&self) -> Result<(), ReadError> {
-        self.intent.validate()?;
-        text(&self.query, "query.query")?;
         validate_dependencies(&self.dependency_revisions)?;
-        validate_parameters(&self.parameters)?;
+        self.parameters.validate()?;
         ReadProvenance::from_handles(&self.provenance_handles)?;
         if requires_scope(self.operation) && self.scope_id.is_none() {
             return Err(ReadError::ScopeRequired);
-        }
-        if let Some(uri) = &self.exact_resource_uri {
-            text(uri.as_str(), "query.exact_resource_uri")?;
         }
         if !operation_matches_intent(self.operation, self.intent.mode) {
             return Err(ReadError::InvalidIntentOperation {
@@ -285,8 +465,8 @@ pub struct ResourceRequest {
     pub consistency: ReadConsistency,
     /// Dependency revisions used for consistency validation.
     pub dependency_revisions: BTreeMap<RevisionKey, u64>,
-    /// Additional closed parameters for the named operation.
-    pub parameters: BTreeMap<String, Value>,
+    /// Additional closed selectors for the named operation.
+    pub parameters: NamedParameters,
     /// Exact source/evidence handles for result lineage.
     #[serde(default)]
     pub provenance_handles: Vec<ProvenanceHandle>,
@@ -296,7 +476,7 @@ impl ResourceRequest {
     /// Validates exact resource ownership and bounded read parameters.
     pub fn validate(&self) -> Result<(), ReadError> {
         validate_dependencies(&self.dependency_revisions)?;
-        validate_parameters(&self.parameters)?;
+        self.parameters.validate()?;
         ReadProvenance::from_handles(&self.provenance_handles)?;
         if requires_scope(self.operation) && self.scope_id.is_none() {
             return Err(ReadError::ScopeRequired);
@@ -421,14 +601,173 @@ pub enum ReadError {
     /// A read response is older than the declared minimum revision.
     #[error("read response is behind the declared minimum revision")]
     StaleRevision,
-    /// Store boundary rejected the named read.
+    /// Store boundary rejected the named read, with its exact typed identity.
+    ///
+    /// Every [`StoreError`] discriminant maps to exactly one variant below, so
+    /// stale, conflicted, missing, unknown, partial, and unavailable outcomes
+    /// stay distinguishable and can never collapse into a successful
+    /// empty/current result. The mapping in `From<StoreError>` is exhaustive:
+    /// a future store variant fails compilation here until it is assigned an
+    /// explicit disposition, never silently erased.
     #[error("store read: {0}")]
-    Store(String),
+    Store(StoreReadFailure),
+}
+
+/// Typed store-boundary failure for Governor reads.
+///
+/// This mirrors every [`StoreError`] discriminant in store-neutral Governor
+/// vocabulary. Static store details (`field`/`reason`) become bounded owned
+/// strings; transitions digests keep their expected/observed pair; contract
+/// inner errors keep their exact display text. No variant carries provider
+/// secrets or raw query text.
+#[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum StoreReadFailure {
+    /// A required field is malformed or out of bounds.
+    InvalidField {
+        /// Name of the malformed field.
+        field: String,
+        /// Validation reason for the malformed field.
+        reason: String,
+    },
+    /// A required field is empty.
+    Empty {
+        /// Name of the empty field.
+        field: String,
+    },
+    /// Duplicate exact values were supplied.
+    Duplicate {
+        /// Name of the duplicated field.
+        field: String,
+    },
+    /// Foundation contract rejection, with its exact display text.
+    Foundation(String),
+    /// Security contract rejection, with its exact display text.
+    Security(String),
+    /// Receipt contract rejection, with its exact display text.
+    Receipt(String),
+    /// The named operation is unknown to the store catalogue.
+    UnknownOperation,
+    /// The operation manifest digest does not match.
+    ManifestMismatch,
+    /// The transition class ceiling was exceeded.
+    TransitionClassExceeded,
+    /// The effect ceiling was exceeded.
+    EffectCeilingExceeded,
+    /// The state fence does not match; never served as current.
+    FenceMismatch,
+    /// A revision conflict was observed.
+    RevisionConflict,
+    /// An ordering conflict was observed.
+    OrderingConflict,
+    /// The projection publication is invalid.
+    InvalidProjection,
+    /// The outbox intent is invalid.
+    InvalidOutbox,
+    /// The terminal receipt is invalid.
+    InvalidReceipt,
+    /// An identity conflict was observed.
+    IdentityConflict,
+    /// A transition digest mismatch with the claimed and observed digests.
+    TransitionDigestMismatch {
+        /// Claimed digest.
+        expected: String,
+        /// Recomputed digest.
+        observed: String,
+    },
+    /// The receipt was not found.
+    ReceiptNotFound,
+    /// The receipt envelope is missing; write outcome is unknown.
+    MissingReceiptEnvelope,
+    /// The payload exceeds the named-operation limit.
+    PayloadTooLarge,
+    /// The store is unavailable; never an empty success.
+    Unavailable,
+    /// Canonical serialization failed, with its exact display text.
+    Serialization(String),
+}
+
+impl std::fmt::Display for StoreReadFailure {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::InvalidField { field, reason } => {
+                write!(formatter, "invalid field {field}: {reason}")
+            }
+            Self::Empty { field } => write!(formatter, "empty field {field}"),
+            Self::Duplicate { field } => write!(formatter, "duplicate values in {field}"),
+            Self::Foundation(detail)
+            | Self::Security(detail)
+            | Self::Receipt(detail)
+            | Self::Serialization(detail) => formatter.write_str(detail),
+            Self::UnknownOperation => formatter.write_str("unknown named operation"),
+            Self::ManifestMismatch => formatter.write_str("operation manifest digest mismatch"),
+            Self::TransitionClassExceeded => {
+                formatter.write_str("transition class ceiling exceeded")
+            }
+            Self::EffectCeilingExceeded => formatter.write_str("effect ceiling exceeded"),
+            Self::FenceMismatch => formatter.write_str("state fence mismatch"),
+            Self::RevisionConflict => formatter.write_str("revision conflict"),
+            Self::OrderingConflict => formatter.write_str("ordering conflict"),
+            Self::InvalidProjection => formatter.write_str("invalid projection publication"),
+            Self::InvalidOutbox => formatter.write_str("invalid outbox intent"),
+            Self::InvalidReceipt => formatter.write_str("invalid terminal receipt"),
+            Self::IdentityConflict => formatter.write_str("identity conflict"),
+            Self::TransitionDigestMismatch { expected, observed } => write!(
+                formatter,
+                "transition digest mismatch: expected {expected}, observed {observed}"
+            ),
+            Self::ReceiptNotFound => formatter.write_str("receipt not found"),
+            Self::MissingReceiptEnvelope => {
+                formatter.write_str("receipt envelope is missing; write outcome is unknown")
+            }
+            Self::PayloadTooLarge => formatter.write_str("payload exceeds named-operation limit"),
+            Self::Unavailable => formatter.write_str("store unavailable"),
+        }
+    }
+}
+
+impl From<StoreError> for StoreReadFailure {
+    fn from(error: StoreError) -> Self {
+        match error {
+            StoreError::InvalidField { field, reason } => Self::InvalidField {
+                field: field.to_owned(),
+                reason: reason.to_owned(),
+            },
+            StoreError::Empty { field } => Self::Empty {
+                field: field.to_owned(),
+            },
+            StoreError::Duplicate { field } => Self::Duplicate {
+                field: field.to_owned(),
+            },
+            StoreError::Foundation(error) => Self::Foundation(error.to_string()),
+            StoreError::Security(error) => Self::Security(error.to_string()),
+            StoreError::Receipt(error) => Self::Receipt(error.to_string()),
+            StoreError::UnknownOperation => Self::UnknownOperation,
+            StoreError::ManifestMismatch => Self::ManifestMismatch,
+            StoreError::TransitionClassExceeded => Self::TransitionClassExceeded,
+            StoreError::EffectCeilingExceeded => Self::EffectCeilingExceeded,
+            StoreError::FenceMismatch => Self::FenceMismatch,
+            StoreError::RevisionConflict => Self::RevisionConflict,
+            StoreError::OrderingConflict => Self::OrderingConflict,
+            StoreError::InvalidProjection => Self::InvalidProjection,
+            StoreError::InvalidOutbox => Self::InvalidOutbox,
+            StoreError::InvalidReceipt => Self::InvalidReceipt,
+            StoreError::IdentityConflict => Self::IdentityConflict,
+            StoreError::TransitionDigestMismatch { expected, observed } => {
+                Self::TransitionDigestMismatch { expected, observed }
+            }
+            StoreError::ReceiptNotFound => Self::ReceiptNotFound,
+            StoreError::MissingReceiptEnvelope => Self::MissingReceiptEnvelope,
+            StoreError::PayloadTooLarge => Self::PayloadTooLarge,
+            StoreError::Unavailable => Self::Unavailable,
+            StoreError::Serialization(detail) => Self::Serialization(detail),
+        }
+    }
 }
 
 impl From<StoreError> for ReadError {
     fn from(error: StoreError) -> Self {
-        Self::Store(error.to_string())
+        Self::Store(StoreReadFailure::from(error))
     }
 }
 
@@ -513,22 +852,21 @@ impl<C: CanonicalReadClient> LocalReadPort for ReadService<C> {
         }
         let intent = QueryIntent {
             mode: QueryMode::Verification,
-            time_scope: "governor local evidence window".to_owned(),
-            branch_environment_scope: "governor local branch and environment".to_owned(),
-            freshness_policy: "exact captured records only".to_owned(),
-            required_assurance: "verifier evidence read".to_owned(),
+            time_scope: TimeScope::EvidenceWindow,
+            branch_environment_scope: BranchEnvironmentScope::LocalEnvironment,
+            freshness_policy: FreshnessPolicy::ExactCapturedRecords,
+            required_assurance: RequiredAssurance::VerifierEvidence,
         };
-        let mut parameters = BTreeMap::new();
-        parameters.insert("subject".to_owned(), Value::String(subject.clone()));
-        parameters.insert(
-            "max_records".to_owned(),
-            Value::String(max_records.to_string()),
-        );
+        let parameters = NamedParameters::from_map(BTreeMap::from([
+            ("subject".to_owned(), Value::String(subject)),
+            (
+                "max_records".to_owned(),
+                Value::String(max_records.to_string()),
+            ),
+        ]))?;
         let request = QueryRequest {
             intent,
             operation: NamedReadOperation::GetEvidencePack,
-            query: format!("subject:{subject}"),
-            exact_resource_uri: None,
             scope_id: Some(scope),
             consistency: ReadConsistency::Eventual,
             dependency_revisions: BTreeMap::new(),
@@ -563,33 +901,29 @@ impl<C: CanonicalReadClient> LocalReadPort for ReadService<C> {
         }
         let intent = QueryIntent {
             mode: QueryMode::ContextReconstruction,
-            time_scope: "governor local projection window".to_owned(),
-            branch_environment_scope: "governor local branch and environment".to_owned(),
-            freshness_policy: "exact projection inputs only".to_owned(),
-            required_assurance: "context reconstruction read".to_owned(),
+            time_scope: TimeScope::ProjectionWindow,
+            branch_environment_scope: BranchEnvironmentScope::LocalEnvironment,
+            freshness_policy: FreshnessPolicy::ProjectionInputsOnly,
+            required_assurance: RequiredAssurance::ReconstructionInputs,
         };
-        let query_text = match &packet_ref {
-            Some(packet) => format!("packet:{packet}"),
-            None => "packet:projection-inputs".to_owned(),
-        };
-        // Facade-valid shape today (scope-bound, admitted intent/operation);
-        // no `packet_ref` / `material_refs` parameter mapping exists until
-        // MGR04 (#19) declares the storage schema, so no selectors cross.
+        // Facade-valid shape today (scope-bound, admitted intent/operation).
+        // `packet_ref` / `material_refs` are validated above but map to no
+        // selector yet: no `packet_ref` / `material_refs` parameter mapping
+        // exists until MGR04 (#19) declares the storage schema, so no
+        // selectors cross and no free text enters the request.
         let request = QueryRequest {
             intent,
             operation: NamedReadOperation::GetUnderstandingProjectionInputs,
-            query: query_text,
-            exact_resource_uri: None,
             scope_id: Some(scope),
             consistency: ReadConsistency::Eventual,
             dependency_revisions: BTreeMap::new(),
-            parameters: BTreeMap::new(),
+            parameters: NamedParameters::new(),
             provenance_handles: Vec::new(),
         };
         request.validate()?;
         // Storage has no catalogue row, parameter schema, or adapter handler
         // for this operation on base: fail closed, never `Ok`-empty.
-        Err(ReadError::Store(StoreError::Unavailable.to_string()))
+        Err(ReadError::Store(StoreReadFailure::Unavailable))
     }
 }
 
@@ -617,7 +951,7 @@ impl<C: CanonicalReadClient> ReadService<C> {
         scope_id: Option<ScopeId>,
         consistency: ReadConsistency,
         dependencies: &BTreeMap<RevisionKey, u64>,
-        parameters: &BTreeMap<String, Value>,
+        parameters: &NamedParameters,
         handles: &[ProvenanceHandle],
     ) -> Result<NamedReadResponse, ReadError> {
         ctx.validate().map_err(|error| ReadError::InvalidField {
@@ -643,7 +977,7 @@ impl<C: CanonicalReadClient> ReadService<C> {
             scope_id,
             consistency,
             state_fence: ctx.state_fence.clone(),
-            parameters: parameters.clone(),
+            parameters: parameters.as_map().clone(),
         };
         request.validate()?;
         let response = self.store.execute_named(request).await?;
@@ -714,7 +1048,6 @@ impl<C: CanonicalReadClient> ReadApi for ReadService<C> {
         request: QueryRequest,
     ) -> Result<QueryResult, ReadError> {
         request.validate()?;
-        let parameters = query_parameters(&request)?;
         let response = self
             .execute(
                 ctx,
@@ -722,7 +1055,7 @@ impl<C: CanonicalReadClient> ReadApi for ReadService<C> {
                 request.scope_id,
                 request.consistency,
                 &request.dependency_revisions,
-                &parameters,
+                &request.parameters,
                 &request.provenance_handles,
             )
             .await?;
@@ -744,7 +1077,7 @@ impl<C: CanonicalReadClient> ReadApi for ReadService<C> {
     ) -> Result<ResourceContent, ReadError> {
         request.validate()?;
         let mut parameters = request.parameters.clone();
-        insert_exact_parameter(&mut parameters, "resource_uri", request.uri.as_str())?;
+        parameters.insert_exact("resource_uri", request.uri.as_str())?;
         let response = self
             .execute(
                 ctx,
@@ -785,7 +1118,7 @@ pub fn contract_identity() -> Result<ContractIdentity, eliot_contracts::Contract
         &Shape {
             surface: "governor_named_read_query_and_resource_facade",
             version: CONTRACT_VERSION,
-            raw_query_rule: "closed_named_operations_only",
+            raw_query_rule: "closed_named_operations_and_scalar_selectors_only",
             stable_read_rule: "revision_heads_before_and_after_named_read",
             provenance_rule: "exact_handles_or_read_only_unavailable_disposition",
         },
@@ -896,43 +1229,6 @@ pub const fn context_reconstruction_operations() -> [NamedReadOperation; 6] {
     ]
 }
 
-fn query_parameters(request: &QueryRequest) -> Result<BTreeMap<String, Value>, ReadError> {
-    // T11.1: free-text `query` is explicit intent data only, never a store
-    // selector. The closed catalogue admits only owner-declared selectors
-    // (e.g. `subject`/`max_records` for `GetEvidencePack`); forwarding free
-    // text as a `query` parameter always fails the catalogue gate with
-    // "unknown parameter" and can never return the acceptance read. Callers
-    // supply closed selectors in `request.parameters`; a smuggled `query` or
-    // `exact_resource_uri` key fails closed here before transport, and a
-    // `QueryRequest`-level `exact_resource_uri` fails closed because exact
-    // expansion uses `ResourceRequest`, not `QueryRequest`.
-    if request.parameters.contains_key("query") {
-        return Err(ReadError::DuplicateField("named_parameters".to_owned()));
-    }
-    if request.parameters.contains_key("exact_resource_uri") {
-        return Err(ReadError::DuplicateField("named_parameters".to_owned()));
-    }
-    if request.exact_resource_uri.is_some() {
-        return Err(ReadError::InvalidField {
-            field: "query.exact_resource_uri".to_owned(),
-            reason: "exact resource expansion uses ResourceRequest, not QueryRequest".to_owned(),
-        });
-    }
-    Ok(request.parameters.clone())
-}
-
-fn insert_exact_parameter(
-    parameters: &mut BTreeMap<String, Value>,
-    key: &str,
-    value: &str,
-) -> Result<(), ReadError> {
-    if parameters.contains_key(key) {
-        return Err(ReadError::DuplicateField("named_parameters".to_owned()));
-    }
-    parameters.insert(key.to_owned(), Value::String(value.to_owned()));
-    Ok(())
-}
-
 fn validate_dependencies(dependencies: &BTreeMap<RevisionKey, u64>) -> Result<(), ReadError> {
     if dependencies.values().any(|revision| *revision == 0) {
         return Err(ReadError::InvalidDependencyRevision);
@@ -986,19 +1282,6 @@ fn same_dependency_heads(
             .map(|head| head.revision);
         left_revision == right_revision
     })
-}
-
-fn validate_parameters(parameters: &BTreeMap<String, Value>) -> Result<(), ReadError> {
-    for (name, value) in parameters {
-        text(name, "named_parameter")?;
-        if value.is_null() {
-            return Err(ReadError::InvalidField {
-                field: "named_parameter".to_owned(),
-                reason: "null values are not allowed".to_owned(),
-            });
-        }
-    }
-    Ok(())
 }
 
 fn text(value: &str, field: &'static str) -> Result<(), ReadError> {
@@ -1099,23 +1382,28 @@ mod evidence_pack_read_tests {
         })
     }
 
-    fn evidence_params(subject: &str, max_records: &str) -> BTreeMap<String, Value> {
-        BTreeMap::from([
+    #[allow(
+        clippy::expect_used,
+        reason = "test-only closed selectors are statically known valid"
+    )]
+    fn evidence_params(subject: &str, max_records: &str) -> NamedParameters {
+        NamedParameters::from_map(BTreeMap::from([
             ("subject".to_owned(), Value::String(subject.to_owned())),
             (
                 "max_records".to_owned(),
                 Value::String(max_records.to_owned()),
             ),
-        ])
+        ]))
+        .expect("evidence selectors are closed and bounded")
     }
 
     fn verification_intent() -> QueryIntent {
         QueryIntent {
             mode: QueryMode::Verification,
-            time_scope: "evidence window for verification".to_owned(),
-            branch_environment_scope: "test branch and environment".to_owned(),
-            freshness_policy: "exact captured records only".to_owned(),
-            required_assurance: "verifier evidence read".to_owned(),
+            time_scope: TimeScope::EvidenceWindow,
+            branch_environment_scope: BranchEnvironmentScope::LocalEnvironment,
+            freshness_policy: FreshnessPolicy::ExactCapturedRecords,
+            required_assurance: RequiredAssurance::VerifierEvidence,
         }
     }
 
@@ -1123,13 +1411,11 @@ mod evidence_pack_read_tests {
         scope: Option<&str>,
         consistency: ReadConsistency,
         dependencies: BTreeMap<RevisionKey, u64>,
-        parameters: BTreeMap<String, Value>,
+        parameters: NamedParameters,
     ) -> Result<QueryRequest, StoreError> {
         Ok(QueryRequest {
             intent: verification_intent(),
             operation: NamedReadOperation::GetEvidencePack,
-            query: "retrieve the exact captured evidence record".to_owned(),
-            exact_resource_uri: None,
             scope_id: scope.map(ScopeId::new).transpose()?,
             consistency,
             dependency_revisions: dependencies,
@@ -1359,14 +1645,12 @@ mod evidence_pack_read_tests {
     }
 
     #[test]
-    fn evidence_pack_query_returns_exact_record_without_forwarding_free_text()
+    fn evidence_pack_query_returns_exact_record_through_closed_selectors()
     -> Result<(), Box<dyn std::error::Error>> {
-        // T11.1 (#1465 residual fix): free-text `query` is explicit intent
-        // data only and is never forwarded as a store selector. The closed
-        // catalogue admits only `subject`/`max_records` for `GetEvidencePack`;
-        // the facade forwards exactly those closed parameters. The free-text
-        // below deliberately differs from the subject to prove it is not used
-        // as a selector: the exact captured record still returns.
+        // T11.1 (#1465 residual fix, #1144 wire): the closed catalogue admits
+        // only `subject`/`max_records` for `GetEvidencePack`; the facade
+        // forwards exactly those closed selectors. There is no free-text
+        // query field: the operation plus selectors fully determine the read.
         let fence = fence()?;
         let ctx = metadata(&fence)?;
         let mut client = EvidenceTableClient::new(fence.clone());
@@ -1400,74 +1684,44 @@ mod evidence_pack_read_tests {
     }
 
     #[test]
-    fn evidence_pack_query_rejects_smuggled_free_text_and_resource_uri_params()
-    -> Result<(), Box<dyn std::error::Error>> {
-        // #1465 residual preserved: a caller that smuggles free text as a
-        // `query` store parameter, or an `exact_resource_uri` store parameter,
-        // still fails closed at the catalogue gate ("unknown parameter") —
-        // success would mean the boundary silently widened.
-        let fence_one = fence()?;
-        let ctx = metadata(&fence_one)?;
-        let service = ReadService::new(EvidenceTableClient::new(fence_one));
-        let mut smuggled = evidence_params("evidence-alpha", "10");
+    fn evidence_pack_query_rejects_reserved_selector_keys() -> Result<(), Box<dyn std::error::Error>>
+    {
+        // #1465 residual preserved, #1144 wire: a caller that smuggles the
+        // retired top-level selector names (`query`, `exact_resource_uri`) as
+        // store parameters still fails closed at construction — success
+        // would mean the boundary silently widened.
+        let mut smuggled = evidence_params("evidence-alpha", "10").into_inner();
         smuggled.insert("query".to_owned(), Value::String("free text".to_owned()));
-        let request = evidence_query(
-            Some("scope-evidence"),
-            ReadConsistency::Eventual,
-            BTreeMap::new(),
-            smuggled,
-        )?;
-        match block_on(service.query(&ctx, request)) {
-            Err(ReadError::DuplicateField(field)) => assert_eq!(field, "named_parameters"),
-            other => panic!("smuggled query param must fail closed, observed: {other:?}"),
-        }
+        assert!(
+            matches!(
+                NamedParameters::from_map(smuggled),
+                Err(ReadError::DuplicateField(field)) if field == "named_parameters"
+            ),
+            "smuggled query param must fail closed"
+        );
 
-        let fence_two = fence()?;
-        let ctx = metadata(&fence_two)?;
-        let service = ReadService::new(EvidenceTableClient::new(fence_two));
-        let mut smuggled_uri = evidence_params("evidence-alpha", "10");
+        let mut smuggled_uri = evidence_params("evidence-alpha", "10").into_inner();
         smuggled_uri.insert(
             "exact_resource_uri".to_owned(),
             Value::String("eliot://resource/1".to_owned()),
         );
+        assert!(
+            matches!(
+                NamedParameters::from_map(smuggled_uri),
+                Err(ReadError::DuplicateField(field)) if field == "named_parameters"
+            ),
+            "smuggled exact_resource_uri param must fail closed"
+        );
+        // Exact expansion uses `ResourceRequest`, never `QueryRequest`: there
+        // is no request-level URI field left to smuggle through, and the
+        // well-formed request still validates.
         let request = evidence_query(
-            Some("scope-evidence"),
-            ReadConsistency::Eventual,
-            BTreeMap::new(),
-            smuggled_uri,
-        )?;
-        match block_on(service.query(&ctx, request)) {
-            Err(ReadError::DuplicateField(field)) => assert_eq!(field, "named_parameters"),
-            other => {
-                panic!("smuggled exact_resource_uri param must fail closed, observed: {other:?}")
-            }
-        }
-        Ok(())
-    }
-
-    #[test]
-    fn evidence_pack_query_rejects_request_level_exact_resource_uri()
-    -> Result<(), Box<dyn std::error::Error>> {
-        // Exact expansion uses `ResourceRequest`, never `QueryRequest`: a
-        // request-level `exact_resource_uri` on a query fails closed before
-        // transport instead of being silently forwarded to the catalogue.
-        let fence = fence()?;
-        let ctx = metadata(&fence)?;
-        let service = ReadService::new(EvidenceTableClient::new(fence));
-        let mut request = evidence_query(
             Some("scope-evidence"),
             ReadConsistency::Eventual,
             BTreeMap::new(),
             evidence_params("evidence-alpha", "10"),
         )?;
-        request.exact_resource_uri =
-            Some(EliotResourceUri::new("eliot://resource/evidence-1")?);
-        match block_on(service.query(&ctx, request)) {
-            Err(ReadError::InvalidField { field, .. }) => {
-                assert_eq!(field, "query.exact_resource_uri");
-            }
-            other => panic!("query-level exact_resource_uri must fail closed, observed: {other:?}"),
-        }
+        request.validate()?;
         Ok(())
     }
 
@@ -1516,7 +1770,7 @@ mod evidence_pack_read_tests {
             scope_id: Some(ScopeId::new("scope-evidence")?),
             consistency: ReadConsistency::Eventual,
             state_fence: fence.clone(),
-            parameters: evidence_params("evidence-alpha", "10"),
+            parameters: evidence_params("evidence-alpha", "10").into_inner(),
         };
         let response = block_on(client.execute_named(request))?;
         assert_eq!(response.operation, NamedReadOperation::GetEvidencePack);
@@ -1584,7 +1838,7 @@ mod evidence_pack_read_tests {
                 scope_id: Some(ScopeId::new("scope-evidence")?),
                 consistency: ReadConsistency::Eventual,
                 state_fence: fence.clone(),
-                parameters: evidence_params(subject, max_records),
+                parameters: evidence_params(subject, max_records).into_inner(),
             })
         };
 
@@ -1723,7 +1977,7 @@ mod evidence_pack_read_tests {
         );
 
         match block_on(service.projection_inputs(&ctx, scope, None, Vec::new())) {
-            Err(ReadError::Store(message)) if message == StoreError::Unavailable.to_string() => {}
+            Err(ReadError::Store(StoreReadFailure::Unavailable)) => {}
             other => panic!("projection inputs must fail closed Unavailable, observed: {other:?}"),
         }
         Ok(())

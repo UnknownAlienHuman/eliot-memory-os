@@ -933,7 +933,9 @@ mod tests {
     use eliot_protocol::{
         HOST_REQUEST_WIRE_ID, HostRequestEnvelope, HostRequestIdentity, HostRequestKind,
     };
-    use eliot_read::{ProvenanceDisposition, ReadError, ReadProvenance, ReadService};
+    use eliot_read::{
+        ProvenanceDisposition, ReadError, ReadProvenance, ReadService, StoreReadFailure,
+    };
     use eliot_store_api::{
         CanonicalReadClient, EVIDENCE_PACK_MAX_RECORDS, NamedReadOperation, RevisionHead,
         RevisionKey, StoreError,
@@ -1235,7 +1237,10 @@ mod tests {
             &tool,
         ));
         assert!(
-            matches!(fenced, Err(ReadError::Store(ref reason)) if reason == &StoreError::FenceMismatch.to_string()),
+            matches!(
+                fenced,
+                Err(ReadError::Store(StoreReadFailure::FenceMismatch))
+            ),
             "a wrong fence must fail closed as FenceMismatch, got {fenced:?}"
         );
 
@@ -1249,7 +1254,10 @@ mod tests {
             &packet,
         ));
         assert!(
-            matches!(admitted_only, Err(ReadError::Store(ref reason)) if reason == &StoreError::Unavailable.to_string()),
+            matches!(
+                admitted_only,
+                Err(ReadError::Store(StoreReadFailure::Unavailable))
+            ),
             "packet must stay admission-only as Unavailable, got {admitted_only:?}"
         );
 
