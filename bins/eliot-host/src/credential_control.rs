@@ -271,8 +271,8 @@ impl HostCredentialControl {
         // F-LOG-HOST-2 (#893): single terminal per credential-owned Unknown
         // outcome. Relayed Phase-B responses keep the terminal owned by their
         // Phase-B handler (observed here as relay-only); credential-owned
-        // inspect/provision/revoke outcomes own `host-credential-unknown`.
-        // Inner phases correlate by stage order only.
+        // inspect/provision/revoke Unknown outcomes own the single terminal
+        // emitted below. Inner phases correlate by stage order only.
         credential_control_observe("host.credential requested");
         if matches!(
             request.intent.operation,
