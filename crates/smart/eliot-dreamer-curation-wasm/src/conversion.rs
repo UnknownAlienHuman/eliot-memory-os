@@ -210,20 +210,14 @@ impl From<&CurationRoutingError> for GuestError {
             CurationRoutingError::Denominator { detail } => Self::Denominator {
                 detail: detail.clone(),
             },
-            CurationRoutingError::Handler {
-                handler_id,
-                detail,
-            } => Self::Handler {
+            CurationRoutingError::Handler { handler_id, detail } => Self::Handler {
                 handler_id: handler_id.clone(),
                 detail: detail.clone(),
             },
             CurationRoutingError::HandlerPanicked { handler_id } => Self::HandlerPanicked {
                 handler_id: handler_id.clone(),
             },
-            CurationRoutingError::Envelope {
-                handler_id,
-                detail,
-            } => Self::Envelope {
+            CurationRoutingError::Envelope { handler_id, detail } => Self::Envelope {
                 handler_id: handler_id.clone(),
                 detail: detail.clone(),
             },
@@ -432,18 +426,15 @@ pub fn handle_with_ports(
         Ok(registry) => registry,
         Err(error) => return respond(None, Some(error), 0, String::new()),
     };
-    let registry_digest = match registry.digest() {
-        Ok(digest) => digest,
-        Err(_) => {
-            return respond(
-                None,
-                Some(GuestError::Registry {
-                    detail: "static registry digest requires closed registry".to_owned(),
-                }),
-                0,
-                String::new(),
-            );
-        }
+    let Ok(registry_digest) = registry.digest() else {
+        return respond(
+            None,
+            Some(GuestError::Registry {
+                detail: "static registry digest requires closed registry".to_owned(),
+            }),
+            0,
+            String::new(),
+        );
     };
     let before = ledger.calls();
     ledger.record_call();
@@ -454,12 +445,7 @@ pub fn handle_with_ports(
         &request.policy,
         ports,
     ) {
-        Ok(set) => respond(
-            Some(set),
-            None,
-            ledger.calls() - before,
-            registry_digest,
-        ),
+        Ok(set) => respond(Some(set), None, ledger.calls() - before, registry_digest),
         Err(error) => respond(
             None,
             Some(GuestError::from(&error)),

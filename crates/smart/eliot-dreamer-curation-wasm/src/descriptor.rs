@@ -4,7 +4,7 @@
 //! their owning paths, so the descriptor cannot drift from the accepted
 //! sources by hand-copying. The `dreamer-handler` world file is present and
 //! readable on this base, but its owning issue #756 is OPEN (not accepted),
-//! recorded explicitly as `PRESENT_NOT_ACCEPTED` (ContractChallenge path)
+//! recorded explicitly as `PRESENT_NOT_ACCEPTED` (`ContractChallenge` path)
 //! instead of an invented ABI.
 
 use eliot_contracts::{canonical_json_bytes, sha256_hex};
@@ -160,14 +160,32 @@ pub fn is_forbidden_import(module: &str, name: &str) -> bool {
         .any(|forbidden| module.contains(forbidden) || name.contains(forbidden))
 }
 
+/// Component Model binary version emitted by current `wasm32-wasip2` rustc.
+pub const COMPONENT_VERSION: [u8; 4] = [0x0D, 0x00, 0x01, 0x00];
+
 /// Lists every import of a WebAssembly binary without executing it.
+///
+/// Accepts both core modules (`0x1`) and Component Model components
+/// (`COMPONENT_VERSION`; current `wasm32-wasip2` rustc output). The parser
+/// descends into nested core modules, so embedded imports are listed too:
+/// for components the top-level component imports are exactly the
+/// host-visible surface the pure-world claim is about, and nested core
+/// imports are listed alongside them. An empty list is the exact pure
+/// world, not an inconclusive parse.
 pub fn list_wasm_imports(wasm_bytes: &[u8]) -> Result<Vec<WasmImport>, DescriptorError> {
-    if wasm_bytes.len() < 8
-        || wasm_bytes[0..4] != [0x00, 0x61, 0x73, 0x6D]
-        || wasm_bytes[4..8] != [0x01, 0x00, 0x00, 0x00]
-    {
+    if wasm_bytes.len() < 8 || wasm_bytes[0..4] != [0x00, 0x61, 0x73, 0x6D] {
         return Err(DescriptorError::NotWasm);
     }
+    if wasm_bytes[4..8] == [0x01, 0x00, 0x00, 0x00] {
+        return list_core_imports(wasm_bytes);
+    }
+    if wasm_bytes[4..8] == COMPONENT_VERSION {
+        return list_component_imports(wasm_bytes);
+    }
+    Err(DescriptorError::NotWasm)
+}
+
+fn list_core_imports(wasm_bytes: &[u8]) -> Result<Vec<WasmImport>, DescriptorError> {
     let parser = wasmparser::Parser::new(0);
     let mut imports = Vec::new();
     for payload in parser.parse_all(wasm_bytes) {
@@ -181,6 +199,38 @@ pub fn list_wasm_imports(wasm_bytes: &[u8]) -> Result<Vec<WasmImport>, Descripto
                     name: import.name.to_owned(),
                 });
             }
+        }
+    }
+    Ok(imports)
+}
+
+fn list_component_imports(wasm_bytes: &[u8]) -> Result<Vec<WasmImport>, DescriptorError> {
+    let parser = wasmparser::Parser::new(0);
+    let mut imports = Vec::new();
+    for payload in parser.parse_all(wasm_bytes) {
+        let payload = payload.map_err(|error| DescriptorError::Unreadable(error.to_string()))?;
+        match payload {
+            wasmparser::Payload::ComponentImportSection(reader) => {
+                for import in reader {
+                    let import =
+                        import.map_err(|error| DescriptorError::Unreadable(error.to_string()))?;
+                    imports.push(WasmImport {
+                        module: import.name.name.to_owned(),
+                        name: std::format!("{:?}", import.ty.kind()),
+                    });
+                }
+            }
+            wasmparser::Payload::ImportSection(reader) => {
+                for import in reader.into_imports() {
+                    let import =
+                        import.map_err(|error| DescriptorError::Unreadable(error.to_string()))?;
+                    imports.push(WasmImport {
+                        module: import.module.to_owned(),
+                        name: import.name.to_owned(),
+                    });
+                }
+            }
+            _ => {}
         }
     }
     Ok(imports)
