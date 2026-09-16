@@ -53,6 +53,6 @@ workspace_admission = "forbidden until implementation, package proof, affected E
 [acceptance]
 require_deny_unknown_fields = true
 forbid_unsafe = true
-required_exports = ["SynthesisRequest", "SynthesisOutcome", "ResearchBrief", "SynthesisError", "SynthesisDisposition", "synthesize", "request_digest", "request_canonical_len", "pack_content_digest", "draft_content_digest", "brief_semantic_digest", "brief_canonical_len", "guest_parity_disposition"]
+required_exports = ["SynthesisRequest", "SynthesisOutcome", "ResearchBrief", "SynthesisError", "SynthesisDisposition", "synthesize", "request_digest", "request_semantic_digest", "request_canonical_len", "pack_content_digest", "draft_content_digest", "brief_semantic_digest", "brief_canonical_len", "guest_parity_disposition"]
 required_tests = ["proof.rs hosts all 24 WORK_UNIT_CASE 995/1..24 cases"]
 forbidden_patterns = ['serde_json::Value', 'unimplemented!', 'todo!', 'panic!', 'std::process', 'std::fs', 'std::net', 'std::thread', 'std::time', 'std::env', 'tokio', 'reqwest', 'surrealdb', 'post_handler', 'ModelClient', 'ProviderClient']

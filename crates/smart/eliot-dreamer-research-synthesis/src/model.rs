@@ -7,9 +7,7 @@
 
 use std::fmt::{Display, Formatter, Result as FmtResult};
 
-use crate::bounds::{
-    DIAGNOSTIC_VALUE_PREFIX, MAX_HANDLE_BYTES, MAX_TEXT_BYTES, REDACTED_SUFFIX,
-};
+use crate::bounds::{DIAGNOSTIC_VALUE_PREFIX, MAX_HANDLE_BYTES, MAX_TEXT_BYTES, REDACTED_SUFFIX};
 use crate::digest::{CanonicalWriter, is_digest_hex};
 
 // ---------- closed vocabularies ----------
@@ -267,18 +265,16 @@ pub const fn synthesis_disposition_as_str(disposition: SynthesisDisposition) -> 
 pub const fn guest_parity_disposition(disposition: SynthesisDisposition) -> &'static str {
     match disposition {
         SynthesisDisposition::Complete => "candidate",
-        SynthesisDisposition::Partial => "partial",
-        SynthesisDisposition::Exhausted => "partial",
+        SynthesisDisposition::Partial | SynthesisDisposition::Exhausted => "partial",
         SynthesisDisposition::Abstained => "abstention",
         SynthesisDisposition::Blocked => "blocked",
-        SynthesisDisposition::Unsupported => "unsupported",
+        SynthesisDisposition::Unsupported | SynthesisDisposition::Unknown => "unsupported",
         SynthesisDisposition::Conflicted => "conflict",
-        SynthesisDisposition::Unknown => "unsupported",
     }
 }
 
 /// The seven I9.7 preservation dimensions, checked independently.
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd, Hash)]
 pub enum PreservationDimension {
     /// Load-bearing source elements represented.
     Coverage,
@@ -559,7 +555,7 @@ pub struct OmittedSource {
 /// Governed immutable acquisition boundary (I9.3 `ResearchPack`).
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ResearchPack {
-    /// Digest of the governed pack content (see [`pack_content_digest`]).
+    /// Digest of the governed pack content (see [`crate::pack_content_digest`]).
     pub pack_digest: String,
     /// Exact governed question.
     pub question: String,
@@ -592,7 +588,7 @@ pub struct ResearchPack {
 /// Exact A-03 validated grounded structured draft.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct GroundedDraft {
-    /// Digest of the draft content (see [`draft_content_digest`]).
+    /// Digest of the draft content (see [`crate::draft_content_digest`]).
     pub draft_digest: String,
     /// Grounding digest binding the draft to admitted grounding.
     pub grounding_digest: String,
@@ -961,7 +957,7 @@ pub struct SynthesisOutcome {
 /// Typed synthesis failure: malformed input or an internal defect.
 ///
 /// Diagnostics are bounded and redacted: field values longer than
-/// [`DIAGNOSTIC_VALUE_PREFIX`](crate::bounds::DIAGNOSTIC_VALUE_PREFIX)
+/// [`crate::bounds::DIAGNOSTIC_VALUE_PREFIX`]
 /// characters are cut with a marker, and secrets never enter a diagnostic.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum SynthesisError {
@@ -1190,7 +1186,7 @@ pub fn pack_canonical_bytes(pack: &ResearchPack, semantic: bool) -> Vec<u8> {
         .map(|entry| (entry.handle.as_str(), entry.reason.as_str()))
         .collect();
     if semantic {
-        omitted.sort();
+        omitted.sort_unstable();
     }
     for (handle, reason) in omitted {
         let mut section = CanonicalWriter::new();
@@ -1211,9 +1207,7 @@ fn write_counterclaim(counter: &Counterclaim, writer: &mut CanonicalWriter, sema
             left.source_handle
                 .cmp(&right.source_handle)
                 .then_with(|| precision_rank(left.precision).cmp(&precision_rank(right.precision)))
-                .then_with(|| {
-                    precision_kind_rank(left.kind).cmp(&precision_kind_rank(right.kind))
-                })
+                .then_with(|| precision_kind_rank(left.kind).cmp(&precision_kind_rank(right.kind)))
         });
     }
     for citation in &citations {
@@ -1242,9 +1236,7 @@ fn write_claim(claim: &StructuredClaim, writer: &mut CanonicalWriter, semantic: 
             left.source_handle
                 .cmp(&right.source_handle)
                 .then_with(|| precision_rank(left.precision).cmp(&precision_rank(right.precision)))
-                .then_with(|| {
-                    precision_kind_rank(left.kind).cmp(&precision_kind_rank(right.kind))
-                })
+                .then_with(|| precision_kind_rank(left.kind).cmp(&precision_kind_rank(right.kind)))
         });
     }
     for citation in &support {

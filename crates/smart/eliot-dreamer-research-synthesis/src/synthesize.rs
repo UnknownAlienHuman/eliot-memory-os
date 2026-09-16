@@ -21,7 +21,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use crate::bounds::{
-    MAX_CLAIMS, MAX_PROBES, MAX_PROBE_OUTCOMES, MAX_REFERENCES_PER_CLAIM, MAX_RIVALS, MAX_SOURCES,
+    MAX_CLAIMS, MAX_PROBE_OUTCOMES, MAX_PROBES, MAX_REFERENCES_PER_CLAIM, MAX_RIVALS, MAX_SOURCES,
     MAX_UNKNOWNS, SYNTHESIS_JOB_CLASS, SYNTHESIS_SCHEMA_REVISION,
 };
 use crate::digest::{CanonicalWriter, len_u64, sha256_hex};
@@ -31,12 +31,11 @@ use crate::model::{
     GroundedDraft, InputReceipt, JobBinding, Omission, OmissionKind, Precision, PrecisionKind,
     PreservationDimension, PreservationVerdict, ProbeBasis, ProbeResidue, ProbeResidueReason,
     RecommendedProbe, ResearchBrief, ResearchPack, RivalPosition, RivalStance, SourceAuthority,
-    SourceCard, StructuredClaim, StructuredProbe, SynthesisBounds,
-    SynthesisDisposition, SynthesisError, SynthesisOutcome, SynthesisPolicy, SynthesisRequest,
-    claim_canonical_bytes, claim_disposition_as_str, counterclaim_canonical_bytes,
-    draft_canonical_bytes, is_digest, is_handle, is_text, omission_kind_rank, pack_canonical_bytes,
-    preservation_dimension_as_str, preservation_dimensions, redact_value,
-    source_authority_rank, synthesis_disposition_as_str,
+    SourceCard, StructuredClaim, StructuredProbe, SynthesisBounds, SynthesisDisposition,
+    SynthesisError, SynthesisOutcome, SynthesisPolicy, SynthesisRequest, claim_canonical_bytes,
+    claim_disposition_as_str, counterclaim_canonical_bytes, draft_canonical_bytes, is_digest,
+    is_handle, is_text, omission_kind_rank, pack_canonical_bytes, preservation_dimension_as_str,
+    preservation_dimensions, redact_value, source_authority_rank, synthesis_disposition_as_str,
 };
 
 // ---------- public digests ----------
@@ -71,6 +70,25 @@ pub fn request_digest(request: &SynthesisRequest) -> String {
     sha256_hex(&request_canonical_bytes(request))
 }
 
+/// Digest of the semantic request bytes (order-insensitive content identity).
+#[must_use]
+pub fn request_semantic_digest(request: &SynthesisRequest) -> String {
+    let binding = &request.binding;
+    let mut writer = CanonicalWriter::new();
+    writer.integer("request.schema", u64::from(request.schema_revision));
+    write_binding(binding, &mut writer);
+    writer.section("request.pack", &pack_canonical_bytes(&request.pack, true));
+    writer.section(
+        "request.draft",
+        &draft_canonical_bytes(&request.draft, true),
+    );
+    write_receipt(&request.receipt, &mut writer);
+    write_policy(&request.policy, &mut writer);
+    write_bounds(&request.bounds, &mut writer);
+    write_cancellation(&request.cancellation, &mut writer);
+    sha256_hex(&writer.finish())
+}
+
 /// Digest of the canonical brief bytes (order-insensitive semantic identity).
 #[must_use]
 pub fn brief_semantic_digest(brief: &ResearchBrief) -> String {
@@ -100,10 +118,7 @@ fn request_canonical_bytes(request: &SynthesisRequest) -> Vec<u8> {
     let mut writer = CanonicalWriter::new();
     writer.integer("request.schema", u64::from(request.schema_revision));
     write_binding(binding, &mut writer);
-    writer.section(
-        "request.pack",
-        &pack_canonical_bytes(&request.pack, false),
-    );
+    writer.section("request.pack", &pack_canonical_bytes(&request.pack, false));
     writer.section(
         "request.draft",
         &draft_canonical_bytes(&request.draft, false),
@@ -151,10 +166,7 @@ fn write_receipt(receipt: &InputReceipt, writer: &mut CanonicalWriter) {
 fn write_policy(policy: &SynthesisPolicy, writer: &mut CanonicalWriter) {
     writer.text("policy.digest", &policy.policy_digest);
     writer.text("policy.revision", &policy.revision);
-    writer.integer(
-        "policy.valid_through",
-        policy.valid_through_generation,
-    );
+    writer.integer("policy.valid_through", policy.valid_through_generation);
     writer.flag("policy.allow_partial", policy.allow_partial);
     writer.flag(
         "policy.authorize_supplied",
@@ -202,7 +214,7 @@ fn write_cancellation(view: &CancellationView, writer: &mut CanonicalWriter) {
 fn malformed(field: &str, detail: &str) -> SynthesisError {
     SynthesisError::Malformed {
         field: field.to_owned(),
-        detail: redact_value(detail).to_owned(),
+        detail: redact_value(detail),
     }
 }
 
@@ -279,6 +291,12 @@ fn check_claim_shape(claim: &StructuredClaim, index: usize) -> Result<(), Synthe
 }
 
 fn check_envelope(request: &SynthesisRequest) -> Result<(), SynthesisError> {
+    check_envelope_identity(request)?;
+    check_envelope_content(request)?;
+    check_envelope_bounds(request)
+}
+
+fn check_envelope_identity(request: &SynthesisRequest) -> Result<(), SynthesisError> {
     if request.schema_revision != SYNTHESIS_SCHEMA_REVISION {
         return Err(SynthesisError::UnsupportedSchema {
             want_revision: SYNTHESIS_SCHEMA_REVISION,
@@ -289,17 +307,14 @@ fn check_envelope(request: &SynthesisRequest) -> Result<(), SynthesisError> {
     if request.binding.job_class != SYNTHESIS_JOB_CLASS {
         return Err(SynthesisError::KindMismatch {
             want: SYNTHESIS_JOB_CLASS.to_owned(),
-            got: redact_value(&request.binding.job_class).to_owned(),
+            got: redact_value(&request.binding.job_class),
             detail: "research synthesis job class".to_owned(),
         });
     }
     let binding = &request.binding;
     check_handle(&binding.operation_id, "binding.operation_id")?;
     check_handle(&binding.idempotency_key, "binding.idempotency_key")?;
-    check_handle(
-        &binding.requester_principal,
-        "binding.requester_principal",
-    )?;
+    check_handle(&binding.requester_principal, "binding.requester_principal")?;
     check_handle(&binding.requester_session, "binding.requester_session")?;
     check_handle(&binding.task_id, "binding.task_id")?;
     check_handle(&binding.attempt_id, "binding.attempt_id")?;
@@ -323,6 +338,10 @@ fn check_envelope(request: &SynthesisRequest) -> Result<(), SynthesisError> {
     )?;
     check_digest(&request.policy.policy_digest, "policy.policy_digest")?;
     check_handle(&request.policy.revision, "policy.revision")?;
+    Ok(())
+}
+
+fn check_envelope_content(request: &SynthesisRequest) -> Result<(), SynthesisError> {
     if request.pack.sources.is_empty() {
         return Err(malformed(
             "pack.sources",
@@ -330,7 +349,10 @@ fn check_envelope(request: &SynthesisRequest) -> Result<(), SynthesisError> {
         ));
     }
     if request.pack.sources.len() > MAX_SOURCES {
-        return Err(malformed("pack.sources", "source count exceeds the ceiling"));
+        return Err(malformed(
+            "pack.sources",
+            "source count exceeds the ceiling",
+        ));
     }
     for (index, card) in request.pack.sources.iter().enumerate() {
         check_card(card, index)?;
@@ -389,6 +411,10 @@ fn check_envelope(request: &SynthesisRequest) -> Result<(), SynthesisError> {
     for position in &request.draft.concilium.positions {
         check_text(position, "draft.concilium.positions")?;
     }
+    Ok(())
+}
+
+fn check_envelope_bounds(request: &SynthesisRequest) -> Result<(), SynthesisError> {
     let bounds = &request.bounds;
     if bounds.max_input_bytes == 0
         || bounds.max_output_bytes == 0
@@ -410,8 +436,8 @@ fn check_envelope(request: &SynthesisRequest) -> Result<(), SynthesisError> {
 fn mismatch(field: &str, want: &str, got: &str) -> SynthesisError {
     SynthesisError::ReferenceMismatch {
         field: field.to_owned(),
-        want: redact_value(want).to_owned(),
-        got: redact_value(got).to_owned(),
+        want: redact_value(want),
+        got: redact_value(got),
     }
 }
 
@@ -513,11 +539,7 @@ fn unknown_preservation(note: &str) -> Vec<PreservationVerdict> {
         .collect()
 }
 
-fn blocked_outcome(
-    request: &SynthesisRequest,
-    note: &str,
-    input_digest: &str,
-) -> SynthesisOutcome {
+fn blocked_outcome(request: &SynthesisRequest, note: &str, input_digest: &str) -> SynthesisOutcome {
     SynthesisOutcome {
         disposition: SynthesisDisposition::Blocked,
         brief: None,
@@ -541,14 +563,13 @@ fn check_terminal(request: &SynthesisRequest, input_digest: &str) -> Option<Synt
     if let (Some(now), Some(deadline)) = (
         request.cancellation.now_ms,
         request.cancellation.deadline_ms,
-    ) {
-        if now > deadline {
-            return Some(blocked_outcome(
-                request,
-                "observed now passed the wall deadline",
-                input_digest,
-            ));
-        }
+    ) && now > deadline
+    {
+        return Some(blocked_outcome(
+            request,
+            "observed now passed the wall deadline",
+            input_digest,
+        ));
     }
     if request.binding.fence_generation > request.policy.valid_through_generation {
         return Some(blocked_outcome(
@@ -625,7 +646,7 @@ fn firewall_handle(
 ) -> Result<(), SynthesisError> {
     if !state.authorized.contains_key(handle) {
         return Err(SynthesisError::AcquisitionRejected {
-            handle: redact_value(handle).to_owned(),
+            handle: redact_value(handle),
             detail: format!("{field} leaves the authorized source set"),
         });
     }
@@ -693,11 +714,12 @@ fn accept_citations(
     let mut precisionless = 0_u64;
     for citation in citations {
         firewall_handle(state, &citation.source_handle, field)?;
-        let card = state.authorized.get(&citation.source_handle).ok_or_else(|| {
-            SynthesisError::Internal {
+        let card = state
+            .authorized
+            .get(&citation.source_handle)
+            .ok_or_else(|| SynthesisError::Internal {
                 detail: "firewall passed an unauthorized handle".to_owned(),
-            }
-        })?;
+            })?;
         if card.privacy_class == "deny-brief" {
             notes.push(format!(
                 "withheld: {} is privacy-denied for brief use",
@@ -715,7 +737,8 @@ fn accept_citations(
             continue;
         }
         let before = notes.len();
-        let capped_precision = cap_precision(citation.precision, card, notes, &citation.source_handle);
+        let capped_precision =
+            cap_precision(citation.precision, card, notes, &citation.source_handle);
         if notes.len() > before {
             capped = capped.saturating_add(1);
         }
@@ -843,10 +866,7 @@ fn required_precision_kind(kind: crate::model::ClaimKind) -> Option<PrecisionKin
     }
 }
 
-fn absence_verdict(
-    pack: &ResearchPack,
-    counter_evidence: &[String],
-) -> (ClaimDisposition, String) {
+fn absence_verdict(pack: &ResearchPack, counter_evidence: &[String]) -> (ClaimDisposition, String) {
     if !counter_evidence.is_empty() {
         return (
             ClaimDisposition::Contested,
@@ -873,52 +893,17 @@ fn project_claim(
     claim: &StructuredClaim,
     request: &SynthesisRequest,
 ) -> Result<Option<(ClaimVerdict, Vec<ClaimVerdict>)>, SynthesisError> {
-    let canonical = claim_canonical_bytes(claim, true);
-    if let Some(previous) = state.seen_claims.get(&claim.claim_id) {
-        if *previous == canonical {
-            return Ok(Some((
-                ClaimVerdict {
-                    claim_id: claim.claim_id.clone(),
-                    is_counterclaim: false,
-                    kind: claim.kind,
-                    disposition: ClaimDisposition::DuplicateCollapsed,
-                    support: Vec::new(),
-                    counter_evidence: Vec::new(),
-                    citations: Vec::new(),
-                    weakest_grade: EvidenceGrade::E0,
-                    authority: SourceAuthority::Unknown,
-                    lineage_groups: vec!["unknown".to_owned()],
-                    precision_notes: vec!["byte-identical repeat collapsed".to_owned()],
-                    absence_basis: String::new(),
-                },
-                Vec::new(),
-            )));
-        }
-        return Err(malformed(
-            "draft.claims",
-            &format!(
-                "duplicate claim id with changed content: {}",
-                claim.claim_id
-            ),
-        ));
+    if let Some(duplicate) = check_claim_duplicate(state, claim)? {
+        return Ok(Some(duplicate));
     }
-    state
-        .seen_claims
-        .insert(claim.claim_id.clone(), canonical);
-
-    let refs = len_u64(&claim.support)
-        .saturating_add(len_u64(&claim.counterclaims))
-        .saturating_add(
-            claim
-                .counterclaims
-                .iter()
-                .map(|counter| len_u64(&counter.citations))
-                .fold(0_u64, |left, right| left.saturating_add(right)),
-        );
+    let refs = claim_reference_cost(claim);
     if refs > MAX_REFERENCES_PER_CLAIM {
         return Err(malformed(
             "draft.claims",
-            &format!("claim {} exceeds the per-claim reference ceiling", claim.claim_id),
+            &format!(
+                "claim {} exceeds the per-claim reference ceiling",
+                claim.claim_id
+            ),
         ));
     }
     if state.refs_used.saturating_add(refs) > request.bounds.max_references {
@@ -966,7 +951,66 @@ fn project_claim(
         }
         counter_verdicts.push(verdict);
     }
+    let verdict = finish_claim_verdict(claim, request, &accepted, counter_evidence, notes);
+    Ok(Some((verdict, counter_verdicts)))
+}
 
+fn check_claim_duplicate(
+    state: &mut ProjectionState<'_>,
+    claim: &StructuredClaim,
+) -> Result<Option<(ClaimVerdict, Vec<ClaimVerdict>)>, SynthesisError> {
+    let canonical = claim_canonical_bytes(claim, true);
+    if let Some(previous) = state.seen_claims.get(&claim.claim_id) {
+        if *previous == canonical {
+            return Ok(Some((
+                ClaimVerdict {
+                    claim_id: claim.claim_id.clone(),
+                    is_counterclaim: false,
+                    kind: claim.kind,
+                    disposition: ClaimDisposition::DuplicateCollapsed,
+                    support: Vec::new(),
+                    counter_evidence: Vec::new(),
+                    citations: Vec::new(),
+                    weakest_grade: EvidenceGrade::E0,
+                    authority: SourceAuthority::Unknown,
+                    lineage_groups: vec!["unknown".to_owned()],
+                    precision_notes: vec!["byte-identical repeat collapsed".to_owned()],
+                    absence_basis: String::new(),
+                },
+                Vec::new(),
+            )));
+        }
+        return Err(malformed(
+            "draft.claims",
+            &format!(
+                "duplicate claim id with changed content: {}",
+                claim.claim_id
+            ),
+        ));
+    }
+    state.seen_claims.insert(claim.claim_id.clone(), canonical);
+    Ok(None)
+}
+
+fn claim_reference_cost(claim: &StructuredClaim) -> u64 {
+    len_u64(&claim.support)
+        .saturating_add(len_u64(&claim.counterclaims))
+        .saturating_add(
+            claim
+                .counterclaims
+                .iter()
+                .map(|counter| len_u64(&counter.citations))
+                .fold(0_u64, u64::saturating_add),
+        )
+}
+
+fn finish_claim_verdict(
+    claim: &StructuredClaim,
+    request: &SynthesisRequest,
+    accepted: &AcceptedSupport,
+    counter_evidence: Vec<String>,
+    mut notes: Vec<String>,
+) -> ClaimVerdict {
     let disposition = if claim.kind == crate::model::ClaimKind::Absence {
         let (absence_disposition, basis) = absence_verdict(&request.pack, &counter_evidence);
         notes.push(basis);
@@ -978,9 +1022,7 @@ fn project_claim(
                     .to_owned(),
             );
             ClaimDisposition::Withheld
-        } else if accepted.precisionless > 0
-            && required_precision_kind(claim.kind).is_some()
-        {
+        } else if accepted.precisionless > 0 && required_precision_kind(claim.kind).is_some() {
             notes.push(
                 "required numeric/time/version/causal precision is unsupported across all citations"
                     .to_owned(),
@@ -990,9 +1032,10 @@ fn project_claim(
             ClaimDisposition::Unsupported
         }
     } else {
-        precision_gate(claim, &accepted, &mut notes)
+        precision_gate(claim, accepted, &mut notes)
     };
-    let disposition = if disposition == ClaimDisposition::Supported && !counter_evidence.is_empty() {
+    let disposition = if disposition == ClaimDisposition::Supported && !counter_evidence.is_empty()
+    {
         notes.push("contested: undefeated counter-evidence coexists".to_owned());
         ClaimDisposition::Contested
     } else {
@@ -1000,6 +1043,13 @@ fn project_claim(
     };
 
     let mut lineage: Vec<String> = accepted.lineage.iter().cloned().collect();
+    if disposition == ClaimDisposition::AbsentScopeComplete {
+        lineage = canonical_strings(request.pack.source_denominator.clone());
+        notes.push(format!(
+            "absence basis: complete denominator over {} sources",
+            lineage.len()
+        ));
+    }
     if lineage.is_empty() {
         lineage.push("unknown".to_owned());
     }
@@ -1010,7 +1060,7 @@ fn project_claim(
         disposition,
         support: canonical_strings(accepted.handles.clone()),
         counter_evidence: canonical_strings(counter_evidence),
-        citations: canonical_strings(accepted.handles),
+        citations: canonical_strings(accepted.handles.clone()),
         weakest_grade: accepted.weakest_grade,
         authority: accepted.authority,
         lineage_groups: lineage,
@@ -1022,12 +1072,11 @@ fn project_claim(
         },
     };
     if accepted.capped > 0 {
-        verdict.precision_notes.push(format!(
-            "{} citations capped to qualified",
-            accepted.capped
-        ));
+        verdict
+            .precision_notes
+            .push(format!("{} citations capped to qualified", accepted.capped));
     }
-    Ok(Some((verdict, counter_verdicts)))
+    verdict
 }
 
 fn precision_gate(
@@ -1035,9 +1084,9 @@ fn precision_gate(
     accepted: &AcceptedSupport,
     notes: &mut Vec<String>,
 ) -> ClaimDisposition {
-    use crate::model::ClaimKind::{Causal, Factual, Numeric, Time, Version};
+    use crate::model::ClaimKind::{Absence, Causal, Factual, Numeric, Time, Version};
     match claim.kind {
-        Factual => ClaimDisposition::Supported,
+        Factual | Absence => ClaimDisposition::Supported,
         Numeric | Time | Version => {
             if accepted.matched == 0 {
                 notes.push(
@@ -1052,9 +1101,7 @@ fn precision_gate(
         }
         Causal => {
             if !claim.grounded_relation {
-                notes.push(
-                    "causal claim without a grounded relation stays limited".to_owned(),
-                );
+                notes.push("causal claim without a grounded relation stays limited".to_owned());
                 ClaimDisposition::PrecisionLimited
             } else if accepted.matched == 0 {
                 notes.push(
@@ -1067,7 +1114,6 @@ fn precision_gate(
                 ClaimDisposition::Supported
             }
         }
-        crate::model::ClaimKind::Absence => ClaimDisposition::Supported,
     }
 }
 
@@ -1189,7 +1235,11 @@ fn project_probes(
         {
             residue.push(ProbeResidue {
                 probe_id: probe.probe_id.clone(),
-                reason: if probe.discriminates.iter().any(|target| !live_targets.contains(target)) {
+                reason: if probe
+                    .discriminates
+                    .iter()
+                    .any(|target| !live_targets.contains(target))
+                {
                     ProbeResidueReason::UnknownTarget
                 } else {
                     ProbeResidueReason::Nondiscriminative
@@ -1287,12 +1337,8 @@ fn project_concilium(
 
 // ---------- coverage, dependence, preservation ----------
 
-fn build_coverage(
-    request: &SynthesisRequest,
-    cited: &BTreeSet<String>,
-) -> CoverageReport {
-    let denominator: BTreeSet<String> =
-        request.pack.source_denominator.iter().cloned().collect();
+fn build_coverage(request: &SynthesisRequest, cited: &BTreeSet<String>) -> CoverageReport {
+    let denominator: BTreeSet<String> = request.pack.source_denominator.iter().cloned().collect();
     let mut represented: Vec<String> = denominator.intersection(cited).cloned().collect();
     represented.sort();
     let mut cited_sources: Vec<String> = cited.iter().cloned().collect();
@@ -1307,10 +1353,7 @@ fn build_coverage(
     }
 }
 
-fn build_dependence(
-    request: &SynthesisRequest,
-    cited: &BTreeSet<String>,
-) -> Vec<DependenceGroup> {
+fn build_dependence(request: &SynthesisRequest, cited: &BTreeSet<String>) -> Vec<DependenceGroup> {
     let mut groups: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
     for card in &request.pack.sources {
         if cited.contains(&card.handle) {
@@ -1334,47 +1377,7 @@ fn build_dependence(
         .collect()
 }
 
-fn check_preservation(
-    request: &SynthesisRequest,
-    brief: &ResearchBrief,
-    state: &ProjectionState<'_>,
-) -> Vec<PreservationVerdict> {
-    let coverage_ok = request.pack.coverage_denominator == DenominatorKind::CompleteScope
-        && request.pack.missing_source_classes.is_empty()
-        && request.pack.omitted_sources.is_empty()
-        && !state.omitted.iter().any(|omission| {
-            matches!(
-                omission.kind,
-                OmissionKind::Claims | OmissionKind::Rivals | OmissionKind::References
-            )
-        });
-    let preservation_ok = !state.omitted.iter().any(|omission| {
-        matches!(
-            omission.kind,
-            OmissionKind::Claims | OmissionKind::Rivals
-        )
-    });
-    let mut allowed: BTreeSet<&str> = BTreeSet::new();
-    for card in &request.pack.sources {
-        allowed.insert(card.handle.as_str());
-    }
-    for claim in request.draft.claims.iter() {
-        allowed.insert(claim.claim_id.as_str());
-        for counter in &claim.counterclaims {
-            allowed.insert(counter.counterclaim_id.as_str());
-        }
-    }
-    for rival in &request.draft.rivals {
-        allowed.insert(rival.rival_id.as_str());
-    }
-    for unknown in &request.draft.unknowns {
-        allowed.insert(unknown.unknown_id.as_str());
-    }
-    for probe in &request.draft.probes {
-        allowed.insert(probe.probe_id.as_str());
-    }
-    let mut faithfulness_ok = true;
-    let mut faithfulness_detail = "every brief handle resolves to an authorized or input handle";
+fn brief_handles_resolve(brief: &ResearchBrief, allowed: &BTreeSet<&str>) -> (bool, &'static str) {
     for verdict in &brief.claim_matrix {
         for handle in verdict
             .support
@@ -1383,16 +1386,17 @@ fn check_preservation(
             .chain(verdict.citations.iter())
         {
             if !allowed.contains(handle.as_str()) {
-                faithfulness_ok = false;
-                faithfulness_detail = "brief invents a handle outside inputs";
+                return (false, "brief invents a handle outside inputs");
             }
         }
     }
-    let lineage_unknown = brief.claim_matrix.iter().any(|verdict| {
-        verdict.lineage_groups.iter().any(|group| group == "unknown")
-    });
-    let reversibility_ok = brief.pack_digest == request.pack.pack_digest;
-    let mut authority_ok = true;
+    (
+        true,
+        "every brief handle resolves to an authorized or input handle",
+    )
+}
+
+fn authority_ceiling_holds(state: &ProjectionState<'_>, brief: &ResearchBrief) -> bool {
     for verdict in &brief.claim_matrix {
         if verdict.disposition == ClaimDisposition::DuplicateCollapsed {
             continue;
@@ -1412,9 +1416,58 @@ fn check_preservation(
             }
         }
         if seen && (weakest_grade != verdict.weakest_grade || authority != verdict.authority) {
-            authority_ok = false;
+            return false;
         }
     }
+    true
+}
+
+fn check_preservation(
+    request: &SynthesisRequest,
+    brief: &ResearchBrief,
+    state: &ProjectionState<'_>,
+) -> Vec<PreservationVerdict> {
+    let coverage_ok = request.pack.coverage_denominator == DenominatorKind::CompleteScope
+        && request.pack.missing_source_classes.is_empty()
+        && request.pack.omitted_sources.is_empty()
+        && !state.omitted.iter().any(|omission| {
+            matches!(
+                omission.kind,
+                OmissionKind::Claims | OmissionKind::Rivals | OmissionKind::References
+            )
+        });
+    let preservation_ok = !state
+        .omitted
+        .iter()
+        .any(|omission| matches!(omission.kind, OmissionKind::Claims | OmissionKind::Rivals));
+    let mut allowed: BTreeSet<&str> = BTreeSet::new();
+    for card in &request.pack.sources {
+        allowed.insert(card.handle.as_str());
+    }
+    for claim in &request.draft.claims {
+        allowed.insert(claim.claim_id.as_str());
+        for counter in &claim.counterclaims {
+            allowed.insert(counter.counterclaim_id.as_str());
+        }
+    }
+    for rival in &request.draft.rivals {
+        allowed.insert(rival.rival_id.as_str());
+    }
+    for unknown in &request.draft.unknowns {
+        allowed.insert(unknown.unknown_id.as_str());
+    }
+    for probe in &request.draft.probes {
+        allowed.insert(probe.probe_id.as_str());
+    }
+    let (faithfulness_ok, faithfulness_detail) = brief_handles_resolve(brief, &allowed);
+    let lineage_unknown = brief.claim_matrix.iter().any(|verdict| {
+        verdict
+            .lineage_groups
+            .iter()
+            .any(|group| group == "unknown")
+    });
+    let reversibility_ok = brief.pack_digest == request.pack.pack_digest;
+    let authority_ok = authority_ceiling_holds(state, brief);
     let closure_ok = state.omitted.iter().all(|omission| {
         omission.omitted <= omission.denominator && !omission.detail.trim().is_empty()
     });
@@ -1647,6 +1700,25 @@ pub fn synthesize(request: &SynthesisRequest) -> Result<SynthesisOutcome, Synthe
     check_input_budget(request)?;
 
     let mut state = ProjectionState::build(request);
+    let (matrix, cited) = project_matrix(&mut state, request)?;
+    let projected = project_portfolio(&mut state, request, matrix, cited)?;
+    assemble_outcome(request, &mut state, projected, &input_digest)
+}
+
+struct ProjectedParts {
+    matrix: Vec<ClaimVerdict>,
+    cited: BTreeSet<String>,
+    rivals: Vec<RivalPosition>,
+    unknowns: Vec<String>,
+    recommended: Vec<RecommendedProbe>,
+    residue: Vec<ProbeResidue>,
+    concilium: ConciliumRecommendation,
+}
+
+fn project_matrix(
+    state: &mut ProjectionState<'_>,
+    request: &SynthesisRequest,
+) -> Result<(Vec<ClaimVerdict>, BTreeSet<String>), SynthesisError> {
     let mut matrix: Vec<ClaimVerdict> = Vec::new();
     let mut cited: BTreeSet<String> = BTreeSet::new();
     let claim_denominator = len_u64(&request.draft.claims);
@@ -1656,7 +1728,7 @@ pub fn synthesize(request: &SynthesisRequest) -> Result<SynthesisOutcome, Synthe
         if projected_claims >= admitted_claims {
             break;
         }
-        match project_claim(&mut state, claim, request)? {
+        match project_claim(state, claim, request)? {
             Some((verdict, counter_verdicts)) => {
                 projected_claims = projected_claims.saturating_add(1);
                 for handle in verdict
@@ -1693,7 +1765,15 @@ pub fn synthesize(request: &SynthesisRequest) -> Result<SynthesisOutcome, Synthe
             claim_denominator.saturating_sub(admitted_claims),
         );
     }
+    Ok((matrix, cited))
+}
 
+fn project_portfolio(
+    state: &mut ProjectionState<'_>,
+    request: &SynthesisRequest,
+    matrix: Vec<ClaimVerdict>,
+    mut cited: BTreeSet<String>,
+) -> Result<ProjectedParts, SynthesisError> {
     let mut live_claims: BTreeSet<String> = BTreeSet::new();
     for claim in &request.draft.claims {
         live_claims.insert(claim.claim_id.clone());
@@ -1701,7 +1781,7 @@ pub fn synthesize(request: &SynthesisRequest) -> Result<SynthesisOutcome, Synthe
             live_claims.insert(counter.counterclaim_id.clone());
         }
     }
-    let rivals = project_rivals(&mut state, request, &live_claims)?;
+    let rivals = project_rivals(state, request, &live_claims)?;
     for rival in &rivals {
         for handle in &rival.evidence {
             cited.insert(handle.clone());
@@ -1709,9 +1789,9 @@ pub fn synthesize(request: &SynthesisRequest) -> Result<SynthesisOutcome, Synthe
     }
 
     let mut unknown_texts: BTreeSet<String> = BTreeSet::new();
-    project_unknowns(&mut state, request, &mut unknown_texts);
+    project_unknowns(state, request, &mut unknown_texts);
 
-    let mut live_targets = live_claims.clone();
+    let mut live_targets = live_claims;
     for rival in &request.draft.rivals {
         live_targets.insert(rival.rival_id.clone());
     }
@@ -1721,41 +1801,76 @@ pub fn synthesize(request: &SynthesisRequest) -> Result<SynthesisOutcome, Synthe
     let mut recommended: Vec<RecommendedProbe> = Vec::new();
     let mut residue: Vec<ProbeResidue> = Vec::new();
     project_probes(
-        &mut state,
+        state,
         request,
         &live_targets,
         &mut recommended,
         &mut residue,
     );
 
-    let concilium = project_concilium(&mut state, &request.draft.concilium, &request.policy)?;
+    let concilium = project_concilium(state, &request.draft.concilium, &request.policy)?;
 
     let unknown_lineage = matrix.iter().any(|verdict| {
-        verdict.lineage_groups.iter().any(|group| group == "unknown")
+        verdict
+            .lineage_groups
+            .iter()
+            .any(|group| group == "unknown")
     });
-    if unknown_lineage {
+    let supported_any = matrix.iter().any(|verdict| {
+        matches!(
+            verdict.disposition,
+            ClaimDisposition::Supported
+                | ClaimDisposition::Contested
+                | ClaimDisposition::AbsentScopeComplete
+                | ClaimDisposition::DuplicateCollapsed
+        )
+    });
+    if unknown_lineage && supported_any {
         unknown_texts.insert(
             "lineage-unknown: at least one verdict rests on unknown independence".to_owned(),
         );
     }
-    let unknowns: Vec<String> = unknown_texts.iter().cloned().collect();
-    let coverage = build_coverage(request, &cited);
-    let dependence = build_dependence(request, &cited);
+    Ok(ProjectedParts {
+        matrix,
+        cited,
+        rivals,
+        unknowns: unknown_texts.iter().cloned().collect(),
+        recommended,
+        residue,
+        concilium,
+    })
+}
 
-    let opposed = has_opposed_rivals(&rivals);
-    let disposition = decide_disposition(request, &matrix, &rivals, &unknowns, &state, opposed);
+fn assemble_outcome(
+    request: &SynthesisRequest,
+    state: &mut ProjectionState<'_>,
+    projected: ProjectedParts,
+    input_digest: &str,
+) -> Result<SynthesisOutcome, SynthesisError> {
+    let coverage = build_coverage(request, &projected.cited);
+    let dependence = build_dependence(request, &projected.cited);
+    let opposed = has_opposed_rivals(&projected.rivals);
+    let disposition = decide_disposition(
+        request,
+        &projected.matrix,
+        &projected.rivals,
+        &projected.unknowns,
+        state,
+        opposed,
+    );
 
-    let brief_id = format!("brief-{}", &input_digest[..16.min(input_digest.len())]);
+    let semantic_input = request_semantic_digest(request);
+    let brief_id = format!("brief-{}", &semantic_input[..16.min(semantic_input.len())]);
     let mut brief = ResearchBrief {
         brief_id,
         pack_digest: request.pack.pack_digest.clone(),
         question: request.pack.question.clone(),
-        claim_matrix: matrix,
-        rivals,
-        unknowns,
-        probes: recommended,
-        probe_residue: residue,
-        concilium,
+        claim_matrix: projected.matrix,
+        rivals: projected.rivals,
+        unknowns: projected.unknowns,
+        probes: projected.recommended,
+        probe_residue: projected.residue,
+        concilium: projected.concilium,
         coverage,
         dependence,
         disposition,
@@ -1764,26 +1879,9 @@ pub fn synthesize(request: &SynthesisRequest) -> Result<SynthesisOutcome, Synthe
         raw_digest: String::new(),
         semantic_digest: String::new(),
     };
-    brief.preservation = check_preservation(request, &brief, &state);
-    if disposition == SynthesisDisposition::Complete
-        && brief.preservation.iter().any(|verdict| !verdict.passed || !verdict.known)
-    {
-        brief.disposition = SynthesisDisposition::Partial;
-    }
-    brief.raw_digest = brief_raw_digest(&brief);
-    brief.semantic_digest = brief_semantic_digest(&brief);
-    enforce_output_budget(request, &mut brief, &mut state)?;
-    brief.preservation = check_preservation(request, &brief, &state);
-    if brief.disposition == SynthesisDisposition::Complete
-        && brief
-            .preservation
-            .iter()
-            .any(|verdict| !verdict.passed || !verdict.known)
-    {
-        brief.disposition = SynthesisDisposition::Partial;
-    }
-    brief.raw_digest = brief_raw_digest(&brief);
-    brief.semantic_digest = brief_semantic_digest(&brief);
+    settle_brief(request, state, &mut brief);
+    enforce_output_budget(request, &mut brief, state)?;
+    settle_brief(request, state, &mut brief);
 
     let outcome_disposition = brief.disposition;
     let output_digest = brief.semantic_digest.clone();
@@ -1793,19 +1891,36 @@ pub fn synthesize(request: &SynthesisRequest) -> Result<SynthesisOutcome, Synthe
         brief: Some(brief),
         preservation,
         inherited_receipt: request.receipt.clone(),
-        input_digest,
+        input_digest: input_digest.to_owned(),
         output_digest,
         work_used: state.work_used,
         omitted: state.omitted.clone(),
     })
 }
 
+fn settle_brief(
+    request: &SynthesisRequest,
+    state: &ProjectionState<'_>,
+    brief: &mut ResearchBrief,
+) {
+    brief.preservation = check_preservation(request, brief, state);
+    if brief.disposition == SynthesisDisposition::Complete
+        && brief
+            .preservation
+            .iter()
+            .any(|verdict| !verdict.passed || !verdict.known)
+    {
+        brief.disposition = SynthesisDisposition::Partial;
+    }
+    brief.raw_digest = brief_raw_digest(brief);
+    brief.semantic_digest = brief_semantic_digest(brief);
+}
+
 fn has_opposed_rivals(rivals: &[RivalPosition]) -> bool {
     for left in rivals {
         for right in rivals {
             if left.target_claim == right.target_claim
-                && ((left.stance == RivalStance::Supports
-                    && right.stance == RivalStance::Opposes)
+                && ((left.stance == RivalStance::Supports && right.stance == RivalStance::Opposes)
                     || (left.stance == RivalStance::Opposes
                         && right.stance == RivalStance::Supports))
             {
@@ -1905,7 +2020,7 @@ fn enforce_output_budget(
                 .saturating_add(elided_unknowns)
                 .saturating_add(elided_residue),
         );
-        brief.omitted = state.omitted.clone();
+        brief.omitted.clone_from(&state.omitted);
         if brief.disposition == SynthesisDisposition::Complete {
             brief.disposition = SynthesisDisposition::Partial;
         }
