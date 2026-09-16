@@ -407,6 +407,9 @@ impl KernelComposition {
             self.service.clone(),
             Arc::new(client),
             route,
+            // I14.21 (#1690): the gateway owns unknown-commit recovery
+            // against the composition-retained Kernel ORS handle.
+            Some(Arc::clone(&self.generation_gateway.ors)),
         ));
         attach_then_retain_canonical_store(
             Arc::clone(&gateway),

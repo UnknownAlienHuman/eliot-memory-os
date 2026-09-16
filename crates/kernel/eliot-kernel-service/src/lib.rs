@@ -16,6 +16,13 @@
 use std::future::Future;
 use std::pin::Pin;
 
+#[cfg(windows)]
+mod commit_recovery;
+#[cfg(windows)]
+pub use commit_recovery::{
+    CommitRecoveryClass, CommitRecoveryError, classify_commit_receipt, paused_ordering_scope_view,
+    paused_scopes_snapshot, receipt_evidence_digest, recover_commit,
+};
 mod doctor;
 mod doctor_front_door;
 mod host_request_binding;

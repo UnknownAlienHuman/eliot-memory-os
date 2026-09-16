@@ -1414,6 +1414,9 @@ impl KernelComposition {
             self.service.clone(),
             std::sync::Arc::new(client),
             route.clone(),
+            // I14.21 (#1690): the rebind gateway recovers against the same
+            // composition-retained Kernel ORS handle as the live gateway.
+            Some(std::sync::Arc::clone(&self.generation_gateway.ors)),
         ));
         let receipt = {
             let mut svc = self

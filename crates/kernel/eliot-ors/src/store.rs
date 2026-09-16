@@ -48,12 +48,13 @@ use crate::{
     SupervisionLeaseProjection, SupervisionLeaseReceipt, SupervisionLeaseReceiptInput,
     SupervisionLeaseRecord, SupervisionLeaseSnapshot, SupervisionLeaseStageReceipt,
     SupervisionLeaseStageResolution, SupervisionLeaseStageResolutionDisposition,
-    SupervisionLeaseTicketReconciliation, UserBrokerFence, UserBrokerRegistration,
-    UserBrokerRegistrationReceipt, WorkerReplayAck, WorkerReplayAckRecord, WorkerReplayBegin,
-    WorkerReplayCursors, WorkerReplayDraft, WorkerReplayEvent, WorkerReplayRequestDecision,
-    WorkerReplayRequestRecord, WorkerReplayStreamRecord, WriterReservationToken,
-    is_replay_terminal_phase, parse_replay_stream_id, require_replay_claim_binding,
-    signed_supervision_lease_from_verified, signed_terminal_supervision_lease_from_verified,
+    SupervisionLeaseTicketReconciliation, UnknownCommitOutcome, UnknownCommitRecord,
+    UserBrokerFence, UserBrokerRegistration, UserBrokerRegistrationReceipt, WorkerReplayAck,
+    WorkerReplayAckRecord, WorkerReplayBegin, WorkerReplayCursors, WorkerReplayDraft,
+    WorkerReplayEvent, WorkerReplayRequestDecision, WorkerReplayRequestRecord,
+    WorkerReplayStreamRecord, WriterReservationToken, is_replay_terminal_phase,
+    parse_replay_stream_id, require_replay_claim_binding, signed_supervision_lease_from_verified,
+    signed_terminal_supervision_lease_from_verified,
 };
 
 const META: TableDefinition<&str, &str> = TableDefinition::new("ors_meta_v1");
@@ -91,6 +92,8 @@ const STORE_REBIND_REPLAY: TableDefinition<&str, &str> =
     TableDefinition::new("ors_store_rebind_replay_v1");
 const STORE_FAILURE_RETENTION: TableDefinition<&str, &str> =
     TableDefinition::new("ors_store_failure_retention_v1");
+const UNKNOWN_COMMIT_RECOVERY: TableDefinition<&str, &str> =
+    TableDefinition::new("ors_unknown_commit_recovery_v1");
 const HOST_REQUESTS: TableDefinition<&str, &str> = TableDefinition::new("ors_host_requests_v1");
 const NATIVE_WORKER_CLAIMS: TableDefinition<&str, &str> =
     TableDefinition::new("ors_native_worker_claims_v1");
@@ -1224,6 +1227,141 @@ impl RedbRecoveryStore {
             records.push(record);
         }
         Ok(records)
+    }
+
+    /// Stages one Kernel-owned unknown-commit recovery record before the
+    /// commit send (I14.21, issue #1690).
+    ///
+    /// The record must be open (no outcome, no evidence). An exact replay
+    /// under the same idempotency key returns the durably stored record
+    /// unchanged; a changed binding under the same key fails with an
+    /// integrity error, so one key can never cover two different attempts.
+    pub fn stage_unknown_commit(
+        &self,
+        record: &UnknownCommitRecord,
+    ) -> Result<Option<UnknownCommitRecord>, OrsError> {
+        record.validate()?;
+        if !record.is_open() {
+            return Err(OrsError::InvalidField {
+                field: "unknown_commit_outcome",
+                reason: "only an open unknown-commit record stages",
+            });
+        }
+        let write = self.database.begin_write().map_err(storage)?;
+        let key = record.record_key();
+        let stored = {
+            let mut table = write.open_table(UNKNOWN_COMMIT_RECOVERY).map_err(storage)?;
+            let staged_bytes = table
+                .get(key.as_str())
+                .map_err(storage)?
+                .map(|value| value.value().to_owned());
+            let Some(bytes) = staged_bytes else {
+                let payload = encode(record)?;
+                table
+                    .insert(key.as_str(), payload.as_str())
+                    .map_err(storage)?;
+                drop(table);
+                write.commit().map_err(storage)?;
+                return Ok(None);
+            };
+            let existing: UnknownCommitRecord = decode(&bytes)?;
+            existing.validate()?;
+            if !existing.same_binding(record) {
+                return Err(OrsError::IntegrityProblem {
+                    record_type: "unknown_commit_recovery",
+                    reason: "existing unknown-commit binding conflicts".to_owned(),
+                });
+            }
+            existing
+        };
+        write.commit().map_err(storage)?;
+        Ok(Some(stored))
+    }
+
+    /// Loads one unknown-commit recovery record by exact idempotency key.
+    pub fn load_unknown_commit(
+        &self,
+        idempotency_key: &str,
+    ) -> Result<Option<UnknownCommitRecord>, OrsError> {
+        let read = self.database.begin_read().map_err(storage)?;
+        let table = read.open_table(UNKNOWN_COMMIT_RECOVERY).map_err(storage)?;
+        table
+            .get(idempotency_key)
+            .map_err(storage)?
+            .map(|value| {
+                let record: UnknownCommitRecord = decode(value.value())?;
+                record.validate()?;
+                Ok(record)
+            })
+            .transpose()
+    }
+
+    /// Lists every still-open unknown-commit record: the visible Problem
+    /// State for Doctor/Human disposition (I14.21, issue #1690).
+    ///
+    /// Restart rehydrates the same open set: an unknown outcome never
+    /// degrades to not-attempted, and a resolved record never reopens.
+    pub fn list_open_unknown_commits(&self) -> Result<Vec<UnknownCommitRecord>, OrsError> {
+        let read = self.database.begin_read().map_err(storage)?;
+        let table = read.open_table(UNKNOWN_COMMIT_RECOVERY).map_err(storage)?;
+        let mut records = Vec::new();
+        for entry in table.iter().map_err(storage)? {
+            let (_, value) = entry.map_err(storage)?;
+            let record: UnknownCommitRecord = decode(value.value())?;
+            record.validate()?;
+            if record.is_open() {
+                records.push(record);
+            }
+        }
+        Ok(records)
+    }
+
+    /// Resolves one open unknown-commit record with its receipt evidence
+    /// (I14.21 evidence-backed disposition, issue #1690).
+    ///
+    /// Only an open record resolves, and only with a bound receipt digest:
+    /// resolution without evidence fails, a second resolution fails, and a
+    /// different digest never replaces the bound one. Returns `Ok(None)`
+    /// for an unknown key; this method never invents a record and never
+    /// retries a send.
+    pub fn resolve_unknown_commit(
+        &self,
+        idempotency_key: &str,
+        outcome: UnknownCommitOutcome,
+        evidence_receipt_digest: &str,
+    ) -> Result<Option<UnknownCommitRecord>, OrsError> {
+        crate::model::validate_digest(evidence_receipt_digest, "unknown_commit_evidence")?;
+        let write = self.database.begin_write().map_err(storage)?;
+        let resolved = {
+            let mut table = write.open_table(UNKNOWN_COMMIT_RECOVERY).map_err(storage)?;
+            let staged_bytes = table
+                .get(idempotency_key)
+                .map_err(storage)?
+                .map(|value| value.value().to_owned());
+            let Some(bytes) = staged_bytes else {
+                drop(table);
+                write.commit().map_err(storage)?;
+                return Ok(None);
+            };
+            let mut next: UnknownCommitRecord = decode(&bytes)?;
+            next.validate()?;
+            if !next.is_open() {
+                return Err(OrsError::InvalidField {
+                    field: "unknown_commit_outcome",
+                    reason: "only an open unknown-commit record resolves",
+                });
+            }
+            next.outcome = Some(outcome);
+            next.evidence_receipt_digest = Some(evidence_receipt_digest.to_owned());
+            next.validate()?;
+            let payload = encode(&next)?;
+            table
+                .insert(idempotency_key, payload.as_str())
+                .map_err(storage)?;
+            next
+        };
+        write.commit().map_err(storage)?;
+        Ok(Some(resolved))
     }
 
     /// Stages one P-04 host-request operation before any acknowledgement.
@@ -4253,6 +4391,7 @@ impl RedbRecoveryStore {
                     .map_err(storage)?,
             );
             drop(write.open_table(STORE_REBIND_REPLAY).map_err(storage)?);
+            drop(write.open_table(UNKNOWN_COMMIT_RECOVERY).map_err(storage)?);
             drop(write.open_table(NATIVE_WORKER_CLAIMS).map_err(storage)?);
             drop(write.open_table(REPLAY_STREAMS).map_err(storage)?);
             drop(write.open_table(REPLAY_REQUESTS).map_err(storage)?);
@@ -7340,6 +7479,78 @@ mod host_request_result_tests {
             Err(OrsError::HostRequestIdentityConflict { .. })
         ));
 
+        drop(store);
+        let _ = std::fs::remove_file(path);
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod unknown_commit_recovery_tests {
+    use super::*;
+    use crate::{UnknownCommitOutcome, UnknownCommitRecord};
+
+    fn open_record(key: &str, operation: &str, scopes: &[&str]) -> UnknownCommitRecord {
+        UnknownCommitRecord {
+            idempotency_key: key.to_owned(),
+            operation_id: crate::OperationIdentity::new(operation).expect("operation"),
+            canonical_request_hash: "a".repeat(64),
+            ordering_scopes: scopes.iter().map(|scope| (*scope).to_owned()).collect(),
+            outcome: None,
+            evidence_receipt_digest: None,
+        }
+    }
+
+    #[test]
+    fn unknown_commit_round_trip_conflict_and_resolve() -> Result<(), OrsError> {
+        let path = std::env::temp_dir().join(format!(
+            "eliot-unknown-commit-{}-{}.redb",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0, |duration| duration.as_nanos())
+        ));
+        let store = RedbRecoveryStore::open(&path)?;
+        let record = open_record("key-1", "op-1", &["scope-a"]);
+        assert!(store.stage_unknown_commit(&record)?.is_none());
+        // Exact replay returns the stored record unchanged.
+        let replayed = store
+            .stage_unknown_commit(&record)?
+            .expect("replay returns the record");
+        assert_eq!(replayed, record);
+        // Changed binding under the same key conflicts.
+        let mut conflicting = record.clone();
+        conflicting.canonical_request_hash = "b".repeat(64);
+        assert!(matches!(
+            store.stage_unknown_commit(&conflicting),
+            Err(OrsError::IntegrityProblem { .. })
+        ));
+        // The open set carries the record; resolution binds evidence once.
+        assert_eq!(store.list_open_unknown_commits()?.len(), 1);
+        let resolved = store
+            .resolve_unknown_commit("key-1", UnknownCommitOutcome::Committed, &"c".repeat(64))?
+            .expect("resolution stores");
+        assert_eq!(resolved.outcome, Some(UnknownCommitOutcome::Committed));
+        assert!(store.list_open_unknown_commits()?.is_empty());
+        // A resolved record never reopens.
+        assert!(matches!(
+            store.resolve_unknown_commit(
+                "key-1",
+                UnknownCommitOutcome::RolledBack,
+                &"d".repeat(64)
+            ),
+            Err(OrsError::InvalidField { .. })
+        ));
+        // Unknown keys resolve to None without inventing records.
+        assert!(
+            store
+                .resolve_unknown_commit(
+                    "key-missing",
+                    UnknownCommitOutcome::Committed,
+                    &"e".repeat(64)
+                )?
+                .is_none()
+        );
         drop(store);
         let _ = std::fs::remove_file(path);
         Ok(())

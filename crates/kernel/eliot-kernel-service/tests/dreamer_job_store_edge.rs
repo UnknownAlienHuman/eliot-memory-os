@@ -1663,7 +1663,12 @@ mod gateway_cases {
             AuthorityEpoch::new(LIVE_GENERATION).expect("loopback epoch"),
         )
         .expect("loopback route");
-        let gateway = Arc::new(KernelStoreGateway::new(service, Arc::new(client), route));
+        let gateway = Arc::new(KernelStoreGateway::new(
+            service,
+            Arc::new(client),
+            route,
+            None,
+        ));
         LoopbackSetup {
             gateway,
             log,
