@@ -13,6 +13,9 @@ use sha2::{Digest as _, Sha256};
 use thiserror::Error;
 
 use crate::DEFAULT_GUEST_TARGET;
+use crate::component_contract::{
+    ProofCeiling, TYPED_PACKAGE_ID, TypedContractError, TypedWorld,
+};
 
 const MAX_TEXT_BYTES: usize = 512;
 
@@ -734,6 +737,8 @@ pub enum RuntimeError {
     SecurityContract(String),
     #[error("process contract: {0}")]
     ProcessContract(String),
+    #[error("typed contract: {0}")]
+    TypedContract(String),
 }
 
 impl From<RuntimeContractError> for RuntimeError {
@@ -757,6 +762,12 @@ impl From<SecurityContractError> for RuntimeError {
 impl From<eliot_process::ContractError> for RuntimeError {
     fn from(error: eliot_process::ContractError) -> Self {
         Self::ProcessContract(error.to_string())
+    }
+}
+
+impl From<TypedContractError> for RuntimeError {
+    fn from(error: TypedContractError) -> Self {
+        Self::TypedContract(error.to_string())
     }
 }
 
@@ -844,6 +855,95 @@ fn canonicalize(value: Value) -> Value {
             Value::Object(sorted)
         }
         scalar => scalar,
+    }
+}
+
+/// One separated proof stage bound by a [`ModuleTestCapsule`](crate::capsule::ModuleTestCapsule).
+/// Build, ABI, instantiation, invocation, result, parity, and receipt
+/// proofs never share a capsule: parity evidence is separate from
+/// invocation evidence.
+#[derive(Clone, Copy, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum ProofStage {
+    Build,
+    Abi,
+    Instantiation,
+    Invocation,
+    Result,
+    Parity,
+    Receipt,
+}
+
+/// Immutable typed receipt binding one kit digest, world, artifact, stage,
+/// and proof ceiling to the observed input/output digests. Digests are
+/// derived by the neutral facade from actual values, never supplied by the
+/// engine or guest.
+#[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TypedReceipt {
+    pub kit_digest: Sha256Digest,
+    pub world: TypedWorld,
+    pub package_id: String,
+    pub artifact_digest: Sha256Digest,
+    pub input_digest: Sha256Digest,
+    pub output_digest: Option<Sha256Digest>,
+    pub output_bytes: u64,
+    pub stage: ProofStage,
+    pub proof_ceiling: ProofCeiling,
+    pub terminal: String,
+    pub semantic_digest: Sha256Digest,
+}
+
+impl TypedReceipt {
+    /// Validates package identity, terminal bound, and digest presence:
+    /// output bytes exist exactly when an output digest exists.
+    pub fn validate(&self) -> Result<(), TypedContractError> {
+        if self.package_id != TYPED_PACKAGE_ID {
+            return Err(TypedContractError::PackageMismatch {
+                want: TYPED_PACKAGE_ID.to_owned(),
+                got: self.package_id.clone(),
+            });
+        }
+        validate_text(&self.terminal, "typed.terminal")
+            .map_err(|_| TypedContractError::DescriptorField("terminal".to_owned()))?;
+        if self.output_bytes == 0 && self.output_digest.is_some()
+            || self.output_bytes > 0 && self.output_digest.is_none()
+        {
+            return Err(TypedContractError::ReportMismatch);
+        }
+        Ok(())
+    }
+}
+
+/// Exact typed result pairing a validated receipt with its limited output
+/// evidence.
+#[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TypedResult {
+    pub receipt: TypedReceipt,
+    pub output: Option<Vec<u8>>,
+}
+
+impl TypedResult {
+    /// Validates the receipt and the output evidence: present bytes must
+    /// match the receipt digest and length exactly, and absent bytes must
+    /// pair with an absent digest.
+    pub fn validate(&self) -> Result<(), TypedContractError> {
+        self.receipt.validate()?;
+        match (&self.output, &self.receipt.output_digest) {
+            (Some(bytes), Some(digest)) => {
+                let observed_len =
+                    u64::try_from(bytes.len()).map_err(|_| TypedContractError::ReportMismatch)?;
+                if observed_len != self.receipt.output_bytes
+                    || Sha256Digest::of_bytes(bytes) != *digest
+                {
+                    return Err(TypedContractError::ReportMismatch);
+                }
+                Ok(())
+            }
+            (None, None) => Ok(()),
+            _ => Err(TypedContractError::ReportMismatch),
+        }
     }
 }
 

@@ -6,6 +6,8 @@ use crate::{
     GovernorResolution, InvocationRequest, ProcessBinding, ProcessLaunchEnvelope, PromotionQuery,
     PromotionVerification, SourceVerification,
 };
+use crate::capsule::{ModuleContractKit, invoke_typed};
+use crate::component_contract::TypedContractError;
 
 /// Typed failure shared by injected authority and execution ports.
 #[derive(Clone, Copy, Debug, Eq, Error, PartialEq)]
@@ -87,6 +89,27 @@ pub trait ComponentEnginePort: Send {
     fn invoke(&mut self, invocation: &EngineInvocation) -> Result<EngineReport, PortError>;
 
     fn reconcile(&mut self, invocation: &EngineInvocation) -> Result<EngineReport, PortError>;
+}
+
+/// Typed extension over the engine boundary. Implementors bind one
+/// Governor-admitted [`ModuleContractKit`] and expose a kit-checked typed
+/// invocation that still travels through the real neutral
+/// [`ComponentEnginePort::invoke`] path. The Host Wasmtime provider owns
+/// its generated binding and implements this trait; the neutral crate
+/// never implements an engine itself.
+pub trait TypedComponentPort: ComponentEnginePort {
+    /// Returns the Governor-admitted kit bound by composition.
+    fn kit(&self) -> &ModuleContractKit;
+
+    /// Checks the invocation against the kit, invokes through the real
+    /// neutral engine API, and validates the report envelope.
+    fn invoke_typed(
+        &mut self,
+        invocation: &EngineInvocation,
+    ) -> Result<EngineReport, TypedContractError> {
+        let kit = self.kit().clone();
+        invoke_typed(self, &kit, invocation)
+    }
 }
 
 /// Complete injected dependency set. Missing any set yields typed `PLAN_GAP`.
