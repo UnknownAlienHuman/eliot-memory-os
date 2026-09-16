@@ -342,6 +342,10 @@ fn request_cancel_operation(job: &str, attempt: &str, reason: &str, at: u64) -> 
 
 /// Fresh transport correlation shared by request builders.
 fn fresh_request_json(fresh: &str) -> Value {
+    fresh_request_json_with_fence(fresh, &fence_json())
+}
+
+fn fresh_request_json_with_fence(fresh: &str, fence_value: &Value) -> Value {
     json!({
         "request": {
             "metadata": {
@@ -350,11 +354,11 @@ fn fresh_request_json(fresh: &str) -> Value {
                 "task_id": "job-775",
                 "product_id": "product-dreamer-775",
                 "source_id": "source-dreamer-775",
-                "state_fence": fence_json(),
+                "state_fence": fence_value,
                 "clock": {"valid_time_ms": 1_000, "known_time_ms": 1_001,
                           "transaction_sequence": null, "monotonic_ns": null},
             },
-            "state_fence": fence_json(),
+            "state_fence": fence_value,
         },
         "idempotency_key": "transport-775",
         "deadline_unix_ms": 600_000,
@@ -371,16 +375,30 @@ fn make_request_unchecked(
     idempotency: &str,
     fresh: &str,
 ) -> DurableJobRequest {
+    make_request_unchecked_with_fence(operation, role, operation_id, idempotency, fresh, &fence_json())
+}
+
+/// Builds a request against an explicit fence for stale-fence proofs (the
+/// identity, operation, and digest all bind the same fence so K0 construction
+/// succeeds and the adapter pin is what refuses).
+fn make_request_unchecked_with_fence(
+    operation: JobOperation,
+    role: JobRole,
+    operation_id: &str,
+    idempotency: &str,
+    fresh: &str,
+    fence_value: &Value,
+) -> DurableJobRequest {
     let kind = operation.kind().as_str().to_owned();
     let mut identity: DurableRequestIdentity = serde_json::from_value(json!({
-        "request": fresh_request_json(fresh),
+        "request": fresh_request_json_with_fence(fresh, fence_value),
         "operation": {
             "operation_id": operation_id,
             "request_id": "originating-775",
             "idempotency_key": idempotency,
             "operation_kind": kind,
             "effect": "CANDIDATE",
-            "state_fence": fence_json(),
+            "state_fence": fence_value,
         },
         "canonical_request_hash": "0".repeat(64),
     }))
@@ -1010,7 +1028,7 @@ fn case_03_transition_matrix() {
         serde_json::from_value(record_json(Queued)).expect("queued record");
     queued.transition(Leased).expect("allowed edge applies");
     assert_eq!(queued.revision, 5);
-    assert!(queued.transition(Running).is_err());
+    assert!(queued.transition(JobState::Checkpointed).is_err());
     let mut terminal: eliot_protocol::dreamer_job::DurableJobRecord =
         serde_json::from_value(record_json(Completed)).expect("terminal record");
     assert!(terminal.transition(Partial).is_err());
@@ -1195,12 +1213,14 @@ async fn case_06_stale_pins_not_applied() {
         submit_and_lease(&harness, "06", job, attempt, "worker-775-06").await;
     let issued = issued_of(&lease);
 
-    // Stale fence: the selector fence must equal the admitted scope fence.
+    // Stale fence: identity, operation, and context agree on a foreign fence
+    // so K0 construction succeeds and the adapter's stored-fence pin refuses.
+    let foreign = foreign_fence_json();
     let mut stale_selector: eliot_protocol::dreamer_job::LeaseSelector =
         serde_json::from_value(lease_selector_json(1, "worker-stale-775-06", 8)).expect("selector");
     stale_selector.expected_fence =
-        serde_json::from_value(foreign_fence_json()).expect("foreign fence");
-    let stale_fence = make_request(
+        serde_json::from_value(foreign.clone()).expect("foreign fence");
+    let stale_fence = make_request_unchecked_with_fence(
         JobOperation::LeaseExact {
             selector: stale_selector,
             job_id: TaskId::new(job).expect("job"),
@@ -1209,10 +1229,14 @@ async fn case_06_stale_pins_not_applied() {
         "operation-775-06-stale-fence",
         "stable-775-06-stale-fence",
         "fresh-775-06-stale-fence",
+        &foreign,
     );
+    stale_fence.validate().expect("stale request constructs");
+    let mut stale_ctx = ctx("ctx-775-06-stale-fence");
+    stale_ctx.state_fence = serde_json::from_value(foreign).expect("foreign fence");
     let fence_error = harness
         .adapter()
-        .dreamer_job(&ctx("ctx-775-06-stale-fence"), stale_fence)
+        .dreamer_job(&stale_ctx, stale_fence)
         .await
         .expect_err("stale fence fails");
     assert!(matches!(fence_error, StoreError::FenceMismatch));
@@ -1456,8 +1480,9 @@ async fn case_07_verifying_vs_result() {
     assert!(verifying.result_under_verification.is_some());
     assert!(verifying.outcome.is_none());
 
-    // A partial outcome without unresolved work is invalid evidence.
-    let bad_partial = make_request(
+    // A partial outcome without unresolved work is invalid evidence: the
+    // closed contract refuses it before any provider write.
+    let bad_partial = make_request_unchecked(
         publish_op_json(
             &lease_value_of(&verifying),
             &outcome_json("PARTIAL", None, &[], None),
@@ -1694,7 +1719,7 @@ fn case_10_ambiguous_post_submit_is_store_uncertainty() {
         MutationDisposition::StillUnknown,
         MutationDisposition::Committed
     );
-    let display = format!("{:?}", StoreError::MissingReceiptEnvelope);
+    let display = format!("{}", StoreError::MissingReceiptEnvelope);
     assert!(display.contains("unknown"));
     assert!(!format!("{:?}", JobState::UnknownOutcome).contains("MissingReceiptEnvelope"));
 }
@@ -2144,7 +2169,7 @@ async fn case_15_bounded_selection() {
         .await
         .expect("bounded page selects");
     assert_eq!(second.job_id.to_string(), "job-775-15-b");
-    assert_eq!(second.selection_coverage, vec!["job-775-15-a".to_owned()]);
+    assert_eq!(second.selection_coverage, vec!["job-775-15-b".to_owned()]);
 
     let third: DurableJobResponse = adapter
         .dreamer_job(

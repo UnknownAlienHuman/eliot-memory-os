@@ -1,5 +1,4 @@
 {
-  "description": "WORK_UNIT_CASE 775/20: recovery record whose value_digest does not match its payload must fail closed, never panic.",
   "namespace": "dreamer-job-v1",
   "key": "job_probe_probe",
   "state_fence": {
