@@ -700,9 +700,7 @@ impl std::fmt::Display for StoreReadFailure {
             | Self::Receipt(detail)
             | Self::Serialization(detail) => formatter.write_str(detail),
             Self::UnknownOperation => formatter.write_str("unknown named operation"),
-            Self::ManifestMismatch => {
-                formatter.write_str("operation manifest digest mismatch")
-            }
+            Self::ManifestMismatch => formatter.write_str("operation manifest digest mismatch"),
             Self::TransitionClassExceeded => {
                 formatter.write_str("transition class ceiling exceeded")
             }
@@ -722,9 +720,7 @@ impl std::fmt::Display for StoreReadFailure {
             Self::MissingReceiptEnvelope => {
                 formatter.write_str("receipt envelope is missing; write outcome is unknown")
             }
-            Self::PayloadTooLarge => {
-                formatter.write_str("payload exceeds named-operation limit")
-            }
+            Self::PayloadTooLarge => formatter.write_str("payload exceeds named-operation limit"),
             Self::Unavailable => formatter.write_str("store unavailable"),
         }
     }
@@ -758,10 +754,7 @@ impl From<StoreError> for StoreReadFailure {
             StoreError::InvalidReceipt => Self::InvalidReceipt,
             StoreError::IdentityConflict => Self::IdentityConflict,
             StoreError::TransitionDigestMismatch { expected, observed } => {
-                Self::TransitionDigestMismatch {
-                    expected,
-                    observed,
-                }
+                Self::TransitionDigestMismatch { expected, observed }
             }
             StoreError::ReceiptNotFound => Self::ReceiptNotFound,
             StoreError::MissingReceiptEnvelope => Self::MissingReceiptEnvelope,
@@ -1389,6 +1382,10 @@ mod evidence_pack_read_tests {
         })
     }
 
+    #[allow(
+        clippy::expect_used,
+        reason = "test-only closed selectors are statically known valid"
+    )]
     fn evidence_params(subject: &str, max_records: &str) -> NamedParameters {
         NamedParameters::from_map(BTreeMap::from([
             ("subject".to_owned(), Value::String(subject.to_owned())),
@@ -1687,8 +1684,8 @@ mod evidence_pack_read_tests {
     }
 
     #[test]
-    fn evidence_pack_query_rejects_reserved_selector_keys()
-    -> Result<(), Box<dyn std::error::Error>> {
+    fn evidence_pack_query_rejects_reserved_selector_keys() -> Result<(), Box<dyn std::error::Error>>
+    {
         // #1465 residual preserved, #1144 wire: a caller that smuggles the
         // retired top-level selector names (`query`, `exact_resource_uri`) as
         // store parameters still fails closed at construction — success
