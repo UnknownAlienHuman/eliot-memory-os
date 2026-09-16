@@ -480,3 +480,398 @@ fn launch_12_canaries_absent_from_observations() {
     assert!(bounded.truncated());
     assert!(bounded.text().len() <= 1024);
 }
+
+// ---- Sibling-CD slice (cases 5,6,7,8,9,10,13) ----
+
+fn scm_source() -> String {
+    manifest_source("src/scm_launch.rs")
+}
+
+fn sequence_source() -> String {
+    manifest_source("src/store_kernel_launch_sequence.rs")
+}
+
+fn driver_source() -> String {
+    manifest_source("src/kernel_activation_driver.rs")
+}
+
+fn frontdoor_source() -> String {
+    manifest_source("src/kernel_front_door_client.rs")
+}
+
+fn cd_combined() -> String {
+    format!(
+        "{}{}{}{}",
+        scm_source(),
+        sequence_source(),
+        driver_source(),
+        frontdoor_source()
+    )
+}
+
+// WORK_UNIT_CASE: 978/5
+#[test]
+fn launch_05_start_identity_vs_pid() {
+    let scm = scm_source();
+    for required in [
+        "fn classify_host_scm_inspection",
+        "fn resolve_host_scm_inspection_with_probe",
+        "fn validate_host_scm_bootstrap",
+        "host.scm-launch classification requested",
+        "host.scm-launch start-identity observed",
+        "host.scm-launch pid observed",
+        "host.scm-launch request observed",
+        "host.scm-launch process observed",
+        "host.scm-launch admitted",
+    ] {
+        assert!(scm.contains(required), "scm must pin {required:?}");
+    }
+    assert_ne!(
+        "host.scm-launch start-identity observed",
+        "host.scm-launch pid observed"
+    );
+    assert_ne!(
+        "host.scm-launch request observed",
+        "host.scm-launch process observed"
+    );
+    let correlation = "start-identity:978-5";
+    let text = capture_emit(|| {
+        observe_entrypoint_with_detail(
+            EntrypointStage::ScmDispatch,
+            &format!("host.scm-launch start-identity observed {correlation}"),
+        );
+        observe_entrypoint_with_detail(
+            EntrypointStage::ScmDispatch,
+            &format!("host.scm-launch pid observed {correlation}"),
+        );
+    });
+    assert!(text.contains("host.scm-launch start-identity observed"));
+    assert!(text.contains("host.scm-launch pid observed"));
+    assert_eq!(count_occurrences(&text, correlation), 2, "got: {text}");
+}
+
+// WORK_UNIT_CASE: 978/6
+#[test]
+fn launch_06_store_before_kernel() {
+    let sequence = sequence_source();
+    for required in [
+        "fn launch_store_then_kernel",
+        "host.store-launch requested",
+        "host.store-launch store-ready observed",
+        "host.kernel-launch requested",
+        "host.kernel-launch kernel-ready observed",
+    ] {
+        assert!(
+            sequence.contains(required),
+            "sequence must pin {required:?}"
+        );
+    }
+    let requested = sequence
+        .find("host.store-launch requested")
+        .expect("must pin store request");
+    let store_ready = sequence
+        .find("host.store-launch store-ready observed")
+        .expect("must pin store-ready");
+    let kernel_requested = sequence
+        .find("host.kernel-launch requested")
+        .expect("must pin kernel request");
+    let kernel_ready = sequence
+        .find("host.kernel-launch kernel-ready observed")
+        .expect("must pin kernel-ready");
+    assert!(
+        requested < store_ready
+            && store_ready < kernel_requested
+            && kernel_requested < kernel_ready,
+        "Store-before-Kernel order must be observed separately"
+    );
+    assert_ne!(
+        "host.store-launch store-ready observed",
+        "host.kernel-launch kernel-ready observed"
+    );
+    let text = capture_emit(|| {
+        observe_entrypoint_with_detail(
+            EntrypointStage::Startup,
+            "host.store-launch store-ready observed",
+        );
+        observe_entrypoint_with_detail(
+            EntrypointStage::Startup,
+            "host.kernel-launch kernel-ready observed",
+        );
+    });
+    assert!(text.contains("host.store-launch store-ready observed"));
+    assert!(text.contains("host.kernel-launch kernel-ready observed"));
+}
+
+// WORK_UNIT_CASE: 978/7
+#[test]
+fn launch_07_nonce_handshake_auth_activation_distinct() {
+    let driver = driver_source();
+    let frontdoor = frontdoor_source();
+    for required in [
+        "host.kernel-activation nonce requested",
+        "host.kernel-activation nonce issued",
+        "host.kernel-activation activating requested",
+        "host.kernel-activation activation observed",
+        "host.kernel-activation candidate observed",
+    ] {
+        assert!(driver.contains(required), "driver must pin {required:?}");
+    }
+    for required in [
+        "host.kernel-front-door handshake requested",
+        "host.kernel-front-door handshake observed",
+        "host.kernel-front-door auth requested",
+        "host.kernel-front-door authenticated peer observed",
+        "host.kernel-front-door control requested",
+    ] {
+        assert!(
+            frontdoor.contains(required),
+            "front-door must pin {required:?}"
+        );
+    }
+    assert_ne!(
+        "host.kernel-activation nonce issued",
+        "host.kernel-activation activation observed"
+    );
+    assert_ne!(
+        "host.kernel-front-door handshake observed",
+        "host.kernel-front-door authenticated peer observed"
+    );
+    let fixture = launch_fixture();
+    let canaries = fixture_str_list(&fixture, "canaries");
+    assert!(!canaries.is_empty(), "fixture must pin canaries");
+    for source in [driver_source(), frontdoor_source()] {
+        for line in source.lines().filter(|line| {
+            line.contains("host.kernel-activation") || line.contains("host.kernel-front-door")
+        }) {
+            for canary in &canaries {
+                assert!(
+                    !line.contains(canary.as_str()),
+                    "diagnostic line must not contain canary {canary:?}: {line}"
+                );
+            }
+            assert!(
+                !line.contains("activation_nonce"),
+                "nonce value must never be observed: {line}"
+            );
+        }
+    }
+    let text = capture_emit(|| {
+        observe_entrypoint_with_detail(
+            EntrypointStage::Startup,
+            "host.kernel-activation nonce issued",
+        );
+        observe_entrypoint_with_detail(
+            EntrypointStage::ScmDispatch,
+            "host.kernel-front-door authenticated peer observed",
+        );
+        observe_entrypoint_with_detail(
+            EntrypointStage::Startup,
+            "host.kernel-activation activation observed",
+        );
+    });
+    assert!(text.contains("host.kernel-activation nonce issued"));
+    assert!(text.contains("host.kernel-front-door authenticated peer observed"));
+    assert!(text.contains("host.kernel-activation activation observed"));
+}
+
+// WORK_UNIT_CASE: 978/8
+#[test]
+fn launch_08_readiness_needs_owner_evidence() {
+    let driver = driver_source();
+    assert!(driver.contains("fn active"));
+    assert!(
+        driver.contains("host.kernel-activation readiness requested"),
+        "readiness request must be observed"
+    );
+    assert!(
+        driver.contains("host.kernel-activation readiness observed"),
+        "readiness must be observed only on owner evidence"
+    );
+    assert_ne!(
+        "host.kernel-activation readiness requested",
+        "host.kernel-activation readiness observed"
+    );
+    for line in driver.lines().filter(|line| line.contains("readiness")) {
+        assert!(
+            !line.contains("liveness"),
+            "readiness detail must not claim liveness: {line}"
+        );
+    }
+    let text = capture_emit(|| {
+        observe_entrypoint_with_detail(
+            EntrypointStage::Startup,
+            "host.kernel-activation readiness requested",
+        );
+        observe_entrypoint_with_detail(
+            EntrypointStage::Startup,
+            "host.kernel-activation readiness observed",
+        );
+    });
+    assert!(text.contains("host.kernel-activation readiness requested"));
+    assert!(text.contains("host.kernel-activation readiness observed"));
+    assert!(!text.contains("host.kernel-launch kernel-ready observed"));
+}
+
+// WORK_UNIT_CASE: 978/9
+#[test]
+fn launch_09_before_start_vs_timeout_disconnect_unknown() {
+    let frontdoor = frontdoor_source();
+    assert!(frontdoor.contains("fn activation_response_or_reconcile"));
+    assert!(frontdoor.contains("fn validate_authenticated_kernel_peer"));
+    assert!(frontdoor.contains("fn connect_authenticated_kernel_front_door"));
+    for detail in [
+        "host.kernel-front-door before-start observed",
+        "host.kernel-front-door timeout observed",
+        "host.kernel-front-door disconnect observed",
+        "host.kernel-front-door unknown observed",
+        "host.kernel-front-door reconcile requested",
+        "host.kernel-front-door activation observed",
+    ] {
+        assert!(frontdoor.contains(detail), "front-door must pin {detail:?}");
+    }
+    assert_ne!(
+        "host.kernel-front-door before-start observed",
+        "host.kernel-front-door timeout observed"
+    );
+    assert_ne!(
+        "host.kernel-front-door disconnect observed",
+        "host.kernel-front-door unknown observed"
+    );
+    let correlation = "front-door:978-9";
+    let text = capture_emit(|| {
+        observe_entrypoint_with_detail(
+            EntrypointStage::ScmDispatch,
+            &format!("host.kernel-front-door before-start observed {correlation}"),
+        );
+        observe_entrypoint_with_detail(
+            EntrypointStage::ScmDispatch,
+            &format!("host.kernel-front-door timeout observed {correlation}"),
+        );
+        observe_entrypoint_with_detail(
+            EntrypointStage::ScmDispatch,
+            &format!("host.kernel-front-door disconnect observed {correlation}"),
+        );
+        observe_entrypoint_with_detail(
+            EntrypointStage::ScmDispatch,
+            &format!("host.kernel-front-door unknown observed {correlation}"),
+        );
+    });
+    for detail in [
+        "host.kernel-front-door before-start observed",
+        "host.kernel-front-door timeout observed",
+        "host.kernel-front-door disconnect observed",
+        "host.kernel-front-door unknown observed",
+    ] {
+        assert!(text.contains(detail), "got: {text}");
+    }
+    assert_eq!(count_occurrences(&text, correlation), 4, "got: {text}");
+}
+
+// WORK_UNIT_CASE: 978/10
+#[test]
+fn launch_10_one_terminal_across_nesting() {
+    let owned = cd_combined();
+    assert_eq!(
+        count_occurrences(&owned, "host-scm-launch-unknown"),
+        1,
+        "SCM terminal must be owned by exactly one callsite"
+    );
+    assert!(scm_source().contains("struct ScmLaunchTerminalGuard"));
+    assert!(scm_source().contains("fn disarm"));
+    assert!(
+        !owned.contains("static DEDUP"),
+        "no mutable global dedup cache may exist"
+    );
+    for source in [sequence_source(), driver_source(), frontdoor_source()] {
+        assert!(
+            !source.contains("observe_terminal_error"),
+            "inner nesting must correlate by stage order only, no inner terminal"
+        );
+    }
+    assert!(
+        !owned.contains("host-launch-failed"),
+        "CD must not own the AB terminal"
+    );
+    let fixture = launch_fixture();
+    let terminal_event = fixture["terminal_event"]
+        .as_str()
+        .expect("fixture must pin the terminal event");
+    let correlation = "single-terminal:978-10";
+    let failed = capture_emit(|| {
+        observe_entrypoint_with_detail(
+            EntrypointStage::ScmDispatch,
+            &format!("host.scm-launch requested {correlation}"),
+        );
+        observe_entrypoint_with_detail(
+            EntrypointStage::ScmDispatch,
+            &format!("host.scm-launch pid observed {correlation}"),
+        );
+        observe_terminal_error("host-scm-launch-unknown");
+    });
+    assert_eq!(
+        count_occurrences(&failed, terminal_event),
+        1,
+        "one failed op emits one terminal, got: {failed}"
+    );
+    assert_eq!(
+        count_occurrences(&failed, correlation),
+        2,
+        "phases share correlation, got: {failed}"
+    );
+    let succeeded = capture_emit(|| {
+        observe_entrypoint_with_detail(EntrypointStage::ScmDispatch, "host.scm-launch admitted");
+    });
+    assert_eq!(
+        count_occurrences(&succeeded, terminal_event),
+        0,
+        "success emits no terminal, got: {succeeded}"
+    );
+}
+
+// WORK_UNIT_CASE: 978/13
+#[test]
+fn launch_13_deterministic_semantic_fields() {
+    let scm = scm_source();
+    let sequence = sequence_source();
+    let driver = driver_source();
+    let combined = format!("{scm}{sequence}{driver}");
+    for required in [
+        "host.scm-launch probe requested",
+        "HOST_SCM_TRANSIENT_MAX_INSPECTIONS",
+        "host.store-launch store-ready observed",
+        "host.kernel-launch kernel-ready observed",
+        "host.kernel-activation nonce issued",
+        "host.kernel-activation readiness observed",
+    ] {
+        assert!(
+            combined.contains(required),
+            "deterministic vocabulary must pin {required:?}"
+        );
+    }
+    let first = capture_emit(|| {
+        observe_entrypoint_with_detail(
+            EntrypointStage::ScmDispatch,
+            "host.scm-launch probe requested",
+        );
+        observe_entrypoint_with_detail(
+            EntrypointStage::Startup,
+            "host.store-launch store-ready observed",
+        );
+    });
+    let second = capture_emit(|| {
+        observe_entrypoint_with_detail(
+            EntrypointStage::ScmDispatch,
+            "host.scm-launch probe requested",
+        );
+        observe_entrypoint_with_detail(
+            EntrypointStage::Startup,
+            "host.store-launch store-ready observed",
+        );
+    });
+    assert_eq!(
+        count_occurrences(&first, "host.entrypoint_stage"),
+        count_occurrences(&second, "host.entrypoint_stage"),
+        "injected schedules must emit deterministically"
+    );
+    assert_eq!(first.len(), second.len(), "got: {first:?} vs {second:?}");
+}
