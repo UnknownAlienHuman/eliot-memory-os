@@ -246,6 +246,10 @@ pub(super) fn run() -> Result<(), String> {
     // thread, no transport, no start() contour or run-loop change.
     attach_agent_fabric(&composition)?;
     kernel.report_ready().map_err(|error| error.to_string())?;
+    // #740: readiness record. Handshake (connect) and readiness (recovery +
+    // attach gates passed, Kernel accepted ready) stay distinct events.
+    let _startup_span = tracing::info_span!("eliotd.daemon_start").entered();
+    let _ = eliotd::diagnostics::emit_daemon_readiness(true, false);
     let status = composition.status();
     write_json(&ready_message(&status))?;
 
@@ -255,7 +259,9 @@ pub(super) fn run() -> Result<(), String> {
         .map_err(|error| error.to_string())?;
     let loop_result = runtime.block_on(run_loop(Arc::clone(&kernel), &composition));
     let shutdown_result = composition.shutdown().map_err(|error| error.to_string());
-    match (loop_result, shutdown_result) {
+    // #740: shutdown disposition record. The terminal-failure reports below
+    // keep their exact existing behavior; this only names the disposition.
+    let final_result = match (loop_result, shutdown_result) {
         (Ok(RunLoopExit::Shutdown), Ok(())) => Ok(()),
         (
             Ok(RunLoopExit::ShutdownActivationUnknown {
@@ -289,7 +295,24 @@ pub(super) fn run() -> Result<(), String> {
             &kernel,
             format!("{error}; shutdown: {shutdown_error}"),
         )),
+    };
+    match &final_result {
+        Ok(()) => {
+            let _ = eliotd::diagnostics::emit_shutdown(
+                eliotd::diagnostics::ShutdownOutcome::Clean,
+                "daemon shutdown completed",
+            );
+        }
+        Err(error) => {
+            let outcome = if error.contains("unknown ticket") {
+                eliotd::diagnostics::ShutdownOutcome::WithActivationUnknown
+            } else {
+                eliotd::diagnostics::ShutdownOutcome::WithError
+            };
+            let _ = eliotd::diagnostics::emit_shutdown(outcome, error);
+        }
     }
+    final_result
 }
 
 /// Attaches the T12-06 Governor Dreamer intake registration (gated, no lifecycle change).
@@ -342,16 +365,34 @@ fn attach_dreamer_model(composition: &DaemonComposition) -> Result<(), String> {
 /// constructed per admitted operation through the fabric composition, and the
 /// run loop dispatches only post-activation provider-neutral intents.
 fn attach_agent_fabric(composition: &DaemonComposition) -> Result<(), String> {
+    // #740: #872 attach span over the existing control path. The admitted
+    // ingress reaching the durable fabric is recorded with the descriptor
+    // identities before readiness is reported.
+    let _span = tracing::info_span!("eliotd.fabric_attach").entered();
     let descriptor = composition
         .agent_fabric_descriptor()
         .map_err(|error| error.to_string())?;
     if descriptor.service != SERVICE_NAME {
         return Err("agent fabric descriptor service mismatch".to_owned());
     }
+    let _ = eliotd::diagnostics::emit_fabric_attached(
+        &descriptor.service,
+        descriptor.generation,
+        descriptor.authority_epoch,
+    );
     Ok(())
 }
 
 fn report_terminal_failure(kernel: &DaemonKernelClient, reason: String) -> String {
+    // #740: owning error record at the terminal-failure boundary. The
+    // degraded/fatal/status writes below keep their exact existing behavior.
+    let _span = tracing::info_span!("eliotd.terminal_failure").entered();
+    let _ = eliotd::diagnostics::ErrorRecord::of(
+        eliotd::diagnostics::OwningComponent::DaemonRuntime,
+        "terminal-failure",
+        &reason,
+    )
+    .emit();
     let mut terminal = reason.clone();
     if let Err(error) = kernel.report_degraded(reason.clone()) {
         append_failure(&mut terminal, "Kernel degraded report", error);
@@ -566,8 +607,12 @@ async fn run_loop(
 async fn drain_activation_on_shutdown(
     flight: &mut ActivationFlight,
 ) -> Result<RunLoopExit, String> {
+    // #740: drain span. Idle drains and unknown-retention drains emit
+    // distinct dispositions with the original identity verbatim.
+    let _span = tracing::info_span!("eliotd.activation_drain").entered();
     let previous = std::mem::replace(flight, ActivationFlight::Idle);
     let ActivationFlight::InFlight(state) = previous else {
+        let _ = eliotd::diagnostics::emit_drain(eliotd::diagnostics::DrainOutcome::Idle, "", "");
         return Ok(RunLoopExit::Shutdown);
     };
     let retained = state.retained;
@@ -584,14 +629,26 @@ async fn drain_activation_on_shutdown(
                 ticket_id,
                 result_sha256,
                 detail,
-            }) => Ok(RunLoopExit::ShutdownActivationUnknown {
-                ticket_id,
-                result_sha256,
-                detail,
-            }),
+            }) => {
+                let _ = eliotd::diagnostics::emit_drain(
+                    eliotd::diagnostics::DrainOutcome::ActivationUnknown,
+                    &ticket_id,
+                    &result_sha256,
+                );
+                Ok(RunLoopExit::ShutdownActivationUnknown {
+                    ticket_id,
+                    result_sha256,
+                    detail,
+                })
+            }
         },
         Err(_) => {
             if let Some(identity) = retained {
+                let _ = eliotd::diagnostics::emit_drain(
+                    eliotd::diagnostics::DrainOutcome::ActivationUnknown,
+                    &identity.ticket_id,
+                    &identity.result_sha256,
+                );
                 Ok(RunLoopExit::ShutdownActivationUnknown {
                     ticket_id: identity.ticket_id,
                     result_sha256: identity.result_sha256,
@@ -661,6 +718,9 @@ fn settle_local_read_completion(
 /// Kernel contract. Any step failure fails the daemon closed — a claimed
 /// pair that cannot forward or submit is never silently discarded.
 async fn run_local_read_poll(kernel: &DaemonKernelClient) -> Result<LocalReadPollOutcome, String> {
+    // #740: receipt span over the claim/forward/submit poll step. Pair
+    // presence and submit outcome are named; payload bytes never are.
+    let _span = tracing::info_span!("eliotd.local_read_poll").entered();
     let pair = kernel
         .claim_local_read_pair_async()
         .await
@@ -731,6 +791,13 @@ async fn dispatch_agent_activation_result(
     ticket: &AgentActivationResolutionTicket,
     result: AgentActivationResolutionResult,
 ) -> Result<(), ActivationDispatchError> {
+    // #740: dispatch span over the submit-then-reconcile path. The retained
+    // result is reused verbatim; only bounded ticket identity is carried.
+    let _span = tracing::info_span!(
+        "eliotd.activation_dispatch",
+        ticket = %eliotd::diagnostics::sanitize_identity(&ticket.ticket_id)
+    )
+    .entered();
     observe_transient_deferral(&result);
     match kernel.submit_agent_activation_result(&result).await {
         Ok(ack) => classify_submit_ack(ticket, &result, &ack),
@@ -791,7 +858,16 @@ fn classify_submit_ack(
     match ack.outcome {
         AgentActivationResultAckOutcome::Accepted
         | AgentActivationResultAckOutcome::ExactReplay
-        | AgentActivationResultAckOutcome::Reconciled => Ok(()),
+        | AgentActivationResultAckOutcome::Reconciled => {
+            // #740: ack record. Accepted/replayed/reconciled correlation is
+            // not completed work; no completion is claimed here.
+            let _ = eliotd::diagnostics::emit_activation_ack(
+                &ticket.ticket_id,
+                &result.result_sha256,
+                &ack.outcome,
+            );
+            Ok(())
+        }
         AgentActivationResultAckOutcome::Unknown => Err(ActivationDispatchError::Unknown {
             ticket_id: ticket.ticket_id.clone(),
             result_sha256: result.result_sha256.clone(),
@@ -816,6 +892,13 @@ fn classify_reconcile_ack(
         AgentActivationResultAckOutcome::Accepted
         | AgentActivationResultAckOutcome::ExactReplay
         | AgentActivationResultAckOutcome::Reconciled => {
+            // #740: reconcile-ack record. Reconciled retention is not
+            // completed work; no completion is claimed here.
+            let _ = eliotd::diagnostics::emit_activation_ack(
+                &ticket.ticket_id,
+                &result.result_sha256,
+                &ack.outcome,
+            );
             if ack.ticket_id != ticket.ticket_id || ack.result_sha256 != result.result_sha256 {
                 return Err(ActivationDispatchError::Hard(format!(
                     "Kernel activation result reconcile ticket {} binding mismatch",
@@ -848,6 +931,15 @@ fn observe_transient_deferral(result: &AgentActivationResolutionResult) {
     if result.is_transient_retry() {
         if let Some(not_before) = transient_not_before(result) {
             TRANSIENT_DEFERRAL_OBSERVED.fetch_add(1, Ordering::Relaxed);
+            // #740: structured twin of the operator stderr line below. The
+            // existing line keeps its exact bytes; this only adds the typed
+            // record to the diagnostics sink.
+            tracing::info!(
+                target: "eliotd::diagnostics",
+                event = "eliotd.transient_deferral",
+                ticket = %eliotd::diagnostics::sanitize_identity(&result.ticket_id),
+                not_before = not_before,
+            );
             eprintln!(
                 "eliotd transient activation deferral ticket {} not_before {not_before}",
                 result.ticket_id
@@ -908,20 +1000,20 @@ pub(super) fn plan_daemon_evidence_read(
     max_records: &str,
 ) -> Result<eliot_store_api::NamedReadRequest, String> {
     if subject.trim().is_empty() || subject.chars().any(char::is_control) {
-        return Err("daemon evidence read subject must be non-blank with no control characters"
-            .to_owned());
+        return Err(
+            "daemon evidence read subject must be non-blank with no control characters".to_owned(),
+        );
     }
     if max_records.trim().is_empty() || max_records.chars().any(char::is_control) {
-        return Err("daemon evidence read max_records must be a non-blank decimal bound".to_owned());
-    }
-    let bound: u32 = max_records
-        .trim()
-        .parse()
-        .map_err(|_| "daemon evidence read max_records must be a positive decimal bound".to_owned())?;
-    if bound == 0 {
         return Err(
-            "daemon evidence read max_records must be a positive decimal bound".to_owned(),
+            "daemon evidence read max_records must be a non-blank decimal bound".to_owned(),
         );
+    }
+    let bound: u32 = max_records.trim().parse().map_err(|_| {
+        "daemon evidence read max_records must be a positive decimal bound".to_owned()
+    })?;
+    if bound == 0 {
+        return Err("daemon evidence read max_records must be a positive decimal bound".to_owned());
     }
     let scope = eliot_store_api::ScopeId::new(scope_id)
         .map_err(|error| format!("daemon evidence read scope: {error}"))?;
@@ -978,13 +1070,24 @@ pub(super) fn project_daemon_evidence_response(
         .and_then(serde_json::Value::as_str)
         .ok_or_else(|| "daemon evidence payload misses its subject".to_owned())?;
     if subject != expected_subject {
-        return Err("daemon evidence payload subject does not match the requested subject"
-            .to_owned());
+        return Err(
+            "daemon evidence payload subject does not match the requested subject".to_owned(),
+        );
     }
-    if response.payload.get("records").and_then(serde_json::Value::as_array).is_none() {
+    if response
+        .payload
+        .get("records")
+        .and_then(serde_json::Value::as_array)
+        .is_none()
+    {
         return Err("daemon evidence payload misses its records array".to_owned());
     }
-    if response.payload.get("provenance").and_then(serde_json::Value::as_object).is_none() {
+    if response
+        .payload
+        .get("provenance")
+        .and_then(serde_json::Value::as_object)
+        .is_none()
+    {
         return Err("daemon evidence payload misses its provenance".to_owned());
     }
     Ok(serde_json::json!({
@@ -1017,8 +1120,9 @@ pub(super) fn plan_daemon_position_read(
     position: &str,
 ) -> Result<eliot_store_api::NamedReadRequest, String> {
     if position.trim().is_empty() || position.chars().any(char::is_control) {
-        return Err("daemon position read position must be non-blank with no control characters"
-            .to_owned());
+        return Err(
+            "daemon position read position must be non-blank with no control characters".to_owned(),
+        );
     }
     let scope = eliot_store_api::ScopeId::new(scope_id)
         .map_err(|error| format!("daemon position read scope: {error}"))?;
@@ -1059,7 +1163,9 @@ pub(super) fn project_daemon_position_response(
     expected_position: &str,
 ) -> Result<serde_json::Value, String> {
     if response.operation != eliot_store_api::NamedReadOperation::GetCurrentEpistemicPosition {
-        return Err("daemon position response operation must be GetCurrentEpistemicPosition".to_owned());
+        return Err(
+            "daemon position response operation must be GetCurrentEpistemicPosition".to_owned(),
+        );
     }
     if response.state_fence != *admitted_fence {
         return Err("daemon position response fence does not match the admitted fence".to_owned());
@@ -1420,7 +1526,8 @@ pub(super) fn context_reconstruction_role_admission(
     max_records: &str,
     position: &str,
 ) -> Result<Vec<(&'static str, bool)>, String> {
-    let planned = plan_daemon_context_reconstruction(fence, scope_id, subject, max_records, position)?;
+    let planned =
+        plan_daemon_context_reconstruction(fence, scope_id, subject, max_records, position)?;
     let entries = eliot_store_api::generated_operation_manifests()
         .map_err(|error| format!("daemon reconstruction admission manifests: {error}"))?;
     let mut admission = Vec::with_capacity(planned.len());
@@ -1440,7 +1547,11 @@ pub(super) fn context_reconstruction_role_admission(
             eliot_store_api::NamedReadOperation::GetCurrentEpistemicPosition => {
                 "GetCurrentEpistemicPosition"
             }
-            _ => return Err("daemon reconstruction closure planned an out-of-closure operation".to_owned()),
+            _ => {
+                return Err(
+                    "daemon reconstruction closure planned an out-of-closure operation".to_owned(),
+                );
+            }
         };
         let admitted = request.validate_against_catalogue(&entries).is_ok();
         admission.push((name, admitted));
@@ -1793,9 +1904,8 @@ mod tests {
         let fence = StateFence::new(epoch, ResourceGeneration::genesis());
 
         // Closed planning: exact subject + explicit bound + scope + fence.
-        let request =
-            plan_daemon_evidence_read(&fence, "scope-evidence", "evidence-alpha", "10")
-                .expect("closed evidence read plans");
+        let request = plan_daemon_evidence_read(&fence, "scope-evidence", "evidence-alpha", "10")
+            .expect("closed evidence read plans");
         assert_eq!(
             request.operation,
             eliot_store_api::NamedReadOperation::GetEvidencePack
@@ -1804,8 +1914,8 @@ mod tests {
         // The planned request passes the real catalogue gate: only
         // `subject`/`max_records` cross, so generation never reports an
         // unknown parameter.
-        let entries = eliot_store_api::generated_operation_manifests()
-            .expect("catalogue generates");
+        let entries =
+            eliot_store_api::generated_operation_manifests().expect("catalogue generates");
         request
             .validate_against_catalogue(&entries)
             .expect("planned request is catalogue-closed");
@@ -1834,9 +1944,8 @@ mod tests {
                 "provenance": {"matched_total": 1},
             }),
         };
-        let projected =
-            project_daemon_evidence_response(&response, &fence, "evidence-alpha")
-                .expect("exact response projects");
+        let projected = project_daemon_evidence_response(&response, &fence, "evidence-alpha")
+            .expect("exact response projects");
         assert_eq!(projected["subject"], "evidence-alpha");
         assert_eq!(projected["evidence_pack"], response.payload);
         assert!(

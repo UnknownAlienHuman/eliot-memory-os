@@ -45,6 +45,9 @@ impl KernelRecoveryPort for DaemonKernelClient {
         &self,
         request: KernelNamedReadRequest,
     ) -> Result<Option<KernelNamedReadReply>, KernelPortError> {
+        // #740: request/result span over the recovery-read boundary. Record
+        // identity and cardinality travel; payload bytes never do.
+        let _span = tracing::info_span!("eliotd.recovery_read").entered();
         let key = RecoveryRecordKey::new(OWNER_RECOVERY_NAMESPACE, request.owner.as_str())
             .map_err(|error| KernelPortError::Contract(error.to_string()))?;
         let snapshot = self.recovery_snapshot(
@@ -82,6 +85,10 @@ impl KernelRecoveryPort for DaemonKernelClient {
         &self,
         request: &GovernorGenesisRequest,
     ) -> Result<(), KernelPortError> {
+        // #740: request/result span over the genesis rebuild boundary.
+        // Requested/in-progress/completed stays an owner result; the span
+        // only marks the daemon-side submission and its receipt outcome.
+        let _span = tracing::info_span!("eliotd.recovery_genesis").entered();
         request
             .validate(
                 &self.snapshot.state_fence(),
