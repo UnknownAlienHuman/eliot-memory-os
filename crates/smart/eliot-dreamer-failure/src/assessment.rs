@@ -284,14 +284,11 @@ fn outcome(input: &FailureInput) -> (OutcomeAssessment, Option<FailureObservatio
             eliot_receipts::ReceiptDispositionKind::Partial,
             Some(FailureObservationState::PartiallyApplied) | None,
         ) if verified_receipt.is_some() => OutcomeAssessment::PartiallyApplied,
-        (_, Some(FailureObservationState::PartiallyApplied)) => {
-            OutcomeAssessment::PartiallyApplied
-        }
-        (eliot_receipts::ReceiptDispositionKind::Failure, Some(FailureObservationState::ExecutedButSemanticallyFailed))
-            if semantic_floor =>
-        {
-            OutcomeAssessment::ExecutedButSemanticallyFailed
-        }
+        (_, Some(FailureObservationState::PartiallyApplied)) => OutcomeAssessment::PartiallyApplied,
+        (
+            eliot_receipts::ReceiptDispositionKind::Failure,
+            Some(FailureObservationState::ExecutedButSemanticallyFailed),
+        ) if semantic_floor => OutcomeAssessment::ExecutedButSemanticallyFailed,
         _ => OutcomeAssessment::UnknownOutcome,
     };
     (assessed, declared)
