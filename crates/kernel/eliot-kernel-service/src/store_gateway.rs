@@ -10,12 +10,14 @@
 //! and unknown genesis outcomes remain the EBP client's exact-operation
 //! reconciliation result.
 
+use std::collections::BTreeSet;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use eliot_contracts::{EpochId, OperationId, RequestMetadata, StateFence};
 use eliot_ipc::NamedPipeTransport;
 use eliot_kernel_core::GenerationRoute;
+use eliot_ors::RedbRecoveryStore;
 use eliot_protocol::dreamer_job::{DurableJobRequest, DurableJobResponse};
 use eliot_store_api::{
     CanonicalRequestView, CanonicalStoreClient, CanonicalValidationSnapshot, NamedReadRequest,
@@ -24,6 +26,7 @@ use eliot_store_api::{
     StoreRecoverySnapshot, WriteReceipt, verify_canonical_request_hash,
 };
 
+use crate::commit_recovery::recover_commit;
 use crate::{EbpCanonicalStoreClient, EbpStoreTransport, KernelService};
 
 const ACTIVE_DAEMON_CALLER: &str = "eliotd";
@@ -138,6 +141,16 @@ pub struct KernelStoreGateway {
     /// bind time) fails every later gate closed.
     route_epoch: Option<EpochId>,
     flight: GatewayFlight,
+    /// Durable owner for unknown-commit recovery (I14.21, issue #1690).
+    /// Production composition always supplies the Kernel ORS handle; `None`
+    /// (tests, or a composition that cannot open ORS) degrades recovery to
+    /// fail-closed errors without staging, pause, or disposition.
+    commit_ors: Option<Arc<RedbRecoveryStore>>,
+    /// In-process mirror of the ordering scopes paused by open
+    /// unknown-commit records. The durable open set in ORS is authoritative;
+    /// this index gates admission without a database round trip and is
+    /// updated alongside every stage/resolve.
+    paused_scopes: Mutex<BTreeSet<String>>,
 }
 
 impl std::fmt::Debug for KernelStoreGateway {
@@ -157,6 +170,7 @@ impl KernelStoreGateway {
         service: Arc<Mutex<KernelService>>,
         store: Arc<EbpCanonicalStoreClient<NamedPipeTransport>>,
         route: GenerationRoute,
+        commit_ors: Option<Arc<RedbRecoveryStore>>,
     ) -> Self {
         // Bind the scalar route contour to its canonical lineage at
         // composition (Implements #64): the sequence inside `route` was
@@ -170,6 +184,8 @@ impl KernelStoreGateway {
             route,
             route_epoch,
             flight: GatewayFlight::new(),
+            commit_ors,
+            paused_scopes: Mutex::new(BTreeSet::new()),
         }
     }
 
@@ -273,18 +289,53 @@ impl KernelStoreGateway {
             return Err("canonical-store gateway is fenced for rebind".to_owned());
         }
 
-        let result = self
-            .store
-            .apply_prepared(
+        let identity = transition.identity.clone();
+        let ordering_scopes: Vec<String> = transition
+            .ordering_scopes
+            .iter()
+            .map(|scope| scope.as_str().to_owned())
+            .collect();
+        // I14.21 (#1690): the single commit runs through unknown-commit
+        // recovery. The closures below borrow the admitted values and clone
+        // per attempt, so the same-identity retry resends the identical
+        // admitted transition and never a rebuilt one.
+        let send = || {
+            self.store.apply_prepared(
                 context,
-                transition,
-                expected_revision_heads,
-                expected_ordering_heads,
+                transition.clone(),
+                expected_revision_heads.clone(),
+                expected_ordering_heads.clone(),
             )
-            .await
-            .map_err(|error| error.to_string());
+        };
+        let query = || {
+            self.store.receipt_exact(
+                identity.operation_id.clone(),
+                identity.canonical_request_hash.as_str(),
+            )
+        };
+        let result = recover_commit(
+            self.commit_ors.as_deref(),
+            &self.paused_scopes,
+            &identity,
+            &ordering_scopes,
+            send,
+            query,
+        )
+        .await
+        .map_err(|error| error.to_string());
         drop(lease);
         result
+    }
+
+    /// Lists the currently paused ordering scopes with the idempotency key
+    /// pausing each: the visible Problem State surface for Doctor/Human
+    /// disposition (I14.21, issue #1690). The durable open set in ORS is
+    /// authoritative; this mirrors it for admission gating.
+    pub fn paused_ordering_scopes(&self) -> Vec<(String, String)> {
+        crate::commit_recovery::paused_ordering_scope_view(
+            &self.paused_scopes,
+            self.commit_ors.as_deref(),
+        )
     }
 
     /// Reads one bounded, opaque Store recovery snapshot through the active
@@ -395,11 +446,31 @@ impl KernelStoreGateway {
         if self.is_fenced() {
             return Err("canonical-store gateway is fenced for rebind".to_owned());
         }
-        let result = self
-            .store
-            .initialize_genesis(context, request)
-            .await
-            .map_err(|error| error.to_string());
+        let identity = eliot_store_api::OperationIdentity {
+            operation_id: request.operation_id.clone(),
+            idempotency_key: request.idempotency_key.clone(),
+            canonical_request_hash: request.canonical_request_hash.clone(),
+        };
+        // I14.21 (#1690): genesis commits run the same recovery. Genesis
+        // names no ordering scopes, so nothing pauses, but the durable
+        // unknown-commit record plus disposition-first still apply.
+        let send = || self.store.initialize_genesis(context, request.clone());
+        let query = || {
+            self.store.receipt_exact(
+                identity.operation_id.clone(),
+                identity.canonical_request_hash.as_str(),
+            )
+        };
+        let result = recover_commit(
+            self.commit_ors.as_deref(),
+            &self.paused_scopes,
+            &identity,
+            &[],
+            send,
+            query,
+        )
+        .await
+        .map_err(|error| error.to_string());
         drop(lease);
         result
     }

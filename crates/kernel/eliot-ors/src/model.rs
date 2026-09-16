@@ -2520,6 +2520,107 @@ impl StoreFailureRetentionRecord {
     }
 }
 
+/// Terminal outcome of one Kernel-owned unknown-commit recovery record.
+///
+/// The outcome names what evidence proved, never a retry policy: a resolved
+/// record is immutable terminal evidence. `RolledBack` covers every terminal
+/// non-committed receipt (rejected, cancelled) whose digest is bound as
+/// evidence; `DeadLetter` and `NewIdentityRequired` keep their distinct
+/// Store-reported meanings so no caller can mistake them for a safe
+/// same-identity retry.
+#[derive(Clone, Copy, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum UnknownCommitOutcome {
+    Committed,
+    RolledBack,
+    DeadLetter,
+    NewIdentityRequired,
+}
+
+/// Durable Kernel-owned unknown-commit recovery record (I14.21, issue #1690).
+///
+/// The Kernel stages one record per canonical write attempt keyed by the
+/// admitted operation idempotency key before the commit send, and resolves
+/// it exactly once when receipt evidence arrives. While a record is open,
+/// its ordering scopes are paused: no dependent mutation in those scopes is
+/// admitted until an evidence-backed disposition resolves it. ORS stores the
+/// record verbatim and never interprets commit, retry, or problem semantics.
+#[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct UnknownCommitRecord {
+    /// Durable write-attempt identity: the admitted idempotency key.
+    pub idempotency_key: String,
+    /// Exact admitted operation identity bound to the attempt.
+    pub operation_id: OperationIdentity,
+    /// Digest of the exact canonical request bytes admitted for the attempt.
+    pub canonical_request_hash: String,
+    /// Ordering scopes paused while this record is open. Empty only for
+    /// scopeless commits (genesis); a scoped commit always names its scopes.
+    pub ordering_scopes: Vec<String>,
+    /// `None` while the commit outcome is unknown; the terminal outcome once
+    /// receipt evidence resolved it. A resolved record never reopens.
+    pub outcome: Option<UnknownCommitOutcome>,
+    /// Digest of the resolving `WriteReceipt` bound at disposition. `None`
+    /// while open; required once resolved.
+    pub evidence_receipt_digest: Option<String>,
+}
+
+impl UnknownCommitRecord {
+    /// Returns the durable key binding one write attempt to its idempotency key.
+    #[must_use]
+    pub fn record_key(&self) -> String {
+        self.idempotency_key.clone()
+    }
+
+    /// Returns whether two records carry the exact same admitted binding.
+    ///
+    /// Outcome and evidence are excluded: they are ORS-owned reconciliation
+    /// progression, not caller binding.
+    #[must_use]
+    pub fn same_binding(&self, other: &Self) -> bool {
+        self.idempotency_key == other.idempotency_key
+            && self.operation_id == other.operation_id
+            && self.canonical_request_hash == other.canonical_request_hash
+            && self.ordering_scopes == other.ordering_scopes
+    }
+
+    /// Returns true while the commit outcome is still unknown.
+    #[must_use]
+    pub const fn is_open(&self) -> bool {
+        self.outcome.is_none()
+    }
+
+    /// Validates shape and identity binding without interpreting commit
+    /// semantics. An open record carries no evidence; a resolved record
+    /// always binds its resolving receipt digest.
+    pub fn validate(&self) -> Result<(), OrsError> {
+        validate_text(&self.idempotency_key, "unknown_commit_idempotency_key")?;
+        validate_text(self.operation_id.as_str(), "unknown_commit_operation_id")?;
+        validate_digest(
+            &self.canonical_request_hash,
+            "unknown_commit_canonical_request_hash",
+        )?;
+        for scope in &self.ordering_scopes {
+            validate_text(scope, "unknown_commit_ordering_scope")?;
+        }
+        match (&self.outcome, &self.evidence_receipt_digest) {
+            (None, None) => Ok(()),
+            (None, Some(_)) => Err(OrsError::InvalidField {
+                field: "unknown_commit_evidence_receipt_digest",
+                reason: "an open unknown-commit record carries no evidence",
+            }),
+            (Some(_), Some(digest)) => {
+                validate_digest(digest, "unknown_commit_evidence_receipt_digest")?;
+                Ok(())
+            }
+            (Some(_), None) => Err(OrsError::InvalidField {
+                field: "unknown_commit_evidence_receipt_digest",
+                reason: "a resolved unknown-commit record binds its receipt evidence",
+            }),
+        }
+    }
+}
+
 /// Closed P-04 host-request kinds preserved by ORS without interpretation.
 ///
 /// The kind is an opaque routing label. ORS never interprets task, scope,

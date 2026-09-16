@@ -446,7 +446,11 @@ impl<T: EbpStoreTransport + 'static> EbpCanonicalStoreClient<T> {
     /// identity conflict, reported after the exact query ran. A receipt whose
     /// canonical request hash diverges from the admitted digest (RECHECK-63)
     /// is a digest mismatch, never an adopted identity.
-    pub(super) async fn receipt_exact(
+    ///
+    /// Crate-visible (I14.21, issue #1690): the Store gateway's
+    /// disposition-first path queries the same exact receipt before any
+    /// same-identity resubmission.
+    pub(crate) async fn receipt_exact(
         &self,
         operation_id: OperationId,
         expected_canonical_request_hash: &str,
