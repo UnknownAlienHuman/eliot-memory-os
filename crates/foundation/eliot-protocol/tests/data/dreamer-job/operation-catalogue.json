@@ -1,0 +1,18 @@
+{
+  "contract": "eliot.foundation.protocol.durable-job",
+  "count": 12,
+  "operations": [
+    { "wire": "SUBMIT_JOB", "roles": ["REQUESTER"] },
+    { "wire": "LEASE_NEXT", "roles": ["WORKER"] },
+    { "wire": "LEASE_EXACT", "roles": ["WORKER"] },
+    { "wire": "RENEW_LEASE", "roles": ["WORKER"] },
+    { "wire": "START_JOB", "roles": ["WORKER"] },
+    { "wire": "CHECKPOINT_JOB", "roles": ["WORKER"] },
+    { "wire": "RESUME_JOB", "roles": ["WORKER"] },
+    { "wire": "BEGIN_VERIFICATION", "roles": ["WORKER"] },
+    { "wire": "PUBLISH_OUTCOME", "roles": ["WORKER"] },
+    { "wire": "STATUS", "roles": ["REQUESTER", "WORKER", "CONTROLLER"] },
+    { "wire": "REQUEST_CANCEL", "roles": ["REQUESTER", "CONTROLLER"] },
+    { "wire": "RECONCILE_MUTATION", "roles": ["REQUESTER", "WORKER", "CONTROLLER"] }
+  ]
+}

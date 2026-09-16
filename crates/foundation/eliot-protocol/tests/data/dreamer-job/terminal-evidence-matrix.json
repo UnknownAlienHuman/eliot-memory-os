@@ -1,0 +1,30 @@
+{
+  "contract": "eliot.foundation.protocol.durable-job",
+  "terminal": {
+    "COMPLETED": {
+      "requires_evidence": true,
+      "requires_result_or_abstention": true,
+      "requires_unresolved": false
+    },
+    "PARTIAL": {
+      "requires_evidence": true,
+      "requires_result_or_abstention": false,
+      "requires_unresolved": true
+    },
+    "FAILED": {
+      "requires_evidence": true,
+      "requires_result_or_abstention": false,
+      "requires_unresolved": false
+    },
+    "CANCELLED": {
+      "requires_evidence": true,
+      "requires_result_or_abstention": false,
+      "requires_unresolved": false
+    },
+    "UNKNOWN_OUTCOME": {
+      "requires_evidence": true,
+      "requires_result_or_abstention": false,
+      "requires_unresolved": false
+    }
+  }
+}
