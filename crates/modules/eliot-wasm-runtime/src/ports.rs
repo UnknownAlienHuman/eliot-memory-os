@@ -106,7 +106,10 @@ pub trait TypedComponentPort: ComponentEnginePort {
     fn invoke_typed(
         &mut self,
         invocation: &EngineInvocation,
-    ) -> Result<EngineReport, TypedContractError> {
+    ) -> Result<EngineReport, TypedContractError>
+    where
+        Self: Sized,
+    {
         let kit = self.kit().clone();
         invoke_typed(self, &kit, invocation)
     }
