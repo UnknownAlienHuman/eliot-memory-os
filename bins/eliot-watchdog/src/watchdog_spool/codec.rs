@@ -59,6 +59,29 @@ pub enum WatchdogSpoolPayload {
         corrupt_sequence: Option<u64>,
         corrupt_digest: String,
     },
+    /// Watchdog-owned problem intent for Governor-unavailable reconciliation
+    /// (I8.1, case-(b) spool-local kind: exports under the existing `Recovery`
+    /// class, never as a new shared kind). Evidence refs are 64-hex digests;
+    /// lineage mirrors the export cursor identities; the reason proves
+    /// Governor unavailability (never `SpoolPressure`).
+    ProblemIntent {
+        service: String,
+        evidence_refs: Vec<String>,
+        lineage_installation_id: String,
+        lineage_generation: u64,
+        lineage_epoch: u64,
+        governor_unavailable_reason: GapRecoveryReason,
+    },
+    /// Watchdog-owned incident intent, same spool-local shape and export class
+    /// as [`WatchdogSpoolPayload::ProblemIntent`].
+    IncidentIntent {
+        service: String,
+        evidence_refs: Vec<String>,
+        lineage_installation_id: String,
+        lineage_generation: u64,
+        lineage_epoch: u64,
+        governor_unavailable_reason: GapRecoveryReason,
+    },
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
@@ -87,6 +110,7 @@ pub(crate) fn encode_entry(entry: &WatchdogSpoolEntry) -> Result<Vec<u8>, SpoolE
             "watchdog spool record exceeds the bounded frame size".to_owned(),
         ));
     }
+    super::intent::check_stored_intent_payload(entry.observed_at_ms, &entry.payload)?;
     Ok(bytes)
 }
 
@@ -133,6 +157,7 @@ fn decode_entry(sequence: u64, bytes: &[u8]) -> Result<WatchdogSpoolEntry, Spool
             "record {sequence} has an invalid schema or sequence"
         )));
     }
+    super::intent::check_stored_intent_payload(entry.observed_at_ms, &entry.payload)?;
     Ok(entry)
 }
 

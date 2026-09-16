@@ -22,6 +22,10 @@ use crate::{SERVICE_NAME, SpoolError, WatchdogRuntimeBinding, current_unix_ms};
 
 mod codec;
 pub mod export_driver;
+/// Spool-local intent records (I8.1 `problem_intent` / `incident_intent`).
+/// Case-(b): the shared export kinds are not extended; intents persist as
+/// codec variants and export under the existing `Recovery` class below.
+pub(crate) mod intent;
 
 pub use codec::{WatchdogSpoolEntry, WatchdogSpoolPayload};
 pub(crate) use codec::{WatchdogSpoolHeader, encode_entry, encode_high_water, validate_header};
@@ -1114,11 +1118,19 @@ fn store_export_cursor_bytes(write: &WriteTransaction, bytes: &[u8]) -> Result<(
 }
 
 /// Maps one spool codec payload to its owner-neutral export class.
+///
+/// Spool-local intents (`ProblemIntent`, `IncidentIntent`) export under the
+/// existing `Recovery` (gap-like) class: the shared `WatchdogSpoolPayloadKind`
+/// is intentionally not extended (out-of-lane exhaustive matches would break;
+/// Governor-side kind admission is the MGR02 handoff), so ordering, the
+/// compaction gap boundary, and the terminal disposition table are unchanged.
 fn export_payload_kind(payload: &WatchdogSpoolPayload) -> WatchdogSpoolPayloadKind {
     match payload {
         WatchdogSpoolPayload::Heartbeat { .. } => WatchdogSpoolPayloadKind::Heartbeat,
         WatchdogSpoolPayload::Gap { .. } => WatchdogSpoolPayloadKind::Gap,
-        WatchdogSpoolPayload::Recovery { .. } => WatchdogSpoolPayloadKind::Recovery,
+        WatchdogSpoolPayload::Recovery { .. }
+        | WatchdogSpoolPayload::ProblemIntent { .. }
+        | WatchdogSpoolPayload::IncidentIntent { .. } => WatchdogSpoolPayloadKind::Recovery,
     }
 }
 
