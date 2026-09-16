@@ -908,20 +908,20 @@ pub(super) fn plan_daemon_evidence_read(
     max_records: &str,
 ) -> Result<eliot_store_api::NamedReadRequest, String> {
     if subject.trim().is_empty() || subject.chars().any(char::is_control) {
-        return Err(
-            "daemon evidence read subject must be non-blank with no control characters".to_owned(),
-        );
+        return Err("daemon evidence read subject must be non-blank with no control characters"
+            .to_owned());
     }
     if max_records.trim().is_empty() || max_records.chars().any(char::is_control) {
-        return Err(
-            "daemon evidence read max_records must be a non-blank decimal bound".to_owned(),
-        );
+        return Err("daemon evidence read max_records must be a non-blank decimal bound".to_owned());
     }
-    let bound: u32 = max_records.trim().parse().map_err(|_| {
-        "daemon evidence read max_records must be a positive decimal bound".to_owned()
-    })?;
+    let bound: u32 = max_records
+        .trim()
+        .parse()
+        .map_err(|_| "daemon evidence read max_records must be a positive decimal bound".to_owned())?;
     if bound == 0 {
-        return Err("daemon evidence read max_records must be a positive decimal bound".to_owned());
+        return Err(
+            "daemon evidence read max_records must be a positive decimal bound".to_owned(),
+        );
     }
     let scope = eliot_store_api::ScopeId::new(scope_id)
         .map_err(|error| format!("daemon evidence read scope: {error}"))?;
@@ -978,24 +978,13 @@ pub(super) fn project_daemon_evidence_response(
         .and_then(serde_json::Value::as_str)
         .ok_or_else(|| "daemon evidence payload misses its subject".to_owned())?;
     if subject != expected_subject {
-        return Err(
-            "daemon evidence payload subject does not match the requested subject".to_owned(),
-        );
+        return Err("daemon evidence payload subject does not match the requested subject"
+            .to_owned());
     }
-    if response
-        .payload
-        .get("records")
-        .and_then(serde_json::Value::as_array)
-        .is_none()
-    {
+    if response.payload.get("records").and_then(serde_json::Value::as_array).is_none() {
         return Err("daemon evidence payload misses its records array".to_owned());
     }
-    if response
-        .payload
-        .get("provenance")
-        .and_then(serde_json::Value::as_object)
-        .is_none()
-    {
+    if response.payload.get("provenance").and_then(serde_json::Value::as_object).is_none() {
         return Err("daemon evidence payload misses its provenance".to_owned());
     }
     Ok(serde_json::json!({
@@ -1028,9 +1017,8 @@ pub(super) fn plan_daemon_position_read(
     position: &str,
 ) -> Result<eliot_store_api::NamedReadRequest, String> {
     if position.trim().is_empty() || position.chars().any(char::is_control) {
-        return Err(
-            "daemon position read position must be non-blank with no control characters".to_owned(),
-        );
+        return Err("daemon position read position must be non-blank with no control characters"
+            .to_owned());
     }
     let scope = eliot_store_api::ScopeId::new(scope_id)
         .map_err(|error| format!("daemon position read scope: {error}"))?;
@@ -1071,9 +1059,7 @@ pub(super) fn project_daemon_position_response(
     expected_position: &str,
 ) -> Result<serde_json::Value, String> {
     if response.operation != eliot_store_api::NamedReadOperation::GetCurrentEpistemicPosition {
-        return Err(
-            "daemon position response operation must be GetCurrentEpistemicPosition".to_owned(),
-        );
+        return Err("daemon position response operation must be GetCurrentEpistemicPosition".to_owned());
     }
     if response.state_fence != *admitted_fence {
         return Err("daemon position response fence does not match the admitted fence".to_owned());
@@ -1434,8 +1420,7 @@ pub(super) fn context_reconstruction_role_admission(
     max_records: &str,
     position: &str,
 ) -> Result<Vec<(&'static str, bool)>, String> {
-    let planned =
-        plan_daemon_context_reconstruction(fence, scope_id, subject, max_records, position)?;
+    let planned = plan_daemon_context_reconstruction(fence, scope_id, subject, max_records, position)?;
     let entries = eliot_store_api::generated_operation_manifests()
         .map_err(|error| format!("daemon reconstruction admission manifests: {error}"))?;
     let mut admission = Vec::with_capacity(planned.len());
@@ -1455,11 +1440,7 @@ pub(super) fn context_reconstruction_role_admission(
             eliot_store_api::NamedReadOperation::GetCurrentEpistemicPosition => {
                 "GetCurrentEpistemicPosition"
             }
-            _ => {
-                return Err(
-                    "daemon reconstruction closure planned an out-of-closure operation".to_owned(),
-                );
-            }
+            _ => return Err("daemon reconstruction closure planned an out-of-closure operation".to_owned()),
         };
         let admitted = request.validate_against_catalogue(&entries).is_ok();
         admission.push((name, admitted));
@@ -1812,8 +1793,9 @@ mod tests {
         let fence = StateFence::new(epoch, ResourceGeneration::genesis());
 
         // Closed planning: exact subject + explicit bound + scope + fence.
-        let request = plan_daemon_evidence_read(&fence, "scope-evidence", "evidence-alpha", "10")
-            .expect("closed evidence read plans");
+        let request =
+            plan_daemon_evidence_read(&fence, "scope-evidence", "evidence-alpha", "10")
+                .expect("closed evidence read plans");
         assert_eq!(
             request.operation,
             eliot_store_api::NamedReadOperation::GetEvidencePack
@@ -1822,8 +1804,8 @@ mod tests {
         // The planned request passes the real catalogue gate: only
         // `subject`/`max_records` cross, so generation never reports an
         // unknown parameter.
-        let entries =
-            eliot_store_api::generated_operation_manifests().expect("catalogue generates");
+        let entries = eliot_store_api::generated_operation_manifests()
+            .expect("catalogue generates");
         request
             .validate_against_catalogue(&entries)
             .expect("planned request is catalogue-closed");
@@ -1852,8 +1834,9 @@ mod tests {
                 "provenance": {"matched_total": 1},
             }),
         };
-        let projected = project_daemon_evidence_response(&response, &fence, "evidence-alpha")
-            .expect("exact response projects");
+        let projected =
+            project_daemon_evidence_response(&response, &fence, "evidence-alpha")
+                .expect("exact response projects");
         assert_eq!(projected["subject"], "evidence-alpha");
         assert_eq!(projected["evidence_pack"], response.payload);
         assert!(

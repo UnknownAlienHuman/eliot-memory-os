@@ -562,13 +562,8 @@ impl DaemonComposition {
     /// divergence.
     pub fn task_lifecycle(
         &self,
-    ) -> Result<
-        task_lifecycle_adapters::ForwardingTaskLifecycle<
-            '_,
-            dyn eliot_governor::KernelGenerationPort,
-        >,
-        DaemonError,
-    > {
+    ) -> Result<task_lifecycle_adapters::ForwardingTaskLifecycle<'_, dyn eliot_governor::KernelGenerationPort>, DaemonError>
+    {
         if self.readiness() != eliot_governor::CompositionReadiness::Ready {
             return Err(DaemonError::Composition(
                 eliot_governor::CompositionError::NotReady,
@@ -689,11 +684,7 @@ impl DaemonComposition {
         reads: &'a KernelContextReadClient,
         now: u64,
     ) -> Result<
-        eliot_governor::GovernorEpistemicComposition<
-            'a,
-            DaemonKernelClient,
-            KernelContextReadClient,
-        >,
+        eliot_governor::GovernorEpistemicComposition<'a, DaemonKernelClient, KernelContextReadClient>,
         DaemonError,
     > {
         if self.readiness() != eliot_governor::CompositionReadiness::Ready {
@@ -702,13 +693,15 @@ impl DaemonComposition {
             ));
         }
         let activation = self.governor.read_unique_agent_activation(now)?;
-        Ok(eliot_governor::GovernorEpistemicComposition::borrow(
-            &self.governor.owners().canonical,
-            activation,
-            kernel.as_ref(),
-            reads,
-            self.readiness(),
-        ))
+        Ok(
+            eliot_governor::GovernorEpistemicComposition::borrow(
+                &self.governor.owners().canonical,
+                activation,
+                kernel.as_ref(),
+                reads,
+                self.readiness(),
+            ),
+        )
     }
 
     /// Borrows the Governor Dreamer orientation intake adapter over the retained owners plus
@@ -805,7 +798,8 @@ impl DaemonComposition {
         }
         let config = daemon_coordinator_config()
             .map_err(|error| DaemonError::Lifecycle(error.to_string()))?;
-        plan_candidate(&config, request).map_err(|error| DaemonError::Lifecycle(error.to_string()))
+        plan_candidate(&config, request)
+            .map_err(|error| DaemonError::Lifecycle(error.to_string()))
     }
 
     /// Borrows the Governor reconstruction read composition over the retained
