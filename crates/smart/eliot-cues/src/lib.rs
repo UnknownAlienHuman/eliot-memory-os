@@ -10,6 +10,130 @@
 //! references to canonical records and immutable graph edges supplied by their
 //! owners.  A published snapshot is the sole input to matching and bounded
 //! activation; invalidation is a revision fence, never a second truth store.
+//!
+//! ## Issue #1143 ledger — `SPLIT_AND_RETAIN_AS_TEMPORARY_FACADE`
+//!
+//! Authority: issue #1143 (owns only `eliot-cues` + `eliot-dreamer-core`;
+//! `eliot-epistemic` is `RETAIN_AND_HARDEN_IN_PLACE` and out of scope) and
+//! `crates/smart/cognitive-donor-map.toml` (`SPLIT_AND_RETAIN_AS_TEMPORARY_FACADE`
+//! with targets `eliot-cue-contracts`, `eliot-cue-normalizer`, `eliot-cue-binding`,
+//! `eliot-cue-index`, `eliot-cue-activation`). GAP (#40): snapshot construction
+//! has no admitted cell yet — [`CueSnapshot`]/[`CueRuntime`] stay here until one
+//! is proposed; no target name is invented here.
+//!
+//! LEDGER + EDGE MIGRATION ONLY this turn: no root turn (root `Cargo.toml`
+//! members, `Cargo.lock`, generated indexes are a serialized residual owned by
+//! the LEGACY-DELETE-last root turn), no deletions (`LEGACY-DELETE-last`).
+//! Zero live Cargo reverse-deps and zero `use eliot_cues::` outside self were
+//! re-verified; both are necessary but not sufficient — this ledger is the
+//! sufficiency record (47 pub items below, one row each).
+//!
+//! Dispositions — exactly one per row:
+//! - `MIGRATED-1143`: edge migrated this turn; differential fixture cited;
+//!   facade item retained byte-identical until LEGACY-DELETE.
+//! - `FIXTURE`: bounded compatibility fixture with expiry/removal condition.
+//! - `DELETE-PROPOSED`: removal deferred to the LEGACY-DELETE-last root turn
+//!   once the stated precondition closes. Never executed here.
+//!
+//! Current #94 owner cells: `eliot-cue-contracts` (vocabulary + identity,
+//! functional cell `smart.cue.contracts`), `eliot-cue-normalizer` (A-11 shared
+//! normalization, `smart.cue.normalizer`), `eliot-cue-binding` (A-12,
+//! `smart.cue.binding`), `eliot-cue-index` (A-13, `smart.cue.index`),
+//! `eliot-cue-activation` (A-14a, `smart.cue.activation`).
+//!
+//! | # | Facade item | Current #94 owner | Bounded fixture + expiry | Disposition |
+//! |---|-------------|-------------------|--------------------------|-------------|
+//! | 1 | `CONTRACT_NAME` | contracts hub identity | replay/diagnostic string; expires at LEGACY-DELETE | FIXTURE |
+//! | 2 | `CONTRACT_VERSION` | contracts `CONTRACT_REVISION` ("2.0.0") | replay string; expires at LEGACY-DELETE | FIXTURE |
+//! | 3 | `MAX_FIRED` | activation `ActivationBounds` | firing-cap differential; expires at LEGACY-DELETE | DELETE-PROPOSED once activation bounds own the cap |
+//! | 4 | `MAX_SPREAD_DEPTH` | activation `ActivationProfile` | spread-depth differential (see D-CUE-3); expires at LEGACY-DELETE | DELETE-PROPOSED once profile owns depth |
+//! | 5 | `MAX_FANOUT` | activation profile + contracts `MAX_RELATION_EDGES` | fanout differential; expires at LEGACY-DELETE | DELETE-PROPOSED once profile owns fanout |
+//! | 6 | `ACTIVATION_THRESHOLD` | activation caller-supplied profile | threshold differential (see D-CUE-3); expires at LEGACY-DELETE | DELETE-PROPOSED; never promoted to a profile default |
+//! | 7 | `CueKind` | contracts `normalization::CueKind` (vocabulary owner) | spelling projection; retained until CUEKIND-OWNER (#835/#706) alias sequencing lands | DELETE-PROPOSED after #835 + anchor repoint |
+//! | 8 | `MatchMode` | contracts `normalization::MatchMode` | mode projection; expires at LEGACY-DELETE | DELETE-PROPOSED after anchor repoint |
+//! | 9 | `CueStrength` | contracts `activation::ActivationStrength` + activation evaluation | strength projection; expires at LEGACY-DELETE | DELETE-PROPOSED after activation owns strength |
+//! | 10 | `CueKind::allows` | contracts `normalization::mode_admissible` | admissibility differential; expires at LEGACY-DELETE | DELETE-PROPOSED after anchor repoint |
+//! | 11 | `CueError` | contracts `CueContractError` (+ normalizer/activation errors) | error-mapping fixture; expires at LEGACY-DELETE | DELETE-PROPOSED after consumers use owner errors |
+//! | 12 | `ObservedCue` | contracts `observation::ObservedCue` | observation-shape fixture; expires at LEGACY-DELETE | DELETE-PROPOSED after adapters use owner shape |
+//! | 13 | `ObservedCue::normalize` | normalizer `normalize_cue`/`capture_cue`/`fire_cue` (A-11) | single-seam differential (see D-CUE-1); expires when adapters call A-11 | DELETE-PROPOSED after A-11 edge admitted |
+//! | 14 | `ObservedCue::source_value` | contracts `CueSourceValue` (+ normalizer `source_value`) | lossless-spelling differential; expires at LEGACY-DELETE | DELETE-PROPOSED after adapters use owner shape |
+//! | 15 | `CueKey` | contracts `CueComparisonKey` (+ `NormalizedCue`) | EDGE-CUE-1143 projection; retained byte-identical until LEGACY-DELETE | MIGRATED-1143 (`ledger_1143_*` in `tests/integrity.rs`) |
+//! | 16 | `CueKey::new` | normalizer under legacy-fold policy (v1 replay) | v1-replay differential (see D-CUE-1); expires at v1-replay retirement | DELETE-PROPOSED after re-observation path owns intake |
+//! | 17 | `CueKey::with_case_policy` | normalizer `CasePolicy` explicit branch | explicit-policy differential; expires at LEGACY-DELETE | FIXTURE until A-11 edge admitted |
+//! | 18 | `CueKey::with_mode` | contracts `mode_admissible` | mode-gate differential; expires at LEGACY-DELETE | DELETE-PROPOSED after anchor repoint |
+//! | 19 | `CueKey::comparison_key` | contracts `CueComparisonKey` | EDGE-CUE-1143 projection; retained byte-identical until LEGACY-DELETE | MIGRATED-1143 (`ledger_1143_*` in `tests/integrity.rs`) |
+//! | 20 | `CueKey::mode` field | contracts `CueComparisonKey::mode` | covered by row 19 | MIGRATED-1143 (field of row 15) |
+//! | 21 | `InvalidationCause` | contracts `invalidation::{InvalidationCause, SnapshotInvalidation}` | cause-mapping fixture; expires at LEGACY-DELETE | DELETE-PROPOSED after index owns invalidation |
+//! | 22 | `CueRecord` | index `SnapshotMember` + binding `CueBindingCandidate` via `ClosedSnapshotRow` | row-shape fixture; expires at LEGACY-DELETE | DELETE-PROPOSED after index owns rows |
+//! | 23 | `CueRecord::new` | index admission (legacy `cue:` id retained for replay) | replay-construction fixture (see D-CUE-2); expires at v1-replay retirement | FIXTURE until v1 replay retires |
+//! | 24 | `CueRecord::row_id_v2` | contracts `cue_row_id` (frozen v2 identity) | EDGE-CUE-1143 identity differential; retained byte-identical until LEGACY-DELETE | MIGRATED-1143 (`ledger_1143_*` in `tests/integrity.rs`) |
+//! | 25 | `CueRecord::migrate_v1` | contracts `ConversionDisposition::V1ReplayPreserved` | replay-bridge fixture; expires at v1-replay retirement | FIXTURE until v1 replay retires |
+//! | 26 | `CueRecord::transition` | `eliot-evidence::LifecycleState` + index lifecycle rules | lifecycle-mapping fixture; expires at LEGACY-DELETE | DELETE-PROPOSED after index owns transitions |
+//! | 27 | `CueRecord::invalidate` | contracts `SnapshotInvalidation` mapping | invalidation-mapping fixture; expires at LEGACY-DELETE | DELETE-PROPOSED after index owns invalidation |
+//! | 28 | `Freshness` | contracts freshness labels (activation/index) | freshness-mapping fixture; expires at LEGACY-DELETE | DELETE-PROPOSED after activation/index own freshness |
+//! | 29 | `Freshness::is_usable` | activation freshness check | usability differential; expires at LEGACY-DELETE | DELETE-PROPOSED after activation owns check |
+//! | 30 | `Freshness::matches_revision` | index revision check | revision differential; expires at LEGACY-DELETE | DELETE-PROPOSED after index owns check |
+//! | 31 | `ActivationEdge` | contracts `RelationEdge` + `SnapshotEdgeWeight` join | edge-shape fixture; expires at LEGACY-DELETE | DELETE-PROPOSED after snapshot closure owns edges |
+//! | 32 | `V1RowMigration` | contracts `ConversionDisposition` | replay-bridge fixture; expires at v1-replay retirement | FIXTURE until v1 replay retires |
+//! | 33 | `V1SnapshotMigration` | contracts `ConversionDisposition` + receipts `ProofCeiling::CandidateArtifact` | replay-bridge fixture (candidate ceiling, never admission); expires at v1-replay retirement | FIXTURE until v1 replay retires |
+//! | 34 | `FiredCue` | contracts `activation::DirectActivation` | firing-shape fixture; expires at LEGACY-DELETE | DELETE-PROPOSED after activation owns result shape |
+//! | 35 | `ActivationHit` | contracts `DerivedActivation`/`DirectActivation` | hit-shape fixture; expires at LEGACY-DELETE | DELETE-PROPOSED after activation owns result shape |
+//! | 36 | `ActivationTrace` | contracts `activation::ActivationTrace` | trace-shape fixture; expires at LEGACY-DELETE | DELETE-PROPOSED after activation owns result shape |
+//! | 37 | `FiringResult` | contracts `activation::ActivationResult` | result-shape fixture; expires at LEGACY-DELETE | DELETE-PROPOSED after activation owns result shape |
+//! | 38 | `CueSnapshot` | NO admitted cell (#40 GAP: snapshot construction) | retained facade; expires when a snapshot cell is proposed + consumers migrate | FIXTURE (GAP-blocked; delete forbidden until cell exists) |
+//! | 39 | `CueSnapshot::validate` | contracts snapshot validation + fence check | fence/ceiling differential; expires with row 38 | FIXTURE (GAP-blocked) |
+//! | 40 | `CueSnapshot::validate_closed` | contracts `validate_closed_rows`/`validate_closed_weights` + `CueProjectionDenominator` | closed-validation differential (`closed_validation_*` tests); expires with row 38 | FIXTURE (GAP-blocked) |
+//! | 41 | `CueSnapshot::migrate_v1_snapshot` | contracts `ConversionDisposition` batch | replay-bridge fixture (candidate ceiling); expires at v1-replay retirement | FIXTURE until v1 replay retires |
+//! | 42 | `CueSnapshot::invalidate` | contracts `SnapshotInvalidation` | revision-fence differential; expires with row 38 | FIXTURE (GAP-blocked) |
+//! | 43 | `CueRuntime` | NO admitted cell (#40 GAP) | retained evaluator; expires when a snapshot cell is proposed | FIXTURE (GAP-blocked; delete forbidden until cell exists) |
+//! | 44 | `CueRuntime::new` | NO admitted cell (#40 GAP) | construction-gate fixture; expires with row 43 | FIXTURE (GAP-blocked) |
+//! | 45 | `CueRuntime::snapshot` | NO admitted cell (#40 GAP) | accessor fixture; expires with row 43 | FIXTURE (GAP-blocked) |
+//! | 46 | `CueRuntime::invalidated` | NO admitted cell (#40 GAP) | invalidation fixture; expires with row 43 | FIXTURE (GAP-blocked) |
+//! | 47 | `CueRuntime::fire` | activation `evaluate_activation` (A-14a) | firing differential (see D-CUE-3/D-CUE-4); retained until snapshot cell + consumers migrate | DELETE-PROPOSED after snapshot cell exists and activation owns firing |
+//!
+//! ## EDGE-CUE-1143 (migrated this turn, candidate ceiling)
+//!
+//! Facade [`CueKey::comparison_key`] + [`CueRecord::row_id_v2`] project onto the
+//! owner-neutral vocabulary (`eliot-cue-contracts::{CueComparisonKey, cue_row_id}`,
+//! functional capability `smart.cue.contracts` per
+//! `crates/smart/cognitive-crate-decisions.toml`). Differential fixtures
+//! `ledger_1143_*` in `tests/integrity.rs` prove: (a) every facade kind/mode
+//! projects to the owner spelling and validates under the owner
+//! (`CueComparisonKey::validate`); (b) the facade v2 view equals the frozen
+//! owner function byte-identically; (c) the owner path validates with aggregate
+//! fallback unavailable (no `eliot_cues::` item constructed or called); (d) the
+//! case-policy divergence stays explicit (D-CUE-1). #13 capability resolution
+//! for this edge maps to `smart.cue.contracts` (representation) with proof in
+//! the owner cell plus the facade differential here; full runtime/Product proof
+//! stays with #1100/#11. Proof ceiling: `COGNITIVE_AGGREGATE_RETIREMENT_CANDIDATE`.
+//!
+//! ## Corrected divergences (explicit; never restored for output-match)
+//!
+//! - D-CUE-1: path values are unconditionally lowercased here (donor-map
+//!   rejected overgeneralization). Retained byte-identical for v1 replay; the
+//!   cell decides case per explicit policy (`with_case_policy`).
+//! - D-CUE-2: v1 `cue:` (blake3 over scope+value+target) vs frozen v2 `cuev2:`
+//!   (canonical-JSON/sha256 over scope+kind+mode+value+target+revision).
+//!   Namespaces never collide; re-observation via the normalizer is the only v2
+//!   path — v1 bytes retain no spelling to recover.
+//! - D-CUE-3: facade firing numerals (`MAX_FIRED`/`MAX_SPREAD_DEPTH`/`MAX_FANOUT`/
+//!   `ACTIVATION_THRESHOLD`) are retained constants, never promoted to
+//!   activation-profile defaults (the profile is caller-supplied, unbenchmarked,
+//!   never default-enabled).
+//! - D-CUE-4: facade `CueStrength`/`Freshness` are local metadata only; admission
+//!   strength and epistemic status (`Observed`/`Supported`/`Verified`) belong to
+//!   the activation/index cells, never to this facade.
+//!
+//! ## Sequencing (read-only; not duplicated here)
+//!
+//! SHIM-SWEEP-SMART / CUEKIND-OWNER touch adjacent state: #833 (facade
+//! conversion — landed as the header above), #835 (transitional `eliot-types`
+//! `CueKind` alias removal) + #706 (migration denominator freeze) own alias
+//! deletion sequencing, #246 owns canonical spelling/keys/identity, #598 owns
+//! the A-11 normalizer, #804 owns the A-10 vocabulary. This turn is
+//! ledger-first and pre-deletes nothing. Residual for the LEGACY-DELETE-last
+//! root turn: root `Cargo.toml` member line, `Cargo.lock` own-entry, generated
+//! doc indexes, `module.toml` donor anchors, shipped serde boundaries.
 
 #![forbid(unsafe_code)]
 

@@ -290,3 +290,177 @@ fn closed_validation_catches_duplicates_bad_endpoint_weight_and_denominator() ->
     assert!(!denominator(1, 0, 1, 0).is_empty_complete());
     Ok(())
 }
+
+// Issue #1143, EDGE-CUE-1143: facade comparison-key projection migrates to the
+// owner-neutral vocabulary (`eliot-cue-contracts`, `smart.cue.contracts`).
+// Every facade kind projects to the owner spelling and validates under the
+// owner; the facade itself is untouched (candidate ceiling, no deletion).
+#[test]
+fn ledger_1143_comparison_key_projects_to_owner_vocabulary() -> TestResult {
+    let cases: [(CueKind, &str, MatchMode); 10] = [
+        (CueKind::FilePath, "src/lib.rs", MatchMode::Exact),
+        (CueKind::DirPath, "src/sub", MatchMode::Prefix),
+        (CueKind::Symbol, "foo::bar", MatchMode::Exact),
+        (
+            CueKind::ErrorSignature,
+            "sig:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+            MatchMode::Signature,
+        ),
+        (CueKind::CommandPattern, "cargo test", MatchMode::Exact),
+        (CueKind::Dependency, "serde 1.0", MatchMode::Exact),
+        (CueKind::ApiSurface, "CueKey::new", MatchMode::Exact),
+        (CueKind::TaskClass, "bug fix", MatchMode::Exact),
+        (CueKind::Subsystem, "dreamer", MatchMode::Exact),
+        (CueKind::Concept, "usable cue", MatchMode::Exact),
+    ];
+    assert_eq!(cases.len(), 10);
+    for (kind, value, mode) in cases {
+        let key = CueKey::new("ledger1143", kind, value)?;
+        assert_eq!(key.mode, mode);
+        let projected = key.comparison_key();
+        assert_eq!(projected.scope, "ledger1143");
+        assert_eq!(projected.normalized_value, key.value);
+        let owner_kind = match kind {
+            CueKind::FilePath => eliot_cue_contracts::CueKind::FilePath,
+            CueKind::DirPath => eliot_cue_contracts::CueKind::DirPath,
+            CueKind::Symbol => eliot_cue_contracts::CueKind::Symbol,
+            CueKind::ErrorSignature => eliot_cue_contracts::CueKind::ErrorSignature,
+            CueKind::CommandPattern => eliot_cue_contracts::CueKind::CommandPattern,
+            CueKind::Dependency => eliot_cue_contracts::CueKind::Dependency,
+            CueKind::ApiSurface => eliot_cue_contracts::CueKind::ApiSurface,
+            CueKind::TaskClass => eliot_cue_contracts::CueKind::TaskClass,
+            CueKind::Subsystem => eliot_cue_contracts::CueKind::Subsystem,
+            CueKind::Concept => eliot_cue_contracts::CueKind::Concept,
+        };
+        let owner_mode = match mode {
+            MatchMode::Exact => eliot_cue_contracts::MatchMode::Exact,
+            MatchMode::Prefix => eliot_cue_contracts::MatchMode::Prefix,
+            MatchMode::Signature => eliot_cue_contracts::MatchMode::Signature,
+        };
+        assert_eq!(projected.kind, owner_kind);
+        assert_eq!(projected.mode, owner_mode);
+        projected.validate()?;
+    }
+    Ok(())
+}
+
+// Issue #1143, EDGE-CUE-1143: the facade v2 row view equals the frozen owner
+// function (`eliot-cue-contracts::cue_row_id`) byte-identically across kinds,
+// modes, and targets; distinct semantics never share an identity.
+#[test]
+fn ledger_1143_row_id_v2_equals_frozen_owner_function() -> TestResult {
+    let signature = "sig:abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789";
+    let cases: [(CueKind, &str, &str); 3] = [
+        (CueKind::Concept, "usable cue", "artifact:ledger-a"),
+        (CueKind::FilePath, "Src/Lib.rs", "artifact:ledger-b"),
+        (CueKind::ErrorSignature, signature, "artifact:ledger-c"),
+    ];
+    let mut identities = BTreeSet::new();
+    for (kind, value, target) in cases {
+        let key = CueKey::new("ledger1143", kind, value)?;
+        let record = CueRecord::new(
+            key.clone(),
+            ArtifactId::new(target)?,
+            "ledger-1143".to_owned(),
+            CueStrength::Secondary,
+            Freshness::Unbounded,
+            1,
+        )?;
+        let handle = eliot_cue_contracts::TargetHandle::new(target)?;
+        let expected = cue_row_id(
+            "ledger1143",
+            key.comparison_key().kind,
+            key.comparison_key().mode,
+            &key.value,
+            &handle,
+        )?;
+        assert_eq!(record.row_id_v2()?, expected);
+        assert!(expected.starts_with("cuev2:"));
+        assert!(identities.insert(expected));
+    }
+    assert_eq!(identities.len(), 3);
+    Ok(())
+}
+
+// Issue #1143, EDGE-CUE-1143 fallback-disabled run: the owner path validates
+// with no aggregate fallback available. No `eliot_cues::` item is constructed
+// or called anywhere in this test; every value is built and validated through
+// `eliot-cue-contracts` (+ `eliot-contracts` identities) alone.
+#[test]
+fn ledger_1143_owner_path_validates_without_facade_fallback() -> TestResult {
+    assert!(eliot_cue_contracts::is_supported_schema_revision("2.0.0"));
+    assert!(!eliot_cue_contracts::is_supported_schema_revision("1.0.0"));
+    let target = eliot_cue_contracts::TargetHandle::new("artifact:ledger-1143")?;
+    let key = eliot_cue_contracts::CueComparisonKey::new(
+        "ledger1143".to_owned(),
+        eliot_cue_contracts::CueKind::Concept,
+        eliot_cue_contracts::MatchMode::Exact,
+        "usable cue".to_owned(),
+    );
+    key.validate()?;
+    let first = cue_row_id(
+        "ledger1143",
+        eliot_cue_contracts::CueKind::Concept,
+        eliot_cue_contracts::MatchMode::Exact,
+        "usable cue",
+        &target,
+    )?;
+    let again = cue_row_id(
+        "ledger1143",
+        eliot_cue_contracts::CueKind::Concept,
+        eliot_cue_contracts::MatchMode::Exact,
+        "usable cue",
+        &target,
+    )?;
+    assert_eq!(first, again);
+    assert!(first.starts_with("cuev2:"));
+    let rescoped = cue_row_id(
+        "other-scope",
+        eliot_cue_contracts::CueKind::Concept,
+        eliot_cue_contracts::MatchMode::Exact,
+        "usable cue",
+        &target,
+    )?;
+    assert_ne!(first, rescoped);
+    let source = eliot_cue_contracts::CueSourceValue::new(
+        "Src/Lib.rs".to_owned(),
+        "src/lib.rs:rev-1".to_owned(),
+        "policy-sensitive:1".to_owned(),
+    );
+    source.validate()?;
+    assert_eq!(source.canonical_spelling, "Src/Lib.rs");
+    Ok(())
+}
+
+// Issue #1143 corrected divergence D-CUE-1: the legacy unconditional path
+// fold is retained byte-identical for v1 replay while the explicit-policy
+// branch preserves case. Both project to validating owner keys with distinct
+// frozen identities — the divergence is explicit, never silently fixed.
+#[test]
+fn ledger_1143_case_policy_divergence_stays_explicit() -> TestResult {
+    let legacy = CueKey::new("ledger1143", CueKind::FilePath, "Src/Lib.rs")?;
+    assert_eq!(legacy.value, "src/lib.rs");
+    let sensitive = CueKey::with_case_policy("ledger1143", CueKind::FilePath, "Src/Lib.rs", true)?;
+    assert_eq!(sensitive.value, "Src/Lib.rs");
+    assert_eq!(legacy.comparison_key().normalized_value, "src/lib.rs");
+    assert_eq!(sensitive.comparison_key().normalized_value, "Src/Lib.rs");
+    legacy.comparison_key().validate()?;
+    sensitive.comparison_key().validate()?;
+    let target = eliot_cue_contracts::TargetHandle::new("artifact:ledger-1143")?;
+    let legacy_id = cue_row_id(
+        "ledger1143",
+        legacy.comparison_key().kind,
+        legacy.comparison_key().mode,
+        &legacy.value,
+        &target,
+    )?;
+    let sensitive_id = cue_row_id(
+        "ledger1143",
+        sensitive.comparison_key().kind,
+        sensitive.comparison_key().mode,
+        &sensitive.value,
+        &target,
+    )?;
+    assert_ne!(legacy_id, sensitive_id);
+    Ok(())
+}
