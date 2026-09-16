@@ -268,11 +268,13 @@ fn call(
     )
 }
 
+#[allow(dead_code)]
 fn rebind_policy(input: &mut eliot_dreamer_contracts::FailureInput, policy: &eliot_dreamer_failure::FailurePolicy) {
     input.policy_digest.clone_from(&policy.digest);
     input.proposal.policy_digest.clone_from(&policy.digest);
 }
 
+#[allow(dead_code)]
 fn rebind_job_digest(input: &mut eliot_dreamer_contracts::FailureInput) {
     let digest = digest_hex(&canonical_bytes(&input.job).expect("job bytes"));
     input.item.job_digest = digest;
@@ -286,6 +288,7 @@ fn rebind_outcome(input: &mut eliot_dreamer_contracts::FailureInput) {
     input.proposal.outcome = input.action_evidence.outcome.clone();
 }
 
+#[allow(dead_code)]
 fn rebind_action(input: &mut eliot_dreamer_contracts::FailureInput) {
     input.proposal.action = input.action_evidence.action.clone();
 }
@@ -294,6 +297,7 @@ fn rebind_environment(input: &mut eliot_dreamer_contracts::FailureInput) {
     input.proposal.environment = input.environment.clone();
 }
 
+#[allow(dead_code)]
 fn resealed_policy(mut policy: eliot_dreamer_failure::FailurePolicy) -> eliot_dreamer_failure::FailurePolicy {
     policy.seal().expect("mutated policy seals");
     policy
@@ -499,7 +503,7 @@ fn proof_08_policy_rejection_vs_mechanism_failure() {
         decision.result.common_disposition,
         CandidateDisposition::Abstention
     );
-    assert_eq!(decision.assessment.causal.causal_claim_permitted, false);
+    assert!(!decision.assessment.causal.causal_claim_permitted);
 }
 
 // WORK_UNIT_CASE: 663/9
