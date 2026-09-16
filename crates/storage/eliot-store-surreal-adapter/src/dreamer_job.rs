@@ -808,6 +808,9 @@ async fn status(
 const MAX_LEASE_CANDIDATES: usize = MAX_DREAMER_JOB_HISTORY;
 /// Bounded Dreamer namespace scan backing deterministic selection.
 const JOB_SCAN_LIMIT: usize = 256;
+// The scan SQL carries this bound as an inline literal; the assertion keeps
+// the two in lockstep.
+const _: () = assert!(JOB_SCAN_LIMIT == 256);
 
 /// Resolves one operation-idempotency row: exact hash/kind replay returns the
 /// original outcome with fresh correlation swapped in, changed content under
@@ -875,13 +878,10 @@ async fn scan_ledgers(
         "dreamer_namespace".to_owned(),
         serde_json::Value::String(schema::dreamer::NAMESPACE.to_owned()),
     );
-    bindings.insert(
-        "dreamer_limit".to_owned(),
-        serde_json::Value::from(JOB_SCAN_LIMIT),
-    );
     // Bounded scan ordered by key; filtering to the exact job happens in Rust
-    // below so no substring match lives in the query string.
-    let sql = "SELECT VALUE { namespace: namespace, key: key, state_fence: state_fence, revision: revision, schema: schema, payload: payload, value_digest: value_digest } FROM recovery_job WHERE namespace = $dreamer_namespace ORDER BY key LIMIT $dreamer_limit;";
+    // below so no substring match lives in the query string. The limit is an
+    // inline literal (never a bound parameter) for the pinned provider.
+    let sql = "SELECT VALUE { namespace: namespace, key: key, state_fence: state_fence, revision: revision, schema: schema, payload: payload, value_digest: value_digest } FROM recovery_job WHERE namespace = $dreamer_namespace ORDER BY key LIMIT 256;";
     let mut response = client::query(db, config, "dreamer.scan_jobs", sql, bindings).await?;
     if !response.take_errors().is_empty() {
         return Err(AdapterError::PartialOutcome);
@@ -1200,6 +1200,7 @@ async fn op_lease_next(
     .await
 }
 
+#[allow(clippy::too_many_lines)]
 async fn op_renew(
     adapter: &SurrealStoreAdapter,
     db: &client::RpcTransport,
@@ -1312,6 +1313,7 @@ async fn op_renew(
     .await
 }
 
+#[allow(clippy::too_many_lines)]
 async fn op_start(
     adapter: &SurrealStoreAdapter,
     db: &client::RpcTransport,
@@ -1582,6 +1584,7 @@ async fn op_checkpoint(
     .await
 }
 
+#[allow(clippy::too_many_lines)]
 async fn op_resume(
     adapter: &SurrealStoreAdapter,
     db: &client::RpcTransport,
@@ -1930,6 +1933,7 @@ async fn op_publish(
     .await
 }
 
+#[allow(clippy::too_many_lines)]
 async fn op_request_cancel(
     adapter: &SurrealStoreAdapter,
     db: &client::RpcTransport,
@@ -2070,8 +2074,7 @@ async fn op_reconcile(
     let operation_id = mutation.operation.operation_id.to_string();
     let op_key = dreamer_operation_row_key(&operation_id);
     let existing = read_dreamer_row(db, &adapter.config, &op_key).await?;
-    match existing {
-        Some(op_row) => {
+    if let Some(op_row) = existing {
             let stored = decode_stored_mutation(&op_row)?;
             if stored.canonical_request_hash != mutation.canonical_request_hash
                 || stored.operation_kind != mutation.operation.operation_kind
@@ -2122,8 +2125,7 @@ async fn op_reconcile(
                 .map_err(map_durable_error)
                 .map_err(AdapterError::Store)?;
             Ok(response)
-        }
-        None => {
+    } else {
             if mutation.disposition == MutationDisposition::Committed {
                 // No operation row, no receipt: not committed success.
                 return Err(AdapterError::Store(StoreError::InvalidReceipt));
@@ -2168,7 +2170,6 @@ async fn op_reconcile(
                 .map_err(AdapterError::Store)?;
             Ok(response)
         }
-    }
 }
 
 /// Commits four Dreamer rows (job, event, operation, receipt) in one provider
@@ -2408,27 +2409,27 @@ mod tests {
             serde_json::from_value(serde_json::json!({
                 "operation": "RENEW_LEASE",
                 "lease": lease,
-                "observed_at_unix_ms": 50,
+                "now_unix_ms": 50,
             }))
             .expect("renew"),
             serde_json::from_value(serde_json::json!({
                 "operation": "START_JOB",
                 "lease": lease,
-                "observed_at_unix_ms": 50,
+                "now_unix_ms": 50,
             }))
             .expect("start"),
             serde_json::from_value(serde_json::json!({
                 "operation": "CHECKPOINT_JOB",
                 "lease": lease,
                 "checkpoint": test_checkpoint_json(),
-                "observed_at_unix_ms": 50,
+                "now_unix_ms": 50,
             }))
             .expect("checkpoint"),
             serde_json::from_value(serde_json::json!({
                 "operation": "RESUME_JOB",
                 "lease": lease,
                 "checkpoint": test_checkpoint_json(),
-                "observed_at_unix_ms": 50,
+                "now_unix_ms": 50,
             }))
             .expect("resume"),
             serde_json::from_value(serde_json::json!({
@@ -2436,14 +2437,14 @@ mod tests {
                 "lease": lease,
                 "result": test_content_json("result"),
                 "evidence": [test_artifact_json()],
-                "observed_at_unix_ms": 50,
+                "now_unix_ms": 50,
             }))
             .expect("begin verification"),
             serde_json::from_value(serde_json::json!({
                 "operation": "PUBLISH_OUTCOME",
                 "lease": lease,
                 "outcome": test_outcome_json(),
-                "observed_at_unix_ms": 50,
+                "now_unix_ms": 50,
             }))
             .expect("publish"),
             serde_json::from_value(serde_json::json!({
