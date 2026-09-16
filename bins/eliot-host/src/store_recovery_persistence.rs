@@ -326,7 +326,9 @@ impl StoreRecoveryPendingIdentity {
         if request.mutation_digest.as_str() != self.mutation_digest {
             // F-LOG-HOST-2 (#893): stale/mismatched mutation preserved as
             // Unknown by the caller, never adopted.
-            store_recovery_persist_observe("host.store-recovery intent mutation mismatch preserved");
+            store_recovery_persist_observe(
+                "host.store-recovery intent mutation mismatch preserved",
+            );
             return Err(HostError::RecoveryRequired(
                 "Store recovery request mutation does not match the durable intent".to_owned(),
             ));
@@ -523,8 +525,7 @@ pub(super) fn read_store_recovery_pending_identity(
         MAX_PENDING_BYTES,
         "store recovery pending record",
     )?;
-    let identity =
-        store_recovery_pending_identity_from_bytes(&bytes, expected_mutation_digest)?;
+    let identity = store_recovery_pending_identity_from_bytes(&bytes, expected_mutation_digest)?;
     store_recovery_persist_observe("host.store-recovery pending loaded");
     Ok(Some(identity))
 }
@@ -1153,9 +1154,7 @@ pub(super) fn persist_store_recovery_receipt(
                     sync_store_recovery_dir(&dir)?;
                     // F-LOG-HOST-2 (#893): exact-record replay is a readback,
                     // never a duplicate commit.
-                    store_recovery_persist_observe(
-                        "host.store-recovery receipt replay readback",
-                    );
+                    store_recovery_persist_observe("host.store-recovery receipt replay readback");
                     Ok(())
                 } else {
                     // F-LOG-HOST-2 (#893): a conflicting winner is preserved;

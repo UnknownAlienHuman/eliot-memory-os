@@ -281,19 +281,13 @@ impl HostCredentialControl {
                 | HostCredentialControlOperation::FinalizePhaseB
         ) {
             let response = self.enqueue_phase_b(request).await;
-            if matches!(
-                response,
-                HostCredentialControlResponse::Unknown { .. }
-            ) {
+            if matches!(response, HostCredentialControlResponse::Unknown { .. }) {
                 credential_control_observe("host.credential phase-b relayed unknown");
             }
             return response;
         }
         let response = self.core.handle(request);
-        if matches!(
-            response,
-            HostCredentialControlResponse::Unknown { .. }
-        ) {
+        if matches!(response, HostCredentialControlResponse::Unknown { .. }) {
             credential_control_observe("host.credential unknown");
             credential_control_observe_terminal("host-credential-unknown");
         }
