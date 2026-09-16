@@ -437,7 +437,7 @@ pub fn validate_host_scm_bootstrap(
     scm_launch_observe("host.scm-launch requested");
     // WORK_UNIT_CASE: 978/10 — one terminal across the SCM nesting:
     // classification and probe correlate by stage order only; only this guard
-    // may emit `host-scm-launch-unknown`.
+    // may emit the SCM unknown code.
     let mut scm_terminal = ScmLaunchTerminalGuard::armed("host-scm-launch-unknown");
     let registration_nonce = launch_options.registration_nonce().ok_or_else(|| {
         HostError::Platform("SystemService requires the registration nonce pair".to_owned())
