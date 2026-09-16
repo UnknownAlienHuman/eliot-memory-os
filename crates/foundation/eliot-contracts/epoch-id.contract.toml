@@ -91,34 +91,6 @@ invariants = [
   "DIRECT_CHILD and DIRECT_PARENT require an exact one-step sequence delta in one lineage",
 ]
 
-[types.LegacyScalarEpoch]
-kind = "compatibility-only closed struct"
-fields = [
-  "scalar_sequence: NonZeroU64",
-  "source_record_ref",
-  "source_contract_revision",
-]
-invariants = [
-  "contains no active lineage identity",
-  "cannot satisfy an authority check",
-  "cannot enter StateFence, route fence, MAC, request digest, or active receipt directly",
-]
-
-[types.LegacyEpochImport]
-kind = "closed enum"
-values = [
-  "EVIDENCE_BOUND_ACTIVE",
-  "HISTORICAL_SUSPENDED",
-  "MANUAL_RECOVERY_REQUIRED",
-]
-invariants = [
-  "only EVIDENCE_BOUND_ACTIVE contains an EpochId",
-  "EVIDENCE_BOUND_ACTIVE requires exact installation identity, Host lineage evidence, source record identity, and migration receipt",
-  "HISTORICAL_SUSPENDED preserves the scalar and evidence without authority",
-  "MANUAL_RECOVERY_REQUIRED preserves the scalar and blocks dependent admission",
-  "absence, ambiguity, or conflict in lineage evidence never defaults to the current lineage",
-]
-
 [functions]
 public = [
   "EpochLineageId::new(canonical_uuid_text) -> Result<EpochLineageId, EpochContractError>",
@@ -128,12 +100,10 @@ public = [
   "EpochTransition::direct_child(parent) -> Result<EpochTransition, EpochContractError>",
   "EpochTransition::validate() -> Result<(), EpochContractError>",
   "epoch_identity_digest(epoch_id) -> Result<LowercaseSha256, EpochContractError>",
-  "import_legacy_scalar_epoch(input, evidence) -> Result<LegacyEpochImport, EpochContractError>",
 ]
 forbidden = [
   "EpochId::value() -> u64",
   "From<EpochId> for u64",
-  "From<LegacyScalarEpoch> for EpochId without evidence",
   "PartialOrd or Ord on EpochId or EpochLineageId",
   "comparison of epochs from different lineages by sequence, timestamp, or UUID",
   "implicit current-lineage fallback",
@@ -148,20 +118,16 @@ closed_values = [
   "INVALID_GENESIS",
   "PARENT_LINEAGE_MISMATCH",
   "NOT_DIRECT_CHILD",
-  "LEGACY_LINEAGE_EVIDENCE_MISSING",
-  "LEGACY_LINEAGE_EVIDENCE_AMBIGUOUS",
-  "LEGACY_LINEAGE_EVIDENCE_CONFLICTED",
-  "LEGACY_ACTIVE_BINDING_FORBIDDEN",
   "SERIALIZATION_FAILURE",
 ]
 
 [migration]
 no_third_type_rule = "eliot-host-state must migrate/re-export the canonical types; a parallel EpochIdentity implementation is forbidden"
-legacy_scalar_owner = "compatibility decoder only"
+legacy_scalar_owner = "removed; no legacy scalar import exists"
 new_authority_fields = "must use EpochId"
 durable_rewrite = "requires an explicit migration receipt; no in-place guessing"
 restore_rule = "new globally distinct lineage; every previous lineage is fenced before admission"
-rollback_rule = "rollback may read historical scalar records only through the compatibility import; it cannot reactivate them"
+rollback_rule = "rollback cannot reactivate historical scalar records; no compatibility import exists"
 
 [[migration.wave]]
 order = 1
@@ -205,9 +171,6 @@ minimum = [
   "sequence overflow fails closed",
   "noncanonical UUID spelling fails",
   "canonical digest is stable and changes with lineage or sequence",
-  "legacy scalar with exact lineage evidence binds once",
-  "legacy scalar without evidence remains HISTORICAL_SUSPENDED or MANUAL_RECOVERY_REQUIRED",
-  "conflicting legacy evidence cannot produce active authority",
   "serde unknown field and enum value fail closed",
   "no public scalar coercion helper exists",
 ]
