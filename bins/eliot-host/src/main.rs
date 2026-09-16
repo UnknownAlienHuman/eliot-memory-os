@@ -228,15 +228,75 @@ fn console_process_exit_code() -> i32 {
     }
 }
 
+// F-LOG-HOST-7 process/console failure-diagnostics boundary table (issue #982).
+//
+// Every observation below goes through the #889 facade
+// (`eliot_host::host_diagnostics`) to stderr only; `host_console_protocol::
+// write_response` keeps sole stdout ownership, and every preserved behavior
+// (wire bytes, exit codes, SCM fallback, cleanup counts) is unchanged. New
+// callsites use entrypoint observations with static nonsecret words only: no
+// argv/env/nonce/credentials, no raw request lines, no error text (I15.4,
+// I07.20). The single HOST-0 terminal record for the console path is
+// preserved verbatim and stays the only terminal emission in this file:
+// lib.rs owns child-failure terminals, so main correlates without re-emitting
+// (single-terminal rule); the SCM-dispatcher failure is likewise a stage
+// detail, keeping stderr/capsule/exit 1066 as its receipt.
+//
+// B1  process bootstrap capture (`PROCESS_BOOTSTRAP.set`, Startup): cached
+//     only; a static outcome word, never launch material.
+// B2  diagnostics install (#889): preserved exactly once, never repeated.
+// B3  SCM dispatcher contour (windows-only, ScmDispatch): the `Ok(true)`
+//     service path stays unobserved (SCM owns the process); `Ok(false)`
+//     console fallback vs `Err` dispatcher failure stay distinct, and no
+//     fallback is added where none existed.
+// B4  console terminal exit (HOST-0 reference): preserved verbatim.
+// B5  console launch parse (ConsoleLoop/LaunchConfig): the Error frame plus
+//     the `false` return are unchanged; no payload is logged.
+// B6  console open (ConsoleLoop): the Error frame plus `false` are unchanged;
+//     lib owns the terminal, main only correlates.
+// B7  Ready write (ConsoleLoop): bytes unchanged; the record never upgrades
+//     Ready into durable/global readiness (I01.10).
+// B8  read loop incl. blank/malformed (ConsoleLoop): blank input still skips
+//     silently by design; read failure keeps Error plus terminate.
+// B9  dispatch Status/Stop/malformed (ConsoleLoop): response correlation and
+//     terminate flags unchanged; no second terminal for lib-terminal faults.
+// B10 response write failure (ConsoleLoop): the identical break-to-shutdown.
+// B11 EOF (ShutdownDrain): normal drain, not a failure record.
+// B12 shutdown/cancellation (`finish_console_shutdown`, ShutdownDrain): the
+//     single `host.stop()` call is preserved; drain outcome observed only.
+// B13 terminal exit codes (`console_process_exit_code`): unchanged.
+// B14 start-failure capsule/stderr/SCM status: untouched receipt owners.
+
 fn main() {
     let _ = PROCESS_BOOTSTRAP.set(parse_process_bootstrap(std::env::args_os().skip(1)));
     // HOST-0 (issue #889): best-effort diagnostics install; never gates startup.
     let _ = eliot_host::host_diagnostics::install_host_diagnostics();
+    // F-LOG-HOST-7 B1 (issue #982): bootstrap capture observed after install
+    // (earlier records would miss the subscriber) with a static word only;
+    // the cached value may carry launch material (I15.4).
+    eliot_host::host_diagnostics::observe_entrypoint(
+        eliot_host::host_diagnostics::EntrypointStage::Startup,
+    );
     #[cfg(windows)]
     match run_as_scm_service() {
         Ok(true) => return,
-        Ok(false) => {}
+        Ok(false) => {
+            // F-LOG-HOST-7 B3 (issue #982): supported interactive-console
+            // fallback, recorded distinctly from dispatcher failure below.
+            eliot_host::host_diagnostics::observe_entrypoint_with_detail(
+                eliot_host::host_diagnostics::EntrypointStage::ScmDispatch,
+                "console_fallback",
+            );
+        }
         Err(error) => {
+            // F-LOG-HOST-7 B3 (issue #982): dispatcher failure as stage detail
+            // only, so the HOST-0 terminal record below stays singular per the
+            // #889 contract; stderr, capsule, and exit 1066 still own the
+            // terminal receipt with identical text and codes.
+            eliot_host::host_diagnostics::observe_entrypoint_with_detail(
+                eliot_host::host_diagnostics::EntrypointStage::ScmDispatch,
+                "dispatcher_failed",
+            );
             let detail = format!(
                 "StartServiceCtrlDispatcherW failed with Win32 error {error} (0x{error:08X})"
             );
@@ -270,9 +330,27 @@ fn main() {
 }
 
 fn run_console() -> bool {
+    // F-LOG-HOST-7 B5 (issue #982): console loop entered; stdout framing below
+    // is unchanged.
+    eliot_host::host_diagnostics::observe_entrypoint(
+        eliot_host::host_diagnostics::EntrypointStage::ConsoleLoop,
+    );
     let launch_options = match HostLaunchOptions::parse(std::env::args_os().skip(1)) {
-        Ok(options) => options,
+        Ok(options) => {
+            // F-LOG-HOST-7 B5: launch config accepted; no argv/env echoed.
+            eliot_host::host_diagnostics::observe_entrypoint_with_detail(
+                eliot_host::host_diagnostics::EntrypointStage::LaunchConfig,
+                "launch_config_accepted",
+            );
+            options
+        }
         Err(error) => {
+            // F-LOG-HOST-7 B5: parse failure keeps the exact Error frame and
+            // `false` return; the raw error text is never logged.
+            eliot_host::host_diagnostics::observe_entrypoint_with_detail(
+                eliot_host::host_diagnostics::EntrypointStage::ConsoleLoop,
+                "launch_parse_failed",
+            );
             write_response(&Response::Error {
                 error: error.to_string(),
             });
@@ -282,6 +360,12 @@ fn run_console() -> bool {
     let mut host = match open_host(launch_options) {
         Ok(host) => host,
         Err(error) => {
+            // F-LOG-HOST-7 B6 (issue #982): open failure correlates only; the
+            // lib-owned terminal for this child failure is not re-emitted.
+            eliot_host::host_diagnostics::observe_entrypoint_with_detail(
+                eliot_host::host_diagnostics::EntrypointStage::ConsoleLoop,
+                "open_failed",
+            );
             write_response(&Response::Error {
                 error: error.to_string(),
             });
@@ -294,18 +378,44 @@ fn run_console() -> bool {
     }) {
         return finish_console_shutdown(&mut host, "ready response failed");
     }
+    // F-LOG-HOST-7 B7 (issue #982): Ready bytes unchanged; this record never
+    // promotes Ready into durable/global readiness (I01.10).
+    eliot_host::host_diagnostics::observe_entrypoint_with_detail(
+        eliot_host::host_diagnostics::EntrypointStage::ConsoleLoop,
+        "ready_written",
+    );
     for line in io::stdin().lock().lines() {
         let (response, terminate) = match line {
+            // Blank input still skips silently by design: not a failure, so
+            // intentionally unobserved (keeps the hot path quiet).
             Ok(line) if line.trim().is_empty() => continue,
             Ok(line) => dispatch(&mut host, &line),
-            Err(error) => (
-                Response::Error {
-                    error: error.to_string(),
-                },
-                true,
-            ),
+            Err(error) => {
+                // F-LOG-HOST-7 B8 (issue #982): read failure keeps Error plus
+                // terminate; the raw error text stays out of diagnostics.
+                eliot_host::host_diagnostics::observe_entrypoint_with_detail(
+                    eliot_host::host_diagnostics::EntrypointStage::ConsoleLoop,
+                    "console_read_failed",
+                );
+                (
+                    Response::Error {
+                        error: error.to_string(),
+                    },
+                    true,
+                )
+            }
         };
-        if !write_response(&response) || terminate || !host.running() {
+        // F-LOG-HOST-7 B10 (issue #982): write failure breaks to the identical
+        // shutdown path; the condition is split only to observe it, preserving
+        // evaluation order and outcome.
+        if !write_response(&response) {
+            eliot_host::host_diagnostics::observe_entrypoint_with_detail(
+                eliot_host::host_diagnostics::EntrypointStage::ConsoleLoop,
+                "response_write_failed",
+            );
+            break;
+        }
+        if terminate || !host.running() {
             break;
         }
     }
@@ -348,37 +458,83 @@ fn dispatch(host: &mut HostComposition, line: &str) -> (Response, bool) {
                         .is_some(),
                     managed_dependencies: state.dependencies.len(),
                 },
-                Err(error) => Response::Error {
-                    error: error.to_string(),
-                },
+                Err(error) => {
+                    // F-LOG-HOST-7 B9 (issue #982): snapshot failure observed
+                    // only; the Error response and stay-in-loop flag below are
+                    // unchanged.
+                    eliot_host::host_diagnostics::observe_entrypoint_with_detail(
+                        eliot_host::host_diagnostics::EntrypointStage::ConsoleLoop,
+                        "status_snapshot_failed",
+                    );
+                    Response::Error {
+                        error: error.to_string(),
+                    }
+                }
             },
             false,
         ),
         Ok(Request::Stop) => (
             match host.stop() {
-                Ok(()) => Response::Stopped,
-                Err(error) => Response::Error {
-                    error: error.to_string(),
-                },
+                Ok(()) => {
+                    // F-LOG-HOST-7 B9: accepted stop still terminates the loop;
+                    // the Stopped frame below keeps owning completion.
+                    eliot_host::host_diagnostics::observe_entrypoint_with_detail(
+                        eliot_host::host_diagnostics::EntrypointStage::ConsoleLoop,
+                        "stop_accepted",
+                    );
+                    Response::Stopped
+                }
+                Err(error) => {
+                    // F-LOG-HOST-7 B9: stop failure correlates only; a
+                    // lib-terminal child failure is not re-emitted here.
+                    eliot_host::host_diagnostics::observe_entrypoint_with_detail(
+                        eliot_host::host_diagnostics::EntrypointStage::ConsoleLoop,
+                        "stop_failed",
+                    );
+                    Response::Error {
+                        error: error.to_string(),
+                    }
+                }
             },
             true,
         ),
-        Err(error) => (
-            Response::Error {
-                error: error.to_string(),
-            },
-            false,
-        ),
+        Err(error) => {
+            // F-LOG-HOST-7 B9: malformed input keeps Error plus stay-in-loop;
+            // the raw line is never logged (user content, I15.4/I07.20).
+            eliot_host::host_diagnostics::observe_entrypoint_with_detail(
+                eliot_host::host_diagnostics::EntrypointStage::ConsoleLoop,
+                "request_malformed",
+            );
+            (
+                Response::Error {
+                    error: error.to_string(),
+                },
+                false,
+            )
+        }
     }
 }
 
 fn finish_console_shutdown(host: &mut HostComposition, cause: &str) -> bool {
+    // F-LOG-HOST-7 B11/B12 (issue #982): drain entered; `cause` is one of the
+    // two frozen caller literals, so it is safe detail. EOF is a normal drain,
+    // not a failure record.
+    eliot_host::host_diagnostics::observe_entrypoint_with_detail(
+        eliot_host::host_diagnostics::EntrypointStage::ShutdownDrain,
+        cause,
+    );
     if !host.running() {
         return !host.shutdown_failed();
     }
     match host.stop() {
         Ok(()) | Err(HostError::Stopped) => true,
         Err(error) => {
+            // F-LOG-HOST-7 B12: durable-shutdown failure keeps the exact
+            // stderr text and `false` below; observed with a static word only.
+            eliot_host::host_diagnostics::observe_entrypoint_with_detail(
+                eliot_host::host_diagnostics::EntrypointStage::ShutdownDrain,
+                "durable_shutdown_failed",
+            );
             let _ = writeln!(
                 io::stderr().lock(),
                 "eliot-host: durable shutdown failed after {cause}: {error}"
