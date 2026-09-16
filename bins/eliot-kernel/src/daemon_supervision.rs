@@ -29,6 +29,25 @@ pub(crate) enum DaemonRuntimeStatus {
     Failed(String),
 }
 
+/// F-LOG-KERNEL-3 (#901): supervision boundary observations.
+///
+/// Observation only, via #895's facade: fixed `kernel.supervision.*` event
+/// names plus a bounded stable outcome. Subordinate infos only; the single
+/// terminal for a failed supervision operation stays with the owning
+/// publication/renewal boundary. Never carries lease material, cursors,
+/// digests, evidence, or owner error strings (I15.4, I07.20).
+fn observe_supervision(event: &'static str, outcome: &'static str) {
+    use super::kernel_diagnostics::{KERNEL_DIAGNOSTICS_TARGET, bound_field};
+    let event_bound = bound_field(event);
+    let outcome_bound = bound_field(outcome);
+    tracing::info!(
+        target: KERNEL_DIAGNOSTICS_TARGET,
+        event = event_bound.text(),
+        outcome = outcome_bound.text(),
+        "daemon supervision observation"
+    );
+}
+
 pub(crate) const fn daemon_status_proves_ready(status: &DaemonRuntimeStatus) -> bool {
     matches!(status, DaemonRuntimeStatus::Ready)
 }
@@ -114,6 +133,9 @@ pub(crate) fn classify_eliotd_live_receipt_transition(
     supervision_successor: Option<&EliotdSupervisionSuccessorEvidence>,
 ) -> Result<EliotdLiveReceiptDisposition, KernelServiceError> {
     if old == expected {
+        // F-LOG-KERNEL-3 (#901): exact replay is an observation of the
+        // existing receipt, not another publication.
+        observe_supervision("kernel.supervision.receipt_replayed", "success");
         return Ok(EliotdLiveReceiptDisposition::ExactReplay);
     }
     let exact_activation_predecessor = activation_predecessor.is_some_and(|predecessor| {
@@ -124,6 +146,10 @@ pub(crate) fn classify_eliotd_live_receipt_transition(
             && old.supervision.public_key_fingerprint == expected.supervision.public_key_fingerprint
     });
     if !status_is_ready && exact_activation_predecessor {
+        observe_supervision(
+            "kernel.supervision.receipt_replaced",
+            "activation_predecessor",
+        );
         return Ok(EliotdLiveReceiptDisposition::ReplaceActivationPredecessor);
     }
     let exact_renewal_predecessor = supervision_successor.is_some_and(|successor| {
@@ -150,8 +176,12 @@ pub(crate) fn classify_eliotd_live_receipt_transition(
             && old.supervision.public_key_fingerprint == expected.supervision.public_key_fingerprint
     });
     if status_is_ready && exact_renewal_predecessor {
+        observe_supervision("kernel.supervision.receipt_replaced", "renewal_predecessor");
         return Ok(EliotdLiveReceiptDisposition::ReplaceRenewalPredecessor);
     }
+    // Subordinate observation only; the owning publication boundary emits the
+    // single terminal for the rejected transition.
+    observe_supervision("kernel.supervision.receipt_rejected", "fenced");
     Err(KernelServiceError::ReadinessNotProven)
 }
 
@@ -265,6 +295,9 @@ impl DaemonSupervisionProgressState {
     /// deliberately not recorded: refusals re-evaluate deterministically, and
     /// only recorded renewals participate in replay/identity-conflict.
     pub(crate) fn note_missed_renewal(&mut self) {
+        // F-LOG-KERNEL-3 (#901): blocked-renewal observation; the stale-expiry
+        // decision stays with the renewal join.
+        observe_supervision("kernel.supervision.renewal_missed", "deferred");
         self.missed_renewals = self.missed_renewals.saturating_add(1);
     }
 
@@ -298,12 +331,152 @@ impl DaemonSupervisionProgressState {
         self.missed_renewals = 0;
         self.last_eligible_observation_ms = Some(now_ms);
         self.reconciliation_pending = false;
+        // F-LOG-KERNEL-3 (#901): verified-renewal observation. Only the
+        // outcome is logged; cursors, digests, and revision identities stay
+        // with the owner.
+        observe_supervision("kernel.supervision.renewal_recorded", "success");
     }
 
     /// Marks the durable outcome unknown after a failed renew commit. The
     /// renewal join then reports `ReconciliationRequired` instead of minting
     /// a successor until exact reconciliation.
     pub(crate) fn note_reconciliation_pending(&mut self) {
+        // F-LOG-KERNEL-3 (#901): unknown-outcome observation; the outcome
+        // stays unknown until the owner reconciles it exactly.
+        observe_supervision("kernel.supervision.reconciliation_required", "unknown");
         self.reconciliation_pending = true;
+    }
+}
+
+#[cfg(all(test, windows))]
+mod daemon_supervision_diagnostics_tests {
+    //! F-LOG-KERNEL-3 (#901) focused diagnostics proof: readiness versus
+    //! liveness, blocked-renewal stale expiry, unknown-outcome blocking, and
+    //! secret-free capture for the supervision observations added above.
+
+    #![allow(clippy::expect_used, clippy::unwrap_used)]
+
+    use super::*;
+    use std::io::Write;
+    use std::sync::{Arc, Mutex};
+
+    #[derive(Clone, Default)]
+    struct CaptureSink {
+        bytes: Arc<Mutex<Vec<u8>>>,
+    }
+
+    impl Write for CaptureSink {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.bytes
+                .lock()
+                .map_err(|_| std::io::Error::other("capture lock poisoned"))?
+                .extend_from_slice(buf);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    fn capture(run: impl FnOnce()) -> String {
+        let sink = CaptureSink::default();
+        let writer_sink = sink.clone();
+        {
+            let subscriber = tracing_subscriber::fmt()
+                .with_ansi(false)
+                .with_writer(move || writer_sink.clone())
+                .finish();
+            tracing::subscriber::with_default(subscriber, run);
+        }
+        String::from_utf8_lossy(&sink.bytes.lock().expect("capture lock")).into_owned()
+    }
+
+    fn test_progress() -> DaemonSupervisionProgressState {
+        DaemonSupervisionProgressState {
+            accepted_cursors: Vec::new(),
+            admitted_idle_contract: None,
+            boot_id: None,
+            transport_session_evidence: None,
+            last_monotonic_ms: 0,
+            last_request_id: None,
+            last_observation_sha256: None,
+            last_successor_revision: None,
+            missed_renewals: 0,
+            last_eligible_observation_ms: None,
+            reconciliation_pending: false,
+        }
+    }
+
+    fn test_policy() -> DaemonSupervisionRenewalPolicy {
+        DaemonSupervisionRenewalPolicy {
+            validity_ms: 60_000,
+            renew_after_ms: 30_000,
+            max_observation_age_ms: 10_000,
+            max_wall_skew_ms: 5_000,
+            require_watchdog_coverage: false,
+        }
+    }
+
+    #[test]
+    fn supervision_diagnostics_readiness_and_renewal_boundaries() {
+        // Liveness is not readiness: only `Ready` proves ready. Status
+        // payloads stay with the owner; observations below carry fixed names.
+        assert!(!daemon_status_proves_ready(
+            &DaemonRuntimeStatus::NotLaunched
+        ));
+        assert!(!daemon_status_proves_ready(&DaemonRuntimeStatus::Launching));
+        assert!(!daemon_status_proves_ready(&DaemonRuntimeStatus::Running));
+        assert!(daemon_status_proves_ready(&DaemonRuntimeStatus::Ready));
+        assert!(!daemon_status_proves_ready(&DaemonRuntimeStatus::Degraded(
+            "degraded-canary".to_owned()
+        )));
+        assert!(!daemon_status_proves_ready(&DaemonRuntimeStatus::Failed(
+            "failed-canary".to_owned()
+        )));
+
+        // Three consecutive blocked renewals stale-expire the lease; fewer do
+        // not. The counting behavior is unchanged, only observed.
+        let policy = test_policy();
+        let mut progress = test_progress();
+        assert!(!progress.stale_renewal_expired(&policy, 1_000_000));
+        progress.note_missed_renewal();
+        progress.note_missed_renewal();
+        assert!(!progress.stale_renewal_expired(&policy, 1_000_000));
+        assert_eq!(progress.missed_renewals, 2);
+        progress.note_missed_renewal();
+        assert!(progress.stale_renewal_expired(&policy, 1_000_000));
+
+        // An unknown outcome blocks successors until exact reconciliation.
+        assert!(!progress.reconciliation_pending);
+        progress.note_reconciliation_pending();
+        assert!(progress.reconciliation_pending);
+
+        // Monotonic evidence never regresses, so rolled-back observations
+        // stay detectable after refusals.
+        progress.advance_monotonic_ms(500);
+        progress.advance_monotonic_ms(100);
+        assert_eq!(progress.last_monotonic_ms, 500);
+
+        // Captured diagnostics carry fixed events only; owner payloads never
+        // reach the sink (helpers accept `&'static str`, so no `String`
+        // payload can be passed at all).
+        let text = capture(|| {
+            observe_supervision("kernel.supervision.renewal_missed", "deferred");
+            observe_supervision("kernel.supervision.reconciliation_required", "unknown");
+            observe_supervision("kernel.supervision.renewal_recorded", "success");
+            observe_supervision("kernel.supervision.receipt_replayed", "success");
+        });
+        for marker in [
+            "kernel.supervision.renewal_missed",
+            "kernel.supervision.reconciliation_required",
+            "kernel.supervision.renewal_recorded",
+            "kernel.supervision.receipt_replayed",
+        ] {
+            assert!(text.contains(marker), "missing diagnostics marker {marker}");
+        }
+        for canary in ["degraded-canary", "failed-canary"] {
+            assert!(!text.contains(canary), "owner payload leaked: {canary}");
+        }
     }
 }

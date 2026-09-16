@@ -22,6 +22,46 @@ use super::{
 use sha2::{Digest as _, Sha256};
 use std::path::Path;
 
+/// F-LOG-KERNEL-3 (#901): live-receipt boundary observations.
+///
+/// Observation only, via #895's facade: fixed `kernel.live_receipt.*`
+/// event names plus a bounded stable outcome. Never carries receipt roots,
+/// artifact digests, process bindings, evidence material, or owner error
+/// strings (I15.4, I07.20).
+#[cfg(windows)]
+fn observe_live_receipt(event: &'static str, outcome: &'static str) {
+    use super::kernel_diagnostics::{KERNEL_DIAGNOSTICS_TARGET, bound_field};
+    let event_bound = bound_field(event);
+    let outcome_bound = bound_field(outcome);
+    tracing::info!(
+        target: KERNEL_DIAGNOSTICS_TARGET,
+        event = event_bound.text(),
+        outcome = outcome_bound.text(),
+        "daemon live receipt observation"
+    );
+}
+
+/// Maps one live-receipt/readiness failure to its stable diagnostic code.
+///
+/// Only the variant is emitted; any `String` payload or embedded state is
+/// never logged.
+#[cfg(windows)]
+fn live_receipt_terminal_code(error: &KernelServiceError) -> &'static str {
+    match error {
+        KernelServiceError::InvalidField { .. } => "LIVE_INVALID_FIELD",
+        KernelServiceError::IllegalTransition { .. } => "LIVE_ILLEGAL_TRANSITION",
+        KernelServiceError::HandshakeMismatch { .. } => "LIVE_HANDSHAKE_MISMATCH",
+        KernelServiceError::MissingContainmentEvidence => "LIVE_MISSING_CONTAINMENT",
+        KernelServiceError::ReadinessNotProven => "READINESS_NOT_PROVEN",
+        KernelServiceError::AdmissionClosed(_) => "LIVE_ADMISSION_CLOSED",
+        KernelServiceError::GenerationFenced => "LIVE_GENERATION_FENCED",
+        KernelServiceError::RestartBudgetExhausted => "LIVE_RESTART_BUDGET_EXHAUSTED",
+        KernelServiceError::ControlReserveExhausted => "LIVE_CONTROL_RESERVE_EXHAUSTED",
+        KernelServiceError::Platform(_) => "LIVE_PLATFORM",
+        KernelServiceError::Core(_) => "LIVE_CORE",
+    }
+}
+
 impl KernelComposition {
     #[cfg(windows)]
     pub(crate) fn eliotd_live_ready_evidence(
@@ -44,6 +84,42 @@ impl KernelComposition {
     #[cfg(windows)]
     #[allow(clippy::too_many_lines)]
     pub(crate) fn publish_eliotd_live_receipt(
+        &self,
+        launch: &EliotdLaunchDescriptor,
+        process: &ProcessStartReceipt,
+        ready: &EliotdLiveReadyEvidence,
+        supervision_contour: &DaemonSupervisionContour,
+        supervision_successor: Option<&SupervisionLeaseSnapshot>,
+    ) -> Result<EliotdLiveReceipt, KernelServiceError> {
+        // F-LOG-KERNEL-3 (#901): receipt publication boundary. Requested,
+        // published, and validated stay distinct; an exact replay is read
+        // back, not republished; exactly one terminal is emitted per failed
+        // publication and no receipt material is logged.
+        observe_live_receipt("kernel.live_receipt.publication_requested", "attempt");
+        match self.publish_eliotd_live_receipt_inner(
+            launch,
+            process,
+            ready,
+            supervision_contour,
+            supervision_successor,
+        ) {
+            Ok(receipt) => {
+                observe_live_receipt("kernel.live_receipt.published", "success");
+                Ok(receipt)
+            }
+            Err(error) => {
+                observe_live_receipt("kernel.live_receipt.publication_rejected", "fenced");
+                super::kernel_diagnostics::observe_terminal_error(live_receipt_terminal_code(
+                    &error,
+                ));
+                Err(error)
+            }
+        }
+    }
+
+    #[cfg(windows)]
+    #[allow(clippy::too_many_lines)]
+    fn publish_eliotd_live_receipt_inner(
         &self,
         launch: &EliotdLaunchDescriptor,
         process: &ProcessStartReceipt,
@@ -363,6 +439,33 @@ impl KernelComposition {
 
     #[cfg(windows)]
     pub(crate) async fn validate_daemon_process_readiness(
+        &self,
+        launch: &EliotdLaunchDescriptor,
+        receipt: &ProcessStartReceipt,
+    ) -> Result<(), KernelServiceError> {
+        // F-LOG-KERNEL-3 (#901): readiness boundary. A live OS handle is not
+        // readiness; exactly one terminal is emitted per failed validation.
+        observe_live_receipt("kernel.live_receipt.readiness_requested", "attempt");
+        match self
+            .validate_daemon_process_readiness_inner(launch, receipt)
+            .await
+        {
+            Ok(()) => {
+                observe_live_receipt("kernel.live_receipt.readiness_proven", "success");
+                Ok(())
+            }
+            Err(error) => {
+                observe_live_receipt("kernel.live_receipt.readiness_rejected", "fenced");
+                super::kernel_diagnostics::observe_terminal_error(live_receipt_terminal_code(
+                    &error,
+                ));
+                Err(error)
+            }
+        }
+    }
+
+    #[cfg(windows)]
+    async fn validate_daemon_process_readiness_inner(
         &self,
         launch: &EliotdLaunchDescriptor,
         receipt: &ProcessStartReceipt,
