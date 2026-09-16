@@ -19,6 +19,10 @@ mod host_composition_phase_b;
 #[cfg(windows)]
 mod host_composition_store_recovery;
 mod host_composition_validation;
+/// Host structured diagnostics facade (F-LOG-HOST-0, #889): compiled
+/// once here and imported by the binary; later leaves extend through their
+/// own serialized turns, never a second copy.
+pub mod host_diagnostics;
 mod host_job_launch;
 #[cfg(windows)]
 mod launch_artifact;
@@ -28,6 +32,10 @@ mod launch_options;
 mod runtime_control;
 mod scm_launch;
 mod store_kernel_launch_sequence;
+/// Host Windows Event Log sink seam (F-LOG-HOST-0, #889): thin bounded
+/// wrapper over #984's accepted safe port; explicitly unavailable until #984
+/// lands, never FFI inside Host.
+pub mod windows_event_log;
 
 pub use credential_control::{HostCredentialControl, HostPhaseBRequest, HostPhaseBRequestQueue};
 #[cfg(windows)]
