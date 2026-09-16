@@ -174,9 +174,9 @@ impl KernelComposition {
             }
             Err(error) => {
                 observe_control("kernel.control.request_denied", "rejected");
-                super::kernel_diagnostics::observe_terminal_error(
-                    control_request_terminal_code(&error),
-                );
+                super::kernel_diagnostics::observe_terminal_error(control_request_terminal_code(
+                    &error,
+                ));
                 Err(error)
             }
         }

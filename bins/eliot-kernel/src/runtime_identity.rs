@@ -254,10 +254,18 @@ mod runtime_identity_diagnostics_tests {
         // inputs keep the exact 64-hex digest, distinct principals diverge,
         // and only the fixed event name reaches the sink.
         let generation = Generation::new(1).expect("generation");
-        let first =
-            stable_owner_principal_digest("S-1-5-18-sid-canary", "testd", &test_epoch(), generation);
-        let second =
-            stable_owner_principal_digest("S-1-5-18-sid-canary", "testd", &test_epoch(), generation);
+        let first = stable_owner_principal_digest(
+            "S-1-5-18-sid-canary",
+            "testd",
+            &test_epoch(),
+            generation,
+        );
+        let second = stable_owner_principal_digest(
+            "S-1-5-18-sid-canary",
+            "testd",
+            &test_epoch(),
+            generation,
+        );
         assert_eq!(first, second);
         assert_eq!(first.len(), 64);
         assert!(
@@ -269,8 +277,12 @@ mod runtime_identity_diagnostics_tests {
         assert_ne!(first, other);
 
         let text = capture(|| {
-            let _ =
-                stable_owner_principal_digest("S-1-5-18-sid-canary", "testd", &test_epoch(), generation);
+            let _ = stable_owner_principal_digest(
+                "S-1-5-18-sid-canary",
+                "testd",
+                &test_epoch(),
+                generation,
+            );
         });
         assert!(
             text.contains("kernel.identity.owner_digest_derived"),

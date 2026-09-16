@@ -361,10 +361,22 @@ mod generation_recovery_diagnostics_tests {
         let fence = &policy.module_generation.state_fence;
         assert_eq!(fence.authority_epoch.sequence.get(), 7);
         assert_eq!(fence.resource_generation.value(), 3);
-        assert_eq!(policy.config_snapshot["generation"], serde_json::json!(3u64));
-        assert_eq!(policy.config_snapshot["authority_epoch"], serde_json::json!(7u64));
-        assert_eq!(policy.config_snapshot["service"], serde_json::json!(SERVICE_NAME));
-        assert_eq!(policy.config_snapshot["protocol"], serde_json::json!(PROTOCOL_VERSION));
+        assert_eq!(
+            policy.config_snapshot["generation"],
+            serde_json::json!(3u64)
+        );
+        assert_eq!(
+            policy.config_snapshot["authority_epoch"],
+            serde_json::json!(7u64)
+        );
+        assert_eq!(
+            policy.config_snapshot["service"],
+            serde_json::json!(SERVICE_NAME)
+        );
+        assert_eq!(
+            policy.config_snapshot["protocol"],
+            serde_json::json!(PROTOCOL_VERSION)
+        );
         assert_eq!(
             policy.config_snapshot["artifact_digest"],
             serde_json::json!("artifact-canary-string")
