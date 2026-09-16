@@ -353,7 +353,7 @@ impl GenerationRecord {
 
     /// Returns the Slice-A world projection.
     #[must_use]
-    pub const fn world(&self) -> &str {
+    pub fn world(&self) -> &str {
         &self.world
     }
 }
@@ -1047,22 +1047,28 @@ impl GenerationCoordinator {
         if !state.holds_operation(operation_id) {
             return Err(ReplacementError::UnknownOperation);
         }
-        let Some(drain) = state.draining.as_mut() else {
+        let Some(drain) = state.draining.as_ref() else {
             return Err(ReplacementError::DrainNotArmed);
         };
         if drain.operation_id != operation_id {
             return Err(ReplacementError::UnknownOperation);
         }
-        let unresolved = state.unresolved_on(drain.generation);
+        let draining_generation = drain.generation;
+        let drain_deadline_ms = drain.deadline_ms;
+        let mut blocked = drain.blocked;
+        let unresolved = state.unresolved_on(draining_generation);
         if !unresolved.is_empty() {
-            drain.blocked = true;
+            blocked = true;
+        }
+        if let Some(drain) = state.draining.as_mut() {
+            drain.blocked = blocked;
         }
         Ok(DrainStatus {
             draining: true,
-            draining_generation: Some(drain.generation),
+            draining_generation: Some(draining_generation),
             unresolved,
-            blocked: drain.blocked,
-            deadline_ms: Some(drain.deadline_ms),
+            blocked,
+            deadline_ms: Some(drain_deadline_ms),
         })
     }
 
