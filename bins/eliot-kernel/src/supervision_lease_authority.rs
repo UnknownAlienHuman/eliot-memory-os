@@ -41,6 +41,38 @@ use crate::daemon_supervision::DaemonSupervisionContour;
 #[cfg(windows)]
 use crate::daemon_supervision::DaemonSupervisionProgressState;
 
+/// F-LOG-KERNEL-3 (#901): supervision-lease boundary observations.
+///
+/// Observation only, via #895's facade: fixed `kernel.supervision.*` event
+/// names plus a bounded stable outcome. Never carries lease identities,
+/// digests, signed material, tickets, or owner error strings (I15.4).
+#[cfg(windows)]
+fn observe_supervision_lease(event: &'static str, outcome: &'static str) {
+    use crate::kernel_diagnostics::{KERNEL_DIAGNOSTICS_TARGET, bound_field};
+    let event_bound = bound_field(event);
+    let outcome_bound = bound_field(outcome);
+    tracing::info!(
+        target: KERNEL_DIAGNOSTICS_TARGET,
+        event = event_bound.text(),
+        outcome = outcome_bound.text(),
+        "supervision lease observation"
+    );
+}
+
+/// Maps one supervision-lease authority failure to its stable code.
+///
+/// Only the variant is emitted; any `String` payload or embedded ORS error
+/// is never logged.
+#[cfg(windows)]
+fn supervision_authority_terminal_code(error: &SupervisionLeaseAuthorityError) -> &'static str {
+    match error {
+        SupervisionLeaseAuthorityError::Configuration(_) => "SUPERVISION_CONFIGURATION",
+        SupervisionLeaseAuthorityError::ProtectedKeyUnavailable => "SUPERVISION_KEY_UNAVAILABLE",
+        SupervisionLeaseAuthorityError::Contract(_) => "SUPERVISION_CONTRACT",
+        SupervisionLeaseAuthorityError::Ors(_) => "SUPERVISION_ORS",
+    }
+}
+
 #[cfg(windows)]
 use super::sha256_hex;
 #[cfg(windows)]
@@ -471,6 +503,29 @@ impl KernelSupervisionLeaseAuthority {
         &self,
         ticket: &SupervisionLeaseCommitTicket,
     ) -> Result<SupervisionLeaseSnapshot, SupervisionLeaseAuthorityError> {
+        // F-LOG-KERNEL-3 (#901): lease acquire/renew boundary. Exact replay
+        // is read back inside, not recommitted; exactly one terminal is
+        // emitted per failed commit and no lease material is logged.
+        observe_supervision_lease("kernel.supervision.commit_requested", "attempt");
+        match self.commit_active_inner(ticket) {
+            Ok(snapshot) => {
+                observe_supervision_lease("kernel.supervision.commit_committed", "success");
+                Ok(snapshot)
+            }
+            Err(error) => {
+                observe_supervision_lease("kernel.supervision.commit_failed", "rejected");
+                crate::kernel_diagnostics::observe_terminal_error(
+                    supervision_authority_terminal_code(&error),
+                );
+                Err(error)
+            }
+        }
+    }
+
+    fn commit_active_inner(
+        &self,
+        ticket: &SupervisionLeaseCommitTicket,
+    ) -> Result<SupervisionLeaseSnapshot, SupervisionLeaseAuthorityError> {
         if !matches!(
             ticket.operation,
             SupervisionLeaseOperation::Commit | SupervisionLeaseOperation::Renew
@@ -504,6 +559,29 @@ impl KernelSupervisionLeaseAuthority {
     }
 
     pub fn commit_terminal(
+        &self,
+        ticket: &SupervisionLeaseCommitTicket,
+    ) -> Result<SupervisionLeaseSnapshot, SupervisionLeaseAuthorityError> {
+        // F-LOG-KERNEL-3 (#901): lease revoke/expire/supersede/close
+        // boundary. A terminal disposition stays terminal; exactly one
+        // terminal diagnostic is emitted per failed commit.
+        observe_supervision_lease("kernel.supervision.terminal_requested", "attempt");
+        match self.commit_terminal_inner(ticket) {
+            Ok(snapshot) => {
+                observe_supervision_lease("kernel.supervision.terminal_committed", "success");
+                Ok(snapshot)
+            }
+            Err(error) => {
+                observe_supervision_lease("kernel.supervision.terminal_failed", "rejected");
+                crate::kernel_diagnostics::observe_terminal_error(
+                    supervision_authority_terminal_code(&error),
+                );
+                Err(error)
+            }
+        }
+    }
+
+    fn commit_terminal_inner(
         &self,
         ticket: &SupervisionLeaseCommitTicket,
     ) -> Result<SupervisionLeaseSnapshot, SupervisionLeaseAuthorityError> {
