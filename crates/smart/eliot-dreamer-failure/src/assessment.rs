@@ -269,25 +269,26 @@ fn outcome(input: &FailureInput) -> (OutcomeAssessment, Option<FailureObservatio
         receipt.core.disposition.kind() == eliot_receipts::ReceiptDispositionKind::Failure
             && receipt.core.verifier.is_some()
     }) && semantic_evidence;
-    let assessed = match verified.kind() {
-        eliot_receipts::ReceiptDispositionKind::Cancelled
-            if verified_receipt.is_some()
-                && matches!(declared, Some(FailureObservationState::Cancelled) | None) =>
-        {
-            OutcomeAssessment::Cancelled
-        }
-        eliot_receipts::ReceiptDispositionKind::Partial
-            if verified_receipt.is_some()
-                && matches!(
-                    declared,
-                    Some(FailureObservationState::PartiallyApplied) | None
-                ) =>
-        {
+    let assessed = match (verified.kind(), declared) {
+        (
+            eliot_receipts::ReceiptDispositionKind::Cancelled,
+            Some(FailureObservationState::Cancelled) | None,
+        ) if verified_receipt.is_some() => OutcomeAssessment::Cancelled,
+        (_, Some(FailureObservationState::Cancelled)) => OutcomeAssessment::Cancelled,
+        (_, Some(FailureObservationState::TimedOut)) => OutcomeAssessment::TimedOut,
+        (_, Some(FailureObservationState::NotAttempted)) => OutcomeAssessment::NotAttempted,
+        (_, Some(FailureObservationState::Rejected)) => OutcomeAssessment::Rejected,
+        (_, Some(FailureObservationState::Unavailable)) => OutcomeAssessment::Unavailable,
+        (_, Some(FailureObservationState::VerifierFailed)) => OutcomeAssessment::VerifierFailed,
+        (
+            eliot_receipts::ReceiptDispositionKind::Partial,
+            Some(FailureObservationState::PartiallyApplied) | None,
+        ) if verified_receipt.is_some() => OutcomeAssessment::PartiallyApplied,
+        (_, Some(FailureObservationState::PartiallyApplied)) => {
             OutcomeAssessment::PartiallyApplied
         }
-        eliot_receipts::ReceiptDispositionKind::Failure
-            if semantic_floor
-                && declared == Some(FailureObservationState::ExecutedButSemanticallyFailed) =>
+        (eliot_receipts::ReceiptDispositionKind::Failure, Some(FailureObservationState::ExecutedButSemanticallyFailed))
+            if semantic_floor =>
         {
             OutcomeAssessment::ExecutedButSemanticallyFailed
         }
