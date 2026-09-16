@@ -19,11 +19,11 @@
 //! live handlers (the typed Rust boundary used by proof) with the same
 //! closed checks A-31 enforces; it never invents a handler.
 
+use eliot_dreamer_contracts::registry::family_kinds;
 use eliot_dreamer_contracts::{
     CURATION_FAMILIES, CurationFamily, CurationHandlerDescriptor, CurationHandlerPort,
     CurationHandlerRegistry, NativeCurationHandler, parse_family,
 };
-use eliot_dreamer_contracts::registry::family_kinds;
 use eliot_dreamer_curation::{
     NativeCurationPort, NativeCurationPortSet, OwnerRevisionPin, expected_owner_package,
 };
@@ -32,7 +32,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::conversion::GuestError;
 
-/// Frozen ContractChallenge for the missing live-handler edge.
+/// Frozen `ContractChallenge` for the missing live-handler edge.
 ///
 /// The manager alone owns `crates/smart/cognitive-contract-challenges.toml`;
 /// this record is the frozen evidence the manager appends. It is data, not a
@@ -159,9 +159,11 @@ pub fn static_registry() -> Result<CurationHandlerRegistry, GuestError> {
             handler_id: expected_owner_package(family).to_owned(),
             accepted_kinds: family_kinds(family).to_vec(),
         };
-        registry.register(descriptor).map_err(|error| GuestError::Registry {
-            detail: std::format!("static descriptor rejected: {error}"),
-        })?;
+        registry
+            .register(descriptor)
+            .map_err(|error| GuestError::Registry {
+                detail: std::format!("static descriptor rejected: {error}"),
+            })?;
     }
     Ok(registry)
 }
@@ -172,10 +174,11 @@ pub fn static_registry() -> Result<CurationHandlerRegistry, GuestError> {
 ///
 /// Returns [`GuestError::Registry`] when composition or digesting fails.
 pub fn static_registry_digest() -> Result<String, GuestError> {
-    static_registry()
-        .and_then(|registry| registry.digest().map_err(|_| GuestError::Registry {
+    static_registry().and_then(|registry| {
+        registry.digest().map_err(|_| GuestError::Registry {
             detail: "static registry digest requires closed registry".to_owned(),
-        }))
+        })
+    })
 }
 
 /// Assembles a live port set from caller-supplied handlers against the

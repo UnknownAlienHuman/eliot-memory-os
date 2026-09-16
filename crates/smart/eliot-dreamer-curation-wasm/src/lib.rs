@@ -45,17 +45,17 @@ pub use conversion::{
     MAX_GUEST_OUTPUT_BYTES, decode_request, decode_response, disposition_as_str, encode_request,
     encode_response, family_as_str, handle_request_typed, handle_static_with_ledger,
     handle_with_ports, kind_as_str, parse_disposition, parse_family_spelling, parse_kind_spelling,
-    rejection_hint_as_str, request_digest, wit_export_name,
+    rejection_hint_as_str, request_digest, resolve_family, resolve_rejection_hint, wit_export_name,
 };
 pub use descriptor::{
-    ComponentDescriptor, DescriptorError, EXPORT_NAME, FORBIDDEN_IMPORT_SUBSTRINGS,
-    GUEST_ABI_VERSION, GUEST_TARGET, GUEST_WIT_BYTES, HANDLER_SUBTYPE, TOOLCHAIN_BYTES,
-    TOOLCHAIN_CHANNEL, TYPED_WORLD_NAME, TYPED_WORLD_OWNER, TYPED_WORLD_STATUS, WORLD_NAME,
-    WORLD_PACKAGE, WasmImport, check_wasm_imports, descriptor, descriptor_digest,
+    COMPONENT_VERSION, ComponentDescriptor, DescriptorError, EXPORT_NAME,
+    FORBIDDEN_IMPORT_SUBSTRINGS, GUEST_ABI_VERSION, GUEST_TARGET, GUEST_WIT_BYTES, HANDLER_SUBTYPE,
+    TOOLCHAIN_BYTES, TOOLCHAIN_CHANNEL, TYPED_WORLD_NAME, TYPED_WORLD_OWNER, TYPED_WORLD_STATUS,
+    WORLD_NAME, WORLD_PACKAGE, WasmImport, check_wasm_imports, descriptor, descriptor_digest,
     is_forbidden_import, list_wasm_imports,
 };
 pub use export::{handle, handle_with_ledger, qualified_export_name};
 pub use static_registry::{
-    MISSING_OWNER_ISSUES, StaticPortChallenge, assemble_ports, missing_owner_families,
-    owner_issue, static_port_challenge, static_registry, static_registry_digest,
+    MISSING_OWNER_ISSUES, StaticPortChallenge, assemble_ports, missing_owner_families, owner_issue,
+    static_port_challenge, static_registry, static_registry_digest,
 };

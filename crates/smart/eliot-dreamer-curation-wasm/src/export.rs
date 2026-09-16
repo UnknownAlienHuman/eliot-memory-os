@@ -1,11 +1,12 @@
 //! The `handle` guest export over the accepted `dreamer-handler` shape.
 //!
-//! `dreamer-handler.wit` declares `handle: func(candidate:
-//! validated-candidate) -> result<handler-outcome, handler-error>` inside the
-//! exported `handler` interface. Component binding generation (`wit-bindgen`
-//! + `wit-component`) for the #756 typed world is not available on this base,
-//! so no raw canonical-ABI memory protocol is fabricated here: this module
-//! implements the canonical-byte transport of the typed
+//! `dreamer-handler.wit` declares a `handle` function returning a
+//! `result<handler-outcome, handler-error>` inside the exported `handler`
+//! interface. Component binding generation (`wit-bindgen` plus
+//! `wit-component`) for the #756 typed world is not available on this base,
+//! so no raw canonical-ABI memory protocol is fabricated here.
+//!
+//! This module implements the canonical-byte transport of the typed
 //! [`GuestRequest`](crate::conversion::GuestRequest) envelope under the same
 //! export name, carrying either the native candidate set or the exhaustive
 //! typed error. Undecodable or oversize input keeps the transport-level `Err`;
