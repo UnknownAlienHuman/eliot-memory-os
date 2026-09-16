@@ -3279,6 +3279,11 @@ impl CoordinationOwner {
     /// The review binds the exact artifact digest at its revision; a stale
     /// revision is retained as stale and never satisfies a requirement.
     /// Conflicting recommendations on one revision retain a conflict set.
+    // Single-function admission pipeline (#696): field validation, replay
+    // short-circuit, anchor/standing derivation, conflict-set retention, and
+    // commit share one fallible flow over `draft`. Splitting it would churn the
+    // proven boundary without changing any check, so the scoped allow stays and
+    // is disclosed in the #696 R2 report and PR body.
     #[allow(clippy::too_many_lines)]
     pub fn submit_peer_review(
         &mut self,

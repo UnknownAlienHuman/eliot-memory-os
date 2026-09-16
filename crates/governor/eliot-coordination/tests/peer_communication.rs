@@ -1,4 +1,10 @@
-#![allow(clippy::expect_used, clippy::unwrap_used, clippy::similar_names)]
+// Integration proof over 35 cases: every step asserts through `.expect` with a
+// message naming the invariant, so failures point at the broken guarantee.
+// Threading `Result` through all 35 cases would churn the proof without
+// strengthening it. This is the only file-level allow: `unwrap_used` needs
+// none (no `.unwrap()` calls exist; the one fallback uses `Option::unwrap_or`
+// with a default) and `similar_names` does not fire on this file.
+#![allow(clippy::expect_used)]
 
 use std::cell::Cell;
 use std::collections::{BTreeMap, VecDeque};
@@ -866,38 +872,37 @@ fn peer_duplicate_permutations_converge_to_one_canonical_state() {
     }
 }
 
-// WORK_UNIT_CASE: 696/7
-#[test]
-fn peer_bounds_are_typed_and_independent() {
-    let fixture = fixture_map("bounds-vectors.json");
+// Helpers for 696/7: each bound family asserts through one focused helper so
+// the case stays a readable orchestrator; every check from the original case
+// is preserved verbatim below.
+fn assert_bound_fixtures_agree(fixture: &BTreeMap<String, JVal>) {
+    // Bound constants are small compile-time limits; `try_from` documents the
+    // i64-range assumption for the JSON-fixture comparison without `as` casts.
+    let message_bytes_max = i64::try_from(eliot_coordination::MAX_PEER_MESSAGE_BYTES)
+        .expect("message-bytes bound fits in i64");
+    let inline_text_max = i64::try_from(eliot_coordination::MAX_PEER_INLINE_TEXT)
+        .expect("inline-text bound fits in i64");
+    let references_max = i64::try_from(eliot_coordination::MAX_PEER_REFERENCES)
+        .expect("references bound fits in i64");
+    let stream_depth_max = i64::try_from(eliot_coordination::MAX_PEER_STREAM_DEPTH)
+        .expect("stream-depth bound fits in i64");
+    let board_entries_max = i64::try_from(eliot_coordination::MAX_BOARD_ENTRIES_PER_SCOPE)
+        .expect("board-entries bound fits in i64");
+    let board_revisions_max = i64::try_from(eliot_coordination::MAX_BOARD_REVISIONS_PER_ENTRY)
+        .expect("board-revisions bound fits in i64");
+    assert_eq!(get_int(fixture, "message_bytes_max"), message_bytes_max);
+    assert_eq!(get_int(fixture, "inline_text_max"), inline_text_max);
+    assert_eq!(get_int(fixture, "references_max"), references_max);
+    assert_eq!(get_int(fixture, "stream_depth_max"), stream_depth_max);
     assert_eq!(
-        get_int(&fixture, "message_bytes_max"),
-        eliot_coordination::MAX_PEER_MESSAGE_BYTES as i64
+        get_int(fixture, "board_entries_per_scope_max"),
+        board_entries_max
     );
-    assert_eq!(
-        get_int(&fixture, "inline_text_max"),
-        eliot_coordination::MAX_PEER_INLINE_TEXT as i64
-    );
-    assert_eq!(
-        get_int(&fixture, "references_max"),
-        eliot_coordination::MAX_PEER_REFERENCES as i64
-    );
-    assert_eq!(
-        get_int(&fixture, "stream_depth_max"),
-        eliot_coordination::MAX_PEER_STREAM_DEPTH as i64
-    );
-    assert_eq!(
-        get_int(&fixture, "board_entries_per_scope_max"),
-        eliot_coordination::MAX_BOARD_ENTRIES_PER_SCOPE as i64
-    );
-    assert_eq!(
-        get_int(&fixture, "board_revisions_max"),
-        eliot_coordination::MAX_BOARD_REVISIONS_PER_ENTRY as i64
-    );
+    assert_eq!(get_int(fixture, "board_revisions_max"), board_revisions_max);
+}
 
-    let mut setup = peer_setup();
-    let fence = setup.fence.clone();
-    let mut oversized = base_draft(&fence, "msg-big", "req-big");
+fn assert_message_size_bounds(setup: &mut PeerSetup, fence: &StateFence) {
+    let mut oversized = base_draft(fence, "msg-big", "req-big");
     oversized.payload_bytes = eliot_coordination::MAX_PEER_MESSAGE_BYTES.saturating_add(1);
     assert_eq!(
         setup
@@ -905,7 +910,7 @@ fn peer_bounds_are_typed_and_independent() {
             .enqueue_peer_message(&oversized, &setup.clock, &setup.durability),
         Err(CoordinationError::InvalidField("payload_bytes"))
     );
-    let mut wide = base_draft(&fence, "msg-wide", "req-wide");
+    let mut wide = base_draft(fence, "msg-wide", "req-wide");
     wide.evidence_refs = (0..17).map(|index| format!("evidence-{index}")).collect();
     assert_eq!(
         setup
@@ -913,18 +918,21 @@ fn peer_bounds_are_typed_and_independent() {
             .enqueue_peer_message(&wide, &setup.clock, &setup.durability),
         Err(CoordinationError::InvalidField("peer_references"))
     );
+}
+
+fn assert_stream_depth_bound(setup: &mut PeerSetup, fence: &StateFence) {
     for index in 0..eliot_coordination::MAX_PEER_STREAM_DEPTH {
         enqueue(
-            &mut setup,
+            setup,
             &base_draft(
-                &fence,
+                fence,
                 &format!("msg-depth-{index}"),
                 &format!("req-depth-{index}"),
             ),
         );
     }
     let overflow = setup.owner.enqueue_peer_message(
-        &base_draft(&fence, "msg-depth-over", "req-depth-over"),
+        &base_draft(fence, "msg-depth-over", "req-depth-over"),
         &setup.clock,
         &setup.durability,
     );
@@ -935,7 +943,9 @@ fn peer_bounds_are_typed_and_independent() {
             limit: eliot_coordination::MAX_PEER_STREAM_DEPTH,
         })
     );
+}
 
+fn assert_sender_outstanding_bound() {
     let mut sender_bound = peer_setup();
     let fence = sender_bound.fence.clone();
     for name in ["work-o1", "work-o2", "work-o3"] {
@@ -952,8 +962,8 @@ fn peer_bounds_are_typed_and_independent() {
             &format!("msg-out-{index}"),
             &format!("req-out-{index}"),
         );
-        draft.work_item_id = work.to_owned();
-        draft.recipient_session_id = recipient.to_owned();
+        work.clone_into(&mut draft.work_item_id);
+        recipient.clone_into(&mut draft.recipient_session_id);
         draft.payload_digest = format!("digest-out-{index}");
         sender_bound
             .owner
@@ -961,7 +971,7 @@ fn peer_bounds_are_typed_and_independent() {
             .expect("outstanding admits");
     }
     let mut over = base_draft(&fence, "msg-out-over", "req-out-over");
-    over.work_item_id = "work-o3".to_owned();
+    "work-o3".clone_into(&mut over.work_item_id);
     assert_eq!(
         sender_bound.owner.enqueue_peer_message(
             &over,
@@ -973,7 +983,9 @@ fn peer_bounds_are_typed_and_independent() {
             limit: eliot_coordination::MAX_PEER_OUTSTANDING_PER_SENDER,
         })
     );
+}
 
+fn assert_recipient_outstanding_bound() {
     let mut recipient_bound = peer_setup();
     let fence = recipient_bound.fence.clone();
     for name in ["work-r1", "work-r2", "work-r3"] {
@@ -990,8 +1002,8 @@ fn peer_bounds_are_typed_and_independent() {
             &format!("msg-in-{index}"),
             &format!("req-in-{index}"),
         );
-        draft.work_item_id = work.to_owned();
-        draft.sender_session_id = sender.to_owned();
+        work.clone_into(&mut draft.work_item_id);
+        sender.clone_into(&mut draft.sender_session_id);
         draft.payload_digest = format!("digest-in-{index}");
         recipient_bound
             .owner
@@ -999,7 +1011,7 @@ fn peer_bounds_are_typed_and_independent() {
             .expect("inbound admits");
     }
     let mut over = base_draft(&fence, "msg-in-over", "req-in-over");
-    over.work_item_id = "work-r3".to_owned();
+    "work-r3".clone_into(&mut over.work_item_id);
     assert_eq!(
         recipient_bound.owner.enqueue_peer_message(
             &over,
@@ -1011,10 +1023,12 @@ fn peer_bounds_are_typed_and_independent() {
             limit: eliot_coordination::MAX_PEER_OUTSTANDING_PER_RECIPIENT,
         })
     );
+}
 
+fn assert_board_revision_bound(setup: &mut PeerSetup, fence: &StateFence) {
     let mut revised = post_board(
-        &mut setup,
-        &base_board(&fence, "board-rev-bound", "req-rev-0", "tenant-alpha"),
+        setup,
+        &base_board(fence, "board-rev-bound", "req-rev-0", "tenant-alpha"),
     );
     for index in 1..eliot_coordination::MAX_BOARD_REVISIONS_PER_ENTRY {
         let receipt = setup
@@ -1064,6 +1078,23 @@ fn peer_bounds_are_typed_and_independent() {
             limit: eliot_coordination::MAX_BOARD_REVISIONS_PER_ENTRY,
         })
     );
+}
+
+// WORK_UNIT_CASE: 696/7
+#[test]
+fn peer_bounds_are_typed_and_independent() {
+    assert_bound_fixtures_agree(&fixture_map("bounds-vectors.json"));
+
+    let mut setup = peer_setup();
+    let fence = setup.fence.clone();
+    assert_message_size_bounds(&mut setup, &fence);
+    assert_stream_depth_bound(&mut setup, &fence);
+
+    assert_sender_outstanding_bound();
+
+    assert_recipient_outstanding_bound();
+
+    assert_board_revision_bound(&mut setup, &fence);
 }
 
 // WORK_UNIT_CASE: 696/8
@@ -2354,6 +2385,78 @@ fn peer_conflicting_reviews_preserve_a_conflict_set() {
     assert_eq!(receipt.review.conflict_id, None);
 }
 
+// Helper for 696/28: submits one review per standing (complete, partial,
+// abstained, expired) so the denominator case stays under the line limit; all
+// four submissions and their expectations are preserved verbatim.
+fn submit_denominator_reviews(
+    setup: &mut PeerSetup,
+    fence: &StateFence,
+    artifact: &str,
+    head_revision: u64,
+) {
+    setup
+        .owner
+        .submit_peer_review(
+            &base_review(
+                fence,
+                "review-full-1",
+                "req-full-1",
+                artifact,
+                head_revision,
+            ),
+            &setup.clock,
+            &setup.durability,
+        )
+        .expect("complete submits");
+    let mut partial = base_review(
+        fence,
+        "review-partial-1",
+        "req-partial-1",
+        artifact,
+        head_revision,
+    );
+    "session-b".clone_into(&mut partial.reviewer_session_id);
+    partial.completeness = ReviewCompleteness::Partial;
+    setup
+        .owner
+        .submit_peer_review(&partial, &setup.clock, &setup.durability)
+        .expect("partial submits");
+    let mut abstained = base_review(
+        fence,
+        "review-abstain-1",
+        "req-abstain-1",
+        artifact,
+        head_revision,
+    );
+    "session-c".clone_into(&mut abstained.reviewer_session_id);
+    abstained.recommendation = ReviewRecommendation::Abstain;
+    abstained.completeness = ReviewCompleteness::Abstain;
+    setup
+        .owner
+        .submit_peer_review(&abstained, &setup.clock, &setup.durability)
+        .expect("abstention submits");
+    register_session(
+        &mut setup.owner,
+        &setup.fence.clone(),
+        "session-e",
+        10,
+        100_000,
+    );
+    let mut expiring = base_review(
+        fence,
+        "review-expiring-1",
+        "req-expiring-1",
+        artifact,
+        head_revision,
+    );
+    "session-e".clone_into(&mut expiring.reviewer_session_id);
+    expiring.expires_at = Some(1000);
+    setup
+        .owner
+        .submit_peer_review(&expiring, &setup.clock, &setup.durability)
+        .expect("expiring submits");
+}
+
 // WORK_UNIT_CASE: 696/28
 #[test]
 fn peer_expected_review_denominator_retains_every_standing() {
@@ -2379,67 +2482,7 @@ fn peer_expected_review_denominator_retains_every_standing() {
         )
         .expect("expectation set");
     let head_revision = get_u64(&fixture, "review_revision");
-    setup
-        .owner
-        .submit_peer_review(
-            &base_review(
-                &fence,
-                "review-full-1",
-                "req-full-1",
-                &artifact,
-                head_revision,
-            ),
-            &setup.clock,
-            &setup.durability,
-        )
-        .expect("complete submits");
-    let mut partial = base_review(
-        &fence,
-        "review-partial-1",
-        "req-partial-1",
-        &artifact,
-        head_revision,
-    );
-    partial.reviewer_session_id = "session-b".to_owned();
-    partial.completeness = ReviewCompleteness::Partial;
-    setup
-        .owner
-        .submit_peer_review(&partial, &setup.clock, &setup.durability)
-        .expect("partial submits");
-    let mut abstained = base_review(
-        &fence,
-        "review-abstain-1",
-        "req-abstain-1",
-        &artifact,
-        head_revision,
-    );
-    abstained.reviewer_session_id = "session-c".to_owned();
-    abstained.recommendation = ReviewRecommendation::Abstain;
-    abstained.completeness = ReviewCompleteness::Abstain;
-    setup
-        .owner
-        .submit_peer_review(&abstained, &setup.clock, &setup.durability)
-        .expect("abstention submits");
-    register_session(
-        &mut setup.owner,
-        &setup.fence.clone(),
-        "session-e",
-        10,
-        100_000,
-    );
-    let mut expiring = base_review(
-        &fence,
-        "review-expiring-1",
-        "req-expiring-1",
-        &artifact,
-        head_revision,
-    );
-    expiring.reviewer_session_id = "session-e".to_owned();
-    expiring.expires_at = Some(1000);
-    setup
-        .owner
-        .submit_peer_review(&expiring, &setup.clock, &setup.durability)
-        .expect("expiring submits");
+    submit_denominator_reviews(&mut setup, &fence, &artifact, head_revision);
     let denominator = setup.owner.peer_review_denominator(&artifact);
     assert_eq!(denominator.expected, 3);
     assert_eq!(denominator.submitted, 4);
