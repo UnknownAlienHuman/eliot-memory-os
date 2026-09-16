@@ -1,0 +1,42 @@
+{
+  "contract": "eliot.foundation.protocol.durable-job",
+  "states": [
+    "NOT_STARTED",
+    "QUEUED",
+    "LEASED",
+    "RUNNING",
+    "CHECKPOINTED",
+    "VERIFYING",
+    "COMPLETED",
+    "PARTIAL",
+    "FAILED",
+    "CANCELLED",
+    "UNKNOWN_OUTCOME"
+  ],
+  "terminal": [
+    "COMPLETED",
+    "PARTIAL",
+    "FAILED",
+    "CANCELLED",
+    "UNKNOWN_OUTCOME"
+  ],
+  "legal_edges": [
+    ["NOT_STARTED", "QUEUED"],
+    ["QUEUED", "LEASED"],
+    ["LEASED", "RUNNING"],
+    ["CHECKPOINTED", "RUNNING"],
+    ["RUNNING", "CHECKPOINTED"],
+    ["RUNNING", "FAILED"],
+    ["RUNNING", "CANCELLED"],
+    ["RUNNING", "UNKNOWN_OUTCOME"],
+    ["CHECKPOINTED", "VERIFYING"],
+    ["CHECKPOINTED", "FAILED"],
+    ["CHECKPOINTED", "CANCELLED"],
+    ["CHECKPOINTED", "UNKNOWN_OUTCOME"],
+    ["VERIFYING", "COMPLETED"],
+    ["VERIFYING", "PARTIAL"],
+    ["VERIFYING", "FAILED"],
+    ["VERIFYING", "CANCELLED"],
+    ["VERIFYING", "UNKNOWN_OUTCOME"]
+  ]
+}
