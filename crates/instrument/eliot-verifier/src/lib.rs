@@ -12,11 +12,6 @@ use eliot_instrument_api::{
     VerificationOutcome, VerificationRun as CurrentVerificationRun,
 };
 use eliot_instrument_nextest::{NEXTEST_INSTRUMENT, parse_jsonl};
-use eliot_types::verification::{
-    SkippedTest, SkippedTestReason, TestInventory, TestMetadata, TestStatefulness,
-    TestSuiteProfile, VerificationCommandResult, VerificationCommandStatus, VerificationDecision,
-    VerificationPlan, VerificationRun, VerificationRunStatus, VerificationVerdict,
-};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
@@ -84,6 +79,204 @@ fn id(prefix: &str, value: impl Serialize) -> String {
     let mut digest = Sha256::new();
     digest.update(bytes);
     format!("{prefix}-{:x}", digest.finalize())
+}
+
+// Verifier-local planning DTOs.
+//
+// These types are owned by this crate. They cover exactly the inventory,
+// profile, plan, run, and verdict shapes the `plan` / `execute` / `verdict`
+// path genuinely reads or constructs. The legacy donor crate is never
+// referenced here.
+
+/// Intent of one verifiable test, as read by profile filtering.
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TestIntent {
+    TypeContract,
+    BoundarySecurity,
+    Regression,
+    /// Tests that prove a unit of work is actually finished. Records written
+    /// under the retired milestone spelling still load.
+    #[serde(alias = "phase_closeout")]
+    CompletionProof,
+    BehaviorEval,
+    StatefulDbSafety,
+    RuntimeServiceSafety,
+    ExternalProviderSafety,
+    PerformanceCost,
+    FlakeDetection,
+}
+
+/// Cost class of one verifiable test, as compared against a profile ceiling.
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TestCostClass {
+    Tiny,
+    Small,
+    Medium,
+    Large,
+    VeryLarge,
+}
+
+/// Statefulness of one verifiable test, as filtered by a profile.
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TestStatefulness {
+    Pure,
+    TempFs,
+    LocalDbIsolated,
+    LocalDbSharedSerial,
+    NetworkForbidden,
+    ServiceProcess,
+    WindowsServiceDryRun,
+}
+
+/// One verifiable test, with exactly the fields planning reads.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct TestMetadata {
+    pub test_id: String,
+    pub crate_name: String,
+    pub intent: TestIntent,
+    pub component_refs: Vec<String>,
+    pub risk_refs: Vec<String>,
+    pub estimated_cost: TestCostClass,
+    pub statefulness: TestStatefulness,
+    pub required_profiles: Vec<String>,
+}
+
+/// Immutable test inventory input to planning, with exactly the fields used.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct TestInventory {
+    pub inventory_id: String,
+    #[serde(with = "time::serde::rfc3339")]
+    pub generated_at: OffsetDateTime,
+    pub tests: Vec<TestMetadata>,
+}
+
+/// Profile selecting which inventory tests are in scope, with exactly the
+/// fields planning reads.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct TestSuiteProfile {
+    pub profile_id: String,
+    pub included_intents: Vec<TestIntent>,
+    pub excluded_statefulness: Vec<TestStatefulness>,
+    pub max_cost_class: Option<TestCostClass>,
+    pub requires_serial: bool,
+    pub required_commands: Vec<String>,
+}
+
+/// Estimated runtime severity carried as write-only plan metadata.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum VerificationRuntimeClass {
+    Fast,
+    Medium,
+    Full,
+    Deep,
+}
+
+/// One test left out of a plan and why.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct SkippedTest {
+    pub test_id: String,
+    pub reason: SkippedTestReason,
+}
+
+/// Reason a test was left out of a plan.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SkippedTestReason {
+    OutOfScopeForProfile,
+    CoveredByRequiredGate,
+    PlatformNotSupported,
+    RequiresManualServiceInstall,
+    DeepOnly,
+}
+
+/// Deterministic plan payload produced by [`plan`].
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct VerificationPlan {
+    pub plan_id: String,
+    pub profile_id: String,
+    pub changed_refs: Vec<String>,
+    pub selected_tests: Vec<String>,
+    pub required_commands: Vec<String>,
+    pub skipped_tests: Vec<SkippedTest>,
+    pub estimated_runtime_class: VerificationRuntimeClass,
+    #[serde(with = "time::serde::rfc3339")]
+    pub created_at: OffsetDateTime,
+}
+
+/// Status of one executed command observation.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum VerificationCommandStatus {
+    Passed,
+    Failed,
+    Skipped,
+    TimedOut,
+    NotSupported,
+}
+
+/// Executor-owned observation for one planned command.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct VerificationCommandResult {
+    pub command: String,
+    pub status: VerificationCommandStatus,
+    pub duration_ms: u64,
+    pub stdout_ref: Option<String>,
+    pub stderr_ref: Option<String>,
+    pub parsed_test_count: Option<u64>,
+    pub warnings: Vec<String>,
+}
+
+/// Lifecycle status of one completed verification run.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum VerificationRunStatus {
+    Passed,
+    Failed,
+    Partial,
+    Blocked,
+}
+
+/// Completed run vessel consumed by [`verdict`].
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct VerificationRun {
+    pub run_id: String,
+    pub plan_id: String,
+    pub profile_id: String,
+    #[serde(with = "time::serde::rfc3339")]
+    pub started_at: OffsetDateTime,
+    #[serde(with = "time::serde::rfc3339::option")]
+    pub finished_at: Option<OffsetDateTime>,
+    pub command_results: Vec<VerificationCommandResult>,
+    pub status: VerificationRunStatus,
+}
+
+/// Finish-gate decision produced by [`verdict`].
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum VerificationDecision {
+    Allow,
+    AllowWithWarnings,
+    Block,
+    RequireFullVerify,
+    RequireSerialDbVerify,
+}
+
+/// Durable verdict vessel produced by [`verdict`].
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct VerificationVerdict {
+    pub verdict_id: String,
+    pub run_id: String,
+    pub profile_id: String,
+    pub decision: VerificationDecision,
+    pub blocking_failures: Vec<String>,
+    pub warnings: Vec<String>,
+    pub required_followups: Vec<String>,
+    #[serde(with = "time::serde::rfc3339")]
+    pub created_at: OffsetDateTime,
 }
 
 /// A command selected for one verifier plan.
@@ -212,11 +405,11 @@ pub fn plan(
     selected.sort();
     skipped.sort_by(|a, b| a.test_id.cmp(&b.test_id));
     let runtime = if commands.iter().any(|c| c.serial) {
-        eliot_types::verification::VerificationRuntimeClass::Deep
+        VerificationRuntimeClass::Deep
     } else if commands.len() > 3 {
-        eliot_types::verification::VerificationRuntimeClass::Full
+        VerificationRuntimeClass::Full
     } else {
-        eliot_types::verification::VerificationRuntimeClass::Fast
+        VerificationRuntimeClass::Fast
     };
     let profile_id = profile.profile_id.clone();
     let base = VerificationPlan {
@@ -1005,7 +1198,7 @@ fn main() {
                 selected_tests: Vec::new(),
                 required_commands: Vec::new(),
                 skipped_tests: Vec::new(),
-                estimated_runtime_class: eliot_types::verification::VerificationRuntimeClass::Fast,
+                estimated_runtime_class: VerificationRuntimeClass::Fast,
                 created_at: OffsetDateTime::now_utc(),
             },
             commands: vec![PlannedCommand {
