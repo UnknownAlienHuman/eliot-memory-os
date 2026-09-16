@@ -4,7 +4,7 @@ version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
-description = "Provider-neutral role-filtered ELIOT ControlBoard contract (bounded reference fixture; no production consumer)"
+description = "Provider-neutral role-filtered ELIOT ControlBoard contract (bounded reference fixture; bins/eliotd production daemon composition)"
 
 [package.metadata.eliot]
 work_id = "A-08"
@@ -12,15 +12,17 @@ functional_cell = "controlboard"
 lifecycle_owner = "A-08"
 source_layer = "C3"
 proof_entrypoint = "cargo test -p eliot-controlboard --all-targets --all-features"
-# Fixture disposition (#1213 MGR01 half): bounded reference fixture with no
-# production consumer in this lane. The `eliot-cli` catalogue edge is severed
-# to an inlined `PLAN_GAP` literal; the only remaining reverse dependency is
-# `bins/eliotd` test-only adapters. Full delete follows with the eliotd lane.
+# Fixture disposition (#1213 MGR01 half): bounded reference fixture. The
+# `eliot-cli` catalogue edge is severed to an inlined `PLAN_GAP` literal; the
+# remaining reverse dependency is the `bins/eliotd` production daemon
+# composition (`DaemonComposition::controlboard`) over production adapters
+# (`bins/eliotd/src/controlboard_adapters.rs`). Full delete follows with the
+# eliotd lane.
 # This crate is frozen: no board extension, owner bindings, authority, or
 # currentness.
 fixture_status = "bounded-reference-fixture"
-production_consumers = "none"
-remaining_reverse_dependency = "bins/eliotd test-only adapters"
+production_consumers = "bins/eliotd production daemon composition"
+remaining_reverse_dependency = "bins/eliotd production adapters"
 follow_up = "full delete with eliotd lane"
 
 [dependencies]

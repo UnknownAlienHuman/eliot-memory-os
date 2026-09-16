@@ -6,11 +6,12 @@
 //! providers therefore remain an explicit `PLAN_GAP`; this crate never creates
 //! a caller-mintable substitute.
 //!
-//! Fixture disposition (#1213 MGR01 half): bounded reference fixture with no
-//! production consumer in this lane. The `eliot-cli` catalogue edge is severed
-//! to an inlined `PLAN_GAP` literal; the only remaining reverse dependency is
-//! the `bins/eliotd` test-only adapters. Full delete follows with the eliotd
-//! lane. This crate is frozen: no board extension, owner bindings, authority,
+//! Fixture disposition (#1213 MGR01 half): bounded reference fixture. The
+//! `eliot-cli` catalogue edge is severed to an inlined `PLAN_GAP` literal;
+//! the remaining reverse dependency is the `bins/eliotd` production daemon
+//! composition (`DaemonComposition::controlboard`) over production adapters
+//! (`bins/eliotd/src/controlboard_adapters.rs`). Full delete follows with the
+//! eliotd lane. This crate is frozen: no board extension, owner bindings, authority,
 //! or currentness is added here.
 
 #![forbid(unsafe_code)]

@@ -31,8 +31,8 @@ pub const MCP_SURFACE_CONTRACT_REVISION: &str = eliot_mcp::CONTRACT_REVISION;
 /// (`crates/surfaces/eliot-controlboard/src/lib.rs:40`, value `"PLAN_GAP"`).
 /// The `eliot-controlboard` dependency is severed here; this is now a local
 /// literal pinned by `controlboard_plan_gap_marker_is_pinned`. That crate is a
-/// bounded reference fixture with no production consumer in this lane; its full
-/// delete follows with the eliotd lane.
+/// bounded reference fixture whose remaining production consumer is the
+/// `bins/eliotd` daemon composition; its full delete follows with the eliotd lane.
 pub const CONTROLBOARD_PLAN_GAP: &str = "PLAN_GAP";
 
 /// Canonical command identifiers from the first-line command projection.
