@@ -1551,8 +1551,8 @@ mod tests {
         encode_component, generate_message_id,
     };
     use crate::{
-        AuthorityCeiling, BasicAuth, LoopbackEndpoint, ModelSelection, OpenCodeEvent,
-        OpenCodeWireRouteState, ReadOnlyRunRequest, RunStatus,
+        AuthorityCeiling, BasicAuth, LoopbackEndpoint, LoopbackHttpError, ModelSelection,
+        OpenCodeEvent, OpenCodeWireRouteState, ReadOnlyRunRequest, RunStatus,
     };
     use secrecy::SecretString;
     use std::collections::VecDeque;
@@ -1864,5 +1864,28 @@ mod tests {
             }
         });
         Ok((port, requests))
+    }
+
+    #[test]
+    fn rate_limit_status_is_definitively_rejected_typed() {
+        // A 429 rate-limit response stays a typed HTTP status error and is
+        // definitively rejected: it is never retried blindly and never
+        // becomes an empty successful result.
+        let limited = OpenCodeRunError::Http(LoopbackHttpError::Status {
+            status: 429,
+            body_preview: String::new(),
+        });
+        assert!(matches!(
+            limited,
+            OpenCodeRunError::Http(LoopbackHttpError::Status { status: 429, .. })
+        ));
+        assert!(super::dispatch_definitively_rejected(&limited));
+        // 5xx stays outside the definitive-rejection band (separate
+        // unknown/retryable path), proving the 4xx band is exact.
+        let server = OpenCodeRunError::Http(LoopbackHttpError::Status {
+            status: 503,
+            body_preview: String::new(),
+        });
+        assert!(!super::dispatch_definitively_rejected(&server));
     }
 }
