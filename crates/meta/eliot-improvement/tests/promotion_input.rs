@@ -1168,11 +1168,19 @@ fn case_26_canonical_order_digest_and_malformed_regressions() {
 
 // WORK_UNIT_CASE: 972/27
 #[test]
-fn case_27_source_bound_module_without_lib_edits_or_duplication() {
+fn case_27_integrator_export_turn_minimal_without_duplication() {
     const LIB: &str = include_str!("../src/lib.rs");
-    assert!(!LIB.contains("mod promotion_input"));
+    assert!(LIB.contains("mod promotion_input"));
+    assert!(LIB.contains("prepare_promotion_input"));
     assert!(!LIB.contains("promotion_input.rs"));
     assert!(LIB.contains("PromotionInput"));
+    // Ordinary public package imports resolve (no path-copy substitute).
+    let _ = eliot_improvement::prepare_promotion_input;
+    let _ = eliot_improvement::promotion_evidence_digest;
+    assert_eq!(
+        eliot_improvement::MODULE_ID,
+        "meta.improvement.promotion_input"
+    );
     const SRC: &str = include_str!("../src/promotion_input.rs");
     assert!(SRC.contains("prepare_promotion_input"));
     assert!(SRC.contains("meta.improvement.promotion_input"));
