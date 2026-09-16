@@ -16,17 +16,25 @@ use eliot_process::{
     ExitStatus, ImageId, JobId, OperationId, PhysicalProcessBinding, ProcessEvidence,
     ProcessEvidenceSink, ProcessExecutionBinding, ProcessExecutionError, ProcessExecutionView,
     ProcessExecutor, ProcessHealth, ProcessHealthStatus, ProcessId, ProcessLaunchAdmission,
-    ProcessLifecycle, ProcessRequest, ProcessStartReceipt, ProcessState, ProcessStreamEvidence,
-    ProcessStreamKind, ProcessStreamPolicyBinding, ProcessStreamPrefixPreview,
-    ProcessStreamSinkLimits, ProcessTreeId, SessionId, StreamEvidenceGap, StreamPersistenceStatus,
-    StreamTransportStatus, SuspendedLaunchEvidence, SuspendedProcessIdentity, ValidatedDispatch,
+    ProcessLifecycle, ProcessRequest, ProcessStartReceipt, ProcessState,
+    ProcessStreamDigestAlgorithm, ProcessStreamEvidence, ProcessStreamKind,
+    ProcessStreamPolicyBinding, ProcessStreamPrefixPreview, ProcessStreamSinkAbortReason,
+    ProcessStreamSinkAbortRequest, ProcessStreamSinkAppend, ProcessStreamSinkAppendDisposition,
+    ProcessStreamSinkClient, ProcessStreamSinkError, ProcessStreamSinkFinalizeRequest,
+    ProcessStreamSinkLimits, ProcessStreamSinkOpenRequest, ProcessStreamSinkReadback,
+    ProcessStreamSinkSession, ProcessStreamSinkSessionId, ProcessStreamSinkSourceId,
+    ProcessStreamSinkState, ProcessStreamSinkTerminal, ProcessStreamSinkTerminalId, ProcessTreeId,
+    SessionId, StreamEvidenceGap, StreamPersistenceStatus, StreamTransportStatus,
+    SuspendedLaunchEvidence, SuspendedProcessIdentity, ValidatedDispatch,
 };
 use sha2::{Digest as _, Sha256};
 use std::collections::BTreeMap;
+use std::future::Future;
 use std::io::Read as _;
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
+use std::task::{Context, Poll, Waker};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -51,14 +59,18 @@ const STREAM_JOIN_POLL: Duration = Duration::from_millis(5);
 const SINK_BACKPRESSURE_IN_FLIGHT_BYTES: u64 = 64 * 1024;
 static JOB_SEQUENCE: AtomicU64 = AtomicU64::new(1);
 
-/// Builds the #267 sink-port limits P-04 consumes ONLY as a bound.
+/// Builds the #267 sink-port limits P-04 consumes as a bound and as the
+/// [`StreamSinkPump`] session contract.
 ///
-/// The port itself is never called here: no sink session is opened, appended,
-/// finalized, or read back on the drain path, so pipe draining can never block
-/// on persistence I/O. The validated `max_in_flight_bytes` ceiling alone
-/// parameterizes [`CaptureSession`]'s overflow latch, and persistence stays
-/// `SourceUnavailable` (no durable provider is wired in P-04) with no source
-/// locator, so no `raw:*` handle is ever minted.
+/// When a [`ProcessStreamSinkClient`] is attached, the drain path really calls
+/// the port: one session open before the first admitted byte, one append per
+/// [`STREAM_CHUNK_BYTES`] drain chunk, and exactly one finalize/abort. The
+/// validated `max_in_flight_bytes` ceiling still parameterizes
+/// [`CaptureSession`]'s overflow latch, and pipe draining never waits on
+/// persistence beyond the single bounded provider call per chunk (backpressure
+/// sheds the remainder with an explicit gap instead of blocking). With no sink
+/// attached, persistence stays `SourceUnavailable` with no source locator, so
+/// no `raw:*` handle is ever minted.
 fn sink_backpressure_limits() -> Result<ProcessStreamSinkLimits, ProcessExecutionError> {
     ProcessStreamSinkLimits::new(
         u64::try_from(STREAM_CHUNK_BYTES).map_err(|_| ProcessExecutionError::UnknownOutcome)?,
@@ -73,6 +85,588 @@ fn sink_backpressure_limits() -> Result<ProcessStreamSinkLimits, ProcessExecutio
         2_000,
     )
     .map_err(|_| ProcessExecutionError::UnknownOutcome)
+}
+
+/// Drives one already-resolved future to completion on the calling thread.
+///
+/// The drain/finalize path is synchronous, while the sink port is async; this
+/// spins the future with `yield_now` and performs no sleeping, no retry, and
+/// no I/O of its own. Provider-side time is bounded by the wait budget carried
+/// in each sink request, never by this driver.
+fn block_on_sink<F: Future>(future: F) -> F::Output {
+    let mut future = std::pin::pin!(future);
+    let waker = Waker::noop();
+    let mut context = Context::from_waker(waker);
+    loop {
+        match future.as_mut().poll(&mut context) {
+            Poll::Ready(output) => return output,
+            Poll::Pending => std::thread::yield_now(),
+        }
+    }
+}
+
+/// Exact stream label bound into sink session identities.
+fn sink_stream_label(kind: ProcessStreamKind) -> &'static str {
+    match kind {
+        ProcessStreamKind::Stdout => "stdout",
+        ProcessStreamKind::Stderr => "stderr",
+    }
+}
+
+/// Mints one deterministic sink identity for a bound stream.
+///
+/// The identity derives from the execution binding's operation id plus the
+/// stream label, so cleanup/reopen re-issues the identical value and
+/// reconciles the same session instead of minting a second receipt. When the
+/// composed value would exceed the port's reference ceiling, the operation
+/// fragment falls back to its SHA-256 (still deterministic, still unique).
+fn sink_identity(binding: &ProcessExecutionBinding, kind: ProcessStreamKind, role: &str) -> String {
+    let operation = binding.operation_id().as_str();
+    let stream = sink_stream_label(kind);
+    let full = format!("p04-sink:{operation}:{stream}:{role}");
+    if full.len() <= 256 {
+        return full;
+    }
+    format!(
+        "p04-sink:{}:{stream}:{role}",
+        short_digest(operation.as_bytes())
+    )
+}
+
+/// Typed outcome of offering one drain chunk to the sink.
+///
+/// Every shed variant keeps the pipe draining: the chunk (and, once shedding
+/// latches, every later chunk) is not admitted, the shed fact latches on the
+/// pump, and the drain thread moves on with no retry loop and no sleep.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum SinkAppendOutcome {
+    /// The provider admitted every byte offered.
+    Admitted,
+    /// The provider reported backpressure; the remainder sheds with an
+    /// explicit persistence gap.
+    ShedBackpressure,
+    /// The provider exceeded the typed wait budget; the remainder sheds.
+    ShedTimeout,
+    /// The provider reported cancellation; the remainder sheds.
+    ShedCancelled,
+    /// The provider already terminalized; the remainder sheds.
+    ShedTerminal(ProcessStreamSinkState),
+    /// The pump already sheds (or holds its terminal): the chunk was not
+    /// offered and no provider I/O happened.
+    ShedClosed,
+}
+
+/// Policy-bound streaming pump from the pipe drain into immutable evidence.
+///
+/// One pump owns exactly one stream of one operation. It opens its sink
+/// session before the first admitted byte (binding, kind, policy, limits, and
+/// deterministic identity), appends per drain chunk with the bounded wait
+/// budget from the session limits, and settles exactly one
+/// [`ProcessStreamSinkTerminal`] through finalize/abort (with a single
+/// readback reconcile when the provider and the pump disagree about who
+/// terminalized first). The terminal's evidence is the only durable record:
+/// its source is `Some` exactly on complete/partial terminals and `None` with
+/// an exact gap otherwise, and a policy-prohibited stream carries a withheld
+/// preview so raw pre-policy bytes never enter the durable record.
+///
+/// Shedding is one-way: the first backpressure, timeout, cancellation, or
+/// terminal disposition latches, and every later chunk is shed locally
+/// without provider I/O. A provider error instead latches the failure flag
+/// and fails the current offer, so the next chunk retries with a fresh
+/// bounded call. Either way the admitted stream stays a contiguous prefix,
+/// and the drain thread never blocks on persistence.
+#[allow(
+    clippy::struct_excessive_bools,
+    reason = "shedding, backpressure, provider failure, cancellation, and prohibition are independent latch observations"
+)]
+pub struct StreamSinkPump {
+    client: Arc<dyn ProcessStreamSinkClient>,
+    binding: ProcessExecutionBinding,
+    kind: ProcessStreamKind,
+    policy: ProcessStreamPolicyBinding,
+    limits: ProcessStreamSinkLimits,
+    session: Option<ProcessStreamSinkSession>,
+    next_sequence: u64,
+    next_offset: u64,
+    admitted_digest: Sha256,
+    offered_bytes: u64,
+    preview_prefix: Vec<u8>,
+    preview_ceiling: usize,
+    shedding: bool,
+    backpressured: bool,
+    provider_failed: bool,
+    cancelled: bool,
+    policy_prohibited: bool,
+    terminal: Option<ProcessStreamSinkTerminal>,
+}
+
+impl StreamSinkPump {
+    /// Binds one pump to its client and contract; no I/O happens here.
+    ///
+    /// [`Self::open`] must succeed before the first [`Self::append`].
+    #[must_use]
+    pub fn new(
+        client: Arc<dyn ProcessStreamSinkClient>,
+        binding: ProcessExecutionBinding,
+        kind: ProcessStreamKind,
+        policy: ProcessStreamPolicyBinding,
+        limits: ProcessStreamSinkLimits,
+    ) -> Self {
+        let preview_ceiling = usize::try_from(limits.max_preview_bytes())
+            .unwrap_or(usize::MAX)
+            .clamp(1, EVIDENCE_PREVIEW_CEILING);
+        Self {
+            client,
+            binding,
+            kind,
+            policy,
+            limits,
+            session: None,
+            next_sequence: 0,
+            next_offset: 0,
+            admitted_digest: Sha256::new(),
+            offered_bytes: 0,
+            preview_prefix: Vec::new(),
+            preview_ceiling,
+            shedding: false,
+            backpressured: false,
+            provider_failed: false,
+            cancelled: false,
+            policy_prohibited: false,
+            terminal: None,
+        }
+    }
+
+    /// Opens the sink session before the first admitted byte.
+    ///
+    /// Idempotent for the bound contract: reopening re-issues the identical
+    /// request (deterministic identity) and returns the same session instead
+    /// of minting a second one.
+    pub fn open(&mut self) -> Result<(), ProcessExecutionError> {
+        if self.session.is_some() {
+            return Ok(());
+        }
+        let request = ProcessStreamSinkOpenRequest::new(
+            ProcessStreamSinkSessionId::new(sink_identity(&self.binding, self.kind, "session"))
+                .map_err(|_| ProcessExecutionError::UnknownOutcome)?,
+            ProcessStreamSinkSourceId::new(sink_identity(&self.binding, self.kind, "source"))
+                .map_err(|_| ProcessExecutionError::UnknownOutcome)?,
+            ProcessStreamSinkTerminalId::new(sink_identity(&self.binding, self.kind, "terminal"))
+                .map_err(|_| ProcessExecutionError::UnknownOutcome)?,
+            self.binding.clone(),
+            self.kind,
+            self.policy.clone(),
+            self.limits,
+            ProcessStreamDigestAlgorithm::Sha256,
+            ProcessStreamDigestAlgorithm::Sha256,
+        )
+        .map_err(|_| ProcessExecutionError::UnknownOutcome)?;
+        let session = block_on_sink(self.client.open(request)).map_err(|error| {
+            if matches!(error, ProcessStreamSinkError::ProviderUnavailable) {
+                ProcessExecutionError::Unavailable("stream sink open unavailable".to_owned())
+            } else {
+                ProcessExecutionError::UnknownOutcome
+            }
+        })?;
+        self.session = Some(session);
+        Ok(())
+    }
+
+    /// Offers one drain chunk; never blocks the pipe drain.
+    ///
+    /// The chunk is split at the session chunk ceiling and each piece is
+    /// offered exactly once with the session append budget. The first shed
+    /// latches and every later call sheds locally with no provider I/O, so
+    /// this performs no retry loop and no sleep. An append before
+    /// [`Self::open`] fails closed.
+    pub fn append(&mut self, chunk: &[u8]) -> Result<SinkAppendOutcome, ProcessExecutionError> {
+        if chunk.is_empty() {
+            return Ok(SinkAppendOutcome::Admitted);
+        }
+        let Some(session) = self.session.clone() else {
+            return Err(ProcessExecutionError::UnknownOutcome);
+        };
+        // Every byte the drain hands over once the session is open, including
+        // bytes later shed by pressure or an already-settled terminal below:
+        // only a pre-open offer is rejected without custody.
+        self.offered_bytes = self.offered_bytes.saturating_add(chunk.len() as u64);
+        if let Some(terminal) = &self.terminal {
+            return Ok(SinkAppendOutcome::ShedTerminal(terminal.state()));
+        }
+        if self.shedding {
+            return Ok(SinkAppendOutcome::ShedClosed);
+        }
+        let max_chunk = usize::try_from(self.limits.max_chunk_bytes()).unwrap_or(usize::MAX);
+        if max_chunk == 0 {
+            return Err(ProcessExecutionError::UnknownOutcome);
+        }
+        let wait_budget = self.limits.max_append_wait_ms();
+        let mut outcome = SinkAppendOutcome::Admitted;
+        for piece in chunk.chunks(max_chunk) {
+            let piece_outcome = self.append_piece(&session, piece, wait_budget)?;
+            match piece_outcome {
+                SinkAppendOutcome::Admitted => {}
+                shed => {
+                    outcome = shed;
+                    self.shedding = true;
+                    break;
+                }
+            }
+        }
+        Ok(outcome)
+    }
+
+    /// Finalizes an EOF drain to exactly one terminal.
+    ///
+    /// A second call returns the same terminal without provider I/O. When the
+    /// provider disagrees (identity conflict or transient unavailability),
+    /// one readback reconcile adopts the provider's terminal instead of
+    /// minting a second receipt.
+    pub fn finalize_eof(&mut self) -> Result<ProcessStreamSinkTerminal, ProcessExecutionError> {
+        if let Some(terminal) = &self.terminal {
+            return Ok(terminal.clone());
+        }
+        if self.policy_prohibited {
+            return Err(ProcessExecutionError::UnknownOutcome);
+        }
+        let Some(session) = self.session.clone() else {
+            return Err(ProcessExecutionError::UnknownOutcome);
+        };
+        let preview = ProcessStreamPrefixPreview::from_transport_prefix(
+            self.preview_prefix.clone(),
+            self.admitted_bytes(),
+        )
+        .map_err(|_| ProcessExecutionError::UnknownOutcome)?;
+        let request = ProcessStreamSinkFinalizeRequest::new(
+            session.terminal_id().clone(),
+            self.next_sequence,
+            self.next_offset,
+            self.limits.max_finalize_wait_ms(),
+            StreamTransportStatus::Complete,
+            self.admitted_sha256(),
+            self.admitted_bytes(),
+            preview,
+            None,
+            self.finalize_gaps(),
+        )
+        .map_err(|_| ProcessExecutionError::UnknownOutcome)?;
+        match block_on_sink(self.client.finalize(session.clone(), request)) {
+            Ok(terminal) => self.adopt_terminal(terminal),
+            Err(
+                error @ (ProcessStreamSinkError::ProviderUnavailable
+                | ProcessStreamSinkError::TerminalIdentityConflict
+                | ProcessStreamSinkError::Terminal),
+            ) => {
+                let _ = error;
+                self.adopt_readback_terminal(&session)
+            }
+            Err(_) => Err(ProcessExecutionError::UnknownOutcome),
+        }
+    }
+
+    /// Aborts a cancel-before-EOF drain to exactly one terminal.
+    ///
+    /// The admitted prefix stays claimed (digest/count over admitted bytes)
+    /// with the exact cancellation gap; the source stays `None`.
+    pub fn abort_cancelled(&mut self) -> Result<ProcessStreamSinkTerminal, ProcessExecutionError> {
+        self.abort_with(
+            ProcessStreamSinkAbortReason::Cancellation,
+            StreamTransportStatus::CancelledBeforeEof,
+            false,
+        )
+    }
+
+    /// Aborts a policy-prohibited stream to exactly one terminal.
+    ///
+    /// The admitted identity (digest/count) is preserved for custody while the
+    /// preview is withheld, so raw pre-policy bytes never enter the durable
+    /// record; the source stays `None` with the exact prohibition gap.
+    pub fn abort_policy_prohibited(
+        &mut self,
+    ) -> Result<ProcessStreamSinkTerminal, ProcessExecutionError> {
+        self.policy_prohibited = true;
+        self.abort_with(
+            ProcessStreamSinkAbortReason::PolicyProhibition,
+            StreamTransportStatus::Complete,
+            true,
+        )
+    }
+
+    /// Aborts a read-failed drain to exactly one terminal.
+    ///
+    /// The admitted prefix stays claimed with the exact transport-failure
+    /// gap; the source stays `None`.
+    pub fn abort_transport_failure(
+        &mut self,
+    ) -> Result<ProcessStreamSinkTerminal, ProcessExecutionError> {
+        self.abort_with(
+            ProcessStreamSinkAbortReason::TransportFailure,
+            StreamTransportStatus::ReadFailed,
+            false,
+        )
+    }
+
+    /// Reconciles the session identity without minting a receipt.
+    ///
+    /// Re-issues the identical open (deterministic identity, so the provider
+    /// returns the same session) and reads back whatever the provider holds:
+    /// the one terminal when finalization already landed, the open session
+    /// view otherwise. Cleanup and reopen paths use this instead of a second
+    /// finalize/abort.
+    pub fn reopen(&mut self) -> Result<ProcessStreamSinkReadback, ProcessExecutionError> {
+        self.open()?;
+        let Some(session) = self.session.clone() else {
+            return Err(ProcessExecutionError::UnknownOutcome);
+        };
+        block_on_sink(self.client.readback(session))
+            .map_err(|_| ProcessExecutionError::UnknownOutcome)
+    }
+
+    /// Returns the admitted-byte count covered by the terminal (or so far).
+    #[must_use]
+    pub const fn admitted_bytes(&self) -> u64 {
+        self.next_offset
+    }
+
+    /// Returns the incremental SHA-256 over every admitted byte.
+    #[must_use]
+    pub fn admitted_sha256(&self) -> String {
+        format!("{:x}", self.admitted_digest.clone().finalize())
+    }
+
+    /// Returns every byte offered, including bytes shed after pressure.
+    #[must_use]
+    pub const fn offered_bytes(&self) -> u64 {
+        self.offered_bytes
+    }
+
+    /// Returns whether the session is open (before any terminal).
+    #[must_use]
+    pub const fn is_open(&self) -> bool {
+        self.session.is_some()
+    }
+
+    /// Returns whether persistence pressure shed the admitted prefix tail.
+    #[must_use]
+    pub const fn backpressure_observed(&self) -> bool {
+        self.backpressured
+    }
+
+    /// Returns whether the provider failed on the streaming path.
+    #[must_use]
+    pub const fn provider_failed(&self) -> bool {
+        self.provider_failed
+    }
+
+    /// Returns the open session, when one exists.
+    #[must_use]
+    pub const fn session(&self) -> Option<&ProcessStreamSinkSession> {
+        self.session.as_ref()
+    }
+
+    /// Returns the one terminal, when finalization already landed.
+    #[must_use]
+    pub const fn terminal(&self) -> Option<&ProcessStreamSinkTerminal> {
+        self.terminal.as_ref()
+    }
+
+    /// Returns the terminal evidence, when finalization already landed.
+    #[must_use]
+    pub fn evidence(&self) -> Option<ProcessStreamEvidence> {
+        self.terminal
+            .as_ref()
+            .map(|terminal| terminal.evidence().clone())
+    }
+
+    fn append_piece(
+        &mut self,
+        session: &ProcessStreamSinkSession,
+        piece: &[u8],
+        wait_budget: u64,
+    ) -> Result<SinkAppendOutcome, ProcessExecutionError> {
+        let next_sequence = self
+            .next_sequence
+            .checked_add(1)
+            .ok_or(ProcessExecutionError::UnknownOutcome)?;
+        let next_offset = self
+            .next_offset
+            .checked_add(piece.len() as u64)
+            .ok_or(ProcessExecutionError::UnknownOutcome)?;
+        let request = ProcessStreamSinkAppend::from_bytes(
+            self.next_sequence,
+            self.next_offset,
+            piece.to_vec(),
+            wait_budget,
+        );
+        match block_on_sink(self.client.append(session.clone(), request)) {
+            Ok(
+                ProcessStreamSinkAppendDisposition::Accepted { .. }
+                | ProcessStreamSinkAppendDisposition::Replayed { .. },
+            ) => {
+                // Replayed is idempotent acknowledgement of an already-known
+                // sequence: counters advance exactly once per piece because a
+                // replayed piece is never re-offered by this pump.
+                self.admitted_digest.update(piece);
+                self.next_sequence = next_sequence;
+                self.next_offset = next_offset;
+                let remaining = self
+                    .preview_ceiling
+                    .saturating_sub(self.preview_prefix.len());
+                self.preview_prefix
+                    .extend_from_slice(&piece[..piece.len().min(remaining)]);
+                Ok(SinkAppendOutcome::Admitted)
+            }
+            Ok(ProcessStreamSinkAppendDisposition::Backpressured { .. }) => {
+                self.backpressured = true;
+                Ok(SinkAppendOutcome::ShedBackpressure)
+            }
+            Ok(ProcessStreamSinkAppendDisposition::DeadlineExceeded) => {
+                self.backpressured = true;
+                Ok(SinkAppendOutcome::ShedTimeout)
+            }
+            Ok(ProcessStreamSinkAppendDisposition::Cancelled) => {
+                self.cancelled = true;
+                Ok(SinkAppendOutcome::ShedCancelled)
+            }
+            Ok(ProcessStreamSinkAppendDisposition::Terminal { state, .. }) => {
+                Ok(SinkAppendOutcome::ShedTerminal(state))
+            }
+            Err(_) => {
+                self.provider_failed = true;
+                Err(ProcessExecutionError::UnknownOutcome)
+            }
+        }
+    }
+
+    fn finalize_gaps(&self) -> Vec<StreamEvidenceGap> {
+        if self.backpressured {
+            vec![
+                StreamEvidenceGap::PersistenceUnavailable,
+                StreamEvidenceGap::PersistenceBackpressure,
+            ]
+        } else if self.provider_failed {
+            vec![StreamEvidenceGap::PersistenceUnavailable]
+        } else {
+            Vec::new()
+        }
+    }
+
+    fn abort_with(
+        &mut self,
+        reason: ProcessStreamSinkAbortReason,
+        transport: StreamTransportStatus,
+        withheld: bool,
+    ) -> Result<ProcessStreamSinkTerminal, ProcessExecutionError> {
+        if let Some(terminal) = &self.terminal {
+            return Ok(terminal.clone());
+        }
+        let Some(session) = self.session.clone() else {
+            return Err(ProcessExecutionError::UnknownOutcome);
+        };
+        let preview = if withheld {
+            ProcessStreamPrefixPreview::withheld_by_policy()
+        } else {
+            ProcessStreamPrefixPreview::from_transport_prefix(
+                self.preview_prefix.clone(),
+                self.admitted_bytes(),
+            )
+            .map_err(|_| ProcessExecutionError::UnknownOutcome)?
+        };
+        let gaps = match reason {
+            ProcessStreamSinkAbortReason::Cancellation
+            | ProcessStreamSinkAbortReason::CallerShutdown => vec![
+                StreamEvidenceGap::PersistenceUnavailable,
+                StreamEvidenceGap::CancelledBeforeEof,
+            ],
+            ProcessStreamSinkAbortReason::PolicyProhibition
+            | ProcessStreamSinkAbortReason::RedactionFailure => {
+                vec![StreamEvidenceGap::PolicyProhibited]
+            }
+            ProcessStreamSinkAbortReason::TransportFailure => vec![
+                StreamEvidenceGap::PersistenceUnavailable,
+                StreamEvidenceGap::TransportReadFailed,
+            ],
+        };
+        let wait_budget = self.limits.max_abort_wait_ms();
+        let request = ProcessStreamSinkAbortRequest::new(
+            session.terminal_id().clone(),
+            reason,
+            self.next_sequence,
+            self.next_offset,
+            wait_budget,
+            transport,
+            self.admitted_sha256(),
+            self.admitted_bytes(),
+            preview,
+            None,
+            gaps,
+        )
+        .map_err(|_| ProcessExecutionError::UnknownOutcome)?;
+        match block_on_sink(self.client.abort(session.clone(), request)) {
+            Ok(terminal) => self.adopt_terminal(terminal),
+            Err(
+                error @ (ProcessStreamSinkError::ProviderUnavailable
+                | ProcessStreamSinkError::TerminalIdentityConflict
+                | ProcessStreamSinkError::Terminal),
+            ) => {
+                let _ = error;
+                self.adopt_readback_terminal(&session)
+            }
+            Err(_) => Err(ProcessExecutionError::UnknownOutcome),
+        }
+    }
+
+    fn adopt_terminal(
+        &mut self,
+        terminal: ProcessStreamSinkTerminal,
+    ) -> Result<ProcessStreamSinkTerminal, ProcessExecutionError> {
+        enforce_sink_terminal(self.session.as_ref(), &terminal)?;
+        self.terminal = Some(terminal.clone());
+        Ok(terminal)
+    }
+
+    fn adopt_readback_terminal(
+        &mut self,
+        session: &ProcessStreamSinkSession,
+    ) -> Result<ProcessStreamSinkTerminal, ProcessExecutionError> {
+        match block_on_sink(self.client.readback(session.clone())) {
+            Ok(ProcessStreamSinkReadback::Terminal { terminal }) => self.adopt_terminal(terminal),
+            Ok(_) | Err(_) => Err(ProcessExecutionError::UnknownOutcome),
+        }
+    }
+}
+
+/// Enforces the terminal/evidence contract on one provider result.
+///
+/// The terminal must validate, belong to the open session fence, and carry a
+/// source exactly on complete/partial terminals (`Some`) and never otherwise
+/// (`None` with an exact gap). Anything else fails closed: the provider result
+/// is dropped and no evidence is minted from it.
+fn enforce_sink_terminal(
+    session: Option<&ProcessStreamSinkSession>,
+    terminal: &ProcessStreamSinkTerminal,
+) -> Result<(), ProcessExecutionError> {
+    let Some(session) = session else {
+        return Err(ProcessExecutionError::UnknownOutcome);
+    };
+    terminal
+        .validate()
+        .map_err(|_| ProcessExecutionError::UnknownOutcome)?;
+    if terminal.session_id() != session.session_id()
+        || terminal.source_id() != session.source_id()
+        || terminal.terminal_id() != session.terminal_id()
+        || terminal.open_request_sha256() != session.open_request_sha256()
+    {
+        return Err(ProcessExecutionError::UnknownOutcome);
+    }
+    let durable = matches!(
+        terminal.state(),
+        ProcessStreamSinkState::CompleteSource | ProcessStreamSinkState::PartialSource
+    );
+    if durable != terminal.evidence().source().is_some() {
+        return Err(ProcessExecutionError::UnknownOutcome);
+    }
+    Ok(())
 }
 
 /// P-07's injected process-authority seam.
@@ -431,10 +1025,7 @@ impl CaptureSession {
     pub const fn capture_available(&self) -> bool {
         self.requested
             && self.draining
-            && !matches!(
-                self.disposition,
-                CaptureDisposition::CaptureUnavailable
-            )
+            && !matches!(self.disposition, CaptureDisposition::CaptureUnavailable)
     }
 
     fn snapshot(&self) -> CapturedStream {
@@ -527,6 +1118,11 @@ struct Operation {
     stderr: Arc<Mutex<CaptureSession>>,
     stdout_thread: Option<JoinHandle<()>>,
     stderr_thread: Option<JoinHandle<()>>,
+    /// Policy-bound sink pumps owned by the drain threads (`None` when no
+    /// sink client is attached or the session open failed and the legacy
+    /// `SourceUnavailable` path applies).
+    stdout_pump: Option<Arc<Mutex<StreamSinkPump>>>,
+    stderr_pump: Option<Arc<Mutex<StreamSinkPump>>>,
     deadline: Instant,
     deadline_watcher: Option<DeadlineWatcher>,
     /// Operation-bound watcher owner identity minted when the deadline
@@ -792,6 +1388,7 @@ pub struct ExecutorHealthSummary {
 pub struct WindowsProcessExecutor {
     authority: Arc<dyn DispatchValidationPort>,
     launch_admission: Option<Arc<dyn ProcessLaunchAdmission>>,
+    stream_sink: Option<Arc<dyn ProcessStreamSinkClient>>,
     operations: Mutex<BTreeMap<OperationId, Arc<Mutex<Operation>>>>,
     reservations: Mutex<std::collections::BTreeSet<OperationId>>,
     capture_limit: usize,
@@ -817,6 +1414,30 @@ impl WindowsProcessExecutor {
         Self {
             authority,
             launch_admission: None,
+            stream_sink: None,
+            operations: Mutex::new(BTreeMap::new()),
+            reservations: Mutex::new(std::collections::BTreeSet::new()),
+            capture_limit: DEFAULT_CAPTURE_LIMIT,
+        }
+    }
+
+    /// Creates one executor that streams policy-bound process output into
+    /// immutable evidence through the #267 sink port.
+    ///
+    /// The drain path opens one sink session per requested stream before the
+    /// first admitted byte, appends per chunk with typed backpressure that
+    /// never blocks the pipe drain, and settles exactly one terminal per
+    /// stream at finalize. With no sink attached ([`Self::new`]), persistence
+    /// stays `SourceUnavailable` as before.
+    #[must_use]
+    pub fn new_with_stream_sink(
+        authority: Arc<dyn DispatchValidationPort>,
+        stream_sink: Arc<dyn ProcessStreamSinkClient>,
+    ) -> Self {
+        Self {
+            authority,
+            launch_admission: None,
+            stream_sink: Some(stream_sink),
             operations: Mutex::new(BTreeMap::new()),
             reservations: Mutex::new(std::collections::BTreeSet::new()),
             capture_limit: DEFAULT_CAPTURE_LIMIT,
@@ -832,6 +1453,7 @@ impl WindowsProcessExecutor {
         Self {
             authority,
             launch_admission: Some(launch_admission),
+            stream_sink: None,
             operations: Mutex::new(BTreeMap::new()),
             reservations: Mutex::new(std::collections::BTreeSet::new()),
             capture_limit: DEFAULT_CAPTURE_LIMIT,
@@ -847,6 +1469,7 @@ impl WindowsProcessExecutor {
         Self {
             authority,
             launch_admission: None,
+            stream_sink: None,
             operations: Mutex::new(BTreeMap::new()),
             reservations: Mutex::new(std::collections::BTreeSet::new()),
             capture_limit: capture_limit.max(1),
@@ -1167,6 +1790,16 @@ impl WindowsProcessExecutor {
                     cleanup_unknown = true;
                     continue;
                 }
+                // Cleanup/reopen reconciles the sink session identity without
+                // minting a second receipt: a best-effort readback surfaces an
+                // out-of-band terminal under the same session, and never
+                // finalizes. Errors stay ignored; cleanup never fails on the
+                // sink.
+                let pumps = [guard.stdout_pump.clone(), guard.stderr_pump.clone()];
+                drop(guard);
+                for pump in pumps.into_iter().flatten() {
+                    settle_sink_pump(&pump);
+                }
                 ids.push(id.clone());
             }
             // Remove every independently cleanable terminal operation even
@@ -1228,6 +1861,17 @@ impl WindowsProcessExecutor {
                     quarantine_operation(&mut guard);
                     retain_cleanup_owners = true;
                 }
+                // Same cleanup/reopen reconcile as `cleanup_finished`: a
+                // best-effort readback under the same session identity, never
+                // a second terminal mint.
+                let pumps = [guard.stdout_pump.clone(), guard.stderr_pump.clone()];
+                drop(guard);
+                for pump in pumps.into_iter().flatten() {
+                    settle_sink_pump(&pump);
+                }
+                let mut guard = operation
+                    .lock()
+                    .map_err(|_| operation_unavailable(id, "operation lock"))?;
                 // Shutdown containment attributes every watcher join to its
                 // operation-bound owner (issue #83: restart/shutdown can
                 // identify and contain every watcher/Job owner): the owner
@@ -1450,11 +2094,31 @@ impl ProcessExecutor for WindowsProcessExecutor {
             };
             #[cfg(not(test))]
             let stdout_injection: Option<CaptureSpawnInjection> = None;
+            // Issue-267 sink sessions open here, after resume and before the
+            // first admitted byte: the binding, kind, policy, limits, and
+            // deterministic identity travel in the open request, and the drain
+            // threads below append per chunk. An open failure keeps `None` so
+            // the legacy `SourceUnavailable` path applies (provider failure
+            // never claims a complete source).
+            let stream_binding = state.view().binding().clone();
+            let stdout_pump = open_stream_pump(
+                self.stream_sink.as_ref(),
+                &stream_binding,
+                ProcessStreamKind::Stdout,
+                stdout_requested,
+            );
+            let stderr_pump = open_stream_pump(
+                self.stream_sink.as_ref(),
+                &stream_binding,
+                ProcessStreamKind::Stderr,
+                stderr_requested,
+            );
             let stdout_thread = match spawn_capture(
                 "stdout",
                 running.take_stdout(),
                 Arc::clone(&stdout),
                 stdout_injection,
+                stdout_pump.clone(),
             ) {
                 Ok(thread) => thread,
                 Err(error) => {
@@ -1486,6 +2150,7 @@ impl ProcessExecutor for WindowsProcessExecutor {
                     running.take_stderr(),
                     Arc::clone(&stderr),
                     stderr_injection,
+                    stderr_pump.clone(),
                 ) {
                     Ok(thread) => thread,
                     Err(error) => {
@@ -1513,6 +2178,8 @@ impl ProcessExecutor for WindowsProcessExecutor {
                 stderr,
                 stdout_thread,
                 stderr_thread,
+                stdout_pump,
+                stderr_pump,
                 deadline,
                 deadline_watcher: None,
                 deadline_watcher_owner: None,
@@ -1937,22 +2604,30 @@ impl ProcessExecutor for WindowsProcessExecutor {
             }
             let view = guard.state.view();
             let binding = view.binding().clone();
-            let stdout_typed =
-                match typed_stream_evidence(&guard.stdout, ProcessStreamKind::Stdout, &binding) {
-                    Ok(stream) => stream,
-                    Err(error) => {
-                        quarantine_operation(&mut guard);
-                        return Err(error);
-                    }
-                };
-            let stderr_typed =
-                match typed_stream_evidence(&guard.stderr, ProcessStreamKind::Stderr, &binding) {
-                    Ok(stream) => stream,
-                    Err(error) => {
-                        quarantine_operation(&mut guard);
-                        return Err(error);
-                    }
-                };
+            let stdout_typed = match typed_stream_evidence(
+                &guard.stdout,
+                guard.stdout_pump.as_ref(),
+                ProcessStreamKind::Stdout,
+                &binding,
+            ) {
+                Ok(stream) => stream,
+                Err(error) => {
+                    quarantine_operation(&mut guard);
+                    return Err(error);
+                }
+            };
+            let stderr_typed = match typed_stream_evidence(
+                &guard.stderr,
+                guard.stderr_pump.as_ref(),
+                ProcessStreamKind::Stderr,
+                &binding,
+            ) {
+                Ok(stream) => stream,
+                Err(error) => {
+                    quarantine_operation(&mut guard);
+                    return Err(error);
+                }
+            };
             let Ok(evidence) = ProcessEvidence::new_typed(
                 view,
                 stdout_typed,
@@ -2278,8 +2953,7 @@ fn quarantined_record(
     // publication step instead of a capture/watcher owner.
     let evidence_gap = if let Some(publish_gap) = operation.start_publish_gap {
         publish_gap
-    } else if operation.deadline_watcher_owner.is_none()
-        && operation.watcher_fail_closed_contained
+    } else if operation.deadline_watcher_owner.is_none() && operation.watcher_fail_closed_contained
     {
         WATCHER_EVIDENCE_GAP
     } else if operation.capture_failures.is_empty() {
@@ -2713,9 +3387,11 @@ fn join_capture_thread(
 
 #[cfg(windows)]
 fn session_status(session: &Arc<Mutex<CaptureSession>>) -> CaptureDisposition {
-    session.lock().map_or(CaptureDisposition::UnknownOutcome, |guard| {
-        guard.disposition()
-    })
+    session
+        .lock()
+        .map_or(CaptureDisposition::UnknownOutcome, |guard| {
+            guard.disposition()
+        })
 }
 
 /// Lands `CancelledBeforeEof` on both stream sessions of one cancelled
@@ -2750,12 +3426,53 @@ fn session_requested(session: &Arc<Mutex<CaptureSession>>) -> bool {
     session.lock().is_ok_and(|guard| guard.requested())
 }
 
+/// Opens one policy-bound sink session for a requested stream.
+///
+/// Returns `None` when no sink client is attached, the stream was not
+/// requested, or the open itself failed: every `None` keeps the legacy
+/// `SourceUnavailable` evidence path, so a provider failure never claims a
+/// complete source. A successful open happens-before the drain thread's first
+/// admitted byte at the call site.
+#[cfg(windows)]
+fn open_stream_pump(
+    client: Option<&Arc<dyn ProcessStreamSinkClient>>,
+    binding: &ProcessExecutionBinding,
+    kind: ProcessStreamKind,
+    requested: bool,
+) -> Option<Arc<Mutex<StreamSinkPump>>> {
+    if !requested {
+        return None;
+    }
+    let client = client.map(Arc::clone)?;
+    let policy = p04_stream_policy().ok()?;
+    let limits = sink_backpressure_limits().ok()?;
+    let mut pump = StreamSinkPump::new(client, binding.clone(), kind, policy, limits);
+    pump.open().ok()?;
+    Some(Arc::new(Mutex::new(pump)))
+}
+
+/// Best-effort sink settle for a cleanup/reopen pass.
+///
+/// Reads back the provider-held session identity without finalizing, so an
+/// out-of-band terminal surfaces under the same session instead of minting a
+/// second receipt. Errors are ignored: cleanup never fails because the sink
+/// is unreachable, and exactly-one-terminal stays owned by finalize/abort.
+#[cfg(windows)]
+fn settle_sink_pump(pump: &Arc<Mutex<StreamSinkPump>>) {
+    if let Ok(mut pump) = pump.lock()
+        && pump.terminal().is_none()
+    {
+        let _ = pump.reopen();
+    }
+}
+
 #[cfg(windows)]
 fn spawn_capture(
     stream: &'static str,
     file: Option<std::fs::File>,
     session: Arc<Mutex<CaptureSession>>,
     injection: Option<CaptureSpawnInjection>,
+    sink_pump: Option<Arc<Mutex<StreamSinkPump>>>,
 ) -> Result<Option<JoinHandle<()>>, ProcessExecutionError> {
     // Issue-84 state machine note (§1): stream-capture ownership is installed
     // AFTER resume because the read handles live on `RunningJobChild` and can
@@ -2817,6 +3534,19 @@ fn spawn_capture(
                         // retained. A lock loss here ends the drain without
                         // landing a disposition; the join path fences unknown.
                         guard.observe(&buffer[..read]);
+                        drop(guard);
+                        // Policy-bound streaming: offer the same chunk to the
+                        // sink exactly once with the session wait budget. The
+                        // pump sheds (never retries, never sleeps) on
+                        // backpressure, timeout, or provider failure, and a
+                        // lost pump lock is skipped the same way — the pipe
+                        // keeps draining in every case, so persistence can
+                        // never block capture.
+                        if let Some(pump) = &sink_pump
+                            && let Ok(mut pump) = pump.lock()
+                        {
+                            let _ = pump.append(&buffer[..read]);
+                        }
                     }
                     Err(_) => {
                         read_failed = true;
@@ -2896,16 +3626,21 @@ fn session_transport(disposition: CaptureDisposition) -> StreamTransportStatus {
 #[cfg(windows)]
 fn typed_stream_evidence(
     session: &Arc<Mutex<CaptureSession>>,
+    sink_pump: Option<&Arc<Mutex<StreamSinkPump>>>,
     kind: ProcessStreamKind,
     binding: &ProcessExecutionBinding,
 ) -> Result<Option<ProcessStreamEvidence>, ProcessExecutionError> {
-    // One owned session resolves to exactly one typed evidence: the full
-    // transport digest/count accumulated from the bytes actually observed,
-    // the admissible-source identity (SHA-256/count over that same observed
-    // stream), a bounded preview with its exact omission range, and the
-    // typed durable-source disposition. Only an EOF session resolves to
-    // complete transport; every other disposition keeps its honest typed
-    // state instead of fabricating complete proof.
+    // One owned session resolves to exactly one typed evidence. With a sink
+    // pump attached, EOF finalizes and cancel-before-EOF aborts through the
+    // #267 port to exactly one terminal, and the terminal's evidence is the
+    // durable record: its source is `Some` exactly on complete/partial
+    // terminals and `None` with an exact gap otherwise (a zero-byte EOF still
+    // publishes a real verifiable object). A provider failure on the sink
+    // path falls through to the honest-gap construction below — never a
+    // complete source. Without a pump, an EOF session resolves exactly as
+    // before (bounded preview, `SourceUnavailable`, no source locator, no
+    // `raw:*` handle); every other disposition keeps its honest typed state
+    // instead of fabricating complete proof.
     let (retained, total_bytes, observed_sha256, disposition, backpressured) = {
         let guard = session
             .lock()
@@ -2919,11 +3654,8 @@ fn typed_stream_evidence(
             // unavailable with exact zero-byte custody and no source
             // locator.
             let policy = p04_stream_policy()?;
-            let preview = ProcessStreamPrefixPreview::from_transport_prefix(
-                Vec::new(),
-                0,
-            )
-            .map_err(|_| ProcessExecutionError::UnknownOutcome)?;
+            let preview = ProcessStreamPrefixPreview::from_transport_prefix(Vec::new(), 0)
+                .map_err(|_| ProcessExecutionError::UnknownOutcome)?;
             let evidence = ProcessStreamEvidence::new_raw(
                 binding.clone(),
                 kind,
@@ -2941,9 +3673,8 @@ fn typed_stream_evidence(
         }
         let disposition = guard.disposition();
         match disposition {
-            CaptureDisposition::Eof => {}
+            CaptureDisposition::Eof | CaptureDisposition::CancelledBeforeEof => {}
             CaptureDisposition::ReadFailed
-            | CaptureDisposition::CancelledBeforeEof
             | CaptureDisposition::CaptureUnavailable
             | CaptureDisposition::UnknownOutcome
             | CaptureDisposition::Draining => {
@@ -2959,6 +3690,26 @@ fn typed_stream_evidence(
             guard.backpressure_observed(),
         )
     };
+    if let Some(pump) = sink_pump {
+        match sink_terminal_evidence(pump, disposition) {
+            Ok(evidence) => return Ok(Some(evidence)),
+            Err(_) => {
+                if disposition == CaptureDisposition::CancelledBeforeEof {
+                    return legacy_cancelled_evidence(
+                        binding,
+                        kind,
+                        retained,
+                        total_bytes,
+                        observed_sha256,
+                        backpressured,
+                    )
+                    .map(Some);
+                }
+            }
+        }
+    } else if disposition == CaptureDisposition::CancelledBeforeEof {
+        return Err(ProcessExecutionError::UnknownOutcome);
+    }
     let mut prefix = retained;
     if prefix.len() > EVIDENCE_PREVIEW_CEILING {
         prefix.truncate(EVIDENCE_PREVIEW_CEILING);
@@ -2967,10 +3718,12 @@ fn typed_stream_evidence(
     let transport = session_transport(disposition);
     let preview = ProcessStreamPrefixPreview::from_transport_prefix(prefix, total_bytes)
         .map_err(|_| ProcessExecutionError::UnknownOutcome)?;
-    // No durable provider is wired in P-04; the store backend is T3-owned, so
-    // persistence stays `SourceUnavailable` with no source locator (no `raw:*`
-    // handle is ever minted). When the session latched sink-pressure overflow
-    // while draining, the exact `PersistenceBackpressure` gap travels alongside
+    // Legacy path (no sink pump attached, or the pump's provider failed on an
+    // EOF drain): no durable provider is wired in P-04 and the store backend
+    // is T3-owned, so persistence stays `SourceUnavailable` with no source
+    // locator (no `raw:*` handle is ever minted). When the session latched
+    // sink-pressure overflow while draining, the exact
+    // `PersistenceBackpressure` gap travels alongside
     // `PersistenceUnavailable`: pressure was shed and the pipe kept draining
     // with exact digest/count, instead of blocking capture on persistence I/O.
     // The complete evidence still resolves to bytes whose digest/count match
@@ -2996,6 +3749,79 @@ fn typed_stream_evidence(
     )
     .map_err(|_| ProcessExecutionError::UnknownOutcome)?;
     Ok(Some(evidence))
+}
+
+/// Settles one owned session through its sink pump to the terminal evidence.
+///
+/// EOF finalizes and cancel-before-EOF aborts; every other disposition fails
+/// closed. The pump enforces the terminal/evidence contract (source exactly
+/// on complete/partial terminals, never otherwise) before returning.
+#[cfg(windows)]
+fn sink_terminal_evidence(
+    pump: &Arc<Mutex<StreamSinkPump>>,
+    disposition: CaptureDisposition,
+) -> Result<ProcessStreamEvidence, ProcessExecutionError> {
+    let mut pump = pump
+        .lock()
+        .map_err(|_| ProcessExecutionError::UnknownOutcome)?;
+    let terminal = match disposition {
+        CaptureDisposition::Eof => pump.finalize_eof()?,
+        CaptureDisposition::CancelledBeforeEof => pump.abort_cancelled()?,
+        CaptureDisposition::ReadFailed
+        | CaptureDisposition::CaptureUnavailable
+        | CaptureDisposition::UnknownOutcome
+        | CaptureDisposition::Draining => {
+            return Err(ProcessExecutionError::UnknownOutcome);
+        }
+    };
+    Ok(terminal.evidence().clone())
+}
+
+/// Builds the provider-failure fallback for a cancelled drain.
+///
+/// The sink pump was attached but could not settle a terminal, so the locally
+/// observed admitted prefix stays claimed with the exact cancellation gap and
+/// `SourceUnavailable` persistence: never a complete source, never a source
+/// locator. Gaps stay canonically sorted (`PersistenceUnavailable`,
+/// `PersistenceBackpressure`, `CancelledBeforeEof`).
+#[cfg(windows)]
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the fallback carries the exact observed custody plus the typed gap set"
+)]
+fn legacy_cancelled_evidence(
+    binding: &ProcessExecutionBinding,
+    kind: ProcessStreamKind,
+    retained: Vec<u8>,
+    total_bytes: u64,
+    observed_sha256: String,
+    backpressured: bool,
+) -> Result<ProcessStreamEvidence, ProcessExecutionError> {
+    let mut prefix = retained;
+    if prefix.len() > EVIDENCE_PREVIEW_CEILING {
+        prefix.truncate(EVIDENCE_PREVIEW_CEILING);
+    }
+    let policy = p04_stream_policy()?;
+    let preview = ProcessStreamPrefixPreview::from_transport_prefix(prefix, total_bytes)
+        .map_err(|_| ProcessExecutionError::UnknownOutcome)?;
+    let mut gaps = vec![StreamEvidenceGap::PersistenceUnavailable];
+    if backpressured {
+        gaps.push(StreamEvidenceGap::PersistenceBackpressure);
+    }
+    gaps.push(StreamEvidenceGap::CancelledBeforeEof);
+    ProcessStreamEvidence::new_raw(
+        binding.clone(),
+        kind,
+        policy,
+        StreamTransportStatus::CancelledBeforeEof,
+        StreamPersistenceStatus::SourceUnavailable,
+        observed_sha256,
+        total_bytes,
+        preview,
+        None,
+        gaps,
+    )
+    .map_err(|_| ProcessExecutionError::UnknownOutcome)
 }
 
 fn retention(limit: u64, ceiling: usize) -> usize {
@@ -4785,8 +5611,7 @@ mod tests {
                     // join window) is an honest typed outcome for B itself,
                     // but B must still be retained — never promoted — and A
                     // must still read unknown.
-                    let view_b =
-                        block_on(executor.inspect(OperationId::new("op-82-b-healthy")?))?;
+                    let view_b = block_on(executor.inspect(OperationId::new("op-82-b-healthy")?))?;
                     assert_eq!(view_b.lifecycle(), ProcessLifecycle::UnknownOutcome);
                 }
                 Err(other) => {
@@ -4797,8 +5622,7 @@ mod tests {
                 }
             }
             // A is still fenced as unknown: the failure stayed scoped to A.
-            let view_a_again =
-                block_on(executor.inspect(OperationId::new("op-82-a-quarantine")?))?;
+            let view_a_again = block_on(executor.inspect(OperationId::new("op-82-a-quarantine")?))?;
             assert_eq!(view_a_again.lifecycle(), ProcessLifecycle::UnknownOutcome);
             Ok(())
         }
@@ -4818,8 +5642,8 @@ mod tests {
     /// with its watcher attached. Honest self-skip on non-Windows; no
     /// `#[ignore]`.
     #[test]
-    fn watcher_spawn_failure_fences_only_that_operation(
-    ) -> Result<(), Box<dyn std::error::Error>> {
+    fn watcher_spawn_failure_fences_only_that_operation() -> Result<(), Box<dyn std::error::Error>>
+    {
         #[cfg(not(windows))]
         {
             assert!(
@@ -4985,10 +5809,8 @@ mod tests {
         op_tag: &str,
         argv: Vec<String>,
         wall_timeout_ms: u64,
-    ) -> Result<
-        (WindowsProcessExecutor, ProcessRequest, OperationId),
-        Box<dyn std::error::Error>,
-    > {
+    ) -> Result<(WindowsProcessExecutor, ProcessRequest, OperationId), Box<dyn std::error::Error>>
+    {
         let generation = Generation::new(1)?;
         let fence = FencingToken::new(test_epoch(1), generation, format!("fence-83-{op_tag}"))?;
         let mut authority = DispatchPermitAuthority::activate(
@@ -5041,8 +5863,8 @@ mod tests {
         clippy::too_many_lines,
         reason = "issue-83 fail-closed acceptance needs start-failure plus owner, quarantine, and cancel evidence in one bounded test"
     )]
-    fn issue83_watcher_spawn_failure_is_fail_closed_unknown(
-    ) -> Result<(), Box<dyn std::error::Error>> {
+    fn issue83_watcher_spawn_failure_is_fail_closed_unknown()
+    -> Result<(), Box<dyn std::error::Error>> {
         #[cfg(not(windows))]
         {
             assert!(
@@ -5073,10 +5895,7 @@ mod tests {
                 super::s83_disarm_watcher_failure_for(&operation_id);
                 // NEVER a normal receipt: the failed start is typed unknown.
                 assert!(
-                    matches!(
-                        start_result,
-                        Err(ProcessExecutionError::UnknownOutcome)
-                    ),
+                    matches!(start_result, Err(ProcessExecutionError::UnknownOutcome)),
                     "watcher-spawn failure must fail closed as UnknownOutcome, got {start_result:?}"
                 );
                 // No start evidence may be fabricated for the failed op.
@@ -5153,8 +5972,7 @@ mod tests {
     /// single `inspect` must observe terminal timed-out enforcement.
     /// Honest self-skip on non-Windows; no `#[ignore]`.
     #[test]
-    fn issue83_no_poll_deadline_enforced_autonomously(
-    ) -> Result<(), Box<dyn std::error::Error>> {
+    fn issue83_no_poll_deadline_enforced_autonomously() -> Result<(), Box<dyn std::error::Error>> {
         #[cfg(not(windows))]
         {
             assert!(
@@ -5179,8 +5997,7 @@ mod tests {
             let outcome: Result<(), Box<dyn std::error::Error>> = (|| {
                 // Enforcement ownership is installed at start, before any
                 // observation happens.
-                let expected_owner =
-                    format!("deadline-watcher:{}", operation_id.as_str());
+                let expected_owner = format!("deadline-watcher:{}", operation_id.as_str());
                 assert_eq!(
                     executor.deadline_watcher_owner(&operation_id),
                     Some(expected_owner)
@@ -5340,8 +6157,7 @@ mod tests {
                         assert_eq!(receipt.lifecycle(), ProcessLifecycle::Exited);
                     }
                     Err(
-                        ProcessExecutionError::UnknownOutcome
-                        | ProcessExecutionError::Contract(_),
+                        ProcessExecutionError::UnknownOutcome | ProcessExecutionError::Contract(_),
                     ) => {
                         // Bounded contention on B's own tree: B is fenced as
                         // unknown but stays retained — never promoted — and
@@ -5392,8 +6208,7 @@ mod tests {
     /// both arms are typed, never `NotFound`, never fabricated success.
     /// Honest self-skip on non-Windows; no `#[ignore]`.
     #[test]
-    fn issue83_cancel_healthy_op_returns_typed_receipt(
-    ) -> Result<(), Box<dyn std::error::Error>> {
+    fn issue83_cancel_healthy_op_returns_typed_receipt() -> Result<(), Box<dyn std::error::Error>> {
         #[cfg(not(windows))]
         {
             assert!(
@@ -5423,9 +6238,7 @@ mod tests {
                         assert_eq!(receipt.status(), CancellationStatus::Completed);
                         assert_eq!(receipt.lifecycle(), ProcessLifecycle::Exited);
                         let Some(descendants) = receipt.descendants() else {
-                            panic!(
-                                "cancel receipt must carry post-finalize descendant evidence"
-                            );
+                            panic!("cancel receipt must carry post-finalize descendant evidence");
                         };
                         assert!(descendants.complete() && descendants.tree_terminated());
                         let view = block_on(executor.inspect(operation_id.clone()))?;
@@ -5464,8 +6277,8 @@ mod tests {
     /// an honest `Completed` exit, never an unknown outcome. Honest
     /// self-skip on non-Windows; no `#[ignore]`.
     #[test]
-    fn issue83_quick_exit_reconciles_without_unknown_fence(
-    ) -> Result<(), Box<dyn std::error::Error>> {
+    fn issue83_quick_exit_reconciles_without_unknown_fence()
+    -> Result<(), Box<dyn std::error::Error>> {
         #[cfg(not(windows))]
         {
             assert!(
@@ -5477,8 +6290,7 @@ mod tests {
         #[cfg(windows)]
         {
             let argv = vec!["/c".to_owned(), "exit".to_owned(), "0".to_owned()];
-            let (executor, request, operation_id) =
-                s83_parts("quick-exit", argv, 30_000)?;
+            let (executor, request, operation_id) = s83_parts("quick-exit", argv, 30_000)?;
             let sink = Arc::new(RecordingSink::default());
             let sink_dyn: Arc<dyn ProcessEvidenceSink> = sink.clone();
             // The quick-exit child starts through the full path and reports a
@@ -5514,8 +6326,7 @@ mod tests {
     /// proven. Independent dimensions stay available (no global poison, per
     /// #82). Honest self-skip on non-Windows; no `#[ignore]`.
     #[test]
-    fn issue84_stdout_spawn_failure_contains_job_tree(
-    ) -> Result<(), Box<dyn std::error::Error>> {
+    fn issue84_stdout_spawn_failure_contains_job_tree() -> Result<(), Box<dyn std::error::Error>> {
         #[cfg(not(windows))]
         {
             assert!(
@@ -5528,11 +6339,8 @@ mod tests {
         {
             let bat_path = s83_keepalive_bat("84-stdout-fail")?;
             let outcome: Result<(), Box<dyn std::error::Error>> = (|| {
-                let (executor, request, operation_id) = s83_parts(
-                    "84-stdout-fail",
-                    s83_keepalive_argv(&bat_path),
-                    30_000,
-                )?;
+                let (executor, request, operation_id) =
+                    s83_parts("84-stdout-fail", s83_keepalive_argv(&bat_path), 30_000)?;
                 let sink = Arc::new(RecordingSink::default());
                 let sink_dyn: Arc<dyn ProcessEvidenceSink> = sink.clone();
                 // Identity-scoped injection: arm exactly this op's stdout
@@ -5641,8 +6449,8 @@ mod tests {
     /// dimensions stay available (no global poison, per #82). Honest
     /// self-skip on non-Windows; no `#[ignore]`.
     #[test]
-    fn issue84_registry_publish_failure_retains_reconcilable_op(
-    ) -> Result<(), Box<dyn std::error::Error>> {
+    fn issue84_registry_publish_failure_retains_reconcilable_op()
+    -> Result<(), Box<dyn std::error::Error>> {
         #[cfg(not(windows))]
         {
             assert!(
@@ -5655,11 +6463,8 @@ mod tests {
         {
             let bat_path = s83_keepalive_bat("84-publish-fail")?;
             let outcome: Result<(), Box<dyn std::error::Error>> = (|| {
-                let (executor, request, operation_id) = s83_parts(
-                    "84-publish-fail",
-                    s83_keepalive_argv(&bat_path),
-                    30_000,
-                )?;
+                let (executor, request, operation_id) =
+                    s83_parts("84-publish-fail", s83_keepalive_argv(&bat_path), 30_000)?;
                 let sink = Arc::new(RecordingSink::default());
                 let sink_dyn: Arc<dyn ProcessEvidenceSink> = sink.clone();
                 // Identity-scoped injection at the exact registry-publication
@@ -5676,10 +6481,7 @@ mod tests {
                 // NEVER a normal receipt: the failed start is typed unknown
                 // even though every control owner installed cleanly.
                 assert!(
-                    matches!(
-                        start_result,
-                        Err(ProcessExecutionError::UnknownOutcome)
-                    ),
+                    matches!(start_result, Err(ProcessExecutionError::UnknownOutcome)),
                     "publish failure must fail closed as UnknownOutcome, got {start_result:?}"
                 );
                 // The op stays registered: inspect routes to it with the
@@ -5734,5 +6536,947 @@ mod tests {
             let _ = std::fs::remove_file(&bat_path);
             outcome
         }
+    }
+
+    /// Issue #267 test-only in-memory sink.
+    ///
+    /// Admits chunks with strict sequence/offset ownership, tracks the
+    /// admitted digest/counters independently of the pump, and mints checked
+    /// terminals from the finalize/abort requests. The durable locator is a
+    /// fake `eliot://` URI string: no storage implementation, no Blob types
+    /// in the process path (the real Blob adapter arrives downstream, #297).
+    struct FakeStreamSink {
+        state: Mutex<FakeStreamSinkState>,
+    }
+
+    struct FakeStreamSinkState {
+        session: Option<eliot_process::ProcessStreamSinkSession>,
+        chunks: Vec<eliot_process::ProcessStreamSinkAppend>,
+        next_sequence: u64,
+        next_offset: u64,
+        terminal: Option<eliot_process::ProcessStreamSinkTerminal>,
+        terminal_command: Option<eliot_process::ProcessStreamSinkTerminalCommandIdentity>,
+        backpressured: bool,
+        fail_finalize: bool,
+        append_calls: u64,
+        finalize_calls: u64,
+    }
+
+    impl FakeStreamSink {
+        fn new() -> Self {
+            Self {
+                state: Mutex::new(FakeStreamSinkState {
+                    session: None,
+                    chunks: Vec::new(),
+                    next_sequence: 0,
+                    next_offset: 0,
+                    terminal: None,
+                    terminal_command: None,
+                    backpressured: false,
+                    fail_finalize: false,
+                    append_calls: 0,
+                    finalize_calls: 0,
+                }),
+            }
+        }
+
+        fn lock(&self) -> std::sync::MutexGuard<'_, FakeStreamSinkState> {
+            self.state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+        }
+
+        fn set_backpressured(&self, backpressured: bool) {
+            self.lock().backpressured = backpressured;
+        }
+
+        fn set_fail_finalize(&self, fail: bool) {
+            self.lock().fail_finalize = fail;
+        }
+
+        fn append_calls(&self) -> u64 {
+            self.lock().append_calls
+        }
+
+        fn finalize_calls(&self) -> u64 {
+            self.lock().finalize_calls
+        }
+
+        fn terminal_count(&self) -> u64 {
+            u64::from(self.lock().terminal.is_some())
+        }
+
+        fn admitted_bytes(state: &FakeStreamSinkState) -> Vec<u8> {
+            state
+                .chunks
+                .iter()
+                .flat_map(|chunk| chunk.bytes().iter().copied())
+                .collect()
+        }
+
+        fn admitted_digest(state: &FakeStreamSinkState) -> String {
+            super::short_digest(&Self::admitted_bytes(state))
+        }
+
+        fn ready<T: Send + 'static>(
+            result: Result<T, eliot_process::ProcessStreamSinkError>,
+        ) -> eliot_process::ProcessStreamSinkFuture<'static, T> {
+            Box::pin(async move { result })
+        }
+
+        fn complete_evidence(
+            state: &FakeStreamSinkState,
+            request: &eliot_process::ProcessStreamSinkFinalizeRequest,
+        ) -> Result<eliot_process::ProcessStreamEvidence, eliot_process::ProcessStreamSinkError>
+        {
+            use eliot_process::{DurableStreamLocatorKind, StreamPersistenceStatus};
+            let session = state
+                .session
+                .clone()
+                .ok_or(eliot_process::ProcessStreamSinkError::ProviderUnavailable)?;
+            let bytes = Self::admitted_bytes(state);
+            let digest = Self::admitted_digest(state);
+            let (persistence, source) = if request.gaps().is_empty() {
+                let locator = format!("eliot://fake-sink-267/{digest}");
+                let receipt = format!("fake-receipt-267:{digest}");
+                let source = eliot_process::DurableProcessStreamSource::exact_transport(
+                    DurableStreamLocatorKind::Blob,
+                    locator,
+                    receipt,
+                    digest,
+                    bytes.len() as u64,
+                )
+                .map_err(|error| {
+                    eliot_process::ProcessStreamSinkError::EvidenceInvariant {
+                        reason: error.to_string(),
+                    }
+                })?;
+                (StreamPersistenceStatus::CompleteSource, Some(source))
+            } else {
+                (StreamPersistenceStatus::SourceUnavailable, None)
+            };
+            eliot_process::ProcessStreamEvidence::new_raw(
+                session.binding().clone(),
+                session.stream(),
+                session.policy().clone(),
+                request.transport(),
+                persistence,
+                request.observed_sha256().to_owned(),
+                request.observed_bytes(),
+                request.preview().clone(),
+                source,
+                request.gaps().to_vec(),
+            )
+            .map_err(|error| {
+                eliot_process::ProcessStreamSinkError::EvidenceInvariant {
+                    reason: error.to_string(),
+                }
+            })
+        }
+
+        fn abort_evidence(
+            state: &FakeStreamSinkState,
+            request: &eliot_process::ProcessStreamSinkAbortRequest,
+        ) -> Result<eliot_process::ProcessStreamEvidence, eliot_process::ProcessStreamSinkError>
+        {
+            let session = state
+                .session
+                .clone()
+                .ok_or(eliot_process::ProcessStreamSinkError::ProviderUnavailable)?;
+            eliot_process::ProcessStreamEvidence::new_raw(
+                session.binding().clone(),
+                session.stream(),
+                session.policy().clone(),
+                request.transport(),
+                eliot_process::StreamPersistenceStatus::SourceUnavailable,
+                request.observed_sha256().to_owned(),
+                request.observed_bytes(),
+                request.preview().clone(),
+                None,
+                request.gaps().to_vec(),
+            )
+            .map_err(|error| {
+                eliot_process::ProcessStreamSinkError::EvidenceInvariant {
+                    reason: error.to_string(),
+                }
+            })
+        }
+    }
+
+    impl eliot_process::ProcessStreamSinkClient for FakeStreamSink {
+        fn open(
+            &self,
+            request: eliot_process::ProcessStreamSinkOpenRequest,
+        ) -> eliot_process::ProcessStreamSinkFuture<'_, eliot_process::ProcessStreamSinkSession>
+        {
+            let mut state = self.lock();
+            let result = match state.session.as_ref() {
+                Some(existing)
+                    if existing.open_request_sha256() == request.open_request_sha256() =>
+                {
+                    Ok(existing.clone())
+                }
+                Some(_) => Err(eliot_process::ProcessStreamSinkError::OpenDigestMismatch),
+                None => eliot_process::ProcessStreamSinkSession::from_open_request(request)
+                    .inspect(|session| {
+                        state.session = Some(session.clone());
+                    }),
+            };
+            Self::ready(result)
+        }
+
+        fn append(
+            &self,
+            session: eliot_process::ProcessStreamSinkSession,
+            request: eliot_process::ProcessStreamSinkAppend,
+        ) -> eliot_process::ProcessStreamSinkFuture<
+            '_,
+            eliot_process::ProcessStreamSinkAppendDisposition,
+        > {
+            let mut state = self.lock();
+            state.append_calls = state.append_calls.saturating_add(1);
+            let result = state
+                .session
+                .clone()
+                .ok_or(eliot_process::ProcessStreamSinkError::ProviderUnavailable)
+                .and_then(|existing| {
+                    if existing != session {
+                        return Err(eliot_process::ProcessStreamSinkError::SessionMismatch);
+                    }
+                    if let Some(terminal) = &state.terminal {
+                        return Ok(
+                            eliot_process::ProcessStreamSinkAppendDisposition::Terminal {
+                                state: terminal.state(),
+                                terminal_sha256: terminal.terminal_sha256().to_owned(),
+                            },
+                        );
+                    }
+                    session.validate_append(&request)?;
+                    if request.wait_budget_ms() == 0 {
+                        return Ok(
+                            eliot_process::ProcessStreamSinkAppendDisposition::DeadlineExceeded,
+                        );
+                    }
+                    if state.backpressured {
+                        return Ok(
+                            eliot_process::ProcessStreamSinkAppendDisposition::Backpressured {
+                                retry_after_ms: 1,
+                            },
+                        );
+                    }
+                    if request.sequence() != state.next_sequence {
+                        return Err(if request.sequence() < state.next_sequence {
+                            eliot_process::ProcessStreamSinkError::MismatchedReplay
+                        } else {
+                            eliot_process::ProcessStreamSinkError::SequenceGap {
+                                expected: state.next_sequence,
+                                observed: request.sequence(),
+                            }
+                        });
+                    }
+                    if request.offset() != state.next_offset {
+                        return Err(eliot_process::ProcessStreamSinkError::OffsetMismatch {
+                            expected: state.next_offset,
+                            observed: request.offset(),
+                        });
+                    }
+                    if state.next_sequence >= session.limits().max_chunks() {
+                        return Err(eliot_process::ProcessStreamSinkError::ChunkCountLimitExceeded);
+                    }
+                    if request.byte_length()
+                        > session
+                            .limits()
+                            .max_total_admitted_bytes()
+                            .saturating_sub(state.next_offset)
+                    {
+                        return Err(eliot_process::ProcessStreamSinkError::TotalLimitExceeded);
+                    }
+                    state.next_sequence = state.next_sequence.saturating_add(1);
+                    state.next_offset = state.next_offset.saturating_add(request.byte_length());
+                    state.chunks.push(request);
+                    Ok(
+                        eliot_process::ProcessStreamSinkAppendDisposition::Accepted {
+                            next_sequence: state.next_sequence,
+                            next_offset: state.next_offset,
+                        },
+                    )
+                });
+            Self::ready(result)
+        }
+
+        fn finalize(
+            &self,
+            session: eliot_process::ProcessStreamSinkSession,
+            request: eliot_process::ProcessStreamSinkFinalizeRequest,
+        ) -> eliot_process::ProcessStreamSinkFuture<'_, eliot_process::ProcessStreamSinkTerminal>
+        {
+            let mut state = self.lock();
+            state.finalize_calls = state.finalize_calls.saturating_add(1);
+            let result = state
+                .session
+                .clone()
+                .ok_or(eliot_process::ProcessStreamSinkError::ProviderUnavailable)
+                .and_then(|existing| {
+                    if existing != session {
+                        return Err(eliot_process::ProcessStreamSinkError::SessionMismatch);
+                    }
+                    if state.fail_finalize {
+                        return Err(eliot_process::ProcessStreamSinkError::ProviderUnavailable);
+                    }
+                    let identity = request.command_identity()?;
+                    if let Some(terminal) = &state.terminal {
+                        return if state.terminal_command.as_ref() == Some(&identity) {
+                            Ok(terminal.clone())
+                        } else {
+                            Err(eliot_process::ProcessStreamSinkError::TerminalIdentityConflict)
+                        };
+                    }
+                    session.validate_finalize(&request)?;
+                    if request.expected_final_sequence() != state.next_sequence {
+                        return Err(eliot_process::ProcessStreamSinkError::SequenceGap {
+                            expected: state.next_sequence,
+                            observed: request.expected_final_sequence(),
+                        });
+                    }
+                    if request.expected_final_offset() != state.next_offset {
+                        return Err(eliot_process::ProcessStreamSinkError::OffsetMismatch {
+                            expected: state.next_offset,
+                            observed: request.expected_final_offset(),
+                        });
+                    }
+                    if request.observed_sha256() != Self::admitted_digest(&state)
+                        || request.observed_bytes() != state.next_offset
+                    {
+                        return Err(eliot_process::ProcessStreamSinkError::EvidenceInvariant {
+                            reason: "fake observed facts do not match admitted chunks".to_owned(),
+                        });
+                    }
+                    let evidence = Self::complete_evidence(&state, &request)?;
+                    let sink_state = if request.gaps().is_empty() {
+                        eliot_process::ProcessStreamSinkState::CompleteSource
+                    } else {
+                        eliot_process::ProcessStreamSinkState::SourceUnavailable
+                    };
+                    let terminal = eliot_process::ProcessStreamSinkTerminal::from_finalize(
+                        session,
+                        request,
+                        sink_state,
+                        state.next_sequence,
+                        state.next_offset,
+                        Self::admitted_digest(&state),
+                        evidence,
+                    )?;
+                    state.terminal_command = Some(identity);
+                    state.terminal = Some(terminal.clone());
+                    Ok(terminal)
+                });
+            Self::ready(result)
+        }
+
+        fn abort(
+            &self,
+            session: eliot_process::ProcessStreamSinkSession,
+            request: eliot_process::ProcessStreamSinkAbortRequest,
+        ) -> eliot_process::ProcessStreamSinkFuture<'_, eliot_process::ProcessStreamSinkTerminal>
+        {
+            let mut state = self.lock();
+            let result = state
+                .session
+                .clone()
+                .ok_or(eliot_process::ProcessStreamSinkError::ProviderUnavailable)
+                .and_then(|existing| {
+                    if existing != session {
+                        return Err(eliot_process::ProcessStreamSinkError::SessionMismatch);
+                    }
+                    let identity = request.command_identity()?;
+                    if let Some(terminal) = &state.terminal {
+                        return if state.terminal_command.as_ref() == Some(&identity) {
+                            Ok(terminal.clone())
+                        } else {
+                            Err(eliot_process::ProcessStreamSinkError::TerminalIdentityConflict)
+                        };
+                    }
+                    session.validate_abort(&request)?;
+                    if request.expected_final_sequence() != state.next_sequence {
+                        return Err(eliot_process::ProcessStreamSinkError::SequenceGap {
+                            expected: state.next_sequence,
+                            observed: request.expected_final_sequence(),
+                        });
+                    }
+                    if request.expected_final_offset() != state.next_offset {
+                        return Err(eliot_process::ProcessStreamSinkError::OffsetMismatch {
+                            expected: state.next_offset,
+                            observed: request.expected_final_offset(),
+                        });
+                    }
+                    if request.observed_sha256() != Self::admitted_digest(&state)
+                        || request.observed_bytes() != state.next_offset
+                    {
+                        return Err(eliot_process::ProcessStreamSinkError::EvidenceInvariant {
+                            reason: "fake observed facts do not match admitted chunks".to_owned(),
+                        });
+                    }
+                    let evidence = Self::abort_evidence(&state, &request)?;
+                    let sink_state = match request.reason() {
+                        eliot_process::ProcessStreamSinkAbortReason::Cancellation
+                        | eliot_process::ProcessStreamSinkAbortReason::CallerShutdown => {
+                            eliot_process::ProcessStreamSinkState::Cancelled
+                        }
+                        eliot_process::ProcessStreamSinkAbortReason::PolicyProhibition => {
+                            eliot_process::ProcessStreamSinkState::PolicyProhibited
+                        }
+                        eliot_process::ProcessStreamSinkAbortReason::RedactionFailure => {
+                            eliot_process::ProcessStreamSinkState::RedactionFailed
+                        }
+                        eliot_process::ProcessStreamSinkAbortReason::TransportFailure => {
+                            eliot_process::ProcessStreamSinkState::SourceUnavailable
+                        }
+                    };
+                    let terminal = eliot_process::ProcessStreamSinkTerminal::from_abort(
+                        session,
+                        request,
+                        sink_state,
+                        state.next_sequence,
+                        state.next_offset,
+                        Self::admitted_digest(&state),
+                        evidence,
+                    )?;
+                    state.terminal_command = Some(identity);
+                    state.terminal = Some(terminal.clone());
+                    Ok(terminal)
+                });
+            Self::ready(result)
+        }
+
+        fn readback(
+            &self,
+            session: eliot_process::ProcessStreamSinkSession,
+        ) -> eliot_process::ProcessStreamSinkFuture<'_, eliot_process::ProcessStreamSinkReadback>
+        {
+            let state = self.lock();
+            if state.session.as_ref() != Some(&session) {
+                return Self::ready(Err(eliot_process::ProcessStreamSinkError::SessionMismatch));
+            }
+            if let Some(terminal) = &state.terminal {
+                return Self::ready(Ok(eliot_process::ProcessStreamSinkReadback::Terminal {
+                    terminal: terminal.clone(),
+                }));
+            }
+            let view = eliot_process::ProcessStreamSinkSessionView::new(
+                session.session_id().clone(),
+                session.source_id().clone(),
+                session.terminal_id().clone(),
+                eliot_process::ProcessStreamSinkState::Open,
+                state.next_sequence,
+                state.next_offset,
+                state.next_sequence,
+                state.next_offset,
+                Self::admitted_digest(&state),
+                session.open_request_sha256().to_owned(),
+                None,
+            );
+            Self::ready(
+                view.map(|view| eliot_process::ProcessStreamSinkReadback::Session { view })
+                    .map_err(|_| eliot_process::ProcessStreamSinkError::ProviderUnavailable),
+            )
+        }
+
+        fn reconcile(
+            &self,
+            session: eliot_process::ProcessStreamSinkSession,
+            _outcome: eliot_process::ProcessStreamSinkUnknownOutcome,
+        ) -> eliot_process::ProcessStreamSinkFuture<'_, eliot_process::ProcessStreamSinkReadback>
+        {
+            // The fake never records uncertainty, so reconcile mirrors the
+            // current readback: the one terminal when finalization landed, the
+            // open session view otherwise.
+            self.readback(session)
+        }
+    }
+
+    /// Issue #267 helper: mints a real execution binding through the exact
+    /// production authority round-trip (intent, issued permit, suspended
+    /// identity, validation context), mirroring the `FakePort` path. The
+    /// suspended identity is fabricated but fully validated; no child runs.
+    fn sink_test_binding(
+        tag: &str,
+    ) -> Result<eliot_process::ProcessExecutionBinding, Box<dyn std::error::Error>> {
+        let generation = Generation::new(1)?;
+        let fence = FencingToken::new(test_epoch(1), generation, format!("fence-267-{tag}"))?;
+        let mut authority = DispatchPermitAuthority::activate(
+            DispatchAuthorityId::new(format!("auth-267-{tag}"))?,
+            KernelDispatchKey::from_secret_bytes([0x5a; 32])?,
+        );
+        let tree = ProcessTreeId::new(format!("tree-267-{tag}"))?;
+        let job = JobId::new(format!("job-267-{tag}"))?;
+        let image = ImageId::new(format!("image-267-{tag}"))?;
+        let session_id = SessionId::new(format!("session-267-{tag}"))?;
+        let exe_digest = "e".repeat(64);
+        let intent = ProcessIntent::new(
+            OperationId::new(format!("op-267-{tag}"))?,
+            tree.clone(),
+            job.clone(),
+            image.clone(),
+            session_id.clone(),
+            generation,
+            "sink-test-image-267",
+            exe_digest.clone(),
+            vec![
+                "/c".to_owned(),
+                "echo".to_owned(),
+                format!("probe-267-{tag}"),
+            ],
+            std::env::temp_dir().to_string_lossy().into_owned(),
+            EnvironmentProjection::default(),
+            ResourceLimits::new(30_000, Some(10_000), Some(512_000_000), 4_096, 4_096, 4)?,
+        )?;
+        let permit = authority.issue(
+            &intent,
+            PermitIssuance::new(
+                ActionLeaseRef::new(format!("lease-267-{tag}"))?,
+                fence.clone(),
+                revisions(),
+                100,
+                10_000,
+                format!("nonce-267-{tag}"),
+            )?,
+        )?;
+        let request = ProcessRequest::new(intent, permit)?;
+        let observed = SuspendedProcessIdentity::new(
+            eliot_process::ProcessId::new(format!("windows-process-267-{tag}"))?,
+            tree,
+            job,
+            image,
+            session_id,
+            generation,
+            eliot_process::PhysicalProcessBinding::new(
+                4_242,
+                818_934_281,
+                "sink-test-image-267",
+                "Local\\Eliot-267-Test",
+            )?,
+            super::now_ms(),
+            exe_digest,
+        )?;
+        let context = eliot_process::DispatchValidationContext::new(
+            eliot_platform::ClockObservation {
+                valid_time_ms: Some(150),
+                known_time_ms: Some(150),
+                transaction_sequence: None,
+                monotonic_ns: Some(1),
+            },
+            fence,
+            test_epoch(1),
+            revisions(),
+            41,
+        )?;
+        let validated = authority.validate_and_consume(request, observed, &context)?;
+        Ok(validated.binding().clone())
+    }
+
+    /// Issue #267 helper: the exact P-04 stream policy binding under test
+    /// (same refs as the production [`super::p04_stream_policy`] on Windows).
+    fn sink_test_policy()
+    -> Result<eliot_process::ProcessStreamPolicyBinding, Box<dyn std::error::Error>> {
+        Ok(eliot_process::ProcessStreamPolicyBinding::new(
+            "p04:stream-policy:transport-preview-v1",
+            "p04:privacy:raw-transport-preview",
+            "p04:visibility:operation-diagnostic",
+            "p04:retention:bounded-prefix-only",
+            "p04:redaction:none-raw-preview",
+        )?)
+    }
+
+    /// Issue #267 T1: a fake sink streams a complete multi-chunk stdout plus a
+    /// zero-byte stderr into real verifiable evidence objects.
+    ///
+    /// The pump opens each session before the first admitted byte, appends per
+    /// chunk, and finalizes to exactly one terminal: resolved digest/count
+    /// equal the independently computed observed bytes, the durable source
+    /// carries the same identity, the preview stays separate with its exact
+    /// omission, and the zero-byte stream still publishes a real verifiable
+    /// object. Cleanup/reopen reconciles the same session/terminal identity
+    /// without minting a second receipt.
+    #[test]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "the complete plus zero-byte acceptance surface needs open, chunked append, finalize, and reopen evidence in one bounded test"
+    )]
+    fn stream_sink_fake_complete_and_zero_byte_publish_verifiable_objects()
+    -> Result<(), Box<dyn std::error::Error>> {
+        use eliot_process::{
+            ProcessStreamKind, ProcessStreamSinkReadback, ProcessStreamSinkState,
+            StreamPersistenceStatus, StreamPreviewRepresentation, StreamTransportStatus,
+        };
+
+        let limits = super::sink_backpressure_limits()?;
+        let policy = sink_test_policy()?;
+        let fake = Arc::new(FakeStreamSink::new());
+        let client: Arc<dyn eliot_process::ProcessStreamSinkClient> = fake.clone();
+
+        // Stdout: 20_000 bytes exceed the 16_384-byte preview ceiling, so the
+        // preview must truncate with the exact omitted suffix while the
+        // resolved identity still covers every observed byte.
+        let binding = sink_test_binding("t1-complete")?;
+        let mut pump = super::StreamSinkPump::new(
+            client.clone(),
+            binding,
+            ProcessStreamKind::Stdout,
+            policy.clone(),
+            limits,
+        );
+        // Fail-closed ordering: no byte is admitted before the session opens.
+        assert!(matches!(
+            pump.append(b"early"),
+            Err(ProcessExecutionError::UnknownOutcome)
+        ));
+        pump.open()?;
+        // The session is open before the first admitted byte: the readback is
+        // an open session view with zero counters, never a terminal.
+        match pump.reopen()? {
+            ProcessStreamSinkReadback::Session { view } => {
+                assert_eq!(view.state(), ProcessStreamSinkState::Open);
+                assert_eq!(view.next_sequence(), 0);
+                assert_eq!(view.next_offset(), 0);
+            }
+            ProcessStreamSinkReadback::Terminal { .. }
+            | ProcessStreamSinkReadback::UnknownOutcome { .. } => {
+                return Err("open session must read back as a session".into());
+            }
+        }
+        let payload: Vec<u8> = (0..20_000_u32).map(|i| (i % 251) as u8).collect();
+        let expected_digest = super::short_digest(&payload);
+        assert_eq!(
+            pump.append(&payload[..7_000])?,
+            super::SinkAppendOutcome::Admitted
+        );
+        assert_eq!(
+            pump.append(&payload[7_000..14_000])?,
+            super::SinkAppendOutcome::Admitted
+        );
+        assert_eq!(
+            pump.append(&payload[14_000..])?,
+            super::SinkAppendOutcome::Admitted
+        );
+        assert_eq!(pump.admitted_bytes(), 20_000);
+        assert_eq!(pump.offered_bytes(), 20_000);
+        assert_eq!(pump.admitted_sha256(), expected_digest);
+        let terminal = pump.finalize_eof()?;
+        assert_eq!(terminal.state(), ProcessStreamSinkState::CompleteSource);
+        terminal.validate()?;
+        let evidence = terminal.evidence().clone();
+        evidence.validate()?;
+        assert_eq!(evidence.observed_sha256(), expected_digest.as_str());
+        assert_eq!(evidence.observed_bytes(), 20_000);
+        assert_eq!(evidence.transport(), StreamTransportStatus::Complete);
+        assert_eq!(
+            evidence.persistence(),
+            StreamPersistenceStatus::CompleteSource
+        );
+        assert!(evidence.gaps().is_empty());
+        let Some(source) = evidence.source() else {
+            return Err("complete terminal must carry a durable source".into());
+        };
+        assert_eq!(source.sha256(), expected_digest.as_str());
+        assert_eq!(source.byte_length(), 20_000);
+        // The preview is separate from the resolved identity: a bounded
+        // retained prefix with the exact omitted suffix, never the full
+        // stream digest.
+        let preview = evidence.preview();
+        assert_eq!(
+            preview.representation(),
+            StreamPreviewRepresentation::TransportBytes
+        );
+        assert_eq!(preview.retained_bytes(), 16_384);
+        assert_eq!(preview.represented_bytes(), 20_000);
+        assert!(preview.is_truncated());
+        assert_eq!(preview.bytes(), &payload[..16_384]);
+        assert_eq!(
+            preview.sha256(),
+            super::short_digest(&payload[..16_384]).as_str()
+        );
+        assert_ne!(preview.sha256(), expected_digest.as_str());
+        assert_eq!(preview.omitted_ranges().len(), 1);
+        assert_eq!(preview.omitted_ranges()[0].start(), 16_384);
+        assert_eq!(preview.omitted_ranges()[0].end_exclusive(), 20_000);
+        // Cleanup/reopen reconciles the same identity: the same session
+        // digest, the same terminal digest, and no second receipt.
+        let Some(session) = pump.session() else {
+            return Err("sink session must stay open".into());
+        };
+        let open_sha = session.open_request_sha256().to_owned();
+        let terminal_sha = terminal.terminal_sha256().to_owned();
+        match pump.reopen()? {
+            ProcessStreamSinkReadback::Terminal { terminal } => {
+                assert_eq!(terminal.terminal_sha256(), terminal_sha.as_str());
+            }
+            ProcessStreamSinkReadback::Session { .. }
+            | ProcessStreamSinkReadback::UnknownOutcome { .. } => {
+                return Err("reopen must reconcile the same terminal".into());
+            }
+        }
+        let Some(session) = pump.session() else {
+            return Err("sink session must stay open".into());
+        };
+        assert_eq!(session.open_request_sha256(), open_sha.as_str());
+        assert_eq!(
+            pump.finalize_eof()?.terminal_sha256(),
+            terminal_sha.as_str()
+        );
+        assert_eq!(fake.terminal_count(), 1);
+        assert_eq!(fake.finalize_calls(), 1);
+
+        // Stderr: a zero-byte EOF still publishes a real verifiable object
+        // with the empty digest identity and a complete (untruncated) preview.
+        // A separate fake owns this stream's session identity.
+        let zero = sink_test_binding("t1-zero")?;
+        let zero_fake = Arc::new(FakeStreamSink::new());
+        let zero_client: Arc<dyn eliot_process::ProcessStreamSinkClient> = zero_fake.clone();
+        let mut pump = super::StreamSinkPump::new(
+            zero_client,
+            zero,
+            ProcessStreamKind::Stderr,
+            policy,
+            limits,
+        );
+        pump.open()?;
+        assert_eq!(pump.admitted_bytes(), 0);
+        let terminal = pump.finalize_eof()?;
+        assert_eq!(terminal.state(), ProcessStreamSinkState::CompleteSource);
+        terminal.validate()?;
+        let evidence = terminal.evidence().clone();
+        evidence.validate()?;
+        assert_eq!(
+            evidence.observed_sha256(),
+            super::empty_sha256_hex().as_str()
+        );
+        assert_eq!(evidence.observed_bytes(), 0);
+        let Some(source) = evidence.source() else {
+            return Err("zero-byte terminal must carry a durable source".into());
+        };
+        assert_eq!(source.sha256(), super::empty_sha256_hex().as_str());
+        assert_eq!(source.byte_length(), 0);
+        assert!(!evidence.preview().is_truncated());
+        assert!(evidence.preview().bytes().is_empty());
+        assert!(evidence.preview().omitted_ranges().is_empty());
+        assert!(evidence.gaps().is_empty());
+        Ok(())
+    }
+
+    /// Issue #267 T2: pressure, cancellation, prohibition, and provider
+    /// failure settle to typed gaps without blocking the drain.
+    ///
+    /// Backpressure sheds the remainder (the calls return immediately while
+    /// the pipe keeps draining) with the exact persistence gap;
+    /// cancel-before-EOF preserves the admitted prefix with the cancellation
+    /// gap; `POLICY_PROHIBITED` withholds raw bytes while keeping custody;
+    /// and a provider failure never yields a complete source while reopen
+    /// reconciles the same session identity.
+    #[test]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "the pressure, cancel, policy-negative, and provider-failure acceptance surface shares one fake-sink shape in one bounded test"
+    )]
+    fn stream_sink_fake_pressure_cancel_and_policy_negative_settle_typed_gaps()
+    -> Result<(), Box<dyn std::error::Error>> {
+        use eliot_process::{
+            ProcessStreamKind, ProcessStreamSinkReadback, ProcessStreamSinkState,
+            StreamEvidenceGap, StreamPersistenceStatus, StreamPreviewRepresentation,
+            StreamTransportStatus,
+        };
+
+        let limits = super::sink_backpressure_limits()?;
+        let policy = sink_test_policy()?;
+
+        // Pressure: the first chunk admits, the rest sheds, and every call
+        // returns immediately — the drain never blocks on persistence.
+        let fake = Arc::new(FakeStreamSink::new());
+        let client: Arc<dyn eliot_process::ProcessStreamSinkClient> = fake.clone();
+        let binding = sink_test_binding("t2-pressure")?;
+        let mut pump = super::StreamSinkPump::new(
+            client.clone(),
+            binding,
+            ProcessStreamKind::Stdout,
+            policy.clone(),
+            limits,
+        );
+        pump.open()?;
+        let prefix: Vec<u8> = (0..5_000_u32).map(|i| (i % 251) as u8).collect();
+        assert_eq!(pump.append(&prefix)?, super::SinkAppendOutcome::Admitted);
+        fake.set_backpressured(true);
+        let tail: Vec<u8> = (0..9_000_u32).map(|i| (i % 251) as u8).collect();
+        assert_eq!(
+            pump.append(&tail)?,
+            super::SinkAppendOutcome::ShedBackpressure
+        );
+        assert!(pump.backpressure_observed());
+        assert_eq!(pump.admitted_bytes(), 5_000);
+        assert_eq!(fake.append_calls(), 2);
+        // Shedding latches: later chunks shed locally with no provider I/O.
+        assert_eq!(
+            pump.append(&[7_u8; 100])?,
+            super::SinkAppendOutcome::ShedClosed
+        );
+        assert_eq!(fake.append_calls(), 2);
+        assert_eq!(pump.offered_bytes(), 14_100);
+        let terminal = pump.finalize_eof()?;
+        assert_eq!(terminal.state(), ProcessStreamSinkState::SourceUnavailable);
+        terminal.validate()?;
+        let evidence = terminal.evidence().clone();
+        evidence.validate()?;
+        assert!(evidence.source().is_none());
+        assert!(
+            evidence
+                .gaps()
+                .contains(&StreamEvidenceGap::PersistenceBackpressure)
+        );
+        assert!(
+            evidence
+                .gaps()
+                .contains(&StreamEvidenceGap::PersistenceUnavailable)
+        );
+        assert_eq!(
+            evidence.observed_sha256(),
+            super::short_digest(&prefix).as_str()
+        );
+        assert_eq!(evidence.observed_bytes(), 5_000);
+        assert_eq!(evidence.transport(), StreamTransportStatus::Complete);
+        assert_eq!(
+            evidence.persistence(),
+            StreamPersistenceStatus::SourceUnavailable
+        );
+
+        // Cancel-before-EOF preserves the admitted prefix with the exact
+        // cancellation gap and no durable source. A separate fake owns this
+        // stream's session identity.
+        let fake = Arc::new(FakeStreamSink::new());
+        let client: Arc<dyn eliot_process::ProcessStreamSinkClient> = fake.clone();
+        let binding = sink_test_binding("t2-cancel")?;
+        let mut pump = super::StreamSinkPump::new(
+            client.clone(),
+            binding,
+            ProcessStreamKind::Stdout,
+            policy.clone(),
+            limits,
+        );
+        pump.open()?;
+        assert_eq!(
+            pump.append(b"cancelled-prefix")?,
+            super::SinkAppendOutcome::Admitted
+        );
+        let terminal = pump.abort_cancelled()?;
+        assert_eq!(terminal.state(), ProcessStreamSinkState::Cancelled);
+        terminal.validate()?;
+        let evidence = terminal.evidence().clone();
+        evidence.validate()?;
+        assert!(evidence.source().is_none());
+        assert!(
+            evidence
+                .gaps()
+                .contains(&StreamEvidenceGap::CancelledBeforeEof)
+        );
+        assert_eq!(
+            evidence.observed_sha256(),
+            super::short_digest(b"cancelled-prefix").as_str()
+        );
+        assert_eq!(evidence.observed_bytes(), 16);
+        assert_eq!(
+            evidence.transport(),
+            StreamTransportStatus::CancelledBeforeEof
+        );
+        assert!(!evidence.preview().is_truncated());
+        assert_eq!(evidence.preview().bytes(), b"cancelled-prefix");
+
+        // Policy prohibition withholds raw bytes while keeping custody:
+        // identity and count stay exact, the preview is empty, and the
+        // durable record carries no source and no raw material. A separate
+        // fake owns this stream's session identity.
+        let fake = Arc::new(FakeStreamSink::new());
+        let client: Arc<dyn eliot_process::ProcessStreamSinkClient> = fake.clone();
+        let binding = sink_test_binding("t2-policy")?;
+        let mut pump = super::StreamSinkPump::new(
+            client.clone(),
+            binding,
+            ProcessStreamKind::Stderr,
+            policy.clone(),
+            limits,
+        );
+        pump.open()?;
+        assert_eq!(
+            pump.append(b"secret=42-classified")?,
+            super::SinkAppendOutcome::Admitted
+        );
+        let terminal = pump.abort_policy_prohibited()?;
+        assert_eq!(terminal.state(), ProcessStreamSinkState::PolicyProhibited);
+        terminal.validate()?;
+        let evidence = terminal.evidence().clone();
+        evidence.validate()?;
+        assert!(evidence.source().is_none());
+        assert_eq!(evidence.gaps(), &[StreamEvidenceGap::PolicyProhibited]);
+        assert_eq!(
+            evidence.preview().representation(),
+            StreamPreviewRepresentation::WithheldByPolicy
+        );
+        assert!(evidence.preview().bytes().is_empty());
+        assert_eq!(
+            evidence.observed_sha256(),
+            super::short_digest(b"secret=42-classified").as_str()
+        );
+        assert_eq!(evidence.observed_bytes(), 20);
+
+        // Provider failure never yields a complete source: finalization
+        // errors, no terminal exists, and reopen reads back the same open
+        // session. Clearing the fault then settles exactly one terminal.
+        // A separate fake owns this stream's session identity.
+        let fake = Arc::new(FakeStreamSink::new());
+        let client: Arc<dyn eliot_process::ProcessStreamSinkClient> = fake.clone();
+        let binding = sink_test_binding("t2-provider")?;
+        let mut pump =
+            super::StreamSinkPump::new(client, binding, ProcessStreamKind::Stdout, policy, limits);
+        pump.open()?;
+        assert_eq!(
+            pump.append(b"provider-failure-probe")?,
+            super::SinkAppendOutcome::Admitted
+        );
+        fake.set_fail_finalize(true);
+        assert!(matches!(
+            pump.finalize_eof(),
+            Err(ProcessExecutionError::UnknownOutcome)
+        ));
+        assert!(pump.evidence().is_none());
+        assert!(pump.terminal().is_none());
+        match pump.reopen()? {
+            ProcessStreamSinkReadback::Session { .. } => {}
+            ProcessStreamSinkReadback::Terminal { .. }
+            | ProcessStreamSinkReadback::UnknownOutcome { .. } => {
+                return Err("failed finalization must leave the session open".into());
+            }
+        }
+        fake.set_fail_finalize(false);
+        let terminal = pump.finalize_eof()?;
+        assert_eq!(terminal.state(), ProcessStreamSinkState::CompleteSource);
+        let terminal_sha = terminal.terminal_sha256().to_owned();
+        let evidence = terminal.evidence().clone();
+        evidence.validate()?;
+        assert_eq!(
+            evidence.observed_sha256(),
+            super::short_digest(b"provider-failure-probe").as_str()
+        );
+        assert!(evidence.source().is_some());
+        match pump.reopen()? {
+            ProcessStreamSinkReadback::Terminal { terminal } => {
+                assert_eq!(terminal.terminal_sha256(), terminal_sha.as_str());
+            }
+            ProcessStreamSinkReadback::Session { .. }
+            | ProcessStreamSinkReadback::UnknownOutcome { .. } => {
+                return Err("reopen must reconcile the same terminal".into());
+            }
+        }
+        assert_eq!(
+            pump.finalize_eof()?.terminal_sha256(),
+            terminal_sha.as_str()
+        );
+        assert_eq!(fake.terminal_count(), 1);
+        Ok(())
     }
 }
