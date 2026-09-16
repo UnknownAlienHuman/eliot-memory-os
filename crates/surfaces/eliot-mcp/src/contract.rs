@@ -10,16 +10,13 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use thiserror::Error;
 
-/// Final primary and isolated compatibility MCP protocol profiles.
+/// Final primary MCP protocol profile. Single native path.
 #[derive(Clone, Copy, Debug, Default, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
 pub enum McpProtocolVersion {
     /// Final MCP specification profile.
     #[serde(rename = "2026-07-28")]
     #[default]
     Final2026_07_28,
-    /// Isolated compatibility profile.
-    #[serde(rename = "2025-11-25")]
-    Compat2025_11_25,
 }
 
 /// Client features that only affect presentation, never ELIOT semantics.
@@ -57,11 +54,11 @@ pub struct ApplicationRequest {
     /// Presentation-only client features.
     #[serde(default)]
     pub client_capabilities: ClientCapabilities,
-    /// Canonical semantic tool request or the isolated legacy alias.
+    /// Canonical semantic tool request.
     pub tool: ToolRequest,
 }
 
-/// Exact canonical tool requests plus one non-canonical compatibility alias.
+/// Exact canonical tool requests.
 #[derive(Clone, Debug, JsonSchema, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "name", content = "arguments", deny_unknown_fields)]
 pub enum ToolRequest {
@@ -89,9 +86,6 @@ pub enum ToolRequest {
     /// Candidate finish attempt.
     #[serde(rename = "eliot.finish")]
     Finish(FinishAttemptDraft),
-    /// Compatibility alias; normalized to `Observe::InfluenceAck` before dispatch.
-    #[serde(rename = "eliot.memory_use")]
-    LegacyMemoryUse(MemoryInfluenceAcknowledgement),
 }
 
 impl ToolRequest {
@@ -101,21 +95,12 @@ impl ToolRequest {
         match self {
             Self::State(_) => "eliot.state",
             Self::Packet(_) => "eliot.packet",
-            Self::Observe(_) | Self::LegacyMemoryUse(_) => "eliot.observe",
+            Self::Observe(_) => "eliot.observe",
             Self::Query(_) => "eliot.query",
             Self::Act(_) => "eliot.act",
             Self::Verify(_) => "eliot.verify",
             Self::Coordinate(_) => "eliot.coordinate",
             Self::Finish(_) => "eliot.finish",
-        }
-    }
-
-    /// Normalizes the sole legacy alias to its canonical observation form.
-    #[must_use]
-    pub fn canonicalized(self) -> Self {
-        match self {
-            Self::LegacyMemoryUse(value) => Self::Observe(ObserveInput::InfluenceAck(value)),
-            value => value,
         }
     }
 
@@ -129,7 +114,6 @@ impl ToolRequest {
             Self::Verify(value) => value.validate(),
             Self::Coordinate(value) => value.validate(),
             Self::Finish(value) => value.validate(),
-            Self::LegacyMemoryUse(value) => value.validate(),
         }
     }
 }
@@ -390,7 +374,7 @@ pub enum InfluenceClass {
     SuppressedAsWrongScope,
 }
 
-/// Influence acknowledgement used by both canonical observe and the alias.
+/// Influence acknowledgement used by canonical observe.
 #[derive(Clone, Debug, JsonSchema, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct MemoryInfluenceAcknowledgement {
@@ -800,9 +784,9 @@ pub const PROTECTED_ENVELOPE_KEYS: [&str; 6] = [
     "tool",
 ];
 
-/// Explicitly admitted tool variants, including the sole legacy alias.
+/// Explicitly admitted tool variants.
 /// Unknown variants are rejected before collapse; no trial decoding is used.
-pub const ADMITTED_TOOL_NAMES: [&str; 9] = [
+pub const ADMITTED_TOOL_NAMES: [&str; 8] = [
     "eliot.state",
     "eliot.packet",
     "eliot.observe",
@@ -811,7 +795,6 @@ pub const ADMITTED_TOOL_NAMES: [&str; 9] = [
     "eliot.verify",
     "eliot.coordinate",
     "eliot.finish",
-    "eliot.memory_use",
 ];
 
 /// Maximum decoded control-name length echoed in diagnostics. Longer names
@@ -859,8 +842,7 @@ pub enum TypedRejection {
 /// strings, so escape-equivalent forms such as `"tool"` and
 /// `"\u0074ool"` conflict) before any `serde_json::Value` map collapse.
 /// Unknown tool variants from the explicit admission list are rejected
-/// before typed construction. Supported compatibility (`eliot.memory_use`)
-/// is admitted explicitly; no trial decoding is performed. Opaque tool data
+/// before typed construction; no trial decoding is performed. Opaque tool data
 /// (`content`/`message` values) remains inert `Value` and is never consulted
 /// for selector, identity, policy, authority, effect-ceiling, or `Finish`
 /// routing.
