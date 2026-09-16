@@ -1228,9 +1228,10 @@ impl GenerationCoordinator {
                 receipt.external_evidence = Some(evidence);
                 receipt.durable_published = true;
                 let confirmed = receipt.clone();
-                let adoption_matches = state.adoption.as_ref().is_some_and(|adoption| {
-                    adoption.operation_id == confirmed.operation_id
-                });
+                let adoption_matches = state
+                    .adoption
+                    .as_ref()
+                    .is_some_and(|adoption| adoption.operation_id == confirmed.operation_id);
                 if let Some(adoption) = state.adoption.as_mut().filter(|_| adoption_matches) {
                     adoption.confirmed = true;
                 }
