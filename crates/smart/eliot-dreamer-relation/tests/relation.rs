@@ -441,7 +441,8 @@ fn fixtures() -> (RelationInput, CurationAcceptanceCtx<'static>) {
 
 use eliot_dreamer_relation::{
     CausalMaterialBinding, CausalPredicateBinding, EvidenceBinding, EvidenceBindingKind,
-    EvidenceGradeBinding, RelationPolicy, grade_binding_digest, propose_relation,
+    EvidenceGradeBinding, GroundedRelationDraft, RelationPolicy, RelationResult,
+    grade_binding_digest, propose_relation,
 };
 use eliot_epistemic_contracts::{
     CausalClaim, CausalClaimParams, CausalStatus, EvidenceGrade, GradeAssignment, LineageRootId,
@@ -556,6 +557,198 @@ fn prepared(
     policy.seal().expect("policy seal");
     input.policy_digest.clone_from(&policy.digest);
     (input, policy, fixtures().1)
+}
+
+/// Decomposed 655-case: the validated item, grounded draft, endpoint pair,
+/// registry snapshot and neighborhood travel as separate typed inputs.
+struct Case {
+    item: ValidatedCurationItem,
+    draft: GroundedRelationDraft,
+    source: RelationEndpoint,
+    target: RelationEndpoint,
+    registry: RelationRegistrySnapshot,
+    neighborhood: RelationNeighborhood,
+    policy: RelationPolicy,
+    ctx: CurationAcceptanceCtx<'static>,
+}
+
+impl Case {
+    fn from_input(
+        input: RelationInput,
+        policy: RelationPolicy,
+        ctx: CurationAcceptanceCtx<'static>,
+    ) -> Self {
+        Self {
+            draft: GroundedRelationDraft {
+                schema_version: input.schema_version,
+                operation_id: input.operation_id.clone(),
+                request_id: input.request_id.clone(),
+                idempotency_key: input.idempotency_key.clone(),
+                task_id: input.task_id.clone(),
+                scope_id: input.scope_id.clone(),
+                state_fence: input.state_fence.clone(),
+                policy_digest: input.policy_digest.clone(),
+                family: input.family,
+                direction: input.direction,
+                screen: input.screen.clone(),
+                evidence: input.evidence.clone(),
+                counterevidence: input.counterevidence.clone(),
+                rivals: input.rivals.clone(),
+                no_relation_alternative: input.no_relation_alternative.clone(),
+                temporal: input.temporal.clone(),
+                verifier: input.verifier.clone(),
+                disclosure_evidence: input.disclosure_evidence.clone(),
+                preservation: input.preservation.clone(),
+            },
+            item: input.item,
+            source: input.source,
+            target: input.target,
+            registry: input.registry,
+            neighborhood: input.neighborhood,
+            policy,
+            ctx,
+        }
+    }
+
+    fn ready() -> Self {
+        let (input, policy, ctx) = prepared(fixtures().0);
+        Self::from_input(input, policy, ctx)
+    }
+
+    fn causal() -> Self {
+        let (input, policy, ctx) = causal_fixtures();
+        Self::from_input(input, policy, ctx)
+    }
+
+    /// Reassembles the closed input closure from the current decomposed parts.
+    fn assembled(&self) -> RelationInput {
+        self.draft.assemble(
+            &self.item,
+            &self.source,
+            &self.target,
+            &self.registry,
+            &self.neighborhood,
+        )
+    }
+
+    fn run(&self) -> Result<RelationResult, eliot_dreamer_contracts::ContractViolation> {
+        propose_relation(
+            &self.item,
+            &self.draft,
+            &self.source,
+            &self.target,
+            &self.registry,
+            &self.neighborhood,
+            &self.ctx,
+            &self.policy,
+        )
+    }
+
+    /// Re-seals the policy after a policy mutation and rebinds the draft.
+    fn reseal(&mut self) {
+        self.policy.seal().expect("reseal policy");
+        self.draft.policy_digest.clone_from(&self.policy.digest);
+    }
+
+    /// Recomputes the registry digest after a registry mutation and rebinds
+    /// every alternative and neighborhood snapshot to the new digest.
+    fn rebind_registry(&mut self) {
+        self.registry.digest = self.registry.computed_digest().expect("registry digest");
+        for alternative in self
+            .draft
+            .rivals
+            .iter_mut()
+            .chain(self.draft.no_relation_alternative.iter_mut())
+        {
+            alternative.registry_digest.clone_from(&self.registry.digest);
+        }
+        for relation in &mut self.neighborhood.relations {
+            relation.registry_digest.clone_from(&self.registry.digest);
+        }
+    }
+
+    /// Re-points evidence predicates, alternatives and the disclosure decision
+    /// at the current endpoint pair after an endpoint swap.
+    fn rebind_pair(&mut self) {
+        let source_id = self.source.endpoint_id().to_owned();
+        let target_id = self.target.endpoint_id().to_owned();
+        for evidence in self
+            .draft
+            .evidence
+            .iter_mut()
+            .chain(self.draft.counterevidence.iter_mut())
+        {
+            evidence.predicate.source_id.clone_from(&source_id);
+            evidence.predicate.target_id.clone_from(&target_id);
+        }
+        for alternative in self
+            .draft
+            .rivals
+            .iter_mut()
+            .chain(self.draft.no_relation_alternative.iter_mut())
+        {
+            alternative.source_id.clone_from(&source_id);
+            alternative.target_id.clone_from(&target_id);
+            alternative.source_revision = self.source.admitted.target_revision.clone();
+            alternative.target_revision = self.target.admitted.target_revision.clone();
+            alternative.source_material_digest = self.source.material_digest().to_owned();
+            alternative.target_material_digest = self.target.material_digest().to_owned();
+            alternative.source_admission_id =
+                self.source.admitted.admission.receipt_id.as_str().to_owned();
+            alternative.target_admission_id =
+                self.target.admitted.admission.receipt_id.as_str().to_owned();
+            alternative.source_admission_digest =
+                self.source.admitted.admission.canonical_sha256.clone();
+            alternative.target_admission_digest =
+                self.target.admitted.admission.canonical_sha256.clone();
+        }
+        if let Some(disclosure) = self.draft.disclosure_evidence.as_mut() {
+            disclosure.source_id.clone_from(&source_id);
+            disclosure.target_id.clone_from(&target_id);
+            disclosure.source_revision = self.source.admitted.target_revision.clone();
+            disclosure.target_revision = self.target.admitted.target_revision.clone();
+            disclosure.source_material_digest = self.source.material_digest().to_owned();
+            disclosure.target_material_digest = self.target.material_digest().to_owned();
+            disclosure.source_admission_id =
+                self.source.admitted.admission.receipt_id.as_str().to_owned();
+            disclosure.target_admission_id =
+                self.target.admitted.admission.receipt_id.as_str().to_owned();
+            disclosure.source_admission_digest =
+                self.source.admitted.admission.canonical_sha256.clone();
+            disclosure.target_admission_digest =
+                self.target.admitted.admission.canonical_sha256.clone();
+            disclosure.family = self.draft.family;
+            disclosure.direction = self.draft.direction;
+        }
+    }
+
+    /// Recomputes the accepted item digest after an item payload change and
+    /// rebuilds the retained screen, handler request and acceptance context.
+    fn rescreen(&mut self) {
+        let item_digest = self
+            .item
+            .item_digest(self.ctx.grounded)
+            .expect("item digest");
+        let mut screen = self.draft.screen.clone();
+        screen.item_digest = item_digest;
+        screen.screened_targets = self.item.payload.facets().targets.clone();
+        let mut request = (*self.ctx.request).clone();
+        request.payload = self.item.payload.clone();
+        request.denominator = self.item.denominator.clone();
+        request.screen_binding = Some(screen.clone());
+        self.draft.screen = screen.clone();
+        let screen_ref = Box::leak(Box::new(screen));
+        let request_ref = Box::leak(Box::new(request));
+        self.ctx = CurationAcceptanceCtx {
+            job: self.ctx.job,
+            bundle: self.ctx.bundle,
+            receipt: self.ctx.receipt,
+            screen: screen_ref,
+            grounded: self.ctx.grounded,
+            request: request_ref,
+            usage: self.ctx.usage,
+        };
+    }
 }
 
 fn causal_claim() -> CausalClaim {
@@ -861,62 +1054,54 @@ fn snapshot(
 #[test]
 fn direct_positive_requires_current_disclosure() {
     let (input, policy, ctx) = prepared(fixtures().0);
-    let result = propose_relation(input.clone(), &ctx, &policy).expect("positive relation");
+    let mut case = Case::from_input(input, policy, ctx);
+    let result = case.run().expect("positive relation");
     assert_eq!(result.disposition, RelationDisposition::Positive);
-    let mut refused = input;
-    refused.disclosure_evidence = None;
-    assert!(propose_relation(refused, &ctx, &policy).is_err());
+    case.draft.disclosure_evidence = None;
+    assert!(case.run().is_err());
 }
 
 #[test]
 fn causal_claim_accepts_lower_ceiling_and_rejects_missing_proof() {
     let (input, policy, ctx) = causal_fixtures();
-    let result = propose_relation(input.clone(), &ctx, &policy).expect("causal relation");
+    let mut case = Case::from_input(input, policy, ctx);
+    let result = case.run().expect("causal relation");
     assert_eq!(result.disposition, RelationDisposition::Positive);
     result.validate().expect("sealed causal result");
-    let mut missing = policy.clone();
-    missing.causal_material = None;
-    missing.seal().expect("reseal");
-    let mut missing_input = input;
-    missing_input.policy_digest = missing.digest.clone();
-    assert!(propose_relation(missing_input, &ctx, &missing).is_err());
+    case.policy.causal_material = None;
+    case.reseal();
+    assert!(case.run().is_err());
 }
 
 #[test]
 fn permitted_path_and_forbidden_path_are_distinct() {
-    let (mut input, mut policy, ctx) = prepared(fixtures().0);
-    input.evidence.clear();
-    input.registry.rules[0].permits_transitive = true;
-    input.registry.digest = input.registry.computed_digest().expect("registry");
-    input.rivals[0].registry_digest = input.registry.digest.clone();
-    input
-        .no_relation_alternative
-        .as_mut()
-        .expect("no relation")
-        .registry_digest = input.registry.digest.clone();
+    let (input, policy, ctx) = prepared(fixtures().0);
+    let mut case = Case::from_input(input, policy, ctx);
+    case.draft.evidence.clear();
+    case.registry.rules[0].permits_transitive = true;
+    case.rebind_registry();
     let edge_one_id = "edge-1";
     let edge_one = snapshot(
-        &input,
+        &case.assembled(),
         edge_one_id,
-        input.family,
-        input.direction,
+        case.draft.family,
+        case.draft.direction,
         "source-a",
         "middle-c",
     );
     let edge_two_id = "edge-2";
     let edge_two = snapshot(
-        &input,
+        &case.assembled(),
         edge_two_id,
-        input.family,
-        input.direction,
+        case.draft.family,
+        case.draft.direction,
         "middle-c",
         "target-b",
     );
-    input
-        .neighborhood
+    case.neighborhood
         .relations
         .extend([edge_one.clone(), edge_two.clone()]);
-    policy.transitive_path = vec![
+    case.policy.transitive_path = vec![
         eliot_dreamer_relation::PathRef {
             edge_id: edge_one_id.to_owned(),
             relation_digest: edge_one.relation_digest.clone(),
@@ -926,106 +1111,77 @@ fn permitted_path_and_forbidden_path_are_distinct() {
             relation_digest: edge_two.relation_digest.clone(),
         },
     ];
-    policy.seal().expect("policy");
-    input.policy_digest.clone_from(&policy.digest);
-    propose_relation(input.clone(), &ctx, &policy).expect("permitted transitive path");
-    let mut forbidden = policy;
-    forbidden.transitive_path[0].relation_digest = edge_one.relation_digest;
-    input.registry.rules[0].permits_transitive = false;
-    input.registry.digest = input.registry.computed_digest().expect("registry");
-    input.rivals[0].registry_digest = input.registry.digest.clone();
-    input
-        .no_relation_alternative
-        .as_mut()
-        .expect("no relation")
-        .registry_digest = input.registry.digest.clone();
-    for edge in &mut input.neighborhood.relations {
-        edge.registry_digest = input.registry.digest.clone();
-    }
-    forbidden.seal().expect("policy");
-    input.policy_digest = forbidden.digest.clone();
-    assert!(propose_relation(input, &ctx, &forbidden).is_err());
+    case.reseal();
+    case.run().expect("permitted transitive path");
+    case.policy.transitive_path[0].relation_digest = edge_one.relation_digest;
+    case.registry.rules[0].permits_transitive = false;
+    case.rebind_registry();
+    case.reseal();
+    assert!(case.run().is_err());
 }
 
 #[test]
 fn duplicate_inverse_and_changed_snapshot_are_retained() {
-    let (mut input, mut policy, ctx) = prepared(fixtures().0);
+    let (input, policy, ctx) = prepared(fixtures().0);
+    let mut case = Case::from_input(input, policy, ctx);
     let id = "external-retained";
     let existing = snapshot(
-        &input,
+        &case.assembled(),
         id,
-        input.family,
-        input.direction,
+        case.draft.family,
+        case.draft.direction,
         "source-a",
         "target-b",
     );
-    input.neighborhood.relations.push(existing.clone());
-    policy.proposed_snapshot = Some(existing.clone());
-    policy.seal().expect("policy");
-    input.policy_digest.clone_from(&policy.digest);
-    let result = propose_relation(input.clone(), &ctx, &policy).expect("duplicate");
+    case.neighborhood.relations.push(existing.clone());
+    case.policy.proposed_snapshot = Some(existing.clone());
+    case.reseal();
+    let result = case.run().expect("duplicate");
     assert_eq!(result.disposition, RelationDisposition::Duplicate);
     assert_eq!(result.closure.candidate.relation_id, id);
     let mut changed = existing;
     changed.relation_digest = digest("changed");
-    let mut conflict = policy;
-    conflict.proposed_snapshot = Some(changed);
-    conflict.seal().expect("policy");
-    input.policy_digest = conflict.digest.clone();
+    case.policy.proposed_snapshot = Some(changed);
+    case.reseal();
     assert_eq!(
-        propose_relation(input, &ctx, &conflict)
-            .expect("conflict")
-            .disposition,
+        case.run().expect("conflict").disposition,
         RelationDisposition::Conflict
     );
 
-    let (mut inverse_input, inverse_policy, inverse_ctx) = prepared(fixtures().0);
+    let mut inverse_case = Case::ready();
     let inverse = snapshot(
-        &inverse_input,
+        &inverse_case.assembled(),
         "inverse-retained",
         RelationFamily::Contradicts,
         RelationDirection::Forward,
         "target-b",
         "source-a",
     );
-    inverse_input.neighborhood.relations.push(inverse.clone());
-    inverse_input.policy_digest = inverse_policy.digest.clone();
-    let inverse_result =
-        propose_relation(inverse_input, &inverse_ctx, &inverse_policy).expect("inverse relation");
+    inverse_case.neighborhood.relations.push(inverse.clone());
+    let inverse_result = inverse_case.run().expect("inverse relation");
     assert_eq!(inverse_result.disposition, RelationDisposition::Inverse);
     assert_eq!(
         inverse_result.closure.candidate.before.as_ref(),
         Some(&inverse)
     );
 
-    let (mut symmetric_input, symmetric_policy, symmetric_ctx) = prepared(fixtures().0);
-    symmetric_input.registry.rules[0].symmetric = true;
-    symmetric_input.registry.rules[0].inverse_family = None;
-    symmetric_input.registry.digest = symmetric_input
-        .registry
-        .computed_digest()
-        .expect("symmetric registry");
-    symmetric_input.rivals[0].registry_digest = symmetric_input.registry.digest.clone();
-    symmetric_input
-        .no_relation_alternative
-        .as_mut()
-        .expect("no relation")
-        .registry_digest = symmetric_input.registry.digest.clone();
+    let mut symmetric_case = Case::ready();
+    symmetric_case.registry.rules[0].symmetric = true;
+    symmetric_case.registry.rules[0].inverse_family = None;
+    symmetric_case.rebind_registry();
     let symmetric = snapshot(
-        &symmetric_input,
+        &symmetric_case.assembled(),
         "symmetric-retained",
         RelationFamily::Supports,
         RelationDirection::Forward,
         "target-b",
         "source-a",
     );
-    symmetric_input
+    symmetric_case
         .neighborhood
         .relations
         .push(symmetric.clone());
-    symmetric_input.policy_digest = symmetric_policy.digest.clone();
-    let symmetric_result = propose_relation(symmetric_input, &symmetric_ctx, &symmetric_policy)
-        .expect("symmetric relation");
+    let symmetric_result = symmetric_case.run().expect("symmetric relation");
     assert_eq!(symmetric_result.disposition, RelationDisposition::Ambiguous);
     assert_eq!(
         symmetric_result.closure.candidate.before.as_ref(),
@@ -1035,33 +1191,27 @@ fn duplicate_inverse_and_changed_snapshot_are_retained() {
 
 #[test]
 fn replay_permutation_bounds_and_cancel_are_explicit() {
-    let (input, mut policy, ctx) = prepared(fixtures().0);
-    let first = propose_relation(input.clone(), &ctx, &policy).expect("first replay");
+    let (input, policy, ctx) = prepared(fixtures().0);
+    let mut case = Case::from_input(input, policy, ctx);
+    let first = case.run().expect("first replay");
     first.validate().expect("first sealed replay");
-    let digest_before = policy.digest.clone();
-    policy.grade_bindings.reverse();
-    policy.expected_alternative_refs.reverse();
-    policy.seal().expect("normalized policy");
-    assert_eq!(digest_before, policy.digest);
-    let second = propose_relation(input.clone(), &ctx, &policy).expect("second replay");
+    let digest_before = case.policy.digest.clone();
+    case.policy.grade_bindings.reverse();
+    case.policy.expected_alternative_refs.reverse();
+    case.policy.seal().expect("normalized policy");
+    assert_eq!(digest_before, case.policy.digest);
+    let second = case.run().expect("second replay");
     assert_eq!(first.result_digest, second.result_digest);
     assert_eq!(first.closure.result_digest, second.closure.result_digest);
-    let mut permuted_input = input.clone();
-    permuted_input.counterevidence.reverse();
-    permuted_input.policy_digest.clone_from(&policy.digest);
-    let permuted = propose_relation(permuted_input, &ctx, &policy).expect("permuted replay");
+    case.draft.counterevidence.reverse();
+    let permuted = case.run().expect("permuted replay");
     assert_eq!(first.result_digest, permuted.result_digest);
     assert_eq!(first.closure.result_digest, permuted.closure.result_digest);
-    let mut cancelled = policy.clone();
-    cancelled.cancellation_requested = true;
-    cancelled.seal().expect("cancel");
-    let mut cancelled_input = input.clone();
-    cancelled_input.policy_digest = cancelled.digest.clone();
-    assert!(propose_relation(cancelled_input, &ctx, &cancelled).is_err());
-    let mut bounded = policy;
-    bounded.max_evidence = 1;
-    bounded.seal().expect("bound");
-    let mut bounded_input = input;
-    bounded_input.policy_digest = bounded.digest.clone();
-    assert!(propose_relation(bounded_input, &ctx, &bounded).is_err());
+    case.policy.cancellation_requested = true;
+    case.reseal();
+    assert!(case.run().is_err());
+    case.policy.cancellation_requested = false;
+    case.policy.max_evidence = 1;
+    case.reseal();
+    assert!(case.run().is_err());
 }
