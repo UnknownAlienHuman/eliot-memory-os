@@ -27,15 +27,10 @@ use eliot_platform_windows::{
     is_eliot_governor_running, is_process_elevated, observe_current_user_config,
     windows_path_identity_digest,
 };
-use eliot_runtime_contracts::{
-    RUNTIME_LIVE_STORE_BIND, RUNTIME_LIVE_STORE_ENDPOINT, RUNTIME_LIVE_STORE_NAMESPACE,
-    RuntimeLiveStoreIdentity,
-};
+use eliot_runtime_contracts::RuntimeLiveStoreIdentity;
 use eliot_store_surreal::{StoreLaunchConfig, launch_config_digest};
 #[cfg(windows)]
 mod legacy_governor_config;
-#[cfg(windows)]
-use legacy_governor_config::GovernorConfig;
 use serde_json::json;
 use sha2::{Digest, Sha256};
 use std::path::PathBuf;
@@ -495,7 +490,6 @@ struct ManifestBoundCanaryBinding {
     manifest: CandidateManifest,
     fence: ActivationCommitFence,
     store_config_lease: ProtectedRuntimePathLease,
-    legacy_config: Option<eliot_platform_windows::LocalAppDataConfigRead>,
 }
 
 #[cfg(windows)]
@@ -627,83 +621,35 @@ fn classify_legacy_governor_process_state(state: Result<bool, String>) -> Result
 }
 
 #[cfg(windows)]
-fn observe_legacy_governor_config() -> Result<Option<eliot_platform_windows::LocalAppDataConfigRead>>
-{
-    let retained = match observe_current_user_config(INSTALLATION_INPUT_LIMIT) {
-        Ok(eliot_platform_windows::LocalAppDataConfigObservation::Absent { .. }) => None,
+fn observe_legacy_governor_config() -> Result<()> {
+    // #1687: the legacy Governor file is never adopted as authority. A present
+    // file fails closed with the Kernel-surface migration action; an absent
+    // file is provisional and lets the canary/install path proceed.
+    match observe_current_user_config(INSTALLATION_INPUT_LIMIT) {
+        Ok(eliot_platform_windows::LocalAppDataConfigObservation::Absent { .. }) => {
+            legacy_governor_config::gate_legacy_config_observation(None)
+                .map_err(|error| anyhow::anyhow!(error))?;
+        }
         Ok(eliot_platform_windows::LocalAppDataConfigObservation::Present(read)) => {
-            let text = std::str::from_utf8(read.bytes())
-                .map_err(|error| anyhow::anyhow!("legacy Governor config is not UTF-8: {error}"))?;
-            let config: GovernorConfig = toml::from_str(text)
-                .map_err(|error| anyhow::anyhow!("legacy Governor config is malformed: {error}"))?;
-            config
-                .validate()
-                .map_err(|error| anyhow::anyhow!("legacy Governor config is invalid: {error}"))?;
-            config
-                .db
-                .surreal
-                .reject_store_collision(
-                    RUNTIME_LIVE_STORE_BIND,
-                    RUNTIME_LIVE_STORE_ENDPOINT,
-                    RUNTIME_LIVE_STORE_NAMESPACE,
-                )
-                .map_err(|error| {
-                    anyhow::anyhow!(
-                        "legacy Governor config collides with runtime-live Store: {error}"
-                    )
-                })?;
-            read.verify_stable().map_err(|error| {
-                anyhow::anyhow!("legacy Governor config changed during validation: {error}")
-            })?;
-            Some(read)
+            legacy_governor_config::gate_legacy_config_observation(Some((
+                read.path(),
+                read.bytes(),
+            )))
+            .map_err(|error| anyhow::anyhow!(error))?;
         }
         Err(error) => anyhow::bail!("legacy Governor config observation is unknown: {error}"),
-    };
-    classify_legacy_governor_process_state(
-        is_eliot_governor_running().map_err(|error| error.to_string()),
-    )
-    .map_err(|error| anyhow::anyhow!(error))?;
-    Ok(retained)
-}
-
-#[cfg(windows)]
-fn revalidate_legacy_governor_gate(
-    retained: Option<&eliot_platform_windows::LocalAppDataConfigRead>,
-) -> Result<()> {
-    if let Some(read) = retained {
-        let text = std::str::from_utf8(read.bytes()).map_err(|error| {
-            anyhow::anyhow!("retained legacy Governor config is not UTF-8: {error}")
-        })?;
-        let config: GovernorConfig = toml::from_str(text).map_err(|error| {
-            anyhow::anyhow!("retained legacy Governor config is malformed: {error}")
-        })?;
-        config.validate().map_err(|error| {
-            anyhow::anyhow!("retained legacy Governor config is invalid: {error}")
-        })?;
-        config
-            .db
-            .surreal
-            .reject_store_collision(
-                RUNTIME_LIVE_STORE_BIND,
-                RUNTIME_LIVE_STORE_ENDPOINT,
-                RUNTIME_LIVE_STORE_NAMESPACE,
-            )
-            .map_err(|error| {
-                anyhow::anyhow!(
-                    "retained legacy Governor config collides with runtime-live Store: {error}"
-                )
-            })?;
-        read.verify_stable()
-            .map_err(|error| anyhow::anyhow!("retained legacy Governor config changed: {error}"))?;
-    } else {
-        // An absent legacy config is provisional; reobserve the OS-known path
-        // after the guarded operation so appearance is not silently adopted.
-        let _ = observe_legacy_governor_config()?;
     }
     classify_legacy_governor_process_state(
         is_eliot_governor_running().map_err(|error| error.to_string()),
     )
     .map_err(|error| anyhow::anyhow!(error))
+}
+
+#[cfg(windows)]
+fn revalidate_legacy_governor_gate() -> Result<()> {
+    // Re-observe the OS-known path after the guarded operation so a file that
+    // appears mid-operation is rejected rather than silently adopted.
+    observe_legacy_governor_config()
 }
 
 #[cfg(windows)]
@@ -808,7 +754,9 @@ fn load_manifest_bound_canary_binding(
         anyhow::bail!("active manifest and committed activation fence disagree");
     }
     validate_active_phase_b_runtime_binding(&registry, &manifest, &fence)?;
-    let legacy_config = observe_legacy_governor_config()?;
+    // #1687: reject a present legacy Governor file before any canary effect;
+    // absent proceeds with no legacy config adopted.
+    observe_legacy_governor_config()?;
     let store_config_lease = ProtectedRuntimePathLease::open_existing_absolute_exclusive(
         Path::new(manifest.runtime_launch.store_config_path.as_str()),
     )
@@ -890,7 +838,6 @@ fn load_manifest_bound_canary_binding(
         manifest,
         fence,
         store_config_lease,
-        legacy_config,
     })
 }
 
@@ -902,7 +849,6 @@ fn revalidate_manifest_bound_canary_binding(
     expected_manifest: &CandidateManifest,
     expected_fence: &ActivationCommitFence,
     expected_store_config_lease: &ProtectedRuntimePathLease,
-    expected_legacy_config: Option<&eliot_platform_windows::LocalAppDataConfigRead>,
 ) -> Result<()> {
     let canonical_host_root = validate_snapshot_matches_lease(
         &PathBuf::from(
@@ -949,7 +895,7 @@ fn revalidate_manifest_bound_canary_binding(
         anyhow::bail!("committed activation fence changed during canary");
     }
     validate_active_phase_b_runtime_binding(&registry, &active.manifest, fence)?;
-    revalidate_legacy_governor_gate(expected_legacy_config)?;
+    revalidate_legacy_governor_gate()?;
     validate_manifest_store_config(expected_manifest, expected_store_config_lease)?;
     retained_host
         .verify_stable_identity()
@@ -993,7 +939,6 @@ fn validate_manifest_bound_canary_state(binding: &ManifestBoundCanaryBinding) ->
         &binding.manifest,
         &binding.fence,
         &binding.store_config_lease,
-        binding.legacy_config.as_ref(),
     )
 }
 
@@ -1715,7 +1660,6 @@ fn installation_status_error_code(error: &InstallationError) -> &'static str {
 struct InstallationRuntimePreflightGuard {
     _source: TrustedSourceBundle,
     generation: TrustedSourceFileLease,
-    legacy_config: Option<eliot_platform_windows::LocalAppDataConfigRead>,
 }
 
 #[cfg(windows)]
@@ -1767,7 +1711,7 @@ impl InstallationRuntimePreflightGuard {
         {
             anyhow::bail!("retained generation.json runtime binding changed during effects");
         }
-        revalidate_legacy_governor_gate(self.legacy_config.as_ref())
+        revalidate_legacy_governor_gate()
     }
 }
 
@@ -1858,11 +1802,12 @@ fn validate_installation_runtime_preflight(
         .read_bounded(INSTALLATION_INPUT_LIMIT)
         .map_err(anyhow::Error::new)
         .context("re-read generation.json lease")?;
-    let legacy_config = observe_legacy_governor_config()?;
+    // #1687: reject a present legacy Governor file before installation effects;
+    // absent proceeds with no legacy config adopted.
+    observe_legacy_governor_config()?;
     Ok(InstallationRuntimePreflightGuard {
         _source: source,
         generation: lease,
-        legacy_config,
     })
 }
 
