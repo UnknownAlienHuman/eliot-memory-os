@@ -2594,4 +2594,62 @@ mod tests {
         );
         Ok(())
     }
+
+    #[tokio::test]
+    async fn wire_close_before_response_is_typed_unknown() -> Result<(), Box<dyn std::error::Error>>
+    {
+        use std::collections::VecDeque;
+        use std::io::Error as IoError;
+
+        struct QueueTransport {
+            chunks: VecDeque<Vec<u8>>,
+        }
+
+        impl AcpTransport for QueueTransport {
+            type Error = IoError;
+
+            async fn write_frame(&mut self, frame: Vec<u8>) -> Result<(), Self::Error> {
+                self.chunks.push_back(frame);
+                Ok(())
+            }
+
+            async fn read_chunk(&mut self) -> Result<Option<Vec<u8>>, Self::Error> {
+                Ok(self.chunks.pop_front())
+            }
+        }
+
+        // Immediate close before any complete response is an explicit unknown
+        // outcome (a response may have been accepted); it never becomes an
+        // empty successful result.
+        let mut closing = AcpWire::new(QueueTransport {
+            chunks: VecDeque::new(),
+        });
+        match closing.receive().await? {
+            AcpOutcome::Unknown(unknown) => {
+                assert_eq!(unknown.operation_id, "wire-receive");
+                assert!(!unknown.reason.trim().is_empty());
+                assert_eq!(unknown.session_id, None);
+            }
+            AcpOutcome::Completed(_) | AcpOutcome::Unavailable { .. } => {
+                panic!("transport close must not complete or resolve as unavailable")
+            }
+        }
+
+        // One complete framed response still completes with its exact message.
+        let body = br#"{"jsonrpc":"2.0","id":1,"result":{}}"#;
+        let frame = AcpFrameCodec::encode(body)?;
+        let mut queued = AcpWire::new(QueueTransport {
+            chunks: VecDeque::from([frame]),
+        });
+        match queued.receive().await? {
+            AcpOutcome::Completed(AcpJsonRpcMessage::Response(response)) => {
+                assert_eq!(response.id, AcpRequestId::Number(1));
+                assert!(response.error.is_none());
+            }
+            other => panic!("framed response must complete, got {other:?}"),
+        }
+        // The queue is drained: the next read observes the close as unknown.
+        assert!(matches!(queued.receive().await?, AcpOutcome::Unknown(_)));
+        Ok(())
+    }
 }

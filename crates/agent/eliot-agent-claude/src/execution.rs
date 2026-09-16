@@ -1652,6 +1652,27 @@ mod tests {
         }
     }
 
+    #[test]
+    fn credential_reference_is_redacted_in_debug() -> TestResult {
+        // The factory carries a broker/key reference only; raw secret material
+        // never enters this package (`SecretRef` holds provider/key ids, and
+        // its constructor takes no secret bytes). The factory's own
+        // credential field must render as the redaction marker instead of the
+        // reference. (The sealed `ProcessRequest` projection keeps its
+        // kernel-owned `SecretRef` list under the kernel's Debug; those ids
+        // are likewise non-secret references.)
+        let input = fresh_input()?;
+        assert_eq!(input.credential.provider(), "test-broker");
+        assert_eq!(input.credential.key(), "claude-api-key");
+        let rendered = format!("{input:?}");
+        assert!(rendered.contains("credential: \"[redacted credential reference]\""));
+        let prepared = prepared_fixture()?;
+        assert_eq!(prepared.credential().provider(), "test-broker");
+        let rendered = format!("{prepared:?}");
+        assert!(rendered.contains("credential: \"[redacted credential reference]\""));
+        Ok(())
+    }
+
     // -- preparation -------------------------------------------------------
 
     #[test]
