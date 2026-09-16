@@ -1,15 +1,91 @@
 use super::*;
 
+// F-LOG-HOST-2 (#893) Store-recovery request observation helpers.
+//
+// Through the #889 facade only
+// (`crate::host_diagnostics::observe_entrypoint_with_detail`,
+// `observe_terminal_error`); the Event Log seam stays typed-Unavailable
+// (`crate::windows_event_log::event_log_sink_status`), never implemented here
+// (#984 still open).
+//
+// Observation-only contract: every helper projects facts already produced by
+// the semantic owner. Arguments are static literals only — never Store
+// payloads, digests treated as secrets, process identities, or arbitrary
+// error text — so bounding limits size, not sensitivity (I15.4). Sink outcome
+// never alters result/order/status/cleanup. There is no mutable global dedup
+// cache: one terminal emission per failed recovery operation is enforced by
+// the single outermost guard per operation (`handle_store_recovery_request`
+// and `reconcile_store_recovery_request` each own theirs), while inner
+// attempt/reconcile/execute phases correlate by stage order only. Exact
+// replay is observed as readback, never as a duplicate commit; changed
+// content stays a preserved conflict. This mirrors the `HostTerminalGuard`
+// model in `lib.rs` (F-LOG-HOST-1, #891) without touching it.
+fn store_recovery_note_event_log_unavailable() {
+    let _ = crate::windows_event_log::event_log_sink_status();
+}
+
+fn store_recovery_observe(detail: &str) {
+    store_recovery_note_event_log_unavailable();
+    crate::host_diagnostics::observe_entrypoint_with_detail(
+        crate::host_diagnostics::EntrypointStage::ScmDispatch,
+        detail,
+    );
+}
+
+fn store_recovery_observe_terminal(code: &str) {
+    store_recovery_note_event_log_unavailable();
+    crate::host_diagnostics::observe_terminal_error(code);
+}
+
+/// Single-terminal guard for one Store-recovery request operation.
+///
+/// Armed on entry; the single outermost boundary disarms on success or on
+/// delegation to another terminal-owning boundary. Any `Unknown` return drops
+/// armed and emits exactly one terminal record with the operation's frozen
+/// code. Emitting here never changes the `Response`: the guard only observes
+/// the already-produced outcome. No dedup cache, no lock, no second
+/// evaluation.
+struct StoreRecoveryTerminalGuard<'a> {
+    code: &'a str,
+    armed: bool,
+}
+
+impl<'a> StoreRecoveryTerminalGuard<'a> {
+    fn armed(code: &'a str) -> Self {
+        Self { code, armed: true }
+    }
+
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for StoreRecoveryTerminalGuard<'_> {
+    fn drop(&mut self) {
+        if self.armed {
+            store_recovery_observe_terminal(self.code);
+        }
+    }
+}
+
 impl HostComposition {
     #[cfg(windows)]
     pub fn handle_store_recovery_request(
         &mut self,
         request: &HostRuntimeControlRequest,
     ) -> HostRuntimeControlResponse {
+        // F-LOG-HOST-2 (#893): recovery requested/attempted/succeeded/failed/
+        // unknown stay distinct. Single terminal via guard; the delegated
+        // reconcile path owns its own terminal, so this guard disarms before
+        // delegating.
+        store_recovery_observe("host.store-recovery requested");
+        let mut handle_terminal = StoreRecoveryTerminalGuard::armed("host-store-recovery-unknown");
         if request.operation == HostRuntimeControlOperation::ReconcileStoreRecovery {
+            handle_terminal.disarm();
             return self.reconcile_store_recovery_request(request);
         }
         if self.store_recovery_startup_fence.is_fenced() {
+            store_recovery_observe("host.store-recovery unknown fence");
             return HostRuntimeControlResponse::unknown_for(
                 request,
                 eliot_host_service::runtime_control::runtime_control_unknown_ref(
@@ -24,6 +100,7 @@ impl HostComposition {
             .live_guard()
             .is_err()
         {
+            store_recovery_observe("host.store-recovery unknown owner");
             return HostRuntimeControlResponse::unknown_for(
                 request,
                 eliot_host_service::runtime_control::runtime_control_unknown_ref(
@@ -34,14 +111,21 @@ impl HostComposition {
         }
         let result = self.execute_store_recovery(request);
         match result {
-            Ok(receipt) => HostRuntimeControlResponse::store_recovered_for(request, receipt),
-            Err(_error) => HostRuntimeControlResponse::unknown_for(
-                request,
-                eliot_host_service::runtime_control::runtime_control_unknown_ref(
-                    "store-recovery",
+            Ok(receipt) => {
+                handle_terminal.disarm();
+                store_recovery_observe("host.store-recovery receipt completion");
+                HostRuntimeControlResponse::store_recovered_for(request, receipt)
+            }
+            Err(_error) => {
+                store_recovery_observe("host.store-recovery unknown");
+                HostRuntimeControlResponse::unknown_for(
                     request,
-                ),
-            ),
+                    eliot_host_service::runtime_control::runtime_control_unknown_ref(
+                        "store-recovery",
+                        request,
+                    ),
+                )
+            }
         }
     }
 
@@ -55,13 +139,19 @@ impl HostComposition {
         generation: &PlatformHandle,
         config_digest: &PlatformHandle,
     ) -> Result<HostRuntimeControlRequest, HostError> {
-        host_owned_store_recovery_request(
+        // F-LOG-HOST-2 (#893): SCM dead-Store trigger identity boundary. The
+        // built request is observed as admitted by the caller; failures stay
+        // with the caller's terminal.
+        store_recovery_observe("host.store-recovery scm requested");
+        let request = host_owned_store_recovery_request(
             &self.host,
             &self.activation_id,
             &self.activation_generation,
             generation,
             config_digest,
-        )
+        )?;
+        store_recovery_observe("host.store-recovery scm admitted");
+        Ok(request)
     }
 
     #[cfg(windows)]
@@ -70,6 +160,10 @@ impl HostComposition {
         &mut self,
         request: &HostRuntimeControlRequest,
     ) -> Result<Option<HostStoreRecoveryReceipt>, HostError> {
+        // F-LOG-HOST-2 (#893): committed-reconcile boundary. Stale or foreign
+        // evidence is preserved as a typed failure, never adopted; terminals
+        // stay with the outermost request boundary.
+        store_recovery_observe("host.store-recovery reconcile-committed requested");
         if self.store_recovery_startup_fence.is_fenced()
             && request.operation != HostRuntimeControlOperation::ReconcileStoreRecovery
         {
@@ -93,6 +187,9 @@ impl HostComposition {
         if pending.host_epoch != self.host.epoch.current.sequence.get()
             || pending.host_lineage != self.host.epoch.current.lineage_id.as_str()
         {
+            // F-LOG-HOST-2 (#893): foreign-epoch intent preserved, never
+            // adopted by this Host epoch.
+            store_recovery_observe("host.store-recovery epoch mismatch preserved");
             return Err(HostError::RecoveryRequired(
                 "Store recovery pending identity belongs to another live Host epoch".to_owned(),
             ));
@@ -227,6 +324,9 @@ impl HostComposition {
             || &phase_b.launch != launch
             || self.jobs.config_digest.as_ref() != Some(&phase_b.config_file_digest)
         {
+            // F-LOG-HOST-2 (#893): stale generation/config/Phase-B binding
+            // preserved, never adopted.
+            store_recovery_observe("host.store-recovery stale binding preserved");
             return Err(HostError::RecoveryRequired(
                 "Store recovery generation/config/Phase-B binding is stale".to_owned(),
             ));
@@ -391,6 +491,10 @@ impl HostComposition {
             } else {
                 receipt
             };
+        // F-LOG-HOST-2 (#893): committed contour reconciled from durable
+        // evidence; a reconcile rebind is a readback, never a duplicate
+        // commit.
+        store_recovery_observe("host.store-recovery reconcile-committed receipt");
         Ok(Some(response_receipt))
     }
 
@@ -404,6 +508,10 @@ impl HostComposition {
         &self,
         receipt: &HostStoreRecoveryReceipt,
     ) -> Result<bool, HostError> {
+        // F-LOG-HOST-2 (#893): contour-compare boundary. A receipt that does
+        // not match this exact live contour is preserved as non-matching,
+        // never adopted; terminals stay with the outermost request boundary.
+        store_recovery_observe("host.store-recovery contour compare requested");
         let snapshot = self.journal.snapshot()?;
         let active_fence =
             record_fence(&self.host, &self.activation_id, &self.activation_generation);
@@ -417,14 +525,19 @@ impl HostComposition {
                 && record.store_fence == receipt.store_fence
         });
         let Some(record) = committed.next() else {
+            store_recovery_observe("host.store-recovery contour mismatch preserved");
             return Ok(false);
         };
         if committed.next().is_some() {
+            // F-LOG-HOST-2 (#893): multiple committed matches stay a
+            // conflict, never an adoption.
+            store_recovery_observe("host.store-recovery contour conflict preserved");
             return Err(HostError::RecoveryRequired(
                 "Store recovery receipt matches multiple current committed rebinds".to_owned(),
             ));
         }
         let Some(store) = self.jobs.store.as_ref() else {
+            store_recovery_observe("host.store-recovery contour mismatch preserved");
             return Ok(false);
         };
         let process = store.evidence().process();
@@ -438,6 +551,7 @@ impl HostComposition {
             || record.process_image_path.as_str() != process.image_path
             || record.job_name.as_str() != store.job_identity().name()
         {
+            store_recovery_observe("host.store-recovery contour mismatch preserved");
             return Ok(false);
         }
         if !store
@@ -446,13 +560,20 @@ impl HostComposition {
             .iter()
             .any(|observed| observed == process)
         {
+            store_recovery_observe("host.store-recovery contour mismatch preserved");
             return Ok(false);
         }
-        Ok(snapshot.readiness_observations.iter().any(|observation| {
+        let matched = snapshot.readiness_observations.iter().any(|observation| {
             observation.fence == active_fence
                 && observation.store_fence == receipt.store_fence
                 && observation.ready_receipt_digest == receipt.ready_receipt_digest
-        }))
+        });
+        if matched {
+            store_recovery_observe("host.store-recovery contour matched");
+        } else {
+            store_recovery_observe("host.store-recovery contour mismatch preserved");
+        }
+        Ok(matched)
     }
 
     #[cfg(windows)]
@@ -461,12 +582,21 @@ impl HostComposition {
         &mut self,
         request: &HostRuntimeControlRequest,
     ) -> HostRuntimeControlResponse {
+        // F-LOG-HOST-2 (#893): reconcile requested/attempted/receipt/
+        // readback/unknown stay distinct. Single terminal via guard; inner
+        // compare/persist phases correlate by stage order only. An exact
+        // durable receipt rebind is a readback replay, never a duplicate
+        // commit; changed content stays a preserved conflict.
+        store_recovery_observe("host.store-recovery reconcile requested");
+        let mut reconcile_terminal =
+            StoreRecoveryTerminalGuard::armed("host-store-recovery-reconcile-unknown");
         if self
             .owner_lease
             .activation_capability()
             .live_guard()
             .is_err()
         {
+            store_recovery_observe("host.store-recovery reconcile unknown owner");
             return HostRuntimeControlResponse::unknown_for(
                 request,
                 eliot_host_service::runtime_control::runtime_control_unknown_ref(
@@ -478,6 +608,7 @@ impl HostComposition {
         if request.validate().is_err()
             || request.operation != HostRuntimeControlOperation::ReconcileStoreRecovery
         {
+            store_recovery_observe("host.store-recovery reconcile unknown validation");
             return HostRuntimeControlResponse::unknown_for(
                 request,
                 eliot_host_service::runtime_control::runtime_control_unknown_ref(
@@ -487,6 +618,7 @@ impl HostComposition {
             );
         }
         if self.store_recovery_startup_fence.is_fenced() {
+            store_recovery_observe("host.store-recovery reconcile unknown fence");
             return HostRuntimeControlResponse::unknown_for(
                 request,
                 eliot_host_service::runtime_control::runtime_control_unknown_ref(
@@ -498,10 +630,13 @@ impl HostComposition {
         let key = request.mutation_digest.as_str().to_owned();
         match self.reconcile_committed_store_recovery(request) {
             Ok(Some(receipt)) => {
+                reconcile_terminal.disarm();
+                store_recovery_observe("host.store-recovery reconcile receipt completion");
                 return HostRuntimeControlResponse::store_recovered_for(request, receipt);
             }
             Ok(None) => {}
             Err(_) => {
+                store_recovery_observe("host.store-recovery reconcile unknown");
                 return HostRuntimeControlResponse::unknown_for(
                     request,
                     eliot_host_service::runtime_control::runtime_control_unknown_ref(
@@ -513,6 +648,9 @@ impl HostComposition {
         }
         match has_store_recovery_pending(self.launch_options.host_state_root(), &key) {
             Ok(true) => {
+                // F-LOG-HOST-2 (#893): a retained intent keeps this Unknown;
+                // the pending record is preserved, never re-committed here.
+                store_recovery_observe("host.store-recovery reconcile unknown pending");
                 return HostRuntimeControlResponse::unknown_for(
                     request,
                     eliot_host_service::runtime_control::runtime_control_unknown_ref(
@@ -522,6 +660,7 @@ impl HostComposition {
                 );
             }
             Err(_) => {
+                store_recovery_observe("host.store-recovery reconcile unknown snapshot");
                 return HostRuntimeControlResponse::unknown_for(
                     request,
                     eliot_host_service::runtime_control::runtime_control_unknown_ref(
@@ -542,11 +681,23 @@ impl HostComposition {
                 match self.store_recovery_receipt_matches_current_contour(&receipt) {
                     Ok(true) => match rebind_store_recovery_receipt(&receipt, request) {
                         Ok(rebound) => {
+                            // F-LOG-HOST-2 (#893): exact durable receipt
+                            // rebind is a response-loss readback, never a
+                            // duplicate commit.
+                            reconcile_terminal.disarm();
+                            store_recovery_observe(
+                                "host.store-recovery reconcile receipt readback replay",
+                            );
                             return HostRuntimeControlResponse::store_recovered_for(
                                 request, rebound,
                             );
                         }
                         Err(_) => {
+                            // F-LOG-HOST-2 (#893): changed content stays a
+                            // preserved conflict, never an adoption.
+                            store_recovery_observe(
+                                "host.store-recovery reconcile unknown conflict",
+                            );
                             return HostRuntimeControlResponse::unknown_for(
                                 request,
                                 eliot_host_service::runtime_control::runtime_control_unknown_ref(
@@ -557,6 +708,7 @@ impl HostComposition {
                         }
                     },
                     Ok(false) => {
+                        store_recovery_observe("host.store-recovery reconcile unknown fence");
                         return HostRuntimeControlResponse::unknown_for(
                             request,
                             eliot_host_service::runtime_control::runtime_control_unknown_ref(
@@ -566,6 +718,7 @@ impl HostComposition {
                         );
                     }
                     Err(_) => {
+                        store_recovery_observe("host.store-recovery reconcile unknown snapshot");
                         return HostRuntimeControlResponse::unknown_for(
                             request,
                             eliot_host_service::runtime_control::runtime_control_unknown_ref(
@@ -578,6 +731,7 @@ impl HostComposition {
             }
             Ok(None) => {}
             Err(_) => {
+                store_recovery_observe("host.store-recovery reconcile unknown snapshot");
                 return HostRuntimeControlResponse::unknown_for(
                     request,
                     eliot_host_service::runtime_control::runtime_control_unknown_ref(
@@ -598,6 +752,10 @@ impl HostComposition {
                             StoreRebindState::Pending | StoreRebindState::Unknown
                         )
                 }) {
+                    // F-LOG-HOST-2 (#893): a journaled pending intent keeps
+                    // this Unknown; the intent is preserved, never re-committed
+                    // here.
+                    store_recovery_observe("host.store-recovery reconcile unknown pending");
                     return HostRuntimeControlResponse::unknown_for(
                         request,
                         eliot_host_service::runtime_control::runtime_control_unknown_ref(
@@ -608,6 +766,7 @@ impl HostComposition {
                 }
             }
             Err(_) => {
+                store_recovery_observe("host.store-recovery reconcile unknown snapshot");
                 return HostRuntimeControlResponse::unknown_for(
                     request,
                     eliot_host_service::runtime_control::runtime_control_unknown_ref(
@@ -617,6 +776,10 @@ impl HostComposition {
                 );
             }
         }
+        // F-LOG-HOST-2 (#893): no committed contour, receipt, or pending
+        // intent proved this reconcile; the armed guard emits the single
+        // terminal for this Unknown outcome on return.
+        store_recovery_observe("host.store-recovery reconcile unknown");
         HostRuntimeControlResponse::unknown_for(
             request,
             eliot_host_service::runtime_control::runtime_control_unknown_ref(
@@ -632,6 +795,11 @@ impl HostComposition {
         &mut self,
         request: &HostRuntimeControlRequest,
     ) -> Result<HostStoreRecoveryReceipt, HostError> {
+        // F-LOG-HOST-2 (#893): execute attempt boundary. Attempted versus
+        // replayed versus completed stay distinct; failures propagate to the
+        // single terminal owned by `handle_store_recovery_request`, so this
+        // boundary owns no terminal of its own.
+        store_recovery_observe("host.store-recovery execute requested");
         request.validate().map_err(HostError::ProcessContour)?;
         if request.operation != HostRuntimeControlOperation::RecoverStore {
             return Err(HostError::ProcessContour(
@@ -640,6 +808,9 @@ impl HostComposition {
         }
         let key = request.mutation_digest.as_str().to_owned();
         if let Some(receipt) = self.reconcile_committed_store_recovery(request)? {
+            // F-LOG-HOST-2 (#893): committed contour already reconciled; an
+            // exact replay is a readback, never a duplicate commit.
+            store_recovery_observe("host.store-recovery execute replay readback");
             return Ok(receipt);
         }
         if has_store_recovery_pending(self.launch_options.host_state_root(), &key)? {
@@ -662,6 +833,9 @@ impl HostComposition {
             if receipt.request_digest == request.request_digest
                 && self.store_recovery_receipt_matches_current_contour(&receipt)?
             {
+                // F-LOG-HOST-2 (#893): durable receipt answers response loss
+                // for this exact live contour; a readback, never a new commit.
+                store_recovery_observe("host.store-recovery execute receipt readback");
                 return Ok(receipt);
             }
             return Err(HostError::RecoveryRequired(
@@ -701,6 +875,10 @@ impl HostComposition {
             &self.host,
         )? == StoreRecoveryPendingPublication::Replay
         {
+            // F-LOG-HOST-2 (#893): the intent is already pending from an
+            // earlier attempt; this replay stays Unknown pending reconcile,
+            // never a second publication.
+            store_recovery_observe("host.store-recovery execute intent replay observed");
             return Err(HostError::RecoveryRequired(
                 "Store recovery intent is already pending; reconcile required".to_owned(),
             ));
@@ -1003,6 +1181,9 @@ impl HostComposition {
                 "fresh Store readiness did not produce an admissible lease".to_owned(),
             ));
         }
+        // F-LOG-HOST-2 (#893): recovery executed to a fresh receipt; the
+        // completion response is observed by `handle_store_recovery_request`.
+        store_recovery_observe("host.store-recovery execute receipt completion");
         Ok(receipt)
     }
 }
