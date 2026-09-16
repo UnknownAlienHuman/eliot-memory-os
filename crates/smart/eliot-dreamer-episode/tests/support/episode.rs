@@ -6,7 +6,6 @@ use eliot_contracts::{
     ArtifactId, ClockReading, EpochId, EpochLineageId, ProductId, ResourceGeneration, SourceId,
     StateFence, TaskRevision,
 };
-use std::num::NonZeroU64;
 use eliot_dreamer_contracts::curation::{EpisodePayload, TargetEvidence};
 use eliot_dreamer_contracts::*;
 use eliot_epistemic_contracts::{
@@ -25,6 +24,7 @@ use eliot_observation_contracts::{
     ObservationKind, ObservationScope, PrivacyRetentionDisclosure, ProducerTrace,
 };
 use eliot_receipts::WorkScopeId;
+use std::num::NonZeroU64;
 
 use eliot_dreamer_episode::{
     BoundaryRule, EpisodeOutcome, EpisodeParticipant, EpisodePolicy, EventAndSourceSnapshot,
