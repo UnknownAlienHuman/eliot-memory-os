@@ -5893,6 +5893,10 @@ impl HostComposition {
     /// Returns an error only when Host admission itself is fenced.
     #[cfg(windows)]
     pub fn liveness_tick(&mut self) -> Result<HostLivenessTick, HostError> {
+        // F-LOG-HOST-1: liveness is never readiness. Single terminal via
+        // guard; the readiness contour here is identity rederivation only.
+        host_lifecycle_observe_requested("host.liveness requested");
+        let mut _host_terminal = HostTerminalGuard::armed("host-liveness-failed");
         self.ensure_admission_open()?;
         let liveness = self.jobs.liveness_only();
         let active_manifest = self.registry.active().map(|active| &active.manifest);
@@ -5907,6 +5911,9 @@ impl HostComposition {
             std::time::Instant::now(),
         );
         self.readiness_gate = readiness_gate;
+        _host_terminal.disarm();
+        // Liveness observation only; never claims ready.
+        host_lifecycle_observe_requested("host.liveness observed");
         Ok(tick)
     }
 
@@ -5921,6 +5928,11 @@ impl HostComposition {
     #[cfg(windows)]
     #[allow(clippy::too_many_lines, reason = "ordered branch reconciliation")]
     pub fn reconcile_approved_contour(&mut self) -> Result<HostBranchDisposition, HostError> {
+        // F-LOG-HOST-1: reconcile vs liveness vs readiness preserved.
+        // Readiness is claimed only inside `reconcile_branch_readiness_at`
+        // with authenticated evidence; this outer only admits the contour.
+        host_lifecycle_observe_requested("host.reconcile requested");
+        let mut _host_terminal = HostTerminalGuard::armed("host-reconcile-failed");
         self.ensure_admission_open()?;
         let active =
             self.registry.active().cloned().ok_or_else(|| {
@@ -6049,14 +6061,18 @@ impl HostComposition {
                 });
             }
         }
-        Ok(self.reconcile_branch_readiness_at(
+        let disposition = self.reconcile_branch_readiness_at(
             &active.manifest.generation,
             kernel_artifact,
             store_artifact,
             &materialized_config_digest,
             disposition,
             std::time::Instant::now(),
-        ))
+        );
+        _host_terminal.disarm();
+        // Admitted only; ready vs degraded is owned by the readiness contour.
+        host_lifecycle_observe_requested("host.reconcile admitted");
+        Ok(disposition)
     }
 
     #[cfg(windows)]
@@ -6069,8 +6085,12 @@ impl HostComposition {
         disposition: HostBranchDisposition,
         now: std::time::Instant,
     ) -> HostBranchDisposition {
+        // F-LOG-HOST-1: readiness is claimed only with authenticated proof.
+        // Degraded vs ready preserved; liveness alone never becomes ready.
+        // Phase only; outer reconcile owns the terminal.
         if disposition != HostBranchDisposition::LiveAwaitingReadiness {
             self.readiness_gate.branch_degraded();
+            host_lifecycle_observe_requested("host.readiness degraded");
             if let Err(error) = self.persist_degraded_process_observation(generation, disposition) {
                 self.readiness_gate
                     .fail(None, readiness_failure_kind(&error), now);
@@ -6078,6 +6098,7 @@ impl HostComposition {
             }
             return disposition;
         }
+        host_lifecycle_observe_requested("host.readiness requested proof");
         let contour =
             self.current_readiness_contour(generation, kernel_artifact, store_artifact, config);
         let mut readiness_gate = std::mem::take(&mut self.readiness_gate);
@@ -6085,6 +6106,13 @@ impl HostComposition {
             self.persist_fresh_authenticated_readiness(generation)
         });
         self.readiness_gate = readiness_gate;
+        // Ready only when the authenticated gate admits it; degraded stays
+        // degraded. The detail below is emitted only for the ready outcome.
+        if outcome == HostBranchDisposition::Healthy {
+            host_lifecycle_observe_requested("host.readiness ready proof");
+        } else {
+            host_lifecycle_observe_requested("host.readiness degraded");
+        }
         outcome
     }
 
@@ -6123,6 +6151,9 @@ impl HostComposition {
         store_artifact: &PlatformHandle,
         config: &PlatformHandle,
     ) -> Result<ReadinessContourIdentity, HostError> {
+        // F-LOG-HOST-1: contour probe only; never claims ready by itself.
+        // The ready claim happens only after the authenticated proof fence.
+        host_lifecycle_observe_requested("host.readiness-contour requested");
         if self.jobs.approved_generation.as_ref() != Some(generation)
             || self.jobs.kernel_artifact_digest.as_ref() != Some(kernel_artifact)
             || self.jobs.store_artifact_digest.as_ref() != Some(store_artifact)
@@ -6309,6 +6340,9 @@ impl HostComposition {
         &mut self,
         generation: &PlatformHandle,
     ) -> Result<ReadinessContourIdentity, HostError> {
+        // F-LOG-HOST-1: ready only with actual proof fence; phase only here,
+        // outer reconcile owns the terminal. Never claims ready from liveness.
+        host_lifecycle_observe_requested("host.readiness-proof requested");
         // A pending candidate is approved but intentionally not active until
         // this fresh proof crosses the registry CAS.  Resolve the exact
         // generation from the registry projection rather than treating the
@@ -6414,6 +6448,8 @@ impl HostComposition {
                 "readiness contour changed while admitting the proof".to_owned(),
             ));
         }
+        // F-LOG-HOST-1: ready only now that the proof fence is confirmed.
+        host_lifecycle_observe_requested("host.readiness-proof ready");
         Ok(confirmed)
     }
 
@@ -6423,6 +6459,8 @@ impl HostComposition {
         generation: &PlatformHandle,
         disposition: HostBranchDisposition,
     ) -> Result<(), HostError> {
+        // F-LOG-HOST-1: degraded is distinct from ready; phase only.
+        host_lifecycle_observe_requested("host.degraded-observation requested");
         debug_assert_ne!(
             disposition,
             HostBranchDisposition::LiveAwaitingReadiness,
@@ -6464,6 +6502,8 @@ impl HostComposition {
     ///
     /// Returns an error if the durable Host state cannot be loaded.
     pub fn has_durable_branch_fence(&self) -> Result<bool, HostError> {
+        // F-LOG-HOST-1: guard probe only; never a terminal and never readiness.
+        host_lifecycle_observe_requested("host.branch-fence requested");
         let state = self.snapshot()?;
         Ok(self.store_recovery_startup_fence.is_fenced()
             || self.pending_record.is_some()
@@ -6481,6 +6521,9 @@ impl HostComposition {
         error: HostError,
         evidence: &str,
     ) -> Result<(), HostError> {
+        // F-LOG-HOST-1: cleanup phase only; outer start/stop owns the terminal.
+        // `evidence` is an already-produced typed reason, never free text.
+        host_lifecycle_observe_drain("host.cleanup-active requested");
         let durable = self
             .journal
             .snapshot()
@@ -6498,6 +6541,8 @@ impl HostComposition {
 
     #[cfg(windows)]
     fn cleanup_launched_contour(&mut self, error: HostError) -> Result<(), HostError> {
+        // F-LOG-HOST-1: cleanup phase only; outer owns the terminal.
+        host_lifecycle_observe_drain("host.cleanup-launched requested");
         let store = self.jobs.terminate_store();
         let kernel = self.jobs.terminate_kernel();
         match (kernel, store) {
@@ -6512,6 +6557,8 @@ impl HostComposition {
     }
 
     fn ensure_admission_open(&self) -> Result<(), HostError> {
+        // F-LOG-HOST-1: guard phase only; callers own the single terminal.
+        // Requested vs admitted preserved: fenced is never admitted.
         if !self.running {
             return Err(HostError::Stopped);
         }
@@ -6541,6 +6588,13 @@ impl HostComposition {
         reason = "the ordered durable drain, process termination, clean-marker commit, and lease-release sequence is one security-critical transaction"
     )]
     pub fn stop(&mut self) -> Result<(), HostError> {
+        // F-LOG-HOST-1: stop/drain distinct. Requested vs Draining vs
+        // StoppedClean are three durable records sharing one drain_generation
+        // correlation; draining vs drained and requested vs stopped are never
+        // merged. Cancellation requested stays distinct from stopped. Single
+        // terminal via guard; inner terminates are phase only.
+        host_lifecycle_observe_drain("host.stop requested");
+        let mut _host_terminal = HostTerminalGuard::armed("host-stop-failed");
         if !self.running {
             return Err(HostError::Stopped);
         }
@@ -6574,6 +6628,9 @@ impl HostComposition {
                                     .map_err(|error| HostError::Platform(error.to_string()))?,
                             ],
                         }))?;
+                        // F-LOG-HOST-1: drain Requested is distinct from
+                        // Draining; shares one drain_generation correlation.
+                        host_lifecycle_observe_drain("host.drain requested");
                     }
                     if self
                         .journal
@@ -6592,6 +6649,9 @@ impl HostComposition {
                                     .map_err(|error| HostError::Platform(error.to_string()))?,
                             ],
                         }))?;
+                        // F-LOG-HOST-1: Draining is distinct from Requested and
+                        // from drained/StoppedClean; one correlation.
+                        host_lifecycle_observe_drain("host.drain draining");
                     }
                     if self
                         .journal
@@ -6651,6 +6711,9 @@ impl HostComposition {
                 .is_some_and(|current| current.state == ActivationState::Draining)
             {
                 self.transition_activation(ActivationState::StoppedClean, "host-stopped-clean")?;
+                // F-LOG-HOST-1: StoppedClean (drained) is distinct from
+                // Draining and from requested/stopped.
+                host_lifecycle_observe_drain("host.stop stopped-clean drained");
             }
             #[cfg(windows)]
             cleanup_completed_store_recovery_supporting_evidence(
@@ -6679,6 +6742,10 @@ impl HostComposition {
         }
         self.running = false;
         self.shutdown_failed = false;
+        // F-LOG-HOST-1: stopped is distinct from requested/draining; the
+        // single guard terminal stays armed only for failures.
+        _host_terminal.disarm();
+        host_lifecycle_observe_drain("host.stop stopped");
         Ok(())
     }
 
@@ -6733,6 +6800,12 @@ fn lifecycle_context(
     host: &HostInstallationEpoch,
     operation: &str,
 ) -> Result<RequestMetadata, HostError> {
+    // F-LOG-HOST-1: lifecycle identity projection only; preserves exact
+    // installation/process/start/generation/operation identities already
+    // produced by the owner. `operation` is a static caller literal, never
+    // SCM payload/env/credentials. Single terminal via manual observe: the
+    // guard cannot wrap this free function without changing its signature.
+    host_lifecycle_observe_requested("host.lifecycle-context requested");
     let request_id = RequestId::new(format!(
         "host:{}:{}:{}:{}",
         host.epoch.current.lineage_id,
@@ -6740,18 +6813,27 @@ fn lifecycle_context(
         operation,
         std::process::id()
     ))
-    .map_err(|error| HostError::Platform(error.to_string()))?;
-    Ok(RequestMetadata {
+    .map_err(|error| {
+        host_lifecycle_observe_terminal("host-lifecycle-context-failed");
+        HostError::Platform(error.to_string())
+    })?;
+    let context = RequestMetadata {
         request_id,
         session_id: None,
         task_id: None,
-        product_id: ProductId::new("eliot-host")
-            .map_err(|error| HostError::Platform(error.to_string()))?,
-        source_id: SourceId::new("eliot-host-service")
-            .map_err(|error| HostError::Platform(error.to_string()))?,
+        product_id: ProductId::new("eliot-host").map_err(|error| {
+            host_lifecycle_observe_terminal("host-lifecycle-context-failed");
+            HostError::Platform(error.to_string())
+        })?,
+        source_id: SourceId::new("eliot-host-service").map_err(|error| {
+            host_lifecycle_observe_terminal("host-lifecycle-context-failed");
+            HostError::Platform(error.to_string())
+        })?,
         state_fence: StateFence::new(host.epoch.current.clone(), ResourceGeneration::genesis()),
         clock: ClockReading::default(),
-    })
+    };
+    host_lifecycle_observe_requested("host.lifecycle-context admitted");
+    Ok(context)
 }
 
 fn owner_lease_error(error: HostOwnerLeaseError) -> HostError {
