@@ -29,6 +29,11 @@ pub struct StoreFailureStatusProjection {
     pub conflict: Option<StoreConflictObservation>,
     pub retry_after_ms: Option<u64>,
     pub evidence_ref: Option<String>,
+    /// Bounded unique evidence-handle set passed through from the typed
+    /// contract alongside the legacy singular `evidence_ref`. The contract
+    /// guarantees boundedness and uniqueness, so this projection copies the
+    /// set without inventing references.
+    pub evidence_handles: Vec<String>,
     pub owner: &'static str,
     pub next_safe_action: &'static str,
     pub blocks_writer_readiness: bool,
@@ -88,6 +93,10 @@ fn blocks_writer_readiness_for(
     mutation_disposition: StoreMutationDisposition,
     retry_directive: StoreRetryDirective,
 ) -> bool {
+    // Checked refusals where no mutation could ever apply (`NotAttempted`,
+    // `NotApplicable`) never block: only unknown outcomes, unknown mutations,
+    // and exact-reconciliation directives do. `NotApplicable` is never grouped
+    // with `Unknown` — unknown stays exact-reconciliation only.
     matches!(disposition, StoreFailureDisposition::UnknownOutcome)
         || matches!(mutation_disposition, StoreMutationDisposition::Unknown)
         || matches!(
@@ -112,6 +121,7 @@ fn derive_component_state(
         | StoreFailureDisposition::DeadlineExceeded => ComponentState::Unavailable { reason },
         StoreFailureDisposition::InternalDefect => ComponentState::Corrupt { reason },
         StoreFailureDisposition::Conflict
+        | StoreFailureDisposition::Denied
         | StoreFailureDisposition::DeterministicRejection
         | StoreFailureDisposition::Unsupported
         | StoreFailureDisposition::MigrationRequired => ComponentState::NotHealthy { reason },
@@ -147,6 +157,10 @@ pub fn project_store_failure(
     let mutation_disposition = failure.mutation_disposition;
     let retry_directive = failure.retry_directive;
     let recovery_action = failure.recovery_action;
+    // Bounded unique handle set passthrough. `failure.validate()` above
+    // already enforces the set bound, per-handle shape, and uniqueness, so
+    // this copies the typed set alongside the singular legacy reference.
+    let evidence_handles = failure.evidence_handles.as_slice().to_vec();
     let next_safe_action = next_safe_action_for(retry_directive, recovery_action);
     let blocks_writer_readiness =
         blocks_writer_readiness_for(disposition, mutation_disposition, retry_directive);
@@ -162,6 +176,7 @@ pub fn project_store_failure(
         conflict: failure.conflict.clone(),
         retry_after_ms: failure.retry_after_ms,
         evidence_ref,
+        evidence_handles,
         owner: "store",
         next_safe_action,
         blocks_writer_readiness,

@@ -38,6 +38,7 @@ use eliot_store_api::StoreError;
 use eliot_store_api::StoreFailure;
 use eliot_store_api::StoreFailureDisposition;
 use eliot_store_api::StoreFailureIdentityContext;
+use eliot_store_api::StoreMutationDisposition;
 use eliot_store_api::StoreRequest;
 use eliot_store_api::StoreResponse;
 use eliot_store_api::WriteReceipt;
@@ -117,11 +118,16 @@ impl RequestFailure {
     /// Reports whether this failure is a typed unknown-outcome failure bound
     /// to the admitted operation. Callers reconcile exactly that operation via
     /// `receipt_exact`/`reconcile_genesis` and never adopt a peer identity.
+    /// Both halves of the unknown-outcome triple are required: an
+    /// `UnknownOutcome` disposition with any other mutation (including the
+    /// `NotApplicable` refusal, where no mutation could ever apply) is never
+    /// unknown and never reconciles.
     pub(super) fn is_unknown_outcome_failure(&self) -> bool {
         matches!(
             self,
             Self::Failure(failure)
                 if failure.disposition == StoreFailureDisposition::UnknownOutcome
+                    && failure.mutation_disposition == StoreMutationDisposition::Unknown
         )
     }
 }
@@ -140,9 +146,14 @@ impl RequestFailure {
 /// internal defect has no dedicated variant and stays a fixed (never peer
 /// prose) serialization signal; a generic deterministic rejection keeps only
 /// its rejection class via a synthesized field because `StoreFailure` carries
-/// no structured rejection fields. Retry/mutation control semantics are
-/// preserved in every arm: retryable stays retryable, conflicts stay
-/// conflicts, unknown stays unknown.
+/// no structured rejection fields. `StoreError` likewise has no denial
+/// variant: `Denied` projects to the existing non-retryable refusal
+/// `IdentityConflict` (never retryable `Unavailable`, never validation-shape
+/// `InvalidField`, never `Unsupported`/`Serialization` prose), preserving
+/// authorization-denied semantics — the caller must resolve authority out of
+/// band instead of retrying the same identity. Retry/mutation control
+/// semantics are preserved in every arm: retryable stays retryable, conflicts
+/// stay conflicts, denials stay non-retryable refusals, unknown stays unknown.
 fn failure_into_store_error(failure: &StoreFailure) -> StoreError {
     match failure.disposition {
         StoreFailureDisposition::Conflict => match failure.reason_code.as_str() {
@@ -159,6 +170,7 @@ fn failure_into_store_error(failure: &StoreFailure) -> StoreError {
                 reason: "deterministic store rejection",
             },
         },
+        StoreFailureDisposition::Denied => StoreError::IdentityConflict,
         StoreFailureDisposition::Unavailable
         | StoreFailureDisposition::Backpressured
         | StoreFailureDisposition::DeadlineExceeded

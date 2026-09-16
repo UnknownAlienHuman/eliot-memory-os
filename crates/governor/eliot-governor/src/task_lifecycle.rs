@@ -51,7 +51,7 @@ use eliot_store_api::{
     CONTRACT_VERSION, EffectClass, EventProjectionRelationIntents, NamedMutationOperation,
     NamedMutationRequest, NamedOperationManifest, OperationManifestDigest, OrderingHeadExpectation,
     OrderingScopeId, ScopeId, SecurityContext, StoreFailure,
-    StoreFailureDisposition, StoreFailureIdentityContext, StoreMutationDisposition,
+    StoreEvidenceHandles, StoreFailureDisposition, StoreFailureIdentityContext, StoreMutationDisposition,
     StoreReasonCode, StoreRecoveryAction, StoreRetryDirective, TransitionClass, WriteReceipt,
     WriteReceiptStatus,
 };
@@ -204,7 +204,9 @@ fn store_failure(
         recovery_action: recovery,
         conflict: None,
         retry_after_ms: None,
+        retry_after_dependency_revision: None,
         evidence_ref: ctx.evidence_ref.clone(),
+        evidence_handles: StoreEvidenceHandles::default(),
         human_detail: None,
     };
     failure

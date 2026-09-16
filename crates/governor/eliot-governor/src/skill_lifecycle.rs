@@ -37,7 +37,7 @@ use eliot_store_api::{
     CONTRACT_VERSION, EffectClass, EventProjectionRelationIntents, NamedMutationOperation,
     NamedMutationRequest, NamedOperationManifest, OperationManifestDigest, OrderingHeadExpectation,
     OrderingScopeId, STORE_FAILURE_CONTRACT_REVISION, ScopeId, SecurityContext, StoreFailure,
-    StoreFailureDisposition, StoreFailureIdentityContext, StoreMutationDisposition,
+    StoreEvidenceHandles, StoreFailureDisposition, StoreFailureIdentityContext, StoreMutationDisposition,
     StoreReasonCode, StoreRecoveryAction, StoreRetryDirective, TransitionClass, WriteReceiptStatus,
 };
 
@@ -136,7 +136,9 @@ fn store_failure(
         recovery_action: recovery,
         conflict: None,
         retry_after_ms: None,
+        retry_after_dependency_revision: None,
         evidence_ref: ctx.evidence_ref.clone(),
+        evidence_handles: StoreEvidenceHandles::default(),
         human_detail: None,
     };
     failure
@@ -172,10 +174,10 @@ fn map_kernel_error(error: KernelPortError, ctx: &StoreFailureIdentityContext) -
         .map(SkillError::Store)
         .unwrap_or(SkillError::IdentityMismatch),
         KernelPortError::NotAdmitted(_) => store_failure(
-            StoreFailureDisposition::Unavailable,
+            StoreFailureDisposition::Denied,
             "KERNEL_NOT_ADMITTED",
             StoreMutationDisposition::NotAttempted,
-            StoreRetryDirective::RetrySameIdentityAfterBackoff,
+            StoreRetryDirective::DoNotRetry,
             StoreRecoveryAction::RestoreStoreConnectivity,
             ctx,
         )
@@ -238,7 +240,7 @@ fn map_composition_error(error: CompositionError, ctx: &StoreFailureIdentityCont
         .map(SkillError::Store)
         .unwrap_or(SkillError::IdentityMismatch),
         CompositionError::Authority(_) => store_failure(
-            StoreFailureDisposition::DeterministicRejection,
+            StoreFailureDisposition::Denied,
             "AUTHORITY_REJECTED",
             StoreMutationDisposition::NotAttempted,
             StoreRetryDirective::DoNotRetry,
@@ -476,7 +478,7 @@ impl<P: KernelTransitionPort + ?Sized> SkillLifecycleApi for GovernorSkillLifecy
             let failure = store_failure(
                 StoreFailureDisposition::DeterministicRejection,
                 "SKILL_RECEIPT_MISMATCH",
-                StoreMutationDisposition::NotAttempted,
+                StoreMutationDisposition::NotApplicable,
                 StoreRetryDirective::DoNotRetry,
                 StoreRecoveryAction::None,
                 &ctx,
@@ -489,7 +491,7 @@ impl<P: KernelTransitionPort + ?Sized> SkillLifecycleApi for GovernorSkillLifecy
             let failure = store_failure(
                 StoreFailureDisposition::DeterministicRejection,
                 "SKILL_TRANSITION_MISMATCH",
-                StoreMutationDisposition::NotAttempted,
+                StoreMutationDisposition::NotApplicable,
                 StoreRetryDirective::DoNotRetry,
                 StoreRecoveryAction::None,
                 &ctx,
@@ -497,7 +499,7 @@ impl<P: KernelTransitionPort + ?Sized> SkillLifecycleApi for GovernorSkillLifecy
             return Err(SkillError::Store(failure));
         }
         if receipt.status != WriteReceiptStatus::Committed {
-            let (reason, disposition, retry, recovery) = match receipt.status {
+            let (reason, disposition, mutation, retry, recovery) = match receipt.status {
                 WriteReceiptStatus::Committed => {
                     let failure = store_failure(
                         StoreFailureDisposition::InternalDefect,
@@ -509,33 +511,33 @@ impl<P: KernelTransitionPort + ?Sized> SkillLifecycleApi for GovernorSkillLifecy
                     )?;
                     return Err(SkillError::Store(failure));
                 }
+                // Definitive refusals: the store refused to commit, so no
+                // mutation could ever apply through these outcomes.
                 WriteReceiptStatus::Rejected => (
                     "SKILL_NOT_COMMITTED_REJECTED",
                     StoreFailureDisposition::DeterministicRejection,
+                    StoreMutationDisposition::NotApplicable,
                     StoreRetryDirective::DoNotRetry,
                     StoreRecoveryAction::None,
                 ),
                 WriteReceiptStatus::Cancelled => (
                     "SKILL_NOT_COMMITTED_CANCELLED",
                     StoreFailureDisposition::DeterministicRejection,
+                    StoreMutationDisposition::NotApplicable,
                     StoreRetryDirective::DoNotRetry,
                     StoreRecoveryAction::None,
                 ),
+                // Abnormal terminal state with an unclear effect: stay
+                // fail-closed and claim no attempted mutation.
                 WriteReceiptStatus::DeadLetter => (
                     "SKILL_NOT_COMMITTED_DEAD_LETTER",
                     StoreFailureDisposition::InternalDefect,
+                    StoreMutationDisposition::NotAttempted,
                     StoreRetryDirective::ManualRecovery,
                     StoreRecoveryAction::EscalateInternalDefect,
                 ),
             };
-            let failure = store_failure(
-                disposition,
-                reason,
-                StoreMutationDisposition::NotAttempted,
-                retry,
-                recovery,
-                &ctx,
-            )?;
+            let failure = store_failure(disposition, reason, mutation, retry, recovery, &ctx)?;
             return Err(SkillError::Store(failure));
         }
         Ok(receipt)
@@ -962,5 +964,21 @@ mod tests {
             1,
             "retry with a new deadline must not re-execute"
         );
+    }
+
+    #[test]
+    fn denied_mapping_validates_with_empty_evidence() {
+        let ctx = StoreFailureIdentityContext::default();
+        // Kernel admission refusal is an authorization denial: non-retryable,
+        // never capacity backoff.
+        let SkillError::Store(denied) =
+            map_kernel_error(KernelPortError::NotAdmitted("gate".to_owned()), &ctx)
+        else {
+            panic!("kernel NotAdmitted must map to a typed store failure");
+        };
+        assert_eq!(denied.disposition, StoreFailureDisposition::Denied);
+        assert_eq!(denied.retry_directive, StoreRetryDirective::DoNotRetry);
+        assert!(denied.evidence_handles.is_empty());
+        denied.validate().expect("denied failure validates");
     }
 }

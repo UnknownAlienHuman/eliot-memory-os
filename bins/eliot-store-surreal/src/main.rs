@@ -65,6 +65,8 @@ fn frame_rejection_defect(
                 recovery_action: eliot_store_api::StoreRecoveryAction::EscalateInternalDefect,
                 conflict: None,
                 retry_after_ms: None,
+                retry_after_dependency_revision: None,
+                evidence_handles: Default::default(),
                 evidence_ref: None,
                 human_detail,
             };
