@@ -136,6 +136,29 @@ impl WatchdogComposition {
                             Ok(admission) => admission,
                             Err(error) => {
                                 authority_state.publish_no_authority();
+                                // I14.23: intentional and incomplete shutdown
+                                // are distinct observed states, not generic
+                                // gaps. The lease stays fenced either way;
+                                // only the observation vocabulary differs so
+                                // recovery can tell a clean stop from retained
+                                // pending work.
+                                if crate::supervision_lease_load::is_intentional_shutdown_fence(
+                                    &error,
+                                ) {
+                                    tracing::info!(
+                                        event = "watchdog.shutdown.intentional_observed",
+                                        observation = "intentional",
+                                        "watchdog observed intentional shutdown; pre-drain leases fenced"
+                                    );
+                                } else if crate::supervision_lease_load::is_incomplete_shutdown_fence(
+                                    &error,
+                                ) {
+                                    tracing::info!(
+                                        event = "watchdog.shutdown.incomplete_observed",
+                                        observation = "incomplete",
+                                        "watchdog observed incomplete shutdown; pending work retained"
+                                    );
+                                }
                                 if let Some(reason) = host_gap {
                                     report_gap_nonfatal(kernel.as_ref(), reason).await;
                                 }
