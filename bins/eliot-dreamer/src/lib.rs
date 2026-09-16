@@ -6,6 +6,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use eliot_cli::kernel_client::{KernelClient, KernelClientError};
 use eliot_contracts::StateFence;
+use eliot_protocol::dreamer_job::{DurableJobResponse, JobState as ProtocolJobState};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
@@ -137,6 +138,7 @@ pub struct AuthenticatedKernelJobPort {
     admission: KernelJobAdmission,
     view: JobView,
     handshake: KernelHandshake,
+    transport: kernel_port::KernelClaimTransport,
 }
 
 impl AuthenticatedKernelJobPort {
@@ -176,16 +178,13 @@ impl AuthenticatedKernelJobPort {
             authority_epoch: material.epoch.sequence.get(),
             dreamer_claim_supported: true,
         };
-        let view = JobView {
-            job_id: started.job_id.as_str().to_owned(),
-            state: JobState::Running,
-            result: None,
-        };
+        let view = project_claimed_view(&started);
         Ok(Self {
             material,
             admission,
             view,
             handshake,
+            transport,
         })
     }
 
@@ -193,6 +192,41 @@ impl AuthenticatedKernelJobPort {
     #[must_use]
     pub fn claimed_view(&self) -> &JobView {
         &self.view
+    }
+
+    /// Returns the Kernel-bound admission identity this claim proved.
+    ///
+    /// The caller drives the supervised loop through
+    /// [`KernelSupervisedComposition`] with exactly this admission; any other
+    /// identity refuses fail-closed at the port.
+    #[must_use]
+    pub fn claimed_admission(&self) -> &KernelJobAdmission {
+        &self.admission
+    }
+
+    /// Refuses any admission that is not the claimed dreamer job.
+    fn check_claimed(&self, admission: &KernelJobAdmission) -> Result<(), DreamerError> {
+        admission.validate()?;
+        if admission.job_id != self.material.job_id
+            || admission.scope_id != self.material.scope_id
+            || admission.state_fence != self.material.fence
+            || admission.idempotency_key != self.admission.idempotency_key
+        {
+            return Err(DreamerError::KernelAdmissionRequired(
+                "presented admission is not the claimed dreamer job".to_owned(),
+            ));
+        }
+        Ok(())
+    }
+
+    /// Observes the live Kernel-proved disposition of the claimed job.
+    ///
+    /// A refused or unbound reply fails closed; the port never serves a stale
+    /// cached view as liveness.
+    fn live_view(&mut self) -> Result<JobView, DreamerError> {
+        let observed = kernel_port::status_once(&self.material, &mut self.transport)
+            .map_err(|error| port_denied(&error))?;
+        Ok(project_claimed_view(&observed))
     }
 }
 
@@ -231,39 +265,27 @@ impl KernelJobPort for AuthenticatedKernelJobPort {
         job: &DreamJobInput,
     ) -> Result<JobView, DreamerError> {
         let _ = job;
-        self.admission.validate()?;
-        if admission.job_id != self.material.job_id
-            || admission.scope_id != self.material.scope_id
-            || admission.state_fence != self.material.fence
-            || admission.idempotency_key != self.admission.idempotency_key
-        {
-            return Err(DreamerError::KernelAdmissionRequired(
-                "presented admission is not the claimed dreamer job".to_owned(),
-            ));
-        }
-        Ok(self.view.clone())
+        self.check_claimed(admission)?;
+        self.live_view()
     }
 
     fn cancel(&mut self, admission: &KernelJobAdmission) -> Result<JobView, DreamerError> {
         let _ = admission;
         Err(DreamerError::KernelAdmissionRequired(
-            "one-shot dreamer claim admits no cancel yet; worker lifecycle continues in T12-10"
+            "worker role admits no cancel origination; cancellation is Kernel-owned and arrives as a proved disposition"
                 .to_owned(),
         ))
     }
 
     fn status(&mut self, admission: &KernelJobAdmission) -> Result<JobView, DreamerError> {
-        let _ = admission;
-        Err(DreamerError::KernelAdmissionRequired(
-            "one-shot dreamer claim admits no status yet; worker lifecycle continues in T12-10"
-                .to_owned(),
-        ))
+        self.check_claimed(admission)?;
+        self.live_view()
     }
 
     fn reconcile(&mut self, admission: &KernelJobAdmission) -> Result<JobView, DreamerError> {
         let _ = admission;
         Err(DreamerError::KernelAdmissionRequired(
-            "one-shot dreamer claim admits no reconcile yet; worker lifecycle continues in T12-10"
+            "mutation reconciliation originates Kernel-side; the claim port preserves the reconciling disposition via status"
                 .to_owned(),
         ))
     }
@@ -336,6 +358,48 @@ pub enum JobState {
     Completed,
     Cancelled,
     Rejected,
+    /// Terminal partial disposition proved by the Kernel ledger: exact, never
+    /// promoted to success.
+    Partial,
+    /// Terminal failure disposition proved by the Kernel ledger: exact, never
+    /// rendered as absence.
+    Failed,
+    /// Reconciling disposition: the Kernel reported `UnknownOutcome`. The
+    /// outcome is unresolved and must never render as success or absence.
+    Reconciling,
+}
+
+/// Projects one Kernel-proved claim-port observation onto the local lifecycle.
+///
+/// Total over the closed protocol lifecycle: in-progress states project to
+/// the matching local progress state, every terminal state keeps its exact
+/// identity, and `UnknownOutcome` projects to [`JobState::Reconciling`].
+pub(crate) fn project_claimed_state(observed: ProtocolJobState) -> JobState {
+    match observed {
+        ProtocolJobState::NotStarted | ProtocolJobState::Queued => JobState::Queued,
+        ProtocolJobState::Leased
+        | ProtocolJobState::Running
+        | ProtocolJobState::Checkpointed
+        | ProtocolJobState::Verifying => JobState::Running,
+        ProtocolJobState::Completed => JobState::Completed,
+        ProtocolJobState::Partial => JobState::Partial,
+        ProtocolJobState::Failed => JobState::Failed,
+        ProtocolJobState::Cancelled => JobState::Cancelled,
+        ProtocolJobState::UnknownOutcome => JobState::Reconciling,
+    }
+}
+
+/// Projects the Kernel-proved disposition of one claim-port observation.
+///
+/// The view carries no candidate payload: candidate artifacts arrive through
+/// the model channel, and the claim port never invents one. A `None` result
+/// is honest absence of a proved payload, not a success claim.
+pub(crate) fn project_claimed_view(observed: &DurableJobResponse) -> JobView {
+    JobView {
+        job_id: observed.job_id.as_str().to_owned(),
+        state: project_claimed_state(observed.state),
+        result: None,
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -663,4 +727,32 @@ fn all_handles(input: &DreamJobInput) -> Vec<String> {
         .chain(&input.conformance_handles)
         .cloned()
         .collect()
+}
+
+#[cfg(test)]
+mod projection_tests {
+    use super::*;
+
+    /// The claim-port projection is total and exact: every closed protocol
+    /// lifecycle state maps to its local identity, terminal states keep
+    /// their exact disposition, and `UnknownOutcome` never renders as
+    /// success or absence.
+    #[test]
+    fn protocol_state_projection_is_total_and_exact() {
+        for (observed, expected) in [
+            (ProtocolJobState::NotStarted, JobState::Queued),
+            (ProtocolJobState::Queued, JobState::Queued),
+            (ProtocolJobState::Leased, JobState::Running),
+            (ProtocolJobState::Running, JobState::Running),
+            (ProtocolJobState::Checkpointed, JobState::Running),
+            (ProtocolJobState::Verifying, JobState::Running),
+            (ProtocolJobState::Completed, JobState::Completed),
+            (ProtocolJobState::Partial, JobState::Partial),
+            (ProtocolJobState::Failed, JobState::Failed),
+            (ProtocolJobState::Cancelled, JobState::Cancelled),
+            (ProtocolJobState::UnknownOutcome, JobState::Reconciling),
+        ] {
+            assert_eq!(project_claimed_state(observed), expected);
+        }
+    }
 }

@@ -16,6 +16,7 @@ members = [
   "crates/agent/eliot-agent-opencode",
   "crates/agent/eliot-swarm",
   "crates/foundation/eliot-bootstrap",
+  "crates/foundation/eliot-conformance-contracts",
   "crates/foundation/eliot-contracts",
   "crates/foundation/eliot-evaluation-contracts",
   "crates/foundation/eliot-evidence",
@@ -155,6 +156,7 @@ members = [
   "crates/smart/eliot-dreamer-bundle",  # agent_order 4
   "crates/smart/eliot-dreamer-candidate-validation",  # agent_order 5
   "crates/smart/eliot-dreamer-claim-grounding",  # agent_order 14
+  "crates/smart/eliot-dreamer-research-synthesis",  # agent_order 6
   "crates/smart/eliot-dreamer-rival-model",  # agent_order 16
   "crates/smart/eliot-dreamer-probe-plan",  # agent_order 17
   "crates/smart/eliot-dreamer-orientation",  # agent_order 6
@@ -185,7 +187,6 @@ exclude = [
   "crates/smart/eliot-learning-delta",  # agent_order 34
   "crates/smart/eliot-learning-overlay",  # agent_order 35
   "crates/meta/eliot-learning-activation-assessment",  # agent_order 36
-  "crates/foundation/eliot-conformance-contracts",  # prototype dep target for #216 (not a member; admission forbidden until fixture+review)
 ]
 default-members = [
   "bins/eliot",
@@ -217,6 +218,7 @@ eliot-store = { path = "crates/eliot-store", version = "0.1.0" }
 eliot-types = { path = "crates/eliot-types", version = "0.1.0" }
 eliot-windows-ipc = { path = "crates/eliot-windows-ipc", version = "0.1.0" }
 eliot-bootstrap = { path = "crates/foundation/eliot-bootstrap", version = "0.1.0" }
+eliot-conformance-contracts = { path = "crates/foundation/eliot-conformance-contracts", version = "0.1.0" }
 eliot-contracts = { path = "crates/foundation/eliot-contracts", version = "0.1.0" }
 eliot-evaluation-contracts = { path = "crates/foundation/eliot-evaluation-contracts", version = "0.1.0" }
 eliot-evidence = { path = "crates/foundation/eliot-evidence", version = "0.1.0" }

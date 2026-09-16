@@ -38,8 +38,8 @@ mod protected_launch_config;
 use kernel_authority_port::KernelAuthorityPort;
 use operation_identity::{IssuerHandle, OperationIdentityIssuer};
 use protected_launch_config::{
-    BrokerLaunchBinding, MigrationEvidence, REGISTRATION_LEASE_TTL_MS, binding_digest,
-    fresh_registration_request, load_protected_launch_binding,
+    BrokerLaunchBinding, REGISTRATION_LEASE_TTL_MS, binding_digest, fresh_registration_request,
+    load_protected_launch_binding,
 };
 
 pub const SERVICE_NAME: &str = "eliot-user-broker";
@@ -596,7 +596,6 @@ pub struct BrokerComposition {
     launch_lease: Option<ProtectedPathLease>,
     registration_digest: Option<String>,
     identity_issuer: IssuerHandle,
-    migration_evidence: Option<MigrationEvidence>,
 }
 
 impl BrokerComposition {
@@ -608,7 +607,7 @@ impl BrokerComposition {
     /// front door. The binary never substitutes a local authority/process
     /// provider when this composition is unavailable.
     pub fn start_with_kernel(config: BrokerConfig) -> Result<Self, CompositionError> {
-        let (launch_binding, launch_lease, migration_evidence) = load_protected_launch_binding()?;
+        let (launch_binding, launch_lease) = load_protected_launch_binding()?;
         let client = eliot_cli::kernel_client::KernelClient::load()
             .map_err(|error| CompositionError::Kernel(error.to_string()))?;
         let client = Arc::new(Mutex::new(client));
@@ -625,7 +624,6 @@ impl BrokerComposition {
             Some(client),
             Some((launch_binding, launch_lease)),
             issuer,
-            migration_evidence,
         )
     }
 
@@ -647,7 +645,6 @@ impl BrokerComposition {
         _kernel_client: Option<SharedKernelClient>,
         launch: Option<(BrokerLaunchBinding, ProtectedPathLease)>,
         issuer: IssuerHandle,
-        migration_evidence: Option<MigrationEvidence>,
     ) -> Result<Self, CompositionError> {
         config.validate()?;
         let snapshot = config.data_root.join(config.snapshot_name);
@@ -692,7 +689,6 @@ impl BrokerComposition {
             launch_lease,
             registration_digest,
             identity_issuer: issuer,
-            migration_evidence,
         })
     }
 
@@ -708,13 +704,6 @@ impl BrokerComposition {
             },
             snapshot: self.snapshot.display().to_string(),
         }
-    }
-
-    /// Returns the v1→v2 migration evidence when the protected launch file
-    /// was migrated during composition. `None` means the file was already v2.
-    #[must_use]
-    pub fn migration_evidence(&self) -> Option<&MigrationEvidence> {
-        self.migration_evidence.as_ref()
     }
 
     /// Performs broker self-authentication from the retained stable

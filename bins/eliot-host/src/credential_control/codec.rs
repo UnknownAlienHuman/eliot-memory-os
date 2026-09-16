@@ -23,6 +23,35 @@ use super::HostCredentialControlRequest;
 const ENVELOPE_VERSION: &str = "eliot.store-credential-envelope.v1";
 const MARKER_VERSION: &str = "eliot.store-credential-marker.v1";
 
+// F-LOG-HOST-5 (#980) inner-phase observations for credential codec.
+//
+// Through the #889 facade only
+// (`crate::host_diagnostics::observe_entrypoint_with_detail`); the Event Log
+// seam stays typed-Unavailable
+// (`crate::windows_event_log::event_log_sink_status`), never implemented here
+// (#984 still open).
+//
+// Observation-only contract (mirrors `host_composition_phase_b.rs:30-41`):
+// every call projects a boundary already decided by the semantic owner.
+// Arguments are static literals only — no bytes, digests, keys, identities,
+// or error text are formatted, so no secret material can cross (I15.4) and no
+// extra evaluation runs on the semantic path. Sink outcome never alters the
+// typed `Err(())`, order, or cleanup. No terminal emission here: one terminal
+// per failed operation stays with the credential operation guard, while these
+// inner phases correlate by stage order only. Malformed input keeps its
+// original typed failure with zero byte leakage.
+fn credential_codec_note_event_log_unavailable() {
+    let _ = crate::windows_event_log::event_log_sink_status();
+}
+
+fn credential_codec_observe(detail: &str) {
+    credential_codec_note_event_log_unavailable();
+    crate::host_diagnostics::observe_entrypoint_with_detail(
+        crate::host_diagnostics::EntrypointStage::ScmDispatch,
+        detail,
+    );
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
 pub(super) enum MarkerPhase {
@@ -141,7 +170,9 @@ pub(super) fn decode_marker(
     identity: &InstallerRootObjectSnapshot,
     bytes: &[u8],
 ) -> Result<MarkerRecord, ()> {
-    let marker: MarkerRecord = serde_json::from_slice(bytes).map_err(|_| ())?;
+    let marker: MarkerRecord = serde_json::from_slice(bytes).map_err(|_| {
+        credential_codec_observe("host.credential codec marker malformed retained");
+    })?;
     let expected = marker_bytes(
         request,
         key,
@@ -149,12 +180,17 @@ pub(super) fn decode_marker(
         marker.phase,
         marker.credential_envelope_digest.as_ref(),
     )
-    .map_err(|_| ())?;
-    let expected: MarkerRecord = serde_json::from_slice(&expected).map_err(|_| ())?;
+    .map_err(|_| {
+        credential_codec_observe("host.credential codec marker malformed retained");
+    })?;
+    let expected: MarkerRecord = serde_json::from_slice(&expected).map_err(|_| {
+        credential_codec_observe("host.credential codec marker malformed retained");
+    })?;
     if !constant_time_handle_equal(&marker.mac, &expected.mac)
         || marker.marker != marker_identity(identity)
         || marker.version != MARKER_VERSION
     {
+        credential_codec_observe("host.credential codec marker malformed retained");
         return Err(());
     }
     Ok(marker)
@@ -223,13 +259,21 @@ pub(super) fn decode_envelope(
     identity: &InstallerRootObjectSnapshot,
     bytes: &[u8],
 ) -> Result<(), ()> {
-    let envelope: CredentialEnvelope = serde_json::from_slice(bytes).map_err(|_| ())?;
-    let expected = envelope_bytes(request, key, host_owner_epoch, identity, &envelope.secret)?;
-    let expected: CredentialEnvelope = serde_json::from_slice(&expected).map_err(|_| ())?;
+    let envelope: CredentialEnvelope = serde_json::from_slice(bytes).map_err(|_| {
+        credential_codec_observe("host.credential codec envelope malformed retained");
+    })?;
+    let expected = envelope_bytes(request, key, host_owner_epoch, identity, &envelope.secret)
+        .map_err(|_| {
+            credential_codec_observe("host.credential codec envelope malformed retained");
+        })?;
+    let expected: CredentialEnvelope = serde_json::from_slice(&expected).map_err(|_| {
+        credential_codec_observe("host.credential codec envelope malformed retained");
+    })?;
     if !constant_time_handle_equal(&envelope.mac, &expected.mac)
         || envelope.marker != marker_identity(identity)
         || envelope.version != ENVELOPE_VERSION
     {
+        credential_codec_observe("host.credential codec envelope malformed retained");
         return Err(());
     }
     Ok(())

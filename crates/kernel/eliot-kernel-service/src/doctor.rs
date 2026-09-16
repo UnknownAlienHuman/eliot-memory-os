@@ -1285,10 +1285,9 @@ fn doctor_envelope_digests(
 /// Reconstructs the canonical authority epoch bound in one staged row.
 ///
 /// Slice E4-B (issue #64): the `epoch_lineage` column is the authority — a
-/// staged row without one carries only an unbound legacy scalar and binds
-/// no authority, so it fails closed here. The `u64` column is migration
-/// evidence only (a legacy-scalar sequence projection in the
-/// `import_legacy_scalar_epoch` sense): it must equal the lineage sequence
+/// staged row without one carries only an unbound sequence value and binds
+/// no authority, so it fails closed here. The `u64` column is sequence
+/// evidence only: it must equal the lineage sequence
 /// exactly, otherwise the row is corrupt and fails closed. Authority
 /// readers must use the returned `EpochId` tuple through
 /// `is_same_authority` and never the bare `u64`. Mint stays Host-owned;
@@ -1360,9 +1359,8 @@ fn build_staged_doctor_attempt(
         principal_ref: OpaqueLabel::new(session_principal)
             .map_err(|error| KernelServiceError::Platform(error.to_string()))?,
         fence_digest: terms.envelope.fence.digest.clone(),
-        // Legacy-scalar evidence projection of the live context epoch only
-        // (a legacy-scalar sequence value in the `import_legacy_scalar_epoch`
-        // sense). Authority is the `epoch_lineage` tuple below — never this
+        // Sequence evidence projection of the live context epoch only.
+        // Authority is the `epoch_lineage` tuple below — never this
         // bare `u64`; `staged_attempt_authority_epoch` proves the two agree.
         authority_epoch: context.authority_epoch.sequence.get(),
         // Live context generation; gate-proven equal to the presented

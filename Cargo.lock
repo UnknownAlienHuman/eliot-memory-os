@@ -970,6 +970,7 @@ name = "eliot-conformance-contracts"
 version = "0.1.0"
 dependencies = [
  "serde",
+ "serde_json",
  "thiserror",
 ]
 
@@ -1444,6 +1445,10 @@ dependencies = [
  "serde",
  "serde_json",
 ]
+
+[[package]]
+name = "eliot-dreamer-research-synthesis"
+version = "0.1.0"
 
 [[package]]
 name = "eliot-dreamer-rival-model"

@@ -19,6 +19,36 @@ use thiserror::Error;
 
 use crate::HostError;
 
+// F-LOG-HOST-3 (#978) Store-before-Kernel sequence observation helpers.
+//
+// Through the #889 facade only
+// (`crate::host_diagnostics::observe_entrypoint_with_detail`); the Event Log
+// seam stays typed-Unavailable
+// (`crate::windows_event_log::event_log_sink_status`), never implemented here
+// (#984 still open). No terminal is owned here: the single terminal for a
+// failed launch stays with the outermost #891 contour (`host-start-failed` in
+// `lib.rs`); this sequence correlates Store-ready vs Kernel-ready by stage
+// order only.
+//
+// Observation-only contract: every helper projects facts already produced by
+// the semantic owner. Arguments are static literals only — never process
+// identities, PIDs, paths, digests, or arbitrary error text — so bounding
+// limits size, not sensitivity (I15.4). Sink outcome never alters
+// result/order/status/cleanup. There is no mutable global dedup cache.
+#[cfg(windows)]
+fn store_kernel_note_event_log_unavailable() {
+    let _ = crate::windows_event_log::event_log_sink_status();
+}
+
+#[cfg(windows)]
+fn store_kernel_observe(detail: &str) {
+    store_kernel_note_event_log_unavailable();
+    crate::host_diagnostics::observe_entrypoint_with_detail(
+        crate::host_diagnostics::EntrypointStage::Startup,
+        detail,
+    );
+}
+
 #[derive(Debug, Error, Eq, PartialEq)]
 pub enum StoreLivenessEvidence {
     #[error("dead")]
@@ -48,8 +78,21 @@ where
     KF: FnOnce() -> Result<K, HostError>,
     CF: FnOnce(S) -> Result<(), Box<(S, String)>>,
 {
+    // WORK_UNIT_CASE: 978/6 — Store launch requested before any Kernel work;
+    // Store-before-Kernel ordering is observed, never reordered.
+    store_kernel_observe("host.store-launch requested");
     let store = launch_store().map_err(StoreKernelLaunchError::Launch)?;
     if let Err(evidence) = observe_store(&store) {
+        // WORK_UNIT_CASE: 978/6 — Store liveness outcome observed separately
+        // from Kernel readiness; exact evidence propagates unchanged.
+        match &evidence {
+            StoreLivenessEvidence::Dead => {
+                store_kernel_observe("host.store-launch store-dead observed");
+            }
+            StoreLivenessEvidence::Unknown(_) => {
+                store_kernel_observe("host.store-launch store-unknown observed");
+            }
+        }
         return match cleanup_store(store) {
             Ok(()) => Err(StoreKernelLaunchError::StoreNotLive { evidence }),
             Err(boxed) => {
@@ -58,6 +101,11 @@ where
             }
         };
     }
+    // WORK_UNIT_CASE: 978/6 — Store-ready observed; Kernel is invoked only
+    // after this barrier.
+    store_kernel_observe("host.store-launch store-ready observed");
+    // WORK_UNIT_CASE: 978/6 — Kernel launch requested only after Store-ready.
+    store_kernel_observe("host.kernel-launch requested");
     let kernel = match launch_kernel() {
         Ok(kernel) => kernel,
         Err(error) => {
@@ -75,5 +123,8 @@ where
             };
         }
     };
+    // WORK_UNIT_CASE: 978/6 — Kernel-ready observed distinctly from
+    // Store-ready; readiness still requires its own owner proof downstream.
+    store_kernel_observe("host.kernel-launch kernel-ready observed");
     Ok((store, kernel))
 }
