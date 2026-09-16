@@ -37,6 +37,84 @@ mod store_kernel_launch_sequence;
 /// lands, never FFI inside Host.
 pub mod windows_event_log;
 
+// F-LOG-HOST-1 (#891) lifecycle/SCM observation helpers.
+//
+// Through the #889 facade only (`host_diagnostics::observe_entrypoint`,
+// `observe_entrypoint_with_detail`, `observe_terminal_error`); the Event Log
+// seam stays typed-Unavailable (`windows_event_log::event_log_sink_status`),
+// never implemented here (#984 still open).
+//
+// Observation-only contract: every helper projects facts already produced by
+// the semantic owner. Arguments are static literals or borrows of
+// already-owned identities; no helper computes new digests, opens handles,
+// evaluates side-effectful values, acquires locks, or branches the semantic
+// result. Sink outcome never alters result/order/status/cleanup. There is no
+// mutable global dedup cache: one terminal emission per failed public
+// operation is enforced by the single outermost guard per operation, while
+// inner phase observations share correlation by stage order only.
+fn host_lifecycle_note_event_log_unavailable() {
+    let _ = windows_event_log::event_log_sink_status();
+}
+
+fn host_lifecycle_observe_requested(detail: &str) {
+    host_lifecycle_note_event_log_unavailable();
+    host_diagnostics::observe_entrypoint_with_detail(
+        host_diagnostics::EntrypointStage::Startup,
+        detail,
+    );
+}
+
+fn host_lifecycle_observe_scm(detail: &str) {
+    host_lifecycle_note_event_log_unavailable();
+    host_diagnostics::observe_entrypoint_with_detail(
+        host_diagnostics::EntrypointStage::ScmDispatch,
+        detail,
+    );
+}
+
+fn host_lifecycle_observe_drain(detail: &str) {
+    host_lifecycle_note_event_log_unavailable();
+    host_diagnostics::observe_entrypoint_with_detail(
+        host_diagnostics::EntrypointStage::ShutdownDrain,
+        detail,
+    );
+}
+
+fn host_lifecycle_observe_terminal(code: &str) {
+    host_lifecycle_note_event_log_unavailable();
+    host_diagnostics::observe_terminal_error(code);
+}
+
+/// Single-terminal guard for one public fallible operation.
+///
+/// Armed on entry; the single outermost boundary disarms on success. Any
+/// `Err` return (explicit or via `?`) drops armed and emits exactly one
+/// terminal record with the operation's frozen code. Emitting here never
+/// changes the `Result`: the guard only observes the already-produced
+/// outcome. No dedup cache, no lock, no second evaluation.
+struct HostTerminalGuard<'a> {
+    code: &'a str,
+    armed: bool,
+}
+
+impl<'a> HostTerminalGuard<'a> {
+    fn armed(code: &'a str) -> Self {
+        Self { code, armed: true }
+    }
+
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for HostTerminalGuard<'_> {
+    fn drop(&mut self) {
+        if self.armed {
+            host_lifecycle_observe_terminal(self.code);
+        }
+    }
+}
+
 pub use credential_control::{HostCredentialControl, HostPhaseBRequest, HostPhaseBRequestQueue};
 #[cfg(windows)]
 use launch_artifact::{
@@ -872,6 +950,9 @@ impl HostJobBranches {
     ///
     /// Returns an error if either owner-scoped Job identity is invalid.
     pub fn new(host: &HostInstallationEpoch) -> Result<Self, WindowsAdapterError> {
+        // F-LOG-HOST-1: phase only; the outermost `open` guard owns the single
+        // terminal for this contour. Liveness is not readiness here.
+        host_lifecycle_observe_requested("host.jobs requested");
         let suffix = format!(
             "{}-{}",
             host.epoch.current.lineage_id.as_str(),
@@ -880,6 +961,7 @@ impl HostJobBranches {
         let kernel_identity = JobObjectIdentity::new(format!("Local\\Eliot-Host-Kernel-{suffix}"))?;
         let store_identity = JobObjectIdentity::new(format!("Local\\Eliot-Host-Store-{suffix}"))?;
         let kernel_launch_binding = KernelLaunchBinding::observe_current()?;
+        host_lifecycle_observe_requested("host.jobs admitted");
         Ok(Self {
             kernel: None,
             store: None,
@@ -942,12 +1024,14 @@ impl HostJobBranches {
     /// on this startup path; the binding is populated only by a later
     /// approved contour admission.
     pub fn new_fenced(host: &HostInstallationEpoch) -> Result<Self, WindowsAdapterError> {
+        // F-LOG-HOST-1: phase only; outermost `open` owns the terminal.
+        host_lifecycle_observe_requested("host.jobs-fenced requested");
         let suffix = format!(
             "{}-{}",
             host.epoch.current.lineage_id.as_str(),
             host.epoch.current.sequence
         );
-        Ok(Self {
+        let branches = Self {
             kernel: None,
             store: None,
             kernel_identity: JobObjectIdentity::new(format!("Local\\Eliot-Host-Kernel-{suffix}"))?,
@@ -976,7 +1060,9 @@ impl HostJobBranches {
             kernel_activation_receipt: None,
             kernel_restart_attempts: 0,
             store_restart_attempts: 0,
-        })
+        };
+        host_lifecycle_observe_requested("host.jobs-fenced admitted");
+        Ok(branches)
     }
 
     #[allow(
@@ -2878,6 +2964,9 @@ impl HostJobBranches {
         store_artifact: &PlatformHandle,
         host: &HostInstallationEpoch,
     ) -> Result<HostBranchDisposition, HostError> {
+        // F-LOG-HOST-1: phase only; outer `reconcile_approved_contour` owns
+        // the single terminal. Liveness here is never readiness.
+        host_lifecycle_observe_requested("host.branch-reconcile requested");
         // This low-level branch helper has no journal/outer-intent authority.
         // A dead Store must therefore be recovered by HostComposition's one
         // durable Store-recovery operation, never by the generic relaunch
@@ -3108,6 +3197,9 @@ impl HostJobBranches {
     ///
     /// Returns an error if the owned Kernel Job branch cannot be terminated.
     pub fn terminate_kernel(&mut self) -> Result<(), HostError> {
+        // F-LOG-HOST-1: phase only; outer `stop`/reconcile owns the terminal.
+        // Termination requested is distinct from stopped.
+        host_lifecycle_observe_drain("host.kernel-terminate requested");
         if let Some(kernel) = self.kernel.as_mut() {
             kernel
                 .terminate_in_place(0xE017_0001)
@@ -3116,6 +3208,7 @@ impl HostJobBranches {
         }
         self.kernel_candidate = None;
         self.kernel_activation_receipt = None;
+        host_lifecycle_observe_drain("host.kernel-terminate stopped");
         Ok(())
     }
 
@@ -3125,12 +3218,15 @@ impl HostJobBranches {
     ///
     /// Returns an error if the owned store Job branch cannot be terminated.
     pub fn terminate_store(&mut self) -> Result<(), HostError> {
+        // F-LOG-HOST-1: phase only; outer `stop`/reconcile owns the terminal.
+        host_lifecycle_observe_drain("host.store-terminate requested");
         if let Some(store) = self.store.as_mut() {
             store
                 .terminate_in_place(0xE017_0002)
                 .map_err(|error| HostError::RecoveryRequired(error.to_string()))?;
             self.store.take();
         }
+        host_lifecycle_observe_drain("host.store-terminate stopped");
         Ok(())
     }
 
@@ -3724,6 +3820,10 @@ impl HostComposition {
         reason = "Host reopen keeps the epoch, registry, and Phase-B crash-recovery ordering in one boundary"
     )]
     pub fn open(launch_options: HostLaunchOptions) -> Result<Self, HostError> {
+        // F-LOG-HOST-1: request/admitted distinction; single terminal via
+        // guard. Missing evidence suppresses `admitted`, never a new branch.
+        host_lifecycle_observe_requested("host.open requested");
+        let mut host_terminal = HostTerminalGuard::armed("host-open-failed");
         if launch_options.installation().as_str().trim().is_empty() {
             return Err(HostError::MissingInstallation);
         }
@@ -3881,6 +3981,9 @@ impl HostComposition {
             // child launch, or readiness publication may run before the exact
             // inner contour is reconstructed.
             composition.readiness_gate.branch_degraded();
+            // F-LOG-HOST-1: fenced is distinct from admitted; no false ready.
+            host_terminal.disarm();
+            host_lifecycle_observe_requested("host.open fenced store-recovery");
             return Ok(composition);
         }
         #[cfg(windows)]
@@ -3894,6 +3997,9 @@ impl HostComposition {
                 // pair: the exact original handoff must retry preparation.
                 Self::reconcile_pending_agent_bridge_stage(&pending)?;
                 composition.readiness_gate.branch_degraded();
+                // F-LOG-HOST-1: fenced bridge-stage is not admitted/ready.
+                host_terminal.disarm();
+                host_lifecycle_observe_requested("host.open fenced bridge-stage");
                 return Ok(composition);
             }
             if let Some(prepared) = pending.phase_b_prepared.as_ref() {
@@ -3956,6 +4062,9 @@ impl HostComposition {
                         )?;
                     }
                     composition.readiness_gate.branch_degraded();
+                    // F-LOG-HOST-1: prepared without receipt is degraded, not ready.
+                    host_terminal.disarm();
+                    host_lifecycle_observe_requested("host.open degraded prepared-without-receipt");
                     return Ok(composition);
                 } else if let Some(binding) = materialization.agent_bridge() {
                     // A crash after the receipt CAS and before backup cleanup
@@ -3993,6 +4102,9 @@ impl HostComposition {
                 // Keep the runtime-control query surface alive, but admit no
                 // Phase-B/process/readiness contour for this fresh owner.
                 composition.readiness_gate.branch_degraded();
+                // F-LOG-HOST-1: fenced is distinct from admitted.
+                host_terminal.disarm();
+                host_lifecycle_observe_requested("host.open fenced store-recovery-active");
                 return Ok(composition);
             }
             // A committed ActiveVerified fence is source evidence only.  Every
@@ -4008,6 +4120,9 @@ impl HostComposition {
                 None,
             )?;
         }
+        // F-LOG-HOST-1: admitted only with durable evidence; guard disarmed.
+        host_terminal.disarm();
+        host_lifecycle_observe_requested("host.open admitted");
         Ok(composition)
     }
 
@@ -4027,17 +4142,24 @@ impl HostComposition {
     /// root cannot be admitted.
     #[cfg(windows)]
     pub fn credential_control(&self) -> Result<HostCredentialControl, HostError> {
+        // F-LOG-HOST-1: SCM receipt boundary; identities only, never secret
+        // values/env/payloads. Single terminal via guard.
+        host_lifecycle_observe_scm("host.credential-control requested");
+        let mut host_terminal = HostTerminalGuard::armed("host-credential-control-failed");
         let capability = self
             .owner_lease
             .credential_mutation_capability()
             .map_err(|error| HostError::Platform(error.to_string()))?;
-        HostCredentialControl::new(
+        let control = HostCredentialControl::new(
             self.host.clone(),
             self.launch_options.host_state_root().to_path_buf(),
             capability,
             std::sync::Arc::new(std::sync::Mutex::new(std::collections::VecDeque::new())),
         )
-        .map_err(HostError::Platform)
+        .map_err(HostError::Platform)?;
+        host_terminal.disarm();
+        host_lifecycle_observe_scm("host.credential-control admitted receipt");
+        Ok(control)
     }
 
     /// Handles one authenticated, transaction-bound Phase-B request on the
@@ -4055,7 +4177,13 @@ impl HostComposition {
         intent: &HostPhaseBMaterializationIntent,
         credential_receipt: &CredentialAccessReceipt,
     ) -> HostCredentialControlResponse {
+        // F-LOG-HOST-1: SCM receipt vs Unknown; failed vs unknown preserved
+        // by distinct details/codes. One terminal per Unknown outcome; the
+        // inner `?` chain shares correlation and never emits its own terminal.
+        host_lifecycle_observe_scm("host.phase-b requested");
         if self.store_recovery_startup_fence.is_fenced() {
+            host_lifecycle_observe_scm("host.phase-b unknown store-recovery-fence");
+            host_lifecycle_observe_terminal("host-phase-b-unknown");
             return HostCredentialControlResponse::Unknown {
                 pending_ref: phase_b_unknown_ref(
                     "store-recovery-fence",
@@ -4177,12 +4305,20 @@ impl HostComposition {
             Ok(receipt)
         })();
         match result {
-            Ok(receipt) => HostCredentialControlResponse::PhaseBPrepared {
-                receipt: Box::new(receipt),
-            },
-            Err(_error) => HostCredentialControlResponse::Unknown {
-                pending_ref: phase_b_unknown_ref("phase-b", "MaterializePhaseB", intent),
-            },
+            Ok(receipt) => {
+                // Receipt (prepared) is distinct from completion (finalized).
+                host_lifecycle_observe_scm("host.phase-b prepared receipt");
+                HostCredentialControlResponse::PhaseBPrepared {
+                    receipt: Box::new(receipt),
+                }
+            }
+            Err(_error) => {
+                host_lifecycle_observe_scm("host.phase-b unknown");
+                host_lifecycle_observe_terminal("host-phase-b-unknown");
+                HostCredentialControlResponse::Unknown {
+                    pending_ref: phase_b_unknown_ref("phase-b", "MaterializePhaseB", intent),
+                }
+            }
         }
     }
 
@@ -4195,6 +4331,9 @@ impl HostComposition {
         credential_receipt: &CredentialAccessReceipt,
         final_receipt: &HostPhaseBMaterializationReceipt,
     ) -> HostCredentialControlResponse {
+        // F-LOG-HOST-1: prepared receipt vs ready completion; Unknown never
+        // false-success. Single terminal for the Unknown outcome.
+        host_lifecycle_observe_scm("host.phase-b-finalize requested");
         let result = (|| {
             intent
                 .validate()
@@ -4277,13 +4416,18 @@ impl HostComposition {
             self.resume_pending_activation_after_phase_b()?;
             Ok(final_receipt.clone())
         })();
-        match result {
-            Ok(receipt) => HostCredentialControlResponse::PhaseBReady {
+        if let Ok(receipt) = result {
+            // Ready completion is distinct from prepared receipt.
+            host_lifecycle_observe_scm("host.phase-b-finalize ready completion");
+            HostCredentialControlResponse::PhaseBReady {
                 receipt: Box::new(receipt),
-            },
-            Err(_) => HostCredentialControlResponse::Unknown {
+            }
+        } else {
+            host_lifecycle_observe_scm("host.phase-b-finalize unknown");
+            host_lifecycle_observe_terminal("host-phase-b-finalize-unknown");
+            HostCredentialControlResponse::Unknown {
                 pending_ref: phase_b_unknown_ref("phase-b-finalize", "FinalizePhaseB", intent),
-            },
+            }
         }
     }
 
@@ -4304,7 +4448,12 @@ impl HostComposition {
         intent: &HostPhaseBMaterializationIntent,
         credential_receipt: &CredentialAccessReceipt,
     ) -> HostCredentialControlResponse {
+        // F-LOG-HOST-1: query-only replay/readback is never another commit.
+        // Unknown stays Unknown, never false-success; single terminal.
+        host_lifecycle_observe_scm("host.phase-b-reconcile requested");
         if self.store_recovery_startup_fence.is_fenced() {
+            host_lifecycle_observe_scm("host.phase-b-reconcile unknown store-recovery-fence");
+            host_lifecycle_observe_terminal("host-phase-b-reconcile-unknown");
             return HostCredentialControlResponse::Unknown {
                 pending_ref: phase_b_unknown_ref("store-recovery-fence", "ReconcilePhaseB", intent),
             };
@@ -4322,6 +4471,8 @@ impl HostComposition {
             && receipt.effect_id == intent.effect_id
             && receipt.request_digest == intent.request_digest
         {
+            // F-LOG-HOST-1: replay/readback, not another commit.
+            host_lifecycle_observe_scm("host.phase-b-reconcile prepared readback replay");
             return HostCredentialControlResponse::PhaseBPrepared {
                 receipt: Box::new(receipt.clone()),
             };
@@ -4524,27 +4675,41 @@ impl HostComposition {
             )
         })();
         match result {
-            Ok(receipt) => HostCredentialControlResponse::PhaseBReady {
-                receipt: Box::new(receipt),
-            },
-            Err(_error) => HostCredentialControlResponse::Unknown {
-                pending_ref: phase_b_unknown_ref("phase-b-query", "ReconcilePhaseB", intent),
-            },
+            Ok(receipt) => {
+                // Committed receipt readback is replay, not another commit.
+                host_lifecycle_observe_scm("host.phase-b-reconcile receipt readback replay");
+                HostCredentialControlResponse::PhaseBReady {
+                    receipt: Box::new(receipt),
+                }
+            }
+            Err(_error) => {
+                host_lifecycle_observe_scm("host.phase-b-reconcile unknown");
+                host_lifecycle_observe_terminal("host-phase-b-reconcile-unknown");
+                HostCredentialControlResponse::Unknown {
+                    pending_ref: phase_b_unknown_ref("phase-b-query", "ReconcilePhaseB", intent),
+                }
+            }
         }
     }
 
     #[cfg(windows)]
     #[allow(missing_docs, clippy::missing_errors_doc)]
     pub fn runtime_control(&self) -> Result<HostRuntimeControl, HostError> {
+        // F-LOG-HOST-1: SCM control receipt boundary; single terminal.
+        host_lifecycle_observe_scm("host.runtime-control requested");
+        let mut host_terminal = HostTerminalGuard::armed("host-runtime-control-failed");
         let capability = self.owner_lease.activation_capability();
         let _guard = capability
             .live_guard()
             .map_err(|e| HostError::Platform(e.to_string()))?;
-        HostRuntimeControl::new_with_capability(
+        let control = HostRuntimeControl::new_with_capability(
             std::sync::Arc::clone(&self.runtime_control_queue),
             &capability,
         )
-        .map_err(HostError::Platform)
+        .map_err(HostError::Platform)?;
+        host_terminal.disarm();
+        host_lifecycle_observe_scm("host.runtime-control admitted receipt");
+        Ok(control)
     }
 
     #[cfg(windows)]
@@ -4558,7 +4723,14 @@ impl HostComposition {
         &mut self,
         request: &HostRuntimeControlRequest,
     ) -> HostRuntimeControlResponse {
+        // F-LOG-HOST-1: SCM receipt vs Unknown; control receipt distinct from
+        // completion. Unsupported op stays typed Unknown, never false-success.
+        // One terminal per Unknown outcome; inner `execute` shares correlation
+        // and never emits its own terminal.
+        host_lifecycle_observe_scm("host.kernel-restart requested");
         if request.operation == HostRuntimeControlOperation::ReconcileKernelRestart {
+            // Reconcile is query-only replay, not another restart commit.
+            host_lifecycle_observe_scm("host.kernel-restart reconcile-delegated readback");
             return self.reconcile_kernel_restart_request(request);
         }
         if self
@@ -4567,6 +4739,8 @@ impl HostComposition {
             .live_guard()
             .is_err()
         {
+            host_lifecycle_observe_scm("host.kernel-restart unknown owner-fenced");
+            host_lifecycle_observe_terminal("host-kernel-restart-unknown");
             return HostRuntimeControlResponse::unknown_for(
                 request,
                 runtime_control_unknown_ref("kernel-restart", request),
@@ -4574,11 +4748,20 @@ impl HostComposition {
         }
         let result = self.execute_kernel_restart(request);
         match result {
-            Ok(receipt) => HostRuntimeControlResponse::restarted_for(request, receipt),
-            Err(_error) => HostRuntimeControlResponse::unknown_for(
-                request,
-                runtime_control_unknown_ref("kernel-restart", request),
-            ),
+            Ok(receipt) => {
+                host_lifecycle_observe_scm("host.kernel-restart receipt completion");
+                HostRuntimeControlResponse::restarted_for(request, receipt)
+            }
+            Err(_error) => {
+                // Unsupported op, pending/unknown, or failed restart all stay
+                // typed Unknown preserving identity; never false-success.
+                host_lifecycle_observe_scm("host.kernel-restart unknown");
+                host_lifecycle_observe_terminal("host-kernel-restart-unknown");
+                HostRuntimeControlResponse::unknown_for(
+                    request,
+                    runtime_control_unknown_ref("kernel-restart", request),
+                )
+            }
         }
     }
 
@@ -4588,18 +4771,27 @@ impl HostComposition {
         &mut self,
         request: &HostRuntimeControlRequest,
     ) -> HostRuntimeControlResponse {
+        // F-LOG-HOST-1: reconcile is query-only replay; Unknown never
+        // false-success and never rewrites the durable receipt. Timeout or
+        // possible state change stays Unknown until reconciliation evidence.
+        // One terminal per Unknown outcome; success readback is replay.
+        host_lifecycle_observe_scm("host.kernel-restart-reconcile requested");
         if self
             .owner_lease
             .activation_capability()
             .live_guard()
             .is_err()
         {
+            host_lifecycle_observe_scm("host.kernel-restart-reconcile unknown owner-fenced");
+            host_lifecycle_observe_terminal("host-kernel-restart-reconcile-unknown");
             return HostRuntimeControlResponse::unknown_for(
                 request,
                 runtime_control_unknown_ref("kernel-restart-reconcile", request),
             );
         }
         if request.validate().is_err() {
+            host_lifecycle_observe_scm("host.kernel-restart-reconcile unknown validation");
+            host_lifecycle_observe_terminal("host-kernel-restart-reconcile-unknown");
             return HostRuntimeControlResponse::unknown_for(
                 request,
                 runtime_control_unknown_ref("kernel-restart-reconcile", request),
@@ -4607,16 +4799,24 @@ impl HostComposition {
         }
         let key = request.mutation_digest.as_str().to_owned();
         if let Some(receipt) = self.runtime_restarts.get(&key).cloned() {
-            return match rebind_runtime_restart_receipt(&receipt, request) {
-                Ok(receipt) => HostRuntimeControlResponse::restarted_for(request, receipt),
-                Err(_) => HostRuntimeControlResponse::unknown_for(
+            return if let Ok(receipt) = rebind_runtime_restart_receipt(&receipt, request) {
+                host_lifecycle_observe_scm("host.kernel-restart-reconcile receipt readback replay");
+                HostRuntimeControlResponse::restarted_for(request, receipt)
+            } else {
+                host_lifecycle_observe_scm("host.kernel-restart-reconcile unknown conflict");
+                host_lifecycle_observe_terminal("host-kernel-restart-reconcile-unknown");
+                HostRuntimeControlResponse::unknown_for(
                     request,
                     runtime_control_unknown_ref("kernel-restart-reconcile-conflict", request),
-                ),
+                )
             };
         }
         match has_runtime_restart_pending(self.launch_options.host_state_root(), &key) {
             Ok(true) | Err(_) => {
+                // Pending or unreadable pending stays Unknown; a timeout is
+                // never proof of effect or non-effect.
+                host_lifecycle_observe_scm("host.kernel-restart-reconcile unknown pending");
+                host_lifecycle_observe_terminal("host-kernel-restart-reconcile-unknown");
                 return HostRuntimeControlResponse::unknown_for(
                     request,
                     runtime_control_unknown_ref("kernel-restart-pending", request),
@@ -4627,6 +4827,8 @@ impl HostComposition {
         let snapshot = match self.journal.snapshot() {
             Ok(s) => s,
             Err(_e) => {
+                host_lifecycle_observe_scm("host.kernel-restart-reconcile unknown snapshot");
+                host_lifecycle_observe_terminal("host-kernel-restart-reconcile-unknown");
                 return HostRuntimeControlResponse::unknown_for(
                     request,
                     runtime_control_unknown_ref("kernel-restart-reconcile-snapshot", request),
@@ -4636,6 +4838,8 @@ impl HostComposition {
         if let Some(kernel) = snapshot.kernel.as_ref() {
             let _ = kernel;
         }
+        host_lifecycle_observe_scm("host.kernel-restart-reconcile unknown");
+        host_lifecycle_observe_terminal("host-kernel-restart-reconcile-unknown");
         HostRuntimeControlResponse::unknown_for(
             request,
             runtime_control_unknown_ref("kernel-restart-reconcile-unknown", request),
@@ -4653,6 +4857,9 @@ impl HostComposition {
         &mut self,
         request: &HostRuntimeControlRequest,
     ) -> Result<HostKernelRestartReceipt, HostError> {
+        // F-LOG-HOST-1: inner phase only; outer `handle_kernel_restart_request`
+        // owns the single terminal. Unsupported op stays typed, never success.
+        host_lifecycle_observe_scm("host.kernel-restart-execute requested");
         request.validate().map_err(HostError::ProcessContour)?;
         if request.operation != HostRuntimeControlOperation::RestartKernel {
             return Err(HostError::ProcessContour(
@@ -4925,6 +5132,8 @@ impl HostComposition {
         persist_runtime_restart_receipt(self.launch_options.host_state_root(), &receipt)?;
         self.runtime_restarts.insert(key, receipt.clone());
         self.readiness_gate.branch_degraded();
+        // F-LOG-HOST-1: receipt (restart) is distinct from reconcile readback.
+        host_lifecycle_observe_scm("host.kernel-restart-execute receipt");
         Ok(receipt)
     }
 
@@ -5181,6 +5390,11 @@ impl HostComposition {
         kernel_executable: impl AsRef<Path>,
         store_executable: impl AsRef<Path>,
     ) -> Result<(), HostError> {
+        // F-LOG-HOST-1: request vs admitted vs started vs ready preserved.
+        // Single terminal via guard; inner `start_manifest_contour` is phase
+        // only and shares correlation without its own terminal.
+        host_lifecycle_observe_requested("host.start requested");
+        let mut host_terminal = HostTerminalGuard::armed("host-start-failed");
         self.ensure_admission_open()?;
         let active =
             self.registry.active().cloned().ok_or_else(|| {
@@ -5196,7 +5410,12 @@ impl HostComposition {
             store_executable.as_ref(),
             store_artifact,
             None,
-        )
+        )?;
+        host_terminal.disarm();
+        // Started is distinct from ready: readiness still requires its own
+        // authenticated proof via the readiness contour.
+        host_lifecycle_observe_requested("host.start started");
+        Ok(())
     }
 
     /// Resumes one pending activation after Host Phase B has materialized its
@@ -5210,6 +5429,9 @@ impl HostComposition {
     /// stale, or the exact pending contour cannot be reconciled.
     #[cfg(windows)]
     pub fn resume_pending_activation_after_phase_b(&mut self) -> Result<(), HostError> {
+        // F-LOG-HOST-1: pending resume boundary; single terminal via guard.
+        host_lifecycle_observe_requested("host.resume-pending requested");
+        let mut host_terminal = HostTerminalGuard::armed("host-resume-pending-failed");
         let pending = self.registry.pending_activation().cloned().ok_or_else(|| {
             HostError::ProcessContour("no pending activation requires Phase-B resume".to_owned())
         })?;
@@ -5223,11 +5445,16 @@ impl HostComposition {
                 "pending activation has no exact Phase-B materialization receipt".to_owned(),
             ));
         }
-        self.reconcile_pending_activation(&pending)
+        self.reconcile_pending_activation(&pending)?;
+        host_terminal.disarm();
+        host_lifecycle_observe_requested("host.resume-pending admitted");
+        Ok(())
     }
 
     #[cfg(windows)]
     fn resume_pending_phase_b_receipt(&mut self) -> Result<(), HostError> {
+        // F-LOG-HOST-1: inner phase only; outer resume owns the terminal.
+        host_lifecycle_observe_requested("host.resume-pending-receipt requested");
         let pending = self.registry.pending_activation().cloned().ok_or_else(|| {
             HostError::RecoveryRequired(
                 "Phase-B receipt continuation has no exact pending activation".to_owned(),
@@ -5276,6 +5503,10 @@ impl HostComposition {
         store_artifact: &PlatformHandle,
         pending: Option<&eliot_installation::PendingActivation>,
     ) -> Result<(), HostError> {
+        // F-LOG-HOST-1: inner phase only; outer `start_approved_contour`/`open`
+        // owns the single terminal. Requested vs started vs ready preserved:
+        // started here is never readiness.
+        host_lifecycle_observe_requested("host.start-manifest requested");
         Self::validate_launch_options_for_manifest(&self.launch_options, manifest)?;
         let manifest_digest = phase_b_manifest_digest(manifest)?;
         let phase_b = match self
@@ -5401,6 +5632,8 @@ impl HostComposition {
         if let Err(error) = self.persist_process_observations(&manifest.generation) {
             self.cleanup_active_kernel_contour(error, "host-process-observation-failed")
         } else {
+            // F-LOG-HOST-1: started only; readiness needs its own proof.
+            host_lifecycle_observe_requested("host.start-manifest started");
             Ok(())
         }
     }
@@ -5650,6 +5883,10 @@ impl HostComposition {
     /// Returns an error only when Host admission itself is fenced.
     #[cfg(windows)]
     pub fn liveness_tick(&mut self) -> Result<HostLivenessTick, HostError> {
+        // F-LOG-HOST-1: liveness is never readiness. Single terminal via
+        // guard; the readiness contour here is identity rederivation only.
+        host_lifecycle_observe_requested("host.liveness requested");
+        let mut host_terminal = HostTerminalGuard::armed("host-liveness-failed");
         self.ensure_admission_open()?;
         let liveness = self.jobs.liveness_only();
         let active_manifest = self.registry.active().map(|active| &active.manifest);
@@ -5664,6 +5901,9 @@ impl HostComposition {
             std::time::Instant::now(),
         );
         self.readiness_gate = readiness_gate;
+        host_terminal.disarm();
+        // Liveness observation only; never claims ready.
+        host_lifecycle_observe_requested("host.liveness observed");
         Ok(tick)
     }
 
@@ -5678,6 +5918,11 @@ impl HostComposition {
     #[cfg(windows)]
     #[allow(clippy::too_many_lines, reason = "ordered branch reconciliation")]
     pub fn reconcile_approved_contour(&mut self) -> Result<HostBranchDisposition, HostError> {
+        // F-LOG-HOST-1: reconcile vs liveness vs readiness preserved.
+        // Readiness is claimed only inside `reconcile_branch_readiness_at`
+        // with authenticated evidence; this outer only admits the contour.
+        host_lifecycle_observe_requested("host.reconcile requested");
+        let mut host_terminal = HostTerminalGuard::armed("host-reconcile-failed");
         self.ensure_admission_open()?;
         let active =
             self.registry.active().cloned().ok_or_else(|| {
@@ -5806,14 +6051,18 @@ impl HostComposition {
                 });
             }
         }
-        Ok(self.reconcile_branch_readiness_at(
+        let disposition = self.reconcile_branch_readiness_at(
             &active.manifest.generation,
             kernel_artifact,
             store_artifact,
             &materialized_config_digest,
             disposition,
             std::time::Instant::now(),
-        ))
+        );
+        host_terminal.disarm();
+        // Admitted only; ready vs degraded is owned by the readiness contour.
+        host_lifecycle_observe_requested("host.reconcile admitted");
+        Ok(disposition)
     }
 
     #[cfg(windows)]
@@ -5826,8 +6075,12 @@ impl HostComposition {
         disposition: HostBranchDisposition,
         now: std::time::Instant,
     ) -> HostBranchDisposition {
+        // F-LOG-HOST-1: readiness is claimed only with authenticated proof.
+        // Degraded vs ready preserved; liveness alone never becomes ready.
+        // Phase only; outer reconcile owns the terminal.
         if disposition != HostBranchDisposition::LiveAwaitingReadiness {
             self.readiness_gate.branch_degraded();
+            host_lifecycle_observe_requested("host.readiness degraded");
             if let Err(error) = self.persist_degraded_process_observation(generation, disposition) {
                 self.readiness_gate
                     .fail(None, readiness_failure_kind(&error), now);
@@ -5835,6 +6088,7 @@ impl HostComposition {
             }
             return disposition;
         }
+        host_lifecycle_observe_requested("host.readiness requested proof");
         let contour =
             self.current_readiness_contour(generation, kernel_artifact, store_artifact, config);
         let mut readiness_gate = std::mem::take(&mut self.readiness_gate);
@@ -5842,6 +6096,13 @@ impl HostComposition {
             self.persist_fresh_authenticated_readiness(generation)
         });
         self.readiness_gate = readiness_gate;
+        // Ready only when the authenticated gate admits it; degraded stays
+        // degraded. The detail below is emitted only for the ready outcome.
+        if outcome == HostBranchDisposition::Healthy {
+            host_lifecycle_observe_requested("host.readiness ready proof");
+        } else {
+            host_lifecycle_observe_requested("host.readiness degraded");
+        }
         outcome
     }
 
@@ -5880,6 +6141,9 @@ impl HostComposition {
         store_artifact: &PlatformHandle,
         config: &PlatformHandle,
     ) -> Result<ReadinessContourIdentity, HostError> {
+        // F-LOG-HOST-1: contour probe only; never claims ready by itself.
+        // The ready claim happens only after the authenticated proof fence.
+        host_lifecycle_observe_requested("host.readiness-contour requested");
         if self.jobs.approved_generation.as_ref() != Some(generation)
             || self.jobs.kernel_artifact_digest.as_ref() != Some(kernel_artifact)
             || self.jobs.store_artifact_digest.as_ref() != Some(store_artifact)
@@ -6066,6 +6330,9 @@ impl HostComposition {
         &mut self,
         generation: &PlatformHandle,
     ) -> Result<ReadinessContourIdentity, HostError> {
+        // F-LOG-HOST-1: ready only with actual proof fence; phase only here,
+        // outer reconcile owns the terminal. Never claims ready from liveness.
+        host_lifecycle_observe_requested("host.readiness-proof requested");
         // A pending candidate is approved but intentionally not active until
         // this fresh proof crosses the registry CAS.  Resolve the exact
         // generation from the registry projection rather than treating the
@@ -6171,6 +6438,8 @@ impl HostComposition {
                 "readiness contour changed while admitting the proof".to_owned(),
             ));
         }
+        // F-LOG-HOST-1: ready only now that the proof fence is confirmed.
+        host_lifecycle_observe_requested("host.readiness-proof ready");
         Ok(confirmed)
     }
 
@@ -6180,6 +6449,8 @@ impl HostComposition {
         generation: &PlatformHandle,
         disposition: HostBranchDisposition,
     ) -> Result<(), HostError> {
+        // F-LOG-HOST-1: degraded is distinct from ready; phase only.
+        host_lifecycle_observe_requested("host.degraded-observation requested");
         debug_assert_ne!(
             disposition,
             HostBranchDisposition::LiveAwaitingReadiness,
@@ -6221,6 +6492,8 @@ impl HostComposition {
     ///
     /// Returns an error if the durable Host state cannot be loaded.
     pub fn has_durable_branch_fence(&self) -> Result<bool, HostError> {
+        // F-LOG-HOST-1: guard probe only; never a terminal and never readiness.
+        host_lifecycle_observe_requested("host.branch-fence requested");
         let state = self.snapshot()?;
         Ok(self.store_recovery_startup_fence.is_fenced()
             || self.pending_record.is_some()
@@ -6238,6 +6511,9 @@ impl HostComposition {
         error: HostError,
         evidence: &str,
     ) -> Result<(), HostError> {
+        // F-LOG-HOST-1: cleanup phase only; outer start/stop owns the terminal.
+        // `evidence` is an already-produced typed reason, never free text.
+        host_lifecycle_observe_drain("host.cleanup-active requested");
         let durable = self
             .journal
             .snapshot()
@@ -6255,6 +6531,8 @@ impl HostComposition {
 
     #[cfg(windows)]
     fn cleanup_launched_contour(&mut self, error: HostError) -> Result<(), HostError> {
+        // F-LOG-HOST-1: cleanup phase only; outer owns the terminal.
+        host_lifecycle_observe_drain("host.cleanup-launched requested");
         let store = self.jobs.terminate_store();
         let kernel = self.jobs.terminate_kernel();
         match (kernel, store) {
@@ -6269,6 +6547,8 @@ impl HostComposition {
     }
 
     fn ensure_admission_open(&self) -> Result<(), HostError> {
+        // F-LOG-HOST-1: guard phase only; callers own the single terminal.
+        // Requested vs admitted preserved: fenced is never admitted.
         if !self.running {
             return Err(HostError::Stopped);
         }
@@ -6298,6 +6578,13 @@ impl HostComposition {
         reason = "the ordered durable drain, process termination, clean-marker commit, and lease-release sequence is one security-critical transaction"
     )]
     pub fn stop(&mut self) -> Result<(), HostError> {
+        // F-LOG-HOST-1: stop/drain distinct. Requested vs Draining vs
+        // StoppedClean are three durable records sharing one drain_generation
+        // correlation; draining vs drained and requested vs stopped are never
+        // merged. Cancellation requested stays distinct from stopped. Single
+        // terminal via guard; inner terminates are phase only.
+        host_lifecycle_observe_drain("host.stop requested");
+        let mut host_terminal = HostTerminalGuard::armed("host-stop-failed");
         if !self.running {
             return Err(HostError::Stopped);
         }
@@ -6331,6 +6618,9 @@ impl HostComposition {
                                     .map_err(|error| HostError::Platform(error.to_string()))?,
                             ],
                         }))?;
+                        // F-LOG-HOST-1: drain Requested is distinct from
+                        // Draining; shares one drain_generation correlation.
+                        host_lifecycle_observe_drain("host.drain requested");
                     }
                     if self
                         .journal
@@ -6349,6 +6639,9 @@ impl HostComposition {
                                     .map_err(|error| HostError::Platform(error.to_string()))?,
                             ],
                         }))?;
+                        // F-LOG-HOST-1: Draining is distinct from Requested and
+                        // from drained/StoppedClean; one correlation.
+                        host_lifecycle_observe_drain("host.drain draining");
                     }
                     if self
                         .journal
@@ -6408,6 +6701,9 @@ impl HostComposition {
                 .is_some_and(|current| current.state == ActivationState::Draining)
             {
                 self.transition_activation(ActivationState::StoppedClean, "host-stopped-clean")?;
+                // F-LOG-HOST-1: StoppedClean (drained) is distinct from
+                // Draining and from requested/stopped.
+                host_lifecycle_observe_drain("host.stop stopped-clean drained");
             }
             #[cfg(windows)]
             cleanup_completed_store_recovery_supporting_evidence(
@@ -6436,6 +6732,10 @@ impl HostComposition {
         }
         self.running = false;
         self.shutdown_failed = false;
+        // F-LOG-HOST-1: stopped is distinct from requested/draining; the
+        // single guard terminal stays armed only for failures.
+        host_terminal.disarm();
+        host_lifecycle_observe_drain("host.stop stopped");
         Ok(())
     }
 
@@ -6490,6 +6790,12 @@ fn lifecycle_context(
     host: &HostInstallationEpoch,
     operation: &str,
 ) -> Result<RequestMetadata, HostError> {
+    // F-LOG-HOST-1: lifecycle identity projection only; preserves exact
+    // installation/process/start/generation/operation identities already
+    // produced by the owner. `operation` is a static caller literal, never
+    // SCM payload/env/credentials. Single terminal via manual observe: the
+    // guard cannot wrap this free function without changing its signature.
+    host_lifecycle_observe_requested("host.lifecycle-context requested");
     let request_id = RequestId::new(format!(
         "host:{}:{}:{}:{}",
         host.epoch.current.lineage_id,
@@ -6497,18 +6803,27 @@ fn lifecycle_context(
         operation,
         std::process::id()
     ))
-    .map_err(|error| HostError::Platform(error.to_string()))?;
-    Ok(RequestMetadata {
+    .map_err(|error| {
+        host_lifecycle_observe_terminal("host-lifecycle-context-failed");
+        HostError::Platform(error.to_string())
+    })?;
+    let context = RequestMetadata {
         request_id,
         session_id: None,
         task_id: None,
-        product_id: ProductId::new("eliot-host")
-            .map_err(|error| HostError::Platform(error.to_string()))?,
-        source_id: SourceId::new("eliot-host-service")
-            .map_err(|error| HostError::Platform(error.to_string()))?,
+        product_id: ProductId::new("eliot-host").map_err(|error| {
+            host_lifecycle_observe_terminal("host-lifecycle-context-failed");
+            HostError::Platform(error.to_string())
+        })?,
+        source_id: SourceId::new("eliot-host-service").map_err(|error| {
+            host_lifecycle_observe_terminal("host-lifecycle-context-failed");
+            HostError::Platform(error.to_string())
+        })?,
         state_fence: StateFence::new(host.epoch.current.clone(), ResourceGeneration::genesis()),
         clock: ClockReading::default(),
-    })
+    };
+    host_lifecycle_observe_requested("host.lifecycle-context admitted");
+    Ok(context)
 }
 
 fn owner_lease_error(error: HostOwnerLeaseError) -> HostError {
