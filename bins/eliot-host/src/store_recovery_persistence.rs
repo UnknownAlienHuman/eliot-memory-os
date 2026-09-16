@@ -108,12 +108,12 @@ pub(super) fn store_recovery_inner_binding_path(host_state_root: &Path, digest: 
 pub(super) fn load_durable_store_recoveries(
     host_state_root: &Path,
 ) -> Result<Vec<StoreRecoveryReopenFence>, HostError> {
+    const MAX_STORE_RECOVERY_RECORD_BYTES: u64 = 16 * 1024;
+    const MAX_STORE_RECOVERY_RECORDS: usize = 1024;
     // F-LOG-HOST-2 (#893): Store projection boundary. The projected fences
     // are startup evidence only; terminals stay with the outermost recovery
     // boundary.
     store_recovery_persist_observe("host.store-recovery projection requested");
-    const MAX_STORE_RECOVERY_RECORD_BYTES: u64 = 16 * 1024;
-    const MAX_STORE_RECOVERY_RECORDS: usize = 1024;
     let mut pending_records = std::collections::HashMap::new();
     let mut termination_records = std::collections::HashMap::new();
     let mut inner_bindings = std::collections::HashMap::new();
@@ -488,10 +488,10 @@ fn store_recovery_pending_identity_from_bytes(
 pub(super) fn read_store_recovery_pending_identity(
     path: &Path,
 ) -> Result<Option<StoreRecoveryPendingIdentity>, HostError> {
+    const MAX_PENDING_BYTES: u64 = 16 * 1024;
     // F-LOG-HOST-2 (#893): pending-identity load boundary; loaded versus
     // absent stay distinct, failures stay with the outermost terminal.
     store_recovery_persist_observe("host.store-recovery pending load requested");
-    const MAX_PENDING_BYTES: u64 = 16 * 1024;
     let expected_mutation_digest = path
         .file_name()
         .and_then(|name| name.to_str())
