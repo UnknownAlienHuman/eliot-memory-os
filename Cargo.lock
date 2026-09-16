@@ -2064,7 +2064,6 @@ dependencies = [
 name = "eliot-native-worker"
 version = "0.1.0"
 dependencies = [
- "eliot-agent-acp",
  "eliot-agent-claude",
  "eliot-agent-codex",
  "eliot-agent-opencode",

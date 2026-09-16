@@ -14,7 +14,6 @@ name = "eliot-native-worker"
 path = "src/main.rs"
 
 [dependencies]
-eliot-agent-acp = { path = "../../crates/agent/eliot-agent-acp" }
 eliot-agent-claude = { path = "../../crates/agent/eliot-agent-claude" }
 eliot-agent-codex = { path = "../../crates/agent/eliot-agent-codex" }
 eliot-agent-opencode = { path = "../../crates/agent/eliot-agent-opencode" }
