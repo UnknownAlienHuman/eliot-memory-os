@@ -168,7 +168,10 @@ fn runtime_control_unknown_ref_preserves_request_identity_across_reopen() -> Tes
         HostRuntimeControlOperation::RestartKernel,
         PlatformHandle::new("reopen-request-17")?,
     )?;
-    let pending_ref = runtime_control_unknown_ref("kernel-restart-reconcile", &request);
+    let pending_ref = eliot_host_service::runtime_control::runtime_control_unknown_ref(
+        "kernel-restart-reconcile",
+        &request,
+    );
     assert!(pending_ref.as_str().contains("RestartKernel"));
     assert!(pending_ref.as_str().contains(request.request_id.as_str()));
     assert!(

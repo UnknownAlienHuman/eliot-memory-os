@@ -166,42 +166,22 @@ pub struct InitializeResponse {
     pub protocol_version: McpProtocolVersion,
     /// Exact canonical tool count.
     pub canonical_tool_count: usize,
-    /// Whether the legacy alias is available in the compatibility adapter.
-    pub legacy_memory_use_alias: bool,
     /// Hard encoded structured-response limit.
     pub structured_response_limit_bytes: usize,
     /// Explicit statement that initialize did not create application identity.
     pub application_binding_created: bool,
 }
 
-/// Correlation-only hint admitted only by the 2025-11-25 adapter.
-#[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct CompatibilityCorrelation {
-    /// Opaque transport hint. It is not a Session identity.
-    pub transport_session_hint: Option<String>,
-}
-
 /// Immutable forwarded request passed to the injected semantic owner.
 #[derive(Clone, Debug, JsonSchema, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ForwardedRequest {
-    /// Validated request with its canonical tool form.
+    /// Validated request in its canonical tool form.
     pub request: ApplicationRequest,
-    /// Original typed request, retained before compatibility normalization.
-    pub original_request: ApplicationRequest,
-    /// Canonical digest of the original typed request.
-    pub original_request_sha256: String,
-    /// Canonical digest of the original typed payload.
-    pub original_payload_sha256: String,
-    /// Canonical digest of the normalized typed payload.
-    pub canonical_payload_sha256: String,
     /// SHA-256 over canonical serialized request bytes, including identity.
     pub canonical_request_sha256: String,
     /// Trusted current operational binding resolved for this exact request.
     pub active_session_binding: ActiveSessionBinding,
-    /// Compatibility-only transport correlation hint.
-    pub compatibility_correlation_hint: Option<String>,
     /// Owner-authenticated source evidence required by every semantic handoff.
     pub source_assurance: ForwardedSourceAssurance,
 }
@@ -214,7 +194,7 @@ pub struct ForwardedSourceAssurance {
     pub owner_principal_ref: String,
     pub evidence_ref: String,
     pub request_id: String,
-    /// Exact typed pre-normalization request identity.
+    /// Exact typed request identity.
     pub original_request_sha256: String,
     pub idempotency_key: String,
     pub cancellation_id: String,
@@ -748,7 +728,7 @@ pub struct McpResponse {
     pub canonical_request_sha256: String,
     /// Candidate/projection/typed-gap class.
     pub kind: ResponseKind,
-    /// Canonical tool name after alias normalization.
+    /// Canonical tool name.
     pub canonical_tool_name: String,
     /// Structured bounded content or a resource pointer.
     pub content: Value,
@@ -760,8 +740,6 @@ pub struct McpResponse {
     pub resource: Option<ResourceHandle>,
     /// Long-operation presentation.
     pub job: Option<JobPresentation>,
-    /// Compat-only hint echoed solely for transport correlation.
-    pub compatibility_correlation_hint: Option<String>,
 }
 
 /// Immutable identity binding one bounded MCP response to its request.
@@ -805,7 +783,6 @@ impl McpCore {
         InitializeResponse {
             protocol_version: request.protocol_version,
             canonical_tool_count: crate::CANONICAL_TOOL_NAMES.len(),
-            legacy_memory_use_alias: true,
             structured_response_limit_bytes: HARD_STRUCTURED_RESPONSE_BYTES,
             application_binding_created: false,
         }
@@ -824,42 +801,15 @@ impl McpCore {
                 "the primary entrypoint admits only 2026-07-28",
             ));
         }
-        Self::execute_inner(port, transport, request, None)
-    }
-
-    /// Isolated 2025-11-25 adapter. The hint cannot replace the application binding.
-    pub fn execute_compat<P: KernelGovernorPort + ?Sized>(
-        &self,
-        port: &P,
-        transport: TransportRequestContext,
-        request: ApplicationRequest,
-        correlation: CompatibilityCorrelation,
-    ) -> Result<McpResponse, BridgeError> {
-        if request.protocol_version != McpProtocolVersion::Compat2025_11_25 {
-            return Err(BridgeError::invalid(
-                "protocol_version",
-                "compatibility correlation is only admitted for 2025-11-25",
-            ));
-        }
-        if correlation
-            .transport_session_hint
-            .as_ref()
-            .is_some_and(|value| value.trim().is_empty())
-        {
-            return Err(BridgeError::invalid(
-                "compatibility.transport_session_hint",
-                "must be non-blank when present",
-            ));
-        }
-        Self::execute_inner(port, transport, request, correlation.transport_session_hint)
+        Self::execute_inner(port, transport, request)
     }
 
     /// Validates raw request bytes through the protected decoder before any
     /// trusted construction or semantic dispatch.
     ///
     /// Raw duplicate protected keys (including escape-equivalent forms) and
-    /// unknown protected variants fail here with zero port calls. Supported
-    /// compatibility is admitted explicitly; no trial decoding is performed.
+    /// unknown protected variants fail here with zero port calls; no trial
+    /// decoding is performed.
     pub fn execute_raw<P: KernelGovernorPort + ?Sized>(
         &self,
         port: &P,
@@ -871,33 +821,14 @@ impl McpCore {
         self.execute(port, transport, request)
     }
 
-    /// Raw-bytes form of the isolated 2025-11-25 adapter.
-    pub fn execute_compat_raw<P: KernelGovernorPort + ?Sized>(
-        &self,
-        port: &P,
-        transport: TransportRequestContext,
-        request_bytes: &[u8],
-        correlation: CompatibilityCorrelation,
-    ) -> Result<McpResponse, BridgeError> {
-        let request =
-            decode_protected_request_bytes(request_bytes).map_err(raw_rejection_to_bridge)?;
-        self.execute_compat(port, transport, request, correlation)
-    }
-
     #[allow(clippy::too_many_lines)]
     fn execute_inner<P: KernelGovernorPort + ?Sized>(
         port: &P,
         transport: TransportRequestContext,
-        mut request: ApplicationRequest,
-        compatibility_hint: Option<String>,
+        request: ApplicationRequest,
     ) -> Result<McpResponse, BridgeError> {
         transport.validate()?;
         validate_application_request(&request)?;
-        let original_request = request.clone();
-        let original_request_sha256 = canonical_sha256(&original_request)?;
-        let original_payload_sha256 = canonical_sha256(&original_request.tool)?;
-        request.tool = request.tool.canonicalized();
-        let canonical_payload_sha256 = canonical_sha256(&request.tool)?;
         let correlation = RequestCorrelation {
             request_id: request
                 .identity
@@ -915,7 +846,7 @@ impl McpCore {
             transport,
             claimed_session: request.session.clone(),
             request_id: correlation.request_id.clone(),
-            original_request_sha256: original_request_sha256.clone(),
+            original_request_sha256: correlation.canonical_request_sha256.clone(),
             idempotency_key: correlation.idempotency_key.clone(),
             cancellation_id: request.identity.cancellation_id.clone(),
             canonical_request_sha256: correlation.canonical_request_sha256.clone(),
@@ -929,7 +860,6 @@ impl McpCore {
                     &correlation.idempotency_key,
                     &correlation.canonical_request_sha256,
                     &canonical_tool_name,
-                    compatibility_hint,
                     failure,
                 );
             }
@@ -945,7 +875,6 @@ impl McpCore {
                         &correlation.idempotency_key,
                         &correlation.canonical_request_sha256,
                         &canonical_tool_name,
-                        compatibility_hint,
                         failure,
                     );
                 }
@@ -958,13 +887,8 @@ impl McpCore {
         )?;
         let forwarded = ForwardedRequest {
             request,
-            original_request,
-            original_request_sha256,
-            original_payload_sha256,
-            canonical_payload_sha256,
             canonical_request_sha256: correlation.canonical_request_sha256.clone(),
             active_session_binding,
-            compatibility_correlation_hint: compatibility_hint.clone(),
             source_assurance,
         };
         let projection = match port.dispatch(&forwarded) {
@@ -975,7 +899,6 @@ impl McpCore {
                     &correlation.idempotency_key,
                     &correlation.canonical_request_sha256,
                     &canonical_tool_name,
-                    compatibility_hint,
                     failure,
                 );
             }
@@ -1004,7 +927,6 @@ impl McpCore {
             proof_ceiling: projection.proof_ceiling,
             resource: projection.resource,
             job,
-            compatibility_correlation_hint: compatibility_hint,
         };
         bounded_response(response)
     }
@@ -1038,7 +960,6 @@ fn negative_response(
     idempotency_key: &str,
     canonical_request_sha256: &str,
     canonical_tool_name: &str,
-    compatibility_hint: Option<String>,
     failure: PortFailure,
 ) -> Result<McpResponse, BridgeError> {
     let (kind, content) = match failure {
@@ -1074,7 +995,6 @@ fn negative_response(
         proof_ceiling: ProofCeiling::Observation,
         resource: None,
         job: None,
-        compatibility_correlation_hint: compatibility_hint,
     })
 }
 
@@ -1530,10 +1450,10 @@ pub enum ReplayDisposition {
 
 /// Compares two forwarded requests for exact replay or invalidation.
 ///
-/// Exact replay requires identical retry identity plus identical payload
-/// digests, canonical request digests, active binding, source assurance
-/// (including the assurance digest), and policy. Any protected change under
-/// one identity conflicts and invalidates reuse.
+/// Exact replay requires identical retry identity plus identical canonical
+/// request digests, active binding, source assurance (including the assurance
+/// digest), and policy. Any protected change under one identity conflicts and
+/// invalidates reuse.
 #[must_use]
 pub fn replay_disposition(
     original: &ForwardedRequest,
@@ -1544,12 +1464,8 @@ pub fn replay_disposition(
     {
         return ReplayDisposition::DifferentIdentity;
     }
-    if original.original_request_sha256 != candidate.original_request_sha256
-        || original.original_payload_sha256 != candidate.original_payload_sha256
-        || original.canonical_payload_sha256 != candidate.canonical_payload_sha256
-        || original.canonical_request_sha256 != candidate.canonical_request_sha256
+    if original.canonical_request_sha256 != candidate.canonical_request_sha256
         || original.request != candidate.request
-        || original.original_request != candidate.original_request
     {
         return ReplayDisposition::Conflict(ReplayConflictKind::PayloadChanged);
     }
@@ -1571,9 +1487,6 @@ pub fn replay_disposition(
         || original.source_assurance.canonical_request_sha256
             != candidate.source_assurance.canonical_request_sha256
     {
-        return ReplayDisposition::Conflict(ReplayConflictKind::BindingChanged);
-    }
-    if original.compatibility_correlation_hint != candidate.compatibility_correlation_hint {
         return ReplayDisposition::Conflict(ReplayConflictKind::BindingChanged);
     }
     ReplayDisposition::ExactReplay

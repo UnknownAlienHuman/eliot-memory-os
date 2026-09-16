@@ -277,12 +277,12 @@ fn assured_ingress_forwards_one_complete_envelope() -> Result<(), Box<dyn Error>
         .as_ref()
         .expect("semantic port receives a request");
     assert_eq!(
-        forwarded.original_request_sha256,
+        forwarded.source_assurance.original_request_sha256,
         forwarded.canonical_request_sha256
     );
     assert_eq!(
-        forwarded.original_payload_sha256,
-        forwarded.canonical_payload_sha256
+        forwarded.source_assurance.canonical_request_sha256,
+        forwarded.canonical_request_sha256
     );
     assert_eq!(forwarded.source_assurance.request_id, "request-1");
     assert_eq!(forwarded.source_assurance.session_id, "session-1");
@@ -421,9 +421,6 @@ fn admitted_forwards_once_with_complete_envelope() -> Result<(), Box<dyn Error>>
         .as_ref()
         .expect("semantic port receives a request");
     for digest in [
-        &forwarded.original_request_sha256,
-        &forwarded.original_payload_sha256,
-        &forwarded.canonical_payload_sha256,
         &forwarded.canonical_request_sha256,
         &forwarded.source_assurance.assurance_digest,
         &forwarded.source_assurance.state_fence_digest,
@@ -432,6 +429,14 @@ fn admitted_forwards_once_with_complete_envelope() -> Result<(), Box<dyn Error>>
     ] {
         assert!(is_hex64(digest), "digests must be lowercase hex");
     }
+    assert_eq!(
+        forwarded.source_assurance.original_request_sha256,
+        forwarded.canonical_request_sha256
+    );
+    assert_eq!(
+        forwarded.source_assurance.canonical_request_sha256,
+        forwarded.canonical_request_sha256
+    );
     assert_eq!(forwarded.source_assurance.request_id, "request-1");
     assert_eq!(forwarded.source_assurance.session_id, "session-1");
     assert_eq!(forwarded.source_assurance.idempotency_key, "idempotency-1");

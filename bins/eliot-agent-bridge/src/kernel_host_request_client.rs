@@ -1038,7 +1038,6 @@ mod tests {
             "proof_ceiling": "SCOPED_VERIFICATION",
             "resource": null,
             "job": null,
-            "compatibility_correlation_hint": null,
         });
         let digest = sha256_hex(
             &canonical_json_bytes(
