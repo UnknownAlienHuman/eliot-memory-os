@@ -13,6 +13,8 @@ use eliot_wasm_runtime::{
 use wasmtime::component::{Component, Linker};
 use wasmtime::{Config, Engine, ResourceLimiter, Store, StoreLimits, StoreLimitsBuilder};
 
+use crate::shadow::{enforce_shadow_no_effect, shadow_port_error};
+
 const WASMTIME_VERSION: &str = "47.0.4";
 const WIT_VERSION: &str = "1.0.0";
 const WIT_WORLD: &str = "eliot:wasm/guest";
@@ -500,6 +502,15 @@ impl ComponentEnginePort for WasmtimeComponentEngine {
             &invocation.input,
             invocation.manifest.imports.is_empty(),
         )
+        .and_then(|report| {
+            // Host-half shadow gate (issue #21, AC4): a shadow-contour report
+            // carrying canonical/external effect content or out-of-envelope
+            // scheduling/memory demand is denied before it can leave the
+            // host toward the A-12 facade.
+            enforce_shadow_no_effect(invocation.contour, &invocation.limits, &report)
+                .map(|()| report)
+                .map_err(shadow_port_error)
+        })
     }
 
     fn reconcile(&mut self, _invocation: &EngineInvocation) -> Result<EngineReport, PortError> {

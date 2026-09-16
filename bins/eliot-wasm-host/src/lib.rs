@@ -21,6 +21,7 @@ use eliot_wasm_runtime::{
 
 mod artifact_preflight;
 mod cli_contract;
+mod shadow;
 mod typed_bindings;
 mod typed_execution;
 mod wasmtime_provider;
@@ -29,6 +30,7 @@ pub use artifact_preflight::{
     MAX_ARTIFACT_BYTES, Preflight, PreflightError, preflight_bytes, read_bounded_artifact,
 };
 pub use cli_contract::{CliConfig, CliError, Profile, Transport, parse_args};
+pub use shadow::{ShadowError, enforce_shadow_no_effect, shadow_port_error};
 pub use typed_bindings::{
     LEGACY_EXPORT, LEGACY_WORLD, TYPED_PACKAGE_ID, TYPED_WIT_VERSION, TypedWorld,
     export_matches_interface, typed_wit_digest,
