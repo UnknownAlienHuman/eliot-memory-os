@@ -1,13 +1,13 @@
 use eliot_process::{CancellationReceipt, ProcessEvidence, ProcessRequest, ProcessStartReceipt};
 use thiserror::Error;
 
+use crate::capsule::{ModuleContractKit, invoke_typed};
+use crate::component_contract::TypedContractError;
 use crate::{
     AuthorityResolution, DerivedExecutionEvidence, EngineBinding, EngineInvocation, EngineReport,
     GovernorResolution, InvocationRequest, ProcessBinding, ProcessLaunchEnvelope, PromotionQuery,
     PromotionVerification, SourceVerification,
 };
-use crate::capsule::{ModuleContractKit, invoke_typed};
-use crate::component_contract::TypedContractError;
 
 /// Typed failure shared by injected authority and execution ports.
 #[derive(Clone, Copy, Debug, Eq, Error, PartialEq)]

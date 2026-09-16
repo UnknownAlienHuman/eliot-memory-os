@@ -287,7 +287,9 @@ impl GenerationRecord {
             ));
         }
         if params.artifact_len == 0 {
-            return Err(ReplacementError::InvalidGeneration("artifact-empty".to_owned()));
+            return Err(ReplacementError::InvalidGeneration(
+                "artifact-empty".to_owned(),
+            ));
         }
         if params.artifact_len > MAX_ARTIFACT_BYTES {
             return Err(ReplacementError::InvalidGeneration(
@@ -295,7 +297,10 @@ impl GenerationRecord {
             ));
         }
         let number = params.generation.generation.value();
-        if params.predecessor.is_some_and(|predecessor| predecessor >= number) {
+        if params
+            .predecessor
+            .is_some_and(|predecessor| predecessor >= number)
+        {
             return Err(ReplacementError::InvalidGeneration(
                 "predecessor-not-older".to_owned(),
             ));
@@ -375,8 +380,7 @@ impl CandidateDescriptor {
                 "candidate.probe_deadline_ms".to_owned(),
             ));
         }
-        if self.max_probe_output_bytes == 0
-            || self.max_probe_output_bytes > MAX_PROBE_OUTPUT_BYTES
+        if self.max_probe_output_bytes == 0 || self.max_probe_output_bytes > MAX_PROBE_OUTPUT_BYTES
         {
             return Err(ReplacementError::InvalidField(
                 "candidate.max_probe_output_bytes".to_owned(),
@@ -848,12 +852,9 @@ impl CoordinatorState {
         self.candidate
             .as_ref()
             .is_some_and(|candidate| candidate.record.generation_number() == generation)
-            || self
-                .pending_rollback
-                .as_ref()
-                .is_some_and(|pending| {
-                    pending.current == generation || pending.target == generation
-                })
+            || self.pending_rollback.as_ref().is_some_and(|pending| {
+                pending.current == generation || pending.target == generation
+            })
     }
 
     fn evictible_retained(&self) -> Option<u64> {
@@ -863,11 +864,7 @@ impl CoordinatorState {
                 .values()
                 .any(|lease| lease.accepted_generation == *number)
                 || self.referenced_elsewhere(*number);
-            if referenced {
-                None
-            } else {
-                Some(*number)
-            }
+            if referenced { None } else { Some(*number) }
         })
     }
 
@@ -925,9 +922,12 @@ impl GenerationCoordinator {
     /// Returns the currently admitted (new-call) generation number, if any.
     #[must_use]
     pub fn active_generation_number(&self) -> Option<u64> {
-        self.lock_state()
-            .ok()
-            .and_then(|state| state.active.as_ref().map(GenerationRecord::generation_number))
+        self.lock_state().ok().and_then(|state| {
+            state
+                .active
+                .as_ref()
+                .map(GenerationRecord::generation_number)
+        })
     }
 
     /// Validates the exclusive operation, the exact expected generation, and
@@ -986,8 +986,7 @@ impl GenerationCoordinator {
         if state.draining.is_some() {
             return Err(ReplacementError::DrainAlreadyActive);
         }
-        let armed =
-            state.candidate_held_by(operation_id) || state.rollback_held_by(operation_id);
+        let armed = state.candidate_held_by(operation_id) || state.rollback_held_by(operation_id);
         if !armed {
             return Err(ReplacementError::DrainNotArmed);
         }
@@ -1334,7 +1333,11 @@ impl GenerationCoordinator {
         if fence_digest != pending.current_fence_digest {
             return Err(ReplacementError::StaleExpectedGeneration);
         }
-        if state.draining.as_ref().is_none_or(|drain| drain.operation_id != operation_id) {
+        if state
+            .draining
+            .as_ref()
+            .is_none_or(|drain| drain.operation_id != operation_id)
+        {
             return Err(ReplacementError::DrainNotArmed);
         }
         if !state.unresolved_on(expected_current).is_empty() {
@@ -1519,14 +1522,21 @@ impl GenerationCoordinator {
     /// Returns [`ReplacementError::InvariantViolation`] on any breach.
     pub fn verify_call_invariants(&self) -> Result<(), ReplacementError> {
         let state = self.lock_state()?;
-        let active_number = state.active.as_ref().map(GenerationRecord::generation_number);
+        let active_number = state
+            .active
+            .as_ref()
+            .map(GenerationRecord::generation_number);
         for lease in state.inflight.values() {
             if active_number.is_none_or(|active| lease.accepted_generation != active) {
                 return Err(ReplacementError::InvariantViolation(
                     "call-acceptance-mismatch".to_owned(),
                 ));
             }
-            if state.history.iter().any(|entry| entry.call_id == lease.call_id) {
+            if state
+                .history
+                .iter()
+                .any(|entry| entry.call_id == lease.call_id)
+            {
                 return Err(ReplacementError::InvariantViolation(
                     "call-tracked-and-recorded".to_owned(),
                 ));
@@ -1729,7 +1739,10 @@ impl GenerationCoordinator {
                     retired_active = false;
                 }
                 LifecycleEventKind::Retired => {
-                    if active.as_ref().is_some_and(|(current, _)| *current == entry.generation) {
+                    if active
+                        .as_ref()
+                        .is_some_and(|(current, _)| *current == entry.generation)
+                    {
                         active = None;
                         retired_active = true;
                     }
@@ -1931,8 +1944,8 @@ impl CoordinatorState {
         let sequence = self.next_sequence()?;
         let prev = self.chain_prev();
         let empty: Vec<String> = Vec::new();
-        let inflight_digest = canonical_digest(&empty)
-            .map_err(|_| external_contract("receipt-seal-failed"))?;
+        let inflight_digest =
+            canonical_digest(&empty).map_err(|_| external_contract("receipt-seal-failed"))?;
         let receipt = seal_switch_receipt(
             sequence,
             &request.operation_id,
@@ -1953,8 +1966,7 @@ impl CoordinatorState {
 }
 
 fn check_text(value: &str, field: &'static str) -> Result<(), ReplacementError> {
-    crate::validate_text(value, field)
-        .map_err(|_| ReplacementError::InvalidField(field.to_owned()))
+    crate::validate_text(value, field).map_err(|_| ReplacementError::InvalidField(field.to_owned()))
 }
 
 fn invalid_generation(code: &'static str) -> ReplacementError {
@@ -1993,7 +2005,9 @@ fn check_compatible_fields(
     }
     if old.abi_digest != new.abi_digest {
         if old.component_version == new.component_version {
-            return Err(ReplacementError::IncompatibleCandidate("abi-drift".to_owned()));
+            return Err(ReplacementError::IncompatibleCandidate(
+                "abi-drift".to_owned(),
+            ));
         }
         return Err(ReplacementError::IncompatibleCandidate(
             "abi-mismatch".to_owned(),
@@ -2021,15 +2035,10 @@ fn check_compatible_fields(
     }
     match (&old.state_migration, &new.state_migration) {
         (StateMigration::Stateless, _)
-        | (
-            StateMigration::Reversible { .. },
-            StateMigration::Reversible { .. },
-        ) => Ok(()),
-        (StateMigration::Reversible { .. }, StateMigration::Stateless) => {
-            Err(ReplacementError::IncompatibleCandidate(
-                "state-migration".to_owned(),
-            ))
-        }
+        | (StateMigration::Reversible { .. }, StateMigration::Reversible { .. }) => Ok(()),
+        (StateMigration::Reversible { .. }, StateMigration::Stateless) => Err(
+            ReplacementError::IncompatibleCandidate("state-migration".to_owned()),
+        ),
     }
 }
 
@@ -2112,8 +2121,8 @@ fn seal_switch_receipt(
         inflight_digest,
         prev_receipt_digest: prev,
     };
-    let receipt_digest = canonical_digest(&seal)
-        .map_err(|_| external_contract("receipt-seal-failed"))?;
+    let receipt_digest =
+        canonical_digest(&seal).map_err(|_| external_contract("receipt-seal-failed"))?;
     Ok(SwitchReceipt {
         sequence,
         operation_id: operation_id.to_owned(),
@@ -2147,8 +2156,8 @@ fn seal_rollback_receipt(
         new_calls_retained,
         prev_receipt_digest: prev,
     };
-    let receipt_digest = canonical_digest(&seal)
-        .map_err(|_| external_contract("receipt-seal-failed"))?;
+    let receipt_digest =
+        canonical_digest(&seal).map_err(|_| external_contract("receipt-seal-failed"))?;
     Ok(RollbackReceipt {
         sequence,
         operation_id: operation_id.to_owned(),
@@ -2173,8 +2182,8 @@ fn seal_reconcile_receipt(
         evidence: &observed.evidence,
         prev_receipt_digest: prev,
     };
-    let receipt_digest = canonical_digest(&seal)
-        .map_err(|_| external_contract("receipt-seal-failed"))?;
+    let receipt_digest =
+        canonical_digest(&seal).map_err(|_| external_contract("receipt-seal-failed"))?;
     Ok(ReconcileReceipt {
         sequence,
         operation_id: observed.operation_id.clone(),
