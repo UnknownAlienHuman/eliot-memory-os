@@ -1120,6 +1120,11 @@ struct Operation {
     stderr: Arc<Mutex<CaptureSession>>,
     stdout_thread: Option<JoinHandle<()>>,
     stderr_thread: Option<JoinHandle<()>>,
+    /// Policy-bound sink pumps owned by the drain threads (`None` when no
+    /// sink client is attached or the session open failed and the legacy
+    /// `SourceUnavailable` path applies).
+    stdout_pump: Option<Arc<Mutex<StreamSinkPump>>>,
+    stderr_pump: Option<Arc<Mutex<StreamSinkPump>>>,
     deadline: Instant,
     deadline_watcher: Option<DeadlineWatcher>,
     /// Operation-bound watcher owner identity minted when the deadline
@@ -1385,6 +1390,7 @@ pub struct ExecutorHealthSummary {
 pub struct WindowsProcessExecutor {
     authority: Arc<dyn DispatchValidationPort>,
     launch_admission: Option<Arc<dyn ProcessLaunchAdmission>>,
+    stream_sink: Option<Arc<dyn ProcessStreamSinkClient>>,
     operations: Mutex<BTreeMap<OperationId, Arc<Mutex<Operation>>>>,
     reservations: Mutex<std::collections::BTreeSet<OperationId>>,
     capture_limit: usize,
@@ -1410,6 +1416,30 @@ impl WindowsProcessExecutor {
         Self {
             authority,
             launch_admission: None,
+            stream_sink: None,
+            operations: Mutex::new(BTreeMap::new()),
+            reservations: Mutex::new(std::collections::BTreeSet::new()),
+            capture_limit: DEFAULT_CAPTURE_LIMIT,
+        }
+    }
+
+    /// Creates one executor that streams policy-bound process output into
+    /// immutable evidence through the #267 sink port.
+    ///
+    /// The drain path opens one sink session per requested stream before the
+    /// first admitted byte, appends per chunk with typed backpressure that
+    /// never blocks the pipe drain, and settles exactly one terminal per
+    /// stream at finalize. With no sink attached ([`Self::new`]), persistence
+    /// stays `SourceUnavailable` as before.
+    #[must_use]
+    pub fn new_with_stream_sink(
+        authority: Arc<dyn DispatchValidationPort>,
+        stream_sink: Arc<dyn ProcessStreamSinkClient>,
+    ) -> Self {
+        Self {
+            authority,
+            launch_admission: None,
+            stream_sink: Some(stream_sink),
             operations: Mutex::new(BTreeMap::new()),
             reservations: Mutex::new(std::collections::BTreeSet::new()),
             capture_limit: DEFAULT_CAPTURE_LIMIT,
@@ -1425,6 +1455,7 @@ impl WindowsProcessExecutor {
         Self {
             authority,
             launch_admission: Some(launch_admission),
+            stream_sink: None,
             operations: Mutex::new(BTreeMap::new()),
             reservations: Mutex::new(std::collections::BTreeSet::new()),
             capture_limit: DEFAULT_CAPTURE_LIMIT,
@@ -1440,6 +1471,7 @@ impl WindowsProcessExecutor {
         Self {
             authority,
             launch_admission: None,
+            stream_sink: None,
             operations: Mutex::new(BTreeMap::new()),
             reservations: Mutex::new(std::collections::BTreeSet::new()),
             capture_limit: capture_limit.max(1),
@@ -1760,6 +1792,19 @@ impl WindowsProcessExecutor {
                     cleanup_unknown = true;
                     continue;
                 }
+                // Cleanup/reopen reconciles the sink session identity without
+                // minting a second receipt: a best-effort readback surfaces an
+                // out-of-band terminal under the same session, and never
+                // finalizes. Errors stay ignored; cleanup never fails on the
+                // sink.
+                let pumps = [
+                    guard.stdout_pump.clone(),
+                    guard.stderr_pump.clone(),
+                ];
+                drop(guard);
+                for pump in pumps.into_iter().flatten() {
+                    settle_sink_pump(&pump);
+                }
                 ids.push(id.clone());
             }
             // Remove every independently cleanable terminal operation even
@@ -1821,6 +1866,20 @@ impl WindowsProcessExecutor {
                     quarantine_operation(&mut guard);
                     retain_cleanup_owners = true;
                 }
+                // Same cleanup/reopen reconcile as `cleanup_finished`: a
+                // best-effort readback under the same session identity, never
+                // a second terminal mint.
+                let pumps = [
+                    guard.stdout_pump.clone(),
+                    guard.stderr_pump.clone(),
+                ];
+                drop(guard);
+                for pump in pumps.into_iter().flatten() {
+                    settle_sink_pump(&pump);
+                }
+                let mut guard = operation
+                    .lock()
+                    .map_err(|_| operation_unavailable(id, "operation lock"))?;
                 // Shutdown containment attributes every watcher join to its
                 // operation-bound owner (issue #83: restart/shutdown can
                 // identify and contain every watcher/Job owner): the owner
@@ -2043,11 +2102,31 @@ impl ProcessExecutor for WindowsProcessExecutor {
             };
             #[cfg(not(test))]
             let stdout_injection: Option<CaptureSpawnInjection> = None;
+            // Issue-267 sink sessions open here, after resume and before the
+            // first admitted byte: the binding, kind, policy, limits, and
+            // deterministic identity travel in the open request, and the drain
+            // threads below append per chunk. An open failure keeps `None` so
+            // the legacy `SourceUnavailable` path applies (provider failure
+            // never claims a complete source).
+            let stream_binding = state.view().binding().clone();
+            let stdout_pump = open_stream_pump(
+                &self.stream_sink,
+                &stream_binding,
+                ProcessStreamKind::Stdout,
+                stdout_requested,
+            );
+            let stderr_pump = open_stream_pump(
+                &self.stream_sink,
+                &stream_binding,
+                ProcessStreamKind::Stderr,
+                stderr_requested,
+            );
             let stdout_thread = match spawn_capture(
                 "stdout",
                 running.take_stdout(),
                 Arc::clone(&stdout),
                 stdout_injection,
+                stdout_pump.clone(),
             ) {
                 Ok(thread) => thread,
                 Err(error) => {
@@ -2079,6 +2158,7 @@ impl ProcessExecutor for WindowsProcessExecutor {
                     running.take_stderr(),
                     Arc::clone(&stderr),
                     stderr_injection,
+                    stderr_pump.clone(),
                 ) {
                     Ok(thread) => thread,
                     Err(error) => {
@@ -2106,6 +2186,8 @@ impl ProcessExecutor for WindowsProcessExecutor {
                 stderr,
                 stdout_thread,
                 stderr_thread,
+                stdout_pump,
+                stderr_pump,
                 deadline,
                 deadline_watcher: None,
                 deadline_watcher_owner: None,
@@ -2530,22 +2612,30 @@ impl ProcessExecutor for WindowsProcessExecutor {
             }
             let view = guard.state.view();
             let binding = view.binding().clone();
-            let stdout_typed =
-                match typed_stream_evidence(&guard.stdout, ProcessStreamKind::Stdout, &binding) {
-                    Ok(stream) => stream,
-                    Err(error) => {
-                        quarantine_operation(&mut guard);
-                        return Err(error);
-                    }
-                };
-            let stderr_typed =
-                match typed_stream_evidence(&guard.stderr, ProcessStreamKind::Stderr, &binding) {
-                    Ok(stream) => stream,
-                    Err(error) => {
-                        quarantine_operation(&mut guard);
-                        return Err(error);
-                    }
-                };
+            let stdout_typed = match typed_stream_evidence(
+                &guard.stdout,
+                guard.stdout_pump.as_ref(),
+                ProcessStreamKind::Stdout,
+                &binding,
+            ) {
+                Ok(stream) => stream,
+                Err(error) => {
+                    quarantine_operation(&mut guard);
+                    return Err(error);
+                }
+            };
+            let stderr_typed = match typed_stream_evidence(
+                &guard.stderr,
+                guard.stderr_pump.as_ref(),
+                ProcessStreamKind::Stderr,
+                &binding,
+            ) {
+                Ok(stream) => stream,
+                Err(error) => {
+                    quarantine_operation(&mut guard);
+                    return Err(error);
+                }
+            };
             let Ok(evidence) = ProcessEvidence::new_typed(
                 view,
                 stdout_typed,
@@ -3343,12 +3433,53 @@ fn session_requested(session: &Arc<Mutex<CaptureSession>>) -> bool {
     session.lock().is_ok_and(|guard| guard.requested())
 }
 
+/// Opens one policy-bound sink session for a requested stream.
+///
+/// Returns `None` when no sink client is attached, the stream was not
+/// requested, or the open itself failed: every `None` keeps the legacy
+/// `SourceUnavailable` evidence path, so a provider failure never claims a
+/// complete source. A successful open happens-before the drain thread's first
+/// admitted byte at the call site.
+#[cfg(windows)]
+fn open_stream_pump(
+    client: &Option<Arc<dyn ProcessStreamSinkClient>>,
+    binding: &ProcessExecutionBinding,
+    kind: ProcessStreamKind,
+    requested: bool,
+) -> Option<Arc<Mutex<StreamSinkPump>>> {
+    if !requested {
+        return None;
+    }
+    let client = client.as_ref().map(Arc::clone)?;
+    let policy = p04_stream_policy().ok()?;
+    let limits = sink_backpressure_limits().ok()?;
+    let mut pump = StreamSinkPump::new(client, binding.clone(), kind, policy, limits);
+    pump.open().ok()?;
+    Some(Arc::new(Mutex::new(pump)))
+}
+
+/// Best-effort sink settle for a cleanup/reopen pass.
+///
+/// Reads back the provider-held session identity without finalizing, so an
+/// out-of-band terminal surfaces under the same session instead of minting a
+/// second receipt. Errors are ignored: cleanup never fails because the sink
+/// is unreachable, and exactly-one-terminal stays owned by finalize/abort.
+#[cfg(windows)]
+fn settle_sink_pump(pump: &Arc<Mutex<StreamSinkPump>>) {
+    if let Ok(mut pump) = pump.lock() {
+        if pump.terminal().is_none() {
+            let _ = pump.reopen();
+        }
+    }
+}
+
 #[cfg(windows)]
 fn spawn_capture(
     stream: &'static str,
     file: Option<std::fs::File>,
     session: Arc<Mutex<CaptureSession>>,
     injection: Option<CaptureSpawnInjection>,
+    sink_pump: Option<Arc<Mutex<StreamSinkPump>>>,
 ) -> Result<Option<JoinHandle<()>>, ProcessExecutionError> {
     // Issue-84 state machine note (§1): stream-capture ownership is installed
     // AFTER resume because the read handles live on `RunningJobChild` and can
@@ -3410,6 +3541,19 @@ fn spawn_capture(
                         // retained. A lock loss here ends the drain without
                         // landing a disposition; the join path fences unknown.
                         guard.observe(&buffer[..read]);
+                        drop(guard);
+                        // Policy-bound streaming: offer the same chunk to the
+                        // sink exactly once with the session wait budget. The
+                        // pump sheds (never retries, never sleeps) on
+                        // backpressure, timeout, or provider failure, and a
+                        // lost pump lock is skipped the same way — the pipe
+                        // keeps draining in every case, so persistence can
+                        // never block capture.
+                        if let Some(pump) = &sink_pump
+                            && let Ok(mut pump) = pump.lock()
+                        {
+                            let _ = pump.append(&buffer[..read]);
+                        }
                     }
                     Err(_) => {
                         read_failed = true;
@@ -3489,16 +3633,21 @@ fn session_transport(disposition: CaptureDisposition) -> StreamTransportStatus {
 #[cfg(windows)]
 fn typed_stream_evidence(
     session: &Arc<Mutex<CaptureSession>>,
+    sink_pump: Option<&Arc<Mutex<StreamSinkPump>>>,
     kind: ProcessStreamKind,
     binding: &ProcessExecutionBinding,
 ) -> Result<Option<ProcessStreamEvidence>, ProcessExecutionError> {
-    // One owned session resolves to exactly one typed evidence: the full
-    // transport digest/count accumulated from the bytes actually observed,
-    // the admissible-source identity (SHA-256/count over that same observed
-    // stream), a bounded preview with its exact omission range, and the
-    // typed durable-source disposition. Only an EOF session resolves to
-    // complete transport; every other disposition keeps its honest typed
-    // state instead of fabricating complete proof.
+    // One owned session resolves to exactly one typed evidence. With a sink
+    // pump attached, EOF finalizes and cancel-before-EOF aborts through the
+    // #267 port to exactly one terminal, and the terminal's evidence is the
+    // durable record: its source is `Some` exactly on complete/partial
+    // terminals and `None` with an exact gap otherwise (a zero-byte EOF still
+    // publishes a real verifiable object). A provider failure on the sink
+    // path falls through to the honest-gap construction below — never a
+    // complete source. Without a pump, an EOF session resolves exactly as
+    // before (bounded preview, `SourceUnavailable`, no source locator, no
+    // `raw:*` handle); every other disposition keeps its honest typed state
+    // instead of fabricating complete proof.
     let (retained, total_bytes, observed_sha256, disposition, backpressured) = {
         let guard = session
             .lock()
@@ -3534,9 +3683,8 @@ fn typed_stream_evidence(
         }
         let disposition = guard.disposition();
         match disposition {
-            CaptureDisposition::Eof => {}
+            CaptureDisposition::Eof | CaptureDisposition::CancelledBeforeEof => {}
             CaptureDisposition::ReadFailed
-            | CaptureDisposition::CancelledBeforeEof
             | CaptureDisposition::CaptureUnavailable
             | CaptureDisposition::UnknownOutcome
             | CaptureDisposition::Draining => {
@@ -3552,6 +3700,26 @@ fn typed_stream_evidence(
             guard.backpressure_observed(),
         )
     };
+    if let Some(pump) = sink_pump {
+        match sink_terminal_evidence(pump, disposition) {
+            Ok(evidence) => return Ok(Some(evidence)),
+            Err(_) => {
+                if disposition == CaptureDisposition::CancelledBeforeEof {
+                    return legacy_cancelled_evidence(
+                        binding,
+                        kind,
+                        retained,
+                        total_bytes,
+                        observed_sha256,
+                        backpressured,
+                    )
+                    .map(Some);
+                }
+            }
+        }
+    } else if disposition == CaptureDisposition::CancelledBeforeEof {
+        return Err(ProcessExecutionError::UnknownOutcome);
+    }
     let mut prefix = retained;
     if prefix.len() > EVIDENCE_PREVIEW_CEILING {
         prefix.truncate(EVIDENCE_PREVIEW_CEILING);
@@ -3560,10 +3728,12 @@ fn typed_stream_evidence(
     let transport = session_transport(disposition);
     let preview = ProcessStreamPrefixPreview::from_transport_prefix(prefix, total_bytes)
         .map_err(|_| ProcessExecutionError::UnknownOutcome)?;
-    // No durable provider is wired in P-04; the store backend is T3-owned, so
-    // persistence stays `SourceUnavailable` with no source locator (no `raw:*`
-    // handle is ever minted). When the session latched sink-pressure overflow
-    // while draining, the exact `PersistenceBackpressure` gap travels alongside
+    // Legacy path (no sink pump attached, or the pump's provider failed on an
+    // EOF drain): no durable provider is wired in P-04 and the store backend
+    // is T3-owned, so persistence stays `SourceUnavailable` with no source
+    // locator (no `raw:*` handle is ever minted). When the session latched
+    // sink-pressure overflow while draining, the exact
+    // `PersistenceBackpressure` gap travels alongside
     // `PersistenceUnavailable`: pressure was shed and the pipe kept draining
     // with exact digest/count, instead of blocking capture on persistence I/O.
     // The complete evidence still resolves to bytes whose digest/count match
@@ -3589,6 +3759,79 @@ fn typed_stream_evidence(
     )
     .map_err(|_| ProcessExecutionError::UnknownOutcome)?;
     Ok(Some(evidence))
+}
+
+/// Settles one owned session through its sink pump to the terminal evidence.
+///
+/// EOF finalizes and cancel-before-EOF aborts; every other disposition fails
+/// closed. The pump enforces the terminal/evidence contract (source exactly
+/// on complete/partial terminals, never otherwise) before returning.
+#[cfg(windows)]
+fn sink_terminal_evidence(
+    pump: &Arc<Mutex<StreamSinkPump>>,
+    disposition: CaptureDisposition,
+) -> Result<ProcessStreamEvidence, ProcessExecutionError> {
+    let mut pump = pump
+        .lock()
+        .map_err(|_| ProcessExecutionError::UnknownOutcome)?;
+    let terminal = match disposition {
+        CaptureDisposition::Eof => pump.finalize_eof()?,
+        CaptureDisposition::CancelledBeforeEof => pump.abort_cancelled()?,
+        CaptureDisposition::ReadFailed
+        | CaptureDisposition::CaptureUnavailable
+        | CaptureDisposition::UnknownOutcome
+        | CaptureDisposition::Draining => {
+            return Err(ProcessExecutionError::UnknownOutcome);
+        }
+    };
+    Ok(terminal.evidence().clone())
+}
+
+/// Builds the provider-failure fallback for a cancelled drain.
+///
+/// The sink pump was attached but could not settle a terminal, so the locally
+/// observed admitted prefix stays claimed with the exact cancellation gap and
+/// `SourceUnavailable` persistence: never a complete source, never a source
+/// locator. Gaps stay canonically sorted (`PersistenceUnavailable`,
+/// `PersistenceBackpressure`, `CancelledBeforeEof`).
+#[cfg(windows)]
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the fallback carries the exact observed custody plus the typed gap set"
+)]
+fn legacy_cancelled_evidence(
+    binding: &ProcessExecutionBinding,
+    kind: ProcessStreamKind,
+    retained: Vec<u8>,
+    total_bytes: u64,
+    observed_sha256: String,
+    backpressured: bool,
+) -> Result<ProcessStreamEvidence, ProcessExecutionError> {
+    let mut prefix = retained;
+    if prefix.len() > EVIDENCE_PREVIEW_CEILING {
+        prefix.truncate(EVIDENCE_PREVIEW_CEILING);
+    }
+    let policy = p04_stream_policy()?;
+    let preview = ProcessStreamPrefixPreview::from_transport_prefix(prefix, total_bytes)
+        .map_err(|_| ProcessExecutionError::UnknownOutcome)?;
+    let mut gaps = vec![StreamEvidenceGap::PersistenceUnavailable];
+    if backpressured {
+        gaps.push(StreamEvidenceGap::PersistenceBackpressure);
+    }
+    gaps.push(StreamEvidenceGap::CancelledBeforeEof);
+    ProcessStreamEvidence::new_raw(
+        binding.clone(),
+        kind,
+        policy,
+        StreamTransportStatus::CancelledBeforeEof,
+        StreamPersistenceStatus::SourceUnavailable,
+        observed_sha256,
+        total_bytes,
+        preview,
+        None,
+        gaps,
+    )
+    .map_err(|_| ProcessExecutionError::UnknownOutcome)
 }
 
 fn retention(limit: u64, ceiling: usize) -> usize {
