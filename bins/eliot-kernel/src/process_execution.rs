@@ -1628,8 +1628,10 @@ impl KernelComposition {
                 .map(ProcessExecutionResponse::Reconciled),
         };
         result.unwrap_or_else(|error| {
+            // F-LOG-KERNEL-3 (#901): subordinate observation only; the
+            // gateway boundary above owns the single terminal for the failed
+            // operation (case 25 across propagation).
             observe_process("kernel.process.request_failed", "rejected");
-            super::kernel_diagnostics::observe_terminal_error(process_terminal_code(&error));
             ProcessExecutionResponse::Rejected(
                 eliot_kernel_service::ProcessExecutionRejection::from_error(&error),
             )
