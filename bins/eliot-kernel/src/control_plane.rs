@@ -20,9 +20,114 @@
 
 use super::*;
 
+/// F-LOG-KERNEL-4 (#903): control-plane boundary observations.
+///
+/// Observation only, via #895's facade: fixed `kernel.control.*` event names
+/// plus a bounded stable outcome. Never carries request payloads, digests,
+/// peer identities, pipe names, or owner error strings (I15.4, I07.20).
+fn observe_control(event: &'static str, outcome: &'static str) {
+    use super::kernel_diagnostics::{KERNEL_DIAGNOSTICS_TARGET, bound_field};
+    let event_bound = bound_field(event);
+    let outcome_bound = bound_field(outcome);
+    tracing::info!(
+        target: KERNEL_DIAGNOSTICS_TARGET,
+        event = event_bound.text(),
+        outcome = outcome_bound.text(),
+        "control plane observation"
+    );
+}
+
+/// Maps one control-transition failure to its stable diagnostic code.
+///
+/// Only the variant is emitted; any `String` payload or embedded state is
+/// never logged.
+fn control_transition_terminal_code(error: &KernelServiceError) -> &'static str {
+    match error {
+        KernelServiceError::InvalidField { .. } => "CONTROL_INVALID_FIELD",
+        KernelServiceError::IllegalTransition { .. } => "CONTROL_ILLEGAL_TRANSITION",
+        KernelServiceError::HandshakeMismatch { .. } => "CONTROL_HANDSHAKE_MISMATCH",
+        KernelServiceError::MissingContainmentEvidence => "CONTROL_MISSING_CONTAINMENT",
+        KernelServiceError::ReadinessNotProven => "CONTROL_READINESS_NOT_PROVEN",
+        KernelServiceError::AdmissionClosed(_) => "CONTROL_ADMISSION_CLOSED",
+        KernelServiceError::GenerationFenced => "CONTROL_GENERATION_FENCED",
+        KernelServiceError::RestartBudgetExhausted => "CONTROL_RESTART_BUDGET_EXHAUSTED",
+        KernelServiceError::ControlReserveExhausted => "CONTROL_RESERVE_EXHAUSTED",
+        KernelServiceError::Platform(_) => "CONTROL_PLATFORM",
+        KernelServiceError::Core(_) => "CONTROL_CORE",
+    }
+}
+
+/// Maps one authenticated control-request failure to its stable diagnostic
+/// code.
+///
+/// Only the variant is emitted; any `String` payload is never logged. The
+/// `control_` prefix keeps request-operation terminals distinct from other
+/// `TransportError` owners (`frame_*`, `daemon_*`).
+fn control_request_terminal_code(error: &TransportError) -> &'static str {
+    match error {
+        TransportError::InvalidLimits => "control_invalid_limits",
+        TransportError::UnauthenticatedPeer => "control_unauthenticated_peer",
+        TransportError::PeerIdentityUnavailable => "control_peer_unavailable",
+        TransportError::Protocol(_) => "control_protocol",
+        TransportError::SessionFenced => "control_fenced",
+        TransportError::Backpressure => "control_backpressure",
+        TransportError::Timeout => "control_timeout",
+        TransportError::Cancelled => "control_cancelled",
+        TransportError::InvalidPipeName => "control_invalid_pipe",
+        TransportError::UnknownOutcome => "control_unknown_outcome",
+        TransportError::Io(_) => "control_io",
+        TransportError::PlanGap { .. } => "control_plan_gap",
+        TransportError::UnknownRequest => "control_unknown_request",
+        TransportError::IdentityConflict => "control_identity_conflict",
+        TransportError::RegistryFull => "control_registry_full",
+    }
+}
+
+/// Observes one protected-control capacity read with its bounded count.
+///
+/// The count is a small nonsecret integer; it is still routed through the
+/// bounded field helper so the observation keeps the `MAX_FIELD` shape.
+fn observe_control_capacity(capacity: usize) {
+    use super::kernel_diagnostics::{KERNEL_DIAGNOSTICS_TARGET, bound_field};
+    let event_bound = bound_field("kernel.control.capacity_observed");
+    let capacity_bound = bound_field(&capacity.to_string());
+    tracing::info!(
+        target: KERNEL_DIAGNOSTICS_TARGET,
+        event = event_bound.text(),
+        capacity = capacity_bound.text(),
+        "control capacity observation"
+    );
+}
+
 impl KernelComposition {
     /// Applies one lifecycle command through the sole Kernel transition gateway.
+    ///
+    /// Diagnostic wrapper (F-LOG-KERNEL-4, #903): exactly one terminal is
+    /// emitted per failed transition; the admitted state versus the failure
+    /// record stay distinct, and no command or error material is logged.
     pub fn apply_control(
+        &self,
+        command: KernelControlCommand,
+    ) -> Result<KernelServiceState, KernelServiceError> {
+        observe_control("kernel.control.transition_requested", "attempt");
+        match self.apply_control_inner(command) {
+            Ok(state) => {
+                observe_control("kernel.control.transition_committed", "success");
+                Ok(state)
+            }
+            Err(error) => {
+                observe_control("kernel.control.transition_failed", "rejected");
+                super::kernel_diagnostics::observe_terminal_error(
+                    control_transition_terminal_code(&error),
+                );
+                Err(error)
+            }
+        }
+    }
+
+    /// Transition sequence; every fence check precedes the single service
+    /// application. See [`KernelComposition::apply_control`].
+    fn apply_control_inner(
         &self,
         command: KernelControlCommand,
     ) -> Result<KernelServiceState, KernelServiceError> {
@@ -46,11 +151,45 @@ impl KernelComposition {
 
     /// Applies one authenticated Host control request after binding the
     /// transport's handle-proven peer and the approved generation contour.
+    ///
+    /// Diagnostic wrapper (F-LOG-KERNEL-4, #903): exactly one terminal is
+    /// emitted per failed request with the request operation's own stable
+    /// code; failures already terminaled by the transition gateway below
+    /// arrive here transformed into the request error, never re-terminaled
+    /// under their original value.
+    pub async fn apply_control_request(
+        &self,
+        request: KernelControlRequest,
+        peer: &PeerIdentity,
+        expected_sequence: u64,
+    ) -> Result<KernelControlResponse, TransportError> {
+        observe_control("kernel.control.request_received", "attempt");
+        match self
+            .apply_control_request_inner(request, peer, expected_sequence)
+            .await
+        {
+            Ok(response) => {
+                observe_control("kernel.control.request_admitted", "success");
+                Ok(response)
+            }
+            Err(error) => {
+                observe_control("kernel.control.request_denied", "rejected");
+                super::kernel_diagnostics::observe_terminal_error(
+                    control_request_terminal_code(&error),
+                );
+                Err(error)
+            }
+        }
+    }
+
+    /// Authenticated validation and command-order sequence; every admission
+    /// check precedes the single transition gateway call. See
+    /// [`KernelComposition::apply_control_request`].
     #[allow(
         clippy::too_many_lines,
         reason = "the authenticated control handler preserves one visible validation and command-order boundary"
     )]
-    pub async fn apply_control_request(
+    async fn apply_control_request_inner(
         &self,
         request: KernelControlRequest,
         peer: &PeerIdentity,
@@ -426,15 +565,111 @@ impl KernelComposition {
     }
 
     /// Returns the runtime's protected-control capacity.
+    ///
+    /// Diagnostic read (F-LOG-KERNEL-4, #903): the observed count is emitted
+    /// as a bounded nonsecret field; the reserve itself is never acquired,
+    /// released, or resized here.
     #[must_use]
     pub fn control_capacity(&self) -> usize {
-        self.runtime
-            .available_capacity(eliot_runtime::ExecutionClass::ProtectedControl)
+        let capacity = self
+            .runtime
+            .available_capacity(eliot_runtime::ExecutionClass::ProtectedControl);
+        observe_control_capacity(capacity);
+        capacity
     }
 
     /// Requests shutdown without starting a second lifecycle owner.
     #[must_use]
     pub fn request_shutdown(&self) -> bool {
         self.runtime.shutdown_handle().request()
+    }
+}
+
+#[cfg(test)]
+mod control_plane_diagnostics_tests {
+    //! F-LOG-KERNEL-4 (#903) focused diagnostics proof: stable terminal
+    //! codes for the transition gateway and the authenticated request
+    //! boundary. Both mappers emit variant vocabulary only; payloads,
+    //! digests, and peer material never reach the sink.
+
+    use super::*;
+
+    #[test]
+    fn control_diagnostics_terminal_codes_are_stable() {
+        // Transition gateway codes: one fixed code per service failure
+        // variant, even when the payload carries a secret-like canary.
+        assert_eq!(
+            control_transition_terminal_code(&KernelServiceError::GenerationFenced),
+            "CONTROL_GENERATION_FENCED"
+        );
+        assert_eq!(
+            control_transition_terminal_code(&KernelServiceError::ReadinessNotProven),
+            "CONTROL_READINESS_NOT_PROVEN"
+        );
+        assert_eq!(
+            control_transition_terminal_code(&KernelServiceError::MissingContainmentEvidence),
+            "CONTROL_MISSING_CONTAINMENT"
+        );
+        assert_eq!(
+            control_transition_terminal_code(&KernelServiceError::RestartBudgetExhausted),
+            "CONTROL_RESTART_BUDGET_EXHAUSTED"
+        );
+        assert_eq!(
+            control_transition_terminal_code(&KernelServiceError::ControlReserveExhausted),
+            "CONTROL_RESERVE_EXHAUSTED"
+        );
+        assert_eq!(
+            control_transition_terminal_code(&KernelServiceError::Platform(
+                "token=control-canary".to_owned()
+            )),
+            "CONTROL_PLATFORM"
+        );
+
+        // Request boundary codes: every transport failure keeps its own
+        // request-operation code; the fenced admission path keeps the exact
+        // typed denial without request material.
+        assert_eq!(
+            control_request_terminal_code(&TransportError::SessionFenced),
+            "control_fenced"
+        );
+        assert_eq!(
+            control_request_terminal_code(&TransportError::PeerIdentityUnavailable),
+            "control_peer_unavailable"
+        );
+        assert_eq!(
+            control_request_terminal_code(&TransportError::UnauthenticatedPeer),
+            "control_unauthenticated_peer"
+        );
+        assert_eq!(
+            control_request_terminal_code(&TransportError::Timeout),
+            "control_timeout"
+        );
+        assert_eq!(
+            control_request_terminal_code(&TransportError::Cancelled),
+            "control_cancelled"
+        );
+        assert_eq!(
+            control_request_terminal_code(&TransportError::UnknownOutcome),
+            "control_unknown_outcome"
+        );
+        assert_eq!(
+            control_request_terminal_code(&TransportError::Backpressure),
+            "control_backpressure"
+        );
+        assert_eq!(
+            control_request_terminal_code(&TransportError::RegistryFull),
+            "control_registry_full"
+        );
+        assert_eq!(
+            control_request_terminal_code(&TransportError::Io("pipe-canary".to_owned())),
+            "control_io"
+        );
+        assert_eq!(
+            control_request_terminal_code(&TransportError::PlanGap {
+                dependency: "dep",
+                reason: "reason",
+            }),
+            "control_plan_gap"
+        );
     }
 }
