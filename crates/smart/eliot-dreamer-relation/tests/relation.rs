@@ -1516,3 +1516,334 @@ fn work_unit_655_10_partial_contradicted_unknown_evidence() {
     let result = case.run().expect("partial evidence relation");
     assert_eq!(result.disposition, RelationDisposition::Abstention);
 }
+
+// WORK_UNIT_CASE: 655/11
+#[test]
+fn work_unit_655_11_similarity_cannot_establish_relation() {
+    // A similar-but-different endpoint handle never joins the admitted pair.
+    let mut case = Case::ready();
+    case.draft.evidence[0].predicate.source_id = "source-a-lookalike".to_owned();
+    assert!(case.run().is_err());
+    // A lookalike alternative never joins the admitted pair either.
+    let mut case = Case::ready();
+    case.draft.rivals[0].source_id = "source-a-lookalike".to_owned();
+    assert!(case.run().is_err());
+    // Cue-overlap wording with the exact tuple still needs qualified evidence.
+    let mut case = Case::ready();
+    case.draft.evidence[0].predicate.expression =
+        "looks like source-a supports target-b".to_owned();
+    case.draft.evidence[0].named.external_grade = None;
+    let result = case.run().expect("similarity wording without grade");
+    assert_ne!(result.disposition, RelationDisposition::Positive);
+}
+
+// WORK_UNIT_CASE: 655/12
+#[test]
+fn work_unit_655_12_cooccurrence_cannot_establish_relation() {
+    // Frequently cited but ungraded evidence stays unknown: no positive edge.
+    let mut case = Case::ready();
+    case.draft.evidence[0].named.external_grade = None;
+    let result = case.run().expect("ungraded relation");
+    assert_ne!(result.disposition, RelationDisposition::Positive);
+    // Repeated citations of one handle cannot corroborate independently.
+    let mut case = Case::ready();
+    let repeat = case.draft.evidence[0].clone();
+    case.draft.evidence.push(repeat);
+    assert!(case.run().is_err());
+    // Retrieval rank without a grade binding is not support either.
+    let mut case = Case::ready();
+    case.policy.grade_bindings.clear();
+    case.reseal();
+    let result = case.run().expect("unbound grades");
+    assert_ne!(result.disposition, RelationDisposition::Positive);
+}
+
+// WORK_UNIT_CASE: 655/13
+#[test]
+fn work_unit_655_13_chronology_cannot_establish_causality() {
+    // Ordered times with no mechanism, rivals or confounders: not causal.
+    let mut case = Case::causal();
+    case.policy.causal_claim = None;
+    case.policy.causal_bindings.clear();
+    case.policy.causal_material = None;
+    case.policy.causal_predicate = None;
+    case.reseal();
+    let result = case.run().expect("chronology-only causal draft");
+    assert_ne!(result.disposition, RelationDisposition::Positive);
+    // The chronology itself is preserved even though causality is refused.
+    assert!(
+        result
+            .closure
+            .candidate
+            .temporal
+            .event_time
+            .is_some()
+    );
+}
+
+// WORK_UNIT_CASE: 655/14
+#[test]
+fn work_unit_655_14_valid_causal_mechanism_with_rivals() {
+    let case = Case::causal();
+    let result = case.run().expect("causal relation");
+    assert_eq!(result.disposition, RelationDisposition::Positive);
+    result.validate().expect("sealed causal result");
+    assert_eq!(result.closure.candidate.family, RelationFamily::Causes);
+    assert!(
+        result
+            .closure
+            .candidate
+            .evidence_refs
+            .contains(&"evidence-1".to_owned())
+    );
+    assert!(
+        result
+            .closure
+            .candidate
+            .rival_refs
+            .contains(&"rival-1".to_owned())
+    );
+    assert_eq!(
+        result.closure.candidate.no_relation_ref.as_deref(),
+        Some("no-relation-1")
+    );
+    let kinds: Vec<EvidenceBindingKind> = case
+        .policy
+        .causal_bindings
+        .iter()
+        .map(|binding| binding.kind)
+        .collect();
+    for required in [
+        EvidenceBindingKind::Mechanism,
+        EvidenceBindingKind::Rival,
+        EvidenceBindingKind::Confounder,
+        EvidenceBindingKind::Discriminator,
+    ] {
+        assert!(kinds.contains(&required), "missing causal role {required:?}");
+    }
+}
+
+// WORK_UNIT_CASE: 655/15
+#[test]
+fn work_unit_655_15_missing_causal_discriminator_or_confounder() {
+    // Without a discriminator the asserted claim no longer joins its exact
+    // role bindings: a typed roles rejection, never a positive causal edge.
+    let mut case = Case::causal();
+    case.policy
+        .causal_bindings
+        .retain(|binding| binding.kind != EvidenceBindingKind::Discriminator);
+    case.reseal();
+    match case.run() {
+        Err(ContractViolation::BindingMismatch { field, .. }) => {
+            assert_eq!(field, "relation.causal_claim.roles");
+        }
+        other => panic!("expected causal roles rejection, got {other:?}"),
+    }
+    // Without a confounder the same join fails.
+    let mut case = Case::causal();
+    case.policy
+        .causal_bindings
+        .retain(|binding| binding.kind != EvidenceBindingKind::Confounder);
+    case.reseal();
+    match case.run() {
+        Err(ContractViolation::BindingMismatch { field, .. }) => {
+            assert_eq!(field, "relation.causal_claim.roles");
+        }
+        other => panic!("expected causal roles rejection, got {other:?}"),
+    }
+}
+
+// WORK_UNIT_CASE: 655/16
+#[test]
+fn work_unit_655_16_five_times_and_clock_conversion() {
+    let case = Case::causal();
+    let result = case.run().expect("five-time causal relation");
+    assert_eq!(result.disposition, RelationDisposition::Positive);
+    let temporal = &result.closure.candidate.temporal;
+    for point in [
+        &temporal.event_time,
+        &temporal.effective_time,
+        &temporal.observation_time,
+        &temporal.ingestion_time,
+        &temporal.commit_time,
+    ] {
+        assert!(point.is_some(), "all five causal times are retained");
+    }
+    // A conversion reference to an absent material is rejected.
+    let mut case = Case::causal();
+    case.draft
+        .temporal
+        .event_time
+        .as_mut()
+        .expect("event time")
+        .conversion_ref = Some("absent-clock".to_owned());
+    assert!(case.run().is_err());
+    // Cross-clock readings without an exact typed mapping are rejected.
+    let mut case = Case::causal();
+    case.draft
+        .temporal
+        .commit_time
+        .as_mut()
+        .expect("commit time")
+        .clock_ref = "clock-2".to_owned();
+    assert!(case.run().is_err());
+}
+
+fn time_point(value: i64) -> RelationTimePoint {
+    RelationTimePoint {
+        reading: eliot_contracts::ClockReading {
+            valid_time_ms: Some(value),
+            known_time_ms: Some(value),
+            transaction_sequence: None,
+            monotonic_ns: None,
+        },
+        clock_ref: "clock-1".to_owned(),
+        uncertainty_ms: 0,
+        conversion_ref: None,
+    }
+}
+
+// WORK_UNIT_CASE: 655/17
+#[test]
+fn work_unit_655_17_partial_temporal_order_preserved() {
+    // Serialization order never proves event order: an inverted commit/event
+    // pair is retained as supplied without imposing an order.
+    let mut case = Case::ready();
+    case.policy.temporal_required = true;
+    case.draft.temporal = RelationTemporalEvidence {
+        event_time: Some(time_point(20)),
+        effective_time: None,
+        observation_time: None,
+        ingestion_time: None,
+        commit_time: Some(time_point(10)),
+        temporal_status: EpistemicStatus::Supported,
+        uncertainty_ref: None,
+    };
+    case.reseal();
+    let result = case.run().expect("inverted order retained");
+    assert_eq!(result.disposition, RelationDisposition::Positive);
+    assert_eq!(
+        result
+            .closure
+            .candidate
+            .temporal
+            .event_time
+            .as_ref()
+            .expect("event")
+            .reading
+            .valid_time_ms,
+        Some(20)
+    );
+    assert_eq!(
+        result
+            .closure
+            .candidate
+            .temporal
+            .commit_time
+            .as_ref()
+            .expect("commit")
+            .reading
+            .valid_time_ms,
+        Some(10)
+    );
+    // A single explicit time point satisfies the temporal requirement.
+    let mut case = Case::ready();
+    case.policy.temporal_required = true;
+    case.draft.temporal = RelationTemporalEvidence {
+        event_time: Some(time_point(10)),
+        effective_time: None,
+        observation_time: None,
+        ingestion_time: None,
+        commit_time: None,
+        temporal_status: EpistemicStatus::Supported,
+        uncertainty_ref: None,
+    };
+    case.reseal();
+    let result = case.run().expect("partial time");
+    assert_eq!(result.disposition, RelationDisposition::Positive);
+    // Unknown temporal status fails even with points present.
+    let mut case = Case::ready();
+    case.policy.temporal_required = true;
+    case.draft.temporal.temporal_status = EpistemicStatus::Unknown;
+    case.reseal();
+    assert!(case.run().is_err());
+}
+
+// WORK_UNIT_CASE: 655/18
+#[test]
+fn work_unit_655_18_duplicate_and_idempotent_replay() {
+    let mut case = Case::ready();
+    let first = case.run().expect("first");
+    let second = case.run().expect("replay");
+    assert_eq!(first.result_digest, second.result_digest);
+    assert_eq!(
+        first.closure.candidate.candidate_id,
+        second.closure.candidate.candidate_id
+    );
+    // An exact proposed snapshot matching the retained relation is a duplicate.
+    let retained = snapshot(
+        &case.assembled(),
+        "dup-18",
+        case.draft.family,
+        case.draft.direction,
+        "source-a",
+        "target-b",
+    );
+    case.neighborhood.relations.push(retained);
+    case.policy.proposed_snapshot = Some(case.neighborhood.relations[0].clone());
+    case.reseal();
+    let duplicate = case.run().expect("duplicate");
+    assert_eq!(duplicate.disposition, RelationDisposition::Duplicate);
+    let replay = case.run().expect("duplicate replay");
+    assert_eq!(duplicate.result_digest, replay.result_digest);
+}
+
+// WORK_UNIT_CASE: 655/19
+#[test]
+fn work_unit_655_19_same_id_changed_payload_conflicts() {
+    let mut case = Case::ready();
+    let retained = snapshot(
+        &case.assembled(),
+        "stable-19",
+        case.draft.family,
+        case.draft.direction,
+        "source-a",
+        "target-b",
+    );
+    case.neighborhood.relations.push(retained.clone());
+    let mut changed = retained.clone();
+    changed.relation_digest = digest("changed-19");
+    case.policy.proposed_snapshot = Some(changed);
+    case.reseal();
+    let result = case.run().expect("changed same-ID snapshot");
+    assert_eq!(result.disposition, RelationDisposition::Conflict);
+    assert_eq!(
+        result.closure.candidate.before.as_ref(),
+        Some(&retained)
+    );
+    assert_eq!(result.closure.candidate.relation_id, "stable-19");
+}
+
+// WORK_UNIT_CASE: 655/20
+#[test]
+fn work_unit_655_20_invalid_reversal_is_not_an_inverse() {
+    // A same-family reversed snapshot is neither the registry inverse nor
+    // symmetric: it never yields an inverse disposition or a before record.
+    let mut case = Case::ready();
+    let reversed = snapshot(
+        &case.assembled(),
+        "reversed-20",
+        RelationFamily::Supports,
+        RelationDirection::Forward,
+        "target-b",
+        "source-a",
+    );
+    case.neighborhood.relations.push(reversed);
+    let result = case.run().expect("reversed neighborhood");
+    assert_ne!(result.disposition, RelationDisposition::Inverse);
+    assert!(result.closure.candidate.before.is_none());
+    // A proposal direction outside the registry rule fails outright.
+    let mut case = Case::ready();
+    case.draft.direction = RelationDirection::Reverse;
+    assert!(case.run().is_err());
+}
