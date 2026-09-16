@@ -11,6 +11,10 @@ mod ports;
 mod runtime;
 mod types;
 
+pub mod capsule;
+pub mod component_contract;
+pub mod replacement;
+
 pub use ports::*;
 pub use runtime::WasmRuntime;
 pub use types::*;
