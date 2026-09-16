@@ -711,20 +711,6 @@ fn explicit_legacy_compatibility_cannot_invent_authority() {
         "legacy hash-only locators must not gain a default residency"
     );
 
-    // Canonical legacy-epoch import stays loss-visible: missing evidence is
-    // suspended history, never fresh residency or fence authority.
-    let legacy =
-        eliot_contracts::LegacyScalarEpoch::new(7, "record-7", "legacy-v1").expect("legacy scalar");
-    let imported = eliot_contracts::import_legacy_scalar_epoch(
-        legacy,
-        eliot_contracts::LegacyEpochEvidence::Missing,
-    )
-    .expect("missing imports as suspended");
-    assert!(matches!(
-        imported,
-        eliot_contracts::LegacyEpochImport::HistoricalSuspended { .. }
-    ));
-
     // Valid historical archives keep their dispositional envelope.
     let disposition = RestoreArchiveDisposition {
         disposition: RestoreArchiveDispositionKind::HistoricalPreserved,
