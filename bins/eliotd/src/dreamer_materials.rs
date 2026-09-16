@@ -410,7 +410,10 @@ mod tests {
     use super::*;
 
     use eliot_contracts::{EpochId, EpochLineageId, RequestId, ResourceGeneration};
-    use eliot_read::{ProvenanceDisposition, QueryIntent, QueryMode, QueryResult, ReadProvenance};
+    use eliot_read::{
+        BranchEnvironmentScope, FreshnessPolicy, ProvenanceDisposition, QueryIntent, QueryMode,
+        QueryResult, ReadProvenance, RequiredAssurance, TimeScope,
+    };
     use eliot_store_api::{NamedReadOperation, ReadConsistency};
     use std::num::NonZeroU64;
 
@@ -584,10 +587,10 @@ mod tests {
             QueryResult {
                 intent: QueryIntent {
                     mode: QueryMode::Verification,
-                    time_scope: "test window".to_owned(),
-                    branch_environment_scope: "test branch".to_owned(),
-                    freshness_policy: "exact records only".to_owned(),
-                    required_assurance: "test evidence read".to_owned(),
+                    time_scope: TimeScope::EvidenceWindow,
+                    branch_environment_scope: BranchEnvironmentScope::LocalEnvironment,
+                    freshness_policy: FreshnessPolicy::ExactCapturedRecords,
+                    required_assurance: RequiredAssurance::VerifierEvidence,
                 },
                 operation: NamedReadOperation::GetEvidencePack,
                 state_fence: self.fence.clone(),
@@ -630,7 +633,7 @@ mod tests {
             _material_refs: Vec<String>,
         ) -> Result<eliot_read::QueryResult, ReadError> {
             Err(ReadError::Store(
-                eliot_store_api::StoreError::Unavailable.to_string(),
+                eliot_store_api::StoreError::Unavailable.into(),
             ))
         }
     }

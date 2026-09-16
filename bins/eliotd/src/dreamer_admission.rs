@@ -326,7 +326,8 @@ mod tests {
         OpaqueContentRef,
     };
     use eliot_read::{
-        ProvenanceDisposition, QueryIntent, QueryMode, QueryResult, ReadError, ReadProvenance,
+        BranchEnvironmentScope, FreshnessPolicy, ProvenanceDisposition, QueryIntent, QueryMode,
+        QueryResult, ReadError, ReadProvenance, RequiredAssurance, StoreReadFailure, TimeScope,
     };
     use eliot_receipts::{
         AuthorityBinding, EffectClass, OperationBinding, ProofCeiling, RequestBinding,
@@ -536,14 +537,14 @@ mod tests {
                 .payloads
                 .get(&subject)
                 .cloned()
-                .ok_or_else(|| ReadError::Store("test subject is not admitted".to_owned()))?;
+                .ok_or_else(|| ReadError::Store(StoreReadFailure::Unavailable))?;
             Ok(QueryResult {
                 intent: QueryIntent {
                     mode: QueryMode::Verification,
-                    time_scope: "test window".to_owned(),
-                    branch_environment_scope: "test branch".to_owned(),
-                    freshness_policy: "exact records only".to_owned(),
-                    required_assurance: "test evidence read".to_owned(),
+                    time_scope: TimeScope::EvidenceWindow,
+                    branch_environment_scope: BranchEnvironmentScope::LocalEnvironment,
+                    freshness_policy: FreshnessPolicy::ExactCapturedRecords,
+                    required_assurance: RequiredAssurance::VerifierEvidence,
                 },
                 operation: eliot_store_api::NamedReadOperation::GetEvidencePack,
                 state_fence: self.fence.clone(),
@@ -565,7 +566,7 @@ mod tests {
             _material_refs: Vec<String>,
         ) -> Result<QueryResult, ReadError> {
             Err(ReadError::Store(
-                eliot_store_api::StoreError::Unavailable.to_string(),
+                eliot_store_api::StoreError::Unavailable.into(),
             ))
         }
     }
