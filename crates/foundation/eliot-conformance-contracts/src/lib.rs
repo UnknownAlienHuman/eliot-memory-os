@@ -6,11 +6,38 @@
 
 #![forbid(unsafe_code)]
 
+mod self_quality;
 mod validation;
 
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
+pub use self_quality::{
+    BlockedDiagnosis, CauseHypothesisStatus, ConflictedDiagnosis, DenominatorCompleteness,
+    DimensionOutcome, DimensionStatus, EvidenceCeilings, ISSUE_A36_LEARNING_ACTIVATION,
+    ISSUE_A37_LEARNING_CLOSURE, ISSUE_A39_CONFLICT_ANALYSIS, ISSUE_A40_DEVELOPMENT_DIAGNOSIS,
+    ISSUE_A41_MAINTENANCE_PLAN, ISSUE_A42_CONFIGURATION_ASSISTANCE, IncompleteDiagnosis,
+    InterventionState, MAX_SELF_QUALITY_DIGEST_BYTES, MAX_SELF_QUALITY_DIMENSIONS,
+    MAX_SELF_QUALITY_HANDOFFS, MAX_SELF_QUALITY_HISTORY, MAX_SELF_QUALITY_OBSERVATIONS,
+    MAX_SELF_QUALITY_REFS, MAX_SELF_QUALITY_TEXT_BYTES, MIN_SELF_QUALITY_DIGEST_BYTES,
+    MetricMeasurement, MetricPresence, NoActionDisposition, NoProblemDisposition, ObservationCore,
+    ObservationWindow, OwnerBinding, PriorDiagnosisRecord, Priority, ProductContractRef,
+    QualityDenominator, QualityLimits, Recurrence, SELF_QUALITY_CANDIDATE_SCHEMA,
+    SELF_QUALITY_CONTRACT_VERSION, SELF_QUALITY_HANDOFF_SCHEMA, SELF_QUALITY_SCHEMA,
+    SelfQualityContractError, SelfQualityDiagnosisCandidate, SelfQualityDimension,
+    SelfQualityHandoff, SelfQualityHandoffOwner, SelfQualityInput, SelfQualityObservation,
+    SelfQualityPolicy, Severity, SourceIdentity, UnknownDiagnosis, canonicalize_dimension_outcomes,
+    canonicalize_handoffs, canonicalize_observations, canonicalize_self_quality_input,
+    digest_candidate, digest_policy as digest_self_quality_policy, digest_self_quality_input,
+    validate_blocked_against_input, validate_candidate_against_input, validate_ceilings,
+    validate_compatibility_version, validate_conflicted_against_input, validate_denominator,
+    validate_dimension_outcome, validate_handoff, validate_handoff_set,
+    validate_incomplete_against_input, validate_limits, validate_metric_measurement,
+    validate_no_action_against_input, validate_no_problem_against_input, validate_observation,
+    validate_observation_core, validate_observation_window, validate_owner_binding,
+    validate_policy, validate_prior_record, validate_product_contract_ref,
+    validate_self_quality_input, validate_source_identity, validate_unknown_against_input,
+};
 pub use validation::{
     canonicalize_capability_support_row, canonicalize_contract_set, canonicalize_domain_coverage,
     canonicalize_support_claim_set, validate_capability_support_row,
