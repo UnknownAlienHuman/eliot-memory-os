@@ -1237,7 +1237,10 @@ mod tests {
             &tool,
         ));
         assert!(
-            matches!(fenced, Err(ReadError::Store(StoreReadFailure::FenceMismatch))),
+            matches!(
+                fenced,
+                Err(ReadError::Store(StoreReadFailure::FenceMismatch))
+            ),
             "a wrong fence must fail closed as FenceMismatch, got {fenced:?}"
         );
 
@@ -1251,7 +1254,10 @@ mod tests {
             &packet,
         ));
         assert!(
-            matches!(admitted_only, Err(ReadError::Store(StoreReadFailure::Unavailable))),
+            matches!(
+                admitted_only,
+                Err(ReadError::Store(StoreReadFailure::Unavailable))
+            ),
             "packet must stay admission-only as Unavailable, got {admitted_only:?}"
         );
 
