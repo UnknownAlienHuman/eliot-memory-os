@@ -92,6 +92,7 @@ thread_local! {
 }
 
 mod directory_publication;
+mod event_log;
 mod installer_authority_key;
 mod installer_root;
 mod kernel_front_door_expectation;
@@ -125,6 +126,13 @@ pub(crate) use directory_publication::{
     create_owned_directory_relative, rename_directory_from_handle,
     retain_directory_publication_contour, sync_directory_handle,
     validate_directory_publication_absolute, verify_directory_publication_contour,
+};
+pub use event_log::{
+    AdmittedEventLogEvent, EVENT_LOG_MAX_INSERTION_BYTES, EVENT_LOG_MAX_INSERTION_UTF16_UNITS,
+    EVENT_LOG_MAX_INSERTIONS, EVENT_LOG_QUEUE_CAPACITY, EVENT_LOG_SERVICE_FAILURE_ID,
+    EVENT_LOG_SERVICE_START_ID, EVENT_LOG_SERVICE_STOP_ID, EVENT_LOG_SOURCE, EventLogError,
+    EventLogReceipt, EventLogSeverity, EventLogSourceAvailability, is_event_log_supported,
+    report_local_event, validate_event_log_insertion,
 };
 pub use installer_authority_key::{
     INSTALLATION_AUTHORITY_KEY_FILE_BYTES, INSTALLATION_AUTHORITY_KEY_FILE_VERSION,
