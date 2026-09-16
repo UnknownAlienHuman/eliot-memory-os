@@ -15,7 +15,31 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
+mod peer_communication;
 mod work_lease_issuance;
+
+pub use peer_communication::{
+    AdmitArtifactRevision, AnchorResolution, AnchoredReview, ArgumentAcceptability, AssertedEffect,
+    BoardAnchor, BoardCompactionPolicy, BoardCompactionReceipt, BoardEntry, BoardEntryReceipt,
+    BoardEntryState, BoardEntrySummary, BoardOmission, BoardPage, BoardTombstone,
+    ConflictCandidate, ConflictCandidateDraft, EmbeddedMarker, EmbeddedMarkerDraft,
+    EmbeddedMarkerKind, EnqueuePeerMessage, ExternalResolutionReceipt, LiveDeltaKind,
+    MAX_BOARD_ENTRIES_PER_SCOPE, MAX_BOARD_PAGE_SIZE, MAX_BOARD_REVISIONS_PER_ENTRY,
+    MAX_PEER_ATTEMPT_HISTORY, MAX_PEER_INLINE_TEXT, MAX_PEER_MESSAGE_BYTES,
+    MAX_PEER_OUTSTANDING_PER_RECIPIENT, MAX_PEER_OUTSTANDING_PER_SENDER, MAX_PEER_REFERENCES,
+    MAX_PEER_STREAM_DEPTH, MarkerDisposition, OPTIONAL_PEER_ENVELOPE_FIELDS, PEER_CHANNEL_REVISION,
+    PEER_MESSAGE_SCHEMA, PeerAckReceipt, PeerArtifactHead, PeerAttemptRecord, PeerBoardKind,
+    PeerClockPort, PeerConflict, PeerConflictDimension, PeerConflictReceipt, PeerConflictState,
+    PeerConflictType, PeerConsumeReceipt, PeerCursor, PeerCursorKey, PeerDeliveryAttempt,
+    PeerDeliveryPort, PeerDeliveryReceipt, PeerDeliveryTarget, PeerDurability,
+    PeerDurabilityAttestation, PeerDurabilityPort, PeerEndpointLossReport, PeerEnqueueReceipt,
+    PeerEnvelopeHeader, PeerMessage, PeerMessageDiagnostic, PeerMessageKind, PeerMessageState,
+    PeerReconnectReport, PeerReviewAckReceipt, PeerReviewAdvance, PeerReviewDenominator,
+    PeerReviewLifecycle, PeerReviewReceipt, PeerReviewStanding, PeerStreamHead, PeerStreamId,
+    PostBoardEntry, PrivacyClass, REQUIRED_PEER_ENVELOPE_FIELDS, RawField, RecordPeerConflict,
+    ReviewCompleteness, ReviewKind, ReviewRecommendation, ReviewTargetKind, ReviseBoardEntry,
+    SubmitPeerReview, decode_peer_envelope, peer_digest_hex,
+};
 
 pub use work_lease_issuance::{
     WORK_LEASE_ISSUANCE_REVISION, WorkLeaseIssuanceDisposition, WorkLeaseIssuanceError,
@@ -100,6 +124,38 @@ pub enum CoordinationError {
     LegacyWorkLeaseCannotBeCanonicalized,
     #[error("work lease issuance evidence could not be encoded")]
     IssuanceEvidenceEncoding,
+    #[error("unknown peer message kind: {0}")]
+    UnknownPeerKind(String),
+    #[error("unknown peer schema: {0}")]
+    UnknownPeerSchema(String),
+    #[error("unknown peer field: {0}")]
+    UnknownPeerField(String),
+    #[error("duplicate peer field: {0}")]
+    DuplicatePeerField(String),
+    #[error("missing peer field: {0}")]
+    MissingPeerField(String),
+    #[error("peer semantic conflict on identity: {0}")]
+    PeerSemanticConflict(String),
+    #[error("peer backpressure on {scope}: live ceiling is {limit}")]
+    PeerBackpressure { scope: String, limit: usize },
+    #[error("peer record is expired: {0}")]
+    PeerExpired(String),
+    #[error("peer delivery outcome is unknown, reconcile first: {0}")]
+    PeerDeliveryUnknown(String),
+    #[error("peer privacy disclosure denied: {0}")]
+    PeerPrivacyDenied(String),
+    #[error("peer cross-scope forwarding rejected: {0}")]
+    PeerCrossScopeRejected(String),
+    #[error("peer authority/effect injection rejected: {0}")]
+    PeerAuthorityRejected(String),
+    #[error("peer review anchor cannot satisfy a required review: {0}")]
+    PeerReviewAnchorInvalid(String),
+    #[error("peer conflict resolution requires an external receipt: {0}")]
+    PeerResolutionRequiresExternal(String),
+    #[error("peer board compaction requires an exact retaining policy: {scope}")]
+    PeerCompactionRequiresPolicy { scope: String },
+    #[error("peer retraction would erase observed evidence: {0}")]
+    PeerRetractionRejected(String),
 }
 
 /// Lifecycle of an attached actor session.
@@ -141,6 +197,10 @@ pub enum CoordinationEventKind {
     IntegrationClaimed,
     WorkReassigned,
     ReadyAdmitted,
+    BoardEntryPosted,
+    BoardEntryRevised,
+    ReviewItemSubmitted,
+    PeerConflictRecorded,
 }
 
 /// A durable, idempotent event with its exact causal and fencing context.
@@ -460,6 +520,36 @@ pub struct CoordinationOwner {
     events: Vec<CoordinationEvent>,
     #[serde(default)]
     work_lease_issuance_by_request: BTreeMap<String, WorkLeaseIssuanceProvenance>,
+    #[serde(default)]
+    peer_messages: BTreeMap<String, peer_communication::PeerMessage>,
+    #[serde(default)]
+    peer_streams: BTreeMap<peer_communication::PeerStreamId, peer_communication::PeerStreamHead>,
+    #[serde(default)]
+    peer_cursors: BTreeMap<peer_communication::PeerCursorKey, peer_communication::PeerCursor>,
+    #[serde(default)]
+    peer_request_index: BTreeMap<String, String>,
+    #[serde(default)]
+    peer_board_heads: BTreeMap<String, peer_communication::BoardEntry>,
+    #[serde(default)]
+    peer_board_revisions: BTreeMap<(String, u64), peer_communication::BoardEntry>,
+    #[serde(default)]
+    peer_board_tombstones: BTreeMap<(String, u64), peer_communication::BoardTombstone>,
+    #[serde(default)]
+    peer_board_requests: BTreeMap<String, String>,
+    #[serde(default)]
+    peer_conflicts: BTreeMap<String, peer_communication::PeerConflict>,
+    #[serde(default)]
+    peer_conflict_requests: BTreeMap<String, String>,
+    #[serde(default)]
+    peer_reviews: BTreeMap<String, peer_communication::AnchoredReview>,
+    #[serde(default)]
+    peer_review_requests: BTreeMap<String, String>,
+    #[serde(default)]
+    peer_review_expectations: BTreeMap<String, u64>,
+    #[serde(default)]
+    peer_artifact_heads: BTreeMap<String, peer_communication::PeerArtifactHead>,
+    #[serde(default)]
+    peer_artifact_revisions: BTreeMap<(String, u64), String>,
 }
 
 impl CoordinationOwner {
