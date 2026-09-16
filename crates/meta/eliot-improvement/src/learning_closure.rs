@@ -1111,20 +1111,14 @@ fn check_economics_identity(
     campaign: &CampaignAndTarget,
     evidence: &OutcomeHarmAndEconomicsEvidence,
 ) -> Option<LearningClosureDisposition> {
-    let Some(first) = evidence.economics.first() else {
-        return None;
-    };
+    let first = evidence.economics.first()?;
     for record in &evidence.economics[1..] {
         if record.currency != first.currency || record.unit != first.unit {
             return Some(inconclusive(
                 campaign,
                 format!(
                     "attempt {} currency/unit {}/{} vs {}/{}: currency-unit-mismatch",
-                    record.attempt_id,
-                    record.currency,
-                    record.unit,
-                    first.currency,
-                    first.unit
+                    record.attempt_id, record.currency, record.unit, first.currency, first.unit
                 ),
                 "economics normalization",
             ));
@@ -1159,7 +1153,11 @@ fn check_harm(
                 "attempt {} {:?} harm {}",
                 outcome.attempt_id,
                 outcome.kind,
-                outcome.harm.harm_ref.as_deref().unwrap_or("unreferenced-harm")
+                outcome
+                    .harm
+                    .harm_ref
+                    .as_deref()
+                    .unwrap_or("unreferenced-harm")
             ));
         }
     }
@@ -1193,9 +1191,7 @@ fn check_comparison_identity(
         }
     }
     // Uniform predeclared comparison frame across outcomes.
-    let Some(first) = evidence.outcomes.first() else {
-        return None;
-    };
+    let first = evidence.outcomes.first()?;
     for outcome in &evidence.outcomes[1..] {
         if outcome.metric != first.metric || outcome.unit != first.unit {
             return Some(inconclusive(
@@ -1446,11 +1442,15 @@ fn hash_evidence(
         field(hasher, &assessment.attempt_id);
         field(hasher, &assessment.overlay_id);
         field(hasher, &format!("{:?}", assessment.stage));
-        field(hasher, if assessment.observed { "observed" } else { "missing" });
         field(
             hasher,
-            assessment.evidence_ref.as_deref().unwrap_or(""),
+            if assessment.observed {
+                "observed"
+            } else {
+                "missing"
+            },
         );
+        field(hasher, assessment.evidence_ref.as_deref().unwrap_or(""));
         field(
             hasher,
             if assessment.use_linked {
@@ -1479,9 +1479,7 @@ fn hash_evidence(
         }
     }
     let mut outcome_refs: Vec<&OutcomeRecord> = evidence.outcomes.iter().collect();
-    outcome_refs.sort_by(|a, b| {
-        (&a.attempt_id, &a.metric).cmp(&(&b.attempt_id, &b.metric))
-    });
+    outcome_refs.sort_by(|a, b| (&a.attempt_id, &a.metric).cmp(&(&b.attempt_id, &b.metric)));
     for outcome in outcome_refs {
         field(hasher, &outcome.attempt_id);
         field(hasher, &outcome.metric);
@@ -1551,8 +1549,7 @@ fn closure_digest(
     hash_evidence(&mut hasher, campaign, attempts, overlays, evidence);
     let mut priors: Vec<&PriorClosure> = history.prior.iter().collect();
     priors.sort_by(|a, b| {
-        (&a.campaign_id, &a.closure_id, &a.digest)
-            .cmp(&(&b.campaign_id, &b.closure_id, &b.digest))
+        (&a.campaign_id, &a.closure_id, &a.digest).cmp(&(&b.campaign_id, &b.closure_id, &b.digest))
     });
     for prior in priors {
         field(&mut hasher, &prior.closure_id);
