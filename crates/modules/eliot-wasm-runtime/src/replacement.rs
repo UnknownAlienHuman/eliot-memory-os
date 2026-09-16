@@ -1228,14 +1228,11 @@ impl GenerationCoordinator {
                 receipt.external_evidence = Some(evidence);
                 receipt.durable_published = true;
                 let confirmed = receipt.clone();
-                if state
-                    .adoption
-                    .as_ref()
-                    .is_some_and(|adoption| adoption.operation_id == confirmed.operation_id)
-                {
-                    if let Some(adoption) = state.adoption.as_mut() {
-                        adoption.confirmed = true;
-                    }
+                let adoption_matches = state.adoption.as_ref().is_some_and(|adoption| {
+                    adoption.operation_id == confirmed.operation_id
+                });
+                if let Some(adoption) = state.adoption.as_mut().filter(|_| adoption_matches) {
+                    adoption.confirmed = true;
                 }
                 Ok(confirmed)
             }
@@ -1417,18 +1414,20 @@ impl GenerationCoordinator {
         let sequence = state.next_sequence()?;
         let prev = state.chain_prev();
         let receipt = seal_reconcile_receipt(sequence, observed, &prev)?;
-        if state
+        let adoption_matches = state
             .adoption
             .as_ref()
-            .is_some_and(|adoption| adoption.operation_id == observed.operation_id)
-            && state
-                .active
-                .as_ref()
-                .is_some_and(|active| active.generation_number() == observed.observed_active)
+            .is_some_and(|adoption| adoption.operation_id == observed.operation_id);
+        let active_matches = state
+            .active
+            .as_ref()
+            .is_some_and(|active| active.generation_number() == observed.observed_active);
+        if let Some(adoption) = state
+            .adoption
+            .as_mut()
+            .filter(|_| adoption_matches && active_matches)
         {
-            if let Some(adoption) = state.adoption.as_mut() {
-                adoption.confirmed = true;
-            }
+            adoption.confirmed = true;
         }
         if state.reconcile_log.len() >= MAX_RECEIPTS {
             state.reconcile_log.pop_front();
@@ -1779,10 +1778,11 @@ impl GenerationCoordinator {
     }
 
     fn release_operation(&self, operation_id: &str) {
-        if let Ok(mut state) = self.lock_state() {
-            if state.holds_operation(operation_id) {
-                state.operation = None;
-            }
+        let Ok(mut state) = self.lock_state() else {
+            return;
+        };
+        if state.holds_operation(operation_id) {
+            state.operation = None;
         }
     }
 
@@ -2034,7 +2034,7 @@ fn check_compatible_fields(
             "capability-expansion".to_owned(),
         ));
     }
-    if !limits_narrower(&old.limits, &new.limits) {
+    if !limits_narrower(old, new) {
         return Err(ReplacementError::IncompatibleCandidate(
             "limit-widening".to_owned(),
         ));
@@ -2048,24 +2048,43 @@ fn check_compatible_fields(
     }
 }
 
-fn limits_narrower(old: &InvocationLimits, new: &InvocationLimits) -> bool {
-    new.max_input_bytes <= old.max_input_bytes
-        && new.max_output_bytes <= old.max_output_bytes
-        && new.max_host_calls <= old.max_host_calls
-        && new.max_fuel <= old.max_fuel
-        && new.max_memory_bytes <= old.max_memory_bytes
-        && new.max_table_elements <= old.max_table_elements
-        && new.max_instances <= old.max_instances
-        && new.max_stack_bytes <= old.max_stack_bytes
-        && new.wall_deadline_ms <= old.wall_deadline_ms
-        && new.epoch.deadline_ticks <= old.epoch.deadline_ticks
-        && new.epoch.cancellation == old.epoch.cancellation
-        && new.artifact_access.max_reads <= old.artifact_access.max_reads
-        && new.artifact_access.max_bytes <= old.artifact_access.max_bytes
-        && new
-            .artifact_access
-            .allowed_digests
-            .is_subset(&old.artifact_access.allowed_digests)
+fn limits_narrower(old: &GenerationRecord, new: &GenerationRecord) -> bool {
+    let old_limits = &old.limits;
+    let new_limits = &new.limits;
+    new_limits.max_input_bytes <= old_limits.max_input_bytes
+        && new_limits.max_output_bytes <= old_limits.max_output_bytes
+        && new_limits.max_host_calls <= old_limits.max_host_calls
+        && new_limits.max_fuel <= old_limits.max_fuel
+        && new_limits.max_memory_bytes <= old_limits.max_memory_bytes
+        && new_limits.max_table_elements <= old_limits.max_table_elements
+        && new_limits.max_instances <= old_limits.max_instances
+        && new_limits.max_stack_bytes <= old_limits.max_stack_bytes
+        && new_limits.wall_deadline_ms <= old_limits.wall_deadline_ms
+        && new_limits.epoch.deadline_ticks <= old_limits.epoch.deadline_ticks
+        && new_limits.epoch.cancellation == old_limits.epoch.cancellation
+        && new_limits.artifact_access.max_reads <= old_limits.artifact_access.max_reads
+        && new_limits.artifact_access.max_bytes <= old_limits.artifact_access.max_bytes
+        && non_artifact_digests(new_limits, &new.artifact_digest)
+            .is_subset(&non_artifact_digests(old_limits, &old.artifact_digest))
+}
+
+/// Digests admitted beyond the generation's own artifact: the only
+/// artifact-access surface that must not widen across a replacement. Each
+/// generation necessarily admits its own (rotating) artifact — structural
+/// validation already requires that membership — so the raw allowed sets are
+/// compared modulo the rotation. A candidate admitting any foreign digest the
+/// old generation did not admit still fails as widening.
+fn non_artifact_digests(
+    limits: &InvocationLimits,
+    artifact: &Sha256Digest,
+) -> BTreeSet<Sha256Digest> {
+    limits
+        .artifact_access
+        .allowed_digests
+        .iter()
+        .filter(|digest| *digest != artifact)
+        .cloned()
+        .collect()
 }
 
 fn genesis_digest() -> Sha256Digest {
