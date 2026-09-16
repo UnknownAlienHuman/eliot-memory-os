@@ -1,0 +1,517 @@
+inventory_digest = "f08f42ad4ea1f564f4a079a253eb9449d16b01289647e8e57cb99468f9d006cf"
+
+[header]
+schema = "eliot.context-measurement-inventory.v1"
+rule_revision = "866.1"
+tool_version = "0.1.0"
+source_sha = "55c986504b31bbb1b00ce00626e46ca8ae1533b6818afd3f00fdafcf1059d537"
+rule_digest = "2759e7cef963bbdf8fbcca654efe3fc29f0e40f4d32fcd39a623fa70ca48a52a"
+owner_digest = "a8e92d9229d0ad5fa065a9ff21a0aca7d7bda07a4ddf0cbd4aebc01cfd808e0c"
+scan_denominator_files = 9
+scan_denominator_bytes = 122820
+candidate_count = 31
+classified_count = 31
+generation_command = "python scripts/context_measurement_inventory.py sync --root ."
+coverage_disposition = "COMPLETE"
+coverage_reason = "every denominator case discovered exactly once with a closed class"
+proof_ceiling = "STATIC_SOURCE_CLASSIFICATION_ONLY"
+scan_roots = ["crates/smart/eliot-context-assembly/src/measurement.rs", "crates/smart/eliot-context-contracts/src/measurement.rs", "crates/smart/eliot-context-measurement/src/capacity.rs", "crates/smart/eliot-context-measurement/src/envelope.rs", "crates/smart/eliot-context-measurement/src/lib.rs", "crates/smart/eliot-context-measurement/src/observation.rs", "crates/smart/eliot-context-measurement/src/receipt.rs", "crates/smart/eliot-context-measurement/src/stu.rs", "crates/smart/eliot-context-measurement/tests/measurement.rs"]
+exclusions = []
+classifications = ["exact-utf8-envelope", "normative-stu-estimate", "serializer-identity-bound", "route-identity-bound", "estimator-policy-unvalidated", "capacity-fit-analysis", "exact-observation", "stale-or-absent-observation", "transformed-observation", "test-only"]
+owner_allocations = ["#704:9", "#783:8", "#878:6", "#880:8"]
+
+[[rows]]
+id = "c0001"
+case_ref = "704/1"
+owner = "#704"
+path = "crates/smart/eliot-context-measurement/src/stu.rs"
+signal = "stu_for_bytes"
+span_start = 17
+span_end = 17
+source_sha256 = "cf6809fcc65c16154a6672122ff8b10148501dc04ff0f9acf4d37273d85c6e49"
+span_digest = "efc9b335bca94c3c6c97329fc398a20ae9a4817e856b019dac7bfe081d15ff9e"
+row_digest = "303e1cbe9ae2f28748009c80b11cbe889d7fb599579abedea541bab583972025"
+classification = "normative-stu-estimate"
+evidence = "normative STU signal 'stu_for_bytes': ceil(bytes/3) estimate, never proves fit"
+successor_scope = "bounded successor scope: consumer #704 owns case 704/1 (normative-stu-estimate); prove fit/error/receipt in the owning issue"
+invalidation = "row invalid when the source span digest, file sha, rule revision, or owner map changes; rerun sync"
+
+[[rows]]
+id = "c0002"
+case_ref = "704/2"
+owner = "#704"
+path = "crates/smart/eliot-context-measurement/src/lib.rs"
+signal = "measure_serialized_context"
+span_start = 426
+span_end = 426
+source_sha256 = "c3f86995eb994833219a37278c28d79afbdbef6eedca2abcb1ceaa47e2db7095"
+span_digest = "cadcc7b5482a41479cceced92a8568abf062211222217997ddd94f6c0219340f"
+row_digest = "6042dd0b2a1ed5d04f4d5f3859a397d7c77e7267636ec92e94fda7bef24e2dac"
+classification = "exact-utf8-envelope"
+evidence = "exact envelope signal 'measure_serialized_context': final UTF-8 bytes and digest binding"
+successor_scope = "bounded successor scope: consumer #704 owns case 704/2 (exact-utf8-envelope); prove fit/error/receipt in the owning issue"
+invalidation = "row invalid when the source span digest, file sha, rule revision, or owner map changes; rerun sync"
+
+[[rows]]
+id = "c0003"
+case_ref = "704/3"
+owner = "#704"
+path = "crates/smart/eliot-context-measurement/src/lib.rs"
+signal = "measure_exact_utf8"
+span_start = 124
+span_end = 124
+source_sha256 = "c3f86995eb994833219a37278c28d79afbdbef6eedca2abcb1ceaa47e2db7095"
+span_digest = "a21aa74eb457bbc9f418ebece6a1d50b3f51533cba44147ac3a52fddc84d9022"
+row_digest = "7acf865078f2f1dc63a88b0d3fe42e64eb0edeb451192f72a24c18250ee3de8f"
+classification = "exact-utf8-envelope"
+evidence = "exact envelope signal 'measure_exact_utf8': final UTF-8 bytes and digest binding"
+successor_scope = "bounded successor scope: consumer #704 owns case 704/3 (exact-utf8-envelope); prove fit/error/receipt in the owning issue"
+invalidation = "row invalid when the source span digest, file sha, rule revision, or owner map changes; rerun sync"
+
+[[rows]]
+id = "c0004"
+case_ref = "704/4"
+owner = "#704"
+path = "crates/smart/eliot-context-measurement/src/envelope.rs"
+signal = "declared_len"
+span_start = 78
+span_end = 78
+source_sha256 = "5907c5ab9681175a48cb9d4ffcae8c11f75411c75cdf27058193fb4d3a1c1362"
+span_digest = "01544bc68d8ea63f492ee5cfbfbfc3056587756b4e2f21993f2c0415ad376589"
+row_digest = "48bbec1daa02a7bb25c34355347d07925fe56d3c1c1a583c0bfaac1d67c06acc"
+classification = "exact-utf8-envelope"
+evidence = "exact envelope signal 'declared_len': final UTF-8 bytes and digest binding"
+successor_scope = "bounded successor scope: consumer #704 owns case 704/4 (exact-utf8-envelope); prove fit/error/receipt in the owning issue"
+invalidation = "row invalid when the source span digest, file sha, rule revision, or owner map changes; rerun sync"
+
+[[rows]]
+id = "c0005"
+case_ref = "704/5"
+owner = "#704"
+path = "crates/smart/eliot-context-measurement/src/envelope.rs"
+signal = "content_digest"
+span_start = 79
+span_end = 79
+source_sha256 = "5907c5ab9681175a48cb9d4ffcae8c11f75411c75cdf27058193fb4d3a1c1362"
+span_digest = "6dd50ffaee280b1cc2abb7772572780032039f442a63a829fafb51f81368c477"
+row_digest = "f6c9f6b3f2c73100c65a9e99fbe6b6600871c0b51c3134e8c3c04f6cef11a1c7"
+classification = "exact-utf8-envelope"
+evidence = "exact envelope signal 'content_digest': final UTF-8 bytes and digest binding"
+successor_scope = "bounded successor scope: consumer #704 owns case 704/5 (exact-utf8-envelope); prove fit/error/receipt in the owning issue"
+invalidation = "row invalid when the source span digest, file sha, rule revision, or owner map changes; rerun sync"
+
+[[rows]]
+id = "c0006"
+case_ref = "704/6"
+owner = "#704"
+path = "crates/smart/eliot-context-measurement/src/lib.rs"
+signal = "rendered_utf8_bytes"
+span_start = 162
+span_end = 162
+source_sha256 = "c3f86995eb994833219a37278c28d79afbdbef6eedca2abcb1ceaa47e2db7095"
+span_digest = "b0c22c8c58ea41a4591130981f279427cf76d894198c96225530b00d3baee310"
+row_digest = "79d9d21dcea88c337bc45e58c949fca1cf8102463aa1cd5ea698e8d71a17f3dc"
+classification = "exact-utf8-envelope"
+evidence = "exact envelope signal 'rendered_utf8_bytes': final UTF-8 bytes and digest binding"
+successor_scope = "bounded successor scope: consumer #704 owns case 704/6 (exact-utf8-envelope); prove fit/error/receipt in the owning issue"
+invalidation = "row invalid when the source span digest, file sha, rule revision, or owner map changes; rerun sync"
+
+[[rows]]
+id = "c0007"
+case_ref = "704/7"
+owner = "#704"
+path = "crates/smart/eliot-context-measurement/src/lib.rs"
+signal = "estimator_id"
+span_start = 207
+span_end = 207
+source_sha256 = "c3f86995eb994833219a37278c28d79afbdbef6eedca2abcb1ceaa47e2db7095"
+span_digest = "be09f104a7f6e767f2b2ff68a2b20c811f69c6fd2486ce62e66d7b61ec8995ea"
+row_digest = "7ea98c76f447a5437f7f6cbc15581a3a776703ae3cd35749429ca5b1b52fd655"
+classification = "estimator-policy-unvalidated"
+evidence = "estimator signal 'estimator_id': UNVALIDATED planning evidence, candidates cited only"
+successor_scope = "bounded successor scope: consumer #704 owns case 704/7 (estimator-policy-unvalidated); prove fit/error/receipt in the owning issue"
+invalidation = "row invalid when the source span digest, file sha, rule revision, or owner map changes; rerun sync"
+
+[[rows]]
+id = "c0008"
+case_ref = "704/8"
+owner = "#704"
+path = "crates/smart/eliot-context-measurement/src/lib.rs"
+signal = "candidate_digests"
+span_start = 213
+span_end = 213
+source_sha256 = "c3f86995eb994833219a37278c28d79afbdbef6eedca2abcb1ceaa47e2db7095"
+span_digest = "fbf5f5fa89b3b1feae4fa738263579d3c52d03812dd54941c1636f04e71b9f31"
+row_digest = "90d6e5059a053400eb0784ed01fb33ff3c27b7543244ccc6a7e5173c12002f9f"
+classification = "estimator-policy-unvalidated"
+evidence = "estimator signal 'candidate_digests': UNVALIDATED planning evidence, candidates cited only"
+successor_scope = "bounded successor scope: consumer #704 owns case 704/8 (estimator-policy-unvalidated); prove fit/error/receipt in the owning issue"
+invalidation = "row invalid when the source span digest, file sha, rule revision, or owner map changes; rerun sync"
+
+[[rows]]
+id = "c0009"
+case_ref = "704/9"
+owner = "#704"
+path = "crates/smart/eliot-context-measurement/src/receipt.rs"
+signal = "receipt_digest"
+span_start = 242
+span_end = 242
+source_sha256 = "7086c402a96274c8ee97dfd6e599e8eb99aa535b62b0c3a248a461c42bbc33f9"
+span_digest = "6c01184f283bd5a5530e98b30950bdbf37b4141e3973d816427bdbb7361ba012"
+row_digest = "9c8259e0d34459d8b380029be984ca63e404b0be51fb06f47730ab1883eb2366"
+classification = "capacity-fit-analysis"
+evidence = "capacity signal 'receipt_digest': reserves/fit/headroom/error/receipt binding"
+successor_scope = "bounded successor scope: consumer #704 owns case 704/9 (capacity-fit-analysis); prove fit/error/receipt in the owning issue"
+invalidation = "row invalid when the source span digest, file sha, rule revision, or owner map changes; rerun sync"
+
+[[rows]]
+id = "c0010"
+case_ref = "783/1"
+owner = "#783"
+path = "crates/smart/eliot-context-assembly/src/measurement.rs"
+signal = "final_bytes"
+span_start = 21
+span_end = 21
+source_sha256 = "cf2286a992eaad13c9a37ca82b3ad55b3256fab8e3f65c4d6b236731e59fa1f9"
+span_digest = "7909b65fce3d7f7ca867b9f8e24bba30067a39dfe141748a197d27e862856395"
+row_digest = "3ff8c9501221929fdbd116959a5502498f36b12677d6dc16f9ceb1c0d2d1da25"
+classification = "exact-utf8-envelope"
+evidence = "exact envelope signal 'final_bytes': final UTF-8 bytes and digest binding"
+successor_scope = "bounded successor scope: consumer #783 owns case 783/1 (exact-utf8-envelope); prove fit/error/receipt in the owning issue"
+invalidation = "row invalid when the source span digest, file sha, rule revision, or owner map changes; rerun sync"
+
+[[rows]]
+id = "c0011"
+case_ref = "783/2"
+owner = "#783"
+path = "crates/smart/eliot-context-assembly/src/measurement.rs"
+signal = "envelope_digest"
+span_start = 65
+span_end = 65
+source_sha256 = "cf2286a992eaad13c9a37ca82b3ad55b3256fab8e3f65c4d6b236731e59fa1f9"
+span_digest = "c123fe019fa8b05c557708f07ff46e53bd895570213b01e7570f1c871f6f9cda"
+row_digest = "21acb9b27f8156245e31ee45b0ba0286f7f2dc957e89cbdce0081fd47c0c2282"
+classification = "exact-utf8-envelope"
+evidence = "exact envelope signal 'envelope_digest': final UTF-8 bytes and digest binding"
+successor_scope = "bounded successor scope: consumer #783 owns case 783/2 (exact-utf8-envelope); prove fit/error/receipt in the owning issue"
+invalidation = "row invalid when the source span digest, file sha, rule revision, or owner map changes; rerun sync"
+
+[[rows]]
+id = "c0012"
+case_ref = "783/3"
+owner = "#783"
+path = "crates/smart/eliot-context-assembly/src/measurement.rs"
+signal = "serializer_id"
+span_start = 77
+span_end = 77
+source_sha256 = "cf2286a992eaad13c9a37ca82b3ad55b3256fab8e3f65c4d6b236731e59fa1f9"
+span_digest = "235f70a11a9912d875bc22fc93cd4943e54e73be3d45637dfc5d5b4552349312"
+row_digest = "f34a0a0a127b91900bd90809dbbc6c88980e2493e77aefef06a5f376c14a6178"
+classification = "serializer-identity-bound"
+evidence = "serializer identity signal 'serializer_id': serializer/schema binding"
+successor_scope = "bounded successor scope: consumer #783 owns case 783/3 (serializer-identity-bound); prove fit/error/receipt in the owning issue"
+invalidation = "row invalid when the source span digest, file sha, rule revision, or owner map changes; rerun sync"
+
+[[rows]]
+id = "c0013"
+case_ref = "783/4"
+owner = "#783"
+path = "crates/smart/eliot-context-assembly/src/measurement.rs"
+signal = "route_id"
+span_start = 80
+span_end = 80
+source_sha256 = "cf2286a992eaad13c9a37ca82b3ad55b3256fab8e3f65c4d6b236731e59fa1f9"
+span_digest = "5185fa870c47db88c722de58b2534bedbfe64ee463551db2cdbd4b8c92b70036"
+row_digest = "5e9124dda17a7803590481dd07643587c2453c5a1117d8641c42d3bc95f313f4"
+classification = "route-identity-bound"
+evidence = "route identity signal 'route_id': route/provider/model/tokenizer binding"
+successor_scope = "bounded successor scope: consumer #783 owns case 783/4 (route-identity-bound); prove fit/error/receipt in the owning issue"
+invalidation = "row invalid when the source span digest, file sha, rule revision, or owner map changes; rerun sync"
+
+[[rows]]
+id = "c0014"
+case_ref = "783/5"
+owner = "#783"
+path = "crates/smart/eliot-context-assembly/src/measurement.rs"
+signal = "model_id"
+span_start = 81
+span_end = 81
+source_sha256 = "cf2286a992eaad13c9a37ca82b3ad55b3256fab8e3f65c4d6b236731e59fa1f9"
+span_digest = "179b40e8f8e000487b54c4a8469cf2a9af9f9dda28a5d5e91abe895f081909f9"
+row_digest = "d387ac6c7a2336bdc66280386a8fe905ce4dafd630c17e74b279d3d889f7ef51"
+classification = "route-identity-bound"
+evidence = "route identity signal 'model_id': route/provider/model/tokenizer binding"
+successor_scope = "bounded successor scope: consumer #783 owns case 783/5 (route-identity-bound); prove fit/error/receipt in the owning issue"
+invalidation = "row invalid when the source span digest, file sha, rule revision, or owner map changes; rerun sync"
+
+[[rows]]
+id = "c0015"
+case_ref = "783/6"
+owner = "#783"
+path = "crates/smart/eliot-context-assembly/src/measurement.rs"
+signal = "proves_fit"
+span_start = 86
+span_end = 86
+source_sha256 = "cf2286a992eaad13c9a37ca82b3ad55b3256fab8e3f65c4d6b236731e59fa1f9"
+span_digest = "4ada173fcfcf33b865a7cd5b839ae6f23c2691f2e65b6157aa4ef4c6fdcead3b"
+row_digest = "08465fda78a3eb085d0d7deaeb940cc9decc9fcce6334cfb371d8de6e5794129"
+classification = "capacity-fit-analysis"
+evidence = "capacity signal 'proves_fit': reserves/fit/headroom/error/receipt binding"
+successor_scope = "bounded successor scope: consumer #783 owns case 783/6 (capacity-fit-analysis); prove fit/error/receipt in the owning issue"
+invalidation = "row invalid when the source span digest, file sha, rule revision, or owner map changes; rerun sync"
+
+[[rows]]
+id = "c0016"
+case_ref = "783/7"
+owner = "#783"
+path = "crates/smart/eliot-context-assembly/src/measurement.rs"
+signal = "fixed_overhead"
+span_start = 71
+span_end = 71
+source_sha256 = "cf2286a992eaad13c9a37ca82b3ad55b3256fab8e3f65c4d6b236731e59fa1f9"
+span_digest = "96a1467e927cefbbd73f17887ce467411508142a2ccb17f5d58a383e66fbf567"
+row_digest = "9a1e09eefb4e3ba405c95293fddd20d5f5db5285523e75cba640309e0b158052"
+classification = "capacity-fit-analysis"
+evidence = "capacity signal 'fixed_overhead': reserves/fit/headroom/error/receipt binding"
+successor_scope = "bounded successor scope: consumer #783 owns case 783/7 (capacity-fit-analysis); prove fit/error/receipt in the owning issue"
+invalidation = "row invalid when the source span digest, file sha, rule revision, or owner map changes; rerun sync"
+
+[[rows]]
+id = "c0017"
+case_ref = "783/8"
+owner = "#783"
+path = "crates/smart/eliot-context-assembly/src/measurement.rs"
+signal = "ExactUtf8"
+span_start = 54
+span_end = 54
+source_sha256 = "cf2286a992eaad13c9a37ca82b3ad55b3256fab8e3f65c4d6b236731e59fa1f9"
+span_digest = "5bed2256c141a0920a70ce49cf7c10099b4e39e6df974ad1b2a747aac626ab5c"
+row_digest = "d079eddcc94821307f2298e2f7fa8578916b65b74d280bff68a51ff4035fa15b"
+classification = "exact-utf8-envelope"
+evidence = "exact envelope signal 'ExactUtf8': final UTF-8 bytes and digest binding"
+successor_scope = "bounded successor scope: consumer #783 owns case 783/8 (exact-utf8-envelope); prove fit/error/receipt in the owning issue"
+invalidation = "row invalid when the source span digest, file sha, rule revision, or owner map changes; rerun sync"
+
+[[rows]]
+id = "c0018"
+case_ref = "878/1"
+owner = "#878"
+path = "crates/smart/eliot-context-contracts/src/measurement.rs"
+signal = "serializer_id"
+span_start = 46
+span_end = 46
+source_sha256 = "28d92dda59a99b2a761620507ffec6d8f59c7ddfc09c7454fb576edb2c98b4be"
+span_digest = "760da60ccd73864d0711da2f46630a708f439a3c6fc36db58c9cd293d3bfd975"
+row_digest = "4ae7c8d8769028e139da04a736b27362b5526932dcb833e4ce943f9946571211"
+classification = "serializer-identity-bound"
+evidence = "serializer identity signal 'serializer_id': serializer/schema binding"
+successor_scope = "bounded successor scope: consumer #878 owns case 878/1 (serializer-identity-bound); prove fit/error/receipt in the owning issue"
+invalidation = "row invalid when the source span digest, file sha, rule revision, or owner map changes; rerun sync"
+
+[[rows]]
+id = "c0019"
+case_ref = "878/2"
+owner = "#878"
+path = "crates/smart/eliot-context-contracts/src/measurement.rs"
+signal = "serializer_options_digest"
+span_start = 48
+span_end = 48
+source_sha256 = "28d92dda59a99b2a761620507ffec6d8f59c7ddfc09c7454fb576edb2c98b4be"
+span_digest = "cec712fe0b26619e19279c47b762bcd262063d3a118aca6094bbe26266c28e21"
+row_digest = "296a75b054cda21aa15567e92042ea8ccead0c200a74f7df91938b5eb9df2e6f"
+classification = "serializer-identity-bound"
+evidence = "serializer identity signal 'serializer_options_digest': serializer/schema binding"
+successor_scope = "bounded successor scope: consumer #878 owns case 878/2 (serializer-identity-bound); prove fit/error/receipt in the owning issue"
+invalidation = "row invalid when the source span digest, file sha, rule revision, or owner map changes; rerun sync"
+
+[[rows]]
+id = "c0020"
+case_ref = "878/3"
+owner = "#878"
+path = "crates/smart/eliot-context-contracts/src/measurement.rs"
+signal = "schema_version"
+span_start = 44
+span_end = 44
+source_sha256 = "28d92dda59a99b2a761620507ffec6d8f59c7ddfc09c7454fb576edb2c98b4be"
+span_digest = "64b922bff6c5cb28892d77355ae331436ad5e2ac613ac0653505b6a8bc3a6132"
+row_digest = "65799f8edf47a5e87d8296c868980fa0e43a67b9ef50c2941b6790e6e599c5fa"
+classification = "serializer-identity-bound"
+evidence = "serializer identity signal 'schema_version': serializer/schema binding"
+successor_scope = "bounded successor scope: consumer #878 owns case 878/3 (serializer-identity-bound); prove fit/error/receipt in the owning issue"
+invalidation = "row invalid when the source span digest, file sha, rule revision, or owner map changes; rerun sync"
+
+[[rows]]
+id = "c0021"
+case_ref = "878/4"
+owner = "#878"
+path = "crates/smart/eliot-context-contracts/src/measurement.rs"
+signal = "StuEstimate"
+span_start = 23
+span_end = 23
+source_sha256 = "28d92dda59a99b2a761620507ffec6d8f59c7ddfc09c7454fb576edb2c98b4be"
+span_digest = "8e759a2ab8e44fa27242331c1f0e3391d1672dbd54916b21ed433cb85b262681"
+row_digest = "55c7143f81663492424e11caaa51051f179f5b54fc53d7acdba88c511b1a5199"
+classification = "normative-stu-estimate"
+evidence = "normative STU signal 'StuEstimate': ceil(bytes/3) estimate, never proves fit"
+successor_scope = "bounded successor scope: consumer #878 owns case 878/4 (normative-stu-estimate); prove fit/error/receipt in the owning issue"
+invalidation = "row invalid when the source span digest, file sha, rule revision, or owner map changes; rerun sync"
+
+[[rows]]
+id = "c0022"
+case_ref = "878/5"
+owner = "#878"
+path = "crates/smart/eliot-context-contracts/src/measurement.rs"
+signal = "TokenizerObservation"
+span_start = 31
+span_end = 31
+source_sha256 = "28d92dda59a99b2a761620507ffec6d8f59c7ddfc09c7454fb576edb2c98b4be"
+span_digest = "8ca052faa4fdd2a29123c50b0bca40428b2eeeed364f0a666efc711a8d5eb188"
+row_digest = "e19d9811f4ab6be67dbedf088fc9562b4ca19904f71b38a1893422ca8be886b8"
+classification = "exact-observation"
+evidence = "exact observation signal 'TokenizerObservation': actually-run route tokenizer count"
+successor_scope = "bounded successor scope: consumer #878 owns case 878/5 (exact-observation); prove fit/error/receipt in the owning issue"
+invalidation = "row invalid when the source span digest, file sha, rule revision, or owner map changes; rerun sync"
+
+[[rows]]
+id = "c0023"
+case_ref = "878/6"
+owner = "#878"
+path = "crates/smart/eliot-context-contracts/src/measurement.rs"
+signal = "utf8_bytes"
+span_start = 51
+span_end = 51
+source_sha256 = "28d92dda59a99b2a761620507ffec6d8f59c7ddfc09c7454fb576edb2c98b4be"
+span_digest = "342b62570dd312853cf48a161494482ba25a2d4a1cb347af8a467e77a47d6343"
+row_digest = "128acd09e3d64d3ab72f1896de0bcebb470f3c1e43f44f32812bc008c24f1358"
+classification = "exact-utf8-envelope"
+evidence = "exact envelope signal 'utf8_bytes': final UTF-8 bytes and digest binding"
+successor_scope = "bounded successor scope: consumer #878 owns case 878/6 (exact-utf8-envelope); prove fit/error/receipt in the owning issue"
+invalidation = "row invalid when the source span digest, file sha, rule revision, or owner map changes; rerun sync"
+
+[[rows]]
+id = "c0024"
+case_ref = "880/1"
+owner = "#880"
+path = "crates/smart/eliot-context-measurement/src/capacity.rs"
+signal = "fixed_overhead"
+span_start = 67
+span_end = 67
+source_sha256 = "331ac9d8e25ce11b04a423364c70b30c3c9ea8ad7baab6d9703c12a2d62441c0"
+span_digest = "445c4d7c0b203c379969b58eabeb34dbcdb05d2cf1bbb81285e3d822da8b2557"
+row_digest = "fcfdabe65669de97b7163930d693df90de8c1caf6a9d2c407208dbe87337aa1b"
+classification = "capacity-fit-analysis"
+evidence = "capacity signal 'fixed_overhead': reserves/fit/headroom/error/receipt binding"
+successor_scope = "bounded successor scope: consumer #880 owns case 880/1 (capacity-fit-analysis); prove fit/error/receipt in the owning issue"
+invalidation = "row invalid when the source span digest, file sha, rule revision, or owner map changes; rerun sync"
+
+[[rows]]
+id = "c0025"
+case_ref = "880/2"
+owner = "#880"
+path = "crates/smart/eliot-context-measurement/src/capacity.rs"
+signal = "headroom"
+span_start = 97
+span_end = 97
+source_sha256 = "331ac9d8e25ce11b04a423364c70b30c3c9ea8ad7baab6d9703c12a2d62441c0"
+span_digest = "69cabe436dbc02278b72f0cb257da9b3ad061888777144eb319c6a111c759377"
+row_digest = "22124ee65863df661d9b20a0179e5c218130b478c105d36efcbc6a94b20fc010"
+classification = "capacity-fit-analysis"
+evidence = "capacity signal 'headroom': reserves/fit/headroom/error/receipt binding"
+successor_scope = "bounded successor scope: consumer #880 owns case 880/2 (capacity-fit-analysis); prove fit/error/receipt in the owning issue"
+invalidation = "row invalid when the source span digest, file sha, rule revision, or owner map changes; rerun sync"
+
+[[rows]]
+id = "c0026"
+case_ref = "880/3"
+owner = "#880"
+path = "crates/smart/eliot-context-measurement/src/capacity.rs"
+signal = "observed_tokens"
+span_start = 139
+span_end = 139
+source_sha256 = "331ac9d8e25ce11b04a423364c70b30c3c9ea8ad7baab6d9703c12a2d62441c0"
+span_digest = "2c103f90061681e7ef71acc225486d808ea436a891c040b6350ab466076f77c6"
+row_digest = "c7aeddf4e2055ca3303630c038414666fab9c0d7054edb0dac0fc62761e9f061"
+classification = "exact-observation"
+evidence = "exact observation signal 'observed_tokens': actually-run route tokenizer count"
+successor_scope = "bounded successor scope: consumer #880 owns case 880/3 (exact-observation); prove fit/error/receipt in the owning issue"
+invalidation = "row invalid when the source span digest, file sha, rule revision, or owner map changes; rerun sync"
+
+[[rows]]
+id = "c0027"
+case_ref = "880/4"
+owner = "#880"
+path = "crates/smart/eliot-context-measurement/src/observation.rs"
+signal = "ProviderTokenizerRun"
+span_start = 82
+span_end = 82
+source_sha256 = "b9e8dfab46b19e8e83ad23ef4dc1922d73571df9531f7247aad40a22b8cd610a"
+span_digest = "d6182f2ba29c99ee0dc6618f86138998382b92fb73c8b804a809a74f57811428"
+row_digest = "ba2504f460619ba00a778fbd4c2095ac00afe6bd3977d4d9ebb4d9f990f3a9fa"
+classification = "exact-observation"
+evidence = "exact observation signal 'ProviderTokenizerRun': actually-run route tokenizer count"
+successor_scope = "bounded successor scope: consumer #880 owns case 880/4 (exact-observation); prove fit/error/receipt in the owning issue"
+invalidation = "row invalid when the source span digest, file sha, rule revision, or owner map changes; rerun sync"
+
+[[rows]]
+id = "c0028"
+case_ref = "880/5"
+owner = "#880"
+path = "crates/smart/eliot-context-measurement/src/observation.rs"
+signal = "Transformed"
+span_start = 31
+span_end = 31
+source_sha256 = "b9e8dfab46b19e8e83ad23ef4dc1922d73571df9531f7247aad40a22b8cd610a"
+span_digest = "ef8654bad0caa5457f1e99f92dae8bfbe213bc9ac209976aa262e429ae87cb65"
+row_digest = "bab01533cb60dd86213a8f2b97f4cf2982ef931117a5d7b6cabd35f9297573a4"
+classification = "transformed-observation"
+evidence = "transformed signal 'Transformed': provider rewrite evidence, no count comparison"
+successor_scope = "bounded successor scope: consumer #880 owns case 880/5 (transformed-observation); prove fit/error/receipt in the owning issue"
+invalidation = "row invalid when the source span digest, file sha, rule revision, or owner map changes; rerun sync"
+
+[[rows]]
+id = "c0029"
+case_ref = "880/6"
+owner = "#880"
+path = "crates/smart/eliot-context-measurement/src/observation.rs"
+signal = "Stale"
+span_start = 29
+span_end = 29
+source_sha256 = "b9e8dfab46b19e8e83ad23ef4dc1922d73571df9531f7247aad40a22b8cd610a"
+span_digest = "9ea9bf9583d1969c65eb5b61c992dfcc68bea4a965a03e21224b708c874c031f"
+row_digest = "f0edd52f0b8efe29d292c1633c9526b63c2f3494c13037e3477bc9462511075c"
+classification = "stale-or-absent-observation"
+evidence = "non-exact signal 'Stale': absent/unavailable/stale/unsupported/unknown, never zero"
+successor_scope = "bounded successor scope: consumer #880 owns case 880/6 (stale-or-absent-observation); prove fit/error/receipt in the owning issue"
+invalidation = "row invalid when the source span digest, file sha, rule revision, or owner map changes; rerun sync"
+
+[[rows]]
+id = "c0030"
+case_ref = "880/7"
+owner = "#880"
+path = "crates/smart/eliot-context-measurement/src/observation.rs"
+signal = "Absent"
+span_start = 20
+span_end = 20
+source_sha256 = "b9e8dfab46b19e8e83ad23ef4dc1922d73571df9531f7247aad40a22b8cd610a"
+span_digest = "3aaab08e5a8a99e8eaf195b482e0709f5c2400efbed6b432354db41a251478de"
+row_digest = "3ff3e3d2d61caec5f0f52b5f7e6a69727a51f923371eda4c63437ae3fd3f1876"
+classification = "stale-or-absent-observation"
+evidence = "non-exact signal 'Absent': absent/unavailable/stale/unsupported/unknown, never zero"
+successor_scope = "bounded successor scope: consumer #880 owns case 880/7 (stale-or-absent-observation); prove fit/error/receipt in the owning issue"
+invalidation = "row invalid when the source span digest, file sha, rule revision, or owner map changes; rerun sync"
+
+[[rows]]
+id = "c0031"
+case_ref = "880/8"
+owner = "#880"
+path = "crates/smart/eliot-context-measurement/tests/measurement.rs"
+signal = "#[test]"
+span_start = 75
+span_end = 75
+source_sha256 = "e61e9893f4dbabe2f382eb1b046010b8f01188582b89ee5a53386e676e84aaa5"
+span_digest = "adecf1064167614f0c568899948384b9601cf02bbb8b78bc5c17ca86fbfbb84a"
+row_digest = "f2ad97c97d6d71b91904302b77c9c584223a641791dafe6312c96da761ddfea0"
+classification = "test-only"
+evidence = "test marker (#[test]/cfg(test)) in scanned slice; no shipped measurement"
+successor_scope = "none-required"
+invalidation = "row invalid when the source span digest, file sha, rule revision, or owner map changes; rerun sync"
