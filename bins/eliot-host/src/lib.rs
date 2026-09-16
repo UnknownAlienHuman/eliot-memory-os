@@ -160,13 +160,13 @@ use eliot_contracts::{AuthorityEpoch, EpochContractError, EpochId, ResourceGener
 #[cfg(windows)]
 use eliot_contracts::{ClockReading, ProductId, RequestId, RequestMetadata, SourceId, StateFence};
 use eliot_host_state::{
-    ActivationState, AppendReceipt, DrainCommitRecord, DrainRecord, DrainState, EpochIdentity,
-    EpochLineageId, EpochTransition, HostInstallationEpoch, HostObservationRecord, HostState,
+    ActivationState, AppendReceipt, DrainRecord, DrainState, EpochIdentity, EpochLineageId,
+    EpochTransition, HostInstallationEpoch, HostObservationRecord, HostState,
     HostStateJournalService, HostStateRecord, IdempotencyIdentity, JournalBackend, JournalError,
     KernelJobBinding, KernelRecord, NonceState, OneTimeNonceState, PriorKernelDisposition,
     ProductionHostStateJournal, ReconcileOutcome, RecordFence, RecoveryLineageEvidence,
-    RedbJournalBackend, StoreRebindRecord, StoreRebindState, WakeDisposition,
-    host_owner_epoch_digest, record_checksum,
+    RedbJournalBackend, StoreRebindRecord, StoreRebindState, host_owner_epoch_digest,
+    record_checksum,
 };
 use eliot_installation::{
     ActivationCommitFence, ActivePhaseBRebindIntent, ActivePhaseBRebindReceipt,
@@ -3443,8 +3443,9 @@ use journal_append::{
 #[cfg(test)]
 use journal_append::{append_clean_marker, exact_termination_binding_matches};
 use journal_append::{
-    append_reconciled, clean_marker_record, initial_activation_record, pending_activation_binding,
-    terminated_prior_kernel, transition_activation_record,
+    append_reconciled, clean_marker_record, drain_commit_record_for_stop,
+    initial_activation_record, pending_activation_binding, terminated_prior_kernel,
+    transition_activation_record,
 };
 
 mod store_recovery_fence;
@@ -6654,26 +6655,23 @@ impl HostComposition {
                         self.transition_activation(ActivationState::Draining, "host-draining")?;
                     }
                     if self.journal.snapshot()?.drain_commit.is_none() {
-                        self.append_record(HostStateRecord::DrainCommit(DrainCommitRecord {
-                            fence: activation.fence.clone(),
-                            operation: operation("host-drain-commit")?,
-                            drain_generation,
-                            last_admission_closed_at: fresh_identity("host-admission-closed-at")?,
-                            lease_and_pending_operation_snapshot: Vec::new(),
-                            authority_epochs_fenced: vec![activation.lineage.kernel_epoch.clone()],
-                            processes_modules_and_store_branches_to_stop: vec![
-                                PlatformHandle::new("canonical-store-branch")
-                                    .map_err(|error| HostError::Platform(error.to_string()))?,
-                                PlatformHandle::new("kernel-branch")
-                                    .map_err(|error| HostError::Platform(error.to_string()))?,
-                            ],
-                            wake_during_drain_disposition: WakeDisposition::QueueNextGeneration,
-                            irreversible_stage: PlatformHandle::new("authority-fenced")
-                                .map_err(|error| HostError::Platform(error.to_string()))?,
-                            recovery_owner: PlatformHandle::new("host-composition")
-                                .map_err(|error| HostError::Platform(error.to_string()))?,
-                            committed_at: fresh_identity("host-drain-committed-at")?,
-                        }))?;
+                        // I14.23/I1.5: the commit carries the exact Kernel
+                        // lease/receipt snapshot observed in the journal, so
+                        // recovery can prove which authority was fenced. The
+                        // snapshot rule is owned by the journal helper; an
+                        // empty snapshot is admitted only when the journal
+                        // proves nothing remains to fence.
+                        let snapshot = self.journal.snapshot()?;
+                        let commit = drain_commit_record_for_stop(
+                            &snapshot,
+                            &activation,
+                            &drain_generation,
+                        )?;
+                        // F-LOG-HOST-1: drain commit is distinct from
+                        // Requested/Draining; one drain_generation
+                        // correlation.
+                        host_lifecycle_observe_drain("host.drain commit");
+                        self.append_record(HostStateRecord::DrainCommit(commit))?;
                     }
                 }
                 ActivationState::Draining if state.drain_commit.is_some() => {}

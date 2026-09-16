@@ -4,11 +4,11 @@ pub(super) use readiness_append::append_authenticated_kernel_readiness;
 
 use super::{HostError, fresh_identity, fresh_lineage_id, operation, record_fence, sha256_json};
 use eliot_host_state::{
-    ActivationState, AppendReceipt, CleanMarker, EliotActivationRecord, EpochTransition,
-    HostInstallationEpoch, HostKernelStoreLineage, HostState, HostStateJournalService,
-    HostStateRecord, JOURNAL_VERSION, JournalBackend, JournalError, JournalManifest,
-    KernelJobBinding, KernelRecord, LifecycleTimestamps, PriorKernelDisposition, PriorKernelSource,
-    ReadinessEvidence, ReconcileOutcome,
+    ActivationState, AppendReceipt, CleanMarker, DrainCommitRecord, EliotActivationRecord,
+    EpochTransition, HostInstallationEpoch, HostKernelStoreLineage, HostState,
+    HostStateJournalService, HostStateRecord, JOURNAL_VERSION, JournalBackend, JournalError,
+    JournalManifest, KernelJobBinding, KernelRecord, LifecycleTimestamps, PriorKernelDisposition,
+    PriorKernelSource, ReadinessEvidence, ReconcileOutcome, WakeDisposition,
 };
 #[cfg(windows)]
 use eliot_host_state::{StoreRebindRecord, StoreRebindState};
@@ -414,6 +414,68 @@ pub(super) fn persist_store_rebind_disposition<B: JournalBackend>(
     append_reconciled(journal, HostStateRecord::StoreRebind(terminal))?;
     host_journal_observe("host.journal rebind disposition appended");
     Ok(())
+}
+
+/// Builds the I1.5 `DrainCommit` linearization record for Host stop,
+/// carrying the Kernel lease/receipt snapshot observed in the journal into
+/// `lease_and_pending_operation_snapshot`.
+///
+/// The snapshot is the exact live authority Host must fence before stopping:
+/// the activation's runtime and supervision lease refs, the latest readiness
+/// observation's predecessor lease identity and ORS receipt, and every
+/// non-terminal store-rebind operation. An empty snapshot is honest only
+/// when the journal proves no lease or pending operation remains; callers
+/// must not substitute a placeholder. The `drain_generation` correlation
+/// binds this commit to the `Requested`/`Draining` records that precede it.
+pub(super) fn drain_commit_record_for_stop(
+    snapshot: &HostState,
+    activation: &EliotActivationRecord,
+    drain_generation: &EpochTransition,
+) -> Result<DrainCommitRecord, HostError> {
+    let mut lease_and_pending: Vec<PlatformHandle> = Vec::new();
+    lease_and_pending.extend(activation.runtime_lease_refs.iter().cloned());
+    lease_and_pending.extend(activation.supervision_lease_refs.iter().cloned());
+    if let Some(readiness) = snapshot.readiness_observations.last()
+        && let Some(predecessor) = readiness.active_supervision_lease.as_ref()
+    {
+        lease_and_pending.push(
+            PlatformHandle::new(predecessor.supervision_lease_id.clone())
+                .map_err(|error| HostError::Platform(error.to_string()))?,
+        );
+        lease_and_pending.push(
+            PlatformHandle::new(predecessor.ors_receipt_sha256.clone())
+                .map_err(|error| HostError::Platform(error.to_string()))?,
+        );
+    }
+    for rebind in snapshot.store_rebinds.iter().filter(|record| {
+        matches!(
+            record.state,
+            eliot_host_state::StoreRebindState::Pending
+                | eliot_host_state::StoreRebindState::Unknown
+        )
+    }) {
+        lease_and_pending.push(rebind.operation_id.clone());
+    }
+    Ok(DrainCommitRecord {
+        fence: activation.fence.clone(),
+        operation: operation("host-drain-commit")?,
+        drain_generation: drain_generation.clone(),
+        last_admission_closed_at: fresh_identity("host-admission-closed-at")?,
+        lease_and_pending_operation_snapshot: lease_and_pending,
+        authority_epochs_fenced: vec![activation.lineage.kernel_epoch.clone()],
+        processes_modules_and_store_branches_to_stop: vec![
+            PlatformHandle::new("canonical-store-branch")
+                .map_err(|error| HostError::Platform(error.to_string()))?,
+            PlatformHandle::new("kernel-branch")
+                .map_err(|error| HostError::Platform(error.to_string()))?,
+        ],
+        wake_during_drain_disposition: WakeDisposition::QueueNextGeneration,
+        irreversible_stage: PlatformHandle::new("authority-fenced")
+            .map_err(|error| HostError::Platform(error.to_string()))?,
+        recovery_owner: PlatformHandle::new("host-composition")
+            .map_err(|error| HostError::Platform(error.to_string()))?,
+        committed_at: fresh_identity("host-drain-committed-at")?,
+    })
 }
 
 pub(super) fn clean_marker_record(

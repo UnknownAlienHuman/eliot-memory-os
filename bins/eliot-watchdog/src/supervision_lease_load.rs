@@ -56,6 +56,12 @@ fn read_journaled_current_supervision(
         .ok_or_else(|| SpoolError::LeaseFenced("Host journal is missing".to_owned()))?;
     let state = eliot_host_state::readonly_project_host_state(&inspection.image)
         .map_err(|error| SpoolError::LeaseFenced(format!("Host journal replay failed: {error}")))?;
+    // I14.23 safe shutdown is observed before any lease is trusted: a
+    // committed drain fences pre-drain leases until a fresh activation
+    // generation supersedes it, and an unlinearized drain is an explicit
+    // incomplete-shutdown state whose pending work must be retained, never
+    // silently revived through a stale lease.
+    check_shutdown_drain_fence(&state)?;
     let kernel = state
         .kernel
         .as_ref()
@@ -102,6 +108,71 @@ fn read_journaled_current_supervision(
         ));
     }
     Ok(reconstructed)
+}
+
+/// Fail-closed marker for an observed intentional shutdown: the Host journal
+/// carries a linearized `DrainCommit` for the current activation generation,
+/// so every pre-drain lease is stale until a fresh generation supersedes it.
+pub(crate) const INTENTIONAL_SHUTDOWN_FENCE_MARKER: &str = "intentional-shutdown";
+
+/// Fail-closed marker for an observed incomplete shutdown: the Host journal
+/// carries an unlinearized drain (deadline expiry with pending work
+/// retained), so no stale lease is admitted while recovery is outstanding.
+pub(crate) const INCOMPLETE_SHUTDOWN_FENCE_MARKER: &str = "incomplete-shutdown";
+
+/// Observes the I14.23 shutdown state in the projected Host journal and
+/// fences stale leases without minting authority or selecting an owner.
+///
+/// A `DrainCommit` bound to the current activation generation is the
+/// post-linearization state: pre-drain leases cannot revive shutdown and a
+/// fresh activation generation is required. When the activation already moved
+/// to a fresh generation the committed drain is superseded and verification
+/// proceeds against the current generation. An unlinearized `Draining`
+/// activation is the incomplete-shutdown recovery state: pending work is
+/// retained in the journal and stale leases stay fenced.
+pub(crate) fn check_shutdown_drain_fence(
+    state: &eliot_host_state::HostState,
+) -> Result<(), SpoolError> {
+    if let Some(commit) = state.drain_commit.as_ref() {
+        let superseded = state.activation.as_ref().is_some_and(|activation| {
+            activation.fence.activation_generation != commit.drain_generation
+        });
+        if superseded {
+            return Ok(());
+        }
+        return Err(SpoolError::LeaseFenced(format!(
+            "{INTENTIONAL_SHUTDOWN_FENCE_MARKER}: drain committed; \
+             pre-drain leases fenced until a fresh activation generation"
+        )));
+    }
+    if state.drain.as_ref().is_some_and(|drain| {
+        matches!(
+            drain.state,
+            eliot_host_state::DrainState::Requested | eliot_host_state::DrainState::Draining
+        )
+    }) && state
+        .activation
+        .as_ref()
+        .is_some_and(|activation| activation.state == eliot_host_state::ActivationState::Draining)
+    {
+        return Err(SpoolError::LeaseFenced(format!(
+            "{INCOMPLETE_SHUTDOWN_FENCE_MARKER}: unlinearized drain; \
+             pending work retained, no stale lease admitted"
+        )));
+    }
+    Ok(())
+}
+
+/// Reports whether a lease-load failure is the observed intentional-shutdown
+/// fence. Thin classification over the existing `LeaseFenced` control path.
+pub(crate) fn is_intentional_shutdown_fence(error: &SpoolError) -> bool {
+    matches!(error, SpoolError::LeaseFenced(reason) if reason.contains(INTENTIONAL_SHUTDOWN_FENCE_MARKER))
+}
+
+/// Reports whether a lease-load failure is the observed incomplete-shutdown
+/// fence. Thin classification over the existing `LeaseFenced` control path.
+pub(crate) fn is_incomplete_shutdown_fence(error: &SpoolError) -> bool {
+    matches!(error, SpoolError::LeaseFenced(reason) if reason.contains(INCOMPLETE_SHUTDOWN_FENCE_MARKER))
 }
 
 #[allow(

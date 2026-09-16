@@ -4,7 +4,8 @@ mod journal_termination_tests;
 
 use super::*;
 use eliot_host_state::{
-    BackendError, BackendReconcileState, DurableImage, FaultPoint, MemoryBackend, PreparedAppend,
+    BackendError, BackendReconcileState, DrainCommitRecord, DurableImage, FaultPoint,
+    MemoryBackend, PreparedAppend, WakeDisposition,
 };
 #[cfg(windows)]
 use eliot_installation::{InstallationEpoch, RuntimeStateRoots};
