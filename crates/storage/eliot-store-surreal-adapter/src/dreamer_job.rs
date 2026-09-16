@@ -12,15 +12,22 @@
 //! client, table, or semantic decoder: physical namespace, key layout and
 //! `SurrealQL` stay private to this module plus [`crate::schema`].
 //!
-//! Scope (T12-02 S1, working provider edge): `Submit`, `LeaseExact` and
-//! `Status` are durably implemented with compare-and-swap lease exclusion and
-//! exact-replay vs changed-content discrimination. All other K0 operations
-//! return [`StoreError::UnknownOperation`] (explicitly unadvertised; deferred,
-//! not defaulted). No in-memory stand-in: persistence is proven by reopening
-//! the adapter over the same `SurrealKV` files, and lease exclusion by two
+//! Scope (B-DRM-S1 #775, full ledger edge): all twelve K0 operations are
+//! durably implemented with compare-and-swap exclusion and exact-replay vs
+//! changed-content discrimination. Every mutation commits record, monotonic
+//! event, unique operation-idempotency evidence and immutable receipt rows in
+//! one provider transaction. No in-memory stand-in: persistence is proven by
+//! reopening the adapter over the same `SurrealKV` files, and exclusion by
 //! concurrent callers racing one expected revision in real provider
 //! transactions. The adapter-wide `write_lock` is deliberately *not* taken
 //! here so the CAS outcome is decided by the database, not by a process mutex.
+//!
+//! Corrected lifecycle (I14.20):
+//! `NOT_STARTED → QUEUED → LEASED → RUNNING ↔ CHECKPOINTED → VERIFYING →`
+//! terminal (`COMPLETED | PARTIAL | FAILED | CANCELLED | UNKNOWN_OUTCOME`).
+//! Cancellation-requested is recorded evidence, never a job state; a
+//! result-under-verification is never a terminal outcome; a committed semantic
+//! `UNKNOWN_OUTCOME` is independent from Store commit uncertainty.
 
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -31,13 +38,14 @@ use crate::client;
 use crate::error::AdapterError;
 use crate::schema;
 use eliot_protocol::dreamer_job::{
-    DurableJobRecord, DurableJobRequest, DurableJobResponse, JobLease, JobOperation, JobState,
-    MutationDisposition,
+    DurableJobRecord, DurableJobRequest, DurableJobResponse, JobLease, JobOperation, JobRole,
+    JobState, LeaseSelector, MutationDisposition,
 };
 use eliot_store_api::{
-    DreamerJobLedgerEvent, DreamerJobLedgerRecord, DreamerJobMutationIdentity, OperationId,
-    RecoveryRecord, RecoveryRecordKey, RequestMeta, StateFence, StoreError, canonical_json_bytes,
-    dreamer_job_queue_key, map_durable_error, sha256_hex, validate_ledger_bundle,
+    DreamerJobLedgerEvent, DreamerJobLedgerRecord, DreamerJobMutationIdentity,
+    MAX_DREAMER_JOB_HISTORY, OperationId, RecoveryRecord, RecoveryRecordKey, RequestMeta,
+    StateFence, StoreError, canonical_json_bytes, dreamer_job_queue_key, map_durable_error,
+    sha256_hex, validate_ledger_bundle,
 };
 
 /// Outer CAS generation for the first Dreamer mutation of a job.
@@ -273,10 +281,10 @@ pub(crate) async fn dreamer_job(
     if ctx.state_fence != request.request_identity.operation.state_fence {
         return Err(AdapterError::Store(StoreError::FenceMismatch));
     }
-    // Deliberately no `write_lock`: lease exclusion is decided by provider
+    // Deliberately no `write_lock`: exclusion is decided by provider
     // CAS inside one transaction, so concurrent callers genuinely race.
-    // Unsupported K0 operations fail here as explicitly unadvertised
-    // (`UnknownOperation`); they are deferred, never defaulted.
+    // The closed denominator stays the single advertisement gate even though
+    // the dispatch below is exhaustive: an unadvertised kind fails here.
     if !is_supported_operation(&request.operation) {
         return Err(AdapterError::Store(StoreError::UnknownOperation));
     }
@@ -284,9 +292,19 @@ pub(crate) async fn dreamer_job(
     crate::apply::ensure_ready(adapter, db).await?;
     match &request.operation {
         JobOperation::Submit { .. } => submit(adapter, db, ctx, request).await,
+        JobOperation::LeaseNext { .. } => op_lease_next(adapter, db, ctx, request).await,
         JobOperation::LeaseExact { .. } => lease_exact(adapter, db, ctx, request).await,
+        JobOperation::Renew { .. } => op_renew(adapter, db, ctx, request).await,
+        JobOperation::Start { .. } => op_start(adapter, db, ctx, request).await,
+        JobOperation::Checkpoint { .. } => op_checkpoint(adapter, db, ctx, request).await,
+        JobOperation::Resume { .. } => op_resume(adapter, db, ctx, request).await,
+        JobOperation::BeginVerification { .. } => {
+            op_begin_verification(adapter, db, ctx, request).await
+        }
+        JobOperation::Publish { .. } => op_publish(adapter, db, ctx, request).await,
         JobOperation::Status { .. } => status(db, &adapter.config, ctx, request).await,
-        _ => Err(AdapterError::Store(StoreError::UnknownOperation)),
+        JobOperation::RequestCancel { .. } => op_request_cancel(adapter, db, ctx, request).await,
+        JobOperation::Reconcile { .. } => op_reconcile(adapter, db, ctx, request).await,
     }
 }
 
@@ -785,6 +803,604 @@ async fn status(
     Ok(response)
 }
 
+/// Maximum `LeaseNext` candidates observed in one selection page. It equals
+/// the ledger history bound so one page can never overflow the record.
+const MAX_LEASE_CANDIDATES: usize = MAX_DREAMER_JOB_HISTORY;
+/// Bounded Dreamer namespace scan backing deterministic selection.
+const JOB_SCAN_LIMIT: usize = 256;
+// The scan SQL carries this bound as an inline literal; the assertion keeps
+// the two in lockstep.
+const _: () = assert!(JOB_SCAN_LIMIT == 256);
+
+/// Resolves one operation-idempotency row: exact hash/kind replay returns the
+/// original outcome with fresh correlation swapped in, changed content under
+/// the same identity conflicts, and absence yields `Ok(None)`.
+async fn replay_or_conflict(
+    db: &client::RpcTransport,
+    config: &crate::config::SurrealAdapterConfig,
+    op_key: &str,
+    request: &DurableJobRequest,
+) -> Result<Option<DurableJobResponse>, AdapterError> {
+    let Some(existing) = read_dreamer_row(db, config, op_key).await? else {
+        return Ok(None);
+    };
+    let stored = decode_stored_mutation(&existing)?;
+    if stored.canonical_request_hash == request.request_identity.canonical_request_hash
+        && stored.operation_kind == request.operation.kind().as_str()
+    {
+        let mut replayed = stored.response;
+        replayed.request_identity = request.request_identity.clone();
+        replayed
+            .validate_for(request)
+            .map_err(map_durable_error)
+            .map_err(AdapterError::Store)?;
+        return Ok(Some(replayed));
+    }
+    Err(AdapterError::Store(StoreError::IdentityConflict))
+}
+
+/// Loads and validates one job ledger by job/attempt identity; `Ok(None)`
+/// when absent. Malformed provider rows fail closed, never repaired.
+async fn load_ledger(
+    db: &client::RpcTransport,
+    config: &crate::config::SurrealAdapterConfig,
+    job_id: &str,
+    attempt_id: &str,
+) -> Result<Option<(String, RecoveryRecord, DreamerJobLedgerRecord)>, AdapterError> {
+    let row_key = dreamer_job_row_key(job_id, attempt_id);
+    let Some(job_row) = read_dreamer_row(db, config, &row_key).await? else {
+        return Ok(None);
+    };
+    if job_row.schema != schema::dreamer::SCHEMA_LEDGER_RECORD {
+        return Err(AdapterError::Store(StoreError::InvalidField {
+            field: "dreamer_job.schema",
+            reason: "job row carries an unexpected schema",
+        }));
+    }
+    let ledger = decode_ledger_record(&job_row)?;
+    ledger.validate().map_err(AdapterError::Store)?;
+    if ledger.record.submission.job_id.as_str() != job_id
+        || ledger.record.submission.attempt_id.as_str() != attempt_id
+    {
+        return Err(AdapterError::Store(StoreError::IdentityConflict));
+    }
+    Ok(Some((row_key, job_row, ledger)))
+}
+
+/// Scans the versioned Dreamer namespace in deterministic key order,
+/// returning every valid job ledger. Malformed rows fail the scan closed.
+async fn scan_ledgers(
+    db: &client::RpcTransport,
+    config: &crate::config::SurrealAdapterConfig,
+) -> Result<Vec<(String, RecoveryRecord, DreamerJobLedgerRecord)>, AdapterError> {
+    let mut bindings = serde_json::Map::new();
+    bindings.insert(
+        "dreamer_namespace".to_owned(),
+        serde_json::Value::String(schema::dreamer::NAMESPACE.to_owned()),
+    );
+    // Bounded scan ordered by key; filtering to the exact job happens in Rust
+    // below so no substring match lives in the query string. The limit is an
+    // inline literal (never a bound parameter) for the pinned provider.
+    let sql = "SELECT VALUE { namespace: namespace, key: key, state_fence: state_fence, revision: revision, schema: schema, payload: payload, value_digest: value_digest } FROM recovery_job WHERE namespace = $dreamer_namespace ORDER BY key LIMIT 256;";
+    let mut response = client::query(db, config, "dreamer.scan_jobs", sql, bindings).await?;
+    if !response.take_errors().is_empty() {
+        return Err(AdapterError::PartialOutcome);
+    }
+    let rows: Vec<RecoveryRecord> = response.take(0)?;
+    let mut ledgers = Vec::new();
+    for row in rows {
+        row.validate().map_err(AdapterError::Store)?;
+        if row.namespace != schema::dreamer::NAMESPACE {
+            continue;
+        }
+        if !row.key.starts_with(schema::dreamer::KEY_JOB_PREFIX) {
+            continue;
+        }
+        if row.schema != schema::dreamer::SCHEMA_LEDGER_RECORD {
+            return Err(AdapterError::Store(StoreError::InvalidField {
+                field: "dreamer_job.schema",
+                reason: "job row carries an unexpected schema",
+            }));
+        }
+        let ledger = decode_ledger_record(&row)?;
+        ledger.validate().map_err(AdapterError::Store)?;
+        ledgers.push((row.key.clone(), row, ledger));
+    }
+    Ok(ledgers)
+}
+
+/// Requires the presented lease to be the exact active owner. A superseded,
+/// revoked, foreign, or absent lease is deterministic not-applied, never a
+/// revival. Lease-window validity itself is enforced by K0 against the
+/// server-issued window, not by a caller-chosen clock.
+fn require_active_lease(
+    ledger: &DreamerJobLedgerRecord,
+    lease: &JobLease,
+) -> Result<(), AdapterError> {
+    match &ledger.active_lease {
+        Some(active) if active == lease => Ok(()),
+        _ => Err(AdapterError::Store(StoreError::RevisionConflict)),
+    }
+}
+
+/// Issues one deterministic lease binding for an operation identity: the lease
+/// value derives from the operation id so an owner retry replays the identical
+/// lease, while issuance/owner evidence comes from the admitted selector and
+/// the provider-observed clock.
+fn issue_lease(
+    operation_id: &str,
+    ledger: &DreamerJobLedgerRecord,
+    selector: &LeaseSelector,
+) -> Result<JobLease, AdapterError> {
+    let lease_value = format!("dreamer-{}", &sha256_hex(operation_id.as_bytes())[..40]);
+    let issued = now_unix_ms();
+    serde_json::from_value(serde_json::json!({
+        "job_id": ledger.record.submission.job_id,
+        "attempt_id": ledger.record.submission.attempt_id,
+        "lease_id": {
+            "namespace": "eliot.governor.work-lease",
+            "revision": "v1",
+            "value": lease_value,
+        },
+        "owner_artifact_id": selector.worker_artifact_id,
+        "resource_generation": ledger.record.submission.work_scope.resource_generation,
+        "state_fence": ledger.record.submission.work_scope.state_fence,
+        "issued_at_unix_ms": issued,
+        "expires_at_unix_ms": issued.saturating_add(LEASE_TTL_MS).max(issued + 1),
+        "revision": FIRST_OUTER_REVISION,
+    }))
+    .map_err(|error| AdapterError::Serialization(error.to_string()))
+}
+
+/// Commits one validated ledger mutation: the job row swaps via outer-revision
+/// CAS while its event, operation-idempotency and receipt rows create in the
+/// same provider transaction. A CAS loser re-reads to classify exact replay
+/// versus stale conflict; any other provider error stays unknown-outcome.
+#[allow(clippy::too_many_arguments)]
+async fn commit_ledger_mutation(
+    db: &client::RpcTransport,
+    config: &crate::config::SurrealAdapterConfig,
+    request: &DurableJobRequest,
+    row_key: &str,
+    expected_outer: u64,
+    ledger: &DreamerJobLedgerRecord,
+    event: &DreamerJobLedgerEvent,
+    response: DurableJobResponse,
+) -> Result<DurableJobResponse, AdapterError> {
+    validate_ledger_bundle(request, &response, ledger, event).map_err(AdapterError::Store)?;
+    let operation_id = request.request_identity.operation.operation_id.to_string();
+    let op_key = dreamer_operation_row_key(&operation_id);
+    let stored = StoredMutation {
+        operation_id: operation_id.clone(),
+        idempotency_key: request.request_identity.operation.idempotency_key.clone(),
+        canonical_request_hash: request.request_identity.canonical_request_hash.clone(),
+        operation_kind: request.operation.kind().as_str().to_owned(),
+        response: response.clone(),
+    };
+    let receipt_id = response
+        .receipt_id
+        .clone()
+        .ok_or(AdapterError::Store(StoreError::InvalidReceipt))?;
+    let receipt_row = StoredReceipt {
+        operation_id: operation_id.clone(),
+        receipt_id: receipt_id.to_string(),
+        job_id: ledger.record.submission.job_id.to_string(),
+        attempt_id: ledger.record.submission.attempt_id.to_string(),
+        revision: response.revision,
+    };
+    let fence = ledger.record.submission.work_scope.state_fence.clone();
+    let new_outer = expected_outer.saturating_add(1);
+    let cursor = ledger.event_cursor;
+    let (job_payload, _) = encode_canonical(ledger)?;
+    let (event_payload, _) = encode_canonical(event)?;
+    let (op_payload, _) = encode_canonical(&stored)?;
+    let (receipt_payload, _) = encode_canonical(&receipt_row)?;
+    let new_job_row = build_recovery_row(
+        row_key.to_owned(),
+        &fence,
+        new_outer,
+        schema::dreamer::SCHEMA_LEDGER_RECORD,
+        job_payload,
+    )?;
+    let event_row = build_recovery_row(
+        dreamer_event_row_key(
+            &ledger.record.submission.job_id.to_string(),
+            &ledger.record.submission.attempt_id.to_string(),
+            cursor,
+        ),
+        &fence,
+        cursor,
+        schema::dreamer::SCHEMA_LEDGER_EVENT,
+        event_payload,
+    )?;
+    let op_row = build_recovery_row(
+        op_key.clone(),
+        &fence,
+        cursor,
+        schema::dreamer::SCHEMA_MUTATION,
+        op_payload,
+    )?;
+    let receipt_record = build_recovery_row(
+        dreamer_receipt_row_key(&operation_id),
+        &fence,
+        cursor,
+        schema::dreamer::SCHEMA_RECEIPT,
+        receipt_payload,
+    )?;
+    match cas_job_plus_three(
+        db,
+        config,
+        &operation_id,
+        &new_job_row,
+        row_key,
+        expected_outer,
+        &fence,
+        [&event_row, &op_row, &receipt_record],
+    )
+    .await
+    {
+        Ok(()) => Ok(response),
+        Err(AdapterError::ProviderConflict) => {
+            match replay_or_conflict(db, config, &op_key, request).await? {
+                Some(replayed) => Ok(replayed),
+                None => Err(AdapterError::Store(StoreError::RevisionConflict)),
+            }
+        }
+        Err(error) => Err(error),
+    }
+}
+
+/// Advances one ledger cursor for a new mutation, returning the cursor.
+fn advance_cursor(ledger: &mut DreamerJobLedgerRecord) -> u64 {
+    ledger.event_cursor = ledger.event_cursor.saturating_add(1).max(1);
+    ledger.event_cursor
+}
+
+#[allow(clippy::too_many_lines)]
+async fn op_lease_next(
+    adapter: &SurrealStoreAdapter,
+    db: &client::RpcTransport,
+    _ctx: &RequestMeta,
+    request: DurableJobRequest,
+) -> Result<DurableJobResponse, AdapterError> {
+    let JobOperation::LeaseNext { selector } = &request.operation else {
+        return Err(AdapterError::Store(StoreError::UnknownOperation));
+    };
+    if request.role != JobRole::Worker {
+        return Err(AdapterError::Store(StoreError::UnknownOperation));
+    }
+    if usize::try_from(selector.max_candidates).unwrap_or(usize::MAX) > MAX_LEASE_CANDIDATES {
+        return Err(AdapterError::Store(StoreError::PayloadTooLarge));
+    }
+    let operation_id = request.request_identity.operation.operation_id.to_string();
+    let op_key = dreamer_operation_row_key(&operation_id);
+    if let Some(replayed) = replay_or_conflict(db, &adapter.config, &op_key, &request).await? {
+        return Ok(replayed);
+    }
+    let ledgers = scan_ledgers(db, &adapter.config).await?;
+    let mut scoped: Vec<&(String, RecoveryRecord, DreamerJobLedgerRecord)> = ledgers
+        .iter()
+        .filter(|(_, _, ledger)| {
+            ledger.record.submission.work_scope.scope_id == selector.scope_id
+                && ledger.record.submission.work_scope.state_fence == selector.expected_fence
+        })
+        .collect();
+    scoped.sort_by(|left, right| left.0.cmp(&right.0));
+    if scoped.is_empty() {
+        // Complete-empty selection is distinct from stale, partial, and
+        // unavailable: no candidate exists in this scope and fence.
+        return Err(AdapterError::Store(StoreError::Empty {
+            field: "dreamer_job.selection",
+        }));
+    }
+    // Coverage names the bounded selectable set (queued jobs in deterministic
+    // key order), so the leased job below is always covered as K0 requires.
+    let mut eligible: Vec<&(String, RecoveryRecord, DreamerJobLedgerRecord)> = scoped
+        .iter()
+        .filter(|(_, _, ledger)| ledger.record.state == JobState::Queued)
+        .copied()
+        .collect();
+    eligible.sort_by(|left, right| left.0.cmp(&right.0));
+    let coverage: Vec<String> = eligible
+        .iter()
+        .take(usize::try_from(selector.max_candidates).unwrap_or(usize::MAX))
+        .map(|(_, _, ledger)| ledger.record.submission.job_id.to_string())
+        .collect();
+    let Some((row_key, job_row, mut ledger)) = eligible
+        .iter()
+        .find(|(_, _, ledger)| {
+            ledger.record.revision == selector.expected_revision
+                && ledger.active_lease.is_none()
+                && ledger.record.lease.is_none()
+        })
+        .map(|(row_key, job_row, ledger)| (row_key.clone(), job_row.clone(), ledger.clone()))
+    else {
+        // Candidates exist but none is leasable at the expected revision:
+        // exhausted or stale, deterministically not-applied.
+        return Err(AdapterError::Store(StoreError::RevisionConflict));
+    };
+    let expected_outer = job_row.revision;
+    let lease = issue_lease(&operation_id, &ledger, selector)?;
+    let response = DurableJobResponse {
+        request_identity: request.request_identity.clone(),
+        job_id: ledger.record.submission.job_id.clone(),
+        attempt_id: ledger.record.submission.attempt_id.clone(),
+        scope: ledger.record.submission.work_scope.clone(),
+        revision: selector.expected_revision,
+        state: JobState::Leased,
+        disposition: Some(MutationDisposition::Committed),
+        receipt_id: Some(validated_id(receipt_id_text(
+            &request.request_identity.operation.operation_id,
+        ))?),
+        lease: Some(lease.clone()),
+        checkpoint: None,
+        result_under_verification: None,
+        outcome: None,
+        selection_coverage: coverage,
+        selection_frontier: Some(ledger.queue_key.clone()),
+    };
+    response
+        .validate_for(&request)
+        .map_err(map_durable_error)
+        .map_err(AdapterError::Store)?;
+    let receipt_id = response
+        .receipt_id
+        .clone()
+        .ok_or(AdapterError::Store(StoreError::InvalidReceipt))?;
+    ledger.record.state = JobState::Leased;
+    ledger.record.lease = Some(lease.clone());
+    advance_cursor(&mut ledger);
+    ledger.active_lease = Some(lease.clone());
+    ledger.last_mutation = mutation_identity(&request);
+    ledger.last_receipt_id = Some(receipt_id.clone());
+    ledger.record_digest = ledger.compute_digest().map_err(AdapterError::Store)?;
+    ledger.validate().map_err(AdapterError::Store)?;
+    let cursor = ledger.event_cursor;
+    let mut event = DreamerJobLedgerEvent {
+        job_id: ledger.record.submission.job_id.clone(),
+        attempt_id: ledger.record.submission.attempt_id.clone(),
+        prior_state: JobState::Queued,
+        next_state: JobState::Leased,
+        prior_revision: selector.expected_revision,
+        next_revision: selector.expected_revision,
+        event_cursor: cursor,
+        operation: request.operation.clone(),
+        role: request.role,
+        lease: Some(lease),
+        checkpoint: None,
+        result_under_verification: None,
+        mutation: mutation_identity(&request),
+        receipt_id: Some(receipt_id),
+        event_digest: "0".repeat(64),
+    };
+    event.event_digest = event.compute_digest().map_err(AdapterError::Store)?;
+    event.validate().map_err(AdapterError::Store)?;
+    commit_ledger_mutation(
+        db,
+        &adapter.config,
+        &request,
+        &row_key,
+        expected_outer,
+        &ledger,
+        &event,
+        response,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_lines)]
+async fn op_renew(
+    adapter: &SurrealStoreAdapter,
+    db: &client::RpcTransport,
+    _ctx: &RequestMeta,
+    request: DurableJobRequest,
+) -> Result<DurableJobResponse, AdapterError> {
+    let JobOperation::Renew { lease, now_unix_ms } = &request.operation else {
+        return Err(AdapterError::Store(StoreError::UnknownOperation));
+    };
+    if request.role != JobRole::Worker {
+        return Err(AdapterError::Store(StoreError::UnknownOperation));
+    }
+    let operation_id = request.request_identity.operation.operation_id.to_string();
+    let op_key = dreamer_operation_row_key(&operation_id);
+    if let Some(replayed) = replay_or_conflict(db, &adapter.config, &op_key, &request).await? {
+        return Ok(replayed);
+    }
+    let Some((row_key, job_row, mut ledger)) = load_ledger(
+        db,
+        &adapter.config,
+        &lease.job_id.to_string(),
+        &lease.attempt_id.to_string(),
+    )
+    .await?
+    else {
+        return Err(AdapterError::Store(StoreError::RevisionConflict));
+    };
+    if lease.state_fence != ledger.record.submission.work_scope.state_fence {
+        return Err(AdapterError::Store(StoreError::FenceMismatch));
+    }
+    require_active_lease(&ledger, lease)?;
+    // Renewal extends only the expiry from the accepted observation time; it
+    // cannot change owner, route, budget, or resurrect superseded ownership.
+    let mut renewed = lease.clone();
+    renewed.expires_at_unix_ms = now_unix_ms.saturating_add(LEASE_TTL_MS).max(*now_unix_ms);
+    renewed
+        .validate_active_at(*now_unix_ms)
+        .map_err(map_durable_error)
+        .map_err(AdapterError::Store)?;
+    let expected_outer = job_row.revision;
+    let response = DurableJobResponse {
+        request_identity: request.request_identity.clone(),
+        job_id: ledger.record.submission.job_id.clone(),
+        attempt_id: ledger.record.submission.attempt_id.clone(),
+        scope: ledger.record.submission.work_scope.clone(),
+        revision: ledger.record.revision,
+        state: ledger.record.state,
+        disposition: Some(MutationDisposition::Committed),
+        receipt_id: Some(validated_id(receipt_id_text(
+            &request.request_identity.operation.operation_id,
+        ))?),
+        lease: Some(renewed.clone()),
+        checkpoint: ledger.record.checkpoint.clone(),
+        result_under_verification: ledger.result_under_verification.clone(),
+        outcome: ledger.record.outcome.clone(),
+        selection_coverage: Vec::new(),
+        selection_frontier: None,
+    };
+    response
+        .validate_for(&request)
+        .map_err(map_durable_error)
+        .map_err(AdapterError::Store)?;
+    let receipt_id = response
+        .receipt_id
+        .clone()
+        .ok_or(AdapterError::Store(StoreError::InvalidReceipt))?;
+    let prior_state = ledger.record.state;
+    let prior_revision = ledger.record.revision;
+    ledger.record.lease = Some(renewed.clone());
+    advance_cursor(&mut ledger);
+    ledger.active_lease = Some(renewed.clone());
+    ledger.last_mutation = mutation_identity(&request);
+    ledger.last_receipt_id = Some(receipt_id.clone());
+    ledger.record_digest = ledger.compute_digest().map_err(AdapterError::Store)?;
+    ledger.validate().map_err(AdapterError::Store)?;
+    let cursor = ledger.event_cursor;
+    let mut event = DreamerJobLedgerEvent {
+        job_id: ledger.record.submission.job_id.clone(),
+        attempt_id: ledger.record.submission.attempt_id.clone(),
+        prior_state,
+        next_state: prior_state,
+        prior_revision,
+        next_revision: prior_revision,
+        event_cursor: cursor,
+        operation: request.operation.clone(),
+        role: request.role,
+        lease: Some(renewed),
+        checkpoint: ledger.record.checkpoint.clone(),
+        result_under_verification: ledger.result_under_verification.clone(),
+        mutation: mutation_identity(&request),
+        receipt_id: Some(receipt_id),
+        event_digest: "0".repeat(64),
+    };
+    event.event_digest = event.compute_digest().map_err(AdapterError::Store)?;
+    event.validate().map_err(AdapterError::Store)?;
+    commit_ledger_mutation(
+        db,
+        &adapter.config,
+        &request,
+        &row_key,
+        expected_outer,
+        &ledger,
+        &event,
+        response,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_lines)]
+async fn op_start(
+    adapter: &SurrealStoreAdapter,
+    db: &client::RpcTransport,
+    _ctx: &RequestMeta,
+    request: DurableJobRequest,
+) -> Result<DurableJobResponse, AdapterError> {
+    let JobOperation::Start { lease, .. } = &request.operation else {
+        return Err(AdapterError::Store(StoreError::UnknownOperation));
+    };
+    if request.role != JobRole::Worker {
+        return Err(AdapterError::Store(StoreError::UnknownOperation));
+    }
+    let operation_id = request.request_identity.operation.operation_id.to_string();
+    let op_key = dreamer_operation_row_key(&operation_id);
+    if let Some(replayed) = replay_or_conflict(db, &adapter.config, &op_key, &request).await? {
+        return Ok(replayed);
+    }
+    let Some((row_key, job_row, mut ledger)) = load_ledger(
+        db,
+        &adapter.config,
+        &lease.job_id.to_string(),
+        &lease.attempt_id.to_string(),
+    )
+    .await?
+    else {
+        return Err(AdapterError::Store(StoreError::RevisionConflict));
+    };
+    if lease.state_fence != ledger.record.submission.work_scope.state_fence {
+        return Err(AdapterError::Store(StoreError::FenceMismatch));
+    }
+    require_active_lease(&ledger, lease)?;
+    let expected_outer = job_row.revision;
+    let prior_state = ledger.record.state;
+    let prior_revision = ledger.record.revision;
+    ledger
+        .record
+        .transition(JobState::Running)
+        .map_err(map_durable_error)
+        .map_err(AdapterError::Store)?;
+    let response = DurableJobResponse {
+        request_identity: request.request_identity.clone(),
+        job_id: ledger.record.submission.job_id.clone(),
+        attempt_id: ledger.record.submission.attempt_id.clone(),
+        scope: ledger.record.submission.work_scope.clone(),
+        revision: ledger.record.revision,
+        state: JobState::Running,
+        disposition: Some(MutationDisposition::Committed),
+        receipt_id: Some(validated_id(receipt_id_text(
+            &request.request_identity.operation.operation_id,
+        ))?),
+        lease: Some(lease.clone()),
+        checkpoint: ledger.record.checkpoint.clone(),
+        result_under_verification: None,
+        outcome: None,
+        selection_coverage: Vec::new(),
+        selection_frontier: None,
+    };
+    response
+        .validate_for(&request)
+        .map_err(map_durable_error)
+        .map_err(AdapterError::Store)?;
+    let receipt_id = response
+        .receipt_id
+        .clone()
+        .ok_or(AdapterError::Store(StoreError::InvalidReceipt))?;
+    advance_cursor(&mut ledger);
+    ledger.last_mutation = mutation_identity(&request);
+    ledger.last_receipt_id = Some(receipt_id.clone());
+    ledger.record_digest = ledger.compute_digest().map_err(AdapterError::Store)?;
+    ledger.validate().map_err(AdapterError::Store)?;
+    let cursor = ledger.event_cursor;
+    let mut event = DreamerJobLedgerEvent {
+        job_id: ledger.record.submission.job_id.clone(),
+        attempt_id: ledger.record.submission.attempt_id.clone(),
+        prior_state,
+        next_state: JobState::Running,
+        prior_revision,
+        next_revision: ledger.record.revision,
+        event_cursor: cursor,
+        operation: request.operation.clone(),
+        role: request.role,
+        lease: Some(lease.clone()),
+        checkpoint: ledger.record.checkpoint.clone(),
+        result_under_verification: None,
+        mutation: mutation_identity(&request),
+        receipt_id: Some(receipt_id),
+        event_digest: "0".repeat(64),
+    };
+    event.event_digest = event.compute_digest().map_err(AdapterError::Store)?;
+    event.validate().map_err(AdapterError::Store)?;
+    commit_ledger_mutation(
+        db,
+        &adapter.config,
+        &request,
+        &row_key,
+        expected_outer,
+        &ledger,
+        &event,
+        response,
+    )
+    .await
+}
+
 /// Locates the single job row for a `LeaseExact` request.
 ///
 /// S1 jobs are addressed by job id; the attempt is the one recorded at
@@ -834,6 +1450,691 @@ async fn find_job_for_lease(
         return Ok(Some((row.key.clone(), row, ledger)));
     }
     Ok(None)
+}
+
+#[allow(clippy::too_many_lines)]
+async fn op_checkpoint(
+    adapter: &SurrealStoreAdapter,
+    db: &client::RpcTransport,
+    _ctx: &RequestMeta,
+    request: DurableJobRequest,
+) -> Result<DurableJobResponse, AdapterError> {
+    let JobOperation::Checkpoint {
+        lease, checkpoint, ..
+    } = &request.operation
+    else {
+        return Err(AdapterError::Store(StoreError::UnknownOperation));
+    };
+    if request.role != JobRole::Worker {
+        return Err(AdapterError::Store(StoreError::UnknownOperation));
+    }
+    let operation_id = request.request_identity.operation.operation_id.to_string();
+    let op_key = dreamer_operation_row_key(&operation_id);
+    if let Some(replayed) = replay_or_conflict(db, &adapter.config, &op_key, &request).await? {
+        return Ok(replayed);
+    }
+    let Some((row_key, job_row, mut ledger)) = load_ledger(
+        db,
+        &adapter.config,
+        &lease.job_id.to_string(),
+        &lease.attempt_id.to_string(),
+    )
+    .await?
+    else {
+        return Err(AdapterError::Store(StoreError::RevisionConflict));
+    };
+    if lease.state_fence != ledger.record.submission.work_scope.state_fence {
+        return Err(AdapterError::Store(StoreError::FenceMismatch));
+    }
+    require_active_lease(&ledger, lease)?;
+    let expected_outer = job_row.revision;
+    let prior_state = ledger.record.state;
+    let prior_revision = ledger.record.revision;
+    ledger
+        .record
+        .transition(JobState::Checkpointed)
+        .map_err(map_durable_error)
+        .map_err(AdapterError::Store)?;
+    ledger.record.checkpoint = Some(checkpoint.as_ref().clone());
+    let response = DurableJobResponse {
+        request_identity: request.request_identity.clone(),
+        job_id: ledger.record.submission.job_id.clone(),
+        attempt_id: ledger.record.submission.attempt_id.clone(),
+        scope: ledger.record.submission.work_scope.clone(),
+        revision: ledger.record.revision,
+        state: JobState::Checkpointed,
+        disposition: Some(MutationDisposition::Committed),
+        receipt_id: Some(validated_id(receipt_id_text(
+            &request.request_identity.operation.operation_id,
+        ))?),
+        lease: Some(lease.clone()),
+        checkpoint: ledger.record.checkpoint.clone(),
+        result_under_verification: None,
+        outcome: None,
+        selection_coverage: Vec::new(),
+        selection_frontier: None,
+    };
+    response
+        .validate_for(&request)
+        .map_err(map_durable_error)
+        .map_err(AdapterError::Store)?;
+    let receipt_id = response
+        .receipt_id
+        .clone()
+        .ok_or(AdapterError::Store(StoreError::InvalidReceipt))?;
+    advance_cursor(&mut ledger);
+    ledger.last_mutation = mutation_identity(&request);
+    ledger.last_receipt_id = Some(receipt_id.clone());
+    ledger.record_digest = ledger.compute_digest().map_err(AdapterError::Store)?;
+    ledger.validate().map_err(AdapterError::Store)?;
+    let cursor = ledger.event_cursor;
+    let mut event = DreamerJobLedgerEvent {
+        job_id: ledger.record.submission.job_id.clone(),
+        attempt_id: ledger.record.submission.attempt_id.clone(),
+        prior_state,
+        next_state: JobState::Checkpointed,
+        prior_revision,
+        next_revision: ledger.record.revision,
+        event_cursor: cursor,
+        operation: request.operation.clone(),
+        role: request.role,
+        lease: Some(lease.clone()),
+        checkpoint: ledger.record.checkpoint.clone(),
+        result_under_verification: None,
+        mutation: mutation_identity(&request),
+        receipt_id: Some(receipt_id),
+        event_digest: "0".repeat(64),
+    };
+    event.event_digest = event.compute_digest().map_err(AdapterError::Store)?;
+    event.validate().map_err(AdapterError::Store)?;
+    commit_ledger_mutation(
+        db,
+        &adapter.config,
+        &request,
+        &row_key,
+        expected_outer,
+        &ledger,
+        &event,
+        response,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_lines)]
+async fn op_resume(
+    adapter: &SurrealStoreAdapter,
+    db: &client::RpcTransport,
+    _ctx: &RequestMeta,
+    request: DurableJobRequest,
+) -> Result<DurableJobResponse, AdapterError> {
+    let JobOperation::Resume {
+        lease, checkpoint, ..
+    } = &request.operation
+    else {
+        return Err(AdapterError::Store(StoreError::UnknownOperation));
+    };
+    if request.role != JobRole::Worker {
+        return Err(AdapterError::Store(StoreError::UnknownOperation));
+    }
+    let operation_id = request.request_identity.operation.operation_id.to_string();
+    let op_key = dreamer_operation_row_key(&operation_id);
+    if let Some(replayed) = replay_or_conflict(db, &adapter.config, &op_key, &request).await? {
+        return Ok(replayed);
+    }
+    let Some((row_key, job_row, mut ledger)) = load_ledger(
+        db,
+        &adapter.config,
+        &lease.job_id.to_string(),
+        &lease.attempt_id.to_string(),
+    )
+    .await?
+    else {
+        return Err(AdapterError::Store(StoreError::RevisionConflict));
+    };
+    if lease.state_fence != ledger.record.submission.work_scope.state_fence {
+        return Err(AdapterError::Store(StoreError::FenceMismatch));
+    }
+    require_active_lease(&ledger, lease)?;
+    // Resume binds the exact stored checkpoint; a different checkpoint under
+    // the same identity is a conflict, never a silent substitution.
+    if ledger.record.checkpoint.as_ref() != Some(checkpoint.as_ref()) {
+        return Err(AdapterError::Store(StoreError::IdentityConflict));
+    }
+    let expected_outer = job_row.revision;
+    let prior_state = ledger.record.state;
+    let prior_revision = ledger.record.revision;
+    ledger
+        .record
+        .transition(JobState::Running)
+        .map_err(map_durable_error)
+        .map_err(AdapterError::Store)?;
+    let response = DurableJobResponse {
+        request_identity: request.request_identity.clone(),
+        job_id: ledger.record.submission.job_id.clone(),
+        attempt_id: ledger.record.submission.attempt_id.clone(),
+        scope: ledger.record.submission.work_scope.clone(),
+        revision: ledger.record.revision,
+        state: JobState::Running,
+        disposition: Some(MutationDisposition::Committed),
+        receipt_id: Some(validated_id(receipt_id_text(
+            &request.request_identity.operation.operation_id,
+        ))?),
+        lease: Some(lease.clone()),
+        checkpoint: ledger.record.checkpoint.clone(),
+        result_under_verification: None,
+        outcome: None,
+        selection_coverage: Vec::new(),
+        selection_frontier: None,
+    };
+    response
+        .validate_for(&request)
+        .map_err(map_durable_error)
+        .map_err(AdapterError::Store)?;
+    let receipt_id = response
+        .receipt_id
+        .clone()
+        .ok_or(AdapterError::Store(StoreError::InvalidReceipt))?;
+    advance_cursor(&mut ledger);
+    ledger.last_mutation = mutation_identity(&request);
+    ledger.last_receipt_id = Some(receipt_id.clone());
+    ledger.record_digest = ledger.compute_digest().map_err(AdapterError::Store)?;
+    ledger.validate().map_err(AdapterError::Store)?;
+    let cursor = ledger.event_cursor;
+    let mut event = DreamerJobLedgerEvent {
+        job_id: ledger.record.submission.job_id.clone(),
+        attempt_id: ledger.record.submission.attempt_id.clone(),
+        prior_state,
+        next_state: JobState::Running,
+        prior_revision,
+        next_revision: ledger.record.revision,
+        event_cursor: cursor,
+        operation: request.operation.clone(),
+        role: request.role,
+        lease: Some(lease.clone()),
+        checkpoint: ledger.record.checkpoint.clone(),
+        result_under_verification: None,
+        mutation: mutation_identity(&request),
+        receipt_id: Some(receipt_id),
+        event_digest: "0".repeat(64),
+    };
+    event.event_digest = event.compute_digest().map_err(AdapterError::Store)?;
+    event.validate().map_err(AdapterError::Store)?;
+    commit_ledger_mutation(
+        db,
+        &adapter.config,
+        &request,
+        &row_key,
+        expected_outer,
+        &ledger,
+        &event,
+        response,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_lines)]
+async fn op_begin_verification(
+    adapter: &SurrealStoreAdapter,
+    db: &client::RpcTransport,
+    _ctx: &RequestMeta,
+    request: DurableJobRequest,
+) -> Result<DurableJobResponse, AdapterError> {
+    let JobOperation::BeginVerification { lease, result, .. } = &request.operation else {
+        return Err(AdapterError::Store(StoreError::UnknownOperation));
+    };
+    if request.role != JobRole::Worker {
+        return Err(AdapterError::Store(StoreError::UnknownOperation));
+    }
+    let operation_id = request.request_identity.operation.operation_id.to_string();
+    let op_key = dreamer_operation_row_key(&operation_id);
+    if let Some(replayed) = replay_or_conflict(db, &adapter.config, &op_key, &request).await? {
+        return Ok(replayed);
+    }
+    let Some((row_key, job_row, mut ledger)) = load_ledger(
+        db,
+        &adapter.config,
+        &lease.job_id.to_string(),
+        &lease.attempt_id.to_string(),
+    )
+    .await?
+    else {
+        return Err(AdapterError::Store(StoreError::RevisionConflict));
+    };
+    if lease.state_fence != ledger.record.submission.work_scope.state_fence {
+        return Err(AdapterError::Store(StoreError::FenceMismatch));
+    }
+    require_active_lease(&ledger, lease)?;
+    let expected_outer = job_row.revision;
+    let prior_state = ledger.record.state;
+    let prior_revision = ledger.record.revision;
+    // Only a checkpointed job may enter verification: publishing a terminal
+    // candidate directly from running is an illegal transition, and the
+    // result-under-verification is never itself a terminal outcome.
+    ledger
+        .record
+        .transition(JobState::Verifying)
+        .map_err(map_durable_error)
+        .map_err(AdapterError::Store)?;
+    ledger.result_under_verification = Some(result.as_ref().clone());
+    let response = DurableJobResponse {
+        request_identity: request.request_identity.clone(),
+        job_id: ledger.record.submission.job_id.clone(),
+        attempt_id: ledger.record.submission.attempt_id.clone(),
+        scope: ledger.record.submission.work_scope.clone(),
+        revision: ledger.record.revision,
+        state: JobState::Verifying,
+        disposition: Some(MutationDisposition::Committed),
+        receipt_id: Some(validated_id(receipt_id_text(
+            &request.request_identity.operation.operation_id,
+        ))?),
+        lease: Some(lease.clone()),
+        checkpoint: ledger.record.checkpoint.clone(),
+        result_under_verification: ledger.result_under_verification.clone(),
+        outcome: None,
+        selection_coverage: Vec::new(),
+        selection_frontier: None,
+    };
+    response
+        .validate_for(&request)
+        .map_err(map_durable_error)
+        .map_err(AdapterError::Store)?;
+    let receipt_id = response
+        .receipt_id
+        .clone()
+        .ok_or(AdapterError::Store(StoreError::InvalidReceipt))?;
+    advance_cursor(&mut ledger);
+    ledger.last_mutation = mutation_identity(&request);
+    ledger.last_receipt_id = Some(receipt_id.clone());
+    ledger.record_digest = ledger.compute_digest().map_err(AdapterError::Store)?;
+    ledger.validate().map_err(AdapterError::Store)?;
+    let cursor = ledger.event_cursor;
+    let mut event = DreamerJobLedgerEvent {
+        job_id: ledger.record.submission.job_id.clone(),
+        attempt_id: ledger.record.submission.attempt_id.clone(),
+        prior_state,
+        next_state: JobState::Verifying,
+        prior_revision,
+        next_revision: ledger.record.revision,
+        event_cursor: cursor,
+        operation: request.operation.clone(),
+        role: request.role,
+        lease: Some(lease.clone()),
+        checkpoint: ledger.record.checkpoint.clone(),
+        result_under_verification: ledger.result_under_verification.clone(),
+        mutation: mutation_identity(&request),
+        receipt_id: Some(receipt_id),
+        event_digest: "0".repeat(64),
+    };
+    event.event_digest = event.compute_digest().map_err(AdapterError::Store)?;
+    event.validate().map_err(AdapterError::Store)?;
+    commit_ledger_mutation(
+        db,
+        &adapter.config,
+        &request,
+        &row_key,
+        expected_outer,
+        &ledger,
+        &event,
+        response,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_lines)]
+async fn op_publish(
+    adapter: &SurrealStoreAdapter,
+    db: &client::RpcTransport,
+    _ctx: &RequestMeta,
+    request: DurableJobRequest,
+) -> Result<DurableJobResponse, AdapterError> {
+    let JobOperation::Publish { lease, outcome, .. } = &request.operation else {
+        return Err(AdapterError::Store(StoreError::UnknownOperation));
+    };
+    if request.role != JobRole::Worker {
+        return Err(AdapterError::Store(StoreError::UnknownOperation));
+    }
+    let operation_id = request.request_identity.operation.operation_id.to_string();
+    let op_key = dreamer_operation_row_key(&operation_id);
+    if let Some(replayed) = replay_or_conflict(db, &adapter.config, &op_key, &request).await? {
+        return Ok(replayed);
+    }
+    let Some((row_key, job_row, mut ledger)) = load_ledger(
+        db,
+        &adapter.config,
+        &lease.job_id.to_string(),
+        &lease.attempt_id.to_string(),
+    )
+    .await?
+    else {
+        return Err(AdapterError::Store(StoreError::RevisionConflict));
+    };
+    if lease.state_fence != ledger.record.submission.work_scope.state_fence {
+        return Err(AdapterError::Store(StoreError::FenceMismatch));
+    }
+    require_active_lease(&ledger, lease)?;
+    let expected_outer = job_row.revision;
+    let prior_state = ledger.record.state;
+    let prior_revision = ledger.record.revision;
+    // The closed K0 matrix decides the terminal edge: `Completed`/`Partial`
+    // only from `Verifying`; `Failed`/`Cancelled`/`UnknownOutcome` from
+    // `Running`, `Checkpointed`, or `Verifying`. Terminal history is immutable
+    // afterwards. A committed semantic `UNKNOWN_OUTCOME` stays a stored job
+    // result and never upgrades Store commit uncertainty.
+    ledger
+        .record
+        .transition(outcome.state)
+        .map_err(map_durable_error)
+        .map_err(AdapterError::Store)?;
+    ledger.record.outcome = Some(outcome.as_ref().clone());
+    // Terminal publication releases active ownership while retaining the final
+    // lease as history: terminal records carry no active lease.
+    if let Some(active) = ledger.active_lease.take() {
+        ledger.lease_history.push(active);
+    }
+    ledger.record.lease = None;
+    ledger.result_under_verification = None;
+    let response = DurableJobResponse {
+        request_identity: request.request_identity.clone(),
+        job_id: ledger.record.submission.job_id.clone(),
+        attempt_id: ledger.record.submission.attempt_id.clone(),
+        scope: ledger.record.submission.work_scope.clone(),
+        revision: ledger.record.revision,
+        state: outcome.state,
+        disposition: Some(MutationDisposition::Committed),
+        receipt_id: Some(validated_id(receipt_id_text(
+            &request.request_identity.operation.operation_id,
+        ))?),
+        lease: None,
+        checkpoint: ledger.record.checkpoint.clone(),
+        result_under_verification: None,
+        outcome: ledger.record.outcome.clone(),
+        selection_coverage: Vec::new(),
+        selection_frontier: None,
+    };
+    response
+        .validate_for(&request)
+        .map_err(map_durable_error)
+        .map_err(AdapterError::Store)?;
+    let receipt_id = response
+        .receipt_id
+        .clone()
+        .ok_or(AdapterError::Store(StoreError::InvalidReceipt))?;
+    advance_cursor(&mut ledger);
+    ledger.last_mutation = mutation_identity(&request);
+    ledger.last_receipt_id = Some(receipt_id.clone());
+    ledger.record_digest = ledger.compute_digest().map_err(AdapterError::Store)?;
+    ledger.validate().map_err(AdapterError::Store)?;
+    let cursor = ledger.event_cursor;
+    let mut event = DreamerJobLedgerEvent {
+        job_id: ledger.record.submission.job_id.clone(),
+        attempt_id: ledger.record.submission.attempt_id.clone(),
+        prior_state,
+        next_state: outcome.state,
+        prior_revision,
+        next_revision: ledger.record.revision,
+        event_cursor: cursor,
+        operation: request.operation.clone(),
+        role: request.role,
+        lease: None,
+        checkpoint: ledger.record.checkpoint.clone(),
+        result_under_verification: None,
+        mutation: mutation_identity(&request),
+        receipt_id: Some(receipt_id),
+        event_digest: "0".repeat(64),
+    };
+    event.event_digest = event.compute_digest().map_err(AdapterError::Store)?;
+    event.validate().map_err(AdapterError::Store)?;
+    commit_ledger_mutation(
+        db,
+        &adapter.config,
+        &request,
+        &row_key,
+        expected_outer,
+        &ledger,
+        &event,
+        response,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_lines)]
+async fn op_request_cancel(
+    adapter: &SurrealStoreAdapter,
+    db: &client::RpcTransport,
+    _ctx: &RequestMeta,
+    request: DurableJobRequest,
+) -> Result<DurableJobResponse, AdapterError> {
+    let JobOperation::RequestCancel {
+        job_id,
+        attempt_id,
+        reason,
+        requested_at_unix_ms,
+        expected_fence,
+    } = &request.operation
+    else {
+        return Err(AdapterError::Store(StoreError::UnknownOperation));
+    };
+    // Cancellation is requested by the requester or controller roles; the
+    // recorded principal names the authenticated role class, never a
+    // caller-supplied identity string.
+    let principal = match request.role {
+        JobRole::Requester => "requester",
+        JobRole::Controller => "controller",
+        JobRole::Worker => return Err(AdapterError::Store(StoreError::UnknownOperation)),
+    };
+    let operation_id = request.request_identity.operation.operation_id.to_string();
+    let op_key = dreamer_operation_row_key(&operation_id);
+    if let Some(replayed) = replay_or_conflict(db, &adapter.config, &op_key, &request).await? {
+        return Ok(replayed);
+    }
+    let Some((row_key, job_row, mut ledger)) = load_ledger(
+        db,
+        &adapter.config,
+        &job_id.to_string(),
+        &attempt_id.to_string(),
+    )
+    .await?
+    else {
+        return Err(AdapterError::Store(StoreError::RevisionConflict));
+    };
+    if *expected_fence != ledger.record.submission.work_scope.state_fence {
+        return Err(AdapterError::Store(StoreError::FenceMismatch));
+    }
+    let expected_outer = job_row.revision;
+    let prior_state = ledger.record.state;
+    let prior_revision = ledger.record.revision;
+    // Records cancellation intent only: the job state is unchanged, so this is
+    // never the terminal `CANCELLED` outcome. Terminal history rejects it.
+    ledger
+        .record
+        .request_cancel(
+            principal.to_owned(),
+            reason.clone(),
+            request.request_identity.operation.operation_id.clone(),
+            *requested_at_unix_ms,
+        )
+        .map_err(map_durable_error)
+        .map_err(AdapterError::Store)?;
+    let response = DurableJobResponse {
+        request_identity: request.request_identity.clone(),
+        job_id: ledger.record.submission.job_id.clone(),
+        attempt_id: ledger.record.submission.attempt_id.clone(),
+        scope: ledger.record.submission.work_scope.clone(),
+        revision: ledger.record.revision,
+        state: prior_state,
+        disposition: Some(MutationDisposition::Committed),
+        receipt_id: Some(validated_id(receipt_id_text(
+            &request.request_identity.operation.operation_id,
+        ))?),
+        lease: ledger.active_lease.clone(),
+        checkpoint: ledger.record.checkpoint.clone(),
+        result_under_verification: ledger.result_under_verification.clone(),
+        outcome: None,
+        selection_coverage: Vec::new(),
+        selection_frontier: None,
+    };
+    response
+        .validate_for(&request)
+        .map_err(map_durable_error)
+        .map_err(AdapterError::Store)?;
+    let receipt_id = response
+        .receipt_id
+        .clone()
+        .ok_or(AdapterError::Store(StoreError::InvalidReceipt))?;
+    advance_cursor(&mut ledger);
+    ledger.last_mutation = mutation_identity(&request);
+    ledger.last_receipt_id = Some(receipt_id.clone());
+    ledger.record_digest = ledger.compute_digest().map_err(AdapterError::Store)?;
+    ledger.validate().map_err(AdapterError::Store)?;
+    let cursor = ledger.event_cursor;
+    let mut event = DreamerJobLedgerEvent {
+        job_id: ledger.record.submission.job_id.clone(),
+        attempt_id: ledger.record.submission.attempt_id.clone(),
+        prior_state,
+        next_state: prior_state,
+        prior_revision,
+        next_revision: ledger.record.revision,
+        event_cursor: cursor,
+        operation: request.operation.clone(),
+        role: request.role,
+        lease: ledger.active_lease.clone(),
+        checkpoint: ledger.record.checkpoint.clone(),
+        result_under_verification: ledger.result_under_verification.clone(),
+        mutation: mutation_identity(&request),
+        receipt_id: Some(receipt_id),
+        event_digest: "0".repeat(64),
+    };
+    event.event_digest = event.compute_digest().map_err(AdapterError::Store)?;
+    event.validate().map_err(AdapterError::Store)?;
+    commit_ledger_mutation(
+        db,
+        &adapter.config,
+        &request,
+        &row_key,
+        expected_outer,
+        &ledger,
+        &event,
+        response,
+    )
+    .await
+}
+
+/// Reconciles one mutation by exact operation identity. This is a pure
+/// observation: it never mutates the ledger, never replays a commit, and never
+/// authorizes a retry. A stored operation with matching hash proves the
+/// commit; only an independently proven absence (no operation row, hence the
+/// atomic commit never ran) may answer not-applied; anything unbindable stays
+/// `MissingReceiptEnvelope` still-unknown. A missing or mismatched receipt is
+/// never committed success.
+async fn op_reconcile(
+    adapter: &SurrealStoreAdapter,
+    db: &client::RpcTransport,
+    _ctx: &RequestMeta,
+    request: DurableJobRequest,
+) -> Result<DurableJobResponse, AdapterError> {
+    let JobOperation::Reconcile { mutation } = &request.operation else {
+        return Err(AdapterError::Store(StoreError::UnknownOperation));
+    };
+    // Every role may reconcile; K0 already enforced the permission.
+    let operation_id = mutation.operation.operation_id.to_string();
+    let op_key = dreamer_operation_row_key(&operation_id);
+    let existing = read_dreamer_row(db, &adapter.config, &op_key).await?;
+    if let Some(op_row) = existing {
+        let stored = decode_stored_mutation(&op_row)?;
+        if stored.canonical_request_hash != mutation.canonical_request_hash
+            || stored.operation_kind != mutation.operation.operation_kind
+        {
+            return Err(AdapterError::Store(StoreError::IdentityConflict));
+        }
+        if mutation.disposition != MutationDisposition::Committed {
+            // The operation provably committed; a contrary claim conflicts
+            // instead of rewriting history.
+            return Err(AdapterError::Store(StoreError::IdentityConflict));
+        }
+        let Some((_, _, ledger)) = load_ledger(
+            db,
+            &adapter.config,
+            &mutation.job_id.to_string(),
+            &mutation.attempt_id.to_string(),
+        )
+        .await?
+        else {
+            return Err(AdapterError::Store(StoreError::InvalidReceipt));
+        };
+        if mutation.operation.state_fence != ledger.record.submission.work_scope.state_fence {
+            return Err(AdapterError::Store(StoreError::FenceMismatch));
+        }
+        if mutation.committed_state != Some(ledger.record.state)
+            || mutation.receipt_id != ledger.last_receipt_id
+        {
+            return Err(AdapterError::Store(StoreError::InvalidReceipt));
+        }
+        let response = DurableJobResponse {
+            request_identity: request.request_identity.clone(),
+            job_id: ledger.record.submission.job_id.clone(),
+            attempt_id: ledger.record.submission.attempt_id.clone(),
+            scope: ledger.record.submission.work_scope.clone(),
+            revision: ledger.record.revision,
+            state: ledger.record.state,
+            disposition: Some(MutationDisposition::Committed),
+            receipt_id: ledger.last_receipt_id.clone(),
+            lease: ledger.active_lease.clone(),
+            checkpoint: ledger.record.checkpoint.clone(),
+            result_under_verification: ledger.result_under_verification.clone(),
+            outcome: ledger.record.outcome.clone(),
+            selection_coverage: Vec::new(),
+            selection_frontier: None,
+        };
+        response
+            .validate_for(&request)
+            .map_err(map_durable_error)
+            .map_err(AdapterError::Store)?;
+        Ok(response)
+    } else {
+        if mutation.disposition == MutationDisposition::Committed {
+            // No operation row, no receipt: not committed success.
+            return Err(AdapterError::Store(StoreError::InvalidReceipt));
+        }
+        let Some((_, _, ledger)) = load_ledger(
+            db,
+            &adapter.config,
+            &mutation.job_id.to_string(),
+            &mutation.attempt_id.to_string(),
+        )
+        .await?
+        else {
+            // Nothing to bind scope or revision to: honestly still-unknown
+            // rather than a fabricated not-applied answer.
+            return Err(AdapterError::Store(StoreError::MissingReceiptEnvelope));
+        };
+        if mutation.operation.state_fence != ledger.record.submission.work_scope.state_fence {
+            return Err(AdapterError::Store(StoreError::FenceMismatch));
+        }
+        // Proven absence: the atomic commit always writes the operation
+        // row, so its absence proves this mutation never applied. The
+        // current record binds scope and revision without changing it.
+        let response = DurableJobResponse {
+            request_identity: request.request_identity.clone(),
+            job_id: ledger.record.submission.job_id.clone(),
+            attempt_id: ledger.record.submission.attempt_id.clone(),
+            scope: ledger.record.submission.work_scope.clone(),
+            revision: ledger.record.revision,
+            state: ledger.record.state,
+            disposition: Some(mutation.disposition),
+            receipt_id: None,
+            lease: ledger.active_lease.clone(),
+            checkpoint: ledger.record.checkpoint.clone(),
+            result_under_verification: ledger.result_under_verification.clone(),
+            outcome: ledger.record.outcome.clone(),
+            selection_coverage: Vec::new(),
+            selection_frontier: None,
+        };
+        response
+            .validate_for(&request)
+            .map_err(map_durable_error)
+            .map_err(AdapterError::Store)?;
+        Ok(response)
+    }
 }
 
 /// Commits four Dreamer rows (job, event, operation, receipt) in one provider
@@ -983,12 +2284,25 @@ async fn cas_job_plus_three(
     })
 }
 
-/// S1 capability denominator: only the implemented working edge is advertised.
+/// Full capability denominator: every closed K0 operation is implemented and
+/// advertised. The match is exhaustive (no wildcard) so a future thirteenth
+/// operation variant fails the build instead of silently defaulting.
 #[must_use]
 pub(crate) fn is_supported_operation(operation: &JobOperation) -> bool {
     matches!(
         operation,
-        JobOperation::Submit { .. } | JobOperation::LeaseExact { .. } | JobOperation::Status { .. }
+        JobOperation::Submit { .. }
+            | JobOperation::LeaseNext { .. }
+            | JobOperation::LeaseExact { .. }
+            | JobOperation::Renew { .. }
+            | JobOperation::Start { .. }
+            | JobOperation::Checkpoint { .. }
+            | JobOperation::Resume { .. }
+            | JobOperation::BeginVerification { .. }
+            | JobOperation::Publish { .. }
+            | JobOperation::Status { .. }
+            | JobOperation::RequestCancel { .. }
+            | JobOperation::Reconcile { .. }
     )
 }
 
@@ -1036,25 +2350,97 @@ mod tests {
     }
 
     #[test]
-    fn supported_operations_are_exactly_the_working_edge() {
-        assert!(is_supported_operation(&JobOperation::Status {
-            job_id: eliot_contracts::TaskId::new("j").expect("job"),
-            attempt_id: eliot_contracts::ArtifactId::new("a").expect("attempt"),
-            expected_revision: 1,
-            expected_fence: test_fence(),
-        }));
-        assert!(is_supported_operation(&JobOperation::Submit {
-            submission: Box::new(test_submission()),
-        }));
-        // Renew is representative of the deferred lifecycle: shaped correctly
-        // but explicitly unadvertised in S1.
-        assert!(!is_supported_operation(&JobOperation::Renew {
-            lease: test_lease(),
-            now_unix_ms: 2_000,
-        }));
-        assert!(!is_supported_operation(&JobOperation::Reconcile {
-            mutation: Box::new(test_reconciliation()),
-        }));
+    fn supported_operations_cover_the_closed_twelve() {
+        // Deserialization only: support is a kind denominator, not validity.
+        let lease = serde_json::to_value(test_lease()).expect("lease json");
+        let fence = serde_json::to_value(test_fence()).expect("fence json");
+        let operations: Vec<JobOperation> = vec![
+            serde_json::from_value(serde_json::json!({
+                "operation": "SUBMIT_JOB",
+                "submission": serde_json::to_value(test_submission()).expect("submission json"),
+            }))
+            .expect("submit"),
+            serde_json::from_value(serde_json::json!({
+                "operation": "LEASE_NEXT",
+                "selector": test_selector_json(),
+            }))
+            .expect("lease next"),
+            serde_json::from_value(serde_json::json!({
+                "operation": "LEASE_EXACT",
+                "selector": test_selector_json(),
+                "job_id": "job",
+            }))
+            .expect("lease exact"),
+            serde_json::from_value(serde_json::json!({
+                "operation": "RENEW_LEASE",
+                "lease": lease,
+                "now_unix_ms": 50,
+            }))
+            .expect("renew"),
+            serde_json::from_value(serde_json::json!({
+                "operation": "START_JOB",
+                "lease": lease,
+                "now_unix_ms": 50,
+            }))
+            .expect("start"),
+            serde_json::from_value(serde_json::json!({
+                "operation": "CHECKPOINT_JOB",
+                "lease": lease,
+                "checkpoint": test_checkpoint_json(),
+                "now_unix_ms": 50,
+            }))
+            .expect("checkpoint"),
+            serde_json::from_value(serde_json::json!({
+                "operation": "RESUME_JOB",
+                "lease": lease,
+                "checkpoint": test_checkpoint_json(),
+                "now_unix_ms": 50,
+            }))
+            .expect("resume"),
+            serde_json::from_value(serde_json::json!({
+                "operation": "BEGIN_VERIFICATION",
+                "lease": lease,
+                "result": test_content_json("result"),
+                "evidence": [test_artifact_json()],
+                "now_unix_ms": 50,
+            }))
+            .expect("begin verification"),
+            serde_json::from_value(serde_json::json!({
+                "operation": "PUBLISH_OUTCOME",
+                "lease": lease,
+                "outcome": test_outcome_json(),
+                "now_unix_ms": 50,
+            }))
+            .expect("publish"),
+            serde_json::from_value(serde_json::json!({
+                "operation": "STATUS",
+                "job_id": "job",
+                "attempt_id": "attempt",
+                "expected_revision": 1,
+                "expected_fence": fence,
+            }))
+            .expect("status"),
+            serde_json::from_value(serde_json::json!({
+                "operation": "REQUEST_CANCEL",
+                "job_id": "job",
+                "attempt_id": "attempt",
+                "reason": "probe",
+                "requested_at_unix_ms": 60,
+                "expected_fence": fence,
+            }))
+            .expect("request cancel"),
+            JobOperation::Reconcile {
+                mutation: Box::new(test_reconciliation()),
+            },
+        ];
+        assert_eq!(operations.len(), 12);
+        for operation in &operations {
+            assert!(
+                is_supported_operation(operation),
+                "operation kind is advertised: {}",
+                operation.kind()
+            );
+        }
     }
 
     #[test]
@@ -1086,6 +2472,73 @@ mod tests {
             "provider outcome is unknown"
         ));
         assert!(!crate::client::is_dreamer_conflict(""));
+    }
+
+    fn test_selector_json() -> serde_json::Value {
+        serde_json::json!({
+            "scope_id": "scope-dreamer",
+            "expected_revision": 1,
+            "expected_fence": serde_json::to_value(test_fence()).expect("fence json"),
+            "worker_artifact_id": "worker",
+            "max_candidates": 8,
+        })
+    }
+
+    fn test_content_json(revision: &str) -> serde_json::Value {
+        serde_json::json!({
+            "contract": {
+                "name": "eliot.smart.dreamer.contracts",
+                "version": {"major": 1, "minor": 0, "patch": 0},
+                "shape_sha256": "0".repeat(64),
+            },
+            "source_revision": revision,
+            "byte_length": 8,
+            "sha256": "1".repeat(64),
+            "artifact_id": format!("artifact-{revision}"),
+        })
+    }
+
+    fn test_checkpoint_json() -> serde_json::Value {
+        serde_json::json!({
+            "checkpoint_id": "checkpoint-1",
+            "reference": {
+                "contract": {
+                    "name": "eliot.smart.dreamer.contracts",
+                    "version": {"major": 1, "minor": 0, "patch": 0},
+                    "shape_sha256": "0".repeat(64),
+                },
+                "source_revision": "checkpoint-1",
+                "byte_length": 8,
+                "sha256": "1".repeat(64),
+                "artifact_id": "checkpoint-1",
+            },
+            "completed_phases": ["phase-a"],
+            "remaining_phases": ["phase-b"],
+            "budget_remaining": 7,
+            "possible_effects": ["CANDIDATE"],
+            "state_fence": serde_json::to_value(test_fence()).expect("fence json"),
+        })
+    }
+
+    fn test_artifact_json() -> serde_json::Value {
+        serde_json::json!({
+            "artifact_id": "artifact-evidence-1",
+            "sha256": "2".repeat(64),
+            "role": "ARTIFACT",
+            "source_revision": "rev-1",
+        })
+    }
+
+    fn test_outcome_json() -> serde_json::Value {
+        serde_json::json!({
+            "state": "COMPLETED",
+            "result": test_content_json("output"),
+            "evidence": [test_artifact_json()],
+            "verifier": null,
+            "proof_ceiling": "CANDIDATE_ARTIFACT",
+            "abstention_reason": null,
+            "unresolved": [],
+        })
     }
 
     fn test_fence() -> eliot_store_api::StateFence {

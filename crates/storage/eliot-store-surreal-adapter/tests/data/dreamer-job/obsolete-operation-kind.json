@@ -1,0 +1,6 @@
+{
+  "operation_id": "operation-775-20-obsolete",
+  "idempotency_key": "stable-775-20-obsolete",
+  "canonical_request_hash": "0000000000000000000000000000000000000000000000000000000000000000",
+  "operation_kind": "CANDIDATE_READY"
+}
