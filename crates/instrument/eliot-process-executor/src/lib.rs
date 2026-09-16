@@ -17,9 +17,9 @@ use eliot_process::{
     ProcessEvidenceSink, ProcessExecutionBinding, ProcessExecutionError, ProcessExecutionView,
     ProcessExecutor, ProcessHealth, ProcessHealthStatus, ProcessId, ProcessLaunchAdmission,
     ProcessLifecycle, ProcessRequest, ProcessStartReceipt, ProcessState, ProcessStreamEvidence,
-    ProcessStreamKind, ProcessStreamPolicyBinding, ProcessStreamPrefixPreview, ProcessTreeId,
-    SessionId, StreamEvidenceGap, StreamPersistenceStatus, StreamTransportStatus,
-    SuspendedLaunchEvidence, SuspendedProcessIdentity, ValidatedDispatch,
+    ProcessStreamKind, ProcessStreamPolicyBinding, ProcessStreamPrefixPreview,
+    ProcessStreamSinkLimits, ProcessTreeId, SessionId, StreamEvidenceGap, StreamPersistenceStatus,
+    StreamTransportStatus, SuspendedLaunchEvidence, SuspendedProcessIdentity, ValidatedDispatch,
 };
 use sha2::{Digest as _, Sha256};
 use std::collections::BTreeMap;
@@ -44,7 +44,36 @@ const WATCH_INTERVAL: Duration = Duration::from_millis(25);
 const STREAM_CHUNK_BYTES: usize = 8192;
 const STREAM_JOIN_TIMEOUT: Duration = Duration::from_secs(2);
 const STREAM_JOIN_POLL: Duration = Duration::from_millis(5);
+/// Bounded sink-pressure isolation ceiling: bytes of observed stream after
+/// which P-04 records that persistence pressure was shed while the pipe kept
+/// draining. Sized well above the focused proof volumes so ordinary streams
+/// never latch it, and far below any unbounded retention.
+const SINK_BACKPRESSURE_IN_FLIGHT_BYTES: u64 = 64 * 1024;
 static JOB_SEQUENCE: AtomicU64 = AtomicU64::new(1);
+
+/// Builds the #267 sink-port limits P-04 consumes ONLY as a bound.
+///
+/// The port itself is never called here: no sink session is opened, appended,
+/// finalized, or read back on the drain path, so pipe draining can never block
+/// on persistence I/O. The validated `max_in_flight_bytes` ceiling alone
+/// parameterizes [`CaptureSession`]'s overflow latch, and persistence stays
+/// `SourceUnavailable` (no durable provider is wired in P-04) with no source
+/// locator, so no `raw:*` handle is ever minted.
+fn sink_backpressure_limits() -> Result<ProcessStreamSinkLimits, ProcessExecutionError> {
+    ProcessStreamSinkLimits::new(
+        u64::try_from(STREAM_CHUNK_BYTES).map_err(|_| ProcessExecutionError::UnknownOutcome)?,
+        u64::try_from(EVIDENCE_PREVIEW_CEILING)
+            .map_err(|_| ProcessExecutionError::UnknownOutcome)?,
+        2_048,
+        16 * 1024,
+        8,
+        SINK_BACKPRESSURE_IN_FLIGHT_BYTES,
+        250,
+        2_000,
+        2_000,
+    )
+    .map_err(|_| ProcessExecutionError::UnknownOutcome)
+}
 
 /// P-07's injected process-authority seam.
 ///
@@ -81,59 +110,340 @@ pub struct CapturedStream {
     pub captured: bool,
 }
 
-#[allow(
-    clippy::struct_excessive_bools,
-    reason = "requested, captured, truncated, complete, and read_error are independent stream observations"
-)]
-struct StreamCapture {
-    requested: bool,
-    bytes: Vec<u8>,
-    limit: usize,
-    total_bytes: u64,
-    truncated: bool,
-    complete: bool,
-    read_error: bool,
-    captured: bool,
-    digest: Sha256,
+/// Typed terminal disposition of one owned stream capture session.
+///
+/// Every state below is observable through [`CaptureSession`] without
+/// inventing a minted string handle: zero-byte EOF (`Eof`), a drained
+/// failure (`ReadFailed`), a missing handle/thread (`CaptureUnavailable`),
+/// cancellation before EOF (`CancelledBeforeEof`), and the explicit unknown
+/// (`UnknownOutcome`) all stay distinct. Failures remain operation-local; the
+/// disposition never fabricates complete proof for a partial observation.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum CaptureDisposition {
+    /// The drain thread is owned and still draining; no terminal state yet.
+    Draining,
+    /// EOF was observed after every received byte was drained (including the
+    /// zero-byte case, where `total_bytes == 0` and the digest is the empty
+    /// SHA-256).
+    Eof,
+    /// A read failed after zero or more bytes were observed; the observed
+    /// prefix stays queryable but complete evidence is forbidden.
+    ReadFailed,
+    /// The requested handle/thread was unavailable; no bytes are claimed.
+    CaptureUnavailable,
+    /// Cancellation ended capture before EOF was observed.
+    CancelledBeforeEof,
+    /// The capture outcome itself cannot be established.
+    UnknownOutcome,
 }
 
-impl std::fmt::Debug for StreamCapture {
+impl CaptureDisposition {
+    /// Returns whether a terminal state reached EOF with exact byte custody.
+    #[must_use]
+    pub const fn is_eof_complete(self) -> bool {
+        matches!(self, Self::Eof)
+    }
+
+    /// Returns the exact `ProcessStreamKind` label for diagnostics.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Draining => "draining",
+            Self::Eof => "eof",
+            Self::ReadFailed => "read-failed",
+            Self::CaptureUnavailable => "capture-unavailable",
+            Self::CancelledBeforeEof => "cancelled-before-eof",
+            Self::UnknownOutcome => "unknown-outcome",
+        }
+    }
+}
+
+/// One owned capture session per requested stream (stdout/stderr).
+///
+/// A session is minted exactly once at the capture-setup start-state
+/// boundary, next to the #83/#84 owners, and owns the drain of exactly one
+/// stream: the full transport digest/count over the bytes actually observed,
+/// the admissible-source identity (SHA-256/count over the full observed
+/// stream), a bounded diagnostics prefix, and the typed durable-source
+/// disposition. The two sessions drain independently with bounded memory
+/// (only the prefix is retained); the full digest/count accumulators never
+/// retain the stream. Terminal [`CaptureDisposition`] states preserve the
+/// exact zero-byte EOF, read-failure, cancellation-before-EOF,
+/// capture-unavailable, and unknown-outcome contours through the typed
+/// session without minting a durable-source handle string.
+#[allow(
+    clippy::struct_excessive_bools,
+    reason = "requested, draining, truncated, and backpressured are independent session observations"
+)]
+pub struct CaptureSession {
+    /// Exact stream owned by this session (`"stdout"` or `"stderr"`).
+    stream: &'static str,
+    /// Bounded retained diagnostics prefix ceiling.
+    limit: usize,
+    /// Bytes retained for the bounded preview (never the full stream).
+    prefix: Vec<u8>,
+    /// Full transport digest over every byte actually observed.
+    digest: Sha256,
+    /// Full count over every byte actually observed.
+    total_bytes: u64,
+    /// Whether the drain observed bytes beyond the retained prefix.
+    truncated: bool,
+    /// Terminal disposition; `Draining` until the drain thread lands.
+    disposition: CaptureDisposition,
+    /// Whether the request asked for this stream (`false` sessions never
+    /// claim a handle and stay `CaptureUnavailable`).
+    requested: bool,
+    /// Whether a drain thread owns this session's pipe handle.
+    draining: bool,
+    /// Bytes observed since minting, counted against the sink-pressure
+    /// isolation ceiling. Never blocks the drain; only feeds the latch below.
+    sink_pressure_bytes: u64,
+    /// Isolation ceiling taken from the #267 sink-port limits
+    /// (`max_in_flight_bytes`). The drain never waits on persistence.
+    backpressure_ceiling: u64,
+    /// Latched when observed bytes exceeded the isolation ceiling: persistence
+    /// pressure was shed while the pipe kept draining. Latched once, never
+    /// cleared, so the overflow fact survives the terminal landing.
+    backpressured: bool,
+}
+
+impl std::fmt::Debug for CaptureSession {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("StreamCapture")
-            .field("requested", &self.requested)
-            .field("bytes", &self.bytes)
+        f.debug_struct("CaptureSession")
+            .field("stream", &self.stream)
+            .field("prefix", &self.prefix)
             .field("limit", &self.limit)
             .field("total_bytes", &self.total_bytes)
             .field("truncated", &self.truncated)
-            .field("complete", &self.complete)
-            .field("read_error", &self.read_error)
-            .field("captured", &self.captured)
+            .field("disposition", &self.disposition)
+            .field("requested", &self.requested)
+            .field("draining", &self.draining)
+            .field("sink_pressure_bytes", &self.sink_pressure_bytes)
+            .field("backpressure_ceiling", &self.backpressure_ceiling)
+            .field("backpressured", &self.backpressured)
             .finish_non_exhaustive()
     }
 }
 
-impl StreamCapture {
-    fn new(limit: usize, requested: bool) -> Self {
+impl CaptureSession {
+    /// Mints one owned session for `stream` at the capture-setup boundary.
+    ///
+    /// `limit` is the bounded retained-prefix ceiling; the full digest/count
+    /// accumulators always observe every drained byte regardless of the
+    /// ceiling. An unrequested stream is minted `CaptureUnavailable` so no
+    /// production path can claim bytes for a stream that was never asked for.
+    #[must_use]
+    pub fn new(stream: &'static str, limit: usize, requested: bool) -> Self {
+        // The isolation ceiling is the validated #267 port bound; when the
+        // port shape itself cannot be built (unreachable with the constants
+        // above), fail closed to the same byte ceiling rather than unbounded.
+        let backpressure_ceiling = match sink_backpressure_limits() {
+            Ok(limits) => limits.max_in_flight_bytes(),
+            Err(_) => SINK_BACKPRESSURE_IN_FLIGHT_BYTES,
+        };
         Self {
-            requested,
-            bytes: Vec::new(),
+            stream,
             limit: limit.max(1),
+            prefix: Vec::new(),
+            digest: Sha256::new(),
             total_bytes: 0,
             truncated: false,
-            complete: false,
-            read_error: false,
-            captured: false,
-            digest: Sha256::new(),
+            disposition: if requested {
+                CaptureDisposition::Draining
+            } else {
+                CaptureDisposition::CaptureUnavailable
+            },
+            requested,
+            draining: false,
+            sink_pressure_bytes: 0,
+            backpressure_ceiling,
+            backpressured: false,
         }
+    }
+
+    /// Marks the drain thread as installed; operation-local ownership only.
+    pub fn mark_draining(&mut self) {
+        if self.requested {
+            self.draining = true;
+        }
+    }
+
+    /// Feeds one observed chunk into the session: the full digest/count
+    /// always advance over the actual bytes, while retention stays bounded to
+    /// the prefix ceiling. The sink-pressure counter advances alongside the
+    /// digest without ever blocking: past the isolation ceiling only the
+    /// overflow fact latches, and the pipe keeps draining.
+    pub fn observe(&mut self, chunk: &[u8]) {
+        if chunk.is_empty() {
+            return;
+        }
+        self.digest.update(chunk);
+        self.total_bytes = self.total_bytes.saturating_add(chunk.len() as u64);
+        self.sink_pressure_bytes = self.sink_pressure_bytes.saturating_add(chunk.len() as u64);
+        if self.sink_pressure_bytes > self.backpressure_ceiling {
+            self.backpressured = true;
+        }
+        let remaining = self.limit.saturating_sub(self.prefix.len());
+        let retained = chunk.len().min(remaining);
+        self.prefix.extend_from_slice(&chunk[..retained]);
+        if retained < chunk.len() {
+            self.truncated = true;
+        }
+    }
+
+    /// Lands the zero-byte-or-more EOF: exact digest/count custody is
+    /// already accumulated; a zero-byte stream keeps the empty SHA-256.
+    pub fn mark_eof(&mut self) {
+        if self.requested {
+            self.disposition = CaptureDisposition::Eof;
+        }
+    }
+
+    /// Lands a read failure; the observed prefix stays queryable but
+    /// complete evidence is forbidden.
+    pub fn mark_read_failed(&mut self) {
+        if self.requested {
+            self.disposition = CaptureDisposition::ReadFailed;
+        }
+    }
+
+    /// Lands cancellation before EOF; the observed prefix stays queryable
+    /// but complete evidence is forbidden.
+    pub fn mark_cancelled_before_eof(&mut self) {
+        if self.requested {
+            self.disposition = CaptureDisposition::CancelledBeforeEof;
+        }
+    }
+
+    /// Cancel-path single-terminal landing: only a still-draining session
+    /// moves to `CancelledBeforeEof`.
+    ///
+    /// An already-landed terminal (`Eof`, `ReadFailed`, `CaptureUnavailable`,
+    /// `UnknownOutcome`, or an earlier `CancelledBeforeEof`) already tells its
+    /// story and is preserved, so a late cancel can never rewrite exact byte
+    /// custody into cancellation. The drain thread lands through
+    /// `land_drain_terminal`, which preserves a cancel that won the race the
+    /// same way; exactly one terminal survives either order.
+    pub fn cancel_before_eof(&mut self) {
+        if self.requested && matches!(self.disposition, CaptureDisposition::Draining) {
+            self.disposition = CaptureDisposition::CancelledBeforeEof;
+        }
+    }
+
+    /// Drain-thread single-terminal landing: only a still-draining session
+    /// adopts the drain outcome, so a cancellation that landed first is never
+    /// overwritten by a trailing EOF/read result from torn-down pipes.
+    fn land_drain_terminal(&mut self, terminal: CaptureDisposition) {
+        if self.requested && matches!(self.disposition, CaptureDisposition::Draining) {
+            self.disposition = terminal;
+        }
+    }
+
+    /// Lands the explicit unknown outcome; nothing is fabricated.
+    pub fn mark_unknown_outcome(&mut self) {
+        if self.requested {
+            self.disposition = CaptureDisposition::UnknownOutcome;
+        }
+    }
+
+    /// Lands capture-unavailable; claims no bytes.
+    pub fn mark_capture_unavailable(&mut self) {
+        self.disposition = CaptureDisposition::CaptureUnavailable;
+    }
+
+    /// Returns the owned stream label.
+    #[must_use]
+    pub const fn stream(&self) -> &'static str {
+        self.stream
+    }
+
+    /// Returns whether this stream was requested.
+    #[must_use]
+    pub const fn requested(&self) -> bool {
+        self.requested
+    }
+
+    /// Returns whether a drain thread owns this session's pipe handle.
+    #[must_use]
+    pub const fn draining(&self) -> bool {
+        self.draining
+    }
+
+    /// Returns the terminal disposition.
+    #[must_use]
+    pub const fn disposition(&self) -> CaptureDisposition {
+        self.disposition
+    }
+
+    /// Returns the full observed byte count.
+    #[must_use]
+    pub const fn total_bytes(&self) -> u64 {
+        self.total_bytes
+    }
+
+    /// Returns the full observed SHA-256 over bytes actually drained.
+    #[must_use]
+    pub fn observed_sha256(&self) -> String {
+        format!("{:x}", self.digest.clone().finalize())
+    }
+
+    /// Returns the bounded retained prefix for diagnostics/preview.
+    #[must_use]
+    pub fn prefix(&self) -> &[u8] {
+        &self.prefix
+    }
+
+    /// Returns whether bytes beyond the retained prefix were observed.
+    #[must_use]
+    pub const fn truncated(&self) -> bool {
+        self.truncated
+    }
+
+    /// Returns whether sink pressure overflow latched while draining: the
+    /// observed stream exceeded the #267 port isolation ceiling, persistence
+    /// pressure was shed, and the pipe kept draining with exact digest/count.
+    #[must_use]
+    pub const fn backpressure_observed(&self) -> bool {
+        self.backpressured
+    }
+
+    /// Returns bytes counted against the sink-pressure isolation ceiling.
+    #[must_use]
+    pub const fn sink_pressure_bytes(&self) -> u64 {
+        self.sink_pressure_bytes
+    }
+
+    /// Returns the #267 port isolation ceiling in bytes.
+    #[must_use]
+    pub const fn backpressure_ceiling(&self) -> u64 {
+        self.backpressure_ceiling
+    }
+
+    /// Returns whether EOF landed (including the zero-byte case).
+    #[must_use]
+    pub const fn eof_complete(&self) -> bool {
+        matches!(self.disposition, CaptureDisposition::Eof)
+    }
+
+    /// Returns whether capture is available for this session: requested,
+    /// owned by a drain thread, and not fenced unavailable.
+    #[must_use]
+    pub const fn capture_available(&self) -> bool {
+        self.requested
+            && self.draining
+            && !matches!(
+                self.disposition,
+                CaptureDisposition::CaptureUnavailable
+            )
     }
 
     fn snapshot(&self) -> CapturedStream {
         CapturedStream {
-            bytes: self.bytes.clone(),
+            bytes: self.prefix.clone(),
             total_bytes: self.total_bytes,
             truncated: self.truncated,
-            complete: self.complete,
-            captured: self.captured,
+            complete: self.disposition.is_eof_complete(),
+            captured: self.draining,
         }
     }
 }
@@ -213,8 +523,8 @@ struct Operation {
     state: ProcessState,
     sink: Arc<dyn ProcessEvidenceSink>,
     child: Option<RunningJobChild<ValidatedDispatch>>,
-    stdout: Arc<Mutex<StreamCapture>>,
-    stderr: Arc<Mutex<StreamCapture>>,
+    stdout: Arc<Mutex<CaptureSession>>,
+    stderr: Arc<Mutex<CaptureSession>>,
     stdout_thread: Option<JoinHandle<()>>,
     stderr_thread: Option<JoinHandle<()>>,
     deadline: Instant,
@@ -1104,11 +1414,13 @@ impl ProcessExecutor for WindowsProcessExecutor {
                     Some("P-02 suspended launch and resume observed".to_owned()),
                 )?,
             )?;
-            let stdout = Arc::new(Mutex::new(StreamCapture::new(
+            let stdout = Arc::new(Mutex::new(CaptureSession::new(
+                "stdout",
                 retention(stdout_limit, self.capture_limit),
                 stdout_requested,
             )));
-            let stderr = Arc::new(Mutex::new(StreamCapture::new(
+            let stderr = Arc::new(Mutex::new(CaptureSession::new(
+                "stderr",
                 retention(stderr_limit, self.capture_limit),
                 stderr_requested,
             )));
@@ -1528,22 +1840,31 @@ impl ProcessExecutor for WindowsProcessExecutor {
                 quarantine_operation(&mut guard);
                 return Err(error.into());
             }
-            if guard.state.view().lifecycle() == ProcessLifecycle::Cancelling
-                && let Err(error) = finalize_operation(&mut guard, ExitDisposition::Cancelled, true)
-            {
-                quarantine_operation(&mut guard);
-                // `finalize_operation` is the same tree-termination path the
-                // start failure routes use: it may have fenced this op as
-                // `UnknownOutcome` while proving the containment attempt, or
-                // it may surface a typed contract error for the same fence.
-                // Surface the honest typed outcome instead of falling through
-                // to a second `cancel()` projection that can never succeed
-                // from `UnknownOutcome` (and would fabricate an
-                // `InvalidTransition` contract error for a contained op).
-                if guard.state.view().lifecycle() == ProcessLifecycle::UnknownOutcome {
-                    return Err(ProcessExecutionError::UnknownOutcome);
+            if guard.state.view().lifecycle() == ProcessLifecycle::Cancelling {
+                let finalize_result =
+                    finalize_operation(&mut guard, ExitDisposition::Cancelled, true);
+                // Land cancel-before-EOF on any session the finalize path
+                // could not join to EOF (early containment returns, abandoned
+                // threads): the guarded landing preserves an EOF the drain
+                // already proved, so the healthy cancel-receipt path keeps its
+                // exact closure evidence while a genuinely cut-short capture
+                // lands typed `CancelledBeforeEof` for exactly this op.
+                mark_operation_cancelled_before_eof(&guard.stdout, &guard.stderr);
+                if let Err(error) = finalize_result {
+                    quarantine_operation(&mut guard);
+                    // `finalize_operation` is the same tree-termination path the
+                    // start failure routes use: it may have fenced this op as
+                    // `UnknownOutcome` while proving the containment attempt, or
+                    // it may surface a typed contract error for the same fence.
+                    // Surface the honest typed outcome instead of falling through
+                    // to a second `cancel()` projection that can never succeed
+                    // from `UnknownOutcome` (and would fabricate an
+                    // `InvalidTransition` contract error for a contained op).
+                    if guard.state.view().lifecycle() == ProcessLifecycle::UnknownOutcome {
+                        return Err(ProcessExecutionError::UnknownOutcome);
+                    }
+                    return Err(error);
                 }
-                return Err(error);
             }
             // Re-read the receipt after the finalize path so the returned
             // descendants prove the post-finalize tree state instead of the
@@ -1716,6 +2037,29 @@ fn refresh_operation(operation: &mut Operation) -> Result<(), ProcessExecutionEr
     }
 }
 
+/// Joins both capture streams for a finalizing operation.
+///
+/// A cancelled capture that never reached EOF (abandoned thread, missing
+/// join, lock loss) lands typed `CancelledBeforeEof` here for exactly this
+/// operation; landed EOF/read terminals are preserved, so a healthy drain
+/// keeps its exact closure evidence.
+#[cfg(windows)]
+fn join_finalize_streams(
+    operation: &mut Operation,
+    cancelled: bool,
+) -> Result<(), ProcessExecutionError> {
+    if !join_streams(operation) {
+        if cancelled {
+            mark_operation_cancelled_before_eof(&operation.stdout, &operation.stderr);
+        }
+        return Err(ProcessExecutionError::UnknownOutcome);
+    }
+    if cancelled {
+        mark_operation_cancelled_before_eof(&operation.stdout, &operation.stderr);
+    }
+    Ok(())
+}
+
 #[cfg(windows)]
 fn finalize_operation(
     operation: &mut Operation,
@@ -1807,7 +2151,7 @@ fn finalize_operation(
             return Err(error.into());
         }
     };
-    if !join_streams(operation) {
+    if join_finalize_streams(operation, cancelled).is_err() {
         operation.termination = Some(termination);
         operation.cleanup_required = true;
         return Err(ProcessExecutionError::UnknownOutcome);
@@ -2258,6 +2602,29 @@ impl Drop for S84PublishArmGuard<'_> {
 }
 
 #[cfg(windows)]
+fn session_join_disposition(
+    status: CaptureDisposition,
+    thread_id: Option<&String>,
+) -> Option<CaptureFailureDisposition> {
+    // One owned session maps to exactly one join verdict: EOF drains pass,
+    // read failures keep their typed contour, and every non-EOF terminal
+    // (cancelled-before-EOF, capture-unavailable, unknown, still draining)
+    // fences as incomplete/spawn-failed instead of fabricating completeness.
+    match status {
+        CaptureDisposition::Eof => None,
+        CaptureDisposition::ReadFailed => Some(CaptureFailureDisposition::ReadFailed),
+        CaptureDisposition::CancelledBeforeEof
+        | CaptureDisposition::CaptureUnavailable
+        | CaptureDisposition::UnknownOutcome
+        | CaptureDisposition::Draining => Some(if thread_id.is_some() {
+            CaptureFailureDisposition::Incomplete
+        } else {
+            CaptureFailureDisposition::SpawnFailed
+        }),
+    }
+}
+
+#[cfg(windows)]
 fn join_streams(operation: &mut Operation) -> bool {
     let stdout_result = join_capture_thread(&mut operation.stdout_thread, "stdout");
     let stderr_result = join_capture_thread(&mut operation.stderr_thread, "stderr");
@@ -2268,45 +2635,31 @@ fn join_streams(operation: &mut Operation) -> bool {
     if let Err(failure) = &stderr_result {
         failures.push(failure.clone());
     }
-    if let Ok(thread_id) = &stdout_result {
-        let (complete, read_error) = capture_status(&operation.stdout);
-        if read_error {
-            failures.push(CaptureFailure {
-                stream: "stdout",
-                thread_id: thread_id.clone(),
-                disposition: CaptureFailureDisposition::ReadFailed,
-            });
-        } else if !complete {
-            failures.push(CaptureFailure {
-                stream: "stdout",
-                thread_id: thread_id.clone(),
-                disposition: if thread_id.is_some() {
-                    CaptureFailureDisposition::Incomplete
-                } else {
-                    CaptureFailureDisposition::SpawnFailed
-                },
-            });
-        }
+    // An unrequested stream never owns a pipe: it stays `CaptureUnavailable`
+    // with zero claimed bytes and can never fail a join. Only requested
+    // sessions resolve through the typed join verdict, so a limit-0 stream
+    // keeps the base pass behavior instead of fencing as spawn-failed.
+    if let Ok(thread_id) = &stdout_result
+        && session_requested(&operation.stdout)
+        && let Some(disposition) =
+            session_join_disposition(session_status(&operation.stdout), thread_id.as_ref())
+    {
+        failures.push(CaptureFailure {
+            stream: "stdout",
+            thread_id: thread_id.clone(),
+            disposition,
+        });
     }
-    if let Ok(thread_id) = &stderr_result {
-        let (complete, read_error) = capture_status(&operation.stderr);
-        if read_error {
-            failures.push(CaptureFailure {
-                stream: "stderr",
-                thread_id: thread_id.clone(),
-                disposition: CaptureFailureDisposition::ReadFailed,
-            });
-        } else if !complete {
-            failures.push(CaptureFailure {
-                stream: "stderr",
-                thread_id: thread_id.clone(),
-                disposition: if thread_id.is_some() {
-                    CaptureFailureDisposition::Incomplete
-                } else {
-                    CaptureFailureDisposition::SpawnFailed
-                },
-            });
-        }
+    if let Ok(thread_id) = &stderr_result
+        && session_requested(&operation.stderr)
+        && let Some(disposition) =
+            session_join_disposition(session_status(&operation.stderr), thread_id.as_ref())
+    {
+        failures.push(CaptureFailure {
+            stream: "stderr",
+            thread_id: thread_id.clone(),
+            disposition,
+        });
     }
     for failure in &failures {
         if !operation.capture_failures.contains(failure) {
@@ -2359,17 +2712,49 @@ fn join_capture_thread(
 }
 
 #[cfg(windows)]
-fn capture_status(capture: &Arc<Mutex<StreamCapture>>) -> (bool, bool) {
-    capture.lock().map_or((false, true), |guard| {
-        (!guard.requested || guard.complete, guard.read_error)
+fn session_status(session: &Arc<Mutex<CaptureSession>>) -> CaptureDisposition {
+    session.lock().map_or(CaptureDisposition::UnknownOutcome, |guard| {
+        guard.disposition()
     })
+}
+
+/// Lands `CancelledBeforeEof` on both stream sessions of one cancelled
+/// operation through the guarded single-terminal landing.
+///
+/// A session that already reached `Eof`/`ReadFailed`/unavailable/unknown keeps
+/// its terminal, so a healthy drain that already proved EOF is never rewritten
+/// (the #83 cancel-receipt path never regresses). A session still draining —
+/// abandoned thread, missing join, or containment failure — honestly records
+/// that cancellation ended capture before EOF. Lock loss keeps the prior state
+/// and is fenced as `UnknownOutcome` by the join path for exactly this
+/// operation; nothing is fabricated and no sibling operation is touched.
+#[cfg(windows)]
+fn mark_operation_cancelled_before_eof(
+    stdout: &Arc<Mutex<CaptureSession>>,
+    stderr: &Arc<Mutex<CaptureSession>>,
+) {
+    for session in [stdout, stderr] {
+        if let Ok(mut guard) = session.lock() {
+            guard.cancel_before_eof();
+        }
+    }
+}
+
+/// Returns whether one capture session was requested.
+///
+/// An unrequested session never owns a pipe and can never fail a join: it
+/// stays `CaptureUnavailable` with zero claimed bytes. Requested sessions
+/// always resolve through [`session_join_disposition`].
+#[cfg(windows)]
+fn session_requested(session: &Arc<Mutex<CaptureSession>>) -> bool {
+    session.lock().is_ok_and(|guard| guard.requested())
 }
 
 #[cfg(windows)]
 fn spawn_capture(
     stream: &'static str,
     file: Option<std::fs::File>,
-    capture: Arc<Mutex<StreamCapture>>,
+    session: Arc<Mutex<CaptureSession>>,
     injection: Option<CaptureSpawnInjection>,
 ) -> Result<Option<JoinHandle<()>>, ProcessExecutionError> {
     // Issue-84 state machine note (§1): stream-capture ownership is installed
@@ -2386,14 +2771,20 @@ fn spawn_capture(
             "injected {stream} capture spawn failure"
         )));
     }
-    let requested = capture
+    let requested = session
         .lock()
         .map_err(|_| unavailable(format!("{stream} capture lock poisoned")))?
-        .requested;
+        .requested();
     if !requested {
         return Ok(None);
     }
     let Some(mut file) = file else {
+        // The pipe handle is missing while the stream was requested: fence
+        // this session as capture-unavailable so production never claims a
+        // byte it did not observe and never mints a durable-source handle.
+        if let Ok(mut guard) = session.lock() {
+            guard.mark_capture_unavailable();
+        }
         return Err(unavailable(format!(
             "requested {stream} capture reader handle is missing"
         )));
@@ -2401,13 +2792,16 @@ fn spawn_capture(
     let thread = thread::Builder::new()
         .name("eliot-p04-stream".to_owned())
         .spawn(move || {
-            if let Ok(mut guard) = capture.lock() {
-                guard.captured = true;
+            // Claim drain ownership before the first read so
+            // `capture_available` is exact from thread start.
+            if let Ok(mut guard) = session.lock() {
+                guard.mark_draining();
             } else {
                 return;
             }
             let mut buffer = [0_u8; STREAM_CHUNK_BYTES];
             let mut reached_eof = false;
+            let mut read_failed = false;
             loop {
                 match file.read(&mut buffer) {
                     Ok(0) => {
@@ -2415,28 +2809,36 @@ fn spawn_capture(
                         break;
                     }
                     Ok(read) => {
-                        let Some(mut guard) = capture.lock().ok() else {
+                        let Some(mut guard) = session.lock().ok() else {
                             return;
                         };
-                        guard.digest.update(&buffer[..read]);
-                        guard.total_bytes = guard.total_bytes.saturating_add(read as u64);
-                        let remaining = guard.limit.saturating_sub(guard.bytes.len());
-                        let retained = read.min(remaining);
-                        guard.bytes.extend_from_slice(&buffer[..retained]);
-                        if retained < read {
-                            guard.truncated = true;
-                        }
+                        // Bounded memory: the full digest/count always advance
+                        // over the observed bytes while only the prefix stays
+                        // retained. A lock loss here ends the drain without
+                        // landing a disposition; the join path fences unknown.
+                        guard.observe(&buffer[..read]);
                     }
                     Err(_) => {
-                        if let Ok(mut guard) = capture.lock() {
-                            guard.read_error = true;
-                        }
+                        read_failed = true;
                         break;
                     }
                 }
             }
-            if reached_eof && let Ok(mut guard) = capture.lock() {
-                guard.complete = true;
+            // Land exactly one terminal disposition from the bytes actually
+            // observed: zero-byte EOF keeps the empty digest/count, a read
+            // failure keeps the observed prefix queryable, and no
+            // durable-source handle string is ever minted. The landing is
+            // guarded so a cancellation that already ended capture keeps its
+            // typed `CancelledBeforeEof` instead of being overwritten by a
+            // trailing EOF/read result from torn-down pipes.
+            if let Ok(mut guard) = session.lock() {
+                if read_failed {
+                    guard.land_drain_terminal(CaptureDisposition::ReadFailed);
+                } else if reached_eof {
+                    guard.land_drain_terminal(CaptureDisposition::Eof);
+                } else {
+                    guard.land_drain_terminal(CaptureDisposition::UnknownOutcome);
+                }
             }
         })
         .map_err(|error| unavailable(format!("{stream} capture reader spawn failed: {error}")))?;
@@ -2469,46 +2871,128 @@ fn p04_stream_policy() -> Result<ProcessStreamPolicyBinding, ProcessExecutionErr
     .map_err(|_| ProcessExecutionError::UnknownOutcome)
 }
 
+/// Maps one owned capture session to its exact transport status.
+///
+/// Every terminal session state has exactly one typed transport contour:
+/// EOF drains stay `Complete`, read failures stay `ReadFailed`,
+/// cancellation-before-EOF stays `CancelledBeforeEof`, and both
+/// capture-unavailable and unknown-outcome stay `UnknownOutcome`. A session
+/// still draining is never promoted: it reports `UnknownOutcome` so
+/// `ProcessEvidence` construction waits for the terminal (or an explicitly
+/// partial/unavailable) disposition instead of fabricating completeness.
+#[cfg(windows)]
+fn session_transport(disposition: CaptureDisposition) -> StreamTransportStatus {
+    match disposition {
+        CaptureDisposition::Draining | CaptureDisposition::UnknownOutcome => {
+            StreamTransportStatus::UnknownOutcome
+        }
+        CaptureDisposition::Eof => StreamTransportStatus::Complete,
+        CaptureDisposition::ReadFailed => StreamTransportStatus::ReadFailed,
+        CaptureDisposition::CaptureUnavailable => StreamTransportStatus::CaptureUnavailable,
+        CaptureDisposition::CancelledBeforeEof => StreamTransportStatus::CancelledBeforeEof,
+    }
+}
+
 #[cfg(windows)]
 fn typed_stream_evidence(
-    capture: &Arc<Mutex<StreamCapture>>,
+    session: &Arc<Mutex<CaptureSession>>,
     kind: ProcessStreamKind,
     binding: &ProcessExecutionBinding,
 ) -> Result<Option<ProcessStreamEvidence>, ProcessExecutionError> {
-    let (retained, total_bytes, observed_sha256) = {
-        let guard = capture
+    // One owned session resolves to exactly one typed evidence: the full
+    // transport digest/count accumulated from the bytes actually observed,
+    // the admissible-source identity (SHA-256/count over that same observed
+    // stream), a bounded preview with its exact omission range, and the
+    // typed durable-source disposition. Only an EOF session resolves to
+    // complete transport; every other disposition keeps its honest typed
+    // state instead of fabricating complete proof.
+    let (retained, total_bytes, observed_sha256, disposition, backpressured) = {
+        let guard = session
             .lock()
             .map_err(|_| ProcessExecutionError::UnknownOutcome)?;
-        if !guard.requested || !guard.captured {
+        if !guard.requested() {
             return Ok(None);
         }
-        if guard.read_error || !guard.complete {
-            return Err(ProcessExecutionError::UnknownOutcome);
+        if !guard.capture_available() {
+            // Requested but no drain thread owns the pipe (missing handle or
+            // spawn failure fenced at setup): the stream is capture-
+            // unavailable with exact zero-byte custody and no source
+            // locator.
+            let policy = p04_stream_policy()?;
+            let preview = ProcessStreamPrefixPreview::from_transport_prefix(
+                Vec::new(),
+                0,
+            )
+            .map_err(|_| ProcessExecutionError::UnknownOutcome)?;
+            let evidence = ProcessStreamEvidence::new_raw(
+                binding.clone(),
+                kind,
+                policy,
+                StreamTransportStatus::CaptureUnavailable,
+                StreamPersistenceStatus::SourceUnavailable,
+                crate::empty_sha256_hex(),
+                0,
+                preview,
+                None,
+                vec![StreamEvidenceGap::CaptureUnavailable],
+            )
+            .map_err(|_| ProcessExecutionError::UnknownOutcome)?;
+            return Ok(Some(evidence));
         }
-        let observed_sha256 = format!("{:x}", guard.digest.clone().finalize());
-        (guard.bytes.clone(), guard.total_bytes, observed_sha256)
+        let disposition = guard.disposition();
+        match disposition {
+            CaptureDisposition::Eof => {}
+            CaptureDisposition::ReadFailed
+            | CaptureDisposition::CancelledBeforeEof
+            | CaptureDisposition::CaptureUnavailable
+            | CaptureDisposition::UnknownOutcome
+            | CaptureDisposition::Draining => {
+                return Err(ProcessExecutionError::UnknownOutcome);
+            }
+        }
+        let observed_sha256 = guard.observed_sha256();
+        (
+            guard.prefix().to_vec(),
+            guard.total_bytes(),
+            observed_sha256,
+            disposition,
+            guard.backpressure_observed(),
+        )
     };
     let mut prefix = retained;
     if prefix.len() > EVIDENCE_PREVIEW_CEILING {
         prefix.truncate(EVIDENCE_PREVIEW_CEILING);
     }
     let policy = p04_stream_policy()?;
+    let transport = session_transport(disposition);
     let preview = ProcessStreamPrefixPreview::from_transport_prefix(prefix, total_bytes)
         .map_err(|_| ProcessExecutionError::UnknownOutcome)?;
     // No durable provider is wired in P-04; the store backend is T3-owned, so
-    // persistence is always `SourceUnavailable` with exactly the
-    // `PersistenceUnavailable` gap and no source locator.
+    // persistence stays `SourceUnavailable` with no source locator (no `raw:*`
+    // handle is ever minted). When the session latched sink-pressure overflow
+    // while draining, the exact `PersistenceBackpressure` gap travels alongside
+    // `PersistenceUnavailable`: pressure was shed and the pipe kept draining
+    // with exact digest/count, instead of blocking capture on persistence I/O.
+    // The complete evidence still resolves to bytes whose digest/count match
+    // the full observed stream: `observed_sha256`/`observed_bytes` above are
+    // the session accumulators over every drained byte, and the preview
+    // carries the bounded retained prefix with its exact `[retained, observed)`
+    // omission range.
+    let mut gaps = vec![StreamEvidenceGap::PersistenceUnavailable];
+    if backpressured {
+        gaps.push(StreamEvidenceGap::PersistenceBackpressure);
+    }
     let evidence = ProcessStreamEvidence::new_raw(
         binding.clone(),
         kind,
         policy,
-        StreamTransportStatus::Complete,
+        transport,
         StreamPersistenceStatus::SourceUnavailable,
         observed_sha256,
         total_bytes,
         preview,
         None,
-        vec![StreamEvidenceGap::PersistenceUnavailable],
+        gaps,
     )
     .map_err(|_| ProcessExecutionError::UnknownOutcome)?;
     Ok(Some(evidence))
@@ -2536,6 +3020,16 @@ fn short_digest(bytes: &[u8]) -> String {
     let mut hasher = Sha256::new();
     hasher.update(bytes);
     format!("{:x}", hasher.finalize())
+}
+
+/// Canonical SHA-256 hex over zero observed bytes.
+///
+/// The zero-byte-EOF identity: a capture session that drained nothing still
+/// resolves its `observed_sha256` to this digest, and capture-unavailable
+/// transport claims exactly this digest with a zero count.
+#[must_use]
+pub fn empty_sha256_hex() -> String {
+    short_digest(&[])
 }
 
 fn now_ms() -> u64 {
@@ -3539,6 +4033,198 @@ mod tests {
             )?,
         )?;
         Ok(ProcessRequest::new(intent, permit)?)
+    }
+
+    #[test]
+    fn capture_session_accumulates_digest_count_and_bounded_prefix() {
+        // Issue #268 production half: one owned session accumulates the full
+        // transport digest/count over the bytes actually observed while the
+        // retained prefix stays bounded to the ceiling.
+        let payload: Vec<u8> = (0_u32..300).map(|i| (i % 251) as u8).collect();
+        let mut session = super::CaptureSession::new("stdout", 64, true);
+        session.mark_draining();
+        session.observe(&payload[..100]);
+        session.observe(&payload[100..]);
+        session.mark_eof();
+        assert_eq!(session.total_bytes(), 300);
+        assert_eq!(session.observed_sha256(), super::short_digest(&payload));
+        assert!(session.eof_complete());
+        assert!(session.truncated());
+        assert_eq!(session.prefix(), &payload[..64]);
+        assert!(session.capture_available());
+    }
+
+    #[test]
+    fn capture_session_preserves_zero_byte_eof() {
+        // Issue #268 production half: a zero-byte EOF keeps the empty
+        // SHA-256/count identity with no retained prefix and no truncation.
+        let mut session = super::CaptureSession::new("stderr", 64, true);
+        session.mark_draining();
+        session.mark_eof();
+        assert_eq!(session.total_bytes(), 0);
+        assert_eq!(session.observed_sha256(), super::empty_sha256_hex());
+        assert!(session.eof_complete());
+        assert!(!session.truncated());
+        assert!(session.prefix().is_empty());
+        assert!(session.capture_available());
+    }
+
+    /// Issue #268 test helper: locks a fake-executor session, recovering
+    /// through poison (test sessions are never poisoned; the recovery keeps
+    /// the helper total without `expect`).
+    #[cfg(windows)]
+    fn lock_session(
+        session: &Arc<Mutex<super::CaptureSession>>,
+    ) -> std::sync::MutexGuard<'_, super::CaptureSession> {
+        session
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// Issue #268 (cancel-before-EOF): the cancel path lands typed
+    /// `CancelledBeforeEof` on exactly the cancelled operation while a sibling
+    /// operation stays independently drivable.
+    ///
+    /// Fake-executor level, no live pipes: two owned session pairs stand in
+    /// for operations A and B. A is driven with a partial prefix and cancelled
+    /// through the production cancel-path caller
+    /// (`mark_operation_cancelled_before_eof`, the same helper `cancel()` and
+    /// `finalize_operation(cancelled=true)` invoke); B is driven past the sink
+    /// isolation ceiling, completed, and cancelled independently. The drain
+    /// never blocks on persistence: overflow only latches the typed
+    /// backpressure fact while digest/count stay exact. No `raw:*` handle is
+    /// minted anywhere. Honest self-skip on non-Windows (the typed
+    /// transport/join mappings under test are Windows-gated); the live
+    /// cancel-receipt edge stays the declared ceiling.
+    #[test]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "the cancel/sibling/backpressure/raw-handle assertions are one acceptance surface for issue 268"
+    )]
+    fn cancelled_capture_lands_typed_cancelled_before_eof_and_keeps_sibling_op_healthy() {
+        #[cfg(not(windows))]
+        {
+            assert!(
+                cfg!(not(windows)),
+                "non-Windows targets must take the explicit skip branch"
+            );
+        }
+        #[cfg(windows)]
+        {
+            use eliot_process::StreamTransportStatus;
+
+            let mint = |stream: &'static str| {
+                Arc::new(Mutex::new(super::CaptureSession::new(stream, 64, true)))
+            };
+            // Operation A: partial stdout prefix, silent stderr; both draining.
+            let a_stdout = mint("stdout");
+            let a_stderr = mint("stderr");
+            lock_session(&a_stdout).mark_draining();
+            lock_session(&a_stdout).observe(b"partial-prefix");
+            lock_session(&a_stderr).mark_draining();
+            // Operation B (sibling): draining pair, untouched by A's cancel.
+            let b_stdout = mint("stdout");
+            let b_stderr = mint("stderr");
+            lock_session(&b_stdout).mark_draining();
+            lock_session(&b_stderr).mark_draining();
+            // Bounded backpressure isolation on B: drive past the #267 port
+            // ceiling. `observe` returns immediately (never blocks on
+            // persistence) while the full digest/count stay exact and only the
+            // prefix stays bounded.
+            let big: Vec<u8> = (0_u32..80_000).map(|i| (i % 251) as u8).collect();
+            lock_session(&b_stdout).observe(&big);
+            {
+                let guard = lock_session(&b_stdout);
+                assert!(guard.backpressure_observed());
+                assert!(guard.sink_pressure_bytes() > guard.backpressure_ceiling());
+                assert_eq!(guard.total_bytes(), 80_000);
+                assert_eq!(guard.observed_sha256(), super::short_digest(&big));
+                assert_eq!(guard.prefix().len(), 64);
+                assert_eq!(guard.prefix(), &big[..64]);
+                assert!(guard.truncated());
+                assert_eq!(guard.disposition(), super::CaptureDisposition::Draining);
+            }
+            // The cancel path lands typed `CancelledBeforeEof` on A only,
+            // through the production caller rather than the session methods.
+            super::mark_operation_cancelled_before_eof(&a_stdout, &a_stderr);
+            for session in [&a_stdout, &a_stderr] {
+                let disposition = lock_session(session).disposition();
+                assert_eq!(disposition, super::CaptureDisposition::CancelledBeforeEof);
+                assert_eq!(
+                    super::session_transport(disposition),
+                    StreamTransportStatus::CancelledBeforeEof
+                );
+                // Never complete proof: only `Eof` resolves to `Complete`.
+                assert_ne!(
+                    super::session_transport(disposition),
+                    StreamTransportStatus::Complete
+                );
+            }
+            // A's observed prefix stays queryable after cancel (not orphaned).
+            {
+                let guard = lock_session(&a_stdout);
+                assert_eq!(guard.prefix(), b"partial-prefix");
+                assert_eq!(guard.total_bytes(), 14);
+                assert!(!guard.eof_complete());
+            }
+            // The join verdict fences A as `Incomplete` with an owned thread
+            // (`SpawnFailed` without one): never a pass, never `ReadFailed`.
+            let thread_id = "ThreadId(7)".to_owned();
+            assert_eq!(
+                super::session_join_disposition(
+                    super::CaptureDisposition::CancelledBeforeEof,
+                    Some(&thread_id)
+                ),
+                Some(super::CaptureFailureDisposition::Incomplete)
+            );
+            assert_eq!(
+                super::session_join_disposition(
+                    super::CaptureDisposition::CancelledBeforeEof,
+                    None
+                ),
+                Some(super::CaptureFailureDisposition::SpawnFailed)
+            );
+            // Sibling B is untouched by A's cancel: still draining, still
+            // completable, independently cancellable.
+            assert_eq!(
+                lock_session(&b_stdout).disposition(),
+                super::CaptureDisposition::Draining
+            );
+            lock_session(&b_stdout).mark_eof();
+            assert_eq!(
+                super::session_transport(lock_session(&b_stdout).disposition()),
+                StreamTransportStatus::Complete
+            );
+            assert_eq!(
+                super::session_join_disposition(super::CaptureDisposition::Eof, Some(&thread_id)),
+                None
+            );
+            super::mark_operation_cancelled_before_eof(&b_stdout, &b_stderr);
+            assert_eq!(
+                lock_session(&b_stderr).disposition(),
+                super::CaptureDisposition::CancelledBeforeEof
+            );
+            // B's EOF custody is preserved: a late cancel never rewrites exact
+            // completion into cancellation.
+            assert_eq!(
+                lock_session(&b_stdout).disposition(),
+                super::CaptureDisposition::Eof
+            );
+            // A stayed cancelled while B moved independently: failures are
+            // operation-local in both directions.
+            assert_eq!(
+                lock_session(&a_stdout).disposition(),
+                super::CaptureDisposition::CancelledBeforeEof
+            );
+            // No production path mints a `raw:*` stream handle: sessions carry
+            // only their stream labels and typed dispositions.
+            for session in [&a_stdout, &a_stderr, &b_stdout, &b_stderr] {
+                let debug = format!("{:?}", lock_session(session));
+                assert!(!debug.contains("raw:"), "no raw handle, got {debug:?}");
+            }
+            assert_eq!(lock_session(&a_stdout).stream(), "stdout");
+            assert_eq!(lock_session(&a_stderr).stream(), "stderr");
+        }
     }
 
     #[test]
