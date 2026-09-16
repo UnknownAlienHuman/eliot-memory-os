@@ -1,0 +1,7 @@
+{
+  "description": "WORK_UNIT_CASE 775/20: malformed dreamer mutation identity (blank idempotency key) must fail closed as InvalidField, never panic.",
+  "operation_id": "operation-775-20-malformed",
+  "idempotency_key": "",
+  "canonical_request_hash": "0000000000000000000000000000000000000000000000000000000000000000",
+  "operation_kind": "SUBMIT_JOB"
+}
