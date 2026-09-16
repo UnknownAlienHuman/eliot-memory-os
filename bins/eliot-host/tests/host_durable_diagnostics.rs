@@ -1399,6 +1399,13 @@ fn durable_t_b_sink_failure_leaves_operation_identical() {
 }
 
 // WORK_UNIT_CASE: 893/25
+fn semantic_lines(capture: &str) -> Vec<&str> {
+    capture
+        .lines()
+        .map(|line| line.split_once(' ').map_or(line, |(_, rest)| rest))
+        .collect()
+}
+
 #[test]
 fn durable_25_deterministic_captures_under_injected_schedule() {
     // Deterministic semantic captures: the injected-fault seam and the
@@ -1444,12 +1451,6 @@ fn durable_25_deterministic_captures_under_injected_schedule() {
     // Wall-clock timestamps prefix every record (observational timing stays
     // separate from semantics), so determinism compares the semantic suffix
     // of each line.
-    fn semantic_lines(capture: &str) -> Vec<&str> {
-        capture
-            .lines()
-            .map(|line| line.split_once(' ').map(|(_, rest)| rest).unwrap_or(line))
-            .collect()
-    }
     assert_eq!(
         semantic_lines(&first),
         semantic_lines(&second),
@@ -1532,6 +1533,6 @@ fn durable_26_actual_path_and_diff_guard() {
     // No duplicate evaluation: terminal emission sites are singular per code
     // (proven in case 22); phase observations are pure static literals with
     // no computed values to evaluate twice.
-    assert!(fixture["allowed_diff"]["single_terminal_per_failed_op"].as_bool() == Some(true));
-    assert!(fixture["allowed_diff"]["no_new_logging_subsystem"].as_bool() == Some(true));
+    assert_eq!(fixture["allowed_diff"]["single_terminal_per_failed_op"].as_bool(), Some(true));
+    assert_eq!(fixture["allowed_diff"]["no_new_logging_subsystem"].as_bool(), Some(true));
 }
