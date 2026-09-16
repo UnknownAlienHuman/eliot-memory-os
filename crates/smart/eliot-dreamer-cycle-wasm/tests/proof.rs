@@ -2,6 +2,7 @@
 #![allow(
     clippy::assigning_clones,
     clippy::expect_used,
+    clippy::print_stderr,
     clippy::similar_names,
     clippy::too_many_lines,
     clippy::unwrap_used
@@ -770,10 +771,7 @@ fn exact_and_one_over_every_independent_budget() {
     assert!(over_native.requests.is_empty());
     let over_response = handle_request_typed(&guest_envelope(over, Vec::new(), over_policy));
     assert_eq!(over_response.error, None);
-    assert_eq!(
-        over_response.step.expect("replayed step"),
-        over_native
-    );
+    assert_eq!(over_response.step.expect("replayed step"), over_native);
 
     // MAX_RECORDS observations: guest preflights with zero calls, native reports Bound.
     let many = vec![observed.clone(); MAX_RECORDS + 1];
@@ -1261,10 +1259,9 @@ fn every_native_error_maps_exhaustively() {
     // BudgetBlocked: zero request allowance on the activation scenario.
     let (activation_envelope, activation_state, activation_policy, _) = activation();
     let _ = activation_envelope;
-    let (blocked_state, blocked_policy) =
-        retune(&activation_state, &activation_policy, |policy| {
-            policy.max_requests = 0;
-        });
+    let (blocked_state, blocked_policy) = retune(&activation_state, &activation_policy, |policy| {
+        policy.max_requests = 0;
+    });
     natives.push(step_dreamer_cycle(&blocked_state, &[], &blocked_policy).unwrap_err());
     // Contract: screen binding with a non-hex digest fails inner validation.
     let mut bad_screen = screen_for(&request);
@@ -1537,9 +1534,12 @@ fn output_bound_retains_frontier() {
     let (parity_state, parity_policy) = retune(&current, &current_policy, |policy| {
         policy.max_bytes = exact_len;
     });
-    let parity_native =
-        step_dreamer_cycle(&parity_state, std::slice::from_ref(&partial), &parity_policy)
-            .unwrap();
+    let parity_native = step_dreamer_cycle(
+        &parity_state,
+        std::slice::from_ref(&partial),
+        &parity_policy,
+    )
+    .unwrap();
     assert_eq!(step, parity_native);
     // One byte less fails closed instead of truncating the frontier.
     let (over, over_policy) = retune(&current, &current_policy, |policy| {
@@ -1554,29 +1554,8 @@ fn output_bound_retains_frontier() {
 // WORK_UNIT_CASE: 644/19
 #[test]
 fn actual_built_import_inspection() {
-    let found = candidate_artifact_paths()
-        .into_iter()
-        .find(|path| path.is_file());
-    if let Some(path) = found {
-        let bytes = std::fs::read(&path).unwrap_or_else(|_| panic!("read {}", path.display()));
-        let imports = check_wasm_imports(&bytes).expect("built artifact passes the gate");
-        for import in &imports {
-            assert!(
-                !is_forbidden_import(&import.module, &import.name),
-                "built import {}::{} is not forbidden",
-                import.module,
-                import.name
-            );
-        }
-        eprintln!(
-            "inspected built artifact {}: {} imports",
-            path.display(),
-            imports.len()
-        );
-        return;
-    }
-    // ContractChallenge path (#758/#760/#870 OPEN): no built artifact on this
-    // machine, so the pinned gate itself is proven over fixtures.
+    // The pinned gate itself is proven over fixtures in both encodings first:
+    // core modules and components share one forbidden-namespace rule.
     for forbidden in eliot_dreamer_cycle_wasm::FORBIDDEN_IMPORT_SUBSTRINGS {
         assert!(
             is_forbidden_import(&format!("cap:{forbidden}"), "f"),
@@ -1602,6 +1581,18 @@ fn actual_built_import_inspection() {
             }
         );
     }
+    let component_forbidden = wat::parse_str(
+        "(component (import \"wasi:clocks/wall-clock@0.2.10\" (instance (export \"now\" (func)))))",
+    )
+    .expect("component wasi fixture");
+    let error = check_wasm_imports(&component_forbidden).expect_err("component import must fail");
+    assert_eq!(
+        error,
+        eliot_dreamer_cycle_wasm::DescriptorError::ForbiddenImport {
+            module: "wasi:clocks/wall-clock@0.2.10".into(),
+            name: "instance".into(),
+        }
+    );
     let benign =
         wat::parse_str("(module (func (export \"run\") (param i32) (result i32) local.get 0))")
             .expect("benign fixture");
@@ -1611,7 +1602,40 @@ fn actual_built_import_inspection() {
             .expect("benign passes")
             .is_empty()
     );
+    let benign_component = wat::parse_str("(component)").expect("benign component fixture");
+    assert_eq!(
+        list_wasm_imports(&benign_component).expect("component imports"),
+        vec![]
+    );
+    assert_eq!(
+        list_wasm_imports(b"not a module").expect_err("not wasm"),
+        eliot_dreamer_cycle_wasm::DescriptorError::NotWasm
+    );
     assert!(check_wasm_imports(b"not a module").is_err());
+    // Then the actual built component is inspected when the wasip2 release
+    // artifact exists on the proving machine.
+    let found = candidate_artifact_paths()
+        .into_iter()
+        .find(|path| path.is_file());
+    if let Some(path) = found {
+        let bytes = std::fs::read(&path).unwrap_or_else(|_| panic!("read {}", path.display()));
+        let imports = check_wasm_imports(&bytes).expect("built artifact passes the gate");
+        for import in &imports {
+            assert!(
+                !is_forbidden_import(&import.module, &import.name),
+                "built import {}::{} is not forbidden",
+                import.module,
+                import.name
+            );
+        }
+        eprintln!(
+            "inspected built artifact {}: {} imports",
+            path.display(),
+            imports.len()
+        );
+    } else {
+        eprintln!("no built wasip2 artifact present; gate proven over fixtures");
+    }
 }
 
 // WORK_UNIT_CASE: 644/20
@@ -1641,13 +1665,22 @@ fn no_scheduler_store_provider_process_path() {
     // list must name every issue-namespace capability, while no other source
     // file may touch scheduler, store, provider, process or effect paths.
     for namespace in [
-        "filesystem", "network", "stdio", "env", "args", "clock", "random", "process", "thread",
-        "credential", "store", "kernel", "provider",
+        "filesystem",
+        "network",
+        "stdio",
+        "env",
+        "args",
+        "clock",
+        "random",
+        "process",
+        "thread",
+        "credential",
+        "store",
+        "kernel",
+        "provider",
     ] {
         assert!(
-            eliot_dreamer_cycle_wasm::FORBIDDEN_IMPORT_SUBSTRINGS
-                .iter()
-                .any(|forbidden| *forbidden == namespace),
+            eliot_dreamer_cycle_wasm::FORBIDDEN_IMPORT_SUBSTRINGS.contains(&namespace),
             "gate must deny {namespace}"
         );
     }
@@ -1681,12 +1714,7 @@ fn no_scheduler_store_provider_process_path() {
     // No generic-serialization or stub escape in any source file.
     for name in ["lib.rs", "conversion.rs", "descriptor.rs", "export.rs"] {
         let source = read_src(name);
-        for forbidden in [
-            "serde_json::Value",
-            "unimplemented!",
-            "todo!",
-            "todo!()",
-        ] {
+        for forbidden in ["serde_json::Value", "unimplemented!", "todo!", "todo!()"] {
             assert!(
                 !source.contains(forbidden),
                 "{name} must not contain {forbidden}"
