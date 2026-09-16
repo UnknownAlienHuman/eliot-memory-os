@@ -1130,8 +1130,7 @@ impl ProcessEvidenceRecord {
             serde_json::to_vec(&evidence).map_err(|error| OrsError::Encoding(error.to_string()))?;
         // Lineage-aware binding (Implements #64): the active epoch comes only
         // from the owner's canonical `EpochId` via `authority_epoch`.
-        // Legacy numerics enter only via `import_legacy_scalar_epoch` with
-        // evidence, never via coercion.
+        // No scalar-to-authority coercion exists.
         let authority_epoch = owner.authority_epoch().clone();
         let record = Self {
             contract_version: CONTRACT_VERSION,
