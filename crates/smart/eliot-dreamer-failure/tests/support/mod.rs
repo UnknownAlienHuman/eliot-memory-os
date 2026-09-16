@@ -10,7 +10,6 @@ use eliot_contracts::{
     ProductId, RequestId, ResourceGeneration, SourceId, StateFence, TaskId, TaskRevision,
     TransactionSequence, sha256_hex,
 };
-use std::num::NonZeroU64;
 use eliot_dreamer_contracts::curation::{FailurePayload, TargetEvidence};
 use eliot_dreamer_contracts::*;
 use eliot_dreamer_failure::FailurePolicy;
@@ -23,6 +22,7 @@ use eliot_receipts::{
     ReceiptDisposition, ReceiptEnvelope, ReceiptKind, RequestBinding, TaskBinding, VerifierBinding,
     WorkScopeBinding, WorkScopeId, contract_identity,
 };
+use std::num::NonZeroU64;
 
 fn sample_job() -> DreamJobInput {
     DreamJobInput {
@@ -136,10 +136,7 @@ fn fence() -> StateFence {
     StateFence::new(test_epoch(), ResourceGeneration::genesis())
 }
 fn distinct_fence(generation: u64) -> StateFence {
-    StateFence::new(
-        test_epoch(),
-        ResourceGeneration::new(generation).unwrap(),
-    )
+    StateFence::new(test_epoch(), ResourceGeneration::new(generation).unwrap())
 }
 fn digest(value: &[u8]) -> String {
     sha256_hex(value)

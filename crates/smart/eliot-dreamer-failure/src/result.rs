@@ -246,7 +246,8 @@ fn choose_disposition(assessment: &FailureAssessment, cancelled: bool) -> Failur
         ApplicabilityAssessment::Incomplete
             | ApplicabilityAssessment::ChangedEnvironment
             | ApplicabilityAssessment::ScopeMismatch
-    ) {
+    ) || assessment.counts.false_activation_count > 0
+    {
         return FailureDisposition::Partial;
     }
     match (
