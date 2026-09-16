@@ -1,11 +1,48 @@
 use super::*;
 
+// F-LOG-HOST-2 (#893) inner-phase observations for durable activation
+// (request/stage/commit/observation/reconciliation).
+//
+// Through the #889 facade only
+// (`super::host_diagnostics::observe_entrypoint_with_detail`); the Event Log
+// seam stays typed-Unavailable
+// (`super::windows_event_log::event_log_sink_status`), never implemented here
+// (#984 still open).
+//
+// Observation-only contract (mirrors the #891 `lib.rs` helpers): every call
+// projects a boundary already decided by the semantic owner. Arguments are
+// static literals only — no digests, revisions, approvals, fences, or error
+// text are formatted, so no secret material can cross (I15.4) and no extra
+// evaluation runs on the semantic path. Sink outcome never alters result,
+// order, state, receipt, or cleanup. There is no mutable global dedup cache
+// and no terminal emission here: one terminal per failed operation is owned by
+// the single outermost contour (`lib.rs` `HostTerminalGuard` / Unknown
+// terminals), while these inner phases correlate by stage order only
+// (case 22). A positive commit record is emitted only after exact durable
+// readback confirms it (case 15); failures and unknowns emit no success
+// record.
+#[cfg(windows)]
+fn host_activation_note_event_log_unavailable() {
+    let _ = super::windows_event_log::event_log_sink_status();
+}
+
+#[cfg(windows)]
+fn host_activation_observe(detail: &str) {
+    host_activation_note_event_log_unavailable();
+    super::host_diagnostics::observe_entrypoint_with_detail(
+        super::host_diagnostics::EntrypointStage::Startup,
+        detail,
+    );
+}
+
 impl HostComposition {
     #[cfg(windows)]
     pub(super) fn reconcile_pending_activation(
         &mut self,
         pending: &eliot_installation::PendingActivation,
     ) -> Result<(), HostError> {
+        // WORK_UNIT_CASE: 893/14 — pending activation reconciliation requested.
+        host_activation_observe("host.activation reconcile requested");
         self.ensure_admission_open()?;
         let host_capability = self.owner_lease.activation_capability();
         let pending = self.claim_pending_durable(pending, &host_capability)?;
@@ -47,6 +84,9 @@ impl HostComposition {
             return Err(error);
         }
         self.commit_pending_durable(&pending, &host_capability)?;
+        // WORK_UNIT_CASE: 893/14 — pending activation reconciled and
+        // committed; abort/stale paths above emit no reconciled record.
+        host_activation_observe("host.activation reconciled");
         Ok(())
     }
 
@@ -56,6 +96,8 @@ impl HostComposition {
         pending: &eliot_installation::PendingActivation,
         host_capability: &eliot_platform_windows::HostOwnerEpochCapability,
     ) -> Result<eliot_installation::PendingActivation, HostError> {
+        // WORK_UNIT_CASE: 893/14 — pending activation claim (stage) requested.
+        host_activation_observe("host.activation claim requested");
         let expected_revision = self.registry.revision();
         let expected_post_revision = if self.registry.pending_activation().is_some_and(|current| {
             current.approval == pending.approval
@@ -90,7 +132,11 @@ impl HostComposition {
         let recovered = exact_pending.cloned();
         self.registry = durable;
         match outcome {
-            Ok(returned) if exact_readback && Some(&returned) == recovered.as_ref() => Ok(returned),
+            Ok(returned) if exact_readback && Some(&returned) == recovered.as_ref() => {
+                // WORK_UNIT_CASE: 893/14 — claim staged by direct CAS.
+                host_activation_observe("host.activation claim staged");
+                Ok(returned)
+            }
             Ok(_) if exact_readback => Err(HostError::RecoveryRequired(
                 "pending activation claim returned a value different from exact registry readback"
                     .to_owned(),
@@ -98,11 +144,19 @@ impl HostComposition {
             Ok(_) => Err(HostError::RecoveryRequired(
                 "pending activation claim succeeded but exact registry readback failed".to_owned(),
             )),
-            Err(_error) if exact_readback => recovered.ok_or_else(|| {
-                HostError::RecoveryRequired(
-                    "pending activation claim readback lost the exact pending record".to_owned(),
-                )
-            }),
+            Err(_error) if exact_readback => {
+                let claimed = recovered.ok_or_else(|| {
+                    HostError::RecoveryRequired(
+                        "pending activation claim readback lost the exact pending record"
+                            .to_owned(),
+                    )
+                })?;
+                // WORK_UNIT_CASE: 893/14 — claim confirmed by exact readback
+                // after an unknown CAS outcome; distinct from the direct CAS
+                // above, never a second stage effect.
+                host_activation_observe("host.activation claim staged readback");
+                Ok(claimed)
+            }
             Err(error) => Err(HostError::RecoveryRequired(format!(
                 "pending activation claim failed and exact readback did not confirm it: {error}"
             ))),
@@ -116,6 +170,8 @@ impl HostComposition {
         intent: &HostPhaseBMaterializationIntent,
         host_capability: &eliot_platform_windows::HostOwnerEpochCapability,
     ) -> Result<(), HostError> {
+        // WORK_UNIT_CASE: 893/14 — Phase-B intent persistence requested.
+        host_activation_observe("host.activation intent requested");
         let expected_revision = self.registry.revision();
         let expected_post_revision = if self.registry.pending_activation().is_some_and(|current| {
             current
@@ -150,14 +206,23 @@ impl HostComposition {
             });
         self.registry = durable;
         match outcome {
-            Ok(returned) if exact_readback && returned == *intent => Ok(()),
+            Ok(returned) if exact_readback && returned == *intent => {
+                // WORK_UNIT_CASE: 893/14 — intent staged by direct CAS.
+                host_activation_observe("host.activation intent staged");
+                Ok(())
+            }
             Ok(_) if exact_readback => Err(HostError::RecoveryRequired(
                 "Phase-B intent succeeded but exact registry readback differed".to_owned(),
             )),
             Ok(_) => Err(HostError::RecoveryRequired(
                 "Phase-B intent succeeded but exact registry readback failed".to_owned(),
             )),
-            Err(_error) if exact_readback => Ok(()),
+            Err(_error) if exact_readback => {
+                // WORK_UNIT_CASE: 893/14 — intent confirmed staged by exact
+                // readback after an unknown CAS outcome.
+                host_activation_observe("host.activation intent staged readback");
+                Ok(())
+            }
             Err(error) => Err(HostError::RecoveryRequired(format!(
                 "Phase-B intent failed and exact registry readback did not confirm it: {error}"
             ))),
@@ -171,6 +236,8 @@ impl HostComposition {
         prepared: &HostPhaseBPreparedMaterialization,
         host_capability: &eliot_platform_windows::HostOwnerEpochCapability,
     ) -> Result<(), HostError> {
+        // WORK_UNIT_CASE: 893/3 — Phase-B preparation persistence requested.
+        host_activation_observe("host.activation prepared requested");
         let expected_revision = self.registry.revision();
         let expected_post_revision = if self.registry.pending_activation().is_some_and(|current| {
             current
@@ -207,14 +274,24 @@ impl HostComposition {
             });
         self.registry = durable;
         match outcome {
-            Ok(returned) if exact_readback && returned == *prepared => Ok(()),
+            Ok(returned) if exact_readback && returned == *prepared => {
+                // WORK_UNIT_CASE: 893/3 — preparation staged by direct CAS;
+                // distinct from materialization.
+                host_activation_observe("host.activation prepared staged");
+                Ok(())
+            }
             Ok(_) if exact_readback => Err(HostError::RecoveryRequired(
                 "Phase-B preparation succeeded but exact registry readback differed".to_owned(),
             )),
             Ok(_) => Err(HostError::RecoveryRequired(
                 "Phase-B preparation succeeded but exact registry readback failed".to_owned(),
             )),
-            Err(_error) if exact_readback => Ok(()),
+            Err(_error) if exact_readback => {
+                // WORK_UNIT_CASE: 893/3 — preparation confirmed staged by
+                // exact readback after an unknown CAS outcome.
+                host_activation_observe("host.activation prepared staged readback");
+                Ok(())
+            }
             Err(error) => Err(HostError::RecoveryRequired(format!(
                 "Phase-B preparation failed and exact registry readback did not confirm it: {error}"
             ))),
@@ -228,6 +305,8 @@ impl HostComposition {
         stage: &AgentBridgeStagePrepared,
         host_capability: &eliot_platform_windows::HostOwnerEpochCapability,
     ) -> Result<(), HostError> {
+        // WORK_UNIT_CASE: 893/3 — Agent Bridge stage persistence requested.
+        host_activation_observe("host.activation bridge-stage requested");
         let expected_revision = self.registry.revision();
         let expected_post_revision = if self.registry.pending_activation().is_some_and(|current| {
             current.phase_b_agent_bridge_stage_prepared.as_ref() == Some(stage)
@@ -264,7 +343,11 @@ impl HostComposition {
             });
         self.registry = durable;
         match outcome {
-            Ok(returned) if exact_readback && returned == *stage => Ok(()),
+            Ok(returned) if exact_readback && returned == *stage => {
+                // WORK_UNIT_CASE: 893/3 — bridge stage persisted by direct CAS.
+                host_activation_observe("host.activation bridge-stage staged");
+                Ok(())
+            }
             Ok(_) if exact_readback => Err(HostError::RecoveryRequired(
                 "Agent Bridge stage-prepared succeeded but exact registry readback differed"
                     .to_owned(),
@@ -273,7 +356,12 @@ impl HostComposition {
                 "Agent Bridge stage-prepared succeeded but exact registry readback failed"
                     .to_owned(),
             )),
-            Err(_error) if exact_readback => Ok(()),
+            Err(_error) if exact_readback => {
+                // WORK_UNIT_CASE: 893/3 — bridge stage confirmed staged by
+                // exact readback after an unknown CAS outcome.
+                host_activation_observe("host.activation bridge-stage staged readback");
+                Ok(())
+            }
             Err(error) => Err(HostError::RecoveryRequired(format!(
                 "Agent Bridge stage-prepared failed and exact registry readback did not confirm it: {error}"
             ))),
@@ -287,6 +375,8 @@ impl HostComposition {
         stage: &AgentBridgeStagePrepared,
         host_capability: &eliot_platform_windows::HostOwnerEpochCapability,
     ) -> Result<(), HostError> {
+        // WORK_UNIT_CASE: 893/14 — bridge-stage clear requested.
+        host_activation_observe("host.activation bridge-stage-clear requested");
         let expected_revision = self.registry.revision();
         let expected_post_revision = if self.registry.pending_activation().is_some_and(|current| {
             current.phase_b_agent_bridge_stage_prepared.as_ref() == Some(stage)
@@ -323,11 +413,20 @@ impl HostComposition {
             });
         self.registry = durable;
         match outcome {
-            Ok(()) if exact_readback => Ok(()),
+            Ok(()) if exact_readback => {
+                // WORK_UNIT_CASE: 893/14 — bridge stage cleared by direct CAS.
+                host_activation_observe("host.activation bridge-stage cleared");
+                Ok(())
+            }
             Ok(()) => Err(HostError::RecoveryRequired(
                 "Agent Bridge stage-clear succeeded but exact registry readback failed".to_owned(),
             )),
-            Err(_error) if exact_readback => Ok(()),
+            Err(_error) if exact_readback => {
+                // WORK_UNIT_CASE: 893/14 — bridge-stage clear confirmed by
+                // exact readback after an unknown CAS outcome.
+                host_activation_observe("host.activation bridge-stage cleared readback");
+                Ok(())
+            }
             Err(error) => Err(HostError::RecoveryRequired(format!(
                 "Agent Bridge stage-clear failed and exact registry readback did not confirm it: {error}"
             ))),
@@ -341,6 +440,9 @@ impl HostComposition {
         receipt: &HostPhaseBMaterializationReceipt,
         host_capability: &eliot_platform_windows::HostOwnerEpochCapability,
     ) -> Result<(), HostError> {
+        // WORK_UNIT_CASE: 893/15 — Phase-B receipt persistence requested; the
+        // positive receipt record below requires exact durable readback.
+        host_activation_observe("host.activation receipt requested");
         let expected_revision = self.registry.revision();
         let expected_post_revision = if self.registry.pending_activation().is_some_and(|current| {
             current
@@ -374,14 +476,24 @@ impl HostComposition {
             });
         self.registry = durable;
         let result = match outcome {
-            Ok(returned) if exact_readback && returned == *receipt => Ok(()),
+            Ok(returned) if exact_readback && returned == *receipt => {
+                // WORK_UNIT_CASE: 893/15 — receipt staged by direct CAS with
+                // exact readback.
+                host_activation_observe("host.activation receipt staged");
+                Ok(())
+            }
             Ok(_) if exact_readback => Err(HostError::RecoveryRequired(
                 "Phase-B receipt succeeded but exact registry readback differed".to_owned(),
             )),
             Ok(_) => Err(HostError::RecoveryRequired(
                 "Phase-B receipt succeeded but exact registry readback failed".to_owned(),
             )),
-            Err(_error) if exact_readback => Ok(()),
+            Err(_error) if exact_readback => {
+                // WORK_UNIT_CASE: 893/15 — receipt confirmed staged by exact
+                // readback after an unknown CAS outcome.
+                host_activation_observe("host.activation receipt staged readback");
+                Ok(())
+            }
             Err(error) => Err(HostError::RecoveryRequired(format!(
                 "Phase-B receipt failed and exact registry readback did not confirm it: {error}"
             ))),
@@ -411,6 +523,8 @@ impl HostComposition {
         receipt: &eliot_installation::HostPhaseBPreparedReceipt,
         host_capability: &eliot_platform_windows::HostOwnerEpochCapability,
     ) -> Result<(), HostError> {
+        // WORK_UNIT_CASE: 893/15 — prepared-receipt persistence requested.
+        host_activation_observe("host.activation prepared-receipt requested");
         let expected_revision = self.registry.revision();
         let expected_post_revision = if self
             .registry
@@ -445,8 +559,18 @@ impl HostComposition {
             });
         self.registry = durable;
         match outcome {
-            Ok(returned) if exact_readback && returned == *receipt => Ok(()),
-            Err(_) if exact_readback => Ok(()),
+            Ok(returned) if exact_readback && returned == *receipt => {
+                // WORK_UNIT_CASE: 893/15 — prepared receipt staged by direct
+                // CAS with exact readback.
+                host_activation_observe("host.activation prepared-receipt staged");
+                Ok(())
+            }
+            Err(_) if exact_readback => {
+                // WORK_UNIT_CASE: 893/15 — prepared receipt confirmed staged
+                // by exact readback after an unknown CAS outcome.
+                host_activation_observe("host.activation prepared-receipt staged readback");
+                Ok(())
+            }
             Ok(_) => Err(HostError::RecoveryRequired(
                 "prepared receipt succeeded but exact readback differed".to_owned(),
             )),
@@ -462,6 +586,8 @@ impl HostComposition {
         intent: &ActivePhaseBRebindIntent,
         host_capability: &eliot_platform_windows::HostOwnerEpochCapability,
     ) -> Result<(), HostError> {
+        // WORK_UNIT_CASE: 893/14 — rebind-intent persistence requested.
+        host_activation_observe("host.activation rebind-intent requested");
         let expected_revision = self.registry.revision();
         let expected_post_revision = if self
             .registry
@@ -490,7 +616,11 @@ impl HostComposition {
                 .is_some_and(|current| current.intent == *intent);
         self.registry = durable;
         match outcome {
-            Ok(returned) if exact_readback && returned == *intent => Ok(()),
+            Ok(returned) if exact_readback && returned == *intent => {
+                // WORK_UNIT_CASE: 893/14 — rebind intent staged by direct CAS.
+                host_activation_observe("host.activation rebind-intent staged");
+                Ok(())
+            }
             Ok(_) if exact_readback => Err(HostError::RecoveryRequired(
                 "Active Phase-B rebind intent succeeded but exact registry readback differed"
                     .to_owned(),
@@ -499,7 +629,12 @@ impl HostComposition {
                 "Active Phase-B rebind intent succeeded but exact registry readback failed"
                     .to_owned(),
             )),
-            Err(_error) if exact_readback => Ok(()),
+            Err(_error) if exact_readback => {
+                // WORK_UNIT_CASE: 893/14 — rebind intent confirmed staged by
+                // exact readback after an unknown CAS outcome.
+                host_activation_observe("host.activation rebind-intent staged readback");
+                Ok(())
+            }
             Err(error) => Err(HostError::RecoveryRequired(format!(
                 "Active Phase-B rebind intent failed and exact registry readback did not confirm it: {error}"
             ))),
@@ -513,6 +648,8 @@ impl HostComposition {
         intent: &ActivePhaseBRebindIntent,
         host_capability: &eliot_platform_windows::HostOwnerEpochCapability,
     ) -> Result<(), HostError> {
+        // WORK_UNIT_CASE: 893/14 — rebind recovery/intent persistence requested.
+        host_activation_observe("host.activation rebind-recovery requested");
         let expected_revision = self.registry.revision();
         let expected_post_revision =
             if self
@@ -565,6 +702,8 @@ impl HostComposition {
                         .last()
                         .is_some_and(|existing| existing == recovery) =>
             {
+                // WORK_UNIT_CASE: 893/14 — rebind recovery staged by direct CAS.
+                host_activation_observe("host.activation rebind-recovery staged");
                 Ok(())
             }
             Ok(_) if exact_readback => Err(HostError::RecoveryRequired(
@@ -575,7 +714,12 @@ impl HostComposition {
                 "Active Phase-B recovery/intent succeeded but exact registry readback failed"
                     .to_owned(),
             )),
-            Err(_error) if exact_readback => Ok(()),
+            Err(_error) if exact_readback => {
+                // WORK_UNIT_CASE: 893/14 — rebind recovery confirmed staged
+                // by exact readback after an unknown CAS outcome.
+                host_activation_observe("host.activation rebind-recovery staged readback");
+                Ok(())
+            }
             Err(error) => Err(HostError::RecoveryRequired(format!(
                 "Active Phase-B recovery/intent failed and exact registry readback did not confirm it: {error}"
             ))),
@@ -588,6 +732,8 @@ impl HostComposition {
         prepared: &HostPhaseBPreparedMaterialization,
         host_capability: &eliot_platform_windows::HostOwnerEpochCapability,
     ) -> Result<(), HostError> {
+        // WORK_UNIT_CASE: 893/14 — rebind-preparation persistence requested.
+        host_activation_observe("host.activation rebind-prepared requested");
         let expected_revision = self.registry.revision();
         let expected_post_revision = if self
             .registry
@@ -616,7 +762,12 @@ impl HostComposition {
                 .is_some_and(|current| current.prepared.as_ref() == Some(prepared));
         self.registry = durable;
         match outcome {
-            Ok(returned) if exact_readback && returned == *prepared => Ok(()),
+            Ok(returned) if exact_readback && returned == *prepared => {
+                // WORK_UNIT_CASE: 893/14 — rebind preparation staged by
+                // direct CAS.
+                host_activation_observe("host.activation rebind-prepared staged");
+                Ok(())
+            }
             Ok(_) if exact_readback => Err(HostError::RecoveryRequired(
                 "Active Phase-B rebind preparation succeeded but exact registry readback differed"
                     .to_owned(),
@@ -625,7 +776,12 @@ impl HostComposition {
                 "Active Phase-B rebind preparation succeeded but exact registry readback failed"
                     .to_owned(),
             )),
-            Err(_error) if exact_readback => Ok(()),
+            Err(_error) if exact_readback => {
+                // WORK_UNIT_CASE: 893/14 — rebind preparation confirmed
+                // staged by exact readback after an unknown CAS outcome.
+                host_activation_observe("host.activation rebind-prepared staged readback");
+                Ok(())
+            }
             Err(error) => Err(HostError::RecoveryRequired(format!(
                 "Active Phase-B rebind preparation failed and exact registry readback did not confirm it: {error}"
             ))),
@@ -638,6 +794,9 @@ impl HostComposition {
         receipt: &ActivePhaseBRebindReceipt,
         host_capability: &eliot_platform_windows::HostOwnerEpochCapability,
     ) -> Result<(), HostError> {
+        // WORK_UNIT_CASE: 893/15 — rebind-receipt persistence requested; the
+        // positive record below requires exact durable readback.
+        host_activation_observe("host.activation rebind-receipt requested");
         let expected_revision = self.registry.revision();
         let expected_post_revision = if self
             .registry
@@ -666,7 +825,12 @@ impl HostComposition {
                 .is_some_and(|current| current.receipt.as_ref() == Some(receipt));
         self.registry = durable;
         match outcome {
-            Ok(returned) if exact_readback && returned == *receipt => Ok(()),
+            Ok(returned) if exact_readback && returned == *receipt => {
+                // WORK_UNIT_CASE: 893/15 — rebind receipt staged by direct CAS
+                // with exact readback.
+                host_activation_observe("host.activation rebind-receipt staged");
+                Ok(())
+            }
             Ok(_) if exact_readback => Err(HostError::RecoveryRequired(
                 "Active Phase-B rebind receipt succeeded but exact registry readback differed"
                     .to_owned(),
@@ -675,7 +839,12 @@ impl HostComposition {
                 "Active Phase-B rebind receipt succeeded but exact registry readback failed"
                     .to_owned(),
             )),
-            Err(_error) if exact_readback => Ok(()),
+            Err(_error) if exact_readback => {
+                // WORK_UNIT_CASE: 893/15 — rebind receipt confirmed staged by
+                // exact readback after an unknown CAS outcome.
+                host_activation_observe("host.activation rebind-receipt staged readback");
+                Ok(())
+            }
             Err(error) => Err(HostError::RecoveryRequired(format!(
                 "Active Phase-B rebind receipt failed and exact registry readback did not confirm it: {error}"
             ))),
@@ -688,6 +857,8 @@ impl HostComposition {
         pending: &eliot_installation::PendingActivation,
         host_capability: &eliot_platform_windows::HostOwnerEpochCapability,
     ) -> Result<(), HostError> {
+        // WORK_UNIT_CASE: 893/14 — pending activation abort requested.
+        host_activation_observe("host.activation abort requested");
         let expected_revision = self.registry.revision();
         let expected_post_revision = if self.registry.pending_activation().is_some() {
             expected_revision.checked_add(1).ok_or_else(|| {
@@ -717,11 +888,21 @@ impl HostComposition {
                 .any(|generation| generation.manifest.generation == pending.manifest.generation);
         self.registry = durable;
         match outcome {
-            Ok(()) if exact_readback => Ok(()),
+            Ok(()) if exact_readback => {
+                // WORK_UNIT_CASE: 893/14 — pending activation aborted by
+                // direct CAS; distinct from commit.
+                host_activation_observe("host.activation aborted");
+                Ok(())
+            }
             Ok(()) => Err(HostError::RecoveryRequired(
                 "pending activation abort succeeded but exact registry readback failed".to_owned(),
             )),
-            Err(_error) if exact_readback => Ok(()),
+            Err(_error) if exact_readback => {
+                // WORK_UNIT_CASE: 893/14 — abort confirmed by exact readback
+                // after an unknown CAS outcome.
+                host_activation_observe("host.activation aborted readback");
+                Ok(())
+            }
             Err(error) => Err(HostError::RecoveryRequired(format!(
                 "pending activation abort failed and exact readback did not confirm it: {error}"
             ))),
@@ -737,6 +918,9 @@ impl HostComposition {
         &mut self,
         pending: &eliot_installation::PendingActivation,
     ) -> Result<ActivationCommitFence, HostError> {
+        // WORK_UNIT_CASE: 893/14 — commit-fence observation requested; the
+        // fence is rebuilt from fresh durable evidence below.
+        host_activation_observe("host.activation commit-fence requested");
         self.ensure_admission_open()?;
         let durable = self.open_registry_store()?.load().map_err(|error| {
             HostError::RecoveryRequired(format!(
@@ -956,6 +1140,10 @@ impl HostComposition {
                 .map_err(|error| HostError::Platform(error.to_string()))?,
         };
         fence.validate().map_err(HostError::Installation)?;
+        // WORK_UNIT_CASE: 893/14 — commit fence observed from fresh
+        // readiness/journal/Phase-B evidence; stale or substituted fences
+        // above emit no observed record.
+        host_activation_observe("host.activation commit-fence observed");
         Ok(fence)
     }
 
@@ -964,6 +1152,8 @@ impl HostComposition {
         &self,
         commit_fence: &ActivationCommitFence,
     ) -> Result<(), HostError> {
+        // WORK_UNIT_CASE: 893/14 — pre-CAS journal-fence re-verification requested.
+        host_activation_observe("host.activation journal-fence requested");
         // The registry readback itself is not a liveness barrier. Re-snapshot
         // the journal after that read and immediately before the CAS so an
         // intervening degraded/recovery append cannot reuse the earlier fence.
@@ -998,6 +1188,9 @@ impl HostComposition {
                 "activation commit readiness fence changed before registry CAS".to_owned(),
             ));
         }
+        // WORK_UNIT_CASE: 893/14 — journal fence still exact immediately
+        // before the commit CAS.
+        host_activation_observe("host.activation journal-fence observed");
         Ok(())
     }
 
@@ -1007,6 +1200,9 @@ impl HostComposition {
         pending: &eliot_installation::PendingActivation,
         host_capability: &eliot_platform_windows::HostOwnerEpochCapability,
     ) -> Result<(), HostError> {
+        // WORK_UNIT_CASE: 893/15 — pending activation commit requested; the
+        // positive commit record below requires exact durable readback.
+        host_activation_observe("host.activation commit requested");
         let commit_fence = self.fresh_pending_commit_fence(pending)?;
         let durable_before_commit = self.open_registry_store()?.load().map_err(|error| {
             HostError::RecoveryRequired(format!(
@@ -1055,11 +1251,21 @@ impl HostComposition {
             });
         self.registry = durable;
         let result = match outcome {
-            Ok(()) if exact_readback => return Ok(()),
+            Ok(()) if exact_readback => {
+                // WORK_UNIT_CASE: 893/15 — activation committed by direct CAS
+                // with exact readback.
+                host_activation_observe("host.activation committed");
+                return Ok(());
+            }
             Ok(()) => HostError::RecoveryRequired(
                 "activation commit succeeded but exact registry readback failed".to_owned(),
             ),
-            Err(_error) if exact_readback => return Ok(()),
+            Err(_error) if exact_readback => {
+                // WORK_UNIT_CASE: 893/15 — commit confirmed by exact readback
+                // after an unknown CAS outcome; never a second commit effect.
+                host_activation_observe("host.activation committed readback");
+                return Ok(());
+            }
             Err(error) => HostError::RecoveryRequired(format!(
                 "activation commit failed and exact readback did not confirm it: {error}"
             )),

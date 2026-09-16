@@ -9,6 +9,37 @@ use super::phase_b_materialization::{
 #[cfg(windows)]
 use eliot_platform_windows::reconcile_agent_bridge_stage;
 
+// F-LOG-HOST-2 (#893) inner-phase observations for Phase-B materialization.
+//
+// Through the #889 facade only
+// (`super::host_diagnostics::observe_entrypoint_with_detail`); the Event Log
+// seam stays typed-Unavailable
+// (`super::windows_event_log::event_log_sink_status`), never implemented here
+// (#984 still open).
+//
+// Observation-only contract (mirrors the #891 `lib.rs` helpers): every call
+// projects a boundary already decided by the semantic owner. Arguments are
+// static literals only — no digests, identities, bytes, or error text are
+// formatted, so no secret material can cross (I15.4) and no extra evaluation
+// runs on the semantic path. Sink outcome never alters result, order, state,
+// receipt, or cleanup. There is no mutable global dedup cache and no terminal
+// emission here: one terminal per failed operation is owned by the single
+// outermost contour (`lib.rs` `HostTerminalGuard` / Unknown terminals), while
+// these inner phases correlate by stage order only (case 22).
+#[cfg(windows)]
+fn phase_b_note_event_log_unavailable() {
+    let _ = super::windows_event_log::event_log_sink_status();
+}
+
+#[cfg(windows)]
+fn phase_b_observe(detail: &str) {
+    phase_b_note_event_log_unavailable();
+    super::host_diagnostics::observe_entrypoint_with_detail(
+        super::host_diagnostics::EntrypointStage::ScmDispatch,
+        detail,
+    );
+}
+
 impl HostComposition {
     /// Materializes the Host-owned Phase-B authority, Store bootstrap, and
     /// dynamic launch descriptors for one already-approved generation.
@@ -42,6 +73,8 @@ impl HostComposition {
         input: &HostPhaseBInput,
         durable_prior_binding: Option<&PhaseBLiveBinding>,
     ) -> Result<HostPhaseBMaterialization, HostError> {
+        // WORK_UNIT_CASE: 893/2 — Phase-B request observed before admission.
+        phase_b_observe("host.phase-b-materialize requested");
         self.ensure_admission_open()?;
         manifest
             .validate()
@@ -181,6 +214,8 @@ impl HostComposition {
                 "Phase-B authority descriptor digest changed before publication".to_owned(),
             ));
         }
+        // WORK_UNIT_CASE: 893/2 — admission/validation passed; preparation begins.
+        phase_b_observe("host.phase-b-materialize admitted contour");
 
         let config_path = approved_locator(
             Path::new(manifest.config_path.as_str()),
@@ -668,6 +703,9 @@ impl HostComposition {
                 "Phase-B four-file publication requires a durable prepared capability".to_owned(),
             ));
         }
+        // WORK_UNIT_CASE: 893/3 — durable preparation staged; distinct from
+        // materialization below.
+        phase_b_observe("host.phase-b-materialize prepared staged");
         let (authority_readback_digest, authority_identity) =
             phase_b_materialize_file_with_rollback(
                 profile,
@@ -734,6 +772,9 @@ impl HostComposition {
                 "Phase-B destination readback differs from the durable preparation".to_owned(),
             ));
         }
+        // WORK_UNIT_CASE: 893/4 — four-file publication observed committed by
+        // exact readback; the publication request above stays distinct.
+        phase_b_observe("host.phase-b-materialize published readback exact");
         if let Some(agent_bridge) = agent_bridge_materialization.as_ref() {
             let mut bridge_allowed_profile_digests = vec![&agent_bridge.binding.profile_digest];
             let mut bridge_allowed_declaration_digests =
@@ -800,6 +841,9 @@ impl HostComposition {
         active: &eliot_installation::ApprovedGeneration,
         recovery_kind: ActivePhaseBRebindRecoveryKind,
     ) -> Result<(), HostError> {
+        // WORK_UNIT_CASE: 893/19 — Active rebind requested; replay-vs-commit
+        // distinguished below.
+        phase_b_observe("host.phase-b-rebind requested");
         self.ensure_admission_open()?;
         let manifest = &active.manifest;
         let manifest_digest = phase_b_manifest_digest(manifest)?;
@@ -956,6 +1000,9 @@ impl HostComposition {
                 .agent_bridge_final
                 .clone_from(&receipt.agent_bridge);
             self.phase_b = Some(materialization);
+            // WORK_UNIT_CASE: 893/19 — completed receipt rehydrated by exact
+            // readback; never a duplicate commit.
+            phase_b_observe("host.phase-b-rebind readback replay");
             return Ok(());
         }
 
@@ -1015,6 +1062,9 @@ impl HostComposition {
         materialization.host_process_identity = Some(receipt.host_process_identity.clone());
         materialization.public_receipt_digest = Some(receipt.receipt_digest.clone());
         self.phase_b = Some(materialization);
+        // WORK_UNIT_CASE: 893/19 — rebind publication reconciled against the
+        // durable preparation; distinct from the readback-replay path above.
+        phase_b_observe("host.phase-b-rebind reconciled");
         Ok(())
     }
 
@@ -1030,6 +1080,9 @@ impl HostComposition {
         pending: Option<&eliot_installation::PendingActivation>,
         prior_bridge: Option<&AgentBridgePhaseBBinding>,
     ) -> Result<HostPhaseBMaterialization, HostError> {
+        // WORK_UNIT_CASE: 893/5 — prepared rehydrate requested; response-loss
+        // replays arrive here without rematerializing any destination.
+        phase_b_observe("host.phase-b-rehydrate requested");
         prepared.validate().map_err(HostError::Installation)?;
         if let Some(pending) = pending {
             if pending.phase_b_prepared.as_ref() != Some(prepared) {
@@ -1205,6 +1258,9 @@ impl HostComposition {
         let agent_bridge_final = pending
             .and_then(|pending| pending.phase_b_receipt.as_ref())
             .and_then(|receipt| receipt.agent_bridge.clone());
+        // WORK_UNIT_CASE: 893/5 — exact four-path readback replay; no
+        // destination was published on this path.
+        phase_b_observe("host.phase-b-rehydrate readback replay");
         Ok(HostPhaseBMaterialization {
             transaction_id: Some(prepared.transaction_id.clone()),
             effect_id: Some(prepared.effect_id.clone()),
@@ -1238,6 +1294,8 @@ impl HostComposition {
     pub(super) fn reconcile_pending_agent_bridge_stage(
         pending: &eliot_installation::PendingActivation,
     ) -> Result<(), HostError> {
+        // WORK_UNIT_CASE: 893/3 — durable executable-stage reconciliation requested.
+        phase_b_observe("host.phase-b-bridge-stage requested");
         let stage = pending
             .phase_b_agent_bridge_stage_prepared
             .as_ref()
@@ -1277,6 +1335,9 @@ impl HostComposition {
         .map_err(|error| {
             HostError::RecoveryRequired(format!("reconcile pending Agent Bridge stage: {error}"))
         })?;
+        // WORK_UNIT_CASE: 893/3 — executable stage reconciled exact; no pair
+        // was manufactured here.
+        phase_b_observe("host.phase-b-bridge-stage reconciled");
         Ok(())
     }
 
@@ -1290,6 +1351,9 @@ impl HostComposition {
         pending: &eliot_installation::PendingActivation,
         prepared: &HostPhaseBPreparedMaterialization,
     ) -> Result<(), HostError> {
+        // WORK_UNIT_CASE: 893/9 — rollback of the uncommitted contour
+        // requested; restoration is observed only on the success path below.
+        phase_b_observe("host.phase-b-rollback requested");
         if pending.prior_active_generation.is_some()
             && (prepared.agent_bridge.is_none()
                 || self
@@ -1453,6 +1517,10 @@ impl HostComposition {
                 "Agent Bridge client declaration",
             )?;
         }
+        // WORK_UNIT_CASE: 893/9 — uncommitted destinations restored and the
+        // prepared/intent records cleared. A failed rollback emits no restored
+        // record here (case 10); the outer contour owns the single terminal.
+        phase_b_observe("host.phase-b-rollback restored");
         Ok(())
     }
 
@@ -1460,6 +1528,10 @@ impl HostComposition {
     pub(super) fn reconcile_phase_b_for_manifest(
         _manifest: &CandidateManifest,
     ) -> Result<HostPhaseBMaterialization, HostError> {
+        // WORK_UNIT_CASE: 893/19 — manifest-only reconciliation requested; it
+        // always fails closed (destination bytes are never an input), so no
+        // restored/replayed record follows.
+        phase_b_observe("host.phase-b-manifest-reconcile requested");
         Err(HostError::RecoveryRequired(
             "Phase-B recovery requires a transaction-bound Host receipt; destination bytes are never an input"
                 .to_owned(),
