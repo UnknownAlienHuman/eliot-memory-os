@@ -104,6 +104,14 @@ pub fn plan_candidate(
     config: &CoordinatorConfig,
     request: StaffingPlanRequest,
 ) -> Result<StaffingPlanCandidate, FabricError> {
+    // #740: candidate-planning span over the existing #872 control path.
+    // Planning compiles a candidate only; admission happens exclusively
+    // through the staged reservation + committed admission below.
+    let _span = tracing::info_span!(
+        "eliotd.fabric_plan_candidate",
+        candidate = %crate::diagnostics::sanitize_identity(request.candidate_id.as_str())
+    )
+    .entered();
     let mut coordinator = AgentCoordinator::new(
         config.clone(),
         PlanGap::G11Unavailable {
@@ -781,6 +789,12 @@ impl AgentFabric {
         &mut self,
         definition_id: &CandidateId,
     ) -> Result<Reservation, FabricError> {
+        // #740: staged-reservation span over the existing control path.
+        let _span = tracing::info_span!(
+            "eliotd.fabric_stage",
+            definition = %crate::diagnostics::sanitize_identity(definition_id.as_str())
+        )
+        .entered();
         let key = definition_id.as_str().to_owned();
         let definition = self
             .definitions
@@ -815,6 +829,35 @@ impl AgentFabric {
     /// when the receipt does not bind the exact definition digest and
     /// reservation identity.
     pub fn commit_admission(
+        &mut self,
+        reservation_id: &str,
+    ) -> Result<FabricAdmission, FabricError> {
+        // #740: admission span over the existing control path. The committed
+        // receipt binds the exact definition digest and reservation; every
+        // rejection records its typed reason plus the exact owner.
+        let _span = tracing::info_span!(
+            "eliotd.fabric_commit",
+            reservation = %crate::diagnostics::sanitize_identity(reservation_id)
+        )
+        .entered();
+        let outcome = self.commit_admission_checked(reservation_id);
+        match &outcome {
+            Ok(admission) => {
+                let _ = crate::diagnostics::AdmissionRecord::of(
+                    crate::diagnostics::disposition_of_admission(admission),
+                    &admission.reservation_id,
+                    admission.admission_id.as_str(),
+                )
+                .emit();
+            }
+            Err(error) => {
+                let _ = crate::diagnostics::RejectionRecord::of_fabric_error(error).emit();
+            }
+        }
+        outcome
+    }
+
+    fn commit_admission_checked(
         &mut self,
         reservation_id: &str,
     ) -> Result<FabricAdmission, FabricError> {
@@ -1032,6 +1075,24 @@ impl AgentFabric {
     /// Returns [`FabricError::AckNotResult`] when the caller treats the ack as
     /// a result, and [`FabricError::Quarantined`] for unknown attempts.
     pub fn observe_worker_ack(&mut self, ack: &WorkerAck) -> Result<(), FabricError> {
+        // #740: ack span. A worker acknowledgement is never completed work;
+        // the record keeps `completed='false'` even on success.
+        let _span = tracing::info_span!(
+            "eliotd.fabric_ack",
+            attempt = %crate::diagnostics::sanitize_identity(ack.attempt_id.as_str())
+        )
+        .entered();
+        let outcome = self.observe_worker_ack_checked(ack);
+        if outcome.is_ok() {
+            let _ = crate::diagnostics::emit_worker_ack(
+                ack.attempt_id.as_str(),
+                ack.worker_id.as_str(),
+            );
+        }
+        outcome
+    }
+
+    fn observe_worker_ack_checked(&mut self, ack: &WorkerAck) -> Result<(), FabricError> {
         validate_text(&ack.worker_id, "worker_id")?;
         let key = ack.attempt_id.as_str().to_owned();
         if !self.attempt_states.contains_key(&key) {
@@ -1052,6 +1113,24 @@ impl AgentFabric {
     /// candidate as Finish, or [`FabricError::Quarantined`] for unknown or
     /// undispatched attempts.
     pub fn submit_attempt_result(
+        &mut self,
+        result: &AttemptResultRecord,
+    ) -> Result<(), FabricError> {
+        // #740: result span. An attempt result is never task Finish; only the
+        // authoritative Finish result can complete work.
+        let _span = tracing::info_span!(
+            "eliotd.fabric_result",
+            attempt = %crate::diagnostics::sanitize_identity(result.attempt_id.as_str())
+        )
+        .entered();
+        let outcome = self.submit_attempt_result_checked(result);
+        if let Err(error) = &outcome {
+            let _ = crate::diagnostics::RejectionRecord::of_fabric_error(error).emit();
+        }
+        outcome
+    }
+
+    fn submit_attempt_result_checked(
         &mut self,
         result: &AttemptResultRecord,
     ) -> Result<(), FabricError> {
@@ -1103,6 +1182,13 @@ impl AgentFabric {
     ///
     /// Returns [`FabricError::Quarantined`] for unknown attempts.
     pub fn mark_unknown_outcome(&mut self, attempt_id: &AttemptId) -> Result<(), FabricError> {
+        // #740: unknown-outcome span. The original identity is preserved
+        // verbatim; diagnostics never trigger a resend or recompute.
+        let _span = tracing::info_span!(
+            "eliotd.fabric_unknown",
+            attempt = %crate::diagnostics::sanitize_identity(attempt_id.as_str())
+        )
+        .entered();
         let key = attempt_id.as_str().to_owned();
         if !self.attempt_states.contains_key(&key) {
             return Err(FabricError::Quarantined(format!(
@@ -1123,6 +1209,23 @@ impl AgentFabric {
     /// [`FabricError::ResultNotFinish`] otherwise: no fabric state is task
     /// Finish.
     pub fn require_finish(&self, attempt_id: &AttemptId) -> Result<(), FabricError> {
+        // #740: strict-Finish span. Refusal records refusal without
+        // fabricated completion; success is impossible here by owner design
+        // (attempt results are never Finish) and stays unlogged as finished.
+        let _span = tracing::info_span!(
+            "eliotd.fabric_finish",
+            attempt = %crate::diagnostics::sanitize_identity(attempt_id.as_str())
+        )
+        .entered();
+        let outcome = self.require_finish_checked(attempt_id);
+        if let Err(error) = &outcome {
+            let (reason, owner) = crate::diagnostics::fabric_rejection_of(error);
+            let _ = crate::diagnostics::emit_finish_refusal(attempt_id.as_str(), reason, owner);
+        }
+        outcome
+    }
+
+    fn require_finish_checked(&self, attempt_id: &AttemptId) -> Result<(), FabricError> {
         let key = attempt_id.as_str().to_owned();
         match self.attempt_states.get(&key) {
             Some(AttemptLifecycle::UnknownOutcome) => Err(FabricError::UnknownChild(format!(

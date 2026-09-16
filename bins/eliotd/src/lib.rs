@@ -39,6 +39,7 @@ mod controlboard_adapters;
 mod daemon_config;
 mod daemon_kernel_client;
 mod daemon_kernel_port_adapters;
+pub mod diagnostics;
 mod dreamer_admission;
 mod dreamer_materials;
 mod dreamer_model_adapter;
@@ -315,6 +316,10 @@ impl DaemonComposition {
         identity: &eliot_protocol::RequestIdentity,
         envelope: eliot_governor::CanonicalWriteEnvelope,
     ) -> Result<eliot_store_api::WriteReceipt, DaemonError> {
+        // #740: request/result span over the neutral handoff boundary. The
+        // handoff (prepared envelope submitted) and the commitment (validated
+        // owner receipt) stay distinguishable in the sink.
+        let _span = tracing::info_span!("eliotd.canonical_commit").entered();
         let receipt = self
             .governor
             .commit_canonical(identity, envelope)
@@ -446,6 +451,13 @@ impl DaemonComposition {
         ticket: &AgentActivationResolutionTicket,
         now: u64,
     ) -> Result<AgentActivationResolutionResult, DaemonError> {
+        // #740: semantic-admission span. Records the ticket identity plus the
+        // actual admitted/rejected disposition and digest once resolved.
+        let _span = tracing::info_span!(
+            "eliotd.activation_resolution",
+            ticket = %crate::diagnostics::sanitize_identity(&ticket.ticket_id)
+        )
+        .entered();
         ticket
             .validate()
             .map_err(|error| DaemonError::Lifecycle(error.to_string()))?;
@@ -459,7 +471,7 @@ impl DaemonComposition {
                 "semantic activation ticket deadline has expired".to_owned(),
             ));
         }
-        match self.governor.resolve_activation_outcome(now) {
+        let outcome = match self.governor.resolve_activation_outcome(now) {
             GovernorActivationOutcome::Resolved(snapshot) => {
                 if snapshot.state_fence != ticket.state_fence {
                     return Err(DaemonError::Lifecycle(
@@ -476,7 +488,21 @@ impl DaemonComposition {
             outcome => {
                 activation_projection::map_governor_outcome_to_protocol(ticket, outcome, now.max(1))
             }
+        };
+        match &outcome {
+            Ok(result) => {
+                let _ = crate::diagnostics::AdmissionRecord::of(
+                    crate::diagnostics::disposition_of_resolution(&result.disposition),
+                    &ticket.ticket_id,
+                    &result.result_sha256,
+                )
+                .emit();
+            }
+            Err(error) => {
+                let _ = crate::diagnostics::ErrorRecord::of_daemon_error(error).emit();
+            }
         }
+        outcome
     }
 
     /// Records the already-validated Kernel-issued owner session facts for
@@ -562,8 +588,13 @@ impl DaemonComposition {
     /// divergence.
     pub fn task_lifecycle(
         &self,
-    ) -> Result<task_lifecycle_adapters::ForwardingTaskLifecycle<'_, dyn eliot_governor::KernelGenerationPort>, DaemonError>
-    {
+    ) -> Result<
+        task_lifecycle_adapters::ForwardingTaskLifecycle<
+            '_,
+            dyn eliot_governor::KernelGenerationPort,
+        >,
+        DaemonError,
+    > {
         if self.readiness() != eliot_governor::CompositionReadiness::Ready {
             return Err(DaemonError::Composition(
                 eliot_governor::CompositionError::NotReady,
@@ -684,7 +715,11 @@ impl DaemonComposition {
         reads: &'a KernelContextReadClient,
         now: u64,
     ) -> Result<
-        eliot_governor::GovernorEpistemicComposition<'a, DaemonKernelClient, KernelContextReadClient>,
+        eliot_governor::GovernorEpistemicComposition<
+            'a,
+            DaemonKernelClient,
+            KernelContextReadClient,
+        >,
         DaemonError,
     > {
         if self.readiness() != eliot_governor::CompositionReadiness::Ready {
@@ -693,15 +728,13 @@ impl DaemonComposition {
             ));
         }
         let activation = self.governor.read_unique_agent_activation(now)?;
-        Ok(
-            eliot_governor::GovernorEpistemicComposition::borrow(
-                &self.governor.owners().canonical,
-                activation,
-                kernel.as_ref(),
-                reads,
-                self.readiness(),
-            ),
-        )
+        Ok(eliot_governor::GovernorEpistemicComposition::borrow(
+            &self.governor.owners().canonical,
+            activation,
+            kernel.as_ref(),
+            reads,
+            self.readiness(),
+        ))
     }
 
     /// Borrows the Governor Dreamer orientation intake adapter over the retained owners plus
@@ -759,6 +792,8 @@ impl DaemonComposition {
     /// before reporting readiness so the wiring is exercised on the production
     /// path.
     pub fn agent_fabric_descriptor(&self) -> Result<AgentFabricDescriptor, DaemonError> {
+        // #740: #872 integrated-path span over the admitted fence binding.
+        let _span = tracing::info_span!("eliotd.fabric_descriptor").entered();
         if self.readiness() != CompositionReadiness::Ready {
             return Err(DaemonError::Composition(CompositionError::NotReady));
         }
@@ -768,12 +803,18 @@ impl DaemonComposition {
         })?;
         let config = daemon_coordinator_config()
             .map_err(|error| DaemonError::Lifecycle(error.to_string()))?;
-        Ok(AgentFabricDescriptor {
+        let descriptor = AgentFabricDescriptor {
             service: SERVICE_NAME.to_owned(),
             generation: fence.resource_generation.value(),
             authority_epoch: fence.authority_epoch.sequence.get(),
             capacity_identity: config.capacity_identity,
-        })
+        };
+        let _ = crate::diagnostics::emit_fabric_attached(
+            &descriptor.service,
+            descriptor.generation,
+            descriptor.authority_epoch,
+        );
+        Ok(descriptor)
     }
 
     /// Plans one Task-Controller staffing request through the real coordinator
@@ -787,6 +828,9 @@ impl DaemonComposition {
         &self,
         request: eliot_agent_coordinator::StaffingPlanRequest,
     ) -> Result<eliot_agent_coordinator::StaffingPlanCandidate, DaemonError> {
+        // #740: #872 planning span. Candidate planning is not admission: the
+        // record keeps the candidate disposition distinct from admitted.
+        let _span = tracing::info_span!("eliotd.fabric_plan").entered();
         if self.readiness() != CompositionReadiness::Ready {
             return Err(DaemonError::Composition(CompositionError::NotReady));
         }
@@ -798,8 +842,7 @@ impl DaemonComposition {
         }
         let config = daemon_coordinator_config()
             .map_err(|error| DaemonError::Lifecycle(error.to_string()))?;
-        plan_candidate(&config, request)
-            .map_err(|error| DaemonError::Lifecycle(error.to_string()))
+        plan_candidate(&config, request).map_err(|error| DaemonError::Lifecycle(error.to_string()))
     }
 
     /// Borrows the Governor reconstruction read composition over the retained

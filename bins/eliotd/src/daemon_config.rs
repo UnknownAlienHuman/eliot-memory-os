@@ -62,37 +62,48 @@ impl DaemonConfig {
         launch_nonce: &str,
         expected_artifact_sha256: &str,
     ) -> Result<Self, DaemonError> {
-        let config_path = config_path.as_ref().to_path_buf();
-        if !config_path.is_absolute() {
-            return Err(DaemonError::LaunchConfig(
-                "launch config path must be an absolute approved runtime identity".to_owned(),
-            ));
+        // #740: config-boundary span. Records the outcome plus a bounded
+        // reason only; digests, nonces and file bytes never enter the sink.
+        let _span = tracing::info_span!("eliotd.config_load").entered();
+        let outcome: Result<Self, DaemonError> = (|| {
+            let config_path = config_path.as_ref().to_path_buf();
+            if !config_path.is_absolute() {
+                return Err(DaemonError::LaunchConfig(
+                    "launch config path must be an absolute approved runtime identity".to_owned(),
+                ));
+            }
+            validate_sha256(expected_config_sha256, "config descriptor digest")?;
+            validate_sha256(expected_artifact_sha256, "executable digest")?;
+            validate_launch_nonce(launch_nonce)?;
+            let config_lease = ProtectedRuntimePathLease::open_existing_absolute(&config_path)?;
+            if config_lease.path() != config_path {
+                return Err(DaemonError::LaunchConfig(
+                    "launch config path is not the retained canonical runtime identity".to_owned(),
+                ));
+            }
+            let bytes = config_lease.read_bounded(MAX_CONFIG_BYTES)?;
+            if sha256_hex(&bytes) != expected_config_sha256 {
+                return Err(DaemonError::LaunchConfig(
+                    "launch config digest does not match the retained bytes".to_owned(),
+                ));
+            }
+            let launch: GovernorLaunchConfig = serde_json::from_slice(&bytes)
+                .map_err(|error| DaemonError::LaunchConfig(error.to_string()))?;
+            let mut config = Self::from_launch_with_binding(
+                launch,
+                config_path,
+                launch_nonce,
+                expected_artifact_sha256,
+            )?;
+            config.config_lease = Some(config_lease);
+            Ok(config)
+        })();
+        // #740: owning error record at the config boundary. Success needs no
+        // record beyond the span: digests, nonces and bytes stay out.
+        if let Err(error) = &outcome {
+            let _ = crate::diagnostics::ErrorRecord::of_daemon_error(error).emit();
         }
-        validate_sha256(expected_config_sha256, "config descriptor digest")?;
-        validate_sha256(expected_artifact_sha256, "executable digest")?;
-        validate_launch_nonce(launch_nonce)?;
-        let config_lease = ProtectedRuntimePathLease::open_existing_absolute(&config_path)?;
-        if config_lease.path() != config_path {
-            return Err(DaemonError::LaunchConfig(
-                "launch config path is not the retained canonical runtime identity".to_owned(),
-            ));
-        }
-        let bytes = config_lease.read_bounded(MAX_CONFIG_BYTES)?;
-        if sha256_hex(&bytes) != expected_config_sha256 {
-            return Err(DaemonError::LaunchConfig(
-                "launch config digest does not match the retained bytes".to_owned(),
-            ));
-        }
-        let launch: GovernorLaunchConfig = serde_json::from_slice(&bytes)
-            .map_err(|error| DaemonError::LaunchConfig(error.to_string()))?;
-        let mut config = Self::from_launch_with_binding(
-            launch,
-            config_path,
-            launch_nonce,
-            expected_artifact_sha256,
-        )?;
-        config.config_lease = Some(config_lease);
-        Ok(config)
+        outcome
     }
 
     /// Creates a config only for the exact protected path used by production.

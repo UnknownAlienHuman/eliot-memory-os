@@ -127,6 +127,14 @@ pub fn map_governor_outcome_to_protocol(
     outcome: GovernorActivationOutcome,
     resolved_at_unix_ms: u64,
 ) -> Result<AgentActivationResolutionResult, DaemonError> {
+    // #740: request/result span over the typed projection boundary. The
+    // Governor outcome stays the sole discriminator; the span only names the
+    // resulting disposition plus the available ticket/result identities.
+    let _span = tracing::info_span!(
+        "eliotd.activation_projection",
+        ticket = %crate::diagnostics::sanitize_identity(&ticket.ticket_id)
+    )
+    .entered();
     let disposition = match outcome {
         GovernorActivationOutcome::Resolved(snapshot) => {
             let binding = AgentActivationResolvedBinding {
@@ -179,6 +187,15 @@ pub fn map_governor_outcome_to_protocol(
 
     AgentActivationResolutionResult::new(ticket, resolved_at_unix_ms, disposition)
         .map_err(|error| DaemonError::Lifecycle(error.to_string()))
+        .inspect(|result| {
+            // #740: result span carries disposition + digest identities only.
+            let _ = crate::diagnostics::AdmissionRecord::of(
+                crate::diagnostics::disposition_of_resolution(&result.disposition),
+                &ticket.ticket_id,
+                &result.result_sha256,
+            )
+            .emit();
+        })
 }
 
 #[cfg(test)]

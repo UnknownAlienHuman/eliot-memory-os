@@ -16,6 +16,7 @@ use eliot_store_api::{
     OrderingHeadExpectation, PreparedTransition, RevisionHeadExpectation, StoreHealth,
     WriteReceipt, validate_store_receipt_envelope,
 };
+use tracing::Instrument as _;
 
 use super::{DaemonKernelClient, kernel_port_error, kind_value};
 
@@ -80,82 +81,117 @@ impl KernelTransitionPort for DaemonKernelClient {
         expected_ordering_heads: Vec<OrderingHeadExpectation>,
     ) -> KernelPortFuture<'a, WriteReceipt> {
         let identity = identity.clone();
-        Box::pin(async move {
-            check_identity_binding(
-                &identity,
-                &transition,
-                &expected_revision_heads,
-                &expected_ordering_heads,
-            )?;
-            let expected_transition = transition.clone();
-            let value = self
-                .transact_async_with_identity(
-                    "apply_prepared",
-                    serde_json::json!({
-                        "context": identity.request.metadata.clone(),
-                        "transition": transition,
-                        "expected_revision_heads": expected_revision_heads,
-                        "expected_ordering_heads": expected_ordering_heads,
-                    }),
-                    identity.clone(),
+        // #740: handoff/commitment span over the neutral transition
+        // boundary. Identity binding agreement marks the prepared handoff;
+        // the validated receipt envelope marks the commitment. The two
+        // are never the same record. The span instruments the future
+        // (`Send`-safe) instead of an entered guard, which cannot cross
+        // an await.
+        let span = tracing::info_span!(
+            "eliotd.transition_handoff",
+            operation = %super::diagnostics::sanitize_identity(&identity.idempotency_key)
+        );
+        Box::pin(
+            async move {
+                check_identity_binding(
+                    &identity,
+                    &transition,
+                    &expected_revision_heads,
+                    &expected_ordering_heads,
+                )?;
+                let _ = super::diagnostics::emit_handoff(
+                    super::diagnostics::HandoffKind::Prepared,
+                    identity.idempotency_key.as_str(),
+                    identity.request.metadata.request_id.as_str(),
+                );
+                let expected_transition = transition.clone();
+                let value = self
+                    .transact_async_with_identity(
+                        "apply_prepared",
+                        serde_json::json!({
+                            "context": identity.request.metadata.clone(),
+                            "transition": transition,
+                            "expected_revision_heads": expected_revision_heads,
+                            "expected_ordering_heads": expected_ordering_heads,
+                        }),
+                        identity.clone(),
+                    )
+                    .await
+                    .map_err(kernel_port_error)?;
+                let value = kind_value(&value, "write_receipt")?;
+                let receipt: WriteReceipt = serde_json::from_value(value)
+                    .map_err(|error| KernelPortError::Contract(error.to_string()))?;
+                validate_store_receipt_envelope(
+                    &identity.request.metadata,
+                    &expected_transition,
+                    &receipt,
                 )
-                .await
-                .map_err(kernel_port_error)?;
-            let value = kind_value(&value, "write_receipt")?;
-            let receipt: WriteReceipt = serde_json::from_value(value)
                 .map_err(|error| KernelPortError::Contract(error.to_string()))?;
-            validate_store_receipt_envelope(
-                &identity.request.metadata,
-                &expected_transition,
-                &receipt,
-            )
-            .map_err(|error| KernelPortError::Contract(error.to_string()))?;
-            Ok(receipt)
-        })
+                let _ = super::diagnostics::emit_handoff(
+                    super::diagnostics::HandoffKind::Committed,
+                    identity.idempotency_key.as_str(),
+                    receipt.operation_id.as_str(),
+                );
+                Ok(receipt)
+            }
+            .instrument(span),
+        )
     }
 
     fn receipt(&self, operation_id: OperationId) -> KernelPortFuture<'_, Option<WriteReceipt>> {
         let state_fence = self.kernel_binding.state_fence.clone();
-        Box::pin(async move {
-            let value = self
-                .transact_async(
-                    "receipt",
-                    serde_json::json!({
-                        "operation_id": operation_id.clone(),
-                        "state_fence": state_fence.clone(),
-                    }),
-                )
-                .await
-                .map_err(kernel_port_error)?;
-            let value = kind_value(&value, "receipt")?;
-            let Some(receipt) = serde_json::from_value::<Option<WriteReceipt>>(value)
-                .map_err(|error| KernelPortError::Contract(error.to_string()))?
-            else {
-                return Ok(None);
-            };
-            receipt
-                .validate()
-                .map_err(|error| KernelPortError::Contract(error.to_string()))?;
-            if receipt.operation_id != operation_id || receipt.state_fence != state_fence {
-                return Err(KernelPortError::Contract(
+        // #740: receipt-boundary span over the owning read path
+        // (`Send`-safe instrumentation; no entered guard crosses an await).
+        let span = tracing::info_span!("eliotd.transition_receipt");
+        Box::pin(
+            async move {
+                let value = self
+                    .transact_async(
+                        "receipt",
+                        serde_json::json!({
+                            "operation_id": operation_id.clone(),
+                            "state_fence": state_fence.clone(),
+                        }),
+                    )
+                    .await
+                    .map_err(kernel_port_error)?;
+                let value = kind_value(&value, "receipt")?;
+                let Some(receipt) = serde_json::from_value::<Option<WriteReceipt>>(value)
+                    .map_err(|error| KernelPortError::Contract(error.to_string()))?
+                else {
+                    return Ok(None);
+                };
+                receipt
+                    .validate()
+                    .map_err(|error| KernelPortError::Contract(error.to_string()))?;
+                if receipt.operation_id != operation_id || receipt.state_fence != state_fence {
+                    return Err(KernelPortError::Contract(
                     "daemon receipt does not match the requested operation and active state fence"
                         .to_owned(),
                 ));
+                }
+                Ok(Some(receipt))
             }
-            Ok(Some(receipt))
-        })
+            .instrument(span),
+        )
     }
 
     fn health(&self) -> KernelPortFuture<'_, StoreHealth> {
-        Box::pin(async move {
-            let value = self
-                .transact_async("health", serde_json::json!({}))
-                .await
-                .map_err(kernel_port_error)?;
-            let value = kind_value(&value, "health")?;
-            serde_json::from_value(value)
-                .map_err(|error| KernelPortError::Contract(error.to_string()))
-        })
+        // #740: health-boundary span over the owning read path
+        // (`Send`-safe instrumentation; no entered guard crosses an await).
+        let span = tracing::info_span!("eliotd.transition_health");
+        Box::pin(
+            async move {
+                let value = self
+                    .transact_async("health", serde_json::json!({}))
+                    .await
+                    .map_err(kernel_port_error)?;
+                let value = kind_value(&value, "health")?;
+                serde_json::from_value(value)
+                    .map_err(|error| KernelPortError::Contract(error.to_string()))
+            }
+            .instrument(span),
+        )
     }
 }
 
