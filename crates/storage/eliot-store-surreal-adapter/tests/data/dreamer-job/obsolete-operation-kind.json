@@ -1,5 +1,4 @@
 {
-  "description": "WORK_UNIT_CASE 775/20: the obsolete CandidateReady vocabulary is not a closed operation kind and must be rejected as UnknownOperation.",
   "operation_id": "operation-775-20-obsolete",
   "idempotency_key": "stable-775-20-obsolete",
   "canonical_request_hash": "0000000000000000000000000000000000000000000000000000000000000000",

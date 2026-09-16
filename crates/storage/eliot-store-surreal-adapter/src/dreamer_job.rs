@@ -1093,16 +1093,23 @@ async fn op_lease_next(
             field: "dreamer_job.selection",
         }));
     }
-    let coverage: Vec<String> = scoped
+    // Coverage names the bounded selectable set (queued jobs in deterministic
+    // key order), so the leased job below is always covered as K0 requires.
+    let mut eligible: Vec<&(String, RecoveryRecord, DreamerJobLedgerRecord)> = scoped
+        .iter()
+        .filter(|(_, _, ledger)| ledger.record.state == JobState::Queued)
+        .copied()
+        .collect();
+    eligible.sort_by(|left, right| left.0.cmp(&right.0));
+    let coverage: Vec<String> = eligible
         .iter()
         .take(usize::try_from(selector.max_candidates).unwrap_or(usize::MAX))
         .map(|(_, _, ledger)| ledger.record.submission.job_id.to_string())
         .collect();
-    let Some((row_key, job_row, mut ledger)) = scoped
+    let Some((row_key, job_row, mut ledger)) = eligible
         .iter()
         .find(|(_, _, ledger)| {
-            ledger.record.state == JobState::Queued
-                && ledger.record.revision == selector.expected_revision
+            ledger.record.revision == selector.expected_revision
                 && ledger.active_lease.is_none()
                 && ledger.record.lease.is_none()
         })
