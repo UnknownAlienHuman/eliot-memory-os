@@ -875,3 +875,54 @@ fn launch_13_deterministic_semantic_fields() {
     );
     assert_eq!(first.len(), second.len(), "got: {first:?} vs {second:?}");
 }
+
+// WORK_UNIT_CASE: 978/14
+#[test]
+fn launch_14_source_guard_stays_diagnostics_only() {
+    let files = [
+        job_launch_source(),
+        launch_options_source(),
+        artifact_source(),
+        descriptor_source(),
+        scm_source(),
+        sequence_source(),
+        driver_source(),
+        frontdoor_source(),
+    ];
+    for source in &files {
+        for forbidden in ["unsafe", "println!", "print!", "eprintln!"] {
+            assert!(
+                !source.contains(forbidden),
+                "diagnostics-only change must not introduce {forbidden:?}"
+            );
+        }
+        for direct in [
+            "tracing::info!",
+            "tracing::warn!",
+            "tracing::error!",
+            "tracing::debug!",
+        ] {
+            assert!(
+                !source.contains(direct),
+                "all observations go through the single host_diagnostics facade, found {direct:?}"
+            );
+        }
+        assert!(
+            source.contains("observe_entrypoint") || source.contains("observe_terminal_error"),
+            "every boundary file must emit through the facade"
+        );
+    }
+    for other in [
+        "src/credential_control.rs",
+        "src/host_activation_durable.rs",
+        "src/host_composition_phase_b.rs",
+        "src/host_composition_store_recovery.rs",
+        "src/phase_b_materialization.rs",
+        "src/store_recovery_persistence.rs",
+    ] {
+        assert!(
+            !manifest_source(other).contains("978/"),
+            "F-LOG-HOST-3 must not touch sibling item scope {other}"
+        );
+    }
+}
