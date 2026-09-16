@@ -125,8 +125,27 @@ pub(crate) fn read_approved_service_registration(
         observation = "attempted",
         "attempting installer-approved registration projection"
     );
-    let (registry, manifest) = crate::read_registry_for_bootstrap(bootstrap)?;
-    let (approval, request) = approved_service_registration(&registry, &manifest, role)?;
+    crate::diagnostics::observe_service_registration(
+        crate::diagnostics::ServiceRegistrationObservation::Requested,
+        "approved registration projection requested",
+    );
+    let (registry, manifest) = crate::read_registry_for_bootstrap(bootstrap).inspect_err(|_| {
+        crate::diagnostics::observe_service_registration(
+            crate::diagnostics::ServiceRegistrationObservation::Unknown,
+            "registry readback unknown",
+        );
+    })?;
+    let (approval, request) = approved_service_registration(&registry, &manifest, role)
+        .inspect_err(|_| {
+            crate::diagnostics::observe_service_registration(
+                crate::diagnostics::ServiceRegistrationObservation::Mismatched,
+                "approval binding mismatched",
+            );
+        })?;
+    crate::diagnostics::observe_service_registration(
+        crate::diagnostics::ServiceRegistrationObservation::Observed,
+        "approved registration observed",
+    );
     Ok((manifest, approval, request))
 }
 
@@ -143,17 +162,42 @@ pub(crate) fn validate_bound_service_registrations(
         observation = "attempted",
         "validating bound service registrations"
     );
+    crate::diagnostics::observe_service_registration(
+        crate::diagnostics::ServiceRegistrationObservation::Requested,
+        "bound registration validation requested",
+    );
     let (_, host_request) =
-        approved_service_registration(registry, manifest, InstallerServiceRole::Host)?;
+        approved_service_registration(registry, manifest, InstallerServiceRole::Host).inspect_err(
+            |_| {
+                crate::diagnostics::observe_service_registration(
+                    crate::diagnostics::ServiceRegistrationObservation::Mismatched,
+                    "host binding mismatched",
+                );
+            },
+        )?;
     let (_, watchdog_request) =
-        approved_service_registration(registry, manifest, InstallerServiceRole::Watchdog)?;
+        approved_service_registration(registry, manifest, InstallerServiceRole::Watchdog)
+            .inspect_err(|_| {
+                crate::diagnostics::observe_service_registration(
+                    crate::diagnostics::ServiceRegistrationObservation::Mismatched,
+                    "watchdog binding mismatched",
+                );
+            })?;
     if host_request != *expected_host_request
         || watchdog_request != *expected_watchdog_request
         || watchdog_request.bootstrap() != Some(bootstrap)
     {
+        crate::diagnostics::observe_service_registration(
+            crate::diagnostics::ServiceRegistrationObservation::Mismatched,
+            "bound registration changed",
+        );
         return Err(SpoolError::InvalidLease(
             "installer SCM registration approval changed after watchdog binding".to_owned(),
         ));
     }
+    crate::diagnostics::observe_service_registration(
+        crate::diagnostics::ServiceRegistrationObservation::Observed,
+        "bound registration observed",
+    );
     Ok(())
 }

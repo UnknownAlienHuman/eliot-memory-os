@@ -35,6 +35,10 @@ pub(super) struct ObservedWatchdogPublication {
     pub(super) raw: OwnedDirectoryObservation,
 }
 
+#[allow(
+    clippy::too_many_lines,
+    reason = "each publication boundary carries one observation-only record without changing the readback decision"
+)]
 pub(super) fn observe_watchdog_publication(
     path: &Path,
 ) -> Result<ObservedWatchdogPublication, SpoolError> {
@@ -43,6 +47,10 @@ pub(super) fn observe_watchdog_publication(
         event = "watchdog.publication_observation_attempted",
         observation = "attempted",
         "observing watchdog publication without payload material"
+    );
+    crate::diagnostics::observe_publication(
+        crate::diagnostics::PublicationObservation::Requested,
+        "publication readback requested",
     );
     let raw = observe_owned_directory_exact(
         path,
@@ -53,71 +61,154 @@ pub(super) fn observe_watchdog_publication(
         ],
         LEASE_FILE_LIMIT,
     )
-    .map_err(|error| SpoolError::InvalidLease(error.to_string()))?;
-    let admission_bytes = raw
-        .bytes(WATCHDOG_ADMISSION_FILE_NAME)
-        .ok_or_else(|| SpoolError::InvalidLease("admission child is absent".to_owned()))?;
-    let lease_bytes = raw
-        .bytes(SUPERVISION_LEASE_FILE_NAME)
-        .ok_or_else(|| SpoolError::InvalidLease("lease child is absent".to_owned()))?;
-    let marker_bytes = raw
-        .bytes(WATCHDOG_PUBLICATION_FILE_NAME)
-        .ok_or_else(|| SpoolError::InvalidLease("publication marker is absent".to_owned()))?;
-    let admission: WatchdogAdmissionConfig = serde_json::from_slice(admission_bytes)
-        .map_err(|error| SpoolError::InvalidLease(error.to_string()))?;
-    let lease: SignedSupervisionLease = serde_json::from_slice(lease_bytes)
-        .map_err(|error| SpoolError::InvalidLease(error.to_string()))?;
-    let marker: WatchdogPublicationBundle = serde_json::from_slice(marker_bytes)
-        .map_err(|error| SpoolError::InvalidLease(error.to_string()))?;
-    admission
-        .validate()
-        .map_err(|error| SpoolError::InvalidLease(error.to_string()))?;
-    lease
-        .validate()
-        .map_err(|error| SpoolError::InvalidLease(error.to_string()))?;
-    marker
-        .validate()
-        .map_err(|error| SpoolError::InvalidLease(error.to_string()))?;
-    if admission
-        .canonical_bytes()
-        .map_err(|error| SpoolError::InvalidLease(error.to_string()))?
-        != admission_bytes
-        || serde_json::to_vec(&lease)
-            .map_err(|error| SpoolError::InvalidLease(error.to_string()))?
-            != lease_bytes
-        || marker
-            .canonical_bytes()
-            .map_err(|error| SpoolError::InvalidLease(error.to_string()))?
-            != marker_bytes
+    .map_err(|error| {
+        crate::diagnostics::observe_publication(
+            crate::diagnostics::PublicationObservation::Absent,
+            "owned publication directory unavailable",
+        );
+        SpoolError::InvalidLease(error.to_string())
+    })?;
+    let admission_bytes = raw.bytes(WATCHDOG_ADMISSION_FILE_NAME).ok_or_else(|| {
+        crate::diagnostics::observe_publication(
+            crate::diagnostics::PublicationObservation::Absent,
+            "admission child absent",
+        );
+        SpoolError::InvalidLease("admission child is absent".to_owned())
+    })?;
+    let lease_bytes = raw.bytes(SUPERVISION_LEASE_FILE_NAME).ok_or_else(|| {
+        crate::diagnostics::observe_publication(
+            crate::diagnostics::PublicationObservation::Absent,
+            "lease child absent",
+        );
+        SpoolError::InvalidLease("lease child is absent".to_owned())
+    })?;
+    let marker_bytes = raw.bytes(WATCHDOG_PUBLICATION_FILE_NAME).ok_or_else(|| {
+        crate::diagnostics::observe_publication(
+            crate::diagnostics::PublicationObservation::Absent,
+            "publication marker absent",
+        );
+        SpoolError::InvalidLease("publication marker is absent".to_owned())
+    })?;
+    let admission: WatchdogAdmissionConfig =
+        serde_json::from_slice(admission_bytes).map_err(|error| {
+            crate::diagnostics::observe_publication(
+                crate::diagnostics::PublicationObservation::Conflicting,
+                "admission encoding conflicting",
+            );
+            SpoolError::InvalidLease(error.to_string())
+        })?;
+    let lease: SignedSupervisionLease = serde_json::from_slice(lease_bytes).map_err(|error| {
+        crate::diagnostics::observe_publication(
+            crate::diagnostics::PublicationObservation::Conflicting,
+            "lease encoding conflicting",
+        );
+        SpoolError::InvalidLease(error.to_string())
+    })?;
+    let marker: WatchdogPublicationBundle =
+        serde_json::from_slice(marker_bytes).map_err(|error| {
+            crate::diagnostics::observe_publication(
+                crate::diagnostics::PublicationObservation::Conflicting,
+                "marker encoding conflicting",
+            );
+            SpoolError::InvalidLease(error.to_string())
+        })?;
+    admission.validate().map_err(|error| {
+        crate::diagnostics::observe_publication(
+            crate::diagnostics::PublicationObservation::Conflicting,
+            "admission content conflicting",
+        );
+        SpoolError::InvalidLease(error.to_string())
+    })?;
+    lease.validate().map_err(|error| {
+        crate::diagnostics::observe_publication(
+            crate::diagnostics::PublicationObservation::Conflicting,
+            "lease content conflicting",
+        );
+        SpoolError::InvalidLease(error.to_string())
+    })?;
+    marker.validate().map_err(|error| {
+        crate::diagnostics::observe_publication(
+            crate::diagnostics::PublicationObservation::Conflicting,
+            "marker content conflicting",
+        );
+        SpoolError::InvalidLease(error.to_string())
+    })?;
+    if admission.canonical_bytes().map_err(|error| {
+        crate::diagnostics::observe_publication(
+            crate::diagnostics::PublicationObservation::Conflicting,
+            "canonical encoding conflicting",
+        );
+        SpoolError::InvalidLease(error.to_string())
+    })? != admission_bytes
+        || serde_json::to_vec(&lease).map_err(|error| {
+            crate::diagnostics::observe_publication(
+                crate::diagnostics::PublicationObservation::Conflicting,
+                "canonical encoding conflicting",
+            );
+            SpoolError::InvalidLease(error.to_string())
+        })? != lease_bytes
+        || marker.canonical_bytes().map_err(|error| {
+            crate::diagnostics::observe_publication(
+                crate::diagnostics::PublicationObservation::Conflicting,
+                "canonical encoding conflicting",
+            );
+            SpoolError::InvalidLease(error.to_string())
+        })? != marker_bytes
     {
+        crate::diagnostics::observe_publication(
+            crate::diagnostics::PublicationObservation::Conflicting,
+            "publication children not canonical",
+        );
         return Err(SpoolError::InvalidLease(
             "Watchdog publication children are not canonical".to_owned(),
         ));
     }
     marker
         .verify_bytes(admission_bytes, lease_bytes)
-        .map_err(|error| SpoolError::InvalidLease(error.to_string()))?;
+        .map_err(|error| {
+            crate::diagnostics::observe_publication(
+                crate::diagnostics::PublicationObservation::Conflicting,
+                "publication binding conflicting",
+            );
+            SpoolError::InvalidLease(error.to_string())
+        })?;
     if marker.installation_id != admission.installation_id
         || marker.approved_generation != admission.approved_generation
         || marker.supervision_lease_scope_id != admission.supervision_lease_scope_id
         || marker.supervision_lease_id != lease.payload.lease_id
     {
+        crate::diagnostics::observe_publication(
+            crate::diagnostics::PublicationObservation::Conflicting,
+            "marker not bound to admission",
+        );
         return Err(SpoolError::InvalidLease(
             "Watchdog marker is not bound to its admission template".to_owned(),
         ));
     }
-    let expected_name = marker
-        .directory_name()
-        .map_err(|error| SpoolError::InvalidLease(error.to_string()))?;
+    let expected_name = marker.directory_name().map_err(|error| {
+        crate::diagnostics::observe_publication(
+            crate::diagnostics::PublicationObservation::Conflicting,
+            "directory identity conflicting",
+        );
+        SpoolError::InvalidLease(error.to_string())
+    })?;
     if path
         .file_name()
         .and_then(|name| name.to_str())
         .is_none_or(|name| !name.eq_ignore_ascii_case(&expected_name))
     {
+        crate::diagnostics::observe_publication(
+            crate::diagnostics::PublicationObservation::Conflicting,
+            "directory not keyed by receipt",
+        );
         return Err(SpoolError::InvalidLease(
             "Watchdog directory is not keyed by its ORS receipt".to_owned(),
         ));
     }
+    crate::diagnostics::observe_publication(
+        crate::diagnostics::PublicationObservation::Observed,
+        "publication observed",
+    );
     Ok(ObservedWatchdogPublication {
         marker,
         admission,
@@ -135,14 +226,36 @@ pub(super) fn scan_watchdog_publications(
         observation = "attempted",
         "scanning watchdog publications without payload material"
     );
+    crate::diagnostics::observe_publication(
+        crate::diagnostics::PublicationObservation::Requested,
+        "publication scan requested",
+    );
     let mut observed = Vec::new();
-    for entry in std::fs::read_dir(host_state_root)? {
-        let entry = entry?;
+    for entry in std::fs::read_dir(host_state_root).map_err(|error| {
+        crate::diagnostics::observe_publication(
+            crate::diagnostics::PublicationObservation::Absent,
+            "state root unavailable",
+        );
+        SpoolError::Io(error)
+    })? {
+        let entry = entry.map_err(|error| {
+            crate::diagnostics::observe_publication(
+                crate::diagnostics::PublicationObservation::Absent,
+                "directory entry unavailable",
+            );
+            SpoolError::Io(error)
+        })?;
         let name = entry
             .file_name()
             .to_str()
             .map(ToOwned::to_owned)
-            .ok_or(SpoolError::InvalidProtectedRoot)?;
+            .ok_or_else(|| {
+                crate::diagnostics::observe_publication(
+                    crate::diagnostics::PublicationObservation::Conflicting,
+                    "directory entry identity conflicting",
+                );
+                SpoolError::InvalidProtectedRoot
+            })?;
         if name
             .to_ascii_lowercase()
             .starts_with(WATCHDOG_PUBLICATION_DIRECTORY_PREFIX)
@@ -150,6 +263,10 @@ pub(super) fn scan_watchdog_publications(
             observed.push(observe_watchdog_publication(&entry.path())?);
         }
     }
+    crate::diagnostics::observe_publication(
+        crate::diagnostics::PublicationObservation::Observed,
+        "publication scan observed",
+    );
     Ok(observed)
 }
 
@@ -163,6 +280,10 @@ pub(super) fn read_manifest_selected_ors_current(
         observation = "attempted",
         "reading manifest-selected ORS current without payload material"
     );
+    crate::diagnostics::observe_publication(
+        crate::diagnostics::PublicationObservation::Requested,
+        "durable current read requested",
+    );
     let kernel_ors_path = PathBuf::from(
         selected_manifest
             .runtime_launch
@@ -172,20 +293,56 @@ pub(super) fn read_manifest_selected_ors_current(
     )
     .join(KERNEL_ORS_FILE_NAME);
     let kernel_ors_lease = ProtectedRuntimePathLease::open_existing_absolute(&kernel_ors_path)
-        .map_err(|error| SpoolError::InvalidLease(format!("Kernel ORS open failed: {error}")))?;
+        .map_err(|error| {
+            crate::diagnostics::observe_publication(
+                crate::diagnostics::PublicationObservation::Absent,
+                "kernel ORS unavailable",
+            );
+            SpoolError::InvalidLease(format!("Kernel ORS open failed: {error}"))
+        })?;
     if !windows_paths_equal(kernel_ors_lease.path(), &kernel_ors_path) {
+        crate::diagnostics::observe_publication(
+            crate::diagnostics::PublicationObservation::Conflicting,
+            "kernel ORS path conflicting",
+        );
         return Err(SpoolError::InvalidLease(
             "Kernel ORS path is not the manifest-selected path".to_owned(),
         ));
     }
-    kernel_ors_lease
-        .verify_stable_identity()
-        .map_err(|error| SpoolError::InvalidLease(format!("Kernel ORS changed: {error}")))?;
-    kernel_ors_lease
-        .verify_path_identity()
-        .map_err(|error| SpoolError::InvalidLease(format!("Kernel ORS path changed: {error}")))?;
-    read_current_supervision_lease_read_only(kernel_ors_lease.path(), lease_id)
-        .map_err(|error| SpoolError::InvalidLease(format!("Kernel ORS read failed: {error}")))
+    kernel_ors_lease.verify_stable_identity().map_err(|error| {
+        crate::diagnostics::observe_publication(
+            crate::diagnostics::PublicationObservation::Stale,
+            "kernel ORS changed",
+        );
+        SpoolError::InvalidLease(format!("Kernel ORS changed: {error}"))
+    })?;
+    kernel_ors_lease.verify_path_identity().map_err(|error| {
+        crate::diagnostics::observe_publication(
+            crate::diagnostics::PublicationObservation::Conflicting,
+            "kernel ORS path changed",
+        );
+        SpoolError::InvalidLease(format!("Kernel ORS path changed: {error}"))
+    })?;
+    let current = read_current_supervision_lease_read_only(kernel_ors_lease.path(), lease_id)
+        .map_err(|error| {
+            crate::diagnostics::observe_publication(
+                crate::diagnostics::PublicationObservation::Absent,
+                "kernel ORS read failed",
+            );
+            SpoolError::InvalidLease(format!("Kernel ORS read failed: {error}"))
+        })?;
+    if current.is_some() {
+        crate::diagnostics::observe_publication(
+            crate::diagnostics::PublicationObservation::Observed,
+            "durable current observed",
+        );
+    } else {
+        crate::diagnostics::observe_publication(
+            crate::diagnostics::PublicationObservation::Absent,
+            "durable current absent",
+        );
+    }
+    Ok(current)
 }
 
 pub(super) fn verify_against_durable_current(
@@ -200,29 +357,95 @@ pub(super) fn verify_against_durable_current(
         observation = "attempted",
         "verifying supervision lease against durable current"
     );
+    crate::diagnostics::observe_publication(
+        crate::diagnostics::PublicationObservation::Requested,
+        "durable verification requested",
+    );
     let durable_current = durable_current.ok_or_else(|| {
+        crate::diagnostics::observe_publication(
+            crate::diagnostics::PublicationObservation::Absent,
+            "durable current absent",
+        );
         SpoolError::LeaseFenced("Kernel ORS has no current supervision lease".to_owned())
     })?;
     if durable_current.record.artifact != *envelope {
+        crate::diagnostics::observe_publication(
+            crate::diagnostics::PublicationObservation::Conflicting,
+            "lease not durable artifact",
+        );
         return Err(SpoolError::LeaseFenced(
             "signed supervision lease is not the exact durable Kernel ORS artifact".to_owned(),
         ));
     }
-    validate_payload_bindings(context, &envelope.payload)
-        .map_err(|error| map_lease_verification_error(&error))?;
+    validate_payload_bindings(context, &envelope.payload).map_err(|error| {
+        let mapped = map_lease_verification_error(&error);
+        match &mapped {
+            SpoolError::LeaseStale(_) => crate::diagnostics::observe_publication(
+                crate::diagnostics::PublicationObservation::Stale,
+                "lease binding stale",
+            ),
+            SpoolError::LeaseFenced(_) => crate::diagnostics::observe_publication(
+                crate::diagnostics::PublicationObservation::Conflicting,
+                "lease binding conflicting",
+            ),
+            _ => crate::diagnostics::observe_publication(
+                crate::diagnostics::PublicationObservation::Absent,
+                "lease binding absent",
+            ),
+        }
+        mapped
+    })?;
     let mut context = context.clone();
     context.ors_mirror = durable_current.record.artifact.payload.ors_mirror.clone();
-    context
-        .validate()
-        .map_err(|error| map_lease_verification_error(&error))?;
-    let lease = trust_anchor
-        .verify(envelope, &context)
-        .map_err(|error| map_lease_verification_error(&error))?;
+    context.validate().map_err(|error| {
+        let mapped = map_lease_verification_error(&error);
+        match &mapped {
+            SpoolError::LeaseStale(_) => crate::diagnostics::observe_publication(
+                crate::diagnostics::PublicationObservation::Stale,
+                "context stale",
+            ),
+            SpoolError::LeaseFenced(_) => crate::diagnostics::observe_publication(
+                crate::diagnostics::PublicationObservation::Conflicting,
+                "context conflicting",
+            ),
+            _ => crate::diagnostics::observe_publication(
+                crate::diagnostics::PublicationObservation::Absent,
+                "context absent",
+            ),
+        }
+        mapped
+    })?;
+    let lease = trust_anchor.verify(envelope, &context).map_err(|error| {
+        let mapped = map_lease_verification_error(&error);
+        match &mapped {
+            SpoolError::LeaseStale(_) => crate::diagnostics::observe_publication(
+                crate::diagnostics::PublicationObservation::Stale,
+                "lease verification stale",
+            ),
+            SpoolError::LeaseFenced(_) => crate::diagnostics::observe_publication(
+                crate::diagnostics::PublicationObservation::Conflicting,
+                "lease verification conflicting",
+            ),
+            _ => crate::diagnostics::observe_publication(
+                crate::diagnostics::PublicationObservation::Absent,
+                "lease verification absent",
+            ),
+        }
+        mapped
+    })?;
     if lease.payload() != &durable_current.record.artifact.payload {
+        crate::diagnostics::observe_publication(
+            crate::diagnostics::PublicationObservation::Conflicting,
+            "verified lease diverged",
+        );
         return Err(SpoolError::LeaseFenced(
             "verified supervision lease diverged from the durable Kernel ORS artifact".to_owned(),
         ));
     }
+    crate::diagnostics::observe_publication(
+        crate::diagnostics::PublicationObservation::Observed,
+        "durable verification observed",
+    );
     Ok(lease)
 }
 
