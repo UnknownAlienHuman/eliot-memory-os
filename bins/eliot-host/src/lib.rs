@@ -37,6 +37,84 @@ mod store_kernel_launch_sequence;
 /// lands, never FFI inside Host.
 pub mod windows_event_log;
 
+// F-LOG-HOST-1 (#891) lifecycle/SCM observation helpers.
+//
+// Through the #889 facade only (`host_diagnostics::observe_entrypoint`,
+// `observe_entrypoint_with_detail`, `observe_terminal_error`); the Event Log
+// seam stays typed-Unavailable (`windows_event_log::event_log_sink_status`),
+// never implemented here (#984 still open).
+//
+// Observation-only contract: every helper projects facts already produced by
+// the semantic owner. Arguments are static literals or borrows of
+// already-owned identities; no helper computes new digests, opens handles,
+// evaluates side-effectful values, acquires locks, or branches the semantic
+// result. Sink outcome never alters result/order/status/cleanup. There is no
+// mutable global dedup cache: one terminal emission per failed public
+// operation is enforced by the single outermost guard per operation, while
+// inner phase observations share correlation by stage order only.
+fn host_lifecycle_note_event_log_unavailable() {
+    let _ = windows_event_log::event_log_sink_status();
+}
+
+fn host_lifecycle_observe_requested(detail: &str) {
+    host_lifecycle_note_event_log_unavailable();
+    host_diagnostics::observe_entrypoint_with_detail(
+        host_diagnostics::EntrypointStage::Startup,
+        detail,
+    );
+}
+
+fn host_lifecycle_observe_scm(detail: &str) {
+    host_lifecycle_note_event_log_unavailable();
+    host_diagnostics::observe_entrypoint_with_detail(
+        host_diagnostics::EntrypointStage::ScmDispatch,
+        detail,
+    );
+}
+
+fn host_lifecycle_observe_drain(detail: &str) {
+    host_lifecycle_note_event_log_unavailable();
+    host_diagnostics::observe_entrypoint_with_detail(
+        host_diagnostics::EntrypointStage::ShutdownDrain,
+        detail,
+    );
+}
+
+fn host_lifecycle_observe_terminal(code: &str) {
+    host_lifecycle_note_event_log_unavailable();
+    host_diagnostics::observe_terminal_error(code);
+}
+
+/// Single-terminal guard for one public fallible operation.
+///
+/// Armed on entry; the single outermost boundary disarms on success. Any
+/// `Err` return (explicit or via `?`) drops armed and emits exactly one
+/// terminal record with the operation's frozen code. Emitting here never
+/// changes the `Result`: the guard only observes the already-produced
+/// outcome. No dedup cache, no lock, no second evaluation.
+struct HostTerminalGuard<'a> {
+    code: &'a str,
+    armed: bool,
+}
+
+impl<'a> HostTerminalGuard<'a> {
+    fn armed(code: &'a str) -> Self {
+        Self { code, armed: true }
+    }
+
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for HostTerminalGuard<'_> {
+    fn drop(&mut self) {
+        if self.armed {
+            host_lifecycle_observe_terminal(self.code);
+        }
+    }
+}
+
 pub use credential_control::{HostCredentialControl, HostPhaseBRequest, HostPhaseBRequestQueue};
 #[cfg(windows)]
 use launch_artifact::{
