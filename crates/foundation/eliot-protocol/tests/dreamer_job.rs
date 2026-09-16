@@ -713,12 +713,10 @@ fn outcome_for(state: JobState) -> JobOutcome {
 }
 
 fn other_terminal(state: JobState) -> JobState {
-    match state {
-        JobState::Completed => JobState::Failed,
-        JobState::Partial => JobState::Completed,
-        JobState::Failed => JobState::Cancelled,
-        JobState::Cancelled => JobState::UnknownOutcome,
-        _ => JobState::Completed,
+    if state == JobState::Completed {
+        JobState::Failed
+    } else {
+        JobState::Completed
     }
 }
 
@@ -776,7 +774,9 @@ fn reconcile_request(mutation: &MutationReconciliation, role: JobRole) -> Durabl
         "stable-reconcile",
     );
     request_identity.operation = mutation.operation.clone();
-    request_identity.canonical_request_hash = mutation.canonical_request_hash.clone();
+    request_identity
+        .canonical_request_hash
+        .clone_from(&mutation.canonical_request_hash);
     round_trip(&DurableJobRequest {
         request_identity,
         role,
@@ -797,22 +797,22 @@ fn checkpoint_other() -> JobCheckpoint {
     }
 }
 
-fn wire_of_state(state: &JobState) -> String {
-    serde_json::to_string(state)
+fn wire_of_state(state: JobState) -> String {
+    serde_json::to_string(&state)
         .expect("wire")
         .trim_matches('"')
         .to_owned()
 }
 
-fn wire_of_capability(capability: &JobCapability) -> String {
-    serde_json::to_string(capability)
+fn wire_of_capability(capability: JobCapability) -> String {
+    serde_json::to_string(&capability)
         .expect("wire")
         .trim_matches('"')
         .to_owned()
 }
 
-fn wire_of_role(role: &JobRole) -> String {
-    serde_json::to_string(role)
+fn wire_of_role(role: JobRole) -> String {
+    serde_json::to_string(&role)
         .expect("wire")
         .trim_matches('"')
         .to_owned()
@@ -929,6 +929,66 @@ fn resume_gate(checkpoint: &JobCheckpoint) -> Result<(), &'static str> {
     }
 }
 
+fn catalogue_operations() -> [JobOperation; 12] {
+    [
+        JobOperation::Submit {
+            submission: Box::new(submission()),
+        },
+        JobOperation::LeaseNext {
+            selector: selector(),
+        },
+        JobOperation::LeaseExact {
+            selector: selector(),
+            job_id: TaskId::new("job").expect("job"),
+        },
+        JobOperation::Renew {
+            lease: lease(),
+            now_unix_ms: 50,
+        },
+        JobOperation::Start {
+            lease: lease(),
+            now_unix_ms: 50,
+        },
+        JobOperation::Checkpoint {
+            lease: lease(),
+            checkpoint: Box::new(checkpoint()),
+            now_unix_ms: 50,
+        },
+        JobOperation::Resume {
+            lease: lease(),
+            checkpoint: Box::new(checkpoint()),
+            now_unix_ms: 50,
+        },
+        JobOperation::BeginVerification {
+            lease: lease(),
+            result: Box::new(content_ref("result")),
+            evidence: vec![artifact("stage-evidence")],
+            now_unix_ms: 50,
+        },
+        JobOperation::Publish {
+            lease: lease(),
+            outcome: Box::new(outcome_failed()),
+            now_unix_ms: 50,
+        },
+        JobOperation::Status {
+            job_id: TaskId::new("job").expect("job"),
+            attempt_id: ArtifactId::new("attempt").expect("attempt"),
+            expected_revision: 1,
+            expected_fence: fence(),
+        },
+        JobOperation::RequestCancel {
+            job_id: TaskId::new("job").expect("job"),
+            attempt_id: ArtifactId::new("attempt").expect("attempt"),
+            reason: "stop".to_owned(),
+            requested_at_unix_ms: 10,
+            expected_fence: fence(),
+        },
+        JobOperation::Reconcile {
+            mutation: Box::new(mutation_committed_unknown()),
+        },
+    ]
+}
+
 // WORK_UNIT_CASE: 769/1
 #[test]
 fn canonical_lifecycle_vocabulary_matches_i14_20() {
@@ -952,12 +1012,13 @@ fn canonical_lifecycle_vocabulary_matches_i14_20() {
         JobState::Cancelled,
         JobState::UnknownOutcome,
     ];
-    let wire: Vec<String> = all.iter().map(wire_of_state).collect();
+    let wire: Vec<String> = all.iter().copied().map(wire_of_state).collect();
     assert_eq!(wire, fixture_states);
     let fixture_terminal: Vec<String> =
         serde_json::from_value(vocabulary["terminal"].clone()).expect("terminal");
     let terminal: Vec<String> = all
         .iter()
+        .copied()
         .filter(|state| state.is_terminal())
         .map(wire_of_state)
         .collect();
@@ -976,7 +1037,7 @@ fn canonical_lifecycle_vocabulary_matches_i14_20() {
     for from in all {
         for to in all {
             let listed = edges.iter().any(|(edge_from, edge_to)| {
-                edge_from == &wire_of_state(&from) && edge_to == &wire_of_state(&to)
+                edge_from == &wire_of_state(from) && edge_to == &wire_of_state(to)
             });
             assert_eq!(
                 from.can_transition_to(to),
@@ -1043,63 +1104,7 @@ fn operation_catalogue_is_closed_at_twelve() {
         .map(|entry| entry["wire"].as_str().expect("wire").to_owned())
         .collect();
     assert_eq!(wires, fixture_wires);
-    let operations = [
-        JobOperation::Submit {
-            submission: Box::new(submission()),
-        },
-        JobOperation::LeaseNext {
-            selector: selector(),
-        },
-        JobOperation::LeaseExact {
-            selector: selector(),
-            job_id: TaskId::new("job").expect("job"),
-        },
-        JobOperation::Renew {
-            lease: lease(),
-            now_unix_ms: 50,
-        },
-        JobOperation::Start {
-            lease: lease(),
-            now_unix_ms: 50,
-        },
-        JobOperation::Checkpoint {
-            lease: lease(),
-            checkpoint: Box::new(checkpoint()),
-            now_unix_ms: 50,
-        },
-        JobOperation::Resume {
-            lease: lease(),
-            checkpoint: Box::new(checkpoint()),
-            now_unix_ms: 50,
-        },
-        JobOperation::BeginVerification {
-            lease: lease(),
-            result: Box::new(content_ref("result")),
-            evidence: vec![artifact("stage-evidence")],
-            now_unix_ms: 50,
-        },
-        JobOperation::Publish {
-            lease: lease(),
-            outcome: Box::new(outcome_failed()),
-            now_unix_ms: 50,
-        },
-        JobOperation::Status {
-            job_id: TaskId::new("job").expect("job"),
-            attempt_id: ArtifactId::new("attempt").expect("attempt"),
-            expected_revision: 1,
-            expected_fence: fence(),
-        },
-        JobOperation::RequestCancel {
-            job_id: TaskId::new("job").expect("job"),
-            attempt_id: ArtifactId::new("attempt").expect("attempt"),
-            reason: "stop".to_owned(),
-            requested_at_unix_ms: 10,
-            expected_fence: fence(),
-        },
-        JobOperation::Reconcile {
-            mutation: Box::new(mutation_committed_unknown()),
-        },
-    ];
+    let operations = catalogue_operations();
     for (operation, kind) in operations.iter().zip(kinds) {
         assert_eq!(operation.kind(), kind);
         assert_eq!(operation.kind().as_str(), kind.as_str());
@@ -1127,9 +1132,14 @@ fn operation_catalogue_is_closed_at_twelve() {
 fn role_capabilities_are_distinct_and_closed() {
     let matrix = fixture("role-capability-matrix.json");
     for role in [JobRole::Requester, JobRole::Worker, JobRole::Controller] {
-        let wire: Vec<String> = role.capabilities().iter().map(wire_of_capability).collect();
+        let wire: Vec<String> = role
+            .capabilities()
+            .iter()
+            .copied()
+            .map(wire_of_capability)
+            .collect();
         let expected: Vec<String> =
-            serde_json::from_value(matrix["roles"][wire_of_role(&role)].clone())
+            serde_json::from_value(matrix["roles"][wire_of_role(role)].clone())
                 .expect("capabilities");
         assert_eq!(wire, expected, "{role:?}");
     }
@@ -1159,7 +1169,7 @@ fn role_capabilities_are_distinct_and_closed() {
         for role in [JobRole::Requester, JobRole::Worker, JobRole::Controller] {
             assert_eq!(
                 role.permits(kind),
-                listed.contains(&wire_of_role(&role)),
+                listed.contains(&wire_of_role(role)),
                 "{role:?} on {}",
                 kind.as_str()
             );
@@ -2343,11 +2353,10 @@ fn each_terminal_shape_has_exact_evidence() {
         (JobState::Cancelled, outcome_cancelled()),
         (JobState::UnknownOutcome, outcome_unknown()),
     ] {
-        let wire = wire_of_state(&state);
+        let wire = wire_of_state(state);
         let flags = &matrix["terminal"][wire.as_str()];
-        assert_eq!(
+        assert!(
             flags["requires_evidence"].as_bool().expect("flag"),
-            true,
             "{wire}"
         );
         outcome.validate().expect("evidence present");
@@ -2355,11 +2364,10 @@ fn each_terminal_shape_has_exact_evidence() {
         evidenceless.evidence.clear();
         assert!(evidenceless.validate().is_err(), "{wire} requires evidence");
         if wire == "COMPLETED" {
-            assert_eq!(
+            assert!(
                 flags["requires_result_or_abstention"]
                     .as_bool()
-                    .expect("flag"),
-                true
+                    .expect("flag")
             );
             let mut bare = outcome.clone();
             bare.result = None;
@@ -2367,7 +2375,7 @@ fn each_terminal_shape_has_exact_evidence() {
             assert!(bare.validate().is_err());
         }
         if wire == "PARTIAL" {
-            assert_eq!(flags["requires_unresolved"].as_bool().expect("flag"), true);
+            assert!(flags["requires_unresolved"].as_bool().expect("flag"));
             let mut frontierless = outcome.clone();
             frontierless.unresolved.clear();
             assert!(frontierless.validate().is_err());
