@@ -220,11 +220,12 @@ fn semantic_digest_detects_machine_tamper_and_bad_revision_fails_closed() {
     bad_revision.contract_revision = "eliot.store.failure.v1".to_owned();
     assert!(bad_revision.validate().is_err());
 
-    // An unrepresentable denied disposition fails closed at decode: denial
-    // has no arm in the frozen v2 contour (see the reject-mapping docs).
+    // Denied is an explicit arm of the v2 contour: a DENIED disposition
+    // decodes to the arm instead of failing closed.
     let mut denied_value = serde_json::to_value(&failure).unwrap();
     denied_value["disposition"] = serde_json::json!("DENIED");
-    assert!(serde_json::from_value::<StoreFailure>(denied_value).is_err());
+    let denied: StoreFailure = serde_json::from_value(denied_value).unwrap();
+    assert_eq!(denied.disposition, StoreFailureDisposition::Denied);
 }
 
 #[test]
@@ -292,6 +293,7 @@ fn same_identity_retry_requires_request_or_idempotency_evidence() {
 #[test]
 fn retry_after_requires_a_nonzero_future_delay() {
     let mut failure = StoreFailure::from_store_error(StoreError::Unavailable, context()).unwrap();
+    failure.retry_after_dependency_revision = Some("dependency-revision-1".to_owned());
     failure.retry_after_ms = Some(0);
     assert!(failure.validate().is_err());
 
@@ -307,6 +309,7 @@ fn disposition_fixtures_cover_backpressure_migration_and_unknown_outcome() {
     backpressure.reason_code = StoreReasonCode::new("STORE_BACKPRESSURED").unwrap();
     backpressure.recovery_action = StoreRecoveryAction::WaitForCapacity;
     backpressure.retry_after_ms = Some(250);
+    backpressure.retry_after_dependency_revision = Some("dependency-revision-1".to_owned());
     backpressure.validate().unwrap();
 
     let mut migration = StoreFailure::from_store_error(StoreError::Unavailable, context()).unwrap();
@@ -336,4 +339,25 @@ fn malformed_and_oversized_wire_fields_fail_closed() {
     let mut oversized = failure;
     oversized.evidence_ref = Some("x".repeat(eliot_store_api::MAX_STORE_FAILURE_REFERENCE_LEN + 1));
     assert!(oversized.validate().is_err());
+}
+
+#[test]
+fn denied_and_not_applicable_with_evidence_handles() {
+    let mut failure = StoreFailure::from_store_error(StoreError::Unavailable, context()).unwrap();
+    failure.disposition = StoreFailureDisposition::Denied;
+    failure.mutation_disposition = StoreMutationDisposition::NotApplicable;
+    failure.retry_directive = StoreRetryDirective::DoNotRetry;
+    failure.evidence_handles = StoreEvidenceHandles::new(vec!["a".to_owned()]).unwrap();
+    failure.validate().unwrap();
+    let round_tripped: StoreFailure =
+        serde_json::from_value(serde_json::to_value(&failure).unwrap()).unwrap();
+    assert_eq!(round_tripped, failure);
+    let digest = failure.semantic_digest().unwrap();
+    let mut tampered = failure.clone();
+    tampered.evidence_handles = StoreEvidenceHandles::new(vec!["b".to_owned()]).unwrap();
+    assert_ne!(tampered.semantic_digest().unwrap(), digest);
+    assert!(StoreEvidenceHandles::new(vec!["dup".to_owned(), "dup".to_owned()]).is_err());
+    let mut missing = StoreFailure::from_store_error(StoreError::Unavailable, context()).unwrap();
+    missing.retry_after_ms = Some(250);
+    assert!(missing.validate().is_err());
 }

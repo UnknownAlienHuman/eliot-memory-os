@@ -25,17 +25,15 @@ pub const MAX_STORE_FAILURE_EVIDENCE_HANDLES: usize = 8;
 
 /// Small stable control axis for a store failure.
 ///
-/// This closed contour is frozen at v2: unmigrated consumers construct
-/// [`StoreFailure`] with struct literals and match this enum exhaustively, so
-/// this contract-only unit grows neither the variants nor the payload fields.
+/// This closed contour is versioned at v2: [`StoreFailure`] carries the
+/// `eliot.store.failure.v2` revision and unknown future reason codes survive
+/// decoding, while the disposition itself stays closed so exhaustive matches
+/// fail closed on unrepresentable arms.
 ///
-/// Reject-mapping for authorization/policy denial (issue #205): denial has no
-/// arm here. No `StoreError` producer maps to it, and reusing
-/// `DeterministicRejection` or `Unsupported` for a denial is rejected — those
-/// arms assert validation-shape semantics, never an authorization decision. A
-/// payload carrying an unrepresentable `DENIED` disposition fails closed at
-/// decode. Landing a `Denied` arm requires the follow-up bridge mapping,
-/// Kernel consumer, and runtime-status projection units to migrate first.
+/// Authorization/policy denial (issue #205) has an explicit arm: `Denied`
+/// asserts an authorization decision, never validation shape. No `StoreError`
+/// producer maps to it, and reusing `DeterministicRejection` or `Unsupported`
+/// for a denial is rejected — those arms assert validation-shape semantics.
 #[derive(
     Clone, Copy, Debug, Eq, JsonSchema, Ord, PartialEq, PartialOrd, Serialize, Deserialize,
 )]
@@ -43,6 +41,7 @@ pub const MAX_STORE_FAILURE_EVIDENCE_HANDLES: usize = 8;
 pub enum StoreFailureDisposition {
     DeterministicRejection,
     Conflict,
+    Denied,
     Unavailable,
     Backpressured,
     DeadlineExceeded,
@@ -113,20 +112,19 @@ impl From<StoreReasonCode> for String {
 
 /// What is known about the mutation when the failure was reported.
 ///
-/// This closed contour is frozen at v2 for the same reason as
-/// [`StoreFailureDisposition`]: exhaustive downstream matches keep compiling
-/// only while no variant is added.
+/// This closed contour is versioned at v2 alongside
+/// [`StoreFailureDisposition`].
 ///
-/// Reject-mapping for `not_applicable` (issue #205): outcomes where no
-/// mutation could ever apply (read-path and validation refusals) map to
-/// `NotAttempted` — no mutation was attempted and none was possible.
-/// `ProvenNotApplied` stays reserved for the checked-and-absent case
-/// (`known_not_applied`). A dedicated `NOT_APPLICABLE` arm awaits the same
-/// consumer-migration follow-up as `Denied`.
+/// `NotApplicable` covers outcomes where no mutation could ever apply
+/// (read-path and validation refusals) — no mutation was attempted and none
+/// was possible. `NotAttempted` covers outcomes where no mutation was
+/// attempted but one could have applied. `ProvenNotApplied` stays reserved
+/// for the checked-and-absent case (`known_not_applied`).
 #[derive(Clone, Copy, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
 pub enum StoreMutationDisposition {
     NotAttempted,
+    NotApplicable,
     ProvenNotApplied,
     Committed,
     Partial,
@@ -171,11 +169,9 @@ pub enum StoreRecoveryAction {
 /// within the set, and the set holds at most
 /// [`MAX_STORE_FAILURE_EVIDENCE_HANDLES`] entries.
 ///
-/// Attachment to the [`StoreFailure`] wire payload awaits the
-/// bridge/Kernel consumer migration (the frozen v2 field set keeps
-/// unmigrated struct-literal constructors compiling); until then the legacy
-/// singular `evidence_ref` remains the only wire-carried handle and this
-/// type is the validated set the migration unit attaches.
+/// Attachment to the [`StoreFailure`] wire payload is live: the set travels
+/// as `evidence_handles` alongside the legacy singular `evidence_ref`,
+/// which is kept for wire compatibility during migration.
 #[derive(Clone, Debug, Default, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
 #[serde(try_from = "Vec<String>", into = "Vec<String>")]
 pub struct StoreEvidenceHandles(Vec<String>);
@@ -333,15 +329,23 @@ pub struct StoreFailure {
     pub conflict: Option<StoreConflictObservation>,
     /// Non-zero future delay before the same identity may be retried. A set
     /// delay requires a retryable disposition with
-    /// `RetrySameIdentityAfterBackoff` plus exact request/idempotency
-    /// evidence. Gating the delay on a named dependency revision is deferred:
-    /// the frozen v2 field set has no revision slot, so the revision half of
-    /// the retry-after invariant rides the bridge/Kernel migration follow-up.
+    /// `RetrySameIdentityAfterBackoff`, exact request/idempotency evidence,
+    /// and the named dependency revision in
+    /// `retry_after_dependency_revision` (non-zero, within
+    /// [`MAX_STORE_FAILURE_RETRY_AFTER_MS`]).
     pub retry_after_ms: Option<u64>,
-    /// Legacy singular evidence handle. Kept for wire compatibility; the
-    /// bounded unique set contract is [`StoreEvidenceHandles`], which the
-    /// migration follow-up attaches to this payload.
+    /// Named dependency revision gating `retry_after_ms` (issue #205).
+    /// Required whenever `retry_after_ms` is set; bounded, non-empty and
+    /// free of control characters.
+    #[serde(default)]
+    pub retry_after_dependency_revision: Option<String>,
+    /// Legacy singular evidence handle, kept for wire compatibility.
     pub evidence_ref: Option<String>,
+    /// Bounded unique recovery/evidence handles. Additive under v2 with a
+    /// default empty set so older frames still decode; machine-semantic and
+    /// bound into [`StoreFailure::semantic_digest`].
+    #[serde(default)]
+    pub evidence_handles: StoreEvidenceHandles,
     /// Diagnostic prose only; it is excluded from equality and control semantics.
     pub human_detail: Option<String>,
 }
@@ -361,7 +365,9 @@ impl PartialEq for StoreFailure {
             && self.recovery_action == other.recovery_action
             && self.conflict == other.conflict
             && self.retry_after_ms == other.retry_after_ms
+            && self.retry_after_dependency_revision == other.retry_after_dependency_revision
             && self.evidence_ref == other.evidence_ref
+            && self.evidence_handles == other.evidence_handles
     }
 }
 
@@ -384,7 +390,9 @@ struct StoreFailureSemanticView<'a> {
     recovery_action: StoreRecoveryAction,
     conflict: Option<&'a StoreConflictObservation>,
     retry_after_ms: Option<u64>,
+    retry_after_dependency_revision: Option<&'a str>,
     evidence_ref: Option<&'a str>,
+    evidence_handles: &'a StoreEvidenceHandles,
 }
 
 impl StoreFailure {
@@ -393,10 +401,12 @@ impl StoreFailure {
     /// The digest binds every machine-semantic field
     /// (`contract_revision`, disposition, reason code, request/operation
     /// identities, mutation/retry/recovery control, conflict observations,
-    /// retry delay, and evidence reference) through deterministic canonical
-    /// JSON. `human_detail` is diagnostic prose only and is excluded, so
-    /// rewording provider text never changes the digest while any machine
-    /// tampering does. Two failures that compare equal always share a digest.
+    /// retry delay plus its named dependency revision, evidence reference,
+    /// and the bounded unique evidence-handle set) through deterministic
+    /// canonical JSON. `human_detail` is diagnostic prose only and is
+    /// excluded, so rewording provider text never changes the digest while
+    /// any machine tampering does. Two failures that compare equal always
+    /// share a digest.
     pub fn semantic_digest(&self) -> Result<String, StoreFailureContractError> {
         let view = StoreFailureSemanticView {
             contract_revision: &self.contract_revision,
@@ -413,7 +423,9 @@ impl StoreFailure {
             recovery_action: self.recovery_action,
             conflict: self.conflict.as_ref(),
             retry_after_ms: self.retry_after_ms,
+            retry_after_dependency_revision: self.retry_after_dependency_revision.as_deref(),
             evidence_ref: self.evidence_ref.as_deref(),
+            evidence_handles: &self.evidence_handles,
         };
         let bytes = canonical_json_bytes(&view)
             .map_err(|_| invalid("semantic_digest", "canonical semantic encoding failed"))?;
@@ -435,6 +447,11 @@ impl StoreFailure {
             "idempotency_key_ref_or_digest",
         )?;
         validate_optional_reference(self.evidence_ref.as_deref(), "evidence_ref")?;
+        validate_optional_reference(
+            self.retry_after_dependency_revision.as_deref(),
+            "retry_after_dependency_revision",
+        )?;
+        self.evidence_handles.validate()?;
         if let Some(fence) = &self.state_fence_ref_or_exact_safe_projection {
             fence.validate().map_err(|_| {
                 invalid(
@@ -471,6 +488,7 @@ impl StoreFailure {
         if let Some(delay) = self.retry_after_ms
             && (delay == 0
                 || delay > MAX_STORE_FAILURE_RETRY_AFTER_MS
+                || self.retry_after_dependency_revision.is_none()
                 || !matches!(
                     self.disposition,
                     StoreFailureDisposition::Unavailable
@@ -481,7 +499,7 @@ impl StoreFailure {
         {
             return Err(invalid(
                 "retry_after_ms",
-                "retry delay requires a non-zero future delay with a retryable disposition and retry directive",
+                "retry delay requires a non-zero future delay with a retryable disposition, retry directive and named dependency revision",
             ));
         }
 
@@ -492,7 +510,10 @@ impl StoreFailure {
             ));
         }
         if self.disposition == StoreFailureDisposition::DeterministicRejection
-            && self.mutation_disposition != StoreMutationDisposition::NotAttempted
+            && !matches!(
+                self.mutation_disposition,
+                StoreMutationDisposition::NotAttempted | StoreMutationDisposition::NotApplicable
+            )
         {
             return Err(invalid(
                 "mutation_disposition",
@@ -725,7 +746,9 @@ impl StoreFailure {
             recovery_action: StoreRecoveryAction::None,
             conflict: None,
             retry_after_ms: None,
+            retry_after_dependency_revision: None,
             evidence_ref: context.evidence_ref.clone(),
+            evidence_handles: StoreEvidenceHandles::default(),
             human_detail: None,
         }
     }
