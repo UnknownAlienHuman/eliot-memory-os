@@ -43,9 +43,9 @@ use eliot_protocol::dreamer_job::{
 };
 use eliot_store_api::{
     DreamerJobLedgerEvent, DreamerJobLedgerRecord, DreamerJobMutationIdentity,
-    MAX_DREAMER_JOB_HISTORY, OperationId, RecoveryRecord, RecoveryRecordKey,
-    RequestMeta, StateFence, StoreError, canonical_json_bytes, dreamer_job_queue_key,
-    map_durable_error, sha256_hex, validate_ledger_bundle,
+    MAX_DREAMER_JOB_HISTORY, OperationId, RecoveryRecord, RecoveryRecordKey, RequestMeta,
+    StateFence, StoreError, canonical_json_bytes, dreamer_job_queue_key, map_durable_error,
+    sha256_hex, validate_ledger_bundle,
 };
 
 /// Outer CAS generation for the first Dreamer mutation of a job.
@@ -968,19 +968,11 @@ async fn commit_ledger_mutation(
     response: DurableJobResponse,
 ) -> Result<DurableJobResponse, AdapterError> {
     validate_ledger_bundle(request, &response, ledger, event).map_err(AdapterError::Store)?;
-    let operation_id = request
-        .request_identity
-        .operation
-        .operation_id
-        .to_string();
+    let operation_id = request.request_identity.operation.operation_id.to_string();
     let op_key = dreamer_operation_row_key(&operation_id);
     let stored = StoredMutation {
         operation_id: operation_id.clone(),
-        idempotency_key: request
-            .request_identity
-            .operation
-            .idempotency_key
-            .clone(),
+        idempotency_key: request.request_identity.operation.idempotency_key.clone(),
         canonical_request_hash: request.request_identity.canonical_request_hash.clone(),
         operation_kind: request.operation.kind().as_str().to_owned(),
         response: response.clone(),
@@ -996,12 +988,7 @@ async fn commit_ledger_mutation(
         attempt_id: ledger.record.submission.attempt_id.to_string(),
         revision: response.revision,
     };
-    let fence = ledger
-        .record
-        .submission
-        .work_scope
-        .state_fence
-        .clone();
+    let fence = ledger.record.submission.work_scope.state_fence.clone();
     let new_outer = expected_outer.saturating_add(1);
     let cursor = ledger.event_cursor;
     let (job_payload, _) = encode_canonical(ledger)?;
@@ -1053,12 +1040,12 @@ async fn commit_ledger_mutation(
     .await
     {
         Ok(()) => Ok(response),
-        Err(AdapterError::ProviderConflict) => match replay_or_conflict(db, config, &op_key, request)
-            .await?
-        {
-            Some(replayed) => Ok(replayed),
-            None => Err(AdapterError::Store(StoreError::RevisionConflict)),
-        },
+        Err(AdapterError::ProviderConflict) => {
+            match replay_or_conflict(db, config, &op_key, request).await? {
+                Some(replayed) => Ok(replayed),
+                None => Err(AdapterError::Store(StoreError::RevisionConflict)),
+            }
+        }
         Err(error) => Err(error),
     }
 }
@@ -1085,11 +1072,7 @@ async fn op_lease_next(
     if usize::try_from(selector.max_candidates).unwrap_or(usize::MAX) > MAX_LEASE_CANDIDATES {
         return Err(AdapterError::Store(StoreError::PayloadTooLarge));
     }
-    let operation_id = request
-        .request_identity
-        .operation
-        .operation_id
-        .to_string();
+    let operation_id = request.request_identity.operation.operation_id.to_string();
     let op_key = dreamer_operation_row_key(&operation_id);
     if let Some(replayed) = replay_or_conflict(db, &adapter.config, &op_key, &request).await? {
         return Ok(replayed);
@@ -1112,9 +1095,7 @@ async fn op_lease_next(
     }
     let coverage: Vec<String> = scoped
         .iter()
-        .take(
-            usize::try_from(selector.max_candidates).unwrap_or(usize::MAX),
-        )
+        .take(usize::try_from(selector.max_candidates).unwrap_or(usize::MAX))
         .map(|(_, _, ledger)| ledger.record.submission.job_id.to_string())
         .collect();
     let Some((row_key, job_row, mut ledger)) = scoped
@@ -1213,11 +1194,7 @@ async fn op_renew(
     if request.role != JobRole::Worker {
         return Err(AdapterError::Store(StoreError::UnknownOperation));
     }
-    let operation_id = request
-        .request_identity
-        .operation
-        .operation_id
-        .to_string();
+    let operation_id = request.request_identity.operation.operation_id.to_string();
     let op_key = dreamer_operation_row_key(&operation_id);
     if let Some(replayed) = replay_or_conflict(db, &adapter.config, &op_key, &request).await? {
         return Ok(replayed);
@@ -1326,11 +1303,7 @@ async fn op_start(
     if request.role != JobRole::Worker {
         return Err(AdapterError::Store(StoreError::UnknownOperation));
     }
-    let operation_id = request
-        .request_identity
-        .operation
-        .operation_id
-        .to_string();
+    let operation_id = request.request_identity.operation.operation_id.to_string();
     let op_key = dreamer_operation_row_key(&operation_id);
     if let Some(replayed) = replay_or_conflict(db, &adapter.config, &op_key, &request).await? {
         return Ok(replayed);
@@ -1488,11 +1461,7 @@ async fn op_checkpoint(
     if request.role != JobRole::Worker {
         return Err(AdapterError::Store(StoreError::UnknownOperation));
     }
-    let operation_id = request
-        .request_identity
-        .operation
-        .operation_id
-        .to_string();
+    let operation_id = request.request_identity.operation.operation_id.to_string();
     let op_key = dreamer_operation_row_key(&operation_id);
     if let Some(replayed) = replay_or_conflict(db, &adapter.config, &op_key, &request).await? {
         return Ok(replayed);
@@ -1600,11 +1569,7 @@ async fn op_resume(
     if request.role != JobRole::Worker {
         return Err(AdapterError::Store(StoreError::UnknownOperation));
     }
-    let operation_id = request
-        .request_identity
-        .operation
-        .operation_id
-        .to_string();
+    let operation_id = request.request_identity.operation.operation_id.to_string();
     let op_key = dreamer_operation_row_key(&operation_id);
     if let Some(replayed) = replay_or_conflict(db, &adapter.config, &op_key, &request).await? {
         return Ok(replayed);
@@ -1713,11 +1678,7 @@ async fn op_begin_verification(
     if request.role != JobRole::Worker {
         return Err(AdapterError::Store(StoreError::UnknownOperation));
     }
-    let operation_id = request
-        .request_identity
-        .operation
-        .operation_id
-        .to_string();
+    let operation_id = request.request_identity.operation.operation_id.to_string();
     let op_key = dreamer_operation_row_key(&operation_id);
     if let Some(replayed) = replay_or_conflict(db, &adapter.config, &op_key, &request).await? {
         return Ok(replayed);
@@ -1825,11 +1786,7 @@ async fn op_publish(
     if request.role != JobRole::Worker {
         return Err(AdapterError::Store(StoreError::UnknownOperation));
     }
-    let operation_id = request
-        .request_identity
-        .operation
-        .operation_id
-        .to_string();
+    let operation_id = request.request_identity.operation.operation_id.to_string();
     let op_key = dreamer_operation_row_key(&operation_id);
     if let Some(replayed) = replay_or_conflict(db, &adapter.config, &op_key, &request).await? {
         return Ok(replayed);
@@ -1958,17 +1915,18 @@ async fn op_request_cancel(
         JobRole::Controller => "controller",
         JobRole::Worker => return Err(AdapterError::Store(StoreError::UnknownOperation)),
     };
-    let operation_id = request
-        .request_identity
-        .operation
-        .operation_id
-        .to_string();
+    let operation_id = request.request_identity.operation.operation_id.to_string();
     let op_key = dreamer_operation_row_key(&operation_id);
     if let Some(replayed) = replay_or_conflict(db, &adapter.config, &op_key, &request).await? {
         return Ok(replayed);
     }
-    let Some((row_key, job_row, mut ledger)) =
-        load_ledger(db, &adapter.config, &job_id.to_string(), &attempt_id.to_string()).await?
+    let Some((row_key, job_row, mut ledger)) = load_ledger(
+        db,
+        &adapter.config,
+        &job_id.to_string(),
+        &attempt_id.to_string(),
+    )
+    .await?
     else {
         return Err(AdapterError::Store(StoreError::RevisionConflict));
     };
@@ -2075,101 +2033,101 @@ async fn op_reconcile(
     let op_key = dreamer_operation_row_key(&operation_id);
     let existing = read_dreamer_row(db, &adapter.config, &op_key).await?;
     if let Some(op_row) = existing {
-            let stored = decode_stored_mutation(&op_row)?;
-            if stored.canonical_request_hash != mutation.canonical_request_hash
-                || stored.operation_kind != mutation.operation.operation_kind
-            {
-                return Err(AdapterError::Store(StoreError::IdentityConflict));
-            }
-            if mutation.disposition != MutationDisposition::Committed {
-                // The operation provably committed; a contrary claim conflicts
-                // instead of rewriting history.
-                return Err(AdapterError::Store(StoreError::IdentityConflict));
-            }
-            let Some((_, _, ledger)) = load_ledger(
-                db,
-                &adapter.config,
-                &mutation.job_id.to_string(),
-                &mutation.attempt_id.to_string(),
-            )
-            .await?
-            else {
-                return Err(AdapterError::Store(StoreError::InvalidReceipt));
-            };
-            if mutation.operation.state_fence != ledger.record.submission.work_scope.state_fence {
-                return Err(AdapterError::Store(StoreError::FenceMismatch));
-            }
-            if mutation.committed_state != Some(ledger.record.state)
-                || mutation.receipt_id != ledger.last_receipt_id
-            {
-                return Err(AdapterError::Store(StoreError::InvalidReceipt));
-            }
-            let response = DurableJobResponse {
-                request_identity: request.request_identity.clone(),
-                job_id: ledger.record.submission.job_id.clone(),
-                attempt_id: ledger.record.submission.attempt_id.clone(),
-                scope: ledger.record.submission.work_scope.clone(),
-                revision: ledger.record.revision,
-                state: ledger.record.state,
-                disposition: Some(MutationDisposition::Committed),
-                receipt_id: ledger.last_receipt_id.clone(),
-                lease: ledger.active_lease.clone(),
-                checkpoint: ledger.record.checkpoint.clone(),
-                result_under_verification: ledger.result_under_verification.clone(),
-                outcome: ledger.record.outcome.clone(),
-                selection_coverage: Vec::new(),
-                selection_frontier: None,
-            };
-            response
-                .validate_for(&request)
-                .map_err(map_durable_error)
-                .map_err(AdapterError::Store)?;
-            Ok(response)
-    } else {
-            if mutation.disposition == MutationDisposition::Committed {
-                // No operation row, no receipt: not committed success.
-                return Err(AdapterError::Store(StoreError::InvalidReceipt));
-            }
-            let Some((_, _, ledger)) = load_ledger(
-                db,
-                &adapter.config,
-                &mutation.job_id.to_string(),
-                &mutation.attempt_id.to_string(),
-            )
-            .await?
-            else {
-                // Nothing to bind scope or revision to: honestly still-unknown
-                // rather than a fabricated not-applied answer.
-                return Err(AdapterError::Store(StoreError::MissingReceiptEnvelope));
-            };
-            if mutation.operation.state_fence != ledger.record.submission.work_scope.state_fence {
-                return Err(AdapterError::Store(StoreError::FenceMismatch));
-            }
-            // Proven absence: the atomic commit always writes the operation
-            // row, so its absence proves this mutation never applied. The
-            // current record binds scope and revision without changing it.
-            let response = DurableJobResponse {
-                request_identity: request.request_identity.clone(),
-                job_id: ledger.record.submission.job_id.clone(),
-                attempt_id: ledger.record.submission.attempt_id.clone(),
-                scope: ledger.record.submission.work_scope.clone(),
-                revision: ledger.record.revision,
-                state: ledger.record.state,
-                disposition: Some(mutation.disposition),
-                receipt_id: None,
-                lease: ledger.active_lease.clone(),
-                checkpoint: ledger.record.checkpoint.clone(),
-                result_under_verification: ledger.result_under_verification.clone(),
-                outcome: ledger.record.outcome.clone(),
-                selection_coverage: Vec::new(),
-                selection_frontier: None,
-            };
-            response
-                .validate_for(&request)
-                .map_err(map_durable_error)
-                .map_err(AdapterError::Store)?;
-            Ok(response)
+        let stored = decode_stored_mutation(&op_row)?;
+        if stored.canonical_request_hash != mutation.canonical_request_hash
+            || stored.operation_kind != mutation.operation.operation_kind
+        {
+            return Err(AdapterError::Store(StoreError::IdentityConflict));
         }
+        if mutation.disposition != MutationDisposition::Committed {
+            // The operation provably committed; a contrary claim conflicts
+            // instead of rewriting history.
+            return Err(AdapterError::Store(StoreError::IdentityConflict));
+        }
+        let Some((_, _, ledger)) = load_ledger(
+            db,
+            &adapter.config,
+            &mutation.job_id.to_string(),
+            &mutation.attempt_id.to_string(),
+        )
+        .await?
+        else {
+            return Err(AdapterError::Store(StoreError::InvalidReceipt));
+        };
+        if mutation.operation.state_fence != ledger.record.submission.work_scope.state_fence {
+            return Err(AdapterError::Store(StoreError::FenceMismatch));
+        }
+        if mutation.committed_state != Some(ledger.record.state)
+            || mutation.receipt_id != ledger.last_receipt_id
+        {
+            return Err(AdapterError::Store(StoreError::InvalidReceipt));
+        }
+        let response = DurableJobResponse {
+            request_identity: request.request_identity.clone(),
+            job_id: ledger.record.submission.job_id.clone(),
+            attempt_id: ledger.record.submission.attempt_id.clone(),
+            scope: ledger.record.submission.work_scope.clone(),
+            revision: ledger.record.revision,
+            state: ledger.record.state,
+            disposition: Some(MutationDisposition::Committed),
+            receipt_id: ledger.last_receipt_id.clone(),
+            lease: ledger.active_lease.clone(),
+            checkpoint: ledger.record.checkpoint.clone(),
+            result_under_verification: ledger.result_under_verification.clone(),
+            outcome: ledger.record.outcome.clone(),
+            selection_coverage: Vec::new(),
+            selection_frontier: None,
+        };
+        response
+            .validate_for(&request)
+            .map_err(map_durable_error)
+            .map_err(AdapterError::Store)?;
+        Ok(response)
+    } else {
+        if mutation.disposition == MutationDisposition::Committed {
+            // No operation row, no receipt: not committed success.
+            return Err(AdapterError::Store(StoreError::InvalidReceipt));
+        }
+        let Some((_, _, ledger)) = load_ledger(
+            db,
+            &adapter.config,
+            &mutation.job_id.to_string(),
+            &mutation.attempt_id.to_string(),
+        )
+        .await?
+        else {
+            // Nothing to bind scope or revision to: honestly still-unknown
+            // rather than a fabricated not-applied answer.
+            return Err(AdapterError::Store(StoreError::MissingReceiptEnvelope));
+        };
+        if mutation.operation.state_fence != ledger.record.submission.work_scope.state_fence {
+            return Err(AdapterError::Store(StoreError::FenceMismatch));
+        }
+        // Proven absence: the atomic commit always writes the operation
+        // row, so its absence proves this mutation never applied. The
+        // current record binds scope and revision without changing it.
+        let response = DurableJobResponse {
+            request_identity: request.request_identity.clone(),
+            job_id: ledger.record.submission.job_id.clone(),
+            attempt_id: ledger.record.submission.attempt_id.clone(),
+            scope: ledger.record.submission.work_scope.clone(),
+            revision: ledger.record.revision,
+            state: ledger.record.state,
+            disposition: Some(mutation.disposition),
+            receipt_id: None,
+            lease: ledger.active_lease.clone(),
+            checkpoint: ledger.record.checkpoint.clone(),
+            result_under_verification: ledger.result_under_verification.clone(),
+            outcome: ledger.record.outcome.clone(),
+            selection_coverage: Vec::new(),
+            selection_frontier: None,
+        };
+        response
+            .validate_for(&request)
+            .map_err(map_durable_error)
+            .map_err(AdapterError::Store)?;
+        Ok(response)
+    }
 }
 
 /// Commits four Dreamer rows (job, event, operation, receipt) in one provider
