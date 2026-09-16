@@ -240,6 +240,11 @@ pub(super) fn run() -> Result<(), String> {
     // the model wiring before readiness is reported; no thread, no transport, no
     // provider credentials, no start() contour or run-loop change.
     attach_dreamer_model(&composition)?;
+    // #872: gated agent-fabric registration at the same attach site. The
+    // readiness-gated descriptor proves the admitted ingress reaches the
+    // durable swarm-control composition before readiness is reported; no
+    // thread, no transport, no start() contour or run-loop change.
+    attach_agent_fabric(&composition)?;
     kernel.report_ready().map_err(|error| error.to_string())?;
     let status = composition.status();
     write_json(&ready_message(&status))?;
@@ -322,6 +327,27 @@ fn attach_dreamer_model(composition: &DaemonComposition) -> Result<(), String> {
     let _context = adapter
         .model_route_context()
         .map_err(|error| error.to_string())?;
+    Ok(())
+}
+
+/// Attaches the #872 durable agent-fabric registration (gated, no lifecycle change).
+///
+/// Post-`start` attach-style check at the single site holding the composition:
+/// builds the [`AgentFabricDescriptor`](eliotd::AgentFabricDescriptor) through
+/// the readiness-gated `DaemonComposition::agent_fabric_descriptor` accessor.
+/// Fails closed before `report_ready` when the Governor is not ready or the
+/// admitted fence cannot bind the descriptor. No coordinator is constructed
+/// here, no thread, no transport, no provider execution or credentials, no
+/// `start()` contour or run-loop change: the single `AgentCoordinator` is
+/// constructed per admitted operation through the fabric composition, and the
+/// run loop dispatches only post-activation provider-neutral intents.
+fn attach_agent_fabric(composition: &DaemonComposition) -> Result<(), String> {
+    let descriptor = composition
+        .agent_fabric_descriptor()
+        .map_err(|error| error.to_string())?;
+    if descriptor.service != SERVICE_NAME {
+        return Err("agent fabric descriptor service mismatch".to_owned());
+    }
     Ok(())
 }
 

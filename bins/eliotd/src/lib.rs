@@ -34,6 +34,7 @@ use eliot_protocol::{ProtocolVersion, ServerHello};
 use std::sync::atomic::Ordering;
 
 mod activation_projection;
+mod agent_fabric;
 mod controlboard_adapters;
 mod daemon_config;
 mod daemon_kernel_client;
@@ -53,6 +54,14 @@ mod store_failure_projection;
 mod task_lifecycle_adapters;
 
 pub use activation_projection::AgentActivationResolver;
+pub use agent_fabric::{
+    ActivationEvidence, AdmissionAuthorityPort, ActivationAuthorityPort, AgentFabric,
+    AgentFabricDescriptor, AttemptLifecycle, CancellationLifecycle, COORDINATOR_CRATE, DAEMON_CRATE,
+    DispatchAck, DispatchEgressPort, DispatchIntent, FabricAdmission, FabricError, FabricPorts,
+    FabricSnapshot, LedgerEntry, ModelRegistryPort, PeerChannelPort, PeerMessage, PeerReceipt,
+    Reservation, RouteRequirements, SwarmDefinition, SwarmEntryReceipt, WorkerAck,
+    AttemptResultRecord, PREREQ_PORTS, daemon_coordinator_config, plan_candidate, prereq_ports,
+};
 
 use controlboard_adapters::SharedOperatorReplay;
 
@@ -736,6 +745,59 @@ impl DaemonComposition {
             return Err(DaemonError::Composition(CompositionError::NotReady));
         }
         Ok(GovernedDreamerModelAdapter::new(self))
+    }
+
+    /// Proves the admitted daemon ingress reaches the durable agent fabric
+    /// (issue #872).
+    ///
+    /// Post-`start` attach-style descriptor, mirroring
+    /// [`Self::dreamer_model`]: readiness is checked first, then the admitted
+    /// fence snapshot binds the descriptor. No coordinator is constructed here
+    /// and no `start()` contour changes; the daemon runtime calls this once
+    /// before reporting readiness so the wiring is exercised on the production
+    /// path.
+    pub fn agent_fabric_descriptor(&self) -> Result<AgentFabricDescriptor, DaemonError> {
+        if self.readiness() != CompositionReadiness::Ready {
+            return Err(DaemonError::Composition(CompositionError::NotReady));
+        }
+        let fence = self.governor.kernel_snapshot().state_fence().clone();
+        fence
+            .validate()
+            .map_err(|error| DaemonError::Lifecycle(format!("agent fabric admitted fence: {error}")))?;
+        let config = daemon_coordinator_config()
+            .map_err(|error| DaemonError::Lifecycle(error.to_string()))?;
+        Ok(AgentFabricDescriptor {
+            service: SERVICE_NAME.to_owned(),
+            generation: fence.resource_generation.value(),
+            authority_epoch: fence.authority_epoch.sequence.get(),
+            capacity_identity: config.capacity_identity,
+        })
+    }
+
+    /// Plans one Task-Controller staffing request through the real coordinator
+    /// owner on the admitted daemon path (issue #872).
+    ///
+    /// Readiness plus exact-fence agreement gate the call; candidate planning
+    /// delegates to [`plan_candidate`], so the production caller and the wired
+    /// tests share one implementation. No admission, reservation, attempt, or
+    /// dispatch occurs here.
+    pub fn agent_fabric_plan(
+        &self,
+        request: eliot_agent_coordinator::StaffingPlanRequest,
+    ) -> Result<eliot_agent_coordinator::StaffingPlanCandidate, DaemonError> {
+        if self.readiness() != CompositionReadiness::Ready {
+            return Err(DaemonError::Composition(CompositionError::NotReady));
+        }
+        let admitted = self.governor.kernel_snapshot().state_fence().clone();
+        if request.state_fence != admitted {
+            return Err(DaemonError::Lifecycle(
+                "agent fabric request fence is stale".to_owned(),
+            ));
+        }
+        let config = daemon_coordinator_config()
+            .map_err(|error| DaemonError::Lifecycle(error.to_string()))?;
+        plan_candidate(&config, request)
+            .map_err(|error| DaemonError::Lifecycle(error.to_string()))
     }
 
     /// Borrows the Governor reconstruction read composition over the retained
