@@ -18,15 +18,24 @@ use eliot_process::{
     ProcessExecutor, ProcessHealth, ProcessHealthStatus, ProcessId, ProcessLaunchAdmission,
     ProcessLifecycle, ProcessRequest, ProcessStartReceipt, ProcessState, ProcessStreamEvidence,
     ProcessStreamKind, ProcessStreamPolicyBinding, ProcessStreamPrefixPreview,
-    ProcessStreamSinkLimits, ProcessTreeId, SessionId, StreamEvidenceGap, StreamPersistenceStatus,
-    StreamTransportStatus, SuspendedLaunchEvidence, SuspendedProcessIdentity, ValidatedDispatch,
+    ProcessStreamSinkAbortReason, ProcessStreamSinkAbortRequest, ProcessStreamSinkAppend,
+    ProcessStreamSinkAppendDisposition, ProcessStreamSinkClient, ProcessStreamSinkError,
+    ProcessStreamSinkFinalizeRequest, ProcessStreamSinkLimits, ProcessStreamSinkOpenRequest,
+    ProcessStreamSinkReadback, ProcessStreamSinkSession, ProcessStreamSinkSessionId,
+    ProcessStreamSinkSourceId, ProcessStreamSinkState, ProcessStreamSinkTerminal,
+    ProcessStreamSinkTerminalId, ProcessStreamDigestAlgorithm,
+    ProcessTreeId, SessionId, StreamEvidenceGap,
+    StreamPersistenceStatus, StreamTransportStatus, SuspendedLaunchEvidence,
+    SuspendedProcessIdentity, ValidatedDispatch,
 };
 use sha2::{Digest as _, Sha256};
 use std::collections::BTreeMap;
+use std::future::Future;
 use std::io::Read as _;
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
+use std::task::{Context, Poll, Waker};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -51,14 +60,18 @@ const STREAM_JOIN_POLL: Duration = Duration::from_millis(5);
 const SINK_BACKPRESSURE_IN_FLIGHT_BYTES: u64 = 64 * 1024;
 static JOB_SEQUENCE: AtomicU64 = AtomicU64::new(1);
 
-/// Builds the #267 sink-port limits P-04 consumes ONLY as a bound.
+/// Builds the #267 sink-port limits P-04 consumes as a bound and as the
+/// [`StreamSinkPump`] session contract.
 ///
-/// The port itself is never called here: no sink session is opened, appended,
-/// finalized, or read back on the drain path, so pipe draining can never block
-/// on persistence I/O. The validated `max_in_flight_bytes` ceiling alone
-/// parameterizes [`CaptureSession`]'s overflow latch, and persistence stays
-/// `SourceUnavailable` (no durable provider is wired in P-04) with no source
-/// locator, so no `raw:*` handle is ever minted.
+/// When a [`ProcessStreamSinkClient`] is attached, the drain path really calls
+/// the port: one session open before the first admitted byte, one append per
+/// [`STREAM_CHUNK_BYTES`] drain chunk, and exactly one finalize/abort. The
+/// validated `max_in_flight_bytes` ceiling still parameterizes
+/// [`CaptureSession`]'s overflow latch, and pipe draining never waits on
+/// persistence beyond the single bounded provider call per chunk (backpressure
+/// sheds the remainder with an explicit gap instead of blocking). With no sink
+/// attached, persistence stays `SourceUnavailable` with no source locator, so
+/// no `raw:*` handle is ever minted.
 fn sink_backpressure_limits() -> Result<ProcessStreamSinkLimits, ProcessExecutionError> {
     ProcessStreamSinkLimits::new(
         u64::try_from(STREAM_CHUNK_BYTES).map_err(|_| ProcessExecutionError::UnknownOutcome)?,
@@ -73,6 +86,586 @@ fn sink_backpressure_limits() -> Result<ProcessStreamSinkLimits, ProcessExecutio
         2_000,
     )
     .map_err(|_| ProcessExecutionError::UnknownOutcome)
+}
+
+/// Drives one already-resolved future to completion on the calling thread.
+///
+/// The drain/finalize path is synchronous, while the sink port is async; this
+/// spins the future with `yield_now` and performs no sleeping, no retry, and
+/// no I/O of its own. Provider-side time is bounded by the wait budget carried
+/// in each sink request, never by this driver.
+fn block_on_sink<F: Future>(future: F) -> F::Output {
+    let mut future = std::pin::pin!(future);
+    let waker = Waker::noop();
+    let mut context = Context::from_waker(waker);
+    loop {
+        match future.as_mut().poll(&mut context) {
+            Poll::Ready(output) => return output,
+            Poll::Pending => std::thread::yield_now(),
+        }
+    }
+}
+
+/// Exact stream label bound into sink session identities.
+fn sink_stream_label(kind: ProcessStreamKind) -> &'static str {
+    match kind {
+        ProcessStreamKind::Stdout => "stdout",
+        ProcessStreamKind::Stderr => "stderr",
+    }
+}
+
+/// Mints one deterministic sink identity for a bound stream.
+///
+/// The identity derives from the execution binding's operation id plus the
+/// stream label, so cleanup/reopen re-issues the identical value and
+/// reconciles the same session instead of minting a second receipt. When the
+/// composed value would exceed the port's reference ceiling, the operation
+/// fragment falls back to its SHA-256 (still deterministic, still unique).
+fn sink_identity(
+    binding: &ProcessExecutionBinding,
+    kind: ProcessStreamKind,
+    role: &str,
+) -> Result<String, ProcessExecutionError> {
+    let operation = binding.operation_id().as_str();
+    let stream = sink_stream_label(kind);
+    let full = format!("p04-sink:{operation}:{stream}:{role}");
+    if full.len() <= 256 {
+        return Ok(full);
+    }
+    Ok(format!(
+        "p04-sink:{}:{stream}:{role}",
+        short_digest(operation.as_bytes())
+    ))
+}
+
+/// Typed outcome of offering one drain chunk to the sink.
+///
+/// Every shed variant keeps the pipe draining: the chunk (and, once shedding
+/// latches, every later chunk) is not admitted, the shed fact latches on the
+/// pump, and the drain thread moves on with no retry loop and no sleep.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum SinkAppendOutcome {
+    /// The provider admitted every byte offered.
+    Admitted,
+    /// The provider reported backpressure; the remainder sheds with an
+    /// explicit persistence gap.
+    ShedBackpressure,
+    /// The provider exceeded the typed wait budget; the remainder sheds.
+    ShedTimeout,
+    /// The provider reported cancellation; the remainder sheds.
+    ShedCancelled,
+    /// The provider already terminalized; the remainder sheds.
+    ShedTerminal(ProcessStreamSinkState),
+    /// The pump already sheds (or holds its terminal): the chunk was not
+    /// offered and no provider I/O happened.
+    ShedClosed,
+}
+
+/// Policy-bound streaming pump from the pipe drain into immutable evidence.
+///
+/// One pump owns exactly one stream of one operation. It opens its sink
+/// session before the first admitted byte (binding, kind, policy, limits, and
+/// deterministic identity), appends per drain chunk with the bounded wait
+/// budget from the session limits, and settles exactly one
+/// [`ProcessStreamSinkTerminal`] through finalize/abort (with a single
+/// readback reconcile when the provider and the pump disagree about who
+/// terminalized first). The terminal's evidence is the only durable record:
+/// its source is `Some` exactly on complete/partial terminals and `None` with
+/// an exact gap otherwise, and a policy-prohibited stream carries a withheld
+/// preview so raw pre-policy bytes never enter the durable record.
+///
+/// Shedding is one-way: the first backpressure, timeout, cancellation,
+/// terminal disposition, or provider error latches, and every later chunk is
+/// shed locally without provider I/O. The admitted stream therefore stays a
+/// contiguous prefix, and the drain thread never blocks on persistence.
+#[allow(
+    clippy::struct_excessive_bools,
+    reason = "shedding, backpressure, provider failure, cancellation, and prohibition are independent latch observations"
+)]
+pub struct StreamSinkPump {
+    client: Arc<dyn ProcessStreamSinkClient>,
+    binding: ProcessExecutionBinding,
+    kind: ProcessStreamKind,
+    policy: ProcessStreamPolicyBinding,
+    limits: ProcessStreamSinkLimits,
+    session: Option<ProcessStreamSinkSession>,
+    next_sequence: u64,
+    next_offset: u64,
+    admitted_digest: Sha256,
+    offered_bytes: u64,
+    preview_prefix: Vec<u8>,
+    preview_ceiling: usize,
+    shedding: bool,
+    backpressured: bool,
+    provider_failed: bool,
+    cancelled: bool,
+    policy_prohibited: bool,
+    terminal: Option<ProcessStreamSinkTerminal>,
+}
+
+impl StreamSinkPump {
+    /// Binds one pump to its client and contract; no I/O happens here.
+    ///
+    /// [`Self::open`] must succeed before the first [`Self::append`].
+    #[must_use]
+    pub fn new(
+        client: Arc<dyn ProcessStreamSinkClient>,
+        binding: ProcessExecutionBinding,
+        kind: ProcessStreamKind,
+        policy: ProcessStreamPolicyBinding,
+        limits: ProcessStreamSinkLimits,
+    ) -> Self {
+        let preview_ceiling = usize::try_from(limits.max_preview_bytes())
+            .unwrap_or(usize::MAX)
+            .min(EVIDENCE_PREVIEW_CEILING)
+            .max(1);
+        Self {
+            client,
+            binding,
+            kind,
+            policy,
+            limits,
+            session: None,
+            next_sequence: 0,
+            next_offset: 0,
+            admitted_digest: Sha256::new(),
+            offered_bytes: 0,
+            preview_prefix: Vec::new(),
+            preview_ceiling,
+            shedding: false,
+            backpressured: false,
+            provider_failed: false,
+            cancelled: false,
+            policy_prohibited: false,
+            terminal: None,
+        }
+    }
+
+    /// Opens the sink session before the first admitted byte.
+    ///
+    /// Idempotent for the bound contract: reopening re-issues the identical
+    /// request (deterministic identity) and returns the same session instead
+    /// of minting a second one.
+    pub fn open(&mut self) -> Result<(), ProcessExecutionError> {
+        if self.session.is_some() {
+            return Ok(());
+        }
+        let request = ProcessStreamSinkOpenRequest::new(
+            ProcessStreamSinkSessionId::new(sink_identity(&self.binding, self.kind, "session")?)
+                .map_err(|_| ProcessExecutionError::UnknownOutcome)?,
+            ProcessStreamSinkSourceId::new(sink_identity(&self.binding, self.kind, "source")?)
+                .map_err(|_| ProcessExecutionError::UnknownOutcome)?,
+            ProcessStreamSinkTerminalId::new(sink_identity(&self.binding, self.kind, "terminal")?)
+                .map_err(|_| ProcessExecutionError::UnknownOutcome)?,
+            self.binding.clone(),
+            self.kind,
+            self.policy.clone(),
+            self.limits,
+            ProcessStreamDigestAlgorithm::Sha256,
+            ProcessStreamDigestAlgorithm::Sha256,
+        )
+        .map_err(|_| ProcessExecutionError::UnknownOutcome)?;
+        let session = block_on_sink(self.client.open(request)).map_err(|error| {
+            if matches!(error, ProcessStreamSinkError::ProviderUnavailable) {
+                ProcessExecutionError::Unavailable("stream sink open unavailable".to_owned())
+            } else {
+                ProcessExecutionError::UnknownOutcome
+            }
+        })?;
+        self.session = Some(session);
+        Ok(())
+    }
+
+    /// Offers one drain chunk; never blocks the pipe drain.
+    ///
+    /// The chunk is split at the session chunk ceiling and each piece is
+    /// offered exactly once with the session append budget. The first shed
+    /// latches and every later call sheds locally with no provider I/O, so
+    /// this performs no retry loop and no sleep. An append before
+    /// [`Self::open`] fails closed.
+    pub fn append(&mut self, chunk: &[u8]) -> Result<SinkAppendOutcome, ProcessExecutionError> {
+        if chunk.is_empty() {
+            return Ok(SinkAppendOutcome::Admitted);
+        }
+        if let Some(terminal) = &self.terminal {
+            return Ok(SinkAppendOutcome::ShedTerminal(terminal.state()));
+        }
+        if self.shedding {
+            return Ok(SinkAppendOutcome::ShedClosed);
+        }
+        let Some(session) = self.session.clone() else {
+            return Err(ProcessExecutionError::UnknownOutcome);
+        };
+        self.offered_bytes = self.offered_bytes.saturating_add(chunk.len() as u64);
+        let max_chunk = usize::try_from(self.limits.max_chunk_bytes()).unwrap_or(usize::MAX);
+        if max_chunk == 0 {
+            return Err(ProcessExecutionError::UnknownOutcome);
+        }
+        let wait_budget = self.limits.max_append_wait_ms();
+        let mut outcome = SinkAppendOutcome::Admitted;
+        for piece in chunk.chunks(max_chunk) {
+            let piece_outcome = self.append_piece(&session, piece, wait_budget)?;
+            match piece_outcome {
+                SinkAppendOutcome::Admitted => {}
+                shed => {
+                    outcome = shed;
+                    self.shedding = true;
+                    break;
+                }
+            }
+        }
+        Ok(outcome)
+    }
+
+    /// Finalizes an EOF drain to exactly one terminal.
+    ///
+    /// A second call returns the same terminal without provider I/O. When the
+    /// provider disagrees (identity conflict or transient unavailability),
+    /// one readback reconcile adopts the provider's terminal instead of
+    /// minting a second receipt.
+    pub fn finalize_eof(&mut self) -> Result<ProcessStreamSinkTerminal, ProcessExecutionError> {
+        if let Some(terminal) = &self.terminal {
+            return Ok(terminal.clone());
+        }
+        if self.policy_prohibited {
+            return Err(ProcessExecutionError::UnknownOutcome);
+        }
+        let Some(session) = self.session.clone() else {
+            return Err(ProcessExecutionError::UnknownOutcome);
+        };
+        let preview = ProcessStreamPrefixPreview::from_transport_prefix(
+            self.preview_prefix.clone(),
+            self.admitted_bytes(),
+        )
+        .map_err(|_| ProcessExecutionError::UnknownOutcome)?;
+        let request = ProcessStreamSinkFinalizeRequest::new(
+            session.terminal_id().clone(),
+            self.next_sequence,
+            self.next_offset,
+            self.limits.max_finalize_wait_ms(),
+            StreamTransportStatus::Complete,
+            self.admitted_sha256(),
+            self.admitted_bytes(),
+            preview,
+            None,
+            self.finalize_gaps(),
+        )
+        .map_err(|_| ProcessExecutionError::UnknownOutcome)?;
+        match block_on_sink(self.client.finalize(session.clone(), request)) {
+            Ok(terminal) => self.adopt_terminal(terminal),
+            Err(
+                error @ (ProcessStreamSinkError::ProviderUnavailable
+                | ProcessStreamSinkError::TerminalIdentityConflict
+                | ProcessStreamSinkError::Terminal),
+            ) => {
+                let _ = error;
+                self.adopt_readback_terminal(&session)
+            }
+            Err(_) => Err(ProcessExecutionError::UnknownOutcome),
+        }
+    }
+
+    /// Aborts a cancel-before-EOF drain to exactly one terminal.
+    ///
+    /// The admitted prefix stays claimed (digest/count over admitted bytes)
+    /// with the exact cancellation gap; the source stays `None`.
+    pub fn abort_cancelled(&mut self) -> Result<ProcessStreamSinkTerminal, ProcessExecutionError> {
+        self.abort_with(
+            ProcessStreamSinkAbortReason::Cancellation,
+            StreamTransportStatus::CancelledBeforeEof,
+            false,
+        )
+    }
+
+    /// Aborts a policy-prohibited stream to exactly one terminal.
+    ///
+    /// The admitted identity (digest/count) is preserved for custody while the
+    /// preview is withheld, so raw pre-policy bytes never enter the durable
+    /// record; the source stays `None` with the exact prohibition gap.
+    pub fn abort_policy_prohibited(
+        &mut self,
+    ) -> Result<ProcessStreamSinkTerminal, ProcessExecutionError> {
+        self.policy_prohibited = true;
+        self.abort_with(
+            ProcessStreamSinkAbortReason::PolicyProhibition,
+            StreamTransportStatus::Complete,
+            true,
+        )
+    }
+
+    /// Aborts a read-failed drain to exactly one terminal.
+    ///
+    /// The admitted prefix stays claimed with the exact transport-failure
+    /// gap; the source stays `None`.
+    pub fn abort_transport_failure(
+        &mut self,
+    ) -> Result<ProcessStreamSinkTerminal, ProcessExecutionError> {
+        self.abort_with(
+            ProcessStreamSinkAbortReason::TransportFailure,
+            StreamTransportStatus::ReadFailed,
+            false,
+        )
+    }
+
+    /// Reconciles the session identity without minting a receipt.
+    ///
+    /// Re-issues the identical open (deterministic identity, so the provider
+    /// returns the same session) and reads back whatever the provider holds:
+    /// the one terminal when finalization already landed, the open session
+    /// view otherwise. Cleanup and reopen paths use this instead of a second
+    /// finalize/abort.
+    pub fn reopen(&mut self) -> Result<ProcessStreamSinkReadback, ProcessExecutionError> {
+        self.open()?;
+        let Some(session) = self.session.clone() else {
+            return Err(ProcessExecutionError::UnknownOutcome);
+        };
+        block_on_sink(self.client.readback(session))
+            .map_err(|_| ProcessExecutionError::UnknownOutcome)
+    }
+
+    /// Returns the admitted-byte count covered by the terminal (or so far).
+    #[must_use]
+    pub const fn admitted_bytes(&self) -> u64 {
+        self.next_offset
+    }
+
+    /// Returns the incremental SHA-256 over every admitted byte.
+    #[must_use]
+    pub fn admitted_sha256(&self) -> String {
+        format!("{:x}", self.admitted_digest.clone().finalize())
+    }
+
+    /// Returns every byte offered, including bytes shed after pressure.
+    #[must_use]
+    pub const fn offered_bytes(&self) -> u64 {
+        self.offered_bytes
+    }
+
+    /// Returns whether the session is open (before any terminal).
+    #[must_use]
+    pub const fn is_open(&self) -> bool {
+        self.session.is_some()
+    }
+
+    /// Returns whether persistence pressure shed the admitted prefix tail.
+    #[must_use]
+    pub const fn backpressure_observed(&self) -> bool {
+        self.backpressured
+    }
+
+    /// Returns whether the provider failed on the streaming path.
+    #[must_use]
+    pub const fn provider_failed(&self) -> bool {
+        self.provider_failed
+    }
+
+    /// Returns the open session, when one exists.
+    #[must_use]
+    pub const fn session(&self) -> Option<&ProcessStreamSinkSession> {
+        self.session.as_ref()
+    }
+
+    /// Returns the one terminal, when finalization already landed.
+    #[must_use]
+    pub const fn terminal(&self) -> Option<&ProcessStreamSinkTerminal> {
+        self.terminal.as_ref()
+    }
+
+    /// Returns the terminal evidence, when finalization already landed.
+    #[must_use]
+    pub fn evidence(&self) -> Option<ProcessStreamEvidence> {
+        self.terminal.as_ref().map(|terminal| terminal.evidence().clone())
+    }
+
+    fn append_piece(
+        &mut self,
+        session: &ProcessStreamSinkSession,
+        piece: &[u8],
+        wait_budget: u64,
+    ) -> Result<SinkAppendOutcome, ProcessExecutionError> {
+        let next_sequence = self
+            .next_sequence
+            .checked_add(1)
+            .ok_or(ProcessExecutionError::UnknownOutcome)?;
+        let next_offset = self
+            .next_offset
+            .checked_add(piece.len() as u64)
+            .ok_or(ProcessExecutionError::UnknownOutcome)?;
+        let request = ProcessStreamSinkAppend::from_bytes(
+            self.next_sequence,
+            self.next_offset,
+            piece.to_vec(),
+            wait_budget,
+        );
+        match block_on_sink(self.client.append(session.clone(), request)) {
+            Ok(ProcessStreamSinkAppendDisposition::Accepted { .. })
+            | Ok(ProcessStreamSinkAppendDisposition::Replayed { .. }) => {
+                // Replayed is idempotent acknowledgement of an already-known
+                // sequence: counters advance exactly once per piece because a
+                // replayed piece is never re-offered by this pump.
+                self.admitted_digest.update(piece);
+                self.next_sequence = next_sequence;
+                self.next_offset = next_offset;
+                let remaining = self.preview_ceiling.saturating_sub(self.preview_prefix.len());
+                self.preview_prefix
+                    .extend_from_slice(&piece[..piece.len().min(remaining)]);
+                Ok(SinkAppendOutcome::Admitted)
+            }
+            Ok(ProcessStreamSinkAppendDisposition::Backpressured { .. }) => {
+                self.backpressured = true;
+                Ok(SinkAppendOutcome::ShedBackpressure)
+            }
+            Ok(ProcessStreamSinkAppendDisposition::DeadlineExceeded) => {
+                self.backpressured = true;
+                Ok(SinkAppendOutcome::ShedTimeout)
+            }
+            Ok(ProcessStreamSinkAppendDisposition::Cancelled) => {
+                self.cancelled = true;
+                Ok(SinkAppendOutcome::ShedCancelled)
+            }
+            Ok(ProcessStreamSinkAppendDisposition::Terminal { state, .. }) => {
+                Ok(SinkAppendOutcome::ShedTerminal(state))
+            }
+            Err(ProcessStreamSinkError::ProviderUnavailable) => {
+                self.provider_failed = true;
+                Err(ProcessExecutionError::UnknownOutcome)
+            }
+            Err(_) => {
+                self.provider_failed = true;
+                Err(ProcessExecutionError::UnknownOutcome)
+            }
+        }
+    }
+
+    fn finalize_gaps(&self) -> Vec<StreamEvidenceGap> {
+        if self.backpressured {
+            vec![
+                StreamEvidenceGap::PersistenceUnavailable,
+                StreamEvidenceGap::PersistenceBackpressure,
+            ]
+        } else if self.provider_failed {
+            vec![StreamEvidenceGap::PersistenceUnavailable]
+        } else {
+            Vec::new()
+        }
+    }
+
+    fn abort_with(
+        &mut self,
+        reason: ProcessStreamSinkAbortReason,
+        transport: StreamTransportStatus,
+        withheld: bool,
+    ) -> Result<ProcessStreamSinkTerminal, ProcessExecutionError> {
+        if let Some(terminal) = &self.terminal {
+            return Ok(terminal.clone());
+        }
+        let Some(session) = self.session.clone() else {
+            return Err(ProcessExecutionError::UnknownOutcome);
+        };
+        let preview = if withheld {
+            ProcessStreamPrefixPreview::withheld_by_policy()
+        } else {
+            ProcessStreamPrefixPreview::from_transport_prefix(
+                self.preview_prefix.clone(),
+                self.admitted_bytes(),
+            )
+            .map_err(|_| ProcessExecutionError::UnknownOutcome)?
+        };
+        let gaps = match reason {
+            ProcessStreamSinkAbortReason::Cancellation
+            | ProcessStreamSinkAbortReason::CallerShutdown => vec![
+                StreamEvidenceGap::PersistenceUnavailable,
+                StreamEvidenceGap::CancelledBeforeEof,
+            ],
+            ProcessStreamSinkAbortReason::PolicyProhibition
+            | ProcessStreamSinkAbortReason::RedactionFailure => {
+                vec![StreamEvidenceGap::PolicyProhibited]
+            }
+            ProcessStreamSinkAbortReason::TransportFailure => vec![
+                StreamEvidenceGap::PersistenceUnavailable,
+                StreamEvidenceGap::TransportReadFailed,
+            ],
+        };
+        let wait_budget = self.limits.max_abort_wait_ms();
+        let request = ProcessStreamSinkAbortRequest::new(
+            session.terminal_id().clone(),
+            reason,
+            self.next_sequence,
+            self.next_offset,
+            wait_budget,
+            transport,
+            self.admitted_sha256(),
+            self.admitted_bytes(),
+            preview,
+            None,
+            gaps,
+        )
+        .map_err(|_| ProcessExecutionError::UnknownOutcome)?;
+        match block_on_sink(self.client.abort(session.clone(), request)) {
+            Ok(terminal) => self.adopt_terminal(terminal),
+            Err(
+                error @ (ProcessStreamSinkError::ProviderUnavailable
+                | ProcessStreamSinkError::TerminalIdentityConflict
+                | ProcessStreamSinkError::Terminal),
+            ) => {
+                let _ = error;
+                self.adopt_readback_terminal(&session)
+            }
+            Err(_) => Err(ProcessExecutionError::UnknownOutcome),
+        }
+    }
+
+    fn adopt_terminal(
+        &mut self,
+        terminal: ProcessStreamSinkTerminal,
+    ) -> Result<ProcessStreamSinkTerminal, ProcessExecutionError> {
+        enforce_sink_terminal(&self.session, &terminal)?;
+        self.terminal = Some(terminal.clone());
+        Ok(terminal)
+    }
+
+    fn adopt_readback_terminal(
+        &mut self,
+        session: &ProcessStreamSinkSession,
+    ) -> Result<ProcessStreamSinkTerminal, ProcessExecutionError> {
+        match block_on_sink(self.client.readback(session.clone())) {
+            Ok(ProcessStreamSinkReadback::Terminal { terminal }) => self.adopt_terminal(terminal),
+            Ok(_) | Err(_) => Err(ProcessExecutionError::UnknownOutcome),
+        }
+    }
+}
+
+/// Enforces the terminal/evidence contract on one provider result.
+///
+/// The terminal must validate, belong to the open session fence, and carry a
+/// source exactly on complete/partial terminals (`Some`) and never otherwise
+/// (`None` with an exact gap). Anything else fails closed: the provider result
+/// is dropped and no evidence is minted from it.
+fn enforce_sink_terminal(
+    session: &Option<ProcessStreamSinkSession>,
+    terminal: &ProcessStreamSinkTerminal,
+) -> Result<(), ProcessExecutionError> {
+    let Some(session) = session else {
+        return Err(ProcessExecutionError::UnknownOutcome);
+    };
+    terminal
+        .validate()
+        .map_err(|_| ProcessExecutionError::UnknownOutcome)?;
+    if terminal.session_id() != session.session_id()
+        || terminal.source_id() != session.source_id()
+        || terminal.terminal_id() != session.terminal_id()
+        || terminal.open_request_sha256() != session.open_request_sha256()
+    {
+        return Err(ProcessExecutionError::UnknownOutcome);
+    }
+    let durable = matches!(
+        terminal.state(),
+        ProcessStreamSinkState::CompleteSource | ProcessStreamSinkState::PartialSource
+    );
+    if durable != terminal.evidence().source().is_some() {
+        return Err(ProcessExecutionError::UnknownOutcome);
+    }
+    Ok(())
 }
 
 /// P-07's injected process-authority seam.
