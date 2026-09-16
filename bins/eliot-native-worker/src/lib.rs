@@ -306,6 +306,45 @@ impl AdmittedLifecycle for KernelNativeWorkerClient {
     }
 }
 
+/// Requires the presented hello artifact manifest to name the owner-produced
+/// facet manifest bound by the admitted claim join.
+///
+/// Artifact/manifest negative (Implements #22): the handshake artifact
+/// identity (`WorkerHello::artifact_manifest_digest`, I7.3) travels outside
+/// the claim binding digest, so a rewired manifest otherwise drives to
+/// `Ready` on a foreign artifact. The admitted contour binds the presented
+/// manifest to the owner-produced facet identity
+/// (`NativeWorkerExecutableBinding::facet_manifest_ref`) already covered by
+/// the digest: any other manifest — or a v1 claim with no join to prove one
+/// — is a refused presentation (typed exit 78 in the binary, never the
+/// missing-material deferral). Credentials stay broker-bound per #23/User
+/// Broker: this pin compares manifest identities only and carries no
+/// credential material.
+///
+/// # Errors
+///
+/// Returns [`NativeWorkerError::KernelAdmissionRequired`] when the claim
+/// carries no v2 executable join or the presented manifest does not name the
+/// joined facet.
+pub fn require_artifact_manifest_match(
+    claim: &NativeWorkerClaim,
+    hello: &WorkerHello,
+) -> Result<(), NativeWorkerError> {
+    let join = claim.executable_binding.as_ref().ok_or_else(|| {
+        NativeWorkerError::KernelAdmissionRequired(
+            "admitted claim carries no executable join; old wire cannot prove an artifact manifest"
+                .to_owned(),
+        )
+    })?;
+    if hello.artifact_manifest_digest != join.facet_manifest_ref {
+        return Err(NativeWorkerError::KernelAdmissionRequired(
+            "admitted artifact manifest does not match the owner-produced facet manifest"
+                .to_owned(),
+        ));
+    }
+    Ok(())
+}
+
 /// Drives one admitted native-worker generation to `Ready`.
 ///
 /// Sequence: register, claim the exact authenticated unit, reconcile any
@@ -313,8 +352,9 @@ impl AdmittedLifecycle for KernelNativeWorkerClient {
 /// retained record, never a second process), compose-checked
 /// `start_claimed` through the exact `WorkerCore::demand_start_claimed` gate,
 /// then submit readiness. Invalid admission fails before any factory or
-/// process start is invoked: the lifecycle transport refuses first, and the
-/// claimed core gate refuses before P-03 starts anything. No coordinator
+/// process start is invoked: the artifact/manifest pin refuses first, then
+/// the lifecycle transport refuses, and the claimed core gate refuses before
+/// P-03 starts anything. No coordinator
 /// verification is consumed here (T9-05 is not part of this contour); no user
 /// authentication is performed (owner decision #1376); no worker-local replay
 /// journal is created (thin transport over T9-03 only).
@@ -335,6 +375,10 @@ where
     C: DurableCheckpointPort,
     L: AdmittedLifecycle,
 {
+    // Artifact/manifest negative (#22): a worker starting from a
+    // non-matching artifact/manifest identity is refused before any
+    // registration submit, factory effect, or process start.
+    require_artifact_manifest_match(admission.claim(), &hello)?;
     lifecycle.submit_registration(registration)?;
     lifecycle.submit_claim(admission)?;
     lifecycle.submit_reconcile(reconcile)?;

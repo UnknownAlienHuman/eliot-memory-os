@@ -689,7 +689,7 @@ fn hello() -> WorkerHello {
         request_id: "start-claim-1".to_owned(),
         trace_context: BTreeMap::from([("trace_id".to_owned(), "trace-claim-1".to_owned())]),
         deadline_unix_ms: 5_000,
-        artifact_manifest_digest: "manifest-digest-1".to_owned(),
+        artifact_manifest_digest: "facet-manifest-7".to_owned(),
         launch_nonce: "launch-nonce-claim-1".to_owned(),
         worker_generation: 1,
         authority_epoch: epoch(),
@@ -1008,6 +1008,17 @@ fn admitted_drive_reaches_ready_and_serves_bounded_frame() {
     );
 
     remove_bat("drive-ready");
+}
+
+#[test]
+fn artifact_manifest_mismatch_refuses_before_start_without_deferral() {
+    let (mut worker, _, registration, claim_value, hello_value, process, _, _, _) = build_driver("drive-artifact-negative", "operation-artifact-negative-1", "tree-artifact-negative-1", "nonce-artifact-negative-1");
+    let mut mismatched = hello_value; mismatched.artifact_manifest_digest = "rewired-manifest-negative-1".to_owned();
+    let mut lifecycle = FakeLifecycle::new();
+    let Err(error) = block_on(drive_admitted_claimed(&mut lifecycle, &mut worker, &registration, &claim_request(&registration, &claim_value), mismatched, process, &reconcile_for(&claim_value), &readiness_for(&claim_value))) else { panic!("artifact mismatch must refuse") };
+    let detail = error.to_string();
+    assert!(matches!(&error, NativeWorkerError::KernelAdmissionRequired(_)) && detail.starts_with(eliot_native_worker::KERNEL_ADMISSION_REQUIRED) && (match &error { NativeWorkerError::KernelAdmissionRequired(_) => 78, _ => 1 } == 78) && !detail.contains("PROVIDER_RUNTIME_DEFERRED") && worker.lifecycle() != WorkerLifecycle::Ready);
+    remove_bat("drive-artifact-negative");
 }
 
 #[test]
