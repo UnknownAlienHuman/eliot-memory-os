@@ -3091,6 +3091,26 @@ mod tests {
         Ok(())
     }
 
+    #[tokio::test]
+    async fn second_launch_is_rejected_without_starting_another_process() -> TestResult {
+        // Single-take binding: after one admitted launch, no second process
+        // may be started to escape uncertainty; the retry path is the exact
+        // `reconcile_unknown` on the same operation, never a fresh launch.
+        let executor = Arc::new(FakeExecutor {
+            starts: AtomicUsize::new(0),
+        });
+        let adapter = CodexAdapter::new(executor.clone());
+        let mut attached = attached()?;
+        let _first = adapter.launch(&mut attached, Arc::new(Sink)).await?;
+        assert_eq!(executor.starts.load(Ordering::SeqCst), 1);
+        assert!(matches!(
+            adapter.launch(&mut attached, Arc::new(Sink)).await,
+            Err(CodexAdapterError::ProcessAlreadyStarted)
+        ));
+        assert_eq!(executor.starts.load(Ordering::SeqCst), 1);
+        Ok(())
+    }
+
     fn make_gate_and_snapshot(
         now: u64,
         model: &str,
