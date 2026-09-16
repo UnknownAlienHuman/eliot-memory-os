@@ -1446,6 +1446,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "eliot-dreamer-research-synthesis"
+version = "0.1.0"
+
+[[package]]
 name = "eliot-dreamer-rival-model"
 version = "0.1.0"
 dependencies = [

@@ -155,6 +155,7 @@ members = [
   "crates/smart/eliot-dreamer-bundle",  # agent_order 4
   "crates/smart/eliot-dreamer-candidate-validation",  # agent_order 5
   "crates/smart/eliot-dreamer-claim-grounding",  # agent_order 14
+  "crates/smart/eliot-dreamer-research-synthesis",  # agent_order 6
   "crates/smart/eliot-dreamer-rival-model",  # agent_order 16
   "crates/smart/eliot-dreamer-probe-plan",  # agent_order 17
   "crates/smart/eliot-dreamer-orientation",  # agent_order 6

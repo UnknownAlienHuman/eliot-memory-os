@@ -11,9 +11,9 @@ description = "Pure native ResearchPack-to-ResearchBrief synthesis owner for ELI
 path = "src/lib.rs"
 
 [package.metadata.eliot]
-prototype = true
+prototype = false
 source_status = "IMPLEMENTED"
-workspace_admission = "pending_package_proof_and_integration_owner_review"
+workspace_admission = "admitted via #995 (A-RESEARCH-SYNTHESIS) root workspace membership"
 functional_cell = "smart.dreamer.research-synthesis"
 source_layer = "C1"
 runtime_layer = "R6"
@@ -22,22 +22,3 @@ agent_order = 6
 
 [lints]
 workspace = true
-
-[workspace]
-
-[workspace.lints.rust]
-unsafe_code = "forbid"
-missing_docs = "allow"
-
-[workspace.lints.clippy]
-all = { level = "warn", priority = -1 }
-pedantic = { level = "warn", priority = -1 }
-dbg_macro = "warn"
-expect_used = "warn"
-missing_errors_doc = "allow"
-missing_panics_doc = "allow"
-module_name_repetitions = "allow"
-must_use_candidate = "allow"
-print_stderr = "warn"
-print_stdout = "warn"
-unwrap_used = "warn"
