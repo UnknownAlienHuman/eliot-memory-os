@@ -7,7 +7,7 @@ use learning_closure::{
     ClosureAssembly, ClosurePolicy, ClosureStatus, DeltaKind, EconomicsRecord, EvidenceSource,
     HarmRecord, LearningClosureError, LifecycleStage, MODULE_ID, OutcomeHarmAndEconomicsEvidence,
     OutcomeKind, OutcomeRecord, OverlayAndActivationAssessments, OverlayRecord, PRODUCT_PULSE,
-    PriorClosureHistory, RUNTIME_LAYER, SOURCE_LAYER, StageAssessment,
+    PriorClosure, PriorClosureHistory, RUNTIME_LAYER, SOURCE_LAYER, StageAssessment,
 };
 use std::collections::BTreeSet;
 
@@ -1163,5 +1163,259 @@ fn case_30_concurrent_intervention() {
             assert_eq!(candidate.status, ClosureStatus::ClosedTaskLocal);
         }
         other => panic!("linked intervention must close, got {other:?}"),
+    }
+}
+
+// WORK_UNIT_CASE: 819/31
+#[test]
+fn case_31_same_model_generator_evaluator_dependence() {
+    let (c, a, o, mut e, h, p) = complete_inputs();
+    e.outcomes[0].source_id = e.outcomes[0].evaluator_id.clone();
+    match learning_closure::assemble_campaign_learning_closure(c, a, o, e, h, p) {
+        Ok(ClosureAssembly::Disposition(disposition)) => {
+            assert_eq!(disposition.disposition, "inconclusive");
+            assert!(
+                disposition
+                    .missing_evidence
+                    .iter()
+                    .any(|m| m.contains("generator-evaluator-dependence"))
+            );
+        }
+        other => panic!("dependent evaluation must dispose, got {other:?}"),
+    }
+}
+
+// WORK_UNIT_CASE: 819/32
+#[test]
+fn case_32_correlation_before_after_temporal_order_not_causality() {
+    let (c, a, mut o, mut e, h, p) = complete_inputs();
+    o.assessments.push(stage(
+        "attempt-1",
+        "overlay-1",
+        LifecycleStage::Benefit,
+        true,
+        true,
+        false,
+    ));
+    e.outcomes[0].causal = CausalAttribution::None;
+    match learning_closure::assemble_campaign_learning_closure(c, a, o, e, h, p) {
+        Ok(ClosureAssembly::Disposition(disposition)) => {
+            assert_eq!(disposition.disposition, "inconclusive");
+            assert!(
+                disposition
+                    .missing_evidence
+                    .iter()
+                    .any(|m| m.contains("benefit-without-causal-attribution"))
+            );
+        }
+        other => panic!("uncorrelated benefit must dispose, got {other:?}"),
+    }
+}
+
+// WORK_UNIT_CASE: 819/33
+#[test]
+fn case_33_one_positive_attempt_not_broad_transfer() {
+    use OutcomeKind::{Negative, Positive};
+    let (c, a, o, e, h, p) = multi_inputs(&[Positive, Negative]);
+    match learning_closure::assemble_campaign_learning_closure(c, a, o, e, h, p) {
+        Ok(ClosureAssembly::Candidate(candidate)) => {
+            assert_eq!(candidate.status, ClosureStatus::ClosedTaskLocal);
+            assert_eq!(candidate.handoff.requested_class, "task-local-retention");
+            assert_eq!(candidate.proof_ceiling, "module-proof-only");
+            assert!(candidate.handoff.active_permit.is_none());
+            assert!(candidate.handoff.promotion_receipt.is_none());
+        }
+        other => panic!("mixed campaign must stay task-local, got {other:?}"),
+    }
+}
+
+// WORK_UNIT_CASE: 819/34
+#[test]
+fn case_34_valid_bounded_economics_evidence() {
+    let (c, a, o, e, h, p) = complete_inputs();
+    for record in &e.economics {
+        assert!(record.cost_known);
+        assert_eq!(record.currency, "USD");
+        assert_eq!(record.unit, "attempt");
+    }
+    match learning_closure::assemble_campaign_learning_closure(c, a, o, e, h, p) {
+        Ok(ClosureAssembly::Candidate(candidate)) => {
+            assert_eq!(candidate.denominators.economics_count, 2);
+            assert_eq!(candidate.denominators.outcome_count, 2);
+        }
+        other => panic!("bounded economics must close, got {other:?}"),
+    }
+}
+
+// WORK_UNIT_CASE: 819/35
+#[test]
+fn case_35_unknown_cost_not_zero() {
+    // A mutant that prices unknown cost at zero and closes must fail here.
+    let (c, a, o, mut e, h, p) = complete_inputs();
+    e.economics[0].cost_known = false;
+    e.economics[0].cost = 0.0;
+    match learning_closure::assemble_campaign_learning_closure(c, a, o, e, h, p) {
+        Ok(ClosureAssembly::Disposition(disposition)) => {
+            assert_eq!(disposition.disposition, "continue-collect");
+            assert!(
+                disposition
+                    .missing_evidence
+                    .iter()
+                    .any(|m| m.contains("unknown cost is not zero"))
+            );
+            assert!(!disposition.open_debt.is_empty());
+        }
+        other => panic!("unknown cost must dispose, got {other:?}"),
+    }
+}
+
+// WORK_UNIT_CASE: 819/36
+#[test]
+fn case_36_currency_unit_mismatch() {
+    let (c, a, o, mut e, h, p) = complete_inputs();
+    e.economics[1].currency = "EUR".to_string();
+    e.economics[1].unit = "run".to_string();
+    match learning_closure::assemble_campaign_learning_closure(c, a, o, e, h, p) {
+        Ok(ClosureAssembly::Disposition(disposition)) => {
+            assert_eq!(disposition.disposition, "inconclusive");
+            assert!(
+                disposition
+                    .missing_evidence
+                    .iter()
+                    .any(|m| m.contains("currency-unit-mismatch"))
+            );
+        }
+        other => panic!("currency/unit mismatch must dispose, got {other:?}"),
+    }
+}
+
+// WORK_UNIT_CASE: 819/37
+#[test]
+fn case_37_low_cost_cannot_compensate_harm() {
+    let (c, a, o, mut e, h, p) = complete_inputs();
+    e.outcomes[0].kind = OutcomeKind::Harmful;
+    e.outcomes[0].harm = HarmRecord {
+        harm_observed: true,
+        harm_ref: Some("harm-819-cheap".to_string()),
+    };
+    e.economics[0].cost = 0.01;
+    match learning_closure::assemble_campaign_learning_closure(c, a, o, e, h, p) {
+        Ok(ClosureAssembly::Disposition(disposition)) => {
+            assert_eq!(disposition.disposition, "retire-review");
+            assert!(
+                disposition
+                    .open_debt
+                    .iter()
+                    .any(|m| m.contains("attempt-1"))
+            );
+        }
+        other => panic!("cheap harm must still retire, got {other:?}"),
+    }
+}
+
+// WORK_UNIT_CASE: 819/38
+#[test]
+fn case_38_retained_rejected_superseded_conflicted_expired_updates() {
+    // History (superseded + active, same + other campaigns) binds the digest.
+    let (c, a, o, e, _, p) = complete_inputs();
+    let plain = match learning_closure::assemble_campaign_learning_closure(
+        c.clone(),
+        a.clone(),
+        o.clone(),
+        e.clone(),
+        history(),
+        p.clone(),
+    ) {
+        Ok(ClosureAssembly::Candidate(candidate)) => candidate,
+        other => panic!("plain campaign must close, got {other:?}"),
+    };
+    let with_history = PriorClosureHistory {
+        prior: vec![
+            PriorClosure {
+                closure_id: "closure-819-old".to_string(),
+                campaign_id: "campaign-819-a".to_string(),
+                digest: "old-digest-819".to_string(),
+                superseded: true,
+            },
+            PriorClosure {
+                closure_id: "closure-819-live".to_string(),
+                campaign_id: "campaign-819-a".to_string(),
+                digest: "live-digest-819".to_string(),
+                superseded: false,
+            },
+            PriorClosure {
+                closure_id: "closure-819-other".to_string(),
+                campaign_id: "campaign-819-other".to_string(),
+                digest: "other-digest-819".to_string(),
+                superseded: false,
+            },
+        ],
+    };
+    match learning_closure::assemble_campaign_learning_closure(c, a, o, e, with_history, p) {
+        Ok(ClosureAssembly::Candidate(candidate)) => {
+            assert_eq!(candidate.denominators.supplied_attempts, 2);
+            assert_ne!(candidate.digest, plain.digest);
+        }
+        other => panic!("historic updates must stay bound, got {other:?}"),
+    }
+    // A conflicted update is retained with debt, never silently dropped.
+    let (c2, a2, mut o2, e2, h2, p2) = complete_inputs();
+    o2.overlays[0].admission = AdmissionState::Conflicted;
+    match learning_closure::assemble_campaign_learning_closure(c2, a2, o2, e2, h2, p2) {
+        Ok(ClosureAssembly::Disposition(disposition)) => {
+            assert_eq!(disposition.disposition, "task-local-retain");
+            assert!(
+                disposition
+                    .open_debt
+                    .iter()
+                    .any(|m| m.contains("overlay-1"))
+            );
+        }
+        other => panic!("conflicted update must retain, got {other:?}"),
+    }
+}
+
+// WORK_UNIT_CASE: 819/39
+#[test]
+fn case_39_hidden_harmful_rejected_update_invalidates_complete() {
+    // A mutant that ignores harm flags and closes must fail here.
+    let (c, a, o, mut e, h, p) = complete_inputs();
+    e.outcomes[0].harm = HarmRecord {
+        harm_observed: true,
+        harm_ref: Some("hidden-harm-819".to_string()),
+    };
+    match learning_closure::assemble_campaign_learning_closure(c, a, o, e, h, p) {
+        Ok(ClosureAssembly::Disposition(disposition)) => {
+            assert_eq!(disposition.disposition, "retire-review");
+            assert!(
+                disposition
+                    .missing_evidence
+                    .iter()
+                    .any(|m| m.contains("attempt-1"))
+            );
+            assert!(!disposition.open_debt.is_empty());
+        }
+        other => panic!("hidden harm must invalidate closure, got {other:?}"),
+    }
+}
+
+// WORK_UNIT_CASE: 819/40
+#[test]
+fn case_40_no_winner_by_latest_confidence_source_count() {
+    let (c, a, o, mut e, h, p) = complete_inputs();
+    let mut rival = outcome("attempt-1", true);
+    rival.kind = OutcomeKind::Negative;
+    e.outcomes.push(rival);
+    match learning_closure::assemble_campaign_learning_closure(c, a, o, e, h, p) {
+        Ok(ClosureAssembly::Disposition(disposition)) => {
+            assert_eq!(disposition.disposition, "inconclusive");
+            assert!(
+                disposition
+                    .missing_evidence
+                    .iter()
+                    .any(|m| m.contains("conflicting-outcomes-no-winner"))
+            );
+        }
+        other => panic!("contradictory outcomes must dispose, got {other:?}"),
     }
 }
