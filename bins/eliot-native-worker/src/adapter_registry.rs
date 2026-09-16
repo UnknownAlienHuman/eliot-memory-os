@@ -26,8 +26,7 @@
 //!   `compile_opencode_model_catalogue` with compile-time signature
 //!   assertions. Client construction with a provider-resolved `BasicAuth`
 //!   stays a Writer-B drive step behind the credential boundary.
-//! - codex constructs the real `CodexAdapter::<E>::new` over the forwarded
-//!   P-03 executor and pins `attach` with compile-time signature assertions.
+//! - codex has no invoke entry in this contour: `CodexAdapter::<E>::new`,
 //!   `attach`/`begin_attempt` with live Q-01/A-01 records belong to the
 //!   agent-plane caller that owns those records, not to this contour.
 //! - acp constructs the real `AcpWire::new` over the caller-owned transport
@@ -83,8 +82,7 @@
 //!
 //! Resolve once with [`AdapterRegistry::resolve_claim`], validate once with
 //! [`validate_admitted_dispatch`], then call exactly one of
-//! [`invoke_opencode_factory`], [`invoke_codex_factory`],
-//! [`invoke_acp_factory`], or [`invoke_claude_factory`] with the validated
+//! [`invoke_opencode_factory`], [`invoke_acp_factory`], or [`invoke_claude_factory`] with the validated
 //! token and a [`FactoryLedger`]. Retained replay reconciles through the
 //! ledger via [`FactoryLedger::contains_operation`]; it never recalls a
 //! constructor.
@@ -95,9 +93,7 @@ use std::sync::Arc;
 
 use eliot_agent_acp::{AcpAdmission, AcpAdmissionError, AcpProcessBinding, AcpWire};
 use eliot_agent_claude::{ClaudeSidecarError, ClaudeSidecarRequest};
-use eliot_agent_codex::{
-    CODEX_ADAPTER_ID, CodexAdapter, CodexAdapterError, CodexAttachInput, CodexAttachReceipt,
-};
+use eliot_agent_codex::CODEX_ADAPTER_ID;
 use eliot_agent_opencode::{
     BasicAuth, HealthResponse, LoopbackEndpoint, LoopbackEndpointError, OPENCODE_ADAPTER_ID,
     OpenCodeCatalogueContext, OpenCodeClient, OpenCodeRunError, OpenCodeRunPolicy, ProviderCatalog,
@@ -961,52 +957,6 @@ fn assert_opencode_entries() {
             eliot_agent_opencode::OpenCodeCatalogueCollection,
             eliot_agent_opencode::OpenCodeCatalogueError,
         >;
-}
-
-/// Controlled codex seams: the forwarded P-03 executor behind `Arc`.
-#[derive(Clone, Debug)]
-pub struct CodexFactorySeams<E> {
-    /// Forwarded process executor; construction stores it without starting.
-    pub executor: Arc<E>,
-}
-
-/// Invokes exactly the named codex factory.
-///
-/// Constructs the real `CodexAdapter::<E>::new` over the forwarded executor
-/// (pure: stores the handle, starts nothing) and pins `attach` by
-/// compile-time signature assertion. `attach`/`begin_attempt` with live
-/// Q-01/A-01 records belong to the agent-plane caller that owns those
-/// records; the drive step performs the single P-03 start.
-///
-/// # Errors
-///
-/// Returns ledger, resolution, substitution, and input failures without any
-/// factory effect on any failure path.
-pub fn invoke_codex_factory<E>(
-    registry: &AdapterRegistry,
-    validated: &ValidatedDispatch,
-    seams: &CodexFactorySeams<E>,
-    ledger: &mut FactoryLedger,
-) -> Result<FactoryAttempt, RegistryError>
-where
-    E: ProcessExecutor,
-{
-    let _entry = begin_invoke(registry, validated, AdapterIdentity::Codex, ledger)?;
-    assert_codex_entries::<E>();
-    let _adapter = CodexAdapter::new(Arc::clone(&seams.executor));
-    commit_invoke(ledger, AdapterIdentity::Codex, validated)
-}
-
-/// Pins the codex entries reachable from this contour at build time.
-fn assert_codex_entries<E>()
-where
-    E: ProcessExecutor,
-{
-    let _ = CodexAdapter::<E>::new as fn(Arc<E>) -> CodexAdapter<E>;
-    let _ = CodexAdapter::<E>::attach
-        as fn(CodexAttachInput) -> Result<CodexAttachReceipt, CodexAdapterError>;
-    let _ = eliot_agent_codex::attach
-        as fn(CodexAttachInput) -> Result<CodexAttachReceipt, CodexAdapterError>;
 }
 
 /// Controlled ACP seams: the forwarded executor and the caller-owned
