@@ -1,11 +1,14 @@
 //! Provider-neutral, recovery-safe failures for the store wire.
 
+use std::collections::BTreeSet;
 use std::fmt;
 
 use eliot_contracts::{OperationId, RequestId, StateFence};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
+
+use crate::{canonical_json_bytes, sha256_hex};
 
 /// Independent revision for the typed store failure payload.
 pub const STORE_FAILURE_CONTRACT_REVISION: &str = "eliot.store.failure.v2";
@@ -17,8 +20,22 @@ pub const MAX_STORE_FAILURE_DETAIL_LEN: usize = 1024;
 pub const MAX_STORE_FAILURE_REFERENCE_LEN: usize = 512;
 /// Maximum retry delay represented on the wire.
 pub const MAX_STORE_FAILURE_RETRY_AFTER_MS: u64 = 3_600_000;
+/// Maximum number of recovery/evidence handles in one validated handle set.
+pub const MAX_STORE_FAILURE_EVIDENCE_HANDLES: usize = 8;
 
 /// Small stable control axis for a store failure.
+///
+/// This closed contour is frozen at v2: unmigrated consumers construct
+/// [`StoreFailure`] with struct literals and match this enum exhaustively, so
+/// this contract-only unit grows neither the variants nor the payload fields.
+///
+/// Reject-mapping for authorization/policy denial (issue #205): denial has no
+/// arm here. No `StoreError` producer maps to it, and reusing
+/// `DeterministicRejection` or `Unsupported` for a denial is rejected — those
+/// arms assert validation-shape semantics, never an authorization decision. A
+/// payload carrying an unrepresentable `DENIED` disposition fails closed at
+/// decode. Landing a `Denied` arm requires the follow-up bridge mapping,
+/// Kernel consumer, and runtime-status projection units to migrate first.
 #[derive(
     Clone, Copy, Debug, Eq, JsonSchema, Ord, PartialEq, PartialOrd, Serialize, Deserialize,
 )]
@@ -95,6 +112,17 @@ impl From<StoreReasonCode> for String {
 }
 
 /// What is known about the mutation when the failure was reported.
+///
+/// This closed contour is frozen at v2 for the same reason as
+/// [`StoreFailureDisposition`]: exhaustive downstream matches keep compiling
+/// only while no variant is added.
+///
+/// Reject-mapping for `not_applicable` (issue #205): outcomes where no
+/// mutation could ever apply (read-path and validation refusals) map to
+/// `NotAttempted` — no mutation was attempted and none was possible.
+/// `ProvenNotApplied` stays reserved for the checked-and-absent case
+/// (`known_not_applied`). A dedicated `NOT_APPLICABLE` arm awaits the same
+/// consumer-migration follow-up as `Denied`.
 #[derive(Clone, Copy, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
 pub enum StoreMutationDisposition {
@@ -135,6 +163,85 @@ pub enum StoreRecoveryAction {
     EnterManualRecovery,
 }
 
+/// Bounded, unique recovery/evidence handles (issue #205).
+///
+/// This is the validated contract piece for the evidence-handle invariant:
+/// every handle is non-empty, bounded by
+/// [`MAX_STORE_FAILURE_REFERENCE_LEN`], free of control characters, unique
+/// within the set, and the set holds at most
+/// [`MAX_STORE_FAILURE_EVIDENCE_HANDLES`] entries.
+///
+/// Attachment to the [`StoreFailure`] wire payload awaits the
+/// bridge/Kernel consumer migration (the frozen v2 field set keeps
+/// unmigrated struct-literal constructors compiling); until then the legacy
+/// singular `evidence_ref` remains the only wire-carried handle and this
+/// type is the validated set the migration unit attaches.
+#[derive(Clone, Debug, Default, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
+#[serde(try_from = "Vec<String>", into = "Vec<String>")]
+pub struct StoreEvidenceHandles(Vec<String>);
+
+impl StoreEvidenceHandles {
+    /// Constructs a validated handle set.
+    pub fn new(handles: Vec<String>) -> Result<Self, StoreFailureContractError> {
+        let value = Self(handles);
+        value.validate()?;
+        Ok(value)
+    }
+
+    /// Validates boundedness, per-handle shape, and uniqueness.
+    pub fn validate(&self) -> Result<(), StoreFailureContractError> {
+        if self.0.len() > MAX_STORE_FAILURE_EVIDENCE_HANDLES {
+            return Err(invalid(
+                "evidence_handles",
+                "evidence handle set exceeds the bound",
+            ));
+        }
+        let mut seen = BTreeSet::new();
+        for handle in &self.0 {
+            validate_optional_reference(Some(handle), "evidence_handles")?;
+            if !seen.insert(handle) {
+                return Err(invalid(
+                    "evidence_handles",
+                    "evidence handles must be unique",
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    /// Returns the validated handles in stable order.
+    #[must_use]
+    pub fn as_slice(&self) -> &[String] {
+        &self.0
+    }
+
+    /// Returns the number of handles in the set.
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.0.len()
+    }
+
+    /// Returns whether the set carries no handles.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+}
+
+impl TryFrom<Vec<String>> for StoreEvidenceHandles {
+    type Error = StoreFailureContractError;
+
+    fn try_from(value: Vec<String>) -> Result<Self, Self::Error> {
+        Self::new(value)
+    }
+}
+
+impl From<StoreEvidenceHandles> for Vec<String> {
+    fn from(value: StoreEvidenceHandles) -> Self {
+        value.0
+    }
+}
+
 /// Safe provider-neutral observations for a conflict.
 #[derive(Clone, Debug, Default, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -167,7 +274,29 @@ impl StoreConflictObservation {
         validate_optional_reference(
             self.manifest_or_contract_expected_observed_refs.as_deref(),
             "manifest_or_contract_expected_observed_refs",
-        )
+        )?;
+        if self.expected_state_fence_ref.is_none()
+            && self.observed_state_fence_ref.is_none()
+            && self.revision_key_and_expected_observed_values.is_none()
+            && self.ordering_scope_and_expected_observed_values.is_none()
+            && self.manifest_or_contract_expected_observed_refs.is_none()
+        {
+            return Err(invalid(
+                "conflict",
+                "conflict disposition requires at least one typed observation",
+            ));
+        }
+        if let (Some(expected), Some(observed)) = (
+            self.expected_state_fence_ref.as_deref(),
+            self.observed_state_fence_ref.as_deref(),
+        ) && expected == observed
+        {
+            return Err(invalid(
+                "expected_state_fence_ref",
+                "fence conflict requires distinct expected and observed fences",
+            ));
+        }
+        Ok(())
     }
 }
 
@@ -202,7 +331,16 @@ pub struct StoreFailure {
     pub retry_directive: StoreRetryDirective,
     pub recovery_action: StoreRecoveryAction,
     pub conflict: Option<StoreConflictObservation>,
+    /// Non-zero future delay before the same identity may be retried. A set
+    /// delay requires a retryable disposition with
+    /// `RetrySameIdentityAfterBackoff` plus exact request/idempotency
+    /// evidence. Gating the delay on a named dependency revision is deferred:
+    /// the frozen v2 field set has no revision slot, so the revision half of
+    /// the retry-after invariant rides the bridge/Kernel migration follow-up.
     pub retry_after_ms: Option<u64>,
+    /// Legacy singular evidence handle. Kept for wire compatibility; the
+    /// bounded unique set contract is [`StoreEvidenceHandles`], which the
+    /// migration follow-up attaches to this payload.
     pub evidence_ref: Option<String>,
     /// Diagnostic prose only; it is excluded from equality and control semantics.
     pub human_detail: Option<String>,
@@ -229,7 +367,59 @@ impl PartialEq for StoreFailure {
 
 impl Eq for StoreFailure {}
 
+/// Canonical machine-semantic projection of [`StoreFailure`] feeding
+/// [`StoreFailure::semantic_digest`]. `human_detail` is deliberately absent:
+/// diagnostic prose must never steer machine recovery.
+#[derive(Serialize)]
+struct StoreFailureSemanticView<'a> {
+    contract_revision: &'a str,
+    disposition: StoreFailureDisposition,
+    reason_code: &'a str,
+    request_id: Option<&'a RequestId>,
+    operation_id: Option<&'a OperationId>,
+    idempotency_key_ref_or_digest: Option<&'a str>,
+    state_fence_ref_or_exact_safe_projection: Option<&'a StateFence>,
+    mutation_disposition: StoreMutationDisposition,
+    retry_directive: StoreRetryDirective,
+    recovery_action: StoreRecoveryAction,
+    conflict: Option<&'a StoreConflictObservation>,
+    retry_after_ms: Option<u64>,
+    evidence_ref: Option<&'a str>,
+}
+
 impl StoreFailure {
+    /// Computes the canonical machine-semantics digest (issue #205).
+    ///
+    /// The digest binds every machine-semantic field
+    /// (`contract_revision`, disposition, reason code, request/operation
+    /// identities, mutation/retry/recovery control, conflict observations,
+    /// retry delay, and evidence reference) through deterministic canonical
+    /// JSON. `human_detail` is diagnostic prose only and is excluded, so
+    /// rewording provider text never changes the digest while any machine
+    /// tampering does. Two failures that compare equal always share a digest.
+    pub fn semantic_digest(&self) -> Result<String, StoreFailureContractError> {
+        let view = StoreFailureSemanticView {
+            contract_revision: &self.contract_revision,
+            disposition: self.disposition,
+            reason_code: self.reason_code.as_str(),
+            request_id: self.request_id.as_ref(),
+            operation_id: self.operation_id.as_ref(),
+            idempotency_key_ref_or_digest: self.idempotency_key_ref_or_digest.as_deref(),
+            state_fence_ref_or_exact_safe_projection: self
+                .state_fence_ref_or_exact_safe_projection
+                .as_ref(),
+            mutation_disposition: self.mutation_disposition,
+            retry_directive: self.retry_directive,
+            recovery_action: self.recovery_action,
+            conflict: self.conflict.as_ref(),
+            retry_after_ms: self.retry_after_ms,
+            evidence_ref: self.evidence_ref.as_deref(),
+        };
+        let bytes = canonical_json_bytes(&view)
+            .map_err(|_| invalid("semantic_digest", "canonical semantic encoding failed"))?;
+        Ok(sha256_hex(&bytes))
+    }
+
     /// Validates wire shape and all cross-field recovery invariants.
     #[allow(clippy::too_many_lines)]
     pub fn validate(&self) -> Result<(), StoreFailureContractError> {
@@ -262,6 +452,12 @@ impl StoreFailure {
                 ));
             }
         }
+        if self.disposition == StoreFailureDisposition::Conflict && self.conflict.is_none() {
+            return Err(invalid(
+                "conflict",
+                "conflict disposition requires typed conflict details",
+            ));
+        }
         if let Some(detail) = &self.human_detail
             && (detail.is_empty()
                 || detail.len() > MAX_STORE_FAILURE_DETAIL_LEN
@@ -273,7 +469,8 @@ impl StoreFailure {
             ));
         }
         if let Some(delay) = self.retry_after_ms
-            && (delay > MAX_STORE_FAILURE_RETRY_AFTER_MS
+            && (delay == 0
+                || delay > MAX_STORE_FAILURE_RETRY_AFTER_MS
                 || !matches!(
                     self.disposition,
                     StoreFailureDisposition::Unavailable
@@ -284,7 +481,7 @@ impl StoreFailure {
         {
             return Err(invalid(
                 "retry_after_ms",
-                "retry delay requires a retryable disposition and retry directive",
+                "retry delay requires a non-zero future delay with a retryable disposition and retry directive",
             ));
         }
 
@@ -353,6 +550,15 @@ impl StoreFailure {
                 "same-identity retry requires a retryable disposition",
             ));
         }
+        if self.retry_directive == StoreRetryDirective::RetrySameIdentityAfterBackoff
+            && self.request_id.is_none()
+            && self.idempotency_key_ref_or_digest.is_none()
+        {
+            return Err(invalid(
+                "retry_directive",
+                "same-identity retry requires exact request or idempotency evidence",
+            ));
+        }
         if self.disposition == StoreFailureDisposition::UnknownOutcome
             && self.recovery_action != StoreRecoveryAction::ReconcileUnknownOutcome
         {
@@ -383,66 +589,97 @@ impl StoreFailure {
         use crate::StoreError;
 
         let mut failure = Self::base(&context);
-        let (disposition, reason_code, mutation, retry, recovery) = match &error {
-            StoreError::InvalidField { .. } => deterministic("INVALID_FIELD"),
-            StoreError::Empty { .. } => deterministic("EMPTY_FIELD"),
-            StoreError::Duplicate { .. } => deterministic("DUPLICATE_IDENTITY"),
-            StoreError::Foundation(_) => deterministic("FOUNDATION_CONTRACT_REJECTED"),
-            StoreError::Security(_) => deterministic("SECURITY_CONTRACT_REJECTED"),
-            StoreError::Receipt(_) => deterministic("RECEIPT_CONTRACT_REJECTED"),
-            StoreError::UnknownOperation => unsupported("UNKNOWN_NAMED_OPERATION"),
-            StoreError::ManifestMismatch => unsupported("OPERATION_MANIFEST_MISMATCH"),
-            StoreError::TransitionClassExceeded => unsupported("TRANSITION_CLASS_EXCEEDED"),
-            StoreError::EffectCeilingExceeded => unsupported("EFFECT_CEILING_EXCEEDED"),
-            StoreError::FenceMismatch => conflict(
-                "STATE_FENCE_MISMATCH",
-                StoreRecoveryAction::RefreshStateFence,
-            ),
-            StoreError::RevisionConflict => conflict(
-                "REVISION_CONFLICT",
-                StoreRecoveryAction::RefreshRevisionHeads,
-            ),
-            StoreError::OrderingConflict => conflict(
-                "ORDERING_CONFLICT",
-                StoreRecoveryAction::RefreshRevisionHeads,
-            ),
-            StoreError::InvalidProjection => defect("INVALID_PROJECTION"),
-            StoreError::InvalidOutbox => defect("INVALID_OUTBOX"),
-            StoreError::InvalidReceipt => defect("INVALID_RECEIPT"),
-            StoreError::IdentityConflict => (
-                StoreFailureDisposition::Conflict,
-                "IDENTITY_CONFLICT",
-                StoreMutationDisposition::NotAttempted,
-                StoreRetryDirective::NewIdentityAfterCondition,
-                StoreRecoveryAction::None,
-            ),
-            StoreError::TransitionDigestMismatch { .. } => (
-                StoreFailureDisposition::Conflict,
-                "TRANSITION_DIGEST_MISMATCH",
-                StoreMutationDisposition::NotAttempted,
-                StoreRetryDirective::NewIdentityAfterCondition,
-                StoreRecoveryAction::None,
-            ),
-            StoreError::ReceiptNotFound => (
-                StoreFailureDisposition::DeterministicRejection,
-                "RECEIPT_NOT_FOUND",
-                StoreMutationDisposition::NotAttempted,
-                StoreRetryDirective::DoNotRetry,
-                StoreRecoveryAction::ResolveWriteReceipt,
-            ),
-            StoreError::MissingReceiptEnvelope => {
-                return Self::unknown_outcome(&context, "RECEIPT_ENVELOPE_MISSING");
-            }
-            StoreError::PayloadTooLarge => deterministic("PAYLOAD_TOO_LARGE"),
-            StoreError::Unavailable => (
-                StoreFailureDisposition::Unavailable,
-                "STORE_UNAVAILABLE",
-                StoreMutationDisposition::NotAttempted,
-                StoreRetryDirective::RetrySameIdentityAfterBackoff,
-                StoreRecoveryAction::RestoreStoreConnectivity,
-            ),
-            StoreError::Serialization(_) => defect("SERIALIZATION_FAILURE"),
-        };
+        let (disposition, reason_code, mutation, retry, recovery, conflict_observation) =
+            match &error {
+                StoreError::InvalidField { .. } => deterministic("INVALID_FIELD"),
+                StoreError::Empty { .. } => deterministic("EMPTY_FIELD"),
+                StoreError::Duplicate { .. } => deterministic("DUPLICATE_IDENTITY"),
+                StoreError::Foundation(_) => deterministic("FOUNDATION_CONTRACT_REJECTED"),
+                StoreError::Security(_) => deterministic("SECURITY_CONTRACT_REJECTED"),
+                StoreError::Receipt(_) => deterministic("RECEIPT_CONTRACT_REJECTED"),
+                StoreError::UnknownOperation => unsupported("UNKNOWN_NAMED_OPERATION"),
+                StoreError::ManifestMismatch => unsupported("OPERATION_MANIFEST_MISMATCH"),
+                StoreError::TransitionClassExceeded => unsupported("TRANSITION_CLASS_EXCEEDED"),
+                StoreError::EffectCeilingExceeded => unsupported("EFFECT_CEILING_EXCEEDED"),
+                StoreError::FenceMismatch => conflict(
+                    "STATE_FENCE_MISMATCH",
+                    StoreRecoveryAction::RefreshStateFence,
+                    StoreConflictObservation {
+                        observed_state_fence_ref: Some("STATE_FENCE_MISMATCH".to_owned()),
+                        ..Default::default()
+                    },
+                ),
+                StoreError::RevisionConflict => conflict(
+                    "REVISION_CONFLICT",
+                    StoreRecoveryAction::RefreshRevisionHeads,
+                    StoreConflictObservation {
+                        revision_key_and_expected_observed_values: Some(
+                            "REVISION_CONFLICT".to_owned(),
+                        ),
+                        ..Default::default()
+                    },
+                ),
+                StoreError::OrderingConflict => conflict(
+                    "ORDERING_CONFLICT",
+                    StoreRecoveryAction::RefreshRevisionHeads,
+                    StoreConflictObservation {
+                        ordering_scope_and_expected_observed_values: Some(
+                            "ORDERING_CONFLICT".to_owned(),
+                        ),
+                        ..Default::default()
+                    },
+                ),
+                StoreError::InvalidProjection => defect("INVALID_PROJECTION"),
+                StoreError::InvalidOutbox => defect("INVALID_OUTBOX"),
+                StoreError::InvalidReceipt => defect("INVALID_RECEIPT"),
+                StoreError::IdentityConflict => (
+                    StoreFailureDisposition::Conflict,
+                    "IDENTITY_CONFLICT",
+                    StoreMutationDisposition::NotAttempted,
+                    StoreRetryDirective::NewIdentityAfterCondition,
+                    StoreRecoveryAction::None,
+                    Some(StoreConflictObservation {
+                        manifest_or_contract_expected_observed_refs: Some(
+                            "IDENTITY_CONFLICT".to_owned(),
+                        ),
+                        ..Default::default()
+                    }),
+                ),
+                StoreError::TransitionDigestMismatch { expected, observed } => (
+                    StoreFailureDisposition::Conflict,
+                    "TRANSITION_DIGEST_MISMATCH",
+                    StoreMutationDisposition::NotAttempted,
+                    StoreRetryDirective::NewIdentityAfterCondition,
+                    StoreRecoveryAction::None,
+                    Some(StoreConflictObservation {
+                        manifest_or_contract_expected_observed_refs: Some(format!(
+                            "expected:{expected} observed:{observed}"
+                        )),
+                        ..Default::default()
+                    }),
+                ),
+                StoreError::ReceiptNotFound => (
+                    StoreFailureDisposition::DeterministicRejection,
+                    "RECEIPT_NOT_FOUND",
+                    StoreMutationDisposition::NotAttempted,
+                    StoreRetryDirective::DoNotRetry,
+                    StoreRecoveryAction::ResolveWriteReceipt,
+                    None,
+                ),
+                StoreError::MissingReceiptEnvelope => {
+                    return Self::unknown_outcome(&context, "RECEIPT_ENVELOPE_MISSING");
+                }
+                StoreError::PayloadTooLarge => deterministic("PAYLOAD_TOO_LARGE"),
+                StoreError::Unavailable => (
+                    StoreFailureDisposition::Unavailable,
+                    "STORE_UNAVAILABLE",
+                    StoreMutationDisposition::NotAttempted,
+                    StoreRetryDirective::RetrySameIdentityAfterBackoff,
+                    StoreRecoveryAction::RestoreStoreConnectivity,
+                    None,
+                ),
+                StoreError::Serialization(_) => defect("SERIALIZATION_FAILURE"),
+            };
         drop(error);
         drop(context);
         failure.disposition = disposition;
@@ -450,6 +687,7 @@ impl StoreFailure {
         failure.mutation_disposition = mutation;
         failure.retry_directive = retry;
         failure.recovery_action = recovery;
+        failure.conflict = conflict_observation;
         failure.validate()?;
         Ok(failure)
     }
@@ -580,6 +818,18 @@ impl ErasureFailureKind {
         failure.mutation_disposition = mutation;
         failure.retry_directive = retry;
         failure.recovery_action = recovery;
+        // Intent conflicts carry no measured expected/observed values at this
+        // boundary, so the observation holds the axis category marker (same
+        // rationale as `StoreFailure::from_store_error`).
+        failure.conflict = match self {
+            Self::IntentConflict => Some(StoreConflictObservation {
+                manifest_or_contract_expected_observed_refs: Some(
+                    "ERASURE_INTENT_CONFLICT".to_owned(),
+                ),
+                ..Default::default()
+            }),
+            Self::Incomplete | Self::Unknown | Self::UnsupportedIntent => None,
+        };
         failure.validate()?;
         Ok(failure)
     }
@@ -615,6 +865,7 @@ fn deterministic(
     StoreMutationDisposition,
     StoreRetryDirective,
     StoreRecoveryAction,
+    Option<StoreConflictObservation>,
 ) {
     (
         StoreFailureDisposition::DeterministicRejection,
@@ -622,6 +873,7 @@ fn deterministic(
         StoreMutationDisposition::NotAttempted,
         StoreRetryDirective::DoNotRetry,
         StoreRecoveryAction::None,
+        None,
     )
 }
 
@@ -633,6 +885,7 @@ fn unsupported(
     StoreMutationDisposition,
     StoreRetryDirective,
     StoreRecoveryAction,
+    Option<StoreConflictObservation>,
 ) {
     (
         StoreFailureDisposition::Unsupported,
@@ -640,18 +893,28 @@ fn unsupported(
         StoreMutationDisposition::NotAttempted,
         StoreRetryDirective::DoNotRetry,
         StoreRecoveryAction::None,
+        None,
     )
 }
 
+/// Conflict mapping with the axis-correct typed observation.
+///
+/// The attached observation carries a category marker naming the conflict
+/// axis, not measured expected/observed values: `StoreError` variants carry
+/// no such values. Markers keep the `CONFLICT requires typed details`
+/// invariant total over this constructor; the bridge/edge follow-up replaces
+/// markers with exact expected/observed evidence.
 fn conflict(
     reason: &'static str,
     recovery: StoreRecoveryAction,
+    observation: StoreConflictObservation,
 ) -> (
     StoreFailureDisposition,
     &'static str,
     StoreMutationDisposition,
     StoreRetryDirective,
     StoreRecoveryAction,
+    Option<StoreConflictObservation>,
 ) {
     (
         StoreFailureDisposition::Conflict,
@@ -659,6 +922,7 @@ fn conflict(
         StoreMutationDisposition::NotAttempted,
         StoreRetryDirective::NewIdentityAfterCondition,
         recovery,
+        Some(observation),
     )
 }
 
@@ -670,6 +934,7 @@ fn defect(
     StoreMutationDisposition,
     StoreRetryDirective,
     StoreRecoveryAction,
+    Option<StoreConflictObservation>,
 ) {
     (
         StoreFailureDisposition::InternalDefect,
@@ -677,6 +942,7 @@ fn defect(
         StoreMutationDisposition::NotAttempted,
         StoreRetryDirective::ManualRecovery,
         StoreRecoveryAction::EscalateInternalDefect,
+        None,
     )
 }
 
