@@ -26,7 +26,7 @@
 
 use std::num::NonZeroU64;
 
-use eliot_contracts::{EpochId, EpochLineageId, LegacyScalarEpoch};
+use eliot_contracts::{EpochId, EpochLineageId};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
@@ -141,16 +141,16 @@ pub struct DoctorAttemptRecord {
     pub principal_ref: OpaqueLabel,
     /// Opaque echo of the Kernel-supplied state-fence digest.
     pub fence_digest: String,
-    /// Legacy scalar sequence evidence (Implements #64, T6-E4-C).
+    /// Sequence evidence projection of the canonical lineage authority
+    /// (Implements #64, T6-E4-C).
     ///
-    /// Retained only as the `LegacyScalarEpoch::scalar_sequence` projection
-    /// for wire/durable compatibility with the pre-lineage contour; it never
+    /// A durable copy of the `epoch_lineage.current.epoch` sequence for
+    /// wire/durable compatibility with the pre-lineage contour; it never
     /// authorizes on its own. The canonical authority is `epoch_lineage`
     /// below, and [`DoctorAttemptRecord::validate`] requires both halves to
     /// agree as an exact tuple. Callers holding a canonical [`EpochId`] must
-    /// use [`DoctorAttemptRecord::validate_against_epoch`]; legacy numerics
-    /// promote to active authority only via
-    /// `import_legacy_scalar_epoch` with `Bound` evidence, never by coercion.
+    /// use [`DoctorAttemptRecord::validate_against_epoch`]; no scalar-to-authority
+    /// coercion exists.
     pub authority_epoch: u64,
     /// Target resource generation at admission time.
     pub generation: u64,
@@ -237,8 +237,8 @@ impl DoctorAttemptRecord {
     /// Bridges the ORS `EpochLineage` contour (`OpaqueLabel` + `u64`) to the
     /// canonical [`EpochId`] (`EpochLineageId` + `NonZeroU64`) without coercion:
     /// the lineage UUID must parse and the sequence must be non-zero, and the
-    /// lineage `current.epoch` must equal the legacy `authority_epoch`
-    /// projection. `None` lineage (historical echo rows) fails as
+    /// lineage `current.epoch` must equal the `authority_epoch`
+    /// sequence projection. `None` lineage (historical echo rows) fails as
     /// `InvalidEpochLineage`: readable but never reactivatable.
     pub fn canonical_authority_epoch(&self) -> Result<EpochId, OrsError> {
         let lineage = self
@@ -254,28 +254,6 @@ impl DoctorAttemptRecord {
         let sequence =
             NonZeroU64::new(lineage.current.epoch).ok_or(OrsError::InvalidEpochLineage)?;
         EpochId::new(lineage_id, sequence).map_err(|_| OrsError::InvalidEpochLineage)
-    }
-
-    /// Returns the legacy scalar evidence projection for migration bookkeeping.
-    ///
-    /// The returned [`LegacyScalarEpoch`] carries only `scalar_sequence` plus
-    /// caller-supplied provenance; it never authorizes. Active promotion
-    /// requires `import_legacy_scalar_epoch` with `Bound` evidence at the
-    /// migration boundary.
-    pub fn legacy_scalar_epoch(
-        &self,
-        source_record_ref: &str,
-        source_contract_revision: &str,
-    ) -> Result<LegacyScalarEpoch, OrsError> {
-        LegacyScalarEpoch::new(
-            self.authority_epoch,
-            source_record_ref,
-            source_contract_revision,
-        )
-        .map_err(|_| OrsError::InvalidField {
-            field: "doctor_attempt_epoch",
-            reason: "legacy scalar must be non-zero with provenance",
-        })
     }
 
     /// Requires this attempt's canonical authority to be the exact
@@ -301,8 +279,8 @@ impl DoctorAttemptRecord {
     /// Validates identity shape and bound terms without interpreting meaning.
     ///
     /// T6-E4-C lineage cutover: the canonical authority is the exact
-    /// `epoch_lineage` tuple, and the retained `u64` is only its legacy
-    /// scalar evidence. `None` lineage fails closed (`InvalidEpochLineage`)
+    /// `epoch_lineage` tuple, and the retained `u64` is only its sequence
+    /// evidence projection. `None` lineage fails closed (`InvalidEpochLineage`)
     /// so historical echo rows stay deserializable but can never stage anew;
     /// `Some` must satisfy the tightened direct-child [`EpochLineage::validate`]
     /// edge and bind `current.epoch == authority_epoch`, else `EpochMismatch`.
