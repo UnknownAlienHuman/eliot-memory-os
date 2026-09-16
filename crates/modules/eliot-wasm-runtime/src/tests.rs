@@ -1426,7 +1426,20 @@ fn replacement_record(
     artifact_char: char,
     predecessor: Option<u64>,
 ) -> GenerationRecord {
+    replacement_record_with_extra(number, artifact_char, predecessor, None)
+}
+
+fn replacement_record_with_extra(
+    number: u64,
+    artifact_char: char,
+    predecessor: Option<u64>,
+    extra_artifact: Option<Sha256Digest>,
+) -> GenerationRecord {
     let artifact = digest(artifact_char);
+    let mut envelope = replacement_limits(&artifact);
+    if let Some(foreign) = extra_artifact {
+        envelope.artifact_access.allowed_digests.insert(foreign);
+    }
     must(GenerationRecord::new(GenerationParams {
         generation: replacement_generation(number, &artifact),
         predecessor,
@@ -1440,7 +1453,7 @@ fn replacement_record(
         observed_imports: [must(CapabilityId::new("log"))].into_iter().collect(),
         state_migration: StateMigration::Stateless,
         scope: "scope-1".to_owned(),
-        limits: replacement_limits(&artifact),
+        limits: envelope,
     }))
 }
 
@@ -1576,6 +1589,15 @@ fn drain_linearization_blocks_old_and_new_acquisition() {
 fn atomic_switch_moves_admission_target() {
     let facade = admitted_runtime();
     let mut oracle = passing_oracle();
+    let widening = replacement_record_with_extra(2, 'd', Some(1), Some(digest('e')));
+    assert_eq!(
+        facade.prepare_replacement(
+            &replacement_prepare("op-17-wide", 1, widening),
+            &mut oracle,
+        ),
+        Err(ReplacementError::IncompatibleCandidate("limit-widening".to_owned()))
+    );
+    assert_eq!(oracle.calls, 0);
     must(facade.prepare_replacement(
         &replacement_prepare("op-17", 1, replacement_record(2, 'c', Some(1))),
         &mut oracle,

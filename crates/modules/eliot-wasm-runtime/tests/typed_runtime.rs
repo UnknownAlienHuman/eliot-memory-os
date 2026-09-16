@@ -297,7 +297,16 @@ fn barrier_controlled_concurrent_acquisition_and_single_switch() {
     for (index, handle) in handles.into_iter().enumerate() {
         match handle.join() {
             Ok(()) => {}
-            Err(_) => panic!("acquirer {index} failed"),
+            Err(payload) => {
+                let detail = payload
+                    .downcast_ref::<String>()
+                    .cloned()
+                    .or_else(|| {
+                        payload.downcast_ref::<&str>().map(|message| (*message).to_owned())
+                    })
+                    .unwrap_or_else(|| "non-string panic payload".to_owned());
+                panic!("acquirer {index} failed: {detail}");
+            }
         }
     }
     assert_eq!(
