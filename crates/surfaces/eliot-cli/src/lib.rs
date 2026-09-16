@@ -23,10 +23,17 @@ pub const CATALOGUE_REVISION: &str = "a11-plan-v2";
 pub const SCHEMA_VERSION: &str = "eliot-cli-schema-v1";
 /// MCP surface revision consumed by the CLI catalogue edge.
 pub const MCP_SURFACE_CONTRACT_REVISION: &str = eliot_mcp::CONTRACT_REVISION;
-/// Stable A-08 [`eliot_controlboard::PLAN_GAP`] marker bound into this
-/// catalogue edge while its admitted providers remain uninjected by
-/// composition.
-pub const CONTROLBOARD_PLAN_GAP: &str = eliot_controlboard::PLAN_GAP;
+/// Stable A-08 `PLAN_GAP` marker for this catalogue edge while its admitted
+/// providers remain uninjected by composition.
+///
+/// Provenance (#1213 MGR01 half): previously re-exported as
+/// `eliot_controlboard::PLAN_GAP`
+/// (`crates/surfaces/eliot-controlboard/src/lib.rs:40`, value `"PLAN_GAP"`).
+/// The `eliot-controlboard` dependency is severed here; this is now a local
+/// literal pinned by `controlboard_plan_gap_marker_is_pinned`. That crate is a
+/// bounded reference fixture whose remaining production consumer is the
+/// `bins/eliotd` daemon composition; its full delete follows with the eliotd lane.
+pub const CONTROLBOARD_PLAN_GAP: &str = "PLAN_GAP";
 
 /// Canonical command identifiers from the first-line command projection.
 #[derive(
@@ -536,6 +543,13 @@ pub mod kernel_client {
         /// until Kernel advertises the operation and its handshake snapshot
         /// includes the current fence and observed clock needed to construct
         /// the request identity.  No local identity is a valid substitute.
+        ///
+        /// The `"controlboard.read"` capability string is retained because the
+        /// broker contract requires it: `OPERATOR_CAPABILITIES` in
+        /// `crates/surfaces/eliot-user-broker-core/src/lib.rs:29` is exactly
+        /// `["controlboard.read", "operator.command"]` (verified by grep for
+        /// `controlboard.read`; #1213). It is a broker-owned capability name,
+        /// not an `eliot-controlboard` crate binding.
         pub fn ensure_operator_launch(&mut self) -> Result<Value, KernelClientError> {
             let _request = OperatorLaunchRequest {
                 role: "human_operator".to_owned(),
@@ -1990,6 +2004,8 @@ fn schema_command(spec: &CommandSpec) -> SchemaCommand {
             missing_work_id,
             dependency,
         } => SchemaAvailability {
+            // Local `"PLAN_GAP"` literal (#1213 severed edge): wire-stable
+            // unavailable code, not a live `eliot-controlboard` binding.
             code: CONTROLBOARD_PLAN_GAP,
             dependency,
             missing_work_id: Some(missing_work_id),
@@ -2034,6 +2050,8 @@ fn schema_command(spec: &CommandSpec) -> SchemaCommand {
 const fn availability_code(availability: CommandAvailability) -> &'static str {
     match availability {
         CommandAvailability::Admitted => "ADMITTED",
+        // Local `"PLAN_GAP"` literal (#1213 severed edge): help-text code for
+        // unavailable rows, not a live `eliot-controlboard` binding.
         CommandAvailability::PlanGap { .. } => CONTROLBOARD_PLAN_GAP,
         CommandAvailability::Unsupported { .. } => "UNSUPPORTED",
         CommandAvailability::Unimplemented { .. } => "UNIMPLEMENTED",
