@@ -4726,7 +4726,14 @@ impl HostComposition {
         &mut self,
         request: &HostRuntimeControlRequest,
     ) -> HostRuntimeControlResponse {
+        // F-LOG-HOST-1: SCM receipt vs Unknown; control receipt distinct from
+        // completion. Unsupported op stays typed Unknown, never false-success.
+        // One terminal per Unknown outcome; inner `execute` shares correlation
+        // and never emits its own terminal.
+        host_lifecycle_observe_scm("host.kernel-restart requested");
         if request.operation == HostRuntimeControlOperation::ReconcileKernelRestart {
+            // Reconcile is query-only replay, not another restart commit.
+            host_lifecycle_observe_scm("host.kernel-restart reconcile-delegated readback");
             return self.reconcile_kernel_restart_request(request);
         }
         if self
@@ -4735,6 +4742,8 @@ impl HostComposition {
             .live_guard()
             .is_err()
         {
+            host_lifecycle_observe_scm("host.kernel-restart unknown owner-fenced");
+            host_lifecycle_observe_terminal("host-kernel-restart-unknown");
             return HostRuntimeControlResponse::unknown_for(
                 request,
                 runtime_control_unknown_ref("kernel-restart", request),
@@ -4742,11 +4751,20 @@ impl HostComposition {
         }
         let result = self.execute_kernel_restart(request);
         match result {
-            Ok(receipt) => HostRuntimeControlResponse::restarted_for(request, receipt),
-            Err(_error) => HostRuntimeControlResponse::unknown_for(
-                request,
-                runtime_control_unknown_ref("kernel-restart", request),
-            ),
+            Ok(receipt) => {
+                host_lifecycle_observe_scm("host.kernel-restart receipt completion");
+                HostRuntimeControlResponse::restarted_for(request, receipt)
+            }
+            Err(_error) => {
+                // Unsupported op, pending/unknown, or failed restart all stay
+                // typed Unknown preserving identity; never false-success.
+                host_lifecycle_observe_scm("host.kernel-restart unknown");
+                host_lifecycle_observe_terminal("host-kernel-restart-unknown");
+                HostRuntimeControlResponse::unknown_for(
+                    request,
+                    runtime_control_unknown_ref("kernel-restart", request),
+                )
+            }
         }
     }
 
@@ -4756,18 +4774,27 @@ impl HostComposition {
         &mut self,
         request: &HostRuntimeControlRequest,
     ) -> HostRuntimeControlResponse {
+        // F-LOG-HOST-1: reconcile is query-only replay; Unknown never
+        // false-success and never rewrites the durable receipt. Timeout or
+        // possible state change stays Unknown until reconciliation evidence.
+        // One terminal per Unknown outcome; success readback is replay.
+        host_lifecycle_observe_scm("host.kernel-restart-reconcile requested");
         if self
             .owner_lease
             .activation_capability()
             .live_guard()
             .is_err()
         {
+            host_lifecycle_observe_scm("host.kernel-restart-reconcile unknown owner-fenced");
+            host_lifecycle_observe_terminal("host-kernel-restart-reconcile-unknown");
             return HostRuntimeControlResponse::unknown_for(
                 request,
                 runtime_control_unknown_ref("kernel-restart-reconcile", request),
             );
         }
         if request.validate().is_err() {
+            host_lifecycle_observe_scm("host.kernel-restart-reconcile unknown validation");
+            host_lifecycle_observe_terminal("host-kernel-restart-reconcile-unknown");
             return HostRuntimeControlResponse::unknown_for(
                 request,
                 runtime_control_unknown_ref("kernel-restart-reconcile", request),
@@ -4776,15 +4803,30 @@ impl HostComposition {
         let key = request.mutation_digest.as_str().to_owned();
         if let Some(receipt) = self.runtime_restarts.get(&key).cloned() {
             return match rebind_runtime_restart_receipt(&receipt, request) {
-                Ok(receipt) => HostRuntimeControlResponse::restarted_for(request, receipt),
-                Err(_) => HostRuntimeControlResponse::unknown_for(
-                    request,
-                    runtime_control_unknown_ref("kernel-restart-reconcile-conflict", request),
-                ),
+                Ok(receipt) => {
+                    host_lifecycle_observe_scm(
+                        "host.kernel-restart-reconcile receipt readback replay",
+                    );
+                    HostRuntimeControlResponse::restarted_for(request, receipt)
+                }
+                Err(_) => {
+                    host_lifecycle_observe_scm(
+                        "host.kernel-restart-reconcile unknown conflict",
+                    );
+                    host_lifecycle_observe_terminal("host-kernel-restart-reconcile-unknown");
+                    HostRuntimeControlResponse::unknown_for(
+                        request,
+                        runtime_control_unknown_ref("kernel-restart-reconcile-conflict", request),
+                    )
+                }
             };
         }
         match has_runtime_restart_pending(self.launch_options.host_state_root(), &key) {
             Ok(true) | Err(_) => {
+                // Pending or unreadable pending stays Unknown; a timeout is
+                // never proof of effect or non-effect.
+                host_lifecycle_observe_scm("host.kernel-restart-reconcile unknown pending");
+                host_lifecycle_observe_terminal("host-kernel-restart-reconcile-unknown");
                 return HostRuntimeControlResponse::unknown_for(
                     request,
                     runtime_control_unknown_ref("kernel-restart-pending", request),
@@ -4795,6 +4837,8 @@ impl HostComposition {
         let snapshot = match self.journal.snapshot() {
             Ok(s) => s,
             Err(_e) => {
+                host_lifecycle_observe_scm("host.kernel-restart-reconcile unknown snapshot");
+                host_lifecycle_observe_terminal("host-kernel-restart-reconcile-unknown");
                 return HostRuntimeControlResponse::unknown_for(
                     request,
                     runtime_control_unknown_ref("kernel-restart-reconcile-snapshot", request),
@@ -4804,6 +4848,8 @@ impl HostComposition {
         if let Some(kernel) = snapshot.kernel.as_ref() {
             let _ = kernel;
         }
+        host_lifecycle_observe_scm("host.kernel-restart-reconcile unknown");
+        host_lifecycle_observe_terminal("host-kernel-restart-reconcile-unknown");
         HostRuntimeControlResponse::unknown_for(
             request,
             runtime_control_unknown_ref("kernel-restart-reconcile-unknown", request),
@@ -4821,6 +4867,9 @@ impl HostComposition {
         &mut self,
         request: &HostRuntimeControlRequest,
     ) -> Result<HostKernelRestartReceipt, HostError> {
+        // F-LOG-HOST-1: inner phase only; outer `handle_kernel_restart_request`
+        // owns the single terminal. Unsupported op stays typed, never success.
+        host_lifecycle_observe_scm("host.kernel-restart-execute requested");
         request.validate().map_err(HostError::ProcessContour)?;
         if request.operation != HostRuntimeControlOperation::RestartKernel {
             return Err(HostError::ProcessContour(
@@ -5093,6 +5142,8 @@ impl HostComposition {
         persist_runtime_restart_receipt(self.launch_options.host_state_root(), &receipt)?;
         self.runtime_restarts.insert(key, receipt.clone());
         self.readiness_gate.branch_degraded();
+        // F-LOG-HOST-1: receipt (restart) is distinct from reconcile readback.
+        host_lifecycle_observe_scm("host.kernel-restart-execute receipt");
         Ok(receipt)
     }
 
@@ -5349,6 +5400,11 @@ impl HostComposition {
         kernel_executable: impl AsRef<Path>,
         store_executable: impl AsRef<Path>,
     ) -> Result<(), HostError> {
+        // F-LOG-HOST-1: request vs admitted vs started vs ready preserved.
+        // Single terminal via guard; inner `start_manifest_contour` is phase
+        // only and shares correlation without its own terminal.
+        host_lifecycle_observe_requested("host.start requested");
+        let mut _host_terminal = HostTerminalGuard::armed("host-start-failed");
         self.ensure_admission_open()?;
         let active =
             self.registry.active().cloned().ok_or_else(|| {
@@ -5364,7 +5420,12 @@ impl HostComposition {
             store_executable.as_ref(),
             store_artifact,
             None,
-        )
+        )?;
+        _host_terminal.disarm();
+        // Started is distinct from ready: readiness still requires its own
+        // authenticated proof via the readiness contour.
+        host_lifecycle_observe_requested("host.start started");
+        Ok(())
     }
 
     /// Resumes one pending activation after Host Phase B has materialized its
@@ -5378,6 +5439,9 @@ impl HostComposition {
     /// stale, or the exact pending contour cannot be reconciled.
     #[cfg(windows)]
     pub fn resume_pending_activation_after_phase_b(&mut self) -> Result<(), HostError> {
+        // F-LOG-HOST-1: pending resume boundary; single terminal via guard.
+        host_lifecycle_observe_requested("host.resume-pending requested");
+        let mut _host_terminal = HostTerminalGuard::armed("host-resume-pending-failed");
         let pending = self.registry.pending_activation().cloned().ok_or_else(|| {
             HostError::ProcessContour("no pending activation requires Phase-B resume".to_owned())
         })?;
@@ -5391,11 +5455,16 @@ impl HostComposition {
                 "pending activation has no exact Phase-B materialization receipt".to_owned(),
             ));
         }
-        self.reconcile_pending_activation(&pending)
+        self.reconcile_pending_activation(&pending)?;
+        _host_terminal.disarm();
+        host_lifecycle_observe_requested("host.resume-pending admitted");
+        Ok(())
     }
 
     #[cfg(windows)]
     fn resume_pending_phase_b_receipt(&mut self) -> Result<(), HostError> {
+        // F-LOG-HOST-1: inner phase only; outer resume owns the terminal.
+        host_lifecycle_observe_requested("host.resume-pending-receipt requested");
         let pending = self.registry.pending_activation().cloned().ok_or_else(|| {
             HostError::RecoveryRequired(
                 "Phase-B receipt continuation has no exact pending activation".to_owned(),
@@ -5444,6 +5513,10 @@ impl HostComposition {
         store_artifact: &PlatformHandle,
         pending: Option<&eliot_installation::PendingActivation>,
     ) -> Result<(), HostError> {
+        // F-LOG-HOST-1: inner phase only; outer `start_approved_contour`/`open`
+        // owns the single terminal. Requested vs started vs ready preserved:
+        // started here is never readiness.
+        host_lifecycle_observe_requested("host.start-manifest requested");
         Self::validate_launch_options_for_manifest(&self.launch_options, manifest)?;
         let manifest_digest = phase_b_manifest_digest(manifest)?;
         let phase_b = match self
@@ -5569,6 +5642,8 @@ impl HostComposition {
         if let Err(error) = self.persist_process_observations(&manifest.generation) {
             self.cleanup_active_kernel_contour(error, "host-process-observation-failed")
         } else {
+            // F-LOG-HOST-1: started only; readiness needs its own proof.
+            host_lifecycle_observe_requested("host.start-manifest started");
             Ok(())
         }
     }
