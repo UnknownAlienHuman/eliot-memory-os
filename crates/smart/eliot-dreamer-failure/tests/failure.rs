@@ -544,3 +544,212 @@ fn proof_10_tool_response_without_semantic_verifier() {
         OutcomeAssessment::ExecutedButSemanticallyFailed
     );
 }
+
+// WORK_UNIT_CASE: 663/11
+#[test]
+fn proof_11_partial_unknown_external_effect() {
+    let (mut input, policy) = prepared();
+    input.action_evidence.coverage = FailureCoverage::Partial;
+    input.action_evidence.outcome.coverage = FailureCoverage::Partial;
+    input.history.coverage = FailureCoverage::Partial;
+    rebind_outcome(&mut input);
+    rebind_history(&mut input);
+    input.validate().expect("partial coverages validate");
+    let decision = call(&input, &policy).expect("partial effect executes");
+    assert_eq!(decision.assessment.outcome, OutcomeAssessment::UnknownOutcome);
+    assert_eq!(decision.result.disposition, FailureDisposition::Partial);
+    assert_eq!(
+        decision.result.common_disposition,
+        CandidateDisposition::Partial
+    );
+    let coverage = decision
+        .result
+        .final_preservation
+        .verdicts
+        .iter()
+        .find(|v| v.dimension == eliot_dreamer_contracts::RelationPreservationDimension::Coverage)
+        .expect("coverage present");
+    assert!(!coverage.passed);
+}
+
+// WORK_UNIT_CASE: 663/12
+#[test]
+fn proof_12_missing_failed_verifier() {
+    let (mut input, policy) = prepared();
+    set_declared(&mut input, FailureObservationState::VerifierFailed);
+    input.validate().expect("verifier-failed declares");
+    let decision = call(&input, &policy).expect("verifier-failed executes");
+    assert_eq!(decision.assessment.outcome, OutcomeAssessment::VerifierFailed);
+    assert_eq!(decision.result.disposition, FailureDisposition::Partial);
+    let (mut input, policy) = prepared();
+    input.proposal.mitigation.verifier_digest = "ff".repeat(32);
+    assert!(call(&input, &policy).is_err());
+    let (mut input, policy) = prepared();
+    input.proposal.mitigation.verifier_revision = "0.9.0".to_owned();
+    assert!(call(&input, &policy).is_err());
+}
+
+// WORK_UNIT_CASE: 663/13
+#[test]
+fn proof_13_exact_violated_invariant() {
+    let (input, policy) = prepared();
+    let baseline = call(&input, &policy).expect("invariant baseline executes");
+    assert_eq!(input.proposal.violated_invariant, "invariant");
+    assert_eq!(baseline.result.proposal.violated_invariant, "invariant");
+    let mut changed = input.clone();
+    changed.proposal.violated_invariant = "other-invariant".to_owned();
+    changed.validate().expect("changed invariant validates");
+    let other = call(&changed, &policy).expect("changed invariant executes");
+    assert_ne!(
+        baseline.assessment.current_trigger_digest,
+        other.assessment.current_trigger_digest
+    );
+    assert_ne!(baseline.decision_id, other.decision_id);
+}
+
+// WORK_UNIT_CASE: 663/14
+#[test]
+fn proof_14_incomplete_instrumentation_unknown() {
+    let (mut input, policy) = prepared();
+    input.action_evidence.coverage = FailureCoverage::Unknown;
+    input.action_evidence.outcome.coverage = FailureCoverage::Unknown;
+    input.action_evidence.outcome.failure_state = Some(FailureObservationState::UnknownOutcome);
+    rebind_outcome(&mut input);
+    input.validate().expect("unknown instrumentation validates");
+    let decision = call(&input, &policy).expect("unknown path executes");
+    assert_eq!(decision.assessment.outcome, OutcomeAssessment::UnknownOutcome);
+    assert_eq!(decision.result.disposition, FailureDisposition::Partial);
+    assert_ne!(
+        decision.assessment.outcome,
+        OutcomeAssessment::ExecutedButSemanticallyFailed
+    );
+}
+
+// WORK_UNIT_CASE: 663/15
+#[test]
+fn proof_15_exact_trigger_positive() {
+    let (input, policy) = prepared();
+    let decision = call(&input, &policy).expect("exact trigger executes");
+    assert_eq!(decision.assessment.trigger, TriggerAssessment::Exact);
+    assert_eq!(
+        input.proposal.comparison.comparator,
+        FailureComparator::ExactEquality
+    );
+    assert!(input.proposal.comparison.missing_dimensions.is_empty());
+    assert!(!input.proposal.comparison.dimensions.is_empty());
+    assert_eq!(
+        input.proposal.trigger.len(),
+        input.proposal.comparison.dimensions.len()
+    );
+    assert_eq!(decision.assessment.current_trigger_digest.len(), 64);
+    assert!(decision.assessment.supports_candidate());
+}
+
+// WORK_UNIT_CASE: 663/16
+#[test]
+fn proof_16_near_match_control_not_blocked() {
+    let (mut input, policy) = prepared();
+    input.history.entries[0].near_match = true;
+    input.history.near_match_count = 1;
+    rebind_history(&mut input);
+    input.validate().expect("near-match history validates");
+    let decision = call(&input, &policy).expect("near-match control executes");
+    assert_eq!(decision.assessment.counts.near_match_count, 1);
+    assert_ne!(decision.result.disposition, FailureDisposition::Blocked);
+    assert_ne!(
+        decision.result.common_disposition,
+        CandidateDisposition::Blocked
+    );
+    assert_eq!(decision.assessment.counts.semantic_success_count, 1);
+    assert!(decision.result.validate_against(&input).is_ok());
+}
+
+// WORK_UNIT_CASE: 663/17
+#[test]
+fn proof_17_missing_trigger_field_restricts() {
+    let (mut input, policy) = prepared();
+    input.proposal.trigger.retain(|d| d.name != "target");
+    input.proposal.comparison.dimensions.retain(|d| d.name != "target");
+    input.proposal.comparison.missing_dimensions = vec!["target".to_owned()];
+    input.validate().expect("missing dimension validates");
+    let decision = call(&input, &policy).expect("missing trigger executes");
+    assert_eq!(decision.assessment.trigger, TriggerAssessment::Missing);
+    assert_eq!(decision.result.disposition, FailureDisposition::Partial);
+    assert!(!decision.assessment.supports_candidate());
+}
+
+// WORK_UNIT_CASE: 663/18
+#[test]
+fn proof_18_changed_environment_requires_revalidation() {
+    let (mut input, policy) = prepared();
+    input.environment.environment_id = "env-new".to_owned();
+    rebind_environment(&mut input);
+    for dimension in input
+        .proposal
+        .trigger
+        .iter_mut()
+        .chain(input.proposal.comparison.dimensions.iter_mut())
+    {
+        if dimension.name == "environment" {
+            dimension.value = FailureDimensionValue::Text("env-new".to_owned());
+        }
+    }
+    input.validate().expect("changed environment validates");
+    let decision = call(&input, &policy).expect("changed env executes");
+    assert_eq!(
+        decision.assessment.applicability,
+        ApplicabilityAssessment::ChangedEnvironment
+    );
+    assert_eq!(decision.result.disposition, FailureDisposition::Partial);
+    let mut tooled = input.clone();
+    tooled.environment.tool_revision = "tool-v2".to_owned();
+    tooled.proposal.environment.tool_revision = "tool-v2".to_owned();
+    tooled.validate().expect("retooled env validates");
+    let retooled = call(&tooled, &policy).expect("retooled executes");
+    assert_eq!(
+        retooled.assessment.applicability,
+        ApplicabilityAssessment::ChangedEnvironment
+    );
+}
+
+// WORK_UNIT_CASE: 663/19
+#[test]
+fn proof_19_scope_target_effect_leakage() {
+    let (mut input, policy) = prepared();
+    input.proposal.applicability.target_id = "b".to_owned();
+    input.validate().expect("leaked target validates as scoped input");
+    let decision = call(&input, &policy).expect("leakage check executes");
+    assert_eq!(
+        decision.assessment.applicability,
+        ApplicabilityAssessment::ScopeMismatch
+    );
+    assert_eq!(decision.result.disposition, FailureDisposition::Partial);
+    // Scope leakage narrows applicability without rewriting the exact
+    // failure observation: the outcome stays semantic-failure while the
+    // candidate is withheld from Hypothesis.
+    assert_eq!(
+        decision.assessment.outcome,
+        OutcomeAssessment::ExecutedButSemanticallyFailed
+    );
+    assert!(decision.result.validate_against(&input).is_ok());
+}
+
+// WORK_UNIT_CASE: 663/20
+#[test]
+fn proof_20_counts_cannot_prove_causality() {
+    let (input, policy) = prepared();
+    let decision = call(&input, &policy).expect("causal ceiling executes");
+    assert_eq!(
+        decision.assessment.causal.status,
+        eliot_dreamer_contracts::FailureCausalStatus::Unknown
+    );
+    assert!(!decision.assessment.causal.may_describe_correlation);
+    assert!(!decision.assessment.causal.causal_claim_permitted);
+    assert!(decision
+        .assessment
+        .causal
+        .limitation_refs
+        .contains(&"causal_mechanism_requires_intervention_evidence".to_owned()));
+    assert_eq!(decision.assessment.counts.represented_total, 2);
+    assert_eq!(decision.assessment.counts.independent_count, 2);
+}
