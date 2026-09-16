@@ -798,3 +798,370 @@ fn case_20_process_model_worker_self_report_insufficient() {
         other => panic!("self-report outcome must not close, got {other:?}"),
     }
 }
+
+fn multi_inputs(
+    kinds: &[OutcomeKind],
+) -> (
+    CampaignAndTarget,
+    AttemptOutcomesAndDeltas,
+    OverlayAndActivationAssessments,
+    OutcomeHarmAndEconomicsEvidence,
+    PriorClosureHistory,
+    ClosurePolicy,
+) {
+    let target = "target-819-a";
+    let mut expected = Vec::new();
+    let mut attempts = Vec::new();
+    let mut overlays = Vec::new();
+    let mut assessments = Vec::new();
+    let mut outcomes = Vec::new();
+    let mut records = Vec::new();
+    for (index, kind) in kinds.iter().enumerate() {
+        let attempt_id = format!("mattempt-{}", index + 1);
+        let overlay_id = format!("moverlay-{}", index + 1);
+        expected.push(attempt_id.clone());
+        attempts.push(attempt(&attempt_id, target));
+        overlays.push(overlay(&overlay_id, &attempt_id));
+        assessments.push(stage(
+            &attempt_id,
+            &overlay_id,
+            LifecycleStage::Delivery,
+            true,
+            false,
+            false,
+        ));
+        assessments.push(stage(
+            &attempt_id,
+            &overlay_id,
+            LifecycleStage::Use,
+            true,
+            true,
+            false,
+        ));
+        assessments.push(stage(
+            &attempt_id,
+            &overlay_id,
+            LifecycleStage::Outcome,
+            true,
+            true,
+            false,
+        ));
+        let mut record = outcome(&attempt_id, true);
+        record.kind = kind.clone();
+        outcomes.push(record);
+        records.push(economics(&attempt_id));
+    }
+    (
+        campaign(),
+        AttemptOutcomesAndDeltas {
+            expected_attempt_ids: expected,
+            attempts,
+        },
+        OverlayAndActivationAssessments {
+            overlays,
+            assessments,
+        },
+        OutcomeHarmAndEconomicsEvidence {
+            outcomes,
+            economics: records,
+        },
+        history(),
+        policy(),
+    )
+}
+
+// WORK_UNIT_CASE: 819/21
+#[test]
+fn case_21_complete_vs_incomplete_member_stage_denominator() {
+    let candidate = assemble_complete();
+    assert_eq!(candidate.denominators.supplied_attempts, 2);
+    // Incomplete member denominator: attempt-2 missing from supply.
+    let (c, mut a, o, e, h, p) = complete_inputs();
+    a.attempts.pop();
+    match learning_closure::assemble_campaign_learning_closure(c, a, o, e, h, p) {
+        Ok(ClosureAssembly::Disposition(disposition)) => {
+            assert_eq!(disposition.disposition, "continue-collect");
+            assert!(
+                disposition
+                    .missing_evidence
+                    .iter()
+                    .any(|m| m.contains("attempt-2"))
+            );
+        }
+        other => panic!("missing member must dispose, got {other:?}"),
+    }
+    // Incomplete stage denominator: attempt-2 loses proven use.
+    let (c2, a2, mut o2, e2, h2, p2) = complete_inputs();
+    o2.assessments
+        .retain(|s| !(s.attempt_id == "attempt-2" && s.stage == LifecycleStage::Use));
+    match learning_closure::assemble_campaign_learning_closure(c2, a2, o2, e2, h2, p2) {
+        Ok(ClosureAssembly::Disposition(disposition)) => {
+            assert_eq!(disposition.disposition, "inconclusive");
+            assert!(
+                disposition
+                    .missing_evidence
+                    .iter()
+                    .any(|m| m.contains("delivery-without-use"))
+            );
+        }
+        other => panic!("missing stage must dispose, got {other:?}"),
+    }
+}
+
+// WORK_UNIT_CASE: 819/22
+#[test]
+fn case_22_positive_negative_mixed_unchanged_harmful_outcome() {
+    use OutcomeKind::{Harmful, Mixed, Negative, Positive, Unchanged};
+    let (c, a, o, e, h, p) =
+        multi_inputs(&[Positive, Negative, Mixed, Unchanged]);
+    match learning_closure::assemble_campaign_learning_closure(c, a, o, e, h, p) {
+        Ok(ClosureAssembly::Candidate(candidate)) => {
+            assert_eq!(candidate.denominators.outcome_count, 4);
+            assert_eq!(candidate.status, ClosureStatus::ClosedTaskLocal);
+        }
+        other => panic!("four distinct non-harmful kinds must close, got {other:?}"),
+    }
+    // Kinds are load-bearing in the digest, never collapsed to positive.
+    let (c2, a2, o2, e2, h2, p2) =
+        multi_inputs(&[Positive, Positive, Positive, Positive]);
+    let (c3, a3, o3, e3, h3, p3) =
+        multi_inputs(&[Positive, Negative, Mixed, Unchanged]);
+    let uniform = match learning_closure::assemble_campaign_learning_closure(c2, a2, o2, e2, h2, p2)
+    {
+        Ok(ClosureAssembly::Candidate(candidate)) => candidate,
+        other => panic!("uniform kinds must close, got {other:?}"),
+    };
+    let varied = match learning_closure::assemble_campaign_learning_closure(c3, a3, o3, e3, h3, p3)
+    {
+        Ok(ClosureAssembly::Candidate(candidate)) => candidate,
+        other => panic!("varied kinds must close, got {other:?}"),
+    };
+    assert_ne!(uniform.digest, varied.digest);
+    // Harmful kind never closes: it retires to review with visible debt.
+    let (c4, a4, o4, mut e4, h4, p4) =
+        multi_inputs(&[Positive, Negative, Mixed, Harmful]);
+    e4.outcomes[3].harm = HarmRecord {
+        harm_observed: true,
+        harm_ref: Some("harm-819-m4".to_string()),
+    };
+    match learning_closure::assemble_campaign_learning_closure(c4, a4, o4, e4, h4, p4) {
+        Ok(ClosureAssembly::Disposition(disposition)) => {
+            assert_eq!(disposition.disposition, "retire-review");
+            assert!(
+                disposition
+                    .open_debt
+                    .iter()
+                    .any(|m| m.contains("mattempt-4"))
+            );
+        }
+        other => panic!("harmful outcome must retire, got {other:?}"),
+    }
+}
+
+// WORK_UNIT_CASE: 819/23
+#[test]
+fn case_23_missing_measurement_vs_no_event() {
+    // Missing instrumentation is unknown, never zero harm/no effect: a mutant
+    // that closes over Unmeasured outcomes must fail here.
+    let (c, a, mut o, mut e, h, p) = complete_inputs();
+    e.outcomes[0].kind = OutcomeKind::Unmeasured;
+    e.outcomes[0].use_linked = false;
+    for assessment in &mut o.assessments {
+        if assessment.attempt_id == "attempt-1"
+            && matches!(
+                assessment.stage,
+                LifecycleStage::Outcome | LifecycleStage::Benefit
+            )
+        {
+            assessment.observed = false;
+            assessment.evidence_ref = None;
+            assessment.use_linked = false;
+        }
+    }
+    match learning_closure::assemble_campaign_learning_closure(c, a, o, e, h, p) {
+        Ok(ClosureAssembly::Disposition(disposition)) => {
+            assert_eq!(disposition.disposition, "inconclusive");
+            assert!(
+                disposition
+                    .missing_evidence
+                    .iter()
+                    .any(|m| m.contains("use-without-outcome-linkage"))
+            );
+        }
+        other => panic!("unmeasured outcome must dispose, got {other:?}"),
+    }
+    // An observed no-event is legitimate evidence and closes.
+    let (c2, a2, o2, mut e2, h2, p2) = complete_inputs();
+    e2.outcomes[0].kind = OutcomeKind::NoEvent;
+    match learning_closure::assemble_campaign_learning_closure(c2, a2, o2, e2, h2, p2) {
+        Ok(ClosureAssembly::Candidate(candidate)) => {
+            assert_eq!(candidate.denominators.outcome_count, 2);
+        }
+        other => panic!("observed no-event must close, got {other:?}"),
+    }
+}
+
+// WORK_UNIT_CASE: 819/24
+#[test]
+fn case_24_metric_unit_population_window_mismatch() {
+    let (c, a, o, mut e, h, p) = complete_inputs();
+    e.outcomes[1].metric = "other-metric-819".to_string();
+    e.outcomes[1].unit = "other-unit-819".to_string();
+    match learning_closure::assemble_campaign_learning_closure(c, a, o, e, h, p) {
+        Ok(ClosureAssembly::Disposition(disposition)) => {
+            assert_eq!(disposition.disposition, "inconclusive");
+            assert!(
+                disposition
+                    .missing_evidence
+                    .iter()
+                    .any(|m| m.contains("metric-identity-mismatch"))
+            );
+        }
+        other => panic!("metric/unit mismatch must dispose, got {other:?}"),
+    }
+}
+
+// WORK_UNIT_CASE: 819/25
+#[test]
+fn case_25_compatible_baseline_control_comparison() {
+    let (c, a, o, e, h, p) = complete_inputs();
+    assert_eq!(e.outcomes[0].baseline_ref, e.outcomes[1].baseline_ref);
+    assert_eq!(e.outcomes[0].control_ref, e.outcomes[1].control_ref);
+    assert!(e.outcomes[0].control_ref.is_some());
+    match learning_closure::assemble_campaign_learning_closure(c, a, o, e, h, p) {
+        Ok(ClosureAssembly::Candidate(candidate)) => {
+            assert_eq!(candidate.denominators.outcome_count, 2);
+            assert_eq!(candidate.status, ClosureStatus::ClosedTaskLocal);
+        }
+        other => panic!("compatible comparison must close, got {other:?}"),
+    }
+}
+
+// WORK_UNIT_CASE: 819/26
+#[test]
+fn case_26_post_hoc_favorable_baseline_rejected() {
+    let (c, a, o, mut e, h, p) = complete_inputs();
+    e.outcomes[1].baseline_ref = "favorable-baseline-819".to_string();
+    match learning_closure::assemble_campaign_learning_closure(c, a, o, e, h, p) {
+        Ok(ClosureAssembly::Disposition(disposition)) => {
+            assert_eq!(disposition.disposition, "inconclusive");
+            assert!(
+                disposition
+                    .missing_evidence
+                    .iter()
+                    .any(|m| m.contains("post-hoc-baseline"))
+            );
+        }
+        other => panic!("post-hoc baseline must dispose, got {other:?}"),
+    }
+}
+
+// WORK_UNIT_CASE: 819/27
+#[test]
+fn case_27_attrition_selection_bias() {
+    let (c, a, o, mut e, h, p) = complete_inputs();
+    e.outcomes[1].population = "subgroup-favorable-819".to_string();
+    match learning_closure::assemble_campaign_learning_closure(c, a, o, e, h, p) {
+        Ok(ClosureAssembly::Disposition(disposition)) => {
+            assert_eq!(disposition.disposition, "inconclusive");
+            assert!(
+                disposition
+                    .missing_evidence
+                    .iter()
+                    .any(|m| m.contains("attrition-selection-bias"))
+            );
+            assert_eq!(
+                disposition.missing_owner,
+                Some("evaluator-819-a".to_string())
+            );
+        }
+        other => panic!("attrited population must dispose, got {other:?}"),
+    }
+}
+
+// WORK_UNIT_CASE: 819/28
+#[test]
+fn case_28_changed_environment_target_scope() {
+    let (c, a, o, mut e, h, p) = complete_inputs();
+    e.outcomes[1].window = "shifted-window-819".to_string();
+    match learning_closure::assemble_campaign_learning_closure(c, a, o, e, h, p) {
+        Ok(ClosureAssembly::Disposition(disposition)) => {
+            assert_eq!(disposition.disposition, "inconclusive");
+            assert!(
+                disposition
+                    .missing_evidence
+                    .iter()
+                    .any(|m| m.contains("environment-window-change"))
+            );
+        }
+        other => panic!("changed environment must dispose, got {other:?}"),
+    }
+}
+
+// WORK_UNIT_CASE: 819/29
+#[test]
+fn case_29_complete_partial_confounder_denominator() {
+    let (c, a, o, e, h, p) = complete_inputs();
+    match learning_closure::assemble_campaign_learning_closure(c, a, o, e, h, p) {
+        Ok(ClosureAssembly::Candidate(candidate)) => {
+            assert_eq!(candidate.denominators.outcome_count, 2);
+        }
+        other => panic!("complete confounder denominator must close, got {other:?}"),
+    }
+    let (c2, a2, o2, mut e2, h2, p2) = complete_inputs();
+    e2.outcomes[1].control_ref = None;
+    match learning_closure::assemble_campaign_learning_closure(c2, a2, o2, e2, h2, p2) {
+        Ok(ClosureAssembly::Disposition(disposition)) => {
+            assert_eq!(disposition.disposition, "inconclusive");
+            assert!(
+                disposition
+                    .missing_evidence
+                    .iter()
+                    .any(|m| m.contains("confounder-denominator-incomplete"))
+            );
+        }
+        other => panic!("partial confounder denominator must dispose, got {other:?}"),
+    }
+}
+
+// WORK_UNIT_CASE: 819/30
+#[test]
+fn case_30_concurrent_intervention() {
+    let (c, a, mut o, e, h, p) = complete_inputs();
+    o.assessments.push(stage(
+        "attempt-1",
+        "overlay-1",
+        LifecycleStage::Action,
+        true,
+        false,
+        false,
+    ));
+    match learning_closure::assemble_campaign_learning_closure(c, a, o, e, h, p) {
+        Ok(ClosureAssembly::Disposition(disposition)) => {
+            assert_eq!(disposition.disposition, "inconclusive");
+            assert!(
+                disposition
+                    .missing_evidence
+                    .iter()
+                    .any(|m| m.contains("concurrent-intervention-undisclosed"))
+            );
+        }
+        other => panic!("undisclosed intervention must dispose, got {other:?}"),
+    }
+    // A use-linked, attributed action is accounted intervention evidence.
+    let (c2, a2, mut o2, e2, h2, p2) = complete_inputs();
+    o2.assessments.push(stage(
+        "attempt-1",
+        "overlay-1",
+        LifecycleStage::Action,
+        true,
+        true,
+        true,
+    ));
+    match learning_closure::assemble_campaign_learning_closure(c2, a2, o2, e2, h2, p2) {
+        Ok(ClosureAssembly::Candidate(candidate)) => {
+            assert_eq!(candidate.status, ClosureStatus::ClosedTaskLocal);
+        }
+        other => panic!("linked intervention must close, got {other:?}"),
+    }
+}
