@@ -8,6 +8,7 @@
 use std::sync::atomic::Ordering;
 use std::time::Duration;
 
+use eliot_kernel_core::RouteScope;
 use eliot_kernel_service::{
     EliotdLaunchDescriptor, KernelControlCommand, KernelServiceError, KernelServiceState,
 };
@@ -15,7 +16,6 @@ use eliot_platform::PlatformHandle;
 use eliot_platform_windows::{
     current_process_named_pipe_expectation, observe_named_pipe_peer_process,
 };
-use eliot_kernel_core::RouteScope;
 use eliot_process::{
     CancellationStatus, Generation, ProcessExecutionError, ProcessLifecycle, ProcessOwnerBinding,
     ProcessStartReceipt,
@@ -28,13 +28,63 @@ use super::{
     stable_owner_principal_digest,
 };
 
+/// F-LOG-KERNEL-4 (#903): daemon-runtime boundary observations.
+///
+/// Observation only, via #895's facade: fixed `kernel.daemon.*` event names
+/// plus a bounded stable outcome. Never carries launch descriptors, nonces,
+/// receipts, digests, paths, supervision material, or owner error strings
+/// (I15.4, I07.20).
+fn observe_daemon_runtime(event: &'static str, outcome: &'static str) {
+    use super::kernel_diagnostics::{KERNEL_DIAGNOSTICS_TARGET, bound_field};
+    let event_bound = bound_field(event);
+    let outcome_bound = bound_field(outcome);
+    tracing::info!(
+        target: KERNEL_DIAGNOSTICS_TARGET,
+        event = event_bound.text(),
+        outcome = outcome_bound.text(),
+        "daemon runtime observation"
+    );
+}
+
+/// Maps one daemon-recovery failure to its stable diagnostic code.
+///
+/// Only the variant is emitted; any `String` payload is never logged. The
+/// `RECOVERY_` prefix keeps recovery-operation terminals distinct from the
+/// launch-operation codes (`daemon_process_launch.rs`).
+#[cfg(windows)]
+fn daemon_recovery_terminal_code(error: &KernelBuildError) -> &'static str {
+    match error {
+        KernelBuildError::Platform(_) => "RECOVERY_PLATFORM",
+        KernelBuildError::Transport(_) => "RECOVERY_TRANSPORT",
+        KernelBuildError::Runtime(_) => "RECOVERY_RUNTIME",
+        KernelBuildError::Ors(_) => "RECOVERY_ORS",
+        KernelBuildError::Core(_) => "RECOVERY_CORE",
+        KernelBuildError::Service(_) => "RECOVERY_SERVICE",
+        KernelBuildError::StoreBootstrapRequired => "RECOVERY_STORE_BOOTSTRAP_REQUIRED",
+        KernelBuildError::StoreAlreadyConnected => "RECOVERY_STORE_ALREADY_CONNECTED",
+        KernelBuildError::Principal(_) => "RECOVERY_PRINCIPAL",
+    }
+}
+
 impl KernelComposition {
     /// Returns the immutable approved child contour, if integrated startup
     /// supplied one.  Absence is an integration error, not a permission to
     /// infer a sibling executable.
+    ///
+    /// Diagnostic read (F-LOG-KERNEL-4, #903): only contour presence is
+    /// observed; the descriptor itself is never logged.
     #[must_use]
     pub fn daemon_launch(&self) -> Option<&EliotdLaunchDescriptor> {
-        self.daemon_launch.as_ref()
+        let launch = self.daemon_launch.as_ref();
+        observe_daemon_runtime(
+            "kernel.daemon.contour_observed",
+            if launch.is_some() {
+                "present"
+            } else {
+                "absent"
+            },
+        );
+        launch
     }
 
     pub(crate) fn active_daemon_launch(
@@ -78,6 +128,12 @@ impl KernelComposition {
         launched: &ProcessStartReceipt,
         timeout: Duration,
     ) -> Result<(), KernelBuildError> {
+        // F-LOG-KERNEL-4 (#903): readiness-rendezvous observations. This
+        // rendezvous is always a subordinate phase of a larger operation
+        // (recovery, control request, or probe), so every outcome here is an
+        // info; the owning operation emits the single terminal. Liveness
+        // (a running process) is never logged as readiness.
+        observe_daemon_runtime("kernel.daemon.await_requested", "attempt");
         let deadline = tokio::time::Instant::now() + timeout;
         loop {
             let changed = self.daemon_status_changed.notified();
@@ -86,25 +142,38 @@ impl KernelComposition {
                     KernelBuildError::Service("daemon runtime lock poisoned".to_owned())
                 })?;
                 if state.receipt.as_ref() != Some(launched) {
+                    observe_daemon_runtime("kernel.daemon.await_rejected", "receipt_mismatch");
                     return Err(KernelBuildError::Service(
                         "eliotd readiness is not bound to the exact launched process receipt"
                             .to_owned(),
                     ));
                 }
                 match &state.status {
-                    DaemonRuntimeStatus::Ready => return Ok(()),
+                    DaemonRuntimeStatus::Ready => {
+                        observe_daemon_runtime("kernel.daemon.await_satisfied", "success");
+                        return Ok(());
+                    }
                     DaemonRuntimeStatus::Running => {}
                     DaemonRuntimeStatus::Degraded(reason) => {
+                        observe_daemon_runtime(
+                            "kernel.daemon.await_rejected",
+                            "degraded_before_ready",
+                        );
                         return Err(KernelBuildError::Service(format!(
                             "eliotd degraded before authenticated readiness: {reason}"
                         )));
                     }
                     DaemonRuntimeStatus::Failed(reason) => {
+                        observe_daemon_runtime(
+                            "kernel.daemon.await_rejected",
+                            "failed_before_ready",
+                        );
                         return Err(KernelBuildError::Service(format!(
                             "eliotd failed before authenticated readiness: {reason}"
                         )));
                     }
                     DaemonRuntimeStatus::NotLaunched | DaemonRuntimeStatus::Launching => {
+                        observe_daemon_runtime("kernel.daemon.await_rejected", "not_launched");
                         return Err(KernelBuildError::Service(
                             "eliotd readiness wait has no launched process".to_owned(),
                         ));
@@ -112,6 +181,7 @@ impl KernelComposition {
                 }
             }
             if tokio::time::timeout_at(deadline, changed).await.is_err() {
+                observe_daemon_runtime("kernel.daemon.await_rejected", "timeout");
                 let reason = format!(
                     "eliotd did not complete authenticated Governor recovery and report_ready within {} ms",
                     timeout.as_millis()
@@ -312,8 +382,8 @@ impl KernelComposition {
             .map_err(|error| {
                 KernelBuildError::Service(format!("eliotd ORS cutover readback failed: {error}"))
             })?;
-        let scope =
-            RouteScope::new("daemon").map_err(|error| KernelBuildError::Service(error.to_string()))?;
+        let scope = RouteScope::new("daemon")
+            .map_err(|error| KernelBuildError::Service(error.to_string()))?;
         let generations = self
             .generations
             .lock()
@@ -334,12 +404,40 @@ impl KernelComposition {
     /// Performs one Kernel-owned bounded recovery of a failed daemon
     /// attempt. The old process effect must be known terminal before the
     /// active descriptor, nonce, and operation identity are replaced.
+    ///
+    /// Diagnostic wrapper (F-LOG-KERNEL-4, #903): exactly one terminal is
+    /// emitted per failed recovery with the recovery operation's own stable
+    /// code. Subordinate rendezvous/launch/readiness phases keep correlation
+    /// infos only; a failure already terminaled below arrives here
+    /// transformed into the recovery error, while the unchanged rendezvous
+    /// error is terminaled here for the first time.
+    #[cfg(windows)]
+    pub async fn recover_eliotd(&self) -> Result<ProcessStartReceipt, KernelBuildError> {
+        observe_daemon_runtime("kernel.daemon.recovery_requested", "attempt");
+        match self.recover_eliotd_inner().await {
+            Ok(receipt) => {
+                observe_daemon_runtime("kernel.daemon.recovery_committed", "success");
+                Ok(receipt)
+            }
+            Err(error) => {
+                observe_daemon_runtime("kernel.daemon.recovery_failed", "rejected");
+                super::kernel_diagnostics::observe_terminal_error(daemon_recovery_terminal_code(
+                    &error,
+                ));
+                Err(error)
+            }
+        }
+    }
+
+    /// Bounded disposition, fresh binding, and readiness rendezvous; every
+    /// disposition check precedes the single relaunch. See
+    /// [`KernelComposition::recover_eliotd`].
     #[cfg(windows)]
     #[allow(
         clippy::too_many_lines,
         reason = "bounded recovery keeps disposition, fresh binding, and readiness rendezvous ordered"
     )]
-    pub async fn recover_eliotd(&self) -> Result<ProcessStartReceipt, KernelBuildError> {
+    async fn recover_eliotd_inner(&self) -> Result<ProcessStartReceipt, KernelBuildError> {
         let _recovery_gate = self.daemon_recovery_gate.lock().await;
         let service_state = self
             .service_state()
@@ -502,6 +600,13 @@ impl KernelComposition {
 
     /// Records an authenticated daemon-ready report after generation checks
     /// have been performed by the front-door dispatcher.
+    ///
+    /// Subordinate boundary (F-LOG-KERNEL-4, #903): the ready report is
+    /// always a phase of the authenticated daemon request, so every outcome
+    /// here is an info; the request dispatcher owns the single terminal for
+    /// the mapped failure. Ready versus running versus liveness stay
+    /// distinct: only an exact already-ready receipt is read back, never
+    /// promoted from a merely running process.
     pub fn mark_daemon_ready(&self) -> Result<(), KernelServiceError> {
         let mut state = self
             .daemon_runtime
@@ -512,13 +617,16 @@ impl KernelComposition {
             && state.status == DaemonRuntimeStatus::Ready
             && state.supervision.is_some()
         {
+            observe_daemon_runtime("kernel.daemon.ready_reported", "already_ready");
             return Ok(());
         }
         #[cfg(windows)]
         if state.supervision.is_none() {
+            observe_daemon_runtime("kernel.daemon.ready_reported", "supervision_unproven");
             return Err(KernelServiceError::ReadinessNotProven);
         }
         if state.receipt.is_none() || state.status != DaemonRuntimeStatus::Running {
+            observe_daemon_runtime("kernel.daemon.ready_reported", "readiness_unproven");
             return Err(KernelServiceError::ReadinessNotProven);
         }
         state.status = DaemonRuntimeStatus::Ready;
@@ -526,6 +634,7 @@ impl KernelComposition {
         #[cfg(windows)]
         self.note_agent_bridge_peer_set_change();
         self.daemon_status_changed.notify_one();
+        observe_daemon_runtime("kernel.daemon.ready_proven", "success");
         Ok(())
     }
 
