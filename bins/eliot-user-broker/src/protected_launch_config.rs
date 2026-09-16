@@ -8,8 +8,7 @@
 //! capability-family topology.
 //!
 //! This cell owns only the protected stable caller/launch binding bytes,
-//! validation, explicit v1→v2 migration, and the retained
-//! `ProtectedPathLease`. It never mints Kernel authority, never governs
+//! validation, and the retained `ProtectedPathLease`. It never mints Kernel authority, never governs
 //! canonical store state, and never synthesizes Governor decisions or process
 //! evidence.
 //!
@@ -23,19 +22,12 @@
 //! Kernel connection/challenge material stays owned by the Kernel client
 //! declaration (`eliot-cli`); policy/config authority stays owned by Kernel
 //! snapshots. Neither is copied into this broker-local binding.
-//!
-//! A legacy v1 file (with an embedded full `RequestIdentity`) is never
-//! silently reinterpreted: it is validated with the legacy rules, its stable
-//! fields and epoch fence are extracted, its historical request authority is
-//! dropped, its SHA-256 digest is retained as migration evidence, and the v2
-//! bytes are published atomically when the protected contour permits it.
 
 #![forbid(unsafe_code)]
 
 use std::fs;
 
 use eliot_platform_windows::ProtectedPathLease;
-use eliot_protocol::RequestIdentity;
 use eliot_user_broker_core::{OperatorArtifact, RegistrationRequest};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -46,8 +38,6 @@ use super::operation_identity::validate_fence_value;
 
 /// Stable protected launch binding schema version.
 pub(super) const LAUNCH_BINDING_SCHEMA: &str = "eliot.user-broker.launch-binding.v2";
-/// Legacy protected launch schema marker (migration source only).
-const LEGACY_LAUNCH_SCHEMA_HINT: &str = "request_identity";
 
 const LAUNCH_CONFIG_RELATIVE_PATH: &str = "Eliot/user-broker/launch.json";
 
@@ -82,30 +72,6 @@ pub(super) struct OperatorArtifactConfig {
     pub(super) image_id: String,
     pub(super) executable: String,
     pub(super) artifact_digest: String,
-}
-
-/// Legacy v1 protected launch file: stable declaration plus one embedded
-/// full per-operation [`RequestIdentity`]. Read-only migration source; its
-/// request authority is never installed for a Kernel operation.
-#[derive(Clone, Debug, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct LegacyBrokerLaunchConfigV1 {
-    registration: RegistrationRequest,
-    request_identity: RequestIdentity,
-    operator_artifact: OperatorArtifactConfig,
-}
-
-/// Evidence retained for one explicit v1→v2 migration.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct MigrationEvidence {
-    /// SHA-256 of the exact legacy v1 bytes that were migrated.
-    pub v1_digest: String,
-    /// Digest of the resulting v2 binding.
-    pub binding_digest: String,
-    /// Whether the v2 bytes were durably published back to the protected
-    /// file. `false` still never revives v1 request authority: migration is
-    /// applied in memory and no code path installs a legacy identity.
-    pub durable_rewrite: bool,
 }
 
 fn artifact_digest() -> Result<String, CompositionError> {
@@ -175,8 +141,8 @@ pub(super) fn validate_launch_binding(
     Ok(())
 }
 
-/// Parses and validates v2 binding bytes. Legacy v1 bytes always fail here
-/// because `request_identity` is not an admitted v2 field.
+/// Parses and validates v2 binding bytes. Unknown-schema bytes are refused
+/// with a typed error (fail-closed); they are never reinterpreted.
 pub(super) fn parse_binding_bytes(bytes: &[u8]) -> Result<BrokerLaunchBinding, CompositionError> {
     let binding: BrokerLaunchBinding =
         serde_json::from_slice(bytes).map_err(CompositionError::Encoding)?;
@@ -251,57 +217,8 @@ pub(super) fn fresh_registration_request(
     Ok(request)
 }
 
-/// Migrates legacy v1 bytes to a v2 binding in memory. The legacy file is
-/// validated with the legacy rules first; only the stable declaration, the
-/// operator artifact, and the epoch fence cross the boundary. The historical
-/// `request_id`, `idempotency_key`, `cancellation_id`, and absolute deadline
-/// are dropped and never become authority again.
-pub(super) fn migrate_v1_bytes(
-    bytes: &[u8],
-) -> Result<(BrokerLaunchBinding, MigrationEvidence), CompositionError> {
-    let legacy: LegacyBrokerLaunchConfigV1 =
-        serde_json::from_slice(bytes).map_err(CompositionError::Encoding)?;
-    validate_registration_declaration(&legacy.registration)?;
-    validate_operator_artifact(&legacy.operator_artifact)?;
-    legacy
-        .request_identity
-        .validate()
-        .map_err(|error| CompositionError::Launch(error.to_string()))?;
-    // Only the epoch fence crosses the boundary, as exact JSON. Field access
-    // needs no foundation type import; the fence is revalidated below.
-    let fence = serde_json::to_value(&legacy.request_identity.request.state_fence)
-        .map_err(CompositionError::Encoding)?;
-    let binding = BrokerLaunchBinding {
-        schema: LAUNCH_BINDING_SCHEMA.to_owned(),
-        registration: legacy.registration,
-        operator_artifact: legacy.operator_artifact,
-        launch_authority_fence: fence,
-    };
-    validate_launch_binding(&binding)?;
-    let digest = binding_digest(&binding)?;
-    Ok((
-        binding,
-        MigrationEvidence {
-            v1_digest: sha256_hex(bytes),
-            binding_digest: digest,
-            durable_rewrite: false,
-        },
-    ))
-}
-
-/// Returns true when the bytes look like a legacy v1 file rather than v2.
-/// This is a routing hint only; parsing remains strict in both directions.
-fn looks_like_v1(bytes: &[u8]) -> bool {
-    serde_json::from_slice::<serde_json::Value>(bytes)
-        .is_ok_and(|value| value.get(LEGACY_LAUNCH_SCHEMA_HINT).is_some())
-}
-
 pub(super) fn load_protected_launch_binding() -> Result<
-    (
-        BrokerLaunchBinding,
-        ProtectedPathLease,
-        Option<MigrationEvidence>,
-    ),
+    (BrokerLaunchBinding, ProtectedPathLease),
     CompositionError,
 > {
     #[cfg(not(windows))]
@@ -319,51 +236,9 @@ pub(super) fn load_protected_launch_binding() -> Result<
         let bytes = lease
             .read_bounded(64 * 1024)
             .map_err(|error| CompositionError::Protected(error.to_string()))?;
-        if looks_like_v1(&bytes) {
-            let (binding, mut evidence) = migrate_v1_bytes(&bytes)?;
-            evidence.durable_rewrite = rewrite_binding_atomically(&path, &binding)?;
-            let digest = binding_digest(&binding)?;
-            evidence.binding_digest = digest;
-            return Ok((binding, lease, Some(evidence)));
-        }
         let binding = parse_binding_bytes(&bytes)?;
-        Ok((binding, lease, None))
+        Ok((binding, lease))
     }
-}
-
-/// Publishes v2 bytes back to the protected launch file and proves the exact
-/// bytes durable. Returns whether the durable rewrite succeeded; a failure
-/// leaves the legacy file untouched and the caller proceeds with the
-/// in-memory migrated binding (its legacy request authority stays inert).
-#[cfg(windows)]
-fn rewrite_binding_atomically(
-    path: &std::path::Path,
-    binding: &BrokerLaunchBinding,
-) -> Result<bool, CompositionError> {
-    let bytes = serde_json::to_vec(binding).map_err(CompositionError::Encoding)?;
-    let parent = path
-        .parent()
-        .ok_or_else(|| CompositionError::Protected("launch file has no parent".to_owned()))?;
-    let file_name = path
-        .file_name()
-        .ok_or_else(|| CompositionError::Protected("launch file name missing".to_owned()))?;
-    let scope = eliot_platform::WorkScopePath::new(file_name.to_string_lossy().into_owned())
-        .map_err(|error| CompositionError::Protected(error.to_string()))?;
-    let platform = eliot_platform_windows::WindowsPlatform::new(parent)
-        .map_err(|error| CompositionError::Protected(error.to_string()))?;
-    // The publish outcome classification is intentionally not trusted here:
-    // the re-read below is the durability proof.
-    let _ = platform.publish_atomic(&scope, &bytes);
-    let fresh = ProtectedPathLease::open_existing_absolute(path)
-        .map_err(|error| CompositionError::Protected(error.to_string()))?;
-    fresh
-        .verify_stable_identity()
-        .and_then(|()| fresh.verify_path_identity())
-        .map_err(|error| CompositionError::Protected(error.to_string()))?;
-    let current = fresh
-        .read_bounded(64 * 1024)
-        .map_err(|error| CompositionError::Protected(error.to_string()))?;
-    Ok(current == bytes)
 }
 
 #[cfg(test)]
@@ -384,32 +259,6 @@ mod tests {
             "policy_revision": null,
             "integration_revision": null,
         })
-    }
-
-    fn test_request_identity() -> RequestIdentity {
-        serde_json::from_value(serde_json::json!({
-            "request": {
-                "metadata": {
-                    "request_id": "v1-historical-request",
-                    "session_id": null,
-                    "task_id": null,
-                    "product_id": "eliot-user-broker",
-                    "source_id": "user-broker-transport",
-                    "state_fence": test_fence(),
-                    "clock": {
-                        "valid_time_ms": 1_786_000_000_000i64,
-                        "known_time_ms": 1_786_000_000_000i64,
-                        "transaction_sequence": null,
-                        "monotonic_ns": null,
-                    },
-                },
-                "state_fence": test_fence(),
-            },
-            "idempotency_key": "v1-historical-idempotency",
-            "deadline_unix_ms": 1,
-            "cancellation_id": "v1-historical-cancellation",
-        }))
-        .expect("test request identity")
     }
 
     fn live_registration() -> RegistrationRequest {
@@ -470,86 +319,29 @@ mod tests {
     }
 
     #[test]
-    fn legacy_v1_bytes_never_parse_as_v2() {
-        let legacy = serde_json::json!({
+    fn unknown_schema_is_refused() {
+        let legacy_shaped = serde_json::json!({
             "registration": live_registration(),
-            "request_identity": test_request_identity(),
+            "request_identity": {
+                "historical": "v1-historical-request",
+            },
             "operator_artifact": {
                 "image_id": "image-test-1",
                 "executable": "C:\\Eliot\\operator.exe",
                 "artifact_digest": "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
             },
         });
-        let bytes = serde_json::to_vec(&legacy).expect("legacy bytes");
-        let parsed = parse_binding_bytes(&bytes);
+        let legacy_bytes = serde_json::to_vec(&legacy_shaped).expect("legacy bytes");
         assert!(
-            parsed.is_err(),
-            "v1 bytes must never be silently read as v2, got {parsed:?}"
+            parse_binding_bytes(&legacy_bytes).is_err(),
+            "legacy-shaped bytes must be refused fail-closed"
         );
-        assert!(looks_like_v1(&bytes));
-        assert!(!looks_like_v1(
-            &serde_json::to_vec(&test_binding()).expect("v2 bytes")
-        ));
-    }
-
-    #[test]
-    fn migration_drops_historical_request_authority() {
-        let legacy = serde_json::json!({
-            "registration": live_registration(),
-            "request_identity": test_request_identity(),
-            "operator_artifact": {
-                "image_id": "image-test-1",
-                "executable": "C:\\Eliot\\operator.exe",
-                "artifact_digest": "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
-            },
-        });
-        let bytes = serde_json::to_vec(&legacy).expect("legacy bytes");
-        let (binding, evidence) = migrate_v1_bytes(&bytes).expect("migration");
-        assert_eq!(binding.schema, LAUNCH_BINDING_SCHEMA);
-        assert_eq!(binding.registration.installation_id, "installation-test-1");
-        assert_eq!(binding.registration.launch_nonce, "launch-nonce-test-1");
-        assert_eq!(binding.launch_authority_fence, test_fence());
-        assert_eq!(evidence.v1_digest, sha256_hex(&bytes));
-        assert!(!evidence.durable_rewrite);
-        // No historical request authority survives in any serialized form.
-        let rebound = serde_json::to_vec(&binding).expect("v2 bytes");
-        let text = String::from_utf8(rebound).expect("utf8");
-        for historical in [
-            "v1-historical-request",
-            "v1-historical-idempotency",
-            "v1-historical-cancellation",
-            "request_identity",
-            "idempotency_key",
-            "cancellation_id",
-            "deadline_unix_ms",
-        ] {
-            assert!(
-                !text.contains(historical),
-                "migrated binding must not carry {historical}"
-            );
-        }
-        let reparsed = parse_binding_bytes(&serde_json::to_vec(&binding).expect("bytes"))
-            .expect("migrated binding reparses as v2");
-        assert_eq!(reparsed, binding);
-    }
-
-    #[test]
-    fn migration_rejects_a_tampered_legacy_file() {
-        let mut registration = live_registration();
-        registration.launch_nonce = String::new();
-        let legacy = serde_json::json!({
-            "registration": registration,
-            "request_identity": test_request_identity(),
-            "operator_artifact": {
-                "image_id": "image-test-1",
-                "executable": "C:\\Eliot\\operator.exe",
-                "artifact_digest": "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
-            },
-        });
-        let bytes = serde_json::to_vec(&legacy).expect("legacy bytes");
+        let mut unknown = test_binding();
+        unknown.schema = "eliot.user-broker.launch-binding.v9".to_owned();
+        let unknown_bytes = serde_json::to_vec(&unknown).expect("v9 bytes");
         assert!(
-            migrate_v1_bytes(&bytes).is_err(),
-            "tampered v1 must fail closed"
+            parse_binding_bytes(&unknown_bytes).is_err(),
+            "unknown schema version must be refused fail-closed"
         );
     }
 
