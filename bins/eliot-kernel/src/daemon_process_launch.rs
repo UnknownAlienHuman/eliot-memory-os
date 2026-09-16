@@ -43,16 +43,76 @@ use super::observe_named_pipe_peer_process;
 use super::stable_owner_principal_digest;
 use super::unix_ms;
 
+/// F-LOG-KERNEL-3 (#901): daemon-launch boundary observations.
+///
+/// Observation only, via #895's facade: fixed `kernel.daemon.*` event names
+/// plus a bounded stable outcome. Never carries executable paths, argument
+/// material, digests, lease references, or owner error strings (I15.4).
+#[cfg(windows)]
+fn observe_daemon_launch(event: &'static str, outcome: &'static str) {
+    use super::kernel_diagnostics::{KERNEL_DIAGNOSTICS_TARGET, bound_field};
+    let event_bound = bound_field(event);
+    let outcome_bound = bound_field(outcome);
+    tracing::info!(
+        target: KERNEL_DIAGNOSTICS_TARGET,
+        event = event_bound.text(),
+        outcome = outcome_bound.text(),
+        "daemon launch observation"
+    );
+}
+
+/// Maps one daemon-launch build failure to its stable diagnostic code.
+///
+/// Only the variant is emitted; any `String` payload is never logged.
+#[cfg(windows)]
+fn daemon_launch_terminal_code(error: &KernelBuildError) -> &'static str {
+    match error {
+        KernelBuildError::Platform(_) => "PLATFORM",
+        KernelBuildError::Transport(_) => "TRANSPORT",
+        KernelBuildError::Runtime(_) => "RUNTIME",
+        KernelBuildError::Ors(_) => "ORS",
+        KernelBuildError::Core(_) => "CORE",
+        KernelBuildError::Service(_) => "SERVICE",
+        KernelBuildError::StoreBootstrapRequired => "STORE_BOOTSTRAP_REQUIRED",
+        KernelBuildError::StoreAlreadyConnected => "STORE_ALREADY_CONNECTED",
+        KernelBuildError::Principal(_) => "PRINCIPAL",
+    }
+}
+
 impl KernelComposition {
     /// Launches the approved `eliotd` through the existing Kernel process
     /// authority.  Store bootstrap must already be connected; the child is
     /// never spawned from a raw command or an ambient environment.
+    ///
+    /// Diagnostic wrapper (F-LOG-KERNEL-3, #901): exactly one terminal is
+    /// emitted per failed launch; the admitted receipt versus the failure
+    /// record stay distinct, and no launch material is logged.
+    #[cfg(windows)]
+    pub async fn launch_eliotd(&self) -> Result<ProcessStartReceipt, KernelBuildError> {
+        observe_daemon_launch("kernel.daemon.launch_requested", "attempt");
+        match self.launch_eliotd_inner().await {
+            Ok(receipt) => {
+                observe_daemon_launch("kernel.daemon.launch_committed", "success");
+                Ok(receipt)
+            }
+            Err(error) => {
+                observe_daemon_launch("kernel.daemon.launch_failed", "rejected");
+                super::kernel_diagnostics::observe_terminal_error(daemon_launch_terminal_code(
+                    &error,
+                ));
+                Err(error)
+            }
+        }
+    }
+
+    /// Admitted-launch sequence; every authority check precedes the single
+    /// process start. See [`KernelComposition::launch_eliotd`].
     #[cfg(windows)]
     #[allow(
         clippy::too_many_lines,
         reason = "the launch admission sequence is intentionally contiguous so every authority check precedes the single process start"
     )]
-    pub async fn launch_eliotd(&self) -> Result<ProcessStartReceipt, KernelBuildError> {
+    async fn launch_eliotd_inner(&self) -> Result<ProcessStartReceipt, KernelBuildError> {
         let launch = self
             .active_daemon_launch()
             .map_err(|error| KernelBuildError::Service(error.to_string()))?
