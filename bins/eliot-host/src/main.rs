@@ -230,6 +230,8 @@ fn console_process_exit_code() -> i32 {
 
 fn main() {
     let _ = PROCESS_BOOTSTRAP.set(parse_process_bootstrap(std::env::args_os().skip(1)));
+    // HOST-0 (issue #889): best-effort diagnostics install; never gates startup.
+    let _ = eliot_host::host_diagnostics::install_host_diagnostics();
     #[cfg(windows)]
     match run_as_scm_service() {
         Ok(true) => return,
@@ -250,6 +252,12 @@ fn main() {
         }
     }
     if !run_console() {
+        // HOST-0 (issue #889): the single reference failure observation.
+        // Diagnostics observe only; capsule, stderr, and exit code below
+        // still own the terminal receipt. Other sites stay for #891/#982.
+        eliot_host::host_diagnostics::observe_terminal_error(
+            eliot_host::host_diagnostics::HOST_TERMINAL_CODE_CONSOLE_FAILED,
+        );
         let cached = captured_bootstrap_snapshot();
         persist_host_start_failure(
             HostStopCode::ConsoleFailed,

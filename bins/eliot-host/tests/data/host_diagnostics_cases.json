@@ -1,0 +1,31 @@
+{
+  "contract": "F-LOG-HOST-0 host structured diagnostics facade",
+  "issue": 889,
+  "target": "eliot_host::diagnostics",
+  "note": "Pins the facade-init, absent Event Log seam, bounded queue/drop, and stdout-ownership proofs exercised by the focused contract tests. The full 22-case matrix (complete inventory, per-identity distinctions, canary sweeps, allowed-diff review) is deferred to the owning follow-ups (#891/#893/#985); real Host-wrapper Event Log delivery smoke on isolated Windows needs #984 and stays an honest residual.",
+  "stages": {
+    "startup": "startup",
+    "launch_config": "launch_config",
+    "scm_dispatch": "scm_dispatch",
+    "console_loop": "console_loop",
+    "shutdown_drain": "shutdown_drain"
+  },
+  "entrypoint_event": "host.entrypoint_stage",
+  "terminal_event": "host.terminal_error",
+  "terminal_codes": {
+    "dispatcher_failed": "dispatcher_failed",
+    "console_failed": "console_failed"
+  },
+  "reference_failure": "console_failed",
+  "max_field_bytes": 256,
+  "max_detail_bytes": 1024,
+  "event_log_sink": "unavailable",
+  "event_log_source": "EliotHost",
+  "event_mappings": {
+    "service_start": { "event_id": 100, "severity": "information" },
+    "service_stop": { "event_id": 101, "severity": "information" },
+    "service_failure": { "event_id": 102, "severity": "error" }
+  },
+  "queue_capacity": 64,
+  "stdout_protocol_contamination": false
+}
