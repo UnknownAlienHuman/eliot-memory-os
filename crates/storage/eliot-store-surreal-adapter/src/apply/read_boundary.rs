@@ -523,13 +523,71 @@ const READ_ERASURE_INTENTS: &str =
 const READ_ALL_ERASURE_OUTCOMES: &str =
     "SELECT VALUE { operation_id: operation_id, outcomes: outcomes } FROM erasure_outcome;";
 
+/// One side of the sealed erasure join: the observed state of one
+/// never-vs-defined erasure table.
+enum ErasureTable<T> {
+    /// The table is defined; carries its decoded sealed rows.
+    Rows(Vec<T>),
+    /// The table was never defined on this pre-erasure store: the exact
+    /// absent-table signal, an empty side of the join.
+    Absent,
+    /// Any other provider error or malformed envelope: the pack must refuse
+    /// fail-closed.
+    Unknown,
+}
+
+/// Reads one sealed erasure table through its closed single-statement SELECT,
+/// never inside `BEGIN TRANSACTION`: a missing table aborts the whole
+/// transaction, so the absent-table signal is only observable outside one.
+/// Live provider observation for the transactional form was
+/// `"The table 'erasure_intent' does not exist"` plus
+/// `"The query was not executed due to a cancelled transaction"` and
+/// `"Cannot COMMIT: the transaction was aborted due to a prior error"` for
+/// the cancelled remainder — which the old `all(is_absent_table)` check
+/// (correctly, but fatally) refused to call absent.
+///
+/// Only the exact absent-table signal naming `table` maps to `Absent`;
+/// every other error class — including those transaction-cancellation
+/// artifacts — maps to `Unknown` so the pack refuses fail-closed instead of
+/// silently including erased records. Transport loss
+/// (`ProviderUnavailable`) likewise maps to `Unknown`; any other transport
+/// error propagates.
+async fn read_erasure_table<T: serde::de::DeserializeOwned>(
+    db: &client::RpcTransport,
+    config: &SurrealAdapterConfig,
+    operation: &'static str,
+    sql: &str,
+    table: &str,
+) -> Result<ErasureTable<T>, AdapterError> {
+    let mut response = match client::query(db, config, operation, sql, Map::new()).await {
+        Ok(response) => response,
+        Err(AdapterError::ProviderUnavailable) => return Ok(ErasureTable::Unknown),
+        Err(error) => return Err(error),
+    };
+    let errors = response.take_errors();
+    if !errors.is_empty() {
+        if errors
+            .iter()
+            .all(|error| client::is_absent_table(error) && error.contains(table))
+        {
+            return Ok(ErasureTable::Absent);
+        }
+        return Ok(ErasureTable::Unknown);
+    }
+    match response.take::<Vec<T>>(0) {
+        Ok(rows) => Ok(ErasureTable::Rows(rows)),
+        Err(_) => Ok(ErasureTable::Unknown),
+    }
+}
+
 /// Reads the sealed erasure-suppression set for `GetEvidencePack`.
 ///
-/// Both closed reads share one snapshot: sealed intent rows plus their sealed
-/// outcome rows, joined in Rust by exact `operation_id`. Only pairs with a
-/// `PURGED` store-owned surface outcome suppress — the reference handler's
-/// evidence-backed `erased_subjects` rule. Absent erasure tables
-/// (never-defined on a pre-erasure store) read as an empty `Known` set,
+/// Sealed intent rows plus their sealed outcome rows, each through its own
+/// closed non-transactional SELECT and joined in Rust by exact
+/// `operation_id`. Only pairs with a `PURGED` store-owned surface outcome
+/// suppress — the reference handler's evidence-backed `erased_subjects`
+/// rule. Never-defined erasure tables on a pre-erasure store observe the
+/// exact absent-table signal and read as the empty side of the join,
 /// matching the reference handler's empty suppression on a fresh store.
 /// Any other provider error or malformed envelope returns `Unknown` so the
 /// pack read refuses fail-closed instead of silently including erased
@@ -538,40 +596,31 @@ async fn read_erasure_suppression(
     db: &client::RpcTransport,
     config: &SurrealAdapterConfig,
 ) -> Result<ErasureSuppression, AdapterError> {
-    let sql = format!("BEGIN TRANSACTION; {READ_ERASURE_INTENTS} {READ_ALL_ERASURE_OUTCOMES} COMMIT TRANSACTION;");
-    let mut response = match client::query(db, config, "read.erasure_suppression", &sql, Map::new()).await {
-        Ok(response) => response,
-        Err(AdapterError::ProviderUnavailable) => return Ok(ErasureSuppression::Unknown),
-        Err(error) => return Err(error),
+    let intents = match read_erasure_table::<ErasureIntentRow>(
+        db,
+        config,
+        "read.erasure_suppression_intents",
+        READ_ERASURE_INTENTS,
+        "erasure_intent",
+    )
+    .await?
+    {
+        ErasureTable::Rows(intents) => intents,
+        ErasureTable::Absent => Vec::new(),
+        ErasureTable::Unknown => return Ok(ErasureSuppression::Unknown),
     };
-    let errors = response.take_errors();
-    if !errors.is_empty() {
-        // Never-defined erasure tables on a pre-erasure store observe
-        // absent-table: an empty `Known` set, matching the reference
-        // handler's empty suppression on a fresh store. A transaction that
-        // mixes one absent table with one present table still reports
-        // absent-table for the missing side: when every error is
-        // absent-table the present side decoded as empty below, so empty
-        // `Known` stays exact. Every other error class stays `Unknown` so
-        // the pack refuses fail-closed.
-        if errors.iter().all(|error| client::is_absent_table(error)) {
-            return Ok(ErasureSuppression::Known(std::collections::BTreeSet::new()));
-        }
-        return Ok(ErasureSuppression::Unknown);
-    }
-    // SurrealDB 3 retains the BEGIN result at index 0 (null). An absent
-    // table inside the transaction decodes as `NONE` at its index, which
-    // `take::<Vec<_>>` reports as a shape error: treat that as the empty
-    // side of the join (still an exact `Known` set), never as `Unknown`.
-    let intents: Vec<ErasureIntentRow> = match response.take(1) {
-        Ok(intents) => intents,
-        Err(AdapterError::Serialization(_)) => Vec::new(),
-        Err(_) => return Ok(ErasureSuppression::Unknown),
-    };
-    let outcomes: Vec<ErasureOutcomeRow> = match response.take(2) {
-        Ok(outcomes) => outcomes,
-        Err(AdapterError::Serialization(_)) => Vec::new(),
-        Err(_) => return Ok(ErasureSuppression::Unknown),
+    let outcomes = match read_erasure_table::<ErasureOutcomeRow>(
+        db,
+        config,
+        "read.erasure_suppression_outcomes",
+        READ_ALL_ERASURE_OUTCOMES,
+        "erasure_outcome",
+    )
+    .await?
+    {
+        ErasureTable::Rows(outcomes) => outcomes,
+        ErasureTable::Absent => Vec::new(),
+        ErasureTable::Unknown => return Ok(ErasureSuppression::Unknown),
     };
     Ok(ErasureSuppression::Known(
         suppressed_pairs(&intents, &outcomes),
