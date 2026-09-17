@@ -262,21 +262,15 @@ fn port_denied(error: &kernel_port::KernelPortError) -> DreamerError {
 /// compilation here until the new class is assigned an owning slice.
 fn refuse_unsupported_job_class(job: &DreamJobInput) -> Result<(), DreamerError> {
     match job.job_class {
-        JobClass::Curation => Err(DreamerError::UnsupportedJobClass(job.job_class)),
-        JobClass::Clarification => Err(DreamerError::UnsupportedJobClass(job.job_class)),
-        JobClass::ArchitectureSelfQuery => {
+        JobClass::Curation
+        | JobClass::Clarification
+        | JobClass::ArchitectureSelfQuery
+        | JobClass::DevelopmentDiagnosis
+        | JobClass::OrchestrationPlanning
+        | JobClass::ConfigurationAssistance => {
             Err(DreamerError::UnsupportedJobClass(job.job_class))
         }
-        JobClass::DevelopmentDiagnosis => Err(DreamerError::UnsupportedJobClass(job.job_class)),
-        JobClass::OrchestrationPlanning => {
-            Err(DreamerError::UnsupportedJobClass(job.job_class))
-        }
-        JobClass::ConfigurationAssistance => {
-            Err(DreamerError::UnsupportedJobClass(job.job_class))
-        }
-        JobClass::Orientation => Ok(()),
-        JobClass::ResearchSynthesis => Ok(()),
-        JobClass::Maintenance => Ok(()),
+        JobClass::Orientation | JobClass::ResearchSynthesis | JobClass::Maintenance => Ok(()),
     }
 }
 
@@ -524,8 +518,13 @@ impl DreamerError {
     pub const fn code(&self) -> &'static str {
         match self {
             Self::KernelAdmissionRequired(_) => KERNEL_ADMISSION_REQUIRED,
-            Self::UnsupportedJobClass(_) => "DREAMER_REQUEST_REJECTED",
-            _ => "DREAMER_REQUEST_REJECTED",
+            Self::InvalidField(_)
+            | Self::LimitExceeded(_)
+            | Self::InvalidAdmission(_)
+            | Self::DuplicateJob(_)
+            | Self::UnknownJob(_)
+            | Self::NotCancellable(_)
+            | Self::UnsupportedJobClass(_) => "DREAMER_REQUEST_REJECTED",
         }
     }
 }
