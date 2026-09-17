@@ -1,7 +1,7 @@
 //! Snapshot-bound configuration change intent (A-42).
 //!
 //! Pure candidate-only deterministic stateless zero-effect owner of exactly
-//! one typed [`ConfigurationChangeIntent`] anchored to an exact immutable
+//! one typed [`ConfigurationChangeCandidate`] anchored to an exact immutable
 //! base snapshot digest with a bounded closed change set, a purely derived
 //! in-memory candidate snapshot digest, complete impact dispositions, and an
 //! inert verifier, rollout, stop, rollback, and Human approval boundary. The
@@ -34,7 +34,7 @@
 //! layer or owner, generic patch shapes, unknown fields, contradictory
 //! operations, mixed layers or owners, raw secrets, forbidden ceiling
 //! widening, incomplete impact, missing verifier or rollback, absent approval)
-//! are inert terminal outcomes carried by [`ConfigurationChangeIntent`],
+//! are inert terminal outcomes carried by [`ConfigurationChangeCandidate`],
 //! never errors that invite a blind retry. Forbidden widening is rejected,
 //! not warned; decision-required work is not ready.
 //!
@@ -665,7 +665,7 @@ pub struct PriorHistory {
 
 /// Complete inert snapshot-bound configuration change intent.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct ConfigurationChangeIntent {
+pub struct ConfigurationChangeCandidate {
     /// Terminal outcome for this intent.
     pub outcome: ConfigurationOutcome,
     /// Stable intent handle for this candidate.
@@ -698,7 +698,7 @@ pub struct ConfigurationChangeIntent {
 
 // ---------------------------------------------------------------------------
 // Typed fail-closed error. Malformed input only; semantic shortfalls stay
-// inert outcomes carried by `ConfigurationChangeIntent`.
+// inert outcomes carried by `ConfigurationChangeCandidate`.
 // ---------------------------------------------------------------------------
 
 /// Typed fail-closed configuration-plan error.
@@ -1555,7 +1555,7 @@ fn emit_candidate(
     policy: &ConfigurationPolicy,
     receipt_digest: &str,
     note: &str,
-) -> Result<ConfigurationChangeIntent, ConfigurationError> {
+) -> Result<ConfigurationChangeCandidate, ConfigurationError> {
     let handle = ["cfg-", &base.snapshot_id].concat();
     check_handle(&handle, "intent.handle")?;
     let preservation = build_preservation()?;
@@ -1577,7 +1577,7 @@ fn emit_candidate(
         policy,
         receipt_digest,
     )?;
-    Ok(ConfigurationChangeIntent {
+    Ok(ConfigurationChangeCandidate {
         outcome,
         intent_handle: handle,
         primary_layer,
@@ -1613,7 +1613,7 @@ fn emit_candidate(
 ///
 /// Returns [`ConfigurationError`] only for malformed, mismatched, over-bound,
 /// or stale inputs. Every semantic shortfall is an inert
-/// [`ConfigurationChangeIntent`] outcome instead.
+/// [`ConfigurationChangeCandidate`] outcome instead.
 #[allow(clippy::too_many_arguments)]
 #[allow(clippy::too_many_lines)]
 pub fn propose_configuration_change(
@@ -1626,7 +1626,7 @@ pub fn propose_configuration_change(
     history: &PriorHistory,
     boundary: &InertBoundary,
     policy: &ConfigurationPolicy,
-) -> Result<ConfigurationChangeIntent, ConfigurationError> {
+) -> Result<ConfigurationChangeCandidate, ConfigurationError> {
     validate_policy_shapes(policy)?;
     validate_anchor_shapes(base)?;
     validate_request_shapes(request)?;
@@ -2194,7 +2194,7 @@ mod tests {
     }
 
     /// Runs the full valid fixture set through the entry point.
-    fn run_valid() -> super::ConfigurationChangeIntent {
+    fn run_valid() -> super::ConfigurationChangeCandidate {
         let job = test_job();
         let draft = test_draft();
         let request = test_request();
