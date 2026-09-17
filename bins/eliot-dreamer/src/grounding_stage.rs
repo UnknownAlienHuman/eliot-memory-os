@@ -4,62 +4,45 @@
 //! against the frozen evidence universe through the #602 owner
 //! ([`ground_draft_with_controls`](eliot_dreamer_claim_grounding::ground_draft_with_controls))
 //! exactly once per admitted job. This module performs no local retrieval,
-//! ranking, or truth promotion: the structured draft and the frozen manifest
-//! arrive Governor-resolved through a source-owner port in a later slice,
-//! and the returned owner [`GroundedDreamDraft`](eliot_dreamer_contracts::grounding::GroundedDreamDraft)
+//! ranking, or truth promotion: the structured draft arrives from the model
+//! stage, the frozen manifest and bundle are derived from the admitted pair
+//! through [`admitted_material`], and the returned owner [`GroundedDreamDraft`](eliot_dreamer_contracts::grounding::GroundedDreamDraft)
 //! is surfaced unmodified so the frozen claim denominator is preserved
 //! losslessly (the denominator arrives with governed material; Dreamer never
 //! selects it, and never synthesizes a frozen universe locally).
 
 use eliot_dreamer_claim_grounding::{GroundingRequest, ground_draft_with_controls};
 use eliot_dreamer_contracts::ContractViolation;
-use eliot_dreamer_contracts::grounding::GroundedDreamDraft;
+use eliot_dreamer_contracts::grounding::{GroundedDreamDraft, ModelDraft};
 
+use crate::admitted_material::{admission_of, bundle_of, grounding_policy, manifest_of};
 use crate::controller::verify_admitted_binding;
 use crate::{DreamJobInput, DreamerError, KernelJobAdmission};
-
-/// Admitted grounding identity for one Dreamer job.
-///
-/// A placeholder until the Governor-resolved draft and frozen manifest arrive
-/// through a source-owner port in a later slice: it carries only the admitted
-/// job identity and the frozen manifest digest it must bind, never assembled
-/// evidence. Resolution refuses rather than filling these handles locally,
-/// because a locally built universe would be self-issued authority.
-///
-/// Constructed by the Governor-material slice once the source-owner port
-/// lands; until then the slice tests pin its identity-only shape.
-#[allow(
-    dead_code,
-    reason = "constructed by the Governor-material slice; tests pin it until then"
-)]
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) struct GroundingInputs {
-    pub job_id: String,
-    pub manifest_digest: String,
-}
 
 /// Resolves the A-14b inputs for one admitted job.
 ///
 /// Fails closed: any invalid/stale admission or identity mismatch refuses here
-/// with zero owner-grounding calls. The Governor-issued structured draft and
-/// frozen evidence universe arrive through a source-owner port in a later
-/// slice; until then resolution refuses rather than synthesizing a frozen
-/// universe locally, because locally assembled evidence would be self-issued
-/// authority.
-///
-/// Called by `submit` once the Governor-material slice lands; until then the
-/// slice tests exercise the fail-closed boundary.
-#[allow(
-    dead_code,
-    reason = "called by submit in the Governor-material slice; tests cover it until then"
-)]
+/// with zero owner-grounding calls, as does any derived binding the owner
+/// rejects. The structured draft arrives from the model stage and is carried
+/// verbatim; the job, bundle, manifest, and policy are derived from the
+/// admitted pair through [`admitted_material`], and the manifest digest is
+/// asserted to equal the bundle's digest before the request is built, so a
+/// drifted frozen universe can never reach the owner.
 pub(crate) fn resolve_grounding_inputs(
     admission: &KernelJobAdmission,
     job: &DreamJobInput,
-) -> Result<GroundingInputs, DreamerError> {
+    draft: ModelDraft,
+) -> Result<GroundingRequest, DreamerError> {
     verify_admitted_binding(admission, job)?;
-    Err(DreamerError::InvalidAdmission(
-        "admitted grounding inputs require Governor-resolved draft and manifest",
+    let admitted = admission_of(admission, job)?;
+    let bundle = bundle_of(admission, job)?;
+    let manifest = manifest_of(&bundle)?;
+    if manifest.digest != bundle.manifest_digest {
+        return Err(DreamerError::InvalidAdmission("manifest binding drift"));
+    }
+    let policy = grounding_policy();
+    Ok(GroundingRequest::new(
+        admitted, bundle, manifest, draft, policy,
     ))
 }
 
@@ -80,12 +63,12 @@ pub(crate) fn ground_admitted_draft_with(
 
 /// Production entry: the real A-14b grounding, once per admission.
 ///
-/// Unwired until the Governor-material slice lands: `submit` cannot supply a
-/// [`GroundingRequest`] yet, so the entry is exercised by the slice tests
-/// below. Remove the allowance once the pipeline calls this entry.
+/// Unwired until the pipeline threads the model draft through; `submit`
+/// cannot supply a [`ModelDraft`] yet, so the entry is exercised by the slice
+/// tests below. Remove the allowance once the pipeline calls this entry.
 #[allow(
     dead_code,
-    reason = "wired by the Governor-material slice; tests cover it until then"
+    reason = "wired once the pipeline threads the model draft; tests cover it until then"
 )]
 pub(crate) fn ground_admitted_draft(
     request: GroundingRequest,
@@ -129,6 +112,7 @@ fn grounding_denied(error: &ContractViolation) -> DreamerError {
 
 #[cfg(test)]
 mod slice_5_grounding_tests {
+    use crate::admitted_material as governed;
     use super::*;
     use std::collections::{BTreeMap, BTreeSet};
     use std::num::NonZeroU64;
@@ -138,7 +122,8 @@ mod slice_5_grounding_tests {
     use eliot_dreamer_claim_grounding::ground_draft_with_controls;
     use eliot_dreamer_contracts::grounding::{
         AllowedReferenceManifest, AttemptIdentity, GROUNDING_SCHEMA_VERSION, GroundingPolicy,
-        ModelDraft, RouteIdentity,
+        ModelDraft, RouteIdentity, budget_digest, bundle_digest, requester_digest,
+        route_fingerprint,
     };
     use eliot_dreamer_contracts::{
         BudgetLimits, BundleCompleteness, DreamInputBundle, DreamJobAdmission, JobClass, Requester,
@@ -200,6 +185,124 @@ mod slice_5_grounding_tests {
         }
     }
 
+    /// A draft that is never validated: resolution fails at the binding check
+    /// before the draft is touched, so stale/switched inputs need only a
+    /// well-formed value, never governed material.
+    fn dummy_draft() -> ModelDraft {
+        let Ok(task_id) = TaskId::new("task-slice-5") else {
+            panic!("test task identity must construct");
+        };
+        ModelDraft {
+            schema_version: GROUNDING_SCHEMA_VERSION,
+            job_id: "job-slice-5".to_owned(),
+            task_id,
+            scope_id: "scope-slice-5".to_owned(),
+            state_fence: fence(),
+            job: grounding_job(),
+            bundle: grounding_bundle(),
+            raw_output_digest: "0".repeat(64),
+            requester_digest: "0".repeat(64),
+            attempt: AttemptIdentity {
+                attempt_id: "attempt-slice-5".to_owned(),
+                attempt_number: 1,
+                maximum_attempts: 2,
+            },
+            route: RouteIdentity {
+                provider: "provider-slice-5".to_owned(),
+                model: "model-slice-5".to_owned(),
+                route_revision: "r1".to_owned(),
+                fingerprint: "0".repeat(64),
+            },
+            budget_digest: "0".repeat(64),
+            bundle_digest: "0".repeat(64),
+            input_manifest_digest: "0".repeat(64),
+            claims: Vec::new(),
+            non_material_claims: Vec::new(),
+            screen: None,
+            draft_digest: "0".repeat(64),
+        }
+    }
+
+    /// Builds the governed inline draft for a valid admission: the admitted
+    /// job and bundle verbatim, empty claims, the admitted route with its
+    /// owner fingerprint, owner-computed digests, and the owner preimage
+    /// digest. Mirrors the model stage derivation so the test proves what the
+    /// pipeline will carry, not a second implementation.
+    fn governed_draft(admission: &KernelJobAdmission, job: &DreamJobInput) -> ModelDraft {
+        let Ok(admitted) = governed::admission_of(admission, job) else {
+            panic!("test admission must derive");
+        };
+        let Ok(bundle) = governed::bundle_of(admission, job) else {
+            panic!("test bundle must derive");
+        };
+        let Ok(task_id) = TaskId::new(admitted.task_id.clone()) else {
+            panic!("test task identity must construct");
+        };
+        let Some(route_text) = job.allowed_model_routes.first() else {
+            panic!("test route must be admitted");
+        };
+        let Some(attempt_cap) = admitted.budget.attempts else {
+            panic!("test attempts budget must be explicit");
+        };
+        let Ok(maximum_attempts) = u32::try_from(attempt_cap) else {
+            panic!("test attempts budget must fit the owner counter");
+        };
+        let mut route = RouteIdentity {
+            provider: route_text.clone(),
+            model: route_text.clone(),
+            route_revision: "r1".to_owned(),
+            fingerprint: String::new(),
+        };
+        let Ok(fingerprint) = route_fingerprint(&route) else {
+            panic!("test route fingerprint must compute");
+        };
+        route.fingerprint = fingerprint;
+        let canonical_id = admitted.canonical_id();
+        let Ok(requester) = requester_digest(&admitted) else {
+            panic!("test requester digest must compute");
+        };
+        let Ok(budget) = budget_digest(&admitted) else {
+            panic!("test budget digest must compute");
+        };
+        let Ok(bundle_sum) = bundle_digest(&bundle) else {
+            panic!("test bundle digest must compute");
+        };
+        let mut draft = ModelDraft {
+            schema_version: GROUNDING_SCHEMA_VERSION,
+            job_id: canonical_id.clone(),
+            task_id,
+            scope_id: admitted.scope_id.clone(),
+            state_fence: admitted.state_fence.clone(),
+            job: admitted.clone(),
+            bundle: bundle.clone(),
+            raw_output_digest: governed::sha_hex(&[
+                canonical_id.as_str(),
+                job.exact_question.as_str(),
+                admitted.scope_id.as_str(),
+                admission.request_id.as_str(),
+            ]),
+            requester_digest: requester,
+            attempt: AttemptIdentity {
+                attempt_id: admission.attempt_id.clone(),
+                attempt_number: 1,
+                maximum_attempts,
+            },
+            route,
+            budget_digest: budget,
+            bundle_digest: bundle_sum,
+            input_manifest_digest: admitted.frozen_manifest_digest.clone(),
+            claims: Vec::new(),
+            non_material_claims: Vec::new(),
+            screen: None,
+            draft_digest: "0".repeat(64),
+        };
+        let Ok(computed) = draft.computed_digest() else {
+            panic!("test draft digest must compute");
+        };
+        draft.draft_digest = computed;
+        draft
+    }
+
     /// Stale Kernel input fails closed at resolution with zero grounding
     /// calls: resolution precedes grounding, so there is no grounding to
     /// count — the refusal itself is the proof, and it carries the
@@ -208,7 +311,7 @@ mod slice_5_grounding_tests {
     fn stale_admission_fails_closed_before_any_grounding() {
         let admission = admission_with_deadline(1);
         let job = job_for(&admission);
-        let refused = resolve_grounding_inputs(&admission, &job);
+        let refused = resolve_grounding_inputs(&admission, &job, dummy_draft());
         assert!(
             matches!(
                 refused,
@@ -225,45 +328,76 @@ mod slice_5_grounding_tests {
         let admission = admission_with_deadline(u64::MAX);
         let mut job = job_for(&admission);
         job.job_id = "caller-switched-job".to_owned();
-        let refused = resolve_grounding_inputs(&admission, &job);
+        let refused = resolve_grounding_inputs(&admission, &job, dummy_draft());
         assert_eq!(
             refused.map_err(|error| error.code()),
             Err(KERNEL_ADMISSION_REQUIRED)
         );
     }
 
-    /// A valid admission with matching identity reaches the material
-    /// boundary: the refusal names the missing Governor-resolved draft and
-    /// manifest instead of synthesizing a frozen universe locally (no
-    /// self-issued authority).
+    /// A valid admission with matching identity and one evidence handle
+    /// grounds successfully through the real owner: resolution carries the
+    /// governed material, the owner proves it, and the grounded draft binds
+    /// the admitted canonical identity with the frozen manifest digest.
     #[test]
-    fn valid_admission_waits_for_governed_material() {
+    fn valid_admission_grounds_successfully() {
         let admission = admission_with_deadline(u64::MAX);
-        let job = job_for(&admission);
-        let refused = resolve_grounding_inputs(&admission, &job);
-        assert!(
-            matches!(
-                refused,
-                Err(DreamerError::InvalidAdmission(
-                    "admitted grounding inputs require Governor-resolved draft and manifest"
-                ))
-            ),
-            "valid input must wait for governed material, got {refused:?}"
+        let mut job = job_for(&admission);
+        job.evidence_handles.push("evidence-slice-5".to_owned());
+        let draft = governed_draft(&admission, &job);
+        let Ok(request) = resolve_grounding_inputs(&admission, &job, draft) else {
+            panic!("valid admission must resolve governed material");
+        };
+        assert_eq!(
+            request.bundle.materials.len(),
+            1,
+            "the admitted evidence handle must be carried"
+        );
+        assert_eq!(
+            request.bundle.materials[0].handle, "evidence-slice-5",
+            "the carried material must keep the admitted handle verbatim"
+        );
+        let Ok(grounded) = ground_admitted_draft(request) else {
+            panic!("governed material must ground through the real owner");
+        };
+        let Ok(admitted) = governed::admission_of(&admission, &job) else {
+            panic!("test admission must derive");
+        };
+        assert_eq!(
+            grounded.job_id,
+            admitted.canonical_id(),
+            "the grounded draft must bind the admitted canonical identity"
+        );
+        assert_eq!(
+            grounded.manifest_digest, admitted.frozen_manifest_digest,
+            "the grounded draft must bind the frozen manifest digest"
         );
     }
 
-    /// The admitted grounding handle carries identity only: the job it binds
-    /// and the frozen manifest digest it must match. No assembled evidence
-    /// travels here, so resolution output cannot become a locally synthesized
-    /// universe behind the Governor's back.
+    /// The derived bundle and the rebuilt frozen manifest agree: the manifest
+    /// digest equals the bundle's manifest digest, and both pass the real
+    /// owner validation, so the frozen universe cannot drift between stages.
     #[test]
-    fn grounding_inputs_hold_identity_only() {
-        let inputs = GroundingInputs {
-            job_id: "job-slice-5".to_owned(),
-            manifest_digest: "manifest-slice-5".to_owned(),
+    fn manifest_bundle_digest_agreement() {
+        let admission = admission_with_deadline(u64::MAX);
+        let mut job = job_for(&admission);
+        job.evidence_handles.push("evidence-slice-5".to_owned());
+        let Ok(bundle) = governed::bundle_of(&admission, &job) else {
+            panic!("test bundle must derive");
         };
-        assert_eq!(inputs.job_id, "job-slice-5");
-        assert_eq!(inputs.manifest_digest, "manifest-slice-5");
+        let Ok(()) = bundle.validate() else {
+            panic!("derived bundle must satisfy the real owner validation");
+        };
+        let Ok(manifest) = governed::manifest_of(&bundle) else {
+            panic!("test manifest must derive");
+        };
+        let Ok(()) = manifest.validate() else {
+            panic!("derived manifest must satisfy the real owner validation");
+        };
+        assert_eq!(
+            manifest.digest, bundle.manifest_digest,
+            "manifest digest must equal the bundle manifest digest"
+        );
     }
 
     fn grounding_job() -> DreamJobAdmission {

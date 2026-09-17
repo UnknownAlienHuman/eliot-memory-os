@@ -14,7 +14,7 @@ use thiserror::Error;
 
 use crate::KERNEL_ADMISSION_REQUIRED;
 
-#[derive(Debug, Error)]
+#[derive(Debug, Error, PartialEq)]
 pub enum DreamerError {
     #[error("invalid field: {0}")]
     InvalidField(&'static str),

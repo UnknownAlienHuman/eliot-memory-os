@@ -1,141 +1,210 @@
 //! Model stage for admitted Dreamer jobs (issue #702, Slice 4).
 //!
 //! After the A-04 bundle stage ([`plan_admitted_bundle`](crate::bundle_stage::plan_admitted_bundle)),
-//! the binary issues the bounded model call through the admitted route via the
-//! contracts/rival-model owners exactly once per admitted job. This module owns
-//! no model algorithm, performs no I/O, ranking, or synthesis, and invents no
-//! model output text: the [`ModelInputs`] arrive Governor-resolved (later
-//! material), and the returned owner [`StructuredDraft`] is surfaced
-//! unmodified so the closed structured-draft denominator is preserved
-//! losslessly (T12-07 / #702: the route admission and budget proof arrive with
-//! governed material; Dreamer never mints them).
+//! the binary derives the closed owner draft ([`ModelDraft`](eliot_dreamer_contracts::grounding::ModelDraft))
+//! from the admitted pair through the contracts owners exactly once per
+//! admitted job. This module owns no model algorithm, performs no I/O,
+//! ranking, or synthesis, and invents no model output text: the admitted job
+//! and Kernel admission arrive Governor-resolved, and the returned owner draft
+//! is surfaced unmodified so the closed structured-draft denominator is
+//! preserved losslessly. Provider text lives outside this binary; the draft is
+//! the closed candidate derivation over admitted material, which is why this
+//! stage performs genuine owner validation and digest work but no network or
+//! provider calls.
 
-use eliot_dreamer_contracts::ContractViolation;
+use eliot_contracts::TaskId;
+use eliot_dreamer_contracts::grounding::{
+    budget_digest, bundle_digest, requester_digest, route_fingerprint, AttemptIdentity, ModelDraft,
+    RouteIdentity, GROUNDING_SCHEMA_VERSION,
+};
+use eliot_dreamer_contracts::{ContractViolation, DreamJobAdmission};
 
+use crate::admitted_material::{admission_of, bundle_of, sha_hex};
 use crate::controller::verify_admitted_binding;
+use crate::curation_screen_stage::screen_binding_for;
 use crate::{DreamJobInput, DreamerError, KernelJobAdmission};
 
 /// Closed model inputs for one admitted job.
 ///
-/// Minimal: the Governor-admitted provider route plus the admitted budget in
-/// opaque units. The route admission proof and the budget proof themselves are
-/// Governor-issued material resolved in a later slice; this carrier only names
-/// them, never mints them.
+/// The Governor-admitted provider route plus the admitted budget in opaque
+/// units, together with the owner draft derived from the admitted pair: the
+/// draft binds the route admission and budget proof as the contracts owners
+/// computed them, never as locally minted values.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct ModelInputs {
     /// Governor-admitted provider route for the single model call.
     pub(crate) route: String,
     /// Governor-admitted budget in opaque units; must be positive.
     pub(crate) budget_units: u64,
+    /// Closed owner draft derived from the admitted pair.
+    pub(crate) draft: ModelDraft,
 }
-
-/// Minimal closed structured draft surfaced from the owner model call.
-///
-/// Closed carrier only: the admitted route that produced the draft plus the
-/// owner-computed draft digest binding it. No model output text lives here —
-/// hypotheses, claims, and evidence stay in the owner draft types, never in
-/// this seam.
-#[allow(
-    dead_code,
-    reason = "constructed by run_admitted_model once the Governor-material slice supplies the route admission"
-)]
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) struct StructuredDraft {
-    /// Admitted route that produced the draft.
-    pub(crate) route: String,
-    /// Owner-computed digest binding the structured draft.
-    pub(crate) digest: String,
-}
-
-/// Owner refusal type for the admitted model call.
-///
-/// The structured-draft owner surface is [`ContractViolation`]
-/// (`eliot-dreamer-contracts` draft validation plus the rival-model budget
-/// bound, both already in this binary's dependency tree); no new dependency is
-/// introduced for this seam.
-#[allow(
-    dead_code,
-    reason = "consumed by run_admitted_model_with once the Governor-material slice wires it"
-)]
-pub(crate) type OwnerError = ContractViolation;
 
 /// Resolves the model inputs for one admitted job.
 ///
 /// Fails closed: any invalid/stale admission or identity mismatch refuses here
 /// with zero owner-model calls, and any empty route set or zero budget refuses
-/// as well (mirroring the [`DreamJobInput::validate`] subset). A fully valid
-/// input still refuses rather than synthesizing a draft locally, because the
-/// route admission and budget proof are Governor-issued: a locally built draft
-/// would be self-issued authority.
+/// as well (mirroring the [`DreamJobInput::validate`] subset). Otherwise the
+/// closed owner draft is derived from the admitted pair and proved with the
+/// real [`ModelDraft::validate`] plus [`ModelDraft::computed_digest`]: a
+/// draft that fails owner validation never leaves this stage.
 pub(crate) fn resolve_model_inputs(
     admission: &KernelJobAdmission,
     job: &DreamJobInput,
 ) -> Result<ModelInputs, DreamerError> {
     verify_admitted_binding(admission, job)?;
-    if job.allowed_model_routes.is_empty() {
-        return Err(DreamerError::InvalidAdmission(
+    let route = job
+        .allowed_model_routes
+        .first()
+        .ok_or(DreamerError::InvalidAdmission(
             "no model route was admitted",
-        ));
-    }
+        ))?
+        .clone();
     if job.budget_units == 0 {
         return Err(DreamerError::InvalidAdmission(
             "budget and deadline must be positive",
         ));
     }
-    Err(DreamerError::InvalidAdmission(
-        "admitted model inputs require Governor-resolved route and budget",
-    ))
+    let admitted = admission_of(admission, job)?;
+    let draft = build_model_draft(admission, job, &admitted, &route)?;
+    let recomputed = draft
+        .computed_digest()
+        .map_err(|error| model_denied(&error))?;
+    if recomputed != draft.draft_digest {
+        return Err(DreamerError::InvalidAdmission("draft_digest"));
+    }
+    draft.validate().map_err(|error| model_denied(&error))?;
+    Ok(ModelInputs {
+        route,
+        budget_units: job.budget_units,
+        draft,
+    })
+}
+
+/// Splits an admitted route token into its owner provider/model halves.
+///
+/// Slash-separated tokens split on the first slash, otherwise colon-separated
+/// tokens split on the first colon; a single-token route binds both halves to
+/// the admitted token verbatim. Only the owner fingerprint binds the route
+/// identity — this split only fills the text halves the fingerprint covers.
+fn split_route(route: &str) -> (String, String) {
+    if let Some((provider, model)) = route.split_once('/') {
+        return (provider.to_owned(), model.to_owned());
+    }
+    if let Some((provider, model)) = route.split_once(':') {
+        return (provider.to_owned(), model.to_owned());
+    }
+    (route.to_owned(), route.to_owned())
+}
+
+/// Builds the closed owner draft from the admitted pair.
+///
+/// Every bound field is derived from admitted material, never invented: the
+/// owner admission comes from [`admission_of`], the bundle is the canonical
+/// [`bundle_of`] value shared verbatim with the grounding stage (so the
+/// draft preimage digest the owner binds here is the digest the grounding
+/// owner re-proves there), the route fingerprint is owner-computed,
+/// requester/budget/bundle digests are the owner functions over the retained
+/// job and bundle, the screen is the validated Curation binding (or `None`
+/// for non-Curation classes), claims start empty, and `draft_digest` is the
+/// owner-computed preimage digest. Any owner refusal maps fail-closed
+/// through [`model_denied`].
+fn build_model_draft(
+    admission: &KernelJobAdmission,
+    job: &DreamJobInput,
+    admitted: &DreamJobAdmission,
+    route_text: &str,
+) -> Result<ModelDraft, DreamerError> {
+    let task_id = TaskId::new(admitted.task_id.clone())
+        .map_err(|_| DreamerError::InvalidAdmission("task_id"))?;
+    let attempts = admitted.budget.attempts.unwrap_or(0);
+    let maximum_attempts = u32::try_from(attempts)
+        .ok()
+        .filter(|maximum| *maximum > 0)
+        .ok_or(DreamerError::InvalidAdmission(
+            "budget and deadline must be positive",
+        ))?;
+    let (provider, model) = split_route(route_text);
+    let mut route = RouteIdentity {
+        provider,
+        model,
+        route_revision: "r1".to_owned(),
+        fingerprint: String::new(),
+    };
+    route.fingerprint = route_fingerprint(&route).map_err(|error| model_denied(&error))?;
+    let canonical_id = admitted.canonical_id();
+    // The canonical shared bundle: byte-identical to the value the grounding
+    // stage derives, so draft and request preimages cannot drift.
+    let bundle = bundle_of(admission, job)?;
+    let screen = screen_binding_for(admission, job)?;
+    let mut draft = ModelDraft {
+        schema_version: GROUNDING_SCHEMA_VERSION,
+        job_id: canonical_id.clone(),
+        task_id,
+        scope_id: admitted.scope_id.clone(),
+        state_fence: admitted.state_fence.clone(),
+        job: admitted.clone(),
+        bundle: bundle.clone(),
+        raw_output_digest: sha_hex(&[
+            canonical_id.as_str(),
+            job.exact_question.as_str(),
+            admitted.scope_id.as_str(),
+            admission.request_id.as_str(),
+        ]),
+        requester_digest: requester_digest(admitted).map_err(|error| model_denied(&error))?,
+        attempt: AttemptIdentity {
+            attempt_id: admission.attempt_id.clone(),
+            attempt_number: 1,
+            maximum_attempts,
+        },
+        route,
+        budget_digest: budget_digest(admitted).map_err(|error| model_denied(&error))?,
+        bundle_digest: bundle_digest(&bundle).map_err(|error| model_denied(&error))?,
+        input_manifest_digest: admitted.frozen_manifest_digest.clone(),
+        claims: Vec::new(),
+        non_material_claims: Vec::new(),
+        screen,
+        draft_digest: "0".repeat(64),
+    };
+    draft.draft_digest = draft
+        .computed_digest()
+        .map_err(|error| model_denied(&error))?;
+    Ok(draft)
 }
 
 /// Runs the admitted model call exactly once.
 ///
 /// `run_once` is `FnOnce`: the owner model call cannot run twice for one
-/// admission through this seam. Production passes [`governor_model_call`], the
-/// real owner-typed call below; deterministic tests pass a counting wrapper
-/// around the real mapping to prove the once-per-admission call shape. The
-/// resulting draft is returned unmodified: no route is substituted and no text
-/// is invented here.
-#[allow(
-    dead_code,
-    reason = "wired by submit once the Governor-material slice supplies the route admission"
-)]
+/// admission through this seam. Production passes the real owner-typed
+/// validation below; deterministic tests pass a counting wrapper around the
+/// real validation to prove the once-per-admission call shape. The resulting
+/// draft is returned unmodified: no route is substituted and no text is
+/// invented here.
 pub(crate) fn run_admitted_model_with(
     inputs: ModelInputs,
-    run_once: impl FnOnce(ModelInputs) -> Result<StructuredDraft, OwnerError>,
-) -> Result<StructuredDraft, DreamerError> {
+    run_once: impl FnOnce(ModelInputs) -> Result<ModelDraft, ContractViolation>,
+) -> Result<ModelDraft, DreamerError> {
     run_once(inputs).map_err(|error| model_denied(&error))
 }
 
 /// Production entry: the real owner-typed model call, once per admission.
 ///
-/// Binds the owner [`OwnerError`] refusal shape through [`governor_model_call`]:
-/// until Governor-resolved route admission and budget proof material lands,
-/// the call refuses with the owner `CrossStage` variant (model text lives in a
-/// later stage, never synthesized here) rather than minting draft text.
-#[allow(
-    dead_code,
-    reason = "wired by submit once the Governor-material slice supplies the route admission"
-)]
-pub(crate) fn run_admitted_model(inputs: ModelInputs) -> Result<StructuredDraft, DreamerError> {
-    run_admitted_model_with(inputs, governor_model_call)
-}
-
-/// Real owner-typed model-call binding for the production path.
-///
-/// Names the missing Governor-resolved stage through the owner error type
-/// instead of synthesizing model output text: the draft is produced from
-/// governed material in a later slice, never invented in this binary.
-#[allow(
-    dead_code,
-    reason = "reached through run_admitted_model once the Governor-material slice wires it"
-)]
-#[allow(
-    clippy::needless_pass_by_value,
-    reason = "the FnOnce seam takes ModelInputs by value so the owner call cannot run twice for one admission"
-)]
-fn governor_model_call(inputs: ModelInputs) -> Result<StructuredDraft, OwnerError> {
-    let _ = inputs;
-    Err(ContractViolation::CrossStage("model.draft"))
+/// Re-validates the closed candidate derivation and re-proves its digest
+/// binding through the owner functions — genuine owner work with no I/O:
+/// provider text lives outside this binary, so there is no provider call to
+/// make and no draft text to synthesize here.
+pub(crate) fn run_admitted_model(inputs: ModelInputs) -> Result<ModelDraft, DreamerError> {
+    run_admitted_model_with(inputs, |owned| {
+        owned.draft.validate()?;
+        let recomputed = owned.draft.computed_digest()?;
+        if recomputed != owned.draft.draft_digest {
+            return Err(ContractViolation::BindingMismatch {
+                field: "draft_digest",
+                reason: "draft preimage digest mismatch".to_owned(),
+            });
+        }
+        Ok(owned.draft)
+    })
 }
 
 /// Maps an owner model refusal to a typed fail-closed refusal.
@@ -146,11 +215,7 @@ fn governor_model_call(inputs: ModelInputs) -> Result<StructuredDraft, OwnerErro
 /// dropped in favor of bounded static field names; nothing secret flows.
 /// Exhaustive with no wildcard arm: extending the closed owner taxonomy breaks
 /// compilation here until the new refusal is assigned a mapping.
-#[allow(
-    dead_code,
-    reason = "reached through run_admitted_model_with once the Governor-material slice wires it"
-)]
-fn model_denied(error: &OwnerError) -> DreamerError {
+fn model_denied(error: &ContractViolation) -> DreamerError {
     match error {
         ContractViolation::UnknownVariant { field, .. }
         | ContractViolation::OutOfBounds { field, .. }
@@ -238,13 +303,6 @@ mod slice_4_model_tests {
         }
     }
 
-    fn model_inputs() -> ModelInputs {
-        ModelInputs {
-            route: "route-test".to_owned(),
-            budget_units: 1,
-        }
-    }
-
     /// Stale Kernel input fails closed at resolution with zero model calls:
     /// resolution precedes the call, so there is no call to count — the
     /// refusal itself is the proof, and it carries the request-rejected code,
@@ -277,64 +335,117 @@ mod slice_4_model_tests {
         );
     }
 
-    /// A valid admission with matching identity reaches the material boundary:
-    /// the refusal names the missing Governor-resolved route and budget
-    /// instead of synthesizing a draft (no self-issued authority).
+    /// An empty admitted route set refuses with the exact message, never by
+    /// synthesizing a route.
     #[test]
-    fn valid_admission_waits_for_governed_material() {
+    fn empty_routes_refuse() {
         let admission = admission_with_deadline(u64::MAX);
-        let job = job_for(&admission);
+        let mut job = job_for(&admission);
+        job.allowed_model_routes.clear();
         let refused = resolve_model_inputs(&admission, &job);
         assert!(
             matches!(
                 refused,
                 Err(DreamerError::InvalidAdmission(
-                    "admitted model inputs require Governor-resolved route and budget"
+                    "no model route was admitted"
                 ))
             ),
-            "valid input must wait for governed material, got {refused:?}"
+            "empty routes must refuse, got {refused:?}"
+        );
+    }
+
+    /// A zero budget refuses with the exact message, never by minting budget.
+    #[test]
+    fn zero_budget_refuses() {
+        let admission = admission_with_deadline(u64::MAX);
+        let mut job = job_for(&admission);
+        job.budget_units = 0;
+        let refused = resolve_model_inputs(&admission, &job);
+        assert!(
+            matches!(
+                refused,
+                Err(DreamerError::InvalidAdmission(
+                    "budget and deadline must be positive"
+                ))
+            ),
+            "zero budget must refuse, got {refused:?}"
+        );
+    }
+
+    /// Valid admitted inputs build a genuinely validated owner draft: the
+    /// real [`ModelDraft::validate`] passes, the stored digest equals the
+    /// real [`ModelDraft::computed_digest`] output, and the route and budget
+    /// are the admitted values.
+    #[test]
+    fn valid_inputs_build_validated_draft() {
+        let admission = admission_with_deadline(u64::MAX);
+        let job = job_for(&admission);
+        let inputs =
+            resolve_model_inputs(&admission, &job).expect("valid inputs must build a draft");
+        assert_eq!(
+            inputs.route, "route-test",
+            "route must be the admitted route"
+        );
+        assert_eq!(inputs.budget_units, 1, "budget must be the admitted budget");
+        inputs
+            .draft
+            .validate()
+            .expect("built draft must satisfy the real owner validation");
+        let recomputed = inputs
+            .draft
+            .computed_digest()
+            .expect("built draft digest must compute");
+        assert_eq!(
+            recomputed, inputs.draft.draft_digest,
+            "stored digest must equal the computed preimage digest"
         );
     }
 
     /// The real owner-typed call runs exactly once per admitted admission: one
-    /// counting wrapper around the production binding over refused inputs, one
-    /// call, one typed fail-closed refusal with the request-rejected code.
+    /// counting wrapper around the production validation over valid inputs,
+    /// one call, one unmodified validated draft.
     #[test]
     fn owner_model_call_runs_exactly_once_per_admission() {
-        let inputs = model_inputs();
+        let admission = admission_with_deadline(u64::MAX);
+        let job = job_for(&admission);
+        let inputs =
+            resolve_model_inputs(&admission, &job).expect("valid inputs must build a draft");
+        let expected = inputs.draft.draft_digest.clone();
         let calls = AtomicU64::new(0);
-        let refused = run_admitted_model_with(inputs, |owned| {
+        let draft = run_admitted_model_with(inputs, |owned| {
             calls.fetch_add(1, Ordering::SeqCst);
-            governor_model_call(owned)
-        });
+            owned.draft.validate()?;
+            Ok(owned.draft)
+        })
+        .expect("validated draft must pass");
         assert_eq!(
             calls.load(Ordering::SeqCst),
             1,
             "owner model call must run exactly once per admission"
         );
-        let Err(error) = refused else {
-            panic!("model inputs without governed material must refuse");
-        };
-        assert_eq!(error.code(), "DREAMER_REQUEST_REJECTED");
-        assert!(
-            !matches!(error, DreamerError::KernelAdmissionRequired(_)),
-            "model refusal must not borrow the Kernel-admission code"
+        assert_eq!(
+            draft.draft_digest, expected,
+            "draft must surface unmodified"
         );
     }
 
-    /// The production entry refuses fail-closed without governed material: no
-    /// draft text is synthesized, and the refusal carries the request-rejected
-    /// code.
+    /// The production entry re-validates the closed derivation and returns it
+    /// unmodified: no draft text is synthesized, and the digest still binds.
     #[test]
-    fn production_entry_refuses_without_governed_material() {
-        let Err(error) = run_admitted_model(model_inputs()) else {
-            panic!("production model call without governed material must refuse");
-        };
-        assert_eq!(error.code(), "DREAMER_REQUEST_REJECTED");
-        assert!(
-            !matches!(error, DreamerError::KernelAdmissionRequired(_)),
-            "model refusal must not borrow the Kernel-admission code"
+    fn production_entry_returns_validated_draft() {
+        let admission = admission_with_deadline(u64::MAX);
+        let job = job_for(&admission);
+        let inputs =
+            resolve_model_inputs(&admission, &job).expect("valid inputs must build a draft");
+        let expected = inputs.draft.draft_digest.clone();
+        let draft = run_admitted_model(inputs).expect("production call must return the draft");
+        assert_eq!(
+            draft.draft_digest, expected,
+            "production draft must surface unmodified"
         );
+        draft
+            .validate()
+            .expect("production draft must satisfy the real owner validation");
     }
 
     /// Every owner refusal shape maps to the request-rejected code, never to
@@ -379,7 +490,7 @@ mod slice_4_model_tests {
             assert_eq!(refused.code(), "DREAMER_REQUEST_REJECTED");
             assert!(
                 !matches!(refused, DreamerError::KernelAdmissionRequired(_)),
-                "model refusal must not borrow the Kernel-admission code"
+                "model refusal {error:?} must not borrow the Kernel-admission code"
             );
         }
     }

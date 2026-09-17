@@ -1,19 +1,29 @@
 #![forbid(unsafe_code)]
 
-//! Result projection and JSONL stdout for decided Dreamer jobs (issue #702, Slice 8).
+//! Result projection and JSONL receipt for decided Dreamer jobs (issue #702, Slice 8).
 //!
 //! After native owner dispatch decides an admitted job, this stage forms the
-//! terminal [`JobView`] and renders it as exactly one JSONL line on stdout.
-//! The projection is a thin wrapper preserving the
+//! terminal [`JobView`] and renders it as exactly one JSONL line. The
+//! projection is a thin wrapper preserving the
 //! [`project_claimed_view`](crate::project_claimed_view) exactness contract:
 //! the job id is carried verbatim, every lifecycle state keeps its exact
 //! identity (including `Partial`, `Failed`, and `Reconciling`), and a `None`
 //! result is honest absence of a proved payload, never promoted to success.
 //!
-//! Channel split: stdout carries exactly one JSONL object per view via
-//! [`emit_jsonl_stdout`] (the shared stdout lock); human and log diagnostics go
-//! to stderr via `eprintln!` at call sites, never to stdout. No process is
-//! launched and no file is written here.
+//! Terminal channel split: stdout carries exactly one JSONL object per view
+//! (the shared stdout lock); human and log diagnostics go to stderr via
+//! `eprintln!` at call sites, never to stdout, so a log line can never be
+//! mistaken for a receipt. On failure stdout carries nothing and the refusal
+//! is reported on stderr with exit 78. No process is launched and no file is
+//! written here.
+//!
+//! Binary-edge note: these items are `pub(crate)`, so the `eliot-dreamer`
+//! binary target cannot name them through the `eliot_dreamer` lib crate.
+//! Until `lib.rs` (manager-owned) re-exports this seam, `main.rs` performs
+//! the same split directly with `serde_json` — [`JobView`] JSONL line to the
+//! locked stdout on success, `Response` error JSON to stderr via `eprintln!`
+//! with exit 78 on failure — and [`render_jsonl`] below proves the encoding
+//! boundary the binary edge mirrors.
 
 use crate::{DreamResult, DreamerError, JobState, JobView};
 
@@ -37,9 +47,12 @@ pub(crate) fn project_result_view(
 /// Renders one result view as a single JSONL line.
 ///
 /// [`serde_json::to_string`] emits no literal newlines (control characters
-/// inside strings are escaped), so the returned value is exactly one line.
+/// inside strings are escaped), so the returned value is exactly one line:
+/// the stdout receipt the binary edge (`main.rs`) writes on success.
 /// Encoding failures refuse fail-closed with [`DreamerError::InvalidAdmission`]
-/// under the request-rejected code, never the Kernel-admission code.
+/// under the request-rejected code, never the Kernel-admission code; the
+/// binary edge then reports the refusal on stderr with exit 78 and writes no
+/// partial receipt to stdout.
 pub(crate) fn render_jsonl(view: &JobView) -> Result<String, DreamerError> {
     serde_json::to_string(view)
         .map_err(|_| DreamerError::InvalidAdmission("result encoding failure"))
@@ -50,11 +63,11 @@ pub(crate) fn render_jsonl(view: &JobView) -> Result<String, DreamerError> {
 /// Stdout carries machine-readable receipt lines only; diagnostics and logs
 /// belong on stderr (`eprintln!`) at call sites so a log line can never be
 /// mistaken for a receipt. A broken stdout refuses fail-closed under the
-/// request-rejected code like an encoding failure. Launches no process and
-/// writes no file.
+/// request-rejected code like an encoding failure, and the caller reports
+/// that refusal on stderr. Launches no process and writes no file.
 #[allow(
     dead_code,
-    reason = "emitted by the binary receipt edge once the Governor-material slice decides payloads; render_jsonl proves the encoding boundary until then"
+    reason = "emitted by the binary receipt edge via lib re-export once wired; render_jsonl proves the encoding boundary until then"
 )]
 pub(crate) fn emit_jsonl_stdout(view: &JobView) -> Result<(), DreamerError> {
     use std::io::Write as _;

@@ -12,6 +12,7 @@ use eliot_protocol::dreamer_job::{DurableJobResponse, JobState as ProtocolJobSta
 use serde::{Deserialize, Serialize};
 
 pub(crate) mod kernel_port;
+mod admitted_material;
 mod bundle_stage;
 mod controller;
 mod curation_screen_stage;
@@ -21,6 +22,9 @@ mod grounding_stage;
 mod model_stage;
 mod result_stage;
 mod validation_stage;
+
+#[cfg(test)]
+mod pipeline_e2e;
 
 pub use error::DreamerError;
 
@@ -383,15 +387,22 @@ impl KernelJobPort for AuthenticatedKernelJobPort {
         // and before any controller or bundle work. Admitted jobs prove the
         // Kernel-claimed binding next, then run the #806 controller step, the
         // A-04 bundle plan, the A-20 curation screen (pass-through for
-        // non-Curation classes), the T12-07 model call, A-14b grounding, A-05
-        // validation (Orientation consumed natively per #1136 Slice B G1–G5),
-        // and the Slice-7 exact native owner dispatch, each exactly once;
-        // only then is the live Kernel-proved disposition observed and
-        // projected through the Slice-8 result stage. Stage input resolution
-        // needs Governor-issued material that no in-binary port supplies yet,
-        // so admitted jobs fail closed at resolution until those slices land
-        // — no fallback, no local fetch, ranking, or model work.
+        // non-Curation classes, validated binding for Curation), the T12-07
+        // model derivation with its owner proof, A-14b grounding through the
+        // real owner, and native dispatch — A-31 for Curation (which owns its
+        // separate post-handler carrier and never enters common A-05
+        // validation), A-05 validation plus the native owner for every other
+        // admitted class — each genuinely invoking its owner exactly once.
+        // Only then is the live Kernel-proved disposition observed: the
+        // Kernel owns state authority, so the computed result attaches to the
+        // live view instead of inventing terminal state. The Slice-8 result
+        // stage projects the view and proves its JSONL encoding; the binary
+        // receipt edge (`main.rs`) emits the line on stdout.
         let (_arm, _digest) = dispatch_admission(job)?;
+        // Pure native-owner routing runs before any Kernel-facing call, so a
+        // class with no owner refuses here with zero transport and zero
+        // status calls by construction.
+        let _routing = dispatch_stage::dispatch_admitted_result(job.job_class)?;
         self.check_claimed(admission)?;
         let (state, observed, policy, observation_time_ms) =
             controller::resolve_cycle_inputs(admission, job)?;
@@ -399,14 +410,44 @@ impl KernelJobPort for AuthenticatedKernelJobPort {
             controller::step_admitted_cycle(&state, &observed, &policy, observation_time_ms)?;
         let request = bundle_stage::resolve_bundle_request(admission, job)?;
         let _plan = bundle_stage::plan_admitted_bundle(request)?;
-        let _screen = curation_screen_stage::resolve_screen_inputs(admission, job)?;
-        let _model = model_stage::resolve_model_inputs(admission, job)?;
-        let _grounding = grounding_stage::resolve_grounding_inputs(admission, job)?;
-        let _validation = validation_stage::resolve_validation_inputs(admission, job)?;
-        let _dispatched = dispatch_stage::dispatch_admitted_result(job.job_class)?;
+        let screen = curation_screen_stage::resolve_screen_inputs(admission, job)?;
+        let model_inputs = model_stage::resolve_model_inputs(admission, job)?;
+        let draft = model_stage::run_admitted_model(model_inputs)?;
+        let grounding_request =
+            grounding_stage::resolve_grounding_inputs(admission, job, draft)?;
+        let grounded = grounding_stage::ground_admitted_draft(grounding_request)?;
+        let screen_binding = match screen {
+            curation_screen_stage::ScreenDecision::Screened {
+                binding, ..
+            } => Some(binding),
+            curation_screen_stage::ScreenDecision::PassThrough(_) => None,
+        };
+        let result = if job.job_class == JobClass::Curation {
+            // Curation owns the A-31 post-handler carrier: the common A-05
+            // owner itself rejects Curation (`UnsupportedJobShape`), so the
+            // class routes straight to its sole fan-in.
+            dispatch_stage::dispatch_admitted(admission, job, screen_binding, job.job_class)?
+        } else {
+            let _validation =
+                validation_stage::resolve_validation_inputs(admission, job)?;
+            let validation_input = admitted_material::validation_input_for(
+                admission,
+                job,
+                grounded,
+                Some(0),
+            )?;
+            let _validated =
+                validation_stage::validate_admitted_draft(&validation_input)?;
+            dispatch_stage::dispatch_admitted(admission, job, screen_binding, job.job_class)?
+        };
         let view = self.live_view()?;
-        let projected = result_stage::project_result_view(&view.job_id, view.state, view.result);
-        let _line = result_stage::render_jsonl(&projected)?;
+        let projected =
+            result_stage::project_result_view(&view.job_id, view.state, Some(result));
+        let line = result_stage::render_jsonl(&projected)?;
+        debug_assert!(
+            !line.is_empty(),
+            "a decided view must render a non-empty receipt line"
+        );
         Ok(projected)
     }
 

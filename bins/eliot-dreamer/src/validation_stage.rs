@@ -13,7 +13,7 @@
 //! Stage order is `dispatch_admission`, then the controller step, then the
 //! bundle plan, then validation here: a refused class returns at dispatch
 //! with zero validation work, and a failed controller or bundle stage never
-//! reaches validation. Non-Curation refused classes never reach this seam
+//! reaches validation. Non-admitted refused classes never reach this seam
 //! (dispatch already refused them), but resolution still refuses them
 //! fail-closed with [`DreamerError::UnsupportedJobClass`] if they do.
 //!
@@ -42,16 +42,22 @@
 //! - G4: `architecture_implications` / `model_routes_and_cost` markers
 //!   preserved. The seam takes references and returns no rewritten copy, so
 //!   there is no field here that could drop or thin the owner residues.
-//! - G5: Governor-record sourcing host-side for admitted drafts and
-//!   positions. Positions and the draft are never synthesized locally:
-//!   resolution fail-closes until the Governor-resolved material arrives
-//!   through a source-owner port, because locally built material would be
-//!   self-issued authority.
+//! - G5: Governor-resolved material arrives as the typed owner carrier. The
+//!   sibling grounding stage supplies the [`GroundedDreamDraft`](eliot_dreamer_contracts::grounding::GroundedDreamDraft);
+//!   the caller builds the [`GroundingValidationInput`] from it (policy,
+//!   usage, preservation, observation, rival declarations) and passes it to
+//!   [`validate_admitted_draft`]. Resolution itself maps admitted classes
+//!   directly with no material gate: nothing is synthesized here, and the
+//!   owner decides acceptance on the supplied carrier.
 
 use eliot_dreamer_candidate_validation::{
-    DreamDraftValidationError, validate_grounding_candidate_at,
+    DreamDraftValidationError, StructuredCandidateValidationOutcome,
+    validate_grounding_candidate_at,
 };
 use eliot_dreamer_contracts::JobClass;
+use eliot_dreamer_contracts::validation::structured::{
+    GroundingValidationInput, ValidatedGroundingCandidate,
+};
 
 use crate::controller::verify_admitted_binding;
 use crate::{DreamJobInput, DreamerError, KernelJobAdmission};
@@ -75,8 +81,13 @@ pub(crate) enum ValidationInputs {
         /// semantic task.
         operation_id: String,
     },
-    /// Admitted non-Orientation classes (`ResearchSynthesis`, `Maintenance`):
-    /// no per-class validation shape yet.
+    /// Admitted non-Orientation classes (`ResearchSynthesis`, `Maintenance`,
+    /// `Curation`): no per-class validation shape yet.
+    ///
+    /// `Curation` maps here but reaches validation only through the
+    /// `dispatch_stage` direct pipeline in end-to-end wiring: `submit`'s
+    /// Slice-A gate still refuses it at entry, so this arm never admits
+    /// Curation past the binary front door on its own.
     OtherAdmitted,
 }
 
@@ -84,27 +95,24 @@ pub(crate) enum ValidationInputs {
 ///
 /// Fails closed: any invalid/stale admission or identity mismatch refuses here
 /// with zero owner-validation calls, and refused classes refuse with
-/// [`DreamerError::UnsupportedJobClass`]. Admitted classes map to
-/// [`ValidationInputs`] (Orientation through the G1 split) and then still
-/// fail closed with the Governor-material refusal, because the
-/// Governor-resolved draft and epistemic positions arrive through a
-/// source-owner port in a later slice; until then resolution refuses rather
-/// than synthesizing draft material (G5).
+/// [`DreamerError::UnsupportedJobClass`]. Admitted classes map directly to
+/// [`ValidationInputs`] (Orientation through the G1 split, the remaining
+/// admitted classes through the shared arm). The Governor-resolved
+/// [`GroundingValidationInput`] itself arrives as the parameter to
+/// [`validate_admitted_draft`]: resolution maps identity only and never
+/// synthesizes draft material.
 pub(crate) fn resolve_validation_inputs(
     admission: &KernelJobAdmission,
     job: &DreamJobInput,
 ) -> Result<ValidationInputs, DreamerError> {
-    let _inputs = map_admitted_inputs(admission, job)?;
-    Err(DreamerError::InvalidAdmission(
-        "admitted validation inputs require Governor-resolved draft and positions",
-    ))
+    map_admitted_inputs(admission, job)
 }
 
 /// Maps one admitted job to its validation inputs after the binding check.
 ///
 /// Pure mapping step of [`resolve_validation_inputs`]: binding first, then
 /// the closed class match (admitted classes map, refused classes refuse), so
-/// the G1 split is observable and testable ahead of the G5 material gate.
+/// the G1 split is observable and testable.
 fn map_admitted_inputs(
     admission: &KernelJobAdmission,
     job: &DreamJobInput,
@@ -116,9 +124,10 @@ fn map_admitted_inputs(
             task_id: job.task_id.clone(),
             operation_id: admission.request_id.clone(),
         }),
-        JobClass::ResearchSynthesis | JobClass::Maintenance => Ok(ValidationInputs::OtherAdmitted),
-        JobClass::Curation
-        | JobClass::Clarification
+        JobClass::ResearchSynthesis | JobClass::Maintenance | JobClass::Curation => {
+            Ok(ValidationInputs::OtherAdmitted)
+        }
+        JobClass::Clarification
         | JobClass::ArchitectureSelfQuery
         | JobClass::DevelopmentDiagnosis
         | JobClass::OrchestrationPlanning
@@ -133,39 +142,37 @@ fn map_admitted_inputs(
 /// `validate_once` is `FnOnce`: the owner validation cannot run twice for one
 /// admission through this seam. Production passes the A-05 owner entry (see
 /// [`validate_admitted_draft`]); deterministic tests pass a counting wrapper
-/// around real owner validation to prove the once-per-admission call shape.
-#[allow(
-    dead_code,
-    reason = "wired by submit once the Governor-material slice supplies the validated draft"
-)]
+/// around the real owner validation to prove the once-per-admission call
+/// shape. An accepted carrier returns the owner's bound candidate; a rejected
+/// carrier maps to the static semantic-rejection refusal (the dynamic
+/// [`RejectionCode`](eliot_dreamer_candidate_validation::RejectionCode) stays
+/// out of the typed error); an owner contract failure maps through
+/// [`validation_denied`].
 pub(crate) fn validate_admitted_draft_with(
-    inputs: &ValidationInputs,
-    validate_once: impl FnOnce(&ValidationInputs) -> Result<(), DreamDraftValidationError>,
-) -> Result<(), DreamerError> {
-    validate_once(inputs).map_err(|error| validation_denied(&error))
+    input: &GroundingValidationInput,
+    validate_once: impl FnOnce(
+        &GroundingValidationInput,
+    ) -> Result<StructuredCandidateValidationOutcome, DreamDraftValidationError>,
+) -> Result<ValidatedGroundingCandidate, DreamerError> {
+    match validate_once(input) {
+        Ok(StructuredCandidateValidationOutcome::Accepted(candidate)) => Ok(*candidate),
+        Ok(StructuredCandidateValidationOutcome::Rejected(_)) => Err(
+            DreamerError::InvalidAdmission("validation semantic rejection"),
+        ),
+        Err(error) => Err(validation_denied(&error)),
+    }
 }
 
 /// Production entry: the real A-05 owner validation, once per admission.
 ///
-/// Wires [`validate_grounding_candidate_at`] as the `FnOnce` body: the
-/// function item is referenced here so the wiring is exact at compile time
-/// (an owner rename breaks this build), and the call itself runs once the
-/// Governor-resolved draft port lands. Until then (G5) the body fail-closes
-/// instead of synthesizing draft material, so this entry is unreachable while
-/// [`resolve_validation_inputs`] still waits for governed material.
-#[allow(
-    dead_code,
-    reason = "wired by submit once the Governor-material slice supplies the validated draft"
-)]
-pub(crate) fn validate_admitted_draft(inputs: &ValidationInputs) -> Result<(), DreamerError> {
-    validate_admitted_draft_with(inputs, |resolved| {
-        let _ = resolved;
-        let _ = validate_grounding_candidate_at;
-        Err(DreamDraftValidationError::InvalidContract {
-            phase: "governor material",
-            field: "governor.draft",
-        })
-    })
+/// Wires [`validate_grounding_candidate_at`] as the `FnOnce` body: the owner
+/// function decides acceptance on the supplied Governor-resolved carrier, and
+/// this composition only calls it once and maps its typed outcome
+/// fail-closed.
+pub(crate) fn validate_admitted_draft(
+    input: &GroundingValidationInput,
+) -> Result<ValidatedGroundingCandidate, DreamerError> {
+    validate_admitted_draft_with(input, validate_grounding_candidate_at)
 }
 
 /// Maps an owner validation refusal to a typed fail-closed refusal.
@@ -174,10 +181,6 @@ pub(crate) fn validate_admitted_draft(inputs: &ValidationInputs) -> Result<(), D
 /// never the Kernel-admission code: the admission itself was valid, the draft
 /// was not. Dynamic payloads (bounds, digests, details) are dropped in favor
 /// of the bounded static field names; nothing secret flows.
-#[allow(
-    dead_code,
-    reason = "reached through validate_admitted_draft_with once the Governor-material slice wires it"
-)]
 fn validation_denied(error: &DreamDraftValidationError) -> DreamerError {
     match error {
         DreamDraftValidationError::Bound { field, .. }
@@ -191,9 +194,23 @@ fn validation_denied(error: &DreamDraftValidationError) -> DreamerError {
 #[cfg(test)]
 mod slice_6_validation_tests {
     use super::*;
+    use std::collections::{BTreeMap, BTreeSet};
     use std::sync::atomic::{AtomicU64, Ordering};
 
-    use eliot_contracts::{EpochId, EpochLineageId, ResourceGeneration, StateFence};
+    use eliot_contracts::{
+        EpochId, EpochLineageId, ResourceGeneration, StateFence, TaskId,
+    };
+    use eliot_dreamer_candidate_validation::RejectionCode;
+    use eliot_dreamer_candidate_validation::StructuredCandidateRejectionReport;
+    use eliot_dreamer_contracts::grounding::{
+        AllowedReferenceManifest, AttemptIdentity, ClaimGroundingLedger, GroundedDreamDraft,
+        GroundingPolicy, ModelDraft as GroundingModelDraft, RouteIdentity,
+        GROUNDING_SCHEMA_VERSION,
+    };
+    use eliot_dreamer_contracts::{
+        BudgetLimits, BudgetUsage, BundleCompleteness, DreamInputBundle, DreamJobAdmission,
+        PreservationReport, Requester, RequesterOrigin, ValidationPolicy,
+    };
     use eliot_dreamer_orientation::{
         AnchoredEvidence, OrientationPacketCandidate, OrientationResidue,
     };
@@ -203,11 +220,15 @@ mod slice_6_validation_tests {
     const TEST_LINEAGE: &str = "550e8400-e29b-41d4-a716-446655440000";
 
     fn fence() -> StateFence {
-        let epoch = EpochId::new(
-            EpochLineageId::new(TEST_LINEAGE).expect("valid test lineage"),
-            std::num::NonZeroU64::new(1).expect("nonzero test sequence"),
-        )
-        .expect("valid test epoch");
+        let Ok(lineage) = EpochLineageId::new(TEST_LINEAGE) else {
+            panic!("valid test lineage");
+        };
+        let Some(sequence) = std::num::NonZeroU64::new(1) else {
+            panic!("nonzero test sequence");
+        };
+        let Ok(epoch) = EpochId::new(lineage, sequence) else {
+            panic!("valid test epoch");
+        };
         StateFence::new(epoch, ResourceGeneration::genesis())
     }
 
@@ -246,6 +267,24 @@ mod slice_6_validation_tests {
             deadline_ms: 1,
             output_schema: "eliot.dreamer.v1".to_owned(),
             forbidden_effects: Vec::new(),
+        }
+    }
+
+    /// Maps one admitted job, panicking on refusal: the admitted-path tests
+    /// below only exercise classes that must map, so a refusal is a test
+    /// failure rather than a case to branch on.
+    fn must_map(admission: &KernelJobAdmission, job: &DreamJobInput) -> ValidationInputs {
+        match map_admitted_inputs(admission, job) {
+            Ok(mapped) => mapped,
+            Err(error) => panic!("admitted class must map, got {error:?}"),
+        }
+    }
+
+    /// Resolves one admitted job, panicking on refusal: see [`must_map`].
+    fn must_resolve(admission: &KernelJobAdmission, job: &DreamJobInput) -> ValidationInputs {
+        match resolve_validation_inputs(admission, job) {
+            Ok(resolved) => resolved,
+            Err(error) => panic!("admitted input must resolve, got {error:?}"),
         }
     }
 
@@ -288,11 +327,13 @@ mod slice_6_validation_tests {
     /// Refused classes fail closed at resolution with the exact unsupported
     /// variant and the request-rejected code, never the Kernel-admission
     /// code. Dispatch already refused these classes; this arm is defense in
-    /// depth if one ever reaches the seam.
+    /// depth if one ever reaches the seam. `Curation` is not in this set: it
+    /// maps to the shared admitted arm (it reaches validation only via the
+    /// `dispatch_stage` direct pipeline in end-to-end wiring, while `submit`'s
+    /// Slice-A gate still refuses it at entry).
     #[test]
     fn refused_classes_return_unsupported_job_class() {
         for class in [
-            JobClass::Curation,
             JobClass::Clarification,
             JobClass::ArchitectureSelfQuery,
             JobClass::DevelopmentDiagnosis,
@@ -324,7 +365,7 @@ mod slice_6_validation_tests {
     fn orientation_g1_mapping_splits_scope_task_operation() {
         let admission = admission_with_deadline(u64::MAX);
         let job = job_of_class(JobClass::Orientation, Some("task-slice-6"));
-        let mapped = map_admitted_inputs(&admission, &job).expect("admitted class must map");
+        let mapped = must_map(&admission, &job);
         assert_eq!(
             mapped,
             ValidationInputs::OrientationNative {
@@ -350,8 +391,7 @@ mod slice_6_validation_tests {
         );
 
         let job_without_task = job_of_class(JobClass::Orientation, None);
-        let mapped = map_admitted_inputs(&admission, &job_without_task)
-            .expect("admitted class must map");
+        let mapped = must_map(&admission, &job_without_task);
         assert!(
             matches!(
                 mapped,
@@ -365,9 +405,16 @@ mod slice_6_validation_tests {
     }
 
     /// Other admitted classes map to the shared arm with no per-class shape.
+    /// `Curation` maps here as well: it reaches validation only via the
+    /// `dispatch_stage` direct pipeline in end-to-end wiring, while `submit`'s
+    /// Slice-A gate still refuses it at entry.
     #[test]
     fn other_admitted_classes_map_to_shared_arm() {
-        for class in [JobClass::ResearchSynthesis, JobClass::Maintenance] {
+        for class in [
+            JobClass::ResearchSynthesis,
+            JobClass::Maintenance,
+            JobClass::Curation,
+        ] {
             let admission = admission_with_deadline(u64::MAX);
             let job = job_of_class(class, None);
             assert!(
@@ -376,6 +423,39 @@ mod slice_6_validation_tests {
                     Ok(ValidationInputs::OtherAdmitted)
                 ),
                 "class {class:?} must map to the shared admitted arm"
+            );
+        }
+    }
+
+    /// Admitted resolution returns the mapped inputs directly: a valid
+    /// admission with matching identity resolves without any Governor-material
+    /// gate, because the Governor-resolved carrier now arrives as the
+    /// parameter to [`validate_admitted_draft`].
+    #[test]
+    fn admitted_resolution_returns_mapped_inputs() {
+        let admission = admission_with_deadline(u64::MAX);
+        let job = job_of_class(JobClass::Orientation, Some("task-slice-6"));
+        let resolved = must_resolve(&admission, &job);
+        assert_eq!(
+            resolved,
+            ValidationInputs::OrientationNative {
+                scope_id: "scope-slice-6".to_owned(),
+                task_id: Some("task-slice-6".to_owned()),
+                operation_id: "request-slice-6".to_owned(),
+            }
+        );
+        for class in [
+            JobClass::ResearchSynthesis,
+            JobClass::Maintenance,
+            JobClass::Curation,
+        ] {
+            let job = job_of_class(class, None);
+            assert!(
+                matches!(
+                    resolve_validation_inputs(&admission, &job),
+                    Ok(ValidationInputs::OtherAdmitted)
+                ),
+                "class {class:?} must resolve to the shared admitted arm"
             );
         }
     }
@@ -396,10 +476,8 @@ mod slice_6_validation_tests {
         second.evidence_handles = vec!["evidence-b".to_owned(), "evidence-c".to_owned()];
         second.architecture_handles = vec!["architecture-b".to_owned()];
         second.allowed_model_routes = vec!["route-b".to_owned(), "route-c".to_owned()];
-        let first_mapped =
-            map_admitted_inputs(&admission, &first).expect("admitted class must map");
-        let second_mapped =
-            map_admitted_inputs(&admission, &second).expect("admitted class must map");
+        let first_mapped = must_map(&admission, &first);
+        let second_mapped = must_map(&admission, &second);
         assert_eq!(
             first_mapped, second_mapped,
             "payload markers must pass through without parse, regroup, or rewrite"
@@ -455,59 +533,211 @@ mod slice_6_validation_tests {
             as fn(&OrientationPacketCandidate) -> (&OrientationResidue, &OrientationResidue);
     }
 
-    /// G5: a valid admission with matching identity reaches the governed
-    /// material gate. Resolution names the missing Governor-resolved draft
-    /// and positions instead of synthesizing them, and the production entry
-    /// fail-closes the same way with the request-rejected code.
-    #[test]
-    fn valid_admission_waits_for_governed_material_g5() {
-        let admission = admission_with_deadline(u64::MAX);
-        let job = job_of_class(JobClass::Orientation, Some("task-slice-6"));
-        let refused = resolve_validation_inputs(&admission, &job);
-        assert!(
-            matches!(
-                refused,
-                Err(DreamerError::InvalidAdmission(
-                    "admitted validation inputs require Governor-resolved draft and positions"
-                ))
-            ),
-            "valid input must wait for governed material, got {refused:?}"
-        );
-        assert_eq!(
-            refused.map_err(|error| error.code()),
-            Err("DREAMER_REQUEST_REJECTED")
-        );
-
-        let inputs = map_admitted_inputs(&admission, &job).expect("admitted class must map");
-        let refused = validate_admitted_draft(&inputs);
-        let Err(error) = refused else {
-            panic!("production validation without governed draft must refuse");
-        };
-        assert_eq!(error.code(), "DREAMER_REQUEST_REJECTED");
-        assert!(
-            !matches!(error, DreamerError::KernelAdmissionRequired(_)),
-            "material refusal must not borrow the Kernel-admission code"
-        );
+    /// Builds the carried job preimage for the owner-call proofs below. The
+    /// values are only carried, never trusted: the real A-05 owner refuses
+    /// the carrier at its first shallow-shape check.
+    fn carrier_job() -> DreamJobAdmission {
+        DreamJobAdmission {
+            schema_version: 1,
+            job_class: JobClass::Orientation,
+            requester: Requester {
+                origin: RequesterOrigin::Human,
+                principal: "test-harness".to_owned(),
+                session: None,
+            },
+            operation_id: "operation-slice-6".to_owned(),
+            idempotency_key: "idempotency-slice-6".to_owned(),
+            task_id: "task-slice-6".to_owned(),
+            scope_id: "scope-slice-6".to_owned(),
+            state_fence: fence(),
+            privacy_profile: "local_only".to_owned(),
+            contract_ref: "contract-slice-6".to_owned(),
+            policy_ref: "policy-slice-6".to_owned(),
+            budget: BudgetLimits {
+                input_bytes: None,
+                output_bytes: None,
+                source_width: None,
+                reference_width: None,
+                model_calls: None,
+                attempts: None,
+                candidates: None,
+                wall_ms: None,
+                work_fan_out: None,
+                report_bytes: None,
+                max_stu: None,
+            },
+            deadline_ms: None,
+            frozen_manifest_digest: String::new(),
+        }
     }
 
-    /// The owner validation runs exactly once per admitted admission: one
-    /// counting wrapper, one refused input, one call, one typed fail-closed
-    /// refusal with the request-rejected code.
+    /// Builds the carried bundle preimage: only carried, never trusted (see
+    /// [`carrier_job`]).
+    fn carrier_bundle() -> DreamInputBundle {
+        DreamInputBundle {
+            schema_version: 1,
+            job_id: "job-slice-6".to_owned(),
+            scope_id: "scope-slice-6".to_owned(),
+            task_id: "task-slice-6".to_owned(),
+            state_fence: fence(),
+            manifest_digest: String::new(),
+            materials: Vec::new(),
+            omissions: Vec::new(),
+            completeness: BundleCompleteness::Unknown,
+            authoritative_denominator: None,
+        }
+    }
+
+    /// Builds the carried grounding draft preimage: only carried, never
+    /// trusted (see [`carrier_job`]).
+    fn carrier_draft(
+        job: DreamJobAdmission,
+        bundle: DreamInputBundle,
+        task_id: TaskId,
+    ) -> GroundingModelDraft {
+        GroundingModelDraft {
+            schema_version: GROUNDING_SCHEMA_VERSION,
+            job_id: "job-slice-6".to_owned(),
+            task_id,
+            scope_id: "scope-slice-6".to_owned(),
+            state_fence: fence(),
+            job,
+            bundle,
+            raw_output_digest: String::new(),
+            requester_digest: String::new(),
+            attempt: AttemptIdentity {
+                attempt_id: "attempt-slice-6".to_owned(),
+                attempt_number: 1,
+                maximum_attempts: 2,
+            },
+            route: RouteIdentity {
+                provider: "provider-slice-6".to_owned(),
+                model: "model-slice-6".to_owned(),
+                route_revision: "r1".to_owned(),
+                fingerprint: "fingerprint-slice-6".to_owned(),
+            },
+            budget_digest: String::new(),
+            bundle_digest: String::new(),
+            input_manifest_digest: String::new(),
+            claims: Vec::new(),
+            non_material_claims: Vec::new(),
+            screen: None,
+            draft_digest: String::new(),
+        }
+    }
+
+    /// Builds the carried manifest preimage: only carried, never trusted (see
+    /// [`carrier_job`]).
+    fn carrier_manifest(task_id: TaskId) -> AllowedReferenceManifest {
+        AllowedReferenceManifest {
+            schema_version: GROUNDING_SCHEMA_VERSION,
+            manifest_id: "manifest-slice-6".to_owned(),
+            run_id: "run-slice-6".to_owned(),
+            task_id,
+            scope_id: "scope-slice-6".to_owned(),
+            state_fence: fence(),
+            source_snapshot: "snapshot-slice-6".to_owned(),
+            source_revision: "revision-slice-6".to_owned(),
+            references: BTreeMap::new(),
+            coverage_denominators: BTreeMap::new(),
+            coverage_receipts: BTreeMap::new(),
+            dependence_groups: BTreeSet::new(),
+            digest: String::new(),
+        }
+    }
+
+    /// Builds the carried grounding policy preimage: only carried, never
+    /// trusted (see [`carrier_job`]).
+    fn carrier_grounding_policy() -> GroundingPolicy {
+        GroundingPolicy {
+            schema_version: GROUNDING_SCHEMA_VERSION,
+            policy_id: "policy-slice-6".to_owned(),
+            revision: "r1".to_owned(),
+            permitted_kinds: BTreeSet::new(),
+            permitted_nonmaterial_classes: BTreeSet::new(),
+            max_claims: 1,
+            max_subclaims_per_claim: 1,
+            max_support_handles_per_claim: 1,
+            max_output_bytes: 1024,
+            digest: String::new(),
+        }
+    }
+
+    /// Builds the carried ledger preimage: only carried, never trusted (see
+    /// [`carrier_job`]).
+    fn carrier_ledger(task_id: TaskId) -> ClaimGroundingLedger {
+        ClaimGroundingLedger {
+            schema_version: GROUNDING_SCHEMA_VERSION,
+            operation_id: "operation-slice-6".to_owned(),
+            run_id: "run-slice-6".to_owned(),
+            job_id: "job-slice-6".to_owned(),
+            task_id,
+            scope_id: "scope-slice-6".to_owned(),
+            state_fence: fence(),
+            draft_digest: String::new(),
+            manifest_digest: String::new(),
+            policy_digest: String::new(),
+            expected_claim_ids: BTreeSet::new(),
+            expected_subclaim_ids: BTreeMap::new(),
+            records: BTreeMap::new(),
+            nonmaterial_claim_ids: BTreeSet::new(),
+            unprocessed_claim_ids: BTreeSet::new(),
+            unprocessed_reason: None,
+            ledger_digest: String::new(),
+        }
+    }
+
+    /// Builds a structurally addressed but wire-versioned carrier for the
+    /// owner-call proofs below. The outer `schema_version` is intentionally
+    /// wrong, so the real A-05 owner refuses at its first shallow-shape check
+    /// (`structured.schema_version`) without needing a fully valid grounded
+    /// preimage; every nested value is only carried, never trusted.
+    fn malformed_carrier() -> GroundingValidationInput {
+        let Ok(task_id) = TaskId::new("task-slice-6") else {
+            panic!("valid test task");
+        };
+        let draft = carrier_draft(carrier_job(), carrier_bundle(), task_id.clone());
+        let grounded = GroundedDreamDraft {
+            schema_version: GROUNDING_SCHEMA_VERSION,
+            job_id: "job-slice-6".to_owned(),
+            task_id: task_id.clone(),
+            scope_id: "scope-slice-6".to_owned(),
+            state_fence: fence(),
+            draft_digest: String::new(),
+            manifest_digest: String::new(),
+            policy_digest: String::new(),
+            input: draft,
+            manifest: carrier_manifest(task_id.clone()),
+            policy: carrier_grounding_policy(),
+            ledger: carrier_ledger(task_id),
+            screen: None,
+            output_digest: String::new(),
+        };
+        GroundingValidationInput {
+            schema_version: 0,
+            grounded: Box::new(grounded),
+            policy: ValidationPolicy::new("policy-slice-6", 1, 1024),
+            usage: BudgetUsage::default(),
+            preservation: PreservationReport {
+                verdicts: Vec::new(),
+            },
+            observation_time_ms: None,
+            cancellation_requested: false,
+            rival_declarations: None,
+        }
+    }
+
+    /// The real A-05 owner validation runs exactly once per admitted
+    /// admission: one counting wrapper around the production function over a
+    /// wire-versioned carrier, one call, one typed fail-closed refusal with
+    /// the request-rejected code.
     #[test]
     fn owner_validation_runs_exactly_once_per_admission() {
-        let inputs = ValidationInputs::OrientationNative {
-            scope_id: "scope-slice-6".to_owned(),
-            task_id: Some("task-slice-6".to_owned()),
-            operation_id: "request-slice-6".to_owned(),
-        };
+        let input = malformed_carrier();
         let calls = AtomicU64::new(0);
-        let refused = validate_admitted_draft_with(&inputs, |resolved| {
-            assert_eq!(resolved, &inputs, "owner must see the resolved inputs");
+        let refused = validate_admitted_draft_with(&input, |carrier| {
             calls.fetch_add(1, Ordering::SeqCst);
-            Err(DreamDraftValidationError::InvalidContract {
-                phase: "structured shape",
-                field: "structured.schema_version",
-            })
+            validate_grounding_candidate_at(carrier)
         });
         assert_eq!(
             calls.load(Ordering::SeqCst),
@@ -520,6 +750,61 @@ mod slice_6_validation_tests {
                 Err(DreamerError::InvalidAdmission("structured.schema_version"))
             ),
             "owner refusal must map fail-closed, got {refused:?}"
+        );
+        assert_eq!(
+            refused.map_err(|error| error.code()),
+            Err("DREAMER_REQUEST_REJECTED")
+        );
+    }
+
+    /// The production entry calls the real owner once: the same wire-versioned
+    /// carrier refuses through the production path with the request-rejected
+    /// code, never the Kernel-admission code.
+    #[test]
+    fn production_entry_calls_the_real_owner_once() {
+        let refused = validate_admitted_draft(&malformed_carrier());
+        let Err(error) = refused else {
+            panic!("wire-versioned carrier must refuse through the real owner");
+        };
+        assert_eq!(error.code(), "DREAMER_REQUEST_REJECTED");
+        assert!(
+            matches!(
+                error,
+                DreamerError::InvalidAdmission("structured.schema_version")
+            ),
+            "production refusal must carry the owner field, got {error:?}"
+        );
+        assert!(
+            !matches!(error, DreamerError::KernelAdmissionRequired(_)),
+            "validation refusal must not borrow the Kernel-admission code"
+        );
+    }
+
+    /// A rejected owner report maps to the static semantic-rejection refusal:
+    /// the dynamic rejection code stays out of the typed error while the
+    /// refusal still carries the request-rejected code.
+    #[test]
+    fn rejected_report_maps_to_semantic_rejection() {
+        let input = malformed_carrier();
+        let report = StructuredCandidateRejectionReport {
+            input: input.clone(),
+            code: RejectionCode::IdentityMismatch,
+            detail: "structured job or policy identity differs".to_owned(),
+            input_digest: "0".repeat(64),
+        };
+        let refused = validate_admitted_draft_with(&input, |_| {
+            Ok(StructuredCandidateValidationOutcome::Rejected(Box::new(
+                report,
+            )))
+        });
+        assert!(
+            matches!(
+                refused,
+                Err(DreamerError::InvalidAdmission(
+                    "validation semantic rejection"
+                ))
+            ),
+            "rejected report must map to the semantic refusal, got {refused:?}"
         );
         assert_eq!(
             refused.map_err(|error| error.code()),
