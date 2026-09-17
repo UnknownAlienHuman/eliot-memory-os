@@ -841,8 +841,21 @@ mod tests {
                         self.pending = Some(Self::response(
                             connection_id,
                             response_id,
-                            StoreResponse::Error {
-                                error: "unavailable".to_owned(),
+                            StoreResponse::Failure {
+                                failure: StoreFailure::from_store_error(
+                                    StoreError::Unavailable,
+                                    StoreFailureIdentityContext {
+                                        request_id: None,
+                                        operation_id: None,
+                                        idempotency_key_ref_or_digest: None,
+                                        state_fence_ref_or_exact_safe_projection: Some(
+                                            self.requirement.state_fence.clone(),
+                                        ),
+                                        evidence_ref: None,
+                                        transport_unavailable: true,
+                                    },
+                                )
+                                .expect("unavailable store failure is valid"),
                             },
                         ));
                     } else {
