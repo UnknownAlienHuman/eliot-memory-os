@@ -1241,6 +1241,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "eliot-dreamer-accessibility"
+version = "0.1.0"
+dependencies = [
+ "eliot-contracts",
+ "eliot-dreamer-contracts",
+ "eliot-evidence",
+ "schemars",
+ "serde",
+]
+
+[[package]]
 name = "eliot-dreamer-bundle"
 version = "0.1.0"
 dependencies = [
@@ -1348,6 +1359,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "eliot-dreamer-curation"
+version = "0.1.0"
+dependencies = [
+ "eliot-contracts",
+ "eliot-dreamer-contracts",
+ "eliot-evidence",
+ "schemars",
+ "serde",
+]
+
+[[package]]
 name = "eliot-dreamer-cycle"
 version = "0.1.0"
 dependencies = [
@@ -1386,12 +1408,36 @@ dependencies = [
 ]
 
 [[package]]
+name = "eliot-dreamer-failure"
+version = "0.1.0"
+dependencies = [
+ "eliot-contracts",
+ "eliot-dreamer-contracts",
+ "eliot-evidence",
+ "eliot-receipts",
+ "schemars",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "eliot-dreamer-maintenance-plan"
 version = "0.1.0"
 dependencies = [
  "eliot-contracts",
  "eliot-dreamer-contracts",
  "eliot-evidence",
+]
+
+[[package]]
+name = "eliot-dreamer-memory-repair"
+version = "0.1.0"
+dependencies = [
+ "eliot-contracts",
+ "eliot-dreamer-contracts",
+ "eliot-evidence",
+ "schemars",
+ "serde",
 ]
 
 [[package]]
@@ -1436,6 +1482,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "eliot-dreamer-reconsolidation"
+version = "0.1.0"
+dependencies = [
+ "eliot-contracts",
+ "eliot-dreamer-contracts",
+ "eliot-evidence",
+ "schemars",
+ "serde",
+]
+
+[[package]]
 name = "eliot-dreamer-relation"
 version = "0.1.0"
 dependencies = [
@@ -1462,6 +1519,15 @@ dependencies = [
  "eliot-evaluation-contracts",
  "serde",
  "serde_json",
+]
+
+[[package]]
+name = "eliot-dreamer-structure-repair"
+version = "0.1.0"
+dependencies = [
+ "eliot-contracts",
+ "eliot-dreamer-contracts",
+ "eliot-evidence",
 ]
 
 [[package]]

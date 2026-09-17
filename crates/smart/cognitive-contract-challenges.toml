@@ -6,7 +6,9 @@ rule = "A cognitive agent must stop at a missing owner-neutral provider contract
 
 [[challenge]]
 id = "CC-001"
-status = "OPEN_BLOCKING_ACCESSIBILITY"
+status = "RESOLVED"
+resolution_commit = "afbdef21"
+resolution_note = "Resolved in leaf #669 commit afbdef21, 59-case accessibility proof matrix."
 required_owner = "Governor/Meta evaluation contract owner"
 needed_by = ["eliot-dreamer-accessibility", "future use attribution/usefulness evaluation"]
 missing_contract = "Canonical attributed inclusion/influence/use/outcome/cost/regret evidence with complete denominator, fence, scope and no-use semantics."
@@ -24,7 +26,9 @@ resolution_evidence = ["adapter contract fixture", "malformed/partial/timeout mo
 
 [[challenge]]
 id = "CC-003"
-status = "OPEN_INTEGRATION_GATE"
+status = "RESOLVED"
+resolution_commit = "93dd75e3"
+resolution_note = "Resolved in PR #1991 commit 93dd75e3 and leaf #684, 60-case curation proof matrix."
 required_owner = "Codex-owned runtime composition"
 needed_by = ["eliot-dreamer-curation"]
 missing_contract = "Open typed handler registry/invocation protocol that produces TypedCurationHandlerResult without making the facade depend on concrete handlers."

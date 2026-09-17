@@ -1,0 +1,100 @@
+{
+  "admission": "admitted via #966 (T8-AS2) root workspace membership",
+  "base_commit": "a9b51160dadcb731b117e343e2f47e589fe81fd4",
+  "excluded_count": 7,
+  "expected_test_counts": {
+    "eliot-dreamer-accessibility": 59,
+    "eliot-dreamer-curation": 9,
+    "eliot-dreamer-failure": 55,
+    "eliot-dreamer-memory-repair": 6,
+    "eliot-dreamer-reconsolidation": 5,
+    "eliot-dreamer-structure-repair": 8
+  },
+  "issue": 966,
+  "leaf_touch_commit": "8901ad7b6c369e235964cb8a0cd74cb88b65271f",
+  "members_count": 166,
+  "module_status": "ADMITTED",
+  "package_members": 166,
+  "prototype_targets": 18,
+  "single_writer": "T8-AS2",
+  "six": [
+    {
+      "agent_order": 26,
+      "crate_path": "crates/smart/eliot-dreamer-failure",
+      "functional_cell": "smart.dreamer.failure",
+      "leaf_issue": 663,
+      "lib_sha256": "c3f4549dd8f596224216abc4c614d975ff78f530d1c181dc626cd4015ceb837d",
+      "matrix_cases": 55,
+      "matrix_sha256": "160f19a9967c4db68843d50850526205ae551640b5caa639b9916f11c9fe3a2e",
+      "name": "eliot-dreamer-failure",
+      "runtime_layer": "R6",
+      "source_layer": "C1",
+      "test_root": "crates/smart/eliot-dreamer-failure/tests/failure.rs"
+    },
+    {
+      "agent_order": 27,
+      "crate_path": "crates/smart/eliot-dreamer-structure-repair",
+      "functional_cell": "smart.dreamer.structure_repair",
+      "leaf_issue": 665,
+      "lib_sha256": "d2e0a6194275bbe277fa8a9d8566333f9cd53087c7552b1f040a94f6c39e3231",
+      "matrix_cases": 8,
+      "matrix_sha256": "d2e0a6194275bbe277fa8a9d8566333f9cd53087c7552b1f040a94f6c39e3231",
+      "name": "eliot-dreamer-structure-repair",
+      "runtime_layer": "R6",
+      "source_layer": "C1",
+      "test_root": "crates/smart/eliot-dreamer-structure-repair/src/lib.rs"
+    },
+    {
+      "agent_order": 28,
+      "crate_path": "crates/smart/eliot-dreamer-reconsolidation",
+      "functional_cell": "smart.dreamer.reconsolidation",
+      "leaf_issue": 667,
+      "lib_sha256": "58b048ebb3211597bdcea5ac7f10761e63c1d628476ab8c43108431f16dec2ee",
+      "matrix_cases": 5,
+      "matrix_sha256": "58b048ebb3211597bdcea5ac7f10761e63c1d628476ab8c43108431f16dec2ee",
+      "name": "eliot-dreamer-reconsolidation",
+      "runtime_layer": "R6",
+      "source_layer": "C1",
+      "test_root": "crates/smart/eliot-dreamer-reconsolidation/src/lib.rs"
+    },
+    {
+      "agent_order": 29,
+      "crate_path": "crates/smart/eliot-dreamer-accessibility",
+      "functional_cell": "smart.dreamer.accessibility",
+      "leaf_issue": 669,
+      "lib_sha256": "4d293f7fc1551160ceee08d82c89c4ad5b34940b8372e8cc44025cfc48093042",
+      "matrix_cases": 59,
+      "matrix_sha256": "4d293f7fc1551160ceee08d82c89c4ad5b34940b8372e8cc44025cfc48093042",
+      "name": "eliot-dreamer-accessibility",
+      "runtime_layer": "R6",
+      "source_layer": "C1",
+      "test_root": "crates/smart/eliot-dreamer-accessibility/src/lib.rs"
+    },
+    {
+      "agent_order": 30,
+      "crate_path": "crates/smart/eliot-dreamer-memory-repair",
+      "functional_cell": "smart.dreamer.memory_repair",
+      "leaf_issue": 671,
+      "lib_sha256": "9e30fe274141e68a170c14c1481ba0cf789b4fd44b717d8cb6cbcd8d1eebc461",
+      "matrix_cases": 6,
+      "matrix_sha256": "9e30fe274141e68a170c14c1481ba0cf789b4fd44b717d8cb6cbcd8d1eebc461",
+      "name": "eliot-dreamer-memory-repair",
+      "runtime_layer": "R6",
+      "source_layer": "C1",
+      "test_root": "crates/smart/eliot-dreamer-memory-repair/src/lib.rs"
+    },
+    {
+      "agent_order": 31,
+      "crate_path": "crates/smart/eliot-dreamer-curation",
+      "functional_cell": "smart.dreamer.curation",
+      "leaf_issue": 684,
+      "lib_sha256": "e02baa409c18c345841f68277c2d1bb148b74d197c751e17cc27a0b40cab6224",
+      "matrix_cases": 9,
+      "matrix_sha256": "e02baa409c18c345841f68277c2d1bb148b74d197c751e17cc27a0b40cab6224",
+      "name": "eliot-dreamer-curation",
+      "runtime_layer": "R6",
+      "source_layer": "C1",
+      "test_root": "crates/smart/eliot-dreamer-curation/src/lib.rs"
+    }
+  ]
+}
