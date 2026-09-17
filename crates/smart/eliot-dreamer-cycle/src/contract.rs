@@ -5,7 +5,7 @@ use eliot_contracts::{
     ArtifactId, OperationId, PolicyRevision, ProductId, ReceiptId, RequestId, SourceId, StateFence,
 };
 use eliot_dreamer_contracts::{
-    CandidateDisposition, DreamJobInput, ScreenBinding, TypedCurationHandlerRequest,
+    CandidateDisposition, DreamJobAdmission, ScreenBinding, TypedCurationHandlerRequest,
     TypedCurationHandlerResult, ValidationReceipt,
 };
 use eliot_receipts::{EffectClass, ProofCeiling, ReceiptEnvelope, ReceiptKind};
@@ -168,7 +168,7 @@ pub struct PendingRequest {
     pub payload_digest: String,
     /// Digest of the frozen input bundle used by downstream validation.
     pub bundle_digest: String,
-    /// Digest of the complete frozen [`DreamJobInput`] bound by this request.
+    /// Digest of the complete frozen [`DreamJobAdmission`] bound by this request.
     pub job_digest: String,
     /// Job task identity.
     pub task_id: String,
@@ -298,8 +298,8 @@ pub struct DreamerCycleState {
     pub schema_version: u32,
     /// Cycle identity.
     pub cycle_id: ArtifactId,
-    /// Frozen [`DreamJobInput`] request.
-    pub job: DreamJobInput,
+    /// Frozen [`DreamJobAdmission`] request.
+    pub job: DreamJobAdmission,
     /// Digest of the frozen input bundle, distinct from the job manifest.
     pub bundle_digest: String,
     /// Frozen policy identity used to validate this snapshot.
@@ -750,7 +750,7 @@ fn policy_digest(value: &CyclePolicy) -> Result<String, CycleError> {
     Ok(eliot_contracts::sha256_hex(&bytes))
 }
 
-pub(crate) fn job_digest(value: &DreamJobInput) -> Result<String, CycleError> {
+pub(crate) fn job_digest(value: &DreamJobAdmission) -> Result<String, CycleError> {
     let bytes = eliot_contracts::canonical_json_bytes(value)
         .map_err(|error| CycleError::Encoding(error.to_string()))?;
     Ok(eliot_contracts::sha256_hex(&bytes))

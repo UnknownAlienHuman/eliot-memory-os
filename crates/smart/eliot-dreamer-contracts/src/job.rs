@@ -20,7 +20,7 @@ use std::num::NonZeroU64;
 use crate::budget::BudgetLimits;
 use crate::error::{ContractViolation, check_fence, check_text, closed_wire_enum, is_hex64_lower};
 
-/// Exact wire `schema_version` admitted by [`DreamJobInput`].
+/// Exact wire `schema_version` admitted by [`DreamJobAdmission`].
 pub const DREAM_JOB_SCHEMA_VERSION: u32 = 1;
 
 /// Canonical kind marker owned by the architecture-brief surface.
@@ -125,7 +125,7 @@ impl Requester {
 /// Canonical closed intake record for one dream job.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
-pub struct DreamJobInput {
+pub struct DreamJobAdmission {
     /// Wire schema version; must be exactly [`DREAM_JOB_SCHEMA_VERSION`].
     pub schema_version: u32,
     /// Closed job class selecting the owning brief/handler surface.
@@ -156,7 +156,7 @@ pub struct DreamJobInput {
     pub frozen_manifest_digest: String,
 }
 
-impl DreamJobInput {
+impl DreamJobAdmission {
     /// Validates every intrinsic bound. Protected identity fields must be
     /// explicit: a defaulted `schema_version` or a missing digest is
     /// rejected rather than repaired.
@@ -235,7 +235,7 @@ impl DreamJobInput {
 
 /// Reports whether an orientation job is self-contained: orientation output
 /// requires no later output, every other class requires downstream work.
-pub fn orientation_is_self_contained(job: &DreamJobInput) -> bool {
+pub fn orientation_is_self_contained(job: &DreamJobAdmission) -> bool {
     matches!(job.job_class, JobClass::Orientation)
 }
 
@@ -266,14 +266,14 @@ pub fn brief_kinds_distinct() -> bool {
 }
 
 #[cfg(test)]
-pub(crate) fn sample_job() -> DreamJobInput {
+pub(crate) fn sample_job() -> DreamJobAdmission {
     let epoch = EpochId::new(
         EpochLineageId::new("550e8400-e29b-41d4-a716-446655440000")
             .expect("canonical test lineage-A"),
         NonZeroU64::new(1).expect("non-zero test sequence"),
     )
     .expect("valid test epoch");
-    DreamJobInput {
+    DreamJobAdmission {
         schema_version: DREAM_JOB_SCHEMA_VERSION,
         job_class: JobClass::Orientation,
         requester: Requester {
@@ -457,7 +457,7 @@ mod tests {
         let wire = serde_json::to_string(&sample_job()).expect("serialize job");
         let without_class = wire.replace("\"job_class\":\"orientation\",", "");
         assert_ne!(without_class, wire);
-        let err = serde_json::from_str::<DreamJobInput>(&without_class)
+        let err = serde_json::from_str::<DreamJobAdmission>(&without_class)
             .expect_err("missing job_class must fail");
         let msg = err.to_string();
         assert!(msg.contains("job_class"), "unexpected serde error: {err}");
@@ -482,7 +482,7 @@ mod tests {
         let job = sample_job();
         assert!(job.validate().is_ok());
         let wire = serde_json::to_string(&job).expect("serialize job");
-        let back: DreamJobInput = serde_json::from_str(&wire).expect("roundtrip job");
+        let back: DreamJobAdmission = serde_json::from_str(&wire).expect("roundtrip job");
         assert_eq!(back.task_id, "task-1");
         assert_eq!(back.scope_id, "scope-1");
         assert_eq!(back.operation_id, "op-1");
@@ -522,7 +522,7 @@ mod tests {
             "}"
         );
         let err =
-            serde_json::from_str::<DreamJobInput>(&with_extra).expect_err("extra key must fail");
+            serde_json::from_str::<DreamJobAdmission>(&with_extra).expect_err("extra key must fail");
         let msg = err.to_string();
         assert!(
             msg.contains("unknown field"),
@@ -531,7 +531,7 @@ mod tests {
         let needle = std::format!("\"schema_version\":{DREAM_JOB_SCHEMA_VERSION}");
         let zeroed = wire.replace(&needle, "\"schema_version\":0");
         assert_ne!(zeroed, wire);
-        let decoded: DreamJobInput = serde_json::from_str(&zeroed).expect("decodes");
+        let decoded: DreamJobAdmission = serde_json::from_str(&zeroed).expect("decodes");
         let valid = decoded.validate();
         let err = valid.expect_err("zero version must not validate");
         assert_eq!(err, ContractViolation::ImplicitDefault("schema_version"));

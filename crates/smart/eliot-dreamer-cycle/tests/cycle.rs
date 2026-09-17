@@ -9,7 +9,7 @@ use eliot_contracts::{
 use eliot_dreamer_contracts::curation::{ClassificationPayload, TargetEvidence};
 use eliot_dreamer_contracts::{
     AtomicityMode, BudgetLimits, BudgetUsage, CurationFamily, CurationKind, CurationPayload,
-    DreamJobInput, JobClass, Requester, RequesterOrigin, ScreenBinding, ScreenState,
+    DreamJobAdmission, JobClass, Requester, RequesterOrigin, ScreenBinding, ScreenState,
     TargetDenominator, TypedCurationHandlerRequest, TypedCurationHandlerResult, ValidationReceipt,
 };
 use eliot_dreamer_cycle::{
@@ -48,8 +48,8 @@ fn fence() -> StateFence {
     }
 }
 
-fn job(fence: &StateFence) -> DreamJobInput {
-    DreamJobInput {
+fn job(fence: &StateFence) -> DreamJobAdmission {
+    DreamJobAdmission {
         schema_version: 1,
         job_class: JobClass::Curation,
         requester: Requester {

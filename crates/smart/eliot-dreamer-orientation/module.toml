@@ -21,7 +21,7 @@ discriminator = "Generic project Orientation closes without ArchitectureBrief or
 primary_responsibility = "Convert one validated Orientation draft plus a bounded bundle and Current Epistemic Position handles into a candidate-only DreamPacket."
 owned_mutable_state = []
 allowed_effects = []
-inputs = ["DreamJobInput class=Orientation", "DreamInputBundle", "ValidatedDreamDraft", "CurrentEpistemicPosition handles"]
+inputs = ["DreamJobAdmission class=Orientation", "DreamInputBundle", "ValidatedDreamDraft", "CurrentEpistemicPosition handles"]
 outputs = ["DreamPacket candidate", "orientation coverage and quality report", "invalidation conditions"]
 depends_on = ["eliot-contracts", "eliot-evidence", "eliot-epistemic-contracts", "eliot-dreamer-contracts"]
 providers = ["Governor-admitted bundle", "Current Epistemic Position projection", "Dreamer common contracts"]

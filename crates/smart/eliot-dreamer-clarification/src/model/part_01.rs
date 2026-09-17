@@ -1,7 +1,7 @@
 use std::collections::BTreeSet;
 
 use eliot_contracts::{StateFence, canonical_json_bytes, sha256_hex};
-use eliot_dreamer_contracts::{DreamJobInput, JobClass, ValidatedDreamDraft};
+use eliot_dreamer_contracts::{DreamJobAdmission, JobClass, ValidatedDreamDraft};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 

@@ -12,7 +12,7 @@ use crate::error::{
     ContractViolation, check_schema_version, check_text, check_vec_bound, is_hex64_lower,
 };
 use crate::grounding::AttemptIdentity;
-use crate::job::{DreamJobInput, JobClass};
+use crate::job::{DreamJobAdmission, JobClass};
 use eliot_context_contracts::{LossPolicy as ContextLossPolicy, MeasurementUnit};
 use eliot_contracts::{ArtifactId, SourceId};
 use eliot_epistemic_contracts::{DisclosureClass, PositionAssertability, PrivacyHandling};
@@ -110,7 +110,7 @@ pub enum DreamInputRole {
     CurationTargetDispositions,
 }
 
-/// Typed immutable content for roles absent from [`DreamJobInput`].
+/// Typed immutable content for roles absent from [`DreamJobAdmission`].
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(tag = "role", rename_all = "snake_case", deny_unknown_fields)]
 pub enum RecipeInput {
@@ -786,7 +786,7 @@ pub struct DreamJobRecipe {
     /// Canonical digest of all fields except this digest.
     pub recipe_digest: String,
     /// Complete admitted job identity, retained losslessly.
-    pub job: DreamJobInput,
+    pub job: DreamJobAdmission,
     /// Exact attempt identity for this recipe execution.
     #[schemars(with = "AttemptIdentitySchema")]
     pub attempt: AttemptIdentity,
@@ -898,7 +898,7 @@ impl DreamJobRecipe {
             recipe_id: &'a str,
             recipe_revision: &'a str,
             recipe_digest: &'a str,
-            job: &'a DreamJobInput,
+            job: &'a DreamJobAdmission,
             attempt: &'a AttemptIdentity,
             inputs: &'a [RecipeInput],
             context_required: bool,
@@ -1215,7 +1215,7 @@ impl DreamJobRecipe {
     }
 
     /// Validates that this recipe is the exact identity envelope of `job`.
-    pub fn bind_job(&self, job: &DreamJobInput) -> Result<(), ContractViolation> {
+    pub fn bind_job(&self, job: &DreamJobAdmission) -> Result<(), ContractViolation> {
         self.validate()?;
         job.validate()?;
         if self.job != *job {

@@ -15,7 +15,7 @@ use eliot_dreamer_contracts::grounding::{
     ModelDraft, NonMaterialClaim, PrecisionPayload, RouteIdentity,
 };
 use eliot_dreamer_contracts::{
-    BudgetLimits, BundleCompleteness, DreamInputBundle, DreamJobInput, JobClass, Requester,
+    BudgetLimits, BundleCompleteness, DreamInputBundle, DreamJobAdmission, JobClass, Requester,
     RequesterOrigin,
 };
 
@@ -37,8 +37,8 @@ pub fn artifact(value: &str) -> ArtifactId {
     ArtifactId::new(value).expect("artifact")
 }
 
-pub fn job() -> DreamJobInput {
-    DreamJobInput {
+pub fn job() -> DreamJobAdmission {
+    DreamJobAdmission {
         schema_version: 1,
         job_class: JobClass::Curation,
         requester: Requester {

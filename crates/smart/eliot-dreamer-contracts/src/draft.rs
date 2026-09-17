@@ -21,7 +21,7 @@ use crate::{
     budget::BudgetUsage,
     bundle::DreamInputBundle,
     encoding,
-    job::{DreamJobInput, Requester},
+    job::{DreamJobAdmission, Requester},
 };
 use crate::{
     registry::{AtomicityMode, TargetDenominator, TypedCurationHandlerRequest, parse_family},
@@ -371,7 +371,7 @@ impl ValidatedDreamDraft {
 
 /// Acceptance context for [`ValidatedCurationItem::accept`]; all refs required.
 pub struct CurationAcceptanceCtx<'a> {
-    pub job: &'a DreamJobInput,
+    pub job: &'a DreamJobAdmission,
     pub bundle: &'a DreamInputBundle,
     pub receipt: &'a ValidationReceipt,
     pub screen: &'a ScreenBinding,
@@ -749,7 +749,7 @@ mod tests {
         }
     }
     fn ctx_of<'a>(
-        job: &'a crate::job::DreamJobInput,
+        job: &'a crate::job::DreamJobAdmission,
         bundle: &'a crate::bundle::DreamInputBundle,
         receipt: &'a ValidationReceipt,
         screen: &'a crate::screen::ScreenBinding,
@@ -775,7 +775,7 @@ mod tests {
     fn assert_budget(r: &Result<(), ContractViolation>, dim: &str) {
         assert!(matches!(r, Err(ContractViolation::Budget { dimension: g, .. }) if *g == dim));
     }
-    fn job_digest_of(job: &crate::job::DreamJobInput) -> String {
+    fn job_digest_of(job: &crate::job::DreamJobAdmission) -> String {
         let bytes = encoding::canonical_bytes(job).expect("job serializes");
         encoding::digest_hex(&bytes)
     }
@@ -1085,7 +1085,7 @@ mod tests {
     }
     fn accept_probes_permuted_evidence(
         item: &ValidatedCurationItem,
-        job: &DreamJobInput,
+        job: &DreamJobAdmission,
         bundle: &DreamInputBundle,
         screen: &ScreenBinding,
         grounded: &GroundedDreamDraft,
@@ -1122,7 +1122,7 @@ mod tests {
     }
     fn accept_probes(
         item: &ValidatedCurationItem,
-        job: &DreamJobInput,
+        job: &DreamJobAdmission,
         bundle: &DreamInputBundle,
         screen: &ScreenBinding,
         grounded: &GroundedDreamDraft,
@@ -1132,7 +1132,7 @@ mod tests {
         let (jb, rc, sc, gr, rq, us) = (job, &item.receipt, screen, grounded, request, usage);
         let run =
             |it: &ValidatedCurationItem,
-             jb: &DreamJobInput,
+             jb: &DreamJobAdmission,
              rc: &ValidationReceipt,
              sc: &ScreenBinding,
              gr: &GroundedDreamDraft,
@@ -1203,7 +1203,7 @@ mod tests {
 
     fn accept_probes_request(
         item: &ValidatedCurationItem,
-        job: &DreamJobInput,
+        job: &DreamJobAdmission,
         bundle: &DreamInputBundle,
         screen: &ScreenBinding,
         grounded: &GroundedDreamDraft,
@@ -1213,7 +1213,7 @@ mod tests {
         let (jb, rc, sc, gr, rq, us) = (job, &item.receipt, screen, grounded, request, usage);
         let run =
             |it: &ValidatedCurationItem,
-             jb: &DreamJobInput,
+             jb: &DreamJobAdmission,
              rc: &ValidationReceipt,
              sc: &ScreenBinding,
              gr: &GroundedDreamDraft,

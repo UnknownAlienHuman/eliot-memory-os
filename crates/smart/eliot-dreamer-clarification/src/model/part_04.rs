@@ -134,7 +134,7 @@ impl Default for ClarificationPolicy {
 #[serde(deny_unknown_fields)]
 pub struct AdmittedClarificationJob {
     pub schema_version: u32,
-    pub job: DreamJobInput,
+    pub job: DreamJobAdmission,
     pub ambiguities: Vec<ClarificationAmbiguity>,
     pub source_denominator: SourceDenominator,
     pub admission_digest: String,
@@ -181,7 +181,7 @@ impl AdmittedClarificationJob {
         #[derive(Serialize)]
         struct Preimage<'a> {
             schema_version: u32,
-            job: &'a DreamJobInput,
+            job: &'a DreamJobAdmission,
             ambiguities: Vec<ClarificationAmbiguity>,
             source_denominator: SourceDenominator,
         }
@@ -215,7 +215,7 @@ impl AdmittedClarificationJob {
         }
         self.job
             .validate()
-            .map_err(|_| ClarificationError::invalid("job.job", "invalid DreamJobInput"))?;
+            .map_err(|_| ClarificationError::invalid("job.job", "invalid DreamJobAdmission"))?;
         if self.job.job_class != JobClass::Clarification {
             return Err(ClarificationError::binding("job.job_class"));
         }

@@ -78,7 +78,7 @@ impl ActiveAgentOrHumanBoundary {
         Ok(())
     }
 
-    pub fn validate_for(&self, job: &DreamJobInput) -> Result<(), ClarificationError> {
+    pub fn validate_for(&self, job: &DreamJobAdmission) -> Result<(), ClarificationError> {
         self.validate_unsealed()?;
         validate_digest(&self.boundary_digest, "boundary.boundary_digest")?;
         if self.boundary_digest != self.identity_digest()? {

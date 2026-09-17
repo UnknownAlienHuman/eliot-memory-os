@@ -42,7 +42,7 @@ pub const MAX_NOTE_CHARS: usize = 1024;
 
 /// Closed privacy class for one routed call.
 ///
-/// Spellings mirror the admitted `DreamJobInput` privacy profiles
+/// Spellings mirror the admitted `DreamJobAdmission` privacy profiles
 /// (`local_only` / `governed_external`) without importing runtime policy.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize, JsonSchema)]
 pub enum ModelRoutePrivacy {

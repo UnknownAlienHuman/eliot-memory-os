@@ -689,7 +689,7 @@ pub struct CancellationView {
     pub deadline_ms: Option<u64>,
 }
 
-/// Validated job binding (I9.4 `DreamJobInput` projection).
+/// Validated job binding (I9.4 `DreamJobAdmission` projection).
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct JobBinding {
     /// Operation identity.

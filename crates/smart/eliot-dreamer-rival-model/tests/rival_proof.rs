@@ -25,7 +25,7 @@ use eliot_dreamer_contracts::rival::{
     TemporalAvailability,
 };
 use eliot_dreamer_contracts::{
-    BudgetLimits, BudgetUsage, BundleCompleteness, DreamInputBundle, DreamJobInput,
+    BudgetLimits, BudgetUsage, BundleCompleteness, DreamInputBundle, DreamJobAdmission,
     GroundingValidationInput, JobClass, PRESERVATION_DIMENSIONS, PreservationDimension,
     PreservationReport, Requester, RequesterOrigin, STRUCTURED_VALIDATOR_CONTRACT,
     ValidatedDreamDraft, ValidatedGroundingCandidate, ValidationPolicy, ValidationReceipt,
@@ -61,8 +61,8 @@ fn artifact(value: &str) -> ArtifactId {
     ArtifactId::new(value).expect("artifact")
 }
 
-fn job_with_manifest(manifest_digest: String) -> DreamJobInput {
-    DreamJobInput {
+fn job_with_manifest(manifest_digest: String) -> DreamJobAdmission {
+    DreamJobAdmission {
         schema_version: 1,
         job_class: JobClass::Curation,
         requester: Requester {
@@ -260,7 +260,7 @@ fn manifest() -> AllowedReferenceManifest {
     manifest
 }
 
-fn draft_for(manifest: &AllowedReferenceManifest, job: &DreamJobInput) -> ModelDraft {
+fn draft_for(manifest: &AllowedReferenceManifest, job: &DreamJobAdmission) -> ModelDraft {
     let mut claims = vec![claim("claim-1"), claim("claim-2")];
     claims[0].subclaim_ids.insert("claim-2".into());
     claims[0].source_preimage_digest = claims[0].computed_digest().expect("digest");
@@ -349,7 +349,7 @@ fn ledger_for(
     draft: &ModelDraft,
     manifest: &AllowedReferenceManifest,
     policy: &GroundingPolicy,
-    job: &DreamJobInput,
+    job: &DreamJobAdmission,
 ) -> ClaimGroundingLedger {
     use eliot_dreamer_contracts::grounding::AssertionWitness;
     let claims = &draft.claims;

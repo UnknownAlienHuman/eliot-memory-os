@@ -21,7 +21,7 @@ discriminator = "The handler emits one bounded MaintenancePlanCandidate or expli
 primary_responsibility = "Translate bounded self-scope quality, memory, context, capability or Problem evidence into one maintenance plan candidate."
 owned_mutable_state = []
 allowed_effects = []
-inputs = ["DreamJobInput class=Maintenance", "self-quality, memory, context, capability and Problem evidence"]
+inputs = ["DreamJobAdmission class=Maintenance", "self-quality, memory, context, capability and Problem evidence"]
 outputs = ["MaintenancePlanCandidate", "candidate work items", "Human decision packet"]
 depends_on = ["eliot-dreamer-contracts"]
 providers = ["Governor-admitted Dreamer bundle"]

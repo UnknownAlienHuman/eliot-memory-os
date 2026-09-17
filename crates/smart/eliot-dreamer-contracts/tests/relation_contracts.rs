@@ -46,8 +46,8 @@ fn preservation() -> RelationPreservation {
     }
 }
 
-fn job() -> DreamJobInput {
-    DreamJobInput {
+fn job() -> DreamJobAdmission {
+    DreamJobAdmission {
         schema_version: 1,
         job_class: JobClass::Curation,
         requester: Requester {
@@ -267,7 +267,7 @@ fn endpoint(target: &str, role: &str, material: &str) -> RelationEndpoint {
 }
 
 fn relation_item(
-    job_ref: &DreamJobInput,
+    job_ref: &DreamJobAdmission,
     receipt_ref: &ValidationReceipt,
 ) -> ValidatedCurationItem {
     ValidatedCurationItem {

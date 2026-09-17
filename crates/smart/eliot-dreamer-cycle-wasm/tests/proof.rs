@@ -17,7 +17,7 @@ use eliot_contracts::{
     TaskId, TaskRevision, TransactionSequence, canonical_json_bytes, sha256_hex,
 };
 use eliot_dreamer_contracts::{
-    BudgetLimits, BudgetUsage, DreamJobInput, JobClass, Requester, RequesterOrigin, ScreenBinding,
+    BudgetLimits, BudgetUsage, DreamJobAdmission, JobClass, Requester, RequesterOrigin, ScreenBinding,
     ScreenState,
 };
 use eliot_dreamer_cycle::{
@@ -67,12 +67,12 @@ fn fence() -> StateFence {
     }
 }
 
-fn job(fence: &StateFence) -> DreamJobInput {
+fn job(fence: &StateFence) -> DreamJobAdmission {
     job_with_deadline(fence, None)
 }
 
-fn job_with_deadline(fence: &StateFence, deadline_ms: Option<u64>) -> DreamJobInput {
-    DreamJobInput {
+fn job_with_deadline(fence: &StateFence, deadline_ms: Option<u64>) -> DreamJobAdmission {
+    DreamJobAdmission {
         schema_version: 1,
         job_class: JobClass::Curation,
         requester: Requester {
@@ -138,7 +138,7 @@ fn policy_for_phase(fence: &StateFence, phase: CyclePhase, operation_kind: &str)
     policy
 }
 
-fn pending(policy: &CyclePolicy, job: &DreamJobInput) -> PendingRequest {
+fn pending(policy: &CyclePolicy, job: &DreamJobAdmission) -> PendingRequest {
     PendingRequest {
         request_id: RequestId::new("request-1").unwrap(),
         operation_id: OperationId::new("operation-1").unwrap(),
@@ -169,7 +169,7 @@ fn pending(policy: &CyclePolicy, job: &DreamJobInput) -> PendingRequest {
     }
 }
 
-fn state(policy: &CyclePolicy, job: &DreamJobInput, request: PendingRequest) -> DreamerCycleState {
+fn state(policy: &CyclePolicy, job: &DreamJobAdmission, request: PendingRequest) -> DreamerCycleState {
     let mut state = DreamerCycleState {
         schema_version: 1,
         cycle_id: ArtifactId::new("cycle-1").unwrap(),

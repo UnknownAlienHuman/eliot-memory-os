@@ -1,6 +1,6 @@
 //! Borrowed input bounds applied before expensive canonicalization.
 
-use crate::{DreamInputBundle, DreamJobInput, GroundedDreamDraft, ModelDraft, PreservationReport};
+use crate::{DreamInputBundle, DreamJobAdmission, GroundedDreamDraft, ModelDraft, PreservationReport};
 
 /// Maximum canonical bytes admitted by this prototype.
 pub const MAX_CANONICAL_BYTES: usize = 1_048_576;
@@ -44,7 +44,7 @@ fn check_records(
 
 /// Accounts every nested string and collection before canonicalization.
 pub fn preflight_inputs(
-    job: &DreamJobInput,
+    job: &DreamJobAdmission,
     bundle: &DreamInputBundle,
     model: &ModelDraft,
     grounded: &GroundedDreamDraft,

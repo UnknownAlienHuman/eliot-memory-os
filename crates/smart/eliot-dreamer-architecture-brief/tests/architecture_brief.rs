@@ -33,7 +33,7 @@ use eliot_dreamer_contracts::{
     ArchitectureBriefSectionKind, ArchitectureDependencyDenominator, ArchitectureDependencyKind,
     ArchitectureDependencyMember, ArchitectureSourceSnapshot, ArchitectureSourceStatus,
     ArchitectureStatementModality, AttemptBinding, BudgetLimits, BudgetUsage, BundleCompleteness,
-    BundleMaterial, ClaimResidue, DreamInputBundle, DreamJobInput, GroundedDreamDraft, JobClass,
+    BundleMaterial, ClaimResidue, DreamInputBundle, DreamJobAdmission, GroundedDreamDraft, JobClass,
     ModelDraft, NormativePairBinding, OmissionHandle, PRESERVATION_DIMENSIONS,
     PreservationDimension, PreservationReport, Requester, RequesterOrigin, SelfQueryContractError,
     SelfQueryInput, SelfQueryOutputProfile, SelfQueryPolicy, SelfQueryProfile, SourceDisposition,
@@ -202,7 +202,7 @@ fn pair_for(arch_digest: &str) -> NormativePairBinding {
 fn assemble(opts: &BuildOpts) -> SelfQueryInput {
     let fence = test_fence();
     let manifest_digest = sha256_hex(b"manifest-649");
-    let job = DreamJobInput {
+    let job = DreamJobAdmission {
         schema_version: 1,
         job_class: opts.job_class,
         requester: Requester {

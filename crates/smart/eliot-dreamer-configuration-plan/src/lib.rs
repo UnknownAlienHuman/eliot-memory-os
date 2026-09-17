@@ -72,7 +72,7 @@ use eliot_contracts::{canonical_json_bytes, sha256_hex};
 use eliot_dreamer_contracts::CurationRejectionCode;
 use eliot_dreamer_contracts::candidate::DimensionVerdict;
 use eliot_dreamer_contracts::{
-    DreamJobInput, JobClass, PreservationDimension, PreservationReport, ValidatedDreamDraft,
+    DreamJobAdmission, JobClass, PreservationDimension, PreservationReport, ValidatedDreamDraft,
     check_fence, is_hex64_lower,
 };
 
@@ -1145,7 +1145,7 @@ fn intrinsic_receipt_checks(draft: &ValidatedDreamDraft) -> Result<(), Configura
 
 /// Checks job, draft, task, scope, fence, budget, and policy bindings.
 fn intrinsic_binding_checks(
-    job: &DreamJobInput,
+    job: &DreamJobAdmission,
     draft: &ValidatedDreamDraft,
     policy: &ConfigurationPolicy,
 ) -> Result<(), ConfigurationError> {
@@ -1617,7 +1617,7 @@ fn emit_candidate(
 #[allow(clippy::too_many_arguments)]
 #[allow(clippy::too_many_lines)]
 pub fn propose_configuration_change(
-    job: &DreamJobInput,
+    job: &DreamJobAdmission,
     draft: &ValidatedDreamDraft,
     request: &StructuredRequest,
     base: &SnapshotAnchor,
@@ -1978,7 +1978,7 @@ mod tests {
     use eliot_contracts::ResourceGeneration;
     use eliot_dreamer_contracts::BudgetLimits;
     use eliot_dreamer_contracts::CurationRejectionCode;
-    use eliot_dreamer_contracts::DreamJobInput;
+    use eliot_dreamer_contracts::DreamJobAdmission;
     use eliot_dreamer_contracts::JobClass;
     use eliot_dreamer_contracts::Requester;
     use eliot_dreamer_contracts::RequesterOrigin;
@@ -2040,8 +2040,8 @@ mod tests {
     }
 
     /// Returns a configuration-assistance job bound to the test receipt.
-    fn test_job() -> DreamJobInput {
-        DreamJobInput {
+    fn test_job() -> DreamJobAdmission {
+        DreamJobAdmission {
             schema_version: 1,
             job_class: JobClass::ConfigurationAssistance,
             requester: Requester {

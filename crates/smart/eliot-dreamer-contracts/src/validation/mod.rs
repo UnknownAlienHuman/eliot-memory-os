@@ -12,7 +12,7 @@ pub mod policy;
 pub mod structured;
 
 use crate::{
-    BudgetUsage, DreamInputBundle, DreamJobInput, GroundedDreamDraft, ModelDraft,
+    BudgetUsage, DreamInputBundle, DreamJobAdmission, GroundedDreamDraft, ModelDraft,
     PreservationReport, ValidatedDreamDraft,
 };
 use schemars::JsonSchema;
@@ -35,7 +35,7 @@ pub use structured::{
 #[serde(deny_unknown_fields)]
 pub struct ValidatedCandidate {
     /// Frozen job supplied to the gate.
-    pub job: DreamJobInput,
+    pub job: DreamJobAdmission,
     /// Exact input bundle, including materials and accounted omissions.
     pub bundle: DreamInputBundle,
     /// Original structured model value.

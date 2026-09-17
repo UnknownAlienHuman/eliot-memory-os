@@ -19,7 +19,7 @@ use eliot_dreamer_contracts::validation::{
 };
 use eliot_dreamer_contracts::{
     BudgetLimits, BudgetUsage, BundleCompleteness, BundleMaterial, ClaimResidue, DreamInputBundle,
-    DreamJobInput, GroundedDreamDraft, JobClass, ModelDraft, OmissionHandle,
+    DreamJobAdmission, GroundedDreamDraft, JobClass, ModelDraft, OmissionHandle,
     PRESERVATION_DIMENSIONS, PreservationDimension, PreservationReport, Requester, RequesterOrigin,
     SourceDisposition, SupportState, ValidatedCandidate, ValidatedDreamDraft, ValidationPolicy,
     ValidationReceipt,
@@ -100,7 +100,7 @@ fn assemble(
     )
     .expect("valid test epoch");
     let fence = StateFence::new(epoch, ResourceGeneration::genesis());
-    let job = DreamJobInput {
+    let job = DreamJobAdmission {
         schema_version: 1,
         job_class: JobClass::Orientation,
         requester: Requester {

@@ -59,7 +59,7 @@
 use eliot_contracts::sha256_hex;
 use eliot_dreamer_contracts::candidate::{DimensionVerdict, PreservationReport};
 use eliot_dreamer_contracts::{
-    CurationRejectionCode, DreamJobInput, JobClass, PreservationDimension, ValidatedDreamDraft,
+    CurationRejectionCode, DreamJobAdmission, JobClass, PreservationDimension, ValidatedDreamDraft,
     check_fence, is_hex64_lower,
 };
 
@@ -1310,7 +1310,7 @@ fn intrinsic_receipt_checks(draft: &ValidatedDreamDraft) -> Result<(), Orchestra
 
 /// Checks job, draft, task, scope, fence, budget, and policy bindings.
 fn intrinsic_binding_checks(
-    job: &DreamJobInput,
+    job: &DreamJobAdmission,
     draft: &ValidatedDreamDraft,
     policy: &DecompositionPolicy,
 ) -> Result<(), OrchestrationPlanError> {
@@ -2003,7 +2003,7 @@ fn emit_candidate(
     groups: &[Vec<String>],
     omitted: &[String],
     draft: &ValidatedDreamDraft,
-    job: &DreamJobInput,
+    job: &DreamJobAdmission,
     outcome_note: &str,
 ) -> Result<WorkUnitDecomposition, OrchestrationPlanError> {
     let preservation = build_preservation(outcome)?;
@@ -2061,7 +2061,7 @@ fn emit_candidate(
 #[allow(clippy::too_many_arguments)]
 #[allow(clippy::too_many_lines)]
 pub fn propose_work_unit_decomposition(
-    job: &DreamJobInput,
+    job: &DreamJobAdmission,
     draft: &ValidatedDreamDraft,
     objective: &PlanObjective,
     requirements: &[PlanRequirement],
@@ -2335,7 +2335,7 @@ mod tests {
     use eliot_contracts::ResourceGeneration;
     use eliot_dreamer_contracts::BudgetLimits;
     use eliot_dreamer_contracts::CurationRejectionCode;
-    use eliot_dreamer_contracts::DreamJobInput;
+    use eliot_dreamer_contracts::DreamJobAdmission;
     use eliot_dreamer_contracts::JobClass;
     use eliot_dreamer_contracts::Requester;
     use eliot_dreamer_contracts::RequesterOrigin;
@@ -2397,8 +2397,8 @@ mod tests {
     }
 
     /// Returns an orchestration-planning job bound to the test receipt.
-    fn test_job() -> DreamJobInput {
-        DreamJobInput {
+    fn test_job() -> DreamJobAdmission {
+        DreamJobAdmission {
             schema_version: 1,
             job_class: JobClass::OrchestrationPlanning,
             requester: Requester {

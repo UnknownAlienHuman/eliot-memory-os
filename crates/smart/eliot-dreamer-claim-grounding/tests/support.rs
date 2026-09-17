@@ -19,7 +19,7 @@ use eliot_dreamer_contracts::grounding::{
     ModelDraft, PrecisionPayload, RouteIdentity, ScreenTargetBinding, TypedEvidenceAssertion,
 };
 use eliot_dreamer_contracts::{
-    AtomicityMode, BudgetLimits, BundleCompleteness, DreamInputBundle, DreamJobInput, JobClass,
+    AtomicityMode, BudgetLimits, BundleCompleteness, DreamInputBundle, DreamJobAdmission, JobClass,
     Requester, RequesterOrigin, ScreenBinding, ScreenState, TargetDenominator,
 };
 
@@ -241,8 +241,8 @@ pub fn complete_absence_payload() -> (PrecisionPayload, CoverageDenominator, Cov
     )
 }
 
-pub fn job(manifest_digest: String, class: JobClass) -> DreamJobInput {
-    DreamJobInput {
+pub fn job(manifest_digest: String, class: JobClass) -> DreamJobAdmission {
+    DreamJobAdmission {
         schema_version: 1,
         job_class: class,
         requester: Requester {

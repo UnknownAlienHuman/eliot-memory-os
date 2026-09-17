@@ -21,7 +21,7 @@ discriminator = "The handler emits exactly one question or an explicit no-questi
 primary_responsibility = "Select and render one concise discriminative clarification question, why it matters and the safe fallback if unanswered."
 owned_mutable_state = []
 allowed_effects = []
-inputs = ["DreamJobInput class=Clarification", "ValidatedDreamDraft", "active-agent or Human-boundary projection"]
+inputs = ["DreamJobAdmission class=Clarification", "ValidatedDreamDraft", "active-agent or Human-boundary projection"]
 outputs = ["ClarificationDecision", "ClarificationCandidate", "routing recommendation", "safe fallback and expiry"]
 depends_on = ["eliot-contracts", "eliot-dreamer-contracts"]
 providers = ["Governor-admitted Dreamer bundle", "active agent or Human boundary owner"]

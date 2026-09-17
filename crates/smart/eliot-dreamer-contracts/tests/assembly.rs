@@ -16,7 +16,7 @@ use eliot_dreamer_contracts::grounding::AttemptIdentity;
 use eliot_dreamer_contracts::{
     AssemblyFrontier, AssemblyOmissionAccounting, AssemblyOmissionConstraint, AssemblyReserve,
     AssemblyReserveSet, AssemblyStop, AssemblyStopReason, BudgetLimits, DreamInputRole,
-    DreamJobInput, DreamJobRecipe, JobClass, MaterialDisposition, MaterialLedgerEntry,
+    DreamJobAdmission, DreamJobRecipe, JobClass, MaterialDisposition, MaterialLedgerEntry,
     MaterialOutcomeReason, MaterialRepresentation, OmissionHandle, RECIPE_SCHEMA_VERSION,
     RecipeInput, RecipeRole, Requester, RequesterOrigin, RoleDisposition, RoleOmissionPolicy,
     RoleOutcome, RoleOutcomeState, SourceRule, SourceRuleKind, SuppliedItemIdentity, digest_hex,
@@ -52,8 +52,8 @@ fn budget() -> BudgetLimits {
     }
 }
 
-fn job() -> DreamJobInput {
-    DreamJobInput {
+fn job() -> DreamJobAdmission {
+    DreamJobAdmission {
         schema_version: 1,
         job_class: JobClass::Orientation,
         requester: Requester {
