@@ -162,6 +162,7 @@ members = [
   "crates/smart/eliot-dreamer-orientation",  # agent_order 6
   "crates/smart/eliot-dreamer-failure",  # agent_order 26
   "crates/smart/eliot-dreamer-structure-repair",  # agent_order 27
+  "crates/smart/eliot-dreamer-reconsolidation",  # agent_order 28
 ]
 
 # Capability cells declared by `[package.metadata.eliot]` with `agent_order`
@@ -179,7 +180,6 @@ exclude = [
   "crates/smart/eliot-dreamer-clarification",  # agent_order 7
   "crates/smart/eliot-dreamer-architecture-brief",  # agent_order 8
   "crates/smart/eliot-dreamer-implementation-brief",  # agent_order 9
-  "crates/smart/eliot-dreamer-reconsolidation",  # agent_order 28
   "crates/smart/eliot-dreamer-accessibility",  # agent_order 29
   "crates/smart/eliot-dreamer-memory-repair",  # agent_order 30
   "crates/smart/eliot-dreamer-curation",  # agent_order 31
