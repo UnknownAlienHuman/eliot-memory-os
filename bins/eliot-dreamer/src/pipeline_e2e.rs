@@ -11,10 +11,12 @@
 //! result edge asserts the Slice-8 stdout contract: exactly one JSONL line
 //! that round-trips to the identical view.
 //!
-//! `submit` itself is not driven here: the Slice-2 controller/bundle stages
-//! (merged scope) still gate on Governor-resolved material ahead of these
-//! stages, and the live view needs a Kernel transport. These proofs cover
-//! the stages this workstream owns, in the exact order `submit` threads them.
+//! `submit` itself is not driven here: the Slice-A gate (proved separately),
+//! the Slice-2 controller/bundle stages (merged scope), and the live view
+//! (Kernel transport) frame the chain on both sides. The chain tests below
+//! drive [`run_admitted_pipeline`](crate::run_admitted_pipeline) — the exact
+//! function `submit` calls — so stage order and terminal outcomes are proved
+//! for the same code `submit` executes.
 
 use std::num::NonZeroU64;
 
@@ -35,7 +37,7 @@ use eliot_dreamer_contracts::validation::structured::{
 };
 use crate::{
     DreamJobInput, DreamResult, DreamerError, JobClass, JobState, KERNEL_ADMISSION_REQUIRED,
-    KernelJobAdmission,
+    KernelJobAdmission, run_admitted_pipeline,
 };
 
 const TEST_LINEAGE_E2E: &str = "550e8400-e29b-41d4-a716-446655440000";
@@ -215,5 +217,70 @@ fn curation_pipeline_routes_a31_without_class_refusal() {
     assert!(
         message.contains("ports") || message.contains("screen"),
         "refusal must name the boundary, got {message}"
+    );
+}
+
+/// The exact admitted chain `submit` executes past the bundle plan-factor for
+/// Orientation: one call proves screen, model, grounding, validation, and
+/// native dispatch run in canonical order to a packet result. (`submit`
+/// itself additionally needs the Slice-2 controller/bundle gates and a live
+/// Kernel transport, so the chain — the same function `submit` calls — is
+/// the provable unit in-process.)
+#[test]
+fn submit_chain_returns_orientation_packet_with_jsonl() {
+    let admission = admitted_admission("job-e2e-chain-orientation");
+    let job = job_with_handles("job-e2e-chain-orientation", JobClass::Orientation);
+    let result = run_admitted_pipeline(&admission, &job);
+    let Ok(DreamResult::Packet(packet)) = result else {
+        panic!("submit chain must project orientation, got {result:?}");
+    };
+    assert_eq!(packet.scope_id, SCOPE_E2E);
+    assert_eq!(packet.source_coverage.evidence, job.evidence_handles);
+    let job_id = packet.job_id.clone();
+    let view = project_result_view(&job_id, JobState::Completed, Some(DreamResult::Packet(packet)));
+    let line = render_jsonl(&view).expect("chain receipt must render");
+    assert!(!line.contains('\n'), "chain receipt must be one JSONL line");
+    let roundtrip: crate::JobView =
+        serde_json::from_str(&line).expect("chain receipt must round-trip");
+    assert_eq!(roundtrip, view);
+}
+
+/// The exact admitted chain `submit` executes, for Curation: the A-20 screen
+/// admits the eligible set and threads its binding into the A-31 fan-in,
+/// which waits at the live-port boundary — with the binding passed, never a
+/// class refusal. This proves no premature gate blocks Curation before the
+/// screen: the chain fails, if at all, only at the terminal owner boundary.
+#[test]
+fn submit_chain_threads_screen_binding_to_a31_boundary() {
+    let admission = admitted_admission("job-e2e-chain-curation");
+    let job = job_with_handles("job-e2e-chain-curation", JobClass::Curation);
+    // The screen stage the chain threads must admit a valid binding first.
+    let ScreenDecision::Screened {
+        eligible_targets,
+        binding,
+        ..
+    } = resolve_screen_inputs(&admission, &job).expect("chain screen must admit")
+    else {
+        panic!("curation must screen, not pass through");
+    };
+    assert!(!eligible_targets.is_empty());
+    binding
+        .validate()
+        .expect("threaded binding must satisfy the real owner check");
+    // The whole chain then reaches the terminal A-31 boundary with that
+    // binding threaded through — never a class refusal, never silent.
+    let refused = run_admitted_pipeline(&admission, &job);
+    assert!(
+        !matches!(refused, Err(DreamerError::UnsupportedJobClass(_))),
+        "chain must never refuse curation by class, got {refused:?}"
+    );
+    let Err(error) = refused else {
+        panic!("curation without injected ports must wait at the boundary");
+    };
+    assert_eq!(error.code(), "DREAMER_REQUEST_REJECTED");
+    assert_ne!(error.code(), KERNEL_ADMISSION_REQUIRED);
+    assert!(
+        format!("{error}").contains("ports"),
+        "chain must end at the live-port boundary, got {error:?}"
     );
 }

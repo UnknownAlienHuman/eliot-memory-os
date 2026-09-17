@@ -11,26 +11,19 @@
 //! extending the closed taxonomy breaks compilation here until the new class
 //! is assigned an owning slice.
 //!
-//! Two seams live here:
-//!
-//! - [`dispatch_admitted_result`] is the class-only seam driven by `submit`
-//!   today: it takes only the class, so refused classes fail closed before any
-//!   Kernel-facing call and admitted classes bind their distinct
-//!   [`DispatchedOutcome`] as pure routing. Curation is no
-//!   longer refused here: A-31 is the sole curation fan-in, so the Curation
-//!   arm genuinely resolves the closed owner registry and runs the owner
-//!   port-boundary validation instead of returning `UnsupportedJobClass`.
-//! - [`dispatch_admitted`] is the Slice-7 owner entry: it takes the Kernel
-//!   admission, the semantic job, the A-20 screen binding (for Curation), and
-//!   the closed class, and returns the typed [`DreamResult`]. Orientation
-//!   derives the v1 hypothesis pair, validates it through the real v1 A-05
-//!   entry, and genuinely invokes `build_projection` before projecting the
-//!   packet; Curation genuinely resolves descriptors, validates
-//!   registry/policy/screen, and refuses at the live-port boundary;
-//!   `ResearchSynthesis` and `Maintenance` fail closed naming their missing
-//!   Governor-resolved inputs; the remaining five classes refuse with
-//!   `UnsupportedJobClass` (they never reach here via `submit`; direct calls
-//!   refuse).
+//! [`dispatch_admitted`] is the single Slice-7 owner entry: it takes the
+//! Kernel admission, the semantic job, the A-20 screen binding (for
+//! Curation), and the closed class, and returns the typed [`DreamResult`].
+//! There is no class-only stub seam: every arm either genuinely invokes its
+//! owner or refuses naming the exact missing governed input. Orientation
+//! derives the v1 hypothesis pair, validates it through the real v1 A-05
+//! entry, and genuinely invokes `build_projection` before projecting the
+//! packet; Curation genuinely resolves descriptors, validates
+//! registry/policy/screen, and refuses at the live-port boundary;
+//! `ResearchSynthesis` and `Maintenance` fail closed naming their missing
+//! Governor-resolved inputs; the remaining five classes refuse with
+//! `UnsupportedJobClass` (they never reach here via `submit`; direct calls
+//! refuse).
 //!
 //! Fail-closed: every refusal is [`DreamerError::InvalidAdmission`] (the
 //! request-rejected code) or [`DreamerError::UnsupportedJobClass`], never the
@@ -92,100 +85,6 @@ const MAINTENANCE_INPUTS_REFUSAL: &str =
 /// Governor-resolved bundle material and is never invented here.
 const FRAME_SOURCE_REFUSAL: &str =
     "admitted orientation dispatch requires Governor-resolved frame source";
-
-/// Admitted dispatch outcome: exactly one per Slice-A admitted class.
-///
-/// Local to this stage to avoid coupling the dispatch table to the Slice-1
-/// routing identities: refusal authority stays in Slice-A/1, this enum only
-/// names which native owner an admitted job waits on.
-#[allow(
-    clippy::enum_variant_names,
-    reason = "the Admitted postfix mirrors the Slice-1 ClassArm convention so admitted arms read identically at the dispatch site"
-)]
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum DispatchedOutcome {
-    /// Orientation waits on `eliot-dreamer-orientation` `build_projection`.
-    OrientationAdmitted,
-    /// Research synthesis waits on its native research-synthesis owner.
-    ResearchSynthesisAdmitted,
-    /// Maintenance waits on its native maintenance owner.
-    MaintenanceAdmitted,
-}
-
-/// Resolves the native owner for one closed job class.
-///
-/// Pure routing: each of the nine classes names its exact native owner with
-/// no fallthrough and no owner call, so refused classes fail closed before
-/// any Kernel-facing call. The five Slice-A refused classes return
-/// [`DreamerError::UnsupportedJobClass`] carrying their distinct class.
-/// Curation routes through the genuine A-31 boundary for real (closed
-/// registry plus the owner port-set validation) and refuses at the live-port
-/// boundary. The three admitted classes bind their distinct
-/// [`DispatchedOutcome`]; the owner invocation itself lives in
-/// [`dispatch_admitted`], which `submit` runs once the pipeline threads the
-/// admitted pair through.
-pub(crate) fn dispatch_admitted_result(
-    job_class: JobClass,
-) -> Result<DispatchedOutcome, DreamerError> {
-    match job_class {
-        // Native owner: eliot-dreamer-curation (A-31 sole fan-in). Routes for
-        // real through the registry/port boundary instead of refusing: the
-        // class-only seam carries no screen or batch material, so only the
-        // registry and port-set checks run here; the full entry
-        // (registry/policy/screen/ports) lives in `dispatch_curation`.
-        JobClass::Curation => dispatch_curation_class_only(),
-        // Native owner: maintenance/clarification owner. Slice-A refused.
-        JobClass::Clarification => {
-            Err(DreamerError::UnsupportedJobClass(JobClass::Clarification))
-        }
-        // Native owner: architecture self-query owner. Slice-A refused.
-        JobClass::ArchitectureSelfQuery => {
-            Err(DreamerError::UnsupportedJobClass(
-                JobClass::ArchitectureSelfQuery,
-            ))
-        }
-        // Native owner: development-diagnosis owner. Slice-A refused.
-        JobClass::DevelopmentDiagnosis => {
-            Err(DreamerError::UnsupportedJobClass(
-                JobClass::DevelopmentDiagnosis,
-            ))
-        }
-        // Native owner: orchestration-planning owner. Slice-A refused.
-        JobClass::OrchestrationPlanning => {
-            Err(DreamerError::UnsupportedJobClass(
-                JobClass::OrchestrationPlanning,
-            ))
-        }
-        // Native owner: configuration-assistance owner. Slice-A refused.
-        JobClass::ConfigurationAssistance => {
-            Err(DreamerError::UnsupportedJobClass(
-                JobClass::ConfigurationAssistance,
-            ))
-        }
-        // Native owner: eliot-dreamer-orientation build_projection.
-        JobClass::Orientation => Ok(DispatchedOutcome::OrientationAdmitted),
-        // Native owner: research-synthesis owner.
-        JobClass::ResearchSynthesis => Ok(DispatchedOutcome::ResearchSynthesisAdmitted),
-        // Native owner: maintenance owner.
-        JobClass::Maintenance => Ok(DispatchedOutcome::MaintenanceAdmitted),
-    }
-}
-
-/// Runs the class-only Curation route through the genuine A-31 boundary.
-///
-/// Resolves the owner-published closed registry for real and runs the owner
-/// port-set validation for real over the empty in-binary port set. The class
-/// seam carries no screen binding and no validated batch, so registry closure
-/// plus the port boundary are the genuine checks available here; the terminal
-/// outcome is the precise live-ports refusal. No handler is invented and none
-/// is invoked.
-fn dispatch_curation_class_only() -> Result<DispatchedOutcome, DreamerError> {
-    let registry = canonical_registry().map_err(|error| dispatch_denied(&error))?;
-    registry
-        .validate_closure()
-        .map_err(|error| dispatch_denied(&error))?;
-    Err(curation_port_boundary_refusal(&registry))
-}
 
 /// Maps a native owner refusal to a typed fail-closed refusal.
 ///
@@ -588,137 +487,6 @@ fn curation_denied(error: &CurationRoutingError) -> DreamerError {
 mod slice_7_dispatch_tests {
     use super::*;
 
-    use crate::KERNEL_ADMISSION_REQUIRED;
-
-    /// Nine closed classes route distinctly with no wildcard arm: the five
-    /// Slice-A refused classes carry their exact class payload, Curation
-    /// routes through the genuine A-31 port boundary, and each admitted class
-    /// binds its distinct routing outcome. A tenth class would break
-    /// compilation instead of misrouting.
-    #[test]
-    fn all_nine_classes_route_distinctly() {
-        for class in [
-            JobClass::Clarification,
-            JobClass::ArchitectureSelfQuery,
-            JobClass::DevelopmentDiagnosis,
-            JobClass::OrchestrationPlanning,
-            JobClass::ConfigurationAssistance,
-        ] {
-            let refused = dispatch_admitted_result(class);
-            assert!(
-                matches!(refused, Err(DreamerError::UnsupportedJobClass(refused_class)) if refused_class == class),
-                "class {class:?} must refuse with UnsupportedJobClass({class:?})"
-            );
-        }
-        let curation = dispatch_admitted_result(JobClass::Curation);
-        assert!(
-            matches!(
-                curation,
-                Err(DreamerError::InvalidAdmission(CURATION_PORTS_REFUSAL))
-            ),
-            "Curation must route to the A-31 port boundary, got {curation:?}"
-        );
-        for (class, expected) in [
-            (JobClass::Orientation, DispatchedOutcome::OrientationAdmitted),
-            (
-                JobClass::ResearchSynthesis,
-                DispatchedOutcome::ResearchSynthesisAdmitted,
-            ),
-            (JobClass::Maintenance, DispatchedOutcome::MaintenanceAdmitted),
-        ] {
-            let routed = dispatch_admitted_result(class);
-            assert_eq!(
-                routed,
-                Ok(expected),
-                "class {class:?} must bind its distinct routing outcome"
-            );
-        }
-        let outcomes = [
-            DispatchedOutcome::OrientationAdmitted,
-            DispatchedOutcome::ResearchSynthesisAdmitted,
-            DispatchedOutcome::MaintenanceAdmitted,
-        ];
-        assert_ne!(outcomes[0], outcomes[1]);
-        assert_ne!(outcomes[0], outcomes[2]);
-        assert_ne!(outcomes[1], outcomes[2]);
-    }
-
-    /// Each Slice-A refused class fails closed before any Kernel contact with
-    /// the request-rejected code, never the Kernel-admission code. The proof
-    /// is structural: the resolver takes only `JobClass` and returns a plain
-    /// result, so there is no port, transport, or admission channel it could
-    /// call; `submit` runs dispatch before `check_claimed`/`live_view`.
-    #[test]
-    fn refused_fail_closed_before_kernel() {
-        for class in [
-            JobClass::Clarification,
-            JobClass::ArchitectureSelfQuery,
-            JobClass::DevelopmentDiagnosis,
-            JobClass::OrchestrationPlanning,
-            JobClass::ConfigurationAssistance,
-        ] {
-            let Err(error) = dispatch_admitted_result(class) else {
-                panic!("refused class {class:?} must fail");
-            };
-            assert_eq!(error.code(), "DREAMER_REQUEST_REJECTED");
-            assert_ne!(
-                error.code(),
-                KERNEL_ADMISSION_REQUIRED,
-                "refusal for {class:?} must not borrow the Kernel-admission code"
-            );
-            assert_eq!(
-                format!("{error}"),
-                format!("unsupported Dreamer job class: {class:?}")
-            );
-        }
-    }
-
-    /// Curation routes through the genuine A-31 boundary even on the
-    /// class-only seam: the refusal names the missing Governor-injected live
-    /// ports (never `UnsupportedJobClass`), carries the request-rejected
-    /// code, and never the Kernel-admission code.
-    #[test]
-    fn curation_class_only_routes_to_port_boundary() {
-        let Err(error) = dispatch_admitted_result(JobClass::Curation) else {
-            panic!("class-only Curation must wait for live ports");
-        };
-        assert!(
-            matches!(
-                error,
-                DreamerError::InvalidAdmission(CURATION_PORTS_REFUSAL)
-            ),
-            "Curation must name the live-port boundary, got {error:?}"
-        );
-        assert_eq!(error.code(), "DREAMER_REQUEST_REJECTED");
-        assert_ne!(error.code(), KERNEL_ADMISSION_REQUIRED);
-        assert!(
-            !matches!(error, DreamerError::UnsupportedJobClass(_)),
-            "Curation must never refuse with UnsupportedJobClass"
-        );
-    }
-
-    /// Admitted classes bind their distinct routing outcomes with no owner
-    /// call: routing is pure, so the outcome carries the request identity
-    /// forward and the owner invocation in [`dispatch_admitted`] decides.
-    #[test]
-    fn admitted_classes_bind_distinct_routing_outcomes() {
-        for (class, expected) in [
-            (JobClass::Orientation, DispatchedOutcome::OrientationAdmitted),
-            (
-                JobClass::ResearchSynthesis,
-                DispatchedOutcome::ResearchSynthesisAdmitted,
-            ),
-            (JobClass::Maintenance, DispatchedOutcome::MaintenanceAdmitted),
-        ] {
-            let routed = dispatch_admitted_result(class);
-            assert_eq!(
-                routed,
-                Ok(expected),
-                "class {class:?} must bind {expected:?}, got {routed:?}"
-            );
-        }
-    }
-
     /// Every native owner refusal shape maps to the request-rejected code,
     /// never to the Kernel-admission code.
     #[test]
@@ -1045,7 +813,10 @@ mod slice_7_native_owner_tests {
     }
 
     /// The five classes `submit` never admits refuse direct dispatch calls
-    /// with their exact class payload and the request-rejected code.
+    /// with their exact class payload and the request-rejected code, before
+    /// any Kernel contact: `dispatch_admitted` takes only the admitted pair
+    /// plus the class, so there is no port, transport, or admission channel
+    /// it could call.
     #[test]
     fn refused_classes_reject_direct_dispatch() {
         for class in [
@@ -1062,8 +833,15 @@ mod slice_7_native_owner_tests {
                 "class {class:?} must refuse with UnsupportedJobClass({class:?}), got {refused:?}"
             );
             assert_eq!(
-                refused.map_err(|error| error.code()),
+                refused.as_ref().map_err(DreamerError::code),
                 Err("DREAMER_REQUEST_REJECTED")
+            );
+            assert_eq!(
+                format!(
+                    "{}",
+                    refused.expect_err("refused class must fail")
+                ),
+                format!("unsupported Dreamer job class: {class:?}")
             );
         }
     }

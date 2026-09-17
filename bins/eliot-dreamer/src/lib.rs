@@ -274,19 +274,25 @@ fn port_denied(error: &kernel_port::KernelPortError) -> DreamerError {
 /// plain result: refusal performs zero transport and zero status calls by
 /// construction (there is no port, transport, or admission channel to call).
 ///
+/// Curation passes: its six handlers were admitted to the workspace (Wave S2,
+/// #966) and A-31 is its sole fan-in, so the class flows to the screen and
+/// dispatch stages instead of refusing here.
+///
 /// Exhaustive with no wildcard arm: extending the closed taxonomy breaks
 /// compilation here until the new class is assigned an owning slice.
 fn refuse_unsupported_job_class(job: &DreamJobInput) -> Result<(), DreamerError> {
     match job.job_class {
-        JobClass::Curation
-        | JobClass::Clarification
+        JobClass::Clarification
         | JobClass::ArchitectureSelfQuery
         | JobClass::DevelopmentDiagnosis
         | JobClass::OrchestrationPlanning
         | JobClass::ConfigurationAssistance => {
             Err(DreamerError::UnsupportedJobClass(job.job_class))
         }
-        JobClass::Orientation | JobClass::ResearchSynthesis | JobClass::Maintenance => Ok(()),
+        JobClass::Orientation
+        | JobClass::Curation
+        | JobClass::ResearchSynthesis
+        | JobClass::Maintenance => Ok(()),
     }
 }
 
@@ -301,7 +307,7 @@ fn refuse_unsupported_job_class(job: &DreamJobInput) -> Result<(), DreamerError>
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum ClassArm {
     OrientationAdmitted,
-    CurationRefused,
+    CurationAdmitted,
     ClarificationRefused,
     ResearchSynthesisAdmitted,
     ArchitectureSelfQueryRefused,
@@ -319,7 +325,7 @@ enum ClassArm {
 fn dispatch_class(class: JobClass) -> ClassArm {
     match class {
         JobClass::Orientation => ClassArm::OrientationAdmitted,
-        JobClass::Curation => ClassArm::CurationRefused,
+        JobClass::Curation => ClassArm::CurationAdmitted,
         JobClass::Clarification => ClassArm::ClarificationRefused,
         JobClass::ResearchSynthesis => ClassArm::ResearchSynthesisAdmitted,
         JobClass::ArchitectureSelfQuery => ClassArm::ArchitectureSelfQueryRefused,
@@ -372,6 +378,45 @@ fn dispatch_admission_with(
     Ok((arm, digest))
 }
 
+/// Runs the admitted stage chain for one Kernel-bound job.
+///
+/// This is the exact chain [`AuthenticatedKernelJobPort::submit`] executes
+/// past the bundle plan: A-20 screen, T12-07 model derivation with its owner
+/// proof, A-14b grounding through the real owner, then native dispatch — A-31
+/// for Curation (which owns its separate post-handler carrier and never
+/// enters common A-05 validation), A-05 validation plus the native owner for
+/// every other admitted class. Each stage genuinely invokes its owner
+/// exactly once; any refusal fails closed with zero further stage calls.
+/// Extracted as a free function so the chain is unit-provable without a live
+/// Kernel transport (`submit` adds only the claim check before it and the
+/// live view after it).
+fn run_admitted_pipeline(
+    admission: &KernelJobAdmission,
+    job: &DreamJobInput,
+) -> Result<DreamResult, DreamerError> {
+    let screen = curation_screen_stage::resolve_screen_inputs(admission, job)?;
+    let model_inputs = model_stage::resolve_model_inputs(admission, job)?;
+    let draft = model_stage::run_admitted_model(model_inputs)?;
+    let grounding_request = grounding_stage::resolve_grounding_inputs(admission, job, draft)?;
+    let grounded = grounding_stage::ground_admitted_draft(grounding_request)?;
+    let screen_binding = match screen {
+        curation_screen_stage::ScreenDecision::Screened { binding, .. } => Some(binding),
+        curation_screen_stage::ScreenDecision::PassThrough(_) => None,
+    };
+    if job.job_class == JobClass::Curation {
+        // Curation owns the A-31 post-handler carrier: the common A-05
+        // owner itself rejects Curation (`UnsupportedJobShape`), so the
+        // class routes straight to its sole fan-in.
+        dispatch_stage::dispatch_admitted(admission, job, screen_binding, job.job_class)
+    } else {
+        let _validation = validation_stage::resolve_validation_inputs(admission, job)?;
+        let validation_input =
+            admitted_material::validation_input_for(admission, job, grounded, Some(0))?;
+        let _validated = validation_stage::validate_admitted_draft(&validation_input)?;
+        dispatch_stage::dispatch_admitted(admission, job, screen_binding, job.job_class)
+    }
+}
+
 impl KernelJobPort for AuthenticatedKernelJobPort {
     fn handshake(&mut self) -> Result<KernelHandshake, DreamerError> {
         Ok(self.handshake)
@@ -386,23 +431,15 @@ impl KernelJobPort for AuthenticatedKernelJobPort {
         // first, so refused classes fail closed before any Kernel-facing call
         // and before any controller or bundle work. Admitted jobs prove the
         // Kernel-claimed binding next, then run the #806 controller step, the
-        // A-04 bundle plan, the A-20 curation screen (pass-through for
-        // non-Curation classes, validated binding for Curation), the T12-07
-        // model derivation with its owner proof, A-14b grounding through the
-        // real owner, and native dispatch — A-31 for Curation (which owns its
-        // separate post-handler carrier and never enters common A-05
-        // validation), A-05 validation plus the native owner for every other
-        // admitted class — each genuinely invoking its owner exactly once.
+        // A-04 bundle plan, and the admitted stage chain
+        // ([`run_admitted_pipeline`]: screen, model, grounding, native
+        // dispatch), each stage genuinely invoking its owner exactly once.
         // Only then is the live Kernel-proved disposition observed: the
         // Kernel owns state authority, so the computed result attaches to the
         // live view instead of inventing terminal state. The Slice-8 result
         // stage projects the view and proves its JSONL encoding; the binary
         // receipt edge (`main.rs`) emits the line on stdout.
         let (_arm, _digest) = dispatch_admission(job)?;
-        // Pure native-owner routing runs before any Kernel-facing call, so a
-        // class with no owner refuses here with zero transport and zero
-        // status calls by construction.
-        let _routing = dispatch_stage::dispatch_admitted_result(job.job_class)?;
         self.check_claimed(admission)?;
         let (state, observed, policy, observation_time_ms) =
             controller::resolve_cycle_inputs(admission, job)?;
@@ -410,36 +447,7 @@ impl KernelJobPort for AuthenticatedKernelJobPort {
             controller::step_admitted_cycle(&state, &observed, &policy, observation_time_ms)?;
         let request = bundle_stage::resolve_bundle_request(admission, job)?;
         let _plan = bundle_stage::plan_admitted_bundle(request)?;
-        let screen = curation_screen_stage::resolve_screen_inputs(admission, job)?;
-        let model_inputs = model_stage::resolve_model_inputs(admission, job)?;
-        let draft = model_stage::run_admitted_model(model_inputs)?;
-        let grounding_request =
-            grounding_stage::resolve_grounding_inputs(admission, job, draft)?;
-        let grounded = grounding_stage::ground_admitted_draft(grounding_request)?;
-        let screen_binding = match screen {
-            curation_screen_stage::ScreenDecision::Screened {
-                binding, ..
-            } => Some(binding),
-            curation_screen_stage::ScreenDecision::PassThrough(_) => None,
-        };
-        let result = if job.job_class == JobClass::Curation {
-            // Curation owns the A-31 post-handler carrier: the common A-05
-            // owner itself rejects Curation (`UnsupportedJobShape`), so the
-            // class routes straight to its sole fan-in.
-            dispatch_stage::dispatch_admitted(admission, job, screen_binding, job.job_class)?
-        } else {
-            let _validation =
-                validation_stage::resolve_validation_inputs(admission, job)?;
-            let validation_input = admitted_material::validation_input_for(
-                admission,
-                job,
-                grounded,
-                Some(0),
-            )?;
-            let _validated =
-                validation_stage::validate_admitted_draft(&validation_input)?;
-            dispatch_stage::dispatch_admitted(admission, job, screen_binding, job.job_class)?
-        };
+        let result = run_admitted_pipeline(admission, job)?;
         let view = self.live_view()?;
         let projected =
             result_stage::project_result_view(&view.job_id, view.state, Some(result));
@@ -978,11 +986,6 @@ mod slice_a_dispatch_tests {
     }
 
     #[test]
-    fn curation_refuses_without_kernel_contact() {
-        assert_refused(JobClass::Curation);
-    }
-
-    #[test]
     fn clarification_refuses_without_kernel_contact() {
         assert_refused(JobClass::Clarification);
     }
@@ -1007,13 +1010,15 @@ mod slice_a_dispatch_tests {
         assert_refused(JobClass::ConfigurationAssistance);
     }
 
-    /// The three Slice-A admitted classes fall through to the existing path:
+    /// The four Slice-A admitted classes fall through to the existing path:
     /// the gate returns `Ok`, preserving the `check_claimed`/`live_view`
-    /// behavior (including its `None`-result projection) unchanged.
+    /// behavior (including its `None`-result projection) unchanged. Curation
+    /// passes since Wave S2 (#966): A-31 is its sole fan-in.
     #[test]
     fn admitted_classes_pass_the_slice_a_gate() {
         for class in [
             JobClass::Orientation,
+            JobClass::Curation,
             JobClass::ResearchSynthesis,
             JobClass::Maintenance,
         ] {
@@ -1093,7 +1098,7 @@ mod slice_1_dispatch_tests {
     fn all_nine_classes_route_to_distinct_arms() {
         let routed = [
             (JobClass::Orientation, ClassArm::OrientationAdmitted),
-            (JobClass::Curation, ClassArm::CurationRefused),
+            (JobClass::Curation, ClassArm::CurationAdmitted),
             (JobClass::Clarification, ClassArm::ClarificationRefused),
             (
                 JobClass::ResearchSynthesis,
@@ -1135,6 +1140,7 @@ mod slice_1_dispatch_tests {
     fn admitted_classes_dispatch_to_admitted_arms() {
         for class in [
             JobClass::Orientation,
+            JobClass::Curation,
             JobClass::ResearchSynthesis,
             JobClass::Maintenance,
         ] {
@@ -1199,7 +1205,6 @@ mod slice_1_dispatch_tests {
         use eliot_dreamer_contracts::registry::canonical_registry;
 
         for class in [
-            JobClass::Curation,
             JobClass::Clarification,
             JobClass::ArchitectureSelfQuery,
             JobClass::DevelopmentDiagnosis,
@@ -1234,7 +1239,6 @@ mod slice_1_dispatch_tests {
     #[test]
     fn refused_classes_fail_closed_before_kernel() {
         let refused_arms = [
-            (JobClass::Curation, ClassArm::CurationRefused),
             (JobClass::Clarification, ClassArm::ClarificationRefused),
             (
                 JobClass::ArchitectureSelfQuery,
