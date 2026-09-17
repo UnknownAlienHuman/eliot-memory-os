@@ -3885,6 +3885,55 @@ mod tests {
         Ok(())
     }
 
+    /// `ERASURE_STATE_IRREVERSIBLE` restore direction on the reference
+    /// executor (issue #1712): a genuinely committed erasure receipt refuses
+    /// state rehydration, while same-identity replay still returns the
+    /// identical receipt (replay of the deletion proof stays legitimate) and
+    /// a non-erasure receipt stays rehydratable.
+    #[test]
+    fn erasure_receipt_refuses_restore_rehydration_and_replays_identically(
+    ) -> Result<(), StoreError> {
+        use eliot_store_api::ERASURE_STATE_IRREVERSIBLE_CONSTRAINT;
+
+        assert_eq!(
+            ERASURE_STATE_IRREVERSIBLE_CONSTRAINT,
+            "ERASURE_STATE_IRREVERSIBLE"
+        );
+        let state_fence = fence();
+        let ctx = metadata(&state_fence)?;
+        let store = store()?;
+        let staged = named_erasure_transition(
+            "op-erase-guard",
+            "idem-erase-guard",
+            &state_fence,
+            &ctx,
+            "guarded-subject",
+            vec!["approval-user-1".to_owned()],
+        )?;
+        let receipt = store.apply_transaction(&ctx, staged.clone(), &[], &[])?;
+        assert_eq!(receipt.transition_class, TransitionClass::Erasure);
+        assert_eq!(
+            receipt.refuse_rehydration_from_erasure(),
+            Err(StoreError::InvalidReceipt),
+            "a committed erasure receipt must never authorize state rehydration"
+        );
+        // Replay is not rehydration: the same identity resolves to the
+        // identical deletion proof without duplicate destructive work.
+        assert_eq!(
+            store.apply_transaction(&ctx, staged, &[], &[])?,
+            receipt
+        );
+
+        // A non-erasure receipt from the same executor stays rehydratable.
+        let capture = capture_with_subject("op-guard-seed", "kept-subject", &state_fence, &ctx)?;
+        let kept = store.apply_transaction(&ctx, capture, &[], &[])?;
+        assert!(
+            kept.refuse_rehydration_from_erasure().is_ok(),
+            "non-erasure receipt stays rehydratable"
+        );
+        Ok(())
+    }
+
     fn manifest_for(
         classes: Vec<TransitionClass>,
         effect: EffectClass,

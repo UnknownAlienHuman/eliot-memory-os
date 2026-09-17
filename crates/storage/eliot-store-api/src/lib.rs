@@ -579,7 +579,12 @@ pub enum TransitionClass {
     /// non-empty proof/approval handles. Maintenance, curation, Dreamer, and
     /// scheduler paths never carry those handles, so no automatic trigger can
     /// reach this class. The ceiling stays the maximum store-allowed effect;
-    /// existing class maxima are unchanged.
+    /// existing class maxima are unchanged. The ceiling means
+    /// ledger-reversible / state-irreversible (see
+    /// [`ERASURE_STATE_IRREVERSIBLE_CONSTRAINT`]): the deletion commits as an
+    /// audited, ordered, sealed transition, while the erased bytes are not
+    /// recoverable and no restore path may rehydrate them from the receipt
+    /// (see [`WriteReceipt::refuse_rehydration_from_erasure`]).
     Erasure,
 }
 
@@ -1608,6 +1613,26 @@ pub struct RevisionDelta {
     pub after: u64,
 }
 
+/// Name of the issue-#1712 erasure non-resurrection constraint enforced at
+/// the manifest/effect-policy boundary.
+///
+/// `ERASURE_STATE_IRREVERSIBLE` states the exact ceiling semantics of the
+/// named erasure transaction: erasure is ledger-reversible (it commits as an
+/// audited, ordered, sealed transition under the maximum store-allowed
+/// `EffectClass::ReversibleMutation` ceiling, with a purge receipt and a
+/// non-revealing tombstone/digest) but state-irreversible (the erased
+/// canonical bytes are not recoverable). No rollback, recovery, maintenance,
+/// scheduler, Dreamer, or restoration capability may consume an erasure
+/// receipt to recreate or rehydrate erased canonical state (I5.14: "Restore
+/// refuses to resurrect purged payload"). The manifest/effect gate enforces
+/// the execution direction (an `Erasure`-class plan admits only the named
+/// `ApplyErasure` operation; see
+/// [`PreparedTransition::validate_against_catalogue`]), and
+/// [`WriteReceipt::refuse_rehydration_from_erasure`] enforces the restore
+/// direction: every rollback/restore/reconcile executor must call it before
+/// rehydrating state from a receipt.
+pub const ERASURE_STATE_IRREVERSIBLE_CONSTRAINT: &str = "ERASURE_STATE_IRREVERSIBLE";
+
 /// Immutable canonical write receipt.  It proves durable store transport only.
 #[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -1711,6 +1736,23 @@ impl WriteReceipt {
         self.envelope
             .as_ref()
             .ok_or(StoreError::MissingReceiptEnvelope)
+    }
+
+    /// Enforces [`ERASURE_STATE_IRREVERSIBLE_CONSTRAINT`] on the restore
+    /// direction (issue #1712).
+    ///
+    /// An erasure receipt proves that canonical state was deleted; it must
+    /// never authorize recreating or rehydrating the erased bytes. Every
+    /// rollback, recovery, restore, and reconcile executor must call this
+    /// before rehydrating state from a receipt: an erasure receipt fails with
+    /// [`StoreError::InvalidReceipt`], every other class passes unchanged.
+    /// Replay and audit reads of the erasure receipt itself stay legitimate;
+    /// only state rehydration from it is refused.
+    pub fn refuse_rehydration_from_erasure(&self) -> Result<(), StoreError> {
+        if self.transition_class == TransitionClass::Erasure {
+            return Err(StoreError::InvalidReceipt);
+        }
+        Ok(())
     }
 }
 

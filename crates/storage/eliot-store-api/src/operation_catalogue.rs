@@ -553,7 +553,10 @@ pub fn validate_read_against_catalogue(
 /// `ApplyLifecyclePolicy`, `ReconcileRecovery`, `UpdateTaskState`, `ApplyEpistemicRevision`,
 /// and `ApplyErasure` have activated mutation entries; any other named
 /// command fails closed here until a later slice proves its handler, schema,
-/// and consumer triple.
+/// and consumer triple. An `Erasure`-class plan additionally admits only the
+/// named `ApplyErasure` operation (`ERASURE_STATE_IRREVERSIBLE`, enforced
+/// below): no generic reversible-effect executor admits the erasure class
+/// through this gate.
 pub fn validate_transition_against_catalogue(
     transition: &PreparedTransition,
     entries: &[NamedOperationManifest],
@@ -586,6 +589,22 @@ pub fn validate_transition_against_catalogue(
     let set_digest = operation_manifest_set_digest(entries)?;
     if transition.operation_manifest_digest != set_digest {
         return Err(StoreError::ManifestMismatch);
+    }
+    // `ERASURE_STATE_IRREVERSIBLE` execution direction (issue #1712): an
+    // `Erasure`-class plan executes only the named `ApplyErasure` operation.
+    // `PreparedTransition::validate` already aligns each command's family with
+    // the plan class, so this arm is defense in depth today: it stays
+    // mechanically evaluated on every erasure plan and refuses if a future
+    // operation ever maps to the `Erasure` family without travelling the
+    // named erasure transaction. No generic reversible-effect executor admits
+    // the erasure class through this gate.
+    if transition.transition_class == TransitionClass::Erasure
+        && transition
+            .named_operations
+            .iter()
+            .any(|command| command.operation != NamedMutationOperation::ApplyErasure)
+    {
+        return Err(StoreError::TransitionClassExceeded);
     }
     for command in &transition.named_operations {
         let entry = find_entry(entries, named_mutation_operation_name(command.operation))?;

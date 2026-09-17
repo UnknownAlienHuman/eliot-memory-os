@@ -11,10 +11,12 @@ use std::collections::BTreeMap;
 
 use eliot_contracts::{EpochId, EpochLineageId, OperationId, ResourceGeneration};
 use eliot_store_api::{
-    EffectClass, ErasureAdmissionRequest, EventProjectionRelationIntents, NamedMutationOperation,
-    NamedMutationRequest, OperationIdentity, OrderingScopeId, ScopeId, SecurityContext, StoreError,
-    TransitionClass, admit_erasure_transition, decode_erasure_surfaces, encode_erasure_surfaces,
-    generated_operation_manifests, operation_manifest_set_digest,
+    CommitId, ERASURE_STATE_IRREVERSIBLE_CONSTRAINT, EffectClass, ErasureAdmissionRequest,
+    EventProjectionRelationIntents, NamedMutationOperation, NamedMutationRequest, OperationIdentity,
+    OperationManifestDigest, OrderingScopeId, Resubmission, ScopeId, SecurityContext, StoreError,
+    TransitionClass, WriteReceipt, WriteReceiptStatus, admit_erasure_transition,
+    decode_erasure_surfaces, encode_erasure_surfaces, generated_operation_manifests,
+    operation_manifest_set_digest,
 };
 use serde_json::json;
 use std::num::NonZeroU64;
@@ -197,5 +199,114 @@ fn erasure_surface_denominator_is_canonical_and_checked() {
     assert!(
         decode_erasure_surfaces("Index,,Projection").is_err(),
         "blank entries refuse"
+    );
+}
+
+fn restore_probe_receipt(operation: &str, class: TransitionClass) -> WriteReceipt {
+    WriteReceipt {
+        operation_id: OperationId::new(operation).unwrap(),
+        idempotency_key: format!("idem-{operation}"),
+        canonical_request_hash: "c".repeat(64),
+        transition_class: class,
+        status: WriteReceiptStatus::Committed,
+        commit_id: Some(CommitId::new(format!("commit-{operation}")).unwrap()),
+        state_fence: fence(),
+        ordering_sequences: Vec::new(),
+        revision_before_after: Vec::new(),
+        applied_command_ids: vec![format!("command-{operation}")],
+        emitted_event_ids: Vec::new(),
+        projection_refs: Vec::new(),
+        outbox_refs: Vec::new(),
+        operation_manifest_digest: OperationManifestDigest::new("e".repeat(64)).unwrap(),
+        error_code: None,
+        resubmission: Resubmission::None,
+        committed_at: Some(format!("commit-sequence-{operation}")),
+        envelope: None,
+    }
+}
+
+/// `ERASURE_STATE_IRREVERSIBLE` restore direction (issue #1712): a restore
+/// path presented with an erasure receipt refuses with `InvalidReceipt`,
+/// while receipts of every other transition class stay rehydratable.
+/// Replay and audit reads of the erasure receipt itself are unaffected;
+/// only state rehydration from it is refused.
+#[test]
+fn erasure_receipt_refuses_rehydration_for_restore() {
+    assert_eq!(
+        ERASURE_STATE_IRREVERSIBLE_CONSTRAINT,
+        "ERASURE_STATE_IRREVERSIBLE"
+    );
+    assert_eq!(
+        restore_probe_receipt("op-erasure-restore", TransitionClass::Erasure)
+            .refuse_rehydration_from_erasure(),
+        Err(StoreError::InvalidReceipt),
+        "an erasure receipt must never authorize state rehydration"
+    );
+    for class in [
+        TransitionClass::CaptureCandidate,
+        TransitionClass::Epistemic,
+        TransitionClass::TaskControl,
+        TransitionClass::LifecyclePolicy,
+        TransitionClass::RecoverySchema,
+    ] {
+        assert!(
+            restore_probe_receipt("op-restore-ok", class)
+                .refuse_rehydration_from_erasure()
+                .is_ok(),
+            "non-erasure receipt stays rehydratable: {class:?}"
+        );
+    }
+}
+
+/// `ERASURE_STATE_IRREVERSIBLE` execution direction (issue #1712): no
+/// generic reversible-effect manifest entry admits the erasure class. Only
+/// the named `ApplyErasure` entry admits
+/// (`Erasure`, `ReversibleMutation`); the lifecycle, recovery, and task
+/// entries sharing the same ceiling refuse it, so a generic
+/// reversible-effect executor can never pick up an erasure plan.
+#[test]
+fn no_generic_reversible_effect_entry_admits_erasure() {
+    let entries = generated_operation_manifests().unwrap();
+    let mut generic_refusals = Vec::new();
+    let mut erasure_admissions = 0;
+    for entry in &entries {
+        if entry.maximum_effect != EffectClass::ReversibleMutation {
+            continue;
+        }
+        if entry.name == "ApplyErasure" {
+            assert!(
+                entry.admits(TransitionClass::Erasure, EffectClass::ReversibleMutation),
+                "the named erasure entry admits its own class"
+            );
+            erasure_admissions += 1;
+            continue;
+        }
+        assert!(
+            !entry.admits(TransitionClass::Erasure, EffectClass::ReversibleMutation),
+            "generic reversible-effect entry must refuse the erasure class: {}",
+            entry.name
+        );
+        generic_refusals.push(entry.name.clone());
+    }
+    assert_eq!(erasure_admissions, 1);
+    assert!(
+        generic_refusals.contains(&"ReconcileRecovery".to_owned()),
+        "the generic reconcile executor entry refuses erasure: {generic_refusals:?}"
+    );
+}
+
+/// `ERASURE_STATE_IRREVERSIBLE` at the catalogue gate (issue #1712): an
+/// `Erasure`-class plan carrying a generic reversible-effect operation
+/// (`ReconcileRecovery`) fails closed with `TransitionClassExceeded`
+/// instead of executing through the wrong executor.
+#[test]
+fn erasure_class_with_generic_reversible_operation_rejected() {
+    let entries = generated_operation_manifests().unwrap();
+    let mut plan = admit_erasure_transition(&admission_request()).unwrap();
+    plan.named_operations[0].operation = NamedMutationOperation::ReconcileRecovery;
+    assert_eq!(
+        plan.validate_against_catalogue(&entries),
+        Err(StoreError::TransitionClassExceeded),
+        "erasure class with a generic reversible operation must fail at the gate"
     );
 }
