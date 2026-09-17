@@ -35,7 +35,8 @@ use crate::{
     ProviderReassignmentReceipt, ProviderUnknownOutcomeReconciliation, ProviderWorkerFenceReceipt,
     ReassignmentId, RecipeId, RecipeManifest, ResultSubmission, RoleProfileId, RoleProfileManifest,
     RouteCandidateEvidence, StaffingLaneRequest, StaffingPlanCandidate, StaffingPlanRequest,
-    SubmissionId, UnknownOutcomeResolution, WorkerId,
+    SubmissionId, UnknownOutcomeResolution, WORK_CLASS_CONTROL, WorkerId, normal_work_class_from_wire,
+    validate_work_class, work_class_rank,
 };
 
 type TestResult<T = ()> = Result<T, Box<dyn std::error::Error>>;
@@ -364,12 +365,14 @@ fn request(
         plan_revision: rev(&format!("plan-rev-{tag}")),
         state_fence: fence(),
         privacy_class: PrivacyClass::Private,
+        work_class: "swarm".to_owned(),
         lanes: specs
             .iter()
             .map(|spec| {
                 Ok(StaffingLaneRequest {
                     work_unit_id: WorkUnitId::new(spec.work)?,
                     role_id: RoleProfileId::new(spec.role)?,
+                    work_class: "swarm".to_owned(),
                     route_candidates: vec![route_evidence(route(spec.route), 0)],
                     budget: budget(),
                     priority: spec.priority,
@@ -449,6 +452,7 @@ fn provider_receipt(
                 attempt_id,
                 lease_id,
                 worker_id: WorkerId::new(format!("worker-{tag}-{index}"))?,
+                work_class: lane.work_class.clone(),
                 route: selected,
                 routing_receipt_digest,
                 budget: lane.budget.clone(),
@@ -2846,6 +2850,7 @@ fn s5_missing_stored_admission_and_reassigned_stays_unresolved() -> TestResult {
         attempt_id: new_attempt.clone(),
         lease_id: new_lease.clone(),
         worker_id: new_worker.clone(),
+        work_class: reassigned.work_class.clone(),
         route: reassigned.route.clone(),
         routing_receipt_digest: lane.routing_receipt_digest.clone(),
         budget: reassigned.budget.clone(),
@@ -4053,5 +4058,206 @@ fn coordinator_case_12_effect_payload_digest_is_canonical() -> TestResult {
         "rationale_ref": null,
     });
     assert!(serde_json::from_value::<ProposedEffect>(legacy).is_err());
+    Ok(())
+}
+
+// I14.1 work classes (issue #1698): the nine canonical values plan, admit,
+// and echo through the receipt and scheduled record; anything else rejects
+// before launch with a typed error and consumes no capacity.
+
+fn classified_request(tag: &str, class: &str) -> TestResult<StaffingPlanRequest> {
+    let mut req = request(
+        tag,
+        &[LaneSpec {
+            work: "work-wc",
+            role: "reader-wc",
+            route: "a",
+            scope: None,
+            write: false,
+            priority: 1,
+        }],
+        None,
+    )?;
+    req.work_class = class.to_owned();
+    for lane in &mut req.lanes {
+        lane.work_class = class.to_owned();
+    }
+    Ok(req)
+}
+
+#[test]
+fn work_class_all_nine_values_admit_and_echo() -> TestResult {
+    let classes = [
+        "control",
+        "interactive",
+        "verification",
+        "canonical_write",
+        "normal_background",
+        "model_jobs",
+        "swarm",
+        "reporting",
+        "maintenance",
+    ];
+    for (index, class) in classes.iter().enumerate() {
+        let tag = format!("wc9-{index}");
+        let proof = format!("proof-admission-{tag}");
+        let mut coord = coordinator(config(4, 4), &[proof.as_str()])?;
+        let candidate = coord.plan(classified_request(&tag, class)?)?;
+        assert_eq!(candidate.work_class, *class);
+        assert_eq!(candidate.lanes.len(), 1);
+        assert_eq!(candidate.lanes[0].work_class, *class);
+        let receipt = coord.admit(provider_receipt(&candidate, &tag)?)?;
+        assert_eq!(receipt.admitted_lanes.len(), 1);
+        assert_eq!(receipt.admitted_lanes[0].work_class, *class);
+        let next = coord.next_ready().ok_or("admitted work must be ready")?;
+        assert_eq!(next.work_class, *class);
+    }
+    Ok(())
+}
+
+#[test]
+fn work_class_unknown_blank_and_mixed_reject_before_capacity() -> TestResult {
+    let mut coord = coordinator(config(4, 4), &["proof-admission-wcf"])?;
+    // Fill the ready window so a capacity check would fire first if class
+    // validation were ordered after it.
+    let mut tight = AgentCoordinator::with_provider(
+        CoordinatorConfig {
+            max_ready_items: 1,
+            max_admitted_attempts: 4,
+            max_active_per_route: 4,
+            capacity_identity: "capacity-a".to_owned(),
+            capacity_revision: rev("capacity-rev-1"),
+        },
+        Box::new(verifier(&[], 0)),
+    )?;
+    tight.plan(classified_request("wcfill", "swarm")?)?;
+    // Unknown rejects with the typed variant even at capacity: no silent
+    // downgrade to a less restrictive class, no capacity consumed.
+    let unknown = classified_request("wcx", "proton")?;
+    assert_eq!(
+        tight.plan(unknown.clone()).err(),
+        Some(CoordinatorError::UnknownWorkClass("proton".to_owned()))
+    );
+    let mut blank = classified_request("wcb", "swarm")?;
+    blank.work_class = String::new();
+    for lane in &mut blank.lanes {
+        lane.work_class = String::new();
+    }
+    assert_eq!(
+        tight.plan(blank).err(),
+        Some(CoordinatorError::UnknownWorkClass(String::new()))
+    );
+    // Mixed plan/lane classes reject as an identity conflict.
+    let mut mixed = classified_request("wcm", "swarm")?;
+    mixed.lanes[0].work_class = "interactive".to_owned();
+    assert_eq!(
+        coord.plan(mixed).err(),
+        Some(CoordinatorError::IdentityConflict("work_class"))
+    );
+    // A forged receipt class that disagrees with the candidate rejects.
+    let candidate = coord.plan(classified_request("wcf", "swarm")?)?;
+    let mut forged = provider_receipt(&candidate, "wcf")?;
+    forged.admitted_lanes[0].work_class = "control".to_owned();
+    assert_eq!(
+        coord
+            .admit(forged)
+            .err()
+            .map(|error| matches!(error, CoordinatorError::IdentityConflict("admitted_lane"))),
+        Some(true)
+    );
+    Ok(())
+}
+
+#[test]
+fn work_class_control_sorts_before_higher_priority_normal() -> TestResult {
+    let mut coord = coordinator(
+        config(4, 4),
+        &["proof-admission-wchi", "proof-admission-wclo"],
+    )?;
+    let mut hi = classified_request("wchi", "maintenance")?;
+    hi.lanes[0].priority = 9;
+    let mut lo = classified_request("wclo", "control")?;
+    lo.lanes[0].priority = 0;
+    let hi_candidate = coord.plan(hi)?;
+    let lo_candidate = coord.plan(lo)?;
+    coord.admit(provider_receipt(&hi_candidate, "wchi")?)?;
+    coord.admit(provider_receipt(&lo_candidate, "wclo")?)?;
+    let next = coord.next_ready().ok_or("admitted work must be ready")?;
+    assert_eq!(next.work_class, WORK_CLASS_CONTROL);
+    Ok(())
+}
+
+#[test]
+fn work_class_taxonomy_matches_kernel_control_reserve() -> TestResult {
+    use eliot_kernel_core::{ControlOperationClass, NormalWorkClass};
+    // Every normal Kernel variant maps to exactly one I14.1 wire spelling
+    // (no wildcard: a Kernel-side addition fails compilation here).
+    fn wire(value: NormalWorkClass) -> &'static str {
+        match value {
+            NormalWorkClass::Interactive => "interactive",
+            NormalWorkClass::Verification => "verification",
+            NormalWorkClass::CanonicalWrite => "canonical_write",
+            NormalWorkClass::NormalBackground => "normal_background",
+            NormalWorkClass::ModelJob => "model_jobs",
+            NormalWorkClass::Swarm => "swarm",
+            NormalWorkClass::Reporting => "reporting",
+            NormalWorkClass::Maintenance => "maintenance",
+        }
+    }
+    let normals = [
+        NormalWorkClass::Interactive,
+        NormalWorkClass::Verification,
+        NormalWorkClass::CanonicalWrite,
+        NormalWorkClass::NormalBackground,
+        NormalWorkClass::ModelJob,
+        NormalWorkClass::Swarm,
+        NormalWorkClass::Reporting,
+        NormalWorkClass::Maintenance,
+    ];
+    for variant in normals {
+        assert_eq!(normal_work_class_from_wire(wire(variant)), Some(variant));
+        assert!(validate_work_class(wire(variant)).is_ok());
+    }
+    // The protected family (no wildcard: additions fail compilation) carries
+    // no ordinary lane work; only the single `control` partition label is
+    // wire-admissible, and raw protected spellings reject.
+    let protected = [
+        ControlOperationClass::CancelOperation,
+        ControlOperationClass::FenceStaleOwner,
+        ControlOperationClass::RevokeAuthority,
+        ControlOperationClass::HealthReadinessControl,
+        ControlOperationClass::CriticalTelemetry,
+        ControlOperationClass::CriticalAttentionTransition,
+        ControlOperationClass::ProblemTransition,
+        ControlOperationClass::IncidentTransition,
+        ControlOperationClass::PersistentNotificationTransition,
+        ControlOperationClass::SafeShutdown,
+        ControlOperationClass::Drain,
+        ControlOperationClass::Recovery,
+        ControlOperationClass::Containment,
+        ControlOperationClass::UnknownOutcomeReconciliation,
+    ];
+    for operation in protected {
+        match operation {
+            ControlOperationClass::CancelOperation
+            | ControlOperationClass::FenceStaleOwner
+            | ControlOperationClass::RevokeAuthority
+            | ControlOperationClass::HealthReadinessControl
+            | ControlOperationClass::CriticalTelemetry
+            | ControlOperationClass::CriticalAttentionTransition
+            | ControlOperationClass::ProblemTransition
+            | ControlOperationClass::IncidentTransition
+            | ControlOperationClass::PersistentNotificationTransition
+            | ControlOperationClass::SafeShutdown
+            | ControlOperationClass::Drain
+            | ControlOperationClass::Recovery
+            | ControlOperationClass::Containment
+            | ControlOperationClass::UnknownOutcomeReconciliation => {}
+        }
+    }
+    assert!(validate_work_class(WORK_CLASS_CONTROL).is_ok());
+    assert_eq!(work_class_rank(WORK_CLASS_CONTROL), 0);
+    assert!(validate_work_class("CANCEL_OPERATION").is_err());
+    assert!(validate_work_class("MODEL_JOB").is_err());
     Ok(())
 }

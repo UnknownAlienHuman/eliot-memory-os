@@ -712,6 +712,7 @@ dependencies = [
  "eliot-agent-contracts",
  "eliot-contracts",
  "eliot-evaluation-contracts",
+ "eliot-kernel-core",
  "eliot-kernel-service",
  "eliot-receipts",
  "eliot-security-contracts",

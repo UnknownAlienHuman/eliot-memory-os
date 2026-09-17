@@ -238,10 +238,12 @@ fn plan_request() -> TestResult<StaffingPlanRequest> {
         plan_revision: rev("plan-normalization-v1"),
         state_fence: StateFence::new(test_epoch(TEST_LINEAGE_A, 1), ResourceGeneration::genesis()),
         privacy_class: PrivacyClass::Private,
+        work_class: "swarm".to_owned(),
         lanes: vec![
             StaffingLaneRequest {
                 work_unit_id: WorkUnitId::new("work-alpha")?,
                 role_id: RoleProfileId::new("role-alpha")?,
+                work_class: "swarm".to_owned(),
                 route_candidates: vec![route_evidence("alpha")],
                 budget: budget(),
                 priority: 2,
@@ -250,6 +252,7 @@ fn plan_request() -> TestResult<StaffingPlanRequest> {
             StaffingLaneRequest {
                 work_unit_id: WorkUnitId::new("work-beta")?,
                 role_id: RoleProfileId::new("role-beta")?,
+                work_class: "swarm".to_owned(),
                 route_candidates: vec![route_evidence("beta")],
                 budget: budget(),
                 priority: 1,
@@ -280,6 +283,7 @@ fn admission_receipt(
                 attempt_id: AttemptId::new(format!("attempt-{suffix}"))?,
                 lease_id: serde_json::from_value::<WorkLeaseId>(serde_json::json!({"namespace": "eliot.governor.work-lease", "revision": "v1", "value": format!("lease-{suffix}")}))?,
                 worker_id: WorkerId::new(format!("worker-{suffix}"))?,
+                work_class: lane.work_class.clone(),
                 route: selected,
                 routing_receipt_digest: candidate_digest_for(&lane.routing)?,
                 budget: lane.budget.clone(),
