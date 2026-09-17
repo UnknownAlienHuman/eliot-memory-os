@@ -1227,6 +1227,7 @@ dependencies = [
  "eliot-dreamer-candidate-validation",
  "eliot-dreamer-claim-grounding",
  "eliot-dreamer-contracts",
+ "eliot-dreamer-curation",
  "eliot-dreamer-cycle",
  "eliot-dreamer-orientation",
  "eliot-dreamer-probe-plan",

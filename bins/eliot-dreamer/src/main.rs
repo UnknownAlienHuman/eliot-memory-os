@@ -2,7 +2,7 @@ use std::io::{self, Write};
 use std::process::ExitCode;
 
 use eliot_dreamer::{
-    AuthenticatedKernelJobPort, DreamerError, JobState, KernelSupervisedComposition,
+    AuthenticatedKernelJobPort, DreamerError, JobState, JobView, KernelSupervisedComposition,
 };
 use serde::Serialize;
 
@@ -11,16 +11,27 @@ const KERNEL_ADMISSION_EXIT: u8 = 78;
 #[derive(Debug, Serialize)]
 #[serde(tag = "status", rename_all = "snake_case")]
 enum Response {
+    #[allow(
+        dead_code,
+        reason = "retained for the success_response_projects_proved_state proof; the binary edge emits the JobView receipt instead"
+    )]
     Success { job_id: String, state: String },
     Error { code: &'static str, error: String },
 }
 
 fn main() -> ExitCode {
+    // Slice-8 terminal channel split (issue #702):
+    // - stdout carries exactly one JSONL [`JobView`] receipt line on success
+    //   (via `write_view`), and nothing on failure;
+    // - stderr carries the [`Response`] error JSON (via `write_error_stderr`)
+    //   plus human/log diagnostics, never a receipt.
+    // A log line can therefore never be mistaken for a receipt. No process is
+    // launched and no file is written here.
     let mut output = io::BufWriter::new(io::stdout().lock());
     let port = match AuthenticatedKernelJobPort::connect() {
         Ok(port) => port,
         Err(error) => {
-            let _ = write_response(&mut output, &error_response(&error));
+            write_error_stderr(&error);
             return ExitCode::from(KERNEL_ADMISSION_EXIT);
         }
     };
@@ -32,22 +43,32 @@ fn main() -> ExitCode {
     let mut service = match KernelSupervisedComposition::connect(port) {
         Ok(service) => service,
         Err(error) => {
-            let _ = write_response(&mut output, &error_response(&error));
+            write_error_stderr(&error);
             return ExitCode::from(KERNEL_ADMISSION_EXIT);
         }
     };
     match service.status(&admission) {
         Ok(view) => {
-            let _ = write_response(&mut output, &success_response(&view));
+            if !write_view(&mut output, &view) {
+                write_error_stderr(&DreamerError::InvalidAdmission("result encoding failure"));
+                return ExitCode::from(KERNEL_ADMISSION_EXIT);
+            }
             ExitCode::SUCCESS
         }
         Err(error) => {
-            let _ = write_response(&mut output, &error_response(&error));
+            write_error_stderr(&error);
             ExitCode::from(KERNEL_ADMISSION_EXIT)
         }
     }
 }
 
+/// Test-pinned success receipt projection: retained so the proved-state
+/// rendering stays covered by proof while the binary edge emits the
+/// [`JobView`] receipt line.
+#[allow(
+    dead_code,
+    reason = "retained for the success_response_projects_proved_state proof; the binary edge emits the JobView receipt instead"
+)]
 fn success_response(view: &eliot_dreamer::JobView) -> Response {
     Response::Success {
         job_id: view.job_id.clone(),
@@ -57,6 +78,10 @@ fn success_response(view: &eliot_dreamer::JobView) -> Response {
 
 /// Projects the proved local disposition. Exhaustive: a new lifecycle state
 /// fails compilation here instead of rendering a wrong receipt.
+#[allow(
+    dead_code,
+    reason = "retained for the success_response_projects_proved_state proof alongside success_response"
+)]
 fn state_name(state: JobState) -> &'static str {
     match state {
         JobState::Queued => "queued",
@@ -77,10 +102,48 @@ fn error_response(error: &DreamerError) -> Response {
     }
 }
 
-fn write_response(output: &mut impl Write, response: &Response) -> bool {
-    serde_json::to_writer(&mut *output, response).is_ok()
+/// Writes one receipt line (`line` + `\n`) to the locked stdout, flushed.
+///
+/// The caller supplies the already-serialized single line so stdout carries
+/// machine-readable receipt bytes only; diagnostics and logs belong on stderr
+/// (`eprintln!`) at call sites.
+fn write_response(output: &mut impl Write, line: &str) -> bool {
+    output.write_all(line.as_bytes()).is_ok()
         && output.write_all(b"\n").is_ok()
         && output.flush().is_ok()
+}
+
+/// Serializes one Kernel-proved [`JobView`] as exactly one JSONL line on
+/// stdout and nothing else.
+///
+/// [`serde_json::to_string`] emits no literal newlines (control characters
+/// inside strings are escaped), so the receipt is a single line that
+/// round-trips to the identical view. An encoding failure returns `false` so
+/// the caller can refuse fail-closed on stderr with exit 78; stdout then
+/// carries no partial receipt.
+fn write_view(output: &mut impl Write, view: &JobView) -> bool {
+    match serde_json::to_string(view) {
+        Ok(line) => write_response(output, &line),
+        Err(_) => false,
+    }
+}
+
+/// Reports a fail-closed refusal on stderr as [`Response`] error JSON.
+///
+/// Stdout carries nothing on failure: exactly one receipt line on success,
+/// zero lines otherwise. A broken stderr cannot be refused through (there is
+/// no further channel); the process exit code remains the refusal signal.
+#[allow(
+    clippy::print_stderr,
+    reason = "the Slice-8 channel split requires diagnostics on stderr so stdout carries receipts only"
+)]
+fn write_error_stderr(error: &DreamerError) {
+    match serde_json::to_string(&error_response(error)) {
+        Ok(line) => eprintln!("{line}"),
+        Err(_) => eprintln!(
+            r#"{{"status":"error","code":"DREAMER_REQUEST_REJECTED","error":"result encoding failure"}}"#
+        ),
+    }
 }
 
 #[cfg(test)]
@@ -324,5 +387,46 @@ mod tests {
             stale.validate(),
             Err(DreamerError::InvalidAdmission("Kernel deadline is stale"))
         ));
+    }
+
+    /// The stdout receipt is exactly one JSONL [`JobView`] line: a single
+    /// `\n`-terminated line with no embedded carriage returns that decodes to
+    /// the identical view. Nothing but the receipt reaches stdout on success.
+    #[test]
+    fn stdout_receipt_is_one_jobview_line() {
+        let view = JobView {
+            job_id: "job-1".to_owned(),
+            state: JobState::Completed,
+            result: None,
+        };
+        let mut buf = Vec::new();
+        assert!(write_view(&mut buf, &view), "stdout receipt must emit");
+        let line = String::from_utf8(buf).expect("receipt is UTF-8");
+        assert!(line.ends_with('\n'), "receipt must be newline terminated");
+        let body = line.trim_end_matches('\n');
+        assert!(
+            !body.contains('\n') && !body.contains('\r'),
+            "receipt must be a single line, got {line:?}"
+        );
+        let back: JobView = serde_json::from_str(body).expect("receipt must decode");
+        assert_eq!(back, view);
+    }
+
+    /// The stderr refusal keeps the [`Response`] error shape: an
+    /// `error`-tagged object carrying the typed refusal code, so a failure
+    /// line is never mistaken for a receipt.
+    #[test]
+    fn stderr_error_renders_response_error_shape() {
+        let error = DreamerError::KernelAdmissionRequired("closed".to_owned());
+        let line = serde_json::to_string(&error_response(&error)).expect("error must render");
+        let value: serde_json::Value = serde_json::from_str(&line).expect("error must decode");
+        assert_eq!(
+            value.get("status").and_then(serde_json::Value::as_str),
+            Some("error")
+        );
+        assert_eq!(
+            value.get("code").and_then(serde_json::Value::as_str),
+            Some(error.code())
+        );
     }
 }
