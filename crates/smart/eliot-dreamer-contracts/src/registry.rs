@@ -361,6 +361,59 @@ impl CurationHandlerRegistry {
     }
 }
 
+/// Canonical handler identity for one curation family.
+///
+/// Source of truth for the table contents: the A-31 curation dispatch seam
+/// (ten handler families covering the eleven wire kinds, I9.6). This is the
+/// single canonical owner of the family-to-handler-identity assignment: the
+/// table is defined exactly once, here, and the excluded standalone curation
+/// crates align their future admission to it instead of duplicating it.
+#[must_use]
+pub const fn canonical_handler_id(family: CurationFamily) -> &'static str {
+    match family {
+        CurationFamily::Classification => "eliot-dreamer-classification",
+        CurationFamily::Relation => "eliot-dreamer-relation",
+        CurationFamily::Episode => "eliot-dreamer-episode",
+        CurationFamily::Concept => "eliot-dreamer-concept",
+        CurationFamily::Procedure => "eliot-dreamer-procedure",
+        CurationFamily::Failure => "eliot-dreamer-failure",
+        CurationFamily::StructureRepair => "eliot-dreamer-structure-repair",
+        CurationFamily::Reconsolidation => "eliot-dreamer-reconsolidation",
+        CurationFamily::Accessibility => "eliot-dreamer-accessibility",
+        CurationFamily::MemoryRepair => "eliot-dreamer-memory-repair",
+    }
+}
+
+/// Builds the canonical closed ten-family handler registry.
+///
+/// The single production-callable closed composition: one descriptor per
+/// canonical family with the exact canonical kind coverage and the canonical
+/// handler identity, composed through the real [`CurationHandlerRegistry::register`]
+/// checks and sealed with [`CurationHandlerRegistry::validate_closure`], so
+/// gaps, overlaps, renames, and duplicates fail closed here. Consumed from
+/// `bins/eliot-dreamer` via `validate_closure()` + `digest()` with no local
+/// handler-identity table.
+///
+/// # Errors
+///
+/// Returns [`ContractViolation::Registry`] when a canonical family spelling
+/// fails to parse or a canonical descriptor fails registration or closure.
+pub fn canonical_registry() -> Result<CurationHandlerRegistry, ContractViolation> {
+    let mut registry = CurationHandlerRegistry::new();
+    for spelling in CURATION_FAMILIES {
+        let family = parse_family(spelling).map_err(|err| ContractViolation::Registry(
+            std::format!("canonical family spelling is not closed: {spelling} ({err})"),
+        ))?;
+        registry.register(CurationHandlerDescriptor {
+            family,
+            handler_id: canonical_handler_id(family).to_owned(),
+            accepted_kinds: family_kinds(family).to_vec(),
+        })?;
+    }
+    registry.validate_closure()?;
+    Ok(registry)
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum AtomicityMode {
@@ -1044,6 +1097,116 @@ mod tests {
         let err = control.validate().expect_err("control identity must fail");
         assert!(matches!(err, ContractViolation::Malformed { .. }));
         assert_screened_dispatch_fails();
+    }
+
+    // WORK_UNIT_CASE: 1989/canonical-closed-composition
+    #[test]
+    fn case_1989_canonical_registry_closes_over_ten_families() {
+        let registry = canonical_registry().expect("canonical registry composes");
+        assert_eq!(registry.handlers.len(), 10);
+        registry.validate_closure().expect("canonical closure");
+        for spelling in CURATION_FAMILIES {
+            let family = parse_family(spelling).expect("known family");
+            let found: Vec<&CurationHandlerDescriptor> = registry
+                .handlers
+                .iter()
+                .filter(|h| h.family == family)
+                .collect();
+            assert_eq!(found.len(), 1, "family {spelling} covered exactly once");
+            let descriptor = found[0];
+            assert_eq!(
+                descriptor.handler_id,
+                canonical_handler_id(family),
+                "family {spelling} carries its canonical identity"
+            );
+            assert_eq!(
+                sorted_kinds(descriptor.accepted_kinds.clone()),
+                sorted_kinds(family_kinds(family).to_vec()),
+                "family {spelling} carries exact canonical kinds"
+            );
+        }
+        let mut ids: Vec<&str> = registry
+            .handlers
+            .iter()
+            .map(|h| h.handler_id.as_str())
+            .collect();
+        ids.sort_unstable();
+        ids.dedup();
+        assert_eq!(ids.len(), 10, "canonical handler identities are unique");
+        for id in &ids {
+            assert!(
+                id.starts_with("eliot-dreamer-"),
+                "canonical identity {id} uses the owner-package spelling"
+            );
+        }
+    }
+
+    // WORK_UNIT_CASE: 1989/canonical-digest-determinism
+    #[test]
+    fn case_1989_canonical_registry_digest_is_deterministic() {
+        let first = canonical_registry().expect("canonical registry composes");
+        let second = canonical_registry().expect("canonical registry composes");
+        let first_digest = first.digest().expect("closed registry digests");
+        let second_digest = second.digest().expect("closed registry digests");
+        assert_eq!(first_digest, second_digest, "digest stable across calls");
+        assert_eq!(first_digest.len(), 64, "digest is sha256 hex");
+        assert!(
+            first_digest.chars().all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase()),
+            "digest is lowercase hex"
+        );
+        let fixture_digest = full_registry().digest().expect("fixture digests");
+        assert_ne!(
+            first_digest, fixture_digest,
+            "canonical identities differ from the acc-* test fixture"
+        );
+    }
+
+    // WORK_UNIT_CASE: 1989/canonical-negative
+    #[test]
+    fn case_1989_canonical_registry_rejects_tampered_and_unknown_handlers() {
+        let canonical = canonical_registry().expect("canonical registry composes");
+        // Tampered family without matching kinds breaks descriptor validity.
+        let mut drifted = canonical.clone();
+        drifted.handlers[0].family = CurationFamily::MemoryRepair;
+        let err = drifted
+            .validate_closure()
+            .expect_err("family/kind drift must fail");
+        assert!(matches!(err, ContractViolation::Registry(_)));
+        // Tampered kinds (dropped Split) break exact closure coverage.
+        let mut dropped = canonical.clone();
+        let sr = dropped
+            .handlers
+            .iter_mut()
+            .find(|h| h.family == CurationFamily::StructureRepair)
+            .expect("structure_repair handler");
+        sr.accepted_kinds.retain(|k| *k != CurationKind::Split);
+        let err = dropped
+            .validate_closure()
+            .expect_err("dropped kind must fail");
+        assert!(
+            matches!(err, ContractViolation::Registry(m) if m.contains("invalid descriptor") || m.contains("incomplete coverage"))
+        );
+        // Unknown eleventh handler is rejected at registration (overlap).
+        let mut extended = canonical.clone();
+        let err = extended
+            .register(descriptor(
+                CurationFamily::Classification,
+                "eliot-dreamer-unknown",
+                family_kinds(CurationFamily::Classification).to_vec(),
+            ))
+            .expect_err("unknown handler must fail");
+        assert!(
+            matches!(err, ContractViolation::Registry(m) if m.contains("already covered"))
+        );
+        // Duplicated canonical identity is rejected at registration.
+        let mut duped = canonical.clone();
+        let err = duped
+            .register(canonical.handlers[0].clone())
+            .expect_err("duplicate identity must fail");
+        assert!(
+            matches!(err, ContractViolation::Registry(m) if m.contains("duplicate handler_id"))
+        );
+        assert_eq!(duped.handlers.len(), 10, "rejected registration adds nothing");
     }
 
     fn assert_screened_dispatch_fails() {
