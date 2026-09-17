@@ -54,7 +54,7 @@ use eliot_protocol::{
     AGENT_BRIDGE_PROCESS_BINDING_WIRE_ID, AgentActivationResolutionResult,
     AgentBridgePeerAdmissionReceipt, AgentBridgeProcessBinding, HOST_REQUEST_INVOKE_READ_WIRE_ID,
     HOST_REQUEST_RESULT_BODY_WIRE_ID, HostRequestAdmissionReceipt, HostRequestEnvelope,
-    HostRequestInvokeReadPayload, HostRequestKind, HostRequestResultBody,
+    HostRequestInvokeReadPayload, HostRequestKind, HostRequestResultBody, LocalReadAttempt,
     host_request_operation_id,
 };
 use eliot_store_api::{EVIDENCE_PACK_MAX_RECORDS, ScopeId};
@@ -97,13 +97,6 @@ pub(crate) const AGENT_HOST_REQUEST_INVOKE_READ_OPERATION: &str =
 /// record owns lifecycle state, so eviction only drops daemon-leg queue
 /// memory and never fabricates admission.
 const MAX_QUEUED_LOCAL_READS: usize = 64;
-/// Claim lease for one queued local-read pair, mirroring
-/// `AGENT_ACTIVATION_CLAIM_LEASE_MS`.
-///
-/// A claimed pair is retained with this lease so transient resolver failure
-/// retries the exact pair without allocating a new identity; the lease is
-/// absent from the wire.
-const LOCAL_READ_CLAIM_LEASE_MS: u64 = 1_000;
 
 /// Returns whether the operation string selects the P-04 host-request route.
 pub(crate) fn is_host_request_operation(operation: &str) -> bool {
@@ -129,16 +122,113 @@ pub(crate) fn is_host_request_operation(operation: &str) -> bool {
 /// widens to initialize it; see HANDOFF). `local_read_envelope`/`local_read_tool`
 /// are `Some` only for admitted `eliot.query` invoke-reads whose selectors
 /// validated; ordinary indexed operations carry `None` and are never served
-/// to the daemon poller.
+/// to the daemon poller. `local_read_attempt` is the governed attempt
+/// ownership record for the pair: minted at enqueue as unclaimed
+/// (`generation == 0`), claimed by fencing generation at poll time, and
+/// retired or fenced away on completion, expiry, disconnect, restart, epoch
+/// rotation, or revocation. Removal from this index IS invalidation: submit
+/// requires a live record, so a dropped pair can never complete again.
 #[derive(Clone, Debug)]
 pub(crate) struct HostRequestOperationRef {
     pub(crate) operation_id: String,
     pub(crate) request_digest: String,
     pub(crate) local_read_envelope: Option<HostRequestEnvelope>,
     pub(crate) local_read_tool: Option<serde_json::Value>,
-    /// Private Kernel claim lease for the queued pair, mirroring
-    /// `AgentActivationPending::claim_lease_until_unix_ms`.
-    pub(crate) local_read_claim_lease_until_unix_ms: Option<u64>,
+    /// Governed attempt ownership for the queued pair, replacing the former
+    /// time-only claim lease. Never time-expires; only explicit
+    /// retire/fence transitions invalidate it.
+    pub(crate) local_read_attempt: LocalReadAttemptState,
+}
+
+/// Governed attempt ownership record for one queued local-read pair.
+///
+/// Mirrors the T12-10 model-attempt shape (`JobLease` + bound receipt):
+/// exactly one current fencing generation per operation, a boot-unique
+/// attempt identity, and an owner session binding. `generation == 0` means
+/// never claimed; otherwise the record names the live attempt and its owning
+/// daemon session. Only the live `(attempt_id, generation, owner)` triple may
+/// complete the operation.
+///
+/// `enqueue_salt` makes the attempt identity unique per queue lifecycle: a
+/// re-enqueued pair (after retire or fence) restarts at generation 1 but with
+/// a fresh salt, so a capability minted for the previous lifecycle can never
+/// match the new record — even in the same boot with the same owner session.
+#[derive(Clone, Debug, Default)]
+pub(crate) struct LocalReadAttemptState {
+    pub(crate) attempt_id: String,
+    pub(crate) generation: u64,
+    pub(crate) enqueue_salt: u64,
+    pub(crate) owner_connection_id: String,
+    pub(crate) owner_launch_nonce: String,
+    pub(crate) owner_session_epoch: u64,
+}
+
+impl LocalReadAttemptState {
+    /// Returns whether this record names a live (claimed, unretired) attempt.
+    pub(crate) fn is_live(&self) -> bool {
+        self.generation != 0
+    }
+
+    /// Returns whether the presenting daemon session owns the live attempt.
+    pub(crate) fn is_owned_by(&self, session: &Session) -> bool {
+        self.is_live()
+            && self.owner_connection_id == session.connection_id
+            && self.owner_launch_nonce == session.launch_nonce
+            && self.owner_session_epoch == session.session_epoch
+    }
+}
+
+/// Noncanonical stale-attempt observation: a late, duplicate, mismatched, or
+/// revoked submission that must never reach a waiting caller.
+///
+/// The observation is retained for forensics (returned to the submitter as an
+/// audit receipt and projected as the stale wire outcome); the durable ORS
+/// record is untouched, so the waiter observes no stale result.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct StaleLocalReadObservation {
+    pub(crate) operation_id: String,
+    pub(crate) request_digest: String,
+    pub(crate) presented_attempt_id: Option<String>,
+    pub(crate) presented_generation: Option<u64>,
+    pub(crate) current_generation: Option<u64>,
+    pub(crate) reason: StaleLocalReadReason,
+}
+
+/// Closed reason codes for a stale local-read submission. Codes are control
+/// values, never human prose: no error text drives routing.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum StaleLocalReadReason {
+    /// No live claim record: never claimed, already retired, or fenced away
+    /// by disconnect, restart, epoch rotation, or revocation.
+    Unclaimed,
+    /// A live record exists but the presented identity/generation is not
+    /// current: lease replacement, reassignment, or a duplicated attempt.
+    Superseded,
+    /// Identity and generation match but the presenting session does not own
+    /// the attempt: the owner reconnected or was replaced without revocation.
+    OwnerMismatch,
+}
+
+impl StaleLocalReadReason {
+    /// Stable wire code for the stale daemon outcome.
+    pub(crate) const fn as_str(self) -> &'static str {
+        match self {
+            Self::Unclaimed => "unclaimed",
+            Self::Superseded => "superseded",
+            Self::OwnerMismatch => "owner-mismatch",
+        }
+    }
+}
+
+/// Disposition of one daemon-produced local-read result submission.
+///
+/// `Persisted` is the single completion for the current fencing generation;
+/// `StaleAttempt` is the quarantined noncanonical observation. There is no
+/// third outcome: exactly one completion per current generation.
+#[derive(Clone, Debug)]
+pub(crate) enum LocalReadSubmitDisposition {
+    Persisted(Box<HostRequestRecord>),
+    StaleAttempt(StaleLocalReadObservation),
 }
 
 impl KernelComposition {
@@ -339,6 +429,8 @@ impl KernelComposition {
                 request_sha256: envelope.envelope_sha256.clone(),
                 result_digest: digest.clone(),
                 response: body.clone(),
+                // Coherence gate only: stored rows predate attempt ownership.
+                attempt: None,
             }
             .validate()
             .map_err(|_| TransportError::SessionFenced)?;
@@ -751,11 +843,20 @@ impl KernelComposition {
                 request_digest: envelope.envelope_sha256.clone(),
                 local_read_envelope: None,
                 local_read_tool: None,
-                local_read_claim_lease_until_unix_ms: None,
+                local_read_attempt: LocalReadAttemptState::default(),
             });
         Ok(())
     }
 }
+
+/// Process-wide monotonic salt for local-read queue lifecycles.
+///
+/// Bumped at every enqueue so each queue lifecycle mints attempt identities
+/// no earlier lifecycle can collide with, even when the fencing generation
+/// restarts at 1 after retire or fence. Strictly increasing within a boot;
+/// across restarts the composition boot nonce disambiguates.
+static LOCAL_READ_ENQUEUE_SALT: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(1);
 
 impl KernelComposition {
     /// Queues one admitted local-read pair for the daemon poller.
@@ -810,28 +911,53 @@ impl KernelComposition {
                 request_digest: envelope.envelope_sha256.clone(),
                 local_read_envelope: Some(envelope.clone()),
                 local_read_tool: Some(tool.clone()),
-                local_read_claim_lease_until_unix_ms: None,
+                // The durable claim record is written at enqueue, before any
+                // poll: unclaimed (`generation == 0`) until the first claim
+                // mints fencing generation 1. The salt makes this lifecycle's
+                // identities unique even if the pair is re-enqueued later. No
+                // time lease is involved.
+                local_read_attempt: LocalReadAttemptState {
+                    enqueue_salt: LOCAL_READ_ENQUEUE_SALT.fetch_add(
+                        1,
+                        std::sync::atomic::Ordering::SeqCst,
+                    ),
+                    ..LocalReadAttemptState::default()
+                },
             });
         Ok(())
     }
 
-    /// Claims the next admitted local-read pair for the daemon poller.
+    /// Claims the next admitted local-read pair for the daemon poller under
+    /// governed attempt ownership.
     ///
-    /// Mirrors `AgentActivationPendingState::claim_at`: deterministic
-    /// connection-then-fifo order, skipping expired and still-leased pairs,
-    /// granting a bounded claim lease on the returned pair and retaining it
-    /// for transient-failure retry. `None` is a null poll, not an error.
-    /// Pure queue memory: no store IO, so already-resulted pairs are retired
-    /// by [`Self::submit_local_read_result`] (and the sync `local_read` leg)
-    /// rather than re-checked here.
+    /// Deterministic connection-then-fifo order, skipping expired pairs and
+    /// non-pairs. The first claim for a pair mints fencing generation 1 with
+    /// a boot-unique attempt identity bound to the presenting daemon session;
+    /// a re-claim by the same owner session returns the identical current
+    /// capability (lost-answer retry without a new identity); a claim by a
+    /// different owner reassigns the attempt (generation bump, fresh identity,
+    /// new owner), so the superseded capability can never complete. `None` is
+    /// a null poll, not an error. Pure queue memory: no store IO, so
+    /// already-resulted pairs are retired by the submit legs rather than
+    /// re-checked here.
     pub(crate) fn claim_local_read_pair(
         &self,
-    ) -> Result<Option<(HostRequestEnvelope, serde_json::Value)>, TransportError> {
+        session: &Session,
+    ) -> Result<
+        Option<(
+            HostRequestEnvelope,
+            serde_json::Value,
+            eliot_protocol::LocalReadAttempt,
+        )>,
+        TransportError,
+    > {
         let mut index = self
             .host_request_connection_index
             .lock()
             .map_err(|_| TransportError::SessionFenced)?;
         let now = unix_ms();
+        // Deterministic order: `BTreeMap` iterates connections sorted, pairs
+        // stay in enqueue (fifo) order within one connection.
         for refs in index.values_mut() {
             for candidate in refs.iter_mut() {
                 let (Some(envelope), Some(tool)) = (
@@ -843,20 +969,143 @@ impl KernelComposition {
                 if activation_deadline_expired(now, envelope.identity.deadline_unix_ms) {
                     continue;
                 }
-                if candidate
-                    .local_read_claim_lease_until_unix_ms
-                    .is_some_and(|lease_until| now < lease_until)
-                {
+                if envelope.identity.capability != "eliot.query" {
                     continue;
                 }
-                candidate.local_read_claim_lease_until_unix_ms = Some(
-                    now.saturating_add(LOCAL_READ_CLAIM_LEASE_MS)
-                        .min(envelope.identity.deadline_unix_ms),
-                );
-                return Ok(Some((envelope.clone(), tool.clone())));
+                if !candidate.local_read_attempt.is_owned_by(session) {
+                    let generation = candidate
+                        .local_read_attempt
+                        .generation
+                        .checked_add(1)
+                        .ok_or(TransportError::SessionFenced)?;
+                    candidate.local_read_attempt = LocalReadAttemptState {
+                        attempt_id: self.mint_local_read_attempt_id(
+                            &candidate.operation_id,
+                            candidate.local_read_attempt.enqueue_salt,
+                            generation,
+                        ),
+                        generation,
+                        enqueue_salt: candidate.local_read_attempt.enqueue_salt,
+                        owner_connection_id: session.connection_id.clone(),
+                        owner_launch_nonce: session.launch_nonce.clone(),
+                        owner_session_epoch: session.session_epoch,
+                    };
+                }
+                let attempt = self.local_read_attempt_capability(
+                    envelope,
+                    &candidate.operation_id,
+                    &candidate.local_read_attempt,
+                )?;
+                return Ok(Some((envelope.clone(), tool.clone(), attempt)));
             }
         }
         Ok(None)
+    }
+
+    /// Mints the boot-unique attempt identity for one fencing generation.
+    ///
+    /// Binds the exact operation handle, the per-composition boot nonce, the
+    /// per-lifecycle enqueue salt, and the generation: the identity never
+    /// repeats for another claim, another generation, another queue
+    /// lifecycle, or another Kernel incarnation, so a capability serialized
+    /// before a restart, retire, or fence can never match a claim record
+    /// minted after it.
+    fn mint_local_read_attempt_id(
+        &self,
+        operation_id: &str,
+        enqueue_salt: u64,
+        generation: u64,
+    ) -> String {
+        format!(
+            "{operation_id}:attempt:{:016x}:{enqueue_salt}:{generation}",
+            self.local_read_claim_boot_nonce
+        )
+    }
+
+    /// Builds the fenced attempt capability for the live claim record.
+    ///
+    /// Every field is re-derived from the exact admitted envelope plus the
+    /// live record: work-item handle, attempt identity, fencing generation,
+    /// admitted session binding, authority epoch, trusted scope/facet method,
+    /// absolute expiry, and single-use budget. A pair without a derivable
+    /// trusted scope fails closed here and is skipped by the caller.
+    /// Re-derivation is deterministic, so equality with a presented capability
+    /// proves every echoed field is exactly what the Kernel minted.
+    pub(crate) fn local_read_attempt_capability(
+        &self,
+        envelope: &HostRequestEnvelope,
+        operation_id: &str,
+        state: &LocalReadAttemptState,
+    ) -> Result<eliot_protocol::LocalReadAttempt, TransportError> {
+        let _ = self;
+        let scope_text = envelope
+            .identity
+            .work_scope_id
+            .as_deref()
+            .filter(|scope| !scope.trim().is_empty())
+            .or_else(|| {
+                envelope
+                    .identity
+                    .session_id
+                    .as_deref()
+                    .filter(|scope| !scope.trim().is_empty())
+            })
+            .ok_or(TransportError::SessionFenced)?;
+        let session_text = envelope
+            .identity
+            .session_id
+            .as_deref()
+            .filter(|session| !session.trim().is_empty())
+            .or_else(|| {
+                envelope
+                    .identity
+                    .work_scope_id
+                    .as_deref()
+                    .filter(|scope| !scope.trim().is_empty())
+            })
+            .unwrap_or(&envelope.connection_id);
+        let attempt = LocalReadAttempt {
+            wire_id: eliot_protocol::LOCAL_READ_ATTEMPT_WIRE_ID.to_owned(),
+            wire_version: LocalReadAttempt::CONTRACT_VERSION,
+            operation_id: operation_id.to_owned(),
+            attempt_id: state.attempt_id.clone(),
+            fencing_generation: state.generation,
+            session_id: session_text.to_owned(),
+            authority_epoch: envelope.state_fence.authority_epoch.clone(),
+            scope_id: scope_text.to_owned(),
+            facet_method: envelope.identity.capability.clone(),
+            expires_at_unix_ms: envelope.identity.deadline_unix_ms,
+            use_budget: 1,
+        };
+        attempt
+            .validate()
+            .map_err(|_| TransportError::SessionFenced)?;
+        Ok(attempt)
+    }
+
+    /// Loads the live claim record for one operation without mutating it.
+    ///
+    /// Returns `None` when no queued pair exists (never claimed, retired, or
+    /// fenced away). Pure queue memory: no store IO.
+    pub(crate) fn live_local_read_attempt(
+        &self,
+        operation_id: &str,
+        request_digest: &str,
+    ) -> Result<Option<LocalReadAttemptState>, TransportError> {
+        let index = self
+            .host_request_connection_index
+            .lock()
+            .map_err(|_| TransportError::SessionFenced)?;
+        Ok(index
+            .values()
+            .flatten()
+            .find(|candidate| {
+                candidate.operation_id == operation_id
+                    && candidate.request_digest == request_digest
+                    && candidate.local_read_envelope.is_some()
+            })
+            .map(|candidate| candidate.local_read_attempt.clone())
+            .filter(LocalReadAttemptState::is_live))
     }
 
     /// Retires one queued local-read pair without failing.
@@ -881,20 +1130,33 @@ impl KernelComposition {
     /// Submits one daemon-produced local-read result for its waiting host request.
     ///
     /// Validates the closed [`HostRequestResultBody`], binds it to the exact
-    /// stored operation, enforces the absolute deadline bound (expiry is
-    /// [`TransportError::Timeout` — the expected race, projected as a known
-    /// expired outcome by the daemon arm), fence-checks the presenting daemon
-    /// session against the admitted envelope fence (queued full fence when
-    /// present, else the ORS authority/generation), then persists through the
-    /// ORS result path. An exact replay of a resulted operation is idempotent
-    /// even across deadline expiry; a changed body under the same identity is
-    /// [`TransportError::IdentityConflict`]; an unknown operation is
-    /// [`TransportError::UnknownRequest`].
+    /// stored operation, then enforces governed attempt ownership: only the
+    /// current fencing generation presented by the owning session may
+    /// complete. A late, duplicate, mismatched, or revoked submission becomes
+    /// a quarantined [`LocalReadSubmitDisposition::StaleAttempt`] observation
+    /// with an audit receipt — the durable ORS record is untouched, so the
+    /// waiter never observes the stale result — while the current attempt can
+    /// still complete through its own bound capability.
+    ///
+    /// Check order is the safety argument: exact replay first (canonical
+    /// readback, never a new completion), then the absolute deadline bound
+    /// (expiry is [`TransportError::Timeout` — the expected race, projected
+    /// as a known expired outcome by the daemon arm), then attempt currency
+    /// (so lease replacement, restart, epoch rotation, and revocation project
+    /// as stale before any fence join), then the presenting daemon session
+    /// fence, then persistence through the ORS result path. Neither expiry
+    /// nor staleness ever binds a result. A changed body under the same
+    /// identity is [`TransportError::IdentityConflict`]; an unknown operation
+    /// is [`TransportError::UnknownRequest`].
+    #[allow(
+        clippy::too_many_lines,
+        reason = "the submit gate keeps replay, deadline, currency, fence, and persistence joins in one audited order"
+    )]
     pub(crate) fn submit_local_read_result(
         &self,
         session: &Session,
         body: &HostRequestResultBody,
-    ) -> Result<HostRequestRecord, TransportError> {
+    ) -> Result<LocalReadSubmitDisposition, TransportError> {
         body.validate()
             .map_err(|_| TransportError::SessionFenced)?;
         let operation_id = OperationIdentity::new(body.operation_id.clone())
@@ -911,12 +1173,86 @@ impl KernelComposition {
             return Err(TransportError::SessionFenced);
         }
         // Exact replay is idempotent even across deadline expiry: a retained
-        // terminal result never takes the expiry path.
+        // terminal result never takes the expiry path, and serving it is
+        // canonical readback rather than a second completion.
         if stored.state == HostRequestState::ResultReceived
             && stored.result_digest.as_deref() == Some(body.result_digest.as_str())
             && stored.result_response.as_ref() == Some(&body.response)
         {
-            return Ok(stored);
+            return Ok(LocalReadSubmitDisposition::Persisted(Box::new(stored)));
+        }
+        if activation_deadline_expired(unix_ms(), stored.deadline_unix_ms) {
+            return Err(TransportError::Timeout);
+        }
+        // Governed attempt currency: only the live (attempt_id, generation,
+        // owner) triple completes.
+        let live = self.live_local_read_attempt(&body.operation_id, &body.request_sha256)?;
+        match (&body.attempt, live) {
+            (Some(attempt), Some(state))
+                if attempt.attempt_id == state.attempt_id
+                    && attempt.fencing_generation == state.generation =>
+            {
+                if !state.is_owned_by(session) {
+                    return Ok(LocalReadSubmitDisposition::StaleAttempt(
+                        StaleLocalReadObservation {
+                            operation_id: body.operation_id.clone(),
+                            request_digest: body.request_sha256.clone(),
+                            presented_attempt_id: Some(attempt.attempt_id.clone()),
+                            presented_generation: Some(attempt.fencing_generation),
+                            current_generation: Some(state.generation),
+                            reason: StaleLocalReadReason::OwnerMismatch,
+                        },
+                    ));
+                }
+                // The presented capability must echo the admitted bounds:
+                // expiry is the stored absolute deadline and the epoch is the
+                // stored authority. A substituted echo is not the current
+                // valid attempt, even with a matching identity.
+                if attempt.expires_at_unix_ms != stored.deadline_unix_ms
+                    || !attempt
+                        .authority_epoch
+                        .is_same_authority(&stored.authority_epoch)
+                {
+                    return Ok(LocalReadSubmitDisposition::StaleAttempt(
+                        StaleLocalReadObservation {
+                            operation_id: body.operation_id.clone(),
+                            request_digest: body.request_sha256.clone(),
+                            presented_attempt_id: Some(attempt.attempt_id.clone()),
+                            presented_generation: Some(attempt.fencing_generation),
+                            current_generation: Some(state.generation),
+                            reason: StaleLocalReadReason::Superseded,
+                        },
+                    ));
+                }
+            }
+            (Some(attempt), Some(state)) => {
+                return Ok(LocalReadSubmitDisposition::StaleAttempt(
+                    StaleLocalReadObservation {
+                        operation_id: body.operation_id.clone(),
+                        request_digest: body.request_sha256.clone(),
+                        presented_attempt_id: Some(attempt.attempt_id.clone()),
+                        presented_generation: Some(attempt.fencing_generation),
+                        current_generation: Some(state.generation),
+                        reason: StaleLocalReadReason::Superseded,
+                    },
+                ));
+            }
+            (presented, current) => {
+                return Ok(LocalReadSubmitDisposition::StaleAttempt(
+                    StaleLocalReadObservation {
+                        operation_id: body.operation_id.clone(),
+                        request_digest: body.request_sha256.clone(),
+                        presented_attempt_id: presented
+                            .as_ref()
+                            .map(|attempt| attempt.attempt_id.clone()),
+                        presented_generation: presented
+                            .as_ref()
+                            .map(|attempt| attempt.fencing_generation),
+                        current_generation: current.map(|state| state.generation),
+                        reason: StaleLocalReadReason::Unclaimed,
+                    },
+                ));
+            }
         }
         if activation_deadline_expired(unix_ms(), stored.deadline_unix_ms) {
             return Err(TransportError::Timeout);
@@ -965,8 +1301,10 @@ impl KernelComposition {
                 _ => TransportError::SessionFenced,
             })?
             .ok_or(TransportError::UnknownRequest)?;
+        // The single completion consumes the attempt use budget: retire the
+        // pair so no later claim or submit can reuse this generation.
         self.retire_local_read_pair(&body.operation_id, &body.request_sha256);
-        Ok(persisted)
+        Ok(LocalReadSubmitDisposition::Persisted(Box::new(persisted)))
     }
 }
 
@@ -1085,6 +1423,11 @@ fn parent_operation_key(
 /// Terminal records stay under their owner's continuation rules; every store
 /// error is contained because disconnect fencing must hold even when the
 /// store is unavailable.
+///
+/// The caller drops the indexed reference after fencing, which also retires
+/// any queued local-read pair: removal from the connection index IS attempt
+/// invalidation, and submit requires a live claim record, so a fenced pair
+/// can never complete afterwards. Claimed pairs are never exempt.
 fn fence_one_host_request(
     composition: &KernelComposition,
     operation_ref: &HostRequestOperationRef,
@@ -1445,6 +1788,8 @@ pub(crate) fn local_read_replay_response(
         request_sha256: envelope.envelope_sha256.clone(),
         result_digest: digest.clone(),
         response: body.clone(),
+        // Replay readback only: stored rows predate attempt ownership.
+        attempt: None,
     }
     .validate()
     .map_err(|_| TransportError::SessionFenced)?;

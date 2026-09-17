@@ -637,6 +637,10 @@ fn decode_admitted_reply(
             request_sha256: envelope.envelope_sha256.clone(),
             result_digest: digest.clone(),
             response: body.clone(),
+            // Readback coherence only: stored rows predate attempt ownership,
+            // so no attempt is presented here. Submissions always carry the
+            // current attempt, enforced by the Kernel legs.
+            attempt: None,
         }
         .validate()
         .ok()?;
