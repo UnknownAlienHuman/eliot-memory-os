@@ -20,18 +20,35 @@
 //! function `submit` calls (production passes `None` for the
 //! Governor-injected Curation carrier) — so stage order and terminal outcomes
 //! are proved for the same code `submit` executes.
+//!
+//! The public-path tests at the bottom drive
+//! [`AuthenticatedKernelJobPort::submit`](crate::AuthenticatedKernelJobPort)
+//! through the `for_test` port — closed test transport, matching
+//! material/admission fixtures, and an optional counting carrier source — so
+//! the screen-first carrier refusal, the A-31 exactly-once run up to the
+//! closed front door, the refused-class gate, and the Slice-2 controller gate
+//! are proved on the same code production executes.
 
 use std::num::NonZeroU64;
 
 use eliot_contracts::{EpochId, EpochLineageId, ResourceGeneration, StateFence};
 use eliot_dreamer_claim_grounding::GroundingRequest;
 use eliot_dreamer_contracts::grounding::{GroundedDreamDraft, ModelDraft};
+use eliot_dreamer_contracts::ScreenBinding;
+use eliot_dreamer_curation::{NativeCurationPort, NativeCurationPortSet};
 
 use crate::admitted_material::{admission_of, validation_input_for};
 use crate::controller::verify_admitted_binding;
 use crate::curation_screen_stage::{ScreenDecision, resolve_screen_inputs};
 use crate::dispatch_stage::{
-    CURATION_CARRIER_REFUSAL, curation_test_support::CurationTestHarness, dispatch_admitted,
+    CURATION_CARRIER_REFUSAL, CurationExecutionCarrier,
+    curation_test_support::{
+        CountingRoutingHandler, CurationTestHarness, test_batch_for, test_port_bindings,
+    },
+    dispatch_admitted,
+};
+use crate::kernel_port::{
+    ClaimTransport, DispatchGrant, KernelPortError, ValidatedDreamerMaterial,
 };
 use crate::grounding_stage::{ground_admitted_draft, resolve_grounding_inputs};
 use crate::model_stage::{resolve_model_inputs, run_admitted_model};
@@ -41,8 +58,9 @@ use eliot_dreamer_contracts::validation::structured::{
     GroundingValidationInput, ValidatedGroundingCandidate,
 };
 use crate::{
-    DreamJobInput, DreamResult, DreamerError, JobClass, JobState, KERNEL_ADMISSION_REQUIRED,
-    KernelJobAdmission, run_admitted_pipeline,
+    AuthenticatedKernelJobPort, CurationCarrierSource, DreamJobInput, DreamResult, DreamerError,
+    JobClass, JobState, KERNEL_ADMISSION_REQUIRED, KernelJobAdmission, KernelJobPort,
+    run_admitted_pipeline,
 };
 
 const TEST_LINEAGE_E2E: &str = "550e8400-e29b-41d4-a716-446655440000";
@@ -421,4 +439,338 @@ fn submit_chain_curation_stops_before_generic_stages_without_carrier() {
         "dispatch must refuse with exactly the carrier-check reason, got {error:?}"
     );
     assert_eq!(error.code(), "DREAMER_REQUEST_REJECTED");
+}
+
+// ---------------------------------------------------------------------------
+// Public-path `submit` proofs (issue #702 fix4, auditor B1).
+//
+// These tests drive [`AuthenticatedKernelJobPort::submit`] through the
+// `for_test` port — closed test transport, matching material/admission
+// fixtures, and an optional counting carrier source — instead of the private
+// chain. Against the sibling `lib.rs` contract:
+// `crate::CurationCarrierSource::resolve_carrier`, the `for_test`
+// constructor, and the [`KernelJobPort`] `submit` call shape.
+// ---------------------------------------------------------------------------
+
+/// Closed test transport: binds identity but refuses every transact with a
+/// typed transport denial. Owned with no borrows, so it satisfies any
+/// `'static` box bound on the port constructor.
+struct ClosedTestTransport;
+
+impl ClaimTransport for ClosedTestTransport {
+    fn bind_identity(
+        &mut self,
+        _fence: &StateFence,
+        _operation_id: &str,
+    ) -> Result<(), KernelPortError> {
+        Ok(())
+    }
+
+    fn transact(
+        &mut self,
+        _operation: &str,
+        _payload: serde_json::Value,
+    ) -> Result<serde_json::Value, KernelPortError> {
+        Err(KernelPortError::Transport(
+            "test front door is closed".to_owned(),
+        ))
+    }
+}
+
+/// Test curation-carrier source: owns a counting echo handler and resolves a
+/// batch plus ten-port carrier for the presented screen, admission, and job.
+/// The batch and the port halves come from the shared test builders, so no
+/// digest/pin/seal logic is duplicated by hand. Owns everything, so the port
+/// holds it behind a plain shared borrow with no lifetime entanglement.
+struct TestCarrierSource {
+    handler: CountingRoutingHandler,
+}
+
+impl TestCarrierSource {
+    fn new() -> Self {
+        Self {
+            handler: CountingRoutingHandler::new(),
+        }
+    }
+
+    /// Returns the number of routed A-31 handler invocations so far: the
+    /// exactly-once proof observes this after `submit`.
+    fn calls(&self) -> u64 {
+        self.handler.calls()
+    }
+}
+
+impl Default for TestCarrierSource {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl CurationCarrierSource for TestCarrierSource {
+    fn resolve_carrier<'s>(
+        &'s self,
+        screen: &ScreenBinding,
+        admission: &KernelJobAdmission,
+        job: &DreamJobInput,
+    ) -> Result<CurationExecutionCarrier<'s>, DreamerError> {
+        let batch = test_batch_for(screen, admission, job)?;
+        let ports: Vec<NativeCurationPort<'_>> = test_port_bindings()?
+            .into_iter()
+            .map(|binding| NativeCurationPort {
+                port: binding.port,
+                owner_package: binding.owner_package,
+                owner_revision: binding.owner_revision,
+                handler: &self.handler,
+            })
+            .collect();
+        Ok(CurationExecutionCarrier {
+            batch,
+            ports: NativeCurationPortSet { ports },
+        })
+    }
+}
+
+/// Validated claim material for one submit-path job: real epoch fence,
+/// revision/generation 1, and a well-formed grant whose digest, authority
+/// epoch, fence generation, idempotency key, and expiry the admission fixture
+/// mirrors exactly.
+fn submit_material(job_id: &str) -> ValidatedDreamerMaterial {
+    let epoch = test_epoch(1);
+    ValidatedDreamerMaterial {
+        job_id: job_id.to_owned(),
+        attempt_id: format!("{job_id}-attempt-1"),
+        revision: 1,
+        scope_id: SCOPE_E2E.to_owned(),
+        fence: StateFence::new(epoch.clone(), ResourceGeneration::genesis()),
+        epoch: epoch.clone(),
+        generation: 1,
+        nonce: "e2e-submit-nonce-0123456789abcdef".to_owned(),
+        grant: DispatchGrant {
+            grant_digest: "c".repeat(64),
+            authority_epoch: epoch,
+            fence_generation: 1,
+            fence_nonce: format!("{job_id}-fence-nonce"),
+            idempotency_key: format!("{job_id}:attempt-1"),
+            expires_at: u64::MAX,
+        },
+    }
+}
+
+/// Kernel admission mirroring the claim material exactly — job, scope, fence,
+/// and idempotency key match, and the deadline stays live — so only stage
+/// gates (never identity) can refuse the submit path.
+fn submit_admission(material: &ValidatedDreamerMaterial) -> KernelJobAdmission {
+    KernelJobAdmission {
+        job_id: material.job_id.clone(),
+        attempt_id: material.attempt_id.clone(),
+        scope_id: material.scope_id.clone(),
+        request_id: format!("{}-request-1", material.job_id),
+        idempotency_key: material.grant.idempotency_key.clone(),
+        cancellation_id: format!("{}-cancel-1", material.job_id),
+        deadline_unix_ms: u64::MAX,
+        state_fence: material.fence.clone(),
+    }
+}
+
+/// Curation job admitting exactly one screenable target: the routed batch
+/// then carries one item, so the A-31 handler runs exactly once and the
+/// exactly-once proof observes `calls() == 1`.
+fn single_target_job(job_id: &str) -> DreamJobInput {
+    let mut job = job_with_handles(job_id, JobClass::Curation);
+    job.evidence_handles = vec!["evidence-e2e-single".to_owned()];
+    job.memory_handles.clear();
+    job.architecture_handles.clear();
+    job.implementation_handles.clear();
+    job.conformance_handles.clear();
+    job
+}
+
+/// The public `submit` path with an injected carrier runs the screen, then
+/// A-31 exactly once, and only then fails closed at the test front door: the
+/// full pipeline executes in-process, and the live view cannot pass without a
+/// Kernel. Typed result content itself is proved at chain level
+/// (`submit_chain_curation_success_with_injected_carrier`); `submit`
+/// in-process cannot project a result view past `live_view` without a live
+/// Kernel transport, so the closed-transport refusal is the terminal proof
+/// here. The empty-handles twin refuses at the screen with zero handler
+/// calls, proving screen-first ordering through `submit`.
+#[test]
+fn submit_curation_with_source_runs_a31_then_fails_closed_at_transport() {
+    let job_id = "job-e2e-submit-curation-ok";
+    let material = submit_material(job_id);
+    let admission = submit_admission(&material);
+    let job = single_target_job(job_id);
+    let source = TestCarrierSource::new();
+    let mut port = AuthenticatedKernelJobPort::for_test(
+        material,
+        admission.clone(),
+        Box::new(ClosedTestTransport),
+        Some(&source),
+    )
+    .expect("test port must construct");
+    let refused =
+        <AuthenticatedKernelJobPort as KernelJobPort>::submit(&mut port, &admission, &job);
+    let Err(error) = refused else {
+        panic!("curation submit with a carrier must fail closed at the test front door");
+    };
+    assert!(
+        matches!(error, DreamerError::KernelAdmissionRequired(_)),
+        "closed transport must surface after the full pipeline, got {error:?}"
+    );
+    assert_eq!(error.code(), KERNEL_ADMISSION_REQUIRED);
+    assert!(
+        !matches!(error, DreamerError::InvalidAdmission(_)),
+        "pipeline success must not refuse as invalid admission, got {error:?}"
+    );
+    assert!(
+        !matches!(error, DreamerError::UnsupportedJobClass(_)),
+        "curation must never refuse by class, got {error:?}"
+    );
+    assert_eq!(
+        source.calls(),
+        1,
+        "A-31 must invoke the routed handler exactly once"
+    );
+
+    // Empty-handles twin: the screen refuses first, so A-31 never runs.
+    let empty_job_id = "job-e2e-submit-curation-empty";
+    let empty_material = submit_material(empty_job_id);
+    let empty_admission = submit_admission(&empty_material);
+    let mut empty_job = job_with_handles(empty_job_id, JobClass::Curation);
+    empty_job.evidence_handles.clear();
+    empty_job.memory_handles.clear();
+    empty_job.architecture_handles.clear();
+    empty_job.implementation_handles.clear();
+    empty_job.conformance_handles.clear();
+    let empty_source = TestCarrierSource::new();
+    let mut empty_port = AuthenticatedKernelJobPort::for_test(
+        empty_material,
+        empty_admission.clone(),
+        Box::new(ClosedTestTransport),
+        Some(&empty_source),
+    )
+    .expect("empty-handles test port must construct");
+    let refused = <AuthenticatedKernelJobPort as KernelJobPort>::submit(
+        &mut empty_port,
+        &empty_admission,
+        &empty_job,
+    );
+    let Err(error) = refused else {
+        panic!("handle-less curation submit must refuse at the screen");
+    };
+    assert!(
+        matches!(error, DreamerError::InvalidAdmission(_)),
+        "handle-less curation must refuse at the screen, got {error:?}"
+    );
+    assert_eq!(error.code(), "DREAMER_REQUEST_REJECTED");
+    assert!(
+        !matches!(error, DreamerError::KernelAdmissionRequired(_)),
+        "screen refusal must precede any transport contact, got {error:?}"
+    );
+    assert_eq!(
+        empty_source.calls(),
+        0,
+        "a screen-first refusal must never reach A-31"
+    );
+}
+
+/// The public `submit` path without an injected carrier refuses at the
+/// carrier check with exactly [`CURATION_CARRIER_REFUSAL`] — before any
+/// transport contact: the closed front door would surface
+/// `KernelAdmissionRequired`, never the request-rejected code.
+#[test]
+fn submit_curation_without_source_refuses_carrier_before_transport() {
+    let job_id = "job-e2e-submit-curation-bare";
+    let material = submit_material(job_id);
+    let admission = submit_admission(&material);
+    let job = job_with_handles(job_id, JobClass::Curation);
+    let mut port = AuthenticatedKernelJobPort::for_test(
+        material,
+        admission.clone(),
+        Box::new(ClosedTestTransport),
+        None,
+    )
+    .expect("test port must construct");
+    let refused =
+        <AuthenticatedKernelJobPort as KernelJobPort>::submit(&mut port, &admission, &job);
+    let Err(error) = refused else {
+        panic!("carrier-less curation submit must refuse at the carrier check");
+    };
+    assert!(
+        matches!(
+            error,
+            DreamerError::InvalidAdmission(reason) if reason == CURATION_CARRIER_REFUSAL
+        ),
+        "refusal must be exactly the carrier-check reason, got {error:?}"
+    );
+    assert_eq!(error.code(), "DREAMER_REQUEST_REJECTED");
+}
+
+/// The public `submit` path refuses a non-admitted class at the Slice-A gate
+/// with its exact class payload — before any transport contact.
+#[test]
+fn submit_refused_class_refuses_before_transport() {
+    let job_id = "job-e2e-submit-clarification";
+    let material = submit_material(job_id);
+    let admission = submit_admission(&material);
+    let job = job_with_handles(job_id, JobClass::Clarification);
+    let mut port = AuthenticatedKernelJobPort::for_test(
+        material,
+        admission.clone(),
+        Box::new(ClosedTestTransport),
+        None,
+    )
+    .expect("test port must construct");
+    let refused =
+        <AuthenticatedKernelJobPort as KernelJobPort>::submit(&mut port, &admission, &job);
+    assert!(
+        matches!(
+            refused,
+            Err(DreamerError::UnsupportedJobClass(JobClass::Clarification))
+        ),
+        "clarification submit must refuse with its class payload, got {refused:?}"
+    );
+    assert_eq!(
+        refused.as_ref().map_err(DreamerError::code),
+        Err("DREAMER_REQUEST_REJECTED")
+    );
+}
+
+/// The public `submit` path stops a valid generic-track job at the Slice-2
+/// controller gate: the refusal names the Governor-resolved controller
+/// material — no class refusal, no transport contact.
+#[test]
+fn submit_orientation_stops_at_controller_gate() {
+    let job_id = "job-e2e-submit-orientation";
+    let material = submit_material(job_id);
+    let admission = submit_admission(&material);
+    let job = job_with_handles(job_id, JobClass::Orientation);
+    let mut port = AuthenticatedKernelJobPort::for_test(
+        material,
+        admission.clone(),
+        Box::new(ClosedTestTransport),
+        None,
+    )
+    .expect("test port must construct");
+    let refused =
+        <AuthenticatedKernelJobPort as KernelJobPort>::submit(&mut port, &admission, &job);
+    let Err(error) = refused else {
+        panic!("orientation submit must stop at the controller gate");
+    };
+    assert!(
+        matches!(
+            &error,
+            DreamerError::InvalidAdmission(reason) if reason.contains("Governor-resolved")
+        ),
+        "controller gate must name the Governor-resolved material, got {error:?}"
+    );
+    assert_eq!(error.code(), "DREAMER_REQUEST_REJECTED");
+    assert!(
+        !matches!(error, DreamerError::UnsupportedJobClass(_)),
+        "orientation is admitted and must never refuse by class, got {error:?}"
+    );
+    assert!(
+        !matches!(error, DreamerError::KernelAdmissionRequired(_)),
+        "the controller gate must precede any transport contact, got {error:?}"
+    );
 }

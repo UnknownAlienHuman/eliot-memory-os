@@ -108,7 +108,7 @@ const FRAME_SOURCE_REFUSAL: &str =
 /// Both halves arrive together from the Governor. Production carries none
 /// (live ports are absent in-binary); tests inject the
 /// [`curation_test_support`] carrier to prove the wired path.
-pub(crate) struct CurationExecutionCarrier<'a> {
+pub struct CurationExecutionCarrier<'a> {
     /// Already-validated batch bound to the dispatched screen.
     pub batch: ValidatedCurationBatch,
     /// Exactly one live port per owner family, validated against the closed
@@ -633,6 +633,7 @@ pub(crate) mod curation_test_support {
     use eliot_dreamer_curation::{
         compute_input_digest, expected_owner_package, NativeCurationPort,
     };
+    use std::sync::atomic::{AtomicU64, Ordering};
 
     /// Fail-closed reason when the test harness cannot bind its fixture batch
     /// to the given screen, admission, and job.
@@ -946,6 +947,186 @@ pub(crate) mod curation_test_support {
         }
     }
 
+    /// Test-only counting routing handler for submit-path proofs: delegates
+    /// the echo to [`TestRoutingHandler`] while counting invocations, so the
+    /// public `submit` tests prove A-31 ran exactly once. Owns only the
+    /// counter, so carrier sources built around it stay borrow-free.
+    pub(crate) struct CountingRoutingHandler {
+        calls: AtomicU64,
+    }
+
+    impl CountingRoutingHandler {
+        /// Builds an uncalled counting handler.
+        pub(crate) fn new() -> Self {
+            Self {
+                calls: AtomicU64::new(0),
+            }
+        }
+
+        /// Returns the number of routed handler invocations so far.
+        pub(crate) fn calls(&self) -> u64 {
+            self.calls.load(Ordering::SeqCst)
+        }
+    }
+
+    impl Default for CountingRoutingHandler {
+        fn default() -> Self {
+            Self::new()
+        }
+    }
+
+    impl NativeCurationHandler for CountingRoutingHandler {
+        fn handle(
+            &self,
+            call: &BoundCurationCall,
+        ) -> Result<ProducedCurationContent, ContractViolation> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            TestRoutingHandler.handle(call)
+        }
+    }
+
+    /// Owned port binding halves for test carrier sources: the registry
+    /// descriptor plus the owner package and revision the live port must
+    /// carry. Stored owned because the live [`NativeCurationPort`] borrows
+    /// the source handler and cannot live inside the source itself.
+    pub(crate) struct TestPortBinding {
+        /// Registry descriptor, byte-equal to the closed registry entry.
+        pub(crate) port: CurationHandlerPort,
+        /// Real expected owner package for the descriptor family.
+        pub(crate) owner_package: String,
+        /// Pin-matching revision for the batch owner pins.
+        pub(crate) owner_revision: String,
+    }
+
+    /// Builds the ten owned port halves from the real registry descriptors:
+    /// delegates to the private harness builder so the descriptor/package/
+    /// revision logic lives in exactly one place.
+    pub(crate) fn test_port_bindings() -> Result<Vec<TestPortBinding>, DreamerError> {
+        let invalid = || DreamerError::InvalidAdmission(HARNESS_BINDING_REFUSAL);
+        let registry = canonical_registry().map_err(|_| invalid())?;
+        registry.validate_closure().map_err(|_| invalid())?;
+        Ok(harness_port_bindings(&registry)?
+            .into_iter()
+            .map(|binding| TestPortBinding {
+                port: binding.port,
+                owner_package: binding.owner_package,
+                owner_revision: binding.owner_revision,
+            })
+            .collect())
+    }
+
+    /// Builds the fixture batch bound to one screen without assembling ports:
+    /// delegates to the private harness builder so the digest/pin/seal logic
+    /// lives in exactly one place and is never duplicated by hand. Test
+    /// carrier sources reuse this for the presented screen, admission, and
+    /// job, then wrap it in ports around their own handler.
+    pub(crate) fn test_batch_for(
+        screen: &ScreenBinding,
+        admission: &KernelJobAdmission,
+        job: &DreamJobInput,
+    ) -> Result<ValidatedCurationBatch, DreamerError> {
+        harness_batch(screen, admission, job)
+    }
+
+    /// Builds one bound fixture call over a single target, mirroring the
+    /// handler-content proof below, so the counting-handler proof reuses the
+    /// same valid call shape instead of rebuilding it by hand.
+    fn harness_bound_call(target: &str) -> BoundCurationCall {
+        use eliot_dreamer_contracts::registry::CurationHandlerDescriptor;
+
+        let screen = harness_screen(&[target]);
+        let receipt = harness_receipt(
+            "job-harness",
+            &harness_hex("job-harness:bundle"),
+            &harness_hex("job-harness:manifest"),
+            &screen,
+        )
+        .expect("harness receipt must validate");
+        let requester = eliot_dreamer_contracts::Requester {
+            origin: eliot_dreamer_contracts::RequesterOrigin::Human,
+            principal: "harness".to_owned(),
+            session: None,
+        };
+        let item = harness_item(
+            "target-harness",
+            0,
+            &receipt,
+            &screen,
+            "job-harness",
+            &requester,
+        )
+        .expect("harness item must validate");
+        let payload = item.payload.clone();
+        BoundCurationCall {
+            port: CurationHandlerPort {
+                port_id: "harness-port".to_owned(),
+                descriptor: CurationHandlerDescriptor {
+                    family: CurationFamily::Classification,
+                    handler_id: "harness-check".to_owned(),
+                    accepted_kinds: vec![CurationKind::Classification],
+                },
+            },
+            item,
+            request: eliot_dreamer_contracts::TypedCurationHandlerRequest {
+                request_id: screen.request_id.as_str().to_owned(),
+                receipt_id: screen.receipt_id.as_str().to_owned(),
+                source_snapshot: screen.source_snapshot.clone(),
+                source_revision: screen.source_revision.clone(),
+                profile: screen.profile.clone(),
+                kind: CurationKind::Classification,
+                family: CurationFamily::Classification,
+                job_id: "job-harness".to_owned(),
+                scope_id: screen.scope_id.clone(),
+                task_id: screen.task_id.clone(),
+                state_fence: screen.state_fence.clone(),
+                payload,
+                denominator: TargetDenominator {
+                    mode: AtomicityMode::AllOrNothing,
+                    members: vec!["target-harness".to_owned()],
+                    expected_total: 1,
+                },
+                screen_binding: Some(screen),
+            },
+            registry_digest: "c".repeat(64),
+        }
+    }
+
+    /// The counting handler echoes like the fixture handler, counts exactly
+    /// one call per invocation, and the owned port halves cover every
+    /// canonical family with pin-matching revisions.
+    #[test]
+    fn counting_handler_echoes_and_counts_with_full_port_coverage() {
+        let handler = CountingRoutingHandler::new();
+        assert_eq!(handler.calls(), 0);
+        let call = harness_bound_call("target-harness");
+        for _ in 0..2 {
+            let content = handler
+                .handle(&call)
+                .expect("echo handler must produce content");
+            assert_eq!(content.payload, call.request.payload);
+            assert_eq!(content.disposition, CandidateDisposition::Candidate);
+            assert!(content.preservation.overall().is_ok());
+            assert!(content.counterevidence_refs.is_empty());
+            assert!(
+                content.validate_for(&call).is_ok(),
+                "echoed content must satisfy the bound call"
+            );
+        }
+        assert_eq!(handler.calls(), 2);
+        let bindings = test_port_bindings().expect("port halves must build");
+        assert_eq!(bindings.len(), CURATION_FAMILIES.len());
+        for binding in &bindings {
+            assert_eq!(binding.owner_revision, HARNESS_REVISION);
+            assert!(
+                !binding.owner_package.trim().is_empty(),
+                "every port half must name its owner package"
+            );
+            assert!(
+                !binding.port.port_id.trim().is_empty(),
+                "every port half must carry a port identity"
+            );
+        }
+    }
     /// The fixture handler echoes the dispatched payload with passing
     /// preservation and disjoint counterevidence, satisfying every
     /// `ProducedCurationContent` rule the owner enforces.

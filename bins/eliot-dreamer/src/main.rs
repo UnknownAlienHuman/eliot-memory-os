@@ -11,6 +11,10 @@ const KERNEL_ADMISSION_EXIT: u8 = 78;
 #[derive(Debug, Serialize)]
 #[serde(tag = "status", rename_all = "snake_case")]
 enum Response {
+    #[allow(
+        dead_code,
+        reason = "retained for the success_response_projects_proved_state proof; the binary edge emits the JobView receipt instead"
+    )]
     Success { job_id: String, state: String },
     Error { code: &'static str, error: String },
 }
@@ -58,6 +62,13 @@ fn main() -> ExitCode {
     }
 }
 
+/// Test-pinned success receipt projection: retained so the proved-state
+/// rendering stays covered by proof while the binary edge emits the
+/// [`JobView`] receipt line.
+#[allow(
+    dead_code,
+    reason = "retained for the success_response_projects_proved_state proof; the binary edge emits the JobView receipt instead"
+)]
 fn success_response(view: &eliot_dreamer::JobView) -> Response {
     Response::Success {
         job_id: view.job_id.clone(),
@@ -67,6 +78,10 @@ fn success_response(view: &eliot_dreamer::JobView) -> Response {
 
 /// Projects the proved local disposition. Exhaustive: a new lifecycle state
 /// fails compilation here instead of rendering a wrong receipt.
+#[allow(
+    dead_code,
+    reason = "retained for the success_response_projects_proved_state proof alongside success_response"
+)]
 fn state_name(state: JobState) -> &'static str {
     match state {
         JobState::Queued => "queued",
@@ -118,6 +133,10 @@ fn write_view(output: &mut impl Write, view: &JobView) -> bool {
 /// Stdout carries nothing on failure: exactly one receipt line on success,
 /// zero lines otherwise. A broken stderr cannot be refused through (there is
 /// no further channel); the process exit code remains the refusal signal.
+#[allow(
+    clippy::print_stderr,
+    reason = "the Slice-8 channel split requires diagnostics on stderr so stdout carries receipts only"
+)]
 fn write_error_stderr(error: &DreamerError) {
     match serde_json::to_string(&error_response(error)) {
         Ok(line) => eprintln!("{line}"),

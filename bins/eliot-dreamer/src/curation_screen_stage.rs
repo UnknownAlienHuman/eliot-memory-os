@@ -36,6 +36,10 @@ pub(crate) struct ScreenInputs {
 
 /// Admitted screen outcome: pass-through for classes the screen does not
 /// filter, or the owner-screened eligible target set for Curation.
+#[allow(
+    clippy::large_enum_variant,
+    reason = "Screened must carry the validated owner binding alongside the eligible set; boxing would split the screened identity the downstream stages reuse verbatim"
+)]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) enum ScreenDecision {
     /// Non-Curation classes need no pre-model screen: zero screen work, and

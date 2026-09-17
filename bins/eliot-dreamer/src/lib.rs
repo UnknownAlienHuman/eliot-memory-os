@@ -7,9 +7,13 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use eliot_cli::kernel_client::{KernelClient, KernelClientError};
 use eliot_contracts::StateFence;
 use eliot_dreamer_contracts::ContractViolation;
+use eliot_dreamer_contracts::ScreenBinding;
 use eliot_dreamer_contracts::registry::{CurationHandlerRegistry, canonical_registry};
 use eliot_protocol::dreamer_job::{DurableJobResponse, JobState as ProtocolJobState};
 use serde::{Deserialize, Serialize};
+
+use crate::dispatch_stage::CurationExecutionCarrier;
+use crate::kernel_port::{ClaimTransport, KernelClaimTransport};
 
 pub(crate) mod kernel_port;
 mod admitted_material;
@@ -135,6 +139,33 @@ pub trait KernelJobPort {
     fn reconcile(&mut self, admission: &KernelJobAdmission) -> Result<JobView, DreamerError>;
 }
 
+/// Governor injection point for the Curation execution carrier.
+///
+/// Production carries no carrier: the ten live handler ports A-31 routes
+/// through are Governor-injected and absent in-binary, so Curation refuses at
+/// the carrier check without one. The Governor (or a test harness) supplies a
+/// source via
+/// [`AuthenticatedKernelJobPort::with_curation_source`], and `submit` resolves
+/// the carrier from the A-20 screen binding before running the admitted
+/// pipeline.
+///
+/// Object-safe by construction: no generic parameters and no lifetime on the
+/// trait itself, so it is usable as `&dyn CurationCarrierSource`.
+pub trait CurationCarrierSource {
+    /// Resolves the execution carrier for one screened Curation admission.
+    ///
+    /// The returned carrier borrows the source (`'s`), so the caller must
+    /// consume it before any `&mut` use of the port holding the source;
+    /// `submit` complies by running the admitted pipeline to an owned
+    /// [`DreamResult`] before observing the live view.
+    fn resolve_carrier<'s>(
+        &'s self,
+        screen: &ScreenBinding,
+        admission: &KernelJobAdmission,
+        job: &DreamJobInput,
+    ) -> Result<CurationExecutionCarrier<'s>, DreamerError>;
+}
+
 /// Authenticated production adapter over the installation-owned Kernel client.
 ///
 /// The port owns the validated one-shot claim: connecting loads the
@@ -144,15 +175,25 @@ pub trait KernelJobPort {
 /// dispatch permit exactly once, and performs `LeaseExact` then `Start`
 /// through the authenticated worker session. Any step failing closed refuses
 /// with [`DreamerError::KernelAdmissionRequired`] without effect.
-pub struct AuthenticatedKernelJobPort {
+pub struct AuthenticatedKernelJobPort<'a> {
     material: kernel_port::ValidatedDreamerMaterial,
     admission: KernelJobAdmission,
     view: JobView,
     handshake: KernelHandshake,
-    transport: kernel_port::KernelClaimTransport,
+    /// Boxed claim transport: the production [`KernelClaimTransport`] at
+    /// `connect()`, an injected test double via `for_test`. Boxed behind the
+    /// object-safe [`ClaimTransport`] seam so the generic `claim_once` /
+    /// `status_once` call sites need no changes (the blanket `Box<T>` impl
+    /// forwards).
+    transport: Box<dyn ClaimTransport>,
+    /// Optional Governor-injected Curation carrier source. `None` in
+    /// production (live handler ports are absent in-binary, so Curation
+    /// refuses at the carrier check); `Some` where the Governor wired one via
+    /// [`AuthenticatedKernelJobPort::with_curation_source`].
+    curation_source: Option<&'a dyn CurationCarrierSource>,
 }
 
-impl AuthenticatedKernelJobPort {
+impl<'a> AuthenticatedKernelJobPort<'a> {
     pub fn connect() -> Result<Self, DreamerError> {
         let mut session = KernelClient::load().map_err(|error| kernel_admission_error(&error))?;
         let health = session
@@ -180,7 +221,7 @@ impl AuthenticatedKernelJobPort {
         // already consumed and claim authority stays Kernel-side.
         kernel_port::derive_permit(&material, &executable, &working_directory)
             .map_err(|error| port_denied(&error))?;
-        let mut transport = kernel_port::KernelClaimTransport::new(session);
+        let mut transport = KernelClaimTransport::new(session);
         let started =
             kernel_port::claim_once(&material, &mut transport).map_err(|error| port_denied(&error))?;
         let admission = claim_admission(&material);
@@ -195,7 +236,58 @@ impl AuthenticatedKernelJobPort {
             admission,
             view,
             handshake,
+            transport: Box::new(transport),
+            curation_source: None,
+        })
+    }
+
+    /// Wires a Governor-injected Curation carrier source into the port.
+    ///
+    /// The Governor calls this after `connect()`; `submit` resolves the
+    /// execution carrier from the A-20 screen binding through this source for
+    /// Curation jobs only. Non-Curation jobs never consult it.
+    #[must_use]
+    pub fn with_curation_source(self, source: &'a dyn CurationCarrierSource) -> Self {
+        Self {
+            curation_source: Some(source),
+            ..self
+        }
+    }
+
+    /// Test-only constructor mirroring `connect()`'s tail with an injected
+    /// transport and zero Kernel contact.
+    ///
+    /// Validates the presented admission, synthesizes the `Running` claimed
+    /// view for its job identity, derives the claim admission from the
+    /// material and validates it (proving the claim binding), and snapshots
+    /// the handshake from the material epoch — performing no health probe, no
+    /// permit derivation, and no `LeaseExact`/`Start` transact.
+    #[cfg(test)]
+    pub(crate) fn for_test(
+        material: kernel_port::ValidatedDreamerMaterial,
+        admission: KernelJobAdmission,
+        transport: Box<dyn ClaimTransport>,
+        curation_source: Option<&'a dyn CurationCarrierSource>,
+    ) -> Result<Self, DreamerError> {
+        admission.validate()?;
+        let view = JobView {
+            job_id: admission.job_id.clone(),
+            state: JobState::Running,
+            result: None,
+        };
+        let claimed = claim_admission(&material);
+        claimed.validate()?;
+        let handshake = KernelHandshake {
+            authority_epoch: material.epoch.sequence.get(),
+            dreamer_claim_supported: true,
+        };
+        Ok(Self {
+            material,
+            admission,
+            view,
+            handshake,
             transport,
+            curation_source,
         })
     }
 
@@ -230,6 +322,31 @@ impl AuthenticatedKernelJobPort {
         Ok(())
     }
 
+    /// Resolves the Governor-injected Curation execution carrier, if any.
+    ///
+    /// Copies the source reference out of `self` first (`Option<&dyn>` is
+    /// `Copy`, ending the borrow), so the resolved carrier borrows the source
+    /// rather than this port. `None` (production) flows to the carrier check
+    /// inside the admitted pipeline, which refuses with the precise typed
+    /// reason; `Some` delegates to the Governor source with the A-20 screen
+    /// binding.
+    ///
+    /// The caller must consume the carrier before any `&mut` use of the port:
+    /// `submit` runs the admitted pipeline to an owned [`DreamResult`] first
+    /// and only then observes the live view.
+    fn resolve_curation_carrier(
+        &self,
+        screen: &ScreenBinding,
+        admission: &KernelJobAdmission,
+        job: &DreamJobInput,
+    ) -> Result<Option<CurationExecutionCarrier<'_>>, DreamerError> {
+        let source = self.curation_source;
+        match source {
+            None => Ok(None),
+            Some(source) => source.resolve_carrier(screen, admission, job).map(Some),
+        }
+    }
+
     /// Observes the live Kernel-proved disposition of the claimed job.
     ///
     /// A refused or unbound reply fails closed; the port never serves a stale
@@ -238,6 +355,25 @@ impl AuthenticatedKernelJobPort {
         let observed = kernel_port::status_once(&self.material, &mut self.transport)
             .map_err(|error| port_denied(&error))?;
         Ok(project_claimed_view(&observed))
+    }
+
+    /// Shared submit tail: observes the live Kernel-proved disposition, then
+    /// attaches the computed result to it.
+    ///
+    /// The Kernel owns state authority, so the computed result attaches to the
+    /// live view instead of inventing terminal state. The Slice-8 result stage
+    /// projects the view and proves its JSONL encoding; the binary receipt
+    /// edge (`main.rs`) emits the line on stdout.
+    fn finish_with_result(&mut self, result: DreamResult) -> Result<JobView, DreamerError> {
+        let view = self.live_view()?;
+        let projected =
+            result_stage::project_result_view(&view.job_id, view.state, Some(result));
+        let line = result_stage::render_jsonl(&projected)?;
+        debug_assert!(
+            !line.is_empty(),
+            "a decided view must render a non-empty receipt line"
+        );
+        Ok(projected)
     }
 }
 
@@ -434,7 +570,7 @@ fn run_admitted_pipeline(
     dispatch_stage::dispatch_admitted(admission, job, screen_binding, None, job.job_class)
 }
 
-impl KernelJobPort for AuthenticatedKernelJobPort {
+impl KernelJobPort for AuthenticatedKernelJobPort<'_> {
     fn handshake(&mut self) -> Result<KernelHandshake, DreamerError> {
         Ok(self.handshake)
     }
@@ -445,39 +581,51 @@ impl KernelJobPort for AuthenticatedKernelJobPort {
         job: &DreamJobInput,
     ) -> Result<JobView, DreamerError> {
         // Admitted pipeline in canonical order: Slice-A/1 dispatch runs
-        // first, so refused classes fail closed before any Kernel-facing call
-        // and before any controller or bundle work. Admitted jobs prove the
-        // Kernel-claimed binding next, then run the #806 controller step, the
-        // A-04 bundle plan, and the admitted stage chain
-        // ([`run_admitted_pipeline`]: screen, then A-31 for Curation or
-        // model/grounding/validation/dispatch otherwise), each stage
-        // genuinely invoking its owner exactly once.
-        // Only then is the live Kernel-proved disposition observed: the
-        // Kernel owns state authority, so the computed result attaches to the
-        // live view instead of inventing terminal state. The Slice-8 result
-        // stage projects the view and proves its JSONL encoding; the binary
-        // receipt edge (`main.rs`) emits the line on stdout.
+        // first, so refused classes fail closed before any Kernel-facing call.
+        // Admitted jobs prove the Kernel-claimed binding next; that binding
+        // holds for every class.
+        //
+        // Curation branches early, before the #806 controller step and the
+        // A-04 bundle plan: Curation owns a separate carrier and never
+        // consumes controller-cycle or bundle-plan outputs (fix3), so gating
+        // it on Slice-2 Governor material would block it unconditionally. The
+        // screen resolves first — proving screen-first ordering and supplying
+        // the carrier-resolution input — then the Governor-injected carrier,
+        // then the admitted stage chain (screen, carrier check, A-31), each
+        // stage genuinely invoking its owner exactly once. Non-Curation jobs
+        // keep controller, bundle plan, and the admitted stage chain
+        // (model/grounding/validation/dispatch).
+        //
+        // Only then is the live Kernel-proved disposition observed via the
+        // shared tail: the Kernel owns state authority, so the computed result
+        // attaches to the live view instead of inventing terminal state. The
+        // Slice-8 result stage projects the view and proves its JSONL
+        // encoding; the binary receipt edge (`main.rs`) emits the line on
+        // stdout.
         let (_arm, _digest) = dispatch_admission(job)?;
         self.check_claimed(admission)?;
+        if job.job_class == JobClass::Curation {
+            let screen = curation_screen_stage::resolve_screen_inputs(admission, job)?;
+            let binding = match screen {
+                curation_screen_stage::ScreenDecision::Screened { binding, .. } => binding,
+                curation_screen_stage::ScreenDecision::PassThrough(_) => {
+                    return Err(DreamerError::InvalidAdmission(
+                        "admitted curation dispatch requires Governor-resolved screen binding",
+                    ));
+                }
+            };
+            let carrier = self.resolve_curation_carrier(&binding, admission, job)?;
+            let result = run_admitted_pipeline(admission, job, carrier)?;
+            return self.finish_with_result(result);
+        }
         let (state, observed, policy, observation_time_ms) =
             controller::resolve_cycle_inputs(admission, job)?;
         let _step =
             controller::step_admitted_cycle(&state, &observed, &policy, observation_time_ms)?;
         let request = bundle_stage::resolve_bundle_request(admission, job)?;
         let _plan = bundle_stage::plan_admitted_bundle(request)?;
-        // Production carries no Curation execution carrier: live handler
-        // ports are Governor-injected, so Curation refuses at the carrier
-        // check with the precise reason instead of burning generic stages.
         let result = run_admitted_pipeline(admission, job, None)?;
-        let view = self.live_view()?;
-        let projected =
-            result_stage::project_result_view(&view.job_id, view.state, Some(result));
-        let line = result_stage::render_jsonl(&projected)?;
-        debug_assert!(
-            !line.is_empty(),
-            "a decided view must render a non-empty receipt line"
-        );
-        Ok(projected)
+        self.finish_with_result(result)
     }
 
     fn cancel(&mut self, admission: &KernelJobAdmission) -> Result<JobView, DreamerError> {
