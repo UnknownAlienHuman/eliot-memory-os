@@ -9,7 +9,7 @@ content_layout = "eliot-doc-shards-v1"
 
 pair_key_algorithm = "sha256-domain-separated-v1"
 pair_key_input = "UTF-8 domain tag eliot-normative-pair-v1 and lowercase document digests separated and terminated by NUL bytes"
-pair_key = "sha256:105558fc8957e150fab407b4fc5818ec49dc784f23f246f42dc9d3ca5843196b"
+pair_key = "sha256:3ea4dc3442f03d3a0020380854d45cdf20c9d5098197e0bfe1e80cf6f2b805ea"
 
 architecture_path = "docs/architecture/architecture/manifest.json"
 architecture_entry_path = "docs/architecture/architecture/README.md"
@@ -23,7 +23,7 @@ implementation_entry_path = "docs/architecture/implementation/README.md"
 implementation_compatibility_path = "docs/architecture/ELIOT_IMPLEMENTATION.md"
 implementation_revision = "0.29-draft"
 implementation_edition = "2026-08-28"
-implementation_sha256 = "7805bf238fe91819aba50d7e13aa86a8b977561195dbb98aa979f986e2fab063"
+implementation_sha256 = "40b0908a637f46ba6c7c51db08e008673f9232ed74d510d3a4f38489d05d4e89"
 
 supersedes_architecture_sha256 = "58e71a2bdb10925c63d85a708ed768aee8617bed0fb52eb044478ec20ab439d8"
 supersedes_implementation_sha256 = "c216fb7f6fdbc62d108c748be6f61ca7ef9e5d24e5bb13af2677c31a58460c0b"
