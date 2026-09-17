@@ -238,6 +238,21 @@ impl AgentCoordinator {
         validate_recipe(&request)?;
         self.validate_launch_effect_ceiling(&request.launch)?;
 
+        // I14.1 work class (issue #1698) is validated by construction:
+        // `StaffingPlanRequest.work_class` and every lane class are the
+        // closed `WorkClass` boundary type, so `Deserialize` already
+        // rejected any unknown spelling at decode ingress through
+        // `WorkClass::parse_wire` and no unvalidated `String` can reach
+        // here. The only remaining check is the single-class binding: every
+        // lane must carry the plan class so one definition, reservation and
+        // admission bind exactly one class. This runs before any capacity
+        // accounting and consumes no capacity on rejection.
+        for lane in &request.lanes {
+            if lane.work_class != request.work_class {
+                return Err(CoordinatorError::IdentityConflict("work_class"));
+            }
+        }
+
         if request.lanes.is_empty() {
             return Err(CoordinatorError::InvalidField("lanes"));
         }
@@ -360,6 +375,7 @@ impl AgentCoordinator {
                 work_unit_id: lane.work_unit_id.clone(),
                 role_id: lane.role_id.clone(),
                 role_revision: role.manifest_revision.clone(),
+                work_class: lane.work_class,
                 routing,
                 capacity_identity: selected_evidence.capacity_identity.clone(),
                 capacity_revision: selected_evidence.capacity_revision.clone(),
@@ -391,6 +407,7 @@ impl AgentCoordinator {
             plan_revision: request.plan_revision.clone(),
             state_fence: request.state_fence.clone(),
             privacy_class: request.privacy_class,
+            work_class: request.work_class,
             lanes,
         };
         if let Some(existing) = self.plans.get(&candidate.candidate_id) {
@@ -501,6 +518,7 @@ impl AgentCoordinator {
             if lane.route != *selected_route
                 || lane.routing_receipt_digest != routing_digest
                 || lane.role_revision != candidate_lane.role_revision
+                || lane.work_class != candidate_lane.work_class
                 || lane.budget != candidate_lane.budget
                 || lane.priority != candidate_lane.priority
                 || lane.mutation_scope != candidate_lane.mutation_scope
@@ -573,6 +591,7 @@ impl AgentCoordinator {
                 attempt_id: lane.attempt_id.clone(),
                 lease_id: lane.lease_id.clone(),
                 worker_id: lane.worker_id.clone(),
+                work_class: lane.work_class,
                 route: lane.route.clone(),
                 capacity_identity: candidate_lane.capacity_identity.clone(),
                 capacity_revision: candidate_lane.capacity_revision.clone(),
@@ -610,10 +629,24 @@ impl AgentCoordinator {
             .filter(|attempt| attempt.state == CoordinatedAttemptState::Admitted)
             .cloned()
             .collect::<Vec<_>>();
+        // I14.1 work class (issue #1698) routes/selects before priority:
+        // protected control first, then normal classes in document order.
+        // Every queued `AttemptRecord.work_class` is the closed `WorkClass`
+        // boundary type, so only validated values can be observed here:
+        // `admit` copies the class from the validated candidate lane, the
+        // retry path (`reassign`) copies it from the stored record, and
+        // restore replays `plan`/`admit` through the same `Deserialize`
+        // ingress. There is no invalid arm because invalid is
+        // unrepresentable.
         ready.sort_by(|left, right| {
-            right
-                .priority
-                .cmp(&left.priority)
+            left.work_class
+                .rank()
+                .cmp(&right.work_class.rank())
+                .then_with(|| {
+                    right
+                        .priority
+                        .cmp(&left.priority)
+                })
                 .then_with(|| left.work_unit_id.cmp(&right.work_unit_id))
                 .then_with(|| left.role_id.cmp(&right.role_id))
                 .then_with(|| left.attempt_id.cmp(&right.attempt_id))
@@ -1094,6 +1127,7 @@ impl AgentCoordinator {
             attempt_id: receipt.new_attempt_id.clone(),
             lease_id: receipt.new_lease_id.clone(),
             worker_id: receipt.new_worker_id.clone(),
+            work_class: old.work_class,
             route: receipt.route.clone(),
             capacity_identity: old.capacity_identity.clone(),
             capacity_revision: old.capacity_revision.clone(),
@@ -2296,6 +2330,9 @@ fn validate_admitted_lane(lane: &crate::AdmittedLaneReceipt) -> Result<(), Coord
     validate_text(lane.work_unit_id.as_str(), "work_unit_id")?;
     validate_text(lane.role_id.as_str(), "role_id")?;
     validate_text(lane.role_revision.as_str(), "role_revision")?;
+    // I14.1 work class needs no string revalidation here: the lane carries
+    // the closed `WorkClass` boundary type, so `Deserialize` already rejected
+    // unknown spellings at decode ingress and only validated values exist.
     validate_text(lane.attempt_id.as_str(), "attempt_id")?;
     // lease_id is the canonical `WorkLeaseId`: blank/control/boundary/length already
     // enforced by Deserialize; uniqueness and binding are enforced via `==`
