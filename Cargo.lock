@@ -1253,6 +1253,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "eliot-dreamer-architecture-brief"
+version = "0.1.0"
+dependencies = [
+ "eliot-contracts",
+ "eliot-dreamer-contracts",
+ "eliot-epistemic-contracts",
+ "eliot-receipts",
+ "schemars",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "eliot-dreamer-bundle"
 version = "0.1.0"
 dependencies = [
@@ -1280,6 +1293,18 @@ name = "eliot-dreamer-claim-grounding"
 version = "0.1.0"
 dependencies = [
  "eliot-dreamer-contracts",
+]
+
+[[package]]
+name = "eliot-dreamer-clarification"
+version = "0.1.0"
+dependencies = [
+ "eliot-contracts",
+ "eliot-dreamer-contracts",
+ "schemars",
+ "serde",
+ "serde_json",
+ "thiserror",
 ]
 
 [[package]]
@@ -1419,6 +1444,20 @@ dependencies = [
  "schemars",
  "serde",
  "serde_json",
+]
+
+[[package]]
+name = "eliot-dreamer-implementation-brief"
+version = "0.1.0"
+dependencies = [
+ "eliot-conformance-contracts",
+ "eliot-contracts",
+ "eliot-dreamer-contracts",
+ "eliot-epistemic-contracts",
+ "eliot-receipts",
+ "serde",
+ "serde_json",
+ "thiserror",
 ]
 
 [[package]]
