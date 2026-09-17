@@ -326,7 +326,8 @@ fn dispatch_class(class: JobClass) -> ClassArm {
 /// Returns the routed arm; no handler is invoked on any path.
 fn dispatch_admission(job: &DreamJobInput) -> Result<ClassArm, DreamerError> {
     refuse_unsupported_job_class(job)?;
-    Ok(dispatch_class(job.job_class))
+    let arm = dispatch_class(job.job_class);
+    Ok(arm)
 }
 
 impl KernelJobPort for AuthenticatedKernelJobPort {
