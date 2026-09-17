@@ -12,6 +12,8 @@ use eliot_protocol::dreamer_job::{DurableJobResponse, JobState as ProtocolJobSta
 use serde::{Deserialize, Serialize};
 
 pub(crate) mod kernel_port;
+mod bundle_stage;
+mod controller;
 mod error;
 
 pub use error::DreamerError;
@@ -370,13 +372,24 @@ impl KernelJobPort for AuthenticatedKernelJobPort {
         admission: &KernelJobAdmission,
         job: &DreamJobInput,
     ) -> Result<JobView, DreamerError> {
-        // Slice-1 admission dispatch runs the Slice-A gate first, then routes
-        // the distinct per-class arm and validates the owner canonical
-        // registry with its digest — all before `check_claimed`/`live_view`,
-        // which remain the only Kernel-facing calls on this path. The arm and
-        // digest are carried for later slices; this slice routes only.
+        // Slice-2 admitted pipeline (I9.1 order): Slice-A/1 dispatch runs
+        // first, so refused classes fail closed before any Kernel-facing call
+        // and before any controller or bundle work. Admitted jobs prove the
+        // Kernel-claimed binding next, then run the #806 controller step and
+        // the A-04 bundle plan exactly once each; only then is the live
+        // Kernel-proved disposition observed. The step and plan are carried
+        // for later slices. Stage input resolution needs Governor-issued
+        // material that no in-binary port supplies yet, so admitted jobs fail
+        // closed at resolution until those slices land — no fallback, no
+        // local fetch, ranking, or model work.
         let (_arm, _digest) = dispatch_admission(job)?;
         self.check_claimed(admission)?;
+        let (state, observed, policy, observation_time_ms) =
+            controller::resolve_cycle_inputs(admission, job)?;
+        let _step =
+            controller::step_admitted_cycle(&state, &observed, &policy, observation_time_ms)?;
+        let request = bundle_stage::resolve_bundle_request(admission, job)?;
+        let _plan = bundle_stage::plan_admitted_bundle(request)?;
         self.live_view()
     }
 

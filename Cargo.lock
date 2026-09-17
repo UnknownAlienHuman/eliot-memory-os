@@ -1221,11 +1221,13 @@ name = "eliot-dreamer"
 version = "0.1.0"
 dependencies = [
  "eliot-cli",
+ "eliot-context-contracts",
  "eliot-contracts",
  "eliot-dreamer-bundle",
  "eliot-dreamer-candidate-validation",
  "eliot-dreamer-claim-grounding",
  "eliot-dreamer-contracts",
+ "eliot-dreamer-cycle",
  "eliot-dreamer-orientation",
  "eliot-dreamer-probe-plan",
  "eliot-dreamer-rival-model",
