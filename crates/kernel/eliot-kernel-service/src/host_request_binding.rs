@@ -344,6 +344,9 @@ impl AuthenticatedHostSession {
             request_sha256: envelope.envelope_sha256.clone(),
             result_digest: digest.clone(),
             response: body.clone(),
+            // Digest-binding validation vehicle only: the attempt binding is
+            // minted by the Kernel claim record at poll time, never here.
+            attempt: None,
         }
         .validate()
         .map_err(|error| error.to_string())?;

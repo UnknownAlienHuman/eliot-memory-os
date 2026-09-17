@@ -20,8 +20,8 @@ use eliot_protocol::{
     AgentActivationResolutionTicket, AgentActivationResultAck, AgentActivationResultReconcile,
     AgentActivationResultSubmit, EncodingProfile, Frame, FrameKind,
     HOST_REQUEST_INVOKE_READ_WIRE_ID, HostRequestEnvelope, HostRequestInvokeReadPayload,
-    HostRequestResultBody, MessageType, ProtocolPayload, ProtocolVersion, RequestIdentity,
-    host_request_operation_id,
+    HostRequestResultBody, LocalReadAttempt, MessageType, ProtocolPayload, ProtocolVersion,
+    RequestIdentity, host_request_operation_id,
 };
 use eliot_receipts::RequestBinding;
 use eliot_store_api::{NamedReadRequest, NamedReadResponse};
@@ -118,23 +118,33 @@ pub enum LocalReadSubmitOutcome {
     /// the expected claim/submit race, projected as a known outcome — never
     /// as a transport error.
     Expired,
+    /// The presented attempt is not the current fencing generation: lease
+    /// replacement, reassignment, disconnect, restart, epoch rotation, or
+    /// revocation quarantined the submission as a noncanonical observation.
+    /// The waiter never observes the stale result; the poller idles and the
+    /// current attempt can still complete through its own bound capability.
+    /// Never a transport error, never retried with the same capability.
+    StaleAttempt,
 }
 
 /// Parses one unwrapped `local_read_claim` answer value into the claimed
-/// admitted pair.
+/// admitted pair plus its fenced attempt capability.
 ///
 /// The Kernel arm
 /// (`bins/eliot-kernel/src/daemon_request_dispatch.rs::local_read_claim`)
 /// answers the single-`operation`-key poll with `{"pair": {"envelope",
-/// "tool"}}` or `{"pair": null}`. `None` is the empty-queue backoff signal,
-/// not an error — exactly like the activation ticket `None` case. The claimed
-/// envelope must already decode as admitted shape; its closed linkage and
-/// fence binding are re-proved inside
+/// "tool", "attempt"}}` or `{"pair": null}`. `None` is the empty-queue
+/// backoff signal, not an error — exactly like the activation ticket `None`
+/// case. The claimed envelope must already decode as admitted shape and the
+/// attempt must already decode as a bound capability (operation handle equal
+/// to the envelope handle); their closed linkage and fence binding are
+/// re-proved inside
 /// [`forward_admitted_local_read`](super::forward_admitted_local_read) before
-/// any read or submit touches it.
+/// any read or submit touches them. A pair without an attempt fails closed:
+/// absent authority is never invented.
 pub fn parse_local_read_claimed_pair(
     value: &serde_json::Value,
-) -> Result<Option<(HostRequestEnvelope, serde_json::Value)>, String> {
+) -> Result<Option<(HostRequestEnvelope, serde_json::Value, LocalReadAttempt)>, String> {
     // #740: receipt span. Records pair presence/absence by identity; the
     // tool payload value never enters the sink.
     let _span = tracing::info_span!("eliotd.request_receipt").entered();
@@ -152,6 +162,10 @@ pub fn parse_local_read_claimed_pair(
                 .get("tool")
                 .cloned()
                 .ok_or_else(|| "Kernel local_read_claim pair omits the tool".to_owned())?;
+            let attempt_value = pair
+                .get("attempt")
+                .cloned()
+                .ok_or_else(|| "Kernel local_read_claim pair omits the attempt".to_owned())?;
             let envelope: HostRequestEnvelope =
                 serde_json::from_value(envelope_value).map_err(|error| {
                     format!("Kernel local_read_claim pair envelope does not decode: {error}")
@@ -159,7 +173,19 @@ pub fn parse_local_read_claimed_pair(
             envelope.validate().map_err(|error| {
                 format!("Kernel local_read_claim pair envelope is not admitted shape: {error}")
             })?;
-            Ok(Some((envelope, tool)))
+            let attempt: LocalReadAttempt =
+                serde_json::from_value(attempt_value).map_err(|error| {
+                    format!("Kernel local_read_claim pair attempt does not decode: {error}")
+                })?;
+            attempt.validate().map_err(|error| {
+                format!("Kernel local_read_claim pair attempt is not bound shape: {error}")
+            })?;
+            if attempt.operation_id != host_request_operation_id(&envelope) {
+                return Err(
+                    "Kernel local_read_claim pair attempt does not bind the envelope".to_owned(),
+                );
+            }
+            Ok(Some((envelope, tool, attempt)))
         }
         _ => Err("Kernel local_read_claim pair is neither an admitted pair nor null".to_owned()),
     }
@@ -170,14 +196,16 @@ pub fn parse_local_read_claimed_pair(
 ///
 /// The Kernel arm
 /// (`bins/eliot-kernel/src/daemon_request_dispatch.rs::local_read_result`)
-/// answers `{"accepted": true}` on persist (exact replays included) and
+/// answers `{"accepted": true}` on persist (exact replays included),
 /// `{"accepted": false, "expired": true}` when the absolute deadline elapsed
-/// first. Anything else is a contract violation, never a silent accept.
+/// first, and `{"accepted": false, "stale": true, ...}` when the presented
+/// attempt is not the current fencing generation. Anything else is a contract
+/// violation, never a silent accept.
 pub fn parse_local_read_submit_outcome(
     value: &serde_json::Value,
 ) -> Result<LocalReadSubmitOutcome, String> {
-    // #740: submit-outcome span. Accepted/expired stay distinct; anything
-    // else is a contract violation, never a silent accept.
+    // #740: submit-outcome span. Accepted/expired/stale stay distinct;
+    // anything else is a contract violation, never a silent accept.
     let _span = tracing::info_span!("eliotd.local_read_submit").entered();
     let accepted = value
         .get("accepted")
@@ -193,7 +221,14 @@ pub fn parse_local_read_submit_outcome(
     {
         return Ok(LocalReadSubmitOutcome::Expired);
     }
-    Err("Kernel local_read_result answer is neither accepted nor expired".to_owned())
+    if value
+        .get("stale")
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false)
+    {
+        return Ok(LocalReadSubmitOutcome::StaleAttempt);
+    }
+    Err("Kernel local_read_result answer is neither accepted, expired, nor stale".to_owned())
 }
 
 impl DaemonKernelClient {
@@ -783,14 +818,19 @@ impl DaemonKernelClient {
     /// [`claim_agent_activation_ticket`](Self::claim_agent_activation_ticket):
     /// the call travels as the single-`operation`-key `"local_read_claim"`
     /// payload and a null `pair` is the empty-queue backoff signal, not an
-    /// error. The claimed pair still proves its closed linkage and fence
+    /// error. The claimed pair carries the Kernel-minted fenced attempt
+    /// capability, which the caller must present back on the read leg and the
+    /// submit leg. The claimed pair still proves its closed linkage and fence
     /// binding inside
     /// [`forward_admitted_local_read`](super::forward_admitted_local_read)
     /// before any read or submit touches it.
     #[cfg(windows)]
     pub async fn claim_local_read_pair_async(
         &self,
-    ) -> Result<Option<(HostRequestEnvelope, serde_json::Value)>, super::DaemonError> {
+    ) -> Result<
+        Option<(HostRequestEnvelope, serde_json::Value, LocalReadAttempt)>,
+        super::DaemonError,
+    > {
         let value = self
             .transact_async(
                 "local_read_claim",
@@ -829,9 +869,12 @@ impl DaemonKernelClient {
     /// Twin of [`store_named_async`](Self::store_named_async): the admitted
     /// envelope+tool pair proves its closed linkage before any transport is
     /// touched, the call travels as the `"local_read"` operation with a fresh
-    /// operation-bound identity, and the persisted result body behind the
-    /// admitted receipt+record is decoded through its closed body contract
-    /// with exact envelope binding before return. Kernel remains the
+    /// operation-bound identity plus the Kernel-issued attempt capability, and
+    /// the persisted result body behind the admitted receipt+record is rebuilt
+    /// through its closed body contract with exact envelope binding before
+    /// return. The returned body carries the presented attempt verbatim, so
+    /// the poller's submit completes under the same fencing generation the
+    /// read ran under. Kernel remains the
     /// admission, read, and persistence authority; this method performs no
     /// admission decision and no consistency algorithm.
     ///
@@ -840,12 +883,12 @@ impl DaemonKernelClient {
     /// wrapper exists only on the error envelope, which never decodes past
     /// the frame outcome (surfacing as `Unknown`, never as a body).
     ///
-    /// Errors: `Contract` when the pair is malformed or unlinked, the
-    /// admitted fence does not bind the envelope, the admitted answer does
-    /// not bind this envelope, or the persisted body is absent (a packet
-    /// admission carries no result body by design), fails to decode, or fails
-    /// its own digest binding; `NotAdmitted` / `Unknown` for transport
-    /// outcomes via [`kernel_port_error`].
+    /// Errors: `Contract` when the pair is malformed or unlinked, the attempt
+    /// does not bind the envelope, the admitted fence does not bind the
+    /// envelope, the admitted answer does not bind this envelope, or the
+    /// persisted body is absent (a packet admission carries no result body by
+    /// design) or fails its own digest binding; `NotAdmitted` / `Unknown` for
+    /// transport outcomes via [`kernel_port_error`].
     ///
     /// Production caller:
     /// [`forward_admitted_local_read`](super::forward_admitted_local_read),
@@ -854,6 +897,7 @@ impl DaemonKernelClient {
         &self,
         envelope: HostRequestEnvelope,
         tool: serde_json::Value,
+        attempt: LocalReadAttempt,
     ) -> Result<HostRequestResultBody, KernelPortError> {
         let pair = HostRequestInvokeReadPayload {
             wire_id: HOST_REQUEST_INVOKE_READ_WIRE_ID.to_owned(),
@@ -863,6 +907,14 @@ impl DaemonKernelClient {
         };
         pair.validate()
             .map_err(|error| KernelPortError::Contract(error.to_string()))?;
+        attempt
+            .validate()
+            .map_err(|error| KernelPortError::Contract(error.to_string()))?;
+        if attempt.operation_id != host_request_operation_id(&pair.envelope) {
+            return Err(KernelPortError::Contract(
+                "daemon local read attempt does not bind the admitted envelope".to_owned(),
+            ));
+        }
         if self.snapshot.state_fence() != pair.envelope.state_fence {
             return Err(KernelPortError::Contract(
                 "daemon local read fence does not match the admitted snapshot".to_owned(),
@@ -874,6 +926,7 @@ impl DaemonKernelClient {
                 serde_json::json!({
                     "envelope": pair.envelope,
                     "tool": pair.tool,
+                    "attempt": attempt,
                 }),
             )
             .await
@@ -899,7 +952,17 @@ impl DaemonKernelClient {
                 "Kernel local read admission does not bind the admitted envelope".to_owned(),
             ));
         }
-        let body_value = admitted
+        let body_digest = admitted
+            .get("record")
+            .and_then(|record| record.get("result_digest"))
+            .and_then(serde_json::Value::as_str)
+            .ok_or_else(|| {
+                KernelPortError::Contract(
+                    "Kernel local read admission carries no result digest; packet admissions stay admission-only"
+                        .to_owned(),
+                )
+            })?;
+        let body_response = admitted
             .get("record")
             .and_then(|record| record.get("result_response"))
             .cloned()
@@ -909,8 +972,20 @@ impl DaemonKernelClient {
                         .to_owned(),
                 )
             })?;
-        let body: HostRequestResultBody = serde_json::from_value(body_value)
-            .map_err(|error| KernelPortError::Contract(error.to_string()))?;
+        // Rebuilt, never decoded: the ORS record carries the digest-bound
+        // response halves, while the operation handle, envelope binding, and
+        // attempt capability are proven here from the admitted answer. The
+        // body carries the presented attempt verbatim so submit completes
+        // under the generation the read ran under.
+        let body = HostRequestResultBody {
+            wire_id: eliot_protocol::HOST_REQUEST_RESULT_BODY_WIRE_ID.to_owned(),
+            wire_version: HostRequestResultBody::CONTRACT_VERSION,
+            operation_id: operation_id.to_owned(),
+            request_sha256: pair.envelope.envelope_sha256.clone(),
+            result_digest: body_digest.to_owned(),
+            response: body_response,
+            attempt: Some(attempt),
+        };
         body.validate()
             .map_err(|error| KernelPortError::Contract(error.to_string()))?;
         if body.request_sha256 != pair.envelope.envelope_sha256
@@ -1008,8 +1083,7 @@ mod tests {
         capability: &str,
         fence: &StateFence,
         payload_sha256: &str,
-    ) -> Result<HostRequestEnvelope, Box<dyn std::error::Error>> {
-        HostRequestEnvelope {
+    ) -> Result<HostRequestEnvelope, Box<dyn std::error::Error>> {        HostRequestEnvelope {
             wire_id: HOST_REQUEST_WIRE_ID.to_owned(),
             wire_version: HostRequestEnvelope::CONTRACT_VERSION,
             kind: HostRequestKind::Invocation,
@@ -1036,6 +1110,30 @@ mod tests {
         }
         .with_computed_digest()
         .map_err(|error| format!("envelope digest: {error}").into())
+    }
+
+    fn test_attempt(
+        envelope: &HostRequestEnvelope,
+        generation: u64,
+    ) -> Result<LocalReadAttempt, Box<dyn std::error::Error>> {
+        let operation_id = host_request_operation_id(envelope);
+        let attempt = LocalReadAttempt {
+            wire_id: eliot_protocol::LOCAL_READ_ATTEMPT_WIRE_ID.to_owned(),
+            wire_version: LocalReadAttempt::CONTRACT_VERSION,
+            operation_id: operation_id.clone(),
+            attempt_id: format!("{operation_id}:attempt:test-boot:7:{generation}"),
+            fencing_generation: generation,
+            session_id: "kernel-session-1".to_owned(),
+            authority_epoch: envelope.state_fence.authority_epoch.clone(),
+            scope_id: "kernel-session-1".to_owned(),
+            facet_method: "eliot.query".to_owned(),
+            expires_at_unix_ms: envelope.identity.deadline_unix_ms,
+            use_budget: 1,
+        };
+        attempt
+            .validate()
+            .map_err(|error| format!("attempt must validate: {error}"))?;
+        Ok(attempt)
     }
 
     fn test_client(fence: &StateFence) -> Result<DaemonKernelClient, Box<dyn std::error::Error>> {
@@ -1280,8 +1378,9 @@ mod tests {
         // wrong fence is Contract (not a Kernel round-trip), never Ok-empty.
         let transport_fenced = runtime.block_on(forward_admitted_local_read(
             &client,
-            wrong_envelope,
+            wrong_envelope.clone(),
             tool.clone(),
+            test_attempt(&wrong_envelope, 1)?,
         ));
         assert!(
             matches!(transport_fenced, Err(KernelPortError::Contract(_))),
@@ -1293,6 +1392,7 @@ mod tests {
             &client,
             envelope.clone(),
             json!("not-an-object"),
+            test_attempt(&envelope, 1)?,
         ));
         assert!(
             matches!(malformed, Err(KernelPortError::Contract(_))),
@@ -1316,29 +1416,48 @@ mod tests {
             "an empty claim must poll null"
         );
 
-        // A claimed pair round-trips the exact admitted envelope and tool.
+        // A claimed pair round-trips the exact admitted envelope, tool, and
+        // fenced attempt capability.
         let fence = test_fence(1)?;
         let tool = query_tool();
         let envelope = test_envelope("eliot.query", &fence, &tool_digest(&tool)?)?;
+        let attempt = test_attempt(&envelope, 1)?;
         let answer = serde_json::json!({
             "pair": {
                 "envelope": envelope.clone(),
                 "tool": tool.clone(),
+                "attempt": attempt.clone(),
             }
         });
-        let (claimed_envelope, claimed_tool) = parse_local_read_claimed_pair(&answer)
-            .map_err(|error| format!("queued pair must parse: {error}"))?
-            .ok_or("a queued pair must claim")?;
+        let (claimed_envelope, claimed_tool, claimed_attempt) =
+            parse_local_read_claimed_pair(&answer)
+                .map_err(|error| format!("queued pair must parse: {error}"))?
+                .ok_or("a queued pair must claim")?;
         assert_eq!(
             claimed_envelope.envelope_sha256, envelope.envelope_sha256,
             "the claim returns the exact admitted envelope"
         );
         assert_eq!(claimed_tool, tool, "the claim returns the exact tool bytes");
+        assert_eq!(
+            claimed_attempt, attempt,
+            "the claim returns the exact fenced attempt"
+        );
 
-        // A pair omitting the envelope, a non-pair value, and an answer
-        // omitting the pair all fail closed — never Ok-empty, never invented.
+        // A pair omitting the envelope, the tool, or the attempt, a non-pair
+        // value, an attempt bound to another operation, and an answer omitting
+        // the pair all fail closed — never Ok-empty, never invented.
+        let mut foreign_attempt = serde_json::to_value(&attempt)
+            .map_err(|error| format!("attempt must encode: {error}"))?;
+        foreign_attempt["operation_id"] =
+            serde_json::json!("hostreq:ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff");
         for bad in [
-            serde_json::json!({ "pair": { "tool": tool.clone() } }),
+            serde_json::json!({ "pair": { "tool": tool.clone(), "attempt": attempt.clone() } }),
+            serde_json::json!({ "pair": { "envelope": envelope.clone(), "tool": tool.clone() } }),
+            serde_json::json!({ "pair": {
+                "envelope": envelope.clone(),
+                "tool": tool.clone(),
+                "attempt": foreign_attempt.clone(),
+            } }),
             serde_json::json!({ "pair": "not-a-pair" }),
             serde_json::json!({ "operation": "local_read_claim" }),
         ] {
@@ -1349,7 +1468,8 @@ mod tests {
         }
 
         // Accepted persists (exact replays included); expired is the expected
-        // deadline race, never a transport error.
+        // deadline race; stale quarantines a replaced or revoked attempt —
+        // never a transport error.
         assert_eq!(
             parse_local_read_submit_outcome(&serde_json::json!({ "accepted": true }))
                 .map_err(|error| format!("accepted must parse: {error}"))?,
@@ -1361,6 +1481,13 @@ mod tests {
             )
             .map_err(|error| format!("expired must parse: {error}"))?,
             LocalReadSubmitOutcome::Expired,
+        );
+        assert_eq!(
+            parse_local_read_submit_outcome(
+                &serde_json::json!({ "accepted": false, "stale": true, "reason": "superseded" })
+            )
+            .map_err(|error| format!("stale must parse: {error}"))?,
+            LocalReadSubmitOutcome::StaleAttempt,
         );
         for bad in [
             serde_json::json!({}),

@@ -28,7 +28,7 @@ use std::sync::Arc;
 
 use eliot_contracts::{RequestMetadata, StateFence};
 use eliot_governor::KernelPortError;
-use eliot_protocol::{HostRequestEnvelope, HostRequestResultBody};
+use eliot_protocol::{HostRequestEnvelope, HostRequestResultBody, LocalReadAttempt};
 use eliot_read::{LocalReadPort, QueryResult, ReadError, ReadService, StoreReadFailure};
 use eliot_store_api::ScopeId;
 
@@ -39,8 +39,9 @@ use super::{DaemonComposition, DaemonKernelClient, KernelContextReadClient};
 /// Production kernel-caller bridge over the retained authenticated session:
 /// the pair proves its closed linkage and fence binding inside
 /// [`DaemonKernelClient::local_read_async`], travels as the `"local_read"`
-/// operation, and the persisted result body behind the admitted receipt+record
-/// returns decoded and envelope-bound. Kernel remains the admission, read, and
+/// operation with the Kernel-issued attempt capability, and the persisted
+/// result body behind the admitted receipt+record returns carrying that same
+/// attempt for the submit leg. Kernel remains the admission, read, and
 /// persistence authority; this function performs no admission decision and no
 /// consistency algorithm. A wrong fence or malformed pair fails closed before
 /// any transport; a packet admission carries no result body by design.
@@ -48,8 +49,9 @@ pub async fn forward_admitted_local_read(
     kernel: &DaemonKernelClient,
     envelope: HostRequestEnvelope,
     tool: serde_json::Value,
+    attempt: LocalReadAttempt,
 ) -> Result<HostRequestResultBody, KernelPortError> {
-    kernel.local_read_async(envelope, tool).await
+    kernel.local_read_async(envelope, tool, attempt).await
 }
 
 /// Serves one admitted `eliot.query` pair through the Governor read port.

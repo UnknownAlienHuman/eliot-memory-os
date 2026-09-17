@@ -11,10 +11,11 @@
 //!
 //! Test 2 drives the production poller wire contract the daemon `run_loop`
 //! speaks: one `local_read_claim` answer parses to the exact admitted pair
-//! (null polls back off), one digest-bound [`HostRequestResultBody`] binds
-//! the admitted envelope, and one `local_read_result` answer parses to the
-//! typed accepted / expired outcome. Exact replay is byte-stable by
-//! construction, so a resubmitted identical body stays idempotent.
+//! plus its fenced attempt capability (null polls back off), one digest-bound
+//! [`HostRequestResultBody`] binds the admitted envelope, and one
+//! `local_read_result` answer parses to the typed accepted / expired / stale
+//! outcome. Exact replay is byte-stable by construction, so a resubmitted
+//! identical body stays idempotent.
 //!
 //! Hermetic by construction: the port is served by a real in-test
 //! [`CanonicalReadClient`] that derives every response field from the
@@ -39,7 +40,7 @@ use std::num::NonZeroU64;
 use eliot_contracts::{EpochId, EpochLineageId, ResourceGeneration, StateFence};
 use eliot_protocol::{
     HOST_REQUEST_RESULT_BODY_WIRE_ID, HOST_REQUEST_WIRE_ID, HostRequestEnvelope,
-    HostRequestIdentity, HostRequestKind, HostRequestResultBody,
+    HostRequestIdentity, HostRequestKind, HostRequestResultBody, LocalReadAttempt,
 };
 use eliot_read::{ProvenanceDisposition, ReadError, ReadProvenance, ReadService, StoreReadFailure};
 use eliot_store_api::{
@@ -329,6 +330,10 @@ fn result_body_for(envelope: &HostRequestEnvelope) -> TestResult<HostRequestResu
         request_sha256: envelope.envelope_sha256.clone(),
         result_digest: eliot_contracts::sha256_hex(&bytes),
         response,
+        // Wire-shape proof only: stored rows predate attempt ownership, so no
+        // attempt rides this vehicle. Submissions always carry the current
+        // attempt, enforced by the Kernel legs.
+        attempt: None,
     };
     body.validate()
         .map_err(|error| format!("result body must validate: {error}"))?;
@@ -341,17 +346,44 @@ fn claimed_pair_submits_the_exact_bound_body() -> TestResult {
     let tool = query_tool_with_mode("verification");
     let envelope = test_envelope("eliot.query", &fence, &tool_digest(&tool)?)?;
 
-    // The poller claims the exact admitted pair over `local_read_claim`;
-    // a null pair is the empty-queue backoff, not an error.
-    let claim = json!({ "pair": { "envelope": envelope.clone(), "tool": tool.clone() } });
-    let (claimed_envelope, claimed_tool) = eliotd::parse_local_read_claimed_pair(&claim)
-        .map_err(|error| format!("claim must parse: {error}"))?
-        .ok_or("a queued pair must claim")?;
+    // The poller claims the exact admitted pair plus its fenced attempt over
+    // `local_read_claim`; a null pair is the empty-queue backoff, not an
+    // error.
+    let operation_id = eliot_protocol::host_request_operation_id(&envelope);
+    let attempt = LocalReadAttempt {
+        wire_id: eliot_protocol::LOCAL_READ_ATTEMPT_WIRE_ID.to_owned(),
+        wire_version: LocalReadAttempt::CONTRACT_VERSION,
+        operation_id: operation_id.clone(),
+        attempt_id: format!("{operation_id}:attempt:e2e-boot:3:1"),
+        fencing_generation: 1,
+        session_id: "kernel-session-1".to_owned(),
+        authority_epoch: fence.authority_epoch.clone(),
+        scope_id: "kernel-session-1".to_owned(),
+        facet_method: "eliot.query".to_owned(),
+        expires_at_unix_ms: envelope.identity.deadline_unix_ms,
+        use_budget: 1,
+    };
+    attempt
+        .validate()
+        .map_err(|error| format!("attempt must validate: {error}"))?;
+    let claim = json!({ "pair": {
+        "envelope": envelope.clone(),
+        "tool": tool.clone(),
+        "attempt": attempt.clone(),
+    } });
+    let (claimed_envelope, claimed_tool, claimed_attempt) =
+        eliotd::parse_local_read_claimed_pair(&claim)
+            .map_err(|error| format!("claim must parse: {error}"))?
+            .ok_or("a queued pair must claim")?;
     assert_eq!(
         claimed_envelope.envelope_sha256, envelope.envelope_sha256,
         "the claim returns the exact admitted envelope"
     );
     assert_eq!(claimed_tool, tool, "the claim returns the exact tool bytes");
+    assert_eq!(
+        claimed_attempt, attempt,
+        "the claim returns the exact fenced attempt"
+    );
     assert_eq!(
         eliotd::parse_local_read_claimed_pair(&json!({ "pair": null }))
             .map_err(|error| format!("empty claim must not fail: {error}"))?,
@@ -374,7 +406,8 @@ fn claimed_pair_submits_the_exact_bound_body() -> TestResult {
     );
 
     // `local_read_result` projects the typed outcome: accepted persists
-    // (exact replays included); expired is the expected deadline race.
+    // (exact replays included); expired is the expected deadline race; stale
+    // quarantines a replaced or revoked attempt.
     assert_eq!(
         eliotd::parse_local_read_submit_outcome(&json!({ "accepted": true }))
             .map_err(|error| format!("accepted must parse: {error}"))?,
@@ -386,6 +419,14 @@ fn claimed_pair_submits_the_exact_bound_body() -> TestResult {
             .map_err(|error| format!("expired must parse: {error}"))?,
         eliotd::LocalReadSubmitOutcome::Expired,
         "an elapsed deadline projects the expected expired race"
+    );
+    assert_eq!(
+        eliotd::parse_local_read_submit_outcome(
+            &json!({ "accepted": false, "stale": true, "reason": "revoked" })
+        )
+        .map_err(|error| format!("stale must parse: {error}"))?,
+        eliotd::LocalReadSubmitOutcome::StaleAttempt,
+        "a revoked attempt projects the stale quarantine"
     );
 
     // Exact replay stays idempotent: the identical body re-encodes to the

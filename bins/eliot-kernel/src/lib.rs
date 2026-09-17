@@ -492,6 +492,12 @@ pub struct KernelComposition {
     /// `Unknown` without enumerating the store.
     #[cfg(windows)]
     host_request_connection_index: Mutex<BTreeMap<String, Vec<HostRequestOperationRef>>>,
+    /// Boot-unique seed for local-read attempt identities. Minted once per
+    /// composition so attempt IDs never repeat across restarts: a capability
+    /// serialized before a restart can never match a claim record minted after
+    /// it, even when the fencing generation restarts at 1.
+    #[cfg(windows)]
+    local_read_claim_boot_nonce: u64,
 }
 
 #[cfg(windows)]
