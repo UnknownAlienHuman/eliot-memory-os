@@ -14,7 +14,13 @@ use serde::{Deserialize, Serialize};
 pub(crate) mod kernel_port;
 mod bundle_stage;
 mod controller;
+mod curation_screen_stage;
+mod dispatch_stage;
 mod error;
+mod grounding_stage;
+mod model_stage;
+mod result_stage;
+mod validation_stage;
 
 pub use error::DreamerError;
 
@@ -372,16 +378,19 @@ impl KernelJobPort for AuthenticatedKernelJobPort {
         admission: &KernelJobAdmission,
         job: &DreamJobInput,
     ) -> Result<JobView, DreamerError> {
-        // Slice-2 admitted pipeline (I9.1 order): Slice-A/1 dispatch runs
+        // Admitted pipeline in canonical order: Slice-A/1 dispatch runs
         // first, so refused classes fail closed before any Kernel-facing call
         // and before any controller or bundle work. Admitted jobs prove the
-        // Kernel-claimed binding next, then run the #806 controller step and
-        // the A-04 bundle plan exactly once each; only then is the live
-        // Kernel-proved disposition observed. The step and plan are carried
-        // for later slices. Stage input resolution needs Governor-issued
-        // material that no in-binary port supplies yet, so admitted jobs fail
-        // closed at resolution until those slices land — no fallback, no
-        // local fetch, ranking, or model work.
+        // Kernel-claimed binding next, then run the #806 controller step, the
+        // A-04 bundle plan, the A-20 curation screen (pass-through for
+        // non-Curation classes), the T12-07 model call, A-14b grounding, A-05
+        // validation (Orientation consumed natively per #1136 Slice B G1–G5),
+        // and the Slice-7 exact native owner dispatch, each exactly once;
+        // only then is the live Kernel-proved disposition observed and
+        // projected through the Slice-8 result stage. Stage input resolution
+        // needs Governor-issued material that no in-binary port supplies yet,
+        // so admitted jobs fail closed at resolution until those slices land
+        // — no fallback, no local fetch, ranking, or model work.
         let (_arm, _digest) = dispatch_admission(job)?;
         self.check_claimed(admission)?;
         let (state, observed, policy, observation_time_ms) =
@@ -390,7 +399,15 @@ impl KernelJobPort for AuthenticatedKernelJobPort {
             controller::step_admitted_cycle(&state, &observed, &policy, observation_time_ms)?;
         let request = bundle_stage::resolve_bundle_request(admission, job)?;
         let _plan = bundle_stage::plan_admitted_bundle(request)?;
-        self.live_view()
+        let _screen = curation_screen_stage::resolve_screen_inputs(admission, job)?;
+        let _model = model_stage::resolve_model_inputs(admission, job)?;
+        let _grounding = grounding_stage::resolve_grounding_inputs(admission, job)?;
+        let _validation = validation_stage::resolve_validation_inputs(admission, job)?;
+        let _dispatched = dispatch_stage::dispatch_admitted_result(job.job_class)?;
+        let view = self.live_view()?;
+        let projected = result_stage::project_result_view(&view.job_id, view.state, view.result);
+        let _line = result_stage::render_jsonl(&projected)?;
+        Ok(projected)
     }
 
     fn cancel(&mut self, admission: &KernelJobAdmission) -> Result<JobView, DreamerError> {
