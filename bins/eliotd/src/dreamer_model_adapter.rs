@@ -543,11 +543,11 @@ mod tests {
             plan_revision: rev("plan-rev-t12-07")?,
             state_fence: fence.clone(),
             privacy_class: PrivacyClass::Private,
-            work_class: "model_jobs".to_owned(),
+            work_class: "model_jobs".parse()?,
             lanes: vec![StaffingLaneRequest {
                 work_unit_id: WorkUnitId::new("work-1")?,
                 role_id: RoleProfileId::new("role-1")?,
-                work_class: "model_jobs".to_owned(),
+                work_class: "model_jobs".parse()?,
                 route_candidates: vec![RouteCandidateEvidence {
                     route: route.clone(),
                     preference_rank: 0,

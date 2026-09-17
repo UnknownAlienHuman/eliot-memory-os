@@ -20,7 +20,7 @@ use eliot_agent_contracts::RevisionId;
 use eliot_agent_coordinator::{
     AdmissionId, CandidateId, CoordinatorConfig, RecipeId, RecipeManifest, RoleProfileId,
     RoleProfileManifest, RouteCandidateEvidence, StaffingLaneRequest, StaffingPlanCandidate,
-    StaffingPlanRequest,
+    StaffingPlanRequest, WorkClass,
 };
 use eliot_contracts::{EpochId, EpochLineageId, ResourceGeneration, StateFence, sha256_hex};
 use eliot_evaluation_contracts::BudgetEvidence;
@@ -169,12 +169,12 @@ fn test_request(
             .map_err(|error| format!("plan rev: {error}"))?,
         state_fence: fence.clone(),
         privacy_class: PrivacyClass::Private,
-        work_class: "swarm".to_owned(),
+        work_class: WorkClass::parse_wire("swarm").map_err(|error| format!("class: {error}"))?,
         lanes: vec![StaffingLaneRequest {
             work_unit_id: WorkUnitId::new("work-1")
                 .map_err(|error| format!("lane work: {error}"))?,
             role_id: RoleProfileId::new("role-1").map_err(|error| format!("lane role: {error}"))?,
-            work_class: "swarm".to_owned(),
+            work_class: WorkClass::parse_wire("swarm").map_err(|error| format!("class: {error}"))?,
             route_candidates: vec![RouteCandidateEvidence {
                 route: route.clone(),
                 preference_rank: 0,
@@ -271,7 +271,7 @@ impl AdmissionAuthorityPort for FakeAdmission {
             reservation_id: format!("res-{}", definition.definition_id.as_str()),
             definition_id: definition.definition_id.clone(),
             definition_digest: definition.definition_digest.clone(),
-            work_class: definition.work_class.clone(),
+            work_class: definition.work_class,
             fence: definition.fence.clone(),
         })
     }
@@ -286,7 +286,7 @@ impl AdmissionAuthorityPort for FakeAdmission {
                 .map_err(|error| FabricError::Contract(format!("admission id: {error}")))?,
             definition_id: reservation.definition_id.clone(),
             definition_digest: reservation.definition_digest.clone(),
-            work_class: reservation.work_class.clone(),
+            work_class: reservation.work_class,
             reservation_id: reservation.reservation_id.clone(),
             fence: reservation.fence.clone(),
             epoch: reservation.fence.authority_epoch.clone(),

@@ -35,8 +35,7 @@ use crate::{
     ProviderReassignmentReceipt, ProviderUnknownOutcomeReconciliation, ProviderWorkerFenceReceipt,
     ReassignmentId, RecipeId, RecipeManifest, ResultSubmission, RoleProfileId, RoleProfileManifest,
     RouteCandidateEvidence, StaffingLaneRequest, StaffingPlanCandidate, StaffingPlanRequest,
-    SubmissionId, UnknownOutcomeResolution, WORK_CLASS_CONTROL, WorkerId, normal_work_class_from_wire,
-    validate_work_class, work_class_rank,
+    SubmissionId, UnknownOutcomeResolution, WorkClass, WorkerId,
 };
 
 type TestResult<T = ()> = Result<T, Box<dyn std::error::Error>>;
@@ -365,14 +364,14 @@ fn request(
         plan_revision: rev(&format!("plan-rev-{tag}")),
         state_fence: fence(),
         privacy_class: PrivacyClass::Private,
-        work_class: "swarm".to_owned(),
+        work_class: "swarm".parse()?,
         lanes: specs
             .iter()
             .map(|spec| {
                 Ok(StaffingLaneRequest {
                     work_unit_id: WorkUnitId::new(spec.work)?,
                     role_id: RoleProfileId::new(spec.role)?,
-                    work_class: "swarm".to_owned(),
+                    work_class: "swarm".parse()?,
                     route_candidates: vec![route_evidence(route(spec.route), 0)],
                     budget: budget(),
                     priority: spec.priority,
@@ -452,7 +451,7 @@ fn provider_receipt(
                 attempt_id,
                 lease_id,
                 worker_id: WorkerId::new(format!("worker-{tag}-{index}"))?,
-                work_class: lane.work_class.clone(),
+                work_class: lane.work_class,
                 route: selected,
                 routing_receipt_digest,
                 budget: lane.budget.clone(),
@@ -2850,7 +2849,7 @@ fn s5_missing_stored_admission_and_reassigned_stays_unresolved() -> TestResult {
         attempt_id: new_attempt.clone(),
         lease_id: new_lease.clone(),
         worker_id: new_worker.clone(),
-        work_class: reassigned.work_class.clone(),
+        work_class: reassigned.work_class,
         route: reassigned.route.clone(),
         routing_receipt_digest: lane.routing_receipt_digest.clone(),
         budget: reassigned.budget.clone(),
@@ -4062,8 +4061,9 @@ fn coordinator_case_12_effect_payload_digest_is_canonical() -> TestResult {
 }
 
 // I14.1 work classes (issue #1698): the nine canonical values plan, admit,
-// and echo through the receipt and scheduled record; anything else rejects
-// before launch with a typed error and consumes no capacity.
+// and echo through the receipt and scheduled record; anything else is
+// unrepresentable in the `WorkClass` boundary type and rejects at decode
+// ingress through `WorkClass::parse_wire` with the typed error.
 
 fn classified_request(tag: &str, class: &str) -> TestResult<StaffingPlanRequest> {
     let mut req = request(
@@ -4078,39 +4078,67 @@ fn classified_request(tag: &str, class: &str) -> TestResult<StaffingPlanRequest>
         }],
         None,
     )?;
-    req.work_class = class.to_owned();
+    let parsed: WorkClass = class
+        .parse()
+        .map_err(|error: CoordinatorError| format!("fixture class must be valid: {error}"))?;
+    req.work_class = parsed;
     for lane in &mut req.lanes {
-        lane.work_class = class.to_owned();
+        lane.work_class = parsed;
     }
     Ok(req)
 }
 
 #[test]
 fn work_class_all_nine_values_admit_and_echo() -> TestResult {
-    let classes = [
-        "control",
-        "interactive",
-        "verification",
-        "canonical_write",
-        "normal_background",
-        "model_jobs",
-        "swarm",
-        "reporting",
-        "maintenance",
-    ];
+    let classes = WorkClass::ALL_WIRE_SPELLINGS;
     for (index, class) in classes.iter().enumerate() {
         let tag = format!("wc9-{index}");
         let proof = format!("proof-admission-{tag}");
         let mut coord = coordinator(config(4, 4), &[proof.as_str()])?;
+        let expected: WorkClass = class
+            .parse()
+            .map_err(|error: CoordinatorError| format!("canonical class must parse: {error}"))?;
         let candidate = coord.plan(classified_request(&tag, class)?)?;
-        assert_eq!(candidate.work_class, *class);
+        assert_eq!(candidate.work_class, expected);
+        assert_eq!(candidate.work_class.as_wire_str(), *class);
         assert_eq!(candidate.lanes.len(), 1);
-        assert_eq!(candidate.lanes[0].work_class, *class);
+        assert_eq!(candidate.lanes[0].work_class, expected);
         let receipt = coord.admit(provider_receipt(&candidate, &tag)?)?;
         assert_eq!(receipt.admitted_lanes.len(), 1);
-        assert_eq!(receipt.admitted_lanes[0].work_class, *class);
+        assert_eq!(receipt.admitted_lanes[0].work_class, expected);
         let next = coord.next_ready().ok_or("admitted work must be ready")?;
-        assert_eq!(next.work_class, *class);
+        assert_eq!(next.work_class, expected);
+    }
+    Ok(())
+}
+
+#[test]
+fn work_class_wire_spellings_stay_nine_lowercase() -> TestResult {
+    // Locks the serialized wire: exactly the nine I14.1 lowercase strings,
+    // in scheduler order, with no silent default or alternate spelling.
+    assert_eq!(
+        WorkClass::ALL_WIRE_SPELLINGS,
+        [
+            "control",
+            "interactive",
+            "verification",
+            "canonical_write",
+            "normal_background",
+            "model_jobs",
+            "swarm",
+            "reporting",
+            "maintenance",
+        ]
+    );
+    for spelling in WorkClass::ALL_WIRE_SPELLINGS {
+        let parsed: WorkClass = spelling
+            .parse()
+            .map_err(|error: CoordinatorError| format!("wire spelling must parse: {error}"))?;
+        assert_eq!(parsed.as_wire_str(), spelling);
+        let json = serde_json::to_string(&parsed)?;
+        assert_eq!(json, format!("\"{spelling}\""));
+        let roundtrip: WorkClass = serde_json::from_str(&json)?;
+        assert_eq!(roundtrip, parsed);
     }
     Ok(())
 }
@@ -4131,25 +4159,40 @@ fn work_class_unknown_blank_and_mixed_reject_before_capacity() -> TestResult {
         Box::new(verifier(&[], 0)),
     )?;
     tight.plan(classified_request("wcfill", "swarm")?)?;
-    // Unknown rejects with the typed variant even at capacity: no silent
-    // downgrade to a less restrictive class, no capacity consumed.
-    let unknown = classified_request("wcx", "proton")?;
+    // Unknown and blank reject at the validated constructor with the typed
+    // variant before any coordinator insertion: no silent downgrade to a
+    // less restrictive class, no capacity consumed. The `String` exists
+    // solely at this decode ingress; no `StaffingPlanRequest` with an
+    // invalid class can be constructed to reach `plan`.
     assert_eq!(
-        tight.plan(unknown.clone()).err(),
+        WorkClass::parse_wire("proton").err(),
         Some(CoordinatorError::UnknownWorkClass("proton".to_owned()))
     );
-    let mut blank = classified_request("wcb", "swarm")?;
-    blank.work_class = String::new();
-    for lane in &mut blank.lanes {
-        lane.work_class = String::new();
-    }
     assert_eq!(
-        tight.plan(blank).err(),
+        WorkClass::parse_wire("").err(),
         Some(CoordinatorError::UnknownWorkClass(String::new()))
     );
+    // Serde ingress rejects the same way: the wire `String` converts
+    // immediately, so invalid JSON never becomes a request.
+    let mut valid_json = serde_json::to_value(classified_request("wcx", "swarm")?)?;
+    valid_json["work_class"] = serde_json::json!("proton");
+    let decoded: Result<StaffingPlanRequest, _> = serde_json::from_value(valid_json);
+    let message = decoded.err().map(|error| error.to_string()).unwrap_or_default();
+    assert!(
+        message.contains("unknown work class: proton"),
+        "decode must reject unknown class, got {message:?}"
+    );
+    // The failed ingress consumed no capacity: the tight coordinator still
+    // holds exactly its one filled plan and a second valid plan still hits
+    // the capacity fence (not a class error).
+    let overfill = classified_request("wcover", "swarm")?;
+    assert!(matches!(
+        tight.plan(overfill).err(),
+        Some(CoordinatorError::Backpressure { .. })
+    ));
     // Mixed plan/lane classes reject as an identity conflict.
     let mut mixed = classified_request("wcm", "swarm")?;
-    mixed.lanes[0].work_class = "interactive".to_owned();
+    mixed.lanes[0].work_class = "interactive".parse()?;
     assert_eq!(
         coord.plan(mixed).err(),
         Some(CoordinatorError::IdentityConflict("work_class"))
@@ -4157,7 +4200,7 @@ fn work_class_unknown_blank_and_mixed_reject_before_capacity() -> TestResult {
     // A forged receipt class that disagrees with the candidate rejects.
     let candidate = coord.plan(classified_request("wcf", "swarm")?)?;
     let mut forged = provider_receipt(&candidate, "wcf")?;
-    forged.admitted_lanes[0].work_class = "control".to_owned();
+    forged.admitted_lanes[0].work_class = WorkClass::Control;
     assert_eq!(
         coord
             .admit(forged)
@@ -4165,6 +4208,10 @@ fn work_class_unknown_blank_and_mixed_reject_before_capacity() -> TestResult {
             .map(|error| matches!(error, CoordinatorError::IdentityConflict("admitted_lane"))),
         Some(true)
     );
+    // No silent default: a missing `work_class` field fails decode.
+    let mut missing_json = serde_json::to_value(classified_request("wcmiss", "swarm")?)?;
+    missing_json.as_object_mut().ok_or("request must be an object")?.remove("work_class");
+    assert!(serde_json::from_value::<StaffingPlanRequest>(missing_json).is_err());
     Ok(())
 }
 
@@ -4183,7 +4230,7 @@ fn work_class_control_sorts_before_higher_priority_normal() -> TestResult {
     coord.admit(provider_receipt(&hi_candidate, "wchi")?)?;
     coord.admit(provider_receipt(&lo_candidate, "wclo")?)?;
     let next = coord.next_ready().ok_or("admitted work must be ready")?;
-    assert_eq!(next.work_class, WORK_CLASS_CONTROL);
+    assert_eq!(next.work_class, WorkClass::Control);
     Ok(())
 }
 
@@ -4191,19 +4238,8 @@ fn work_class_control_sorts_before_higher_priority_normal() -> TestResult {
 fn work_class_taxonomy_matches_kernel_control_reserve() -> TestResult {
     use eliot_kernel_core::{ControlOperationClass, NormalWorkClass};
     // Every normal Kernel variant maps to exactly one I14.1 wire spelling
-    // (no wildcard: a Kernel-side addition fails compilation here).
-    fn wire(value: NormalWorkClass) -> &'static str {
-        match value {
-            NormalWorkClass::Interactive => "interactive",
-            NormalWorkClass::Verification => "verification",
-            NormalWorkClass::CanonicalWrite => "canonical_write",
-            NormalWorkClass::NormalBackground => "normal_background",
-            NormalWorkClass::ModelJob => "model_jobs",
-            NormalWorkClass::Swarm => "swarm",
-            NormalWorkClass::Reporting => "reporting",
-            NormalWorkClass::Maintenance => "maintenance",
-        }
-    }
+    // via the single `WorkClass` boundary (no wildcard: a Kernel-side
+    // addition fails compilation in `as_wire_str` and here).
     let normals = [
         NormalWorkClass::Interactive,
         NormalWorkClass::Verification,
@@ -4215,12 +4251,19 @@ fn work_class_taxonomy_matches_kernel_control_reserve() -> TestResult {
         NormalWorkClass::Maintenance,
     ];
     for variant in normals {
-        assert_eq!(normal_work_class_from_wire(wire(variant)), Some(variant));
-        assert!(validate_work_class(wire(variant)).is_ok());
+        let boundary = WorkClass::Normal(variant);
+        let wire = boundary.as_wire_str();
+        assert_eq!(WorkClass::parse_wire(wire), Ok(boundary));
+        // Serde round-trips the same spelling: the wire `String` exists
+        // solely at decode ingress.
+        let json = serde_json::to_string(&boundary)?;
+        assert_eq!(json, format!("\"{wire}\""));
+        assert_eq!(serde_json::from_str::<WorkClass>(&json)?, boundary);
     }
     // The protected family (no wildcard: additions fail compilation) carries
     // no ordinary lane work; only the single `control` partition label is
-    // wire-admissible, and raw protected spellings reject.
+    // wire-admissible, and raw protected spellings reject through the same
+    // validated constructor.
     let protected = [
         ControlOperationClass::CancelOperation,
         ControlOperationClass::FenceStaleOwner,
@@ -4255,9 +4298,10 @@ fn work_class_taxonomy_matches_kernel_control_reserve() -> TestResult {
             | ControlOperationClass::UnknownOutcomeReconciliation => {}
         }
     }
-    assert!(validate_work_class(WORK_CLASS_CONTROL).is_ok());
-    assert_eq!(work_class_rank(WORK_CLASS_CONTROL), 0);
-    assert!(validate_work_class("CANCEL_OPERATION").is_err());
-    assert!(validate_work_class("MODEL_JOB").is_err());
+    assert_eq!(WorkClass::parse_wire("control"), Ok(WorkClass::Control));
+    assert_eq!(WorkClass::Control.as_wire_str(), "control");
+    assert_eq!(WorkClass::Control.rank(), 0);
+    assert!(WorkClass::parse_wire("CANCEL_OPERATION").is_err());
+    assert!(WorkClass::parse_wire("MODEL_JOB").is_err());
     Ok(())
 }

@@ -207,11 +207,12 @@ pub struct RouteCandidateEvidence {
 pub struct StaffingLaneRequest {
     pub work_unit_id: WorkUnitId,
     pub role_id: RoleProfileId,
-    /// I14.1 work class (issue #1698) carried verbatim as its canonical
-    /// `snake_case` spelling. Validated closed at plan time against the Kernel
-    /// taxonomy ([`NormalWorkClass`] plus the protected `control` partition);
-    /// absent or unknown is rejected, never defaulted.
-    pub work_class: String,
+    /// I14.1 work class (issue #1698) as the closed boundary type. The wire
+    /// carries exactly the nine lowercase spellings; `Deserialize` converts
+    /// through [`WorkClass::parse_wire`] so an unknown value rejects at
+    /// decode ingress and every in-memory value is validated by
+    /// construction. Absent or unknown is rejected, never defaulted.
+    pub work_class: WorkClass,
     pub route_candidates: Vec<RouteCandidateEvidence>,
     pub budget: BudgetEnvelope,
     pub priority: u16,
@@ -228,10 +229,11 @@ pub struct StaffingPlanRequest {
     pub plan_revision: RevisionId,
     pub state_fence: StateFence,
     pub privacy_class: PrivacyClass,
-    /// I14.1 work class for the whole plan (issue #1698). Every lane must
-    /// carry this same class; a mixed-class plan is rejected so one
-    /// definition, reservation and admission bind exactly one class.
-    pub work_class: String,
+    /// I14.1 work class for the whole plan (issue #1698) as the closed
+    /// boundary type. Every lane must carry this same class; a mixed-class
+    /// plan is rejected so one definition, reservation and admission bind
+    /// exactly one class.
+    pub work_class: WorkClass,
     pub lanes: Vec<StaffingLaneRequest>,
 }
 
@@ -241,9 +243,10 @@ pub struct StaffingLaneCandidate {
     pub work_unit_id: WorkUnitId,
     pub role_id: RoleProfileId,
     pub role_revision: RevisionId,
-    /// I14.1 work class threaded from the requesting lane (issue #1698):
-    /// deterministic recipe/route/admission policy input, echoed verbatim.
-    pub work_class: String,
+    /// I14.1 work class threaded from the requesting lane (issue #1698) as
+    /// the closed boundary type: deterministic recipe/route/admission policy
+    /// input, echoed exactly.
+    pub work_class: WorkClass,
     pub routing: RouteSelectionCandidate,
     pub capacity_identity: String,
     pub capacity_revision: RevisionId,
@@ -265,8 +268,9 @@ pub struct StaffingPlanCandidate {
     pub plan_revision: RevisionId,
     pub state_fence: StateFence,
     pub privacy_class: PrivacyClass,
-    /// I14.1 work class threaded from the requesting plan (issue #1698).
-    pub work_class: String,
+    /// I14.1 work class threaded from the requesting plan (issue #1698) as
+    /// the closed boundary type.
+    pub work_class: WorkClass,
     pub lanes: Vec<StaffingLaneCandidate>,
 }
 
@@ -280,9 +284,10 @@ pub struct AdmittedLaneReceipt {
     pub lease_id: WorkLeaseId,
     pub worker_id: WorkerId,
     /// I14.1 work class echoed from the admitted candidate lane (issue
-    /// #1698). Checked for exact equality at admission; a mismatch or an
-    /// unknown value rejects, never downgrades.
-    pub work_class: String,
+    /// #1698) as the closed boundary type. Checked for exact equality at
+    /// admission; a mismatch rejects, never downgrades. Unknown values are
+    /// unrepresentable: `Deserialize` rejects them at decode ingress.
+    pub work_class: WorkClass,
     pub route: RouteFingerprint,
     /// Recomputed candidate identity: `candidate_digest_for` of the admitted
     /// `RouteSelectionCandidate` bytes (canonical JSON + SHA-256 hex, typed).
@@ -384,9 +389,10 @@ pub struct AttemptRecord {
     pub attempt_id: AttemptId,
     pub lease_id: WorkLeaseId,
     pub worker_id: WorkerId,
-    /// I14.1 work class carried from the admitted lane (issue #1698). The
-    /// scheduler routes/selects on this class before priority.
-    pub work_class: String,
+    /// I14.1 work class carried from the admitted lane (issue #1698) as the
+    /// closed boundary type. The scheduler routes/selects on this class
+    /// before priority; only validated values can be stored here.
+    pub work_class: WorkClass,
     pub route: RouteFingerprint,
     pub capacity_identity: String,
     pub capacity_revision: RevisionId,
@@ -791,65 +797,133 @@ pub(crate) fn validate_text(value: &str, field: &'static str) -> Result<(), Coor
     Ok(())
 }
 
-/// I14.1 protected-partition work class (issue #1698). This is the single
-/// non-normal value: it draws only from protected control capacity owned by
-/// the Kernel (`eliot_kernel_core::ControlOperationClass` family) and can
-/// never be served from the normal partition.
-pub(crate) const WORK_CLASS_CONTROL: &str = "control";
+/// I14.1 closed work-class boundary type (issue #1698). This is the SOLE
+/// in-memory representation of the class: exactly the protected `control`
+/// partition plus the eight Kernel normal-work classes. The wire carries
+/// solely the nine lowercase I14.1 spellings; `Deserialize` converts
+/// immediately through [`WorkClass::parse_wire`], so an unknown, blank, or
+/// absent-shaped value rejects at decode ingress and `next_ready` plus every
+/// queue/projection read can only ever observe validated values (anything
+/// else is unrepresentable). There is no second enum, alias, or string
+/// bridge for this vocabulary.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub enum WorkClass {
+    /// Protected control partition: draws only from protected control
+    /// capacity owned by the Kernel (`ControlOperationClass` family), never
+    /// from the normal partition.
+    Control,
+    /// Ordinary workload class owned by the Kernel taxonomy.
+    Normal(NormalWorkClass),
+}
 
-/// Maps one I14.1 wire spelling to its Kernel normal-work owner (issue
-/// #1698). Every [`NormalWorkClass`] variant is named explicitly so the
-/// mapping is reviewable against the Kernel source; anything else (including
-/// the protected `control` class and unknown values) is `None`, and only
-/// `control` is additionally accepted by [`validate_work_class`]. A
-/// Kernel-side taxonomy change is pinned by the exhaustive coupling test,
-/// never by a silent parallel vocabulary here.
-pub(crate) fn normal_work_class_from_wire(value: &str) -> Option<NormalWorkClass> {
-    match value {
-        "interactive" => Some(NormalWorkClass::Interactive),
-        "verification" => Some(NormalWorkClass::Verification),
-        "canonical_write" => Some(NormalWorkClass::CanonicalWrite),
-        "normal_background" => Some(NormalWorkClass::NormalBackground),
-        // I14.1 spells the model class `model_jobs`; the frozen
-        // control-reserve vocabulary spells it `MODEL_JOB`.
-        "model_jobs" => Some(NormalWorkClass::ModelJob),
-        "swarm" => Some(NormalWorkClass::Swarm),
-        "reporting" => Some(NormalWorkClass::Reporting),
-        "maintenance" => Some(NormalWorkClass::Maintenance),
-        _ => None,
+impl WorkClass {
+    /// The nine canonical I14.1 wire spellings in scheduler order (control
+    /// first, then normal classes in I14.1 document order).
+    pub const ALL_WIRE_SPELLINGS: [&'static str; 9] = [
+        "control",
+        "interactive",
+        "verification",
+        "canonical_write",
+        "normal_background",
+        "model_jobs",
+        "swarm",
+        "reporting",
+        "maintenance",
+    ];
+
+    /// Returns the exact lowercase I14.1 wire spelling for this class.
+    /// Every [`NormalWorkClass`] variant is named explicitly so the mapping
+    /// is reviewable against the Kernel source; a Kernel-side addition fails
+    /// compilation here, never silently.
+    #[must_use]
+    pub const fn as_wire_str(self) -> &'static str {
+        match self {
+            Self::Control => "control",
+            Self::Normal(NormalWorkClass::Interactive) => "interactive",
+            Self::Normal(NormalWorkClass::Verification) => "verification",
+            Self::Normal(NormalWorkClass::CanonicalWrite) => "canonical_write",
+            Self::Normal(NormalWorkClass::NormalBackground) => "normal_background",
+            // I14.1 spells the model class `model_jobs`; the frozen
+            // control-reserve vocabulary spells it `MODEL_JOB`.
+            Self::Normal(NormalWorkClass::ModelJob) => "model_jobs",
+            Self::Normal(NormalWorkClass::Swarm) => "swarm",
+            Self::Normal(NormalWorkClass::Reporting) => "reporting",
+            Self::Normal(NormalWorkClass::Maintenance) => "maintenance",
+        }
+    }
+
+    /// Converts one wire spelling to the boundary type (issue #1698): exactly
+    /// the nine canonical spellings. Blank or unknown values reject with the
+    /// typed [`CoordinatorError::UnknownWorkClass`]; the caller never
+    /// substitutes a less restrictive class. This is the SOLE validated
+    /// constructor from the wire `String`.
+    pub fn parse_wire(value: &str) -> Result<Self, CoordinatorError> {
+        match value {
+            "control" => Ok(Self::Control),
+            "interactive" => Ok(Self::Normal(NormalWorkClass::Interactive)),
+            "verification" => Ok(Self::Normal(NormalWorkClass::Verification)),
+            "canonical_write" => Ok(Self::Normal(NormalWorkClass::CanonicalWrite)),
+            "normal_background" => Ok(Self::Normal(NormalWorkClass::NormalBackground)),
+            "model_jobs" => Ok(Self::Normal(NormalWorkClass::ModelJob)),
+            "swarm" => Ok(Self::Normal(NormalWorkClass::Swarm)),
+            "reporting" => Ok(Self::Normal(NormalWorkClass::Reporting)),
+            "maintenance" => Ok(Self::Normal(NormalWorkClass::Maintenance)),
+            _ => Err(CoordinatorError::UnknownWorkClass(value.to_owned())),
+        }
+    }
+
+    /// Deterministic scheduler rank (issue #1698): protected `control` first
+    /// (the reserve exists so control is never crowded out by normal work),
+    /// then the eight normal classes in I14.1 document order. There is no
+    /// invalid arm: invalid values are unrepresentable in this type.
+    pub(crate) const fn rank(self) -> u8 {
+        match self {
+            Self::Control => 0,
+            Self::Normal(NormalWorkClass::Interactive) => 1,
+            Self::Normal(NormalWorkClass::Verification) => 2,
+            Self::Normal(NormalWorkClass::CanonicalWrite) => 3,
+            Self::Normal(NormalWorkClass::NormalBackground) => 4,
+            Self::Normal(NormalWorkClass::ModelJob) => 5,
+            Self::Normal(NormalWorkClass::Swarm) => 6,
+            Self::Normal(NormalWorkClass::Reporting) => 7,
+            Self::Normal(NormalWorkClass::Maintenance) => 8,
+        }
     }
 }
 
-/// Validates one closed I14.1 work-class value (issue #1698): exactly the
-/// nine canonical spellings. Blank, absent-shaped, or unknown values are
-/// rejected with [`CoordinatorError::UnknownWorkClass`]; the caller never
-/// substitutes a less restrictive class.
-pub(crate) fn validate_work_class(value: &str) -> Result<(), CoordinatorError> {
-    if value == WORK_CLASS_CONTROL || normal_work_class_from_wire(value).is_some() {
-        Ok(())
-    } else {
-        Err(CoordinatorError::UnknownWorkClass(value.to_owned()))
+impl std::str::FromStr for WorkClass {
+    type Err = CoordinatorError;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        Self::parse_wire(value)
     }
 }
 
-/// Deterministic scheduler rank for one validated work class (issue #1698):
-/// protected `control` first (the reserve exists so control is never crowded
-/// out by normal work), then the eight normal classes in I14.1 document
-/// order. Unvalidated values sort last; admission never produces them, so
-/// this arm is defensive ordering, not a silent default.
-pub(crate) fn work_class_rank(value: &str) -> u8 {
-    if value == WORK_CLASS_CONTROL {
-        return 0;
+impl TryFrom<String> for WorkClass {
+    type Error = CoordinatorError;
+
+    fn try_from(value: String) -> Result<Self, Self::Error> {
+        Self::parse_wire(&value)
     }
-    match normal_work_class_from_wire(value) {
-        Some(NormalWorkClass::Interactive) => 1,
-        Some(NormalWorkClass::Verification) => 2,
-        Some(NormalWorkClass::CanonicalWrite) => 3,
-        Some(NormalWorkClass::NormalBackground) => 4,
-        Some(NormalWorkClass::ModelJob) => 5,
-        Some(NormalWorkClass::Swarm) => 6,
-        Some(NormalWorkClass::Reporting) => 7,
-        Some(NormalWorkClass::Maintenance) => 8,
-        None => u8::MAX,
+}
+
+impl TryFrom<&str> for WorkClass {
+    type Error = CoordinatorError;
+
+    fn try_from(value: &str) -> Result<Self, Self::Error> {
+        Self::parse_wire(value)
+    }
+}
+
+impl Serialize for WorkClass {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_str(self.as_wire_str())
+    }
+}
+
+impl<'de> Deserialize<'de> for WorkClass {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let value = String::deserialize(deserializer)?;
+        Self::parse_wire(&value).map_err(serde::de::Error::custom)
     }
 }

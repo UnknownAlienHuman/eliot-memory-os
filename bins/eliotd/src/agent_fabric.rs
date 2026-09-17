@@ -27,7 +27,7 @@ use eliot_agent_api::{AttemptId, RouteFingerprint};
 use eliot_agent_contracts::RevisionId;
 use eliot_agent_coordinator::{
     AdmissionId, AgentCoordinator, CandidateId, CoordinatorConfig, CoordinatorError,
-    CoordinatorSnapshot, PlanGap, StaffingPlanCandidate, StaffingPlanRequest,
+    CoordinatorSnapshot, PlanGap, StaffingPlanCandidate, StaffingPlanRequest, WorkClass,
 };
 use eliot_contracts::{EpochId, StateFence, fences_match_exact};
 use serde::{Deserialize, Serialize};
@@ -129,10 +129,13 @@ pub struct SwarmDefinition {
     pub definition_id: CandidateId,
     /// Digest of the exact frozen request bytes.
     pub definition_digest: String,
-    /// I14.1 work class carried verbatim from the admitted request (issue
-    /// #1698). Bound into every reservation, admission and dispatch built
-    /// from this definition; never defaulted.
-    pub work_class: String,
+    /// I14.1 work class carried as the closed boundary type from the
+    /// admitted request (issue #1698). The single `WorkClass` enum is owned
+    /// by the coordinator crate and reused here; there is no second enum.
+    /// Bound into every reservation, admission and dispatch built from this
+    /// definition; never defaulted. The wire spelling stays the nine
+    /// lowercase I14.1 strings via `WorkClass` serde.
+    pub work_class: WorkClass,
     /// Task identity preserved verbatim.
     pub task_id: String,
     /// Task revision preserved verbatim.
@@ -153,9 +156,10 @@ pub struct Reservation {
     pub definition_id: CandidateId,
     /// Digest of the staged definition; must equal the frozen digest.
     pub definition_digest: String,
-    /// I14.1 work class echoed from the staged definition (issue #1698);
-    /// the fabric rejects a reservation that does not bind the exact class.
-    pub work_class: String,
+    /// I14.1 work class echoed from the staged definition (issue #1698) as
+    /// the closed boundary type; the fabric rejects a reservation that does
+    /// not bind the exact class.
+    pub work_class: WorkClass,
     /// Fence at staging time.
     pub fence: StateFence,
 }
@@ -170,9 +174,10 @@ pub struct FabricAdmission {
     pub definition_id: CandidateId,
     /// Exact frozen definition digest bound by this admission.
     pub definition_digest: String,
-    /// I14.1 work class bound by this admission (issue #1698); echoes the
-    /// staged reservation and frozen definition exactly.
-    pub work_class: String,
+    /// I14.1 work class bound by this admission (issue #1698) as the closed
+    /// boundary type; echoes the staged reservation and frozen definition
+    /// exactly.
+    pub work_class: WorkClass,
     /// Reservation identity this admission commits.
     pub reservation_id: String,
     /// Fence at admission time.
@@ -213,9 +218,10 @@ pub struct DispatchIntent {
     pub admission_id: AdmissionId,
     /// Registered attempt identity.
     pub attempt_id: AttemptId,
-    /// I14.1 work class carried verbatim from the admission (issue #1698),
-    /// so the dispatch record identifies the same class.
-    pub work_class: String,
+    /// I14.1 work class carried as the closed boundary type from the
+    /// admission (issue #1698), so the dispatch record identifies the same
+    /// class.
+    pub work_class: WorkClass,
     /// Activated launch evidence digest.
     pub activation_digest: String,
     /// Fence carried verbatim from activation.
@@ -712,7 +718,7 @@ impl AgentFabric {
         let definition = SwarmDefinition {
             definition_id: request.candidate_id.clone(),
             definition_digest: digest.clone(),
-            work_class: request.work_class.clone(),
+            work_class: request.work_class,
             task_id: request.launch.task_id.as_str().to_owned(),
             task_revision: request.task_revision.clone(),
             plan_revision: request.plan_revision.as_str().to_owned(),
@@ -1064,7 +1070,7 @@ impl AgentFabric {
             dispatch_id: dispatch_id.to_owned(),
             admission_id: admission_id.clone(),
             attempt_id: attempt_id.clone(),
-            work_class: admission.work_class.clone(),
+            work_class: admission.work_class,
             activation_digest: evidence.activation_digest.clone(),
             fence: evidence.fence.clone(),
             epoch: evidence.epoch.clone(),
