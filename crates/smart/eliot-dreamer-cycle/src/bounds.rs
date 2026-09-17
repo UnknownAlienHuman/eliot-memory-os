@@ -522,7 +522,7 @@ fn preflight_facets(
 }
 
 fn preflight_job(
-    job: &eliot_dreamer_contracts::DreamJobInput,
+    job: &eliot_dreamer_contracts::DreamJobAdmission,
     total: &mut usize,
 ) -> Result<(), CycleError> {
     for (value, field) in [

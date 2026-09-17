@@ -11,7 +11,7 @@ use eliot_dreamer_contracts::{
     ConceptEvidence, ConceptInput, ConceptMode, ConceptNeighborhood, ConceptParameter,
     ConceptProposal, ConceptRollback, ConceptSnapshot, ConceptSourceDenominator, ConceptSourceRef,
     ConceptSourceSet, ConceptVerifierRef, CurationFamily, CurationKind, CurationPayload,
-    DreamInputBundle, DreamJobInput, GroundedDreamDraft, JobClass, NamedEvidence,
+    DreamInputBundle, DreamJobAdmission, GroundedDreamDraft, JobClass, NamedEvidence,
     RelationPreservation, RelationPreservationDimension, RelationPreservationVerdict, Requester,
     RequesterOrigin, ScreenBinding, ScreenState, SupportState, TargetDenominator,
     TypedCurationHandlerRequest, TypedCurationHandlerResult, ValidatedCurationItem,
@@ -53,8 +53,8 @@ fn preservation(passing: bool) -> RelationPreservation {
     }
 }
 
-fn job() -> DreamJobInput {
-    DreamJobInput {
+fn job() -> DreamJobAdmission {
+    DreamJobAdmission {
         schema_version: 1,
         job_class: JobClass::Curation,
         requester: Requester {
@@ -206,7 +206,7 @@ fn proposal(mode: ConceptMode, passing: bool) -> ConceptProposal {
 
 struct Fixture {
     input: ConceptInput,
-    job: DreamJobInput,
+    job: DreamJobAdmission,
     bundle: DreamInputBundle,
     receipt: ValidationReceipt,
     grounded: GroundedDreamDraft,

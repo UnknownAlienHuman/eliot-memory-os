@@ -5,7 +5,7 @@
 //! assembly, fetching, grounding or validation behavior: those belong to the
 //! A-04/A-05 composition that consumes these contracts.
 //!
-//! Job (`crate::job::DreamJobInput`) and budget (`crate::budget`) shapes live
+//! Job (`crate::job::DreamJobAdmission`) and budget (`crate::budget`) shapes live
 //! in sibling modules and are never redefined here.
 
 #![forbid(unsafe_code)]

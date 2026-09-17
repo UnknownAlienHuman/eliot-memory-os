@@ -21,7 +21,7 @@ use eliot_dreamer_contracts::{
     ArchitectureDependencyDenominator, ArchitectureDependencyKind, ArchitectureDependencyMember,
     ArchitectureSourceSnapshot, ArchitectureSourceStatus, ArchitectureStatementModality,
     AttemptBinding, BudgetLimits, BudgetUsage, BundleCompleteness, BundleMaterial, ClaimResidue,
-    DreamInputBundle, DreamJobInput, GroundedDreamDraft, JobClass, ModelDraft,
+    DreamInputBundle, DreamJobAdmission, GroundedDreamDraft, JobClass, ModelDraft,
     NormativePairBinding, PRESERVATION_DIMENSIONS, PreservationDimension, PreservationReport,
     Requester, RequesterOrigin, SelfQueryInput, SelfQueryOutputProfile, SelfQueryPolicy,
     SelfQueryProfile, SourceDisposition, SupportState, ValidatedCandidate, ValidatedDreamDraft,
@@ -115,7 +115,7 @@ pub fn fixture() -> ImplementationBriefInput {
         .validate()
         .expect("architecture denominator");
 
-    let job = DreamJobInput {
+    let job = DreamJobAdmission {
         schema_version: 1,
         job_class: JobClass::ArchitectureSelfQuery,
         requester: Requester {

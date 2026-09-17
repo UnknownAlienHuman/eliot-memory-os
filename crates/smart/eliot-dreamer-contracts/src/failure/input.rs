@@ -10,7 +10,7 @@ use crate::curation::{CurationKind, CurationPayload};
 use crate::draft::{CurationAcceptanceCtx, GroundedDreamDraft, ValidatedCurationItem};
 use crate::encoding::{canonical_bytes, digest_hex};
 use crate::error::{ContractViolation, check_fence, check_text, check_vec_bound};
-use crate::job::{DreamJobInput, JobClass};
+use crate::job::{DreamJobAdmission, JobClass};
 use crate::registry::{CurationFamily, TypedCurationHandlerRequest};
 use crate::screen::{ScreenBinding, ScreenState};
 
@@ -49,7 +49,7 @@ impl Write for BoundedWriter {
 pub struct FailureInput {
     pub schema_version: u32,
     pub operation: FailureOperation,
-    pub job: DreamJobInput,
+    pub job: DreamJobAdmission,
     pub bundle: DreamInputBundle,
     pub grounded: GroundedDreamDraft,
     pub usage: BudgetUsage,

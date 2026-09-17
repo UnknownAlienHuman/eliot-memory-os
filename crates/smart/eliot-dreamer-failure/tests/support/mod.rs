@@ -24,8 +24,8 @@ use eliot_receipts::{
 };
 use std::num::NonZeroU64;
 
-fn sample_job() -> DreamJobInput {
-    DreamJobInput {
+fn sample_job() -> DreamJobAdmission {
+    DreamJobAdmission {
         schema_version: 1,
         job_class: JobClass::Curation,
         requester: Requester {

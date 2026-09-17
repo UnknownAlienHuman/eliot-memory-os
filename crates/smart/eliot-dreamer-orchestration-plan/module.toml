@@ -21,7 +21,7 @@ discriminator = "The handler emits a bounded plan candidate with explicit altern
 primary_responsibility = "Translate one Human or Main-Agent objective into bounded work units, competence and route classes, context budgets, independence, synthesis and verifier paths."
 owned_mutable_state = []
 allowed_effects = []
-inputs = ["DreamJobInput class=OrchestrationPlanning", "objective and acceptance", "capability, route and budget evidence"]
+inputs = ["DreamJobAdmission class=OrchestrationPlanning", "objective and acceptance", "capability, route and budget evidence"]
 outputs = ["CognitiveWorkPlanCandidate", "work-unit packets", "route and independence alternatives"]
 depends_on = ["eliot-dreamer-contracts"]
 providers = ["Governor-admitted Dreamer bundle", "capability and route projections"]

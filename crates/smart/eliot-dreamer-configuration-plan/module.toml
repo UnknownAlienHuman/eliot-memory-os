@@ -21,7 +21,7 @@ discriminator = "The handler emits one typed delta candidate with current and ca
 primary_responsibility = "Translate a Human request or diagnosed problem into one typed ConfigurationChangeIntent candidate."
 owned_mutable_state = []
 allowed_effects = []
-inputs = ["DreamJobInput class=ConfigurationAssistance", "current configuration snapshots", "natural-language request or diagnosed Problem evidence"]
+inputs = ["DreamJobAdmission class=ConfigurationAssistance", "current configuration snapshots", "natural-language request or diagnosed Problem evidence"]
 outputs = ["ConfigurationChangeIntent candidate", "impact and owner matrix", "probe and rollback plan"]
 depends_on = ["eliot-dreamer-contracts"]
 providers = ["Governor-admitted Dreamer bundle", "current configuration projections"]

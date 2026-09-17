@@ -21,7 +21,7 @@ discriminator = "The handler must preserve rival root causes, expose common-mode
 primary_responsibility = "Diagnose one bounded development or product gap using repair history, discriminators, product identity and a validated ConflictAnalysisCandidate when available."
 owned_mutable_state = []
 allowed_effects = []
-inputs = ["DreamJobInput class=DevelopmentDiagnosis", "Product Objective and gap", "repair, discriminator and runtime evidence", "optional ConflictAnalysisCandidate"]
+inputs = ["DreamJobAdmission class=DevelopmentDiagnosis", "Product Objective and gap", "repair, discriminator and runtime evidence", "optional ConflictAnalysisCandidate"]
 outputs = ["DevelopmentDiagnosisCandidate", "minimum discriminating experiment", "owner, repair-scope and guardrail recommendation"]
 depends_on = ["eliot-dreamer-contracts"]
 providers = ["Governor-admitted Dreamer bundle", "conflict-analysis sub-handler"]

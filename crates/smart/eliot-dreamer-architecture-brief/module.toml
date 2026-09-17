@@ -21,7 +21,7 @@ discriminator = "The brief is independently reconstructible from exact accepted 
 primary_responsibility = "Produce an ArchitectureBrief candidate preserving applicable ARCH anchors, intent, rationale, Hard Boundaries, unresolved questions and exact source identity."
 owned_mutable_state = []
 allowed_effects = []
-inputs = ["DreamJobInput class=ArchitectureSelfQuery", "ValidatedDreamDraft", "accepted Architecture handles and pair identity"]
+inputs = ["DreamJobAdmission class=ArchitectureSelfQuery", "ValidatedDreamDraft", "accepted Architecture handles and pair identity"]
 outputs = ["ArchitectureBriefProjection", "ArchitectureBriefCandidate", "normative coverage manifest", "invalidation conditions"]
 depends_on = ["eliot-dreamer-contracts"]
 providers = ["Governor-admitted accepted Architecture source handles"]

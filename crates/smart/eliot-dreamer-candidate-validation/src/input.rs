@@ -13,13 +13,13 @@ use crate::receipt::{
 use crate::validate::validate_preservation;
 use eliot_dreamer_contracts::validation::{DreamDraftValidationError, ValidationPolicy};
 use eliot_dreamer_contracts::{
-    BudgetUsage, BundleCompleteness, ContractViolation, DreamInputBundle, DreamJobInput,
+    BudgetUsage, BundleCompleteness, ContractViolation, DreamInputBundle, DreamJobAdmission,
     GroundedDreamDraft, ModelDraft, PreservationReport, SourceDisposition, SupportState,
 };
 
 #[derive(Clone, Copy)]
 struct ValidationInputs<'a> {
-    job: &'a DreamJobInput,
+    job: &'a DreamJobAdmission,
     bundle: &'a DreamInputBundle,
     model: &'a ModelDraft,
     grounded: &'a GroundedDreamDraft,
@@ -46,7 +46,7 @@ fn invalid_contract(
 /// A-03 value; malformed contract shapes return a typed validation error.
 #[allow(clippy::too_many_arguments)]
 pub fn validate_grounded_dream_draft_at(
-    job: &DreamJobInput,
+    job: &DreamJobAdmission,
     bundle: &DreamInputBundle,
     model: &ModelDraft,
     grounded: &GroundedDreamDraft,

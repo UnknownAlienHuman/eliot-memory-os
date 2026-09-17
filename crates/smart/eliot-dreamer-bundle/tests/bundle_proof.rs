@@ -34,7 +34,7 @@ use eliot_dreamer_contracts::grounding::canonical::{
 use eliot_dreamer_contracts::grounding::{AllowedReferenceManifest, AuthorizedReference};
 use eliot_dreamer_contracts::{
     AssemblyReserve, AssemblyReserveSet, BudgetLimits, ContractViolation, DisclosureAuthorization,
-    DreamJobInput, JobClass, Requester, RequesterOrigin,
+    DreamJobAdmission, JobClass, Requester, RequesterOrigin,
 };
 
 const ROUTE_ID: &str = "route-1";
@@ -196,8 +196,8 @@ fn curation_roles() -> Vec<RecipeRole> {
     .collect()
 }
 
-fn job_with_manifest(manifest_digest: String) -> DreamJobInput {
-    DreamJobInput {
+fn job_with_manifest(manifest_digest: String) -> DreamJobAdmission {
+    DreamJobAdmission {
         schema_version: 1,
         job_class: JobClass::Orientation,
         requester: Requester {
@@ -238,7 +238,7 @@ fn recipe_inputs() -> Vec<RecipeInput> {
     ]
 }
 
-fn recipe_for(job: DreamJobInput) -> DreamJobRecipe {
+fn recipe_for(job: DreamJobAdmission) -> DreamJobRecipe {
     use DreamInputRole::*;
     let mut roles = vec![
         source_free_role(ExactQuestion),

@@ -111,7 +111,7 @@ pub use failure::{
     FailureRollback, FailureSourceMember, failure_input_digest, failure_proposal_digest,
     failure_result_digest, seal_failure, validate_failure,
 };
-pub use job::{DreamJobInput, JobClass, Requester, RequesterOrigin, parse_job_class};
+pub use job::{DreamJobAdmission, JobClass, Requester, RequesterOrigin, parse_job_class};
 pub use model_route::{
     CostUsageReceipt, MAX_ALLOWED_ROUTES, MAX_NOTE_CHARS, MAX_ROUTE_CHARS,
     MODEL_ROUTE_SCHEMA_VERSION, ModelRouteDisposition, ModelRouteOutcome, ModelRoutePrivacy,

@@ -103,8 +103,8 @@ fn taxonomy() -> TaxonomyDenominator {
     t.digest = t.computed_digest().expect("taxonomy digest");
     t
 }
-fn job() -> DreamJobInput {
-    DreamJobInput {
+fn job() -> DreamJobAdmission {
+    DreamJobAdmission {
         schema_version: 1,
         job_class: JobClass::Curation,
         requester: Requester {

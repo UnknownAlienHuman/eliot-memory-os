@@ -8,7 +8,7 @@ use eliot_dreamer_contracts::grounding::{
     GroundingPolicy, ModelDraft,
 };
 use eliot_dreamer_contracts::{
-    ContractViolation, DreamInputBundle, DreamJobInput, canonical_bytes,
+    ContractViolation, DreamInputBundle, DreamJobAdmission, canonical_bytes,
 };
 
 use crate::evidence;
@@ -51,7 +51,7 @@ impl Default for GroundingControls {
 /// Complete owned input to the pure grounding operation.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct GroundingRequest {
-    pub job: DreamJobInput,
+    pub job: DreamJobAdmission,
     pub bundle: DreamInputBundle,
     pub manifest: AllowedReferenceManifest,
     pub draft: ModelDraft,
@@ -64,7 +64,7 @@ impl GroundingRequest {
     /// signal.
     #[must_use]
     pub fn new(
-        job: DreamJobInput,
+        job: DreamJobAdmission,
         bundle: DreamInputBundle,
         manifest: AllowedReferenceManifest,
         draft: ModelDraft,
@@ -91,7 +91,7 @@ impl GroundingRequest {
 /// Grounds one complete A03 v2 context. Only explicit proposed handles are
 /// inspected; no manifest-wide search is performed.
 pub fn ground_draft(
-    job: DreamJobInput,
+    job: DreamJobAdmission,
     bundle: DreamInputBundle,
     manifest: AllowedReferenceManifest,
     draft: ModelDraft,
