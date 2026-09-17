@@ -51,7 +51,7 @@ Documented runners (repo root, ``CARGO_TARGET_DIR`` set per owner disk rule)::
     python -m unittest scripts.tests.test_wave_admission_d1 -v
 
 Deterministic, no network, no stubs. Declared denominator: 20 cases, exactly
-1..20, one method per ``# WORK_UNIT_CASE: 968/<case>`` marker.
+1..20, one method per ``WORK_UNIT_CASE: 968/<case>`` marker.
 """
 
 from __future__ import annotations
@@ -72,7 +72,7 @@ if str(ROOT) not in sys.path:
 if str(ROOT / "scripts") not in sys.path:
     sys.path.insert(0, str(ROOT / "scripts"))
 FIX = ROOT / "scripts" / "testdata" / "work-unit-gate" / "wave-d1"
-BASE_SHA = "3b831849d41294ef48cdd162e0891662b0cb9ce1"
+BASE_SHA = "02775d03f5cc8649d77f8e6c3a8e75edafd38618"
 ADMISSION_NOTE = "admitted via #968 (T8-A1) root workspace membership"
 CLARIFICATION = "eliot-dreamer-clarification"
 ARCH_BRIEF = "eliot-dreamer-architecture-brief"
