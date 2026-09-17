@@ -249,6 +249,31 @@ fn port_denied(error: &kernel_port::KernelPortError) -> DreamerError {
     DreamerError::KernelAdmissionRequired(error.to_string())
 }
 
+/// Slice-A fail-closed dispatcher over the closed [`JobClass`] taxonomy (I9.3).
+///
+/// Runs first in [`AuthenticatedKernelJobPort::submit`], before
+/// `check_claimed`/`live_view`, so a class with no owning Slice-A handler is
+/// refused with [`DreamerError::UnsupportedJobClass`] before any
+/// Kernel-facing call. The gate takes only the semantic input and returns a
+/// plain result: refusal performs zero transport and zero status calls by
+/// construction (there is no port, transport, or admission channel to call).
+///
+/// Exhaustive with no wildcard arm: extending the closed taxonomy breaks
+/// compilation here until the new class is assigned an owning slice.
+fn refuse_unsupported_job_class(job: &DreamJobInput) -> Result<(), DreamerError> {
+    match job.job_class {
+        JobClass::Curation
+        | JobClass::Clarification
+        | JobClass::ArchitectureSelfQuery
+        | JobClass::DevelopmentDiagnosis
+        | JobClass::OrchestrationPlanning
+        | JobClass::ConfigurationAssistance => {
+            Err(DreamerError::UnsupportedJobClass(job.job_class))
+        }
+        JobClass::Orientation | JobClass::ResearchSynthesis | JobClass::Maintenance => Ok(()),
+    }
+}
+
 impl KernelJobPort for AuthenticatedKernelJobPort {
     fn handshake(&mut self) -> Result<KernelHandshake, DreamerError> {
         Ok(self.handshake)
@@ -259,7 +284,7 @@ impl KernelJobPort for AuthenticatedKernelJobPort {
         admission: &KernelJobAdmission,
         job: &DreamJobInput,
     ) -> Result<JobView, DreamerError> {
-        let _ = job;
+        refuse_unsupported_job_class(job)?;
         self.check_claimed(admission)?;
         self.live_view()
     }
@@ -484,6 +509,8 @@ pub enum DreamerError {
     NotCancellable(String),
     #[error("{KERNEL_ADMISSION_REQUIRED}: {0}")]
     KernelAdmissionRequired(String),
+    #[error("unsupported Dreamer job class: {0:?}")]
+    UnsupportedJobClass(JobClass),
 }
 
 impl DreamerError {
@@ -491,7 +518,13 @@ impl DreamerError {
     pub const fn code(&self) -> &'static str {
         match self {
             Self::KernelAdmissionRequired(_) => KERNEL_ADMISSION_REQUIRED,
-            _ => "DREAMER_REQUEST_REJECTED",
+            Self::InvalidField(_)
+            | Self::LimitExceeded(_)
+            | Self::InvalidAdmission(_)
+            | Self::DuplicateJob(_)
+            | Self::UnknownJob(_)
+            | Self::NotCancellable(_)
+            | Self::UnsupportedJobClass(_) => "DREAMER_REQUEST_REJECTED",
         }
     }
 }
@@ -777,6 +810,124 @@ mod projection_tests {
             (ProtocolJobState::UnknownOutcome, JobState::Reconciling),
         ] {
             assert_eq!(project_claimed_state(observed), expected);
+        }
+    }
+}
+
+#[cfg(test)]
+mod slice_a_dispatch_tests {
+    use super::*;
+
+    /// Builds a well-formed semantic input for one class. The Slice-A gate
+    /// reads only `job_class`, so validity of the remaining fields keeps the
+    /// proof focused on dispatch rather than input validation.
+    fn job_of_class(class: JobClass) -> DreamJobInput {
+        DreamJobInput {
+            job_id: "job-slice-a".into(),
+            job_class: class,
+            exact_question: "What does ELIOT know about this scope?".into(),
+            requester: "test-harness".into(),
+            scope_id: "scope-slice-a".into(),
+            task_id: None,
+            state_fence: "fence-slice-a".into(),
+            evidence_handles: Vec::new(),
+            memory_handles: Vec::new(),
+            architecture_handles: Vec::new(),
+            implementation_handles: Vec::new(),
+            conformance_handles: Vec::new(),
+            conflicts_and_unknowns: Vec::new(),
+            privacy_profile: "local_only".into(),
+            allowed_tools: Vec::new(),
+            allowed_model_routes: vec!["route-test".into()],
+            budget_units: 1,
+            deadline_ms: 1,
+            output_schema: "eliot.dreamer.v1".into(),
+            forbidden_effects: Vec::new(),
+        }
+    }
+
+    /// Proves refusal for one class with the exact variant and payload.
+    ///
+    /// No-transport/no-status proof is structural: the gate under test takes
+    /// only `&DreamJobInput` and returns a plain result, so there is no port,
+    /// transport, or admission channel it could call; `submit` invokes it
+    /// before `check_claimed`/`live_view`, which are the only Kernel-facing
+    /// calls on that path.
+    fn assert_refused(class: JobClass) {
+        let job = job_of_class(class);
+        let refused = refuse_unsupported_job_class(&job);
+        assert!(
+            matches!(refused, Err(DreamerError::UnsupportedJobClass(refused_class)) if refused_class == class),
+            "class {class:?} must refuse with UnsupportedJobClass({class:?})"
+        );
+    }
+
+    #[test]
+    fn curation_refuses_without_kernel_contact() {
+        assert_refused(JobClass::Curation);
+    }
+
+    #[test]
+    fn clarification_refuses_without_kernel_contact() {
+        assert_refused(JobClass::Clarification);
+    }
+
+    #[test]
+    fn architecture_self_query_refuses_without_kernel_contact() {
+        assert_refused(JobClass::ArchitectureSelfQuery);
+    }
+
+    #[test]
+    fn development_diagnosis_refuses_without_kernel_contact() {
+        assert_refused(JobClass::DevelopmentDiagnosis);
+    }
+
+    #[test]
+    fn orchestration_planning_refuses_without_kernel_contact() {
+        assert_refused(JobClass::OrchestrationPlanning);
+    }
+
+    #[test]
+    fn configuration_assistance_refuses_without_kernel_contact() {
+        assert_refused(JobClass::ConfigurationAssistance);
+    }
+
+    /// The three Slice-A admitted classes fall through to the existing path:
+    /// the gate returns `Ok`, preserving the `check_claimed`/`live_view`
+    /// behavior (including its `None`-result projection) unchanged.
+    #[test]
+    fn admitted_classes_pass_the_slice_a_gate() {
+        for class in [
+            JobClass::Orientation,
+            JobClass::ResearchSynthesis,
+            JobClass::Maintenance,
+        ] {
+            let job = job_of_class(class);
+            assert!(
+                refuse_unsupported_job_class(&job).is_ok(),
+                "class {class:?} must pass the Slice-A gate"
+            );
+        }
+    }
+
+    /// The new variant renders its payload and maps to the request-rejected
+    /// code, never to the Kernel-admission code.
+    #[test]
+    fn unsupported_variant_display_and_code_hold() {
+        for class in [
+            JobClass::Curation,
+            JobClass::Clarification,
+            JobClass::ArchitectureSelfQuery,
+            JobClass::DevelopmentDiagnosis,
+            JobClass::OrchestrationPlanning,
+            JobClass::ConfigurationAssistance,
+        ] {
+            let error = DreamerError::UnsupportedJobClass(class);
+            assert_eq!(
+                format!("{error}"),
+                format!("unsupported Dreamer job class: {class:?}")
+            );
+            assert_eq!(error.code(), "DREAMER_REQUEST_REJECTED");
         }
     }
 }
