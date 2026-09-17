@@ -641,7 +641,8 @@ mod tests {
     use eliot_store_api::{
         CommitId, EffectClass, EventProjectionRelationIntents, NamedMutationOperation,
         NamedMutationRequest, OperationIdentity, OperationManifestDigest, Resubmission,
-        TransitionClass, WriteReceiptStatus, canonical_request_hash,
+        StoreFailure, StoreFailureIdentityContext, TransitionClass, WriteReceiptStatus,
+        canonical_request_hash,
     };
     use serde_json::json;
     use std::num::NonZeroU64;
