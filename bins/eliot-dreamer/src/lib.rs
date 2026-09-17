@@ -381,40 +381,57 @@ fn dispatch_admission_with(
 /// Runs the admitted stage chain for one Kernel-bound job.
 ///
 /// This is the exact chain [`AuthenticatedKernelJobPort::submit`] executes
-/// past the bundle plan: A-20 screen, T12-07 model derivation with its owner
-/// proof, A-14b grounding through the real owner, then native dispatch — A-31
-/// for Curation (which owns its separate post-handler carrier and never
-/// enters common A-05 validation), A-05 validation plus the native owner for
-/// every other admitted class. Each stage genuinely invokes its owner
-/// exactly once; any refusal fails closed with zero further stage calls.
-/// Extracted as a free function so the chain is unit-provable without a live
-/// Kernel transport (`submit` adds only the claim check before it and the
-/// live view after it).
+/// past the bundle plan. Curation owns a separate pipeline: screen (A-20),
+/// then the execution-carrier check, then A-31 — it never consumes the
+/// generic grounded draft and never enters common A-05 validation (the A-05
+/// owner itself directs Curation to its separate carrier). The carrier check
+/// runs BEFORE any model/grounding work, so a Curation job with no
+/// Governor-injected carrier refuses with the precise typed refusal instead
+/// of burning generic stages only to fail at the port boundary. Every other
+/// admitted class runs screen (pass-through), model, grounding, validation,
+/// then native dispatch, each stage genuinely invoking its owner exactly
+/// once; any refusal fails closed with zero further stage calls.
+///
+/// The carrier is `None` in production (live handler ports are
+/// Governor-injected and absent in-binary); tests inject it to prove the
+/// wired A-31 path. Extracted as a free function so the chain is
+/// unit-provable without a live Kernel transport (`submit` adds only the
+/// claim check before it and the live view after it).
 fn run_admitted_pipeline(
     admission: &KernelJobAdmission,
     job: &DreamJobInput,
+    curation_carrier: Option<dispatch_stage::CurationExecutionCarrier<'_>>,
 ) -> Result<DreamResult, DreamerError> {
     let screen = curation_screen_stage::resolve_screen_inputs(admission, job)?;
+    if job.job_class == JobClass::Curation {
+        let binding = match screen {
+            curation_screen_stage::ScreenDecision::Screened { binding, .. } => binding,
+            curation_screen_stage::ScreenDecision::PassThrough(_) => {
+                return Err(DreamerError::InvalidAdmission(
+                    "admitted curation dispatch requires Governor-resolved screen binding",
+                ));
+            }
+        };
+        // Carrier check before any generic model/grounding work: without a
+        // Governor-injected execution carrier there is nothing downstream to
+        // run, so refuse here with the precise reason.
+        let carrier = curation_carrier.ok_or(DreamerError::InvalidAdmission(
+            dispatch_stage::CURATION_CARRIER_REFUSAL,
+        ))?;
+        return dispatch_stage::dispatch_curation(binding, carrier);
+    }
     let model_inputs = model_stage::resolve_model_inputs(admission, job)?;
     let draft = model_stage::run_admitted_model(model_inputs)?;
     let grounding_request = grounding_stage::resolve_grounding_inputs(admission, job, draft)?;
     let grounded = grounding_stage::ground_admitted_draft(grounding_request)?;
-    let screen_binding = match screen {
-        curation_screen_stage::ScreenDecision::Screened { binding, .. } => Some(binding),
-        curation_screen_stage::ScreenDecision::PassThrough(_) => None,
-    };
-    if job.job_class == JobClass::Curation {
-        // Curation owns the A-31 post-handler carrier: the common A-05
-        // owner itself rejects Curation (`UnsupportedJobShape`), so the
-        // class routes straight to its sole fan-in.
-        dispatch_stage::dispatch_admitted(admission, job, screen_binding, job.job_class)
-    } else {
-        let _validation = validation_stage::resolve_validation_inputs(admission, job)?;
-        let validation_input =
-            admitted_material::validation_input_for(admission, job, grounded, Some(0))?;
-        let _validated = validation_stage::validate_admitted_draft(&validation_input)?;
-        dispatch_stage::dispatch_admitted(admission, job, screen_binding, job.job_class)
-    }
+    // Non-Curation classes pass the screen through with no binding to carry:
+    // the resolve above already proved the pass-through.
+    let screen_binding = None;
+    let _validation = validation_stage::resolve_validation_inputs(admission, job)?;
+    let validation_input =
+        admitted_material::validation_input_for(admission, job, grounded, Some(0))?;
+    let _validated = validation_stage::validate_admitted_draft(&validation_input)?;
+    dispatch_stage::dispatch_admitted(admission, job, screen_binding, None, job.job_class)
 }
 
 impl KernelJobPort for AuthenticatedKernelJobPort {
@@ -432,8 +449,9 @@ impl KernelJobPort for AuthenticatedKernelJobPort {
         // and before any controller or bundle work. Admitted jobs prove the
         // Kernel-claimed binding next, then run the #806 controller step, the
         // A-04 bundle plan, and the admitted stage chain
-        // ([`run_admitted_pipeline`]: screen, model, grounding, native
-        // dispatch), each stage genuinely invoking its owner exactly once.
+        // ([`run_admitted_pipeline`]: screen, then A-31 for Curation or
+        // model/grounding/validation/dispatch otherwise), each stage
+        // genuinely invoking its owner exactly once.
         // Only then is the live Kernel-proved disposition observed: the
         // Kernel owns state authority, so the computed result attaches to the
         // live view instead of inventing terminal state. The Slice-8 result
@@ -447,7 +465,10 @@ impl KernelJobPort for AuthenticatedKernelJobPort {
             controller::step_admitted_cycle(&state, &observed, &policy, observation_time_ms)?;
         let request = bundle_stage::resolve_bundle_request(admission, job)?;
         let _plan = bundle_stage::plan_admitted_bundle(request)?;
-        let result = run_admitted_pipeline(admission, job)?;
+        // Production carries no Curation execution carrier: live handler
+        // ports are Governor-injected, so Curation refuses at the carrier
+        // check with the precise reason instead of burning generic stages.
+        let result = run_admitted_pipeline(admission, job, None)?;
         let view = self.live_view()?;
         let projected =
             result_stage::project_result_view(&view.job_id, view.state, Some(result));

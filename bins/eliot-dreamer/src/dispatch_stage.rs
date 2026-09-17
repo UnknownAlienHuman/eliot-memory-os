@@ -13,37 +13,40 @@
 //!
 //! [`dispatch_admitted`] is the single Slice-7 owner entry: it takes the
 //! Kernel admission, the semantic job, the A-20 screen binding (for
-//! Curation), and the closed class, and returns the typed [`DreamResult`].
+//! Curation), the Governor-injected Curation execution carrier (for Curation),
+//! and the closed class, and returns the typed [`DreamResult`].
 //! There is no class-only stub seam: every arm either genuinely invokes its
 //! owner or refuses naming the exact missing governed input. Orientation
 //! derives the v1 hypothesis pair, validates it through the real v1 A-05
 //! entry, and genuinely invokes `build_projection` before projecting the
 //! packet; Curation genuinely resolves descriptors, validates
-//! registry/policy/screen, and refuses at the live-port boundary;
-//! `ResearchSynthesis` and `Maintenance` fail closed naming their missing
-//! Governor-resolved inputs; the remaining five classes refuse with
-//! `UnsupportedJobClass` (they never reach here via `submit`; direct calls
-//! refuse).
+//! registry/policy/screen, and routes the injected batch through the real
+//! A-31 fan-in; `ResearchSynthesis` and `Maintenance` fail closed naming
+//! their missing Governor-resolved inputs; the remaining five classes refuse
+//! with `UnsupportedJobClass` (they never reach here via `submit`; direct
+//! calls refuse).
 //!
 //! Fail-closed: every refusal is [`DreamerError::InvalidAdmission`] (the
 //! request-rejected code) or [`DreamerError::UnsupportedJobClass`], never the
 //! Kernel-admission code: the admission itself was valid, the owner inputs
 //! were not. Dynamic payloads (handles, digests, reasons) are dropped in favor
-//! of bounded static field names; nothing secret flows. No leaf handler is
-//! invoked on any path: Curation stops at the port boundary because no
-//! production `NativeCurationHandler` implementations exist in the workspace
-//! (only test doubles), so the ten live ports the owner requires cannot be
-//! assembled in-binary and leaf invocation awaits Governor-injected ports.
+//! of bounded static field names; nothing secret flows. The Curation leaf
+//! handler runs only behind a Governor-injected carrier: production carries
+//! none (the ten live ports are Governor-injected and absent in-binary), so
+//! production Curation refuses at the carrier check before any generic stage
+//! work; tests inject the [`curation_test_support`] carrier to prove the wired
+//! A-31 path end to end.
 
 use eliot_dreamer_candidate_validation::{
-    CandidateValidationOutcome, DreamDraftValidationError, validate_grounded_dream_draft_at,
+    validate_grounded_dream_draft_at, CandidateValidationOutcome, DreamDraftValidationError,
 };
+use eliot_dreamer_contracts::registry::{canonical_registry, CurationHandlerRegistry};
 use eliot_dreamer_contracts::{
-    registry::{canonical_registry, CurationHandlerRegistry},
     ContractViolation, JobClass, ScreenBinding, ScreenState, SourceDisposition,
 };
 use eliot_dreamer_curation::{
-    CurationRoutingError, NativeCurationPortSet, RoutingPolicy, MAX_BATCH_ITEMS,
+    route_validated_curation, CurationCandidateSet, CurationRoutingError, NativeCurationPortSet,
+    OwnerRevisionPin, RoutingDisposition, RoutingPolicy, ValidatedCurationBatch, MAX_BATCH_ITEMS,
 };
 use eliot_dreamer_orientation::{
     projection::{build_projection, OrientationPacketCandidate},
@@ -56,8 +59,8 @@ use crate::admitted_material::{
 };
 use crate::controller::verify_admitted_binding;
 use crate::{
-    DreamJobInput, DreamPacket, DreamResult, DreamerError, Interpretation, KernelJobAdmission,
-    SourceCoverage,
+    CurationCandidate, DreamJobInput, DreamPacket, DreamResult, DreamerError, Interpretation,
+    KernelJobAdmission, SourceCoverage,
 };
 
 /// Terminal fail-closed reason when the A-31 fan-in cannot be invoked: the
@@ -70,6 +73,19 @@ const CURATION_PORTS_REFUSAL: &str =
 /// binding the fan-in must be checked against.
 const CURATION_SCREEN_REFUSAL: &str =
     "admitted curation dispatch requires Governor-resolved screen binding";
+/// Fail-closed reason when the Curation arm is entered without the
+/// Governor-injected execution carrier: the validated batch and the ten live
+/// handler ports arrive together from the Governor, so without them there is
+/// no A-31 input to route and no generic stage work to burn first.
+pub(crate) const CURATION_CARRIER_REFUSAL: &str =
+    "admitted Curation requires Governor-injected execution carrier and handler ports";
+/// Fail-closed reason when a routed set carries no accepted candidate: an
+/// empty success would promote absence to a result, so the arm refuses
+/// instead.
+const CURATION_EMPTY_REFUSAL: &str = "curation produced no accepted candidates";
+/// Routing policy identity shared by dispatch and the test harness: the sealed
+/// input digest covers the policy, so both sides must use the identical value.
+const CURATION_POLICY_ID: &str = "eliot-dreamer-dispatch";
 /// Fail-closed reason for the `ResearchSynthesis` arm: the owner projection
 /// needs a Governor-owned `ResearchPack` its synthesis vocabulary cannot be
 /// built from here (see the arm documentation).
@@ -85,6 +101,20 @@ const MAINTENANCE_INPUTS_REFUSAL: &str =
 /// Governor-resolved bundle material and is never invented here.
 const FRAME_SOURCE_REFUSAL: &str =
     "admitted orientation dispatch requires Governor-resolved frame source";
+
+/// Governor-injected Curation execution carrier: the validated batch plus the
+/// ten live handler ports A-31 routes it through.
+///
+/// Both halves arrive together from the Governor. Production carries none
+/// (live ports are absent in-binary); tests inject the
+/// [`curation_test_support`] carrier to prove the wired path.
+pub(crate) struct CurationExecutionCarrier<'a> {
+    /// Already-validated batch bound to the dispatched screen.
+    pub batch: ValidatedCurationBatch,
+    /// Exactly one live port per owner family, validated against the closed
+    /// registry and the batch pins at dispatch time.
+    pub ports: NativeCurationPortSet<'a>,
+}
 
 /// Maps a native owner refusal to a typed fail-closed refusal.
 ///
@@ -124,21 +154,25 @@ fn dispatch_denied(error: &ContractViolation) -> DreamerError {
 ///
 /// Takes the Kernel admission, the semantic job, the A-20 screen binding
 /// (`Some` for Curation, carried from the screen stage; `None` elsewhere),
-/// and the closed class. Returns the owner-typed [`DreamResult`].
+/// the Governor-injected Curation execution carrier (`Some` only where the
+/// Governor injected one; production passes `None`), and the closed class.
+/// Returns the owner-typed [`DreamResult`].
 ///
 /// Fail-closed: the admission/job binding is verified first, then the class
 /// parameter is bound against the semantic job, then the exhaustive nine-arm
 /// match runs with no wildcard. Orientation derives the v1 hypothesis pair
 /// from the admitted pair, validates it through the real v1 A-05 entry, and
-/// genuinely invokes `build_projection`; Curation genuinely resolves
-/// descriptors, validates registry/policy/screen, and refuses at the
-/// live-port boundary; `ResearchSynthesis` and `Maintenance` name their
-/// missing Governor-resolved inputs; the five classes `submit` never admits
-/// refuse with `UnsupportedJobClass`.
+/// genuinely invokes `build_projection`; Curation checks the carrier first
+/// (a missing carrier refuses before any screen or registry work, so no
+/// generic stage burns on a job that cannot route), then the screen binding,
+/// then the real A-31 fan-in; `ResearchSynthesis` and `Maintenance` name
+/// their missing Governor-resolved inputs; the five classes `submit` never
+/// admits refuse with `UnsupportedJobClass`.
 pub(crate) fn dispatch_admitted(
     admission: &KernelJobAdmission,
     job: &DreamJobInput,
     screen: Option<ScreenBinding>,
+    curation_carrier: Option<CurationExecutionCarrier<'_>>,
     job_class: JobClass,
 ) -> Result<DreamResult, DreamerError> {
     verify_admitted_binding(admission, job)?;
@@ -146,8 +180,20 @@ pub(crate) fn dispatch_admitted(
         return Err(DreamerError::InvalidAdmission("job class binding"));
     }
     match job_class {
-        // Native owner: eliot-dreamer-curation (A-31 sole fan-in).
-        JobClass::Curation => dispatch_curation(screen),
+        // Native owner: eliot-dreamer-curation (A-31 sole fan-in). The
+        // carrier check runs before the screen check: without the
+        // Governor-injected batch and ports there is nothing to route, so
+        // the precise carrier refusal names the missing governed input
+        // even when the screen is absent too.
+        JobClass::Curation => {
+            let Some(carrier) = curation_carrier else {
+                return Err(DreamerError::InvalidAdmission(CURATION_CARRIER_REFUSAL));
+            };
+            let Some(binding) = screen else {
+                return Err(DreamerError::InvalidAdmission(CURATION_SCREEN_REFUSAL));
+            };
+            dispatch_curation(binding, carrier)
+        }
         // Native owner: eliot-dreamer-orientation build_projection.
         JobClass::Orientation => dispatch_orientation(admission, job),
         // Native owner: eliot-dreamer-research-synthesis `synthesize`. The
@@ -384,60 +430,139 @@ fn orientation_denied(error: &OrientationError) -> DreamerError {
     }
 }
 
+/// Builds the bounded all-or-nothing routing policy for one A-31 call.
+///
+/// Shared by dispatch and the test harness: the sealed input digest covers
+/// the policy, so both sides must use the identical value or the owner
+/// digest check fails closed on drift.
+fn curation_routing_policy() -> RoutingPolicy {
+    let max_items = u32::try_from(MAX_BATCH_ITEMS).unwrap_or(u32::MAX);
+    RoutingPolicy {
+        policy_id: CURATION_POLICY_ID.to_owned(),
+        policy_revision: 1,
+        allow_partial: false,
+        max_items,
+    }
+}
+
 /// Dispatches one admitted Curation job through the A-31 sole fan-in.
 ///
-/// Takes the A-20 screen binding from the screen stage (`Some` for Curation;
-/// `None` refuses naming the missing governed screen). Then, genuinely and in
-/// order: resolves the owner-published closed registry, validates its closure
-/// and stable digest, validates a bounded all-or-nothing routing policy,
-/// validates the screen binding through the real owner check, resolves the
-/// ten owner descriptors through that validated registry, and runs the owner
-/// port-set validation.
-///
-/// HARD TRUTH: no production `NativeCurationHandler` implementations exist in
-/// the workspace (only test doubles), and the owner port validation requires
-/// exactly ten live ports, so the empty in-binary port set always fails that
-/// genuine owner check. The terminal outcome is therefore the precise
-/// live-ports refusal — reached AFTER genuinely invoking the owner boundary,
-/// with no handler semantics invented in this binary. Leaf invocation awaits
-/// Governor-injected ports (which arrive together with the validated batch
-/// material in a later slice; no batch envelope is fabricated here, so
-/// [`route_validated_curation`](eliot_dreamer_curation::route_validated_curation)
-/// itself is not yet callable). Never returns `UnsupportedJobClass`.
-fn dispatch_curation(screen: Option<ScreenBinding>) -> Result<DreamResult, DreamerError> {
-    let screen = screen.ok_or(DreamerError::InvalidAdmission(CURATION_SCREEN_REFUSAL))?;
+/// Takes the A-20 screen binding from the screen stage and the
+/// Governor-injected execution carrier (both already checked present by
+/// [`dispatch_admitted`]). Then, genuinely and in order: resolves the
+/// owner-published closed registry, validates its closure and stable digest,
+/// validates the bounded all-or-nothing routing policy, validates the screen
+/// binding through the real owner check, requires the carrier to bring live
+/// ports (an empty port set refuses at the genuine owner port boundary), and
+/// routes the injected batch through the real
+/// [`route_validated_curation`](eliot_dreamer_curation::route_validated_curation),
+/// mapping the returned candidate set onto [`DreamResult::Curation`].
+/// Never returns `UnsupportedJobClass`.
+#[allow(
+    clippy::needless_pass_by_value,
+    reason = "the composition moves owned Governor inputs in; borrowing would break the pinned lib.rs call shape"
+)]
+pub(crate) fn dispatch_curation(
+    screen: ScreenBinding,
+    carrier: CurationExecutionCarrier<'_>,
+) -> Result<DreamResult, DreamerError> {
     let registry = canonical_registry().map_err(|error| dispatch_denied(&error))?;
     registry
         .validate_closure()
         .map_err(|error| dispatch_denied(&error))?;
     let _registry_digest = registry.digest().map_err(|error| dispatch_denied(&error))?;
-    let max_items = u32::try_from(MAX_BATCH_ITEMS).unwrap_or(u32::MAX);
-    let policy = RoutingPolicy {
-        policy_id: "eliot-dreamer-dispatch".to_owned(),
-        policy_revision: 1,
-        allow_partial: false,
-        max_items,
-    };
+    let policy = curation_routing_policy();
     policy.validate().map_err(|error| curation_denied(&error))?;
     screen.validate().map_err(|error| dispatch_denied(&error))?;
     if screen.state != ScreenState::Eligible {
         return Err(DreamerError::InvalidAdmission("screen ineligible"));
     }
-    Err(curation_port_boundary_refusal(&registry))
+    if carrier.ports.ports.is_empty() {
+        return Err(curation_port_boundary_refusal(
+            &registry,
+            &carrier.batch.owner_pins,
+            &carrier.ports,
+        ));
+    }
+    let set = route_validated_curation(&carrier.batch, &screen, &registry, &policy, &carrier.ports)
+        .map_err(|error| curation_denied(&error))?;
+    map_curation_set(&set)
+}
+
+/// Maps one routed A-31 candidate set onto the crate curation result.
+///
+/// One [`CurationCandidate`] per member with a live candidate disposition and
+/// exactly one handler call: rejected (duplicate/conflict/abstention/
+/// unsupported), blocked (blocked/partial/internal-defect), and unprocessed
+/// members carry no sealed content and never surface as candidates. Under the
+/// all-or-nothing policy the router already fails closed on any such member,
+/// so the filter is defense-in-depth, never a silent drop.
+///
+/// Honest routing-record mapping: handler content stays Governor-sealed, so
+/// the transformation and rollback texts name the sealing handler, the sealed
+/// result digest, and the owner routing note instead of inventing content.
+/// Provenance carries the omitted targets plus the denominator members
+/// (G4-like lineage: what the set covered and what it left uncovered). A set
+/// with zero accepted members refuses fail-closed instead of returning an
+/// empty success.
+fn map_curation_set(set: &CurationCandidateSet) -> Result<DreamResult, DreamerError> {
+    let mut candidates = Vec::with_capacity(set.members.len());
+    for member in &set.members {
+        if member.disposition != RoutingDisposition::Candidate || member.calls != 1 {
+            continue;
+        }
+        let result_digest = member.result_digest.as_deref().unwrap_or("absent");
+        candidates.push(CurationCandidate {
+            candidate_id: member.member_id.clone(),
+            kind: member.kind.as_str().to_owned(),
+            source_handles: member.targets.clone(),
+            proposed_transformation: format!(
+                "routing record: handler {handler_id} sealed a live candidate under result digest {result_digest}; owner note: {note}; content stays Governor-sealed, this record maps the routing outcome only",
+                handler_id = member.handler_id, note = member.note,
+            ),
+            uncertainty: "candidate_only; content sealed under result digest".to_owned(),
+            rollback: format!(
+                "routing record: discard candidate {member_id} ({kind}) sealed by handler {handler_id}; no source mutation was performed",
+                member_id = member.member_id, kind = member.kind.as_str(), handler_id = member.handler_id,
+            ),
+        });
+    }
+    if candidates.is_empty() {
+        return Err(DreamerError::InvalidAdmission(CURATION_EMPTY_REFUSAL));
+    }
+    let mut provenance = Vec::new();
+    for handle in set
+        .omitted_targets
+        .iter()
+        .chain(set.denominator.members.iter())
+    {
+        if !provenance.contains(handle) {
+            provenance.push(handle.clone());
+        }
+    }
+    Ok(DreamResult::Curation {
+        job_id: set.job_id.clone(),
+        candidates,
+        provenance,
+    })
 }
 
 /// Runs the genuine owner port-boundary check and maps its terminal refusal.
 ///
-/// Validates the empty in-binary port set against the closed registry through
-/// the real owner [`NativeCurationPortSet::validate`](eliot_dreamer_curation::NativeCurationPortSet::validate):
-/// with no Governor-injected live ports this always fails the exact-ten
-/// requirement, and the owner error maps to the precise live-ports refusal.
-/// The `Ok` arm is defensive-unreachable (an empty set can never satisfy the
-/// owner) and refuses identically: there are still no live ports to dispatch
-/// through. No handler is constructed, counted, or invoked on any path.
-fn curation_port_boundary_refusal(registry: &CurationHandlerRegistry) -> DreamerError {
-    let empty = NativeCurationPortSet { ports: Vec::new() };
-    match empty.validate(registry, &[]) {
+/// Validates the carrier port set against the closed registry and the batch
+/// pins through the real owner
+/// [`NativeCurationPortSet::validate`](eliot_dreamer_curation::NativeCurationPortSet::validate).
+/// An empty carrier set always fails the exact-ten requirement, and the owner
+/// error maps to the precise live-ports refusal. The `Ok` arm is
+/// defensive-unreachable (an empty set can never satisfy the owner) and
+/// refuses identically: there are still no live ports to dispatch through.
+/// No handler is constructed, counted, or invoked on any path.
+fn curation_port_boundary_refusal(
+    registry: &CurationHandlerRegistry,
+    pins: &[OwnerRevisionPin],
+    ports: &NativeCurationPortSet<'_>,
+) -> DreamerError {
+    match ports.validate(registry, pins) {
         Err(error) => curation_denied(&error),
         Ok(()) => DreamerError::InvalidAdmission(CURATION_PORTS_REFUSAL),
     }
@@ -480,6 +605,476 @@ fn curation_denied(error: &CurationRoutingError) -> DreamerError {
             DreamerError::InvalidAdmission("curation atomicity")
         }
         CurationRoutingError::Digest { .. } => DreamerError::InvalidAdmission("curation digest"),
+    }
+}
+
+/// Test-only Curation execution support: the fixture handler, the valid
+/// batch bound to one screen, and the ten-port carrier assembled around it.
+///
+/// Production never builds these (live ports are Governor-injected); the
+/// dispatch-level and pipeline e2e tests use this harness to prove the wired
+/// A-31 path with real owner crates and no new dependencies.
+#[cfg(test)]
+pub(crate) mod curation_test_support {
+    use super::*;
+    use eliot_contracts::sha256_hex;
+    use eliot_dreamer_contracts::candidate::{
+        DimensionVerdict, PreservationDimension, PreservationReport, PRESERVATION_DIMENSIONS,
+    };
+    use eliot_dreamer_contracts::curation::{kind_family, ClassificationPayload, TargetEvidence};
+    use eliot_dreamer_contracts::registry::{
+        CurationFamily, CurationHandlerPort, CURATION_FAMILIES,
+    };
+    use eliot_dreamer_contracts::{
+        parse_family, AtomicityMode, BoundCurationCall, CandidateDisposition, CurationKind,
+        CurationPayload, NativeCurationHandler, ProducedCurationContent, TargetDenominator,
+        ValidatedCurationItem, ValidationReceipt,
+    };
+    use eliot_dreamer_curation::{
+        compute_input_digest, expected_owner_package, NativeCurationPort,
+    };
+
+    /// Fail-closed reason when the test harness cannot bind its fixture batch
+    /// to the given screen, admission, and job.
+    const HARNESS_BINDING_REFUSAL: &str = "curation test harness binding invalid";
+
+    /// Revision pinned per owner family and matched by every injected port.
+    const HARNESS_REVISION: &str = "test-rev-1";
+
+    /// Test-only routing handler: echoes the dispatched payload as a live
+    /// candidate with passing preservation, so the payload kind always equals
+    /// the item kind, targets travel reverbatim, and counterevidence stays
+    /// disjoint from mutable targets by construction (empty).
+    pub(crate) struct TestRoutingHandler;
+
+    impl NativeCurationHandler for TestRoutingHandler {
+        fn handle(
+            &self,
+            call: &BoundCurationCall,
+        ) -> Result<ProducedCurationContent, ContractViolation> {
+            let mut verdicts = Vec::with_capacity(PRESERVATION_DIMENSIONS.len());
+            for spelling in PRESERVATION_DIMENSIONS {
+                verdicts.push(DimensionVerdict {
+                    dimension: PreservationDimension::parse(spelling)?,
+                    passed: true,
+                    known: true,
+                    note: "test routing handler preserves the dispatched payload verbatim"
+                        .to_owned(),
+                });
+            }
+            Ok(ProducedCurationContent {
+                payload: call.request.payload.clone(),
+                disposition: CandidateDisposition::Candidate,
+                preservation: PreservationReport { verdicts },
+                support_note: "test routing handler echoes the dispatched payload".to_owned(),
+                rollback_note: "discard the routed candidate; no source mutation ran".to_owned(),
+                counterevidence_refs: Vec::new(),
+            })
+        }
+    }
+
+    /// Owned port binding halves: the registry descriptor plus the owner
+    /// package and revision the live port must carry. Stored owned because
+    /// the live [`NativeCurationPort`] borrows the harness handler and
+    /// cannot live inside the harness itself.
+    struct HarnessPortBinding {
+        port: CurationHandlerPort,
+        owner_package: String,
+        owner_revision: String,
+    }
+
+    /// Test harness owning one routing handler plus the valid batch bound to
+    /// one screen binding.
+    pub(crate) struct CurationTestHarness {
+        handler: TestRoutingHandler,
+        batch: ValidatedCurationBatch,
+        port_bindings: Vec<HarnessPortBinding>,
+    }
+
+    /// Deterministic 64-hex fixture digest over one label.
+    fn harness_hex(label: &str) -> String {
+        sha256_hex(label.as_bytes())
+    }
+
+    /// Builds the shape-valid A-05 receipt backing the fixture batch: every
+    /// digest is well-formed hex, and the bundle/manifest digests plus the
+    /// task/scope/fence triple equal the batch envelope so the owner
+    /// uniformity check binds.
+    fn harness_receipt(
+        job_id: &str,
+        bundle_digest: &str,
+        manifest_digest: &str,
+        binding: &ScreenBinding,
+    ) -> Result<ValidationReceipt, DreamerError> {
+        let receipt = ValidationReceipt {
+            schema_version: 1,
+            validator_contract: "curation-test-harness".to_owned(),
+            validator_policy: "curation-test-policy".to_owned(),
+            job_id: job_id.to_owned(),
+            draft_digest: harness_hex(&format!("{job_id}:draft")),
+            bundle_digest: bundle_digest.to_owned(),
+            manifest_digest: manifest_digest.to_owned(),
+            task_id: binding.task_id.clone(),
+            scope_id: binding.scope_id.clone(),
+            input_digest: harness_hex(&format!("{job_id}:validator-input")),
+            output_digest: harness_hex(&format!("{job_id}:validator-output")),
+            terminal_disposition: "accepted".to_owned(),
+            proof_ceiling: "candidate-only".to_owned(),
+            state_fence: binding.state_fence.clone(),
+            preservation_digest: harness_hex(&format!("{job_id}:preservation")),
+            budget_digest: harness_hex(&format!("{job_id}:budget")),
+        };
+        receipt
+            .validate()
+            .map_err(|_| DreamerError::InvalidAdmission(HARNESS_BINDING_REFUSAL))?;
+        Ok(receipt)
+    }
+
+    /// Builds one fixture item per screened target using the simplest payload
+    /// kind (Classification): one mutable target, one disjoint evidence
+    /// handle, and a per-item all-or-nothing denominator covering exactly
+    /// that target, so the batch union covers the screen denominator exactly.
+    fn harness_item(
+        target: &str,
+        index: usize,
+        receipt: &ValidationReceipt,
+        binding: &ScreenBinding,
+        job_id: &str,
+        requester: &eliot_dreamer_contracts::Requester,
+    ) -> Result<ValidatedCurationItem, DreamerError> {
+        let evidence = format!("evidence-{index}");
+        if binding.screened_targets.contains(&evidence) {
+            return Err(DreamerError::InvalidAdmission(HARNESS_BINDING_REFUSAL));
+        }
+        let payload = CurationPayload::Classification(ClassificationPayload {
+            label: "test-routing-fixture".to_owned(),
+            confidence_bps: 9_000,
+            target_evidence: TargetEvidence {
+                targets: vec![target.to_owned()],
+                evidence_refs: vec![evidence],
+            },
+        });
+        let item = ValidatedCurationItem {
+            receipt: receipt.clone(),
+            kind_spelling: CurationKind::Classification.as_str().to_owned(),
+            family_spelling: kind_family(CurationKind::Classification).to_owned(),
+            payload,
+            denominator: TargetDenominator {
+                mode: AtomicityMode::AllOrNothing,
+                members: vec![target.to_owned()],
+                expected_total: 1,
+            },
+            source_digest: harness_hex(&format!("{job_id}:source:{target}")),
+            task_id: binding.task_id.clone(),
+            scope_id: binding.scope_id.clone(),
+            state_fence: binding.state_fence.clone(),
+            job_digest: harness_hex(&format!("{job_id}:job")),
+            requester: requester.clone(),
+            budget_note: "test harness batch; within admitted ceilings".to_owned(),
+        };
+        item.validate()
+            .map_err(|_| DreamerError::InvalidAdmission(HARNESS_BINDING_REFUSAL))?;
+        Ok(item)
+    }
+
+    /// Builds the batch bound to one screen: request/task/scope/fence
+    /// identities from that screen, denominator members equal to the screened
+    /// targets, registry digest from the real closed registry, one revision
+    /// pin per family in canonical order, budgets and usage from the
+    /// admitted ceilings, and the input digest from the real owner seal over
+    /// batch, screen, registry digest, and the shared routing policy.
+    fn harness_batch(
+        binding: &ScreenBinding,
+        admission: &KernelJobAdmission,
+        job: &DreamJobInput,
+    ) -> Result<ValidatedCurationBatch, DreamerError> {
+        let invalid = || DreamerError::InvalidAdmission(HARNESS_BINDING_REFUSAL);
+        binding.validate().map_err(|_| invalid())?;
+        if binding.state != ScreenState::Eligible {
+            return Err(invalid());
+        }
+        let admitted = admission_of(admission, job)?;
+        let job_id = admitted.canonical_id();
+        let registry = canonical_registry().map_err(|_| invalid())?;
+        let registry_digest = registry.digest().map_err(|_| invalid())?;
+        let bundle_digest = harness_hex(&format!("{job_id}:bundle"));
+        let manifest_digest = harness_hex(&format!("{job_id}:manifest"));
+        let receipt = harness_receipt(&job_id, &bundle_digest, &manifest_digest, binding)?;
+        let mut items = Vec::with_capacity(binding.screened_targets.len());
+        for (index, target) in binding.screened_targets.iter().enumerate() {
+            items.push(harness_item(
+                target,
+                index,
+                &receipt,
+                binding,
+                &job_id,
+                &admitted.requester,
+            )?);
+        }
+        let expected_total =
+            u32::try_from(binding.screened_targets.len()).map_err(|_| invalid())?;
+        let owner_pins = CURATION_FAMILIES
+            .iter()
+            .map(|spelling| {
+                parse_family(spelling).map(|family| OwnerRevisionPin {
+                    family,
+                    revision: HARNESS_REVISION.to_owned(),
+                })
+            })
+            .collect::<Result<Vec<OwnerRevisionPin>, ContractViolation>>()
+            .map_err(|_| invalid())?;
+        let budgets = admitted.budget;
+        let usage = usage_of(&budgets);
+        let policy = curation_routing_policy();
+        let mut batch = ValidatedCurationBatch {
+            job_id,
+            request_id: binding.request_id.as_str().to_owned(),
+            operation_id: admission.request_id.clone(),
+            idempotency_key: admission.idempotency_key.clone(),
+            requester: admitted.requester.clone(),
+            task_id: binding.task_id.clone(),
+            attempt: 1,
+            scope_id: binding.scope_id.clone(),
+            state_fence: binding.state_fence.clone(),
+            bundle_digest,
+            manifest_digest,
+            grounding_digest: harness_hex("curation-test-harness:grounding"),
+            receipt,
+            items,
+            denominator: TargetDenominator {
+                mode: AtomicityMode::AllOrNothing,
+                members: binding.screened_targets.clone(),
+                expected_total,
+            },
+            privacy_profile: admitted.privacy_profile.clone(),
+            authority_ref: "test-harness: no authority exercised".to_owned(),
+            effect_note: "test-harness routing only; no effect exercised".to_owned(),
+            proof_ceiling: "candidate-only".to_owned(),
+            atomicity: AtomicityMode::AllOrNothing,
+            budgets,
+            usage,
+            deadline_ms: None,
+            observation_time_ms: None,
+            cancelled: false,
+            predecessor_digests: Vec::new(),
+            invalidation_note: "test-harness batch; no invalidation".to_owned(),
+            registry_digest: registry_digest.clone(),
+            owner_pins,
+            input_digest: "0".repeat(64),
+        };
+        batch.input_digest = compute_input_digest(&batch, binding, &registry_digest, &policy)
+            .map_err(|_| invalid())?;
+        batch
+            .validate()
+            .map_err(|_| DreamerError::InvalidAdmission(HARNESS_BINDING_REFUSAL))?;
+        Ok(batch)
+    }
+
+    /// Builds the ten owned port halves from the real registry descriptors:
+    /// byte-equal descriptors, the real expected owner package per family,
+    /// and pin-matching revisions.
+    fn harness_port_bindings(
+        registry: &CurationHandlerRegistry,
+    ) -> Result<Vec<HarnessPortBinding>, DreamerError> {
+        let invalid = || DreamerError::InvalidAdmission(HARNESS_BINDING_REFUSAL);
+        let mut bindings = Vec::with_capacity(CURATION_FAMILIES.len());
+        for spelling in CURATION_FAMILIES {
+            let family = parse_family(spelling).map_err(|_| invalid())?;
+            let declared = registry
+                .handlers
+                .iter()
+                .find(|item| item.family == family)
+                .ok_or_else(invalid)?;
+            bindings.push(HarnessPortBinding {
+                port: CurationHandlerPort {
+                    port_id: format!("test-port-{}", family.as_str()),
+                    descriptor: declared.clone(),
+                },
+                owner_package: expected_owner_package(family).to_owned(),
+                owner_revision: HARNESS_REVISION.to_owned(),
+            });
+        }
+        Ok(bindings)
+    }
+
+    impl CurationTestHarness {
+        /// Builds the harness for one screen binding: the batch bound to
+        /// that screen (request/task/scope/fence identities, denominator
+        /// members, registry digest, owner pins, admitted budgets, sealed
+        /// input digest) plus the ten owned port halves.
+        pub(crate) fn for_screen(
+            binding: &ScreenBinding,
+            admission: &KernelJobAdmission,
+            job: &DreamJobInput,
+        ) -> Result<Self, DreamerError> {
+            let invalid = || DreamerError::InvalidAdmission(HARNESS_BINDING_REFUSAL);
+            let registry = canonical_registry().map_err(|_| invalid())?;
+            registry.validate_closure().map_err(|_| invalid())?;
+            Ok(Self {
+                handler: TestRoutingHandler,
+                batch: harness_batch(binding, admission, job)?,
+                port_bindings: harness_port_bindings(&registry)?,
+            })
+        }
+
+        /// Builds the Governor-injected execution carrier around the
+        /// harness handler: the ten-port set from the real registry
+        /// descriptors with expected owner packages and pin-matching
+        /// revisions, borrowing the owned test handler for every port (only
+        /// the dispatched family is ever called).
+        pub(crate) fn carrier(&self) -> CurationExecutionCarrier<'_> {
+            let ports = self
+                .port_bindings
+                .iter()
+                .map(|binding| NativeCurationPort {
+                    port: binding.port.clone(),
+                    owner_package: binding.owner_package.clone(),
+                    owner_revision: binding.owner_revision.clone(),
+                    handler: &self.handler,
+                })
+                .collect();
+            CurationExecutionCarrier {
+                batch: self.batch.clone(),
+                ports: NativeCurationPortSet { ports },
+            }
+        }
+
+        /// Returns the fixture batch bound to the screen, for boundary
+        /// probes (e.g. pairing it with an empty port set) and assertions.
+        pub(crate) fn batch(&self) -> &ValidatedCurationBatch {
+            &self.batch
+        }
+    }
+
+    /// The fixture handler echoes the dispatched payload with passing
+    /// preservation and disjoint counterevidence, satisfying every
+    /// `ProducedCurationContent` rule the owner enforces.
+    #[test]
+    fn test_routing_handler_produces_valid_content() {
+        use eliot_dreamer_contracts::registry::CurationHandlerDescriptor;
+
+        let screen = harness_screen(&["target-harness"]);
+        let Ok(receipt) = harness_receipt(
+            "job-harness",
+            &harness_hex("job-harness:bundle"),
+            &harness_hex("job-harness:manifest"),
+            &screen,
+        ) else {
+            panic!("harness receipt must validate");
+        };
+        let requester = eliot_dreamer_contracts::Requester {
+            origin: eliot_dreamer_contracts::RequesterOrigin::Human,
+            principal: "harness".to_owned(),
+            session: None,
+        };
+        let Ok(item) = harness_item(
+            "target-harness",
+            0,
+            &receipt,
+            &screen,
+            "job-harness",
+            &requester,
+        ) else {
+            panic!("harness item must validate");
+        };
+        let payload = item.payload.clone();
+        let descriptor = CurationHandlerDescriptor {
+            family: CurationFamily::Classification,
+            handler_id: "harness-check".to_owned(),
+            accepted_kinds: vec![CurationKind::Classification],
+        };
+        let handler = TestRoutingHandler;
+        let call = BoundCurationCall {
+            port: CurationHandlerPort {
+                port_id: "harness-port".to_owned(),
+                descriptor,
+            },
+            item,
+            request: eliot_dreamer_contracts::TypedCurationHandlerRequest {
+                request_id: screen.request_id.as_str().to_owned(),
+                receipt_id: screen.receipt_id.as_str().to_owned(),
+                source_snapshot: screen.source_snapshot.clone(),
+                source_revision: screen.source_revision.clone(),
+                profile: screen.profile.clone(),
+                kind: CurationKind::Classification,
+                family: CurationFamily::Classification,
+                job_id: "job-harness".to_owned(),
+                scope_id: screen.scope_id.clone(),
+                task_id: screen.task_id.clone(),
+                state_fence: screen.state_fence.clone(),
+                payload: payload.clone(),
+                denominator: TargetDenominator {
+                    mode: AtomicityMode::AllOrNothing,
+                    members: vec!["target-harness".to_owned()],
+                    expected_total: 1,
+                },
+                screen_binding: Some(screen.clone()),
+            },
+            registry_digest: "c".repeat(64),
+        };
+        let content = handler.handle(&call);
+        let Ok(content) = content else {
+            panic!("echo handler must produce content");
+        };
+        assert_eq!(content.payload, payload);
+        assert_eq!(content.disposition, CandidateDisposition::Candidate);
+        assert!(content.preservation.overall().is_ok());
+        assert!(!content.support_note.trim().is_empty());
+        assert!(!content.rollback_note.trim().is_empty());
+        assert!(content.counterevidence_refs.is_empty());
+        assert!(
+            content.validate_for(&call).is_ok(),
+            "echoed content must satisfy the bound call"
+        );
+    }
+
+    /// Builds one eligible fixture screen over the given targets.
+    fn harness_screen(targets: &[&str]) -> ScreenBinding {
+        ScreenBinding {
+            request_id: binding_request_id(),
+            receipt_id: binding_receipt_id(),
+            screened_targets: targets.iter().map(|target| (*target).to_owned()).collect(),
+            source_snapshot: "snapshot-harness".to_owned(),
+            source_revision: "revision-harness".to_owned(),
+            profile: "profile-harness".to_owned(),
+            task_id: "task-harness".to_owned(),
+            scope_id: "scope-harness".to_owned(),
+            state_fence: binding_fence(),
+            state: ScreenState::Eligible,
+            result_digest: "a".repeat(64),
+            item_digest: "b".repeat(64),
+        }
+    }
+
+    fn binding_fence() -> eliot_contracts::StateFence {
+        use std::num::NonZeroU64;
+
+        use eliot_contracts::{EpochId, EpochLineageId, ResourceGeneration};
+
+        let Ok(lineage) = EpochLineageId::new("550e8400-e29b-41d4-a716-446655440000") else {
+            panic!("harness lineage must parse");
+        };
+        let Some(sequence) = NonZeroU64::new(1) else {
+            panic!("harness sequence must be nonzero");
+        };
+        let Ok(epoch) = EpochId::new(lineage, sequence) else {
+            panic!("harness epoch must construct");
+        };
+        eliot_contracts::StateFence::new(epoch, ResourceGeneration::genesis())
+    }
+
+    fn binding_request_id() -> eliot_contracts::RequestId {
+        let Ok(id) = eliot_contracts::RequestId::new("req-harness") else {
+            panic!("harness request id must parse");
+        };
+        id
+    }
+
+    fn binding_receipt_id() -> eliot_contracts::ReceiptId {
+        let Ok(id) = eliot_contracts::ReceiptId::new("rcpt-harness") else {
+            panic!("harness receipt id must parse");
+        };
+        id
     }
 }
 
@@ -541,6 +1136,7 @@ mod slice_7_native_owner_tests {
     use std::num::NonZeroU64;
 
     use crate::KERNEL_ADMISSION_REQUIRED;
+    use curation_test_support::CurationTestHarness;
     use eliot_contracts::{
         EpochId, EpochLineageId, ReceiptId, RequestId, ResourceGeneration, StateFence,
     };
@@ -627,6 +1223,18 @@ mod slice_7_native_owner_tests {
         }
     }
 
+    fn harness_for_fixture() -> CurationTestHarness {
+        let screen = valid_screen();
+        match CurationTestHarness::for_screen(
+            &screen,
+            &admission(),
+            &semantic_job(JobClass::Curation),
+        ) {
+            Ok(harness) => harness,
+            Err(error) => panic!("fixture harness must build, got {error:?}"),
+        }
+    }
+
     /// Orientation genuinely projects from the admitted pair: the v1
     /// hypothesis pair validates through the real v1 A-05 entry, the owner
     /// `build_projection` succeeds, packet identity bindings travel verbatim,
@@ -635,7 +1243,7 @@ mod slice_7_native_owner_tests {
     fn orientation_projects_packet_with_g4_preserved() {
         let admission = admission();
         let job = semantic_job(JobClass::Orientation);
-        let result = dispatch_admitted(&admission, &job, None, JobClass::Orientation);
+        let result = dispatch_admitted(&admission, &job, None, None, JobClass::Orientation);
         let Ok(DreamResult::Packet(packet)) = result else {
             panic!("orientation must project, got {result:?}");
         };
@@ -695,7 +1303,7 @@ mod slice_7_native_owner_tests {
         let admission = admission();
         let mut job = semantic_job(JobClass::Orientation);
         job.evidence_handles.clear();
-        let refused = dispatch_admitted(&admission, &job, None, JobClass::Orientation);
+        let refused = dispatch_admitted(&admission, &job, None, None, JobClass::Orientation);
         assert!(
             matches!(
                 refused,
@@ -716,7 +1324,7 @@ mod slice_7_native_owner_tests {
         let admission = admission();
         let mut job = semantic_job(JobClass::Orientation);
         job.job_id = "caller-switched-job".to_owned();
-        let refused = dispatch_admitted(&admission, &job, None, JobClass::Orientation);
+        let refused = dispatch_admitted(&admission, &job, None, None, JobClass::Orientation);
         assert_eq!(
             refused.map_err(|error| error.code()),
             Err(KERNEL_ADMISSION_REQUIRED)
@@ -731,6 +1339,7 @@ mod slice_7_native_owner_tests {
             &admission(),
             &semantic_job(JobClass::Orientation),
             None,
+            None,
             JobClass::Curation,
         );
         assert!(
@@ -742,16 +1351,107 @@ mod slice_7_native_owner_tests {
         );
     }
 
-    /// Curation reaches the genuine A-31 port boundary: descriptors resolve
-    /// from the real closed registry, registry/policy/screen validate for
-    /// real, and the terminal refusal names the missing Governor-injected
-    /// live ports with the precise reason — never `UnsupportedJobClass`.
+    /// Curation without the Governor-injected carrier refuses at the carrier
+    /// check with the precise reason — never `UnsupportedJobClass`, never
+    /// the Kernel-admission code — before any screen or registry work burns.
     #[test]
-    fn curation_reaches_port_boundary_with_precise_refusal() {
+    fn curation_without_carrier_refuses_at_carrier_check() {
         let refused = dispatch_admitted(
             &admission(),
             &semantic_job(JobClass::Curation),
             Some(valid_screen()),
+            None,
+            JobClass::Curation,
+        );
+        assert!(
+            matches!(
+                refused,
+                Err(DreamerError::InvalidAdmission(CURATION_CARRIER_REFUSAL))
+            ),
+            "curation without a carrier must name it, got {refused:?}"
+        );
+        assert_eq!(
+            refused.as_ref().map_err(DreamerError::code),
+            Err("DREAMER_REQUEST_REJECTED")
+        );
+        assert!(
+            !matches!(refused, Err(DreamerError::UnsupportedJobClass(_))),
+            "curation must never refuse with UnsupportedJobClass"
+        );
+        assert!(
+            !matches!(refused, Err(DreamerError::KernelAdmissionRequired(_))),
+            "curation must never borrow the Kernel-admission code"
+        );
+    }
+
+    /// Curation with neither screen nor carrier refuses with the carrier
+    /// reason: without the Governor-injected batch and ports there is
+    /// nothing to route, so the carrier check names the missing governed
+    /// input even when the screen is absent too.
+    #[test]
+    fn curation_without_carrier_or_screen_names_carrier() {
+        let refused = dispatch_admitted(
+            &admission(),
+            &semantic_job(JobClass::Curation),
+            None,
+            None,
+            JobClass::Curation,
+        );
+        assert!(
+            matches!(
+                refused,
+                Err(DreamerError::InvalidAdmission(CURATION_CARRIER_REFUSAL))
+            ),
+            "curation without carrier or screen must name the carrier, got {refused:?}"
+        );
+        assert_eq!(
+            refused.map_err(|error| error.code()),
+            Err("DREAMER_REQUEST_REJECTED")
+        );
+    }
+
+    /// Curation with a carrier but without the screen-stage binding refuses
+    /// naming the missing governed screen before any registry work.
+    #[test]
+    fn curation_without_screen_names_missing_binding() {
+        let harness = harness_for_fixture();
+        let refused = dispatch_admitted(
+            &admission(),
+            &semantic_job(JobClass::Curation),
+            None,
+            Some(harness.carrier()),
+            JobClass::Curation,
+        );
+        assert!(
+            matches!(
+                refused,
+                Err(DreamerError::InvalidAdmission(CURATION_SCREEN_REFUSAL))
+            ),
+            "curation without a screen must name it, got {refused:?}"
+        );
+        assert_eq!(
+            refused.map_err(|error| error.code()),
+            Err("DREAMER_REQUEST_REJECTED")
+        );
+    }
+
+    /// Curation with a valid batch but an empty port set reaches the genuine
+    /// A-31 port boundary: descriptors resolve from the real closed registry,
+    /// registry/policy/screen validate for real, and the terminal refusal
+    /// names the missing Governor-injected live ports with the precise
+    /// reason — never `UnsupportedJobClass`.
+    #[test]
+    fn curation_empty_ports_carrier_reaches_port_boundary() {
+        let harness = harness_for_fixture();
+        let carrier = CurationExecutionCarrier {
+            batch: harness.batch().clone(),
+            ports: NativeCurationPortSet { ports: Vec::new() },
+        };
+        let refused = dispatch_admitted(
+            &admission(),
+            &semantic_job(JobClass::Curation),
+            Some(valid_screen()),
+            Some(carrier),
             JobClass::Curation,
         );
         assert!(
@@ -771,23 +1471,86 @@ mod slice_7_native_owner_tests {
         );
     }
 
-    /// Curation without the screen-stage binding refuses naming the missing
-    /// governed screen before any registry work.
+    /// Curation with the injected carrier routes through the real A-31
+    /// fan-in: the accepted candidate carries the kind wire spelling, the
+    /// screened targets reverbatim, routing-record texts naming the sealing
+    /// handler and result digest, the candidate-only ceiling, and denominator
+    /// provenance; the result then renders through the Slice-8 edge to one
+    /// JSONL line that round-trips to the identical view.
     #[test]
-    fn curation_without_screen_names_missing_binding() {
-        let refused = dispatch_admitted(
+    fn curation_success_routes_accepted_candidate_with_provenance() {
+        use crate::result_stage::{project_result_view, render_jsonl};
+        use crate::{JobState, JobView};
+
+        let harness = harness_for_fixture();
+        let result = dispatch_admitted(
             &admission(),
             &semantic_job(JobClass::Curation),
-            None,
+            Some(valid_screen()),
+            Some(harness.carrier()),
             JobClass::Curation,
         );
-        assert!(
-            matches!(
-                refused,
-                Err(DreamerError::InvalidAdmission(CURATION_SCREEN_REFUSAL))
-            ),
-            "curation without a screen must name it, got {refused:?}"
+        let Ok(DreamResult::Curation {
+            job_id,
+            candidates,
+            provenance,
+        }) = result
+        else {
+            panic!("injected-carrier curation must route, got {result:?}");
+        };
+        assert_eq!(candidates.len(), 1);
+        let candidate = &candidates[0];
+        assert_eq!(candidate.candidate_id.len(), 64);
+        assert_eq!(candidate.kind, "classification");
+        assert_eq!(
+            candidate.source_handles,
+            vec!["target-slice-7".to_owned()],
+            "targets must travel reverbatim, got {:?}",
+            candidate.source_handles
         );
+        assert!(
+            candidate
+                .proposed_transformation
+                .contains("eliot-dreamer-classification"),
+            "transformation must name the sealing handler, got {:?}",
+            candidate.proposed_transformation
+        );
+        assert!(
+            candidate.proposed_transformation.contains("result digest"),
+            "transformation must name the sealed result digest, got {:?}",
+            candidate.proposed_transformation
+        );
+        assert_eq!(
+            candidate.uncertainty,
+            "candidate_only; content sealed under result digest"
+        );
+        assert!(
+            !candidate.rollback.trim().is_empty(),
+            "rollback must carry a routing record"
+        );
+        assert_eq!(
+            provenance,
+            vec!["target-slice-7".to_owned()],
+            "provenance must carry the denominator members, got {provenance:?}"
+        );
+        let view = project_result_view(
+            &job_id,
+            JobState::Completed,
+            Some(DreamResult::Curation {
+                job_id: job_id.clone(),
+                candidates: candidates.clone(),
+                provenance: provenance.clone(),
+            }),
+        );
+        let Ok(line) = render_jsonl(&view) else {
+            panic!("curation receipt must render");
+        };
+        assert!(!line.contains('\n'), "receipt must be exactly one line");
+        let roundtrip: JobView = match serde_json::from_str(&line) {
+            Ok(view) => view,
+            Err(error) => panic!("receipt must round-trip, got {error:?}"),
+        };
+        assert_eq!(roundtrip, view);
     }
 
     /// `ResearchSynthesis` and `Maintenance` fail closed naming their missing
@@ -799,8 +1562,7 @@ mod slice_7_native_owner_tests {
             (JobClass::ResearchSynthesis, RESEARCH_PACK_REFUSAL),
             (JobClass::Maintenance, MAINTENANCE_INPUTS_REFUSAL),
         ] {
-            let refused =
-                dispatch_admitted(&admission(), &semantic_job(class), None, class);
+            let refused = dispatch_admitted(&admission(), &semantic_job(class), None, None, class);
             assert!(
                 matches!(refused, Err(DreamerError::InvalidAdmission(got)) if got == reason),
                 "class {class:?} must name its governed input, got {refused:?}"
@@ -826,8 +1588,7 @@ mod slice_7_native_owner_tests {
             JobClass::OrchestrationPlanning,
             JobClass::ConfigurationAssistance,
         ] {
-            let refused =
-                dispatch_admitted(&admission(), &semantic_job(class), None, class);
+            let refused = dispatch_admitted(&admission(), &semantic_job(class), None, None, class);
             assert!(
                 matches!(refused, Err(DreamerError::UnsupportedJobClass(refused_class)) if refused_class == class),
                 "class {class:?} must refuse with UnsupportedJobClass({class:?}), got {refused:?}"
@@ -836,13 +1597,11 @@ mod slice_7_native_owner_tests {
                 refused.as_ref().map_err(DreamerError::code),
                 Err("DREAMER_REQUEST_REJECTED")
             );
-            assert_eq!(
-                format!(
-                    "{}",
-                    refused.expect_err("refused class must fail")
-                ),
-                format!("unsupported Dreamer job class: {class:?}")
-            );
+            let message = match refused {
+                Err(error) => format!("{error}"),
+                Ok(_) => panic!("refused class must fail"),
+            };
+            assert_eq!(message, format!("unsupported Dreamer job class: {class:?}"));
         }
     }
 

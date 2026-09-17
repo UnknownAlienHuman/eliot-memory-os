@@ -3,11 +3,13 @@
 //! End-to-end pipeline proofs for admitted Dreamer jobs (issue #702, Slices
 //! 3-8; #1136 Slice B).
 //!
-//! Threads the admitted stages in canonical order — screen, model, grounding,
-//! validation (non-Curation), dispatch, result — for one Orientation job
-//! (proved packet receipt through the real native projector) and one Curation
-//! job (A-31 routing without class refusal, plus the genuine v2 semantic
-//! gate). Deterministic: no I/O, no sleeps, no process launch, no files. The
+//! Threads the admitted stages in canonical order — screen, then (for
+//! Curation) the execution-carrier check and A-31, or (otherwise) model,
+//! grounding, validation (non-Curation), dispatch, result — for one
+//! Orientation job (proved packet receipt through the real native projector)
+//! and Curation jobs (carrier-gated A-31 routing without class refusal, the
+//! genuine v2 semantic gate, and the injected-carrier success path).
+//! Deterministic: no I/O, no sleeps, no process launch, no files. The
 //! result edge asserts the Slice-8 stdout contract: exactly one JSONL line
 //! that round-trips to the identical view.
 //!
@@ -15,8 +17,9 @@
 //! the Slice-2 controller/bundle stages (merged scope), and the live view
 //! (Kernel transport) frame the chain on both sides. The chain tests below
 //! drive [`run_admitted_pipeline`](crate::run_admitted_pipeline) — the exact
-//! function `submit` calls — so stage order and terminal outcomes are proved
-//! for the same code `submit` executes.
+//! function `submit` calls (production passes `None` for the
+//! Governor-injected Curation carrier) — so stage order and terminal outcomes
+//! are proved for the same code `submit` executes.
 
 use std::num::NonZeroU64;
 
@@ -27,7 +30,9 @@ use eliot_dreamer_contracts::grounding::{GroundedDreamDraft, ModelDraft};
 use crate::admitted_material::{admission_of, validation_input_for};
 use crate::controller::verify_admitted_binding;
 use crate::curation_screen_stage::{ScreenDecision, resolve_screen_inputs};
-use crate::dispatch_stage::dispatch_admitted;
+use crate::dispatch_stage::{
+    CURATION_CARRIER_REFUSAL, curation_test_support::CurationTestHarness, dispatch_admitted,
+};
 use crate::grounding_stage::{ground_admitted_draft, resolve_grounding_inputs};
 use crate::model_stage::{resolve_model_inputs, run_admitted_model};
 use crate::result_stage::{project_result_view, render_jsonl};
@@ -140,7 +145,7 @@ fn orientation_pipeline_threads_screen_to_packet_receipt() {
             .is_empty(),
         "accepted candidate must bind its output digest"
     );
-    let result = dispatch_admitted(&admission, &job, None, JobClass::Orientation);
+    let result = dispatch_admitted(&admission, &job, None, None, JobClass::Orientation);
     let Ok(DreamResult::Packet(packet)) = result else {
         panic!("orientation dispatch must project, got {result:?}");
     };
@@ -167,8 +172,10 @@ fn orientation_pipeline_threads_screen_to_packet_receipt() {
 /// Curation routes to the A-31 sole fan-in without class refusal: the screen
 /// admits a non-empty eligible set, the v2 owner itself directs Curation to
 /// its separate carrier (`UnsupportedJobShape` semantic rejection, never a
-/// shape error), and dispatch names the live-port boundary — never
-/// `UnsupportedJobClass`, never the Kernel-admission code.
+/// shape error), and dispatch without an injected carrier refuses at the
+/// carrier check with the precise reason — never `UnsupportedJobClass`,
+/// never the Kernel-admission code. (The live-port boundary behind the
+/// carrier is proved by the dispatch-level tests, which inject the carrier.)
 #[test]
 fn curation_pipeline_routes_a31_without_class_refusal() {
     let admission = admitted_admission("job-e2e-curation");
@@ -202,21 +209,24 @@ fn curation_pipeline_routes_a31_without_class_refusal() {
         ),
         "curation must take the separate-carrier gate, got {rejected:?}"
     );
-    // A-31 fan-in: precise port-boundary refusal, never a class refusal.
-    let refused = dispatch_admitted(&admission, &job, Some(binding), JobClass::Curation);
+    // A-31 fan-in without an injected carrier: the precise carrier-check
+    // refusal, never a class refusal.
+    let refused = dispatch_admitted(&admission, &job, Some(binding), None, JobClass::Curation);
     assert!(
         !matches!(refused, Err(DreamerError::UnsupportedJobClass(_))),
         "curation must never refuse with UnsupportedJobClass, got {refused:?}"
     );
     let Err(error) = refused else {
-        panic!("curation without injected ports must wait at the boundary");
+        panic!("curation without an injected carrier must refuse at the carrier check");
     };
     assert_eq!(error.code(), "DREAMER_REQUEST_REJECTED");
     assert_ne!(error.code(), KERNEL_ADMISSION_REQUIRED);
-    let message = format!("{error}");
     assert!(
-        message.contains("ports") || message.contains("screen"),
-        "refusal must name the boundary, got {message}"
+        matches!(
+            error,
+            DreamerError::InvalidAdmission(reason) if reason == CURATION_CARRIER_REFUSAL
+        ),
+        "refusal must be exactly the carrier-check reason, got {error:?}"
     );
 }
 
@@ -230,7 +240,7 @@ fn curation_pipeline_routes_a31_without_class_refusal() {
 fn submit_chain_returns_orientation_packet_with_jsonl() {
     let admission = admitted_admission("job-e2e-chain-orientation");
     let job = job_with_handles("job-e2e-chain-orientation", JobClass::Orientation);
-    let result = run_admitted_pipeline(&admission, &job);
+    let result = run_admitted_pipeline(&admission, &job, None);
     let Ok(DreamResult::Packet(packet)) = result else {
         panic!("submit chain must project orientation, got {result:?}");
     };
@@ -245,11 +255,13 @@ fn submit_chain_returns_orientation_packet_with_jsonl() {
     assert_eq!(roundtrip, view);
 }
 
-/// The exact admitted chain `submit` executes, for Curation: the A-20 screen
-/// admits the eligible set and threads its binding into the A-31 fan-in,
-/// which waits at the live-port boundary — with the binding passed, never a
-/// class refusal. This proves no premature gate blocks Curation before the
-/// screen: the chain fails, if at all, only at the terminal owner boundary.
+/// The exact admitted chain `submit` executes, for Curation without an
+/// injected carrier: the A-20 screen admits the eligible set, then the
+/// carrier check refuses with exactly [`CURATION_CARRIER_REFUSAL`] — right
+/// after the screen, BEFORE any model/grounding work. This proves no
+/// premature gate blocks Curation before the screen, and no generic stage
+/// burns before the refusal: the chain fails only at the carrier check,
+/// never with a class refusal and never silently.
 #[test]
 fn submit_chain_threads_screen_binding_to_a31_boundary() {
     let admission = admitted_admission("job-e2e-chain-curation");
@@ -267,20 +279,146 @@ fn submit_chain_threads_screen_binding_to_a31_boundary() {
     binding
         .validate()
         .expect("threaded binding must satisfy the real owner check");
-    // The whole chain then reaches the terminal A-31 boundary with that
-    // binding threaded through — never a class refusal, never silent.
-    let refused = run_admitted_pipeline(&admission, &job);
+    // The whole chain then refuses at the carrier check with the exact
+    // reason — never a class refusal, never silent, never the Kernel code.
+    let refused = run_admitted_pipeline(&admission, &job, None);
     assert!(
         !matches!(refused, Err(DreamerError::UnsupportedJobClass(_))),
         "chain must never refuse curation by class, got {refused:?}"
     );
     let Err(error) = refused else {
-        panic!("curation without injected ports must wait at the boundary");
+        panic!("curation without an injected carrier must refuse at the carrier check");
     };
+    assert!(
+        matches!(
+            error,
+            DreamerError::InvalidAdmission(reason) if reason == CURATION_CARRIER_REFUSAL
+        ),
+        "chain must refuse with exactly the carrier-check reason, got {error:?}"
+    );
     assert_eq!(error.code(), "DREAMER_REQUEST_REJECTED");
     assert_ne!(error.code(), KERNEL_ADMISSION_REQUIRED);
     assert!(
-        format!("{error}").contains("ports"),
-        "chain must end at the live-port boundary, got {error:?}"
+        !matches!(error, DreamerError::KernelAdmissionRequired(_)),
+        "chain refusal must not borrow the Kernel-admission code, got {error:?}"
     );
+}
+
+/// The exact admitted chain `submit` executes, for Curation with a
+/// Governor-injected carrier: the screen admits, the carrier check passes,
+/// and A-31 routes to a `Curation` result whose candidates carry non-blank
+/// identity and handles. The Slice-8 edge then projects the result view and
+/// proves the single-line JSONL round-trip, so the Curation terminal edge is
+/// proved exactly like the Orientation one.
+#[test]
+fn submit_chain_curation_success_with_injected_carrier() {
+    let admission = admitted_admission("job-e2e-chain-curation-ok");
+    let job = job_with_handles("job-e2e-chain-curation-ok", JobClass::Curation);
+    let ScreenDecision::Screened {
+        eligible_targets,
+        binding,
+        ..
+    } = resolve_screen_inputs(&admission, &job).expect("chain screen must admit")
+    else {
+        panic!("curation must screen, not pass through");
+    };
+    assert!(!eligible_targets.is_empty());
+    binding
+        .validate()
+        .expect("threaded binding must satisfy the real owner check");
+    let harness =
+        CurationTestHarness::for_screen(&binding, &admission, &job).expect("harness must build");
+    let result = run_admitted_pipeline(&admission, &job, Some(harness.carrier()));
+    let Ok(DreamResult::Curation {
+        job_id,
+        candidates,
+        provenance,
+    }) = result
+    else {
+        panic!("injected-carrier chain must route curation, got {result:?}");
+    };
+    let canonical = admission_of(&admission, &job)
+        .expect("e2e admission must derive")
+        .canonical_id();
+    assert_eq!(job_id, canonical);
+    assert!(
+        !candidates.is_empty(),
+        "a routed curation must name candidates"
+    );
+    for candidate in &candidates {
+        assert!(
+            !candidate.candidate_id.trim().is_empty(),
+            "every candidate must carry a non-blank id"
+        );
+        assert!(
+            !candidate.kind.trim().is_empty(),
+            "every candidate must carry a non-blank kind"
+        );
+        assert!(
+            !candidate.source_handles.is_empty(),
+            "every candidate must carry source handles"
+        );
+        for handle in &candidate.source_handles {
+            assert!(
+                !handle.trim().is_empty(),
+                "every candidate handle must be non-blank"
+            );
+        }
+    }
+    let view = project_result_view(
+        &job_id,
+        JobState::Completed,
+        Some(DreamResult::Curation {
+            job_id: job_id.clone(),
+            candidates: candidates.clone(),
+            provenance: provenance.clone(),
+        }),
+    );
+    let line = render_jsonl(&view).expect("chain receipt must render");
+    assert!(!line.contains('\n'), "chain receipt must be one JSONL line");
+    let roundtrip: crate::JobView =
+        serde_json::from_str(&line).expect("chain receipt must round-trip");
+    assert_eq!(roundtrip, view);
+}
+
+/// The carrier check runs before any generic stage: for a fully valid
+/// Curation job (the success twin proves model/grounding would pass this
+/// input), the carrier-less chain refuses with exactly
+/// [`CURATION_CARRIER_REFUSAL`] — no generic grounding runs only to fail
+/// later at the port boundary. The refusal site is structural:
+/// `run_admitted_pipeline` checks the carrier immediately after the screen,
+/// textually before any model/grounding call. The dispatch-level check
+/// refuses identically.
+#[test]
+fn submit_chain_curation_stops_before_generic_stages_without_carrier() {
+    let admission = admitted_admission("job-e2e-chain-curation-early");
+    let job = job_with_handles("job-e2e-chain-curation-early", JobClass::Curation);
+    // Chain level: the screen admits, then the carrier check refuses before
+    // any generic model/grounding work could run.
+    let refused = run_admitted_pipeline(&admission, &job, None);
+    let Err(error) = refused else {
+        panic!("carrier-less curation must refuse at the carrier check");
+    };
+    assert!(
+        matches!(
+            error,
+            DreamerError::InvalidAdmission(reason) if reason == CURATION_CARRIER_REFUSAL
+        ),
+        "chain must refuse with exactly the carrier-check reason, got {error:?}"
+    );
+    assert_eq!(error.code(), "DREAMER_REQUEST_REJECTED");
+    assert_ne!(error.code(), KERNEL_ADMISSION_REQUIRED);
+    // Dispatch level: the same missing carrier refuses with the same reason.
+    let refused = dispatch_admitted(&admission, &job, None, None, JobClass::Curation);
+    let Err(error) = refused else {
+        panic!("carrier-less dispatch must refuse at the carrier check");
+    };
+    assert!(
+        matches!(
+            error,
+            DreamerError::InvalidAdmission(reason) if reason == CURATION_CARRIER_REFUSAL
+        ),
+        "dispatch must refuse with exactly the carrier-check reason, got {error:?}"
+    );
+    assert_eq!(error.code(), "DREAMER_REQUEST_REJECTED");
 }

@@ -84,10 +84,13 @@ pub(crate) enum ValidationInputs {
     /// Admitted non-Orientation classes (`ResearchSynthesis`, `Maintenance`,
     /// `Curation`): no per-class validation shape yet.
     ///
-    /// `Curation` maps here but reaches validation only through the
-    /// `dispatch_stage` direct pipeline in end-to-end wiring: `submit`'s
-    /// Slice-A gate still refuses it at entry, so this arm never admits
-    /// Curation past the binary front door on its own.
+    /// `Curation` maps here, but the admitted chain never sends it through
+    /// common A-05 validation: Slice-A admits Curation since Wave S2 (#966),
+    /// `submit` threads it screen → carrier-check → A-31, and the A-05 owner
+    /// itself directs Curation to its separate carrier (`UnsupportedJobShape`
+    /// semantic rejection). This arm maps the class by owner rule — it is the
+    /// chain order, not a gate refusal, that keeps Curation out of the
+    /// generic validation path.
     OtherAdmitted,
 }
 
@@ -328,9 +331,10 @@ mod slice_6_validation_tests {
     /// variant and the request-rejected code, never the Kernel-admission
     /// code. Dispatch already refused these classes; this arm is defense in
     /// depth if one ever reaches the seam. `Curation` is not in this set: it
-    /// maps to the shared admitted arm (it reaches validation only via the
-    /// `dispatch_stage` direct pipeline in end-to-end wiring, while `submit`'s
-    /// Slice-A gate still refuses it at entry).
+    /// maps to the shared admitted arm (Slice-A admits it since Wave S2
+    /// (#966) and the chain threads it screen → carrier-check → A-31, so it
+    /// never reaches common A-05 validation in production — by chain order,
+    /// not by gate refusal).
     #[test]
     fn refused_classes_return_unsupported_job_class() {
         for class in [
@@ -405,9 +409,10 @@ mod slice_6_validation_tests {
     }
 
     /// Other admitted classes map to the shared arm with no per-class shape.
-    /// `Curation` maps here as well: it reaches validation only via the
-    /// `dispatch_stage` direct pipeline in end-to-end wiring, while `submit`'s
-    /// Slice-A gate still refuses it at entry.
+    /// `Curation` maps here as well: Slice-A admits it since Wave S2 (#966)
+    /// and the chain threads it screen → carrier-check → A-31, so production
+    /// never routes it through common A-05 validation — by chain order and
+    /// the owner `UnsupportedJobShape` rule, not by gate refusal.
     #[test]
     fn other_admitted_classes_map_to_shared_arm() {
         for class in [
