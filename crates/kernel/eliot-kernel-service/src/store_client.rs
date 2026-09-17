@@ -841,12 +841,16 @@ mod tests {
                     if matches!(self.fault, SnapshotFault::Unavailable) {
                         self.pending = Some(Self::response(
                             connection_id,
-                            response_id,
+                            response_id.clone(),
                             StoreResponse::Failure {
                                 failure: StoreFailure::from_store_error(
                                     StoreError::Unavailable,
                                     StoreFailureIdentityContext {
-                                        request_id: None,
+                                        // A same-identity retry directive is
+                                        // only valid with exact request or
+                                        // idempotency evidence, so the failure
+                                        // carries the request it answers.
+                                        request_id: Some(response_id.clone()),
                                         operation_id: None,
                                         idempotency_key_ref_or_digest: None,
                                         state_fence_ref_or_exact_safe_projection: Some(
