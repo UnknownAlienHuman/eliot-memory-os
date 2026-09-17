@@ -166,6 +166,9 @@ members = [
   "crates/smart/eliot-dreamer-accessibility",  # agent_order 29
   "crates/smart/eliot-dreamer-memory-repair",  # agent_order 30
   "crates/smart/eliot-dreamer-curation",  # agent_order 31
+  "crates/smart/eliot-dreamer-clarification",  # agent_order 7
+  "crates/smart/eliot-dreamer-architecture-brief",  # agent_order 8
+  "crates/smart/eliot-dreamer-implementation-brief",  # agent_order 9
 ]
 
 # Capability cells declared by `[package.metadata.eliot]` with `agent_order`
@@ -180,9 +183,6 @@ members = [
 # Single-cell admission (#806/T8-A806) follows the same serialized turn for
 # eliot-dreamer-cycle (standalone nonmember; never in `exclude`).
 exclude = [
-  "crates/smart/eliot-dreamer-clarification",  # agent_order 7
-  "crates/smart/eliot-dreamer-architecture-brief",  # agent_order 8
-  "crates/smart/eliot-dreamer-implementation-brief",  # agent_order 9
   "crates/smart/eliot-learning-state-view",  # agent_order 33
   "crates/smart/eliot-learning-delta",  # agent_order 34
   "crates/smart/eliot-learning-overlay",  # agent_order 35
