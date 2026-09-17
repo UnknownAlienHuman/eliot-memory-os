@@ -26,10 +26,12 @@
 //! through the `for_test` port — closed test transport, matching
 //! material/admission fixtures, and an optional counting carrier source — so
 //! the screen-first carrier refusal, the A-31 exactly-once run up to the
-//! closed front door, the refused-class gate, and the Slice-2 controller gate
+//! closed front door, the live-bound success tail returning the Curation
+//! result view, the refused-class gate, and the Slice-2 controller gate
 //! are proved on the same code production executes.
 
 use std::num::NonZeroU64;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use eliot_contracts::{EpochId, EpochLineageId, ResourceGeneration, StateFence};
 use eliot_dreamer_claim_grounding::GroundingRequest;
@@ -48,8 +50,9 @@ use crate::dispatch_stage::{
     dispatch_admitted,
 };
 use crate::kernel_port::{
-    ClaimTransport, DispatchGrant, KernelPortError, ValidatedDreamerMaterial,
+    ClaimTransport, DREAMER_JOB_WIRE_ID, DispatchGrant, KernelPortError, ValidatedDreamerMaterial,
 };
+use eliot_protocol::dreamer_job::{DurableJobRequest, JobOperation, JobRole};
 use crate::grounding_stage::{ground_admitted_draft, resolve_grounding_inputs};
 use crate::model_stage::{resolve_model_inputs, run_admitted_model};
 use crate::result_stage::{project_result_view, render_jsonl};
@@ -772,5 +775,239 @@ fn submit_orientation_stops_at_controller_gate() {
     assert!(
         !matches!(error, DreamerError::KernelAdmissionRequired(_)),
         "the controller gate must precede any transport contact, got {error:?}"
+    );
+}
+
+/// Echo claim transport for the public-path success proof: binds identity,
+/// then answers the live-tail `STATUS` observation by echoing the submitted
+/// request — never hardcoded job ids.
+///
+/// Mirrors the `kernel_port.rs` fake's `STATUS` answer shape (`RUNNING` state,
+/// null disposition, null receipt) but derives every binding from the decoded
+/// request: job/attempt/revision echo the `Status` operation, the fence echoes
+/// the operation fence, and the lease pins the echoed attempt under the echoed
+/// generation with a fresh wall-clock pin. The scope id rides from the test
+/// material (the `Status` operation carries no scope field, so there is
+/// nothing to echo); every other binding is request-derived. Any non-`STATUS`
+/// kind fails closed: `submit`'s live tail only ever sends `STATUS`.
+struct SuccessClaimTransport {
+    scope_id: String,
+}
+
+impl SuccessClaimTransport {
+    /// Binds the scope the echoed `STATUS` reply projects: the `Status`
+    /// operation carries job/attempt/revision/fence but no scope, so the
+    /// material scope travels here instead of being invented per reply.
+    fn for_scope(scope_id: &str) -> Self {
+        Self {
+            scope_id: scope_id.to_owned(),
+        }
+    }
+
+    /// Decodes and validates the submitted request from the wire payload,
+    /// like the `kernel_port.rs` fake's `submitted_request`: the closed wire
+    /// id selects the route, the typed `request` field must decode and
+    /// validate, and only the worker claim arm answers.
+    fn submitted_request(
+        payload: &serde_json::Value,
+    ) -> Result<DurableJobRequest, KernelPortError> {
+        let denied = |detail: String| KernelPortError::Transport(detail);
+        if payload.get("operation").and_then(serde_json::Value::as_str)
+            != Some(DREAMER_JOB_WIRE_ID)
+        {
+            return Err(denied(
+                "success transport admits only the dreamer job wire".to_owned(),
+            ));
+        }
+        let request_value = payload.get("request").cloned().ok_or_else(|| {
+            denied("success transport payload carries no typed request".to_owned())
+        })?;
+        let request: DurableJobRequest =
+            serde_json::from_value(request_value).map_err(|error| denied(error.to_string()))?;
+        request
+            .validate()
+            .map_err(|error| denied(error.to_string()))?;
+        if request.role != JobRole::Worker {
+            return Err(denied(
+                "success transport admits only the worker claim arm".to_owned(),
+            ));
+        }
+        Ok(request)
+    }
+
+    /// Answers one `STATUS` observation by echoing the submitted request into
+    /// the fake's `RUNNING` reply shape: exact identity echo, echoed
+    /// job/attempt/revision/scope/fence bindings, and the echoed lease pin
+    /// with a fresh wall-clock interval (`issued_at` < `expires_at`, expiry in
+    /// the future). Any other operation kind fails closed.
+    fn status_reply(
+        &self,
+        request: &DurableJobRequest,
+    ) -> Result<serde_json::Value, KernelPortError> {
+        let denied = |detail: String| KernelPortError::Transport(detail);
+        let JobOperation::Status {
+            job_id,
+            attempt_id,
+            expected_revision,
+            expected_fence,
+        } = &request.operation
+        else {
+            return Err(denied(
+                "success transport admits only the STATUS observation".to_owned(),
+            ));
+        };
+        let fence_json =
+            serde_json::to_value(expected_fence).map_err(|error| denied(error.to_string()))?;
+        let generation = fence_json.get("resource_generation").cloned().ok_or_else(|| {
+            denied("echoed fence carries no resource generation".to_owned())
+        })?;
+        let identity_json = serde_json::to_value(&request.request_identity)
+            .map_err(|error| denied(error.to_string()))?;
+        let product_id = request
+            .request_identity
+            .request
+            .request
+            .metadata
+            .product_id
+            .as_str()
+            .to_owned();
+        let now_ms = u64::try_from(
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map_or(0, |elapsed| elapsed.as_millis()),
+        )
+        .unwrap_or(0);
+        let issued_at = now_ms.saturating_sub(1_000).max(1);
+        let expires_at = now_ms
+            .saturating_add(60_000)
+            .max(issued_at.saturating_add(1));
+        let lease = serde_json::json!({
+            "job_id": job_id.as_str(),
+            "attempt_id": attempt_id.as_str(),
+            "lease_id": {
+                "namespace": "eliot.governor.work-lease",
+                "revision": "v1",
+                "value": format!("{}-lease", attempt_id.as_str()),
+            },
+            "owner_artifact_id": attempt_id.as_str(),
+            "resource_generation": generation.clone(),
+            "state_fence": fence_json.clone(),
+            "issued_at_unix_ms": issued_at,
+            "expires_at_unix_ms": expires_at,
+            "revision": expected_revision,
+        });
+        Ok(serde_json::json!({
+            "request_identity": identity_json,
+            "job_id": job_id.as_str(),
+            "attempt_id": attempt_id.as_str(),
+            "scope": {
+                "scope_id": self.scope_id.as_str(),
+                "product_id": product_id,
+                "resource_generation": generation,
+                "state_fence": fence_json,
+            },
+            "revision": expected_revision,
+            "state": "RUNNING",
+            "disposition": null,
+            "receipt_id": null,
+            "lease": lease,
+            "checkpoint": null,
+            "result_under_verification": null,
+            "outcome": null,
+            "selection_coverage": [],
+            "selection_frontier": null,
+        }))
+    }
+}
+
+impl ClaimTransport for SuccessClaimTransport {
+    fn bind_identity(
+        &mut self,
+        _fence: &StateFence,
+        _operation_id: &str,
+    ) -> Result<(), KernelPortError> {
+        Ok(())
+    }
+
+    fn transact(
+        &mut self,
+        operation: &str,
+        payload: serde_json::Value,
+    ) -> Result<serde_json::Value, KernelPortError> {
+        if operation != DREAMER_JOB_WIRE_ID {
+            return Err(KernelPortError::Transport(
+                "success transport admits only the dreamer job wire".to_owned(),
+            ));
+        }
+        let request = Self::submitted_request(&payload)?;
+        self.status_reply(&request)
+    }
+}
+
+/// The public `submit` path with an injected carrier and a live-bound echo
+/// transport succeeds end to end: the screen admits, A-31 routes exactly
+/// once, and the live tail observes `RUNNING` from the echoed `STATUS` reply,
+/// so `submit` returns `Ok` with the Kernel-owned state and the computed
+/// Curation result attached. The closed-transport twin proves the fail-closed
+/// tail; this test proves the success tail on the same code production
+/// executes.
+#[test]
+fn submit_curation_with_source_succeeds_with_curation_result_view() {
+    let job_id = "job-e2e-submit-curation-live";
+    let material = submit_material(job_id);
+    let admission = submit_admission(&material);
+    let job = single_target_job(job_id);
+    let source = TestCarrierSource::new();
+    let mut port = AuthenticatedKernelJobPort::for_test(
+        material.clone(),
+        admission.clone(),
+        Box::new(SuccessClaimTransport::for_scope(&material.scope_id)),
+        Some(&source),
+    )
+    .expect("test port must construct");
+    let view = <AuthenticatedKernelJobPort as KernelJobPort>::submit(&mut port, &admission, &job)
+        .expect("curation submit with a live-bound transport must succeed");
+    assert_eq!(view.state, JobState::Running);
+    assert_eq!(view.job_id.as_str(), job_id);
+    let Some(DreamResult::Curation {
+        job_id: result_job_id,
+        candidates,
+        ..
+    }) = view.result
+    else {
+        panic!("curation submit must project a curation result view, got {view:?}");
+    };
+    let canonical = admission_of(&admission, &job)
+        .expect("e2e admission must derive")
+        .canonical_id();
+    assert_eq!(result_job_id, canonical);
+    assert!(
+        !candidates.is_empty(),
+        "a routed curation must name candidates"
+    );
+    for candidate in &candidates {
+        assert!(
+            !candidate.candidate_id.trim().is_empty(),
+            "every candidate must carry a non-blank id"
+        );
+        assert!(
+            !candidate.kind.trim().is_empty(),
+            "every candidate must carry a non-blank kind"
+        );
+        assert!(
+            !candidate.source_handles.is_empty(),
+            "every candidate must carry source handles"
+        );
+        for handle in &candidate.source_handles {
+            assert!(
+                !handle.trim().is_empty(),
+                "every candidate handle must be non-blank"
+            );
+        }
+    }
+    assert_eq!(
+        source.calls(),
+        1,
+        "A-31 must invoke the routed handler exactly once"
     );
 }
