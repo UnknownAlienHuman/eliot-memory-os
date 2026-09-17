@@ -6,6 +6,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use eliot_cli::kernel_client::{KernelClient, KernelClientError};
 use eliot_contracts::StateFence;
+use eliot_dreamer_contracts::ContractViolation;
+use eliot_dreamer_contracts::registry::{CurationHandlerRegistry, canonical_registry};
 use eliot_protocol::dreamer_job::{DurableJobResponse, JobState as ProtocolJobState};
 use serde::{Deserialize, Serialize};
 
@@ -316,18 +318,46 @@ fn dispatch_class(class: JobClass) -> ClassArm {
     }
 }
 
-/// Slice-1 admission dispatch: Slice-A gate, then the distinct per-class arm.
+/// Slice-1 admission dispatch: Slice-A gate, then the distinct per-class arm,
+/// then the owner-published canonical registry validation (Slice 1c, #702).
 ///
 /// Runs first in [`AuthenticatedKernelJobPort::submit`], before
 /// `check_claimed`/`live_view`, so refused classes fail closed with a typed
 /// refusal before any leaf runs and before any Kernel-facing call. The
 /// Slice-A gate is the sole refusal authority: refused classes return before
-/// the arm is routed, so there is no second refusal mapping to diverge.
-/// Returns the routed arm; no handler is invoked on any path.
-fn dispatch_admission(job: &DreamJobInput) -> Result<ClassArm, DreamerError> {
+/// the arm is routed and before any registry work, so there is no second
+/// refusal mapping to diverge and no registry cost on refusal.
+///
+/// Admitted classes validate the owner value only —
+/// [`canonical_registry()`](canonical_registry) once, then its
+/// [`validate_closure`](CurationHandlerRegistry::validate_closure), then its
+/// [`digest`](CurationHandlerRegistry::digest) — with no local handler-ID
+/// table, no separate kind-coverage pass, and no direct `handlers` iteration:
+/// kind coverage is proved by the owner's closure check, not daemon-side.
+/// Returns the routed arm with the stable registry digest; no handler is
+/// invoked on any path.
+fn dispatch_admission(job: &DreamJobInput) -> Result<(ClassArm, String), DreamerError> {
+    dispatch_admission_with(job, canonical_registry)
+}
+
+/// Admission dispatch with an injectable canonical-registry provider.
+///
+/// Production passes
+/// [`canonical_registry()`](canonical_registry); deterministic tests pass a
+/// counting wrapper around it to prove the owner validation runs exactly once
+/// per admitted admission and never on refusal.
+fn dispatch_admission_with(
+    job: &DreamJobInput,
+    canonical: impl Fn() -> Result<CurationHandlerRegistry, ContractViolation>,
+) -> Result<(ClassArm, String), DreamerError> {
     refuse_unsupported_job_class(job)?;
     let arm = dispatch_class(job.job_class);
-    Ok(arm)
+    let not_closed =
+        |violation: ContractViolation| DreamerError::RegistryNotClosed(violation.to_string());
+    let registry = canonical().map_err(not_closed)?;
+    registry.validate_closure().map_err(not_closed)?;
+    let digest = registry.digest().map_err(not_closed)?;
+    Ok((arm, digest))
 }
 
 impl KernelJobPort for AuthenticatedKernelJobPort {
@@ -341,9 +371,11 @@ impl KernelJobPort for AuthenticatedKernelJobPort {
         job: &DreamJobInput,
     ) -> Result<JobView, DreamerError> {
         // Slice-1 admission dispatch runs the Slice-A gate first, then routes
-        // the distinct per-class arm — all before `check_claimed`/`live_view`,
-        // which remain the only Kernel-facing calls on this path.
-        let _arm = dispatch_admission(job)?;
+        // the distinct per-class arm and validates the owner canonical
+        // registry with its digest — all before `check_claimed`/`live_view`,
+        // which remain the only Kernel-facing calls on this path. The arm and
+        // digest are carried for later slices; this slice routes only.
+        let (_arm, _digest) = dispatch_admission(job)?;
         self.check_claimed(admission)?;
         self.live_view()
     }
@@ -1024,9 +1056,10 @@ mod slice_1_dispatch_tests {
         assert_eq!(arms.len(), 9, "all nine arms must be distinct");
     }
 
-    /// Each admitted class dispatches to its distinct admitted arm. No
-    /// digest or validation is performed here: the follow-up issue owns the
-    /// owner-provided registry API.
+    /// Each admitted class dispatches to its distinct admitted arm with the
+    /// owner registry digest: the Slice 1c step validates the
+    /// owner-published canonical registry and returns its stable digest
+    /// alongside the arm.
     #[test]
     fn admitted_classes_dispatch_to_admitted_arms() {
         for class in [
@@ -1034,15 +1067,90 @@ mod slice_1_dispatch_tests {
             JobClass::ResearchSynthesis,
             JobClass::Maintenance,
         ] {
-            let arm =
+            let (arm, digest) =
                 dispatch_admission(&job_of_class(class)).expect("admitted class must dispatch");
             assert_eq!(dispatch_class(class), arm);
+            assert!(!digest.is_empty(), "admitted arm must carry a registry digest");
         }
-        let first = dispatch_admission(&job_of_class(JobClass::Orientation))
+        let (first_arm, first_digest) = dispatch_admission(&job_of_class(JobClass::Orientation))
             .expect("admitted class must dispatch");
-        let second = dispatch_admission(&job_of_class(JobClass::Orientation))
+        let (second_arm, second_digest) = dispatch_admission(&job_of_class(JobClass::Orientation))
             .expect("admitted class must dispatch");
-        assert_eq!(first, second, "dispatch must be deterministic");
+        assert_eq!(first_arm, second_arm, "dispatch must be deterministic");
+        assert_eq!(
+            first_digest, second_digest,
+            "registry digest must be stable across admissions"
+        );
+    }
+
+    /// The owner registry validation runs exactly once per admitted admission:
+    /// one `canonical_registry()` provider call, then the owner's
+    /// `validate_closure()` and `digest()` on that same value. The counting
+    /// wrapper drives the production helper, so the count proves the call
+    /// shape rather than a second implementation.
+    #[test]
+    fn admitted_arm_validates_owner_registry_exactly_once() {
+        use std::sync::atomic::{AtomicU64, Ordering};
+
+        use eliot_dreamer_contracts::registry::canonical_registry;
+
+        let calls = AtomicU64::new(0);
+        let provider = || {
+            calls.fetch_add(1, Ordering::SeqCst);
+            canonical_registry()
+        };
+        let (arm, digest) = dispatch_admission_with(&job_of_class(JobClass::Orientation), provider)
+            .expect("admitted class must dispatch");
+        assert_eq!(arm, ClassArm::OrientationAdmitted);
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            1,
+            "owner registry must be published exactly once per admission"
+        );
+        let owner_digest = canonical_registry()
+            .expect("canonical registry composes")
+            .digest()
+            .expect("closed registry digests");
+        assert_eq!(
+            digest, owner_digest,
+            "admission digest must be the owner digest, not a local value"
+        );
+    }
+
+    /// Refused classes return at the Slice-A gate with no registry work: the
+    /// provider is never called, so refusal costs no validation and performs
+    /// zero Kernel-facing calls (the dispatch takes only `&DreamJobInput`,
+    /// and `submit` runs it before `check_claimed`/`live_view`).
+    #[test]
+    fn refused_arms_do_no_registry_work() {
+        use std::sync::atomic::{AtomicU64, Ordering};
+
+        use eliot_dreamer_contracts::registry::canonical_registry;
+
+        for class in [
+            JobClass::Curation,
+            JobClass::Clarification,
+            JobClass::ArchitectureSelfQuery,
+            JobClass::DevelopmentDiagnosis,
+            JobClass::OrchestrationPlanning,
+            JobClass::ConfigurationAssistance,
+        ] {
+            let calls = AtomicU64::new(0);
+            let provider = || {
+                calls.fetch_add(1, Ordering::SeqCst);
+                canonical_registry()
+            };
+            let refused = dispatch_admission_with(&job_of_class(class), provider);
+            assert!(
+                matches!(refused, Err(DreamerError::UnsupportedJobClass(refused_class)) if refused_class == class),
+                "class {class:?} must refuse with UnsupportedJobClass({class:?})"
+            );
+            assert_eq!(
+                calls.load(Ordering::SeqCst),
+                0,
+                "refused class {class:?} must do no registry work"
+            );
+        }
     }
 
     /// Each refused class fails closed at the Slice-A gate with the exact
