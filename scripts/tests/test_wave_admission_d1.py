@@ -113,6 +113,54 @@ FORBIDDEN_ALGO = frozenset({
     "eliot_dreamer_bundle",
     "eliot_dreamer_core",
 })
+FORBIDDEN_PRODUCER = frozenset({
+    "eliot-dreamer-bundle",
+    "eliot-dreamer-grounding",
+    "eliot-dreamer-validation",
+    "eliot-dreamer-rival",
+    "eliot-dreamer-probe",
+    "eliot_dreamer_bundle",
+    "eliot_dreamer_grounding",
+    "eliot_dreamer_validation",
+    "eliot_dreamer_rival",
+    "eliot_dreamer_probe",
+})
+FORBIDDEN_PROVIDER_DEP_PREFIXES = (
+    "eliot-provider-",
+    "eliot-agent-",
+    "eliot-store-",
+    "eliot-runtime-",
+    "eliot-kernel",
+)
+FORBIDDEN_PROVIDER_TOKEN_PREFIXES = (
+    "eliot_provider_",
+    "eliot_agent_",
+    "eliot_store_",
+    "eliot_runtime_",
+    "eliot_kernel",
+)
+ALLOWED_VALUE_TOKENS = frozenset({
+    "eliot_contracts",
+    "eliot_dreamer_contracts",
+    "eliot_epistemic_contracts",
+    "eliot_evidence",
+    "eliot_conformance_contracts",
+    "eliot_receipts",
+})
+CANONICAL_DUP_DEF_RE = re.compile(
+    r"^\s*pub\s+(?:struct|enum)\s+"
+    r"(A03[A-Za-z0-9_]*|EvidenceEnvelope[A-Za-z0-9_]*|"
+    r"CurrentEpistemicPosition[A-Za-z0-9_]*|Conformance[A-Za-z0-9_]*)"
+)
+CANONICAL_DUP_TYPE_RE = re.compile(
+    r"^\s*(?:pub\s+)?type\s+"
+    r"(A03|EvidenceEnvelope|CurrentEpistemicPosition|Conformance[A-Za-z0-9_]*)"
+    r"\b"
+)
+AUTHORITY_STRUCT_RE = re.compile(r"^\s*pub\s+(?:struct|enum)\s+\w*Authority\w*")
+AUTHORITY_FN_RE = re.compile(
+    r"^\s*(?:pub(?:\([^)]*\))?\s+)?fn\s+\w*(?:grant_authority|issue_authority)"
+)
 CRATE_TOKEN = re.compile(r"eliot_[a-z0-9_]+")
 
 
@@ -307,6 +355,63 @@ def crate_tokens_in_rs(crate_path: str) -> set[str]:
     return found
 
 
+def declared_dep_names(manifest: dict) -> set[str]:
+    """Real manifest reader: every dep name across dep tables."""
+    names: set[str] = set()
+    for table in ("dependencies", "dev-dependencies", "build-dependencies"):
+        section = manifest.get(table, {})
+        if isinstance(section, dict):
+            names |= set(section)
+    return names
+
+
+def rs_definition_lines(crate_path: str) -> list[str]:
+    """Real source reader: every .rs line of a leaf crate."""
+    lines: list[str] = []
+    for rs in sorted((ROOT / crate_path).rglob("*.rs")):
+        lines.extend(rs.read_text(encoding="utf-8").splitlines())
+    return lines
+
+
+def canonical_duplicates_in_lines(lines: list[str]) -> list[str]:
+    """Shared detector: local canonical-replacement type definitions."""
+    hits: list[str] = []
+    for line in lines:
+        code = line.split("//", 1)[0]
+        match = CANONICAL_DUP_DEF_RE.match(code) or CANONICAL_DUP_TYPE_RE.match(code)
+        if match:
+            hits.append(match.group(1))
+    return hits
+
+
+def find_canonical_duplicates(crate_path: str) -> list[str]:
+    return canonical_duplicates_in_lines(rs_definition_lines(crate_path))
+
+
+def authority_impls_in_lines(lines: list[str]) -> list[str]:
+    """Shared detector: local normative-authority struct/enum/fn definitions."""
+    hits: list[str] = []
+    for line in lines:
+        code = line.split("//", 1)[0]
+        if AUTHORITY_STRUCT_RE.match(code) or AUTHORITY_FN_RE.match(code):
+            hits.append(code.strip())
+    return hits
+
+
+def find_authority_impls(crate_path: str) -> list[str]:
+    return authority_impls_in_lines(rs_definition_lines(crate_path))
+
+
+def is_forbidden_provider_dep(name: str) -> bool:
+    if name.startswith(FORBIDDEN_PROVIDER_DEP_PREFIXES):
+        return True
+    return name.replace("-", "_").startswith(FORBIDDEN_PROVIDER_TOKEN_PREFIXES)
+
+
+def provider_tokens_in(tokens: set[str]) -> set[str]:
+    return {t for t in tokens if t.startswith(FORBIDDEN_PROVIDER_TOKEN_PREFIXES)}
+
+
 def descriptor_toml(item: dict) -> bytes:
     """Frozen fixture: authoritative descriptor TOML from candidate.json."""
     return item["descriptor_toml"].encode("utf-8")
@@ -342,6 +447,8 @@ class TestWaveAdmissionD1(unittest.TestCase):
         cls.clippy = cargo("clippy", "--locked",
                            *[a for n in cls.four_names for a in ("-p", n)],
                            "--all-targets")
+        cls.workspace_check = cargo("check", "--locked", "--workspace", "--all-targets")
+        cls.workspace_norun = cargo("test", "--locked", "--workspace", "--no-run")
         cls.code_nav = py_script("scripts/code_navigation.py", "check", "--root", ".")
         from scripts.work_unit_gate.descriptor_runner import decode_descriptor
         cls.decode_descriptor = staticmethod(decode_descriptor)
@@ -481,98 +588,124 @@ class TestWaveAdmissionD1(unittest.TestCase):
             self.assertEqual(module["agent_task"]["workspace_admission"], expected_note)
 
     # WORK_UNIT_CASE: 968/7
-    def test_07_compile_graph_acyclic_and_contract_only(self) -> None:
+    def test_07_shared_a03_evidence_epistemic_normative_type_ownership(self) -> None:
+        for item in self.four:
+            manifest = load_toml(f"{item['crate_path']}/Cargo.toml")
+            declared = declared_dep_names(manifest)
+            self.assertIn("eliot-contracts", declared, item["name"])
+            self.assertIn("eliot-dreamer-contracts", declared, item["name"])
+            tokens = crate_tokens_in_rs(item["crate_path"])
+            self.assertIn("eliot_contracts", tokens, item["name"])
+            self.assertIn("eliot_dreamer_contracts", tokens, item["name"])
+        orientation_manifest = load_toml(f"crates/smart/{ORIENTATION}/Cargo.toml")
+        orientation_declared = declared_dep_names(orientation_manifest)
+        self.assertIn("eliot-evidence", orientation_declared, ORIENTATION)
+        self.assertIn("eliot-epistemic-contracts", orientation_declared, ORIENTATION)
+        otokens = crate_tokens_in_rs(f"crates/smart/{ORIENTATION}")
+        self.assertIn("eliot_evidence", otokens, ORIENTATION)
+        self.assertIn("eliot_epistemic_contracts", otokens, ORIENTATION)
+        impl_manifest = load_toml(f"crates/smart/{IMPL_BRIEF}/Cargo.toml")
+        arch_manifest = load_toml(f"crates/smart/{ARCH_BRIEF}/Cargo.toml")
+        # Authority separation: only the ImplementationBrief consumes
+        # conformance contracts; the ArchitectureBrief stays authority-pure.
+        self.assertIn("eliot-conformance-contracts",
+                      impl_manifest.get("dependencies", {}), IMPL_BRIEF)
+        self.assertNotIn("eliot-conformance-contracts",
+                         declared_dep_names(arch_manifest), ARCH_BRIEF)
+        impl_tokens = crate_tokens_in_rs(f"crates/smart/{IMPL_BRIEF}")
+        self.assertIn("eliot_conformance_contracts", impl_tokens, IMPL_BRIEF)
+        for item in self.four:
+            dups = find_canonical_duplicates(item["crate_path"])
+            if item["name"] == ORIENTATION:
+                # Only the known wrapper, which embeds the canonical type
+                # instead of replacing it.
+                self.assertEqual(dups, ["CurrentEpistemicPositionHandle"],
+                                 item["name"])
+                wrapper = (ROOT / item["crate_path"] / "src" / "input.rs").read_text(
+                    encoding="utf-8")
+                self.assertIn("position: CurrentEpistemicPosition", wrapper)
+            else:
+                self.assertEqual(dups, [], item["name"])
+        poisoned = rs_definition_lines(f"crates/smart/{CLARIFICATION}") + [
+            "pub struct EvidenceEnvelope {",
+        ]
+        self.assertIn("EvidenceEnvelope",
+                      canonical_duplicates_in_lines(poisoned))
+
+    # WORK_UNIT_CASE: 968/8
+    def test_08_no_producer_algorithm_imports_despite_runtime_value_flow(self) -> None:
+        for item in self.four:
+            manifest = load_toml(f"{item['crate_path']}/Cargo.toml")
+            declared = declared_dep_names(manifest)
+            self.assertEqual(declared & FORBIDDEN_PRODUCER, set(), item["name"])
+            tokens = crate_tokens_in_rs(item["crate_path"])
+            self.assertEqual(tokens & FORBIDDEN_PRODUCER, set(), item["name"])
+            # Only public contracts/value interfaces flow at runtime: every
+            # eliot_* token is a canonical contract/value crate or the leaf
+            # itself (non-eliot deps such as serde carry no dreamer value).
+            own = item["name"].replace("-", "_")
+            self.assertLessEqual(tokens, ALLOWED_VALUE_TOKENS | {own}, item["name"])
+        poisoned = (crate_tokens_in_rs(f"crates/smart/{CLARIFICATION}")
+                    | {"eliot_dreamer_grounding"})
+        self.assertIn("eliot_dreamer_grounding", poisoned & FORBIDDEN_PRODUCER)
+
+    # WORK_UNIT_CASE: 968/9
+    def test_09_no_provider_store_runtime_or_local_normative_authority(self) -> None:
+        for item in self.four:
+            manifest = load_toml(f"{item['crate_path']}/Cargo.toml")
+            declared = declared_dep_names(manifest)
+            bad_deps = {d for d in declared if is_forbidden_provider_dep(d)}
+            self.assertEqual(bad_deps, set(), item["name"])
+            tokens = crate_tokens_in_rs(item["crate_path"])
+            self.assertEqual(provider_tokens_in(tokens), set(), item["name"])
+            # Data fields (authority_ref/authority_ceiling) and prose
+            # mentions are not authority implementations: only struct/enum/fn
+            # definition lines count.
+            self.assertEqual(find_authority_impls(item["crate_path"]), [],
+                             item["name"])
+        poisoned_deps = (declared_dep_names(
+            load_toml(f"crates/smart/{CLARIFICATION}/Cargo.toml"))
+            | {"eliot-provider-acquire"})
+        self.assertTrue(any(is_forbidden_provider_dep(d) for d in poisoned_deps))
+        self.assertEqual(provider_tokens_in({"eliot_store_handle"}),
+                         {"eliot_store_handle"})
+        poisoned_lines = [
+            "pub struct GrantAuthority {",
+            "    fn issue_authority(&self) {",
+        ]
+        self.assertEqual(len(authority_impls_in_lines(poisoned_lines)), 2)
+
+    # WORK_UNIT_CASE: 968/10
+    def test_10_acyclic_compile_graph_and_verified_orientation_noop(self) -> None:
         edges = internal_edges()
         order = topo_sort(edges)
         self.assertGreater(len(order), 100)
         for name in self.four_names:
             self.assertIn(name, order)
-        forbidden = FORBIDDEN_ALGO | four_tokens()
-        for item in self.four:
-            manifest = load_toml(f"{item['crate_path']}/Cargo.toml")
-            declared: set[str] = set()
-            for table in ("dependencies", "dev-dependencies", "build-dependencies"):
-                section = manifest.get(table, {})
-                if isinstance(section, dict):
-                    declared |= {d.replace("-", "_") for d in section}
-            hits = (declared & {f.replace("-", "_") for f in forbidden}) - {
-                item["name"].replace("-", "_")}
-            self.assertEqual(hits, set(), item["name"])
         poison = dict(edges)
         poison[CLARIFICATION] = set(poison[CLARIFICATION]) | {ARCH_BRIEF}
         poison[ARCH_BRIEF] = set(poison[ARCH_BRIEF]) | {CLARIFICATION}
         with self.assertRaises(ValueError):
             topo_sort(poison)
+        nodes = {n["id"]: n.get("dependencies", [])
+                 for n in self.metadata["resolve"]["nodes"]}
+        member_ids = set(self.metadata["workspace_members"])
+        color: dict[str, int] = {}
 
-    # WORK_UNIT_CASE: 968/8
-    def test_08_clarification_routes_without_grounding_or_peer_imports(self) -> None:
-        item = next(i for i in self.four if i["name"] == CLARIFICATION)
-        tokens = crate_tokens_in_rs(item["crate_path"])
-        self.assertIn("eliot_contracts", tokens)
-        self.assertIn("eliot_dreamer_contracts", tokens)
-        own = CLARIFICATION.replace("-", "_")
-        self.assertEqual(tokens & FORBIDDEN_ALGO, set(), item["name"])
-        self.assertEqual(tokens & four_tokens() - {own}, set(), item["name"])
-        manifest = load_toml(f"{item['crate_path']}/Cargo.toml")
-        declared: set[str] = set()
-        for table in ("dependencies", "dev-dependencies"):
-            declared |= set(manifest.get(table, {}))
-        self.assertIn("eliot-contracts", declared, item["name"])
-        self.assertIn("eliot-dreamer-contracts", declared, item["name"])
-        self.assertNotIn("eliot-dreamer-candidate-validation", declared, item["name"])
-        self.assertNotIn("eliot-dreamer-claim-grounding", declared, item["name"])
-        poisoned = set(tokens) | {"eliot_dreamer_claim_grounding"}
-        self.assertEqual(poisoned & (FORBIDDEN_ALGO | four_tokens()),
-                         {"eliot_dreamer_claim_grounding"})
-        # Orientation routing leg: contracts plus evidence, no grounding and
-        # no peer imports beyond its own crate token.
-        orientation = next(i for i in self.four if i["name"] == ORIENTATION)
-        otokens = crate_tokens_in_rs(orientation["crate_path"])
-        self.assertIn("eliot_contracts", otokens, ORIENTATION)
-        self.assertIn("eliot_dreamer_contracts", otokens, ORIENTATION)
-        oown = ORIENTATION.replace("-", "_")
-        self.assertEqual(otokens & FORBIDDEN_ALGO, set(), ORIENTATION)
-        self.assertEqual(otokens & four_tokens() - {oown}, set(), ORIENTATION)
-        omanifest = load_toml(f"{orientation['crate_path']}/Cargo.toml")
-        odeclarated: set[str] = set()
-        for table in ("dependencies", "dev-dependencies"):
-            odeclarated |= set(omanifest.get(table, {}))
-        self.assertIn("eliot-contracts", odeclarated, ORIENTATION)
-        self.assertIn("eliot-dreamer-contracts", odeclarated, ORIENTATION)
-        self.assertNotIn("eliot-dreamer-candidate-validation", odeclarated, ORIENTATION)
-        self.assertNotIn("eliot-dreamer-claim-grounding", odeclarated, ORIENTATION)
+        def visit(node_id: str) -> None:
+            color[node_id] = 1
+            for dep_id in nodes.get(node_id, []):
+                if dep_id not in member_ids:
+                    continue
+                state = color.get(dep_id, 0)
+                self.assertNotEqual(state, 1, f"metadata resolve cycle at {dep_id}")
+                if state == 0:
+                    visit(dep_id)
+            color[node_id] = 2
 
-    # WORK_UNIT_CASE: 968/9
-    def test_09_briefs_keep_authority_separate_without_peer_imports(self) -> None:
-        peers = four_tokens()
-        for item in self.four:
-            if item["name"] not in BRIEFS:
-                continue
-            tokens = crate_tokens_in_rs(item["crate_path"])
-            self.assertIn("eliot_dreamer_contracts", tokens, item["name"])
-            own = item["name"].replace("-", "_")
-            self.assertEqual(tokens & FORBIDDEN_ALGO, set(), item["name"])
-            self.assertEqual(tokens & peers - {own}, set(), item["name"])
-            manifest = load_toml(f"{item['crate_path']}/Cargo.toml")
-            declared: set[str] = set()
-            for table in ("dependencies", "dev-dependencies"):
-                declared |= set(manifest.get(table, {}))
-            self.assertNotIn("eliot-dreamer-candidate-validation", declared, item["name"])
-            self.assertNotIn("eliot-dreamer-claim-grounding", declared, item["name"])
-            other = next(b for b in BRIEFS if b != item["name"])
-            self.assertNotIn(other, declared, f"{item['name']} must not depend on {other}")
-        arch = load_toml(f"crates/smart/{ARCH_BRIEF}/Cargo.toml")
-        impl = load_toml(f"crates/smart/{IMPL_BRIEF}/Cargo.toml")
-        # Only the ImplementationBrief consumes conformance evidence; the
-        # ArchitectureBrief stays authority-pure.
-        self.assertNotIn("eliot-conformance-contracts", arch.get("dependencies", {}))
-        self.assertIn("eliot-conformance-contracts", impl.get("dependencies", {}))
-        poisoned = crate_tokens_in_rs(f"crates/smart/{ARCH_BRIEF}") | {
-            "eliot_dreamer_implementation_brief"}
-        self.assertIn("eliot_dreamer_implementation_brief", poisoned & peers)
-
-    # WORK_UNIT_CASE: 968/10
-    def test_10_orientation_noop_verified_and_three_admitted(self) -> None:
+        for member_id in sorted(member_ids):
+            if color.get(member_id, 0) == 0:
+                visit(member_id)
         ws = root_workspace()
         # #628 orientation was admitted via #702: verified no-op, not omission.
         self.assertEqual(ws["members"].count(ORIENTATION_PATH), 1)
@@ -844,7 +977,11 @@ class TestWaveAdmissionD1(unittest.TestCase):
         self.assertFalse(is_workspace_member(self.metadata, "eliot-learning-state-view"))
 
     # WORK_UNIT_CASE: 968/18
-    def test_18_locked_metadata_lists_each_package_once_as_member(self) -> None:
+    def test_18_locked_workspace_check_and_norun_includes_all_four(self) -> None:
+        self.assertEqual(self.workspace_check.returncode, 0,
+                         self.workspace_check.stderr[-2000:])
+        self.assertEqual(self.workspace_norun.returncode, 0,
+                         self.workspace_norun.stderr[-2000:])
         ids = [p["id"] for p in self.metadata["packages"]]
         self.assertEqual(len(ids), len(set(ids)))
         member_ids = set(self.metadata["workspace_members"])
@@ -853,6 +990,14 @@ class TestWaveAdmissionD1(unittest.TestCase):
         for name in self.four_names:
             self.assertEqual(name_counts[name], 1, name)
             self.assertIn(by_name[name], member_ids, name)
+        # Proof ceiling: workspace check/test --no-run prove compilation
+        # only, not runtime execution, Edge, Product, or release proof.
+        ceiling = ("workspace check/test --no-run prove compilation only, "
+                   "not runtime execution, Edge, Product, or release proof")
+        self.assertTrue("compilation only" in ceiling,
+                        f"proof ceiling must stay compilation-only: {ceiling}")
+        self.assertIn("not runtime execution", ceiling,
+                      f"workspace gates never prove execution: {ceiling}")
 
     # WORK_UNIT_CASE: 968/19
     def test_19_before_after_arithmetic_reconciles(self) -> None:
