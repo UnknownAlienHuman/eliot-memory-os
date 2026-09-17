@@ -25,7 +25,7 @@ architecture = [
   "https://github.com/UnknownAlienHuman/eliot-memory-os/blob/main/docs/architecture/A10-02-impact-and-authority.md#a102-impact-and-authority",
 ]
 implementation = [
-  "https://github.com/UnknownAlienHuman/eliot-memory-os/blob/main/docs/architecture/I00-05-current-system-evidence-and-source-support-model.md#i05-current-system-evidence-and-source-support-model",
+  "https://github.com/UnknownAlienHuman/eliot-memory-os/blob/main/docs/architecture/I00-05-conformance-support-and-evidence-status.md#i05-conformance-support-and-evidence-status",
   "https://github.com/UnknownAlienHuman/eliot-memory-os/blob/main/docs/architecture/I07-20-agent-facing-error-contract.md#i720-agent-facing-error-contract",
   "https://github.com/UnknownAlienHuman/eliot-memory-os/blob/main/docs/architecture/I12-18-prediction-and-calibration.md#i1218-prediction-and-calibration",
   "https://github.com/UnknownAlienHuman/eliot-memory-os/blob/main/docs/architecture/I12-22-theory-portfolio-and-practical-weighting.md#i1222-theory-portfolio-and-practical-weighting",
