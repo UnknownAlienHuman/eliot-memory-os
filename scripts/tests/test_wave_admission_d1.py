@@ -308,26 +308,8 @@ def crate_tokens_in_rs(crate_path: str) -> set[str]:
 
 
 def descriptor_toml(item: dict) -> bytes:
-    """Membership-required rust-package descriptor over real frozen digests."""
-    count = item["matrix_cases"]
-    text = f"""schema_version = "eliot-work-unit-descriptor-v2"
-identity = {{value = "work-unit-{item['leaf_issue']}"}}
-issue = {{repository = {{owner = "UnknownAlienHuman", name = "eliot-memory-os"}}, number = {item['leaf_issue']}}}
-unit = {{value = "T8-A1"}}
-mode = "rust-package"
-source_roots = [{{value = "{item['crate_path']}/src/lib.rs"}}]
-test_roots = [{{value = "{item['test_root']}"}}]
-matrix_cases = {count}
-proof_ceiling = {{value = "workspace-integration"}}
-revision = 1
-body_sha256 = "{item['lib_sha256']}"
-matrix_sha256 = "{item['matrix_sha256']}"
-require_workspace_member = true
-package = {{name = "{item['name']}"}}
-requirements = {{source_floor = 1, public_floor = 1, test_floor = {count}, required_guards = [{{value = "bounded"}}]}}
-bounds = {{wall_ms = 10000, idle_ms = 5000, output_bytes = 65536, line_bytes = 4096, discovery_tests = {count}, child_processes = 4}}
-"""
-    return text.encode("utf-8")
+    """Frozen fixture: authoritative descriptor TOML from candidate.json."""
+    return item["descriptor_toml"].encode("utf-8")
 
 
 def is_workspace_member(metadata: dict, name: str) -> bool:
@@ -834,12 +816,15 @@ class TestWaveAdmissionD1(unittest.TestCase):
     # WORK_UNIT_CASE: 968/17
     def test_17_descriptors_decode_and_suites_execute_pass(self) -> None:
         for item in self.four:
-            raw = descriptor_toml(item)
+            raw = item["descriptor_toml"].encode("utf-8")
             decoded = self.decode_descriptor(
                 raw, f".github/work-units/{item['leaf_issue']}.toml")
-            self.assertTrue(decoded["require_workspace_member"])
+            self.assertTrue(decoded["require_workspace_member"] is True)
             self.assertEqual(decoded["package"], {"name": item["name"]})
             self.assertEqual(decoded["matrix_cases"], item["matrix_cases"])
+            self.assertEqual(decoded["body_sha256"], item["lib_sha256"])
+            self.assertEqual(decoded["matrix_sha256"], item["matrix_sha256"])
+            self.assertEqual(decoded["proof_ceiling"]["value"], "workspace-integration")
             self.assertTrue(is_workspace_member(self.metadata, item["name"]),
                             item["name"])
             run = self.test_runs[item["name"]]
@@ -854,7 +839,7 @@ class TestWaveAdmissionD1(unittest.TestCase):
         self.assertNotIn("\nerror:", combined)
         with self.assertRaises(Exception):
             self.decode_descriptor(
-                descriptor_toml(self.four[0]) + b'\nfuture_field = "no"\n',
+                self.four[0]["descriptor_toml"].encode("utf-8") + b'\nfuture_field = "no"\n',
                 f".github/work-units/{self.four[0]['leaf_issue']}.toml")
         self.assertFalse(is_workspace_member(self.metadata, "eliot-learning-state-view"))
 
