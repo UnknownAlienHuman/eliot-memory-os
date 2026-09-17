@@ -32,6 +32,7 @@ use thiserror::Error;
 
 mod dreamer_job;
 pub mod epistemic_revision;
+pub mod erasure_admission;
 mod payload_authority;
 mod request_hash;
 mod store_failure;
@@ -84,6 +85,13 @@ pub use wire::{
 mod operation_catalogue;
 mod operation_parameters;
 mod revocation_history;
+
+pub use erasure_admission::{
+    ERASURE_PARAM_OPERATION_ID, ERASURE_PARAM_REASON, ERASURE_PARAM_REQUESTER,
+    ERASURE_PARAM_SUBJECT, ERASURE_PARAM_SURFACES, ERASURE_SURFACE_SEPARATOR,
+    ErasureAdmissionRequest, admit_erasure_transition, decode_erasure_surfaces,
+    encode_erasure_surfaces,
+};
 
 pub use operation_catalogue::{
     ACTIVATED_READ_OWNING_SECTION, EVIDENCE_PACK_MAX_RECORDS, GENESIS_OWNING_SECTION,
@@ -563,6 +571,16 @@ pub enum TransitionClass {
     TaskControl,
     LifecyclePolicy,
     RecoverySchema,
+    /// Explicit user-requested canonical erasure/disposition (issue #1712).
+    ///
+    /// Irreversible deletion semantics inside the canonical store: admitted
+    /// only through the named erasure transaction carrying explicit
+    /// user-initiated identity (identity + exact scope + reason) and
+    /// non-empty proof/approval handles. Maintenance, curation, Dreamer, and
+    /// scheduler paths never carry those handles, so no automatic trigger can
+    /// reach this class. The ceiling stays the maximum store-allowed effect;
+    /// existing class maxima are unchanged.
+    Erasure,
 }
 
 impl TransitionClass {
@@ -570,7 +588,7 @@ impl TransitionClass {
     pub const fn maximum_effect(self) -> EffectClass {
         match self {
             Self::CaptureCandidate | Self::Epistemic => EffectClass::Candidate,
-            Self::TaskControl | Self::LifecyclePolicy | Self::RecoverySchema => {
+            Self::TaskControl | Self::LifecyclePolicy | Self::RecoverySchema | Self::Erasure => {
                 EffectClass::ReversibleMutation
             }
         }
@@ -643,6 +661,16 @@ pub enum NamedMutationOperation {
     /// unsupported until a store-owned slice activates its catalogue row
     /// with proven handlers; the typed parameters are already closed.
     RecordAuthorityRevocation,
+    /// Named canonical erasure/disposition transaction (issue #1712).
+    ///
+    /// Explicit user request ONLY, never automatic: the prepared transition
+    /// must carry [`TransitionClass::Erasure`], the declared erasure effect
+    /// ceiling, the closed erasure typed parameters (exact subject, surface
+    /// denominator, explicit reason, user-initiated requester identity, and
+    /// the stable intent identity), and non-empty proof/approval handles.
+    /// The store bridge applies only the recorded plan; it never derives
+    /// deletion semantics.
+    ApplyErasure,
 }
 
 impl NamedMutationOperation {
@@ -656,6 +684,7 @@ impl NamedMutationOperation {
             Self::ReconcileRecovery | Self::RecordAuthorityRevocation => {
                 TransitionClass::RecoverySchema
             }
+            Self::ApplyErasure => TransitionClass::Erasure,
         }
     }
 }
@@ -1285,6 +1314,23 @@ impl PreparedTransition {
             self.transition_class.maximum_effect(),
         ) {
             return Err(StoreError::TransitionClassExceeded);
+        }
+        // Issue #1712: erasure travels under exactly one operation identity.
+        // Bundling the irreversible deletion with any other command (or
+        // splitting it across commands) is rejected pre-execution, and the
+        // plan must carry the explicit user approval handles: automatic
+        // maintenance, curation, Dreamer, and scheduler paths furnish none,
+        // so they can never reach the erasure transaction.
+        if self.transition_class == TransitionClass::Erasure {
+            if self.named_operations.len() != 1 {
+                return Err(StoreError::TransitionClassExceeded);
+            }
+            if self.required_proof_and_approval_refs.is_empty() {
+                return Err(StoreError::InvalidField {
+                    field: "proof_or_approval_ref",
+                    reason: "erasure requires explicit user approval",
+                });
+            }
         }
         validate_digest(
             &self.admission_contract_set_digest,
@@ -1929,6 +1975,7 @@ fn operation_kind(class: TransitionClass) -> &'static str {
         TransitionClass::TaskControl => "store.apply.task_control",
         TransitionClass::LifecyclePolicy => "store.apply.lifecycle_policy",
         TransitionClass::RecoverySchema => "store.apply.recovery_schema",
+        TransitionClass::Erasure => "store.apply.erasure",
     }
 }
 

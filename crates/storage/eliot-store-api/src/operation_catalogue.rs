@@ -25,6 +25,10 @@
 //! plus the `ApplyEpistemicRevision` mutation (T11.2: persists
 //! `TransitionClass::Epistemic` with the `EffectClass::Candidate`
 //! ceiling and the owner-approved epistemic-revision payload),
+//! plus the `ApplyErasure` mutation (issue #1712: persists
+//! `TransitionClass::Erasure` with the `EffectClass::ReversibleMutation`
+//! ceiling and the owner-approved five-field canonical-erasure payload
+//! admitted only for explicit user requests),
 //! plus the provider-independent genesis bootstrap entry sourced by
 //! [`genesis_manifest`](crate::genesis_manifest). Every other operation stays
 //! known-but-unsupported and unadvertised: no other mutation on base has a
@@ -107,8 +111,8 @@ pub const OPERATION_CATALOGUE_PROFILE: &str = "eliot.storage.operation-profile.v
 pub const ACTIVATED_READ_OWNING_SECTION: &str = "I5.17";
 
 /// Owning section for the activated mutation entries: the same command-family
-/// activation section that owns the read entries (AUD-C01 activates the five
-/// proven mutations under it).
+/// activation section that owns the read entries (the proven mutations
+/// activate under it).
 pub const ACTIVATED_MUTATION_OWNING_SECTION: &str = "I5.17";
 
 /// Owning section for the genesis bootstrap entry: the canonical contract
@@ -282,10 +286,13 @@ struct ActivatedMutationDescriptor {
 /// `ReconcileRecovery` persists `ReversibleMutation` through the
 /// `RecoverySchema` family; `UpdateTaskState` persists `ReversibleMutation`
 /// through the `TaskControl` family; `ApplyEpistemicRevision` persists
-/// `ReversibleMutation` through the `Epistemic` family. All
-/// six address no scope, mirroring the scope-free read descriptors. Every
+/// `ReversibleMutation` through the `Epistemic` family; `ApplyErasure`
+/// persists `ReversibleMutation` through the `Erasure` family (issue #1712:
+/// explicit user request ONLY, with the closed five-field erasure typed
+/// contract). All
+/// seven address no scope, mirroring the scope-free read descriptors. Every
 /// other mutation stays known-but-unsupported.
-const ACTIVATED_MUTATIONS: [ActivatedMutationDescriptor; 6] = [
+const ACTIVATED_MUTATIONS: [ActivatedMutationDescriptor; 7] = [
     ActivatedMutationDescriptor {
         operation: NamedMutationOperation::ApplyEpistemicRevision,
         transition_classes: &[TransitionClass::Epistemic],
@@ -315,6 +322,11 @@ const ACTIVATED_MUTATIONS: [ActivatedMutationDescriptor; 6] = [
         operation: NamedMutationOperation::UpdateTaskState,
         transition_classes: &[TransitionClass::TaskControl],
         maximum_effect: EffectClass::ReversibleMutation,
+    },
+    ActivatedMutationDescriptor {
+        operation: NamedMutationOperation::ApplyErasure,
+        transition_classes: &[TransitionClass::Erasure],
+        maximum_effect: TransitionClass::Erasure.maximum_effect(),
     },
 ];
 
@@ -380,7 +392,7 @@ fn genesis_entry_spec() -> OperationManifestSpec {
 /// Generates the per-operation manifest descriptors from the declaration table.
 ///
 /// Declaration order is the canonical order: the ten activated reads, the
-/// six activated mutations, then the genesis bootstrap entry. Generation is
+/// seven activated mutations, then the genesis bootstrap entry. Generation is
 /// pure over crate constants, so the same source always yields byte-identical
 /// entries.
 pub fn generated_operation_manifests() -> Result<Vec<NamedOperationManifest>, StoreError> {
@@ -538,7 +550,8 @@ pub fn validate_read_against_catalogue(
 /// to a mutation entry, stay within that entry's ceiling, carry only the
 /// owner-approved typed parameters for the approved command, and stay within
 /// the entry input bound. Only `CaptureObservation`, `AppendAuditEvent`,
-/// `ApplyLifecyclePolicy`, `ReconcileRecovery`, `UpdateTaskState`, and `ApplyEpistemicRevision` have activated mutation entries; any other named
+/// `ApplyLifecyclePolicy`, `ReconcileRecovery`, `UpdateTaskState`, `ApplyEpistemicRevision`,
+/// and `ApplyErasure` have activated mutation entries; any other named
 /// command fails closed here until a later slice proves its handler, schema,
 /// and consumer triple.
 pub fn validate_transition_against_catalogue(
@@ -591,7 +604,8 @@ pub fn validate_transition_against_catalogue(
             | NamedMutationOperation::ApplyLifecyclePolicy
             | NamedMutationOperation::ReconcileRecovery
             | NamedMutationOperation::UpdateTaskState
-            | NamedMutationOperation::ApplyEpistemicRevision => {
+            | NamedMutationOperation::ApplyEpistemicRevision
+            | NamedMutationOperation::ApplyErasure => {
                 validate_typed_mutation_parameters(command.operation, &command.parameters)?;
             }
             NamedMutationOperation::RecordAuthorityRevocation => {
