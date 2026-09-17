@@ -18,19 +18,14 @@ pub const KERNEL_ADMISSION_REQUIRED: &str = "KERNEL_ADMISSION_REQUIRED";
 const MAX_TEXT: usize = 16_384;
 const MAX_ITEMS: usize = 256;
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum JobClass {
-    Orientation,
-    Curation,
-    Clarification,
-    ResearchSynthesis,
-    Architecture,
-    DevelopmentDiagnosis,
-    Maintenance,
-    Orchestration,
-    Configuration,
-}
+/// The canonical nine work classes of I9.3, owned by `eliot-dreamer-contracts`.
+///
+/// This crate previously declared its own copy whose `Architecture`,
+/// `Orchestration` and `Configuration` variants were truncations of the
+/// document's headings, and whose `rename_all` wire tokens therefore did not
+/// match the taxonomy. The owner carries an explicit `#[serde(rename)]` per
+/// variant, so the spelling is stated rather than derived.
+pub use eliot_dreamer_contracts::JobClass;
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -727,6 +722,35 @@ fn all_handles(input: &DreamJobInput) -> Vec<String> {
         .chain(&input.conformance_handles)
         .cloned()
         .collect()
+}
+
+#[cfg(test)]
+mod taxonomy_tests {
+    use super::*;
+
+    /// The nine classes this binary admits are the nine section headings of
+    /// I9.3, in the owner's stated wire spelling. Before this crate took
+    /// `JobClass` from `eliot-dreamer-contracts` it declared its own copy in
+    /// which three of these tokens were truncated, so a job admitted here
+    /// would not have matched the same class at the boundary.
+    #[test]
+    fn admitted_classes_are_the_canonical_nine_wire_tokens() {
+        let taxonomy = [
+            (JobClass::Orientation, "orientation"),
+            (JobClass::Curation, "curation"),
+            (JobClass::Clarification, "clarification"),
+            (JobClass::ResearchSynthesis, "research_synthesis"),
+            (JobClass::ArchitectureSelfQuery, "architecture_self_query"),
+            (JobClass::DevelopmentDiagnosis, "development_diagnosis"),
+            (JobClass::Maintenance, "maintenance"),
+            (JobClass::OrchestrationPlanning, "orchestration_planning"),
+            (JobClass::ConfigurationAssistance, "configuration_assistance"),
+        ];
+        for (class, token) in taxonomy {
+            let encoded = serde_json::to_string(&class).expect("a closed class encodes");
+            assert_eq!(encoded, format!("\"{token}\""), "wire token for {class:?}");
+        }
+    }
 }
 
 #[cfg(test)]

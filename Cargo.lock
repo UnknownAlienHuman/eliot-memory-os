@@ -1223,6 +1223,7 @@ dependencies = [
  "eliot-dreamer-bundle",
  "eliot-dreamer-candidate-validation",
  "eliot-dreamer-claim-grounding",
+ "eliot-dreamer-contracts",
  "eliot-dreamer-orientation",
  "eliot-dreamer-probe-plan",
  "eliot-dreamer-rival-model",
