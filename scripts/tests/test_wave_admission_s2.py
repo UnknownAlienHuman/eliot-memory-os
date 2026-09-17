@@ -47,6 +47,8 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[2]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
+if str(ROOT / "scripts") not in sys.path:
+    sys.path.insert(0, str(ROOT / "scripts"))
 FIX = ROOT / "scripts" / "testdata" / "work-unit-gate" / "wave-s2"
 BASE_SHA = "a9b51160dadcb731b117e343e2f47e589fe81fd4"
 ADMISSION_NOTE = "admitted via #966 (T8-AS2) root workspace membership"
@@ -710,18 +712,24 @@ class TestWaveAdmissionS2(unittest.TestCase):
         self.assertIn("**18**", prototype_index)
         before_pkg = sha256_bytes(read_bytes("docs/code-navigation/PACKAGE_DOCS_INDEX.md"))
         before_proto = sha256_bytes(read_bytes("docs/code-navigation/PROTOTYPE_DOCS_INDEX.md"))
-        first = py_script("scripts/code_navigation.py", "sync-index", "--root", ".")
-        self.assertEqual(first.returncode, 0, first.stderr[-2000:])
-        mid_pkg = sha256_bytes(read_bytes("docs/code-navigation/PACKAGE_DOCS_INDEX.md"))
-        mid_proto = sha256_bytes(read_bytes("docs/code-navigation/PROTOTYPE_DOCS_INDEX.md"))
-        second = py_script("scripts/code_navigation.py", "sync-index", "--root", ".")
-        self.assertEqual(second.returncode, 0, second.stderr[-2000:])
-        after_pkg = sha256_bytes(read_bytes("docs/code-navigation/PACKAGE_DOCS_INDEX.md"))
-        after_proto = sha256_bytes(read_bytes("docs/code-navigation/PROTOTYPE_DOCS_INDEX.md"))
-        self.assertEqual(before_pkg, mid_pkg)
-        self.assertEqual(mid_pkg, after_pkg)
-        self.assertEqual(before_proto, mid_proto)
-        self.assertEqual(mid_proto, after_proto)
+        check_run = py_script("scripts/code_navigation.py", "check", "--root", ".")
+        self.assertEqual(check_run.returncode, 0, check_run.stderr[-2000:])
+        from code_navigation_lib import build_registry
+        from code_navigation_lib.package_docs import render as render_pkg
+        from code_navigation_lib.prototype_docs import render as render_proto
+        reg = build_registry(ROOT)
+        first_pkg = render_pkg(reg, ROOT).encode("utf-8")
+        first_proto = render_proto(ROOT, reg).encode("utf-8")
+        second_pkg = render_pkg(reg, ROOT).encode("utf-8")
+        second_proto = render_proto(ROOT, reg).encode("utf-8")
+        self.assertEqual(read_bytes("docs/code-navigation/PACKAGE_DOCS_INDEX.md"), first_pkg)
+        self.assertEqual(read_bytes("docs/code-navigation/PROTOTYPE_DOCS_INDEX.md"), first_proto)
+        self.assertEqual(first_pkg, second_pkg)
+        self.assertEqual(first_proto, second_proto)
+        self.assertEqual(before_pkg, sha256_bytes(first_pkg))
+        self.assertEqual(before_proto, sha256_bytes(first_proto))
+        self.assertEqual(before_pkg, sha256_bytes(second_pkg))
+        self.assertEqual(before_proto, sha256_bytes(second_proto))
 
     # WORK_UNIT_CASE: 966/17
     def test_17_descriptors_decode_and_suites_execute_pass(self) -> None:
