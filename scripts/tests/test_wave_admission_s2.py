@@ -86,6 +86,8 @@ OWNED_PATHS = frozenset({
     "crates/smart/eliot-dreamer-curation/Cargo.toml",
     "crates/smart/eliot-dreamer-curation/module.toml",
     "crates/research/eliot-dreamer-source-assurance/Cargo.toml",
+    "crates/smart/cognitive-contract-challenges.toml",
+    "docs/operations/HANDOFF-2026-09-17.md",
     "docs/code-navigation/PACKAGE_DOCS_INDEX.md",
     "docs/code-navigation/PROTOTYPE_DOCS_INDEX.md",
     "scripts/tests/test_wave_admission_s2.py",
@@ -418,14 +420,13 @@ class TestWaveAdmissionS2(unittest.TestCase):
                 current["needed_by"] = json.loads(line.split("=", 1)[1].strip().replace("'", '"'))
             elif current is not None and line.startswith("id ="):
                 current["id"] = line.split("=", 1)[1].strip().strip('"')
+        all_challenges = {e.get("id"): e.get("status") for e in open_entries}
+        self.assertEqual(all_challenges.get("CC-001"), "RESOLVED")
+        self.assertEqual(all_challenges.get("CC-003"), "RESOLVED")
         blocking = [e for e in open_entries
                     if str(e.get("status", "")).startswith("OPEN")
                     and set(self.six_names) & set(e.get("needed_by", []))]
-        self.assertEqual({e["id"] for e in blocking}, {"CC-001", "CC-003"})
-        challenge_errors = validate_challenges(blocking, set(self.six_names))
-        self.assertEqual(len(challenge_errors), 2)
-        self.assertTrue(any("CC-001" in e for e in challenge_errors))
-        self.assertTrue(any("CC-003" in e for e in challenge_errors))
+        self.assertEqual(blocking, [])
         self.assertEqual(validate_challenges([], set(self.six_names)), [])
         poison = [{"id": "CC-X", "needed_by": [self.six_names[0]]}]
         self.assertTrue(validate_challenges(poison, set(self.six_names)))
