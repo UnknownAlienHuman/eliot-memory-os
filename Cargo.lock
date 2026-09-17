@@ -795,6 +795,7 @@ dependencies = [
  "eliot-contracts",
  "eliot-security-contracts",
  "eliot-store-api",
+ "eliot-store-memory",
  "serde",
  "serde_json",
  "thiserror",

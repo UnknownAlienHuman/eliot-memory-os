@@ -2040,3 +2040,338 @@ fn consumer_guard_proves_no_rewrite_mint_cutover_or_weakened_default() {
             .any(|entry| entry == "authority_minting")
     );
 }
+
+// ---------------------------------------------------------------------------
+// Issue #1712 (`ERASURE_STATE_IRREVERSIBLE`, I5.14): executor-level proof.
+// The predicate `WriteReceipt::refuse_rehydration_from_erasure` is wired into
+// the single mandatory restore-dispatch guard (`refuse_erasure_rehydration`,
+// exercised through `execute_with_journal` for both fresh apply and resume
+// reconcile). These cases present a genuinely store-committed erasure receipt
+// to the restore executor and prove it fails with `InvalidReceipt` before any
+// target observes the receipt phase, while a non-erasure receipt flows
+// through the same executor untouched.
+// ---------------------------------------------------------------------------
+
+/// Commits a real erasure through the reference store executor and returns
+/// the store-issued committed receipt (the same typed shape the Surreal edge
+/// commits; `MemoryStore` is the reference contour used here only to mint an
+/// undeniable erasure receipt, not as the proof edge).
+fn committed_erasure_receipt() -> eliot_store_api::WriteReceipt {
+    let fence = StateFence::new(epoch(1), ResourceGeneration::genesis());
+    let ctx = eliot_store_api::RequestMeta {
+        request_id: eliot_contracts::RequestId::new("request-erase-1712").expect("request id"),
+        session_id: None,
+        task_id: None,
+        product_id: eliot_contracts::ProductId::new("product-erase-1712").expect("product"),
+        source_id: eliot_contracts::SourceId::new("source-erase-1712").expect("source"),
+        state_fence: fence.clone(),
+        clock: eliot_contracts::ClockReading {
+            valid_time_ms: Some(1),
+            known_time_ms: Some(1),
+            transaction_sequence: None,
+            monotonic_ns: Some(1),
+        },
+    };
+    let set_digest = eliot_store_api::operation_manifest_set_digest(
+        &eliot_store_api::generated_operation_manifests().expect("catalogue"),
+    )
+    .expect("erasure set digest");
+    let request = eliot_store_api::ErasureAdmissionRequest {
+        identity: eliot_store_api::OperationIdentity {
+            operation_id: eliot_store_api::OperationId::new("op-erase-1712").expect("operation"),
+            idempotency_key: "idem-erase-1712".to_owned(),
+            canonical_request_hash: "c".repeat(64),
+        },
+        scope_id: eliot_store_api::ScopeId::new("scope-1").expect("scope"),
+        ordering_scope: eliot_store_api::OrderingScopeId::new("scope-1").expect("ordering"),
+        state_fence: fence,
+        subject: "erased-subject-1712".to_owned(),
+        surfaces: vec!["CanonicalPayload".to_owned()],
+        reason: "user requested deletion".to_owned(),
+        requester: "user:test".to_owned(),
+        approval_refs: vec!["approval-user-1".to_owned()],
+        admission_contract_set_digest: "b".repeat(64),
+        operation_manifest_digest: set_digest,
+        security: eliot_store_api::SecurityContext::default(),
+        event_projection_relation_intents: eliot_store_api::EventProjectionRelationIntents {
+            event_ids: Vec::new(),
+            projection_kinds: Vec::new(),
+            relation_kinds: Vec::new(),
+        },
+    };
+    let mut prepared =
+        eliot_store_api::admit_erasure_transition(&request).expect("erasure admits");
+    let view = eliot_store_api::CanonicalRequestView::from_apply(&ctx, &prepared, &[], &[]);
+    prepared.identity.canonical_request_hash =
+        eliot_store_api::canonical_request_hash(&view).expect("request digest");
+    let store = eliot_store_memory::MemoryStore::new();
+    let receipt = store
+        .apply_transaction(&ctx, prepared, &[], &[])
+        .expect("erasure commits");
+    assert_eq!(
+        receipt.transition_class,
+        eliot_store_api::TransitionClass::Erasure
+    );
+    assert_eq!(
+        receipt.status,
+        eliot_store_api::WriteReceiptStatus::Committed
+    );
+    receipt
+        .validate()
+        .expect("store-committed erasure receipt is well-formed");
+    receipt
+}
+
+/// Minimal restore target that records every dispatched phase name and
+/// returns the standard applied effect, so each case observes exactly which
+/// phases the coordinator dispatched before terminating.
+struct ErasureProbeTarget {
+    calls: Vec<String>,
+}
+
+fn probe_phase_name(phase: &RestorePhase) -> String {
+    match phase {
+        RestorePhase::Pending => "pending".to_owned(),
+        RestorePhase::PrepareIsolatedRoot => "prepare".to_owned(),
+        RestorePhase::ApplyPurgeLedger => "purge".to_owned(),
+        RestorePhase::ImportSealedBlob { hash } => format!("blob:{hash}"),
+        RestorePhase::ImportCanonicalEvent { record_id } => format!("event:{record_id}"),
+        RestorePhase::ImportReceipt { operation_id } => format!("receipt:{operation_id}"),
+        RestorePhase::ImportProjection { record_id } => format!("projection:{record_id}"),
+        RestorePhase::SuspendOrsOperations => "ors-suspend".to_owned(),
+        RestorePhase::RebuildProjections => "rebuild".to_owned(),
+        RestorePhase::VerifyReceiptEventChain => "verify".to_owned(),
+        RestorePhase::FinalizeIsolatedRoot => "finalize".to_owned(),
+    }
+}
+
+impl RestoreTarget for ErasureProbeTarget {
+    fn prepare_isolated(
+        &mut self,
+        _: &RestoreContext,
+        _: &eliot_backup::RestoredFence,
+    ) -> Result<(), BackupError> {
+        Ok(())
+    }
+    fn apply_purge_ledger(
+        &mut self,
+        _: &[eliot_security_contracts::PurgeLedgerEntry],
+    ) -> Result<(), BackupError> {
+        Ok(())
+    }
+    fn import_sealed_blob(&mut self, _: &eliot_backup::BackupBlob) -> Result<(), BackupError> {
+        Ok(())
+    }
+    fn import_canonical_event(
+        &mut self,
+        _: &eliot_backup::CanonicalRecord,
+    ) -> Result<(), BackupError> {
+        Ok(())
+    }
+    fn import_receipt(&mut self, _: &eliot_store_api::WriteReceipt) -> Result<(), BackupError> {
+        Ok(())
+    }
+    fn import_projection(
+        &mut self,
+        _: &eliot_backup::CanonicalRecord,
+    ) -> Result<(), BackupError> {
+        Ok(())
+    }
+    fn suspend_ors_operations(
+        &mut self,
+        _: &eliot_backup::OrsSnapshotFence,
+    ) -> Result<(), BackupError> {
+        Ok(())
+    }
+    fn rebuild_projections(
+        &mut self,
+        _: &eliot_backup::RestoredFence,
+    ) -> Result<(), BackupError> {
+        Ok(())
+    }
+    fn verify_receipt_event_chain(
+        &mut self,
+        _: &[eliot_store_api::WriteReceipt],
+        _: &[eliot_backup::CanonicalRecord],
+    ) -> Result<(), BackupError> {
+        Ok(())
+    }
+    fn finalize_isolated(
+        &mut self,
+        _: &eliot_backup::RestoredFence,
+    ) -> Result<RestoreEvidence, BackupError> {
+        Err(BackupError::RestoreTargetReceiptRequired)
+    }
+    fn apply_restore_effect(
+        &mut self,
+        plan: &RestorePlan,
+        bundle: &BackupBundle,
+        intent: &RestoreIntent,
+    ) -> Result<RestoreAppliedEffect, BackupError> {
+        self.calls.push(probe_phase_name(&intent.phase));
+        Ok(applied_effect_for(intent, bundle, plan))
+    }
+}
+
+/// Builds a `CanonicalOnlyDegraded` probe bundle mirroring
+/// `degraded_bundle_with_class`, but carrying the given canonical events and
+/// receipts with a consistent event-range count. The manifest is computed at
+/// build, so plan compilation observes exactly this bundle.
+fn probe_bundle_with_events_and_receipts(
+    canonical_events: Vec<eliot_backup::CanonicalRecord>,
+    receipts: Vec<eliot_store_api::WriteReceipt>,
+) -> BackupBundle {
+    let source_fence = StateFence::new(epoch(1), ResourceGeneration::genesis());
+    let event_count = canonical_events.len() as u64;
+    let (first_sequence, last_sequence) = if event_count == 0 {
+        (None, None)
+    } else {
+        (Some(1), Some(event_count))
+    };
+    BackupBundle::build(BackupInput {
+        backup_id: "bundle-1712-probe".to_owned(),
+        class: BackupClass::CanonicalOnlyDegraded,
+        source_adapter: "test-adapter".to_owned(),
+        schema_generation: "schema-1".to_owned(),
+        export_fence: ExportFence {
+            export_id: "export-1712".to_owned(),
+            store_generation: "store-1712".to_owned(),
+            state_fence: source_fence,
+            scope_id: None,
+            revision_heads: Vec::new(),
+            ordering_heads: Vec::new(),
+            event_range: EventRange {
+                first_sequence,
+                last_sequence,
+                count: event_count,
+            },
+            blob_reachability_manifest: Vec::new(),
+            consistent: true,
+        },
+        canonical_events,
+        projections: Vec::new(),
+        receipts,
+        blobs: Vec::new(),
+        purge_ledger: Vec::new(),
+        ors_snapshot: None,
+        artifacts: Vec::new(),
+        watchdog_spool: None,
+        host_audit: None,
+        missing_features: Vec::new(),
+        purge_ledger_revision: 7,
+    })
+    .expect("probe bundle builds")
+}
+
+// Issue #1712 case: the restore executor refuses rehydration from a genuinely
+// committed erasure receipt with `InvalidReceipt` before any target observes
+// the receipt phase.
+#[test]
+fn restore_executor_refuses_rehydration_from_committed_erasure_receipt() {
+    let erasure = committed_erasure_receipt();
+    // The committed erasure receipt references its tombstone event; the bundle
+    // must carry that event for receipt/event-chain closure, exactly as a real
+    // post-erasure export would. The erased canonical bytes themselves are
+    // absent: nothing here could resurrect them.
+    let mut canonical_events = Vec::new();
+    for event_id in erasure.emitted_event_ids.clone() {
+        canonical_events.push(
+            eliot_backup::CanonicalRecord::new(
+                "test-event",
+                event_id.to_string(),
+                serde_json::json!({"id": event_id.to_string(), "tombstone": true}),
+            )
+            .expect("tombstone event builds"),
+        );
+    }
+    let bundle = probe_bundle_with_events_and_receipts(canonical_events, vec![erasure]);
+    let plan =
+        RestorePlan::compile(&bundle, target_context("target-1712-erasure")).expect("plan");
+    let mut target = ErasureProbeTarget { calls: Vec::new() };
+    let mut journal = MapJournal::new();
+    assert_eq!(
+        plan.execute_with_journal(&bundle, &mut target, &mut journal),
+        Err(BackupError::Store(
+            eliot_store_api::StoreError::InvalidReceipt
+        ))
+    );
+    assert!(
+        !target
+            .calls
+            .iter()
+            .any(|call| call.starts_with("receipt:")),
+        "the erasure receipt phase must never reach the target: {:?}",
+        target.calls
+    );
+    // Prepare, purge, and the tombstone event import all dispatch normally;
+    // the coordinator refuses exactly at the erasure receipt phase.
+    assert_eq!(
+        target.calls,
+        vec![
+            "prepare".to_owned(),
+            "purge".to_owned(),
+            "event:event-op-erase-1712".to_owned()
+        ]
+    );
+    // A resumed execution reconciles the durably persisted receipt intent
+    // through the same guard: no further target dispatch, same InvalidReceipt.
+    let calls_before_resume = target.calls.clone();
+    assert_eq!(
+        plan.execute_with_journal(&bundle, &mut target, &mut journal),
+        Err(BackupError::Store(
+            eliot_store_api::StoreError::InvalidReceipt
+        ))
+    );
+    assert_eq!(target.calls, calls_before_resume);
+}
+
+// Issue #1712 control: a well-formed non-erasure receipt flows through the
+// same restore executor untouched (no behavior change off the erasure class).
+#[test]
+fn restore_executor_imports_non_erasure_receipt_untouched() {
+    let control = eliot_store_api::WriteReceipt {
+        operation_id: eliot_store_api::OperationId::new("op-control-1712").expect("operation"),
+        idempotency_key: "idem-control-1712".to_owned(),
+        canonical_request_hash: "a".repeat(64),
+        transition_class: eliot_store_api::TransitionClass::CaptureCandidate,
+        status: eliot_store_api::WriteReceiptStatus::Committed,
+        commit_id: Some(eliot_store_api::CommitId::new("commit-control-1712").expect("commit")),
+        state_fence: StateFence::new(epoch(1), ResourceGeneration::genesis()),
+        ordering_sequences: Vec::new(),
+        revision_before_after: Vec::new(),
+        applied_command_ids: vec!["cmd-control-1712".to_owned()],
+        emitted_event_ids: Vec::new(),
+        projection_refs: Vec::new(),
+        outbox_refs: Vec::new(),
+        operation_manifest_digest: eliot_store_api::OperationManifestDigest::new(
+            "manifest-control-1712",
+        )
+        .expect("manifest"),
+        error_code: None,
+        resubmission: eliot_store_api::Resubmission::None,
+        committed_at: Some("commit-sequence-0000000000000001".to_owned()),
+        envelope: None,
+    };
+    control.validate().expect("control receipt is well-formed");
+    assert!(control.refuse_rehydration_from_erasure().is_ok());
+    let bundle = probe_bundle_with_events_and_receipts(Vec::new(), vec![control]);
+    let plan =
+        RestorePlan::compile(&bundle, target_context("target-1712-control")).expect("plan");
+    let mut target = ErasureProbeTarget { calls: Vec::new() };
+    let mut journal = MapJournal::new();
+    let result = plan.execute_with_journal(&bundle, &mut target, &mut journal);
+    assert!(
+        target.calls.contains(&"receipt:op-control-1712".to_owned()),
+        "the non-erasure receipt phase must reach the target: {:?} / {result:?}",
+        target.calls
+    );
+    assert!(
+        !matches!(
+            result,
+            Err(BackupError::Store(
+                eliot_store_api::StoreError::InvalidReceipt
+            ))
+        ),
+        "a non-erasure receipt must never trip the erasure guard: {result:?}"
+    );
+}
