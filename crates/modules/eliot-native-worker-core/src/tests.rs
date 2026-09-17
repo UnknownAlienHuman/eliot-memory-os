@@ -15,8 +15,8 @@ use eliot_agent_api::{
     ProposedEffect, ResourceGeneration, StateFence, WorkLeaseId,
 };
 use eliot_contracts::{
-    DecisionId, EpochId, EpochLineageId, IntegrationRevision, PolicyRevision, TaskId, TaskRevision,
-    sha256_hex,
+    ClockReading, DecisionId, EpochId, EpochLineageId, IntegrationRevision, LowercaseSha256,
+    PolicyRevision, TaskId, TaskRevision, sha256_hex,
 };
 use eliot_process::{
     ActionLeaseRef, CancellationReceipt, CancellationRequest, DescendantEvidence,
@@ -374,8 +374,18 @@ impl CapabilityAdmissionPort for FakeAdmission {
                     proposal: request.proposal().clone(),
                     authority_epoch: request.authority_epoch().clone(),
                     authorization_ref: "effect-authorization-1".to_owned(),
-                    authorized_at: "provider-observed".to_owned(),
-                    expires_at: "provider-expiry".to_owned(),
+                    authorized_at: ClockReading {
+                        valid_time_ms: Some(100),
+                        known_time_ms: Some(100),
+                        transaction_sequence: None,
+                        monotonic_ns: None,
+                    },
+                    expires_at: ClockReading {
+                        valid_time_ms: Some(10_000),
+                        known_time_ms: Some(10_000),
+                        transaction_sequence: None,
+                        monotonic_ns: None,
+                    },
                 },
                 request.lease().clone(),
                 request.state_fence().clone(),
@@ -776,7 +786,10 @@ fn proposed_effect() -> ProposedEffect {
         attempt_id: AttemptId::new("attempt-1").expect("attempt"),
         kind: EffectKind::WriteCandidate,
         scope_ref: "scope-1".to_owned(),
-        payload_digest: "payload-digest-1".to_owned(),
+        payload_digest: serde_json::from_value::<LowercaseSha256>(serde_json::json!(sha256_hex(
+            b"payload-effect-1"
+        )))
+        .expect("canonical effect digest"),
         rationale_ref: None,
     }
 }
