@@ -279,12 +279,12 @@ fn refuse_unsupported_job_class(job: &DreamJobInput) -> Result<(), DreamerError>
 
 /// Slice-1 class dispatch outcome: exactly one arm per closed I9.3 class.
 ///
-/// The three admitted arms proceed to one registry validation and then the
-/// Kernel-owned path; the six refused arms fail closed with
-/// [`DreamerError::UnsupportedJobClass`] before any registry, leaf, or
-/// Kernel-facing call. Exhaustive with no wildcard arm: extending the closed
-/// taxonomy breaks compilation here and in [`refuse_unsupported_job_class`]
-/// until the new class is assigned an owning slice.
+/// Arms are routing identities only, not a second refusal mapping: refusal
+/// authority lives in [`refuse_unsupported_job_class`] plus the exhaustive
+/// [`dispatch_class`] match. Exhaustive with no wildcard arm: extending the
+/// closed taxonomy breaks compilation here and in
+/// [`refuse_unsupported_job_class`] until the new class is assigned an
+/// owning slice.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum ClassArm {
     OrientationAdmitted,
@@ -296,23 +296,6 @@ enum ClassArm {
     MaintenanceAdmitted,
     OrchestrationPlanningRefused,
     ConfigurationAssistanceRefused,
-}
-
-impl ClassArm {
-    /// Reports whether this arm proceeds past the Slice-1 gate.
-    const fn is_admitted(self) -> bool {
-        match self {
-            Self::OrientationAdmitted
-            | Self::ResearchSynthesisAdmitted
-            | Self::MaintenanceAdmitted => true,
-            Self::CurationRefused
-            | Self::ClarificationRefused
-            | Self::ArchitectureSelfQueryRefused
-            | Self::DevelopmentDiagnosisRefused
-            | Self::OrchestrationPlanningRefused
-            | Self::ConfigurationAssistanceRefused => false,
-        }
-    }
 }
 
 /// Routes one closed job class to its distinct Slice-1 arm (I9.3).
@@ -338,16 +321,15 @@ fn dispatch_class(class: JobClass) -> ClassArm {
 /// exactly one registry validation for admitted classes.
 ///
 /// Runs first in [`AuthenticatedKernelJobPort::submit`], before
-/// `check_claimed`/`live_view`, so refused arms — and unknown or uncovered
+/// `check_claimed`/`live_view`, so refused classes — and unknown or uncovered
 /// kinds — fail closed with a typed refusal before any leaf runs and before
-/// any Kernel-facing call. Returns the routed arm plus the validated registry
-/// digest; no handler is invoked on any path.
+/// any Kernel-facing call. The Slice-A gate is the sole refusal authority:
+/// refused classes return before the arm is routed, so there is no second
+/// refusal mapping to diverge. Returns the routed arm plus the validated
+/// registry digest; no handler is invoked on any path.
 fn dispatch_admission(job: &DreamJobInput) -> Result<(ClassArm, String), DreamerError> {
     refuse_unsupported_job_class(job)?;
     let arm = dispatch_class(job.job_class);
-    if !arm.is_admitted() {
-        return Err(DreamerError::UnsupportedJobClass(job.job_class));
-    }
     let digest = semantic_registry::validated_registry_digest()?;
     Ok((arm, digest))
 }
@@ -1003,10 +985,12 @@ mod slice_1_dispatch_tests {
         }
     }
 
-    /// All nine closed classes route to distinct arms: the three Slice-A
-    /// admitted classes to admitted arms, the six refused classes to refused
-    /// arms. No wildcard arm exists, so a tenth class would break compilation
-    /// instead of misrouting.
+    /// All nine closed classes route to distinct arms. No wildcard arm
+    /// exists, so a tenth class would break compilation instead of
+    /// misrouting. Admitted/refused partition is proved by
+    /// `dispatch_admission` outcomes below, not by a second boolean mapping:
+    /// the Slice-A gate plus this exhaustive match are the sole refusal
+    /// authority.
     #[test]
     fn all_nine_classes_route_to_distinct_arms() {
         let routed = [
@@ -1038,16 +1022,6 @@ mod slice_1_dispatch_tests {
         assert_eq!(routed.len(), 9);
         for (class, expected) in routed {
             assert_eq!(dispatch_class(class), expected, "distinct arm for {class:?}");
-            assert_eq!(
-                dispatch_class(class).is_admitted(),
-                matches!(
-                    expected,
-                    ClassArm::OrientationAdmitted
-                        | ClassArm::ResearchSynthesisAdmitted
-                        | ClassArm::MaintenanceAdmitted
-                ),
-                "admission flag for {class:?}"
-            );
         }
         let mut arms: Vec<ClassArm> = routed.iter().map(|(_, arm)| *arm).collect();
         arms.sort_by_key(|arm| *arm as u8);
@@ -1066,7 +1040,6 @@ mod slice_1_dispatch_tests {
         ] {
             let (arm, digest) =
                 dispatch_admission(&job_of_class(class)).expect("admitted class must dispatch");
-            assert!(arm.is_admitted(), "class {class:?} must take an admitted arm");
             assert_eq!(dispatch_class(class), arm);
             assert_eq!(digest.len(), 64, "digest must be sha256 hex");
             assert!(
@@ -1083,24 +1056,40 @@ mod slice_1_dispatch_tests {
         assert_eq!(first, second, "registry identity must be deterministic");
     }
 
-    /// Each refused class fails closed with the exact Slice-A refusal before
-    /// any registry, leaf, or Kernel-facing call: the dispatch takes only
-    /// `&DreamJobInput` and returns a plain result, so there is no port,
-    /// transport, or admission channel it could call, and `submit` invokes it
-    /// before `check_claimed`/`live_view`, the only Kernel-facing calls.
+    /// Each refused class fails closed at the Slice-A gate with the exact
+    /// refusal before any registry, leaf, or Kernel-facing call: the dispatch
+    /// takes only `&DreamJobInput` and returns a plain result, so there is no
+    /// port, transport, or admission channel it could call, and `submit`
+    /// invokes it before `check_claimed`/`live_view`, the only Kernel-facing
+    /// calls. The refused arm identity is routed only for classes the gate
+    /// already refused, so it carries no second refusal decision.
     #[test]
     fn refused_classes_fail_closed_before_registry_or_kernel() {
-        for class in [
-            JobClass::Curation,
-            JobClass::Clarification,
-            JobClass::ArchitectureSelfQuery,
-            JobClass::DevelopmentDiagnosis,
-            JobClass::OrchestrationPlanning,
-            JobClass::ConfigurationAssistance,
-        ] {
-            assert!(
-                !dispatch_class(class).is_admitted(),
-                "class {class:?} must take a refused arm"
+        let refused_arms = [
+            (JobClass::Curation, ClassArm::CurationRefused),
+            (JobClass::Clarification, ClassArm::ClarificationRefused),
+            (
+                JobClass::ArchitectureSelfQuery,
+                ClassArm::ArchitectureSelfQueryRefused,
+            ),
+            (
+                JobClass::DevelopmentDiagnosis,
+                ClassArm::DevelopmentDiagnosisRefused,
+            ),
+            (
+                JobClass::OrchestrationPlanning,
+                ClassArm::OrchestrationPlanningRefused,
+            ),
+            (
+                JobClass::ConfigurationAssistance,
+                ClassArm::ConfigurationAssistanceRefused,
+            ),
+        ];
+        for (class, expected) in refused_arms {
+            assert_eq!(
+                dispatch_class(class),
+                expected,
+                "class {class:?} must route its distinct refused arm"
             );
             let refused = dispatch_admission(&job_of_class(class));
             assert!(
