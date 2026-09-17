@@ -148,10 +148,12 @@ fn test_request(
             .map_err(|error| format!("plan rev: {error}"))?,
         state_fence: fence.clone(),
         privacy_class: PrivacyClass::Private,
+        work_class: "swarm".to_owned(),
         lanes: vec![StaffingLaneRequest {
             work_unit_id: WorkUnitId::new("work-1")
                 .map_err(|error| format!("lane work: {error}"))?,
             role_id: RoleProfileId::new("role-1").map_err(|error| format!("lane role: {error}"))?,
+            work_class: "swarm".to_owned(),
             route_candidates: vec![RouteCandidateEvidence {
                 route: route.clone(),
                 preference_rank: 0,
@@ -279,6 +281,7 @@ impl AdmissionAuthorityPort for FakeAdmission {
             reservation_id: format!("res-{}", definition.definition_id.as_str()),
             definition_id: definition.definition_id.clone(),
             definition_digest: definition.definition_digest.clone(),
+            work_class: definition.work_class.clone(),
             fence: definition.fence.clone(),
         })
     }
@@ -291,6 +294,7 @@ impl AdmissionAuthorityPort for FakeAdmission {
                     .map_err(|error| FabricError::Contract(format!("admission id: {error}")))?,
                 definition_id: reservation.definition_id.clone(),
                 definition_digest: reservation.definition_digest.clone(),
+                work_class: reservation.work_class.clone(),
                 reservation_id: reservation.reservation_id.clone(),
                 fence: reservation.fence.clone(),
                 epoch: reservation.fence.authority_epoch.clone(),
@@ -310,6 +314,7 @@ impl AdmissionAuthorityPort for FakeAdmission {
                     .map_err(|error| FabricError::Contract(format!("admission id: {error}")))?,
                 definition_id: reservation.definition_id.clone(),
                 definition_digest: "f".repeat(64),
+                work_class: reservation.work_class.clone(),
                 reservation_id: reservation.reservation_id.clone(),
                 fence: reservation.fence.clone(),
                 epoch: reservation.fence.authority_epoch.clone(),
@@ -323,6 +328,7 @@ impl AdmissionAuthorityPort for FakeAdmission {
                     .map_err(|error| FabricError::Contract(format!("admission id: {error}")))?,
                 definition_id: reservation.definition_id.clone(),
                 definition_digest: reservation.definition_digest.clone(),
+                work_class: reservation.work_class.clone(),
                 reservation_id: "res-foreign".to_owned(),
                 fence: reservation.fence.clone(),
                 epoch: reservation.fence.authority_epoch.clone(),
@@ -1636,5 +1642,86 @@ fn full_request_to_dispatch_ledger_with_denial_loss_replay() -> TestResult {
         world.fabric.attempt_of(&attempt),
         Some(AttemptLifecycle::ResultSubmitted)
     );
+    Ok(())
+}
+
+// WORK_UNIT_CASE: 872/29 — I14.1 work classes (issue #1698). Each of the nine
+// canonical values threads verbatim through definition, reservation,
+// admission and dispatch; the observable records identify the same class.
+#[test]
+fn work_class_threads_through_definition_reservation_admission_and_dispatch() -> TestResult {
+    let classes = [
+        "control",
+        "interactive",
+        "verification",
+        "canonical_write",
+        "normal_background",
+        "model_jobs",
+        "swarm",
+        "reporting",
+        "maintenance",
+    ];
+    for (index, class) in classes.iter().enumerate() {
+        let route = test_route()?;
+        let mut world = test_world(
+            Some(route.clone()),
+            AdmitMode::Admit,
+            ActivateMode::Activate,
+            EgressMode::Ack,
+            false,
+        )?;
+        let fence = test_fence()?;
+        let mut request = test_request(&fence, &route, &format!("candidate-1698-{index}"))?;
+        request.work_class = (*class).to_owned();
+        for lane in &mut request.lanes {
+            lane.work_class = (*class).to_owned();
+        }
+        let (definition, _candidate) = world.fabric.define_and_plan(request)?;
+        assert_eq!(definition.work_class, *class);
+        let reservation = world
+            .fabric
+            .stage_reservation(&definition.definition_id)?;
+        assert_eq!(reservation.work_class, *class);
+        let admission = world.fabric.commit_admission(&reservation.reservation_id)?;
+        assert_eq!(admission.work_class, *class);
+        let attempt = admission.attempt_ids.first().ok_or("one attempt")?.clone();
+        world.fabric.activate(&admission.admission_id, &attempt)?;
+        let intent = world.fabric.dispatch(
+            &admission.admission_id,
+            &attempt,
+            &format!("dispatch-1698-{index}"),
+        )?;
+        assert_eq!(intent.work_class, *class);
+    }
+    Ok(())
+}
+
+// WORK_UNIT_CASE: 872/30 — I14.1 work classes (issue #1698). An unknown class
+// rejects at definition time with the typed coordinator error before any
+// reservation is staged: no launch, no capacity consumed, no silent default.
+#[test]
+fn work_class_unknown_rejects_before_launch_without_capacity() -> TestResult {
+    let route = test_route()?;
+    let mut world = test_world(
+        Some(route.clone()),
+        AdmitMode::Admit,
+        ActivateMode::Activate,
+        EgressMode::Ack,
+        false,
+    )?;
+    let fence = test_fence()?;
+    let mut request = test_request(&fence, &route, "candidate-1698-unknown")?;
+    request.work_class = "proton".to_owned();
+    for lane in &mut request.lanes {
+        lane.work_class = "proton".to_owned();
+    }
+    match world.fabric.define_and_plan(request) {
+        Err(FabricError::Coordinator(
+            eliot_agent_coordinator::CoordinatorError::UnknownWorkClass(value),
+        )) => assert_eq!(value, "proton"),
+        other => return Err(format!("unknown class must reject typed, got {other:?}").into()),
+    }
+    assert_eq!(counter_value(&world.admission.stage_calls), 0);
+    assert_eq!(counter_value(&world.admission.commit_calls), 0);
     Ok(())
 }

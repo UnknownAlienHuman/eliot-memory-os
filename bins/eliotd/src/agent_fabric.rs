@@ -129,6 +129,10 @@ pub struct SwarmDefinition {
     pub definition_id: CandidateId,
     /// Digest of the exact frozen request bytes.
     pub definition_digest: String,
+    /// I14.1 work class carried verbatim from the admitted request (issue
+    /// #1698). Bound into every reservation, admission and dispatch built
+    /// from this definition; never defaulted.
+    pub work_class: String,
     /// Task identity preserved verbatim.
     pub task_id: String,
     /// Task revision preserved verbatim.
@@ -149,6 +153,9 @@ pub struct Reservation {
     pub definition_id: CandidateId,
     /// Digest of the staged definition; must equal the frozen digest.
     pub definition_digest: String,
+    /// I14.1 work class echoed from the staged definition (issue #1698);
+    /// the fabric rejects a reservation that does not bind the exact class.
+    pub work_class: String,
     /// Fence at staging time.
     pub fence: StateFence,
 }
@@ -163,6 +170,9 @@ pub struct FabricAdmission {
     pub definition_id: CandidateId,
     /// Exact frozen definition digest bound by this admission.
     pub definition_digest: String,
+    /// I14.1 work class bound by this admission (issue #1698); echoes the
+    /// staged reservation and frozen definition exactly.
+    pub work_class: String,
     /// Reservation identity this admission commits.
     pub reservation_id: String,
     /// Fence at admission time.
@@ -203,6 +213,9 @@ pub struct DispatchIntent {
     pub admission_id: AdmissionId,
     /// Registered attempt identity.
     pub attempt_id: AttemptId,
+    /// I14.1 work class carried verbatim from the admission (issue #1698),
+    /// so the dispatch record identifies the same class.
+    pub work_class: String,
     /// Activated launch evidence digest.
     pub activation_digest: String,
     /// Fence carried verbatim from activation.
@@ -699,6 +712,7 @@ impl AgentFabric {
         let definition = SwarmDefinition {
             definition_id: request.candidate_id.clone(),
             definition_digest: digest.clone(),
+            work_class: request.work_class.clone(),
             task_id: request.launch.task_id.as_str().to_owned(),
             task_revision: request.task_revision.clone(),
             plan_revision: request.plan_revision.as_str().to_owned(),
@@ -812,6 +826,14 @@ impl AgentFabric {
                 "reservation does not bind the exact definition".to_owned(),
             ));
         }
+        // I14.1 work class (issue #1698): the staged reservation must echo
+        // the frozen definition class exactly; a class mismatch is a binding
+        // failure, never a silent downgrade.
+        if reservation.work_class != definition.work_class {
+            return Err(FabricError::ReceiptBinding(
+                "reservation does not bind the exact definition work class".to_owned(),
+            ));
+        }
         validate_text(&reservation.reservation_id, "reservation_id")?;
         self.reservations
             .insert(reservation.reservation_id.clone(), reservation.clone());
@@ -895,6 +917,7 @@ impl AgentFabric {
                 .unwrap_or_default()
             || receipt.reservation_id != reservation_id
             || receipt.definition_id != reservation.definition_id
+            || receipt.work_class != reservation.work_class
         {
             return Err(FabricError::ReceiptBinding(
                 "admission receipt does not bind the exact definition digest and reservation"
@@ -1000,6 +1023,13 @@ impl AgentFabric {
     ) -> Result<DispatchIntent, FabricError> {
         validate_text(dispatch_id, "dispatch_id")?;
         let admission_key = admission_id.as_str().to_owned();
+        let admission = self
+            .admissions
+            .get(&admission_key)
+            .cloned()
+            .ok_or_else(|| {
+                FabricError::StaleAdmission(format!("unknown admission {admission_key}"))
+            })?;
         let activation_key = format!("{admission_key}/{}", attempt_id.as_str());
         let evidence = self
             .activations
@@ -1012,6 +1042,7 @@ impl AgentFabric {
             if existing.admission_id == *admission_id
                 && existing.attempt_id == *attempt_id
                 && existing.activation_digest == evidence.activation_digest
+                && existing.work_class == admission.work_class
             {
                 self.record("dispatch_replayed", dispatch_id);
                 return Ok(existing);
@@ -1033,6 +1064,7 @@ impl AgentFabric {
             dispatch_id: dispatch_id.to_owned(),
             admission_id: admission_id.clone(),
             attempt_id: attempt_id.clone(),
+            work_class: admission.work_class.clone(),
             activation_digest: evidence.activation_digest.clone(),
             fence: evidence.fence.clone(),
             epoch: evidence.epoch.clone(),

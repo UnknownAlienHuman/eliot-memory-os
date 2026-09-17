@@ -208,7 +208,7 @@ pub struct StaffingLaneRequest {
     pub work_unit_id: WorkUnitId,
     pub role_id: RoleProfileId,
     /// I14.1 work class (issue #1698) carried verbatim as its canonical
-    /// snake_case spelling. Validated closed at plan time against the Kernel
+    /// `snake_case` spelling. Validated closed at plan time against the Kernel
     /// taxonomy ([`NormalWorkClass`] plus the protected `control` partition);
     /// absent or unknown is rejected, never defaulted.
     pub work_class: String,
