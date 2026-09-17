@@ -15,6 +15,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use eliot_store_api::epistemic_revision::{EpistemicCommit, position_key};
 use eliot_store_api::{
     CanonicalRequestView, CanonicalStoreClient, CanonicalValidationSnapshot, CommitId,
+    ERASURE_PARAM_OPERATION_ID, ERASURE_PARAM_SUBJECT, ERASURE_PARAM_SURFACES,
     EVIDENCE_PACK_MAX_RECORDS, EventId, EventProjectionRelationIntents, NamedMutationOperation,
     NamedReadOperation, NamedReadRequest, NamedReadResponse, OperationId, OperationManifestDigest,
     OrderingHead, OrderingHeadExpectation, OrderingScopeId, OutboxId, OutboxIntent, OutboxState,
@@ -22,8 +23,9 @@ use eliot_store_api::{
     ProjectionStatus, RecoveryRecord, RecoveryRecordKey, RequestMeta, Resubmission, RevisionDelta,
     RevisionHead, RevisionHeadExpectation, RevisionKey, ScopeId, ScopeRevisionView, SplitView,
     StateFence, StoreError, StoreGenesisRequest, StoreHealth, StoreHealthStatus,
-    StoreRecoveryRequest, StoreRecoverySnapshot, WriteReceipt, WriteReceiptStatus,
-    canonical_json_bytes, canonical_request_hash, generated_operation_manifests, genesis_manifest,
+    StoreRecoveryRequest, StoreRecoverySnapshot, TransitionClass, WriteReceipt, WriteReceiptStatus,
+    canonical_json_bytes, canonical_request_hash, decode_erasure_surfaces,
+    generated_operation_manifests, genesis_manifest,
     is_genesis_fence, issue_genesis_receipt_envelope, issue_store_receipt_envelope,
     named_mutation_operation_name, sha256_hex, validate_genesis_receipt_envelope,
     validate_store_receipt_envelope, verify_canonical_request_hash,
@@ -306,6 +308,11 @@ impl MemoryStore {
                 .epistemic_positions
                 .insert(key, (commit, receipt.clone()));
         }
+        // Issue #1712: the admitted erasure operation executes its recorded
+        // plan here, under the same lock as the receipt commit: one identity,
+        // one receipt, recoverable replay without duplicate work. Any other
+        // class is a no-op in this hook.
+        dispatch_apply_erasure(&mut state, &transition)?;
         Ok(commit_transaction(
             &mut state,
             transition,
@@ -314,6 +321,220 @@ impl MemoryStore {
             receipt,
         ))
     }
+}
+
+/// Records one erasure intent on already-locked state (688-B).
+///
+/// Same behavior as [`MemoryStore::record_erasure_intent`]: durable-only
+/// registry write, idempotent on byte-identical re-record,
+/// [`StoreError::IdentityConflict`] on divergence. Split out so the
+/// named-operation commit path can record under its held lock.
+fn record_erasure_intent_state(
+    state: &mut MemoryState,
+    intent: StoreErasureIntent,
+) -> Result<Vec<StoreSurfaceOutcome>, StoreError> {
+    if let Some(existing) = state.erasure_intents.get(intent.operation_id.as_str()) {
+        if existing.intent == intent {
+            return Ok(existing.outcomes.clone());
+        }
+        return Err(StoreError::IdentityConflict);
+    }
+    let outcomes = intent
+        .surfaces
+        .iter()
+        .map(|surface| StoreSurfaceOutcome::NotAttempted { surface: *surface })
+        .collect::<Vec<_>>();
+    state.erasure_intents.insert(
+        intent.operation_id.clone(),
+        ErasureRegistryEntry {
+            intent,
+            outcomes: outcomes.clone(),
+            dispatched: false,
+        },
+    );
+    Ok(outcomes)
+}
+
+/// Executes one recorded erasure intent on already-locked state (688-B).
+///
+/// Same behavior as [`MemoryStore::apply_erasure`], including sealed-outcome
+/// replay without duplicate destructive work. Split out so the
+/// named-operation commit path can dispatch under its held lock.
+fn apply_erasure_state(
+    state: &mut MemoryState,
+    operation_id: &str,
+) -> Result<Vec<StoreSurfaceOutcome>, StoreError> {
+    // Replay: a sealed entry returns its original outcomes verbatim.
+    if let Some(existing) = state.erasure_intents.get(operation_id)
+        && existing.dispatched
+    {
+        return Ok(existing.outcomes.clone());
+    }
+    let (subject, scope_id, surfaces) = {
+        let entry = state
+            .erasure_intents
+            .get(operation_id)
+            .ok_or(StoreError::ReceiptNotFound)?;
+        if entry.dispatched {
+            return Ok(entry.outcomes.clone());
+        }
+        (
+            entry.intent.subject.clone(),
+            entry.intent.scope_id.clone(),
+            entry.intent.surfaces.clone(),
+        )
+    };
+    let mut outcomes = Vec::with_capacity(surfaces.len());
+    let mut store_owned_dispatched = false;
+    for surface in &surfaces {
+        if !surface.is_store_owned() {
+            outcomes.push(StoreSurfaceOutcome::Incomplete { surface: *surface });
+            continue;
+        }
+        // Preserve an already-terminal outcome on this surface instead of
+        // re-running destructive work (partial-resume identity).
+        let preserved = state
+            .erasure_intents
+            .get(operation_id)
+            .and_then(|entry| {
+                entry.outcomes.iter().find(|outcome| {
+                    outcome.surface() == *surface
+                        && !matches!(outcome, StoreSurfaceOutcome::NotAttempted { .. })
+                })
+            })
+            .copied();
+        if let Some(outcome) = preserved {
+            outcomes.push(outcome);
+            if matches!(outcome, StoreSurfaceOutcome::Purged { .. }) {
+                store_owned_dispatched = true;
+            }
+            continue;
+        }
+        // Exact subject match on capture rows admitted under the exact
+        // recorded scope. Ambiguous rows (missing/non-string subject)
+        // never match: they stay and the surface reports `Incomplete`,
+        // preserving `Unknown`-style caution (`Unknown` itself is never
+        // fabricated here).
+        let had_match = state.named_operations.iter().any(|record| {
+            record.scope_id == scope_id
+                && record.operation.operation == NamedMutationOperation::CaptureObservation
+                && record
+                    .operation
+                    .parameters
+                    .get("subject")
+                    .and_then(Value::as_str)
+                    == Some(subject.as_str())
+        });
+        state.named_operations.retain(|record| {
+            !(record.scope_id == scope_id
+                && record.operation.operation == NamedMutationOperation::CaptureObservation
+                && record
+                    .operation
+                    .parameters
+                    .get("subject")
+                    .and_then(Value::as_str)
+                    == Some(subject.as_str()))
+        });
+        if had_match {
+            store_owned_dispatched = true;
+            outcomes.push(StoreSurfaceOutcome::Purged { surface: *surface });
+        } else {
+            // No matching rows under the exact pair: nothing to remove,
+            // which is a complete store-side removal of zero rows.
+            store_owned_dispatched = true;
+            outcomes.push(StoreSurfaceOutcome::Purged { surface: *surface });
+        }
+    }
+    let entry = state
+        .erasure_intents
+        .get_mut(operation_id)
+        .ok_or(StoreError::ReceiptNotFound)?;
+    entry.outcomes.clone_from(&outcomes);
+    entry.dispatched = true;
+    // Suppression is evidence-backed only: recorded intent + dispatched
+    // store-owned removal. Out-of-scope-only intents never suppress.
+    if store_owned_dispatched && surfaces.iter().any(|surface| surface.is_store_owned()) {
+        state
+            .erased_subjects
+            .insert((scope_id.to_string(), subject));
+    }
+    Ok(outcomes)
+}
+
+/// Resolves one handler-surface name of the named erasure transaction.
+///
+/// Closed vocabulary: the eight store surfaces shared with the Surreal
+/// handler. Unknown names fail closed; the bridge never invents a surface.
+fn store_surface_by_name(name: &str) -> Result<StoreErasureSurface, StoreError> {
+    match name {
+        "CanonicalPayload" => Ok(StoreErasureSurface::CanonicalPayload),
+        "Projection" => Ok(StoreErasureSurface::Projection),
+        "Index" => Ok(StoreErasureSurface::Index),
+        "Blob" => Ok(StoreErasureSurface::Blob),
+        "OperationalRecovery" => Ok(StoreErasureSurface::OperationalRecovery),
+        "ProviderCopy" => Ok(StoreErasureSurface::ProviderCopy),
+        "BackupRestorePath" => Ok(StoreErasureSurface::BackupRestorePath),
+        "RouteContinuation" => Ok(StoreErasureSurface::RouteContinuation),
+        _ => Err(StoreError::InvalidField {
+            field: "erasure.surfaces",
+            reason: "unknown erasure surface",
+        }),
+    }
+}
+
+/// Dispatches the admitted `ApplyErasure` named operation (issue #1712).
+///
+/// No-op for every other transition class. For the erasure class the bridge
+/// applies only the recorded plan: subject, scope, and surfaces are copied
+/// verbatim from the admitted parameters into the local intent (recorded
+/// idempotently, so same-operation retry replays instead of duplicating),
+/// then the recorded intent is applied. The stable intent identity must equal
+/// the transition identity, binding record, execution, and receipt under one
+/// identity; divergence is an [`StoreError::IdentityConflict`] with no
+/// destructive effect beyond the already-recorded identical intent.
+fn dispatch_apply_erasure(
+    state: &mut MemoryState,
+    transition: &PreparedTransition,
+) -> Result<(), StoreError> {
+    if transition.transition_class != TransitionClass::Erasure {
+        return Ok(());
+    }
+    let Some(command) = transition.named_operations.first() else {
+        return Err(StoreError::TransitionClassExceeded);
+    };
+    if command.operation != NamedMutationOperation::ApplyErasure {
+        return Err(StoreError::TransitionClassExceeded);
+    }
+    let text_param = |name: &str| {
+        command
+            .parameters
+            .get(name)
+            .and_then(Value::as_str)
+            .ok_or(StoreError::InvalidField {
+                field: "operation.parameter",
+                reason: "missing required parameter",
+            })
+    };
+    let subject = text_param(ERASURE_PARAM_SUBJECT)?;
+    let surfaces_value = text_param(ERASURE_PARAM_SURFACES)?;
+    let operation_id = text_param(ERASURE_PARAM_OPERATION_ID)?;
+    if operation_id != transition.identity.operation_id.to_string() {
+        return Err(StoreError::IdentityConflict);
+    }
+    let mut surfaces = Vec::new();
+    for name in decode_erasure_surfaces(surfaces_value)? {
+        surfaces.push(store_surface_by_name(&name)?);
+    }
+    let intent = StoreErasureIntent {
+        operation_id: operation_id.to_owned(),
+        subject: subject.to_owned(),
+        scope_id: transition.scope_id.clone(),
+        surfaces,
+        state_fence: transition.state_fence.clone(),
+    };
+    record_erasure_intent_state(state, intent)?;
+    apply_erasure_state(state, operation_id)?;
+    Ok(())
 }
 
 fn validate_transaction(
@@ -377,6 +598,10 @@ fn validate_transaction_state(
         .named_operations
         .iter()
         .any(|command| command.operation == NamedMutationOperation::ApplyEpistemicRevision)
+        || transition
+            .named_operations
+            .iter()
+            .any(|command| command.operation == NamedMutationOperation::ApplyErasure)
     {
         return transition.validate_against_catalogue(&generated_operation_manifests()?);
     }
@@ -615,26 +840,7 @@ impl MemoryStore {
     ) -> Result<Vec<StoreSurfaceOutcome>, StoreError> {
         intent.validate()?;
         let mut state = self.lock_state()?;
-        if let Some(existing) = state.erasure_intents.get(intent.operation_id.as_str()) {
-            if existing.intent == intent {
-                return Ok(existing.outcomes.clone());
-            }
-            return Err(StoreError::IdentityConflict);
-        }
-        let outcomes = intent
-            .surfaces
-            .iter()
-            .map(|surface| StoreSurfaceOutcome::NotAttempted { surface: *surface })
-            .collect::<Vec<_>>();
-        state.erasure_intents.insert(
-            intent.operation_id.clone(),
-            ErasureRegistryEntry {
-                intent,
-                outcomes: outcomes.clone(),
-                dispatched: false,
-            },
-        );
-        Ok(outcomes)
+        record_erasure_intent_state(&mut state, intent)
     }
 
     /// Executes one recorded erasure intent (688-B).
@@ -664,101 +870,7 @@ impl MemoryStore {
     ) -> Result<Vec<StoreSurfaceOutcome>, StoreError> {
         validate_erasure_text(operation_id, "erasure.operation_id")?;
         let mut state = self.lock_state()?;
-        // Replay: a sealed entry returns its original outcomes verbatim.
-        if let Some(existing) = state.erasure_intents.get(operation_id)
-            && existing.dispatched
-        {
-            return Ok(existing.outcomes.clone());
-        }
-        let (subject, scope_id, surfaces) = {
-            let entry = state
-                .erasure_intents
-                .get(operation_id)
-                .ok_or(StoreError::ReceiptNotFound)?;
-            if entry.dispatched {
-                return Ok(entry.outcomes.clone());
-            }
-            (
-                entry.intent.subject.clone(),
-                entry.intent.scope_id.clone(),
-                entry.intent.surfaces.clone(),
-            )
-        };
-        let mut outcomes = Vec::with_capacity(surfaces.len());
-        let mut store_owned_dispatched = false;
-        for surface in &surfaces {
-            if !surface.is_store_owned() {
-                outcomes.push(StoreSurfaceOutcome::Incomplete { surface: *surface });
-                continue;
-            }
-            // Preserve an already-terminal outcome on this surface instead of
-            // re-running destructive work (partial-resume identity).
-            let preserved = state
-                .erasure_intents
-                .get(operation_id)
-                .and_then(|entry| {
-                    entry.outcomes.iter().find(|outcome| {
-                        outcome.surface() == *surface
-                            && !matches!(outcome, StoreSurfaceOutcome::NotAttempted { .. })
-                    })
-                })
-                .copied();
-            if let Some(outcome) = preserved {
-                outcomes.push(outcome);
-                if matches!(outcome, StoreSurfaceOutcome::Purged { .. }) {
-                    store_owned_dispatched = true;
-                }
-                continue;
-            }
-            // Exact subject match on capture rows admitted under the exact
-            // recorded scope. Ambiguous rows (missing/non-string subject)
-            // never match: they stay and the surface reports `Incomplete`,
-            // preserving `Unknown`-style caution (`Unknown` itself is never
-            // fabricated here).
-            let had_match = state.named_operations.iter().any(|record| {
-                record.scope_id == scope_id
-                    && record.operation.operation == NamedMutationOperation::CaptureObservation
-                    && record
-                        .operation
-                        .parameters
-                        .get("subject")
-                        .and_then(Value::as_str)
-                        == Some(subject.as_str())
-            });
-            state.named_operations.retain(|record| {
-                !(record.scope_id == scope_id
-                    && record.operation.operation == NamedMutationOperation::CaptureObservation
-                    && record
-                        .operation
-                        .parameters
-                        .get("subject")
-                        .and_then(Value::as_str)
-                        == Some(subject.as_str()))
-            });
-            if had_match {
-                store_owned_dispatched = true;
-                outcomes.push(StoreSurfaceOutcome::Purged { surface: *surface });
-            } else {
-                // No matching rows under the exact pair: nothing to remove,
-                // which is a complete store-side removal of zero rows.
-                store_owned_dispatched = true;
-                outcomes.push(StoreSurfaceOutcome::Purged { surface: *surface });
-            }
-        }
-        let entry = state
-            .erasure_intents
-            .get_mut(operation_id)
-            .ok_or(StoreError::ReceiptNotFound)?;
-        entry.outcomes.clone_from(&outcomes);
-        entry.dispatched = true;
-        // Suppression is evidence-backed only: recorded intent + dispatched
-        // store-owned removal. Out-of-scope-only intents never suppress.
-        if store_owned_dispatched && surfaces.iter().any(|surface| surface.is_store_owned()) {
-            state
-                .erased_subjects
-                .insert((scope_id.to_string(), subject));
-        }
-        Ok(outcomes)
+        apply_erasure_state(&mut state, operation_id)
     }
 
     /// Returns the current per-surface outcomes for one operation, if any.
@@ -3576,6 +3688,248 @@ mod tests {
         assert_eq!(
             pack_records(&store.execute_named_sync(&neighbour_query)?.payload)?.len(),
             1
+        );
+        Ok(())
+    }
+
+    fn erasure_set_digest() -> Result<OperationManifestDigest, StoreError> {
+        Ok(eliot_store_api::operation_manifest_set_digest(
+            &generated_operation_manifests()?,
+        )?)
+    }
+
+    fn named_erasure_transition(
+        operation: &str,
+        idempotency_key: &str,
+        state_fence: &StateFence,
+        ctx: &RequestMeta,
+        subject: &str,
+        approvals: Vec<String>,
+    ) -> Result<PreparedTransition, StoreError> {
+        let request = eliot_store_api::ErasureAdmissionRequest {
+            identity: eliot_store_api::OperationIdentity {
+                operation_id: OperationId::new(operation).map_err(StoreError::Foundation)?,
+                idempotency_key: idempotency_key.to_owned(),
+                canonical_request_hash: "c".repeat(64),
+            },
+            scope_id: ScopeId::new("scope-1")?,
+            ordering_scope: OrderingScopeId::new("scope-1")?,
+            state_fence: state_fence.clone(),
+            subject: subject.to_owned(),
+            surfaces: vec!["CanonicalPayload".to_owned()],
+            reason: "user requested deletion".to_owned(),
+            requester: "user:test".to_owned(),
+            approval_refs: approvals,
+            admission_contract_set_digest: "b".repeat(64),
+            operation_manifest_digest: erasure_set_digest()?,
+            security: eliot_store_api::SecurityContext::default(),
+            event_projection_relation_intents: EventProjectionRelationIntents {
+                event_ids: vec![],
+                projection_kinds: vec![],
+                relation_kinds: vec![],
+            },
+        };
+        let mut prepared = eliot_store_api::admit_erasure_transition(&request)?;
+        let view = CanonicalRequestView::from_apply(ctx, &prepared, &[], &[]);
+        prepared.identity.canonical_request_hash = canonical_request_hash(&view)?;
+        Ok(prepared)
+    }
+
+    fn rebind_erasure_hash(
+        ctx: &RequestMeta,
+        transition: &mut PreparedTransition,
+    ) -> Result<(), StoreError> {
+        let view = CanonicalRequestView::from_apply(ctx, transition, &[], &[]);
+        transition.identity.canonical_request_hash = canonical_request_hash(&view)?;
+        Ok(())
+    }
+
+    #[test]
+    fn named_erasure_stages_receipts_and_replays_without_duplicates() -> Result<(), StoreError> {
+        let state_fence = fence();
+        let ctx = metadata(&state_fence)?;
+        let store = store()?;
+        // Seed one governed observation under the exact admitted pair.
+        store.apply_transaction(
+            &ctx,
+            capture_with_subject("op-seed-1", "doomed-subject", &state_fence, &ctx)?,
+            &[],
+            &[],
+        )?;
+        let query = evidence_pack_query(
+            &state_fence,
+            Some("scope-1"),
+            evidence_params("doomed-subject", "10"),
+        )?;
+        assert_eq!(
+            pack_records(&store.execute_named_sync(&query)?.payload)?.len(),
+            1
+        );
+
+        // Specified request + valid authority stages under one identity and
+        // executes through the named operation into one receipt.
+        let staged = named_erasure_transition(
+            "op-erase-1",
+            "idem-erase-1",
+            &state_fence,
+            &ctx,
+            "doomed-subject",
+            vec!["approval-user-1".to_owned()],
+        )?;
+        let receipt = store.apply_transaction(&ctx, staged.clone(), &[], &[])?;
+        assert_eq!(receipt.transition_class, TransitionClass::Erasure);
+        assert_eq!(receipt.status, WriteReceiptStatus::Committed);
+        // The recorded plan executed: the observation is gone and suppressed.
+        assert!(pack_records(&store.execute_named_sync(&query)?.payload)?.is_empty());
+        assert!(
+            store
+                .erased_subjects()?
+                .iter()
+                .any(|erased| erased.subject == "doomed-subject")
+        );
+
+        // Same key + same hash resolves to the original receipt: no duplicate
+        // destructive work and no second receipt.
+        let replayed = store.apply_transaction(&ctx, staged, &[], &[])?;
+        assert_eq!(replayed, receipt);
+
+        // Same key + different hash is an identity conflict with no effect.
+        let conflicted = named_erasure_transition(
+            "op-erase-2",
+            "idem-erase-1",
+            &state_fence,
+            &ctx,
+            "other-subject",
+            vec!["approval-user-1".to_owned()],
+        )?;
+        assert_eq!(
+            store.apply_transaction(&ctx, conflicted, &[], &[]),
+            Err(StoreError::IdentityConflict)
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn named_erasure_rejects_unapproved_and_out_of_manifest() -> Result<(), StoreError> {
+        let state_fence = fence();
+        let ctx = metadata(&state_fence)?;
+        let store = store()?;
+
+        // No explicit approval: rejected pre-execution with no receipt and no
+        // recorded intent.
+        let mut unapproved = named_erasure_transition(
+            "op-erase-na",
+            "idem-erase-na",
+            &state_fence,
+            &ctx,
+            "doomed-subject",
+            vec!["approval-user-1".to_owned()],
+        )?;
+        unapproved.required_proof_and_approval_refs.clear();
+        rebind_erasure_hash(&ctx, &mut unapproved)?;
+        assert!(matches!(
+            store.apply_transaction(&ctx, unapproved, &[], &[]),
+            Err(StoreError::InvalidField {
+                field: "proof_or_approval_ref",
+                ..
+            })
+        ));
+        assert!(
+            store
+                .receipt_sync(
+                    &OperationId::new("op-erase-na").map_err(StoreError::Foundation)?
+                )?
+                .is_none()
+        );
+        assert_eq!(store.erasure_outcomes("op-erase-na")?, None);
+
+        // Out-of-manifest digest: rejected pre-execution with no receipt.
+        let mut stale = named_erasure_transition(
+            "op-erase-stale",
+            "idem-erase-stale",
+            &state_fence,
+            &ctx,
+            "doomed-subject",
+            vec!["approval-user-1".to_owned()],
+        )?;
+        stale.operation_manifest_digest =
+            OperationManifestDigest::new("0".repeat(64))?;
+        rebind_erasure_hash(&ctx, &mut stale)?;
+        assert_eq!(
+            store.apply_transaction(&ctx, stale, &[], &[]),
+            Err(StoreError::ManifestMismatch)
+        );
+
+        // Unknown surface: the closed shape passes the catalogue gate, then
+        // dispatch refuses with no receipt and no recorded intent.
+        let mut unknown = named_erasure_transition(
+            "op-erase-unknown",
+            "idem-erase-unknown",
+            &state_fence,
+            &ctx,
+            "doomed-subject",
+            vec!["approval-user-1".to_owned()],
+        )?;
+        unknown.named_operations[0]
+            .parameters
+            .insert("surfaces".to_owned(), json!("Nope"));
+        rebind_erasure_hash(&ctx, &mut unknown)?;
+        assert!(matches!(
+            store.apply_transaction(&ctx, unknown, &[], &[]),
+            Err(StoreError::InvalidField {
+                field: "erasure.surfaces",
+                ..
+            })
+        ));
+        assert_eq!(store.erasure_outcomes("op-erase-unknown")?, None);
+        Ok(())
+    }
+
+    /// `ERASURE_STATE_IRREVERSIBLE` restore direction on the reference
+    /// executor (issue #1712): a genuinely committed erasure receipt refuses
+    /// state rehydration, while same-identity replay still returns the
+    /// identical receipt (replay of the deletion proof stays legitimate) and
+    /// a non-erasure receipt stays rehydratable.
+    #[test]
+    fn erasure_receipt_refuses_restore_rehydration_and_replays_identically(
+    ) -> Result<(), StoreError> {
+        use eliot_store_api::ERASURE_STATE_IRREVERSIBLE_CONSTRAINT;
+
+        assert_eq!(
+            ERASURE_STATE_IRREVERSIBLE_CONSTRAINT,
+            "ERASURE_STATE_IRREVERSIBLE"
+        );
+        let state_fence = fence();
+        let ctx = metadata(&state_fence)?;
+        let store = store()?;
+        let staged = named_erasure_transition(
+            "op-erase-guard",
+            "idem-erase-guard",
+            &state_fence,
+            &ctx,
+            "guarded-subject",
+            vec!["approval-user-1".to_owned()],
+        )?;
+        let receipt = store.apply_transaction(&ctx, staged.clone(), &[], &[])?;
+        assert_eq!(receipt.transition_class, TransitionClass::Erasure);
+        assert_eq!(
+            receipt.refuse_rehydration_from_erasure(),
+            Err(StoreError::InvalidReceipt),
+            "a committed erasure receipt must never authorize state rehydration"
+        );
+        // Replay is not rehydration: the same identity resolves to the
+        // identical deletion proof without duplicate destructive work.
+        assert_eq!(
+            store.apply_transaction(&ctx, staged, &[], &[])?,
+            receipt
+        );
+
+        // A non-erasure receipt from the same executor stays rehydratable.
+        let capture = capture_with_subject("op-guard-seed", "kept-subject", &state_fence, &ctx)?;
+        let kept = store.apply_transaction(&ctx, capture, &[], &[])?;
+        assert!(
+            kept.refuse_rehydration_from_erasure().is_ok(),
+            "non-erasure receipt stays rehydratable"
         );
         Ok(())
     }

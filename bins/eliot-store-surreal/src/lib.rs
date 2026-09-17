@@ -1824,6 +1824,113 @@ mod tests {
         );
     }
 
+    fn erasure_transition(
+        fence: &StateFence,
+        manifest_digest: &str,
+    ) -> eliot_store_api::PreparedTransition {
+        use eliot_store_api::{
+            EffectClass, EventProjectionRelationIntents, NamedMutationOperation,
+            NamedMutationRequest, OperationIdentity, OperationManifestDigest, OrderingScopeId,
+            ScopeId, SecurityContext, TransitionClass,
+        };
+        eliot_store_api::PreparedTransition {
+            identity: OperationIdentity {
+                operation_id: OperationId::new("op-erasure-bridge").expect("operation id"),
+                idempotency_key: "idem-erasure-bridge".to_owned(),
+                canonical_request_hash: "c".repeat(64),
+            },
+            state_fence: fence.clone(),
+            scope_id: ScopeId::new("scope-bridge").expect("scope"),
+            task_id: None,
+            ordering_scopes: vec![OrderingScopeId::new("scope-bridge").expect("ordering")],
+            transition_class: TransitionClass::Erasure,
+            requested_effect_ceiling: EffectClass::ReversibleMutation,
+            admission_contract_set_digest: "b".repeat(64),
+            operation_manifest_digest: OperationManifestDigest::new(manifest_digest)
+                .expect("manifest digest"),
+            named_operations: vec![NamedMutationRequest {
+                operation: NamedMutationOperation::ApplyErasure,
+                parameters: std::collections::BTreeMap::from([
+                    ("subject".to_owned(), serde_json::json!("subject-bridge")),
+                    (
+                        "surfaces".to_owned(),
+                        serde_json::json!("CanonicalPayload,Index"),
+                    ),
+                    (
+                        "reason".to_owned(),
+                        serde_json::json!("user requested deletion"),
+                    ),
+                    ("requester".to_owned(), serde_json::json!("user:test")),
+                    (
+                        "erasure_operation_id".to_owned(),
+                        serde_json::json!("op-erasure-bridge"),
+                    ),
+                ]),
+            }],
+            event_projection_relation_intents: EventProjectionRelationIntents {
+                event_ids: Vec::new(),
+                projection_kinds: Vec::new(),
+                relation_kinds: Vec::new(),
+            },
+            security: SecurityContext::default(),
+            required_proof_and_approval_refs: vec!["approval-user-1".to_owned()],
+        }
+    }
+
+    #[test]
+    fn ingress_admits_named_erasure_apply_with_live_catalogue() {
+        use eliot_store_api::{generated_operation_manifests, operation_manifest_set_digest};
+        let config = config();
+        let mut session = admitted_session(&config);
+        let fence = config.runtime_launch.authority_state_fence.clone();
+        let context = request_meta(fence.clone());
+        // The live catalogue digest admits the named erasure operation at
+        // the bins ingress gate: the frame reaches dispatch instead of
+        // failing as an unknown operation.
+        let entries = generated_operation_manifests().expect("catalogue generates");
+        let set_digest = operation_manifest_set_digest(&entries).expect("set digest computes");
+        let transition = erasure_transition(&fence, set_digest.as_str());
+        let identity = session_identity(&context, &transition.identity.idempotency_key);
+        let frame = ingress_frame(
+            &session,
+            &context,
+            identity,
+            Request::Apply {
+                context: context.clone(),
+                transition,
+                expected_revision_heads: Vec::new(),
+                expected_ordering_heads: Vec::new(),
+            },
+        );
+        let request = validate_request_frame(&mut session, &frame)
+            .expect("admitted erasure apply passes ingress");
+        assert!(
+            matches!(request, Request::Apply { .. }),
+            "erasure apply frame reaches dispatch"
+        );
+
+        // A stale manifest digest on the same erasure shape still fails
+        // before any provider effect.
+        let mut session = admitted_session(&config);
+        let stale = erasure_transition(&fence, "stale-manifest-digest");
+        let identity = session_identity(&context, &stale.identity.idempotency_key);
+        let frame = ingress_frame(
+            &session,
+            &context,
+            identity,
+            Request::Apply {
+                context: context.clone(),
+                transition: stale,
+                expected_revision_heads: Vec::new(),
+                expected_ordering_heads: Vec::new(),
+            },
+        );
+        assert!(
+            validate_request_frame(&mut session, &frame).is_err(),
+            "stale erasure manifest must fail before dispatch"
+        );
+    }
+
     #[test]
     fn ingress_rejects_extra_read_parameter_before_dispatch() {
         use eliot_store_api::{NamedReadOperation, ReadConsistency};
