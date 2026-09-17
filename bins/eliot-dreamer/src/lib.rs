@@ -8,9 +8,11 @@ use eliot_cli::kernel_client::{KernelClient, KernelClientError};
 use eliot_contracts::StateFence;
 use eliot_protocol::dreamer_job::{DurableJobResponse, JobState as ProtocolJobState};
 use serde::{Deserialize, Serialize};
-use thiserror::Error;
 
 pub(crate) mod kernel_port;
+mod error;
+
+pub use error::DreamerError;
 
 pub const SERVICE_NAME: &str = "eliot-dreamer";
 pub const PROTOCOL_VERSION: &str = "eliot.dreamer.v1";
@@ -274,6 +276,60 @@ fn refuse_unsupported_job_class(job: &DreamJobInput) -> Result<(), DreamerError>
     }
 }
 
+/// Slice-1 class dispatch outcome: exactly one arm per closed I9.3 class.
+///
+/// Arms are routing identities only, not a second refusal mapping: refusal
+/// authority lives in [`refuse_unsupported_job_class`] plus the exhaustive
+/// [`dispatch_class`] match. Exhaustive with no wildcard arm: extending the
+/// closed taxonomy breaks compilation here and in
+/// [`refuse_unsupported_job_class`] until the new class is assigned an
+/// owning slice.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ClassArm {
+    OrientationAdmitted,
+    CurationRefused,
+    ClarificationRefused,
+    ResearchSynthesisAdmitted,
+    ArchitectureSelfQueryRefused,
+    DevelopmentDiagnosisRefused,
+    MaintenanceAdmitted,
+    OrchestrationPlanningRefused,
+    ConfigurationAssistanceRefused,
+}
+
+/// Routes one closed job class to its distinct Slice-1 arm (I9.3).
+///
+/// Pure: takes only the class and performs no leaf, transport, or
+/// status work, so refused arms perform zero Kernel-facing calls by
+/// construction. Nine distinct arms, exhaustive with no wildcard arm.
+fn dispatch_class(class: JobClass) -> ClassArm {
+    match class {
+        JobClass::Orientation => ClassArm::OrientationAdmitted,
+        JobClass::Curation => ClassArm::CurationRefused,
+        JobClass::Clarification => ClassArm::ClarificationRefused,
+        JobClass::ResearchSynthesis => ClassArm::ResearchSynthesisAdmitted,
+        JobClass::ArchitectureSelfQuery => ClassArm::ArchitectureSelfQueryRefused,
+        JobClass::DevelopmentDiagnosis => ClassArm::DevelopmentDiagnosisRefused,
+        JobClass::Maintenance => ClassArm::MaintenanceAdmitted,
+        JobClass::OrchestrationPlanning => ClassArm::OrchestrationPlanningRefused,
+        JobClass::ConfigurationAssistance => ClassArm::ConfigurationAssistanceRefused,
+    }
+}
+
+/// Slice-1 admission dispatch: Slice-A gate, then the distinct per-class arm.
+///
+/// Runs first in [`AuthenticatedKernelJobPort::submit`], before
+/// `check_claimed`/`live_view`, so refused classes fail closed with a typed
+/// refusal before any leaf runs and before any Kernel-facing call. The
+/// Slice-A gate is the sole refusal authority: refused classes return before
+/// the arm is routed, so there is no second refusal mapping to diverge.
+/// Returns the routed arm; no handler is invoked on any path.
+fn dispatch_admission(job: &DreamJobInput) -> Result<ClassArm, DreamerError> {
+    refuse_unsupported_job_class(job)?;
+    let arm = dispatch_class(job.job_class);
+    Ok(arm)
+}
+
 impl KernelJobPort for AuthenticatedKernelJobPort {
     fn handshake(&mut self) -> Result<KernelHandshake, DreamerError> {
         Ok(self.handshake)
@@ -284,7 +340,10 @@ impl KernelJobPort for AuthenticatedKernelJobPort {
         admission: &KernelJobAdmission,
         job: &DreamJobInput,
     ) -> Result<JobView, DreamerError> {
-        refuse_unsupported_job_class(job)?;
+        // Slice-1 admission dispatch runs the Slice-A gate first, then routes
+        // the distinct per-class arm — all before `check_claimed`/`live_view`,
+        // which remain the only Kernel-facing calls on this path.
+        let _arm = dispatch_admission(job)?;
         self.check_claimed(admission)?;
         self.live_view()
     }
@@ -493,41 +552,8 @@ pub struct JobView {
     pub result: Option<DreamResult>,
 }
 
-#[derive(Debug, Error)]
-pub enum DreamerError {
-    #[error("invalid field: {0}")]
-    InvalidField(&'static str),
-    #[error("input limit exceeded: {0}")]
-    LimitExceeded(&'static str),
-    #[error("invalid admission: {0}")]
-    InvalidAdmission(&'static str),
-    #[error("job already exists: {0}")]
-    DuplicateJob(String),
-    #[error("unknown job: {0}")]
-    UnknownJob(String),
-    #[error("job is not cancellable: {0}")]
-    NotCancellable(String),
-    #[error("{KERNEL_ADMISSION_REQUIRED}: {0}")]
-    KernelAdmissionRequired(String),
-    #[error("unsupported Dreamer job class: {0:?}")]
-    UnsupportedJobClass(JobClass),
-}
-
-impl DreamerError {
-    #[must_use]
-    pub const fn code(&self) -> &'static str {
-        match self {
-            Self::KernelAdmissionRequired(_) => KERNEL_ADMISSION_REQUIRED,
-            Self::InvalidField(_)
-            | Self::LimitExceeded(_)
-            | Self::InvalidAdmission(_)
-            | Self::DuplicateJob(_)
-            | Self::UnknownJob(_)
-            | Self::NotCancellable(_)
-            | Self::UnsupportedJobClass(_) => "DREAMER_REQUEST_REJECTED",
-        }
-    }
-}
+// `DreamerError` is singly owned by `error.rs` and re-exported above; the
+// public path `eliot_dreamer::DreamerError` is unchanged.
 
 /// Production Dreamer composition. It has no local job map: all admission,
 /// cancellation, replay and terminal readback are delegated to Kernel.
@@ -591,20 +617,6 @@ impl<P: KernelJobPort> KernelSupervisedComposition<P> {
         }
         Ok(())
     }
-}
-
-/// T12-08 consumer-linkage prerequisite for issue #702.
-///
-/// Real production references to the five T8-A4-admitted leaves so package
-/// resolution succeeds. Linkage only, not a working job path: no stage
-/// modules, no job execution, and no reference to the still-excluded
-/// `eliot-dreamer-orientation` leaf.
-pub fn admitted_leaf_linkage() {
-    let _ = eliot_dreamer_bundle::plan_bundle;
-    let _ = eliot_dreamer_candidate_validation::validate_grounded_dream_draft_at;
-    let _ = eliot_dreamer_claim_grounding::ground_draft;
-    let _ = eliot_dreamer_rival_model::structure_rival_models;
-    let _ = eliot_dreamer_probe_plan::ProbePlan::new;
 }
 
 #[cfg(test)]
@@ -928,6 +940,221 @@ mod slice_a_dispatch_tests {
                 format!("unsupported Dreamer job class: {class:?}")
             );
             assert_eq!(error.code(), "DREAMER_REQUEST_REJECTED");
+        }
+    }
+}
+
+#[cfg(test)]
+mod slice_1_dispatch_tests {
+    use super::*;
+    use eliot_dreamer_contracts::{
+        BoundCurationCall, ContractViolation, NativeCurationHandler, ProducedCurationContent,
+    };
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    /// Builds a well-formed semantic input for one class. The Slice-1
+    /// dispatch reads only `job_class`, so validity of the remaining fields
+    /// keeps each proof focused on routing rather than input validation.
+    fn job_of_class(class: JobClass) -> DreamJobInput {
+        DreamJobInput {
+            job_id: "job-slice-1".into(),
+            job_class: class,
+            exact_question: "What does ELIOT know about this scope?".into(),
+            requester: "test-harness".into(),
+            scope_id: "scope-slice-1".into(),
+            task_id: None,
+            state_fence: "fence-slice-1".into(),
+            evidence_handles: Vec::new(),
+            memory_handles: Vec::new(),
+            architecture_handles: Vec::new(),
+            implementation_handles: Vec::new(),
+            conformance_handles: Vec::new(),
+            conflicts_and_unknowns: Vec::new(),
+            privacy_profile: "local_only".into(),
+            allowed_tools: Vec::new(),
+            allowed_model_routes: vec!["route-test".into()],
+            budget_units: 1,
+            deadline_ms: 1,
+            output_schema: "eliot.dreamer.v1".into(),
+            forbidden_effects: Vec::new(),
+        }
+    }
+
+    /// All nine closed classes route to distinct arms. No wildcard arm
+    /// exists, so a tenth class would break compilation instead of
+    /// misrouting. Admitted/refused partition is proved by
+    /// `dispatch_admission` outcomes below, not by a second boolean mapping:
+    /// the Slice-A gate plus this exhaustive match are the sole refusal
+    /// authority.
+    #[test]
+    fn all_nine_classes_route_to_distinct_arms() {
+        let routed = [
+            (JobClass::Orientation, ClassArm::OrientationAdmitted),
+            (JobClass::Curation, ClassArm::CurationRefused),
+            (JobClass::Clarification, ClassArm::ClarificationRefused),
+            (
+                JobClass::ResearchSynthesis,
+                ClassArm::ResearchSynthesisAdmitted,
+            ),
+            (
+                JobClass::ArchitectureSelfQuery,
+                ClassArm::ArchitectureSelfQueryRefused,
+            ),
+            (
+                JobClass::DevelopmentDiagnosis,
+                ClassArm::DevelopmentDiagnosisRefused,
+            ),
+            (JobClass::Maintenance, ClassArm::MaintenanceAdmitted),
+            (
+                JobClass::OrchestrationPlanning,
+                ClassArm::OrchestrationPlanningRefused,
+            ),
+            (
+                JobClass::ConfigurationAssistance,
+                ClassArm::ConfigurationAssistanceRefused,
+            ),
+        ];
+        assert_eq!(routed.len(), 9);
+        for (class, expected) in routed {
+            assert_eq!(dispatch_class(class), expected, "distinct arm for {class:?}");
+        }
+        let mut arms: Vec<ClassArm> = routed.iter().map(|(_, arm)| *arm).collect();
+        arms.sort_by_key(|arm| *arm as u8);
+        arms.dedup();
+        assert_eq!(arms.len(), 9, "all nine arms must be distinct");
+    }
+
+    /// Each admitted class dispatches to its distinct admitted arm. No
+    /// digest or validation is performed here: the follow-up issue owns the
+    /// owner-provided registry API.
+    #[test]
+    fn admitted_classes_dispatch_to_admitted_arms() {
+        for class in [
+            JobClass::Orientation,
+            JobClass::ResearchSynthesis,
+            JobClass::Maintenance,
+        ] {
+            let arm =
+                dispatch_admission(&job_of_class(class)).expect("admitted class must dispatch");
+            assert_eq!(dispatch_class(class), arm);
+        }
+        let first = dispatch_admission(&job_of_class(JobClass::Orientation))
+            .expect("admitted class must dispatch");
+        let second = dispatch_admission(&job_of_class(JobClass::Orientation))
+            .expect("admitted class must dispatch");
+        assert_eq!(first, second, "dispatch must be deterministic");
+    }
+
+    /// Each refused class fails closed at the Slice-A gate with the exact
+    /// refusal before any leaf or Kernel-facing call: the dispatch
+    /// takes only `&DreamJobInput` and returns a plain result, so there is no
+    /// port, transport, or admission channel it could call, and `submit`
+    /// invokes it before `check_claimed`/`live_view`, the only Kernel-facing
+    /// calls. The refused arm identity is routed only for classes the gate
+    /// already refused, so it carries no second refusal decision.
+    #[test]
+    fn refused_classes_fail_closed_before_kernel() {
+        let refused_arms = [
+            (JobClass::Curation, ClassArm::CurationRefused),
+            (JobClass::Clarification, ClassArm::ClarificationRefused),
+            (
+                JobClass::ArchitectureSelfQuery,
+                ClassArm::ArchitectureSelfQueryRefused,
+            ),
+            (
+                JobClass::DevelopmentDiagnosis,
+                ClassArm::DevelopmentDiagnosisRefused,
+            ),
+            (
+                JobClass::OrchestrationPlanning,
+                ClassArm::OrchestrationPlanningRefused,
+            ),
+            (
+                JobClass::ConfigurationAssistance,
+                ClassArm::ConfigurationAssistanceRefused,
+            ),
+        ];
+        for (class, expected) in refused_arms {
+            assert_eq!(
+                dispatch_class(class),
+                expected,
+                "class {class:?} must route its distinct refused arm"
+            );
+            let refused = dispatch_admission(&job_of_class(class));
+            assert!(
+                matches!(refused, Err(DreamerError::UnsupportedJobClass(refused_class)) if refused_class == class),
+                "class {class:?} must refuse with UnsupportedJobClass({class:?})"
+            );
+        }
+    }
+
+    /// The Slice-1 typed refusals render their payloads and map to the
+    /// request-rejected code, never to the Kernel-admission code.
+    #[test]
+    fn slice_1_refusal_display_and_code_hold() {
+        let kind_error =
+            DreamerError::UnsupportedCurationKind(eliot_dreamer_contracts::CurationKind::Repair);
+        assert_eq!(
+            format!("{kind_error}"),
+            "unsupported Dreamer curation kind: Repair"
+        );
+        assert_eq!(kind_error.code(), "DREAMER_REQUEST_REJECTED");
+        let registry_error =
+            DreamerError::RegistryNotClosed("incomplete coverage".to_owned());
+        assert_eq!(
+            format!("{registry_error}"),
+            "curation handler registry is not closed: incomplete coverage"
+        );
+        assert_eq!(registry_error.code(), "DREAMER_REQUEST_REJECTED");
+    }
+
+    /// Counting handler double in the contracts owner's blessed shape:
+    /// implementors count real `handle` calls against an injected port. Slice
+    /// 1 exposes no invocation surface, so driving the full admission dispatch
+    /// for every class must leave every counter at
+    /// zero. A later slice wiring a `handle` call into this path trips this
+    /// guard.
+    struct CountingLeaf {
+        calls: AtomicU64,
+    }
+
+    impl NativeCurationHandler for CountingLeaf {
+        fn handle(
+            &self,
+            _call: &BoundCurationCall,
+        ) -> Result<ProducedCurationContent, ContractViolation> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            Err(ContractViolation::Registry(
+                "slice-1 counting double is never invoked".to_owned(),
+            ))
+        }
+    }
+
+    #[test]
+    fn slice_1_dispatch_runs_no_handler() {
+        let leaves: [CountingLeaf; 10] = [0, 1, 2, 3, 4, 5, 6, 7, 8, 9]
+            .map(|_| CountingLeaf {
+                calls: AtomicU64::new(0),
+            });
+        for class in [
+            JobClass::Orientation,
+            JobClass::Curation,
+            JobClass::Clarification,
+            JobClass::ResearchSynthesis,
+            JobClass::ArchitectureSelfQuery,
+            JobClass::DevelopmentDiagnosis,
+            JobClass::Maintenance,
+            JobClass::OrchestrationPlanning,
+            JobClass::ConfigurationAssistance,
+        ] {
+            let _ = dispatch_admission(&job_of_class(class));
+        }
+        for (index, leaf) in leaves.iter().enumerate() {
+            assert_eq!(
+                leaf.calls.load(Ordering::SeqCst),
+                0,
+                "leaf {index} must never be called by Slice-1 dispatch"
+            );
         }
     }
 }
