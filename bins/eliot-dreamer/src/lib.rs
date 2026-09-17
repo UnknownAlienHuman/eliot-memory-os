@@ -11,7 +11,6 @@ use serde::{Deserialize, Serialize};
 
 pub(crate) mod kernel_port;
 mod error;
-mod semantic_registry;
 
 pub use error::DreamerError;
 
@@ -300,7 +299,7 @@ enum ClassArm {
 
 /// Routes one closed job class to its distinct Slice-1 arm (I9.3).
 ///
-/// Pure: takes only the class and performs no registry, leaf, transport, or
+/// Pure: takes only the class and performs no leaf, transport, or
 /// status work, so refused arms perform zero Kernel-facing calls by
 /// construction. Nine distinct arms, exhaustive with no wildcard arm.
 fn dispatch_class(class: JobClass) -> ClassArm {
@@ -317,21 +316,17 @@ fn dispatch_class(class: JobClass) -> ClassArm {
     }
 }
 
-/// Slice-1 admission dispatch: Slice-A gate, distinct per-class arm, then
-/// exactly one registry validation for admitted classes.
+/// Slice-1 admission dispatch: Slice-A gate, then the distinct per-class arm.
 ///
 /// Runs first in [`AuthenticatedKernelJobPort::submit`], before
-/// `check_claimed`/`live_view`, so refused classes — and unknown or uncovered
-/// kinds — fail closed with a typed refusal before any leaf runs and before
-/// any Kernel-facing call. The Slice-A gate is the sole refusal authority:
-/// refused classes return before the arm is routed, so there is no second
-/// refusal mapping to diverge. Returns the routed arm plus the validated
-/// registry digest; no handler is invoked on any path.
-fn dispatch_admission(job: &DreamJobInput) -> Result<(ClassArm, String), DreamerError> {
+/// `check_claimed`/`live_view`, so refused classes fail closed with a typed
+/// refusal before any leaf runs and before any Kernel-facing call. The
+/// Slice-A gate is the sole refusal authority: refused classes return before
+/// the arm is routed, so there is no second refusal mapping to diverge.
+/// Returns the routed arm; no handler is invoked on any path.
+fn dispatch_admission(job: &DreamJobInput) -> Result<ClassArm, DreamerError> {
     refuse_unsupported_job_class(job)?;
-    let arm = dispatch_class(job.job_class);
-    let digest = semantic_registry::validated_registry_digest()?;
-    Ok((arm, digest))
+    Ok(dispatch_class(job.job_class))
 }
 
 impl KernelJobPort for AuthenticatedKernelJobPort {
@@ -345,10 +340,9 @@ impl KernelJobPort for AuthenticatedKernelJobPort {
         job: &DreamJobInput,
     ) -> Result<JobView, DreamerError> {
         // Slice-1 admission dispatch runs the Slice-A gate first, then routes
-        // the distinct per-class arm and validates the registry once for
-        // admitted classes — all before `check_claimed`/`live_view`, which
-        // remain the only Kernel-facing calls on this path.
-        let (_arm, _registry_digest) = dispatch_admission(job)?;
+        // the distinct per-class arm — all before `check_claimed`/`live_view`,
+        // which remain the only Kernel-facing calls on this path.
+        let _arm = dispatch_admission(job)?;
         self.check_claimed(admission)?;
         self.live_view()
     }
@@ -1029,42 +1023,36 @@ mod slice_1_dispatch_tests {
         assert_eq!(arms.len(), 9, "all nine arms must be distinct");
     }
 
-    /// Each admitted class validates the registry once per admission and
-    /// receives the deterministic closed-registry digest.
+    /// Each admitted class dispatches to its distinct admitted arm. No
+    /// digest or validation is performed here: the follow-up issue owns the
+    /// owner-provided registry API.
     #[test]
-    fn admitted_classes_validate_registry_once_per_admission() {
+    fn admitted_classes_dispatch_to_admitted_arms() {
         for class in [
             JobClass::Orientation,
             JobClass::ResearchSynthesis,
             JobClass::Maintenance,
         ] {
-            let (arm, digest) =
+            let arm =
                 dispatch_admission(&job_of_class(class)).expect("admitted class must dispatch");
             assert_eq!(dispatch_class(class), arm);
-            assert_eq!(digest.len(), 64, "digest must be sha256 hex");
-            assert!(
-                digest
-                    .chars()
-                    .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase()),
-                "digest must be lowercase hex"
-            );
         }
-        let (_, first) = dispatch_admission(&job_of_class(JobClass::Orientation))
+        let first = dispatch_admission(&job_of_class(JobClass::Orientation))
             .expect("admitted class must dispatch");
-        let (_, second) = dispatch_admission(&job_of_class(JobClass::Orientation))
+        let second = dispatch_admission(&job_of_class(JobClass::Orientation))
             .expect("admitted class must dispatch");
-        assert_eq!(first, second, "registry identity must be deterministic");
+        assert_eq!(first, second, "dispatch must be deterministic");
     }
 
     /// Each refused class fails closed at the Slice-A gate with the exact
-    /// refusal before any registry, leaf, or Kernel-facing call: the dispatch
+    /// refusal before any leaf or Kernel-facing call: the dispatch
     /// takes only `&DreamJobInput` and returns a plain result, so there is no
     /// port, transport, or admission channel it could call, and `submit`
     /// invokes it before `check_claimed`/`live_view`, the only Kernel-facing
     /// calls. The refused arm identity is routed only for classes the gate
     /// already refused, so it carries no second refusal decision.
     #[test]
-    fn refused_classes_fail_closed_before_registry_or_kernel() {
+    fn refused_classes_fail_closed_before_kernel() {
         let refused_arms = [
             (JobClass::Curation, ClassArm::CurationRefused),
             (JobClass::Clarification, ClassArm::ClarificationRefused),
@@ -1122,7 +1110,7 @@ mod slice_1_dispatch_tests {
     /// Counting handler double in the contracts owner's blessed shape:
     /// implementors count real `handle` calls against an injected port. Slice
     /// 1 exposes no invocation surface, so driving the full admission dispatch
-    /// for every class plus a registry validation must leave every counter at
+    /// for every class must leave every counter at
     /// zero. A later slice wiring a `handle` call into this path trips this
     /// guard.
     struct CountingLeaf {
@@ -1160,7 +1148,6 @@ mod slice_1_dispatch_tests {
         ] {
             let _ = dispatch_admission(&job_of_class(class));
         }
-        let _ = semantic_registry::validated_registry_digest();
         for (index, leaf) in leaves.iter().enumerate() {
             assert_eq!(
                 leaf.calls.load(Ordering::SeqCst),
