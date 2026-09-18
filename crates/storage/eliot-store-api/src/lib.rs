@@ -37,6 +37,7 @@ mod payload_authority;
 mod request_hash;
 mod store_failure;
 mod wire;
+pub mod write_admission;
 
 pub use dreamer_job::{
     DREAMER_JOB_LEDGER_SCHEMA, DreamerJobExpectedState, DreamerJobLedgerEvent,
@@ -57,13 +58,12 @@ pub use request_hash::{
 };
 
 pub use store_failure::{
-    ErasureFailureKind, MAX_STORE_FAILURE_DETAIL_LEN,
-    MAX_STORE_FAILURE_EVIDENCE_HANDLES, MAX_STORE_FAILURE_REFERENCE_LEN,
-    MAX_STORE_FAILURE_RETRY_AFTER_MS, MAX_STORE_REASON_CODE_LEN, STORE_FAILURE_CONTRACT_REVISION,
-    StoreConflictObservation, StoreEvidenceHandles, StoreFailure, StoreFailureContractError,
-    StoreFailureDisposition, StoreFailureIdentityContext, StoreFailureRequestContext,
-    StoreMutationDisposition, StoreReasonCode, StoreRecoveryAction, StoreRetryDirective,
-    erasure_store_failure,
+    ErasureFailureKind, MAX_STORE_FAILURE_DETAIL_LEN, MAX_STORE_FAILURE_EVIDENCE_HANDLES,
+    MAX_STORE_FAILURE_REFERENCE_LEN, MAX_STORE_FAILURE_RETRY_AFTER_MS, MAX_STORE_REASON_CODE_LEN,
+    STORE_FAILURE_CONTRACT_REVISION, StoreConflictObservation, StoreEvidenceHandles, StoreFailure,
+    StoreFailureContractError, StoreFailureDisposition, StoreFailureIdentityContext,
+    StoreFailureRequestContext, StoreMutationDisposition, StoreReasonCode, StoreRecoveryAction,
+    StoreRetryDirective, erasure_store_failure,
 };
 
 pub use wire::{
@@ -91,6 +91,12 @@ pub use erasure_admission::{
     ERASURE_PARAM_SUBJECT, ERASURE_PARAM_SURFACES, ERASURE_SURFACE_SEPARATOR,
     ErasureAdmissionRequest, admit_erasure_transition, decode_erasure_surfaces,
     encode_erasure_surfaces,
+};
+
+pub use write_admission::{
+    MAX_WRITE_ADMISSION_LABEL_BYTES, MAX_WRITE_ADMISSION_SCOPES, ReservedScopeBinding,
+    ReservedWriteRequest, WRITE_ADMISSION_CONTRACT_VERSION, WriteAdmissionParams,
+    WriteAdmissionProjection, WriterEpochBinding, prepared_transition_digest,
 };
 
 pub use operation_catalogue::{
@@ -2392,6 +2398,24 @@ pub trait CanonicalStoreClient: Send + Sync {
         expected_revision_heads: Vec<RevisionHeadExpectation>,
         expected_ordering_heads: Vec<OrderingHeadExpectation>,
     ) -> Result<WriteReceipt, StoreError>;
+
+    /// Applies one closed reserved-write request carrying ORS-admitted
+    /// reservation evidence (issue #990).
+    ///
+    /// The default body checks the closed request shape and then refuses with
+    /// [`StoreError::Unavailable`] without effects: it never delegates to the
+    /// unreserved [`apply_prepared`](Self::apply_prepared) path as a
+    /// fallback, and it manufactures no receipt. An optional method
+    /// declaration cannot advertise runtime support; the later process owner
+    /// enables this operation only with a real backend behind it. Existing
+    /// direct apply behavior is unchanged.
+    async fn apply_reserved_write(
+        &self,
+        request: ReservedWriteRequest,
+    ) -> Result<WriteReceipt, StoreError> {
+        request.validate()?;
+        Err(StoreError::Unavailable)
+    }
 
     /// Reads one bounded, same-fence recovery snapshot. Wave 1 keeps the
     /// provider/state implementation out of this neutral contract crate.
