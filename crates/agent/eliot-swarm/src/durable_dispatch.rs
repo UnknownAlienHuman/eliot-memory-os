@@ -15,6 +15,7 @@
 
 use eliot_agent_api::WorkLeaseId;
 use eliot_agent_contracts::{AgentAttemptId, RevisionId, WorkItem, WorkItemId};
+use eliot_coordination::{SwarmPlanAttachmentError, SwarmPlanAttachmentLedger};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
@@ -33,8 +34,9 @@ pub const JOB_OWNER: &str = "Governor";
 /// One admitted plan bound to one Governor-owned durable job.
 ///
 /// The job handle is opaque owner lineage: this cell never parses, mints, or
-/// reassigns it. Singularity (one job per plan revision) is enforced by
-/// [`assert_single_attachment`]; the Governor receipt pins the exact binding.
+/// reassigns it. Singularity (one job per plan revision) is enforced by the
+/// Governor canonical attach-once decision inside [`attach_plan_job`]; the
+/// Governor receipt pins the exact binding.
 #[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct DurableJobAttachment {
@@ -118,17 +120,61 @@ pub enum ReplayVerdict {
 
 /// Attaches one admitted plan to one Governor-owned durable job.
 ///
+/// Singularity (one job per admitted plan revision) is decided by the Governor
+/// canonical attach-once owner, not by this cell: the canonical
+/// [`SwarmPlanAttachmentLedger::attach_plan_once`] decision runs BEFORE the
+/// attachment value is constructed, so two calls for the same plan revision
+/// with different job handles cannot both succeed against the same owner. An
+/// unbound key records and returns the exact binding; an identically bound key
+/// replays idempotently; a key bound to a different job or fence digest is
+/// [`SwarmError::OwnershipConflict`], naming the canonical winner.
+///
 /// Fail-closed: a blank handle never attaches, a missing verifier is
-/// [`SwarmError::PlanGap`], and a non-Governor or fence-mismatched receipt is
-/// rejected by the shared receipt validation.
+/// [`SwarmError::PlanGap`], a non-Governor or plan/fence-mismatched receipt is
+/// rejected by the shared receipt validation, and a canon binding that does
+/// not echo the requested job/fence is refused as an internal contract
+/// violation.
+///
+/// Durable-binding remainder (BLOCKED): the ledger above is the Governor-owned
+/// in-memory canon for this process. Cross-process and restart durability
+/// needs a production `SwarmPlanAttachmentStore` behind
+/// `attach_plan_once_durable`; no production store implementation exists yet,
+/// and binding the trait to the real Governor canonical-write path is queued
+/// remainder in the canon crate
+/// (`crates/governor/eliot-coordination/src/swarm_plan_attachment.rs`: store
+/// contract plus durable entry point). This function does not fake durability:
+/// it enforces attach-once against the Governor owner it is given.
 pub fn attach_plan_job(
     plan: &AdmittedSwarmPlan,
+    owner: &SwarmPlanAttachmentLedger,
     job_handle: &str,
     attachment_receipt: ReceiptEnvelope,
     verifier: Option<&dyn ReceiptVerificationPort>,
 ) -> Result<DurableJobAttachment, SwarmError> {
     validate_text(job_handle, "job_handle")?;
     let binding: &ProviderBinding = plan.provider_binding();
+    let fence_digest = binding.state_fence_digest.as_str();
+    let canon = owner
+        .attach_plan_once(
+            plan.admission_receipt().identity.canonical_sha256.as_str(),
+            plan.revision().as_str(),
+            job_handle,
+            fence_digest,
+        )
+        .map_err(|error| match error {
+            SwarmPlanAttachmentError::OwnershipConflict { .. } => SwarmError::OwnershipConflict,
+            SwarmPlanAttachmentError::InvalidSnapshot => SwarmError::InvalidSnapshot,
+            SwarmPlanAttachmentError::Serialization => SwarmError::Serialization,
+            // Unreachable through this path: the handle is validated above and
+            // the remaining identities come from the admitted plan, so a canon
+            // input refusal is an internal contract violation.
+            SwarmPlanAttachmentError::InvalidField(_) => SwarmError::Contract,
+        })?;
+    // The canon echoes the requested tuple on success; refuse anything else
+    // rather than sealing a binding the owner did not decide.
+    if canon.job_handle() != job_handle || canon.fence_digest() != fence_digest {
+        return Err(SwarmError::Contract);
+    }
     let request = ProviderRequest {
         operation_kind: JOB_ATTACH_OPERATION.to_owned(),
         artifact_digest: digest(&(
@@ -149,8 +195,13 @@ pub fn attach_plan_job(
     })
 }
 
-/// Enforces one job per plan revision.
+/// Defense-in-depth re-check for one job per plan revision.
 ///
+/// Enforcement lives in the Governor canonical attach-once decision consulted
+/// by [`attach_plan_job`]; this helper only re-compares two already-built
+/// attachment values for callers that still hold a prior value (for example,
+/// to notice a stale in-memory copy). It cannot see Governor state, so passing
+/// `None` or omitting the call never establishes singularity on its own.
 /// Re-attaching the same handle is idempotent; a different handle for the
 /// same plan revision is [`SwarmError::OwnershipConflict`]. Attachments for
 /// other plan revisions are out of scope for this check and pass through.
@@ -262,6 +313,7 @@ mod tests {
     use std::error::Error;
 
     use eliot_agent_contracts::WorkItemState;
+    use eliot_coordination::SwarmPlanAttachmentLedger;
     use eliot_receipts::{ReceiptCore, WorkScopeBinding};
     use serde_json::{Value, json};
 
@@ -569,11 +621,18 @@ mod tests {
 
     fn attached(
         plan: &AdmittedSwarmPlan,
+        owner: &SwarmPlanAttachmentLedger,
         job_handle: &str,
     ) -> Result<DurableJobAttachment, Box<dyn Error>> {
         let request = attach_request(plan.provider_binding(), job_handle)?;
         let receipt = receipt_for(JOB_OWNER, &request, None)?;
-        Ok(attach_plan_job(plan, job_handle, receipt, Some(&Trusted))?)
+        Ok(attach_plan_job(
+            plan,
+            owner,
+            job_handle,
+            receipt,
+            Some(&Trusted),
+        )?)
     }
 
     fn grant(stale: bool) -> RouteGrant {
@@ -588,7 +647,8 @@ mod tests {
 
     fn dispatched() -> Result<DispatchedLaunch, Box<dyn Error>> {
         let plan = admitted_plan()?;
-        let attachment = attached(&plan, "job-1")?;
+        let owner = SwarmPlanAttachmentLedger::new();
+        let attachment = attached(&plan, &owner, "job-1")?;
         let item = plan
             .work_items()
             .iter()
@@ -609,29 +669,70 @@ mod tests {
     }
 
     #[test]
-    fn attach_seals_exact_job_plan_and_fence() -> TestResult {
+    fn attach_rejects_plan_or_fence_mismatched_receipt() -> TestResult {
         let plan = admitted_plan()?;
-        let attachment = attached(&plan, "job-1")?;
-        assert_eq!(attachment.job_handle(), "job-1");
-        assert_eq!(attachment.plan_revision(), plan.revision());
+        let owner = SwarmPlanAttachmentLedger::new();
+        let request = attach_request(plan.provider_binding(), "job-1")?;
+        let receipt = receipt_for(JOB_OWNER, &request, None)?;
+
+        // Plan seal: identical receipt shape with a drifted task revision.
+        let mut wrong_plan_core = receipt.core.clone();
+        wrong_plan_core
+            .task
+            .as_mut()
+            .ok_or("missing task")?
+            .task_revision = serde_json::from_value(json!(2_u64))?;
+        let wrong_plan = ReceiptEnvelope::issue(wrong_plan_core)?;
         assert_eq!(
-            attachment.state_fence_digest(),
-            plan.provider_binding().state_fence_digest
+            attach_plan_job(&plan, &owner, "job-1", wrong_plan, Some(&Trusted)),
+            Err(SwarmError::BindingMismatch)
         );
+
+        // Fence seal: every fence in the core rotates coherently to a new
+        // valid fence the plan was never admitted under. A single-field
+        // rotation cannot stay structurally valid (`ReceiptEnvelope::issue`
+        // requires all core fences to agree), so the rotation must be coherent
+        // for the rejection to prove the binding check rather than issuance.
+        let mut wrong_fence_core = receipt.core.clone();
+        let mut rotated = wrong_fence_core.work_scope.state_fence.clone();
+        rotated.resource_generation = serde_json::from_value(json!(2_u64))?;
+        wrong_fence_core.work_scope.resource_generation = rotated.resource_generation;
+        wrong_fence_core.work_scope.state_fence = rotated.clone();
+        wrong_fence_core
+            .task
+            .as_mut()
+            .ok_or("missing task")?
+            .state_fence = rotated.clone();
+        wrong_fence_core
+            .session
+            .as_mut()
+            .ok_or("missing session")?
+            .state_fence = rotated.clone();
+        wrong_fence_core.causal.state_fence = rotated.clone();
+        wrong_fence_core.request.metadata.state_fence = rotated.clone();
+        wrong_fence_core.request.state_fence = rotated.clone();
+        wrong_fence_core.operation.state_fence = rotated.clone();
+        if let Some(verifier) = wrong_fence_core.verifier.as_mut() {
+            verifier.state_fence = rotated.clone();
+        }
+        wrong_fence_core.authority.state_fence = rotated;
+        let wrong_fence = ReceiptEnvelope::issue(wrong_fence_core)?;
         assert_eq!(
-            attachment.attachment_receipt_digest(),
-            attachment.attachment_receipt().identity.canonical_sha256
+            attach_plan_job(&plan, &owner, "job-1", wrong_fence, Some(&Trusted)),
+            Err(SwarmError::BindingMismatch)
         );
+
         Ok(())
     }
 
     #[test]
     fn attach_rejects_blank_job_handle_before_receipt_use() -> TestResult {
         let plan = admitted_plan()?;
+        let owner = SwarmPlanAttachmentLedger::new();
         let request = attach_request(plan.provider_binding(), "job-1")?;
         let receipt = receipt_for(JOB_OWNER, &request, None)?;
         assert_eq!(
-            attach_plan_job(&plan, "   ", receipt, Some(&Trusted)),
+            attach_plan_job(&plan, &owner, "   ", receipt, Some(&Trusted)),
             Err(SwarmError::Blank("job_handle"))
         );
         Ok(())
@@ -640,10 +741,11 @@ mod tests {
     #[test]
     fn attach_requires_verifier_fail_closed() -> TestResult {
         let plan = admitted_plan()?;
+        let owner = SwarmPlanAttachmentLedger::new();
         let request = attach_request(plan.provider_binding(), "job-1")?;
         let receipt = receipt_for(JOB_OWNER, &request, None)?;
         assert_eq!(
-            attach_plan_job(&plan, "job-1", receipt, None),
+            attach_plan_job(&plan, &owner, "job-1", receipt, None),
             Err(SwarmError::PlanGap(RequiredProvider::ReceiptVerifier))
         );
         Ok(())
@@ -652,10 +754,11 @@ mod tests {
     #[test]
     fn attach_rejects_foreign_owner_receipt() -> TestResult {
         let plan = admitted_plan()?;
+        let owner = SwarmPlanAttachmentLedger::new();
         let request = attach_request(plan.provider_binding(), "job-1")?;
         let receipt = receipt_for("A-02", &request, None)?;
         assert_eq!(
-            attach_plan_job(&plan, "job-1", receipt, Some(&Trusted)),
+            attach_plan_job(&plan, &owner, "job-1", receipt, Some(&Trusted)),
             Err(SwarmError::InvalidReceipt)
         );
         Ok(())
@@ -664,6 +767,7 @@ mod tests {
     #[test]
     fn attach_rejects_task_mismatched_receipt() -> TestResult {
         let plan = admitted_plan()?;
+        let owner = SwarmPlanAttachmentLedger::new();
         let request = attach_request(plan.provider_binding(), "job-1")?;
         let receipt = receipt_for(JOB_OWNER, &request, None)?;
         // Same request digest (artifacts match) but a forged task binding.
@@ -672,7 +776,7 @@ mod tests {
             serde_json::from_value(json!("task-2"))?;
         let forged = ReceiptEnvelope::issue(core)?;
         assert_eq!(
-            attach_plan_job(&plan, "job-1", forged, Some(&Trusted)),
+            attach_plan_job(&plan, &owner, "job-1", forged, Some(&Trusted)),
             Err(SwarmError::BindingMismatch)
         );
         Ok(())
@@ -681,11 +785,25 @@ mod tests {
     #[test]
     fn single_attachment_conflicts_on_second_job() -> TestResult {
         let plan = admitted_plan()?;
-        let first = attached(&plan, "job-1")?;
-        let same = attached(&plan, "job-1")?;
+        let owner = SwarmPlanAttachmentLedger::new();
+        let first = attached(&plan, &owner, "job-1")?;
+        // Identical replay against the Governor canon is idempotent.
+        let same = attached(&plan, &owner, "job-1")?;
+        assert_eq!(first, same);
         assert!(assert_single_attachment(None, &first).is_ok());
         assert!(assert_single_attachment(Some(&first), &same).is_ok());
-        let second = attached(&plan, "job-2")?;
+        // A second job for the same plan revision loses at the canon: without
+        // the Governor call both attaches would succeed.
+        let request = attach_request(plan.provider_binding(), "job-2")?;
+        let receipt = receipt_for(JOB_OWNER, &request, None)?;
+        assert_eq!(
+            attach_plan_job(&plan, &owner, "job-2", receipt, Some(&Trusted)),
+            Err(SwarmError::OwnershipConflict)
+        );
+        // The defense-in-depth helper still names the conflict when handed two
+        // divergent attachment values (built here against a rival owner).
+        let rival_owner = SwarmPlanAttachmentLedger::new();
+        let second = attached(&plan, &rival_owner, "job-2")?;
         assert_eq!(
             assert_single_attachment(Some(&first), &second),
             Err(SwarmError::OwnershipConflict)
@@ -717,7 +835,8 @@ mod tests {
     #[test]
     fn dispatch_blocks_stale_grant_without_fallback() -> TestResult {
         let plan = admitted_plan()?;
-        let attachment = attached(&plan, "job-1")?;
+        let owner = SwarmPlanAttachmentLedger::new();
+        let attachment = attached(&plan, &owner, "job-1")?;
         let item = plan.work_items()[0].clone();
         let work_id = WorkUnitId::new("unit-1")?;
         assert_eq!(
@@ -739,7 +858,8 @@ mod tests {
     #[test]
     fn dispatch_rejects_foreign_plan_revision() -> TestResult {
         let plan = admitted_plan()?;
-        let attachment = attached(&plan, "job-1")?;
+        let owner = SwarmPlanAttachmentLedger::new();
+        let attachment = attached(&plan, &owner, "job-1")?;
         let mut item = plan.work_items()[0].clone();
         item.plan_revision = RevisionId::new("plan-2")?;
         let work_id = WorkUnitId::new("unit-1")?;

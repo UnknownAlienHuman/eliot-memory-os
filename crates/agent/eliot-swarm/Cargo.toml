@@ -17,6 +17,7 @@ workspace_admission = "retire-candidate per #1139 (closed via PR #1673); provide
 [dependencies]
 eliot-agent-api.workspace = true
 eliot-agent-contracts.workspace = true
+eliot-coordination.workspace = true
 eliot-evidence.workspace = true
 eliot-receipts.workspace = true
 eliot-security-contracts.workspace = true
