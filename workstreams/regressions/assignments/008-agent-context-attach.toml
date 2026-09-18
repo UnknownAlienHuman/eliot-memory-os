@@ -8,12 +8,12 @@ proof_ceiling = "TASK_BOUND_ONBOARDING_EDGE_CANDIDATE_ONLY"
 issue = 8
 agent_bridge_issue = 77
 activation_parent_issue = 66
-activation_receiver_issue = 1095
+activation_receiver_issue = 1115
 activation_producer_issue = 839
 operator_issue = 1105
 parent_product_issue = 11
 base_branch = "main"
-base_sha = "8ebf8b41847391c340393d56aeb14dd4f2b5e37b"
+base_sha = "4558a5816f8861a0ca2bf31fe8985d5caa526a0c"
 normative_pair_ref = "docs/normative-pair.toml"
 
 [work_unit]
