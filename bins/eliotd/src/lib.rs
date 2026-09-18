@@ -397,12 +397,13 @@ impl DaemonComposition {
     /// v1-compat only. This method must not consume v2 typed-result data;
     /// `resolve_agent_activation_v2` is the single production resolver spine.
     /// Behavior is preserved (only `Resolved` maps; every other outcome is an
-    /// error, never coerced to success) so the current runtime call site keeps
-    /// working until Slice 2 migrates it to v2.
+    /// error, never coerced to success) so existing compatibility consumers keep
+    /// working. The runtime production path already resolves through v2 (the
+    /// `daemon_runtime` claim arm); this v1 method has no production caller.
     ///
-    /// Removal is owned separately by the #839 follow-up (Slice 2 migrates the
-    /// daemon runtime call site to v2) with final v1 retirement tracked by #66;
-    /// this method is not removed as opportunistic cleanup.
+    /// Final v1 retirement is tracked by #66 (#204 removes the success-only
+    /// compatibility path after the complete migration passes); this method is
+    /// not removed as opportunistic cleanup.
     ///
     /// The Governor typed outcome is the sole discriminator: only `Resolved`
     /// produces a decision. Every other outcome is surfaced as an error and is

@@ -692,11 +692,16 @@ impl KernelComposition {
     /// Loads the exact retained typed resolution result for an Activation
     /// envelope without invoking the semantic resolver.
     ///
-    /// A missing ticket or a ticket without a retained result is an unknown
-    /// operation; a result bound to another connection fails closed; a digest
-    /// or fence mismatch is an identity conflict; a non-resolved disposition
-    /// fails closed without yielding any binding.
-    fn host_request_activation_resolution(
+    /// The canonical v2 envelope ledger (`pending.results`, retained with its
+    /// submission phase by the production submit path) is authoritative and is
+    /// read first; the unenveloped P-04 raw map is a compatibility fallback.
+    /// This matches the bridge waiter priority (v2 envelope wins over the raw
+    /// leg), so one ticket exposes one result identity on both the daemon and
+    /// host-request legs. A missing ticket or a ticket without a retained
+    /// result is an unknown operation; a result bound to another connection
+    /// fails closed; a digest or fence mismatch is an identity conflict; a
+    /// non-resolved disposition fails closed without yielding any binding.
+    pub(super) fn host_request_activation_resolution(
         &self,
         envelope: &HostRequestEnvelope,
     ) -> Result<AgentActivationResolutionResult, TransportError> {
@@ -704,21 +709,27 @@ impl KernelComposition {
             .activation_binding
             .as_ref()
             .ok_or(TransportError::SessionFenced)?;
-        let ticket_connection = {
+        let retained = {
             let pending = self
                 .agent_activation_pending
                 .lock()
                 .map_err(|_| TransportError::SessionFenced)?;
-            pending
+            let ticket_connection = pending
                 .entries
                 .get(&activation_binding.ticket_id)
                 .map(|entry| entry.ticket.connection_id.clone())
-                .ok_or(TransportError::UnknownRequest)?
+                .ok_or(TransportError::UnknownRequest)?;
+            if ticket_connection != envelope.connection_id {
+                return Err(TransportError::SessionFenced);
+            }
+            pending
+                .results
+                .get(&activation_binding.ticket_id)
+                .map(|record| record.result.clone())
         };
-        if ticket_connection != envelope.connection_id {
-            return Err(TransportError::SessionFenced);
-        }
-        let result: AgentActivationResolutionResult = {
+        let result: AgentActivationResolutionResult = if let Some(result) = retained {
+            result
+        } else {
             let results = self
                 .agent_activation_results
                 .lock()
