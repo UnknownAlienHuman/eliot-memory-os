@@ -485,10 +485,14 @@ pub enum DurableEvent {
     StaleFenceObserved(FenceEvidence),
 }
 
-/// Request the adapter to advance one stage through the cycle controller.
+/// Inert, non-authoritative stage transition proposal emitted by the Dreamer controller.
+///
+/// This carries NO execution rights or authority; it serves strictly as an inert
+/// transition proposal that must be validated and authorized by the Kernel before
+/// any external adapter executes work.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
-pub struct AdvanceStageCommand {
+pub struct ProposedStageTransition {
     /// Stage to advance.
     pub stage: DurableStage,
     /// Fresh operation identity minted for this attempt.
@@ -498,6 +502,8 @@ pub struct AdvanceStageCommand {
     /// Digest of the frozen job this attempt belongs to.
     pub job_digest: String,
 }
+
+pub type AdvanceStageCommand = ProposedStageTransition;
 
 /// Request the adapter to read back one parked operation under the same
 /// identity. A replacement retry is never permitted.
@@ -523,7 +529,7 @@ pub struct EscalateCommand {
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
 pub enum DurableCommand {
-    /// Advance one stage through the owning cycle controller.
+    /// Inert stage transition proposal requiring Kernel authorization.
     AdvanceStage(AdvanceStageCommand),
     /// Reconcile one parked operation under the same identity.
     ReconcileOperation(ReconcileCommand),
