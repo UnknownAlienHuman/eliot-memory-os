@@ -208,8 +208,9 @@ impl SurrealStoreAdapter {
     ///
     /// Test observability only: the sole armer is the
     /// `production_path_disjoint_writers_overlap_and_conflicts_fail_closed`
-    /// integration test, which passes a two-party barrier so its two public
-    /// production writers prove concurrent progress past admission. No
+    /// integration test, which passes a three-party barrier so its two public
+    /// production writers plus the test-side observer future prove concurrent
+    /// progress past admission. No
     /// production caller arms this hook.
     ///
     /// Inert-by-default guarantee: while disarmed, the attempt loop performs
