@@ -720,10 +720,13 @@ pub fn ensure_eligible(
 /// fields are private and its only production constructor
 /// ([`ResolvedSendOutcome::after_resolved_send`]) is `pub(crate)`, called
 /// exclusively from the two resolved-send match arms in `store_gateway.rs`
-/// after the transport future returns. External lifecycle callers and tests
-/// cannot mint it; tests use the explicitly test-only
-/// [`ResolvedSendOutcome::mint_for_test`], which is compiled only with
-/// `debug_assertions` and is absent from production (release) builds.
+/// after the transport future returns. External lifecycle callers cannot mint
+/// it; the explicitly test-only [`ResolvedSendOutcome::mint_for_test`] is
+/// compiled only under `cfg(test)` and is absent from every non-test build,
+/// including ordinary debug dependency builds. White-box lifecycle proofs
+/// therefore live in crate unit tests; a downstream-shaped `compile_fail`
+/// doctest on [`ResolvedSendOutcome`] proves external callers cannot name the
+/// mint.
 pub fn begin_execute_after_send(
     owner: &CompositionReservation,
     token: &WriterReservationToken,
@@ -756,9 +759,17 @@ pub fn begin_execute_after_send(
 /// `ResolvedSendKind` (which never participated in the transition contract)
 /// are removed.
 ///
-/// Lifecycle proofs that drive ORS directly use the explicitly test-only
-/// [`ResolvedSendOutcome::mint_for_test`], which exists only in
-/// `debug_assertions` builds and is absent from production builds.
+/// Lifecycle proofs that drive ORS directly live in crate unit tests and use
+/// the explicitly test-only [`ResolvedSendOutcome::mint_for_test`], which
+/// exists only under `cfg(test)` and is absent from every non-test build,
+/// including ordinary debug dependency builds. No downstream or integration
+/// caller can name it:
+///
+/// ```compile_fail
+/// // Post-send evidence cannot be minted outside the crate in any non-test
+/// // build, including an ordinary debug dependency build.
+/// let _ = eliot_kernel_service::ResolvedSendOutcome::mint_for_test;
+/// ```
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ResolvedSendOutcome {
     operation_id: String,
@@ -781,12 +792,13 @@ impl ResolvedSendOutcome {
 
     /// TEST-ONLY post-send evidence mint for lifecycle proofs.
     ///
-    /// Compiled only with `debug_assertions` (dev/test builds) and absent
-    /// from production (release) builds. Production code must never call
-    /// this: the gateway mints evidence only after the transport future
-    /// returns via [`ResolvedSendOutcome::after_resolved_send`].
-    #[cfg(debug_assertions)]
-    pub fn mint_for_test(token: &WriterReservationToken) -> Self {
+    /// Compiled only under `cfg(test)` (crate unit tests) and absent from
+    /// every non-test build, including ordinary debug dependency builds.
+    /// Production code must never call this: the gateway mints evidence only
+    /// after the transport future returns via
+    /// [`ResolvedSendOutcome::after_resolved_send`].
+    #[cfg(test)]
+    pub(crate) fn mint_for_test(token: &WriterReservationToken) -> Self {
         Self::after_resolved_send(token)
     }
 

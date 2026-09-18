@@ -6,8 +6,11 @@
 //! `mark_eligible`, `begin_execute_after_send`, `mark_unknown`, `reconcile`, `release`)
 //! and the real #990 projection plus the real #991 client exchange. No test
 //! fabricates a token: the only minted tokens come from `reserve_for_transition`.
-//! Execution starts only on typed post-send evidence (`ResolvedSendOutcome`),
-//! so the pre-send call cannot compile; recovery pages to exhaustion.
+//! Execution starts only on typed post-send evidence (`ResolvedSendOutcome`).
+//! The mint is `#[cfg(test)] pub(crate)`, so it is absent from every non-test
+//! build (including ordinary debug dependency builds) and unreachable from
+//! downstream crates; a downstream-shaped `compile_fail` doctest on
+//! `ResolvedSendOutcome` proves the boundary. Recovery pages to exhaustion.
 //!
 //! Case map:
 //! - 01 exact two-constructor injection and production gateway→ORS→Store map.
@@ -67,16 +70,16 @@ use std::collections::BTreeMap;
 use std::num::NonZeroU64;
 use std::sync::Arc;
 
-use eliot_contracts::{
-    ClockReading, EpochId, EpochLineageId, OperationId, ProductId, RequestId, ResourceGeneration,
-    SourceId, StateFence,
-};
-use eliot_kernel_service::{
+use crate::{
     CompositionReservation, ObservedHead, RESERVATION_KEY_NAME, RESERVATION_KEY_PROVIDER,
     RESERVATION_VISIBILITY, ReservationSeed, ReservationWriteError, ResolvedSendOutcome,
     SealedReservation, begin_execute_after_send, cancel_before_send, ensure_eligible,
     finalize_reservation, mark_unknown_outcome, project_reserved_write, reconcile_receipt,
     reserve_for_transition,
+};
+use eliot_contracts::{
+    ClockReading, EpochId, EpochLineageId, OperationId, ProductId, RequestId, ResourceGeneration,
+    SourceId, StateFence,
 };
 use eliot_ors::{
     CanonicalEvidenceProvider, EpochIdentity, EpochLineage, OpaqueLabel, OrsError,
@@ -157,7 +160,7 @@ struct ReservationFixture {
 
 fn fixture_992() -> ReservationFixture {
     let fixture: ReservationFixture =
-        serde_json::from_str(include_str!("data/store_write_reservation.json"))
+        serde_json::from_str(include_str!("../tests/data/store_write_reservation.json"))
             .expect("992 frozen fixture parses");
     assert_fixture_contract_shape(&fixture.contract);
     // Suite-level manifest/revision identities live in the same namespace as
@@ -233,6 +236,14 @@ fn fence_with(fixture: &ReservationFixture) -> StateFence {
     let generation = ResourceGeneration::new(fixture.resource_generation)
         .expect("992 fixture generation builds");
     StateFence::new(epoch(fixture.authority_sequence), generation)
+}
+
+fn stale_fence_with(fixture: &ReservationFixture) -> StateFence {
+    StateFence::new(
+        epoch(fixture.stale_epoch),
+        ResourceGeneration::new(fixture.resource_generation)
+            .expect("992 fixture generation builds"),
+    )
 }
 
 fn writer_epoch() -> EpochLineage {
@@ -896,16 +907,35 @@ fn receipt_with_envelope(
 }
 
 fn unresolved(owner: &CompositionReservation) -> Vec<eliot_ors::ReservationRecord> {
-    eliot_kernel_service::unresolved_reservations(owner, 256).expect("992 recovery scans")
+    crate::unresolved_reservations(owner, 256).expect("992 recovery scans")
 }
 
 /// Post-send evidence for one token: the harness observed the single send
-/// resolve before execution starts. Every lifecycle proof below passes this
-/// test-only evidence (compiled with `debug_assertions`, absent from
-/// production builds); the pre-send evidence-free call cannot compile here
-/// either.
+/// resolve before execution starts. These are crate unit tests, so they may
+/// use the `#[cfg(test)] pub(crate)` mint, which is absent from every non-test
+/// build; downstream callers cannot mint, as the `compile_fail` doctest on
+/// `ResolvedSendOutcome` proves.
 fn send_evidence(token: &eliot_ors::WriterReservationToken) -> ResolvedSendOutcome {
     ResolvedSendOutcome::mint_for_test(token)
+}
+
+/// Exact error code for a [`ReservationWriteError`] on the 992 negative-path
+/// decision surface. Each tested refusal maps to exactly one code, so `==`
+/// against the expected code is an exact equality assertion even though the
+/// error types do not implement `PartialEq` (deliberately: no production API
+/// is widened for test equality). Non-target variants map to distinct codes,
+/// so no other error can satisfy the equality.
+fn reservation_error_code(error: &ReservationWriteError) -> &'static str {
+    match error {
+        ReservationWriteError::Admission { .. } => "admission",
+        ReservationWriteError::Binding { .. } => "binding",
+        ReservationWriteError::Unsupported { .. } => "unsupported",
+        ReservationWriteError::Unknown { .. } => "unknown",
+        ReservationWriteError::Ors(OrsError::StaleWriterEpoch) => "ors-stale-writer-epoch",
+        ReservationWriteError::Ors(OrsError::InvalidTransition) => "ors-invalid-transition",
+        ReservationWriteError::Ors(_) => "ors-other",
+        ReservationWriteError::Store(_) => "store",
+    }
 }
 
 // WORK_UNIT_CASE: 992/2
@@ -1239,10 +1269,8 @@ fn stale_epoch_fence_expiry_or_changed_digest_cannot_dispatch() {
     );
 
     let mut changed_fence = context.clone();
-    changed_fence.state_fence = StateFence::new(
-        epoch(fixture_992().stale_epoch),
-        ResourceGeneration::genesis(),
-    );
+    let fixture = fixture_992();
+    changed_fence.state_fence = stale_fence_with(&fixture);
     let error = project_reserved_write(
         &sealed,
         &changed_fence,
@@ -1490,10 +1518,8 @@ fn forged_foreign_partial_or_stale_receipt_cannot_release_or_finalize() {
     );
 
     let mut stale = receipt_for(&request, WriteReceiptStatus::Committed);
-    stale.state_fence = StateFence::new(
-        epoch(fixture_992().stale_epoch),
-        ResourceGeneration::genesis(),
-    );
+    let fixture = fixture_992();
+    stale.state_fence = stale_fence_with(&fixture);
     let error = reconcile_receipt(&sealed.token, &stale).expect_err("992/14 stale fence must fail");
     assert!(
         matches!(
@@ -1719,8 +1745,7 @@ fn recovery_pagination_reports_every_unresolved_token() {
         let tag = format!("21p{index}");
         reserve_one(&owner, &tag, &["scope-992-a"]);
     }
-    let all = eliot_kernel_service::unresolved_reservations(&owner, 2)
-        .expect("992/21 paged recovery scans");
+    let all = crate::unresolved_reservations(&owner, 2).expect("992/21 paged recovery scans");
     assert_eq!(all.len(), 5, "992/21 every planted token is reported");
     let orders: Vec<u64> = all
         .iter()
@@ -1740,7 +1765,7 @@ fn recovery_pagination_reports_every_unresolved_token() {
     }
     // The first bounded page alone is truncated: the truncation signal is
     // real, and exhaustion (not the first page) is the recovery result.
-    let first = eliot_kernel_service::recovery_page(&owner, 2).expect("992/21 first page reads");
+    let first = crate::recovery_page(&owner, 2).expect("992/21 first page reads");
     assert!(
         first.next_after_order.is_some(),
         "992/21 first page carries the truncation signal"
@@ -1960,13 +1985,10 @@ fn durable_rebind_recovers_identity_and_fences_stale_writers() {
     let error =
         begin_execute_after_send(&stale_owner, &sealed.token, &send_evidence(&sealed.token))
             .expect_err("992/24 stale writer is fenced on rebind");
-    let stale_fence_rejected = matches!(
-        error,
-        ReservationWriteError::Ors(OrsError::StaleWriterEpoch)
-    );
+    let stale_fence_rejected = reservation_error_code(&error) == "ors-stale-writer-epoch";
     assert!(
         stale_fence_rejected,
-        "992/24 stale writer is fenced with the exact StaleWriterEpoch error"
+        "992/24 stale writer is fenced with the exact StaleWriterEpoch error, got {error:?}"
     );
     let still = unresolved(&recovered);
     assert_eq!(still, pending, "992/24 stale attempt moved nothing");
@@ -2286,11 +2308,13 @@ fn holder_of_only_owner_and_token_never_reaches_executing() {
     // A caller holding only `(owner, token)` — no send observation — can never
     // advance `Eligible -> Executing`. Eligibility alone is not execution;
     // unknown-marking from `Eligible` is refused; mismatched post-send
-    // evidence is refused without touching ORS. The same-token pre-send forge
-    // is closed by construction on top: `ResolvedSendOutcome` has no public
-    // constructor, the only production mint is the crate-internal post-send
-    // path in the gateway, and the test-only mint is compiled with
-    // `debug_assertions` only, so it is absent from production builds.
+    // evidence is refused without touching ORS. This test is a
+    // binding/no-state-change proof: mismatched evidence fails with the exact
+    // `Binding` refusal and the token stays `Eligible`. The same-token
+    // pre-send forge is closed one level down: `ResolvedSendOutcome` has no
+    // public constructor in any non-test build (the mint is `#[cfg(test)]`
+    // `pub(crate)`), and a downstream-shaped `compile_fail` doctest proves
+    // external callers cannot name it.
     // Revert check (see work report): with the pre-fix public `for_token`
     // constructor restored, a pre-send mint for this token reaches
     // `Executing`, so the negative property fails pre-fix and holds post-fix.
@@ -2306,20 +2330,31 @@ fn holder_of_only_owner_and_token_never_reaches_executing() {
     );
     let unknown = mark_unknown_outcome(&owner, &sealed.token)
         .expect_err("992/28 unknown-marking before execution must fail");
+    let premature_unknown_rejected = reservation_error_code(&unknown) == "ors-invalid-transition";
     assert!(
-        matches!(
-            unknown,
-            ReservationWriteError::Ors(OrsError::InvalidTransition)
-        ),
+        premature_unknown_rejected,
         "992/28 premature unknown fails closed, got {unknown:?}"
     );
     let (_c2, _t2, _r2, _o2, other) = reserve_one(&owner, "28b", &[fixture.scope_b.as_str()]);
     let mismatched = send_evidence(&other.token);
     let error = begin_execute_after_send(&owner, &sealed.token, &mismatched)
         .expect_err("992/28 mismatched evidence must not execute");
-    assert!(
-        matches!(error, ReservationWriteError::Binding { .. }),
-        "992/28 mismatched evidence fails as a binding mismatch, got {error:?}"
+    let ReservationWriteError::Binding {
+        operation_id,
+        detail,
+    } = &error
+    else {
+        panic!("992/28 mismatched evidence fails as a binding mismatch, got {error:?}");
+    };
+    assert_eq!(
+        operation_id.as_str(),
+        sealed.token.operation_id.as_str(),
+        "992/28 binding refusal preserves the exact refused operation"
+    );
+    assert_eq!(
+        detail.as_str(),
+        "post-send evidence operation does not match the reservation operation",
+        "992/28 binding refusal carries the exact mismatch detail"
     );
     let pending = unresolved(&owner);
     let record = pending
@@ -2340,7 +2375,7 @@ fn mutated_fixture_prefix_controls_generated_reservation_identity() {
     // non-semantic JSON value is mutated in memory, and the reservation path
     // consumes the mutated value end to end, from seed identity through
     // request projection, receipt, and finalization.
-    let text = include_str!("data/store_write_reservation.json");
+    let text = include_str!("../tests/data/store_write_reservation.json");
     let mut value: Value = serde_json::from_str(text).expect("992/29 fixture json parses");
     let file_prefix = value
         .get("reservation_id_prefix")
@@ -2410,17 +2445,17 @@ fn mutated_fixture_prefix_controls_generated_reservation_identity() {
 #[cfg(windows)]
 mod gateway_cases {
     use super::*;
-    use eliot_contracts::AuthorityEpoch;
-    use eliot_ipc::{
-        NamedPipeServer, NamedPipeTransport, PeerIdentity, TransportLimits, server_hello_frame,
-    };
-    use eliot_kernel_core::{GenerationRoute, RouteScope};
-    use eliot_kernel_service::{
+    use crate::{
         HostFileIdentity, HostJobBinding, HostJobIdentity, HostJobRoot, HostKernelCandidateBinding,
         HostProcessBinding, KERNEL_CONTROL_PIPE, KernelActivationPermit, KernelControlCommand,
         KernelReadyReceipt, KernelService, KernelServiceState, KernelStoreGateway,
         ProcessObservation, RestartBudget,
     };
+    use eliot_contracts::AuthorityEpoch;
+    use eliot_ipc::{
+        NamedPipeServer, NamedPipeTransport, PeerIdentity, TransportLimits, server_hello_frame,
+    };
+    use eliot_kernel_core::{GenerationRoute, RouteScope};
     use eliot_platform::KernelActivationNonce;
     use eliot_protocol::{FrameKind, ProtocolVersion, ServerHello};
     use eliot_runtime_contracts::{
@@ -2752,7 +2787,7 @@ mod gateway_cases {
             }
         };
         let live = fence();
-        let requirement = eliot_kernel_service::HostStoreBootstrapRequirement {
+        let requirement = crate::HostStoreBootstrapRequirement {
             route_identity: handle("store_bridge"),
             canonical_pipe_identity: handle(&pipe),
             store_generation: ResourceGeneration::genesis(),
@@ -2777,7 +2812,7 @@ mod gateway_cases {
             mode,
             Arc::clone(&log),
         ));
-        let client = eliot_kernel_service::EbpCanonicalStoreClient::connect(transport, requirement)
+        let client = crate::EbpCanonicalStoreClient::connect(transport, requirement)
             .await
             .expect("992 EBP handshake");
         let service = Arc::new(Mutex::new(ready_service()));
@@ -3449,8 +3484,7 @@ mod gateway_cases {
             260,
             "992/27 all planted tokens are recovered exhaustively"
         );
-        let first =
-            eliot_kernel_service::recovery_page(&owner, 256).expect("992/27 first page reads");
+        let first = crate::recovery_page(&owner, 256).expect("992/27 first page reads");
         assert!(
             first.next_after_order.is_some(),
             "992/27 first page carries the truncation signal"

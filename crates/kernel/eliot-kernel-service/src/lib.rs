@@ -34,6 +34,8 @@ mod store_client;
 #[cfg(windows)]
 mod store_gateway;
 mod store_write_reservation;
+#[cfg(test)]
+mod store_write_reservation_tests;
 mod testd_front_door;
 
 pub use capacity_evidence::{
