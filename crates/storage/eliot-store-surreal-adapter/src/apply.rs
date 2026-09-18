@@ -11,17 +11,20 @@ use crate::config::{SchemaGeneration, SurrealAdapterConfig};
 use crate::error::AdapterError;
 use crate::plan::{self, build_receipt, validate_receipt_identity, validate_revision_heads};
 use crate::readiness::{CompiledMigration, MigrationReceipt, SemanticReadiness};
+use crate::write_execution::{
+    AttemptOutcome, ExclusiveOpKind, ExecutableAttempt, OpExecution, ProviderGate,
+    ReconcileOutcome, ReservedAttemptTransport, current_time_ms,
+};
 use crate::{client, schema};
 #[cfg(test)]
-use eliot_store_api::{
-    CONTRACT_VERSION, OperationId, StoreGenesisRequest, validate_genesis_receipt_envelope,
-};
+use eliot_store_api::{CONTRACT_VERSION, validate_genesis_receipt_envelope};
 use eliot_store_api::{
     ERASURE_PARAM_OPERATION_ID, ERASURE_PARAM_SUBJECT, ERASURE_PARAM_SURFACES, ExactJsonBytes,
-    NamedMutationOperation, OrderingHead, OrderingHeadExpectation, OrderingScopeId, RecoveryRecord,
-    RevisionHead, RevisionHeadExpectation, RevisionKey, StateFence, StoreError,
-    StoreRecoveryRequest, StoreRecoverySnapshot, TransitionClass, WriteReceipt,
-    decode_erasure_surfaces, generated_operation_manifests, operation_manifest_set_digest,
+    NamedMutationOperation, OperationId, OrderingHead, OrderingHeadExpectation, OrderingScopeId,
+    RecoveryRecord, RequestMeta, ReservedWriteRequest, RevisionHead, RevisionHeadExpectation,
+    RevisionKey, StateFence, StoreError, StoreGenesisRequest, StoreRecoveryRequest,
+    StoreRecoverySnapshot, TransitionClass, WriteReceipt, decode_erasure_surfaces,
+    generated_operation_manifests, operation_manifest_set_digest,
 };
 use serde::de::DeserializeOwned;
 use serde_json::{Map, Value, json};
@@ -39,7 +42,28 @@ use atomic_write::{TxLane, to_value, write_transaction};
 #[cfg(test)]
 use atomic_write::{ordering_write_template, revision_write_template};
 use empty_migration::handle_empty_migration;
-pub(crate) use genesis::initialize_genesis;
+pub(crate) async fn initialize_genesis(
+    adapter: &SurrealStoreAdapter,
+    context: &RequestMeta,
+    request: StoreGenesisRequest,
+) -> Result<WriteReceipt, AdapterError> {
+    // S-CONC-EXECUTE (issue #993): genesis runs through the exclusive
+    // drain gate when a generation is installed, mirroring migrations.
+    let Some(execution) = adapter.execution_handle() else {
+        return genesis::initialize_genesis_direct(adapter, context, request).await;
+    };
+    let transport = ProviderReservedTransport { adapter };
+    let (_, receipt) = execution
+        .drain_for_migration(
+            ExclusiveOpKind::Genesis,
+            current_time_ms(),
+            &transport,
+            || genesis::initialize_genesis_direct(adapter, context, request),
+        )
+        .await?;
+    Ok(receipt)
+}
+
 #[cfg(test)]
 use genesis::{
     GenesisState, build_genesis_bindings, build_genesis_sql, genesis_receipt,
@@ -466,7 +490,36 @@ async fn handle_forward_migration(
 }
 
 /// Applies one explicit migration and records the new schema generation.
+///
+/// When a write-execution generation is installed, the migration runs
+/// through its exclusive drain gate: normal admission closes, queued work
+/// dispositions without effects, every possible in-flight effect is
+/// awaited and reconciled, and only a verified quiescence grants
+/// exclusivity to the existing operation below. Without an installed
+/// generation this keeps the exact legacy entrypoint.
 pub(crate) async fn apply_migration(
+    adapter: &SurrealStoreAdapter,
+    migration: &CompiledMigration,
+    observed_clock: &eliot_platform::ClockObservation,
+    state_fence: &StateFence,
+) -> Result<MigrationReceipt, AdapterError> {
+    let Some(execution) = adapter.execution_handle() else {
+        return apply_migration_direct(adapter, migration, observed_clock, state_fence).await;
+    };
+    let transport = ProviderReservedTransport { adapter };
+    let (_, receipt) = execution
+        .drain_for_migration(
+            ExclusiveOpKind::Migration,
+            current_time_ms(),
+            &transport,
+            || apply_migration_direct(adapter, migration, observed_clock, state_fence),
+        )
+        .await?;
+    Ok(receipt)
+}
+
+/// Applies one explicit migration and records the new schema generation.
+async fn apply_migration_direct(
     adapter: &SurrealStoreAdapter,
     migration: &CompiledMigration,
     observed_clock: &eliot_platform::ClockObservation,
@@ -600,6 +653,17 @@ pub(crate) async fn apply_prepared_with_authority(
     expected_ordering_heads: Vec<eliot_store_api::OrderingHeadExpectation>,
     authorities: &[Option<ExactJsonBytes>],
 ) -> Result<WriteReceipt, AdapterError> {
+    // S-CONC-EXECUTE (issue #993): a concurrent execution generation owns
+    // the writable root, so the old unreserved path must not bypass its
+    // scheduler. The serial profile explicitly admits this legacy lane.
+    if let Some(execution) = adapter.execution_handle()
+        && !execution.unreserved_apply_admission().allowed()
+    {
+        return Err(AdapterError::Store(StoreError::InvalidField {
+            field: "store.write_path",
+            reason: "unreserved apply is not admitted under the concurrent execution generation",
+        }));
+    }
     validate_transition(ctx, &transition)?;
 
     let db = client(adapter).await?;
@@ -653,6 +717,210 @@ pub(crate) async fn apply_prepared_without_write_guard(
         TxLane::PooledWrite,
     )
     .await
+}
+
+/// Applies one sealed reserved write through the installed concurrent
+/// execution generation (S-CONC-EXECUTE, issue #993).
+///
+/// Runs the existing admitted receiving boundary first, then queues the
+/// operation behind the generation's bounded scheduler and executes the
+/// ready batch over the pooled normal-write lane. Without an installed
+/// concurrent generation this preserves the default refusal semantics for
+/// backends without scheduler support. A submitted operation that finds
+/// no ready execution in this batch (blocked behind a predecessor or an
+/// uncertain scope) reports retryable unavailability: nothing was
+/// fabricated and the caller reconciles or retries by identity.
+pub(crate) async fn apply_reserved_write(
+    adapter: &SurrealStoreAdapter,
+    request: ReservedWriteRequest,
+) -> Result<WriteReceipt, AdapterError> {
+    request.validate().map_err(AdapterError::Store)?;
+    let Some(execution) = adapter.execution_handle() else {
+        return Err(AdapterError::Store(StoreError::UnknownOperation));
+    };
+    if !execution.is_concurrent() {
+        return Err(AdapterError::Store(StoreError::UnknownOperation));
+    }
+    let operation_id = request.transition.identity.operation_id.clone();
+    execution.submit_reserved(request, current_time_ms())?;
+    let transport = ProviderReservedTransport { adapter };
+    let outcomes = execution
+        .run_ready_batch(current_time_ms(), &transport)
+        .await?;
+    for outcome in &outcomes {
+        if outcome.operation_id() == &operation_id {
+            return op_outcome_to_receipt(outcome);
+        }
+    }
+    Err(AdapterError::Store(StoreError::Unavailable))
+}
+
+/// Maps one executed reserved outcome onto the client boundary.
+fn op_outcome_to_receipt(outcome: &OpExecution) -> Result<WriteReceipt, AdapterError> {
+    match outcome {
+        OpExecution::Committed { receipt, .. } => Ok(receipt.as_ref().clone()),
+        OpExecution::Rejected { error, .. } => Err(AdapterError::Store(error.clone())),
+        OpExecution::DeadLetter { .. } => Err(AdapterError::Store(StoreError::InvalidField {
+            field: "store.write_disposition",
+            reason: "dead letter with proven non-application",
+        })),
+        OpExecution::CancelledBeforeEffect { .. } | OpExecution::DrainedWithoutEffect { .. } => {
+            Err(AdapterError::Store(StoreError::Unavailable))
+        }
+        OpExecution::UnknownRetained { .. } => {
+            Err(AdapterError::Store(StoreError::MissingReceiptEnvelope))
+        }
+        OpExecution::ExecutionError { error, .. } => Err(error.clone()),
+    }
+}
+
+/// Production reserved attempt over the admitted #987 pooled normal-write
+/// lane (S-CONC-EXECUTE, issue #993).
+///
+/// Mirrors the [`apply_prepared_with_authority`] preamble exactly —
+/// admitted-operation gate, transport, readiness — and runs the same #989
+/// bounded attempt loop, except on `TxLane::PooledWrite` so concurrent
+/// tasks execute on real separate sessions instead of serializing on the
+/// facade socket. No transaction SQL is duplicated: the canonical attempt
+/// below is shared. Authorities stay all-`None` (the legacy digest path),
+/// matching the unreserved entry, because the #990 sealed shape carries no
+/// per-operation authority material.
+pub(crate) async fn apply_reserved_attempt(
+    adapter: &SurrealStoreAdapter,
+    attempt: &ExecutableAttempt,
+) -> Result<WriteReceipt, AdapterError> {
+    let authorities: Vec<Option<ExactJsonBytes>> =
+        vec![None; attempt.transition.named_operations.len()];
+    validate_transition(&attempt.context, &attempt.transition)?;
+    let db = client(adapter).await?;
+    ensure_ready(adapter, db).await?;
+    apply_with_retry(
+        adapter,
+        db,
+        &attempt.context,
+        attempt.transition.clone(),
+        attempt.expected_revision_heads.clone(),
+        attempt.expected_ordering_heads.clone(),
+        &authorities,
+        TxLane::PooledWrite,
+    )
+    .await
+}
+
+/// Production transport behind the execution orchestration: pooled-lane
+/// attempts, gate reads against the durable fence, and exact receipt
+/// reconciliation. Holds no scheduler lock and no global write mutex.
+pub(crate) struct ProviderReservedTransport<'a> {
+    adapter: &'a SurrealStoreAdapter,
+}
+
+impl ReservedAttemptTransport for ProviderReservedTransport<'_> {
+    async fn read_submission_gate(
+        &self,
+        _execution: &crate::write_execution::WriteExecution,
+        attempt: &ExecutableAttempt,
+        now_ms: u64,
+    ) -> ProviderGate {
+        let Ok(db) = client(self.adapter).await else {
+            return ProviderGate::closed();
+        };
+        let Ok(fence) = read_fence(db, &self.adapter.config).await else {
+            return ProviderGate::closed();
+        };
+        // An absent fence contradicts nothing yet: the attempt path's own
+        // readiness and head checks still decide. A present fence must
+        // match the admitted transition fence exactly.
+        let fence_matches = fence
+            .as_ref()
+            .is_none_or(|fence| fence.state_fence == attempt.transition.state_fence);
+        let not_expired =
+            u64::try_from(attempt.expires_at_ms).is_ok_and(|expires| now_ms < expires);
+        ProviderGate {
+            owner_current: true,
+            fence_matches,
+            not_expired,
+        }
+    }
+
+    async fn execute_attempt(
+        &self,
+        _execution: &crate::write_execution::WriteExecution,
+        attempt: &ExecutableAttempt,
+    ) -> AttemptOutcome {
+        match apply_reserved_attempt(self.adapter, attempt).await {
+            Ok(receipt) => AttemptOutcome::Committed(Box::new(receipt)),
+            Err(error) => map_attempt_error(error),
+        }
+    }
+
+    async fn reconcile_unknown(
+        &self,
+        _execution: &crate::write_execution::WriteExecution,
+        operation_id: &OperationId,
+    ) -> ReconcileOutcome {
+        match read_receipt(self.adapter, operation_id.clone()).await {
+            Ok(Some(receipt)) => ReconcileOutcome::Committed(Box::new(receipt)),
+            // Absence of a receipt is not proof of non-application: the
+            // commit may have landed without a readable receipt yet. Stay
+            // unknown and reconcile again later; restart recovery owns the
+            // terminal escape hatch through its durable denominator.
+            Ok(None) | Err(_) => ReconcileOutcome::StillUnknown,
+        }
+    }
+}
+
+/// Maps one production attempt failure onto the orchestration outcome.
+///
+/// Local defects that provably precede any provider send dispose as
+/// `Cancelled` (safe to resubmit under the same identity); deterministic
+/// conflicts and malformed inputs dispose as `Rejected` with the exact
+/// cause; everything ambiguous — including any transport loss inside the
+/// attempt window, which is treated as possible-submission per I14.21 —
+/// stays `Unknown` for exact receipt reconciliation. `AllocationContention`
+/// cannot reach here unhandled: the #989 loop retries it internally and
+/// only surfaces exhaustion, which proved no commit for this identity.
+fn map_attempt_error(error: AdapterError) -> AttemptOutcome {
+    match error {
+        AdapterError::Store(store) => match store {
+            StoreError::IdentityConflict
+            | StoreError::RevisionConflict
+            | StoreError::OrderingConflict
+            | StoreError::FenceMismatch
+            | StoreError::InvalidField { .. }
+            | StoreError::Empty { .. }
+            | StoreError::Duplicate { .. }
+            | StoreError::Foundation(_)
+            | StoreError::Security(_)
+            | StoreError::Receipt(_)
+            | StoreError::UnknownOperation
+            | StoreError::ManifestMismatch
+            | StoreError::TransitionClassExceeded
+            | StoreError::EffectCeilingExceeded
+            | StoreError::InvalidProjection
+            | StoreError::InvalidOutbox
+            | StoreError::InvalidReceipt
+            | StoreError::TransitionDigestMismatch { .. }
+            | StoreError::ReceiptNotFound
+            | StoreError::PayloadTooLarge => AttemptOutcome::Rejected(store),
+            StoreError::Serialization(_) => AttemptOutcome::Cancelled,
+            StoreError::MissingReceiptEnvelope | StoreError::Unavailable => {
+                AttemptOutcome::Unknown { retry_after_ms: 0 }
+            }
+        },
+        AdapterError::ProviderConflict => AttemptOutcome::Rejected(StoreError::RevisionConflict),
+        // Pre-effect dispositions without provider effects: allocation
+        // exhaustion proved no commit for this identity inside the #989
+        // loop, and the local defects below all precede any provider send.
+        AdapterError::AllocationContention { .. }
+        | AdapterError::MigrationRequired
+        | AdapterError::Config(_)
+        | AdapterError::Serialization(_)
+        | AdapterError::NamedOperationUnavailable { .. } => AttemptOutcome::Cancelled,
+        AdapterError::UnknownOutcome { .. }
+        | AdapterError::PartialOutcome
+        | AdapterError::UnknownMigrationOutcome { .. }
+        | AdapterError::ProviderUnavailable => AttemptOutcome::Unknown { retry_after_ms: 0 },
+    }
 }
 
 /// Production-path transaction-attempt rendezvous (S-CONC-TX, issue #989).
@@ -2597,6 +2865,93 @@ mod concurrent_allocation_tests {
             receipt
                 .require_reconciliation_envelope()
                 .expect("reconciliation envelope travels");
+        }
+    }
+}
+
+#[cfg(test)]
+mod execution_delegation_tests {
+    #![allow(clippy::expect_used, clippy::unwrap_used)]
+
+    use super::*;
+    use crate::config::ClientSetLimits;
+    use crate::write_execution::WriteExecution;
+
+    #[test]
+    fn deterministic_failures_reject_with_the_exact_cause() {
+        assert!(matches!(
+            map_attempt_error(AdapterError::Store(StoreError::IdentityConflict)),
+            AttemptOutcome::Rejected(StoreError::IdentityConflict)
+        ));
+        assert!(matches!(
+            map_attempt_error(AdapterError::Store(StoreError::RevisionConflict)),
+            AttemptOutcome::Rejected(StoreError::RevisionConflict)
+        ));
+        assert!(matches!(
+            map_attempt_error(AdapterError::ProviderConflict),
+            AttemptOutcome::Rejected(StoreError::RevisionConflict)
+        ));
+        assert!(matches!(
+            map_attempt_error(AdapterError::Store(StoreError::InvalidField {
+                field: "admission.scopes",
+                reason: "reservation projection failed scheduler structure",
+            })),
+            AttemptOutcome::Rejected(StoreError::InvalidField { .. })
+        ));
+    }
+
+    #[test]
+    fn serial_generation_admits_the_legacy_lane() {
+        let execution = WriteExecution::install_serial(
+            ClientSetLimits::compatibility(),
+            std::num::NonZeroUsize::new(4).expect("queue"),
+        )
+        .expect("serial installs");
+        assert!(execution.unreserved_apply_admission().allowed());
+    }
+
+    #[test]
+    fn pre_effect_local_defects_cancel_without_provider_effects() {
+        for error in [
+            AdapterError::AllocationContention {
+                operation_id: "op-993-cancel".to_owned(),
+            },
+            AdapterError::Config("bad lane".to_owned()),
+            AdapterError::Serialization("bad plan".to_owned()),
+            AdapterError::MigrationRequired,
+            AdapterError::NamedOperationUnavailable {
+                operation: "unknown.op".to_owned(),
+            },
+            AdapterError::Store(StoreError::Serialization("bad bytes".to_owned())),
+        ] {
+            assert!(
+                matches!(map_attempt_error(error), AttemptOutcome::Cancelled),
+                "pre-effect defect must dispose without effects"
+            );
+        }
+    }
+
+    #[test]
+    fn ambiguous_outcomes_stay_unknown_for_reconciliation() {
+        for error in [
+            AdapterError::UnknownOutcome {
+                operation_id: "op-993-unknown".to_owned(),
+            },
+            AdapterError::PartialOutcome,
+            AdapterError::UnknownMigrationOutcome {
+                migration_id: "migration-993".to_owned(),
+            },
+            AdapterError::ProviderUnavailable,
+            AdapterError::Store(StoreError::Unavailable),
+            AdapterError::Store(StoreError::MissingReceiptEnvelope),
+        ] {
+            assert!(
+                matches!(
+                    map_attempt_error(error),
+                    AttemptOutcome::Unknown { retry_after_ms: 0 }
+                ),
+                "ambiguous outcome must reconcile, never blind-retry or complete"
+            );
         }
     }
 }

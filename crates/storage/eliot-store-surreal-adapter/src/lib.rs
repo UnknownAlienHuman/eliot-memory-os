@@ -24,9 +24,11 @@ mod health;
 mod plan;
 mod readiness;
 mod schema;
+mod write_execution;
 mod write_scheduler;
 
 use std::fmt;
+use std::num::NonZeroUsize;
 
 pub use config::{
     ADAPTER_NAME, ClientSetLimits, ConfigError, MAX_CLIENT_SET_SESSIONS_PER_ROLE,
@@ -35,16 +37,23 @@ pub use config::{
 use eliot_platform::ClockObservation;
 use eliot_platform_windows::RetainedProcessPathLease;
 use eliot_store_api::{
-    CanonicalStoreClient, CanonicalValidationSnapshot, ExactJsonBytes, GENESIS_MANIFEST_NAME,
-    NamedOperationManifest, NamedReadRequest, NamedReadResponse, OperationId, OrderingHead,
-    OrderingHeadExpectation, OrderingScopeId, PreparedTransition, RequestMeta, RevisionHead,
-    RevisionHeadExpectation, RevisionKey, ScopeId, ScopeRevisionView, StoreError,
-    StoreGenesisRequest, StoreHealth, StoreRecoveryRequest, StoreRecoverySnapshot, WriteReceipt,
-    generated_operation_manifests, operation_manifest_set_digest,
+    CAPABILITY_RESERVED_WRITE, CanonicalStoreClient, CanonicalValidationSnapshot, ExactJsonBytes,
+    GENESIS_MANIFEST_NAME, NamedOperationManifest, NamedReadRequest, NamedReadResponse,
+    OperationId, OrderingHead, OrderingHeadExpectation, OrderingScopeId, PreparedTransition,
+    RequestMeta, ReservedWriteRequest, RevisionHead, RevisionHeadExpectation, RevisionKey, ScopeId,
+    ScopeRevisionView, StateFence, StoreError, StoreGenesisRequest, StoreHealth,
+    StoreRecoveryRequest, StoreRecoverySnapshot, WriteReceipt, generated_operation_manifests,
+    operation_manifest_set_digest,
 };
 pub use error::AdapterError;
 pub use health::{AdapterAvailability, AdapterHealth, ProviderHealth};
 pub use readiness::{CompiledMigration, MigrationReceipt, SemanticReadiness};
+pub use write_execution::{
+    AttemptOutcome, ConcurrentEvidence, DrainReport, DurableOpOutcome, DurableRecoverySet,
+    ExclusiveOpKind, ExecutableAttempt, ExecutionMetrics, ExecutionProfile, OpExecution,
+    ProtectedPermit, ProviderGate, ReconcileOutcome, ReservedAttemptTransport, SubmitDisposition,
+    UnreservedAdmission, WriteExecution,
+};
 pub use write_scheduler::{
     CompletionOutcome, ReservationProjection, ReservedScopeProjection, ScheduleReject,
     WriteScheduler,
@@ -69,6 +78,12 @@ pub struct SurrealStoreAdapter {
     /// no production caller arms it, so production always observes the
     /// disarmed (inert) state documented on [`Self::arm_tx_rendezvous`].
     pub(crate) tx_rendezvous: std::sync::Mutex<Option<std::sync::Arc<tokio::sync::Barrier>>>,
+    /// Installed write-execution generation (S-CONC-EXECUTE, issue #993).
+    /// `None` preserves the pre-#993 direct path; one installed generation
+    /// owns the bounded scheduler and permit bounds, gates unreserved
+    /// `Apply` under the concurrent profile, and routes reserved writes
+    /// and exclusive drains.
+    pub(crate) execution: std::sync::Mutex<Option<std::sync::Arc<WriteExecution>>>,
 }
 
 impl fmt::Debug for SurrealStoreAdapter {
@@ -79,6 +94,7 @@ impl fmt::Debug for SurrealStoreAdapter {
             .field("provider_process_lease", &"retained")
             .field("connected", &self.client.get().is_some_and(Result::is_ok))
             .field("write_lock", &"private")
+            .field("execution", &"private")
             .field("operation_manifest", &self.operation_manifest)
             .field("client_limits", &self.client_limits)
             .field("tx_rendezvous", &"private")
@@ -127,6 +143,7 @@ impl SurrealStoreAdapter {
             client: tokio::sync::OnceCell::new(),
             write_lock: tokio::sync::Mutex::new(()),
             tx_rendezvous: std::sync::Mutex::new(None),
+            execution: std::sync::Mutex::new(None),
             operation_manifest,
             client_limits: ClientSetLimits::compatibility(),
         })
@@ -160,6 +177,7 @@ impl SurrealStoreAdapter {
             client: tokio::sync::OnceCell::new(),
             write_lock: tokio::sync::Mutex::new(()),
             tx_rendezvous: std::sync::Mutex::new(None),
+            execution: std::sync::Mutex::new(None),
             operation_manifest: manifest,
             client_limits: limits,
         })
@@ -188,6 +206,7 @@ impl SurrealStoreAdapter {
             client: tokio::sync::OnceCell::new(),
             write_lock: tokio::sync::Mutex::new(()),
             tx_rendezvous: std::sync::Mutex::new(None),
+            execution: std::sync::Mutex::new(None),
             operation_manifest: manifest,
             client_limits: ClientSetLimits::compatibility(),
         })
@@ -201,6 +220,100 @@ impl SurrealStoreAdapter {
     /// Returns the fixed bounded session-set limits bound at construction.
     pub fn client_set_limits(&self) -> ClientSetLimits {
         self.client_limits
+    }
+
+    /// Installs the concurrent reserved-write execution generation
+    /// (S-CONC-EXECUTE, issue #993).
+    ///
+    /// The evidence binds actuals: the expected schema generation comes
+    /// from this adapter's validated configuration, while the observed
+    /// generation, Kernel generation identity, and current fence come from
+    /// the composition owner after readiness and authentication. Install
+    /// fails when a generation is already present: profile change is a
+    /// drained generation transition, never a live overwrite.
+    pub fn install_concurrent_execution(
+        &self,
+        lanes: NonZeroUsize,
+        max_pending: NonZeroUsize,
+        observed_generation: SchemaGeneration,
+        kernel_generation: String,
+        state_fence: StateFence,
+    ) -> Result<(), AdapterError> {
+        let evidence = ConcurrentEvidence {
+            capability: CAPABILITY_RESERVED_WRITE,
+            observed_generation,
+            expected_generation: self.config.expected_schema_generation.clone(),
+            state_fence,
+            kernel_generation,
+        };
+        let execution = WriteExecution::install_concurrent(
+            self.client_limits,
+            lanes,
+            max_pending,
+            &evidence,
+            write_execution::current_time_ms(),
+        )?;
+        self.install_execution(execution)
+    }
+
+    /// Installs the serial compatibility execution generation: one lane,
+    /// legacy unreserved path admitted, reserved writes refused.
+    pub fn install_serial_execution(&self, max_pending: NonZeroUsize) -> Result<(), AdapterError> {
+        let execution = WriteExecution::install_serial(self.client_limits, max_pending)?;
+        self.install_execution(execution)
+    }
+
+    /// Uninstalls the execution generation for a profile change. Fails
+    /// closed unless the installed generation is quiescent, open, and
+    /// never recovery-blocked.
+    pub fn uninstall_drained_execution(&self) -> Result<(), AdapterError> {
+        let mut slot = self
+            .execution
+            .lock()
+            .map_err(|_| AdapterError::Store(StoreError::Unavailable))?;
+        let Some(execution) = slot.as_ref() else {
+            return Err(AdapterError::Store(StoreError::InvalidField {
+                field: "execution.generation",
+                reason: "no execution generation is installed",
+            }));
+        };
+        execution.uninstall_readiness()?;
+        *slot = None;
+        Ok(())
+    }
+
+    /// Advertises the reserved-write capability exactly when a concurrent
+    /// execution generation owns this adapter. No backend without an
+    /// accepted scheduler advertises it.
+    #[must_use]
+    pub fn reserved_write_capability(&self) -> Option<&'static str> {
+        self.execution
+            .lock()
+            .ok()
+            .and_then(|slot| slot.clone())
+            .filter(|execution| execution.is_concurrent())
+            .map(|_| CAPABILITY_RESERVED_WRITE)
+    }
+
+    /// Returns the installed execution generation, if any.
+    pub(crate) fn execution_handle(&self) -> Option<std::sync::Arc<WriteExecution>> {
+        self.execution.lock().ok().and_then(|slot| slot.clone())
+    }
+
+    /// Installs one execution generation; refuses when one is present.
+    fn install_execution(&self, execution: WriteExecution) -> Result<(), AdapterError> {
+        let mut slot = self
+            .execution
+            .lock()
+            .map_err(|_| AdapterError::Store(StoreError::Unavailable))?;
+        if slot.is_some() {
+            return Err(AdapterError::Store(StoreError::InvalidField {
+                field: "execution.generation",
+                reason: "an execution generation is already installed",
+            }));
+        }
+        *slot = Some(std::sync::Arc::new(execution));
+        Ok(())
     }
 
     /// Arms the S-CONC-TX production-path transaction-attempt rendezvous
@@ -387,6 +500,15 @@ impl CanonicalStoreClient for SurrealStoreAdapter {
         request: StoreRecoveryRequest,
     ) -> Result<StoreRecoverySnapshot, StoreError> {
         apply::recovery(self, request)
+            .await
+            .map_err(AdapterError::into_store_error)
+    }
+
+    async fn apply_reserved_write(
+        &self,
+        request: ReservedWriteRequest,
+    ) -> Result<WriteReceipt, StoreError> {
+        apply::apply_reserved_write(self, request)
             .await
             .map_err(AdapterError::into_store_error)
     }

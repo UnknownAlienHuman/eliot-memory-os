@@ -71,7 +71,6 @@ const READ_ERASURE_OUTCOME: &str = "SELECT VALUE { operation_id: operation_id, o
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) enum TxLane {
     Facade,
-    #[cfg(test)]
     PooledWrite,
 }
 
@@ -231,7 +230,6 @@ async fn send_transaction(
 ) -> Result<client::RpcResults, AdapterError> {
     match lane {
         TxLane::Facade => client::query(db, config, "transaction.apply", sql, bindings).await,
-        #[cfg(test)]
         TxLane::PooledWrite => db.query_write("transaction.apply", sql, bindings).await,
     }
 }

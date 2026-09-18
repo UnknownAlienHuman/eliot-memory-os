@@ -1,0 +1,65 @@
+{
+  "contract_version": 1,
+  "description": "S-CONC-EXECUTE ordering-scope execution scenario (issue #993): two disjoint reservations commit through separate provider paths while a shared-scope successor dispositions deterministically. Scripted outcomes drive the real scheduler, permit, and drain seams; no provider is touched.",
+  "lineage": "550e8400-e29b-41d4-a716-446655440000",
+  "submit_at_ms_offset": 0,
+  "run_at_ms_offset": 250,
+  "operations": [
+    {
+      "op": "op-993-m1",
+      "scope": "scope-993-a",
+      "order": 1,
+      "reserved_sequence": 5,
+      "expected_sequence": 4,
+      "outcome": "commit"
+    },
+    {
+      "op": "op-993-m2",
+      "scope": "scope-993-b",
+      "order": 2,
+      "reserved_sequence": 5,
+      "expected_sequence": 4,
+      "outcome": "commit"
+    },
+    {
+      "op": "op-993-m3",
+      "scope": "scope-993-a",
+      "order": 3,
+      "reserved_sequence": 6,
+      "expected_sequence": 5,
+      "outcome": "reject"
+    },
+    {
+      "op": "op-993-m4",
+      "scope": "scope-993-c",
+      "order": 4,
+      "reserved_sequence": 5,
+      "expected_sequence": 4,
+      "outcome": "cancel"
+    },
+    {
+      "op": "op-993-m5",
+      "scope": "scope-993-d",
+      "order": 5,
+      "reserved_sequence": 5,
+      "expected_sequence": 4,
+      "outcome": "deadletter"
+    }
+  ],
+  "expected_metrics": {
+    "submitted": 5,
+    "duplicates_suppressed": 0,
+    "committed": 2,
+    "committed_via_reconcile": 0,
+    "rejected": 1,
+    "dead_lettered": 1,
+    "cancelled_before_effect": 1,
+    "unknown_observed": 0,
+    "reconciled_absent": 0,
+    "still_unknown_retained": 0,
+    "queue_full_shed": 0,
+    "submit_refused_not_ready": 0,
+    "oldest_ready_wait_max_ms": 250,
+    "permit_waited_events": 0
+  }
+}
