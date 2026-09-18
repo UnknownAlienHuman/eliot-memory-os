@@ -44,9 +44,14 @@ fn old_to_new_ownership_map_preserves_checks_and_real_callers() {
         );
     }
     let caller = source("src/apply.rs");
-    assert!(caller.contains(
-        "client::RpcTransport::connect(&adapter.config, &adapter.provider_process_lease)"
-    ));
+    // Aligned by R4 hardening for S-CONC-CLIENTS (#987): the transport
+    // constructor now carries the explicit bounded session-set profile. The
+    // chain apply::client -> RpcTransport -> ProviderOwner::start +
+    // RpcSession::connect with the exact process lease is preserved; only the
+    // constructor symbol and its additive limits argument changed.
+    assert!(caller.contains("client::RpcTransport::connect_with_limits("));
+    assert!(caller.contains("&adapter.provider_process_lease,"));
+    assert!(caller.contains("adapter.client_limits,"));
     let facade = source("src/client.rs");
     assert!(facade.contains("ProviderOwner::start(config, Arc::clone(process_lease))"));
     assert!(facade.contains("RpcSession::connect(&provider, deadline)"));

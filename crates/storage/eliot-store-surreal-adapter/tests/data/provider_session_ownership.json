@@ -59,7 +59,7 @@
     }
   ],
   "callers": [
-    "SurrealStoreAdapter::connect -> apply::client -> RpcTransport::connect -> ProviderOwner::start + RpcSession::connect",
+    "SurrealStoreAdapter::connect -> apply::client -> RpcTransport::connect_with_limits -> ProviderOwner::start + RpcSession::connect + SessionPool (issue 987; compatibility profile preserves the pre-pool facade)",
     "apply::client -> RpcTransport::validate_liveness -> ProviderOwner::validate_liveness",
     "client::query -> RpcTransport::query -> RpcSession::request -> request_payload",
     "payload_tests native fixture -> test-only child projection; version/request delegation"
