@@ -15,8 +15,14 @@ enum Response {
         dead_code,
         reason = "retained for the success_response_projects_proved_state proof; the binary edge emits the JobView receipt instead"
     )]
-    Success { job_id: String, state: String },
-    Error { code: &'static str, error: String },
+    Success {
+        job_id: String,
+        state: String,
+    },
+    Error {
+        code: &'static str,
+        error: String,
+    },
 }
 
 fn main() -> ExitCode {
@@ -316,7 +322,7 @@ mod tests {
             requester: "requester".to_owned(),
             scope_id: admission.scope_id.clone(),
             task_id: None,
-            state_fence: "kernel-owned".to_owned(),
+            state_fence: admission.state_fence.clone(),
             evidence_handles: Vec::new(),
             memory_handles: Vec::new(),
             architecture_handles: Vec::new(),

@@ -14,8 +14,8 @@ use eliot_dreamer_contracts::grounding::canonical::{
 };
 use eliot_dreamer_contracts::grounding::{
     AllowedReferenceManifest, AttemptIdentity, AuthorizedReference, ClaimGroundingLedger,
-    ClaimGroundingRecord, ClaimKind, GroundingPolicy, MaterialClaim, ModelDraft, NonMaterialClaim,
-    PrecisionPayload, RouteIdentity,
+    ClaimGroundingRecord, ClaimKind, GroundingPolicy, MaterialClaim, NonMaterialClaim,
+    PrecisionPayload, RouteIdentity, StructuredModelDraft,
 };
 use eliot_dreamer_contracts::rival::{
     ClaimDeclarations, CommonModeDisclosure, CurrentPositionAvailability, DeclarationAvailability,
@@ -260,7 +260,7 @@ fn manifest() -> AllowedReferenceManifest {
     manifest
 }
 
-fn draft_for(manifest: &AllowedReferenceManifest, job: &DreamJobAdmission) -> ModelDraft {
+fn draft_for(manifest: &AllowedReferenceManifest, job: &DreamJobAdmission) -> StructuredModelDraft {
     let mut claims = vec![claim("claim-1"), claim("claim-2")];
     claims[0].subclaim_ids.insert("claim-2".into());
     claims[0].source_preimage_digest = claims[0].computed_digest().expect("digest");
@@ -276,7 +276,7 @@ fn draft_for(manifest: &AllowedReferenceManifest, job: &DreamJobAdmission) -> Mo
         completeness: BundleCompleteness::Unknown,
         authoritative_denominator: None,
     };
-    let mut draft = ModelDraft {
+    let mut draft = StructuredModelDraft {
         schema_version: 2,
         job_id: job.canonical_id(),
         task_id: task(),
@@ -346,7 +346,7 @@ fn grounding_policy() -> GroundingPolicy {
 }
 
 fn ledger_for(
-    draft: &ModelDraft,
+    draft: &StructuredModelDraft,
     manifest: &AllowedReferenceManifest,
     policy: &GroundingPolicy,
     job: &DreamJobAdmission,
@@ -1470,7 +1470,11 @@ fn rival_606_02_three_models_share_one_assumption() {
     let result = structure_rival_models(&bundle, &candidate, &position, &policy)
         .expect("three slots with a shared assumption structure");
     result.validate().expect("result validates");
-    assert_eq!(result.assessments.len(), 3, "every input keeps one disposition");
+    assert_eq!(
+        result.assessments.len(),
+        3,
+        "every input keeps one disposition"
+    );
     let retained = result
         .assessments
         .iter()
@@ -1494,7 +1498,15 @@ fn rival_606_02_three_models_share_one_assumption() {
         .count();
     assert_eq!(unavailable, 1, "third slot stays explicitly unavailable");
     assert_eq!(result.distinct_material_classes, 2);
-    assert_eq!(result.declarations.as_ref().expect("packed").assumptions.len(), 1);
+    assert_eq!(
+        result
+            .declarations
+            .as_ref()
+            .expect("packed")
+            .assumptions
+            .len(),
+        1
+    );
 }
 
 // WORK_UNIT_CASE: 606/3
@@ -1691,7 +1703,10 @@ fn rival_606_05_duplicate_model_identities_rejected() {
         source_coverage: unknown_coverage(),
         unresolved: BTreeSet::new(),
     });
-    assert!(attempt.is_err(), "duplicate model identities must fail closed");
+    assert!(
+        attempt.is_err(),
+        "duplicate model identities must fail closed"
+    );
 }
 
 // WORK_UNIT_CASE: 606/6
@@ -1761,7 +1776,10 @@ fn rival_606_06_same_id_changed_payload_rejected() {
         source_coverage: unknown_coverage(),
         unresolved: BTreeSet::new(),
     });
-    assert!(attempt.is_err(), "same ID with changed payload must fail closed");
+    assert!(
+        attempt.is_err(),
+        "same ID with changed payload must fail closed"
+    );
 }
 
 // WORK_UNIT_CASE: 606/7
@@ -1832,7 +1850,10 @@ fn rival_606_07_raw_prose_without_typed_propositions_rejected() {
         },
         unresolved: BTreeSet::new(),
     });
-    assert!(attempt.is_err(), "raw prose without typed propositions must fail");
+    assert!(
+        attempt.is_err(),
+        "raw prose without typed propositions must fail"
+    );
 }
 
 // WORK_UNIT_CASE: 606/8
@@ -1932,13 +1953,10 @@ fn rival_606_08_missing_prediction_falsifier_stays_explicit() {
         .expect("missing fields stay explicit");
     assert!(result.unknown_total > 0);
     assert!(
-        result
-            .assessments
-            .iter()
-            .any(|a| matches!(
-                a.disposition,
-                eliot_dreamer_rival_model::ModelDisposition::Unknown { .. }
-            )),
+        result.assessments.iter().any(|a| matches!(
+            a.disposition,
+            eliot_dreamer_rival_model::ModelDisposition::Unknown { .. }
+        )),
         "missing assumption/prediction must not imply support"
     );
 }
@@ -1960,10 +1978,16 @@ fn rival_606_09_support_and_counterevidence_both_preserved() {
     };
     let slot_a = find("model-a");
     let slot_b = find("model-b");
-    let RivalModelSlot::Retained { declaration: decl_a } = slot_a else {
+    let RivalModelSlot::Retained {
+        declaration: decl_a,
+    } = slot_a
+    else {
         panic!("model-a retained");
     };
-    let RivalModelSlot::Retained { declaration: decl_b } = slot_b else {
+    let RivalModelSlot::Retained {
+        declaration: decl_b,
+    } = slot_b
+    else {
         panic!("model-b retained");
     };
     assert!(matches!(
@@ -2413,11 +2437,10 @@ fn rival_606_19_cooccurrence_is_not_causality() {
         .expect("co-occurrence structures");
     result.validate().expect("result validates");
     assert!(
-        result
-            .comparison
-            .groups
-            .iter()
-            .all(|g| !matches!(g.kind, eliot_dreamer_rival_model::SharedInputKind::CausalRecord)),
+        result.comparison.groups.iter().all(|g| !matches!(
+            g.kind,
+            eliot_dreamer_rival_model::SharedInputKind::CausalRecord
+        )),
         "no causal record may be inferred from co-occurrence"
     );
     let declarations = result.declarations.as_ref().expect("packed");
@@ -2589,7 +2612,10 @@ fn rival_606_23_nondiscriminative_need_is_unprobeable_not_match() {
     let (candidate, bundle, position, policy) = two_model_fixture();
     let result = structure_rival_models(&bundle, &candidate, &position, &policy)
         .expect("nondiscriminative structures");
-    assert!(result.discriminators.is_empty(), "no exact discriminator exists");
+    assert!(
+        result.discriminators.is_empty(),
+        "no exact discriminator exists"
+    );
     assert_eq!(
         result.discriminator_search.outcome,
         eliot_dreamer_rival_model::DiscriminatorOutcome::Unprobeable
@@ -2604,10 +2630,16 @@ fn rival_606_23_nondiscriminative_need_is_unprobeable_not_match() {
 #[test]
 fn rival_606_24_no_executable_probe_tool_or_route() {
     let (candidate, bundle, position, policy) = two_model_fixture();
-    let result = structure_rival_models(&bundle, &candidate, &position, &policy)
-        .expect("inert structures");
+    let result =
+        structure_rival_models(&bundle, &candidate, &position, &policy).expect("inert structures");
     let wire = serde_json::to_string(&result).expect("serializes");
-    for forbidden in ["\"provider\"", "\"tool\"", "\"route\"", "\"promotion\"", "\"Finish\""] {
+    for forbidden in [
+        "\"provider\"",
+        "\"tool\"",
+        "\"route\"",
+        "\"promotion\"",
+        "\"Finish\"",
+    ] {
         assert!(
             !wire.contains(forbidden),
             "inert result must not carry executable {forbidden}"
@@ -2648,8 +2680,15 @@ fn rival_606_26_verbose_models_do_not_crowd_required_rivals() {
     let result = structure_rival_models(&bundle, &candidate, &position, &tight)
         .expect("tight bound structures");
     result.validate().expect("tight result validates");
-    assert_eq!(result.assessments.len(), 2, "every input keeps one disposition");
-    assert_eq!(result.omitted_count, 1, "verbose model is omitted, not merged");
+    assert_eq!(
+        result.assessments.len(),
+        2,
+        "every input keeps one disposition"
+    );
+    assert_eq!(
+        result.omitted_count, 1,
+        "verbose model is omitted, not merged"
+    );
     assert_eq!(result.omission_frontier.model_ids.len(), 1);
     assert!(
         result
@@ -2668,7 +2707,10 @@ fn rival_606_26_verbose_models_do_not_crowd_required_rivals() {
         })
         .count();
     assert_eq!(retained, 1, "required rival remains despite verbose input");
-    assert!(result.unknown_total > 0, "unknowns stay reserved under crowding");
+    assert!(
+        result.unknown_total > 0,
+        "unknowns stay reserved under crowding"
+    );
 }
 
 // WORK_UNIT_CASE: 606/27
@@ -2676,8 +2718,8 @@ fn rival_606_26_verbose_models_do_not_crowd_required_rivals() {
 fn rival_606_27_independent_bounds_yield_exact_frontier() {
     let (candidate, bundle, position, _) = two_model_fixture();
     let tight = policy_with_max_models(1);
-    let result = structure_rival_models(&bundle, &candidate, &position, &tight)
-        .expect("bounded structures");
+    let result =
+        structure_rival_models(&bundle, &candidate, &position, &tight).expect("bounded structures");
     let omitted: Vec<_> = result
         .assessments
         .iter()
@@ -2691,13 +2733,12 @@ fn rival_606_27_independent_bounds_yield_exact_frontier() {
     assert_eq!(omitted.len(), 1);
     assert_eq!(result.omission_frontier.model_ids.len(), 1);
     assert_eq!(
-        result.omission_frontier.model_ids[0].model_id,
-        omitted[0].model_id,
+        result.omission_frontier.model_ids[0].model_id, omitted[0].model_id,
         "frontier must name the exact omitted identity"
     );
     let (ok_candidate, ok_bundle, ok_position, ok_policy) = two_model_fixture();
-    let ok = structure_rival_models(&ok_bundle, &ok_candidate, &ok_position, &ok_policy)
-        .expect("fits");
+    let ok =
+        structure_rival_models(&ok_bundle, &ok_candidate, &ok_position, &ok_policy).expect("fits");
     assert_eq!(ok.omitted_count, 0);
     assert!(ok.omission_frontier.model_ids.is_empty());
 }
@@ -2714,7 +2755,10 @@ fn rival_606_28_insufficient_rivals_without_consensus() {
         eliot_dreamer_rival_model::RivalModelDisposition::InsufficientRivals
     );
     assert!(result.distinct_material_classes < result.required_min_classes);
-    assert!(result.discriminators.is_empty(), "no consensus discriminator invented");
+    assert!(
+        result.discriminators.is_empty(),
+        "no consensus discriminator invented"
+    );
     assert_eq!(
         result.discriminator_search.outcome,
         eliot_dreamer_rival_model::DiscriminatorOutcome::InsufficientRivals
@@ -2803,8 +2847,8 @@ fn rival_606_29_randomized_order_is_deterministic() {
 #[test]
 fn rival_606_30_replay_matches_and_changed_policy_conflicts() {
     let (candidate, bundle, position, policy) = two_model_fixture();
-    let result = structure_rival_models(&bundle, &candidate, &position, &policy)
-        .expect("structures");
+    let result =
+        structure_rival_models(&bundle, &candidate, &position, &policy).expect("structures");
     result
         .validate_against(&bundle, &candidate, &position, &policy)
         .expect("exact replay validates");
@@ -2826,7 +2870,9 @@ fn rival_606_31_malformed_inputs_fail_closed_without_panic() {
     assert!(
         matches!(
             bad_digest,
-            Err(eliot_dreamer_rival_model::RivalModelError::InvalidContract(_))
+            Err(eliot_dreamer_rival_model::RivalModelError::InvalidContract(
+                _
+            ))
         ),
         "tampered policy digest must fail closed"
     );
@@ -2880,8 +2926,7 @@ fn rival_606_31_malformed_inputs_fail_closed_without_panic() {
         state_fence: fence(),
     };
     let missing = ValidatedGroundingCandidate::new(input, validated).expect("candidate");
-    let missing_result =
-        structure_rival_models(&bundle, &missing, &position, &policy);
+    let missing_result = structure_rival_models(&bundle, &missing, &position, &policy);
     assert!(
         matches!(
             missing_result,
@@ -2895,8 +2940,8 @@ fn rival_606_31_malformed_inputs_fail_closed_without_panic() {
 #[test]
 fn rival_606_32_every_input_has_one_output_disposition() {
     let (candidate, bundle, position, policy) = two_model_fixture();
-    let result = structure_rival_models(&bundle, &candidate, &position, &policy)
-        .expect("structures");
+    let result =
+        structure_rival_models(&bundle, &candidate, &position, &policy).expect("structures");
     result.validate().expect("result validates");
     let declarations = result.declarations.as_ref().expect("packed");
     assert_eq!(result.assessments.len(), declarations.models.len());
@@ -2913,10 +2958,16 @@ fn rival_606_32_every_input_has_one_output_disposition() {
         .map(|a| a.model_id.clone())
         .collect();
     output_ids.sort();
-    assert_eq!(input_ids, output_ids, "every input maps to exactly one output");
+    assert_eq!(
+        input_ids, output_ids,
+        "every input maps to exactly one output"
+    );
     let mut seen = BTreeSet::new();
     for assessment in &result.assessments {
-        assert!(seen.insert(assessment.model_id.clone()), "no duplicate output");
+        assert!(
+            seen.insert(assessment.model_id.clone()),
+            "no duplicate output"
+        );
     }
 }
 
@@ -2924,8 +2975,8 @@ fn rival_606_32_every_input_has_one_output_disposition() {
 #[test]
 fn rival_606_33_lost_counterevidence_changes_digest() {
     let (candidate, bundle, position, policy) = two_model_fixture();
-    let full = structure_rival_models(&bundle, &candidate, &position, &policy)
-        .expect("full structures");
+    let full =
+        structure_rival_models(&bundle, &candidate, &position, &policy).expect("full structures");
     let grounded = grounded_fixture();
     let ref_a = claim_ref_for("claim-1", &grounded);
     let ref_b = claim_ref_for("claim-2", &grounded);
@@ -2979,8 +3030,8 @@ fn rival_606_33_lost_counterevidence_changes_digest() {
 #[test]
 fn rival_606_34_no_winner_current_or_accepted_field() {
     let (candidate, bundle, position, policy) = two_model_fixture();
-    let result = structure_rival_models(&bundle, &candidate, &position, &policy)
-        .expect("structures");
+    let result =
+        structure_rival_models(&bundle, &candidate, &position, &policy).expect("structures");
     let wire = serde_json::to_string(&result).expect("serializes");
     for forbidden in [
         "\"winner\"",
@@ -3009,8 +3060,14 @@ fn rival_606_35_causal_ceiling_bounded_by_supplied_evidence() {
         .expect("ceiling check structures");
     result.validate().expect("result validates");
     let wire = serde_json::to_string(&result).expect("serializes");
-    assert!(!wire.contains("SCIENCE_GRADE"), "ceiling never reaches science grade");
-    assert!(!wire.contains("MECHANISM"), "no mechanism without exact supply");
+    assert!(
+        !wire.contains("SCIENCE_GRADE"),
+        "ceiling never reaches science grade"
+    );
+    assert!(
+        !wire.contains("MECHANISM"),
+        "no mechanism without exact supply"
+    );
     let declarations = result.declarations.as_ref().expect("packed");
     for slot in &declarations.models {
         let RivalModelSlot::Retained { declaration } = slot else {
@@ -3043,10 +3100,16 @@ fn rival_606_36_no_forbidden_runtime_or_provider_api() {
         );
     }
     let (candidate, bundle, position, policy) = two_model_fixture();
-    let result = structure_rival_models(&bundle, &candidate, &position, &policy)
-        .expect("structures");
+    let result =
+        structure_rival_models(&bundle, &candidate, &position, &policy).expect("structures");
     let wire = serde_json::to_string(&result).expect("serializes");
-    for forbidden in ["\"provider\"", "\"promotion\"", "\"Store\"", "\"Finish\"", "\"tool\""] {
+    for forbidden in [
+        "\"provider\"",
+        "\"promotion\"",
+        "\"Store\"",
+        "\"Finish\"",
+        "\"tool\"",
+    ] {
         assert!(!wire.contains(forbidden), "no {forbidden} API in output");
     }
     result.validate().expect("result validates");

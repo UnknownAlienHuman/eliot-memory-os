@@ -13,7 +13,7 @@
 
 use eliot_dreamer_claim_grounding::{GroundingRequest, ground_draft_with_controls};
 use eliot_dreamer_contracts::ContractViolation;
-use eliot_dreamer_contracts::grounding::{GroundedDreamDraft, ModelDraft};
+use eliot_dreamer_contracts::grounding::{GroundedDreamDraft, StructuredModelDraft};
 
 use crate::admitted_material::{admission_of, bundle_of, grounding_policy, manifest_of};
 use crate::controller::verify_admitted_binding;
@@ -31,7 +31,7 @@ use crate::{DreamJobInput, DreamerError, KernelJobAdmission};
 pub(crate) fn resolve_grounding_inputs(
     admission: &KernelJobAdmission,
     job: &DreamJobInput,
-    draft: ModelDraft,
+    draft: StructuredModelDraft,
 ) -> Result<GroundingRequest, DreamerError> {
     verify_admitted_binding(admission, job)?;
     let admitted = admission_of(admission, job)?;
@@ -64,7 +64,7 @@ pub(crate) fn ground_admitted_draft_with(
 /// Production entry: the real A-14b grounding, once per admission.
 ///
 /// Unwired until the pipeline threads the model draft through; `submit`
-/// cannot supply a [`ModelDraft`] yet, so the entry is exercised by the slice
+/// cannot supply a [`StructuredModelDraft`] yet, so the entry is exercised by the slice
 /// tests below. Remove the allowance once the pipeline calls this entry.
 #[allow(
     dead_code,
@@ -112,8 +112,8 @@ fn grounding_denied(error: &ContractViolation) -> DreamerError {
 
 #[cfg(test)]
 mod slice_5_grounding_tests {
-    use crate::admitted_material as governed;
     use super::*;
+    use crate::admitted_material as governed;
     use std::collections::{BTreeMap, BTreeSet};
     use std::num::NonZeroU64;
     use std::sync::atomic::{AtomicU64, Ordering};
@@ -122,7 +122,7 @@ mod slice_5_grounding_tests {
     use eliot_dreamer_claim_grounding::ground_draft_with_controls;
     use eliot_dreamer_contracts::grounding::{
         AllowedReferenceManifest, AttemptIdentity, GROUNDING_SCHEMA_VERSION, GroundingPolicy,
-        ModelDraft, RouteIdentity, budget_digest, bundle_digest, requester_digest,
+        RouteIdentity, StructuredModelDraft, budget_digest, bundle_digest, requester_digest,
         route_fingerprint,
     };
     use eliot_dreamer_contracts::{
@@ -168,7 +168,7 @@ mod slice_5_grounding_tests {
             requester: "test-harness".to_owned(),
             scope_id: admission.scope_id.clone(),
             task_id: None,
-            state_fence: "kernel-owned".to_owned(),
+            state_fence: admission.state_fence.clone(),
             evidence_handles: Vec::new(),
             memory_handles: Vec::new(),
             architecture_handles: Vec::new(),
@@ -188,11 +188,11 @@ mod slice_5_grounding_tests {
     /// A draft that is never validated: resolution fails at the binding check
     /// before the draft is touched, so stale/switched inputs need only a
     /// well-formed value, never governed material.
-    fn dummy_draft() -> ModelDraft {
+    fn dummy_draft() -> StructuredModelDraft {
         let Ok(task_id) = TaskId::new("task-slice-5") else {
             panic!("test task identity must construct");
         };
-        ModelDraft {
+        StructuredModelDraft {
             schema_version: GROUNDING_SCHEMA_VERSION,
             job_id: "job-slice-5".to_owned(),
             task_id,
@@ -228,7 +228,7 @@ mod slice_5_grounding_tests {
     /// owner fingerprint, owner-computed digests, and the owner preimage
     /// digest. Mirrors the model stage derivation so the test proves what the
     /// pipeline will carry, not a second implementation.
-    fn governed_draft(admission: &KernelJobAdmission, job: &DreamJobInput) -> ModelDraft {
+    fn governed_draft(admission: &KernelJobAdmission, job: &DreamJobInput) -> StructuredModelDraft {
         let Ok(admitted) = governed::admission_of(admission, job) else {
             panic!("test admission must derive");
         };
@@ -267,7 +267,7 @@ mod slice_5_grounding_tests {
         let Ok(bundle_sum) = bundle_digest(&bundle) else {
             panic!("test bundle digest must compute");
         };
-        let mut draft = ModelDraft {
+        let mut draft = StructuredModelDraft {
             schema_version: GROUNDING_SCHEMA_VERSION,
             job_id: canonical_id.clone(),
             task_id,
@@ -499,7 +499,7 @@ mod slice_5_grounding_tests {
         let Ok(task_id) = TaskId::new("task-slice-5") else {
             panic!("test task identity must construct");
         };
-        let draft = ModelDraft {
+        let draft = StructuredModelDraft {
             schema_version: GROUNDING_SCHEMA_VERSION,
             job_id: "job-slice-5".to_owned(),
             task_id,

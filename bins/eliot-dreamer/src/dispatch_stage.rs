@@ -38,19 +38,20 @@
 //! A-31 path end to end.
 
 use eliot_dreamer_candidate_validation::{
-    validate_grounded_dream_draft_at, CandidateValidationOutcome, DreamDraftValidationError,
+    CandidateValidationOutcome, DreamDraftValidationError, validate_grounded_dream_draft_at,
 };
-use eliot_dreamer_contracts::registry::{canonical_registry, CurationHandlerRegistry};
+use eliot_dreamer_contracts::registry::{CurationHandlerRegistry, canonical_registry};
 use eliot_dreamer_contracts::{
     ContractViolation, JobClass, ScreenBinding, ScreenState, SourceDisposition,
 };
 use eliot_dreamer_curation::{
-    route_validated_curation, CurationCandidateSet, CurationRoutingError, NativeCurationPortSet,
-    OwnerRevisionPin, RoutingDisposition, RoutingPolicy, ValidatedCurationBatch, MAX_BATCH_ITEMS,
+    CurationCandidateSet, CurationRoutingError, MAX_BATCH_ITEMS, NativeCurationPortSet,
+    OwnerRevisionPin, RoutingDisposition, RoutingPolicy, ValidatedCurationBatch,
+    route_validated_curation,
 };
 use eliot_dreamer_orientation::{
-    projection::{build_projection, OrientationPacketCandidate},
     AdmittedOrientationJob, OrientationError, OrientationPolicy,
+    projection::{OrientationPacketCandidate, build_projection},
 };
 
 use crate::admitted_material::{
@@ -338,8 +339,9 @@ fn v1_denied(error: &DreamDraftValidationError) -> DreamerError {
 /// Projects one native orientation packet onto the crate packet result.
 ///
 /// Identity bindings travel verbatim (packet/job/question/scope from the
-/// owner packet; the state fence from the admitted semantic input, which owns
-/// the fence string the typed owner fence was captured under). Source
+/// owner packet; the state fence from the admitted semantic input, which now
+/// carries the typed fence proved equal to the Kernel-admitted one by the
+/// binding check). Source
 /// coverage carries the five admitted handle families verbatim. Interpreted
 /// statements travel with their source handles at the candidate-only ceiling:
 /// nothing is promoted. ABSOLUTE G4 RULE: both owner residues,
@@ -619,19 +621,19 @@ pub(crate) mod curation_test_support {
     use super::*;
     use eliot_contracts::sha256_hex;
     use eliot_dreamer_contracts::candidate::{
-        DimensionVerdict, PreservationDimension, PreservationReport, PRESERVATION_DIMENSIONS,
+        DimensionVerdict, PRESERVATION_DIMENSIONS, PreservationDimension, PreservationReport,
     };
-    use eliot_dreamer_contracts::curation::{kind_family, ClassificationPayload, TargetEvidence};
+    use eliot_dreamer_contracts::curation::{ClassificationPayload, TargetEvidence, kind_family};
     use eliot_dreamer_contracts::registry::{
-        CurationFamily, CurationHandlerPort, CURATION_FAMILIES,
+        CURATION_FAMILIES, CurationFamily, CurationHandlerPort,
     };
     use eliot_dreamer_contracts::{
-        parse_family, AtomicityMode, BoundCurationCall, CandidateDisposition, CurationKind,
-        CurationPayload, NativeCurationHandler, ProducedCurationContent, TargetDenominator,
-        ValidatedCurationItem, ValidationReceipt,
+        AtomicityMode, BoundCurationCall, CandidateDisposition, CurationKind, CurationPayload,
+        NativeCurationHandler, ProducedCurationContent, TargetDenominator, ValidatedCurationItem,
+        ValidationReceipt, parse_family,
     };
     use eliot_dreamer_curation::{
-        compute_input_digest, expected_owner_package, NativeCurationPort,
+        NativeCurationPort, compute_input_digest, expected_owner_package,
     };
     use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -1364,7 +1366,7 @@ mod slice_7_native_owner_tests {
             requester: "test-harness".to_owned(),
             scope_id: SCOPE.to_owned(),
             task_id: Some(TASK.to_owned()),
-            state_fence: "fence-slice-7".to_owned(),
+            state_fence: fence(),
             evidence_handles: vec!["evidence-slice-7".to_owned()],
             memory_handles: vec!["memory-slice-7".to_owned()],
             architecture_handles: vec!["architecture-slice-7".to_owned()],

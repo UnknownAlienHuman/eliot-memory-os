@@ -26,16 +26,29 @@ use crate::{DreamJobInput, DreamerError, KernelJobAdmission};
 /// input fails closed with zero stage calls. The fence/identity binding is
 /// defense in depth alongside the claim-port check: admission freshness comes
 /// from [`KernelJobAdmission::validate`], claimed-identity binding from the
-/// job/scope match.
+/// job/scope match, and fence agreement from the typed equality below —
+/// the semantic input now carries a real [`StateFence`](eliot_contracts::StateFence),
+/// so a caller-supplied fence that differs from the admitted one refuses here
+/// instead of flowing downstream as opaque text.
+///
+/// Post-verify invariant relied on by [`admission_of`](crate::admitted_material::admission_of),
+/// [`bundle_of`](crate::admitted_material::bundle_of), and the frozen manifest
+/// shell: `job.state_fence == admission.state_fence`, so deriving from either
+/// side binds the same fence.
 pub(crate) fn verify_admitted_binding(
     admission: &KernelJobAdmission,
     job: &DreamJobInput,
 ) -> Result<(), DreamerError> {
-    job.validate()?;
+    job.validate().map_err(|error| crate::job_denied(&error))?;
     admission.validate()?;
     if admission.job_id != job.job_id || admission.scope_id != job.scope_id {
         return Err(DreamerError::KernelAdmissionRequired(
             "job/attempt identity does not match the admitted semantic input".to_owned(),
+        ));
+    }
+    if admission.state_fence != job.state_fence {
+        return Err(DreamerError::KernelAdmissionRequired(
+            "job state fence does not match the admitted semantic input".to_owned(),
         ));
     }
     Ok(())
@@ -137,7 +150,9 @@ mod slice_2_controller_tests {
     use super::*;
     use std::sync::atomic::{AtomicU64, Ordering};
 
-    use eliot_contracts::{EpochId, EpochLineageId, PolicyRevision, ResourceGeneration, StateFence};
+    use eliot_contracts::{
+        EpochId, EpochLineageId, PolicyRevision, ResourceGeneration, StateFence,
+    };
     use eliot_dreamer_contracts::{
         BudgetLimits, DreamJobAdmission, JobClass, Requester, RequesterOrigin,
     };
@@ -177,7 +192,7 @@ mod slice_2_controller_tests {
             requester: "test-harness".to_owned(),
             scope_id: admission.scope_id.clone(),
             task_id: None,
-            state_fence: "kernel-owned".to_owned(),
+            state_fence: admission.state_fence.clone(),
             evidence_handles: Vec::new(),
             memory_handles: Vec::new(),
             architecture_handles: Vec::new(),
@@ -219,6 +234,27 @@ mod slice_2_controller_tests {
         let admission = admission_with_deadline(u64::MAX);
         let mut job = job_for(&admission);
         job.job_id = "caller-switched-job".to_owned();
+        let refused = resolve_cycle_inputs(&admission, &job);
+        assert_eq!(
+            refused.map_err(|error| error.code()),
+            Err(KERNEL_ADMISSION_REQUIRED)
+        );
+    }
+
+    /// A caller-supplied fence that differs from the admitted one fails closed
+    /// at the binding check with the Kernel-admission code and zero transition
+    /// calls: the semantic input now carries a typed fence, so disagreement is
+    /// an authority mismatch, not opaque text to carry downstream.
+    #[test]
+    fn switched_state_fence_fails_closed_before_any_step() {
+        let admission = admission_with_deadline(u64::MAX);
+        let mut job = job_for(&admission);
+        let other_epoch = EpochId::new(
+            EpochLineageId::new(TEST_LINEAGE).expect("valid test lineage"),
+            std::num::NonZeroU64::new(2).expect("nonzero test sequence"),
+        )
+        .expect("valid test epoch");
+        job.state_fence = StateFence::new(other_epoch, ResourceGeneration::genesis());
         let refused = resolve_cycle_inputs(&admission, &job);
         assert_eq!(
             refused.map_err(|error| error.code()),

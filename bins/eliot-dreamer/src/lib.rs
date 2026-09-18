@@ -15,7 +15,6 @@ use serde::{Deserialize, Serialize};
 use crate::dispatch_stage::CurationExecutionCarrier;
 use crate::kernel_port::{ClaimTransport, KernelClaimTransport};
 
-pub(crate) mod kernel_port;
 mod admitted_material;
 mod bundle_stage;
 mod controller;
@@ -23,6 +22,7 @@ mod curation_screen_stage;
 mod dispatch_stage;
 mod error;
 mod grounding_stage;
+pub(crate) mod kernel_port;
 mod model_stage;
 mod result_stage;
 mod validation_stage;
@@ -36,7 +36,6 @@ pub const SERVICE_NAME: &str = "eliot-dreamer";
 pub const PROTOCOL_VERSION: &str = "eliot.dreamer.v1";
 pub const KERNEL_ADMISSION_REQUIRED: &str = "KERNEL_ADMISSION_REQUIRED";
 const MAX_TEXT: usize = 16_384;
-const MAX_ITEMS: usize = 256;
 
 /// The canonical nine work classes of I9.3, owned by `eliot-dreamer-contracts`.
 ///
@@ -47,30 +46,14 @@ const MAX_ITEMS: usize = 256;
 /// variant, so the spelling is stated rather than derived.
 pub use eliot_dreamer_contracts::JobClass;
 
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct DreamJobInput {
-    pub job_id: String,
-    pub job_class: JobClass,
-    pub exact_question: String,
-    pub requester: String,
-    pub scope_id: String,
-    pub task_id: Option<String>,
-    pub state_fence: String,
-    pub evidence_handles: Vec<String>,
-    pub memory_handles: Vec<String>,
-    pub architecture_handles: Vec<String>,
-    pub implementation_handles: Vec<String>,
-    pub conformance_handles: Vec<String>,
-    pub conflicts_and_unknowns: Vec<String>,
-    pub privacy_profile: String,
-    pub allowed_tools: Vec<String>,
-    pub allowed_model_routes: Vec<String>,
-    pub budget_units: u64,
-    pub deadline_ms: i64,
-    pub output_schema: String,
-    pub forbidden_effects: Vec<String>,
-}
+/// The canonical semantic dream-job input, owned by `eliot-dreamer-contracts`.
+///
+/// This crate previously declared its own copy with an opaque `state_fence:
+/// String`, which admitted jobs without a validated fence. The owner carries
+/// a real [`StateFence`](eliot_contracts::StateFence) plus intrinsic
+/// `validate()` bounds, so the stringly-typed hole is closed at the type
+/// level.
+pub use eliot_dreamer_contracts::DreamJobInput;
 
 /// Exact identity inherited from the Kernel for one Dreamer job attempt.
 ///
@@ -204,8 +187,8 @@ impl<'a> AuthenticatedKernelJobPort<'a> {
                 "Kernel health handshake was not OPEN and fenced".to_owned(),
             ));
         }
-        let live_epoch = kernel_port::live_epoch_from_health(&health)
-            .map_err(|error| port_denied(&error))?;
+        let live_epoch =
+            kernel_port::live_epoch_from_health(&health).map_err(|error| port_denied(&error))?;
         let material = kernel_port::read_material(&live_epoch)
             .map_err(|error| port_denied(&error))?
             .ok_or_else(|| {
@@ -213,8 +196,8 @@ impl<'a> AuthenticatedKernelJobPort<'a> {
                     "no staged dreamer dispatch material was presented".to_owned(),
                 )
             })?;
-        let (executable, working_directory) = kernel_port::claim_executable_paths()
-            .map_err(|error| port_denied(&error))?;
+        let (executable, working_directory) =
+            kernel_port::claim_executable_paths().map_err(|error| port_denied(&error))?;
         // Derive-and-drop: the sealed request proves the grant binds through
         // the real contour constructors now. Dropping the ephemeral authority
         // admits no second issuance in this process; the staged file is
@@ -222,8 +205,8 @@ impl<'a> AuthenticatedKernelJobPort<'a> {
         kernel_port::derive_permit(&material, &executable, &working_directory)
             .map_err(|error| port_denied(&error))?;
         let mut transport = KernelClaimTransport::new(session);
-        let started =
-            kernel_port::claim_once(&material, &mut transport).map_err(|error| port_denied(&error))?;
+        let started = kernel_port::claim_once(&material, &mut transport)
+            .map_err(|error| port_denied(&error))?;
         let admission = claim_admission(&material);
         admission.validate()?;
         let handshake = KernelHandshake {
@@ -366,8 +349,7 @@ impl<'a> AuthenticatedKernelJobPort<'a> {
     /// edge (`main.rs`) emits the line on stdout.
     fn finish_with_result(&mut self, result: DreamResult) -> Result<JobView, DreamerError> {
         let view = self.live_view()?;
-        let projected =
-            result_stage::project_result_view(&view.job_id, view.state, Some(result));
+        let projected = result_stage::project_result_view(&view.job_id, view.state, Some(result));
         let line = result_stage::render_jsonl(&projected)?;
         debug_assert!(
             !line.is_empty(),
@@ -650,53 +632,46 @@ impl KernelJobPort for AuthenticatedKernelJobPort<'_> {
     }
 }
 
-fn kernel_admission_error(error: &KernelClientError) -> DreamerError {
-    DreamerError::KernelAdmissionRequired(error.to_string())
+/// Maps an owner intake refusal to a typed fail-closed refusal.
+///
+/// `DreamJobInput::validate` is owner-published and returns
+/// [`ContractViolation`]; every mapping here is
+/// [`DreamerError::InvalidAdmission`] (request-rejected code), never the
+/// Kernel-admission code: the admission itself was valid, the semantic input
+/// was not. Dynamic payloads are dropped in favor of bounded static field
+/// names; nothing secret flows. Exhaustive with no wildcard arm: extending
+/// the closed owner taxonomy breaks compilation here until the new refusal is
+/// assigned a mapping.
+pub(crate) fn job_denied(error: &ContractViolation) -> DreamerError {
+    match error {
+        ContractViolation::UnknownVariant { field, .. }
+        | ContractViolation::OutOfBounds { field, .. }
+        | ContractViolation::BindingMismatch { field, .. }
+        | ContractViolation::Malformed { field, .. }
+        | ContractViolation::MissingField(field)
+        | ContractViolation::ImplicitDefault(field)
+        | ContractViolation::CrossStage(field) => DreamerError::InvalidAdmission(field),
+        ContractViolation::Budget { dimension, .. } => DreamerError::InvalidAdmission(dimension),
+        ContractViolation::KindPayload(_) => {
+            DreamerError::InvalidAdmission("kind/payload mismatch")
+        }
+        ContractViolation::Registry(_) => {
+            DreamerError::InvalidAdmission("handler registry conflict")
+        }
+        ContractViolation::ScreenIneligible(_) => {
+            DreamerError::InvalidAdmission("screen ineligible")
+        }
+        ContractViolation::Preservation(_) => {
+            DreamerError::InvalidAdmission("preservation failure")
+        }
+        ContractViolation::ForbiddenCarry(_) => {
+            DreamerError::InvalidAdmission("forbidden candidate carry")
+        }
+    }
 }
 
-impl DreamJobInput {
-    pub fn validate(&self) -> Result<(), DreamerError> {
-        for (name, value) in [
-            ("job_id", &self.job_id),
-            ("exact_question", &self.exact_question),
-            ("requester", &self.requester),
-            ("scope_id", &self.scope_id),
-            ("state_fence", &self.state_fence),
-            ("privacy_profile", &self.privacy_profile),
-            ("output_schema", &self.output_schema),
-        ] {
-            validate_text(name, value)?;
-        }
-        for (name, values) in [
-            ("evidence_handles", &self.evidence_handles),
-            ("memory_handles", &self.memory_handles),
-            ("architecture_handles", &self.architecture_handles),
-            ("implementation_handles", &self.implementation_handles),
-            ("conformance_handles", &self.conformance_handles),
-            ("conflicts_and_unknowns", &self.conflicts_and_unknowns),
-            ("allowed_tools", &self.allowed_tools),
-            ("allowed_model_routes", &self.allowed_model_routes),
-            ("forbidden_effects", &self.forbidden_effects),
-        ] {
-            if values.len() > MAX_ITEMS {
-                return Err(DreamerError::LimitExceeded(name));
-            }
-            for value in values {
-                validate_text(name, value)?;
-            }
-        }
-        if self.budget_units == 0 || self.deadline_ms <= 0 {
-            return Err(DreamerError::InvalidAdmission(
-                "budget and deadline must be positive",
-            ));
-        }
-        if self.allowed_model_routes.is_empty() {
-            return Err(DreamerError::InvalidAdmission(
-                "no model route was admitted",
-            ));
-        }
-        Ok(())
-    }
+fn kernel_admission_error(error: &KernelClientError) -> DreamerError {
+    DreamerError::KernelAdmissionRequired(error.to_string())
 }
 
 fn validate_text(name: &'static str, value: &str) -> Result<(), DreamerError> {
@@ -768,7 +743,7 @@ pub struct DreamPacket {
     pub job_id: String,
     pub question: String,
     pub scope_id: String,
-    pub state_fence: String,
+    pub state_fence: StateFence,
     pub source_coverage: SourceCoverage,
     pub synthesized_interpretations: Vec<Interpretation>,
     pub rival_models_and_dissent: Vec<String>,
@@ -863,7 +838,7 @@ impl<P: KernelJobPort> KernelSupervisedComposition<P> {
         admission: &KernelJobAdmission,
         job: &DreamJobInput,
     ) -> Result<JobView, DreamerError> {
-        job.validate()?;
+        job.validate().map_err(|error| job_denied(&error))?;
         self.validate_fence(admission)?;
         if admission.job_id != job.job_id || admission.scope_id != job.scope_id {
             return Err(DreamerError::KernelAdmissionRequired(
@@ -932,7 +907,7 @@ impl DreamerComposition {
     }
 
     pub fn submit(&mut self, input: DreamJobInput) -> Result<JobView, DreamerError> {
-        input.validate()?;
+        input.validate().map_err(|error| job_denied(&error))?;
         if self.jobs.contains_key(&input.job_id) {
             return Err(DreamerError::DuplicateJob(input.job_id));
         }
@@ -1069,7 +1044,10 @@ mod taxonomy_tests {
             (JobClass::DevelopmentDiagnosis, "development_diagnosis"),
             (JobClass::Maintenance, "maintenance"),
             (JobClass::OrchestrationPlanning, "orchestration_planning"),
-            (JobClass::ConfigurationAssistance, "configuration_assistance"),
+            (
+                JobClass::ConfigurationAssistance,
+                "configuration_assistance",
+            ),
         ];
         for (class, token) in taxonomy {
             let encoded = serde_json::to_string(&class).expect("a closed class encodes");
@@ -1109,6 +1087,18 @@ mod projection_tests {
 #[cfg(test)]
 mod slice_a_dispatch_tests {
     use super::*;
+    use eliot_contracts::{EpochId, EpochLineageId, ResourceGeneration};
+
+    const TEST_LINEAGE: &str = "550e8400-e29b-41d4-a716-446655440000";
+
+    fn fence() -> StateFence {
+        let epoch = EpochId::new(
+            EpochLineageId::new(TEST_LINEAGE).expect("valid test lineage"),
+            std::num::NonZeroU64::new(1).expect("nonzero test sequence"),
+        )
+        .expect("valid test epoch");
+        StateFence::new(epoch, ResourceGeneration::genesis())
+    }
 
     /// Builds a well-formed semantic input for one class. The Slice-A gate
     /// reads only `job_class`, so validity of the remaining fields keeps the
@@ -1121,7 +1111,7 @@ mod slice_a_dispatch_tests {
             requester: "test-harness".into(),
             scope_id: "scope-slice-a".into(),
             task_id: None,
-            state_fence: "fence-slice-a".into(),
+            state_fence: fence(),
             evidence_handles: Vec::new(),
             memory_handles: Vec::new(),
             architecture_handles: Vec::new(),
@@ -1224,10 +1214,22 @@ mod slice_a_dispatch_tests {
 #[cfg(test)]
 mod slice_1_dispatch_tests {
     use super::*;
+    use eliot_contracts::{EpochId, EpochLineageId, ResourceGeneration};
     use eliot_dreamer_contracts::{
         BoundCurationCall, ContractViolation, NativeCurationHandler, ProducedCurationContent,
     };
     use std::sync::atomic::{AtomicU64, Ordering};
+
+    const TEST_LINEAGE: &str = "550e8400-e29b-41d4-a716-446655440000";
+
+    fn fence() -> StateFence {
+        let epoch = EpochId::new(
+            EpochLineageId::new(TEST_LINEAGE).expect("valid test lineage"),
+            std::num::NonZeroU64::new(1).expect("nonzero test sequence"),
+        )
+        .expect("valid test epoch");
+        StateFence::new(epoch, ResourceGeneration::genesis())
+    }
 
     /// Builds a well-formed semantic input for one class. The Slice-1
     /// dispatch reads only `job_class`, so validity of the remaining fields
@@ -1240,7 +1242,7 @@ mod slice_1_dispatch_tests {
             requester: "test-harness".into(),
             scope_id: "scope-slice-1".into(),
             task_id: None,
-            state_fence: "fence-slice-1".into(),
+            state_fence: fence(),
             evidence_handles: Vec::new(),
             memory_handles: Vec::new(),
             architecture_handles: Vec::new(),
@@ -1293,7 +1295,11 @@ mod slice_1_dispatch_tests {
         ];
         assert_eq!(routed.len(), 9);
         for (class, expected) in routed {
-            assert_eq!(dispatch_class(class), expected, "distinct arm for {class:?}");
+            assert_eq!(
+                dispatch_class(class),
+                expected,
+                "distinct arm for {class:?}"
+            );
         }
         let mut arms: Vec<ClassArm> = routed.iter().map(|(_, arm)| *arm).collect();
         arms.sort_by_key(|arm| *arm as u8);
@@ -1316,7 +1322,10 @@ mod slice_1_dispatch_tests {
             let (arm, digest) =
                 dispatch_admission(&job_of_class(class)).expect("admitted class must dispatch");
             assert_eq!(dispatch_class(class), arm);
-            assert!(!digest.is_empty(), "admitted arm must carry a registry digest");
+            assert!(
+                !digest.is_empty(),
+                "admitted arm must carry a registry digest"
+            );
         }
         let (first_arm, first_digest) = dispatch_admission(&job_of_class(JobClass::Orientation))
             .expect("admitted class must dispatch");
@@ -1451,8 +1460,7 @@ mod slice_1_dispatch_tests {
             "unsupported Dreamer curation kind: Repair"
         );
         assert_eq!(kind_error.code(), "DREAMER_REQUEST_REJECTED");
-        let registry_error =
-            DreamerError::RegistryNotClosed("incomplete coverage".to_owned());
+        let registry_error = DreamerError::RegistryNotClosed("incomplete coverage".to_owned());
         assert_eq!(
             format!("{registry_error}"),
             "curation handler registry is not closed: incomplete coverage"
@@ -1484,10 +1492,9 @@ mod slice_1_dispatch_tests {
 
     #[test]
     fn slice_1_dispatch_runs_no_handler() {
-        let leaves: [CountingLeaf; 10] = [0, 1, 2, 3, 4, 5, 6, 7, 8, 9]
-            .map(|_| CountingLeaf {
-                calls: AtomicU64::new(0),
-            });
+        let leaves: [CountingLeaf; 10] = [0, 1, 2, 3, 4, 5, 6, 7, 8, 9].map(|_| CountingLeaf {
+            calls: AtomicU64::new(0),
+        });
         for class in [
             JobClass::Orientation,
             JobClass::Curation,

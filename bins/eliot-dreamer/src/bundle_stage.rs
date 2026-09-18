@@ -52,9 +52,7 @@ pub(crate) fn plan_admitted_bundle_with(
 }
 
 /// Production entry: the real A-04 bundle plan, once per admission.
-pub(crate) fn plan_admitted_bundle(
-    request: AssemblyRequest,
-) -> Result<AssemblyPlan, DreamerError> {
+pub(crate) fn plan_admitted_bundle(request: AssemblyRequest) -> Result<AssemblyPlan, DreamerError> {
     plan_admitted_bundle_with(request, plan_bundle)
 }
 
@@ -108,8 +106,8 @@ mod slice_2_bundle_tests {
     };
     use eliot_dreamer_bundle::AssemblyPolicy;
     use eliot_dreamer_contracts::assembly::{
-        DreamInputRole, DreamJobRecipe, RecipeInput, RecipeRole, RoleDisposition, RoleOmissionPolicy,
-        SourceRule, SourceRuleKind,
+        DreamInputRole, DreamJobRecipe, RecipeInput, RecipeRole, RoleDisposition,
+        RoleOmissionPolicy, SourceRule, SourceRuleKind,
     };
     use eliot_dreamer_contracts::grounding::{
         AllowedReferenceManifest, AttemptIdentity, GROUNDING_SCHEMA_VERSION,
@@ -155,7 +153,7 @@ mod slice_2_bundle_tests {
             requester: "test-harness".to_owned(),
             scope_id: admission.scope_id.clone(),
             task_id: None,
-            state_fence: "kernel-owned".to_owned(),
+            state_fence: admission.state_fence.clone(),
             evidence_handles: Vec::new(),
             memory_handles: Vec::new(),
             architecture_handles: Vec::new(),
@@ -497,7 +495,10 @@ mod slice_2_bundle_tests {
         );
         for role in plan.carrier().recipe.roles.clone() {
             assert_eq!(
-                outcomes.iter().filter(|outcome| outcome.role == role.role).count(),
+                outcomes
+                    .iter()
+                    .filter(|outcome| outcome.role == role.role)
+                    .count(),
                 1,
                 "role {:?} must appear exactly once in the preserved denominator",
                 role.role

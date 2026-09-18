@@ -1378,6 +1378,7 @@ version = "0.1.0"
 dependencies = [
  "blake3",
  "eliot-contracts",
+ "eliot-dreamer-contracts",
  "schemars",
  "serde",
  "serde_json",

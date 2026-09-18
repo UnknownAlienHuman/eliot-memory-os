@@ -29,8 +29,8 @@
 //!   correlation identity — preferring it over `task_id`, which names the
 //!   semantic task in a different namespace and may be absent. Fences stay
 //!   bound through [`verify_admitted_binding`](crate::controller::verify_admitted_binding)
-//!   (the Kernel-owned typed fence plus the semantic fence string) and are
-//!   never collapsed into a single literal fence string.
+//!   (the admitted typed fence, proved equal on the Kernel and semantic sides)
+//!   and are never collapsed into a single literal fence string.
 //! - G2: 32-key candidate versus 15-key shape handled natively. This seam
 //!   accepts only the native struct; no YAML or 15-key parsing exists here
 //!   (the crate does not depend on a YAML parser for this path).
@@ -155,7 +155,10 @@ pub(crate) fn validate_admitted_draft_with(
     input: &GroundingValidationInput,
     validate_once: impl FnOnce(
         &GroundingValidationInput,
-    ) -> Result<StructuredCandidateValidationOutcome, DreamDraftValidationError>,
+    ) -> Result<
+        StructuredCandidateValidationOutcome,
+        DreamDraftValidationError,
+    >,
 ) -> Result<ValidatedGroundingCandidate, DreamerError> {
     match validate_once(input) {
         Ok(StructuredCandidateValidationOutcome::Accepted(candidate)) => Ok(*candidate),
@@ -200,15 +203,13 @@ mod slice_6_validation_tests {
     use std::collections::{BTreeMap, BTreeSet};
     use std::sync::atomic::{AtomicU64, Ordering};
 
-    use eliot_contracts::{
-        EpochId, EpochLineageId, ResourceGeneration, StateFence, TaskId,
-    };
+    use eliot_contracts::{EpochId, EpochLineageId, ResourceGeneration, StateFence, TaskId};
     use eliot_dreamer_candidate_validation::RejectionCode;
     use eliot_dreamer_candidate_validation::StructuredCandidateRejectionReport;
+    use eliot_dreamer_contracts::grounding::StructuredModelDraft;
     use eliot_dreamer_contracts::grounding::{
-        AllowedReferenceManifest, AttemptIdentity, ClaimGroundingLedger, GroundedDreamDraft,
-        GroundingPolicy, ModelDraft as GroundingModelDraft, RouteIdentity,
-        GROUNDING_SCHEMA_VERSION,
+        AllowedReferenceManifest, AttemptIdentity, ClaimGroundingLedger, GROUNDING_SCHEMA_VERSION,
+        GroundedDreamDraft, GroundingPolicy, RouteIdentity,
     };
     use eliot_dreamer_contracts::{
         BudgetLimits, BudgetUsage, BundleCompleteness, DreamInputBundle, DreamJobAdmission,
@@ -248,7 +249,11 @@ mod slice_6_validation_tests {
         }
     }
 
-    fn job_of_class(class: JobClass, task_id: Option<&str>) -> DreamJobInput {
+    fn job_of_class(
+        admission: &KernelJobAdmission,
+        class: JobClass,
+        task_id: Option<&str>,
+    ) -> DreamJobInput {
         DreamJobInput {
             job_id: "job-slice-6".to_owned(),
             job_class: class,
@@ -256,7 +261,7 @@ mod slice_6_validation_tests {
             requester: "test-harness".to_owned(),
             scope_id: "scope-slice-6".to_owned(),
             task_id: task_id.map(str::to_owned),
-            state_fence: "kernel-owned".to_owned(),
+            state_fence: admission.state_fence.clone(),
             evidence_handles: Vec::new(),
             memory_handles: Vec::new(),
             architecture_handles: Vec::new(),
@@ -298,7 +303,7 @@ mod slice_6_validation_tests {
     #[test]
     fn stale_admission_fails_closed_before_any_validation() {
         let admission = admission_with_deadline(1);
-        let job = job_of_class(JobClass::Orientation, None);
+        let job = job_of_class(&admission, JobClass::Orientation, None);
         let refused = resolve_validation_inputs(&admission, &job);
         assert!(
             matches!(
@@ -318,7 +323,7 @@ mod slice_6_validation_tests {
     #[test]
     fn switched_job_identity_fails_closed_before_any_validation() {
         let admission = admission_with_deadline(u64::MAX);
-        let mut job = job_of_class(JobClass::Orientation, None);
+        let mut job = job_of_class(&admission, JobClass::Orientation, None);
         job.job_id = "caller-switched-job".to_owned();
         let refused = resolve_validation_inputs(&admission, &job);
         assert_eq!(
@@ -345,14 +350,14 @@ mod slice_6_validation_tests {
             JobClass::ConfigurationAssistance,
         ] {
             let admission = admission_with_deadline(u64::MAX);
-            let job = job_of_class(class, None);
+            let job = job_of_class(&admission, class, None);
             let refused = resolve_validation_inputs(&admission, &job);
             assert!(
                 matches!(refused, Err(DreamerError::UnsupportedJobClass(refused_class)) if refused_class == class),
                 "class {class:?} must refuse with UnsupportedJobClass({class:?})"
             );
             let admission = admission_with_deadline(u64::MAX);
-            let job = job_of_class(class, None);
+            let job = job_of_class(&admission, class, None);
             assert_eq!(
                 resolve_validation_inputs(&admission, &job).map_err(|error| error.code()),
                 Err("DREAMER_REQUEST_REJECTED"),
@@ -368,7 +373,7 @@ mod slice_6_validation_tests {
     #[test]
     fn orientation_g1_mapping_splits_scope_task_operation() {
         let admission = admission_with_deadline(u64::MAX);
-        let job = job_of_class(JobClass::Orientation, Some("task-slice-6"));
+        let job = job_of_class(&admission, JobClass::Orientation, Some("task-slice-6"));
         let mapped = must_map(&admission, &job);
         assert_eq!(
             mapped,
@@ -394,15 +399,12 @@ mod slice_6_validation_tests {
             "operation must be the Kernel correlation, not the semantic task"
         );
 
-        let job_without_task = job_of_class(JobClass::Orientation, None);
+        let job_without_task = job_of_class(&admission, JobClass::Orientation, None);
         let mapped = must_map(&admission, &job_without_task);
         assert!(
             matches!(
                 mapped,
-                ValidationInputs::OrientationNative {
-                    task_id: None,
-                    ..
-                }
+                ValidationInputs::OrientationNative { task_id: None, .. }
             ),
             "an absent task must stay absent, got {mapped:?}"
         );
@@ -421,7 +423,7 @@ mod slice_6_validation_tests {
             JobClass::Curation,
         ] {
             let admission = admission_with_deadline(u64::MAX);
-            let job = job_of_class(class, None);
+            let job = job_of_class(&admission, class, None);
             assert!(
                 matches!(
                     map_admitted_inputs(&admission, &job),
@@ -439,7 +441,7 @@ mod slice_6_validation_tests {
     #[test]
     fn admitted_resolution_returns_mapped_inputs() {
         let admission = admission_with_deadline(u64::MAX);
-        let job = job_of_class(JobClass::Orientation, Some("task-slice-6"));
+        let job = job_of_class(&admission, JobClass::Orientation, Some("task-slice-6"));
         let resolved = must_resolve(&admission, &job);
         assert_eq!(
             resolved,
@@ -454,7 +456,7 @@ mod slice_6_validation_tests {
             JobClass::Maintenance,
             JobClass::Curation,
         ] {
-            let job = job_of_class(class, None);
+            let job = job_of_class(&admission, class, None);
             assert!(
                 matches!(
                     resolve_validation_inputs(&admission, &job),
@@ -473,11 +475,11 @@ mod slice_6_validation_tests {
     #[test]
     fn seam_carries_identity_untouched_g2_g3_g4() {
         let admission = admission_with_deadline(u64::MAX);
-        let mut first = job_of_class(JobClass::Orientation, Some("task-slice-6"));
+        let mut first = job_of_class(&admission, JobClass::Orientation, Some("task-slice-6"));
         first.evidence_handles = vec!["evidence-a".to_owned()];
         first.architecture_handles = vec!["architecture-a".to_owned()];
         first.allowed_model_routes = vec!["route-a".to_owned()];
-        let mut second = job_of_class(JobClass::Orientation, Some("task-slice-6"));
+        let mut second = job_of_class(&admission, JobClass::Orientation, Some("task-slice-6"));
         second.evidence_handles = vec!["evidence-b".to_owned(), "evidence-c".to_owned()];
         second.architecture_handles = vec!["architecture-b".to_owned()];
         second.allowed_model_routes = vec!["route-b".to_owned(), "route-c".to_owned()];
@@ -524,8 +526,7 @@ mod slice_6_validation_tests {
     fn native_orientation_shape_is_struct_not_yaml_g2_g3_g4() {
         let candidate_path = std::any::type_name::<OrientationPacketCandidate>();
         assert_eq!(
-            candidate_path,
-            "eliot_dreamer_orientation::projection::OrientationPacketCandidate",
+            candidate_path, "eliot_dreamer_orientation::projection::OrientationPacketCandidate",
             "validation must consume the native candidate struct"
         );
         let evidence_path = std::any::type_name::<Vec<AnchoredEvidence>>();
@@ -599,8 +600,8 @@ mod slice_6_validation_tests {
         job: DreamJobAdmission,
         bundle: DreamInputBundle,
         task_id: TaskId,
-    ) -> GroundingModelDraft {
-        GroundingModelDraft {
+    ) -> StructuredModelDraft {
+        StructuredModelDraft {
             schema_version: GROUNDING_SCHEMA_VERSION,
             job_id: "job-slice-6".to_owned(),
             task_id,

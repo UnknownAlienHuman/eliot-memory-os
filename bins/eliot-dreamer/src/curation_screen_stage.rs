@@ -108,7 +108,7 @@ pub(crate) fn screenable_targets(job: &DreamJobInput) -> Vec<String> {
 /// The binding is returned unvalidated: the single real
 /// [`ScreenBinding::validate`] call happens in the production entry the
 /// caller routes through ([`screen_admitted_targets`] here,
-/// `ModelDraft::validate` in the model stage), keeping exactly one owner
+/// `StructuredModelDraft::validate` in the model stage), keeping exactly one owner
 /// call per admission per stage.
 pub(crate) fn screen_binding_for(
     admission: &KernelJobAdmission,
@@ -306,7 +306,7 @@ mod slice_3_screen_tests {
             requester: "test-harness".to_owned(),
             scope_id: admission.scope_id.clone(),
             task_id: None,
-            state_fence: "kernel-owned".to_owned(),
+            state_fence: admission.state_fence.clone(),
             evidence_handles: Vec::new(),
             memory_handles: Vec::new(),
             architecture_handles: Vec::new(),

@@ -1,7 +1,7 @@
 //! Model stage for admitted Dreamer jobs (issue #702, Slice 4).
 //!
 //! After the A-04 bundle stage ([`plan_admitted_bundle`](crate::bundle_stage::plan_admitted_bundle)),
-//! the binary derives the closed owner draft ([`ModelDraft`](eliot_dreamer_contracts::grounding::ModelDraft))
+//! the binary derives the closed owner draft ([`StructuredModelDraft`](eliot_dreamer_contracts::grounding::StructuredModelDraft))
 //! from the admitted pair through the contracts owners exactly once per
 //! admitted job. This module owns no model algorithm, performs no I/O,
 //! ranking, or synthesis, and invents no model output text: the admitted job
@@ -14,8 +14,8 @@
 
 use eliot_contracts::TaskId;
 use eliot_dreamer_contracts::grounding::{
-    budget_digest, bundle_digest, requester_digest, route_fingerprint, AttemptIdentity, ModelDraft,
-    RouteIdentity, GROUNDING_SCHEMA_VERSION,
+    AttemptIdentity, GROUNDING_SCHEMA_VERSION, RouteIdentity, StructuredModelDraft, budget_digest,
+    bundle_digest, requester_digest, route_fingerprint,
 };
 use eliot_dreamer_contracts::{ContractViolation, DreamJobAdmission};
 
@@ -37,7 +37,7 @@ pub(crate) struct ModelInputs {
     /// Governor-admitted budget in opaque units; must be positive.
     pub(crate) budget_units: u64,
     /// Closed owner draft derived from the admitted pair.
-    pub(crate) draft: ModelDraft,
+    pub(crate) draft: StructuredModelDraft,
 }
 
 /// Resolves the model inputs for one admitted job.
@@ -46,7 +46,7 @@ pub(crate) struct ModelInputs {
 /// with zero owner-model calls, and any empty route set or zero budget refuses
 /// as well (mirroring the [`DreamJobInput::validate`] subset). Otherwise the
 /// closed owner draft is derived from the admitted pair and proved with the
-/// real [`ModelDraft::validate`] plus [`ModelDraft::computed_digest`]: a
+/// real [`StructuredModelDraft::validate`] plus [`StructuredModelDraft::computed_digest`]: a
 /// draft that fails owner validation never leaves this stage.
 pub(crate) fn resolve_model_inputs(
     admission: &KernelJobAdmission,
@@ -114,7 +114,7 @@ fn build_model_draft(
     job: &DreamJobInput,
     admitted: &DreamJobAdmission,
     route_text: &str,
-) -> Result<ModelDraft, DreamerError> {
+) -> Result<StructuredModelDraft, DreamerError> {
     let task_id = TaskId::new(admitted.task_id.clone())
         .map_err(|_| DreamerError::InvalidAdmission("task_id"))?;
     let attempts = admitted.budget.attempts.unwrap_or(0);
@@ -137,7 +137,7 @@ fn build_model_draft(
     // stage derives, so draft and request preimages cannot drift.
     let bundle = bundle_of(admission, job)?;
     let screen = screen_binding_for(admission, job)?;
-    let mut draft = ModelDraft {
+    let mut draft = StructuredModelDraft {
         schema_version: GROUNDING_SCHEMA_VERSION,
         job_id: canonical_id.clone(),
         task_id,
@@ -182,8 +182,8 @@ fn build_model_draft(
 /// invented here.
 pub(crate) fn run_admitted_model_with(
     inputs: ModelInputs,
-    run_once: impl FnOnce(ModelInputs) -> Result<ModelDraft, ContractViolation>,
-) -> Result<ModelDraft, DreamerError> {
+    run_once: impl FnOnce(ModelInputs) -> Result<StructuredModelDraft, ContractViolation>,
+) -> Result<StructuredModelDraft, DreamerError> {
     run_once(inputs).map_err(|error| model_denied(&error))
 }
 
@@ -193,7 +193,9 @@ pub(crate) fn run_admitted_model_with(
 /// binding through the owner functions — genuine owner work with no I/O:
 /// provider text lives outside this binary, so there is no provider call to
 /// make and no draft text to synthesize here.
-pub(crate) fn run_admitted_model(inputs: ModelInputs) -> Result<ModelDraft, DreamerError> {
+pub(crate) fn run_admitted_model(
+    inputs: ModelInputs,
+) -> Result<StructuredModelDraft, DreamerError> {
     run_admitted_model_with(inputs, |owned| {
         owned.draft.validate()?;
         let recomputed = owned.draft.computed_digest()?;
@@ -286,7 +288,7 @@ mod slice_4_model_tests {
             requester: "test-harness".to_owned(),
             scope_id: admission.scope_id.clone(),
             task_id: None,
-            state_fence: "kernel-owned".to_owned(),
+            state_fence: admission.state_fence.clone(),
             evidence_handles: Vec::new(),
             memory_handles: Vec::new(),
             architecture_handles: Vec::new(),
@@ -335,8 +337,9 @@ mod slice_4_model_tests {
         );
     }
 
-    /// An empty admitted route set refuses with the exact message, never by
-    /// synthesizing a route.
+    /// An empty admitted route set refuses at the owner intake check with the
+    /// canonical missing-field refusal, never by synthesizing a route. The
+    /// binding check runs first, so the refusal names the absent owner field.
     #[test]
     fn empty_routes_refuse() {
         let admission = admission_with_deadline(u64::MAX);
@@ -346,15 +349,14 @@ mod slice_4_model_tests {
         assert!(
             matches!(
                 refused,
-                Err(DreamerError::InvalidAdmission(
-                    "no model route was admitted"
-                ))
+                Err(DreamerError::InvalidAdmission("allowed_model_routes"))
             ),
             "empty routes must refuse, got {refused:?}"
         );
     }
 
-    /// A zero budget refuses with the exact message, never by minting budget.
+    /// A zero budget refuses at the owner intake check with the canonical
+    /// budget-binding refusal, never by minting budget.
     #[test]
     fn zero_budget_refuses() {
         let admission = admission_with_deadline(u64::MAX);
@@ -362,19 +364,14 @@ mod slice_4_model_tests {
         job.budget_units = 0;
         let refused = resolve_model_inputs(&admission, &job);
         assert!(
-            matches!(
-                refused,
-                Err(DreamerError::InvalidAdmission(
-                    "budget and deadline must be positive"
-                ))
-            ),
+            matches!(refused, Err(DreamerError::InvalidAdmission("budget"))),
             "zero budget must refuse, got {refused:?}"
         );
     }
 
     /// Valid admitted inputs build a genuinely validated owner draft: the
-    /// real [`ModelDraft::validate`] passes, the stored digest equals the
-    /// real [`ModelDraft::computed_digest`] output, and the route and budget
+    /// real [`StructuredModelDraft::validate`] passes, the stored digest equals the
+    /// real [`StructuredModelDraft::computed_digest`] output, and the route and budget
     /// are the admitted values.
     #[test]
     fn valid_inputs_build_validated_draft() {

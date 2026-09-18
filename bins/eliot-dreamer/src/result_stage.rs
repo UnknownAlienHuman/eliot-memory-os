@@ -81,9 +81,24 @@ pub(crate) fn emit_jsonl_stdout(view: &JobView) -> Result<(), DreamerError> {
 #[cfg(test)]
 mod slice_8_result_tests {
     use super::*;
+    use std::num::NonZeroU64;
+
+    use eliot_contracts::{EpochId, EpochLineageId, ResourceGeneration, StateFence};
+
     use crate::{CurationCandidate, DreamPacket, Interpretation, SourceCoverage};
 
     use crate::KERNEL_ADMISSION_REQUIRED;
+
+    const TEST_LINEAGE: &str = "550e8400-e29b-41d4-a716-446655440000";
+
+    fn fence() -> StateFence {
+        let epoch = EpochId::new(
+            EpochLineageId::new(TEST_LINEAGE).expect("valid test lineage"),
+            NonZeroU64::new(1).expect("nonzero test sequence"),
+        )
+        .expect("valid test epoch");
+        StateFence::new(epoch, ResourceGeneration::genesis())
+    }
 
     fn coverage() -> SourceCoverage {
         SourceCoverage {
@@ -101,7 +116,7 @@ mod slice_8_result_tests {
             job_id: job_id.to_owned(),
             question: "What does ELIOT know about this scope?".to_owned(),
             scope_id: "scope-slice-8".to_owned(),
-            state_fence: "fence-slice-8".to_owned(),
+            state_fence: fence(),
             source_coverage: coverage(),
             synthesized_interpretations: vec![Interpretation {
                 statement: "Bounded references are available for governed interpretation."
