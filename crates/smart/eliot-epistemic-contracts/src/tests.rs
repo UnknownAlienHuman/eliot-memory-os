@@ -2762,3 +2762,56 @@ fn old_resolver_records_migrate_preserving_handles_sources_revisions() -> CaseRe
     assert_eq!(view_decoded, view);
     Ok(())
 }
+// WORK_UNIT_CASE: 580/48
+#[test]
+fn assumption_and_investigation_cannot_serialize_as_support() -> CaseResult {
+    // Issue #38 acceptance: an assumption or investigation document must never
+    // decode as support, and a support document must never decode as an
+    // assumption or investigation. Shape separation is mechanical: support-only
+    // keys stay absent from assumption/investigation wires and vice versa, and
+    // cross-decoding fails through the checked wire route.
+    let held = assumption()?;
+    let inquiry = investigation_with("open-route")?;
+    let observed = support_with(
+        Supported,
+        BTreeSet::from([artifact("handle-1")?]),
+        None,
+        None,
+    )?;
+    for wire in [encoded(&held)?, encoded(&inquiry)?] {
+        let value: serde_json::Value =
+            serde_json::from_str(&wire).map_err(|_| ContractError::Canonicalization)?;
+        let member = value
+            .as_object()
+            .ok_or(ContractError::Canonicalization)?;
+        for forbidden in ["result", "handles", "verdict", "support"] {
+            assert!(
+                !member.contains_key(forbidden),
+                "assumption/investigation wire carries {forbidden}"
+            );
+        }
+        assert!(serde_json::from_str::<SupportRecord>(&wire).is_err());
+    }
+    let support_wire = encoded(&observed)?;
+    let support_value: serde_json::Value =
+        serde_json::from_str(&support_wire).map_err(|_| ContractError::Canonicalization)?;
+    let support_member = support_value
+        .as_object()
+        .ok_or(ContractError::Canonicalization)?;
+    for forbidden in [
+        "assumption_kind",
+        "requirement_kind",
+        "statement",
+        "inquiry",
+    ] {
+        assert!(
+            !support_member.contains_key(forbidden),
+            "support wire carries {forbidden}"
+        );
+    }
+    assert!(support_member.contains_key("result"));
+    assert!(support_member.contains_key("handles"));
+    assert!(serde_json::from_str::<AssumptionRecord>(&support_wire).is_err());
+    assert!(serde_json::from_str::<InvestigationRequirement>(&support_wire).is_err());
+    Ok(())
+}
