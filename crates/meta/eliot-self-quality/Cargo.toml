@@ -11,7 +11,7 @@ description = "Bounded candidate-only self-quality diagnosis over a frozen obser
 path = "src/lib.rs"
 
 [package.metadata.eliot]
-prototype = true
+prototype = false
 source_status = "IMPLEMENTED"
 workspace_admission = "deferred to #967; standalone until serialized root admission"
 functional_cell = "meta.self_quality.diagnosis"
