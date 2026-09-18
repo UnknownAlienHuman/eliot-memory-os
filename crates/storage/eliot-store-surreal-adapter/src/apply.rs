@@ -655,6 +655,41 @@ pub(crate) async fn apply_prepared_without_write_guard(
     .await
 }
 
+/// Production-path transaction-attempt rendezvous (S-CONC-TX, issue #989).
+///
+/// When the adapter's rendezvous is armed (only the
+/// `production_path_disjoint_writers_overlap_and_conflicts_fail_closed`
+/// integration test arms it), the first allocation attempt of each writer
+/// blocks here — after admission, the idempotency/fence/head reads, and the
+/// plan build, before the canonical transaction is sent — until every party
+/// has arrived. Both public production calls therefore reach the same
+/// post-admission transaction-attempt rendezvous before either is allowed to
+/// continue, so a single serialized production write lane (for example the
+/// removed process-global write guard re-added over this loop) deadlocks
+/// here instead: the first writer waits for a second writer that can never
+/// arrive, and the bounded wait below fails the attempt rather than hanging
+/// the suite.
+///
+/// Production-safe when unarmed (the only state reachable outside that
+/// test: no production caller arms it): one uncontended `std` mutex lock
+/// plus an `is_none` check, then return — no await, no allocation, no
+/// provider I/O, no error-taxonomy change. The mutex is never held across an
+/// await and never contended in production, so unarmed writers neither block
+/// nor serialize on it.
+///
+/// First-attempt only (callers invoke this solely while `semantic_plan` is
+/// still `None`): allocation-contention retries re-enter alone after the
+/// partner has moved on, so a second wait would stall until the bound below.
+async fn rendezvous_before_transaction(adapter: &SurrealStoreAdapter) -> Result<(), AdapterError> {
+    let Some(barrier) = adapter.tx_rendezvous_barrier() else {
+        return Ok(());
+    };
+    tokio::time::timeout(std::time::Duration::from_mins(1), barrier.wait())
+        .await
+        .map_err(|_| AdapterError::ProviderUnavailable)?;
+    Ok(())
+}
+
 /// Bounded in-transaction allocation loop (S-CONC-TX, issue #989).
 ///
 /// Allocation lives in the canonical transaction: every attempt re-reads the
@@ -766,6 +801,14 @@ async fn apply_with_retry(
             full
         };
         let receipt = build_receipt(ctx, &transition, &plan)?;
+
+        // S-CONC-TX production-path rendezvous (issue #989): first attempt
+        // only, after every pre-transaction read and the plan build, before
+        // the canonical transaction is sent. See
+        // `rendezvous_before_transaction`.
+        if semantic_plan.is_none() {
+            rendezvous_before_transaction(adapter).await?;
+        }
 
         match write_transaction(
             db,

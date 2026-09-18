@@ -45,9 +45,10 @@
 //!
 //! Rework proofs beyond the denominator (no denominator change):
 //! `production_path_disjoint_writers_overlap_and_conflicts_fail_closed`
-//! races two disjoint writers through the public production entry from a
-//! barrier-synchronized start, and Case 3 derives its stale expectation
-//! from the baseline receipt's observed pre-commit head value.
+//! arms a post-admission transaction-attempt rendezvous reached by the public
+//! production entry itself and blocks both writers there until both have
+//! arrived, and Case 3 derives its stale expectation from the baseline
+//! receipt's observed pre-commit head value.
 //!
 //! Provider evidence (recorded on failure output and in the work item): the
 //! pinned `surreal.exe` path plus its SHA-256, the server version handshake
@@ -1254,12 +1255,19 @@ async fn real_provider_run_records_sessions_outcomes_and_progress() {
     harness.cleanup().await;
 }
 
-// PROOF (rework, beyond the 20-case denominator): production-path overlap.
+// PROOF (rework, beyond the 20-case denominator): production-path rendezvous.
 // Two independent disjoint-scope transitions race through the public
-// production entry (facade lane, no process-global gate) from a
-// barrier-synchronized start: both commit with unique allocations over
-// overlapping wall-clock intervals, and a genuine same-scope stale-head
-// conflict still fails closed with no allocation consumed.
+// production entry with the post-admission rendezvous armed: EACH writer
+// blocks inside `apply_with_retry` — after admission, fence/head reads, and
+// plan build, before its canonical transaction is sent — until BOTH writers
+// have arrived. One-sentence proof: both public production calls reached the
+// same post-admission transaction-attempt rendezvous before either was
+// allowed to continue, so a single serialized production write lane would
+// deadlock/time out rather than satisfy this test (a re-added process-global
+// write guard over the attempt loop leaves the first writer waiting for a
+// second writer that can never arrive, and the bounded rendezvous wait fails
+// the attempt). Distinct allocations plus the genuine same-scope stale-head
+// refusal below close the proof.
 #[tokio::test]
 async fn production_path_disjoint_writers_overlap_and_conflicts_fail_closed() {
     use std::sync::Arc;
@@ -1267,36 +1275,19 @@ async fn production_path_disjoint_writers_overlap_and_conflicts_fail_closed() {
     let harness = Harness::fresh("21").await;
     let (ctx_a, transition_a) = admitted("op-989-case21-a", "scope-989-a", "subject-989-21-a");
     let (ctx_b, transition_b) = admitted("op-989-case21-b", "scope-989-b", "subject-989-21-b");
-    let barrier = Arc::new(tokio::sync::Barrier::new(2));
-    let barrier_a = Arc::clone(&barrier);
-    let barrier_b = Arc::clone(&barrier);
     let adapter = harness.adapter();
-    let (outcome_a, outcome_b) = tokio::join!(
-        async move {
-            barrier_a.wait().await;
-            let entered = Instant::now();
-            let receipt =
-                CanonicalStoreClient::apply_prepared(adapter, &ctx_a, transition_a, vec![], vec![])
-                    .await;
-            (entered, Instant::now(), receipt)
-        },
-        async move {
-            barrier_b.wait().await;
-            let entered = Instant::now();
-            let receipt =
-                CanonicalStoreClient::apply_prepared(adapter, &ctx_b, transition_b, vec![], vec![])
-                    .await;
-            (entered, Instant::now(), receipt)
-        }
-    );
-    let (entered_a, finished_a, receipt_a) = outcome_a;
-    let (entered_b, finished_b, receipt_b) = outcome_b;
+    adapter.arm_tx_rendezvous(Arc::new(tokio::sync::Barrier::new(2)));
+    let (receipt_a, receipt_b) = tokio::time::timeout(Duration::from_mins(2), async {
+        tokio::join!(
+            CanonicalStoreClient::apply_prepared(adapter, &ctx_a, transition_a, vec![], vec![]),
+            CanonicalStoreClient::apply_prepared(adapter, &ctx_b, transition_b, vec![], vec![]),
+        )
+    })
+    .await
+    .expect("both production writers reach the post-admission rendezvous and commit");
+    adapter.disarm_tx_rendezvous();
     let receipt_a = receipt_a.expect("production writer A commits");
     let receipt_b = receipt_b.expect("production writer B commits");
-    assert!(
-        entered_a <= finished_b && entered_b <= finished_a,
-        "production writers overlapped in time"
-    );
     let mut committed = BTreeSet::new();
     committed.insert(commit_sequence(&receipt_a));
     committed.insert(commit_sequence(&receipt_b));
@@ -1306,17 +1297,12 @@ async fn production_path_disjoint_writers_overlap_and_conflicts_fail_closed() {
             "commit-sequence-0000000000000001".to_owned(),
             "commit-sequence-0000000000000002".to_owned(),
         ]),
-        "overlapping production writers share no allocation"
+        "rendezvoused production writers share no allocation"
     );
     for receipt in [&receipt_a, &receipt_b] {
         receipt.validate().expect("receipt validates");
     }
-    println!(
-        "SCONC-989 case=21 overlap_a_ms={} overlap_b_ms={} committed={:?}",
-        finished_a.duration_since(entered_a).as_millis(),
-        finished_b.duration_since(entered_b).as_millis(),
-        committed
-    );
+    println!("SCONC-989 case=21 rendezvoused committed={committed:?}");
     // Genuine conflict on the same production path still fails closed: the
     // stale expectation is writer A's own observed pre-commit head value,
     // provably superseded by exactly one.

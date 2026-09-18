@@ -64,6 +64,11 @@ pub struct SurrealStoreAdapter {
     /// profile enables separate read/write/admin lanes under the same single
     /// provider generation.
     pub(crate) client_limits: ClientSetLimits,
+    /// Armed production-path transaction-attempt rendezvous (S-CONC-TX #989
+    /// proof hook). `None` unless the rendezvous integration test arms it;
+    /// no production caller arms it, so production always observes the
+    /// disarmed (inert) state documented on [`Self::arm_tx_rendezvous`].
+    pub(crate) tx_rendezvous: std::sync::Mutex<Option<std::sync::Arc<tokio::sync::Barrier>>>,
 }
 
 impl fmt::Debug for SurrealStoreAdapter {
@@ -76,6 +81,7 @@ impl fmt::Debug for SurrealStoreAdapter {
             .field("write_lock", &"private")
             .field("operation_manifest", &self.operation_manifest)
             .field("client_limits", &self.client_limits)
+            .field("tx_rendezvous", &"private")
             .finish()
     }
 }
@@ -120,6 +126,7 @@ impl SurrealStoreAdapter {
             provider_process_lease: std::sync::Arc::new(provider_process_lease),
             client: tokio::sync::OnceCell::new(),
             write_lock: tokio::sync::Mutex::new(()),
+            tx_rendezvous: std::sync::Mutex::new(None),
             operation_manifest,
             client_limits: ClientSetLimits::compatibility(),
         })
@@ -152,6 +159,7 @@ impl SurrealStoreAdapter {
             provider_process_lease: std::sync::Arc::new(provider_process_lease),
             client: tokio::sync::OnceCell::new(),
             write_lock: tokio::sync::Mutex::new(()),
+            tx_rendezvous: std::sync::Mutex::new(None),
             operation_manifest: manifest,
             client_limits: limits,
         })
@@ -179,6 +187,7 @@ impl SurrealStoreAdapter {
             provider_process_lease: std::sync::Arc::new(provider_process_lease),
             client: tokio::sync::OnceCell::new(),
             write_lock: tokio::sync::Mutex::new(()),
+            tx_rendezvous: std::sync::Mutex::new(None),
             operation_manifest: manifest,
             client_limits: ClientSetLimits::compatibility(),
         })
@@ -192,6 +201,46 @@ impl SurrealStoreAdapter {
     /// Returns the fixed bounded session-set limits bound at construction.
     pub fn client_set_limits(&self) -> ClientSetLimits {
         self.client_limits
+    }
+
+    /// Arms the S-CONC-TX production-path transaction-attempt rendezvous
+    /// (issue #989 proof hook).
+    ///
+    /// Test observability only: the sole armer is the
+    /// `production_path_disjoint_writers_overlap_and_conflicts_fail_closed`
+    /// integration test, which passes a two-party barrier so its two public
+    /// production writers prove concurrent progress past admission. No
+    /// production caller arms this hook.
+    ///
+    /// Inert-by-default guarantee: while disarmed, the attempt loop performs
+    /// one uncontended `std` mutex lock plus an `is_none` check and returns
+    /// without awaiting, allocating, logging, touching the provider, or
+    /// altering the error taxonomy — the canonical transaction path is
+    /// byte-identical to the unhooked flow. The mutex is never held across an
+    /// await and never contended in production, so disarmed writers neither
+    /// block nor serialize on it.
+    pub fn arm_tx_rendezvous(&self, barrier: std::sync::Arc<tokio::sync::Barrier>) {
+        if let Ok(mut guard) = self.tx_rendezvous.lock() {
+            *guard = Some(barrier);
+        }
+    }
+
+    /// Disarms the S-CONC-TX production-path rendezvous, restoring the inert
+    /// production state. See [`Self::arm_tx_rendezvous`].
+    pub fn disarm_tx_rendezvous(&self) {
+        if let Ok(mut guard) = self.tx_rendezvous.lock() {
+            *guard = None;
+        }
+    }
+
+    /// Returns the currently armed rendezvous barrier, if any. The attempt
+    /// loop clones the `Arc` under the mutex and waits outside it, so the
+    /// mutex is never held across an await.
+    pub(crate) fn tx_rendezvous_barrier(&self) -> Option<std::sync::Arc<tokio::sync::Barrier>> {
+        self.tx_rendezvous
+            .lock()
+            .ok()
+            .and_then(|guard| (*guard).clone())
     }
 
     /// Returns the immutable manifest bound to this adapter.
