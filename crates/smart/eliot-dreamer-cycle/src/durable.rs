@@ -1439,7 +1439,10 @@ fn validate_stage_closure(state: &DurableJobState) -> Result<(), CycleError> {
                     DurableStage::Grounding => DurableStage::Model,
                     DurableStage::Validation => DurableStage::Grounding,
                     DurableStage::Dispatch => DurableStage::Validation,
-                    _ => DurableStage::Submission,
+                    DurableStage::Submission => DurableStage::Dispatch,
+                    DurableStage::Bundle | DurableStage::Delivery | DurableStage::Model => {
+                        unreachable!()
+                    }
                 };
                 if !settled_stages.contains(&predecessor) {
                     return Err(CycleError::PhaseViolation(

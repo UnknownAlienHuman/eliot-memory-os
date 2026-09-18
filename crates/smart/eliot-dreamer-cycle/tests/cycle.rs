@@ -2043,3 +2043,26 @@ fn pinned_wasm_portable_operation_uses_only_injected_evidence() {
     );
     assert!(before.is_err());
 }
+
+#[test]
+fn durable_state_rejects_submission_without_dispatch_predecessor() {
+    let (mut state, _) = durable_admit_orientation();
+    state.progress_rank = 100;
+    state.settled.push(eliot_dreamer_cycle::SettledOperation {
+        operation_id: OperationId::new("00000000-0000-0000-0000-000000000001").unwrap(),
+        idempotency_key: "idempotency-bundle".to_owned(),
+        stage: eliot_dreamer_cycle::DurableStage::Bundle,
+        outcome: eliot_dreamer_cycle::OperationOutcome::Ready,
+        evidence_digest: Some("a".repeat(64)),
+    });
+    state.settled.push(eliot_dreamer_cycle::SettledOperation {
+        operation_id: OperationId::new("00000000-0000-0000-0000-000000000002").unwrap(),
+        idempotency_key: "idempotency-submission".to_owned(),
+        stage: eliot_dreamer_cycle::DurableStage::Submission,
+        outcome: eliot_dreamer_cycle::OperationOutcome::Ready,
+        evidence_digest: Some("b".repeat(64)),
+    });
+    // Missing Dispatch stage! Must fail validation with PhaseViolation.
+    let validation = state.validate();
+    assert!(matches!(validation, Err(CycleError::PhaseViolation(_))));
+}
