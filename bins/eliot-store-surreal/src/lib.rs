@@ -32,9 +32,9 @@ use eliot_protocol::{
 use eliot_store_api::{
     CAPABILITIES, CanonicalStoreClient, CanonicalValidationSnapshot, EFFECTS, ExactJsonBytes,
     NamedReadRequest, NamedReadResponse, OperationId, OrderingHead, OrderingHeadExpectation,
-    OrderingScopeId, PreparedTransition, RequestMeta, RevisionHead, RevisionHeadExpectation,
-    RevisionKey, StoreError, StoreHealth, WriteReceipt, decode_request_frame_with_authority,
-    generated_operation_manifests, genesis_manifest,
+    OrderingScopeId, PreparedTransition, RequestMeta, ReservedWriteRequest, RevisionHead,
+    RevisionHeadExpectation, RevisionKey, StoreError, StoreHealth, WriteReceipt,
+    decode_request_frame_with_authority, generated_operation_manifests, genesis_manifest,
 };
 pub use eliot_store_api::{
     ReadinessReceipt, ReadinessStatus, StoreRequest as Request, StoreResponse as Response,
@@ -450,6 +450,28 @@ impl StoreComposition {
             .map_err(map_adapter_error)
     }
 
+    /// Applies one sealed reserved-write request through the sole canonical
+    /// write path and returns the immutable transport receipt (issue #991).
+    ///
+    /// Thin composition delegation: the closed #990 request shape is
+    /// validated and the fence is pinned to this composition before the
+    /// existing `CanonicalStoreClient` operation runs. The concrete backend's
+    /// explicit unsupported result is preserved until the scheduler backend
+    /// slice lands — a reserved request is never routed to ordinary `Apply`,
+    /// and support is advertised only from the accepted concrete backend.
+    pub async fn apply_reserved_write(
+        &self,
+        request: ReservedWriteRequest,
+    ) -> Result<WriteReceipt, StoreCompositionError> {
+        request.validate().map_err(StoreCompositionError::Store)?;
+        if request.context.state_fence != self.state_fence {
+            return Err(StoreCompositionError::Store(StoreError::FenceMismatch));
+        }
+        CanonicalStoreClient::apply_reserved_write(&self.store, request)
+            .await
+            .map_err(StoreCompositionError::Store)
+    }
+
     /// Reconciles a possibly ambiguous write by exact operation identity.
     pub async fn receipt(
         &self,
@@ -723,15 +745,20 @@ pub fn validate_request_frame(
 }
 
 /// Re-enforces the active generated catalogue on one session-validated
-/// request before any provider I/O (slice C2, issue #19).
+/// request before any provider I/O (slice C2, issue #19; reserved write,
+/// issue #991).
 ///
 /// Named reads and prepared transitions use the same catalogue validators as
-/// the adapter's pre-commit gate. Genesis is an explicit closed admitted
-/// path bound to the active genesis entry — not a wildcard: the seed must
-/// satisfy its context contract while the entry exists. Recovery, receipt,
-/// head, snapshot, health, readiness, and Dreamer ledger requests keep their
-/// own bounded validation (already run by the wire decode) and perform no
-/// canonical mutation.
+/// the adapter's pre-commit gate. A reserved-write request carries the same
+/// executable transition vocabulary, so its transition is catalogue-checked
+/// exactly like an `Apply` transition after its reservation binding
+/// validates; the reservation evidence itself confers no new operation
+/// authority. Genesis is an explicit closed admitted path bound to the
+/// active genesis entry — not a wildcard: the seed must satisfy its context
+/// contract while the entry exists. Recovery, receipt, head, snapshot,
+/// health, readiness, and Dreamer ledger requests keep their own bounded
+/// validation (already run by the wire decode) and perform no canonical
+/// mutation.
 fn enforce_admitted_operation(request: &Request) -> Result<(), String> {
     match request {
         Request::Named { request } => {
@@ -743,6 +770,14 @@ fn enforce_admitted_operation(request: &Request) -> Result<(), String> {
         Request::Apply { transition, .. } => {
             let entries = generated_operation_manifests().map_err(|error| error.to_string())?;
             transition
+                .validate_against_catalogue(&entries)
+                .map_err(|error| error.to_string())
+        }
+        Request::ReservedWrite { request } => {
+            request.validate().map_err(|error| error.to_string())?;
+            let entries = generated_operation_manifests().map_err(|error| error.to_string())?;
+            request
+                .transition
                 .validate_against_catalogue(&entries)
                 .map_err(|error| error.to_string())
         }

@@ -7,8 +7,10 @@
 //! Store-client reserved-write entry point) cover the owner mapping, round
 //! trip, every rejection family, ordinary-apply compatibility, legacy
 //! compatibility, and the exported-interface authority guard. No reservation, wire, commit, or
-//! concurrent execution is established by these types, and no Store-client
-//! apply operation for reserved writes exists in this slice.
+//! concurrent execution is established by these types. Slice #991 activates
+//! the reserved-write wire variant and client entry point with an explicit
+//! unsupported backend; the authority guard below now pins the declared-but-
+//! unadvertised capability instead of the absence of the variant.
 
 #![allow(clippy::unwrap_used)]
 #![allow(clippy::expect_used)]
@@ -774,6 +776,7 @@ fn store_request_op_tag(request: &StoreRequest) -> &'static str {
         StoreRequest::Readiness => "readiness",
         StoreRequest::Named { .. } => "named",
         StoreRequest::Apply { .. } => "apply",
+        StoreRequest::ReservedWrite { .. } => "reserved_write",
         StoreRequest::Recovery { .. } => "recovery",
         StoreRequest::InitializeGenesis { .. } => "initialize_genesis",
         StoreRequest::Receipt { .. } => "receipt",
@@ -800,9 +803,11 @@ fn missing_reservation_cannot_decode_through_a_legacy_fallback() {
     assert!(serde_json::from_value::<ReservedWriteRequest>(legacy_json).is_err());
     let reserved_json = serde_json::to_value(valid_request()).unwrap();
     assert!(serde_json::from_value::<StoreRequest>(reserved_json).is_err());
-    // Closed wire-variant catalogue: every exported `StoreRequest` variant
-    // encodes under its fixed `op` tag, round-trips, and validates, so no
-    // reserved-write variant exists on the wire in this slice.
+    // Closed wire-variant catalogue: every exported legacy `StoreRequest`
+    // variant encodes under its fixed `op` tag, round-trips, and validates.
+    // Slice #991 adds exactly one variant (`reserved_write`, covered
+    // separately below); the legacy eleven keep their exact tags, encodings,
+    // and advertised capabilities unchanged.
     let catalogue = vec![
         StoreRequest::Health,
         StoreRequest::Readiness,
@@ -856,10 +861,29 @@ fn missing_reservation_cannot_decode_through_a_legacy_fallback() {
         ],
         "closed wire catalogue carries no reserved-write variant"
     );
-    // Reserved-write evidence selects no wire operation: it carries no `op`
-    // tag while every `StoreRequest` encoding requires one.
+    // Reserved-write evidence selects no wire operation by itself: the bare
+    // projection carries no `op` tag while every `StoreRequest` encoding
+    // requires one. Only the explicit #991 `ReservedWrite` wrapper selects
+    // the declared (still unadvertised) capability.
     let reserved_shape = serde_json::to_value(valid_request()).unwrap();
     assert!(reserved_shape.get("op").is_none());
+    let reserved_variant = StoreRequest::ReservedWrite {
+        request: valid_request(),
+    };
+    assert_eq!(store_request_op_tag(&reserved_variant), "reserved_write");
+    let reserved_encoded = serde_json::to_value(&reserved_variant).unwrap();
+    assert_eq!(reserved_encoded.get("op"), Some(&json!("reserved_write")));
+    let reserved_decoded: StoreRequest = serde_json::from_value(reserved_encoded).unwrap();
+    assert_eq!(&reserved_decoded, &reserved_variant);
+    assert!(reserved_decoded.validate().is_ok());
+    assert_eq!(
+        reserved_decoded.capability(),
+        eliot_store_api::CAPABILITY_RESERVED_WRITE
+    );
+    assert!(
+        !CAPABILITIES.contains(&reserved_decoded.capability()),
+        "the reserved-write capability is declared but stays unadvertised until the backend slice"
+    );
 }
 
 // WORK_UNIT_CASE: 990/11
@@ -868,9 +892,10 @@ fn caller_created_projection_shape_is_closed_schema_hygiene() {
     // Schema hygiene ONLY, never an authority proof: a self-consistent caller
     // fabrication passes `validate()` by construction, so this pins the
     // closed JSON shape and nothing about currency or agency. The
-    // no-authority boundary itself is proven by the `compile_fail` doctest on
-    // `CanonicalStoreClient` (no invocable reserved-write entry point) and
-    // the closed wire catalogue in 990/10 (no reserved-write variant).
+    // no-authority boundary itself is proven by the explicit-unsupported
+    // default body of `CanonicalStoreClient::apply_reserved_write` (no
+    // backend accepts the operation) and the declared-but-unadvertised
+    // capability in 990/10.
     let fabricated = valid_request();
     assert!(
         fabricated.validate().is_ok(),
@@ -1133,17 +1158,23 @@ fn existing_client_implementations_keep_ordinary_apply_behavior() {
 // WORK_UNIT_CASE: 990/16
 #[test]
 fn exported_api_surface_exposes_no_reserved_write_authority() {
-    // Exported-interface authority guard, never source-text matching: the
-    // entry-point proof is the `compile_fail` doctest on
-    // `CanonicalStoreClient` (a caller attempt at `apply_reserved_write`
-    // must fail to compile), and the wire proof is the closed `StoreRequest`
-    // catalogue in 990/10. This test pins the remaining runtime-exported
-    // surfaces: the advertised capability and effect sets.
+    // Exported-interface authority guard, never source-text matching: slice
+    // #991 activates the wire variant and the client entry point, so the
+    // guard now pins the remaining runtime-exported surfaces. The entry-point
+    // proof is the explicit-unsupported default body of
+    // `CanonicalStoreClient::apply_reserved_write` (a backend without support
+    // refuses with `UnknownOperation` before any provider I/O), and the wire
+    // proof is the declared-but-unadvertised capability in 990/10. This test
+    // pins the rest: the advertised capability and effect sets.
     assert!(
         CAPABILITIES
             .iter()
             .all(|capability| !capability.contains("reserv") && !capability.contains("admission")),
         "no hidden capability activation: {CAPABILITIES:?}"
+    );
+    assert!(
+        !CAPABILITIES.contains(&eliot_store_api::CAPABILITY_RESERVED_WRITE),
+        "the declared reserved-write capability stays unadvertised until the backend slice"
     );
     assert_eq!(
         EFFECTS,
@@ -1151,7 +1182,8 @@ fn exported_api_surface_exposes_no_reserved_write_authority() {
         "no reserved-write effect exists on the exported surface"
     );
     // Authority conclusion at the wire boundary: caller-sealed reservation
-    // evidence still selects no `StoreRequest` operation.
+    // evidence still selects no `StoreRequest` operation by itself; only the
+    // explicit #991 `ReservedWrite` wrapper selects the declared capability.
     let reserved_json = serde_json::to_value(valid_request()).unwrap();
     assert!(serde_json::from_value::<StoreRequest>(reserved_json).is_err());
 }

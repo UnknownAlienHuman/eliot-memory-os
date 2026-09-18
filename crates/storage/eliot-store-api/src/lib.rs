@@ -75,11 +75,11 @@ pub use wire::{
     CAPABILITY_DREAMER_JOB_START, CAPABILITY_DREAMER_JOB_STATUS, CAPABILITY_DREAMER_JOB_SUBMIT,
     CAPABILITY_ERASURE_INTENT, CAPABILITY_HEALTH, CAPABILITY_INITIALIZE_GENESIS,
     CAPABILITY_NAMED_READ, CAPABILITY_ORDERING_HEADS, CAPABILITY_READINESS, CAPABILITY_RECEIPT,
-    CAPABILITY_RECOVERY, CAPABILITY_REVISION_HEADS, CAPABILITY_VALIDATION_SNAPSHOT, EFFECTS,
-    ErasureSurfaceRequest, ReadinessReceipt, ReadinessStatus, StoreRequest, StoreResponse,
-    StoreWireError, decode_request_frame, decode_request_frame_with_authority,
-    decode_response_frame, dreamer_job_capability, request_frame,
-    request_frame_with_payload_authority, response_frame,
+    CAPABILITY_RECOVERY, CAPABILITY_RESERVED_WRITE, CAPABILITY_REVISION_HEADS,
+    CAPABILITY_VALIDATION_SNAPSHOT, EFFECTS, ErasureSurfaceRequest, ReadinessReceipt,
+    ReadinessStatus, StoreRequest, StoreResponse, StoreWireError, decode_request_frame,
+    decode_request_frame_with_authority, decode_response_frame, dreamer_job_capability,
+    request_frame, request_frame_with_payload_authority, response_frame,
 };
 
 mod operation_catalogue;
@@ -2389,15 +2389,20 @@ pub fn aggregate_erasure_outcomes(
 /// Canonical store boundary.  Only these store-neutral types cross into an
 /// adapter; SDK/query/credential/table types remain adapter-private.
 ///
-/// Slice #990 is projection-only: this trait exposes no reserved-write
-/// operation, so a caller cannot invoke one regardless of payload shape.
-/// The following attempt must fail to compile because the method does not
-/// exist:
+/// Slice #991 activates the reserved-write entry point: the wire variant
+/// exists and the client can invoke it, but no backend accepts it yet. The
+/// default body below is the explicit unsupported result; API enum presence
+/// is not readiness, and the capability stays unadvertised until the actual
+/// scheduler backend lands. The entry-point proof is the signature assertion
+/// below plus the runtime default-refusal coverage in the
+/// `reserved_write_dispatch` suite (991/14): a caller attempt at
+/// `apply_reserved_write` compiles and routes, and a backend without support
+/// refuses with [`StoreError::UnknownOperation`] before any provider I/O.
 ///
-/// ```compile_fail
+/// ```rust
 /// use eliot_store_api::{CanonicalStoreClient, ReservedWriteRequest};
 ///
-/// fn reserved_write_is_not_invocable<C: CanonicalStoreClient>(
+/// fn reserved_write_is_invocable<C: CanonicalStoreClient>(
 ///     client: &C,
 ///     request: ReservedWriteRequest,
 /// ) {
@@ -2414,6 +2419,25 @@ pub trait CanonicalStoreClient: Send + Sync {
         expected_revision_heads: Vec<RevisionHeadExpectation>,
         expected_ordering_heads: Vec<OrderingHeadExpectation>,
     ) -> Result<WriteReceipt, StoreError>;
+
+    /// Applies one sealed reserved-write request through the existing
+    /// authenticated Store path (issue #991).
+    ///
+    /// The default body validates the closed #990 request shape and then
+    /// refuses with [`StoreError::UnknownOperation`] without manufacturing
+    /// durable evidence, touching provider state, or falling back to ordinary
+    /// `Apply`. No successful default body exists: backends without an
+    /// accepted scheduler explicitly report unsupported, and support is
+    /// advertised only from the accepted concrete backend. Real execution
+    /// lands in a later backend slice; the exact Kernel client override lives
+    /// in `eliot-kernel-service`.
+    async fn apply_reserved_write(
+        &self,
+        request: ReservedWriteRequest,
+    ) -> Result<WriteReceipt, StoreError> {
+        request.validate()?;
+        Err(StoreError::UnknownOperation)
+    }
 
     /// Reads one bounded, same-fence recovery snapshot. Wave 1 keeps the
     /// provider/state implementation out of this neutral contract crate.

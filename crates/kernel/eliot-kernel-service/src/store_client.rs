@@ -18,10 +18,10 @@ use eliot_store_api::{
     CAPABILITIES, CanonicalRequestView, CanonicalStoreClient, CanonicalValidationSnapshot, EFFECTS,
     NamedReadOperation, NamedReadRequest, NamedReadResponse, OperationId, OrderingHead,
     OrderingHeadExpectation, OrderingScopeId, PreparedTransition, ReadConsistency,
-    RecoveryRecordKey, RequestMeta, RevisionHead, RevisionHeadExpectation, RevisionKey, ScopeId,
-    ScopeRevisionView, StoreError, StoreGenesisRequest, StoreHealth, StoreRecoveryRequest,
-    StoreRecoverySnapshot, StoreRequest, StoreResponse, StoreWireError, WriteReceipt,
-    dreamer_job_capability, map_durable_error, validate_genesis_receipt_envelope,
+    RecoveryRecordKey, RequestMeta, ReservedWriteRequest, RevisionHead, RevisionHeadExpectation,
+    RevisionKey, ScopeId, ScopeRevisionView, StoreError, StoreGenesisRequest, StoreHealth,
+    StoreRecoveryRequest, StoreRecoverySnapshot, StoreRequest, StoreResponse, StoreWireError,
+    WriteReceipt, dreamer_job_capability, map_durable_error, validate_genesis_receipt_envelope,
     verify_canonical_request_hash,
 };
 use thiserror::Error;
@@ -227,6 +227,46 @@ impl<T: EbpStoreTransport + 'static> EbpCanonicalStoreClient<T> {
         validate_genesis_receipt_envelope(context, request, receipt)
     }
 
+    /// Binds one reserved-write answer to the exact admitted reservation
+    /// (issue #991).
+    ///
+    /// Operation, idempotency, canonical hash, transition class, fence, and
+    /// the reserved scope/sequence coverage must all match the admitted
+    /// request. Anything else observed after the single send is an uncertain
+    /// observation for the caller to reconcile — never success and never an
+    /// adopted peer identity.
+    fn validate_reserved_write_receipt(
+        &self,
+        request: &ReservedWriteRequest,
+        receipt: &WriteReceipt,
+    ) -> Result<(), StoreError> {
+        receipt.validate()?;
+        receipt.require_reconciliation_envelope().map(|_| ())?;
+        if receipt.operation_id != request.transition.identity.operation_id
+            || receipt.idempotency_key != request.transition.identity.idempotency_key
+            || receipt.canonical_request_hash != request.transition.identity.canonical_request_hash
+        {
+            return Err(StoreError::IdentityConflict);
+        }
+        if receipt.transition_class != request.transition.transition_class {
+            return Err(StoreError::IdentityConflict);
+        }
+        self.validate_requirement_fence(&receipt.state_fence)?;
+        if receipt.ordering_sequences.len() != request.admission.scopes.len() {
+            return Err(StoreError::IdentityConflict);
+        }
+        for scope in &request.admission.scopes {
+            let covered = receipt
+                .ordering_sequences
+                .iter()
+                .any(|head| head.scope == scope.scope && head.sequence == scope.reserved_sequence);
+            if !covered {
+                return Err(StoreError::IdentityConflict);
+            }
+        }
+        Ok(())
+    }
+
     async fn reconcile_genesis(
         &self,
         context: &RequestMeta,
@@ -318,6 +358,82 @@ impl<T: EbpStoreTransport + 'static> CanonicalStoreClient for EbpCanonicalStoreC
             // with the wrong operation identity or response kind is itself an
             // uncertain observation. Reconcile only the operation that this
             // Kernel call admitted; never adopt an identity from the peer.
+            Ok(_) => {
+                self.receipt_exact(operation_id, &canonical_request_hash)
+                    .await
+            }
+            Err(RequestFailure::Unknown {
+                operation_id: observed,
+                ..
+            }) => {
+                // The peer's identity is evidence of a mismatch only; the
+                // receipt lookup remains bound to our admitted operation.
+                let _ = observed;
+                self.receipt_exact(operation_id, &canonical_request_hash)
+                    .await
+            }
+            // A typed unknown-outcome failure was already bound to the
+            // admitted operation in `execute_raw`; reconcile exactly it.
+            Err(error) if error.is_unknown_outcome_failure() => {
+                self.receipt_exact(operation_id, &canonical_request_hash)
+                    .await
+            }
+            Err(error) => Err(error.into_store_error()),
+        }
+    }
+
+    /// Applies one sealed reserved-write request through the existing
+    /// authenticated Store path (issue #991).
+    ///
+    /// The client serializes the exact #990 fields — immutable
+    /// transition/admission digest, operation/idempotency, full scope and head
+    /// set, reservation order/token binding, writer epoch/fence and expiry —
+    /// and dispatches once through the existing `CanonicalStoreClient`
+    /// operation. Response correlation (`request_id`) stays separate from
+    /// operation identity: the receipt is accepted only when its exact
+    /// operation/class/fence/head/receipt identity matches the admitted
+    /// request. Committed, deterministic not-applied/conflict, unsupported,
+    /// and possible-commit/reconciliation outcomes are preserved with no
+    /// catch-all success, no automatic retry, no second ledger, and no
+    /// fallback to ordinary `Apply`. A response write failure cannot erase a
+    /// known committed receipt: any misbound answer observed after the single
+    /// send reconciles the exact admitted operation via `receipt_exact`.
+    async fn apply_reserved_write(
+        &self,
+        request: ReservedWriteRequest,
+    ) -> Result<WriteReceipt, StoreError> {
+        request.validate()?;
+        request.context.validate().map_err(StoreError::Foundation)?;
+        self.validate_requirement_fence(&request.context.state_fence)?;
+        self.validate_requirement_fence(&request.transition.state_fence)?;
+        self.validate_requirement_fence(&request.admission.state_fence)?;
+        let operation_id = request.transition.identity.operation_id.clone();
+        let idempotency_key = request.transition.identity.idempotency_key.clone();
+        let canonical_request_hash = request.transition.identity.canonical_request_hash.clone();
+        let result = self
+            .execute_raw(
+                StoreRequest::ReservedWrite {
+                    request: request.clone(),
+                },
+                Some(&request.context),
+                &idempotency_key,
+            )
+            .await;
+        match result {
+            Ok(StoreResponse::Transaction { receipt }) => {
+                match self.validate_reserved_write_receipt(&request, &receipt) {
+                    Ok(()) => Ok(receipt),
+                    Err(_) => {
+                        self.receipt_exact(operation_id, &canonical_request_hash)
+                            .await
+                    }
+                }
+            }
+            // Once the reserved write has crossed the transport boundary, a
+            // valid response with the wrong operation identity or response
+            // kind is itself an uncertain observation. Reconcile only the
+            // operation that this Kernel call admitted; never adopt an
+            // identity from the peer and never retry under a new identity.
             Ok(_) => {
                 self.receipt_exact(operation_id, &canonical_request_hash)
                     .await
