@@ -961,3 +961,1730 @@ fn eligible_output_has_no_kind_handler_action_path() {
         ));
     }
 }
+
+fn rule_with_protection(
+    id: &str,
+    class: FindingClass,
+    precedence: u16,
+    required: ProtectionClass,
+) -> RuleSpec {
+    RuleSpec {
+        rule_id: RuleId::new(id).expect("rule"),
+        finding_class: class,
+        precedence,
+        required_protection: [required].into_iter().collect(),
+    }
+}
+
+fn evidence_with_class(
+    snapshot: &SourceSnapshot,
+    member_id: MemberId,
+    id: &str,
+    class: ProtectionClass,
+    state: ProtectionEvidenceState,
+    outcome: ProtectionOutcome,
+    invalidated: bool,
+) -> ProtectionEvidence {
+    let mut record = evidence(snapshot, member_id, id, state, outcome, invalidated);
+    record.class = class;
+    record
+}
+
+// WORK_UNIT_CASE: 588/2
+#[test]
+fn current_truth_present_is_protected() {
+    let mut snapshot = source(1, DenominatorCoverage::Complete);
+    snapshot.members[0]
+        .evidence
+        .provenance
+        .insert(ArtifactId::new("prov-0").expect("artifact"));
+    let prof = profile(vec![rule(
+        "provenance_gap_v1",
+        FindingClass::ProvenanceGap,
+        1,
+    )]);
+    let req = request(&snapshot, prof);
+    let records = vec![evidence(
+        &snapshot,
+        snapshot.members[0].member_id.clone(),
+        "evidence-0",
+        ProtectionEvidenceState::CurrentVerified,
+        ProtectionOutcome::Present,
+        false,
+    )];
+    let result = screen_memory_curation(&req, &snapshot, &records).expect("screen");
+    assert_eq!(result.state, ResultState::Complete);
+    assert_eq!(result.protection[0].decision, ProtectionDecision::Protected);
+    assert!(
+        result.protection[0]
+            .required
+            .contains(&ProtectionClass::CurrentTruth)
+    );
+    assert_eq!(
+        result.coverage.members[0].disposition,
+        MemberDisposition::Protected
+    );
+    assert!(!result.coverage.members[0].eligible);
+    assert_eq!(result.eligibility[0].status, EligibilityStatus::Protected);
+    assert!(result.findings.is_empty());
+    assert!(result.validate().is_ok());
+}
+
+// WORK_UNIT_CASE: 588/3
+#[test]
+fn minority_dissent_present_is_protected() {
+    let mut snapshot = source(1, DenominatorCoverage::Complete);
+    snapshot.members[0]
+        .evidence
+        .provenance
+        .insert(ArtifactId::new("prov-0").expect("artifact"));
+    let prof = profile(vec![rule_with_protection(
+        "provenance_gap_v1",
+        FindingClass::ProvenanceGap,
+        1,
+        ProtectionClass::MinorityDissent,
+    )]);
+    let req = request(&snapshot, prof);
+    let records = vec![evidence_with_class(
+        &snapshot,
+        snapshot.members[0].member_id.clone(),
+        "evidence-0",
+        ProtectionClass::MinorityDissent,
+        ProtectionEvidenceState::CurrentVerified,
+        ProtectionOutcome::Present,
+        false,
+    )];
+    let result = screen_memory_curation(&req, &snapshot, &records).expect("screen");
+    assert_eq!(result.state, ResultState::Complete);
+    assert_eq!(result.protection[0].decision, ProtectionDecision::Protected);
+    assert!(
+        result.protection[0]
+            .required
+            .contains(&ProtectionClass::MinorityDissent)
+    );
+    assert_eq!(
+        result.protection[0].evidence[0].class,
+        ProtectionClass::MinorityDissent
+    );
+    assert_eq!(
+        result.coverage.members[0].disposition,
+        MemberDisposition::Protected
+    );
+    assert!(!result.coverage.members[0].eligible);
+    assert_eq!(result.eligibility[0].status, EligibilityStatus::Protected);
+    assert!(result.findings.is_empty());
+    assert!(result.validate().is_ok());
+}
+
+// WORK_UNIT_CASE: 588/4
+#[test]
+fn unresolved_conflict_present_is_protected() {
+    let mut snapshot = source(1, DenominatorCoverage::Complete);
+    snapshot.members[0]
+        .evidence
+        .provenance
+        .insert(ArtifactId::new("prov-0").expect("artifact"));
+    let prof = profile(vec![rule_with_protection(
+        "provenance_gap_v1",
+        FindingClass::ProvenanceGap,
+        1,
+        ProtectionClass::UnresolvedConflict,
+    )]);
+    let req = request(&snapshot, prof);
+    let records = vec![evidence_with_class(
+        &snapshot,
+        snapshot.members[0].member_id.clone(),
+        "evidence-0",
+        ProtectionClass::UnresolvedConflict,
+        ProtectionEvidenceState::CurrentVerified,
+        ProtectionOutcome::Present,
+        false,
+    )];
+    let result = screen_memory_curation(&req, &snapshot, &records).expect("screen");
+    assert_eq!(result.state, ResultState::Complete);
+    assert_eq!(result.protection[0].decision, ProtectionDecision::Protected);
+    assert!(
+        result.protection[0]
+            .required
+            .contains(&ProtectionClass::UnresolvedConflict)
+    );
+    assert_eq!(
+        result.coverage.members[0].disposition,
+        MemberDisposition::Protected
+    );
+    assert!(!result.coverage.members[0].eligible);
+    assert_eq!(result.eligibility[0].status, EligibilityStatus::Protected);
+    assert!(result.findings.is_empty());
+    assert!(result.validate().is_ok());
+}
+
+// WORK_UNIT_CASE: 588/5
+#[test]
+fn negative_memory_present_is_protected() {
+    let mut snapshot = source(1, DenominatorCoverage::Complete);
+    snapshot.members[0]
+        .evidence
+        .provenance
+        .insert(ArtifactId::new("prov-0").expect("artifact"));
+    let prof = profile(vec![rule_with_protection(
+        "provenance_gap_v1",
+        FindingClass::ProvenanceGap,
+        1,
+        ProtectionClass::NegativeMemory,
+    )]);
+    let req = request(&snapshot, prof);
+    let records = vec![evidence_with_class(
+        &snapshot,
+        snapshot.members[0].member_id.clone(),
+        "evidence-0",
+        ProtectionClass::NegativeMemory,
+        ProtectionEvidenceState::CurrentVerified,
+        ProtectionOutcome::Present,
+        false,
+    )];
+    let result = screen_memory_curation(&req, &snapshot, &records).expect("screen");
+    assert_eq!(result.state, ResultState::Complete);
+    assert_eq!(result.protection[0].decision, ProtectionDecision::Protected);
+    assert!(
+        result.protection[0]
+            .required
+            .contains(&ProtectionClass::NegativeMemory)
+    );
+    assert_eq!(
+        result.coverage.members[0].disposition,
+        MemberDisposition::Protected
+    );
+    assert!(!result.coverage.members[0].eligible);
+    assert_eq!(result.eligibility[0].status, EligibilityStatus::Protected);
+    assert!(result.findings.is_empty());
+    assert!(result.validate().is_ok());
+}
+
+// WORK_UNIT_CASE: 588/6
+#[test]
+fn counterexample_present_is_protected() {
+    let mut snapshot = source(1, DenominatorCoverage::Complete);
+    snapshot.members[0]
+        .evidence
+        .provenance
+        .insert(ArtifactId::new("prov-0").expect("artifact"));
+    let prof = profile(vec![rule_with_protection(
+        "provenance_gap_v1",
+        FindingClass::ProvenanceGap,
+        1,
+        ProtectionClass::Counterexample,
+    )]);
+    let req = request(&snapshot, prof);
+    let records = vec![evidence_with_class(
+        &snapshot,
+        snapshot.members[0].member_id.clone(),
+        "evidence-0",
+        ProtectionClass::Counterexample,
+        ProtectionEvidenceState::CurrentVerified,
+        ProtectionOutcome::Present,
+        false,
+    )];
+    let result = screen_memory_curation(&req, &snapshot, &records).expect("screen");
+    assert_eq!(result.state, ResultState::Complete);
+    assert_eq!(result.protection[0].decision, ProtectionDecision::Protected);
+    assert!(
+        result.protection[0]
+            .required
+            .contains(&ProtectionClass::Counterexample)
+    );
+    assert_eq!(
+        result.coverage.members[0].disposition,
+        MemberDisposition::Protected
+    );
+    assert!(!result.coverage.members[0].eligible);
+    assert_eq!(result.eligibility[0].status, EligibilityStatus::Protected);
+    assert!(result.findings.is_empty());
+    assert!(result.validate().is_ok());
+}
+
+// WORK_UNIT_CASE: 588/7
+#[test]
+fn retention_erasure_present_is_protected() {
+    let mut snapshot = source(1, DenominatorCoverage::Complete);
+    snapshot.members[0]
+        .evidence
+        .provenance
+        .insert(ArtifactId::new("prov-0").expect("artifact"));
+    let prof = profile(vec![rule_with_protection(
+        "provenance_gap_v1",
+        FindingClass::ProvenanceGap,
+        1,
+        ProtectionClass::RetentionErasure,
+    )]);
+    let req = request(&snapshot, prof);
+    let records = vec![evidence_with_class(
+        &snapshot,
+        snapshot.members[0].member_id.clone(),
+        "evidence-0",
+        ProtectionClass::RetentionErasure,
+        ProtectionEvidenceState::CurrentVerified,
+        ProtectionOutcome::Present,
+        false,
+    )];
+    let result = screen_memory_curation(&req, &snapshot, &records).expect("screen");
+    assert_eq!(result.state, ResultState::Complete);
+    assert_eq!(result.protection[0].decision, ProtectionDecision::Protected);
+    assert!(
+        result.protection[0]
+            .required
+            .contains(&ProtectionClass::RetentionErasure)
+    );
+    assert_eq!(
+        result.coverage.members[0].disposition,
+        MemberDisposition::Protected
+    );
+    assert!(!result.coverage.members[0].eligible);
+    assert_eq!(result.eligibility[0].status, EligibilityStatus::Protected);
+    assert!(result.findings.is_empty());
+    assert!(result.validate().is_ok());
+}
+
+// WORK_UNIT_CASE: 588/8
+#[test]
+fn protected_dependency_present_is_protected() {
+    let mut snapshot = source(1, DenominatorCoverage::Complete);
+    snapshot.members[0]
+        .evidence
+        .provenance
+        .insert(ArtifactId::new("prov-0").expect("artifact"));
+    let prof = profile(vec![rule_with_protection(
+        "provenance_gap_v1",
+        FindingClass::ProvenanceGap,
+        1,
+        ProtectionClass::ProtectedDependency,
+    )]);
+    let req = request(&snapshot, prof);
+    let records = vec![evidence_with_class(
+        &snapshot,
+        snapshot.members[0].member_id.clone(),
+        "evidence-0",
+        ProtectionClass::ProtectedDependency,
+        ProtectionEvidenceState::CurrentVerified,
+        ProtectionOutcome::Present,
+        false,
+    )];
+    let result = screen_memory_curation(&req, &snapshot, &records).expect("screen");
+    assert_eq!(result.state, ResultState::Complete);
+    assert_eq!(result.protection[0].decision, ProtectionDecision::Protected);
+    assert!(
+        result.protection[0]
+            .required
+            .contains(&ProtectionClass::ProtectedDependency)
+    );
+    assert_eq!(
+        result.coverage.members[0].disposition,
+        MemberDisposition::Protected
+    );
+    assert!(!result.coverage.members[0].eligible);
+    assert_eq!(result.eligibility[0].status, EligibilityStatus::Protected);
+    assert!(result.findings.is_empty());
+    assert!(result.validate().is_ok());
+}
+
+// WORK_UNIT_CASE: 588/9
+#[test]
+fn audit_history_present_is_protected() {
+    let mut snapshot = source(1, DenominatorCoverage::Complete);
+    snapshot.members[0]
+        .evidence
+        .provenance
+        .insert(ArtifactId::new("prov-0").expect("artifact"));
+    let prof = profile(vec![rule_with_protection(
+        "provenance_gap_v1",
+        FindingClass::ProvenanceGap,
+        1,
+        ProtectionClass::AuditHistory,
+    )]);
+    let req = request(&snapshot, prof);
+    let records = vec![evidence_with_class(
+        &snapshot,
+        snapshot.members[0].member_id.clone(),
+        "evidence-0",
+        ProtectionClass::AuditHistory,
+        ProtectionEvidenceState::CurrentVerified,
+        ProtectionOutcome::Present,
+        false,
+    )];
+    let result = screen_memory_curation(&req, &snapshot, &records).expect("screen");
+    assert_eq!(result.state, ResultState::Complete);
+    assert_eq!(result.protection[0].decision, ProtectionDecision::Protected);
+    assert!(
+        result.protection[0]
+            .required
+            .contains(&ProtectionClass::AuditHistory)
+    );
+    assert_eq!(
+        result.protection[0].evidence[0].class,
+        ProtectionClass::AuditHistory
+    );
+    assert_eq!(
+        result.coverage.members[0].disposition,
+        MemberDisposition::Protected
+    );
+    assert!(!result.coverage.members[0].eligible);
+    assert_eq!(result.eligibility[0].status, EligibilityStatus::Protected);
+    assert!(result.findings.is_empty());
+    assert!(result.validate().is_ok());
+}
+
+// WORK_UNIT_CASE: 588/10
+#[test]
+fn dissent_absent_clears_to_eligible() {
+    let mut snapshot = source(1, DenominatorCoverage::Complete);
+    snapshot.members[0]
+        .evidence
+        .provenance
+        .insert(ArtifactId::new("prov-0").expect("artifact"));
+    let prof = profile(vec![rule_with_protection(
+        "provenance_gap_v1",
+        FindingClass::ProvenanceGap,
+        1,
+        ProtectionClass::MinorityDissent,
+    )]);
+    let req = request(&snapshot, prof);
+    let records = vec![evidence_with_class(
+        &snapshot,
+        snapshot.members[0].member_id.clone(),
+        "evidence-0",
+        ProtectionClass::MinorityDissent,
+        ProtectionEvidenceState::CurrentVerified,
+        ProtectionOutcome::Absent,
+        false,
+    )];
+    let result = screen_memory_curation(&req, &snapshot, &records).expect("screen");
+    assert_eq!(result.state, ResultState::Complete);
+    assert!(result.coverage.frontier.complete);
+    assert_eq!(
+        result.protection[0].decision,
+        ProtectionDecision::Unprotected
+    );
+    assert_eq!(
+        result.coverage.members[0].disposition,
+        MemberDisposition::Eligible
+    );
+    assert!(result.coverage.members[0].eligible);
+    assert_eq!(
+        result.eligibility[0].status,
+        EligibilityStatus::EligibleForSemanticCuration
+    );
+    assert!(result.findings.is_empty());
+    assert!(result.validate().is_ok());
+}
+
+// WORK_UNIT_CASE: 588/11
+#[test]
+fn missing_evidence_fails_closed_unknown() {
+    let mut snapshot = source(1, DenominatorCoverage::Complete);
+    snapshot.members[0]
+        .evidence
+        .provenance
+        .insert(ArtifactId::new("prov-0").expect("artifact"));
+    let prof = profile(vec![rule_with_protection(
+        "provenance_gap_v1",
+        FindingClass::ProvenanceGap,
+        1,
+        ProtectionClass::MinorityDissent,
+    )]);
+    let req = request(&snapshot, prof);
+    let records: Vec<ProtectionEvidence> = Vec::new();
+    let result = screen_memory_curation(&req, &snapshot, &records).expect("screen");
+    assert_eq!(result.state, ResultState::Blocked);
+    assert!(!result.coverage.frontier.complete);
+    assert_eq!(result.protection[0].decision, ProtectionDecision::Unknown);
+    assert_eq!(
+        result.coverage.members[0].disposition,
+        MemberDisposition::Blocked
+    );
+    assert!(!result.coverage.members[0].eligible);
+    assert_eq!(
+        result.eligibility[0].status,
+        EligibilityStatus::UnknownBlocked
+    );
+    assert!(result.findings.is_empty());
+    assert!(result.validate().is_ok());
+}
+
+// WORK_UNIT_CASE: 588/12
+#[test]
+fn stale_dissent_evidence_fails_closed() {
+    let mut snapshot = source(1, DenominatorCoverage::Complete);
+    snapshot.members[0]
+        .evidence
+        .provenance
+        .insert(ArtifactId::new("prov-0").expect("artifact"));
+    let prof = profile(vec![rule_with_protection(
+        "provenance_gap_v1",
+        FindingClass::ProvenanceGap,
+        1,
+        ProtectionClass::MinorityDissent,
+    )]);
+    let req = request(&snapshot, prof);
+    let records = vec![evidence_with_class(
+        &snapshot,
+        snapshot.members[0].member_id.clone(),
+        "evidence-0",
+        ProtectionClass::MinorityDissent,
+        ProtectionEvidenceState::Stale,
+        ProtectionOutcome::Absent,
+        false,
+    )];
+    let result = screen_memory_curation(&req, &snapshot, &records).expect("screen");
+    assert_eq!(result.state, ResultState::Blocked);
+    assert!(!result.coverage.frontier.complete);
+    assert_eq!(result.protection[0].decision, ProtectionDecision::Unknown);
+    assert_eq!(
+        result.coverage.members[0].disposition,
+        MemberDisposition::Blocked
+    );
+    assert!(!result.coverage.members[0].eligible);
+    assert_eq!(
+        result.eligibility[0].status,
+        EligibilityStatus::UnknownBlocked
+    );
+    assert!(result.findings.is_empty());
+    assert!(result.validate().is_ok());
+}
+
+// WORK_UNIT_CASE: 588/13
+#[test]
+fn invalidated_present_evidence_fails_closed() {
+    let mut snapshot = source(1, DenominatorCoverage::Complete);
+    snapshot.members[0]
+        .evidence
+        .provenance
+        .insert(ArtifactId::new("prov-0").expect("artifact"));
+    let prof = profile(vec![rule(
+        "provenance_gap_v1",
+        FindingClass::ProvenanceGap,
+        1,
+    )]);
+    let req = request(&snapshot, prof);
+    let records = vec![evidence(
+        &snapshot,
+        snapshot.members[0].member_id.clone(),
+        "evidence-0",
+        ProtectionEvidenceState::CurrentVerified,
+        ProtectionOutcome::Present,
+        true,
+    )];
+    let result = screen_memory_curation(&req, &snapshot, &records).expect("screen");
+    assert_eq!(result.state, ResultState::Blocked);
+    assert_eq!(result.protection[0].decision, ProtectionDecision::Unknown);
+    assert_eq!(
+        result.coverage.members[0].disposition,
+        MemberDisposition::Blocked
+    );
+    assert!(!result.coverage.members[0].eligible);
+    assert_eq!(
+        result.eligibility[0].status,
+        EligibilityStatus::UnknownBlocked
+    );
+    assert!(result.findings.is_empty());
+    assert!(result.validate().is_ok());
+}
+
+// WORK_UNIT_CASE: 588/14
+#[test]
+fn wrong_class_clear_evidence_fails_closed() {
+    let mut snapshot = source(1, DenominatorCoverage::Complete);
+    snapshot.members[0]
+        .evidence
+        .provenance
+        .insert(ArtifactId::new("prov-0").expect("artifact"));
+    let prof = profile(vec![rule_with_protection(
+        "provenance_gap_v1",
+        FindingClass::ProvenanceGap,
+        1,
+        ProtectionClass::MinorityDissent,
+    )]);
+    let req = request(&snapshot, prof);
+    let records = vec![evidence(
+        &snapshot,
+        snapshot.members[0].member_id.clone(),
+        "evidence-0",
+        ProtectionEvidenceState::CurrentVerified,
+        ProtectionOutcome::Absent,
+        false,
+    )];
+    let result = screen_memory_curation(&req, &snapshot, &records).expect("screen");
+    assert_eq!(result.state, ResultState::Blocked);
+    assert_eq!(result.protection[0].decision, ProtectionDecision::Unknown);
+    assert_eq!(
+        result.coverage.members[0].disposition,
+        MemberDisposition::Blocked
+    );
+    assert!(!result.coverage.members[0].eligible);
+    assert_eq!(
+        result.eligibility[0].status,
+        EligibilityStatus::UnknownBlocked
+    );
+    assert!(result.findings.is_empty());
+    assert!(result.validate().is_ok());
+}
+
+// WORK_UNIT_CASE: 588/16
+#[test]
+fn malformed_evidence_fails_closed() {
+    let mut snapshot = source(1, DenominatorCoverage::Complete);
+    snapshot.members[0]
+        .evidence
+        .provenance
+        .insert(ArtifactId::new("prov-0").expect("artifact"));
+    let prof = profile(vec![rule(
+        "provenance_gap_v1",
+        FindingClass::ProvenanceGap,
+        1,
+    )]);
+    let req = request(&snapshot, prof);
+    let records = vec![evidence(
+        &snapshot,
+        snapshot.members[0].member_id.clone(),
+        "evidence-0",
+        ProtectionEvidenceState::Malformed,
+        ProtectionOutcome::Absent,
+        false,
+    )];
+    let result = screen_memory_curation(&req, &snapshot, &records).expect("screen");
+    assert_eq!(result.state, ResultState::Blocked);
+    assert!(!result.coverage.frontier.complete);
+    assert_eq!(result.protection[0].decision, ProtectionDecision::Unknown);
+    assert_eq!(
+        result.coverage.members[0].disposition,
+        MemberDisposition::Blocked
+    );
+    assert!(!result.coverage.members[0].eligible);
+    assert_eq!(
+        result.eligibility[0].status,
+        EligibilityStatus::UnknownBlocked
+    );
+    assert!(result.findings.is_empty());
+    assert!(result.validate().is_ok());
+}
+
+// WORK_UNIT_CASE: 588/17
+#[test]
+fn unavailable_evidence_fails_closed() {
+    let mut snapshot = source(1, DenominatorCoverage::Complete);
+    snapshot.members[0]
+        .evidence
+        .provenance
+        .insert(ArtifactId::new("prov-0").expect("artifact"));
+    let prof = profile(vec![rule(
+        "provenance_gap_v1",
+        FindingClass::ProvenanceGap,
+        1,
+    )]);
+    let req = request(&snapshot, prof);
+    let records = vec![evidence(
+        &snapshot,
+        snapshot.members[0].member_id.clone(),
+        "evidence-0",
+        ProtectionEvidenceState::Unavailable,
+        ProtectionOutcome::Absent,
+        false,
+    )];
+    let result = screen_memory_curation(&req, &snapshot, &records).expect("screen");
+    assert_eq!(result.state, ResultState::Blocked);
+    assert!(!result.coverage.frontier.complete);
+    assert_eq!(result.protection[0].decision, ProtectionDecision::Unknown);
+    assert_eq!(
+        result.coverage.members[0].disposition,
+        MemberDisposition::Blocked
+    );
+    assert!(!result.coverage.members[0].eligible);
+    assert_eq!(
+        result.eligibility[0].status,
+        EligibilityStatus::UnknownBlocked
+    );
+    assert!(result.findings.is_empty());
+    assert!(result.validate().is_ok());
+}
+
+// WORK_UNIT_CASE: 588/18
+#[test]
+fn unknown_state_evidence_fails_closed() {
+    let mut snapshot = source(1, DenominatorCoverage::Complete);
+    snapshot.members[0]
+        .evidence
+        .provenance
+        .insert(ArtifactId::new("prov-0").expect("artifact"));
+    let prof = profile(vec![rule(
+        "provenance_gap_v1",
+        FindingClass::ProvenanceGap,
+        1,
+    )]);
+    let req = request(&snapshot, prof);
+    let records = vec![evidence(
+        &snapshot,
+        snapshot.members[0].member_id.clone(),
+        "evidence-0",
+        ProtectionEvidenceState::Unknown,
+        ProtectionOutcome::Absent,
+        false,
+    )];
+    let result = screen_memory_curation(&req, &snapshot, &records).expect("screen");
+    assert_eq!(result.state, ResultState::Blocked);
+    assert!(!result.coverage.frontier.complete);
+    assert_eq!(result.protection[0].decision, ProtectionDecision::Unknown);
+    assert_eq!(
+        result.coverage.members[0].disposition,
+        MemberDisposition::Blocked
+    );
+    assert!(!result.coverage.members[0].eligible);
+    assert_eq!(
+        result.eligibility[0].status,
+        EligibilityStatus::UnknownBlocked
+    );
+    assert!(result.findings.is_empty());
+    assert!(result.validate().is_ok());
+}
+
+// WORK_UNIT_CASE: 588/19
+#[test]
+fn unknown_outcome_evidence_fails_closed() {
+    let mut snapshot = source(1, DenominatorCoverage::Complete);
+    snapshot.members[0]
+        .evidence
+        .provenance
+        .insert(ArtifactId::new("prov-0").expect("artifact"));
+    let prof = profile(vec![rule(
+        "provenance_gap_v1",
+        FindingClass::ProvenanceGap,
+        1,
+    )]);
+    let req = request(&snapshot, prof);
+    let records = vec![evidence(
+        &snapshot,
+        snapshot.members[0].member_id.clone(),
+        "evidence-0",
+        ProtectionEvidenceState::CurrentVerified,
+        ProtectionOutcome::Unknown,
+        false,
+    )];
+    let result = screen_memory_curation(&req, &snapshot, &records).expect("screen");
+    assert_eq!(result.state, ResultState::Blocked);
+    assert!(!result.coverage.frontier.complete);
+    assert_eq!(result.protection[0].decision, ProtectionDecision::Unknown);
+    assert_eq!(
+        result.coverage.members[0].disposition,
+        MemberDisposition::Blocked
+    );
+    assert!(!result.coverage.members[0].eligible);
+    assert_eq!(
+        result.eligibility[0].status,
+        EligibilityStatus::UnknownBlocked
+    );
+    assert!(result.findings.is_empty());
+    assert!(result.validate().is_ok());
+}
+
+// WORK_UNIT_CASE: 588/20
+#[test]
+fn invalidated_absent_evidence_fails_closed() {
+    let mut snapshot = source(1, DenominatorCoverage::Complete);
+    snapshot.members[0]
+        .evidence
+        .provenance
+        .insert(ArtifactId::new("prov-0").expect("artifact"));
+    let prof = profile(vec![rule(
+        "provenance_gap_v1",
+        FindingClass::ProvenanceGap,
+        1,
+    )]);
+    let req = request(&snapshot, prof);
+    let records = vec![evidence(
+        &snapshot,
+        snapshot.members[0].member_id.clone(),
+        "evidence-0",
+        ProtectionEvidenceState::CurrentVerified,
+        ProtectionOutcome::Absent,
+        true,
+    )];
+    let result = screen_memory_curation(&req, &snapshot, &records).expect("screen");
+    assert_eq!(result.state, ResultState::Blocked);
+    assert!(!result.coverage.frontier.complete);
+    assert_eq!(result.protection[0].decision, ProtectionDecision::Unknown);
+    assert_eq!(
+        result.coverage.members[0].disposition,
+        MemberDisposition::Blocked
+    );
+    assert!(!result.coverage.members[0].eligible);
+    assert_eq!(
+        result.eligibility[0].status,
+        EligibilityStatus::UnknownBlocked
+    );
+    assert!(result.findings.is_empty());
+    assert!(result.validate().is_ok());
+}
+
+// WORK_UNIT_CASE: 588/21
+#[test]
+fn empty_evidence_fails_closed() {
+    let mut snapshot = source(1, DenominatorCoverage::Complete);
+    snapshot.members[0]
+        .evidence
+        .provenance
+        .insert(ArtifactId::new("prov-0").expect("artifact"));
+    let prof = profile(vec![rule(
+        "provenance_gap_v1",
+        FindingClass::ProvenanceGap,
+        1,
+    )]);
+    let req = request(&snapshot, prof);
+    let records: Vec<ProtectionEvidence> = Vec::new();
+    let result = screen_memory_curation(&req, &snapshot, &records).expect("screen");
+    assert_eq!(result.state, ResultState::Blocked);
+    assert!(!result.coverage.frontier.complete);
+    assert_eq!(result.protection[0].decision, ProtectionDecision::Unknown);
+    assert_eq!(
+        result.coverage.members[0].disposition,
+        MemberDisposition::Blocked
+    );
+    assert!(!result.coverage.members[0].eligible);
+    assert_eq!(
+        result.eligibility[0].status,
+        EligibilityStatus::UnknownBlocked
+    );
+    assert!(result.findings.is_empty());
+    assert!(result.validate().is_ok());
+}
+
+// WORK_UNIT_CASE: 588/22
+#[test]
+fn conflict_ambiguity_finding_blocks_member() {
+    let mut snapshot = source(1, DenominatorCoverage::Complete);
+    snapshot.members[0]
+        .evidence
+        .provenance
+        .insert(ArtifactId::new("prov-0").expect("artifact"));
+    snapshot.members[0]
+        .evidence
+        .conflict
+        .insert(ArtifactId::new("conflict-1").expect("artifact"));
+    let prof = profile(vec![rule(
+        "conflict_ambiguity_v1",
+        FindingClass::ConflictAmbiguity,
+        1,
+    )]);
+    let req = request(&snapshot, prof);
+    let records = vec![evidence(
+        &snapshot,
+        snapshot.members[0].member_id.clone(),
+        "evidence-0",
+        ProtectionEvidenceState::CurrentVerified,
+        ProtectionOutcome::Absent,
+        false,
+    )];
+    let result = screen_memory_curation(&req, &snapshot, &records).expect("screen");
+    assert_eq!(result.state, ResultState::Complete);
+    assert!(result.coverage.frontier.complete);
+    assert_eq!(
+        result.protection[0].decision,
+        ProtectionDecision::Unprotected
+    );
+    assert_eq!(result.findings.len(), 1);
+    assert_eq!(result.findings[0].class, FindingClass::ConflictAmbiguity);
+    assert_eq!(result.findings[0].proof, FindingProof::Deterministic);
+    assert_eq!(
+        result.findings[0].invariant,
+        "member retains one or more conflict references"
+    );
+    assert!(
+        result.findings[0]
+            .evidence
+            .contains(&ArtifactId::new("conflict-1").expect("artifact"))
+    );
+    assert!(result.findings[0].invalidated_by.is_none());
+    assert_eq!(
+        result.coverage.members[0].disposition,
+        MemberDisposition::Blocked
+    );
+    assert!(!result.coverage.members[0].eligible);
+    assert_eq!(
+        result.eligibility[0].status,
+        EligibilityStatus::UnknownBlocked
+    );
+    let assessment = result.protection.first().expect("protection assessment");
+    let dimensions = assess_dimensions(
+        &snapshot.members[0].member_id,
+        assessment,
+        &result.findings,
+        false,
+        true,
+        true,
+    )
+    .expect("dimension assessment");
+    let support = dimensions
+        .verdict(CurationDimension::Support)
+        .expect("support verdict");
+    assert_eq!(support.outcome, DimensionOutcome::Flagged);
+    assert_eq!(support.finding_ids.len(), 1);
+    assert!(result.validate().is_ok());
+}
+
+// WORK_UNIT_CASE: 588/23
+#[test]
+fn provenance_gap_finding_blocks_member() {
+    let snapshot = source(1, DenominatorCoverage::Complete);
+    assert!(snapshot.members[0].evidence.provenance.is_empty());
+    assert!(snapshot.members[0].evidence.conflict.is_empty());
+    let prof = profile(vec![rule(
+        "provenance_gap_v1",
+        FindingClass::ProvenanceGap,
+        1,
+    )]);
+    let req = request(&snapshot, prof);
+    let records = vec![evidence(
+        &snapshot,
+        snapshot.members[0].member_id.clone(),
+        "evidence-0",
+        ProtectionEvidenceState::CurrentVerified,
+        ProtectionOutcome::Absent,
+        false,
+    )];
+    let result = screen_memory_curation(&req, &snapshot, &records).expect("screen");
+    assert_eq!(result.state, ResultState::Complete);
+    assert!(result.coverage.frontier.complete);
+    assert_eq!(
+        result.protection[0].decision,
+        ProtectionDecision::Unprotected
+    );
+    assert_eq!(result.findings.len(), 1);
+    assert_eq!(result.findings[0].class, FindingClass::ProvenanceGap);
+    assert_eq!(result.findings[0].proof, FindingProof::Deterministic);
+    assert_eq!(
+        result.findings[0].invariant,
+        "member has no supplied provenance handle"
+    );
+    assert!(result.findings[0].evidence.is_empty());
+    assert_eq!(
+        result.coverage.members[0].disposition,
+        MemberDisposition::Blocked
+    );
+    assert!(!result.coverage.members[0].eligible);
+    assert_eq!(
+        result.eligibility[0].status,
+        EligibilityStatus::UnknownBlocked
+    );
+    assert!(result.validate().is_ok());
+}
+
+// WORK_UNIT_CASE: 588/24
+#[test]
+fn both_structural_rules_fire_deterministically() {
+    let mut snapshot = source(1, DenominatorCoverage::Complete);
+    snapshot.members[0]
+        .evidence
+        .conflict
+        .insert(ArtifactId::new("conflict-1").expect("artifact"));
+    let prof = profile(vec![
+        rule("provenance_gap_v1", FindingClass::ProvenanceGap, 1),
+        rule("conflict_ambiguity_v1", FindingClass::ConflictAmbiguity, 2),
+    ]);
+    let req = request(&snapshot, prof);
+    let first = evidence(
+        &snapshot,
+        snapshot.members[0].member_id.clone(),
+        "evidence-a",
+        ProtectionEvidenceState::CurrentVerified,
+        ProtectionOutcome::Absent,
+        false,
+    );
+    let second = evidence(
+        &snapshot,
+        snapshot.members[0].member_id.clone(),
+        "evidence-b",
+        ProtectionEvidenceState::CurrentVerified,
+        ProtectionOutcome::Absent,
+        false,
+    );
+    let left =
+        screen_memory_curation(&req, &snapshot, &[second.clone(), first.clone()]).expect("screen");
+    let right = screen_memory_curation(&req, &snapshot, &[first, second]).expect("screen");
+    assert_eq!(left.result_digest, right.result_digest);
+    assert_eq!(left.findings.len(), 2);
+    assert_eq!(left.findings[0].class, FindingClass::ProvenanceGap);
+    assert_eq!(left.findings[1].class, FindingClass::ConflictAmbiguity);
+    assert_eq!(left.state, ResultState::Complete);
+    assert_eq!(
+        left.coverage.members[0].disposition,
+        MemberDisposition::Blocked
+    );
+    assert!(!left.coverage.members[0].eligible);
+    assert_eq!(
+        left.eligibility[0].status,
+        EligibilityStatus::UnknownBlocked
+    );
+    assert!(left.validate().is_ok());
+    assert!(right.validate().is_ok());
+}
+
+// WORK_UNIT_CASE: 588/25
+#[test]
+fn unsupported_rule_id_rejected() {
+    let snapshot = source(1, DenominatorCoverage::Complete);
+    let prof = profile(vec![rule(
+        "unknown_rule_v9",
+        FindingClass::ProvenanceGap,
+        1,
+    )]);
+    let req = request(&snapshot, prof);
+    let records = vec![evidence(
+        &snapshot,
+        snapshot.members[0].member_id.clone(),
+        "evidence-0",
+        ProtectionEvidenceState::CurrentVerified,
+        ProtectionOutcome::Absent,
+        false,
+    )];
+    assert!(matches!(
+        screen_memory_curation(&req, &snapshot, &records),
+        Err(CurationScreenError::Contract(ContractError::Unsupported {
+            field: "profile.rule_id"
+        }))
+    ));
+}
+
+// WORK_UNIT_CASE: 588/27
+#[test]
+fn stale_source_availability_blocks() {
+    // source_status() maps Stale to StaleUnavailable, but a Complete
+    // denominator with non-Available availability is unrepresentable
+    // (SourceSnapshot::validate rejects it), so this Partial case asserts
+    // IncompleteTruncated while the Blocked state proves fail-closed.
+    let mut snapshot = source(1, DenominatorCoverage::Partial);
+    snapshot.availability = SourceAvailability::Stale;
+    snapshot.members[0]
+        .evidence
+        .provenance
+        .insert(ArtifactId::new("prov-0").expect("artifact"));
+    let prof = profile(vec![rule(
+        "provenance_gap_v1",
+        FindingClass::ProvenanceGap,
+        1,
+    )]);
+    let req = request(&snapshot, prof);
+    let records = vec![evidence(
+        &snapshot,
+        snapshot.members[0].member_id.clone(),
+        "evidence-0",
+        ProtectionEvidenceState::CurrentVerified,
+        ProtectionOutcome::Absent,
+        false,
+    )];
+    let result = screen_memory_curation(&req, &snapshot, &records).expect("screen");
+    assert_eq!(result.state, ResultState::Blocked);
+    assert!(!result.coverage.frontier.complete);
+    assert!(result.findings.is_empty());
+    assert_eq!(
+        result.eligibility[0].status,
+        EligibilityStatus::IncompleteTruncated
+    );
+    assert_eq!(
+        result.coverage.members[0].disposition,
+        MemberDisposition::Blocked
+    );
+    assert!(!result.coverage.members[0].eligible);
+    assert!(result.validate().is_ok());
+}
+
+// WORK_UNIT_CASE: 588/28
+#[test]
+fn malformed_source_availability_blocks() {
+    // source_status() maps Malformed to UnknownBlocked; Partial denominator
+    // shadows the per-member status to IncompleteTruncated (see 588/27).
+    let mut snapshot = source(1, DenominatorCoverage::Partial);
+    snapshot.availability = SourceAvailability::Malformed;
+    snapshot.members[0]
+        .evidence
+        .provenance
+        .insert(ArtifactId::new("prov-0").expect("artifact"));
+    let prof = profile(vec![rule(
+        "provenance_gap_v1",
+        FindingClass::ProvenanceGap,
+        1,
+    )]);
+    let req = request(&snapshot, prof);
+    let records = vec![evidence(
+        &snapshot,
+        snapshot.members[0].member_id.clone(),
+        "evidence-0",
+        ProtectionEvidenceState::CurrentVerified,
+        ProtectionOutcome::Absent,
+        false,
+    )];
+    let result = screen_memory_curation(&req, &snapshot, &records).expect("screen");
+    assert_eq!(result.state, ResultState::Blocked);
+    assert!(!result.coverage.frontier.complete);
+    assert!(result.findings.is_empty());
+    assert_eq!(
+        result.eligibility[0].status,
+        EligibilityStatus::IncompleteTruncated
+    );
+    assert_eq!(
+        result.coverage.members[0].disposition,
+        MemberDisposition::Blocked
+    );
+    assert!(!result.coverage.members[0].eligible);
+    assert!(result.validate().is_ok());
+}
+
+// WORK_UNIT_CASE: 588/29
+#[test]
+fn unavailable_source_availability_blocks() {
+    // source_status() maps Unavailable to StaleUnavailable; Partial
+    // denominator shadows the per-member status (see 588/27).
+    let mut snapshot = source(1, DenominatorCoverage::Partial);
+    snapshot.availability = SourceAvailability::Unavailable;
+    snapshot.members[0]
+        .evidence
+        .provenance
+        .insert(ArtifactId::new("prov-0").expect("artifact"));
+    let prof = profile(vec![rule(
+        "provenance_gap_v1",
+        FindingClass::ProvenanceGap,
+        1,
+    )]);
+    let req = request(&snapshot, prof);
+    let records = vec![evidence(
+        &snapshot,
+        snapshot.members[0].member_id.clone(),
+        "evidence-0",
+        ProtectionEvidenceState::CurrentVerified,
+        ProtectionOutcome::Absent,
+        false,
+    )];
+    let result = screen_memory_curation(&req, &snapshot, &records).expect("screen");
+    assert_eq!(result.state, ResultState::Blocked);
+    assert!(!result.coverage.frontier.complete);
+    assert!(result.findings.is_empty());
+    assert_eq!(
+        result.eligibility[0].status,
+        EligibilityStatus::IncompleteTruncated
+    );
+    assert_eq!(
+        result.coverage.members[0].disposition,
+        MemberDisposition::Blocked
+    );
+    assert!(!result.coverage.members[0].eligible);
+    assert!(result.validate().is_ok());
+}
+
+// WORK_UNIT_CASE: 588/30
+#[test]
+fn unknown_source_availability_blocks() {
+    // source_status() maps Unknown to UnknownBlocked; Partial denominator
+    // shadows the per-member status (see 588/27).
+    let mut snapshot = source(1, DenominatorCoverage::Partial);
+    snapshot.availability = SourceAvailability::Unknown;
+    snapshot.members[0]
+        .evidence
+        .provenance
+        .insert(ArtifactId::new("prov-0").expect("artifact"));
+    let prof = profile(vec![rule(
+        "provenance_gap_v1",
+        FindingClass::ProvenanceGap,
+        1,
+    )]);
+    let req = request(&snapshot, prof);
+    let records = vec![evidence(
+        &snapshot,
+        snapshot.members[0].member_id.clone(),
+        "evidence-0",
+        ProtectionEvidenceState::CurrentVerified,
+        ProtectionOutcome::Absent,
+        false,
+    )];
+    let result = screen_memory_curation(&req, &snapshot, &records).expect("screen");
+    assert_eq!(result.state, ResultState::Blocked);
+    assert!(!result.coverage.frontier.complete);
+    assert!(result.findings.is_empty());
+    assert_eq!(
+        result.eligibility[0].status,
+        EligibilityStatus::IncompleteTruncated
+    );
+    assert_eq!(
+        result.coverage.members[0].disposition,
+        MemberDisposition::Blocked
+    );
+    assert!(!result.coverage.members[0].eligible);
+    assert!(result.validate().is_ok());
+}
+
+// WORK_UNIT_CASE: 588/31
+#[test]
+fn blocked_source_availability_blocks() {
+    // source_status() maps Blocked to UnknownBlocked; Partial denominator
+    // shadows the per-member status (see 588/27).
+    let mut snapshot = source(1, DenominatorCoverage::Partial);
+    snapshot.availability = SourceAvailability::Blocked;
+    snapshot.members[0]
+        .evidence
+        .provenance
+        .insert(ArtifactId::new("prov-0").expect("artifact"));
+    let prof = profile(vec![rule(
+        "provenance_gap_v1",
+        FindingClass::ProvenanceGap,
+        1,
+    )]);
+    let req = request(&snapshot, prof);
+    let records = vec![evidence(
+        &snapshot,
+        snapshot.members[0].member_id.clone(),
+        "evidence-0",
+        ProtectionEvidenceState::CurrentVerified,
+        ProtectionOutcome::Absent,
+        false,
+    )];
+    let result = screen_memory_curation(&req, &snapshot, &records).expect("screen");
+    assert_eq!(result.state, ResultState::Blocked);
+    assert!(!result.coverage.frontier.complete);
+    assert!(result.findings.is_empty());
+    assert_eq!(
+        result.eligibility[0].status,
+        EligibilityStatus::IncompleteTruncated
+    );
+    assert_eq!(
+        result.coverage.members[0].disposition,
+        MemberDisposition::Blocked
+    );
+    assert!(!result.coverage.members[0].eligible);
+    assert!(result.validate().is_ok());
+}
+
+// WORK_UNIT_CASE: 588/33
+#[test]
+fn partial_denominator_is_partial_not_complete() {
+    let mut snapshot = source(2, DenominatorCoverage::Partial);
+    for (index, member) in snapshot.members.iter_mut().enumerate() {
+        member
+            .evidence
+            .provenance
+            .insert(ArtifactId::new(format!("prov-{index}")).expect("artifact"));
+    }
+    let prof = profile(vec![rule(
+        "provenance_gap_v1",
+        FindingClass::ProvenanceGap,
+        1,
+    )]);
+    let req = request(&snapshot, prof);
+    let records = snapshot
+        .members
+        .iter()
+        .enumerate()
+        .map(|(index, member)| {
+            evidence(
+                &snapshot,
+                member.member_id.clone(),
+                &format!("evidence-{index}"),
+                ProtectionEvidenceState::CurrentVerified,
+                ProtectionOutcome::Absent,
+                false,
+            )
+        })
+        .collect::<Vec<_>>();
+    let result = screen_memory_curation(&req, &snapshot, &records).expect("screen");
+    assert_eq!(result.state, ResultState::Partial);
+    assert!(!result.coverage.frontier.complete);
+    assert!(result.coverage.next_cursor.is_none());
+    assert_eq!(result.coverage.members.len(), 2);
+    assert!(
+        result
+            .eligibility
+            .iter()
+            .all(|item| item.status == EligibilityStatus::IncompleteTruncated)
+    );
+    for member in &result.coverage.members {
+        assert_eq!(member.disposition, MemberDisposition::Blocked);
+        assert!(!member.eligible);
+    }
+    assert!(result.validate().is_ok());
+}
+
+// WORK_UNIT_CASE: 588/34
+#[test]
+fn immutable_reference_is_preserved_outside_scope() {
+    let mut snapshot = source(2, DenominatorCoverage::Complete);
+    for (index, member) in snapshot.members.iter_mut().enumerate() {
+        member
+            .evidence
+            .provenance
+            .insert(ArtifactId::new(format!("prov-{index}")).expect("artifact"));
+    }
+    let changed = snapshot.members[0].member_id.clone();
+    let reference = snapshot.members[1].member_id.clone();
+    snapshot.partition = MemberPartition {
+        changed_targets: [changed].into_iter().collect(),
+        immutable_references: [reference].into_iter().collect(),
+    };
+    let prof = profile(vec![rule(
+        "provenance_gap_v1",
+        FindingClass::ProvenanceGap,
+        1,
+    )]);
+    let req = request(&snapshot, prof);
+    let records = snapshot
+        .members
+        .iter()
+        .enumerate()
+        .map(|(index, member)| {
+            evidence(
+                &snapshot,
+                member.member_id.clone(),
+                &format!("evidence-{index}"),
+                ProtectionEvidenceState::CurrentVerified,
+                ProtectionOutcome::Absent,
+                false,
+            )
+        })
+        .collect::<Vec<_>>();
+    let result = screen_memory_curation(&req, &snapshot, &records).expect("screen");
+    assert_eq!(result.state, ResultState::Complete);
+    assert!(result.coverage.frontier.complete);
+    assert_eq!(
+        result.coverage.members[0].disposition,
+        MemberDisposition::Eligible
+    );
+    assert!(result.coverage.members[0].eligible);
+    assert_eq!(
+        result.eligibility[0].status,
+        EligibilityStatus::EligibleForSemanticCuration
+    );
+    assert_eq!(
+        result.coverage.members[1].disposition,
+        MemberDisposition::PreservedReference
+    );
+    assert!(!result.coverage.members[1].eligible);
+    assert_eq!(
+        result.eligibility[1].status,
+        EligibilityStatus::OutsideScope
+    );
+    assert!(result.validate().is_ok());
+}
+
+// WORK_UNIT_CASE: 588/36
+#[test]
+fn snapshot_mutation_invalidates_digest_and_disposition() {
+    let mut snapshot = source(1, DenominatorCoverage::Complete);
+    let prof = profile(vec![rule(
+        "provenance_gap_v1",
+        FindingClass::ProvenanceGap,
+        1,
+    )]);
+    let req = request(&snapshot, prof);
+    let records = vec![evidence(
+        &snapshot,
+        snapshot.members[0].member_id.clone(),
+        "evidence-0",
+        ProtectionEvidenceState::CurrentVerified,
+        ProtectionOutcome::Absent,
+        false,
+    )];
+    let before = screen_memory_curation(&req, &snapshot, &records).expect("screen");
+    assert_eq!(before.findings.len(), 1);
+    assert_eq!(
+        before.coverage.members[0].disposition,
+        MemberDisposition::Blocked
+    );
+    assert_eq!(
+        before.eligibility[0].status,
+        EligibilityStatus::UnknownBlocked
+    );
+    snapshot.members[0]
+        .evidence
+        .provenance
+        .insert(ArtifactId::new("prov-0").expect("artifact"));
+    let after = screen_memory_curation(&req, &snapshot, &records).expect("screen");
+    assert!(after.findings.is_empty());
+    assert_eq!(
+        after.coverage.members[0].disposition,
+        MemberDisposition::Eligible
+    );
+    assert_eq!(
+        after.eligibility[0].status,
+        EligibilityStatus::EligibleForSemanticCuration
+    );
+    assert_ne!(before.result_digest, after.result_digest);
+    assert!(before.validate().is_ok());
+    assert!(after.validate().is_ok());
+}
+
+// WORK_UNIT_CASE: 588/37
+#[test]
+fn rule_set_change_invalidates_digest() {
+    let mut snapshot = source(1, DenominatorCoverage::Complete);
+    snapshot.members[0]
+        .evidence
+        .provenance
+        .insert(ArtifactId::new("prov-0").expect("artifact"));
+    let base_profile = profile(vec![rule(
+        "provenance_gap_v1",
+        FindingClass::ProvenanceGap,
+        1,
+    )]);
+    let base_request = request(&snapshot, base_profile);
+    let alt_profile = profile(vec![
+        rule("provenance_gap_v1", FindingClass::ProvenanceGap, 1),
+        rule("conflict_ambiguity_v1", FindingClass::ConflictAmbiguity, 2),
+    ]);
+    assert!(
+        alt_profile
+            .requested_findings
+            .contains(&FindingClass::ConflictAmbiguity)
+    );
+    let alt_request = request(&snapshot, alt_profile);
+    let records = vec![evidence(
+        &snapshot,
+        snapshot.members[0].member_id.clone(),
+        "evidence-0",
+        ProtectionEvidenceState::CurrentVerified,
+        ProtectionOutcome::Absent,
+        false,
+    )];
+    let base = screen_memory_curation(&base_request, &snapshot, &records).expect("screen");
+    let alt = screen_memory_curation(&alt_request, &snapshot, &records).expect("screen");
+    assert_ne!(base.result_digest, alt.result_digest);
+    assert_eq!(base.state, ResultState::Complete);
+    assert_eq!(alt.state, ResultState::Complete);
+    assert!(base.validate().is_ok());
+    assert!(alt.validate().is_ok());
+}
+
+// WORK_UNIT_CASE: 588/38
+#[test]
+fn work_unit_and_byte_accounting_exact() {
+    let mut snapshot = source(2, DenominatorCoverage::Complete);
+    for (index, member) in snapshot.members.iter_mut().enumerate() {
+        member
+            .evidence
+            .provenance
+            .insert(ArtifactId::new(format!("prov-{index}")).expect("artifact"));
+    }
+    let prof = profile(vec![rule(
+        "provenance_gap_v1",
+        FindingClass::ProvenanceGap,
+        1,
+    )]);
+    let req = request(&snapshot, prof);
+    let records = snapshot
+        .members
+        .iter()
+        .enumerate()
+        .map(|(index, member)| {
+            evidence(
+                &snapshot,
+                member.member_id.clone(),
+                &format!("evidence-{index}"),
+                ProtectionEvidenceState::CurrentVerified,
+                ProtectionOutcome::Absent,
+                false,
+            )
+        })
+        .collect::<Vec<_>>();
+    let result = screen_memory_curation(&req, &snapshot, &records).expect("screen");
+    // work_units == members + evidence_records + members * profile_rules
+    // with n = 2 members, e = 2 records, r = 1 rule.
+    assert_eq!(result.coverage.usage.work_units, 6);
+    assert_eq!(result.coverage.usage.processed_items, 2);
+    assert!(result.coverage.usage.input_bytes > 0);
+    assert!(result.coverage.usage.work_units > 0);
+    let encoded = eliot_contracts::canonical_json_bytes(&result).expect("encoded result");
+    assert_eq!(result.coverage.usage.output_bytes, encoded.len() as u64);
+    let partial = source(2, DenominatorCoverage::Partial);
+    assert_eq!(
+        partial.denominator.total_members,
+        partial.denominator.declared_member_ids.len() as u64 + 1
+    );
+    assert_eq!(partial.denominator.total_members, 3);
+    assert!(result.validate().is_ok());
+}
+
+// WORK_UNIT_CASE: 588/39
+#[test]
+fn partial_prefix_accounting_without_unprocessed() {
+    let mut snapshot = source(2, DenominatorCoverage::Partial);
+    for (index, member) in snapshot.members.iter_mut().enumerate() {
+        member
+            .evidence
+            .provenance
+            .insert(ArtifactId::new(format!("prov-{index}")).expect("artifact"));
+    }
+    let prof = profile(vec![rule(
+        "provenance_gap_v1",
+        FindingClass::ProvenanceGap,
+        1,
+    )]);
+    let req = request(&snapshot, prof);
+    let records = snapshot
+        .members
+        .iter()
+        .enumerate()
+        .map(|(index, member)| {
+            evidence(
+                &snapshot,
+                member.member_id.clone(),
+                &format!("evidence-{index}"),
+                ProtectionEvidenceState::CurrentVerified,
+                ProtectionOutcome::Absent,
+                false,
+            )
+        })
+        .collect::<Vec<_>>();
+    let result = screen_memory_curation(&req, &snapshot, &records).expect("screen");
+    assert_eq!(result.state, ResultState::Partial);
+    assert!(!result.coverage.frontier.complete);
+    assert!(result.coverage.frontier.remaining.is_empty());
+    assert!(result.coverage.next_cursor.is_none());
+    assert_eq!(result.coverage.members.len(), 2);
+    assert_eq!(result.coverage.denominator.total_members, 3);
+    for member in &result.coverage.members {
+        assert_ne!(member.disposition, MemberDisposition::Unprocessed);
+    }
+    assert!(
+        result
+            .eligibility
+            .iter()
+            .all(|item| item.status == EligibilityStatus::IncompleteTruncated)
+    );
+    assert!(result.coverage.members.iter().all(|item| !item.eligible));
+    assert!(result.validate().is_ok());
+}
+
+// WORK_UNIT_CASE: 588/40
+#[test]
+fn full_result_has_no_effect_paths() {
+    let mut snapshot = source(2, DenominatorCoverage::Complete);
+    for (index, member) in snapshot.members.iter_mut().enumerate() {
+        member
+            .evidence
+            .provenance
+            .insert(ArtifactId::new(format!("prov-{index}")).expect("artifact"));
+    }
+    let prof = profile(vec![rule(
+        "provenance_gap_v1",
+        FindingClass::ProvenanceGap,
+        1,
+    )]);
+    let req = request(&snapshot, prof);
+    let records = snapshot
+        .members
+        .iter()
+        .enumerate()
+        .map(|(index, member)| {
+            evidence(
+                &snapshot,
+                member.member_id.clone(),
+                &format!("evidence-{index}"),
+                ProtectionEvidenceState::CurrentVerified,
+                ProtectionOutcome::Absent,
+                false,
+            )
+        })
+        .collect::<Vec<_>>();
+    let result = screen_memory_curation(&req, &snapshot, &records).expect("screen");
+    assert!(result.validate().is_ok());
+    assert_eq!(result.state, ResultState::Complete);
+    let bytes = eliot_contracts::canonical_json_bytes(&result).expect("result json");
+    let text = String::from_utf8(bytes).expect("result utf8");
+    // "kind" is excluded here: SourceMember.kind is a legitimate JSON key,
+    // so it is covered by the eligibility-scoped 588/44 check instead.
+    for forbidden in [
+        "handler", "family", "action", "route", "mutation", "Finish", "provider", "Store", "model",
+    ] {
+        assert!(
+            !text.contains(forbidden),
+            "result must not contain {forbidden}"
+        );
+    }
+}
+
+// WORK_UNIT_CASE: 588/41
+#[test]
+fn findings_are_closed_and_deterministic() {
+    let mut snapshot = source(2, DenominatorCoverage::Complete);
+    snapshot.members[1]
+        .evidence
+        .provenance
+        .insert(ArtifactId::new("prov-1").expect("artifact"));
+    snapshot.members[1]
+        .evidence
+        .conflict
+        .insert(ArtifactId::new("conflict-1").expect("artifact"));
+    let prof = profile(vec![
+        rule("provenance_gap_v1", FindingClass::ProvenanceGap, 1),
+        rule("conflict_ambiguity_v1", FindingClass::ConflictAmbiguity, 2),
+    ]);
+    let req = request(&snapshot, prof);
+    let records = snapshot
+        .members
+        .iter()
+        .enumerate()
+        .map(|(index, member)| {
+            evidence(
+                &snapshot,
+                member.member_id.clone(),
+                &format!("evidence-{index}"),
+                ProtectionEvidenceState::CurrentVerified,
+                ProtectionOutcome::Absent,
+                false,
+            )
+        })
+        .collect::<Vec<_>>();
+    let result = screen_memory_curation(&req, &snapshot, &records).expect("screen");
+    assert_eq!(result.findings.len(), 2);
+    let gap = result
+        .findings
+        .iter()
+        .find(|finding| finding.class == FindingClass::ProvenanceGap)
+        .expect("provenance gap");
+    assert_eq!(gap.invariant, "member has no supplied provenance handle");
+    let ambiguity = result
+        .findings
+        .iter()
+        .find(|finding| finding.class == FindingClass::ConflictAmbiguity)
+        .expect("conflict ambiguity");
+    assert_eq!(
+        ambiguity.invariant,
+        "member retains one or more conflict references"
+    );
+    for finding in &result.findings {
+        assert!(matches!(
+            finding.class,
+            FindingClass::ProvenanceGap | FindingClass::ConflictAmbiguity
+        ));
+        assert_eq!(finding.proof, FindingProof::Deterministic);
+        assert!(!finding.invariant.is_empty());
+        assert!(
+            finding
+                .validate_against_profile(&result.request.profile)
+                .is_ok()
+        );
+        let bytes = eliot_contracts::canonical_json_bytes(finding).expect("finding json");
+        let text = String::from_utf8(bytes).expect("finding utf8");
+        for forbidden in [
+            "handler", "family", "action", "route", "mutation", "Finish", "provider", "Store",
+            "model",
+        ] {
+            assert!(
+                !text.contains(forbidden),
+                "finding must not contain {forbidden}"
+            );
+        }
+    }
+    assert!(result.validate().is_ok());
+}
+
+// WORK_UNIT_CASE: 588/42
+#[test]
+fn item_input_output_bounds_rejected() {
+    let snapshot = source(2, DenominatorCoverage::Complete);
+    let mut item_limited = request(
+        &snapshot,
+        profile(vec![rule(
+            "provenance_gap_v1",
+            FindingClass::ProvenanceGap,
+            1,
+        )]),
+    );
+    item_limited.profile.limits.max_items = 1;
+    assert!(matches!(
+        screen_memory_curation(&item_limited, &snapshot, &[]),
+        Err(CurationScreenError::Contract(ContractError::Bound {
+            field: "screen.items"
+        }))
+    ));
+    let mut byte_limited = item_limited;
+    byte_limited.profile.limits.max_items = 64;
+    byte_limited.profile.limits.max_bytes = 1;
+    assert!(matches!(
+        screen_memory_curation(&byte_limited, &snapshot, &[]),
+        Err(CurationScreenError::Contract(ContractError::Bound {
+            field: "screen.input_bytes"
+        }))
+    ));
+
+    let mut complete = source(1, DenominatorCoverage::Complete);
+    complete.members[0]
+        .evidence
+        .provenance
+        .insert(ArtifactId::new("prov-0").expect("artifact"));
+    let complete_request = request(
+        &complete,
+        profile(vec![rule(
+            "provenance_gap_v1",
+            FindingClass::ProvenanceGap,
+            1,
+        )]),
+    );
+    let complete_evidence = vec![evidence(
+        &complete,
+        complete.members[0].member_id.clone(),
+        "evidence-0",
+        ProtectionEvidenceState::CurrentVerified,
+        ProtectionOutcome::Absent,
+        false,
+    )];
+    let result = screen_memory_curation(&complete_request, &complete, &complete_evidence)
+        .expect("bounded result");
+    let mut output_limited = complete_request;
+    output_limited.profile.limits.max_output_bytes = result.coverage.usage.output_bytes - 32;
+    assert!(matches!(
+        screen_memory_curation(&output_limited, &complete, &complete_evidence),
+        Err(CurationScreenError::Contract(ContractError::Bound {
+            field: "result.output_bytes"
+        }))
+    ));
+}
+
+// WORK_UNIT_CASE: 588/43
+#[test]
+fn page_time_cancellation_rejected() {
+    let mut snapshot = source(1, DenominatorCoverage::Complete);
+    snapshot.members[0]
+        .evidence
+        .provenance
+        .insert(ArtifactId::new("prov-0").expect("artifact"));
+    let profile_value = profile(vec![rule(
+        "provenance_gap_v1",
+        FindingClass::ProvenanceGap,
+        1,
+    )]);
+    let base = request(&snapshot, profile_value);
+    let records = vec![evidence(
+        &snapshot,
+        snapshot.members[0].member_id.clone(),
+        "evidence-0",
+        ProtectionEvidenceState::CurrentVerified,
+        ProtectionOutcome::Absent,
+        false,
+    )];
+    let ok = screen_memory_curation(&base, &snapshot, &records).expect("single call works");
+    assert_eq!(ok.state, ResultState::Complete);
+    let mut paged = snapshot.clone();
+    paged.page.has_more = true;
+    assert!(matches!(
+        screen_memory_curation(&base, &paged, &records),
+        Err(CurationScreenError::Contract(ContractError::Unsupported {
+            field: "source.page.frontier"
+        }))
+    ));
+    let mut timed = base.clone();
+    timed.profile.limits.deadline_ms = Some(1);
+    assert!(matches!(
+        screen_memory_curation(&timed, &snapshot, &records),
+        Err(CurationScreenError::Contract(ContractError::Unsupported {
+            field: "profile.limits.time"
+        }))
+    ));
+    let mut cancelled = base;
+    cancelled.cancellation_requested = true;
+    assert!(matches!(
+        screen_memory_curation(&cancelled, &snapshot, &records),
+        Err(CurationScreenError::Cancelled)
+    ));
+}
