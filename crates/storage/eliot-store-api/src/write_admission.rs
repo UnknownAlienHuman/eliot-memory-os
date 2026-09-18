@@ -112,11 +112,10 @@
 //!
 //! # Non-goals
 //!
-//! No wire-enum activation, no change to the existing apply signature, no
-//! adapter/Kernel/ORS implementation, and no new receipt issuer. The
-//! separately reviewed wire integration adds and versions the reserved
-//! operation and gates it on a real backend, preserving legacy compatibility
-//! or explicit refusal.
+//! No wire-enum activation, no Store-client apply operation introduced in
+//! this slice, no adapter/Kernel/ORS implementation, and no new receipt
+//! issuer. A separately reviewed later slice may add and version a reserved
+//! operation gated on a real backend, preserving legacy compatibility.
 
 use std::collections::BTreeSet;
 

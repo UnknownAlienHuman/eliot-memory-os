@@ -2,11 +2,13 @@
 //!
 //! Pure in-crate proofs only: a closed versioned projection carries mapped
 //! ORS reservation evidence across the Kernel-to-Store boundary as shape
-//! only, bound by two recomputed canonical digests. Exactly sixteen cases
-//! (`990/1` through `990/16`) cover the owner mapping, round trip, every
-//! rejection family, the unsupported client default, legacy compatibility,
-//! and the source/API guard. No reservation, wire, commit, or concurrent
-//! execution is established by these types.
+//! only, bound by two recomputed canonical digests. Fifteen cases (`990/1`
+//! through `990/13`, `990/15`, `990/16`; `990/14` retired with the removed
+//! Store-client reserved-write entry point) cover the owner mapping, round
+//! trip, every rejection family, ordinary-apply compatibility, legacy
+//! compatibility, and the source/API guard. No reservation, wire, commit, or
+//! concurrent execution is established by these types, and no Store-client
+//! apply operation for reserved writes exists in this slice.
 
 #![allow(clippy::unwrap_used)]
 #![allow(clippy::expect_used)]
@@ -833,27 +835,12 @@ fn block_on<F: Future>(future: F) -> F::Output {
     }
 }
 
-// WORK_UNIT_CASE: 990/14
-#[test]
-fn unsupported_client_default_refuses_without_unreserved_fallback() {
-    let client = StubClient::new();
-    let outcome = block_on(client.apply_reserved_write(valid_request()));
-    assert_eq!(outcome, Err(StoreError::Unavailable));
-    assert_eq!(client.apply_call_count(), 0, "no unreserved fallback ran");
-    let mut broken = valid_request();
-    broken.admission.reservation_order = 0;
-    let refused = block_on(client.apply_reserved_write(broken));
-    assert!(refused.is_err());
-    assert_eq!(
-        client.apply_call_count(),
-        0,
-        "invalid input still causes no effects"
-    );
-}
-
 // WORK_UNIT_CASE: 990/15
 #[test]
 fn existing_client_implementations_keep_ordinary_apply_behavior() {
+    // Trait/backward-compatibility coverage only: the stub manufactures a
+    // rejected receipt and bypasses real admission authority, so this proves
+    // ordinary-apply behavior is unchanged, not production write semantics.
     let client = StubClient::new();
     let plan = transition();
     let operation = plan.identity.operation_id.clone();
@@ -865,6 +852,12 @@ fn existing_client_implementations_keep_ordinary_apply_behavior() {
     ))
     .unwrap();
     assert_eq!(receipt.operation_id, operation);
+    assert_eq!(receipt.status, WriteReceiptStatus::Rejected);
+    assert_eq!(receipt.error_code, Some(ErrorCode::Conflict));
+    assert_eq!(receipt.commit_id, None);
+    assert_eq!(receipt.resubmission, Resubmission::None);
+    assert!(receipt.ordering_sequences.is_empty());
+    assert!(receipt.revision_before_after.is_empty());
     assert!(receipt.validate().is_ok());
     assert_eq!(client.apply_call_count(), 1);
     let legacy = StoreRequest::Apply {
@@ -925,4 +918,16 @@ fn source_and_api_guard_excludes_hidden_authority_io_and_activation() {
             .all(|capability| !capability.contains("reserv") && !capability.contains("admission")),
         "no hidden capability activation: {CAPABILITIES:?}"
     );
+    // Audit-D reconciliation: invoking a reserved-write entry point is now
+    // impossible because the trait exposes none. The projection JSON-key
+    // assertion in 990/11 remains the shape-only proof; this guards the
+    // boundary itself against reintroduction of a Store-client
+    // reserved-write operation outside a separately reviewed slice.
+    let lib = include_str!("../src/lib.rs");
+    for forbidden in ["apply_reserved_write", "reserved_write"] {
+        assert!(
+            !lib.contains(forbidden),
+            "lib.rs must not contain a reserved-write entry point: {forbidden:?}"
+        );
+    }
 }

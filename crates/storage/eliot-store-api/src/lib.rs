@@ -2399,24 +2399,6 @@ pub trait CanonicalStoreClient: Send + Sync {
         expected_ordering_heads: Vec<OrderingHeadExpectation>,
     ) -> Result<WriteReceipt, StoreError>;
 
-    /// Applies one closed reserved-write request carrying ORS-admitted
-    /// reservation evidence (issue #990).
-    ///
-    /// The default body checks the closed request shape and then refuses with
-    /// [`StoreError::Unavailable`] without effects: it never delegates to the
-    /// unreserved [`apply_prepared`](Self::apply_prepared) path as a
-    /// fallback, and it manufactures no receipt. An optional method
-    /// declaration cannot advertise runtime support; the later process owner
-    /// enables this operation only with a real backend behind it. Existing
-    /// direct apply behavior is unchanged.
-    async fn apply_reserved_write(
-        &self,
-        request: ReservedWriteRequest,
-    ) -> Result<WriteReceipt, StoreError> {
-        request.validate()?;
-        Err(StoreError::Unavailable)
-    }
-
     /// Reads one bounded, same-fence recovery snapshot. Wave 1 keeps the
     /// provider/state implementation out of this neutral contract crate.
     async fn recovery(
