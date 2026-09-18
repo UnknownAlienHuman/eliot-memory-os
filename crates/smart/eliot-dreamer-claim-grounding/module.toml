@@ -58,6 +58,6 @@ workspace_admission = "admitted via #836 (T8-A4) root workspace membership"
 [acceptance]
 require_deny_unknown_fields = true
 forbid_unsafe = true
-required_exports = []
-required_tests = []
+required_exports = ["ground_draft", "ground_draft_with_controls", "GroundingRequest", "GroundingControls", "Cancellation"]
+required_tests = ["tests/grounding.rs hosts all 36 WORK_UNIT_CASE 602/1..36 cases"]
 forbidden_patterns = ['serde_json::Value', 'unimplemented!', 'todo!']
