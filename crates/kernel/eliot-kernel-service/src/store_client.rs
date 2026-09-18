@@ -641,7 +641,8 @@ mod tests {
     use eliot_store_api::{
         CommitId, EffectClass, EventProjectionRelationIntents, NamedMutationOperation,
         NamedMutationRequest, OperationIdentity, OperationManifestDigest, Resubmission,
-        TransitionClass, WriteReceiptStatus, canonical_request_hash,
+        StoreFailure, StoreFailureIdentityContext, TransitionClass, WriteReceiptStatus,
+        canonical_request_hash,
     };
     use serde_json::json;
     use std::num::NonZeroU64;
@@ -840,9 +841,26 @@ mod tests {
                     if matches!(self.fault, SnapshotFault::Unavailable) {
                         self.pending = Some(Self::response(
                             connection_id,
-                            response_id,
-                            StoreResponse::Error {
-                                error: "unavailable".to_owned(),
+                            response_id.clone(),
+                            StoreResponse::Failure {
+                                failure: StoreFailure::from_store_error(
+                                    StoreError::Unavailable,
+                                    StoreFailureIdentityContext {
+                                        // A same-identity retry directive is
+                                        // only valid with exact request or
+                                        // idempotency evidence, so the failure
+                                        // carries the request it answers.
+                                        request_id: Some(response_id.clone()),
+                                        operation_id: None,
+                                        idempotency_key_ref_or_digest: None,
+                                        state_fence_ref_or_exact_safe_projection: Some(
+                                            self.requirement.state_fence.clone(),
+                                        ),
+                                        evidence_ref: None,
+                                        transport_unavailable: true,
+                                    },
+                                )
+                                .expect("unavailable store failure is valid"),
                             },
                         ));
                     } else {

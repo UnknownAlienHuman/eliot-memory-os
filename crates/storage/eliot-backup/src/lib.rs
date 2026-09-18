@@ -1394,6 +1394,7 @@ impl RestorePlan {
                         .intent
                         .as_ref()
                         .ok_or(BackupError::RestoreJournalCorrupt)?;
+                    refuse_erasure_rehydration(bundle, intent)?;
                     match target.reconcile_restore_effect(intent)? {
                         RestoreReconciliation::Applied(applied) => {
                             let final_receipt = validate_applied_effect(
@@ -1748,7 +1749,41 @@ fn apply_restore_phase<T: RestoreTarget>(
     if matches!(intent.phase, RestorePhase::Pending) {
         return Err(BackupError::RestorePhaseMismatch);
     }
+    refuse_erasure_rehydration(bundle, intent)?;
     target.apply_restore_effect(plan, bundle, intent)
+}
+
+/// Enforces `ERASURE_STATE_IRREVERSIBLE` on the restore direction (issue
+/// #1712; I5.14: "Restore refuses to resurrect purged payload").
+///
+/// This is the single mandatory guard every restore/reconcile dispatch in
+/// this coordinator funnels through before a target may observe a
+/// receipt-bearing phase. When the intent names an `ImportReceipt` phase, the
+/// receipt is resolved from the same bundle the phases derive from (any
+/// divergence fails closed as `PlanMismatch`) and
+/// [`WriteReceipt::refuse_rehydration_from_erasure`] decides: an erasure
+/// receipt fails with `StoreError::InvalidReceipt` (surfaced as
+/// `BackupError::Store`), every other class passes unchanged so receipt-proof
+/// import and receipt/event-chain verification are unaffected. Replay and
+/// audit reads of erasure receipts stay legitimate elsewhere; only state
+/// rehydration through this restore executor is refused. Non-receipt phases
+/// pass through untouched, and no target implementation can bypass this gate
+/// because the coordinator refuses before dispatch.
+fn refuse_erasure_rehydration(
+    bundle: &BackupBundle,
+    intent: &RestoreIntent,
+) -> Result<(), BackupError> {
+    if let RestorePhase::ImportReceipt { operation_id } = &intent.phase {
+        let receipt = bundle
+            .receipts
+            .iter()
+            .find(|receipt| receipt.operation_id.to_string() == *operation_id)
+            .ok_or(BackupError::PlanMismatch)?;
+        receipt
+            .refuse_rehydration_from_erasure()
+            .map_err(BackupError::Store)?;
+    }
+    Ok(())
 }
 
 fn validate_applied_effect(

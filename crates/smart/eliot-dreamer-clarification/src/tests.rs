@@ -3,7 +3,7 @@ use std::fmt::Debug;
 use eliot_contracts::{EpochId, EpochLineageId, ResourceGeneration, StateFence};
 use std::num::NonZeroU64;
 use eliot_dreamer_contracts::{
-    BudgetLimits, DreamJobInput, JobClass, Requester, RequesterOrigin, ValidatedDreamDraft,
+    BudgetLimits, DreamJobAdmission, JobClass, Requester, RequesterOrigin, ValidatedDreamDraft,
     ValidationReceipt,
 };
 use eliot_dreamer_contracts::job::DREAM_JOB_SCHEMA_VERSION;
@@ -32,8 +32,8 @@ fn digest(ch: char) -> String {
     std::iter::repeat_n(ch, 64).collect()
 }
 
-fn job() -> DreamJobInput {
-    DreamJobInput {
+fn job() -> DreamJobAdmission {
+    DreamJobAdmission {
         schema_version: DREAM_JOB_SCHEMA_VERSION,
         job_class: JobClass::Clarification,
         requester: Requester {
@@ -67,7 +67,7 @@ fn job() -> DreamJobInput {
     }
 }
 
-fn validated_draft(job: &DreamJobInput) -> ValidatedDreamDraft {
+fn validated_draft(job: &DreamJobAdmission) -> ValidatedDreamDraft {
     let receipt = ValidationReceipt {
         schema_version: 1,
         validator_contract: "eliot.dreamer.validation.v1".to_owned(),

@@ -1089,6 +1089,22 @@ impl KernelComposition {
             agent_activation_results: Mutex::new(BTreeMap::new()),
             #[cfg(windows)]
             host_request_connection_index: Mutex::new(BTreeMap::new()),
+            #[cfg(windows)]
+            local_read_claim_boot_nonce: {
+                use std::collections::hash_map::DefaultHasher;
+                use std::hash::{Hash, Hasher};
+                // Boot-unique, not cryptographic: process identity plus wall
+                // time plus a stack address distinguish every composition
+                // incarnation, so attempt IDs never repeat across restarts.
+                let stack_anchor = 0u8;
+                let mut hasher = DefaultHasher::new();
+                std::process::id().hash(&mut hasher);
+                super::unix_ms().hash(&mut hasher);
+                std::ptr::from_ref(&stack_anchor).hash(&mut hasher);
+                let nonce = hasher.finish();
+                // Zero is reserved as "no boot nonce"; remap without biasing.
+                if nonce == 0 { 1 } else { nonce }
+            },
         })
     }
 }

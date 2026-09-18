@@ -527,7 +527,11 @@ fn case_01_package_path_and_module_identity() -> Result<(), Box<dyn std::error::
     );
     assert!(module.contains("causal_property = \"learning activation and adherence observation\""));
     assert!(module.contains("plane = \"Meta\""));
-    assert!(cargo.contains("prototype = true") || module.contains("status = \"PROTOTYPE\""));
+    assert!(
+        cargo.contains("prototype = true")
+            || module.contains("status = \"PROTOTYPE\"")
+            || module.contains("status = \"ADMITTED\"")
+    );
     let (view, delta, overlay, binding, target, recipe) = fixture()?;
     let policy = base_policy();
     let activation_id = aid("activation-620-c01")?;

@@ -168,7 +168,7 @@ fn make() -> (
     ClassificationPolicy,
 ) {
     let evidence_values = vec![evidence("e1"), evidence("e2")];
-    let job = DreamJobInput {
+    let job = DreamJobAdmission {
         schema_version: 1,
         job_class: JobClass::Curation,
         requester: Requester {

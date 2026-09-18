@@ -23,7 +23,7 @@ use eliot_dreamer_contracts::{
     AtomicityMode, BoundCurationCall, BudgetLimits, BudgetUsage, BundleCompleteness,
     BundleMaterial, CandidateDisposition, ContractViolation, CurationAcceptanceCtx, CurationFamily,
     CurationHandlerDescriptor, CurationHandlerPort, CurationHandlerRegistry, CurationKind,
-    CurationPayload, DreamInputBundle, DreamJobInput, FullCurationResult, GroundedDreamDraft,
+    CurationPayload, DreamInputBundle, DreamJobAdmission, FullCurationResult, GroundedDreamDraft,
     JobClass, NativeCurationHandler, PreservationDimension, PreservationReport,
     ProducedCurationContent, Requester, RequesterOrigin, ScreenBinding, ScreenState,
     SourceDisposition, TargetDenominator, TypedCurationHandlerRequest, ValidatedCurationItem,
@@ -81,7 +81,7 @@ impl NativeCurationHandler for FixtureHandler {
 }
 
 struct Fixtures {
-    job: DreamJobInput,
+    job: DreamJobAdmission,
     bundle: DreamInputBundle,
     grounded: GroundedDreamDraft,
     item: ValidatedCurationItem,
@@ -148,8 +148,8 @@ fn fixture_fence() -> StateFence {
     StateFence::new(test_epoch(), ResourceGeneration::genesis())
 }
 
-fn fixture_job(fence: &StateFence) -> DreamJobInput {
-    DreamJobInput {
+fn fixture_job(fence: &StateFence) -> DreamJobAdmission {
+    DreamJobAdmission {
         schema_version: job::DREAM_JOB_SCHEMA_VERSION,
         job_class: JobClass::Curation,
         requester: Requester {
@@ -268,7 +268,7 @@ fn fixture_denominator() -> TargetDenominator {
 
 fn fixture_item(
     fence: &StateFence,
-    job: &DreamJobInput,
+    job: &DreamJobAdmission,
     receipt: &ValidationReceipt,
     payload: &CurationPayload,
     denominator: &TargetDenominator,

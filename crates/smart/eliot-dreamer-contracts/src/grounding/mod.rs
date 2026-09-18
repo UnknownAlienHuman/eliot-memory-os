@@ -11,7 +11,7 @@ pub use eliot_contracts::{ArtifactId, StateFence, TaskId};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 
-use crate::{ContractViolation, DreamInputBundle, DreamJobInput, ScreenBinding};
+use crate::{ContractViolation, DreamInputBundle, DreamJobAdmission, ScreenBinding};
 
 pub mod claims;
 pub mod encoding;
@@ -83,11 +83,11 @@ pub struct RouteIdentity {
     pub fingerprint: String,
 }
 
-pub fn requester_digest(job: &DreamJobInput) -> Result<String, ContractViolation> {
+pub fn requester_digest(job: &DreamJobAdmission) -> Result<String, ContractViolation> {
     encoding::digest(&job.requester)
 }
 
-pub fn budget_digest(job: &DreamJobInput) -> Result<String, ContractViolation> {
+pub fn budget_digest(job: &DreamJobAdmission) -> Result<String, ContractViolation> {
     encoding::digest(&job.budget)
 }
 
@@ -112,13 +112,13 @@ pub fn route_fingerprint(route: &RouteIdentity) -> Result<String, ContractViolat
 /// Structured provider output retained before grounding.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub struct ModelDraft {
+pub struct StructuredModelDraft {
     pub schema_version: u32,
     pub job_id: String,
     pub task_id: TaskId,
     pub scope_id: String,
     pub state_fence: StateFence,
-    pub job: DreamJobInput,
+    pub job: DreamJobAdmission,
     pub bundle: DreamInputBundle,
     pub raw_output_digest: String,
     pub requester_digest: String,
@@ -133,7 +133,7 @@ pub struct ModelDraft {
     pub draft_digest: String,
 }
 
-impl ModelDraft {
+impl StructuredModelDraft {
     #[allow(clippy::items_after_statements)]
     pub fn computed_digest(&self) -> Result<String, ContractViolation> {
         encoding::preflight(self)?;
@@ -172,7 +172,7 @@ impl ModelDraft {
             task_id: &'a TaskId,
             scope_id: &'a str,
             state_fence: &'a StateFence,
-            job: &'a DreamJobInput,
+            job: &'a DreamJobAdmission,
             bundle: &'a DreamInputBundle,
             raw_output_digest: &'a str,
             requester_digest: &'a str,
@@ -319,7 +319,7 @@ pub struct GroundedDreamDraft {
     pub draft_digest: String,
     pub manifest_digest: String,
     pub policy_digest: String,
-    pub input: ModelDraft,
+    pub input: StructuredModelDraft,
     pub manifest: AllowedReferenceManifest,
     pub policy: GroundingPolicy,
     pub ledger: ClaimGroundingLedger,
@@ -393,7 +393,7 @@ impl GroundedDreamDraft {
             task_id: &'a TaskId,
             scope_id: &'a str,
             state_fence: &'a StateFence,
-            job: &'a DreamJobInput,
+            job: &'a DreamJobAdmission,
             bundle: &'a DreamInputBundle,
             raw_output_digest: &'a str,
             requester_digest: &'a str,
@@ -481,7 +481,7 @@ fn check_digest(value: &str, field: &'static str) -> Result<(), ContractViolatio
     }
 }
 
-fn check_attempt(attempt: &AttemptIdentity, job: &DreamJobInput) -> Result<(), ContractViolation> {
+fn check_attempt(attempt: &AttemptIdentity, job: &DreamJobAdmission) -> Result<(), ContractViolation> {
     check_text(&attempt.attempt_id, "attempt_id")?;
     if attempt.attempt_number == 0
         || attempt.attempt_number > attempt.maximum_attempts

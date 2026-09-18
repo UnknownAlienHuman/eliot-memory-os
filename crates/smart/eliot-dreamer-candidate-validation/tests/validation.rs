@@ -8,7 +8,7 @@ use eliot_dreamer_candidate_validation::{
 use eliot_dreamer_contracts::candidate::DimensionVerdict;
 use eliot_dreamer_contracts::{
     BudgetLimits, BudgetUsage, BundleCompleteness, BundleMaterial, ClaimResidue, DreamInputBundle,
-    DreamJobInput, GroundedDreamDraft, JobClass, ModelDraft, OmissionHandle,
+    DreamJobAdmission, GroundedDreamDraft, JobClass, ModelDraft, OmissionHandle,
     PRESERVATION_DIMENSIONS, PreservationDimension, PreservationReport, Requester, RequesterOrigin,
     SourceDisposition, SupportState,
 };
@@ -27,7 +27,7 @@ fn fence() -> StateFence {
 
 #[allow(clippy::too_many_lines)]
 fn fixture() -> (
-    DreamJobInput,
+    DreamJobAdmission,
     DreamInputBundle,
     ModelDraft,
     GroundedDreamDraft,
@@ -35,7 +35,7 @@ fn fixture() -> (
     BudgetUsage,
     PreservationReport,
 ) {
-    let job = DreamJobInput {
+    let job = DreamJobAdmission {
         schema_version: 1,
         job_class: JobClass::Orientation,
         requester: Requester {

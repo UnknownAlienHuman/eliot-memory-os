@@ -58,7 +58,9 @@
 //! for `GetTaskState`, the optional `problem_id` / `max_records` selectors
 //! for `GetAttentionAndProblems`, the `selector` / `max_records` selectors
 //! for `GetUnderstandingProjectionInputs`, and the `skill_id` /
-//! `max_records` selectors for `GetCapabilityEvidenceState`) is
+//! `max_records` selectors for `GetCapabilityEvidenceState`, and the five
+//! canonical-erasure fields for `ApplyErasure` (`subject`, `surfaces`,
+//! `reason`, `requester`, `erasure_operation_id`)) is
 //! owner-approved and therefore supersedes the
 //! generic [`CONTROL_FIELD_DENYLIST`](crate::CONTROL_FIELD_DENYLIST) for that
 //! exact name; every undeclared control name is still rejected fail-closed.
@@ -124,7 +126,10 @@ pub enum ParameterShape {
     /// selectors (the exact revoked `origin_ref` and the explicit
     /// `max_records` bound as its decimal string, range-checked against
     /// [`REVOCATION_HISTORY_MAX_RECORDS`](crate::REVOCATION_HISTORY_MAX_RECORDS)
-    /// by every handler). Length is bounded by the owning manifest entry's
+    /// by every handler), and for the four `ApplyErasure` text fields (the
+    /// exact admitted `subject`, the canonical `surfaces` denominator, the
+    /// explicit user `reason`, and the user-initiated `requester` handle).
+    /// Length is bounded by the owning manifest entry's
     /// `max_input_bytes` over the canonical parameter bytes (the same
     /// mechanism that bounds the activated reads), so no separate string
     /// length constant exists here.
@@ -423,6 +428,44 @@ static GET_AUTHORITY_REVOCATION_HISTORY_PARAMETERS: [ParameterDeclaration; 2] = 
     },
 ];
 
+/// Owner-approved canonical-erasure fields for the explicit user-requested
+/// `ApplyErasure` named transaction (issue #1712, built by
+/// `erasure_admission::admit_erasure_transition`): the exact admitted target
+/// `subject`, the canonical surface denominator `surfaces` (sorted,
+/// comma-joined handler-surface names; closed-enum membership is enforced at
+/// dispatch), the explicit user `reason`, the user-initiated `requester`
+/// identity handle, and the stable `erasure_operation_id` binding the
+/// recorded intent to its execution and receipt. Automatic
+/// maintenance/curation/Dreamer/scheduler paths furnish no reason, requester,
+/// or approval handles, so they can never satisfy this contract.
+static APPLY_ERASURE_PARAMETERS: [ParameterDeclaration; 5] = [
+    ParameterDeclaration {
+        name: "subject",
+        shape: ParameterShape::Subject,
+        required: true,
+    },
+    ParameterDeclaration {
+        name: "surfaces",
+        shape: ParameterShape::Subject,
+        required: true,
+    },
+    ParameterDeclaration {
+        name: "reason",
+        shape: ParameterShape::Subject,
+        required: true,
+    },
+    ParameterDeclaration {
+        name: "requester",
+        shape: ParameterShape::Subject,
+        required: true,
+    },
+    ParameterDeclaration {
+        name: "erasure_operation_id",
+        shape: ParameterShape::OperationId,
+        required: true,
+    },
+];
+
 /// Owner-approved task-control fields emitted by the Governor task lifecycle
 /// envelope (`crates/governor/eliot-governor/src/task_lifecycle.rs`,
 /// `task_envelope`): the transitioned `task_id`, the admitted `event_id`, the
@@ -527,6 +570,7 @@ pub const fn named_mutation_operation_name(operation: NamedMutationOperation) ->
         NamedMutationOperation::ReconcileRecovery => "ReconcileRecovery",
         NamedMutationOperation::AppendAuditEvent => "AppendAuditEvent",
         NamedMutationOperation::RecordAuthorityRevocation => "RecordAuthorityRevocation",
+        NamedMutationOperation::ApplyErasure => "ApplyErasure",
     }
 }
 
@@ -541,6 +585,7 @@ pub const fn named_mutation_operation_by_name(name: &str) -> Option<NamedMutatio
         b"ReconcileRecovery" => Some(NamedMutationOperation::ReconcileRecovery),
         b"AppendAuditEvent" => Some(NamedMutationOperation::AppendAuditEvent),
         b"RecordAuthorityRevocation" => Some(NamedMutationOperation::RecordAuthorityRevocation),
+        b"ApplyErasure" => Some(NamedMutationOperation::ApplyErasure),
         _ => None,
     }
 }
@@ -608,7 +653,9 @@ pub const fn declared_read_parameters(
 /// authority-revocation fields (`origin_ref`, `closure_id`,
 /// `closure_revision`, `affected_digest`, `affected_count`,
 /// `invalidation_reason`, `fence_digest`); `ApplyEpistemicRevision` declares
-/// the required `revision` epistemic-revision payload;
+/// the required `revision` epistemic-revision payload; `ApplyErasure`
+/// declares the five required canonical-erasure fields (`subject`,
+/// `surfaces`, `reason`, `requester`, `erasure_operation_id`);
 /// every other variant declares none,
 /// so any supplied parameter fails closed. Variants without a catalogue entry
 /// never reach this table: they fail as [`StoreError::UnknownOperation`] first.
@@ -625,6 +672,7 @@ pub const fn declared_mutation_parameters(
         NamedMutationOperation::RecordAuthorityRevocation => {
             &RECORD_AUTHORITY_REVOCATION_PARAMETERS
         }
+        NamedMutationOperation::ApplyErasure => &APPLY_ERASURE_PARAMETERS,
         NamedMutationOperation::ApplyEpistemicRevision => &EPISTEMIC_REVISION_PARAMETERS,
     }
 }

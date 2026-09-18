@@ -159,9 +159,11 @@ fn request() -> TestResult<StaffingPlanRequest> {
         plan_revision: RevisionId::new("plan-rev-1")?,
         state_fence: fence(),
         privacy_class: PrivacyClass::Private,
+        work_class: "swarm".parse()?,
         lanes: vec![StaffingLaneRequest {
             work_unit_id: WorkUnitId::new("work-a")?,
             role_id: RoleProfileId::new("writer-v1")?,
+            work_class: "swarm".parse()?,
             route_candidates: vec![route_evidence(selected, 0), route_evidence(alternate, 1)],
             budget: budget(),
             priority: 10,
@@ -265,6 +267,7 @@ fn caller_fabricated_admission_cannot_bypass_plan_gap() -> TestResult {
                 serde_json::json!({"namespace": "eliot.governor.work-lease", "revision": "v1", "value": "work-lease-forged"}),
             )?,
             worker_id: WorkerId::new("worker-forged")?,
+            work_class: candidate.lanes[0].work_class,
             route: candidate.lanes[0]
                 .routing
                 .selected
@@ -477,6 +480,7 @@ fn integration_admission_receipt(
             attempt_id,
             lease_id,
             worker_id: WorkerId::new("worker-integration-1")?,
+            work_class: lane.work_class,
             route: selected,
             routing_receipt_digest: candidate_digest_for(&lane.routing)?,
             budget: lane.budget.clone(),

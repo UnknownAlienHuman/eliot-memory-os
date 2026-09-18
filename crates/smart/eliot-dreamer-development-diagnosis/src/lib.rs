@@ -72,7 +72,7 @@ use eliot_contracts::{canonical_json_bytes, sha256_hex};
 use eliot_dreamer_contracts::CurationRejectionCode;
 use eliot_dreamer_contracts::candidate::DimensionVerdict;
 use eliot_dreamer_contracts::{
-    CurrentObservation, DreamJobInput, JobClass, MechanismExercise, PreservationDimension,
+    CurrentObservation, DreamJobAdmission, JobClass, MechanismExercise, PreservationDimension,
     PreservationReport, RepairEventOutcome, RepairHistoryPresence, RepeatReason,
     ValidatedDreamDraft, check_fence, is_hex64_lower,
 };
@@ -1366,7 +1366,7 @@ fn intrinsic_receipt_checks(draft: &ValidatedDreamDraft) -> Result<(), Diagnosis
 
 /// Checks job, draft, task, scope, fence, budget, and policy bindings.
 fn intrinsic_binding_checks(
-    job: &DreamJobInput,
+    job: &DreamJobAdmission,
     draft: &ValidatedDreamDraft,
     policy: &DiagnosisPolicy,
 ) -> Result<(), DiagnosisError> {
@@ -2227,7 +2227,7 @@ fn emit_candidate(
 #[allow(clippy::too_many_arguments)]
 #[allow(clippy::too_many_lines)]
 pub fn diagnose_development_gap(
-    job: &DreamJobInput,
+    job: &DreamJobAdmission,
     draft: &ValidatedDreamDraft,
     product: &ProductGap,
     discriminator: &DiscriminatorEvidence,
@@ -2558,7 +2558,7 @@ mod tests {
     use eliot_contracts::ResourceGeneration;
     use eliot_dreamer_contracts::BudgetLimits;
     use eliot_dreamer_contracts::CurrentObservation;
-    use eliot_dreamer_contracts::DreamJobInput;
+    use eliot_dreamer_contracts::DreamJobAdmission;
     use eliot_dreamer_contracts::JobClass;
     use eliot_dreamer_contracts::MechanismExercise;
     use eliot_dreamer_contracts::RepairEventOutcome;
@@ -2626,8 +2626,8 @@ mod tests {
     }
 
     /// Returns a development-diagnosis job bound to the test receipt.
-    fn test_job() -> DreamJobInput {
-        DreamJobInput {
+    fn test_job() -> DreamJobAdmission {
+        DreamJobAdmission {
             schema_version: 1,
             job_class: JobClass::DevelopmentDiagnosis,
             requester: Requester {

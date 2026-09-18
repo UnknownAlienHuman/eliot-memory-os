@@ -1,7 +1,7 @@
 schema_version = 4
 module_id = "smart.dreamer.architecture_brief"
 crate = "eliot-dreamer-architecture-brief"
-status = "PROTOTYPE"
+status = "ADMITTED"
 wave = "cognitive-micromodules-wave-01"
 agent_order = 8
 plane = "Smart"
@@ -21,7 +21,7 @@ discriminator = "The brief is independently reconstructible from exact accepted 
 primary_responsibility = "Produce an ArchitectureBrief candidate preserving applicable ARCH anchors, intent, rationale, Hard Boundaries, unresolved questions and exact source identity."
 owned_mutable_state = []
 allowed_effects = []
-inputs = ["DreamJobInput class=ArchitectureSelfQuery", "ValidatedDreamDraft", "accepted Architecture handles and pair identity"]
+inputs = ["DreamJobAdmission class=ArchitectureSelfQuery", "ValidatedDreamDraft", "accepted Architecture handles and pair identity"]
 outputs = ["ArchitectureBriefProjection", "ArchitectureBriefCandidate", "normative coverage manifest", "invalidation conditions"]
 depends_on = ["eliot-dreamer-contracts"]
 providers = ["Governor-admitted accepted Architecture source handles"]
@@ -56,7 +56,7 @@ integration_owner = "cognitive-wave-integrator"
 implementation_language = "Rust 2024"
 required_verification = ["module/package proof at the declared proof ceiling", "real provider/consumer fixture for every changed edge", "the named Product Pulse or Edge proof before promotion", "exact donor reuse/rewrite/reject trace"]
 writeback = "return implementation artifact, exact proof evidence, donor disposition, unresolved ContractChallenges and merge/remove recommendation"
-workspace_admission = "forbidden until implementation, package proof, affected Edge proof, current-main ancestry and integration-owner review"
+workspace_admission = "admitted via #968 (T8-A1) root workspace membership"
 
 # Acceptance is decided by the owning contract and independent review
 # (I0.10: line/test/type counts are not goals). `scripts/verify-work-unit.py`

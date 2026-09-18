@@ -19,6 +19,7 @@ use eliot_agent_contracts::RevisionId;
 use eliot_agent_coordinator::{
     CandidateId, CoordinatorConfig, RecipeId, RecipeManifest, RoleProfileId, RoleProfileManifest,
     RouteCandidateEvidence, StaffingLaneRequest, StaffingPlanCandidate, StaffingPlanRequest,
+    WorkClass,
 };
 use eliot_contracts::{EpochId, EpochLineageId, ResourceGeneration, StateFence, sha256_hex};
 use eliot_evaluation_contracts::BudgetEvidence;
@@ -148,10 +149,12 @@ fn test_request(
             .map_err(|error| format!("plan rev: {error}"))?,
         state_fence: fence.clone(),
         privacy_class: PrivacyClass::Private,
+        work_class: "swarm".parse().map_err(|error| format!("class: {error}"))?,
         lanes: vec![StaffingLaneRequest {
             work_unit_id: WorkUnitId::new("work-1")
                 .map_err(|error| format!("lane work: {error}"))?,
             role_id: RoleProfileId::new("role-1").map_err(|error| format!("lane role: {error}"))?,
+            work_class: "swarm".parse().map_err(|error| format!("class: {error}"))?,
             route_candidates: vec![RouteCandidateEvidence {
                 route: route.clone(),
                 preference_rank: 0,
@@ -279,6 +282,7 @@ impl AdmissionAuthorityPort for FakeAdmission {
             reservation_id: format!("res-{}", definition.definition_id.as_str()),
             definition_id: definition.definition_id.clone(),
             definition_digest: definition.definition_digest.clone(),
+            work_class: definition.work_class,
             fence: definition.fence.clone(),
         })
     }
@@ -291,6 +295,7 @@ impl AdmissionAuthorityPort for FakeAdmission {
                     .map_err(|error| FabricError::Contract(format!("admission id: {error}")))?,
                 definition_id: reservation.definition_id.clone(),
                 definition_digest: reservation.definition_digest.clone(),
+                work_class: reservation.work_class,
                 reservation_id: reservation.reservation_id.clone(),
                 fence: reservation.fence.clone(),
                 epoch: reservation.fence.authority_epoch.clone(),
@@ -310,6 +315,7 @@ impl AdmissionAuthorityPort for FakeAdmission {
                     .map_err(|error| FabricError::Contract(format!("admission id: {error}")))?,
                 definition_id: reservation.definition_id.clone(),
                 definition_digest: "f".repeat(64),
+                work_class: reservation.work_class,
                 reservation_id: reservation.reservation_id.clone(),
                 fence: reservation.fence.clone(),
                 epoch: reservation.fence.authority_epoch.clone(),
@@ -323,6 +329,7 @@ impl AdmissionAuthorityPort for FakeAdmission {
                     .map_err(|error| FabricError::Contract(format!("admission id: {error}")))?,
                 definition_id: reservation.definition_id.clone(),
                 definition_digest: reservation.definition_digest.clone(),
+                work_class: reservation.work_class,
                 reservation_id: "res-foreign".to_owned(),
                 fence: reservation.fence.clone(),
                 epoch: reservation.fence.authority_epoch.clone(),
@@ -1636,5 +1643,89 @@ fn full_request_to_dispatch_ledger_with_denial_loss_replay() -> TestResult {
         world.fabric.attempt_of(&attempt),
         Some(AttemptLifecycle::ResultSubmitted)
     );
+    Ok(())
+}
+
+// WORK_UNIT_CASE: 872/29 — I14.1 work classes (issue #1698). Each of the nine
+// canonical wire spellings threads as the closed `WorkClass` boundary type
+// through definition, reservation, admission and dispatch; the observable
+// records identify the same class and serialize to the same wire string.
+#[test]
+fn work_class_threads_through_definition_reservation_admission_and_dispatch() -> TestResult {
+    let classes = WorkClass::ALL_WIRE_SPELLINGS;
+    for (index, class) in classes.iter().enumerate() {
+        let route = test_route()?;
+        let mut world = test_world(
+            Some(route.clone()),
+            AdmitMode::Admit,
+            ActivateMode::Activate,
+            EgressMode::Ack,
+            false,
+        )?;
+        let fence = test_fence()?;
+        let mut request = test_request(&fence, &route, &format!("candidate-1698-{index}"))?;
+        let expected: WorkClass = (*class)
+            .parse()
+            .map_err(|error| format!("canonical class must parse: {error}"))?;
+        request.work_class = expected;
+        for lane in &mut request.lanes {
+            lane.work_class = expected;
+        }
+        let (definition, _candidate) = world.fabric.define_and_plan(request)?;
+        assert_eq!(definition.work_class, expected);
+        assert_eq!(definition.work_class.as_wire_str(), *class);
+        let reservation = world
+            .fabric
+            .stage_reservation(&definition.definition_id)?;
+        assert_eq!(reservation.work_class, expected);
+        let admission = world.fabric.commit_admission(&reservation.reservation_id)?;
+        assert_eq!(admission.work_class, expected);
+        let attempt = admission.attempt_ids.first().ok_or("one attempt")?.clone();
+        world.fabric.activate(&admission.admission_id, &attempt)?;
+        let intent = world.fabric.dispatch(
+            &admission.admission_id,
+            &attempt,
+            &format!("dispatch-1698-{index}"),
+        )?;
+        assert_eq!(intent.work_class, expected);
+    }
+    Ok(())
+}
+
+// WORK_UNIT_CASE: 872/30 — I14.1 work classes (issue #1698). An unknown class
+// is unrepresentable in the `WorkClass` boundary type: the validated
+// constructor rejects with the typed coordinator error at decode ingress
+// before any definition is frozen, so no reservation is staged, no launch
+// occurs, no capacity is consumed, and no silent default is substituted.
+#[test]
+fn work_class_unknown_rejects_before_launch_without_capacity() -> TestResult {
+    let route = test_route()?;
+    let world = test_world(
+        Some(route.clone()),
+        AdmitMode::Admit,
+        ActivateMode::Activate,
+        EgressMode::Ack,
+        false,
+    )?;
+    let fence = test_fence()?;
+    let request = test_request(&fence, &route, "candidate-1698-unknown")?;
+    // The wire `String` converts solely through the validated constructor.
+    match WorkClass::parse_wire("proton") {
+        Err(eliot_agent_coordinator::CoordinatorError::UnknownWorkClass(value)) => {
+            assert_eq!(value, "proton");
+        }
+        other => return Err(format!("unknown class must reject typed, got {other:?}").into()),
+    }
+    // The same rejection fires at serde ingress for a request-shaped payload.
+    let mut tampered = serde_json::to_value(&request).map_err(|error| format!("encode: {error}"))?;
+    tampered["work_class"] = serde_json::json!("proton");
+    let decoded: Result<StaffingPlanRequest, _> = serde_json::from_value(tampered);
+    let message = decoded.err().map(|error| error.to_string()).unwrap_or_default();
+    assert!(
+        message.contains("unknown work class: proton"),
+        "decode must reject unknown class, got {message:?}"
+    );
+    assert_eq!(counter_value(&world.admission.stage_calls), 0);
+    assert_eq!(counter_value(&world.admission.commit_calls), 0);
     Ok(())
 }

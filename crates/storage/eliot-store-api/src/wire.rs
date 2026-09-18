@@ -524,9 +524,6 @@ pub enum StoreResponse {
         operation_id: OperationId,
         reason: String,
     },
-    Error {
-        error: String,
-    },
 }
 
 impl StoreResponse {
@@ -633,7 +630,6 @@ impl StoreResponse {
                 .validate()
                 .map_err(|error| StoreWireError::Invalid(error.to_string())),
             Self::Unknown { reason, .. } => validate_legacy_failure_text(reason, "unknown.reason"),
-            Self::Error { error } => validate_legacy_failure_text(error, "error"),
         }
     }
 }

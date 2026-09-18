@@ -3195,7 +3195,17 @@ pub const HOST_REQUEST_INVOKE_READ_WIRE_VERSION: u16 = 1;
 /// Stable wire identity for a P-04 host-request result body.
 pub const HOST_REQUEST_RESULT_BODY_WIRE_ID: &str = "eliot.protocol.host-request-result-body";
 /// Current host-request result body wire version.
-pub const HOST_REQUEST_RESULT_BODY_WIRE_VERSION: u16 = 1;
+///
+/// Version 2 carries the governed attempt binding (`attempt`): the
+/// Kernel-issued fenced capability the completing daemon must present. Stored
+/// version-1 rows predate attempt ownership and still decode (the field
+/// defaults to `None`); the Kernel claim/submit legs require a current attempt
+/// and never accept a body without one.
+pub const HOST_REQUEST_RESULT_BODY_WIRE_VERSION: u16 = 2;
+/// Stable wire identity for a Kernel-issued local-read attempt capability.
+pub const LOCAL_READ_ATTEMPT_WIRE_ID: &str = "eliot.protocol.local-read-attempt";
+/// Current local-read attempt capability wire version.
+pub const LOCAL_READ_ATTEMPT_WIRE_VERSION: u16 = 1;
 
 /// Versioned P-04 invoke-read payload: one exact envelope plus the exact
 /// canonical tool bytes it admits (Implements #18: local read result).
@@ -3271,7 +3281,7 @@ impl HostRequestInvokeReadPayload {
 }
 
 /// Versioned P-04 result body: the exact bounded answer bound to one admitted
-/// envelope (Implements #18: local read result).
+/// envelope (Implements #18: local read result) and to one governed attempt.
 ///
 /// Carries the opaque bounded response JSON (payload plus revision inside its
 /// content, preserved verbatim from the read owner) with the digests binding
@@ -3279,6 +3289,13 @@ impl HostRequestInvokeReadPayload {
 /// hard structured-response ceiling, and its canonical digest must equal
 /// `result_digest`; a changed payload digest or forged body is rejected
 /// before reading.
+///
+/// The optional `attempt` carries the Kernel-minted fenced attempt capability
+/// for the completing daemon (see [`LocalReadAttempt`]). It is optional on
+/// the wire only so stored pre-ownership rows still decode for exact-replay
+/// readback; every daemon read-port call and result submission must present
+/// the current attempt, enforced by the Kernel legs rather than by shape
+/// validation alone.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct HostRequestResultBody {
@@ -3294,6 +3311,11 @@ pub struct HostRequestResultBody {
     pub result_digest: String,
     /// Exact bounded response JSON (answer payload plus revision).
     pub response: Value,
+    /// Governed attempt binding for the completing daemon. `None` only for
+    /// stored rows that predate attempt ownership; submissions must carry the
+    /// current attempt.
+    #[serde(default)]
+    pub attempt: Option<LocalReadAttempt>,
 }
 
 impl HostRequestResultBody {
@@ -3356,6 +3378,147 @@ impl HostRequestResultBody {
             return Err(ProtocolError::InvalidField {
                 field: "host_request_result_body.result_digest",
                 reason: "result digest does not bind the exact response bytes",
+            });
+        }
+        if let Some(attempt) = &self.attempt {
+            attempt.validate()?;
+            if attempt.operation_id != self.operation_id {
+                return Err(ProtocolError::InvalidField {
+                    field: "host_request_result_body.attempt",
+                    reason: "attempt does not bind the exact operation handle",
+                });
+            }
+        }
+        Ok(())
+    }
+}
+
+/// Kernel-issued fenced attempt capability for one queued local read.
+///
+/// Replaces the former time-only claim lease: the Kernel mints exactly one
+/// current attempt per queued operation, with a monotonically increasing
+/// fencing generation per operation and a boot-unique attempt identity, and
+/// only the current generation may complete. The daemon must present this
+/// capability verbatim on every read-port call (`local_read`) and on the
+/// result submission (`local_read_result`); the Kernel legs re-check every
+/// field against the live claim record, so a late, duplicate, reassigned, or
+/// revoked attempt fails as a stale noncanonical observation instead of
+/// binding a waiting caller.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct LocalReadAttempt {
+    /// Capability wire identity.
+    pub wire_id: String,
+    /// Capability wire version.
+    pub wire_version: u16,
+    /// Kernel-derived opaque operation handle (`hostreq:` + envelope digest):
+    /// the work-item identity this attempt may complete.
+    pub operation_id: String,
+    /// Boot-unique attempt identity minted by the Kernel at claim. Never
+    /// reused across claims, restarts, or generations.
+    pub attempt_id: String,
+    /// Monotonic fencing generation for this operation, starting at 1. Only
+    /// the current generation may complete or extend the attempt.
+    pub fencing_generation: u64,
+    /// Admitted envelope session binding (I15.2 principal/session binding).
+    pub session_id: String,
+    /// Authority epoch observed at claim; rotation invalidates the attempt.
+    pub authority_epoch: EpochId,
+    /// Trusted Kernel-issued scope the read is admitted for.
+    pub scope_id: String,
+    /// Exact facet method admitted for this attempt (`eliot.query`).
+    pub facet_method: String,
+    /// Absolute expiry: the admitted envelope deadline. Elapsed expiry is the
+    /// expected race and projects as expiry, never as authority.
+    pub expires_at_unix_ms: u64,
+    /// Remaining completions this attempt may produce. Exactly one: a
+    /// persisted completion retires the attempt.
+    pub use_budget: u32,
+}
+
+impl LocalReadAttempt {
+    /// Current attempt capability contract version.
+    pub const CONTRACT_VERSION: u16 = LOCAL_READ_ATTEMPT_WIRE_VERSION;
+
+    /// Validates the closed capability shape. Currency (current generation,
+    /// live owner, live epoch) is owned by the Kernel claim record, never by
+    /// shape validation alone.
+    pub fn validate(&self) -> Result<(), ProtocolError> {
+        if self.wire_id != LOCAL_READ_ATTEMPT_WIRE_ID
+            || self.wire_version != Self::CONTRACT_VERSION
+        {
+            return Err(ProtocolError::InvalidField {
+                field: "local_read_attempt.wire",
+                reason: "unsupported local-read attempt capability",
+            });
+        }
+        bounded_text(
+            &self.operation_id,
+            "local_read_attempt.operation_id",
+            MAX_HOST_REQUEST_TEXT_BYTES,
+        )?;
+        if !self
+            .operation_id
+            .strip_prefix("hostreq:")
+            .is_some_and(|digest| {
+                digest.len() == 64
+                    && digest
+                        .bytes()
+                        .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+            })
+        {
+            return Err(ProtocolError::InvalidField {
+                field: "local_read_attempt.operation_id",
+                reason: "must be the deterministic opaque handle for the envelope digest",
+            });
+        }
+        bounded_text(
+            &self.attempt_id,
+            "local_read_attempt.attempt_id",
+            MAX_HOST_REQUEST_TEXT_BYTES,
+        )?;
+        if self.attempt_id == self.operation_id {
+            return Err(ProtocolError::InvalidField {
+                field: "local_read_attempt.attempt_id",
+                reason: "attempt identity must not reuse the operation handle",
+            });
+        }
+        if self.fencing_generation == 0 {
+            return Err(ProtocolError::InvalidField {
+                field: "local_read_attempt.fencing_generation",
+                reason: "fencing generation must be positive",
+            });
+        }
+        bounded_text(
+            &self.session_id,
+            "local_read_attempt.session_id",
+            MAX_HOST_REQUEST_TEXT_BYTES,
+        )?;
+        eliot_contracts::epoch_identity_digest(&self.authority_epoch)
+            .map_err(|_| ProtocolError::InvalidField {
+                field: "local_read_attempt.authority_epoch",
+                reason: "authority epoch is not a valid epoch",
+            })?;
+        bounded_text(
+            &self.scope_id,
+            "local_read_attempt.scope_id",
+            MAX_HOST_REQUEST_TEXT_BYTES,
+        )?;
+        bounded_text(
+            &self.facet_method,
+            "local_read_attempt.facet_method",
+            MAX_HOST_REQUEST_TEXT_BYTES,
+        )?;
+        if self.expires_at_unix_ms == 0 {
+            return Err(ProtocolError::InvalidField {
+                field: "local_read_attempt.expires_at_unix_ms",
+                reason: "attempt expiry must be greater than zero",
+            });
+        }
+        if self.use_budget == 0 {
+            return Err(ProtocolError::InvalidField {
+                field: "local_read_attempt.use_budget",
+                reason: "attempt use budget must be positive",
             });
         }
         Ok(())

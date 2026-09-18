@@ -15,7 +15,7 @@ use eliot_dreamer_contracts::{
     ConceptNeighborhood, ConceptParameter, ConceptProposal, ConceptSnapshot,
     ConceptSourceDenominator, ConceptSourceRef, ConceptSourceSet, ConceptVerifierRef,
     ContractViolation, CurationAcceptanceCtx, CurationFamily, CurationKind, CurationPayload,
-    DreamInputBundle, DreamJobInput, GroundedDreamDraft, JobClass, NamedEvidence,
+    DreamInputBundle, DreamJobAdmission, GroundedDreamDraft, JobClass, NamedEvidence,
     RelationPreservation, RelationPreservationDimension, RelationPreservationVerdict, Requester,
     RequesterOrigin, ScreenBinding, ScreenState, SupportState, TargetDenominator,
     TypedCurationHandlerRequest, ValidatedCurationItem, ValidationReceipt, canonical_bytes,
@@ -162,8 +162,8 @@ struct Fixture {
     context: CurationAcceptanceCtx<'static>,
 }
 
-fn fixture_job() -> DreamJobInput {
-    DreamJobInput {
+fn fixture_job() -> DreamJobAdmission {
+    DreamJobAdmission {
         schema_version: 1,
         job_class: JobClass::Curation,
         requester: Requester {
@@ -213,7 +213,7 @@ fn fixture_source() -> ConceptSourceRef {
     }
 }
 
-fn fixture_receipt(job: &DreamJobInput) -> ValidationReceipt {
+fn fixture_receipt(job: &DreamJobAdmission) -> ValidationReceipt {
     ValidationReceipt {
         schema_version: 1,
         validator_contract: "a05".to_owned(),
@@ -338,7 +338,7 @@ fn fixture_request(
 fn fixture_item(
     receipt: &ValidationReceipt,
     grounded: &GroundedDreamDraft,
-    job: &DreamJobInput,
+    job: &DreamJobAdmission,
     source: &ConceptSourceRef,
     payload: &CurationPayload,
     denominator: &TargetDenominator,

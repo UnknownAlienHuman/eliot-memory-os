@@ -661,7 +661,7 @@ pub fn classification_input_digest(
 
 #[derive(Serialize)]
 struct AcceptanceContextWire<'a> {
-    job: &'a crate::job::DreamJobInput,
+    job: &'a crate::job::DreamJobAdmission,
     bundle: &'a crate::bundle::DreamInputBundle,
     receipt: &'a crate::draft::ValidationReceipt,
     screen: &'a ScreenBinding,

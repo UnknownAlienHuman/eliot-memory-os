@@ -18,8 +18,8 @@ use std::collections::BTreeMap;
 
 use eliot_contracts::StateFence;
 use eliot_kernel_service::AuthenticatedHostSession;
-use eliot_ors::{OperationIdentity, OrsError};
-use eliot_protocol::{HostRequestEnvelope, HostRequestResultBody, host_request_operation_id};
+use eliot_protocol::{HostRequestEnvelope, HostRequestResultBody, LocalReadAttempt,
+    host_request_operation_id};
 use eliot_store_api::{
     CanonicalRequestView, NamedReadOperation, NamedReadRequest, NamedReadResponse,
     OrderingHeadExpectation, PreparedTransition, ReadConsistency, RequestMeta,
@@ -110,12 +110,15 @@ struct StoreNamedOperation {
 /// Carries the exact admitted envelope plus the exact canonical tool bytes it
 /// admits — the same linkage-checked pair as the invoke-read frame payload —
 /// so the read leg re-proves capability + payload-digest binding before any
-/// Gateway IO. `eliot.packet` pairs decode here but are admitted, never read.
+/// Gateway IO. The Kernel-issued attempt capability is required: the sync leg
+/// never mints authority and never bypasses the claim record. `eliot.packet`
+/// pairs decode here but are admitted, never read.
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct LocalReadOperation {
     envelope: HostRequestEnvelope,
     tool: serde_json::Value,
+    attempt: LocalReadAttempt,
 }
 
 #[derive(Deserialize)]
@@ -443,19 +446,22 @@ impl KernelComposition {
             }
             "local_read_claim" => {
                 // Outbound-only eliotd poller for admitted `eliot.query` pairs
-                // (Implements #18): mirrors `agent_activation_claim` exactly —
+                // (Implements #18): mirrors `agent_activation_claim` —
                 // same session/auth/ready/fence gates via the dispatcher head
                 // and `frame_dispatch` allowlist, same single-`operation`-key
-                // payload shape, same null poll (not error) when empty.
+                // payload shape, same null poll (not error) when empty. The
+                // claimed pair carries the Kernel-minted fenced attempt
+                // capability the daemon must present back on the read leg and
+                // the submit leg; no time lease is involved.
                 #[cfg(windows)]
                 {
                     if payload.as_object().is_none_or(|object| object.len() != 1) {
                         return Err(TransportError::SessionFenced);
                     }
-                    self.claim_local_read_pair().map(|pair| match pair {
-                        Some((envelope, tool)) => serde_json::json!({
+                    self.claim_local_read_pair(session).map(|pair| match pair {
+                        Some((envelope, tool, attempt)) => serde_json::json!({
                             "status": "known",
-                            "value": { "pair": { "envelope": envelope, "tool": tool } },
+                            "value": { "pair": { "envelope": envelope, "tool": tool, "attempt": attempt } },
                             "recovery": null,
                         }),
                         None => serde_json::json!({
@@ -475,11 +481,15 @@ impl KernelComposition {
                 // Daemon submit leg for the claimed pair (Implements #18):
                 // validates plus fence-checks the submitted
                 // `HostRequestResultBody` and binds it to the waiting host
-                // request through the ORS result path. Exact replay stays
-                // idempotent (even across deadline expiry); a changed body
-                // under the same identity conflicts; an elapsed deadline is
-                // the expected race and projects as a known expired outcome
-                // so the caller retains liveness without parsing errors.
+                // request through the ORS result path. Only the current
+                // fencing generation presented by the owning session persists;
+                // a late, duplicate, or revoked attempt projects as a known
+                // stale outcome (never a bound result, never a transport
+                // error). Exact replay stays idempotent (even across deadline
+                // expiry); a changed body under the same identity conflicts;
+                // an elapsed deadline is the expected race and projects as a
+                // known expired outcome so the caller retains liveness without
+                // parsing errors.
                 #[cfg(windows)]
                 {
                     let result_value = payload
@@ -489,7 +499,12 @@ impl KernelComposition {
                     let body: HostRequestResultBody = serde_json::from_value(result_value)
                         .map_err(|_| TransportError::SessionFenced)?;
                     match self.submit_local_read_result(session, &body) {
-                        Ok(_) => Ok(Self::accepted_daemon_response()),
+                        Ok(host_request_route::LocalReadSubmitDisposition::Persisted(_)) => {
+                            Ok(Self::accepted_daemon_response())
+                        }
+                        Ok(host_request_route::LocalReadSubmitDisposition::StaleAttempt(
+                            observation,
+                        )) => Ok(Self::stale_attempt_daemon_response(&observation)),
                         Err(TransportError::Timeout) => {
                             Ok(Self::expired_activation_daemon_response())
                         }
@@ -561,6 +576,30 @@ impl KernelComposition {
         serde_json::json!({
             "status": "known",
             "value": { "accepted": false, "expired": true },
+            "recovery": null,
+        })
+    }
+
+    /// Typed outcome for a stale local-read submit: a late, duplicate, or
+    /// revoked attempt quarantined as a noncanonical observation.
+    ///
+    /// Carries the audit receipt (operation, presented/current generation,
+    /// stable reason code) so the caller can distinguish replacement from
+    /// revocation without parsing error strings; the waiter never observes
+    /// the stale result.
+    fn stale_attempt_daemon_response(
+        observation: &host_request_route::StaleLocalReadObservation,
+    ) -> serde_json::Value {
+        serde_json::json!({
+            "status": "known",
+            "value": {
+                "accepted": false,
+                "stale": true,
+                "reason": observation.reason.as_str(),
+                "operation_id": observation.operation_id,
+                "presented_generation": observation.presented_generation,
+                "current_generation": observation.current_generation,
+            },
             "recovery": null,
         })
     }
@@ -801,13 +840,18 @@ impl KernelComposition {
     /// linkage plus closed selectors are proven (pure, no IO), then the full
     /// admission gate runs, then an exact replay of a resulted operation
     /// serves its stored bounded body without re-dispatch and without Gateway
-    /// IO. Only a fresh admitted query reaches the Gateway, over the admitted
+    /// IO, then the presented attempt capability is proven current against
+    /// the live claim record before any Gateway IO. Only a fresh admitted
+    /// query with a current attempt reaches the Gateway, over the admitted
     /// fence with the explicit scope, exact subject, and catalogue-bound
     /// `max_records`; the bounded answer is projected through the MCP
-    /// evidence-pack projection and persisted through the ORS result path, so
-    /// the bridge readback and later replays answer `Responded` with the exact
-    /// record instead of a bare `Accepted` admission. `eliot.packet` pairs
-    /// are admitted and returned honestly, never read on this leg.
+    /// evidence-pack projection and completed through the shared submit gate
+    /// ([`KernelComposition::submit_local_read_result`]), so the sync leg can
+    /// never bypass attempt ownership: persistence, exact-replay, conflict,
+    /// expiry, fence, and staleness joins are identical to the async submit
+    /// leg. A stale attempt fails closed here (never a bound result);
+    /// `eliot.packet` pairs are admitted and returned honestly, never read on
+    /// this leg.
     #[cfg(windows)]
     #[allow(
         clippy::too_many_lines,
@@ -818,11 +862,16 @@ impl KernelComposition {
         session: &Session,
         payload: serde_json::Value,
     ) -> Result<serde_json::Value, TransportError> {
-        // Closed decode first: unknown fields never reach the read leg.
+        // Closed decode first: unknown fields never reach the read leg, and a
+        // read without the Kernel-issued attempt capability never decodes.
         let operation: LocalReadOperation =
             serde_json::from_value(payload).map_err(|_| TransportError::SessionFenced)?;
         let envelope = operation.envelope;
         let tool = operation.tool;
+        let attempt = operation.attempt;
+        attempt
+            .validate()
+            .map_err(|_| TransportError::SessionFenced)?;
         // Rejection-before-reading: linkage plus closed selectors next. This
         // validation is pure, so a changed payload digest, a forged
         // descriptor, or a malformed selector never reaches Gateway IO.
@@ -838,6 +887,26 @@ impl KernelComposition {
                 &receipt, &record,
             ));
         };
+        // No bypass: the presented attempt must be the live claim-record
+        // attempt owned by the presenting session before any Gateway IO. A
+        // replaced, retired, or revoked attempt fails closed here. Full
+        // capability equality proves every echoed field is exactly what the
+        // Kernel minted for this envelope; a substituted echo fails closed.
+        let operation_id = host_request_operation_id(&envelope);
+        let live = self.live_local_read_attempt(&operation_id, &envelope.envelope_sha256)?;
+        let current = match live {
+            Some(state)
+                if state.attempt_id == attempt.attempt_id
+                    && state.generation == attempt.fencing_generation
+                    && state.is_owned_by(session) =>
+            {
+                state
+            }
+            _ => return Err(TransportError::SessionFenced),
+        };
+        if attempt != self.local_read_attempt_capability(&envelope, &operation_id, &current)? {
+            return Err(TransportError::SessionFenced);
+        }
         let mut parameters = BTreeMap::new();
         parameters.insert(
             "subject".to_owned(),
@@ -878,29 +947,33 @@ impl KernelComposition {
             response.payload,
         )
         .map_err(|_| TransportError::SessionFenced)?;
-        let operation_id = OperationIdentity::new(host_request_operation_id(&envelope))
+        // The sync leg completes through the shared submit gate, never
+        // through a private persist: attempt currency, deadline, fence, and
+        // staleness joins are identical to the async submit leg. A concurrent
+        // invalidation between the pre-check above and this commit surfaces
+        // as stale and fails closed; only the current attempt persists.
+        let submission = HostRequestResultBody {
+            wire_id: eliot_protocol::HOST_REQUEST_RESULT_BODY_WIRE_ID.to_owned(),
+            wire_version: HostRequestResultBody::CONTRACT_VERSION,
+            operation_id: operation_id.clone(),
+            request_sha256: envelope.envelope_sha256.clone(),
+            result_digest: digest,
+            response: body,
+            attempt: Some(attempt),
+        };
+        submission
+            .validate()
             .map_err(|_| TransportError::SessionFenced)?;
-        self.generation_gateway
-            .ors
-            .persist_host_request_result(&operation_id, &envelope.envelope_sha256, &digest, &body)
-            .map_err(|error| match error {
-                OrsError::HostRequestIdentityConflict { .. } => TransportError::IdentityConflict,
-                _ => TransportError::SessionFenced,
-            })?
-            .ok_or(TransportError::SessionFenced)?;
-        let resulted = self
-            .generation_gateway
-            .ors
-            .load_host_request(&operation_id, &envelope.envelope_sha256)
-            .map_err(|_| TransportError::SessionFenced)?
-            .ok_or(TransportError::SessionFenced)?;
+        let resulted = match self.submit_local_read_result(session, &submission)? {
+            host_request_route::LocalReadSubmitDisposition::Persisted(record) => record,
+            host_request_route::LocalReadSubmitDisposition::StaleAttempt(_) => {
+                return Err(TransportError::SessionFenced);
+            }
+        };
         if host_request_route::local_read_replay_response(&receipt, &resulted, &envelope)?.is_none()
         {
             return Err(TransportError::SessionFenced);
         }
-        // The sync leg answered this operation: retire any queued async pair
-        // for it so a later `local_read_claim` poll skips it without store IO.
-        self.retire_local_read_pair(operation_id.as_str(), &envelope.envelope_sha256);
         Ok(host_request_route::host_request_admitted_response(
             &receipt, &resulted,
         ))
@@ -1132,23 +1205,56 @@ mod local_read_dispatch_tests {
     fn local_read_operation_rejects_unknown_fields() {
         let tool = query_tool();
         let envelope = test_envelope("eliot.query", &tool_digest(&tool));
-        let valid = serde_json::json!({"envelope": envelope, "tool": tool});
+        let operation_id = eliot_protocol::host_request_operation_id(&envelope);
+        let authority_epoch =
+            serde_json::to_value(envelope.state_fence.clone()).expect("fence encodes")
+                ["authority_epoch"]
+                .clone();
+        let attempt = serde_json::json!({
+            "wire_id": eliot_protocol::LOCAL_READ_ATTEMPT_WIRE_ID,
+            "wire_version": eliot_protocol::LocalReadAttempt::CONTRACT_VERSION,
+            "operation_id": operation_id,
+            "attempt_id": format!("{operation_id}:attempt:1:1:1"),
+            "fencing_generation": 1,
+            "session_id": "kernel-session-1",
+            "authority_epoch": authority_epoch,
+            "scope_id": "kernel-session-1",
+            "facet_method": "eliot.query",
+            "expires_at_unix_ms": 2_000_000,
+            "use_budget": 1,
+        });
+        let valid = serde_json::json!({"envelope": envelope, "tool": tool, "attempt": attempt});
         let decoded: LocalReadOperation =
-            serde_json::from_value(valid).expect("closed envelope+tool pair must decode");
+            serde_json::from_value(valid).expect("closed envelope+tool+attempt must decode");
         assert_eq!(decoded.tool, tool);
         assert_eq!(
             decoded.envelope.envelope_sha256, envelope.envelope_sha256,
             "the admitted digest rides the closed carrier"
         );
+        assert_eq!(
+            decoded.attempt.operation_id, operation_id,
+            "the attempt binds the exact operation handle"
+        );
 
         let widened = serde_json::json!({
             "envelope": envelope,
             "tool": tool,
+            "attempt": attempt,
             "unknown_field": null,
         });
         assert!(
             serde_json::from_value::<LocalReadOperation>(widened).is_err(),
             "deny_unknown_fields must reject a widened local-read envelope"
+        );
+
+        // A read without the attempt capability never decodes: no bypass.
+        let missing = serde_json::json!({
+            "envelope": envelope,
+            "tool": tool,
+        });
+        assert!(
+            serde_json::from_value::<LocalReadOperation>(missing).is_err(),
+            "a local-read call without the attempt capability must not decode"
         );
     }
 

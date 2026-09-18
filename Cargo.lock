@@ -712,6 +712,7 @@ dependencies = [
  "eliot-agent-contracts",
  "eliot-contracts",
  "eliot-evaluation-contracts",
+ "eliot-kernel-core",
  "eliot-kernel-service",
  "eliot-receipts",
  "eliot-security-contracts",
@@ -795,6 +796,7 @@ dependencies = [
  "eliot-contracts",
  "eliot-security-contracts",
  "eliot-store-api",
+ "eliot-store-memory",
  "serde",
  "serde_json",
  "thiserror",
@@ -1219,10 +1221,14 @@ name = "eliot-dreamer"
 version = "0.1.0"
 dependencies = [
  "eliot-cli",
+ "eliot-context-contracts",
  "eliot-contracts",
  "eliot-dreamer-bundle",
  "eliot-dreamer-candidate-validation",
  "eliot-dreamer-claim-grounding",
+ "eliot-dreamer-contracts",
+ "eliot-dreamer-curation",
+ "eliot-dreamer-cycle",
  "eliot-dreamer-orientation",
  "eliot-dreamer-probe-plan",
  "eliot-dreamer-rival-model",
@@ -1233,6 +1239,30 @@ dependencies = [
  "serde",
  "serde_json",
  "thiserror",
+]
+
+[[package]]
+name = "eliot-dreamer-accessibility"
+version = "0.1.0"
+dependencies = [
+ "eliot-contracts",
+ "eliot-dreamer-contracts",
+ "eliot-evidence",
+ "schemars",
+ "serde",
+]
+
+[[package]]
+name = "eliot-dreamer-architecture-brief"
+version = "0.1.0"
+dependencies = [
+ "eliot-contracts",
+ "eliot-dreamer-contracts",
+ "eliot-epistemic-contracts",
+ "eliot-receipts",
+ "schemars",
+ "serde",
+ "serde_json",
 ]
 
 [[package]]
@@ -1263,6 +1293,18 @@ name = "eliot-dreamer-claim-grounding"
 version = "0.1.0"
 dependencies = [
  "eliot-dreamer-contracts",
+]
+
+[[package]]
+name = "eliot-dreamer-clarification"
+version = "0.1.0"
+dependencies = [
+ "eliot-contracts",
+ "eliot-dreamer-contracts",
+ "schemars",
+ "serde",
+ "serde_json",
+ "thiserror",
 ]
 
 [[package]]
@@ -1336,10 +1378,22 @@ version = "0.1.0"
 dependencies = [
  "blake3",
  "eliot-contracts",
+ "eliot-dreamer-contracts",
  "schemars",
  "serde",
  "serde_json",
  "thiserror",
+]
+
+[[package]]
+name = "eliot-dreamer-curation"
+version = "0.1.0"
+dependencies = [
+ "eliot-contracts",
+ "eliot-dreamer-contracts",
+ "eliot-evidence",
+ "schemars",
+ "serde",
 ]
 
 [[package]]
@@ -1381,12 +1435,50 @@ dependencies = [
 ]
 
 [[package]]
+name = "eliot-dreamer-failure"
+version = "0.1.0"
+dependencies = [
+ "eliot-contracts",
+ "eliot-dreamer-contracts",
+ "eliot-evidence",
+ "eliot-receipts",
+ "schemars",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
+name = "eliot-dreamer-implementation-brief"
+version = "0.1.0"
+dependencies = [
+ "eliot-conformance-contracts",
+ "eliot-contracts",
+ "eliot-dreamer-contracts",
+ "eliot-epistemic-contracts",
+ "eliot-receipts",
+ "serde",
+ "serde_json",
+ "thiserror",
+]
+
+[[package]]
 name = "eliot-dreamer-maintenance-plan"
 version = "0.1.0"
 dependencies = [
  "eliot-contracts",
  "eliot-dreamer-contracts",
  "eliot-evidence",
+]
+
+[[package]]
+name = "eliot-dreamer-memory-repair"
+version = "0.1.0"
+dependencies = [
+ "eliot-contracts",
+ "eliot-dreamer-contracts",
+ "eliot-evidence",
+ "schemars",
+ "serde",
 ]
 
 [[package]]
@@ -1431,6 +1523,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "eliot-dreamer-reconsolidation"
+version = "0.1.0"
+dependencies = [
+ "eliot-contracts",
+ "eliot-dreamer-contracts",
+ "eliot-evidence",
+ "schemars",
+ "serde",
+]
+
+[[package]]
 name = "eliot-dreamer-relation"
 version = "0.1.0"
 dependencies = [
@@ -1457,6 +1560,15 @@ dependencies = [
  "eliot-evaluation-contracts",
  "serde",
  "serde_json",
+]
+
+[[package]]
+name = "eliot-dreamer-structure-repair"
+version = "0.1.0"
+dependencies = [
+ "eliot-contracts",
+ "eliot-dreamer-contracts",
+ "eliot-evidence",
 ]
 
 [[package]]
@@ -1933,6 +2045,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "eliot-learning-activation-assessment"
+version = "0.1.0"
+dependencies = [
+ "eliot-contracts",
+ "eliot-evidence",
+ "eliot-learning-contracts",
+ "schemars",
+ "serde",
+ "serde_json",
+ "thiserror",
+]
+
+[[package]]
 name = "eliot-learning-contracts"
 version = "0.1.0"
 dependencies = [
@@ -1944,6 +2069,40 @@ dependencies = [
  "serde",
  "serde_json",
  "thiserror",
+]
+
+[[package]]
+name = "eliot-learning-delta"
+version = "0.1.0"
+dependencies = [
+ "eliot-contracts",
+ "eliot-evidence",
+ "eliot-instrument-api",
+ "eliot-learning-contracts",
+ "schemars",
+ "serde",
+ "serde_json",
+ "thiserror",
+]
+
+[[package]]
+name = "eliot-learning-overlay"
+version = "0.1.0"
+dependencies = [
+ "eliot-agent-contracts",
+ "eliot-contracts",
+ "eliot-evidence",
+ "eliot-learning-contracts",
+ "thiserror",
+]
+
+[[package]]
+name = "eliot-learning-state-view"
+version = "0.1.0"
+dependencies = [
+ "eliot-contracts",
+ "eliot-evidence",
+ "eliot-learning-contracts",
 ]
 
 [[package]]
@@ -2456,6 +2615,17 @@ dependencies = [
  "eliot-evidence",
  "eliot-receipts",
  "schemars",
+ "serde",
+ "serde_json",
+ "thiserror",
+]
+
+[[package]]
+name = "eliot-self-quality"
+version = "0.1.0"
+dependencies = [
+ "eliot-conformance-contracts",
+ "eliot-contracts",
  "serde",
  "serde_json",
  "thiserror",

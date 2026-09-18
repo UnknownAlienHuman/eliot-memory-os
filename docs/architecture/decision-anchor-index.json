@@ -1,6 +1,6 @@
 {
   "schema_version": "eliot-decision-anchor-index-v1",
-  "normative_pair_key": "sha256:105558fc8957e150fab407b4fc5818ec49dc784f23f246f42dc9d3ca5843196b",
+  "normative_pair_key": "sha256:3ea4dc3442f03d3a0020380854d45cdf20c9d5098197e0bfe1e80cf6f2b805ea",
   "architecture_source_sha256": "c6932eaf26935e752eefb4de591afc91ea1a7180be5a8ff0005554b8029bac1a",
   "architecture_manifest_path": "docs/architecture/architecture/manifest.json",
   "architecture_manifest_git_blob_sha1": "3714202509c5437e2569cb2487915d1257339812",

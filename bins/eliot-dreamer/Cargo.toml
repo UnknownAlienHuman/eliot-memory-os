@@ -17,6 +17,9 @@ path = "src/main.rs"
 eliot-cli.workspace = true
 eliot-contracts.workspace = true
 eliot-dreamer-bundle = { path = "../../crates/smart/eliot-dreamer-bundle" }
+eliot-dreamer-contracts = { path = "../../crates/smart/eliot-dreamer-contracts" }
+eliot-dreamer-curation = { path = "../../crates/smart/eliot-dreamer-curation" }
+eliot-dreamer-cycle = { path = "../../crates/smart/eliot-dreamer-cycle" }
 eliot-dreamer-candidate-validation = { path = "../../crates/smart/eliot-dreamer-candidate-validation" }
 eliot-dreamer-claim-grounding = { path = "../../crates/smart/eliot-dreamer-claim-grounding" }
 eliot-dreamer-probe-plan = { path = "../../crates/smart/eliot-dreamer-probe-plan" }
@@ -32,3 +35,6 @@ thiserror.workspace = true
 
 [lints]
 workspace = true
+
+[dev-dependencies]
+eliot-context-contracts = { path = "../../crates/smart/eliot-context-contracts" }

@@ -10,6 +10,11 @@ description = "Role-separated source assurance over frozen Research evidence set
 [lib]
 path = "src/lib.rs"
 
+[package.metadata.eliot]
+prototype = true
+source_status = "IMPLEMENTED"
+workspace_admission = "pending_agent_implementation_and_proof"
+
 [dependencies]
 blake3 = "=1.8.5"
 schemars = { version = "=1.2.1", features = ["derive"] }

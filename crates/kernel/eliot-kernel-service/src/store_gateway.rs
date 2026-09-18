@@ -1412,8 +1412,9 @@ mod live_surreal_evidence_pack_e2e {
     };
     use eliot_platform_windows::{RetainedProcessPathLease, WindowsPlatform};
     use eliot_read::{
-        EliotResourceUri, QueryIntent, QueryMode, QueryRequest, ReadApi, ReadError, ReadService,
-        StateRequest,
+        BranchEnvironmentScope, FreshnessPolicy, NamedParameters, QueryIntent, QueryMode,
+        QueryRequest, ReadApi, ReadError, ReadService, RequiredAssurance, StateRequest,
+        StoreReadFailure, TimeScope,
     };
     use eliot_store_api::{
         EVIDENCE_PACK_MAX_RECORDS, EffectClass,
@@ -1524,34 +1525,28 @@ mod live_surreal_evidence_pack_e2e {
     fn verification_intent() -> QueryIntent {
         QueryIntent {
             mode: QueryMode::Verification,
-            time_scope: "t11-live-session-window".to_owned(),
-            branch_environment_scope: "t11-live-branch".to_owned(),
-            freshness_policy: "t11-live-exact-fence".to_owned(),
-            required_assurance: "t11-live-evidence-provenance".to_owned(),
+            time_scope: TimeScope::EvidenceWindow,
+            branch_environment_scope: BranchEnvironmentScope::LocalEnvironment,
+            freshness_policy: FreshnessPolicy::ExactFence,
+            required_assurance: RequiredAssurance::VerifierEvidence,
         }
     }
 
-    fn evidence_parameters(subject: &str, max_records: &str) -> BTreeMap<String, Value> {
-        BTreeMap::from([
+    fn evidence_parameters(subject: &str, max_records: &str) -> NamedParameters {
+        NamedParameters::from_map(BTreeMap::from([
             ("subject".to_owned(), Value::String(subject.to_owned())),
             (
                 "max_records".to_owned(),
                 Value::String(max_records.to_owned()),
             ),
-        ])
+        ]))
+        .expect("the evidence selectors satisfy the closed-selector bounds")
     }
 
-    fn live_query(
-        scope: &ScopeId,
-        subject: &str,
-        max_records: &str,
-        free_text: &str,
-    ) -> QueryRequest {
+    fn live_query(scope: &ScopeId, subject: &str, max_records: &str) -> QueryRequest {
         QueryRequest {
             intent: verification_intent(),
             operation: NamedReadOperation::GetEvidencePack,
-            query: free_text.to_owned(),
-            exact_resource_uri: None,
             scope_id: Some(scope.clone()),
             consistency: ReadConsistency::Eventual,
             dependency_revisions: BTreeMap::new(),
@@ -1737,15 +1732,20 @@ mod live_surreal_evidence_pack_e2e {
         let parts = build_adapter(&tag);
         let service = ReadService::new(parts.adapter);
 
-        // Free text is intent data only — a smuggled `query` selector fails
-        // the closed catalogue gate before any transport.
-        let mut smuggled = evidence_parameters(&subject, "10");
-        smuggled.insert("query".to_owned(), Value::String(subject.clone()));
+        // A retired `query` selector can no longer be built through
+        // `NamedParameters`, but the newtype is `#[serde(transparent)]` with a
+        // derived `Deserialize` that does not validate — so the wire can still
+        // present one. The gate that must hold is the service's, before any
+        // transport.
+        let smuggled = serde_json::from_value::<NamedParameters>(json!({
+            "subject": subject.clone(),
+            "max_records": "10",
+            "query": subject.clone(),
+        }))
+        .expect("wire-shaped named parameters deserialize without validation");
         let smuggled_request = QueryRequest {
             intent: verification_intent(),
             operation: NamedReadOperation::GetEvidencePack,
-            query: "unrelated prose".to_owned(),
-            exact_resource_uri: None,
             scope_id: Some(scope.clone()),
             consistency: ReadConsistency::Eventual,
             dependency_revisions: BTreeMap::new(),
@@ -1762,22 +1762,23 @@ mod live_surreal_evidence_pack_e2e {
                     .await,
                 Err(ReadError::DuplicateField(_))
             ),
-            "a smuggled `query` parameter must fail closed"
+            "a wire-smuggled `query` selector must fail closed at the service gate"
         );
 
         // Exact expansion belongs to `ResourceRequest`, never to
-        // `QueryRequest` — both the parameter key and the request-level
-        // selector fail closed on this path.
-        let mut smuggled_uri = evidence_parameters(&subject, "10");
-        smuggled_uri.insert(
-            "exact_resource_uri".to_owned(),
-            Value::String("eliot://evidence/pack".to_owned()),
-        );
+        // `QueryRequest`. The request-level selector is now structurally
+        // unrepresentable — `QueryRequest` has no `exact_resource_uri` field —
+        // so the only remaining bypass is the wire-decoded parameter key, and
+        // that is what this proves.
+        let smuggled_uri = serde_json::from_value::<NamedParameters>(json!({
+            "subject": subject.clone(),
+            "max_records": "10",
+            "exact_resource_uri": "eliot://evidence/pack",
+        }))
+        .expect("wire-shaped named parameters deserialize without validation");
         let smuggled_uri_request = QueryRequest {
             intent: verification_intent(),
             operation: NamedReadOperation::GetEvidencePack,
-            query: "unrelated prose".to_owned(),
-            exact_resource_uri: None,
             scope_id: Some(scope.clone()),
             consistency: ReadConsistency::Eventual,
             dependency_revisions: BTreeMap::new(),
@@ -1794,33 +1795,13 @@ mod live_surreal_evidence_pack_e2e {
                     .await,
                 Err(ReadError::DuplicateField(_))
             ),
-            "a smuggled `exact_resource_uri` parameter must fail closed"
+            "a wire-smuggled `exact_resource_uri` selector must fail closed at the service gate"
         );
-        let request_level_uri = QueryRequest {
-            intent: verification_intent(),
-            operation: NamedReadOperation::GetEvidencePack,
-            query: "unrelated prose".to_owned(),
-            exact_resource_uri: Some(
-                EliotResourceUri::new("eliot://evidence/pack").expect("test URI parses"),
-            ),
-            scope_id: Some(scope.clone()),
-            consistency: ReadConsistency::Eventual,
-            dependency_revisions: BTreeMap::new(),
-            parameters: evidence_parameters(&subject, "10"),
-            provenance_handles: Vec::new(),
-        };
-        assert!(
-            matches!(
-                service
-                    .query(
-                        &live_context(&fence, &format!("query-request-uri-{tag}")),
-                        request_level_uri
-                    )
-                    .await,
-                Err(ReadError::InvalidField { .. })
-            ),
-            "a request-level `exact_resource_uri` must fail closed on the query path"
-        );
+        // Deleted with #1976: `QueryRequest` no longer has an
+        // `exact_resource_uri` field, so a request-level exact selector on the
+        // broad-query path is structurally unrepresentable. The invariant is
+        // held by the type, not by this assertion; the wire-smuggled parameter
+        // key above covers the one bypass that still exists.
 
         // `state()` owns current-state operations only — `GetEvidencePack`
         // is rejected before any transport.
@@ -1905,18 +1886,14 @@ mod live_surreal_evidence_pack_e2e {
         assert_eq!(receipt.state_fence, fence);
 
         // `eliot.query` acceptance: the Governor read facade over the SAME
-        // live adapter returns the exact record/provenance. Free text is
-        // deliberately unrelated prose — it must never become a selector.
+        // live adapter returns the exact record/provenance. Free text cannot
+        // be supplied at all now — the closed named operation and the closed
+        // selectors fully determine the read.
         let service = ReadService::new(adapter);
         let result = service
             .query(
                 &live_context(&fence, &format!("query-{tag}")),
-                live_query(
-                    &scope,
-                    &subject,
-                    "10",
-                    "summarize everything captured for the operator in prose",
-                ),
+                live_query(&scope, &subject, "10"),
             )
             .await
             .expect("live eliot.query reads its exact pack");
@@ -1966,15 +1943,14 @@ mod live_surreal_evidence_pack_e2e {
         let fenced = service
             .query(
                 &live_context(&wrong_fence(), &format!("query-wrong-fence-{tag}")),
-                live_query(&scope, &subject, "10", "unrelated prose"),
+                live_query(&scope, &subject, "10"),
             )
             .await;
         match fenced {
-            Err(ReadError::Store(message)) => assert!(
-                message.contains("state fence mismatch"),
-                "wrong-fence refusal must surface the typed mismatch, observed: {message}"
+            Err(ReadError::Store(StoreReadFailure::FenceMismatch)) => {}
+            other => panic!(
+                "wrong fence must fail closed with FenceMismatch, observed: {other:?}"
             ),
-            other => panic!("wrong fence must fail closed, observed: {other:?}"),
         }
 
         // Acceptance negative: exceeding the declared bound must not return
@@ -1982,20 +1958,14 @@ mod live_surreal_evidence_pack_e2e {
         let over_bound = service
             .query(
                 &live_context(&fence, &format!("query-over-bound-{tag}")),
-                live_query(
-                    &scope,
-                    &subject,
-                    &(EVIDENCE_PACK_MAX_RECORDS + 1).to_string(),
-                    "unrelated prose",
-                ),
+                live_query(&scope, &subject, &(EVIDENCE_PACK_MAX_RECORDS + 1).to_string()),
             )
             .await;
         match over_bound {
-            Err(ReadError::Store(message)) => assert!(
-                message.contains("payload exceeds named-operation limit"),
-                "over-bound refusal must surface the typed limit, observed: {message}"
+            Err(ReadError::Store(StoreReadFailure::PayloadTooLarge)) => {}
+            other => panic!(
+                "over-bound request must fail closed with PayloadTooLarge, observed: {other:?}"
             ),
-            other => panic!("over-bound request must fail closed, observed: {other:?}"),
         }
 
         // An admitted state operation still serves on the same live store
@@ -2009,7 +1979,7 @@ mod live_surreal_evidence_pack_e2e {
                     scope_id: None,
                     consistency: ReadConsistency::Eventual,
                     dependency_revisions: BTreeMap::new(),
-                    parameters: BTreeMap::new(),
+                    parameters: NamedParameters::new(),
                     provenance_handles: Vec::new(),
                 },
             )

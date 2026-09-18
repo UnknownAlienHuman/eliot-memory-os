@@ -130,12 +130,15 @@ fn start_activation_claim(
 
 /// Settled outcome of one local-read poll step (Implements #18: the eliotd
 /// half of the outbound-only `local_read_claim` / `local_read_result`
-/// poller). `IdleBackoff` is the null poll (empty queue, or every pair still
-/// leased/expired); `Accepted` / `Expired` mirror the typed submit outcome.
+/// poller). `IdleBackoff` is the null poll (empty queue, or every pair
+/// expired); `Accepted` / `Expired` / `StaleAttempt` mirror the typed submit
+/// outcome. A stale attempt idles like expiry: the quarantined capability is
+/// never retried, and the next tick claims the current generation anew.
 enum LocalReadPollOutcome {
     IdleBackoff,
     Accepted,
     Expired,
+    StaleAttempt,
 }
 
 /// Completion of one in-flight local-read step. Claim, forward, and submit
@@ -694,9 +697,10 @@ async fn next_local_read_completion(flight: &mut LocalReadFlight) -> LocalReadCo
 }
 
 /// Settles one completed local-read poll step back to idle. Every outcome —
-/// null-poll backoff, accepted persist, or the expected expiry race (the
-/// next claim reclaims the pair) — simply idles until the next tick; only a
-/// step failure fails the daemon closed.
+/// null-poll backoff, accepted persist, the expected expiry race, or a stale
+/// attempt quarantine (the next claim mints or returns the current
+/// generation) — simply idles until the next tick; only a step failure fails
+/// the daemon closed.
 fn settle_local_read_completion(
     completion: LocalReadCompletion,
     flight: &mut LocalReadFlight,
@@ -710,13 +714,15 @@ fn settle_local_read_completion(
     }
 }
 
-/// Runs one local-read poll step: `local_read_claim` (pair or null, 1000 ms
-/// Kernel lease, null means backoff), then
-/// [`forward_admitted_local_read`] for the admitted pair, then
-/// `local_read_result` with the returned [`HostRequestResultBody`]
-/// (accepted or the expected expiry race). Exact replays stay idempotent by
-/// Kernel contract. Any step failure fails the daemon closed — a claimed
-/// pair that cannot forward or submit is never silently discarded.
+/// Runs one local-read poll step: `local_read_claim` (pair plus fenced
+/// attempt capability, or null meaning backoff), then
+/// [`forward_admitted_local_read`] for the admitted pair under that attempt,
+/// then `local_read_result` with the returned [`HostRequestResultBody`]
+/// (accepted, the expected expiry race, or the stale-attempt quarantine).
+/// Exact replays stay idempotent by Kernel contract. Any step failure fails
+/// the daemon closed — a claimed pair that cannot forward or submit is never
+/// silently discarded. A stale capability is never retried: the step settles
+/// and the next tick claims the current generation anew.
 async fn run_local_read_poll(kernel: &DaemonKernelClient) -> Result<LocalReadPollOutcome, String> {
     // #740: receipt span over the claim/forward/submit poll step. Pair
     // presence and submit outcome are named; payload bytes never are.
@@ -725,15 +731,16 @@ async fn run_local_read_poll(kernel: &DaemonKernelClient) -> Result<LocalReadPol
         .claim_local_read_pair_async()
         .await
         .map_err(|error| format!("Kernel local-read pair claim: {error}"))?;
-    let Some((envelope, tool)) = pair else {
+    let Some((envelope, tool, attempt)) = pair else {
         return Ok(LocalReadPollOutcome::IdleBackoff);
     };
-    let body = forward_admitted_local_read(kernel, envelope, tool)
+    let body = forward_admitted_local_read(kernel, envelope, tool, attempt)
         .await
         .map_err(|error| format!("daemon local-read forward: {error}"))?;
     match submit_local_read_result_idempotent(kernel, &body).await? {
         LocalReadSubmitOutcome::Accepted => Ok(LocalReadPollOutcome::Accepted),
         LocalReadSubmitOutcome::Expired => Ok(LocalReadPollOutcome::Expired),
+        LocalReadSubmitOutcome::StaleAttempt => Ok(LocalReadPollOutcome::StaleAttempt),
     }
 }
 
@@ -744,7 +751,9 @@ async fn run_local_read_poll(kernel: &DaemonKernelClient) -> Result<LocalReadPol
 /// reconcile: the retained body is reused verbatim, never recomputed, and no
 /// local replay cache or timer is introduced. The retry is safe because the
 /// Kernel submit leg is exact-replay idempotent — an identical body under the
-/// same identity persists once and replays, never duplicates.
+/// same identity persists once and replays, never duplicates. Only transport
+/// failures retry: `Expired` and `StaleAttempt` are settled outcomes, so a
+/// quarantined capability is never resubmitted.
 async fn submit_local_read_result_idempotent(
     kernel: &DaemonKernelClient,
     body: &eliot_protocol::HostRequestResultBody,
@@ -761,10 +770,12 @@ async fn submit_local_read_result_idempotent(
 }
 
 /// Bounded shutdown drain for one in-flight local-read poll. Never starts
-/// new work and retains no local identity: an un-submitted pair's Kernel
-/// claim lease (1000 ms) expires and the pair re-claims on the next loop,
-/// while an already-persisted body exact-replays idempotently on the next
-/// submit — so the drain always settles as plain `Shutdown`, never unknown.
+/// new work and retains no local identity: an un-submitted pair's attempt
+/// capability is revoked on disconnect (the Kernel drops the queue record,
+/// so no time lease has to expire first) and the next loop claims the
+/// current generation anew, while an already-persisted body exact-replays
+/// idempotently on the next submit — so the drain always settles as plain
+/// `Shutdown`, never unknown.
 async fn drain_local_read_on_shutdown(flight: &mut LocalReadFlight) -> Result<RunLoopExit, String> {
     let previous = std::mem::replace(flight, LocalReadFlight::Idle);
     let LocalReadFlight::InFlight(state) = previous else {

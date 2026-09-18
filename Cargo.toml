@@ -160,6 +160,20 @@ members = [
   "crates/smart/eliot-dreamer-rival-model",  # agent_order 16
   "crates/smart/eliot-dreamer-probe-plan",  # agent_order 17
   "crates/smart/eliot-dreamer-orientation",  # agent_order 6
+  "crates/smart/eliot-dreamer-failure",  # agent_order 26
+  "crates/smart/eliot-dreamer-structure-repair",  # agent_order 27
+  "crates/smart/eliot-dreamer-reconsolidation",  # agent_order 28
+  "crates/smart/eliot-dreamer-accessibility",  # agent_order 29
+  "crates/smart/eliot-dreamer-memory-repair",  # agent_order 30
+  "crates/smart/eliot-dreamer-curation",  # agent_order 31
+  "crates/smart/eliot-dreamer-clarification",  # agent_order 7
+  "crates/smart/eliot-dreamer-architecture-brief",  # agent_order 8
+  "crates/smart/eliot-dreamer-implementation-brief",  # agent_order 9
+  "crates/smart/eliot-learning-state-view",  # agent_order 33
+  "crates/smart/eliot-learning-delta",  # agent_order 34
+  "crates/smart/eliot-learning-overlay",  # agent_order 35
+  "crates/meta/eliot-learning-activation-assessment",  # agent_order 36
+  "crates/meta/eliot-self-quality",  # agent_order 38
 ]
 
 # Capability cells declared by `[package.metadata.eliot]` with `agent_order`
@@ -168,26 +182,12 @@ members = [
 # `members`, cargo refuses with "current package believes it's in a
 # workspace when it's not" and the cell cannot be built or tested at all.
 #
-# Wave admission (#829/T8-A0) is the single serialized root turn for proved
-# contract cells: package-local proof first, then this one owner moves each
-# from `exclude` to `members`. Leaves never self-promote. See I2.3 and I2.11.
-# Single-cell admission (#806/T8-A806) follows the same serialized turn for
-# eliot-dreamer-cycle (standalone nonmember; never in `exclude`).
-exclude = [
-  "crates/smart/eliot-dreamer-clarification",  # agent_order 7
-  "crates/smart/eliot-dreamer-architecture-brief",  # agent_order 8
-  "crates/smart/eliot-dreamer-implementation-brief",  # agent_order 9
-  "crates/smart/eliot-dreamer-failure",  # agent_order 26
-  "crates/smart/eliot-dreamer-structure-repair",  # agent_order 27
-  "crates/smart/eliot-dreamer-reconsolidation",  # agent_order 28
-  "crates/smart/eliot-dreamer-accessibility",  # agent_order 29
-  "crates/smart/eliot-dreamer-memory-repair",  # agent_order 30
-  "crates/smart/eliot-dreamer-curation",  # agent_order 31
-  "crates/smart/eliot-learning-state-view",  # agent_order 33
-  "crates/smart/eliot-learning-delta",  # agent_order 34
-  "crates/smart/eliot-learning-overlay",  # agent_order 35
-  "crates/meta/eliot-learning-activation-assessment",  # agent_order 36
-]
+# Wave admission (#967/T8-AL1) is the single serialized root turn for proved
+# learning cells: package-local proof first, then this one owner moves each
+# from `exclude` to `members`. Self-quality (#820) was a standalone
+# nonmember and joins `members` directly; it was never in `exclude`.
+# Leaves never self-promote. See I2.3 and I2.11.
+exclude = []
 default-members = [
   "bins/eliot",
   "bins/eliot-host",
@@ -281,6 +281,11 @@ eliot-watchdog-core = { path = "crates/supervision/eliot-watchdog-core", version
 eliot-research-exchange = { path = "crates/research/eliot-research-exchange", version = "0.1.0" }
 eliot-research-exchange-api = { path = "crates/research/eliot-research-exchange-api", version = "0.1.0" }
 eliot-researcher = { path = "crates/research/eliot-researcher", version = "0.1.0" }
+eliot-learning-state-view = { path = "crates/smart/eliot-learning-state-view", version = "0.1.0" }
+eliot-learning-delta = { path = "crates/smart/eliot-learning-delta", version = "0.1.0" }
+eliot-learning-overlay = { path = "crates/smart/eliot-learning-overlay", version = "0.1.0" }
+eliot-learning-activation-assessment = { path = "crates/meta/eliot-learning-activation-assessment", version = "0.1.0" }
+eliot-self-quality = { path = "crates/meta/eliot-self-quality", version = "0.1.0" }
 futures-util = { version = "0.3.32", features = ["sink"] }
 wasmtime = { version = "=47.0.4", default-features = false, features = ["component-model", "cranelift", "runtime", "std"] }
 wat = "=1.256.0"

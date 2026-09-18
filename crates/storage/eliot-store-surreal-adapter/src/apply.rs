@@ -17,10 +17,11 @@ use eliot_store_api::{
     CONTRACT_VERSION, OperationId, StoreGenesisRequest, validate_genesis_receipt_envelope,
 };
 use eliot_store_api::{
-    ExactJsonBytes, OrderingHead, OrderingHeadExpectation, OrderingScopeId, RecoveryRecord,
+    ERASURE_PARAM_OPERATION_ID, ERASURE_PARAM_SUBJECT, ERASURE_PARAM_SURFACES, ExactJsonBytes,
+    NamedMutationOperation, OrderingHead, OrderingHeadExpectation, OrderingScopeId, RecoveryRecord,
     RevisionHead, RevisionHeadExpectation, RevisionKey, StateFence, StoreError,
-    StoreRecoveryRequest, StoreRecoverySnapshot, WriteReceipt, generated_operation_manifests,
-    operation_manifest_set_digest,
+    StoreRecoveryRequest, StoreRecoverySnapshot, TransitionClass, WriteReceipt,
+    decode_erasure_surfaces, generated_operation_manifests, operation_manifest_set_digest,
 };
 use serde::de::DeserializeOwned;
 use serde_json::{Map, Value, json};
@@ -618,6 +619,17 @@ pub(crate) async fn apply_prepared_with_authority(
         &transition.state_fence,
     )?;
 
+    // Issue #1712: the admitted erasure operation dispatches its recorded
+    // intent-before-delete plan here, after every fallible precondition and
+    // before receipt planning. Same-operation replay returns the sealed
+    // outcomes without duplicate destructive work; a lost commit response
+    // reconciles by same-operation retry through the receipt path above,
+    // never by blind retry.
+    if transition.transition_class == TransitionClass::Erasure {
+        let intent = surreal_intent_from_transition(&transition)?;
+        apply_surreal_erasure(adapter, &intent).await?;
+    }
+
     let plan = plan::select_apply_plan(
         &transition,
         authorities,
@@ -667,14 +679,13 @@ pub(crate) async fn apply_prepared_with_authority(
 /// live path the returned intent is the durable row the atomic transaction
 /// below opens with, so no destructive statement can precede it.
 ///
-/// 688-FIX: live-path entry owned by the real-Surreal round-trip integration
-/// slice (no admitted dispatch on this base; see `atomic_write`). `allow`
-/// holds only here so wiring a caller does not widen scope.
+/// Issue #1712 admits the named dispatch: `apply_prepared_with_authority`
+/// routes an admitted `ApplyErasure` transition through this gate, so the
+/// intent-before-delete path is live.
 ///
 /// Follow-up integration slice (NOT this contour): `GetEvidencePack`
 /// suppression of sealed erasures plus the `erasure_intent`/`erasure_outcome`
 /// table migration stay with the real-Surreal integration owner.
-#[allow(dead_code)]
 pub(crate) fn record_surreal_erasure_intent(
     intent: atomic_write::SurrealErasureIntent,
 ) -> Result<atomic_write::SurrealErasureIntent, AdapterError> {
@@ -691,10 +702,13 @@ pub(crate) fn record_surreal_erasure_intent(
 /// refuses: `write_erasure_transaction` is never reached, so no `DELETE`
 /// can precede the durable intent row.
 ///
+/// Issue #1712 admits the named dispatch (see
+/// `apply_prepared_with_authority`); this entry executes only the recorded
+/// plan and never derives deletion semantics.
+///
 /// Follow-up integration slice (NOT this contour): `GetEvidencePack`
 /// suppression of sealed erasures plus the `erasure_intent`/`erasure_outcome`
 /// table migration stay with the real-Surreal integration owner.
-#[allow(dead_code)]
 pub(crate) async fn apply_surreal_erasure(
     adapter: &SurrealStoreAdapter,
     intent: &atomic_write::SurrealErasureIntent,
@@ -731,6 +745,58 @@ pub(crate) fn erasure_template_ordering(
             "erasure template orders intent before delete before outcome seal".to_owned(),
         ))
     }
+}
+
+/// Builds the recorded erasure intent verbatim from the admitted named
+/// operation (issue #1712).
+///
+/// The bridge applies only the recorded plan: subject, scope, fence, and
+/// surfaces are copied verbatim from the admitted `ApplyErasure` parameters
+/// into the local intent, never derived. The stable intent identity must
+/// equal the transition identity, binding record, execution, and receipt
+/// under one identity; divergence is an identity conflict with no
+/// destructive effect.
+fn surreal_intent_from_transition(
+    transition: &eliot_store_api::PreparedTransition,
+) -> Result<atomic_write::SurrealErasureIntent, AdapterError> {
+    if transition.transition_class != TransitionClass::Erasure {
+        return Err(AdapterError::Store(StoreError::TransitionClassExceeded));
+    }
+    let Some(command) = transition.named_operations.first() else {
+        return Err(AdapterError::Store(StoreError::TransitionClassExceeded));
+    };
+    if command.operation != NamedMutationOperation::ApplyErasure {
+        return Err(AdapterError::Store(StoreError::TransitionClassExceeded));
+    }
+    let text_param = |name: &'static str| {
+        command
+            .parameters
+            .get(name)
+            .and_then(Value::as_str)
+            .ok_or(AdapterError::Store(StoreError::InvalidField {
+                field: "operation.parameter",
+                reason: "missing required parameter",
+            }))
+    };
+    let subject = text_param(ERASURE_PARAM_SUBJECT)?;
+    let surfaces_value = text_param(ERASURE_PARAM_SURFACES)?;
+    let operation_id = text_param(ERASURE_PARAM_OPERATION_ID)?;
+    if operation_id != transition.identity.operation_id.to_string() {
+        return Err(AdapterError::Store(StoreError::IdentityConflict));
+    }
+    let surfaces = decode_erasure_surfaces(surfaces_value)
+        .map_err(AdapterError::Store)?
+        .iter()
+        .map(|name| atomic_write::SurrealErasureSurface::by_name(name))
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(AdapterError::Store)?;
+    Ok(atomic_write::SurrealErasureIntent {
+        operation_id: operation_id.to_owned(),
+        subject: subject.to_owned(),
+        scope_id: transition.scope_id.clone(),
+        surfaces,
+        state_fence: transition.state_fence.clone(),
+    })
 }
 
 /// Enforces the same admitted operation before staging and commit (slice C2).
@@ -1391,6 +1457,130 @@ mod admitted_operation_gate_tests {
         assert_eq!(
             query.validate_against_catalogue(&entries),
             Err(StoreError::UnknownOperation)
+        );
+    }
+
+    fn erasure_operation() -> eliot_store_api::NamedMutationRequest {
+        NamedMutationRequest {
+            operation: NamedMutationOperation::ApplyErasure,
+            parameters: BTreeMap::from([
+                ("subject".to_owned(), json!("subject-gate")),
+                ("surfaces".to_owned(), json!("CanonicalPayload,Index")),
+                ("reason".to_owned(), json!("user requested deletion")),
+                ("requester".to_owned(), json!("user:test")),
+                ("erasure_operation_id".to_owned(), json!("op-gate")),
+            ]),
+        }
+    }
+
+    fn erasure_transition(
+        fence: &StateFence,
+        manifest_digest: OperationManifestDigest,
+    ) -> eliot_store_api::PreparedTransition {
+        let mut transition = transition_with(
+            fence,
+            manifest_digest,
+            TransitionClass::Erasure,
+            EffectClass::ReversibleMutation,
+            vec![erasure_operation()],
+        );
+        transition.required_proof_and_approval_refs = vec!["approval-user-1".to_owned()];
+        transition
+    }
+
+    /// Issue #1712: the admitted erasure operation passes the pre-stage gate
+    /// under its declared class, and the intent builder binds the recorded
+    /// plan verbatim from the admitted parameters.
+    #[test]
+    fn admitted_erasure_passes_the_pre_stage_gate() {
+        let fence = test_fence(1);
+        let context = test_context(&fence);
+        let entries = generated_operation_manifests().expect("active catalogue generates");
+        let set_digest = operation_manifest_set_digest(&entries).expect("set digest computes");
+        let transition = erasure_transition(&fence, set_digest);
+        assert!(
+            validate_transition(&context, &transition).is_ok(),
+            "admitted erasure passes the pre-stage gate"
+        );
+        let intent = surreal_intent_from_transition(&transition).expect("intent binds");
+        assert_eq!(intent.operation_id, "op-gate");
+        assert_eq!(intent.subject, "subject-gate");
+        assert_eq!(intent.scope_id.as_str(), "scope-gate");
+        assert_eq!(
+            intent.surfaces,
+            vec![
+                atomic_write::SurrealErasureSurface::CanonicalPayload,
+                atomic_write::SurrealErasureSurface::Index,
+            ]
+        );
+    }
+
+    /// Issue #1712: unapproved, out-of-manifest, and divergent erasure plans
+    /// are rejected pre-stage with no provider effect.
+    #[test]
+    fn erasure_gate_rejects_unapproved_and_out_of_manifest() {
+        let fence = test_fence(1);
+        let context = test_context(&fence);
+        let entries = generated_operation_manifests().expect("active catalogue generates");
+        let set_digest = operation_manifest_set_digest(&entries).expect("set digest computes");
+
+        // No explicit approval: automatic paths furnish none and fail here.
+        let mut unapproved = erasure_transition(&fence, set_digest.clone());
+        unapproved.required_proof_and_approval_refs.clear();
+        assert!(matches!(
+            validate_transition(&context, &unapproved),
+            Err(AdapterError::Store(StoreError::InvalidField { .. }))
+        ));
+
+        // Wrong transition class for the named erasure operation.
+        let mut wrong_class = erasure_transition(&fence, set_digest.clone());
+        wrong_class.transition_class = TransitionClass::CaptureCandidate;
+        assert_eq!(
+            validate_transition(&context, &wrong_class),
+            Err(AdapterError::Store(StoreError::TransitionClassExceeded))
+        );
+
+        // Stale manifest digest never reaches the store.
+        let mut stale = transition_with(
+            &fence,
+            OperationManifestDigest::new("stale-manifest-digest").expect("digest"),
+            TransitionClass::Erasure,
+            EffectClass::ReversibleMutation,
+            vec![erasure_operation()],
+        );
+        stale.required_proof_and_approval_refs = vec!["approval-user-1".to_owned()];
+        assert_eq!(
+            validate_transition(&context, &stale),
+            Err(AdapterError::Store(StoreError::ManifestMismatch))
+        );
+
+        // Unknown surface: dispatch refuses the invented denominator.
+        let mut unknown = erasure_transition(&fence, set_digest);
+        unknown.named_operations[0]
+            .parameters
+            .insert("surfaces".to_owned(), json!("Nope"));
+        assert!(matches!(
+            surreal_intent_from_transition(&unknown),
+            Err(AdapterError::Store(StoreError::InvalidField { .. }))
+        ));
+
+        // Divergent intent identity: record, execution, and receipt stay
+        // bound under one identity.
+        let mut divergent = erasure_operation();
+        divergent
+            .parameters
+            .insert("erasure_operation_id".to_owned(), json!("op-other"));
+        let mut transition = erasure_transition(
+            &fence,
+            operation_manifest_set_digest(
+                &generated_operation_manifests().expect("active catalogue generates"),
+            )
+            .expect("set digest computes"),
+        );
+        transition.named_operations = vec![divergent];
+        assert_eq!(
+            surreal_intent_from_transition(&transition),
+            Err(AdapterError::Store(StoreError::IdentityConflict))
         );
     }
 }

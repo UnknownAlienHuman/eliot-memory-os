@@ -850,6 +850,26 @@ pub(crate) struct KernelClaimTransport {
     client: KernelClient,
 }
 
+/// Lets boxed transports (test doubles, future Governor bridges) serve the
+/// generic claim seams without changing their call sites.
+impl<T: ClaimTransport + ?Sized> ClaimTransport for Box<T> {
+    fn bind_identity(
+        &mut self,
+        fence: &StateFence,
+        operation_id: &str,
+    ) -> Result<(), KernelPortError> {
+        (**self).bind_identity(fence, operation_id)
+    }
+
+    fn transact(
+        &mut self,
+        operation: &str,
+        payload: serde_json::Value,
+    ) -> Result<serde_json::Value, KernelPortError> {
+        (**self).transact(operation, payload)
+    }
+}
+
 impl KernelClaimTransport {
     /// Wraps an authenticated client whose health handshake already passed.
     pub(crate) fn new(client: KernelClient) -> Self {
