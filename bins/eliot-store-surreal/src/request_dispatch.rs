@@ -338,6 +338,22 @@ impl StoreDispatchBackend for StoreComposition {
                     Err(error) => map_store_error(error, context),
                 }
             }
+            // Issue #991: one authenticated reserved-write arm. The sealed
+            // request is validated and delegated through the composition's
+            // reserved-write operation only; an unsupported backend refuses
+            // with a typed failure before any provider I/O and never falls
+            // back to ordinary `Apply`.
+            Request::ReservedWrite { request } => {
+                let failure_context = failure_context_for_operation(
+                    &request.context,
+                    request.transition.identity.operation_id.clone(),
+                    request.transition.identity.idempotency_key.clone(),
+                );
+                match self.apply_reserved_write(request).await {
+                    Ok(receipt) => response_for_transaction_receipt(receipt, failure_context),
+                    Err(error) => map_composition_error(error, failure_context),
+                }
+            }
             Request::RevisionHeads { keys } => match self.revision_heads(keys).await {
                 Ok(heads) => Response::RevisionHeads { heads },
                 Err(error) => map_store_error(error, StoreFailureIdentityContext::default()),
