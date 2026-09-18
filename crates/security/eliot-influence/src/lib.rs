@@ -202,6 +202,10 @@ pub fn decide(request: &InfluenceRequest) -> Result<InfluenceDecision, Influence
         reasons.push(InfluenceReason::DependencyRevoked);
     } else if request.dependency_closure.current_influence == InfluenceState::Quarantined {
         reasons.push(InfluenceReason::DependencyQuarantined);
+    } else if request.dependency_closure.current_influence == InfluenceState::Unknown {
+        // Fail-closed: an unknown dependency state proves nothing, so it
+        // quarantines like an explicit quarantine instead of allowing use.
+        reasons.push(InfluenceReason::DependencyQuarantined);
     }
     if request.policy.require_verified_integrity
         && !matches!(
@@ -247,6 +251,7 @@ pub fn decide(request: &InfluenceRequest) -> Result<InfluenceDecision, Influence
         matches!(
             reason,
             InfluenceReason::DependencyRevoked
+                | InfluenceReason::DependencyQuarantined
                 | InfluenceReason::SourceQuarantined
                 | InfluenceReason::WrongScope
         )
@@ -374,4 +379,186 @@ pub enum InfluenceError {
     FenceOrLineageMismatch,
     #[error("influence request cannot be canonically serialized")]
     Canonicalization,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use eliot_contracts::{EpochId, EpochLineageId, ResourceGeneration};
+    use eliot_security_contracts::{
+        CompetenceLevel, EffectCeiling, EpistemicUse, FreshnessStatus, IndependenceLevel,
+        InstructionTaint, IntegrityStatus, PrivacyClass, QuarantineState,
+    };
+
+    const TEST_LINEAGE: &str = "550e8400-e29b-41d4-a716-446655440000";
+
+    fn test_fence() -> StateFence {
+        let lineage = match EpochLineageId::new(TEST_LINEAGE) {
+            Ok(lineage) => lineage,
+            Err(error) => panic!("valid test lineage: {error:?}"),
+        };
+        let Some(ordinal) = std::num::NonZeroU64::new(7) else {
+            panic!("nonzero test epoch ordinal")
+        };
+        let epoch = match EpochId::new(lineage, ordinal) {
+            Ok(epoch) => epoch,
+            Err(error) => panic!("valid test epoch: {error:?}"),
+        };
+        let generation = match ResourceGeneration::new(3) {
+            Ok(generation) => generation,
+            Err(error) => panic!("valid test generation: {error:?}"),
+        };
+        StateFence::new(epoch, generation)
+    }
+
+    fn clean_assurance(fence: &StateFence) -> SourceAssurance {
+        SourceAssurance {
+            source_ref: "source:test".to_string(),
+            provenance_ref: "provenance:test".to_string(),
+            integrity: IntegrityStatus::Verified,
+            freshness: FreshnessStatus::Current,
+            competence: CompetenceLevel::DomainVerified,
+            independence: IndependenceLevel::Independent,
+            privacy_class: PrivacyClass::Public,
+            instruction_taint: InstructionTaint::Cleared,
+            allowed_epistemic_use: vec![EpistemicUse::Observation],
+            allowed_effects: vec![EffectCeiling::ReadOnly],
+            required_verifier: None,
+            quarantine: QuarantineState::None,
+            state_fence: fence.clone(),
+        }
+    }
+
+    fn test_closure(fence: &StateFence, state: InfluenceState) -> InfluenceDependencyClosure {
+        InfluenceDependencyClosure {
+            closure_id: "closure:test".to_string(),
+            root_ref: "origin:test".to_string(),
+            dependent_refs: vec!["origin:test".to_string(), "derived:test".to_string()],
+            invalidation_reason: if state == InfluenceState::Active {
+                None
+            } else {
+                Some(RevocationReason::Erasure)
+            },
+            current_influence: state,
+            state_fence: fence.clone(),
+            revision: 1,
+        }
+    }
+
+    fn test_request(state: InfluenceState) -> InfluenceRequest {
+        let fence = test_fence();
+        let policy = InfluencePolicy {
+            policy_id: "policy:test".to_string(),
+            revision: 1,
+            state_fence: fence.clone(),
+            require_verified_integrity: false,
+            require_current_freshness: false,
+            allow_unknown_independence: true,
+            allow_instruction_taint: true,
+            minimum_level: InfluenceLevel::VerifiedUse,
+        };
+        let provenance = ProvenanceRecord {
+            subject_ref: "subject:test".to_string(),
+            origin_ref: "origin:test".to_string(),
+            source_assurance: clean_assurance(&fence),
+            parent_refs: vec!["parent:test".to_string()],
+            transformation_ref: None,
+            state_fence: fence.clone(),
+        };
+        InfluenceRequest {
+            request_id: "request:test".to_string(),
+            subject_ref: "subject:test".to_string(),
+            requested_level: InfluenceLevel::VerifiedUse,
+            policy,
+            provenance,
+            dependency_closure: test_closure(&fence, state),
+        }
+    }
+
+    #[test]
+    fn revoked_closure_blocks_use() {
+        let decision = match decide(&test_request(InfluenceState::Revoked)) {
+            Ok(decision) => decision,
+            Err(error) => panic!("revoked decide succeeds: {error:?}"),
+        };
+        assert_eq!(decision.disposition, InfluenceDisposition::Revoked);
+        assert_eq!(decision.allowed_level, InfluenceLevel::Stored);
+        assert!(
+            decision
+                .reasons
+                .contains(&InfluenceReason::DependencyRevoked)
+        );
+    }
+
+    #[test]
+    fn revocation_output_blocks_decide() {
+        let fence = test_fence();
+        let receipt = match revoke(&RevocationRequest {
+            request_id: "revoke:test".to_string(),
+            root_ref: "origin:test".to_string(),
+            reason: RevocationReason::Erasure,
+            state_fence: fence.clone(),
+            graph: vec![
+                InfluenceEdge {
+                    source_ref: "origin:test".to_string(),
+                    dependent_ref: "derived:test".to_string(),
+                },
+                InfluenceEdge {
+                    source_ref: "derived:test".to_string(),
+                    dependent_ref: "leaf:test".to_string(),
+                },
+            ],
+        }) {
+            Ok(receipt) => receipt,
+            Err(error) => panic!("revoke succeeds: {error:?}"),
+        };
+        assert!(receipt.affected_refs.contains(&"origin:test".to_string()));
+        assert!(receipt.affected_refs.contains(&"derived:test".to_string()));
+        assert!(receipt.affected_refs.contains(&"leaf:test".to_string()));
+        for closure in &receipt.closures {
+            assert_eq!(closure.current_influence, InfluenceState::Revoked);
+        }
+        let Some(revoked) = receipt
+            .closures
+            .iter()
+            .find(|closure| closure.root_ref == "origin:test")
+        else {
+            panic!("revocation covers its root")
+        };
+        let mut request = test_request(InfluenceState::Active);
+        request.dependency_closure = revoked.clone();
+        request.provenance.origin_ref = revoked.root_ref.clone();
+        request.dependency_closure.closure_id = "closure:test".to_string();
+        let decision = match decide(&request) {
+            Ok(decision) => decision,
+            Err(error) => panic!("revoked closure decide succeeds: {error:?}"),
+        };
+        assert_eq!(decision.disposition, InfluenceDisposition::Revoked);
+        assert_eq!(decision.allowed_level, InfluenceLevel::Stored);
+    }
+
+    #[test]
+    fn unknown_closure_fails_closed() {
+        let decision = match decide(&test_request(InfluenceState::Unknown)) {
+            Ok(decision) => decision,
+            Err(error) => panic!("unknown decide succeeds: {error:?}"),
+        };
+        assert_eq!(decision.disposition, InfluenceDisposition::Quarantined);
+        assert_eq!(decision.allowed_level, InfluenceLevel::Stored);
+        assert!(
+            decision
+                .reasons
+                .contains(&InfluenceReason::DependencyQuarantined)
+        );
+    }
+
+    #[test]
+    fn quarantined_closure_quarantines() {
+        let decision = match decide(&test_request(InfluenceState::Quarantined)) {
+            Ok(decision) => decision,
+            Err(error) => panic!("quarantined decide succeeds: {error:?}"),
+        };
+        assert_eq!(decision.disposition, InfluenceDisposition::Quarantined);
+        assert_eq!(decision.allowed_level, InfluenceLevel::Stored);
+    }
 }

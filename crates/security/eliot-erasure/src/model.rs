@@ -201,6 +201,40 @@ pub struct IntentReceipt {
     pub request_digest: String,
 }
 
+/// Durable non-revivable tombstone committed BEFORE any destructive dispatch.
+///
+/// The tombstone carries no erased content: only the operation/request
+/// digests, subject/scope refs, revision and fence. The orchestration commits
+/// it after [`ErasureIntent`] and before [`ErasureBackend::erase`]; a missing
+/// or mismatched tombstone fails closed with
+/// [`ErasureError::MissingTombstone`] and zero destructive calls.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct Tombstone {
+    pub operation_id: String,
+    pub request_digest: String,
+    pub tombstone_digest: String,
+    pub subject_ref: String,
+    pub scope: String,
+    pub revision: u64,
+    pub state_fence: StateFence,
+}
+
+impl Tombstone {
+    /// Fail-closed validation of the durable tombstone.
+    pub fn validate(&self) -> Result<(), ErasureError> {
+        text(&self.operation_id, "tombstone.operation_id")?;
+        digest(&self.request_digest, "tombstone.request_digest")?;
+        digest(&self.tombstone_digest, "tombstone.tombstone_digest")?;
+        text(&self.subject_ref, "tombstone.subject_ref")?;
+        text(&self.scope, "tombstone.scope")?;
+        self.state_fence
+            .validate()
+            .map_err(|_| ErasureError::InvalidField("tombstone.state_fence"))?;
+        Ok(())
+    }
+}
+
 /// Per-surface erasure outcome, supplied as a typed value.
 ///
 /// Live Store/provider owners will produce these per surface in their own
@@ -296,11 +330,15 @@ pub fn aggregate_surface_outcomes(
 /// that state.
 ///
 /// Protocol order, enforced by [`execute`]: `current_revision`, then
-/// `completed_receipt` (replay check), then `record_intent` (durable intent),
-/// then `erase` (destructive dispatch under the recorded intent), then the
-/// fail-closed outcome aggregation, then `append_purge_ledger` (only on
-/// aggregate success), then `note_completed` (seals the replayable result).
-/// No destructive call happens before `record_intent` succeeds.
+/// `completed_receipt` (replay check, tombstone-verified), then
+/// `record_intent` (durable intent), then `commit_tombstone` (durable
+/// non-revivable tombstone), then `load_tombstone` verification, then `erase`
+/// (destructive dispatch under the recorded intent and verified tombstone),
+/// then the fail-closed outcome aggregation, then `append_purge_ledger` (only
+/// on aggregate success), then `note_completed` (seals the replayable result).
+/// No destructive call happens before both `record_intent` and
+/// `commit_tombstone` succeed, and a missing tombstone fails closed with
+/// [`ErasureError::MissingTombstone`].
 pub trait ErasureBackend {
     type Error: std::error::Error + Send + Sync + 'static;
 
@@ -315,6 +353,26 @@ pub trait ErasureBackend {
     /// twice with identical content is idempotent, while the same id with
     /// different content must yield [`ErasureError::IntentConflict`].
     fn record_intent(&mut self, _intent: ErasureIntent) -> Result<IntentReceipt, ErasureError> {
+        Err(ErasureError::UnsupportedIntent)
+    }
+
+    /// Commits the durable tombstone before any destructive call.
+    ///
+    /// The default refuses with [`ErasureError::UnsupportedIntent`] so a
+    /// backend without tombstone durability fails closed with zero
+    /// destructive calls. Implementations must persist the tombstone under
+    /// its stable `operation_id`; committing the same tombstone twice with
+    /// identical content is idempotent, while the same id with different
+    /// content must yield [`ErasureError::IntentConflict`].
+    fn commit_tombstone(&mut self, _tombstone: Tombstone) -> Result<Tombstone, ErasureError> {
+        Err(ErasureError::UnsupportedIntent)
+    }
+
+    /// Loads the durable tombstone for fail-closed verification.
+    ///
+    /// The default refuses with [`ErasureError::UnsupportedIntent`]; a
+    /// backend that cannot prove the tombstone must not erase.
+    fn load_tombstone(&self, _operation_id: &str) -> Result<Option<Tombstone>, ErasureError> {
         Err(ErasureError::UnsupportedIntent)
     }
 
@@ -364,12 +422,16 @@ pub struct ErasureReceipt {
 
 /// Executes one exact-fence erasure against the already-authoritative backend.
 ///
-/// Intent and replay identity are durable before destructive dispatch:
-/// the intent is built and recorded first, an exact replay of a completed
-/// intent returns the original receipt with no second destructive dispatch,
-/// and only then does erasure fan out under the recorded intent. Per-surface
-/// outcomes aggregate fail-closed — one incomplete or unknown surface
-/// prevents a `Purged` result and no ledger entry is appended on refusal.
+/// Tombstone-first lifecycle: the intent is built and recorded, then the
+/// durable tombstone is committed and load-verified, and only then does
+/// erasure fan out under the recorded intent and verified tombstone. An exact
+/// replay of a completed intent returns the original receipt with no second
+/// destructive dispatch after verifying the tombstone still binds the exact
+/// request-derived candidate. Tombstone commit failure or a missing/mismatched tombstone yields
+/// [`ErasureError::MissingTombstone`] (or the backend refusal) with zero
+/// destructive calls. Per-surface outcomes aggregate fail-closed — one
+/// incomplete or unknown surface prevents a `Purged` result and no ledger
+/// entry is appended on refusal.
 pub fn execute<B: ErasureBackend>(
     backend: &mut B,
     request: &ErasureRequest,
@@ -387,27 +449,68 @@ pub fn execute<B: ErasureBackend>(
     }
 
     let intent = ErasureIntent::new(request, &request_digest)?;
+    let computed_tombstone_digest = tombstone_digest(request, &request_digest);
 
     if let Some(prior) = backend.completed_receipt(&intent.operation_id)? {
         if prior.request_digest != request_digest {
             return Err(ErasureError::IntentConflict);
+        }
+        let candidate = Tombstone {
+            operation_id: intent.operation_id.clone(),
+            request_digest: request_digest.clone(),
+            tombstone_digest: computed_tombstone_digest.clone(),
+            subject_ref: request.subject_ref.clone(),
+            scope: request.scope.clone(),
+            revision,
+            state_fence: request.state_fence.clone(),
+        };
+        candidate.validate()?;
+        let stored = backend.load_tombstone(&intent.operation_id)?;
+        let Some(stored) = stored else {
+            return Err(ErasureError::MissingTombstone);
+        };
+        if stored != candidate
+            || prior.purge.tombstone_digest != candidate.tombstone_digest
+        {
+            return Err(ErasureError::MissingTombstone);
         }
         return Ok(prior);
     }
 
     backend.record_intent(intent.clone())?;
 
+    let candidate = Tombstone {
+        operation_id: intent.operation_id.clone(),
+        request_digest: request_digest.clone(),
+        tombstone_digest: computed_tombstone_digest.clone(),
+        subject_ref: request.subject_ref.clone(),
+        scope: request.scope.clone(),
+        revision,
+        state_fence: request.state_fence.clone(),
+    };
+    candidate.validate()?;
+    let committed = backend.commit_tombstone(candidate.clone())?;
+    if committed != candidate {
+        return Err(ErasureError::MissingTombstone);
+    }
+    let stored = backend.load_tombstone(&intent.operation_id)?;
+    let Some(stored) = stored else {
+        return Err(ErasureError::MissingTombstone);
+    };
+    if stored != candidate {
+        return Err(ErasureError::MissingTombstone);
+    }
+
     let outcomes = backend
         .erase(&intent)
         .map_err(|error| ErasureError::Backend(Box::new(error)))?;
     let purged_locations = aggregate_surface_outcomes(&intent.locations, &outcomes)?;
-    let tombstone_digest = tombstone_digest(request, &request_digest);
     let purge = PurgeLedgerEntry {
         purge_id: format!("purge-{request_digest}"),
         subject_ref: request.subject_ref.clone(),
         scope: request.scope.clone(),
         purged_locations,
-        tombstone_digest,
+        tombstone_digest: candidate.tombstone_digest.clone(),
         state: PurgeState::Purged,
         state_fence: request.state_fence.clone(),
         revision,
@@ -497,6 +600,8 @@ pub enum ErasureError {
     UnknownSurface,
     #[error("erasure backend does not implement durable intent")]
     UnsupportedIntent,
+    #[error("erasure tombstone is missing or does not bind this operation")]
+    MissingTombstone,
     #[error("erasure intent conflicts with the already-recorded operation")]
     IntentConflict,
     #[error("generated purge ledger entry is invalid")]
@@ -507,4 +612,207 @@ pub enum ErasureError {
     ScopeMismatch,
     #[error("erasure backend failed: {0}")]
     Backend(#[source] Box<dyn std::error::Error + Send + Sync>),
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::BTreeMap;
+    use std::error::Error;
+    use std::fmt;
+
+    use eliot_contracts::{EpochId, EpochLineageId, ResourceGeneration};
+
+    use super::*;
+
+    #[derive(Debug)]
+    struct BackendError(String);
+
+    impl fmt::Display for BackendError {
+        fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+            formatter.write_str(&self.0)
+        }
+    }
+
+    impl Error for BackendError {}
+
+    fn test_fence() -> StateFence {
+        let lineage = match EpochLineageId::new("550e8400-e29b-41d4-a716-446655440000") {
+            Ok(lineage) => lineage,
+            Err(error) => panic!("valid test lineage: {error:?}"),
+        };
+        let Some(ordinal) = std::num::NonZeroU64::new(7) else {
+            panic!("nonzero test epoch ordinal")
+        };
+        let epoch = match EpochId::new(lineage, ordinal) {
+            Ok(epoch) => epoch,
+            Err(error) => panic!("valid test epoch: {error:?}"),
+        };
+        let generation = match ResourceGeneration::new(3) {
+            Ok(generation) => generation,
+            Err(error) => panic!("valid test generation: {error:?}"),
+        };
+        StateFence::new(epoch, generation)
+    }
+
+    fn test_request(request_id: &str) -> ErasureRequest {
+        ErasureRequest {
+            request_id: request_id.to_string(),
+            subject_ref: "subject:tombstone-closure".to_string(),
+            scope: "scope:tombstone-closure".to_string(),
+            locations: vec![PurgeLocation::CanonicalPayload, PurgeLocation::Blob],
+            expected_revision: 7,
+            approval_digest: "ab".repeat(32),
+            evidence: Vec::new(),
+            state_fence: test_fence(),
+        }
+    }
+
+    /// Corrupt/stale backend simulation: `commit_tombstone` echoes the
+    /// already-durable tombstone instead of the supplied candidate, and
+    /// `load_tombstone` reloads that same durable value. A pre-inserted
+    /// tombstone with the right identity and digests but substituted
+    /// authorization fields is therefore returned and reloaded verbatim,
+    /// exactly the substitution the full candidate binding must refuse.
+    struct StaleEchoBackend {
+        revision: u64,
+        tombstones: BTreeMap<String, Tombstone>,
+        completions: BTreeMap<String, ErasureReceipt>,
+        erase_calls: usize,
+        ledger_appends: usize,
+    }
+
+    impl StaleEchoBackend {
+        fn ready() -> Self {
+            Self {
+                revision: 7,
+                tombstones: BTreeMap::new(),
+                completions: BTreeMap::new(),
+                erase_calls: 0,
+                ledger_appends: 0,
+            }
+        }
+
+        fn erase_calls(&self) -> usize {
+            self.erase_calls
+        }
+
+        fn ledger_appends(&self) -> usize {
+            self.ledger_appends
+        }
+    }
+
+    impl ErasureBackend for StaleEchoBackend {
+        type Error = BackendError;
+
+        fn current_revision(
+            &self,
+            _subject_ref: &str,
+            _scope: &str,
+        ) -> Result<u64, Self::Error> {
+            Ok(self.revision)
+        }
+
+        fn completed_receipt(
+            &self,
+            operation_id: &str,
+        ) -> Result<Option<ErasureReceipt>, ErasureError> {
+            if operation_id.trim().is_empty() {
+                return Err(ErasureError::InvalidField("operation_id"));
+            }
+            Ok(self.completions.get(operation_id).cloned())
+        }
+
+        fn record_intent(&mut self, intent: ErasureIntent) -> Result<IntentReceipt, ErasureError> {
+            intent.validate()?;
+            Ok(IntentReceipt {
+                operation_id: intent.operation_id.clone(),
+                request_digest: intent.request_digest.clone(),
+            })
+        }
+
+        fn commit_tombstone(&mut self, tombstone: Tombstone) -> Result<Tombstone, ErasureError> {
+            tombstone.validate()?;
+            if let Some(existing) = self.tombstones.get(&tombstone.operation_id) {
+                return Ok(existing.clone());
+            }
+            self.tombstones
+                .insert(tombstone.operation_id.clone(), tombstone.clone());
+            Ok(tombstone)
+        }
+
+        fn load_tombstone(
+            &self,
+            operation_id: &str,
+        ) -> Result<Option<Tombstone>, ErasureError> {
+            if operation_id.trim().is_empty() {
+                return Err(ErasureError::InvalidField("operation_id"));
+            }
+            Ok(self.tombstones.get(operation_id).cloned())
+        }
+
+        fn note_completed(&mut self, receipt: ErasureReceipt) -> Result<(), ErasureError> {
+            self.completions
+                .insert(receipt.request_id.clone(), receipt);
+            Ok(())
+        }
+
+        fn erase(
+            &mut self,
+            intent: &ErasureIntent,
+        ) -> Result<Vec<SurfaceOutcome>, Self::Error> {
+            self.erase_calls += 1;
+            if intent.validate().is_err() {
+                return Err(BackendError("invalid intent at dispatch".to_string()));
+            }
+            Ok(intent
+                .locations
+                .iter()
+                .map(|location| SurfaceOutcome::Purged {
+                    location: *location,
+                })
+                .collect())
+        }
+
+        fn append_purge_ledger(&mut self, entry: PurgeLedgerEntry) -> Result<(), Self::Error> {
+            self.ledger_appends += 1;
+            if entry.validate().is_err() {
+                return Err(BackendError("invalid purge ledger entry".to_string()));
+            }
+            Ok(())
+        }
+    }
+
+    // WORK_UNIT_CASE: 1131/mismatched-tombstone-binding
+    #[test]
+    fn mismatched_tombstone_binding_yields_zero_destructive_effects() -> Result<(), ErasureError> {
+        let request = test_request("request-1131-tombstone-binding");
+        let mut backend = StaleEchoBackend::ready();
+
+        let request_digest = request.request_digest()?;
+        let intent = ErasureIntent::new(&request, &request_digest)?;
+        let mut tombstone = Tombstone {
+            operation_id: intent.operation_id.clone(),
+            request_digest: intent.request_digest.clone(),
+            tombstone_digest: tombstone_digest(&request, &intent.request_digest),
+            subject_ref: request.subject_ref.clone(),
+            scope: request.scope.clone(),
+            revision: request.expected_revision,
+            state_fence: request.state_fence.clone(),
+        };
+        tombstone.scope = "scope:substituted".to_string();
+        backend
+            .tombstones
+            .insert(intent.operation_id.clone(), tombstone);
+
+        match execute(&mut backend, &request) {
+            Ok(_) => panic!("mismatched tombstone binding must refuse"),
+            Err(ErasureError::MissingTombstone) => {}
+            Err(other) => panic!("typed tombstone refusal, got: {other:?}"),
+        }
+
+        assert_eq!(backend.erase_calls(), 0);
+        assert_eq!(backend.ledger_appends(), 0);
+        assert!(backend.completions.is_empty());
+        Ok(())
+    }
 }
