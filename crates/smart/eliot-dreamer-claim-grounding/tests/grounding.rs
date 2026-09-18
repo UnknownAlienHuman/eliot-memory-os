@@ -684,6 +684,105 @@ fn context_mismatches_are_typed_errors() {
         .is_err(),
         "route fingerprint drift must fail"
     );
+    let mut bad_task = draft.clone();
+    bad_task.task_id = eliot_dreamer_contracts::grounding::canonical::TaskId::new("other-task")
+        .expect("other task");
+    refresh_draft(&mut bad_task);
+    assert!(
+        ground_draft(
+            job(
+                manifest.digest.clone(),
+                eliot_dreamer_contracts::JobClass::Orientation,
+            ),
+            bad_task.bundle.clone(),
+            manifest.clone(),
+            bad_task,
+            policy()
+        )
+        .is_err(),
+        "task drift must fail"
+    );
+    // AttemptIdentity binds the job attempts budget via attempt_number
+    // (attempt_id is format-checked only), so bumping attempt_number past
+    // maximum_attempts is the typed negative for attempt drift.
+    let mut bad_attempt = draft.clone();
+    bad_attempt.attempt.attempt_number = 2;
+    refresh_draft(&mut bad_attempt);
+    assert!(
+        ground_draft(
+            job(
+                manifest.digest.clone(),
+                eliot_dreamer_contracts::JobClass::Orientation,
+            ),
+            bad_attempt.bundle.clone(),
+            manifest.clone(),
+            bad_attempt,
+            policy()
+        )
+        .is_err(),
+        "attempt drift must fail"
+    );
+    let alt_fence = eliot_dreamer_contracts::grounding::canonical::StateFence::new(
+        eliot_dreamer_contracts::grounding::canonical::EpochId::new(
+            eliot_dreamer_contracts::grounding::canonical::EpochLineageId::new(
+                "550e8400-e29b-41d4-a716-446655440001",
+            )
+            .expect("alt lineage"),
+            std::num::NonZeroU64::new(2).expect("non-zero sequence"),
+        )
+        .expect("alt epoch"),
+        eliot_dreamer_contracts::grounding::canonical::ResourceGeneration::genesis(),
+    );
+    let mut bad_fence = draft.clone();
+    bad_fence.state_fence = alt_fence;
+    refresh_draft(&mut bad_fence);
+    assert!(
+        ground_draft(
+            job(
+                manifest.digest.clone(),
+                eliot_dreamer_contracts::JobClass::Orientation,
+            ),
+            bad_fence.bundle.clone(),
+            manifest.clone(),
+            bad_fence,
+            policy()
+        )
+        .is_err(),
+        "fence drift must fail"
+    );
+    // StructuredModelDraft::validate only format-checks raw_output_digest, so a
+    // fresh valid digest still grounds; the drift must instead surface in the
+    // output digest, which covers the retained input preimage.
+    let mut bad_raw = draft.clone();
+    bad_raw.raw_output_digest =
+        "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd".into();
+    refresh_draft(&mut bad_raw);
+    let base_grounded = ground_draft(
+        job(
+            manifest.digest.clone(),
+            eliot_dreamer_contracts::JobClass::Orientation,
+        ),
+        draft.bundle.clone(),
+        manifest.clone(),
+        draft.clone(),
+        policy(),
+    )
+    .expect("base draft grounds");
+    let raw_grounded = ground_draft(
+        job(
+            manifest.digest.clone(),
+            eliot_dreamer_contracts::JobClass::Orientation,
+        ),
+        bad_raw.bundle.clone(),
+        manifest.clone(),
+        bad_raw,
+        policy(),
+    )
+    .expect("raw-output variant grounds");
+    assert_ne!(
+        base_grounded.output_digest, raw_grounded.output_digest,
+        "raw-output drift must change the witness"
+    );
 }
 
 // WORK_UNIT_CASE: 602/5
@@ -2437,14 +2536,46 @@ fn identity_requires_exact_entity_version_and_scope() {
             eliot_dreamer_contracts::JobClass::Orientation,
         ),
         version_draft.bundle.clone(),
-        manifest,
+        manifest.clone(),
         version_draft,
         policy(),
     )
     .expect("wrong version grounds");
     assert_eq!(
         version_grounded.ledger.records["claim-identity"].disposition,
-        SupportResult::Unknown
+        SupportResult::Unknown,
+        "version mismatch must not be supported"
+    );
+    let mut wrong_scope = identity_payload();
+    if let PrecisionPayload::IdentityEntity { scope, .. } = &mut wrong_scope {
+        *scope = "other-scope".into();
+    }
+    let scope_claim = claim_with_payload(
+        "claim-identity",
+        "proposition-identity",
+        wrong_scope,
+        Some("evidence-1"),
+    );
+    let scope_draft = draft(
+        &manifest,
+        vec![scope_claim],
+        eliot_dreamer_contracts::JobClass::Orientation,
+    );
+    let scope_grounded = ground_draft(
+        job(
+            manifest.digest.clone(),
+            eliot_dreamer_contracts::JobClass::Orientation,
+        ),
+        scope_draft.bundle.clone(),
+        manifest,
+        scope_draft,
+        policy(),
+    )
+    .expect("wrong scope grounds");
+    assert_eq!(
+        scope_grounded.ledger.records["claim-identity"].disposition,
+        SupportResult::Unknown,
+        "scope mismatch must not be supported"
     );
 }
 
@@ -2480,7 +2611,18 @@ fn dropped_counterevidence_cannot_yield_a_complete_witness() {
     .expect("without counterevidence grounds");
     assert_eq!(
         without_grounded.ledger.records["claim-1"].disposition,
-        SupportResult::Supported
+        SupportResult::Unknown
+    );
+    assert!(
+        without_grounded.ledger.records["claim-1"]
+            .unknowns
+            .iter()
+            .any(|entry| entry.contains("dropped counterevidence")),
+        "selective draft must record dropped counterevidence"
+    );
+    assert!(
+        without_grounded.ledger.records["claim-1"].witnesses.len() < 2,
+        "selective draft must not yield a complete witness"
     );
     let mut with_counter_claim = claim("claim-1", "proposition-1", Some("evidence-1"));
     with_counter_claim
@@ -3042,6 +3184,147 @@ fn api_guard_excludes_extraction_entailment_retrieval_and_effects() {
         SupportResult::OutsideManifest,
         "no retrieval or search"
     );
+}
+
+// WORK_UNIT_CASE: 602/35
+#[test]
+fn api_guard_has_no_prohibited_dependencies_or_effects() {
+    let crate_dir = env!("CARGO_MANIFEST_DIR");
+    let cargo_toml =
+        std::fs::read_to_string(format!("{crate_dir}/Cargo.toml")).expect("read crate Cargo.toml");
+    let mut in_dependencies = false;
+    let mut dependencies = Vec::new();
+    for line in cargo_toml.lines() {
+        let trimmed = line.trim();
+        if trimmed.starts_with('[') {
+            in_dependencies = trimmed == "[dependencies]";
+            continue;
+        }
+        if !in_dependencies {
+            continue;
+        }
+        let entry = trimmed.split('#').next().unwrap_or("").trim();
+        if entry.is_empty() {
+            continue;
+        }
+        let name = entry
+            .split('=')
+            .next()
+            .unwrap_or("")
+            .trim()
+            .trim_matches('"')
+            .to_lowercase();
+        if name.is_empty() {
+            continue;
+        }
+        dependencies.push(name);
+    }
+    assert_eq!(
+        dependencies,
+        vec!["eliot-dreamer-contracts"],
+        "dependency allowlist must hold"
+    );
+    for dependency in &dependencies {
+        if dependency == "eliot-dreamer-contracts" {
+            continue;
+        }
+        for forbidden in [
+            "tokio",
+            "eliot_store",
+            "eliot-store",
+            "reqwest",
+            "hyper",
+            "fs",
+            "net",
+            "clock",
+            "model",
+            "retrieval",
+            "dispatch",
+            "store",
+            "finish",
+        ] {
+            assert!(
+                !dependency.contains(forbidden),
+                "prohibited dependency {dependency:?} contains {forbidden:?}"
+            );
+        }
+    }
+    let sources = [
+        "src/lib.rs",
+        "src/grounding.rs",
+        "src/evidence.rs",
+        "src/precision.rs",
+    ];
+    for source in sources {
+        let text =
+            std::fs::read_to_string(format!("{crate_dir}/{source}")).expect("read crate source");
+        assert!(
+            text.len() < 1_048_576,
+            "{source} must stay bounded for the surface scan"
+        );
+        for token in [
+            "std::fs",
+            "std::net",
+            "tokio",
+            "eliot_store",
+            "eliot-store",
+            "Finish",
+            "std::process",
+            "std::env",
+            "std::time",
+            "SystemTime",
+            "Instant::now",
+        ] {
+            assert!(
+                !text.contains(token),
+                "forbidden effect token {token:?} present in {source}"
+            );
+        }
+        // Bare "model" is allowed (e.g. StructuredModelDraft); only a model
+        // import line outside the known-good identifier is denied.
+        for (index, line) in text.lines().enumerate() {
+            let trimmed = line.trim_start();
+            if trimmed.starts_with("use ")
+                && trimmed.to_lowercase().contains("model")
+                && !line.contains("StructuredModel")
+            {
+                panic!(
+                    "forbidden model import in {source} line {}: {line:?}",
+                    index + 1
+                );
+            }
+        }
+    }
+    let lib =
+        std::fs::read_to_string(format!("{crate_dir}/src/lib.rs")).expect("read crate lib.rs");
+    assert!(
+        lib.contains("pub use grounding::"),
+        "lib must re-export the pure grounding surface"
+    );
+    for line in lib.lines() {
+        let trimmed = line.trim();
+        if trimmed.starts_with("pub use ") {
+            assert!(
+                trimmed.contains("grounding::"),
+                "unexpected public re-export: {trimmed:?}"
+            );
+        }
+        if trimmed.starts_with("pub mod ") {
+            assert!(
+                trimmed.contains("grounding"),
+                "unexpected public module: {trimmed:?}"
+            );
+        }
+    }
+    for name in [
+        "ground_draft",
+        "ground_draft_with_controls",
+        "GroundingRequest",
+        "GroundingControls",
+        "Cancellation",
+    ] {
+        assert!(lib.contains(name), "lib must re-export {name}");
+    }
 }
 
 // WORK_UNIT_CASE: 602/36
