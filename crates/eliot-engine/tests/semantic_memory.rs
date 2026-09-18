@@ -385,7 +385,8 @@ fn low_lexical_overlap_alias_retrieval_finds_case_but_keeps_it_as_prior() {
             exposure_policy: MemoryExposurePolicy::default(),
         },
         &[case],
-    );
+    )
+    .expect("recall delivery counts are exact");
     assert!(!response.no_useful_memory);
     assert_eq!(response.experience_priors.len(), 1);
     assert!(
@@ -480,7 +481,8 @@ fn exposure_policy_partitions_control_and_candidate_conditions() {
             },
         },
         std::slice::from_ref(&case),
-    );
+    )
+    .expect("recall delivery counts are exact");
     assert!(control.no_useful_memory);
     let candidate = ExperienceRetrievalService::recall(
         &ExperienceRecallRequest {
@@ -493,8 +495,103 @@ fn exposure_policy_partitions_control_and_candidate_conditions() {
             },
         },
         &[case],
-    );
+    )
+    .expect("recall delivery counts are exact");
     assert!(!candidate.fused_rank_traces.is_empty());
+}
+
+#[test]
+fn recall_binds_resolvable_rank_trace_handle_through_delivery() {
+    let project_id = ProjectId::new_v7();
+    let mut admitted = formed(episode(
+        project_id,
+        "trace-admitted",
+        "staged writeback is not a canonical receipt",
+        "staged writeback",
+        "canonical receipt absent",
+        "canonical receipt present",
+        "write receipt missing",
+        "staged is not persisted",
+    ));
+    admitted.maturity.state = ExperienceMaturityState::TransferValidated;
+    let mut suppressed = formed(episode(
+        project_id,
+        "trace-suppressed",
+        "staged writeback is not a canonical receipt",
+        "staged writeback",
+        "canonical receipt absent",
+        "canonical receipt absent",
+        "write receipt missing",
+        "staged is not persisted",
+    ));
+    suppressed.maturity.state = ExperienceMaturityState::TransferValidated;
+    let frame = TaskMeaningFrame {
+        task_id: "trace-delivery".to_owned(),
+        normalized_goal: "write receipt missing".to_owned(),
+        problem_or_failure_signature: "canonical receipt absent".to_owned(),
+        current_evidence: vec!["canonical receipt absent".to_owned()],
+        ..TaskMeaningFrame::default()
+    };
+    let need = MemoryNeedService::decide(&frame, Some(MemoryNeed::CausalCase));
+    let response = ExperienceRetrievalService::recall(
+        &ExperienceRecallRequest {
+            project_id,
+            task_frame: frame,
+            need,
+            exposure_policy: MemoryExposurePolicy::default(),
+        },
+        &[admitted.clone(), suppressed.clone()],
+    )
+    .expect("recall delivery counts are exact");
+
+    assert!(!response.no_useful_memory);
+    assert_eq!(response.fused_rank_traces.len(), 2);
+    assert_eq!(response.experience_priors.len(), 1);
+    assert_eq!(response.visible_count, 1);
+    assert_eq!(response.suppressed_count, 1);
+    for trace in &response.fused_rank_traces {
+        assert!(!trace.routes.is_empty());
+    }
+    let admitted_trace = response
+        .fused_rank_traces
+        .iter()
+        .find(|trace| trace.candidate_ref == admitted.case_id)
+        .expect("admitted trace");
+    let suppressed_trace = response
+        .fused_rank_traces
+        .iter()
+        .find(|trace| trace.candidate_ref == suppressed.case_id)
+        .expect("suppressed trace");
+    assert!(admitted_trace.admitted_for_applicability_review);
+    assert!(suppressed_trace.admitted_for_applicability_review);
+    let verdict = |case_id: &str| {
+        response
+            .applicability
+            .iter()
+            .find(|decision| decision.experience_ref == case_id)
+            .map(|decision| decision.verdict)
+    };
+    assert_eq!(
+        verdict(&admitted.case_id),
+        Some(ApplicabilityVerdict::ApplicableAsPrior)
+    );
+    assert_eq!(
+        verdict(&suppressed.case_id),
+        Some(ApplicabilityVerdict::NearMiss)
+    );
+    assert_eq!(
+        response.rank_trace_handle,
+        eliot_types::ExperienceRecallResponse::rank_trace_handle_for(&response.fused_rank_traces)
+    );
+    response
+        .validate_delivery()
+        .expect("delivery handle must resolve");
+    let mut stripped = response.clone();
+    stripped.rank_trace_handle.clear();
+    assert!(stripped.validate_delivery().is_err());
+    let mut miscounted = response.clone();
+    miscounted.visible_count = 0;
+    assert!(miscounted.validate_delivery().is_err());
 }
 
 #[test]
@@ -528,7 +625,8 @@ fn current_fact_need_cannot_leak_a_causal_case() {
             },
         },
         &[case],
-    );
+    )
+    .expect("recall delivery counts are exact");
 
     assert!(response.no_useful_memory);
     assert!(response.fused_rank_traces.is_empty());
